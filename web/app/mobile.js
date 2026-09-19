@@ -20,6 +20,7 @@ let root = null;
 let forced = false;
 let active = false;
 let built = false;
+let collapsedBefore = null;
 
 let stageBar = null;
 let stageTitle = null;
@@ -62,6 +63,21 @@ function element(tag, className, html) {
   return node;
 }
 
+const alertsDialog = () => document.querySelector('#notificationsPanel');
+
+// The inbox is a <dialog> the console opens through its own button, so the stack
+// follows it rather than driving it: adopt the entry once it is up (any click
+// that opens it, plus a render for the paths that open it without one), and drop
+// the dialog whenever the entry leaves the stack by any other route.
+function adoptAlerts() {
+  if (active && alertsDialog()?.open && !showing('alerts')) open('alerts');
+}
+function closeDroppedAlerts() {
+  if (showing('alerts')) return;
+  const dialog = alertsDialog();
+  if (dialog?.open) dialog.close();
+}
+
 function sheet(id, label) {
   const node = element('div', 'mobile-sheet');
   node.id = id;
@@ -100,11 +116,16 @@ function build() {
   bar.append(statusButton);
 
   // The bottom tab bar is the console's own mode switch, moved by CSS. Alerts is
-  // the one tab with no mode of its own: it opens the inbox dialog.
+  // the one tab with no mode of its own: it opens the inbox dialog, which joins
+  // the overlay stack like the sheets so Back closes it instead of walking out
+  // of the console with it still up.
   alertsTab = element('button', 'mobile-alerts-tab', 'Alerts<span class="count zero"></span>');
   alertsTab.type = 'button';
   alertsTab.addEventListener('click', () => document.querySelector('#notificationsButton')?.click());
   modes.append(alertsTab);
+  // Whatever closed it — the close button, Escape, the backdrop, or a link out
+  // of it — the entry it owns goes with it.
+  alertsDialog()?.addEventListener('close', () => { if (active) close('alerts'); });
 
   stageBar = element('div', 'mobile-stagebar',
     '<button type="button" class="mobile-back">‹ Queue</button><span class="mobile-stagebar-title"></span>');
@@ -141,7 +162,10 @@ function activate() {
   borrow('#meters', statusSheet.querySelector('.mobile-sheet-body'));
   borrow('#health', statusSheet.querySelector('.mobile-sheet-body'));
   // A collapsed rail or queue is a desktop gesture with no phone affordance:
-  // the rail lives in a sheet and the queue is the screen.
+  // the rail lives in a sheet and the queue is the screen. Remembered, not
+  // discarded — giving the DOM back without the state would silently expand
+  // panels Owner had collapsed.
+  collapsedBefore = { rail: ctx.state.collapsed.rail, queue: ctx.state.collapsed.queue };
   ctx.state.collapsed.rail = false;
   ctx.state.collapsed.queue = false;
   // Watch has no tab on the phone; a remembered Watch would leave a blank screen.
@@ -157,8 +181,14 @@ function deactivate() {
   // no-op and a Forward would land on a `keepOverlay` state with nothing open.
   const pops = overlays.filter((entry) => entry.pushed).length;
   overlays.length = 0;
+  closeDroppedAlerts();
   rewind(pops);
   giveBack();
+  if (collapsedBefore) {
+    ctx.state.collapsed.rail = collapsedBefore.rail;
+    ctx.state.collapsed.queue = collapsedBefore.queue;
+    collapsedBefore = null;
+  }
 }
 
 function apply({ booting = false } = {}) {
@@ -183,6 +213,7 @@ function close(name) {
   const index = overlays.findLastIndex((entry) => entry.name === name);
   if (index < 0) return;
   const pops = overlays.splice(index).filter((entry) => entry.pushed).length;
+  closeDroppedAlerts();
   sync();
   rewind(pops);
 }
@@ -193,8 +224,18 @@ function toggle(name) {
 
 // Standing on an entry whose overlay is closed: put the overlay back rather than
 // leave the entry dead. The sheets need nothing but themselves; the stage needs
-// an item to show, and Triage to show it in.
+// an item to show, and Triage to show it in; the inbox has to be reopened, and
+// claims the entry first so adopting it does not push a second one.
 function reopen(name) {
+  if (name === 'alerts') {
+    const dialog = alertsDialog();
+    if (!dialog) return false;
+    overlays.push({ name, pushed: true });
+    if (!dialog.open) document.querySelector('#notificationsButton')?.click();
+    if (!dialog.open) { overlays.pop(); return false; }
+    sync();
+    return true;
+  }
   if (name !== 'filter' && name !== 'status'
     && !(name === 'stage' && ctx.state.mode === 'triage' && ctx.state.currentItem)) return false;
   overlays.push({ name, pushed: true });
@@ -215,13 +256,15 @@ function onPopState(event) {
     // Back out of the last overlay, or a navigation that was never ours.
     if (!overlays.length) return;
     overlays.length -= 1;
+    closeDroppedAlerts();
     sync();
     return;
   }
   const top = overlays.length ? overlays[overlays.length - 1].name : null;
   if (top === wanted) return;
   const index = overlays.findLastIndex((entry) => entry.name === wanted);
-  if (index >= 0) { overlays.length = index + 1; sync(); return; } // Back over several at once
+  // Back over several at once.
+  if (index >= 0) { overlays.length = index + 1; closeDroppedAlerts(); sync(); return; }
   if (!reopen(wanted)) rewind(1);
 }
 
@@ -255,6 +298,10 @@ function sync() {
   badge.textContent = unread;
   badge.classList.toggle('zero', !unread);
   if (stageOpen) stageTitle.textContent = headingText() || document.querySelector('#stage .qempty b')?.textContent || '';
+  alertsTab.classList.toggle('on', showing('alerts'));
+  // The backstop for an inbox opened without a click of its own — a notification
+  // tap arrives that way.
+  adoptAlerts();
 }
 
 // The stage heading carries the session number and mark inside the same element
@@ -299,5 +346,9 @@ export function installMobile(context) {
     else if (event.target.closest('#qlist .qitem')) open('stage');
     else if (event.target.closest('#rail [data-project]')) close('filter');
   }, true);
+  // After the click, not before: whichever control just opened the inbox — the
+  // Alerts tab, the bar button, the preview banner — the dialog is up by now, so
+  // the entry can be claimed in the same gesture rather than at the next render.
+  document.addEventListener('click', () => { if (active) adoptAlerts(); });
   apply({ booting: true });
 }

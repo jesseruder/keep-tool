@@ -171,8 +171,8 @@ CSS. It does only what CSS cannot: it borrows `#rail` into a
 filter sheet and `#meters`/`#health` into a status sheet behind the connection
 dot, appends an Alerts tab to the mode switch (which `styles.css` fixes to the
 bottom of the screen, with Watch hidden), and toggles `mobile-stage-open` so a
-selected queue row pushes the stage over the queue. Each sheet and the stage push
-one `history.pushState({keepOverlay})` entry, so Android's back button — which the
+selected queue row pushes the stage over the queue. Each sheet, the stage and the
+alerts inbox push one `history.pushState({keepOverlay})` entry, so Android's back button — which the
 shell routes through WebView history — unwinds them one at a time. The entry at
 depth k names the k-th overlay, so arriving on a `keepOverlay` entry whose
 overlay is closed (a Forward, or a leftover from a shell that went away) reopens

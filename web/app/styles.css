@@ -679,7 +679,7 @@ html.mobile .bar { flex-wrap: nowrap; gap: 8px; padding-inline: 10px; }
 html.mobile .bar .session-history, html.mobile .bar #soundButton, html.mobile .bar #notificationsButton { display: none; }
 .mobile-filter, .mobile-status { display: none; }
 html.mobile .mobile-filter, html.mobile .mobile-status {
-  display: inline-flex; align-items: center; gap: 7px; min-height: 40px; max-width: 45vw;
+  display: inline-flex; align-items: center; gap: 7px; min-height: 44px; max-width: 45vw;
   padding: 6px 12px; border: 1px solid var(--bar-line); border-radius: 18px;
   background: var(--bar-seg); color: var(--bar-muted); font-size: 12px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;

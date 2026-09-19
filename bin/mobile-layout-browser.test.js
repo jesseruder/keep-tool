@@ -187,7 +187,11 @@ test('isolated browser: the console is usable on a 412px touch screen',
       // The Android shell injects this before the page's own scripts run.
       const injected = await call('Page.addScriptToEvaluateOnNewDocument', {
         source: "window.keepShell = { platform: 'android', version: 'browser-test',"
-          + " post(message) { (window.__shellPosts = window.__shellPosts || []).push(message); } };",
+          + " post(message) { (window.__shellPosts = window.__shellPosts || []).push(message); } };"
+          // Collapsed on the desktop this console was last used on: the phone
+          // expands both, and must hand them back the way it found them.
+          + " try { localStorage.setItem('keep.console.collapsed',"
+          + " JSON.stringify({ rail: true, queue: true, rside: false })); } catch {}",
       });
       const origin = `http://127.0.0.1:${server.address().port}`;
       await call('Page.navigate', { url: `${origin}/` });
@@ -251,9 +255,11 @@ test('isolated browser: the console is usable on a 412px touch screen',
         'the stage is the whole screen');
       assert.ok(await evaluate("document.querySelector('.mobile-stagebar').getBoundingClientRect().height >= 44"),
         'the back control is a touch target');
-      // Every answer button clears 44px, and so does the row action menu.
-      assert.equal(await evaluate("[...document.querySelectorAll('#stage .opt, #stage .shead .btn, #stage .session-actions > summary')]"
-        + ".every(node => node.getBoundingClientRect().height >= 44)"), true, 'stage controls are touch-sized');
+      // Every answer button clears 44px, and so do the row action menu and the
+      // two controls the top bar keeps.
+      assert.equal(await evaluate("[...document.querySelectorAll('#stage .opt, #stage .shead .btn,"
+        + " #stage .session-actions > summary, .bar .mobile-filter, .bar .mobile-status')]"
+        + ".every(node => node.getBoundingClientRect().height >= 44)"), true, 'stage and bar controls are touch-sized');
       // The terminal handoff is on the same screen as the answer buttons.
       assert.equal(await evaluate("(() => { const rect = document.querySelector('.term-handoff-open').getBoundingClientRect();"
         + " return rect.height >= 44 && rect.top >= 0 && rect.bottom <= window.innerHeight; })()"), true,
@@ -324,12 +330,24 @@ test('isolated browser: the console is usable on a 412px touch screen',
         'the reviewer side panel stacks under the pane');
       await shoot('reviewer');
 
+      // The inbox is a tab, so it owns a history entry like the sheets: Android's
+      // Back closes it instead of walking out of the console with it still up.
       await evaluate("document.querySelector('.mobile-alerts-tab').click()");
       await wait("document.querySelector('#notificationsPanel').open");
+      assert.equal(await evaluate('history.state && history.state.keepOverlay'), 'alerts',
+        'opening the inbox pushes its own entry');
       assert.ok(await evaluate("document.querySelector('#notificationsPanel').getBoundingClientRect().right <= " + WIDTH),
         'the alerts inbox fits the screen');
       await shoot('alerts');
+      await evaluate('history.back()');
+      await wait("!document.querySelector('#notificationsPanel').open"
+        + " && !(history.state && history.state.keepOverlay)");
+      // Closing it by its own control rewinds the entry rather than leaving it.
+      await evaluate("document.querySelector('.mobile-alerts-tab').click()");
+      await wait("document.querySelector('#notificationsPanel').open && history.state?.keepOverlay === 'alerts'");
       await evaluate("document.querySelector('#notificationsPanel [data-close]').click()");
+      await wait("!document.querySelector('#notificationsPanel').open"
+        + " && !(history.state && history.state.keepOverlay)");
 
       await evaluate("document.querySelector('.modes [data-mode=triage]').click()");
       await wait("document.querySelector('#triage').classList.contains('on')");
@@ -377,6 +395,11 @@ test('isolated browser: the console is usable on a 412px touch screen',
       assert.equal(await evaluate("document.querySelector('#rail').parentElement.id"), 'triage',
         'the rail goes back where the console expects it');
       assert.equal(await evaluate('history.length'), withStage, 'the unwind consumes the entry it pushed');
+      // The rail and the queue were collapsed before the phone expanded them;
+      // handing the DOM back without the state would silently expand them.
+      await wait("document.querySelector('#rail').classList.contains('collapsed')");
+      assert.equal(await evaluate("document.querySelector('#triage .queue').classList.contains('collapsed')"), true,
+        'the collapsed queue comes back too');
 
       // ── A desktop window this narrow is still a desktop. The phone layout
       // moves DOM and rewrites `keep-mode`; a media query must do neither, so a
