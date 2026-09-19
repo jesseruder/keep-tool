@@ -334,14 +334,30 @@ function saveTickets(rows, root = DEFAULT_ROOT) {
   return rows;
 }
 
+// Every write to the file is a read-modify-write, and there are two writers in
+// this process: a push recording its tickets and a poll dropping the ones it
+// resolved. They run interleaved — the poll awaits the network between its read
+// and its write — so each mutation reads the file again at commit time and is
+// expressed as a change to what it finds, and the mutations are queued so two of
+// them cannot read the same state. Across processes the rename is still atomic,
+// so the worst case is a `keep alert` CLI's ticket lost to a simultaneous poll:
+// one unread receipt, and the device is dropped by the next push's ticket.
+let ticketWrites = Promise.resolve();
+function withTickets(mutation) {
+  const run = () => { try { return mutation(); } catch { return null; } };
+  const next = ticketWrites.then(run, run);
+  ticketWrites = next.then(() => {}, () => {});
+  return next;
+}
+
 // Never raised to a caller: a push that went out is not a failure because the
 // daemon could not write down its ticket.
 function recordTickets(rows, root = DEFAULT_ROOT, now = Date.now()) {
-  if (!rows.length) return [];
-  try {
+  if (!rows.length) return Promise.resolve([]);
+  return withTickets(() => {
     const live = loadTickets(root).filter((ticket) => now - ticket.at < TICKET_TTL_MS);
     return saveTickets([...live, ...rows], root);
-  } catch { return []; }
+  });
 }
 
 // Ask Expo what became of the pushes it accepted. Batches of 300 ids, one
@@ -352,16 +368,30 @@ async function pollReceipts(options = {}) {
   const registry = options.devices || require('./devices.js');
   const doFetch = options.fetch || globalThis.fetch;
   const now = Number.isFinite(options.now) ? options.now : Date.now();
+  // Whatever this commits is expressed against the file as it is then, not as it
+  // is now: a push that records a ticket while the receipts request is in flight
+  // must keep it.
+  const commit = (resolved, removedTokens) => withTickets(() => {
+    const fresh = loadTickets(root);
+    const kept = fresh.filter((ticket) => !resolved.has(ticket.id) && !removedTokens.has(ticket.token)
+      && now - ticket.at < TICKET_TTL_MS);
+    if (kept.length !== fresh.length) saveTickets(kept, root);
+    return { dropped: fresh.length - kept.length, pending: kept.length };
+  });
   const stored = loadTickets(root);
   const tickets = stored.filter((ticket) => now - ticket.at < TICKET_TTL_MS);
   const expired = stored.length - tickets.length;
   if (!tickets.length || typeof doFetch !== 'function') {
-    if (expired) { try { saveTickets(tickets, root); } catch {} }
-    return { checked: 0, resolved: 0, removed: [], pending: tickets.length, expired, detail: 'no tickets' };
+    const committed = await commit(new Set(), new Set());
+    return {
+      ok: true, checked: 0, resolved: 0, removed: [],
+      pending: committed ? committed.pending : tickets.length, expired, detail: 'no tickets',
+    };
   }
   const byId = new Map(tickets.map((ticket) => [ticket.id, ticket]));
   const resolved = new Set();
   const removed = [];
+  let failure = null;
   for (let start = 0; start < tickets.length; start += RECEIPT_BATCH) {
     const ids = tickets.slice(start, start + RECEIPT_BATCH).map((ticket) => ticket.id);
     let payload = null;
@@ -372,9 +402,14 @@ async function pollReceipts(options = {}) {
         body: JSON.stringify({ ids }),
         signal: AbortSignal.timeout(EXPO_TIMEOUT_MS),
       });
-      if (!response.ok) { expoLog(`receipts HTTP ${response.status}`, now); continue; }
+      if (!response.ok) {
+        failure = failure || `HTTP ${response.status}`;
+        expoLog(`receipts HTTP ${response.status}`, now);
+        continue;
+      }
       payload = await response.json();
     } catch (error) {
+      failure = failure || oneLine(error && error.message || error, 160);
       expoLog(`receipts ${oneLine(error && error.message || error, 160)}`, now);
       continue;
     }
@@ -391,21 +426,28 @@ async function pollReceipts(options = {}) {
       if (!receipt || receipt.status === 'ok') continue;
       const reason = receipt.details && receipt.details.error;
       if (reason === 'DeviceNotRegistered') {
+        // Its other pushes are on their way to the same dead phone: they go with
+        // it, rather than being polled for a receipt that says this again.
         try { if (registry.remove(ticket.token, root)) removed.push(ticket.token); } catch {}
         continue;
       }
       expoLog(`receipt ${reason || 'error'}: ${oneLine(receipt.message || '', 160)}`, now);
     }
   }
-  const pending = tickets.filter((ticket) => !resolved.has(ticket.id));
-  if (resolved.size || expired) { try { saveTickets(pending, root); } catch {} }
+  const committed = await commit(resolved, new Set(removed));
+  const pending = committed ? committed.pending : tickets.length - resolved.size;
+  const detail = `${resolved.size} resolved, ${pending} pending${removed.length ? `, ${removed.length} unregistered` : ''}`;
   return {
+    // A request Expo refused is a failed run, not a quiet one: the scheduler's
+    // health row has to say so, or an outage reads as "nothing to do".
+    ok: !failure,
+    ...(failure ? { error: `receipts request failed: ${failure}` } : {}),
     checked: tickets.length,
     resolved: resolved.size,
     removed,
-    pending: pending.length,
+    pending,
     expired,
-    detail: `${resolved.size} resolved, ${pending.length} pending${removed.length ? `, ${removed.length} unregistered` : ''}`,
+    detail: failure ? `${detail} — ${failure}` : detail,
   };
 }
 
@@ -502,7 +544,7 @@ async function sendExpo(notification, options = {}) {
       expoLog(`${reason || 'error'}: ${oneLine(ticket && ticket.message || '', 160)}`, now);
     }
   }
-  recordTickets(accepted, root, now);
+  await recordTickets(accepted, root, now);
   return ok ? 'ok' : 'failed';
 }
 

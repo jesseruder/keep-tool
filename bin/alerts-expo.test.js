@@ -328,6 +328,9 @@ test('a receipts call that fails keeps every ticket for the next run', async (t)
   });
   assert.equal(refused.resolved, 0);
   assert.equal(refused.pending, 1);
+  assert.equal(refused.ok, false, 'an outage is a failed run, not a quiet one');
+  assert.match(refused.error, /receipts request failed: HTTP 502/);
+  assert.match(refused.detail, /HTTP 502/);
   assert.deepEqual(ticketsOf(root).map((ticket) => ticket.id), ['ticket-a']);
   assert.match(written.join(''), /receipts HTTP 502/);
 
@@ -336,6 +339,7 @@ test('a receipts call that fails keeps every ticket for the next run', async (t)
     root, now: now + 61e3, devices: fakeRegistry(['aaaaaa']), fetch: async () => { throw new Error('socket hang up'); },
   });
   assert.equal(broken.pending, 1);
+  assert.equal(broken.ok, false);
   assert.match(written.join(''), /receipts socket hang up/);
 
   // An error that is not a dead device is logged, not acted on.
@@ -351,6 +355,7 @@ test('a receipts call that fails keeps every ticket for the next run', async (t)
   });
   assert.deepEqual(other.removed, []);
   assert.equal(other.pending, 0, 'a verdict is a verdict');
+  assert.equal(other.ok, true, 'the request itself was answered');
   assert.match(written.join(''), /receipt MessageTooBig/);
 });
 
@@ -369,6 +374,72 @@ test('the ticket file is capped, and the oldest unanswered ticket is the one dro
   assert.equal(tickets.length, 500);
   assert.equal(tickets.at(-1).id, `ticket-${expoToken('new00299')}-${now + 1000}`);
   assert.equal(tickets.some((ticket) => ticket.id.includes('old00000')), false, 'the oldest hundred fell off');
+});
+
+test('a push recorded while a poll is in flight keeps its ticket', async (t) => {
+  const root = makeRoot(t);
+  const now = Date.parse('2026-09-19T09:00:00Z');
+  await alerts.sendExpo({ ...waiting }, {
+    root, now, devices: fakeRegistry(['first0']), fetch: async () => expoTickets(['ticket-first']),
+  });
+
+  // The receipts request hangs until the test releases it. A push lands in the
+  // meantime, and the poll's write must be a change to what it finds then — not
+  // the snapshot it read before the request.
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const polling = alerts.pollReceipts({
+    root,
+    now: now + 1000,
+    devices: fakeRegistry(['first0']),
+    fetch: async () => {
+      await held;
+      return { ok: true, status: 200, json: async () => ({ data: { 'ticket-first': { status: 'ok' } } }) };
+    },
+  });
+  await alerts.sendExpo({ ...waiting }, {
+    root, now: now + 500, devices: fakeRegistry(['second']), fetch: async () => expoTickets(['ticket-second']),
+  });
+  assert.deepEqual(ticketsOf(root).map((ticket) => ticket.id), ['ticket-first', 'ticket-second']);
+
+  release();
+  const result = await polling;
+  assert.equal(result.resolved, 1);
+  assert.deepEqual(ticketsOf(root).map((ticket) => ticket.id), ['ticket-second'],
+    'the poll dropped only what it resolved');
+  assert.equal(result.pending, 1);
+});
+
+test("a dead phone's other pending tickets go with it", async (t) => {
+  const root = makeRoot(t);
+  const now = Date.parse('2026-09-19T09:00:00Z');
+  const registry = fakeRegistry(['gonegone', 'staystay']);
+  // Two pushes, so the dead phone has two tickets outstanding and the live one has two.
+  await alerts.sendExpo({ ...waiting }, {
+    root, now, devices: registry, fetch: async () => expoTickets(['gone-1', 'stay-1']),
+  });
+  await alerts.sendExpo({ ...waiting }, {
+    root, now: now + 1000, devices: registry, fetch: async () => expoTickets(['gone-2', 'stay-2']),
+  });
+  assert.equal(ticketsOf(root).length, 4);
+
+  const result = await alerts.pollReceipts({
+    root,
+    now: now + 2000,
+    devices: registry,
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: {
+        'gone-1': { status: 'error', message: 'not registered', details: { error: 'DeviceNotRegistered' } },
+        'stay-1': { status: 'ok' },
+      } }),
+    }),
+  });
+  assert.deepEqual(registry.removed, [expoToken('gonegone')]);
+  assert.deepEqual(ticketsOf(root).map((ticket) => ticket.id), ['stay-2'],
+    "the dead phone's second ticket was dropped unasked");
+  assert.equal(result.pending, 1);
 });
 
 test('a ticket nobody answered for a day is given up on', async (t) => {
@@ -391,7 +462,7 @@ test('a ticket nobody answered for a day is given up on', async (t) => {
   // With no tickets at all the poll is a no-op that writes nothing.
   const empty = makeRoot(t);
   const quiet = await alerts.pollReceipts({ root: empty, fetch: async () => { throw new Error('never called'); } });
-  assert.deepEqual(quiet, { checked: 0, resolved: 0, removed: [], pending: 0, expired: 0, detail: 'no tickets' });
+  assert.deepEqual(quiet, { ok: true, checked: 0, resolved: 0, removed: [], pending: 0, expired: 0, detail: 'no tickets' });
   assert.equal(ticketsOf(empty), null);
 });
 

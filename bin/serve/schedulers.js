@@ -47,6 +47,51 @@ function gitFailure(error, stderr) {
   return new Error(timedOut ? `${reason} (killed after ${PULL_TIMEOUT_MS / 1000}s)` : reason);
 }
 
+// Expo reports an uninstalled app in a push's receipt, minutes after the push
+// itself was accepted, so the registry only learns about a dead phone if
+// somebody asks. Nothing here is urgent: a phone that is gone costs one wasted
+// request per push until the next run.
+//
+// One timer, rescheduled after each tick rather than an interval beside it: two
+// mechanisms is how the first poll ended up running twice at once. The guard is
+// the same rule the other slow ticks keep — a run that outlasts its cadence is
+// never joined by a second one.
+function startReceiptsPoller({
+  keep, health,
+  poll = (request) => require('../alerts.js').pollReceipts(request),
+  setTimeout: st = setTimeout,
+  write = (line) => process.stderr.write(line),
+} = {}) {
+  let running = false;
+  let timer = null;
+  const schedule = () => { timer = st(tick, PUSH_RECEIPTS_MS); timer?.unref?.(); };
+  const tick = async () => {
+    // The run in flight schedules the next one when it finishes, so a skipped
+    // tick must not start a second timer beside it.
+    if (running) return;
+    running = true;
+    try {
+      const result = await poll({ root: keep.ROOT }) || {};
+      health.record('push-receipts', {
+        ok: result.ok !== false,
+        cadenceMs: PUSH_RECEIPTS_MS,
+        detail: result.detail,
+        ...(result.ok === false ? { error: result.error || 'receipts request failed' } : {}),
+      });
+    } catch (error) {
+      // pollReceipts does not throw; a bug that makes it throw is still not a
+      // reason to lose the timer.
+      health.record('push-receipts', { ok: false, cadenceMs: PUSH_RECEIPTS_MS, error });
+      write(`keep serve: push receipts failed: ${error.message}\n`);
+    } finally {
+      running = false;
+      schedule();
+    }
+  };
+  schedule();
+  return { tick, get running() { return running; } };
+}
+
 // Pulls cloud-made commits (the overnight check routine's, say) into the local
 // registry, in two halves that are deliberately not one `git pull`.
 //
@@ -605,21 +650,7 @@ function startSchedulers(ctx) {
   setInterval(foldFleetUsage, 5 * 60e3).unref();
   setTimeout(foldFleetUsage, 20e3).unref();
 
-  // Expo reports an uninstalled app in a push's receipt, minutes after the push
-  // itself was accepted, so the registry only learns about a dead phone if
-  // somebody asks. Nothing here is urgent: a phone that is gone costs one wasted
-  // request per alert until the next run.
-  const receiptsTick = async () => {
-    try {
-      const result = await require('../alerts.js').pollReceipts({ root: keep.ROOT });
-      health.record('push-receipts', { ok: true, cadenceMs: PUSH_RECEIPTS_MS, detail: result.detail });
-    } catch (error) {
-      health.record('push-receipts', { ok: false, cadenceMs: PUSH_RECEIPTS_MS, error });
-      process.stderr.write(`keep serve: push receipts failed: ${error.message}\n`);
-    }
-  };
-  setInterval(receiptsTick, PUSH_RECEIPTS_MS).unref();
-  setTimeout(receiptsTick, PUSH_RECEIPTS_MS).unref();
+  startReceiptsPoller({ keep, health });
 
   startLoopLagProbe();
   const pull = createRegistryPull({ keep, health });
@@ -635,4 +666,6 @@ function startSchedulers(ctx) {
   return { restarts };
 }
 
-module.exports = { startFeatureSchedulers, startSchedulers, createRegistryPull, startLoopLagProbe };
+module.exports = {
+  startFeatureSchedulers, startSchedulers, createRegistryPull, startLoopLagProbe, startReceiptsPoller,
+};

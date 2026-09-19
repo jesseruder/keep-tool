@@ -8,7 +8,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { createRegistryPull, startLoopLagProbe } = require('./serve/schedulers.js');
+const { createRegistryPull, startLoopLagProbe, startReceiptsPoller } = require('./serve/schedulers.js');
 
 const ROOT = '/registry/root';
 
@@ -200,4 +200,80 @@ test('the lag probe names a tick that arrived late and stays quiet for one on ti
   clock = 5600;
   tick();
   assert.equal(lines.length, 1, 'the next tick is on time again: one stall is reported once');
+});
+
+
+// The receipts poller: one timer, rescheduled after each run, and a run that
+// outlasts its cadence is never joined by a second one.
+function receiptsHarness(answers) {
+  const rows = [];
+  const timers = [];
+  let unrefs = 0;
+  const polls = [];
+  const poller = startReceiptsPoller({
+    keep: { ROOT: '/registry/root' },
+    health: { record: (name, entry) => rows.push([name, entry]) },
+    poll: (request) => { polls.push(request); return answers(polls.length); },
+    setTimeout: (fn, ms) => { timers.push({ fn, ms }); return { unref() { unrefs += 1; } }; },
+    write: () => {},
+  });
+  return { poller, rows, timers, polls, unrefs: () => unrefs };
+}
+
+test('the receipts poller keeps one unrefd timer, a cadence apart', async () => {
+  const harness = receiptsHarness(() => Promise.resolve({ ok: true, detail: '0 resolved, 0 pending' }));
+  assert.equal(harness.timers.length, 1, 'one mechanism, not an interval beside a timeout');
+  assert.equal(harness.timers[0].ms, 15 * 60e3, 'the first poll is a cadence after start, not at start');
+  assert.equal(harness.unrefs(), 1, 'the poller never keeps the daemon alive by itself');
+  assert.deepEqual(harness.polls, []);
+
+  await harness.timers[0].fn();
+  assert.deepEqual(harness.polls, [{ root: '/registry/root' }]);
+  assert.deepEqual(harness.rows, [['push-receipts', {
+    ok: true, cadenceMs: 15 * 60e3, detail: '0 resolved, 0 pending',
+  }]]);
+  assert.equal(harness.timers.length, 2, 'the run that finished scheduled the next one');
+  assert.equal(harness.timers[1].ms, 15 * 60e3);
+});
+
+test('a slow receipts run is never joined by a second one', async () => {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const harness = receiptsHarness((count) => count === 1
+    ? held.then(() => ({ ok: true, detail: 'slow' }))
+    : Promise.resolve({ ok: true, detail: 'fast' }));
+
+  const first = harness.timers[0].fn();
+  assert.equal(harness.poller.running, true);
+  await harness.poller.tick();
+  assert.equal(harness.polls.length, 1, 'the second call found one in flight and left it alone');
+  assert.equal(harness.timers.length, 1, 'and started no timer of its own');
+
+  release();
+  await first;
+  assert.equal(harness.poller.running, false);
+  assert.equal(harness.timers.length, 2);
+  await harness.timers[1].fn();
+  assert.equal(harness.polls.length, 2);
+  assert.deepEqual(harness.rows.map(([, entry]) => entry.detail), ['slow', 'fast']);
+});
+
+test('a failed receipts request leaves the health row failing, not green', async () => {
+  const harness = receiptsHarness((count) => count === 1
+    ? Promise.resolve({ ok: false, error: 'receipts request failed: HTTP 502', detail: '0 resolved, 3 pending — HTTP 502' })
+    : Promise.reject(new Error('poll threw')));
+
+  await harness.timers[0].fn();
+  assert.deepEqual(harness.rows[0], ['push-receipts', {
+    ok: false,
+    cadenceMs: 15 * 60e3,
+    detail: '0 resolved, 3 pending — HTTP 502',
+    error: 'receipts request failed: HTTP 502',
+  }]);
+
+  // pollReceipts does not throw, but a bug that made it throw must not lose the timer.
+  await harness.timers[1].fn();
+  assert.equal(harness.rows[1][1].ok, false);
+  assert.equal(harness.rows[1][1].error.message, 'poll threw');
+  assert.equal(harness.timers.length, 3);
 });

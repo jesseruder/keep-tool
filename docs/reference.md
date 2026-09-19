@@ -806,10 +806,12 @@ and never raised to the caller. An uninstalled app is usually reported later
 still, in that push's *receipt*, so every accepted ticket is written to
 `.keep/push-tickets.json` (0600, newest 500, dropped after 24 hours) and the
 daemon's `push-receipts` scheduler asks for them every 15 minutes, 300 ids per
-request. A receipt is a verdict: `DeviceNotRegistered` unregisters that phone,
-anything else is logged once a minute, and either way the ticket is dropped. A
-receipt Expo has not produced yet, or a request that fails, leaves its tickets
-for the next run. The row shows up in `keep health` like any other scheduler.
+request. A receipt is a verdict: `DeviceNotRegistered` unregisters that phone and
+drops its other pending tickets with it, anything else is logged once a minute,
+and either way the ticket is dropped. A receipt Expo has not produced yet leaves
+its ticket for the next run, and so does a request that fails — which is recorded
+as a failed run, so an Expo outage shows up in `keep health` as a failing
+`push-receipts` row rather than a green one.
 
 ### A session waiting on you
 
