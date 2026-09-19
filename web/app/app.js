@@ -847,7 +847,8 @@ function renderMeters() {
       const resetAt = reading.resetsAt == null || reading.resetsAt === '' ? NaN : new Date(reading.resetsAt).getTime();
       const reset = Number.isFinite(resetAt) ? ` · resets ${new Date(resetAt).toLocaleString()}` : '';
       const windowMs = Number(reading.windowMs);
-      const elapsed = Number.isFinite(resetAt) && windowMs > 0 ? Math.max(0, Math.min(100, 100 * (1 - (resetAt - Date.now()) / windowMs))) : null;
+      // A reset already in the past means the reading is stale, not that the window is used up.
+      const elapsed = Number.isFinite(resetAt) && resetAt > Date.now() && windowMs > 0 ?Math.max(0, Math.min(100, 100 * (1 - (resetAt - Date.now()) / windowMs))) : null;
       const elapsedText = elapsed == null ? '' : ` · ${Math.round(elapsed)}% of window elapsed`;
       return { ...reading, percent, elapsed, detail: `${reading.account}: ${Math.round(percent)}%${elapsedText}${reset}` };
     });
