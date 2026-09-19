@@ -704,6 +704,49 @@ test('isolated browser: the console is usable on a 412px touch screen',
         + " && !(history.state && history.state.keepOverlay)"
         + " && document.querySelector('#triage').classList.contains('on')");
 
+      // A sheet left open covers the stage (it is strictly above it in the
+      // stack), so a tap that only pushed the stage under it showed the row
+      // nobody could see, and the first Back dropped an invisible entry. The
+      // sheet goes the way its own Back takes it.
+      await evaluate("document.querySelector('.mobile-filter').click()");
+      await wait("document.querySelector('#mobileFilterSheet').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'filter'");
+      await evaluate("window.keepShellReceive({ type: 'notificationClick', key: 'q-2' })");
+      await settle("document.documentElement.classList.contains('mobile-stage-open')"
+        + " && document.querySelector('#stage').dataset.itemKey === 'q-2'");
+      assert.equal(await evaluate("document.querySelector('#mobileFilterSheet').classList.contains('on')"), false,
+        'the sheet that was covering the stage is gone');
+      assert.equal(await evaluate("Boolean(document.elementFromPoint(206, 500)?.closest('#mobileFilterSheet'))"), false,
+        'and nothing of it is left over the row the notification named');
+      assert.equal(await evaluate("Boolean(document.elementFromPoint(206, 500)?.closest('#stage'))"), true,
+        'the stage is what the middle of the screen shows');
+      assert.equal(await evaluate("document.querySelector('.mobile-stagebar-title').textContent"), 'Second in the queue',
+        'the back bar names the row that was tapped');
+      assert.equal(await evaluate('history.state && history.state.keepOverlay'), 'stage',
+        'the stage owns the entry, and it is the only one left');
+      await evaluate('history.back()');
+      await settle("!document.documentElement.classList.contains('mobile-stage-open')"
+        + " && !(history.state && history.state.keepOverlay)"
+        + " && document.querySelector('#qlist .qitem.sel')?.dataset.key === 'waiting:q-2'");
+
+      // The same for the status sheet, opened over Focus's own stage: the sheet
+      // goes, the tap leaves Focus, and what is left is one stage with one entry.
+      await evaluate("document.querySelector('#triage .queue .qfocus').click()");
+      await wait("document.documentElement.classList.contains('mobile-stage-open')");
+      await evaluate("document.querySelector('.mobile-status').click()");
+      await wait("document.querySelector('#mobileStatusSheet').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'status'");
+      await evaluate("window.keepShellReceive({ type: 'notificationClick', key: 'q-3' })");
+      await settle("document.querySelector('#stage').dataset.itemKey === 'q-3'"
+        + " && !document.querySelector('#mobileStatusSheet').classList.contains('on')");
+      assert.equal(await evaluate("document.documentElement.classList.contains('mobile-stage-open')"), true,
+        'the stage the tap asked for is on screen');
+      assert.equal(await evaluate('history.state && history.state.keepOverlay'), 'stage',
+        'with one entry of its own, not the sheet it replaced');
+      await evaluate('history.back()');
+      await settle("!document.documentElement.classList.contains('mobile-stage-open')"
+        + " && !(history.state && history.state.keepOverlay)");
+
       // The order the phone actually delivers: the tap lands while a state reload
       // is already in flight, before its `data` has been applied.
       await evaluate("document.querySelector('#qlist [data-key=\"waiting:q-1\"]').click()");

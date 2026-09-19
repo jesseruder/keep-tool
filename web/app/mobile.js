@@ -359,6 +359,19 @@ export function mobileActive() { return active; }
 // it would only make the next Back a dead press.
 export function openMobileStage() {
   if (!active || ctx.state.mode !== 'triage' || !ctx.state.currentItem) return;
+  // Whatever the phone was left with open covers the stage: a sheet, the inbox,
+  // a row's actions menu. The stage has to be the screen, and it is strictly
+  // under them in the stack, so they go first — the way their own Back would
+  // take them. Leaving them up hid the row the notification named behind a
+  // sheet, and made the first Back a press with nothing to show for it.
+  const covering = overlays.length && !(overlays.length === 1 && overlays[0].name === 'stage');
+  if (covering) {
+    const gone = overlays.splice(0);
+    const pops = gone.filter((entry) => entry.pushed).length;
+    dropped(gone);
+    sync();
+    if (pops) { pendingStage = true; rewind(pops); return; }
+  }
   // A tap rarely lands on Triage: coming back to it gives up the tab's entry,
   // and that rewind is still in flight here. Pushing the stage over it would
   // leave the stack naming an entry the traversal is about to move off — and
