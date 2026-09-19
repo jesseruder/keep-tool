@@ -68,6 +68,16 @@ work while the worker drives; it must not also click, type, navigate, or rotate
 that same target. On escalation, have the worker stop and return the current state
 before another agent takes control. Reuse the worker for related follow-ups.
 
+**Browser Bridge is the browser.** Every Claude Code and Codex session on this Mac
+has the `browser` MCP server (`~/keep-tool/browser-bridge`, one shared daemon driving
+Jesse's Edge). Its tools mirror Claude in Chrome: call `tabs_context_mcp` first, then
+`navigate`, `computer`, `read_page`, `find`, `form_input`, `gif_creator` and the rest.
+Each session gets its own Edge tab group and tab-scoped tools refuse tab ids from other
+groups. A subagent shares its parent's MCP connection, so a UI worker drives the
+parent's tab group: hand it the tab id from `tabs_context_mcp`, not a URL to reopen.
+Claude in Chrome and the Codex Chrome plugin are switched off and should stay off
+beside it; they would give the model a second, account-bound copy of the same tools.
+
 ## Handoff and results
 
 Supply the objective, starting state, target browser/device, required flow,
