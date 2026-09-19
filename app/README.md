@@ -8,8 +8,9 @@ daemon; each teammate enters their own server address and access token.
 The app is a shell around the Keep web console rather than a second interface over
 the same API. Three screens, on a React Navigation native stack:
 
-- **Setup** — server URL, token, and palette, saved in AsyncStorage. Reachable again
-  from the gear in the console screen's top bar.
+- **Setup** — server URL, token, and palette, saved in AsyncStorage, plus the push
+  registration state with a Retry and **Forget this server**. Reachable again from
+  the gear in the console screen's top bar.
 - **Console** — a `react-native-webview` holding the console itself. This is where
   everything happens.
 - **Terminal** — the native terminal, reached only when the console asks for it. The
@@ -49,8 +50,8 @@ reload in a loop. `decideBootstrap` in `src/bridge.js` is the whole rule as a pu
 function, and `bridge.test.js` drives the adversarial sequence through it. Nothing
 else in the app stores or reads the cookie.
 
-The native side still sends `x-keep-token` for the two things it does itself: the
-setup connection check and the 15-minute background sweep.
+The native side still sends `x-keep-token` for the three things it does itself: the
+setup connection check, push registration, and the background sweep.
 
 ### Terminal
 
@@ -164,6 +165,73 @@ the sweep's `kind:sessionId:since` and the session id travels with it.
 
 `src/bridge.js` holds all of this as pure functions — URL, injected scripts, parser,
 dispatch table — and `src/bridge.test.js` covers them with plain `node --test`.
+
+A message for a console that has not said `ready` yet has nowhere to go —
+`window.keepShellReceive` does not exist, and the injection is swallowed — so the
+shell holds the last five and hands them over as soon as the console announces
+itself. That is the ordinary case for a notification tapped from a cold start.
+
+### Push
+
+The phone registers itself with the daemon and is pushed to through Expo.
+`src/push.js` is the whole rule as pure functions — the Expo calls (permission, the
+token) and the HTTP client are injected by `App.js` — and `src/push.test.js` drives
+it with a fake api and a fake AsyncStorage.
+
+**Registration.** On every launch with a saved config, and again when Setup saves
+one: ask for notification permission, get an Expo push token for the EAS project id
+in `extra.eas.projectId`, and `POST /api/devices`:
+
+```json
+{ "expoPushToken": "ExponentPushToken[…]", "platform": "android",
+  "name": "android phone", "appVersion": "1.0.0" }
+```
+
+`name` would be the device's model if `expo-device` were a dependency; it is not, so
+it is the platform. The daemon keys devices by the token, so re-registering the same
+one refreshes it rather than adding a row.
+
+`{token, registeredAt, server}` is kept in AsyncStorage under
+`@keep/pushRegistration`, and `shouldRegister` re-registers when the token has
+rotated, when the server address is a different one, or when the record is a day
+old — otherwise an ordinary launch costs no request at all. Setup's **Retry** forces
+it. A refused permission clears the record and unregisters the phone from the daemon;
+a phone that cannot show a notification should not be collecting pushes. Nothing here logs the token, and only its last six characters are
+ever displayed.
+
+**Moving on.** Connecting to a different server, or **Forget this server**, sends
+`DELETE /api/devices` to the daemon being left, best effort, with the config that is
+being replaced — it is the only thing that can still authenticate the removal.
+
+**The tap.** A push carries `data: {key, sessionId}`, where `key` is the console's
+own attention key or `alert:<id>`. Foreground, background and cold start all end at
+the same place: `{type:'notificationClick', key}` through the bridge, queued if the
+console is not up yet, and the console selects that row or opens that message.
+
+**One notification, not two.** The console raises its own notification for a row that
+starts waiting, and `bin/attention-push.js` pushes the same rows from the daemon. So
+once registration has succeeded the shell stops turning the console's `notify` into a
+local notification — for attention rows. An `alert:<id>` is not dropped, because it
+only reaches the phone if the operator put `expo` in `KEEP_ALERT_CHANNELS`; those are
+deduped by key instead, and so is a push that arrives while the app is open. The
+keys match exactly: `attention-push.js` mirrors the console's own spelling.
+
+**The sweep.** The 15-minute background sweep (`expo-background-task`, raising local
+notifications from `/api/state?view=notifications`) is the fallback for a phone push
+cannot reach. It is unregistered as soon as registration succeeds, and registered
+again when permission is denied or no token can be had — a pass the OS had already
+scheduled checks the same flag before it notifies. A *failed* registration is not the
+same as no registration: a launch with no network, or a daily refresh the daemon
+missed, keeps the phone registered and the sweep off, because the device is still on
+the daemon's list and running both is what buzzes twice. Only a token that has
+rotated away from what the daemon holds turns the sweep back on. The once-per-launch
+baseline pass runs either way, recording what is already waiting without
+announcing it, so if the sweep ever does take over it does not fire for the backlog.
+
+**The badge.** The push carries `badge` and the system applies it while the app is
+away. In the app the console's `{type:'badge'}` is the source of truth; returning to
+the foreground forgets what was last applied, so the console's next badge message
+wins whatever the launcher was left showing.
 
 From the repository root:
 

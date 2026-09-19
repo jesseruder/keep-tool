@@ -1,17 +1,47 @@
 import React, { useState } from 'react';
-import { KeyboardAvoidingView, Platform, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
+import { Alert, KeyboardAvoidingView, Platform, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 
 import { PALETTES } from '../../theme';
 import { normalizeServer, ping } from '../api';
 import { Button, InlineError } from '../ui';
 
+const { pushStatusLine } = require('../push');
+
 const DEFAULT_SERVER = 'http://your-computer:7777';
 
-export default function Setup({ initialConfig, onCancel, onConnected, onDiagnostics, onPalette, paletteId, scheme, styles }) {
+export default function Setup({ initialConfig, onCancel, onConnected, onDiagnostics, onForget, onPalette, onRetryPush, paletteId, push, scheme, styles }) {
   const [server, setServer] = useState(initialConfig?.server || '');
   const [token, setToken] = useState(initialConfig?.token || '');
   const [connecting, setConnecting] = useState(false);
+  const [retryingPush, setRetryingPush] = useState(false);
   const [error, setError] = useState(null);
+
+  const retryPush = async () => {
+    if (!onRetryPush || retryingPush) return;
+    setRetryingPush(true);
+    try { await onRetryPush(); }
+    finally { setRetryingPush(false); }
+  };
+
+  const forget = () => {
+    Alert.alert(
+      'Forget this server?',
+      'The saved address and token go, and this phone stops receiving notifications from it.',
+      [
+        { style: 'cancel', text: 'Cancel' },
+        {
+          style: 'destructive',
+          text: 'Forget',
+          onPress: () => {
+            setServer('');
+            setToken('');
+            setError(null);
+            Promise.resolve(onForget && onForget()).catch(() => {});
+          },
+        },
+      ],
+    );
+  };
 
   const connect = async () => {
     const config = { server: normalizeServer(server), token: token.trim() };
@@ -44,6 +74,26 @@ export default function Setup({ initialConfig, onCancel, onConnected, onDiagnost
         <Text style={styles.inputLabel}>Token</Text>
         <TextInput autoCapitalize="none" autoCorrect={false} onChangeText={setToken} onSubmitEditing={connect} placeholder="Keep access token" placeholderTextColor={styles.colors.faint} secureTextEntry style={styles.input} value={token} />
 
+        {initialConfig ? (
+          <>
+            <Text style={styles.inputLabel}>Notifications</Text>
+            <View style={styles.pushRow}>
+              <Text style={styles.pushState}>{pushStatusLine(push)}</Text>
+              {onRetryPush ? (
+                <Pressable
+                  accessibilityLabel="Retry push registration"
+                  accessibilityRole="button"
+                  disabled={retryingPush}
+                  onPress={retryPush}
+                  style={({ pressed }) => [styles.pushRetry, (pressed || retryingPush) && styles.pressed]}
+                >
+                  <Text style={styles.pushRetryText}>{retryingPush ? 'Retrying…' : 'Retry'}</Text>
+                </Pressable>
+              ) : null}
+            </View>
+          </>
+        ) : null}
+
         <Text style={styles.inputLabel}>Palette · follows system appearance</Text>
         <View style={styles.paletteList}>
           {PALETTES.map((palette) => {
@@ -66,6 +116,11 @@ export default function Setup({ initialConfig, onCancel, onConnected, onDiagnost
           {initialConfig ? <Button onPress={onCancel} quiet style={styles.setupAction} styles={styles}>Cancel</Button> : null}
           <Button loading={connecting} onPress={connect} style={styles.setupAction} styles={styles}>Connect</Button>
         </View>
+        {initialConfig && onForget ? (
+          <View style={styles.setupActions}>
+            <Button onPress={forget} quiet style={styles.setupAction} styles={styles} textStyle={styles.forgetText}>Forget this server</Button>
+          </View>
+        ) : null}
       </ScrollView>
     </KeyboardAvoidingView>
   );

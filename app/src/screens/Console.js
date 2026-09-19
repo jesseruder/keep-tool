@@ -61,6 +61,9 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
   const bootstrapRef = useRef(bootstrapState());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // Bumped by every `ready`. The shell holds messages for a console that is not up
+  // yet, and this is what tells it to hand them over.
+  const [readyTick, setReadyTick] = useState(0);
   // Every load of the WebView is a bootstrap: the source is always the `?token=`
   // URL, so remounting is how the shell asks the daemon for a fresh session.
   const [bootstrapKey, setBootstrapKey] = useState(0);
@@ -116,8 +119,11 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
 
   useEffect(() => { triggerRef.current = trigger; }, [trigger]);
 
+  // A page that has not said `ready` has no `window.keepShellReceive`, so the
+  // injection would be swallowed without a trace — which is exactly the cold start a
+  // notification tap arrives in. Refusing here is what makes the shell queue it.
   const send = useCallback((message) => {
-    if (!webRef.current) return false;
+    if (!webRef.current || !readyRef.current) return false;
     webRef.current.injectJavaScript(shellReceiveScript(message));
     return true;
   }, []);
@@ -139,7 +145,7 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
   useEffect(() => {
     registerConsole({ send, reload, hardReload });
     return () => registerConsole(null);
-  }, [hardReload, registerConsole, reload, send]);
+  }, [hardReload, readyTick, registerConsole, reload, send]);
 
   // Sessions live in the daemon's memory alone, so a long spell in the background is
   // reason enough to expect the session to be gone by the time the app is back.
@@ -178,6 +184,7 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
         if (graceRef.current) clearTimeout(graceRef.current);
         setLoading(false);
         setError(null);
+        setReadyTick((value) => value + 1);
       },
       // The daemon answered a real request: the session is good, once per page load.
       authenticated: () => trigger('authenticated'),

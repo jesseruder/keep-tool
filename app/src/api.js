@@ -64,6 +64,16 @@ export async function request(config, path, options = {}) {
 // a stale token fails here rather than as a blank WebView.
 export const ping = (config) => request(config, '/api/state?view=notifications');
 
+// Push registration. The body is `{ expoPushToken, platform, name, appVersion }`;
+// the daemon keys devices by the token, so re-registering the same one refreshes it
+// rather than adding a row. `src/push.js` decides when either of these runs.
+export const registerDevice = (config, body) => request(config, '/api/devices', {
+  method: 'POST', body, timeoutMs: 8000,
+});
+export const unregisterDevice = (config, expoPushToken) => request(config, '/api/devices', {
+  method: 'DELETE', body: { expoPushToken }, timeoutMs: 8000,
+});
+
 // Terminals address either an agent session or a bare shell pane; `target` is
 // { sessionId } or { pane }, and the daemon rejects the mixture of both.
 export const send = (config, target, text) => request(config, '/api/send', {

@@ -2,11 +2,12 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DarkTheme, DefaultTheme, NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import * as BackgroundTask from 'expo-background-task';
+import Constants from 'expo-constants';
 import * as Notifications from 'expo-notifications';
 import { StatusBar } from 'expo-status-bar';
 import * as TaskManager from 'expo-task-manager';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Platform, View, useColorScheme } from 'react-native';
+import { ActivityIndicator, AppState, Platform, View, useColorScheme } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { DEFAULT_PALETTE, themeFor } from './theme';
@@ -16,6 +17,8 @@ import Setup from './src/screens/Setup';
 import Spike from './src/screens/Spike';
 import Terminal from './src/screens/Terminal';
 import { makeStyles } from './src/ui';
+
+const push = require('./src/push');
 
 const CONFIG_KEY = '@keep/config';
 const NOTIFIED_ATTENTION_KEY = '@keep/notifiedAttention';
@@ -57,7 +60,9 @@ function attentionNotificationContent(item) {
     sound: 'default',
     // The sweep has no key of the console's own, so a tap carries the key it builds
     // plus the session id; the console resolves whichever of the two it knows.
-    data: { key: attentionNotificationKey(item), sessionId: item.sessionId || null },
+    // `local` marks what this app scheduled itself: the notification handler shows
+    // those without asking, because the dedupe happened before they were scheduled.
+    data: { key: attentionNotificationKey(item), local: true, sessionId: item.sessionId || null },
   };
 }
 
@@ -153,11 +158,21 @@ try {
     try {
       const savedConfig = await AsyncStorage.getItem(CONFIG_KEY);
       const config = savedConfig ? JSON.parse(savedConfig) : null;
+      // The daemon pushes the same rows to a registered phone, so a sweep that ran
+      // anyway would notify twice. The task is unregistered when registration
+      // succeeds; this is the guard for a pass the OS had already scheduled.
+      if (push.isPushActive(await push.readRegistration(AsyncStorage), config?.server)) {
+        return BackgroundTask.BackgroundTaskResult.Success;
+      }
       const swept = await sweepAttention(config, { background: true });
       return swept ? BackgroundTask.BackgroundTaskResult.Success : BackgroundTask.BackgroundTaskResult.Failed;
     } catch { return BackgroundTask.BackgroundTaskResult.Failed; }
   });
 } catch {}
+
+// Keys announced recently, by either side. `data.local` marks the notifications this
+// app scheduled itself, which have already been through the rule below.
+const announced = new Map();
 
 let notificationSetup = false;
 async function setupNotifications() {
@@ -165,13 +180,20 @@ async function setupNotifications() {
   notificationSetup = true;
   try {
     Notifications.setNotificationHandler({
-      handleNotification: async () => ({
-        shouldShowBanner: true,
-        shouldShowList: true,
-        shouldShowAlert: true,
-        shouldPlaySound: true,
-        shouldSetBadge: false,
-      }),
+      handleNotification: async (notification) => {
+        const data = notification?.request?.content?.data || {};
+        // A push that arrives while the app is open, for something the console has
+        // already announced, is shown once. Ours are let through unexamined: they
+        // claimed their key when they were scheduled.
+        const show = data.local === true || push.claimNotification(announced, data.key);
+        return {
+          shouldShowBanner: show,
+          shouldShowList: show,
+          shouldShowAlert: show,
+          shouldPlaySound: show,
+          shouldSetBadge: false,
+        };
+      },
     });
   } catch {}
   if (Platform.OS === 'android') {
@@ -182,8 +204,43 @@ async function setupNotifications() {
       });
     } catch {}
   }
-  try { await Notifications.requestPermissionsAsync(); }
-  catch {}
+}
+
+// Permission is asked for once, by the registration pass — push and the sweep's own
+// local notifications need the same grant, so a phone that cannot register still
+// ends up able to show what the sweep finds.
+async function ensureNotificationPermission() {
+  try {
+    const current = await Notifications.getPermissionsAsync();
+    if (current?.granted || current?.status === 'granted') return 'granted';
+    if (current?.canAskAgain === false) return 'denied';
+    const asked = await Notifications.requestPermissionsAsync();
+    return asked?.granted || asked?.status === 'granted' ? 'granted' : 'denied';
+  } catch { return 'denied'; }
+}
+
+// The EAS project the token is minted for. A build without one — a bare Expo Go run —
+// cannot get a push token at all, and says so on Setup rather than failing silently.
+function easProjectId() {
+  return Constants.expoConfig?.extra?.eas?.projectId
+    || Constants.easConfig?.projectId
+    || '';
+}
+
+async function expoPushToken() {
+  const projectId = easProjectId();
+  if (!projectId) throw new Error('this build has no EAS project id');
+  const result = await Notifications.getExpoPushTokenAsync({ projectId });
+  return result?.data || '';
+}
+
+// The 15-minute sweep is the fallback for a phone push cannot reach. It is kept, not
+// deleted, so a denied permission or an unreachable daemon still notifies.
+async function applySweepTask(enabled) {
+  try {
+    if (enabled) await BackgroundTask.registerTaskAsync(ATTENTION_SWEEP_TASK, { minimumInterval: 15 });
+    else await BackgroundTask.unregisterTaskAsync(ATTENTION_SWEEP_TASK);
+  } catch {}
 }
 
 // The console owns the count; the shell only forwards changes to the launcher.
@@ -195,7 +252,13 @@ async function applyBadge(count) {
   catch {}
 }
 
+// The console raises its own notification for a row that starts waiting, and
+// `bin/attention-push.js` pushes the same rows from the daemon. `shouldNotifyLocally`
+// is the rule for which of the two this phone actually shows.
+let pushIsLive = false;
+
 async function notifyFromConsole(message) {
+  if (!push.shouldNotifyLocally(announced, { key: message.key, pushActive: pushIsLive })) return;
   await setupNotifications();
   try {
     await Notifications.scheduleNotificationAsync({
@@ -203,7 +266,7 @@ async function notifyFromConsole(message) {
         title: message.title,
         body: message.body,
         sound: 'default',
-        ...(message.key ? { data: { key: message.key } } : {}),
+        data: { local: true, ...(message.key ? { key: message.key } : {}) },
       },
       trigger: { channelId: 'attention' },
     });
@@ -238,6 +301,7 @@ function KeepShell() {
   const styles = useMemo(() => makeStyles(colors), [colors]);
   const [booting, setBooting] = useState(true);
   const [config, setConfig] = useState(null);
+  const [pushState, setPushState] = useState({ status: 'idle', sweep: true });
   const consoleRef = useRef(null);
   // A notification tapped from a cold start arrives before the WebView exists, so
   // the message waits here until the console registers itself.
@@ -278,22 +342,61 @@ function KeepShell() {
     for (const message of queued) instance.send(message);
   }, []);
 
-  // Notifications, the background sweep, and the once-per-launch baseline. The
-  // baseline records what is already waiting without announcing it, so the first
-  // sweep after a fresh install does not fire for the whole backlog.
+  // Registration: on every launch with a saved config, and again when Setup saves
+  // one. `force` is Setup's Retry, which re-registers even when the record is fresh.
+  const syncPush = useCallback(async (target, { force = false } = {}) => {
+    const next = await push.syncRegistration({
+      appVersion: Constants.expoConfig?.version || Constants.nativeAppVersion || '',
+      config: target,
+      force,
+      getToken: expoPushToken,
+      permission: ensureNotificationPermission,
+      platform: Platform.OS,
+      post: api.registerDevice,
+      remove: api.unregisterDevice,
+      storage: AsyncStorage,
+    });
+    pushIsLive = next.status === 'registered';
+    setPushState(next);
+    await applySweepTask(next.sweep);
+    return next;
+  }, []);
+
+  // Notifications, registration, the background sweep, and the once-per-launch
+  // baseline. The baseline runs whether or not push is live: it records what is
+  // already waiting without announcing it, so if registration ever fails later the
+  // sweep that takes over does not fire for the whole backlog.
   useEffect(() => {
     if (!config) return;
     let cancelled = false;
     (async () => {
       await setupNotifications();
       if (cancelled) return;
-      try { await BackgroundTask.registerTaskAsync(ATTENTION_SWEEP_TASK, { minimumInterval: 15 }); }
+      try { await syncPush(config); }
       catch {}
+      if (cancelled) return;
       try { await sweepAttention(config, { baseline: true }); }
       catch {}
     })();
     return () => { cancelled = true; };
-  }, [config]);
+  }, [config, syncPush]);
+
+  // The launcher badge can be moved behind the app's back by a push that arrived
+  // while it was away, so coming back to the foreground forgets what was applied and
+  // the console's next `badge` message wins.
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (next) => {
+      if (next !== 'active') return;
+      lastBadgeCount = null;
+      // Pushes delivered while the app was away were shown by the system, with
+      // nothing running to record them. Claiming what is still in the tray keeps the
+      // console from announcing the same rows a second time now that it is back.
+      Notifications.getPresentedNotificationsAsync().then((shown) => {
+        for (const item of shown || []) push.claimNotification(announced, item?.request?.content?.data?.key);
+      }).catch(() => {});
+    });
+    return () => subscription.remove();
+  }, []);
 
   useEffect(() => {
     const deliver = (response) => {
@@ -310,10 +413,30 @@ function KeepShell() {
   }, [toConsole]);
 
   const saveConfig = useCallback(async (next) => {
+    // Moving to another server: the old daemon still holds this phone, and only the
+    // config being replaced can authenticate the removal, so it happens here.
+    if (config?.server && api.normalizeServer(config.server) !== api.normalizeServer(next.server)) {
+      await push.unregisterDevice({ config, remove: api.unregisterDevice, storage: AsyncStorage });
+      pushIsLive = false;
+    }
     await AsyncStorage.setItem(CONFIG_KEY, JSON.stringify(next));
     lastBadgeCount = null;
     setConfig(next);
-  }, []);
+  }, [config]);
+
+  // Forget: unregister from the daemon best-effort, then drop the config. The sweep
+  // goes with it — there is no server left for it to read.
+  const forgetConfig = useCallback(async () => {
+    if (config) await push.unregisterDevice({ config, remove: api.unregisterDevice, storage: AsyncStorage });
+    pushIsLive = false;
+    await applySweepTask(false);
+    try { await AsyncStorage.multiRemove([CONFIG_KEY, NOTIFIED_ATTENTION_KEY, BACKGROUND_ATTENTION_ETAG_KEY, BACKGROUND_ATTENTION_STATE_KEY]); }
+    catch {}
+    lastBadgeCount = null;
+    applyBadge(0);
+    setPushState({ status: 'idle', sweep: true });
+    setConfig(null);
+  }, [config]);
 
   const changePalette = useCallback((next) => {
     setPaletteId(next);
@@ -405,8 +528,15 @@ function KeepShell() {
                   else nav.replace('Console');
                 }}
                 onDiagnostics={() => nav.navigate('Spike')}
+                onForget={async () => {
+                  await forgetConfig();
+                  // The Console screen underneath has no server left to load.
+                  nav.reset({ index: 0, routes: [{ name: 'Setup' }] });
+                }}
                 onPalette={changePalette}
+                onRetryPush={config ? () => syncPush(config, { force: true }) : undefined}
                 paletteId={paletteId}
+                push={pushState}
                 scheme={scheme}
                 styles={styles}
               />
