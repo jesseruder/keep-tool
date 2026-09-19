@@ -32,3 +32,4 @@ app/dist/
 
 test-results/
 playwright-report/
+app/google-services.json

@@ -10,8 +10,16 @@ module.exports = ({ config }) => {
   const androidPackage = process.env.KEEP_ANDROID_PACKAGE || local.androidPackage;
   const iosBundleIdentifier = process.env.KEEP_IOS_BUNDLE_IDENTIFIER || local.iosBundleIdentifier;
   // Android push needs the Firebase config for this package. The file holds API keys,
-  // so it lives outside the repository (next to mobile.json) and is only referenced.
-  const googleServicesFile = process.env.KEEP_GOOGLE_SERVICES_FILE || local.googleServicesFile;
+  // so it lives outside the repository (next to mobile.json). Expo serializes this
+  // field into the app's public config asset, so the build machine's absolute path
+  // must not be the value: the file is copied to an ignored spot beside this config
+  // and referenced by that relative path instead.
+  const googleServicesSource = process.env.KEEP_GOOGLE_SERVICES_FILE || local.googleServicesFile;
+  let googleServicesFile = '';
+  if (googleServicesSource && fs.existsSync(googleServicesSource)) {
+    fs.copyFileSync(googleServicesSource, path.join(__dirname, 'google-services.json'));
+    googleServicesFile = './google-services.json';
+  }
   if (process.env.EAS_BUILD === 'true') {
     const platform = process.env.EAS_BUILD_PLATFORM;
     if ((platform === 'android' && !androidPackage) || (platform === 'ios' && !iosBundleIdentifier)) {
