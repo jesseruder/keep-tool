@@ -89,6 +89,12 @@ function openPaneSocket(options = {}) {
   let closed = false;
   let retry = 0;
   let retryTimer = null;
+  // Two flags, not one. `replayEnded` says the replay frames are all in hand, which
+  // is the moment live output starts; `replayDone` says the parser has caught up,
+  // which is when input may be sent. They are not the same instant, and a frame that
+  // arrives in between is live output — routing it through the replay path would
+  // hand it to a consumer that is not tracking what it changed.
+  let replayEnded = false;
   let replayDone = false;
   let reportedVisible;
   let subscription = null;
@@ -123,6 +129,7 @@ function openPaneSocket(options = {}) {
 
   const connect = () => {
     if (closed) return;
+    replayEnded = false;
     replayDone = false;
     clearAttachTimer();
     status(retry === 0 ? 'connecting' : 'reconnecting');
@@ -153,25 +160,31 @@ function openPaneSocket(options = {}) {
     connection.onmessage = (event) => {
       if (socket !== connection) return;
       const kind = classifyFrame(event.data);
-      if (kind === 'binary') {
-        const bytes = toBytes(event.data);
-        if (replayDone) { onData && onData(bytes); } else { onReplay && onReplay(bytes); }
-        if (replayDone) markHealthy();
-        return;
-      }
-      if (kind === 'text') {
-        if (replayDone) { onData && onData(event.data); } else { onReplay && onReplay(event.data); }
-        if (replayDone) markHealthy();
+      if (kind === 'binary' || kind === 'text') {
+        const data = kind === 'binary' ? toBytes(event.data) : event.data;
+        if (replayEnded) {
+          onData && onData(data);
+          markHealthy();
+        } else {
+          onReplay && onReplay(data);
+        }
         return;
       }
       const message = parseFrame(event.data);
       if (!message) return;
       if (message.t === 'attached') {
         clearAttachTimer();
+        replayEnded = false;
         replayDone = false;
         reportVisibility(currentlyVisible(), true);
         onAttached && onAttached(message);
       } else if (message.t === 'replay-end') {
+        // From this frame on everything is live output, even though the parser has
+        // not finished the replay: the drain below only covers writes queued before
+        // it, so anything routed to onReplay after this point would be parsed after
+        // the consumer had already repainted and would sit on screen unseen until
+        // the next byte arrived — which, on a waiting agent, is never.
+        replayEnded = true;
         whenDrained(() => {
           if (socket !== connection || closed) return;
           replayDone = true;

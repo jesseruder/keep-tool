@@ -36,13 +36,15 @@ const DEFAULT_FONT_SIZE = 9;
 const CELL_WIDTH_EM = 0.6;
 const LINE_HEIGHT_EM = 1.3;
 const BODY_PADDING = 8;
-// How much of the pane's own scrollback the emulator keeps. The attach snapshot
-// carries 100 lines, "load earlier output" reattaches for the lot.
-const EMULATOR_SCROLLBACK = 20000;
+// How much of the pane's own scrollback the emulator keeps, and how much of it the
+// screen holds on to. Both match the daemon: bin/host.js keeps 10,000 lines per pane
+// and bin/console.js's `history=full` snapshot sends up to the same, so "load earlier
+// output" cannot arrive with more than either of these can hold.
+const EMULATOR_SCROLLBACK = 10000;
+const MAX_CACHED_SCROLLBACK = 10000;
 // Rows above the screen that are actually mounted. Every one is a native view, so
 // the window grows on request rather than rendering a whole buffer nobody scrolled to.
 const SCROLLBACK_PAGE = 300;
-const MAX_CACHED_SCROLLBACK = 5000;
 const FRAME_MS = 33;
 const REPEAT_MS = 110;
 // What the hidden input is held at, so that a backspace on an otherwise empty field
@@ -144,8 +146,8 @@ function makeStyles(colors) {
 
 // One parsed row. Memoized on the row object, which the paint step only replaces for
 // rows the parser actually touched, so a spinner repaints one line and not the screen.
-const Row = React.memo(function Row({ cursorX, cursorUnderline, fontSize, lineHeight, onCopy, onPress, row, styles, theme }) {
-  const segments = rowSegments(row, cursorX);
+const Row = React.memo(function Row({ cursor, cursorUnderline, fontSize, lineHeight, onCopy, onPress, row, styles, theme }) {
+  const segments = rowSegments(row, cursor);
   const text = { fontSize, lineHeight };
   const body = segments.length === 0
     ? ' '
@@ -232,8 +234,11 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
   const inputRef = useRef(null);
   const scrollRef = useRef(null);
   const followRef = useRef(true);
-  const scrollbackRef = useRef({ seq: 0, rows: [] });
-  const scrolledRef = useRef(0);
+  const scrollbackRef = useRef({ seq: 0, rows: [], sliding: false });
+  // The mounted window, as a ref as well, because the paint step runs off a timer
+  // and must read the current one rather than the one its closure was made with.
+  const windowRef = useRef(SCROLLBACK_PAGE);
+  const scrollbackStaleRef = useRef(false);
   const modifiersRef = useRef(modifiers);
   const fontRef = useRef(DEFAULT_FONT_SIZE);
   const toastTimer = useRef(null);
@@ -282,6 +287,52 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
     return () => controller.abort();
   }, [config, target?.pane, target?.session]);
 
+  // Everything the mounted scrollback rows are read from, in one place: the append
+  // path while the emulator's buffer still has room, and a straight read of the
+  // mounted window once it is full. Once the buffer is dropping its oldest line for
+  // every new one, what was collected earlier is no longer contiguous with what is on
+  // screen, and appending to it would show the reader a seam without saying so.
+  const syncScrollback = useCallback((emulator, window) => {
+    if (emulator.isAlternate()) return;
+    const { length, saturated } = emulator.normalScrollback();
+    const cache = scrollbackRef.current;
+    if (saturated) {
+      const want = Math.max(SCROLLBACK_PAGE, window);
+      const rows = emulator.scrollbackRows(want, want);
+      // These rows are a window onto a buffer that slides under them, so a key can
+      // only be a position in the window; nothing here is the same line it was a
+      // moment ago. The prefix keeps them from ever colliding with the collected
+      // rows' keys, which are positions in the pane's output.
+      scrollbackRef.current = {
+        seq: length, rows: rows.map((row, index) => ({ key: `sbw:${index}`, row })), sliding: true,
+      };
+      setScrollback(scrollbackRef.current.rows);
+      return;
+    }
+    if (cache.sliding) {
+      // The buffer is back under its limit, which only a reset does, and its lines are
+      // numbered from zero again; start collecting from there.
+      scrollbackRef.current = { seq: 0, rows: [], sliding: false };
+      setScrollback([]);
+    }
+    const held = scrollbackRef.current;
+    const grown = length - (held.seq + held.rows.length);
+    if (grown <= 0) return;
+    const added = emulator.scrollbackRows(grown, grown).map((row, index) => ({
+      key: `sb:${held.seq + held.rows.length + index}`,
+      row,
+    }));
+    let next = [...held.rows, ...added];
+    let seq = held.seq;
+    if (next.length > MAX_CACHED_SCROLLBACK) {
+      const dropped = next.length - MAX_CACHED_SCROLLBACK;
+      next = next.slice(dropped);
+      seq += dropped;
+    }
+    scrollbackRef.current = { seq, rows: next, sliding: false };
+    setScrollback(next);
+  }, []);
+
   // One paint: the rows the parser touched since the last frame, plus everything the
   // cursor and the scrollback need. `rows()` is only called for those rows, so an
   // idle pane costs a timer and nothing else.
@@ -305,45 +356,29 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
 
     const nextCursor = emulator.cursor();
     setCursor((current) => (current.x === nextCursor.x && current.y === nextCursor.y
-      && current.visible === nextCursor.visible ? current : nextCursor));
+      && current.visible === nextCursor.visible && current.offset === nextCursor.offset
+      && current.length === nextCursor.length ? current : nextCursor));
     setAlternate(emulator.isAlternate());
 
-    // A line that scrolled off the top will never change again, so it is read once
-    // and kept. How many did is counted rather than measured, because the emulator's
-    // own scrollback saturates and its length would stop growing under a long build
-    // log while output kept scrolling. The alternate screen has no scrollback of its
-    // own and must not disturb the normal buffer's, so it is left alone entirely.
-    if (emulator.isAlternate()) return;
-    const scrolled = emulator.scrolledLines();
-    const cache = scrollbackRef.current;
-    const grown = Math.min(
-      scrolled - scrolledRef.current,
-      emulator.scrollbackLength(),
-      MAX_CACHED_SCROLLBACK,
-    );
-    scrolledRef.current = scrolled;
-    if (grown <= 0) return;
-    const added = emulator.scrollbackRows(grown, grown).map((row, index) => ({
-      key: `sb:${cache.seq + cache.rows.length + index}`,
-      row,
-    }));
-    let next = [...cache.rows, ...added];
-    let seq = cache.seq;
-    if (next.length > MAX_CACHED_SCROLLBACK) {
-      const dropped = next.length - MAX_CACHED_SCROLLBACK;
-      next = next.slice(dropped);
-      seq += dropped;
+    // A saturated buffer has to be re-read rather than added to, and re-reading the
+    // mounted window on every frame of a build log would be the most expensive thing
+    // on screen. While the reader is following the output the rows above are off the
+    // screen, so the read waits until they scroll up (onScroll does it then).
+    if (emulator.normalScrollback().saturated && followRef.current) {
+      scrollbackStaleRef.current = true;
+      return;
     }
-    scrollbackRef.current = { seq, rows: next };
-    setScrollback(next);
-  }, []);
+    scrollbackStaleRef.current = false;
+    syncScrollback(emulator, windowRef.current);
+  }, [syncScrollback]);
 
   // A reattach replays the screen from scratch (the replay opens with a reset), so
-  // what was collected describes a buffer that no longer exists. The row keys carry
-  // on from where they were, because React must not match an old row to a new one.
-  const resetCaches = useCallback((emulator) => {
-    scrollbackRef.current = { seq: scrollbackRef.current.seq + scrollbackRef.current.rows.length, rows: [] };
-    scrolledRef.current = emulator ? emulator.scrolledLines() : 0;
+  // what was collected describes a buffer that no longer exists, and the new one
+  // numbers its lines from zero again.
+  const resetCaches = useCallback(() => {
+    scrollbackRef.current = { seq: 0, rows: [], sliding: false };
+    scrollbackStaleRef.current = false;
+    windowRef.current = SCROLLBACK_PAGE;
     setScrollback([]);
     setScrollbackWindow(SCROLLBACK_PAGE);
   }, []);
@@ -373,7 +408,7 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
         if (Number.isInteger(state.cols) && Number.isInteger(state.rows)) {
           emulator.resize(state.cols, state.rows);
         }
-        resetCaches(emulator);
+        resetCaches();
         queue.invalidateAll();
       },
       onReplay: (data) => emulator.write(data),
@@ -389,7 +424,17 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
         emulator.write(data, () => queue.invalidate(emulator.takeDirty()));
       },
       onPaneState: (next, message) => {
-        if (next) setPaneState(next);
+        if (next) {
+          setPaneState(next);
+          // The primary viewer on the Mac owns the geometry; an observer follows it.
+          // Without this the rows keep the size they attached at and every line wraps
+          // in a different place than it does on the desktop.
+          if (Number.isInteger(next.cols) && Number.isInteger(next.rows)
+            && (next.cols !== emulator.cols || next.rows !== emulator.term.rows)) {
+            emulator.resize(next.cols, next.rows);
+            queue.invalidateAll();
+          }
+        }
         if (message?.t === 'exit') setStatus('exited');
         if (message?.t === 'error' && message.message) note(message.message);
       },
@@ -477,15 +522,17 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
     // `history=full` reattaches with the pane's whole scrollback in the snapshot,
     // which is how the desktop console's own history button works.
     if (scrollbackWindow < scrollbackRef.current.rows.length) {
-      setScrollbackWindow((current) => current + SCROLLBACK_PAGE);
+      windowRef.current = scrollbackWindow + SCROLLBACK_PAGE;
+      setScrollbackWindow(windowRef.current);
+      const emulator = emulatorRef.current;
+      if (emulator) syncScrollback(emulator, windowRef.current);
       return;
     }
     const socket = socketRef.current;
     if (!socket || !socket.loadFullHistory()) return;
     setFullHistory(true);
-    setScrollbackWindow((current) => current + SCROLLBACK_PAGE);
     setStatus('history');
-  }, [scrollbackWindow]);
+  }, [scrollbackWindow, syncScrollback]);
 
   // Pinch, without a gesture library: the responder only takes the gesture when a
   // second finger lands, so one-finger scrolling still belongs to the ScrollViews.
@@ -516,7 +563,13 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
     if (atBottom === followRef.current) return;
     followRef.current = atBottom;
     setFollowing(atBottom);
-  }, []);
+    // Leaving the bottom is the moment the rows above become worth reading again.
+    const emulator = emulatorRef.current;
+    if (!atBottom && emulator && scrollbackStaleRef.current) {
+      scrollbackStaleRef.current = false;
+      syncScrollback(emulator, windowRef.current);
+    }
+  }, [syncScrollback]);
 
   // Tapping the screen is how the soft keyboard is asked for; the field itself is
   // off-screen, so there is nothing else to tap.
@@ -604,13 +657,13 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
                   </Pressable>
                 ) : (
                   <Text style={styles.historyNote}>
-                    {fullHistory ? 'Start of the pane’s buffer' : 'Start of the loaded output'}
+                    {moreHistory ? 'Start of the loaded output' : 'Start of the pane’s buffer'}
                   </Text>
                 )}
               </View>
               {visibleScrollback.map((entry) => (
                 <Row
-                  cursorX={-1}
+                  cursor={null}
                   fontSize={fontSize}
                   key={entry.key}
                   lineHeight={lineHeight}
@@ -623,8 +676,8 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
               ))}
               {rows.map((row, index) => (
                 <Row
+                  cursor={cursor.visible && cursor.y === index ? cursor : null}
                   cursorUnderline={!alive}
-                  cursorX={cursor.visible && cursor.y === index ? cursor.x : -1}
                   fontSize={fontSize}
                   key={index}
                   lineHeight={lineHeight}

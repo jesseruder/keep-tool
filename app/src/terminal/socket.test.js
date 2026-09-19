@@ -325,3 +325,34 @@ test('loading earlier output reattaches asking for the whole scrollback', () => 
   assert.equal(socket().url.endsWith('&history=full'), true, 'later reconnects keep the full history');
   handle.close();
 });
+
+test('output arriving while the parser catches up is live, not replay', () => {
+  // The drain covers the writes queued before it. A frame that lands between
+  // replay-end and the drain resolving is live output, and handing it to the replay
+  // path would mean the consumer never learns that it changed anything: it repaints
+  // on the drain, the frame is parsed after that, and a pane that then goes quiet
+  // leaves a stale screen on the phone.
+  let release = null;
+  const { handle, events, socket } = drive({ drain: () => new Promise((resolve) => { release = resolve; }) });
+  const ws = socket();
+  ws.open();
+  ws.deliver(JSON.stringify({ t: 'attached', pane: { cols: 80, rows: 24 } }));
+  ws.deliver('screen replay');
+  assert.deepEqual(events.replay, ['screen replay']);
+
+  ws.deliver(JSON.stringify({ t: 'replay-end' }));
+  assert.equal(events.replayEnd, 0, 'the end of the replay waits for the parser');
+
+  ws.deliver('live output');
+  assert.deepEqual(events.data, ['live output'], 'it goes to the live path, dirty tracking and all');
+  assert.deepEqual(events.replay, ['screen replay'], 'and not to the replay path');
+
+  release();
+  return Promise.resolve().then(() => {
+    assert.equal(events.replayEnd, 1);
+    assert.equal(handle.isReplayDone(), true);
+    ws.deliver('more output');
+    assert.deepEqual(events.data, ['live output', 'more output']);
+    handle.close();
+  });
+});

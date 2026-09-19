@@ -61,9 +61,11 @@ hand xterm's renderer, and a screenshot stream would cost far more than the byte
 
 The phone is an **observer**. `src/terminal/socket.js` attaches with `viewer=mobile-…`
 and `primary=0`, and never sends `resize` or `primary`, so opening a session on the
-phone cannot reflow the window somebody is typing into on the Mac. The pane's geometry
-is adopted from the `attached` frame. The host does accept an observer's keystrokes,
-so a question can still be answered from the phone; the status bar says so.
+phone cannot reflow the window somebody is typing into on the Mac. The geometry is
+adopted, not chosen: from the `attached` frame, and again from every later pane frame,
+so resizing the window on the Mac reflows the phone with it. The host does accept an
+observer's keystrokes, so a question can still be answered from the phone; the status
+bar says so.
 
 | module | what it owns |
 | --- | --- |
@@ -89,6 +91,12 @@ invalidates the whole screen instead.
 pinching scales the font between 6 and 20 px and the size is remembered. Lines that
 scroll off the top are kept as they go past and mounted above the live screen, so
 scrolling up reads them; the view follows the output whenever it is at the bottom.
+How many went past is *measured* (the normal buffer's `baseY`, which a scroll region
+or the alternate screen does not touch) rather than counted from xterm's scroll
+events, which fire for both. Once the emulator's 10,000-line buffer is full it drops
+its oldest line for every new one, so the collected rows would stop being contiguous
+with the screen; from there the mounted window is re-read from the buffer instead,
+and only while the reader is actually looking at it.
 **Load earlier output** first mounts more of what the app already holds and then
 reattaches with `history=full`, which is how the console's own history button works:
 the pane's whole scrollback arrives in the attach snapshot, rather than being stitched

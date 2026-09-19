@@ -74,9 +74,35 @@ function readLine(line, cols, cell) {
       runs.push(open);
     }
     text += chars;
-    if (cell.getCode() !== 0) trimmed = text.length;
+    // A cell counts as drawn when it holds a character *or* carries a background the
+    // program painted on it. `ESC[44m ESC[K` writes no characters at all, and clipping
+    // at the last character would erase the blue bar it just painted to the edge.
+    if (cell.getCode() !== 0 || style.bg !== null || style.inverse) trimmed = text.length;
   }
   return { text, runs, trimmed };
+}
+
+// The cursor is at a cell, but a row is a string: a wide glyph covers two cells and
+// one character, a combining mark rides along with the cell before it, and an emoji is
+// two string units in one cell. Slicing a row at the cursor's cell index would cut a
+// surrogate pair in half, so the offset is walked out of the cells themselves — the
+// same walk readLine does, stopped at the cursor.
+function cursorOffset(line, cols, cell, cursorX) {
+  const limit = Math.max(0, Math.min(cols, cursorX | 0));
+  // No line at all, or a cursor past the last column: blank cells from here on, one
+  // string unit each, which is what the renderer pads the row out with.
+  if (!line) return { offset: limit, length: 1 };
+  let offset = 0;
+  let length = 1;
+  for (let x = 0; x < cols; x++) {
+    line.getCell(x, cell);
+    // The trailing half of a wide glyph is not a position of its own.
+    if (cell.getWidth() === 0) continue;
+    const chars = cell.getChars() || ' ';
+    if (x >= limit) { length = chars.length; break; }
+    offset += chars.length;
+  }
+  return { offset, length };
 }
 
 function createEmulator(options = {}) {
@@ -119,15 +145,7 @@ function createEmulator(options = {}) {
       else markRange(event, maybeEnd === undefined ? event : maybeEnd);
     }));
   }
-  // Lines that left the top of the screen, counted rather than measured. The buffer's
-  // own scrollback saturates — past its limit the oldest line is dropped for every new
-  // one — so `scrollbackLength()` stops growing while output keeps scrolling, and a
-  // reader that watched only that length would silently stop following. xterm scrolls
-  // one line per event, so counting the events is the number of lines that went past.
-  let scrolled = 0;
-  if (typeof term.onScroll === 'function') {
-    disposables.push(term.onScroll(() => { scrolled += 1; markAll(); }));
-  }
+  if (typeof term.onScroll === 'function') disposables.push(term.onScroll(() => markAll()));
   if (typeof term.onResize === 'function') disposables.push(term.onResize(() => markAll()));
 
   const cell = term.buffer.active.getNullCell();
@@ -190,10 +208,20 @@ function createEmulator(options = {}) {
       return term.buffer.active.viewportY;
     },
 
-    // Every line that has ever scrolled off the top, since this emulator was created.
-    // Only differences between two readings mean anything; the count keeps rising
-    // after the buffer starts dropping its oldest lines, which is the point.
-    scrolledLines() { return scrolled; },
+    // The normal buffer's scrollback, measured rather than counted. `baseY` is how
+    // many lines have moved above the screen and nothing else touches it: a scroll
+    // inside a scroll region that does not start at the top moves lines within the
+    // screen, and the alternate buffer has a scrollback of its own — neither changes
+    // this number, while counting xterm's scroll events would have counted both.
+    //
+    // `saturated` is the one thing a reader cannot infer from the length: once the
+    // buffer is full the oldest line is dropped for every new one, so the length
+    // stops growing while output keeps scrolling and a cache built by appending
+    // differences would quietly fall behind the buffer it is supposed to mirror.
+    normalScrollback() {
+      const length = term.buffer.normal.baseY;
+      return { length, limit: scrollback, saturated: length >= scrollback };
+    },
 
     // A window of those lines, in the same row shape `rows()` returns. `offset`
     // counts lines back from the top of the viewport, so scrollbackRows(20, 20) is
@@ -226,11 +254,18 @@ function createEmulator(options = {}) {
       const buffer = term.buffer.active;
       // DECTCEM is not on the public API; the core service is where the parser puts it.
       const hidden = term._core && term._core.coreService && term._core.coreService.isCursorHidden;
+      const line = buffer.getLine(buffer.baseY + buffer.cursorY);
+      // `offset` and `length` are where the cursor is in the row's *string*, which is
+      // what the renderer slices; `x` is the cell, and the two differ wherever a wide
+      // glyph, an emoji or a combining mark does.
+      const { offset, length } = cursorOffset(line, term.cols, cell, buffer.cursorX);
       return {
         x: buffer.cursorX,
         // cursorY is measured from baseY; the renderer wants it from the viewport top.
         y: buffer.baseY + buffer.cursorY - buffer.viewportY,
         visible: !hidden,
+        offset,
+        length,
       };
     },
 

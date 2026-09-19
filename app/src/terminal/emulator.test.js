@@ -159,7 +159,8 @@ test('the emulator reproduces what the serializer sees, row for row', async (t) 
   assert.deepEqual(mine, fixture.expected.rows);
   assert.deepEqual(emulator.rows().map((row) => row.runs), expectedRuns());
   assert.equal(emulator.isAlternate(), fixture.expected.alternate);
-  assert.deepEqual(emulator.cursor(), fixture.expected.cursor);
+  const { x, y, visible } = emulator.cursor();
+  assert.deepEqual({ x, y, visible }, fixture.expected.cursor);
 
   const bytes = frames.reduce((total, data) => total + (data.length || 0), 0);
   const drained = process.hrtime.bigint();
@@ -304,7 +305,10 @@ test('the alternate buffer and cursor are reported for the status line', async (
   assert.equal(emulator.isAlternate(), false);
   await new Promise((resolve) => emulator.write('\x1b[?1049h\x1b[2;4H\x1b[?25l', resolve));
   assert.equal(emulator.isAlternate(), true);
-  assert.deepEqual(emulator.cursor(), { x: 3, y: 1, visible: false });
+  assert.deepEqual(
+    (({ x, y, visible }) => ({ x, y, visible }))(emulator.cursor()),
+    { x: 3, y: 1, visible: false },
+  );
   await new Promise((resolve) => emulator.write('\x1b[?25h\x1b[?1049l', resolve));
   assert.equal(emulator.isAlternate(), false);
   assert.equal(emulator.cursor().visible, true);
@@ -348,21 +352,125 @@ test('the key bar can read the modes that decide what a cursor key sends', async
   assert.deepEqual(emulator.modes(), { applicationCursor: false, bracketedPaste: false });
 });
 
-test('scrolled lines keep counting after the buffer starts dropping its oldest', async (t) => {
-  const emulator = createEmulator({ cols: 8, rows: 2, scrollback: 3 });
+test('the normal buffer\'s scrollback is measured, not counted', async (t) => {
+  const emulator = createEmulator({ cols: 8, rows: 3, scrollback: 10 });
   t.after(() => emulator.dispose());
-  assert.equal(emulator.scrolledLines(), 0);
+  const length = () => emulator.normalScrollback().length;
+  assert.deepEqual(emulator.normalScrollback(), { length: 0, limit: 10, saturated: false });
 
-  await new Promise((resolve) => emulator.write('a\r\nb\r\nc\r\n', resolve));
-  assert.equal(emulator.scrollbackLength(), 2);
-  assert.equal(emulator.scrolledLines(), 2, 'while there is room, the count is the scrollback length');
+  await new Promise((resolve) => emulator.write('a\r\nb\r\nc\r\nd\r\ne\r\n', resolve));
+  assert.equal(length(), 3, 'five lines on a three-row screen put three above it');
 
-  await new Promise((resolve) => emulator.write('d\r\ne\r\nf\r\n', resolve));
-  assert.equal(emulator.scrollbackLength(), 3, 'the buffer is full and drops its oldest line');
-  assert.equal(emulator.scrolledLines(), 5, 'the count still follows what went past');
+  // A scroll region that does not start at the top moves lines inside the screen.
+  // Counting xterm's scroll events would have counted these; nothing left the screen.
+  await new Promise((resolve) => emulator.write('\x1b[2;3r\x1b[3;1H\n\n\n\x1b[r', resolve));
+  assert.equal(length(), 3, 'a scroll region scroll adds nothing to the scrollback');
+
+  // The alternate screen scrolls its own buffer and leaves the normal one alone.
+  await new Promise((resolve) => emulator.write('\x1b[?1049h', resolve));
+  assert.equal(length(), 3);
+  await new Promise((resolve) => emulator.write('x\r\ny\r\nz\r\nw\r\n', resolve));
+  assert.equal(length(), 3, 'output on the alternate screen adds nothing');
+  await new Promise((resolve) => emulator.write('\x1b[?1049l', resolve));
+  assert.equal(length(), 3, 'leaving the alternate screen adds nothing either');
+
+  // Resetting the scroll region homed the cursor, so put it back on the bottom row
+  // before asking for two more lines off the top.
+  await new Promise((resolve) => emulator.write('\x1b[3;1Hf\r\ng\r\n', resolve));
+  assert.equal(length(), 5, 'two more lines off the screen are two more in the scrollback');
+});
+
+test('a saturated scrollback says so, because its length stops telling the truth', async (t) => {
+  const emulator = createEmulator({ cols: 8, rows: 3, scrollback: 10 });
+  t.after(() => emulator.dispose());
+  const lines = [];
+  for (let i = 0; i < 30; i++) lines.push(`line${i}`);
+  await new Promise((resolve) => emulator.write(`${lines.join('\r\n')}\r\n`, resolve));
+
+  assert.deepEqual(emulator.normalScrollback(), { length: 10, limit: 10, saturated: true },
+    'thirty lines through a ten line scrollback: the length is pinned and says so');
   assert.deepEqual(
-    emulator.scrollbackRows(3, 3).map((row) => row.text.slice(0, row.trimmed)),
-    ['c', 'd', 'e'],
-    'what is left is the newest lines, in order',
+    emulator.scrollbackRows(10, 10).map((row) => row.text.slice(0, row.trimmed)),
+    ['line18', 'line19', 'line20', 'line21', 'line22', 'line23', 'line24', 'line25', 'line26', 'line27'],
+    'what is left is the newest ten, so a reader rebuilds from them rather than appending',
   );
+  assert.deepEqual(emulator.rows().map((row) => row.text.slice(0, row.trimmed)), ['line28', 'line29', '']);
+});
+
+test('the cursor is reported in string offsets, not cells', async (t) => {
+  const emulator = createEmulator({ cols: 20, rows: 1 });
+  t.after(() => emulator.dispose());
+  // Two wide glyphs (two cells each under xterm's width tables), an emoji (one cell,
+  // two string units), and a combining acute, which rides along with the cell it
+  // modifies. The cell index and the string offset disagree from the first glyph on.
+  await new Promise((resolve) => emulator.write('\u65e5\u672c\u{1f600}e\u0301x', resolve));
+  const [row] = emulator.rows({ start: 0, end: 0 });
+  assert.equal(row.text.slice(0, row.trimmed), '\u65e5\u672c\u{1f600}e\u0301x');
+
+  const at = async (cell) => {
+    await new Promise((resolve) => emulator.write(`\x1b[1;${cell + 1}H`, resolve));
+    return emulator.cursor();
+  };
+  const seen = [];
+  for (const cell of [0, 2, 4, 5, 6, 9]) {
+    const cursor = await at(cell);
+    seen.push([cursor.x, cursor.offset, cursor.length]);
+    assert.equal(cursor.y, 0);
+    assert.equal(
+      row.text.slice(cursor.offset, cursor.offset + cursor.length).length,
+      cursor.length,
+      'the slice at the cursor is whole, never half a surrogate pair',
+    );
+  }
+  assert.deepEqual(seen, [
+    [0, 0, 1],   // the first wide glyph
+    [2, 1, 1],   // the second: two cells along, one character in
+    [4, 2, 2],   // the emoji: one cell, two string units
+    [5, 4, 2],   // e + combining acute, carried in one cell
+    [6, 6, 1],   // the x after them
+    [9, 9, 1],   // past the text: blank cells are one unit each
+  ]);
+  assert.equal(row.text.slice(2, 4), '\u{1f600}', 'the emoji slices whole');
+  assert.equal(row.text.slice(4, 6), 'e\u0301', 'so does the combined character');
+});
+
+test('a cell the program painted a background onto counts as drawn', async (t) => {
+  const emulator = createEmulator({ cols: 10, rows: 2 });
+  t.after(() => emulator.dispose());
+  // Erase to end of line with blue set: no characters are written at all, and
+  // clipping at the last character would throw the bar away.
+  await new Promise((resolve) => emulator.write('\x1b[44m\x1b[K', resolve));
+  const [row] = emulator.rows({ start: 0, end: 0 });
+  assert.equal(row.trimmed, 10, 'the painted row is drawn to the edge');
+  assert.equal(row.runs.length, 1);
+  assert.equal(row.runs[0].bg, 4);
+  assert.deepEqual([row.runs[0].start, row.runs[0].end], [0, 10]);
+
+  await new Promise((resolve) => emulator.write('\x1b[0m\x1b[2;1Hab', resolve));
+  const [plain] = emulator.rows({ start: 1, end: 1 });
+  assert.equal(plain.trimmed, 2, 'an unpainted row still stops at its text');
+});
+
+test('adopting the pane\'s geometry reflows the screen and the reader follows it', async (t) => {
+  const emulator = createEmulator({ cols: 80, rows: 24 });
+  t.after(() => emulator.dispose());
+  await new Promise((resolve) => emulator.write('hello', resolve));
+  assert.equal(emulator.rows().length, 24);
+  assert.equal(emulator.cols, 80);
+
+  // What the screen does when a pane frame reports the primary viewer's new size.
+  emulator.resize(100, 40);
+  await emulator.flush();
+  assert.equal(emulator.cols, 100);
+  assert.equal(emulator.rows().length, 40, 'rows() returns the new height, so the renderer keys match');
+  assert.deepEqual(emulator.takeDirty().length, 40, 'a resize invalidates the whole screen');
+  assert.equal(rowText(emulator.rows({ start: 0, end: 0 })[0]), 'hello', 'the content survives');
+
+  // A line long enough to wrap at the old width but not the new one.
+  await new Promise((resolve) => emulator.write(`\r\n${'x'.repeat(90)}`, resolve));
+  assert.equal(rowText(emulator.rows({ start: 1, end: 1 })[0]).length, 90, 'the row is one row at 100 columns');
+  emulator.resize(80, 40);
+  await emulator.flush();
+  assert.equal(rowText(emulator.rows({ start: 1, end: 1 })[0]).length, 80,
+    'and is re-laid out to the narrower screen rather than staying 90 wide');
 });
