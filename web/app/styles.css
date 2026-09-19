@@ -640,3 +640,201 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .model-usage table { border-collapse: collapse; margin: 8px 0; }
 .model-usage th, .model-usage td { padding: 4px 10px 4px 0; text-align: right; white-space: nowrap; }
 .model-usage th:first-child, .model-usage td:first-child { text-align: left; }
+
+/* ── The phone layout ───────────────────────────────────────────────────────
+   One markup tree with the desktop console. `mobile.js` sets `html.mobile` when
+   the WebView shell is present (or `?mobile=1` asks for it), and does the three
+   things CSS cannot: it borrows the rail and the meters into sheets, appends the
+   Alerts tab, and toggles `mobile-stage-open`. Everything else is here, so a
+   wide window is untouched.
+
+   The plain `@media (max-width: 480px)` block below never turns any of that on —
+   a narrow desktop window must not move DOM or rewrite stored state. It only
+   keeps a narrow window from scrolling sideways, which is safe on its own. */
+@media (max-width: 480px) {
+  .mode { min-width: 0; }
+  .stage { flex-basis: 0; min-width: 0; }
+  .review-queue-list { min-width: 0; }
+  .dock { min-width: 0; }
+  .fleetbar input { width: 100%; }
+  .fleet td { max-width: none; }
+  .help .card { width: auto; max-width: calc(100vw - 20px); }
+  .help dl { grid-template-columns: 96px 1fr; gap: 8px 12px; }
+  .history-pop { left: 8px; width: calc(100vw - 16px); }
+  .health .pop { right: 8px; width: calc(100vw - 16px); }
+  .session-actions-pop, .account-menu, .review-pop { width: min(280px, calc(100vw - 20px)); }
+  .findbar input { width: min(200px, 40vw); }
+}
+
+html.mobile { -webkit-text-size-adjust: 100%; }
+html.mobile body { height: 100dvh; padding-bottom: calc(56px + env(safe-area-inset-bottom, 0px)); }
+html.mobile .mode { min-width: 0; }
+/* Keyboard hints and the Watch layouts are desktop affordances with no gesture. */
+html.mobile .keys { display: none; }
+html.mobile .modes [data-mode="watch"] { display: none; }
+
+/* The top bar keeps two controls: the project filter and the connection dot
+   that opens usage and health. Everything else is a tab, a sheet, or gone. */
+html.mobile .bar { flex-wrap: nowrap; gap: 8px; padding-inline: 10px; }
+html.mobile .bar .session-history, html.mobile .bar #soundButton, html.mobile .bar #notificationsButton { display: none; }
+.mobile-filter, .mobile-status { display: none; }
+html.mobile .mobile-filter, html.mobile .mobile-status {
+  display: inline-flex; align-items: center; gap: 7px; min-height: 40px; max-width: 45vw;
+  padding: 6px 12px; border: 1px solid var(--bar-line); border-radius: 18px;
+  background: var(--bar-seg); color: var(--bar-muted); font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+html.mobile .mobile-filter[hidden] { display: none; }
+html.mobile .mobile-filter.on { color: var(--bar-text); background: var(--bar-sel); }
+html.mobile .mobile-status { margin-left: auto; }
+html.mobile .mobile-status i { width: 9px; height: 9px; flex: none; border-radius: 50%; background: var(--warn); }
+html.mobile .mobile-status[data-status="live"] i { background: var(--ok); }
+html.mobile .mobile-status[data-status="down"] i, html.mobile .mobile-status[data-status="error"] i { background: var(--bad); }
+html.mobile .mobile-status-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* The mode switch becomes the bottom tab bar. Triage, Fleet, Alerts, Queue and
+   the Reviewer; `order` puts them in that reading order without moving markup. */
+html.mobile .bar .modes {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+  display: flex; gap: 0; overflow: visible; padding: 0 0 env(safe-area-inset-bottom, 0px);
+  border: 0; border-top: 1px solid var(--bar-line); border-radius: 0; background: var(--bar-bg);
+}
+html.mobile .bar .modes button {
+  flex: 1 1 0; min-width: 0; min-height: 56px; flex-direction: column; justify-content: center;
+  gap: 3px; padding: 7px 2px; border-radius: 0; font-size: 11px; line-height: 1.2;
+}
+html.mobile .bar .modes button.on { color: var(--accent); background: none; box-shadow: inset 0 2px var(--accent); }
+html.mobile .bar .modes .count { padding: 1px 6px; font-size: 10px; }
+/* The Reviewer tab keeps one signal, not two stacked under its label: the "N new"
+   count sits where every other tab's badge sits, and the alive dot goes. */
+html.mobile .bar .modes .dot { display: none; }
+html.mobile .bar .modes .nw { font-size: 10px; }
+html.mobile .modes [data-mode="triage"] { order: 1; }
+html.mobile .modes [data-mode="fleet"] { order: 2; }
+html.mobile .modes .mobile-alerts-tab { order: 3; }
+html.mobile .modes [data-mode="review-queue"] { order: 4; }
+html.mobile .modes [data-mode="reviewer"] { order: 5; }
+.mobile-alerts-tab { display: none; }
+html.mobile .modes .mobile-alerts-tab { display: flex; align-items: center; color: var(--bar-muted); }
+
+/* Sheets: the project rail behind the filter button, usage and health behind
+   the connection dot. Each is one history entry, so Android's back closes it. */
+.mobile-sheet { display: none; }
+html.mobile .mobile-sheet.on { display: block; position: fixed; inset: 0; z-index: 70; }
+.mobile-sheet-backdrop { position: absolute; inset: 0; background: rgb(0 0 0 / .45); }
+.mobile-sheet-card {
+  position: absolute; left: 0; right: 0; bottom: 0; max-height: 82dvh;
+  display: flex; flex-direction: column; background: var(--panel); color: var(--text);
+  border-top: 1px solid var(--line-2); border-radius: 14px 14px 0 0; box-shadow: var(--shadow);
+}
+.mobile-sheet-card > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px 10px; border-bottom: 1px solid var(--line); }
+.mobile-sheet-card > header .btn { min-height: 44px; padding-inline: 16px; }
+.mobile-sheet-body { flex: 1; min-height: 0; overflow: auto; padding: 8px 12px calc(18px + env(safe-area-inset-bottom, 0px)); }
+html.mobile .mobile-sheet .rail { width: auto; padding: 0; border-right: 0; background: none; overflow: visible; }
+html.mobile .mobile-sheet .rail .rh .collapse { display: none; }
+html.mobile .mobile-sheet .rail button { min-height: 44px; }
+html.mobile .mobile-sheet .meters { display: flex; flex-wrap: wrap; flex: 0 0 auto; min-width: 0; width: 100%; gap: 10px 18px; margin: 0; padding: 0; border-left: 0; color: var(--muted); font-size: 12px; }
+html.mobile .mobile-sheet .meter-group { flex-wrap: wrap; min-height: 44px; }
+html.mobile .mobile-sheet .meter-details { display: block; position: static; min-width: 0; padding: 0; border: 0; background: none; box-shadow: none; color: var(--muted); }
+html.mobile .mobile-sheet .health { display: flex; flex-wrap: wrap; width: 100%; margin: 14px 0 0; padding: 0; }
+html.mobile .mobile-sheet .health .pop { display: block; position: static; flex: 1 0 100%; width: auto; max-height: none; margin-top: 10px; }
+html.mobile .mobile-sheet .health dl { grid-template-columns: 96px 1fr; }
+
+/* Triage: the queue is the screen, and a selected row pushes the stage over it. */
+html.mobile #triage { flex-direction: column; min-width: 0; }
+html.mobile #triage .rail, html.mobile #triage .queue-strip { display: none; }
+html.mobile #triage .queue, html.mobile #triage .queue.collapsed { display: flex; width: 100%; min-width: 0; flex: 1; border-right: 0; }
+html.mobile #triage .qhead .collapse { display: none; }
+html.mobile #triage .stage { display: none; }
+html.mobile.mobile-stage-open #triage .queue { display: none; }
+html.mobile.mobile-stage-open #triage .stage { display: flex; flex: 1; min-width: 0; }
+.mobile-stagebar { display: none; }
+html.mobile.mobile-stage-open #triage .mobile-stagebar {
+  display: flex; align-items: center; gap: 10px; flex: none; min-height: 48px;
+  padding: 0 8px 0 4px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+.mobile-back { min-height: 44px; padding: 0 12px; border-radius: 6px; color: var(--info); font-weight: 500; }
+.mobile-stagebar-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
+
+/* Touch targets. 44 px is the floor for anything that answers, dismisses,
+   restores, filters or opens a menu. */
+html.mobile .qitem { min-height: 60px; align-content: center; padding: 12px 12px 12px 8px; }
+html.mobile .qhead.qgroup.qtoggle, html.mobile .qdis-head, html.mobile .qfocus { min-height: 48px; }
+html.mobile .qdis { min-height: 52px; padding: 10px 12px 10px 10px; }
+html.mobile .qdis .btn, html.mobile .shead .btn, html.mobile .brief .btn,
+html.mobile .session-actions > summary, html.mobile .session-actions-content .btn,
+html.mobile .account-handoff > summary, html.mobile .term-handoff-open,
+html.mobile .mobile-reply .btn, html.mobile .mobile-reply input { min-height: 44px; }
+html.mobile .opt { flex: 1 1 100%; min-height: 48px; padding: 10px 14px; }
+html.mobile .shead { padding: 10px 12px; gap: 8px; }
+html.mobile .shead h2 { flex: 1 1 100%; }
+html.mobile .shead .acts { flex: 1 0 100%; margin-left: 0; flex-wrap: wrap; justify-content: flex-start; gap: 8px; }
+html.mobile .session-actions-pop { width: min(300px, calc(100vw - 24px)); right: auto; left: 0; }
+html.mobile .brief { padding: 10px 12px 16px; }
+html.mobile .brief .summary { height: auto; max-height: 28dvh; }
+html.mobile .brief .summary.state-line { max-height: 28dvh; }
+html.mobile .verdict-grade-msg { max-width: 100%; }
+/* The terminal is a handoff panel on the phone: its button has to be on the
+   screen with the answer buttons, not below a full page of stage. */
+html.mobile .stage-body { flex-direction: column; }
+html.mobile .stage-agent-log, html.mobile .stage-agent-log.collapsed { width: auto; max-height: 40%; border-left: 0; border-top: 1px solid var(--line); }
+html.mobile .term-handoff-body { gap: 16px; padding: 20px 16px; }
+html.mobile .term-handoff-open { min-width: 200px; justify-content: center; }
+/* Free text: the desktop types into xterm, the phone has this. */
+.mobile-reply { display: none; }
+html.mobile .mobile-reply { display: flex; gap: 8px; flex: none; padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+html.mobile .mobile-reply input { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--panel-2); color: var(--text); font-size: 16px; }
+
+/* Fleet: the nine-column table becomes one card per row. Branch, kind and
+   account are the columns a phone can do without. */
+html.mobile .fleet .fleetbar { flex-wrap: wrap; gap: 8px 10px; }
+html.mobile .fleet .fleetbar input { width: 100%; min-height: 44px; }
+html.mobile .fleet table, html.mobile .fleet tbody, html.mobile .fleet tr, html.mobile .fleet td { display: block; }
+html.mobile .fleet thead { display: none; }
+html.mobile .fleet tr { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+html.mobile .fleet td { max-width: none; padding: 0; border: 0; white-space: normal; overflow-wrap: anywhere; }
+html.mobile .fleet td:nth-child(2) { order: 0; flex: 1 0 100%; font-weight: 500; }
+html.mobile .fleet td:nth-child(1) { order: 1; }
+html.mobile .fleet td:nth-child(5) { order: 2; }
+html.mobile .fleet td:nth-child(6) { order: 3; }
+html.mobile .fleet td:nth-child(4) { order: 4; }
+html.mobile .fleet td:nth-child(3), html.mobile .fleet td:nth-child(7), html.mobile .fleet td:nth-child(8) { display: none; }
+html.mobile .fleet td:last-child { order: 5; flex: 1 0 100%; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+html.mobile .fleet td:last-child .btn { min-height: 44px; }
+html.mobile .fleet td:last-child .btn + .btn { margin-left: 0; }
+html.mobile .fleet .grp td { display: block; flex: 1 0 100%; }
+.mobile-only { display: none; }
+html.mobile .mobile-only { display: inline-flex; }
+
+/* Reviewer: the side panel stacks under the pane instead of beside it. */
+html.mobile #reviewer { flex-direction: column; min-width: 0; }
+html.mobile #reviewer .rterm { flex: 1 1 45%; min-height: 180px; }
+html.mobile #reviewer .rside, html.mobile #reviewer .rside.collapsed { display: flex; width: 100%; flex: 1 1 55%; min-height: 0; border-left: 0; border-top: 1px solid var(--line); }
+html.mobile #reviewer .rside-strip { display: none; }
+html.mobile .rstats { grid-template-columns: repeat(2, 1fr); }
+html.mobile .rstat { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+html.mobile .rstat .v { font-size: 17px; }
+html.mobile .fe { grid-template-columns: 44px 18px 1fr; gap: 0 8px; padding: 10px 12px; }
+
+/* Review queue: the list and the detail stack, and every control is tappable. */
+html.mobile #review-queue.on { flex-direction: column; overflow: auto; min-width: 0; }
+html.mobile .review-queue-list { width: 100%; min-width: 0; flex: 0 0 auto; max-height: 48dvh; border-right: 0; border-bottom: 1px solid var(--line); }
+html.mobile .review-queue-heading { padding: 14px 14px 8px; }
+html.mobile .review-queue-main { overflow: visible; }
+html.mobile .review-queue-types button, html.mobile .review-queue-filters .btn,
+html.mobile .review-actions .btn, html.mobile .review-conversations .btn,
+html.mobile .review-context > button, html.mobile .review-later-toggle { min-height: 44px; }
+html.mobile .review-queue-filters { flex-wrap: wrap; }
+html.mobile .review-queue-filters .btn { flex: 1 1 28%; }
+html.mobile .review-queue-tools { flex-wrap: wrap; }
+html.mobile .review-queue-tools > input { flex: 1 0 100%; min-height: 44px; }
+html.mobile .review-queue-tools select { min-height: 44px; }
+html.mobile .review-queue-item { min-height: 60px; padding: 13px 14px; }
+html.mobile .review-queue-detail { padding: 18px 14px 40px; }
+html.mobile .review-body { font-size: 14px; }
+
+/* The alerts inbox is a tab, so its dialog fills the screen above the tab bar. */
+html.mobile #notificationsPanel { inset: calc(var(--top-bar-height) + 6px) 8px calc(64px + env(safe-area-inset-bottom, 0px)) 8px; width: auto; }
+html.mobile .notification-heading, html.mobile .notification-toolbar, html.mobile .notification-item { padding-inline: 14px; }
+html.mobile .notification-toolbar .btn, html.mobile .notification-actions .btn, html.mobile .notification-enable { min-height: 44px; }
+html.mobile .notification-preview { padding-inline: 14px; }

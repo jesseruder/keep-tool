@@ -135,6 +135,9 @@ export function receiveShellMessage(message) {
     // The shell arrived after this module ran, or reattached to a live page.
     // Redo the load-time work and replay what it missed.
     document.documentElement.classList.toggle('mobile', isMobileShell());
+    // The phone layout listens for this: it has to borrow the rail and raise the
+    // tab bar when the shell only shows up after the page has loaded.
+    try { window.dispatchEvent(new Event('keep-shell-hello')); } catch {}
     if (readyRequested) postShell({ type: 'ready' });
     if (lastBadge != null) postShell({ type: 'badge', count: lastBadge });
   } else if (type === 'notificationClick') {

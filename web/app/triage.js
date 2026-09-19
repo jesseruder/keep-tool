@@ -642,6 +642,41 @@ async function sendReply(ctx, item, text) {
   } catch (error) { ctx.toast(error.message); ctx.refresh(); }
 }
 
+// Free text on the phone. The desktop console types it into the terminal, but
+// the phone hands the terminal to the app, so the stage carries its own one-line
+// composer; `html.mobile` is what shows it. It stays on the item it answered
+// rather than advancing the way an option or Continue does: on a phone the stage
+// is the whole screen, and jumping to another session loses the thread.
+function mobileReplyHTML(item) {
+  if (!item.sessionId) return '';
+  return '<form class="mobile-reply"><input type="text" name="reply" autocomplete="off" autocapitalize="sentences"'
+    + ' placeholder="Reply to this session…" aria-label="Reply to this session">'
+    + '<button class="btn primary" type="submit">Send</button></form>';
+}
+
+function installMobileReply(stage, ctx, item) {
+  const form = stage.querySelector('.mobile-reply');
+  if (!form) return;
+  const input = form.querySelector('input');
+  const button = form.querySelector('button');
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    const target = ctx.state.currentItem?.sessionId ? ctx.state.currentItem : item;
+    if (!text || !target.sessionId || button.disabled) return;
+    button.disabled = true;
+    try {
+      await api.send(target.sessionId, text);
+      input.value = '';
+      // Deliberately not marked sent: free text may or may not end the wait, and
+      // the daemon's next state is what decides. Owner stays on the session.
+      ctx.toast('Reply sent');
+      ctx.refresh();
+    } catch (error) { ctx.toast(error.message); }
+    finally { button.disabled = false; }
+  });
+}
+
 async function chooseOption(ctx, item, number) {
   const option = item.options?.[number - 1];
   if (!option) return;
@@ -711,10 +746,11 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     // stage is showing an agent's work. The aside is part of the skeleton and is
     // only hidden, never added or removed, so appearing next to the terminal
     // cannot rebuild the host the terminal is mounted in.
-    ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts"><span class="quick-actions"></span>${actionsMenuHTML()}</div></div><div class="brief"></div><div class="stage-body"><div class="stage-terminal"></div><aside class="stage-agent-log" hidden></aside></div>`);
+    ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts"><span class="quick-actions"></span>${actionsMenuHTML()}</div></div><div class="brief"></div>${mobileReplyHTML(item)}<div class="stage-body"><div class="stage-terminal"></div><aside class="stage-agent-log" hidden></aside></div>`);
     stage.dataset.itemKey = key;
     stage.dataset.pane = item.pane || '';
     stage.dataset.focusKey = '';
+    installMobileReply(stage, ctx, item);
   }
   const pinLabel = ctx.isPanePinned(item.pane) ? 'Unpin from Watch' : 'Pin to Watch';
   const closable = hasLivePane && item.sessionId && ['claude', 'codex'].includes(pane.meta?.agent);

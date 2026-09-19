@@ -162,6 +162,27 @@ key}`, which lands in the same handler the desktop shell's notification clicks
 use, or `{type:'reload'}`. On the mobile shell the app owns notification
 permission (always `granted`), the launcher badge, and waiting sounds.
 
+`<html class="mobile">` is also the whole phone layout, which is the desktop
+console laid out for 412 px — one markup tree, not a second UI. `web/app/mobile.js`
+turns it on when the shell is present, or when `?mobile=1` asks for it — never
+from a media query, because it moves DOM and rewrites stored state and a desktop
+window dragged narrow must do neither; the `max-width: 480px` rules stay pure
+CSS. It does only what CSS cannot: it borrows `#rail` into a
+filter sheet and `#meters`/`#health` into a status sheet behind the connection
+dot, appends an Alerts tab to the mode switch (which `styles.css` fixes to the
+bottom of the screen, with Watch hidden), and toggles `mobile-stage-open` so a
+selected queue row pushes the stage over the queue. Each sheet and the stage push
+one `history.pushState({keepOverlay})` entry, so Android's back button — which the
+shell routes through WebView history — unwinds them one at a time. The entry at
+depth k names the k-th overlay, so arriving on a `keepOverlay` entry whose
+overlay is closed (a Forward, or a leftover from a shell that went away) reopens
+it, or goes straight back again: the history never holds an overlay entry with
+no overlay behind it. The phone
+stage carries a one-line reply composer (`.mobile-reply`), because free text on
+the desktop is typed into xterm and the phone hands the terminal to the app;
+Fleet rows carry a `Terminal` button that posts the same `openTerminal`. On a
+desktop the module builds nothing at all.
+
 ## CLI
 
 ```

@@ -16,11 +16,15 @@ export function fleetRowHTML(ctx, row, panes) {
   const closeIdle = row.session && row.alive
     ? `<button class="btn" data-close-idle="${ctx.esc(row.sessionId)}" data-pane="${ctx.esc(row.pane)}">Close</button>` : '';
   const remove = (row.pane && panes.get(row.pane)?.alive === false ? `<button class="btn" data-remove="${ctx.esc(row.pane)}">Remove</button>` : '') + closeIdle;
+  // The phone hands live terminals to the app; `mobile.js` owns the click and
+  // `.mobile-only` keeps the button off every other screen.
+  const terminal = row.alive && row.pane
+    ? `<button class="btn mobile-only" data-open-terminal="${ctx.esc(row.pane)}" data-session="${ctx.esc(row.sessionId || '')}" data-title="${ctx.esc(row.title)}">Terminal</button>` : '';
   const configured = (ctx.data.accounts || []).find((account) => account.id === row.accountId);
   const account = row.accountLabel || configured?.label || row.accountId;
   const badge = numBadgeHTML(ctx.esc, row.num, row.id);
   const identity = badge || `<span class="mono faint">${ctx.esc(row.id)}</span>`;
-  return `<tr><td><span class="st"><i class="${ctx.esc(row.state)}"></i>${ctx.esc(row.stateLabel || row.state)}</span></td><td${row.renamed ? ` title="${ctx.esc(RENAMED_HINT)}"` : ''}>${markHTML(ctx.esc, row.mark)}${ctx.esc(row.title)}${row.reviewer ? '<span class="rv">reviewer</span>' : ''} ${identity}</td><td class="mono muted">${ctx.esc(row.branch)}</td><td class="mono info">${ctx.esc(row.taskId || '')}${ctx.tagsHTML(ctx.taskFor(row))}</td><td class="mono waiting-kind">${ctx.esc(row.waiting)}</td><td class="mono muted">${ctx.esc(ctx.rel(row.since))}</td><td class="mono ${row.kind === 'codex' ? 'kind-codex' : ''}">${ctx.esc(row.kind)}</td><td>${ctx.esc(account || '—')}</td><td><button class="btn" data-pin="${ctx.esc(row.pane || '')}" data-title="${ctx.esc(row.title)}" ${row.alive && !pinned ? '' : 'disabled'}>${pinned ? 'Pinned' : 'Pin'}</button>${reopen}${remove}</td></tr>`;
+  return `<tr><td><span class="st"><i class="${ctx.esc(row.state)}"></i>${ctx.esc(row.stateLabel || row.state)}</span></td><td${row.renamed ? ` title="${ctx.esc(RENAMED_HINT)}"` : ''}>${markHTML(ctx.esc, row.mark)}${ctx.esc(row.title)}${row.reviewer ? '<span class="rv">reviewer</span>' : ''} ${identity}</td><td class="mono muted">${ctx.esc(row.branch)}</td><td class="mono info">${ctx.esc(row.taskId || '')}${ctx.tagsHTML(ctx.taskFor(row))}</td><td class="mono waiting-kind">${ctx.esc(row.waiting)}</td><td class="mono muted">${ctx.esc(ctx.rel(row.since))}</td><td class="mono ${row.kind === 'codex' ? 'kind-codex' : ''}">${ctx.esc(row.kind)}</td><td>${ctx.esc(account || '—')}</td><td><button class="btn" data-pin="${ctx.esc(row.pane || '')}" data-title="${ctx.esc(row.title)}" ${row.alive && !pinned ? '' : 'disabled'}>${pinned ? 'Pinned' : 'Pin'}</button>${terminal}${reopen}${remove}</td></tr>`;
 }
 
 export function renderFleet(ctx) {

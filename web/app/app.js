@@ -27,6 +27,7 @@ import { createDetailStore } from './details.js';
 import { handleGradeKey } from './state-line.js';
 import { focusQueueItem, handleLeaveTerminalKey } from './leave-terminal.js';
 import { acknowledgeNotificationClick, installNotificationClicks, notificationPermission, notify, requestPermission, setBadge, shellReady } from './shell.js';
+import { installMobile, syncMobile } from './mobile.js';
 
 applyTheme();
 
@@ -909,6 +910,7 @@ function renderTop() {
   document.querySelector('#connection').textContent = `${sessionCount} session${sessionCount === 1 ? '' : 's'} · ${paneCount} pane${paneCount === 1 ? '' : 's'}`;
   updateDockButton();
   renderReviewerTop(ctx);
+  syncMobile();
 }
 
 function dockAvailable() { return window.innerWidth >= 1100; }
@@ -1300,6 +1302,7 @@ function installBootControls() {
   helpKey?.addEventListener('click', openHelp);
   installWatchControls(ctx);
   installTriageControls(ctx);
+  installMobile(ctx);
 }
 
 Object.defineProperty(window, 'keepConsole', {
