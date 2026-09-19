@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import stateDelta from './shared/state-delta.js';
+
+const { diffConsoleState } = stateDelta;
 
 globalThis.location = new URL('http://localhost:7777/app/');
 
@@ -205,4 +208,117 @@ test('a restart write response can supersede a concurrent sequence advance from 
   await newWrite;
   await api.getState();
   assert.equal(calls.at(-1).headers['x-keep-after-mutation'], 'new:1');
+});
+
+function projection(generatedAt, sessions) {
+  return {
+    generatedAt,
+    tasks: [{ id: 'card-a', fm: { title: 'A' } }],
+    sessions,
+    panes: [{ id: 'p-1', alive: true }],
+    reviewQueue: { counts: { open: 1 }, items: [{ id: 'r-1', title: 'R' }] },
+  };
+}
+
+const FIRST = projection(1000, [{ id: 's-1', title: 'One' }, { id: 's-2', title: 'Two' }]);
+const SECOND = projection(2000, [{ id: 's-1', title: 'One renamed' }, { id: 's-2', title: 'Two' }]);
+const THIRD = projection(3000, [{ id: 's-1', title: 'One renamed' }, { id: 's-2', title: 'Two' }, { id: 's-3', title: 'Three' }]);
+
+test('the console applies delta envelopes to the snapshot it holds and asks for the next one', async () => {
+  const calls = [];
+  let respond;
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push(String(url));
+    return respond(String(url), options);
+  };
+  const api = await import(`./api.js?deltas=${Date.now()}`);
+
+  respond = () => reply({ instance: 'worker-1', version: 1, full: FIRST });
+  assert.deepEqual(await api.getState(), FIRST, 'the first read takes the full envelope');
+  assert.equal(calls.at(-1), '/api/state?console=1', 'with nothing to name yet, no since');
+
+  respond = () => reply({ instance: 'worker-1', version: 3, since: 1,
+    deltas: [diffConsoleState(FIRST, SECOND), diffConsoleState(SECOND, THIRD)] });
+  const applied = await api.getState();
+  assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-1:1')}`);
+  assert.deepEqual(applied, THIRD, 'the chain rebuilds the projection the worker holds');
+
+  // app.js edits the object it is handed; the cached base must not be that object.
+  applied.sessions.pop();
+  applied.generatedAt = 0;
+  // A publication with nothing the console renders: an empty chain from wherever it stands.
+  respond = (url) => reply({ instance: 'worker-1', version: 4, deltas: [],
+    since: Number(decodeURIComponent(url.split('since=')[1] || '').split(':')[1]) });
+  assert.deepEqual(await api.getState(), THIRD, 'the pristine snapshot survives the caller editing its copy');
+  assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-1:3')}`);
+  assert.deepEqual(await api.getState(), THIRD);
+  assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-1:4')}`,
+    'an empty chain still advances the version the console names');
+});
+
+test('a delta the console cannot place sends it back for one full projection', async () => {
+  const calls = [];
+  let respond;
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push(String(url));
+    return respond(String(url), options);
+  };
+  const api = await import(`./api.js?delta-fallback=${Date.now()}`);
+  const full = (instance, version, state) => reply({ instance, version, full: state });
+
+  respond = () => full('worker-1', 1, FIRST);
+  await api.getState();
+
+  // A worker restart: a chain from an instance the console never saw.
+  respond = (url) => (url.includes('since=')
+    ? reply({ instance: 'worker-2', version: 9, since: 1, deltas: [diffConsoleState(FIRST, SECOND)] })
+    : full('worker-2', 9, THIRD));
+  assert.deepEqual(await api.getState(), THIRD, 'a foreign chain is refused and reloaded whole');
+  assert.equal(calls.at(-1), '/api/state?console=1');
+  assert.equal(calls.filter((url) => url.startsWith('/api/state')).length, 3, 'exactly one retry');
+
+  // A chain that does not start where the console stands.
+  respond = (url) => (url.includes('since=')
+    ? reply({ instance: 'worker-2', version: 11, since: 10, deltas: [diffConsoleState(FIRST, SECOND)] })
+    : full('worker-2', 11, SECOND));
+  assert.deepEqual(await api.getState(), SECOND, 'a chain that starts elsewhere is refused');
+
+  // A delta that cannot apply: the console drops its base and reloads.
+  const unapplicable = { keyed: { sessions: { key: 'id', order: ['ghost'] } } };
+  respond = (url) => (url.includes('since=')
+    ? reply({ instance: 'worker-2', version: 12, since: 11, deltas: [unapplicable] })
+    : full('worker-2', 12, THIRD));
+  assert.deepEqual(await api.getState(), THIRD, 'an unapplicable delta falls back to the projection');
+
+  // And if the fallback still answers with deltas there is no base to apply them to.
+  respond = () => reply({ instance: 'worker-2', version: 13, since: 12, deltas: [unapplicable] });
+  await assert.rejects(() => api.getState(), /unknown row|without a base snapshot/);
+});
+
+test('a plain console projection still loads, and stops the console naming a snapshot', async () => {
+  const calls = [];
+  let respond;
+  globalThis.fetch = async (url) => { calls.push(String(url)); return respond(); };
+  const api = await import(`./api.js?plain=${Date.now()}`);
+
+  // The browser fixtures and the daemon's own route serve consoleState() bare.
+  respond = () => reply(FIRST);
+  assert.deepEqual(await api.getState(), FIRST);
+  assert.deepEqual(await api.getState(), FIRST);
+  assert.deepEqual(calls, ['/api/state?console=1', '/api/state?console=1'], 'no since is ever sent');
+
+  // A worker that starts speaking envelopes mid-stream is adopted on the spot.
+  respond = () => reply({ instance: 'worker-3', version: 5, full: SECOND });
+  assert.deepEqual(await api.getState(), SECOND);
+  respond = () => reply({ instance: 'worker-3', version: 6, since: 5, deltas: [diffConsoleState(SECOND, THIRD)] });
+  assert.deepEqual(await api.getState(), THIRD);
+  assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-3:5')}`);
+
+  // And one that goes back to a bare projection drops the snapshot again.
+  respond = () => reply(FIRST);
+  assert.deepEqual(await api.getState(), FIRST);
+  assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-3:6')}`);
+  respond = () => reply(SECOND);
+  assert.deepEqual(await api.getState(), SECOND);
+  assert.equal(calls.at(-1), '/api/state?console=1');
 });

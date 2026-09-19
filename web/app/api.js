@@ -1,3 +1,6 @@
+import './shared/state-delta.js';
+
+const { applyConsoleDelta } = globalThis.KeepStateDelta;
 const WRITE_HEADERS = { 'content-type': 'application/json' };
 const STATE_MUTATIONS = new Set([
   '/api/abandon-account-handoff', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
@@ -93,8 +96,52 @@ async function request(url, options = {}) {
 let stateRequest;
 let queuedStateRequest;
 
+// The snapshot the console already holds, kept pristine: `{ instance, version, state }`.
+// The worker answers `since=<instance>:<version>` with the deltas back to it, and
+// falls back to a full envelope whenever it cannot name that chain.
+let stateCache = null;
+
 async function fetchState() {
-  return freshRequest('/api/state?console=1');
+  const cached = stateCache;
+  const since = cached ? `&since=${encodeURIComponent(`${cached.instance}:${cached.version}`)}` : '';
+  const state = await absorbState(await freshRequest(`/api/state?console=1${since}`), cached);
+  // app.js reassigns `data` and edits its lists in place (spawned panes, dropped
+  // panes, detail reconciliation), so the cached base must never be what it holds.
+  return stateCache ? structuredClone(state) : state;
+}
+
+function adoptFull(body) {
+  stateCache = { instance: body.instance, version: body.version, state: body.full };
+  return body.full;
+}
+
+// A fixture — or the daemon's own /api/state, which never learned `since` — can serve
+// the bare console projection. Treat it as a one-off snapshot with no delta channel.
+async function absorbState(body, cached) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) { stateCache = null; return body; }
+  if (Object.hasOwn(body, 'full')) return adoptFull(body);
+  if (!Object.hasOwn(body, 'deltas')) { stateCache = null; return body; }
+  if (!cached || body.instance !== cached.instance || body.since !== cached.version) return refetchFull();
+  let next;
+  try {
+    next = (body.deltas || []).reduce((state, delta) => applyConsoleDelta(state, delta), cached.state);
+  } catch (error) {
+    return refetchFull(error);
+  }
+  stateCache = { instance: cached.instance, version: body.version, state: next };
+  return next;
+}
+
+// One retry without `since`; if that still answers with deltas the console has no
+// base to apply them to, so surface the failure rather than render a stale list.
+async function refetchFull(cause) {
+  stateCache = null;
+  const body = await freshRequest('/api/state?console=1');
+  if (body && typeof body === 'object' && Object.hasOwn(body, 'full')) return adoptFull(body);
+  if (body && typeof body === 'object' && Object.hasOwn(body, 'deltas')) {
+    throw cause || new Error('dashboard state deltas arrived without a base snapshot');
+  }
+  return body;
 }
 
 async function freshRequest(url) {
