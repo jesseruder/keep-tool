@@ -196,7 +196,10 @@ const CONSOLE_STATE_KEYS = [
 const CONSOLE_DEAD_SESSION_FIELDS = [
   'id', 'num', 'kind', 'agent', 'agentName', 'title', 'renamed', 'mark', 'project', 'gitBranch',
   'taskId', 'taskStatus', 'state', 'stateLabel', 'alive', 'exited', 'pane', 'mtime', 'lastUserAt',
-  'turnStartedAt', 'accountId', 'accountLabel', 'reviewer', 'rateLimit', 'lastAssistant', 'stateLine',
+  // `account` is the legacy spelling of `accountId`; the console's bulk-transfer
+  // count reads `session.accountId || session.account` and is not alive-gated, so a
+  // parked rate-limited row would drop out of the batch if only the old field is set.
+  'turnStartedAt', 'accountId', 'account', 'accountLabel', 'reviewer', 'rateLimit', 'lastAssistant', 'stateLine',
   'lastVerdict', 'lastVerdictAt', 'verdictConfidence', 'pendingDecision', 'pendingQuestion',
   'pendingPlan', 'activity', '_detailVersion',
 ];
@@ -212,6 +215,10 @@ const CONSOLE_PANE_META_FIELDS = [
 
 // Closed cards outnumber open ones several to one on a live daemon, and the
 // console only renders a done card when something still in flight points at it.
+// A restarting session needs no clause of its own: restart ledger entries are keyed
+// by sessionId, and the session they name is already in sessions[] with its taskId.
+// review.events[].card is deliberately absent: its only card read is the
+// openReviewCard toast, which falls back to the raw id when the card is gone.
 function referencedCardIds(state) {
   const ids = new Set();
   const add = (value) => { if (typeof value === 'string' && value) ids.add(value); };
@@ -221,7 +228,9 @@ function referencedCardIds(state) {
   for (const item of rows(state.reviewQueue?.items)) add(item?.card);
   for (const entry of rows(state.notifications)) add(entry?.card);
   for (const agent of rows(state.agents)) add(agent?.card);
-  for (const restart of rows(state.restarts)) add(restart?.taskId);
+  // The Fleet list builds a row straight from a dead claude/codex pane once its
+  // session has aged out of sessions[], and tags that row from meta.card.
+  for (const pane of rows(state.panes)) add(pane?.meta?.card);
   return ids;
 }
 

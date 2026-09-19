@@ -230,12 +230,12 @@ function consoleFixture() {
     shadowDecisions: { graduated: 1 },
     scopes: { names: ['castle'] },
     projectCatalog: [{ path: '/repo' }],
-    restarts: [{ taskId: 'restart-card', at: 5 }],
+    restarts: [{ sessionId: 'flagged-exited', mode: 'restart', status: 'queued', at: 5 }],
     tasks: [
       { id: 'open-card', fm: { title: 'Open', status: 'active' }, body: 'full body', lastLog: 'latest log' },
       { id: 'linked-card', fm: { title: 'Linked', status: 'done' }, body: 'full body', lastLog: 'latest log' },
       { id: 'closed-card', fm: { title: 'Closed', status: 'done' }, body: 'full body', lastLog: 'latest log' },
-      { id: 'restart-card', fm: { title: 'Restarting', status: 'done' }, body: 'full body', lastLog: 'latest log' },
+      { id: 'pane-card', fm: { title: 'Pane only', status: 'done' }, body: 'full body', lastLog: 'latest log' },
     ],
     sessions: [
       {
@@ -244,10 +244,17 @@ function consoleFixture() {
         lastUser: 'Large user prompt', opener: { via: 'keep' }, unknownBackgroundJobs: ['child'],
       },
       {
-        id: 'flagged-exited', kind: 'claude', title: 'Flagged', state: 'waiting', stateLabel: 'Waiting', exited: true,
-        pane: 'dead-pane', taskId: 'linked-card', accountId: 'claude-main', accountLabel: 'Claude Main',
-        lastAssistant: 'Historical preview', lastUser: 'Large user prompt', opener: { via: 'keep' },
-        endedTurn: true, notify: { type: 'complete' }, lifecycleAgents: ['child'], askedProse: false,
+        id: 'flagged-exited', num: 7, kind: 'claude', agent: 'claude', agentName: 'fleet', title: 'Flagged',
+        renamed: true, mark: 'target', project: '/repo', gitBranch: 'feature/history', taskId: 'linked-card',
+        taskStatus: 'done', state: 'waiting', stateLabel: 'Waiting', alive: false, exited: true, pane: 'dead-pane',
+        mtime: 120, lastUserAt: 110, turnStartedAt: 100, accountId: 'claude-main', account: 'claude-main-legacy',
+        accountLabel: 'Claude Main', reviewer: true, rateLimit: { at: 5 }, lastAssistant: 'Historical preview',
+        stateLine: 'Finished the review', lastVerdict: 'done', lastVerdictAt: 130, verdictConfidence: 0.9,
+        pendingDecision: { id: 'd1', type: 'grade' }, pendingQuestion: 'Ship it?', pendingPlan: { text: 'plan' },
+        activity: { background: { pending: true } },
+        lastUser: 'Large user prompt', lastAssistantFull: 'Full historical tail', lastHuman: 'human', size: 999,
+        opener: { via: 'keep' }, endedTurn: true, notify: { type: 'complete' }, lifecycleAgents: ['child'],
+        askedProse: false, waitingFor: null, attentionAt: 115, localCommandPending: false,
       },
       {
         id: 'state-exited', kind: 'codex', title: 'By state', state: 'exited', stateLabel: 'Exited',
@@ -292,7 +299,7 @@ function consoleFixture() {
         createdAt: '2026-09-07T12:00:00Z', exitedAt: '2026-09-07T13:00:00Z', exitCode: 0, signal: null,
         lastActivityAt: 7, scope: 'castle', cmd: '/bin/zsh', args: ['-lic'], rows: 40, cols: 120, bytes: 123,
         meta: { agent: 'claude', agentName: 'fleet', sessionId: 'flagged-exited', project: '/repo',
-          title: 'Historical', card: 'linked-card', accountId: 'claude-main', accountLabel: 'Claude Main',
+          title: 'Historical', card: 'pane-card', accountId: 'claude-main', accountLabel: 'Claude Main',
           portableTransferId: 'transfer-1', url: 'http://localhost/app', attributes: { pinned: true },
           terminalRendererTrial: 'webgl', openRequestId: 'req-2', launchedBy: 'keep' } },
     ],
@@ -305,9 +312,17 @@ test('console state keeps only the top-level fields the console renders', () => 
   const before = JSON.stringify(state);
   const projected = consoleState(state);
 
-  assert.deepEqual(Object.keys(projected).sort(),
-    CONSOLE_STATE_KEYS.filter((key) => state[key] !== undefined).sort(),
-    'exactly the allowlist, intersected with what the daemon published');
+  // Written out rather than derived from CONSOLE_STATE_KEYS: dropping a field the
+  // console renders has to fail here, not quietly restate the new allowlist.
+  const expectedKeys = [
+    'generatedAt', 'shadowDecisions', 'scopes', 'projectCatalog', 'restarts', 'tasks', 'sessions',
+    'attention', 'setAside', 'notifications', 'reminders', 'limitResume', 'health', 'usage',
+    'reviewQueue', 'accounts', 'handoffs', 'handoffQueue', 'review', 'agents', 'panes', 'hostStatus',
+  ];
+  assert.deepEqual(Object.keys(projected).sort(), [...expectedKeys].sort(),
+    'exactly the fields the console renders, and the fixture publishes every one of them');
+  assert.deepEqual([...CONSOLE_STATE_KEYS].sort(), [...expectedKeys].sort(),
+    'the exported allowlist and the rendered set have not drifted apart');
   for (const key of ['digest', 'landed', 'slack', 'alerts', 'weeklySummary', 'defaults',
     'stalled', 'unblocked', 'brief', 'standup', 'automationAccounts', 'resumeSummary',
     'reviewSummary', 'reviewUsage']) {
@@ -327,7 +342,7 @@ test('console state drops closed cards nothing points at, and every card history
 
   assert.ok(ids.includes('open-card'), 'an open card is always kept');
   assert.ok(ids.includes('linked-card'), 'a done card an exited session points at is kept');
-  assert.ok(ids.includes('restart-card'), 'a done card a pending restart points at is kept');
+  assert.ok(ids.includes('pane-card'), "a done card only a dead pane's meta.card points at is kept");
   assert.equal(ids.includes('closed-card'), false, 'a done card nothing points at is dropped');
 
   for (const task of projected.tasks) {
@@ -348,13 +363,18 @@ test('console state drops closed cards nothing points at, and every card history
   assert.deepEqual(byNotification.tasks.map((task) => task.id), ['done'], 'a notification keeps a closed card');
   const byAgent = consoleState({ tasks: [{ id: 'done', fm: { status: 'done' } }], agents: [{ name: 'a', card: 'done' }] });
   assert.deepEqual(byAgent.tasks.map((task) => task.id), ['done'], 'a standing agent keeps a closed card');
+  // The Fleet list tags a dead pane's row from meta.card once the session is gone.
+  const byPane = consoleState({ tasks: [{ id: 'done', fm: { status: 'done' } }],
+    panes: [{ id: 'p', alive: false, meta: { agent: 'claude', card: 'done' } }] });
+  assert.deepEqual(byPane.tasks.map((task) => task.id), ['done'], "a dead pane's card keeps a closed card");
+  const bySession = consoleState({ tasks: [{ id: 'done', fm: { status: 'done' } }], sessions: [{ id: 's', exited: true, taskId: 'done' }] });
+  assert.deepEqual(bySession.tasks.map((task) => task.id), ['done'], 'an exited session keeps a closed card');
   assert.deepEqual(consoleState({}).tasks, [], 'every referencing list is optional');
 });
 
 test('console state reduces every dead session and leaves live rows whole', () => {
   const state = consoleFixture();
   const projected = consoleState(state);
-  const light = lightweightState(state);
   const live = projected.sessions.find((session) => session.id === 'live');
 
   assert.equal(live.lastUser, 'Large user prompt');
@@ -362,19 +382,39 @@ test('console state reduces every dead session and leaves live rows whole', () =
   assert.deepEqual(live.unknownBackgroundJobs, ['child']);
   assert.equal(live.lastAssistantFull, 'Full tail', 'a live row keeps everything lightweight state left');
 
-  for (const id of ['flagged-exited', 'state-exited', 'not-alive']) {
-    const row = projected.sessions.find((session) => session.id === id);
-    const summarised = light.sessions.find((session) => session.id === id);
-    assert.deepEqual(Object.keys(row).sort(),
-      CONSOLE_DEAD_SESSION_FIELDS.filter((field) => summarised[field] !== undefined).sort(),
-      id + ' keeps exactly the allowlisted dead-session fields');
-    assert.equal(row.lastUser, undefined, id + ' drops the user prompt');
-  }
+  // Written out, not derived: 'flagged-exited' carries every allowlisted field, so
+  // removing one the console renders — state, title, num, mark, mtime, pane,
+  // lastUserAt, account — fails here.
+  const expectedDeadSession = [
+    'id', 'num', 'kind', 'agent', 'agentName', 'title', 'renamed', 'mark', 'project', 'gitBranch',
+    'taskId', 'taskStatus', 'state', 'stateLabel', 'alive', 'exited', 'pane', 'mtime', 'lastUserAt',
+    'turnStartedAt', 'accountId', 'account', 'accountLabel', 'reviewer', 'rateLimit', 'lastAssistant',
+    'stateLine', 'lastVerdict', 'lastVerdictAt', 'verdictConfidence', 'pendingDecision',
+    'pendingQuestion', 'pendingPlan', 'activity', '_detailVersion',
+  ];
   const flagged = projected.sessions.find((session) => session.id === 'flagged-exited');
+  assert.deepEqual(Object.keys(flagged).sort(), [...expectedDeadSession].sort(),
+    'an exited row keeps exactly the fields the console renders on it');
+  assert.deepEqual([...CONSOLE_DEAD_SESSION_FIELDS].sort(), [...expectedDeadSession].sort(),
+    'the exported dead-session allowlist and the rendered set have not drifted apart');
+
+  // The other two dead signals reduce the same way, on rows that carry only a few.
+  assert.deepEqual(Object.keys(projected.sessions.find((session) => session.id === 'state-exited')).sort(),
+    ['_detailVersion', 'id', 'kind', 'state', 'stateLabel', 'title'], "state: 'exited' is a dead row");
+  assert.deepEqual(Object.keys(projected.sessions.find((session) => session.id === 'not-alive')).sort(),
+    ['_detailVersion', 'alive', 'id', 'kind', 'state', 'stateLabel', 'title'], 'alive: false is a dead row');
+
+  for (const id of ['flagged-exited', 'state-exited', 'not-alive']) {
+    assert.equal(projected.sessions.find((session) => session.id === id).lastUser, undefined,
+      id + ' drops the user prompt');
+  }
   assert.equal(flagged.accountLabel, 'Claude Main');
+  assert.equal(flagged.account, 'claude-main-legacy', 'the legacy account field still reaches the batch count');
   assert.equal(flagged.lastAssistant, 'Historical preview');
   assert.equal(flagged.taskId, 'linked-card');
   assert.equal(flagged.notify, undefined);
+  assert.equal(flagged.lastAssistantFull, undefined);
+  assert.deepEqual(flagged.activity, { background: { pending: true } });
   assert.equal(typeof flagged._detailVersion, 'string');
 });
 
@@ -388,13 +428,24 @@ test('console state reduces dead panes and their meta, and leaves live panes who
   assert.equal(live.rows, 40);
   assert.equal(live.meta.openRequestId, 'req-1');
 
-  assert.deepEqual(Object.keys(dead).sort(),
-    CONSOLE_DEAD_PANE_FIELDS.filter((field) => state.panes[1][field] !== undefined).sort());
-  assert.deepEqual(Object.keys(dead.meta).sort(),
-    CONSOLE_PANE_META_FIELDS.filter((field) => state.panes[1].meta[field] !== undefined).sort());
+  // Written out, not derived: the fixture's dead pane carries every allowlisted
+  // field and meta field, so removing one the console renders fails here.
+  const expectedDeadPane = ['id', 'alive', 'agentAlive', 'cwd', 'title', 'createdAt', 'exitedAt', 'pid', 'scope', 'meta'];
+  const expectedPaneMeta = [
+    'agent', 'agentName', 'sessionId', 'project', 'title', 'card', 'accountId', 'accountLabel',
+    'portableTransferId', 'url', 'attributes', 'terminalRendererTrial',
+  ];
+  assert.deepEqual(Object.keys(dead).sort(), [...expectedDeadPane].sort(),
+    'a dead pane keeps exactly the fields the console renders on it');
+  assert.deepEqual(Object.keys(dead.meta).sort(), [...expectedPaneMeta].sort(),
+    'a dead pane keeps exactly the meta the console renders');
+  assert.deepEqual([...CONSOLE_DEAD_PANE_FIELDS].sort(), [...expectedDeadPane].sort(),
+    'the exported dead-pane allowlist and the rendered set have not drifted apart');
+  assert.deepEqual([...CONSOLE_PANE_META_FIELDS].sort(), [...expectedPaneMeta].sort(),
+    'the exported pane-meta allowlist and the rendered set have not drifted apart');
   assert.equal(dead.meta.openRequestId, undefined);
   assert.equal(dead.meta.launchedBy, undefined);
-  assert.equal(dead.meta.card, 'linked-card');
+  assert.equal(dead.meta.card, 'pane-card');
   assert.equal(dead.pid, 42);
   assert.equal(dead.scope, 'castle');
   assert.equal(dead.exitCode, undefined);
@@ -419,6 +470,7 @@ test('console mode is opt-in and leaves the summary and compact projections unto
   assert.deepEqual(light.slack, state.slack);
   assert.deepEqual(light.defaults, state.defaults);
   assert.equal(light.tasks.length, 4, 'the legacy board still sees every card');
+  assert.equal(light.sessions.find((session) => session.id === 'flagged-exited').lastAssistantFull, undefined);
   assert.equal(light.tasks[0].lastLog, 'latest log');
   assert.equal(light.sessions.find((session) => session.id === 'not-alive').lastUser, 'Large user prompt');
   assert.equal(light.sessions.find((session) => session.id === 'flagged-exited').notify.type, 'complete');
