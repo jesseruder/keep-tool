@@ -74,6 +74,15 @@ export default function Setup({ initialConfig, onCancel, onConnected, onDiagnost
         <Text style={styles.inputLabel}>Token</Text>
         <TextInput autoCapitalize="none" autoCorrect={false} onChangeText={setToken} onSubmitEditing={connect} placeholder="Keep access token" placeholderTextColor={styles.colors.faint} secureTextEntry style={styles.input} value={token} />
 
+        {/* Connect sits with the two fields it reads, not below the whole palette
+            list: on a phone the keyboard is up while the token is being typed,
+            and the button was off the bottom of the screen behind it. What went
+            wrong belongs here too, beside the fields to correct. */}
+        <InlineError error={error} styles={styles} />
+        <View style={styles.setupActions}>
+          <Button loading={connecting} onPress={connect} style={styles.setupAction} styles={styles}>Connect</Button>
+        </View>
+
         {initialConfig ? (
           <>
             <Text style={styles.inputLabel}>Notifications</Text>
@@ -111,11 +120,11 @@ export default function Setup({ initialConfig, onCancel, onConnected, onDiagnost
           })}
         </View>
 
-        <InlineError error={error} styles={styles} />
-        <View style={styles.setupActions}>
-          {initialConfig ? <Button onPress={onCancel} quiet style={styles.setupAction} styles={styles}>Cancel</Button> : null}
-          <Button loading={connecting} onPress={connect} style={styles.setupAction} styles={styles}>Connect</Button>
-        </View>
+        {initialConfig ? (
+          <View style={styles.setupActions}>
+            <Button onPress={onCancel} quiet style={styles.setupAction} styles={styles}>Cancel</Button>
+          </View>
+        ) : null}
         {initialConfig && onForget ? (
           <View style={styles.setupActions}>
             <Button onPress={forget} quiet style={styles.setupAction} styles={styles} textStyle={styles.forgetText}>Forget this server</Button>
