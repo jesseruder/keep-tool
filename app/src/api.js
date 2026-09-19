@@ -1,7 +1,9 @@
-import { configureProjects } from './model';
-const { createStateCache, normalizeServer } = require('./state-cache');
+// The console itself talks to the daemon from inside the WebView, with the
+// `keep-token` cookie the `?token=` bootstrap sets. What is left here is what the
+// native shell still does on its own: the setup check, the background sweep's
+// server address, and the fallback terminal viewer.
+const { normalizeServer } = require('./bridge');
 const { screenHistoryPath } = require('./screen-history');
-const stateCache = createStateCache();
 export { normalizeServer };
 
 export async function request(config, path, options = {}) {
@@ -58,13 +60,10 @@ export async function request(config, path, options = {}) {
   }
 }
 
-export const getState = async (config, descriptor = { view: 'needs' }, options = {}) => {
-  const result = await stateCache.load(config, descriptor, options);
-  configureProjects(result.state);
-  return result;
-};
-export const getNotifications = (config, options = {}) => stateCache.load(config, { view: 'notifications' }, options);
-export const getLayouts = (config) => request(config, '/api/layouts');
+// Setup's connection check: the smallest state view there is, so an address typo or
+// a stale token fails here rather than as a blank WebView.
+export const ping = (config) => request(config, '/api/state?view=notifications');
+
 // Terminals address either an agent session or a bare shell pane; `target` is
 // { sessionId } or { pane }, and the daemon rejects the mixture of both.
 export const send = (config, target, text) => request(config, '/api/send', {
@@ -85,41 +84,3 @@ export const screenHistory = (config, target, options = {}, signal) => request(
 export const keys = (config, target, names) => request(config, '/api/keys', {
   method: 'POST', body: { ...target, keys: names },
 });
-export const spawnShell = (config, cwd, name) => request(config, '/api/panes/spawn', {
-  method: 'POST', body: { cwd, ...(name ? { name } : {}) }, timeoutMs: 30000,
-});
-export const answer = (config, sessionId, option, label) => request(config, '/api/answer', {
-  method: 'POST', body: { sessionId, option, label },
-});
-export const ack = (config, item) => {
-  const body = { kind: item.kind, since: item.since };
-  if (item.id) body.id = item.id;
-  else if (item.sessionId) body.sessionId = item.sessionId;
-  else if (item.taskId) body.taskId = item.taskId;
-  return request(config, '/api/ack', { method: 'POST', body });
-};
-export const setAside = (config, key, kind, minutes) => request(config, '/api/setaside', {
-  method: 'POST', body: { key, kind, ...(minutes === undefined ? {} : { minutes }) },
-});
-// A fresh launch waits on the daemon's own budget: 45s for the agent prompt, up to
-// 15s more for a Codex session id, plus the spawn and any opening message. A client
-// timeout shorter than that reports failure for a launch that then succeeds, and the
-// natural retry starts a second agent.
-export const openSession = (config, body) => request(config, '/api/open', {
-  method: 'POST', body, timeoutMs: 90000,
-});
-export const focus = (config, sessionId) => request(config, '/api/focus', {
-  method: 'POST', body: { sessionId },
-});
-export const reviewTick = (config) => request(config, '/api/reviewtick', {
-  method: 'POST', body: { force: true },
-});
-export const getSessionTail = (config, sessionId) => request(
-  config,
-  `/api/sessiontail?id=${encodeURIComponent(sessionId)}`,
-);
-export const getTask = async (config, taskId, options = {}) => {
-  const result = await getState(config, { view: 'task', id: taskId }, options);
-  if (!result.state.task) throw new Error('Card no longer exists');
-  return result.state.task;
-};

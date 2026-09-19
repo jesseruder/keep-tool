@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { KeyboardAvoidingView, Platform, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 
 import { PALETTES } from '../../theme';
-import { getState, normalizeServer } from '../api';
+import { normalizeServer, ping } from '../api';
 import { Button, InlineError } from '../ui';
 
 const DEFAULT_SERVER = 'http://your-computer:7777';
@@ -22,8 +22,10 @@ export default function Setup({ initialConfig, onCancel, onConnected, onPalette,
     setConnecting(true);
     setError(null);
     try {
-      const result = await getState(config);
-      await onConnected(config, result.state);
+      // Check the address and token here so a typo fails on this form rather than
+      // as an unexplained blank page inside the console's WebView.
+      await ping(config);
+      await onConnected(config);
     } catch (connectError) {
       setError({ message: connectError.message || 'Could not connect', screenTail: connectError.screenTail });
     } finally { setConnecting(false); }
@@ -33,7 +35,7 @@ export default function Setup({ initialConfig, onCancel, onConnected, onPalette,
     <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.setupOuter}>
       <ScrollView contentContainerStyle={styles.setupContent} keyboardShouldPersistTaps="handled">
         <Text style={styles.setupTitle}>Connect to Keep</Text>
-        <Text style={styles.setupIntro}>See what needs you, follow the fleet, and check the reviewer from your phone.</Text>
+        <Text style={styles.setupIntro}>Open your Keep console on your phone: what needs you, the fleet, the reviewer, and every terminal.</Text>
 
         <Text style={styles.inputLabel}>Server URL</Text>
         <TextInput autoCapitalize="none" autoCorrect={false} keyboardType="url" onChangeText={setServer} placeholder={DEFAULT_SERVER} placeholderTextColor={styles.colors.faint} style={styles.input} value={server} />
