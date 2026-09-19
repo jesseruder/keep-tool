@@ -1,6 +1,7 @@
 let lastBadge;
 let desktopPermission = 'default';
 let mobileNotificationClick = null;
+let readyRequested = false;
 
 export function isDesktop() {
   return Boolean(window.__TAURI__);
@@ -9,6 +10,9 @@ export function isDesktop() {
 // The Android WebView shell injects `window.keepShell` before page scripts run:
 // `{ platform, version, post(message) }`, where post() serializes `{type, ...}`
 // to the app. The app calls `window.keepShellReceive(message)` the other way.
+// Evaluated on every call: WebView pre-load injection is best-effort on Android,
+// so the shell may only appear after this module has run, announcing itself with
+// `{type:'hello'}`.
 export function isMobileShell() {
   return Boolean(window.keepShell);
 }
@@ -99,12 +103,10 @@ export async function notify({ title, body, tag, onClick } = {}) {
 }
 
 export async function installNotificationClicks(onClick) {
-  if (isMobileShell()) {
-    // The app delivers the tap through keepShellReceive; nothing to poll.
-    mobileNotificationClick = onClick;
-    return;
-  }
-  if (!isDesktop()) return;
+  // Kept whether or not the shell is here yet: the app delivers taps through
+  // keepShellReceive, and there is nothing to poll or unwind if it never comes.
+  mobileNotificationClick = onClick;
+  if (isMobileShell() || !isDesktop()) return;
   const drain = async () => {
     const key = await window.__TAURI__.core.invoke('get_notification_click');
     if (key) await onClick(key);
@@ -123,18 +125,27 @@ export async function acknowledgeNotificationClick(key) {
 // The console is subscribed and has asked for its first state: the shell may
 // show the page instead of its splash.
 export function shellReady() {
+  readyRequested = true;
   postShell({ type: 'ready' });
 }
 
 export function receiveShellMessage(message) {
   const type = message?.type;
-  if (type === 'notificationClick') {
+  if (type === 'hello') {
+    // The shell arrived after this module ran, or reattached to a live page.
+    // Redo the load-time work and replay what it missed.
+    document.documentElement.classList.toggle('mobile', isMobileShell());
+    if (readyRequested) postShell({ type: 'ready' });
+    if (lastBadge != null) postShell({ type: 'badge', count: lastBadge });
+  } else if (type === 'notificationClick') {
     const key = message.key;
     if (key && mobileNotificationClick) Promise.resolve(mobileNotificationClick(key)).catch(() => {});
   } else if (type === 'reload') location.reload();
 }
 
-if (isMobileShell()) window.keepShellReceive = receiveShellMessage;
+// Defined unconditionally: a shell that shows up late still has somewhere to
+// send its hello, and on any other page nothing ever calls it.
+window.keepShellReceive = receiveShellMessage;
 
 if (isDesktop()) {
   Promise.resolve(window.__TAURI__.notification?.isPermissionGranted?.())

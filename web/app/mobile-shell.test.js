@@ -41,7 +41,9 @@ function element(tag = 'div') {
   return node;
 }
 
-globalThis.location = { protocol: 'http:', host: '10.0.0.4:7777', reload() { reloads += 1; } };
+globalThis.location = {
+  protocol: 'http:', host: '10.0.0.4:7777', origin: 'http://10.0.0.4:7777', reload() { reloads += 1; },
+};
 globalThis.window = {
   keepShell: { platform: 'android', version: '0.1.0', post: (message) => posted.push(message) },
   matchMedia: () => ({ matches: false, addEventListener() {} }),
@@ -128,4 +130,45 @@ test('a pane mounts as a handoff panel, not xterm, and its button posts openTerm
   const untitled = mountTerminal(container, 'pane-8');
   untitled.element.querySelector('.term-handoff-open').click();
   assert.deepEqual(posted.at(-1), { type: 'openTerminal', pane: 'pane-8', session: '', title: 'pane-8' });
+});
+
+test('a 403 tells the shell its session is gone, at most once every ten seconds', async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify({ error: 'unauthorized' }), {
+    status: 403, headers: { 'content-type': 'application/json' },
+  });
+  const api = await import('./api.js');
+  const before = posted.length;
+  await assert.rejects(api.getState(), /unauthorized/);
+  assert.deepEqual(posted.at(-1), { type: 'unauthorized' });
+  await assert.rejects(api.getState(), /unauthorized/);
+  assert.equal(posted.length, before + 1, 'a reload storm is one message, not one per request');
+});
+
+// Android's injectedJavaScriptBeforeContentLoaded is best-effort, so the page can
+// run first. The shell then defines window.keepShell and says hello.
+test('a shell that arrives after the page is picked up by hello', async () => {
+  const late = [];
+  const keepShell = window.keepShell;
+  delete window.keepShell;
+  const fresh = await import('./shell.js?late=1');
+  assert.equal(fresh.isMobileShell(), false);
+  assert.equal(typeof window.keepShellReceive, 'function', 'defined even with no shell in sight');
+  toggled.length = 0;
+
+  const clicked = [];
+  await fresh.installNotificationClicks((key) => clicked.push(key));
+  fresh.setBadge(5);
+  fresh.shellReady();
+  assert.deepEqual(late, []);
+
+  window.keepShell = { platform: 'android', version: '0.1.0', post: (message) => late.push(message) };
+  window.keepShellReceive({ type: 'hello' });
+  assert.deepEqual(toggled, [['mobile', true]]);
+  assert.deepEqual(late, [{ type: 'ready' }, { type: 'badge', count: 5 }]);
+
+  window.keepShellReceive({ type: 'notificationClick', key: 'session-3' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(clicked, ['session-3'], 'the handler installed before the shell still runs');
+
+  window.keepShell = keepShell;
 });
