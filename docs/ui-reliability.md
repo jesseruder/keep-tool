@@ -13,19 +13,36 @@ a request, strips forwarded identity headers, and uses a private per-process tok
 for the Unix hop. It never retries writes.
 
 A request is authorized by loopback with a loopback `Host`, by `x-keep-token`, or
-by a `keep-token` cookie. The cookie exists for shells that can only set headers
-on a top-level navigation — a phone WebView, which cannot set one on the page's
-own scripts, styles, fetches, EventSource or WebSocket. `GET /app?token=<token>`
-is the one place the token is exchanged for it: a matching token answers `302` to
-`/app` with `Set-Cookie: keep-token=…; Max-Age=400d; Path=/; HttpOnly;
-SameSite=Strict` and `cache-control: no-store`, and never echoes the token into a
-body or a log. There is no `Secure`: this is private-network HTTP. A wrong token
-falls through to the ordinary ladder, which is a `403` for anyone who could not
-already reach the console. `SameSite=Strict` plus the unchanged `x-keep: 1` and
-JSON content-type requirements on every mutating route are what keep the cookie
-from becoming a cross-site write. The frontend strips `Cookie` along with the
-other forwarded identity headers before the Unix hop, so the daemon authorizes
-that hop by its private token alone.
+— at the frontend worker only — by a browser session. Sessions exist for shells
+that can set headers on a top-level navigation only: a phone WebView cannot set
+one on the page's own scripts, styles, fetches, EventSource or WebSocket.
+`GET /app?token=<token>` is the one place a token becomes a session. A matching
+token answers `302` to `/app` with `Set-Cookie: keep-session=<32 random bytes,
+base64url>; Max-Age=400d; Path=/; HttpOnly; SameSite=Strict` and `cache-control:
+no-store`, and never echoes the token into a body or a log. There is no `Secure`:
+this is private-network HTTP. A wrong token falls through to the ordinary ladder,
+which is a `403` for anyone who could not already reach the console.
+
+The cookie is an opaque id, never the daemon token, because cookies are not
+isolated by port: a token cookie would be handed to every other service on the
+Mac, and any of them could replay it as `x-keep-token`. The worker keeps at most
+32 sessions in memory as `{createdAt, lastSeenAt, host}`, evicting the oldest,
+and accepts one only when the request `Host` equals the host it was issued for.
+Nothing is written to disk and sessions die with the worker process; the app
+notices through the `unauthorized` message below and re-runs its bootstrap.
+
+For the same reason a session is not general authority: a page on another port of
+this host is *same-site*, so `SameSite=Strict` does not stop it from sending the
+cookie here. A session-authorized request must carry `x-keep: 1` for everything
+except `GET` of `/app`, `/app/*`, `/vendor/*`, `/api/events`, and the pane socket
+upgrade — the requests the browser itself issues. That header is the whole
+cross-site barrier: a hostile page cannot add it without a CORS preflight, and
+there is no `access-control-allow-origin` anywhere in this tree. It has to carry
+the barrier alone, because the body readers parse JSON whatever the content type
+claims. Loopback and header-token clients are unaffected by the rule. The
+frontend strips `Cookie` along with the other forwarded identity headers before
+the Unix hop, so the daemon authorizes that hop by its private token alone and
+its own `authorized()` knows nothing about cookies.
 
 A pane socket upgrade needs that same authorization plus an origin rule:
 an `Origin` whose host equals the request's `Host` — any host, so the console

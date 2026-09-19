@@ -116,15 +116,24 @@ reads the watcher's own status file, not health.
 ## Console access
 
 The console at `/app` is authorized three ways: a loopback peer with a loopback
-`Host`, an `x-keep-token` header, or a `keep-token` cookie. The cookie is for a
-shell that can set headers only on its top-level navigation — the Android WebView
+`Host`, an `x-keep-token` header, or a browser session. Sessions are for a shell
+that can set headers only on its top-level navigation — the Android WebView
 shell, whose page scripts, fetches, EventSource and WebSocket cannot. It opens
 `http://<mac>:7777/app?token=<token>` once; a matching token answers `302 /app`
-with `Set-Cookie: keep-token=…; Max-Age=400d; Path=/; HttpOnly; SameSite=Strict`
-and `cache-control: no-store`, and the token never appears in a body or a log. A
-wrong token gets the ordinary `403`. Mutating routes still require `x-keep: 1`
-and a JSON content type, which with `SameSite=Strict` is what makes the cookie
-safe; the frontend strips `Cookie` before the Unix hop to the daemon.
+with `Set-Cookie: keep-session=<32 random bytes, base64url>; Max-Age=400d;
+Path=/; HttpOnly; SameSite=Strict` and `cache-control: no-store`, and the token
+never appears in a body or a log. A wrong token gets the ordinary `403`.
+
+The cookie is an opaque id, never the token itself: cookies are not isolated by
+port, so a token cookie would reach every other service on the Mac and could be
+replayed as `x-keep-token`. The frontend worker holds at most 32 sessions in
+memory (oldest evicted), each valid only for the `Host` it was issued for, and
+forgets them all when it restarts — the app re-runs its bootstrap. For the same
+reason a session must carry `x-keep: 1` on everything except `GET` of `/app`,
+`/app/*`, `/vendor/*`, `/api/events` and the pane socket upgrade: a page on
+another port of this host is same-site, and that header is what it cannot add
+without a CORS preflight nothing here answers. Loopback and header-token clients
+are unaffected. The worker strips `Cookie` before the Unix hop to the daemon.
 
 A pane socket (`/ws/pane/<id>`) additionally needs either an `Origin` whose host
 equals the request's `Host`, or no `Origin` and a valid `x-keep-token` (a native
@@ -134,13 +143,18 @@ The console detects the mobile shell as `window.keepShell`
 (`{ platform, version, post(message) }`, injected before page scripts) and sets
 `<html class="mobile">`. Console → shell messages, all through `post()`:
 `{type:'ready'}` once the console has subscribed, `{type:'badge', count}`,
-`{type:'notify', title, body, key}`, and `{type:'openTerminal', pane, session,
+`{type:'notify', title, body, key}`, `{type:'openTerminal', pane, session,
 title}` from the terminal handoff panel the console shows instead of mounting
-xterm. Shell → console: the app calls `window.keepShellReceive(message)` with
-`{type:'notificationClick', key}`, which lands in the same handler the desktop
-shell's notification clicks use, or `{type:'reload'}`. On the mobile shell the
-app owns notification permission (always `granted`), the launcher badge, and
-waiting sounds.
+xterm, and `{type:'unauthorized'}` (at most once per 10s) when a request comes
+back `403`, which is how the app learns its session is gone and re-bootstraps
+through `/app?token=`. Shell → console: the app calls
+`window.keepShellReceive(message)` — defined unconditionally, since Android's
+pre-load injection is best-effort — with `{type:'hello'}` when it defines
+`window.keepShell` after the page has already run (the console then sets the
+`mobile` class and re-posts `ready` and the last badge), `{type:'notificationClick',
+key}`, which lands in the same handler the desktop shell's notification clicks
+use, or `{type:'reload'}`. On the mobile shell the app owns notification
+permission (always `granted`), the launcher badge, and waiting sounds.
 
 ## CLI
 

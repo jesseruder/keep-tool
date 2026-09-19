@@ -7,7 +7,7 @@ const http = require('node:http');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
-const { createUiRequestServer } = require('./ui-request-server.js');
+const { createUiRequestServer, MAX_SESSIONS } = require('./ui-request-server.js');
 
 function request(port, pathname, options = {}) {
   return new Promise((resolve, reject) => {
@@ -346,26 +346,42 @@ test('a chain that outgrew the projection is answered with the projection', asyn
 test('the shell trades its token for a cookie once, and the cookie carries the whole console', async (t) => {
   const f = await fixture(t);
   const lan = { host: '10.0.0.4:7777' };
-  const cookie = { ...lan, cookie: 'keep-token=public-secret' };
 
   const granted = await request(f.port, '/app?token=public-secret', { headers: lan });
   assert.equal(granted.status, 302);
   assert.equal(granted.headers.location, '/app');
-  assert.equal(granted.headers['set-cookie'][0],
-    'keep-token=public-secret; Max-Age=34560000; Path=/; HttpOnly; SameSite=Strict');
+  const [setCookie] = granted.headers['set-cookie'];
+  assert.match(setCookie, /^keep-session=[A-Za-z0-9_-]{43}; Max-Age=34560000; Path=\/; HttpOnly; SameSite=Strict$/);
+  assert.equal(/public-secret/.test(setCookie), false, 'the cookie is an opaque id, never the daemon token');
+  assert.equal(/Secure/.test(setCookie), false, 'the private network is plain HTTP');
   assert.equal(granted.headers['cache-control'], 'no-store');
   assert.equal(granted.body, '', 'the token is never echoed');
   assert.equal((await request(f.port, '/app?token=wrong', { headers: lan })).status, 403);
   assert.equal((await request(f.port, '/app', { headers: lan })).status, 403);
 
+  const cookie = { ...lan, cookie: setCookie.split(';')[0] };
   assert.equal((await request(f.port, '/app', { headers: cookie })).status, 200);
   assert.equal((await request(f.port, '/app/app.js', { headers: cookie })).status, 200);
   assert.equal((await request(f.port, '/vendor/xterm.js', { headers: cookie })).status, 200);
-  assert.equal((await request(f.port, '/api/layouts', { headers: cookie })).status, 200);
-  assert.equal((await request(f.port, '/api/portable-transfers', { headers: { ...cookie, 'x-keep': '1' } })).status, 503,
-    'loading, not unauthorized: the x-keep gate is unchanged');
-  assert.equal((await request(f.port, '/api/portable-transfers', { headers: cookie })).status, 403,
-    'x-keep is still required of a cookie-authenticated page');
+  assert.equal((await request(f.port, '/app', { headers: { ...cookie, host: '10.0.0.9:7777' } })).status, 403,
+    'a session is only valid for the host it was issued for');
+  assert.equal((await request(f.port, '/app', { headers: { ...lan, cookie: 'keep-token=public-secret' } })).status, 403,
+    'a raw-token cookie is not a session');
+  assert.equal((await request(f.port, '/app', { headers: { ...lan, cookie: 'keep-session=made-up' } })).status, 403);
+
+  assert.equal((await request(f.port, '/api/state', { headers: cookie })).status, 403,
+    'without x-keep a session reaches nothing but the page and its stream');
+  assert.equal((await request(f.port, '/api/state', { headers: { ...cookie, 'x-keep': '1' } })).status, 503,
+    'loading, not unauthorized');
+  assert.equal((await request(f.port, '/api/layouts', { headers: cookie })).status, 403);
+  assert.equal((await request(f.port, '/api/layouts', { headers: { ...cookie, 'x-keep': '1' } })).status, 200);
+  assert.equal((await request(f.port, '/api/portable-transfers', { headers: cookie })).status, 403);
+  assert.equal((await request(f.port, '/api/portable-transfers', { headers: { ...cookie, 'x-keep': '1' } })).status, 503);
+  assert.equal((await request(f.port, '/api/action', { method: 'POST', headers: cookie, body: '{}' })).status, 403,
+    'a same-site page cannot add x-keep without a preflight nothing here answers');
+  assert.equal(f.seen.length, 0, 'none of that reached the daemon');
+  assert.equal((await request(f.port, '/api/state')).status, 503,
+    'loopback and header clients never meet the x-keep rule');
 
   const proxied = await request(f.port, '/api/action', {
     method: 'POST', headers: { ...cookie, 'x-keep': '1' }, body: '{}',
@@ -375,13 +391,38 @@ test('the shell trades its token for a cookie once, and the cookie carries the w
   assert.equal(f.seen.at(-1).headers['x-keep-proxy-token'], 'private-secret');
 });
 
-test('a cookie-authenticated page streams events and opens a pane socket from its own origin', async (t) => {
+test('sessions are bounded, host-bound, and forgotten when the worker is replaced', async (t) => {
+  const f = await fixture(t);
+  const lan = { host: '10.0.0.4:7777' };
+  const issue = async () => {
+    const response = await request(f.port, '/app?token=public-secret', { headers: lan });
+    return response.headers['set-cookie'][0].split(';')[0];
+  };
+  const first = await issue();
+  const cookies = [first];
+  for (let index = 1; index < MAX_SESSIONS; index += 1) cookies.push(await issue());
+  assert.equal((await request(f.port, '/app', { headers: { ...lan, cookie: first } })).status, 200,
+    'the ring is exactly full, so the first session is still there');
+  const overflow = await issue();
+  assert.equal((await request(f.port, '/app', { headers: { ...lan, cookie: first } })).status, 403,
+    'the oldest session is evicted at the limit');
+  assert.equal((await request(f.port, '/app', { headers: { ...lan, cookie: cookies[1] } })).status, 200);
+  assert.equal((await request(f.port, '/app', { headers: { ...lan, cookie: overflow } })).status, 200);
+
+  const replacement = await fixture(t);
+  assert.equal((await request(replacement.port, '/app', { headers: { ...lan, cookie: overflow } })).status, 403,
+    'sessions live in the worker process and die with it');
+});
+
+test('a session streams events and opens a pane socket from its own origin, without the header', async (t) => {
   let upgrades = 0;
   const f = await fixture(t, { bridge: { handleUpgrade(_req, socket) { upgrades += 1;
     socket.end('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n'); }, close() {} } });
+  const issued = await request(f.port, '/app?token=public-secret', { headers: { host: '10.0.0.4:7777' } });
+  const cookie = issued.headers['set-cookie'][0].split(';')[0];
   const hello = await new Promise((resolve, reject) => {
     const req = http.get({ host: '127.0.0.1', port: f.port, path: '/api/events',
-      headers: { host: '10.0.0.4:7777', cookie: 'keep-token=public-secret' } }, (res) => {
+      headers: { host: '10.0.0.4:7777', cookie } }, (res) => {
       if (res.statusCode !== 200) { req.destroy(); resolve(`status ${res.statusCode}`); return; }
       res.on('data', (chunk) => { req.destroy(); resolve(String(chunk)); });
     });
@@ -389,18 +430,19 @@ test('a cookie-authenticated page streams events and opens a pane socket from it
   });
   assert.match(hello, /data: hello/);
 
-  const upgrade = (origin, cookie = '') => new Promise((resolve, reject) => {
+  const upgrade = (origin, sent = '') => new Promise((resolve, reject) => {
     const lines = ['GET /ws/pane/p-1?viewer=v HTTP/1.1', 'Host: 10.0.0.4:7777', `Origin: ${origin}`];
-    if (cookie) lines.push(`Cookie: ${cookie}`);
+    if (sent) lines.push(`Cookie: ${sent}`);
     lines.push('Connection: Upgrade', 'Upgrade: websocket', '', '');
     const socket = net.createConnection(f.port, '127.0.0.1', () => socket.write(lines.join('\r\n')));
     socket.once('data', (chunk) => { socket.destroy(); resolve(String(chunk)); });
     socket.once('error', reject);
   });
-  assert.match(await upgrade("http://10.0.0.4:7777", "keep-token=public-secret"), /101 Switching Protocols/);
+  assert.match(await upgrade('http://10.0.0.4:7777', cookie), /101 Switching Protocols/);
   assert.equal(upgrades, 1);
   assert.match(await upgrade('http://10.0.0.4:7777'), /403 Forbidden/, 'the matching origin is not itself authorization');
-  assert.match(await upgrade('http://evil.example', 'Cookie: keep-token=public-secret'), /403 Forbidden/);
+  assert.match(await upgrade('http://evil.example', cookie), /403 Forbidden/);
+  assert.match(await upgrade('http://10.0.0.4:7777', 'keep-session=made-up'), /403 Forbidden/);
   assert.equal(upgrades, 1);
   assert.equal(f.seen.length, 0);
 });

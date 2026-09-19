@@ -6,14 +6,6 @@ const { createTerminalBridge } = require('./terminal-bridge.js');
 const { createTerminalRelay } = require('./terminal-relay.js');
 
 const FULL_SNAPSHOT_SCROLLBACK = 10000;
-const TOKEN_COOKIE = 'keep-token';
-// Long enough that a phone shell never has to be re-paired in practice; Chrome
-// clamps anything past 400 days to 400 days anyway.
-const TOKEN_COOKIE_MAX_AGE = 400 * 24 * 60 * 60;
-// The cookie-value grammar minus the characters that would need quoting. Tokens
-// keep serve generates are hex; a hand-written one outside this set simply does
-// not get a cookie, and the header and loopback paths still work.
-const COOKIE_SAFE_TOKEN = /^[A-Za-z0-9._~+/=-]+$/;
 const MIME = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -59,8 +51,9 @@ function tokenMatches(candidate, expected) {
   return wanted.length > 0 && actual.length === wanted.length && crypto.timingSafeEqual(actual, wanted);
 }
 
-// Minimal Cookie-header parsing: split on ';', trim, first '='. Anything a
-// browser would not have sent simply fails to match the token.
+// Minimal Cookie-header parsing: split on ';', trim, first '='. A cookie never
+// authorizes anything here — the frontend worker owns browser sessions, and the
+// daemon hop it makes is authorized by the private per-process token.
 function cookieValue(header, name) {
   for (const part of String(header || '').split(';')) {
     const entry = part.trim();
@@ -74,25 +67,7 @@ function cookieValue(header, name) {
 function authorized(req, deps) {
   return tokenMatches(req.headers['x-keep-proxy-token'], deps.internalToken)
     || (deps.isLocal(req.socket.remoteAddress) && localHost(req.headers.host))
-    || tokenMatches(req.headers['x-keep-token'], deps.token)
-    // A WebView sets headers on its top-level navigation only: the page's own
-    // scripts, fetches, EventSource and WebSocket carry the cookie instead.
-    || tokenMatches(cookieValue(req.headers.cookie, TOKEN_COOKIE), deps.token);
-}
-
-// `GET /app?token=<token>` is the one place the token is exchanged for a cookie.
-// Returns the redirect headers, or null when this is not that request — a wrong
-// token falls through to the ordinary authorization ladder, which answers 403
-// for anyone who cannot reach the console without it.
-function appTokenRedirect(req, url, token) {
-  if (req.method !== 'GET') return null;
-  if (url.pathname !== '/app' && url.pathname !== '/app/') return null;
-  const offered = url.searchParams.get('token');
-  if (offered == null || !tokenMatches(offered, token) || !COOKIE_SAFE_TOKEN.test(token)) return null;
-  return {
-    location: '/app',
-    'set-cookie': `${TOKEN_COOKIE}=${token}; Max-Age=${TOKEN_COOKIE_MAX_AGE}; Path=/; HttpOnly; SameSite=Strict`,
-  };
+    || tokenMatches(req.headers['x-keep-token'], deps.token);
 }
 
 function writeDenied(res) {
@@ -436,6 +411,6 @@ function install(input) {
 }
 
 module.exports = {
-  VENDOR, TOKEN_COOKIE, install, validateLayouts, readLayouts, writeLayouts,
-  sameOrigin, upgradeOriginAllowed, authorized, appTokenRedirect, cookieValue, staticPath, serveFile,
+  VENDOR, install, validateLayouts, readLayouts, writeLayouts,
+  sameOrigin, upgradeOriginAllowed, authorized, tokenMatches, cookieValue, staticPath, serveFile,
 };

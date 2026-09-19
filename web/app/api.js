@@ -13,6 +13,19 @@ const STATE_MUTATIONS = new Set([
 ]);
 let stateAfterMutation = '';
 let observedMutationFence = '';
+let unauthorizedPostedAt = 0;
+
+// The mobile shell's session cookie can outlive the worker that issued it (they
+// are in memory only). A 403 is how the page learns that; the shell answers by
+// re-running its /app?token= bootstrap. Sniffed rather than imported so this
+// module keeps working without a DOM.
+function reportUnauthorized() {
+  if (!globalThis.window?.keepShell) return;
+  const now = Date.now();
+  if (now - unauthorizedPostedAt < 10e3) return;
+  unauthorizedPostedAt = now;
+  try { window.keepShell.post({ type: 'unauthorized' }); } catch {}
+}
 
 function rememberMutationFence(fence, observedAtStart) {
   const [epoch, sequenceText] = String(fence || '').split(':');
@@ -53,6 +66,7 @@ async function request(url, options = {}) {
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch {}
   if (!response.ok) {
+    if (response.status === 403) reportUnauthorized();
     const error = new Error(body?.error || text || `${response.status} ${response.statusText}`);
     error.status = response.status;
     error.body = body;

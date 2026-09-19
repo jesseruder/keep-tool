@@ -20,6 +20,20 @@ const HOP_HEADERS = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
   'te', 'trailer', 'transfer-encoding', 'upgrade',
 ]);
+const SESSION_COOKIE = 'keep-session';
+// Long enough that a phone shell is never re-paired by hand; browsers clamp
+// anything past 400 days to 400 days anyway. The session itself is in memory
+// and dies with this worker, which is what bounds it in practice.
+const SESSION_MAX_AGE = 400 * 24 * 60 * 60;
+const MAX_SESSIONS = 32;
+// What a browser session may reach without `x-keep: 1`. Everything else it asks
+// for needs the header, which a cross-site page cannot add without a CORS
+// preflight nothing here ever answers (no access-control-allow-origin exists in
+// this tree). That header is the only cross-site barrier there is: the body
+// readers parse JSON whatever the content type says, and a same-host page on
+// another port is same-site, so SameSite=Strict does not stop it.
+const COOKIE_OPEN_PATHS = (pathname) => pathname === '/app' || pathname.startsWith('/app/')
+  || pathname.startsWith('/vendor/') || pathname === '/api/events';
 
 function json(res, status, value, headers = {}) {
   const body = JSON.stringify(value);
@@ -71,6 +85,40 @@ function createUiRequestServer(options = {}) {
 
   const authorized = (req) => keepConsole.authorized(req, { isLocal, token });
   const deny = (res) => json(res, 403, { error: 'unauthorized' });
+
+  // Browser sessions. The cookie is an opaque id, never the daemon token: a
+  // cookie is not isolated by port, so a token cookie would be handed to every
+  // other service on this host and could be replayed as x-keep-token. An id is
+  // worth nothing anywhere but here, and only for the Host it was issued for.
+  const sessions = new Map();
+  const requestHost = (req) => String(req.headers.host || '').toLowerCase();
+  const issueSession = (host) => {
+    while (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
+    const id = crypto.randomBytes(32).toString('base64url');
+    const now = Date.now();
+    sessions.set(id, { createdAt: now, lastSeenAt: now, host });
+    return id;
+  };
+  const sessionFor = (req) => {
+    const id = keepConsole.cookieValue(req.headers.cookie, SESSION_COOKIE);
+    const entry = id ? sessions.get(id) : null;
+    if (!entry || entry.host !== requestHost(req)) return null;
+    entry.lastSeenAt = Date.now();
+    return entry;
+  };
+  // `GET /app?token=<token>` is the one place a token becomes a session: a
+  // WebView can set headers on its top-level navigation only, never on the
+  // page's scripts, fetches, EventSource or WebSocket.
+  const appTokenGrant = (req, url) => {
+    if (req.method !== 'GET') return null;
+    if (url.pathname !== '/app' && url.pathname !== '/app/') return null;
+    const offered = url.searchParams.get('token');
+    if (offered == null || !keepConsole.tokenMatches(offered, token)) return null;
+    return {
+      location: '/app',
+      'set-cookie': `${SESSION_COOKIE}=${issueSession(requestHost(req))}; Max-Age=${SESSION_MAX_AGE}; Path=/; HttpOnly; SameSite=Strict`,
+    };
+  };
   const snapshotHeaders = () => current ? {
     'x-keep-state-generated-at': String(current.generatedAt),
     'x-keep-state-version': String(current.version),
@@ -177,15 +225,23 @@ function createUiRequestServer(options = {}) {
     try {
       const url = new URL(req.url, 'http://localhost');
       // The public listener is the only door a phone shell knocks on, so the
-      // token-for-cookie exchange lives here and runs before the auth ladder:
+      // token-for-session exchange lives here and runs before the auth ladder:
       // the navigation that carries the token is not otherwise authorized.
-      const grant = keepConsole.appTokenRedirect(req, url, token);
+      const grant = appTokenGrant(req, url);
       if (grant) {
         res.writeHead(302, { ...grant, 'cache-control': 'no-store', 'content-length': 0 });
         res.end();
         return;
       }
-      if (!authorized(req)) return deny(res);
+      if (!authorized(req)) {
+        // A session may fetch the console and its event stream as the browser
+        // itself asks for them; anything else has to prove it is the console's
+        // own code by carrying the header a cross-site page cannot add.
+        if (!sessionFor(req)) return deny(res);
+        if (req.headers['x-keep'] !== '1' && !(req.method === 'GET' && COOKIE_OPEN_PATHS(url.pathname))) {
+          return deny(res);
+        }
+      }
       const rawPath = String(req.url || '').split(/[?#]/, 1)[0];
       let traversal = false;
       if (rawPath.startsWith('/app/')) {
@@ -271,7 +327,7 @@ function createUiRequestServer(options = {}) {
     try { url = new URL(req.url, 'http://localhost'); } catch { socket.destroy(); return; }
     const match = url.pathname.match(/^\/ws\/pane\/([^/]+)$/);
     if (!match) { socket.destroy(); return; }
-    if (!authorized(req) || !keepConsole.upgradeOriginAllowed(req, { token })) {
+    if ((!authorized(req) && !sessionFor(req)) || !keepConsole.upgradeOriginAllowed(req, { token })) {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
       socket.destroy();
       return;
@@ -361,4 +417,4 @@ function createUiRequestServer(options = {}) {
   };
 }
 
-module.exports = { createUiRequestServer, filteredHeaders, MAX_PROXY_IN_FLIGHT, STATE_DELTA_HISTORY };
+module.exports = { createUiRequestServer, filteredHeaders, MAX_PROXY_IN_FLIGHT, STATE_DELTA_HISTORY, MAX_SESSIONS };
