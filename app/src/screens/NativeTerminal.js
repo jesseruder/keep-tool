@@ -18,7 +18,9 @@ const { createEmulator } = require('../terminal/emulator');
 const { encodeKey, encodePaste, encodeText, inputDelta } = require('../terminal/keys');
 const { createRenderQueue } = require('../terminal/render-queue');
 const { rowSegments } = require('../terminal/row');
+const { createScrollbackMirror } = require('../terminal/scrollback');
 const { openPaneSocket } = require('../terminal/socket');
+const { createTerminalStream } = require('../terminal/stream');
 const { runStyle } = require('../terminal/style');
 const { clampFontSize, createPinch, MAX_FONT_SIZE, MIN_FONT_SIZE } = require('../terminal/zoom');
 
@@ -234,7 +236,12 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
   const inputRef = useRef(null);
   const scrollRef = useRef(null);
   const followRef = useRef(true);
-  const scrollbackRef = useRef({ seq: 0, rows: [], sliding: false });
+  // The rows above the screen, mirrored out of the emulator; src/terminal/scrollback.js
+  // owns the awkward part, which is when what it holds stops matching the buffer.
+  const mirrorRef = useRef(null);
+  if (mirrorRef.current === null) {
+    mirrorRef.current = createScrollbackMirror({ page: SCROLLBACK_PAGE, max: MAX_CACHED_SCROLLBACK });
+  }
   // The mounted window, as a ref as well, because the paint step runs off a timer
   // and must read the current one rather than the one its closure was made with.
   const windowRef = useRef(SCROLLBACK_PAGE);
@@ -287,50 +294,9 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
     return () => controller.abort();
   }, [config, target?.pane, target?.session]);
 
-  // Everything the mounted scrollback rows are read from, in one place: the append
-  // path while the emulator's buffer still has room, and a straight read of the
-  // mounted window once it is full. Once the buffer is dropping its oldest line for
-  // every new one, what was collected earlier is no longer contiguous with what is on
-  // screen, and appending to it would show the reader a seam without saying so.
-  const syncScrollback = useCallback((emulator, window) => {
-    if (emulator.isAlternate()) return;
-    const { length, saturated } = emulator.normalScrollback();
-    const cache = scrollbackRef.current;
-    if (saturated) {
-      const want = Math.max(SCROLLBACK_PAGE, window);
-      const rows = emulator.scrollbackRows(want, want);
-      // These rows are a window onto a buffer that slides under them, so a key can
-      // only be a position in the window; nothing here is the same line it was a
-      // moment ago. The prefix keeps them from ever colliding with the collected
-      // rows' keys, which are positions in the pane's output.
-      scrollbackRef.current = {
-        seq: length, rows: rows.map((row, index) => ({ key: `sbw:${index}`, row })), sliding: true,
-      };
-      setScrollback(scrollbackRef.current.rows);
-      return;
-    }
-    if (cache.sliding) {
-      // The buffer is back under its limit, which only a reset does, and its lines are
-      // numbered from zero again; start collecting from there.
-      scrollbackRef.current = { seq: 0, rows: [], sliding: false };
-      setScrollback([]);
-    }
-    const held = scrollbackRef.current;
-    const grown = length - (held.seq + held.rows.length);
-    if (grown <= 0) return;
-    const added = emulator.scrollbackRows(grown, grown).map((row, index) => ({
-      key: `sb:${held.seq + held.rows.length + index}`,
-      row,
-    }));
-    let next = [...held.rows, ...added];
-    let seq = held.seq;
-    if (next.length > MAX_CACHED_SCROLLBACK) {
-      const dropped = next.length - MAX_CACHED_SCROLLBACK;
-      next = next.slice(dropped);
-      seq += dropped;
-    }
-    scrollbackRef.current = { seq, rows: next, sliding: false };
-    setScrollback(next);
+  const syncScrollback = useCallback((emulator, options = {}) => {
+    const next = mirrorRef.current.sync(emulator, windowRef.current, options);
+    if (next) setScrollback(next);
   }, []);
 
   // One paint: the rows the parser touched since the last frame, plus everything the
@@ -360,7 +326,7 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
       && current.length === nextCursor.length ? current : nextCursor));
     setAlternate(emulator.isAlternate());
 
-    // A saturated buffer has to be re-read rather than added to, and re-reading the
+    // A full buffer has to be re-read rather than added to, and re-reading the
     // mounted window on every frame of a build log would be the most expensive thing
     // on screen. While the reader is following the output the rows above are off the
     // screen, so the read waits until they scroll up (onScroll does it then).
@@ -369,17 +335,16 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
       return;
     }
     scrollbackStaleRef.current = false;
-    syncScrollback(emulator, windowRef.current);
+    syncScrollback(emulator);
   }, [syncScrollback]);
 
   // A reattach replays the screen from scratch (the replay opens with a reset), so
   // what was collected describes a buffer that no longer exists, and the new one
   // numbers its lines from zero again.
   const resetCaches = useCallback(() => {
-    scrollbackRef.current = { seq: 0, rows: [], sliding: false };
+    setScrollback(mirrorRef.current.reset());
     scrollbackStaleRef.current = false;
     windowRef.current = SCROLLBACK_PAGE;
-    setScrollback([]);
     setScrollbackWindow(SCROLLBACK_PAGE);
   }, []);
 
@@ -389,6 +354,20 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
     emulatorRef.current = emulator;
     const queue = createRenderQueue({ intervalMs: FRAME_MS, onFlush: paint });
     queueRef.current = queue;
+    // Writes and resizes go down one line, in order: a resize is immediate and a write
+    // is not, so applying one the moment a pane frame reports it would lay bytes that
+    // are still in xterm's queue out at a geometry they were never written for.
+    const stream = createTerminalStream({
+      emulator,
+      onParsed: () => queue.invalidate(emulator.takeDirty()),
+      onResized: () => {
+        // xterm reflows on a resize: rows re-wrap and move between the screen and the
+        // scrollback, so every row collected above the screen describes a width that
+        // no longer exists. They are read again rather than added to.
+        syncScrollback(emulator, { rebuild: true });
+        queue.invalidateAll();
+      },
+    });
     setStatus('connecting');
 
     const socket = openPaneSocket({
@@ -398,31 +377,32 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
       // Every mount is its own viewer: the host counts viewers, and reusing one id
       // across two phones or two mounts would hide one of them.
       viewer: `mobile-${Math.random().toString(36).slice(2, 10)}`,
-      drain: (done) => emulator.drain(done),
+      // What "the screen is current" means with a stream in the way: everything the
+      // stream is holding has reached the parser, and the parser has finished it.
+      // Draining the emulator alone would step over replay frames still queued here.
+      drain: () => stream.idle().then(() => emulator.drain()),
       onAttached: (message) => {
         const state = message.pane || {};
         setPaneState(state);
         setMoreHistory(message.history?.truncated === true);
-        // The pane's geometry is the pane's: this client adopts it and never sends a
-        // resize of its own.
-        if (Number.isInteger(state.cols) && Number.isInteger(state.rows)) {
-          emulator.resize(state.cols, state.rows);
-        }
         resetCaches();
+        // The pane's geometry is the pane's: this client adopts it and never sends a
+        // resize of its own. It goes through the stream so it lands before the replay
+        // that follows it.
+        if (Number.isInteger(state.cols) && Number.isInteger(state.rows)) {
+          stream.resize(state.cols, state.rows);
+        }
         queue.invalidateAll();
       },
-      onReplay: (data) => emulator.write(data),
+      onReplay: (data) => stream.write(data),
       onReplayEnd: () => {
         queue.invalidateAll();
         queue.flush();
         setStatus('live');
       },
-      onData: (data) => {
-        // The dirty list is only complete once the parser has applied the chunk;
-        // xterm's write queue is asynchronous, so the frame is scheduled from its
-        // callback rather than from the frame's arrival.
-        emulator.write(data, () => queue.invalidate(emulator.takeDirty()));
-      },
+      // The dirty list is only complete once the parser has applied the chunk, so the
+      // frame is scheduled from the stream's parsed callback, not from the arrival.
+      onData: (data) => stream.write(data),
       onPaneState: (next, message) => {
         if (next) {
           setPaneState(next);
@@ -431,8 +411,7 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
           // in a different place than it does on the desktop.
           if (Number.isInteger(next.cols) && Number.isInteger(next.rows)
             && (next.cols !== emulator.cols || next.rows !== emulator.term.rows)) {
-            emulator.resize(next.cols, next.rows);
-            queue.invalidateAll();
+            stream.resize(next.cols, next.rows);
           }
         }
         if (message?.t === 'exit') setStatus('exited');
@@ -451,12 +430,16 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
       queueRef.current = null;
       emulatorRef.current = null;
       socket.close();
+      stream.dispose();
       queue.dispose();
       emulator.dispose();
       setRows([]);
       setPaneState(null);
+      // The mirror outlives the emulator it was reading; a new pane must not inherit
+      // the rows of the one before it.
+      resetCaches();
     };
-  }, [config?.server, config?.token, note, paint, pane, resetCaches]);
+  }, [config?.server, config?.token, note, paint, pane, resetCaches, syncScrollback]);
 
   const send = useCallback((bytes) => {
     if (!bytes) return;
@@ -521,11 +504,11 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
     // First mount more of what the app already holds, then ask the host for the rest:
     // `history=full` reattaches with the pane's whole scrollback in the snapshot,
     // which is how the desktop console's own history button works.
-    if (scrollbackWindow < scrollbackRef.current.rows.length) {
+    if (scrollbackWindow < mirrorRef.current.rows().length) {
       windowRef.current = scrollbackWindow + SCROLLBACK_PAGE;
       setScrollbackWindow(windowRef.current);
       const emulator = emulatorRef.current;
-      if (emulator) syncScrollback(emulator, windowRef.current);
+      if (emulator) syncScrollback(emulator);
       return;
     }
     const socket = socketRef.current;
@@ -567,7 +550,7 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
     const emulator = emulatorRef.current;
     if (!atBottom && emulator && scrollbackStaleRef.current) {
       scrollbackStaleRef.current = false;
-      syncScrollback(emulator, windowRef.current);
+      syncScrollback(emulator);
     }
   }, [syncScrollback]);
 

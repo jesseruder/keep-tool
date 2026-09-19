@@ -93,16 +93,24 @@ function cursorOffset(line, cols, cell, cursorX) {
   // string unit each, which is what the renderer pads the row out with.
   if (!line) return { offset: limit, length: 1 };
   let offset = 0;
-  let length = 1;
+  // The glyph the walk last stepped over, so a cursor parked on a continuation cell
+  // can be answered with the character that owns it.
+  let previous = { offset: 0, length: 1 };
   for (let x = 0; x < cols; x++) {
     line.getCell(x, cell);
-    // The trailing half of a wide glyph is not a position of its own.
-    if (cell.getWidth() === 0) continue;
+    if (cell.getWidth() === 0) {
+      // The trailing half of a wide glyph is not a position of its own: a cursor
+      // there is on the glyph, not one character past it. Skipping the cell before
+      // checking the limit drew the block over the next character instead.
+      if (x >= limit) return previous;
+      continue;
+    }
     const chars = cell.getChars() || ' ';
-    if (x >= limit) { length = chars.length; break; }
+    if (x >= limit) return { offset, length: chars.length };
+    previous = { offset, length: chars.length };
     offset += chars.length;
   }
-  return { offset, length };
+  return { offset, length: 1 };
 }
 
 function createEmulator(options = {}) {

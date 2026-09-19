@@ -71,6 +71,8 @@ bar says so.
 | --- | --- |
 | `terminal/emulator.js` | the parser, the viewport rows, the scrollback, the cursor and the modes |
 | `terminal/socket.js` | the relay: attach, replay, live bytes, visibility, reconnect, `history=full` |
+| `terminal/stream.js` | writes and resizes in one order: a resize drains what was written before it |
+| `terminal/scrollback.js` | the rows above the screen, mirrored out of the buffer |
 | `terminal/render-queue.js` | the ~30 fps clock and the coalescing of dirty rows |
 | `terminal/row.js` | a row cut into styling runs, with the cursor cell split out |
 | `terminal/style.js` | a run turned into a React Native style, including the 256-colour palette |
@@ -93,10 +95,17 @@ scroll off the top are kept as they go past and mounted above the live screen, s
 scrolling up reads them; the view follows the output whenever it is at the bottom.
 How many went past is *measured* (the normal buffer's `baseY`, which a scroll region
 or the alternate screen does not touch) rather than counted from xterm's scroll
-events, which fire for both. Once the emulator's 10,000-line buffer is full it drops
-its oldest line for every new one, so the collected rows would stop being contiguous
-with the screen; from there the mounted window is re-read from the buffer instead,
-and only while the reader is actually looking at it.
+events, which fire for both. Collecting them is only sound while they stay put, and
+two things move them: a full buffer, which drops its oldest line for every new one,
+and a resize, which re-wraps lines and shuffles them between the screen and the
+scrollback. Either way the mounted window is read from the buffer again instead of
+being added to — for a full buffer, only while the reader is actually looking at it.
+
+A resize is also why writes and resizes share one queue. xterm parses asynchronously
+but resizes immediately, so a pane frame reporting the Mac's new window size could
+otherwise lay bytes that are still in the parser's queue out at a geometry they were
+never written for. `terminal/stream.js` drains what was written before the resize,
+applies it, rebuilds the scrollback, and only then lets the next frame through.
 **Load earlier output** first mounts more of what the app already holds and then
 reattaches with `history=full`, which is how the console's own history button works:
 the pane's whole scrollback arrives in the attach snapshot, rather than being stitched

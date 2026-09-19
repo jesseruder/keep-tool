@@ -474,3 +474,26 @@ test('adopting the pane\'s geometry reflows the screen and the reader follows it
   assert.equal(rowText(emulator.rows({ start: 1, end: 1 })[0]).length, 80,
     'and is re-laid out to the narrower screen rather than staying 90 wide');
 });
+
+test('a cursor parked on the second cell of a wide glyph is on that glyph', async (t) => {
+  const emulator = createEmulator({ cols: 10, rows: 1 });
+  t.after(() => emulator.dispose());
+  await new Promise((resolve) => emulator.write('\u65e5\u672c', resolve));
+  const [row] = emulator.rows({ start: 0, end: 0 });
+
+  const at = async (cell) => {
+    await new Promise((resolve) => emulator.write(`\x1b[1;${cell + 1}H`, resolve));
+    const cursor = emulator.cursor();
+    return { x: cursor.x, offset: cursor.offset, length: cursor.length };
+  };
+
+  assert.deepEqual(await at(0), { x: 0, offset: 0, length: 1 });
+  assert.deepEqual(await at(1), { x: 1, offset: 0, length: 1 },
+    'the continuation cell belongs to the glyph before it, not to the one after');
+  assert.deepEqual(await at(2), { x: 2, offset: 1, length: 1 }, 'the next glyph starts one character in');
+  assert.deepEqual(await at(3), { x: 3, offset: 1, length: 1 });
+  assert.deepEqual(await at(4), { x: 4, offset: 2, length: 1 }, 'past both, on blank cells');
+
+  const cursor = emulator.cursor();
+  assert.equal(row.text.slice(cursor.offset, cursor.offset + cursor.length).length, cursor.length);
+});
