@@ -350,10 +350,13 @@ test('the shell trades its token for a cookie once, and the cookie carries the w
   const granted = await request(f.port, '/app?token=public-secret', { headers: lan });
   assert.equal(granted.status, 302);
   assert.equal(granted.headers.location, '/app');
-  const [setCookie] = granted.headers['set-cookie'];
+  const [setCookie, clearedCookie] = granted.headers['set-cookie'];
   assert.match(setCookie, /^keep-session=[A-Za-z0-9_-]{43}; Max-Age=34560000; Path=\/; HttpOnly; SameSite=Strict$/);
   assert.equal(/public-secret/.test(setCookie), false, 'the cookie is an opaque id, never the daemon token');
   assert.equal(/Secure/.test(setCookie), false, 'the private network is plain HTTP');
+  assert.equal(clearedCookie, 'keep-token=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict',
+    'the bootstrap also expires the token cookie an earlier design would have set');
+  assert.equal(granted.headers['set-cookie'].length, 2);
   assert.equal(granted.headers['cache-control'], 'no-store');
   assert.equal(granted.body, '', 'the token is never echoed');
   assert.equal((await request(f.port, '/app?token=wrong', { headers: lan })).status, 403);
@@ -412,6 +415,24 @@ test('sessions are bounded, host-bound, and forgotten when the worker is replace
   const replacement = await fixture(t);
   assert.equal((await request(replacement.port, '/app', { headers: { ...lan, cookie: overflow } })).status, 403,
     'sessions live in the worker process and die with it');
+});
+
+test('a session nobody has used within the idle limit is refused and dropped', async (t) => {
+  const f = await fixture(t, { sessionIdleMs: 40 });
+  const lan = { host: '10.0.0.4:7777' };
+  const issued = await request(f.port, '/app?token=public-secret', { headers: lan });
+  const cookie = issued.headers['set-cookie'][0].split(';')[0];
+  const use = () => request(f.port, '/app', { headers: { ...lan, cookie } });
+
+  for (let index = 0; index < 4; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal((await use()).status, 200, 'each request refreshes the session it authorizes');
+  }
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal((await use()).status, 403, 'an idle session is gone');
+  // Swept, not merely refused: it cannot come back, and the ring is free again.
+  assert.equal((await use()).status, 403);
+  assert.equal(f.ui.sessionCount(), 0);
 });
 
 test('a session streams events and opens a pane socket from its own origin, without the header', async (t) => {

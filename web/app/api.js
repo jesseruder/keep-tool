@@ -14,17 +14,29 @@ const STATE_MUTATIONS = new Set([
 let stateAfterMutation = '';
 let observedMutationFence = '';
 let unauthorizedPostedAt = 0;
+let authenticatedPosted = false;
+
+// Sniffed rather than imported so this module keeps working without a DOM.
+function postShell(message) {
+  if (!globalThis.window?.keepShell) return false;
+  try { window.keepShell.post(message); } catch { return false; }
+  return true;
+}
 
 // The mobile shell's session cookie can outlive the worker that issued it (they
 // are in memory only). A 403 is how the page learns that; the shell answers by
-// re-running its /app?token= bootstrap. Sniffed rather than imported so this
-// module keeps working without a DOM.
+// re-running its /app?token= bootstrap.
 function reportUnauthorized() {
-  if (!globalThis.window?.keepShell) return;
   const now = Date.now();
   if (now - unauthorizedPostedAt < 10e3) return;
-  unauthorizedPostedAt = now;
-  try { window.keepShell.post({ type: 'unauthorized' }); } catch {}
+  if (postShell({ type: 'unauthorized' })) unauthorizedPostedAt = now;
+}
+
+// The first state this page actually receives. The shell bounds its bootstrap
+// loop on this rather than on `ready`, which says only that the console asked.
+function reportAuthenticated() {
+  if (authenticatedPosted) return;
+  if (postShell({ type: 'authenticated' })) authenticatedPosted = true;
 }
 
 function rememberMutationFence(fence, observedAtStart) {
@@ -75,6 +87,7 @@ async function request(url, options = {}) {
       && ['dashboard state is still loading', 'dashboard state refresh is pending'].includes(body?.error);
     throw error;
   }
+  if (pathname === '/api/state') reportAuthenticated();
   const fence = response.headers.get('x-keep-mutation-fence') || '';
   if (pathname === '/api/state' || pathname === '/api/portable-transfers') {
     const [publishedEpoch, publishedSequenceText] = fence.split(':');

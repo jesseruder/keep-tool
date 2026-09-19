@@ -25,6 +25,9 @@ const SESSION_COOKIE = 'keep-session';
 // anything past 400 days to 400 days anyway. The session itself is in memory
 // and dies with this worker, which is what bounds it in practice.
 const SESSION_MAX_AGE = 400 * 24 * 60 * 60;
+// A session nobody has used for a day is dropped, so a cookie that leaked to
+// another port of this host stops being replayable long before its Max-Age.
+const SESSION_IDLE_MS = 24 * 60 * 60 * 1000;
 const MAX_SESSIONS = 32;
 // What a browser session may reach without `x-keep: 1`. Everything else it asks
 // for needs the header, which a cross-site page cannot add without a CORS
@@ -92,18 +95,32 @@ function createUiRequestServer(options = {}) {
   // worth nothing anywhere but here, and only for the Host it was issued for.
   const sessions = new Map();
   const requestHost = (req) => String(req.headers.host || '').toLowerCase();
+  // Swept lazily, on the only two paths that touch the map. A session the
+  // console is using is refreshed on every request it makes, so the idle limit
+  // only ever reaches one nobody is holding — which bounds the residual risk
+  // that a same-host service on another port was handed the cookie and could
+  // replay it with the header. See docs/ui-reliability.md.
+  const sessionIdleMs = Math.max(1, Number(options.sessionIdleMs) || SESSION_IDLE_MS);
+  const sweepSessions = (now) => {
+    for (const [id, entry] of sessions) {
+      if (now - entry.lastSeenAt > sessionIdleMs) sessions.delete(id);
+    }
+  };
   const issueSession = (host) => {
+    const now = Date.now();
+    sweepSessions(now);
     while (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
     const id = crypto.randomBytes(32).toString('base64url');
-    const now = Date.now();
     sessions.set(id, { createdAt: now, lastSeenAt: now, host });
     return id;
   };
   const sessionFor = (req) => {
+    const now = Date.now();
+    sweepSessions(now);
     const id = keepConsole.cookieValue(req.headers.cookie, SESSION_COOKIE);
     const entry = id ? sessions.get(id) : null;
     if (!entry || entry.host !== requestHost(req)) return null;
-    entry.lastSeenAt = Date.now();
+    entry.lastSeenAt = now;
     return entry;
   };
   // `GET /app?token=<token>` is the one place a token becomes a session: a
@@ -116,7 +133,12 @@ function createUiRequestServer(options = {}) {
     if (offered == null || !keepConsole.tokenMatches(offered, token)) return null;
     return {
       location: '/app',
-      'set-cookie': `${SESSION_COOKIE}=${issueSession(requestHost(req))}; Max-Age=${SESSION_MAX_AGE}; Path=/; HttpOnly; SameSite=Strict`,
+      'set-cookie': [
+        `${SESSION_COOKIE}=${issueSession(requestHost(req))}; Max-Age=${SESSION_MAX_AGE}; Path=/; HttpOnly; SameSite=Strict`,
+        // An earlier design put the raw token in a cookie. Nothing shipped with
+        // it, but a browser that somehow holds one should not keep it.
+        'keep-token=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict',
+      ],
     };
   };
   const snapshotHeaders = () => current ? {
@@ -414,6 +436,7 @@ function createUiRequestServer(options = {}) {
     },
     snapshot: () => current,
     proxyInFlight: () => proxyInFlight,
+    sessionCount: () => sessions.size,
   };
 }
 

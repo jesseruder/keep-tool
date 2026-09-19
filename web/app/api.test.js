@@ -354,3 +354,31 @@ test('a snapshot older than the cache window is retired and rebuilt from a full 
     assert.equal(calls.at(-1), `/api/state?console=1&delta=1&since=${encodeURIComponent('worker-4:3')}`);
   } finally { Date.now = realNow; }
 });
+
+test('the shell hears once that this page load reached authenticated state', async () => {
+  const posted = [];
+  const previousWindow = globalThis.window;
+  globalThis.window = { keepShell: { post: (message) => posted.push(message) } };
+  try {
+    let respond;
+    globalThis.fetch = async () => respond();
+    const api = await import('./api.js?authenticated=1');
+
+    respond = () => reply({ error: 'unauthorized' }, null, 403);
+    await assert.rejects(api.getState(), /unauthorized/);
+    assert.deepEqual(posted, [{ type: 'unauthorized' }], 'a lost session is reported, not authentication');
+
+    respond = () => reply({ error: 'dashboard state is still loading' }, null, 503);
+    await assert.rejects(api.getState(), /still loading/);
+    assert.equal(posted.length, 1, 'a starting daemon is not an authentication answer');
+
+    respond = () => reply({ panes: [] });
+    assert.deepEqual(await api.getState(), { panes: [] });
+    assert.deepEqual(posted.at(-1), { type: 'authenticated' });
+
+    await api.getState();
+    await api.getLayouts();
+    assert.equal(posted.filter((message) => message.type === 'authenticated').length, 1,
+      'once per page load, not once per read');
+  } finally { globalThis.window = previousWindow; }
+});

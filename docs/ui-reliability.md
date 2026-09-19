@@ -28,8 +28,23 @@ isolated by port: a token cookie would be handed to every other service on the
 Mac, and any of them could replay it as `x-keep-token`. The worker keeps at most
 32 sessions in memory as `{createdAt, lastSeenAt, host}`, evicting the oldest,
 and accepts one only when the request `Host` equals the host it was issued for.
+A session unused for 24 hours is swept — lazily, on the issue and validation
+paths, since the console refreshes its own session on every request it makes.
 Nothing is written to disk and sessions die with the worker process; the app
-notices through the `unauthorized` message below and re-runs its bootstrap.
+notices through the `unauthorized` message below and re-runs its bootstrap. The
+redirect also sends `keep-token=; Max-Age=0` to expire the token cookie an
+earlier design would have set; nothing ever shipped holding one.
+
+**`/app?token=` is the phone shell's bootstrap, not a link to open in a
+general-purpose browser** — at least not on a host that also serves anything
+untrusted. A cookie is scoped to a host, not a port, so once a browser holds the
+session cookie it will send it to *every* service on that host: a proxied
+container on `:8080`, a dev server, anything. Such a service cannot mint a
+session, but it can replay the one it was handed, and unlike a cross-site page it
+can add `x-keep: 1` freely. The intended client never exposes it — the WebView
+loads nothing but this console, so its cookie jar has nowhere else to send it —
+and the idle sweep bounds how long a leaked cookie stays worth anything. Open the
+console in a desktop browser by its ordinary loopback URL instead.
 
 For the same reason a session is not general authority: a page on another port of
 this host is *same-site*, so `SameSite=Strict` does not stop it from sending the

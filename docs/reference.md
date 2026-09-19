@@ -127,8 +127,12 @@ never appears in a body or a log. A wrong token gets the ordinary `403`.
 The cookie is an opaque id, never the token itself: cookies are not isolated by
 port, so a token cookie would reach every other service on the Mac and could be
 replayed as `x-keep-token`. The frontend worker holds at most 32 sessions in
-memory (oldest evicted), each valid only for the `Host` it was issued for, and
-forgets them all when it restarts — the app re-runs its bootstrap. For the same
+memory (oldest evicted, and any unused for 24 hours swept), each valid only for
+the `Host` it was issued for, and forgets them all when it restarts — the app
+re-runs its bootstrap. Because a cookie is not port-scoped, `/app?token=` is the
+phone shell's bootstrap and should not be opened in a general-purpose browser on
+a host that also serves untrusted services; `docs/ui-reliability.md` has the
+detail. For the same
 reason a session must carry `x-keep: 1` on everything except `GET` of `/app`,
 `/app/*`, `/vendor/*`, `/api/events` and the pane socket upgrade: a page on
 another port of this host is same-site, and that header is what it cannot add
@@ -145,9 +149,11 @@ The console detects the mobile shell as `window.keepShell`
 `{type:'ready'}` once the console has subscribed, `{type:'badge', count}`,
 `{type:'notify', title, body, key}`, `{type:'openTerminal', pane, session,
 title}` from the terminal handoff panel the console shows instead of mounting
-xterm, and `{type:'unauthorized'}` (at most once per 10s) when a request comes
-back `403`, which is how the app learns its session is gone and re-bootstraps
-through `/app?token=`. Shell → console: the app calls
+xterm, `{type:'unauthorized'}` (at most once per 10s) when a request comes back
+`403`, which is how the app learns its session is gone and re-bootstraps through
+`/app?token=`, and `{type:'authenticated'}` once per page load when `/api/state`
+first answers `200` — the app bounds its bootstrap loop on that rather than on
+`ready`, which says only that the console asked. Shell → console: the app calls
 `window.keepShellReceive(message)` — defined unconditionally, since Android's
 pre-load injection is best-effort — with `{type:'hello'}` when it defines
 `window.keepShell` after the page has already run (the console then sets the
