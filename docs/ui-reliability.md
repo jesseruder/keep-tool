@@ -21,6 +21,25 @@ keeps immediate post-action reloads coherent without making ordinary reads depen
 on the daemon event loop. `x-keep-state-generated-at`, `x-keep-state-version`, and
 `x-keep-mutation-fence` expose the publication age and boundary.
 
+The console reloads on a delta channel rather than refetching its whole projection
+(780 KB raw, 178 KB gzipped) eight times a minute. `console=1` answers an envelope:
+`{ instance, version, full }` when it has to send the projection, `{ instance,
+version, since, deltas }` when the console named a snapshot it can chain from with
+`&since=<instance>:<version>`. The worker keeps the last 30 publications' deltas in
+a ring (`KEEP_STATE_DELTA_HISTORY`) and diffs each publication against the previous
+one with the two-level keyed diff in `web/app/shared/state-delta.js`: a fixed table
+of keyed lists (tasks, sessions, panes, notifications, accounts, handoffs, agents,
+`reviewQueue.items`, `health.schedulers`, `limitResume.waiting`/`.sent`) sends the
+rows that changed, everything else is a wholesale field. It falls back to the full
+projection whenever it cannot name the chain — another worker's instance, a version
+the ring no longer holds, or a version sequence that stopped increasing, which also
+renames the chain so a repeated version cannot be mistaken for one snapshot. The
+console drops its cached snapshot and reloads once whenever a delta will not apply,
+and treats a response with neither `full` nor `deltas` as a plain projection, which
+is what the browser fixtures and the daemon's own `/api/state` serve. `view=` and
+the full projection are unchanged and ignore `since`; ETag, gzip, `304`, and the
+post-mutation fence apply to the envelope exactly as before.
+
 The focused isolation test deliberately blocks the daemon fixture for 10.5 seconds:
 
 ```sh

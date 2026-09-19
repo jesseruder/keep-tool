@@ -72,7 +72,10 @@ test('frontend returns loading until a real snapshot and serves every projection
   assert.equal(full.headers['x-keep-state-generated-at'], '1234');
   assert.equal(full.headers['x-keep-state-version'], '7');
   assert.equal(JSON.parse(full.body).tasks[0].body, 'full body');
-  const consoleBody = JSON.parse((await request(f.port, '/api/state?console=1')).body);
+  const consoleEnvelope = JSON.parse((await request(f.port, '/api/state?console=1')).body);
+  assert.match(consoleEnvelope.instance, /^[0-9a-f-]{36}$/);
+  assert.equal(consoleEnvelope.version, 7);
+  const consoleBody = consoleEnvelope.full;
   assert.equal(consoleBody.tasks[0].body, undefined);
   assert.equal(consoleBody.tasks[0].lastLog, undefined);
   assert.equal(consoleBody.digest, undefined, 'the console projection drops the fields it never renders');
@@ -149,4 +152,132 @@ test('frontend bounds requests waiting on a stalled core', async (t) => {
   assert.equal(f.seen.length, 1, 'the refused action never reaches the core');
   f.releaseHeld();
   assert.equal((await held).status, 200);
+});
+
+function publication(version, overrides = {}) {
+  return {
+    version,
+    generatedAt: version * 100,
+    mutationFence: 'epoch:1',
+    portableTransfers: [],
+    state: {
+      generatedAt: version * 100,
+      digest: '# dropped',
+      tasks: [{ id: 'card-a', fm: { title: 'A' }, body: 'full body' }],
+      sessions: [{ id: 's-1', title: 'One', pane: 'p-1' }, { id: 's-2', title: 'Two', pane: 'p-2' }],
+      panes: [{ id: 'p-1', alive: true }, { id: 'p-2', alive: true }],
+      attention: [],
+      reviewQueue: { counts: { open: 1 }, items: [{ id: 'r-1', title: 'R' }] },
+      health: { daemon: { pid: 1 }, schedulers: [{ name: 'review', state: 'ok' }] },
+      ...overrides,
+    },
+  };
+}
+
+async function consoleEnvelope(port, since) {
+  const response = await request(port, `/api/state?console=1${since ? `&since=${encodeURIComponent(since)}` : ''}`);
+  assert.equal(response.status, 200, response.body);
+  return { response, body: JSON.parse(response.body) };
+}
+
+test('the console delta channel serves a chain from the snapshot a console already holds', async (t) => {
+  const f = await fixture(t);
+  const { applyConsoleDelta } = require('../web/app/shared/state-delta.js');
+  f.ui.publish(publication(1));
+  const first = await consoleEnvelope(f.port, '');
+  assert.match(first.body.instance, /^[0-9a-f-]{36}$/);
+  assert.equal(first.body.version, 1);
+  assert.equal(first.body.deltas, undefined);
+  const instance = first.body.instance;
+
+  // A console already holding the newest publication is told there is nothing to apply.
+  const level = await consoleEnvelope(f.port, `${instance}:1`);
+  assert.deepEqual(level.body, { instance, version: 1, since: 1, deltas: [] });
+
+  const renamed = [{ id: 's-1', title: 'One renamed', pane: 'p-1' }, { id: 's-2', title: 'Two', pane: 'p-2' }];
+  f.ui.publish(publication(2, { sessions: renamed }));
+  f.ui.publish(publication(3, {
+    sessions: renamed,
+    reviewQueue: { counts: { open: 9 }, items: [{ id: 'r-1', title: 'R' }] },
+  }));
+  const chained = await consoleEnvelope(f.port, `${instance}:1`);
+  assert.equal(chained.body.since, 1);
+  assert.equal(chained.body.version, 3);
+  assert.equal(chained.body.deltas.length, 2, 'one delta per publication, in order');
+  assert.deepEqual(chained.body.deltas[0].keyed.sessions.upsert.map((row) => row.id), ['s-1']);
+  assert.deepEqual(chained.body.deltas[1].nested.reviewQueue.set.counts, { open: 9 });
+  const rebuilt = chained.body.deltas.reduce((state, delta) => applyConsoleDelta(state, delta), first.body.full);
+  assert.deepEqual(rebuilt, (await consoleEnvelope(f.port, '')).body.full,
+    'the chain rebuilds the latest projection exactly');
+  assert.ok(JSON.stringify(chained.body).length < JSON.stringify(first.body).length,
+    'the chain is smaller than the projection it replaces');
+
+  // A console holding the middle publication gets only the tail of the chain.
+  assert.equal((await consoleEnvelope(f.port, `${instance}:2`)).body.deltas.length, 1);
+});
+
+test('the delta channel falls back to a full projection whenever it cannot name a chain', async (t) => {
+  const f = await fixture(t, { deltaHistory: 2 });
+  f.ui.publish(publication(1));
+  const instance = (await consoleEnvelope(f.port, '')).body.instance;
+  for (const version of [2, 3, 4]) f.ui.publish(publication(version));
+
+  const evicted = await consoleEnvelope(f.port, `${instance}:1`);
+  assert.equal(evicted.body.deltas, undefined, 'a version older than the ring gets the projection');
+  assert.equal(evicted.body.version, 4);
+  assert.equal(evicted.body.full.generatedAt, 400);
+  assert.equal((await consoleEnvelope(f.port, `${instance}:3`)).body.deltas.length, 1, 'the ring still holds the tail');
+
+  assert.equal((await consoleEnvelope(f.port, 'some-other-worker:3')).body.deltas, undefined, 'a foreign instance');
+  assert.equal((await consoleEnvelope(f.port, `${instance}:99`)).body.deltas, undefined, 'a version ahead of the worker');
+  assert.equal((await consoleEnvelope(f.port, `${instance}:nope`)).body.deltas, undefined, 'an unparsable version');
+  assert.equal((await consoleEnvelope(f.port, instance)).body.deltas, undefined, 'a malformed since');
+
+  // A version that does not advance stops identifying one snapshot, so the worker
+  // starts a fresh chain and every console holding an old one reloads in full.
+  f.ui.publish(publication(4, { attention: [{ kind: 'input', key: 'k' }] }));
+  const restarted = await consoleEnvelope(f.port, `${instance}:3`);
+  assert.equal(restarted.body.deltas, undefined, 'a repeated version breaks the chain');
+  assert.notEqual(restarted.body.instance, instance, 'and renames it, so the stale version cannot be reused');
+  f.ui.publish(publication(5));
+  assert.equal((await consoleEnvelope(f.port, `${instance}:4`)).body.deltas, undefined,
+    'the retired chain cannot name the ambiguous version either');
+  assert.equal((await consoleEnvelope(f.port, `${restarted.body.instance}:4`)).body.deltas.length, 1,
+    'the new chain serves deltas from its own first publication');
+});
+
+test('since changes nothing about the fence, the other projections, or caching', async (t) => {
+  const f = await fixture(t);
+  f.ui.publish(publication(1));
+  const instance = (await consoleEnvelope(f.port, '')).body.instance;
+
+  // The mobile and full projections ignore since entirely — no envelope.
+  const full = JSON.parse((await request(f.port, `/api/state?since=${instance}:1`)).body);
+  assert.equal(full.tasks[0].body, 'full body', 'the full projection is unwrapped');
+  assert.equal(full.full, undefined);
+  const mobile = JSON.parse((await request(f.port, `/api/state?view=needs&since=${instance}:1`)).body);
+  assert.equal(mobile.full, undefined);
+  assert.equal(mobile.deltas, undefined);
+
+  // The post-mutation fence still holds a since request back.
+  const write = await request(f.port, '/api/action', { method: 'POST', headers: { 'x-keep': '1' }, body: '{}' });
+  assert.equal(write.headers['x-keep-mutation-fence'], 'epoch:2');
+  const behind = await request(f.port, `/api/state?console=1&since=${instance}:1`, { headers: { 'x-keep-after-mutation': 'epoch:2' } });
+  assert.equal(behind.status, 503);
+  assert.match(behind.body, /refresh is pending/);
+  f.ui.publish({ ...publication(2), mutationFence: 'epoch:2' });
+  const released = await request(f.port, `/api/state?console=1&since=${instance}:1`, { headers: { 'x-keep-after-mutation': 'epoch:2' } });
+  assert.equal(released.status, 200);
+  assert.equal(JSON.parse(released.body).deltas.length, 1);
+
+  // ETag and 304 work on the envelope exactly as on the bare projection.
+  const envelope = await request(f.port, '/api/state?console=1');
+  assert.ok(envelope.headers.etag);
+  assert.equal(envelope.headers['x-keep-state-version'], '2');
+  const repeat = await request(f.port, '/api/state?console=1', { headers: { 'if-none-match': envelope.headers.etag } });
+  assert.equal(repeat.status, 304);
+  const deltaResponse = await request(f.port, `/api/state?console=1&since=${instance}:1`);
+  assert.notEqual(deltaResponse.headers.etag, envelope.headers.etag, 'a delta body is not the projection body');
+  assert.equal((await request(f.port, `/api/state?console=1&since=${instance}:1`,
+    { headers: { 'if-none-match': deltaResponse.headers.etag } })).status, 304);
 });

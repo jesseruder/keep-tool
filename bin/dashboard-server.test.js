@@ -116,16 +116,19 @@ test('real dashboard routes use the worker snapshot across full, console, mobile
 
   // The console's own projection: the same list context, without the card
   // histories or the top-level fields the console never renders.
-  const consoleState = await request(port, '/api/state?console=1');
-  assert.equal(consoleState.status, 200);
-  assert.equal(consoleState.body.digest, undefined, 'the console never renders the digest');
-  assert.equal(consoleState.body.landed, undefined);
-  const consoleTask = consoleState.body.tasks.find((task) => task.id === 'route-card');
+  // With no `since`, the console projection arrives as a full delta-channel envelope.
+  const consoleEnvelope = await request(port, '/api/state?console=1');
+  assert.equal(consoleEnvelope.status, 200);
+  assert.ok(consoleEnvelope.body.instance, 'the envelope names the worker that built it');
+  const consoleState = consoleEnvelope.body.full;
+  assert.equal(consoleState.digest, undefined, 'the console never renders the digest');
+  assert.equal(consoleState.landed, undefined);
+  const consoleTask = consoleState.tasks.find((task) => task.id === 'route-card');
   assert.equal(consoleTask.body, undefined);
   assert.equal(consoleTask.lastLog, undefined);
   assert.equal(consoleTask._detailVersion, detail.body.version,
     'the detail route reports the version the console list advertised');
-  assert.ok(Array.isArray(consoleState.body.panes));
+  assert.ok(Array.isArray(consoleState.panes));
 
   assert.equal((await request(port, '/api/state?view=needs')).status, 200);
   assert.equal((await request(port, '/api/dashboard-review-search?q=route')).status, 200);

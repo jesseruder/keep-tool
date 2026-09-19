@@ -10,10 +10,12 @@ const {
 } = require('./dashboard-state.js');
 const { MOBILE_VIEWS, projectMobileState } = require('./mobile-state.js');
 const { sendStateJson } = require('./state-response.js');
+const { diffConsoleState } = require('../web/app/shared/state-delta.js');
 const { createTerminalBridge } = require('./terminal-bridge.js');
 const hostclient = require('./hostclient.js');
 
 const MAX_PROXY_IN_FLIGHT = 64;
+const STATE_DELTA_HISTORY = 30;
 const HOP_HEADERS = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
   'te', 'trailer', 'transfer-encoding', 'upgrade',
@@ -49,6 +51,15 @@ function createUiRequestServer(options = {}) {
   const isLocal = options.isLocal || ((addr) => addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1');
   const maxProxy = Math.max(1, Number(options.maxProxyInFlight) || MAX_PROXY_IN_FLIGHT);
   const heartbeatMs = Math.max(100, Number(options.heartbeatMs) || 15e3);
+  // A console holding a snapshot names the publication chain it came from: a
+  // restarted or replaced worker has a different id, so its first `since` request
+  // falls back to the full projection instead of applying deltas to a foreign chain.
+  let instance = crypto.randomUUID();
+  const deltaHistory = Math.max(1,
+    Number(options.deltaHistory || process.env.KEEP_STATE_DELTA_HISTORY) || STATE_DELTA_HISTORY);
+  // Contiguous by construction: entry[n].from === entry[n - 1].to, and the last
+  // entry always ends at the current publication.
+  const history = [];
   let current = null;
   let proxyInFlight = 0;
   let closing = false;
@@ -73,6 +84,33 @@ function createUiRequestServer(options = {}) {
     const currentSequence = Number(currentSequenceText);
     return Boolean(afterEpoch && afterEpoch === currentEpoch && Number.isSafeInteger(afterSequence)
       && (!Number.isSafeInteger(currentSequence) || currentSequence < afterSequence));
+  };
+
+  // One serialization of the ~780 KB full envelope per publication, however many
+  // consoles ask for it; delta envelopes are small enough to build per request.
+  const fullConsoleBody = () => {
+    if (current.consoleBody == null) {
+      current.consoleBody = JSON.stringify({ instance, version: current.version, full: current.console });
+    }
+    return current.consoleBody;
+  };
+  // `<instance>:<version>` names the snapshot the console already holds. It earns a
+  // delta chain only when it came from this worker and the ring still reaches it.
+  const deltaChain = (since) => {
+    if (!since) return null;
+    const separator = since.lastIndexOf(':');
+    if (separator < 0 || since.slice(0, separator) !== instance) return null;
+    const version = Number(since.slice(separator + 1));
+    if (!Number.isFinite(version) || version > current.version) return null;
+    if (version === current.version) return { since: version, deltas: [] };
+    const start = history.findIndex((entry) => entry.from === version);
+    if (start < 0 || history[history.length - 1].to !== current.version) return null;
+    return { since: version, deltas: history.slice(start).map((entry) => entry.delta) };
+  };
+  const consoleBody = (since) => {
+    const chain = deltaChain(since);
+    if (!chain) return fullConsoleBody();
+    return JSON.stringify({ instance, version: current.version, since: chain.since, deltas: chain.deltas });
   };
 
   const broadcast = (event = { type: 'change', data: 'change' }) => {
@@ -178,15 +216,18 @@ function createUiRequestServer(options = {}) {
         }
         const view = url.searchParams.get('view');
         if (view && !MOBILE_VIEWS.has(view)) return json(res, 400, { error: `unknown mobile state view: ${view}` });
-        let value;
+        // `since` is a console-projection parameter only: the mobile views and the
+        // full state answer exactly as they did before, with no envelope.
+        let body;
         try {
-          value = view ? projectMobileState(current.state, view, url.searchParams.get('id') || '')
-            : wantsConsoleState(url) ? current.console : current.state;
+          body = view ? JSON.stringify(projectMobileState(current.state, view, url.searchParams.get('id') || ''))
+            : wantsConsoleState(url) ? consoleBody(url.searchParams.get('since'))
+              : JSON.stringify(current.state);
         } catch (error) {
           if (error.status === 400) return json(res, 400, { error: error.message });
           throw error;
         }
-        return sendStateJson(req, res, JSON.stringify(value), { headers: snapshotHeaders() });
+        return sendStateJson(req, res, body, { headers: snapshotHeaders() });
       }
       if (req.method === 'GET' && url.pathname === '/api/dashboard-detail') {
         if (!current) return json(res, 503, { error: 'dashboard state is still loading' }, { 'retry-after': '1' });
@@ -250,9 +291,24 @@ function createUiRequestServer(options = {}) {
         throw new Error('invalid dashboard publication');
       }
       const lightweight = lightweightState(state);
+      const previous = current;
+      const projection = consoleState(state, lightweight);
+      // Versions are strictly increasing within a worker process. If one ever is not,
+      // a repeated version no longer identifies a single snapshot, so start a new
+      // chain: the ring empties and the instance changes, which sends every console
+      // holding an old snapshot back to one full projection.
+      if (!previous) history.length = 0;
+      else if (!(value.version > previous.version)) {
+        history.length = 0;
+        instance = crypto.randomUUID();
+      } else {
+        history.push({ from: previous.version, to: value.version, delta: diffConsoleState(previous.console, projection) });
+        while (history.length > deltaHistory) history.shift();
+      }
       current = {
         state,
-        console: consoleState(state, lightweight),
+        console: projection,
+        consoleBody: null,
         portableTransfers: Array.isArray(value.portableTransfers) ? value.portableTransfers : [],
         mutationFence: typeof value.mutationFence === 'string' ? value.mutationFence : '',
         generatedAt: value.generatedAt,
@@ -276,4 +332,4 @@ function createUiRequestServer(options = {}) {
   };
 }
 
-module.exports = { createUiRequestServer, filteredHeaders, MAX_PROXY_IN_FLIGHT };
+module.exports = { createUiRequestServer, filteredHeaders, MAX_PROXY_IN_FLIGHT, STATE_DELTA_HISTORY };
