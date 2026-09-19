@@ -27,7 +27,7 @@ import { createDetailStore } from './details.js';
 import { handleGradeKey } from './state-line.js';
 import { focusQueueItem, handleLeaveTerminalKey } from './leave-terminal.js';
 import { acknowledgeNotificationClick, installNotificationClicks, notificationPermission, notify, requestPermission, setBadge, shellReady } from './shell.js';
-import { installMobile, mobileActive, syncMobile } from './mobile.js';
+import { installMobile, mobileActive, openMobileStage, syncMobile } from './mobile.js';
 
 applyTheme();
 
@@ -1223,9 +1223,16 @@ function selectAttention(key) {
   const active = queueItems().filter((candidate) => !state.dismissed.has(itemKey(candidate)));
   const index = active.findIndex((candidate) => attentionKey(candidate) === key);
   if (index < 0) { toast('This item is no longer waiting on you.'); return; }
-  setSelected(index);
+  // Explicit, the way clicking the row is: a notification names one row, and a
+  // programmatic selection is overruled on the next render by whatever the stage
+  // is already holding. Focus mode is the case that bit — it re-selects its own
+  // item every render, so the tap landed back on the first row waiting.
+  setSelected(index, true);
   state.ensureSelectedVisible = true;
   setMode('triage');
+  // The render above put the row on the stage; on the phone the stage is a
+  // screen of its own, which the tap has to push the way the row's tap does.
+  openMobileStage();
 }
 
 function applyStateEffects() {

@@ -87,6 +87,7 @@ test('isolated browser: the console is usable on a 412px touch screen',
         counts: { 'needs-decision': 1, 'in-progress': 0, resolved: 0 },
       },
     };
+    let stateDelay = 0;
     const server = http.createServer((req, res) => {
       const url = new URL(req.url, 'http://fixture');
       if (url.pathname === '/api/events') {
@@ -118,11 +119,17 @@ test('isolated browser: the console is usable on a 412px touch screen',
         return;
       }
       if (url.pathname.startsWith('/api/')) {
-        res.setHeader('content-type', 'application/json');
-        res.end(JSON.stringify(url.pathname === '/api/state'
-          ? (url.searchParams.get('console') === '1' ? consoleState(state) : state)
-          : url.pathname === '/api/layouts' ? { layouts: [{ name: 'Pinned', role: 'pinned', ids: [], cols: 1 }] }
-            : { ok: true }));
+        const answer = () => {
+          res.setHeader('content-type', 'application/json');
+          res.end(JSON.stringify(url.pathname === '/api/state'
+            ? (url.searchParams.get('console') === '1' ? consoleState(state) : state)
+            : url.pathname === '/api/layouts' ? { layouts: [{ name: 'Pinned', role: 'pinned', ids: [], cols: 1 }] }
+              : { ok: true }));
+        };
+        // A phone's reload is never instant: holding /api/state open is how the
+        // notification tap lands while one is still in flight.
+        if (stateDelay && url.pathname === '/api/state') setTimeout(answer, stateDelay);
+        else answer();
         return;
       }
       const vendors = {
@@ -613,6 +620,111 @@ test('isolated browser: the console is usable on a 412px touch screen',
       await evaluate("document.querySelector('.modes [data-mode=triage]').click()");
       await wait("document.querySelector('#triage').classList.contains('on')"
         + " && !(history.state && history.state.keepOverlay)");
+
+      // ── A notification names one row, and that is the row the tap opens. The
+      // phone has been sitting on the queue with the first row selected, and the
+      // push is for the third: opening the first row's stage instead is how a
+      // tap on a nine-rows-down question landed on the top of the queue.
+      const queuedAt = now - 900e3;
+      state.attention = [
+        { key: 'q-1', kind: 'question', sessionId: 'a', taskId: 'card-a', pane: 'pa', project: alpha,
+          title: 'First in the queue', since: queuedAt, pri: 0, question: 'The oldest question.',
+          options: [{ label: 'Yes' }, { label: 'No' }] },
+        { key: 'q-2', kind: 'question', sessionId: 'a', taskId: 'card-a', pane: 'pa', project: alpha,
+          title: 'Second in the queue', since: queuedAt + 1000, pri: 0, question: 'The next question.' },
+        { key: 'q-3', kind: 'question', sessionId: 'b', taskId: 'card-b', pane: 'pb', project: beta,
+          title: 'Third in the queue', since: queuedAt + 2000, pri: 0, question: 'The question that was pushed.' },
+        { key: 'q-4', kind: 'question', sessionId: 'b', taskId: 'card-b', pane: 'pb', project: beta,
+          title: 'Fourth in the queue', since: queuedAt + 3000, pri: 0, question: 'The newest question.' },
+      ];
+      for (const client of eventClients) client.write('data: {}\n\n');
+      await wait("document.querySelectorAll('#qlist .qitem.k-question').length === 4");
+      // Standing on the first row with the queue showing, the way a phone left on
+      // Triage does: select it, then come back out of its stage.
+      await evaluate("document.querySelector('#qlist [data-key=\"waiting:q-1\"]').click()");
+      await wait("document.documentElement.classList.contains('mobile-stage-open')"
+        + " && document.querySelector('#stage').dataset.itemKey === 'q-1'");
+      await evaluate("document.querySelector('.mobile-back').click()");
+      await wait("!document.documentElement.classList.contains('mobile-stage-open')"
+        + " && document.querySelector('#qlist .qitem.sel')?.dataset.key === 'waiting:q-1'");
+
+      await evaluate("window.keepShellReceive({ type: 'notificationClick', key: 'q-3' })");
+      await settle("document.documentElement.classList.contains('mobile-stage-open')"
+        + " && document.querySelector('#stage').dataset.itemKey === 'q-3'");
+      assert.equal(await evaluate("document.querySelector('#qlist .qitem.sel')?.dataset.key"), 'waiting:q-3',
+        'the tapped row is the selected row');
+      assert.match(await evaluate("document.querySelector('#stage .shead h2').textContent"), /Third in the queue/,
+        'the stage shows the row the notification named');
+      assert.equal(await evaluate("document.querySelector('.mobile-stagebar-title').textContent"), 'Third in the queue',
+        'and so does the back bar');
+      assert.equal(await evaluate('history.state && history.state.keepOverlay'), 'stage',
+        'the stage a tap opens owns its entry, so Back returns to the queue');
+      await shoot('triage-notification-stage');
+      await evaluate("document.querySelector('.mobile-back').click()");
+      await wait("!document.documentElement.classList.contains('mobile-stage-open')"
+        + " && !(history.state && history.state.keepOverlay)");
+
+      // Focus is the case that bit: it holds a stage of its own open on the
+      // oldest row and re-selects that row on every render, so a tap for another
+      // row was overruled by the next render and the phone stayed on the first
+      // row's stage. Selecting by tap leaves Focus, the way selecting any other
+      // row does.
+      await evaluate("document.querySelector('#triage .queue .qfocus').click()");
+      await wait("document.documentElement.classList.contains('mobile-stage-open')"
+        + " && document.querySelector('#stage').dataset.itemKey === 'q-1'");
+      await evaluate("window.keepShellReceive({ type: 'notificationClick', key: 'q-3' })");
+      await settle("document.querySelector('#stage').dataset.itemKey === 'q-3'");
+      assert.equal(await evaluate("document.documentElement.classList.contains('mobile-stage-open')"), true,
+        'the stage stays up on the row the notification named');
+      assert.equal(await evaluate("document.querySelector('#qlist .qitem.sel')?.dataset.key"), 'waiting:q-3',
+        'and Focus does not pull the selection back to the first row');
+      assert.equal(await evaluate("document.querySelector('.mobile-stagebar-title').textContent"), 'Third in the queue',
+        'the back bar names it too, rather than the row it replaced');
+      assert.equal(await evaluate("document.querySelector('#triage .queue .qfocus').getAttribute('aria-pressed')"), 'false',
+        'a tap is an explicit selection, so Focus is left behind');
+      await evaluate("document.querySelector('.mobile-back').click()");
+      await wait("!document.documentElement.classList.contains('mobile-stage-open')"
+        + " && !(history.state && history.state.keepOverlay)");
+
+      // A tap arrives at whatever the phone was left on, which is rarely Triage:
+      // the tab it was standing on is given up first, and the stage still has to
+      // be the entry Back returns from.
+      await evaluate("document.querySelector('.modes [data-mode=fleet]').click()");
+      await wait("document.querySelector('#fleet').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'tab'");
+      await evaluate("window.keepShellReceive({ type: 'notificationClick', key: 'q-2' })");
+      await settle("document.documentElement.classList.contains('mobile-stage-open')"
+        + " && document.querySelector('#stage').dataset.itemKey === 'q-2'");
+      assert.equal(await evaluate("document.querySelector('#triage').classList.contains('on')"), true,
+        'the tap brings Triage back with it');
+      assert.equal(await evaluate('history.state && history.state.keepOverlay'), 'stage',
+        'and the stage it opened is the entry Back leaves');
+      await evaluate('history.back()');
+      await settle("!document.documentElement.classList.contains('mobile-stage-open')"
+        + " && !(history.state && history.state.keepOverlay)"
+        + " && document.querySelector('#triage').classList.contains('on')");
+
+      // The order the phone actually delivers: the tap lands while a state reload
+      // is already in flight, before its `data` has been applied.
+      await evaluate("document.querySelector('#qlist [data-key=\"waiting:q-1\"]').click()");
+      await wait("document.querySelector('#stage').dataset.itemKey === 'q-1'");
+      await evaluate("document.querySelector('.mobile-back').click()");
+      await wait("!document.documentElement.classList.contains('mobile-stage-open')");
+      stateDelay = 300;
+      for (const client of eventClients) client.write('data: {}\n\n');
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      await evaluate("window.keepShellReceive({ type: 'notificationClick', key: 'q-4' })");
+      await settle("document.documentElement.classList.contains('mobile-stage-open')"
+        + " && document.querySelector('#stage').dataset.itemKey === 'q-4'");
+      stateDelay = 0;
+      assert.equal(await evaluate("document.querySelector('#qlist .qitem.sel')?.dataset.key"), 'waiting:q-4',
+        'a tap that overtakes a reload still lands on its own row');
+      await evaluate("document.querySelector('.mobile-back').click()");
+      await wait("!document.documentElement.classList.contains('mobile-stage-open')");
+      // Hand the queue back the way the rest of the pass found it.
+      state.attention = [];
+      for (const client of eventClients) client.write('data: {}\n\n');
+      await wait("!document.querySelector('#qlist .qitem.k-question')");
 
       // ── A shell that goes away unwinds what it pushed and gives the rail back.
       await evaluate("document.querySelector('.mobile-filter').click()");

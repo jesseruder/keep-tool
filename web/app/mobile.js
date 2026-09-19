@@ -51,6 +51,9 @@ const borrowed = [];
 // multi-step go() fires a single popstate.
 const overlays = [];
 let swallow = 0;
+// A stage a notification tap asked for while one of our own history calls was
+// still in flight; opened by the popstate that settles it.
+let pendingStage = false;
 
 const showing = (name) => overlays.some((entry) => entry.name === name);
 
@@ -217,6 +220,7 @@ function deactivate() {
   unwatchAlerts();
   const pops = overlays.filter((entry) => entry.pushed).length;
   overlays.length = 0;
+  pendingStage = false;
   closeDroppedAlerts();
   closeDroppedMenu();
   // The mode is the desktop console's own again; only the entries go.
@@ -306,7 +310,14 @@ function reopen(name, state) {
 function onPopState(event) {
   // One of ours landing: the stack is already right, but anything held back
   // while it was in flight is settled now.
-  if (swallow > 0) { swallow -= 1; sync(); return; }
+  if (swallow > 0) {
+    swallow -= 1;
+    // A stage a notification asked for while this was in flight: now it can own
+    // an entry of its own. (Another call still pending puts it back on hold.)
+    if (pendingStage) { pendingStage = false; openMobileStage(); }
+    sync();
+    return;
+  }
   const wanted = event?.state?.keepOverlay || null;
   if (!active) {
     // An entry left over from a shell that went away. Undo it so the history
@@ -339,6 +350,26 @@ export function syncMobile() {
 // Read by the console's key handler: a phone has no hardware keyboard by
 // default, so the plain-key shortcuts must not fire behind a lost focus.
 export function mobileActive() { return active; }
+
+// A notification tap is a click on the row it names: the console selects the
+// row and then asks for the same stage the row's own tap would have pushed.
+// Called after the render that put the item on the stage, so `currentItem` is
+// the row the tap named — without it there is nothing to show full-screen.
+// Focus mode holds its own stage open with no entry behind it; pushing one over
+// it would only make the next Back a dead press.
+export function openMobileStage() {
+  if (!active || ctx.state.mode !== 'triage' || !ctx.state.currentItem) return;
+  // A tap rarely lands on Triage: coming back to it gives up the tab's entry,
+  // and that rewind is still in flight here. Pushing the stage over it would
+  // leave the stack naming an entry the traversal is about to move off — and
+  // Back a dead press — so the swallowed popstate opens it instead.
+  if (!ctx.state.focusMode && swallow > 0) { pendingStage = true; return; }
+  if (!ctx.state.focusMode) open('stage');
+  // renderTop() syncs before the stage itself is rendered, so the back bar is a
+  // render behind whenever the stage was already up. Catch it up on the row the
+  // notification named rather than leaving the one it replaced named above it.
+  sync();
+}
 
 // Two overlays the console owns rather than this module: the tab, which it
 // switches for its own reasons as well as ours, and the actions menu, which a
