@@ -60,15 +60,17 @@
   const SPEC = buildSpec(KEYED_PATHS);
 
   // A path only earns a keyed diff when the live rows really are keyed: every row
-  // an object carrying a non-empty string or a number, no duplicates. Anything
-  // else (a test fixture, a shape change) falls back to a wholesale field.
+  // an object carrying a non-empty string or a finite number, no duplicates.
+  // Anything else (a test fixture, a shape change) falls back to a wholesale field.
+  // NaN and Infinity are refused because JSON writes them as null, which would
+  // collapse distinct rows into one id the moment the delta crossed the wire.
   function keyable(rows, key) {
     if (!Array.isArray(rows)) return false;
     const seen = new Set();
     for (const row of rows) {
       if (!isPlainObject(row)) return false;
       const id = row[key];
-      if (typeof id !== 'number' && (typeof id !== 'string' || !id)) return false;
+      if (typeof id === 'number' ? !Number.isFinite(id) : (typeof id !== 'string' || !id)) return false;
       if (seen.has(id)) return false;
       seen.add(id);
     }

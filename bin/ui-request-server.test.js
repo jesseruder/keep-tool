@@ -281,3 +281,59 @@ test('since changes nothing about the fence, the other projections, or caching',
   assert.equal((await request(f.port, `/api/state?console=1&since=${instance}:1`,
     { headers: { 'if-none-match': deltaResponse.headers.etag } })).status, 304);
 });
+
+test('a republished state object breaks the chain instead of hiding an in-place edit', async (t) => {
+  const f = await fixture(t);
+  const first = publication(1, { notifications: [{ id: 'n-1', text: 'unread', read: false }] });
+  f.ui.publish(first);
+  const held = await consoleEnvelope(f.port, '');
+  assert.equal(held.body.full.notifications[0].read, false);
+
+  // consoleState passes notifications through by reference, so an edit to the same
+  // state object is already inside the previous projection and invisible to the
+  // diff. The worker does not guess: the same object means a new chain.
+  first.state.notifications[0].read = true;
+  f.ui.publish({ ...first, version: 2, generatedAt: 200 });
+  const aliased = await consoleEnvelope(f.port, `${held.body.instance}:1`);
+  assert.equal(aliased.body.deltas, undefined, 'an aliased publication answers with the projection');
+  assert.notEqual(aliased.body.instance, held.body.instance);
+  assert.equal(aliased.body.full.notifications[0].read, true, 'which does carry the edit');
+
+  // The real caller hands over a fresh graph every publication — bin/serve.js
+  // publishes through createUiRequestWorker, and child.send JSON-serializes it —
+  // and then the very same edit arrives as a delta.
+  const fresh = JSON.parse(JSON.stringify(first.state));
+  fresh.notifications[0].text = 'read at last';
+  f.ui.publish({ version: 3, generatedAt: 300, mutationFence: 'epoch:1', portableTransfers: [], state: fresh });
+  const chained = await consoleEnvelope(f.port, `${aliased.body.instance}:2`);
+  assert.equal(chained.body.deltas.length, 1);
+  assert.deepEqual(chained.body.deltas[0].keyed.notifications.upsert,
+    [{ id: 'n-1', text: 'read at last', read: true }]);
+});
+
+test('a chain that outgrew the projection is answered with the projection', async (t) => {
+  const f = await fixture(t);
+  // A big field nothing changes inflates the projection; a smaller one that changes
+  // every publication is resent whole in every delta of the chain.
+  const catalog = Object.fromEntries(Array.from({ length: 60 },
+    (_, i) => [`/tmp/project-${i}`, { icon: 'x'.repeat(100), label: `Project ${i}` }]));
+  const churn = (n) => ({ events: Array.from({ length: 12 }, (_, i) => ({ at: n * 1000 + i, kind: 'tick', detail: 'y'.repeat(60) })), stats: { seen: n } });
+  const bulky = (version) => publication(version, { projectCatalog: catalog, review: churn(version) });
+
+  f.ui.publish(bulky(1));
+  const first = await consoleEnvelope(f.port, '');
+  const instance = first.body.instance;
+  const fullSize = first.response.body.length;
+
+  f.ui.publish(bulky(2));
+  const short = await consoleEnvelope(f.port, `${instance}:1`);
+  assert.equal(short.body.deltas.length, 1, 'one copy of the churning field still beats the projection');
+  assert.ok(short.response.body.length < fullSize);
+
+  for (const version of [3, 4, 5, 6, 7, 8, 9, 10]) f.ui.publish(bulky(version));
+  const long = await consoleEnvelope(f.port, `${instance}:1`);
+  assert.equal(long.body.deltas, undefined, 'nine copies of it do not, so the projection is cheaper');
+  assert.equal(long.body.version, 10);
+  assert.equal((await consoleEnvelope(f.port, `${instance}:9`)).body.deltas.length, 1,
+    'and the tail of the same ring is still served as a delta');
+});

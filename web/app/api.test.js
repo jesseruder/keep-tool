@@ -322,3 +322,35 @@ test('a plain console projection still loads, and stops the console naming a sna
   assert.deepEqual(await api.getState(), SECOND);
   assert.equal(calls.at(-1), '/api/state?console=1');
 });
+
+test('a snapshot older than the cache window is retired and rebuilt from a full projection', async () => {
+  const calls = [];
+  let respond;
+  const realNow = Date.now;
+  let clock = 1700000000000;
+  Date.now = () => clock;
+  try {
+    globalThis.fetch = async (url) => { calls.push(String(url)); return respond(); };
+    const api = await import('./api.js?stale=1');
+
+    respond = () => reply({ instance: 'worker-4', version: 1, full: FIRST });
+    assert.deepEqual(await api.getState(), FIRST);
+
+    clock += 29 * 60 * 1000;
+    respond = () => reply({ instance: 'worker-4', version: 2, since: 1, deltas: [diffConsoleState(FIRST, SECOND)] });
+    assert.deepEqual(await api.getState(), SECOND, 'inside the window the chain is followed');
+    assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-4:1')}`);
+
+    // Deltas do not refresh the age: what matters is the last projection the console
+    // did not derive, so a wrong-but-applicable chain cannot live in the tab forever.
+    clock += 2 * 60 * 1000;
+    respond = () => reply({ instance: 'worker-4', version: 3, full: THIRD });
+    assert.deepEqual(await api.getState(), THIRD);
+    assert.equal(calls.at(-1), '/api/state?console=1', 'the aged snapshot is dropped before the request goes out');
+
+    clock += 60 * 1000;
+    respond = () => reply({ instance: 'worker-4', version: 4, since: 3, deltas: [diffConsoleState(THIRD, FIRST)] });
+    assert.deepEqual(await api.getState(), FIRST, 'and the window restarts with the new projection');
+    assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-4:3')}`);
+  } finally { Date.now = realNow; }
+});

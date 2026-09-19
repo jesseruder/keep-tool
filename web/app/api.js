@@ -96,12 +96,17 @@ async function request(url, options = {}) {
 let stateRequest;
 let queuedStateRequest;
 
-// The snapshot the console already holds, kept pristine: `{ instance, version, state }`.
-// The worker answers `since=<instance>:<version>` with the deltas back to it, and
-// falls back to a full envelope whenever it cannot name that chain.
+// The snapshot the console already holds, kept pristine:
+// `{ instance, version, state, fetchedAt }`. The worker answers
+// `since=<instance>:<version>` with the deltas back to it, and falls back to a full
+// envelope whenever it cannot name that chain.
 let stateCache = null;
+// However well the chain holds, an applicable-but-wrong delta would live in the tab
+// forever. A snapshot this old is retired and rebuilt from a full projection.
+const STATE_CACHE_MAX_AGE_MS = 30 * 60 * 1000;
 
 async function fetchState() {
+  if (stateCache && Date.now() - stateCache.fetchedAt >= STATE_CACHE_MAX_AGE_MS) stateCache = null;
   const cached = stateCache;
   const since = cached ? `&since=${encodeURIComponent(`${cached.instance}:${cached.version}`)}` : '';
   const state = await absorbState(await freshRequest(`/api/state?console=1${since}`), cached);
@@ -111,7 +116,7 @@ async function fetchState() {
 }
 
 function adoptFull(body) {
-  stateCache = { instance: body.instance, version: body.version, state: body.full };
+  stateCache = { instance: body.instance, version: body.version, state: body.full, fetchedAt: Date.now() };
   return body.full;
 }
 
@@ -128,7 +133,9 @@ async function absorbState(body, cached) {
   } catch (error) {
     return refetchFull(error);
   }
-  stateCache = { instance: cached.instance, version: body.version, state: next };
+  // fetchedAt stays the base snapshot's: the age that matters is how long the
+  // console has gone without a projection it did not derive.
+  stateCache = { instance: cached.instance, version: body.version, state: next, fetchedAt: cached.fetchedAt };
   return next;
 }
 

@@ -31,12 +31,17 @@ one with the two-level keyed diff in `web/app/shared/state-delta.js`: a fixed ta
 of keyed lists (tasks, sessions, panes, notifications, accounts, handoffs, agents,
 `reviewQueue.items`, `health.schedulers`, `limitResume.waiting`/`.sent`) sends the
 rows that changed, everything else is a wholesale field. It falls back to the full
-projection whenever it cannot name the chain — another worker's instance, a version
-the ring no longer holds, or a version sequence that stopped increasing, which also
-renames the chain so a repeated version cannot be mistaken for one snapshot. The
-console drops its cached snapshot and reloads once whenever a delta will not apply,
-and treats a response with neither `full` nor `deltas` as a plain projection, which
-is what the browser fixtures and the daemon's own `/api/state` serve. `view=` and
+projection whenever it cannot name the chain — another worker's instance, or a
+version the ring no longer holds. A version sequence that stops increasing, and a
+state object published twice (which a publication must never be: `consoleState`
+passes fields through by reference, so an in-place edit is invisible to the diff),
+both rename the chain as well, so a stale console cannot be served a delta that
+means something else. A chain that grew longer than the projection it replaces is
+answered with the projection instead. The console drops its cached snapshot and
+reloads once whenever a delta will not apply or its last full projection is over
+30 minutes old, and treats a response with neither `full` nor `deltas` as a plain
+projection, which is what the browser fixtures and the daemon's own
+`/api/state` serve. `view=` and
 the full projection are unchanged and ignore `since`; ETag, gzip, `304`, and the
 post-mutation fence apply to the envelope exactly as before.
 

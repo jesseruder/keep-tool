@@ -280,3 +280,56 @@ test('a corrupt delta throws instead of producing a wrong list', () => {
     /applies to an array/);
   assert.throws(() => diffConsoleState(null, base), /needs two projections/);
 });
+
+test('non-finite numeric ids are not keys, because JSON writes them as null', () => {
+  const base = projection();
+  base.tasks = [{ id: NaN, fm: { title: 'A' } }, { id: Infinity, fm: { title: 'B' } }];
+  const next = projection();
+  next.tasks = [{ id: NaN, fm: { title: 'A changed' } }, { id: Infinity, fm: { title: 'B' } }];
+
+  const delta = diffConsoleState(base, next);
+  assert.deepEqual(Object.keys(delta.set), ['tasks'], 'the path falls back to a wholesale field');
+  assert.equal(delta.keyed, undefined, 'two rows that both serialize to id null are not two rows');
+  // Exactness is judged on the JSON form: that is what the delta channel carries.
+  assert.equal(JSON.stringify(applyConsoleDelta(base, delta)), JSON.stringify(next));
+  assert.deepEqual(base.tasks.map((task) => task.fm.title), ['A', 'B'], 'the base is untouched');
+});
+
+test('randomized projection pairs round trip on their JSON form', () => {
+  let seed = 20260919;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const pick = (list) => list[Math.min(list.length - 1, Math.floor(rnd() * list.length))];
+  // Ids are drawn from a small pool, so duplicates — which must disable keying on
+  // that side — turn up on their own.
+  const rows = (key, ids) => Array.from({ length: Math.floor(rnd() * 5) },
+    () => ({ [key]: pick(ids), at: Math.floor(rnd() * 5), tag: pick(['a', 'b', 'c']) }));
+  const maybe = (value) => pick([value, undefined, null, 'scalar', [], { odd: true }]);
+  const build = () => {
+    const state = { generatedAt: Math.floor(rnd() * 1000) };
+    if (rnd() < 0.9) state.tasks = rnd() < 0.15 ? maybe(rows('id', ['t1', 't2'])) : rows('id', ['t1', 't2', 't3', 't4']);
+    if (rnd() < 0.9) state.sessions = rows('id', ['s1', 's2', 's3']);
+    if (rnd() < 0.8) state.reviewQueue = rnd() < 0.2 ? maybe({ counts: {} })
+      : { counts: { open: Math.floor(rnd() * 3) }, items: rows('id', ['r1', 'r2', 'r3']) };
+    if (rnd() < 0.8) state.health = rnd() < 0.2 ? maybe({ daemon: {} })
+      : { daemon: { pid: Math.floor(rnd() * 3) }, schedulers: rows('name', ['x', 'y', 'z']) };
+    if (rnd() < 0.5) state.attention = rows('key', ['k1', 'k2']);
+    if (rnd() < 0.3) state.hostStatus = maybe({ up: rnd() < 0.5 });
+    return JSON.parse(JSON.stringify(state));
+  };
+  const seen = { keyed: 0, nested: 0, remove: 0, order: 0 };
+  for (let pair = 0; pair < 400; pair += 1) {
+    const previous = build();
+    const next = build();
+    const frozen = JSON.stringify(previous);
+    const delta = diffConsoleState(previous, next);
+    const applied = applyConsoleDelta(previous, delta);
+    assert.deepEqual(JSON.parse(JSON.stringify(applied)), next, `pair ${pair} did not round trip`);
+    assert.equal(JSON.stringify(previous), frozen, `pair ${pair} mutated the base`);
+    if (delta.keyed) seen.keyed += 1;
+    if (delta.nested) seen.nested += 1;
+    if (delta.remove) seen.remove += 1;
+    if (Object.values(delta.keyed || {}).some((entry) => entry.order)) seen.order += 1;
+  }
+  // The generator has to actually reach every branch for the round trips to mean anything.
+  for (const [branch, count] of Object.entries(seen)) assert.ok(count > 20, `only ${count} pairs reached ${branch}`);
+});

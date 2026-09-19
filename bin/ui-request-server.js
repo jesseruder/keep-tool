@@ -110,7 +110,11 @@ function createUiRequestServer(options = {}) {
   const consoleBody = (since) => {
     const chain = deltaChain(since);
     if (!chain) return fullConsoleBody();
-    return JSON.stringify({ instance, version: current.version, since: chain.since, deltas: chain.deltas });
+    const body = JSON.stringify({ instance, version: current.version, since: chain.since, deltas: chain.deltas });
+    // A long chain can outgrow what it replaces: one review event landing per
+    // publication resends the whole wholesale `review` field each time, so a dozen
+    // deltas cost more than the projection. Never send the more expensive answer.
+    return body.length < fullConsoleBody().length ? body : fullConsoleBody();
   };
 
   const broadcast = (event = { type: 'change', data: 'change' }) => {
@@ -285,6 +289,14 @@ function createUiRequestServer(options = {}) {
 
   return {
     server,
+    // Each publication must be a fresh graph. consoleState() passes most top-level
+    // fields through by reference, so the delta is only correct when the previous
+    // projection cannot have been edited underneath it. The real caller satisfies
+    // this by construction: bin/serve.js publishes through createUiRequestWorker,
+    // and child.send() JSON-serializes every state into the worker. The identity
+    // check below is the cheap half of enforcing it — handing back the very same
+    // state object breaks the chain instead of silently diffing a graph against
+    // itself. Snapshotting defensively would cost a clone of 780 KB per publication.
     publish(value) {
       const state = value?.state;
       if (!state || !Number.isFinite(value.generatedAt) || !Number.isFinite(value.version)) {
@@ -296,9 +308,10 @@ function createUiRequestServer(options = {}) {
       // Versions are strictly increasing within a worker process. If one ever is not,
       // a repeated version no longer identifies a single snapshot, so start a new
       // chain: the ring empties and the instance changes, which sends every console
-      // holding an old snapshot back to one full projection.
+      // holding an old snapshot back to one full projection. The same applies to a
+      // republished state object: whatever changed in place is invisible to the diff.
       if (!previous) history.length = 0;
-      else if (!(value.version > previous.version)) {
+      else if (!(value.version > previous.version) || state === previous.state) {
         history.length = 0;
         instance = crypto.randomUUID();
       } else {
