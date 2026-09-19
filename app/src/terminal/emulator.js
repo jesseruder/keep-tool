@@ -17,6 +17,7 @@ if (!scope.performance || typeof scope.performance.now !== 'function') {
   scope.performance = { ...(scope.performance || {}), now: () => Date.now() - origin };
 }
 
+require('./platform');
 const { Terminal } = require('@xterm/headless');
 
 const DEFAULT_COLS = 80;

@@ -1,3 +1,5 @@
+// Before App: xterm reads navigator fields Hermes does not define.
+import './src/terminal/platform';
 import { registerRootComponent } from 'expo';
 
 import App from './App';
