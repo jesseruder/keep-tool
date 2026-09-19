@@ -225,7 +225,11 @@ function createUiRequestServer(options = {}) {
         let body;
         try {
           body = view ? JSON.stringify(projectMobileState(current.state, view, url.searchParams.get('id') || ''))
-            : wantsConsoleState(url) ? consoleBody(url.searchParams.get('since'))
+            : wantsConsoleState(url)
+              // The envelope is opt-in: a console whose JavaScript predates the delta
+              // channel keeps its code across daemon restarts and still expects the
+              // bare projection.
+              ? (url.searchParams.get('delta') === '1' ? consoleBody(url.searchParams.get('since')) : JSON.stringify(current.console))
               : JSON.stringify(current.state);
         } catch (error) {
           if (error.status === 400) return json(res, 400, { error: error.message });

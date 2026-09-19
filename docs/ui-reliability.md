@@ -22,7 +22,9 @@ on the daemon event loop. `x-keep-state-generated-at`, `x-keep-state-version`, a
 `x-keep-mutation-fence` expose the publication age and boundary.
 
 The console reloads on a delta channel rather than refetching its whole projection
-(780 KB raw, 178 KB gzipped) eight times a minute. `console=1` answers an envelope:
+(780 KB raw, 178 KB gzipped) eight times a minute. `console=1&delta=1` answers an envelope (plain `console=1` still answers the bare
+projection, so a console tab running code from before the channel keeps working
+across a daemon restart):
 `{ instance, version, full }` when it has to send the projection, `{ instance,
 version, since, deltas }` when the console named a snapshot it can chain from with
 `&since=<instance>:<version>`. The worker keeps the last 30 publications' deltas in

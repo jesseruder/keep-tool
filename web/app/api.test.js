@@ -235,12 +235,12 @@ test('the console applies delta envelopes to the snapshot it holds and asks for 
 
   respond = () => reply({ instance: 'worker-1', version: 1, full: FIRST });
   assert.deepEqual(await api.getState(), FIRST, 'the first read takes the full envelope');
-  assert.equal(calls.at(-1), '/api/state?console=1', 'with nothing to name yet, no since');
+  assert.equal(calls.at(-1), '/api/state?console=1&delta=1', 'with nothing to name yet, no since');
 
   respond = () => reply({ instance: 'worker-1', version: 3, since: 1,
     deltas: [diffConsoleState(FIRST, SECOND), diffConsoleState(SECOND, THIRD)] });
   const applied = await api.getState();
-  assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-1:1')}`);
+  assert.equal(calls.at(-1), `/api/state?console=1&delta=1&since=${encodeURIComponent('worker-1:1')}`);
   assert.deepEqual(applied, THIRD, 'the chain rebuilds the projection the worker holds');
 
   // app.js edits the object it is handed; the cached base must not be that object.
@@ -250,9 +250,9 @@ test('the console applies delta envelopes to the snapshot it holds and asks for 
   respond = (url) => reply({ instance: 'worker-1', version: 4, deltas: [],
     since: Number(decodeURIComponent(url.split('since=')[1] || '').split(':')[1]) });
   assert.deepEqual(await api.getState(), THIRD, 'the pristine snapshot survives the caller editing its copy');
-  assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-1:3')}`);
+  assert.equal(calls.at(-1), `/api/state?console=1&delta=1&since=${encodeURIComponent('worker-1:3')}`);
   assert.deepEqual(await api.getState(), THIRD);
-  assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-1:4')}`,
+  assert.equal(calls.at(-1), `/api/state?console=1&delta=1&since=${encodeURIComponent('worker-1:4')}`,
     'an empty chain still advances the version the console names');
 });
 
@@ -274,7 +274,7 @@ test('a delta the console cannot place sends it back for one full projection', a
     ? reply({ instance: 'worker-2', version: 9, since: 1, deltas: [diffConsoleState(FIRST, SECOND)] })
     : full('worker-2', 9, THIRD));
   assert.deepEqual(await api.getState(), THIRD, 'a foreign chain is refused and reloaded whole');
-  assert.equal(calls.at(-1), '/api/state?console=1');
+  assert.equal(calls.at(-1), '/api/state?console=1&delta=1');
   assert.equal(calls.filter((url) => url.startsWith('/api/state')).length, 3, 'exactly one retry');
 
   // A chain that does not start where the console stands.
@@ -305,22 +305,22 @@ test('a plain console projection still loads, and stops the console naming a sna
   respond = () => reply(FIRST);
   assert.deepEqual(await api.getState(), FIRST);
   assert.deepEqual(await api.getState(), FIRST);
-  assert.deepEqual(calls, ['/api/state?console=1', '/api/state?console=1'], 'no since is ever sent');
+  assert.deepEqual(calls, ['/api/state?console=1&delta=1', '/api/state?console=1&delta=1'], 'no since is ever sent');
 
   // A worker that starts speaking envelopes mid-stream is adopted on the spot.
   respond = () => reply({ instance: 'worker-3', version: 5, full: SECOND });
   assert.deepEqual(await api.getState(), SECOND);
   respond = () => reply({ instance: 'worker-3', version: 6, since: 5, deltas: [diffConsoleState(SECOND, THIRD)] });
   assert.deepEqual(await api.getState(), THIRD);
-  assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-3:5')}`);
+  assert.equal(calls.at(-1), `/api/state?console=1&delta=1&since=${encodeURIComponent('worker-3:5')}`);
 
   // And one that goes back to a bare projection drops the snapshot again.
   respond = () => reply(FIRST);
   assert.deepEqual(await api.getState(), FIRST);
-  assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-3:6')}`);
+  assert.equal(calls.at(-1), `/api/state?console=1&delta=1&since=${encodeURIComponent('worker-3:6')}`);
   respond = () => reply(SECOND);
   assert.deepEqual(await api.getState(), SECOND);
-  assert.equal(calls.at(-1), '/api/state?console=1');
+  assert.equal(calls.at(-1), '/api/state?console=1&delta=1');
 });
 
 test('a snapshot older than the cache window is retired and rebuilt from a full projection', async () => {
@@ -339,18 +339,18 @@ test('a snapshot older than the cache window is retired and rebuilt from a full 
     clock += 29 * 60 * 1000;
     respond = () => reply({ instance: 'worker-4', version: 2, since: 1, deltas: [diffConsoleState(FIRST, SECOND)] });
     assert.deepEqual(await api.getState(), SECOND, 'inside the window the chain is followed');
-    assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-4:1')}`);
+    assert.equal(calls.at(-1), `/api/state?console=1&delta=1&since=${encodeURIComponent('worker-4:1')}`);
 
     // Deltas do not refresh the age: what matters is the last projection the console
     // did not derive, so a wrong-but-applicable chain cannot live in the tab forever.
     clock += 2 * 60 * 1000;
     respond = () => reply({ instance: 'worker-4', version: 3, full: THIRD });
     assert.deepEqual(await api.getState(), THIRD);
-    assert.equal(calls.at(-1), '/api/state?console=1', 'the aged snapshot is dropped before the request goes out');
+    assert.equal(calls.at(-1), '/api/state?console=1&delta=1', 'the aged snapshot is dropped before the request goes out');
 
     clock += 60 * 1000;
     respond = () => reply({ instance: 'worker-4', version: 4, since: 3, deltas: [diffConsoleState(THIRD, FIRST)] });
     assert.deepEqual(await api.getState(), FIRST, 'and the window restarts with the new projection');
-    assert.equal(calls.at(-1), `/api/state?console=1&since=${encodeURIComponent('worker-4:3')}`);
+    assert.equal(calls.at(-1), `/api/state?console=1&delta=1&since=${encodeURIComponent('worker-4:3')}`);
   } finally { Date.now = realNow; }
 });

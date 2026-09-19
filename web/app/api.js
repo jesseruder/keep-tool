@@ -109,7 +109,7 @@ async function fetchState() {
   if (stateCache && Date.now() - stateCache.fetchedAt >= STATE_CACHE_MAX_AGE_MS) stateCache = null;
   const cached = stateCache;
   const since = cached ? `&since=${encodeURIComponent(`${cached.instance}:${cached.version}`)}` : '';
-  const state = await absorbState(await freshRequest(`/api/state?console=1${since}`), cached);
+  const state = await absorbState(await freshRequest(`/api/state?console=1&delta=1${since}`), cached);
   // app.js reassigns `data` and edits its lists in place (spawned panes, dropped
   // panes, detail reconciliation), so the cached base must never be what it holds.
   return stateCache ? structuredClone(state) : state;
@@ -143,7 +143,7 @@ async function absorbState(body, cached) {
 // base to apply them to, so surface the failure rather than render a stale list.
 async function refetchFull(cause) {
   stateCache = null;
-  const body = await freshRequest('/api/state?console=1');
+  const body = await freshRequest('/api/state?console=1&delta=1');
   if (body && typeof body === 'object' && Object.hasOwn(body, 'full')) return adoptFull(body);
   if (body && typeof body === 'object' && Object.hasOwn(body, 'deltas')) {
     throw cause || new Error('dashboard state deltas arrived without a base snapshot');

@@ -72,7 +72,7 @@ test('frontend returns loading until a real snapshot and serves every projection
   assert.equal(full.headers['x-keep-state-generated-at'], '1234');
   assert.equal(full.headers['x-keep-state-version'], '7');
   assert.equal(JSON.parse(full.body).tasks[0].body, 'full body');
-  const consoleEnvelope = JSON.parse((await request(f.port, '/api/state?console=1')).body);
+  const consoleEnvelope = JSON.parse((await request(f.port, '/api/state?console=1&delta=1')).body);
   assert.match(consoleEnvelope.instance, /^[0-9a-f-]{36}$/);
   assert.equal(consoleEnvelope.version, 7);
   const consoleBody = consoleEnvelope.full;
@@ -80,6 +80,11 @@ test('frontend returns loading until a real snapshot and serves every projection
   assert.equal(consoleBody.tasks[0].lastLog, undefined);
   assert.equal(consoleBody.digest, undefined, 'the console projection drops the fields it never renders');
   assert.deepEqual(Object.keys(consoleBody).sort(), ['attention', 'generatedAt', 'panes', 'reviewQueue', 'sessions', 'tasks']);
+  const legacyConsole = JSON.parse((await request(f.port, '/api/state?console=1')).body);
+  assert.equal(legacyConsole.full, undefined, 'without delta=1 the projection is bare, for consoles running code that predates the envelope');
+  assert.deepEqual(legacyConsole, consoleBody);
+  assert.equal(JSON.parse((await request(f.port, `/api/state?console=1&since=${consoleEnvelope.instance}:7`)).body).full, undefined,
+    'since without delta=1 is ignored the same way');
   assert.equal(JSON.parse((await request(f.port, '/api/state?summary=1')).body).tasks[0].body, 'full body',
     'the retired summary flag is ignored, not a separate projection');
   assert.equal(JSON.parse((await request(f.port, '/api/state', { headers: { referer: `http://localhost:${f.port}/app/` } })).body).tasks[0].body, 'full body',
@@ -175,7 +180,7 @@ function publication(version, overrides = {}) {
 }
 
 async function consoleEnvelope(port, since) {
-  const response = await request(port, `/api/state?console=1${since ? `&since=${encodeURIComponent(since)}` : ''}`);
+  const response = await request(port, `/api/state?console=1&delta=1${since ? `&since=${encodeURIComponent(since)}` : ''}`);
   assert.equal(response.status, 200, response.body);
   return { response, body: JSON.parse(response.body) };
 }
@@ -262,23 +267,23 @@ test('since changes nothing about the fence, the other projections, or caching',
   // The post-mutation fence still holds a since request back.
   const write = await request(f.port, '/api/action', { method: 'POST', headers: { 'x-keep': '1' }, body: '{}' });
   assert.equal(write.headers['x-keep-mutation-fence'], 'epoch:2');
-  const behind = await request(f.port, `/api/state?console=1&since=${instance}:1`, { headers: { 'x-keep-after-mutation': 'epoch:2' } });
+  const behind = await request(f.port, `/api/state?console=1&delta=1&since=${instance}:1`, { headers: { 'x-keep-after-mutation': 'epoch:2' } });
   assert.equal(behind.status, 503);
   assert.match(behind.body, /refresh is pending/);
   f.ui.publish({ ...publication(2), mutationFence: 'epoch:2' });
-  const released = await request(f.port, `/api/state?console=1&since=${instance}:1`, { headers: { 'x-keep-after-mutation': 'epoch:2' } });
+  const released = await request(f.port, `/api/state?console=1&delta=1&since=${instance}:1`, { headers: { 'x-keep-after-mutation': 'epoch:2' } });
   assert.equal(released.status, 200);
   assert.equal(JSON.parse(released.body).deltas.length, 1);
 
   // ETag and 304 work on the envelope exactly as on the bare projection.
-  const envelope = await request(f.port, '/api/state?console=1');
+  const envelope = await request(f.port, '/api/state?console=1&delta=1');
   assert.ok(envelope.headers.etag);
   assert.equal(envelope.headers['x-keep-state-version'], '2');
-  const repeat = await request(f.port, '/api/state?console=1', { headers: { 'if-none-match': envelope.headers.etag } });
+  const repeat = await request(f.port, '/api/state?console=1&delta=1', { headers: { 'if-none-match': envelope.headers.etag } });
   assert.equal(repeat.status, 304);
-  const deltaResponse = await request(f.port, `/api/state?console=1&since=${instance}:1`);
+  const deltaResponse = await request(f.port, `/api/state?console=1&delta=1&since=${instance}:1`);
   assert.notEqual(deltaResponse.headers.etag, envelope.headers.etag, 'a delta body is not the projection body');
-  assert.equal((await request(f.port, `/api/state?console=1&since=${instance}:1`,
+  assert.equal((await request(f.port, `/api/state?console=1&delta=1&since=${instance}:1`,
     { headers: { 'if-none-match': deltaResponse.headers.etag } })).status, 304);
 });
 

@@ -117,7 +117,7 @@ test('real dashboard routes use the worker snapshot across full, console, mobile
   // The console's own projection: the same list context, without the card
   // histories or the top-level fields the console never renders.
   // With no `since`, the console projection arrives as a full delta-channel envelope.
-  const consoleEnvelope = await request(port, '/api/state?console=1');
+  const consoleEnvelope = await request(port, '/api/state?console=1&delta=1');
   assert.equal(consoleEnvelope.status, 200);
   assert.ok(consoleEnvelope.body.instance, 'the envelope names the worker that built it');
   const consoleState = consoleEnvelope.body.full;
