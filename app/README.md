@@ -205,11 +205,13 @@ ever displayed.
 **Moving on.** Connecting to a different server, or **Forget this server**, sends
 `DELETE /api/devices` to the daemon being left, best effort, with the config that is
 being replaced — it is the only thing that can still authenticate the removal. Both
-bump a generation counter first, and every step of a registration checks it: a pass
-that has been superseded writes no record, and a `POST` that had already gone out
-when the `DELETE` did is taken back with a second `DELETE` rather than left standing.
-Without that, forgetting a server while a registration was in flight registered the
-phone all over again a moment later.
+bump a generation counter first, and every step of a registration checks it —
+including the step *after* the record has been written, which is the narrow window
+where Forget looks for a saved token, finds none because the write had not landed
+yet, and sends no `DELETE` of its own. A superseded pass keeps nothing: the record it
+wrote is removed again (only if it is still its own) and the token it registered is
+taken back with a `DELETE`. Without all of that, forgetting a server while a
+registration was in flight registered the phone all over again a moment later.
 
 **The tap.** A push carries `data: {key, sessionId}`, where `key` is the console's
 own attention key or `alert:<id>`. Foreground, background and cold start all end at

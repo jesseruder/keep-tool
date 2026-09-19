@@ -359,6 +359,41 @@ test('a pass superseded by Forget writes nothing, and takes back what landed', a
   assert.deepEqual(api.calls.map((call) => (call.removed ? 'remove' : 'post')), ['post', 'remove']);
   assert.equal(api.calls[1].removed, TOKEN);
 
+  // The narrower window: Forget lands while the record is being written, so its own
+  // unregisterDevice finds nothing saved yet and sends no DELETE. If this pass then
+  // simply finished, the daemon and the record would both come back.
+  const slow = fakeStorage();
+  const written = slow.setItem;
+  const late = fakeApi();
+  let live = true;
+  slow.setItem = async (key, value) => {
+    live = false;
+    await written(key, value);
+  };
+  const raced = await syncRegistration(deps(slow, late, {
+    isCurrent: () => live,
+    remove: late.remove,
+  }));
+  assert.equal(raced.status, 'superseded');
+  assert.equal(await readRegistration(slow), null);
+  assert.deepEqual(late.calls.map((call) => (call.removed ? 'remove' : 'post')), ['post', 'remove']);
+  assert.equal(late.calls[1].removed, TOKEN);
+
+  // A newer pass that has since written its own record is left alone.
+  const busy = fakeStorage();
+  const saveIt = busy.setItem;
+  const other = fakeApi();
+  let held = true;
+  busy.setItem = async (key, value) => {
+    held = false;
+    await saveIt(key, value);
+    // A newer pass put its own registration there straight afterwards.
+    busy.map.set(REGISTRATION_KEY, JSON.stringify({ token: OTHER_TOKEN, server: SERVER, registeredAt: NOW + 5000 }));
+  };
+  const overtaken = await syncRegistration(deps(busy, other, { isCurrent: () => held, remove: other.remove }));
+  assert.equal(overtaken.status, 'superseded');
+  assert.equal((await readRegistration(busy)).token, OTHER_TOKEN);
+
   // Superseded before the POST: the daemon is never told at all.
   const early = fakeStorage();
   const quiet = fakeApi();

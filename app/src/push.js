@@ -206,17 +206,30 @@ async function syncRegistration({
     return saved && saved.token === token ? fallback(reason) : state('unavailable', { reason });
   }
 
-  if (!isCurrent()) {
-    // It landed anyway. Take it back rather than leave a daemon pushing at a phone
-    // that has forgotten it, and write nothing.
+  // The registration landed. From here the pass can still be superseded twice over:
+  // while the request was on the wire, and while the record is being written — and
+  // the second one is the worse of the two, because `unregisterDevice` looks for a
+  // saved token and a write that has not finished yet leaves it nothing to find, so
+  // Forget sends no DELETE and this pass then restores the record behind it. Either
+  // way the pass takes its own registration back: the daemon is told to drop the
+  // token, and the record goes if this pass is what left it there.
+  const record = { token, server, registeredAt: Number(now) };
+  const takeBack = async () => {
+    const current = await readRegistration(storage);
+    // Only ever removing what this pass itself wrote: a newer one may have put a
+    // perfectly good record there in the meantime.
+    if (current && current.token === record.token && current.server === record.server
+      && current.registeredAt === record.registeredAt) await clearRegistration(storage);
     if (remove) {
       try { await remove(config, token); }
       catch {}
     }
     return SUPERSEDED;
-  }
+  };
 
-  await writeRegistration(storage, { token, server, registeredAt: Number(now) });
+  if (!isCurrent()) return takeBack();
+  await writeRegistration(storage, record);
+  if (!isCurrent()) return takeBack();
   return state('registered', { tokenTail: tokenTail(token), registeredAt: Number(now), fresh: false });
 }
 
