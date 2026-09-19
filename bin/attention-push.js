@@ -12,10 +12,15 @@
 // carries is the key the app hands back on a tap, and the console's
 // selectAttention() has to find the row under exactly that key.
 //
-// State is one Set of keys in memory. A daemon restart re-seeds from the first
+// The key set is per-process: a daemon restart re-seeds from the first
 // publication and notifies for nothing in it, which is what a console reload
 // does too — the alternative is a burst of pushes for rows Owner has already
-// seen every time the daemon restarts.
+// seen every time the daemon restarts. The dedupe window and the day's count are
+// the opposite case and live in `.keep/attention-push.json`, so a restart cannot
+// grant another hundred pushes or repeat a key it sent ten minutes ago.
+
+const fs = require('node:fs');
+const path = require('node:path');
 
 const KINDS = new Set(['question', 'permission', 'plan', 'input']);
 
@@ -73,6 +78,49 @@ function envNumber(name, fallback) {
 function dedupeMs() { return envNumber('KEEP_ALERT_DEDUPE_HOURS', DEDUPE_HOURS) * 3600e3; }
 function dailyLimit() { return envNumber('KEEP_ATTENTION_PUSH_DAILY', DAILY_DEFAULT); }
 
+// The dedupe window and the day's count outlive the process: a daemon restart
+// must not hand the phone another hundred pushes, or repeat a key it sent ten
+// minutes ago. The attention key set deliberately does not — see the header.
+function stateFile(root) { return path.join(String(root || ''), '.keep', 'attention-push.json'); }
+
+function loadState(root, now) {
+  const empty = { sentAt: new Map(), day: '', count: 0 };
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')); } catch { return empty; }
+  if (!parsed || typeof parsed !== 'object') return empty;
+  const rows = parsed.sentAt && typeof parsed.sentAt === 'object' ? parsed.sentAt : {};
+  const sentAt = new Map();
+  for (const [key, at] of Object.entries(rows)) {
+    if (typeof key === 'string' && key && Number.isFinite(Number(at)) && now - Number(at) < dedupeMs()) {
+      sentAt.set(key, Number(at));
+    }
+  }
+  return {
+    sentAt,
+    day: typeof parsed.day === 'string' ? parsed.day : '',
+    count: Number.isFinite(Number(parsed.count)) ? Math.max(0, Number(parsed.count)) : 0,
+  };
+}
+
+// Best effort: a push that went out is not a failure because its record could
+// not be written, and the next observation writes the whole state again.
+function saveState(root, state) {
+  const file = stateFile(root);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify({
+        sentAt: Object.fromEntries(state.sentAt), day: state.day, count: state.count,
+      }, null, 2) + '\n', { mode: 0o600 });
+      fs.renameSync(tmp, file);
+    } catch (error) {
+      try { fs.unlinkSync(tmp); } catch {}
+      throw error;
+    }
+  } catch { /* the window and the cap degrade to this process's memory */ }
+}
+
 // One pass over state.attention per publication, a Set of keys and a Map of send
 // times. Nothing is written to disk, and the happy path logs nothing.
 function createAttentionPush(options = {}) {
@@ -83,17 +131,15 @@ function createAttentionPush(options = {}) {
   const onError = options.onError || (() => {});
   let seeded = false;
   let keys = new Set();
-  const sentAt = new Map();
-  let day = '';
-  let today = 0;
+  let state = null;
   return {
     get seeded() { return seeded; },
     get size() { return keys.size; },
-    get sentToday() { return today; },
+    get sentToday() { return state ? state.count : 0; },
     // Returns the notifications it sent, which is what the tests read; the daemon
     // ignores it.
-    observe(state, now = Date.now()) {
-      const rows = state && Array.isArray(state.attention) ? state.attention : [];
+    observe(published, now = Date.now()) {
+      const rows = published && Array.isArray(published.attention) ? published.attention : [];
       const current = new Set(rows.map(attentionKey));
       if (!seeded) {
         seeded = true;
@@ -103,6 +149,9 @@ function createAttentionPush(options = {}) {
       // A row that left the list is forgotten, so the same session waiting again
       // later is a new event — subject to the dedupe window below.
       for (const key of [...keys]) if (!current.has(key)) keys.delete(key);
+      // Read once, on the first publication this process handles: the daemon is
+      // the only writer.
+      if (!state) state = loadState(root, now);
       const sent = [];
       let quietNow = null;
       for (const item of rows) {
@@ -114,15 +163,16 @@ function createAttentionPush(options = {}) {
         // waiting when they end, and the console is where it is triaged.
         if (quietNow === null) quietNow = Boolean(quiet(now));
         if (quietNow) continue;
-        const previous = sentAt.get(key);
+        const previous = state.sentAt.get(key);
         if (Number.isFinite(previous) && now - previous < dedupeMs()) continue;
         const currentDay = alerts().dayOf(now);
-        if (currentDay !== day) { day = currentDay; today = 0; }
-        if (today >= dailyLimit()) continue;
-        today += 1;
-        sentAt.set(key, now);
-        for (const [seen, at] of sentAt) if (now - at >= dedupeMs()) sentAt.delete(seen);
-        const message = notification(state, item);
+        if (currentDay !== state.day) { state.day = currentDay; state.count = 0; }
+        if (state.count >= dailyLimit()) continue;
+        state.count += 1;
+        state.sentAt.set(key, now);
+        for (const [seen, at] of state.sentAt) if (now - at >= dedupeMs()) state.sentAt.delete(seen);
+        saveState(root, state);
+        const message = notification(published, item);
         sent.push(message);
         // Best effort, like every other channel adapter: a phone that cannot be
         // reached must never hold up a publication or reach the caller.

@@ -34,6 +34,7 @@ function startFeatureSchedulers(features, modules, options, health) {
 }
 
 const PULL_TIMEOUT_MS = 30e3;
+const PUSH_RECEIPTS_MS = 15 * 60e3;
 
 // git's own reason for refusing, which the old `stdio: 'ignore'` threw away and
 // health showed as a bare exit status. A child killed for running past the timeout
@@ -603,6 +604,22 @@ function startSchedulers(ctx) {
   setTimeout(collectCardUsage, 1000).unref();
   setInterval(foldFleetUsage, 5 * 60e3).unref();
   setTimeout(foldFleetUsage, 20e3).unref();
+
+  // Expo reports an uninstalled app in a push's receipt, minutes after the push
+  // itself was accepted, so the registry only learns about a dead phone if
+  // somebody asks. Nothing here is urgent: a phone that is gone costs one wasted
+  // request per alert until the next run.
+  const receiptsTick = async () => {
+    try {
+      const result = await require('../alerts.js').pollReceipts({ root: keep.ROOT });
+      health.record('push-receipts', { ok: true, cadenceMs: PUSH_RECEIPTS_MS, detail: result.detail });
+    } catch (error) {
+      health.record('push-receipts', { ok: false, cadenceMs: PUSH_RECEIPTS_MS, error });
+      process.stderr.write(`keep serve: push receipts failed: ${error.message}\n`);
+    }
+  };
+  setInterval(receiptsTick, PUSH_RECEIPTS_MS).unref();
+  setTimeout(receiptsTick, PUSH_RECEIPTS_MS).unref();
 
   startLoopLagProbe();
   const pull = createRegistryPull({ keep, health });

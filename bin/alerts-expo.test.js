@@ -213,6 +213,188 @@ test('quiet hours defer the expo channel exactly as they defer the rest', async 
   assert.equal(pushes, 1);
 });
 
+// --- receipts ---------------------------------------------------------------
+//
+// Expo accepts a push and answers with a ticket; the verdict — including an
+// uninstalled app — arrives minutes later as a receipt, which somebody has to
+// ask for.
+
+const ticketsOf = (root) => {
+  try { return JSON.parse(fs.readFileSync(alerts.ticketsFile(root), 'utf8')).tickets; }
+  catch { return null; }
+};
+const expoTickets = (ids) => ({
+  ok: true, status: 200, json: async () => ({ data: ids.map((id) => ({ status: 'ok', id })) }),
+});
+
+test('an accepted push leaves a ticket behind for its receipt', async (t) => {
+  const root = makeRoot(t);
+  const now = Date.parse('2026-09-19T09:00:00Z');
+  const outcome = await alerts.sendExpo({ ...waiting }, {
+    root,
+    now,
+    devices: fakeRegistry(['aaaaaa', 'bbbbbb']),
+    fetch: async () => expoTickets(['ticket-a', 'ticket-b']),
+  });
+  assert.equal(outcome, 'ok');
+  assert.deepEqual(ticketsOf(root), [
+    { id: 'ticket-a', token: expoToken('aaaaaa'), at: now },
+    { id: 'ticket-b', token: expoToken('bbbbbb'), at: now },
+  ]);
+  assert.equal(fs.statSync(alerts.ticketsFile(root)).mode & 0o777, 0o600);
+  assert.equal(alerts.ticketsFile(root), path.join(root, '.keep', 'push-tickets.json'));
+
+  // A push that failed outright leaves nothing to ask about.
+  await alerts.sendExpo({ ...waiting }, {
+    root, now, devices: fakeRegistry(['cccccc']), fetch: async () => ({ ok: false, status: 502, json: async () => ({}) }),
+  });
+  assert.equal(ticketsOf(root).length, 2);
+});
+
+test('receipts are asked for in batches of three hundred and drop what they answer', async (t) => {
+  const root = makeRoot(t);
+  const now = Date.parse('2026-09-19T09:00:00Z');
+  const tails = Array.from({ length: 350 }, (_value, index) => `t${String(index).padStart(6, '0')}`);
+  await alerts.sendExpo({ ...waiting }, {
+    root,
+    now,
+    devices: fakeRegistry(tails),
+    fetch: async (_url, init) => expoTickets(JSON.parse(init.body).to.map((token) => `ticket-${token}`)),
+  });
+  assert.equal(ticketsOf(root).length, 350);
+
+  const batches = [];
+  const registry = fakeRegistry([]);
+  const result = await alerts.pollReceipts({
+    root,
+    now: now + 60e3,
+    devices: registry,
+    fetch: async (url, init) => {
+      assert.equal(url, 'https://exp.host/--/api/v2/push/getReceipts');
+      assert.ok(init.signal instanceof AbortSignal, 'the request is bounded by a timeout');
+      const ids = JSON.parse(init.body).ids;
+      batches.push(ids.length);
+      // Expo answers only for the receipts it already has.
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: Object.fromEntries(ids.slice(0, 10).map((id) => [id, { status: 'ok' }])) }),
+      };
+    },
+  });
+  assert.deepEqual(batches, [300, 50]);
+  assert.equal(result.resolved, 20);
+  assert.equal(result.pending, 330, 'a receipt Expo has not produced yet keeps its ticket');
+  assert.equal(ticketsOf(root).length, 330);
+  assert.deepEqual(registry.removed, []);
+});
+
+test('a DeviceNotRegistered receipt unregisters that phone and only that phone', async (t) => {
+  const root = makeRoot(t);
+  const now = Date.parse('2026-09-19T09:00:00Z');
+  await alerts.sendExpo({ ...waiting }, {
+    root, now, devices: fakeRegistry(['gonegone', 'staystay']),
+    fetch: async () => expoTickets(['ticket-gone', 'ticket-stay']),
+  });
+  const registry = fakeRegistry(['gonegone', 'staystay']);
+  const result = await alerts.pollReceipts({
+    root,
+    now: now + 60e3,
+    devices: registry,
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: {
+        'ticket-gone': { status: 'error', message: 'not registered', details: { error: 'DeviceNotRegistered' } },
+        'ticket-stay': { status: 'ok' },
+      } }),
+    }),
+  });
+  assert.deepEqual(registry.removed, [expoToken('gonegone')]);
+  assert.deepEqual(result.removed, [expoToken('gonegone')]);
+  assert.deepEqual(ticketsOf(root), [], 'both receipts had a verdict');
+});
+
+test('a receipts call that fails keeps every ticket for the next run', async (t) => {
+  const written = [];
+  t.mock.method(process.stderr, 'write', (chunk) => { written.push(String(chunk)); return true; });
+  const root = makeRoot(t);
+  const now = Date.now() + 7200e3;
+  await alerts.sendExpo({ ...waiting }, {
+    root, now, devices: fakeRegistry(['aaaaaa']), fetch: async () => expoTickets(['ticket-a']),
+  });
+  const refused = await alerts.pollReceipts({
+    root, now, devices: fakeRegistry(['aaaaaa']), fetch: async () => ({ ok: false, status: 502, json: async () => ({}) }),
+  });
+  assert.equal(refused.resolved, 0);
+  assert.equal(refused.pending, 1);
+  assert.deepEqual(ticketsOf(root).map((ticket) => ticket.id), ['ticket-a']);
+  assert.match(written.join(''), /receipts HTTP 502/);
+
+  // A thrown request is the same, and nothing reaches the caller.
+  const broken = await alerts.pollReceipts({
+    root, now: now + 61e3, devices: fakeRegistry(['aaaaaa']), fetch: async () => { throw new Error('socket hang up'); },
+  });
+  assert.equal(broken.pending, 1);
+  assert.match(written.join(''), /receipts socket hang up/);
+
+  // An error that is not a dead device is logged, not acted on.
+  const other = await alerts.pollReceipts({
+    root,
+    now: now + 122e3,
+    devices: fakeRegistry(['aaaaaa']),
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: { 'ticket-a': { status: 'error', message: 'too big', details: { error: 'MessageTooBig' } } } }),
+    }),
+  });
+  assert.deepEqual(other.removed, []);
+  assert.equal(other.pending, 0, 'a verdict is a verdict');
+  assert.match(written.join(''), /receipt MessageTooBig/);
+});
+
+test('the ticket file is capped, and the oldest unanswered ticket is the one dropped', async (t) => {
+  const root = makeRoot(t);
+  const now = Date.parse('2026-09-19T09:00:00Z');
+  const push = (tails, at) => alerts.sendExpo({ ...waiting }, {
+    root,
+    now: at,
+    devices: fakeRegistry(tails),
+    fetch: async (_url, init) => expoTickets(JSON.parse(init.body).to.map((token) => `ticket-${token}-${at}`)),
+  });
+  await push(Array.from({ length: 300 }, (_value, index) => `old${String(index).padStart(5, '0')}`), now);
+  await push(Array.from({ length: 300 }, (_value, index) => `new${String(index).padStart(5, '0')}`), now + 1000);
+  const tickets = ticketsOf(root);
+  assert.equal(tickets.length, 500);
+  assert.equal(tickets.at(-1).id, `ticket-${expoToken('new00299')}-${now + 1000}`);
+  assert.equal(tickets.some((ticket) => ticket.id.includes('old00000')), false, 'the oldest hundred fell off');
+});
+
+test('a ticket nobody answered for a day is given up on', async (t) => {
+  const root = makeRoot(t);
+  const now = Date.parse('2026-09-19T09:00:00Z');
+  await alerts.sendExpo({ ...waiting }, {
+    root, now, devices: fakeRegistry(['aaaaaa']), fetch: async () => expoTickets(['ticket-a']),
+  });
+  let asked = 0;
+  const result = await alerts.pollReceipts({
+    root,
+    now: now + 25 * 3600e3,
+    devices: fakeRegistry(['aaaaaa']),
+    fetch: async () => { asked += 1; return { ok: true, status: 200, json: async () => ({ data: {} }) }; },
+  });
+  assert.equal(asked, 0, 'nothing left to ask about');
+  assert.equal(result.expired, 1);
+  assert.deepEqual(ticketsOf(root), []);
+
+  // With no tickets at all the poll is a no-op that writes nothing.
+  const empty = makeRoot(t);
+  const quiet = await alerts.pollReceipts({ root: empty, fetch: async () => { throw new Error('never called'); } });
+  assert.deepEqual(quiet, { checked: 0, resolved: 0, removed: [], pending: 0, expired: 0, detail: 'no tickets' });
+  assert.equal(ticketsOf(empty), null);
+});
+
 test('the channel becomes available only once a phone has registered', (t) => {
   const root = makeRoot(t);
   // availableChannels refuses every channel inside a test runner, so the real

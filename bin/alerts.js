@@ -16,8 +16,13 @@ const HOUR_MS = 3600e3;
 // carries at most 100 tokens; Owner has one phone, so the batching is there for
 // the shape of the API rather than for the fleet.
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+const EXPO_RECEIPTS_URL = 'https://exp.host/--/api/v2/push/getReceipts';
 const EXPO_BATCH = 100;
+const RECEIPT_BATCH = 300;
 const EXPO_TIMEOUT_MS = 10e3;
+// A receipt Expo has not produced within a day is never coming.
+const TICKET_TTL_MS = 24 * 3600e3;
+const TICKET_MAX = 500;
 
 function atMs(value) {
   if (value instanceof Date) return value.getTime();
@@ -296,6 +301,114 @@ function expoLog(message, now = Date.now()) {
   return true;
 }
 
+// Expo answers a push with a ticket, and the real verdict arrives later as a
+// receipt: a phone that has uninstalled the app is reported there, not in the
+// ticket, so a registry that only reads tickets keeps pushing to dead tokens
+// until Expo rate-limits the sender. Tickets are kept here until a receipt
+// resolves them or they age out, and they outlive the process that sent the
+// push — `keep alert` exits at once, and the daemon does the polling.
+function ticketsFile(root = DEFAULT_ROOT) { return path.join(root, '.keep', 'push-tickets.json'); }
+
+function loadTickets(root = DEFAULT_ROOT) {
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(ticketsFile(root), 'utf8')); } catch { return []; }
+  const rows = Array.isArray(parsed) ? parsed : Array.isArray(parsed && parsed.tickets) ? parsed.tickets : [];
+  return rows
+    .filter((row) => row && typeof row.id === 'string' && row.id && typeof row.token === 'string' && row.token
+      && Number.isFinite(Number(row.at)))
+    .map((row) => ({ id: row.id, token: row.token, at: Number(row.at) }));
+}
+
+function saveTickets(rows, root = DEFAULT_ROOT) {
+  const file = ticketsFile(root);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    // Newest kept: an old ticket whose receipt never came is the one to drop.
+    fs.writeFileSync(tmp, JSON.stringify({ tickets: rows.slice(-TICKET_MAX) }, null, 2) + '\n', { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw error;
+  }
+  return rows;
+}
+
+// Never raised to a caller: a push that went out is not a failure because the
+// daemon could not write down its ticket.
+function recordTickets(rows, root = DEFAULT_ROOT, now = Date.now()) {
+  if (!rows.length) return [];
+  try {
+    const live = loadTickets(root).filter((ticket) => now - ticket.at < TICKET_TTL_MS);
+    return saveTickets([...live, ...rows], root);
+  } catch { return []; }
+}
+
+// Ask Expo what became of the pushes it accepted. Batches of 300 ids, one
+// request each; a receipt is a verdict, so the ticket is dropped whatever it
+// says, while a request that fails leaves every ticket for the next run.
+async function pollReceipts(options = {}) {
+  const root = options.root || DEFAULT_ROOT;
+  const registry = options.devices || require('./devices.js');
+  const doFetch = options.fetch || globalThis.fetch;
+  const now = Number.isFinite(options.now) ? options.now : Date.now();
+  const stored = loadTickets(root);
+  const tickets = stored.filter((ticket) => now - ticket.at < TICKET_TTL_MS);
+  const expired = stored.length - tickets.length;
+  if (!tickets.length || typeof doFetch !== 'function') {
+    if (expired) { try { saveTickets(tickets, root); } catch {} }
+    return { checked: 0, resolved: 0, removed: [], pending: tickets.length, expired, detail: 'no tickets' };
+  }
+  const byId = new Map(tickets.map((ticket) => [ticket.id, ticket]));
+  const resolved = new Set();
+  const removed = [];
+  for (let start = 0; start < tickets.length; start += RECEIPT_BATCH) {
+    const ids = tickets.slice(start, start + RECEIPT_BATCH).map((ticket) => ticket.id);
+    let payload = null;
+    try {
+      const response = await doFetch(EXPO_RECEIPTS_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({ ids }),
+        signal: AbortSignal.timeout(EXPO_TIMEOUT_MS),
+      });
+      if (!response.ok) { expoLog(`receipts HTTP ${response.status}`, now); continue; }
+      payload = await response.json();
+    } catch (error) {
+      expoLog(`receipts ${oneLine(error && error.message || error, 160)}`, now);
+      continue;
+    }
+    if (payload && Array.isArray(payload.errors) && payload.errors.length) {
+      expoLog(`receipts ${oneLine(payload.errors.map((error) => error && error.message).filter(Boolean).join('; '), 160)}`, now);
+    }
+    const data = payload && payload.data && typeof payload.data === 'object' ? payload.data : {};
+    for (const [id, receipt] of Object.entries(data)) {
+      const ticket = byId.get(id);
+      if (!ticket) continue;
+      // A receipt Expo has not produced yet is simply absent from the answer;
+      // one that is here has decided, so the ticket has done its job.
+      resolved.add(id);
+      if (!receipt || receipt.status === 'ok') continue;
+      const reason = receipt.details && receipt.details.error;
+      if (reason === 'DeviceNotRegistered') {
+        try { if (registry.remove(ticket.token, root)) removed.push(ticket.token); } catch {}
+        continue;
+      }
+      expoLog(`receipt ${reason || 'error'}: ${oneLine(receipt.message || '', 160)}`, now);
+    }
+  }
+  const pending = tickets.filter((ticket) => !resolved.has(ticket.id));
+  if (resolved.size || expired) { try { saveTickets(pending, root); } catch {} }
+  return {
+    checked: tickets.length,
+    resolved: resolved.size,
+    removed,
+    pending: pending.length,
+    expired,
+    detail: `${resolved.size} resolved, ${pending.length} pending${removed.length ? `, ${removed.length} unregistered` : ''}`,
+  };
+}
+
 // The console's own badge: the attention rows it is showing plus the unread
 // messages in its inbox (web/app/app.js renderTop). Dismissals are browser-local,
 // so the daemon's count can sit one row above what a console with dismissed rows
@@ -337,6 +450,7 @@ async function sendExpo(notification, options = {}) {
   // Tests drive the once-a-minute log throttle through this rather than the clock.
   const now = Number.isFinite(options.now) ? options.now : Date.now();
   let ok = false;
+  const accepted = [];
   for (let start = 0; start < devices.length; start += EXPO_BATCH) {
     const tokens = devices.slice(start, start + EXPO_BATCH).map((device) => device.expoPushToken);
     const message = {
@@ -372,7 +486,12 @@ async function sendExpo(notification, options = {}) {
     const tickets = Array.isArray(payload && payload.data) ? payload.data : [];
     for (let index = 0; index < tickets.length; index += 1) {
       const ticket = tickets[index];
-      if (ticket && ticket.status === 'ok') { ok = true; continue; }
+      if (ticket && ticket.status === 'ok') {
+        ok = true;
+        // Its receipt, minutes from now, is where an uninstalled app is reported.
+        if (ticket.id) accepted.push({ id: String(ticket.id), token: tokens[index], at: now });
+        continue;
+      }
       const reason = ticket && ticket.details && ticket.details.error;
       // The app was uninstalled or its token rotated: that device is gone, and
       // pushing to it again is what gets a sender rate-limited by Expo.
@@ -383,6 +502,7 @@ async function sendExpo(notification, options = {}) {
       expoLog(`${reason || 'error'}: ${oneLine(ticket && ticket.message || '', 160)}`, now);
     }
   }
+  recordTickets(accepted, root, now);
   return ok ? 'ok' : 'failed';
 }
 
@@ -711,6 +831,8 @@ module.exports = {
   sendAlert,
   deliver,
   sendExpo,
+  pollReceipts,
+  ticketsFile,
   availableChannels,
   quietActive,
   badgeFromState,

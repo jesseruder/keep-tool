@@ -39,6 +39,8 @@ registry data or credentials to the public source repository.
 - `bin/turn-watcher.js` — shadow judgment of ended turns: what Owner would have typed next
 - `.keep/` — machine state (lock, markers, reviewer state), gitignored
 - `.keep/devices.json` — registered phones and their Expo push tokens (0600, local only)
+- `.keep/push-tickets.json` — accepted Expo pushes awaiting a receipt (0600, 24 hours)
+- `.keep/attention-push.json` — the waiting-session pushes' dedupe window and daily count (0600)
 - `.keep/turns.sqlite` — the turn index; a derived cache, safe to delete and rebuild
 - `.keep/artifacts/` — committed per-card durable artifacts, force-added like `.keep/handoffs/`
 - `.keep/holds/` — quiet-window ledgers, one JSON file per hold
@@ -799,8 +801,15 @@ With no phone registered the channel is simply unavailable — nothing is attemp
 and the decision stands on its other channels. An explicit `KEEP_ALERT_CHANNELS`
 list must name `expo` to enable it, exactly as it must name `desktop`.
 Expo answers with one ticket per token: a `DeviceNotRegistered` ticket
-unregisters that device (an uninstalled app, or a rotated token), and any other
-failure is logged at most once a minute and never raised to the caller.
+unregisters that device, and any other failure is logged at most once a minute
+and never raised to the caller. An uninstalled app is usually reported later
+still, in that push's *receipt*, so every accepted ticket is written to
+`.keep/push-tickets.json` (0600, newest 500, dropped after 24 hours) and the
+daemon's `push-receipts` scheduler asks for them every 15 minutes, 300 ids per
+request. A receipt is a verdict: `DeviceNotRegistered` unregisters that phone,
+anything else is logged once a minute, and either way the ticket is dropped. A
+receipt Expo has not produced yet, or a request that fails, leaves its tickets
+for the next run. The row shows up in `keep health` like any other scheduler.
 
 ### A session waiting on you
 
@@ -817,7 +826,8 @@ title is `<project> · <row title>` and the body is the row's question, else its
 detail, else `Waiting for your input.`.
 
 The first publication after the daemon starts seeds the key set and notifies for
-nothing in it — a restart is not news. A key that leaves the attention list is
+nothing in it — a restart is not news, and that set is deliberately the one piece
+of this that does not survive one. A key that leaves the attention list is
 forgotten, so the same session waiting again later is a new event, subject to the
 dedupe window below.
 
@@ -825,7 +835,8 @@ These are not alerts and do not enter the ledger: the row is already in the
 console's “Waiting on you” list, so a second copy in the alert inbox is noise,
 and a session's questions are not judged against the same daily budget as an
 alert somebody wrote on purpose. They go straight to the phones through the Expo
-sender, with their own policy, all of it in memory:
+sender, under their own policy, kept in `.keep/attention-push.json` (0600) so a
+daemon restart cannot grant another day's worth or repeat a key it just sent:
 
 - Quiet hours (`keep quiet`) drop the push. Nothing is queued — the row is still
   waiting when they end, and the console is where it is triaged.
