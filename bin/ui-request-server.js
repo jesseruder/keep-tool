@@ -6,7 +6,8 @@ const http = require('node:http');
 const path = require('node:path');
 const keepConsole = require('./console.js');
 const {
-  compactState, lightweightState, dashboardDetail, reviewQueueSearch, wantsCompactState,
+  compactState, lightweightState, consoleState, dashboardDetail, reviewQueueSearch,
+  wantsCompactState, wantsConsoleState,
 } = require('./dashboard-state.js');
 const { MOBILE_VIEWS, projectMobileState } = require('./mobile-state.js');
 const { sendStateJson } = require('./state-response.js');
@@ -184,8 +185,9 @@ function createUiRequestServer(options = {}) {
         let value;
         try {
           value = view ? projectMobileState(current.state, view, url.searchParams.get('id') || '')
-            : url.searchParams.get('summary') === '1' ? current.lightweight
-              : wantsCompactState(req, url) ? current.compact : current.state;
+            : wantsConsoleState(url) ? current.console
+              : url.searchParams.get('summary') === '1' ? current.lightweight
+                : wantsCompactState(req, url) ? current.compact : current.state;
         } catch (error) {
           if (error.status === 400) return json(res, 400, { error: error.message });
           throw error;
@@ -253,9 +255,11 @@ function createUiRequestServer(options = {}) {
       if (!state || !Number.isFinite(value.generatedAt) || !Number.isFinite(value.version)) {
         throw new Error('invalid dashboard publication');
       }
+      const lightweight = lightweightState(state);
       current = {
         state,
-        lightweight: lightweightState(state),
+        lightweight,
+        console: consoleState(state, lightweight),
         compact: compactState(state),
         portableTransfers: Array.isArray(value.portableTransfers) ? value.portableTransfers : [],
         mutationFence: typeof value.mutationFence === 'string' ? value.mutationFence : '',

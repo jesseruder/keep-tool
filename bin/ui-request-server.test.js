@@ -62,7 +62,8 @@ test('frontend returns loading until a real snapshot and serves every projection
   assert.equal((await request(f.port, '/api/portable-transfers', { headers: { 'x-keep': '1' } })).status, 503);
   const state = {
     generatedAt: 1234,
-    tasks: [{ id: 'task-1', body: 'full body', fm: { title: 'One' } }],
+    digest: '# legacy digest',
+    tasks: [{ id: 'task-1', body: 'full body', fm: { title: 'One' }, lastLog: 'latest log' }],
     sessions: [], panes: [], attention: [], reviewQueue: { items: [{ id: 'review-1', title: 'Needle', body: 'full review' }] },
   };
   f.ui.publish({ version: 7, generatedAt: 1234, mutationFence: 'epoch:1', state, portableTransfers: [{ id: 'transfer-1' }] });
@@ -72,6 +73,11 @@ test('frontend returns loading until a real snapshot and serves every projection
   assert.equal(full.headers['x-keep-state-version'], '7');
   assert.equal(JSON.parse(full.body).tasks[0].body, 'full body');
   assert.equal(JSON.parse((await request(f.port, '/api/state?summary=1')).body).tasks[0].body, undefined);
+  const consoleBody = JSON.parse((await request(f.port, '/api/state?console=1')).body);
+  assert.equal(consoleBody.tasks[0].body, undefined);
+  assert.equal(consoleBody.tasks[0].lastLog, undefined);
+  assert.equal(consoleBody.digest, undefined, 'the console projection drops legacy-board fields');
+  assert.deepEqual(Object.keys(consoleBody).sort(), ['attention', 'generatedAt', 'panes', 'reviewQueue', 'sessions', 'tasks']);
   assert.equal(JSON.parse((await request(f.port, '/api/state', { headers: { referer: `http://localhost:${f.port}/app/` } })).body).tasks[0].body, undefined);
   assert.equal(JSON.parse((await request(f.port, '/api/dashboard-detail?kind=task&id=task-1')).body).value.body, 'full body');
   assert.deepEqual(JSON.parse((await request(f.port, '/api/dashboard-review-search?q=needle')).body).ids, ['review-1']);

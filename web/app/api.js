@@ -94,7 +94,7 @@ let stateRequest;
 let queuedStateRequest;
 
 async function fetchState() {
-  return freshRequest('/api/state?summary=1');
+  return freshRequest('/api/state?console=1');
 }
 
 async function freshRequest(url) {

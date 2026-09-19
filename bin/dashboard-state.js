@@ -172,6 +172,97 @@ function wantsLightweightState(url) {
   return url.searchParams.get('summary') === '1';
 }
 
+function pick(source, fields) {
+  const out = {};
+  for (const field of fields) {
+    if (source && source[field] !== undefined) out[field] = source[field];
+  }
+  return out;
+}
+
+// The web console (web/app) reads exactly these top-level fields. Everything the
+// legacy board at web/index.html needs but the console never renders — digest,
+// alerts, brief, standup, landed, slack, defaults, the weekly rollups — is dropped.
+// A new top-level field the console reads must be added here AND to the allowlist
+// test in dashboard-state.test.js, or it silently arrives undefined in the browser.
+const CONSOLE_STATE_KEYS = [
+  'generatedAt', 'shadowDecisions', 'scopes', 'projectCatalog', 'restarts', 'tasks', 'sessions',
+  'attention', 'setAside', 'notifications', 'reminders', 'limitResume', 'health', 'usage',
+  'reviewQueue', 'accounts', 'handoffs', 'handoffQueue', 'review', 'agents', 'panes', 'hostStatus',
+];
+
+// An exited session is a list row and a transcript link; the console never reads
+// the rest of the observation, lifecycle, or background detail off a dead row.
+const CONSOLE_DEAD_SESSION_FIELDS = [
+  'id', 'num', 'kind', 'agent', 'agentName', 'title', 'renamed', 'mark', 'project', 'gitBranch',
+  'taskId', 'taskStatus', 'state', 'stateLabel', 'alive', 'exited', 'pane', 'mtime', 'lastUserAt',
+  'turnStartedAt', 'accountId', 'accountLabel', 'reviewer', 'rateLimit', 'lastAssistant', 'stateLine',
+  'lastVerdict', 'lastVerdictAt', 'verdictConfidence', 'pendingDecision', 'pendingQuestion',
+  'pendingPlan', 'activity', '_detailVersion',
+];
+
+const CONSOLE_DEAD_PANE_FIELDS = [
+  'id', 'alive', 'agentAlive', 'cwd', 'title', 'createdAt', 'exitedAt', 'pid', 'scope', 'meta',
+];
+
+const CONSOLE_PANE_META_FIELDS = [
+  'agent', 'agentName', 'sessionId', 'project', 'title', 'card', 'accountId', 'accountLabel',
+  'portableTransferId', 'url', 'attributes', 'terminalRendererTrial',
+];
+
+// Closed cards outnumber open ones several to one on a live daemon, and the
+// console only renders a done card when something still in flight points at it.
+function referencedCardIds(state) {
+  const ids = new Set();
+  const add = (value) => { if (typeof value === 'string' && value) ids.add(value); };
+  const rows = (value) => (Array.isArray(value) ? value : []);
+  for (const session of rows(state.sessions)) add(session?.taskId);
+  for (const item of rows(state.attention)) add(item?.taskId);
+  for (const item of rows(state.reviewQueue?.items)) add(item?.card);
+  for (const entry of rows(state.notifications)) add(entry?.card);
+  for (const agent of rows(state.agents)) add(agent?.card);
+  for (const restart of rows(state.restarts)) add(restart?.taskId);
+  return ids;
+}
+
+function consoleSession(session) {
+  if (!session) return session;
+  const dead = session.exited === true || session.state === 'exited' || session.alive === false;
+  return dead ? pick(session, CONSOLE_DEAD_SESSION_FIELDS) : session;
+}
+
+function consolePane(pane) {
+  if (!pane) return pane;
+  if (pane.alive !== false && pane.agentAlive !== false) return pane;
+  const summary = pick(pane, CONSOLE_DEAD_PANE_FIELDS);
+  if (summary.meta !== undefined) summary.meta = pick(summary.meta, CONSOLE_PANE_META_FIELDS);
+  return summary;
+}
+
+// The console's own projection: lightweight state, minus the top-level fields only
+// the legacy board reads, minus closed cards nothing points at, minus the detail
+// that exited sessions and dead panes carry for the full API shape.
+// `lightweight` is an optional already-built summary of the same state: the
+// frontend worker publishes both projections at once, and the detail-version
+// hashing over every card and session is the expensive half of the pass.
+function consoleState(state, lightweight) {
+  const light = lightweight || lightweightState(state);
+  const keep = referencedCardIds(light);
+  const projected = pick(light, CONSOLE_STATE_KEYS);
+  if (projected.tasks !== undefined) {
+    projected.tasks = (light.tasks || [])
+      .filter((task) => task?.fm?.status !== 'done' || keep.has(task?.id))
+      .map((task) => { const { lastLog: _lastLog, ...summary } = task; return summary; });
+  }
+  if (projected.sessions !== undefined) projected.sessions = (light.sessions || []).map(consoleSession);
+  if (projected.panes !== undefined) projected.panes = (light.panes || []).map(consolePane);
+  return projected;
+}
+
+function wantsConsoleState(url) {
+  return url.searchParams.get('console') === '1';
+}
+
 function detailError(status, message) {
   const error = new Error(message);
   error.status = status;
@@ -249,6 +340,12 @@ module.exports = {
   wantsCompactState,
   lightweightState,
   wantsLightweightState,
+  consoleState,
+  wantsConsoleState,
+  CONSOLE_STATE_KEYS,
+  CONSOLE_DEAD_SESSION_FIELDS,
+  CONSOLE_DEAD_PANE_FIELDS,
+  CONSOLE_PANE_META_FIELDS,
   dashboardDetail,
   reviewQueueSearch,
   createJobChangeTracker,

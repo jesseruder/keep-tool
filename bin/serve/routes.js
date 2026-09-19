@@ -16,7 +16,7 @@ function routes(ctx) {
     // serve.js internals
     ATTENTION_KINDS, InjectionError, MOBILE_VIEWS, TAG_INSTRUCTION, TASK_INSTRUCTION, WEB_ROOT,
     abandonAccountHandoff, accounts, announceStateNote, answerSession, attentionAckKey, attentionAckName,
-    cancelQueuedHandoff, closeIdleSession, codex, compactSessionById, companionSnapshot, compactState,
+    cancelQueuedHandoff, closeIdleSession, codex, compactSessionById, companionSnapshot, compactState, consoleState,
     daemonRestartGate, dashboardDetail, fs, handoffRateLimited, handoffSessionRequest, health, hostRequest,
     inspectReviewQueueLaunch,
     keep, launchReviewQueueSession, lightweightState, listHostPanes, listPortableTransfers, notifications,
@@ -25,7 +25,7 @@ function routes(ctx) {
     reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, restorePlan, review,
     reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow, runTaskNow, screenHistorySession, screenSession,
     sendSessionKeys, sendStateJson, sendToSessionLocked, sessionMarks, sessionNames, sessionSummaryFile, setAsideCandidates, summarize,
-    tellSession, transferSession, updateSetAside, wantsCompactState, wantsLightweightState, withInjectionLock,
+    tellSession, transferSession, updateSetAside, wantsCompactState, wantsConsoleState, wantsLightweightState, withInjectionLock,
     writeToShellPane,
     // start()'s own locals. onChange and onFocus are the module-level hooks start()
     // has already pointed at its broadcaster by the time routes() is called.
@@ -815,6 +815,7 @@ function routes(ctx) {
         try {
           responseState = mobileView
             ? projectMobileState(enriched, mobileView, url.searchParams.get('id') || '')
+            : wantsConsoleState(url) ? consoleState(enriched)
             : wantsLightweightState(url) ? lightweightState(enriched)
             : wantsCompactState(req, url) ? compactState(enriched) : enriched;
         } catch (error) {

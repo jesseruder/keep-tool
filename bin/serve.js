@@ -75,7 +75,8 @@ const claudeProjectRoots = accounts.projectRoots();
 const claudeTranscriptIndex = require('./transcript-index').createMultiRootTranscriptIndex(claudeProjectRoots);
 const {
   compactState, wantsCompactState, createJobChangeTracker, attachStateLines, shadowDecisionSummary,
-  wantsLightweightState, lightweightState, dashboardDetail, reviewQueueSearch,
+  wantsLightweightState, lightweightState, wantsConsoleState, consoleState,
+  dashboardDetail, reviewQueueSearch,
 } = require('./dashboard-state');
 const { createDashboardWorker } = require('./dashboard-worker');
 const { createDashboardPublisher } = require('./dashboard-publisher');
@@ -9727,7 +9728,7 @@ function start(deps = {}) {
     WATCHER_TURNS_PER_TICK, WATCHER_WINDOW_MS, WEB_ROOT,
     abandonAccountHandoff, accounts, addHostSessionState, agentProcessRows, announceStateNote,
     answerSession, attentionAckKey, attentionAckName, buildState, cancelQueuedHandoff, cardUsage, closeEphemeralPane,
-    closeIdleSession, codex, compactSessionById, compactState, companionSnapshot, daemonRestartGate,
+    closeIdleSession, codex, compactSessionById, compactState, companionSnapshot, consoleState, daemonRestartGate,
     dashboardDetail, deliverCheckToThread, deliverUnblockToThread, discord, driftWakeFromVerdict,
     envNumber, features, forceRestartSession, fs, handoffRateLimited, handoffSession, handoffSessionRequest, health, hostRequest,
     ideas,
@@ -9745,7 +9746,7 @@ function start(deps = {}) {
     startAutoCompact, startBriefScheduler, startHandoffQueue, startWtGcScheduler, summarize,
     transcriptFileForSession,
     transferSession,
-    unblock, updateSetAside, usage, wantsCompactState, wantsLightweightState, watcherSend,
+    unblock, updateSetAside, usage, wantsCompactState, wantsConsoleState, wantsLightweightState, watcherSend,
     withInjectionLock, writeTarget, writeToShellPane,
     broadcast, dashboardBuild, dashboardBuilder, deps, shutdown, terminalProfile,
     get json() { return json; },

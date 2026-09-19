@@ -116,6 +116,18 @@ test('real dashboard routes use the worker snapshot across full, lightweight, mo
   assert.match(detail.body.value.body, /Full route body/);
   assert.equal(detail.body.version, lightTask._detailVersion);
 
+  // The console's own projection: the same list context, without the card
+  // histories or the top-level fields only the legacy board reads.
+  const consoleState = await request(port, '/api/state?console=1');
+  assert.equal(consoleState.status, 200);
+  assert.equal(consoleState.body.digest, undefined, 'the console never renders the digest');
+  assert.equal(consoleState.body.landed, undefined);
+  const consoleTask = consoleState.body.tasks.find((task) => task.id === 'route-card');
+  assert.equal(consoleTask.body, undefined);
+  assert.equal(consoleTask.lastLog, undefined);
+  assert.equal(consoleTask._detailVersion, lightTask._detailVersion);
+  assert.ok(Array.isArray(consoleState.body.panes));
+
   assert.equal((await request(port, '/api/state?view=needs')).status, 200);
   assert.equal((await request(port, '/api/dashboard-review-search?q=route')).status, 200);
 

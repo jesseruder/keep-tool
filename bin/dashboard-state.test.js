@@ -6,6 +6,12 @@ const {
   wantsCompactState,
   lightweightState,
   wantsLightweightState,
+  consoleState,
+  wantsConsoleState,
+  CONSOLE_STATE_KEYS,
+  CONSOLE_DEAD_SESSION_FIELDS,
+  CONSOLE_DEAD_PANE_FIELDS,
+  CONSOLE_PANE_META_FIELDS,
   dashboardDetail,
   reviewQueueSearch,
   createJobChangeTracker,
@@ -213,6 +219,214 @@ test('lightweight mode is opt-in and does not change compact or mobile query beh
   assert.equal(wantsLightweightState(new URL('http://localhost/api/state?compact=1')), false);
   assert.equal(wantsLightweightState(new URL('http://localhost/api/state?view=home')), false);
   assert.equal(wantsLightweightState(new URL('http://localhost/api/state?summary=1')), true);
+});
+
+
+// A fixture with every top-level field the daemon publishes, both card shapes, all
+// three dead-session signals, and a live and a dead pane.
+function consoleFixture() {
+  return {
+    generatedAt: 123,
+    shadowDecisions: { graduated: 1 },
+    scopes: { names: ['castle'] },
+    projectCatalog: [{ path: '/repo' }],
+    restarts: [{ taskId: 'restart-card', at: 5 }],
+    tasks: [
+      { id: 'open-card', fm: { title: 'Open', status: 'active' }, body: 'full body', lastLog: 'latest log' },
+      { id: 'linked-card', fm: { title: 'Linked', status: 'done' }, body: 'full body', lastLog: 'latest log' },
+      { id: 'closed-card', fm: { title: 'Closed', status: 'done' }, body: 'full body', lastLog: 'latest log' },
+      { id: 'restart-card', fm: { title: 'Restarting', status: 'done' }, body: 'full body', lastLog: 'latest log' },
+    ],
+    sessions: [
+      {
+        id: 'live', num: 4, kind: 'claude', state: 'running', stateLabel: 'Running', alive: true, exited: false,
+        title: 'Live work', taskId: 'open-card', lastAssistant: 'Short update', lastAssistantFull: 'Full tail',
+        lastUser: 'Large user prompt', opener: { via: 'keep' }, unknownBackgroundJobs: ['child'],
+      },
+      {
+        id: 'flagged-exited', kind: 'claude', title: 'Flagged', state: 'waiting', stateLabel: 'Waiting', exited: true,
+        pane: 'dead-pane', taskId: 'linked-card', accountId: 'claude-main', accountLabel: 'Claude Main',
+        lastAssistant: 'Historical preview', lastUser: 'Large user prompt', opener: { via: 'keep' },
+        endedTurn: true, notify: { type: 'complete' }, lifecycleAgents: ['child'], askedProse: false,
+      },
+      {
+        id: 'state-exited', kind: 'codex', title: 'By state', state: 'exited', stateLabel: 'Exited',
+        lastUser: 'Large user prompt', waitingFor: null, toolRunning: false,
+      },
+      {
+        id: 'not-alive', kind: 'claude', title: 'By alive', state: 'waiting', stateLabel: 'Waiting', alive: false,
+        lastUser: 'Large user prompt', attentionAt: 9, localCommandPending: false,
+      },
+    ],
+    attention: [{ sessionId: 'live', kind: 'input', taskId: 'open-card' }],
+    setAside: { ids: [] },
+    stalled: [{ id: 'live' }],
+    unblocked: [{ id: 'live' }],
+    digest: '# digest',
+    notifications: [{ id: 'note', card: 'open-card', read: false }],
+    reminders: [{ id: 'reminder' }],
+    alerts: [{ id: 'alert' }],
+    brief: { text: 'brief' },
+    standup: { text: 'standup' },
+    landed: { today: 1 },
+    limitResume: { waiting: [] },
+    slack: { unread: 2 },
+    health: { ok: true },
+    usage: { input: 1 },
+    reviewQueue: { counts: { 'needs-decision': 1 }, items: [{ id: 'finding', card: 'open-card', body: 'note' }] },
+    accounts: [{ id: 'claude-main' }],
+    defaults: { model: 'opus' },
+    automationAccounts: { headless: 'claude' },
+    handoffs: [{ id: 'handoff' }],
+    handoffQueue: [{ sessionId: 'live' }],
+    resumeSummary: { text: 'resume' },
+    reviewSummary: { text: 'review' },
+    weeklySummary: { text: 'weekly' },
+    reviewUsage: { calls: 3 },
+    review: { events: [{ id: 'event' }], stats: { open: 1 } },
+    agents: [{ name: 'fleet', card: 'open-card' }],
+    panes: [
+      { id: 'live-pane', alive: true, cmd: '/bin/zsh', args: ['-lic'], rows: 40, cols: 120, cwd: '/repo',
+        meta: { agent: 'claude', sessionId: 'live', openRequestId: 'req-1' } },
+      { id: 'dead-pane', alive: false, agentAlive: false, pid: 42, cwd: '/repo', title: 'Historical',
+        createdAt: '2026-09-07T12:00:00Z', exitedAt: '2026-09-07T13:00:00Z', exitCode: 0, signal: null,
+        lastActivityAt: 7, scope: 'castle', cmd: '/bin/zsh', args: ['-lic'], rows: 40, cols: 120, bytes: 123,
+        meta: { agent: 'claude', agentName: 'fleet', sessionId: 'flagged-exited', project: '/repo',
+          title: 'Historical', card: 'linked-card', accountId: 'claude-main', accountLabel: 'Claude Main',
+          portableTransferId: 'transfer-1', url: 'http://localhost/app', attributes: { pinned: true },
+          terminalRendererTrial: 'webgl', openRequestId: 'req-2', launchedBy: 'keep' } },
+    ],
+    hostStatus: { ok: true },
+  };
+}
+
+test('console state keeps only the top-level fields the console renders', () => {
+  const state = consoleFixture();
+  const before = JSON.stringify(state);
+  const projected = consoleState(state);
+
+  assert.deepEqual(Object.keys(projected).sort(),
+    CONSOLE_STATE_KEYS.filter((key) => state[key] !== undefined).sort(),
+    'exactly the allowlist, intersected with what the daemon published');
+  for (const key of ['digest', 'landed', 'slack', 'alerts', 'weeklySummary', 'defaults',
+    'stalled', 'unblocked', 'brief', 'standup', 'automationAccounts', 'resumeSummary',
+    'reviewSummary', 'reviewUsage']) {
+    assert.equal(projected[key], undefined, key + ' is legacy-board only');
+  }
+  assert.deepEqual(projected.review, state.review, 'review events pass through');
+  assert.deepEqual(projected.reviewQueue.counts, state.reviewQueue.counts);
+  assert.deepEqual(projected.notifications, state.notifications);
+  assert.equal(projected.generatedAt, 123);
+  assert.equal(JSON.stringify(state), before, 'source state is not mutated');
+});
+
+test('console state drops closed cards nothing points at, and every card history', () => {
+  const state = consoleFixture();
+  const projected = consoleState(state);
+  const ids = projected.tasks.map((task) => task.id);
+
+  assert.ok(ids.includes('open-card'), 'an open card is always kept');
+  assert.ok(ids.includes('linked-card'), 'a done card an exited session points at is kept');
+  assert.ok(ids.includes('restart-card'), 'a done card a pending restart points at is kept');
+  assert.equal(ids.includes('closed-card'), false, 'a done card nothing points at is dropped');
+
+  for (const task of projected.tasks) {
+    assert.equal(task.lastLog, undefined, task.id + ' carries no log tail');
+    assert.equal(task.body, undefined, task.id + ' carries no history');
+    assert.equal(typeof task._detailVersion, 'string', task.id + ' keeps its detail version');
+    assert.equal(typeof task.fm, 'object', task.id + ' keeps its frontmatter');
+    assert.ok(Object.hasOwn(task, 'createdAt'), task.id + ' keeps the lightweight fields');
+    assert.equal(task.hasCheck, false);
+  }
+  assert.equal(projected.tasks.find((task) => task.id === 'open-card').fm.title, 'Open');
+
+  const byAttention = consoleState({ tasks: [{ id: 'done', fm: { status: 'done' } }], attention: [{ taskId: 'done' }] });
+  assert.deepEqual(byAttention.tasks.map((task) => task.id), ['done'], 'attention keeps a closed card');
+  const byQueue = consoleState({ tasks: [{ id: 'done', fm: { status: 'done' } }], reviewQueue: { items: [{ id: 'f', card: 'done' }] } });
+  assert.deepEqual(byQueue.tasks.map((task) => task.id), ['done'], 'a review-queue item keeps a closed card');
+  const byNotification = consoleState({ tasks: [{ id: 'done', fm: { status: 'done' } }], notifications: [{ id: 'n', card: 'done' }] });
+  assert.deepEqual(byNotification.tasks.map((task) => task.id), ['done'], 'a notification keeps a closed card');
+  const byAgent = consoleState({ tasks: [{ id: 'done', fm: { status: 'done' } }], agents: [{ name: 'a', card: 'done' }] });
+  assert.deepEqual(byAgent.tasks.map((task) => task.id), ['done'], 'a standing agent keeps a closed card');
+  assert.deepEqual(consoleState({}).tasks, [], 'every referencing list is optional');
+});
+
+test('console state reduces every dead session and leaves live rows whole', () => {
+  const state = consoleFixture();
+  const projected = consoleState(state);
+  const light = lightweightState(state);
+  const live = projected.sessions.find((session) => session.id === 'live');
+
+  assert.equal(live.lastUser, 'Large user prompt');
+  assert.deepEqual(live.opener, { via: 'keep' });
+  assert.deepEqual(live.unknownBackgroundJobs, ['child']);
+  assert.equal(live.lastAssistantFull, 'Full tail', 'a live row keeps everything lightweight state left');
+
+  for (const id of ['flagged-exited', 'state-exited', 'not-alive']) {
+    const row = projected.sessions.find((session) => session.id === id);
+    const summarised = light.sessions.find((session) => session.id === id);
+    assert.deepEqual(Object.keys(row).sort(),
+      CONSOLE_DEAD_SESSION_FIELDS.filter((field) => summarised[field] !== undefined).sort(),
+      id + ' keeps exactly the allowlisted dead-session fields');
+    assert.equal(row.lastUser, undefined, id + ' drops the user prompt');
+  }
+  const flagged = projected.sessions.find((session) => session.id === 'flagged-exited');
+  assert.equal(flagged.accountLabel, 'Claude Main');
+  assert.equal(flagged.lastAssistant, 'Historical preview');
+  assert.equal(flagged.taskId, 'linked-card');
+  assert.equal(flagged.notify, undefined);
+  assert.equal(typeof flagged._detailVersion, 'string');
+});
+
+test('console state reduces dead panes and their meta, and leaves live panes whole', () => {
+  const state = consoleFixture();
+  const projected = consoleState(state);
+  const live = projected.panes.find((pane) => pane.id === 'live-pane');
+  const dead = projected.panes.find((pane) => pane.id === 'dead-pane');
+
+  assert.equal(live.cols, 120);
+  assert.equal(live.rows, 40);
+  assert.equal(live.meta.openRequestId, 'req-1');
+
+  assert.deepEqual(Object.keys(dead).sort(),
+    CONSOLE_DEAD_PANE_FIELDS.filter((field) => state.panes[1][field] !== undefined).sort());
+  assert.deepEqual(Object.keys(dead.meta).sort(),
+    CONSOLE_PANE_META_FIELDS.filter((field) => state.panes[1].meta[field] !== undefined).sort());
+  assert.equal(dead.meta.openRequestId, undefined);
+  assert.equal(dead.meta.launchedBy, undefined);
+  assert.equal(dead.meta.card, 'linked-card');
+  assert.equal(dead.pid, 42);
+  assert.equal(dead.scope, 'castle');
+  assert.equal(dead.exitCode, undefined);
+
+  const agentDead = consoleState({ panes: [{ id: 'p', alive: true, agentAlive: false, cols: 80, meta: { sessionId: 's', openRequestId: 'r' } }] });
+  assert.deepEqual(Object.keys(agentDead.panes[0]).sort(), ['agentAlive', 'alive', 'id', 'meta']);
+  assert.deepEqual(agentDead.panes[0].meta, { sessionId: 's' });
+});
+
+test('console mode is opt-in and leaves the summary and compact projections untouched', () => {
+  assert.equal(wantsConsoleState(new URL('http://localhost/api/state')), false);
+  assert.equal(wantsConsoleState(new URL('http://localhost/api/state?summary=1')), false);
+  assert.equal(wantsConsoleState(new URL('http://localhost/api/state?compact=1')), false);
+  assert.equal(wantsConsoleState(new URL('http://localhost/api/state?console=0')), false);
+  assert.equal(wantsConsoleState(new URL('http://localhost/api/state?console=1')), true);
+  assert.equal(wantsLightweightState(new URL('http://localhost/api/state?console=1')), false);
+
+  const state = consoleFixture();
+  const light = lightweightState(state);
+  assert.equal(light.digest, '# digest');
+  assert.deepEqual(light.landed, state.landed);
+  assert.deepEqual(light.slack, state.slack);
+  assert.deepEqual(light.defaults, state.defaults);
+  assert.equal(light.tasks.length, 4, 'the legacy board still sees every card');
+  assert.equal(light.tasks[0].lastLog, 'latest log');
+  assert.equal(light.sessions.find((session) => session.id === 'not-alive').lastUser, 'Large user prompt');
+  assert.equal(light.sessions.find((session) => session.id === 'flagged-exited').notify.type, 'complete');
+  assert.deepEqual(light.panes[0], state.panes[0]);
+  assert.equal(light.panes[1].meta.openRequestId, 'req-2', 'summary mode keeps the full pane meta');
+
+  assert.deepEqual(consoleState(state, light), consoleState(state),
+    'a prebuilt summary is the same input as building one');
 });
 
 test('job reconciliation notifies for meaningful changes, including child-only completion and stale confidence', () => {

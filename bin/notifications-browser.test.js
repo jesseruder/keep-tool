@@ -11,7 +11,7 @@ const WebSocket = require('ws');
 const notifications = require('./notifications');
 const reminders = require('./reminders');
 const { appendAlert } = require('./alerts');
-const { dashboardDetail, lightweightState } = require('./dashboard-state');
+const { consoleState, dashboardDetail, lightweightState } = require('./dashboard-state');
 
 test('isolated browser: alert inbox, read persistence, card links and desktop click-through', { skip: process.env.KEEP_BROWSER_TEST !== '1', timeout: 45000 }, async () => {
   const root = path.resolve(__dirname, '..');
@@ -59,7 +59,7 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
     }
     if (url.pathname.startsWith('/api/')) {
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify(url.pathname === '/api/state' ? (url.searchParams.get('summary') === '1' ? lightweightState(state) : state) : url.pathname === '/api/layouts' ? { layouts: [{ name: 'Pinned', role: 'pinned', ids: ['pa', 'pb'], cols: 2 }] } : { text: 'Fixture summary', fresh: summaryFresh, ok: true })); return;
+      res.end(JSON.stringify(url.pathname === '/api/state' ? (url.searchParams.get('console') === '1' ? consoleState(state) : url.searchParams.get('summary') === '1' ? lightweightState(state) : state) : url.pathname === '/api/layouts' ? { layouts: [{ name: 'Pinned', role: 'pinned', ids: ['pa', 'pb'], cols: 2 }] } : { text: 'Fixture summary', fresh: summaryFresh, ok: true })); return;
     }
     const vendors = { '/vendor/xterm.js': 'node_modules/@xterm/xterm/lib/xterm.js', '/vendor/xterm.css': 'node_modules/@xterm/xterm/css/xterm.css', '/vendor/addon-webgl.js': 'node_modules/@xterm/addon-webgl/lib/addon-webgl.js', '/vendor/addon-fit.js': 'node_modules/@xterm/addon-fit/lib/addon-fit.js', '/vendor/addon-search.js': 'node_modules/@xterm/addon-search/lib/addon-search.js' };
     const file = path.resolve(root, vendors[url.pathname] || `web${url.pathname === '/' ? '/app/index.html' : url.pathname}`);
