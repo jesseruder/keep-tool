@@ -43,8 +43,10 @@ container on `:8080`, a dev server, anything. Such a service cannot mint a
 session, but it can replay the one it was handed, and unlike a cross-site page it
 can add `x-keep: 1` freely. The intended client never exposes it — the WebView
 loads nothing but this console, so its cookie jar has nowhere else to send it —
-and the idle sweep bounds how long a leaked cookie stays worth anything. Open the
-console in a desktop browser by its ordinary loopback URL instead.
+and the idle sweep clears a cookie nobody uses any more; it is cleanup, not a
+ceiling, since replaying a stolen session refreshes its idle clock. A daemon restart
+is what revokes every session. Open the console in a desktop browser by its ordinary
+loopback URL instead.
 
 For the same reason a session is not general authority: a page on another port of
 this host is *same-site*, so `SameSite=Strict` does not stop it from sending the
