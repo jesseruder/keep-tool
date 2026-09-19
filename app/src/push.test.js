@@ -336,63 +336,37 @@ test('the daemon is asked whether it still holds this phone', async () => {
   assert.equal(deviceListHasToken({ error: 'nope' }, TOKEN), null);
 });
 
-test('a pass superseded by Forget writes nothing, and takes back what landed', async () => {
-  // Forget bumps the generation while the POST is in flight. The registration that
-  // comes back must not recreate the record the DELETE just removed.
+test('a Forget asked for mid-pass waits for the pass, and still wins', async () => {
+  // Forget bumps the generation while the POST is in flight and queues its own
+  // unregister. The lock is what orders the two: the pass finishes first, sees that
+  // it has been superseded, takes its own registration back, and Forget then finds
+  // nothing left to delete — which is the correct end state, not a missed step.
   const storage = fakeStorage();
   const api = fakeApi();
-  let current = true;
+  const order = [];
+  let generation = 0;
+  const mine = generation;
+  let forgetting = null;
 
   const result = await syncRegistration(deps(storage, api, {
-    isCurrent: () => current,
+    isCurrent: () => generation === mine,
     post: async (config, body) => {
-      current = false; // Forget lands while this request is on the wire.
+      order.push('post');
+      generation += 1;
+      forgetting = unregisterDevice({ config: CONFIG, remove: api.remove, storage })
+        .then((outcome) => { order.push('forget'); return outcome; });
       return api.post(config, body);
     },
-    remove: api.remove,
+    remove: async (config, token) => { order.push('take-back'); return api.remove(config, token); },
   }));
+  const forgotten = await forgetting;
 
   assert.equal(result.status, 'superseded');
+  assert.deepEqual(order, ['post', 'take-back', 'forget']);
+  assert.deepEqual(forgotten, { hadToken: false, removed: false });
   assert.equal(await readRegistration(storage), null);
-  // It reached the daemon anyway, so it is taken back rather than left pushing at a
-  // phone that has forgotten the server.
   assert.deepEqual(api.calls.map((call) => (call.removed ? 'remove' : 'post')), ['post', 'remove']);
   assert.equal(api.calls[1].removed, TOKEN);
-
-  // The narrower window: Forget lands while the record is being written, so its own
-  // unregisterDevice finds nothing saved yet and sends no DELETE. If this pass then
-  // simply finished, the daemon and the record would both come back.
-  const slow = fakeStorage();
-  const written = slow.setItem;
-  const late = fakeApi();
-  let live = true;
-  slow.setItem = async (key, value) => {
-    live = false;
-    await written(key, value);
-  };
-  const raced = await syncRegistration(deps(slow, late, {
-    isCurrent: () => live,
-    remove: late.remove,
-  }));
-  assert.equal(raced.status, 'superseded');
-  assert.equal(await readRegistration(slow), null);
-  assert.deepEqual(late.calls.map((call) => (call.removed ? 'remove' : 'post')), ['post', 'remove']);
-  assert.equal(late.calls[1].removed, TOKEN);
-
-  // A newer pass that has since written its own record is left alone.
-  const busy = fakeStorage();
-  const saveIt = busy.setItem;
-  const other = fakeApi();
-  let held = true;
-  busy.setItem = async (key, value) => {
-    held = false;
-    await saveIt(key, value);
-    // A newer pass put its own registration there straight afterwards.
-    busy.map.set(REGISTRATION_KEY, JSON.stringify({ token: OTHER_TOKEN, server: SERVER, registeredAt: NOW + 5000 }));
-  };
-  const overtaken = await syncRegistration(deps(busy, other, { isCurrent: () => held, remove: other.remove }));
-  assert.equal(overtaken.status, 'superseded');
-  assert.equal((await readRegistration(busy)).token, OTHER_TOKEN);
 
   // Superseded before the POST: the daemon is never told at all.
   const early = fakeStorage();
@@ -405,6 +379,62 @@ test('a pass superseded by Forget writes nothing, and takes back what landed', a
   assert.equal(skipped.status, 'superseded');
   assert.equal(quiet.calls.length, 0);
   assert.equal(await readRegistration(early), null);
+});
+
+test('registrations run one at a time, in the order they were asked for', async () => {
+  // Two passes at once — a launch and Setup's Retry, a foreground check and a saved
+  // config — used to read the same empty record and both register. Queued, the
+  // second one reads what the first wrote and finds there is nothing left to do.
+  const storage = fakeStorage();
+  const api = fakeApi();
+  const order = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+
+  const first = syncRegistration(deps(storage, api, {
+    post: async (config, body) => {
+      order.push('post-1');
+      await gate;
+      return api.post(config, body);
+    },
+  }));
+  const second = syncRegistration(deps(storage, api, {
+    now: NOW + 1000,
+    post: async (config, body) => {
+      order.push('post-2');
+      return api.post(config, body);
+    },
+  }));
+  order.push('queued');
+  release();
+  const [one, two] = await Promise.all([first, second]);
+
+  // Nothing of the second ran before the first was done, so it never posted at all:
+  // by the time its turn came the record was the first's, and current.
+  assert.deepEqual(order, ['queued', 'post-1']);
+  assert.equal(one.status, 'registered');
+  assert.equal(one.fresh, false);
+  assert.equal(two.status, 'registered');
+  assert.equal(two.fresh, true);
+  assert.equal(api.calls.length, 1);
+  assert.equal((await readRegistration(storage)).registeredAt, NOW);
+
+  // Forced — Setup's Retry behind a launch — it posts in its turn, and what it reads
+  // when it gets there is the record the first one left.
+  let seen = 'never ran';
+  const third = syncRegistration(deps(storage, api, {
+    force: true,
+    now: NOW + 2000,
+    post: async (config, body) => {
+      seen = await readRegistration(storage);
+      return api.post(config, body);
+    },
+  }));
+  assert.equal(seen, 'never ran');
+  assert.equal((await third).status, 'registered');
+  assert.equal(seen.registeredAt, NOW);
+  assert.equal((await readRegistration(storage)).registeredAt, NOW + 2000);
+  assert.equal(api.calls.length, 2);
 });
 
 test('forgetting a server deletes the registration, with or without the daemon', async () => {

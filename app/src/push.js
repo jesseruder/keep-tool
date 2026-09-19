@@ -127,6 +127,30 @@ async function clearRegistration(storage) {
 // the phone, so the caller discards it: no state, no sweep decision, no record.
 const SUPERSEDED = { status: 'superseded', sweep: false };
 
+// Every change to this phone's registration — the record here and the device on the
+// daemon — runs on one chain, one at a time, in the order it was asked for.
+//
+// Concurrent passes were the whole family of bugs in this file: a POST landing after
+// a Forget's DELETE, a record written after a Forget that had found nothing to
+// delete, a read-then-remove racing whatever had just written. Each one was patched
+// by comparing what was found against what was expected, which only moved the race.
+// There is one phone, one record and one daemon list, so nothing here needs to
+// overlap, and serializing is the only fix that does not need to be right about
+// interleavings. A pass therefore reads a record no one else can be halfway through
+// writing, and a Forget asked for mid-pass simply happens next.
+let registrationChain = Promise.resolve();
+
+// The three entry points below take it; nothing inside one of them may wait on
+// another, which is why the injected `post`, `remove` and `list` are the only things
+// a pass calls out to.
+function withRegistrationLock(fn) {
+  const run = registrationChain.then(() => fn());
+  // The chain itself never carries a result or a rejection forward: it is a queue,
+  // not a pipeline, and one caller's failure must not skip the next one's turn.
+  registrationChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 function state(status, extra = {}) {
   // `sweep` is what the caller registers or unregisters the background task by: the
   // 15-minute sweep exists for a phone push cannot reach, so it runs in exactly the
@@ -143,11 +167,16 @@ function state(status, extra = {}) {
 //   isCurrent   () => boolean — false once this pass has been superseded
 // Returns the state Setup shows and the sweep decision; it never throws.
 //
-// `isCurrent` is what makes Forget stick. A registration is three awaits long, and
+// `isCurrent` is what makes Forget stick. A registration is several awaits long, and
 // the config can be thrown away in the middle of it: without the check, a POST that
-// was already in flight when the DELETE went out lands after it, writes the record
-// again, and the phone is registered with a server it was just told to forget.
-async function syncRegistration({
+// was already in flight when Forget bumped the generation would land afterwards and
+// register the phone with a server it was just told to forget. The lock orders the
+// two; the generation is what tells this pass that the order went against it.
+async function syncRegistration(options = {}) {
+  return withRegistrationLock(() => runRegistration(options));
+}
+
+async function runRegistration({
   config, storage, permission, getToken, post, remove,
   platform = 'android', appVersion = '', modelName = '',
   force = false, now = Date.now(), isCurrent = () => true,
@@ -206,30 +235,22 @@ async function syncRegistration({
     return saved && saved.token === token ? fallback(reason) : state('unavailable', { reason });
   }
 
-  // The registration landed. From here the pass can still be superseded twice over:
-  // while the request was on the wire, and while the record is being written — and
-  // the second one is the worse of the two, because `unregisterDevice` looks for a
-  // saved token and a write that has not finished yet leaves it nothing to find, so
-  // Forget sends no DELETE and this pass then restores the record behind it. Either
-  // way the pass takes its own registration back: the daemon is told to drop the
-  // token, and the record goes if this pass is what left it there.
-  const record = { token, server, registeredAt: Number(now) };
-  const takeBack = async () => {
-    const current = await readRegistration(storage);
-    // Only ever removing what this pass itself wrote: a newer one may have put a
-    // perfectly good record there in the meantime.
-    if (current && current.token === record.token && current.server === record.server
-      && current.registeredAt === record.registeredAt) await clearRegistration(storage);
+  // The registration landed, and while it was on the wire the config it was made
+  // under was thrown away. Take it back: the daemon is told to drop the token and the
+  // record goes. Nothing else can have written one in the meantime — whatever
+  // superseded this pass is queued behind it — so there is nothing to compare
+  // against, and the Forget waiting its turn will find no record to delete. That is
+  // right: it is being deleted here, by the pass that made it.
+  if (!isCurrent()) {
+    await clearRegistration(storage);
     if (remove) {
       try { await remove(config, token); }
       catch {}
     }
     return SUPERSEDED;
-  };
+  }
 
-  if (!isCurrent()) return takeBack();
-  await writeRegistration(storage, record);
-  if (!isCurrent()) return takeBack();
+  await writeRegistration(storage, { token, server, registeredAt: Number(now) });
   return state('registered', { tokenTail: tokenTail(token), registeredAt: Number(now), fresh: false });
 }
 
@@ -251,7 +272,11 @@ function deviceListHasToken(response, token) {
 // list while its record here still looks perfectly good — so when the daemon says it
 // is not registered, the record goes and the next pass registers again.
 //   list  async (config) => { devices: [{ tokenTail, … }] }   (GET /api/devices)
-async function verifyRegistration({ config, storage, list, isCurrent = () => true } = {}) {
+async function verifyRegistration(options = {}) {
+  return withRegistrationLock(() => runVerify(options));
+}
+
+async function runVerify({ config, storage, list, isCurrent = () => true } = {}) {
   const server = normalizeServer(config && config.server);
   const saved = await readRegistration(storage);
   if (!server || !registeredWith(saved, server) || !isCurrent()) return { checked: false };
@@ -270,7 +295,11 @@ async function verifyRegistration({ config, storage, list, isCurrent = () => tru
 // Forgetting a server, or moving to another one. Best effort in both directions: the
 // record goes whether or not the daemon could be told, because the config it was
 // made under is going too.
-async function unregisterDevice({ config, storage, remove } = {}) {
+async function unregisterDevice(options = {}) {
+  return withRegistrationLock(() => runUnregister(options));
+}
+
+async function runUnregister({ config, storage, remove } = {}) {
   const saved = await readRegistration(storage);
   const token = saved && saved.token;
   let removed = false;

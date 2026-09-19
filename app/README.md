@@ -204,14 +204,20 @@ ever displayed.
 
 **Moving on.** Connecting to a different server, or **Forget this server**, sends
 `DELETE /api/devices` to the daemon being left, best effort, with the config that is
-being replaced — it is the only thing that can still authenticate the removal. Both
-bump a generation counter first, and every step of a registration checks it —
-including the step *after* the record has been written, which is the narrow window
-where Forget looks for a saved token, finds none because the write had not landed
-yet, and sends no `DELETE` of its own. A superseded pass keeps nothing: the record it
-wrote is removed again (only if it is still its own) and the token it registered is
-taken back with a `DELETE`. Without all of that, forgetting a server while a
-registration was in flight registered the phone all over again a moment later.
+being replaced — it is the only thing that can still authenticate the removal.
+
+**One at a time.** Every change to the registration — a sync, a Forget, a server
+change, the device-list check — runs on a single promise chain in `src/push.js`, in
+the order it was asked for. Two of them overlapping was the whole family of bugs
+here: a `POST` landing after a Forget's `DELETE`, a record written after a Forget
+that had found nothing to delete, a read-then-remove racing whatever had just
+written. Each was patched by comparing what was found against what was expected,
+which only moved the race; serializing is the fix that does not have to be right
+about interleavings. On top of that, a Forget bumps a generation counter before it
+queues, so a pass already running supersedes itself: it writes no record, and if its
+`POST` had already gone out it takes that registration back with a `DELETE` of its
+own. The Forget waiting behind it then finds nothing left to delete, which is the
+right end state rather than a missed step.
 
 **The tap.** A push carries `data: {key, sessionId}`, where `key` is the console's
 own attention key or `alert:<id>`. Foreground, background and cold start all end at
