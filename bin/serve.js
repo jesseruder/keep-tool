@@ -343,7 +343,6 @@ function updateSetAside(body, attention, options = {}) {
 const DIGEST_INSTRUCTION = "You are writing a concise morning briefing for a solo developer's work registry. In 2-4 short sentences (or a few bullets), say what moved, what needs their attention, and what is stuck or waiting. Be specific and skip anything routine. Output only the briefing.";
 const RESUME_INSTRUCTION = "This developer is returning to work after a break. From these in-progress tasks, write a 2-4 sentence 'here's where you were' briefing that orients them fast: what was mid-flight, what's blocked, what to pick up first. Output only the briefing.";
 const REVIEW_INSTRUCTION = "These items are awaiting the developer's decision. For each, give a one-line recommendation (ramp / kill / take a look / merge / etc.) based on its latest status. Output only the list, one '- Title — recommendation' bullet per item. Plain bullets only — never a markdown table, headers, or preamble.";
-const TASK_INSTRUCTION = "Summarize where this task stands for someone resuming it. 2-4 sentences: the goal, what's been done, and the current state / next step. Draw only from the log below. Output only the summary.";
 const SESSION_INSTRUCTION = "Write 2 to 4 short lines, newest first, each naming one thing this coding session worked on recently (feature, bug, file area) and its outcome or current state. Plain text, one item per line, no bullets, no preamble. Output only those lines.";
 const dashboardSessionSources = new WeakMap();
 function associateDashboardSessionFiles(state, targets, store = dashboardSessionSources) {
@@ -382,7 +381,6 @@ async function sessionSummarySnapshot(deps = {}) {
   return { sessions: state.sessions, panes };
 }
 const WEEKLY_INSTRUCTION = "Summarize what this solo developer completed in the last week. Group related work into 3-6 themed bullets and note anything notable that shipped. Be specific; output only the summary.";
-const TAG_INSTRUCTION = "These tasks share a theme/tag. In 2-3 sentences describe the common thread and what's blocking or driving progress across them. Output only that.";
 let onChange = () => {};
 let onFocus = () => {};
 let sweepInFlight = false;
@@ -9862,7 +9860,7 @@ function start(deps = {}) {
   // be a cycle. Bindings start() has not made yet, and the module-level state the
   // rest of the daemon rebinds, are getters so they are read live.
   const ctx = {
-    ATTENTION_KINDS, InjectionError, MOBILE_VIEWS, TAG_INSTRUCTION, TASK_INSTRUCTION,
+    ATTENTION_KINDS, InjectionError, MOBILE_VIEWS,
     TURN_INDEX_BUDGET_BYTES, TURN_INDEX_BUDGET_MS, TURN_INDEX_PRUNE_LIMIT, WATCHER_CONCURRENCY,
     WATCHER_TURNS_PER_TICK, WATCHER_WINDOW_MS,
     abandonAccountHandoff, accounts, addHostSessionState, agentProcessRows, announceStateNote,
@@ -10027,7 +10025,7 @@ function start(deps = {}) {
       onPublished: () => {
         if (announced) return;
         announced = true;
-        console.log(`keep serve — http://localhost:${PORT}`);
+        console.log(`keep serve — http://localhost:${PORT}/app`);
       },
     });
     if (retainedPublication) uiWorker.publish(retainedPublication);

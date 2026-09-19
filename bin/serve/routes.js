@@ -14,7 +14,7 @@
 function routes(ctx) {
   const {
     // serve.js internals
-    ATTENTION_KINDS, InjectionError, MOBILE_VIEWS, TAG_INSTRUCTION, TASK_INSTRUCTION,
+    ATTENTION_KINDS, InjectionError, MOBILE_VIEWS,
     abandonAccountHandoff, accounts, announceStateNote, answerSession, attentionAckKey, attentionAckName,
     cancelQueuedHandoff, closeIdleSession, codex, compactSessionById, companionSnapshot, consoleState,
     daemonRestartGate, dashboardDetail, fs, handoffRateLimited, handoffSessionRequest, health, hostRequest,
@@ -24,7 +24,7 @@ function routes(ctx) {
     prepareSessionSummary, projectMobileState, recentTranscriptText, recoverReviewQueueLaunch, reminders,
     reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, restorePlan, review,
     reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow, runTaskNow, screenHistorySession, screenSession,
-    sendSessionKeys, sendStateJson, sendToSessionLocked, sessionMarks, sessionNames, sessionSummaryFile, setAsideCandidates, summarize,
+    sendSessionKeys, sendStateJson, sendToSessionLocked, sessionMarks, sessionNames, sessionSummaryFile, setAsideCandidates,
     tellSession, transferSession, updateSetAside, wantsConsoleState, withInjectionLock,
     writeToShellPane,
     // start()'s own locals. onChange and onFocus are the module-level hooks start()
@@ -132,21 +132,6 @@ function routes(ctx) {
     },
     {
       method: 'GET',
-      path: '/api/tasksummary',
-      handle: async ({ req, res, url }) => {
-        let task;
-        try { task = keep.loadTask(url.searchParams.get('id') || ''); }
-        catch (e) {
-          if (e instanceof keep.KeepError) return json(res, 400, { error: e.message });
-          throw e;
-        }
-        if ((task.body.match(/^## /gm) || []).length < 3) return json(res, 200, { text: null, tooShort: true });
-        const result = summarize.getSummary(`task-${task.id}`, task.body, TASK_INSTRUCTION, onChange);
-        return json(res, 200, { text: result.text, fresh: result.fresh });
-      },
-    },
-    {
-      method: 'GET',
       path: '/api/sessionsummary',
       handle: async ({ req, res, url }) => {
         const id = url.searchParams.get('id') || '';
@@ -225,21 +210,6 @@ function routes(ctx) {
           if (error instanceof InjectionError) return json(res, error.status, { error: error.message });
           throw error;
         }
-      },
-    },
-    {
-      method: 'GET',
-      path: '/api/tagsummary',
-      handle: async ({ req, res, url }) => {
-        const tag = url.searchParams.get('tag') || '';
-        if (!/^[a-z0-9-]+$/.test(tag)) return json(res, 400, { error: 'bad tag' });
-        const tasks = keep.loadAll(false)
-          .filter((t) => (t.fm.tags || []).includes(tag))
-          .sort((a, b) => a.id.localeCompare(b.id));
-        if (tasks.length < 2) return json(res, 200, { text: null, tooFew: true });
-        const input = tasks.map((t) => `- ${t.fm.title} [${t.fm.status}]: ${keep.lastLogLine(t)}`).join('\n');
-        const result = summarize.getSummary(`tag-${tag}`, input, TAG_INSTRUCTION, onChange);
-        return json(res, 200, { text: result.text, fresh: result.fresh });
       },
     },
     {
