@@ -64,11 +64,25 @@ function element(tag, className, html) {
 }
 
 const alertsDialog = () => document.querySelector('#notificationsPanel');
+let alertsObserver = null;
 
-// The inbox is a <dialog> the console opens through its own button, so the stack
-// follows it rather than driving it: adopt the entry once it is up (any click
-// that opens it, plus a render for the paths that open it without one), and drop
-// the dialog whenever the entry leaves the stack by any other route.
+// The inbox is a <dialog> the console opens for its own reasons — the tab, the
+// bar button, the preview banner, and a notification tap, which opens it
+// straight after a refresh with no click and no render behind it. So the stack
+// follows the dialog itself: the `open` attribute is the one signal every one of
+// those paths goes through.
+function watchAlerts() {
+  const dialog = alertsDialog();
+  if (!dialog || alertsObserver) return;
+  alertsObserver = new MutationObserver(() => { if (dialog.open) adoptAlerts(); });
+  alertsObserver.observe(dialog, { attributes: true, attributeFilter: ['open'] });
+}
+function unwatchAlerts() {
+  alertsObserver?.disconnect();
+  alertsObserver = null;
+}
+// `showing` is also the guard for reopen(), which claims the entry before it
+// reopens the dialog: the observer runs a microtask later and finds it taken.
 function adoptAlerts() {
   if (active && alertsDialog()?.open && !showing('alerts')) open('alerts');
 }
@@ -158,6 +172,7 @@ function giveBack() {
 
 function activate() {
   build();
+  watchAlerts();
   borrow('#rail', filterSheet.querySelector('.mobile-sheet-body'));
   borrow('#meters', statusSheet.querySelector('.mobile-sheet-body'));
   borrow('#health', statusSheet.querySelector('.mobile-sheet-body'));
@@ -179,6 +194,7 @@ function deactivate() {
   // Unwind before dropping the stack: forgetting the overlays without unwinding
   // leaves history entries nothing owns, so the first Back would look like a
   // no-op and a Forward would land on a `keepOverlay` state with nothing open.
+  unwatchAlerts();
   const pops = overlays.filter((entry) => entry.pushed).length;
   overlays.length = 0;
   closeDroppedAlerts();
@@ -299,9 +315,6 @@ function sync() {
   badge.classList.toggle('zero', !unread);
   if (stageOpen) stageTitle.textContent = headingText() || document.querySelector('#stage .qempty b')?.textContent || '';
   alertsTab.classList.toggle('on', showing('alerts'));
-  // The backstop for an inbox opened without a click of its own — a notification
-  // tap arrives that way.
-  adoptAlerts();
 }
 
 // The stage heading carries the session number and mark inside the same element
@@ -346,9 +359,5 @@ export function installMobile(context) {
     else if (event.target.closest('#qlist .qitem')) open('stage');
     else if (event.target.closest('#rail [data-project]')) close('filter');
   }, true);
-  // After the click, not before: whichever control just opened the inbox — the
-  // Alerts tab, the bar button, the preview banner — the dialog is up by now, so
-  // the entry can be claimed in the same gesture rather than at the next render.
-  document.addEventListener('click', () => { if (active) adoptAlerts(); });
   apply({ booting: true });
 }

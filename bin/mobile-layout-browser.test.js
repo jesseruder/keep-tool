@@ -51,7 +51,12 @@ test('isolated browser: the console is usable on a 412px touch screen',
     const state = {
       generatedAt: 1, sessions, panes, attention, setAside: {},
       tasks: [{ id: 'card-a', fm: { project: alpha, tags: ['castle'] } }, { id: 'card-b', fm: { project: beta, tags: ['personal'] } }],
-      notifications: [{ id: 'notice-one', at: now, text: 'The reviewer left a finding on card-a', from: 'Reviewer', caller: 'reviewer', card: 'card-a', read: false }],
+      notifications: [
+        { id: 'notice-one', at: now, text: 'The reviewer left a finding on card-a', from: 'Reviewer', caller: 'reviewer', card: 'card-a', read: false },
+        // Not a review item, so a tap on it opens the inbox instead of
+        // navigating to the review queue.
+        { id: 'notice-plain', at: now - 5000, text: 'A plain heads-up with nothing to decide', from: 'Keep', caller: 'manual', read: false },
+      ],
       accounts: [{ id: 'claude-main', agent: 'claude', label: 'Claude Main', isDefault: true }],
       usage: { accounts: { 'claude-main': { id: 'claude-main', agent: 'claude', label: 'Claude Main', limits: [{ label: 'weekly', used: 41, limit: 100 }] } } },
       health: { daemon: { running: true, pid: 321 }, schedulers: [{ name: 'runs', state: 'ok', displayState: 'ok' }] },
@@ -346,6 +351,16 @@ test('isolated browser: the console is usable on a 412px touch screen',
       await evaluate("document.querySelector('.mobile-alerts-tab').click()");
       await wait("document.querySelector('#notificationsPanel').open && history.state?.keepOverlay === 'alerts'");
       await evaluate("document.querySelector('#notificationsPanel [data-close]').click()");
+      await wait("!document.querySelector('#notificationsPanel').open"
+        + " && !(history.state && history.state.keepOverlay)");
+      // A notification tap opens the inbox from the app, with no click behind it
+      // and after the render that would otherwise have noticed — the dialog
+      // itself is what the entry follows.
+      await evaluate("window.keepShellReceive({ type: 'notificationClick', key: 'alert:notice-plain' })");
+      await wait("document.querySelector('#notificationsPanel').open");
+      assert.equal(await evaluate('history.state && history.state.keepOverlay'), 'alerts',
+        'an inbox opened by a notification tap owns an entry too');
+      await evaluate('history.back()');
       await wait("!document.querySelector('#notificationsPanel').open"
         + " && !(history.state && history.state.keepOverlay)");
 
