@@ -1136,7 +1136,7 @@ test("an initialize carrying a stale session id starts a new session", async (t)
   assert.equal(started.response.status, 200);
   assert.notEqual(started.sessionId, "an-id-from-a-previous-life", "a new id, and a new derived key");
   assert.equal(daemon.sessions.size, 1);
-  assert.ok(logs.some((line) => line.includes("initialize carried a stale session id")));
+  assert.ok(logs.some((line) => line.includes("initialize carried a session id this daemon does not have")));
 
   // And the new session works, under the key its new id derives.
   await rpc(port, { jsonrpc: "2.0", method: "notifications/initialized" }, { sessionId: started.sessionId });
@@ -1243,4 +1243,97 @@ test("a session name with an em dash or an emoji survives both paths", async (t)
   // And a name that really is Latin-1 is left alone rather than reinterpreted.
   await rawSession(port, "café #15");
   assert.equal(host.hellos().at(-1).params.name, "café #15");
+});
+
+test("no log line ever carries a session id", async (t) => {
+  const dir = tempDir(t);
+  await fakeHost(t, dir);
+  let clock = 2_000;
+  const { port, daemon, logs } = await startDaemon(t, dir, { now: () => clock });
+
+  // daemon.log is a file, and an id plus daemon.json's secret derives that session's key. So a
+  // log that printed ids put back exactly the exposure that deriving keys removed.
+  const started = await rawSession(port, "#12 in the log");
+  const adopted = "an-id-from-before-the-restart";
+  await rpc(
+    port,
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "browser_status", arguments: {} } },
+    { sessionId: adopted, headers: { "X-Browser-Bridge-Session": "adopted into the log" } },
+  );
+  const stream = await openStream(port, started);
+  await settle();
+  stream.close();
+  await settle();
+  clock += STREAM_LOSS_IDLE_MS;
+  await daemon.sweep(clock);
+  await daemon.shutdown("test over");
+
+  const written = logs.join("\n");
+  assert.ok(written.includes("session start"), written);
+  assert.ok(written.includes("session adopted"));
+  assert.ok(written.includes("session end"));
+  for (const id of [started, adopted]) {
+    assert.equal(written.includes(id), false, `the log names ${id}`);
+    // What it does carry is eight characters of a one-way tag: enough to follow one session
+    // through a log and tell two apart, and no use to anybody deriving a key.
+    const tag = deriveRegistryKey(SECRET, id).slice(0, 8);
+    assert.ok(written.includes(tag), `no tag for ${id}`);
+    assert.equal(written.includes(deriveRegistryKey(SECRET, id)), false, "and not the whole tag");
+    assert.equal(written.includes(deriveSessionKey(SECRET, id)), false, "and never the key");
+  }
+  // The names are there, because that is what a person reads the log for.
+  assert.ok(written.includes("#12 in the log"));
+  assert.ok(written.includes("adopted into the log"));
+});
+
+test("the session cap holds on every path that would make a session", async (t) => {
+  const dir = tempDir(t);
+  await fakeHost(t, dir);
+  const { port, daemon } = await startDaemon(t, dir);
+
+  for (let index = 0; index < MAX_LIVE_SESSIONS; index++) {
+    daemon.sessions.set(`filler-${index}`, { inFlight: 0, openStreams: 0, lastSeenAt: 0 });
+  }
+  const initialize = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "raw", version: "0" } },
+  };
+
+  // A plain initialize is refused...
+  assert.equal((await rpc(port, initialize)).response.status, 503);
+  // ...and so is one carrying an unknown session id, which used to walk straight past the cap
+  // on its way to starting a session anyway.
+  const withStaleId = await rpc(port, initialize, { sessionId: "any-old-id" });
+  assert.equal(withStaleId.response.status, 503);
+  assert.match(withStaleId.message.error.message, new RegExp(`already holding ${MAX_LIVE_SESSIONS}`));
+  assert.equal(daemon.sessions.size, MAX_LIVE_SESSIONS, "no 201st session");
+});
+
+test("a second initialize on a live session is refused, not forked", async (t) => {
+  const dir = tempDir(t);
+  const host = await fakeHost(t, dir);
+  const { port, daemon } = await startDaemon(t, dir);
+
+  const sessionId = await rawSession(port, "already going");
+  assert.equal(daemon.sessions.size, 1);
+
+  // Starting a new session here would fork the client in two and abandon the tab group it is
+  // using. It belongs to the transport, which knows it is already initialized.
+  const again = await rpc(
+    port,
+    {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "raw", version: "0" } },
+    },
+    { sessionId },
+  );
+  assert.equal(again.response.status, 400);
+  assert.match(again.message.error.message, /already initialized/i);
+  assert.equal(daemon.sessions.size, 1, "the session it already had, and only that one");
+  assert.ok(daemon.sessions.has(sessionId));
+  assert.equal(host.hellos().length, 1, "and one socket client on that tab group");
 });

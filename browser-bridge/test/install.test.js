@@ -302,8 +302,14 @@ test("the plan writes the launcher, the manifests, daemon.json and the launchd j
       hostManifestPath("chrome", env),
       path.join(env.HOME, RUNTIME, "daemon.json"),
       daemonPlistPath(env),
+      path.join(env.HOME, RUNTIME, "daemon.log"),
     ],
   );
+  // launchd would create its own output file 0644, and the daemon writes a line per session
+  // there, so the installer creates it first and keeps whatever is already in it.
+  const logFile = plan.files.at(-1);
+  assert.equal(logFile.mode, 0o600);
+  assert.equal(logFile.append, true);
   assert.equal(plan.files[0].mode, 0o700);
   assert.match(plan.files[0].content, /^#!\/bin\/sh\n/);
   assert.deepEqual(JSON.parse(plan.files[1].content), hostManifest(env));
@@ -733,6 +739,46 @@ test("a real run says which sub-tables it dropped, and where the old file is", a
   assert.match(written, /\[mcp_servers\.browser\.tools\.javascript_tool\]\napproval_mode = "approve"/);
   assert.equal(written.includes("Bearer stale"), false);
   assert.match(fs.readFileSync(`${file}.bak`, "utf8"), /Bearer stale/, "and it is all in the backup");
+});
+
+test("daemon.log is created private, and an existing one is tightened", async (t) => {
+  const env = fakeHome(t);
+  const log = path.join(env.HOME, RUNTIME, "daemon.log");
+  fs.mkdirSync(path.dirname(log), { recursive: true });
+  fs.writeFileSync(log, "an earlier run said things here\n", { mode: 0o644 });
+
+  const { output } = await runInstaller([], env);
+
+  // It holds a line per session, so it is as private as everything else in here.
+  assert.equal(fs.statSync(log).mode & 0o777, 0o600);
+  assert.match(fs.readFileSync(log, "utf8"), /an earlier run said things here/, "and nothing is lost");
+  assert.match(output, /ensured .*daemon\.log \(mode 600\)/);
+
+  // A machine with no log yet gets one, rather than letting launchd make it 0644.
+  const fresh = fakeHome(t);
+  await runInstaller([], fresh);
+  assert.equal(fs.statSync(path.join(fresh.HOME, RUNTIME, "daemon.log")).mode & 0o777, 0o600);
+});
+
+test("--rotate-token clears the registry, because its keys were the old secret's", async (t) => {
+  const env = fakeHome(t);
+  await runInstaller([], env);
+  const sessions = path.join(env.HOME, RUNTIME, "sessions.json");
+  fs.writeFileSync(sessions, JSON.stringify({ ["a".repeat(64)]: { name: "#12 fix-login", lastSeen: 1 } }));
+
+  const before = daemonSettings({}, env);
+  assert.equal(before.secretChanged, false, "a plain re-run changes nothing");
+  const plan = buildPlan({ browsers: ["edge"], uninstall: false }, env);
+  assert.equal(plan.removals.includes(sessions), false);
+
+  // Every entry is filed under a key derived from the old secret, so with a new one they are
+  // rows nothing can ever read again - they would just sit there for a day.
+  const { output } = await runInstaller(["--rotate-token"], env);
+  assert.equal(fs.existsSync(sessions), false, output);
+  assert.notEqual(
+    JSON.parse(fs.readFileSync(path.join(env.HOME, RUNTIME, "daemon.json"), "utf8")).secret,
+    before.secret,
+  );
 });
 
 // --- end to end, on files only -------------------------------------------

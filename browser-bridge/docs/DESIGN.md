@@ -187,9 +187,13 @@ slow). The host answers the client with an error on timeout and drops the late r
   the same unknown id share one adoption (`adoptOnce`), because an agent resuming with a tool
   call while its event stream reconnects sends exactly that, and two adoptions would mean two
   socket clients on one tab group.
-- An `initialize` that still carries an old session id is a client starting over, not a session
-  to adopt: it gets a new session and a new derived key. An adopted transport is created
+- An `initialize` carrying a session id the daemon does **not** have is a client starting over,
+  not a session to adopt: it gets a new session and a new derived key (and it is subject to the
+  live-session cap like any other new session). An adopted transport is created
   already-initialized, so handing it an initialize would be a 400 for the life of that session.
+  An id that *is* live is a different thing — a second initialize on a working session — and it
+  goes to the transport, which refuses it. Starting a new session there would fork the client
+  in two and abandon the tab group it was using.
 - An id whose own client sent `DELETE` is **not** adopted — it gets the 404. That session is
   over and its tab group has been released; bringing the id back would take the group with it.
   An id the *daemon* ended (the sweep) is adopted back, because the sweep was only guessing.
@@ -692,8 +696,14 @@ socket can drive the browser". `daemon.json` is 0600 in a 0700 directory, and th
   extension keys a tab group by, and all the host asks for — is
   `hmacSha256(daemon.json's secret, "session:" + <session id>)`. So whoever holds an id can
   drive that session's tab group, and nothing else can: the ids are 122 random bits from
-  `randomUUID`, they are never written to disk, and they only ever travel between a client and
-  the daemon on loopback.
+  `randomUUID`, and they travel only between a client and the daemon on loopback.
+- Which means **nothing writes an id down**, and that includes the log. `daemon.log` is a file
+  like any other — an id in it plus the secret beside it derives that session's key — so every
+  line names a session by the first eight characters of `hmacSha256(secret, "registry:" + id)`
+  instead: enough to follow one session through a log and to tell two apart, and no use for
+  deriving anything. The session's *name* is in there, because that is what a person reads the
+  log for. The installer also creates `daemon.log` itself at 0600, because launchd would
+  otherwise make its own output file 0644.
 - That is why keys are derived rather than stored. `sessions.json` used to hold them, and an
   agent that had just been told to `cat` a file by a web page it was reading could have said
   `hello` on the socket with somebody else's key and driven their browser. Now that file names
@@ -726,12 +736,14 @@ node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
    the secret is what session keys are derived from and never leaves the machine. Neither is
    rotated on a re-run: the token is in every registration's reach, and rotating the secret
    re-derives every key, which costs every live session its tab group. `--rotate-token` does
-   both deliberately. An install from before the secret existed gains one with its token
-   untouched.
+   both deliberately — and then `sessions.json` is deleted, because every entry in it is filed
+   under a key derived from the *old* secret and could never be read again. An install from
+   before the secret existed gains one with its token untouched.
 4. Write `~/Library/LaunchAgents/com.keep.browser_bridge.daemon.plist` (the same node the
    native-host launcher uses, `mcp/daemon.js`, RunAtLoad, KeepAlive, ThrottleInterval 5,
-   WorkingDirectory the bridge directory, both output paths `BrowserBridge/daemon.log`) and
-   bring the job up. **`launchctl bootout` returns before the job is actually gone**, and a
+   WorkingDirectory the bridge directory, both output paths `BrowserBridge/daemon.log`), make
+   sure `daemon.log` exists at mode 0600 with whatever is already in it (launchd would create
+   it 0644, and the daemon writes a line per session there), and bring the job up. **`launchctl bootout` returns before the job is actually gone**, and a
    `bootstrap` inside that window fails with `Bootstrap failed: 5: Input/output error` — on
    2026-09-18 that took the daemon down and the installer reported success anyway, leaving
    every session without a browser. So the sequence is:
@@ -914,7 +926,9 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
   starts a new session, two parallel requests for one unknown id share a single adoption, an
   absurd id and a runaway session count are refused, a stream lost after a long quiet spell
   still gets its ten minutes, a live-but-quiet session keeps its registry entry, and a name
-  with an em dash or an emoji survives both the helper's path and Codex's. `/healthz` is
+  with an em dash or an emoji survives both the helper's path and Codex's. And: no log line
+  carries a session id or a key, only a tag; the session cap holds on both paths that would
+  make a session; and a second initialize on a *live* id is refused rather than forking it. `/healthz` is
   checked for the Host and Origin refusals, shutdown for finishing quickly against a host that
   never answers `bye`, and the sweep for never ending a session mid-call. The one failure that
   nothing real produces — a throw between a session being registered and its initialize being

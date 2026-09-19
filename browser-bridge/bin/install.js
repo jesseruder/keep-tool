@@ -31,6 +31,7 @@ import {
   launcherPath,
   readDaemonConfig,
   runtimeDir,
+  sessionsPath,
 } from "../host/protocol.js";
 
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -129,6 +130,10 @@ export function daemonSettings(options, env = process.env) {
     secret,
     // Write only when something actually changed, so a re-run does not churn the file.
     fresh: rotate || existing?.token !== token || existing?.secret !== secret,
+    // Every registry entry is filed under a key derived from the *old* secret, so with a new
+    // one they are unreadable rows that would sit there for a day. There was no secret before
+    // the first install, and nothing filed under it, so that case is not a change.
+    secretChanged: Boolean(existing?.secret) && existing.secret !== secret,
   };
 }
 
@@ -519,6 +524,12 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
       content: daemonPlist(nodePath, env, projectDir),
       mode: 0o644,
     });
+    // launchd creates its output file 0644, and the daemon logs one line per session. Creating
+    // it first (and tightening it if it is already there) keeps the session names and tags out
+    // of anything else's reach - a log is a file like any other.
+    files.push({ path: daemonLogPath(env), mode: 0o600, append: true, content: "" });
+    // Entries filed under a secret that has just been replaced can never be read again.
+    if (daemon.secretChanged) removals.push(sessionsPath(env));
   }
 
   // --stdio has to take the job out too: leaving it loaded would keep a daemon listening on
@@ -737,6 +748,10 @@ export function renderPlan(plan, options) {
   const lines = [];
   lines.push(options.uninstall ? "# Browser Bridge uninstall" : "# Browser Bridge install");
   for (const file of plan.files) {
+    if (file.append) {
+      lines.push(`ensure ${file.path} exists (mode ${file.mode.toString(8)}, contents kept)`);
+      continue;
+    }
     lines.push(`write ${file.path} (mode ${file.mode.toString(8)})`);
     for (const line of (file.display ?? file.content).trimEnd().split("\n")) lines.push(`    ${line}`);
   }
@@ -778,6 +793,13 @@ export function renderPlan(plan, options) {
 
 function writeFile(file) {
   fs.mkdirSync(path.dirname(file.path), { recursive: true });
+  if (file.append) {
+    // A log: create it if it is missing, keep whatever is in it, and set the mode either way.
+    fs.closeSync(fs.openSync(file.path, "a", file.mode));
+    fs.chmodSync(file.path, file.mode);
+    process.stdout.write(`ensured ${file.path} (mode ${file.mode.toString(8)})\n`);
+    return;
+  }
   fs.writeFileSync(file.path, file.content, { mode: file.mode });
   fs.chmodSync(file.path, file.mode);
   process.stdout.write(`wrote ${file.path}\n`);

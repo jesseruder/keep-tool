@@ -148,6 +148,13 @@ export function createDaemon({
 
   const registryKey = (id) => deriveRegistryKey(secret, id);
   const remember = (id) => known.get(registryKey(id));
+  /**
+   * What a session is called in the log. Never the session id: daemon.log is a file, and an id
+   * plus daemon.json's secret derives that session's key, so writing ids down would put back
+   * exactly the exposure that deriving keys removed. Eight hex characters of a one-way tag are
+   * enough to follow one session through a log and tell two apart.
+   */
+  const tag = (id) => registryKey(id).slice(0, 8);
 
   const newClient =
     makeClient ??
@@ -250,16 +257,28 @@ export function createDaemon({
     }
 
     const initializing = req.method === "POST" ? initializeRequest(body) : undefined;
+    // Anything that would make a *new* session is subject to the cap, and there are two such
+    // paths: a plain initialize, and an initialize that still carries an old id. Checking only
+    // the first let the second walk straight past it.
+    const wouldStartSession = Boolean(initializing) && !sessions.has(sessionId ?? "");
+    if (wouldStartSession && sessions.size >= MAX_LIVE_SESSIONS) {
+      jsonError(res, 503, -32000, `The Browser Bridge daemon is already holding ${MAX_LIVE_SESSIONS} sessions`);
+      return;
+    }
 
-    // An `initialize` that still carries an old session id is a client starting over, not a
-    // session to adopt: an adopted transport is already initialized, so handing it one would
-    // be a permanent 400. Give it a new session, and a new derived key with it.
-    if (sessionId && initializing) {
+    // An `initialize` that carries an id this daemon does not have is a client starting over,
+    // not a session to adopt: an adopted transport is already initialized, so handing it one
+    // would be a permanent 400. Give it a new session, and a new derived key with it.
+    //
+    // An id that *is* live is a different thing - a second initialize on a working session -
+    // and it belongs to the transport, which refuses it. Starting a new session there would
+    // fork the client in two and abandon the tab group it was using.
+    if (sessionId && initializing && !sessions.has(sessionId)) {
       if (closing) {
         jsonError(res, 503, -32000, "The Browser Bridge daemon is shutting down");
         return;
       }
-      log(`initialize carried a stale session id; starting a new session instead`);
+      log(`initialize carried a session id this daemon does not have; starting a new session`);
       await startSession(req, res, body, initializing);
       return;
     }
@@ -320,10 +339,6 @@ export function createDaemon({
     }
     if (closing) {
       jsonError(res, 503, -32000, "The Browser Bridge daemon is shutting down");
-      return;
-    }
-    if (sessions.size >= MAX_LIVE_SESSIONS) {
-      jsonError(res, 503, -32000, `The Browser Bridge daemon is already holding ${MAX_LIVE_SESSIONS} sessions`);
       return;
     }
     await startSession(req, res, body, initializing);
@@ -446,7 +461,7 @@ export function createDaemon({
     sessions.set(id, entry);
     known.put(registryKey(id), identity);
     log(
-      `session adopted ${id} name=${JSON.stringify(identity.name)} ` +
+      `session adopted ${tag(id)} name=${JSON.stringify(identity.name)} ` +
         `labels=${remembered ? (remembered.ended ? "remembered (ended)" : "remembered") : "from the request"} ` +
         `(${sessions.size} open)`,
     );
@@ -484,7 +499,7 @@ export function createDaemon({
         entry.id = started;
         sessions.set(started, entry);
         known.put(registryKey(started), identity);
-        log(`session start ${started} name=${JSON.stringify(identity.name)} agent=${identity.agent ?? "-"} account=${identity.account ?? "-"} (${sessions.size} open)`);
+        log(`session start ${tag(started)} name=${JSON.stringify(identity.name)} agent=${identity.agent ?? "-"} account=${identity.account ?? "-"} (${sessions.size} open)`);
         // A hook for the tests, and the only way to reach the failure path below: the session
         // is registered from here, before its initialize response goes out, and nothing else
         // in between throws.
@@ -551,7 +566,7 @@ export function createDaemon({
     // session that comes back with the same name lands in the group it left.
     await closeQuietly(entry.client);
     await closeQuietly(entry.transport);
-    log(`session end ${id} name=${JSON.stringify(entry.name)} - ${reason} (${sessions.size} open)`);
+    log(`session end ${tag(id)} name=${JSON.stringify(entry.name)} - ${reason} (${sessions.size} open)`);
   }
 
   /**

@@ -39,8 +39,10 @@ The installer:
 3. writes `BrowserBridge/daemon.json` (mode 0600) with the loopback port, a random 32-byte
    `token` (what every agent sends) and a random 32-byte `secret` (what session keys are
    derived from, and which never leaves this machine), keeping either if it is already there;
-   `--rotate-token` replaces both, which also moves every live session to a new tab group;
-4. writes `~/Library/LaunchAgents/com.keep.browser_bridge.daemon.plist` and reloads the
+   `--rotate-token` replaces both, which also moves every live session to a new tab group and
+   clears `sessions.json`;
+4. makes sure `BrowserBridge/daemon.log` exists at mode 0600 (launchd would create it 0644),
+   writes `~/Library/LaunchAgents/com.keep.browser_bridge.daemon.plist` and reloads the
    launchd job — `kickstart -k` when the plist has not changed, otherwise `bootout`, a poll
    until launchd has really let go, and `bootstrap` with retries — then waits for `/healthz`
    and **exits non-zero if the daemon is not answering**, rather than claiming success;
@@ -183,7 +185,9 @@ session ids and no keys, both of which are derived rather than stored), `host.lo
   up. `daemon.log` says `session adopted` when that happens. The one thing that does move every
   group is `--rotate-token`, because the derivation secret changes with it.
 - **The daemon will not stay up** — `~/Library/Application Support/BrowserBridge/daemon.log`
-  has one line per session plus the reason it exited. `launchctl print gui/$UID/com.keep.browser_bridge.daemon`
+  has one line per session plus the reason it exited. Sessions appear there by name and by an
+  eight-character tag, never by their session id: an id plus the secret next to it would derive
+  that session's key, so the log does not hold one. `launchctl print gui/$UID/com.keep.browser_bridge.daemon`
   shows what launchd thinks. A port already in use is an exit 1 with the reason.
 - **`node bin/install.js` printed `THE DAEMON IS DOWN`** — it tried and could not get the
   job up, and it prints the commands to run by hand. `Bootstrap failed: 5: Input/output
