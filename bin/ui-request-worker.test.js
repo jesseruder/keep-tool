@@ -80,7 +80,7 @@ test('forked frontend serves a full reload and SSE during a 10.5 second core sta
     request(port, '/app'),
     request(port, '/app/app.js'),
     request(port, '/vendor/xterm.js'),
-    request(port, '/api/state?summary=1'),
+    request(port, '/api/state'),
     request(port, '/api/layouts'),
     request(port, '/api/portable-transfers', { headers: { 'x-keep': '1' } }),
     heartbeat,
@@ -91,6 +91,10 @@ test('forked frontend serves a full reload and SSE during a 10.5 second core sta
   }
   assert.equal(JSON.parse(responses[3].body).marker, 1);
   assert.equal((await block).status, 200);
+
+  // The legacy board is deleted: the frontend serves no page at /, and the
+  // request falls through to the core, which has no route for it either.
+  assert.equal((await request(port, '/')).status, 404, 'nothing is served at /');
 
   const action = await request(port, '/api/action', { method: 'POST', headers: { 'x-keep': '1' }, body: '{}' });
   assert.deepEqual(JSON.parse(action.body), { ok: true, actions: 1 });

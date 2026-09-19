@@ -74,8 +74,8 @@ const WATCHER_WINDOW_MS = 2 * 3600e3; // a turn older than this is history, not 
 const claudeProjectRoots = accounts.projectRoots();
 const claudeTranscriptIndex = require('./transcript-index').createMultiRootTranscriptIndex(claudeProjectRoots);
 const {
-  compactState, wantsCompactState, createJobChangeTracker, attachStateLines, shadowDecisionSummary,
-  wantsLightweightState, lightweightState, wantsConsoleState, consoleState,
+  createJobChangeTracker, attachStateLines, shadowDecisionSummary,
+  wantsConsoleState, consoleState,
   dashboardDetail, reviewQueueSearch,
 } = require('./dashboard-state');
 const { createDashboardWorker } = require('./dashboard-worker');
@@ -9864,14 +9864,14 @@ function start(deps = {}) {
   const ctx = {
     ATTENTION_KINDS, InjectionError, MOBILE_VIEWS, TAG_INSTRUCTION, TASK_INSTRUCTION,
     TURN_INDEX_BUDGET_BYTES, TURN_INDEX_BUDGET_MS, TURN_INDEX_PRUNE_LIMIT, WATCHER_CONCURRENCY,
-    WATCHER_TURNS_PER_TICK, WATCHER_WINDOW_MS, WEB_ROOT,
+    WATCHER_TURNS_PER_TICK, WATCHER_WINDOW_MS,
     abandonAccountHandoff, accounts, addHostSessionState, agentProcessRows, announceStateNote,
     answerSession, attentionAckKey, attentionAckName, buildState, cancelQueuedHandoff, cardUsage, closeEphemeralPane,
-    closeIdleSession, codex, compactSessionById, compactState, companionSnapshot, consoleState, daemonRestartGate,
+    closeIdleSession, codex, compactSessionById, companionSnapshot, consoleState, daemonRestartGate,
     dashboardDetail, deliverCheckToThread, deliverUnblockToThread, discord, driftWakeFromVerdict,
     envNumber, features, forceRestartSession, fs, handoffRateLimited, handoffSession, handoffSessionRequest, health, hostRequest,
     ideas,
-    inspectReviewQueueLaunch, keep, keepConsole, landed, launchReviewQueueSession, lightweightState,
+    inspectReviewQueueLaunch, keep, keepConsole, landed, launchReviewQueueSession,
     limitresume, listHostPanes, listPortableTransfers, liveSessionTick, liveTurnIndexSessions,
     loadCurrentSession, notifications, openCheckSession, openSession, path, portableTransferDraft,
     portableTransferPreview, preparePortableTransfer, prepareSessionSummary, projectMobileState,
@@ -9885,7 +9885,7 @@ function start(deps = {}) {
     startAutoCompact, startBriefScheduler, startHandoffQueue, startWtGcScheduler, summarize,
     transcriptFileForSession,
     transferSession,
-    unblock, updateSetAside, usage, wantsCompactState, wantsConsoleState, wantsLightweightState, watcherSend,
+    unblock, updateSetAside, usage, wantsConsoleState, watcherSend,
     withInjectionLock, writeTarget, writeToShellPane,
     broadcast, dashboardBuild, dashboardBuilder, deps, shutdown, terminalProfile,
     get json() { return json; },

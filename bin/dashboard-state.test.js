@@ -2,10 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  compactState,
-  wantsCompactState,
   lightweightState,
-  wantsLightweightState,
   consoleState,
   wantsConsoleState,
   CONSOLE_STATE_KEYS,
@@ -16,17 +13,6 @@ const {
   reviewQueueSearch,
   createJobChangeTracker,
 } = require('./dashboard-state');
-
-test('already-open consoles use compact state while legacy and CLI clients retain full responses', () => {
-  const url = new URL('http://localhost/api/state');
-  assert.equal(wantsCompactState({ headers: {} }, url), false);
-  assert.equal(wantsCompactState({ headers: { referer: 'http://localhost/' } }, url), false);
-  assert.equal(wantsCompactState({ headers: { referer: 'http://localhost/apple' } }, url), false);
-  assert.equal(wantsCompactState({ headers: { referer: 'http://localhost/app' } }, url), true);
-  assert.equal(wantsCompactState({ headers: { referer: 'http://localhost/app/' } }, url), true);
-  assert.equal(wantsCompactState({ headers: {} }, new URL(url + '?compact=1')), true);
-  assert.equal(wantsCompactState({ headers: { referer: 'http://localhost/app' } }, new URL(url + '?compact=0')), false);
-});
 
 test('a card-usage run stamp does not change a card detail version', () => {
   const usage = (updatedAt, calls = 3) => ({ since: 1, updatedAt, pending: false, issues: {}, input: 10, cacheRead: 0, cacheWrite: 0, output: 5, calls, models: {} });
@@ -42,11 +28,10 @@ test('a card-usage run stamp does not change a card detail version', () => {
     dashboardDetail({ tasks: [card(null)] }, 'task', 'card').version);
 });
 
-test('the session number reaches every client: compact, lightweight and exited rows keep num', () => {
+test('the session number reaches every client: summary and exited rows keep num', () => {
   const live = { id: 'live', num: 12, state: 'running' };
   const gone = { id: 'gone', num: 3, exited: true, state: 'exited', lastAssistantFull: 'answer', size: 10 };
   const state = { tasks: [], sessions: [live, gone], notifications: [], attention: [] };
-  assert.deepEqual(compactState(state).sessions.map((session) => session.num), [12, 3]);
   const light = lightweightState(state).sessions;
   assert.equal(light[0].num, 12);
   assert.equal(light[1].num, 3, 'an exited row is trimmed hard but keeps its number');
@@ -56,43 +41,19 @@ test('a hand-renamed session reaches every client with its name and the renamed 
   const live = { id: 'live', title: 'The finder', renamed: true, state: 'running' };
   const gone = { id: 'gone', title: 'The fixer', renamed: true, exited: true, state: 'exited', lastAssistantFull: 'answer', size: 10 };
   const state = { tasks: [], sessions: [live, gone], notifications: [], attention: [] };
-  assert.deepEqual(compactState(state).sessions.map((session) => [session.title, session.renamed]),
-    [['The finder', true], ['The fixer', true]]);
   const light = lightweightState(state).sessions;
   assert.deepEqual(light.map((session) => [session.title, session.renamed]),
     [['The finder', true], ['The fixer', true]], 'an exited row is trimmed hard but keeps its name');
 });
 
-test("a session's mark reaches every client: compact, lightweight and exited rows", () => {
+test("a session's mark reaches every client: summary and exited rows", () => {
   const fire = '\u{1f525}';
   const live = { id: 'live', mark: { color: 'red', emoji: fire }, state: 'running' };
   const gone = { id: 'gone', mark: { color: 'blue' }, exited: true, state: 'exited', lastAssistantFull: 'answer', size: 10 };
   const state = { tasks: [], sessions: [live, gone], notifications: [], attention: [] };
-  assert.deepEqual(compactState(state).sessions.map((session) => session.mark),
-    [{ color: 'red', emoji: fire }, { color: 'blue' }]);
   const light = lightweightState(state).sessions;
   assert.deepEqual(light.map((session) => session.mark),
     [{ color: 'red', emoji: fire }, { color: 'blue' }], 'an exited row is trimmed hard but keeps its mark');
-});
-
-test('console state removes unused histories while preserving inbox notes and safety flags', () => {
-  const state = {
-    tasks: [{ id: 'inbox', body: 'notes', fm: { title: 'Card' } }, { id: 'other', body: 'long history', lastLog: 'latest' }],
-    notifications: [{ card: 'inbox' }],
-    sessions: [{ id: 's', backgroundJobs: [{ id: 'job', status: 'completed' }], pendingBackground: true, unknownBackgroundJobs: ['unknown'], lastAssistantFull: 'answer' }],
-    attention: [{ sessionId: 's' }],
-  };
-  const before = JSON.stringify(state);
-  const compact = compactState(state);
-  assert.equal(compact.tasks[0].body, 'notes');
-  assert.equal(Object.hasOwn(compact.tasks[1], 'body'), false);
-  assert.equal(compact.tasks[1].lastLog, 'latest');
-  assert.equal(Object.hasOwn(compact.sessions[0], 'backgroundJobs'), false);
-  assert.equal(compact.sessions[0].pendingBackground, true);
-  assert.deepEqual(compact.sessions[0].unknownBackgroundJobs, ['unknown']);
-  assert.equal(compact.sessions[0].lastAssistantFull, 'answer');
-  assert.deepEqual(compact.attention, state.attention);
-  assert.equal(JSON.stringify(state), before, 'internal and legacy state is unmodified');
 });
 
 test('lightweight dashboard state preserves list context and moves opened content to details', () => {
@@ -212,13 +173,6 @@ test('dashboard detail validation and full review-note search stay explicit', ()
   assert.deepEqual(reviewQueueSearch(state, 'visible'), { ids: ['one'] });
   assert.throws(() => dashboardDetail(state, 'unknown', 'one'), (error) => error.status === 400);
   assert.throws(() => dashboardDetail(state, 'review', 'missing'), (error) => error.status === 404);
-});
-
-test('lightweight mode is opt-in and does not change compact or mobile query behavior', () => {
-  assert.equal(wantsLightweightState(new URL('http://localhost/api/state')), false);
-  assert.equal(wantsLightweightState(new URL('http://localhost/api/state?compact=1')), false);
-  assert.equal(wantsLightweightState(new URL('http://localhost/api/state?view=home')), false);
-  assert.equal(wantsLightweightState(new URL('http://localhost/api/state?summary=1')), true);
 });
 
 
@@ -455,13 +409,11 @@ test('console state reduces dead panes and their meta, and leaves live panes who
   assert.deepEqual(agentDead.panes[0].meta, { sessionId: 's' });
 });
 
-test('console mode is opt-in and leaves the summary and compact projections untouched', () => {
+test('console mode is opt-in and composes on the internal summary projection', () => {
   assert.equal(wantsConsoleState(new URL('http://localhost/api/state')), false);
-  assert.equal(wantsConsoleState(new URL('http://localhost/api/state?summary=1')), false);
-  assert.equal(wantsConsoleState(new URL('http://localhost/api/state?compact=1')), false);
+  assert.equal(wantsConsoleState(new URL('http://localhost/api/state?view=home')), false);
   assert.equal(wantsConsoleState(new URL('http://localhost/api/state?console=0')), false);
   assert.equal(wantsConsoleState(new URL('http://localhost/api/state?console=1')), true);
-  assert.equal(wantsLightweightState(new URL('http://localhost/api/state?console=1')), false);
 
   const state = consoleFixture();
   const light = lightweightState(state);
@@ -469,7 +421,7 @@ test('console mode is opt-in and leaves the summary and compact projections unto
   assert.deepEqual(light.landed, state.landed);
   assert.deepEqual(light.slack, state.slack);
   assert.deepEqual(light.defaults, state.defaults);
-  assert.equal(light.tasks.length, 4, 'the legacy board still sees every card');
+  assert.equal(light.tasks.length, 4, 'the summary projection still carries every card');
   assert.equal(light.sessions.find((session) => session.id === 'flagged-exited').lastAssistantFull, undefined);
   assert.equal(light.tasks[0].lastLog, 'latest log');
   assert.equal(light.sessions.find((session) => session.id === 'not-alive').lastUser, 'Large user prompt');

@@ -72,16 +72,23 @@ test('frontend returns loading until a real snapshot and serves every projection
   assert.equal(full.headers['x-keep-state-generated-at'], '1234');
   assert.equal(full.headers['x-keep-state-version'], '7');
   assert.equal(JSON.parse(full.body).tasks[0].body, 'full body');
-  assert.equal(JSON.parse((await request(f.port, '/api/state?summary=1')).body).tasks[0].body, undefined);
   const consoleBody = JSON.parse((await request(f.port, '/api/state?console=1')).body);
   assert.equal(consoleBody.tasks[0].body, undefined);
   assert.equal(consoleBody.tasks[0].lastLog, undefined);
-  assert.equal(consoleBody.digest, undefined, 'the console projection drops legacy-board fields');
+  assert.equal(consoleBody.digest, undefined, 'the console projection drops the fields it never renders');
   assert.deepEqual(Object.keys(consoleBody).sort(), ['attention', 'generatedAt', 'panes', 'reviewQueue', 'sessions', 'tasks']);
-  assert.equal(JSON.parse((await request(f.port, '/api/state', { headers: { referer: `http://localhost:${f.port}/app/` } })).body).tasks[0].body, undefined);
+  assert.equal(JSON.parse((await request(f.port, '/api/state?summary=1')).body).tasks[0].body, 'full body',
+    'the retired summary flag is ignored, not a separate projection');
+  assert.equal(JSON.parse((await request(f.port, '/api/state', { headers: { referer: `http://localhost:${f.port}/app/` } })).body).tasks[0].body, 'full body',
+    'a console referer no longer trims the full response');
   assert.equal(JSON.parse((await request(f.port, '/api/dashboard-detail?kind=task&id=task-1')).body).value.body, 'full body');
   assert.deepEqual(JSON.parse((await request(f.port, '/api/dashboard-review-search?q=needle')).body).ids, ['review-1']);
   assert.deepEqual(JSON.parse((await request(f.port, '/api/portable-transfers', { headers: { 'x-keep': '1' } })).body).transfers, [{ id: 'transfer-1' }]);
+
+  // The legacy board is gone: the frontend serves nothing at / and falls through
+  // to the daemon, which answers 404 for it.
+  await request(f.port, '/');
+  assert.equal(f.seen.at(-1)?.url, '/', 'the frontend no longer serves a page at /');
 
   const write = await request(f.port, '/api/action', { method: 'POST', headers: { 'x-keep': '1' }, body: '{}' });
   assert.equal(write.headers['x-keep-mutation-fence'], 'epoch:2');

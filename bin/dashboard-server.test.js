@@ -35,7 +35,7 @@ function request(port, pathname, options = {}) {
   });
 }
 
-test('real dashboard routes use the worker snapshot across full, lightweight, mobile, and detail responses', async (t) => {
+test('real dashboard routes use the worker snapshot across full, console, mobile, and detail responses', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-dashboard-server-'));
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-dashboard-home-'));
   const port = await freePort();
@@ -107,17 +107,15 @@ test('real dashboard routes use the worker snapshot across full, lightweight, mo
   assert.match(tail.body.text, /Tail written after dashboard snapshot/);
   assert.equal((await request(port, `/api/sessionsummary?id=${sessionId}`)).status, 200);
 
-  const light = await request(port, '/api/state?summary=1');
-  assert.equal(light.status, 200);
-  const lightTask = light.body.tasks.find((task) => task.id === 'route-card');
-  assert.equal(lightTask.body, undefined);
   const detail = await request(port, '/api/dashboard-detail?kind=task&id=route-card');
   assert.equal(detail.status, 200);
   assert.match(detail.body.value.body, /Full route body/);
-  assert.equal(detail.body.version, lightTask._detailVersion);
+
+  // The legacy board is deleted, so nothing is served at /.
+  assert.equal((await request(port, '/')).status, 404);
 
   // The console's own projection: the same list context, without the card
-  // histories or the top-level fields only the legacy board reads.
+  // histories or the top-level fields the console never renders.
   const consoleState = await request(port, '/api/state?console=1');
   assert.equal(consoleState.status, 200);
   assert.equal(consoleState.body.digest, undefined, 'the console never renders the digest');
@@ -125,7 +123,8 @@ test('real dashboard routes use the worker snapshot across full, lightweight, mo
   const consoleTask = consoleState.body.tasks.find((task) => task.id === 'route-card');
   assert.equal(consoleTask.body, undefined);
   assert.equal(consoleTask.lastLog, undefined);
-  assert.equal(consoleTask._detailVersion, lightTask._detailVersion);
+  assert.equal(consoleTask._detailVersion, detail.body.version,
+    'the detail route reports the version the console list advertised');
   assert.ok(Array.isArray(consoleState.body.panes));
 
   assert.equal((await request(port, '/api/state?view=needs')).status, 200);

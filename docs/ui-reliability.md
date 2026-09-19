@@ -3,9 +3,10 @@
 ## Request isolation
 
 `keep serve` gives the public TCP listener to a supervised child process. That
-process serves `/`, `/app`, allowlisted `/vendor` files, SSE, terminal WebSocket
-upgrades, layouts, portable-transfer summaries, and every `/api/state` projection
-from its last completed publication. The daemon keeps action ordering, injection
+process serves `/app`, allowlisted `/vendor` files, SSE, terminal WebSocket
+upgrades, layouts, portable-transfer summaries, and every `/api/state` projection —
+full, `console=1`, and the mobile `view=<name>` views — from its last completed
+publication. Nothing is served at `/`; it answers 404. The daemon keeps action ordering, injection
 locks, restart admission, and every authoritative mutation behind a mode-0600 Unix
 socket. The frontend authenticates the real public peer and Host before forwarding
 a request, strips forwarded identity headers, and uses a private per-process token
@@ -26,7 +27,7 @@ The focused isolation test deliberately blocks the daemon fixture for 10.5 secon
 node --require ./scripts/test-env.cjs --test bin/ui-request-worker.test.js
 ```
 
-It requires cached state, root/app/vendor assets, layouts, portable transfers, and
+It requires cached state, app/vendor assets, layouts, portable transfers, and
 an SSE heartbeat to respond in under one second. The same test covers one-shot
 action proxying and frontend-worker replacement with retained-state republish.
 

@@ -6,8 +6,7 @@ const http = require('node:http');
 const path = require('node:path');
 const keepConsole = require('./console.js');
 const {
-  compactState, lightweightState, consoleState, dashboardDetail, reviewQueueSearch,
-  wantsCompactState, wantsConsoleState,
+  lightweightState, consoleState, dashboardDetail, reviewQueueSearch, wantsConsoleState,
 } = require('./dashboard-state.js');
 const { MOBILE_VIEWS, projectMobileState } = require('./mobile-state.js');
 const { sendStateJson } = require('./state-response.js');
@@ -133,9 +132,6 @@ function createUiRequestServer(options = {}) {
     try {
       const url = new URL(req.url, 'http://localhost');
       if (!authorized(req)) return deny(res);
-      if (req.method === 'GET' && url.pathname === '/') {
-        return keepConsole.serveFile(res, path.join(webRoot, 'index.html'));
-      }
       const rawPath = String(req.url || '').split(/[?#]/, 1)[0];
       let traversal = false;
       if (rawPath.startsWith('/app/')) {
@@ -185,9 +181,7 @@ function createUiRequestServer(options = {}) {
         let value;
         try {
           value = view ? projectMobileState(current.state, view, url.searchParams.get('id') || '')
-            : wantsConsoleState(url) ? current.console
-              : url.searchParams.get('summary') === '1' ? current.lightweight
-                : wantsCompactState(req, url) ? current.compact : current.state;
+            : wantsConsoleState(url) ? current.console : current.state;
         } catch (error) {
           if (error.status === 400) return json(res, 400, { error: error.message });
           throw error;
@@ -258,9 +252,7 @@ function createUiRequestServer(options = {}) {
       const lightweight = lightweightState(state);
       current = {
         state,
-        lightweight,
         console: consoleState(state, lightweight),
-        compact: compactState(state),
         portableTransfers: Array.isArray(value.portableTransfers) ? value.portableTransfers : [],
         mutationFence: typeof value.mutationFence === 'string' ? value.mutationFence : '',
         generatedAt: value.generatedAt,

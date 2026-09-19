@@ -152,9 +152,10 @@ function reviewItemSummary(item) {
   return { ...summary, _detailVersion: detailVersion(item) };
 }
 
-// The dashboard list response keeps all counters, notifications, attention rows,
-// and operational state. Only per-item content that is rendered after opening an
-// item moves behind /api/dashboard-detail.
+// The internal list projection consoleState() composes on: it keeps all counters,
+// notifications, attention rows, and operational state, and moves only per-item
+// content that is rendered after opening an item behind /api/dashboard-detail.
+// Nothing serves it directly — /api/state answers full, console=1 or view=<name>.
 function lightweightState(state) {
   return {
     ...state,
@@ -168,10 +169,6 @@ function lightweightState(state) {
   };
 }
 
-function wantsLightweightState(url) {
-  return url.searchParams.get('summary') === '1';
-}
-
 function pick(source, fields) {
   const out = {};
   for (const field of fields) {
@@ -181,7 +178,7 @@ function pick(source, fields) {
 }
 
 // The web console (web/app) reads exactly these top-level fields. Everything the
-// legacy board at web/index.html needs but the console never renders — digest,
+// full /api/state response carries but the console never renders — digest,
 // alerts, brief, standup, landed, slack, defaults, the weekly rollups — is dropped.
 // A new top-level field the console reads must be added here AND to the allowlist
 // test in dashboard-state.test.js, or it silently arrives undefined in the browser.
@@ -248,12 +245,12 @@ function consolePane(pane) {
   return summary;
 }
 
-// The console's own projection: lightweight state, minus the top-level fields only
-// the legacy board reads, minus closed cards nothing points at, minus the detail
+// The console's own projection: lightweight state, minus the top-level fields the
+// console never renders, minus closed cards nothing points at, minus the detail
 // that exited sessions and dead panes carry for the full API shape.
 // `lightweight` is an optional already-built summary of the same state: the
-// frontend worker publishes both projections at once, and the detail-version
-// hashing over every card and session is the expensive half of the pass.
+// frontend worker builds it once per publication, and the detail-version hashing
+// over every card and session is the expensive half of the pass.
 function consoleState(state, lightweight) {
   const light = lightweight || lightweightState(state);
   const keep = referencedCardIds(light);
@@ -299,33 +296,6 @@ function reviewQueueSearch(state, query) {
   };
 }
 
-// The console only displays card histories in its notification inbox. Keep the
-// full API shape for legacy/read-only clients and all internal safety decisions.
-function compactState(state) {
-  const cards = new Set((state.notifications || []).map(entry => entry.card).filter(Boolean));
-  return {
-    ...state,
-    tasks: (state.tasks || []).map(task => {
-      if (cards.has(task.id)) return task;
-      const { body, ...summary } = task;
-      return summary;
-    }),
-    sessions: (state.sessions || []).map(session => {
-      const { backgroundJobs, ...summary } = session;
-      return summary;
-    }),
-  };
-}
-
-function wantsCompactState(req, url) {
-  if (url.searchParams.has('compact')) return url.searchParams.get('compact') === '1';
-  // Already-open consoles retain their JS across daemon restarts. Their field
-  // requirements are the same, so no window reload or PTY interruption is needed.
-  // The legacy dashboard lives at / and keeps the full response.
-  try { return /^\/app(?:\/|$)/.test(new URL(req.headers.referer).pathname); }
-  catch { return false; }
-}
-
 function createJobChangeTracker() {
   const signatures = new Map();
   return (key, result) => {
@@ -345,10 +315,7 @@ function createJobChangeTracker() {
 module.exports = {
   attachStateLines,
   shadowDecisionSummary,
-  compactState,
-  wantsCompactState,
   lightweightState,
-  wantsLightweightState,
   consoleState,
   wantsConsoleState,
   CONSOLE_STATE_KEYS,

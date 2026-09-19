@@ -414,21 +414,6 @@ test('multiple Codex rollouts produce one session and consistently select the ne
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('root dashboard excludes historical and exited sessions with the new activity states', () => {
-  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
-  const context = vm.createContext({});
-  vm.runInContext(html.slice(html.indexOf('function sessionInNow('), html.indexOf('function render()')), context);
-  for (const state of ['idle', 'done', 'exited', 'inactive', 'recent']) {
-    assert.equal(context.sessionInNow({ state, mtime: 0 }, 7200e3), false);
-  }
-  for (const state of ['running', 'waiting', 'needs-input']) {
-    assert.equal(context.sessionInNow({ state, mtime: 0 }, 7200e3), true);
-  }
-  assert.equal(context.sessionInNow({ state: 'idle', mtime: 7199e3 }, 7200e3), true);
-  context.state = { sessions: [{ state: 'idle', mtime: Date.now() - 7200e3 }] };
-  const liveLine = html.match(/const live = .*;/)[0];
-  assert.equal(vm.runInContext(`${liveLine}\nlive.length`, context), 0);
-});
 
 test('a finished child cannot leave its parent waiting for review when notification is missing', () => {
   transcript([

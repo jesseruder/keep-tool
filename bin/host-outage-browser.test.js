@@ -8,7 +8,7 @@ const os = require('node:os');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
 const WebSocket = require('ws');
-const { consoleState, lightweightState } = require('./dashboard-state');
+const { consoleState } = require('./dashboard-state');
 
 // The 2026-09-16 incident: a thrashing Mac left the host answering `hello` but not
 // `list`, so /api/state published no panes and every window read "no host pane".
@@ -43,8 +43,7 @@ test('isolated browser: an unresponsive terminal host is reported as unresponsiv
       if (url.pathname.startsWith('/api/')) {
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify(url.pathname === '/api/state'
-          ? (url.searchParams.get('console') === '1' ? consoleState(state)
-            : url.searchParams.get('summary') === '1' ? lightweightState(state) : state)
+          ? (url.searchParams.get('console') === '1' ? consoleState(state) : state)
           : url.pathname === '/api/layouts' ? { layouts: [{ name: 'Pinned', role: 'pinned', ids: [], cols: 1 }] }
             : { ok: true }));
         return;

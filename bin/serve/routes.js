@@ -14,18 +14,18 @@
 function routes(ctx) {
   const {
     // serve.js internals
-    ATTENTION_KINDS, InjectionError, MOBILE_VIEWS, TAG_INSTRUCTION, TASK_INSTRUCTION, WEB_ROOT,
+    ATTENTION_KINDS, InjectionError, MOBILE_VIEWS, TAG_INSTRUCTION, TASK_INSTRUCTION,
     abandonAccountHandoff, accounts, announceStateNote, answerSession, attentionAckKey, attentionAckName,
-    cancelQueuedHandoff, closeIdleSession, codex, compactSessionById, companionSnapshot, compactState, consoleState,
+    cancelQueuedHandoff, closeIdleSession, codex, compactSessionById, companionSnapshot, consoleState,
     daemonRestartGate, dashboardDetail, fs, handoffRateLimited, handoffSessionRequest, health, hostRequest,
     inspectReviewQueueLaunch,
-    keep, launchReviewQueueSession, lightweightState, listHostPanes, listPortableTransfers, notifications,
+    keep, launchReviewQueueSession, listHostPanes, listPortableTransfers, notifications,
     openSession, path, portableTransferDraft, portableTransferPreview, preparePortableTransfer,
     prepareSessionSummary, projectMobileState, recentTranscriptText, recoverReviewQueueLaunch, reminders,
     reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, restorePlan, review,
     reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow, runTaskNow, screenHistorySession, screenSession,
     sendSessionKeys, sendStateJson, sendToSessionLocked, sessionMarks, sessionNames, sessionSummaryFile, setAsideCandidates, summarize,
-    tellSession, transferSession, updateSetAside, wantsCompactState, wantsConsoleState, wantsLightweightState, withInjectionLock,
+    tellSession, transferSession, updateSetAside, wantsConsoleState, withInjectionLock,
     writeToShellPane,
     // start()'s own locals. onChange and onFocus are the module-level hooks start()
     // has already pointed at its broadcaster by the time routes() is called.
@@ -789,16 +789,6 @@ function routes(ctx) {
     },
     {
       method: null,
-      path: '/',
-      handle: async ({ res }) => {
-        // build the full body before writeHead so a failure can still send a clean 500
-        const body = fs.readFileSync(path.join(WEB_ROOT, 'index.html'));
-        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-        res.end(body);
-      },
-    },
-    {
-      method: null,
       path: '/api/state',
       handle: async ({ req, res, url }) => {
         const mobileView = url.searchParams.get('view');
@@ -815,9 +805,7 @@ function routes(ctx) {
         try {
           responseState = mobileView
             ? projectMobileState(enriched, mobileView, url.searchParams.get('id') || '')
-            : wantsConsoleState(url) ? consoleState(enriched)
-            : wantsLightweightState(url) ? lightweightState(enriched)
-            : wantsCompactState(req, url) ? compactState(enriched) : enriched;
+            : wantsConsoleState(url) ? consoleState(enriched) : enriched;
         } catch (error) {
           if (error.status === 400) return json(res, 400, { error: error.message });
           throw error;

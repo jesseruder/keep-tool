@@ -1821,16 +1821,6 @@ test('duplicate historical session links resolve to the newest explicit owner', 
   assert.deepEqual(sessionTaskOwners([...tasks].reverse()), { 'thread-1': 'actual-owner' });
 });
 
-test('dashboard keeps Needs you visible when attention is empty', () => {
-  const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'index.html'), 'utf8');
-  const render = html.match(/function renderAttention\(\) \{([\s\S]*?)\n\}/);
-  assert.ok(render, 'renderAttention function should exist');
-  assert.match(render[1], /\$\('attention'\)\.style\.display = '';/);
-  assert.doesNotMatch(render[1], /hasItems \? '' : 'none'/);
-  assert.match(html, /Nothing needs you right now/);
-  assert.match(html, /You’re caught up\./);
-});
-
 test('Codex completion marker does not ask for input', () => {
   const item = sessionAttentionItem({
     id: 'codex-thread',

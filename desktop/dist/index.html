@@ -46,7 +46,6 @@
       </div>
     </main>
     <script>
-      const stateUrl = "http://localhost:7777/api/state";
       const appUrl = "http://localhost:7777/app";
       const hint = document.querySelector("#hint");
 
@@ -56,7 +55,9 @@
 
       async function connect() {
         try {
-          await fetch(stateUrl, { mode: "no-cors", cache: "no-store" });
+          // Probe the console itself: a liveness check must not make the daemon
+          // serialize the whole dashboard state.
+          await fetch(appUrl, { mode: "no-cors", cache: "no-store" });
           location.replace(appUrl);
         } catch {
           setTimeout(connect, 1_500);

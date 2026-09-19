@@ -763,16 +763,9 @@ test('saving done again repairs a missing record without touching its sibling', 
   } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
 });
 
-test('dashboard renders recent unblock records with escaped fields and muted deliveries', () => {
-  const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'index.html'), 'utf8');
+test('the daemon publishes the last three days of unblock records', () => {
   const serve = fs.readFileSync(path.join(__dirname, 'serve.js'), 'utf8');
   assert.match(serve, /readRecords\(\{ root: keep\.ROOT, now, days: 3 \}\)/);
-  assert.match(html, /const unblockEntries = state\.unblocked \|\| \[\]/);
-  assert.match(html, /esc\(record\.dependent\)/);
-  assert.match(html, /esc\(record\.upstream\)/);
-  assert.match(html, /esc\(status\)/);
-  assert.match(html, /esc\(record\.attempts\)/);
-  assert.match(html, /record\.state === 'delivered' \? ' delivered' : ''/);
 });
 
 test('deps, brief, and resume surface unresolved or undelivered dependencies', () => {

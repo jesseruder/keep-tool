@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { WebSocketServer } = require('ws');
-const { dashboardDetail, lightweightState } = require('../../bin/dashboard-state');
+const { dashboardDetail } = require('../../bin/dashboard-state');
 
 async function createFixture() {
   const root = path.resolve(__dirname, '../..');
@@ -136,7 +136,7 @@ async function createFixture() {
           json({ ok: true, transfer, preview: portablePreviews.get(transfer.id) || '',
             ...(portableInputs.has(transfer.id) ? { inputs: portableInputs.get(transfer.id) } : {}) }); return;
         }
-        if (url.pathname === '/api/state') { json(url.searchParams.get('summary') === '1' ? lightweightState(state) : state); return; }
+        if (url.pathname === '/api/state') { json(state); return; }
         if (url.pathname === '/api/panes/spawn' && req.method === 'POST') {
           const id = `shell-${++launchSequence}`;
           const pane = { id, pid: 700 + launchSequence, alive: true, cwd: input.cwd,
