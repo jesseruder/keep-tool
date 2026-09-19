@@ -806,11 +806,26 @@ html.mobile .fleet .grp td { display: block; flex: 1 0 100%; }
 .mobile-only { display: none; }
 html.mobile .mobile-only { display: inline-flex; }
 
-/* Reviewer: the side panel stacks under the pane instead of beside it. */
-html.mobile #reviewer { flex-direction: column; min-width: 0; }
-html.mobile #reviewer .rterm { flex: 1 1 45%; min-height: 180px; }
-html.mobile #reviewer .rside, html.mobile #reviewer .rside.collapsed { display: flex; width: 100%; flex: 1 1 55%; min-height: 0; border-left: 0; border-top: 1px solid var(--line); }
+/* Reviewer: one column that scrolls, not a grid squeezed into 412px. Sharing the
+   height out (45/55) gave the head less room than its own buttons need, so the
+   actions spilled over the stat cells below and the pane collapsed to a few
+   pixels with its handoff panel floating free. Every band is content-sized here
+   and the mode scrolls instead. */
+html.mobile #reviewer { flex-direction: column; min-width: 0; overflow: auto; }
+html.mobile #reviewer .rterm { flex: 0 0 auto; min-width: 0; }
+html.mobile #reviewer .rside, html.mobile #reviewer .rside.collapsed { display: flex; width: 100%; flex: 0 0 auto; min-height: 0; border-left: 0; border-top: 1px solid var(--line); }
 html.mobile #reviewer .rside-strip { display: none; }
+html.mobile #reviewer .feed { flex: 0 0 auto; overflow: visible; }
+/* One action per row: the handoff chooser, its menu and the batch transfers are
+   a side-by-side cluster on a desktop and a stack of full-width buttons here. */
+html.mobile #rterm .acts { align-items: flex-start; }
+html.mobile #rterm .account-controls { flex: 1 0 100%; flex-direction: column; align-items: stretch; gap: 8px; }
+html.mobile #rterm .account-menu { position: static; width: 100%; min-width: 0; margin-top: 4px; box-shadow: none; }
+html.mobile #rterm .restart-controls { display: flex; flex: 1 0 100%; flex-wrap: wrap; gap: 8px; }
+html.mobile #rterm .account-handoff, html.mobile #rterm .account-handoff > summary { width: 100%; }
+/* The pane is a handoff panel on the phone, so give it a block of its own
+   rather than a share of a height this column no longer hands out. */
+html.mobile .review-terminal { flex: none; height: 168px; }
 html.mobile .rstats { grid-template-columns: repeat(2, 1fr); }
 html.mobile .rstat { padding: 10px 12px; border-bottom: 1px solid var(--line); }
 html.mobile .rstat .v { font-size: 17px; }

@@ -37,10 +37,17 @@ test('isolated browser: the console is usable on a 412px touch screen',
       { id: 'b', num: 12, kind: 'codex', title: 'Refactor the second project', project: beta, taskId: 'card-b',
         pane: 'pb', mtime: now - 60e3, lastUserAt: now - 60e3, state: 'running', endedTurn: false, gitBranch: 'master',
         accountId: 'codex-main', accountLabel: 'Codex Main' },
+      // The fleet reviewer: rate-limited on an account with somewhere to go, so
+      // the Reviewer tab renders the handoff chooser and the batch transfers
+      // that the desktop grid used to lay over the stat cells.
+      { id: 'r', num: 13, kind: 'claude', title: 'Fleet reviewer', project: alpha, reviewer: true,
+        pane: 'pr', mtime: now - 30e3, lastUserAt: now - 30e3, state: 'idle', endedTurn: true, gitBranch: 'master',
+        rateLimit: true, accountId: 'claude-main', accountLabel: 'Claude Main' },
     ];
     const panes = [
       { id: 'pa', pid: 101, alive: true, cwd: alpha, meta: { agent: 'claude', sessionId: 'a', project: alpha } },
       { id: 'pb', pid: 102, alive: true, cwd: beta, meta: { agent: 'codex', sessionId: 'b', project: beta } },
+      { id: 'pr', pid: 103, alive: true, cwd: alpha, meta: { agent: 'claude', sessionId: 'r', project: alpha } },
     ];
     const attention = [{
       key: 'q-a', kind: 'question', sessionId: 'a', taskId: 'card-a', pane: 'pa', project: alpha,
@@ -57,11 +64,24 @@ test('isolated browser: the console is usable on a 412px touch screen',
         // navigating to the review queue.
         { id: 'notice-plain', at: now - 5000, text: 'A plain heads-up with nothing to decide', from: 'Keep', caller: 'manual', read: false },
       ],
-      accounts: [{ id: 'claude-main', agent: 'claude', label: 'Claude Main', isDefault: true }],
-      usage: { accounts: { 'claude-main': { id: 'claude-main', agent: 'claude', label: 'Claude Main', limits: [{ label: 'weekly', used: 41, limit: 100 }] } } },
+      accounts: [
+        { id: 'claude-main', agent: 'claude', label: 'Claude Main', isDefault: true, handoffSupported: true },
+        { id: 'claude-spare', agent: 'claude', label: 'Claude Spare', handoffSupported: true },
+        { id: 'claude-tertiary', agent: 'claude', label: 'Claude Tertiary', handoffSupported: true },
+      ],
+      usage: { accounts: {
+        'claude-main': { id: 'claude-main', agent: 'claude', label: 'Claude Main', limits: [{ label: 'weekly', used: 41, limit: 100, percent: 41 }] },
+        'claude-spare': { id: 'claude-spare', agent: 'claude', label: 'Claude Spare', limits: [{ label: '5h', used: 2, limit: 100, percent: 2 }] },
+        'claude-tertiary': { id: 'claude-tertiary', agent: 'claude', label: 'Claude Tertiary', limits: [{ label: '5h', used: 9, limit: 100, percent: 9 }] },
+      } },
       health: { daemon: { running: true, pid: 321 }, schedulers: [{ name: 'runs', state: 'ok', displayState: 'ok' }] },
       hostStatus: { ok: true }, limitResume: {},
-      review: { events: [{ id: 'e1', at: now - 120e3, kind: 'finding', title: 'A finding to read on a phone', card: 'card-a', detail: 'Long enough to wrap on a narrow screen.' }], stats: { findings: 3, ideas: 2, ticks: 9, dismissed: 1 } },
+      review: {
+        events: [{ id: 'e1', at: now - 120e3, kind: 'finding', title: 'A finding to read on a phone', card: 'card-a', detail: 'Long enough to wrap on a narrow screen.' }],
+        stats: { findings: 3, ideas: 2, ticks: 9, dismissed: 1, lastTickAt: now - 600e3, tickIntervalMs: 3600e3,
+          medianContextTokens: 42000, weekly: { pointsOfWeek: 41.2, weekPercent: 41 },
+          reviewer: { id: 'r', state: 'idle', model: 'fable' } },
+      },
       reviewQueue: {
         items: [{ id: 'idea:card-a', type: 'idea', card: 'card-a', title: 'Make triage one-handed', body: 'The queue should be the screen.', project: alpha, status: 'needs-decision', at: now - 1000, sessions: [] }],
         counts: { 'needs-decision': 1, 'in-progress': 0, resolved: 0 },
@@ -217,6 +237,21 @@ test('isolated browser: the console is usable on a 412px touch screen',
       await noOverflow('triage');
       await shoot('triage-queue');
 
+      // ── A phone has no hardware keyboard, and a plain key that arrives anyway
+      // — a field losing focus, a stray Bluetooth press — used to run the
+      // desktop shortcuts: `w` put the console in the Layout mode the tab bar
+      // has no tab for, and `p` pinned whatever Triage had selected.
+      for (const key of ['w', 'r', 'e', 'p']) {
+        await evaluate(`document.body.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true }))`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(await evaluate("document.querySelector('#watch').classList.contains('on')"), false,
+        'a stray key does not open the desktop-only Layout mode');
+      assert.equal(await evaluate("document.querySelector('#triage').classList.contains('on')"), true,
+        'the phone stays on the tab it was on');
+      assert.equal(await evaluate("document.querySelector('#reviewer').classList.contains('on')"), false,
+        'and no other mode key fires either');
+
       // ── The rail is a sheet behind the filter button.
       assert.equal(await evaluate("document.querySelector('#mobileFilterSheet #rail') !== null"), true,
         'the project rail moved into the filter sheet');
@@ -270,6 +305,17 @@ test('isolated browser: the console is usable on a 412px touch screen',
         + " return rect.height >= 44 && rect.top >= 0 && rect.bottom <= window.innerHeight; })()"), true,
         'Open terminal is reachable without scrolling past the stage');
       await shoot('triage-stage');
+
+      // The row's actions menu stacks above the stage: one Back closes the menu
+      // and leaves the stage up, rather than taking both.
+      await evaluate("document.querySelector('#stage .session-actions > summary').click()");
+      await wait("document.querySelector('#stage .session-actions').open"
+        + " && history.state && history.state.keepOverlay === 'menu'");
+      await evaluate('history.back()');
+      await wait("!document.querySelector('#stage .session-actions').open"
+        + " && document.documentElement.classList.contains('mobile-stage-open')"
+        + " && history.state && history.state.keepOverlay === 'stage'");
+
       await evaluate("document.querySelector('.term-handoff-open').click()");
       await wait("(window.__shellPosts || []).some(message => message.type === 'openTerminal')");
       assert.equal(await evaluate("window.__shellPosts.find(message => message.type === 'openTerminal').pane"), 'pa');
@@ -320,6 +366,25 @@ test('isolated browser: the console is usable on a 412px touch screen',
       assert.equal(await evaluate("getComputedStyle(document.querySelector('#fleet thead')).display"), 'none',
         'the nine-column header is a desktop affordance');
       await shoot('fleet');
+
+      // Typing into the filter and having the daemon push new state must not
+      // take the field out from under the person's fingers — losing focus is
+      // what let a plain key reach the console's own shortcuts.
+      await evaluate("(() => { const input = document.querySelector('.fleetbar input');"
+        + " input.focus(); input.value = 'keep-mobile'; input.dispatchEvent(new Event('input'));"
+        + " input.setSelectionRange(4, 4); })()");
+      await wait("document.querySelector('.fleetbar input').value === 'keep-mobile'");
+      state.sessions[1].title = 'Refactor the second project once more';
+      for (const client of eventClients) client.write('data: {}\n\n');
+      await wait("document.body.textContent.includes('Refactor the second project once more')");
+      assert.equal(await evaluate("document.activeElement === document.querySelector('.fleetbar input')"), true,
+        'the fleet filter keeps focus across a background refresh');
+      assert.equal(await evaluate("document.querySelector('.fleetbar input').selectionStart"), 4,
+        'and keeps the caret where it was');
+      await evaluate("(() => { const input = document.querySelector('.fleetbar input');"
+        + " input.value = ''; input.dispatchEvent(new Event('input')); input.blur(); })()");
+      await wait("document.querySelector('#fleet [data-open-terminal=\"pb\"]')");
+
       await evaluate("document.querySelector('#fleet [data-open-terminal=\"pb\"]').click()");
       await wait("(window.__shellPosts || []).some(message => message.type === 'openTerminal' && message.pane === 'pb')");
 
@@ -333,7 +398,47 @@ test('isolated browser: the console is usable on a 412px touch screen',
       await noOverflow('reviewer');
       assert.equal(await evaluate("getComputedStyle(document.querySelector('#reviewer')).flexDirection"), 'column',
         'the reviewer side panel stacks under the pane');
+      // The desktop grid kept its columns at 412px: "Continue on another account"
+      // sat over TICKS TODAY, Restart over the actions header, and the embedded
+      // pane collapsed to a few pixels with its handoff panel floating over the
+      // stats. Every action, stat cell and the handoff button must have the
+      // screen to itself.
+      await evaluate(`window.__reviewerBoxes = () => {
+        const nodes = [...document.querySelectorAll('#rterm .acts .btn, #reviewStats .rstat, .review-terminal .term-handoff-open')]
+          .filter((node) => !node.closest('details:not([open])'));
+        const boxes = nodes.map((node) => ({ label: (node.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 32),
+          rect: node.getBoundingClientRect() })).filter((box) => box.rect.width > 0 && box.rect.height > 0);
+        const hits = [];
+        for (let i = 0; i < boxes.length; i += 1) {
+          for (let j = i + 1; j < boxes.length; j += 1) {
+            const a = boxes[i].rect; const b = boxes[j].rect;
+            if (a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1) {
+              hits.push(boxes[i].label + ' over ' + boxes[j].label);
+            }
+          }
+        }
+        return { count: boxes.length, hits, pane: document.querySelector('.review-terminal').getBoundingClientRect().height };
+      }`);
+      const reviewerBoxes = await evaluate('window.__reviewerBoxes()');
+      assert.ok(reviewerBoxes.count >= 7,
+        `the reviewer view rendered its actions and stats (only ${reviewerBoxes.count} boxes)`);
+      assert.deepEqual(reviewerBoxes.hits, [],
+        `the reviewer view overlaps itself: ${reviewerBoxes.hits.join('; ')}`);
+      assert.ok(reviewerBoxes.pane >= 100,
+        `the embedded pane keeps a block of its own (${Math.round(reviewerBoxes.pane)}px)`);
       await shoot('reviewer');
+
+      // The handoff chooser opens into the flow rather than over the batch
+      // transfers beside it, which is the pairing the phone actually showed.
+      await evaluate("document.querySelector('#rterm .account-handoff > summary').click()");
+      await wait("document.querySelector('#rterm .account-handoff').open");
+      const reviewerOpen = await evaluate('window.__reviewerBoxes()');
+      assert.ok(reviewerOpen.count > reviewerBoxes.count, 'the account menu is on screen');
+      assert.deepEqual(reviewerOpen.hits, [],
+        `the open account menu overlaps the reviewer view: ${reviewerOpen.hits.join('; ')}`);
+      await noOverflow('reviewer');
+      await shoot('reviewer-handoff');
+      await evaluate("document.querySelector('#rterm .account-handoff').removeAttribute('open')");
 
       // The inbox is a tab, so it owns a history entry like the sheets: Android's
       // Back closes it instead of walking out of the console with it still up.
@@ -345,14 +450,15 @@ test('isolated browser: the console is usable on a 412px touch screen',
         'the alerts inbox fits the screen');
       await shoot('alerts');
       await evaluate('history.back()');
+      // The Reviewer tab is showing, so what the inbox sat on is the tab's entry.
       await wait("!document.querySelector('#notificationsPanel').open"
-        + " && !(history.state && history.state.keepOverlay)");
+        + " && history.state && history.state.keepOverlay === 'tab'");
       // Closing it by its own control rewinds the entry rather than leaving it.
       await evaluate("document.querySelector('.mobile-alerts-tab').click()");
       await wait("document.querySelector('#notificationsPanel').open && history.state?.keepOverlay === 'alerts'");
       await evaluate("document.querySelector('#notificationsPanel [data-close]').click()");
       await wait("!document.querySelector('#notificationsPanel').open"
-        + " && !(history.state && history.state.keepOverlay)");
+        + " && history.state && history.state.keepOverlay === 'tab'");
       // A notification tap opens the inbox from the app, with no click behind it
       // and after the render that would otherwise have noticed — the dialog
       // itself is what the entry follows.
@@ -362,10 +468,48 @@ test('isolated browser: the console is usable on a 412px touch screen',
         'an inbox opened by a notification tap owns an entry too');
       await evaluate('history.back()');
       await wait("!document.querySelector('#notificationsPanel').open"
+        + " && history.state && history.state.keepOverlay === 'tab'");
+
+      // ── Standing on a tab other than Triage is an overlay too. Without an
+      // entry of its own, Android's Back walked out of the console and closed
+      // the app; now it lands on Triage, and only the next one leaves.
+      assert.equal(await evaluate('history.state && history.state.keepOverlay'), 'tab',
+        'a tab other than Triage owns one entry');
+      await evaluate('history.back()');
+      await wait("document.querySelector('#triage').classList.contains('on')"
         + " && !(history.state && history.state.keepOverlay)");
 
-      await evaluate("document.querySelector('.modes [data-mode=triage]').click()");
-      await wait("document.querySelector('#triage').classList.contains('on')");
+      // Fleet, then Queue, then Back: the whole non-Triage side is one entry, so
+      // Back is always a single step from Triage however far the tabs wandered.
+      await evaluate("document.querySelector('.modes [data-mode=fleet]').click()");
+      await wait("document.querySelector('#fleet').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'tab'");
+      const onTab = await evaluate('history.length');
+      await evaluate("document.querySelector('.modes [data-mode=review-queue]').click()");
+      await wait("document.querySelector('#review-queue').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'tab'");
+      assert.equal(await evaluate('history.length'), onTab,
+        'moving between tabs renames the entry rather than stacking another');
+      await evaluate('history.back()');
+      await wait("document.querySelector('#triage').classList.contains('on')"
+        + " && !(history.state && history.state.keepOverlay)");
+
+      // A sheet opened on another tab stacks above it: the first Back closes the
+      // sheet and stays on the tab, the second lands on Triage. (Projects is a
+      // Triage control; Status is the sheet the other tabs keep.)
+      await evaluate("document.querySelector('.modes [data-mode=fleet]').click()");
+      await wait("document.querySelector('#fleet').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'tab'");
+      await evaluate("document.querySelector('.mobile-status').click()");
+      await wait("document.querySelector('#mobileStatusSheet').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'status'");
+      await evaluate('history.back()');
+      await wait("!document.querySelector('#mobileStatusSheet').classList.contains('on')"
+        + " && document.querySelector('#fleet').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'tab'");
+      await evaluate('history.back()');
+      await wait("document.querySelector('#triage').classList.contains('on')"
+        + " && !(history.state && history.state.keepOverlay)");
       await noOverflow('triage');
 
       // ── Forward onto an entry we already closed must never leave the history
@@ -385,19 +529,27 @@ test('isolated browser: the console is usable on a 412px touch screen',
       assert.equal(await evaluate('history.length'), withStage, 'reopening reuses the entry, it does not stack another');
 
       // The same Forward onto a stage that cannot be restored (Fleet is showing)
-      // bounces straight back rather than sitting on a dead entry.
+      // bounces straight back rather than sitting on a dead entry. Leaving Triage
+      // pushes the tab's entry over the one the stage left behind, so the entry
+      // to bounce off is made here directly — it is the same dead entry a
+      // restored tab or a stale session would leave.
       await evaluate('history.back()');
       await wait("!document.documentElement.classList.contains('mobile-stage-open')");
       await evaluate("document.querySelector('.modes [data-mode=fleet]').click()");
-      await wait("document.querySelector('#fleet').classList.contains('on')");
+      await wait("document.querySelector('#fleet').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'tab'");
+      const onFleet = await evaluate('history.length');
+      await evaluate("history.pushState({ keepOverlay: 'stage' }, ''); history.back()");
+      await wait("history.state && history.state.keepOverlay === 'tab'");
       await evaluate('history.forward()');
       await new Promise((resolve) => setTimeout(resolve, 400));
-      assert.equal(await evaluate('history.state && history.state.keepOverlay'), null,
+      assert.equal(await evaluate('history.state && history.state.keepOverlay'), 'tab',
         'an unrestorable overlay entry is left immediately, not stood on');
       assert.equal(await evaluate("document.documentElement.classList.contains('mobile-stage-open')"), false);
-      assert.equal(await evaluate('history.length'), withStage, 'bouncing off it adds no entry either');
+      assert.equal(await evaluate('history.length'), onFleet + 1, 'bouncing off it adds no entry either');
       await evaluate("document.querySelector('.modes [data-mode=triage]').click()");
-      await wait("document.querySelector('#triage').classList.contains('on')");
+      await wait("document.querySelector('#triage').classList.contains('on')"
+        + " && !(history.state && history.state.keepOverlay)");
 
       // ── A shell that goes away unwinds what it pushed and gives the rail back.
       await evaluate("document.querySelector('.mobile-filter').click()");
@@ -441,7 +593,7 @@ test('isolated browser: the console is usable on a 412px touch screen',
         + " localStorage.setItem('keep-mode', 'watch')");
       await call('Page.navigate', { url: `${origin}/?desktop=1` });
       // Watch leaves #qlist unrendered, so wait on the state instead of a row.
-      await wait("document.querySelector('#connection')?.textContent === '2 sessions · 2 panes'");
+      await wait("document.querySelector('#connection')?.textContent === '3 sessions · 3 panes'");
       assert.equal(await evaluate("document.querySelector('#watch').classList.contains('on')"), true,
         'the remembered Watch still opens on a desktop');
       assert.equal(await evaluate("localStorage.getItem('keep-mode')"), 'watch',

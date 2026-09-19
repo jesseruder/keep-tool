@@ -27,7 +27,7 @@ import { createDetailStore } from './details.js';
 import { handleGradeKey } from './state-line.js';
 import { focusQueueItem, handleLeaveTerminalKey } from './leave-terminal.js';
 import { acknowledgeNotificationClick, installNotificationClicks, notificationPermission, notify, requestPermission, setBadge, shellReady } from './shell.js';
-import { installMobile, syncMobile } from './mobile.js';
+import { installMobile, mobileActive, syncMobile } from './mobile.js';
 
 applyTheme();
 
@@ -1408,7 +1408,7 @@ document.addEventListener('keydown', (event) => {
     if (key === 'Escape' || !inInput) { document.querySelector('#help').classList.remove('on'); event.preventDefault(); }
     return;
   }
-  if (key === '?' && !event.metaKey && !event.ctrlKey && !event.altKey && !inInput) {
+  if (key === '?' && !event.metaKey && !event.ctrlKey && !event.altKey && !inInput && !mobileActive()) {
     help.classList.add('on');
     event.preventDefault();
     return;
@@ -1438,6 +1438,12 @@ document.addEventListener('keydown', (event) => {
     return;
   }
   if (event.metaKey || event.ctrlKey || event.altKey || inInput || state.focused || termFocus) return;
+  // Below here every shortcut is a bare key, and the phone has no hardware
+  // keyboard to press one on purpose: a stray key that arrived when a field lost
+  // focus switched the console to Watch, which the tab bar has no tab for, and
+  // pinned whatever Triage had selected. Escape, the modified shortcuts and
+  // anything typed into a field are untouched.
+  if (mobileActive()) return;
   if (key === 'R' && event.shiftKey) { setDock(!state.dock); event.preventDefault(); return; }
   if (key === 'F' && event.shiftKey) { toggleFocus(); event.preventDefault(); return; }
   if (key === 'r' && !event.shiftKey) { setMode('reviewer'); event.preventDefault(); return; }

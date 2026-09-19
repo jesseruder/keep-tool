@@ -36,6 +36,10 @@ const borrowed = [];
 
 // Overlays are strictly last-in-first-out (a sheet always covers the stage), so
 // one history entry each is enough to make Android's back button unwind them.
+// Standing on a tab other than Triage is an overlay too — the `tab` entry, at
+// the bottom of the stack — because Back out of Fleet has to land on Triage
+// rather than close the app.
+//
 // The entry at history depth k names the k-th overlay, so the destination's
 // `keepOverlay` is always what the stack's top must be — which is how a Forward
 // onto an entry we already closed is recognised and undone.
@@ -93,6 +97,19 @@ function closeDroppedAlerts() {
   if (showing('alerts')) return;
   const dialog = alertsDialog();
   if (dialog?.open) dialog.close();
+}
+
+// The stage's actions menu (Pin to Watch, Rename, Relay to…, the renderer) is a
+// <details> the console opens and closes on its own. Without an entry of its own
+// one Back took the menu and the stage with it, so it joins the stack the way
+// the inbox does — by following the element, whichever path opened it.
+function onMenuToggle(event) {
+  if (!active || !(event.target instanceof Element) || !event.target.matches('.session-actions')) return;
+  if (event.target.open) open('menu'); else close('menu');
+}
+function closeDroppedMenu() {
+  if (showing('menu')) return;
+  document.querySelectorAll('.session-actions[open]').forEach((menu) => menu.removeAttribute('open'));
 }
 
 function sheet(id, label) {
@@ -201,6 +218,8 @@ function deactivate() {
   const pops = overlays.filter((entry) => entry.pushed).length;
   overlays.length = 0;
   closeDroppedAlerts();
+  closeDroppedMenu();
+  // The mode is the desktop console's own again; only the entries go.
   rewind(pops);
   giveBack();
   if (collapsedBefore) {
@@ -220,19 +239,30 @@ function apply({ booting = false } = {}) {
   if (!booting) ctx.refresh();
 }
 
-function open(name) {
+function open(name, mode) {
   if (!active || showing(name)) return;
   let pushed = false;
-  try { history.pushState({ keepOverlay: name }, ''); pushed = true; } catch {}
-  overlays.push({ name, pushed });
+  const entry = mode ? { keepOverlay: name, keepMode: mode } : { keepOverlay: name };
+  try { history.pushState(entry, ''); pushed = true; } catch {}
+  overlays.push({ name, pushed, mode });
   sync();
+}
+
+// Everything an entry owns is given up here, however it was dropped: by its own
+// control, by Back, or by the console re-rendering it away.
+function dropped(entries) {
+  closeDroppedAlerts();
+  closeDroppedMenu();
+  // Losing the tab entry is landing back on Triage.
+  if (entries.some((entry) => entry.name === 'tab') && ctx.state.mode !== 'triage') ctx.setMode('triage');
 }
 
 function close(name) {
   const index = overlays.findLastIndex((entry) => entry.name === name);
   if (index < 0) return;
-  const pops = overlays.splice(index).filter((entry) => entry.pushed).length;
-  closeDroppedAlerts();
+  const gone = overlays.splice(index);
+  const pops = gone.filter((entry) => entry.pushed).length;
+  dropped(gone);
   sync();
   rewind(pops);
 }
@@ -245,7 +275,18 @@ function toggle(name) {
 // leave the entry dead. The sheets need nothing but themselves; the stage needs
 // an item to show, and Triage to show it in; the inbox has to be reopened, and
 // claims the entry first so adopting it does not push a second one.
-function reopen(name) {
+function reopen(name, state) {
+  // The tab entry carries the tab it was pushed for, so Forward puts that tab
+  // back rather than guessing one.
+  if (name === 'tab') {
+    const mode = state?.keepMode;
+    if (!mode || mode === 'triage') return false;
+    overlays.push({ name, pushed: true, mode });
+    reconciling = true;
+    try { ctx.setMode(mode); } finally { reconciling = false; }
+    sync();
+    return true;
+  }
   if (name === 'alerts') {
     const dialog = alertsDialog();
     if (!dialog) return false;
@@ -263,7 +304,9 @@ function reopen(name) {
 }
 
 function onPopState(event) {
-  if (swallow > 0) { swallow -= 1; return; }
+  // One of ours landing: the stack is already right, but anything held back
+  // while it was in flight is settled now.
+  if (swallow > 0) { swallow -= 1; sync(); return; }
   const wanted = event?.state?.keepOverlay || null;
   if (!active) {
     // An entry left over from a shell that went away. Undo it so the history
@@ -274,8 +317,7 @@ function onPopState(event) {
   if (!wanted) {
     // Back out of the last overlay, or a navigation that was never ours.
     if (!overlays.length) return;
-    overlays.length -= 1;
-    closeDroppedAlerts();
+    dropped(overlays.splice(overlays.length - 1));
     sync();
     return;
   }
@@ -283,8 +325,8 @@ function onPopState(event) {
   if (top === wanted) return;
   const index = overlays.findLastIndex((entry) => entry.name === wanted);
   // Back over several at once.
-  if (index >= 0) { overlays.length = index + 1; closeDroppedAlerts(); sync(); return; }
-  if (!reopen(wanted)) rewind(1);
+  if (index >= 0) { dropped(overlays.splice(index + 1)); sync(); return; }
+  if (!reopen(wanted, event?.state)) rewind(1);
 }
 
 // Called at the end of every top-bar render: the tab bar, the two bar buttons
@@ -294,8 +336,44 @@ export function syncMobile() {
   sync();
 }
 
+// Read by the console's key handler: a phone has no hardware keyboard by
+// default, so the plain-key shortcuts must not fire behind a lost focus.
+export function mobileActive() { return active; }
+
+// Two overlays the console owns rather than this module: the tab, which it
+// switches for its own reasons as well as ours, and the actions menu, which a
+// re-render can take away without a toggle event. Both are reconciled from the
+// one place every render passes through, so the stack never drifts from what is
+// actually on the screen.
+let reconciling = false;
+function reconcile() {
+  // Never while one of our own history calls is in flight: pushing an entry on
+  // top of a pending go() would leave the stack naming an entry the traversal is
+  // about to move off. The swallowed popstate syncs again, which lands us here
+  // at the entry the console actually ends up on.
+  if (!active || reconciling || swallow > 0) return;
+  reconciling = true;
+  try {
+    if (showing('menu') && !document.querySelector('.session-actions[open]')) close('menu');
+    const entry = overlays.find((item) => item.name === 'tab');
+    const mode = ctx.state.mode;
+    if (mode === 'triage') { if (entry) close('tab'); }
+    else if (!entry) open('tab', mode);
+    else if (entry.mode !== mode) {
+      // One entry for the whole non-Triage side: moving between Fleet, Queue and
+      // the Reviewer renames it instead of stacking another, so Back from any of
+      // them is one step from Triage.
+      entry.mode = mode;
+      if (entry.pushed && overlays[overlays.length - 1] === entry) {
+        try { history.replaceState({ keepOverlay: 'tab', keepMode: mode }, ''); } catch {}
+      }
+    }
+  } finally { reconciling = false; }
+}
+
 function sync() {
   if (!built) return;
+  reconcile();
   const triage = ctx.state.mode === 'triage';
   // Focus mode is a stage the console holds open by itself; it needs no history
   // entry, because leaving it is a mode or a Focus toggle, not a back gesture.
@@ -340,6 +418,9 @@ export function installMobile(context) {
   // layout has to come up once the shell is there — and go away again if the
   // shell ever does, which is the only thing that deactivates it.
   window.addEventListener('keep-shell-hello', () => apply());
+  // `toggle` does not bubble, so the stage's actions menu is heard in the
+  // capture phase — the rows triage.js recycles need to know nothing about it.
+  document.addEventListener('toggle', onMenuToggle, true);
   // Selecting a queue row is what pushes the stage. Delegated, so the rows that
   // triage.js recycles on every refresh need to know nothing about the phone —
   // and in the capture phase, because the console's own handler re-renders the
