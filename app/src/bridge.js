@@ -31,14 +31,27 @@ function jsValue(value) {
     .replace(/</g, '\\u003c');
 }
 
+function shellDefinition({ platform = 'android', version = '' } = {}) {
+  return `window.keepShell = { platform: ${jsValue(String(platform))}, version: ${jsValue(String(version))}, post(message) { window.ReactNativeWebView.postMessage(JSON.stringify(message)); } };`;
+}
+
 // Runs before the console's own scripts, so the page can feature-detect the shell
 // (`window.keepShell`) on its first line and post to it right away.
-function bootstrapScript({ platform = 'android', version = '' } = {}) {
-  return `window.keepShell = { platform: ${jsValue(String(platform))}, version: ${jsValue(String(version))}, post(message) { window.ReactNativeWebView.postMessage(JSON.stringify(message)); } };\ntrue;`;
+function bootstrapScript(options) {
+  return `${shellDefinition(options)}\ntrue;`;
 }
 
 function shellReceiveScript(message) {
   return `window.keepShellReceive && window.keepShellReceive(${jsValue(message)});\ntrue;`;
+}
+
+// react-native-webview does not guarantee that the before-content-loaded injection
+// beats the page's own scripts on Android, so this runs again once the page has
+// loaded: it defines the shell if that injection lost the race, then says hello.
+// The console answers `hello` by switching to mobile mode and re-posting `ready`
+// and its last badge, which is why a second `ready` has to be harmless.
+function helloScript(options) {
+  return `if (!window.keepShell) { ${shellDefinition(options)} }\n${shellReceiveScript({ type: 'hello' })}`;
 }
 
 function text(value) {
@@ -72,6 +85,8 @@ function parseBridgeMessage(raw) {
   switch (text(parsed.type)) {
     case 'ready':
       return { type: 'ready' };
+    case 'unauthorized':
+      return { type: 'unauthorized' };
     case 'badge': {
       const count = Number(parsed.count);
       if (!Number.isFinite(count) || count < 0) return null;
@@ -98,7 +113,48 @@ function parseBridgeMessage(raw) {
   }
 }
 
-// `handlers` is the dispatch table: { ready, badge, notify, openTerminal, openExternal }.
+// The `keep-session` cookie the `?token=` bootstrap sets is opaque and lives only in
+// the daemon's memory, so every restart forgets it. Re-bootstrapping is therefore
+// ordinary rather than exceptional, and these rules keep it from becoming a loop:
+// the debounce guards *retries*, not the WebView's own first load, and two refusals
+// in a row stop the retrying and put the token in front of the person instead.
+const BOOTSTRAP_DEBOUNCE_MS = 10000;
+const BOOTSTRAP_STALE_MS = 5 * 60 * 1000;
+const BOOTSTRAP_MAX_FAILURES = 2;
+
+function bootstrapState() {
+  return { at: 0, failures: 0 };
+}
+
+// Pure: `{ action, state }` from the previous state, the trigger, and the clock.
+// `event.reason` is 'unauthorized' (a 403 on the top frame, or the console saying
+// so), 'foreground' (with `awayMs`), or 'ready' (the console came up).
+function decideBootstrap(state, event = {}, now = Date.now()) {
+  const at = Number(state?.at) || 0;
+  const previous = Number(state?.failures) || 0;
+  const reason = text(event.reason);
+
+  // The console is up, so the session works; whatever failed before it does not count.
+  if (reason === 'ready') return { action: 'ignore', state: { at, failures: 0 } };
+
+  // A short trip to another app does not cost the session, and reloading the console
+  // under someone who just switched back is worse than a stale page.
+  if (reason === 'foreground' && !(Number(event.awayMs) >= BOOTSTRAP_STALE_MS)) {
+    return { action: 'ignore', state: { at, failures: previous } };
+  }
+
+  const failures = reason === 'unauthorized' ? previous + 1 : previous;
+  if (failures >= BOOTSTRAP_MAX_FAILURES) return { action: 'show-error', state: { at, failures } };
+
+  // The first refusal since the console last came up always earns its retry: a
+  // session dropped by a daemon restart is the common case and recovers unnoticed.
+  if (reason === 'unauthorized' && failures === 1) return { action: 'bootstrap', state: { at: now, failures } };
+
+  if (at && now - at < BOOTSTRAP_DEBOUNCE_MS) return { action: 'ignore', state: { at, failures } };
+  return { action: 'bootstrap', state: { at: now, failures } };
+}
+
+// `handlers` is the dispatch table: { ready, unauthorized, badge, notify, openTerminal, openExternal }.
 // Returns the message that was dispatched, or null when nothing ran.
 function dispatchBridgeMessage(raw, handlers = {}) {
   const message = parseBridgeMessage(raw);
@@ -110,9 +166,15 @@ function dispatchBridgeMessage(raw, handlers = {}) {
 }
 
 module.exports = {
+  BOOTSTRAP_DEBOUNCE_MS,
+  BOOTSTRAP_MAX_FAILURES,
+  BOOTSTRAP_STALE_MS,
   bootstrapScript,
+  bootstrapState,
   consoleUrl,
+  decideBootstrap,
   dispatchBridgeMessage,
+  helloScript,
   normalizeServer,
   parseBridgeMessage,
   shellReceiveScript,

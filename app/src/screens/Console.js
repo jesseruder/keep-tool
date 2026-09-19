@@ -3,6 +3,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  AppState,
   BackHandler,
   Linking,
   Platform,
@@ -13,11 +14,15 @@ import {
 } from 'react-native';
 import { WebView } from 'react-native-webview';
 
-const { bootstrapScript, consoleUrl, dispatchBridgeMessage, shellReceiveScript } = require('../bridge');
+const {
+  bootstrapScript, bootstrapState, consoleUrl, decideBootstrap,
+  dispatchBridgeMessage, helloScript, shellReceiveScript,
+} = require('../bridge');
 
 // A console that never posts `ready` — an older daemon, or one whose scripts fail —
 // still has to become usable, so the overlay lifts shortly after the page loads.
 const READY_GRACE_MS = 2500;
+const TOKEN_ERROR = 'The console would not accept the saved session. Check the token in Setup.';
 
 function makeConsoleStyles(colors) {
   return StyleSheet.create({
@@ -51,18 +56,47 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
   const readyRef = useRef(false);
   const canGoBackRef = useRef(false);
   const graceRef = useRef(null);
+  const bootstrapRef = useRef(bootstrapState());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // Every load of the WebView is a bootstrap: the source is always the `?token=`
+  // URL, so remounting is how the shell asks the daemon for a fresh session.
+  const [bootstrapKey, setBootstrapKey] = useState(0);
 
   const uri = useMemo(() => consoleUrl(config.server, config.token), [config.server, config.token]);
   const origin = useMemo(() => originOf(uri), [uri]);
   const source = useMemo(() => ({ uri }), [uri]);
-  const bootstrap = useMemo(() => bootstrapScript({
+  const injection = useMemo(() => ({
     platform: Platform.OS,
     version: Constants.expoConfig?.version || Constants.nativeAppVersion || '',
   }), []);
+  const bootstrap = useMemo(() => bootstrapScript(injection), [injection]);
+  const hello = useMemo(() => helloScript(injection), [injection]);
 
   useEffect(() => () => { if (graceRef.current) clearTimeout(graceRef.current); }, []);
+
+  const loadBootstrap = useCallback(() => {
+    if (graceRef.current) clearTimeout(graceRef.current);
+    readyRef.current = false;
+    canGoBackRef.current = false;
+    setError(null);
+    setLoading(true);
+    setBootstrapKey((value) => value + 1);
+  }, []);
+
+  // Every re-bootstrap trigger goes through the same decision, so the debounce and
+  // the failure count cannot be sidestepped by whichever one happens to fire.
+  const trigger = useCallback((reason, extra = {}) => {
+    const { action, state } = decideBootstrap(bootstrapRef.current, { reason, ...extra });
+    bootstrapRef.current = state;
+    if (action === 'bootstrap') loadBootstrap();
+    else if (action === 'show-error') {
+      if (graceRef.current) clearTimeout(graceRef.current);
+      setLoading(false);
+      setError(TOKEN_ERROR);
+    }
+    return action;
+  }, [loadBootstrap]);
 
   const send = useCallback((message) => {
     if (!webRef.current) return false;
@@ -70,16 +104,14 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
     return true;
   }, []);
 
+  // Asked for by hand, so it starts over rather than counting against the retries.
   const hardReload = useCallback(() => {
-    readyRef.current = false;
-    canGoBackRef.current = false;
-    setError(null);
-    setLoading(true);
-    webRef.current?.reload();
-  }, []);
+    bootstrapRef.current = bootstrapState();
+    loadBootstrap();
+  }, [loadBootstrap]);
 
   // A console that is up redraws itself from the `reload` message, which keeps its
-  // scroll position and open panes; one that never came up needs the real reload.
+  // scroll position and open panes; one that never came up needs the real load.
   const reload = useCallback(() => {
     if (!error && readyRef.current && send({ type: 'reload' })) return;
     hardReload();
@@ -89,6 +121,19 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
     registerConsole({ send, reload, hardReload });
     return () => registerConsole(null);
   }, [hardReload, registerConsole, reload, send]);
+
+  // Sessions live in the daemon's memory alone, so a long spell in the background is
+  // reason enough to expect the session to be gone by the time the app is back.
+  useEffect(() => {
+    let awayAt = 0;
+    const subscription = AppState.addEventListener('change', (next) => {
+      if (next === 'active') {
+        if (awayAt) trigger('foreground', { awayMs: Date.now() - awayAt });
+        awayAt = 0;
+      } else if (!awayAt) awayAt = Date.now();
+    });
+    return () => subscription.remove();
+  }, [trigger]);
 
   // The console is a full app with its own history; the hardware back button walks
   // that first and only then falls through to the navigator.
@@ -106,18 +151,22 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
 
   const onMessage = useCallback((event) => {
     dispatchBridgeMessage(event.nativeEvent?.data, {
+      // `ready` arrives again whenever the console answers a `hello`, so it has to
+      // be safe to repeat.
       ready: () => {
         readyRef.current = true;
         if (graceRef.current) clearTimeout(graceRef.current);
         setLoading(false);
         setError(null);
+        trigger('ready');
       },
+      unauthorized: () => trigger('unauthorized'),
       badge: onBadge,
       notify: onNotify,
       openTerminal: onOpenTerminal,
       openExternal: (message) => { Linking.openURL(message.url).catch(() => {}); },
     });
-  }, [onBadge, onNotify, onOpenTerminal]);
+  }, [onBadge, onNotify, onOpenTerminal, trigger]);
 
   const failed = useCallback((description) => {
     if (graceRef.current) clearTimeout(graceRef.current);
@@ -168,15 +217,19 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
         domStorageEnabled
         injectedJavaScriptBeforeContentLoaded={bootstrap}
         javaScriptEnabled
+        key={bootstrapKey}
         mediaPlaybackRequiresUserAction={false}
         onError={(event) => failed(event.nativeEvent?.description)}
         onHttpError={(event) => {
           const { statusCode, url } = event.nativeEvent || {};
-          if (Number(statusCode) >= 400 && originOf(url) === origin) {
-            failed(`The server answered ${statusCode}. The saved token may no longer be valid.`);
-          }
+          if (originOf(url) !== origin) return;
+          // The WebView reports HTTP errors for the top frame only, so a 403 here is
+          // the session, not a stray request the console made.
+          if (Number(statusCode) === 403) trigger('unauthorized');
+          else if (Number(statusCode) >= 400) failed(`The server answered ${statusCode}.`);
         }}
         onLoadEnd={() => {
+          webRef.current?.injectJavaScript(hello);
           if (graceRef.current) clearTimeout(graceRef.current);
           graceRef.current = setTimeout(() => setLoading(false), READY_GRACE_MS);
         }}

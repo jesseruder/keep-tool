@@ -17,12 +17,23 @@ the same API. Three screens, on a React Navigation native stack:
 
 ### Bootstrap
 
-The WebView loads `<server>/app?token=<token>` once. The daemon sets an HttpOnly
-`keep-token` cookie and answers with a 302 to `/app`, so the token is not left in the
-address the page keeps. The WebView cookie jar persists across launches on Android,
-so later loads authenticate from the cookie alone. The native side still sends
-`x-keep-token` for the two things it does itself: the setup connection check and the
-15-minute background sweep that raises local notifications.
+The WebView always loads `<server>/app?token=<token>`. The daemon answers with a 302
+to `/app` after setting an opaque `keep-session` cookie, so the token is not left in
+the address the page keeps. That session lives only in the frontend worker's memory:
+**every daemon restart forgets it**, which makes re-bootstrapping ordinary rather
+than exceptional. The app reloads the `?token=` URL when
+
+- the Console screen mounts,
+- the app returns to the foreground after five minutes or more away,
+- the top frame gets an HTTP 403, or the console posts `{type:'unauthorized'}`.
+
+At most one of those lands per ten seconds, and two refusals in a row stop the
+retrying and show the native banner pointing at Setup — a wrong token cannot loop the
+WebView. `decideBootstrap` in `src/bridge.js` is that whole rule as a pure function.
+Nothing else in the app stores or reads the cookie.
+
+The native side still sends `x-keep-token` for the two things it does itself: the
+setup connection check and the 15-minute background sweep.
 
 ### Bridge
 
@@ -32,11 +43,18 @@ so later loads authenticate from the cookie alone. The native side still sends
 window.keepShell = { platform, version, post(message) { … } };
 ```
 
+That injection is not guaranteed to win the race against the page's own scripts on
+Android, so once the page has loaded the app injects it again if it is missing and
+then sends `{type:'hello'}`. The console answers a `hello` by switching to mobile
+mode and re-posting `ready` and its last badge, so **`ready` can arrive more than
+once** and the shell treats it as idempotent.
+
 Console → shell, via `window.keepShell.post(message)`:
 
 | message | effect |
 | --- | --- |
-| `{type:'ready'}` | hides the native loading overlay |
+| `{type:'ready'}` | hides the native loading overlay; clears the refusal count |
+| `{type:'unauthorized'}` | re-bootstraps, under the rules above |
 | `{type:'badge', count}` | sets the launcher badge |
 | `{type:'notify', title, body, key}` | schedules an immediate local notification carrying `key` |
 | `{type:'openTerminal', pane, session, title}` | opens the Terminal screen on that target |
@@ -48,8 +66,9 @@ Shell → console, if the page defines `window.keepShellReceive(message)`:
 
 | message | when |
 | --- | --- |
+| `{type:'hello'}` | the page has loaded; asks the console to re-announce itself |
 | `{type:'notificationClick', key}` | a notification is tapped, including from a cold start |
-| `{type:'reload'}` | the ⟳ button in the top bar; long-press reloads the WebView itself |
+| `{type:'reload'}` | the ⟳ button in the top bar; long-press re-bootstraps instead |
 
 The background sweep's own notifications have no console-issued key, so their `key` is
 the sweep's `kind:sessionId:since` and the session id travels with it.
