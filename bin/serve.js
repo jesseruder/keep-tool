@@ -2958,17 +2958,49 @@ function compactScreenConfirmed(screen, command) {
     && !/esc to (?:interrupt|cancel)|Compacting[.…]/i.test(screen);
 }
 
+const MODEL_SWITCH_STATUS = /(?:^|[^A-Za-z])(?:Set model to|Switched to) ([^\n]*)/;
+
+function modelSwitchFamily(command) {
+  const argument = String(command || '').replace(/^\s*\/model\s+/i, '').toLowerCase();
+  return ['opus', 'sonnet', 'haiku', 'fable'].find((candidate) => argument.includes(candidate)) || '';
+}
+
+function modelSwitchStatusNames(line, family) {
+  const status = String(line || '').match(MODEL_SWITCH_STATUS);
+  if (!status) return false;
+  if (!family) return true;
+  return new RegExp(family, 'i').test(status[1]);
+}
+
 function modelSwitchConfirmed(screen, command) {
-  const argument = String(command || '').replace(/^\s*\/model\s+/i, '');
-  const family = ['opus', 'sonnet', 'haiku', 'fable']
-    .find((candidate) => argument.toLowerCase().includes(candidate));
+  const family = modelSwitchFamily(command);
   // Match only below this command's final echo: the screen tail can retain an
   // earlier successful switch to the same family.
-  return linesAfterLastEcho(screen, command).some((line) => {
-    const status = line.match(/(?:^|[^A-Za-z])(?:Set model to|Switched to) ([^\n]*)/);
-    if (!status) return false;
-    if (!family) return true;
-    return new RegExp(family, 'i').test(status[1]);
+  return linesAfterLastEcho(screen, command).some((line) => modelSwitchStatusNames(line, family));
+}
+
+// The reading above anchors on the command's echo, and the echo has only ever been seen on
+// a /model that completed without a dialog. For one Keep answered itself, the anchor is the
+// answer instead: the model the dialog offered is now named by a status line that was not
+// on the screen when Enter was pressed. Without this a Claude Code that renders no echo
+// after the dialog would leave the swap record unresolved — which blocks delivery to the
+// session and re-types the restore every ten minutes for a day — on a switch that in fact
+// happened.
+//
+// The offered model rather than the family, and the head of the status rather than
+// anywhere in it, because neither half of the novelty test is airtight on its own: the
+// screen read is anchored to the pane's last non-blank row (renderScreen in bin/host.js),
+// so collapsing a dialog taller than the input box pulls rows back in at the top that were
+// pushed out when it opened, and those rows are "new". `Switched to branch 'wt/opus-fix'`
+// is an ordinary transcript row that the family reading alone would call a switch to Opus.
+function modelSwitchSettled(screen, offeredModel, screenWhenAnswered) {
+  const offered = normalizedText(offeredModel).toLowerCase();
+  if (!offered) return false;
+  const answered = new Set(String(screenWhenAnswered || '').split(/\r?\n/).map(normalizedText));
+  return String(screen || '').split(/\r?\n/).map(normalizedText).some((line) => {
+    if (answered.has(line)) return false;
+    const status = line.match(MODEL_SWITCH_STATUS);
+    return Boolean(status) && status[1].toLowerCase().startsWith(offered);
   });
 }
 
@@ -2982,15 +3014,50 @@ function worktreeExitPromptKeepsWorktree(screenText) {
   return claudePrompts.answerable(claudePrompts.recognize(screenText));
 }
 
-// Not a liveness reading: this scans the rows below the last echo of the command that
-// opened the dialog, where the heading can be above the slice and the footer not yet
-// drawn. waitForModelSwitch is watching for a dialog it asked for and is about to answer,
-// which is the one case the looser reading is for.
-function modelSwitchDialogVisible(screen, command) {
-  const lines = command === undefined
-    ? String(screen || '').split(/\r?\n/).map(normalizedText)
-    : linesAfterLastEcho(screen, command);
+// Any "Switch model?" text anywhere on the screen, live or retained. Neither reader of this
+// spends it on a key it would be wrong about: the restore leg presses Escape, which closes
+// a live dialog and does nothing at a prompt, and the wait only logs that a dialog it will
+// not answer is up. The reading that decides an Enter is modelSwitchDialogOffer.
+function modelSwitchDialogVisible(screen) {
+  const lines = String(screen || '').split(/\r?\n/).map(normalizedText);
   return claudePrompts.showsDialog('model-switch', lines.join('\n'));
+}
+
+// The model a dialog Keep may press Enter on is offering, for the command it typed, or ''.
+// The offered model is the answer's own anchor afterwards — see modelSwitchSettled.
+//
+// This cannot be anchored to that command's echo the way modelSwitchConfirmed is: Claude
+// Code takes the typed /model off the screen when it puts the confirmation up, and echoes
+// it into the transcript only once the switch completes, so while the dialog is open there
+// is no echo anywhere on the screen. Every compaction model swap on this machine waited out
+// its timeout below an echo that was not there, and not one was ever accepted.
+//
+// The dialog itself is the anchor instead, read the strict way, because this decides a
+// keystroke. recognize()'s `live` refuses a copy retained above anything that would take
+// the Enter, and the table below refuses a dialog whose Enter would mean something other
+// than the switch Keep asked for: a bare `Esc to cancel` footer (which is some other
+// affordance — see bin/claude-prompts.js), "No, go back" under the cursor, an option list
+// Claude Code has since grown a third entry on, or an offer to switch to a model nobody
+// asked for. The screens each of those reads are under bin/fixtures/claude-prompts/.
+function modelSwitchDialogOffer(screen, command) {
+  const match = claudePrompts.recognize(screen);
+  if (!match || !match.live || match.kind !== 'model-switch') return '';
+  if (!/Enter to confirm/i.test(match.footer || '')) return '';
+  const options = match.options || [];
+  if (options.length !== 2) return '';
+  const [yes] = options;
+  if (!yes.highlighted) return '';
+  const offer = String(yes.text || '').match(/^Yes, switch to\s+(.+)$/i);
+  if (!offer) return '';
+  // Unlike modelSwitchConfirmed, which only reads: with no family there is nothing left
+  // tying this dialog to Keep's own command, and a keystroke needs that.
+  const family = modelSwitchFamily(command);
+  if (!family || !new RegExp(family, 'i').test(offer[1])) return '';
+  return normalizedText(offer[1]);
+}
+
+function modelSwitchDialogAnswerable(screen, command) {
+  return Boolean(modelSwitchDialogOffer(screen, command));
 }
 
 function compactModelBase(value) {
@@ -3071,18 +3138,90 @@ async function waitForModelSwitch(target, command, sid, deps = {}) {
   const now = deps.now || Date.now;
   const read = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const press = deps.pressTargetKey || pressTargetKey;
+  const paneState = deps.livePaneState || livePaneState;
   const deadline = now() + envNumber('KEEP_MODEL_SWITCH_TIMEOUT_MS', 15000);
   let acceptedDialog = false;
+  let acceptedScreen = '';
+  let acceptedOffer = '';
+  let reportedUnanswerable = false;
+  let reportedUnguardable = false;
+  let reportedUnsnapshotted = false;
+  let reportedTooLate = false;
   while (now() < deadline) {
     await sleep(Math.min(500, deadline - now()));
     try {
       const screen = await read(target, 30, false);
       if (modelSwitchConfirmed(screen, command)) return true;
-      if (!acceptedDialog && modelSwitchDialogVisible(screen, command)) {
-        // Mark first: even an ambiguous transport failure must not cause a second Enter.
-        acceptedDialog = true;
-        await pressTargetKey(target, 'Enter', deps);
+      // Only once the dialog Keep answered no longer reads as one to press Enter at:
+      // while it is still up, the Enter was dropped or ignored, and a status line
+      // drifting into view says nothing about it.
+      if (acceptedDialog && !modelSwitchDialogAnswerable(screen, command)
+          && modelSwitchSettled(screen, acceptedOffer, acceptedScreen)) return true;
+      if (acceptedDialog) continue;
+      const offer = modelSwitchDialogOffer(screen, command);
+      if (!offer) {
+        // The dialog is on screen but is not one to press Enter at. This is the reading
+        // that went wrong silently for six scheduler runs, so it says so once per wait.
+        if (!reportedUnanswerable && modelSwitchDialogVisible(screen)) {
+          reportedUnanswerable = true;
+          process.stderr.write(`keep serve: a model-switch dialog for ${sid} is not answerable by Keep (${command})\n`);
+        }
+        continue;
+      }
+      // Two host round trips and a keystroke follow, and the deadline is otherwise only
+      // read at the top of the loop. A key with no poll left to see it land reports the
+      // switch unconfirmed whatever it does, and on the forward leg it puts Keep's Enter
+      // and the restore leg's Escape at the same dialog at once. Declining says so: a
+      // timeout under a second declines every iteration, and an operator reading nothing
+      // but "model switch unconfirmed" is how this signature stayed invisible for six runs.
+      if (deadline - now() < 500) {
+        if (!reportedTooLate) {
+          reportedTooLate = true;
+          process.stderr.write(`keep serve: not answering the model-switch dialog for ${sid}: too little of the wait is left to see the switch land\n`);
+        }
+        continue;
+      }
+      // Taken before the evidence the key is spent on, so the host refuses the Enter
+      // outright if anything reached the pane since — rather than submitting a message a
+      // viewer started typing at the dialog meanwhile.
+      const pane = await paneState((target && target.pane) || 'unknown', deps);
+      if (!pane) {
+        if (!reportedUnguardable) {
+          reportedUnguardable = true;
+          process.stderr.write(`keep serve: not answering the model-switch dialog for ${sid}: the pane's input count is unreadable\n`);
+        }
+        continue;
+      }
+      // The whole visible pane, not the 30 rows the dialog was found in: opening a dialog
+      // taller than the input box pushes rows off the top of a short read, and collapsing
+      // it gives them back, where modelSwitchSettled would read them as new. Read after
+      // the count above, so unlike the screen that found the dialog this one is inside
+      // what the guard covers — which is why it, and not that screen, has to still show
+      // the dialog, and why a read that fails here costs the Enter rather than falling
+      // back to a snapshot already known to be too small to tell a new row from an old one.
+      const snapshot = await read(target, 200, false).catch(() => null);
+      if (!snapshot || modelSwitchDialogOffer(snapshot, command) !== offer) {
+        if (!reportedUnsnapshotted) {
+          reportedUnsnapshotted = true;
+          process.stderr.write(`keep serve: not answering the model-switch dialog for ${sid}: ${snapshot
+            ? 'it is no longer the dialog the input count was taken at'
+            : 'the whole pane could not be read back'}\n`);
+        }
+        continue;
+      }
+      // Both round trips above are spent by now. Nothing is gained by a key the wait has
+      // already run out of time to watch.
+      if (now() >= deadline) continue;
+      // Mark first: even an ambiguous transport failure must not cause a second Enter.
+      acceptedDialog = true;
+      acceptedOffer = offer;
+      acceptedScreen = snapshot;
+      try {
+        await press(target, 'Enter', deps, { expectedInputCount: pane.inputCount, expectedPid: pane.pid });
         process.stderr.write(`keep serve: accepted the model-switch dialog for ${sid} (${command})\n`);
+      } catch (error) {
+        process.stderr.write(`keep serve: the model-switch dialog for ${sid} was not answered: ${String(error && error.message || error)}\n`);
       }
     } catch {}
   }
@@ -9929,6 +10068,9 @@ module.exports = {
   compactScreenConfirmed,
   modelSwitchConfirmed,
   modelSwitchDialogVisible,
+  modelSwitchDialogOffer,
+  modelSwitchDialogAnswerable,
+  waitForModelSwitch,
   worktreeExitPromptKeepsWorktree,
   repairClaudeSettingsModel,
   pickNotifyTarget,

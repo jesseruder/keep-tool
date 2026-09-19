@@ -48,6 +48,9 @@ const {
   compactScreenConfirmed,
   modelSwitchConfirmed,
   modelSwitchDialogVisible,
+  modelSwitchDialogOffer,
+  modelSwitchDialogAnswerable,
+  waitForModelSwitch,
   worktreeExitPromptKeepsWorktree,
   codexTypedTextVisible,
   pendingCompactSwaps,
@@ -3024,7 +3027,7 @@ test('model switch confirmation accepts exact success lines and rejects failure 
   assert.equal(modelSwitchConfirmed(`${haikuEcho}\n${haikuSuccess}`, '/model claude-haiku-4-5-20251001'), true);
 });
 
-test('model switch state is anchored after the last echo of the full command', () => {
+test('a model switch is confirmed only after the last echo of the full command', () => {
   const oldResult = '⎿ Set model to Sonnet 5 and saved as your default for new sessions';
   const pending = [
     '❯ /model sonnet',
@@ -3038,10 +3041,275 @@ test('model switch state is anchored after the last echo of the full command', (
   ].join('\n');
 
   assert.equal(modelSwitchConfirmed(pending, '/model sonnet'), false);
-  assert.equal(modelSwitchDialogVisible(pending, '/model sonnet'), true);
   assert.equal(modelSwitchConfirmed(`${pending}\n${oldResult}`, '/model sonnet'), true);
   assert.equal(modelSwitchConfirmed('⎿ Set model to Sonnet 5', '/model sonnet'), false);
-  assert.equal(modelSwitchDialogVisible('Switch model?\n❯ 1. Yes, switch to Sonnet 5', '/model sonnet'), false);
+  assert.equal(modelSwitchDialogAnswerable(pending, '/model sonnet'), false,
+    'a dialog whose footer has not rendered is not one to press Enter at');
+  assert.equal(modelSwitchDialogAnswerable('Switch model?\n❯ 1. Yes, switch to Sonnet 5', '/model sonnet'), false,
+    'a half-drawn dialog is not one to press Enter at');
+});
+
+// The compaction model swap had never once worked on this machine: review-compact failed
+// six times in a row with "model switch unconfirmed" (sched:review-compact:00c64ee5) and
+// "accepted the model-switch dialog" had never been logged at all, while the finally block
+// escaped a stale dialog after every attempt. Claude Code clears the typed /model when it
+// puts the Switch model? confirmation up and echoes the command only once the switch
+// completes, so waitForModelSwitch — reading only the rows below that echo — was blind to
+// the dialog it had itself just asked for, and waited out its timeout with it still open.
+//
+// Answering a dialog is a keystroke into a live pane, so these pin what must never happen
+// as hard as what must. model-switch.txt is the captured screen; the four refusal screens
+// are constructed from it, as worktree-exit-out-of-order.txt already is for its dialog.
+// node --test --require ./scripts/test-env.cjs bin/serve.test.js
+const claudePromptFixture = (name) => fs.readFileSync(
+  path.join(__dirname, 'fixtures', 'claude-prompts', `${name}.txt`), 'utf8');
+
+test('the model switch dialog Keep opened is the only one it presses Enter at', () => {
+  const dialog = claudePromptFixture('model-switch');
+  assert.doesNotMatch(dialog, /\/model/,
+    'the captured dialog screen carries no echo of the command that opened it');
+
+  assert.equal(modelSwitchDialogAnswerable(dialog, '/model sonnet'), true,
+    'the live dialog offering the requested model is answered with no echo left on screen');
+
+  assert.equal(modelSwitchDialogAnswerable(dialog, '/model opus'), false,
+    'a dialog offering a model this command did not ask for is never answered');
+  assert.equal(modelSwitchDialogAnswerable(claudePromptFixture('model-switch-retained-above-live'), '/model sonnet'),
+    false, 'a dialog retained above a live input box never takes the Enter');
+  assert.equal(modelSwitchDialogAnswerable(claudePromptFixture('model-switch-no-go-back'), '/model sonnet'),
+    false, 'Enter is never pressed with "No, go back" under the cursor');
+  assert.equal(modelSwitchDialogAnswerable(claudePromptFixture('model-switch-esc-only-footer'), '/model sonnet'),
+    false, 'a footer offering only Esc is some other affordance, and Enter is not its answer');
+  assert.equal(modelSwitchDialogAnswerable(claudePromptFixture('model-switch-extra-option'), '/model sonnet'),
+    false, 'an option list Claude Code has grown an entry on is a dialog whose Enter means something new');
+  // Constructed, not captured: a dialog Keep does not know, wearing the one option text it
+  // does. Claude Code answers none of these itself (bin/claude-prompts.js), and neither may
+  // a reading that no longer has the command's echo to tell it whose dialog this is.
+  const unknownDialog = [
+    '  Restart this session on a different model?',
+    '',
+    '  ❯ 1. Yes, switch to Sonnet 5',
+    '    2. No, go back',
+    '',
+    '  Enter to confirm · Esc to cancel',
+  ].join('\n');
+  assert.equal(modelSwitchDialogAnswerable(unknownDialog, '/model sonnet'), false,
+    'a dialog Keep cannot name is never answered, whatever its options say');
+
+  assert.equal(modelSwitchDialogAnswerable(dialog, '/model some-new-family'), false,
+    'a command naming no family Keep knows cannot claim a dialog as its own');
+  assert.equal(modelSwitchDialogAnswerable(dialog, ''), false,
+    'a swap record with no restore command answers nobody\'s dialog');
+  assert.equal(modelSwitchDialogAnswerable(dialog, null), false,
+    'a missing command answers nobody\'s dialog');
+
+  assert.equal(modelSwitchDialogOffer(dialog, '/model sonnet'), 'Sonnet 5',
+    'the answer carries the model the dialog offered, which is what confirms the switch later');
+
+  // The restore leg reads the loose whole-screen one instead, because all it decides is an
+  // Escape; it has to see copies the answerable reading refuses, retained ones included.
+  assert.equal(modelSwitchDialogVisible(claudePromptFixture('model-switch-retained-above-live')), true,
+    'the restore leg sees a model-switch dialog wherever it sits, to escape it');
+});
+
+test('the model switch dialog is answered when Claude Code has taken the typed /model off the screen', async () => {
+  const dialog = claudePromptFixture('model-switch');
+  const status = '  ⎿  Set model to Sonnet 5 and saved as your default for new sessions';
+  const echoed = ['❯ /model sonnet', status, '', '❯'].join('\n');
+  // The same switch if Claude Code renders no echo for a command a dialog completed: only
+  // the status line is new, and it is what the answer is read from instead.
+  const unechoed = [status, '', '❯'].join('\n');
+
+  const run = async (screenAt, over = {}) => {
+    const keys = [];
+    const guards = [];
+    let at = 0;
+    const ok = await waitForModelSwitch({ pane: 'pane-8' }, over.command || '/model sonnet', '#8', {
+      now: () => at,
+      sleep: async (ms) => { at += Math.max(1, ms); },
+      // The wait reads 30 rows to find the dialog, then the whole pane to re-prove it is
+      // still there under the input count it just took, and to remember what was on it.
+      readScreen: async (target, lines) => {
+        if (lines <= 30) return screenAt(keys.length);
+        if (over.wholePaneFails) throw new Error('pane is gone');
+        return (over.wholePane || screenAt)(keys.length);
+      },
+      livePaneState: over.livePaneState || (async () => ({ inputCount: 7, pid: 4242 })),
+      pressTargetKey: async (target, key, deps, options) => {
+        keys.push(key);
+        guards.push(options);
+        if (over.pressThrows) throw over.pressThrows();
+      },
+    });
+    return { ok, keys, guards };
+  };
+
+  const answered = await run((pressed) => (pressed ? echoed : dialog));
+  assert.deepEqual(answered.keys, ['Enter'], 'the dialog Keep opened is answered with one Enter');
+  assert.deepEqual(answered.guards, [{ expectedInputCount: 7, expectedPid: 4242 }],
+    'the Enter is refused by the host if anything reached the pane since the screen was read');
+  assert.equal(answered.ok, true,
+    'the switch is confirmed once the completed command echoes below the dialog');
+
+  const withoutEcho = await run((pressed) => (pressed ? unechoed : dialog));
+  assert.deepEqual(withoutEcho.keys, ['Enter'], 'the dialog is answered once either way');
+  assert.equal(withoutEcho.ok, true,
+    'a switch Keep answered is confirmed by a status line that was not there when it pressed Enter');
+
+  // An earlier switch to the same model is routinely still in the screen tail. The echo is
+  // what usually keeps it from being read as this switch, so with no echo the answer has to
+  // be a line that was not already there.
+  const staleOnly = await run((pressed) => (pressed ? [status, '', '❯'].join('\n') : [status, dialog].join('\n')));
+  assert.deepEqual(staleOnly.keys, ['Enter'], 'the dialog is still the one Keep answers');
+  assert.equal(staleOnly.ok, false,
+    'a status line already on screen when Enter was pressed confirms nothing');
+
+  // The screen read ends at the pane's last non-blank row, so a dialog taller than the
+  // input box pushes rows off the top of a 30-row read and gives them back when it closes.
+  // Those rows are older than the Enter, and the whole-pane snapshot is what knows it.
+  const displaced = await run(
+    (pressed) => (pressed ? [status, '', '❯'].join('\n') : dialog),
+    { wholePane: () => [status, dialog].join('\n') },
+  );
+  assert.deepEqual(displaced.keys, ['Enter'], 'the dialog is answered from the 30-row read');
+  assert.equal(displaced.ok, false,
+    'a row the dialog had pushed out of the short read is not new when the dialog gives it back');
+
+  // "Switched to branch '...'" is an ordinary transcript row, and the branch here carries
+  // the family name. The model the dialog offered is what the status has to name.
+  const opusDialog = dialog.replace(/Sonnet 5/g, 'Opus 5');
+  const branchLine = "  ⎿  Switched to branch 'wt/opus-review-runner'";
+  const branch = await run(
+    (pressed) => (pressed ? [branchLine, '', '❯'].join('\n') : opusDialog),
+    { command: '/model opus' },
+  );
+  assert.deepEqual(branch.keys, ['Enter'], 'the opus dialog is answered');
+  assert.equal(branch.ok, false,
+    'a line that merely contains the model family is not a switch to that model');
+
+  const namedBranch = await run(
+    (pressed) => (pressed ? ["  ⎿  Switched to branch 'Opus 5 rollout'", '', '❯'].join('\n') : opusDialog),
+    { command: '/model opus' },
+  );
+  assert.equal(namedBranch.ok, false,
+    'nor is a line that contains the offered model somewhere other than where the status names it');
+
+  // The Enter can be dropped — by the host guard, or by a viewer answering first. Until
+  // the dialog is gone, a status line drifting into view says nothing about Keep's key.
+  const stillOpen = await run((pressed) => (pressed ? [status, dialog].join('\n') : dialog));
+  assert.deepEqual(stillOpen.keys, ['Enter'], 'the dialog is never pressed a second time');
+  assert.equal(stillOpen.ok, false,
+    'a switch is not confirmed while the dialog Keep answered is still on screen');
+
+  const unanswered = await run(() => dialog);
+  assert.deepEqual(unanswered.keys, ['Enter'],
+    'a dialog that never resolves is never pressed a second time');
+  assert.equal(unanswered.ok, false, 'a switch that never lands is still reported unconfirmed');
+
+  const retained = await run(() => claudePromptFixture('model-switch-retained-above-live'));
+  assert.deepEqual(retained.keys, [],
+    'a dialog retained above a live input box is never answered, whatever the timeout costs');
+  assert.equal(retained.ok, false, 'and the switch is reported unconfirmed instead');
+
+  // The ordinary /model, which completes with no dialog at all. This is the path that
+  // worked before the dialog reading existed, and nothing else here exercises it.
+  const noDialog = await run(() => echoed);
+  assert.deepEqual(noDialog.keys, [], 'a switch that needs no confirmation is never pressed at');
+  assert.equal(noDialog.ok, true, 'and it is confirmed from its own echo');
+
+  // The dialog offered Sonnet 5; the status names Sonnet 4.5. Same family, wrong model.
+  const wrongModel = await run((pressed) => (pressed
+    ? ['  ⎿  Set model to Sonnet 4.5 and saved as your default for new sessions', '', '❯'].join('\n')
+    : dialog));
+  assert.deepEqual(wrongModel.keys, ['Enter'], 'the dialog is answered');
+  assert.equal(wrongModel.ok, false,
+    'a status naming another model of the same family is not the switch the dialog offered');
+
+  const unreadableSnapshot = await run(() => dialog, { wholePaneFails: true });
+  assert.deepEqual(unreadableSnapshot.keys, [],
+    'no Enter is sent when the pane cannot be re-read under the input count it was counted at');
+  assert.equal(unreadableSnapshot.ok, false, 'and the switch is reported unconfirmed instead');
+
+  // Between the input count and the key, the dialog went away — whoever closed it did so
+  // under a count this Enter no longer matches, so the Enter is not sent.
+  const closedMeanwhile = await run(() => dialog, { wholePane: () => ['', '❯'].join('\n') });
+  assert.deepEqual(closedMeanwhile.keys, [],
+    'a dialog gone by the time the guarded read comes back is not answered');
+  assert.equal(closedMeanwhile.ok, false, 'and the switch is reported unconfirmed instead');
+
+  // The count is what the host compares the key against, so the screen the key is spent on
+  // has to be read after it. Read the other way round and a viewer's Esc-then-type lands in
+  // the count's blind spot, and the Enter it justified submits their half-written message.
+  const ordering = await (async () => {
+    const keys = [];
+    let counted = false;
+    let at = 0;
+    const ok = await waitForModelSwitch({ pane: 'pane-8' }, '/model sonnet', '#8', {
+      now: () => at,
+      sleep: async (ms) => { at += Math.max(1, ms); },
+      readScreen: async (target, lines) => (lines <= 30 || !counted ? dialog : ['', '❯'].join('\n')),
+      livePaneState: async () => { counted = true; return { inputCount: 7, pid: 4242 }; },
+      pressTargetKey: async (target, key) => { keys.push(key); },
+    });
+    return { ok, keys };
+  })();
+  assert.deepEqual(ordering.keys, [],
+    'the input count is taken before the screen the Enter is spent on, so a key the count absorbed cannot justify it');
+  assert.equal(ordering.ok, false, 'and the switch is reported unconfirmed instead');
+
+  // Two host round trips and a keystroke follow the decision, and the deadline is read
+  // only at the top of the loop. The step here is deliberately not 500ms: the last poll
+  // lands short of the deadline, so what this pins is the headroom, not `now() >= deadline`.
+  const lateDialog = await (async () => {
+    const keys = [];
+    let at = 0;
+    const ok = await waitForModelSwitch({ pane: 'pane-8' }, '/model sonnet', '#8', {
+      now: () => at,
+      sleep: async () => { at += 300; },
+      readScreen: async () => (at >= 14700 ? dialog : ['', '❯'].join('\n')),
+      livePaneState: async () => ({ inputCount: 7, pid: 4242 }),
+      pressTargetKey: async (target, key) => { keys.push(key); },
+    });
+    return { ok, keys };
+  })();
+  assert.deepEqual(lateDialog.keys, [],
+    'a dialog Keep has too little of the wait left to watch land is declined, not answered');
+  assert.equal(lateDialog.ok, false, 'and the switch is reported unconfirmed instead');
+
+  // Headroom is not a guarantee: the two host round trips between the check and the key
+  // can spend it. A slow host is exactly when they do.
+  const overranMeanwhile = await (async () => {
+    const keys = [];
+    let at = 0;
+    const ok = await waitForModelSwitch({ pane: 'pane-8' }, '/model sonnet', '#8', {
+      now: () => at,
+      sleep: async (ms) => { at += Math.max(1, ms); },
+      readScreen: async (target, lines) => {
+        if (lines > 30) at += 300;
+        return at >= 14500 ? dialog : ['', '❯'].join('\n');
+      },
+      livePaneState: async () => { at += 300; return { inputCount: 7, pid: 4242 }; },
+      pressTargetKey: async (target, key) => { keys.push(key); },
+    });
+    return { ok, keys };
+  })();
+  assert.deepEqual(overranMeanwhile.keys, [],
+    'a wait whose own round trips ran it past the deadline sends no key at the end of them');
+  assert.equal(overranMeanwhile.ok, false, 'and the switch is reported unconfirmed instead');
+
+  const unguardable = await run(() => dialog, { livePaneState: async () => null });
+  assert.deepEqual(unguardable.keys, [],
+    'no Enter is sent into a pane whose input count cannot be read first');
+  assert.equal(unguardable.ok, false, 'and the switch is reported unconfirmed instead');
+
+  // A refused Enter typed nothing, so the dialog is still up on the next poll.
+  const refused = await run(() => dialog, {
+    pressThrows: () => Object.assign(new Error('input arrived on the pane before this keystroke; nothing was typed'),
+      { inputDropped: true }),
+  });
+  assert.deepEqual(refused.keys, ['Enter'],
+    'a refused Enter is not retried: somebody else is at that dialog');
+  assert.equal(refused.ok, false, 'and nothing it did not send is reported as confirmed');
 });
 
 test('the worktree exit prompt is answered only when Keep worktree is the highlighted option', () => {

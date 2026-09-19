@@ -1,0 +1,16 @@
+
+  Switch model?
+  Your next response will be slower and use more tokens
+
+  This conversation is cached for the current model. Switching to Sonnet 5 means the full history gets re-read on your next message.
+
+  ❯ 1. Yes, switch to Sonnet 5
+    2. No, go back
+
+  Enter to confirm · Esc to cancel
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+╭──────────────────────────────────────────────────────────────────────╮
+│ >                                                                    │
+╰──────────────────────────────────────────────────────────────────────╯
+  ? for shortcuts
