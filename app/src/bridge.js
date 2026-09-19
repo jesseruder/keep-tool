@@ -219,6 +219,27 @@ function decideBootstrap(state, event = {}, now = Date.now()) {
   };
 }
 
+// Shell -> console messages for a console that is not up yet. `send` refuses until
+// the page has posted `ready`, and a notification tapped from a cold start is
+// delivered before the WebView has loaded anything at all, so the shell keeps what
+// was refused rather than assuming a handover worked.
+const SHELL_QUEUE_LIMIT = 5;
+
+function queueShellMessage(queue, message, limit = SHELL_QUEUE_LIMIT) {
+  return [...(Array.isArray(queue) ? queue : []), message].slice(-limit);
+}
+
+// Hands the queue to `send` in order and returns what is left: everything from the
+// first refusal on. Stopping there is what keeps the order — a later message must
+// never arrive at the console before an earlier one it was queued behind.
+function drainShellQueue(queue, send) {
+  const rows = Array.isArray(queue) ? queue : [];
+  for (let index = 0; index < rows.length; index += 1) {
+    if (!send(rows[index])) return rows.slice(index);
+  }
+  return [];
+}
+
 // `handlers` is the dispatch table: { ready, authenticated, unauthorized, badge,
 // notify, openTerminal, openExternal }.
 // Returns the message that was dispatched, or null when nothing ran.
@@ -237,13 +258,16 @@ module.exports = {
   BOOTSTRAP_DEBOUNCE_MS,
   BOOTSTRAP_MAX_FAILURES,
   BOOTSTRAP_STALE_MS,
+  SHELL_QUEUE_LIMIT,
   bootstrapScript,
   bootstrapState,
   consoleUrl,
   decideBootstrap,
   dispatchBridgeMessage,
+  drainShellQueue,
   helloScript,
   normalizeServer,
   parseBridgeMessage,
+  queueShellMessage,
   shellReceiveScript,
 };

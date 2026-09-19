@@ -19,6 +19,7 @@ import Terminal from './src/screens/Terminal';
 import { makeStyles } from './src/ui';
 
 const push = require('./src/push');
+const { drainShellQueue, queueShellMessage } = require('./src/bridge');
 
 const CONFIG_KEY = '@keep/config';
 const NOTIFIED_ATTENTION_KEY = '@keep/notifiedAttention';
@@ -27,6 +28,8 @@ const ATTENTION_SWEEP_TASK = 'keep-attention-sweep';
 const BACKGROUND_ATTENTION_ETAG_KEY = '@keep/backgroundAttentionEtag';
 const BACKGROUND_ATTENTION_STATE_KEY = '@keep/backgroundAttentionState';
 const NOTIFIED_ATTENTION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// How often coming back to the app re-checks that the daemon still lists this phone.
+const DEVICE_CHECK_MS = 10 * 60 * 1000;
 
 function projName(project) {
   return project ? String(project).split('/').filter(Boolean).pop() || '' : '';
@@ -304,8 +307,12 @@ function KeepShell() {
   const [pushState, setPushState] = useState({ status: 'idle', sweep: true });
   const consoleRef = useRef(null);
   // A notification tapped from a cold start arrives before the WebView exists, so
-  // the message waits here until the console registers itself.
+  // the message waits here until the console takes it.
   const pendingRef = useRef([]);
+  // Bumped whenever the config this phone is registered under goes away, so a
+  // registration still in flight knows it no longer speaks for anything.
+  const pushGenRef = useRef(0);
+  const verifiedAtRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -329,33 +336,51 @@ function KeepShell() {
     return () => { cancelled = true; };
   }, []);
 
-  const toConsole = useCallback((message) => {
-    if (consoleRef.current?.send(message)) return;
-    pendingRef.current = [...pendingRef.current.slice(-4), message];
+  // A message is only off the queue once the console has actually taken it. `send`
+  // refuses until the page has posted `ready`, and the Console screen re-registers on
+  // every `ready`, which is what brings the drain back around.
+  const drainConsole = useCallback(() => {
+    const instance = consoleRef.current;
+    if (!instance || !pendingRef.current.length) return;
+    pendingRef.current = drainShellQueue(pendingRef.current, (message) => {
+      try { return instance.send(message); }
+      catch { return false; }
+    });
   }, []);
+
+  const toConsole = useCallback((message) => {
+    pendingRef.current = queueShellMessage(pendingRef.current, message);
+    drainConsole();
+  }, [drainConsole]);
 
   const registerConsole = useCallback((instance) => {
     consoleRef.current = instance;
-    if (!instance || !pendingRef.current.length) return;
-    const queued = pendingRef.current;
-    pendingRef.current = [];
-    for (const message of queued) instance.send(message);
-  }, []);
+    drainConsole();
+  }, [drainConsole]);
 
   // Registration: on every launch with a saved config, and again when Setup saves
   // one. `force` is Setup's Retry, which re-registers even when the record is fresh.
+  //
+  // Every pass carries the generation it started in. Forgetting a server, or moving
+  // to another one, bumps it, and a pass that finds itself superseded writes nothing
+  // — otherwise a POST that was already in flight when Forget sent its DELETE would
+  // land afterwards and quietly register the phone all over again.
   const syncPush = useCallback(async (target, { force = false } = {}) => {
+    const generation = pushGenRef.current;
+    const isCurrent = () => pushGenRef.current === generation;
     const next = await push.syncRegistration({
       appVersion: Constants.expoConfig?.version || Constants.nativeAppVersion || '',
       config: target,
       force,
       getToken: expoPushToken,
+      isCurrent,
       permission: ensureNotificationPermission,
       platform: Platform.OS,
       post: api.registerDevice,
       remove: api.unregisterDevice,
       storage: AsyncStorage,
     });
+    if (!isCurrent() || next.status === 'superseded') return next;
     pushIsLive = next.status === 'registered';
     setPushState(next);
     await applySweepTask(next.sweep);
@@ -394,9 +419,27 @@ function KeepShell() {
       Notifications.getPresentedNotificationsAsync().then((shown) => {
         for (const item of shown || []) push.claimNotification(announced, item?.request?.content?.data?.key);
       }).catch(() => {});
+
+      // And ask the daemon whether it still holds this phone. A device evicted by the
+      // 16-device cap, or lost with `.keep/devices.json`, leaves a record here that
+      // looks perfectly good and a phone that never hears anything again.
+      const now = Date.now();
+      if (!config || now - verifiedAtRef.current < DEVICE_CHECK_MS) return;
+      verifiedAtRef.current = now;
+      const generation = pushGenRef.current;
+      push.verifyRegistration({
+        config,
+        isCurrent: () => pushGenRef.current === generation,
+        list: api.listDevices,
+        storage: AsyncStorage,
+      }).then((result) => {
+        if (!result.checked || result.present || pushGenRef.current !== generation) return;
+        pushIsLive = false;
+        return syncPush(config, { force: true });
+      }).catch(() => {});
     });
     return () => subscription.remove();
-  }, []);
+  }, [config, syncPush]);
 
   useEffect(() => {
     const deliver = (response) => {
@@ -416,6 +459,7 @@ function KeepShell() {
     // Moving to another server: the old daemon still holds this phone, and only the
     // config being replaced can authenticate the removal, so it happens here.
     if (config?.server && api.normalizeServer(config.server) !== api.normalizeServer(next.server)) {
+      pushGenRef.current += 1;
       await push.unregisterDevice({ config, remove: api.unregisterDevice, storage: AsyncStorage });
       pushIsLive = false;
     }
@@ -427,6 +471,10 @@ function KeepShell() {
   // Forget: unregister from the daemon best-effort, then drop the config. The sweep
   // goes with it — there is no server left for it to read.
   const forgetConfig = useCallback(async () => {
+    // Before the DELETE, not after: a registration in flight has to be superseded
+    // while it can still be stopped from writing the record back.
+    pushGenRef.current += 1;
+    verifiedAtRef.current = 0;
     if (config) await push.unregisterDevice({ config, remove: api.unregisterDevice, storage: AsyncStorage });
     pushIsLive = false;
     await applySweepTask(false);

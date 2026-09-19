@@ -6,8 +6,9 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   BOOTSTRAP_CEILING_MS, BOOTSTRAP_DEBOUNCE_MS, BOOTSTRAP_STALE_MS, bootstrapScript,
-  bootstrapState, consoleUrl, decideBootstrap, dispatchBridgeMessage, helloScript,
-  normalizeServer, parseBridgeMessage, shellReceiveScript,
+  SHELL_QUEUE_LIMIT, bootstrapState, consoleUrl, decideBootstrap, dispatchBridgeMessage,
+  drainShellQueue, helloScript, normalizeServer, parseBridgeMessage, queueShellMessage,
+  shellReceiveScript,
 } = require('./bridge.js');
 
 test('the console URL carries the token once and tolerates a trailing slash', () => {
@@ -202,6 +203,42 @@ test('the interval and the ceiling bound reloads that each look reasonable alone
   assert.equal(woken.action, 'bootstrap');
   assert.equal(decideBootstrap(woken.state, { reason: 'foreground', awayMs: BOOTSTRAP_STALE_MS }, woken.state.at + BOOTSTRAP_DEBOUNCE_MS - 1).action, 'ignore');
   assert.equal(decideBootstrap(woken.state, { reason: 'foreground', awayMs: BOOTSTRAP_STALE_MS }, woken.state.at + BOOTSTRAP_DEBOUNCE_MS).action, 'bootstrap');
+});
+
+test('a message stays queued until the console actually takes it', () => {
+  // The console refuses everything until its page has posted `ready`, and a
+  // notification tapped from a cold start is handed over long before that. Clearing
+  // the queue on the handover rather than on the send is what dropped those taps.
+  let queue = [];
+  queue = queueShellMessage(queue, { type: 'notificationClick', key: 'a' });
+  queue = queueShellMessage(queue, { type: 'notificationClick', key: 'b' });
+  assert.equal(queue.length, 2);
+
+  const refused = [];
+  queue = drainShellQueue(queue, (message) => { refused.push(message.key); return false; });
+  assert.deepEqual(refused, ['a']);
+  assert.deepEqual(queue.map((message) => message.key), ['a', 'b']);
+
+  // Ready: everything goes, in the order it was queued, and the queue empties.
+  const sent = [];
+  queue = drainShellQueue(queue, (message) => { sent.push(message.key); return true; });
+  assert.deepEqual(sent, ['a', 'b']);
+  assert.deepEqual(queue, []);
+  assert.deepEqual(drainShellQueue(queue, () => { throw new Error('nothing to send'); }), []);
+
+  // A console that takes one and then refuses keeps the rest, in the order they were
+  // queued — a later tap must never reach the console ahead of an earlier one.
+  let partial = [{ key: '1' }, { key: '2' }, { key: '3' }];
+  partial = drainShellQueue(partial, (message) => message.key === '1');
+  assert.deepEqual(partial.map((message) => message.key), ['2', '3']);
+
+  // The queue is bounded: a phone left for a week must not hand the console a
+  // hundred stale taps the moment it comes up.
+  let many = [];
+  for (const key of ['1', '2', '3', '4', '5', '6', '7']) many = queueShellMessage(many, { key });
+  assert.equal(many.length, SHELL_QUEUE_LIMIT);
+  assert.deepEqual(many.map((message) => message.key), ['3', '4', '5', '6', '7']);
+  assert.deepEqual(queueShellMessage(undefined, { key: 'x' }), [{ key: 'x' }]);
 });
 
 test('injected scripts escape values that would otherwise break the source', () => {

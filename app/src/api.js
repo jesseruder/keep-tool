@@ -73,6 +73,9 @@ export const registerDevice = (config, body) => request(config, '/api/devices', 
 export const unregisterDevice = (config, expoPushToken) => request(config, '/api/devices', {
   method: 'DELETE', body: { expoPushToken }, timeoutMs: 8000,
 });
+// Every device the daemon holds, each masked down to its token's last six
+// characters — enough for this phone to tell whether it is still on the list.
+export const listDevices = (config) => request(config, '/api/devices', { timeoutMs: 8000 });
 
 // Terminals address either an agent session or a bare shell pane; `target` is
 // { sessionId } or { pane }, and the daemon rejects the mixture of both.

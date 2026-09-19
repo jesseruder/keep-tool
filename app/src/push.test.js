@@ -4,9 +4,10 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const {
-  NOTIFICATION_DEDUPE_MS, REGISTRATION_KEY, REREGISTER_MS, claimNotification, deviceName,
-  isPushActive, pushStatusLine, readRegistration, registrationBody, shouldNotifyLocally,
-  shouldRegister, syncRegistration, tokenTail, unregisterDevice, validPushToken,
+  NOTIFICATION_DEDUPE_MS, PUSH_STALE_MS, REGISTRATION_KEY, REREGISTER_MS, claimNotification,
+  deviceListHasToken, deviceName, isPushActive, pushStatusLine, readRegistration,
+  registeredWith, registrationBody, shouldNotifyLocally, shouldRegister, syncRegistration,
+  tokenTail, unregisterDevice, validPushToken, verifyRegistration,
 } = require('./push.js');
 
 const TOKEN = 'ExponentPushToken[abc123XYZ789]';
@@ -218,15 +219,8 @@ test('no push token, and a daemon that refuses, both fall back to the sweep', as
   assert.equal(lost.status, 'unavailable');
   assert.equal(lost.sweep, true);
 
-  // Same for a launch with no network at all, once a registration exists.
-  const offline = savedStorage({ token: TOKEN, server: SERVER, registeredAt: NOW });
-  const noToken = await syncRegistration(deps(offline, api, {
-    getToken: async () => { throw new Error('network request failed'); },
-    now: NOW + 2 * REREGISTER_MS,
-  }));
-  assert.equal(noToken.status, 'registered');
-  assert.equal(noToken.sweep, false);
-  assert.equal(noToken.stale, 'network request failed');
+  // (A launch with no network at all, against a record still inside the staleness
+  // window, is the same case — see the staleness test below.)
 
   // And an unconfigured app asks for nothing.
   const bare = await syncRegistration(deps(fakeStorage(), api, { config: { server: '', token: '' } }));
@@ -234,17 +228,148 @@ test('no push token, and a daemon that refuses, both fall back to the sweep', as
   assert.equal(bare.sweep, true);
 });
 
-test('the sweep flag is the saved record read against the current server', () => {
+test('the sweep flag is the saved record, read against the server and the clock', () => {
   const saved = { token: TOKEN, server: SERVER, registeredAt: NOW };
-  assert.equal(isPushActive(saved, SERVER), true);
-  assert.equal(isPushActive(saved, `${SERVER}/`), true);
-  // Age alone never unregisters a phone: the daemon keeps a device until Expo says
-  // it is gone, so a week-old record is still receiving pushes.
-  assert.equal(isPushActive({ ...saved, registeredAt: NOW - 30 * REREGISTER_MS }, SERVER), true);
-  assert.equal(isPushActive(saved, 'http://other:7777'), false);
-  assert.equal(isPushActive(null, SERVER), false);
-  assert.equal(isPushActive({ token: 'junk', server: SERVER }, SERVER), false);
-  assert.equal(isPushActive(saved, undefined), false);
+  assert.equal(isPushActive(saved, SERVER, NOW), true);
+  assert.equal(isPushActive(saved, `${SERVER}/`, NOW), true);
+  // One missed daily refresh is an offline launch and changes nothing.
+  assert.equal(isPushActive(saved, SERVER, NOW + PUSH_STALE_MS - 1), true);
+  // Two days without the daemon acknowledging this phone is not evidence of
+  // anything: eviction, a lost devices.json and a dead token all look like this, and
+  // a fallback a stale record can disable forever is not a fallback.
+  assert.equal(isPushActive(saved, SERVER, NOW + PUSH_STALE_MS), false);
+  assert.equal(isPushActive({ ...saved, registeredAt: 0 }, SERVER, NOW), false);
+  assert.equal(isPushActive(saved, 'http://other:7777', NOW), false);
+  assert.equal(isPushActive(null, SERVER, NOW), false);
+  assert.equal(isPushActive({ token: 'junk', server: SERVER }, SERVER, NOW), false);
+  assert.equal(isPushActive(saved, undefined, NOW), false);
+
+  // Identity is a separate question from freshness: a record too old to be trusted
+  // as live is still this server's record, and Forget has to take it.
+  assert.equal(registeredWith(saved, SERVER), true);
+  assert.equal(registeredWith({ ...saved, registeredAt: NOW - 100 * PUSH_STALE_MS }, SERVER), true);
+  assert.equal(registeredWith(saved, 'http://other:7777'), false);
+  assert.equal(registeredWith(null, SERVER), false);
+});
+
+test('a stale record stops standing in for a registration', async () => {
+  // Younger than the staleness window: an offline launch keeps push and leaves the
+  // sweep off, because the phone almost certainly is still registered.
+  const recent = savedStorage({ token: TOKEN, server: SERVER, registeredAt: NOW });
+  const offline = await syncRegistration(deps(recent, fakeApi(), {
+    getToken: async () => { throw new Error('network request failed'); },
+    now: NOW + REREGISTER_MS + 3600_000,
+  }));
+  assert.equal(offline.status, 'registered');
+  assert.equal(offline.sweep, false);
+
+  // Past it, the same failure means the sweep comes back and the console keeps
+  // announcing its own rows — noisier than the truth, never quieter.
+  const old = savedStorage({ token: TOKEN, server: SERVER, registeredAt: NOW });
+  const lapsed = await syncRegistration(deps(old, fakeApi(), {
+    getToken: async () => { throw new Error('network request failed'); },
+    now: NOW + PUSH_STALE_MS,
+  }));
+  assert.equal(lapsed.status, 'unavailable');
+  assert.equal(lapsed.sweep, true);
+  assert.equal(lapsed.reason, 'network request failed');
+  // A refresh that succeeds puts it back, and that is the only thing that does.
+  const api = fakeApi();
+  const recovered = await syncRegistration(deps(old, api, { now: NOW + PUSH_STALE_MS + 1000 }));
+  assert.equal(recovered.status, 'registered');
+  assert.equal(recovered.sweep, false);
+  assert.equal(api.calls.length, 1);
+  assert.equal((await readRegistration(old)).registeredAt, NOW + PUSH_STALE_MS + 1000);
+});
+
+test('the daemon is asked whether it still holds this phone', async () => {
+  const listed = (tails) => async () => ({ ok: true, devices: tails.map((tail) => ({ tokenTail: tail })) });
+
+  // Present: nothing changes.
+  const storage = savedStorage({ token: TOKEN, server: SERVER, registeredAt: NOW });
+  assert.deepEqual(
+    await verifyRegistration({ config: CONFIG, list: listed(['zzzzzz', 'XYZ789']), storage }),
+    { checked: true, present: true },
+  );
+  assert.equal((await readRegistration(storage)).token, TOKEN);
+
+  // Absent — evicted by the 16-device cap, or a daemon that lost devices.json. The
+  // record goes, so the next pass registers again and the sweep covers the gap.
+  assert.deepEqual(
+    await verifyRegistration({ config: CONFIG, list: listed(['zzzzzz']), storage }),
+    { checked: true, present: false },
+  );
+  assert.equal(await readRegistration(storage), null);
+
+  // Nothing is concluded from a request that failed or an answer that is not a list,
+  // and nothing is asked when there is no record for this server.
+  const intact = savedStorage({ token: TOKEN, server: SERVER, registeredAt: NOW });
+  for (const list of [
+    async () => { throw new Error('down'); },
+    async () => ({ ok: false }),
+    async () => 'nonsense',
+  ]) {
+    assert.deepEqual(await verifyRegistration({ config: CONFIG, list, storage: intact }), { checked: false });
+    assert.equal((await readRegistration(intact)).token, TOKEN);
+  }
+  let asked = false;
+  const elsewhere = savedStorage({ token: TOKEN, server: 'http://other:7777', registeredAt: NOW });
+  assert.deepEqual(
+    await verifyRegistration({ config: CONFIG, list: async () => { asked = true; return {}; }, storage: elsewhere }),
+    { checked: false },
+  );
+  assert.equal(asked, false);
+  // A verification that was superseded while it ran keeps its hands off the record.
+  assert.deepEqual(
+    await verifyRegistration({ config: CONFIG, isCurrent: () => false, list: listed([]), storage: intact }),
+    { checked: false },
+  );
+  assert.equal((await readRegistration(intact)).token, TOKEN);
+
+  // The comparison itself: tails, never tokens, and never a guess from a bad answer.
+  assert.equal(deviceListHasToken({ devices: [{ tokenTail: 'XYZ789' }] }, TOKEN), true);
+  assert.equal(deviceListHasToken([{ tokenTail: 'XYZ789' }], TOKEN), true);
+  assert.equal(deviceListHasToken({ devices: [{ tokenTail: 'other1' }] }, TOKEN), false);
+  assert.equal(deviceListHasToken({ devices: [] }, TOKEN), false);
+  assert.equal(deviceListHasToken({ devices: [{ tokenTail: 'XYZ789' }] }, 'junk'), null);
+  assert.equal(deviceListHasToken(null, TOKEN), null);
+  assert.equal(deviceListHasToken({ error: 'nope' }, TOKEN), null);
+});
+
+test('a pass superseded by Forget writes nothing, and takes back what landed', async () => {
+  // Forget bumps the generation while the POST is in flight. The registration that
+  // comes back must not recreate the record the DELETE just removed.
+  const storage = fakeStorage();
+  const api = fakeApi();
+  let current = true;
+
+  const result = await syncRegistration(deps(storage, api, {
+    isCurrent: () => current,
+    post: async (config, body) => {
+      current = false; // Forget lands while this request is on the wire.
+      return api.post(config, body);
+    },
+    remove: api.remove,
+  }));
+
+  assert.equal(result.status, 'superseded');
+  assert.equal(await readRegistration(storage), null);
+  // It reached the daemon anyway, so it is taken back rather than left pushing at a
+  // phone that has forgotten the server.
+  assert.deepEqual(api.calls.map((call) => (call.removed ? 'remove' : 'post')), ['post', 'remove']);
+  assert.equal(api.calls[1].removed, TOKEN);
+
+  // Superseded before the POST: the daemon is never told at all.
+  const early = fakeStorage();
+  const quiet = fakeApi();
+  const skipped = await syncRegistration(deps(early, quiet, {
+    isCurrent: () => false,
+    post: quiet.post,
+    remove: quiet.remove,
+  }));
+  assert.equal(skipped.status, 'superseded');
+  assert.equal(quiet.calls.length, 0);
+  assert.equal(await readRegistration(early), null);
 });
 
 test('forgetting a server deletes the registration, with or without the daemon', async () => {

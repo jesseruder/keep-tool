@@ -167,9 +167,12 @@ the sweep's `kind:sessionId:since` and the session id travels with it.
 dispatch table — and `src/bridge.test.js` covers them with plain `node --test`.
 
 A message for a console that has not said `ready` yet has nowhere to go —
-`window.keepShellReceive` does not exist, and the injection is swallowed — so the
-shell holds the last five and hands them over as soon as the console announces
-itself. That is the ordinary case for a notification tapped from a cold start.
+`window.keepShellReceive` does not exist, and the injection is swallowed — so `send`
+refuses it and the shell keeps it. A message leaves the queue only when a send
+actually succeeds, never merely because the console registered itself, and the
+Console screen re-registers on every `ready`, which is what brings the drain back
+around. The queue holds five, in order. That is the ordinary case for a notification
+tapped from a cold start: `queueShellMessage`/`drainShellQueue` in `src/bridge.js`.
 
 ### Push
 
@@ -201,7 +204,12 @@ ever displayed.
 
 **Moving on.** Connecting to a different server, or **Forget this server**, sends
 `DELETE /api/devices` to the daemon being left, best effort, with the config that is
-being replaced — it is the only thing that can still authenticate the removal.
+being replaced — it is the only thing that can still authenticate the removal. Both
+bump a generation counter first, and every step of a registration checks it: a pass
+that has been superseded writes no record, and a `POST` that had already gone out
+when the `DELETE` did is taken back with a second `DELETE` rather than left standing.
+Without that, forgetting a server while a registration was in flight registered the
+phone all over again a moment later.
 
 **The tap.** A push carries `data: {key, sessionId}`, where `key` is the console's
 own attention key or `alert:<id>`. Foreground, background and cold start all end at
@@ -220,11 +228,24 @@ keys match exactly: `attention-push.js` mirrors the console's own spelling.
 notifications from `/api/state?view=notifications`) is the fallback for a phone push
 cannot reach. It is unregistered as soon as registration succeeds, and registered
 again when permission is denied or no token can be had — a pass the OS had already
-scheduled checks the same flag before it notifies. A *failed* registration is not the
-same as no registration: a launch with no network, or a daily refresh the daemon
-missed, keeps the phone registered and the sweep off, because the device is still on
-the daemon's list and running both is what buzzes twice. Only a token that has
-rotated away from what the daemon holds turns the sweep back on. The once-per-launch
+scheduled checks the same flag before it notifies. A *failed* registration is not at
+once the same as no registration: a launch with no network, or a daily refresh the
+daemon missed, keeps the phone registered and the sweep off, because the device is
+still on the daemon's list and running both is what buzzes twice.
+
+That belief has a clock on it. Refresh is daily; **48 hours** without one reaching
+the daemon and the record stops counting as live, whatever it says — eviction by the
+16-device cap, a `.keep/devices.json` that was lost, and a token Expo has stopped
+delivering all look exactly like an offline phone from here, and a fallback that a
+stale record can switch off forever is not a fallback. Past that the sweep comes back
+and the console keeps announcing its own rows until a refresh succeeds. A token that
+has rotated away from what the daemon holds turns the sweep back on immediately,
+since the old record cannot cover it.
+
+The quicker half of the same question is simply to ask: coming back to the app, at
+most once every ten minutes, the shell reads `GET /api/devices` and compares token
+tails. A daemon that no longer lists this phone invalidates the record on the spot,
+and the next pass registers again. The once-per-launch
 baseline pass runs either way, recording what is already waiting without
 announcing it, so if the sweep ever does take over it does not fire for the backlog.
 
