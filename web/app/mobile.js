@@ -76,6 +76,9 @@ function watchAlerts() {
   if (!dialog || alertsObserver) return;
   alertsObserver = new MutationObserver(() => { if (dialog.open) adoptAlerts(); });
   alertsObserver.observe(dialog, { attributes: true, attributeFilter: ['open'] });
+  // A shell that attaches while the inbox is already open (keep-shell-hello after
+  // a late injection) would otherwise never see an open mutation for it.
+  adoptAlerts();
 }
 function unwatchAlerts() {
   alertsObserver?.disconnect();
