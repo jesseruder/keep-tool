@@ -853,7 +853,7 @@ function renderMeters() {
       return { ...reading, percent, elapsed, detail: `${reading.account}: ${Math.round(percent)}%${elapsedText}${reset}` };
     });
     const description = `${group.label}. ${details.map((reading) => reading.detail).join('. ')}`;
-    return `<span class="meter-group" tabindex="0" role="group" aria-label="${esc(description)}"><span class="meter-label">${esc(group.label)}</span><span class="meter-readings">${details.map((reading) => `<span class="meter"><i><b class="${reading.percent >= 75 ? 'warn' : ''}" style="width:${reading.percent}%"></b>${reading.elapsed == null ? '' : `<u style="left:${reading.elapsed}%"></u>`}</i><span>${Math.round(reading.percent)}%</span></span>`).join('')}</span><span class="meter-details" role="tooltip">${details.map((reading) => `<span>${esc(reading.detail)}</span>`).join('')}</span></span>`;
+    return `<span class="meter-group" tabindex="0" role="group" aria-label="${esc(description)}"><span class="meter-label">${esc(group.label)}</span><span class="meter-readings">${details.map((reading) => `<span class="meter"><i><b class="${reading.percent >= 75 ? 'warn' : ''}" style="width:${reading.percent}%"></b>${reading.elapsed == null ? '' : `<u class="${reading.elapsed < reading.percent ? 'over' : ''}" style="left:${reading.elapsed}%"></u>`}</i><span>${Math.round(reading.percent)}%</span></span>`).join('')}</span><span class="meter-details" role="tooltip">${details.map((reading) => `<span>${esc(reading.detail)}</span>`).join('')}</span></span>`;
   }).join('') || '<span class="meter unavailable">usage unavailable</span>';
 }
 function renderHealth() {

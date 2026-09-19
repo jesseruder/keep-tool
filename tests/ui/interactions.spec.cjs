@@ -195,6 +195,8 @@ test('account limit groups remain complete and reveal their account details on d
   await claudeWeek.focus();
   await expect(claudeWeek.locator('.meter-details')).toContainText('Claude Main: 30% · 40% of window elapsed');
   await expect(claudeWeek.locator('.meter i u')).toHaveCount(1);
+  // 40% elapsed is past the 30% fill, so the tick sits on the track, not cut into the fill.
+  await expect(claudeWeek.locator('.meter i u')).not.toHaveClass(/over/);
   expect(await claudeWeek.locator('.meter i u').evaluate((tick) => Math.round(parseFloat(tick.style.left)))).toBe(40);
   await expect(codexFiveHour.locator('.meter i u')).toHaveCount(0);
 });
