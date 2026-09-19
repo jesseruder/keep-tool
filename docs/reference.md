@@ -784,11 +784,11 @@ registered phone, by posting to `https://exp.host/--/api/v2/push/send` with a
   "sound": "default", "channelId": "attention", "priority": "high" }
 ```
 
-The title matches the desktop banner's (`Keep`, the alert's `from`, and
-`· Urgent` for an urgent one) unless the caller says what the phone should show.
-`data.key` is what the app hands back to the console on a notification tap:
-`alert:<id>` opens that message in the inbox, the same path a desktop banner
-click takes, and an attention key selects that row in the queue. `badge` is the console's own count — the
+For an alert the title matches the desktop banner's (`Keep`, the alert's `from`,
+and `· Urgent` for an urgent one). `data.key` is what the app hands back to the
+console on a notification tap: `alert:<id>` opens that message in the inbox, the
+same path a desktop banner click takes, and an attention key selects that row in
+the queue. `badge` is the console's own count — the
 attention rows it is showing plus its unread inbox messages — read from the last
 state the daemon published. It is therefore approximate by design: dismissals are
 browser-local, and an alert's own inbox entry is appended after delivery, so it is
@@ -817,18 +817,28 @@ title is `<project> · <row title>` and the body is the row's question, else its
 detail, else `Waiting for your input.`.
 
 The first publication after the daemon starts seeds the key set and notifies for
-nothing in it — a restart is not news — and a key that leaves the attention list
-is forgotten, so the same session waiting again later pushes again. There is no
-disk state and one Set of keys in memory.
+nothing in it — a restart is not news. A key that leaves the attention list is
+forgotten, so the same session waiting again later is a new event, subject to the
+dedupe window below.
 
-These go through `keep alert` at level `attention`, so quiet hours, the six-hour
-per-key dedupe and the daily attention cap apply, and each one appears in the
-alert ledger and the console's inbox. They are delivered to the `expo` channel
-only: the webhook's consumer is unknown and has only ever received `keep alert`
-output, and the speakers stay for urgent alerts. They also carry `desktop: false`,
-because the console is already raising its own banner for the same row. With
-Owner present at the Mac the attention level routes to `sound`, so nothing is
-pushed to the phone at all — the console is right there.
+These are not alerts and do not enter the ledger: the row is already in the
+console's “Waiting on you” list, so a second copy in the alert inbox is noise,
+and a session's questions are not judged against the same daily budget as an
+alert somebody wrote on purpose. They go straight to the phones through the Expo
+sender, with their own policy, all of it in memory:
+
+- Quiet hours (`keep quiet`) drop the push. Nothing is queued — the row is still
+  waiting when they end, and the console is where it is triaged.
+- The same key is pushed at most once every six hours
+  (`KEEP_ALERT_DEDUPE_HOURS`), so a row that leaves the list and comes back is
+  one event, while the same session waiting on something new has a new key and
+  pushes at once.
+- `KEEP_ATTENTION_PUSH_DAILY` caps them, default 100 per local day, separate
+  from the 12 attention alerts.
+
+The webhook never sees them (its consumer is unknown and has only ever received
+`keep alert` output), the speakers stay for urgent alerts, and the console keeps
+raising its own desktop banner for the same row.
 
 ## Standup
 

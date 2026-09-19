@@ -321,7 +321,11 @@ function currentBadge(explicit) {
   try { return clamp(badgeProvider()); } catch { return null; }
 }
 
-async function sendExpo(entry, options = {}) {
+// Notify every registered phone. This is the whole phone channel: a notification
+// to show and the key the app hands back on a tap. It reads the device registry
+// and writes nothing else — the alert ledger belongs to sendAlert, and the
+// waiting-session pushes deliberately stay out of it.
+async function sendExpo(notification, options = {}) {
   const root = options.root || DEFAULT_ROOT;
   const registry = options.devices || require('./devices.js');
   const doFetch = options.fetch || globalThis.fetch;
@@ -329,24 +333,19 @@ async function sendExpo(entry, options = {}) {
   // Nothing registered (or no fetch to reach Expo with): a no-op, recorded like
   // the unconfigured webhook is, since nothing was attempted.
   if (!devices.length || typeof doFetch !== 'function') return 'failed';
-  const badge = currentBadge(options.badge);
+  const badge = currentBadge(notification.badge);
   // Tests drive the once-a-minute log throttle through this rather than the clock.
   const now = Number.isFinite(options.now) ? options.now : Date.now();
-  // A caller that knows what the phone should show supplies `push`; otherwise the
-  // notification is the ledger entry, titled the way the desktop banner is.
-  const push = entry.push && typeof entry.push === 'object' ? entry.push : {};
-  const title = push.title
-    || `${entry.from === 'manual' ? 'Keep' : entry.from || 'Keep'}${entry.level === 'urgent' ? ' · Urgent' : ''}`;
   let ok = false;
   for (let start = 0; start < devices.length; start += EXPO_BATCH) {
     const tokens = devices.slice(start, start + EXPO_BATCH).map((device) => device.expoPushToken);
     const message = {
       to: tokens,
-      title,
-      body: push.body || entry.text,
-      // The key the app hands back on a tap: an attention key the console selects,
-      // or `alert:<id>`, which its notification-click handler opens in the inbox.
-      data: { key: push.key || `alert:${entry.id}`, sessionId: String(push.sessionId || '') },
+      title: notification.title,
+      body: notification.body,
+      // The key the app hands back on a tap: an attention key the console
+      // selects, or `alert:<id>`, which its click handler opens in the inbox.
+      data: { key: notification.key, sessionId: String(notification.sessionId || '') },
       ...(badge === null ? {} : { badge }),
       sound: 'default',
       channelId: 'attention',
@@ -392,8 +391,15 @@ async function deliver(entry, options = {}) {
   const attempts = (entry.channels || []).map(async (channel) => {
     if (channel === 'push') return [channel, await sendPush(entry.text, options.root || DEFAULT_ROOT)];
     if (channel === 'expo') {
-      return [channel, await sendExpo(entry, {
-        root: options.root || DEFAULT_ROOT, badge: options.badge, fetch: options.fetch,
+      return [channel, await sendExpo({
+        // A ledger alert titles itself the way its desktop banner does, and a tap
+        // opens the message in the console's inbox.
+        title: `${entry.from === 'manual' ? 'Keep' : entry.from || 'Keep'}${entry.level === 'urgent' ? ' · Urgent' : ''}`,
+        body: entry.text,
+        key: `alert:${entry.id}`,
+        badge: options.badge,
+      }, {
+        root: options.root || DEFAULT_ROOT, fetch: options.fetch,
         devices: options.devices, now: options.now,
       })];
     }
@@ -453,12 +459,8 @@ async function sendAlert(options) {
       card: options.card || '',
       channels,
       deferred,
-      // What the phone shows and what a tap selects, when the caller knows better
-      // than the ledger text does (the waiting-session pushes do).
-      ...(options.push && typeof options.push === 'object' ? { push: options.push } : {}),
       // The desktop shell adds a visual banner; existing channels retain delivery.
-      // `desktop: false` is for an alert the console already notifies about itself.
-      desktop: options.desktop !== false && !deferred && info.state === 'present' && options.level !== 'brief'
+      desktop: !deferred && info.state === 'present' && options.level !== 'brief'
         && (!enabledChannels() || enabledChannels().has('desktop')),
       presence: info,
       ...(!decision.ok ? { why: decision.why } : routing.deferred ? { why: 'quiet' } : {}),
@@ -710,6 +712,7 @@ module.exports = {
   deliver,
   sendExpo,
   availableChannels,
+  quietActive,
   badgeFromState,
   setBadgeProvider,
   loadReviewFindings,

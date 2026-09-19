@@ -30,14 +30,12 @@ const expoOk = (count) => ({
   status: 200,
   json: async () => ({ data: Array.from({ length: count }, (_value, index) => ({ status: 'ok', id: `ticket-${index}` })) }),
 });
+const waiting = { title: 'Keep · Session 12', body: 'Which branch?', key: 's-1:1000', sessionId: 's-1' };
 
-test('an expo push carries the alert key, the badge and the attention channel', async () => {
+test('a push carries the notification, its tap key, the badge and the attention channel', async () => {
   const calls = [];
-  const outcome = await alerts.sendExpo({
-    id: 'a-123', level: 'attention', text: 'Session 9 is waiting', from: 'agent:tester', channels: ['expo'],
-  }, {
+  const outcome = await alerts.sendExpo({ ...waiting, badge: 4 }, {
     devices: fakeRegistry(['aaaaaa']),
-    badge: 4,
     fetch: async (url, init) => { calls.push({ url, init }); return expoOk(1); },
   });
   assert.equal(outcome, 'ok');
@@ -48,29 +46,49 @@ test('an expo push carries the alert key, the badge and the attention channel', 
   assert.ok(calls[0].init.signal instanceof AbortSignal, 'the request is bounded by a timeout');
   assert.deepEqual(JSON.parse(calls[0].init.body), {
     to: [expoToken('aaaaaa')],
-    title: 'agent:tester',
-    body: 'Session 9 is waiting',
-    data: { key: 'alert:a-123', sessionId: '' },
+    title: 'Keep · Session 12',
+    body: 'Which branch?',
+    data: { key: 's-1:1000', sessionId: 's-1' },
     badge: 4,
     sound: 'default',
     channelId: 'attention',
     priority: 'high',
   });
 
-  // A manual alert keeps the console's own title, and urgent says so.
-  const urgent = [];
-  await alerts.sendExpo({ id: 'a-9', level: 'urgent', text: 'Disk full', from: 'manual' }, {
+  const plain = [];
+  await alerts.sendExpo({ title: 'Keep', body: 'Disk full', key: 'alert:a-9' }, {
     devices: fakeRegistry(['aaaaaa']),
-    fetch: async (_url, init) => { urgent.push(JSON.parse(init.body)); return expoOk(1); },
+    fetch: async (_url, init) => { plain.push(JSON.parse(init.body)); return expoOk(1); },
   });
-  assert.equal(urgent[0].title, 'Keep · Urgent');
-  assert.equal('badge' in urgent[0], false, 'with no badge to report the app keeps the one it has');
+  assert.equal('badge' in plain[0], false, 'with no badge to report the app keeps the one it has');
+  assert.equal(plain[0].data.sessionId, '', 'a notification that names no session still has the field');
+});
+
+test('an alert delivered over the expo channel is titled and keyed like its inbox message', async () => {
+  const bodies = [];
+  const deliverOne = (entry) => alerts.deliver(entry, {
+    devices: fakeRegistry(['aaaaaa']),
+    badge: 2,
+    fetch: async (_url, init) => { bodies.push(JSON.parse(init.body)); return expoOk(1); },
+  });
+  assert.deepEqual(await deliverOne({
+    id: 'a-123', level: 'attention', text: 'Session 9 is waiting', from: 'agent:tester', channels: ['expo'],
+  }), { expo: 'ok' });
+  assert.equal(bodies[0].title, 'agent:tester');
+  assert.equal(bodies[0].body, 'Session 9 is waiting');
+  assert.deepEqual(bodies[0].data, { key: 'alert:a-123', sessionId: '' },
+    'a tap opens that message in the console inbox');
+  assert.equal(bodies[0].badge, 2);
+
+  // A manual alert keeps the console's own title, and urgent says so.
+  await deliverOne({ id: 'a-9', level: 'urgent', text: 'Disk full', from: 'manual', channels: ['expo'] });
+  assert.equal(bodies[1].title, 'Keep · Urgent');
 });
 
 test('expo pushes batch at a hundred tokens per request', async () => {
   const batches = [];
   const tails = Array.from({ length: 150 }, (_value, index) => `t${String(index).padStart(6, '0')}`);
-  const outcome = await alerts.sendExpo({ id: 'a-batch', level: 'attention', text: 'Many phones' }, {
+  const outcome = await alerts.sendExpo({ ...waiting }, {
     devices: fakeRegistry(tails),
     fetch: async (_url, init) => {
       const message = JSON.parse(init.body);
@@ -87,7 +105,7 @@ test('expo pushes batch at a hundred tokens per request', async () => {
 
 test('a DeviceNotRegistered ticket drops that phone and keeps the others', async () => {
   const registry = fakeRegistry(['aaaaaa', 'bbbbbb', 'cccccc']);
-  const outcome = await alerts.sendExpo({ id: 'a-tickets', level: 'attention', text: 'Waiting' }, {
+  const outcome = await alerts.sendExpo({ ...waiting }, {
     devices: registry,
     fetch: async () => ({
       ok: true,
@@ -108,18 +126,17 @@ test('expo failures never throw and are logged at most once a minute', async (t)
   t.mock.method(process.stderr, 'write', (chunk) => { written.push(String(chunk)); return true; });
   // Far enough ahead of anything this process has already logged that the first call speaks.
   const base = Date.now() + 3600e3;
-  const entry = { id: 'a-fail', level: 'attention', text: 'Waiting' };
   const registry = fakeRegistry(['aaaaaa']);
   const refuse = async () => ({ ok: false, status: 502, json: async () => ({}) });
 
-  assert.equal(await alerts.sendExpo(entry, { devices: registry, fetch: refuse, now: base }), 'failed');
-  assert.equal(await alerts.sendExpo(entry, { devices: registry, fetch: refuse, now: base + 1000 }), 'failed');
+  assert.equal(await alerts.sendExpo({ ...waiting }, { devices: registry, fetch: refuse, now: base }), 'failed');
+  assert.equal(await alerts.sendExpo({ ...waiting }, { devices: registry, fetch: refuse, now: base + 1000 }), 'failed');
   assert.equal(written.length, 1, 'the second failure inside the minute stays quiet');
   assert.match(written[0], /^keep alerts: expo push HTTP 502\n$/);
 
   // A timed-out or refused connection is an outcome, not a throw.
   const aborted = async () => { const error = new Error('The operation was aborted'); error.name = 'TimeoutError'; throw error; };
-  assert.equal(await alerts.sendExpo(entry, { devices: registry, fetch: aborted, now: base + 61e3 }), 'failed');
+  assert.equal(await alerts.sendExpo({ ...waiting }, { devices: registry, fetch: aborted, now: base + 61e3 }), 'failed');
   assert.equal(written.length, 2);
   assert.match(written[1], /expo push The operation was aborted/);
   assert.deepEqual(registry.removed, [], 'a failed request unregisters nothing');
@@ -127,7 +144,7 @@ test('expo failures never throw and are logged at most once a minute', async (t)
 
 test('with no phone registered the expo channel does nothing at all', async () => {
   let called = 0;
-  const outcome = await alerts.sendExpo({ id: 'a-none', level: 'attention', text: 'Waiting' }, {
+  const outcome = await alerts.sendExpo({ ...waiting }, {
     devices: fakeRegistry([]),
     fetch: async () => { called += 1; return expoOk(1); },
   });
@@ -147,16 +164,16 @@ test('the badge is the console formula, and the provider is what the daemon plug
   t.after(() => alerts.setBadgeProvider(null));
   alerts.setBadgeProvider(() => alerts.badgeFromState(state));
   const sent = [];
-  const send = (id) => alerts.sendExpo({ id, level: 'attention', text: 'Waiting' }, {
+  const send = () => alerts.sendExpo({ ...waiting }, {
     devices: fakeRegistry(['aaaaaa']),
     fetch: async (_url, init) => { sent.push(JSON.parse(init.body)); return expoOk(1); },
   });
-  await send('a-badge');
+  await send();
   assert.equal(sent[0].badge, 5);
 
   // A provider that throws leaves the payload without a badge rather than the alert undelivered.
   alerts.setBadgeProvider(() => { throw new Error('no state yet'); });
-  await send('a-badge2');
+  await send();
   assert.equal('badge' in sent[1], false);
 });
 
@@ -194,52 +211,6 @@ test('quiet hours defer the expo channel exactly as they defer the rest', async 
   assert.deepEqual(awake.delivered, { expo: 'ok' });
   assert.equal(awake.deliveryOk, true);
   assert.equal(pushes, 1);
-});
-
-test('a caller can say what the phone shows and keep the console from banner-ing twice', async (t) => {
-  const root = makeRoot(t);
-  const bodies = [];
-  const result = await alerts.sendAlert({
-    root,
-    level: 'attention',
-    key: 'session-waiting',
-    text: 'Keep · Session 12 — Which branch?',
-    from: 'attention',
-    // Owner is at the Mac, so this alert would ordinarily be desktop-eligible.
-    presence: { state: 'present' },
-    desktop: false,
-    push: { title: 'Keep · Session 12', body: 'Which branch?', key: 's-1:1000', sessionId: 's-1' },
-    availableChannels: () => ['expo'],
-    deliver: async (entry, options) => alerts.deliver(entry, {
-      ...options,
-      devices: fakeRegistry(['aaaaaa']),
-      fetch: async (_url, init) => { bodies.push(JSON.parse(init.body)); return expoOk(1); },
-    }),
-  });
-  assert.equal(result.entry.desktop, false, 'the console already notified about this row itself');
-  assert.deepEqual(result.entry.push.key, 's-1:1000');
-  assert.equal(bodies[0].title, 'Keep · Session 12');
-  assert.equal(bodies[0].body, 'Which branch?');
-  assert.deepEqual(bodies[0].data, { key: 's-1:1000', sessionId: 's-1' });
-
-  // Without those options the entry is desktop-eligible and the push is the ledger entry.
-  const plain = await alerts.sendAlert({
-    root,
-    level: 'attention',
-    key: 'ordinary',
-    text: 'Something happened',
-    presence: { state: 'present' },
-    availableChannels: () => ['expo'],
-    deliver: async (entry, options) => alerts.deliver(entry, {
-      ...options,
-      devices: fakeRegistry(['aaaaaa']),
-      fetch: async (_url, init) => { bodies.push(JSON.parse(init.body)); return expoOk(1); },
-    }),
-  });
-  assert.equal(plain.entry.desktop, true);
-  assert.equal('push' in plain.entry, false);
-  assert.equal(bodies[1].body, 'Something happened');
-  assert.equal(bodies[1].data.key, `alert:${plain.entry.id}`);
 });
 
 test('the channel becomes available only once a phone has registered', (t) => {

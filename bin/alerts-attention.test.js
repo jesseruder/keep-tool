@@ -1,7 +1,8 @@
 'use strict';
 
 // The daemon-side mirror of the console's waiting-session notification: one push
-// per attention row that is new since the last publication.
+// per attention row that is new since the last publication, delivered straight to
+// the phones instead of through the alert ledger.
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -20,14 +21,21 @@ const waiting = (over = {}) => ({
   pri: 0, kind: 'question', sessionId: 's-1', project: '/Users/jesse/keep-tool',
   title: 'Session 12', question: 'Which branch?', since: 1000, ...over,
 });
-function collector(root) {
+// The default collector never reaches a registry or a clock: quiet is off and the
+// sender records what it was asked to show.
+function collector(over = {}) {
   const sent = [];
-  const push = createAttentionPush({ root, sendAlert: (request) => { sent.push(request); return Promise.resolve({}); } });
+  const push = createAttentionPush({
+    root: '/tmp/keep-unused',
+    quiet: () => false,
+    sendExpo: (message) => { sent.push(message); return Promise.resolve('ok'); },
+    ...over,
+  });
   return { sent, push };
 }
 
 test('the first publication seeds the known rows and pushes nothing', () => {
-  const { sent, push } = collector('/tmp/keep-unused');
+  const { sent, push } = collector();
   assert.deepEqual(push.observe({ attention: [waiting(), waiting({ sessionId: 's-2', since: 2000 })] }), []);
   assert.equal(push.seeded, true);
   assert.equal(push.size, 2);
@@ -35,23 +43,17 @@ test('the first publication seeds the known rows and pushes nothing', () => {
 });
 
 test('a row that arrives after the seed is one push, and republishing it is none', () => {
-  const { sent, push } = collector('/tmp/keep-unused');
+  const { sent, push } = collector();
   push.observe({ attention: [] });
   const state = { attention: [waiting()], projectCatalog: { 'keep-tool': { name: 'Keep' } } };
   assert.equal(push.observe(state).length, 1);
-  assert.equal(sent.length, 1);
-  const request = sent[0];
-  assert.equal(request.level, 'attention');
-  assert.equal(request.key, 's-1:1000', 'the alert key is the key the console computes');
-  assert.equal(request.key, attentionKey(waiting()));
-  assert.equal(request.desktop, false, 'the console raises its own banner for this row');
-  assert.deepEqual(request.push, {
+  assert.deepEqual(sent, [{
     title: 'Keep · Session 12',
     body: 'Which branch?',
     key: 's-1:1000',
     sessionId: 's-1',
-  });
-  assert.equal(request.text, 'Keep · Session 12 — Which branch?');
+  }]);
+  assert.equal(sent[0].key, attentionKey(waiting()), 'the key is the one the console computes');
 
   // The same publication again, and a third with the row unchanged: nothing more.
   assert.deepEqual(push.observe(state), []);
@@ -60,7 +62,7 @@ test('a row that arrives after the seed is one push, and republishing it is none
 });
 
 test('only a top-priority answerable row that is not set aside is pushed', () => {
-  const { sent, push } = collector('/tmp/keep-unused');
+  const { sent, push } = collector();
   push.observe({ attention: [] });
   push.observe({ attention: [
     waiting({ sessionId: 'low', pri: 1 }),
@@ -76,43 +78,103 @@ test('only a top-priority answerable row that is not set aside is pushed', () =>
   push.observe({ attention: [] });
   push.observe({ attention: ['question', 'permission', 'plan', 'input'].map((kind, index) =>
     waiting({ kind, sessionId: `s-${kind}`, since: index })) });
-  assert.deepEqual(sent.map((request) => request.push.sessionId),
+  assert.deepEqual(sent.map((message) => message.sessionId),
     ['s-question', 's-permission', 's-plan', 's-input']);
   assert.equal(notifiable(waiting({ pri: '0' })), true, 'pri is compared as a number, as the console does');
 });
 
-test('a row that leaves and comes back is a new event', () => {
-  const { sent, push } = collector('/tmp/keep-unused');
-  push.observe({ attention: [] });
-  push.observe({ attention: [waiting()] });
+test('a key that leaves and returns waits out the dedupe window', () => {
+  const { sent, push } = collector();
+  const base = Date.parse('2026-09-19T09:00:00Z');
+  push.observe({ attention: [] }, base);
+  push.observe({ attention: [waiting()] }, base);
   assert.equal(sent.length, 1);
-  push.observe({ attention: [] });
-  assert.equal(push.size, 0, 'a row that left the list is forgotten');
-  push.observe({ attention: [waiting()] });
-  assert.equal(sent.length, 2);
 
-  // The same session waiting on something new has a new key and pushes again.
-  push.observe({ attention: [waiting({ since: 5000 })] });
-  assert.equal(sent.length, 3);
-  assert.deepEqual(sent.map((request) => request.key), ['s-1:1000', 's-1:1000', 's-1:5000']);
+  // Gone and back inside six hours: the same waiting event, pushed once.
+  push.observe({ attention: [] }, base + 60e3);
+  assert.equal(push.size, 0, 'a row that left the list is forgotten');
+  push.observe({ attention: [waiting()] }, base + 120e3);
+  assert.equal(sent.length, 1);
+
+  // The same session waiting on something new is a new key, and pushes at once.
+  push.observe({ attention: [waiting({ since: 5000 })] }, base + 180e3);
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent.map((message) => message.key), ['s-1:1000', 's-1:5000']);
+
+  // And the old key pushes again once the window has passed.
+  push.observe({ attention: [] }, base + 7 * 3600e3);
+  push.observe({ attention: [waiting()] }, base + 7 * 3600e3);
+  assert.deepEqual(sent.map((message) => message.key), ['s-1:1000', 's-1:5000', 's-1:1000']);
+});
+
+test('the daily cap is its own, and it is a hundred rather than the alert budget', () => {
+  const { sent, push } = collector();
+  const base = Date.parse('2026-09-19T09:00:00Z');
+  push.observe({ attention: [] }, base);
+  const rows = (count) => Array.from({ length: count }, (_value, index) =>
+    waiting({ sessionId: `s-${index}`, since: index }));
+  push.observe({ attention: rows(130) }, base);
+  assert.equal(sent.length, 100, 'thirteen times the attention alert budget still fits');
+  assert.equal(push.sentToday, 100);
+
+  // The next local day starts the count over.
+  push.observe({ attention: [] }, base + 25 * 3600e3);
+  push.observe({ attention: [waiting({ sessionId: 'tomorrow', since: 1 })] }, base + 25 * 3600e3);
+  assert.equal(sent.length, 101);
+  assert.equal(push.sentToday, 1);
+});
+
+test('KEEP_ATTENTION_PUSH_DAILY sets the cap', (t) => {
+  const previous = process.env.KEEP_ATTENTION_PUSH_DAILY;
+  t.after(() => {
+    if (previous === undefined) delete process.env.KEEP_ATTENTION_PUSH_DAILY;
+    else process.env.KEEP_ATTENTION_PUSH_DAILY = previous;
+  });
+  process.env.KEEP_ATTENTION_PUSH_DAILY = '2';
+  const { sent, push } = collector();
+  push.observe({ attention: [] });
+  push.observe({ attention: [waiting({ sessionId: 'a', since: 1 }), waiting({ sessionId: 'b', since: 2 }),
+    waiting({ sessionId: 'c', since: 3 })] });
+  assert.deepEqual(sent.map((message) => message.sessionId), ['a', 'b']);
+});
+
+test('quiet hours drop the push instead of queueing it', (t) => {
+  const root = makeRoot(t);
+  const sent = [];
+  const push = createAttentionPush({
+    root,
+    sendExpo: (message) => { sent.push(message); return Promise.resolve('ok'); },
+  });
+  const now = Date.now();
+  alerts.setQuiet(new Date(now + 3600e3).toISOString(), root);
+  push.observe({ attention: [] }, now);
+  assert.deepEqual(push.observe({ attention: [waiting()] }, now), [], 'the real quiet file is read');
+  assert.deepEqual(sent, []);
+
+  // Quiet over: the row is still waiting, and the next new key is pushed. The
+  // dropped one is not replayed — the console still lists it.
+  alerts.setQuiet(null, root);
+  push.observe({ attention: [waiting()] }, now + 1);
+  assert.deepEqual(sent, [], 'the key it dropped is already known');
+  push.observe({ attention: [waiting({ since: 2000 })] }, now + 2);
+  assert.deepEqual(sent.map((message) => message.key), ['s-1:2000']);
 });
 
 test('the body and the title fall back the way the console does', () => {
-  const { sent, push } = collector('/tmp/keep-unused');
+  const { sent, push } = collector();
   push.observe({ attention: [] });
   push.observe({ attention: [
     waiting({ sessionId: 'a', since: 1, question: '', detail: 'Approve the command?' }),
     waiting({ sessionId: 'b', since: 2, question: '', detail: '', title: '' }),
   ] });
-  assert.deepEqual(sent.map((request) => [request.push.title, request.push.body]), [
+  assert.deepEqual(sent.map((message) => [message.title, message.body]), [
     ['keep-tool · Session 12', 'Approve the command?'],
     ['keep-tool · Session needs you', 'Waiting for your input.'],
   ]);
 
   // Project names: the catalog wins, a worktree is named for its repo, and an
   // unknown path is its last segment.
-  const catalog = { 'src/castle-www': { name: 'Castle' } };
-  const state = { projectCatalog: catalog };
+  const state = { projectCatalog: { 'src/castle-www': { name: 'Castle' } } };
   assert.equal(projectName(state, '/Users/jesse/src/castle-www'), 'Castle');
   assert.equal(projectName(state, '/Users/jesse/wt/castle-www/fix-feed'), 'Castle');
   assert.equal(projectName(state, '/Users/jesse/wt/keep-tool/light-state/'), 'light-state');
@@ -120,56 +182,20 @@ test('the body and the title fall back the way the console does', () => {
   assert.equal(projectName(state, ''), 'unknown');
 });
 
-test('a push runs the alerts policy: quiet hours defer it and phones get nothing', async (t) => {
-  const root = makeRoot(t);
-  let fetches = 0;
-  const devices = {
-    list: () => [{ expoPushToken: 'ExponentPushToken[attention1]' }],
-    remove: () => true,
-  };
-  const deliverWithFake = async (entry, options) => alerts.deliver(entry, {
-    ...options, devices, fetch: async () => { fetches += 1; return { ok: true, status: 200, json: async () => ({ data: [{ status: 'ok' }] }) }; },
-  });
-  const results = [];
-  const push = createAttentionPush({
-    root,
-    sendAlert: (request) => alerts.sendAlert({
-      ...request,
-      presence: { state: 'away', quietUntil: Date.now() + 60e3 },
-      // The real availability filter refuses every channel inside a test runner.
-      availableChannels: (channels) => channels.filter((channel) => channel === 'expo'),
-      deliver: deliverWithFake,
-    }).then((result) => { results.push(result); return result; }),
-  });
-  push.observe({ attention: [] });
-  push.observe({ attention: [waiting()] });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(results.length, 1);
-  assert.equal(results[0].deferred, true);
-  assert.deepEqual(results[0].channels, []);
-  assert.equal(fetches, 0, 'quiet hours reach no phone');
-  assert.equal(results[0].entry.push.key, 's-1:1000', 'the deferred entry still records what it would have shown');
-});
-
-test('an accepted push reaches the phone with the attention key as its tap target', async (t) => {
+test('a push reaches the phone directly and writes no alert ledger entry', async (t) => {
   const root = makeRoot(t);
   const bodies = [];
   const devices = { list: () => [{ expoPushToken: 'ExponentPushToken[attention1]' }], remove: () => true };
   const push = createAttentionPush({
     root,
-    sendAlert: (request) => alerts.sendAlert({
+    quiet: () => false,
+    sendExpo: (message, request) => alerts.sendExpo({ ...message, badge: 3 }, {
       ...request,
-      presence: { state: 'away' },
-      availableChannels: (channels) => channels.filter((channel) => channel === 'expo'),
-      badge: 3,
-      deliver: async (entry, options) => alerts.deliver(entry, {
-        ...options,
-        devices,
-        fetch: async (_url, init) => {
-          bodies.push(JSON.parse(init.body));
-          return { ok: true, status: 200, json: async () => ({ data: [{ status: 'ok' }] }) };
-        },
-      }),
+      devices,
+      fetch: async (_url, init) => {
+        bodies.push(JSON.parse(init.body));
+        return { ok: true, status: 200, json: async () => ({ data: [{ status: 'ok' }] }) };
+      },
     }),
   });
   push.observe({ attention: [] });
@@ -181,6 +207,13 @@ test('an accepted push reaches the phone with the attention key as its tap targe
   assert.equal(bodies[0].body, 'Which branch?');
   assert.equal(bodies[0].badge, 3);
   assert.equal(bodies[0].channelId, 'attention');
+  assert.equal(bodies[0].priority, 'high');
+
+  // The point of the direct path: no inbox row, and the attention alert budget
+  // is untouched.
+  assert.deepEqual(alerts.readAlerts({ root, all: true }), []);
+  assert.deepEqual(alerts.loadMeta(root), {});
+  assert.equal(fs.existsSync(path.join(root, '.keep', 'alerts.jsonl')), false);
 });
 
 test('with no phone registered nothing is fetched and nothing throws', async (t) => {
@@ -188,48 +221,54 @@ test('with no phone registered nothing is fetched and nothing throws', async (t)
   let fetches = 0;
   const push = createAttentionPush({
     root,
-    sendAlert: (request) => alerts.sendAlert({
+    quiet: () => false,
+    sendExpo: (message, request) => alerts.sendExpo(message, {
       ...request,
-      presence: { state: 'away' },
-      // The real filter: an empty registry leaves no channel at all.
-      availableChannels: (channels, alertRoot) =>
-        alerts.availableChannels(channels.filter((channel) => channel === 'expo'), alertRoot),
-      deliver: async (entry, options) => alerts.deliver(entry, {
-        ...options, fetch: async () => { fetches += 1; return { ok: true, status: 200, json: async () => ({ data: [] }) }; },
-      }),
+      fetch: async () => { fetches += 1; return { ok: true, status: 200, json: async () => ({ data: [] }) }; },
     }),
   });
   push.observe({ attention: [] });
-  const requests = push.observe({ attention: [waiting()] });
+  assert.equal(push.observe({ attention: [waiting()] }).length, 1);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(requests.length, 1);
-  assert.equal(fetches, 0);
-  assert.equal(alerts.readAlerts({ root, all: true }).length, 1, 'the alert is still recorded');
-  assert.deepEqual(alerts.readAlerts({ root, all: true })[0].channels, []);
+  assert.equal(fetches, 0, 'an empty registry is the end of it');
+  assert.deepEqual(alerts.readAlerts({ root, all: true }), []);
 });
 
 test('a failing send never escapes the publish callback', () => {
   const errors = [];
   const push = createAttentionPush({
     root: '/tmp/keep-unused',
-    sendAlert: () => { throw new Error('alerts are down'); },
+    quiet: () => false,
+    sendExpo: () => { throw new Error('expo is down'); },
     onError: (error) => errors.push(error.message),
   });
   push.observe({ attention: [] });
   assert.doesNotThrow(() => push.observe({ attention: [waiting()] }));
-  assert.deepEqual(errors, ['alerts are down']);
+  assert.deepEqual(errors, ['expo is down']);
 
   const rejecting = createAttentionPush({
     root: '/tmp/keep-unused',
-    sendAlert: () => Promise.reject(new Error('expo is down')),
+    quiet: () => false,
+    sendExpo: () => Promise.reject(new Error('the network is down')),
     onError: (error) => errors.push(error.message),
   });
   rejecting.observe({ attention: [] });
   assert.doesNotThrow(() => rejecting.observe({ attention: [waiting()] }));
+
+  // A quiet check that throws (an unreadable registry) must not either.
+  const broken = createAttentionPush({
+    root: '/tmp/keep-unused',
+    quiet: () => { throw new Error('unreadable'); },
+    sendExpo: () => Promise.resolve('ok'),
+    onError: (error) => errors.push(error.message),
+  });
+  broken.observe({ attention: [] });
+  assert.throws(() => broken.observe({ attention: [waiting()] }), /unreadable/,
+    'the daemon catches this one at the publish hook');
 });
 
 test('the daemon hands the observer whatever it published, however odd', () => {
-  const { sent, push } = collector('/tmp/keep-unused');
+  const { sent, push } = collector();
   assert.deepEqual(push.observe(null), []);
   assert.deepEqual(push.observe({}), []);
   assert.deepEqual(push.observe({ attention: 'not a list' }), []);
