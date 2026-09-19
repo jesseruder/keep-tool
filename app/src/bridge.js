@@ -128,6 +128,12 @@ function parseBridgeMessage(raw) {
 // real request 200 produces it. `ready` means the page's scripts ran, which happens
 // before any request and again after every `hello`, so treating it as proof of a
 // working session is what let alternating ready/unauthorized reload in a tight loop.
+//
+// A failure is an attempted bootstrap that `authenticated` never followed. A refusal
+// the interval merely postponed is not one: counting those walled a phone with a
+// perfectly good token behind the error panel after two daemon restarts close
+// together, having never retried the second. Postponed refusals become a pending
+// retry instead, and `retryAt` says when it may run.
 const BOOTSTRAP_DEBOUNCE_MS = 10000;
 const BOOTSTRAP_STALE_MS = 5 * 60 * 1000;
 const BOOTSTRAP_MAX_FAILURES = 2;
@@ -138,7 +144,7 @@ function bootstrapState() {
   // `fresh` is the single exemption from the interval, spent on the first refusal
   // after a mount so a daemon restart recovers at once. Nothing re-arms it but a
   // deliberate retry.
-  return { at: 0, failures: 0, recent: [], fresh: true };
+  return { at: 0, failures: 0, recent: [], fresh: true, pending: false };
 }
 
 function normalizeBootstrapState(state) {
@@ -147,38 +153,69 @@ function normalizeBootstrapState(state) {
     failures: Number(state?.failures) || 0,
     recent: Array.isArray(state?.recent) ? state.recent.filter((at) => Number.isFinite(at)) : [],
     fresh: state?.fresh !== false,
+    pending: state?.pending === true,
   };
 }
 
-// Pure: `{ action, state }` from the previous state, the trigger, and the clock.
-// `event.reason` is 'unauthorized' (a 403 on the top frame, or the console saying
-// so), 'foreground' (with `awayMs`), or 'authenticated'. Anything else is ignored —
-// an unrecognized reason must never be able to reach the reload.
+// Pure: `{ action, state, retryAt }` from the previous state, the trigger, and the
+// clock. `event.reason` is 'unauthorized' (a 403 on the top frame, or the console
+// saying so), 'foreground' (with `awayMs`), 'authenticated', or 'retry' (the caller's
+// timer, firing at a `retryAt` this returned). Anything else is ignored — an
+// unrecognized reason must never be able to reach the reload.
 function decideBootstrap(state, event = {}, now = Date.now()) {
   const current = normalizeBootstrapState(state);
   const reason = text(event.reason);
 
-  if (reason === 'authenticated') return { action: 'ignore', state: { ...current, failures: 0 } };
-  if (reason === 'foreground') {
-    // A short trip to another app does not cost the session, and reloading under
-    // someone who just switched back is worse than a stale page.
-    if (!(Number(event.awayMs) >= BOOTSTRAP_STALE_MS)) return { action: 'ignore', state: current };
-  } else if (reason !== 'unauthorized') return { action: 'ignore', state: current };
+  // A working session settles everything behind it, including a waiting retry.
+  if (reason === 'authenticated') {
+    return { action: 'ignore', state: { ...current, failures: 0, pending: false }, retryAt: 0 };
+  }
 
-  const failures = reason === 'unauthorized' ? current.failures + 1 : current.failures;
-  if (failures >= BOOTSTRAP_MAX_FAILURES) return { action: 'show-error', state: { ...current, failures } };
+  let wanted = reason === 'unauthorized';
+  // A short trip to another app does not cost the session, and reloading under
+  // someone who just switched back is worse than a stale page.
+  if (reason === 'foreground') wanted = Number(event.awayMs) >= BOOTSTRAP_STALE_MS;
+  else if (reason === 'retry') wanted = current.pending;
+  else if (reason !== 'unauthorized') wanted = false;
+  // Whatever else happens, a retry already waiting keeps waiting.
+  if (!wanted) {
+    return {
+      action: 'ignore',
+      state: current,
+      retryAt: current.pending ? current.at + BOOTSTRAP_DEBOUNCE_MS : 0,
+    };
+  }
+
+  if (current.failures >= BOOTSTRAP_MAX_FAILURES) {
+    return { action: 'show-error', state: { ...current, pending: false }, retryAt: 0 };
+  }
 
   const recent = current.recent.filter((at) => now - at < BOOTSTRAP_CEILING_MS);
-  if (recent.length >= BOOTSTRAP_CEILING) return { action: 'show-error', state: { ...current, failures, recent } };
+  if (recent.length >= BOOTSTRAP_CEILING) {
+    return { action: 'show-error', state: { ...current, recent, pending: false }, retryAt: 0 };
+  }
 
   const exempt = current.fresh && reason === 'unauthorized';
   if (!exempt && current.at && now - current.at < BOOTSTRAP_DEBOUNCE_MS) {
-    return { action: 'ignore', state: { ...current, failures, recent } };
+    // Postponed, not refused: nothing is counted, and the caller is told when to
+    // come back so the refusal is not simply dropped.
+    return {
+      action: 'ignore',
+      state: { ...current, recent, pending: true },
+      retryAt: current.at + BOOTSTRAP_DEBOUNCE_MS,
+    };
   }
 
   return {
     action: 'bootstrap',
-    state: { at: now, failures, recent: [...recent, now], fresh: current.fresh && reason !== 'unauthorized' },
+    state: {
+      at: now,
+      failures: current.failures + 1,
+      recent: [...recent, now],
+      fresh: current.fresh && reason !== 'unauthorized',
+      pending: false,
+    },
+    retryAt: 0,
   };
 }
 

@@ -28,11 +28,17 @@ than exceptional. The app reloads the `?token=` URL when
 - the top frame gets an HTTP 403, or the console posts `{type:'unauthorized'}`.
 
 Three independent brakes hold it, because each one alone has a hole: at most one
-reload per ten seconds; at most three in five minutes; and two refusals in a row
-stop the retrying outright. Whichever trips first shows the native banner pointing at
-Setup, and only Retry or the manual reload clears them. The one exemption from the
-interval is the first refusal after a mount, so a daemon restart recovers at once —
-it is spent on use and nothing re-arms it.
+reload per ten seconds; at most three in five minutes; and two *attempted* reloads
+with no `authenticated` between them stop the retrying outright. Whichever trips
+first shows the native banner pointing at Setup, and only Retry or the manual reload
+clears them. The one exemption from the interval is the first refusal after a mount,
+so a daemon restart recovers at once — it is spent on use and nothing re-arms it.
+
+A refusal the interval postpones is not a failure and is not dropped: the rule
+returns a `retryAt`, the Console screen holds a timer for it, and the reload happens
+once the interval is up. Counting postponed refusals stranded a phone with a
+perfectly good token behind the error panel whenever two daemon restarts landed
+within ten seconds of each other.
 
 Only `{type:'authenticated'}`, which the console posts once per page load after a
 request actually comes back 200, clears the failure count. **`ready` does not**: it

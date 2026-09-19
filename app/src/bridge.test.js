@@ -78,7 +78,7 @@ function runBootstrap(script, state = bootstrapState()) {
 }
 
 test('a session the daemon forgot recovers, and a wrong one stops asking', () => {
-  assert.deepEqual(bootstrapState(), { at: 0, failures: 0, recent: [], fresh: true });
+  assert.deepEqual(bootstrapState(), { at: 0, failures: 0, recent: [], fresh: true, pending: false });
 
   // The happy path: a daemon restart drops the session, the first refusal retries at
   // once, the console authenticates, and the count behind it is cleared. Much later
@@ -93,11 +93,57 @@ test('a session the daemon forgot recovers, and a wrong one stops asking', () =>
   assert.equal(later.action, 'bootstrap', 'a refusal long afterwards is a new problem, not the old one');
   assert.deepEqual(later.state.recent, [T + BOOTSTRAP_CEILING_MS + 1], 'the stale bootstrap aged out of the ceiling');
 
-  // A token that is simply wrong: two refusals in a row and it stops, whatever asks.
-  const wrong = runBootstrap([['unauthorized', 0], ['unauthorized', 3]]);
-  assert.deepEqual(wrong.actions, ['bootstrap', 'show-error']);
+  // A token that is simply wrong walls after two *attempted* bootstraps. The refusal
+  // 3ms in is postponed rather than counted, so the wall arrives one retry later
+  // than it used to — the price of not stranding a phone whose token is fine.
+  const wrong = runBootstrap([
+    ['unauthorized', 0], ['unauthorized', 3], ['retry', BOOTSTRAP_DEBOUNCE_MS], ['unauthorized', BOOTSTRAP_DEBOUNCE_MS + 3],
+  ]);
+  assert.deepEqual(wrong.actions, ['bootstrap', 'ignore', 'bootstrap', 'show-error']);
+  assert.equal(wrong.state.failures, 2);
   assert.equal(decideBootstrap(wrong.state, { reason: 'unauthorized' }, T + 60_000).action, 'show-error');
   assert.equal(decideBootstrap(wrong.state, { reason: 'foreground', awayMs: BOOTSTRAP_STALE_MS }, T + 60_000).action, 'show-error');
+});
+
+test('a second restart inside the interval is postponed, never counted against the token', () => {
+  // The round-3 regression: the throttled refusal used to increment the failure
+  // count without ever attempting its bootstrap, so two daemon restarts a few
+  // seconds apart left a phone with a valid token stranded behind the error panel.
+  const recovered = runBootstrap([['unauthorized', 0], ['authenticated', 100]]);
+  assert.deepEqual(recovered.actions, ['bootstrap', 'ignore']);
+  assert.equal(recovered.state.failures, 0);
+
+  const second = decideBootstrap(recovered.state, { reason: 'unauthorized' }, T + 3000);
+  assert.equal(second.action, 'ignore', 'inside the interval, so it waits');
+  assert.equal(second.state.failures, 0, 'waiting is not failing');
+  assert.equal(second.state.pending, true);
+  assert.equal(second.retryAt, T + BOOTSTRAP_DEBOUNCE_MS, 'and it says when to come back');
+
+  // A third refusal while the retry waits changes nothing but keeps the appointment.
+  const third = decideBootstrap(second.state, { reason: 'unauthorized' }, T + 6000);
+  assert.equal(third.action, 'ignore');
+  assert.equal(third.state.failures, 0);
+  assert.equal(third.retryAt, T + BOOTSTRAP_DEBOUNCE_MS);
+
+  // The interval elapses and the postponed bootstrap actually happens.
+  const kept = decideBootstrap(third.state, { reason: 'retry' }, T + BOOTSTRAP_DEBOUNCE_MS);
+  assert.equal(kept.action, 'bootstrap');
+  assert.equal(kept.state.failures, 1);
+  assert.equal(kept.state.pending, false);
+
+  // Unrelated events neither lose the appointment nor fire it early, and a retry
+  // with nothing pending does nothing at all.
+  const held = decideBootstrap(second.state, { reason: 'ready' }, T + 4000);
+  assert.equal(held.action, 'ignore');
+  assert.equal(held.state.pending, true);
+  assert.equal(held.retryAt, T + BOOTSTRAP_DEBOUNCE_MS);
+  assert.equal(decideBootstrap(second.state, { reason: 'retry' }, T + 4000).action, 'ignore', 'early retry still inside the interval');
+  assert.equal(decideBootstrap(recovered.state, { reason: 'retry' }, T + 60_000).action, 'ignore', 'nothing pending');
+  // And authenticating in the meantime cancels it outright.
+  const settled = decideBootstrap(second.state, { reason: 'authenticated' }, T + 5000);
+  assert.equal(settled.state.pending, false);
+  assert.equal(settled.retryAt, 0);
+  assert.equal(decideBootstrap(settled.state, { reason: 'retry' }, T + BOOTSTRAP_DEBOUNCE_MS).action, 'ignore');
 });
 
 test('a console that keeps announcing itself cannot drive the reload', () => {
@@ -107,10 +153,17 @@ test('a console that keeps announcing itself cannot drive the reload', () => {
   const flap = [];
   for (let index = 0; index < 8; index += 1) flap.push(['ready', index * 2], ['unauthorized', index * 2 + 1]);
   const flapped = runBootstrap(flap);
-  assert.deepEqual(flapped.actions.filter((action) => action === 'bootstrap').length, 1,
+  assert.equal(flapped.actions.filter((action) => action === 'bootstrap').length, 1,
     'exactly one reload in sixteen milliseconds of flapping');
-  assert.deepEqual(flapped.actions.slice(0, 4), ['ignore', 'bootstrap', 'ignore', 'show-error']);
-  assert.ok(flapped.actions.slice(4).every((action) => ['ignore', 'show-error'].includes(action)));
+  assert.deepEqual(flapped.actions.slice(0, 4), ['ignore', 'bootstrap', 'ignore', 'ignore']);
+  assert.ok(flapped.actions.slice(2).every((action) => action === 'ignore'));
+
+  // It is postponed, not forgotten: the retry lands one interval later, and because
+  // `ready` never cleared the count that second attempt is the last one.
+  const attempted = decideBootstrap(flapped.state, { reason: 'retry' }, T + BOOTSTRAP_DEBOUNCE_MS + 1);
+  assert.equal(attempted.action, 'bootstrap');
+  assert.equal(attempted.state.failures, 2);
+  assert.equal(decideBootstrap(attempted.state, { reason: 'unauthorized' }, T + BOOTSTRAP_DEBOUNCE_MS + 2).action, 'show-error');
 
   // `hello` replaying `ready` is likewise inert, and no unrecognized reason can
   // reach the reload — including on state this has never seen.
@@ -134,9 +187,11 @@ test('the interval and the ceiling bound reloads that each look reasonable alone
     ['bootstrap', 'ignore', 'bootstrap', 'ignore', 'bootstrap', 'ignore', 'show-error', 'ignore']);
 
   // The one-shot exemption is spent on the first refusal and never re-armed, so a
-  // second refusal inside the window waits even with the count cleared between them.
+  // second refusal inside the window waits out the interval (it is not dropped —
+  // it comes back as a pending retry) even with the count cleared between them.
   const spent = runBootstrap([['unauthorized', 0], ['authenticated', 100], ['unauthorized', 200]]);
   assert.deepEqual(spent.actions, ['bootstrap', 'ignore', 'ignore']);
+  assert.equal(spent.state.pending, true);
 
   // Coming back from the background: only a long absence is worth a fresh session,
   // and even then only one per interval.

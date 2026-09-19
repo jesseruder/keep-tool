@@ -56,6 +56,8 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
   const readyRef = useRef(false);
   const canGoBackRef = useRef(false);
   const graceRef = useRef(null);
+  const retryRef = useRef(null);
+  const triggerRef = useRef(null);
   const bootstrapRef = useRef(bootstrapState());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -73,10 +75,15 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
   const bootstrap = useMemo(() => bootstrapScript(injection), [injection]);
   const hello = useMemo(() => helloScript(injection), [injection]);
 
-  useEffect(() => () => { if (graceRef.current) clearTimeout(graceRef.current); }, []);
+  useEffect(() => () => {
+    if (graceRef.current) clearTimeout(graceRef.current);
+    if (retryRef.current) clearTimeout(retryRef.current);
+  }, []);
 
   const loadBootstrap = useCallback(() => {
     if (graceRef.current) clearTimeout(graceRef.current);
+    if (retryRef.current) clearTimeout(retryRef.current);
+    retryRef.current = null;
     readyRef.current = false;
     canGoBackRef.current = false;
     setError(null);
@@ -84,19 +91,30 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
     setBootstrapKey((value) => value + 1);
   }, []);
 
-  // Every re-bootstrap trigger goes through the same decision, so the debounce and
-  // the failure count cannot be sidestepped by whichever one happens to fire.
+  // Every re-bootstrap trigger goes through the same decision, so the interval, the
+  // ceiling and the failure count cannot be sidestepped by whichever one fires.
   const trigger = useCallback((reason, extra = {}) => {
-    const { action, state } = decideBootstrap(bootstrapRef.current, { reason, ...extra });
+    const { action, state, retryAt } = decideBootstrap(bootstrapRef.current, { reason, ...extra });
     bootstrapRef.current = state;
+    if (retryRef.current) clearTimeout(retryRef.current);
+    retryRef.current = null;
     if (action === 'bootstrap') loadBootstrap();
     else if (action === 'show-error') {
       if (graceRef.current) clearTimeout(graceRef.current);
       setLoading(false);
       setError(TOKEN_ERROR);
+    } else if (retryAt) {
+      // A refusal the interval postponed still has to happen, or a second daemon
+      // restart inside ten seconds is simply lost.
+      retryRef.current = setTimeout(() => {
+        retryRef.current = null;
+        triggerRef.current?.('retry');
+      }, Math.max(0, retryAt - Date.now()));
     }
     return action;
   }, [loadBootstrap]);
+
+  useEffect(() => { triggerRef.current = trigger; }, [trigger]);
 
   const send = useCallback((message) => {
     if (!webRef.current) return false;
