@@ -192,7 +192,6 @@ async function setupNotifications() {
         return {
           shouldShowBanner: show,
           shouldShowList: show,
-          shouldShowAlert: show,
           shouldPlaySound: show,
           shouldSetBadge: false,
         };
