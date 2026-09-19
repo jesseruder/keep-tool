@@ -359,6 +359,12 @@ export function mobileActive() { return active; }
 // it would only make the next Back a dead press.
 export function openMobileStage() {
   if (!active || ctx.state.mode !== 'triage' || !ctx.state.currentItem) return;
+  // A tap rarely lands on Triage: coming back to it gives up the tab's entry,
+  // and that rewind is still in flight here. Unwinding or pushing over a
+  // traversal that has not landed would leave the stack naming an entry the
+  // traversal is about to move off — and Back a dead press — so the swallowed
+  // popstate calls back here instead, and finds the stack settled.
+  if (swallow > 0) { pendingStage = true; return; }
   // Whatever the phone was left with open covers the stage: a sheet, the inbox,
   // a row's actions menu. The stage has to be the screen, and it is strictly
   // under them in the stack, so they go first — the way their own Back would
@@ -372,11 +378,6 @@ export function openMobileStage() {
     sync();
     if (pops) { pendingStage = true; rewind(pops); return; }
   }
-  // A tap rarely lands on Triage: coming back to it gives up the tab's entry,
-  // and that rewind is still in flight here. Pushing the stage over it would
-  // leave the stack naming an entry the traversal is about to move off — and
-  // Back a dead press — so the swallowed popstate opens it instead.
-  if (!ctx.state.focusMode && swallow > 0) { pendingStage = true; return; }
   if (!ctx.state.focusMode) open('stage');
   // renderTop() syncs before the stage itself is rendered, so the back bar is a
   // render behind whenever the stage was already up. Catch it up on the row the
