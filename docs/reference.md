@@ -25,6 +25,7 @@ registry data or credentials to the public source repository.
 - `reviews/` — fleet-reviewer findings, one file per day
 - `bin/alerts.js` — alert routing, rate policy, channel adapters, and brief composition
 - `bin/devices.js` — the phones registered for Expo push, and the `/api/devices` registry
+- `bin/attention-push.js` — the console's waiting-session notification rule, run daemon-side for the phone
 - `bin/unblock.js` — cross-card dependency resolution and linked-session delivery
 - `bin/slack.js` — read-only Slack polling, fleet correlation, cards, and alerts
 - `bin/incidents.js` — deterministic alert parsing for the bots in `alertBots`, and the incident card per signature
@@ -784,9 +785,10 @@ registered phone, by posting to `https://exp.host/--/api/v2/push/send` with a
 ```
 
 The title matches the desktop banner's (`Keep`, the alert's `from`, and
-`· Urgent` for an urgent one). `data.key` is what the app hands back to the
-console on a notification tap: `alert:<id>` opens that message in the inbox, the
-same path a desktop banner click takes. `badge` is the console's own count — the
+`· Urgent` for an urgent one) unless the caller says what the phone should show.
+`data.key` is what the app hands back to the console on a notification tap:
+`alert:<id>` opens that message in the inbox, the same path a desktop banner
+click takes, and an attention key selects that row in the queue. `badge` is the console's own count — the
 attention rows it is showing plus its unread inbox messages — read from the last
 state the daemon published. It is therefore approximate by design: dismissals are
 browser-local, and an alert's own inbox entry is appended after delivery, so it is
@@ -799,6 +801,34 @@ list must name `expo` to enable it, exactly as it must name `desktop`.
 Expo answers with one ticket per token: a `DeviceNotRegistered` ticket
 unregisters that device (an uninstalled app, or a rotated token), and any other
 failure is logged at most once a minute and never raised to the caller.
+
+### A session waiting on you
+
+The phone's main case is not a `keep alert`: it is a session that started waiting.
+The console raises those notifications itself (`applyStateEffects` in
+`web/app/app.js`), which a phone with no console open never sees, so `bin/attention-push.js`
+runs the same rule on the daemon side, once per published state, and pushes
+instead. A row is pushed when its attention key is new since the previous
+publication, `pri` is 0, its kind is `question`, `permission`, `plan` or `input`,
+and Owner has not set it aside — health, stalled, unblocked and overdue rows are
+watched in the console and never pushed. The key is the console's own
+(`item.key`, else `<session/task/pane>:<since>`), so a tap selects that row; the
+title is `<project> · <row title>` and the body is the row's question, else its
+detail, else `Waiting for your input.`.
+
+The first publication after the daemon starts seeds the key set and notifies for
+nothing in it — a restart is not news — and a key that leaves the attention list
+is forgotten, so the same session waiting again later pushes again. There is no
+disk state and one Set of keys in memory.
+
+These go through `keep alert` at level `attention`, so quiet hours, the six-hour
+per-key dedupe and the daily attention cap apply, and each one appears in the
+alert ledger and the console's inbox. They are delivered to the `expo` channel
+only: the webhook's consumer is unknown and has only ever received `keep alert`
+output, and the speakers stay for urgent alerts. They also carry `desktop: false`,
+because the console is already raising its own banner for the same row. With
+Owner present at the Mac the attention level routes to `sound`, so nothing is
+pushed to the phone at all — the console is right there.
 
 ## Standup
 

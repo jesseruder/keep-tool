@@ -332,17 +332,21 @@ async function sendExpo(entry, options = {}) {
   const badge = currentBadge(options.badge);
   // Tests drive the once-a-minute log throttle through this rather than the clock.
   const now = Number.isFinite(options.now) ? options.now : Date.now();
-  const title = `${entry.from === 'manual' ? 'Keep' : entry.from || 'Keep'}${entry.level === 'urgent' ? ' · Urgent' : ''}`;
+  // A caller that knows what the phone should show supplies `push`; otherwise the
+  // notification is the ledger entry, titled the way the desktop banner is.
+  const push = entry.push && typeof entry.push === 'object' ? entry.push : {};
+  const title = push.title
+    || `${entry.from === 'manual' ? 'Keep' : entry.from || 'Keep'}${entry.level === 'urgent' ? ' · Urgent' : ''}`;
   let ok = false;
   for (let start = 0; start < devices.length; start += EXPO_BATCH) {
     const tokens = devices.slice(start, start + EXPO_BATCH).map((device) => device.expoPushToken);
     const message = {
       to: tokens,
       title,
-      body: entry.text,
-      // `alert:<id>` is the key the console's notification-click handler opens in
-      // the inbox; the session id rides along for entries that name one.
-      data: { key: `alert:${entry.id}`, sessionId: String(entry.session || '') },
+      body: push.body || entry.text,
+      // The key the app hands back on a tap: an attention key the console selects,
+      // or `alert:<id>`, which its notification-click handler opens in the inbox.
+      data: { key: push.key || `alert:${entry.id}`, sessionId: String(push.sessionId || '') },
       ...(badge === null ? {} : { badge }),
       sound: 'default',
       channelId: 'attention',
@@ -449,8 +453,12 @@ async function sendAlert(options) {
       card: options.card || '',
       channels,
       deferred,
+      // What the phone shows and what a tap selects, when the caller knows better
+      // than the ledger text does (the waiting-session pushes do).
+      ...(options.push && typeof options.push === 'object' ? { push: options.push } : {}),
       // The desktop shell adds a visual banner; existing channels retain delivery.
-      desktop: !deferred && info.state === 'present' && options.level !== 'brief'
+      // `desktop: false` is for an alert the console already notifies about itself.
+      desktop: options.desktop !== false && !deferred && info.state === 'present' && options.level !== 'brief'
         && (!enabledChannels() || enabledChannels().has('desktop')),
       presence: info,
       ...(!decision.ok ? { why: decision.why } : routing.deferred ? { why: 'quiet' } : {}),
@@ -701,6 +709,7 @@ module.exports = {
   sendAlert,
   deliver,
   sendExpo,
+  availableChannels,
   badgeFromState,
   setBadgeProvider,
   loadReviewFindings,

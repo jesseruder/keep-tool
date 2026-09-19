@@ -196,6 +196,52 @@ test('quiet hours defer the expo channel exactly as they defer the rest', async 
   assert.equal(pushes, 1);
 });
 
+test('a caller can say what the phone shows and keep the console from banner-ing twice', async (t) => {
+  const root = makeRoot(t);
+  const bodies = [];
+  const result = await alerts.sendAlert({
+    root,
+    level: 'attention',
+    key: 'session-waiting',
+    text: 'Keep · Session 12 — Which branch?',
+    from: 'attention',
+    // Owner is at the Mac, so this alert would ordinarily be desktop-eligible.
+    presence: { state: 'present' },
+    desktop: false,
+    push: { title: 'Keep · Session 12', body: 'Which branch?', key: 's-1:1000', sessionId: 's-1' },
+    availableChannels: () => ['expo'],
+    deliver: async (entry, options) => alerts.deliver(entry, {
+      ...options,
+      devices: fakeRegistry(['aaaaaa']),
+      fetch: async (_url, init) => { bodies.push(JSON.parse(init.body)); return expoOk(1); },
+    }),
+  });
+  assert.equal(result.entry.desktop, false, 'the console already notified about this row itself');
+  assert.deepEqual(result.entry.push.key, 's-1:1000');
+  assert.equal(bodies[0].title, 'Keep · Session 12');
+  assert.equal(bodies[0].body, 'Which branch?');
+  assert.deepEqual(bodies[0].data, { key: 's-1:1000', sessionId: 's-1' });
+
+  // Without those options the entry is desktop-eligible and the push is the ledger entry.
+  const plain = await alerts.sendAlert({
+    root,
+    level: 'attention',
+    key: 'ordinary',
+    text: 'Something happened',
+    presence: { state: 'present' },
+    availableChannels: () => ['expo'],
+    deliver: async (entry, options) => alerts.deliver(entry, {
+      ...options,
+      devices: fakeRegistry(['aaaaaa']),
+      fetch: async (_url, init) => { bodies.push(JSON.parse(init.body)); return expoOk(1); },
+    }),
+  });
+  assert.equal(plain.entry.desktop, true);
+  assert.equal('push' in plain.entry, false);
+  assert.equal(bodies[1].body, 'Something happened');
+  assert.equal(bodies[1].data.key, `alert:${plain.entry.id}`);
+});
+
 test('the channel becomes available only once a phone has registered', (t) => {
   const root = makeRoot(t);
   // availableChannels refuses every channel inside a test runner, so the real

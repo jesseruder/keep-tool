@@ -9709,6 +9709,10 @@ function start(deps = {}) {
   });
   const publishedPanes = { panes: null, at: 0, epoch: 0 };
   let lastPaneEpoch = 0;
+  const attentionPush = require('./attention-push.js').createAttentionPush({
+    root: keep.ROOT,
+    onError: (error) => process.stderr.write(`keep serve: attention push failed: ${error.message}\n`),
+  });
   dashboardPublisher = createDashboardPublisher({
     prepare: async () => {
       // Fence before every source read. A mutation that completes while panes,
@@ -9737,6 +9741,10 @@ function start(deps = {}) {
     publish: (publication) => {
       retainedPublication = publication;
       uiWorker?.publish(publication);
+      // A phone is not running the console, so the daemon raises the
+      // waiting-session notifications the console raises for the desktop.
+      try { attentionPush.observe(publication.state); }
+      catch (error) { process.stderr.write(`keep serve: attention push failed: ${error.message}\n`); }
     },
     minIntervalMs: envNumber('KEEP_DASHBOARD_MIN_INTERVAL_MS', 5000),
     onError: (error) => process.stderr.write(`keep serve: dashboard refresh failed; retaining published state: ${error.message}\n`),
