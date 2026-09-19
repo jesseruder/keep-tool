@@ -57,6 +57,8 @@ function makeScreenStyles(colors) {
     historyButtonText: { color: colors.info, fontFamily: mono, fontSize: 10, fontWeight: '700' },
     historyStatus: { color: colors.termDim, flexShrink: 1, fontFamily: mono, fontSize: 10 },
     historyError: { color: colors.bad, fontFamily: mono, fontSize: 10, paddingBottom: 7 },
+    switchView: { borderColor: colors.barLine, borderRadius: 4, borderWidth: 1, justifyContent: 'center', minHeight: 26, paddingHorizontal: 8 },
+    switchViewText: { color: colors.info, fontFamily: mono, fontSize: 10, fontWeight: '700' },
     empty: { alignItems: 'center', flex: 1, justifyContent: 'center', padding: 24 },
     emptyText: { color: colors.termDim, fontFamily: mono, fontSize: 12, lineHeight: 18, textAlign: 'center' },
     // The key row is an accessory bar, not a toolbar: keep it thin so the terminal
@@ -131,7 +133,9 @@ function KeyButton({ disabled, label, name, onKey, repeat, styles }) {
   );
 }
 
-export default function Screen({ colors, config, onBack, pane, project: projectPath, session, sessionId }) {
+export default function Screen({
+  colors, config, onBack, onSwitchView, pane, project: projectPath, session, sessionId, switchLabel,
+}) {
   const styles = useMemo(() => makeScreenStyles(colors), [colors]);
   // Either an agent session or a bare shell pane; the daemon takes one or the other.
   const target = useMemo(() => (sessionId ? { sessionId } : { pane }), [pane, sessionId]);
@@ -352,7 +356,17 @@ export default function Screen({ colors, config, onBack, pane, project: projectP
             </View>
           )}
         </View>
-        <Text numberOfLines={1} style={styles.meta}>{project.name} · pane {paneLabel} · viewing at {cols}×{rows}</Text>
+        <View style={{ alignItems: 'center', flexDirection: 'row', gap: 8, paddingHorizontal: 72 }}>
+          <Text numberOfLines={1} style={[styles.meta, { flexShrink: 1, paddingHorizontal: 0 }]}>
+            {project.name} · pane {paneLabel} · viewing at {cols}×{rows}
+          </Text>
+          {/* The way back to the native terminal, which is what this screen is a fallback for. */}
+          {onSwitchView ? (
+            <Pressable accessibilityRole="button" onPress={onSwitchView} style={({ pressed }) => [styles.switchView, pressed && { opacity: 0.7 }]}>
+              <Text style={styles.switchViewText}>{switchLabel || 'Live view'}</Text>
+            </Pressable>
+          ) : null}
+        </View>
       </View>
 
       <View onLayout={(event) => setBodyWidth(event.nativeEvent.layout.width)} style={styles.body}>

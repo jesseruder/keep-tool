@@ -5,6 +5,7 @@ import { Button, mono } from '../ui';
 
 const { createEmulator } = require('../terminal/emulator');
 const { fixture, frameData, expectedRuns, sameRun } = require('../terminal/fixture');
+const { runStyle } = require('../terminal/style');
 
 // Phase 3 step 0: does xterm's parser run under Hermes, and how fast? The fixture is a
 // synthetic relay stream built by src/terminal/fixtures/generate.js, with the expected
@@ -15,29 +16,6 @@ const { fixture, frameData, expectedRuns, sameRun } = require('../terminal/fixtu
 // palette, 256-colour and truecolour, and every attribute, because a colour mapping
 // that broke under Hermes would render a screen that still reads correctly — and a
 // PASS on text alone would be a lie about exactly the part hardest to eyeball.
-
-const ANSI_16 = [
-  '#000000', '#cc0000', '#4e9a06', '#c4a000', '#3465a4', '#75507b', '#06989a', '#d3d7cf',
-  '#555753', '#ef2929', '#8ae234', '#fce94f', '#729fcf', '#ad7fa8', '#34e2e2', '#eeeeec',
-];
-
-function paletteColor(value) {
-  if (value < 16) return ANSI_16[value];
-  if (value < 232) {
-    const index = value - 16;
-    const step = (n) => (n === 0 ? 0 : 55 + n * 40);
-    const channel = (n) => step(n).toString(16).padStart(2, '0');
-    return `#${channel(Math.floor(index / 36) % 6)}${channel(Math.floor(index / 6) % 6)}${channel(index % 6)}`;
-  }
-  const grey = (8 + (value - 232) * 10).toString(16).padStart(2, '0');
-  return `#${grey}${grey}${grey}`;
-}
-
-function colorFor(value, fallback) {
-  if (value === null || value === undefined) return fallback;
-  if (typeof value === 'string') return value;
-  return paletteColor(value);
-}
 
 function now() {
   if (typeof global !== 'undefined' && global.performance && typeof global.performance.now === 'function') {
@@ -116,30 +94,14 @@ async function runSpike() {
   };
 }
 
-function Row({ row, style }) {
+function Row({ row, style, theme }) {
   if (row.runs.length <= 1) return <Text style={style}>{row.text.slice(0, row.trimmed) || ' '}</Text>;
   return (
     <Text style={style}>
       {row.runs.map((run, index) => {
         const text = row.text.slice(run.start, Math.min(run.end, row.trimmed));
         if (!text) return null;
-        const fg = colorFor(run.inverse ? run.bg : run.fg, run.inverse ? '#000000' : undefined);
-        const bg = colorFor(run.inverse ? run.fg : run.bg, run.inverse ? '#d0d0d0' : undefined);
-        return (
-          <Text
-            key={`${index}:${run.start}`}
-            style={{
-              backgroundColor: bg,
-              color: fg,
-              fontStyle: run.italic ? 'italic' : 'normal',
-              fontWeight: run.bold ? '700' : '400',
-              opacity: run.dim ? 0.6 : 1,
-              textDecorationLine: run.underline ? 'underline' : 'none',
-            }}
-          >
-            {text}
-          </Text>
-        );
+        return <Text key={`${index}:${run.start}`} style={runStyle(run, theme)}>{text}</Text>;
       })}
     </Text>
   );
@@ -226,7 +188,9 @@ export default function Spike({ colors, onBack, styles: appStyles }) {
           <Text style={[styles.sub, { marginTop: 14 }]}>The parsed screen, drawn as native text rows:</Text>
           <ScrollView horizontal>
             <View>
-              {result.rows.map((row, index) => <Row key={index} row={row} style={styles.screenRow} />)}
+              {result.rows.map((row, index) => (
+                <Row key={index} row={row} style={styles.screenRow} theme={{ bg: colors.bg, fg: colors.text }} />
+              ))}
             </View>
           </ScrollView>
         </>

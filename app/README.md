@@ -12,8 +12,9 @@ the same API. Three screens, on a React Navigation native stack:
   from the gear in the console screen's top bar.
 - **Console** — a `react-native-webview` holding the console itself. This is where
   everything happens.
-- **Terminal** — the polled plain-text terminal viewer, reached only when the console
-  asks for it. It is the fallback until a native terminal lands.
+- **Terminal** — the native terminal, reached only when the console asks for it. The
+  old polled plain-text viewer is still there behind a **Text view** toggle, which is
+  remembered; it goes away once the native one has a week of use.
 
 ### Bootstrap
 
@@ -50,6 +51,59 @@ else in the app stores or reads the cookie.
 
 The native side still sends `x-keep-token` for the two things it does itself: the
 setup connection check and the 15-minute background sweep.
+
+### Terminal
+
+The phone runs xterm's parser itself. `@xterm/headless` parses the pane's bytes in the
+app (`src/terminal/emulator.js`) and the rows are drawn as native `<Text>`, one per
+line with a nested `<Text>` per styling run — there is no canvas in React Native to
+hand xterm's renderer, and a screenshot stream would cost far more than the bytes.
+
+The phone is an **observer**. `src/terminal/socket.js` attaches with `viewer=mobile-…`
+and `primary=0`, and never sends `resize` or `primary`, so opening a session on the
+phone cannot reflow the window somebody is typing into on the Mac. The pane's geometry
+is adopted from the `attached` frame. The host does accept an observer's keystrokes,
+so a question can still be answered from the phone; the status bar says so.
+
+| module | what it owns |
+| --- | --- |
+| `terminal/emulator.js` | the parser, the viewport rows, the scrollback, the cursor and the modes |
+| `terminal/socket.js` | the relay: attach, replay, live bytes, visibility, reconnect, `history=full` |
+| `terminal/render-queue.js` | the ~30 fps clock and the coalescing of dirty rows |
+| `terminal/row.js` | a row cut into styling runs, with the cursor cell split out |
+| `terminal/style.js` | a run turned into a React Native style, including the 256-colour palette |
+| `terminal/keys.js` | key and text to bytes: modes, sticky modifiers, paste, the hidden field's delta |
+| `terminal/zoom.js` | the pinch arithmetic |
+
+Each of those has a `node --test` file beside it; everything awkward about the screen
+lives in one of them rather than in the component.
+
+**Painting.** Bytes arrive at whatever rate the pane produces them, so the screen is
+repainted on a clock: the first change after a quiet moment paints at once, and
+anything within the next 33 ms is coalesced into one frame. Only the rows xterm
+reports as dirty are re-read, and each row is a memoized component, so a spinner
+repaints one line. A resize, an alternate-screen switch or the end of a replay
+invalidates the whole screen instead.
+
+**Scrolling and zoom.** The pane is desktop-width, so the screen scrolls sideways;
+pinching scales the font between 6 and 20 px and the size is remembered. Lines that
+scroll off the top are kept as they go past and mounted above the live screen, so
+scrolling up reads them; the view follows the output whenever it is at the bottom.
+**Load earlier output** first mounts more of what the app already holds and then
+reattaches with `history=full`, which is how the console's own history button works:
+the pane's whole scrollback arrives in the attach snapshot, rather than being stitched
+on from a second source.
+
+**Typing.** A hidden `TextInput` (no autocorrect, no suggestions, `visible-password` on
+Android) is held at a sentinel string, and every change is read as a difference against
+it — which is the only way a soft keyboard can report a backspace on an empty field.
+The key bar sends: Esc `ESC`, Tab `TAB`, sticky Ctrl and Alt, the arrows and Home/End
+in either CSI or SS3 form depending on the pane's cursor-keys mode, PgUp/PgDn, ⇧⏎ as
+`ESC CR` (what `web/app/terminal.js` sends, so Claude Code and Codex insert a newline
+instead of submitting), Backspace `DEL`, ^C, and Paste. Paste is bracketed when the
+program asked for it. Copy and paste use React Native's own clipboard, which is
+deprecated but still present in 0.86; without it those two buttons say so rather than
+failing silently.
 
 ### Bridge
 
@@ -147,7 +201,7 @@ and build-identity configuration from the repository root.
 The app's own unit tests run from the repository root:
 
 ```sh
-node --require ./scripts/test-env.cjs --test app/src/*.test.js
+node --require ./scripts/test-env.cjs --test app/src/*.test.js app/src/terminal/*.test.js
 ```
 
 A local Android debug build, without EAS:

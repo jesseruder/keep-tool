@@ -84,3 +84,17 @@ export const screenHistory = (config, target, options = {}, signal) => request(
 export const keys = (config, target, names) => request(config, '/api/keys', {
   method: 'POST', body: { ...target, keys: names },
 });
+
+// The native terminal attaches to a pane, not to a session, so a target that names
+// only a session has to be resolved first. The `terminal` projection answers for
+// either id: it takes a session id or a pane id and returns the pane behind it.
+export const terminalView = (config, id, signal) => request(
+  config,
+  `/api/state?view=terminal&id=${encodeURIComponent(id)}`,
+  { signal, timeoutMs: 8000 },
+);
+
+// "Open on Mac": the console on the desktop brings this session's terminal forward.
+export const focus = (config, sessionId) => request(config, '/api/focus', {
+  method: 'POST', body: { sessionId },
+});

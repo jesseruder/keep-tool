@@ -309,3 +309,60 @@ test('the alternate buffer and cursor are reported for the status line', async (
   assert.equal(emulator.isAlternate(), false);
   assert.equal(emulator.cursor().visible, true);
 });
+
+test('scrollback is readable above the viewport, oldest of the window first', async (t) => {
+  const emulator = createEmulator({ cols: 8, rows: 3, scrollback: 20 });
+  t.after(() => emulator.dispose());
+  assert.equal(emulator.scrollbackLength(), 0, 'a fresh screen has nothing above it');
+  assert.deepEqual(emulator.scrollbackRows(5, 5), []);
+
+  const lines = ['one', 'two', 'three', 'four', 'five', 'six'];
+  await new Promise((resolve) => emulator.write(`${lines.join('\r\n')}`, resolve));
+  assert.deepEqual(emulator.rows().map((row) => row.text.slice(0, row.trimmed)), ['four', 'five', 'six']);
+  assert.equal(emulator.scrollbackLength(), 3);
+
+  const texts = (rows) => rows.map((row) => row.text.slice(0, row.trimmed));
+  assert.deepEqual(texts(emulator.scrollbackRows(2, 2)), ['two', 'three'], 'the window ends at the viewport top');
+  assert.deepEqual(texts(emulator.scrollbackRows(3, 3)), ['one', 'two', 'three']);
+  assert.deepEqual(texts(emulator.scrollbackRows(3, 2)), ['one', 'two'], 'count clips the far end');
+  assert.deepEqual(texts(emulator.scrollbackRows(99, 99)), ['one', 'two', 'three'],
+    'asking past the oldest line returns what there is');
+  assert.deepEqual(emulator.scrollbackRows(0, 5), [], 'no offset is no window');
+  assert.equal(emulator.scrollbackRows(2, 2)[0].runs.length > 0, true, 'scrollback rows carry styling like any row');
+
+  // The alternate screen has a scrollback of its own, which is always empty; the
+  // normal buffer's lines are still there when the program exits.
+  await new Promise((resolve) => emulator.write('\x1b[?1049h', resolve));
+  assert.equal(emulator.scrollbackLength(), 0);
+  await new Promise((resolve) => emulator.write('\x1b[?1049l', resolve));
+  assert.equal(emulator.scrollbackLength(), 3);
+});
+
+test('the key bar can read the modes that decide what a cursor key sends', async (t) => {
+  const emulator = createEmulator({ cols: 8, rows: 2 });
+  t.after(() => emulator.dispose());
+  assert.deepEqual(emulator.modes(), { applicationCursor: false, bracketedPaste: false });
+  await new Promise((resolve) => emulator.write('\x1b[?1h\x1b[?2004h', resolve));
+  assert.deepEqual(emulator.modes(), { applicationCursor: true, bracketedPaste: true });
+  await new Promise((resolve) => emulator.write('\x1b[?1l\x1b[?2004l', resolve));
+  assert.deepEqual(emulator.modes(), { applicationCursor: false, bracketedPaste: false });
+});
+
+test('scrolled lines keep counting after the buffer starts dropping its oldest', async (t) => {
+  const emulator = createEmulator({ cols: 8, rows: 2, scrollback: 3 });
+  t.after(() => emulator.dispose());
+  assert.equal(emulator.scrolledLines(), 0);
+
+  await new Promise((resolve) => emulator.write('a\r\nb\r\nc\r\n', resolve));
+  assert.equal(emulator.scrollbackLength(), 2);
+  assert.equal(emulator.scrolledLines(), 2, 'while there is room, the count is the scrollback length');
+
+  await new Promise((resolve) => emulator.write('d\r\ne\r\nf\r\n', resolve));
+  assert.equal(emulator.scrollbackLength(), 3, 'the buffer is full and drops its oldest line');
+  assert.equal(emulator.scrolledLines(), 5, 'the count still follows what went past');
+  assert.deepEqual(
+    emulator.scrollbackRows(3, 3).map((row) => row.text.slice(0, row.trimmed)),
+    ['c', 'd', 'e'],
+    'what is left is the newest lines, in order',
+  );
+});

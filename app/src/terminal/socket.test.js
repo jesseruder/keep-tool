@@ -290,3 +290,38 @@ test('the backoff is capped', () => {
   assert.equal(Math.max(...backoffs), 8000);
   handle.close();
 });
+
+test('loading earlier output reattaches asking for the whole scrollback', () => {
+  assert.equal(
+    paneSocketUrl('http://keep.local:7777', 'p1', 'v1', { history: 'full' }),
+    'ws://keep.local:7777/ws/pane/p1?viewer=v1&primary=0&history=full',
+  );
+
+  const { handle, socket, timers } = drive();
+  const first = socket();
+  first.open();
+  first.deliver(JSON.stringify({
+    t: 'attached', pane: { cols: 80, rows: 24 }, history: { lines: 900, sent: 100, truncated: true },
+  }));
+  assert.equal(handle.isFullHistory(), false);
+
+  assert.equal(handle.loadFullHistory(), true);
+  const second = socket();
+  assert.notEqual(second, first);
+  assert.equal(second.url.endsWith('&history=full'), true);
+  assert.equal(first.readyState, 3, 'the shortened-history attachment is dropped, not left attached');
+  assert.equal(handle.isFullHistory(), true);
+  assert.equal(handle.loadFullHistory(), false, 'the whole scrollback is only asked for once');
+
+  // The close the client itself caused must not schedule a reconnect on top of the
+  // connect it just made.
+  first.drop('replaced');
+  assert.equal(FakeSocket.opened.length, 2);
+
+  second.open();
+  second.drop('host reload');
+  assert.equal(timers[timers.length - 1].ms, 250, 'a genuine drop still reconnects');
+  timers[timers.length - 1].fn();
+  assert.equal(socket().url.endsWith('&history=full'), true, 'later reconnects keep the full history');
+  handle.close();
+});

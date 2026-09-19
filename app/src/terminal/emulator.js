@@ -119,7 +119,15 @@ function createEmulator(options = {}) {
       else markRange(event, maybeEnd === undefined ? event : maybeEnd);
     }));
   }
-  if (typeof term.onScroll === 'function') disposables.push(term.onScroll(() => markAll()));
+  // Lines that left the top of the screen, counted rather than measured. The buffer's
+  // own scrollback saturates — past its limit the oldest line is dropped for every new
+  // one — so `scrollbackLength()` stops growing while output keeps scrolling, and a
+  // reader that watched only that length would silently stop following. xterm scrolls
+  // one line per event, so counting the events is the number of lines that went past.
+  let scrolled = 0;
+  if (typeof term.onScroll === 'function') {
+    disposables.push(term.onScroll(() => { scrolled += 1; markAll(); }));
+  }
   if (typeof term.onResize === 'function') disposables.push(term.onResize(() => markAll()));
 
   const cell = term.buffer.active.getNullCell();
@@ -174,6 +182,44 @@ function createEmulator(options = {}) {
       const out = [];
       for (let y = first; y <= last; y++) out.push(readLine(buffer.getLine(top + y), term.cols, cell));
       return out;
+    },
+
+    // How many lines sit above the viewport: what "scroll up to read what already
+    // went past" has to work with. The alternate screen has none by definition.
+    scrollbackLength() {
+      return term.buffer.active.viewportY;
+    },
+
+    // Every line that has ever scrolled off the top, since this emulator was created.
+    // Only differences between two readings mean anything; the count keeps rising
+    // after the buffer starts dropping its oldest lines, which is the point.
+    scrolledLines() { return scrolled; },
+
+    // A window of those lines, in the same row shape `rows()` returns. `offset`
+    // counts lines back from the top of the viewport, so scrollbackRows(20, 20) is
+    // the twenty lines immediately above the screen and scrollbackRows(40, 20) is the
+    // twenty before those. The window is clipped to what the buffer still holds, so
+    // asking for more than there is returns fewer rows rather than blank ones.
+    scrollbackRows(offset, count) {
+      const buffer = term.buffer.active;
+      const top = buffer.viewportY;
+      const back = Math.max(0, Math.min(top, Math.floor(Number(offset) || 0)));
+      const want = Math.max(0, Math.floor(Number(count) || 0));
+      const first = top - back;
+      const last = Math.min(top, first + want);
+      const out = [];
+      for (let y = first; y < last; y++) out.push(readLine(buffer.getLine(y), term.cols, cell));
+      return out;
+    },
+
+    // The modes the program running in the pane has turned on, for the key bar: which
+    // bytes a cursor key sends, and whether a paste should be bracketed.
+    modes() {
+      const modes = term.modes || {};
+      return {
+        applicationCursor: Boolean(modes.applicationCursorKeysMode),
+        bracketedPaste: Boolean(modes.bracketedPasteMode),
+      };
     },
 
     cursor() {

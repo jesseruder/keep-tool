@@ -46,14 +46,18 @@ function toBytes(data) {
   return data;
 }
 
-function paneSocketUrl(server, pane, viewer) {
+function paneSocketUrl(server, pane, viewer, options = {}) {
   const base = String(server || '').replace(/\/+$/, '');
   const scheme = base.startsWith('https://') ? 'wss://' : 'ws://';
   const host = base.replace(/^https?:\/\//, '');
   // primary=0 is not a default worth relying on: say it, so a server-side change of
   // mind about the default cannot hand the phone a pane it should not steer.
+  // `history=full` is how the console loads earlier output (web/app/terminal.js): the
+  // attach snapshot carries the pane's whole scrollback instead of the last hundred
+  // lines, so the replay itself is the history and nothing has to be stitched on.
   return `${scheme}${host}/ws/pane/${encodeURIComponent(pane)}`
-    + `?viewer=${encodeURIComponent(viewer)}&primary=0`;
+    + `?viewer=${encodeURIComponent(viewer)}&primary=0`
+    + (options.history === 'full' ? '&history=full' : '');
 }
 
 function loadAppState() {
@@ -89,6 +93,7 @@ function openPaneSocket(options = {}) {
   let reportedVisible;
   let subscription = null;
   let attachTimer = null;
+  let history = options.history === 'full' ? 'full' : null;
   const pendingInput = [];
 
   const status = (state, detail) => { try { onStatus && onStatus(state, detail); } catch {} };
@@ -121,7 +126,7 @@ function openPaneSocket(options = {}) {
     replayDone = false;
     clearAttachTimer();
     status(retry === 0 ? 'connecting' : 'reconnecting');
-    const connection = new Socket(paneSocketUrl(server, pane, viewer), [], {
+    const connection = new Socket(paneSocketUrl(server, pane, viewer, { history }), [], {
       headers: { 'x-keep-token': token },
     });
     socket = connection;
@@ -262,6 +267,22 @@ function openPaneSocket(options = {}) {
       }
       try { socket.send(bytes); return true; } catch { return false; }
     },
+    // "Load earlier output": reattach asking for the pane's whole scrollback, which
+    // arrives as an ordinary replay (prefixed with a reset, so the consumer's
+    // emulator cannot end up holding the old screen twice). Every later reconnect
+    // keeps asking for it, the way the console's own history button does.
+    loadFullHistory() {
+      if (closed || history === 'full') return false;
+      history = 'full';
+      if (retryTimer) { clearTimer(retryTimer); retryTimer = null; }
+      const previous = socket;
+      socket = null;
+      clearAttachTimer();
+      if (previous) { try { previous.close(); } catch {} }
+      connect();
+      return true;
+    },
+    isFullHistory() { return history === 'full'; },
     setVisible(next) {
       visible = Boolean(next);
       reportVisibility(visible, false);
