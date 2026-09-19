@@ -85,6 +85,8 @@ function parseBridgeMessage(raw) {
   switch (text(parsed.type)) {
     case 'ready':
       return { type: 'ready' };
+    case 'authenticated':
+      return { type: 'authenticated' };
     case 'unauthorized':
       return { type: 'unauthorized' };
     case 'badge': {
@@ -115,46 +117,73 @@ function parseBridgeMessage(raw) {
 
 // The `keep-session` cookie the `?token=` bootstrap sets is opaque and lives only in
 // the daemon's memory, so every restart forgets it. Re-bootstrapping is therefore
-// ordinary rather than exceptional, and these rules keep it from becoming a loop:
-// the debounce guards *retries*, not the WebView's own first load, and two refusals
-// in a row stop the retrying and put the token in front of the person instead.
+// ordinary rather than exceptional — and, left ungoverned, a loop: the app reloads
+// the page, the page refuses again, and nothing bounds it.
+//
+// Three independent brakes, because any one of them alone has a hole. The failure
+// count stops a token that is simply wrong. The interval stops a fast flap. The
+// ceiling stops a slow one that would otherwise clear the interval forever.
+//
+// Only `authenticated` clears the failure count, and only the daemon answering a
+// real request 200 produces it. `ready` means the page's scripts ran, which happens
+// before any request and again after every `hello`, so treating it as proof of a
+// working session is what let alternating ready/unauthorized reload in a tight loop.
 const BOOTSTRAP_DEBOUNCE_MS = 10000;
 const BOOTSTRAP_STALE_MS = 5 * 60 * 1000;
 const BOOTSTRAP_MAX_FAILURES = 2;
+const BOOTSTRAP_CEILING = 3;
+const BOOTSTRAP_CEILING_MS = 5 * 60 * 1000;
 
 function bootstrapState() {
-  return { at: 0, failures: 0 };
+  // `fresh` is the single exemption from the interval, spent on the first refusal
+  // after a mount so a daemon restart recovers at once. Nothing re-arms it but a
+  // deliberate retry.
+  return { at: 0, failures: 0, recent: [], fresh: true };
+}
+
+function normalizeBootstrapState(state) {
+  return {
+    at: Number(state?.at) || 0,
+    failures: Number(state?.failures) || 0,
+    recent: Array.isArray(state?.recent) ? state.recent.filter((at) => Number.isFinite(at)) : [],
+    fresh: state?.fresh !== false,
+  };
 }
 
 // Pure: `{ action, state }` from the previous state, the trigger, and the clock.
 // `event.reason` is 'unauthorized' (a 403 on the top frame, or the console saying
-// so), 'foreground' (with `awayMs`), or 'ready' (the console came up).
+// so), 'foreground' (with `awayMs`), or 'authenticated'. Anything else is ignored —
+// an unrecognized reason must never be able to reach the reload.
 function decideBootstrap(state, event = {}, now = Date.now()) {
-  const at = Number(state?.at) || 0;
-  const previous = Number(state?.failures) || 0;
+  const current = normalizeBootstrapState(state);
   const reason = text(event.reason);
 
-  // The console is up, so the session works; whatever failed before it does not count.
-  if (reason === 'ready') return { action: 'ignore', state: { at, failures: 0 } };
+  if (reason === 'authenticated') return { action: 'ignore', state: { ...current, failures: 0 } };
+  if (reason === 'foreground') {
+    // A short trip to another app does not cost the session, and reloading under
+    // someone who just switched back is worse than a stale page.
+    if (!(Number(event.awayMs) >= BOOTSTRAP_STALE_MS)) return { action: 'ignore', state: current };
+  } else if (reason !== 'unauthorized') return { action: 'ignore', state: current };
 
-  // A short trip to another app does not cost the session, and reloading the console
-  // under someone who just switched back is worse than a stale page.
-  if (reason === 'foreground' && !(Number(event.awayMs) >= BOOTSTRAP_STALE_MS)) {
-    return { action: 'ignore', state: { at, failures: previous } };
+  const failures = reason === 'unauthorized' ? current.failures + 1 : current.failures;
+  if (failures >= BOOTSTRAP_MAX_FAILURES) return { action: 'show-error', state: { ...current, failures } };
+
+  const recent = current.recent.filter((at) => now - at < BOOTSTRAP_CEILING_MS);
+  if (recent.length >= BOOTSTRAP_CEILING) return { action: 'show-error', state: { ...current, failures, recent } };
+
+  const exempt = current.fresh && reason === 'unauthorized';
+  if (!exempt && current.at && now - current.at < BOOTSTRAP_DEBOUNCE_MS) {
+    return { action: 'ignore', state: { ...current, failures, recent } };
   }
 
-  const failures = reason === 'unauthorized' ? previous + 1 : previous;
-  if (failures >= BOOTSTRAP_MAX_FAILURES) return { action: 'show-error', state: { at, failures } };
-
-  // The first refusal since the console last came up always earns its retry: a
-  // session dropped by a daemon restart is the common case and recovers unnoticed.
-  if (reason === 'unauthorized' && failures === 1) return { action: 'bootstrap', state: { at: now, failures } };
-
-  if (at && now - at < BOOTSTRAP_DEBOUNCE_MS) return { action: 'ignore', state: { at, failures } };
-  return { action: 'bootstrap', state: { at: now, failures } };
+  return {
+    action: 'bootstrap',
+    state: { at: now, failures, recent: [...recent, now], fresh: current.fresh && reason !== 'unauthorized' },
+  };
 }
 
-// `handlers` is the dispatch table: { ready, unauthorized, badge, notify, openTerminal, openExternal }.
+// `handlers` is the dispatch table: { ready, authenticated, unauthorized, badge,
+// notify, openTerminal, openExternal }.
 // Returns the message that was dispatched, or null when nothing ran.
 function dispatchBridgeMessage(raw, handlers = {}) {
   const message = parseBridgeMessage(raw);
@@ -166,6 +195,8 @@ function dispatchBridgeMessage(raw, handlers = {}) {
 }
 
 module.exports = {
+  BOOTSTRAP_CEILING,
+  BOOTSTRAP_CEILING_MS,
   BOOTSTRAP_DEBOUNCE_MS,
   BOOTSTRAP_MAX_FAILURES,
   BOOTSTRAP_STALE_MS,

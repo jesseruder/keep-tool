@@ -104,7 +104,8 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
     return true;
   }, []);
 
-  // Asked for by hand, so it starts over rather than counting against the retries.
+  // Asked for by hand, so it starts over: the failure count, the ceiling, and the
+  // one-shot exemption all reset. A person pressing Retry is not a loop.
   const hardReload = useCallback(() => {
     bootstrapRef.current = bootstrapState();
     loadBootstrap();
@@ -152,14 +153,16 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
   const onMessage = useCallback((event) => {
     dispatchBridgeMessage(event.nativeEvent?.data, {
       // `ready` arrives again whenever the console answers a `hello`, so it has to
-      // be safe to repeat.
+      // be safe to repeat — and it says only that the page's scripts ran, which is
+      // no evidence at all that the session behind them works.
       ready: () => {
         readyRef.current = true;
         if (graceRef.current) clearTimeout(graceRef.current);
         setLoading(false);
         setError(null);
-        trigger('ready');
       },
+      // The daemon answered a real request: the session is good, once per page load.
+      authenticated: () => trigger('authenticated'),
       unauthorized: () => trigger('unauthorized'),
       badge: onBadge,
       notify: onNotify,

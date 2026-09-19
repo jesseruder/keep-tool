@@ -27,10 +27,20 @@ than exceptional. The app reloads the `?token=` URL when
 - the app returns to the foreground after five minutes or more away,
 - the top frame gets an HTTP 403, or the console posts `{type:'unauthorized'}`.
 
-At most one of those lands per ten seconds, and two refusals in a row stop the
-retrying and show the native banner pointing at Setup — a wrong token cannot loop the
-WebView. `decideBootstrap` in `src/bridge.js` is that whole rule as a pure function.
-Nothing else in the app stores or reads the cookie.
+Three independent brakes hold it, because each one alone has a hole: at most one
+reload per ten seconds; at most three in five minutes; and two refusals in a row
+stop the retrying outright. Whichever trips first shows the native banner pointing at
+Setup, and only Retry or the manual reload clears them. The one exemption from the
+interval is the first refusal after a mount, so a daemon restart recovers at once —
+it is spent on use and nothing re-arms it.
+
+Only `{type:'authenticated'}`, which the console posts once per page load after a
+request actually comes back 200, clears the failure count. **`ready` does not**: it
+says the page's scripts ran, which they do before any request and again after every
+`hello`, so treating it as proof of a session let alternating ready/unauthorized
+reload in a loop. `decideBootstrap` in `src/bridge.js` is the whole rule as a pure
+function, and `bridge.test.js` drives the adversarial sequence through it. Nothing
+else in the app stores or reads the cookie.
 
 The native side still sends `x-keep-token` for the two things it does itself: the
 setup connection check and the 15-minute background sweep.
@@ -47,13 +57,15 @@ That injection is not guaranteed to win the race against the page's own scripts 
 Android, so once the page has loaded the app injects it again if it is missing and
 then sends `{type:'hello'}`. The console answers a `hello` by switching to mobile
 mode and re-posting `ready` and its last badge, so **`ready` can arrive more than
-once** and the shell treats it as idempotent.
+once** and the shell treats it as idempotent — and as carrying no authority over the
+session, per the bootstrap rules above.
 
 Console → shell, via `window.keepShell.post(message)`:
 
 | message | effect |
 | --- | --- |
-| `{type:'ready'}` | hides the native loading overlay; clears the refusal count |
+| `{type:'ready'}` | hides the native loading overlay; nothing else, and repeatable |
+| `{type:'authenticated'}` | a request came back 200; clears the refusal count |
 | `{type:'unauthorized'}` | re-bootstraps, under the rules above |
 | `{type:'badge', count}` | sets the launcher badge |
 | `{type:'notify', title, body, key}` | schedules an immediate local notification carrying `key` |

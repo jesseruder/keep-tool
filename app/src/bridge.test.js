@@ -5,9 +5,9 @@ for (const key of ['KEEP_REVIEWER', 'KEEP_REVIEWER_NAME', 'KEEP_REVIEWER_MODEL']
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
-  BOOTSTRAP_DEBOUNCE_MS, BOOTSTRAP_STALE_MS, bootstrapScript, bootstrapState, consoleUrl,
-  decideBootstrap, dispatchBridgeMessage, helloScript, normalizeServer,
-  parseBridgeMessage, shellReceiveScript,
+  BOOTSTRAP_CEILING_MS, BOOTSTRAP_DEBOUNCE_MS, BOOTSTRAP_STALE_MS, bootstrapScript,
+  bootstrapState, consoleUrl, decideBootstrap, dispatchBridgeMessage, helloScript,
+  normalizeServer, parseBridgeMessage, shellReceiveScript,
 } = require('./bridge.js');
 
 test('the console URL carries the token once and tolerates a trailing slash', () => {
@@ -19,6 +19,7 @@ test('the console URL carries the token once and tolerates a trailing slash', ()
 
 test('parsing keeps the messages the shell can act on and drops the rest', () => {
   assert.deepEqual(parseBridgeMessage('{"type":"ready"}'), { type: 'ready' });
+  assert.deepEqual(parseBridgeMessage('{"type":"authenticated"}'), { type: 'authenticated' });
   assert.deepEqual(parseBridgeMessage('{"type":"unauthorized"}'), { type: 'unauthorized' });
   assert.deepEqual(parseBridgeMessage('{"type":"badge","count":"3"}'), { type: 'badge', count: 3 });
   assert.deepEqual(parseBridgeMessage('{"type":"badge","count":2.7}'), { type: 'badge', count: 2 });
@@ -44,11 +45,13 @@ test('dispatch runs exactly the matching handler and reports what it ran', () =>
   const seen = [];
   const handlers = {
     ready: () => seen.push('ready'),
+    authenticated: () => seen.push('authenticated'),
     unauthorized: () => seen.push('unauthorized'),
     badge: (message) => seen.push(`badge:${message.count}`),
     openTerminal: (message) => seen.push(`terminal:${message.session || message.pane}`),
   };
   assert.deepEqual(dispatchBridgeMessage('{"type":"ready"}', handlers), { type: 'ready' });
+  assert.deepEqual(dispatchBridgeMessage('{"type":"authenticated"}', handlers), { type: 'authenticated' });
   assert.deepEqual(dispatchBridgeMessage('{"type":"unauthorized"}', handlers), { type: 'unauthorized' });
   assert.equal(dispatchBridgeMessage('{"type":"badge","count":4}', handlers).count, 4);
   assert.equal(dispatchBridgeMessage('{"type":"openTerminal","session":"s9"}', handlers).session, 's9');
@@ -56,49 +59,94 @@ test('dispatch runs exactly the matching handler and reports what it ran', () =>
   assert.equal(dispatchBridgeMessage('{"type":"openExternal","url":"https://a.test/"}', handlers), null);
   assert.equal(dispatchBridgeMessage('garbage', handlers), null);
   assert.equal(dispatchBridgeMessage('{"type":"ready"}', {}), null);
-  assert.deepEqual(seen, ['ready', 'unauthorized', 'badge:4', 'terminal:s9']);
+  assert.deepEqual(seen, ['ready', 'authenticated', 'unauthorized', 'badge:4', 'terminal:s9']);
 });
 
-test('a refused session is retried once, then handed back to the person', () => {
-  const T = 1_000_000;
-  // The WebView's own first load is the bootstrap; nothing has failed yet.
-  let state = bootstrapState();
-  assert.deepEqual(state, { at: 0, failures: 0 });
+const T = 1_000_000;
 
-  // A daemon restart drops the session: the first refusal retries straight away,
-  // without waiting out the debounce, and the console coming up clears the count.
-  let step = decideBootstrap(state, { reason: 'unauthorized' }, T);
-  assert.equal(step.action, 'bootstrap');
-  assert.equal(step.state.failures, 1);
-  assert.equal(step.state.at, T);
-  step = decideBootstrap(step.state, { reason: 'ready' }, T + 500);
-  assert.equal(step.action, 'ignore');
-  assert.equal(step.state.failures, 0);
+// Drives a script of [reason, atOffset] pairs through the decision, threading the
+// state, and returns the actions in order.
+function runBootstrap(script, state = bootstrapState()) {
+  const actions = [];
+  let current = state;
+  for (const [reason, offset, extra] of script) {
+    const step = decideBootstrap(current, { reason, ...extra }, T + offset);
+    current = step.state;
+    actions.push(step.action);
+  }
+  return { actions, state: current };
+}
 
-  // A refusal right after that recovery is the storm case: counted, but debounced.
-  step = decideBootstrap(step.state, { reason: 'unauthorized' }, T + 1000);
-  assert.equal(step.action, 'bootstrap', 'the first refusal since `ready` still earns its retry');
-  const stormed = decideBootstrap(step.state, { reason: 'unauthorized' }, T + 1500);
-  assert.equal(stormed.action, 'show-error', 'two refusals in a row stop the retrying');
-  assert.equal(stormed.state.failures, 2);
-  // It stays stopped: a wrong token cannot loop the WebView.
-  assert.equal(decideBootstrap(stormed.state, { reason: 'unauthorized' }, T + 60_000).action, 'show-error');
-  assert.equal(decideBootstrap(stormed.state, { reason: 'foreground', awayMs: BOOTSTRAP_STALE_MS }, T + 60_000).action, 'show-error');
+test('a session the daemon forgot recovers, and a wrong one stops asking', () => {
+  assert.deepEqual(bootstrapState(), { at: 0, failures: 0, recent: [], fresh: true });
+
+  // The happy path: a daemon restart drops the session, the first refusal retries at
+  // once, the console authenticates, and the count behind it is cleared. Much later
+  // — past the interval and past the ceiling's window — a fresh refusal retries too.
+  const first = decideBootstrap(bootstrapState(), { reason: 'unauthorized' }, T);
+  assert.equal(first.action, 'bootstrap');
+  assert.deepEqual([first.state.at, first.state.failures, first.state.fresh], [T, 1, false]);
+  const settled = decideBootstrap(first.state, { reason: 'authenticated' }, T + 400);
+  assert.equal(settled.action, 'ignore');
+  assert.equal(settled.state.failures, 0);
+  const later = decideBootstrap(settled.state, { reason: 'unauthorized' }, T + BOOTSTRAP_CEILING_MS + 1);
+  assert.equal(later.action, 'bootstrap', 'a refusal long afterwards is a new problem, not the old one');
+  assert.deepEqual(later.state.recent, [T + BOOTSTRAP_CEILING_MS + 1], 'the stale bootstrap aged out of the ceiling');
+
+  // A token that is simply wrong: two refusals in a row and it stops, whatever asks.
+  const wrong = runBootstrap([['unauthorized', 0], ['unauthorized', 3]]);
+  assert.deepEqual(wrong.actions, ['bootstrap', 'show-error']);
+  assert.equal(decideBootstrap(wrong.state, { reason: 'unauthorized' }, T + 60_000).action, 'show-error');
+  assert.equal(decideBootstrap(wrong.state, { reason: 'foreground', awayMs: BOOTSTRAP_STALE_MS }, T + 60_000).action, 'show-error');
+});
+
+test('a console that keeps announcing itself cannot drive the reload', () => {
+  // The round-2 finding: `ready` is posted before any request succeeds, and `hello`
+  // makes the console repeat it, so alternating ready/unauthorized at millisecond
+  // spacing used to clear the failure count and skip the interval every time.
+  const flap = [];
+  for (let index = 0; index < 8; index += 1) flap.push(['ready', index * 2], ['unauthorized', index * 2 + 1]);
+  const flapped = runBootstrap(flap);
+  assert.deepEqual(flapped.actions.filter((action) => action === 'bootstrap').length, 1,
+    'exactly one reload in sixteen milliseconds of flapping');
+  assert.deepEqual(flapped.actions.slice(0, 4), ['ignore', 'bootstrap', 'ignore', 'show-error']);
+  assert.ok(flapped.actions.slice(4).every((action) => ['ignore', 'show-error'].includes(action)));
+
+  // `hello` replaying `ready` is likewise inert, and no unrecognized reason can
+  // reach the reload — including on state this has never seen.
+  for (const reason of ['ready', 'hello', 'nonsense', '']) {
+    assert.equal(decideBootstrap(bootstrapState(), { reason }, T).action, 'ignore', reason);
+  }
+  for (const bad of [undefined, null, {}, { at: 'x', failures: 'y', recent: 'no' }]) {
+    assert.equal(decideBootstrap(bad, { reason: 'nonsense' }, T).action, 'ignore');
+  }
+});
+
+test('the interval and the ceiling bound reloads that each look reasonable alone', () => {
+  // Authenticating between refusals keeps the failure count at zero forever, so the
+  // ceiling is the only thing left holding a slow flap: three reloads in five
+  // minutes, then it stops asking.
+  const slow = [];
+  for (let index = 0; index < 4; index += 1) {
+    slow.push(['unauthorized', index * (BOOTSTRAP_DEBOUNCE_MS + 1000)], ['authenticated', index * (BOOTSTRAP_DEBOUNCE_MS + 1000) + 100]);
+  }
+  assert.deepEqual(runBootstrap(slow).actions,
+    ['bootstrap', 'ignore', 'bootstrap', 'ignore', 'bootstrap', 'ignore', 'show-error', 'ignore']);
+
+  // The one-shot exemption is spent on the first refusal and never re-armed, so a
+  // second refusal inside the window waits even with the count cleared between them.
+  const spent = runBootstrap([['unauthorized', 0], ['authenticated', 100], ['unauthorized', 200]]);
+  assert.deepEqual(spent.actions, ['bootstrap', 'ignore', 'ignore']);
 
   // Coming back from the background: only a long absence is worth a fresh session,
-  // and even then only one per debounce window.
-  const settled = { at: T, failures: 0 };
-  assert.equal(decideBootstrap(settled, { reason: 'foreground', awayMs: 60_000 }, T + 60_000).action, 'ignore');
-  assert.equal(decideBootstrap(settled, { reason: 'foreground' }, T + 60_000).action, 'ignore');
-  const woken = decideBootstrap(settled, { reason: 'foreground', awayMs: BOOTSTRAP_STALE_MS }, T + BOOTSTRAP_STALE_MS);
+  // and even then only one per interval.
+  const idle = { at: T, failures: 0, recent: [T], fresh: false };
+  assert.equal(decideBootstrap(idle, { reason: 'foreground', awayMs: 60_000 }, T + 60_000).action, 'ignore');
+  assert.equal(decideBootstrap(idle, { reason: 'foreground' }, T + 60_000).action, 'ignore');
+  const woken = decideBootstrap(idle, { reason: 'foreground', awayMs: BOOTSTRAP_STALE_MS }, T + BOOTSTRAP_STALE_MS);
   assert.equal(woken.action, 'bootstrap');
   assert.equal(decideBootstrap(woken.state, { reason: 'foreground', awayMs: BOOTSTRAP_STALE_MS }, woken.state.at + BOOTSTRAP_DEBOUNCE_MS - 1).action, 'ignore');
   assert.equal(decideBootstrap(woken.state, { reason: 'foreground', awayMs: BOOTSTRAP_STALE_MS }, woken.state.at + BOOTSTRAP_DEBOUNCE_MS).action, 'bootstrap');
-
-  // Nothing it is handed can make it throw or invent an action.
-  for (const bad of [undefined, null, {}, { at: 'x', failures: 'y' }]) {
-    assert.equal(decideBootstrap(bad, { reason: 'nonsense' }, T).action, 'bootstrap');
-  }
 });
 
 test('injected scripts escape values that would otherwise break the source', () => {
