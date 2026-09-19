@@ -9,6 +9,9 @@ module.exports = ({ config }) => {
   const projectId = process.env.KEEP_EXPO_PROJECT_ID || local.projectId;
   const androidPackage = process.env.KEEP_ANDROID_PACKAGE || local.androidPackage;
   const iosBundleIdentifier = process.env.KEEP_IOS_BUNDLE_IDENTIFIER || local.iosBundleIdentifier;
+  // Android push needs the Firebase config for this package. The file holds API keys,
+  // so it lives outside the repository (next to mobile.json) and is only referenced.
+  const googleServicesFile = process.env.KEEP_GOOGLE_SERVICES_FILE || local.googleServicesFile;
   if (process.env.EAS_BUILD === 'true') {
     const platform = process.env.EAS_BUILD_PLATFORM;
     if ((platform === 'android' && !androidPackage) || (platform === 'ios' && !iosBundleIdentifier)) {
@@ -19,7 +22,11 @@ module.exports = ({ config }) => {
     ...config,
     ...(owner ? { owner } : {}),
     ...(projectId ? { extra: { ...config.extra, eas: { projectId } } } : {}),
-    android: { ...config.android, ...(androidPackage ? { package: androidPackage } : {}) },
+    android: {
+      ...config.android,
+      ...(androidPackage ? { package: androidPackage } : {}),
+      ...(googleServicesFile ? { googleServicesFile } : {}),
+    },
     ios: { ...config.ios, ...(iosBundleIdentifier ? { bundleIdentifier: iosBundleIdentifier } : {}) },
   };
 };
