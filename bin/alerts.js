@@ -414,7 +414,11 @@ async function pollReceipts(options = {}) {
       continue;
     }
     if (payload && Array.isArray(payload.errors) && payload.errors.length) {
-      expoLog(`receipts ${oneLine(payload.errors.map((error) => error && error.message).filter(Boolean).join('; '), 160)}`, now);
+      // Expo answers a refused request with HTTP 200 and an errors array; that is
+      // a failed run for the health row just as a 5xx is.
+      const summary = oneLine(payload.errors.map((error) => error && error.message).filter(Boolean).join('; ') || 'request errors', 160);
+      failure = failure || summary;
+      expoLog(`receipts ${summary}`, now);
     }
     const data = payload && payload.data && typeof payload.data === 'object' ? payload.data : {};
     for (const [id, receipt] of Object.entries(data)) {
@@ -428,7 +432,8 @@ async function pollReceipts(options = {}) {
       if (reason === 'DeviceNotRegistered') {
         // Its other pushes are on their way to the same dead phone: they go with
         // it, rather than being polled for a receipt that says this again.
-        try { if (registry.remove(ticket.token, root)) removed.push(ticket.token); } catch {}
+        if (!removed.includes(ticket.token)) removed.push(ticket.token);
+        try { registry.remove(ticket.token, root); } catch {}
         continue;
       }
       expoLog(`receipt ${reason || 'error'}: ${oneLine(receipt.message || '', 160)}`, now);
