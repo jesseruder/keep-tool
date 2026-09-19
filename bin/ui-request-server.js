@@ -142,6 +142,9 @@ function createUiRequestServer(options = {}) {
       proxyInFlight -= 1;
     };
     const headers = filteredHeaders(req.headers);
+    // The browser's cookie authenticated this request here; the daemon hop is
+    // authenticated by the private per-process token and never needs to see it.
+    delete headers.cookie;
     delete headers['x-keep-proxy-token'];
     delete headers['x-forwarded-for'];
     delete headers['x-forwarded-host'];
@@ -173,6 +176,15 @@ function createUiRequestServer(options = {}) {
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://localhost');
+      // The public listener is the only door a phone shell knocks on, so the
+      // token-for-cookie exchange lives here and runs before the auth ladder:
+      // the navigation that carries the token is not otherwise authorized.
+      const grant = keepConsole.appTokenRedirect(req, url, token);
+      if (grant) {
+        res.writeHead(302, { ...grant, 'cache-control': 'no-store', 'content-length': 0 });
+        res.end();
+        return;
+      }
       if (!authorized(req)) return deny(res);
       const rawPath = String(req.url || '').split(/[?#]/, 1)[0];
       let traversal = false;
@@ -259,7 +271,7 @@ function createUiRequestServer(options = {}) {
     try { url = new URL(req.url, 'http://localhost'); } catch { socket.destroy(); return; }
     const match = url.pathname.match(/^\/ws\/pane\/([^/]+)$/);
     if (!match) { socket.destroy(); return; }
-    if (!authorized(req) || !keepConsole.sameOrigin(req)) {
+    if (!authorized(req) || !keepConsole.upgradeOriginAllowed(req, { token })) {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
       socket.destroy();
       return;

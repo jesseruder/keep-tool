@@ -6,6 +6,14 @@ const { createTerminalBridge } = require('./terminal-bridge.js');
 const { createTerminalRelay } = require('./terminal-relay.js');
 
 const FULL_SNAPSHOT_SCROLLBACK = 10000;
+const TOKEN_COOKIE = 'keep-token';
+// Long enough that a phone shell never has to be re-paired in practice; Chrome
+// clamps anything past 400 days to 400 days anyway.
+const TOKEN_COOKIE_MAX_AGE = 400 * 24 * 60 * 60;
+// The cookie-value grammar minus the characters that would need quoting. Tokens
+// keep serve generates are hex; a hand-written one outside this set simply does
+// not get a cookie, and the header and loopback paths still work.
+const COOKIE_SAFE_TOKEN = /^[A-Za-z0-9._~+/=-]+$/;
 const MIME = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -51,10 +59,40 @@ function tokenMatches(candidate, expected) {
   return wanted.length > 0 && actual.length === wanted.length && crypto.timingSafeEqual(actual, wanted);
 }
 
+// Minimal Cookie-header parsing: split on ';', trim, first '='. Anything a
+// browser would not have sent simply fails to match the token.
+function cookieValue(header, name) {
+  for (const part of String(header || '').split(';')) {
+    const entry = part.trim();
+    const equals = entry.indexOf('=');
+    if (equals <= 0 || entry.slice(0, equals).trim() !== name) continue;
+    return entry.slice(equals + 1).trim();
+  }
+  return '';
+}
+
 function authorized(req, deps) {
   return tokenMatches(req.headers['x-keep-proxy-token'], deps.internalToken)
     || (deps.isLocal(req.socket.remoteAddress) && localHost(req.headers.host))
-    || tokenMatches(req.headers['x-keep-token'], deps.token);
+    || tokenMatches(req.headers['x-keep-token'], deps.token)
+    // A WebView sets headers on its top-level navigation only: the page's own
+    // scripts, fetches, EventSource and WebSocket carry the cookie instead.
+    || tokenMatches(cookieValue(req.headers.cookie, TOKEN_COOKIE), deps.token);
+}
+
+// `GET /app?token=<token>` is the one place the token is exchanged for a cookie.
+// Returns the redirect headers, or null when this is not that request — a wrong
+// token falls through to the ordinary authorization ladder, which answers 403
+// for anyone who cannot reach the console without it.
+function appTokenRedirect(req, url, token) {
+  if (req.method !== 'GET') return null;
+  if (url.pathname !== '/app' && url.pathname !== '/app/') return null;
+  const offered = url.searchParams.get('token');
+  if (offered == null || !tokenMatches(offered, token) || !COOKIE_SAFE_TOKEN.test(token)) return null;
+  return {
+    location: '/app',
+    'set-cookie': `${TOKEN_COOKIE}=${token}; Max-Age=${TOKEN_COOKIE_MAX_AGE}; Path=/; HttpOnly; SameSite=Strict`,
+  };
 }
 
 function writeDenied(res) {
@@ -178,6 +216,24 @@ function sameOrigin(req) {
     const host = String(req.headers.host || '').toLowerCase();
     return parsed.protocol === 'http:'
       && localHost(parsed.host)
+      && parsed.host.toLowerCase() === host;
+  } catch { return false; }
+}
+
+// Who may open a pane socket, on top of `authorized`. A browser always sends
+// Origin on a WebSocket handshake, so an Origin that matches the Host this
+// request was made to is the console page itself — on loopback or on the Mac's
+// LAN address, which is what a phone WebView sees. No Origin at all is a native
+// client, and it has to carry the token header; a cookie alone would mean a
+// browser that suppressed its Origin, which browsers do not do.
+function upgradeOriginAllowed(req, deps) {
+  const origin = req.headers.origin;
+  if (!origin) return tokenMatches(req.headers['x-keep-token'], deps?.token);
+  if (sameOrigin(req)) return true;
+  try {
+    const parsed = new URL(origin);
+    const host = String(req.headers.host || '').toLowerCase();
+    return Boolean(host) && (parsed.protocol === 'http:' || parsed.protocol === 'https:')
       && parsed.host.toLowerCase() === host;
   } catch { return false; }
 }
@@ -338,7 +394,7 @@ function install(input) {
     try { url = new URL(req.url, 'http://localhost'); } catch { socket.destroy(); return; }
     const match = url.pathname.match(/^\/ws\/pane\/([^/]+)$/);
     if (!match) { socket.destroy(); return; }
-    if (!authorized(req, deps) || !sameOrigin(req)) {
+    if (!authorized(req, deps) || !upgradeOriginAllowed(req, deps)) {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
       socket.destroy();
       return;
@@ -380,5 +436,6 @@ function install(input) {
 }
 
 module.exports = {
-  VENDOR, install, validateLayouts, readLayouts, writeLayouts, sameOrigin, authorized, staticPath, serveFile,
+  VENDOR, TOKEN_COOKIE, install, validateLayouts, readLayouts, writeLayouts,
+  sameOrigin, upgradeOriginAllowed, authorized, appTokenRedirect, cookieValue, staticPath, serveFile,
 };

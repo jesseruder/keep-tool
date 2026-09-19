@@ -12,6 +12,30 @@ socket. The frontend authenticates the real public peer and Host before forwardi
 a request, strips forwarded identity headers, and uses a private per-process token
 for the Unix hop. It never retries writes.
 
+A request is authorized by loopback with a loopback `Host`, by `x-keep-token`, or
+by a `keep-token` cookie. The cookie exists for shells that can only set headers
+on a top-level navigation — a phone WebView, which cannot set one on the page's
+own scripts, styles, fetches, EventSource or WebSocket. `GET /app?token=<token>`
+is the one place the token is exchanged for it: a matching token answers `302` to
+`/app` with `Set-Cookie: keep-token=…; Max-Age=400d; Path=/; HttpOnly;
+SameSite=Strict` and `cache-control: no-store`, and never echoes the token into a
+body or a log. There is no `Secure`: this is private-network HTTP. A wrong token
+falls through to the ordinary ladder, which is a `403` for anyone who could not
+already reach the console. `SameSite=Strict` plus the unchanged `x-keep: 1` and
+JSON content-type requirements on every mutating route are what keep the cookie
+from becoming a cross-site write. The frontend strips `Cookie` along with the
+other forwarded identity headers before the Unix hop, so the daemon authorizes
+that hop by its private token alone.
+
+A pane socket upgrade needs that same authorization plus an origin rule:
+an `Origin` whose host equals the request's `Host` — any host, so the console
+page works on loopback and on the Mac's LAN address alike — or no `Origin` at all
+together with a valid `x-keep-token`, which is a native client. A browser always
+sends `Origin` on a WebSocket handshake, so a cookie with no `Origin` is not a
+browser and is refused. `bin/console.js` owns the predicate
+(`upgradeOriginAllowed`) and both the daemon and the frontend worker use it;
+`sameOrigin` still means loopback only.
+
 State production runs on invalidation and a 30-second cadence. Refreshes coalesce
 to one active build and one follow-up; a failed build leaves the last valid state in
 place. Before the first real publication, cached routes return bounded `503` loading

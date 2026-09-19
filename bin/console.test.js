@@ -664,3 +664,72 @@ test('project icon discovery requires write authorization and routes validated r
   assert.deepEqual(await accepted.json(), { projects: {} });
   assert.deepEqual(seen, [['/repo']]);
 });
+
+const upgradeRequest = (headers) => ({ headers, socket: { remoteAddress: '10.0.0.7' } });
+
+test('the token cookie authorizes a page whose own requests cannot carry headers', () => {
+  const deps = { isLocal: () => false, token: 'secret', internalToken: 'private' };
+  const authorized = (cookie) => keepConsole.authorized(upgradeRequest({ host: '10.0.0.4:7777', cookie }), deps);
+  assert.equal(authorized('keep-token=secret'), true);
+  assert.equal(authorized(' theme=dark ; keep-token=secret ; other=1'), true, 'one cookie among others');
+  assert.equal(authorized('keep-token=wrong'), false);
+  assert.equal(authorized('keep-tokenish=secret'), false, 'a prefix is not the name');
+  assert.equal(authorized('=secret'), false);
+  assert.equal(authorized('keep-token'), false);
+  assert.equal(authorized(undefined), false);
+  assert.equal(keepConsole.authorized(upgradeRequest({ host: '10.0.0.4:7777', cookie: 'keep-token=secret' }),
+    { ...deps, token: '' }), false, 'an unset token never matches');
+});
+
+test('/app?token= is exchanged for a cookie once, and nothing else is', () => {
+  const url = (value) => new URL(value, 'http://10.0.0.4:7777');
+  const redirect = (value, method = 'GET') => keepConsole.appTokenRedirect({ method }, url(value), 'secret');
+  const granted = redirect('/app?token=secret');
+  assert.equal(granted.location, '/app');
+  assert.match(granted['set-cookie'], /^keep-token=secret; Max-Age=34560000; Path=\/; HttpOnly; SameSite=Strict$/);
+  assert.equal(/Secure/.test(granted['set-cookie']), false, 'the private network is plain HTTP');
+  assert.equal(redirect('/app/?token=secret').location, '/app');
+  assert.equal(redirect('/app?token=wrong'), null);
+  assert.equal(redirect('/app'), null);
+  assert.equal(redirect('/app/index.html?token=secret'), null, 'only the entry navigation');
+  assert.equal(redirect('/api/state?token=secret'), null);
+  assert.equal(redirect('/app?token=secret', 'POST'), null);
+  assert.equal(keepConsole.appTokenRedirect({ method: 'GET' }, url('/app?token=a;b'), 'a;b'), null,
+    'a token that cannot be a cookie value gets none');
+});
+
+test('a pane socket needs an Origin that matches its Host, or a token and no Origin at all', () => {
+  const deps = { token: 'secret' };
+  const allowed = (headers) => keepConsole.upgradeOriginAllowed(upgradeRequest(headers), deps);
+  assert.equal(allowed({ host: 'localhost:7777', origin: 'http://localhost:7777' }), true, 'loopback');
+  assert.equal(allowed({ host: '10.0.0.4:7777', origin: 'http://10.0.0.4:7777' }), true, 'a LAN console page');
+  assert.equal(allowed({ host: '10.0.0.4:7777', origin: 'http://10.0.0.4:7778' }), false, 'another port');
+  assert.equal(allowed({ host: '10.0.0.4:7777', origin: 'http://evil.example' }), false);
+  assert.equal(allowed({ host: '10.0.0.4:7777', origin: 'null' }), false);
+  assert.equal(allowed({ origin: 'http://10.0.0.4:7777' }), false, 'no Host to match');
+  assert.equal(allowed({ host: '10.0.0.4:7777', 'x-keep-token': 'secret' }), true, 'a native client');
+  assert.equal(allowed({ host: '10.0.0.4:7777', 'x-keep-token': 'wrong' }), false);
+  assert.equal(allowed({ host: '10.0.0.4:7777', cookie: 'keep-token=secret' }), false,
+    'a browser always sends Origin, so a cookie without one is not one');
+  assert.equal(allowed({ host: '10.0.0.4:7777' }), false);
+  assert.equal(keepConsole.sameOrigin(upgradeRequest({ host: '10.0.0.4:7777', origin: 'http://10.0.0.4:7777' })), false,
+    'sameOrigin still means loopback only');
+});
+
+test('a cookie-authenticated page on the LAN may open a pane socket', async (t) => {
+  const f = await fixture({ isLocal: () => false });
+  t.after(() => f.close());
+  const origin = `http://127.0.0.1:${f.port}`;
+  const open = new WebSocket(`ws://127.0.0.1:${f.port}/ws/pane/p-1`, {
+    origin, headers: { cookie: 'keep-token=secret' },
+  });
+  await once(open, 'open');
+  open.close();
+  await once(open, 'close');
+
+  const foreign = new WebSocket(`ws://127.0.0.1:${f.port}/ws/pane/p-1`, {
+    origin: 'http://evil.example', headers: { cookie: 'keep-token=secret' },
+  });
+  const [error] = await once(foreign, 'error');
+  assert.match(error.message, /403/);
+});
