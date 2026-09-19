@@ -178,6 +178,17 @@ test('isolated browser: the console is usable on a 412px touch screen',
         return result.result.value;
       };
       const wait = (condition) => evaluate(`new Promise((resolve,reject)=>{const deadline=Date.now()+5000;const tick=()=>{if(${condition})resolve(true);else if(Date.now()>deadline)reject(new Error('condition timed out: '+${JSON.stringify(condition)}));else setTimeout(tick,30)};tick()})`);
+      // The same poll, but tolerant of the page being replaced under it: an
+      // evaluate that lands while a reload is in flight throws rather than
+      // answering, and that is not a failure.
+      const settle = async (condition) => {
+        const deadline = Date.now() + 15000;
+        for (;;) {
+          try { if (await evaluate(`Boolean(${condition})`)) return; } catch {}
+          if (Date.now() > deadline) throw new Error(`condition never settled: ${condition}`);
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      };
       // The same poll, on this side of the bridge, for what the fixture received.
       const until = (predicate, label) => new Promise((resolve, reject) => {
         const deadline = Date.now() + 5000;
@@ -509,6 +520,58 @@ test('isolated browser: the console is usable on a 412px touch screen',
         + " && history.state && history.state.keepOverlay === 'tab'");
       await evaluate('history.back()');
       await wait("document.querySelector('#triage').classList.contains('on')"
+        + " && !(history.state && history.state.keepOverlay)");
+      await noOverflow('triage');
+
+      // A tab change under a sheet cannot write the history entry — the sheet's
+      // entry is the current one — so the entry keeps the tab it was pushed for
+      // until the sheet closes. Repairing it only on the mode change would leave
+      // Forward restoring the tab that was left, not the one that was on screen.
+      await evaluate("document.querySelector('.modes [data-mode=fleet]').click()");
+      await wait("document.querySelector('#fleet').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'tab'"
+        + " && history.state.keepMode === 'fleet'");
+      await evaluate("document.querySelector('.mobile-status').click()");
+      await wait("document.querySelector('#mobileStatusSheet').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'status'");
+      // The console's own mode change, from under the sheet: in the app this is a
+      // notification tap, which lands on setMode the same way.
+      await evaluate("document.querySelector('.modes [data-mode=reviewer]').click()");
+      await wait("document.querySelector('#reviewer').classList.contains('on')"
+        + " && document.querySelector('#mobileStatusSheet').classList.contains('on')");
+      await evaluate("document.querySelector('#mobileStatusSheet [data-sheet-close].btn').click()");
+      await wait("!document.querySelector('#mobileStatusSheet').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'tab'");
+      assert.equal(await evaluate('history.state && history.state.keepMode'), 'reviewer',
+        'the tab entry is repaired once it is the current one again');
+      await evaluate('history.back()');
+      await wait("document.querySelector('#triage').classList.contains('on')"
+        + " && !(history.state && history.state.keepOverlay)");
+      await evaluate('history.forward()');
+      await wait("document.querySelector('#reviewer').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'tab'");
+      await evaluate('history.back()');
+      await wait("document.querySelector('#triage').classList.contains('on')"
+        + " && !(history.state && history.state.keepOverlay)");
+
+      // A reload keeps the history entry but not the overlay stack: boot has to
+      // adopt the tab entry that is already there. Pushing a second one over it
+      // left a twin, and the first Back landed on an entry naming the same
+      // overlay — a press that did nothing before Triage came back.
+      await evaluate("document.querySelector('.modes [data-mode=fleet]').click()");
+      await wait("document.querySelector('#fleet').classList.contains('on')"
+        + " && history.state && history.state.keepOverlay === 'tab'");
+      const beforeReload = await evaluate('history.length');
+      await evaluate('location.reload()');
+      await settle("document.documentElement.classList.contains('mobile')"
+        + " && document.querySelector('#fleet').classList.contains('on')"
+        + " && document.querySelector('#fleet tbody tr')");
+      assert.equal(await evaluate('history.state && history.state.keepOverlay'), 'tab',
+        'the reloaded page still stands on the entry it left');
+      assert.equal(await evaluate('history.length'), beforeReload,
+        'the reload adopts that entry rather than pushing a second one over it');
+      await evaluate('history.back()');
+      await settle("document.querySelector('#triage').classList.contains('on')"
         + " && !(history.state && history.state.keepOverlay)");
       await noOverflow('triage');
 

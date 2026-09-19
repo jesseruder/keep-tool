@@ -355,18 +355,30 @@ function reconcile() {
   reconciling = true;
   try {
     if (showing('menu') && !document.querySelector('.session-actions[open]')) close('menu');
-    const entry = overlays.find((item) => item.name === 'tab');
     const mode = ctx.state.mode;
-    if (mode === 'triage') { if (entry) close('tab'); }
-    else if (!entry) open('tab', mode);
-    else if (entry.mode !== mode) {
-      // One entry for the whole non-Triage side: moving between Fleet, Queue and
-      // the Reviewer renames it instead of stacking another, so Back from any of
-      // them is one step from Triage.
-      entry.mode = mode;
-      if (entry.pushed && overlays[overlays.length - 1] === entry) {
-        try { history.replaceState({ keepOverlay: 'tab', keepMode: mode }, ''); } catch {}
-      }
+    let entry = overlays.find((item) => item.name === 'tab');
+    if (mode === 'triage') { if (entry) close('tab'); return; }
+    if (!entry) {
+      // A reload keeps the history entry but not this module's stack, so boot
+      // finds a `tab` entry already there with nothing owning it. Adopt it, the
+      // way the inbox adopts a dialog that is already open: pushing a second one
+      // over it leaves a twin behind, and Back onto it reads as unchanged —
+      // a dead press before Triage ever comes back.
+      const carried = !overlays.length && history.state?.keepOverlay === 'tab' ? history.state : null;
+      if (!carried) { open('tab', mode); return; }
+      entry = { name: 'tab', pushed: true, mode: carried.keepMode || mode };
+      overlays.push(entry);
+    }
+    // One entry for the whole non-Triage side: moving between Fleet, Queue and
+    // the Reviewer renames it instead of stacking another, so Back from any of
+    // them is one step from Triage. The rename is driven by what the history
+    // actually holds, not by the mode having just changed: a mode change under a
+    // sheet cannot write it (the sheet's entry is the current one), and the
+    // repair has to happen when the tab entry is on top again.
+    entry.mode = mode;
+    if (entry.pushed && overlays[overlays.length - 1] === entry
+      && history.state?.keepOverlay === 'tab' && history.state.keepMode !== mode) {
+      try { history.replaceState({ keepOverlay: 'tab', keepMode: mode }, ''); } catch {}
     }
   } finally { reconciling = false; }
 }
