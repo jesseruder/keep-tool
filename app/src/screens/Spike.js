@@ -4,12 +4,17 @@ import { ScrollView, Text, View } from 'react-native';
 import { Button, mono } from '../ui';
 
 const { createEmulator } = require('../terminal/emulator');
-const { fixture, frameData } = require('../terminal/fixture');
+const { fixture, frameData, expectedRuns, sameRun } = require('../terminal/fixture');
 
 // Phase 3 step 0: does xterm's parser run under Hermes, and how fast? The fixture is a
 // synthetic relay stream built by src/terminal/fixtures/generate.js, with the expected
 // final screen baked in by @xterm/addon-serialize on the Mac — the device does not
 // carry the serializer, only the parser it would actually ship with.
+//
+// The verdict covers the styling, not only the text. The fixture deliberately carries
+// palette, 256-colour and truecolour, and every attribute, because a colour mapping
+// that broke under Hermes would render a screen that still reads correctly — and a
+// PASS on text alone would be a lie about exactly the part hardest to eyeball.
 
 const ANSI_16 = [
   '#000000', '#cc0000', '#4e9a06', '#c4a000', '#3465a4', '#75507b', '#06989a', '#d3d7cf',
@@ -62,9 +67,28 @@ async function runSpike() {
   const rowsMs = now() - rowsStart;
 
   const mine = rows.map((row) => row.text.slice(0, row.trimmed));
+  const wantRuns = expectedRuns();
   const diffs = [];
+  let firstDiff = null;
   for (let y = 0; y < fixture.expected.rows.length; y++) {
-    if (mine[y] !== fixture.expected.rows[y]) diffs.push(y);
+    const wantText = fixture.expected.rows[y];
+    const want = wantRuns[y] || [];
+    const got = rows[y] ? rows[y].runs : [];
+    let detail = null;
+    if (mine[y] !== wantText) {
+      detail = { kind: 'text', got: mine[y], want: wantText };
+    } else if (got.length !== want.length) {
+      detail = { kind: 'runs', got: `${got.length} runs`, want: `${want.length} runs` };
+    } else {
+      for (let i = 0; i < want.length; i++) {
+        if (sameRun(got[i], want[i])) continue;
+        detail = { kind: 'run', index: i, got: got[i], want: want[i] };
+        break;
+      }
+    }
+    if (!detail) continue;
+    diffs.push(y);
+    if (!firstDiff) firstDiff = { row: y, ...detail };
   }
   const cursor = emulator.cursor();
   const alternate = emulator.isAlternate();
@@ -76,6 +100,8 @@ async function runSpike() {
   return {
     pass: diffs.length === 0 && cursorOk && alternate === fixture.expected.alternate,
     diffs,
+    firstDiff,
+    runs: wantRuns.reduce((total, row) => total + row.length, 0),
     rows,
     mine,
     frames: frames.length,
@@ -169,7 +195,9 @@ export default function Spike({ colors, onBack, styles: appStyles }) {
         <>
           <View style={[styles.verdict, { backgroundColor: result.pass ? colors.accentSoft : colors.badSoft }]}>
             <Text style={[styles.verdictText, { color: result.pass ? colors.ok : colors.bad }]}>
-              {result.pass ? 'PASS — the screen matches the serializer' : `FAIL — ${result.diffs.length} rows differ`}
+              {result.pass
+                ? 'PASS — text and styling both match the serializer'
+                : `FAIL — ${result.diffs.length} rows differ`}
             </Text>
           </View>
           <Text style={styles.stat}>{`frames        ${result.frames}`}</Text>
@@ -177,6 +205,7 @@ export default function Spike({ colors, onBack, styles: appStyles }) {
           <Text style={styles.stat}>{`base64 decode ${result.decodeMs.toFixed(1)} ms`}</Text>
           <Text style={styles.stat}>{`write+parse   ${result.writeMs.toFixed(1)} ms`}</Text>
           <Text style={styles.stat}>{`rows()        ${result.rowsMs.toFixed(2)} ms for ${result.rows.length} rows`}</Text>
+          <Text style={styles.stat}>{`style runs    ${result.runs} compared`}</Text>
           <Text style={styles.stat}>{`total         ${result.totalMs.toFixed(1)} ms`}</Text>
           <Text style={styles.stat}>
             {`cursor        ${result.cursor.x},${result.cursor.y} visible=${result.cursor.visible} `
@@ -185,8 +214,13 @@ export default function Spike({ colors, onBack, styles: appStyles }) {
           <Text style={styles.stat}>
             {`alt buffer    ${result.alternate} ${result.alternate === fixture.expected.alternate ? 'ok' : 'MISMATCH'}`}
           </Text>
-          {result.diffs.length ? (
-            <Text style={styles.stat}>{`first diff at row ${result.diffs[0]}:\n  got ${JSON.stringify(result.mine[result.diffs[0]])}\n  want ${JSON.stringify(fixture.expected.rows[result.diffs[0]])}`}</Text>
+          {result.firstDiff ? (
+            <Text style={styles.stat}>
+              {`first diff at row ${result.firstDiff.row}`
+                + `${result.firstDiff.kind === 'run' ? `, run ${result.firstDiff.index}` : ''} `
+                + `(${result.firstDiff.kind})\n  got  ${JSON.stringify(result.firstDiff.got)}`
+                + `\n  want ${JSON.stringify(result.firstDiff.want)}`}
+            </Text>
           ) : null}
 
           <Text style={[styles.sub, { marginTop: 14 }]}>The parsed screen, drawn as native text rows:</Text>

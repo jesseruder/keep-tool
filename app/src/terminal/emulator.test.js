@@ -11,7 +11,9 @@ const { Terminal } = require('@xterm/headless');
 const { SerializeAddon } = require('@xterm/addon-serialize');
 
 const { createEmulator, readLine } = require('./emulator.js');
-const { fixture, dataFrames, jsonFrames, decodeBase64 } = require('./fixture.js');
+const {
+  fixture, dataFrames, jsonFrames, decodeBase64, expandRun, expectedRuns, sameRun,
+} = require('./fixture.js');
 
 const SCROLLBACK = fixture.expected.scrollback || 1000;
 
@@ -150,8 +152,12 @@ test('the emulator reproduces what the serializer sees, row for row', async (t) 
   ));
   assert.deepEqual(mine, visibleRows(replay));
 
-  // The Spike screen compares against this without a serializer on the device.
+  // The Spike screen compares against this without a serializer on the device. Text
+  // alone would let a broken colour or attribute mapping through, and the fixture goes
+  // out of its way to carry palette, 256-colour, truecolour and every attribute, so the
+  // runs are part of the expectation too.
   assert.deepEqual(mine, fixture.expected.rows);
+  assert.deepEqual(emulator.rows().map((row) => row.runs), expectedRuns());
   assert.equal(emulator.isAlternate(), fixture.expected.alternate);
   assert.deepEqual(emulator.cursor(), fixture.expected.cursor);
 
@@ -173,6 +179,33 @@ test('the fixture parses fast enough to be worth putting on a phone', async (t) 
   // of magnitude ahead of Hermes, so the ceiling is loose on purpose: the device run is
   // what decides, this only catches a collapse.
   assert.ok(perFrame < 10000, `parsing 60 s of output took ${perFrame.toFixed(0)} ms`);
+});
+
+test('the baked runs describe the styling the fixture sets out to exercise', async (t) => {
+  const emulator = createEmulator({ cols: fixture.cols, rows: fixture.rows, scrollback: SCROLLBACK });
+  t.after(() => emulator.dispose());
+  await feed(emulator);
+
+  const baked = expectedRuns();
+  assert.equal(baked.length, fixture.rows);
+  const all = baked.flat();
+  // If any of these ever stops being true the fixture has drifted and the device
+  // verdict has quietly stopped proving what it claims to.
+  assert.ok(all.some((run) => typeof run.fg === 'number'), 'a palette foreground');
+  assert.ok(all.some((run) => typeof run.fg === 'number' && run.fg > 15), 'a 256-colour foreground');
+  assert.ok(all.some((run) => typeof run.fg === 'string' && run.fg.startsWith('#')), 'a truecolour foreground');
+  assert.ok(all.some((run) => typeof run.bg === 'string' && run.bg.startsWith('#')), 'a truecolour background');
+  assert.ok(all.some((run) => typeof run.bg === 'number'), 'a palette background');
+  for (const flag of ['bold', 'dim', 'italic', 'underline', 'inverse']) {
+    assert.ok(all.some((run) => run[flag]), `an ${flag} run`);
+  }
+
+  // sameRun is what the device compares with; it has to notice each field.
+  const [reference] = emulator.rows()[0].runs;
+  assert.ok(sameRun(reference, expandRun({ ...reference })));
+  for (const [field, value] of [['start', 99], ['end', 99], ['fg', 7], ['bg', '#123456'], ['bold', !reference.bold]]) {
+    assert.equal(sameRun(reference, { ...reference, [field]: value }), false, `${field} is compared`);
+  }
 });
 
 test('every visible row comes back with runs that cover it', async (t) => {

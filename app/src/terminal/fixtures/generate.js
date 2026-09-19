@@ -124,6 +124,67 @@ json({ t: 'pane', pane: paneState({ title: 'synthetic pane · done' }) });
 
 // --- bake the expected screen -------------------------------------------------
 
+// Read off the reference terminal's cells here rather than importing the emulator: the
+// fixture is the independent statement of what the screen should be, and a generator
+// that called the code under test could only ever agree with it. The shape matches what
+// emulator.js rows() produces, and the node test is what holds the two together.
+function runsOf(line, cols, cell) {
+  const runs = [];
+  let open = null;
+  let offset = 0;
+  for (let x = 0; x < cols; x++) {
+    line.getCell(x, cell);
+    if (cell.getWidth() === 0) continue;
+    const chars = cell.getChars() || ' ';
+    const style = {
+      fg: cell.getFgColorMode() === 0 ? null
+        : cell.isFgRGB() ? `#${(cell.getFgColor() & 0xffffff).toString(16).padStart(6, '0')}`
+          : cell.isFgPalette() ? cell.getFgColor() : null,
+      bg: cell.getBgColorMode() === 0 ? null
+        : cell.isBgRGB() ? `#${(cell.getBgColor() & 0xffffff).toString(16).padStart(6, '0')}`
+          : cell.isBgPalette() ? cell.getBgColor() : null,
+      bold: Boolean(cell.isBold()),
+      dim: Boolean(cell.isDim()),
+      italic: Boolean(cell.isItalic()),
+      underline: Boolean(cell.isUnderline()),
+      inverse: Boolean(cell.isInverse()),
+    };
+    const same = open && open.fg === style.fg && open.bg === style.bg && open.bold === style.bold
+      && open.dim === style.dim && open.italic === style.italic
+      && open.underline === style.underline && open.inverse === style.inverse;
+    if (same) open.end = offset + chars.length;
+    else {
+      open = { start: offset, end: offset + chars.length, ...style };
+      runs.push(open);
+    }
+    offset += chars.length;
+  }
+  return runs;
+}
+
+// Stored without whatever a default cell already is, so the file stays small; fixture.js
+// puts the full shape back before anything compares against it.
+function packRun(run) {
+  const packed = { start: run.start, end: run.end };
+  if (run.fg !== null) packed.fg = run.fg;
+  if (run.bg !== null) packed.bg = run.bg;
+  for (const flag of ['bold', 'dim', 'italic', 'underline', 'inverse']) {
+    if (run[flag]) packed[flag] = true;
+  }
+  return packed;
+}
+
+function visibleRuns(term) {
+  const buffer = term.buffer.active;
+  const cell = buffer.getNullCell();
+  const rows = [];
+  for (let y = 0; y < term.rows; y++) {
+    const line = buffer.getLine(buffer.viewportY + y);
+    rows.push(line ? runsOf(line, term.cols, cell).map(packRun) : []);
+  }
+  return rows;
+}
+
 function visibleRows(term) {
   const buffer = term.buffer.active;
   const rows = [];
@@ -149,6 +210,7 @@ function payload(frame) {
   }
 
   const expected = visibleRows(term);
+  const expectedRuns = visibleRuns(term);
 
   // A fresh terminal replaying host.js's serialization has to land on the same screen.
   // If it does not, the fixture is describing something the desktop could not replay
@@ -176,6 +238,7 @@ function payload(frame) {
     frames,
     expected: {
       rows: expected,
+      runs: expectedRuns,
       alternate: buffer.type === 'alternate',
       cursor: {
         x: buffer.cursorX,
@@ -191,8 +254,11 @@ function payload(frame) {
   fs.writeFileSync(OUT, json);
   const counts = frames.reduce((totals, frame) => ({ ...totals, [frame.kind]: (totals[frame.kind] || 0) + 1 }), {});
   const bytes = frames.reduce((total, frame) => total + (payload(frame)?.length || 0), 0);
+  const runCount = expectedRuns.reduce((total, row) => total + row.length, 0);
+  const styledRows = expectedRuns.filter((row) => row.length > 1).length;
   process.stdout.write(
     `${OUT}\n  ${frames.length} frames ${JSON.stringify(counts)}, ${bytes} bytes of output, `
-    + `${json.length} bytes on disk, ${COLS}x${ROWS}, round-trip clean\n`,
+    + `${json.length} bytes on disk, ${COLS}x${ROWS}, round-trip clean\n`
+    + `  ${runCount} style runs over ${expectedRuns.length} rows, ${styledRows} of them styled\n`,
   );
 })();

@@ -43,4 +43,32 @@ function jsonFrames() {
   return fixture.frames.filter((frame) => frame.kind === 'json').map((frame) => JSON.parse(frame.data));
 }
 
-module.exports = { fixture, decodeBase64, frameData, dataFrames, jsonFrames };
+const RUN_FLAGS = ['bold', 'dim', 'italic', 'underline', 'inverse'];
+
+// The file stores only what a run does differently from a default cell. Put the full
+// shape back, so what is compared against the emulator is the whole run and not just
+// the parts the fixture bothered to write down.
+function expandRun(run) {
+  const full = {
+    start: run.start,
+    end: run.end,
+    fg: run.fg === undefined ? null : run.fg,
+    bg: run.bg === undefined ? null : run.bg,
+  };
+  for (const flag of RUN_FLAGS) full[flag] = run[flag] === true;
+  return full;
+}
+
+function expectedRuns() {
+  return fixture.expected.runs.map((row) => row.map(expandRun));
+}
+
+function sameRun(a, b) {
+  if (!a || !b) return false;
+  if (a.start !== b.start || a.end !== b.end || a.fg !== b.fg || a.bg !== b.bg) return false;
+  return RUN_FLAGS.every((flag) => a[flag] === b[flag]);
+}
+
+module.exports = {
+  fixture, decodeBase64, frameData, dataFrames, jsonFrames, expandRun, expectedRuns, sameRun, RUN_FLAGS,
+};
