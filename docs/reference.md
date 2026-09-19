@@ -24,6 +24,7 @@ registry data or credentials to the public source repository.
 - `skills/packs.json` — the named skill packs (`core`, `handoff`) `keep setup skills` installs
 - `reviews/` — fleet-reviewer findings, one file per day
 - `bin/alerts.js` — alert routing, rate policy, channel adapters, and brief composition
+- `bin/devices.js` — the phones registered for Expo push, and the `/api/devices` registry
 - `bin/unblock.js` — cross-card dependency resolution and linked-session delivery
 - `bin/slack.js` — read-only Slack polling, fleet correlation, cards, and alerts
 - `bin/incidents.js` — deterministic alert parsing for the bots in `alertBots`, and the incident card per signature
@@ -36,6 +37,7 @@ registry data or credentials to the public source repository.
 - `bin/turn-index.js` — SQLite index of agent turns, its incremental ingest, and its queries
 - `bin/turn-watcher.js` — shadow judgment of ended turns: what Owner would have typed next
 - `.keep/` — machine state (lock, markers, reviewer state), gitignored
+- `.keep/devices.json` — registered phones and their Expo push tokens (0600, local only)
 - `.keep/turns.sqlite` — the turn index; a derived cache, safe to delete and rebuild
 - `.keep/artifacts/` — committed per-card durable artifacts, force-added like `.keep/handoffs/`
 - `.keep/holds/` — quiet-window ledgers, one JSON file per hold
@@ -701,6 +703,10 @@ named card without claiming its session.
 | urgent | phone push + speaker | phone push + speaker | unchanged |
 | brief | phone push | phone push | unchanged |
 
+“Phone push” is two channels: the `push` webhook and the `expo` channel below.
+They ride together in every decision, so quiet hours, the dedupe window and the
+daily caps — all decided before a channel is picked — apply to both identically.
+
 Presence is an idle time under five minutes. Phone pushes use `KEEP_PUSH_WEBHOOK` or
 `~/.config/keep/push-webhook`; channel failures never crash the caller. When no push
 channel is configured at all, the brief is recorded once for the day and left in the
@@ -742,6 +748,57 @@ open needs, overdue checks, deferred alerts, recent
 medium/high reviewer findings, active holds, and gated steps with pending commits. A
 failed delivery retries every 30 minutes until 12:00 local, when the daemon records the
 failure and gives up for that day; `keep brief --send` always sends immediately.
+
+## Devices and push
+
+The Keep phone app registers itself for push. `.keep/devices.json` holds the
+registered phones — `{ id, expoPushToken, platform, name, appVersion,
+registeredAt, lastSeenAt }` each — written 0600 through a temp file and a rename,
+like the rest of `.keep/`. The Expo push token is the key: the same token
+re-registering refreshes its name, version and `lastSeenAt` instead of adding a
+row, and a rotated token arrives as a new device. At most 16 devices are kept;
+past that the one seen longest ago loses its slot. A token must look like
+`ExponentPushToken[…]` or `ExpoPushToken[…]`, and the platform must be `android`
+or `ios`.
+
+Three routes, all of them needing `x-keep: 1` on top of the ordinary
+authorization:
+
+- `POST /api/devices` with `{ expoPushToken, platform, name?, appVersion? }` →
+  `{ ok: true, device, count, created }`. A bad token or platform is a `400`.
+- `DELETE /api/devices` with `{ expoPushToken }` → `{ ok: true, removed, count }`.
+  `removed` is false when that token was not registered.
+- `GET /api/devices` → `{ ok: true, devices: [...] }`, each device carrying
+  `tokenTail` (the last six characters) in place of its token. A whole push token
+  is a bearer credential for that phone's notifications and never leaves the
+  daemon.
+
+The `expo` channel delivers every decision the `push` webhook gets, to every
+registered phone, by posting to `https://exp.host/--/api/v2/push/send` with a
+10-second timeout, at most 100 tokens per request:
+
+```json
+{ "to": ["ExponentPushToken[…]"], "title": "agent:reviewer", "body": "<the alert text>",
+  "data": { "key": "alert:<alert id>", "sessionId": "" }, "badge": 3,
+  "sound": "default", "channelId": "attention", "priority": "high" }
+```
+
+The title matches the desktop banner's (`Keep`, the alert's `from`, and
+`· Urgent` for an urgent one). `data.key` is what the app hands back to the
+console on a notification tap: `alert:<id>` opens that message in the inbox, the
+same path a desktop banner click takes. `badge` is the console's own count — the
+attention rows it is showing plus its unread inbox messages — read from the last
+state the daemon published. It is therefore approximate by design: dismissals are
+browser-local, and an alert's own inbox entry is appended after delivery, so it is
+not in the number that alert carries. A process with no dashboard state (the
+`keep` CLI) sends no `badge` at all and the app keeps the count it has.
+
+With no phone registered the channel is simply unavailable — nothing is attempted
+and the decision stands on its other channels. An explicit `KEEP_ALERT_CHANNELS`
+list must name `expo` to enable it, exactly as it must name `desktop`.
+Expo answers with one ticket per token: a `DeviceNotRegistered` ticket
+unregisters that device (an uninstalled app, or a rotated token), and any other
+failure is logged at most once a minute and never raised to the caller.
 
 ## Standup
 

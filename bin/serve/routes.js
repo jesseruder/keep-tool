@@ -21,7 +21,7 @@ function routes(ctx) {
     inspectReviewQueueLaunch,
     keep, launchReviewQueueSession, listHostPanes, listPortableTransfers, notifications,
     openSession, path, portableTransferDraft, portableTransferPreview, preparePortableTransfer,
-    prepareSessionSummary, projectMobileState, recentTranscriptText, recoverReviewQueueLaunch, reminders,
+    prepareSessionSummary, projectMobileState, readBody, recentTranscriptText, recoverReviewQueueLaunch, reminders,
     reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, restorePlan, review,
     reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow, runTaskNow, screenHistorySession, screenSession,
     sendSessionKeys, sendStateJson, sendToSessionLocked, sessionMarks, sessionNames, sessionSummaryFile, setAsideCandidates,
@@ -747,6 +747,39 @@ function routes(ctx) {
           if (e instanceof InjectionError) return json(res, e.status, { error: e.message, ...e.extra });
           return json(res, 502, { error: String(e && e.message || e).slice(0, 500) });
         }
+      },
+    },
+    // The phones registered for Expo push. All three carry `x-keep: 1` like the
+    // other writes: a cookie session is same-site with every other service on
+    // this host, and that header is what such a page cannot add.
+    {
+      method: 'POST',
+      path: '/api/devices',
+      handle: async ({ req, res, url, body }) => {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        try { return json(res, 200, require('../devices.js').register(body || {}, keep.ROOT)); }
+        catch (error) { return json(res, error.status || 500, { error: error.message }); }
+      },
+    },
+    {
+      method: 'DELETE',
+      path: '/api/devices',
+      handle: async ({ req, res, url }) => {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        // Only POST bodies are read by the ladder; a DELETE reads its own.
+        let body;
+        try { body = await readBody(req); } catch (error) { return json(res, 400, { error: error.message }); }
+        try { return json(res, 200, require('../devices.js').unregister(body && body.expoPushToken, keep.ROOT)); }
+        catch (error) { return json(res, error.status || 500, { error: error.message }); }
+      },
+    },
+    {
+      method: 'GET',
+      path: '/api/devices',
+      handle: async ({ req, res, url }) => {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        try { return json(res, 200, { ok: true, devices: require('../devices.js').publicList(keep.ROOT) }); }
+        catch (error) { return json(res, error.status || 500, { error: error.message }); }
       },
     },
     {

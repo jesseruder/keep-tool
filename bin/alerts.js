@@ -12,6 +12,12 @@ const { execFileSync, spawn } = require('child_process');
 const DEFAULT_ROOT = process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
 const DAY_MS = 86400e3;
 const HOUR_MS = 3600e3;
+// Expo's push service, which the Keep phone app registers with. One request
+// carries at most 100 tokens; Owner has one phone, so the batching is there for
+// the shape of the API rather than for the fleet.
+const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+const EXPO_BATCH = 100;
+const EXPO_TIMEOUT_MS = 10e3;
 
 function atMs(value) {
   if (value instanceof Date) return value.getTime();
@@ -45,15 +51,15 @@ function route(level, info, now = Date.now()) {
     if (quietActive(info, now)) return { channels: [], deferred: true };
     return state === 'present'
       ? { channels: ['sound'], deferred: false }
-      : { channels: ['push'], deferred: false };
+      : { channels: ['push', 'expo'], deferred: false };
   }
   if (level === 'urgent') {
-    return { channels: ['push', 'speak'], deferred: false };
+    return { channels: ['push', 'expo', 'speak'], deferred: false };
   }
   if (level === 'brief') {
     // The morning brief is push-only: a spoken fleet summary at 08:00 was more
     // startling than useful, and the speakers stay reserved for urgent alerts.
-    return { channels: ['push'], deferred: false };
+    return { channels: ['push', 'expo'], deferred: false };
   }
   return { channels: [], deferred: true };
 }
@@ -233,6 +239,9 @@ function availableChannels(channels, root = DEFAULT_ROOT) {
   return channels.filter((channel) => {
     if (enabled && !enabled.has(channel)) return false;
     if (channel === 'push') return Boolean(pushWebhook(root));
+    // No phone has registered, so the Expo channel has nowhere to reach and the
+    // decision stays whatever the other channels made of it.
+    if (channel === 'expo') return expoDevices(root).length > 0;
     if (channel === 'speak') return fs.existsSync(path.join(os.homedir(), 'bin', 'announce'));
     if (channel === 'sound') return fs.existsSync('/System/Library/Sounds/Pop.aiff');
     return false;
@@ -272,10 +281,118 @@ async function sendPush(text, root = DEFAULT_ROOT) {
   } catch { return 'failed'; }
 }
 
+// The phone registry, read through a seam so adapter tests can hand in their own.
+function expoDevices(root = DEFAULT_ROOT, registry) {
+  try { return (registry || require('./devices.js')).list(root); } catch { return []; }
+}
+
+// One line a minute at most. A phone that has been reinstalled, or an Expo
+// outage, otherwise writes a line per alert per device into serve.log forever.
+let lastExpoLogAt = -Infinity;
+function expoLog(message, now = Date.now()) {
+  if (now - lastExpoLogAt < 60e3) return false;
+  lastExpoLogAt = now;
+  try { process.stderr.write(`keep alerts: expo push ${message}\n`); } catch {}
+  return true;
+}
+
+// The console's own badge: the attention rows it is showing plus the unread
+// messages in its inbox (web/app/app.js renderTop). Dismissals are browser-local,
+// so the daemon's count can sit one row above what a console with dismissed rows
+// shows, and it is computed from the last published state, so an alert's own
+// inbox entry — appended after delivery — is not in the number it carries.
+function badgeFromState(state) {
+  if (!state || typeof state !== 'object') return null;
+  const attention = Array.isArray(state.attention) ? state.attention.length : 0;
+  const unread = (Array.isArray(state.notifications) ? state.notifications : [])
+    .filter((entry) => entry && entry.read !== true).length;
+  return attention + unread;
+}
+
+// start() points this at the daemon's published state. In a CLI process there is
+// no dashboard state to count, so the payload simply carries no badge and the
+// app leaves the one it has.
+let badgeProvider = null;
+function setBadgeProvider(provider) { badgeProvider = typeof provider === 'function' ? provider : null; }
+function currentBadge(explicit) {
+  const clamp = (value) => Number.isFinite(value) ? Math.max(0, Math.round(value)) : null;
+  if (Number.isFinite(explicit)) return clamp(explicit);
+  if (!badgeProvider) return null;
+  try { return clamp(badgeProvider()); } catch { return null; }
+}
+
+async function sendExpo(entry, options = {}) {
+  const root = options.root || DEFAULT_ROOT;
+  const registry = options.devices || require('./devices.js');
+  const doFetch = options.fetch || globalThis.fetch;
+  const devices = expoDevices(root, registry);
+  // Nothing registered (or no fetch to reach Expo with): a no-op, recorded like
+  // the unconfigured webhook is, since nothing was attempted.
+  if (!devices.length || typeof doFetch !== 'function') return 'failed';
+  const badge = currentBadge(options.badge);
+  // Tests drive the once-a-minute log throttle through this rather than the clock.
+  const now = Number.isFinite(options.now) ? options.now : Date.now();
+  const title = `${entry.from === 'manual' ? 'Keep' : entry.from || 'Keep'}${entry.level === 'urgent' ? ' · Urgent' : ''}`;
+  let ok = false;
+  for (let start = 0; start < devices.length; start += EXPO_BATCH) {
+    const tokens = devices.slice(start, start + EXPO_BATCH).map((device) => device.expoPushToken);
+    const message = {
+      to: tokens,
+      title,
+      body: entry.text,
+      // `alert:<id>` is the key the console's notification-click handler opens in
+      // the inbox; the session id rides along for entries that name one.
+      data: { key: `alert:${entry.id}`, sessionId: String(entry.session || '') },
+      ...(badge === null ? {} : { badge }),
+      sound: 'default',
+      channelId: 'attention',
+      priority: 'high',
+    };
+    let payload = null;
+    try {
+      const response = await doFetch(EXPO_PUSH_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify(message),
+        signal: AbortSignal.timeout(EXPO_TIMEOUT_MS),
+      });
+      if (!response.ok) { expoLog(`HTTP ${response.status}`, now); continue; }
+      payload = await response.json();
+    } catch (error) {
+      expoLog(oneLine(error && error.message || error, 160), now);
+      continue;
+    }
+    if (payload && Array.isArray(payload.errors) && payload.errors.length) {
+      expoLog(oneLine(payload.errors.map((error) => error && error.message).filter(Boolean).join('; '), 160), now);
+    }
+    // Expo answers with one ticket per token, in the order they were sent.
+    const tickets = Array.isArray(payload && payload.data) ? payload.data : [];
+    for (let index = 0; index < tickets.length; index += 1) {
+      const ticket = tickets[index];
+      if (ticket && ticket.status === 'ok') { ok = true; continue; }
+      const reason = ticket && ticket.details && ticket.details.error;
+      // The app was uninstalled or its token rotated: that device is gone, and
+      // pushing to it again is what gets a sender rate-limited by Expo.
+      if (reason === 'DeviceNotRegistered') {
+        try { registry.remove(tokens[index], root); } catch {}
+        continue;
+      }
+      expoLog(`${reason || 'error'}: ${oneLine(ticket && ticket.message || '', 160)}`, now);
+    }
+  }
+  return ok ? 'ok' : 'failed';
+}
+
 async function deliver(entry, options = {}) {
   const text = entry.level === 'brief' && options.spoken ? options.spoken : entry.text;
   const attempts = (entry.channels || []).map(async (channel) => {
     if (channel === 'push') return [channel, await sendPush(entry.text, options.root || DEFAULT_ROOT)];
+    if (channel === 'expo') {
+      return [channel, await sendExpo(entry, {
+        root: options.root || DEFAULT_ROOT, badge: options.badge, fetch: options.fetch,
+        devices: options.devices, now: options.now,
+      })];
+    }
     if (channel === 'speak') {
       const args = ['--from', 'Keep'];
       if (entry.level === 'urgent' && options.force) args.push('--force');
@@ -352,6 +469,9 @@ async function sendAlert(options) {
   if (!result.entry) return result;
   const delivered = result.deferred ? {} : await (options.deliver || deliver)(result.entry, {
     root, force: options.force, spoken: options.spoken,
+    // The Expo channel's seams: an explicit badge count, and the fetch/registry
+    // an adapter test hands in. Production sets none of them.
+    badge: options.badge, fetch: options.fetch, devices: options.devices,
   });
   const deliveryOk = result.entry.desktop === true || Object.values(delivered).includes('ok');
   // Routed, but every channel this level routes to is unconfigured on this machine
@@ -580,6 +700,9 @@ module.exports = {
   readAlerts,
   sendAlert,
   deliver,
+  sendExpo,
+  badgeFromState,
+  setBadgeProvider,
   loadReviewFindings,
   stableKey,
   dayOf,

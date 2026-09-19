@@ -9873,7 +9873,7 @@ function start(deps = {}) {
     limitresume, listHostPanes, listPortableTransfers, liveSessionTick, liveTurnIndexSessions,
     loadCurrentSession, notifications, openCheckSession, openSession, path, portableTransferDraft,
     portableTransferPreview, preparePortableTransfer, prepareSessionSummary, projectMobileState,
-    readLiveSessionLedger, readScreenResult, recentTranscriptText, recoverReviewQueueLaunch, reminders,
+    readBody, readLiveSessionLedger, readScreenResult, recentTranscriptText, recoverReviewQueueLaunch, reminders,
     reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, resolveSessionTarget,
     restartSession,
     restorePlan, resumeAfterLimit, review, reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow,
@@ -9919,6 +9919,11 @@ function start(deps = {}) {
   const isLocal = (addr) => addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 
   const requestRoutes = buildRequestRoutes(ctx);
+
+  // Phone pushes carry the console's own badge count. Only the daemon has the
+  // state it is computed from, so it hands alerts.js a reader for it rather than
+  // every alert caller passing one.
+  alerts.setBadgeProvider(() => alerts.badgeFromState(retainedPublication ? retainedPublication.state : null));
 
   const server = http.createServer(async (req, res) => {
     if (req.keepConsoleHandled) return;

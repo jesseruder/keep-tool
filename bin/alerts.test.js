@@ -36,12 +36,14 @@ test('test runners and their fixture CLIs cannot enable real alert channels', (t
 test('route table covers attention presence and quiet, urgent, and brief', () => {
   const now = Date.parse('2026-09-02T08:00:00');
   assert.deepEqual(route('attention', { state: 'present' }, now), { channels: ['sound'], deferred: false });
-  assert.deepEqual(route('attention', { state: 'away' }, now), { channels: ['push'], deferred: false });
+  // `expo` rides with `push` in every decision, so quiet hours and the rate
+  // policy — both decided before channels are chosen — apply to it unchanged.
+  assert.deepEqual(route('attention', { state: 'away' }, now), { channels: ['push', 'expo'], deferred: false });
   assert.deepEqual(route('attention', { state: 'present', quietUntil: now + 60e3 }, now), { channels: [], deferred: true });
-  assert.deepEqual(route('urgent', { state: 'present', quietUntil: now + 60e3 }, now), { channels: ['push', 'speak'], deferred: false });
-  assert.deepEqual(route('urgent', { state: 'away' }, now), { channels: ['push', 'speak'], deferred: false });
-  assert.deepEqual(route('brief', { state: 'present' }, now), { channels: ['push'], deferred: false });
-  assert.deepEqual(route('brief', { state: 'away' }, now), { channels: ['push'], deferred: false });
+  assert.deepEqual(route('urgent', { state: 'present', quietUntil: now + 60e3 }, now), { channels: ['push', 'expo', 'speak'], deferred: false });
+  assert.deepEqual(route('urgent', { state: 'away' }, now), { channels: ['push', 'expo', 'speak'], deferred: false });
+  assert.deepEqual(route('brief', { state: 'present' }, now), { channels: ['push', 'expo'], deferred: false });
+  assert.deepEqual(route('brief', { state: 'away' }, now), { channels: ['push', 'expo'], deferred: false });
 });
 
 test('alertDecision dedupes for six hours but allows an escalation', () => {
