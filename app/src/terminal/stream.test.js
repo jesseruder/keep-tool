@@ -58,18 +58,59 @@ test('a resize waits for the bytes written before it and holds back the ones aft
   assert.deepEqual(events, ['parsed', 'resized:100x40', 'parsed']);
 });
 
-test('a write that never comes back does not strand the line, and disposal stops it', async () => {
+test('disposal settles the step in flight instead of waiting for a parser that is gone', async () => {
   const fake = fakeEmulator();
-  const stream = createTerminalStream({ emulator: fake.emulator });
-  stream.write('a');
+  const events = [];
+  const stream = createTerminalStream({
+    emulator: fake.emulator,
+    onParsed: () => events.push('parsed'),
+    onResized: () => events.push('resized'),
+  });
+
+  stream.write('first');
+  stream.resize(100, 40);
+  stream.write('second');
+  await settle();
+  assert.deepEqual(fake.log, ['write:first'], 'the first write is in flight and the rest are behind it');
+
+  // The screen unmounts: the emulator is disposed, so the callback for the write in
+  // flight is never coming. Waiting for it would keep the whole line — and every
+  // closure in it — alive behind a screen nobody is looking at.
+  stream.dispose();
+  let settled = false;
+  stream.idle().then(() => { settled = true; });
+  await settle();
+  assert.equal(settled, true, 'idle() resolves rather than waiting for a callback that will not come');
+  assert.deepEqual(fake.log, ['write:first'], 'nothing queued behind it reached the emulator');
+  assert.deepEqual(events, []);
+
+  // The parser answering late must not resurrect any of it.
   fake.releaseWrite();
   await settle();
+  assert.deepEqual(events, [], 'a callback after disposal is ignored');
+  assert.deepEqual(fake.log, ['write:first']);
 
-  stream.dispose();
-  stream.write('b');
+  stream.write('third');
   stream.resize(80, 24);
   await settle();
-  assert.deepEqual(fake.log, ['write:a'], 'nothing reaches a disposed emulator');
+  assert.deepEqual(fake.log, ['write:first'], 'and nothing new reaches a disposed emulator');
+  assert.deepEqual(events, []);
+});
+
+test('a drain that never resolves is released by disposal too', async () => {
+  const fake = fakeEmulator();
+  const events = [];
+  const stream = createTerminalStream({ emulator: fake.emulator, onResized: () => events.push('resized') });
+  stream.resize(60, 20);
+  await settle();
+  assert.deepEqual(fake.log, ['drain']);
+
+  stream.dispose();
+  await stream.idle();
+  fake.releaseDrain();
+  await settle();
+  assert.deepEqual(fake.log, ['drain'], 'the resize is not applied to an emulator that is gone');
+  assert.deepEqual(events, []);
 });
 
 test('over a real emulator the bytes land at the geometry they were written for', async (t) => {

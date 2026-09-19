@@ -18,6 +18,11 @@ function createTerminalStream(options = {}) {
   if (!emulator) throw new Error('createTerminalStream needs an emulator');
   let tail = Promise.resolve();
   let disposed = false;
+  // How the step in flight is ended from outside. A disposed emulator answers no
+  // callbacks at all, so without this the step it was in the middle of would never
+  // settle: `idle()` would wait forever and the whole line — every queued frame and
+  // the closures it holds — would stay alive behind an unmounted screen.
+  let settleCurrent = null;
 
   // Each step runs after the one before it, whether that one settled or threw: a
   // failed write must not strand every frame behind it.
@@ -30,14 +35,30 @@ function createTerminalStream(options = {}) {
     return next;
   };
 
+  // The step's promise, with its resolver parked where dispose() can reach it. `run`
+  // is handed a `finish` that settles the step exactly once and clears the parking
+  // spot, so a callback arriving after disposal is a no-op rather than a second
+  // settle of someone else's step.
+  const step = (run) => new Promise((resolve) => {
+    if (disposed) { resolve(); return; }
+    let done = false;
+    const finish = () => {
+      if (done) return false;
+      done = true;
+      if (settleCurrent === finish) settleCurrent = null;
+      resolve();
+      return true;
+    };
+    settleCurrent = finish;
+    run(finish);
+  });
+
   return {
     write(data) {
-      return chain(() => new Promise((resolve) => {
-        // A disposed emulator's write never calls back, which would strand the line.
-        if (disposed) { resolve(); return; }
+      return chain(() => step((finish) => {
         emulator.write(data, () => {
-          if (!disposed && onParsed) onParsed();
-          resolve();
+          const first = finish();
+          if (first && !disposed && onParsed) onParsed();
         });
       }));
     },
@@ -45,17 +66,27 @@ function createTerminalStream(options = {}) {
     // The observer adopting the pane's geometry. Nothing written before this point is
     // laid out at the new size, and nothing written after it at the old one.
     resize(cols, rows) {
-      return chain(() => Promise.resolve(emulator.drain()).then(() => {
-        if (disposed) return;
-        emulator.resize(cols, rows);
-        if (onResized) onResized(cols, rows);
+      return chain(() => step((finish) => {
+        const applied = () => {
+          if (disposed) { finish(); return; }
+          emulator.resize(cols, rows);
+          const first = finish();
+          if (first && onResized) onResized(cols, rows);
+        };
+        Promise.resolve(emulator.drain()).then(applied, applied);
       }));
     },
 
-    // Resolves when everything queued so far has been applied.
+    // Resolves when everything queued so far has been applied — or, after disposal,
+    // as soon as the line has unwound.
     idle() { return tail; },
 
-    dispose() { disposed = true; },
+    dispose() {
+      disposed = true;
+      const settle = settleCurrent;
+      settleCurrent = null;
+      if (settle) settle();
+    },
   };
 }
 

@@ -142,3 +142,42 @@ test('the alternate screen is left alone, and reset clears the mirror', async (t
   assert.equal(mirror.sync(emulator, 4), null, 'leaving it changes nothing either');
   assert.deepEqual(mirror.reset(), []);
 });
+
+test('a resize declared under a full screen program is honoured when it ends', async (t) => {
+  const emulator = createEmulator({ cols: 80, rows: 6, scrollback: 500 });
+  t.after(() => emulator.dispose());
+  const mirror = createScrollbackMirror({ page: 400, max: 500 });
+  const lines = [];
+  for (let i = 0; i < 50; i++) lines.push(`line ${i} ${'.'.repeat(60)}`);
+  await write(emulator, `${lines.join('\r\n')}\r\n`);
+  mirror.sync(emulator, 400);
+  assert.deepEqual(textOf(mirror.rows()), truth(emulator, 400));
+  assert.equal(textOf(mirror.rows()).some((line) => line.length > 40), true, 'these are eighty column rows');
+
+  // The pane is resized while vim (or anything else on the alternate screen) is
+  // running. There is no scrollback to read while it is, but xterm reflows the normal
+  // buffer underneath, so what is held here is already wrong.
+  await write(emulator, '\x1b[?1049h');
+  emulator.resize(40, 6);
+  await emulator.flush();
+  assert.equal(mirror.sync(emulator, 400, { rebuild: true }), null, 'nothing to read while it is running');
+
+  await write(emulator, '\x1b[?1049l');
+  const after = mirror.sync(emulator, 400);
+  assert.deepEqual(textOf(after), truth(emulator, 400),
+    'the declared resize is honoured on the first sync that can act on it');
+  assert.equal(textOf(after).every((line) => line.length <= 40), true, 'no eighty column rows are left');
+  assert.equal(mirror.length(), emulator.normalScrollback().length);
+
+  // Widening is the case that cannot be noticed after the fact: the buffer's length
+  // does not fall, so nothing but the remembered request says the rows are stale.
+  const narrowRows = textOf(mirror.rows());
+  await write(emulator, '\x1b[?1049h');
+  emulator.resize(100, 6);
+  await emulator.flush();
+  assert.equal(mirror.sync(emulator, 400, { rebuild: true }), null);
+  await write(emulator, '\x1b[?1049l');
+  const wide = mirror.sync(emulator, 400);
+  assert.notDeepEqual(textOf(wide), narrowRows, 'the forty column rows did not survive the widening');
+  assert.deepEqual(textOf(wide), truth(emulator, 400));
+});

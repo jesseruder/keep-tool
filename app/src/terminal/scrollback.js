@@ -34,6 +34,12 @@ function createScrollbackMirror(options = {}) {
   let seq = 0;
   let rows = [];
   let sliding = false;
+  // A resize declared while a full-screen program is running. The alternate screen has
+  // no scrollback of its own, so there is nothing to rebuild from at the time — but
+  // xterm reflows the normal buffer underneath it all the same, and the rows held here
+  // are already wrong. Widening leaves no trace to notice later (the buffer's length
+  // does not fall), so the request is remembered rather than dropped.
+  let pendingRebuild = false;
 
   const rebuild = (emulator, window, length, saturated) => {
     const want = Math.max(page, Number(window) || 0);
@@ -59,6 +65,7 @@ function createScrollbackMirror(options = {}) {
       seq = 0;
       rows = [];
       sliding = false;
+      pendingRebuild = false;
       return rows;
     },
 
@@ -67,11 +74,13 @@ function createScrollbackMirror(options = {}) {
     // `options.rebuild` is the geometry change: the caller knows the buffer was
     // reflowed and that nothing held here survived it.
     sync(emulator, window, syncOptions = {}) {
+      if (syncOptions.rebuild) pendingRebuild = true;
       if (emulator.isAlternate()) return null;
       const { length, saturated } = emulator.normalScrollback();
       // Sliding, reflowed, or a buffer that is somehow shorter than what is held
       // (a reset, or a reflow that moved lines back onto the screen): read it again.
-      if (saturated || syncOptions.rebuild || length < seq + rows.length) {
+      if (saturated || pendingRebuild || length < seq + rows.length) {
+        pendingRebuild = false;
         return rebuild(emulator, window, length, saturated);
       }
       if (sliding) {
