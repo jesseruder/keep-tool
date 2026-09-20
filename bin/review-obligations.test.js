@@ -960,3 +960,29 @@ test('a review record of any shape cannot stop a card settling', () => {
   // The land gate reads the same records and must refuse rather than throw.
   assert.equal(allow.decideLand({ records: misshapen, commits: [commit('a'.repeat(40), 'p1')] }).ok, false);
 });
+
+// ---------- what round nine found ----------
+
+test('a damaged counter cannot hold an obligation open for ever', () => {
+  const box = fixture();
+  const now = Date.now();
+  try {
+    // `-1e30 + 1` is still `-1e30` in floating point, so a miss count below its
+    // threshold stayed below it however many sweeps went by, while the obligation went
+    // on gating its commits.
+    fs.mkdirSync(obligations.obligationsDir(box.root), { recursive: true });
+    fs.writeFileSync(obligations.cardFile('a-card', box.root), JSON.stringify([
+      { ...pending({ at: new Date(now - 30 * 60e3).toISOString() }), misses: -1e30, announceTries: 1e30 },
+    ]));
+    const record = obligations.readRecords('a-card', box.root)[0];
+    assert.equal(record.misses, undefined, 'a nonsense count is no count at all');
+    assert.equal(record.announceTries, obligations.MAX_ANNOUNCE_TRIES, 'and one over its ceiling is at its ceiling');
+
+    let current = record;
+    for (let n = 1; n < obligations.MISSING_JOB_CONFIRMATIONS; n += 1) {
+      current = obligations.applied(current, obligations.decide(current, { job: null, now }), now);
+      assert.equal(current.state, 'open');
+    }
+    assert.equal(obligations.decide(current, { job: null, now }).state, 'failed');
+  } finally { box.cleanup(); }
+});

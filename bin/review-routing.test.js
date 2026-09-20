@@ -121,8 +121,14 @@ test('the fallback reason describes the ledger, and only the accounts reviews ar
     assert.equal(routing.fallbackReason(routed), '', 'nothing exhausted, nothing to describe');
     routing.markExhausted('codex-main', iso(now + 2 * HOUR), { ...routed, ...lock });
     routing.markExhausted('codex-secondary', iso(now + HOUR), { ...routed, ...lock });
-    assert.equal(routing.fallbackReason(routed), `codex exhausted until ${iso(now + HOUR)} as recorded`,
-      'the earliest reset is the one the card is waiting on, and it says when it was observed');
+    assert.equal(routing.fallbackReason(routed), `codex-main, codex-secondary exhausted until ${iso(now + HOUR)} as recorded`,
+      'the accounts are named, and the earliest reset is the one the card is waiting on');
+
+    // One of two resetting before the review is recorded must not leave the record
+    // claiming Codex as a whole is exhausted until the other one's window ends.
+    routing.clearExhausted('codex-main', { ...routed, ...lock });
+    assert.equal(routing.fallbackReason(routed), `codex-secondary exhausted until ${iso(now + HOUR)} as recorded`);
+    routing.markExhausted('codex-main', iso(now + 2 * HOUR), { ...routed, ...lock });
 
     // An account this install does not route reviews to says nothing about a fallback.
     routing.clearExhausted('codex-main', { ...routed, ...lock });
@@ -214,8 +220,9 @@ test('a fallback stamp is the session asserting it, not the ledger guessing at r
     assert.ok(registered, 'the test registry has a built-in Codex account');
     routing.markExhausted(registered, iso(now + HOUR), { root: box.root, now, withLock: (fn) => fn() });
     const described = reviews.buildRecord({ ...input, fallback: true }, gitDeps, { root: box.root });
-    assert.match(described.route, /^fallback \(codex exhausted until .* as recorded\)$/);
-    assert.match(reviews.logLine(described), /reviewer: fallback \(codex exhausted until /);
+    assert.match(described.route, /^fallback \(.+ exhausted until .* as recorded\)$/);
+    assert.ok(described.route.includes(registered), 'and the stamp names the account that was exhausted');
+    assert.match(reviews.logLine(described), /reviewer: fallback \(.+ exhausted until /);
   } finally { box.cleanup(); }
 });
 

@@ -87,6 +87,11 @@ function readRecords(id, root = keep.ROOT, stats = null) {
       ...record,
       job: typeof record.job === 'string' ? record.job : '',
       commits: Array.isArray(record.commits) ? record.commits.filter((commit) => commit && typeof commit === 'object') : [],
+      // Bounded, because the counters decide when an obligation ends. `-1e30 + 1` is
+      // still `-1e30` in floating point, so a damaged `misses` could sit below its
+      // threshold for ever while the obligation gated its commits.
+      ...counter(record.misses, MISSING_JOB_CONFIRMATIONS, 'misses'),
+      ...counter(record.announceTries, MAX_ANNOUNCE_TRIES, 'announceTries'),
     }));
 }
 
@@ -131,6 +136,14 @@ function cards(root = keep.ROOT) {
       .filter((name) => name.endsWith('.json'))
       .map((name) => name.slice(0, -'.json'.length));
   } catch { return []; }
+}
+
+// A persisted counter, clamped to [0, ceiling]. Absent stays absent: these fields are
+// written only when they are non-zero.
+function counter(value, ceiling, name) {
+  const number = Math.trunc(Number(value));
+  if (!Number.isFinite(number) || number <= 0) return value === undefined ? {} : { [name]: undefined };
+  return { [name]: Math.min(number, ceiling) };
 }
 
 function recordId(now = Date.now()) {
@@ -681,6 +694,6 @@ module.exports = {
   obligationsDir, cardFile, readRecords, writeRecords, cards, recordId,
   open, append, isOpen, citedBy, samePatch, outstandingFor,
   decide, applied, checkin, settle, settleFromRecord, summaryLine, satisfiedByCoverage,
-  keptRecords, basisOf, sameBasis, HISTORY_RETENTION_MS, MISSING_JOB_CONFIRMATIONS,
+  keptRecords, basisOf, sameBasis, HISTORY_RETENTION_MS, MISSING_JOB_CONFIRMATIONS, MAX_ANNOUNCE_TRIES,
   TICK_MS, liveJobMap, startScheduler,
 };

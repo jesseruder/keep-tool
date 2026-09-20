@@ -193,8 +193,12 @@ function fallbackReason(options = {}) {
   if (!routed.size) return '';
   const live = [...exhausted.entries()].filter(([id]) => routed.has(id));
   if (!live.length) return '';
+  // Named, not spoken for collectively: one of two accounts may have reset between the
+  // review running and the record being written, and "codex exhausted until X" would
+  // then be false about the other one's window and about Codex as a whole.
+  const names = live.map(([id]) => id).sort().join(', ');
   const until = live.map(([, entry]) => entry.until).sort()[0];
-  return until ? `codex exhausted until ${until} as recorded` : 'codex exhausted';
+  return until ? `${names} exhausted until ${until} as recorded` : `${names} exhausted as recorded`;
 }
 
 function describe(decision) {
