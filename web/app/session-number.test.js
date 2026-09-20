@@ -13,9 +13,10 @@ const ID = 'abcdef12-0000-4000-8000-000000000001';
 function ctxFor(sessions = [], panes = []) {
   return {
     esc,
-    data: { sessions, panes: [], accounts: [], tasks: [] },
+    data: { sessions, panes, accounts: [], tasks: [] },
     state: { dismissed: new Set(), markedRunning: new Set() },
     paneMap: () => new Map(panes.map((pane) => [pane.id, pane])),
+    queueItems: () => [],
     projectHTML: (project) => `<span class="pj">${esc(project)}</span>`,
     tagsHTML: () => '',
     taskFor: () => null,
@@ -24,6 +25,7 @@ function ctxFor(sessions = [], panes = []) {
     kindLabel: (kind) => kind,
     isMarkedRunning: () => false,
     isPanePinned: () => false,
+    isClosingSession: () => false,
   };
 }
 
@@ -75,4 +77,26 @@ test('a triage queue row keeps its number and provider icon before the title', a
   const exitedClaude = queueRow(ctxFor([], [{ id: 'pane-claude', meta: { agent: 'claude' } }]),
     { kind: 'running', pane: 'pane-claude', title: 'former session', project: '/tmp/p', since: Date.now() });
   assert.match(exitedClaude, /provider-icon provider-claude/, 'a pane-only Claude Code session keeps its provider icon');
+});
+
+test('Pi sessions and pane-only rows use a named pi glyph in Fleet and Triage', async () => {
+  const { fleetRowHTML, fleetRows } = await import('./fleet.js');
+  const { queueRow } = await import('./triage.js');
+  const session = { id: ID, num: 12, title: 'The helper', state: 'running', project: '/tmp/p', kind: 'pi' };
+  const fleet = fleetRowHTML(ctxFor(), { ...session, sessionId: ID, session: true, alive: true,
+    stateLabel: 'Running', waiting: '', branch: 'main', since: 1 }, new Map());
+  assert.match(fleet, /provider-icon provider-pi" role="img" aria-label="Pi" title="Pi">π<\/span>The helper/);
+
+  const waiting = queueRow(ctxFor([session]), { kind: 'question', sessionId: ID,
+    title: 'The helper', project: '/tmp/p', since: Date.now() });
+  assert.match(waiting, /provider-icon provider-pi" role="img" aria-label="Pi" title="Pi">π<\/span>The helper/);
+
+  const pane = { id: 'pane-pi', meta: { agent: 'pi' } };
+  for (const alive of [true, false]) {
+    assert.equal(fleetRows(ctxFor([], [{ ...pane, alive }]))[0]?.kind, 'pi',
+      'a Pi pane remains visible in Fleet while its session record is unavailable');
+  }
+  const paneOnly = queueRow(ctxFor([], [pane]), { kind: 'running', pane: pane.id,
+    title: 'Former Pi session', project: '/tmp/p', since: Date.now() });
+  assert.match(paneOnly, /provider-icon provider-pi/);
 });

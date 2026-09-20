@@ -1,7 +1,7 @@
 let dialog;
 let runSequence = 0;
 
-const labels = { shell: 'Plain shell', claude: 'Claude Code', codex: 'Codex' };
+const labels = { shell: 'Plain shell', claude: 'Claude Code', codex: 'Codex', pi: 'Pi' };
 // Offered in the model dropdown; "Other…" still accepts any id the CLI takes.
 const modelPresets = {
   claude: ['claude-fable-5-1', 'claude-fable-5-1[1m]', 'claude-opus-5', 'claude-opus-5[1m]', 'claude-sonnet-5', 'claude-haiku-4-5-20251001'],
@@ -33,7 +33,7 @@ function preferredAccount(ctx, agent, requested) {
 export function openSessionChooser(ctx, options) {
   const modal = ensureDialog();
   if (modal.open) return false;
-  const kinds = (options.kinds || ['shell', 'claude', 'codex']).filter((kind) => labels[kind]);
+  const kinds = (options.kinds || ['shell', 'claude', 'codex', 'pi']).filter((kind) => labels[kind]);
   const initialKind = kinds.includes(options.initialKind) ? options.initialKind : kinds[0];
   const recordedAccountMissing = kinds.length === 1 && initialKind !== 'shell' && options.requireRecordedAccount === true
     && (!options.accountId || !accountsFor(ctx, initialKind).some((account) => account.id === options.accountId));
@@ -45,12 +45,13 @@ export function openSessionChooser(ctx, options) {
     models: {
       claude: options.models?.claude ?? (options.agent === 'claude' ? options.model || '' : ''),
       codex: options.models?.codex ?? (options.agent === 'codex' ? options.model || '' : ''),
+      pi: options.models?.pi ?? (options.agent === 'pi' ? options.model || '' : ''),
     },
     customModel: {},
     error: '', busy: false, bound: false,
   };
 
-  for (const kind of ['claude', 'codex']) state.customModel[kind] = isCustomModel(kind, state.models[kind]);
+  for (const kind of ['claude', 'codex', 'pi']) state.customModel[kind] = isCustomModel(kind, state.models[kind]);
 
   const render = () => {
     const choices = state.kind === 'shell' ? [] : accountsFor(ctx, state.kind);
@@ -72,7 +73,7 @@ export function openSessionChooser(ctx, options) {
     const modelOptions = [['', 'Account default'], ...(modelPresets[state.kind] || []).map((id) => [id, id]), [OTHER_MODEL, 'Other…']];
     const modelField = state.kind === 'shell' || options.showModel === false ? ''
       : `<label>Model<select data-launch-model ${locked}>${modelOptions.map(([value, text]) => `<option value="${ctx.esc(value)}" ${value === selectedModel ? 'selected' : ''}>${ctx.esc(text)}</option>`).join('')}</select>${customModel
-        ? `<input data-launch-model-custom aria-label="Model id" autocomplete="off" spellcheck="false" ${locked} value="${ctx.esc(model)}" placeholder="Model id, e.g. gpt-5.6-sol">` : ''}</label>`;
+        ? `<input data-launch-model-custom aria-label="Model id" autocomplete="off" spellcheck="false" ${locked} value="${ctx.esc(model)}" placeholder="Model id">` : ''}</label>`;
     const projectField = options.editableDirectory
       ? `<label class="wide">Directory <span>Absolute path to an existing directory</span><input data-launch-directory autocomplete="off" spellcheck="false" ${state.busy || state.bound ? 'disabled' : ''} value="${ctx.esc(state.directory)}" placeholder="/absolute/path/to/project"></label>`
       : `<div class="session-launch-value wide"><span>Project</span><strong class="mono">${ctx.esc(options.project || 'Unknown project')}</strong></div>`;

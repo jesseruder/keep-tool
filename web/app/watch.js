@@ -116,18 +116,19 @@ function renderGrid(ctx, layout) {
       element.innerHTML = `<div class="ph"><div class="session-heading"></div><span class="pane-state"></span>${actionsMenuHTML()}</div><div class="pane-terminal"></div>`;
     }
     const shell = pane.meta?.agent === 'shell';
-    const closable = pane.alive && ['claude', 'codex'].includes(pane.meta?.agent) && pane.meta?.sessionId;
+    const closable = pane.alive && ['claude', 'codex', 'pi'].includes(pane.meta?.agent) && pane.meta?.sessionId;
     const pendingHandoff = hasPendingHandoff(ctx, pane.meta?.sessionId, pane.id);
-    const exitedAgent = pane.alive === false && ['claude', 'codex'].includes(pane.meta?.agent);
+    const exitedAgent = pane.alive === false && ['claude', 'codex', 'pi'].includes(pane.meta?.agent);
     const heading = element.querySelector('.ph .session-heading');
     // Skipped while a rename editor is open in this heading; see session-rename.js.
     if (!isEditing(heading)) {
       ctx.patchHTML(heading, `<b${titleAttrsHTML(ctx.esc, entity.session?.id, entity.renamed)}>${markHTML(ctx.esc, entity.mark)}${ctx.esc(entity.title)}${numBadgeHTML(ctx.esc, entity.num, entity.session?.id)}</b><div class="meta">${ctx.projectHTML(entity.project)}${entity.taskId ? `<span class="proj">${ctx.esc(entity.taskId)}</span>${ctx.tagsHTML(ctx.taskFor(entity))}` : ''}${accountLabelHTML(ctx, entity.session, pane)}</div>`);
     }
     ctx.patchHTML(element.querySelector('.pane-state'), `<span class="st"><i class="${ctx.esc(entity.state)}"></i>${ctx.esc(entity.stateLabel || entity.state)}</span>`);
-    const portable = (closable || pendingHandoff) && !entity.session?.reviewer ? portableTransferControls(ctx, pane.meta.sessionId) : '';
-    const handoff = (closable || pendingHandoff) && !entity.session?.reviewer ? handoffControls(ctx, pane.meta.sessionId, pane.id) : '';
-    const restart = closable && !pendingHandoff && !entity.session?.reviewer ? restartControls(ctx, pane.meta.sessionId) : '';
+    const providerControls = ['claude', 'codex'].includes(pane.meta?.agent);
+    const portable = providerControls && (closable || pendingHandoff) && !entity.session?.reviewer ? portableTransferControls(ctx, pane.meta.sessionId) : '';
+    const handoff = providerControls && (closable || pendingHandoff) && !entity.session?.reviewer ? handoffControls(ctx, pane.meta.sessionId, pane.id) : '';
+    const restart = providerControls && closable && !pendingHandoff && !entity.session?.reviewer ? restartControls(ctx, pane.meta.sessionId) : '';
     const menu = element.querySelector('.session-actions');
     patchActionsMenu(ctx, menu, `<button class="btn" data-unpin>Unpin from Watch</button>${closable ? '<button class="btn" data-close-session>Close session</button>' : ''}${shell ? `<button class="btn" data-kill>${pane.alive ? 'Kill shell' : 'Remove shell'}</button>` : ''}${exitedAgent && !pendingHandoff ? '<button class="btn" data-reopen>Reopen</button><button class="btn" data-remove-pane>Remove pane</button>' : ''}${renameButtonsHTML(entity.session?.id, entity.renamed)}${markControlsHTML(ctx.esc, entity.session?.id, entity.mark)}<div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${rendererControlsHTML(ctx, pane.id, pane)}`);
     installActionsMenu(menu, ctx, pane.id);
@@ -232,7 +233,7 @@ export function installWatchControls(ctx) {
         ctx.refresh();
         await ctx.saveLayouts();
         await ctx.reload();
-        const kind = selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex';
+        const kind = ({ shell: 'Shell', claude: 'Claude Code', codex: 'Codex', pi: 'Pi' })[selection.kind];
         ctx.toast(`${kind} opened in ${ctx.projectOf(selection.cwd).name}`);
       });
     } finally { button.disabled = false; }

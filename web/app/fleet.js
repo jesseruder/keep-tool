@@ -48,7 +48,7 @@ export function fleetRowHTML(ctx, row, panes) {
   return `<tr><td><span class="st"><i class="${ctx.esc(row.state)}"></i>${ctx.esc(row.stateLabel || row.state)}</span></td><td${row.renamed ? ` title="${ctx.esc(RENAMED_HINT)}"` : ''}>${markHTML(ctx.esc, row.mark)}${providerIconHTML(row.kind, ctx.esc)}${ctx.esc(row.title)}${row.reviewer ? '<span class="rv">reviewer</span>' : ''} ${identity}</td><td class="mono muted">${ctx.esc(row.branch)}</td><td class="mono info">${ctx.esc(row.taskId || '')}${ctx.tagsHTML(ctx.taskFor(row))}</td><td class="mono waiting-kind">${ctx.esc(row.waiting)}</td><td class="mono muted">${ctx.esc(ctx.rel(row.since))}</td><td class="mono ${row.kind === 'codex' ? 'kind-codex' : ''}">${ctx.esc(row.kind)}</td><td>${ctx.esc(account || '—')}</td><td><button class="btn" data-pin="${ctx.esc(row.pane || '')}" data-title="${ctx.esc(row.title)}" ${row.alive && !pinned ? '' : 'disabled'}>${pinned ? 'Pinned' : 'Pin'}</button>${terminal}${reopen}${remove}</td></tr>`;
 }
 
-export function renderFleet(ctx) {
+export function fleetRows(ctx) {
   const rows = [];
   const panesBySession = new Map();
   const panes = ctx.paneMap();
@@ -78,7 +78,7 @@ export function renderFleet(ctx) {
     const sessionId = pane.meta?.sessionId;
     if (sessionId && panesBySession.has(sessionId)) continue;
     const agent = pane.meta?.agent;
-    if (agent !== 'shell' && !(['claude', 'codex'].includes(agent) && pane.alive === false)) continue;
+    if (agent !== 'shell' && agent !== 'pi' && !(['claude', 'codex'].includes(agent) && pane.alive === false)) continue;
     rows.push({
       id: sessionId || pane.id, pane: pane.id, project: pane.meta?.project || pane.cwd,
       title: pane.meta?.title || pane.title || (agent === 'shell' ? 'shell' : 'exited session'),
@@ -88,6 +88,12 @@ export function renderFleet(ctx) {
     });
   }
 
+  return rows;
+}
+
+export function renderFleet(ctx) {
+  const rows = fleetRows(ctx);
+  const panes = ctx.paneMap();
   const visible = filterFleetRows(ctx, rows);
   const groups = new Map();
   for (const row of visible) {

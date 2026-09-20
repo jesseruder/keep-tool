@@ -138,7 +138,7 @@ test('a rebuilt row that hands over to a listed key is not appended beside it', 
     'dropping the rebuilt row leaves the selection on the pane its new key belongs to');
 });
 
-test('alive unpinned shells without a session list under running until they are pinned', () => {
+test('alive unpinned shells and Pi panes without a session list under running until pinned', () => {
   const source = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
   const pinned = new Set();
   const data = {
@@ -148,6 +148,7 @@ test('alive unpinned shells without a session list under running until they are 
       { id: 'agent-pane', alive: true, createdAt: '2026-01-01', meta: { agent: 'claude', sessionId: 'agent' } },
       { id: 'shell-new', alive: true, createdAt: '2026-03-01', meta: { agent: 'shell' } },
       { id: 'shell-old', alive: true, createdAt: '2026-02-01', cwd: '/tmp/shell', meta: {} },
+      { id: 'pi-pending', alive: true, createdAt: '2026-02-10', meta: { agent: 'pi' } },
       { id: 'shell-exited', alive: false, createdAt: '2026-02-15', meta: { agent: 'shell' } },
     ],
   };
@@ -159,9 +160,9 @@ test('alive unpinned shells without a session list under running until they are 
     sessionItem: (kind, session) => ({ kind, sessionId: session.id, pane: session.pane }) });
   vm.runInContext(source.slice(source.indexOf('function runningItems('), source.indexOf('function pinnedItems(')), ctx);
   const listed = () => Array.from(ctx.runningItems(), (item) => item.sessionId || item.pane);
-  assert.deepEqual(listed(), ['agent', 'shell-old', 'shell-new'], 'shells follow the sessions in pane creation order');
+  assert.deepEqual(listed(), ['agent', 'shell-old', 'pi-pending', 'shell-new'], 'pane-only entries follow sessions in creation order');
   pinned.add('shell-old');
-  assert.deepEqual(listed(), ['agent', 'shell-new'], 'a pinned shell is listed only once, under Pinned');
+  assert.deepEqual(listed(), ['agent', 'pi-pending', 'shell-new'], 'a pinned shell is listed only once, under Pinned');
 });
 
 test('scheduled idle sessions can be dismissed without changing their scheduled task', () => {

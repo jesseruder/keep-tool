@@ -278,10 +278,10 @@ function runningItems() {
   const items = stableSessionOrder(sessions, runningOrder, new Set((data.sessions || []).map((session) => session.id)), createdAt)
     .map((session) => sessionItem('running', session));
   // A pane opened from the rail is not pinned, so Running & waiting is the only
-  // listing a sessionless shell has. stableSessionOrder ranks session ids, so
-  // keep shells out of it and append them in pane creation order instead.
+  // listing a sessionless shell or Pi pane has. Pi can be live before its
+  // transcript appears in the session scan.
   const shells = (data.panes || [])
-    .filter((pane) => pane.alive && !(pane.meta?.agent && pane.meta.agent !== 'shell')
+    .filter((pane) => pane.alive && (!pane.meta?.agent || ['shell', 'pi'].includes(pane.meta.agent))
       && !isPanePinned(pane.id) && !entityForPane(pane.id).session && !isClosingSession(pane.meta?.sessionId, pane.id))
     .map((pane) => {
       const entity = entityForPane(pane.id);
@@ -612,7 +612,7 @@ async function newSession(cwd, name, onOpened) {
   await openSessionChooser(ctx, {
     title: 'New session', description: 'Choose what to open and where.', project: cwd,
     directory: cwd, editableDirectory: true,
-    kinds: ['shell', 'claude', 'codex'], initialKind: 'shell', confirmLabel: 'Open session',
+    kinds: ['shell', 'claude', 'codex', 'pi'], initialKind: 'shell', confirmLabel: 'Open session',
     models: { claude: 'claude-fable-5-1', codex: '' },
     async onSubmit(selection) {
       state.pendingFocus = true;
@@ -653,7 +653,7 @@ async function reopenSession({ sessionId, taskId, agent, title, stalePane, proje
   await openSessionChooser(ctx, {
     eyebrow: freshCard ? 'Card' : 'Conversation', title: `Reopen ${title || taskId || sessionId || 'session'}`,
     description: freshCard ? 'Start the first conversation for this card.' : 'Resume this conversation without sending a new instruction.',
-    project: launchProject, kinds: freshCard ? ['claude', 'codex'] : [provider], initialKind: freshCard ? 'claude' : provider,
+    project: launchProject, kinds: freshCard ? ['claude', 'codex', 'pi'] : [provider], initialKind: freshCard ? 'claude' : provider,
     accountId: currentAccountId, requireRecordedAccount: !freshCard, showModel: freshCard, confirmLabel: freshCard ? 'Start conversation' : 'Reopen',
     models: freshCard ? { claude: 'claude-fable-5-1', codex: '' } : undefined,
     onTransfer: sessionId ? () => openPortableTransfer(ctx, sessionId) : null,

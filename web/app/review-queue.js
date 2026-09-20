@@ -218,7 +218,7 @@ async function chooseLaunch(ctx, item, action) {
   await openSessionChooser(ctx, {
     eyebrow: item.type === 'finding' ? 'Finding' : 'Idea', title: label,
     description: 'Choose the account for this new conversation.', project: item.project || item.card || '',
-    kinds: ['claude', 'codex'], initialKind: 'claude', confirmLabel: label,
+    kinds: ['claude', 'codex', 'pi'], initialKind: 'claude', confirmLabel: label,
     models: { claude: 'claude-fable-5-1', codex: '' },
     async onSubmit(selection) {
       opened = await submit(ctx, item, action, { agent: selection.agent, accountId: selection.accountId,

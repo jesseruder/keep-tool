@@ -37,7 +37,7 @@ const FEED_RETRY_MAX_MS = 60e3;
 // relaying into it would put Owner's words where the agent's recipe belongs.
 //
 // `agentName`, never `agent`: on a session and on pane meta, `agent` is the
-// provider — claude or codex.
+// provider — claude, codex, or pi.
 export function sessionControlsAllowed(session) {
   return !session?.reviewer && !session?.agentName;
 }
@@ -439,7 +439,7 @@ function renderRail(ctx, items) {
         ctx.state.focused = true;
         ctx.state.focusPane = pane.id;
         ctx.refresh();
-        ctx.toast(`${selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex'} opened in ${project.name}`,
+        ctx.toast(`${({ shell: 'Shell', claude: 'Claude Code', codex: 'Codex', pi: 'Pi' })[selection.kind]} opened in ${project.name}`,
           { label: 'Pin', run: () => ctx.pinPane(pane.id, title) });
       });
     } finally { button.disabled = false; }
@@ -449,8 +449,8 @@ function renderRail(ctx, items) {
 export function queueRow(ctx, item) {
   const session = ctx.sessionFor(item);
   const paneAgent = item.pane ? ctx.paneMap().get(item.pane)?.meta?.agent : '';
-  const provider = ['claude', 'codex'].includes(session?.kind) ? session.kind
-    : ['claude', 'codex'].includes(paneAgent) ? paneAgent : '';
+  const provider = ['claude', 'codex', 'pi'].includes(session?.kind) ? session.kind
+    : ['claude', 'codex', 'pi'].includes(paneAgent) ? paneAgent : '';
   const title = item.title || session?.title || 'untitled session';
   const project = item.project || session?.project || '';
   const task = ctx.taskFor(item);
@@ -758,7 +758,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     installMobileReply(stage, ctx, item);
   }
   const pinLabel = ctx.isPanePinned(item.pane) ? 'Unpin from Watch' : 'Pin to Watch';
-  const closable = hasLivePane && item.sessionId && ['claude', 'codex'].includes(pane.meta?.agent);
+  const closable = hasLivePane && item.sessionId && ['claude', 'codex', 'pi'].includes(pane.meta?.agent);
   const dependencyAcknowledged = ctx.setAsideFor(item)?.kind === 'dependency';
   const dependencyWait = session?.activity?.background?.dependencies?.length
     ? `<button class="btn" data-wait-dependency ${dependencyAcknowledged ? 'disabled' : ''}>${dependencyAcknowledged ? 'Waiting for dependency' : 'Wait for dependency'}</button>` : '';
@@ -783,13 +783,14 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   }
   const brief = stage.querySelector('.brief');
   const ownControls = sessionControlsAllowed(session);
-  const portable = item.sessionId && ownControls ? portableTransferControls(ctx, item.sessionId) : '';
-  const handoff = (closable || pendingHandoff) && ownControls ? handoffControls(ctx, item.sessionId, item.pane) : '';
-  const restart = closable && !pendingHandoff && ownControls ? restartControls(ctx, item.sessionId) : '';
+  const providerControls = ['claude', 'codex'].includes(session?.kind || pane?.meta?.agent);
+  const portable = providerControls && item.sessionId && ownControls ? portableTransferControls(ctx, item.sessionId) : '';
+  const handoff = providerControls && (closable || pendingHandoff) && ownControls ? handoffControls(ctx, item.sessionId, item.pane) : '';
+  const restart = providerControls && closable && !pendingHandoff && ownControls ? restartControls(ctx, item.sessionId) : '';
   // The reviewer and every other agent are not working sessions: relaying into
   // or out of one would put the agent's own words in a card's session, which is
   // what `keep nudge` exists for.
-  const relay = item.sessionId && ownControls ? relayControlsHTML(ctx, item.sessionId) : '';
+  const relay = providerControls && item.sessionId && ownControls ? relayControlsHTML(ctx, item.sessionId) : '';
   const markedRunning = Boolean(item.sessionId) && ctx.isMarkedRunning(item);
   const markRunning = !item.sessionId ? ''
     : markedRunning ? '<button class="btn" data-unmark-running title="Put this session back in Waiting on you">Unmark running</button>'

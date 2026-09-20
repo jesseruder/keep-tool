@@ -139,6 +139,7 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .provider-icon { display: inline-block; width: 1em; height: 1em; margin-right: 5px; vertical-align: -.13em; background: currentColor; mask: center / contain no-repeat; -webkit-mask: center / contain no-repeat; }
 .provider-icon.provider-codex { color: #10a37f; mask-image: url('/app/icons/openai.svg'); -webkit-mask-image: url('/app/icons/openai.svg'); }
 .provider-icon.provider-claude { color: #d97757; mask-image: url('/app/icons/claude.svg'); -webkit-mask-image: url('/app/icons/claude.svg'); }
+.provider-icon.provider-pi { background: none; mask: none; -webkit-mask: none; font: bold 1.15em/0.85 Georgia, serif; text-align: center; }
 .qitem .w { color: var(--faint); font: 11px var(--mono); white-space: nowrap; } .qitem .w.long { color: var(--warn); }
 .qitem .p { display: flex; align-items: baseline; min-width: 0; grid-column: 2 / span 2; color: var(--muted); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .qitem .pj { display: inline-block; flex: none; background: transparent; padding: 0; color: var(--muted); font-weight: 500; }
