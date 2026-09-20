@@ -70,6 +70,11 @@ or deploy outcomes, relay a message into Pi (including mobile replies), or suppo
 Keep-managed compaction, or Review Queue automatic launches. Those actions stay
 unavailable instead of being emulated.
 
+Keep also refuses `keep open <Pi session>` while any interactive Pi process outside a
+Keep Pi host pane is running. Pi sets its process title to `pi` and hides the session
+arguments, so Keep cannot safely prove which external session it would resume. Exit the
+external Pi process, then retry the open.
+
 ## Verify
 
 After restarting the Keep daemon, open a fresh Pi session from Keep, run `keep list`
