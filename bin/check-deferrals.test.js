@@ -183,9 +183,14 @@ test('a malformed or future lastDay cannot make an entry immortal or prune a liv
   // A value Keep cannot read at all is kept rather than pruned — it may belong to an
   // active streak, and normalising it away silently handed retention back to `since`,
   // which pruned live streaks before the next note() could repair them.
-  const malformed = deferrals.parse({ live: { since: stampAt(base - 30 * DAY), lastDay: 'yesterday', checkAfter: 'x' } });
+  const malformed = deferrals.parse({ live: { since: stampAt(base - 10 * DAY), lastDay: 'yesterday', checkAfter: 'x' } });
   deferrals.serialize(malformed, base);
   assert.equal(malformed.has('live'), true, 'an unreadable day is not evidence the streak is over');
+  // It is not kept forever, though: the next note() repairs it within a day, so an
+  // entry still unrepaired at twice the retention is history whatever it says.
+  const ancient = deferrals.parse({ old: { since: stampAt(base - 40 * DAY), lastDay: 'yesterday', checkAfter: 'x' } });
+  deferrals.serialize(ancient, base);
+  assert.equal(ancient.has('old'), false);
   // And the next deferral repairs it, after which ordinary retention applies again.
   deferrals.note(malformed, 'live', { checkAfter: 'x', stamp: stampAt(base), today: stampAt(base).slice(0, 10) });
   deferrals.serialize(malformed, base);

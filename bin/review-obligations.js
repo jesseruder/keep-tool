@@ -82,7 +82,9 @@ function keptRecords(records, now = Date.now()) {
     // away the only thing that knows the announcement never landed.
     if (isOpen(record) || record.announce === true) return true;
     const at = timeMs(record.stateAt || record.at);
-    return at === null || now - at <= HISTORY_RETENTION_MS;
+    // A terminal record Keep cannot date is history it cannot keep track of either:
+    // keeping it would be a file on the sweep's scan path with nothing to retire it.
+    return at !== null && now - at <= HISTORY_RETENTION_MS;
   });
 }
 
@@ -222,6 +224,12 @@ function elapsed(now, ...stamps) {
   return Infinity;
 }
 
+function failedByLive(record, live) {
+  return live.state === 'dead'
+    ? { state: 'failed', note: `Codex job ${record.job} is dead${live.reason ? ` (${live.reason})` : ''}` }
+    : { state: 'failed', note: `Codex job ${record.job} has been idle for ${Math.round(Number(live.idleMs) / 60e3)} minutes with no output` };
+}
+
 function forHumans(ms) {
   return Number.isFinite(ms) ? `${Math.round(ms / 3600e3)}h` : 'an unknown length of time';
 }
@@ -244,15 +252,13 @@ function decide(record, { job, jobUnknown = false, live, discovery = 'ok', revie
   if (record.state === 'awaiting-verdict' && sinceState > MAX_RUNNING_MS) {
     return stopWaiting(`Codex job ${record.job} finished ${forHumans(sinceState)} ago and no verdict was ever recorded`);
   }
-  // What the live sweep says about the process, which needs no job file at all. Asked
-  // before the job file, so a dead or long-stalled row decides on its own rather than
-  // being swallowed by "I could not read the file".
-  if (live && live.state === 'dead') {
-    return { state: 'failed', note: `Codex job ${record.job} is dead${live.reason ? ` (${live.reason})` : ''}` };
-  }
-  if (live && live.state === 'stalled' && Number(live.idleMs) > STALL_MS) {
-    return { state: 'failed', note: `Codex job ${record.job} has been idle for ${Math.round(Number(live.idleMs) / 60e3)} minutes with no output` };
-  }
+  // What the live sweep says about the process. It decides on its own only when there is
+  // no job file to read — the snapshot and the file are read separately, so a job that
+  // finished between the two would otherwise be failed on a stale row while its own
+  // result sat on disk saying completed.
+  const gone = Boolean(live) && (live.state === 'dead'
+    || (live.state === 'stalled' && Number(live.idleMs) > STALL_MS));
+  if (!job && gone) return failedByLive(record, live);
   // "I could not look" is never evidence that the job is gone. Three separate readers
   // can each fail to see it: the companion's discovery, the jobs directory, and the job
   // file itself. A live row that still shows the process is affirmative evidence of
@@ -289,6 +295,9 @@ function decide(record, { job, jobUnknown = false, live, discovery = 'ok', revie
   if (FAILED_STATUSES.has(status)) {
     return { state: 'failed', note: `Codex job ${record.job} ended ${status} without a verdict` };
   }
+  // The file says it is still running, and the process is not. Asked after the status,
+  // so a completed result always wins over a snapshot taken before it was written.
+  if (gone) return failedByLive(record, live);
   if (age > MAX_RUNNING_MS) {
     return stopWaiting(`Codex job ${record.job} has been running for ${forHumans(age)} with no verdict`);
   }
@@ -392,14 +401,6 @@ function settle(deps = {}) {
   // still exactly as this pass saw them. Every writer of this file goes through the
   // registry lock — the CLI's append and drop included — so the last rename carries
   // everyone's work rather than the copy its own writer started from.
-  // Clearing or re-stamping one record's announcement debt, by id. The debt flag is its
-  // own identity — unlike a settlement, this write must land whatever else moved.
-  const commitById = (id, recordId, change) => withLock(() => {
-    writeRecords(id, readRecords(id, root).map((record) => (
-      record.id === recordId && record.announce === true ? change(record) : record
-    )), root, now);
-  });
-
   const commit = (id, basis, change) => {
     const touched = new Set();
     withLock(() => {
@@ -474,41 +475,58 @@ function settle(deps = {}) {
     }
 
     for (const recordId of owed.keys()) {
-      // Re-read rather than announcing the snapshot this pass started from. Another
-      // writer may have settled this record in the meantime, and a check-in saying "no
-      // verdict is recorded" about a record that now carries one is worse than a late
-      // one. The debt flag is the identity here, not the state it was in.
-      let current = null;
-      try { current = readRecords(id, root).find((record) => record.id === recordId) || null; }
-      catch (error) { result.errors.push(`${id}: ${error.message || error}`); continue; }
-      if (!current || current.announce !== true) continue;
+      // The whole delivery — re-read the record, re-read the card's review records,
+      // decide, write the check-in, clear the debt — happens inside one registry lock,
+      // with checkinTask told it is already held. Re-reading outside the lock only
+      // narrowed the window in which a verdict recorded between the read and the
+      // check-in would be contradicted by a notice saying none exists.
+      try {
+        withLock(() => {
+          const current = readRecords(id, root).find((record) => record.id === recordId) || null;
+          if (!current || current.announce !== true) return;
+          const clear = (records) => writeRecords(id, records.map((record) => (
+            record.id === recordId && record.announce === true ? omit(record, 'announce', 'announceTries') : record
+          )), root, now);
 
-      const entry = checkin(current, { state: current.state, note: current.note });
-      if (entry) {
-        try { checkinTask(id, entry); }
-        catch (error) {
-          result.errors.push(`${id}: could not record the ${current.state} review: ${error.message || error}`);
-          // A card that has been refusing the check-in for a day is not going to take
-          // it — an archived card never will. Give up loudly rather than retrying every
-          // five minutes until the end of time.
-          const tries = (Number(current.announceTries) || 0) + 1;
+          // A verdict that arrived after this transition was decided answers the
+          // obligation, whatever state the sweep left it in. Terminal records are
+          // included deliberately: an abandoned obligation whose review was recorded
+          // before the retry must not be announced as "no review record".
+          let answered = false;
           try {
-            commitById(id, recordId, (record) => (tries >= MAX_ANNOUNCE_TRIES
-              ? omit(record, 'announce', 'announceTries')
-              : { ...record, announceTries: tries }));
-          } catch (writeError) { result.errors.push(`${id}: ${writeError.message || writeError}`); }
-          if (tries >= MAX_ANNOUNCE_TRIES) {
-            result.errors.push(`${id}: gave up announcing the ${current.state} review after ${tries} attempts`);
+            const reviewRecords = readReviews(id);
+            answered = citedBy(current, reviewRecords, now) || satisfiedByCoverage(current, reviewRecords, now);
+          } catch (error) { result.errors.push(`${id}: could not read the review records: ${error.message || error}`); }
+          if (answered) {
+            clear(readRecords(id, root));
+            return;
           }
-          continue;
-        }
-        result.announced += 1;
-      }
-      // Cleared by id and by the debt flag itself: a bookkeeping change to the record
-      // between the delivery and this write must not leave the debt standing and the
-      // card announced twice.
-      try { commitById(id, recordId, (record) => omit(record, 'announce', 'announceTries')); }
-      catch (error) { result.errors.push(`${id}: could not clear the announcement for ${recordId}: ${error.message || error}`); }
+
+          const entry = checkin(current, { state: current.state, note: current.note });
+          if (entry) {
+            try { checkinTask(id, { ...entry, withinLock: true }); }
+            catch (error) {
+              result.errors.push(`${id}: could not record the ${current.state} review: ${error.message || error}`);
+              // A card that has been refusing the check-in for a day is not going to
+              // take it — an archived card never will. Give up loudly rather than
+              // retrying every five minutes until the end of time.
+              const tries = (Number(current.announceTries) || 0) + 1;
+              writeRecords(id, readRecords(id, root).map((record) => {
+                if (record.id !== recordId || record.announce !== true) return record;
+                return tries >= MAX_ANNOUNCE_TRIES
+                  ? omit(record, 'announce', 'announceTries')
+                  : { ...record, announceTries: tries };
+              }), root, now);
+              if (tries >= MAX_ANNOUNCE_TRIES) {
+                result.errors.push(`${id}: gave up announcing the ${current.state} review after ${tries} attempts`);
+              }
+              return;
+            }
+            result.announced += 1;
+          }
+          clear(readRecords(id, root));
+        });
+      } catch (error) { result.errors.push(`${id}: could not deliver the announcement for ${recordId}: ${error.message || error}`); }
     }
   }
   return result;

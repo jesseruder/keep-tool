@@ -253,8 +253,9 @@ test('the sweep writes the transition before it announces it', () => {
       readReviews: () => [],
       checkinTask: () => { order.push('checkin'); throw new Error('registry is locked'); },
     });
-    assert.deepEqual(order, ['write', 'checkin', 'write'],
-      'written, then announced, then the debt cleared — a transition announced but not written would be announced forever');
+    assert.deepEqual(order, ['write', 'write', 'checkin'],
+      'the transition is written first — one announced but not written would be announced forever — and the'
+      + ' delivery then takes the lock once for the whole read-validate-announce-clear');
     assert.equal(result.settled.length, 1);
     assert.match(result.errors[0], /could not record the awaiting-verdict review: registry is locked/);
     assert.equal(box.read('a-card')[0].state, 'awaiting-verdict');
@@ -656,4 +657,100 @@ test('a record that still owes a check-in outlives retention', () => {
   const quiet = pending({ id: 'obl-2', state: 'failed', stateAt: new Date(now - 60 * DAY).toISOString() });
   assert.deepEqual(obligations.keptRecords([owing, quiet], now).map((entry) => entry.id), ['obl-1'],
     'pruning the owing one would throw away the only thing that knows it never landed');
+});
+
+// ---------- what round four found ----------
+
+test('a completed job file beats a stale row that says the process is gone', () => {
+  const now = Date.now();
+  // The snapshot and the job file are read separately: a review that finished in
+  // between leaves a stalled row beside a completed result. Failing it there would
+  // write "nothing was reviewed" about a review that had just finished.
+  for (const live of [{ state: 'dead', reason: 'no process' }, { state: 'stalled', idleMs: 45 * 60e3 }]) {
+    const decision = obligations.decide(pending(), { job: { status: 'completed' }, live, now });
+    assert.equal(decision.state, 'awaiting-verdict', JSON.stringify(live));
+  }
+  // With no job file to read, the same row still decides on its own.
+  assert.equal(obligations.decide(pending(), { job: null, live: { state: 'dead' }, now }).state, 'failed');
+  // And a file that still says running is overruled by the process being gone.
+  assert.equal(obligations.decide(pending(), { job: { status: 'running' }, live: { state: 'dead' }, now }).state, 'failed');
+});
+
+test('a verdict recorded before the retry cancels the announcement rather than contradicting it', () => {
+  const box = fixture();
+  try {
+    box.write('a-card', [pending()]);
+    const landed = [];
+    let reviews = [];
+    const deps = {
+      root: box.root, withLock: nolock,
+      resolveJob: () => ({ status: 'completed' }),
+      readReviews: () => reviews,
+      checkinTask: (id, payload) => landed.push(payload),
+    };
+    // The first sweep settles it and cannot deliver, so the card owes a notice.
+    obligations.settle({ ...deps, checkinTask: () => { throw new Error('busy'); } });
+    assert.equal(box.read('a-card')[0].announce, true);
+
+    // Before the retry, somebody records the verdict.
+    reviews = [{ id: 'rev-9', job: 'job-42', verdict: 'clean', at: new Date().toISOString() }];
+    const second = obligations.settle(deps);
+    assert.deepEqual(landed, [], 'the pending notice would have contradicted a verdict that exists');
+    assert.equal(second.announced, 0);
+    assert.equal(box.read('a-card')[0].state, 'satisfied');
+    assert.equal('announce' in box.read('a-card')[0], false);
+  } finally { box.cleanup(); }
+});
+
+// The case that needs no concurrency at all: an abandoned obligation whose notice
+// failed, and a review recorded before the retry. settleFromRecord ignores terminal
+// records and the sweep only reads reviews for open ones, so nothing else would notice.
+test('a terminal record does not announce "no review record" once one exists', () => {
+  const box = fixture();
+  const now = Date.now();
+  try {
+    box.write('a-card', [pending({
+      state: 'abandoned', stateAt: new Date(now).toISOString(), note: 'stopped waiting', announce: true,
+    })]);
+    const landed = [];
+    const result = obligations.settle({
+      root: box.root, now, withLock: nolock,
+      resolveJob: () => { throw new Error('no open obligation needs a job'); },
+      readReviews: () => [{ id: 'rev-9', job: 'job-42', verdict: 'findings', at: new Date(now).toISOString() }],
+      checkinTask: (id, payload) => landed.push(payload),
+    });
+    assert.deepEqual(landed, []);
+    assert.equal(result.announced, 0);
+    assert.equal('announce' in box.read('a-card')[0], false, 'and the debt does not sit there forever');
+    assert.equal(box.read('a-card')[0].state, 'abandoned', 'the record still says Keep stopped waiting');
+  } finally { box.cleanup(); }
+});
+
+test('the whole delivery takes the registry lock once, with the check-in inside it', () => {
+  const box = fixture();
+  try {
+    box.write('a-card', [pending()]);
+    let depth = 0;
+    let maxDepth = 0;
+    let insideLock = null;
+    obligations.settle({
+      root: box.root,
+      withLock: (fn) => { depth += 1; maxDepth = Math.max(maxDepth, depth); try { return fn(); } finally { depth -= 1; } },
+      resolveJob: () => ({ status: 'completed' }),
+      readReviews: () => [],
+      checkinTask: (id, payload) => { insideLock = depth > 0 ? payload : null; },
+    });
+    assert.equal(maxDepth, 1, 'never nested — keep.withLock is not re-entrant');
+    assert.ok(insideLock, 'the check-in happens under the same lock the record was read in');
+    assert.equal(insideLock.withinLock, true, 'and says so, so checkinTask does not take it again');
+  } finally { box.cleanup(); }
+});
+
+test('a terminal record Keep cannot date is not kept forever', () => {
+  const now = Date.now();
+  const undated = pending({ id: 'obl-x', state: 'satisfied', at: 'nonsense', stateAt: 'nonsense' });
+  assert.deepEqual(obligations.keptRecords([undated], now), [],
+    'keeping it would leave a file on the sweep scan path with nothing to retire it');
+  assert.deepEqual(obligations.keptRecords([{ ...undated, announce: true }], now).map((r) => r.id), ['obl-x'],
+    'unless it still owes a check-in');
 });
