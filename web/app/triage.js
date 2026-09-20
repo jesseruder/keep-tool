@@ -652,8 +652,8 @@ async function sendReply(ctx, item, text) {
 // composer; `html.mobile` is what shows it. It stays on the item it answered
 // rather than advancing the way an option or Continue does: on a phone the stage
 // is the whole screen, and jumping to another session loses the thread.
-function mobileReplyHTML(item) {
-  if (!item.sessionId) return '';
+function mobileReplyHTML(item, provider) {
+  if (!item.sessionId || provider === 'pi') return '';
   return '<form class="mobile-reply"><input type="text" name="reply" autocomplete="off" autocapitalize="sentences"'
     + ' placeholder="Reply to this session…" aria-label="Reply to this session">'
     + '<button class="btn primary" type="submit">Send</button></form>';
@@ -751,7 +751,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     // stage is showing an agent's work. The aside is part of the skeleton and is
     // only hidden, never added or removed, so appearing next to the terminal
     // cannot rebuild the host the terminal is mounted in.
-    ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts"><span class="quick-actions"></span>${actionsMenuHTML()}</div></div><div class="brief"></div>${mobileReplyHTML(item)}<div class="stage-body"><div class="stage-terminal"></div><aside class="stage-agent-log" hidden></aside></div>`);
+    ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts"><span class="quick-actions"></span>${actionsMenuHTML()}</div></div><div class="brief"></div>${mobileReplyHTML(item, session?.kind || pane?.meta?.agent)}<div class="stage-body"><div class="stage-terminal"></div><aside class="stage-agent-log" hidden></aside></div>`);
     stage.dataset.itemKey = key;
     stage.dataset.pane = item.pane || '';
     stage.dataset.focusKey = '';

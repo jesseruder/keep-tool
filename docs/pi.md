@@ -66,7 +66,7 @@ When no model is supplied, Keep launches `pi/default` on OpenRouter's
 OpenRouter model.
 
 Keep does not currently apply Claude's raw-resume guard to Pi, record post-tool step
-or deploy outcomes, relay a message into Pi, or support Pi restart, transfer, handoff,
+or deploy outcomes, relay a message into Pi (including mobile replies), or support Pi restart, transfer, handoff,
 Keep-managed compaction, or Review Queue automatic launches. Those actions stay
 unavailable instead of being emulated.
 
