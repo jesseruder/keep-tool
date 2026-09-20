@@ -586,7 +586,7 @@ What it found, over the fleet's September 2026 turns. The base rate of real
 hand-offs is about **2.5%** of ended interactive turns, and they come in two
 shapes: the post-land "pull the main checkout and `keep restart-daemon`", and the
 landed worktree left for Owner to `wt rm`. Held out on a window the rules were
-never tuned against, the detector fired on 33 of 2,353 turns at **27% precision**;
+never tuned against, the detector fired on 35 of 2,353 turns at **26% precision**;
 only the "whenever you like" tier reached 50%, and the bare-imperative and
 second-person-heading tiers were noise. The false positives are healthy turns —
 a session listing its own next steps as imperatives, prose describing what a

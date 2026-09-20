@@ -14,7 +14,12 @@
 // false-positive rate must not be able to reach a running session, and the way
 // to guarantee that is to keep it out of the paths that can.
 //
-// Run it: `node bin/handback-eval.js [--suite file] [--json]`.
+// Run it:
+//   node bin/handback-eval.js [--suite file] [--set dev|held-out] [--json]
+//   node bin/handback-eval.js --ablate            # what each rule tier is worth
+//   node bin/handback-eval.js --index --since 2026-09-01 --until 2026-09-13
+// The last one re-runs the rules over the turn index, read-only, and prints
+// redacted closings for a human to label. It never writes to the index.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -22,6 +27,7 @@ const crypto = require('node:crypto');
 
 const DEFAULT_SUITE = path.join(__dirname, 'fixtures/handback-eval.json');
 const LABELS = ['handback', 'ok'];
+const SETS = ['dev', 'held-out'];
 // How a turn *ended* is what this decides, so it reads the same tail the
 // watcher's own pre-signals read. A request made 3 KB back is the work, not the
 // hand-off.
@@ -51,6 +57,12 @@ const CLI_ANY_RE = new RegExp(`\\b(?:${CLI_ANY})\\b`, 'i');
 const COMMAND_RE = new RegExp(`\\b(?:${CLI_UNAMBIGUOUS})\\b`
   + '|(?:^|[\\s(`"\'])(?:\\./|bin/|scripts/|web/|desktop/)\\S+', 'i');
 
+// Work with no command line in the sentence but an obvious mechanical referent.
+// "please run the full suite" hands back exactly as much work as "please run
+// `npm test`", and a detector that only reads backticks would miss the half of
+// the corpus that writes in prose.
+const WORK_RE = /\b(?:the (?:tests?|test suite|suite|full suite|build|linter|lint|benchmarks?|migration|script|daemon)|npm (?:test|run)|the deploy|worktrees?|the main checkout)\b/i;
+
 // The executable referent of a segment, or null. A code span naming any CLI
 // counts; in plain prose only the unambiguous binaries do.
 function commandIn(part) {
@@ -60,11 +72,6 @@ function commandIn(part) {
   if (COMMAND_RE.test(part) || WORK_RE.test(part)) return part;
   return null;
 }
-// Work with no command line in the sentence but an obvious mechanical referent.
-// "please run the full suite" hands back exactly as much work as "please run
-// `npm test`", and a detector that only reads backticks would miss the half of
-// the corpus that writes in prose.
-const WORK_RE = /\b(?:the (?:tests?|test suite|suite|full suite|build|linter|lint|benchmarks?|migration|script|daemon)|npm (?:test|run)|the deploy|worktrees?|the main checkout)\b/i;
 // A first-person clause is the session naming its own next step. "Next, I'll
 // run the suite" is the healthiest shape in the index and must never read as a
 // hand-off, so it suppresses the bare-imperative rule in the same segment.
@@ -125,7 +132,7 @@ const CARVE_OUTS = [
 // says the session will do the work once told, which is the opposite of the
 // thing being detected, and none of them appeared in any corroborated hand-off
 // in the sampled week.
-const STRONG_OFFER_RE = /\b(?:say the word|want me to\b|shall I\b|may I\b|would you like me to\b|should I\b|say ["“]?land["”]?\b|tell me to and I will|and I(?:'|’)ll (?:run|do|land|handle) )/i;
+const STRONG_OFFER_RE = /\b(?:say the word|want me to\b|shall I\b|may I\b|would you like me to\b|should I\b|say ["“]?land["”]?\b|tell me to and I will|and I(?:'|’)ll (?:run|do|land|handle) )|\bI (?:can|could)(?!(?:'|’)t|not\b)\s+(?:just\s+|also\s+)?(?:run|do|land|handle|take|remove|restart|push|pull)\b/i;
 
 // There is deliberately no "the session said it could not" carve-out.
 //
@@ -162,8 +169,14 @@ function stripRelayed(text) {
 // version missed both of the hand-offs Owner corrected in writing.
 function segments(text) {
   return stripRelayed(text)
-    .split(/(?:(?<=\w)!+\s+|(?<=[\w)\]`"'’”])[.?]+\s+|(?<=[\w)\]`"'’”])\.(?:\s+|$)|\n+|(?:^|\n)\s*(?:[-*•]|\d+\.)\s+)/)
-    .map((part) => part.trim())
+    // The bullet alternative comes before `\n+` on purpose: alternation is
+    // ordered, so with `\n+` first the newline matched alone and the `-` stayed
+    // glued to the next segment, where an anchored imperative could never see it.
+    .split(/(?:(?<=\w)!+\s+|(?<=[\w)\]`"'’”])[.?]+\s+|(?<=[\w)\]`"'’”])\.(?:\s+|$)|\n+\s*(?:[-*•]|\d+\.)\s+|\n+|^\s*(?:[-*•]|\d+\.)\s+)/)
+    // A sentence ending in `.` before a bullet is split by the period rule,
+    // which eats the newline and leaves the `-` glued to the next segment. The
+    // imperative rule is anchored, so the marker has to come off here.
+    .map((part) => part.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '').trim())
     .filter(Boolean);
 }
 
@@ -172,9 +185,13 @@ function segments(text) {
 // segment with an ask and no command borrows the next one's command text.
 const FENCE_ONLY_RE = /^`{3,}\w*$/;
 
+// Returns the command text and the segment it was found in. Both matter: the
+// text is the evidence, and the segment is where the reason for asking lives —
+// a borrowed `yarn experiment rollout …` span carries no trace of the "if yes
+// I'll run it" that made the sentence an offer rather than a hand-off.
 function commandNear(parts, index) {
   const here = commandIn(parts[index]);
-  if (here) return here;
+  if (here) return { text: here, segment: parts[index] };
   // A fenced command on the next line belongs to the sentence that introduced
   // it — but only when that sentence actually introduced one. Without the
   // invitation test, "Install referrer correctly does not" borrowed a command
@@ -183,7 +200,8 @@ function commandNear(parts, index) {
   for (let i = index + 1; i < parts.length && i <= index + 2; i += 1) {
     if (FENCE_ONLY_RE.test(parts[i])) continue; // the fence marker is not the command
     if (!invites && !COMMAND_RE.test(parts[i].slice(0, 24))) return null;
-    return commandIn(parts[i]);
+    const found = commandIn(parts[i]);
+    return found ? { text: found, segment: parts[i] } : null;
   }
   return null;
 }
@@ -226,14 +244,22 @@ function headingScope(parts) {
 // Which rule, if any, reads this segment as an ask aimed at Owner. The explicit
 // second-person forms are tried first: when one of them fires, the weaker
 // imperative rule adds nothing and would only confuse the per-rule table.
-function askRuleFor(part) {
+// `without` is applied here rather than to the result, so an ablation removes
+// only that tier's own fires: a segment two rules both match still fires under
+// the other one, which is what "what is this tier worth" means.
+function askRuleFor(part, without = new Set()) {
   const prose = withoutCode(part);
-  const explicit = ASK_PATTERNS.find(([, re]) => re.test(prose));
+  const explicit = ASK_PATTERNS.find(([name, re]) => !without.has(name) && re.test(prose));
   if (explicit) return explicit[0];
-  // A bare imperative is an ask only when the segment is not the session
-  // describing its own move, and never when it carries no second-person
-  // anything — that combination is what "Next: run the suite" looks like.
+  if (without.has('imperative')) return null;
+  // A bare imperative fires on any leading action verb the segment does not
+  // claim for itself — no second-person marker is required, which is precisely
+  // why this tier is the noisiest one and is reported separately. The suite
+  // keeps its known false positives (`ng-15`, `ng-16`, `ng-24`) so the cost
+  // stays visible rather than being tuned away into a total.
   if (IMPERATIVE_RE.test(prose) && !SELF_RE.test(prose)) return 'imperative';
+  // With a first-person clause present, a second-person marker is what tells
+  // "I'll land it; then run `keep restart-daemon`" from "I'll run it".
   if (SECOND_PERSON_RE.test(prose) && IMPERATIVE_RE.test(prose)) return 'imperative';
   return null;
 }
@@ -253,13 +279,13 @@ function detect(lastAssistant, options = {}) {
   const asks = [];
   for (let i = 0; i < parts.length; i += 1) {
     const part = parts[i];
-    const rule = askRuleFor(part) || (scope.has(i) ? 'heading' : null);
-    if (!rule || without.has(rule)) continue;
+    const rule = askRuleFor(part, without) || (scope.has(i) ? 'heading' : null);
+    if (!rule) continue;
     const command = commandNear(parts, i);
     if (!command) { asks.push({ rule, skipped: 'no command', evidence: part }); continue; }
-    const context = rule === 'heading' ? scope.get(i) : part;
-    const carve = CARVE_OUTS.find(([, re]) => re.test(context) || re.test(command));
-    asks.push({ rule, carve: carve ? carve[0] : null, evidence: part, command });
+    const context = `${rule === 'heading' ? scope.get(i) : part}\n${command.segment}`;
+    const carve = CARVE_OUTS.find(([, re]) => re.test(context));
+    asks.push({ rule, carve: carve ? carve[0] : null, evidence: part, command: command.text });
   }
   // A turn that ends by offering to do the work itself — "say the word and I'll
   // run it", "want me to?" — is asking permission, not handing anything over.
@@ -305,12 +331,19 @@ function loadSuite(file = DEFAULT_SUITE) {
       if (typeof item[key] !== 'string' || !item[key].trim()) throw Error(`${item.id}: missing ${key}`);
     }
     if (!LABELS.includes(item.expected)) throw Error(`${item.id}: expected must be handback or ok`);
-    if (item.set !== undefined && !['dev', 'held-out'].includes(item.set)) throw Error(`${item.id}: set must be dev or held-out`);
+    if (item.set !== undefined && !SETS.includes(item.set)) throw Error(`${item.id}: set must be dev or held-out`);
     // The repository is public. Nothing that identifies a person, a machine or a
     // real session may ride in on a fixture, so the suite refuses it rather than
     // relying on a reviewer to notice.
-    if (/\/Users\/[a-z]/i.test(item.text) || /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}\b/i.test(item.text)) {
-      throw Error(`${item.id}: text carries an unredacted home path or session id`);
+    // Exactly what `redact` looks for, and one more: a uuid prefix, because a
+    // fixture is usually written from a clipped excerpt. The two must not drift
+    // apart — a suite that accepts what the redactor removes is not a guarantee.
+    for (const [what, pattern] of [
+      ['a home path', HOME_RE], ['a session id', UUID_RE], ['an email address', EMAIL_RE],
+      ['a long hash', LONG_HASH_RE], ['a session id', /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}\b/i],
+    ]) {
+      pattern.lastIndex = 0; // these are /g, and a shared regex keeps its index
+      if (pattern.test(item.text)) throw Error(`${item.id}: text carries ${what}; redact it first`);
     }
   }
   return suite;
@@ -322,6 +355,9 @@ function suiteHash(suite) { return hash(JSON.stringify(suite)); }
 
 function score(suite, options = {}) {
   const only = options.set || null;
+  // A typo in `--set` must not read as "everything matched nothing": an empty
+  // scoreboard with null rates looks like a clean run to anyone skimming it.
+  if (only && !SETS.includes(only)) throw Error(`unknown set ${only}; expected one of ${SETS.join(', ')}`);
   const rows = suite.cases
     .filter((item) => !only || (item.set || 'dev') === only)
     .map((item) => {
@@ -414,12 +450,28 @@ const SAMPLE_SQL = `SELECT t.id AS id, t.session_id AS session_id, t.n AS n, t.e
 
 // Excerpts from the live index may be pasted into a report or a fixture, and the
 // repository is public. Redact on the way out, once, here.
+// Home directories on every platform, not just this one: a report is redacted or
+// it is not, and "/Users only" is the kind of guarantee that holds until the
+// first transcript from another machine.
+const HOME_RE = /(?:\/(?:Users|home)\/[^\s/"'`]+|[A-Za-z]:\\+Users\\+[^\s\\"'`]+)/g;
+const UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.]+/g;
+const LONG_HASH_RE = /\b[0-9a-f]{32,}\b/gi;
+
 function redact(text) {
   return String(text == null ? '' : text)
-    .replace(/\/Users\/[^\s/]+/g, '~')
-    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<SESSION>')
-    .replace(/\b[0-9a-f]{32,}\b/gi, '<HASH>')
-    .replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, '<EMAIL>');
+    .replace(HOME_RE, '~')
+    .replace(UUID_RE, '<SESSION>')
+    .replace(LONG_HASH_RE, '<HASH>')
+    .replace(EMAIL_RE, '<EMAIL>');
+}
+
+// A stable pseudonym for a session, so two rows from one session are visibly
+// from one session without the report carrying the id that names it. The raw id
+// is printed only when the caller asks for it with `--identify`, which is for
+// looking a turn up locally, not for anything that gets pasted.
+function sessionTag(id) {
+  return `s${crypto.createHash('sha256').update(String(id)).digest('hex').slice(0, 6)}`;
 }
 
 function sampleTurns(options = {}) {
@@ -442,7 +494,7 @@ function indexReport(options = {}) {
     if (!result.handback) continue;
     fired.push({
       id: row.id,
-      session: String(row.session_id).slice(0, 8),
+      session: options.identify ? String(row.session_id) : sessionTag(row.session_id),
       n: row.n,
       agent: row.agent,
       date: new Date(Number(row.ended_at)).toISOString().slice(0, 10),
@@ -498,6 +550,9 @@ if (require.main === module) {
       since: day(flag('--since'), Date.now() - 8 * 86400e3),
       until: day(flag('--until'), Date.now()),
       limit: flag('--limit') ? Number(flag('--limit')) : 120,
+      // Off by default: these rows get pasted into reports, and a session id is
+      // the one field in them that names something real.
+      identify: argv.includes('--identify'),
     });
     if (options.json) { console.log(JSON.stringify(report, null, 2)); }
     else {

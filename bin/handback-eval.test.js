@@ -26,6 +26,17 @@ test('an ask for an executable step the session could have run is a handback', (
   for (const text of cases) assert.equal(evaluator.detect(text).handback, true, text);
 });
 
+test('a bullet list splits, so an imperative bullet is still its own segment', () => {
+  const text = 'The land is done.\n- Run `npm test` on the main checkout to confirm.\n- Then restart the daemon.';
+  assert.equal(evaluator.segments(text).some((part) => /^Run `npm test`/.test(part)), true);
+  assert.equal(evaluator.detect(text).handback, true);
+});
+
+test('an offer anywhere in the tail outranks an ask earlier in it', () => {
+  assert.equal(evaluator.detect('Please run `npm test` when you get a chance. I can do it myself if you prefer.').handback, false);
+  assert.equal(evaluator.detect('Please run `npm test`. I can run it here instead — say the word.').handback, false);
+});
+
 test('a session naming its own next step is never a handback', () => {
   // The single most common healthy shape in the index. A rule that reads these
   // as hand-offs would fire on the turns that are working correctly.
@@ -95,6 +106,21 @@ test('the suite is labeled, redacted, and scores itself', () => {
   assert.ok(report.metrics.precision !== null && report.metrics.recall !== null);
 });
 
+test('index rows are redacted and carry no session id unless asked', () => {
+  // The home directory goes, the path inside it stays — that is what makes a
+  // redacted excerpt still readable as evidence.
+  assert.equal(evaluator.redact('see /home/alice/repo and /Users/bob/repo'), 'see ~/repo and ~/repo');
+  assert.equal(evaluator.redact('C:\\Users\\bob\\repo failed'), '~\\repo failed');
+  assert.equal(evaluator.redact('turn 1a2b3c4d-1111-2222-3333-444455556666 ended'), 'turn <SESSION> ended');
+  assert.equal(evaluator.redact('mail bob@example.com'), 'mail <EMAIL>');
+  assert.match(evaluator.redact(`blob ${'a1b2c3d4'.repeat(5)}`), /<HASH>/);
+});
+
+test('an unknown set is refused rather than scored as an empty run', () => {
+  // A typo that returns zero cases and null rates reads like a clean result.
+  assert.throws(() => evaluator.score(suite, { set: 'heldout' }), /unknown set/);
+});
+
 test('scoring can be restricted to the held-out set', () => {
   const held = evaluator.score(suite, { set: 'held-out' });
   assert.ok(held.metrics.cases > 0, 'the suite needs held-out cases to measure on');
@@ -112,8 +138,24 @@ test('a suite with an unredacted excerpt or a bad label is refused', () => {
   const base = { id: 'a', source: 's', class: 'authorized-command', text: 'please run `npm test`', reason: 'r', expected: 'handback' };
   assert.doesNotThrow(() => evaluator.loadSuite(write([base])));
   assert.throws(() => evaluator.loadSuite(write([{ ...base, expected: 'maybe' }])), /handback or ok/);
-  assert.throws(() => evaluator.loadSuite(write([{ ...base, text: 'run it in /Users/someone/repo' }])), /unredacted/);
-  assert.throws(() => evaluator.loadSuite(write([{ ...base, text: 'session 1a2b3c4d-1111-2222 asked' }])), /unredacted/);
+  // Every shape `redact` removes, on every platform — a suite that accepts what
+  // the redactor strips is not the guarantee it claims to be.
+  const unredacted = [
+    ['run it in /Users/someone/repo', /home path/],
+    ['run it in /home/someone/repo', /home path/],
+    ['run it in C:\\Users\\someone\\repo', /home path/],
+    ['session 1a2b3c4d-1111-2222 asked', /session id/],
+    ['session 1a2b3c4d-1111-2222-3333-444455556666 asked', /session id/],
+    ['mail someone@example.com about it', /email/],
+    [`the blob ${'a1b2c3d4'.repeat(5)} moved`, /hash/],
+  ];
+  for (const [text, message] of unredacted) {
+    assert.throws(() => evaluator.loadSuite(write([{ ...base, text }])), message, text);
+  }
+  // The /g patterns are shared, so a second call must not resume mid-string.
+  const dirty = write([{ ...base, text: 'run it in /home/someone/repo' }]);
+  assert.throws(() => evaluator.loadSuite(dirty), /home path/);
+  assert.throws(() => evaluator.loadSuite(dirty), /home path/);
   assert.throws(() => evaluator.loadSuite(write([base, base])), /unique/);
   fs.rmSync(dir, { recursive: true, force: true });
 });
