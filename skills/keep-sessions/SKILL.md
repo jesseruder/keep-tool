@@ -72,6 +72,9 @@ the legacy permission-bypass defaults; set them explicitly for your intended pol
 Pi cannot currently receive a Keep relay message. `keep tell` to a Pi session is
 unavailable; use the Pi pane directly when the user has authorized a message.
 
+Pi is not available in Review Queue automatic launches. Choose Claude or Codex for
+that workflow.
+
 - A card target means the live session linked to that card. The message arrives framed as
   coming from your session and card, marked as another agent rather than Owner, with the
   command to reply.
