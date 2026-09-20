@@ -774,7 +774,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   // An open rename editor lives inside this heading; patching it would type over
   // Owner's input on the next refresh.
   if (!isEditing(heading)) {
-    ctx.patchHTML(heading, `<h2${titleAttrsHTML(ctx.esc, item.sessionId, session?.renamed)}>${markHTML(ctx.esc, session?.mark)}${ctx.esc(title)}${numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}${outageNote}</div>${task ? modelUsageHTML(task.modelUsage) : ''}`);
+    ctx.patchHTML(heading, `<h2${titleAttrsHTML(ctx.esc, item.sessionId, session?.renamed)}>${markHTML(ctx.esc, session?.mark)}${ctx.esc(title)}${numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}${outageNote}</div>${task ? modelUsageHTML(task.modelUsage, session?.modelUsage) : ''}`);
   }
   const brief = stage.querySelector('.brief');
   const ownControls = sessionControlsAllowed(session);

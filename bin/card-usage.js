@@ -31,8 +31,14 @@ function recordOwner(root, session, card, at = Date.now()) {
   write(file, owners);
 }
 function ownerAt(owners, id, at) {
+  const history = owners[id] || [];
+  // Usage produced before a session's first link belongs to the card it first linked
+  // to, not to nobody. This can never reach across the accounting cutoff: initialize()
+  // seeds every preexisting link at `now`, which is ledger.since, and facts before
+  // `since` are excluded outright. A later release (card null) still stops attribution.
+  if (history.length && at < history[0].at && history[0].card) return history[0].card;
   let owner = null;
-  for (const entry of owners[id] || []) { if (entry.at <= at) owner = entry.card; }
+  for (const entry of history) { if (entry.at <= at) owner = entry.card; }
   return owner;
 }
 function walk(folder, files = []) {
@@ -88,7 +94,9 @@ function sessionOwner(ledger, owners, id, at, visited = new Set()) {
   if (visited.has(id)) return null;
   visited.add(id);
   const session = ledger.sessions[id];
-  // Descendants stay on the parent's card at spawn, even if the parent moves.
+  // Descendants stay on the parent's card at spawn, even if the parent moves. A child
+  // spawned before the parent's first link is not frozen unassigned for its whole life:
+  // ownerAt backfills spawn times that precede that first link onto the first card.
   if (session?.parent) return sessionOwner(ledger, owners, session.parent, Math.max(ledger.since, session.started), visited);
   return ownerAt(owners, id, at);
 }
@@ -321,11 +329,38 @@ function collect(root, tasks, options = {}) {
   write(path.join(dir(root), 'summary.json'), summary);
   return summary;
 }
+// A descendant's usage belongs to the session a person opened, so per-session totals
+// roll every subagent and Codex delegate up into the root of the parent chain.
+function rootSession(ledger, id) {
+  const visited = new Set();
+  let current = id;
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    const parent = ledger.sessions?.[current]?.parent;
+    if (!parent) break;
+    current = parent;
+  }
+  return current;
+}
 function summarize(ledger) {
   const cards = Object.create(null);
+  // Totals only: no per-model breakdown and no updatedAt, so an idle session's row
+  // is byte-identical between collections and never churns a console detail version.
+  const sessions = Object.create(null);
   let unassigned = 0;
+  let unassignedTokens = 0;
   for (const fact of Object.values(ledger.facts)) {
-    if (!fact.card) { unassigned++; continue; }
+    const root = rootSession(ledger, fact.session);
+    if (root) {
+      const entry = sessions[root] || (sessions[root] = { ...empty(), calls: 0 });
+      for (const k of FIELDS) entry[k] += fact.tokens[k];
+      entry.calls++;
+    }
+    if (!fact.card) {
+      unassigned++;
+      unassignedTokens += fact.tokens.input + fact.tokens.cacheRead + fact.tokens.cacheWrite + fact.tokens.output;
+      continue;
+    }
     const card = cards[fact.card] || (cards[fact.card] = { ...empty(), calls: 0, models: {} });
     const name = `${fact.agent}/${fact.model}`;
     const model = card.models[name] || (card.models[name] = { ...empty(), calls: 0 });
@@ -334,7 +369,7 @@ function summarize(ledger) {
       target.calls++;
     }
   }
-  return { since: ledger.since, updatedAt: ledger.updatedAt, pending: ledger.pending, backlog: ledger.backlog, issues: ledger.issues, unassigned, cards };
+  return { since: ledger.since, updatedAt: ledger.updatedAt, pending: ledger.pending, backlog: ledger.backlog, issues: ledger.issues, unassigned, unassignedTokens, cards, sessions };
 }
 function snapshot(root) { return read(path.join(dir(root), 'summary.json'), null); }
 function forCard(summary, id) {
@@ -342,7 +377,15 @@ function forCard(summary, id) {
   return { since: summary.since, updatedAt: summary.updatedAt, pending: summary.pending, issues: summary.issues,
     ...(Object.hasOwn(summary.cards, id) ? summary.cards[id] : { ...empty(), calls: 0, models: {} }) };
 }
-module.exports = { recordOwner, ownerAt, normalize, fold, initialize, withCollectLock, collect, snapshot, forCard, summarize, discover };
+// What one session (with its descendants) has spent, whatever card it is linked to
+// now. Totals only — the per-model table belongs to the card.
+function forSession(summary, agent, id) {
+  if (!summary) return null;
+  const rows = summary.sessions || {};
+  const entry = key(agent, id);
+  return Object.hasOwn(rows, entry) ? rows[entry] : { ...empty(), calls: 0 };
+}
+module.exports = { recordOwner, ownerAt, normalize, fold, initialize, withCollectLock, collect, snapshot, forCard, forSession, summarize, discover };
 if (require.main === module) {
   const keep = require('./keep.js');
   // Hold Keep's lock only to seed a new ledger. The scan reads transcripts and writes

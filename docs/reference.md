@@ -2405,8 +2405,14 @@ in the review ledger as `statuses`, shown by `keep review-stats` and in the cons
 
 ## Per-card model usage
 
-`keep usage <card> [--json]` shows local Claude and Codex token usage by model.
-The card detail and console session header show the same expandable breakdown.
+`keep usage <card> [--json]` shows local Claude and Codex token usage by model, and
+ends with the unassigned total across all cards. `keep usage` with no card prints
+fleet totals instead — attributed tokens, unassigned tokens and events, the start
+time, and whether collection is still catching up (`--json` gives the same fields).
+The card detail and console session header show the same expandable breakdown; the
+header also shows what the open session itself has spent, so moving a session to a
+fresh card does not read as a usage reset. That session figure is the session's own
+total with its subagents and Codex delegates, whatever card it is linked to now.
 `keep serve` collects every 30 seconds in a separate process; the first collection
 sets a durable start time. There is no historical backfill. Old transcript records
 are read only to establish counter baselines and suppress copied responses.
@@ -2420,10 +2426,15 @@ if the transcript omitted intermediate usage events.
 A session claim records an accounting ownership transition independently of its
 movable resume link. Usage belongs to the card linked when the first usage record
 for that response was timestamped; later chunks update that response on the same
-card. Child sessions inherit the parent's card at spawn and retain it when the
-parent changes cards. Claude subagent paths, Codex parent metadata, and Keep's
-explicit Claude-to-Codex parent records provide those relationships. Unlinked or
-unresolved sessions remain unassigned instead of being guessed from a project.
+card. Usage a session produced before its first link goes to the card it first
+links to, once it links — including usage a previous collection had already
+recorded as unassigned. A release (unlinking without relinking) still ends
+attribution: usage after it stays unassigned. Child sessions inherit the parent's
+card at spawn and retain it when the parent changes cards; a child spawned before
+the parent's first link inherits that first card. Claude subagent paths, Codex
+parent metadata, and Keep's explicit Claude-to-Codex parent records provide those
+relationships. Sessions never linked to a card remain unassigned instead of being
+guessed from a project.
 
 The local `.keep/card-usage/` directory contains the ownership timeline, a durable
 ledger of deduplicated usage records and byte checkpoints, and a dashboard summary.

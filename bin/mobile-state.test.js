@@ -22,6 +22,7 @@ function fixture() {
       id: 's', kind: 'codex', project: '/work/keep', title: 'Work', taskId: 'open', state: 'waiting',
       mtime: 10, lastUserAt: 9, lastAssistant: 'short answer', lastAssistantFull: 'full answer '.repeat(200),
       backgroundJobs: { output: 'job output '.repeat(1000) }, observation: { verbose: true }, pane: 'p', endedTurn: true,
+      modelUsage: { input: 1, cacheRead: 2, cacheWrite: 3, output: 4, reasoning: 0, calls: 1 },
     }],
     attention: [{ kind: 'question', sessionId: 's', taskId: 'open', pri: 0, since: 3, question: 'Choose', options: ['A', 'B'] }],
     setAside: {},
@@ -36,6 +37,7 @@ test('needs is a bounded allowlist with no done cards or detail bodies', () => {
   assert.deepEqual(view.tasks.map((task) => task.id), ['open']);
   assert.equal(view.tasks[0].body, undefined);
   assert.equal(view.tasks[0].modelUsage, undefined);
+  assert.equal(view.sessions[0].modelUsage, undefined, 'the phone drops session token totals as it drops a card\'s');
   assert.equal(view.tasks[0].fm.sessions, undefined);
   assert.equal(view.sessions[0].backgroundJobs, undefined);
   assert.equal(view.sessions[0].lastAssistantFull, undefined);

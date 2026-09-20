@@ -342,3 +342,77 @@ test('staged target usage is replayed once after account authority commits', t =
   assert.equal(result.cards.a.calls, 2, 'the copied historical message is not counted twice');
   assert.equal(f.collect({ files, authority: committed }).cards.a.output, 16);
 });
+
+test('usage recorded before a session links lands on the first card it links to', t => {
+  const f = fixture(t);
+  f.tasks.length = 0; // nothing is linked when the ledger is created
+  f.collect();
+  f.append(claude('pre-link', 10));
+  assert.equal(f.collect().unassigned, 1, 'an unlinked session is unassigned until it links');
+  usage.recordOwner(f.root, { id: 's', agent: 'claude' }, 'a', start + 20);
+  f.append(claude('post-link', 30));
+  const linked = f.collect();
+  assert.equal(linked.cards.a.calls, 2, 'the already-recorded fact is re-resolved onto the first card');
+  assert.equal(linked.unassigned, 0);
+  usage.recordOwner(f.root, { id: 's', agent: 'claude' }, null, start + 40);
+  f.append(claude('released', 50));
+  const released = f.collect();
+  assert.equal(released.cards.a.calls, 2, 'a release still stops attribution');
+  assert.equal(released.unassigned, 1);
+});
+
+test('a Codex child spawned before its parent links is attributed to the first card', t => {
+  const f = fixture(t);
+  f.tasks.length = 0;
+  f.collect();
+  const record = path.join(f.root, '.keep/codex-parents/c.json');
+  fs.mkdirSync(path.dirname(record), { recursive: true });
+  fs.writeFileSync(record, JSON.stringify({ parent: 's' }));
+  const child = path.join(f.root, 'c.jsonl');
+  // Spawned at +10, before the parent's first link at +20 — previously frozen forever.
+  fs.writeFileSync(child, [meta('c', 10), context('m'), codex(30, counts(100, 10, 5))].map(r => JSON.stringify(r) + '\n').join(''));
+  f.files.push({ file: child, agent: 'codex' });
+  assert.equal(f.collect().unassigned, 1);
+  usage.recordOwner(f.root, { id: 's', agent: 'claude' }, 'a', start + 20);
+  assert.equal(f.collect().cards.a.output, 5);
+});
+
+test('per-session totals roll descendants into the root session and count unassigned tokens', t => {
+  const f = fixture(t);
+  f.collect();
+  f.append(claude('root-call', 10));
+  const child = path.join(f.root, 's', 'subagents', 'agent-x.jsonl');
+  fs.mkdirSync(path.dirname(child), { recursive: true });
+  fs.writeFileSync(child, [{ type: 'user', timestamp: timestamp(10), sessionId: 's' }, claude('child-call', 20)]
+    .map(r => JSON.stringify(r) + '\n').join(''));
+  f.files.push({ file: child, agent: 'claude' });
+  const summary = JSON.parse(JSON.stringify(f.collect()));
+  const session = usage.forSession(summary, 'claude', 's');
+  assert.equal(session.calls, 2, 'the subagent rolls up into the session a person opened');
+  assert.equal(session.output, 20);
+  assert.equal(usage.forSession(summary, 'claude', 's/agent-x').calls, 0, 'a descendant carries no separate row');
+  assert.equal(session.updatedAt, undefined, 'no collector timestamp, so an idle row never churns');
+  assert.equal(session.models, undefined, 'the per-model table belongs to the card');
+  assert.deepEqual(usage.forSession(summary, 'claude', 'unknown'), { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0, calls: 0 });
+  assert.equal(usage.forSession(null, 'claude', 's'), null);
+  assert.equal(summary.unassignedTokens, 0);
+  usage.recordOwner(f.root, { id: 's', agent: 'claude' }, null, start + 30);
+  f.append(claude('loose', 40));
+  const released = f.collect();
+  assert.equal(released.unassigned, 1);
+  // One response: 100 uncached input + 200 cache read + 30 cache write + 10 output.
+  assert.equal(released.unassignedTokens, 340);
+  assert.equal(usage.forSession(released, 'claude', 's').calls, 3, 'per-session totals count unassigned usage too');
+});
+
+test('the usage renderer adds a session figure only when one is supplied', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../web/app/model-usage.js'), 'utf8').replace('export function', 'function');
+  const ctx = vm.createContext({}); vm.runInContext(source, ctx);
+  const card = { since: start, input: 1000, cacheRead: 2000, cacheWrite: 300, output: 400, reasoning: 0, calls: 7, models: {} };
+  const plain = ctx.modelUsageHTML(card);
+  assert.match(plain, /<summary>3,700 tokens · 7 usage events<\/summary>/);
+  assert.doesNotMatch(plain, /this session/);
+  const withSession = ctx.modelUsageHTML(card, { input: 10, cacheRead: 20, cacheWrite: 3, output: 4, reasoning: 0, calls: 2 });
+  assert.match(withSession, /<summary>3,700 tokens on this card · 37 this session · 7 usage events<\/summary>/);
+  assert.match(withSession, /linked to now/);
+});

@@ -7831,7 +7831,11 @@ function buildState(options = {}) {
   if (workerMode) {
     const terminal = new Set(['completed', 'failed', 'cancelled']);
     const derived = new Set(['taskId', 'taskStatus', 'runtime', 'pane', 'launchModel', 'accountLabel',
-      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark']);
+      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark',
+      // Attached further down, after this block, and re-read from the usage snapshot
+      // on every build. Listed so a reordering cannot freeze a settled session's
+      // totals at whatever the collector had seen the moment it was cached.
+      'modelUsage']);
     for (const session of sessions) {
       const key = `${session.kind}:${session.id}`;
       const evidence = dashboardSourceEvidence.get(key);
@@ -7925,6 +7929,15 @@ function buildState(options = {}) {
   if (workerMode) digest = options.dashboardRuntime?.digest || null;
   else try { digest = ensureDigest(); } catch (e) { process.stderr.write(`keep serve: digest failed: ${e.message}\n`); }
   const alertMeta = alerts.loadMeta(keep.ROOT);
+  // What this session itself has spent, beside the card total the header already
+  // shows, so moving a session to a fresh card does not read as a usage reset. These
+  // rows are rebuilt every pass (the settled cache hands back a clone, and scanCache
+  // holds the parsed transcript rather than the row), so assigning in place is safe.
+  // It happens after the settled-session freeze above so no usage figure is cached.
+  for (const session of sessions) {
+    if (session.kind !== 'claude' && session.kind !== 'codex') continue;
+    session.modelUsage = cardUsage.forSession(cardUsageSummary, session.kind, session.id);
+  }
   attachStateLines(sessions);
   const state = {
     generatedAt: Date.now(),

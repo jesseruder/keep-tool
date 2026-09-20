@@ -57,6 +57,42 @@ test('parseDependency and help expose step-qualified wait-on syntax', () => {
   }
 });
 
+test('keep usage with no card reports fleet totals including unassigned usage', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-usage-fleet-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.keep', 'card-usage'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'card-usage', 'summary.json'), JSON.stringify({
+      since: 0, updatedAt: 60000, pending: true, issues: {}, unassigned: 3, unassignedTokens: 700,
+      cards: { a: { input: 100, cacheRead: 20, cacheWrite: 5, output: 10, reasoning: 0, calls: 2, models: {} } },
+      sessions: { 'claude:s': { input: 100, cacheRead: 20, cacheWrite: 5, output: 10, reasoning: 0, calls: 2 } },
+    }));
+    const run = (...args) => {
+      const result = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'usage', ...args], {
+        encoding: 'utf8', env: { ...process.env, KEEP_DIR: root },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout;
+    };
+    const text = run();
+    assert.match(text, /Fleet model usage \(since 1970-01-01T00:00:00\.000Z\)/);
+    assert.match(text, /Attributed: 135 tokens across 1 card\n/);
+    assert.match(text, /Unassigned: 700 tokens \(3 events\)/);
+    assert.match(text, /catching up/);
+    assert.deepEqual(JSON.parse(run('--json')), {
+      since: 0, updatedAt: 60000, pending: true, issues: {}, cards: 1, attributed: 135,
+      unassigned: 3, unassignedTokens: 700,
+    });
+    const bad = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'usage', 'a', 'b'], {
+      encoding: 'utf8', env: { ...process.env, KEEP_DIR: root },
+    });
+    assert.notEqual(bad.status, 0);
+    assert.match(bad.stderr, /usage: keep usage \[<card>\] \[--json\]/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('serve help documents the done-card close window and opt-out', () => {
   const text = require('./keep.js').commandUsage('serve');
   assert.match(text, /KEEP_AUTO_CLOSE_DONE_MIN \(default 15\)/);

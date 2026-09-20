@@ -57,12 +57,35 @@ const { stepUsage } = stepGroup;
 
 const commands = {};
 
+const usageTokens = (u) => Number(u.input || 0) + Number(u.cacheRead || 0) + Number(u.cacheWrite || 0) + Number(u.output || 0);
 commands.usage = (argv) => {
   const o = parseArgs(argv, { json: 'bool' });
-  if (o._.length !== 1) die('usage: keep usage <card> [--json]');
+  if (o._.length > 1) die('usage: keep usage [<card>] [--json]');
+  const snapshot = cardUsage.snapshot(ROOT);
+  // No card: the fleet view. Unassigned usage is invisible in every per-card table,
+  // so this is the only place a gap in attribution shows up at all.
+  if (!o._.length) {
+    const cards = snapshot ? Object.values(snapshot.cards || {}) : [];
+    const attributed = cards.reduce((sum, card) => sum + usageTokens(card), 0);
+    if (o.json) {
+      console.log(JSON.stringify(snapshot ? {
+        since: snapshot.since, updatedAt: snapshot.updatedAt ?? null, pending: Boolean(snapshot.pending),
+        issues: snapshot.issues || {}, cards: cards.length, attributed,
+        unassigned: snapshot.unassigned || 0, unassignedTokens: snapshot.unassignedTokens || 0,
+      } : null, null, 2));
+      return;
+    }
+    if (!snapshot) { console.log('Model usage collection has not started.'); return; }
+    console.log(`Fleet model usage (since ${new Date(snapshot.since).toISOString()})`);
+    console.log(`Attributed: ${attributed} tokens across ${cards.length} card${cards.length === 1 ? '' : 's'}`);
+    console.log(`Unassigned: ${snapshot.unassignedTokens || 0} tokens (${snapshot.unassigned || 0} events)`);
+    console.log(`Collected: ${snapshot.updatedAt ? new Date(snapshot.updatedAt).toISOString() : 'never'}${snapshot.pending ? ' (catching up)' : ''}`);
+    if (Object.keys(snapshot.issues || {}).length) console.log('Some transcript evidence is incomplete; see --json.');
+    return;
+  }
   const task = loadTaskAnywhere(o._[0]);
   if (!task) die(`unknown card: ${o._[0]}`);
-  const summary = cardUsage.forCard(cardUsage.snapshot(ROOT), task.id);
+  const summary = cardUsage.forCard(snapshot, task.id);
   if (o.json) { console.log(JSON.stringify(summary, null, 2)); return; }
   if (!summary) { console.log('Model usage collection has not started.'); return; }
   console.log(`Model usage for ${task.id} (since ${new Date(summary.since).toISOString()})`);
@@ -72,6 +95,7 @@ commands.usage = (argv) => {
   }
   if (!summary.calls) console.log('No attributed usage yet.');
   if (summary.pending || Object.keys(summary.issues).length) console.log('Collection is catching up or has incomplete evidence; see --json.');
+  console.log(`Unassigned across all cards: ${snapshot?.unassignedTokens || 0} tokens (${snapshot?.unassigned || 0} events)`);
 };
 
 function addTask({
@@ -3305,7 +3329,8 @@ ${stepUsage()}
   keep review-budget [--json] [--model m] [--account claude-id]
                          # may the active reviewer account spend right now?
   keep review-tick [--force]               # wake the reviewer now (needs keep serve)
-  keep usage <card> [--json]     Forward-only model token usage
+  keep usage [<card>] [--json]   Forward-only model token usage
+                         # no card: fleet totals, including unassigned usage
   keep review-stats [--json]               # last tick, skips, per-day counts
   keep nudge <id> --session <sid> --key <k> -m "finding" [--send]
   keep nudge live [on|off|contradictions|<kind,kind>]

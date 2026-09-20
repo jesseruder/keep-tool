@@ -14,6 +14,16 @@ const {
   createJobChangeTracker,
 } = require('./dashboard-state');
 
+test('per-session usage rides on the summary row without moving its detail version', () => {
+  const row = (modelUsage) => ({ id: 'session', kind: 'claude', title: 'Live', state: 'waiting',
+    stateLabel: 'Waiting', lastAssistantFull: 'tail', modelUsage });
+  const totals = { input: 10, cacheRead: 20, cacheWrite: 3, output: 4, reasoning: 0, calls: 2 };
+  const summary = lightweightState({ sessions: [row(totals)] }).sessions[0];
+  assert.deepEqual(summary.modelUsage, totals, 'the console header reads it off the list row');
+  assert.equal(summary._detailVersion, lightweightState({ sessions: [row(undefined)] }).sessions[0]._detailVersion,
+    'a session whose totals grew must not refetch its transcript');
+});
+
 test('a card-usage run stamp does not change a card detail version', () => {
   const usage = (updatedAt, calls = 3) => ({ since: 1, updatedAt, pending: false, issues: {}, input: 10, cacheRead: 0, cacheWrite: 0, output: 5, calls, models: {} });
   const card = (modelUsage) => ({ id: 'card', fm: { title: 'Card' }, body: 'notes', lastLog: 'latest', modelUsage });
@@ -206,6 +216,7 @@ function consoleFixture() {
         stateLine: 'Finished the review', lastVerdict: 'done', lastVerdictAt: 130, verdictConfidence: 0.9,
         pendingDecision: { id: 'd1', type: 'grade' }, pendingQuestion: 'Ship it?', pendingPlan: { text: 'plan' },
         activity: { background: { pending: true } },
+        modelUsage: { input: 1, cacheRead: 2, cacheWrite: 3, output: 4, reasoning: 0, calls: 1 },
         lastUser: 'Large user prompt', lastAssistantFull: 'Full historical tail', lastHuman: 'human', size: 999,
         opener: { via: 'keep' }, endedTurn: true, notify: { type: 'complete' }, lifecycleAgents: ['child'],
         askedProse: false, waitingFor: null, attentionAt: 115, localCommandPending: false,
@@ -344,7 +355,7 @@ test('console state reduces every dead session and leaves live rows whole', () =
     'taskId', 'taskStatus', 'state', 'stateLabel', 'alive', 'exited', 'pane', 'mtime', 'lastUserAt',
     'turnStartedAt', 'accountId', 'account', 'accountLabel', 'reviewer', 'rateLimit', 'lastAssistant',
     'stateLine', 'lastVerdict', 'lastVerdictAt', 'verdictConfidence', 'pendingDecision',
-    'pendingQuestion', 'pendingPlan', 'activity', '_detailVersion',
+    'pendingQuestion', 'pendingPlan', 'activity', 'modelUsage', '_detailVersion',
   ];
   const flagged = projected.sessions.find((session) => session.id === 'flagged-exited');
   assert.deepEqual(Object.keys(flagged).sort(), [...expectedDeadSession].sort(),

@@ -198,7 +198,9 @@ const CONSOLE_DEAD_SESSION_FIELDS = [
   // parked rate-limited row would drop out of the batch if only the old field is set.
   'turnStartedAt', 'accountId', 'account', 'accountLabel', 'reviewer', 'rateLimit', 'lastAssistant', 'stateLine',
   'lastVerdict', 'lastVerdictAt', 'verdictConfidence', 'pendingDecision', 'pendingQuestion',
-  'pendingPlan', 'activity', '_detailVersion',
+  // The session header renders its own token total beside the card's, on an exited
+  // session too. It is four numbers and a count, with no updatedAt to churn.
+  'pendingPlan', 'activity', 'modelUsage', '_detailVersion',
 ];
 
 const CONSOLE_DEAD_PANE_FIELDS = [
