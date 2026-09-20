@@ -12,10 +12,10 @@ let providerFilter = 'all';
 try { filter = sessionStorage.getItem(FILTER_KEY) || ''; } catch {}
 try {
   const savedProvider = sessionStorage.getItem(PROVIDER_FILTER_KEY);
-  if (['claude', 'codex'].includes(savedProvider)) providerFilter = savedProvider;
+  if (['claude', 'codex', 'pi'].includes(savedProvider)) providerFilter = savedProvider;
 } catch {}
 
-const providerLabel = (provider) => ({ claude: 'Claude Code', codex: 'Codex' }[provider] || 'All');
+const providerLabel = (provider) => ({ claude: 'Claude Code', codex: 'Codex', pi: 'Pi' }[provider] || 'All');
 
 export function filterFleetRows(ctx, rows, text = filter, provider = providerFilter) {
   const needle = text.trim().toLowerCase();
@@ -110,7 +110,7 @@ export function renderFleet(ctx) {
 
   const root = document.querySelector('#fleet');
   if (!root.querySelector('.fleetbar')) {
-    root.innerHTML = `<div class="fleetbar"><input type="search" aria-label="Filter fleet" placeholder="Filter title, session, card, project, or branch" value="${ctx.esc(filter)}"><select aria-label="Filter fleet by provider"><option value="all">All</option><option value="claude">Claude Code</option><option value="codex">Codex</option></select><span class="fleet-count"></span><span class="fleet-shadow"></span></div><div class="fleet-results"></div>`;
+    root.innerHTML = `<div class="fleetbar"><input type="search" aria-label="Filter fleet" placeholder="Filter title, session, card, project, or branch" value="${ctx.esc(filter)}"><select aria-label="Filter fleet by provider"><option value="all">All</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="pi">Pi</option></select><span class="fleet-count"></span><span class="fleet-shadow"></span></div><div class="fleet-results"></div>`;
     const input = root.querySelector('.fleetbar input');
     const select = root.querySelector('.fleetbar select');
     select.value = providerFilter;
@@ -120,7 +120,7 @@ export function renderFleet(ctx) {
       renderFleet(ctx);
     });
     select.addEventListener('change', () => {
-      providerFilter = ['claude', 'codex'].includes(select.value) ? select.value : 'all';
+      providerFilter = ['claude', 'codex', 'pi'].includes(select.value) ? select.value : 'all';
       try { sessionStorage.setItem(PROVIDER_FILTER_KEY, providerFilter); } catch {}
       renderFleet(ctx);
     });

@@ -44,6 +44,7 @@ class FakeFleet extends FakeElement {
 const rows = [
   { id: 'claude-live', kind: 'claude', title: 'Keep browser test', project: '/work/keep' },
   { id: 'codex-exited', kind: 'codex', title: 'Other task', project: '/work/other' },
+  { id: 'pi-live', kind: 'pi', title: 'Pi notes', project: '/work/keep' },
   { id: 'shell-pane', kind: 'shell', title: 'shell', project: '/work/keep' },
 ];
 
@@ -65,9 +66,11 @@ function context(sessions = []) {
 test('provider filtering combines with text filtering and keeps shell rows in All', async () => {
   const { filterFleetRows } = await import('./fleet.js');
   const ctx = context();
-  assert.deepEqual(filterFleetRows(ctx, rows, '', 'all').map((row) => row.id), ['claude-live', 'codex-exited', 'shell-pane']);
+  assert.deepEqual(filterFleetRows(ctx, rows, '', 'all').map((row) => row.id), ['claude-live', 'codex-exited', 'pi-live', 'shell-pane']);
   assert.deepEqual(filterFleetRows(ctx, rows, '', 'claude').map((row) => row.id), ['claude-live']);
   assert.deepEqual(filterFleetRows(ctx, rows, '', 'codex').map((row) => row.id), ['codex-exited'], 'pane-only exited Codex rows use their exact kind');
+  assert.deepEqual(filterFleetRows(ctx, rows, '', 'pi').map((row) => row.id), ['pi-live']);
+  assert.deepEqual(filterFleetRows(ctx, rows, 'notes', 'pi').map((row) => row.id), ['pi-live']);
   assert.deepEqual(filterFleetRows(ctx, rows, 'keep', 'claude').map((row) => row.id), ['claude-live']);
   assert.deepEqual(filterFleetRows(ctx, rows, 'keep', 'codex'), []);
 });
@@ -79,7 +82,8 @@ test('Fleet changes the persistent provider selector without replacing the searc
   globalThis.document = { querySelector: (selector) => selector === '#fleet' ? fleet : null };
   const { renderFleet } = await import('./fleet.js');
   const ctx = context([{ id: 'claude-live', pane: 'p1', project: '/work/keep', title: 'Keep browser test', kind: 'claude' },
-    { id: 'codex-exited', pane: 'p2', project: '/work/other', title: 'Other task', kind: 'codex' }]);
+    { id: 'codex-exited', pane: 'p2', project: '/work/other', title: 'Other task', kind: 'codex' },
+    { id: 'pi-live', pane: 'p3', project: '/work/keep', title: 'Pi notes', kind: 'pi' }]);
 
   renderFleet(ctx);
   const input = fleet.input;
@@ -87,7 +91,14 @@ test('Fleet changes the persistent provider selector without replacing the searc
   fleet.select.dispatch('change');
   assert.equal(values.get('keep.console.fleet.provider'), 'codex');
   assert.equal(fleet.input, input, 'the persistent toolbar is not recreated when the provider changes');
-  assert.equal(fleet.count.textContent, '1 of 2');
+  assert.equal(fleet.count.textContent, '1 of 3');
   assert.match(fleet.results.innerHTML, /Other task/);
   assert.doesNotMatch(fleet.results.innerHTML, /Keep browser test/);
+  fleet.select.value = 'pi';
+  fleet.select.dispatch('change');
+  assert.equal(values.get('keep.console.fleet.provider'), 'pi');
+  assert.equal(fleet.input, input);
+  assert.equal(fleet.count.textContent, '1 of 3');
+  assert.match(fleet.results.innerHTML, /Pi notes/);
+  assert.doesNotMatch(fleet.results.innerHTML, /Other task/);
 });
