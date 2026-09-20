@@ -61,6 +61,7 @@ keep reviewed <card> --commit origin/<default>..HEAD --verdict clean|findings --
   card not opted out.
 - `keep land <card>` does the land: it re-checks that, runs `wt land`, and cites the
   landed sha (exit 3 when the reviewed patches are not exactly what would land;
-  `--dry-run` shows the decision). Keep-tool's own main checkout and daemon restart
-  stay manual.
+  `--dry-run` shows the decision). For keep-tool, `wt land` fast-forwards a ready
+  live checkout and restarts the daemon; it reports a skipped or failed deployment
+  for the landing session to resolve.
 - Cite the landed shas in the final check-in, not the pre-rebase worktree shas.

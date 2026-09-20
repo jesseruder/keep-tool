@@ -66,3 +66,23 @@ test('agent-facing scheduling contract is present in skill, README, and CLI help
   assert.equal(require('./health').CADENCES.runs.cadenceMs, 60000);
   assert.match(fs.readFileSync(path.join(root, 'skills/keep-scheduled-checks/SKILL.md'), 'utf8'), /polls due recipes every minute/);
 });
+
+test('keep-tool landing guidance agrees that wt land deploys the ready live checkout', (t) => {
+  const keepRoot = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-land-guidance-'));
+  fs.mkdirSync(path.join(keepRoot, 'tasks'));
+  t.after(() => fs.rmSync(keepRoot, { recursive: true, force: true }));
+
+  const help = spawnSync(process.execPath, [path.join(root, 'bin/keep.js'), 'land', '--help'], {
+    encoding: 'utf8', env: { ...process.env, KEEP_DIR: keepRoot },
+  });
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /wt land.*fast-forwards.*ready live checkout.*restarts the\s+daemon/is);
+  assert.match(help.stdout, /skipped or failed deployment/i);
+
+  for (const file of ['skills/codex-review-runner/SKILL.md', 'skills/keep-ops/SKILL.md', 'docs/reference.md']) {
+    const text = fs.readFileSync(path.join(root, file), 'utf8');
+    assert.match(text, /wt land.*fast-forwards.*ready.*(live|main) checkout.*restarts the\s+daemon/is, file);
+    assert.match(text, /(skipped|failed) deployment/i, file);
+    assert.doesNotMatch(text, /main checkout and daemon restart stay manual/i, file);
+  }
+});

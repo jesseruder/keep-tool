@@ -85,14 +85,16 @@ call or a write.
 ## Changing the daemon's code
 
 The daemon runs from the main keep-tool checkout, which must stay clean: work in a
-worktree, land, fast-forward the main checkout, then `keep restart-daemon`. Skills, docs
-and CLI-only changes need the pull but not the restart. The daemon's own git pull syncs
-the registry, never the code.
+worktree, then land. `wt land` fast-forwards a ready main checkout and restarts the
+daemon; it reports a skipped or failed deployment for the landing session to resolve.
+For manual recovery, skills, docs and CLI-only changes may need only the fast-forward;
+daemon-code changes need the restart too.
+The daemon's own git pull syncs the registry, never the code.
 
 A self-repair session follows the recipe on its card: root-cause from the attached health
-record and log excerpt, land a reviewed fix, and only then pull and restart once the fix
-is on the default branch. If it cannot land, it leaves the card in `review` with the branch
-named and the daemon untouched.
+record and log excerpt, then land a reviewed fix. `wt land` attempts the deployment after
+the land; if it reports a skip or failure, resolve it before closing the card. If it cannot
+land, it leaves the card in `review` with the branch named and the daemon untouched.
 
 ## Reporting
 

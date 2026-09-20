@@ -1554,12 +1554,14 @@ commands.reviews = (argv) => {
   }
 };
 
+const KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE = 'For keep-tool, wt land deploys a ready live checkout by fast-forwarding it and restarting the daemon; it reports any skipped or failed deployment.';
+
 commands.land = (argv) => {
   const o = parseArgs(argv, { json: 'bool', 'dry-run': 'bool' });
   const id = o._[0];
   if (!id || o._.length > 1) die('usage: keep land <card> [--dry-run] [--json]\n'
     + '  Checks keep allow <card> land, then runs wt land from the current worktree and cites the landed sha.\n'
-    + '  Keep-tool\'s own main checkout and daemon restart stay manual: this never pulls ~/keep-tool and never restarts the daemon.');
+    + `  ${KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE}`);
   const task = loadTask(id);
   const verdict = implicitLandVerdict(task);
   if (!verdict.ok) {
@@ -1603,7 +1605,7 @@ commands.land = (argv) => {
   }
   if (o.json) return console.log(JSON.stringify({ id, landed: sha, record, why: verdict.why }, null, 2));
   console.log(`${id}: landed ${sha.slice(0, 12)} onto origin/${context.defaultBranch}${cited}`);
-  console.log('  keep-tool\'s main checkout and daemon restart are still manual');
+  console.log(`  ${KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE}`);
 };
 
 // ---------- shadow decisions ----------
@@ -3159,7 +3161,8 @@ function helpText() {
   keep reviews <card> [--json]                 # the review records on this card
   keep land <card> [--dry-run] [--json]        # keep allow <card> land, then wt land, then cite the sha
                        # exit 3 when the reviewed patches are not exactly what would land
-                       # keep-tool's main checkout and daemon restart stay manual
+                       # for keep-tool, wt land fast-forwards a ready live checkout, restarts the daemon,
+                       # and reports any skipped or failed deployment
   keep retitle <id> "new title"
   keep rename [<#n|session-id>] "new title"    # name a session by hand; its automatic title stops updating
   keep rename [<#n|session-id>] --clear        # hand the session back to automatic titles

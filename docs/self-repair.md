@@ -10,9 +10,10 @@ When a failure signature persists, Keep opens **one card per signature** with th
 health record and a log excerpt attached, creates a fresh `keep-tool` worktree out
 of process, and opens one repair session there, pointed at a root-cause recipe
 stored on the card. The scheduler itself never restarts the daemon and never lands
-anything. The agent lands a reviewed fix and then — and only then — pulls it into
-`~/keep-tool` and restarts the daemon into it; if it could not land, it leaves the
-card in review with its branch named and the daemon untouched.
+anything. When the agent lands a reviewed fix, `wt land` fast-forwards a ready
+`~/keep-tool` checkout and restarts the daemon. If it reports a skipped or failed
+deployment, the agent resolves that before closing the card; if it could not land,
+it leaves the card in review with its branch named and the daemon untouched.
 
 ## What counts as a signature
 
@@ -208,9 +209,8 @@ ok. The plan is always these four steps:
 2. Fix in the worktree with a test that fails before and passes after
 3. Independent review, then `keep reviewed` and `keep land` if `keep allow <card>
    land` allows; otherwise leave the card in review with the branch named
-4. Once the fix is on origin/master: `git -C ~/keep-tool pull --ff-only`,
-   `keep restart-daemon`, then confirm the row is green with `keep health` (both
-   are refused until the land)
+4. Confirm the row is green with `keep health`. `wt land` deploys a ready live
+   checkout; if it reports a skipped or failed deployment, resolve that first.
 
 Evidence is attached as artifacts under `.keep/artifacts/<card>/`: the failing
 health row with the `daemon` row, the whole health snapshot, the last 80 serve.log
@@ -289,8 +289,8 @@ names the constraints: work only in the worktree, never edit or commit in
 `keep codex` — **waiting
 for the result in the foreground, never ending a turn with the review pending** —
 record it with `keep reviewed`, land only through `keep allow` + `keep land`, and
-then — only then — pull the fix into `~/keep-tool`, restart the daemon into it,
-confirm the row went green, and close the card.
+then confirm the row went green and close the card. `wt land` deploys a ready live
+checkout; resolve any skipped or failed deployment it reports before closing.
 
 ## What is gated, and until when
 
@@ -322,12 +322,16 @@ installed: a repair session running in a managed automation account whose
 refusal both. `keep setup hooks` installs them in every managed Claude account, and
 `keep doctor` names any account still missing them.
 
-**Once the card's fix is on `origin/master`, exactly two of those come back:**
+**Once the card's fix is on `origin/master`, exactly two commands come back:**
 
 ```sh
 git -C ~/keep-tool pull --ff-only     # or: pull --ff-only origin master
 keep restart-daemon                   # and the node/shebang spelling of it
 ```
+
+The guard's eligibility is only the landed fix. `wt land` normally deploys it; these
+commands are for a skipped or failed deployment. A documentation or CLI-only change may
+need only the fast-forward, while a daemon-code change needs the restart too.
 
 Each as a **whole command**, matched against the text, not against a parse of it.
 Everything else in this guard reads a command line without being a shell, which is
