@@ -25,6 +25,8 @@ const WINDOW_MS = 7 * DAY_MS;
 const EVIDENCE_MAX = 90000;
 const RETRY_MS = 30 * 60e3;
 const MODEL_TIMEOUT_MS = 600 * 1000;
+const WATCH_TICK_MS = 10 * 1000;
+const WATCH_GAP_MS = 4 * WATCH_TICK_MS;
 const CLAIM_MAX_AGE_MS = MODEL_TIMEOUT_MS + 4 * 60e3;
 const MODEL_OUTPUT_MAX = 1024 * 1024;
 const RAW_OUTPUT_MAX = 200000;
@@ -472,8 +474,16 @@ function normalizeSweepTitle(value) {
     .replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
 }
 
-function captureModelOutput(child, timeoutMs = MODEL_TIMEOUT_MS) {
+// The deadline counts the time we actually watched the generator, not wall clock.
+// A laptop that sleeps mid-sweep, or a daemon whose event loop stalls for a quarter
+// of an hour, hands back an expired timer before the child's own close event: the
+// generator had already answered in well under a minute and we killed it anyway.
+// So tick, and skip a gap far longer than a tick - nobody was watching for that time.
+function captureModelOutput(child, timeoutMs = MODEL_TIMEOUT_MS, deps = {}) {
   return new Promise((resolve, reject) => {
+    const now = deps.now || Date.now;
+    const every = deps.setInterval || setInterval;
+    const stop = deps.clearInterval || clearInterval;
     const stdout = [];
     let stdoutBytes = 0;
     let stderr = '';
@@ -481,11 +491,20 @@ function captureModelOutput(child, timeoutMs = MODEL_TIMEOUT_MS) {
     let closed = false;
     let killTimer;
     let terminationError;
-    const timer = setTimeout(() => terminate(new Error(`ideas generation timed out after ${MODEL_TIMEOUT_MS / 1000}s`)), timeoutMs);
+    let remaining = timeoutMs;
+    let watchedAt = now();
+    const timer = every(() => {
+      const at = now();
+      const delta = at - watchedAt;
+      watchedAt = at;
+      if (delta < 0 || delta > WATCH_GAP_MS) return;
+      remaining -= delta;
+      if (remaining <= 0) terminate(new Error(`ideas generation timed out after ${timeoutMs / 1000}s`));
+    }, WATCH_TICK_MS);
     function terminate(error) {
       if (terminationError) return;
       terminationError = error;
-      clearTimeout(timer);
+      stop(timer);
       try { child.kill('SIGTERM'); } catch {}
       killTimer = setTimeout(() => { if (!closed) try { child.kill('SIGKILL'); } catch {} }, 10e3);
     }
@@ -511,7 +530,7 @@ function captureModelOutput(child, timeoutMs = MODEL_TIMEOUT_MS) {
     function finish(code, error) {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      stop(timer);
       if (error) reject(error);
       else resolve(Buffer.concat(stdout, stdoutBytes).toString('utf8'));
     }
@@ -695,6 +714,6 @@ function startScheduler({ onChange } = {}) {
 }
 
 module.exports = {
-  EVIDENCE_MAX, MODEL_TIMEOUT_MS, CLAIM_MAX_AGE_MS, collectReviews, buildEvidence, renderEvidence, fitEvidence, buildPrompt, parseIdeas,
+  EVIDENCE_MAX, MODEL_TIMEOUT_MS, WATCH_TICK_MS, WATCH_GAP_MS, CLAIM_MAX_AGE_MS, collectReviews, buildEvidence, renderEvidence, fitEvidence, buildPrompt, parseIdeas,
   normalizeSweepTitle, captureModelOutput, runModel, landProposals, run, ideasAccountId, healthForResult, ideasClock, sweepDue, startScheduler, loadMeta,
 };

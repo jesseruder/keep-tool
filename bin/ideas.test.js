@@ -129,6 +129,45 @@ test('captureModelOutput terminates oversized output and rejects only on close',
   await rejection;
 });
 
+test('captureModelOutput charges the deadline only for time it watched', async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.signals = [];
+  child.kill = (signal) => { child.signals.push(signal); };
+  let clock = 0;
+  let tick = null;
+  let cadence = null;
+  let stopped = 0;
+  const deps = {
+    now: () => clock,
+    setInterval: (fn, ms) => { tick = fn; cadence = ms; return 'watchdog'; },
+    clearInterval: (timer) => { if (timer === 'watchdog') stopped += 1; },
+  };
+  const result = ideas.captureModelOutput(child, 600e3, deps);
+  assert.equal(cadence, ideas.WATCH_TICK_MS);
+
+  // The host slept for a quarter of an hour: one very late tick, and it is not charged.
+  clock = 1000e3;
+  tick();
+  assert.deepEqual(child.signals, [], 'a gap nobody watched does not kill the generator');
+
+  // Watched time still accumulates, and 600s of it ends the run.
+  for (let index = 0; index < 59; index += 1) {
+    clock += ideas.WATCH_TICK_MS;
+    tick();
+  }
+  assert.deepEqual(child.signals, [], '590s watched is under the deadline');
+  clock += ideas.WATCH_TICK_MS;
+  tick();
+  assert.deepEqual(child.signals, ['SIGTERM']);
+  assert.equal(stopped, 1, 'the watchdog stops once it has fired');
+
+  const rejection = assert.rejects(result, /timed out after 600s/);
+  child.emit('close', 0);
+  await rejection;
+});
+
 test('sweepDue observes local start, completion, retries, and noon cutoff', () => {
   const clock = { hour: 7, minute: 30, invalid: false };
   const at = (hour, minute) => new Date(2026, 8, 3, hour, minute).getTime();
