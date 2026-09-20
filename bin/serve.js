@@ -3124,6 +3124,19 @@ function readPendingCompactSwap(sessionId, dir = autoCompactDir()) {
   } catch { return null; }
 }
 
+function pendingCompactRestoreFile(sessionId, deps = {}) {
+  if (!/^[A-Za-z0-9_-]+$/.test(String(sessionId || ''))) return null;
+  const dir = deps.dir || deps.autoCompactDir || path.join(deps.root || keep.ROOT, '.keep', 'compact');
+  const file = path.join(dir, `${sessionId}.swap.json`);
+  return fs.existsSync(file) ? file : null;
+}
+
+function assertCompactRestoreSettled(sessionId, deps = {}) {
+  if (pendingCompactRestoreFile(sessionId, deps)) {
+    throw new InjectionError(409, 'model restore is pending; message was not delivered');
+  }
+}
+
 function pendingCompactSwaps(dir) {
   let names = [];
   try { names = fs.readdirSync(dir); } catch { return []; }
@@ -5329,6 +5342,42 @@ function reopenPremiumFamilies() {
 
 const reopenCompactAttempts = new Map();
 
+function reopenHandoffSnapshotFile(root, sessionId) {
+  return path.join(root, '.keep', 'compact', `${sessionId}.reopen-snapshot`);
+}
+
+function readReopenHandoffSnapshot(root, sessionId, accountId) {
+  let record;
+  try { record = JSON.parse(fs.readFileSync(reopenHandoffSnapshotFile(root, sessionId), 'utf8')); }
+  catch { return null; }
+  const turn = record?.turn;
+  if (record?.sessionId !== sessionId || record?.accountId !== accountId || !turn
+      || typeof turn.model !== 'string' || !keep.LAUNCH_MODEL_RE.test(turn.model)
+      || !Number.isFinite(turn.contextTokens) || turn.contextTokens < 0
+      || (turn.usageAt != null && !Number.isFinite(turn.usageAt))
+      || (turn.cacheTtlMs != null && !Number.isFinite(turn.cacheTtlMs))) return null;
+  return turn;
+}
+
+function writeReopenHandoffSnapshot(root, sessionId, accountId, turn) {
+  if (!/^[A-Za-z0-9_-]+$/.test(sessionId) || !accounts.ID_RE.test(accountId)) return;
+  if (!keep.LAUNCH_MODEL_RE.test(String(turn.model || ''))
+      || !Number.isFinite(turn.contextTokens)
+      || turn.contextTokens < envNumber('KEEP_AUTO_COMPACT_MIN_TOKENS', 100000)) return;
+  writeCompactSwapRecord(reopenHandoffSnapshotFile(root, sessionId), {
+    sessionId, accountId, turn: {
+      model: turn.model, contextTokens: turn.contextTokens,
+      usageAt: Number.isFinite(turn.usageAt) ? turn.usageAt : null,
+      cacheTtlMs: Number.isFinite(turn.cacheTtlMs) ? turn.cacheTtlMs : null,
+    },
+  });
+}
+
+function clearReopenHandoffSnapshot(root, sessionId) {
+  try { fs.unlinkSync(reopenHandoffSnapshotFile(root, sessionId)); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+
 function reopenTurnSnapshot(session, deps = {}, launchModel = '') {
   const turn = (deps.sessionLastTurn || sessionLastTurn)(session, deps);
   let model = launchModel || turn.model;
@@ -5345,7 +5394,7 @@ function reopenTurnSnapshot(session, deps = {}, launchModel = '') {
 async function compactReopenedSession(session, target, account, turn, deps = {}) {
   if (deps.reopenCompaction === 'skip') return null;
   const dir = deps.dir || path.join(deps.root || keep.ROOT, '.keep', 'compact');
-  if (fs.existsSync(path.join(dir, `${session.id}.swap.json`))) {
+  if (pendingCompactRestoreFile(session.id, { ...deps, dir })) {
     throw new InjectionError(409, 'model restore is pending; opening message was not delivered');
   }
   const families = reopenPremiumFamilies();
@@ -5368,7 +5417,7 @@ async function compactReopenedSession(session, target, account, turn, deps = {})
     const settings = (deps.readClaudeSettingsModel || readClaudeSettingsModel)(accountSettingsFile);
     if (!settings.ok) {
       process.stderr.write(`keep serve: reopen compaction skipped ${sessionRef(session.id)}: account settings are unreadable (${settings.error})\n`);
-      return null;
+      return { compacted: false, reason: `account settings are unreadable (${settings.error})` };
     }
   }
   await (deps.precheckSessionTarget || precheckSessionTarget)(session, target, deps);
@@ -5794,6 +5843,7 @@ async function observeClaudeMcpMenu(session, target, deps = {}) {
 async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   if (session.kind === 'pi') throw new InjectionError(409, 'Pi API message delivery is unavailable; type in its terminal pane');
   claimInjectionTarget(target);
+  assertCompactRestoreSettled(session.id, deps);
   const pendingDirectory = deps.deliveryDirectory || path.join(keep.ROOT, '.keep', 'delivery');
   const record = require('./delivery-trace').recorder(pendingDirectory, session, target.pane);
   // Whether a single character of this message has been written to the pane. A
@@ -6903,6 +6953,7 @@ async function openSession(body, deps = {}) {
           pane: target.pane,
         };
         if (message) {
+          assertCompactRestoreSettled(session.id, deps);
           await (deps.sendToResolvedTarget || sendToResolvedTarget)(
             { ...session, kind: agent }, target, message, undefined, deps,
           );
@@ -7112,14 +7163,27 @@ async function reopenSessionOnAccount(body, deps = {}) {
     if (running.accountId !== target.id) throw new InjectionError(409, 'A different account reopen is already running for this session');
     return running.promise;
   }
+  const rememberedTurn = () => {
+    const saved = readReopenHandoffSnapshot(root, session.id, target.id);
+    if (saved) return saved;
+    const turn = reopenTurnSnapshot({ ...session, kind: agent }, deps);
+    writeReopenHandoffSnapshot(root, session.id, target.id, turn);
+    return turn;
+  };
   const compactTarget = async (result, turn) => {
     if (result?.status !== 'done' || !result.pane) return result;
     try {
-      await withInjectionLockRetry(() => compactReopenedSession(
+      const compacted = await withInjectionLockRetry(() => compactReopenedSession(
         { ...session, kind: agent }, { pane: result.pane }, target, turn,
         { ...deps, reopenForceCold: true }),
       { ...deps, injectionLockRetryMs: envNumber('KEEP_COMPACT_TIMEOUT_MS', 240000) + 30000 },
       { pane: result.pane, session: session.id, model: true });
+      const signature = JSON.stringify([target.id, turn.model, turn.contextTokens, turn.usageAt]);
+      if (compacted?.compacted || reopenCompactAttempts.get(session.id) === signature) {
+        clearReopenHandoffSnapshot(root, session.id);
+      } else if (compacted && !compacted.compacted) {
+        throw new InjectionError(409, `reopen compaction ${compacted.reason || 'failed'}; retry the open`);
+      }
     } catch (error) {
       const launch = { pane: result.pane, sessionId: session.id, accountId: target.id, agent, recoverable: true };
       if (error instanceof InjectionError) error.extra = { ...(error.extra || {}), code: 'OPEN_EXISTING_PANE', launch };
@@ -7135,14 +7199,17 @@ async function reopenSessionOnAccount(body, deps = {}) {
       if (recorded.targetAccountId !== target.id || recorded.intent !== 'open-only') {
         throw new InjectionError(409, 'A different account handoff is already pending for this session');
       }
-      const turn = reopenTurnSnapshot({ ...session, kind: agent }, deps);
+      const turn = rememberedTurn();
       const resumed = await (deps.handoffSession || handoffSession)({ sessionId: session.id, pane: recorded.pane,
         accountId: target.id, intent: 'open-only' }, deps);
       return compactTarget(resumed, turn);
     }
     if (recorded?.status === 'done' && recorded.targetAccountId === target.id && recorded.intent === 'open-only') {
-      return (deps.openSession || openSession)({ sessionId: session.id, accountId: target.id },
-        { ...deps, reopenForceCold: true });
+      const turn = readReopenHandoffSnapshot(root, session.id, target.id);
+      const opened = await (deps.openSession || openSession)({ sessionId: session.id, accountId: target.id },
+        { ...deps, reopenForceCold: true, ...(turn ? { reopenCompaction: 'skip' } : {}) });
+      if (turn && opened?.pane) await compactTarget({ status: 'done', pane: opened.pane }, turn);
+      return opened;
     }
     let source;
     try { source = accounts.forSession(session.id, agent, { root, env }); }
@@ -7160,7 +7227,7 @@ async function reopenSessionOnAccount(body, deps = {}) {
           accountId: source.id, agent, recoverable: true },
       });
     }
-    const turn = reopenTurnSnapshot({ ...session, kind: agent }, deps);
+    const turn = rememberedTurn();
     const opened = await (deps.openSession || openSession)({ sessionId: session.id, accountId: source.id },
       { ...deps, reopenCompaction: 'skip' });
     if (!opened?.pane) throw new InjectionError(502, 'Source session did not open in a verified pane');

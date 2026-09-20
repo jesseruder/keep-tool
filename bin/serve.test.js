@@ -6993,18 +6993,39 @@ test('reopen blocks the opening message when original model restoration is uncon
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   let sent = 0;
   const session = { id: 'reopen-restore-session', kind: 'codex', project: root };
-  await assert.rejects(openSession({ sessionId: session.id, message: 'Continue.' }, {
-    root, scanSessions: () => [session], resolveSessionTarget: async () => null,
+  let live = false;
+  const compactDir = path.join(root, '.keep', 'compact');
+  fs.mkdirSync(compactDir, { recursive: true });
+  const deps = {
+    root, scanSessions: () => [session], resolveSessionTarget: async () => live ? { pane: 'restore-pane' } : null,
     liveSessionPids: async () => new Map(),
     sessionLastTurn: () => ({ model: 'gpt-6-astra', contextTokens: 180000, usageAt: null }),
     host: recordingHost((type) => type === 'spawn' ? { pane: { id: 'restore-pane' } } : {}),
     waitForHostAgent: async () => true,
     precheckSessionTarget: async () => {},
-    compactSession: async () => ({ compacted: true, restoreUnconfirmed: true, reason: 'restore failed' }),
+    compactSession: async () => { fs.writeFileSync(path.join(compactDir, `${session.id}.swap.json`), '{}');
+      return { compacted: true, restoreUnconfirmed: true, reason: 'restore failed' }; },
     typeOpeningMessage: async () => { sent++; },
-  }), (error) => error.status === 409 && error.extra?.launch?.pane === 'restore-pane'
+    sendToResolvedTarget: async () => { sent++; },
+  };
+  await assert.rejects(openSession({ sessionId: session.id, message: 'Continue.' }, deps),
+    (error) => error.status === 409 && error.extra?.launch?.pane === 'restore-pane'
     && error.extra.code === 'OPEN_EXISTING_PANE');
+  live = true;
+  await assert.rejects(openSession({ sessionId: session.id, message: 'Retry.' }, deps),
+    (error) => error.status === 409 && /model restore is pending/.test(error.message));
   assert.equal(sent, 0);
+});
+
+test('all resolved-target sends refuse a pending model restore before terminal input', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pending-send-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dir = path.join(root, '.keep', 'compact'); fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'pending-session.swap.json'), 'unreadable');
+  await assert.rejects(sendToResolvedTarget({ id: 'pending-session', kind: 'claude' },
+    { pane: 'pending-pane' }, 'Hello', undefined, {
+      root, readScreen: async () => assert.fail('terminal must not be read'),
+    }), (error) => error.status === 409 && /model restore is pending/.test(error.message));
 });
 
 test('focusing an already-live session never compacts it', async () => {
@@ -8912,6 +8933,59 @@ test('different-account reopen serializes source opening and starts one open-onl
     assert.equal(result.intent, 'open-only'); assert.equal(repeated.status, 'done');
     assert.equal(opens, 1); assert.equal(handoffs, 1); assert.equal(compactions, 1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('completed account handoff retries transient compaction with its original cold snapshot only once', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reopen-handoff-retry-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const sourceDir = path.join(root, 'source'), targetDir = path.join(root, 'target');
+  fs.mkdirSync(sourceDir); fs.mkdirSync(targetDir);
+  fs.writeFileSync(path.join(targetDir, 'settings.json'), '{}\n');
+  const config = path.join(root, 'accounts.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'source', label: 'Source', agent: 'claude', configDir: sourceDir },
+    { id: 'target', label: 'Target', agent: 'claude', configDir: targetDir },
+  ], defaultAccounts: { claude: 'source' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+  const session = { id: 'handoff-retry-session', kind: 'claude', project: root, accountId: 'source' };
+  require('./accounts').pinSession(session.id, 'claude', 'source', { root, env });
+  const handoffDir = path.join(root, '.keep', 'account-handoffs'); fs.mkdirSync(handoffDir, { recursive: true });
+  const snapshotFile = path.join(root, '.keep', 'compact', `${session.id}.reopen-snapshot`);
+  let turnReads = 0; let compactions = 0; let sourceOpens = 0; let targetOpens = 0;
+  const deps = {
+    root, env, resolveSessionId: () => session, listHostPanes: async () => [],
+    sessionLastTurn: () => { turnReads++; return turnReads === 1
+      ? { model: 'claude-fable-5-1', contextTokens: 150000, usageAt: Date.now() - 1000 }
+      : { model: 'claude-sonnet-5', contextTokens: 1000, usageAt: Date.now() }; },
+    openSession: async (body, options) => {
+      if (body.accountId === 'source') { sourceOpens++; assert.equal(options.reopenCompaction, 'skip'); }
+      else { targetOpens++; assert.equal(options.reopenCompaction, targetOpens === 1 ? 'skip' : undefined); }
+      return { ok: true, pane: 'target-pane', existing: targetOpens > 0 };
+    },
+    handoffSession: async (body) => {
+      fs.writeFileSync(path.join(handoffDir, `${session.id}.json`), JSON.stringify({
+        sessionId: session.id, targetAccountId: 'target', status: 'done', intent: 'open-only', pane: body.pane,
+      }));
+      return { ok: true, status: 'done', pane: body.pane, intent: 'open-only' };
+    },
+    precheckSessionTarget: async () => {},
+    compactSession: async (_session, _pane, _instruction, options) => {
+      compactions++;
+      assert.equal(options.compactionPolicy.path, 'cold-fallback');
+      assert.equal(options.compactionPolicy.originalModel, 'claude-fable-5-1');
+      return compactions === 1 ? { compacted: false, reason: 'transient failure', attemptStage: 'pre-submit' }
+        : { compacted: true };
+    },
+  };
+  await assert.rejects(reopenSessionOnAccount({ sessionId: session.id, accountId: 'target' }, deps),
+    (error) => error.status === 409 && error.extra?.launch?.pane === 'target-pane');
+  assert.equal(fs.existsSync(snapshotFile), true, 'source context survives completed handoff');
+  await reopenSessionOnAccount({ sessionId: session.id, accountId: 'target' }, deps);
+  assert.equal(fs.existsSync(snapshotFile), false);
+  await reopenSessionOnAccount({ sessionId: session.id, accountId: 'target' }, deps);
+  assert.equal(sourceOpens, 1); assert.equal(targetOpens, 2);
+  assert.equal(turnReads, 1, 'retry uses the saved pre-handoff context');
+  assert.equal(compactions, 2, 'successful retry is not repeated');
 });
 
 test('different-account reopen exposes an existing incomplete source pane instead of launching again', async () => {
