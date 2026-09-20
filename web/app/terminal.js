@@ -117,7 +117,10 @@ export function mountTerminal(container, pane, options = {}) {
   let connectedOnce = false;
   let retryable = true;
   let replayDone = false;
+  let replayGeneration = 0;
+  let replayViewport = null;
   let fullHistory = false;
+  let expandingHistory = false;
   // Whether the attach snapshot left scrollback behind on the host. A new terminal
   // has nothing earlier to load, so the button stays hidden until it does.
   let moreHistory = false;
@@ -132,6 +135,24 @@ export function mountTerminal(container, pane, options = {}) {
   let profileNote = null;
   let profileCapture = null;
   const pendingInput = [];
+
+  const captureReplayViewport = () => {
+    const buffer = terminal.buffer.active;
+    return {
+      following: buffer.viewportY === buffer.baseY,
+      distanceFromBottom: buffer.baseY - buffer.viewportY,
+    };
+  };
+  const restoreReplayViewport = () => {
+    const saved = replayViewport;
+    replayViewport = null;
+    const buffer = terminal.buffer.active;
+    if (!saved || saved.following) terminal.scrollToBottom();
+    // Snapshot tails can advance or reflow while disconnected, so their absolute
+    // row numbers are not stable. Preserve how far the reader had scrolled back:
+    // it keeps manual reading manual without guessing at a false content anchor.
+    else terminal.scrollToLine(Math.max(0, buffer.baseY - saved.distanceFromBottom));
+  };
 
   const sendJson = (value) => {
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(value));
@@ -389,6 +410,10 @@ export function mountTerminal(container, pane, options = {}) {
     const connection = socket;
     socket.binaryType = 'arraybuffer';
     setStatus(fullHistory ? 'loading history' : (connectedOnce ? 'reconnecting' : 'connecting'));
+    // An automatic websocket reconnect replaces the snapshot just like the host
+    // reconnect below. Keep a reader's place; loading explicitly requested full
+    // history is a separate navigation whose fresh snapshot should stand alone.
+    if (connectedOnce && replayDone && !expandingHistory) replayViewport = captureReplayViewport();
     replayDone = false;
     const flushInput = () => {
       if (!pendingInput.length || socket?.readyState !== WebSocket.OPEN || !replayDone) return;
@@ -426,10 +451,18 @@ export function mountTerminal(container, pane, options = {}) {
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
       if (message.t === 'attached') {
+        // The bridge reattaches to a restarted host without closing this browser
+        // websocket. Begin the replay barrier here as well as in connect(): an old
+        // completed replay must not let ResizeObserver or input interrupt the new
+        // snapshot while xterm is still parsing it.
+        if (replayDone) replayViewport = captureReplayViewport();
+        replayDone = false;
+        replayGeneration++;
         reportVisibility(true);
         // The bridge guarantees this precedes the serialized snapshot, so stale
         // local scrollback cannot be doubled when the host reconnects after reload.
         terminal.reset();
+        expandingHistory = false;
         moreHistory = message.history?.truncated === true;
         setPaneState(message.pane);
         if (Number.isInteger(message.pane?.cols) && Number.isInteger(message.pane?.rows)
@@ -440,12 +473,15 @@ export function mountTerminal(container, pane, options = {}) {
       } else if (message.t === 'replay-end') {
         // Receiving the last frame is not the same as xterm having parsed it:
         // write() is asynchronous. Drain its queue before resizing or typing.
+        const generation = replayGeneration;
         terminal.write('', () => {
-          if (disposed || socket !== connection || (!exited && connection.readyState !== WebSocket.OPEN)) return;
+          if (disposed || socket !== connection || generation !== replayGeneration
+              || (!exited && connection.readyState !== WebSocket.OPEN)) return;
           replayDone = true;
           historyButton.hidden = fullHistory || !moreHistory;
           if (isPrimary) fitNow(true);
           else adoptPaneSize();
+          restoreReplayViewport();
           if (!exited) markHealthy();
         });
       } else if (message.t === 'pane') {
@@ -489,6 +525,7 @@ export function mountTerminal(container, pane, options = {}) {
     event.stopPropagation();
     if (disposed || fullHistory || !replayDone) return;
     fullHistory = true;
+    expandingHistory = true;
     historyButton.hidden = true;
     const previous = socket;
     // Exited panes remain attachable long enough to inspect their retained screen.

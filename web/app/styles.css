@@ -386,7 +386,7 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .brief .summary { color: var(--muted); white-space: pre-line; line-height: 1.4; height: 7em; flex-shrink: 0; overflow: auto; }
 /* The watcher's state line replaces the generated summary; it keeps the .summary
    class so existing focus and keyboard code sees the same element. */
-.brief .summary.state-line { display: flex; flex-direction: column; gap: 6px; height: auto; min-height: 3em; max-height: 7em; }
+.brief .summary.state-line { display: flex; flex-direction: column; gap: 6px; }
 .brief .state-line-text { color: var(--text); }
 .brief .state-line-meta { display: flex; align-items: center; gap: 8px; font-size: 11px; }
 .verdict-chip { font: 500 10px/1 var(--mono); text-transform: uppercase; letter-spacing: .05em; border: 1px solid var(--line-2); border-radius: 3px; padding: 3px 5px; display: inline-flex; gap: 5px; align-items: center; color: var(--muted); }

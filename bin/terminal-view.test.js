@@ -384,6 +384,87 @@ test('snapshot parses at its original size before fit or user input', async () =
   } finally { f.mounted.dispose(); }
 });
 
+test('a host reattach on the same websocket blocks fit and input until its new snapshot drains', async () => {
+  const f = fixture();
+  try {
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    const fits = f.fits;
+    f.socket.sent.length = 0;
+
+    // The terminal bridge keeps the browser websocket open across a host reload.
+    // A second attached frame therefore has to begin a fresh replay barrier itself.
+    f.message({ t: 'attached', pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 50 } });
+    f.socket.onmessage({ data: new TextEncoder().encode('\x1b[48;1H› prompt\x1b[50;1HSTATUS\x1b[48;3H').buffer });
+    f.mounted.fit();
+    f.terminal.keyHandler({ type: 'keydown', metaKey: true, ctrlKey: false, key: 'Enter', preventDefault() {} });
+    assert.equal(f.fits, fits, 'layout changes cannot resize a snapshot still being parsed');
+    assert.equal(f.socket.sent.length, 0, 'input queues behind the replacement snapshot');
+
+    f.message({ t: 'replay-end' });
+    assert.equal(f.fits, fits, 'the wire marker still waits for xterm parsing');
+    await f.drain();
+    assert.equal(f.fits, fits + 1);
+    assert.equal(f.terminal.rows, 30);
+    assert.equal(f.terminal.buffer.active.getLine(f.terminal.buffer.active.baseY + f.terminal.buffer.active.cursorY).translateToString(true), '› prompt');
+    assert.equal(JSON.parse(f.socket.sent[0]).t, 'primary');
+    assert.ok(f.socket.sent[1] instanceof Uint8Array);
+  } finally { f.mounted.dispose(); }
+});
+
+test('snapshot replacement preserves following and a manually scrolled viewport', async () => {
+  for (const scrolledBack of [false, true]) {
+    const f = fixture();
+    try {
+      f.message({ t: 'replay-end' });
+      await f.drain();
+      const snapshot = Array.from({ length: 100 }, (_, index) => `line-${index}\r\n`).join('');
+      f.socket.onmessage({ data: new TextEncoder().encode(snapshot).buffer });
+      await f.drain();
+      if (scrolledBack) f.terminal.scrollLines(-10);
+      const before = f.terminal.buffer.active.viewportY;
+
+      f.message({ t: 'attached', pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 30 } });
+      f.socket.onmessage({ data: new TextEncoder().encode(snapshot).buffer });
+      f.message({ t: 'replay-end' });
+      await f.drain();
+
+      const buffer = f.terminal.buffer.active;
+      if (scrolledBack) {
+        assert.equal(buffer.viewportY, before, 'reading position survives a bridge reconnect');
+        assert.ok(buffer.viewportY < buffer.baseY);
+      } else assert.equal(buffer.viewportY, buffer.baseY, 'a following terminal stays at the newest output');
+    } finally { f.mounted.dispose(); }
+  }
+});
+
+test('snapshot replacement keeps a manual scroll offset when a bounded tail advances', async () => {
+  const f = fixture({ history: { lines: 1000, sent: 100, truncated: true } });
+  try {
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    const snapshot = (first) => Array.from({ length: 100 }, (_, index) => `line-${first + index}\r\n`).join('');
+    f.socket.onmessage({ data: new TextEncoder().encode(snapshot(0)).buffer });
+    await f.drain();
+    f.terminal.scrollLines(-10);
+    const before = f.terminal.buffer.active;
+    const distanceFromBottom = before.baseY - before.viewportY;
+
+    f.message({
+      t: 'attached',
+      pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 30 },
+      history: { lines: 1010, sent: 100, truncated: true },
+    });
+    f.socket.onmessage({ data: new TextEncoder().encode(snapshot(10)).buffer });
+    f.message({ t: 'replay-end' });
+    await f.drain();
+
+    const buffer = f.terminal.buffer.active;
+    assert.equal(buffer.baseY - buffer.viewportY, distanceFromBottom);
+    assert.ok(buffer.viewportY < buffer.baseY, 'new output does not force a reader back to the bottom');
+  } finally { f.mounted.dispose(); }
+});
+
 test('healthy output chunks do not rewrite live status but recover after an error', async () => {
   const f = fixture();
   try {
@@ -481,6 +562,41 @@ test('earlier output is loaded only after first paint and preserves queued input
     second.onmessage({ data: JSON.stringify({ t: 'replay-end' }) });
     await f.drain();
     assert.ok(second.sent.some((item) => item instanceof Uint8Array));
+  } finally { f.mounted.dispose(); }
+});
+
+test('a later reconnect preserves scrollback after full history was loaded', async () => {
+  const f = fixture({ history: { lines: 900, sent: 100, truncated: true } });
+  try {
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    f.mounted.element.querySelector('.term-history').dispatch('click');
+    const full = f.mounted.socket;
+    full.onopen();
+    const pane = { id: 'pane', primary: 'viewer', cols: 80, rows: 30 };
+    const snapshot = Array.from({ length: 100 }, (_, index) => `line-${index}\r\n`).join('');
+    full.onmessage({ data: JSON.stringify({ t: 'attached', pane, history: { lines: 100, sent: 100, truncated: false } }) });
+    full.onmessage({ data: new TextEncoder().encode(snapshot).buffer });
+    full.onmessage({ data: JSON.stringify({ t: 'replay-end' }) });
+    await f.drain();
+    f.terminal.scrollLines(-10);
+    const distanceFromBottom = f.terminal.buffer.active.baseY - f.terminal.buffer.active.viewportY;
+
+    full.close();
+    full.onclose();
+    const retry = [...f.timerDelays].find(([, delay]) => delay === 250)?.[0];
+    assert.ok(retry, 'automatic reconnect is scheduled');
+    f.timers.get(retry)();
+    const reconnected = f.mounted.socket;
+    assert.notEqual(reconnected, full);
+    assert.match(reconnected.url, /history=full/);
+    reconnected.onopen();
+    reconnected.onmessage({ data: JSON.stringify({ t: 'attached', pane, history: { lines: 100, sent: 100, truncated: false } }) });
+    reconnected.onmessage({ data: new TextEncoder().encode(snapshot).buffer });
+    reconnected.onmessage({ data: JSON.stringify({ t: 'replay-end' }) });
+    await f.drain();
+    const buffer = f.terminal.buffer.active;
+    assert.equal(buffer.baseY - buffer.viewportY, distanceFromBottom);
   } finally { f.mounted.dispose(); }
 });
 

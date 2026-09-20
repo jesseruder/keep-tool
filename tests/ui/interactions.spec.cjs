@@ -69,6 +69,28 @@ test('rapid switching routes typing to the last clicked session during updates',
     expect(fixture.events.slice(before).filter(e => e.event === 'input').every(e => e.pane === `p${id}`)).toBe(true);
   }
 });
+
+test('watcher state-line refreshes do not resize the desktop terminal', async ({ page }) => {
+  await page.locator('#qlist [data-key="running:b"]').click();
+  await selected(page, 'b');
+  fixture.update('b', { stateLine: 'Short watcher state.' });
+  await expect(page.locator('#stage .state-line-text')).toHaveText('Short watcher state.');
+  await page.waitForTimeout(100);
+  const before = await page.locator('#stage').evaluate((stage) => ({
+    brief: stage.querySelector('.summary.state-line').getBoundingClientRect().height,
+    terminal: stage.querySelector('.xterm-host').getBoundingClientRect().height,
+  }));
+
+  const long = Array.from({ length: 80 }, (_, index) => `watcher update ${index}`).join(' ');
+  fixture.update('b', { stateLine: long });
+  await expect(page.locator('#stage .state-line-text')).toHaveText(long);
+  await page.waitForTimeout(100);
+  const after = await page.locator('#stage').evaluate((stage) => ({
+    brief: stage.querySelector('.summary.state-line').getBoundingClientRect().height,
+    terminal: stage.querySelector('.xterm-host').getBoundingClientRect().height,
+  }));
+  expect(after).toEqual(before);
+});
 test('Close disappears before slow response and stays hidden through stale updates', async ({ page }) => {
   fixture.configure({ closeDelay: 1800 });
   await page.locator('#stage [data-close-session]').click();
