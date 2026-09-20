@@ -807,3 +807,19 @@ test('ordinary desktop sessions keep the shared reply composer hidden', async ()
   assert.equal(stage.button.textContent, 'Send');
   assert.equal(stage.input.getAttribute('aria-label'), 'Reply to this session');
 });
+
+test('a resumed session pane replaces the stale pane captured by its attention row', async () => {
+  const { stagePane } = await import('./triage.js');
+  const panes = new Map([
+    ['before-retirement', { id: 'before-retirement', alive: false }],
+    ['reply-resume-1', { id: 'reply-resume-1', alive: true }],
+  ]);
+  const ctx = { paneMap: () => panes };
+  const item = { sessionId: 'session-b', pane: 'before-retirement', kind: 'input' };
+  const session = { id: 'session-b', pane: 'reply-resume-1', state: 'running', exited: false };
+
+  assert.deepEqual(stagePane(ctx, item, session),
+    { id: 'reply-resume-1', pane: panes.get('reply-resume-1') });
+  assert.deepEqual(stagePane(ctx, item, { ...session, pane: 'not-published-yet' }),
+    { id: 'before-retirement', pane: panes.get('before-retirement') }, 'an unavailable session hint falls back to the row');
+});

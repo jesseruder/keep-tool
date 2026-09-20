@@ -825,6 +825,17 @@ export function emptyQueueHTML(state) {
     : '<div class="qempty"><b>Nothing waiting on you</b>Expand Running, Pinned, or Recent to browse sessions, or open Watch for live panes.</div>';
 }
 
+// Attention rows are point-in-time notifications and may keep the pane that
+// existed when the wait began. Resume updates the session row and pane list in
+// one state publication, so the session's current pane wins whenever it exists.
+export function stagePane(ctx, item, session) {
+  const panes = ctx.paneMap();
+  const sessionPane = session?.pane ? panes.get(session.pane) : null;
+  if (sessionPane) return { id: session.pane, pane: sessionPane };
+  const itemPane = item?.pane ? panes.get(item.pane) : null;
+  return { id: itemPane ? item.pane : '', pane: itemPane || null };
+}
+
 function renderStage(ctx, queue, focusItem, running, pinned) {
   const item = ctx.state.focusMode
     ? queue.active.find((candidate) => focusItem && ctx.itemKey(candidate) === ctx.itemKey(focusItem)) || focusItem
@@ -857,7 +868,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   const title = item.title || session?.title || 'untitled session';
   const waitingItem = item.kind !== 'running' && item.kind !== 'pinned' && item.kind !== 'recent';
   const key = ctx.itemKey(item);
-  const pane = item.pane ? ctx.paneMap().get(item.pane) : null;
+  const { id: paneId, pane } = stagePane(ctx, item, session);
   const hasLivePane = Boolean(pane?.alive);
   const deferredSessionDetail = Boolean(!hasLivePane && session?._detailVersion
     && !Object.hasOwn(session, 'lastAssistantFull'));
@@ -865,8 +876,8 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     ? ctx.detail('session', session)
     : { status: 'ready', value: session, error: '' };
   if (deferredSessionDetail && sessionDetail.status === 'idle') void ctx.ensureDetail('session', session);
-  if (stage.dataset.itemKey !== key || stage.dataset.pane !== (item.pane || '')) {
-    ctx.focusDebug?.('stage-replace', { reason: 'selection-or-pane-change', session: item.sessionId || '', pane: item.pane || '', related: stage.dataset.pane || '' });
+  if (stage.dataset.itemKey !== key || stage.dataset.pane !== paneId) {
+    ctx.focusDebug?.('stage-replace', { reason: 'selection-or-pane-change', session: item.sessionId || '', pane: paneId, related: stage.dataset.pane || '' });
     ctx.clearElement(stage);
     // `.stage-body` is a row: the terminal, and beside it the agent log when the
     // stage is showing an agent's work. The aside is part of the skeleton and is
@@ -874,17 +885,17 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     // cannot rebuild the host the terminal is mounted in.
     ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts"><span class="quick-actions"></span>${actionsMenuHTML()}</div></div><div class="brief"></div>${replyComposerHTML(item, session?.kind || pane?.meta?.agent)}<div class="stage-body"><div class="stage-terminal"></div><aside class="stage-agent-log" hidden></aside></div>`);
     stage.dataset.itemKey = key;
-    stage.dataset.pane = item.pane || '';
+    stage.dataset.pane = paneId;
     stage.dataset.focusKey = '';
     installReplyComposer(stage, ctx, item);
   }
   syncReplyComposer(stage, session);
-  const pinLabel = ctx.isPanePinned(item.pane) ? 'Unpin from Watch' : 'Pin to Watch';
+  const pinLabel = ctx.isPanePinned(paneId) ? 'Unpin from Watch' : 'Pin to Watch';
   const closable = hasLivePane && item.sessionId && ['claude', 'codex', 'pi'].includes(pane.meta?.agent);
   const dependencyAcknowledged = ctx.setAsideFor(item)?.kind === 'dependency';
   const dependencyWait = session?.activity?.background?.dependencies?.length
     ? `<button class="btn" data-wait-dependency ${dependencyAcknowledged ? 'disabled' : ''}>${dependencyAcknowledged ? 'Waiting for dependency' : 'Wait for dependency'}</button>` : '';
-  const pendingHandoff = hasPendingHandoff(ctx, item.sessionId, item.pane);
+  const pendingHandoff = hasPendingHandoff(ctx, item.sessionId, paneId);
   // A silent host says nothing about its panes, whether this one is missing from
   // the list or was carried over from an older one. Both are labelled: a reused
   // pane is shown but named as unconfirmed, and a missing pane is unknown rather
@@ -907,7 +918,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   const ownControls = sessionControlsAllowed(session);
   const providerControls = ['claude', 'codex'].includes(session?.kind || pane?.meta?.agent);
   const portable = providerControls && item.sessionId && ownControls ? portableTransferControls(ctx, item.sessionId) : '';
-  const handoff = providerControls && (closable || pendingHandoff) && ownControls ? handoffControls(ctx, item.sessionId, item.pane) : '';
+  const handoff = providerControls && (closable || pendingHandoff) && ownControls ? handoffControls(ctx, item.sessionId, paneId) : '';
   const restart = providerControls && closable && !pendingHandoff && ownControls ? restartControls(ctx, item.sessionId) : '';
   // The reviewer and every other agent are not working sessions: relaying into
   // or out of one would put the agent's own words in a card's session, which is
@@ -921,16 +932,16 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     : waitingItem ? '<button class="btn" data-mark-running title="This session still has background work: list it under Running &amp; waiting until its next message or turn">Mark running</button>' : '';
   ctx.patchHTML(stage.querySelector('.quick-actions'), `${markRunning}${item.sessionId || waitingItem ? '<button class="btn" data-snooze="60">Snooze 1h</button><button class="btn" data-snooze="1440">Snooze 24h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}`);
   const menu = stage.querySelector('.session-actions');
-  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${keepRunning}${renameButtonsHTML(item.sessionId, session?.renamed)}${markControlsHTML(ctx.esc, item.sessionId, session?.mark)}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, item.pane, pane) : ''}`);
-  installActionsMenu(menu, ctx, item.pane);
+  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${paneId ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${keepRunning}${renameButtonsHTML(item.sessionId, session?.renamed)}${markControlsHTML(ctx.esc, item.sessionId, session?.mark)}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, paneId, pane) : ''}`);
+  installActionsMenu(menu, ctx, paneId);
   if (keepRunning) installKeepRunningControl(menu, ctx, session, api.setSessionKeepRunning);
   installRenameControls(menu, ctx, heading, item.sessionId, title, api.renameSession);
   installMarkControls(menu, ctx, item.sessionId, session?.mark, api.markSession);
   installHeadingRename(heading, ctx, item.sessionId, title, api.renameSession);
   if (relay) installRelayControls(menu.querySelector('.relay-controls'), ctx);
   if (portable) installPortableTransferControls(menu.querySelector('.portable-transfer-controls'), ctx);
-  if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, item.sessionId, item.pane);
-  if (restart) installRestartControls(menu.querySelector('.restart-controls'), ctx, item.sessionId, item.pane);
+  if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, item.sessionId, paneId);
+  if (restart) installRestartControls(menu.querySelector('.restart-controls'), ctx, item.sessionId, paneId);
   const briefChanged = ctx.patchHTML(brief, briefHTML(ctx, item, session));
   installGrading(brief, ctx, session);
   // An agent's pane on the stage brings its log with it, in a column beside the
@@ -960,10 +971,10 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   }
   const terminalHost = stage.querySelector('.stage-terminal');
   if (hasLivePane) {
-    const focusKey = `${key}:${item.pane}`;
+    const focusKey = `${key}:${paneId}`;
     const autoFocus = ctx.state.focusMode && stage.dataset.focusKey !== focusKey && !editing && !ctx.state.pendingFocus;
-    const focus = (ctx.state.focusPane === item.pane || autoFocus) && !editing;
-    ctx.mount(terminalHost, item.pane, { slot: 'triage', focus });
+    const focus = (ctx.state.focusPane === paneId || autoFocus) && !editing;
+    ctx.mount(terminalHost, paneId, { slot: 'triage', focus });
     if (focus) ctx.state.focusPane = null;
     if (autoFocus) {
       ctx.focusTerminal();
@@ -999,7 +1010,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     brief.querySelector('[data-continue]')?.addEventListener('click', () => sendReply(ctx, item, 'continue'));
     brief.querySelector('[data-leave]')?.addEventListener('click', () => dismiss());
   }
-  const pin = () => ctx.pinPane(item.pane, title);
+  const pin = () => ctx.pinPane(paneId, title);
   const dismiss = () => ctx.dismiss(item);
   stage.querySelector('[data-pin]').onclick = pin;
   const reopenButton = stage.querySelector('[data-reopen]');
@@ -1009,13 +1020,13 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     try {
       await ctx.reopenSession({
         sessionId: item.sessionId, taskId: !item.sessionId ? item.taskId : undefined,
-        agent: session?.kind, title, stalePane: item.pane || undefined, project: item.project || session?.project,
+        agent: session?.kind, title, stalePane: paneId || undefined, project: item.project || session?.project,
       });
     } finally { reopenButton.disabled = false; }
   };
   const dismissButton = stage.querySelector('[data-dismiss]');
   const closeButton = stage.querySelector('[data-close-session]');
-  if (closeButton) closeButton.onclick = () => closeSession(ctx, item.sessionId, item.pane, closeButton);
+  if (closeButton) closeButton.onclick = () => closeSession(ctx, item.sessionId, paneId, closeButton);
   if (dismissButton) dismissButton.onclick = dismiss;
   const dependencyButton = stage.querySelector('[data-wait-dependency]');
   if (dependencyButton) dependencyButton.onclick = () => ctx.setAside(item, 'dependency');
