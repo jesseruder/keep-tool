@@ -6,8 +6,28 @@ import { RENAMED_HINT } from './session-rename.js';
 import { markHTML } from './session-mark.js';
 import { providerIconHTML } from './provider-icon.js';
 const FILTER_KEY = 'keep.console.fleet.filter';
+const PROVIDER_FILTER_KEY = 'keep.console.fleet.provider';
 let filter = '';
+let providerFilter = 'all';
 try { filter = sessionStorage.getItem(FILTER_KEY) || ''; } catch {}
+try {
+  const savedProvider = sessionStorage.getItem(PROVIDER_FILTER_KEY);
+  if (['claude', 'codex'].includes(savedProvider)) providerFilter = savedProvider;
+} catch {}
+
+const providerLabel = (provider) => ({ claude: 'Claude Code', codex: 'Codex' }[provider] || 'All');
+
+export function filterFleetRows(ctx, rows, text = filter, provider = providerFilter) {
+  const needle = text.trim().toLowerCase();
+  return rows.filter((row) => {
+    if (provider !== 'all' && row.kind !== provider) return false;
+    if (!needle) return true;
+    const project = ctx.projectOf(row.project);
+    return [row.title, row.id, row.taskId, project.name, project.key, project.path, row.branch, row.accountLabel, row.accountId,
+      ...numHaystack(row.num)]
+      .some((value) => String(value || '').toLowerCase().includes(needle));
+  });
+}
 
 // A numbered session is listed as "#12" with the uuid in the badge tooltip; rows
 // with no session of their own (shells, exited panes) keep the plain id.
@@ -68,14 +88,7 @@ export function renderFleet(ctx) {
     });
   }
 
-  const needle = filter.trim().toLowerCase();
-  const visible = rows.filter((row) => {
-    if (!needle) return true;
-    const project = ctx.projectOf(row.project);
-    return [row.title, row.id, row.taskId, project.name, project.key, project.path, row.branch, row.accountLabel, row.accountId,
-      ...numHaystack(row.num)]
-      .some((value) => String(value || '').toLowerCase().includes(needle));
-  });
+  const visible = filterFleetRows(ctx, rows);
   const groups = new Map();
   for (const row of visible) {
     const project = ctx.projectOf(row.project);
@@ -87,19 +100,26 @@ export function renderFleet(ctx) {
     const waiting = group.rows.filter((row) => row.waiting).length;
     const sessions = group.rows.filter((row) => row.session).length;
     return `<tr class="grp"><td colspan="9">${ctx.projectHTML(group.project.path, true)} <span class="group-meta">${sessions} session${sessions === 1 ? '' : 's'}${waiting ? ` · ${waiting} waiting` : ''}</span></td></tr>${group.rows.map((row) => fleetRowHTML(ctx, row, panes)).join('')}`;
-  }).join('')}</tbody></table>` : '<div class="qempty"><b>No fleet rows match</b>Try another title, card, project, or branch.</div>';
+  }).join('')}</tbody></table>` : `<div class="qempty"><b>No ${providerFilter === 'all' ? '' : `${providerLabel(providerFilter)} `}fleet rows match</b>Try another search or choose another provider.</div>`;
 
   const root = document.querySelector('#fleet');
   if (!root.querySelector('.fleetbar')) {
-    root.innerHTML = `<div class="fleetbar"><input type="search" aria-label="Filter fleet" placeholder="Filter title, session, card, project, or branch" value="${ctx.esc(filter)}"><span></span><span class="fleet-shadow"></span></div><div class="fleet-results"></div>`;
+    root.innerHTML = `<div class="fleetbar"><input type="search" aria-label="Filter fleet" placeholder="Filter title, session, card, project, or branch" value="${ctx.esc(filter)}"><select aria-label="Filter fleet by provider"><option value="all">All</option><option value="claude">Claude Code</option><option value="codex">Codex</option></select><span class="fleet-count"></span><span class="fleet-shadow"></span></div><div class="fleet-results"></div>`;
     const input = root.querySelector('.fleetbar input');
+    const select = root.querySelector('.fleetbar select');
+    select.value = providerFilter;
     input.addEventListener('input', () => {
       filter = input.value;
       try { sessionStorage.setItem(FILTER_KEY, filter); } catch {}
       renderFleet(ctx);
     });
+    select.addEventListener('change', () => {
+      providerFilter = ['claude', 'codex'].includes(select.value) ? select.value : 'all';
+      try { sessionStorage.setItem(PROVIDER_FILTER_KEY, providerFilter); } catch {}
+      renderFleet(ctx);
+    });
   }
-  root.querySelector('.fleetbar span').textContent = `${visible.length} of ${rows.length}`;
+  root.querySelector('.fleet-count').textContent = `${visible.length} of ${rows.length}`;
   // Graduation progress, so Owner can see it without `keep decisions stats`.
   ctx.patchHTML(root.querySelector('.fleet-shadow'), shadowSummaryHTML(ctx.data.shadowDecisions, ctx.esc));
   const results = root.querySelector('.fleet-results');
