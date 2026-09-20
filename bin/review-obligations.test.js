@@ -94,7 +94,11 @@ test('a verdict nobody ever records is abandoned rather than blocking forever', 
   const stuck = pending({ state: 'awaiting-verdict', stateAt: new Date(now - 8 * HOUR).toISOString() });
   const decision = obligations.decide(stuck, { job: { status: 'completed' }, now });
   assert.equal(decision.state, 'abandoned');
-  assert.match(decision.note, /finished 8h ago and no verdict was ever recorded/);
+  // Not "no verdict was ever recorded": one may be on the card for this very job,
+  // written before the obligation was opened. What Keep can say is that it never
+  // matched one to this obligation.
+  assert.doesNotMatch(decision.note, /no verdict was ever recorded/);
+  assert.match(decision.note, /finished 8h ago and Keep never matched a verdict to it/);
 });
 
 test('a review that came back settles the obligation whatever it found', () => {
@@ -130,8 +134,8 @@ test('a review that came back settles the obligation whatever it found', () => {
 test('a dead, stalled, failed or endless job fails the obligation rather than passing it', () => {
   const now = Date.now();
   const cases = [
-    [{ job: { status: 'failed' } }, 'failed', /ended failed without a verdict/],
-    [{ job: { status: 'cancelled' } }, 'failed', /ended cancelled/],
+    [{ job: { status: 'failed' } }, 'failed', /^Codex job job-42 ended failed$/],
+    [{ job: { status: 'cancelled' } }, 'failed', /^Codex job job-42 ended cancelled$/],
     [{ job: { status: 'running' }, live: { state: 'dead', reason: 'process is gone' } }, 'failed', /is dead \(process is gone\)/],
     [{ job: { status: 'running' }, live: { state: 'stalled', idleMs: 45 * 60e3 } }, 'failed', /idle for 45 minutes/],
   ];
@@ -148,7 +152,8 @@ test('a dead, stalled, failed or endless job fails the obligation rather than pa
   // …until it has been running for longer than any review takes.
   const endless = obligations.decide(pending({ at: new Date(now - 8 * HOUR).toISOString() }), { job: { status: 'running' }, now });
   assert.equal(endless.state, 'abandoned');
-  assert.match(endless.note, /running for 8h/);
+  assert.match(endless.note, /^Codex job job-42 has been running for 8h$/,
+    'the status of the job is an observation; "with no verdict" was an inference about the card');
 });
 
 test('a terminal obligation is never reopened by the sweep', () => {
@@ -878,5 +883,56 @@ test('a record with no usable id is reported, not quietly dropped', () => {
     });
     assert.ok(result.errors.some((error) => /1 pending review record\(s\) have no usable id/.test(error)),
       'the next write drops it for good, so the operator hears about it first');
+  } finally { box.cleanup(); }
+});
+
+// ---------- what round seven found ----------
+
+test('the reason a notice carries is an observation, never an inference about the card', () => {
+  const now = Date.now();
+  // The note is interpolated into the check-in verbatim, so it answers to the same
+  // standard as the sentence around it.
+  const reasons = [
+    obligations.decide(pending({ state: 'awaiting-verdict', stateAt: new Date(now - 8 * HOUR).toISOString() }),
+      { job: { status: 'completed' }, now }).note,
+    obligations.decide(pending(), { job: { status: 'failed' }, now }).note,
+    obligations.decide(pending({ at: new Date(now - 8 * HOUR).toISOString() }), { job: { status: 'running' }, now }).note,
+    obligations.decide(pending({ at: new Date(now - 30 * 60e3).toISOString(), misses: 2 }), { job: null, now }).note,
+  ];
+  for (const reason of reasons) {
+    assert.doesNotMatch(reason, /no verdict was ever recorded|without a verdict|with no verdict/, reason);
+  }
+  // And the check-in built from one carries it unchanged.
+  const record = pending({ state: 'failed' });
+  assert.match(obligations.checkin(record, { state: 'failed', note: reasons[1] }).message,
+    /Keep stopped waiting for the review recorded here for .*: Codex job job-42 ended failed\./);
+});
+
+test('the dropped-record diagnostics say which kind of record they counted', () => {
+  const box = fixture();
+  try {
+    fs.mkdirSync(obligations.obligationsDir(box.root), { recursive: true });
+    fs.writeFileSync(obligations.cardFile('a-card', box.root), JSON.stringify([
+      pending({ id: 'obl-ok' }),
+      { ...pending(), id: 42 },
+      { ...pending(), state: 'invented' },
+      null,
+    ]));
+    const stats = {};
+    assert.deepEqual(obligations.readRecords('a-card', box.root, stats).map((r) => r.id), ['obl-ok']);
+    // A record with a good id and an unknown state was never an obligation Keep could
+    // act on; one with a bad id is an obligation it cannot settle or clear. Counting
+    // them together made the message say the wrong thing about half of them.
+    assert.equal(stats.dropped, 1);
+    assert.equal(stats.unrecognized, 2);
+
+    const result = obligations.settle({
+      root: box.root, withLock: nolock, cards: ['a-card'],
+      resolveJob: () => ({ status: 'running' }),
+      readReviews: () => [],
+      checkinTask: () => {},
+    });
+    assert.ok(result.errors.some((error) => /1 pending review record\(s\) have no usable id/.test(error)));
+    assert.ok(result.errors.some((error) => /2 entr\(ies\) .* are not records Keep recognises/.test(error)));
   } finally { box.cleanup(); }
 });

@@ -72,11 +72,16 @@ function readRecords(id, root = keep.ROOT, stats = null) {
   // Normalised, not trusted. A hand-edited record with no `commits` used to throw deep
   // inside the sweep — after the state had been decided — and take every later card on
   // that tick with it, every tick, for as long as the record sat there.
-  const usable = value.filter((record) => record && typeof record === 'object'
-    && STATES.includes(record.state) && typeof record.id === 'string' && record.id);
-  // Said out loud: a record Keep cannot identify is one it cannot settle or clear, and
-  // the next write drops it for good. The caller decides what to do about that.
-  if (stats && value.length !== usable.length) stats.dropped = value.length - usable.length;
+  const shaped = value.filter((record) => record && typeof record === 'object' && STATES.includes(record.state));
+  const usable = shaped.filter((record) => typeof record.id === 'string' && record.id);
+  // Said out loud, and counted apart: a record Keep cannot identify is one it cannot
+  // settle or clear, and the next write drops it for good — while one whose state it
+  // does not recognise was never an obligation it could act on. The caller decides what
+  // to do about either.
+  if (stats) {
+    if (value.length !== shaped.length) stats.unrecognized = value.length - shaped.length;
+    if (shaped.length !== usable.length) stats.dropped = shaped.length - usable.length;
+  }
   return usable
     .map((record) => ({
       ...record,
@@ -269,7 +274,10 @@ function decide(record, { job, jobUnknown = false, live, discovery = 'ok', revie
   // An obligation whose verdict nobody ever records must still end. Six hours after Keep
   // said the job had finished, the session that was going to read it is not coming back.
   if (record.state === 'awaiting-verdict' && sinceState > MAX_RUNNING_MS) {
-    return stopWaiting(`Codex job ${record.job} finished ${forHumans(sinceState)} ago and no verdict was ever recorded`);
+    // Not "no verdict was ever recorded": one may be on the card already, for this very
+    // job, written before this obligation was opened — citedBy deliberately will not
+    // match it, which is a statement about the obligation and not about the card.
+    return stopWaiting(`Codex job ${record.job} finished ${forHumans(sinceState)} ago and Keep never matched a verdict to it`);
   }
   // What the live sweep says about the process. It decides on its own only when there is
   // no job file to read — the snapshot and the file are read separately, so a job that
@@ -312,13 +320,13 @@ function decide(record, { job, jobUnknown = false, live, discovery = 'ok', revie
       : { state: 'awaiting-verdict', note: 'the job finished; the verdict is not recorded yet' };
   }
   if (FAILED_STATUSES.has(status)) {
-    return { state: 'failed', note: `Codex job ${record.job} ended ${status} without a verdict` };
+    return { state: 'failed', note: `Codex job ${record.job} ended ${status}` };
   }
   // The file says it is still running, and the process is not. Asked after the status,
   // so a completed result always wins over a snapshot taken before it was written.
   if (gone) return failedByLive(record, live);
   if (age > MAX_RUNNING_MS) {
-    return stopWaiting(`Codex job ${record.job} has been running for ${forHumans(age)} with no verdict`);
+    return stopWaiting(`Codex job ${record.job} has been running for ${forHumans(age)}`);
   }
   return touch(0);
 }
@@ -459,6 +467,9 @@ function settle(deps = {}) {
     catch (error) { result.errors.push(`${id}: ${error.message || error}`); return; }
     if (stats.dropped) {
       result.errors.push(`${id}: ${stats.dropped} pending review record(s) have no usable id and were ignored`);
+    }
+    if (stats.unrecognized) {
+      result.errors.push(`${id}: ${stats.unrecognized} entr(ies) in the pending reviews are not records Keep recognises`);
     }
 
     // Check-ins this card still owes: from this pass, or from any earlier one whose
