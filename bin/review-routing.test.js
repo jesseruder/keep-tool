@@ -112,17 +112,15 @@ test('an install with no Codex account says so rather than claiming a fallback',
   } finally { box.cleanup(); }
 });
 
-test('provenance stamps a fallback review and nothing else', () => {
+test('the fallback reason describes the ledger, and is empty when nothing is exhausted', () => {
   const now = Date.now();
   const box = fixture({ fallback: 'opus' });
   try {
-    const available = { root: box.root, now, accounts: accounts('codex-main') };
-    assert.equal(routing.provenance('opus subagent', available), '', 'Codex was available; this reviewer was a choice');
-
-    routing.markExhausted('codex-main', iso(now + HOUR), { root: box.root, now });
-    assert.equal(routing.provenance('opus subagent', available), `fallback (codex exhausted until ${iso(now + HOUR)})`);
-    assert.equal(routing.provenance('codex sol', available), '', 'a Codex review is never the fallback');
-    assert.equal(routing.provenance('claude', available), '', 'only the configured fallback is stamped as one');
+    assert.equal(routing.fallbackReason({ root: box.root, now }), '', 'nothing exhausted, nothing to describe');
+    routing.markExhausted('codex-main', iso(now + 2 * HOUR), { root: box.root, now, withLock: (fn) => fn() });
+    routing.markExhausted('codex-secondary', iso(now + HOUR), { root: box.root, now, withLock: (fn) => fn() });
+    assert.equal(routing.fallbackReason({ root: box.root, now }), `codex exhausted until ${iso(now + HOUR)}`,
+      'the earliest reset is the one the card is waiting on');
   } finally { box.cleanup(); }
 });
 
@@ -185,22 +183,28 @@ test('a fallback review record says it was one, and an ordinary one says nothing
   assert.doesNotMatch(reviews.logLine(ordinary), /reviewer:/);
 });
 
-test('the route stamp is looked up from the ledger when the caller does not pass one', () => {
+test('a fallback stamp is the session asserting it, not the ledger guessing at record time', () => {
   const box = fixture({ fallback: 'opus' });
   const now = Date.now();
+  const reviews = require('./reviews.js');
+  const gitDeps = {
+    topLevel: () => '/repo', resolve: () => ['a'.repeat(40)], subject: () => 's',
+    parents: () => ['b'.repeat(40)], patchId: () => 'p1',
+  };
+  const input = { commits: ['HEAD'], verdict: 'clean', by: 'opus subagent', evidence: 'x'.repeat(120) };
   try {
-    const accountId = routing.codexAccounts(box.root)[0];
-    assert.ok(accountId, 'the test registry has a built-in Codex account');
-    routing.markExhausted(accountId, iso(now + HOUR), { root: box.root, now });
-    const reviews = require('./reviews.js');
-    const gitDeps = {
-      topLevel: () => '/repo', resolve: () => ['a'.repeat(40)], subject: () => 's',
-      parents: () => ['b'.repeat(40)], patchId: () => 'p1',
-    };
-    const record = reviews.buildRecord(
-      { commits: ['HEAD'], verdict: 'clean', by: 'opus subagent', evidence: 'x'.repeat(120) },
-      gitDeps, { root: box.root },
-    );
-    assert.match(record.route, /^fallback \(codex exhausted until /);
+    // Inference read the wrong clock in both directions: a review that ran while Codex
+    // was exhausted lost its stamp if recorded after the reset, and an ordinary review
+    // picked one up if an account happened to be exhausted by the time it was written.
+    const ordinary = reviews.buildRecord(input, gitDeps, { root: box.root });
+    assert.equal('route' in ordinary, false, 'no claim, no stamp');
+
+    const claimed = reviews.buildRecord({ ...input, fallback: true }, gitDeps, { root: box.root });
+    assert.equal(claimed.route, 'fallback', 'the claim stands on its own with an empty ledger');
+
+    routing.markExhausted('codex-main', iso(now + HOUR), { root: box.root, now, withLock: (fn) => fn() });
+    const described = reviews.buildRecord({ ...input, fallback: true }, gitDeps, { root: box.root });
+    assert.match(described.route, /^fallback \(codex exhausted until /);
+    assert.match(reviews.logLine(described), /reviewer: fallback \(codex exhausted until /);
   } finally { box.cleanup(); }
 });

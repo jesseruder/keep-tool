@@ -514,6 +514,10 @@ async function escalateBudgetDeferral(task, reason, today, opts = {}) {
       outcome = await openFreshCheckSession(task, { ...opts, today, accountId: fallbackId });
     } catch (e) {
       process.stderr.write(`keep runs: fallback check session for ${task.id} could not be opened: ${e.message}\n`);
+      // A terminal host that was restarting, or an open already in flight, says nothing
+      // about the fallback account. Latching the streak on it would spend the card's one
+      // escalation on a condition that clears by itself a minute later.
+      if (isTransientStartError(e)) return false;
       outcome = { skipped: 'error', reason: String(e && e.message || e) };
     }
     if (!outcome.skipped) {
@@ -550,6 +554,17 @@ async function escalateBudgetDeferral(task, reason, today, opts = {}) {
 // Every budget deferral goes through here: it records the streak, escalates the one
 // that reached the ceiling, and otherwise writes the ordinary once-a-day notice.
 async function handleBudgetDeferral(task, reason, today, opts = {}) {
+  try { return await budgetDeferral(task, reason, today, opts); }
+  catch (e) {
+    // Bookkeeping, not the open. The caller's own catch marks the card opened for the
+    // day on a non-transient failure, and a card whose deferral note could not be
+    // written has had nothing opened on it at all.
+    process.stderr.write(`keep runs: could not handle the deferred check for ${task.id}: ${e.message}\n`);
+    return { noticed: false };
+  }
+}
+
+async function budgetDeferral(task, reason, today, opts = {}) {
   const { entry, escalate } = (opts.recordBudgetDeferral || recordBudgetDeferral)(task, reason, today);
   if (escalate && opts.quietEscalation !== true) {
     const done = await (opts.escalate || escalateBudgetDeferral)(task, reason, today, opts);
@@ -610,15 +625,26 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
     const refusal = (opts.refusal || freshOpenRefusal)(task, today, accountId);
     if (refusal) return { ...refusal, errors: [] };
   }
-  const opened = await open({
-    taskId: task.id,
-    fresh: true,
-    agent: 'claude',
-    ...(accountId ? { accountId } : {}),
-    ...(CHECK_MODEL ? { model: CHECK_MODEL } : {}),
-    message: checkDeliveryMessage(task, { probe: opts.probe }),
-  }, {});
-  freshOpensThisTick += 1;
+  // Reserved before the await, not counted after it. Opening a session is async, and
+  // two cards whose opens overlap — a scheduler card and a probe escalation, now a
+  // deferral's fallback too — both read the allowance before either spent it, and the
+  // tick launched more panes than the cap allows. A failed open gives its slot back.
+  if (enforce) freshOpensThisTick += 1;
+  let opened;
+  try {
+    opened = await open({
+      taskId: task.id,
+      fresh: true,
+      agent: 'claude',
+      ...(accountId ? { accountId } : {}),
+      ...(CHECK_MODEL ? { model: CHECK_MODEL } : {}),
+      message: checkDeliveryMessage(task, { probe: opts.probe }),
+    }, {});
+  } catch (error) {
+    if (enforce) freshOpensThisTick = Math.max(0, freshOpensThisTick - 1);
+    throw error;
+  }
+  if (!enforce) freshOpensThisTick += 1;
   if (enforce) markDay('opened', task.id, today);
   const delivery = {
     sessionId: (opened && opened.sessionId) || '',

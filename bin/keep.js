@@ -1395,6 +1395,16 @@ function formatAllow(task) {
 // `keep allow <card> land` with no explicit grant: the reviewed-patch path.
 // Everything git-shaped lives in bin/reviews.js; the decision itself is
 // allow.decideLand, which is pure.
+// The obligations that bear on this land. An unreadable store becomes one synthetic
+// blocker rather than an empty list: "I could not tell" must read as "not yet", not as
+// "nothing outstanding".
+function readObligations(taskId, records, commits, api) {
+  try { return api.outstandingFor(api.readRecords(taskId), records, commits); }
+  catch (error) {
+    return [{ id: '(unreadable)', job: '(unknown)', accountId: '', state: String(error.message || error) }];
+  }
+}
+
 function implicitLandVerdict(task, deps = {}) {
   const reviews = deps.reviews || require('./reviews.js');
   const records = deps.records || reviews.readRecords(task.id);
@@ -1409,10 +1419,10 @@ function implicitLandVerdict(task, deps = {}) {
     records,
     commits: context.ok ? context.commits : [],
     // Only the obligations whose commits are actually in this range: a review still
-    // out for work that landed last week is not this land's problem.
-    obligations: context.ok
-      ? obligationApi.outstandingFor(obligationApi.readRecords(task.id), records, context.commits)
-      : [],
+    // out for work that landed last week is not this land's problem. A file that
+    // cannot be read is not an absence of obligations — it refuses the land and says
+    // why, rather than failing open on the one question this gate exists to answer.
+    obligations: context.ok ? readObligations(task.id, records, context.commits, obligationApi) : [],
     optOut,
     worktree: context.ok ? null : context,
   });
@@ -1516,15 +1526,15 @@ function reviewRecordError(fn) {
 }
 
 commands.reviewed = (argv) => {
-  const o = parseArgs(argv, { commit: 'list', verdict: 'str', by: 'str', job: 'str', evidence: 'str', json: 'bool' });
+  const o = parseArgs(argv, { commit: 'list', verdict: 'str', by: 'str', job: 'str', evidence: 'str', fallback: 'bool', json: 'bool' });
   const id = o._[0];
-  const usage = 'usage: keep reviewed <card> --commit <sha|range>… --verdict clean|findings [--by codex|opus|claude|human…] [--job <id>] [--evidence "..."] [-m "..."] [--json]';
+  const usage = 'usage: keep reviewed <card> --commit <sha|range>… --verdict clean|findings [--by codex|opus|claude|human…] [--job <id>] [--evidence "..."] [--fallback] [-m "..."] [--json]';
   if (!id || o._.length > 1 || !o.commit || !o.verdict) die(usage);
   const record = reviewRecordError((reviews) => withLock(() => {
     const task = loadTask(id);
     const built = reviews.buildRecord({
       commits: o.commit, verdict: o.verdict, by: o.by, job: o.job, evidence: o.evidence,
-      message: o.m, session: commandSession(),
+      fallback: o.fallback, message: o.m, session: commandSession(),
     }, reviews.gitDeps(process.cwd()));
     reviews.append(id, built);
     const contribution = recordContribution(task);
@@ -1605,20 +1615,23 @@ commands.reviewing = (argv) => {
   if (o.drop) {
     if (o.job || o.commit) die(usage);
     if (!o.m) die('--drop needs -m "why": an obligation dropped without a reason is a review nobody can tell was skipped');
-    const records = obligations.readRecords(id);
-    const target = records.find((record) => record.id === o.drop || record.job === o.drop);
-    if (!target) die(`${id} has no pending review ${o.drop} — keep reviewing ${id} lists them`);
-    if (!obligations.isOpen(target)) die(`pending review ${target.id} is already ${target.state}`);
-    const next = records.map((record) => (record.id === target.id
-      ? obligations.applied(record, { state: 'abandoned', note: `dropped: ${o.m}` })
-      : record));
-    obligations.writeRecords(id, next);
-    console.log(`${id}: dropped pending review ${target.id} (job ${target.job}) — its commits still have no review record`);
+    // Under the registry lock, because the daemon's sweep is reading and rewriting the
+    // same file every five minutes.
+    translating(() => withLock(() => {
+      const records = obligations.readRecords(id);
+      const target = records.find((record) => record.id === o.drop || record.job === o.drop);
+      if (!target) die(`${id} has no pending review ${o.drop} — keep reviewing ${id} lists them`);
+      if (!obligations.isOpen(target)) die(`pending review ${target.id} is already ${target.state}`);
+      obligations.writeRecords(id, records.map((record) => (record.id === target.id
+        ? obligations.applied(record, { state: 'abandoned', note: `dropped: ${o.m}` })
+        : record)));
+      console.log(`${id}: dropped pending review ${target.id} (job ${target.job}) — its commits still have no review record`);
+    }));
     return;
   }
 
   if (!o.job && !o.commit) {
-    const records = obligations.readRecords(id);
+    const records = translating(() => obligations.readRecords(id));
     if (o.json) return console.log(JSON.stringify({ id, obligations: records }, null, 2));
     if (!records.length) return console.log(`${id}: no pending reviews`);
     for (const record of records) console.log(obligations.summaryLine(record));
@@ -1657,7 +1670,9 @@ commands.reviews = (argv) => {
   loadTask(id);
   const records = require('./reviews.js').readRecords(id);
   const obligations = require('./review-obligations.js');
-  const pending = obligations.readRecords(id).filter(obligations.isOpen);
+  let pending;
+  try { pending = obligations.readRecords(id).filter(obligations.isOpen); }
+  catch (error) { die(error.message || String(error)); }
   if (o.json) return console.log(JSON.stringify({ id, records, pending }, null, 2));
   for (const record of pending) console.log(`pending: ${obligations.summaryLine(record)}`);
   if (!records.length) return console.log(`${id}: no review records — keep reviewed ${id} --commit <sha> --verdict clean`);
@@ -3271,8 +3286,9 @@ function helpText() {
                                                # only Owner grants: --grant/--until are refused inside an
                                                # agent session unless --as-owner is passed with KEEP_OWNER=1
   keep reviewed <card> --commit <sha|range>… --verdict clean|findings
-                       [--by codex|opus|claude|human…] [--job <id>] [--evidence "..."] [-m "..."] [--json]
+                       [--by codex|opus|claude|human…] [--job <id>] [--evidence "..."] [--fallback] [-m "..."] [--json]
                        # record that an independent review saw exactly these patches
+                       # --fallback: this reviewer stood in because the Codex accounts were exhausted
   keep reviewing <card> --job <id> --commit <sha|range>… [--account <codex-id>] [--by "codex sol"] [-m "..."]
                        # a review you launched and have not heard back from; the daemon settles it
                        # from the job, and keep land refuses its commits until a verdict is recorded

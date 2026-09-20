@@ -26,6 +26,10 @@ const STATES = [...OPEN_STATES, ...TERMINAL_STATES];
 // is far longer than the gap between launching a task and its job record appearing,
 // and short enough that a mistyped job id is caught within one session.
 const MISSING_JOB_GRACE_MS = 15 * 60e3;
+// And one look is not a confirmed absence: resolveJob answers null for an unreadable
+// directory or a half-written job file too, so a job has to be missing on three
+// consecutive sweeps before Keep is willing to call the review dead.
+const MISSING_JOB_CONFIRMATIONS = 3;
 // A Codex review that has been running for six hours is not going to answer. The
 // obligation is abandoned rather than failed: nobody saw it die, so the honest
 // statement is that Keep stopped waiting.
@@ -45,24 +49,54 @@ function fail(message) { throw new ObligationError(message); }
 function obligationsDir(root = keep.ROOT) { return path.join(root, '.keep', 'review-obligations'); }
 function cardFile(id, root = keep.ROOT) { return path.join(obligationsDir(root), `${id}.json`); }
 
+// A card with no obligations file has no obligations; a card whose file cannot be read
+// is a card Keep does not know about, and that is not the same thing. Swallowing the
+// second would fail open at exactly the moment it matters — an unreadable file would let
+// a land through as if no review were outstanding — and an append built on `[]` would
+// overwrite the history it could not read.
 function readRecords(id, root = keep.ROOT) {
-  try {
-    const value = JSON.parse(fs.readFileSync(cardFile(id, root), 'utf8'));
-    return Array.isArray(value) ? value.filter((record) => record && typeof record === 'object' && STATES.includes(record.state)) : [];
-  } catch { return []; }
+  let text;
+  try { text = fs.readFileSync(cardFile(id, root), 'utf8'); }
+  catch (error) {
+    if (error && error.code === 'ENOENT') return [];
+    fail(`cannot read the pending reviews for ${id}: ${error.message || error}`);
+  }
+  let value;
+  try { value = JSON.parse(text); }
+  catch (error) { fail(`the pending reviews for ${id} are not readable JSON: ${error.message || error}`); }
+  if (!Array.isArray(value)) fail(`the pending reviews for ${id} are not a list`);
+  return value.filter((record) => record && typeof record === 'object' && STATES.includes(record.state));
 }
 
-function writeRecords(id, records, root = keep.ROOT) {
+// Terminal records are history, and history does not need to be re-parsed by the daemon
+// every five minutes forever. A card whose last record ages out loses its file entirely.
+const HISTORY_RETENTION_MS = 30 * 24 * 3600e3;
+
+function keptRecords(records, now = Date.now()) {
+  return records.filter((record) => {
+    if (isOpen(record)) return true;
+    const at = timeMs(record.stateAt || record.at);
+    return at === null || now - at <= HISTORY_RETENTION_MS;
+  });
+}
+
+function writeRecords(id, records, root = keep.ROOT, now = Date.now()) {
   const file = cardFile(id, root);
+  const kept = keptRecords(records, now);
+  if (!kept.length) {
+    try { fs.unlinkSync(file); } catch (error) { if (!error || error.code !== 'ENOENT') throw error; }
+    return kept;
+  }
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   try {
-    fs.writeFileSync(tmp, JSON.stringify(records, null, 2) + '\n');
+    fs.writeFileSync(tmp, JSON.stringify(kept, null, 2) + '\n');
     fs.renameSync(tmp, file);
   } catch (error) {
     try { fs.unlinkSync(tmp); } catch {}
     throw error;
   }
+  return kept;
 }
 
 function cards(root = keep.ROOT) {
@@ -130,10 +164,10 @@ function samePatch(a, b) {
 // Outstanding *for this land*: an obligation whose verdict has not been recorded and
 // whose commits are part of what would land. Scoped by patch id, the same identity
 // `keep reviewed` uses, so a rebase does not lose track of it.
-function outstandingFor(records, reviewRecords, commits) {
+function outstandingFor(records, reviewRecords, commits, now = Date.now()) {
   const landing = commits || [];
   return (records || []).filter(isOpen)
-    .filter((record) => !citedBy(record, reviewRecords))
+    .filter((record) => !citedBy(record, reviewRecords) && !satisfiedByCoverage(record, reviewRecords, now))
     .filter((record) => record.commits.some((commit) => landing.some((other) => samePatch(commit, other))));
 }
 
@@ -150,14 +184,49 @@ const FAILED_STATUSES = new Set(['failed', 'error', 'cancelled', 'canceled', 'ab
 // `job` is reviews.resolveJob's answer (null when no job file was found) and `live` is
 // the codexjobs row for it (null when the sweep does not know it). Returns null to
 // leave the obligation where it is.
-function decide(record, { job, live, reviewRecords, now = Date.now() } = {}) {
+// An independent review of exactly these patches, recorded after this obligation was
+// opened and carrying a verified job of its own, answers the question this obligation
+// asks even though it is not the job it named. Without this, a review re-run under a new
+// job id leaves the first obligation blocking a card that has in fact been reviewed.
+function satisfiedByCoverage(record, reviewRecords, now) {
+  const opened = timeMs(record.at) ?? now;
+  return (reviewRecords || []).some((review) => {
+    if (!review || !String(review.jobAccountId || '').trim()) return false;
+    if (review.job && review.job === record.job) return false; // citedBy already covers it
+    if ((timeMs(review.at) ?? 0) < opened) return false;
+    return record.commits.every((commit) => (review.commits || []).some((other) => samePatch(commit, other)));
+  });
+}
+
+function decide(record, { job, jobUnknown = false, live, discovery = 'ok', reviewRecords, now = Date.now() } = {}) {
   if (!isOpen(record)) return null;
   const age = now - (timeMs(record.at) ?? now);
+  const sinceState = now - (timeMs(record.stateAt || record.at) ?? now);
   if (citedBy(record, reviewRecords)) {
     return { state: 'satisfied', note: 'the verdict was recorded on the card' };
   }
+  if (satisfiedByCoverage(record, reviewRecords, now)) {
+    return { state: 'satisfied', note: 'an independent review of the same patches was recorded under another job' };
+  }
+  // An obligation whose verdict nobody ever records must still end. Six hours after Keep
+  // said the job had finished, the session that was going to read it is not coming back.
+  const stopWaiting = (why) => ({ state: 'abandoned', note: why });
+  if (record.state === 'awaiting-verdict' && sinceState > MAX_RUNNING_MS) {
+    return stopWaiting(`Codex job ${record.job} finished ${Math.round(sinceState / 3600e3)}h ago and no verdict was ever recorded`);
+  }
+  // "I could not look" is not evidence that the job is gone. A companion whose discovery
+  // is partial or unknown, or a jobs directory that would not read this time, leaves the
+  // obligation exactly where it is — only a confirmed absence, seen repeatedly, fails it.
+  if (jobUnknown || (!job && discovery !== 'ok')) {
+    return age > MAX_RUNNING_MS
+      ? stopWaiting(`Keep has not been able to see Codex job ${record.job} for ${Math.round(age / 3600e3)}h`)
+      : null;
+  }
   if (!job) {
-    if (age < MISSING_JOB_GRACE_MS) return null;
+    const misses = Number(record.misses) || 0;
+    if (age < MISSING_JOB_GRACE_MS || misses + 1 < MISSING_JOB_CONFIRMATIONS) {
+      return { state: record.state, misses: misses + 1, note: record.note || '' };
+    }
     return {
       state: 'failed',
       note: `Keep cannot find Codex job ${record.job}${record.accountId ? ` in account ${record.accountId}` : ''}`,
@@ -177,13 +246,26 @@ function decide(record, { job, live, reviewRecords, now = Date.now() } = {}) {
     return { state: 'failed', note: `Codex job ${record.job} has been idle for ${Math.round(Number(live.idleMs) / 60e3)} minutes with no output` };
   }
   if (age > MAX_RUNNING_MS) {
-    return { state: 'abandoned', note: `Codex job ${record.job} has been running for ${Math.round(age / 3600e3)}h with no verdict` };
+    return stopWaiting(`Codex job ${record.job} has been running for ${Math.round(age / 3600e3)}h with no verdict`);
   }
-  return null;
+  // A job that answered again clears the misses a transient read failure counted.
+  return Number(record.misses) ? { state: record.state, misses: 0, note: record.note || '' } : null;
 }
 
+// A decision that does not change the state is a touch — a miss counted, or one
+// cleared. It keeps `stateAt`, so the abandonment clocks measure what they are named
+// after rather than restarting on every sweep.
 function applied(record, decision, now = Date.now()) {
-  return { ...record, state: decision.state, stateAt: new Date(now).toISOString(), note: String(decision.note || '').slice(0, NOTE_LIMIT) };
+  const moved = decision.state !== record.state;
+  const next = {
+    ...record,
+    state: decision.state,
+    stateAt: moved ? new Date(now).toISOString() : (record.stateAt || new Date(now).toISOString()),
+    note: String(decision.note || '').slice(0, NOTE_LIMIT),
+  };
+  if (decision.misses) next.misses = decision.misses;
+  else delete next.misses;
+  return next;
 }
 
 // ---------- what a settled obligation says on the card ----------
@@ -225,60 +307,111 @@ function checkin(record, decision) {
 // Reads every card's obligations, asks the job what happened, writes the transition and
 // its check-in. Everything that touches the outside world arrives through `deps`, so
 // the sweep is testable without a Codex install.
+// What a record looked like when this pass read it. A write only replaces a record that
+// still looks exactly like this: a `keep reviewing --drop` that landed in the window owns
+// its record, and must not be overwritten by a state it has already moved past.
+function basisOf(record) {
+  return { state: record.state, stateAt: record.stateAt || '', misses: Number(record.misses) || 0 };
+}
+
+function sameBasis(record, basis) {
+  if (!basis) return false;
+  const now = basisOf(record);
+  return now.state === basis.state && now.stateAt === basis.stateAt && now.misses === basis.misses;
+}
+
 function settle(deps = {}) {
   const root = deps.root || keep.ROOT;
   const now = deps.now || Date.now();
   const resolveJob = deps.resolveJob || ((id) => require('./reviews.js').resolveJob(id, { root }));
   const readReviews = deps.readReviews || ((id) => require('./reviews.js').readRecords(id, root));
   const checkinTask = deps.checkinTask || keep.checkinTask;
+  const withLock = deps.withLock || keep.withLock;
   const liveJobs = deps.liveJobs || new Map();
+  const discovery = deps.discovery || 'ok';
   const result = { considered: 0, settled: [], errors: [] };
   for (const id of deps.cards || cards(root)) {
-    const records = readRecords(id, root);
+    let records;
+    try { records = readRecords(id, root); }
+    catch (error) { result.errors.push(`${id}: ${error.message || error}`); continue; }
     if (!records.some(isOpen)) continue;
-    const reviewRecords = readReviews(id);
-    const settled = new Map();
+    let reviewRecords = [];
+    try { reviewRecords = readReviews(id); }
+    catch (error) { result.errors.push(`${id}: could not read the review records: ${error.message || error}`); continue; }
+
+    const settled = new Map();   // record id -> what it becomes
+    const basis = new Map();     // record id -> what it looked like when decided
+    const announce = new Map();  // record id -> the check-in that transition earns
     for (const record of records) {
       if (!isOpen(record)) continue;
       result.considered += 1;
       let job = null;
+      let jobUnknown = false;
       try { job = resolveJob(record.job); }
-      catch (error) { result.errors.push(`${id}: ${error.message || error}`); continue; }
-      const decision = decide(record, { job, live: liveJobs.get(record.job) || null, reviewRecords, now });
+      catch (error) {
+        // The jobs directory would not answer. That is not the job's absence, and it is
+        // not a reason to skip the decisions that do not depend on it either.
+        jobUnknown = true;
+        result.errors.push(`${id}: could not resolve job ${record.job}: ${error.message || error}`);
+      }
+      const decision = decide(record, {
+        job, jobUnknown, discovery, live: liveJobs.get(record.job) || null, reviewRecords, now,
+      });
       if (!decision) continue;
-      const landed = applied(record, decision, now);
-      settled.set(record.id, landed);
-      result.settled.push({ card: id, id: record.id, job: record.job, state: decision.state, note: decision.note });
-      const entry = checkin(landed, decision);
-      if (entry) {
-        try { checkinTask(id, entry); }
-        catch (error) { result.errors.push(`${id}: could not record the ${decision.state} review: ${error.message || error}`); }
+      settled.set(record.id, applied(record, decision, now));
+      basis.set(record.id, basisOf(record));
+      if (decision.state !== record.state) {
+        const entry = checkin(settled.get(record.id), decision);
+        announce.set(record.id, { entry, state: decision.state, note: decision.note, job: record.job });
       }
     }
     if (!settled.size) continue;
-    // Re-read before writing and apply only the records this pass actually settled.
-    // Resolving a job is file I/O, and a `keep reviewing` run in that window would
-    // otherwise be overwritten by the copy this sweep started from.
+
+    // Persist before announcing, and under the registry lock. The check-in is a git
+    // commit: a transition announced but not written would be announced again every
+    // five minutes, and one written but not announced is still visible in keep reviews.
+    const written = new Set();
     try {
-      writeRecords(id, readRecords(id, root).map((record) => settled.get(record.id) || record), root);
-    } catch (error) { result.errors.push(`${id}: could not write obligations: ${error.message || error}`); }
+      withLock(() => {
+        const fresh = readRecords(id, root);
+        writeRecords(id, fresh.map((record) => {
+          const next = settled.get(record.id);
+          if (!next || !sameBasis(record, basis.get(record.id))) return record;
+          written.add(record.id);
+          return next;
+        }), root, now);
+      });
+    } catch (error) {
+      result.errors.push(`${id}: could not write obligations: ${error.message || error}`);
+      continue;
+    }
+    for (const [settledId, item] of announce) {
+      if (!written.has(settledId)) continue;
+      result.settled.push({ card: id, id: settledId, job: item.job, state: item.state, note: item.note });
+      if (!item.entry) continue;
+      try { checkinTask(id, item.entry); }
+      catch (error) { result.errors.push(`${id}: could not record the ${item.state} review: ${error.message || error}`); }
+    }
   }
   return result;
 }
 
 // `keep reviewed` closes the obligation the verdict answers, so the daemon never has to
 // announce a review that a session already recorded by hand.
-function settleFromRecord(id, review, root = keep.ROOT, now = Date.now()) {
-  const records = readRecords(id, root);
-  if (!records.some(isOpen)) return [];
+function settleFromRecord(id, review, root = keep.ROOT, now = Date.now(), deps = {}) {
+  const withLock = deps.withLock || keep.withLock;
   const closed = [];
-  const next = records.map((record) => {
-    if (!isOpen(record) || !citedBy(record, [review])) return record;
-    const landed = applied(record, { state: 'satisfied', note: `verdict ${review.verdict} recorded as ${review.id}` }, now);
-    closed.push(landed);
-    return landed;
+  withLock(() => {
+    const records = readRecords(id, root);
+    if (!records.some(isOpen)) return;
+    const next = records.map((record) => {
+      if (!isOpen(record) || !citedBy(record, [review])) return record;
+      const landed = applied(record, { state: 'satisfied', note: `verdict ${review.verdict} recorded as ${review.id}` }, now);
+      closed.push(landed);
+      return landed;
+    });
+    if (closed.length) writeRecords(id, next, root, now);
   });
-  if (closed.length) writeRecords(id, next, root);
   return closed;
 }
 
@@ -306,11 +439,18 @@ function startScheduler({ onChange = () => {}, companionSnapshot, health = requi
     running = true;
     try {
       let liveJobs = new Map();
+      // Unknown discovery is what stops the sweep failing a live obligation because the
+      // companion could not be read this time; it is not a reason to skip the sweep,
+      // which still settles verdicts that were recorded and reviews nobody answered.
+      let discovery = 'unknown';
       if (companionSnapshot) {
-        try { liveJobs = liveJobMap(await companionSnapshot()); }
-        catch (error) { write(`keep review-obligations: companion snapshot unavailable: ${error.message}\n`); }
+        try {
+          const report = await companionSnapshot();
+          liveJobs = liveJobMap(report);
+          discovery = report && report.discovery ? String(report.discovery) : 'unknown';
+        } catch (error) { write(`keep review-obligations: companion snapshot unavailable: ${error.message}\n`); }
       }
-      const result = run({ liveJobs });
+      const result = run({ liveJobs, discovery });
       if (result.settled.length) {
         for (const entry of result.settled) {
           write(`keep review-obligations: ${entry.card} review ${entry.id} → ${entry.state} (${entry.note})\n`);
@@ -351,6 +491,7 @@ module.exports = {
   MISSING_JOB_GRACE_MS, MAX_RUNNING_MS, STALL_MS,
   obligationsDir, cardFile, readRecords, writeRecords, cards, recordId,
   open, append, isOpen, citedBy, samePatch, outstandingFor,
-  decide, applied, checkin, settle, settleFromRecord, summaryLine,
+  decide, applied, checkin, settle, settleFromRecord, summaryLine, satisfiedByCoverage,
+  keptRecords, basisOf, sameBasis, HISTORY_RETENTION_MS, MISSING_JOB_CONFIRMATIONS,
   TICK_MS, liveJobMap, startScheduler,
 };

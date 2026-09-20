@@ -188,7 +188,7 @@ function startSchedulers(ctx) {
     TURN_INDEX_BUDGET_BYTES, TURN_INDEX_BUDGET_MS, TURN_INDEX_PRUNE_LIMIT,
     WATCHER_CONCURRENCY, WATCHER_TURNS_PER_TICK, WATCHER_WINDOW_MS,
     addHostSessionState, agentProcessRows, broadcast, buildState, cardUsage, closeEphemeralPane,
-    closeIdleSession, dashboardBuild, dashboardBuilder, deliverCheckToThread, deliverUnblockToThread,
+    closeIdleSession, companionSnapshot, dashboardBuild, dashboardBuilder, deliverCheckToThread, deliverUnblockToThread,
     deps, discord, driftWakeFromVerdict, envNumber, features, forceRestartSession, fs, health, hostRequest,
     ideas, keep, keepConsole, landed, limitresume, listHostPanes, liveSessionTick,
     liveTurnIndexSessions, loadCurrentSession, openCheckSession, openSession, path,

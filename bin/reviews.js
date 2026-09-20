@@ -257,12 +257,22 @@ function buildRecord(input, deps, options = {}) {
   const commits = resolveCommits(input.commits, deps);
   // Why this reviewer, when it was not the usual one. A fallback review is a review;
   // what a later reader needs is to be able to tell that it was one without
-  // reconstructing the day's usage limits. Empty for every ordinary review.
+  // reconstructing the day's usage limits.
+  //
+  // The caller asserts it — `keep reviewed --fallback` — rather than it being inferred
+  // from the ledger at record time. Inference reads the wrong clock: a review that ran
+  // while Codex was exhausted loses the stamp if it is recorded after the reset, and an
+  // ordinary review picks one up if an account happens to be exhausted by the time it is
+  // written. The ledger is still consulted, but only to say what the fallback was for.
   let route = '';
-  try {
-    route = options.route !== undefined ? String(options.route || '')
-      : require('./review-routing.js').provenance(by, { root: options.root });
-  } catch { route = ''; }
+  if (options.route !== undefined) route = String(options.route || '');
+  else if (input.fallback) {
+    route = 'fallback';
+    try {
+      const reason = require('./review-routing.js').fallbackReason({ root: options.root });
+      if (reason) route = `fallback (${reason})`;
+    } catch { /* the ledger is colour, not the claim */ }
+  }
   return {
     id: recordId(now),
     at: new Date(now).toISOString(),

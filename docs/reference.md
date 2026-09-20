@@ -208,7 +208,7 @@ keep deps [<card>]
 keep done <id> [-m note] [--next "text"] [--commit <sha>]...
 keep allow <id> [<action> [--amount n]] [--quiet] [--json]
 keep allow <id> --grant a,b [--until when] | --revoke a,b | --clear [--as-owner]
-keep reviewed <card> --commit <sha|range>... --verdict clean|findings [--by who] [--job id] [--evidence "..."] [-m "..."]
+keep reviewed <card> --commit <sha|range>... --verdict clean|findings [--by who] [--job id] [--evidence "..."] [--fallback] [-m "..."]
 keep reviews <card> [--json]
 keep reviewing <card> --job <id> --commit <sha|range>... [--account <codex-id>] [--by who] [-m "..."]
 keep reviewing <card> [--drop <obligation-id> -m "why"] [--json]
@@ -1047,17 +1047,34 @@ keeps warm:
 | what Keep sees | the obligation becomes |
 | --- | --- |
 | a review record on the card cites this `--job` | `satisfied`, silently — `clean` and `findings` both count, because the question is whether the review came back |
+| a *later* record with a verified `--job` covers every one of its patches | `satisfied` — a review re-run under a new job id has answered the same question |
 | the job finished and no verdict is recorded | `awaiting-verdict`, with one `review pending` check-in naming the `keep codex … result` and `keep reviewed …` commands |
 | the job ended failed, cancelled or aborted | `failed`, with one `review failed` check-in |
 | the codexjobs sweep calls the job dead, or stalled for over 20 minutes | `failed` |
-| no job file at all, 15 minutes after the obligation was opened | `failed` |
-| still running after six hours | `abandoned` |
+| no job file, on three consecutive sweeps, 15 minutes after the obligation was opened | `failed` |
+| still running after six hours, or `awaiting-verdict` for six hours | `abandoned` |
+
+"I could not look" is never evidence. `resolveJob` answers null for an unreadable jobs
+directory and a half-written job file as well as for a job that is gone, so a missing job
+has to be missing on three consecutive sweeps before it fails, and a companion whose
+discovery is `partial` or `unknown` — or a jobs directory that throws — leaves the
+obligation exactly where it is. Only the six-hour ceiling applies in that state, so an
+unreadable companion cannot block a card forever either.
 
 Two properties hold. **Nothing here ever writes a verdict**: a job that died fails the
 obligation so the review is re-run, and is never mistaken for a clean one. And every
 obligation reaches a terminal state on its own, so a job that died in the night cannot
 block a card forever — `failed` and `abandoned` stop gating the land, and the commits
 are then refused for the ordinary reason, that they have no review record.
+
+The sweep writes each transition **before** it announces it, under the registry lock,
+re-reading and replacing only records that still look exactly as they did when it
+decided: a check-in is a git commit, so a transition announced but not written would be
+announced every five minutes forever, and a `keep reviewing --drop` that landed in the
+window owns its record. A file that exists but cannot be read is an error, never an empty
+list — failing open there would let a land through as if no review were outstanding, and
+an append would overwrite the history it could not read. Terminal records age out after
+30 days, and a card whose last record ages out loses its file.
 
 While an obligation is `open` or `awaiting-verdict` and covers a commit in
 `origin/<default>..HEAD`, `keep allow <card> land` exits 3 naming the job. That is the
@@ -1102,11 +1119,16 @@ configured") rather than a silent improvisation.
 --exhausted` writes. Entries expire at their own reset time, so an account nobody
 remembered to clear does not stay exhausted for a week.
 
-When a review is recorded by the configured fallback *while* every Codex account is
-exhausted, `keep reviewed` stamps the record `route: fallback (codex exhausted until
-<reset>)` and the card's `code-review` entry carries a `reviewer:` line. A fallback
-record still has to clear the same attestation bar as any other: an `opus`/`claude`
-clean record needs a verified `--job` or 80+ characters of `--evidence`.
+`keep reviewed --fallback` stamps the record `route: fallback (codex exhausted until
+<reset>)` and puts a `reviewer:` line in the card's `code-review` entry. The **session
+asserts it**; it is not inferred from the ledger when the record is written. Inference
+read the wrong clock in both directions: a review that ran while Codex was exhausted lost
+the stamp if it was recorded after the reset, and an ordinary review picked one up if an
+account happened to be exhausted by the time it was written. The ledger is still
+consulted, but only to say what the exhaustion was — with an empty ledger the stamp is
+the bare word `fallback`. A fallback record clears the same attestation bar as any other:
+an `opus`/`claude` clean record needs a verified `--job` or 80+ characters of
+`--evidence`.
 
 Writing grants is Owner's: `keep allow <card> --grant`/`--until` and `keep add
 --allow`/`--until` are refused inside an agent session (`CLAUDE_CODE_SESSION_ID` or a

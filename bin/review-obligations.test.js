@@ -4,13 +4,16 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const test = require('node:test');
 
 const obligations = require('./review-obligations.js');
 const allow = require('./allow.js');
 
 const HOUR = 3600e3;
+const DAY = 24 * HOUR;
 const commit = (sha, patchId, subject = 'a change') => ({ sha, patchId, subject });
+const nolock = (fn) => fn();
 
 function pending(over = {}) {
   return {
@@ -36,14 +39,46 @@ test('an obligation must name a job and the commits it covers', () => {
 
 // ---------- the decision ----------
 
-test('a job Keep cannot find is given a grace period, then fails', () => {
+test('a job Keep cannot find is confirmed absent before it fails, not assumed', () => {
   const now = Date.now();
   const young = pending({ at: new Date(now - 60e3).toISOString() });
-  assert.equal(obligations.decide(young, { job: null, now }), null, 'the companion may not have written it yet');
-  const old = pending({ at: new Date(now - 30 * 60e3).toISOString() });
-  const verdict = obligations.decide(old, { job: null, now });
+  assert.deepEqual(obligations.decide(young, { job: null, now }), { state: 'open', misses: 1, note: '' },
+    'inside the grace the miss is counted, not acted on');
+
+  // Past the grace, one look is still one look: resolveJob answers null for an
+  // unreadable directory or a half-written job file too.
+  let record = pending({ at: new Date(now - 30 * 60e3).toISOString() });
+  for (let n = 1; n < obligations.MISSING_JOB_CONFIRMATIONS; n += 1) {
+    const touch = obligations.decide(record, { job: null, now });
+    assert.equal(touch.state, 'open', `miss ${n} does not fail the review`);
+    assert.equal(touch.misses, n);
+    record = obligations.applied(record, touch, now);
+  }
+  const verdict = obligations.decide(record, { job: null, now });
   assert.equal(verdict.state, 'failed');
   assert.match(verdict.note, /cannot find Codex job job-42 in account codex-secondary/);
+});
+
+test('a job that answers again clears the misses a transient read failure counted', () => {
+  const now = Date.now();
+  const record = pending({ misses: 2, at: new Date(now - 30 * 60e3).toISOString() });
+  const decision = obligations.decide(record, { job: { status: 'running' }, now });
+  assert.deepEqual(decision, { state: 'open', misses: 0, note: '' });
+  assert.equal('misses' in obligations.applied(record, decision, now), false, 'and the field goes away');
+});
+
+test('a companion Keep could not read never fails a live obligation', () => {
+  const now = Date.now();
+  const old = pending({ at: new Date(now - 30 * 60e3).toISOString(), misses: 9 });
+  for (const context of [{ job: null, discovery: 'partial' }, { job: null, discovery: 'unknown' }, { jobUnknown: true }]) {
+    assert.equal(obligations.decide(old, { ...context, now }), null, JSON.stringify(context));
+  }
+  // It does still stop waiting eventually, so an unreadable companion cannot block a
+  // card forever either.
+  const ancient = pending({ at: new Date(now - 8 * HOUR).toISOString() });
+  const stopped = obligations.decide(ancient, { job: null, discovery: 'unknown', now });
+  assert.equal(stopped.state, 'abandoned');
+  assert.match(stopped.note, /has not been able to see Codex job job-42 for 8h/);
 });
 
 test('a finished job becomes a verdict Keep is waiting for, and says so once', () => {
@@ -54,6 +89,14 @@ test('a finished job becomes a verdict Keep is waiting for, and says so once', (
   assert.equal(again, null, 'an announced obligation is not announced every five minutes');
 });
 
+test('a verdict nobody ever records is abandoned rather than blocking forever', () => {
+  const now = Date.now();
+  const stuck = pending({ state: 'awaiting-verdict', stateAt: new Date(now - 8 * HOUR).toISOString() });
+  const decision = obligations.decide(stuck, { job: { status: 'completed' }, now });
+  assert.equal(decision.state, 'abandoned');
+  assert.match(decision.note, /finished 8h ago and no verdict was ever recorded/);
+});
+
 test('a review that came back settles the obligation whatever it found', () => {
   const now = Date.now();
   for (const verdict of ['clean', 'findings']) {
@@ -62,9 +105,25 @@ test('a review that came back settles the obligation whatever it found', () => {
     });
     assert.equal(decision.state, 'satisfied', `a ${verdict} verdict is still a verdict`);
   }
-  // A record citing some other job is not this obligation's answer.
+  // A record citing some other job is not this obligation's answer…
   assert.equal(obligations.decide(pending(), {
-    job: { status: 'completed' }, reviewRecords: [{ id: 'rev-2', job: 'job-99', verdict: 'clean' }], now,
+    job: { status: 'completed' }, reviewRecords: [{ id: 'rev-2', job: 'job-99', verdict: 'clean', at: new Date().toISOString() }], now,
+  }).state, 'awaiting-verdict');
+  // …unless it is a verified independent review of exactly the same patches, recorded
+  // after this obligation opened. A re-run under a new job id must not leave the first
+  // obligation blocking a card that has in fact been reviewed.
+  const covering = {
+    id: 'rev-3', job: 'job-99', jobAccountId: 'codex-main', verdict: 'clean',
+    at: new Date(now).toISOString(), commits: [commit('z'.repeat(40), 'p1')],
+  };
+  assert.equal(obligations.decide(pending(), { job: { status: 'completed' }, reviewRecords: [covering], now }).state, 'satisfied');
+  // A self-attestation with no verified job is not an independent review.
+  assert.equal(obligations.decide(pending(), {
+    job: { status: 'completed' }, reviewRecords: [{ ...covering, jobAccountId: '' }], now,
+  }).state, 'awaiting-verdict');
+  // Nor is one written before this review was even launched.
+  assert.equal(obligations.decide(pending(), {
+    job: { status: 'completed' }, reviewRecords: [{ ...covering, at: new Date(now - 4 * HOUR).toISOString() }], now,
   }).state, 'awaiting-verdict');
 });
 
@@ -97,6 +156,15 @@ test('a terminal obligation is never reopened by the sweep', () => {
   for (const state of obligations.TERMINAL_STATES) {
     assert.equal(obligations.decide(pending({ state }), { job: { status: 'completed' }, now }), null);
   }
+});
+
+test('a touch keeps the clock it is measured against', () => {
+  const now = Date.now();
+  const record = pending({ state: 'awaiting-verdict', stateAt: new Date(now - 3 * HOUR).toISOString() });
+  const touched = obligations.applied(record, { state: 'awaiting-verdict', misses: 1, note: '' }, now);
+  assert.equal(touched.stateAt, record.stateAt, 'a miss does not restart the abandonment clock');
+  const moved = obligations.applied(record, { state: 'failed', note: 'gone' }, now);
+  assert.equal(moved.stateAt, new Date(now).toISOString());
 });
 
 // ---------- what it blocks ----------
@@ -149,6 +217,7 @@ test('the sweep settles each obligation once and records what happened on the ca
     const landed = [];
     const deps = {
       root: box.root,
+      withLock: nolock,
       resolveJob: (job) => (job === 'job-42' ? { status: 'completed', accountId: 'codex-secondary' } : { status: 'running' }),
       readReviews: () => [],
       liveJobs: new Map([['job-dead', { id: 'job-dead', state: 'dead', reason: 'no process' }]]),
@@ -172,19 +241,66 @@ test('the sweep settles each obligation once and records what happened on the ca
   } finally { box.cleanup(); }
 });
 
-test('a sweep whose check-in fails keeps the transition and reports the error', () => {
+test('the sweep writes the transition before it announces it', () => {
   const box = fixture();
   try {
     box.write('a-card', [pending()]);
+    const order = [];
+    const result = obligations.settle({
+      root: box.root,
+      withLock: (fn) => { order.push('write'); return fn(); },
+      resolveJob: () => ({ status: 'completed' }),
+      readReviews: () => [],
+      checkinTask: () => { order.push('checkin'); throw new Error('registry is locked'); },
+    });
+    assert.deepEqual(order, ['write', 'checkin'], 'a transition announced but not written would be announced forever');
+    assert.equal(result.settled.length, 1);
+    assert.match(result.errors[0], /could not record the awaiting-verdict review: registry is locked/);
+    assert.equal(box.read('a-card')[0].state, 'awaiting-verdict');
+  } finally { box.cleanup(); }
+});
+
+test('a write that fails announces nothing, so the next sweep tries the whole thing again', () => {
+  const box = fixture();
+  try {
+    box.write('a-card', [pending()]);
+    const landed = [];
+    const result = obligations.settle({
+      root: box.root,
+      withLock: () => { throw new Error('the registry lock is held'); },
+      resolveJob: () => ({ status: 'completed' }),
+      readReviews: () => [],
+      checkinTask: (id, payload) => landed.push(payload),
+    });
+    assert.deepEqual(landed, []);
+    assert.deepEqual(result.settled, []);
+    assert.match(result.errors[0], /could not write obligations/);
+    assert.equal(box.read('a-card')[0].state, 'open');
+  } finally { box.cleanup(); }
+});
+
+test('a record that changed under the sweep keeps its own state and is not announced', () => {
+  const box = fixture();
+  try {
+    box.write('a-card', [pending()]);
+    const landed = [];
+    // The drop lands between the decision and the write, exactly where a five-minute
+    // sweep and a person typing at a terminal collide.
     const result = obligations.settle({
       root: box.root,
       resolveJob: () => ({ status: 'completed' }),
       readReviews: () => [],
-      checkinTask: () => { throw new Error('registry is locked'); },
+      checkinTask: (id, payload) => landed.push(payload),
+      withLock: (fn) => {
+        box.write('a-card', [obligations.applied(pending(), { state: 'abandoned', note: 'dropped: by hand' })]);
+        return fn();
+      },
     });
-    assert.equal(result.settled.length, 1);
-    assert.match(result.errors[0], /could not record the awaiting-verdict review: registry is locked/);
-    assert.equal(box.read('a-card')[0].state, 'awaiting-verdict', 'the state still moved, so the card is not re-announced forever');
+    assert.deepEqual(landed, [], 'nothing is announced for a transition that was not applied');
+    assert.deepEqual(result.settled, []);
+    const after = box.read('a-card');
+    assert.equal(after[0].state, 'abandoned', 'the drop stands');
+    assert.match(after[0].note, /dropped: by hand/);
   } finally { box.cleanup(); }
 });
 
@@ -192,7 +308,8 @@ test('recording the verdict settles the obligation it answered', () => {
   const box = fixture();
   try {
     box.write('a-card', [pending(), pending({ id: 'obl-2', job: 'job-77' })]);
-    const closed = obligations.settleFromRecord('a-card', { id: 'rev-3', job: 'job-42', verdict: 'findings' }, box.root);
+    const closed = obligations.settleFromRecord('a-card', { id: 'rev-3', job: 'job-42', verdict: 'findings' },
+      box.root, Date.now(), { withLock: nolock });
     assert.deepEqual(closed.map((entry) => entry.id), ['obl-1']);
     const after = box.read('a-card');
     assert.equal(after[0].state, 'satisfied');
@@ -207,20 +324,44 @@ test('a partial companion view never fails an obligation', () => {
   assert.equal(obligations.liveJobMap({ discovery: 'ok', jobs: [{ id: 'job-42', state: 'dead' }] }).get('job-42').state, 'dead');
 });
 
-test('an unreadable obligations file reads as none rather than throwing', () => {
+// ---------- storage ----------
+
+test('an unreadable obligations file refuses rather than reading as none', () => {
   const box = fixture();
   try {
+    assert.deepEqual(box.read('never-written'), [], 'a card with no file has no obligations');
     fs.mkdirSync(obligations.obligationsDir(box.root), { recursive: true });
     fs.writeFileSync(obligations.cardFile('a-card', box.root), '{ not json');
-    assert.deepEqual(box.read('a-card'), []);
+    // Failing open here would let a land through as if no review were outstanding.
+    assert.throws(() => box.read('a-card'), /not readable JSON/);
+    assert.throws(() => obligations.append('a-card', pending(), box.root), /not readable JSON/,
+      'and an append must not overwrite history it could not read');
+    fs.writeFileSync(obligations.cardFile('a-card', box.root), JSON.stringify({ nope: true }));
+    assert.throws(() => box.read('a-card'), /not a list/);
+    // Individual records that are not records are still skipped: the file is readable.
     fs.writeFileSync(obligations.cardFile('a-card', box.root), JSON.stringify([pending(), { state: 'invented' }, null]));
     assert.deepEqual(box.read('a-card').map((entry) => entry.id), ['obl-1']);
   } finally { box.cleanup(); }
 });
 
+test('terminal records age out and a card with none left loses its file', () => {
+  const box = fixture();
+  const now = Date.now();
+  try {
+    const old = pending({ id: 'obl-old', state: 'satisfied', stateAt: new Date(now - 60 * DAY).toISOString() });
+    const recent = pending({ id: 'obl-new', state: 'failed', stateAt: new Date(now - DAY).toISOString() });
+    obligations.writeRecords('a-card', [old, recent, pending()], box.root, now);
+    assert.deepEqual(box.read('a-card').map((entry) => entry.id), ['obl-new', 'obl-1'], 'open records always stay');
+
+    obligations.writeRecords('a-card', [old], box.root, now);
+    assert.equal(fs.existsSync(obligations.cardFile('a-card', box.root)), false,
+      'a card whose history has aged out is not rescanned by the daemon every five minutes');
+    assert.deepEqual(box.read('a-card'), []);
+  } finally { box.cleanup(); }
+});
+
 // ---------- the CLI ----------
 
-const { spawnSync } = require('node:child_process');
 const CLI = path.join(__dirname, 'keep.js');
 
 function registry() {
@@ -270,5 +411,18 @@ test('keep reviewing lists, refuses a job it cannot find, and drops only with a 
     const again = box.run(['reviewing', 'gate', '--drop', 'obl-1', '-m', 'again']);
     assert.notEqual(again.status, 0);
     assert.match(again.stderr, /already abandoned/);
+  } finally { box.cleanup(); }
+});
+
+test('an unreadable store is reported by the CLI instead of read as empty', () => {
+  const box = registry();
+  try {
+    fs.mkdirSync(obligations.obligationsDir(box.root), { recursive: true });
+    fs.writeFileSync(obligations.cardFile('gate', box.root), 'not json at all');
+    for (const args of [['reviewing', 'gate'], ['reviews', 'gate']]) {
+      const run = box.run(args);
+      assert.notEqual(run.status, 0, args.join(' '));
+      assert.match(run.stderr, /not readable JSON/);
+    }
   } finally { box.cleanup(); }
 });

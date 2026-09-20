@@ -6,6 +6,7 @@
 // startSchedulers and the whole daemon around it.
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const test = require('node:test');
 
 const { createRegistryPull, startLoopLagProbe, startReceiptsPoller } = require('./serve/schedulers.js');
@@ -276,4 +277,45 @@ test('a failed receipts request leaves the health row failing, not green', async
   assert.equal(harness.rows[1][1].ok, false);
   assert.equal(harness.rows[1][1].error.message, 'poll threw');
   assert.equal(harness.timers.length, 3);
+});
+
+// startSchedulers reads the daemon's internals out of one destructured ctx. A name the
+// body uses but the head never declares is a ReferenceError at daemon start — nothing
+// here runs until the daemon runs, so the file itself is what has to be checked. This
+// caught exactly that: a scheduler was handed `companionSnapshot` that ctx never bound.
+test('every ctx value a scheduler is handed is destructured from ctx', () => {
+  const source = fs.readFileSync(require.resolve('./serve/schedulers.js'), 'utf8');
+  const fn = source.slice(source.indexOf('function startSchedulers(ctx)'));
+  const split = fn.indexOf('} = ctx;');
+  assert.ok(split > 0, 'startSchedulers still destructures ctx in one place');
+  const declared = new Set(fn.slice(0, split).match(/[A-Za-z_$][\w$]*/g) || []);
+  const body = fn.slice(split);
+  // Names the body introduces itself: callback parameters and its own declarations.
+  // A shorthand `{ pane }` inside a callback is that callback's variable, not ctx's.
+  const local = new Set();
+  for (const m of body.matchAll(/\(([^()]*)\)\s*=>/g)) {
+    for (const name of m[1].split(',')) {
+      const bare = name.trim().match(/^([A-Za-z_$][\w$]*)$/);
+      if (bare) local.add(bare[1]);
+    }
+  }
+  for (const m of body.matchAll(/(?:^|[^\w$.])([A-Za-z_$][\w$]*)\s*=>/g)) local.add(m[1]);
+  for (const m of body.matchAll(/\b(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)/g)) local.add(m[1]);
+  for (const m of body.matchAll(/\b(?:const|let|var)\s*\{([^}]*)\}/g)) {
+    for (const name of m[1].split(/[,:]/)) {
+      const bare = name.trim().match(/^([A-Za-z_$][\w$]*)$/);
+      if (bare) local.add(bare[1]);
+    }
+  }
+  const passed = [];
+  for (const call of body.matchAll(/startScheduler\(\{([^}]*)\}/g)) {
+    for (const part of call[1].split(',')) {
+      const shorthand = part.trim().match(/^([A-Za-z_$][\w$]*)$/);
+      if (shorthand && !local.has(shorthand[1])) passed.push(shorthand[1]);
+    }
+  }
+  assert.ok(passed.length, 'the scan found the shorthand bindings it is meant to check');
+  for (const name of passed) {
+    assert.ok(declared.has(name), `${name} is handed to a scheduler but never destructured from ctx`);
+  }
 });

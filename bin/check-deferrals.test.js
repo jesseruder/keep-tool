@@ -151,3 +151,23 @@ test('keep overdue is unchanged when the daemon has recorded no deferrals', () =
     assert.match(run.stdout, /stalled-card.*\(has check recipe\)$/m);
   } finally { cleanup(); }
 });
+
+test('an actively deferring streak is never pruned out from under its own escalation', () => {
+  const base = Date.parse('2026-09-16T18:17:00Z');
+  const map = new Map();
+  // Deferred every day for three weeks: the case this module exists for.
+  for (let day = 0; day < 21; day += 1) {
+    const at = base + day * DAY;
+    deferrals.note(map, 'a-card', { checkAfter: 'x', stamp: stampAt(at), today: stampAt(at).slice(0, 10) });
+    deferrals.serialize(map, at);
+  }
+  deferrals.markEscalated(map, 'a-card');
+  const entry = map.get('a-card');
+  assert.ok(entry, 'expiring it would restart the streak and walk the card through the same notices again');
+  assert.equal(entry.escalated, true);
+  assert.equal(entry.notices, 21);
+
+  // A streak that actually stopped is history and does age out.
+  deferrals.serialize(map, base + 60 * DAY);
+  assert.equal(map.has('a-card'), false);
+});

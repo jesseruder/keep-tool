@@ -88,25 +88,37 @@ function writeLedger(map, root = keep.ROOT) {
   }
 }
 
+// Read-modify-write under the registry lock. Two sessions hitting their limits within
+// the same second is exactly when this ledger matters, and a last-writer-wins rename
+// would drop one account's mark and route a review straight back at it.
 function markExhausted(accountId, until, options = {}) {
   const root = options.root || keep.ROOT;
   const now = options.now || Date.now();
-  const map = ledger(root, now);
-  map.set(String(accountId), {
-    until: String(until),
-    at: new Date(now).toISOString(),
-    note: notes.scrub(options.note == null ? '' : options.note).slice(0, NOTE_LIMIT),
-    bySession: options.session && options.session.id ? String(options.session.id) : '',
+  const withLock = options.withLock || keep.withLock;
+  let entry;
+  withLock(() => {
+    const map = ledger(root, now);
+    entry = {
+      until: String(until),
+      at: new Date(now).toISOString(),
+      note: notes.scrub(options.note == null ? '' : options.note).slice(0, NOTE_LIMIT),
+      bySession: options.session && options.session.id ? String(options.session.id) : '',
+    };
+    map.set(String(accountId), entry);
+    writeLedger(map, root);
   });
-  writeLedger(map, root);
-  return map.get(String(accountId));
+  return entry;
 }
 
 function clearExhausted(accountId, options = {}) {
   const root = options.root || keep.ROOT;
-  const map = ledger(root, options.now || Date.now());
-  const had = map.delete(String(accountId));
-  writeLedger(map, root);
+  const withLock = options.withLock || keep.withLock;
+  let had = false;
+  withLock(() => {
+    const map = ledger(root, options.now || Date.now());
+    had = map.delete(String(accountId));
+    writeLedger(map, root);
+  });
   return had;
 }
 
@@ -160,17 +172,16 @@ function route(options = {}) {
   };
 }
 
-// The provenance a fallback review carries, so a later reader can tell one from an
-// ordinary review without reconstructing the day's usage limits. Empty when this review
-// is not a fallback — a `by` that does not match the configured fallback, or Codex being
-// available at the time, means the reviewer was a choice, not a routing decision.
-function provenance(by, options = {}) {
-  const decision = options.route || route(options);
-  const who = String(by || '').trim().toLowerCase();
-  if (!decision.fallback || decision.reviewer !== decision.fallback) return '';
-  if (!who.startsWith(decision.fallback)) return '';
-  const until = decision.until ? ` until ${decision.until}` : '';
-  return `fallback (codex exhausted${until})`;
+// What the ledger can add to a fallback claim the session has already made. This is
+// colour on an assertion, never the assertion itself: a review that ran while Codex was
+// exhausted is a fallback review whether or not the window has reset by the time it is
+// recorded, so `keep reviewed --fallback` is what decides, and this only says what the
+// exhaustion was when anything is still on record.
+function fallbackReason(options = {}) {
+  const exhausted = options.ledger || ledger(options.root || keep.ROOT, options.now || Date.now());
+  if (!exhausted.size) return '';
+  const until = [...exhausted.values()].map((entry) => entry.until).sort()[0];
+  return until ? `codex exhausted until ${until}` : 'codex exhausted';
 }
 
 function describe(decision) {
@@ -187,5 +198,5 @@ function describe(decision) {
 
 module.exports = {
   FALLBACK_REVIEWERS, configFile, ledgerFile, config, ledger, writeLedger,
-  markExhausted, clearExhausted, codexAccounts, route, provenance, describe,
+  markExhausted, clearExhausted, codexAccounts, route, fallbackReason, describe,
 };

@@ -50,11 +50,14 @@ function parse(value) {
   return out;
 }
 
+// Pruned on last activity, never on when the streak started. A card deferring every day
+// for a fortnight is the case this whole module exists for: expiring it would restart
+// its streak, un-latch its escalation, and walk the card through the same notices again.
 function serialize(map, now = Date.now()) {
   const out = {};
   for (const [id, entry] of map) {
-    const since = timeMs(entry.since);
-    if (since === null || now - since > RETENTION_MS) { map.delete(id); continue; }
+    const seen = timeMs(entry.lastDay) ?? timeMs(entry.since);
+    if (seen === null || now - seen > RETENTION_MS) { map.delete(id); continue; }
     out[id] = entry;
   }
   return out;

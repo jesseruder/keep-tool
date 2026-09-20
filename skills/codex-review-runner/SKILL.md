@@ -24,8 +24,9 @@ initially, not both. Astra xhigh requires Owner's explicit request.
 
 0. Run `keep review-route`. It names the Codex account to use, or says every one of
    them is at its usage limit. In that case use the fallback it names — and only that
-   one — and record the review with `--by "opus …"` and 80+ characters of
-   `--evidence`; Keep stamps the record as a fallback. If it says no fallback is
+   one — and record the review with `--by "opus …" --fallback` and 80+ characters of
+   `--evidence`; `--fallback` is what stamps the record, and Keep fills in what the
+   exhaustion was. If it says no fallback is
    configured, say so on the card and stop rather than improvising a reviewer. When a
    Codex launch fails on a usage limit, record it with
    `keep review-route --exhausted <account> --until <reset> -m "..."` so the next

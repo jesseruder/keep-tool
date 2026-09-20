@@ -1124,3 +1124,82 @@ test('only an explicitly configured fallback purpose counts as a fallback', () =
     checksAccountId: () => 'claude-primary',
   }), undefined, 'a Codex account cannot run a Claude check');
 });
+
+test('a transient fallback launch failure leaves the escalation for later', async () => {
+  _resetSchedulerState();
+  setOpener(async () => { throw new Error('terminal host is unavailable'); });
+  try {
+    const task = card();
+    const landed = [];
+    const deps = { checkinTask: (id, payload) => landed.push(payload), fallbackAccountId: 'claude-secondary' };
+    await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-16', deps);
+    const held = await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-17', deps);
+    assert.equal(held.escalated, false, 'a host that was restarting is not a verdict on the account');
+    assert.equal(landed.length, 1);
+    assert.equal(loadSchedulerState().deferred.get('some-card').escalated, false);
+
+    // A failure that is not transient does land the stalled notice.
+    setOpener(async () => { throw new Error('no such account'); });
+    const stalled = await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-18', deps);
+    assert.equal(stalled.escalated, true);
+    assert.equal(landed.at(-1).heading, 'check stalled');
+    assert.match(landed.at(-1).message, /could not be opened \(no such account\)/);
+  } finally { setOpener(null); _resetSchedulerState(); }
+});
+
+test('a failure in the deferral bookkeeping does not burn the card daily open', async () => {
+  _resetSchedulerState();
+  try {
+    const task = card();
+    const handled = await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-16', {
+      recordBudgetDeferral: () => { throw new Error('the scheduler state is unwritable'); },
+    });
+    // The caller's own catch marks the card opened for the day on a non-transient
+    // error, and nothing was opened here at all.
+    assert.deepEqual(handled, { noticed: false });
+    assert.equal(loadSchedulerState().opened.has('some-card'), false);
+  } finally { _resetSchedulerState(); }
+});
+
+// Opening a session is async: two cards whose opens overlap both used to read the
+// allowance before either had spent it, and the tick launched more panes than the cap.
+test('the per-tick allowance is reserved before the open, not counted after it', async () => {
+  _resetSchedulerState();
+  try {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const opened = [];
+    const open = async (body) => { opened.push(body.taskId); await gate; return { ok: true, sessionId: 'sid', pane: 'p' }; };
+    const cardFor = (id) => { const t = card(); t.id = id; return t; };
+    const budget = { code: 0 };
+    const refusal = (t, today, accountId) => freshOpenRefusal(t, today, accountId, { checkBudget: () => budget });
+
+    const inFlight = [];
+    for (const id of ['a', 'b', 'c']) {
+      inFlight.push(openFreshCheckSession(cardFor(id), { today: '2026-09-16', open, refusal }));
+    }
+    // A fourth card asks while the first three are still awaiting their opener.
+    const fourth = await openFreshCheckSession(cardFor('d'), { today: '2026-09-16', open, refusal });
+    assert.equal(fourth.skipped, 'tick-cap', 'the cap sees the three opens already in flight');
+    release();
+    await Promise.all(inFlight);
+    assert.deepEqual(opened, ['a', 'b', 'c']);
+  } finally { _resetSchedulerState(); }
+});
+
+test('an open that fails gives its slot back', async () => {
+  _resetSchedulerState();
+  try {
+    const cardFor = (id) => { const t = card(); t.id = id; return t; };
+    const budget = { code: 0 };
+    const refusal = (t, today, accountId) => freshOpenRefusal(t, today, accountId, { checkBudget: () => budget });
+    const failing = async () => { throw new Error('terminal host is unavailable'); };
+    for (const id of ['a', 'b', 'c', 'd']) {
+      await assert.rejects(openFreshCheckSession(cardFor(id), { today: '2026-09-16', open: failing, refusal }));
+    }
+    const after = await openFreshCheckSession(cardFor('e'), {
+      today: '2026-09-16', refusal, open: async () => ({ ok: true, sessionId: 'sid', pane: 'p' }),
+    });
+    assert.equal(after.skipped, undefined, 'four failed opens did not spend the tick');
+  } finally { _resetSchedulerState(); }
+});
