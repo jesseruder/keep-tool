@@ -214,3 +214,15 @@ test('fallback attempts are counted on the streak so a restart does not reset th
   const back = deferrals.parse(JSON.parse(JSON.stringify(deferrals.serialize(map, base))));
   assert.equal(back.get('a-card').tries, 2);
 });
+
+test('an empty lastDay is repaired like a damaged one, not read as never active', () => {
+  const base = Date.parse('2026-09-16T18:17:00Z');
+  // null, a number or a missing field all parse to '', and falling back to `since` for
+  // those is the same way an actively deferring streak got pruned.
+  for (const lastDay of [null, 7, undefined]) {
+    const map = deferrals.parse({ live: { since: stampAt(base - 30 * DAY), lastDay, checkAfter: 'x' } });
+    deferrals.serialize(map, base, deferrals.dayOf(base));
+    assert.equal(map.has('live'), true, String(lastDay));
+    assert.equal(map.get('live').lastDay, deferrals.dayOf(base));
+  }
+});

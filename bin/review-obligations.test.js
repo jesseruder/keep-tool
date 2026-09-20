@@ -228,7 +228,7 @@ test('the sweep settles each obligation once and records what happened on the ca
     assert.deepEqual(first.settled.map((entry) => entry.state).sort(), ['awaiting-verdict', 'failed']);
     assert.deepEqual(landed.map(([, payload]) => payload.heading).sort(), ['review failed', 'review pending']);
     assert.match(landed.find(([id]) => id === 'a-card')[1].message, /keep codex --account codex-secondary result job-42/);
-    assert.match(landed.find(([id]) => id === 'b-card')[1].message, /re-run it/);
+    assert.match(landed.find(([id]) => id === 'b-card')[1].message, /re-run the review/);
     assert.equal(box.read('a-card')[0].state, 'awaiting-verdict');
     assert.equal(box.read('b-card')[0].state, 'failed');
 
@@ -760,17 +760,27 @@ test('a terminal record Keep cannot date is not kept forever', () => {
 test('a check-in says what this obligation knows, and makes no claim about the card', () => {
   const now = Date.now();
   const failed = obligations.checkin(pending({ state: 'failed' }), { state: 'failed', note: 'the job is dead' });
-  // "These commits still have no review record" was a claim about the whole card that
-  // this module cannot support: an Opus fallback review, or a record written before the
-  // obligation opened, makes it false.
-  assert.doesNotMatch(failed.message, /no review record|Nothing was reviewed/);
-  assert.match(failed.message, /job job-42\) produced no verdict: the job is dead/);
+  // Every earlier wording asserted something Keep was not in a position to know: that
+  // these commits have no review record (an Opus fallback, or a record predating the
+  // obligation, makes that false), or that no verdict was produced — a review abandoned
+  // after six hours may have produced one that nobody recorded.
+  assert.doesNotMatch(failed.message, /no review record|Nothing was reviewed|produced no verdict/);
+  assert.match(failed.message, /Keep stopped waiting for the review recorded here for .* \(job job-42\): the job is dead/);
+  assert.match(failed.message, /Check whether it produced a verdict/);
   assert.match(failed.message, /unless another independent review already covers these commits/);
-  assert.match(failed.message, /keep reviews a-card lists what is on the card/);
+  assert.match(failed.message, /`keep reviews a-card` lists what is on the card/);
 
   const waiting = obligations.checkin(pending({ state: 'awaiting-verdict' }), { state: 'awaiting-verdict', note: '' });
-  assert.match(waiting.message, /its verdict is not on this card/);
-  assert.match(waiting.message, /while this review is outstanding/);
+  assert.doesNotMatch(waiting.message, /is not on this card/);
+  assert.match(waiting.message, /Keep has not matched a verdict to it/);
+  // Not "keep land refuses these commits": an obligation covering none refuses none,
+  // and an explicit land grant from Owner overrides the implicit one either way.
+  assert.match(waiting.message, /the implicit land grant refuses the commits it covers/);
+
+  // An obligation whose job id did not survive says nothing about a job.
+  const jobless = obligations.checkin(pending({ state: 'failed', job: '' }), { state: 'failed', note: 'Keep cannot see it' });
+  assert.doesNotMatch(jobless.message, /\(job \)|keep codex/);
+  assert.match(jobless.message, /If it produced a verdict, record it/);
 });
 
 test('a record Keep cannot use costs its own card a tick, not every card after it', () => {
@@ -794,7 +804,7 @@ test('a record Keep cannot use costs its own card a tick, not every card after i
     assert.deepEqual(result.errors, []);
     assert.deepEqual(landed.map(([id]) => id).sort(), ['broken-card', 'later-card'],
       'the card after the broken one was reached');
-    assert.match(landed.find(([id]) => id === 'broken-card')[1].message, /launched for this card/);
+    assert.match(landed.find(([id]) => id === 'broken-card')[1].message, /recorded here for this card/);
     assert.equal(box.read('later-card')[0].state, 'awaiting-verdict');
   } finally { box.cleanup(); }
 });
@@ -817,5 +827,56 @@ test('a card whose processing throws does not take the rest of the sweep with it
     });
     assert.ok(result.errors.some((error) => /angry-card/.test(error)));
     assert.deepEqual(landed.map(([id]) => id), ['later-card']);
+  } finally { box.cleanup(); }
+});
+
+// ---------- what round six found ----------
+
+test('a timestamp in the future cannot hold an obligation open until the year 9999', () => {
+  const now = Date.now();
+  // Every ceiling measures elapsed time, and a future stamp made them all measure
+  // negative, so nothing could ever retire the record while it gated its commits.
+  const ahead = pending({ state: 'awaiting-verdict', at: '9999-12-31T00:00:00.000Z', stateAt: '9999-12-31T00:00:00.000Z' });
+  const decision = obligations.decide(ahead, { job: { status: 'completed' }, now });
+  assert.equal(decision.state, 'abandoned', 'a stamp Keep cannot wait on is the same as no stamp at all');
+  const open = obligations.decide(pending({ at: '9999-12-31T00:00:00.000Z', stateAt: '9999-12-31T00:00:00.000Z' }),
+    { job: null, discovery: 'unknown', now });
+  assert.equal(open.state, 'abandoned');
+});
+
+test('an obligation covering nothing is not covered by everything', () => {
+  const now = Date.now();
+  // `every()` over an empty commit list is vacuously true, so any review at all would
+  // have settled a record whose commits did not survive.
+  const empty = pending({ commits: [] });
+  const review = {
+    id: 'rev-1', job: 'job-99', jobAccountId: 'codex-main', verdict: 'clean',
+    at: new Date(now).toISOString(), commits: [commit('q'.repeat(40), 'p9')],
+  };
+  assert.equal(obligations.satisfiedByCoverage(empty, [review], now), false);
+  assert.equal(obligations.decide(empty, { job: { status: 'completed' }, reviewRecords: [review], now }).state,
+    'awaiting-verdict');
+});
+
+test('a record with no usable id is reported, not quietly dropped', () => {
+  const box = fixture();
+  try {
+    fs.mkdirSync(obligations.obligationsDir(box.root), { recursive: true });
+    fs.writeFileSync(obligations.cardFile('a-card', box.root), JSON.stringify([
+      { ...pending(), id: 42 },
+      pending({ id: 'obl-ok' }),
+    ]));
+    const stats = {};
+    assert.deepEqual(obligations.readRecords('a-card', box.root, stats).map((r) => r.id), ['obl-ok']);
+    assert.equal(stats.dropped, 1);
+
+    const result = obligations.settle({
+      root: box.root, withLock: nolock, cards: ['a-card'],
+      resolveJob: () => ({ status: 'running' }),
+      readReviews: () => [],
+      checkinTask: () => {},
+    });
+    assert.ok(result.errors.some((error) => /1 pending review record\(s\) have no usable id/.test(error)),
+      'the next write drops it for good, so the operator hears about it first');
   } finally { box.cleanup(); }
 });

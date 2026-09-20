@@ -58,7 +58,7 @@ function cardFile(id, root = keep.ROOT) { return path.join(obligationsDir(root),
 // second would fail open at exactly the moment it matters — an unreadable file would let
 // a land through as if no review were outstanding — and an append built on `[]` would
 // overwrite the history it could not read.
-function readRecords(id, root = keep.ROOT) {
+function readRecords(id, root = keep.ROOT, stats = null) {
   let text;
   try { text = fs.readFileSync(cardFile(id, root), 'utf8'); }
   catch (error) {
@@ -72,8 +72,12 @@ function readRecords(id, root = keep.ROOT) {
   // Normalised, not trusted. A hand-edited record with no `commits` used to throw deep
   // inside the sweep — after the state had been decided — and take every later card on
   // that tick with it, every tick, for as long as the record sat there.
-  return value
-    .filter((record) => record && typeof record === 'object' && STATES.includes(record.state) && typeof record.id === 'string')
+  const usable = value.filter((record) => record && typeof record === 'object'
+    && STATES.includes(record.state) && typeof record.id === 'string' && record.id);
+  // Said out loud: a record Keep cannot identify is one it cannot settle or clear, and
+  // the next write drops it for good. The caller decides what to do about that.
+  if (stats && value.length !== usable.length) stats.dropped = value.length - usable.length;
+  return usable
     .map((record) => ({
       ...record,
       job: typeof record.job === 'string' ? record.job : '',
@@ -213,6 +217,9 @@ const FAILED_STATUSES = new Set(['failed', 'error', 'cancelled', 'canceled', 'ab
 // asks even though it is not the job it named. Without this, a review re-run under a new
 // job id leaves the first obligation blocking a card that has in fact been reviewed.
 function satisfiedByCoverage(record, reviewRecords, now) {
+  // An obligation covering nothing is not covered by everything: `every()` over an
+  // empty list is vacuously true, and would let any review at all settle it.
+  if (!record.commits.length) return false;
   const opened = timeMs(record.at) ?? now;
   return (reviewRecords || []).some((review) => {
     if (!review || !String(review.jobAccountId || '').trim()) return false;
@@ -228,7 +235,10 @@ function satisfiedByCoverage(record, reviewRecords, now) {
 function elapsed(now, ...stamps) {
   for (const stamp of stamps) {
     const at = timeMs(stamp);
-    if (at !== null) return now - at;
+    // A stamp in the future would make every ceiling measure negative time and never
+    // fire, so a record claiming to have been settled in 9999 would gate its commits
+    // until then. Unreadable and impossible are the same thing here: undated.
+    if (at !== null && at <= now + 86400e3) return now - at;
   }
   return Infinity;
 }
@@ -353,13 +363,14 @@ function checkin(record, decision) {
   const shas = range(record);
   const account = record.accountId ? ` --account ${record.accountId}` : '';
   const what = shas || 'this card';
+  const job = record.job ? ` (job ${record.job})` : '';
   if (decision.state === 'awaiting-verdict') {
     return {
       heading: 'review pending',
-      message: `The review launched for ${what} (job ${record.job}) has finished, and its verdict is not on this card.`
-        + ` Read it with \`keep codex${account} result ${record.job}\` and record it with`
-        + ` \`keep reviewed ${record.card} --commit <range> --verdict clean|findings --job ${record.job}\`.`
-        + ' keep land refuses these commits while this review is outstanding.',
+      message: `The review recorded here for ${what}${job} has finished, and Keep has not matched a verdict to it.`
+        + (record.job ? ` Read it with \`keep codex${account} result ${record.job}\` and record it with` : ' Record it with')
+        + ` \`keep reviewed ${record.card} --commit <range> --verdict clean|findings${record.job ? ` --job ${record.job}` : ''}\`.`
+        + ' While this is outstanding the implicit land grant refuses the commits it covers.',
       linkSession: false,
       commitLabel: 'review',
     };
@@ -367,15 +378,17 @@ function checkin(record, decision) {
   if (decision.state === 'failed' || decision.state === 'abandoned') {
     return {
       heading: 'review failed',
-      message: `The review launched for ${what} (job ${record.job}) produced no verdict: ${decision.note}.`
-        + ' A run that ends without a verdict is not a clean review, so re-run it unless another'
-        + ` independent review already covers these commits — keep reviews ${record.card} lists what is on the card.`,
+      message: `Keep stopped waiting for the review recorded here for ${what}${job}: ${decision.note}.`
+        + (record.job ? ` Check whether it produced a verdict — \`keep codex${account} result ${record.job}\` — and record it if it did;` : ' If it produced a verdict, record it;')
+        + ` otherwise re-run the review unless another independent review already covers these commits.`
+        + ` \`keep reviews ${record.card}\` lists what is on the card.`,
       linkSession: false,
       commitLabel: 'review',
     };
   }
   return null;
 }
+
 
 // ---------- the daemon's sweep ----------
 
@@ -441,8 +454,12 @@ function settle(deps = {}) {
   // with whatever is wrong here.
   function settleCard(id) {
     let records;
-    try { records = readRecords(id, root); }
+    const stats = {};
+    try { records = readRecords(id, root, stats); }
     catch (error) { result.errors.push(`${id}: ${error.message || error}`); return; }
+    if (stats.dropped) {
+      result.errors.push(`${id}: ${stats.dropped} pending review record(s) have no usable id and were ignored`);
+    }
 
     // Check-ins this card still owes: from this pass, or from any earlier one whose
     // announcement never landed. Retried until one does, which is what makes delivery

@@ -80,12 +80,17 @@ function serialize(map, now = Date.now(), today = dayOf(now)) {
     // one indefinitely. Repairing it retires the entry a retention window from now,
     // and an active streak overwrites it on its next deferral anyway.
     const stated = entry.lastDay ? timeMs(entry.lastDay) : null;
-    if (entry.lastDay && (stated === null || stated > now + 86400e3)) {
+    // Empty counts as damaged too: a `lastDay` that was null, a number, or missing
+    // parses to '', and falling back to `since` for those is the same way an actively
+    // deferring streak got pruned before its own note() could repair it. note() sets
+    // this field on every deferred day, so an empty one at save time is either damage
+    // or a streak that has not deferred since it was written.
+    if (!entry.lastDay || stated === null || stated > now + 86400e3) {
       entry.lastDay = today;
       out[id] = entry;
       continue;
     }
-    const seen = stated ?? started;
+    const seen = stated;
     if (now - seen > RETENTION_MS) { map.delete(id); continue; }
     out[id] = entry;
   }

@@ -1068,7 +1068,9 @@ read separately and a review that finished in between leaves a stale row beside 
 result. Only
 the six-hour ceiling applies in that state, so an unreadable companion cannot block a
 card forever either. A record with no readable `at` is treated as undated rather than as
-just-opened, so it ages out instead of counting a miss every five minutes forever.
+just-opened, so it ages out instead of counting a miss every five minutes forever — and
+so is one whose timestamps are in the future, which would otherwise make every ceiling
+measure negative time and gate its commits until that date.
 
 Two properties hold. **Nothing here ever writes a verdict**: a job that died fails the
 obligation so the review is re-run, and is never mistaken for a clean one. And every
@@ -1088,11 +1090,11 @@ re-read the record, re-read the card's review records, write the check-in, clear
 A verdict recorded in the meantime cancels the announcement rather than being
 contradicted by it, and that check covers terminal records too.
 
-A check-in says only what the obligation knows — what happened to the job it named.
-Whether some *other* review covers those commits is a question about the whole card,
-which `keep reviews` answers and this does not: a fallback review recorded with evidence
-rather than a job, or a record written before the obligation opened, would make a flat
-"these commits have no review record" false. A record Keep cannot use is normalised on
+A check-in says only what Keep observed. Not that no verdict was produced — a review
+abandoned after six hours may have produced one nobody recorded — and not that these
+commits have no review record, which is a question about the whole card that
+`keep reviews` answers and this does not. It reports that Keep stopped waiting, what it
+saw, and where to look. A record Keep cannot use is normalised on
 read rather than throwing mid-sweep, and each card is settled inside its own try, so one
 bad record costs its own card a tick instead of every card after it in the listing. A card that refuses the check-in a dozen times running (an archived
 one always will) is given up on with an error rather than retried forever, and a record
