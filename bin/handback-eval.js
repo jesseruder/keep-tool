@@ -142,7 +142,13 @@ const CARVE_OUTS = [
 // unit tests** here" names something else, and the hand-off beside it stands.
 // An anaphoric object is the only cheap evidence that an offer in the next
 // sentence is an offer of *this* work.
-const STRONG_OFFER_RE = /\b(?:say the word|want me to\b|shall I\b|may I\b|would you like me to\b|should I\b|say ["“]?land["”]?\b|tell me to and I will|and I(?:'|’)ll (?:run|do|land|handle) )|\bI (?:can|could)(?!(?:'|’)t|not\b)\s+(?:just\s+|also\s+|still\s+)?\w+\s+(?:it|that|them|this|those)\b/i;
+// The verb has to be one that *performs* the step, not one that watches it:
+// "I can monitor it afterward" beside "please deploy" offers to watch a deploy
+// somebody else runs, which leaves the hand-off exactly where it was.
+const OFFER_VERBS = 'run|rerun|do|land|handle|take|push|pull|restart|remove|delete|apply|deploy|install|commit|sync|rebase|clean|recycle|execute';
+const STRONG_OFFER_RE = new RegExp('\\b(?:say the word|want me to\\b|shall I\\b|may I\\b|would you like me to\\b|should I\\b'
+  + '|say ["“]?land["”]?\\b|tell me to and I will|and I(?:\'|’)ll (?:run|do|land|handle) )'
+  + `|\\bI (?:can|could)(?!(?:'|’)t|not\\b)\\s+(?:just\\s+|also\\s+|still\\s+)?(?:${OFFER_VERBS})\\s+(?:it|that|them|this|those)\\b`, 'i');
 
 // There is deliberately no "the session said it could not" carve-out.
 //
@@ -480,7 +486,13 @@ const SAMPLE_SQL = `SELECT t.id AS id, t.session_id AS session_id, t.n AS n, t.e
 // matters, and over-redacting a few words is not. `/var/root` is the macOS root
 // home and has to match as a whole, or the `/var/` prefix is left dangling in
 // front of the tilde.
-const HOME_RE = /(?:\/(?:Users|home)\/[^\s/"'`]+|(?<![\w/])\/(?:var\/)?root\b|[A-Za-z]:[\\/]+Users[\\/]+[^\\/\n"'`]{1,64})/g;
+// The Windows branch has two forms on purpose. A name followed by a separator
+// may contain spaces — `C:\Users\Alice Smith\repo` — and is taken whole. With no
+// separator after it there is nothing to say where the name ends, so only the
+// first token is taken: eating the rest would turn `C:\Users\Alice Smith the
+// tests failed` into `~`, and a redactor that deletes the evidence is worse than
+// one that leaves a surname. `/private/var/root` is the resolved macOS root home.
+const HOME_RE = /(?:\/(?:Users|home)\/[^\s/"'`]+|(?<![\w/])\/(?:private\/)?(?:var\/)?root\b|[A-Za-z]:[\\/]+Users[\\/]+(?:[^\\/\n"'`]+(?=[\\/])|[^\s\\/\n"'`]+))/g;
 const UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.]+/g;
 const LONG_HASH_RE = /\b[0-9a-f]{32,}\b/gi;

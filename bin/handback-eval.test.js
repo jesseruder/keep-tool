@@ -39,8 +39,11 @@ test('an offer to do the work suppresses the ask; an offer of other work does no
   // An offer of *this* step in the next sentence still suppresses: "it" points
   // back at the step that was just named.
   assert.equal(evaluator.detect('Please run `npm test` when you get a chance. I can run it myself if you prefer.').handback, false);
-  // …whereas an offer of something else leaves the hand-off standing.
+  // …whereas an offer of something else leaves the hand-off standing, and so
+  // does an offer to watch the step rather than take it.
   assert.equal(evaluator.detect('I can run the unit tests here. Please push the branch with `git push`.').handback, true);
+  assert.equal(evaluator.detect('Please deploy with `npm run deploy`. I can monitor it afterward.').handback, true);
+  assert.equal(evaluator.detect('Please run `npm test`. I can summarize it afterward.').handback, true);
 });
 
 test('list markers and bold sentence ends do not hide an imperative', () => {
@@ -132,7 +135,11 @@ test('index rows are redacted and carry no session id unless asked', () => {
   // A Windows user name can contain spaces; stopping at the space would leave
   // half of it in the output.
   assert.equal(evaluator.redact('C:\\Users\\Alice Smith\\repo'), '~\\repo');
+  assert.equal(evaluator.redact('it lives in /private/var/root/keep'), 'it lives in ~/keep');
   assert.equal(evaluator.redact('the /rooted tree'), 'the /rooted tree');
+  // With no separator to end the name, prose must survive: a redactor that
+  // swallows the sentence destroys the evidence it was protecting.
+  assert.equal(evaluator.redact('At C:\\Users\\Alice the tests failed.'), 'At ~ the tests failed.');
   assert.equal(evaluator.redact('turn 1a2b3c4d-1111-2222-3333-444455556666 ended'), 'turn <SESSION> ended');
   assert.equal(evaluator.redact('mail bob@example.com'), 'mail <EMAIL>');
   assert.match(evaluator.redact(`blob ${'a1b2c3d4'.repeat(5)}`), /<HASH>/);
