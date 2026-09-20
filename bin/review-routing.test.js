@@ -218,3 +218,13 @@ test('a fallback stamp is the session asserting it, not the ledger guessing at r
     assert.match(reviews.logLine(described), /reviewer: fallback \(codex exhausted until /);
   } finally { box.cleanup(); }
 });
+
+test('an install that routes reviews nowhere describes no exhaustion', () => {
+  const now = Date.now();
+  const box = fixture({ fallback: 'opus' });
+  try {
+    routing.markExhausted('codex-retired', iso(now + HOUR), { root: box.root, now, withLock: (fn) => fn() });
+    assert.equal(routing.fallbackReason({ root: box.root, now, codexAccounts: [] }), '',
+      'a stale ledger must not have a fallback record cite accounts this install does not use');
+  } finally { box.cleanup(); }
+});

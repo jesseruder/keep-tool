@@ -1461,7 +1461,13 @@ commands.allow = (argv) => {
     // Keep can verify byte for byte.
     if (!verdict.ok && String(request).trim().toLowerCase() === 'land') {
       const implicit = implicitLandVerdict(task);
-      verdict = { ok: implicit.ok, why: implicit.why, ...(implicit.grant ? { grant: implicit.grant } : {}), implicit: true, ...(implicit.record ? { record: implicit.record } : {}) };
+      verdict = {
+        ok: implicit.ok, why: implicit.why, ...(implicit.grant ? { grant: implicit.grant } : {}), implicit: true,
+        ...(implicit.record ? { record: implicit.record } : {}),
+        // The blocker that carried the refusal, so --json says which review is still
+        // out rather than only spelling it in the prose.
+        ...(implicit.obligation ? { obligation: implicit.obligation } : {}),
+      };
     }
     if (o.json) console.log(JSON.stringify({ id, action: request, ...verdict }, null, 2));
     else if (!o.quiet) console.log(verdict.ok ? `allowed: ${verdict.why}` : `not allowed: ${verdict.why}`);

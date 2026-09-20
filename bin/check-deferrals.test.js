@@ -174,19 +174,24 @@ test('an actively deferring streak is never pruned out from under its own escala
 
 test('a malformed or future lastDay cannot make an entry immortal or prune a live one', () => {
   const base = Date.parse('2026-09-16T18:17:00Z');
-  // A future value would keep a dead entry for millennia; it is dropped, and the entry
-  // falls back to its own start date for retention.
+  // A value in the future cannot keep a dead entry alive: retention reads it as today
+  // at the latest, so this one still ages out on its own start date.
   const future = deferrals.parse({ zombie: { since: stampAt(base - 30 * DAY), lastDay: '9999-12-31', checkAfter: 'x' } });
-  assert.equal(future.get('zombie').lastDay, '');
   deferrals.serialize(future, base);
   assert.equal(future.has('zombie'), false);
 
-  // A malformed value is likewise not trusted, and the next note() repairs it.
+  // A value Keep cannot read at all is kept rather than pruned — it may belong to an
+  // active streak, and normalising it away silently handed retention back to `since`,
+  // which pruned live streaks before the next note() could repair them.
   const malformed = deferrals.parse({ live: { since: stampAt(base - 30 * DAY), lastDay: 'yesterday', checkAfter: 'x' } });
-  assert.equal(malformed.get('live').lastDay, '');
+  deferrals.serialize(malformed, base);
+  assert.equal(malformed.has('live'), true, 'an unreadable day is not evidence the streak is over');
+  // And the next deferral repairs it, after which ordinary retention applies again.
   deferrals.note(malformed, 'live', { checkAfter: 'x', stamp: stampAt(base), today: stampAt(base).slice(0, 10) });
   deferrals.serialize(malformed, base);
-  assert.equal(malformed.has('live'), true, 'a streak that deferred today is not history');
+  assert.equal(malformed.get('live').lastDay, stampAt(base).slice(0, 10));
+  deferrals.serialize(malformed, base + 60 * DAY);
+  assert.equal(malformed.has('live'), false, 'a repaired streak that then stopped is history');
 });
 
 test('fallback attempts are counted on the streak so a restart does not reset them', () => {

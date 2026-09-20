@@ -1250,3 +1250,22 @@ test('a fallback host that is never available still reaches a stalled record', a
     assert.equal(loadSchedulerState().deferred.get('some-card').escalated, true);
   } finally { setOpener(null); _resetSchedulerState(); }
 });
+
+test('any successful open ends the deferral streak, not only the scheduler own path', async () => {
+  _resetSchedulerState();
+  try {
+    const task = card();
+    const landed = [];
+    const deps = { checkinTask: (id, payload) => landed.push(payload), fallbackAccountId: null };
+    await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-16', deps);
+    assert.equal(loadSchedulerState().deferred.has('some-card'), true);
+
+    // `keep verify` — Owner asking for the check now. It does not spend the scheduler's
+    // allowance, but the check did run, so the card is not deferred any more.
+    await openFreshCheckSession(task, {
+      today: '2026-09-16', enforce: false, open: async () => ({ ok: true, sessionId: 'sid', pane: 'p' }),
+    });
+    assert.equal(loadSchedulerState().deferred.has('some-card'), false,
+      'a stale streak would carry its fallback attempts into the next exhausted window');
+  } finally { _resetSchedulerState(); }
+});

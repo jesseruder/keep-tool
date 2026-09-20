@@ -1060,7 +1060,9 @@ be missing on three **consecutive** sweeps before it fails — any answer from t
 clears the count — and it is not counted at all while the companion's discovery is
 `partial` or `unknown`, while the jobs directory throws, or while the live sweep still
 shows a row for that job. A live row is the strongest of the three: if the companion can
-see the process, an unreadable job file says nothing about whether it is running. Only
+see the process, an unreadable job file says nothing about whether it is running, and
+seeing it alive clears the absences counted so far. A row that says the job is *dead*, or
+stalled past the threshold, decides on its own without a job file at all. Only
 the six-hour ceiling applies in that state, so an unreadable companion cannot block a
 card forever either. A record with no readable `at` is treated as undated rather than as
 just-opened, so it ages out instead of counting a miss every five minutes forever.
@@ -1077,7 +1079,12 @@ goes through the registry lock, re-reading and replacing only records that still
 exactly as they did when it decided. A check-in is a git commit, so a transition
 announced but not written would be announced every five minutes forever; a transition
 written but not announced carries an `announce` flag and is **retried on later sweeps
-until the check-in lands**, so delivery is durable rather than at-most-once.
+until the check-in lands**, so delivery is durable rather than at-most-once. The retry
+re-reads the record and announces the state it is in *now* — a notice saying "no verdict
+is recorded" about a record that has since been settled would be worse than a late one —
+and a card that refuses the check-in a dozen times running (an archived one always will)
+is given up on with an error rather than retried forever. A record that still owes a
+check-in is never pruned.
 
 A file that exists but cannot be read is an error, never an empty list — failing open
 there would let a land through as if no review were outstanding, and an append would

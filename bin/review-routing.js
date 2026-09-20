@@ -186,8 +186,12 @@ function fallbackReason(options = {}) {
   // says *now*. A window that has already reset and been replaced by another one would
   // otherwise be described with the new window's reset time, so the sentence says when
   // it was observed rather than implying it is when the review ran.
+  // An install that routes reviews to no Codex account has no exhaustion to describe.
+  // Admitting every ledger entry here would have a fallback record cite accounts this
+  // install does not use.
   const routed = new Set(options.codexAccounts || codexAccounts(root, options));
-  const live = [...exhausted.entries()].filter(([id]) => !routed.size || routed.has(id));
+  if (!routed.size) return '';
+  const live = [...exhausted.entries()].filter(([id]) => routed.has(id));
   if (!live.length) return '';
   const until = live.map(([, entry]) => entry.until).sort()[0];
   return until ? `codex exhausted until ${until} as recorded` : 'codex exhausted';

@@ -33,9 +33,10 @@ function entryFrom(value) {
   // `lastDay` decides retention, so it is validated rather than trusted: a malformed
   // value would fall back to a `since` that can prune a still-active streak, and a
   // value in the future would keep a dead one for millennia.
-  const day = typeof value.lastDay === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value.lastDay)
-    && timeMs(value.lastDay) !== null && timeMs(value.lastDay) <= Date.now() + 2 * 86400e3
-    ? value.lastDay : '';
+  // Kept verbatim. Normalising an unreadable value to '' silently handed retention back
+  // to `since`, which is how an actively deferring streak got pruned before the next
+  // note() could repair it; `serialize` decides what an unreadable value means instead.
+  const day = typeof value.lastDay === 'string' ? value.lastDay.slice(0, 20) : '';
   return {
     checkAfter: typeof value.checkAfter === 'string' ? value.checkAfter : '',
     since,
@@ -64,7 +65,17 @@ function parse(value) {
 function serialize(map, now = Date.now()) {
   const out = {};
   for (const [id, entry] of map) {
-    const seen = timeMs(entry.lastDay) ?? timeMs(entry.since);
+    // An entry that names a day Keep cannot read is kept, not pruned: it may be an
+    // active streak whose `lastDay` was mangled, and the next note() repairs it. Only a
+    // readable date, or no date at all, can retire one — and a date in the future is
+    // read as today, so nothing can keep itself alive by claiming to be from 9999.
+    const stated = entry.lastDay ? timeMs(entry.lastDay) : null;
+    if (entry.lastDay && stated === null) { out[id] = entry; continue; }
+    // A day in the future is not activity — it is a bad value claiming to be recent, and
+    // trusting it would keep a dead streak for as long as it cared to claim. The day's
+    // grace absorbs the UTC-versus-local boundary and ordinary clock skew.
+    const usable = stated !== null && stated <= now + 86400e3 ? stated : null;
+    const seen = usable ?? timeMs(entry.since);
     if (seen === null || now - seen > RETENTION_MS) { map.delete(id); continue; }
     out[id] = entry;
   }

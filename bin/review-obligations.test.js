@@ -253,7 +253,8 @@ test('the sweep writes the transition before it announces it', () => {
       readReviews: () => [],
       checkinTask: () => { order.push('checkin'); throw new Error('registry is locked'); },
     });
-    assert.deepEqual(order, ['write', 'checkin'], 'a transition announced but not written would be announced forever');
+    assert.deepEqual(order, ['write', 'checkin', 'write'],
+      'written, then announced, then the debt cleared — a transition announced but not written would be announced forever');
     assert.equal(result.settled.length, 1);
     assert.match(result.errors[0], /could not record the awaiting-verdict review: registry is locked/);
     assert.equal(box.read('a-card')[0].state, 'awaiting-verdict');
@@ -433,9 +434,11 @@ test('a live row for the job outweighs a job file that would not read', () => {
   const now = Date.now();
   const old = pending({ at: new Date(now - 30 * 60e3).toISOString(), misses: 2 });
   // Companion discovery is fine and says the job is running; only its own file failed
-  // to parse. Failing the review here would drop the gate on a demonstrably live job.
-  assert.equal(obligations.decide(old, { job: null, live: { state: 'running' }, discovery: 'ok', now }), null,
-    'nothing changes, so nothing is written — and no further miss is counted');
+  // to parse. Failing the review here would drop the gate on a demonstrably live job —
+  // and a row that still shows the process is affirmative evidence of life, so it clears
+  // the absences counted so far rather than merely not adding to them.
+  assert.deepEqual(obligations.decide(old, { job: null, live: { state: 'running' }, discovery: 'ok', now }),
+    { state: 'open', misses: 0, note: '' }, 'seeing it alive resets the count');
   // With nothing saying it is alive, the third confirmed absence still fails it.
   assert.equal(obligations.decide(old, { job: null, discovery: 'ok', now }).state, 'failed');
 });
@@ -565,4 +568,92 @@ test('the land gate names a corrupt store instead of an imaginary obligation', (
   assert.match(verdict.why, /the pending reviews for a-card could not be read/);
   assert.match(verdict.why, /repair or remove \.keep\/review-obligations\/<card>\.json/);
   assert.doesNotMatch(verdict.why, /keep reviewed --job/, 'no recovery command that cannot work');
+});
+
+// ---------- what round three found ----------
+
+test('a dead or long-stalled row decides on its own, without a job file', () => {
+  const now = Date.now();
+  // Asked before "I could not read the job file", so a dead process is not swallowed by
+  // the cannot-tell branch and left to time out six hours later.
+  const dead = obligations.decide(pending(), { job: null, live: { state: 'dead', reason: 'no process' }, now });
+  assert.equal(dead.state, 'failed');
+  assert.match(dead.note, /is dead \(no process\)/);
+  const stalled = obligations.decide(pending(), { job: null, live: { state: 'stalled', idleMs: 45 * 60e3 }, now });
+  assert.equal(stalled.state, 'failed');
+  // A stalled row inside the threshold is still alive, and clears the absence count.
+  assert.deepEqual(obligations.decide(pending({ misses: 2 }), { job: null, live: { state: 'stalled', idleMs: 60e3 }, now }),
+    { state: 'open', misses: 0, note: '' });
+});
+
+test('an undated awaiting-verdict record with a finished job still stops waiting', () => {
+  const now = Date.now();
+  const undated = pending({ state: 'awaiting-verdict', at: 'nonsense', stateAt: 'nonsense' });
+  const decision = obligations.decide(undated, { job: { status: 'completed' }, now });
+  assert.equal(decision.state, 'abandoned', 'an undated record is not perpetually just-settled');
+  assert.match(decision.note, /finished an unknown length of time ago/);
+  assert.doesNotMatch(decision.note, /Infinity|NaN/);
+  // And an undated record that does reach a time ceiling says so readably.
+  const missing = obligations.decide(pending({ at: 'nonsense', stateAt: 'nonsense' }), { job: null, discovery: 'unknown', now });
+  assert.equal(missing.state, 'abandoned');
+  assert.match(missing.note, /an unknown length of time/);
+  assert.doesNotMatch(missing.note, /Infinity/);
+});
+
+test('an announcement is built from the record as it stands, not from a stale snapshot', () => {
+  const box = fixture();
+  try {
+    box.write('a-card', [pending()]);
+    const landed = [];
+    let interfere = null;
+    const deps = {
+      root: box.root, withLock: nolock,
+      resolveJob: () => ({ status: 'completed' }),
+      readReviews: () => [],
+      checkinTask: (id, payload) => { landed.push(payload); if (interfere) interfere(); },
+    };
+    // First sweep moves it to awaiting-verdict but cannot deliver.
+    let failing = true;
+    const first = obligations.settle({ ...deps, checkinTask: () => { throw new Error('busy'); } });
+    assert.equal(first.announced, 0);
+    assert.equal(box.read('a-card')[0].announce, true);
+
+    // Between the sweeps somebody records the verdict, so the record is satisfied.
+    box.write('a-card', [{ ...box.read('a-card')[0], state: 'satisfied', note: 'verdict recorded', announce: true }]);
+    failing = false;
+    const second = obligations.settle(deps);
+    assert.equal(second.announced, 0, 'satisfied earns no check-in…');
+    assert.deepEqual(landed, [], '…and the stale "no verdict is recorded" notice is never written');
+    assert.equal('announce' in box.read('a-card')[0], false, 'the debt is cleared either way');
+  } finally { box.cleanup(); }
+});
+
+test('a card that will not take a check-in is given up on rather than retried forever', () => {
+  const box = fixture();
+  try {
+    box.write('a-card', [pending()]);
+    const deps = {
+      root: box.root, withLock: nolock,
+      resolveJob: () => ({ status: 'completed' }),
+      readReviews: () => [],
+      checkinTask: () => { throw new Error('no such task: a-card'); },
+    };
+    let sweeps = 0;
+    for (; sweeps < 40; sweeps += 1) {
+      obligations.settle(deps);
+      if (!('announce' in (box.read('a-card')[0] || {}))) break;
+    }
+    assert.ok(sweeps < 39, 'an archived card must not be retried every five minutes forever');
+    const record = box.read('a-card')[0];
+    assert.equal('announce' in record, false);
+    assert.equal(record.state, 'awaiting-verdict', 'and the state it reached still stands');
+  } finally { box.cleanup(); }
+});
+
+test('a record that still owes a check-in outlives retention', () => {
+  const now = Date.now();
+  const owing = pending({ state: 'failed', stateAt: new Date(now - 60 * DAY).toISOString(), announce: true });
+  const quiet = pending({ id: 'obl-2', state: 'failed', stateAt: new Date(now - 60 * DAY).toISOString() });
+  assert.deepEqual(obligations.keptRecords([owing, quiet], now).map((entry) => entry.id), ['obl-1'],
+    'pruning the owing one would throw away the only thing that knows it never landed');
 });

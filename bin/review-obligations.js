@@ -30,6 +30,10 @@ const MISSING_JOB_GRACE_MS = 15 * 60e3;
 // directory or a half-written job file too, so a job has to be missing on three
 // consecutive sweeps before Keep is willing to call the review dead.
 const MISSING_JOB_CONFIRMATIONS = 3;
+// A card that will not take a check-in — an archived one never will — must not be
+// retried every five minutes forever. The attempts are on the record, so a restart does
+// not start the count over.
+const MAX_ANNOUNCE_TRIES = 12;
 // A Codex review that has been running for six hours is not going to answer. The
 // obligation is abandoned rather than failed: nobody saw it die, so the honest
 // statement is that Keep stopped waiting.
@@ -74,7 +78,9 @@ const HISTORY_RETENTION_MS = 30 * 24 * 3600e3;
 
 function keptRecords(records, now = Date.now()) {
   return records.filter((record) => {
-    if (isOpen(record)) return true;
+    // A record that still owes a check-in outlives retention: pruning it would throw
+    // away the only thing that knows the announcement never landed.
+    if (isOpen(record) || record.announce === true) return true;
     const at = timeMs(record.stateAt || record.at);
     return at === null || now - at <= HISTORY_RETENTION_MS;
   });
@@ -205,17 +211,28 @@ function satisfiedByCoverage(record, reviewRecords, now) {
   });
 }
 
+// How long a clock has been running, or Infinity when the record carries no readable
+// timestamp to measure from. Infinity is deliberate: an undated record is not young, and
+// every ceiling here has to fire for it rather than never.
+function elapsed(now, ...stamps) {
+  for (const stamp of stamps) {
+    const at = timeMs(stamp);
+    if (at !== null) return now - at;
+  }
+  return Infinity;
+}
+
+function forHumans(ms) {
+  return Number.isFinite(ms) ? `${Math.round(ms / 3600e3)}h` : 'an unknown length of time';
+}
+
 function decide(record, { job, jobUnknown = false, live, discovery = 'ok', reviewRecords, now = Date.now() } = {}) {
   if (!isOpen(record)) return null;
-  // A record with no readable `at` is not young — it is undated. Reading it as "opened
-  // just now" would keep it inside its own grace forever, counting a miss and rewriting
-  // the file every five minutes for as long as the daemon runs.
-  const openedAt = timeMs(record.at) ?? timeMs(record.stateAt);
-  const age = openedAt === null ? Infinity : now - openedAt;
-  const sinceState = now - (timeMs(record.stateAt || record.at) ?? now);
-  const touch = (misses) => (Number(record.misses) || 0) === misses
-    ? null
-    : { state: record.state, misses, note: record.note || '' };
+  const age = elapsed(now, record.at, record.stateAt);
+  const sinceState = elapsed(now, record.stateAt, record.at);
+  const misses = Number(record.misses) || 0;
+  const touch = (next) => (misses === next ? null : { state: record.state, misses: next, note: record.note || '' });
+  const stopWaiting = (why) => ({ state: 'abandoned', note: why });
   if (citedBy(record, reviewRecords, now)) {
     return { state: 'satisfied', note: 'the verdict was recorded on the card' };
   }
@@ -224,35 +241,47 @@ function decide(record, { job, jobUnknown = false, live, discovery = 'ok', revie
   }
   // An obligation whose verdict nobody ever records must still end. Six hours after Keep
   // said the job had finished, the session that was going to read it is not coming back.
-  const stopWaiting = (why) => ({ state: 'abandoned', note: why });
   if (record.state === 'awaiting-verdict' && sinceState > MAX_RUNNING_MS) {
-    return stopWaiting(`Codex job ${record.job} finished ${Math.round(sinceState / 3600e3)}h ago and no verdict was ever recorded`);
+    return stopWaiting(`Codex job ${record.job} finished ${forHumans(sinceState)} ago and no verdict was ever recorded`);
+  }
+  // What the live sweep says about the process, which needs no job file at all. Asked
+  // before the job file, so a dead or long-stalled row decides on its own rather than
+  // being swallowed by "I could not read the file".
+  if (live && live.state === 'dead') {
+    return { state: 'failed', note: `Codex job ${record.job} is dead${live.reason ? ` (${live.reason})` : ''}` };
+  }
+  if (live && live.state === 'stalled' && Number(live.idleMs) > STALL_MS) {
+    return { state: 'failed', note: `Codex job ${record.job} has been idle for ${Math.round(Number(live.idleMs) / 60e3)} minutes with no output` };
   }
   // "I could not look" is never evidence that the job is gone. Three separate readers
   // can each fail to see it: the companion's discovery, the jobs directory, and the job
-  // file itself. A live row for this job is the strongest of them — if the companion can
-  // see the process, an unreadable job file says nothing about whether it is running.
-  const cannotTell = jobUnknown || (!job && discovery !== 'ok') || (!job && live);
-  if (cannotTell) {
-    return age > MAX_RUNNING_MS
-      ? stopWaiting(`Keep has not been able to see Codex job ${record.job} for ${Math.round(age / 3600e3)}h`)
-      : touch(Number(record.misses) || 0);
+  // file itself. A live row that still shows the process is affirmative evidence of
+  // life, so it clears the absences counted so far — otherwise one unreadable file after
+  // a run of them would fail a review the companion can see running.
+  const alive = Boolean(live) && !job;
+  if (jobUnknown || (!job && discovery !== 'ok') || alive) {
+    if (age > MAX_RUNNING_MS) {
+      return stopWaiting(`Keep has not been able to see Codex job ${record.job} for ${forHumans(age)}`);
+    }
+    return touch(alive ? 0 : misses);
   }
   if (!job) {
-    const misses = (Number(record.misses) || 0) + 1;
-    if (age < MISSING_JOB_GRACE_MS || misses < MISSING_JOB_CONFIRMATIONS) {
-      return { state: record.state, misses, note: record.note || '' };
+    const next = misses + 1;
+    if (age < MISSING_JOB_GRACE_MS || next < MISSING_JOB_CONFIRMATIONS) {
+      return { state: record.state, misses: next, note: record.note || '' };
     }
     return {
       state: 'failed',
       note: `Keep cannot find Codex job ${record.job}${record.accountId ? ` in account ${record.accountId}` : ''}`,
     };
   }
-  // The job answered. Whatever it says, the misses a failed read counted are stale —
+  // The job answered. Whatever it says, the absences a failed read counted are stale —
   // cleared on every path from here, so three *non-consecutive* failures can never add
   // up to a confirmed absence.
   const status = String(job.status || '').toLowerCase();
   if (status === 'completed') {
+    // An undated awaiting-verdict record never reaches here: its sinceState is Infinity,
+    // so the abandonment ceiling above has already fired.
     return record.state === 'awaiting-verdict'
       ? touch(0)
       : { state: 'awaiting-verdict', note: 'the job finished; the verdict is not recorded yet' };
@@ -260,14 +289,8 @@ function decide(record, { job, jobUnknown = false, live, discovery = 'ok', revie
   if (FAILED_STATUSES.has(status)) {
     return { state: 'failed', note: `Codex job ${record.job} ended ${status} without a verdict` };
   }
-  if (live && live.state === 'dead') {
-    return { state: 'failed', note: `Codex job ${record.job} is dead${live.reason ? ` (${live.reason})` : ''}` };
-  }
-  if (live && live.state === 'stalled' && Number(live.idleMs) > STALL_MS) {
-    return { state: 'failed', note: `Codex job ${record.job} has been idle for ${Math.round(Number(live.idleMs) / 60e3)} minutes with no output` };
-  }
   if (age > MAX_RUNNING_MS) {
-    return stopWaiting(`Codex job ${record.job} has been running for ${Math.round(age / 3600e3)}h with no verdict`);
+    return stopWaiting(`Codex job ${record.job} has been running for ${forHumans(age)} with no verdict`);
   }
   return touch(0);
 }
@@ -338,6 +361,12 @@ function checkin(record, decision) {
 // What a record looked like when this pass read it. A write only replaces a record that
 // still looks exactly like this: a `keep reviewing --drop` that landed in the window owns
 // its record, and must not be overwritten by a state it has already moved past.
+function omit(record, ...keys) {
+  const next = { ...record };
+  for (const key of keys) delete next[key];
+  return next;
+}
+
 function basisOf(record) {
   return { state: record.state, stateAt: record.stateAt || '', misses: Number(record.misses) || 0 };
 }
@@ -363,6 +392,14 @@ function settle(deps = {}) {
   // still exactly as this pass saw them. Every writer of this file goes through the
   // registry lock — the CLI's append and drop included — so the last rename carries
   // everyone's work rather than the copy its own writer started from.
+  // Clearing or re-stamping one record's announcement debt, by id. The debt flag is its
+  // own identity — unlike a settlement, this write must land whatever else moved.
+  const commitById = (id, recordId, change) => withLock(() => {
+    writeRecords(id, readRecords(id, root).map((record) => (
+      record.id === recordId && record.announce === true ? change(record) : record
+    )), root, now);
+  });
+
   const commit = (id, basis, change) => {
     const touched = new Set();
     withLock(() => {
@@ -436,20 +473,42 @@ function settle(deps = {}) {
       catch (error) { result.errors.push(`${id}: could not prune obligations: ${error.message || error}`); }
     }
 
-    for (const record of owed.values()) {
-      const entry = checkin(record, { state: record.state, note: record.note });
+    for (const recordId of owed.keys()) {
+      // Re-read rather than announcing the snapshot this pass started from. Another
+      // writer may have settled this record in the meantime, and a check-in saying "no
+      // verdict is recorded" about a record that now carries one is worse than a late
+      // one. The debt flag is the identity here, not the state it was in.
+      let current = null;
+      try { current = readRecords(id, root).find((record) => record.id === recordId) || null; }
+      catch (error) { result.errors.push(`${id}: ${error.message || error}`); continue; }
+      if (!current || current.announce !== true) continue;
+
+      const entry = checkin(current, { state: current.state, note: current.note });
       if (entry) {
         try { checkinTask(id, entry); }
         catch (error) {
-          result.errors.push(`${id}: could not record the ${record.state} review: ${error.message || error}`);
+          result.errors.push(`${id}: could not record the ${current.state} review: ${error.message || error}`);
+          // A card that has been refusing the check-in for a day is not going to take
+          // it — an archived card never will. Give up loudly rather than retrying every
+          // five minutes until the end of time.
+          const tries = (Number(current.announceTries) || 0) + 1;
+          try {
+            commitById(id, recordId, (record) => (tries >= MAX_ANNOUNCE_TRIES
+              ? omit(record, 'announce', 'announceTries')
+              : { ...record, announceTries: tries }));
+          } catch (writeError) { result.errors.push(`${id}: ${writeError.message || writeError}`); }
+          if (tries >= MAX_ANNOUNCE_TRIES) {
+            result.errors.push(`${id}: gave up announcing the ${current.state} review after ${tries} attempts`);
+          }
           continue;
         }
         result.announced += 1;
       }
-      // Clear the debt only once the commit is on the card, and only if the record has
-      // not moved since: a retry must never resurrect a state somebody else changed.
-      try { commit(id, new Map([[record.id, basisOf(record)]]), (current) => { const { announce, ...rest } = current; return rest; }); }
-      catch (error) { result.errors.push(`${id}: could not clear the announcement for ${record.id}: ${error.message || error}`); }
+      // Cleared by id and by the debt flag itself: a bookkeeping change to the record
+      // between the delivery and this write must not leave the debt standing and the
+      // card announced twice.
+      try { commitById(id, recordId, (record) => omit(record, 'announce', 'announceTries')); }
+      catch (error) { result.errors.push(`${id}: could not clear the announcement for ${recordId}: ${error.message || error}`); }
     }
   }
   return result;

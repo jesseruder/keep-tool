@@ -664,6 +664,11 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
   }
   if (!enforce) freshOpensThisTick += 1;
   if (enforce) markDay('opened', task.id, today);
+  // A check that ran is not deferred any more, whichever path opened it — the
+  // scheduler, a probe escalation, `keep verify`, or the fallback account. Clearing
+  // only on the scheduler's path left a probe card carrying its old fallback attempts
+  // into the next exhausted window.
+  clearBudgetDeferral(task.id, today);
   const delivery = {
     sessionId: (opened && opened.sessionId) || '',
     kind: 'claude',
