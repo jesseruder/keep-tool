@@ -19,6 +19,13 @@ const ESCALATE_AFTER_MS = 24 * 3600e3;
 // stopped deferring a fortnight ago is history, not bookkeeping.
 const RETENTION_MS = 14 * 24 * 3600e3;
 
+// Only a scalar may be coerced: converting a hostile object throws, and everything here
+// reads a hand-editable file.
+function scalar(value) {
+  const kind = typeof value;
+  return kind === 'number' || kind === 'string' || kind === 'boolean' ? value : undefined;
+}
+
 function timeMs(stamp) {
   const parsed = Date.parse(String(stamp || '').replace(' ', 'T'));
   return Number.isFinite(parsed) ? parsed : null;
@@ -35,8 +42,10 @@ function entryFrom(value) {
   if (!value || typeof value !== 'object') return null;
   const since = typeof value.since === 'string' ? value.since : '';
   if (!since || timeMs(since) === null) return null;
-  const notices = Number(value.notices);
-  const tries = Number(value.tries);
+  // `Number({toString: 0})` throws TypeError, and this parser runs inside the daemon's
+  // scheduler state load: a throw here wedged every tick, not just this entry.
+  const notices = Number(scalar(value.notices));
+  const tries = Number(scalar(value.tries));
   // `lastDay` is kept verbatim. Normalising an unreadable value to '' silently handed
   // retention back to `since`, which is how an actively deferring streak got pruned
   // before the next note() could repair it; `serialize` decides what one means instead.

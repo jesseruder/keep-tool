@@ -226,3 +226,12 @@ test('an empty lastDay is repaired like a damaged one, not read as never active'
     assert.equal(map.get('live').lastDay, deferrals.dayOf(base));
   }
 });
+
+test('a counter that refuses to be a number does not wedge the scheduler', () => {
+  const hostile = { toString: 0, valueOf: 0 };
+  // This parser runs inside the daemon's scheduler-state load, and every caller of that
+  // is inside a tick: a throw here took the tick, and the next one, and the one after.
+  const map = deferrals.parse({ live: { since: '2026-09-16 18:17', checkAfter: 'x', notices: hostile, tries: hostile } });
+  assert.equal(map.get('live').notices, 0);
+  assert.equal(map.get('live').tries, undefined);
+});

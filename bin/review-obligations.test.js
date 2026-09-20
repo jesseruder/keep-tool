@@ -986,3 +986,34 @@ test('a damaged counter cannot hold an obligation open for ever', () => {
     assert.equal(obligations.decide(current, { job: null, now }).state, 'failed');
   } finally { box.cleanup(); }
 });
+
+// ---------- what round ten found ----------
+
+// `Number({toString: 0})` and `String({toString: 0})` both throw TypeError. Every one
+// of these fields is read from a hand-editable file and then interpolated, compared or
+// counted, and a throw in a parser is a throw in the sweep that called it.
+test('no value in a record can throw on its way through the parser', () => {
+  const box = fixture();
+  const hostile = { toString: 0, valueOf: 0 };
+  try {
+    fs.mkdirSync(obligations.obligationsDir(box.root), { recursive: true });
+    fs.writeFileSync(obligations.cardFile('a-card', box.root), JSON.stringify([{
+      ...pending(),
+      job: hostile, card: hostile, accountId: hostile, by: hostile, note: hostile,
+      misses: hostile, announceTries: hostile,
+      commits: [{ sha: hostile, patchId: hostile, subject: hostile }],
+    }]));
+    const record = obligations.readRecords('a-card', box.root)[0];
+    assert.equal(record.job, '');
+    assert.equal(record.card, '');
+    assert.equal(record.note, '');
+    assert.equal(record.misses, undefined);
+    assert.deepEqual(record.commits, [{ sha: '', patchId: '', subject: '' }]);
+
+    // And every reader of it survives: the decision, the message, and the land gate.
+    const decision = obligations.decide(record, { job: { status: 'completed' }, now: Date.now() });
+    const entry = obligations.checkin(obligations.applied(record, decision), decision);
+    assert.match(entry.message, /has finished/);
+    assert.equal(allow.decideLand({ records: [], commits: [commit('a'.repeat(40), 'p1')], obligations: [record] }).ok, false);
+  } finally { box.cleanup(); }
+});

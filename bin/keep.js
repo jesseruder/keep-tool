@@ -1635,7 +1635,7 @@ commands.reviewing = (argv) => {
       obligations.writeRecords(id, records.map((record) => (record.id === target.id
         ? obligations.applied(record, { state: 'abandoned', note: `dropped: ${o.m}` })
         : record)));
-      console.log(`${id}: dropped pending review ${target.id} (job ${target.job}) — nothing from that job is recorded;`
+      console.log(`${id}: dropped pending review ${target.id} (job ${target.job});`
         + ` keep reviews ${id} lists what is on the card`);
     }));
     return;

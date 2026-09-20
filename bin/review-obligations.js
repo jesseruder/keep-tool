@@ -59,14 +59,14 @@ function cardFile(id, root = keep.ROOT) { return path.join(obligationsDir(root),
 // a land through as if no review were outstanding — and an append built on `[]` would
 // overwrite the history it could not read.
 function readRecords(id, root = keep.ROOT, stats = null) {
-  let text;
-  try { text = fs.readFileSync(cardFile(id, root), 'utf8'); }
+  let raw;
+  try { raw = fs.readFileSync(cardFile(id, root), 'utf8'); }
   catch (error) {
     if (error && error.code === 'ENOENT') return [];
     fail(`cannot read the pending reviews for ${id}: ${error.message || error}`);
   }
   let value;
-  try { value = JSON.parse(text); }
+  try { value = JSON.parse(raw); }
   catch (error) { fail(`the pending reviews for ${id} are not readable JSON: ${error.message || error}`); }
   if (!Array.isArray(value)) fail(`the pending reviews for ${id} are not a list`);
   // Normalised, not trusted. A hand-edited record with no `commits` used to throw deep
@@ -85,8 +85,15 @@ function readRecords(id, root = keep.ROOT, stats = null) {
   return usable
     .map((record) => ({
       ...record,
-      job: typeof record.job === 'string' ? record.job : '',
-      commits: Array.isArray(record.commits) ? record.commits.filter((commit) => commit && typeof commit === 'object') : [],
+      // Every field a reader interpolates or compares, as the type that reader expects.
+      // These records are hand-editable files, and a check-in message is a template
+      // string: one object with a hostile `toString` would throw in the sweep.
+      job: text(record.job, 200),
+      card: text(record.card, 200),
+      accountId: text(record.accountId, 80),
+      by: text(record.by, 120),
+      note: text(record.note, NOTE_LIMIT),
+      commits: commitsOf(record.commits),
       // Bounded, because the counters decide when an obligation ends. `-1e30 + 1` is
       // still `-1e30` in floating point, so a damaged `misses` could sit below its
       // threshold for ever while the obligation gated its commits.
@@ -138,12 +145,35 @@ function cards(root = keep.ROOT) {
   } catch { return []; }
 }
 
+// Coercion is where a hostile value gets its say: `Number({toString: 0})` and
+// `String({toString: 0})` both throw TypeError, and a throw in a parser is a throw in
+// the sweep that called it. Nothing off disk is converted without being a scalar first.
+function scalar(value) {
+  const kind = typeof value;
+  return kind === 'number' || kind === 'string' || kind === 'boolean' ? value : undefined;
+}
+
+function text(value, limit = 400) {
+  const flat = scalar(value);
+  return flat === undefined ? '' : String(flat).slice(0, limit);
+}
+
 // A persisted counter, clamped to [0, ceiling]. Absent stays absent: these fields are
 // written only when they are non-zero.
 function counter(value, ceiling, name) {
-  const number = Math.trunc(Number(value));
+  const number = Math.trunc(Number(scalar(value)));
   if (!Number.isFinite(number) || number <= 0) return value === undefined ? {} : { [name]: undefined };
   return { [name]: Math.min(number, ceiling) };
+}
+
+// The commits a record claims to cover, as the strings every reader of them expects.
+function commitsOf(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter((commit) => commit && typeof commit === 'object').map((commit) => ({
+    sha: text(commit.sha, 80),
+    patchId: text(commit.patchId, 80),
+    subject: text(commit.subject, 200),
+  }));
 }
 
 function recordId(now = Date.now()) {

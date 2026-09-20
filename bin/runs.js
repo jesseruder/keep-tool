@@ -344,12 +344,20 @@ function loadSchedulerState() {
   if (schedulerState) return schedulerState;
   let parsed = null;
   try { parsed = JSON.parse(fs.readFileSync(SCHEDULER_STATE_FILE, 'utf8')); } catch {}
-  schedulerState = {
-    opened: dayRecord(parsed && parsed.opened),
-    budgetNotice: dayRecord(parsed && parsed.budgetNotice),
-    reopened: dayRecord(parsed && parsed.reopened),
-    deferred: checkDeferrals.parse(parsed && parsed.deferred),
-  };
+  // Parsing included: this is bookkeeping read from a hand-editable file, and every
+  // caller of it is inside a scheduler tick. Losing a day of it costs a duplicate pane;
+  // throwing here cost the whole tick, and the next one, and the one after that.
+  try {
+    schedulerState = {
+      opened: dayRecord(parsed && parsed.opened),
+      budgetNotice: dayRecord(parsed && parsed.budgetNotice),
+      reopened: dayRecord(parsed && parsed.reopened),
+      deferred: checkDeferrals.parse(parsed && parsed.deferred),
+    };
+  } catch (e) {
+    process.stderr.write(`keep runs: scheduler state was unreadable and has been reset: ${e.message}\n`);
+    schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map(), deferred: new Map() };
+  }
   return schedulerState;
 }
 
