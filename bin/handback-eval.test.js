@@ -36,6 +36,9 @@ test('an offer to do the work suppresses the ask; an offer of other work does no
   // "say the word" means the session will do the thing under discussion.
   assert.equal(evaluator.detect('Please run `npm test`. I can run it here instead — say the word.').handback, false);
   assert.equal(evaluator.detect('The branch is ready. May I run `wt land` and restart the daemon?').handback, false);
+  // An offer of *this* step in the next sentence still suppresses: "it" points
+  // back at the step that was just named.
+  assert.equal(evaluator.detect('Please run `npm test` when you get a chance. I can run it myself if you prefer.').handback, false);
   // …whereas an offer of something else leaves the hand-off standing.
   assert.equal(evaluator.detect('I can run the unit tests here. Please push the branch with `git push`.').handback, true);
 });
@@ -124,6 +127,12 @@ test('index rows are redacted and carry no session id unless asked', () => {
   assert.equal(evaluator.redact('see /home/alice/repo and /Users/bob/repo'), 'see ~/repo and ~/repo');
   assert.equal(evaluator.redact('C:\\Users\\bob\\repo failed'), '~\\repo failed');
   assert.equal(evaluator.redact('it lives in /root/keep'), 'it lives in ~/keep');
+  assert.equal(evaluator.redact('it lives in /var/root/keep'), 'it lives in ~/keep');
+  assert.equal(evaluator.redact('C:/Users/alice/repo'), '~/repo');
+  // A Windows user name can contain spaces; stopping at the space would leave
+  // half of it in the output.
+  assert.equal(evaluator.redact('C:\\Users\\Alice Smith\\repo'), '~\\repo');
+  assert.equal(evaluator.redact('the /rooted tree'), 'the /rooted tree');
   assert.equal(evaluator.redact('turn 1a2b3c4d-1111-2222-3333-444455556666 ended'), 'turn <SESSION> ended');
   assert.equal(evaluator.redact('mail bob@example.com'), 'mail <EMAIL>');
   assert.match(evaluator.redact(`blob ${'a1b2c3d4'.repeat(5)}`), /<HASH>/);
@@ -165,6 +174,10 @@ test('a suite with an unredacted excerpt or a bad label is refused', () => {
   for (const [text, message] of unredacted) {
     assert.throws(() => evaluator.loadSuite(write([{ ...base, text }])), message, text);
   }
+  // Every published string, not only `text`: a fixture's `source` is where a
+  // path or an address gets written down without thinking.
+  assert.throws(() => evaluator.loadSuite(write([{ ...base, source: 'reported by alice@example.com' }])), /source carries an email/);
+  assert.throws(() => evaluator.loadSuite(write([{ ...base, reason: 'seen in /home/alice/repo' }])), /reason carries a home path/);
   // The /g patterns are shared, so a second call must not resume mid-string.
   const dirty = write([{ ...base, text: 'run it in /home/someone/repo' }]);
   assert.throws(() => evaluator.loadSuite(dirty), /home path/);

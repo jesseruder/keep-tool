@@ -137,7 +137,12 @@ const CARVE_OUTS = [
 // the unit tests here. Please push the branch with `git push`." is a hand-off
 // with an offer beside it, not an offer of the hand-off. That form stays a
 // segment-local carve-out, where it can only suppress the ask it sits in.
-const STRONG_OFFER_RE = /\b(?:say the word|want me to\b|shall I\b|may I\b|would you like me to\b|should I\b|say ["“]?land["”]?\b|tell me to and I will|and I(?:'|’)ll (?:run|do|land|handle) )/i;
+// The last clause is what tells the two apart. "I can run **it** myself" points
+// back at the step just named, so the offer is of that step; "I can run **the
+// unit tests** here" names something else, and the hand-off beside it stands.
+// An anaphoric object is the only cheap evidence that an offer in the next
+// sentence is an offer of *this* work.
+const STRONG_OFFER_RE = /\b(?:say the word|want me to\b|shall I\b|may I\b|would you like me to\b|should I\b|say ["“]?land["”]?\b|tell me to and I will|and I(?:'|’)ll (?:run|do|land|handle) )|\bI (?:can|could)(?!(?:'|’)t|not\b)\s+(?:just\s+|also\s+|still\s+)?\w+\s+(?:it|that|them|this|those)\b/i;
 
 // There is deliberately no "the session said it could not" carve-out.
 //
@@ -353,8 +358,14 @@ function loadSuite(file = DEFAULT_SUITE) {
       ['a home path', HOME_RE], ['a session id', UUID_RE], ['an email address', EMAIL_RE],
       ['a long hash', LONG_HASH_RE], ['a session id', /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}\b/i],
     ]) {
-      pattern.lastIndex = 0; // these are /g, and a shared regex keeps its index
-      if (pattern.test(item.text)) throw Error(`${item.id}: text carries ${what}; redact it first`);
+      // Every string the fixture publishes, not just `text`: `source` names
+      // where a case came from, which is exactly where a path or an address
+      // would be written down without thinking.
+      for (const [field, value] of Object.entries(item)) {
+        if (typeof value !== 'string') continue;
+        pattern.lastIndex = 0; // these are /g, and a shared regex keeps its index
+        if (pattern.test(value)) throw Error(`${item.id}: ${field} carries ${what}; redact it first`);
+      }
     }
   }
   return suite;
@@ -464,7 +475,12 @@ const SAMPLE_SQL = `SELECT t.id AS id, t.session_id AS session_id, t.n AS n, t.e
 // Home directories on every platform, not just this one: a report is redacted or
 // it is not, and "/Users only" is the kind of guarantee that holds until the
 // first transcript from another machine.
-const HOME_RE = /(?:\/(?:Users|home)\/[^\s/"'`]+|\/root\b|[A-Za-z]:\\+Users\\+[^\s\\"'`]+)/g;
+// A Windows user name may contain spaces, so it runs to the next separator
+// rather than to the next space — under-redacting a name is the failure that
+// matters, and over-redacting a few words is not. `/var/root` is the macOS root
+// home and has to match as a whole, or the `/var/` prefix is left dangling in
+// front of the tilde.
+const HOME_RE = /(?:\/(?:Users|home)\/[^\s/"'`]+|(?<![\w/])\/(?:var\/)?root\b|[A-Za-z]:[\\/]+Users[\\/]+[^\\/\n"'`]{1,64})/g;
 const UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.]+/g;
 const LONG_HASH_RE = /\b[0-9a-f]{32,}\b/gi;
