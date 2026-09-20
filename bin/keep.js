@@ -1306,9 +1306,15 @@ commands.overdue = (argv) => {
   const o = parseArgs(argv, { brief: 'bool' });
   const tasks = loadAll(false).filter(isOverdue).sort((a, b) => a.fm.check_after.localeCompare(b.fm.check_after));
   if (!tasks.length) return o.brief ? undefined : console.log('nothing overdue');
+  // Why a due check has not run is the part `keep overdue` could never say. The
+  // scheduler records budget deferrals per card; reading them here is what turns a
+  // list of stale dates into "this one is stalled on an exhausted account".
+  const deferrals = require('./check-deferrals.js');
+  const deferred = deferrals.read(ROOT);
   for (const t of tasks) {
-    if (o.brief) console.log(`- ${t.id}: "${t.fm.title}" check was due ${t.fm.check_after.replace('T', ' ')}${t.fm.check ? ' (has check recipe)' : ''}`);
-    else console.log(fmtTask(t));
+    const why = deferrals.describe(deferred.get(t.id), t.fm.check_after);
+    if (o.brief) console.log(`- ${t.id}: "${t.fm.title}" check was due ${t.fm.check_after.replace('T', ' ')}${t.fm.check ? ' (has check recipe)' : ''}${why}`);
+    else console.log(`${fmtTask(t)}${why}`);
   }
 };
 

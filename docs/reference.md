@@ -2045,7 +2045,28 @@ check-in per card per day (at most three *written* notices a tick; a card alread
 noticed today costs nothing, and the rest are logged only),
 changes neither the status nor the schedule, and leaves the card overdue for the tick
 after the reset. An *unreadable* usage snapshot is not treated as no budget — that would
-stop every card on the board. `KEEP_CHECK_MODEL`, when set, is both the model the opened
+stop every card on the board.
+
+A deferral is correct on its own and invisible in aggregate, so it has a ceiling. The
+scheduler keys a deferral streak on the card's current `check_after` (rescheduling the
+card starts a new one) and counts deferred *days*, not ticks. On the second deferred day,
+or 24 hours after the first deferral, the streak escalates exactly once:
+
+- If an explicitly configured `checks-fallback` automation account exists — a Claude
+  account that is not the `checks` account itself — the check is opened on it, the card
+  records which account ran it, and the streak ends. An unset purpose is not a fallback:
+  `automationFor` would answer with the agent default, which is the account that just
+  refused.
+- Otherwise the card records one `check stalled` check-in naming how long it has been
+  deferred and what to do about it (`keep verify`, reschedule, or configure a fallback),
+  and `keep overdue` marks the card `check stalled on the account budget` from then on.
+
+After escalating, the card stops writing the daily `check deferred` note — the stalled
+record and the `keep overdue` annotation carry it. A refusal that is the scheduler's own
+bookkeeping (the per-day open, the per-tick cap) does not latch the escalation; it is
+retried on a later tick. Escalations share the per-tick notice ceiling, and one held back
+by it keeps its unlatched streak for the next tick. The streak lives in the `deferred`
+bucket of `.keep/runs/scheduler-state.json` and is pruned after a fortnight. `KEEP_CHECK_MODEL`, when set, is both the model the opened
 session is launched with and the model the budget is classified against, so the window
 Keep checks is the window Keep spends; unset, the session takes the model in
 settings.json and the budget is read against the reviewer's model as a proxy.

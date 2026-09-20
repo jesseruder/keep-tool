@@ -16,6 +16,7 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 const keep = require('./keep.js');
 const health = require('./health.js');
+const checkDeferrals = require('./check-deferrals.js');
 
 const RUNS_DIR = path.join(keep.ROOT, '.keep', 'runs');
 // Poll more often without shortening the default ~two-hour busy-thread grace.
@@ -344,6 +345,7 @@ function loadSchedulerState() {
     opened: dayRecord(parsed && parsed.opened),
     budgetNotice: dayRecord(parsed && parsed.budgetNotice),
     reopened: dayRecord(parsed && parsed.reopened),
+    deferred: checkDeferrals.parse(parsed && parsed.deferred),
   };
   return schedulerState;
 }
@@ -356,7 +358,12 @@ function saveSchedulerState(today = keep.nowStamp().slice(0, 10)) {
     for (const [id, day] of map) if (day !== today) map.delete(id);
     return Object.fromEntries(map);
   };
-  const payload = { opened: prune(state.opened), budgetNotice: prune(state.budgetNotice), reopened: prune(state.reopened) };
+  const payload = {
+    opened: prune(state.opened), budgetNotice: prune(state.budgetNotice), reopened: prune(state.reopened),
+    // Not a day record: a deferral streak has to be able to see across midnight, so
+    // this bucket prunes on its own retention rather than on today's date.
+    deferred: checkDeferrals.serialize(state.deferred),
+  };
   const tmp = `${SCHEDULER_STATE_FILE}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.mkdirSync(RUNS_DIR, { recursive: true });
@@ -429,6 +436,131 @@ function noteBudgetDeferral(task, reason, today, deps = keep) {
     process.stderr.write(`keep runs: could not record the deferred check for ${task.id}: ${e.message}\n`);
   }
   return true;
+}
+
+// ---------- bounding a deferral streak ----------
+
+// The account a deferred check may be retried on. Only an explicitly configured
+// `checks-fallback` purpose counts: accounts.automationFor falls back to the agent
+// default for an unset purpose, and re-running the same exhausted account under
+// another name is not a fallback. Undefined means the install configured none.
+function checksFallbackAccountId(env = process.env, deps = {}) {
+  const accounts = deps.accounts || require('./accounts.js');
+  let configured;
+  try { configured = accounts.publicState(env).automationAccounts['checks-fallback']; }
+  catch { return undefined; }
+  if (!configured) return undefined;
+  const primary = (deps.checksAccountId || checksAccountId)(env);
+  if (primary && configured === primary) return undefined;
+  const account = accounts.get(configured, env);
+  return account && account.agent === 'claude' ? configured : undefined;
+}
+
+// Bookkeeping for one budget deferral, keyed on the card's current `check_after`, so
+// rescheduling a card starts its streak over. Returns the entry and whether this
+// deferral is the one that has to stop being silent.
+function recordBudgetDeferral(task, reason, today, now = Date.now()) {
+  const state = loadSchedulerState();
+  const entry = checkDeferrals.note(state.deferred, task.id, {
+    checkAfter: task.fm.check_after || '', reason, stamp: keep.nowStamp(), today,
+  });
+  saveSchedulerState(today);
+  return { entry, escalate: checkDeferrals.escalationDue(entry, now) };
+}
+
+// A check that ran, or was delivered, is not deferred any more — and a card whose
+// schedule moved has a new streak, not a continuing one.
+function clearBudgetDeferral(taskId, today) {
+  const state = loadSchedulerState();
+  if (!checkDeferrals.clear(state.deferred, taskId)) return false;
+  saveSchedulerState(today);
+  return true;
+}
+
+// The end of the line: no fallback account, or one that is exhausted too. One
+// check-in, with the streak in it, and `keep overdue` marks the card stalled from
+// here on. Status and schedule are untouched — the check is still wanted, and the
+// next tick after the reset still picks it up.
+function noteStalledCheck(task, entry, reason, deps = keep) {
+  const since = String(entry.since || '').replace('T', ' ');
+  const days = entry.notices > 1 ? ` on ${entry.notices} separate days` : '';
+  try {
+    deps.checkinTask(task.id, {
+      heading: 'check stalled',
+      message: `check stalled: deferred since ${since}${days} because ${clip(reason, 300)}.`
+        + ' No fallback account is configured or available, so this check has not run.'
+        + ` Run it by hand with keep verify ${task.id}, reschedule it, or configure a checks-fallback automation account.`,
+      linkSession: false,
+      commitLabel: 'check',
+    });
+    return true;
+  } catch (e) {
+    process.stderr.write(`keep runs: could not record the stalled check for ${task.id}: ${e.message}\n`);
+    return false;
+  }
+}
+
+// A deferral streak that reached its ceiling: retry once on the configured fallback
+// account, and say so on the card either way. Returns true when the escalation was
+// carried out (and may be latched), false when it should be retried next tick.
+async function escalateBudgetDeferral(task, reason, today, opts = {}) {
+  const fallbackId = opts.fallbackAccountId !== undefined
+    ? opts.fallbackAccountId
+    : (opts.checksFallbackAccountId || checksFallbackAccountId)();
+  if (fallbackId) {
+    let outcome;
+    try {
+      outcome = await openFreshCheckSession(task, { ...opts, today, accountId: fallbackId });
+    } catch (e) {
+      process.stderr.write(`keep runs: fallback check session for ${task.id} could not be opened: ${e.message}\n`);
+      outcome = { skipped: 'error', reason: String(e && e.message || e) };
+    }
+    if (!outcome.skipped) {
+      process.stderr.write(`keep runs: check for ${task.id} opened on the fallback account ${fallbackId}\n`);
+      try {
+        (opts.checkinTask || keep.checkinTask)(task.id, {
+          heading: 'check deferred',
+          message: `check deferred since ${String(task.fm.check_after || '').replace('T', ' ')} on the checks account (${clip(reason, 200)});`
+            + ` opened on the configured fallback account ${fallbackId} instead.`,
+          linkSession: false,
+          commitLabel: 'check',
+        });
+      } catch (e) {
+        process.stderr.write(`keep runs: could not record the fallback check for ${task.id}: ${e.message}\n`);
+      }
+      clearBudgetDeferral(task.id, today);
+      return true;
+    }
+    // `opened-today` and `tick-cap` are this tick's own bookkeeping, not a verdict on
+    // the fallback: leave the streak unlatched and try again on the next one.
+    if (outcome.skipped !== 'budget' && outcome.skipped !== 'error') return false;
+    reason = outcome.skipped === 'budget'
+      ? `${reason}; the fallback account ${fallbackId} is out of budget too (${clip(outcome.reason || '', 200)})`
+      : `${reason}; the fallback account ${fallbackId} could not be opened (${clip(outcome.reason || '', 200)})`;
+  }
+  const entry = loadSchedulerState().deferred.get(task.id);
+  if (!entry) return true;
+  if (!noteStalledCheck(task, entry, reason, { ...keep, ...(opts.checkinTask ? { checkinTask: opts.checkinTask } : {}) })) return false;
+  checkDeferrals.markEscalated(loadSchedulerState().deferred, task.id);
+  saveSchedulerState(today);
+  return true;
+}
+
+// Every budget deferral goes through here: it records the streak, escalates the one
+// that reached the ceiling, and otherwise writes the ordinary once-a-day notice.
+async function handleBudgetDeferral(task, reason, today, opts = {}) {
+  const { entry, escalate } = (opts.recordBudgetDeferral || recordBudgetDeferral)(task, reason, today);
+  if (escalate && opts.quietEscalation !== true) {
+    const done = await (opts.escalate || escalateBudgetDeferral)(task, reason, today, opts);
+    return { escalated: done === true, retry: done !== true };
+  }
+  // An already-escalated card is logged and nothing more. The stalled check-in and
+  // the `keep overdue` annotation carry it from here; repeating the same sentence
+  // every day is exactly the noise the ceiling exists to stop.
+  return {
+    noticed: (opts.noteBudgetDeferral || noteBudgetDeferral)(task, reason, today,
+      { ...keep, ...(opts.checkinTask ? { checkinTask: opts.checkinTask } : {}), quiet: opts.quiet === true || entry.escalated }),
+  };
 }
 
 // How many sessions this tick has opened. Module state, not a tick-local counter,
@@ -803,7 +935,7 @@ async function escalateProbeFailure(task, result, opts = {}) {
     // budget. A probe failing every ten minutes must not be a way around any of them.
     const outcome = await openFreshCheckSession(task, { ...opts, today, probe: result });
     if (outcome.skipped) {
-      if (outcome.skipped === 'budget') noteBudgetDeferral(task, outcome.reason, today);
+      if (outcome.skipped === 'budget') await handleBudgetDeferral(task, outcome.reason, today, { probe: result });
       else process.stderr.write(`keep runs: probe escalation for ${task.id} held back (${outcome.skipped})\n`);
       return null;
     }
@@ -861,6 +993,7 @@ async function schedulerTick() {
   const tickErrors = [];
   let didWork = false;
   let deferralNotices = 0;
+  let escalations = 0;
   const checksAccount = checksAccountId();
   resetTickAllowance();
   try {
@@ -944,6 +1077,7 @@ async function schedulerTick() {
             tickErrors.push(e);
             process.stderr.write(`keep runs: could not stamp delivered check for ${t.id}: ${e.message}\n`);
           }
+          clearBudgetDeferral(t.id, today);
           process.stderr.write(`keep runs: delivered check for ${t.id} into ${delivery.kind} session ${sessionRef(delivery.sessionId)}\n`);
           if (!landDeliveryWarning(t, delivery)) tickErrors.push(new Error(`could not land delivery warning for ${t.id}`));
           onChange();
@@ -962,12 +1096,18 @@ async function schedulerTick() {
           // Every deferral is logged; only the first few a tick are written to a card.
           // The quota counts check-ins that were actually written — a card that was
           // already noticed today costs nothing, so it must not spend another card's turn.
-          if (noteBudgetDeferral(t, outcome.reason, today, { ...keep, quiet: deferralNotices >= MAX_DEFERRAL_NOTICES_PER_TICK })) {
-            deferralNotices += 1;
-          }
+          // Escalations are rarer and carry the same per-tick ceiling; one held back
+          // here is not lost, because its streak stays unlatched for the next tick.
+          const handled = await handleBudgetDeferral(t, outcome.reason, today, {
+            quiet: deferralNotices >= MAX_DEFERRAL_NOTICES_PER_TICK,
+            quietEscalation: escalations >= MAX_DEFERRAL_NOTICES_PER_TICK,
+          });
+          if (handled.escalated) { escalations += 1; onChange(); }
+          else if (handled.noticed) deferralNotices += 1;
           continue;
         }
         if (outcome.skipped) continue;
+        clearBudgetDeferral(t.id, today);
         const { delivery, errors } = outcome;
         process.stderr.write(`keep runs: opened a check session for ${t.id}${delivery.sessionId ? ` (session ${sessionRef(delivery.sessionId)})` : ''}\n`);
         tickErrors.push(...errors);
@@ -993,7 +1133,7 @@ async function schedulerTick() {
 // Test seam only: the per-day escalation budget and the probe bookkeeping are module
 // state, and a unit test has to start from a known one and leave none behind.
 function _resetSchedulerState() {
-  schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map() };
+  schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map(), deferred: new Map() };
   try { fs.unlinkSync(SCHEDULER_STATE_FILE); } catch {}
   openInFlight.clear();
   resetTickAllowance();
@@ -1011,6 +1151,8 @@ function startScheduler() {
 module.exports = {
   retryPending, startScheduler, schedulerTick, setOnChange, setDeliverer, setOpener, setEphemeralHost,
   openFreshCheckSession, checksAccountId, checkBudget, budgetDeferralReason, noteBudgetDeferral,
+  checksFallbackAccountId, recordBudgetDeferral, clearBudgetDeferral, noteStalledCheck,
+  escalateBudgetDeferral, handleBudgetDeferral,
   freshOpenRefusal, resetTickAllowance, loadSchedulerState, releaseUnfinishedCheck,
   readDeliveryStamp, writeDeliveryStamp, readRawDeliveryStamp, stampExpired, checkinFromSessionAt,
   reapEphemeralPane, sweepEphemeralPanes, MAX_FRESH_OPENS_PER_TICK, MAX_DEFERRAL_NOTICES_PER_TICK,

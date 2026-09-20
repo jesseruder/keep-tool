@@ -35,7 +35,11 @@ daemon polls due recipes every minute.
 - Otherwise Keep opens a fresh interactive Claude session on the card and types the same
   instruction into it — nothing runs headless. At most one such session per card per day,
   and none while the checks account's usage window is exhausted (the card records a
-  `check deferred` note and stays overdue).
+  `check deferred` note and stays overdue). A deferral has a ceiling: on the second
+  deferred day, or after 24 hours, Keep either opens the check on a configured
+  `checks-fallback` account or records one `check stalled` check-in, and `keep overdue`
+  says so from then on. A card marked `check stalled on the account budget` never ran
+  its check — run it with `keep verify <id>` or reschedule it.
 - Keep closes the session it opened once the check is on the card, or after an hour of
   silence — never mid-turn, and never over an unsent draft or an open question. If it
   ends without recording anything, the card says so and comes due again.

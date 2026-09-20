@@ -1001,3 +1001,126 @@ test('a check session that dies without a result is reopened on a later tick', (
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+
+// ---------- bounding a deferral streak ----------
+
+const {
+  handleBudgetDeferral, checksFallbackAccountId, setOpener,
+} = require('./runs.js');
+
+test('a check deferred a second day escalates once instead of deferring forever', async () => {
+  _resetSchedulerState();
+  try {
+    const task = card();
+    const landed = [];
+    const deps = { checkinTask: (id, payload) => landed.push(payload), fallbackAccountId: null };
+    const first = await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-16', deps);
+    assert.equal(first.noticed, true);
+    assert.deepEqual(landed.map((entry) => entry.heading), ['check deferred']);
+
+    const second = await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-17', deps);
+    assert.equal(second.escalated, true, 'the second deferred day is the ceiling');
+    assert.equal(landed.length, 2);
+    assert.equal(landed[1].heading, 'check stalled');
+    assert.match(landed[1].message, /deferred since .* on 2 separate days/);
+    assert.match(landed[1].message, /keep verify some-card/);
+    assert.equal('status' in landed[1], false, 'a stalled check still does not touch the card');
+    assert.equal('clearCheckAfter' in landed[1], false);
+
+    // And from here the card is quiet: the stalled record and keep overdue carry it.
+    for (const day of ['2026-09-18', '2026-09-19']) {
+      const later = await handleBudgetDeferral(task, 'weekly usage at 97%', day, deps);
+      assert.equal(later.escalated, undefined, 'escalation does not repeat');
+      assert.equal(later.noticed, false, 'and neither does the daily notice');
+    }
+    assert.equal(landed.length, 2);
+  } finally { _resetSchedulerState(); }
+});
+
+test('an escalation retries on the configured fallback account and clears the streak', async () => {
+  _resetSchedulerState();
+  const opened = [];
+  setOpener(async (body) => { opened.push(body); return { ok: true, sessionId: 'sid-fb', pane: 'p9' }; });
+  try {
+    const task = card();
+    const landed = [];
+    const deps = { checkinTask: (id, payload) => landed.push(payload), fallbackAccountId: 'claude-secondary' };
+    await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-16', deps);
+    const escalated = await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-17', deps);
+    assert.equal(escalated.escalated, true);
+    assert.equal(opened.length, 1, 'the fallback account gets exactly one attempt');
+    assert.equal(opened[0].accountId, 'claude-secondary');
+    assert.equal(opened[0].taskId, 'some-card');
+    assert.equal(landed.at(-1).heading, 'check deferred');
+    assert.match(landed.at(-1).message, /opened on the configured fallback account claude-secondary/);
+    assert.equal(loadSchedulerState().deferred.has('some-card'), false, 'a check that ran is not deferred');
+  } finally { setOpener(null); _resetSchedulerState(); }
+});
+
+test('a fallback account that is exhausted too lands a stalled check that names it', async () => {
+  _resetSchedulerState();
+  setOpener(async () => { throw new Error('the opener must not be reached without budget'); });
+  try {
+    const task = card();
+    const landed = [];
+    const deps = {
+      checkinTask: (id, payload) => landed.push(payload),
+      fallbackAccountId: 'claude-secondary',
+      refusal: () => ({ skipped: 'budget', reason: 'weekly usage at 99%' }),
+    };
+    await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-16', deps);
+    const escalated = await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-17', deps);
+    assert.equal(escalated.escalated, true);
+    assert.equal(landed.at(-1).heading, 'check stalled');
+    assert.match(landed.at(-1).message, /the fallback account claude-secondary is out of budget too/);
+    assert.equal(loadSchedulerState().deferred.get('some-card').escalated, true);
+  } finally { setOpener(null); _resetSchedulerState(); }
+});
+
+// The tick's own bookkeeping is not a verdict on the fallback: a card held back by
+// the per-day open or the per-tick cap must escalate on a later tick, not be latched
+// as stalled by a refusal that had nothing to do with the account.
+test('a tick-local refusal leaves the escalation for the next tick', async () => {
+  _resetSchedulerState();
+  setOpener(async () => ({ ok: true, sessionId: 'sid-fb', pane: 'p9' }));
+  try {
+    const task = card();
+    const landed = [];
+    const deps = {
+      checkinTask: (id, payload) => landed.push(payload),
+      fallbackAccountId: 'claude-secondary',
+      refusal: () => ({ skipped: 'tick-cap' }),
+    };
+    await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-16', deps);
+    const held = await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-17', deps);
+    assert.equal(held.escalated, false);
+    assert.equal(held.retry, true);
+    assert.equal(landed.length, 1, 'nothing is written for a refusal the fallback never saw');
+    assert.equal(loadSchedulerState().deferred.get('some-card').escalated, false, 'and the streak stays unlatched');
+  } finally { setOpener(null); _resetSchedulerState(); }
+});
+
+test('only an explicitly configured fallback purpose counts as a fallback', () => {
+  const accounts = (automationAccounts, records) => ({
+    publicState: () => ({ automationAccounts }),
+    get: (id) => records.find((entry) => entry.id === id) || null,
+  });
+  const claude = [{ id: 'claude-primary', agent: 'claude' }, { id: 'claude-secondary', agent: 'claude' }];
+  // Unset: automationFor would answer with the agent default, which is the very
+  // account that just refused.
+  assert.equal(checksFallbackAccountId({}, {
+    accounts: accounts({ claude: 'claude-primary' }, claude), checksAccountId: () => 'claude-primary',
+  }), undefined);
+  assert.equal(checksFallbackAccountId({}, {
+    accounts: accounts({ claude: 'claude-primary', 'checks-fallback': 'claude-primary' }, claude),
+    checksAccountId: () => 'claude-primary',
+  }), undefined, 'the checks account is not its own fallback');
+  assert.equal(checksFallbackAccountId({}, {
+    accounts: accounts({ 'checks-fallback': 'claude-secondary' }, claude), checksAccountId: () => 'claude-primary',
+  }), 'claude-secondary');
+  assert.equal(checksFallbackAccountId({}, {
+    accounts: accounts({ 'checks-fallback': 'codex-main' }, [...claude, { id: 'codex-main', agent: 'codex' }]),
+    checksAccountId: () => 'claude-primary',
+  }), undefined, 'a Codex account cannot run a Claude check');
+});
