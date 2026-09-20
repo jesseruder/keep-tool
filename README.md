@@ -362,6 +362,22 @@ npm test
 keep service restart
 ```
 
+A test file here spawns CLIs, daemons and fake hosts of its own, so the suite runs at
+half the machine's cores (at most four files at once) instead of Node's default of one
+per core. `KEEP_TEST_CONCURRENCY` overrides it: a positive integer sets the number of
+test files in flight, and `auto` restores Node's choice. Raise it on an idle machine,
+set `1` to reproduce a flake that only appears under load, and leave it alone while the
+daemon, host and agent sessions are sharing the laptop. An explicit `--test-concurrency`
+argument wins over both.
+
+Timeouts on the host-request path carry a reading of the machine that produced them —
+`host request timed out (spawn) [load 44.3 on 8 cpus, 0.4 GB of 16.0 GB free, swap …]`
+— so a timeout under memory thrash is distinguishable from a real fault after the fact.
+Load and memory come from counters this process already holds; swap is sampled out of
+band on macOS and read from a cache at most 15 seconds old, so a timeout never waits for
+it. `KEEP_PRESSURE=0` removes the annotation and `KEEP_PRESSURE_SWAP=0` keeps it without
+the `sysctl` sample.
+
 For an existing registry, select it with `KEEP_DIR` or write the configuration above
 instead of running `keep init`. Keep its Git history intact. Existing services require a
 deliberate migration; setup will not overwrite them, and it replaces an unrelated skill

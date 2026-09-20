@@ -3,6 +3,7 @@
 const net = require('node:net');
 const path = require('node:path');
 const { FrameDecoder, encodeFrame } = require('./host.js');
+const { annotate } = require('./pressure.js');
 
 function socketPath() {
   return process.env.KEEP_HOST_SOCK || path.join(require('./keep.js').ROOT, '.keep', 'host.sock');
@@ -137,7 +138,7 @@ function connect(options = {}) {
         timer = setTimeout(() => {
           if (pending.get(id) !== waiter) return;
           pending.delete(id);
-          waiter.reject(new Error(`host request timed out (${type})`));
+          waiter.reject(new Error(annotate(`host request timed out (${type})`)));
         }, timeoutMs);
         socket.write(encodeFrame({ ...params, type, id }), (error) => {
           if (!error) return;
@@ -224,7 +225,7 @@ function connect(options = {}) {
     const client = { sock, socket, request, attach, subscribe, onDisconnect, close };
     connectTimer = setTimeout(() => {
       if (connected) return;
-      const error = new Error('host connect timed out');
+      const error = new Error(annotate('host connect timed out'));
       socket.destroy(error);
       reject(error);
     }, connectTimeoutMs);

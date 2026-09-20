@@ -13,6 +13,7 @@ const { execFile } = require('child_process');
 const { AsyncLocalStorage } = require('async_hooks');
 const { promisify } = require('util');
 const keep = require('./keep.js');
+const pressure = require('./pressure.js');
 const runs = require('./runs.js');
 const summarize = require('./summarize.js');
 const titles = require('./titles.js');
@@ -1767,7 +1768,7 @@ async function requestHostClient(client, type, params, deps = {}) {
     return await Promise.race([
       Promise.resolve().then(() => client.request(type, params || {}, { timeoutMs })),
       new Promise((resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(`host request timed out (${type})`)), timeoutMs);
+        timer = setTimeout(() => reject(new Error(pressure.annotate(`host request timed out (${type})`))), timeoutMs);
       }),
     ]);
   } finally {
@@ -1790,7 +1791,7 @@ async function hostRequest(type, params, deps = {}) {
   let forceHostReconnect = false;
   for (;;) {
     const remaining = deadline - wallNow();
-    if (remaining <= 0) throw new Error(`terminal host reload retry timed out (${type})`);
+    if (remaining <= 0) throw new Error(pressure.annotate(`terminal host reload retry timed out (${type})`));
     const connectTimeoutMs = Math.max(1, Math.min(
       deps.hostConnectTimeoutMs == null ? HOST_CONNECT_TIMEOUT_MS : deps.hostConnectTimeoutMs,
       remaining,

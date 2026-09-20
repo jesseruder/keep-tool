@@ -17,6 +17,9 @@ if (process.env.NODE_TEST_CONTEXT) {
   delete process.env.KEEP_AGENT_ACCOUNT_ID;
   delete process.env.KEEP_PANE;
   process.env.KEEP_NO_PUSH = '1';
+  // Timeout diagnostics sample swap out of band with sysctl. A suite of a few hundred
+  // test processes has no use for that reading and every reason not to spawn for it.
+  process.env.KEEP_PRESSURE_SWAP = '0';
   // A daemon under test must never switch the operator's desktop reminders.
   process.env.KEEP_REMINDERS_CONFIG = path.join(root, 'reminders.config.json');
   process.env.KEEP_REMINDERS_STATE = path.join(root, 'reminders-state.json');
