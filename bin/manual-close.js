@@ -11,7 +11,7 @@ async function manualClose(body, deps) {
   let expectedOutputCount = null;
   const verify = (pane) => {
     if (!pane || pane.id !== body.pane || pane.meta?.sessionId !== body.sessionId
-        || !['claude', 'codex'].includes(pane.meta?.agent) || (initial?.pid && pane.pid !== initial.pid)) {
+        || !['claude', 'codex', 'pi'].includes(pane.meta?.agent) || (initial?.pid && pane.pid !== initial.pid)) {
       throw new Error('Session/pane identity changed; nothing terminated');
     }
     if (deps.protectInput && expectedInputCount !== null && pane.inputCount !== expectedInputCount) {

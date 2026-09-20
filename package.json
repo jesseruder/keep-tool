@@ -49,6 +49,7 @@
     "README.md",
     "scripts/",
     "docs/",
+    "integrations/",
     "patches/"
   ],
   "repository": {

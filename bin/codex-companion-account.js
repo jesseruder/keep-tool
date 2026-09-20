@@ -140,7 +140,8 @@ function selectedAccount(accountId, options = {}) {
 
 function companionEnvironment(account, namespace, options = {}) {
   const base = { ...(options.baseEnv || options.env || process.env) };
-  for (const key of [...BROKER_ENV, 'KEEP_PANE', 'KEEP_CODEX_CLIENT_TOKEN', 'KEEP_AGENT_ACCOUNT_ID']) delete base[key];
+  for (const key of [...BROKER_ENV, 'KEEP_PANE', 'KEEP_CODEX_CLIENT_TOKEN', 'KEEP_AGENT_ACCOUNT_ID',
+    'KEEP_PI_SESSION_ID', 'KEEP_PI_KEEP_CLI', 'KEEP_PI_OPENING_FILE']) delete base[key];
   const env = (options.profileEnvironment || launcher.profileEnvironment)('codex', account, base);
   env.CLAUDE_PLUGIN_DATA = namespace.pluginData;
   return env;
@@ -149,7 +150,8 @@ function companionEnvironment(account, namespace, options = {}) {
 function environmentForNamespace(namespace, options = {}) {
   if (!namespace?.accountId || !namespace.configDir) {
     const env = { ...(options.baseEnv || options.env || process.env) };
-    for (const key of [...BROKER_ENV, 'KEEP_PANE', 'KEEP_CODEX_CLIENT_TOKEN', 'KEEP_AGENT_ACCOUNT_ID']) delete env[key];
+    for (const key of [...BROKER_ENV, 'KEEP_PANE', 'KEEP_CODEX_CLIENT_TOKEN', 'KEEP_AGENT_ACCOUNT_ID',
+      'KEEP_PI_SESSION_ID', 'KEEP_PI_KEEP_CLI', 'KEEP_PI_OPENING_FILE']) delete env[key];
     if (namespace?.pluginData) env.CLAUDE_PLUGIN_DATA = namespace.pluginData;
     return env;
   }

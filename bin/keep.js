@@ -6,7 +6,7 @@
 'use strict';
 // keep-core runs require('./config').apply() as it loads, so it comes first.
 const {
-  ROOT, TASKS, ARCHIVE, META, HOLDS_DIR, STATUSES, OPEN_MESSAGE_LIMIT, LAUNCH_MODEL_RE, OPEN_MESSAGE_ERROR,
+  ROOT, TASKS, ARCHIVE, META, HOLDS_DIR, STATUSES, OPEN_MESSAGE_LIMIT, LAUNCH_MODEL_RE, PI_MODEL_RE, OPEN_MESSAGE_ERROR,
   KINDS, CHECK_ON_PASS, MIN_CHECK_EVERY_MS, STATUS_ORDER, KeepError, color, nowStamp, relativeDurationMs,
   parseWhen, stampOf, parseTask, serializeTask, taskPath, loadTask, loadTaskAnywhere, loadAll, saveTask,
   recordDoneTransition, slugify, currentSession, delegationDependencies, currentDelegation, commandSession,
@@ -726,14 +726,14 @@ commands.delegate = async (argv, deps = {}) => {
   }
 
   if (o._.length !== 1 || !o.step) {
-    die('usage: keep delegate <card> --step <n> [--prepare | --session <sid> --agent claude|codex | -- <command...>]');
+    die('usage: keep delegate <card> --step <n> [--prepare | --session <sid> --agent claude|codex|pi | -- <command...>]');
   }
   if (!command.length && separator >= 0) die('keep delegate needs a command after --');
   const modes = Number(Boolean(o.prepare)) + Number(Boolean(o.session || o.agent)) + Number(Boolean(command.length));
   if (modes !== 1 || Boolean(o.session) !== Boolean(o.agent)) {
-    die('choose one delegation transport: --prepare, --session <sid> --agent claude|codex, or -- <command...>');
+    die('choose one delegation transport: --prepare, --session <sid> --agent claude|codex|pi, or -- <command...>');
   }
-  if (o.agent && !['claude', 'codex'].includes(o.agent)) die('agent must be claude or codex');
+  if (o.agent && !['claude', 'codex', 'pi'].includes(o.agent)) die('agent must be claude, codex, or pi');
   if (o.session && !delegation.SESSION_RE.test(o.session)) die('session id must contain only letters, digits, _ or -');
 
   const callerAssignment = currentDelegation();
@@ -742,7 +742,7 @@ commands.delegate = async (argv, deps = {}) => {
   }
 
   const parent = commandSession();
-  if (!parent || !delegation.SESSION_RE.test(parent.id)) die('keep delegate needs a current Claude or Codex parent session');
+  if (!parent || !delegation.SESSION_RE.test(parent.id)) die('keep delegate needs a current agent parent session');
   let record;
   try {
     record = withLock(() => {
@@ -778,7 +778,7 @@ commands.delegate = async (argv, deps = {}) => {
   // variables in a cross-agent child lets ordinary Keep commands attribute the
   // worker's contributions and schedules to its parent before the native client
   // replaces that variable.
-  for (const name of ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID']) delete childEnv[name];
+  for (const name of ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'KEEP_PI_SESSION_ID']) delete childEnv[name];
   let child;
   try {
     child = launch(command[0], command.slice(1), {
@@ -806,10 +806,10 @@ commands.link = (argv) => {
   const o = parseArgs(argv, { session: 'str', agent: 'str' });
   const id = o._[0];
   if (o._.length !== 1 || !o.session || !o.agent) {
-    die('usage: keep link <card> --session <sid> --agent claude|codex');
+    die('usage: keep link <card> --session <sid> --agent claude|codex|pi');
   }
   if (!/^[A-Za-z0-9_-]+$/.test(o.session)) die('session id must contain only letters, digits, _ or -');
-  if (!['claude', 'codex'].includes(o.agent)) die('agent must be claude or codex');
+  if (!['claude', 'codex', 'pi'].includes(o.agent)) die('agent must be claude, codex, or pi');
   if (isReviewerSession()) die('the fleet reviewer cannot link a working session to a card');
   const linked = linkSession(id, { id: o.session, agent: o.agent });
   if (!linked) die(`no task "${id}"`);
@@ -823,7 +823,7 @@ commands.claim = (argv) => {
   if (['pending', 'invalid', 'identity-mismatch'].includes(assigned.kind)) die(delegation.describe(assigned));
   const session = commandSession();
   if (!session || !/^[A-Za-z0-9_-]+$/.test(session.id)) {
-    die('keep claim needs a current Claude or Codex session');
+    die('keep claim needs a current agent session');
   }
   const id = argv[0];
   const linked = linkSession(id, session, { requireProject: true, commitLabel: 'claim' });
@@ -1279,7 +1279,7 @@ commands.show = (argv) => {
   // The card stores `(by <agent> <full id>)` for the reviewer to parse; a reader
   // gets the session's number, which is what agents should repeat.
   if (parsed.rest) {
-    console.log('\n' + parsed.rest.trim().replace(/^(## .*\(by (?:claude|codex) )([A-Za-z0-9_-]+)\)/gm,
+    console.log('\n' + parsed.rest.trim().replace(/^(## .*\(by (?:claude|codex|pi) )([A-Za-z0-9_-]+)\)/gm,
       (whole, head, sid) => (sessionNumbers.numberFor(sid, { root: ROOT }) ? `${head}${sessionRef(sid, { root: ROOT })})` : whole)));
   }
 };
@@ -2760,11 +2760,11 @@ function writeOpenHandoff(id, message, task, options = {}) {
 commands.open = async (argv, deps = {}) => {
   const o = parseArgs(argv, { fresh: 'bool', agent: 'str', model: 'str', account: 'str', 'message-file': 'str' });
   let id = o._[0];
-  if (!id) die('usage: keep open <card|session-id|#n> [--fresh] [--agent claude|codex] [--account <id>] [--model <id>] [-m "opening message" | --message-file <path>]');
-  if (o.agent && !['claude', 'codex'].includes(o.agent)) die('agent must be claude or codex');
+  if (!id) die('usage: keep open <card|session-id|#n> [--fresh] [--agent claude|codex|pi] [--account <id>] [--model <id>] [-m "opening message" | --message-file <path>]');
+  if (o.agent && !['claude', 'codex', 'pi'].includes(o.agent)) die('agent must be claude, codex, or pi');
   // --model goes on the launched command line only (claude --model / codex -m), so it
   // applies to that process and never touches ~/.claude/settings.json.
-  if (o.model != null && !LAUNCH_MODEL_RE.test(o.model)) die('--model must be a model id like claude-fable-5-1 or gpt-5.6-sol');
+  if (o.model != null && !PI_MODEL_RE.test(o.model) && !LAUNCH_MODEL_RE.test(o.model)) die('--model must be a valid model id');
   if (o.m != null && o['message-file'] != null) die('use either -m or --message-file, not both');
   let message = o.m;
   if (o['message-file'] != null) {
@@ -3171,7 +3171,7 @@ function helpText() {
   keep mark --colors                           # the eight palette colors
   keep project <id> [<path|name>] [-m "reason"]   # show or change project; preserves session links and schedule
   keep claim <card>                                # claim for the current session; run from the card's project
-  keep link <card> --session <sid> --agent claude|codex   # repair ownership metadata without waking or launching
+  keep link <card> --session <sid> --agent claude|codex|pi   # repair ownership metadata without waking or launching
   keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
   keep show <id>
   keep artifact <card> [--] [<file>...] [-m "note"]
@@ -3265,7 +3265,7 @@ ${stepUsage()}
   keep probe <id>      # run this card's probe now (exit 1 = failed); no check-in, no daemon
   keep verify <id>     # run this task's check recipe now, in its thread or a fresh session (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)
-  keep open <card|session-id|#n> [--fresh] [--agent claude|codex] [--account <id>] [--model <id>] [-m "opening message" | --message-file <path>]
+  keep open <card|session-id|#n> [--fresh] [--agent claude|codex|pi] [--account <id>] [--model <id>] [-m "opening message" | --message-file <path>]
                          # #n is the console's session number (12, #12 and s12 all work);
                          # a fresh launch without --account picks the caller's account, then the
                          # default, skipping accounts that are out of usage;
@@ -3280,7 +3280,7 @@ ${stepUsage()}
                          # --dry resolves the target and prints what would be sent
   keep delegate <card> --step <n> -- <command> [args]
   keep delegate <card> --step <n> --prepare
-  keep delegate <card> --step <n> --session <sid> --agent claude|codex
+  keep delegate <card> --step <n> --session <sid> --agent claude|codex|pi
   keep delegate --accept <delegation-id> | --end
                          # explicit worker assignment; parent retains card ownership, check-ins and permissions
   keep pane ls [--json] | show <pane> [--json]
@@ -3430,7 +3430,7 @@ module.exports = {
   codexCommandCli: commands.codex,
   commandUsage, helpText, formatOpenResult, openCommand: commands.open, verifyCommand: commands.verify,
   tellCommandCli: commands.tell, writeOpenHandoff,
-  postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
+  postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE, PI_MODEL_RE,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
   renameCommandCli: commands.rename, markCommandCli: commands.mark,
   accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff, transferCommandCli: commands.transfer,

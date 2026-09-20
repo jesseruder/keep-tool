@@ -172,14 +172,15 @@ function routes(ctx) {
       path: '/api/sessiontail',
       handle: async ({ req, res, url }) => {
         const id = url.searchParams.get('id') || '';
-        if (!/^[A-Za-z0-9-]+$/.test(id)) return json(res, 400, { error: 'bad session id' });
+        if (!/^[A-Za-z0-9_-]+$/.test(id)) return json(res, 400, { error: 'bad session id' });
         const current = dashboardBuilder.latest();
         if (!current) return json(res, 503, { error: 'dashboard state is still loading' });
         const session = current.sessions?.find((s) => s.id === id);
         const file = sessionSummaryFile(session, { publishedOnly: true });
         if (!session || !file) return json(res, 404, { error: 'no session' });
         let text;
-        try { text = session.kind === 'codex' ? codex.recentText(file) : recentTranscriptText(file); }
+        try { text = session.kind === 'codex' ? codex.recentText(file)
+          : session.kind === 'pi' ? require('../pi').recentText(file) : recentTranscriptText(file); }
         catch (error) {
           if (error.code === 'ENOENT') return json(res, 404, { error: 'no session' });
           throw error;

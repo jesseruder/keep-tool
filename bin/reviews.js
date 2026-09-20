@@ -27,7 +27,7 @@ const VERDICTS = ['clean', 'findings'];
 // `--by` is free text with a known first word, so a record always says which kind
 // of reviewer produced it and the implicit land grant can tell an agent
 // self-attestation from a human one.
-const BY_VOCABULARY = ['codex', 'opus', 'claude', 'human'];
+const BY_VOCABULARY = ['codex', 'opus', 'claude', 'pi', 'human'];
 const BY_RE = new RegExp(`^(${BY_VOCABULARY.join('|')})(?:[\\s:-]+\\S[\\s\\S]*)?$`, 'i');
 
 class ReviewRecordError extends Error {}
@@ -145,11 +145,12 @@ function cleanVerdict(value) {
 }
 
 function cleanBy(value, env = process.env) {
-  const agent = Boolean(env.CLAUDE_CODE_SESSION_ID || env.CODEX_SESSION_ID || env.CODEX_THREAD_ID);
+  const agent = Boolean(env.CLAUDE_CODE_SESSION_ID || env.CODEX_SESSION_ID || env.CODEX_THREAD_ID || env.KEEP_PI_SESSION_ID);
   const text = notes.scrub(value == null ? '' : value).slice(0, 120);
   if (!text) {
     if (env.CODEX_SESSION_ID || env.CODEX_THREAD_ID) return 'codex';
     if (env.CLAUDE_CODE_SESSION_ID) return 'claude';
+    if (env.KEEP_PI_SESSION_ID) return 'pi';
     return 'human';
   }
   if (!BY_RE.test(text)) {
@@ -160,7 +161,7 @@ function cleanBy(value, env = process.env) {
   // bySession anyway; refusing here says why instead of leaving a record that
   // decideLand will silently distrust.
   if (/^human\b/i.test(text) && agent) {
-    fail('--by human is Owner\'s own attestation and cannot be written from an agent session — use --by claude/opus/codex with --job or --evidence');
+    fail('--by human is Owner\'s own attestation and cannot be written from an agent session — use an agent --by value with --job or --evidence');
   }
   return text;
 }

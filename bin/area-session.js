@@ -132,6 +132,7 @@ function runWt(args, options = {}) {
   const run = options.execFile || execFile;
   const env = { ...(options.env || process.env) };
   delete env.CLAUDE_CODE_SESSION_ID;
+  delete env.KEEP_PI_SESSION_ID;
   return new Promise((resolve) => {
     run(process.execPath, [path.join(__dirname, 'wt.js'), ...args], {
       env,

@@ -555,6 +555,7 @@ function runModel(prompt, model) {
   const sessionId = crypto.randomUUID();
   const env = summarize.automationEnv('ideas').env;
   delete env.CLAUDE_CODE_SESSION_ID;
+  delete env.KEEP_PI_SESSION_ID;
   try {
     const args = slack.classifierArgs(prompt, model, sessionId, undefined, 'text');
     slack.markSpawned(sessionId);

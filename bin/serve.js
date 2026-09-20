@@ -19,6 +19,7 @@ const titles = require('./titles.js');
 const usage = require('./usage.js');
 const cardUsage = require('./card-usage.js');
 const codex = require('./codex.js');
+const pi = require('./pi.js');
 const codexCompact = require('./codex-compact.js');
 const transcripts = require('./transcripts.js');
 const accounts = require('./accounts.js');
@@ -356,6 +357,7 @@ function associateDashboardSessionFiles(state, targets, store = dashboardSession
   return state;
 }
 function sessionSummaryFile(session, deps = {}) {
+  if (session?.kind === 'pi') return session.sessionFile || pi.fileFor(session.id);
   const published = session && dashboardSessionSources.get(session);
   if (published) return published;
   if (deps.publishedOnly) return null;
@@ -367,13 +369,14 @@ function sessionSummaryFile(session, deps = {}) {
 function prepareSessionSummary(session, options = {}, deps = {}) {
   const file = deps.file || sessionSummaryFile(session, deps);
   if (!file) return { text: null, fresh: false };
-  const input = session.kind === 'codex' ? (deps.codex || codex).recentText(file) : recentTranscriptText(file);
+  const input = session.kind === 'codex' ? (deps.codex || codex).recentText(file)
+    : session.kind === 'pi' ? pi.recentText(file) : recentTranscriptText(file);
   return (deps.getSummary || summarize.getSummary)(`session-${session.id}`, input, SESSION_INSTRUCTION, onChange, options);
 }
 
 async function sessionSummarySnapshot(deps = {}) {
   const panes = await listHostPanes(deps) || [];
-  const live = [...hostPanesBySession(panes).values()].filter((p) => p.alive && ['claude', 'codex'].includes(p.meta?.agent));
+  const live = [...hostPanesBySession(panes).values()].filter((p) => p.alive && ['claude', 'codex', 'pi'].includes(p.meta?.agent));
   if (!live.length) return { sessions: [], panes };
   // Use the same marker-enriched classification as Triage. Raw transcript
   // lookups omit permission notifications that can arrive in the middle of a turn.
@@ -1947,7 +1950,7 @@ function hostPanesForPublish(result, memo, now, epoch = memo.epoch || 0) {
 function annotatePaneAgents(panes, rows) {
   const byPid = new Map(rows.map((row) => [row.pid, row]));
   for (const pane of panes) {
-    if (!pane?.alive || !['claude', 'codex'].includes(pane.meta?.agent)) continue;
+    if (!pane?.alive || !['claude', 'codex', 'pi'].includes(pane.meta?.agent)) continue;
     const root = byPid.get(pane.pid);
     if (!root) continue; // An incomplete process snapshot is not proof of exit.
     const tree = new Set([pane.pid]);
@@ -2737,6 +2740,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
 function transcriptFileForSession(session) {
   return session.kind === 'codex'
     ? codex.rolloutFileFor(session.id)
+    : session.kind === 'pi' ? session.sessionFile || pi.fileFor(session.id)
     : findSessionFile(session.id);
 }
 
@@ -3757,6 +3761,10 @@ function readPaneRecord(sessionId, deps = {}) {
 
 function sessionProjectFromTranscript(sessionId, deps = {}, agent = null) {
   if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sessionId)) return { project: '', agent: null };
+  if (agent === 'pi' || agent == null) {
+    const found = (deps.piSessionFor || pi.sessionFor)(sessionId, { root: deps.root || keep.ROOT });
+    if (found?.project) return { project: found.project, agent: 'pi' };
+  }
   if (agent !== 'codex') {
     try {
       const file = (deps.findSessionFile || findSessionFile)(sessionId);
@@ -3799,7 +3807,7 @@ function parseProcessTable(output) {
     // whose argument vector it could not read. That row names a live process and says
     // nothing else about it, so it is neither an agent nor evidence that one is gone.
     const argsUnavailable = /^\([^()]*\)$/.test(args);
-    const agentMatch = argsUnavailable ? null : /(^|\/)(claude|codex)(\s|$)/.exec(args);
+    const agentMatch = argsUnavailable ? null : /(^|\/)(claude|codex|pi)(\s|$)/.exec(args);
     const padded = ` ${args} `;
     const interactive = Boolean(agentMatch)
       && !padded.includes(' -p ')
@@ -3878,7 +3886,7 @@ function agentIdentityOwnsPane(identity, pane, rows) {
     // A nested agent can inherit the outer pane's environment and open files,
     // but its conversation does not own the outer TUI input box.
     const command = String(row?.args || '').trim().split(/\s+/)[0];
-    if (row && /(?:^|\/)(?:codex|claude)$/.test(command)) return false;
+    if (row && /(?:^|\/)(?:codex|claude|pi)$/.test(command)) return false;
   }
   return false;
 }
@@ -3886,7 +3894,9 @@ function agentIdentityOwnsPane(identity, pane, rows) {
 // The session a row's own argv names, which is the strongest process-to-session
 // identity there is.
 function argvSessionId(row) {
-  const match = row.agent === 'claude'
+  const match = row.agent === 'pi'
+    ? /(?:^|\s)--(?:session-id|session)\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args)
+    : row.agent === 'claude'
     ? /(?:^|\s)--(?:resume|session-id)\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args)
     : /(?:^|\s)(?:\S*\/)?codex\s+(?:--?[A-Za-z0-9-]+(?:=\S*)?\s+)*resume\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args);
   return match ? match[1] : null;
@@ -3932,6 +3942,7 @@ function freshSessionRead(session, deps = {}) {
   try {
     return session.kind === 'claude'
       ? (deps.claudeSessionFor || claudeSessionFor)(session.id)
+      : session.kind === 'pi' ? (deps.piSessionFor || pi.sessionFor)(session.id, { root: keep.ROOT })
       : (deps.codexSessionFor || codex.sessionFor)(session.id);
   } catch { return null; }
 }
@@ -4414,6 +4425,9 @@ async function restartSession(body, deps = {}) {
     if (!(await host('hello')).replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
     const pane = (await host('get', { pane: body.pane })).pane;
     const session = (await (deps.buildState || buildState)({ hostPanes: [pane] })).sessions.find((s) => s.id === body.sessionId);
+    if (session?.kind === 'pi') {
+      throw new InjectionError(409, 'Pi in-place restart is unavailable; close the pane and use keep open to resume');
+    }
     // An account handoff names the limit its transfer exists for. Its own
     // observation is minutes old by now — a login-shell auth preflight alone can
     // take 45 seconds — so this is the last look, inside the lock, on the session
@@ -5567,6 +5581,7 @@ async function observeClaudeMcpMenu(session, target, deps = {}) {
 }
 
 async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
+  if (session.kind === 'pi') throw new InjectionError(409, 'Pi API message delivery is unavailable; type in its terminal pane');
   claimInjectionTarget(target);
   const pendingDirectory = deps.deliveryDirectory || path.join(keep.ROOT, '.keep', 'delivery');
   const record = require('./delivery-trace').recorder(pendingDirectory, session, target.pane);
@@ -5807,6 +5822,7 @@ async function resumeAfterLimit(sessionId, text, { hitAt } = {}, deps = {}) {
 async function compactSessionById(body) {
   body = body && typeof body === 'object' ? body : {};
   const session = loadCurrentSession(body.sessionId);
+  if (session.kind === 'pi') throw new InjectionError(409, 'Pi automatic compaction is unavailable');
   const target = claimInjectionTarget(await resolveSessionTarget(session, null));
   await precheckSessionTarget(session, target);
   return compactSession(session, target, body.instruction || (session.reviewer ? review.DEFAULT_REVIEW_COMPACT_INSTRUCTION : undefined));
@@ -6076,6 +6092,19 @@ async function waitForHostSessionId(pane, deps = {}) {
   return null;
 }
 
+async function waitForPiStart(id, launchedAt, deps = {}) {
+  const now = deps.now || Date.now;
+  const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const deadline = now() + 12000;
+  while (now() < deadline) {
+    const event = (deps.piEventFor || pi.eventFor)(id,
+      path.join(deps.root || keep.ROOT, '.keep', 'pi-events'));
+    if (event && Date.parse(event.at || '') >= launchedAt - 1000 && event.phase !== 'shutdown') return event;
+    await sleep(150);
+  }
+  throw new InjectionError(504, `Pi started but its Keep extension did not register session ${sessionRef(id)}; check the pane for extension errors`);
+}
+
 // The lock may be held by a delivery that started during the wait; give it a
 // moment rather than failing the launch after the agent is already up.
 async function withInjectionLockRetry(fn, deps = {}, scope) {
@@ -6203,7 +6232,7 @@ function openBudgetModel(launchModel, deps = {}) {
 async function openSession(body, deps = {}) {
   body = body && typeof body === 'object' ? body : {};
   const freshStandalone = body.fresh === true && !body.taskId && !body.sessionId;
-  if (body.agent != null && !['claude', 'codex'].includes(body.agent)) throw new InjectionError(400, 'agent must be claude or codex');
+  if (body.agent != null && !['claude', 'codex', 'pi'].includes(body.agent)) throw new InjectionError(400, 'agent must be claude, codex, or pi');
   if (body.command != null) throw new InjectionError(400, 'command is not accepted');
   // `deps.launchEnv` is an internal seam — the self-repair scheduler sets
   // KEEP_REPAIR=1 on the pane it opens. It is never settable over HTTP: a body
@@ -6222,8 +6251,9 @@ async function openSession(body, deps = {}) {
   if (body.cwd != null && body.fresh !== true) {
     throw new InjectionError(400, 'cwd is accepted only for a fresh card or standalone agent session');
   }
-  if (body.model != null && (typeof body.model !== 'string' || !keep.LAUNCH_MODEL_RE.test(body.model))) {
-    throw new InjectionError(400, 'model must be a model id like claude-fable-5-1 or gpt-5.6-sol');
+  if (body.model != null && (typeof body.model !== 'string'
+      || !keep.PI_MODEL_RE.test(body.model) && !keep.LAUNCH_MODEL_RE.test(body.model))) {
+    throw new InjectionError(400, 'model must be a valid model id');
   }
   // The model rides the launched command line only; it never writes settings.json.
   const launchModel = body.model || '';
@@ -6329,7 +6359,13 @@ async function openSession(body, deps = {}) {
   if (body.fresh) session = null;
 
   const agent = (session && (session.kind || session.agent)) || body.agent || 'claude';
-  if (!['claude', 'codex'].includes(agent)) throw new InjectionError(400, 'agent must be claude or codex');
+  if (!['claude', 'codex', 'pi'].includes(agent)) throw new InjectionError(400, 'agent must be claude, codex, or pi');
+  if (agent === 'pi' && (deps.onSessionReady || deps.onOpeningReady || deps.onOpeningDelivered)) {
+    throw new InjectionError(409, 'Pi does not support reserved opening delivery');
+  }
+  if (launchModel && !(agent === 'pi' ? keep.PI_MODEL_RE : keep.LAUNCH_MODEL_RE).test(launchModel)) {
+    throw new InjectionError(400, `model is not valid for ${agent}`);
+  }
   if (session && (typeof session.id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(session.id))) {
     throw new InjectionError(400, 'bad session id');
   }
@@ -6386,6 +6422,11 @@ async function openSession(body, deps = {}) {
       try { accountWarning = openAccount.exhaustedWarning(account, usageSnapshot(deps), openBudgetModel(launchModel, deps), Date.now()); }
       catch { accountWarning = ''; }
     }
+  }
+  if (agent === 'pi' && !account.builtIn) throw new InjectionError(400, 'Pi currently supports only pi/default');
+  if (agent === 'pi' && deps.piExtensionReady !== true
+      && !fs.existsSync(path.join(os.homedir(), '.pi', 'agent', 'extensions', 'keep.ts'))) {
+    throw new InjectionError(409, 'Pi Keep extension is not installed at ~/.pi/agent/extensions/keep.ts');
   }
   const allowPendingRegistration = freshStandalone && agent === 'codex' && !message && Boolean(body.requestId)
     && !body.portableTransferId && !body.reviewQueueLaunchId
@@ -6468,7 +6509,7 @@ async function openSession(body, deps = {}) {
   // explicit one, but stays out of the pane meta, which means "the caller asked for
   // this model" and is compared against the request when an open is retried.
   const launchHost = async (inheritedModel = '') => {
-    const sessionId = session ? session.id : agent === 'claude' ? (deps.randomUUID || crypto.randomUUID)() : null;
+    const sessionId = session ? session.id : ['claude', 'pi'].includes(agent) ? (deps.randomUUID || crypto.randomUUID)() : null;
     // Number a new session before it starts, so its start hook can tell it which it is.
     if (sessionId && !session) {
       try { sessionNumbers.assign([{ id: sessionId, mtime: launchedAt }], { root: deps.root || keep.ROOT }); } catch {}
@@ -6477,7 +6518,18 @@ async function openSession(body, deps = {}) {
     // group is recognisable in the browser.
     const browserName = browserBridgeSessionName(openedSessionNumber(sessionId, deps).num, body.taskId);
     const commandModel = launchModel || inheritedModel;
-    const argv = agent === 'codex'
+    let piOpeningFile = null;
+    if (agent === 'pi' && message) {
+      const dir = path.join(deps.root || keep.ROOT, '.keep', 'pi-opening');
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      piOpeningFile = path.join(dir, `${sessionId}-${crypto.randomUUID()}.txt`);
+      fs.writeFileSync(piOpeningFile, message, { flag: 'wx', mode: 0o600 });
+    }
+    const argv = agent === 'pi'
+      ? ['pi', '--provider', 'openrouter', '--model', commandModel || 'minimax/minimax-m3',
+        session ? '--session' : '--session-id', sessionId,
+        ...(piOpeningFile ? ['--', `@${piOpeningFile}`] : [])]
+      : agent === 'codex'
       ? ['codex', ...codexFlagArgs, ...(commandModel ? ['-m', commandModel] : []), ...(sessionId ? ['resume', sessionId] : [])]
       : ['claude', ...claudeFlagArgs, ...(accountMcpConfig ? ['--mcp-config', accountMcpConfig] : []), ...(commandModel ? ['--model', commandModel] : []),
         ...(sessionId ? [session ? '--resume' : '--session-id', sessionId] : [])];
@@ -6499,6 +6551,8 @@ async function openSession(body, deps = {}) {
       // launch that named the browser itself keeps its own name.
       env: require('./agent-launcher').launcherEnv({
         ...repairEnvFor({ sessionId }, deps),
+        ...(agent === 'pi' ? { KEEP_PI_SESSION_ID: sessionId, KEEP_PI_KEEP_CLI: path.join(__dirname, 'keep.js'),
+          ...(piOpeningFile ? { KEEP_PI_OPENING_FILE: piOpeningFile } : {}) } : {}),
         ...(browserName ? { BROWSER_BRIDGE_SESSION_NAME: browserName } : {}),
         ...deps.launchEnv,
       }),
@@ -6563,6 +6617,29 @@ async function openSession(body, deps = {}) {
       if (running) {
         throw new InjectionError(409, `session ${sessionRef(session.id)} is running outside the host (pid ${running.pid}); exit it there first, then keep open again`, { pid: running.pid });
       }
+      if (agent === 'pi') {
+        // Pi overwrites its argv with process.title="pi", so a raw external TUI
+        // cannot be mapped to a session id by ps. Refuse an uncertain concurrent
+        // resume instead of risking two writers on one Pi JSONL file.
+        const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
+        const panes = await (deps.listHostPanes || listHostPanes)(deps, true) || [];
+        const hosts = new Set(panes.filter((pane) => pane.alive && pane.meta?.agent === 'pi')
+          .map((pane) => pane.pid).filter(Number.isInteger));
+        const byPid = new Map(rows.map((row) => [row.pid, row]));
+        const external = rows.find((row) => {
+          if (row.agent !== 'pi' || !row.interactive) return false;
+          let current = row;
+          const seen = new Set();
+          while (current && !seen.has(current.pid)) {
+            if (hosts.has(current.pid)) return false;
+            seen.add(current.pid);
+            current = byPid.get(current.ppid);
+          }
+          return true;
+        });
+        if (external) throw new InjectionError(409,
+          `a Pi process outside Keep is running (pid ${external.pid}); exit it before resuming this session`, { pid: external.pid });
+      }
     }
     if (target) {
       return withInjectionLock(async () => {
@@ -6597,7 +6674,7 @@ async function openSession(body, deps = {}) {
   // for a Claude agent on the built-in profile: Codex takes its model from a config.toml
   // whose own swap keeps no in-memory record, and a managed Claude profile reads its own
   // settings.json, which the recorded value does not describe.
-  const readsSettingsModel = !launchModel || agent === 'codex';
+  const readsSettingsModel = agent !== 'pi' && (!launchModel || agent === 'codex');
   const canNameSwappedModel = agent === 'claude' && !launchModel && account.builtIn === true;
   let launch;
   let spawnStarted = false;
@@ -6636,7 +6713,13 @@ async function openSession(body, deps = {}) {
     if (deps.onLaunched) await deps.onLaunched(launch);
     launchPrepared = true;
     release();
-    if (deferReadiness) {
+    if (agent === 'pi') {
+      // Pi receives the opening message as a positional prompt. Its extension
+      // reports turn state; no Claude/Codex composer probing is involved.
+      await (deps.waitForPiStart || waitForPiStart)(launch.sessionId, launchedAt, deps);
+      launch.settled = true;
+      launch.sent = Boolean(message);
+    } else if (deferReadiness) {
       // The console shows the pane immediately while Claude boots or displays its trust
       // dialog; openRequestId pane metadata still dedupes a retry of the same request.
       launch.settled = false;
@@ -6663,7 +6746,7 @@ async function openSession(body, deps = {}) {
     if (launch.sessionId && deps.onSessionReady && await deps.onSessionReady(launch) === false) {
       throw new InjectionError(409, 'session launch reservation changed before opening instructions were sent');
     }
-    if (message) {
+    if (message && agent !== 'pi') {
       if (body.portableTransferId) {
         launch.sessionId ||= await (deps.waitForHostSessionId || waitForHostSessionId)(launch.pane, deps);
         if (!launch.sessionId || launch.sessionId === body.portableSourceSessionId) {
@@ -7321,6 +7404,7 @@ function scanSessions(options = {}) {
   else try { codexSessions = codex.scan({ dashboard: options.dashboard === true }); } catch {}
   attachCodexMarkers(codexSessions, attentionDir, now, options);
   sessions.push(...codexSessions);
+  try { sessions.push(...pi.scan({ root: keep.ROOT })); } catch {}
   // Hand-typed names are stamped before every titling pass: the generator must
   // see `renamed` so it leaves the name alone.
   sessionNames.apply(sessions, { root: keep.ROOT });
@@ -7556,7 +7640,8 @@ async function restorePlan(query, deps = {}) {
       }
     }
 
-    const hasTranscript = agent === 'codex' || Boolean((deps.transcriptExists || findSessionFile)(id));
+    const hasTranscript = agent === 'codex' ? true : agent === 'pi'
+      ? Boolean((deps.piFileFor || pi.fileFor)(id)) : Boolean((deps.transcriptExists || findSessionFile)(id));
     let action = 'skip';
     let reason;
     if (codexChild) reason = 'codex child session';
@@ -8154,15 +8239,18 @@ function backfillHostSessions(sessions, panes, deps = {}) {
       const id = meta && meta.sessionId;
       const agent = meta && meta.agent;
       if (!pane || typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(id)
-        || !['claude', 'codex'].includes(agent) || sessionIds.has(id)) continue;
+        || !['claude', 'codex', 'pi'].includes(agent) || sessionIds.has(id)) continue;
       const lookup = agent === 'codex'
         ? deps.codexSessionFor || codex.sessionFor
+        : agent === 'pi' ? deps.piSessionFor || pi.sessionFor
         : deps.claudeSessionFor || (deps.dashboard === true
           ? (indexedClaudeSessionFor ||= (deps.createDashboardClaudeSessionResolver || createDashboardClaudeSessionResolver)())
           : deps.freshClaudeSessionFor || claudeSessionFor);
       let session = null;
       try { session = lookup(id); } catch {}
       if (!session) {
+        const piEvent = agent === 'pi' ? pi.eventFor(id, path.join(deps.root || keep.ROOT, '.keep', 'pi-events')) : null;
+        const piPhase = piEvent?.phase || '';
         session = {
           id,
           kind: agent,
@@ -8171,10 +8259,11 @@ function backfillHostSessions(sessions, panes, deps = {}) {
           lastUser: '',
           lastAssistant: '',
           lastAssistantFull: '',
-          mtime: Date.parse(pane.createdAt) || Date.now(),
+          mtime: Math.max(Date.parse(pane.createdAt) || 0, Date.parse(piEvent?.at || '') || 0) || Date.now(),
           size: 0,
-          endedTurn: true,
-          state: 'recent',
+          endedTurn: agent === 'pi' ? piPhase !== 'running' : true,
+          toolRunning: agent === 'pi' && piPhase === 'running',
+          state: agent === 'pi' && piPhase === 'running' ? 'running' : 'recent',
         };
       } else {
         session = { ...session };

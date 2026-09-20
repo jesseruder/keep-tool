@@ -32,6 +32,7 @@ const OPEN_MESSAGE_LIMIT = 2000;
 // A model id as claude --model / codex -m accept it: claude-fable-5-1, opus, gpt-5.6-sol,
 // claude-fable-5-1[1m]. Bounded so it can go straight onto a command line.
 const LAUNCH_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,79}$/;
+const PI_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$/;
 const OPEN_MESSAGE_ERROR = 'agent messages are limited to 2000 characters';
 const KINDS = ['task', 'experiment', 'idea', 'chore', 'bug'];
 // What a passing check means for the card. Absent is `review`: every card written
@@ -337,6 +338,7 @@ function currentSession() {
   if (process.env.CLAUDE_CODE_SESSION_ID) {
     return { id: process.env.CLAUDE_CODE_SESSION_ID, agent: 'claude' };
   }
+  if (process.env.KEEP_PI_SESSION_ID) return { id: process.env.KEEP_PI_SESSION_ID, agent: 'pi' };
   return null;
 }
 
@@ -365,7 +367,7 @@ function commandSession() {
 // hatch for a human who knows what they are giving up.
 function resumeCommand(session, env = process.env, { raw = false } = {}) {
   if (!raw) return `keep open ${session.id}`;
-  return `${session.agent === 'codex' ? 'codex resume' : 'claude --resume'} ${session.id}`;
+  return `${session.agent === 'codex' ? 'codex resume' : session.agent === 'pi' ? 'pi --session' : 'claude --resume'} ${session.id}`;
 }
 
 function claimSession(task, session, otherTasks) {
@@ -407,7 +409,7 @@ function releaseCardSession(taskId, sessionId) {
 
 function linkLaunchedSession(taskId, session) {
   if (!session || typeof session.id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(session.id)) return null;
-  const agent = session.agent === 'codex' ? 'codex' : 'claude';
+  const agent = ['claude', 'codex', 'pi'].includes(session.agent) ? session.agent : 'claude';
   return withLock(() => {
     const all = loadAll(false);
     const task = all.find((entry) => entry.id === taskId);
@@ -898,7 +900,7 @@ function parseArgs(argv, spec) {
 // Not a security boundary — an agent can unset an env var — but it is the same
 // signal the push policy already runs on, and it makes the honest path obvious.
 function inAgentSession(env = process.env) {
-  return Boolean(env.CLAUDE_CODE_SESSION_ID || env.CODEX_SESSION_ID || env.CODEX_THREAD_ID);
+  return Boolean(env.CLAUDE_CODE_SESSION_ID || env.CODEX_SESSION_ID || env.CODEX_THREAD_ID || env.KEEP_PI_SESSION_ID);
 }
 
 // Throws (rather than exiting) so withLock's finally always releases the lock.
@@ -1153,7 +1155,7 @@ function deploymentFact(task, target) {
 
 function isDoneLogHeading(kind) {
   const text = String(kind || '');
-  return /^(?:done(?:\s+\((?:by (?:claude|codex) [A-Za-z0-9_-]+|reviewer [^)]+)\))?|.+\s→\s*done)\s*$/i.test(text);
+  return /^(?:done(?:\s+\((?:by (?:claude|codex|pi) [A-Za-z0-9_-]+|reviewer [^)]+)\))?|.+\s→\s*done)\s*$/i.test(text);
 }
 
 function dependencyResolved(task, target, options = {}) {
@@ -1769,7 +1771,7 @@ function projectMatchesCwd(project, cwd) {
 }
 
 module.exports = {
-  ROOT, TASKS, ARCHIVE, META, LOCK, HOLDS_DIR, STATUSES, OPEN_MESSAGE_LIMIT, LAUNCH_MODEL_RE,
+  ROOT, TASKS, ARCHIVE, META, LOCK, HOLDS_DIR, STATUSES, OPEN_MESSAGE_LIMIT, LAUNCH_MODEL_RE, PI_MODEL_RE,
   OPEN_MESSAGE_ERROR, KINDS, CHECK_ON_PASS, MIN_CHECK_EVERY_MS, STATUS_ORDER, KeepError, isTTY, color,
   STATUS_COLOR, nowStamp, relativeDurationMs, parseWhen, stampOf, parseTask, parseFrontmatterScalar,
   serializeTask, taskPath, loadTask, loadTaskAnywhere, warnedFiles, loadAll, saveTask, recordDoneTransition,

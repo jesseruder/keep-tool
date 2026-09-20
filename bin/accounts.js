@@ -5,9 +5,9 @@ const os = require('node:os');
 const path = require('node:path');
 const { named: sessionNamed } = require('./session-numbers.js');
 
-const AGENTS = ['claude', 'codex'];
+const AGENTS = ['claude', 'codex', 'pi'];
 const CUSTOM_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-const ID_RE = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex)\/default)$/;
+const ID_RE = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex|pi)\/default)$/;
 
 function expand(value) {
   return path.resolve(String(value).replace(/^~(?=\/|$)/, os.homedir()));
@@ -25,7 +25,7 @@ function physical(value) {
 function builtIn(agent) {
   return {
     id: `${agent}/default`,
-    label: agent === 'claude' ? 'Claude (default)' : 'Codex (default)',
+    label: agent === 'claude' ? 'Claude (default)' : agent === 'codex' ? 'Codex (default)' : 'Pi (default)',
     agent,
     configDir: path.join(os.homedir(), `.${agent}`),
     builtIn: true,
@@ -55,6 +55,7 @@ function validated(env = process.env, config = rawConfig(env)) {
     const id = String(entry.id || '');
     const label = String(entry.label || '').trim();
     const agent = String(entry.agent || '');
+    if (agent === 'pi') throw new Error('Pi uses only the built-in pi/default account');
     if (!ID_RE.test(id)) throw new Error(`invalid account id: ${id || '(empty)'}`);
     if (!label || label.length > 100 || /[\r\n]/.test(label)) throw new Error(`invalid account label for ${id}`);
     if (!AGENTS.includes(agent)) throw new Error(`invalid agent for account ${id}`);
@@ -282,6 +283,7 @@ function writeConfig(config, env = process.env) {
   fs.renameSync(tmp, file);
 }
 function add(entry, env = process.env) {
+  if (entry.agent === 'pi') throw new Error('Pi uses only the built-in pi/default account');
   if (!CUSTOM_ID_RE.test(String(entry.id || ''))) throw new Error('custom account ids use lowercase letters, digits, underscores, and hyphens');
   const original = rawConfig(env);
   const config = structuredClone(original);

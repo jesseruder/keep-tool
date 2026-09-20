@@ -48,6 +48,27 @@ test('profile environment isolates managed credentials while native no-config be
     const legacy = launcher.profileEnvironment('claude', native, { ANTHROPIC_API_KEY: 'legacy', CLAUDE_CONFIG_DIR: '/wrong' });
     assert.equal(legacy.ANTHROPIC_API_KEY, 'legacy');
     assert.equal(legacy.CLAUDE_CONFIG_DIR, undefined);
+    const piProfile = launcher.profileEnvironment('pi', accounts.defaultFor('pi', f.env), { ...process.env,
+      CLAUDE_CODE_SESSION_ID: 'outer-claude', CODEX_THREAD_ID: 'outer-codex', KEEP_PI_SESSION_ID: 'pi-session',
+    });
+    assert.equal(piProfile.CLAUDE_CODE_SESSION_ID, undefined);
+    assert.equal(piProfile.CODEX_THREAD_ID, undefined);
+    const piIdentity = spawnSync(process.execPath, ['-e', 'process.stdout.write(JSON.stringify(require("./bin/keep-core").currentSession()))'], {
+      cwd: path.join(__dirname, '..'), encoding: 'utf8', env: piProfile,
+    });
+    assert.equal(piIdentity.status, 0, piIdentity.stderr);
+    assert.deepEqual(JSON.parse(piIdentity.stdout), { id: 'pi-session', agent: 'pi' });
+    const nestedCodex = launcher.profileEnvironment('codex', accounts.defaultFor('codex', f.env), { ...process.env,
+      KEEP_PI_SESSION_ID: 'pi-session', KEEP_PI_KEEP_CLI: '/path/to/keep', KEEP_PI_OPENING_FILE: '/tmp/prompt', CODEX_THREAD_ID: 'codex-child',
+    });
+    assert.equal(nestedCodex.KEEP_PI_SESSION_ID, undefined);
+    assert.equal(nestedCodex.KEEP_PI_KEEP_CLI, undefined);
+    assert.equal(nestedCodex.KEEP_PI_OPENING_FILE, undefined);
+    const codexIdentity = spawnSync(process.execPath, ['-e', 'process.stdout.write(JSON.stringify(require("./bin/keep-core").currentSession()))'], {
+      cwd: path.join(__dirname, '..'), encoding: 'utf8', env: nestedCodex,
+    });
+    assert.equal(codexIdentity.status, 0, codexIdentity.stderr);
+    assert.deepEqual(JSON.parse(codexIdentity.stdout), { id: 'codex-child', agent: 'codex' });
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -91,7 +112,7 @@ test('config rejects traversal ids and physical config directory aliases', () =>
     const before = fs.readFileSync(f.env.KEEP_CONFIG, 'utf8');
     assert.throws(() => accounts.add({ id: 'alias', label: 'Alias', agent: 'claude', configDir: alias }, f.env), /duplicate claude configDir/);
     assert.equal(fs.readFileSync(f.env.KEEP_CONFIG, 'utf8'), before, 'an invalid candidate is never published');
-    assert.equal(accounts.list(f.env).length, 4);
+    assert.equal(accounts.list(f.env).length, 5);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 

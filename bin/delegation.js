@@ -6,7 +6,7 @@ const path = require('node:path');
 const { named: sessionNamed } = require('./session-numbers.js');
 
 const SESSION_RE = /^[A-Za-z0-9_-]+$/;
-const AGENTS = new Set(['claude', 'codex']);
+const AGENTS = new Set(['claude', 'codex', 'pi']);
 
 function directory(root) {
   return path.join(root, '.keep', 'delegations');
@@ -77,7 +77,7 @@ function read(root, id) {
 }
 
 function create(root, { card, step, parent, now = Date.now() }) {
-  if (!validSession(parent)) throw new Error('keep delegate needs a current Claude or Codex parent session');
+  if (!validSession(parent)) throw new Error('keep delegate needs a current agent parent session');
   const id = crypto.randomBytes(16).toString('hex');
   return write(root, {
     version: 1,
@@ -267,6 +267,7 @@ function sessionCandidates(env) {
   const codex = env.CODEX_THREAD_ID || env.CODEX_SESSION_ID;
   if (codex) candidates.push({ id: codex, agent: 'codex' });
   if (env.CLAUDE_CODE_SESSION_ID) candidates.push({ id: env.CLAUDE_CODE_SESSION_ID, agent: 'claude' });
+  if (env.KEEP_PI_SESSION_ID) candidates.push({ id: env.KEEP_PI_SESSION_ID, agent: 'pi' });
   return candidates.filter(validSession);
 }
 
@@ -274,7 +275,7 @@ function acceptSession(record, env) {
   const candidates = sessionCandidates(env).filter((candidate) => candidate.id !== record.parent.id || candidate.agent !== record.parent.agent);
   const unique = candidates.filter((candidate, index) => candidates.findIndex((other) => other.id === candidate.id && other.agent === candidate.agent) === index);
   if (unique.length !== 1) {
-    throw new Error('keep delegate --accept needs exactly one current worker session distinct from the parent; use parent-side --session <id> --agent claude|codex instead');
+    throw new Error('keep delegate --accept needs exactly one current worker session distinct from the parent; use parent-side --session <id> --agent claude|codex|pi instead');
   }
   return unique[0];
 }

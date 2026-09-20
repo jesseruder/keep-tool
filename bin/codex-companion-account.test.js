@@ -45,6 +45,7 @@ test('account wrapper forwards task controls and isolates profile, state, and br
       '--model', 'gpt-5.6-sol', '--effort', 'high', 'implement this'], {
       root: f.root, cwd: f.workspace, accounts: f.accountStore, companionScript: f.script,
       env: { KEEP_DIR: f.root, KEEP_AGENT_ACCOUNT_ID: 'claude-secondary', KEEP_PANE: 'claude-pane',
+        KEEP_PI_SESSION_ID: 'pi-parent', KEEP_PI_KEEP_CLI: '/pi/keep', KEEP_PI_OPENING_FILE: '/pi/prompt',
         KEEP_CODEX_CLIENT_TOKEN: 'old-client', CLAUDE_CONFIG_DIR: f.records[2].configDir,
         CODEX_COMPANION_SESSION_ID: 'parent-claude-session', CODEX_COMPANION_TRANSCRIPT_PATH: '/parent/transcript.jsonl',
         CODEX_COMPANION_APP_SERVER_ENDPOINT: 'unix:/other-account.sock',
@@ -60,6 +61,9 @@ test('account wrapper forwards task controls and isolates profile, state, and br
       'gpt-5.6-sol', '--effort', 'high', 'implement this']);
     assert.equal(launched.options.env.CODEX_HOME, f.records[1].configDir);
     assert.equal(launched.options.env.KEEP_AGENT_ACCOUNT_ID, 'codex-secondary');
+    assert.equal(launched.options.env.KEEP_PI_SESSION_ID, undefined);
+    assert.equal(launched.options.env.KEEP_PI_KEEP_CLI, undefined);
+    assert.equal(launched.options.env.KEEP_PI_OPENING_FILE, undefined);
     assert.equal(launched.options.env.CODEX_COMPANION_SESSION_ID, 'parent-claude-session');
     assert.equal(launched.options.env.CODEX_COMPANION_TRANSCRIPT_PATH, '/parent/transcript.jsonl');
     assert.equal(launched.options.env.CLAUDE_CONFIG_DIR, f.records[2].configDir);

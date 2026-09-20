@@ -632,6 +632,7 @@ function runModel(prompt, model, timeout = MODEL_TIMEOUT_MS) {
     const sessionId = crypto.randomUUID();
     const env = summarize.automationEnv('landed').env;
     delete env.CLAUDE_CODE_SESSION_ID;
+    delete env.KEEP_PI_SESSION_ID;
     let child;
     try {
       const args = slack.classifierArgs(prompt, resolveModel(model), sessionId, undefined, 'text');

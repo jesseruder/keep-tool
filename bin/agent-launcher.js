@@ -60,6 +60,15 @@ function launcherEnv(extra = null) {
 function profileEnvironment(agent, profile, source = process.env) {
   const env = { ...source };
   delete env[LAUNCHER_MARKER];
+  if (agent === 'pi') {
+    delete env.CLAUDE_CODE_SESSION_ID;
+    delete env.CODEX_SESSION_ID;
+    delete env.CODEX_THREAD_ID;
+  } else {
+    delete env.KEEP_PI_SESSION_ID;
+    delete env.KEEP_PI_KEEP_CLI;
+    delete env.KEEP_PI_OPENING_FILE;
+  }
   if (!profile) return env;
   env.KEEP_AGENT_ACCOUNT_ID = profile.id;
   if (profile.managed) for (const key of AUTH_ENV[agent] || []) delete env[key];
@@ -71,6 +80,8 @@ function profileEnvironment(agent, profile, source = process.env) {
       env.CLAUDE_CONFIG_DIR = profile.configDir;
       env.CLAUDE_SECURESTORAGE_CONFIG_DIR = profile.configDir;
     }
+  } else if (agent === 'pi') {
+    // Pi uses ~/.pi/agent; Keep's built-in profile does not replace its provider auth.
   } else if (profile.builtIn) delete env.CODEX_HOME;
   else {
     env.CODEX_HOME = profile.configDir;
@@ -92,8 +103,8 @@ function prepareProfile(agent, profile, options = {}) {
 }
 
 function launch(agent, executable, args, profile = null) {
-  if (!['codex', 'claude'].includes(agent) || !executable) {
-    process.stderr.write('usage: keep-{codex,claude}-cli <agent executable> [args...]\n');
+  if (!['codex', 'claude', 'pi'].includes(agent) || !executable) {
+    process.stderr.write('usage: keep-{codex,claude,pi}-cli <agent executable> [args...]\n');
     process.exitCode = 64;
     return;
   }

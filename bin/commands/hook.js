@@ -376,6 +376,39 @@ commands.hook = async (argv) => {
     try { require('../session-lifecycle').record(ROOT, input); } catch {}
     return; // Observation only: never block or inject context.
   }
+  if (argv[0] === 'pi') {
+    const sid = input && input.session_id;
+    if (typeof sid !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sid)) return;
+    if (argv[1] === 'start') {
+      const pane = await recordSessionPane(input, 'pi');
+      if (!pane?.bound) {
+        process.stderr.write('keep hook pi start: could not bind the host pane\n');
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        withLock(() => delegation.registerStart(ROOT, { id: sid, agent: 'pi' }, process.env,
+          delegationDependencies({ persist: true })));
+      } catch {}
+      return;
+    }
+    if (argv[1] === 'end') { await releaseSessionPane(input, 'pi'); return; }
+    if (argv[1] === 'pre-tool') {
+      const decision = guardRepairCommand(input);
+      const next = decision.deny ? decision : guardStepCommand(input);
+      if (next.deny) {
+        process.stderr.write(`${next.reason}\n`);
+        process.exitCode = 2;
+      }
+      return;
+    }
+    if (argv[1] === 'post-tool') {
+      try { recordDeploy(input); } catch {}
+      try { await recordStepRun(input); } catch {}
+      return;
+    }
+    return;
+  }
   if (argv[0] === 'codex') {
     // Codex hooks must always receive valid JSON and success, even for malformed
     // input or local filesystem failures. The one exception is a step-guard deny,
@@ -1830,9 +1863,12 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
       claimed = prior.claimed === true;
     }
   } catch {}
-  const accountId = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex)\/default)$/.test(env.KEEP_AGENT_ACCOUNT_ID || '')
+  const accountId = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex|pi)\/default)$/.test(env.KEEP_AGENT_ACCOUNT_ID || '')
     ? env.KEEP_AGENT_ACCOUNT_ID : null;
-  const record = { at, startedAt, cwd, agent, pane, claimed, ...(accountId ? { accountId } : {}) };
+  const piInstance = agent === 'pi' && typeof input.instance === 'string' && /^[a-f0-9-]{36}$/.test(input.instance)
+    ? input.instance : null;
+  const record = { at, startedAt, cwd, agent, pane, claimed, ...(accountId ? { accountId } : {}),
+    ...(piInstance ? { piInstance } : {}) };
   fs.mkdirSync(dir, { recursive: true });
   (deps.writePaneRecord || writePaneRecord)(file, record);
   for (const name of fs.readdirSync(dir)) {
@@ -1874,6 +1910,8 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
         }
       }
       const owner = current && current.pane && current.pane.meta && current.pane.meta.sessionId;
+      if (agent === 'pi' && owner === sid && paneMeta.agent === 'pi'
+          && current.pane?.alive === true) record.claimed = true;
       if (owner && owner !== sid) {
         let released = false;
         if (typeof owner === 'string' && /^[A-Za-z0-9_-]+$/.test(owner)) {
@@ -1928,6 +1966,7 @@ async function releaseSessionPane(input, agent = 'claude', deps = {}) {
   let record;
   try { record = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return; }
   if (!record || record.claimed !== true || !record.pane || record.agent !== agent) return;
+  if (agent === 'pi' && (!record.piInstance || input.instance !== record.piInstance)) return;
   const connectHost = deps.connectHost || require('../hostclient.js').connect;
   const timeoutMs = deps.timeoutMs == null ? 1000 : deps.timeoutMs;
   const attempts = deps.attempts == null ? 3 : deps.attempts;

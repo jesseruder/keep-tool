@@ -6838,6 +6838,81 @@ test('open uses host panes for both existing sessions and new Claude and Codex l
   }), (error) => error.status === 504 && /never registered its session id/.test(error.message));
 });
 
+test('Pi opens with a bound session id and private opening file, then resumes the same id', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-open-'));
+  const project = os.tmpdir();
+  const id = '99999999-9999-4999-8999-999999999999';
+  const host = recordingHost((type, _params, calls) => type === 'spawn'
+    ? { pane: { id: `pane-pi-${calls.filter((call) => call.type === 'spawn').length}` } } : {});
+  const deps = {
+    root, host, piExtensionReady: true, randomUUID: () => id,
+    loadTask: () => ({ fm: { project, sessions: [] } }),
+    linkLaunchedSession: () => true,
+    waitForPiStart: async () => ({ phase: 'start' }),
+  };
+  try {
+    const first = await openSession({ taskId: 'card', fresh: true, agent: 'pi', message: 'Inspect one file' }, deps);
+    assert.equal(first.sessionId, id);
+    assert.equal(first.accountId, 'pi/default');
+    assert.equal(first.sent, true);
+    assert.equal(first.linked, true);
+    assert.match(first.command, /pi --provider openrouter --model minimax\/minimax-m3 --session-id/);
+    assert.doesNotMatch(first.command, /Inspect one file/);
+    const spawned = host.calls.find((call) => call.type === 'spawn').params;
+    assert.equal(spawned.meta.agent, 'pi');
+    assert.equal(spawned.meta.sessionId, id);
+    assert.equal(spawned.env.KEEP_PI_SESSION_ID, id);
+    assert.equal(spawned.env.KEEP_PI_KEEP_CLI, path.join(__dirname, 'keep.js'));
+    const openingFile = spawned.env.KEEP_PI_OPENING_FILE;
+    assert.equal(fs.readFileSync(openingFile, 'utf8'), 'Inspect one file');
+    assert.equal(fs.statSync(openingFile).mode & 0o777, 0o600);
+
+    const resumed = await openSession({ sessionId: id }, {
+      ...deps,
+      scanSessions: () => [{ id, kind: 'pi', project }],
+      resolveSessionTarget: async () => { const error = new InjectionError(404, 'not live', { notLive: true }); throw error; },
+      liveSessionPids: async () => new Map(),
+      agentProcessRows: async () => [], listHostPanes: async () => [],
+    });
+    assert.equal(resumed.sessionId, id);
+    assert.match(resumed.command, new RegExp(`--session ${id}$`));
+    assert.doesNotMatch(resumed.command, /--session-id/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Pi resume refuses an unmapped external process whose argv is only pi', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-external-'));
+  const id = '88888888-8888-4888-8888-888888888888';
+  const deps = {
+    root, piExtensionReady: true,
+    scanSessions: () => [{ id, kind: 'pi', project: os.tmpdir() }],
+    resolveSessionTarget: async () => { throw new InjectionError(404, 'not live', { notLive: true }); },
+    liveSessionPids: async () => new Map(),
+    agentProcessRows: async () => [{ pid: 4242, ppid: 1, args: 'pi', agent: 'pi', interactive: true }],
+    listHostPanes: async () => [],
+  };
+  try {
+    await assert.rejects(openSession({ sessionId: id }, deps), /Pi process outside Keep is running \(pid 4242\)/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Pi host-only row follows lifecycle while its first transcript is unwritten', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-host-only-'));
+  const id = '77777777-7777-4777-8777-777777777777';
+  const dir = path.join(root, '.keep', 'pi-events');
+  fs.mkdirSync(dir, { recursive: true });
+  const pane = { id: 'pi-pane', alive: true, cwd: os.tmpdir(), meta: { agent: 'pi', sessionId: id, project: os.tmpdir() } };
+  try {
+    fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ id, phase: 'running', at: new Date().toISOString() }));
+    const sessions = [];
+    backfillHostSessions(sessions, [pane], { root, tasks: [], piSessionFor: () => null });
+    assert.equal(sessions[0].kind, 'pi');
+    assert.equal(sessions[0].state, 'running');
+    assert.equal(sessions[0].endedTurn, false);
+    assert.equal(sessions[0].toolRunning, true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('only an in-flight compaction names the model it swapped out', () => {
   // Mid-compaction settings.json holds the via model, and the swap remembers what it replaced.
   assert.equal(compactionSwappedModel({
