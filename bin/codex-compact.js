@@ -510,7 +510,8 @@ async function compactCodexFallback(session, target, instruction, deps = {}) {
     files = sessionFiles(session, deps);
     original = readRolloutSettings(files.transcript, deps);
     if (!original) throw fail('latest effective model and reasoning effort are unknown');
-    if (original.model !== 'gpt-6-astra') throw fail(`expected gpt-6-astra, found ${original.model}`);
+    const expectedModel = deps.compactionPolicy?.originalModel || 'gpt-6-astra';
+    if (original.model !== expectedModel) throw fail(`expected ${expectedModel}, found ${original.model}`);
     if (!DIRECT_EFFORT_LABELS[original.effort] && !['max', 'ultra'].includes(original.effort)) {
       throw fail(`original reasoning effort ${original.effort} is not offered by the model menu`);
     }

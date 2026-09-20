@@ -34,6 +34,7 @@ const {
   autoCompactIdleMs,
   compactModelExhausted,
   autoCompactPolicy,
+  reopenCompactPolicy,
   autoCompactCandidates,
   autoCompactOutcome,
   autoCompactTick,
@@ -2762,6 +2763,25 @@ test('auto-compact waits an hour before sending five-minute Claude caches throug
   assert.equal(autoCompactCandidates([coldSession], { [base.id]: { ...failedWarm, result: 'timeout' } }, now, opts).length, 0);
 });
 
+test('reopen compaction uses cache warmth immediately and an explicit premium family list', () => {
+  const now = Date.parse('2026-09-20T12:00:00Z');
+  const base = { kind: 'claude', model: 'claude-fable-5-1', contextTokens: 150000,
+    usageAt: now - 1000, cacheTtlMs: 5 * 60e3 };
+  const opts = { minTokens: 100000, premiumFamilies: ['fable', 'astra'], claudeFallbackModel: 'opus' };
+  assert.equal(reopenCompactPolicy(base, now, opts).path, 'warm-current');
+  assert.equal(reopenCompactPolicy({ ...base, usageAt: now - 6 * 60e3 }, now, opts).path, 'cold-fallback');
+  assert.equal(reopenCompactPolicy({ ...base, usageAt: null }, now, opts).path, 'cold-fallback');
+  assert.equal(reopenCompactPolicy(base, now, { ...opts, forceCold: true }).path, 'cold-fallback');
+  assert.equal(reopenCompactPolicy(base, now, { ...opts, modelExhausted: () => true }).path, 'cold-fallback');
+  assert.equal(reopenCompactPolicy({ ...base, contextTokens: 99999 }, now, opts), null);
+  assert.equal(reopenCompactPolicy({ ...base, model: 'claude-sonnet-5', usageAt: null }, now, opts).path, 'warm-current');
+  assert.equal(reopenCompactPolicy({ ...base, model: 'claude-future-7', usageAt: null }, now,
+    { ...opts, premiumFamilies: ['future'] }).path, 'cold-fallback');
+  assert.equal(reopenCompactPolicy({ ...base, kind: 'codex', model: 'gpt-6-astra', usageAt: null }, now, opts).path, 'cold-fallback');
+  assert.equal(reopenCompactPolicy({ ...base, kind: 'codex', model: 'gpt-7-premium', usageAt: null }, now,
+    { ...opts, premiumFamilies: ['premium'] }).path, 'cold-fallback');
+});
+
 function assertAutoCompactHealthRecovered(outcome) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-auto-compact-health-'));
   try {
@@ -4277,6 +4297,85 @@ test('cold Codex compaction invokes the fallback transaction seam and forwards r
   assert.deepEqual(calls, ['/compact']);
   assert.equal(result.restoreUnconfirmed, true);
   assert.equal(autoCompactOutcome(result), 'restore-unconfirmed');
+});
+
+test('reopen Claude swap repairs only its account settings and journals that account path', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-profile-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const accountDir = path.join(root, 'account'), daemonDir = path.join(root, 'daemon');
+  fs.mkdirSync(accountDir); fs.mkdirSync(daemonDir);
+  const settingsFile = path.join(accountDir, 'settings.json');
+  const daemonFile = path.join(daemonDir, 'settings.json');
+  fs.writeFileSync(settingsFile, '{"model":"claude-sonnet-5"}\n');
+  fs.writeFileSync(daemonFile, '{"model":"daemon-only"}\n');
+  const transcript = path.join(root, 'session.jsonl'); fs.writeFileSync(transcript, '{}\n');
+  const oldSettings = process.env.KEEP_CLAUDE_SETTINGS_PATH;
+  const oldTimeout = process.env.KEEP_COMPACT_TIMEOUT_MS;
+  process.env.KEEP_CLAUDE_SETTINGS_PATH = daemonFile;
+  process.env.KEEP_COMPACT_TIMEOUT_MS = '0';
+  t.after(() => {
+    if (oldSettings === undefined) delete process.env.KEEP_CLAUDE_SETTINGS_PATH;
+    else process.env.KEEP_CLAUDE_SETTINGS_PATH = oldSettings;
+    if (oldTimeout === undefined) delete process.env.KEEP_COMPACT_TIMEOUT_MS;
+    else process.env.KEEP_COMPACT_TIMEOUT_MS = oldTimeout;
+  });
+  const commands = [];
+  const result = await compactSession({ id: 'profile-swap', kind: 'claude', accountId: 'managed' },
+    { pane: 'profile-pane' }, null, {
+      dir: path.join(root, 'compact'), compactSettingsFile: settingsFile,
+      compactAccountId: 'managed', compactFamilies: ['fable'],
+      compactionPolicy: { path: 'cold-fallback', originalModel: 'claude-fable-5-1', targetModel: 'opus' },
+      sessionLastTurn: () => ({ model: 'claude-fable-5-1' }),
+      transcriptFileForSession: () => transcript, hostPaneModel: async () => '',
+      readScreen: async () => '❯', waitForModelSwitch: async () => true,
+      typeAndSubmit: async (_target, command) => {
+        commands.push(command);
+        if (command === '/model opus') {
+          const journal = readPendingCompactSwap('profile-swap', path.join(root, 'compact'));
+          assert.equal(journal.settingsFile, settingsFile);
+          assert.equal(journal.accountId, 'managed');
+        }
+        if (command.startsWith('/model ')) fs.writeFileSync(settingsFile,
+          `${JSON.stringify({ model: command.slice('/model '.length) })}\n`);
+      },
+    });
+  assert.equal(result.restoreUnconfirmed, undefined);
+  assert.deepEqual(commands, ['/model opus', '/compact', '/model claude-fable-5-1']);
+  assert.equal(JSON.parse(fs.readFileSync(settingsFile)).model, 'claude-sonnet-5');
+  assert.equal(JSON.parse(fs.readFileSync(daemonFile)).model, 'daemon-only');
+  assert.equal(pendingCompactSwaps(path.join(root, 'compact')).length, 0);
+});
+
+test('pending Claude swap sweep repairs each verified account settings path', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-profiles-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dir = path.join(root, 'compact'); fs.mkdirSync(dir);
+  const accountsById = {};
+  for (const id of ['first', 'second']) {
+    const configDir = path.join(root, id); fs.mkdirSync(configDir);
+    accountsById[id] = { id, agent: 'claude', configDir };
+    fs.writeFileSync(path.join(dir, `${id}.swap.json`), JSON.stringify({
+      sessionId: id, accountId: id, settingsFile: path.join(configDir, 'settings.json'),
+      originalModel: 'claude-fable-5-1', restoreCommand: '/model claude-fable-5-1',
+      switchModel: 'opus', settingsModelBefore: `before-${id}`, settingsModelPresent: true,
+      at: Date.now(),
+    }));
+  }
+  fs.writeFileSync(path.join(dir, 'untrusted.swap.json'), JSON.stringify({
+    sessionId: 'untrusted', accountId: 'first', settingsFile: path.join(root, 'other', 'settings.json'),
+    originalModel: 'claude-fable-5-1', restoreCommand: '/model claude-fable-5-1',
+    switchModel: 'opus', settingsModelBefore: 'wrong', settingsModelPresent: true, at: Date.now(),
+  }));
+  const repaired = [];
+  const result = await sweepPendingCompactSwaps({ dir, scanSessions: () => [],
+    accountById: (id) => accountsById[id],
+    readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'opus' }),
+    repairClaudeSettingsModel: (model, present, file) => { repaired.push([model, present, file]); return { changed: true }; },
+  });
+  assert.equal(result.repairedSettings, 2);
+  assert.deepEqual(repaired.map(([model]) => model).sort(), ['before-first', 'before-second']);
+  assert.deepEqual(repaired.map(([, , file]) => file).sort(),
+    ['first', 'second'].map((id) => path.join(root, id, 'settings.json')));
 });
 
 test('screen-confirmed compaction records a marker flushed by the model restore', async () => {
@@ -6838,6 +6937,87 @@ test('open uses host panes for both existing sessions and new Claude and Codex l
   }), (error) => error.status === 504 && /never registered its session id/.test(error.message));
 });
 
+test('dead-session reopen compacts the ready pane before its opening message and dedupes concurrent opens', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reopen-compact-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const configDir = path.join(root, 'claude'); fs.mkdirSync(configDir);
+  fs.writeFileSync(path.join(configDir, 'settings.json'), '{"model":"claude-fable-5-1"}\n');
+  const config = path.join(root, 'accounts.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'reopen-test', label: 'Reopen', agent: 'claude', configDir },
+  ], defaultAccounts: { claude: 'reopen-test' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+  const session = { id: 'reopen-test-session', kind: 'claude', project: root, accountId: 'reopen-test' };
+  const usageAt = Date.now() - 1000;
+  const events = [];
+  let finishCompact;
+  const compactGate = new Promise((resolve) => { finishCompact = resolve; });
+  let spawns = 0;
+  const deps = {
+    root, env, scanSessions: () => [session], resolveSessionTarget: async () => null,
+    liveSessionPids: async () => new Map(),
+    sessionLastTurn: () => { events.push('usage'); return { model: 'claude-fable-5-1', contextTokens: 160000,
+      usageAt, cacheTtlMs: 60 * 60e3 }; },
+    host: recordingHost((type) => { if (type === 'spawn') { spawns++; return { pane: { id: 'reopened-pane' } }; } return {}; }),
+    waitForHostAgent: async () => { events.push('ready'); return true; },
+    precheckSessionTarget: async () => { events.push('precheck'); },
+    compactSession: async (_session, target, _instruction, options) => {
+      events.push('compact');
+      assert.equal(target.pane, 'reopened-pane');
+      assert.equal(options.compactionPolicy.path, 'warm-current');
+      assert.equal(options.compactSettingsFile, path.join(configDir, 'settings.json'));
+      await compactGate;
+      return { compacted: true };
+    },
+    typeOpeningMessage: async () => { events.push('message'); },
+    trustProject: () => true,
+  };
+  const first = openSession({ sessionId: session.id, message: 'Continue.' }, deps);
+  await new Promise((resolve) => setImmediate(resolve));
+  const joined = openSession({ sessionId: session.id, message: 'Continue.' }, deps);
+  await assert.rejects(openSession({ sessionId: session.id, message: 'Other.' }, deps),
+    (error) => error.status === 409 && /different request/.test(error.message));
+  finishCompact();
+  const [opened, repeated] = await Promise.all([first, joined]);
+  assert.equal(opened.pane, repeated.pane);
+  assert.equal(spawns, 1);
+  assert.deepEqual(events, ['usage', 'ready', 'precheck', 'compact', 'message']);
+  const again = await openSession({ sessionId: session.id }, deps);
+  assert.equal(again.pane, 'reopened-pane');
+  assert.equal(events.filter((event) => event === 'compact').length, 1,
+    'unchanged usage snapshot is compacted only once on repeated reopen');
+});
+
+test('reopen blocks the opening message when original model restoration is unconfirmed', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reopen-restore-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let sent = 0;
+  const session = { id: 'reopen-restore-session', kind: 'codex', project: root };
+  await assert.rejects(openSession({ sessionId: session.id, message: 'Continue.' }, {
+    root, scanSessions: () => [session], resolveSessionTarget: async () => null,
+    liveSessionPids: async () => new Map(),
+    sessionLastTurn: () => ({ model: 'gpt-6-astra', contextTokens: 180000, usageAt: null }),
+    host: recordingHost((type) => type === 'spawn' ? { pane: { id: 'restore-pane' } } : {}),
+    waitForHostAgent: async () => true,
+    precheckSessionTarget: async () => {},
+    compactSession: async () => ({ compacted: true, restoreUnconfirmed: true, reason: 'restore failed' }),
+    typeOpeningMessage: async () => { sent++; },
+  }), (error) => error.status === 409 && error.extra?.launch?.pane === 'restore-pane'
+    && error.extra.code === 'OPEN_EXISTING_PANE');
+  assert.equal(sent, 0);
+});
+
+test('focusing an already-live session never compacts it', async () => {
+  const session = { id: 'live-reopen-session', kind: 'claude', project: os.tmpdir() };
+  const result = await openSession({ sessionId: session.id }, {
+    scanSessions: () => [session],
+    resolveSessionTarget: async () => ({ pane: 'live-pane' }),
+    compactSession: async () => assert.fail('live focus should not compact'),
+    sessionLastTurn: () => assert.fail('live focus should not read compaction usage'),
+  });
+  assert.equal(result.pane, 'live-pane');
+});
+
 test('Pi opens with a bound session id and private opening file, then resumes the same id', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-open-'));
   const project = os.tmpdir();
@@ -8691,6 +8871,7 @@ test('different-account reopen serializes source opening and starts one open-onl
   try {
     const sourceDir = path.join(root, 'source'), targetDir = path.join(root, 'target'), thirdDir = path.join(root, 'third');
     for (const dir of [sourceDir, targetDir, thirdDir]) fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(targetDir, 'settings.json'), '{}\n');
     const config = path.join(root, 'accounts.json');
     fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
       { id: 'source', label: 'Source', agent: 'claude', configDir: sourceDir },
@@ -8702,10 +8883,21 @@ test('different-account reopen serializes source opening and starts one open-onl
     require('./accounts').pinSession(session.id, 'claude', 'source', { root, env });
     let releaseOpen;
     const gate = new Promise((resolve) => { releaseOpen = resolve; });
-    let opens = 0; let handoffs = 0;
+    let opens = 0; let handoffs = 0; let compactions = 0;
     const deps = {
       root, env, resolveSessionId: () => session, listHostPanes: async () => [],
-      openSession: async (body) => { opens++; assert.equal(body.accountId, 'source'); await gate; return { pane: 'source-pane' }; },
+      sessionLastTurn: () => ({ model: 'claude-fable-5-1', contextTokens: 150000,
+        usageAt: Date.now() - 1000, cacheTtlMs: 60 * 60e3 }),
+      precheckSessionTarget: async () => {},
+      compactSession: async (_session, targetPane, _instruction, options) => {
+        compactions++;
+        assert.equal(targetPane.pane, 'source-pane');
+        assert.equal(options.compactionPolicy.path, 'cold-fallback', 'new account has no warm cache');
+        assert.equal(options.compactSettingsFile, path.join(targetDir, 'settings.json'));
+        return { compacted: true };
+      },
+      openSession: async (body, options) => { opens++; assert.equal(body.accountId, 'source');
+        assert.equal(options.reopenCompaction, 'skip'); await gate; return { pane: 'source-pane' }; },
       handoffSession: async (body) => { handoffs++; assert.deepEqual(body, {
         sessionId: session.id, pane: 'source-pane', accountId: 'target', intent: 'open-only',
       }); return { ok: true, status: 'done', pane: body.pane, intent: body.intent }; },
@@ -8718,7 +8910,7 @@ test('different-account reopen serializes source opening and starts one open-onl
     releaseOpen();
     const [result, repeated] = await Promise.all([first, joined]);
     assert.equal(result.intent, 'open-only'); assert.equal(repeated.status, 'done');
-    assert.equal(opens, 1); assert.equal(handoffs, 1);
+    assert.equal(opens, 1); assert.equal(handoffs, 1); assert.equal(compactions, 1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -2841,9 +2841,9 @@ function claudeSettingsPath() {
   );
 }
 
-function readClaudeSettingsModel() {
+function readClaudeSettingsModel(file = claudeSettingsPath()) {
   try {
-    const settings = JSON.parse(fs.readFileSync(claudeSettingsPath(), 'utf8'));
+    const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
       throw new Error('settings.json does not contain a JSON object');
     }
@@ -2859,9 +2859,8 @@ function readClaudeSettingsModel() {
   }
 }
 
-function repairClaudeSettingsModel(expected, expectedPresent = Boolean(expected)) {
+function repairClaudeSettingsModel(expected, expectedPresent = Boolean(expected), file = claudeSettingsPath()) {
   const expectedModel = typeof expected === 'string' ? expected : '';
-  const file = claudeSettingsPath();
   let temp = '';
   try {
     const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -3098,10 +3097,20 @@ function writePendingCompactSwap(session, plan, dir = autoCompactDir(), at = Dat
     switchModel: String(plan.switchCommand || '').replace(/^\s*\/model\s+/i, ''),
     settingsModelBefore: plan.settingsModelBefore,
     settingsModelPresent: plan.settingsModelPresent,
+    ...(plan.settingsFile ? { settingsFile: plan.settingsFile, accountId: plan.accountId } : {}),
     at,
   };
   writeCompactSwapRecord(file, record);
   return file;
+}
+
+function compactSwapSettingsFile(record, deps = {}) {
+  if (!record.settingsFile) return claudeSettingsPath(); // Legacy records used the daemon profile.
+  if (!record.accountId || !path.isAbsolute(record.settingsFile)) return null;
+  const account = (deps.accountById || accounts.get)(record.accountId, deps.env || process.env);
+  if (!account || account.agent !== 'claude' || !account.configDir
+      || path.resolve(record.settingsFile) !== path.join(path.resolve(account.configDir), 'settings.json')) return null;
+  return record.settingsFile;
 }
 
 function readPendingCompactSwap(sessionId, dir = autoCompactDir()) {
@@ -3278,18 +3287,22 @@ async function sweepPendingCompactSwaps(deps = {}) {
       repairedSettingsRecords.add(record.file);
       summary.repairedSettings += 1;
     };
-    // Settings are process-global. Repair them even when the owning session has
-    // exited, disappeared, or cannot safely receive a command this tick.
-    const settingsRecord = records.filter((record) => !record.error && !codexCompact.isCodexCompactSwap(record))
-      .sort((a, b) => compactSwapRecordAt(b) - compactSwapRecordAt(a))[0];
-    if (settingsRecord && !inFlightSwap) {
+    // Repair each account's settings independently, even if its session cannot
+    // safely receive a restore command on this tick.
+    const settingsRecords = new Map();
+    for (const record of records.filter((item) => !item.error && !codexCompact.isCodexCompactSwap(item))
+      .sort((a, b) => compactSwapRecordAt(b) - compactSwapRecordAt(a))) {
+      const file = compactSwapSettingsFile(record, deps);
+      if (file && !settingsRecords.has(file)) settingsRecords.set(file, record);
+    }
+    for (const [settingsFile, settingsRecord] of settingsRecords) if (!inFlightSwap) {
       const sid = (sessionRef(settingsRecord.sessionId) || 'unknown');
       try {
         await lock(async () => {
-          const settings = readSettings();
+          const settings = readSettings(settingsFile);
           const via = String(settingsRecord.switchModel || envString('KEEP_COMPACT_VIA_MODEL', 'opus')).trim();
           if (!settings.ok || !compactModelContainsFamily(settings.value, via)) return;
-          const repaired = repairSettings(settingsRecord.settingsModelBefore, settingsRecord.settingsModelPresent);
+          const repaired = repairSettings(settingsRecord.settingsModelBefore, settingsRecord.settingsModelPresent, settingsFile);
           noteSettingsRepair(settingsRecord, repaired);
           if (repaired.changed) {
             process.stderr.write(`keep serve: restored settings.json model to "${settingsRecord.settingsModelBefore}" after an interrupted compaction of ${sid}\n`);
@@ -3360,6 +3373,12 @@ async function sweepPendingCompactSwaps(deps = {}) {
         process.stderr.write(`keep serve: MODEL RESTORE UNCONFIRMED for claude session ${sid}: ${record.error}\n`);
         continue;
       }
+      const settingsFile = compactSwapSettingsFile(record, deps);
+      if (!settingsFile) {
+        summary.skipped += 1;
+        process.stderr.write(`keep serve: MODEL RESTORE UNCONFIRMED for claude session ${sid}: swap settings account is unavailable\n`);
+        continue;
+      }
       // Assistant usage lags /model commands. Always attempt the idempotent
       // restore for a live session, regardless of its last assistant model.
       if (compactRestoreBusy(session)) {
@@ -3391,20 +3410,20 @@ async function sweepPendingCompactSwaps(deps = {}) {
           // suggestion probe.
           await precheck(current, target, deps);
           const via = String(record.switchModel || envString('KEEP_COMPACT_VIA_MODEL', 'opus')).trim();
-          const before = readSettings();
+          const before = readSettings(settingsFile);
           // /model also overwrites settings.json. Save a hand change so we can
           // put it back after our command, without overwriting a later hand edit.
           const saved = before.ok && !compactModelContainsFamily(before.value, via)
             ? { settingsModelBefore: before.value, settingsModelPresent: before.present }
-            : settingsRecord;
+            : settingsRecords.get(settingsFile);
           const restoreModel = String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim();
           const repair = () => {
-            const after = readSettings();
+            const after = readSettings(settingsFile);
             if (!after.ok || (before.ok && after.value === before.value)) return;
             // Compare-and-swap: only undo the value our own /model command wrote. Anything
             // else is a newer hand change made while we waited, and it stays.
             if (compactModelBase(after.value) !== compactModelBase(restoreModel)) return;
-            const repaired = repairSettings(saved.settingsModelBefore, saved.settingsModelPresent);
+            const repaired = repairSettings(saved.settingsModelBefore, saved.settingsModelPresent, settingsFile);
             noteSettingsRepair(record, repaired);
             if (repaired.error) {
               process.stderr.write(`keep serve: could not restore settings.json model after an interrupted compaction of ${sid}: ${repaired.error}\n`);
@@ -3503,8 +3522,13 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
   const pendingRecordValue = session?.kind === 'claude' ? readPendingCompactSwap(session && session.id, dir) : null;
   const pendingRecord = codexCompact.isCodexCompactSwap(pendingRecordValue) ? null : pendingRecordValue;
   const configuredVia = envString('KEEP_COMPACT_VIA_MODEL', 'opus');
+  const settingsFile = deps.compactSettingsFile || claudeSettingsPath();
+  if (pendingRecord && compactSwapSettingsFile(pendingRecord, deps) !== settingsFile) {
+    return { compacted: false, restoreUnconfirmed: true,
+      reason: 'pending model restore belongs to a different or unavailable account' };
+  }
   const settingsSnapshot = session && session.kind === 'claude' && policy?.path !== 'warm-current'
-    ? (deps.readClaudeSettingsModel || readClaudeSettingsModel)() : { ok: true, present: false, value: '' };
+    ? (deps.readClaudeSettingsModel || readClaudeSettingsModel)(settingsFile) : { ok: true, present: false, value: '' };
   let swap = null;
   let via = null;
   let pendingSwapFile = '';
@@ -3518,6 +3542,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
       originalModel: pendingRecord.originalModel,
       settingsModelBefore: pendingRecord.settingsModelBefore,
       settingsModelPresent: pendingRecord.settingsModelPresent,
+      settingsFile: compactSwapSettingsFile(pendingRecord, deps),
     };
     pendingSwapFile = pendingRecord.file;
     via = pendingVia;
@@ -3529,7 +3554,8 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
   } else {
     let settingsModel = settingsSnapshot.present ? settingsSnapshot.value : '';
     let settingsPresent = settingsSnapshot.present;
-    const records = pendingCompactSwaps(dir).filter((record) => !record.error && !codexCompact.isCodexCompactSwap(record))
+    const records = pendingCompactSwaps(dir).filter((record) => !record.error && !codexCompact.isCodexCompactSwap(record)
+      && compactSwapSettingsFile(record, deps) === settingsFile)
       .sort((a, b) => compactSwapRecordAt(b) - compactSwapRecordAt(a));
     if (compactModelBase(settingsModel) === compactModelBase(configuredVia) && records.length) {
       settingsModel = records[0].settingsModelBefore;
@@ -3541,11 +3567,14 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
     const launchModel = await (deps.hostPaneModel || hostPaneModel)(target, deps);
     swap = compactSwapPlan({ ...session, model: launchModel || lastTurn.model }, {
       via: configuredVia,
-      families: compactModelFamilies(),
+      families: deps.compactFamilies || compactModelFamilies(),
       settingsModel,
       settingsPresent,
     });
     via = swap ? configuredVia : null;
+    if (swap && deps.compactSettingsFile && deps.compactAccountId) {
+      Object.assign(swap, { settingsFile, accountId: deps.compactAccountId });
+    }
   }
   let result;
   let compactDiagnostic;
@@ -3656,20 +3685,21 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
         await (deps.typeAndSubmit || typeAndSubmit)(target, swap.restoreCommand, claudeTypedTextVisible, deps);
         restored = await (deps.waitForModelSwitch || waitForModelSwitch)(target, swap.restoreCommand, sid, deps);
       } catch {}
-      const repaired = (deps.repairClaudeSettingsModel || repairClaudeSettingsModel)(swap.settingsModelBefore, swap.settingsModelPresent);
+      const repaired = (deps.repairClaudeSettingsModel || repairClaudeSettingsModel)(
+        swap.settingsModelBefore, swap.settingsModelPresent, swap.settingsFile || settingsFile);
       if (repaired.changed) {
         process.stderr.write(`keep serve: restored settings.json model to "${swap.settingsModelBefore}" after compaction of ${sid}\n`);
       }
       if (repaired.error) {
         process.stderr.write(`keep serve: could not restore settings.json model after compaction of ${sid}: ${repaired.error}\n`);
       }
-      if (restored) {
+      if (restored && !repaired.error) {
         restoreConfirmed = true;
         try { fs.unlinkSync(pendingSwapFile); } catch (e) {
           process.stderr.write(`keep serve: could not clear model restore record for claude session ${sid}: ${e.message}\n`);
         }
       } else {
-        process.stderr.write(`keep serve: MODEL RESTORE UNCONFIRMED for claude session ${sid}: expected "${swap.restoreCommand}" — restore it by hand\n`);
+        process.stderr.write(`keep serve: MODEL RESTORE UNCONFIRMED for claude session ${sid}: expected "${swap.restoreCommand}" and account settings repair — restore it by hand\n`);
         if (!result) result = { compacted: false, reason: 'model restore unconfirmed', via };
         result.restoreUnconfirmed = true;
       }
@@ -5263,6 +5293,104 @@ function autoCompactPolicy(session, now, opts) {
   };
 }
 
+// Reopen has no idle target window or maximum age. Take this snapshot before the
+// resumed agent writes startup records, since those can make a cold cache look new.
+function reopenCompactPolicy(session, now = Date.now(), opts = {}) {
+  if (!['claude', 'codex'].includes(session?.kind)) return null;
+  const contextTokens = Number(session.contextTokens);
+  if (!Number.isFinite(contextTokens) || contextTokens < (opts.minTokens ?? 100000)) return null;
+  const model = String(session.model || '').trim();
+  if (!model) return null;
+  const families = opts.premiumFamilies || ['fable', 'astra'];
+  const premium = families.some((family) => compactModelContainsFamily(model, family));
+  const fallbackTtlMs = session.kind === 'codex'
+    ? (opts.codexTtlMs ?? 30 * 60e3) : (opts.claudeTtlMs ?? 60 * 60e3);
+  const cacheTtlMs = session.kind === 'claude' && Number.isFinite(session.cacheTtlMs)
+    ? session.cacheTtlMs : fallbackTtlMs;
+  const warm = !opts.forceCold && opts.modelExhausted?.(session) !== true
+    && Number.isFinite(session.usageAt) && session.usageAt > 0
+    && now >= session.usageAt && now - session.usageAt < cacheTtlMs;
+  return {
+    path: premium && !warm ? 'cold-fallback' : 'warm-current',
+    originalModel: model,
+    targetModel: premium && !warm
+      ? session.kind === 'codex' ? (opts.codexFallbackModel || 'gpt-5.6-sol')
+        : (opts.claudeFallbackModel || 'opus') : model,
+    cacheTtlMs,
+    cacheAgeMs: Number.isFinite(session.usageAt) ? now - session.usageAt : null,
+    premium,
+  };
+}
+
+function reopenPremiumFamilies() {
+  return envString('KEEP_REOPEN_COMPACT_PREMIUM_MODELS', 'fable,astra')
+    .split(',').map((family) => family.trim().toLowerCase()).filter(Boolean);
+}
+
+const reopenCompactAttempts = new Map();
+
+function reopenTurnSnapshot(session, deps = {}, launchModel = '') {
+  const turn = (deps.sessionLastTurn || sessionLastTurn)(session, deps);
+  let model = launchModel || turn.model;
+  if (session.kind === 'claude' && !deps.sessionLastTurn && !launchModel) {
+    // A /model command after the last assistant usage is authoritative. The
+    // handoff reader scans through those commands and preserves [1m] exactly.
+    model = (deps.reopenEffectiveModel || handoffCurrentModel)(session, null, '', deps);
+    if (model === '<unknown>') return { ...turn, model: '' };
+  }
+  return { ...turn, model, usageAt: model === turn.model
+    ? turn.usageAt : null };
+}
+
+async function compactReopenedSession(session, target, account, turn, deps = {}) {
+  if (deps.reopenCompaction === 'skip') return null;
+  const dir = deps.dir || path.join(deps.root || keep.ROOT, '.keep', 'compact');
+  if (fs.existsSync(path.join(dir, `${session.id}.swap.json`))) {
+    throw new InjectionError(409, 'model restore is pending; opening message was not delivered');
+  }
+  const families = reopenPremiumFamilies();
+  const policy = reopenCompactPolicy({ ...session, ...turn }, Date.now(), {
+    minTokens: envNumber('KEEP_AUTO_COMPACT_MIN_TOKENS', 100000),
+    premiumFamilies: families,
+    forceCold: deps.reopenForceCold === true,
+    modelExhausted: (candidate) => compactModelExhausted(candidate,
+      { usage: usageSnapshot(deps), now: Date.now() }),
+    claudeTtlMs: envNumber('KEEP_AUTO_COMPACT_CLAUDE_TTL_MIN', envNumber('KEEP_CACHE_TTL_MIN', 60)) * 60e3,
+    codexTtlMs: envNumber('KEEP_AUTO_COMPACT_CODEX_TTL_MIN', 30) * 60e3,
+    claudeFallbackModel: envString('KEEP_COMPACT_VIA_MODEL', 'opus'),
+    codexFallbackModel: envString('KEEP_AUTO_COMPACT_CODEX_FALLBACK_MODEL', 'gpt-5.6-sol'),
+  });
+  if (!policy) return null;
+  const signature = JSON.stringify([account.id, policy.originalModel, turn.contextTokens, turn.usageAt]);
+  if (reopenCompactAttempts.get(session.id) === signature) return null;
+  const accountSettingsFile = session.kind === 'claude' ? path.join(account.configDir, 'settings.json') : undefined;
+  if (session.kind === 'claude' && policy.path === 'cold-fallback') {
+    const settings = (deps.readClaudeSettingsModel || readClaudeSettingsModel)(accountSettingsFile);
+    if (!settings.ok) {
+      process.stderr.write(`keep serve: reopen compaction skipped ${sessionRef(session.id)}: account settings are unreadable (${settings.error})\n`);
+      return null;
+    }
+  }
+  await (deps.precheckSessionTarget || precheckSessionTarget)(session, target, deps);
+  const result = await (deps.compactSession || compactSession)(
+    { ...session, model: policy.originalModel, accountId: account.id }, target, null, {
+      ...deps, dir, sessionLastTurn: () => turn, compactionPolicy: policy, compactFamilies: families,
+      compactSettingsFile: accountSettingsFile,
+      compactAccountId: account.id,
+    });
+  if (result?.restoreUnconfirmed || result?.reason === 'timeout'
+      || (!result?.compacted && result?.attemptStage === 'submitted')) {
+    throw new InjectionError(409, `reopen compaction ${result.reason || 'model restore unconfirmed'}; opening message was not delivered`);
+  }
+  if (result?.compacted) {
+    reopenCompactAttempts.delete(session.id);
+    reopenCompactAttempts.set(session.id, signature);
+    if (reopenCompactAttempts.size > 1024) reopenCompactAttempts.delete(reopenCompactAttempts.keys().next().value);
+  }
+  if (!result?.compacted) process.stderr.write(`keep serve: reopen compaction skipped ${sessionRef(session.id)}: ${String(result?.reason || 'unconfirmed').slice(0, 300)}\n`);
+  return result;
+}
+
 function autoCompactCandidates(sessions, stamps, now, opts) {
   const candidates = [];
   for (const session of sessions || []) {
@@ -6217,7 +6345,7 @@ async function waitForPiStart(id, launchedAt, deps = {}) {
 async function withInjectionLockRetry(fn, deps = {}, scope) {
   const now = deps.now || Date.now;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const deadline = now() + 10000;
+  const deadline = now() + (deps.injectionLockRetryMs ?? 10000);
   for (;;) {
     try { return await withInjectionLock(fn, scope); }
     catch (e) {
@@ -6234,6 +6362,7 @@ function shellQuoteArg(value) {
 }
 
 const freshOpenOperations = new Map();
+const reopenOpenOperations = new Map();
 
 // Pane metadata carried over when a pane is replaced — an in-place restart, a force
 // restart, an account handoff. `ephemeral` is dropped on purpose: it marks a pane the
@@ -6465,6 +6594,19 @@ async function openSession(body, deps = {}) {
   }
   if (body.fresh) session = null;
 
+  if (session && !deps.reopenOpenClaimed) {
+    const identity = JSON.stringify({ accountId: body.accountId || '', model: body.model || '', message });
+    const running = reopenOpenOperations.get(session.id);
+    if (running) {
+      if (running.identity !== identity) throw new InjectionError(409, 'session reopen is already delivering a different request');
+      return running.promise;
+    }
+    const promise = openSession(body, { ...deps, reopenOpenClaimed: true });
+    reopenOpenOperations.set(session.id, { identity, promise });
+    try { return await promise; }
+    finally { if (reopenOpenOperations.get(session.id)?.promise === promise) reopenOpenOperations.delete(session.id); }
+  }
+
   const agent = (session && (session.kind || session.agent)) || body.agent || 'claude';
   if (!['claude', 'codex', 'pi'].includes(agent)) throw new InjectionError(400, 'agent must be claude, codex, or pi');
   if (agent === 'pi' && (deps.onSessionReady || deps.onOpeningReady || deps.onOpeningDelivered)) {
@@ -6479,6 +6621,7 @@ async function openSession(body, deps = {}) {
   let account;
   let accountNote = '';
   let accountWarning = '';
+  let reopenTurn = null;
   if (session) {
     try { account = accounts.forSession(session.id, agent, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
     catch (error) { throw new InjectionError(409, error.message); }
@@ -6768,6 +6911,9 @@ async function openSession(body, deps = {}) {
         return result;
       }, { pane: target.pane, session: session.id, model: modelCommandText(message) });
     }
+    if (agent !== 'pi' && deps.reopenCompaction !== 'skip') {
+      reopenTurn = reopenTurnSnapshot({ ...session, kind: agent }, deps, launchModel);
+    }
   }
 
   // A new pane has no lock to collide with, so the launch holds the model key for one
@@ -6854,6 +7000,12 @@ async function openSession(body, deps = {}) {
     if (launch.sessionId && deps.onSessionReady && await deps.onSessionReady(launch) === false) {
       throw new InjectionError(409, 'session launch reservation changed before opening instructions were sent');
     }
+    if (session && reopenTurn && !message && agent !== 'pi') {
+      await withInjectionLockRetry(() => compactReopenedSession(
+        { ...session, kind: agent }, target, account, reopenTurn, deps),
+      { ...deps, injectionLockRetryMs: envNumber('KEEP_COMPACT_TIMEOUT_MS', 240000) + 30000 },
+      { pane: target.pane, session: session.id, model: true });
+    }
     if (message && agent !== 'pi') {
       if (body.portableTransferId) {
         launch.sessionId ||= await (deps.waitForHostSessionId || waitForHostSessionId)(launch.pane, deps);
@@ -6863,6 +7015,8 @@ async function openSession(body, deps = {}) {
       }
       await withInjectionLockRetry(
         async () => {
+          if (session && reopenTurn) await compactReopenedSession(
+            { ...session, kind: agent }, target, account, reopenTurn, deps);
           if (body.portableTransferId) await assertPortablePaneBinding({
             pane: launch.pane, transferId: body.portableTransferId, accountId: account.id,
             cardId: body.taskId || null, sessionId: launch.sessionId, pid: launch.pid, createdAt: launch.createdAt,
@@ -6875,8 +7029,9 @@ async function openSession(body, deps = {}) {
             throw new InjectionError(409, 'opening-message reservation changed before instructions were sent');
           }
           return (deps.typeOpeningMessage || typeOpeningMessage)(target, agent, message, deps);
-        }, deps,
-        { pane: target.pane, model: modelCommandText(message) },
+        }, session && reopenTurn
+          ? { ...deps, injectionLockRetryMs: envNumber('KEEP_COMPACT_TIMEOUT_MS', 240000) + 30000 } : deps,
+        { pane: target.pane, session: session?.id, model: Boolean(session && reopenTurn) || modelCommandText(message) },
       );
       launch.sent = true;
       if (deps.onOpeningDelivered && await deps.onOpeningDelivered(launch) === false) {
@@ -6911,7 +7066,8 @@ async function openSession(body, deps = {}) {
       // started" from "it started and I could not confirm the rest". Without this
       // a caller that retries on failure opens a second agent on the same work.
       const started = { pane: launch.pane, sessionId: launch.sessionId || null, accountId: account.id, agent };
-      if (error instanceof InjectionError) error.extra = { ...(error.extra || {}), launch: started };
+      if (error instanceof InjectionError) error.extra = { ...(error.extra || {}),
+        ...(session ? { code: 'OPEN_EXISTING_PANE' } : {}), launch: started };
       else if (error && typeof error === 'object') error.launch ||= started;
     }
     throw error;
@@ -6956,6 +7112,22 @@ async function reopenSessionOnAccount(body, deps = {}) {
     if (running.accountId !== target.id) throw new InjectionError(409, 'A different account reopen is already running for this session');
     return running.promise;
   }
+  const compactTarget = async (result, turn) => {
+    if (result?.status !== 'done' || !result.pane) return result;
+    try {
+      await withInjectionLockRetry(() => compactReopenedSession(
+        { ...session, kind: agent }, { pane: result.pane }, target, turn,
+        { ...deps, reopenForceCold: true }),
+      { ...deps, injectionLockRetryMs: envNumber('KEEP_COMPACT_TIMEOUT_MS', 240000) + 30000 },
+      { pane: result.pane, session: session.id, model: true });
+    } catch (error) {
+      const launch = { pane: result.pane, sessionId: session.id, accountId: target.id, agent, recoverable: true };
+      if (error instanceof InjectionError) error.extra = { ...(error.extra || {}), code: 'OPEN_EXISTING_PANE', launch };
+      else error.launch = launch;
+      throw error;
+    }
+    return result;
+  };
   const promise = (async () => {
     const handoffs = require('./account-handoff').list(root);
     const recorded = handoffs.find((entry) => entry.sessionId === session.id);
@@ -6963,11 +7135,14 @@ async function reopenSessionOnAccount(body, deps = {}) {
       if (recorded.targetAccountId !== target.id || recorded.intent !== 'open-only') {
         throw new InjectionError(409, 'A different account handoff is already pending for this session');
       }
-      return (deps.handoffSession || handoffSession)({ sessionId: session.id, pane: recorded.pane,
+      const turn = reopenTurnSnapshot({ ...session, kind: agent }, deps);
+      const resumed = await (deps.handoffSession || handoffSession)({ sessionId: session.id, pane: recorded.pane,
         accountId: target.id, intent: 'open-only' }, deps);
+      return compactTarget(resumed, turn);
     }
     if (recorded?.status === 'done' && recorded.targetAccountId === target.id && recorded.intent === 'open-only') {
-      return (deps.openSession || openSession)({ sessionId: session.id, accountId: target.id }, deps);
+      return (deps.openSession || openSession)({ sessionId: session.id, accountId: target.id },
+        { ...deps, reopenForceCold: true });
     }
     let source;
     try { source = accounts.forSession(session.id, agent, { root, env }); }
@@ -6985,10 +7160,13 @@ async function reopenSessionOnAccount(body, deps = {}) {
           accountId: source.id, agent, recoverable: true },
       });
     }
-    const opened = await (deps.openSession || openSession)({ sessionId: session.id, accountId: source.id }, deps);
+    const turn = reopenTurnSnapshot({ ...session, kind: agent }, deps);
+    const opened = await (deps.openSession || openSession)({ sessionId: session.id, accountId: source.id },
+      { ...deps, reopenCompaction: 'skip' });
     if (!opened?.pane) throw new InjectionError(502, 'Source session did not open in a verified pane');
-    return (deps.handoffSession || handoffSession)({ sessionId: session.id, pane: opened.pane,
+    const result = await (deps.handoffSession || handoffSession)({ sessionId: session.id, pane: opened.pane,
       accountId: target.id, intent: 'open-only' }, deps);
+    return compactTarget(result, turn);
   })();
   reopenOperations.set(session.id, { accountId: target.id, promise });
   try { return await promise; }
@@ -9935,11 +10113,12 @@ function start(deps = {}) {
   const mutationFence = () => `${mutationEpoch}:${mutationSequence}`;
   const shutdown = () => {
     if (inFlightSwap) {
-      const action = shutdownSettingsRepair(inFlightSwap, readClaudeSettingsModel());
+      const settingsFile = inFlightSwap.settingsFile || claudeSettingsPath();
+      const action = shutdownSettingsRepair(inFlightSwap, readClaudeSettingsModel(settingsFile));
       if (!action.repair) {
         process.stderr.write(`keep serve: left settings.json model alone during shutdown: ${action.reason}\n`);
       } else {
-        const repaired = repairClaudeSettingsModel(action.value, action.present);
+        const repaired = repairClaudeSettingsModel(action.value, action.present, settingsFile);
         if (repaired.error) {
           process.stderr.write(`keep serve: could not restore settings.json model during shutdown: ${repaired.error}\n`);
         } else {
@@ -10328,6 +10507,7 @@ module.exports = {
   autoCompactIdleMs,
   compactModelExhausted,
   autoCompactPolicy,
+  reopenCompactPolicy,
   autoCompactCandidates,
   autoCompactOutcome,
   autoCompactTick,

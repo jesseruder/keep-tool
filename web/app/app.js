@@ -655,7 +655,7 @@ async function reopenSession({ sessionId, taskId, agent, title, stalePane, proje
   let openedPane = null;
   await openSessionChooser(ctx, {
     eyebrow: freshCard ? 'Card' : 'Conversation', title: `Reopen ${title || taskId || sessionId || 'session'}`,
-    description: freshCard ? 'Start the first conversation for this card.' : 'Resume this conversation without sending a new instruction.',
+    description: freshCard ? 'Start the first conversation for this card.' : 'Resume this conversation without sending a new instruction. Large conversations compact automatically.',
     project: launchProject, kinds: freshCard ? ['claude', 'codex', 'pi'] : [provider], initialKind: freshCard ? 'claude' : provider,
     accountId: currentAccountId, requireRecordedAccount: !freshCard, showModel: freshCard, confirmLabel: freshCard ? 'Start conversation' : 'Reopen',
     models: freshCard ? { claude: 'claude-fable-5-1', codex: '' } : undefined,
@@ -679,7 +679,7 @@ async function reopenSession({ sessionId, taskId, agent, title, stalePane, proje
           await reload();
           openedPane = launch.pane;
           ctx.openReviewPane(launch.pane);
-          const boundError = new Error(`${error.message} The existing pane is open for inspection; retry resumes setup without creating another.`);
+          const boundError = new Error(`${error.message} The existing pane is open for inspection.`);
           boundError.body = error.body;
           throw boundError;
         }

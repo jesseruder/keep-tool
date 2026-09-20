@@ -2329,6 +2329,19 @@ flush the marker for diagnostics. The gate is configured by `KEEP_CACHE_TTL_MIN`
 240000). Run compaction directly with `keep compact <sid>` or
 `POST /api/compact { "sessionId": "<sid>" }`.
 
+Reopening a stopped Claude or Codex session also compacts when its last context is at
+least `KEEP_AUTO_COMPACT_MIN_TOKENS` (default 100000). Keep snapshots context and cache
+usage before launching the resumed agent, then compacts the ready pane before an opening
+message. A live pane that is merely focused is left alone. Reopen uses the current model
+when the last usage suggests its cache is still warm; a missing usage time is cold.
+For cold premium models, it temporarily selects the cheaper model and restores the exact
+original model afterwards. `KEEP_REOPEN_COMPACT_PREMIUM_MODELS` is a comma-separated
+family list (default `fable,astra`); other models compact on their current model.
+Reopening on another account treats the target as cold and compacts only after the
+handoff reaches its target pane. Claude swap records retain the account settings path so
+interrupted restore and shutdown repair that profile. If model restoration is unconfirmed,
+Keep keeps the pane available for inspection and does not deliver the opening message.
+
 Cold Claude compactions whose transcript model matches `KEEP_AUTO_COMPACT_MODELS` (a
 comma-separated family list, default `fable`) first switch the session to
 `KEEP_COMPACT_VIA_MODEL` (default `opus`; set it to `off` to disable the swap).
