@@ -52,10 +52,11 @@ const laterTick = (run) => {
   if (timer && typeof timer.unref === 'function') timer.unref();
 };
 
-// Start at most one refresh, and make sure it always ends. `timeout` only signals,
-// so the kill is SIGKILL and a watchdog releases the single-flight flag even if the
-// child never reports; the pipes are unref'd so a lingering sysctl cannot hold the
-// process open. The whole thing is best effort — no failure here is worth raising.
+// Start at most one refresh, and make sure it always ends without ever holding the
+// process open: one unref'd watchdog owns both the time bound and the single-flight
+// flag, because execFile's own `timeout` arms a referenced timer that would keep a
+// short-lived CLI alive for the length of the bound. The child and its pipes are
+// unref'd too. All best effort — no failure here is worth raising.
 function refreshSwap(deps = {}) {
   const now = deps.now || Date.now;
   const platform = deps.platform || process.platform;
@@ -79,9 +80,9 @@ function refreshSwap(deps = {}) {
       swapState.at = now();
     };
     const execFile = deps.execFile || child_process.execFile;
+    let child;
     try {
-      const child = execFile('/usr/sbin/sysctl', ['-n', 'vm.swapusage'],
-        { timeout: timeoutMs, killSignal: 'SIGKILL', windowsHide: true },
+      child = execFile('/usr/sbin/sysctl', ['-n', 'vm.swapusage'], { windowsHide: true },
         (error, stdout) => settle(error ? null : parseSwapUsage(stdout)));
       if (child) {
         if (typeof child.unref === 'function') child.unref();
@@ -89,7 +90,11 @@ function refreshSwap(deps = {}) {
           if (pipe && typeof pipe.unref === 'function') pipe.unref();
         }
       }
-      watchdog = setTimeout(() => settle(null), timeoutMs * 2);
+      watchdog = setTimeout(() => {
+        // SIGKILL, not a signal a wedged sysctl could decline.
+        try { if (child) child.kill('SIGKILL'); } catch {}
+        settle(null);
+      }, timeoutMs);
       if (watchdog && typeof watchdog.unref === 'function') watchdog.unref();
     } catch {
       settle(null);

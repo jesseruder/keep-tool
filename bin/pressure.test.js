@@ -96,7 +96,6 @@ test('swap is never read on the timeout path: the sample refreshes out of band',
   assert.equal(first.swapTotalBytes, undefined);
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].args, ['-n', 'vm.swapusage']);
-  assert.equal(calls[0].options.timeout, pressure.SWAP_TIMEOUT_MS);
 
   // A second timeout while the first sample is still running starts nothing new.
   pressure.sample(deps);
@@ -170,20 +169,25 @@ test('the timeout path never spawns: the refresh runs on a later tick', async ()
   assert.deepEqual(calls, ['/usr/sbin/sysctl']);
 });
 
-test('a child that never reports releases the single-flight flag', async () => {
+test('a child that never reports is killed, and the single-flight flag is released', async () => {
   pressure.resetForTest();
   const calls = [];
+  const kills = [];
   const { deps } = machine({
     platform: 'darwin',
     swapTimeoutMs: 10,
     execFile: (file, args, options) => {
-      calls.push(options.killSignal);
-      return { unref() {}, stdout: null, stderr: null }; // never calls back
+      // execFile's own `timeout` arms a timer it will not let go of; the watchdog
+      // here is unref'd, so the bound is ours to enforce.
+      calls.push(options);
+      return { unref() {}, stdout: null, stderr: null, kill: (signal) => kills.push(signal) };
     },
   });
   pressure.sample(deps);
-  assert.deepEqual(calls, ['SIGKILL'], 'the bound is a kill, not a polite signal');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].timeout, undefined, 'no referenced timer may outlive a short CLI');
   await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.deepEqual(kills, ['SIGKILL'], 'the bound is a kill, not a signal sysctl could decline');
   pressure.sample(deps);
   assert.equal(calls.length, 2, 'a wedged child does not stop later samples');
 });

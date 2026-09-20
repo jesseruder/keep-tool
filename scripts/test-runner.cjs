@@ -24,7 +24,10 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 
 const DEFAULT_MAX = 4;
-const FORWARDED = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+// The suite is in its own process group, so every signal the terminal used to send
+// it directly now has to be relayed — including Ctrl-\, and Ctrl-Z, which suspends
+// the suite first and this wrapper after it.
+const FORWARDED = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT', 'SIGCONT'];
 
 function resolveConcurrency(options = {}) {
   const env = options.env || process.env;
@@ -73,14 +76,28 @@ function main(argv = process.argv.slice(2)) {
   // is stopped with SIGTTIN, and no test here reads it.
   const child = spawn(process.execPath, args, { stdio: ['ignore', 'inherit', 'inherit'], detached: true });
   const handlers = new Map();
+  const relay = (signal) => {
+    try { process.kill(-child.pid, signal); }
+    catch { try { child.kill(signal); } catch {} }
+  };
   for (const signal of FORWARDED) {
-    const handler = () => {
-      try { process.kill(-child.pid, signal); }
-      catch { try { child.kill(signal); } catch {} }
-    };
+    const handler = () => relay(signal);
     handlers.set(signal, handler);
     process.on(signal, handler);
   }
+  // Ctrl-Z has to stop the tests before it stops the thing waiting on them, and this
+  // process then suspends itself with the one signal it cannot catch, so the shell
+  // sees a stopped job. SIGCONT is relayed like the rest, which wakes both.
+  //
+  // The relayed stop is SIGSTOP, not SIGTSTP: a detached group is an orphaned one by
+  // definition, and POSIX has the kernel discard SIGTSTP sent to an orphaned group —
+  // the suite would keep running while the shell showed a stopped job.
+  const suspend = () => {
+    relay('SIGSTOP');
+    process.kill(process.pid, 'SIGSTOP');
+  };
+  handlers.set('SIGTSTP', suspend);
+  process.on('SIGTSTP', suspend);
   child.on('error', (error) => {
     process.stderr.write(`could not start the test runner: ${error && error.message}\n`);
     process.exit(1);

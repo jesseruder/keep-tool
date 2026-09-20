@@ -110,6 +110,50 @@ test('an interrupt stops the suite and is reported as a failure', async () => {
   assert.ok(stopped.signal || stopped.code !== 0, `interrupt reported success: ${JSON.stringify(stopped)}`);
 });
 
+// Ctrl-Z used to stop the tests because they shared the terminal's foreground group.
+// They no longer do, so the wrapper has to relay the suspension and then take it.
+test('Ctrl-Z stops the suite with the wrapper, and SIGCONT wakes both', async () => {
+  const { spawn } = require('node:child_process');
+  const state = (pid) => String(spawnSync('ps', ['-o', 'state=', '-p', String(pid)], { encoding: 'utf8' }).stdout || '').trim();
+  const settle = async (pid, wanted) => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (state(pid).startsWith(wanted)) return true;
+      await new Promise((resolve) => { const t = setTimeout(resolve, 100); t.unref(); });
+    }
+    return false;
+  };
+  const child = spawn(process.execPath, [runner, path.join(__dirname, 'fixtures', 'test-runner', 'slow.test.js')],
+    { env: env({ KEEP_TEST_CONCURRENCY: '1' }), stdio: ['ignore', 'pipe', 'pipe'] });
+  const ended = new Promise((resolve) => child.on('exit', () => resolve()));
+  let suite = '';
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('the fixture suite never started')), 20_000);
+      child.stdout.on('data', (chunk) => {
+        if (!String(chunk).includes('fixture running')) return;
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    suite = String(spawnSync('pgrep', ['-P', String(child.pid)], { encoding: 'utf8' }).stdout || '').trim().split('\n')[0];
+    if (!suite) return; // no pgrep here; the relay is covered by the interrupt test
+    child.kill('SIGTSTP');
+    assert.ok(await settle(suite, 'T'), 'the suite kept running while the wrapper was suspended');
+    assert.ok(await settle(child.pid, 'T'), 'the wrapper did not suspend itself');
+    child.kill('SIGCONT');
+    assert.ok(await settle(suite, 'S'), 'the suite was not woken with the wrapper');
+  } finally {
+    // The suite is its own group and its own session; nothing else reaps it.
+    if (suite) {
+      try { process.kill(-Number(suite), 'SIGCONT'); } catch {}
+      try { process.kill(-Number(suite), 'SIGKILL'); } catch {}
+    }
+    child.kill('SIGCONT');
+    child.kill('SIGKILL');
+    await ended;
+  }
+});
+
 test('the runner is the command the suite actually runs', () => {
   const pkg = JSON.parse(require('node:fs').readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
   for (const name of ['test', 'test:reliability', 'test:reliability:browser']) {
