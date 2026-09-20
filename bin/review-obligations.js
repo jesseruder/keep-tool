@@ -69,7 +69,16 @@ function readRecords(id, root = keep.ROOT) {
   try { value = JSON.parse(text); }
   catch (error) { fail(`the pending reviews for ${id} are not readable JSON: ${error.message || error}`); }
   if (!Array.isArray(value)) fail(`the pending reviews for ${id} are not a list`);
-  return value.filter((record) => record && typeof record === 'object' && STATES.includes(record.state));
+  // Normalised, not trusted. A hand-edited record with no `commits` used to throw deep
+  // inside the sweep — after the state had been decided — and take every later card on
+  // that tick with it, every tick, for as long as the record sat there.
+  return value
+    .filter((record) => record && typeof record === 'object' && STATES.includes(record.state) && typeof record.id === 'string')
+    .map((record) => ({
+      ...record,
+      job: typeof record.job === 'string' ? record.job : '',
+      commits: Array.isArray(record.commits) ? record.commits.filter((commit) => commit && typeof commit === 'object') : [],
+    }));
 }
 
 // Terminal records are history, and history does not need to be re-parsed by the daemon
@@ -335,16 +344,22 @@ function range(record) {
   return shas.join(' ');
 }
 
+// What this obligation can honestly say on a card. It knows what happened to the job it
+// named, and nothing else: whether some *other* review covers these commits is a
+// question about the whole card, which `keep reviews` answers and this does not. Saying
+// "these commits have no review record" was a claim it could not support — an Opus
+// fallback review, or a record predating the obligation, makes it false.
 function checkin(record, decision) {
   const shas = range(record);
   const account = record.accountId ? ` --account ${record.accountId}` : '';
+  const what = shas || 'this card';
   if (decision.state === 'awaiting-verdict') {
     return {
       heading: 'review pending',
-      message: `The review launched for ${shas || 'this card'} has finished but no verdict is recorded.`
+      message: `The review launched for ${what} (job ${record.job}) has finished, and its verdict is not on this card.`
         + ` Read it with \`keep codex${account} result ${record.job}\` and record it with`
         + ` \`keep reviewed ${record.card} --commit <range> --verdict clean|findings --job ${record.job}\`.`
-        + ' Until then keep land refuses these commits.',
+        + ' keep land refuses these commits while this review is outstanding.',
       linkSession: false,
       commitLabel: 'review',
     };
@@ -352,9 +367,9 @@ function checkin(record, decision) {
   if (decision.state === 'failed' || decision.state === 'abandoned') {
     return {
       heading: 'review failed',
-      message: `The review launched for ${shas || 'this card'} produced no verdict: ${decision.note}.`
-        + ' Nothing was reviewed, so re-run it — a run that ends without a verdict is not a clean review.'
-        + ` These commits still have no review record, which is what keep land refuses on.`,
+      message: `The review launched for ${what} (job ${record.job}) produced no verdict: ${decision.note}.`
+        + ' A run that ends without a verdict is not a clean review, so re-run it unless another'
+        + ` independent review already covers these commits — keep reviews ${record.card} lists what is on the card.`,
       linkSession: false,
       commitLabel: 'review',
     };
@@ -416,9 +431,18 @@ function settle(deps = {}) {
   };
 
   for (const id of deps.cards || cards(root)) {
+    try { settleCard(id); }
+    catch (error) { result.errors.push(`${id}: ${error.message || error}`); }
+  }
+  return result;
+
+  // Everything for one card, so a throw anywhere inside it costs that card its tick and
+  // not the whole sweep — the cards after it in the directory listing have nothing to do
+  // with whatever is wrong here.
+  function settleCard(id) {
     let records;
     try { records = readRecords(id, root); }
-    catch (error) { result.errors.push(`${id}: ${error.message || error}`); continue; }
+    catch (error) { result.errors.push(`${id}: ${error.message || error}`); return; }
 
     // Check-ins this card still owes: from this pass, or from any earlier one whose
     // announcement never landed. Retried until one does, which is what makes delivery
@@ -428,7 +452,7 @@ function settle(deps = {}) {
     if (records.some(isOpen)) {
       let reviewRecords = [];
       try { reviewRecords = readReviews(id); }
-      catch (error) { result.errors.push(`${id}: could not read the review records: ${error.message || error}`); continue; }
+      catch (error) { result.errors.push(`${id}: could not read the review records: ${error.message || error}`); return; }
 
       const settled = new Map();
       const basis = new Map();
@@ -456,7 +480,7 @@ function settle(deps = {}) {
         try { written = commit(id, basis, (record) => (settled.get(record.id) || {}).next); }
         catch (error) {
           result.errors.push(`${id}: could not write obligations: ${error.message || error}`);
-          continue;
+          return;
         }
         for (const [recordId, { next, moved }] of settled) {
           if (!written.has(recordId)) continue;

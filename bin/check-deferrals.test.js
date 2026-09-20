@@ -172,31 +172,36 @@ test('an actively deferring streak is never pruned out from under its own escala
   assert.equal(map.has('a-card'), false);
 });
 
-test('a malformed or future lastDay cannot make an entry immortal or prune a live one', () => {
+test('a lastDay Keep cannot use is repaired, never trusted and never ignored', () => {
   const base = Date.parse('2026-09-16T18:17:00Z');
-  // A value in the future cannot keep a dead entry alive: retention reads it as today
-  // at the latest, so this one still ages out on its own start date.
-  const future = deferrals.parse({ zombie: { since: stampAt(base - 30 * DAY), lastDay: '9999-12-31', checkAfter: 'x' } });
-  deferrals.serialize(future, base);
-  assert.equal(future.has('zombie'), false);
+  const RETENTION = 14 * DAY;
+  // Ignoring a bad value handed retention back to `since`, which pruned streaks that
+  // were still deferring daily. Trusting one let a dead streak claim to be from 9999 and
+  // live forever. Repairing it to today does neither: the entry survives this save and
+  // ages out a retention window later, and an active streak overwrites it on its next
+  // deferral anyway.
+  for (const lastDay of ['9999-12-31', 'yesterday']) {
+    const map = deferrals.parse({ entry: { since: stampAt(base - 30 * DAY), lastDay, checkAfter: 'x' } });
+    deferrals.serialize(map, base, deferrals.dayOf(base));
+    assert.equal(map.has('entry'), true, `${lastDay}: kept for now`);
+    assert.equal(map.get('entry').lastDay, deferrals.dayOf(base), `${lastDay}: repaired to today`);
+    deferrals.serialize(map, base + RETENTION + DAY);
+    assert.equal(map.has('entry'), false, `${lastDay}: and retired a retention window later`);
+  }
 
-  // A value Keep cannot read at all is kept rather than pruned — it may belong to an
-  // active streak, and normalising it away silently handed retention back to `since`,
-  // which pruned live streaks before the next note() could repair them.
-  const malformed = deferrals.parse({ live: { since: stampAt(base - 10 * DAY), lastDay: 'yesterday', checkAfter: 'x' } });
-  deferrals.serialize(malformed, base);
-  assert.equal(malformed.has('live'), true, 'an unreadable day is not evidence the streak is over');
-  // It is not kept forever, though: the next note() repairs it within a day, so an
-  // entry still unrepaired at twice the retention is history whatever it says.
-  const ancient = deferrals.parse({ old: { since: stampAt(base - 40 * DAY), lastDay: 'yesterday', checkAfter: 'x' } });
-  deferrals.serialize(ancient, base);
-  assert.equal(ancient.has('old'), false);
-  // And the next deferral repairs it, after which ordinary retention applies again.
-  deferrals.note(malformed, 'live', { checkAfter: 'x', stamp: stampAt(base), today: stampAt(base).slice(0, 10) });
-  deferrals.serialize(malformed, base);
-  assert.equal(malformed.get('live').lastDay, stampAt(base).slice(0, 10));
-  deferrals.serialize(malformed, base + 60 * DAY);
-  assert.equal(malformed.has('live'), false, 'a repaired streak that then stopped is history');
+  // A streak claiming to have started in the future is not a streak, and nothing could
+  // ever age it out.
+  const ahead = deferrals.parse({ ahead: { since: stampAt(base + 400 * DAY), lastDay: '', checkAfter: 'x' } });
+  deferrals.serialize(ahead, base);
+  assert.equal(ahead.has('ahead'), false);
+
+  // And a streak still deferring daily keeps its repaired value current.
+  const live = deferrals.parse({ live: { since: stampAt(base - 30 * DAY), lastDay: 'nonsense', checkAfter: 'x' } });
+  deferrals.serialize(live, base, deferrals.dayOf(base));
+  deferrals.note(live, 'live', { checkAfter: 'x', stamp: stampAt(base + DAY), today: deferrals.dayOf(base + DAY) });
+  deferrals.serialize(live, base + DAY);
+  assert.equal(live.get('live').lastDay, deferrals.dayOf(base + DAY));
+  assert.equal(live.get('live').notices, 1, 'and the repair did not cost it a deferred day');
 });
 
 test('fallback attempts are counted on the streak so a restart does not reset them', () => {

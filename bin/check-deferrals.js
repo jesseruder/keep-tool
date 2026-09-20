@@ -24,6 +24,13 @@ function timeMs(stamp) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+// The local day a timestamp falls on, in the `YYYY-MM-DD` form `lastDay` carries.
+function dayOf(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 function entryFrom(value) {
   if (!value || typeof value !== 'object') return null;
   const since = typeof value.since === 'string' ? value.since : '';
@@ -59,26 +66,27 @@ function parse(value) {
 // Pruned on last activity, never on when the streak started. A card deferring every day
 // for a fortnight is the case this whole module exists for: expiring it would restart
 // its streak, un-latch its escalation, and walk the card through the same notices again.
-function serialize(map, now = Date.now()) {
+function serialize(map, now = Date.now(), today = dayOf(now)) {
   const out = {};
   for (const [id, entry] of map) {
-    // An entry that names a day Keep cannot read is kept rather than pruned — it may be
-    // an active streak whose `lastDay` was mangled, and the next note() repairs it
-    // within the day. Twice the retention is far beyond that, and past it even an
-    // unreadable entry is history.
+    // A streak that says it started in the future is not a streak; nothing can age it
+    // out, so nothing else here can be reasoned about either.
+    const started = timeMs(entry.since);
+    if (started === null || started > now + 86400e3) { map.delete(id); continue; }
+
+    // A `lastDay` Keep cannot read is repaired to today rather than being either
+    // trusted or ignored. Ignoring it handed retention back to `since`, which pruned
+    // streaks that were still deferring daily; trusting it let a bad value keep a dead
+    // one indefinitely. Repairing it retires the entry a retention window from now,
+    // and an active streak overwrites it on its next deferral anyway.
     const stated = entry.lastDay ? timeMs(entry.lastDay) : null;
-    if (entry.lastDay && stated === null) {
-      const started = timeMs(entry.since);
-      if (started !== null && now - started > 2 * RETENTION_MS) { map.delete(id); continue; }
+    if (entry.lastDay && (stated === null || stated > now + 86400e3)) {
+      entry.lastDay = today;
       out[id] = entry;
       continue;
     }
-    // A day in the future is not activity — it is a bad value claiming to be recent, and
-    // trusting it would keep a dead streak for as long as it cared to claim. The day's
-    // grace absorbs the UTC-versus-local boundary and ordinary clock skew.
-    const usable = stated !== null && stated <= now + 86400e3 ? stated : null;
-    const seen = usable ?? timeMs(entry.since);
-    if (seen === null || now - seen > RETENTION_MS) { map.delete(id); continue; }
+    const seen = stated ?? started;
+    if (now - seen > RETENTION_MS) { map.delete(id); continue; }
     out[id] = entry;
   }
   return out;
@@ -165,5 +173,5 @@ function describe(entry, checkAfter, now = Date.now()) {
 
 module.exports = {
   ESCALATE_AFTER_NOTICES, ESCALATE_AFTER_MS, RETENTION_MS,
-  timeMs, parse, serialize, note, escalationDue, countAttempt, markEscalated, clear, stateFile, read, describe,
+  timeMs, dayOf, parse, serialize, note, escalationDue, countAttempt, markEscalated, clear, stateFile, read, describe,
 };

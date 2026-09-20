@@ -1086,9 +1086,15 @@ until the check-in lands**, so delivery is durable rather than at-most-once. The
 re-read the record, re-read the card's review records, write the check-in, clear the debt
 — happens inside **one** registry lock, with `checkinTask` told the lock is already held.
 A verdict recorded in the meantime cancels the announcement rather than being
-contradicted by it, and that check covers terminal records too: an abandoned obligation
-whose notice failed must not later announce "no review record" about a review that has
-since been recorded. A card that refuses the check-in a dozen times running (an archived
+contradicted by it, and that check covers terminal records too.
+
+A check-in says only what the obligation knows — what happened to the job it named.
+Whether some *other* review covers those commits is a question about the whole card,
+which `keep reviews` answers and this does not: a fallback review recorded with evidence
+rather than a job, or a record written before the obligation opened, would make a flat
+"these commits have no review record" false. A record Keep cannot use is normalised on
+read rather than throwing mid-sweep, and each card is settled inside its own try, so one
+bad record costs its own card a tick instead of every card after it in the listing. A card that refuses the check-in a dozen times running (an archived
 one always will) is given up on with an error rather than retried forever, and a record
 that still owes a check-in is never pruned.
 
@@ -2209,7 +2215,11 @@ the card its stalled record. The per-tick open allowance is reserved before the 
 rather than counted after it, and a refund belongs to the tick that made the
 reservation. Escalations share the per-tick notice ceiling, and one held back
 by it keeps its unlatched streak for the next tick. The streak lives in the `deferred`
-bucket of `.keep/runs/scheduler-state.json` and is pruned after a fortnight. `KEEP_CHECK_MODEL`, when set, is both the model the opened
+bucket of `.keep/runs/scheduler-state.json` and is pruned a fortnight after its last
+deferred day — never after its first, which would retire the streaks the ceiling exists
+for. A `lastDay` Keep cannot read, or one in the future, is repaired to today rather
+than trusted or ignored: ignoring it handed retention back to the streak's start and
+pruned live streaks, trusting it let a dead one claim to be from 9999. `KEEP_CHECK_MODEL`, when set, is both the model the opened
 session is launched with and the model the budget is classified against, so the window
 Keep checks is the window Keep spends; unset, the session takes the model in
 settings.json and the budget is read against the reviewer's model as a proxy.

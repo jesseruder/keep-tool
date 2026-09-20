@@ -754,3 +754,68 @@ test('a terminal record Keep cannot date is not kept forever', () => {
   assert.deepEqual(obligations.keptRecords([{ ...undated, announce: true }], now).map((r) => r.id), ['obl-x'],
     'unless it still owes a check-in');
 });
+
+// ---------- what round five found ----------
+
+test('a check-in says what this obligation knows, and makes no claim about the card', () => {
+  const now = Date.now();
+  const failed = obligations.checkin(pending({ state: 'failed' }), { state: 'failed', note: 'the job is dead' });
+  // "These commits still have no review record" was a claim about the whole card that
+  // this module cannot support: an Opus fallback review, or a record written before the
+  // obligation opened, makes it false.
+  assert.doesNotMatch(failed.message, /no review record|Nothing was reviewed/);
+  assert.match(failed.message, /job job-42\) produced no verdict: the job is dead/);
+  assert.match(failed.message, /unless another independent review already covers these commits/);
+  assert.match(failed.message, /keep reviews a-card lists what is on the card/);
+
+  const waiting = obligations.checkin(pending({ state: 'awaiting-verdict' }), { state: 'awaiting-verdict', note: '' });
+  assert.match(waiting.message, /its verdict is not on this card/);
+  assert.match(waiting.message, /while this review is outstanding/);
+});
+
+test('a record Keep cannot use costs its own card a tick, not every card after it', () => {
+  const box = fixture();
+  try {
+    // Hand-edited, valid JSON, and missing the commits every consumer reads.
+    fs.mkdirSync(obligations.obligationsDir(box.root), { recursive: true });
+    fs.writeFileSync(obligations.cardFile('broken-card', box.root),
+      JSON.stringify([{ ...pending({ card: 'broken-card' }), commits: null }]));
+    box.write('later-card', [pending({ id: 'obl-2', card: 'later-card' })]);
+
+    const landed = [];
+    const result = obligations.settle({
+      root: box.root, withLock: nolock,
+      cards: ['broken-card', 'later-card'],
+      resolveJob: () => ({ status: 'completed' }),
+      readReviews: () => [],
+      checkinTask: (id, payload) => landed.push([id, payload]),
+    });
+    // Normalising on read is what stops the throw; the per-card catch is the backstop.
+    assert.deepEqual(result.errors, []);
+    assert.deepEqual(landed.map(([id]) => id).sort(), ['broken-card', 'later-card'],
+      'the card after the broken one was reached');
+    assert.match(landed.find(([id]) => id === 'broken-card')[1].message, /launched for this card/);
+    assert.equal(box.read('later-card')[0].state, 'awaiting-verdict');
+  } finally { box.cleanup(); }
+});
+
+test('a card whose processing throws does not take the rest of the sweep with it', () => {
+  const box = fixture();
+  try {
+    box.write('angry-card', [pending({ card: 'angry-card' })]);
+    box.write('later-card', [pending({ id: 'obl-2', card: 'later-card' })]);
+    const landed = [];
+    let refused = false;
+    const result = obligations.settle({
+      root: box.root,
+      cards: ['angry-card', 'later-card'],
+      // The lock itself refuses the first card's write and works from then on.
+      withLock: (fn) => { if (!refused) { refused = true; throw new Error('the registry is wedged'); } return fn(); },
+      resolveJob: () => ({ status: 'completed' }),
+      readReviews: () => [],
+      checkinTask: (id, payload) => landed.push([id, payload]),
+    });
+    assert.ok(result.errors.some((error) => /angry-card/.test(error)));
+    assert.deepEqual(landed.map(([id]) => id), ['later-card']);
+  } finally { box.cleanup(); }
+});
