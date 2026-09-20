@@ -102,13 +102,13 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .rail button.collapse { display: block; width: 22px; padding: 0; text-align: center; }
 .rail button.collapse:hover { background: none; }
 .rail button.rail-dot { display: flex; width: 24px; height: 32px; flex-shrink: 0; padding: 4px 0; align-items: center; justify-content: center; }
-.rail-clients { margin-top: 12px; padding-top: 6px; border-top: 1px solid var(--line); }
+.rail-clients { margin-top: auto; padding-top: 6px; border-top: 1px solid var(--line); }
 .rail-clients .rh { padding-bottom: 4px; }
 .rail-clients .provider-icon { width: 16px; height: 16px; margin: 0; vertical-align: 0; }
 .rail-client-all { width: 16px; text-align: center; font: 16px/1 var(--sans); color: var(--muted); }
-.rail.collapsed .rail-clients { margin-top: 10px; padding-top: 7px; }
+.rail.collapsed .rail-clients { padding-top: 7px; }
 .rail.collapsed .rail-clients button { margin-left: 0; }
-.rail button.rail-shell { grid-template-columns: 16px 1fr; margin-top: auto; }
+.rail button.rail-shell { grid-template-columns: 16px 1fr; }
 .rail .rail-shell-mark { color: var(--faint); font: 500 14px/1 var(--mono); text-align: center; }
 .rail button.rail-shell:hover .rail-shell-mark { color: var(--text); }
 .rail.collapsed button.rail-shell { display: flex; width: 24px; height: 32px; padding: 4px 0; align-items: center; justify-content: center; }
