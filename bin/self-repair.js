@@ -9,10 +9,11 @@
 //
 // Deliberately narrow. This scheduler never restarts the daemon and never lands
 // anything itself: it opens a card and spends one rate-limited agent on it. The
-// restart is the session's, and only after `keep land` has put its fix on
-// origin/master — landedFor() below is what the pre-bash guard asks. Repair state
-// lives here, never in health.json, which is rewritten whole on every record()
-// and would lose it.
+// manual recovery commands become available only after `keep land` has put its
+// fix on origin/master — landedFor() below is what the pre-bash guard asks. `wt
+// land` normally deploys the fix itself; recovery is for a reported skip or
+// failure. Repair state lives here, never in health.json, which is rewritten
+// whole on every record() and would lose it.
 
 const fs = require('fs');
 const path = require('path');
@@ -558,8 +559,8 @@ function symptomNote(candidate, previousCardId) {
     `Last error: ${clip(redactSecrets(notes.scrub(candidate.lastError)), 400) || '(none recorded)'}`,
     `Last ok: ${candidate.lastOkAt ? stamp(candidate.lastOkAt) : 'never recorded'}.`,
     previousCardId ? `This signature recurred after a cooldown; the previous repair card was ${previousCardId}.` : '',
-    'Opened by the daemon self-repair scheduler. The daemon restart is gated, not manual: the repair session'
-      + ' restarts it itself once its fix is landed with `keep land`, and is refused until then.',
+    'Opened by the daemon self-repair scheduler. `wt land` deploys a ready live checkout after `keep land`.'
+      + ' If it reports a skipped or failed deployment, the repair session resolves it after its fix is landed.',
   ].filter(Boolean).join('\n');
 }
 
@@ -567,7 +568,7 @@ const PLAN = Object.freeze([
   'Reproduce and root-cause from the attached health record and log excerpt',
   'Fix in the worktree with a test that fails before and passes after',
   'Independent review, then `keep reviewed` and `keep land` if `keep allow <card> land` allows; otherwise leave the card in review with the branch named',
-  'Once the fix is on origin/master: `git -C ~/keep-tool pull --ff-only`, `keep restart-daemon`, then confirm the row is green with `keep health` (both are refused until the land)',
+  'Confirm the row is green with `keep health`. `wt land` deploys a ready live checkout; resolve a skipped or failed deployment after the fix is on origin/master.',
 ]);
 
 function cardTitle(candidate) {
@@ -731,9 +732,11 @@ function buildRecipe(context) {
     `   keep reviewed ${cardId} --commit origin/master..HEAD --verdict clean --by "codex sol" --job <job-id>`,
     `5. Land only if Keep allows it: keep allow ${cardId} land, and if that exits 0, keep land ${cardId}.`,
     '   If either exits non-zero, leave the card in review and name the branch in your check-in.',
-    '6. Restart the daemon into your fix. Once `keep land` has pushed, and only then, the guard stops refusing',
-    '   exactly two commands, and they are yours to run. Type each one ALONE, exactly as written: the guard',
-    '   matches the whole command, so `cd`, `&&`, a wrapper or an assignment in front of it is still refused.',
+    '6. Confirm the deployment result. After `keep land`, `wt land` normally fast-forwards a ready live checkout',
+    '   and restarts the daemon. If it reports a skipped or failed deployment, recover it yourself. The guard',
+    '   allows exactly two recovery commands once the fix is landed, but that eligibility is not proof recovery',
+    '   is needed. Type each command ALONE, exactly as written: the guard matches the whole command, so `cd`,',
+    '   `&&`, a wrapper or an assignment in front of it is still refused.',
     '   keep who ~/keep-tool',
     '     — if a hold is active, wait it out first: keep wait --no-hold ~/keep-tool --for 2h',
     '   git -C ~/keep-tool pull --ff-only',
@@ -746,12 +749,12 @@ function buildRecipe(context) {
     '',
     'Hard constraints:',
     '- Never edit, commit, or run git writes in ~/keep-tool: that is the live daemon checkout. Only this worktree.',
-    '  The one exception, and only after the land, is `git -C ~/keep-tool pull --ff-only` in step 6.',
+    '  The one exception is `git -C ~/keep-tool pull --ff-only` for a skipped or failed deployment after the land.',
     '- Do not restart the daemon before your fix is landed. `keep restart-daemon`, `keep service` and `launchctl`',
     '  are refused for you until then (KEEP_REPAIR=1 is set for you and the pre-bash guard blocks them; Keep',
     '  recorded this session as the repair agent, so a restart, a force-restart or a handoff re-sets it). After',
-    '  the land the guard allows `git -C ~/keep-tool pull --ff-only` and `keep restart-daemon` as whole commands,',
-    '  and nothing else: `keep service`, `launchctl`, the /api/restart-daemon fetch and every other git write',
+    '  the land the guard allows `git -C ~/keep-tool pull --ff-only` and `keep restart-daemon` as whole recovery',
+    '  commands, and nothing else: `keep service`, `launchctl`, the /api/restart-daemon fetch and every other git write',
     '  stay refused, and so does either command with anything attached to it.',
     '- Never `git push --force` and never `wt land`; landing goes through `keep land`, which enforces the review record.',
     '- Fix this signature\'s root cause and nothing else. A broad refactor cannot be reviewed from here.',

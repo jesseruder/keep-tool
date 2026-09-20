@@ -362,16 +362,18 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
     assert.equal(card.commit, true);
     assert.match(card.note, /Signature sched:review:/);
     assert.match(card.note, /Last error: tick failed for pid 123/);
+    assert.match(card.note, /If it reports a skipped or failed deployment/);
 
-    // The plan is set before the card is saved: four steps, and the restart is
-    // the last one, the session's own, and gated on the land.
+    // The plan is set before the card is saved: four steps, with deployment
+    // recovery conditional on wt land reporting a problem.
     assert.equal(card.draft.plan.length, 4);
     assert.deepEqual(card.draft.plan.map((step) => step.state), ['todo', 'todo', 'todo', 'todo']);
     assert.match(card.draft.plan[0].text, /Reproduce and root-cause/);
     assert.match(card.draft.plan[1].text, /fails before and passes after/);
     assert.match(card.draft.plan[2].text, /keep reviewed/);
-    assert.match(card.draft.plan[3].text, /Once the fix is on origin\/master/);
-    assert.match(card.draft.plan[3].text, /refused until the land/);
+    assert.match(card.draft.plan[3].text, /`wt land` deploys a ready live checkout/);
+    assert.match(card.draft.plan[3].text, /skipped or failed deployment/);
+    assert.doesNotMatch(card.draft.plan[3].text, /Once the fix is on origin\/master.*restart-daemon/);
 
     // Evidence went on as artifacts, staged inside Keep and cleaned up after —
     // and the recipe is one of them, because it does not fit in an open message.
@@ -392,11 +394,16 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
     // turn with the review pending, which killed the poll and landed nothing.
     assert.match(recipe, /YOUR TURN MUST NOT END WHILE THE REVIEW IS STILL PENDING/);
     assert.match(recipe, /keep checkin repair-card-1 --step 4 --status done --commit <sha> --next "nothing"/);
-    // The restart, and the exact two commands it is allowed once the land is done.
+    // A normal land deploys itself; the exact two commands are recovery only when
+    // wt land reports a skip or failure.
     assert.match(recipe, /git -C ~\/keep-tool pull --ff-only/);
     assert.match(recipe, /keep restart-daemon/);
+    assert.match(recipe, /`wt land` normally fast-forwards a ready live checkout/);
+    assert.match(recipe, /If it reports a skipped or failed deployment, recover it yourself/);
+    assert.match(recipe, /eligibility is not proof recovery\s+is needed/);
+    assert.doesNotMatch(recipe, /Restart the daemon into your fix\. Once `keep land` has pushed/);
     assert.match(recipe, /keep wait --no-hold ~\/keep-tool --for 2h/);
-    assert.match(recipe, /the guard stops refusing/);
+    assert.match(recipe, /allows exactly two recovery commands once the fix is landed/);
     assert.match(recipe, /Aim to finish within 60 minutes/);
     assert.equal(/VERDICT/.test(recipe), false, 'nothing parses a verdict line out of a session');
     assert.equal(/killed/.test(recipe), false, 'and nothing kills it on a clock');
