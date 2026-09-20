@@ -255,10 +255,19 @@ function buildRecord(input, deps, options = {}) {
     if (failure) fail(`a clean review record cannot stand on this: ${failure}`);
   }
   const commits = resolveCommits(input.commits, deps);
+  // Why this reviewer, when it was not the usual one. A fallback review is a review;
+  // what a later reader needs is to be able to tell that it was one without
+  // reconstructing the day's usage limits. Empty for every ordinary review.
+  let route = '';
+  try {
+    route = options.route !== undefined ? String(options.route || '')
+      : require('./review-routing.js').provenance(by, { root: options.root });
+  } catch { route = ''; }
   return {
     id: recordId(now),
     at: new Date(now).toISOString(),
     by,
+    ...(route ? { route: route.slice(0, 200) } : {}),
     job,
     // Which account's jobs directory answered, and when that job's result was
     // last written. Both are the audit trail a later reader needs to go look.
@@ -287,6 +296,7 @@ function logLine(record) {
   const lines = [
     `${record.verdict} — ${record.commits.length} commit(s) reviewed by ${record.by}: ${shas.join(', ')}`,
   ];
+  if (record.route) lines.push(`reviewer: ${record.route}`);
   if (record.job) lines.push(`job: ${record.job}${record.jobAccountId ? ` (${record.jobAccountId}, result ${record.jobAt})` : ''}`);
   if (record.evidence) lines.push(`evidence: ${record.evidence}`);
   if (record.message) lines.push(record.message);

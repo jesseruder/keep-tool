@@ -22,6 +22,15 @@ changes, or difficult findings the routine review could not resolve, use
 `--model gpt-6-astra --effort high` and request an adversarial review. Choose one
 initially, not both. Astra xhigh requires Owner's explicit request.
 
+0. Run `keep review-route`. It names the Codex account to use, or says every one of
+   them is at its usage limit. In that case use the fallback it names — and only that
+   one — and record the review with `--by "opus …"` and 80+ characters of
+   `--evidence`; Keep stamps the record as a fallback. If it says no fallback is
+   configured, say so on the card and stop rather than improvising a reviewer. When a
+   Codex launch fails on a usage limit, record it with
+   `keep review-route --exhausted <account> --until <reset> -m "..."` so the next
+   session does not rediscover it. Do not queue a second Codex review for after the
+   reset: a fallback review is a review.
 1. Check `keep codex --account <id> task-resume-candidate --json`. Default to a
    fresh task: a thread that wrote the code must never review it. Use `--resume-last`
    only when the candidate is a previous review thread rechecking its own findings.

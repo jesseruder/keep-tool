@@ -1556,6 +1556,35 @@ commands.reviewed = (argv) => {
   if (record.verdict === 'clean') console.log(`  keep allow ${id} land now answers 0 while these are exactly what would land`);
 };
 
+// `keep review-route` — which reviewer this card's independent review should go to.
+// Advice, not enforcement: it launches nothing and never queues a second review.
+commands['review-route'] = (argv) => {
+  const o = parseArgs(argv, { exhausted: 'str', until: 'str', clear: 'str', json: 'bool' });
+  const usage = 'usage: keep review-route [--json]\n'
+    + '       keep review-route --exhausted <codex-account-id> --until <when> [-m "..."]\n'
+    + '       keep review-route --clear <codex-account-id>';
+  if (o._.length) die(usage);
+  const routing = require('./review-routing.js');
+  if (o.clear) {
+    if (o.exhausted || o.until) die(usage);
+    const had = routing.clearExhausted(o.clear);
+    console.log(had ? `${o.clear}: no longer recorded as exhausted` : `${o.clear}: was not recorded as exhausted`);
+    return;
+  }
+  if (o.exhausted || o.until) {
+    if (!o.exhausted || !o.until) die(usage);
+    const known = routing.codexAccounts().includes(o.exhausted);
+    if (!known) die(`${o.exhausted} is not a registered Codex account this install routes reviews to — keep accounts`);
+    const entry = routing.markExhausted(o.exhausted, parseWhen(o.until), { note: o.m, session: commandSession() });
+    console.log(`${o.exhausted}: exhausted until ${entry.until}`);
+    console.log(routing.describe(routing.route()));
+    return;
+  }
+  const decision = routing.route();
+  if (o.json) return console.log(JSON.stringify(decision, null, 2));
+  console.log(routing.describe(decision));
+};
+
 // `keep reviewing` — the other half of `keep reviewed`: a review that has been launched
 // and has not answered yet. The daemon settles it from the job's own state, and until it
 // does, the implicit land grant refuses the commits it covers.
@@ -1633,7 +1662,7 @@ commands.reviews = (argv) => {
   for (const record of pending) console.log(`pending: ${obligations.summaryLine(record)}`);
   if (!records.length) return console.log(`${id}: no review records — keep reviewed ${id} --commit <sha> --verdict clean`);
   for (const record of records) {
-    console.log(`${record.at}  ${record.verdict.padEnd(8)} ${record.id}  by ${record.by}${record.job ? ` job ${record.job}` : ''}`);
+    console.log(`${record.at}  ${record.verdict.padEnd(8)} ${record.id}  by ${record.by}${record.route ? ` [${record.route}]` : ''}${record.job ? ` job ${record.job}` : ''}`);
     for (const commit of record.commits) console.log(`    ${commit.sha.slice(0, 12)}  ${commit.subject}`);
     if (record.evidence) console.log(`    evidence: ${record.evidence}`);
     if (record.message) console.log(`    ${record.message}`);
@@ -3250,6 +3279,9 @@ function helpText() {
   keep reviewing <card> --drop <obligation-id> -m "why"   # stop waiting for a review that is not coming
   keep reviewing <card> [--json]               # what this card is still waiting for
   keep reviews <card> [--json]                 # the review records on this card
+  keep review-route [--json]                   # which reviewer an independent review should go to now
+  keep review-route --exhausted <codex-id> --until <when> [-m "..."]   # record an account's usage limit
+  keep review-route --clear <codex-id>
   keep land <card> [--dry-run] [--json]        # keep allow <card> land, then wt land, then cite the sha
                        # exit 3 when the reviewed patches are not exactly what would land
                        # for keep-tool, wt land fast-forwards a ready live checkout, restarts the daemon,

@@ -1064,6 +1064,47 @@ it launched is still in flight. An explicit `land` grant from Owner still wins.
 `keep reviewing --drop` is the deliberate way to stop waiting, and it requires a reason.
 `keep reviews <card>` lists the pending ones above the records.
 
+## Which reviewer a review goes to
+
+When every Codex account is at its usage limit, sessions improvise: one hand-runs an
+Opus subagent review, another writes "both Codex accounts at usage limit until 02:00"
+into a check-in, a third hand-schedules a Codex second look. Three cards did all three
+independently on 2026-09-18, and none left anything a later reader could use to tell a
+fallback review from an ordinary one.
+
+```sh
+keep review-route [--json]                                   # who should review, and why
+keep review-route --exhausted <codex-id> --until +4h -m "weekly limit"
+keep review-route --clear <codex-id>
+```
+
+This is advice, not enforcement: it launches nothing, adds no provider, and never queues
+a second review — a fallback review is a review, not half of one. It answers from two
+files. `watch/review-routing.json` is the policy Owner writes:
+
+```json
+{ "codex": ["codex-main", "codex-secondary"], "fallback": "opus" }
+```
+
+Both keys are optional. With no `codex` list, every registered Codex account counts; a
+configured id that is not registered is dropped as a typo rather than offered as a
+reviewer. `fallback` must be `opus` or `claude` — `codex` is what the fallback replaces,
+and `human` is Owner, who is not something a config file routes work to. **With no
+`fallback` there is none**: routing to another model is Owner's decision in this file,
+not one a session makes for itself at 2am, and the answer then is the sentence the
+session needs ("every Codex account is exhausted until 02:00, and no fallback reviewer is
+configured") rather than a silent improvisation.
+
+`.keep/review-routing.json` is the observed-exhaustion ledger `keep review-route
+--exhausted` writes. Entries expire at their own reset time, so an account nobody
+remembered to clear does not stay exhausted for a week.
+
+When a review is recorded by the configured fallback *while* every Codex account is
+exhausted, `keep reviewed` stamps the record `route: fallback (codex exhausted until
+<reset>)` and the card's `code-review` entry carries a `reviewer:` line. A fallback
+record still has to clear the same attestation bar as any other: an `opus`/`claude`
+clean record needs a verified `--job` or 80+ characters of `--evidence`.
+
 Writing grants is Owner's: `keep allow <card> --grant`/`--until` and `keep add
 --allow`/`--until` are refused inside an agent session (`CLAUDE_CODE_SESSION_ID` or a
 Codex session marker) unless `--as-owner` is passed with `KEEP_OWNER=1` in the
