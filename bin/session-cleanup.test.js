@@ -58,6 +58,10 @@ test('real cleanup path closes an idle watched reviewer for restart and preserve
   const pane = { id: 'p', alive: true, attached: 1, visibleAttached: 1,
     meta: { sessionId: 'rev', agent: 'claude', reviewer: true } };
   try {
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'session-restarts.json'), JSON.stringify([{
+      sessionId: 'rev', status: 'restarting', mode: 'now',
+    }]));
     const run = async (patch = {}, draft = '') => {
       const session = { ...base, ...patch };
       let box = draft;
@@ -504,8 +508,8 @@ test('automatic retirement admits only audited runtime helpers and still refuses
     ]) {
       const { child } = scenario;
       let typed = '';
-      let builds = 0;
       pane.inputCount = 0;
+      require('./session-retirement').setKeepRunning(root, 's', false);
       const rows = [parent, child];
       const card = { id: 'card', fm: { status: 'active', updated: new Date(session.mtime).toISOString(),
         needs: ['owner'], sessions: [{ id: 's' }] } };
@@ -514,9 +518,12 @@ test('automatic retirement admits only audited runtime helpers and still refuses
           expectedReason: scenario.durableNeeds ? 'settled-attention' : 'settled-unattended',
           attentionIdleMs: 0, unattendedIdleMs: 0 },
         withInjectionLock: (fn) => fn(),
-        buildState: () => ({ sessions: [{ ...session, ...(scenario.durableNeeds ? { taskId: 'card' } : {}),
-          ...(scenario.latePin && builds++ > 0 ? { keepRunning: true } : {}),
-        }], tasks: scenario.durableNeeds ? [card] : [] }),
+        buildState: () => ({ sessions: [{ ...session, ...(scenario.durableNeeds ? { taskId: 'card' } : {}) }],
+          tasks: scenario.durableNeeds ? [card] : [] }),
+        discoverCodexJobs: async () => ({ jobs: [] }),
+        beforeClose: async () => {
+          if (scenario.latePin) require('./session-retirement').setKeepRunning(root, 's', true);
+        },
         loadAll: () => scenario.durableNeeds ? [card] : [],
         codexSessionFor: () => ({ ...session }), codexRolloutFile: () => rollout,
         agentProcessRows: async () => rows, lsof: async () => '', sleep: async () => {},

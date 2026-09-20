@@ -64,6 +64,10 @@ test('a project .mcp.json server is admitted with the whole subtree its launcher
     const check = (rows, over = {}) => inspect({ root, agent: 'claude', sessionId: 'session-1', parent, rows, cwd, ...over });
     const helpers = check([parent, child, grandchild]);
     assert.deepEqual(helpers.map((h) => h.pid), [2, 3], 'the launcher and the server it spawned are one helper unit');
+    assert.throws(() => check([parent, child, grandchild], { strictLeaves: true }), /background/,
+      'retirement never admits a configured server subtree with unaudited work below it');
+    assert.throws(() => check([parent, child], { strictLeaves: true }), /background/,
+      'a configured command is not an audited retirement helper merely because it is a leaf');
     assert.ok(helpers.every((h) => h.pidStart));
     // PATH resolved the bare command, and env resolved the node its shebang asks for.
     const resolved = { ...child, args: `${npm} exec @playwright/mcp@latest --headless` };

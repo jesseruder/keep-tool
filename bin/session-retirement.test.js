@@ -43,11 +43,30 @@ test('automatic retirement restores unread completion only while exited, acknowl
   assert.equal(acknowledged.notify, undefined, 'acknowledgement survives rebuild and restart reads');
 
   const resumed = { ...acknowledged, exited: false, alive: true, runtime: { state: 'live' }, retirement: undefined };
-  retirement.apply([resumed], { root, panes: [{ alive: true, meta: { sessionId: 'session-one' } }] });
+  retirement.apply([resumed], { root, panes: [{ alive: true, agentAlive: true, meta: { sessionId: 'session-one' } }] });
   assert.equal(resumed.retirement, undefined);
   assert.ok(retirement.lookup(root, 'session-one'), 'read-only state projection does not race a close transaction');
   retirement.clear(root, 'session-one');
   assert.equal(retirement.lookup(root, 'session-one'), null, 'successful resume deactivates old retirement metadata');
+}));
+
+test('a parent shell is exited for retirement state and a verified new process or user turn clears stale metadata', () => fixture((root) => {
+  retirement.begin(root, { sessionId: 'resumed', pane: 'old-pane', reason: 'settled-unattended',
+    idleMinutes: 60, activityAt: 100, processIdentity: { pane: 'old-pane', panePid: 10, agentPid: 11 } });
+  retirement.finish(root, 'resumed', 200);
+  const shell = { id: 'resumed', exited: true, runtime: { state: 'exited' }, mtime: 100 };
+  retirement.apply([shell], { root, panes: [{ id: 'old-pane', alive: true, agentAlive: false,
+    meta: { sessionId: 'resumed' } }] });
+  assert.equal(shell.retirement.automatic, true, 'a live shell is not a live agent process');
+
+  assert.deepEqual(retirement.reconcile(root, [{ id: 'resumed', lastUserAt: 100 }], [{
+    id: 'new-pane', alive: true, agentAlive: true, agentPid: 22, meta: { sessionId: 'resumed' },
+  }]).cleared, ['resumed']);
+  assert.equal(retirement.lookup(root, 'resumed'), null);
+
+  retirement.begin(root, { sessionId: 'resumed', pane: 'new-pane', reason: 'settled-unattended',
+    idleMinutes: 60, activityAt: 300, processIdentity: { pane: 'new-pane', panePid: 20, agentPid: 22 } });
+  assert.deepEqual(retirement.reconcile(root, [{ id: 'resumed', lastUserAt: 301 }], []).cleared, ['resumed']);
 }));
 
 test('a dashboard poll cannot erase a closing retirement snapshot', () => fixture((root) => {
@@ -182,6 +201,38 @@ test('/api/send resumes one automatically retired thread and returns ordinary de
     ['send', { pane: 'new-pane' }, 'continue'],
   ]);
   assert.equal(retirement.lookup(root, 'send-session'), null);
+}));
+
+test('/api/send resumes through a live parent shell and fails closed on unknown agent liveness', async () => fixture(async (root) => {
+  const { sendToSessionLocked, InjectionError } = require('./serve');
+  const prepare = () => {
+    retirement.begin(root, { sessionId: 'shell-session', pane: 'old-pane', reason: 'settled-unattended',
+      idleMinutes: 60, activityAt: 1 });
+    retirement.finish(root, 'shell-session');
+  };
+  const base = {
+    root,
+    loadCurrentSession: () => ({ id: 'shell-session', kind: 'claude', endedTurn: true }),
+    resolveSessionTarget: async () => ({ pane: 'new-pane' }),
+    sendToResolvedTarget: async () => ({ ok: true }),
+  };
+  prepare();
+  let opens = 0;
+  await sendToSessionLocked({ sessionId: 'shell-session', text: 'resume' }, {
+    ...base,
+    listHostPanes: async () => [{ id: 'old-pane', alive: true, agentAlive: false,
+      meta: { sessionId: 'shell-session', agent: 'claude' } }],
+    openSession: async () => { opens++; return { ok: true, pane: 'new-pane' }; },
+  });
+  assert.equal(opens, 1);
+
+  prepare();
+  await assert.rejects(sendToSessionLocked({ sessionId: 'shell-session', text: 'resume' }, {
+    ...base,
+    listHostPanes: async () => [{ id: 'old-pane', alive: true,
+      meta: { sessionId: 'shell-session', agent: 'claude' } }],
+    openSession: async () => assert.fail('unknown liveness must not launch a duplicate'),
+  }), (error) => error instanceof InjectionError && /liveness is unknown/.test(error.message));
 }));
 
 test('keep-running and acknowledgement routes persist the process preference and retire unread overlay', async () => fixture(async (root) => {

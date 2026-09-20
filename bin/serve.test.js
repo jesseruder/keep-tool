@@ -7193,6 +7193,22 @@ test('the check sweep close composition refuses rather than kills, and guards it
   assert.equal(require('./session-retirement').lookup(root, 'check-sid').status, 'retired');
   assert.equal(require('./session-retirement').lookup(root, 'check-sid').notify.message, 'result survived');
 
+  // Once exit input started, a still-live process may simply be shutting down
+  // slowly. Keep the closing record so a later SessionEnd cannot erase the unread
+  // result; the daemon sweep reconciles a positively different resumed process.
+  const slowShutdown = fakeHost();
+  await assert.rejects(closeEphemeralPane(pane, 'check-sid', {
+    root,
+    hostRequest: slowShutdown.request,
+    withInjectionLock: (fn) => fn(),
+    closeIdleSession: async (_request, options) => {
+      options.beforeExitInput();
+      throw new Error('slow shutdown');
+    },
+    listHostPanes: async () => [livePane({ agentAlive: true, agentPid: 500 })],
+  }), /slow shutdown/);
+  assert.equal(require('./session-retirement').lookup(root, 'check-sid').status, 'closing');
+
   // A graceful close that works needs no signal at all.
   const graceful = fakeHost();
   const quiet = await closeEphemeralPane(pane, 'check-sid', {
