@@ -210,6 +210,9 @@ keep allow <id> [<action> [--amount n]] [--quiet] [--json]
 keep allow <id> --grant a,b [--until when] | --revoke a,b | --clear [--as-owner]
 keep reviewed <card> --commit <sha|range>... --verdict clean|findings [--by who] [--job id] [--evidence "..."] [-m "..."]
 keep reviews <card> [--json]
+keep reviewing <card> --job <id> --commit <sha|range>... [--account <codex-id>] [--by who] [-m "..."]
+keep reviewing <card> [--drop <obligation-id> -m "why"] [--json]
+keep review-route [--json] | --exhausted <codex-id> --until <when> [-m "..."] | --clear <codex-id>
 keep land <card> [--dry-run] [--json]
 keep tag <id> +a -b
 keep tags

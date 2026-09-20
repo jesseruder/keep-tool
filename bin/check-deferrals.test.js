@@ -35,7 +35,7 @@ test('rescheduling the card starts a new streak', () => {
   deferrals.note(map, 'a-card', { checkAfter: '2026-09-16T09:00', stamp: stampAt(base), today: '2026-09-16' });
   deferrals.note(map, 'a-card', { checkAfter: '2026-09-16T09:00', stamp: stampAt(base), today: '2026-09-17' });
   assert.equal(deferrals.escalationDue(map.get('a-card'), base + DAY), true);
-  const moved = deferrals.note(map, 'a-card', { checkAfter: '2026-09-20T09:00', stamp: stampAt(base + 2 * DAY), today: '2026-09-18' });
+  const { entry: moved } = deferrals.note(map, 'a-card', { checkAfter: '2026-09-20T09:00', stamp: stampAt(base + 2 * DAY), today: '2026-09-18' });
   assert.equal(moved.notices, 1);
   assert.equal(deferrals.escalationDue(moved, base + 2 * DAY), false, 'a fresh schedule is not already stalled');
 });
@@ -43,13 +43,16 @@ test('rescheduling the card starts a new streak', () => {
 test('escalation is due on the second day or after a full day, and only once', () => {
   const base = Date.parse('2026-09-16T18:17:00Z');
   const map = new Map();
-  const first = deferrals.note(map, 'a-card', { checkAfter: 'x', stamp: stampAt(base), today: '2026-09-16' });
+  const { entry: first, changed } = deferrals.note(map, 'a-card', { checkAfter: 'x', stamp: stampAt(base), today: '2026-09-16' });
+  assert.equal(changed, true, 'a new streak is worth persisting');
+  assert.equal(deferrals.note(map, 'a-card', { checkAfter: 'x', stamp: stampAt(base), today: '2026-09-16' }).changed, false,
+    'the same day again is not: a tick a minute must not be a disk write a minute');
   assert.equal(deferrals.escalationDue(first, base + 3600e3), false, 'one evening of deferral is just a deferral');
   assert.equal(deferrals.escalationDue(first, base + DAY), true, 'a full day of deferral is not');
 
   const second = new Map();
   deferrals.note(second, 'b-card', { checkAfter: 'x', stamp: stampAt(base), today: '2026-09-16' });
-  const twice = deferrals.note(second, 'b-card', { checkAfter: 'x', stamp: stampAt(base), today: '2026-09-17' });
+  const { entry: twice } = deferrals.note(second, 'b-card', { checkAfter: 'x', stamp: stampAt(base), today: '2026-09-17' });
   assert.equal(deferrals.escalationDue(twice, base + 6 * 3600e3), true, 'a second deferred day counts on its own');
 
   deferrals.markEscalated(second, 'b-card');

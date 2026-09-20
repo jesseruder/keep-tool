@@ -37,6 +37,12 @@ Run the review before the push, not after: commit locally, review that commit, w
 for the result, fix what is real, rerun the tests, and only then push. Relay the
 findings, and say what you left alone and why.
 
+Record the review you launched with `keep reviewing <card> --job <id> --commit
+<range>` as soon as it has a job id. If your turn ends before the verdict does, the
+daemon settles it and the card says whether the review came back or died — a run
+that ends without a verdict is not a clean review. `keep review-route` says which
+reviewer to use when an account is at its usage limit.
+
 # Git
 
 Local commits are always fine — commit without asking. Commit on the branch that is

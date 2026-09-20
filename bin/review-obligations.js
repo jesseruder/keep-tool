@@ -237,28 +237,31 @@ function settle(deps = {}) {
     const records = readRecords(id, root);
     if (!records.some(isOpen)) continue;
     const reviewRecords = readReviews(id);
-    let changed = false;
-    const next = records.map((record) => {
-      if (!isOpen(record)) return record;
+    const settled = new Map();
+    for (const record of records) {
+      if (!isOpen(record)) continue;
       result.considered += 1;
       let job = null;
       try { job = resolveJob(record.job); }
-      catch (error) { result.errors.push(`${id}: ${error.message || error}`); return record; }
+      catch (error) { result.errors.push(`${id}: ${error.message || error}`); continue; }
       const decision = decide(record, { job, live: liveJobs.get(record.job) || null, reviewRecords, now });
-      if (!decision) return record;
-      changed = true;
+      if (!decision) continue;
       const landed = applied(record, decision, now);
+      settled.set(record.id, landed);
       result.settled.push({ card: id, id: record.id, job: record.job, state: decision.state, note: decision.note });
       const entry = checkin(landed, decision);
       if (entry) {
         try { checkinTask(id, entry); }
         catch (error) { result.errors.push(`${id}: could not record the ${decision.state} review: ${error.message || error}`); }
       }
-      return landed;
-    });
-    if (!changed) continue;
-    try { writeRecords(id, next, root); }
-    catch (error) { result.errors.push(`${id}: could not write obligations: ${error.message || error}`); }
+    }
+    if (!settled.size) continue;
+    // Re-read before writing and apply only the records this pass actually settled.
+    // Resolving a job is file I/O, and a `keep reviewing` run in that window would
+    // otherwise be overwritten by the copy this sweep started from.
+    try {
+      writeRecords(id, readRecords(id, root).map((record) => settled.get(record.id) || record), root);
+    } catch (error) { result.errors.push(`${id}: could not write obligations: ${error.message || error}`); }
   }
   return result;
 }
@@ -295,7 +298,8 @@ function liveJobMap(report) {
 }
 
 function startScheduler({ onChange = () => {}, companionSnapshot, health = require('./health.js'),
-  settle: run = settle, setInterval: si = setInterval, write = (line) => process.stderr.write(line) } = {}) {
+  settle: run = settle, setInterval: si = setInterval, setTimeout: st = setTimeout,
+  write = (line) => process.stderr.write(line) } = {}) {
   let running = false;
   const tick = async () => {
     if (running) return;
@@ -326,6 +330,9 @@ function startScheduler({ onChange = () => {}, companionSnapshot, health = requi
   };
   const timer = si(() => { void tick(); }, TICK_MS);
   timer?.unref?.();
+  // A daemon that was down while a review finished should not wait out a full cadence
+  // before the card learns about it.
+  st(() => { void tick(); }, 45e3)?.unref?.();
   return { tick, timer };
 }
 

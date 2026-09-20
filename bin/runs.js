@@ -461,10 +461,11 @@ function checksFallbackAccountId(env = process.env, deps = {}) {
 // deferral is the one that has to stop being silent.
 function recordBudgetDeferral(task, reason, today, now = Date.now()) {
   const state = loadSchedulerState();
-  const entry = checkDeferrals.note(state.deferred, task.id, {
+  const { entry, changed } = checkDeferrals.note(state.deferred, task.id, {
     checkAfter: task.fm.check_after || '', reason, stamp: keep.nowStamp(), today,
   });
-  saveSchedulerState(today);
+  // A tick a minute against an exhausted account must not be a disk write a minute.
+  if (changed) saveSchedulerState(today);
   return { entry, escalate: checkDeferrals.escalationDue(entry, now) };
 }
 

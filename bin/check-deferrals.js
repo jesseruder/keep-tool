@@ -62,19 +62,24 @@ function serialize(map, now = Date.now()) {
 
 // One notice per card per local day, matching what the scheduler writes to the card:
 // the count is "days this check has been deferred", not "ticks".
+// Returns `{ entry, changed }`. The scheduler calls this once a minute for every
+// deferred card, so `changed` is what keeps that from being a disk write a minute: the
+// reason is recorded when the streak starts or rolls over a day and not re-read from a
+// usage percentage that drifts on every tick.
 function note(map, taskId, { checkAfter = '', reason = '', stamp, today } = {}) {
   const existing = map.get(taskId);
   const fresh = !existing || existing.checkAfter !== String(checkAfter || '');
   const entry = fresh
     ? { checkAfter: String(checkAfter || ''), since: stamp, lastDay: '', notices: 0, escalated: false, reason: '' }
     : existing;
-  if (entry.lastDay !== today) {
+  const rolled = entry.lastDay !== today;
+  if (rolled) {
     entry.notices += 1;
     entry.lastDay = today;
   }
-  if (reason) entry.reason = String(reason).slice(0, 400);
+  if ((fresh || rolled) && reason) entry.reason = String(reason).slice(0, 400);
   map.set(taskId, entry);
-  return entry;
+  return { entry, changed: fresh || rolled };
 }
 
 // True once, for the deferral streak that earned it: `escalated` is the latch, so a
