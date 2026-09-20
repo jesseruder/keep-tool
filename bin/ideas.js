@@ -27,7 +27,12 @@ const RETRY_MS = 30 * 60e3;
 const MODEL_TIMEOUT_MS = 600 * 1000;
 const WATCH_TICK_MS = 10 * 1000;
 const WATCH_GAP_MS = 4 * WATCH_TICK_MS;
-const CLAIM_MAX_AGE_MS = MODEL_TIMEOUT_MS + 4 * 60e3;
+// Skipped gaps must not add up to a run nobody ever ends: a hung generator on a host
+// that sleeps all day would charge almost nothing. Past this much wall clock the run
+// dies whatever the watched total says, and the claim outlives it by the same margin
+// as before, so a restarted daemon still cannot start a second sweep over a live one.
+const WATCH_CEILING_FACTOR = 4;
+const CLAIM_MAX_AGE_MS = MODEL_TIMEOUT_MS * WATCH_CEILING_FACTOR + 4 * 60e3;
 const MODEL_OUTPUT_MAX = 1024 * 1024;
 const RAW_OUTPUT_MAX = 200000;
 const REVIEW_TAIL_MAX = 200000;
@@ -492,12 +497,18 @@ function captureModelOutput(child, timeoutMs = MODEL_TIMEOUT_MS, deps = {}) {
     let killTimer;
     let terminationError;
     let remaining = timeoutMs;
-    let watchedAt = now();
+    const startedAt = now();
+    let watchedAt = startedAt;
+    const ceilingMs = timeoutMs * WATCH_CEILING_FACTOR;
     const timer = every(() => {
       const at = now();
       const delta = at - watchedAt;
       watchedAt = at;
-      if (delta < 0 || delta > WATCH_GAP_MS) return;
+      if (at - startedAt >= ceilingMs) {
+        terminate(new Error(`ideas generation ran ${Math.round((at - startedAt) / 60e3)} min without finishing`));
+        return;
+      }
+      if (!(delta > 0) || delta > WATCH_GAP_MS) return;
       remaining -= delta;
       if (remaining <= 0) terminate(new Error(`ideas generation timed out after ${timeoutMs / 1000}s`));
     }, WATCH_TICK_MS);
@@ -714,6 +725,6 @@ function startScheduler({ onChange } = {}) {
 }
 
 module.exports = {
-  EVIDENCE_MAX, MODEL_TIMEOUT_MS, WATCH_TICK_MS, WATCH_GAP_MS, CLAIM_MAX_AGE_MS, collectReviews, buildEvidence, renderEvidence, fitEvidence, buildPrompt, parseIdeas,
+  EVIDENCE_MAX, MODEL_TIMEOUT_MS, WATCH_TICK_MS, WATCH_GAP_MS, WATCH_CEILING_FACTOR, CLAIM_MAX_AGE_MS, collectReviews, buildEvidence, renderEvidence, fitEvidence, buildPrompt, parseIdeas,
   normalizeSweepTitle, captureModelOutput, runModel, landProposals, run, ideasAccountId, healthForResult, ideasClock, sweepDue, startScheduler, loadMeta,
 };

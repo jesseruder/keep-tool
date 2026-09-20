@@ -65,9 +65,9 @@ test('parseIdeas bounds malformed JSON extraction to 200k characters', () => {
   assert.ok(Date.now() - started < 1000);
 });
 
-test('claim TTL is derived from the model timeout', () => {
-  assert.equal(ideas.CLAIM_MAX_AGE_MS, ideas.MODEL_TIMEOUT_MS + 4 * 60e3);
-  assert.equal(ideas.CLAIM_MAX_AGE_MS, 14 * 60e3);
+test('claim TTL outlives the longest run the watchdog allows', () => {
+  assert.equal(ideas.CLAIM_MAX_AGE_MS, ideas.MODEL_TIMEOUT_MS * ideas.WATCH_CEILING_FACTOR + 4 * 60e3);
+  assert.equal(ideas.CLAIM_MAX_AGE_MS, 44 * 60e3);
 });
 
 test('landProposals records arbitrary landing errors and continues', () => {
@@ -164,6 +164,35 @@ test('captureModelOutput charges the deadline only for time it watched', async (
   assert.equal(stopped, 1, 'the watchdog stops once it has fired');
 
   const rejection = assert.rejects(result, /timed out after 600s/);
+  child.emit('close', 0);
+  await rejection;
+});
+
+test('captureModelOutput still ends a run that outlives its wall-clock ceiling', async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.signals = [];
+  child.kill = (signal) => { child.signals.push(signal); };
+  let clock = 0;
+  let tick = null;
+  const result = ideas.captureModelOutput(child, 600e3, {
+    now: () => clock,
+    setInterval: (fn) => { tick = fn; return 'watchdog'; },
+    clearInterval: () => {},
+  });
+
+  // Nothing but sleep: every gap is skipped, so the watched total never moves.
+  for (let index = 0; index < 3; index += 1) {
+    clock += 700e3;
+    tick();
+  }
+  assert.deepEqual(child.signals, [], 'skipped gaps alone do not end the run');
+  clock += 700e3;
+  tick();
+  assert.deepEqual(child.signals, ['SIGTERM'], 'past the ceiling a hung generator dies anyway');
+
+  const rejection = assert.rejects(result, /ran \d+ min without finishing/);
   child.emit('close', 0);
   await rejection;
 });
