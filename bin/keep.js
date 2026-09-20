@@ -2764,7 +2764,7 @@ commands.open = async (argv, deps = {}) => {
   if (o.agent && !['claude', 'codex', 'pi'].includes(o.agent)) die('agent must be claude, codex, or pi');
   // --model goes on the launched command line only (claude --model / codex -m), so it
   // applies to that process and never touches ~/.claude/settings.json.
-  if (o.model != null && !PI_MODEL_RE.test(o.model) && !LAUNCH_MODEL_RE.test(o.model)) die('--model must be a valid model id');
+  if (o.model != null && !PI_MODEL_RE.test(o.model) && !LAUNCH_MODEL_RE.test(o.model)) die('--model must be a model id');
   if (o.m != null && o['message-file'] != null) die('use either -m or --message-file, not both');
   let message = o.m;
   if (o['message-file'] != null) {
