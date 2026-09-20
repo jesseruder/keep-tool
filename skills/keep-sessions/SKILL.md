@@ -6,13 +6,13 @@ description: Start, hand off to, message, inspect, delegate to, or move other ag
 # Keep — other sessions
 
 Every interactive session runs in a terminal-host pane that the Keep console shows. Start
-them, talk to them and move them through `keep`, never by running `claude` or `codex` in a
+them, talk to them and move them through `keep`, never by running `claude`, `codex`, or `pi` in a
 shell of your own: a session Keep did not launch has no pane, no account record and no
 card link. All of this needs `keep serve` running.
 
 ## Starting a session
 
-`keep open <card|session-id|#n> [--fresh] [--agent claude|codex] [--account <id>]
+`keep open <card|session-id|#n> [--fresh] [--agent claude|codex|pi] [--account <id>]
 [--model <id>] [-m "opening message" | --message-file <path>]`
 
 - `#n` is the console's session number (`12`, `#12` and `s12` all work). Without `--fresh`,
@@ -24,7 +24,8 @@ card link. All of this needs `keep serve` running.
   worrying about owning it afterwards.
 - **Write the opening message like a check recipe**: name the card, the goal, what is
   already known, what to verify, and what to check in. The new session has none of your
-  context — only the card, the project's cards from its session-start hook, and this
+  context — only the card, the project's cards where the provider supports that
+  context, and this
   message. `-m` waits for the agent's empty prompt, types the message, and prints the new
   session id. Long or multiline messages, and `--message-file` even for short text, are
   saved verbatim in committed `.keep/handoffs/` files; the session gets a one-line pointer.
@@ -33,8 +34,10 @@ card link. All of this needs `keep serve` running.
 
 ### Which account it runs on
 
-`keep accounts list` shows the registered Claude and Codex accounts. An account that is
-out of usage produces a session that cannot take a single turn, so look before you launch:
+`keep accounts list` shows the registered Claude and Codex accounts plus Keep's built-in
+`pi/default` profile. Pi uses its own local provider configuration; Keep does not support
+additional Pi account profiles. An account that is out of usage produces a session that
+cannot take a single turn, so look before you launch:
 
 - If Owner named an account, pass exactly that `--account <id>`. Never substitute another
   one silently; if it is out of usage, say so and ask.
@@ -49,20 +52,25 @@ out of usage produces a session that cannot take a single turn, so look before y
 
 ### Which model
 
-`--model <id>` launches that one process on a model (`claude --model` / `codex -m`) and
+`--model <id>` launches that one process on a model (`claude --model`, `codex -m`, or
+`pi --model`) and
 records it in the pane meta; it never changes `~/.claude/settings.json`, unlike typing
 `/model` as the first message. Omit it for the agent's default. Match the model to the
 work: routine implementation does not need the scarcest model.
 
-Keep launches the `claude` and `codex` executables from PATH; shell aliases are not
-required. `KEEP_OPEN_CLAUDE_FLAGS` and `KEEP_OPEN_CODEX_FLAGS` configure launch
-permissions. `keep init` sets both to empty strings, retaining the agent's normal approval
-behavior. Older configurations that omit these variables retain the legacy
-permission-bypass defaults; set them explicitly for your intended policy.
+Keep launches the `claude`, `codex`, and `pi` executables from PATH; shell aliases are
+not required. `KEEP_OPEN_CLAUDE_FLAGS` and `KEEP_OPEN_CODEX_FLAGS` configure the two
+providers' launch permissions. Pi has no corresponding Keep launch flag setting and
+keeps its normal Pi configuration. `keep init` sets the two variables to empty strings,
+retaining the agent's normal approval behavior. Older configurations that omit them retain
+the legacy permission-bypass defaults; set them explicitly for your intended policy.
 
 ## Messaging a live session
 
 `keep tell <card|session-id|#n> -m "message" [--message-file <path>] [--wait <duration>] [--dry]`
+
+Pi cannot currently receive a Keep relay message. `keep tell` to a Pi session is
+unavailable; use the Pi pane directly when the user has authorized a message.
 
 - A card target means the live session linked to that card. The message arrives framed as
   coming from your session and card, marked as another agent rather than Owner, with the
@@ -101,7 +109,7 @@ The parent session owns the Keep check-in for work delegated to another agent. R
 exact assignment with `keep delegate <card> --step <n> -- <command...>`. If the launcher
 cannot carry environment variables, run `--prepare` and give the printed
 `keep delegate --accept <id>` command to the worker, or register a known worker with
-`--session <id> --agent claude|codex`.
+`--session <id> --agent claude|codex|pi`.
 
 - The assignment snapshots that exact plan position and text; a changed, reordered,
   deleted, or completed step becomes stale and must be reassigned rather than silently
@@ -111,8 +119,8 @@ cannot carry environment variables, run `--prepare` and give the printed
   result and evidence to the parent.
 - `keep delegate --end` deliberately leaves the assignment; a successful explicit
   `keep claim` also leaves it. A resumed worker keeps a still-valid assignment.
-- The same rule applies without an explicit delegation: a Codex session started from a
-  Claude session that owns an open card is refused an ordinary `keep add`. It contributes
+- The same rule applies without an explicit delegation: an agent session started from a
+  session that owns an open card is refused an ordinary `keep add`. It contributes
   with `keep checkin <card> -m "..."` (no claim needed), files a follow-up with `--file`,
   or passes `--force` for deliberately independent work; a forced card records that
   decision as its created entry. `keep lint`'s `handoff-shadow` rule flags the cards that
@@ -129,9 +137,10 @@ when you keep the card and want one step done.
 ## After a restart, and long sessions
 
 - `keep resume` prints the active tasks with their `keep open` commands; `keep restore
-  [--dry]` reopens every session whose agent process is gone (after a host restart or a
-  killed pane) and leaves live ones alone.
-- `keep compact <sid>` compacts a live Claude or Codex session. Check in first: the
+  [--dry]` reopens eligible Claude and Codex sessions whose agent process is gone (after
+  a host restart or a killed pane) and leaves live ones alone. Pi restart is unavailable.
+- `keep compact <sid>` compacts a live Claude or Codex session. Pi compaction is not
+  Keep-managed. Check in first: the
   compacted session reads the card, not its old context.
 - `keep rename "title"` names the current session by hand in the console and stops its
   automatic title from changing; `keep rename <#n|session-id> "title"` names another
@@ -144,6 +153,9 @@ when you keep the card and want one step done.
   would help him pick this session out of a long list; not routinely.
 
 ## Moving a session to another account
+
+Pi sessions cannot be moved with `keep handoff` or `keep transfer`; use Pi's own
+session controls outside Keep if the user directs that work.
 
 - `keep handoff <session-id> --pane <pane-id> --account <target-id>` moves the same
   conversation between two accounts of the same provider, after verifying it is settled: no

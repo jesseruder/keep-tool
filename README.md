@@ -1,6 +1,6 @@
 # Keep
 
-Keep helps you manage work across Claude Code and Codex sessions. It combines a
+Keep helps you manage work across Claude Code, Codex, and Pi sessions. It combines a
 private task registry, a console for your agents' terminals, and a background service
 that follows up on work after you leave a conversation.
 
@@ -23,7 +23,7 @@ agent sessions your Keep tracks across your projects.
   permission requests, completed turns, and other attention items. Open the related
   terminal, answer a question, or snooze an item while working on something else.
 - **Follow several sessions at once.** Pin terminals in Watch, switch between
-  projects, and launch or resume Claude Code and Codex sessions from the console or
+  projects, and launch or resume Claude Code, Codex, and Pi sessions from the console or
   CLI. The terminal host owns the processes, so closing the console window or
   restarting the daemon leaves those sessions running.
 - **Make follow-up work executable.** Give a task a time and a check recipe, such as
