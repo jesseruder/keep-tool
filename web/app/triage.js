@@ -62,15 +62,52 @@ export function matchesTriageFilters(ctx, item) {
     && (!ctx.state.providerFilter || itemProvider(ctx, item) === ctx.state.providerFilter);
 }
 
-// Agent records name their session and pane, but do not carry a reliable client.
-// Resolve it from the same state used by ordinary rows. Unresolved agents still
-// appear under All; a selected client requires a known match.
-export function matchesAgentTriageFilters(ctx, agent) {
-  const session = (ctx.data.sessions || []).find((candidate) => candidate.id === agent.session?.id);
-  const pane = agent.session?.pane ? ctx.paneMap().get(agent.session.pane) : null;
-  const project = session?.project || pane?.meta?.project || pane?.cwd || '';
+// /api/state stamps the sessions an agent currently owns. Its record can still
+// point at an old session after a restart, so only use that pointer if there is
+// no stamped session. Match the daemon's live-first ranking when several are
+// stamped during a handoff.
+export function agentSession(ctx, agent) {
+  const sessions = ctx.data?.sessions || [];
+  const stamped = agent?.name ? sessions.filter((session) => session.agentName === agent.name && !session.reviewer) : [];
+  if (!stamped.length) return sessions.find((session) => session.id === agent?.session?.id)
+    || sessions.find((session) => session.pane && session.pane === agent?.session?.pane) || null;
+  const panes = ctx.paneMap();
+  const rank = (session) => {
+    const paneId = session.pane || session.runtime?.paneId || '';
+    const live = session.exited !== true && session.state !== 'exited' && panes.get(paneId)?.alive !== false;
+    return [Number(live), Number(Boolean(agent?.session?.pane && paneId === agent.session.pane)),
+      Number(Boolean(agent?.session?.id && session.id === agent.session.id)), Number(session.mtime) || 0];
+  };
+  return stamped.reduce((best, session) => {
+    const left = rank(session);
+    const right = rank(best);
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return left[index] > right[index] ? session : best;
+    }
+    return best;
+  });
+}
+
+export function agentPane(ctx, agent) {
+  const session = agentSession(ctx, agent);
+  const paneId = session?.pane || session?.runtime?.paneId || agent?.session?.pane || '';
+  return paneId ? ctx.paneMap().get(paneId) : null;
+}
+
+export function agentProject(ctx, agent) {
+  const session = agentSession(ctx, agent);
+  const pane = agentPane(ctx, agent);
+  return session?.project || pane?.meta?.project || pane?.cwd || agent?.project || '';
+}
+
+// Unresolved agents still appear under All; a selected client requires a
+// provider from their current session or pane.
+export function matchesAgentTriageFilters(ctx, agent, includeProject = true) {
+  const session = agentSession(ctx, agent);
+  const pane = agentPane(ctx, agent);
+  const project = session?.project || pane?.meta?.project || pane?.cwd || agent?.project || '';
   const provider = session?.kind || pane?.meta?.agent || '';
-  return (!ctx.state.filter || (Boolean(project) && ctx.projectOf(project).key === ctx.state.filter))
+  return (!includeProject || !ctx.state.filter || (Boolean(project) && ctx.projectOf(project).key === ctx.state.filter))
     && (!ctx.state.providerFilter || provider === ctx.state.providerFilter);
 }
 
@@ -111,8 +148,8 @@ export function agentRowHTML(ctx, agent) {
 // lists as alive. A dead or unlisted pane is not one a terminal can attach to, so
 // opening the row falls back to the session's own transcript on the stage.
 export function agentLivePane(ctx, agent) {
-  const pane = agent?.session?.pane || '';
-  return pane && ctx.paneMap?.().get(pane)?.alive ? pane : '';
+  const pane = agentPane(ctx, agent);
+  return pane?.alive ? pane.id : '';
 }
 
 // The agent's own log: the feed page fetched when it was opened, newest first,
@@ -134,6 +171,17 @@ export function agentForStage(ctx, item, session) {
   const agents = ctx.data?.agents || [];
   const pane = item.pane || '';
   const sessionId = item.sessionId || session?.id || '';
+  const sessions = ctx.data?.sessions || [];
+  const stamped = (pane && sessions.find((candidate) => candidate.pane === pane || candidate.runtime?.paneId === pane))
+    || (sessionId && sessions.find((candidate) => candidate.id === sessionId));
+  const stampedName = stamped?.agentName || (pane && ctx.paneMap().get(pane)?.meta?.agentName);
+  const owner = stampedName && agents.find((agent) => agent.name === stampedName);
+  if (owner) return owner;
+  const live = pane && agents.find((agent) => {
+    const candidate = agentSession(ctx, agent);
+    return candidate && (candidate.pane === pane || candidate.runtime?.paneId === pane);
+  });
+  if (live) return live;
   return (pane && agents.find((agent) => agent.session?.pane === pane))
     || (sessionId && agents.find((agent) => agent.session?.id === sessionId))
     || null;
@@ -145,9 +193,9 @@ export function agentForStage(ctx, item, session) {
 // openReviewPane left behind. An agent whose session /api/state does not carry
 // keeps that stand-in, which is all there is to show.
 export function agentStageItem(ctx, agent, current = null) {
-  const session = (ctx.data?.sessions || []).find((candidate) => candidate.id === agent?.session?.id);
+  const session = agentSession(ctx, agent);
   if (!session) return current;
-  const pane = session.pane || agent.session?.pane || current?.pane || null;
+  const pane = session.pane || session.runtime?.paneId || agent.session?.pane || current?.pane || null;
   return {
     kind: pane && ctx.paneMap?.().get(pane)?.alive ? 'running' : 'recent',
     sessionId: session.id, num: session.num, pane, project: session.project, title: session.title,
@@ -307,7 +355,8 @@ function openAgent(ctx, name) {
     if (ctx.openReviewPane(live)) ctx.state.paneTarget = null;
     return;
   }
-  if (agent.session?.id) { ctx.openReviewSession?.(agent.session.id); return; }
+  const session = agentSession(ctx, agent);
+  if (session?.id || agent.session?.id) { ctx.openReviewSession?.(session?.id || agent.session.id); return; }
   ctx.toast?.(`${name} has no session to open`);
 }
 
@@ -422,7 +471,11 @@ export function renderRail(ctx, items) {
     const key = ctx.projectOf(item.project).key;
     counts.set(key, (counts.get(key) || 0) + 1);
   }
-  const projects = ctx.knownProjects().filter((project) => counts.has(project.key) || project.key === ctx.state.filter);
+  const agentProjects = new Set((ctx.data.agents || [])
+    .filter((agent) => matchesAgentTriageFilters(ctx, agent, false))
+    .map((agent) => agentProject(ctx, agent)).filter(Boolean).map((path) => ctx.projectOf(path).key));
+  const projects = ctx.knownProjects().filter((project) => counts.has(project.key)
+    || agentProjects.has(project.key) || project.key === ctx.state.filter);
   const collapsed = ctx.state.collapsed.rail;
   const row = (project) => `<button data-project="${ctx.esc(project.key)}" class="${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}">${ctx.projectIcon(project)}<span>${ctx.esc(project.name)}</span><span class="c ${counts.get(project.key) ? 'hot' : ''}">${counts.get(project.key) || ''}</span></button>`;
   const dot = (project) => `<button data-project="${ctx.esc(project.key)}" class="rail-dot ${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}" title="${ctx.esc(project.name)}">${ctx.projectIcon(project)}</button>`;

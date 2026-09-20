@@ -123,6 +123,34 @@ test('changing client drops a selected agent that is now hidden', async () => {
   assert.equal(selection.stageItem, visible);
 });
 
+test('a stale agent record resolves the live stamped session for filtering and stage selection', async () => {
+  const { agentSession, agentLivePane, agentStageItem, agentForStage, matchesAgentTriageFilters, queueSelection } = await import('./triage.js');
+  const agent = { name: 'sandboxes', session: { id: 'old', pane: 'old-pane' } };
+  const ctx = ctxFor({
+    agents: [agent],
+    sessions: [
+      { id: 'old', pane: 'old-pane', kind: 'claude', project: '/work/a', agentName: 'sandboxes',
+        state: 'exited', exited: true, mtime: 20 },
+      { id: 'new', pane: 'new-pane', kind: 'codex', project: '/work/b', agentName: 'sandboxes',
+        title: 'New agent session', state: 'running', mtime: 30 },
+    ],
+    panes: [{ id: 'old-pane', alive: false, meta: { agent: 'claude', project: '/work/a' } },
+      { id: 'new-pane', alive: true, meta: { agent: 'codex', project: '/work/b', agentName: 'sandboxes' } }],
+  });
+  ctx.projectOf = (path) => ({ key: path });
+  ctx.state.providerFilter = 'codex';
+  ctx.state.filter = '/work/b';
+  const oldItem = { kind: 'running', sessionId: 'old', pane: 'old-pane', project: '/work/a' };
+  assert.equal(agentSession(ctx, agent)?.id, 'new');
+  assert.equal(matchesAgentTriageFilters(ctx, agent), true);
+  assert.equal(agentLivePane(ctx, agent), 'new-pane');
+  assert.equal(agentForStage(ctx, oldItem)?.name, 'sandboxes');
+  assert.equal(agentForStage(ctx, { kind: 'running', sessionId: 'new', pane: 'new-pane' })?.name, 'sandboxes');
+  assert.equal(agentStageItem(ctx, agent, oldItem)?.sessionId, 'new');
+  assert.equal(queueSelection(ctx, [], { current: oldItem }).stageItem?.sessionId, 'new',
+    'the selected agent moves to its live session even when the record still names the old one');
+});
+
 test('Recent limits after filtering so older matching clients remain reachable', async () => {
   const fs = await import('node:fs');
   const vm = await import('node:vm');
@@ -196,6 +224,16 @@ test('rail client controls remain separate from project controls when expanded o
     assert.equal((rail.innerHTML.match(/data-client=/g) || []).length, 3);
     rail.querySelectorAll('[data-client]')[0].click();
     assert.equal(ctx.state.providerFilter, null);
+
+    ctx.state.collapsed.rail = false;
+    ctx.state.providerFilter = 'codex';
+    ctx.data.agents = [{ name: 'sandboxes', session: { id: 'old', pane: 'old-pane' } }];
+    ctx.data.sessions = [{ id: 'agent-new', agentName: 'sandboxes', kind: 'codex',
+      pane: 'agent-pane', project: '/work/b', state: 'running' }];
+    ctx.data.panes = [{ id: 'agent-pane', alive: true, meta: { agent: 'codex', project: '/work/b' } }];
+    renderRail(ctx, []);
+    assert.match(rail.innerHTML, /data-project="\/work\/b"[^>]*>.*?<span class="c "><\/span>/,
+      'an agent-only project stays selectable without pretending it has a counted queue session');
   } finally {
     globalThis.document = previousDocument;
   }

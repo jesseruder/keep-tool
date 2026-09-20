@@ -499,7 +499,13 @@ export function installMobile(context) {
     // rather than leaving a full-screen stage on an item that just left.
     if (event.target.closest('#stage [data-dismiss], #stage [data-snooze]')) close('stage');
     else if (event.target.closest('#qlist .qitem')) open('stage');
-    else if (event.target.closest('#rail [data-project]')) close('filter');
+    else handleMobileFilterChoice(event.target, () => close('filter'));
   }, true);
   apply({ booting: true });
+}
+
+export function handleMobileFilterChoice(target, closeFilter) {
+  if (!target.closest('#rail [data-project], #rail [data-client]')) return false;
+  closeFilter();
+  return true;
 }

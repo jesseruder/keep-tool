@@ -72,6 +72,21 @@ test('the mobile shell is detected, announced, and given the badge', async () =>
   assert.deepEqual(posted.at(-1), { type: 'ready' });
 });
 
+test('a client choice in the borrowed rail closes the mobile filter sheet', async () => {
+  const { handleMobileFilterChoice } = await import('./mobile.js');
+  const client = { dataset: { client: 'codex' } };
+  const project = { dataset: { project: '/work/a' } };
+  const closed = [];
+  const target = (choice) => ({ closest(selector) {
+    assert.match(selector, /#rail \[data-client\]/);
+    return choice;
+  } });
+  assert.equal(handleMobileFilterChoice(target(client), () => closed.push('client')), true);
+  assert.equal(handleMobileFilterChoice(target(project), () => closed.push('project')), true);
+  assert.equal(handleMobileFilterChoice(target(null), () => closed.push('other')), false);
+  assert.deepEqual(closed, ['client', 'project']);
+});
+
 test('the app owns permissions, notifications and sounds', async () => {
   assert.equal(shell.notificationPermission(), 'granted');
   assert.equal(await shell.requestPermission(), 'granted');
