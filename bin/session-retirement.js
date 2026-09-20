@@ -5,7 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const ID = /^[A-Za-z0-9_-]+$/;
-const retirementNotifyOverlay = new Map();
+const retirementNotifyOverlay = new WeakSet();
 
 function files(root) {
   return {
@@ -52,6 +52,12 @@ function setKeepRunning(root, sessionId, keepRunning) {
   return { sessionId, keepRunning };
 }
 
+function assertRetirable(root, sessionId) {
+  const prefs = preferences(root);
+  if (!prefs.known) throw Error('Keep-running preference state is unknown');
+  if (prefs.value.sessions[sessionId]?.keepRunning === true) throw Error('Session is explicitly kept running');
+}
+
 function retirements(root) {
   return readVersioned(files(root).retirements, 'sessions');
 }
@@ -71,11 +77,6 @@ function safeNotify(notify) {
     ...(typeof notify.message === 'string' ? { message: notify.message.slice(0, 12000) } : {}),
     ...(Array.isArray(notify.options) ? { options: notify.options.filter((v) => typeof v === 'string').slice(0, 20) } : {}),
   };
-}
-
-function notifyKey(notify) {
-  const safe = safeNotify(notify);
-  return safe ? JSON.stringify(safe) : '';
 }
 
 function begin(root, plan, now = Date.now()) {
@@ -154,12 +155,13 @@ function apply(sessions, options = {}) {
     && pane.meta?.sessionId).map((pane) => pane.meta.sessionId));
   for (const session of sessions || []) {
     // Settled-session cache rows are reused. Remove only fields this projection
-    // attached last time before deriving them again; a fresh marker with different
-    // content remains genuine conversation state.
+    // attached last time before deriving them again; a fresh marker object remains
+    // genuine conversation state even when its content matches the old completion.
     delete session.retirement;
-    const priorOverlay = retirementNotifyOverlay.get(session.id);
-    if (priorOverlay && notifyKey(session.notify) === priorOverlay) delete session.notify;
-    retirementNotifyOverlay.delete(session.id);
+    if (session.notify && retirementNotifyOverlay.has(session.notify)) {
+      retirementNotifyOverlay.delete(session.notify);
+      delete session.notify;
+    }
     session.keepRunningKnown = prefs.known;
     if (prefs.value.sessions[session.id]?.keepRunning === true) session.keepRunning = true;
     else delete session.keepRunning;
@@ -178,7 +180,7 @@ function apply(sessions, options = {}) {
     };
     if (!session.notify && entry.notify) {
       session.notify = { ...entry.notify };
-      retirementNotifyOverlay.set(session.id, notifyKey(session.notify));
+      retirementNotifyOverlay.add(session.notify);
     }
   }
   return { preferencesKnown: prefs.known, retirementsKnown: retired.known, changed: false };
@@ -210,4 +212,4 @@ function lookup(root, sessionId) {
   return state.known ? state.value.sessions[sessionId] || null : null;
 }
 
-module.exports = { acknowledge, apply, begin, cancel, clear, files, finish, lookup, preferences, reconcile, retirements, setKeepRunning };
+module.exports = { acknowledge, apply, assertRetirable, begin, cancel, clear, files, finish, lookup, preferences, reconcile, retirements, setKeepRunning };

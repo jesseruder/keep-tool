@@ -24,6 +24,19 @@ test('unchanged exited sessions retain display state and avoid repeated derivati
   assert.deepEqual(cache.stats(), { hits: 2, misses: 0, stores: 1, evictions: 0, invalidations: 0, size: 1 });
 });
 
+test('cache round trips exclude live retirement projection and notification overlays', () => {
+  const cache = createSettledSessionCache({ recheckMs: 10000 });
+  cache.set(input(), { session: {
+    id: 'old', title: 'Title', retirement: { automatic: true }, keepRunning: true,
+    keepRunningKnown: true, notify: { type: 'complete', message: 'Done' },
+  }, backgroundJobs: { jobs: [] } });
+  const saved = cache.get(input({ now: 2000 })).session;
+  assert.equal(saved.title, 'Title');
+  for (const field of ['retirement', 'keepRunning', 'keepRunningKnown', 'notify']) {
+    assert.equal(saved[field], undefined, `${field} is re-derived from its live store`);
+  }
+});
+
 test('unrelated active transcript and lifecycle events do not thaw settled fleet rows', () => {
   const cache = createSettledSessionCache({ recheckMs: 10000 });
   cache.set(input(), { session: { id: 'old' }, backgroundJobs: { jobs: [] } });

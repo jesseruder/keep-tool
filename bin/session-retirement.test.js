@@ -16,8 +16,10 @@ async function fixture(run) {
 
 test('keep-running is explicit, durable, removable, and corrupt preference state fails closed', () => fixture((root) => {
   assert.deepEqual(retirement.preferences(root), { known: true, value: { version: 1, sessions: {} } });
+  assert.doesNotThrow(() => retirement.assertRetirable(root, 'session-one'));
   retirement.setKeepRunning(root, 'session-one', true);
   assert.equal(retirement.preferences(root).value.sessions['session-one'].keepRunning, true);
+  assert.throws(() => retirement.assertRetirable(root, 'session-one'), /explicitly kept running/);
   retirement.setKeepRunning(root, 'session-one', false);
   assert.equal(retirement.preferences(root).value.sessions['session-one'], undefined);
   fs.writeFileSync(retirement.files(root).preferences, '{bad');
@@ -71,17 +73,33 @@ test('a parent shell is exited for retirement state and a verified new process o
   assert.deepEqual(retirement.reconcile(root, [{ id: 'resumed', lastUserAt: 301 }], []).cleared, ['resumed']);
 }));
 
-test('clearing retirement keeps a genuinely newer notification on a reused row', () => fixture((root) => {
+test('clearing retirement keeps an identical but genuinely newer notification on a reused row', () => fixture((root) => {
   retirement.begin(root, { sessionId: 'fresh-notify', pane: 'pane', reason: 'settled-attention',
-    idleMinutes: 30, activityAt: 1, notify: { type: 'complete', message: 'old completion' } });
+    idleMinutes: 30, activityAt: 1, notify: { type: 'complete', message: 'Done' } });
   retirement.finish(root, 'fresh-notify');
   const row = { id: 'fresh-notify', exited: true, runtime: { state: 'exited' } };
   retirement.apply([row], { root, panes: [] });
-  row.notify = { type: 'permission', message: 'new approval' };
+  row.notify = { type: 'complete', message: 'Done' };
   retirement.clear(root, 'fresh-notify');
   retirement.apply([row], { root, panes: [] });
-  assert.deepEqual(row.notify, { type: 'permission', message: 'new approval' });
+  assert.deepEqual(row.notify, { type: 'complete', message: 'Done' });
   assert.equal(row.retirement, undefined);
+}));
+
+test('acknowledging retirement removes its exact overlay from every projected row', () => fixture((root) => {
+  retirement.begin(root, { sessionId: 'duplicate-row', pane: 'pane', reason: 'settled-attention',
+    idleMinutes: 30, activityAt: 1, notify: { type: 'complete', message: 'Done' } });
+  retirement.finish(root, 'duplicate-row');
+  const rows = [
+    { id: 'duplicate-row', exited: true, runtime: { state: 'exited' } },
+    { id: 'duplicate-row', exited: true, runtime: { state: 'exited' } },
+  ];
+  retirement.apply(rows, { root, panes: [] });
+  assert.notEqual(rows[0].notify, rows[1].notify);
+  assert.equal(retirement.acknowledge(root, 'duplicate-row'), true);
+  retirement.apply(rows, { root, panes: [] });
+  assert.equal(rows[0].notify, undefined);
+  assert.equal(rows[1].notify, undefined);
 }));
 
 test('a dashboard poll cannot erase a closing retirement snapshot', () => fixture((root) => {

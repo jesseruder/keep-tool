@@ -4832,11 +4832,8 @@ async function closeIdleSession(body, deps = {}) {
     const pinned = new Set((layouts.layouts || []).flatMap((layout) => layout.ids || []));
     const assertRetirementPreference = () => {
       if (!deps.closePolicy?.retirement) return;
-      const prefs = require('./session-retirement').preferences(deps.root || keep.ROOT);
-      if (!prefs.known) throw new InjectionError(409, 'Keep-running preference state is unknown');
-      if (prefs.value.sessions[session.id]?.keepRunning === true) {
-        throw new InjectionError(409, 'Session is explicitly kept running');
-      }
+      try { require('./session-retirement').assertRetirable(deps.root || keep.ROOT, session.id); }
+      catch (error) { throw new InjectionError(409, error.message); }
     };
     const checkDonePolicy = async (current, currentPane = pane, policyPane = currentPane) => {
       if (!deps.closePolicy?.done && !deps.closePolicy?.retirement) return null;
@@ -9396,7 +9393,10 @@ async function closeEphemeralPane(pane, sessionId, deps = {}) {
           beforeExitInput: () => { exitInputStarted = true; },
           withInjectionLock: (fn) => fn(),
         }),
-        signal: (id, signal, guard) => host('guarded-kill', { pane: id, signal, ...guard }),
+        signal: (id, signal, guard) => {
+          retirement.assertRetirable(root, sessionId);
+          return host('guarded-kill', { pane: id, signal, ...guard });
+        },
       });
       retirement.finish(root, sessionId, Date.now(), entry.transactionId);
       return closed;

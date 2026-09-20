@@ -7250,6 +7250,25 @@ test('the check sweep close composition refuses rather than kills, and guards it
   assert.equal(kill.params.expectedInputCount, 3);
   assert.equal(kill.params.expectedOutputCount, 9);
 
+  // Recheck the preference at the actual signal boundary. The graceful close can
+  // await pane state after its last policy check, while the user pins the session.
+  const pinnedAtSignal = fakeHost();
+  let pinnedKills = 0;
+  await assert.rejects(closeEphemeralPane(pane, 'check-sid', {
+    root,
+    hostRequest: async (type, params) => {
+      if (type === 'guarded-kill') pinnedKills++;
+      return pinnedAtSignal.request(type, params);
+    },
+    withInjectionLock: (fn) => fn(),
+    manualClose: async (_request, options) => {
+      require('./session-retirement').setKeepRunning(root, 'check-sid', true);
+      return options.signal('pane-check', 'SIGTERM', { expectedPid: 4242 });
+    },
+  }), /explicitly kept running/);
+  assert.equal(pinnedKills, 0);
+  require('./session-retirement').setKeepRunning(root, 'check-sid', false);
+
   // And the policy handed to closeIdleSession is the unattended one, not the Close
   // button's: every automatic guard, plus the ephemeral escape for the card's own
   // schedule, plus an idle window of zero so a finished check closes now.

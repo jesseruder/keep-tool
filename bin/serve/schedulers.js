@@ -325,7 +325,10 @@ function startSchedulers(ctx) {
                 beforeExitInput: () => { exitInputStarted = true; },
                 withInjectionLock: (fn) => fn(),
               }),
-              signal: (pane, signal, guard) => hostRequest('guarded-kill', { pane, signal, ...guard }),
+              signal: (pane, signal, guard) => {
+                retirement.assertRetirable(keep.ROOT, body.sessionId);
+                return hostRequest('guarded-kill', { pane, signal, ...guard });
+              },
             });
             retirement.finish(keep.ROOT, body.sessionId, Date.now(), entry.transactionId);
             return closed;

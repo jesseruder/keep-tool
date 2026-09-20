@@ -9,6 +9,16 @@ function clone(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
 }
 
+function canonicalSession(value) {
+  const session = clone(value);
+  if (!session || typeof session !== 'object') return session;
+  // These fields are projected from live preference/retirement/attention stores
+  // on every build. Persisting them through the JSON cache makes a cleared record
+  // look active until cache expiry and loses object-level overlay provenance.
+  for (const field of ['retirement', 'keepRunning', 'keepRunningKnown', 'notify']) delete session[field];
+  return session;
+}
+
 function sourceFingerprint(file, stat) {
   if (!file || !stat) return null;
   return `${path.resolve(file)}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
@@ -80,7 +90,7 @@ function createSettledSessionCache(options = {}) {
       file: path.resolve(input.file),
       pane: paneFingerprint(input.pane),
       accountId: input.accountId || null,
-      session: clone(value.session),
+      session: canonicalSession(value.session),
       backgroundJobs: clone(value.backgroundJobs),
       storedAt,
       recheckAt: sameEvidence ? prior.recheckAt
