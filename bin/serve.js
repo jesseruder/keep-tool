@@ -5381,7 +5381,7 @@ function clearReopenHandoffSnapshot(root, sessionId) {
 function reopenTurnSnapshot(session, deps = {}, launchModel = '') {
   const turn = (deps.sessionLastTurn || sessionLastTurn)(session, deps);
   let model = launchModel || turn.model;
-  if (session.kind === 'claude' && !deps.sessionLastTurn && !launchModel) {
+  if (session.kind === 'claude' && (!deps.sessionLastTurn || deps.reopenEffectiveModel) && !launchModel) {
     // A /model command after the last assistant usage is authoritative. The
     // handoff reader scans through those commands and preserves [1m] exactly.
     model = (deps.reopenEffectiveModel || handoffCurrentModel)(session, null, '', deps);
@@ -7170,15 +7170,51 @@ async function reopenSessionOnAccount(body, deps = {}) {
     writeReopenHandoffSnapshot(root, session.id, target.id, turn);
     return turn;
   };
+  const validatedTurn = (saved) => {
+    // Resume and account handoff can append startup records after the snapshot.
+    // Only a newer model-usage record or an effective /model change replaces it.
+    // Unknown model evidence must never restore the snapshot's older model.
+    const fresh = reopenTurnSnapshot({ ...session, kind: agent }, deps);
+    if (!keep.LAUNCH_MODEL_RE.test(String(fresh.model || ''))) {
+      throw new InjectionError(409, 'current session model cannot be verified; reopen compaction was not started');
+    }
+    const savedUsage = Number.isFinite(saved.usageAt) ? saved.usageAt : null;
+    const freshUsage = Number.isFinite(fresh.usageAt) ? fresh.usageAt : null;
+    const modelChanged = fresh.model !== saved.model;
+    const usedAgain = freshUsage != null && freshUsage !== savedUsage;
+    if (!modelChanged && !usedAgain) {
+      if (fresh.contextTokens > 0 && fresh.contextTokens !== saved.contextTokens) {
+        throw new InjectionError(409, 'current session activity cannot be verified; reopen compaction was not started');
+      }
+      return saved;
+    }
+    if (!modelChanged && savedUsage != null && freshUsage < savedUsage) {
+      throw new InjectionError(409, 'session usage record moved backward; reopen compaction was not started');
+    }
+    if (!Number.isFinite(fresh.contextTokens) || fresh.contextTokens < 0) {
+      throw new InjectionError(409, 'current session context cannot be verified; reopen compaction was not started');
+    }
+    if (fresh.contextTokens < envNumber('KEEP_AUTO_COMPACT_MIN_TOKENS', 100000)) {
+      clearReopenHandoffSnapshot(root, session.id);
+    } else {
+      writeReopenHandoffSnapshot(root, session.id, target.id, fresh);
+    }
+    return fresh;
+  };
   const compactTarget = async (result, turn) => {
     if (result?.status !== 'done' || !result.pane) return result;
     try {
-      const compacted = await withInjectionLockRetry(() => compactReopenedSession(
-        { ...session, kind: agent }, { pane: result.pane }, target, turn,
-        { ...deps, reopenForceCold: true }),
+      let currentTurn = turn;
+      const compacted = await withInjectionLockRetry(() => {
+        assertCompactRestoreSettled(session.id, deps);
+        currentTurn = validatedTurn(currentTurn);
+        return compactReopenedSession(
+          { ...session, kind: agent }, { pane: result.pane }, target, currentTurn,
+          { ...deps, reopenForceCold: true });
+      },
       { ...deps, injectionLockRetryMs: envNumber('KEEP_COMPACT_TIMEOUT_MS', 240000) + 30000 },
       { pane: result.pane, session: session.id, model: true });
-      const signature = JSON.stringify([target.id, turn.model, turn.contextTokens, turn.usageAt]);
+      const signature = JSON.stringify([target.id, currentTurn.model, currentTurn.contextTokens, currentTurn.usageAt]);
       if (compacted?.compacted || reopenCompactAttempts.get(session.id) === signature) {
         clearReopenHandoffSnapshot(root, session.id);
       } else if (compacted && !compacted.compacted) {

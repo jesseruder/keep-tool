@@ -8905,20 +8905,26 @@ test('different-account reopen serializes source opening and starts one open-onl
     let releaseOpen;
     const gate = new Promise((resolve) => { releaseOpen = resolve; });
     let opens = 0; let handoffs = 0; let compactions = 0;
+    const originalUsageAt = Date.now() - 1000;
+    let currentTurn = { model: 'claude-fable-5-1', contextTokens: 150000,
+      usageAt: originalUsageAt, cacheTtlMs: 60 * 60e3 };
     const deps = {
       root, env, resolveSessionId: () => session, listHostPanes: async () => [],
-      sessionLastTurn: () => ({ model: 'claude-fable-5-1', contextTokens: 150000,
-        usageAt: Date.now() - 1000, cacheTtlMs: 60 * 60e3 }),
+      sessionLastTurn: () => ({ ...currentTurn }),
       precheckSessionTarget: async () => {},
       compactSession: async (_session, targetPane, _instruction, options) => {
         compactions++;
         assert.equal(targetPane.pane, 'source-pane');
         assert.equal(options.compactionPolicy.path, 'cold-fallback', 'new account has no warm cache');
         assert.equal(options.compactSettingsFile, path.join(targetDir, 'settings.json'));
+        assert.equal(options.sessionLastTurn().contextTokens, 180000,
+          'a source turn after the first snapshot replaces stale context');
         return { compacted: true };
       },
       openSession: async (body, options) => { opens++; assert.equal(body.accountId, 'source');
-        assert.equal(options.reopenCompaction, 'skip'); await gate; return { pane: 'source-pane' }; },
+        assert.equal(options.reopenCompaction, 'skip'); await gate;
+        currentTurn = { ...currentTurn, contextTokens: 180000, usageAt: originalUsageAt + 1000 };
+        return { pane: 'source-pane' }; },
       handoffSession: async (body) => { handoffs++; assert.deepEqual(body, {
         sessionId: session.id, pane: 'source-pane', accountId: 'target', intent: 'open-only',
       }); return { ok: true, status: 'done', pane: body.pane, intent: body.intent }; },
@@ -8951,12 +8957,12 @@ test('completed account handoff retries transient compaction with its original c
   require('./accounts').pinSession(session.id, 'claude', 'source', { root, env });
   const handoffDir = path.join(root, '.keep', 'account-handoffs'); fs.mkdirSync(handoffDir, { recursive: true });
   const snapshotFile = path.join(root, '.keep', 'compact', `${session.id}.reopen-snapshot`);
+  const originalUsageAt = Date.now() - 1000;
+  let currentTurn = { model: 'claude-fable-5-1', contextTokens: 150000, usageAt: originalUsageAt };
   let turnReads = 0; let compactions = 0; let sourceOpens = 0; let targetOpens = 0;
   const deps = {
     root, env, resolveSessionId: () => session, listHostPanes: async () => [],
-    sessionLastTurn: () => { turnReads++; return turnReads === 1
-      ? { model: 'claude-fable-5-1', contextTokens: 150000, usageAt: Date.now() - 1000 }
-      : { model: 'claude-sonnet-5', contextTokens: 1000, usageAt: Date.now() }; },
+    sessionLastTurn: () => { turnReads++; return { ...currentTurn }; },
     openSession: async (body, options) => {
       if (body.accountId === 'source') { sourceOpens++; assert.equal(options.reopenCompaction, 'skip'); }
       else { targetOpens++; assert.equal(options.reopenCompaction, targetOpens === 1 ? 'skip' : undefined); }
@@ -8973,6 +8979,7 @@ test('completed account handoff retries transient compaction with its original c
       compactions++;
       assert.equal(options.compactionPolicy.path, 'cold-fallback');
       assert.equal(options.compactionPolicy.originalModel, 'claude-fable-5-1');
+      assert.equal(options.sessionLastTurn().contextTokens, compactions === 1 ? 150000 : 160000);
       return compactions === 1 ? { compacted: false, reason: 'transient failure', attemptStage: 'pre-submit' }
         : { compacted: true };
     },
@@ -8980,12 +8987,57 @@ test('completed account handoff retries transient compaction with its original c
   await assert.rejects(reopenSessionOnAccount({ sessionId: session.id, accountId: 'target' }, deps),
     (error) => error.status === 409 && error.extra?.launch?.pane === 'target-pane');
   assert.equal(fs.existsSync(snapshotFile), true, 'source context survives completed handoff');
+  currentTurn = { model: 'claude-fable-5-1', contextTokens: 160000, usageAt: originalUsageAt + 1000 };
   await reopenSessionOnAccount({ sessionId: session.id, accountId: 'target' }, deps);
   assert.equal(fs.existsSync(snapshotFile), false);
   await reopenSessionOnAccount({ sessionId: session.id, accountId: 'target' }, deps);
   assert.equal(sourceOpens, 1); assert.equal(targetOpens, 2);
-  assert.equal(turnReads, 1, 'retry uses the saved pre-handoff context');
+  assert.equal(turnReads, 3, 'retry revalidates the newer assistant usage');
   assert.equal(compactions, 2, 'successful retry is not repeated');
+});
+
+test('completed handoff revalidates a manual model change before issuing compaction commands', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reopen-model-change-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const targetDir = path.join(root, 'target'); fs.mkdirSync(targetDir);
+  fs.writeFileSync(path.join(targetDir, 'settings.json'), '{}\n');
+  const config = path.join(root, 'accounts.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'target', label: 'Target', agent: 'claude', configDir: targetDir },
+  ], defaultAccounts: { claude: 'target' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+  const session = { id: 'manual-switch-session', kind: 'claude', project: root, accountId: 'target' };
+  const handoffDir = path.join(root, '.keep', 'account-handoffs'); fs.mkdirSync(handoffDir, { recursive: true });
+  fs.writeFileSync(path.join(handoffDir, `${session.id}.json`), JSON.stringify({
+    sessionId: session.id, targetAccountId: 'target', status: 'done', intent: 'open-only', pane: 'target-pane',
+  }));
+  const snapshotFile = path.join(root, '.keep', 'compact', `${session.id}.reopen-snapshot`);
+  fs.mkdirSync(path.dirname(snapshotFile), { recursive: true });
+  fs.writeFileSync(snapshotFile, JSON.stringify({ sessionId: session.id, accountId: 'target',
+    turn: { model: 'claude-fable-5-1', contextTokens: 150000, usageAt: Date.now() - 1000, cacheTtlMs: null } }));
+  let effectiveModel = '<unknown>';
+  let compactions = 0;
+  const deps = {
+    root, env, resolveSessionId: () => session,
+    sessionLastTurn: () => ({ model: 'claude-fable-5-1', contextTokens: 150000, usageAt: Date.now() - 1000 }),
+    reopenEffectiveModel: () => effectiveModel,
+    openSession: async () => ({ ok: true, pane: 'target-pane', existing: true }),
+    precheckSessionTarget: async () => {},
+    compactSession: async (_session, _pane, _instruction, options) => {
+      compactions++;
+      assert.equal(options.compactionPolicy.originalModel, 'claude-sonnet-5');
+      assert.equal(options.compactionPolicy.path, 'warm-current', 'Sonnet remains on its current model');
+      return { compacted: true };
+    },
+  };
+  await assert.rejects(reopenSessionOnAccount({ sessionId: session.id, accountId: 'target' }, deps),
+    (error) => error.status === 409 && /current session model cannot be verified/.test(error.message));
+  assert.equal(compactions, 0);
+  assert.equal(fs.existsSync(snapshotFile), true);
+  effectiveModel = 'claude-sonnet-5';
+  await reopenSessionOnAccount({ sessionId: session.id, accountId: 'target' }, deps);
+  assert.equal(compactions, 1);
+  assert.equal(fs.existsSync(snapshotFile), false);
 });
 
 test('different-account reopen exposes an existing incomplete source pane instead of launching again', async () => {
