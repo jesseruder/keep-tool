@@ -1002,6 +1002,7 @@ at <time> (record <id>)` when **all** of:
 | the range is linear | `origin/<default>..HEAD` contains a merge commit, whose conflict resolution is content no review of the branch saw — rebase first |
 | every commit in `origin/<default>..HEAD` has a `clean` record whose patch-id matches | a commit with no record, or one whose newest record is `findings` |
 | that record clears the attestation bar | `human…` with a `bySession`; `codex…` with no verified `--job`; `opus…`/`claude…` with no verified `--job` and under 80 characters of `--evidence` |
+| no review launched for these commits is still out | a pending review obligation (below) covers one of them and its verdict has not been recorded |
 
 Anything else exits 3 and prints the condition that failed. `--json` adds `implicit:
 true` and the `record` that carried the decision. `watch/autoland.json` is
@@ -1015,6 +1016,53 @@ nothing. `--dry-run` stops before the land. For keep-tool, `wt land` fast-forwar
 ready live checkout to the landed SHA and restarts the daemon. Inspect a skipped or failed
 deployment: a checkout already past this land belongs to its newer landing session; recover
 only a safe failure the landing still owns, otherwise record the blocker or dependency.
+
+## Reviews that were launched and have not answered
+
+`keep reviewed` records that a review happened. The other half is a review that was
+*expected*: a session launches a Codex review, its turn ends before the verdict comes
+back, and the review evaporates — the commits end up self-verified, or sit unlandable
+until somebody notices. Three cards did exactly that over 2026-09-12..15.
+
+```sh
+keep reviewing <card> --job <codex-job-id> --commit origin/master..HEAD [--account codex-secondary] [--by "codex sol"] [-m "..."]
+keep reviewing <card>                              # what this card is still waiting for
+keep reviewing <card> --drop <obligation-id> -m "why"
+```
+
+Open the obligation right after launching the review, from the worktree that holds the
+commits. `--job` must already resolve to a Codex job Keep can find (a job that has not
+finished is fine here — that is the point), and `--commit` is required: an obligation
+that covers nothing cannot gate a land. Records go to
+`.keep/review-obligations/<card>.json` as `{id, at, card, job, accountId, by, commits,
+state, stateAt, note, session}`.
+
+The daemon sweeps them every five minutes (`review-obligations` in `keep health`) and
+settles each one from the job's own state, using the same companion snapshot the console
+keeps warm:
+
+| what Keep sees | the obligation becomes |
+| --- | --- |
+| a review record on the card cites this `--job` | `satisfied`, silently — `clean` and `findings` both count, because the question is whether the review came back |
+| the job finished and no verdict is recorded | `awaiting-verdict`, with one `review pending` check-in naming the `keep codex … result` and `keep reviewed …` commands |
+| the job ended failed, cancelled or aborted | `failed`, with one `review failed` check-in |
+| the codexjobs sweep calls the job dead, or stalled for over 20 minutes | `failed` |
+| no job file at all, 15 minutes after the obligation was opened | `failed` |
+| still running after six hours | `abandoned` |
+
+Two properties hold. **Nothing here ever writes a verdict**: a job that died fails the
+obligation so the review is re-run, and is never mistaken for a clean one. And every
+obligation reaches a terminal state on its own, so a job that died in the night cannot
+block a card forever — `failed` and `abandoned` stop gating the land, and the commits
+are then refused for the ordinary reason, that they have no review record.
+
+While an obligation is `open` or `awaiting-verdict` and covers a commit in
+`origin/<default>..HEAD`, `keep allow <card> land` exits 3 naming the job. That is the
+case a clean record cannot answer: a session self-attesting while the independent review
+it launched is still in flight. An explicit `land` grant from Owner still wins.
+`keep reviewed … --job <id>` settles the matching obligation as it writes the record;
+`keep reviewing --drop` is the deliberate way to stop waiting, and it requires a reason.
+`keep reviews <card>` lists the pending ones above the records.
 
 Writing grants is Owner's: `keep allow <card> --grant`/`--until` and `keep add
 --allow`/`--until` are refused inside an agent session (`CLAUDE_CODE_SESSION_ID` or a

@@ -28,6 +28,7 @@ const CADENCES = Object.freeze({
   review: { cadenceMs: 10 * 60e3 },
   'review-compact': { cadenceMs: 60e3 },
   runs: { cadenceMs: 60e3 },
+  'review-obligations': { cadenceMs: 5 * 60e3 },
   delivery: { cadenceMs: 60e3 },
   unblock: { cadenceMs: 60e3 },
   notes: { cadenceMs: 60e3 },

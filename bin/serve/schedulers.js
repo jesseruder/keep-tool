@@ -342,6 +342,9 @@ function startSchedulers(ctx) {
   // file is the same as no lint at all.
   require('../lint.js').startScheduler({ onChange: broadcast });
   landed.startScheduler({ onChange: broadcast });
+  // Reviews that were launched and never answered. The sweep reads the Codex job's own
+  // state through the snapshot the console already keeps warm, so it costs no extra ps.
+  require('../review-obligations.js').startScheduler({ onChange: broadcast, companionSnapshot });
   if (process.env.KEEP_WT_GC === '0') {
     health.record('wt-gc', { disabled: true, detail: 'KEEP_WT_GC=0' });
   } else startWtGcScheduler({ onChange: broadcast });

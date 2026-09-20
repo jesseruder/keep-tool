@@ -34,7 +34,21 @@ initially, not both. Astra xhigh requires Owner's explicit request.
    Replace the target and concerns with the actual scope. Keep literal task text
    properly shell-quoted. Do not send a review through an implementation thread or
    delegate another review inside it.
-3. Start the background watchdog immediately using that account's `jobsDir` from
+3. Record the obligation as soon as the job id exists, from the worktree that holds
+   the commits:
+
+   ```sh
+   keep reviewing <card> --job <job-id> --account <id> --commit origin/<default>..HEAD --by "codex sol"
+   ```
+
+   This is what stops a review being dropped when the turn ends before the verdict
+   does. The daemon settles it from the job itself — a finished job with no verdict
+   recorded lands a `review pending` check-in, and a dead or stalled one lands a
+   `review failed` check-in so the review is re-run rather than assumed clean — and
+   `keep land` refuses these commits until a verdict is recorded. `keep reviewed …
+   --job <job-id>` closes it; `keep reviewing <card> --drop <id> -m "why"` is the
+   deliberate way to stop waiting.
+4. Start the background watchdog immediately using that account's `jobsDir` from
    `keep codex --account <id> context --json`. When it finishes, read
    `keep codex --account <id> result <job-id>`, relay the review findings, and act on
    them before pushing. A start-only or stale result is not a review; use the

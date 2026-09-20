@@ -248,13 +248,32 @@ function attestationFailure(record) {
 
 function selfAttested(record) { return Boolean(attestationFailure(record)); }
 
-function decideLand({ grants = [], records = [], commits = [], optOut = '', worktree = null, now = Date.now() } = {}) {
+function decideLand({ grants = [], records = [], commits = [], obligations = [], optOut = '', worktree = null, now = Date.now() } = {}) {
   const tokens = (grants || []).map((grant) => (typeof grant === 'string' ? parseToken(grant, 'grant') : grant));
   const explicit = tokens.find((token) => token && token.action === 'land');
   if (explicit) return { ok: true, implicit: false, grant: formatToken(explicit), why: `granted ${formatToken(explicit)}` };
   if (optOut) return { ok: false, implicit: true, why: `no land grant, and auto-land is off: ${optOut}` };
   if (worktree && worktree.ok === false) return { ok: false, implicit: true, why: `no land grant, and ${worktree.why}` };
   if (!commits.length) return { ok: false, implicit: true, why: 'no land grant, and there is nothing to land' };
+
+  // A review this card launched and has not heard back from. It is asked before the
+  // records are, because "the Codex review you started is still out" is the useful
+  // answer — a self-attested clean record covering the same commits would otherwise
+  // let the land through while the independent verdict was still in flight. The
+  // daemon settles every obligation to a terminal state, so a job that died cannot
+  // hold a card here indefinitely.
+  const outstanding = (obligations || []).filter((record) => record && record.outstanding !== false);
+  if (outstanding.length) {
+    const first = outstanding[0];
+    return {
+      ok: false,
+      implicit: true,
+      why: `no land grant, and a review launched for these commits has no verdict yet:`
+        + ` job ${first.job}${first.accountId ? ` on ${first.accountId}` : ''} (${first.state}).`
+        + ` Record its verdict with keep reviewed --job ${first.job}, or drop the obligation with keep reviewing --drop ${first.id}`,
+      obligation: first,
+    };
+  }
 
   const used = [];
   for (const commit of commits) {

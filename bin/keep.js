@@ -1399,6 +1399,7 @@ function implicitLandVerdict(task, deps = {}) {
   const reviews = deps.reviews || require('./reviews.js');
   const records = deps.records || reviews.readRecords(task.id);
   const optOut = deps.optOut !== undefined ? deps.optOut : reviews.optOutReason(task);
+  const obligationApi = deps.obligations || require('./review-obligations.js');
   // Always resolved, even when the card is opted out or holds an explicit grant:
   // `keep land` needs the worktree and the range, and an explicit `land` grant on
   // an opted-out card used to short-circuit past this and land `undefined`.
@@ -1407,6 +1408,11 @@ function implicitLandVerdict(task, deps = {}) {
     grants: allow.readGrants(task),
     records,
     commits: context.ok ? context.commits : [],
+    // Only the obligations whose commits are actually in this range: a review still
+    // out for work that landed last week is not this land's problem.
+    obligations: context.ok
+      ? obligationApi.outstandingFor(obligationApi.readRecords(task.id), records, context.commits)
+      : [],
     optOut,
     worktree: context.ok ? null : context,
   });
@@ -1538,10 +1544,81 @@ commands.reviewed = (argv) => {
     commitAndPush(`keep: code-review ${id}`);
     return built;
   }));
-  if (o.json) return console.log(JSON.stringify(record, null, 2));
+  // The verdict this card was waiting for closes the obligation that was waiting for
+  // it, so the daemon never announces a review a session already recorded by hand.
+  let closed = [];
+  try { closed = require('./review-obligations.js').settleFromRecord(id, record); }
+  catch (error) { process.stderr.write(`keep: the review was recorded but its obligation could not be settled: ${error.message}\n`); }
+  if (o.json) return console.log(JSON.stringify({ ...record, settled: closed.map((entry) => entry.id) }, null, 2));
   console.log(`${id}: recorded ${record.verdict} review ${record.id} over ${record.commits.length} commit(s) by ${record.by}`);
   for (const commit of record.commits) console.log(`  ${commit.sha.slice(0, 12)} ${commit.patchId ? `patch ${commit.patchId.slice(0, 12)}` : 'no patch-id (merge or empty)'} ${commit.subject}`);
+  for (const entry of closed) console.log(`  settled pending review ${entry.id} (job ${entry.job})`);
   if (record.verdict === 'clean') console.log(`  keep allow ${id} land now answers 0 while these are exactly what would land`);
+};
+
+// `keep reviewing` — the other half of `keep reviewed`: a review that has been launched
+// and has not answered yet. The daemon settles it from the job's own state, and until it
+// does, the implicit land grant refuses the commits it covers.
+commands.reviewing = (argv) => {
+  const o = parseArgs(argv, { commit: 'list', job: 'str', account: 'str', by: 'str', drop: 'str', json: 'bool' });
+  const id = o._[0];
+  const usage = 'usage: keep reviewing <card> --job <codex-job-id> --commit <sha|range>… [--account <codex-id>] [--by "codex sol"] [-m "..."] [--json]\n'
+    + '       keep reviewing <card> --drop <obligation-id> -m "why"   # stop waiting for a review you are not going to get\n'
+    + '       keep reviewing <card> [--json]                          # what this card is still waiting for';
+  if (!id || o._.length > 1) die(usage);
+  const obligations = require('./review-obligations.js');
+  const translating = (fn) => {
+    try { return fn(); }
+    catch (error) { if (error instanceof obligations.ObligationError) die(error.message); throw error; }
+  };
+  loadTask(id);
+
+  if (o.drop) {
+    if (o.job || o.commit) die(usage);
+    if (!o.m) die('--drop needs -m "why": an obligation dropped without a reason is a review nobody can tell was skipped');
+    const records = obligations.readRecords(id);
+    const target = records.find((record) => record.id === o.drop || record.job === o.drop);
+    if (!target) die(`${id} has no pending review ${o.drop} — keep reviewing ${id} lists them`);
+    if (!obligations.isOpen(target)) die(`pending review ${target.id} is already ${target.state}`);
+    const next = records.map((record) => (record.id === target.id
+      ? obligations.applied(record, { state: 'abandoned', note: `dropped: ${o.m}` })
+      : record));
+    obligations.writeRecords(id, next);
+    console.log(`${id}: dropped pending review ${target.id} (job ${target.job}) — its commits still have no review record`);
+    return;
+  }
+
+  if (!o.job && !o.commit) {
+    const records = obligations.readRecords(id);
+    if (o.json) return console.log(JSON.stringify({ id, obligations: records }, null, 2));
+    if (!records.length) return console.log(`${id}: no pending reviews`);
+    for (const record of records) console.log(obligations.summaryLine(record));
+    return;
+  }
+  if (!o.job || !o.commit) die(usage);
+
+  const record = translating(() => {
+    const reviews = require('./reviews.js');
+    let commits;
+    try { commits = reviews.resolveCommits(o.commit, reviews.gitDeps(process.cwd())); }
+    catch (error) {
+      if (error instanceof reviews.ReviewRecordError) die(error.message);
+      throw error;
+    }
+    // The job must exist before Keep will wait for it: a typo here would become a
+    // review nobody is running and a card nobody can land.
+    const job = reviews.resolveJob(o.job, { root: ROOT });
+    if (!job) die(`--job "${o.job}" is not a Codex job Keep can find — run keep codex-jobs to see the live ones`);
+    const built = obligations.open({
+      card: id, job: o.job, accountId: o.account || job.accountId, by: o.by,
+      commits, note: o.m, session: commandSession(),
+    });
+    return obligations.append(id, built);
+  });
+  if (o.json) return console.log(JSON.stringify(record, null, 2));
+  console.log(`${id}: waiting on review job ${record.job}${record.accountId ? ` (${record.accountId})` : ''} over ${record.commits.length} commit(s)`);
+  console.log(`  keep allow ${id} land refuses these commits until a verdict is recorded (keep reviewed ${id} --job ${record.job} …)`);
+  console.log(`  record: ${record.id}`);
 };
 
 commands.reviews = (argv) => {
@@ -1550,7 +1627,10 @@ commands.reviews = (argv) => {
   if (!id || o._.length > 1) die('usage: keep reviews <card> [--json]');
   loadTask(id);
   const records = require('./reviews.js').readRecords(id);
-  if (o.json) return console.log(JSON.stringify({ id, records }, null, 2));
+  const obligations = require('./review-obligations.js');
+  const pending = obligations.readRecords(id).filter(obligations.isOpen);
+  if (o.json) return console.log(JSON.stringify({ id, records, pending }, null, 2));
+  for (const record of pending) console.log(`pending: ${obligations.summaryLine(record)}`);
   if (!records.length) return console.log(`${id}: no review records — keep reviewed ${id} --commit <sha> --verdict clean`);
   for (const record of records) {
     console.log(`${record.at}  ${record.verdict.padEnd(8)} ${record.id}  by ${record.by}${record.job ? ` job ${record.job}` : ''}`);
@@ -3164,6 +3244,11 @@ function helpText() {
   keep reviewed <card> --commit <sha|range>… --verdict clean|findings
                        [--by codex|opus|claude|human…] [--job <id>] [--evidence "..."] [-m "..."] [--json]
                        # record that an independent review saw exactly these patches
+  keep reviewing <card> --job <id> --commit <sha|range>… [--account <codex-id>] [--by "codex sol"] [-m "..."]
+                       # a review you launched and have not heard back from; the daemon settles it
+                       # from the job, and keep land refuses its commits until a verdict is recorded
+  keep reviewing <card> --drop <obligation-id> -m "why"   # stop waiting for a review that is not coming
+  keep reviewing <card> [--json]               # what this card is still waiting for
   keep reviews <card> [--json]                 # the review records on this card
   keep land <card> [--dry-run] [--json]        # keep allow <card> land, then wt land, then cite the sha
                        # exit 3 when the reviewed patches are not exactly what would land
