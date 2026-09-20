@@ -761,7 +761,9 @@ export function syncReplyComposer(stage, session) {
 }
 
 function syncReplyPending(form, pending) {
+  const input = form.querySelector('input');
   const button = form.querySelector('button');
+  input.disabled = pending;
   button.disabled = pending;
   if (pending) {
     button.setAttribute('aria-busy', 'true');

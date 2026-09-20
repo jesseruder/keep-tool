@@ -799,6 +799,7 @@ test('automatic retirement exposes the desktop reply composer and labels its one
   installReplyComposer(first, ctx, item, send);
   syncReplyComposer(first, { retirement: { automatic: true } });
   assert.equal(first.input.value, 'Use option A, please.', 'a state-driven stage rebuild restores the draft');
+  assert.equal(first.input.disabled, true, 'the rebuilt field cannot accept text the pending success would discard');
   assert.equal(first.button.disabled, true, 'pending state follows the session onto the rebuilt composer');
   assert.equal(first.button.getAttribute('aria-busy'), 'true');
   assert.equal(first.button.textContent, 'Sending…');
@@ -808,6 +809,7 @@ test('automatic retirement exposes the desktop reply composer and labels its one
   await submitted;
 
   assert.equal(first.input.value, '', 'success clears the currently mounted composer, not only the detached one');
+  assert.equal(first.input.disabled, false);
   await first.form.emit('submit', { preventDefault() {} });
   assert.deepEqual(sends, [['retired-session', 'Use option A, please.']], 'an empty post-success submit cannot resend');
   assert.equal(drafts.has('retired-session'), false);
@@ -841,11 +843,13 @@ test('a failed reply preserves the rebuilt draft and unlocks its current compose
   stage.replace();
   installReplyComposer(stage, ctx, item, () => pending);
   syncReplyComposer(stage, { retirement: { automatic: true } });
+  assert.equal(stage.input.disabled, true);
   assert.equal(stage.button.disabled, true);
   reject(new Error('resume failed'));
   await submitted;
 
   assert.equal(stage.input.value, 'Keep this draft');
+  assert.equal(stage.input.disabled, false);
   assert.equal(stage.button.disabled, false);
   assert.equal(stage.button.getAttribute('aria-busy'), null);
   assert.equal(stage.button.textContent, 'Send & resume');
