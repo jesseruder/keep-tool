@@ -426,3 +426,143 @@ test('an unreadable store is reported by the CLI instead of read as empty', () =
     }
   } finally { box.cleanup(); }
 });
+
+// ---------- what round two found ----------
+
+test('a live row for the job outweighs a job file that would not read', () => {
+  const now = Date.now();
+  const old = pending({ at: new Date(now - 30 * 60e3).toISOString(), misses: 2 });
+  // Companion discovery is fine and says the job is running; only its own file failed
+  // to parse. Failing the review here would drop the gate on a demonstrably live job.
+  assert.equal(obligations.decide(old, { job: null, live: { state: 'running' }, discovery: 'ok', now }), null,
+    'nothing changes, so nothing is written — and no further miss is counted');
+  // With nothing saying it is alive, the third confirmed absence still fails it.
+  assert.equal(obligations.decide(old, { job: null, discovery: 'ok', now }).state, 'failed');
+});
+
+test('misses have to be consecutive, not merely three', () => {
+  const now = Date.now();
+  let record = pending({ state: 'awaiting-verdict', at: new Date(now - 30 * 60e3).toISOString() });
+  for (let n = 0; n < 5; n += 1) {
+    // Alternating: a read that failed, then one that succeeded.
+    record = obligations.applied(record, obligations.decide(record, { job: null, discovery: 'ok', now }), now);
+    assert.equal(record.state, 'awaiting-verdict', 'a single miss never fails it');
+    const cleared = obligations.decide(record, { job: { status: 'completed' }, now });
+    assert.deepEqual(cleared, { state: 'awaiting-verdict', misses: 0, note: '' }, 'a job that answered clears the count');
+    record = obligations.applied(record, cleared, now);
+    assert.equal('misses' in record, false);
+  }
+});
+
+test('an undated record ages out instead of counting misses forever', () => {
+  const now = Date.now();
+  let undated = pending({ at: 'not a date', stateAt: 'not a date either' });
+  // Reading an unreadable `at` as "opened just now" kept the record inside its own
+  // grace forever: a miss counted and the file rewritten every five minutes, with no
+  // sweep ever reaching the confirmation that ends it.
+  for (let n = 1; n < obligations.MISSING_JOB_CONFIRMATIONS; n += 1) {
+    const touch = obligations.decide(undated, { job: null, discovery: 'ok', now });
+    assert.equal(touch.misses, n);
+    undated = obligations.applied(undated, touch, now);
+  }
+  assert.equal(obligations.decide(undated, { job: null, discovery: 'ok', now }).state, 'failed');
+});
+
+test('a review record written before the obligation existed is not its verdict', () => {
+  const now = Date.now();
+  const record = pending();
+  const early = { id: 'rev-0', job: 'job-42', verdict: 'clean', at: new Date(now - 4 * HOUR).toISOString() };
+  assert.equal(obligations.decide(record, { job: { status: 'completed' }, reviewRecords: [early], now }).state,
+    'awaiting-verdict', 'the same job id registered twice must not arrive pre-satisfied');
+  const answer = { id: 'rev-1', job: 'job-42', verdict: 'clean', at: new Date(now).toISOString() };
+  assert.equal(obligations.decide(record, { job: { status: 'completed' }, reviewRecords: [answer], now }).state, 'satisfied');
+});
+
+test('an announcement that could not be delivered is retried until it lands', () => {
+  const box = fixture();
+  try {
+    box.write('a-card', [pending()]);
+    let failing = true;
+    const landed = [];
+    const deps = {
+      root: box.root,
+      withLock: nolock,
+      resolveJob: () => ({ status: 'completed' }),
+      readReviews: () => [],
+      checkinTask: (id, payload) => {
+        if (failing) throw new Error('the registry lock is held');
+        landed.push(payload);
+      },
+    };
+    const first = obligations.settle(deps);
+    assert.equal(first.settled.length, 1);
+    assert.equal(first.announced, 0);
+    assert.match(first.errors[0], /could not record the awaiting-verdict review/);
+    assert.equal(box.read('a-card')[0].state, 'awaiting-verdict');
+    assert.equal(box.read('a-card')[0].announce, true, 'the card still owes a check-in');
+
+    // The next sweep decides nothing new — and still delivers the notice.
+    failing = false;
+    const second = obligations.settle(deps);
+    assert.deepEqual(second.settled, []);
+    assert.equal(second.announced, 1);
+    assert.equal(landed[0].heading, 'review pending');
+    assert.equal('announce' in box.read('a-card')[0], false, 'and the debt is cleared once it lands');
+
+    const third = obligations.settle(deps);
+    assert.equal(third.announced, 0, 'not announced twice');
+  } finally { box.cleanup(); }
+});
+
+test('a debt cleared by a state that earns no check-in is not chased forever', () => {
+  const box = fixture();
+  try {
+    box.write('a-card', [{ ...pending(), announce: true }]);
+    const deps = {
+      root: box.root, withLock: nolock,
+      resolveJob: () => ({ status: 'completed' }),
+      readReviews: () => [{ id: 'rev-1', job: 'job-42', verdict: 'clean', at: new Date().toISOString() }],
+      checkinTask: () => { throw new Error('nothing should be announced'); },
+    };
+    const result = obligations.settle(deps);
+    assert.equal(result.settled[0].state, 'satisfied');
+    assert.equal(result.announced, 0);
+    assert.deepEqual(result.errors, []);
+    assert.equal('announce' in box.read('a-card')[0], false, 'satisfied earns no check-in, so it owes none');
+  } finally { box.cleanup(); }
+});
+
+test('a card whose obligations are all terminal is eventually retired by the sweep', () => {
+  const box = fixture();
+  const now = Date.now();
+  try {
+    // Written the way a sweep months ago left it: writeRecords itself would prune this
+    // on the way in, which is exactly why nothing ever retired the file — no writer
+    // came back to this card again.
+    fs.mkdirSync(obligations.obligationsDir(box.root), { recursive: true });
+    fs.writeFileSync(obligations.cardFile('a-card', box.root),
+      JSON.stringify([pending({ state: 'satisfied', stateAt: new Date(now - 60 * DAY).toISOString() })]));
+    assert.equal(fs.existsSync(obligations.cardFile('a-card', box.root)), true);
+    const result = obligations.settle({
+      root: box.root, now, withLock: nolock,
+      resolveJob: () => { throw new Error('no open obligation should need a job'); },
+      readReviews: () => [],
+      checkinTask: () => { throw new Error('nothing to announce'); },
+    });
+    assert.equal(result.considered, 0);
+    assert.deepEqual(result.errors, []);
+    assert.equal(fs.existsSync(obligations.cardFile('a-card', box.root)), false);
+  } finally { box.cleanup(); }
+});
+
+test('the land gate names a corrupt store instead of an imaginary obligation', () => {
+  const commits = [commit('a'.repeat(40), 'p1')];
+  const verdict = allow.decideLand({
+    records: [], commits,
+    obligations: [{ unreadable: true, card: 'a-card', why: 'the pending reviews for a-card are not readable JSON' }],
+  });
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.why, /the pending reviews for a-card could not be read/);
+  assert.match(verdict.why, /repair or remove \.keep\/review-obligations\/<card>\.json/);
+  assert.doesNotMatch(verdict.why, /keep reviewed --job/, 'no recovery command that cannot work');
+});

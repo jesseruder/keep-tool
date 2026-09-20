@@ -265,6 +265,17 @@ function decideLand({ grants = [], records = [], commits = [], obligations = [],
   const outstanding = (obligations || []).filter((record) => record && record.outstanding !== false);
   if (outstanding.length) {
     const first = outstanding[0];
+    // A store Keep could not read is not an obligation, and must not be answered with
+    // an obligation's recovery commands.
+    if (first.unreadable) {
+      return {
+        ok: false,
+        implicit: true,
+        why: `no land grant, and the pending reviews for ${first.card || 'this card'} could not be read: ${first.why}`
+          + ' — repair or remove .keep/review-obligations/<card>.json, then run this again',
+        obligation: first,
+      };
+    }
     return {
       ok: false,
       implicit: true,

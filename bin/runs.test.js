@@ -1006,7 +1006,7 @@ test('a check session that dies without a result is reopened on a later tick', (
 // ---------- bounding a deferral streak ----------
 
 const {
-  handleBudgetDeferral, checksFallbackAccountId, setOpener,
+  handleBudgetDeferral, checksFallbackAccountId, setOpener, MAX_FALLBACK_ATTEMPTS,
 } = require('./runs.js');
 
 test('a check deferred a second day escalates once instead of deferring forever', async () => {
@@ -1202,4 +1202,51 @@ test('an open that fails gives its slot back', async () => {
     });
     assert.equal(after.skipped, undefined, 'four failed opens did not spend the tick');
   } finally { _resetSchedulerState(); }
+});
+
+test('a refund from a previous tick does not hand this tick a free slot', async () => {
+  _resetSchedulerState();
+  try {
+    const cardFor = (id) => { const t = card(); t.id = id; return t; };
+    const budget = { code: 0 };
+    const refusal = (t, today, accountId) => freshOpenRefusal(t, today, accountId, { checkBudget: () => budget });
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    // A probe callback reserves an open near the end of a tick and its opener rejects
+    // during the next one.
+    const late = openFreshCheckSession(cardFor('late'), {
+      today: '2026-09-16', refusal, open: async () => { await gate; throw new Error('boom'); },
+    });
+    resetTickAllowance();
+    const opened = [];
+    const open = async (body) => { opened.push(body.taskId); return { ok: true, sessionId: 'sid', pane: 'p' }; };
+    for (const id of ['a', 'b', 'c']) {
+      await openFreshCheckSession(cardFor(id), { today: '2026-09-16', refusal, open });
+    }
+    release();
+    await assert.rejects(late);
+    const extra = await openFreshCheckSession(cardFor('d'), { today: '2026-09-16', refusal, open });
+    assert.equal(extra.skipped, 'tick-cap', 'the old tick\'s refund belongs to the old tick');
+    assert.deepEqual(opened, ['a', 'b', 'c']);
+  } finally { _resetSchedulerState(); }
+});
+
+test('a fallback host that is never available still reaches a stalled record', async () => {
+  _resetSchedulerState();
+  setOpener(async () => { throw new Error('terminal host is unavailable'); });
+  try {
+    const task = card();
+    const landed = [];
+    const deps = { checkinTask: (id, payload) => landed.push(payload), fallbackAccountId: 'claude-secondary' };
+    await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-16', deps);
+    for (let n = 0; n < MAX_FALLBACK_ATTEMPTS - 1; n += 1) {
+      const held = await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-17', deps);
+      assert.equal(held.escalated, false, `retry ${n + 1} is still worth trying`);
+    }
+    const done = await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-17', deps);
+    assert.equal(done.escalated, true, 'a host unavailable for three escalations is not transient');
+    assert.equal(landed.at(-1).heading, 'check stalled');
+    assert.match(landed.at(-1).message, /attempts failed/);
+    assert.equal(loadSchedulerState().deferred.get('some-card').escalated, true);
+  } finally { setOpener(null); _resetSchedulerState(); }
 });

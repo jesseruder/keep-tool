@@ -53,12 +53,12 @@ test('the exhaustion ledger expires by itself', () => {
   const box = fixture();
   const now = Date.now();
   try {
-    routing.markExhausted('codex-main', iso(now + 2 * HOUR), { root: box.root, now, note: 'weekly limit' });
-    routing.markExhausted('codex-secondary', iso(now - HOUR), { root: box.root, now: now - 3 * HOUR });
+    routing.markExhausted('codex-main', iso(now + 2 * HOUR), { root: box.root, now, note: 'weekly limit', withLock: (fn) => fn() });
+    routing.markExhausted('codex-secondary', iso(now - HOUR), { root: box.root, now: now - 3 * HOUR, withLock: (fn) => fn() });
     const live = routing.ledger(box.root, now);
     assert.deepEqual([...live.keys()], ['codex-main'], 'a window that has reset is not exhaustion');
     assert.equal(live.get('codex-main').note, 'weekly limit');
-    assert.equal(routing.clearExhausted('codex-main', { root: box.root, now }), true);
+    assert.equal(routing.clearExhausted('codex-main', { root: box.root, now, withLock: (fn) => fn() }), true);
     assert.equal(routing.ledger(box.root, now).size, 0);
   } finally { box.cleanup(); }
 });
@@ -67,7 +67,7 @@ test('routing prefers an available Codex account and names the exhausted ones', 
   const box = fixture({ fallback: 'opus' });
   const now = Date.now();
   try {
-    routing.markExhausted('codex-main', iso(now + HOUR), { root: box.root, now });
+    routing.markExhausted('codex-main', iso(now + HOUR), { root: box.root, now, withLock: (fn) => fn() });
     const decision = routing.route({ root: box.root, now, accounts: accounts('codex-main', 'codex-secondary') });
     assert.equal(decision.reviewer, 'codex');
     assert.equal(decision.accountId, 'codex-secondary');
@@ -79,8 +79,8 @@ test('routing prefers an available Codex account and names the exhausted ones', 
 test('a fallback is only taken when every Codex account is exhausted and one is configured', () => {
   const now = Date.now();
   const both = (root) => {
-    routing.markExhausted('codex-main', iso(now + HOUR), { root, now });
-    routing.markExhausted('codex-secondary', iso(now + 2 * HOUR), { root, now });
+    routing.markExhausted('codex-main', iso(now + HOUR), { root, now, withLock: (fn) => fn() });
+    routing.markExhausted('codex-secondary', iso(now + 2 * HOUR), { root, now, withLock: (fn) => fn() });
   };
   const configured = fixture({ fallback: 'opus' });
   try {
@@ -112,15 +112,23 @@ test('an install with no Codex account says so rather than claiming a fallback',
   } finally { box.cleanup(); }
 });
 
-test('the fallback reason describes the ledger, and is empty when nothing is exhausted', () => {
+test('the fallback reason describes the ledger, and only the accounts reviews are routed to', () => {
   const now = Date.now();
   const box = fixture({ fallback: 'opus' });
+  const routed = { root: box.root, now, codexAccounts: ['codex-main', 'codex-secondary'] };
+  const lock = { withLock: (fn) => fn() };
   try {
-    assert.equal(routing.fallbackReason({ root: box.root, now }), '', 'nothing exhausted, nothing to describe');
-    routing.markExhausted('codex-main', iso(now + 2 * HOUR), { root: box.root, now, withLock: (fn) => fn() });
-    routing.markExhausted('codex-secondary', iso(now + HOUR), { root: box.root, now, withLock: (fn) => fn() });
-    assert.equal(routing.fallbackReason({ root: box.root, now }), `codex exhausted until ${iso(now + HOUR)}`,
-      'the earliest reset is the one the card is waiting on');
+    assert.equal(routing.fallbackReason(routed), '', 'nothing exhausted, nothing to describe');
+    routing.markExhausted('codex-main', iso(now + 2 * HOUR), { ...routed, ...lock });
+    routing.markExhausted('codex-secondary', iso(now + HOUR), { ...routed, ...lock });
+    assert.equal(routing.fallbackReason(routed), `codex exhausted until ${iso(now + HOUR)} as recorded`,
+      'the earliest reset is the one the card is waiting on, and it says when it was observed');
+
+    // An account this install does not route reviews to says nothing about a fallback.
+    routing.clearExhausted('codex-main', { ...routed, ...lock });
+    routing.clearExhausted('codex-secondary', { ...routed, ...lock });
+    routing.markExhausted('codex-retired', iso(now + HOUR), { ...routed, ...lock });
+    assert.equal(routing.fallbackReason(routed), '');
   } finally { box.cleanup(); }
 });
 
@@ -202,9 +210,11 @@ test('a fallback stamp is the session asserting it, not the ledger guessing at r
     const claimed = reviews.buildRecord({ ...input, fallback: true }, gitDeps, { root: box.root });
     assert.equal(claimed.route, 'fallback', 'the claim stands on its own with an empty ledger');
 
-    routing.markExhausted('codex-main', iso(now + HOUR), { root: box.root, now, withLock: (fn) => fn() });
+    const registered = routing.codexAccounts(box.root)[0];
+    assert.ok(registered, 'the test registry has a built-in Codex account');
+    routing.markExhausted(registered, iso(now + HOUR), { root: box.root, now, withLock: (fn) => fn() });
     const described = reviews.buildRecord({ ...input, fallback: true }, gitDeps, { root: box.root });
-    assert.match(described.route, /^fallback \(codex exhausted until /);
+    assert.match(described.route, /^fallback \(codex exhausted until .* as recorded\)$/);
     assert.match(reviews.logLine(described), /reviewer: fallback \(codex exhausted until /);
   } finally { box.cleanup(); }
 });

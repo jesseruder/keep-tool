@@ -1401,7 +1401,11 @@ function formatAllow(task) {
 function readObligations(taskId, records, commits, api) {
   try { return api.outstandingFor(api.readRecords(taskId), records, commits); }
   catch (error) {
-    return [{ id: '(unreadable)', job: '(unknown)', accountId: '', state: String(error.message || error) }];
+    // Marked `unreadable`, not dressed up as an obligation: its id and job would
+    // otherwise appear in --json and in the refusal as commands to run, and neither
+    // recording a verdict for job "(unknown)" nor dropping "(unreadable)" repairs a
+    // corrupt store.
+    return [{ unreadable: true, card: taskId, why: String(error.message || error) }];
   }
 }
 
@@ -1655,7 +1659,10 @@ commands.reviewing = (argv) => {
       card: id, job: o.job, accountId: o.account || job.accountId, by: o.by,
       commits, note: o.m, session: commandSession(),
     });
-    return obligations.append(id, built);
+    // Under the registry lock, like every other writer of this file: the daemon's
+    // sweep reads and rewrites it every five minutes, and an unlocked append is how a
+    // brand-new gate disappears under the sweep's older copy.
+    return withLock(() => obligations.append(id, built));
   });
   if (o.json) return console.log(JSON.stringify(record, null, 2));
   console.log(`${id}: waiting on review job ${record.job}${record.accountId ? ` (${record.accountId})` : ''} over ${record.commits.length} commit(s)`);

@@ -315,6 +315,9 @@ function landDeliveryWarning(task, delivery) {
 // as fifty commits.
 const MAX_FRESH_OPENS_PER_TICK = 3;
 const MAX_DEFERRAL_NOTICES_PER_TICK = 3;
+// How many times a deferral escalation may be retried on a transient failure before the
+// card gets its stalled record anyway.
+const MAX_FALLBACK_ATTEMPTS = 3;
 // The model a scheduled check runs as. Unset means the launched session takes the model
 // in settings.json, and the budget is classified against the reviewer's model as a
 // proxy. Set it and BOTH move together — the pane is launched with it and the budget is
@@ -516,9 +519,17 @@ async function escalateBudgetDeferral(task, reason, today, opts = {}) {
       process.stderr.write(`keep runs: fallback check session for ${task.id} could not be opened: ${e.message}\n`);
       // A terminal host that was restarting, or an open already in flight, says nothing
       // about the fallback account. Latching the streak on it would spend the card's one
-      // escalation on a condition that clears by itself a minute later.
-      if (isTransientStartError(e)) return false;
-      outcome = { skipped: 'error', reason: String(e && e.message || e) };
+      // escalation on a condition that clears by itself a minute later — but a host that
+      // has been "temporarily" unavailable for three escalations running is not
+      // transient, and retrying every tick forever is the silence this ceiling exists to
+      // stop. The count is on the streak, so it survives a restart.
+      if (isTransientStartError(e)) {
+        const state = loadSchedulerState();
+        const tries = checkDeferrals.countAttempt(state.deferred, task.id);
+        saveSchedulerState(today);
+        if (tries < MAX_FALLBACK_ATTEMPTS) return false;
+        outcome = { skipped: 'error', reason: `${tries} attempts failed, last: ${String(e && e.message || e)}` };
+      } else outcome = { skipped: 'error', reason: String(e && e.message || e) };
     }
     if (!outcome.skipped) {
       process.stderr.write(`keep runs: check for ${task.id} opened on the fallback account ${fallbackId}\n`);
@@ -583,7 +594,12 @@ async function budgetDeferral(task, reason, today, opts = {}) {
 // because a probe escalation runs from an async probe callback that may land between
 // ticks and must spend from the same allowance.
 let freshOpensThisTick = 0;
-function resetTickAllowance() { freshOpensThisTick = 0; }
+// Which tick the current allowance belongs to. A probe callback can reserve an open at
+// the end of one tick and have its opener reject during the next; without an identity,
+// that refund would hand a slot back to a tick that never spent one, and the scheduler
+// could launch four sessions in a tick capped at three.
+let allowanceTick = 0;
+function resetTickAllowance() { freshOpensThisTick = 0; allowanceTick += 1; }
 
 // Everything that can refuse an open before one is attempted, in one place so the
 // scheduler path and the probe-escalation path cannot drift apart.
@@ -628,7 +644,9 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
   // Reserved before the await, not counted after it. Opening a session is async, and
   // two cards whose opens overlap — a scheduler card and a probe escalation, now a
   // deferral's fallback too — both read the allowance before either spent it, and the
-  // tick launched more panes than the cap allows. A failed open gives its slot back.
+  // tick launched more panes than the cap allows. A failed open gives its slot back to
+  // the tick it took it from, and to no other.
+  const reservedIn = allowanceTick;
   if (enforce) freshOpensThisTick += 1;
   let opened;
   try {
@@ -641,7 +659,7 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
       message: checkDeliveryMessage(task, { probe: opts.probe }),
     }, {});
   } catch (error) {
-    if (enforce) freshOpensThisTick = Math.max(0, freshOpensThisTick - 1);
+    if (enforce && reservedIn === allowanceTick) freshOpensThisTick = Math.max(0, freshOpensThisTick - 1);
     throw error;
   }
   if (!enforce) freshOpensThisTick += 1;
@@ -1179,7 +1197,7 @@ module.exports = {
   retryPending, startScheduler, schedulerTick, setOnChange, setDeliverer, setOpener, setEphemeralHost,
   openFreshCheckSession, checksAccountId, checkBudget, budgetDeferralReason, noteBudgetDeferral,
   checksFallbackAccountId, recordBudgetDeferral, clearBudgetDeferral, noteStalledCheck,
-  escalateBudgetDeferral, handleBudgetDeferral,
+  escalateBudgetDeferral, handleBudgetDeferral, MAX_FALLBACK_ATTEMPTS,
   freshOpenRefusal, resetTickAllowance, loadSchedulerState, releaseUnfinishedCheck,
   readDeliveryStamp, writeDeliveryStamp, readRawDeliveryStamp, stampExpired, checkinFromSessionAt,
   reapEphemeralPane, sweepEphemeralPanes, MAX_FRESH_OPENS_PER_TICK, MAX_DEFERRAL_NOTICES_PER_TICK,

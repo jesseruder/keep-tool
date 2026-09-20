@@ -29,11 +29,19 @@ function entryFrom(value) {
   const since = typeof value.since === 'string' ? value.since : '';
   if (!since || timeMs(since) === null) return null;
   const notices = Number(value.notices);
+  const tries = Number(value.tries);
+  // `lastDay` decides retention, so it is validated rather than trusted: a malformed
+  // value would fall back to a `since` that can prune a still-active streak, and a
+  // value in the future would keep a dead one for millennia.
+  const day = typeof value.lastDay === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value.lastDay)
+    && timeMs(value.lastDay) !== null && timeMs(value.lastDay) <= Date.now() + 2 * 86400e3
+    ? value.lastDay : '';
   return {
     checkAfter: typeof value.checkAfter === 'string' ? value.checkAfter : '',
     since,
-    lastDay: typeof value.lastDay === 'string' ? value.lastDay : '',
+    lastDay: day,
     notices: Number.isFinite(notices) && notices > 0 ? Math.trunc(notices) : 0,
+    ...(Number.isFinite(tries) && tries > 0 ? { tries: Math.trunc(tries) } : {}),
     escalated: value.escalated === true,
     reason: typeof value.reason === 'string' ? value.reason.slice(0, 400) : '',
   };
@@ -94,6 +102,18 @@ function escalationDue(entry, now = Date.now()) {
     || (since !== null && now - since >= ESCALATE_AFTER_MS);
 }
 
+// How many times the fallback open has been attempted for this streak. A transient
+// failure is worth retrying; a host that has been "temporarily" unavailable for three
+// escalations running is not transient, and the card deserves the stalled record rather
+// than a retry every tick forever.
+function countAttempt(map, taskId) {
+  const entry = map.get(taskId);
+  if (!entry) return 0;
+  entry.tries = (Number(entry.tries) || 0) + 1;
+  map.set(taskId, entry);
+  return entry.tries;
+}
+
 function markEscalated(map, taskId) {
   const entry = map.get(taskId);
   if (!entry) return null;
@@ -132,5 +152,5 @@ function describe(entry, checkAfter, now = Date.now()) {
 
 module.exports = {
   ESCALATE_AFTER_NOTICES, ESCALATE_AFTER_MS, RETENTION_MS,
-  timeMs, parse, serialize, note, escalationDue, markEscalated, clear, stateFile, read, describe,
+  timeMs, parse, serialize, note, escalationDue, countAttempt, markEscalated, clear, stateFile, read, describe,
 };

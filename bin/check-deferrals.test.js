@@ -171,3 +171,31 @@ test('an actively deferring streak is never pruned out from under its own escala
   deferrals.serialize(map, base + 60 * DAY);
   assert.equal(map.has('a-card'), false);
 });
+
+test('a malformed or future lastDay cannot make an entry immortal or prune a live one', () => {
+  const base = Date.parse('2026-09-16T18:17:00Z');
+  // A future value would keep a dead entry for millennia; it is dropped, and the entry
+  // falls back to its own start date for retention.
+  const future = deferrals.parse({ zombie: { since: stampAt(base - 30 * DAY), lastDay: '9999-12-31', checkAfter: 'x' } });
+  assert.equal(future.get('zombie').lastDay, '');
+  deferrals.serialize(future, base);
+  assert.equal(future.has('zombie'), false);
+
+  // A malformed value is likewise not trusted, and the next note() repairs it.
+  const malformed = deferrals.parse({ live: { since: stampAt(base - 30 * DAY), lastDay: 'yesterday', checkAfter: 'x' } });
+  assert.equal(malformed.get('live').lastDay, '');
+  deferrals.note(malformed, 'live', { checkAfter: 'x', stamp: stampAt(base), today: stampAt(base).slice(0, 10) });
+  deferrals.serialize(malformed, base);
+  assert.equal(malformed.has('live'), true, 'a streak that deferred today is not history');
+});
+
+test('fallback attempts are counted on the streak so a restart does not reset them', () => {
+  const base = Date.parse('2026-09-16T18:17:00Z');
+  const map = new Map();
+  assert.equal(deferrals.countAttempt(map, 'missing'), 0, 'no streak, nothing to count');
+  deferrals.note(map, 'a-card', { checkAfter: 'x', stamp: stampAt(base), today: '2026-09-16' });
+  assert.equal(deferrals.countAttempt(map, 'a-card'), 1);
+  assert.equal(deferrals.countAttempt(map, 'a-card'), 2);
+  const back = deferrals.parse(JSON.parse(JSON.stringify(deferrals.serialize(map, base))));
+  assert.equal(back.get('a-card').tries, 2);
+});

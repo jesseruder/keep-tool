@@ -178,10 +178,19 @@ function route(options = {}) {
 // recorded, so `keep reviewed --fallback` is what decides, and this only says what the
 // exhaustion was when anything is still on record.
 function fallbackReason(options = {}) {
-  const exhausted = options.ledger || ledger(options.root || keep.ROOT, options.now || Date.now());
+  const root = options.root || keep.ROOT;
+  const now = options.now || Date.now();
+  const exhausted = options.ledger || ledger(root, now);
   if (!exhausted.size) return '';
-  const until = [...exhausted.values()].map((entry) => entry.until).sort()[0];
-  return until ? `codex exhausted until ${until}` : 'codex exhausted';
+  // Only the accounts this install actually routes reviews to, and only what the ledger
+  // says *now*. A window that has already reset and been replaced by another one would
+  // otherwise be described with the new window's reset time, so the sentence says when
+  // it was observed rather than implying it is when the review ran.
+  const routed = new Set(options.codexAccounts || codexAccounts(root, options));
+  const live = [...exhausted.entries()].filter(([id]) => !routed.size || routed.has(id));
+  if (!live.length) return '';
+  const until = live.map(([, entry]) => entry.until).sort()[0];
+  return until ? `codex exhausted until ${until} as recorded` : 'codex exhausted';
 }
 
 function describe(decision) {

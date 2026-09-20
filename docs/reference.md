@@ -1054,12 +1054,16 @@ keeps warm:
 | no job file, on three consecutive sweeps, 15 minutes after the obligation was opened | `failed` |
 | still running after six hours, or `awaiting-verdict` for six hours | `abandoned` |
 
-"I could not look" is never evidence. `resolveJob` answers null for an unreadable jobs
-directory and a half-written job file as well as for a job that is gone, so a missing job
-has to be missing on three consecutive sweeps before it fails, and a companion whose
-discovery is `partial` or `unknown` — or a jobs directory that throws — leaves the
-obligation exactly where it is. Only the six-hour ceiling applies in that state, so an
-unreadable companion cannot block a card forever either.
+"I could not look" is never evidence. Three readers can each fail to see a job: the
+companion's discovery, the jobs directory, and the job file itself. A missing job has to
+be missing on three **consecutive** sweeps before it fails — any answer from the job
+clears the count — and it is not counted at all while the companion's discovery is
+`partial` or `unknown`, while the jobs directory throws, or while the live sweep still
+shows a row for that job. A live row is the strongest of the three: if the companion can
+see the process, an unreadable job file says nothing about whether it is running. Only
+the six-hour ceiling applies in that state, so an unreadable companion cannot block a
+card forever either. A record with no readable `at` is treated as undated rather than as
+just-opened, so it ages out instead of counting a miss every five minutes forever.
 
 Two properties hold. **Nothing here ever writes a verdict**: a job that died fails the
 obligation so the review is re-run, and is never mistaken for a clean one. And every
@@ -1067,14 +1071,20 @@ obligation reaches a terminal state on its own, so a job that died in the night 
 block a card forever — `failed` and `abandoned` stop gating the land, and the commits
 are then refused for the ordinary reason, that they have no review record.
 
-The sweep writes each transition **before** it announces it, under the registry lock,
-re-reading and replacing only records that still look exactly as they did when it
-decided: a check-in is a git commit, so a transition announced but not written would be
-announced every five minutes forever, and a `keep reviewing --drop` that landed in the
-window owns its record. A file that exists but cannot be read is an error, never an empty
-list — failing open there would let a land through as if no review were outstanding, and
-an append would overwrite the history it could not read. Terminal records age out after
-30 days, and a card whose last record ages out loses its file.
+The sweep writes each transition **before** it announces it, and **every** writer of the
+file — the sweep, `keep reviewing`'s append, its `--drop`, and `keep reviewed`'s settle —
+goes through the registry lock, re-reading and replacing only records that still look
+exactly as they did when it decided. A check-in is a git commit, so a transition
+announced but not written would be announced every five minutes forever; a transition
+written but not announced carries an `announce` flag and is **retried on later sweeps
+until the check-in lands**, so delivery is durable rather than at-most-once.
+
+A file that exists but cannot be read is an error, never an empty list — failing open
+there would let a land through as if no review were outstanding, and an append would
+overwrite the history it could not read. `keep allow <card> land` then refuses naming the
+store, not an imaginary obligation. Terminal records age out after 30 days; a card whose
+last record ages out loses its file, and the sweep is what retires it, because nothing
+else would ever write to that card again.
 
 While an obligation is `open` or `awaiting-verdict` and covers a commit in
 `origin/<default>..HEAD`, `keep allow <card> land` exits 3 naming the job. That is the
@@ -1125,8 +1135,10 @@ asserts it**; it is not inferred from the ledger when the record is written. Inf
 read the wrong clock in both directions: a review that ran while Codex was exhausted lost
 the stamp if it was recorded after the reset, and an ordinary review picked one up if an
 account happened to be exhausted by the time it was written. The ledger is still
-consulted, but only to say what the exhaustion was — with an empty ledger the stamp is
-the bare word `fallback`. A fallback record clears the same attestation bar as any other:
+consulted, but only to say what the exhaustion was — and only for the accounts this
+install routes reviews to, phrased `as recorded` because the window it names is the one
+standing when the record was written. With an empty ledger the stamp is the bare word
+`fallback`. A fallback record clears the same attestation bar as any other:
 an `opus`/`claude` clean record needs a verified `--job` or 80+ characters of
 `--evidence`.
 
@@ -2178,7 +2190,11 @@ or 24 hours after the first deferral, the streak escalates exactly once:
 After escalating, the card stops writing the daily `check deferred` note — the stalled
 record and the `keep overdue` annotation carry it. A refusal that is the scheduler's own
 bookkeeping (the per-day open, the per-tick cap) does not latch the escalation; it is
-retried on a later tick. Escalations share the per-tick notice ceiling, and one held back
+retried on a later tick, and so is a transient launch failure — but only three times, so
+a host that has been "temporarily" unavailable for three escalations running still gets
+the card its stalled record. The per-tick open allowance is reserved before the open
+rather than counted after it, and a refund belongs to the tick that made the
+reservation. Escalations share the per-tick notice ceiling, and one held back
 by it keeps its unlatched streak for the next tick. The streak lives in the `deferred`
 bucket of `.keep/runs/scheduler-state.json` and is pruned after a fortnight. `KEEP_CHECK_MODEL`, when set, is both the model the opened
 session is launched with and the model the budget is classified against, so the window
