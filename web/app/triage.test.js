@@ -52,6 +52,169 @@ const LOUD_ROW = {
   unseen: { count: 1, needsYou: true },
 };
 
+test('client and project filters combine for session, pane-only, and agent rows', async () => {
+  const { matchesTriageFilters, matchesAgentTriageFilters } = await import('./triage.js');
+  const ctx = ctxFor({
+    sessions: [
+      { id: 'claude-a', kind: 'claude', project: '/work/a', pane: 'pane-a' },
+      { id: 'codex-a', kind: 'codex', project: '/work/a', pane: 'pane-b' },
+      { id: 'codex-b', kind: 'codex', project: '/work/b', pane: 'pane-c' },
+    ],
+    panes: [
+      { id: 'pane-a', meta: { agent: 'claude', project: '/work/a' } },
+      { id: 'pane-b', meta: { agent: 'codex', project: '/work/a' } },
+      { id: 'pane-c', meta: { agent: 'codex', project: '/work/b' } },
+      { id: 'pane-only', meta: { agent: 'codex', project: '/work/a' } },
+      { id: 'shell', meta: { agent: 'shell', project: '/work/a' } },
+    ],
+  });
+  ctx.projectOf = (path) => ({ key: path });
+  const rows = [
+    { kind: 'question', sessionId: 'claude-a', project: '/work/a' },
+    { kind: 'running', sessionId: 'codex-a', pane: 'pane-b', project: '/work/a' },
+    { kind: 'pinned', sessionId: 'codex-b', pane: 'pane-c', project: '/work/b' },
+    { kind: 'recent', sessionId: 'codex-a', pane: 'pane-b', project: '/work/a' },
+    { kind: 'dismissed', pane: 'pane-only', project: '/work/a' },
+    { kind: 'running', pane: 'shell', project: '/work/a' },
+  ];
+  const ids = () => rows.filter((row) => matchesTriageFilters(ctx, row)).map((row) => row.kind);
+  assert.deepEqual(ids(), ['question', 'running', 'pinned', 'recent', 'dismissed', 'running']);
+  ctx.state.filter = '/work/a';
+  ctx.state.providerFilter = 'codex';
+  assert.deepEqual(ids(), ['running', 'recent', 'dismissed'], 'every section uses both filters; shells have no selected client');
+  ctx.state.providerFilter = null;
+  assert.deepEqual(ids(), ['question', 'running', 'recent', 'dismissed', 'running'], 'All clients preserves the project');
+  ctx.state.filter = null;
+  ctx.state.providerFilter = 'claude';
+  assert.deepEqual(ids(), ['question'], 'All projects preserves the client');
+
+  const agents = [
+    { session: { id: 'claude-a', pane: 'pane-a' } },
+    { session: { id: 'codex-b', pane: 'pane-c' } },
+    { session: { id: 'missing', pane: 'pane-only' } },
+    { session: { id: 'missing', pane: 'missing' } },
+  ];
+  assert.deepEqual(agents.map((agent) => matchesAgentTriageFilters(ctx, agent)), [true, false, false, false]);
+  ctx.state.providerFilter = 'codex';
+  ctx.state.filter = '/work/a';
+  assert.deepEqual(agents.map((agent) => matchesAgentTriageFilters(ctx, agent)), [false, false, true, false],
+    'pane metadata resolves an agent with no session record');
+  ctx.state.filter = null;
+  ctx.state.providerFilter = null;
+  assert.equal(agents.every((agent) => matchesAgentTriageFilters(ctx, agent)), true,
+    'All clients keeps unresolved agents');
+});
+
+test('changing client drops a selected agent that is now hidden', async () => {
+  const { queueSelection } = await import('./triage.js');
+  const ctx = ctxFor({
+    sessions: [{ id: 'agent-sid', kind: 'claude', project: '/work/a', pane: 'agent-pane' }],
+    panes: [{ id: 'agent-pane', meta: { agent: 'claude', project: '/work/a' } }],
+    agents: [{ name: 'sandboxes', session: { id: 'agent-sid', pane: 'agent-pane' } }],
+  });
+  ctx.projectOf = (path) => ({ key: path });
+  ctx.state.providerFilter = 'codex';
+  const visible = { kind: 'running', sessionId: 'codex-sid', project: '/work/a' };
+  const selection = queueSelection(ctx, [visible], {
+    current: { kind: 'running', sessionId: 'agent-sid', pane: 'agent-pane', project: '/work/a' },
+    selectedKey: null,
+  });
+  assert.equal(selection.agent, null);
+  assert.equal(selection.stageItem, visible);
+});
+
+test('Recent limits after filtering so older matching clients remain reachable', async () => {
+  const fs = await import('node:fs');
+  const vm = await import('node:vm');
+  const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  const recent = source.slice(source.indexOf('function recentItems('), source.indexOf('function matchesTriageFilter('));
+  const sessions = [
+    ...Array.from({ length: 7 }, (_, index) => ({ id: `claude-${index}`, kind: 'claude', project: '/work/a',
+      state: 'exited', exited: true, lastUserAt: 100 - index })),
+    { id: 'codex-a', kind: 'codex', project: '/work/a', state: 'exited', exited: true, lastUserAt: 50 },
+    { id: 'codex-b', kind: 'codex', project: '/work/b', state: 'exited', exited: true, lastUserAt: 40 },
+  ];
+  const context = vm.createContext({
+    data: { sessions }, state: { filter: null, providerFilter: 'codex' },
+    isClosingSession: () => false, projectOf: (path) => ({ key: path }),
+    recentSessionTime: (session) => session.lastUserAt,
+    sessionItem: (_kind, session) => ({ sessionId: session.id }),
+  });
+  vm.runInContext(recent, context);
+  assert.deepEqual(Array.from(context.recentItems(), (item) => item.sessionId), ['codex-a', 'codex-b']);
+  context.state.filter = '/work/b';
+  assert.deepEqual(Array.from(context.recentItems(), (item) => item.sessionId), ['codex-b']);
+});
+
+test('rail client controls remain separate from project controls when expanded or collapsed', async () => {
+  const { renderRail } = await import('./triage.js');
+  const previousDocument = globalThis.document;
+  const rail = {
+    classList: { toggle() {} },
+    _html: '', _buttons: {},
+    get innerHTML() { return this._html; },
+    set innerHTML(value) { this._html = value; this._buttons = {}; },
+    querySelector() { return { addEventListener() {} }; },
+    querySelectorAll(selector) {
+      const field = selector === '[data-client]' ? 'client' : 'project';
+      return this._buttons[field] ||= [...this.innerHTML.matchAll(new RegExp(`<button[^>]*data-${field}="([^"]*)"[^>]*>`, 'g'))]
+        .map((match) => ({ dataset: { [field]: match[1] }, addEventListener(_type, handler) { this.click = handler; } }));
+    },
+  };
+  globalThis.document = { querySelector: (selector) => selector === '#rail' ? rail : null };
+  try {
+    const ctx = ctxFor({ scopes: { names: ['personal'] } });
+    ctx.state = { filter: '/work/a', providerFilter: null, collapsed: { rail: false }, dismissed: new Set(), selected: 0 };
+    ctx.projectOf = (path) => ({ key: path, path, name: path.split('/').pop(), scope: 'personal' });
+    ctx.projectIcon = () => '<i></i>';
+    ctx.knownProjects = () => ['/work/a', '/work/b'].map(ctx.projectOf);
+    ctx.triageItems = () => [];
+    ctx.isMarkedRunning = () => false;
+    ctx.setSelected = () => {};
+    ctx.toggleCollapsed = () => {};
+    const rows = [{ kind: 'question', sessionId: 'one', project: '/work/a' },
+      { kind: 'question', sessionId: 'two', project: '/work/b' }];
+    renderRail(ctx, rows);
+    assert.match(rail.innerHTML, /Client/);
+    assert.ok(rail.innerHTML.indexOf('Client') > rail.innerHTML.indexOf('data-project="\/work\/b"'));
+    assert.ok(rail.innerHTML.indexOf('Client') < rail.innerHTML.indexOf('data-shell'));
+    assert.match(rail.innerHTML, /provider-claude/);
+    assert.match(rail.innerHTML, /provider-codex/);
+    renderRail(ctx, [rows[1]]);
+    assert.match(rail.innerHTML, /data-project="\/work\/a" class="on"/,
+      'a selected project remains visible when the client has no rows in it');
+    rail.querySelectorAll('[data-client]')[2].click();
+    assert.equal(ctx.state.providerFilter, 'codex');
+    assert.equal(ctx.state.filter, '/work/a');
+    renderRail(ctx, rows);
+    rail.querySelectorAll('[data-project]')[0].click();
+    assert.equal(ctx.state.filter, null);
+    assert.equal(ctx.state.providerFilter, 'codex');
+    ctx.state.collapsed.rail = true;
+    renderRail(ctx, rows);
+    assert.match(rail.innerHTML, /class="rail-clients" role="group" aria-label="Client"/);
+    assert.equal((rail.innerHTML.match(/data-client=/g) || []).length, 3);
+    rail.querySelectorAll('[data-client]')[0].click();
+    assert.equal(ctx.state.providerFilter, null);
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test('empty queue copy names active filters without claiming the global queue is clear', async () => {
+  const { emptyQueueHTML } = await import('./triage.js');
+  assert.match(emptyQueueHTML({ filter: null, providerFilter: null }), /Nothing waiting on you/);
+  for (const state of [
+    { filter: '/work/a', providerFilter: null },
+    { filter: null, providerFilter: 'codex' },
+    { filter: '/work/a', providerFilter: 'codex' },
+  ]) {
+    const html = emptyQueueHTML(state);
+    assert.match(html, /No sessions shown for these filters/);
+    assert.doesNotMatch(html, /Nothing waiting on you/);
+  }
+});
+
 test('the Agents group is built only when an agent exists', async () => {
   const { agentRowHTML, emptyStateCounts } = await import('./triage.js');
   const empty = ctxFor();

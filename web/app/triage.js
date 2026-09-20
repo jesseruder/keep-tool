@@ -50,6 +50,30 @@ export function hiddenFromRunning(session) {
   return Boolean(session?.reviewer || session?.agentName);
 }
 
+export function itemProvider(ctx, item) {
+  const session = ctx.sessionFor(item);
+  const pane = item?.pane ? ctx.paneMap().get(item.pane) : null;
+  const kind = session?.kind || pane?.meta?.agent || '';
+  return ['claude', 'codex', 'pi'].includes(kind) ? kind : '';
+}
+
+export function matchesTriageFilters(ctx, item) {
+  return (!ctx.state.filter || ctx.projectOf(item.project).key === ctx.state.filter)
+    && (!ctx.state.providerFilter || itemProvider(ctx, item) === ctx.state.providerFilter);
+}
+
+// Agent records name their session and pane, but do not carry a reliable client.
+// Resolve it from the same state used by ordinary rows. Unresolved agents still
+// appear under All; a selected client requires a known match.
+export function matchesAgentTriageFilters(ctx, agent) {
+  const session = (ctx.data.sessions || []).find((candidate) => candidate.id === agent.session?.id);
+  const pane = agent.session?.pane ? ctx.paneMap().get(agent.session.pane) : null;
+  const project = session?.project || pane?.meta?.project || pane?.cwd || '';
+  const provider = session?.kind || pane?.meta?.agent || '';
+  return (!ctx.state.filter || (Boolean(project) && ctx.projectOf(project).key === ctx.state.filter))
+    && (!ctx.state.providerFilter || provider === ctx.state.providerFilter);
+}
+
 export function agentLifecycleLabel(agent) {
   if (agent?.lifecycle === 'needs-you') return 'needs you';
   if (agent?.lifecycle === 'stopped') return 'stopped';
@@ -154,7 +178,8 @@ export function selectedRowItem(ctx, items, selectedKey) {
 // carries it until Owner selects that row by name, and then that row does.
 export function queueSelection(ctx, items, { current, selectedKey, fallback = 0, focusMode = false } = {}) {
   const chosen = selectedRowItem(ctx, items, selectedKey);
-  const agent = focusMode || chosen ? null : agentForStage(ctx, current, ctx.sessionFor(current));
+  const candidate = focusMode || chosen ? null : agentForStage(ctx, current, ctx.sessionFor(current));
+  const agent = candidate && matchesAgentTriageFilters(ctx, candidate) ? candidate : null;
   if (agent) return { agent, selected: -1, selectedKey: null, stageItem: agentStageItem(ctx, agent, current) };
   if (focusMode && !current) return { agent: null, selected: -1, selectedKey: null, stageItem: null };
   const selected = selectionIndex(items, selectedKey, current, fallback, ctx.itemKey, ctx.triageKey);
@@ -377,16 +402,17 @@ function shellProject(ctx) {
   // that is an agent - an agent has no row and no index - and only then the index.
   const items = ctx.triageItems();
   const current = ctx.state.currentItem;
+  const agent = agentForStage(ctx, current, ctx.sessionFor(current));
   const item = selectedRowItem(ctx, items, ctx.state.selectedKey)
-    || (agentForStage(ctx, current, ctx.sessionFor(current)) ? current : null)
-    || items[ctx.state.selected] || current;
+    || (agent && matchesAgentTriageFilters(ctx, agent) ? current : null)
+    || items[ctx.state.selected] || (current && matchesTriageFilters(ctx, current) ? current : null);
   const projectPath = item?.project || ctx.sessionFor(item)?.project;
   if (!projectPath) return fallback;
   const selected = ctx.projectOf(projectPath);
   return projects.find((project) => project.key === selected.key) || (selected.path.startsWith('/') ? selected : fallback);
 }
 
-function renderRail(ctx, items) {
+export function renderRail(ctx, items) {
   const rail = document.querySelector('#rail');
   const counted = [...new Map(items.filter((item) => item.kind === 'pinned'
     || (item.kind === 'running' && ctx.isMarkedRunning(item))
@@ -396,7 +422,7 @@ function renderRail(ctx, items) {
     const key = ctx.projectOf(item.project).key;
     counts.set(key, (counts.get(key) || 0) + 1);
   }
-  const projects = ctx.knownProjects().filter((project) => counts.has(project.key));
+  const projects = ctx.knownProjects().filter((project) => counts.has(project.key) || project.key === ctx.state.filter);
   const collapsed = ctx.state.collapsed.rail;
   const row = (project) => `<button data-project="${ctx.esc(project.key)}" class="${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}">${ctx.projectIcon(project)}<span>${ctx.esc(project.name)}</span><span class="c ${counts.get(project.key) ? 'hot' : ''}">${counts.get(project.key) || ''}</span></button>`;
   const dot = (project) => `<button data-project="${ctx.esc(project.key)}" class="rail-dot ${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}" title="${ctx.esc(project.name)}">${ctx.projectIcon(project)}</button>`;
@@ -404,14 +430,24 @@ function renderRail(ctx, items) {
   const shellButton = collapsed
     ? '<button class="rail-shell rail-dot" data-shell title="New session"><span class="rail-shell-mark">+</span></button>'
     : `<button class="rail-shell" data-shell title="New session in ${ctx.esc(shell.name)}"><span class="rail-shell-mark">+</span><span>session</span></button>`;
+  const clientChoice = (kind, label) => collapsed
+    ? `<button data-client="${kind}" class="rail-dot ${ctx.state.providerFilter === (kind || null) ? 'on' : ''}" title="${label}" aria-label="${label}" aria-pressed="${ctx.state.providerFilter === (kind || null)}">${kind ? providerIconHTML(kind, ctx.esc) : '<span class="rail-client-all">◎</span>'}</button>`
+    : `<button data-client="${kind}" class="${ctx.state.providerFilter === (kind || null) ? 'on' : ''}" aria-label="${label}" aria-pressed="${ctx.state.providerFilter === (kind || null)}">${kind ? providerIconHTML(kind, ctx.esc) : '<span class="rail-client-all">◎</span>'}<span>${label}</span></button>`;
+  const clients = `<div class="rail-clients" role="group" aria-label="Client">${collapsed ? '' : '<div class="rh">Client</div>'}${clientChoice('', 'All')}${clientChoice('claude', 'Claude Code')}${clientChoice('codex', 'Codex')}</div>`;
   rail.classList.toggle('collapsed', collapsed);
   rail.innerHTML = collapsed
-    ? `<div class="rh"><button class="collapse" aria-expanded="false" title="Expand (⌘B)">›</button></div><button data-project="" class="rail-dot all ${ctx.state.filter ? '' : 'on'}" title="All">${ctx.projectIcon({ key: 'all' })}</button>${projects.map(dot).join('')}${shellButton}`
+    ? `<div class="rh"><button class="collapse" aria-expanded="false" title="Expand (⌘B)">›</button></div><button data-project="" class="rail-dot all ${ctx.state.filter ? '' : 'on'}" title="All projects">${ctx.projectIcon({ key: 'all' })}</button>${projects.map(dot).join('')}${clients}${shellButton}`
     : `<div class="rh"><span>Projects</span><button class="collapse" aria-expanded="true" title="Collapse (⌘B)">‹</button></div><button data-project="" class="all ${ctx.state.filter ? '' : 'on'}">${ctx.projectIcon({ key: 'all' })}<span>All</span><span class="c hot">${counted.length}</span></button>`
-      + (ctx.data.scopes || globalThis.KeepScopeRules.defaults).names.map((scope) => `<div class="scope">${ctx.esc(scope)}</div>${projects.filter((p) => p.scope === scope).map(row).join('')}`).join('') + shellButton;
+      + (ctx.data.scopes || globalThis.KeepScopeRules.defaults).names.map((scope) => `<div class="scope">${ctx.esc(scope)}</div>${projects.filter((p) => p.scope === scope).map(row).join('')}`).join('') + clients + shellButton;
   rail.querySelector('.collapse').addEventListener('click', () => ctx.toggleCollapsed('rail'));
   rail.querySelectorAll('[data-project]').forEach((button) => button.addEventListener('click', () => {
     ctx.state.filter = button.dataset.project || null;
+    ctx.setSelected(0);
+    ctx.state.ensureSelectedVisible = true;
+    ctx.refresh();
+  }));
+  rail.querySelectorAll('[data-client]').forEach((button) => button.addEventListener('click', () => {
+    ctx.state.providerFilter = button.dataset.client || null;
     ctx.setSelected(0);
     ctx.state.ensureSelectedVisible = true;
     ctx.refresh();
@@ -433,6 +469,7 @@ function renderRail(ctx, items) {
         ctx.state.showRunning = true;
         try { sessionStorage.setItem('keep-running-expanded', '1'); } catch {}
         ctx.state.filter = null;
+        ctx.state.providerFilter = null;
         // openReviewPane keeps the pane selected until its own running row exists.
         if (ctx.paneMap().get(pane.id)?.alive) ctx.openReviewPane(pane.id);
         ctx.state.ensureSelectedVisible = true;
@@ -448,9 +485,7 @@ function renderRail(ctx, items) {
 
 export function queueRow(ctx, item) {
   const session = ctx.sessionFor(item);
-  const paneAgent = item.pane ? ctx.paneMap().get(item.pane)?.meta?.agent : '';
-  const provider = ['claude', 'codex', 'pi'].includes(session?.kind) ? session.kind
-    : ['claude', 'codex', 'pi'].includes(paneAgent) ? paneAgent : '';
+  const provider = itemProvider(ctx, item);
   const title = item.title || session?.title || 'untitled session';
   const project = item.project || session?.project || '';
   const task = ctx.taskFor(item);
@@ -553,7 +588,7 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
   // waiting, below the sessions doing a card's work, and the group is absent
   // entirely when there is no agent to list. Unlike Running, it is not gated on
   // `showRunning`: collapsing the sessions must not hide the fleet.
-  const agentRows = ctx.data.agents || [];
+  const agentRows = (ctx.data.agents || []).filter((agent) => matchesAgentTriageFilters(ctx, agent));
   if (agentRows.length) {
     addGroup(`Agents · ${ctx.esc(agentRows.length)}`);
     for (const agent of agentRows) {
@@ -582,7 +617,7 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
     addGroup('Selected session');
     addRows(retainedSelection, active.length - retainedSelection.length);
   }
-  if (!active.length && !dismissed.length) addGroup('<div class="qempty"><b>Nothing waiting on you</b>Expand Running, Pinned, or Recent to browse sessions, or open Watch for live panes.</div>', '');
+  if (!active.length && !dismissed.length) addGroup(emptyQueueHTML(ctx.state), '');
   if (dismissed.length) {
     const wrap = document.createElement('div');
     wrap.className = 'qdis-wrap';
@@ -699,9 +734,15 @@ async function chooseOption(ctx, item, number) {
 // "N running · N pinned", and the agents only when there are any: a standing
 // zero teaches nothing.
 export function emptyStateCounts(ctx, running, pinned) {
-  const agentCount = (ctx.data.agents || []).length;
+  const agentCount = (ctx.data.agents || []).filter((agent) => matchesAgentTriageFilters(ctx, agent)).length;
   return [`${running.length} running`, `${pinned.length} pinned`,
     ...(agentCount ? [`${agentCount} agent${agentCount === 1 ? '' : 's'}`] : [])].join(' · ');
+}
+
+export function emptyQueueHTML(state) {
+  return state.filter || state.providerFilter
+    ? '<div class="qempty"><b>No sessions shown for these filters</b>Change a filter or expand Running, Pinned, or Recent.</div>'
+    : '<div class="qempty"><b>Nothing waiting on you</b>Expand Running, Pinned, or Recent to browse sessions, or open Watch for live panes.</div>';
 }
 
 function renderStage(ctx, queue, focusItem, running, pinned) {
@@ -913,7 +954,7 @@ export function installTriageControls() {}
 export function renderTriage(ctx) {
   ensurePinnedState(ctx);
   const items = ctx.queueItems();
-  const matchesFilter = (item) => !ctx.state.filter || ctx.projectOf(item.project).key === ctx.state.filter;
+  const matchesFilter = (item) => matchesTriageFilters(ctx, item);
   const visible = items.filter(matchesFilter);
   const waiting = visible.filter((item) => !ctx.state.dismissed.has(ctx.itemKey(item)));
   const sessions = [...ctx.runningItems(), ...ctx.pinnedItems(), ...ctx.recentItems(),
@@ -941,7 +982,8 @@ export function renderTriage(ctx) {
     ctx.state.selectedKey = key;
     ctx.state.currentItem = focusItem || null;
   }
-  renderRail(ctx, [...items, ...ctx.runningItems(), ...ctx.pinnedItems()]);
+  renderRail(ctx, [...items, ...ctx.runningItems(), ...ctx.pinnedItems()]
+    .filter((item) => !ctx.state.providerFilter || itemProvider(ctx, item) === ctx.state.providerFilter));
   const queue = renderQueue(ctx, waiting, running, pinned, recent, dismissed);
   renderStage(ctx, queue, focusItem, running, pinned);
 }

@@ -15,7 +15,7 @@ import { setTerminalRendererPreference } from './terminal-renderer.js';
 import { installFocusDebug } from './focus-debug.js';
 import { retainSelection, stableSessionOrder } from './selection.js';
 import { createSessionHistory, installSessionHistory } from './session-history.js';
-import { installTriageControls, renderTriage } from './triage.js';
+import { installTriageControls, matchesTriageFilters, renderTriage } from './triage.js';
 import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
 import { numLabel } from './session-number.js';
@@ -92,7 +92,7 @@ try {
   }
 } catch {}
 const state = {
-  mode: restoredMode, selected: 0, selectedKey: null, filter: null, focused: false, dock: restoredDock, collapsed: restoredCollapsed,
+  mode: restoredMode, selected: 0, selectedKey: null, filter: null, providerFilter: null, focused: false, dock: restoredDock, collapsed: restoredCollapsed,
   dismissed: new Set(), markedRunning: new Set(), showDismissed: false, showRunning: restoredRunning, showRecent: restoredRecent, sent: new Set(),
   layouts: [{ name: 'Pinned', ids: [], cols: 0, role: 'pinned' }], layout: 0, editing: false, pickFilter: '', currentActions: {},
   ensureSelectedVisible: true, focusPane: null, pendingFocus: false, currentItem: null,
@@ -319,13 +319,15 @@ function recentItems() {
     // otherwise appear a second time as its own Recent row.
     .filter((session) => !session.reviewer && !session.agentName
       && !isClosingSession(session.id, session.pane) && session.state !== 'running'
-      && (Number.isFinite(typeof session.lastUserAt === 'number' ? session.lastUserAt : Date.parse(session.lastUserAt)) || session.exited))
+      && (Number.isFinite(typeof session.lastUserAt === 'number' ? session.lastUserAt : Date.parse(session.lastUserAt)) || session.exited)
+      && (!state.filter || projectOf(session.project).key === state.filter)
+      && (!state.providerFilter || session.kind === state.providerFilter))
     .sort((a, b) => recentSessionTime(b) - recentSessionTime(a))
     .slice(0, 6)
     .map((session) => sessionItem('recent', session));
 }
 function matchesTriageFilter(item) {
-  return !state.filter || projectOf(item.project).key === state.filter;
+  return matchesTriageFilters(ctx, item);
 }
 function triageVisible(item) {
   return (item.kind === 'pinned' || (item.kind === 'running' && isMarkedRunning(item)) || !state.dismissed.has(itemKey(item))) && matchesTriageFilter(item);
@@ -1132,6 +1134,7 @@ function navigateHistory(entry, focus = true) {
   state.mode = watch ? 'watch' : 'triage';
   if (watch) { state.layout = layout; state.editing = false; }
   state.filter = null;
+  state.providerFilter = null;
   state.paneTarget = null;
   if (state.focusMode) toggleFocus(false, false);
   state.historyTarget = { ...entry, kind: 'recent', state: 'exited', pane: null };
@@ -1168,7 +1171,7 @@ const ctx = {
     if (!pane?.alive) { toast('The saved successor pane is no longer available'); return false; }
     const entity = entityForPane(paneId);
     const item = { kind: 'running', pane: paneId, project: entity.project, title: entity.title, state: entity.state };
-    state.mode = 'triage'; state.filter = null;
+    state.mode = 'triage'; state.filter = null; state.providerFilter = null;
     if (state.focusMode) toggleFocus(false, false);
     state.paneTarget = item; state.currentItem = item; state.selectedKey = triageKey(item);
     state.ensureSelectedVisible = true; state.focused = false; state.focusPane = paneId;
@@ -1220,6 +1223,7 @@ function focusSession(sessionId) {
 }
 function selectAttention(key) {
   state.filter = null;
+  state.providerFilter = null;
   const active = queueItems().filter((candidate) => !state.dismissed.has(itemKey(candidate)));
   const index = active.findIndex((candidate) => attentionKey(candidate) === key);
   if (index < 0) { toast('This item is no longer waiting on you.'); return; }

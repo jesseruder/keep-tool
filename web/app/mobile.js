@@ -1,6 +1,6 @@
 // The phone layout. Not a second console: one markup tree, laid out by
 // `html.mobile` rules in styles.css, plus the few things CSS cannot do — move
-// the project rail and the meters into sheets, put the mode switch at the
+// the filter rail and the meters into sheets, put the mode switch at the
 // bottom of the screen, and push the stage over the queue with a back control
 // wired to the WebView's history so Android's back button pops it.
 //
@@ -138,7 +138,7 @@ function build() {
   const modes = document.querySelector('.bar .modes');
   const triage = document.querySelector('#triage');
 
-  filterButton = element('button', 'mobile-filter', 'Projects');
+  filterButton = element('button', 'mobile-filter', 'Filters');
   filterButton.type = 'button';
   filterButton.setAttribute('aria-haspopup', 'dialog');
   filterButton.setAttribute('aria-expanded', 'false');
@@ -175,7 +175,7 @@ function build() {
   });
   triage.prepend(stageBar);
 
-  filterSheet = sheet('mobileFilterSheet', 'Projects');
+  filterSheet = sheet('mobileFilterSheet', 'Filters');
   statusSheet = sheet('mobileStatusSheet', 'Status');
 }
 
@@ -442,8 +442,9 @@ function sync() {
   statusButton.setAttribute('aria-expanded', String(showing('status')));
   filterButton.hidden = !triage;
   const project = ctx.state.filter && ctx.knownProjects().find((entry) => entry.key === ctx.state.filter);
-  filterButton.textContent = project ? project.name : 'Projects';
-  filterButton.classList.toggle('on', Boolean(project));
+  const client = { claude: 'Claude Code', codex: 'Codex' }[ctx.state.providerFilter];
+  filterButton.textContent = [project?.name, client].filter(Boolean).join(' · ') || 'Filters';
+  filterButton.classList.toggle('on', Boolean(project || client));
   const connection = document.querySelector('#connection');
   statusButton.dataset.status = connection?.dataset.status || '';
   statusButton.querySelector('.mobile-status-label').textContent = connection?.textContent || '';
