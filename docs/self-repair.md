@@ -11,9 +11,10 @@ health record and a log excerpt attached, creates a fresh `keep-tool` worktree o
 of process, and opens one repair session there, pointed at a root-cause recipe
 stored on the card. The scheduler itself never restarts the daemon and never lands
 anything. When the agent lands a reviewed fix, `wt land` fast-forwards a ready
-`~/keep-tool` checkout and restarts the daemon. If it reports a skipped or failed
-deployment, the agent resolves that before closing the card; if it could not land,
-it leaves the card in review with its branch named and the daemon untouched.
+`~/keep-tool` checkout and restarts the daemon. Inspect a skipped or failed deployment:
+a checkout already past this land belongs to its newer landing session; recover only a safe
+failure the repair still owns, otherwise record the blocker or dependency. If it could not
+land, it leaves the card in review with its branch named and the daemon untouched.
 
 ## What counts as a signature
 
@@ -209,8 +210,9 @@ ok. The plan is always these four steps:
 2. Fix in the worktree with a test that fails before and passes after
 3. Independent review, then `keep reviewed` and `keep land` if `keep allow <card>
    land` allows; otherwise leave the card in review with the branch named
-4. Confirm the row is green with `keep health`. `wt land` deploys a ready live
-   checkout; if it reports a skipped or failed deployment, resolve that first.
+4. Confirm the row is green with `keep health`. Inspect a `wt land` skip: a checkout
+   already past this land belongs to its newer landing session; recover only a safe failure
+   the repair still owns, otherwise record the blocker or dependency.
 
 Evidence is attached as artifacts under `.keep/artifacts/<card>/`: the failing
 health row with the `daemon` row, the whole health snapshot, the last 80 serve.log
@@ -289,8 +291,9 @@ names the constraints: work only in the worktree, never edit or commit in
 `keep codex` — **waiting
 for the result in the foreground, never ending a turn with the review pending** —
 record it with `keep reviewed`, land only through `keep allow` + `keep land`, and
-then confirm the row went green and close the card. `wt land` deploys a ready live
-checkout; resolve any skipped or failed deployment it reports before closing.
+then confirm the row went green and close the card. Inspect any skipped deployment: do not
+pull or restart a checkout already past this land; recover only a safe failure the repair
+still owns, otherwise record the blocker or dependency.
 
 ## What is gated, and until when
 

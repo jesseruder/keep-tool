@@ -1012,8 +1012,9 @@ frontmatter keys Keep does not know are dropped on rewrite unless they are strin
 `keep land <card>` runs that check and, on a 0, runs `wt land` in-process and cites the
 landed sha in a check-in naming the record. On a 3 it prints the `why` and lands
 nothing. `--dry-run` stops before the land. For keep-tool, `wt land` fast-forwards a
-ready live checkout to the landed SHA and restarts the daemon. It reports a skipped or
-failed deployment so the landing session can resolve it.
+ready live checkout to the landed SHA and restarts the daemon. Inspect a skipped or failed
+deployment: a checkout already past this land belongs to its newer landing session; recover
+only a safe failure the landing still owns, otherwise record the blocker or dependency.
 
 Writing grants is Owner's: `keep allow <card> --grant`/`--until` and `keep add
 --allow`/`--until` are refused inside an agent session (`CLAUDE_CODE_SESSION_ID` or a

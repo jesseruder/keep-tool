@@ -362,7 +362,7 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
     assert.equal(card.commit, true);
     assert.match(card.note, /Signature sched:review:/);
     assert.match(card.note, /Last error: tick failed for pid 123/);
-    assert.match(card.note, /If it reports a skipped or failed deployment/);
+    assert.match(card.note, /checkout already past this land belongs to the newer landing session/);
 
     // The plan is set before the card is saved: four steps, with deployment
     // recovery conditional on wt land reporting a problem.
@@ -371,8 +371,9 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
     assert.match(card.draft.plan[0].text, /Reproduce and root-cause/);
     assert.match(card.draft.plan[1].text, /fails before and passes after/);
     assert.match(card.draft.plan[2].text, /keep reviewed/);
-    assert.match(card.draft.plan[3].text, /`wt land` deploys a ready live checkout/);
-    assert.match(card.draft.plan[3].text, /skipped or failed deployment/);
+    assert.match(card.draft.plan[3].text, /Inspect any `wt land` skip/);
+    assert.match(card.draft.plan[3].text, /already past this land to its newer landing session/);
+    assert.match(card.draft.plan[3].text, /actionable failure this repair still owns/);
     assert.doesNotMatch(card.draft.plan[3].text, /Once the fix is on origin\/master.*restart-daemon/);
 
     // Evidence went on as artifacts, staged inside Keep and cleaned up after —
@@ -394,13 +395,16 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
     // turn with the review pending, which killed the poll and landed nothing.
     assert.match(recipe, /YOUR TURN MUST NOT END WHILE THE REVIEW IS STILL PENDING/);
     assert.match(recipe, /keep checkin repair-card-1 --step 4 --status done --commit <sha> --next "nothing"/);
-    // A normal land deploys itself; the exact two commands are recovery only when
-    // wt land reports a skip or failure.
+    // A normal land deploys itself. A checkout already past this land belongs to
+    // its newer landing session, while only a safe, owned failure may recover.
     assert.match(recipe, /git -C ~\/keep-tool pull --ff-only/);
     assert.match(recipe, /keep restart-daemon/);
     assert.match(recipe, /`wt land` normally fast-forwards a ready live checkout/);
-    assert.match(recipe, /If it reports a skipped or failed deployment, recover it yourself/);
-    assert.match(recipe, /eligibility is not proof recovery\s+is needed/);
+    assert.match(recipe, /checkout is already past this land, a newer landing session owns\s+that restart/);
+    assert.match(recipe, /do not pull or restart it/);
+    assert.match(recipe, /dirty, busy, on another branch, or cannot fast-forward, leave it alone/);
+    assert.match(recipe, /Only recover an actionable failure when this repair still owns the landed SHA/);
+    assert.match(recipe, /eligibility is not proof they\s+are needed/);
     assert.doesNotMatch(recipe, /Restart the daemon into your fix\. Once `keep land` has pushed/);
     assert.match(recipe, /keep wait --no-hold ~\/keep-tool --for 2h/);
     assert.match(recipe, /allows exactly two recovery commands once the fix is landed/);

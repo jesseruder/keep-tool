@@ -82,7 +82,7 @@ test('keep-tool landing guidance agrees that wt land deploys the ready live chec
   for (const file of ['skills/codex-review-runner/SKILL.md', 'skills/keep-ops/SKILL.md', 'docs/reference.md']) {
     const text = fs.readFileSync(path.join(root, file), 'utf8');
     assert.match(text, /wt land.*fast-forwards.*ready.*(live|main) checkout.*restarts the\s+daemon/is, file);
-    assert.match(text, /(skipped|failed) deployment/i, file);
+    assert.match(text, /(skipped|failed)\s+deployment/i, file);
     assert.doesNotMatch(text, /main checkout and daemon restart stay manual/i, file);
   }
 });

@@ -86,15 +86,17 @@ call or a write.
 
 The daemon runs from the main keep-tool checkout, which must stay clean: work in a
 worktree, then land. `wt land` fast-forwards a ready main checkout and restarts the
-daemon; it reports a skipped or failed deployment for the landing session to resolve.
+daemon; it reports a skipped or failed deployment for the landing session to inspect.
 For manual recovery, skills, docs and CLI-only changes may need only the fast-forward;
 daemon-code changes need the restart too.
 The daemon's own git pull syncs the registry, never the code.
 
 A self-repair session follows the recipe on its card: root-cause from the attached health
 record and log excerpt, then land a reviewed fix. `wt land` attempts the deployment after
-the land; if it reports a skip or failure, resolve it before closing the card. If it cannot
-land, it leaves the card in `review` with the branch named and the daemon untouched.
+the land; a checkout already past this land belongs to its newer landing session, so do not
+pull or restart it. Recover only a safe failure the landing still owns; otherwise record the
+specific blocker or dependency. If it cannot land, it leaves the card in `review` with the
+branch named and the daemon untouched.
 
 ## Reporting
 

@@ -11,9 +11,11 @@
 // anything itself: it opens a card and spends one rate-limited agent on it. The
 // manual recovery commands become available only after `keep land` has put its
 // fix on origin/master — landedFor() below is what the pre-bash guard asks. `wt
-// land` normally deploys the fix itself; recovery is for a reported skip or
-// failure. Repair state lives here, never in health.json, which is rewritten
-// whole on every record() and would lose it.
+// land` normally deploys the fix itself. A skip must be inspected: a checkout
+// already past this land belongs to its newer landing session, while a live
+// checkout that is dirty, busy, wrong-branch or diverged is not ours to alter.
+// Repair state lives here, never in health.json, which is rewritten whole on
+// every record() and would lose it.
 
 const fs = require('fs');
 const path = require('path');
@@ -560,7 +562,7 @@ function symptomNote(candidate, previousCardId) {
     `Last ok: ${candidate.lastOkAt ? stamp(candidate.lastOkAt) : 'never recorded'}.`,
     previousCardId ? `This signature recurred after a cooldown; the previous repair card was ${previousCardId}.` : '',
     'Opened by the daemon self-repair scheduler. `wt land` deploys a ready live checkout after `keep land`.'
-      + ' If it reports a skipped or failed deployment, the repair session resolves it after its fix is landed.',
+      + ' Inspect a skipped deployment: a checkout already past this land belongs to the newer landing session.',
   ].filter(Boolean).join('\n');
 }
 
@@ -568,7 +570,7 @@ const PLAN = Object.freeze([
   'Reproduce and root-cause from the attached health record and log excerpt',
   'Fix in the worktree with a test that fails before and passes after',
   'Independent review, then `keep reviewed` and `keep land` if `keep allow <card> land` allows; otherwise leave the card in review with the branch named',
-  'Confirm the row is green with `keep health`. `wt land` deploys a ready live checkout; resolve a skipped or failed deployment after the fix is on origin/master.',
+  'Confirm the row is green with `keep health`. Inspect any `wt land` skip: defer a checkout already past this land to its newer landing session, and recover only an actionable failure this repair still owns.',
 ]);
 
 function cardTitle(candidate) {
@@ -732,10 +734,13 @@ function buildRecipe(context) {
     `   keep reviewed ${cardId} --commit origin/master..HEAD --verdict clean --by "codex sol" --job <job-id>`,
     `5. Land only if Keep allows it: keep allow ${cardId} land, and if that exits 0, keep land ${cardId}.`,
     '   If either exits non-zero, leave the card in review and name the branch in your check-in.',
-    '6. Confirm the deployment result. After `keep land`, `wt land` normally fast-forwards a ready live checkout',
-    '   and restarts the daemon. If it reports a skipped or failed deployment, recover it yourself. The guard',
-    '   allows exactly two recovery commands once the fix is landed, but that eligibility is not proof recovery',
-    '   is needed. Type each command ALONE, exactly as written: the guard matches the whole command, so `cd`,',
+    '6. Inspect the deployment result. After `keep land`, `wt land` normally fast-forwards a ready live checkout',
+    '   and restarts the daemon. If it says the checkout is already past this land, a newer landing session owns',
+    '   that restart: do not pull or restart it. Verify health if possible and record the precise dependency or',
+    '   blocker. If it is dirty, busy, on another branch, or cannot fast-forward, leave it alone and record why.',
+    '   Only recover an actionable failure when this repair still owns the landed SHA and the checkout is safe.',
+    '   The guard allows exactly two recovery commands once the fix is landed, but eligibility is not proof they',
+    '   are needed. Type each command ALONE, exactly as written: the guard matches the whole command, so `cd`,',
     '   `&&`, a wrapper or an assignment in front of it is still refused.',
     '   keep who ~/keep-tool',
     '     — if a hold is active, wait it out first: keep wait --no-hold ~/keep-tool --for 2h',
@@ -749,7 +754,8 @@ function buildRecipe(context) {
     '',
     'Hard constraints:',
     '- Never edit, commit, or run git writes in ~/keep-tool: that is the live daemon checkout. Only this worktree.',
-    '  The one exception is `git -C ~/keep-tool pull --ff-only` for a skipped or failed deployment after the land.',
+    '  The one exception is `git -C ~/keep-tool pull --ff-only` for an actionable deployment failure this repair',
+    '  still owns after the land; never clean, change, pull or restart someone else\'s newer live checkout.',
     '- Do not restart the daemon before your fix is landed. `keep restart-daemon`, `keep service` and `launchctl`',
     '  are refused for you until then (KEEP_REPAIR=1 is set for you and the pre-bash guard blocks them; Keep',
     '  recorded this session as the repair agent, so a restart, a force-restart or a handoff re-sets it). After',
