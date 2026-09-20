@@ -743,7 +743,7 @@ class ReplyControl {
   emit(type, event = {}) { return this.listeners.get(type)?.(event); }
 }
 
-function replyStage() {
+function replyControls() {
   const input = new ReplyControl();
   const button = new ReplyControl('Send');
   const classes = new Set(['mobile-reply']);
@@ -754,7 +754,18 @@ function replyStage() {
     contains(name) { return classes.has(name); },
   };
   form.querySelector = selector => selector === 'input' ? input : selector === 'button' ? button : null;
-  return { input, button, form, querySelector: selector => selector === '.mobile-reply' ? form : null };
+  return { input, button, form };
+}
+
+function replyStage() {
+  let controls = replyControls();
+  return {
+    get input() { return controls.input; },
+    get button() { return controls.button; },
+    get form() { return controls.form; },
+    replace() { controls = replyControls(); },
+    querySelector(selector) { return selector === '.mobile-reply' ? controls.form : null; },
+  };
 }
 
 test('automatic retirement exposes the desktop reply composer and labels its one send as a resume', async () => {
@@ -767,7 +778,11 @@ test('automatic retirement exposes the desktop reply composer and labels its one
   const ctx = { state: { currentItem: item, replyDrafts: drafts }, refreshes: 0, toasts: [],
     refresh() { this.refreshes += 1; }, toast(message) { this.toasts.push(message); } };
   const first = replyStage();
-  installReplyComposer(first, ctx, item, () => assert.fail('drafting does not send'));
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const sends = [];
+  const send = async (...args) => { sends.push(args); await pending; };
+  installReplyComposer(first, ctx, item, send);
   syncReplyComposer(first, { retirement: { automatic: true } });
   assert.equal(first.form.classList.contains('desktop-retired-reply'), true);
   assert.equal(first.button.textContent, 'Send & resume');
@@ -776,24 +791,25 @@ test('automatic retirement exposes the desktop reply composer and labels its one
 
   first.input.value = 'Use option A, please.';
   first.input.emit('input');
-  const rebuilt = replyStage();
-  let release;
-  const pending = new Promise(resolve => { release = resolve; });
-  const sends = [];
-  installReplyComposer(rebuilt, ctx, item, async (...args) => { sends.push(args); await pending; });
-  syncReplyComposer(rebuilt, { retirement: { automatic: true } });
-  assert.equal(rebuilt.input.value, 'Use option A, please.', 'a state-driven stage rebuild restores the draft');
+  const detachedForm = first.form;
+  const submitted = detachedForm.emit('submit', { preventDefault() {} });
+  assert.equal(detachedForm.querySelector('button').disabled, true);
 
-  const submitted = rebuilt.form.emit('submit', { preventDefault() {} });
-  assert.equal(rebuilt.button.disabled, true);
-  assert.equal(rebuilt.button.getAttribute('aria-busy'), 'true');
-  assert.equal(rebuilt.button.textContent, 'Sending…');
-  await rebuilt.form.emit('submit', { preventDefault() {} });
+  first.replace();
+  installReplyComposer(first, ctx, item, send);
+  syncReplyComposer(first, { retirement: { automatic: true } });
+  assert.equal(first.input.value, 'Use option A, please.', 'a state-driven stage rebuild restores the draft');
+  assert.equal(first.button.disabled, true, 'pending state follows the session onto the rebuilt composer');
+  assert.equal(first.button.getAttribute('aria-busy'), 'true');
+  assert.equal(first.button.textContent, 'Sending…');
+  await first.form.emit('submit', { preventDefault() {} });
   assert.deepEqual(sends, [['retired-session', 'Use option A, please.']], 'busy submit cannot duplicate /api/send');
   release();
   await submitted;
 
-  assert.equal(rebuilt.input.value, '');
+  assert.equal(first.input.value, '', 'success clears the currently mounted composer, not only the detached one');
+  await first.form.emit('submit', { preventDefault() {} });
+  assert.deepEqual(sends, [['retired-session', 'Use option A, please.']], 'an empty post-success submit cannot resend');
   assert.equal(drafts.has('retired-session'), false);
   assert.equal(ctx.refreshes, 1);
   assert.deepEqual(ctx.toasts, ['Reply sent; session resuming']);
@@ -806,6 +822,35 @@ test('ordinary desktop sessions keep the shared reply composer hidden', async ()
   assert.equal(stage.form.classList.contains('desktop-retired-reply'), false);
   assert.equal(stage.button.textContent, 'Send');
   assert.equal(stage.input.getAttribute('aria-label'), 'Reply to this session');
+});
+
+test('a failed reply preserves the rebuilt draft and unlocks its current composer', async () => {
+  const { syncReplyComposer, installReplyComposer } = await import('./triage.js');
+  const item = { sessionId: 'retired-session', kind: 'input' };
+  const ctx = { state: { currentItem: item, replyDrafts: new Map(), replyPendingSends: new Set() },
+    refresh() { assert.fail('a failed reply does not refresh'); }, toasts: [], toast(message) { this.toasts.push(message); } };
+  const stage = replyStage();
+  let reject;
+  const pending = new Promise((_resolve, onReject) => { reject = onReject; });
+  installReplyComposer(stage, ctx, item, () => pending);
+  syncReplyComposer(stage, { retirement: { automatic: true } });
+  stage.input.value = 'Keep this draft';
+  stage.input.emit('input');
+  const submitted = stage.form.emit('submit', { preventDefault() {} });
+
+  stage.replace();
+  installReplyComposer(stage, ctx, item, () => pending);
+  syncReplyComposer(stage, { retirement: { automatic: true } });
+  assert.equal(stage.button.disabled, true);
+  reject(new Error('resume failed'));
+  await submitted;
+
+  assert.equal(stage.input.value, 'Keep this draft');
+  assert.equal(stage.button.disabled, false);
+  assert.equal(stage.button.getAttribute('aria-busy'), null);
+  assert.equal(stage.button.textContent, 'Send & resume');
+  assert.equal(ctx.state.replyDrafts.get('retired-session'), 'Keep this draft');
+  assert.deepEqual(ctx.toasts, ['resume failed']);
 });
 
 test('a resumed session pane replaces the stale pane captured by its attention row', async () => {

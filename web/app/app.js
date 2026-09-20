@@ -97,7 +97,7 @@ const state = {
   layouts: [{ name: 'Pinned', ids: [], cols: 0, role: 'pinned' }], layout: 0, editing: false, pickFilter: '', currentActions: {},
   ensureSelectedVisible: true, focusPane: null, pendingFocus: false, currentItem: null,
   focusMode: restoredFocus,
-  historyTarget: null, paneTarget: null, replyDrafts: new Map(),
+  historyTarget: null, paneTarget: null, replyDrafts: new Map(), replyPendingSends: new Set(),
 };
 const topBar = document.querySelector('.bar');
 const syncTopBarHeight = () => document.documentElement.style.setProperty('--top-bar-height', `${topBar.getBoundingClientRect().height}px`);

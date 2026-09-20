@@ -760,14 +760,28 @@ export function syncReplyComposer(stage, session) {
   if (!button.disabled) button.textContent = resumes ? 'Send & resume' : 'Send';
 }
 
+function syncReplyPending(form, pending) {
+  const button = form.querySelector('button');
+  button.disabled = pending;
+  if (pending) {
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = 'Sending…';
+  } else {
+    button.removeAttribute('aria-busy');
+    button.textContent = form.classList.contains('desktop-retired-reply') ? 'Send & resume' : 'Send';
+  }
+}
+
 export function installReplyComposer(stage, ctx, item, send = api.send) {
   const form = stage.querySelector('.mobile-reply');
   if (!form) return;
   const input = form.querySelector('input');
   const button = form.querySelector('button');
   const drafts = ctx.state.replyDrafts ||= new Map();
+  const pendingSends = ctx.state.replyPendingSends ||= new Set();
   form.dataset.sessionId = item.sessionId;
   input.value = drafts.get(item.sessionId) || '';
+  syncReplyPending(form, pendingSends.has(item.sessionId));
   input.addEventListener('input', () => {
     const sessionId = form.dataset.sessionId;
     if (sessionId) drafts.set(sessionId, input.value);
@@ -776,23 +790,25 @@ export function installReplyComposer(stage, ctx, item, send = api.send) {
     event.preventDefault();
     const text = input.value.trim();
     const target = ctx.state.currentItem?.sessionId ? ctx.state.currentItem : item;
-    if (!text || !target.sessionId || button.disabled) return;
-    button.disabled = true;
-    button.setAttribute('aria-busy', 'true');
-    button.textContent = 'Sending…';
+    if (!text || !target.sessionId || pendingSends.has(target.sessionId)) return;
+    const sessionId = target.sessionId;
+    const resuming = form.classList.contains('desktop-retired-reply');
+    pendingSends.add(sessionId);
+    syncReplyPending(form, true);
     try {
-      await send(target.sessionId, text);
-      input.value = '';
-      drafts.delete(target.sessionId);
+      await send(sessionId, text);
+      drafts.delete(sessionId);
+      const current = stage.querySelector('.mobile-reply');
+      if (current?.dataset.sessionId === sessionId) current.querySelector('input').value = '';
       // Deliberately not marked sent: free text may or may not end the wait, and
       // the daemon's next state is what decides. Owner stays on the session.
-      ctx.toast(form.classList.contains('desktop-retired-reply') ? 'Reply sent; session resuming' : 'Reply sent');
+      ctx.toast(resuming ? 'Reply sent; session resuming' : 'Reply sent');
       ctx.refresh();
     } catch (error) { ctx.toast(error.message); }
     finally {
-      button.disabled = false;
-      button.removeAttribute('aria-busy');
-      button.textContent = form.classList.contains('desktop-retired-reply') ? 'Send & resume' : 'Send';
+      pendingSends.delete(sessionId);
+      const current = stage.querySelector('.mobile-reply');
+      if (current?.dataset.sessionId === sessionId) syncReplyPending(current, false);
     }
   });
 }
