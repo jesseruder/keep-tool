@@ -22,6 +22,7 @@ export function hostOutageText(status, now = Date.now()) {
 }
 
 export function sessionLabel(session) {
+  if (session?.retirement?.automatic === true) return 'Paused to save memory';
   return session?.stateLabel || session?.activity?.label || session?.state || 'unknown';
 }
 

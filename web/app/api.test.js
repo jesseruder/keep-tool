@@ -94,6 +94,26 @@ test('portable metadata waits on the same post-write fence as dashboard state', 
   assert.equal(calls[2].headers['x-keep-after-mutation'], 'epoch:4');
 });
 
+test('keep-running updates use the mutation fence and exact boolean contract', async () => {
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), headers: { ...(options.headers || {}) }, method: options.method || 'GET', body: options.body });
+    if ((options.method || 'GET') !== 'GET') {
+      return reply({ ok: true, sessionId: 'session-a', keepRunning: true }, 'epoch:7');
+    }
+    return reply({ sessions: [{ id: 'session-a', keepRunning: true }] }, 'epoch:7');
+  };
+  const api = await import(`./api.js?keep-running=${Date.now()}`);
+
+  assert.deepEqual(await api.setSessionKeepRunning('session-a', true),
+    { ok: true, sessionId: 'session-a', keepRunning: true });
+  assert.equal(calls[0].url, '/api/session-keep-running');
+  assert.equal(calls[0].method, 'POST');
+  assert.deepEqual(JSON.parse(calls[0].body), { sessionId: 'session-a', keepRunning: true });
+  await api.getState();
+  assert.equal(calls[1].headers['x-keep-after-mutation'], 'epoch:7');
+});
+
 test('out-of-order write responses cannot regress the pending mutation fence', async () => {
   let releaseFirst;
   const calls = [];

@@ -9,7 +9,7 @@ const STATE_MUTATIONS = new Set([
   '/api/mark-session', '/api/notifications', '/api/open', '/api/panes/spawn',
   '/api/portable-transfers', '/api/reminders', '/api/rename-session', '/api/reopen-session',
   '/api/resolve-portable-transfer', '/api/restart-daemon', '/api/restart-session', '/api/review-queue',
-  '/api/reviewtick', '/api/run', '/api/send', '/api/setaside', '/api/transfer-session',
+  '/api/reviewtick', '/api/run', '/api/send', '/api/session-keep-running', '/api/setaside', '/api/transfer-session',
 ]);
 let stateAfterMutation = '';
 let observedMutationFence = '';
@@ -267,6 +267,7 @@ export const setAside = (key, kind, minutes) => write('/api/setaside', {
 export const renameSession = (sessionId, title) => write('/api/rename-session', { sessionId, title });
 // A patch: an absent key is left alone, null or '' removes that half of the mark.
 export const markSession = (sessionId, patch) => write('/api/mark-session', { sessionId, ...patch });
+export const setSessionKeepRunning = (sessionId, keepRunning) => write('/api/session-keep-running', { sessionId, keepRunning });
 export const spawnPane = (cwd, name) => write('/api/panes/spawn', { cwd, name });
 export const killPane = (pane) => write(`/api/panes/${encodeURIComponent(pane)}/kill`);
 export const removePane = (pane) => write(`/api/panes/${encodeURIComponent(pane)}/remove`);

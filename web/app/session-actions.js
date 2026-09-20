@@ -11,7 +11,7 @@ function focusIdentity(element) {
     if (element.dataset[name] != null) return `[data-${name.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}="${CSS.escape(element.dataset[name])}"]`;
   }
   return ['pin', 'unpin', 'closeSession', 'snooze', 'dismiss', 'waitDependency', 'reopen', 'kill', 'removePane',
-    'rename', 'renameReset', 'markEmoji', 'emojiPick', 'emojiSearch', 'markClear']
+    'rename', 'renameReset', 'markEmoji', 'emojiPick', 'emojiSearch', 'markClear', 'keepRunning']
     .find((name) => element.dataset[name] != null);
 }
 
@@ -43,6 +43,39 @@ export function rendererControlsHTML(ctx, pane, paneState) {
   const selected = effectiveTerminalRenderer(pane, paneState);
   const option = (renderer, label) => `<button class="btn renderer-choice ${selected === renderer ? 'selected' : ''}" type="button" aria-pressed="${selected === renderer}" data-renderer="${renderer}"><span>${label}</span><span class="renderer-check" aria-hidden="true">${selected === renderer ? '✓' : ''}</span></button>`;
   return `<div class="session-actions-label">Terminal renderer</div><div class="renderer-options" role="group" aria-label="Terminal renderer">${option('dom', 'Standard')}${option('webgl', 'GPU accelerated')}</div>`;
+}
+
+export function keepRunningControlHTML(session) {
+  if (!session?.id) return '';
+  const keepRunning = session.keepRunning === true;
+  const label = keepRunning ? 'Allow automatic close' : 'Keep running';
+  const help = keepRunning
+    ? 'Keep running is on. Activate to allow Keep to pause this session after its work has settled'
+    : 'Keep running is off. Activate to keep this session open until you allow automatic close';
+  return `<div class="session-actions-label">Automatic close</div><button class="btn" type="button" data-keep-running aria-pressed="${keepRunning}" aria-label="${help}" title="${help}">${label}</button>`;
+}
+
+export function installKeepRunningControl(menu, ctx, session, setKeepRunning) {
+  const button = menu.querySelector('[data-keep-running]');
+  if (!button || !session?.id) return;
+  button.onclick = async () => {
+    if (button.disabled) return;
+    const next = session.keepRunning !== true;
+    const label = button.textContent;
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = 'Saving…';
+    try {
+      await setKeepRunning(session.id, next);
+      session.keepRunning = next;
+      ctx.refresh();
+    } catch (error) {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+      button.textContent = label;
+      ctx.toast(`Could not update automatic close: ${error.message}`);
+    }
+  };
 }
 
 let dismissInstalled = false;

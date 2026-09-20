@@ -236,7 +236,8 @@ function entityForPane(id) {
   return {
     pane, session, project: session?.project || pane.meta?.project || pane.cwd || '',
     title: session?.title || pane.meta?.title || pane.title || 'shell', state: pane.alive === false ? 'exited' : session?.state || (pane.alive ? 'running' : 'exited'),
-    stateLabel: pane.alive === false ? 'Exited' : session ? sessionLabel(session) : pane.alive ? 'Running' : 'Exited',
+    stateLabel: pane.alive === false && session?.retirement?.automatic !== true
+      ? 'Exited' : session ? sessionLabel(session) : pane.alive ? 'Running' : 'Exited',
     reviewer: Boolean(session?.reviewer), taskId: session?.taskId || null, num: session?.num,
     renamed: Boolean(session?.renamed), mark: session?.mark,
   };

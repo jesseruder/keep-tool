@@ -190,6 +190,25 @@ async function createFixture() {
             meta: { agent: session.kind, sessionId: session.id, accountId: account.id, accountLabel: account.label, project: session.project } });
           publish(); json({ ok: true, pane: paneId, sessionId: session.id, accountId: account.id, accountLabel: account.label, agent: session.kind }); return;
         }
+        if (url.pathname === '/api/session-keep-running' && req.method === 'POST') {
+          const session = sessions.find(candidate => candidate.id === input.sessionId);
+          if (!session || typeof input.keepRunning !== 'boolean') { json({ error: 'Invalid fixture keep-running request' }, 400); return; }
+          session.keepRunning = input.keepRunning;
+          publish(); json({ ok: true, sessionId: session.id, keepRunning: session.keepRunning }); return;
+        }
+        if (url.pathname === '/api/send' && req.method === 'POST') {
+          const session = sessions.find(candidate => candidate.id === input.sessionId);
+          if (!session) { json({ error: 'Unknown fixture session' }, 404); return; }
+          if (session.retirement?.automatic === true) {
+            const paneId = `reply-resume-${++launchSequence}`;
+            session.pane = paneId; session.state = 'running'; session.exited = false; delete session.retirement;
+            panes.push({ id: paneId, pid: 850 + launchSequence, alive: true, cwd: session.project,
+              meta: { agent: session.kind, sessionId: session.id, accountId: session.accountId, accountLabel: session.accountLabel, project: session.project } });
+          }
+          session.lastUserAt = Date.now(); session.mtime = Date.now();
+          record('input', { sessionId: session.id, text: input.text });
+          publish(); json({ ok: true, sessionId: session.id, pane: session.pane }); return;
+        }
         if (url.pathname === '/api/review-queue' && req.method === 'POST') {
           const item = state.reviewQueue.items.find(candidate => candidate.id === input.id);
           if (!item) { json({ error: 'Unknown review item' }, 404); return; }

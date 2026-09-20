@@ -7,7 +7,8 @@ import { portableTransferControls, installPortableTransferControls } from './por
 import { relayControlsHTML, installRelayControls } from './session-relay.js';
 import { sessionLabel, sessionExplanation, backgroundLabel, hostOutage, hostOutageText } from './status.js';
 import { retainSelection, selectionIndex } from './selection.js';
-import { actionsMenuHTML, installActionsMenu, patchActionsMenu, rendererControlsHTML } from './session-actions.js';
+import { actionsMenuHTML, installActionsMenu, installKeepRunningControl, keepRunningControlHTML,
+  patchActionsMenu, rendererControlsHTML } from './session-actions.js';
 import { stateLineHTML, installGrading } from './state-line.js';
 import { numBadgeHTML } from './session-number.js';
 import { installHeadingRename, installRenameControls, isEditing, renameButtonsHTML, titleAttrsHTML } from './session-rename.js';
@@ -868,7 +869,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     : `<span class="host-outage">${ctx.esc(hostOutageText(outage))}${outage.stale && outage.panesAt
       ? ` · panes last listed ${ctx.esc(ctx.rel(outage.panesAt))}` : ''}</span>`;
   const reopen = hasLivePane || pendingHandoff ? ''
-    : `<button class="btn" data-reopen ${paneUnknown ? 'disabled title="The terminal host is not answering; its panes cannot be listed."' : ''}>Reopen</button>`;
+    : `<button class="btn" data-reopen ${paneUnknown ? 'disabled title="The terminal host is not answering; its panes cannot be listed."' : ''}>${session?.retirement?.automatic === true ? 'Resume' : 'Reopen'}</button>`;
   const heading = stage.querySelector('.shead .session-heading');
   // An open rename editor lives inside this heading; patching it would type over
   // Owner's input on the next refresh.
@@ -885,14 +886,17 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   // or out of one would put the agent's own words in a card's session, which is
   // what `keep nudge` exists for.
   const relay = providerControls && item.sessionId && ownControls ? relayControlsHTML(ctx, item.sessionId) : '';
+  const keepRunning = hasLivePane && item.sessionId && ownControls && providerControls
+    ? keepRunningControlHTML(session) : '';
   const markedRunning = Boolean(item.sessionId) && ctx.isMarkedRunning(item);
   const markRunning = !item.sessionId ? ''
     : markedRunning ? '<button class="btn" data-unmark-running title="Put this session back in Waiting on you">Unmark running</button>'
     : waitingItem ? '<button class="btn" data-mark-running title="This session still has background work: list it under Running &amp; waiting until its next message or turn">Mark running</button>' : '';
   ctx.patchHTML(stage.querySelector('.quick-actions'), `${markRunning}${item.sessionId || waitingItem ? '<button class="btn" data-snooze="60">Snooze 1h</button><button class="btn" data-snooze="1440">Snooze 24h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}`);
   const menu = stage.querySelector('.session-actions');
-  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${renameButtonsHTML(item.sessionId, session?.renamed)}${markControlsHTML(ctx.esc, item.sessionId, session?.mark)}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, item.pane, pane) : ''}`);
+  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${keepRunning}${renameButtonsHTML(item.sessionId, session?.renamed)}${markControlsHTML(ctx.esc, item.sessionId, session?.mark)}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, item.pane, pane) : ''}`);
   installActionsMenu(menu, ctx, item.pane);
+  if (keepRunning) installKeepRunningControl(menu, ctx, session, api.setSessionKeepRunning);
   installRenameControls(menu, ctx, heading, item.sessionId, title, api.renameSession);
   installMarkControls(menu, ctx, item.sessionId, session?.mark, api.markSession);
   installHeadingRename(heading, ctx, item.sessionId, title, api.renameSession);
@@ -951,7 +955,9 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
       ? '<p class="muted" role="status">Loading recent conversation…</p>'
       : sessionDetail.status === 'error'
         ? `<p role="alert">Could not load recent conversation: ${ctx.esc(sessionDetail.error)} <button class="btn" data-retry-session-detail>Retry</button></p>`
-        : paneUnknown ? '' : '<p class="muted">no host pane</p>';
+        : paneUnknown ? '' : session?.retirement?.automatic === true
+          ? '<p class="muted" role="status">Paused to save memory</p>'
+          : '<p class="muted">no host pane</p>';
     let legacy = terminalHost.querySelector('.legacy');
     if (!legacy) {
       terminalHost.innerHTML = '<div class="legacy"></div>';
