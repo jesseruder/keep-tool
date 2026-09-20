@@ -215,6 +215,9 @@ function startScheduler({ snapshot, close, closeShell, record, onError = () => {
             reason: plan.kind,
             activityAt: plan.activityAt,
             notify: plan.notify,
+            processIdentity: Number.isInteger(pane.agentPid) ? {
+              pane: pane.id, panePid: pane.pid, agentPid: pane.agentPid,
+            } : null,
             idleMinutes: plan.idleMinutes,
             doneIdleMs,
             idleMs: plan.idleMs,

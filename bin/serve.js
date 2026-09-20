@@ -4837,11 +4837,18 @@ async function closeIdleSession(body, deps = {}) {
         fallbackCacheMs: 0,
       }, deps);
       const allTasks = (deps.loadAll || keep.loadAll)(true);
+      let policySession = current.sessions.find((candidate) => candidate.id === session.id);
+      if (deps.closePolicy?.retirement) {
+        const prefs = require('./session-retirement').preferences(deps.root || keep.ROOT);
+        policySession = { ...policySession, keepRunningKnown: prefs.known };
+        if (prefs.value.sessions[session.id]?.keepRunning === true) policySession.keepRunning = true;
+        else delete policySession.keepRunning;
+      }
       const legacy = deps.closePolicy.legacyDoneAt || {};
       const plan = (deps.closePolicy?.retirement
         ? require('./session-cleanup').retirementPlan
         : require('./session-cleanup').doneClosePlan)(
-        current.sessions.find((candidate) => candidate.id === session.id),
+        policySession,
         policyPane,
         { ...current, allTasks, pinned, companion },
         (deps.now || Date.now)(),
@@ -4891,14 +4898,16 @@ async function closeIdleSession(body, deps = {}) {
       // scheduler opens a fresh session for the check when its owner is closed.
       if (!ownsItsSchedule && current.tasks.some((t) => { const f = t.fm || t; return f.check_after && (f.scheduled_by === session.id || f.sessions?.some((s) => s.id === session.id)); })) throw new InjectionError(409, 'Session owns a scheduled check on another card');
       if (require('./delivery').pendingForSession(path.join(deps.root || keep.ROOT, '.keep', 'delivery'), session.id)) throw new InjectionError(409, 'Session has an unconfirmed delivery');
-      const transfer = require('./account-handoff').transferInFlight(deps.root || keep.ROOT, session.id, (deps.now || Date.now)());
-      if (transfer) throw new InjectionError(409, `Session has an account transfer in flight (${transfer.status}/${transfer.phase})`);
-      if ((deps.readPendingCompactSwap || readPendingCompactSwap)(session.id, deps.autoCompactDir)) {
-        throw new InjectionError(409, 'Session has a model switch or compaction restore in flight');
+      if (deps.closePolicy?.retirement) {
+        const transfer = require('./account-handoff').transferInFlight(deps.root || keep.ROOT, session.id, (deps.now || Date.now)());
+        if (transfer) throw new InjectionError(409, `Session has an account transfer in flight (${transfer.status}/${transfer.phase})`);
+        if ((deps.readPendingCompactSwap || readPendingCompactSwap)(session.id, deps.autoCompactDir)) {
+          throw new InjectionError(409, 'Session has a model switch or compaction restore in flight');
+        }
+        const restart = require('./session-restart').read(path.join(deps.root || keep.ROOT, '.keep', 'session-restarts.json'))
+          .find((entry) => entry.sessionId === session.id && ['queued', 'restarting', 'recovery-needed'].includes(entry.status));
+        if (restart) throw new InjectionError(409, 'Session has a restart request in flight');
       }
-      const restart = require('./session-restart').read(path.join(deps.root || keep.ROOT, '.keep', 'session-restarts.json'))
-        .find((entry) => entry.sessionId === session.id && ['queued', 'restarting', 'recovery-needed'].includes(entry.status));
-      if (restart) throw new InjectionError(409, 'Session has a restart request in flight');
     };
     checkTaskSafety(state);
     const target = claimInjectionTarget(await resolveSessionTarget(session, { expectedPane: pane.id }, deps));
@@ -4940,6 +4949,7 @@ async function closeIdleSession(body, deps = {}) {
           cwd: session.project || pane.cwd,
           account,
           env: process.env,
+          strictLeaves: deps.closePolicy?.retirement === true,
         });
       } catch (error) { throw new InjectionError(409, error.message); }
       if (initial) {
@@ -5834,8 +5844,12 @@ function sendToSessionLocked(body, deps = {}) {
     if (entry?.automatic === true) {
       const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
       if (!Array.isArray(panes)) throw new InjectionError(503, 'terminal host is unavailable; retired session cannot be resumed');
-      const live = panes.some((pane) => pane?.alive && pane.meta?.sessionId === request.sessionId
+      const matching = panes.filter((pane) => pane?.alive && pane.meta?.sessionId === request.sessionId
         && ['claude', 'codex'].includes(pane.meta?.agent));
+      const live = matching.some((pane) => pane.agentAlive === true);
+      if (!live && matching.some((pane) => pane.agentAlive !== false)) {
+        throw new InjectionError(409, 'retired session agent liveness is unknown; retry after the host refreshes');
+      }
       if (!live) {
         await (deps.openSession || openSession)({ sessionId: request.sessionId }, deps);
       }
@@ -6728,6 +6742,7 @@ async function openSession(body, deps = {}) {
     }
     if (target) {
       return withInjectionLock(async () => {
+        try { require('./session-retirement').clear(deps.root || keep.ROOT, session.id); } catch {}
         const result = {
           ok: true,
           existing: true,
@@ -9337,6 +9352,9 @@ async function closeEphemeralPane(pane, sessionId, deps = {}) {
       idleMinutes: 0,
       activityAt: require('./session-cleanup').meaningfulActivityAt(session, pane) || Date.now(),
       notify: session?.notify,
+      processIdentity: Number.isInteger(pane.agentPid) ? {
+        pane: pane.id, panePid: pane.pid, agentPid: pane.agentPid,
+      } : null,
     });
     let exitInputStarted = false;
     try {
@@ -9379,8 +9397,6 @@ async function closeEphemeralPane(pane, sessionId, deps = {}) {
         if (Array.isArray(panes) && (!current || !current.alive || current.agentAlive === false
             || current.meta?.sessionId !== sessionId)) {
           retirement.finish(root, sessionId, Date.now(), entry.transactionId);
-        } else if (current?.alive && current.agentAlive === true && current.meta?.sessionId === sessionId) {
-          retirement.cancel(root, sessionId, entry.transactionId);
         }
       } catch {} // Unknown process state retains the closing snapshot.
       throw error;

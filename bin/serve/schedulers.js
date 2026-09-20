@@ -277,6 +277,7 @@ function startSchedulers(ctx) {
       // Shell verification must see new viewers/output even inside the host-list cache TTL.
       const panes = await listHostPanes({}, true);
       const state = await addHostSessionState(await buildState({ hostPanes: panes }), { panes });
+      require('../session-retirement').reconcile(keep.ROOT, state.sessions, panes);
       const layouts = await keepConsole.readLayouts(path.join(keep.ROOT, '.keep', 'layouts.json'));
       return {
         ...state,
@@ -336,9 +337,6 @@ function startSchedulers(ctx) {
               if (Array.isArray(panes) && (!current || !current.alive || current.agentAlive === false
                   || current.meta?.sessionId !== body.sessionId)) {
                 retirement.finish(keep.ROOT, body.sessionId, Date.now(), entry.transactionId);
-              } else if (current?.alive && current.agentAlive === true
-                  && current.meta?.sessionId === body.sessionId) {
-                retirement.cancel(keep.ROOT, body.sessionId, entry.transactionId);
               }
             } catch {} // Unknown process state retains the closing snapshot.
             throw error;

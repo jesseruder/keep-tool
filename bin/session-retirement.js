@@ -86,6 +86,13 @@ function begin(root, plan, now = Date.now()) {
     idleMinutes: Math.max(0, Math.floor(Number(plan.idleMinutes) || 0)),
     activityAt: Number(plan.activityAt) || 0,
     startedAt: now,
+    ...(plan.processIdentity && Number.isInteger(plan.processIdentity.agentPid) ? {
+      processIdentity: {
+        pane: String(plan.processIdentity.pane || plan.pane),
+        ...(Number.isInteger(plan.processIdentity.panePid) ? { panePid: plan.processIdentity.panePid } : {}),
+        agentPid: plan.processIdentity.agentPid,
+      },
+    } : {}),
     ...(safeNotify(plan.notify) ? { notify: safeNotify(plan.notify) } : {}),
   };
   write(files(root).retirements, bounded(current.value));
@@ -137,17 +144,18 @@ function apply(sessions, options = {}) {
   const panes = Array.isArray(options.panes) ? options.panes : [];
   const prefs = preferences(root);
   const retired = retirements(root);
-  const live = new Set(panes.filter((pane) => pane?.alive && pane.meta?.sessionId).map((pane) => pane.meta.sessionId));
+  const live = new Set(panes.filter((pane) => pane?.alive && pane.agentAlive === true
+    && pane.meta?.sessionId).map((pane) => pane.meta.sessionId));
   for (const session of sessions || []) {
     session.keepRunningKnown = prefs.known;
     if (prefs.value.sessions[session.id]?.keepRunning === true) session.keepRunning = true;
     else delete session.keepRunning;
     const entry = retired.value.sessions[session.id];
     if (!entry?.automatic) continue;
-    const processLive = live.has(session.id) || session.runtime?.state === 'live'
-      || (session.exited !== true && session.runtime?.state !== 'exited' && session.alive === true);
-    if (processLive) continue;
     const processExited = session.exited === true || session.runtime?.state === 'exited' || session.state === 'exited';
+    const processLive = !processExited && (live.has(session.id) || session.runtime?.state === 'live'
+      || session.alive === true);
+    if (processLive) continue;
     if (!processExited) continue;
     session.retirement = {
       automatic: true,
@@ -160,9 +168,30 @@ function apply(sessions, options = {}) {
   return { preferencesKnown: prefs.known, retirementsKnown: retired.known, changed: false };
 }
 
+function reconcile(root, sessions, panes) {
+  const current = retirements(root);
+  if (!current.known) return { known: false, cleared: [] };
+  const bySession = new Map((sessions || []).map((session) => [session.id, session]));
+  const live = new Map((panes || []).filter((pane) => pane?.alive && pane.agentAlive === true
+    && pane.meta?.sessionId && Number.isInteger(pane.agentPid)).map((pane) => [pane.meta.sessionId, pane]));
+  const cleared = [];
+  for (const [sessionId, entry] of Object.entries(current.value.sessions)) {
+    const pane = live.get(sessionId);
+    const original = entry.processIdentity;
+    const resumedProcess = pane && original && (pane.id !== original.pane || pane.agentPid !== original.agentPid);
+    const lastUserAt = Number(bySession.get(sessionId)?.lastUserAt);
+    const resumedTurn = Number.isFinite(lastUserAt) && lastUserAt > Number(entry.activityAt || 0);
+    if (!resumedProcess && !resumedTurn) continue;
+    delete current.value.sessions[sessionId];
+    cleared.push(sessionId);
+  }
+  if (cleared.length) write(files(root).retirements, current.value);
+  return { known: true, cleared };
+}
+
 function lookup(root, sessionId) {
   const state = retirements(root);
   return state.known ? state.value.sessions[sessionId] || null : null;
 }
 
-module.exports = { acknowledge, apply, begin, cancel, clear, files, finish, lookup, preferences, retirements, setKeepRunning };
+module.exports = { acknowledge, apply, begin, cancel, clear, files, finish, lookup, preferences, reconcile, retirements, setKeepRunning };

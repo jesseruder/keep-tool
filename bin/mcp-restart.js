@@ -364,7 +364,7 @@ function subtree(child, rows) {
   }
   return captured;
 }
-function inspect({ root, agent, sessionId, parent, rows, cwd, account, env }) {
+function inspect({ root, agent, sessionId, parent, rows, cwd, account, env, strictLeaves = false }) {
   const executable = parent.args.split(/\s+/)[0];
   const runtime = agent === 'codex' && executable.startsWith('/') ? path.join(path.dirname(executable), 'codex-code-mode-host') : null;
   const pinCache = new Map(); // One fresh inspection only; never across exit checks.
@@ -373,10 +373,22 @@ function inspect({ root, agent, sessionId, parent, rows, cwd, account, env }) {
   return rows.filter(p => p.ppid === parent.pid).flatMap(child => {
     if (agent === 'codex') {
       const tree = require('./runtime-restart').match({ root, agent, sessionId, parent, child, rows, pinCache });
-      if (tree) return tree;
+      if (tree) {
+        if (strictLeaves && tree.length !== 1) throw Error('Local background processes are still present');
+        return tree;
+      }
     }
     const refuse = () => { throw Error('Local background processes are still present'); };
     if (!child.pidStart) refuse();
+    // Retirement admits only exact audited/runtime leaves. Restart keeps accepting
+    // a declared server subtree because that transaction waits for every captured
+    // descendant; retirement must not mistake work launched by a server for a helper.
+    if (strictLeaves) {
+      if (rows.some(p => p.ppid === child.pid) || !approved(root, agent, child)) refuse();
+      if (captured.has(child.pid)) refuse();
+      captured.add(child.pid);
+      return [{ pid: child.pid, ppid: child.ppid, pidStart: child.pidStart, args: child.args }];
+    }
     declared ??= declarations({ agent, parent, cwd, account });
     if (declared.some(entry => declaredMatch(child, entry, { rows, env }))) {
       const tree = subtree(child, rows);
