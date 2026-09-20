@@ -632,31 +632,48 @@ Only a validated interactive root transcript may continue; child threads, pendin
 tools, and unanswered synchronous or asynchronous questions are protected.
 The question PreToolUse matcher is `^(?:.*\.)?request_user_input(?:_async)?$`.
 
-Automatic cleanup checks every five minutes. An agent session becomes eligible 15
-minutes after the later of its card's transition to `done` and its last transcript,
-pane input, or pane output activity. Every card linked to the session must be done.
-Background ledgers, Codex companion jobs, process
-children, pinned panes, attached viewers, drafts, and unknown activity protect the
-session. Output remains unread until a visible viewer receives the pane history;
-unread output protects the session even after the idle window passes.
+Automatic cleanup checks on the existing five-minute sweep. A completed scheduled
+check is eligible as soon as its turn settles. A session whose linked cards are all
+done is eligible after 15 idle minutes; a session durably waiting for a question,
+review, scheduled check, need, or dependency after 30 minutes; and any other settled,
+unviewed conversation—including a generic wait for the next instruction—after 60
+minutes. Transcript and user-input timestamps measure that idle time. Terminal
+redraws and saved Watch layouts do not reset or pin it.
 
-Eligible sessions use the console's graceful Close path. Only a successfully
+Background ledgers, Codex companion jobs, actual command or worker children, visible
+viewers, drafts, terminal question/permission/plan dialogs, session-local timers,
+standing agents, and unknown activity protect the process. Known runtime and MCP
+helper descendants qualify only through the same identity-checked audit used by
+restart; executable names alone never qualify. `keep keep-running [<#n|session-id>]
+on|off` controls a persistent process pin independent of **Pin to Watch**; the latter
+only changes the console layout. The equivalent API is `POST
+/api/session-keep-running` with the exact JSON body `{sessionId, keepRunning}`.
+
+Eligible sessions use the console's guarded graceful-exit path. Only a successfully
 submitted `/exit` may progress to the existing timeout-based TERM/KILL fallback;
 any refusal, changed input, or safety-check race cancels force escalation. The card
-keeps its session link and gets a `closed (daemon): idle N min after done` log entry,
-so `keep open <card>` resumes the same Claude or Codex thread.
+and transcript keep their session link, pending attention, unread completion, and
+scheduled state. The console labels the exited conversation **Paused to save memory**,
+and the row carries `retirement: {automatic: true, at, reason, idleMinutes}`.
+`keep open <card>`, Resume, or a reply resumes the same Claude or Codex thread. Reply
+resume happens inside `/api/send`, which retains its ordinary success response and
+does not duplicate the message. Explicit Close keeps its separate acknowledgement
+behavior.
 
 Managed zsh panes, including shells left after an agent exits, retain their separate
 eight-hour cleanup. Shell cleanup requires a verified empty prompt and no child
 processes, and rechecks identity and activity before sending EOF. Exit attempts and
 refusals are recorded in `.keep/session-cleanup.json`; failures retry at most once
-per hour. Set `KEEP_AUTO_CLOSE_DONE_MIN` to another idle window in minutes. Set
-`KEEP_AUTO_CLOSE=0` to disable both agent and shell automatic cleanup.
+per hour. Set `KEEP_AUTO_CLOSE_DONE_MIN`, `KEEP_AUTO_CLOSE_ATTENTION_MIN`, and
+`KEEP_AUTO_CLOSE_UNATTENDED_MIN` to change the three agent windows. Set
+`KEEP_AUTO_CLOSE=0` to disable both agent and shell automatic cleanup. The existing
+done-window variable and master switch are backward compatible; the attention and
+unattended variables only split the additional settled-session tiers.
 
 Automatic Codex cleanup can retire parents with completed remote children only
 when the full, identity-checked descendant history proves completion and remains
 unchanged before exit. Missing/legacy child evidence, yielded commands and local
-child processes remain protected. The existing age, pin, viewer, draft and task
+child processes remain protected. The existing age, viewer, draft and task
 guards still apply; explicit Close retains its separate graceful-then-force policy.
 
 Each continuation is appended to `.keep/continues.jsonl` with its card, session, step,

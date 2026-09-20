@@ -254,7 +254,9 @@ instructions](app/README.md).
     "KEEP_REVIEW_SWEEP_AT": "07:45",
     "KEEP_OPEN_CLAUDE_FLAGS": "",
     "KEEP_OPEN_CODEX_FLAGS": "",
-    "KEEP_AUTO_CLOSE_DONE_MIN": "15"
+    "KEEP_AUTO_CLOSE_DONE_MIN": "15",
+    "KEEP_AUTO_CLOSE_ATTENTION_MIN": "30",
+    "KEEP_AUTO_CLOSE_UNATTENDED_MIN": "60"
   }
 }
 ```
@@ -273,9 +275,18 @@ agent account. Scheduled recipes run in agents, and the reviewer is an ordinary
 interactive agent with the permissions you give it. Set launch permission flags
 explicitly if your workflow needs unattended privileged actions. Compaction keeps
 its existing `KEEP_AUTO_COMPACT` control; see the [command reference](docs/reference.md).
-Done-card sessions close after 15 idle minutes by default; set
-`KEEP_AUTO_CLOSE_DONE_MIN` to another number of minutes, or set `KEEP_AUTO_CLOSE=0`
-to disable automatic session and shell cleanup.
+Settled agent processes retire without deleting their conversations: completed
+scheduled checks retire immediately, sessions whose linked cards are all done after
+15 idle minutes, sessions durably waiting for a question, review, check, need or
+dependency after 30 minutes, and other settled conversations after 60 minutes.
+Configure the three windows with `KEEP_AUTO_CLOSE_DONE_MIN`,
+`KEEP_AUTO_CLOSE_ATTENTION_MIN`, and
+`KEEP_AUTO_CLOSE_UNATTENDED_MIN`; set `KEEP_AUTO_CLOSE=0` to disable automatic agent
+and shell cleanup. `keep keep-running [<#n|session-id>] on` persistently protects a
+session's process; use `off` to return it to this policy. Keep running is separate
+from **Pin to Watch**, which only controls the console layout. The existing
+`KEEP_AUTO_CLOSE_DONE_MIN` and `KEEP_AUTO_CLOSE=0` settings keep their prior meanings;
+the attention and unattended windows are additional controls.
 
 Remote access requires setting `KEEP_HOST` explicitly; the default binds only to
 loopback. Remote API requests use the private registry's `.keep/token`.
