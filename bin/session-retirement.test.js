@@ -38,15 +38,17 @@ test('automatic retirement restores unread completion only while exited, acknowl
   assert.deepEqual(exited.notify, { type: 'complete', message: 'Finished the migration.' });
 
   assert.equal(retirement.acknowledge(root, 'session-one'), true);
-  const acknowledged = { ...exited, notify: undefined, retirement: undefined };
-  retirement.apply([acknowledged], { root, panes: [], write: false });
-  assert.equal(acknowledged.notify, undefined, 'acknowledgement survives rebuild and restart reads');
+  retirement.apply([exited], { root, panes: [], write: false });
+  assert.equal(exited.notify, undefined, 'acknowledgement clears a restored notify on the reused cached row');
 
-  const resumed = { ...acknowledged, exited: false, alive: true, runtime: { state: 'live' }, retirement: undefined };
+  retirement.clear(root, 'session-one');
+  retirement.apply([exited], { root, panes: [], write: false });
+  assert.equal(exited.retirement, undefined, 'a cleared record removes derived retirement from the reused cached row');
+  assert.equal(exited.notify, undefined, 'a cleared record does not resurrect its completion');
+
+  const resumed = { ...exited, exited: false, alive: true, runtime: { state: 'live' }, retirement: undefined };
   retirement.apply([resumed], { root, panes: [{ alive: true, agentAlive: true, meta: { sessionId: 'session-one' } }] });
   assert.equal(resumed.retirement, undefined);
-  assert.ok(retirement.lookup(root, 'session-one'), 'read-only state projection does not race a close transaction');
-  retirement.clear(root, 'session-one');
   assert.equal(retirement.lookup(root, 'session-one'), null, 'successful resume deactivates old retirement metadata');
 }));
 
@@ -67,6 +69,19 @@ test('a parent shell is exited for retirement state and a verified new process o
   retirement.begin(root, { sessionId: 'resumed', pane: 'new-pane', reason: 'settled-unattended',
     idleMinutes: 60, activityAt: 300, processIdentity: { pane: 'new-pane', panePid: 20, agentPid: 22 } });
   assert.deepEqual(retirement.reconcile(root, [{ id: 'resumed', lastUserAt: 301 }], []).cleared, ['resumed']);
+}));
+
+test('clearing retirement keeps a genuinely newer notification on a reused row', () => fixture((root) => {
+  retirement.begin(root, { sessionId: 'fresh-notify', pane: 'pane', reason: 'settled-attention',
+    idleMinutes: 30, activityAt: 1, notify: { type: 'complete', message: 'old completion' } });
+  retirement.finish(root, 'fresh-notify');
+  const row = { id: 'fresh-notify', exited: true, runtime: { state: 'exited' } };
+  retirement.apply([row], { root, panes: [] });
+  row.notify = { type: 'permission', message: 'new approval' };
+  retirement.clear(root, 'fresh-notify');
+  retirement.apply([row], { root, panes: [] });
+  assert.deepEqual(row.notify, { type: 'permission', message: 'new approval' });
+  assert.equal(row.retirement, undefined);
 }));
 
 test('a dashboard poll cannot erase a closing retirement snapshot', () => fixture((root) => {

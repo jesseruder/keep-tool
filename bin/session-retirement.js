@@ -5,6 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const ID = /^[A-Za-z0-9_-]+$/;
+const retirementNotifyOverlay = new Map();
 
 function files(root) {
   return {
@@ -70,6 +71,11 @@ function safeNotify(notify) {
     ...(typeof notify.message === 'string' ? { message: notify.message.slice(0, 12000) } : {}),
     ...(Array.isArray(notify.options) ? { options: notify.options.filter((v) => typeof v === 'string').slice(0, 20) } : {}),
   };
+}
+
+function notifyKey(notify) {
+  const safe = safeNotify(notify);
+  return safe ? JSON.stringify(safe) : '';
 }
 
 function begin(root, plan, now = Date.now()) {
@@ -147,6 +153,13 @@ function apply(sessions, options = {}) {
   const live = new Set(panes.filter((pane) => pane?.alive && pane.agentAlive === true
     && pane.meta?.sessionId).map((pane) => pane.meta.sessionId));
   for (const session of sessions || []) {
+    // Settled-session cache rows are reused. Remove only fields this projection
+    // attached last time before deriving them again; a fresh marker with different
+    // content remains genuine conversation state.
+    delete session.retirement;
+    const priorOverlay = retirementNotifyOverlay.get(session.id);
+    if (priorOverlay && notifyKey(session.notify) === priorOverlay) delete session.notify;
+    retirementNotifyOverlay.delete(session.id);
     session.keepRunningKnown = prefs.known;
     if (prefs.value.sessions[session.id]?.keepRunning === true) session.keepRunning = true;
     else delete session.keepRunning;
@@ -163,7 +176,10 @@ function apply(sessions, options = {}) {
       reason: entry.reason,
       idleMinutes: entry.idleMinutes,
     };
-    if (!session.notify && entry.notify) session.notify = { ...entry.notify };
+    if (!session.notify && entry.notify) {
+      session.notify = { ...entry.notify };
+      retirementNotifyOverlay.set(session.id, notifyKey(session.notify));
+    }
   }
   return { preferencesKnown: prefs.known, retirementsKnown: retired.known, changed: false };
 }
