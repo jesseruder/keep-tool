@@ -1269,3 +1269,22 @@ test('any successful open ends the deferral streak, not only the scheduler own p
       'a stale streak would carry its fallback attempts into the next exhausted window');
   } finally { _resetSchedulerState(); }
 });
+
+test('the fallback notice dates the streak, not the card due date', async () => {
+  _resetSchedulerState();
+  const opened = [];
+  setOpener(async (body) => { opened.push(body); return { ok: true, sessionId: 'sid-fb', pane: 'p9' }; });
+  try {
+    // The card came due long before anything deferred it — a daemon that was down when
+    // it fell due did not defer it for those days.
+    const task = card({ check_after: '2020-01-01T00:00' });
+    const landed = [];
+    const deps = { checkinTask: (id, payload) => landed.push(payload), fallbackAccountId: 'claude-secondary' };
+    await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-16', deps);
+    const since = loadSchedulerState().deferred.get('some-card').since;
+    await handleBudgetDeferral(task, 'weekly usage at 97%', '2026-09-17', deps);
+    assert.equal(opened.length, 1);
+    assert.match(landed.at(-1).message, new RegExp(`check deferred since ${since.replace('T', ' ')} on the checks account`));
+    assert.doesNotMatch(landed.at(-1).message, /2020-01-01/);
+  } finally { setOpener(null); _resetSchedulerState(); }
+});

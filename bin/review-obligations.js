@@ -230,7 +230,8 @@ function satisfiedByCoverage(record, reviewRecords, now) {
     if (!review || !String(review.jobAccountId || '').trim()) return false;
     if (review.job && review.job === record.job) return false; // citedBy already covers it
     if ((timeMs(review.at) ?? 0) < opened) return false;
-    return record.commits.every((commit) => (review.commits || []).some((other) => samePatch(commit, other)));
+    const covered = Array.isArray(review.commits) ? review.commits : [];
+    return record.commits.every((commit) => covered.some((other) => samePatch(commit, other)));
   });
 }
 
@@ -277,7 +278,7 @@ function decide(record, { job, jobUnknown = false, live, discovery = 'ok', revie
     // Not "no verdict was ever recorded": one may be on the card already, for this very
     // job, written before this obligation was opened — citedBy deliberately will not
     // match it, which is a statement about the obligation and not about the card.
-    return stopWaiting(`Codex job ${record.job} finished ${forHumans(sinceState)} ago and Keep never matched a verdict to it`);
+    return stopWaiting(`Keep has waited ${forHumans(sinceState)} for the verdict of Codex job ${record.job} and never matched one to it`);
   }
   // What the live sweep says about the process. It decides on its own only when there is
   // no job file to read — the snapshot and the file are read separately, so a job that
@@ -294,7 +295,7 @@ function decide(record, { job, jobUnknown = false, live, discovery = 'ok', revie
   const alive = Boolean(live) && !job;
   if (jobUnknown || (!job && discovery !== 'ok') || alive) {
     if (age > MAX_RUNNING_MS) {
-      return stopWaiting(`Keep has not been able to see Codex job ${record.job} for ${forHumans(age)}`);
+      return stopWaiting(`Keep has waited ${forHumans(age)} for Codex job ${record.job} and still cannot read its result`);
     }
     return touch(alive ? 0 : misses);
   }
@@ -317,7 +318,7 @@ function decide(record, { job, jobUnknown = false, live, discovery = 'ok', revie
     // so the abandonment ceiling above has already fired.
     return record.state === 'awaiting-verdict'
       ? touch(0)
-      : { state: 'awaiting-verdict', note: 'the job finished; the verdict is not recorded yet' };
+      : { state: 'awaiting-verdict', note: 'the job finished; Keep has not matched a verdict to it' };
   }
   if (FAILED_STATUSES.has(status)) {
     return { state: 'failed', note: `Codex job ${record.job} ended ${status}` };
@@ -326,7 +327,7 @@ function decide(record, { job, jobUnknown = false, live, discovery = 'ok', revie
   // so a completed result always wins over a snapshot taken before it was written.
   if (gone) return failedByLive(record, live);
   if (age > MAX_RUNNING_MS) {
-    return stopWaiting(`Codex job ${record.job} has been running for ${forHumans(age)}`);
+    return stopWaiting(`Keep has waited ${forHumans(age)} for Codex job ${record.job}, which has not finished`);
   }
   return touch(0);
 }

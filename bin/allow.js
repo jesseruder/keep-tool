@@ -197,7 +197,9 @@ function decide(task, request, { amount, now = Date.now() } = {}) {
 function coveringRecords(records, commit) {
   const sha = String(commit && commit.sha || '');
   const patchId = String(commit && commit.patchId || '');
-  return (records || []).filter((record) => (record.commits || []).some((entry) => {
+  // `commits` comes off disk and may be any shape; a throw in the land gate would be an
+  // exception where a refusal belongs.
+  return (records || []).filter((record) => (Array.isArray(record.commits) ? record.commits : []).some((entry) => {
     const entryPatch = String(entry && entry.patchId || '');
     if (patchId && entryPatch) return entryPatch === patchId;
     const entrySha = String(entry && entry.sha || '');

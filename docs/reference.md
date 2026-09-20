@@ -1075,8 +1075,17 @@ measure negative time and gate its commits until that date.
 Two properties hold. **Nothing here ever writes a verdict**: a job that died fails the
 obligation so the review is re-run, and is never mistaken for a clean one. And every
 obligation reaches a terminal state on its own, so a job that died in the night cannot
-block a card forever — `failed` and `abandoned` stop gating the land, and the commits
-are then refused for the ordinary reason, that they have no review record.
+block a card forever — `failed` and `abandoned` stop gating the land, and the land is
+then decided by the ordinary rules above.
+
+That second property is a deliberate trade, and it is worth being explicit about what it
+costs: a card whose only clean record is an agent self-attestation with 80+ characters of
+evidence *will* land once its outstanding obligation terminates. The obligation is what
+stops a session self-attesting while the independent review it launched is still in
+flight; it is not a second attestation bar, and keeping it forever would be exactly the
+endless blocker on a dead job this mechanism exists to avoid. The card records the
+`review failed` check-in either way, so the terminated obligation is visible to anyone
+reading it.
 
 The sweep writes each transition **before** it announces it, and **every** writer of the
 file — the sweep, `keep reviewing`'s append, its `--drop`, and `keep reviewed`'s settle —
@@ -1090,11 +1099,13 @@ re-read the record, re-read the card's review records, write the check-in, clear
 A verdict recorded in the meantime cancels the announcement rather than being
 contradicted by it, and that check covers terminal records too.
 
-A check-in says only what Keep observed. Not that no verdict was produced — a review
-abandoned after six hours may have produced one nobody recorded — and not that these
-commits have no review record, which is a question about the whole card that
-`keep reviews` answers and this does not. It reports that Keep stopped waiting, what it
-saw, and where to look. A record Keep cannot use is normalised on
+A check-in says only what Keep observed, and so does the reason inside it, which is
+interpolated verbatim. Not that no verdict was produced — a review abandoned after six
+hours may have produced one nobody recorded. Not that these commits have no review
+record, which is a question about the whole card that `keep reviews` answers and this
+does not. And not how long the *job* ran or how long ago it finished: a daemon that was
+down for a day did not watch it for that day, so every duration is how long **Keep
+waited**. It reports that Keep stopped waiting, what it saw, and where to look. A record Keep cannot use is normalised on
 read rather than throwing mid-sweep, and each card is settled inside its own try, so one
 bad record costs its own card a tick instead of every card after it in the listing. A card that refuses the check-in a dozen times running (an archived
 one always will) is given up on with an error rather than retried forever, and a record

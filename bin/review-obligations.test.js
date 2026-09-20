@@ -78,7 +78,10 @@ test('a companion Keep could not read never fails a live obligation', () => {
   const ancient = pending({ at: new Date(now - 8 * HOUR).toISOString() });
   const stopped = obligations.decide(ancient, { job: null, discovery: 'unknown', now });
   assert.equal(stopped.state, 'abandoned');
-  assert.match(stopped.note, /has not been able to see Codex job job-42 for 8h/);
+  // Not "has not been able to see it for 8h": the age is how long the obligation has
+  // been open, and a live row may say Keep can see the job right now. What it knows is
+  // how long it has waited and that it still cannot read a result.
+  assert.match(stopped.note, /^Keep has waited 8h for Codex job job-42 and still cannot read its result$/);
 });
 
 test('a finished job becomes a verdict Keep is waiting for, and says so once', () => {
@@ -98,7 +101,10 @@ test('a verdict nobody ever records is abandoned rather than blocking forever', 
   // written before the obligation was opened. What Keep can say is that it never
   // matched one to this obligation.
   assert.doesNotMatch(decision.note, /no verdict was ever recorded/);
-  assert.match(decision.note, /finished 8h ago and Keep never matched a verdict to it/);
+  // "finished 8h ago" is a claim about the job; a daemon that was down for a day did
+  // not watch it for that day. How long Keep waited is what Keep knows.
+  assert.doesNotMatch(decision.note, /finished 8h ago/);
+  assert.match(decision.note, /^Keep has waited 8h for the verdict of Codex job job-42 and never matched one to it$/);
 });
 
 test('a review that came back settles the obligation whatever it found', () => {
@@ -152,8 +158,8 @@ test('a dead, stalled, failed or endless job fails the obligation rather than pa
   // …until it has been running for longer than any review takes.
   const endless = obligations.decide(pending({ at: new Date(now - 8 * HOUR).toISOString() }), { job: { status: 'running' }, now });
   assert.equal(endless.state, 'abandoned');
-  assert.match(endless.note, /^Codex job job-42 has been running for 8h$/,
-    'the status of the job is an observation; "with no verdict" was an inference about the card');
+  assert.match(endless.note, /^Keep has waited 8h for Codex job job-42, which has not finished$/,
+    'the age is how long Keep waited; the job may have been queued rather than running for it');
 });
 
 test('a terminal obligation is never reopened by the sweep', () => {
@@ -597,12 +603,12 @@ test('an undated awaiting-verdict record with a finished job still stops waiting
   const undated = pending({ state: 'awaiting-verdict', at: 'nonsense', stateAt: 'nonsense' });
   const decision = obligations.decide(undated, { job: { status: 'completed' }, now });
   assert.equal(decision.state, 'abandoned', 'an undated record is not perpetually just-settled');
-  assert.match(decision.note, /finished an unknown length of time ago/);
+  assert.match(decision.note, /waited an unknown length of time for the verdict/);
   assert.doesNotMatch(decision.note, /Infinity|NaN/);
   // And an undated record that does reach a time ceiling says so readably.
   const missing = obligations.decide(pending({ at: 'nonsense', stateAt: 'nonsense' }), { job: null, discovery: 'unknown', now });
   assert.equal(missing.state, 'abandoned');
-  assert.match(missing.note, /an unknown length of time/);
+  assert.match(missing.note, /waited an unknown length of time for Codex job job-42/);
   assert.doesNotMatch(missing.note, /Infinity/);
 });
 
@@ -935,4 +941,22 @@ test('the dropped-record diagnostics say which kind of record they counted', () 
     assert.ok(result.errors.some((error) => /1 pending review record\(s\) have no usable id/.test(error)));
     assert.ok(result.errors.some((error) => /2 entr\(ies\) .* are not records Keep recognises/.test(error)));
   } finally { box.cleanup(); }
+});
+
+// ---------- what round eight found ----------
+
+test('a review record of any shape cannot stop a card settling', () => {
+  const now = Date.now();
+  // Review records come off disk and may be anything. A throw here left this card's
+  // obligations open on every sweep from then on, protected only by the per-card catch.
+  const misshapen = [
+    { id: 'rev-1', job: 'job-99', jobAccountId: 'codex-main', at: new Date(now).toISOString(), commits: {} },
+    { id: 'rev-2', job: 'job-98', jobAccountId: 'codex-main', at: new Date(now).toISOString(), commits: 'nope' },
+    { id: 'rev-3', job: 'job-97', jobAccountId: 'codex-main', at: new Date(now).toISOString() },
+  ];
+  assert.equal(obligations.satisfiedByCoverage(pending(), misshapen, now), false);
+  assert.equal(obligations.decide(pending(), { job: { status: 'completed' }, reviewRecords: misshapen, now }).state,
+    'awaiting-verdict');
+  // The land gate reads the same records and must refuse rather than throw.
+  assert.equal(allow.decideLand({ records: misshapen, commits: [commit('a'.repeat(40), 'p1')] }).ok, false);
 });

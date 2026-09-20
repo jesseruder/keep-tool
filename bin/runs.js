@@ -508,6 +508,11 @@ function noteStalledCheck(task, entry, reason, deps = keep) {
 // account, and say so on the card either way. Returns true when the escalation was
 // carried out (and may be latched), false when it should be retried next tick.
 async function escalateBudgetDeferral(task, reason, today, opts = {}) {
+  // Read before anything opens: a successful open clears the streak, and the notice is
+  // dated by the streak's own first deferral rather than by the card's due date — a
+  // daemon that was down when the check fell due did not defer it for those days.
+  const streak = loadSchedulerState().deferred.get(task.id);
+  const since = String((streak && streak.since) || '').replace('T', ' ') || 'its first deferral';
   const fallbackId = opts.fallbackAccountId !== undefined
     ? opts.fallbackAccountId
     : (opts.checksFallbackAccountId || checksFallbackAccountId)();
@@ -536,7 +541,7 @@ async function escalateBudgetDeferral(task, reason, today, opts = {}) {
       try {
         (opts.checkinTask || keep.checkinTask)(task.id, {
           heading: 'check deferred',
-          message: `check deferred since ${String(task.fm.check_after || '').replace('T', ' ')} on the checks account (${clip(reason, 200)});`
+          message: `check deferred since ${since} on the checks account (${clip(reason, 200)});`
             + ` opened on the configured fallback account ${fallbackId} instead.`,
           linkSession: false,
           commitLabel: 'check',
