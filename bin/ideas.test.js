@@ -192,7 +192,7 @@ test('captureModelOutput still ends a run that outlives its wall-clock ceiling',
   tick();
   assert.deepEqual(child.signals, ['SIGTERM'], 'past the ceiling a hung generator dies anyway');
 
-  const rejection = assert.rejects(result, /ran \d+ min without finishing/);
+  const rejection = assert.rejects(result, /ran \d+ min, \d+s of it watched, without finishing/);
   child.emit('close', 0);
   await rejection;
 });

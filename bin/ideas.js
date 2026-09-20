@@ -505,7 +505,10 @@ function captureModelOutput(child, timeoutMs = MODEL_TIMEOUT_MS, deps = {}) {
       const delta = at - watchedAt;
       watchedAt = at;
       if (at - startedAt >= ceilingMs) {
-        terminate(new Error(`ideas generation ran ${Math.round((at - startedAt) / 60e3)} min without finishing`));
+        // Both totals: a generator that hung for the whole 40 minutes and a host that
+        // slept through 39 of them read the same otherwise, and they want opposite fixes.
+        terminate(new Error(`ideas generation ran ${Math.round((at - startedAt) / 60e3)} min, `
+          + `${Math.round((timeoutMs - remaining) / 1000)}s of it watched, without finishing`));
         return;
       }
       if (!(delta > 0) || delta > WATCH_GAP_MS) return;
@@ -706,7 +709,10 @@ function startScheduler({ onChange } = {}) {
     running = true;
     try {
       const result = await run({ now });
-      if (result.skipped === 'budget') recordAttempt(now, result.reason);
+      // A claim held by another runner outlives the retry cadence, so stamp the
+      // attempt for that too: otherwise every 60s tick rebuilds the evidence and
+      // reads the budget again for the rest of the claim's life, to no purpose.
+      if (result.skipped === 'budget' || result.skipped === 'in progress') recordAttempt(now, result.reason);
       if (!result.skipped && onChange) onChange();
       const record = healthForResult(result);
       if (!record.ok) process.stderr.write(`keep ideas: ${record.error}\n`);
