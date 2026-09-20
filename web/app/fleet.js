@@ -81,7 +81,7 @@ export function fleetRows(ctx) {
     if (agent !== 'shell' && agent !== 'pi' && !(['claude', 'codex'].includes(agent) && pane.alive === false)) continue;
     rows.push({
       id: sessionId || pane.id, pane: pane.id, project: pane.meta?.project || pane.cwd,
-      title: pane.meta?.title || pane.title || (agent === 'shell' ? 'shell' : 'exited session'),
+      title: pane.meta?.title || pane.title || (agent === 'shell' ? 'shell' : pane.alive ? 'Pi session' : 'exited session'),
       state: pane.alive ? 'running' : 'exited', kind: agent, branch: '', since: pane.createdAt,
       taskId: pane.meta?.card || '', session: false, waiting: '', alive: Boolean(pane.alive),
       sessionId, agent, accountId: pane.meta?.accountId || '', accountLabel: pane.meta?.accountLabel || '',

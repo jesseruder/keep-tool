@@ -1,5 +1,4 @@
-// Claude and Codex use local Simple Icons marks. Pi uses the Greek letter it is
-// named for until the Pi project provides a local logo asset.
+// Claude and Codex use local Simple Icons marks. Pi uses a typographic π mark.
 const PROVIDERS = {
   claude: { label: 'Claude Code' },
   codex: { label: 'Codex' },

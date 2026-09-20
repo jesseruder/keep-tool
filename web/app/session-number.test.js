@@ -93,8 +93,11 @@ test('Pi sessions and pane-only rows use a named pi glyph in Fleet and Triage', 
 
   const pane = { id: 'pane-pi', meta: { agent: 'pi' } };
   for (const alive of [true, false]) {
-    assert.equal(fleetRows(ctxFor([], [{ ...pane, alive }]))[0]?.kind, 'pi',
+    const row = fleetRows(ctxFor([], [{ ...pane, alive }]))[0];
+    assert.equal(row?.kind, 'pi',
       'a Pi pane remains visible in Fleet while its session record is unavailable');
+    assert.equal(row?.title, alive ? 'Pi session' : 'exited session',
+      'a sessionless Pi pane has a title that matches its live state');
   }
   const paneOnly = queueRow(ctxFor([], [pane]), { kind: 'running', pane: pane.id,
     title: 'Former Pi session', project: '/tmp/p', since: Date.now() });
