@@ -17,6 +17,9 @@ function machine(overrides = {}) {
     totalmem: () => 16 * GB,
     freemem: () => 0.4 * GB,
     env: {},
+    // The real refresh runs on a later tick; these tests drive it directly and the
+    // two below cover the deferral itself.
+    schedule: (run) => run(),
     ...overrides,
   };
   return { state, deps };
@@ -149,6 +152,40 @@ test('KEEP_PRESSURE_SWAP=0 keeps the in-process readings and spawns nothing', ()
   const reading = pressure.sample(deps);
   assert.equal(reading.load1, 44.25);
   assert.deepEqual(calls, []);
+});
+
+// Spawning is a syscall that the machine this diagnoses can make slow, so the
+// timeout path must not reach it at all — not even to start one.
+test('the timeout path never spawns: the refresh runs on a later tick', async () => {
+  pressure.resetForTest();
+  const calls = [];
+  const { deps } = machine({
+    platform: 'darwin',
+    schedule: undefined,
+    execFile: (file, args, options, callback) => { calls.push(file); callback(null, 'total = 1.00G  used = 0.50G'); return { unref() {} }; },
+  });
+  pressure.annotate('host request timed out (spawn)', deps);
+  assert.deepEqual(calls, [], 'nothing was spawned from the caller stack');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(calls, ['/usr/sbin/sysctl']);
+});
+
+test('a child that never reports releases the single-flight flag', async () => {
+  pressure.resetForTest();
+  const calls = [];
+  const { deps } = machine({
+    platform: 'darwin',
+    swapTimeoutMs: 10,
+    execFile: (file, args, options) => {
+      calls.push(options.killSignal);
+      return { unref() {}, stdout: null, stderr: null }; // never calls back
+    },
+  });
+  pressure.sample(deps);
+  assert.deepEqual(calls, ['SIGKILL'], 'the bound is a kill, not a polite signal');
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  pressure.sample(deps);
+  assert.equal(calls.length, 2, 'a wedged child does not stop later samples');
 });
 
 test('a non-macOS host never looks for swap', () => {

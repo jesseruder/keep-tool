@@ -44,9 +44,18 @@ function parseSwapUsage(text) {
   return { swapTotalBytes: total, swapUsedBytes: used };
 }
 
-// Start at most one refresh, keep it off the caller's critical path, and let the
-// process exit while it runs. A spawn can fail outright on a machine short of
-// memory, which is exactly when this is called: that failure is not worth raising.
+// Spawning is itself a syscall that a machine short of memory can make slow or fail,
+// so the caller does not even start one: the refresh is handed to a later tick on an
+// unref'd timer, and a process that ends before that tick simply never samples.
+const laterTick = (run) => {
+  const timer = setTimeout(run, 0);
+  if (timer && typeof timer.unref === 'function') timer.unref();
+};
+
+// Start at most one refresh, and make sure it always ends. `timeout` only signals,
+// so the kill is SIGKILL and a watchdog releases the single-flight flag even if the
+// child never reports; the pipes are unref'd so a lingering sysctl cannot hold the
+// process open. The whole thing is best effort — no failure here is worth raising.
 function refreshSwap(deps = {}) {
   const now = deps.now || Date.now;
   const platform = deps.platform || process.platform;
@@ -55,22 +64,37 @@ function refreshSwap(deps = {}) {
   if (swapState.pending) return;
   if (swapState.sample && now() - swapState.at < SWAP_TTL_MS) return;
   swapState.pending = true;
-  const execFile = deps.execFile || child_process.execFile;
-  try {
-    const child = execFile('/usr/sbin/sysctl', ['-n', 'vm.swapusage'],
-      { timeout: deps.swapTimeoutMs || SWAP_TIMEOUT_MS, windowsHide: true },
-      (error, stdout) => {
-        swapState.pending = false;
-        if (error) return;
-        const parsed = parseSwapUsage(stdout);
-        if (!parsed) return;
-        swapState.sample = parsed;
-        swapState.at = now();
-      });
-    if (child && typeof child.unref === 'function') child.unref();
-  } catch {
-    swapState.pending = false;
-  }
+  const timeoutMs = deps.swapTimeoutMs || SWAP_TIMEOUT_MS;
+  const schedule = deps.schedule || laterTick;
+  schedule(() => {
+    let settled = false;
+    let watchdog;
+    const settle = (parsed) => {
+      if (settled) return;
+      settled = true;
+      if (watchdog) clearTimeout(watchdog);
+      swapState.pending = false;
+      if (!parsed) return;
+      swapState.sample = parsed;
+      swapState.at = now();
+    };
+    const execFile = deps.execFile || child_process.execFile;
+    try {
+      const child = execFile('/usr/sbin/sysctl', ['-n', 'vm.swapusage'],
+        { timeout: timeoutMs, killSignal: 'SIGKILL', windowsHide: true },
+        (error, stdout) => settle(error ? null : parseSwapUsage(stdout)));
+      if (child) {
+        if (typeof child.unref === 'function') child.unref();
+        for (const pipe of [child.stdout, child.stderr]) {
+          if (pipe && typeof pipe.unref === 'function') pipe.unref();
+        }
+      }
+      watchdog = setTimeout(() => settle(null), timeoutMs * 2);
+      if (watchdog && typeof watchdog.unref === 'function') watchdog.unref();
+    } catch {
+      settle(null);
+    }
+  });
 }
 
 // Returns null when nothing readable came back, so callers can leave a message alone.

@@ -65,10 +65,19 @@ function main(argv = process.argv.slice(2)) {
     process.stderr.write(`test concurrency ${decision.concurrency} (${decision.source}; override with KEEP_TEST_CONCURRENCY)\n`);
   }
   const args = buildArgs(decision, argv, path.join(__dirname, 'test-env.cjs'));
-  const child = spawn(process.execPath, args, { stdio: 'inherit' });
+  // The suite runs in its own process group, so Ctrl-C reaches it once — through
+  // this wrapper — instead of once from the terminal and once more forwarded, which
+  // turns Node's cancelled-run handling into an abrupt kill. The group also means a
+  // `kill` aimed at the wrapper alone still stops every test process. Its stdin is
+  // the one thing not inherited: a background process group that reads the terminal
+  // is stopped with SIGTTIN, and no test here reads it.
+  const child = spawn(process.execPath, args, { stdio: ['ignore', 'inherit', 'inherit'], detached: true });
   const handlers = new Map();
   for (const signal of FORWARDED) {
-    const handler = () => { try { child.kill(signal); } catch {} };
+    const handler = () => {
+      try { process.kill(-child.pid, signal); }
+      catch { try { child.kill(signal); } catch {} }
+    };
     handlers.set(signal, handler);
     process.on(signal, handler);
   }

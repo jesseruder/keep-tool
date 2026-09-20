@@ -91,6 +91,16 @@ test('an interrupt stops the suite and is reported as a failure', async () => {
       resolve();
     });
   });
+  // Ctrl-C at a terminal goes to the foreground process group. The suite is not in
+  // it, so the only SIGINT it sees is the one this wrapper forwards.
+  const group = spawnSync('ps', ['-o', 'pgid=', '-p', String(child.pid)], { encoding: 'utf8' });
+  const suite = spawnSync('pgrep', ['-P', String(child.pid)], { encoding: 'utf8' });
+  const suitePid = String(suite.stdout || '').trim().split('\n')[0];
+  if (group.status === 0 && suite.status === 0 && suitePid) {
+    const suiteGroup = spawnSync('ps', ['-o', 'pgid=', '-p', suitePid], { encoding: 'utf8' });
+    assert.notEqual(suiteGroup.stdout.trim(), group.stdout.trim(), 'the suite shares the wrapper process group');
+  }
+
   child.kill('SIGINT');
   let guard;
   const stopped = await Promise.race([ended,
