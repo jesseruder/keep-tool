@@ -4830,6 +4830,14 @@ async function closeIdleSession(body, deps = {}) {
     if (await closeExitedCodexShell(session, pane, deps)) return { ok: true, closing: true, sessionId: session.id, pane: pane.id };
     const layouts = await keepConsole.readLayouts(path.join(deps.root || keep.ROOT, '.keep', 'layouts.json'));
     const pinned = new Set((layouts.layouts || []).flatMap((layout) => layout.ids || []));
+    const assertRetirementPreference = () => {
+      if (!deps.closePolicy?.retirement) return;
+      const prefs = require('./session-retirement').preferences(deps.root || keep.ROOT);
+      if (!prefs.known) throw new InjectionError(409, 'Keep-running preference state is unknown');
+      if (prefs.value.sessions[session.id]?.keepRunning === true) {
+        throw new InjectionError(409, 'Session is explicitly kept running');
+      }
+    };
     const checkDonePolicy = async (current, currentPane = pane, policyPane = currentPane) => {
       if (!deps.closePolicy?.done && !deps.closePolicy?.retirement) return null;
       const companion = await (deps.discoverCodexJobs || stalled.discoverCodexJobs)({
@@ -5054,6 +5062,7 @@ async function closeIdleSession(body, deps = {}) {
         try { verifyCodexChildren(); } catch (error) { throw new InjectionError(409, error.message); }
       }
       if (deps.beforeClose) await deps.beforeClose();
+      assertRetirementPreference();
       return currentPane;
     };
     await unchanged();
@@ -5066,6 +5075,7 @@ async function closeIdleSession(body, deps = {}) {
         throw new InjectionError(409, 'Pane input activity could not be verified');
       }
     }
+    assertRetirementPreference();
     deps.beforeExitInput?.();
     // Claude's slash menu can occupy more than 30 rows below the input, and on a
     // loaded machine it can take seconds to draw: 4s of polling for Claude rather
@@ -5105,6 +5115,7 @@ async function closeIdleSession(body, deps = {}) {
           if (deps.closePolicy?.retirement || deps.closePolicy?.done) {
             await inspectAutomaticProcesses({ requireGone: true });
           }
+          assertRetirementPreference();
         },
       } : {}),
     };
