@@ -37,7 +37,9 @@ function activity(session, context = {}) {
   };
   // Ordered policy over independent facts. Keep every applicable candidate so
   // an unexpected decision can be explained without logging conversation text.
-  add(session.exited || session.state === 'exited' || model.process.state === 'exited', 'process-exited', 'process', 'exited', 'Exited', null, null, 'observed', model.process.observedAt || null);
+  const processExited = session.exited || session.state === 'exited' || model.process.state === 'exited';
+  add(processExited && session.retirement?.automatic !== true,
+    'process-exited', 'process', 'exited', 'Exited', null, null, 'observed', model.process.observedAt || null);
   add(session.deadMidTurn, 'process-missing', 'process', 'inactive', 'Inactive', 'process no longer detected');
   const notify = session.notify || {};
   add(notify.type === 'permission', 'permission-notification', 'notification', 'needs-input', 'Needs input', 'permission', { kind: 'permission', detail: notify.message });
@@ -81,6 +83,12 @@ function activity(session, context = {}) {
   add(taskStatus === 'waiting', 'task-waiting', 'registry', 'waiting', 'Waiting: dependency', 'dependency');
   add(taskStatus === 'landing', 'task-landing', 'registry', 'waiting', 'Waiting: land', 'land');
   add(taskStatus === 'blocked', 'task-blocked', 'registry', 'waiting', 'Waiting: blocked', 'blocker not specified');
+  // Automatic retirement stops only the process. The conversation and its
+  // durable request remain actionable, so explicit question/review/check/card
+  // candidates above keep their precedence after the process exits. An ordinary
+  // exit still reads Exited and is not put back into attention by attention().
+  add(processExited && session.retirement?.automatic === true,
+    'process-exited', 'process', 'exited', 'Exited', null, null, 'observed', model.process.observedAt || null);
   add(true, 'no-current-work', 'fallback', 'idle', 'Idle', null, null, model.foreground.state === 'unknown' ? 'uncertain' : 'inferred');
   const chosen = candidates[0];
   const evidence = ({ rule, source, confidence, at, state }) => ({ rule, source, confidence, at: at ?? null, state });
@@ -94,7 +102,8 @@ function attention(session, context) {
   // A standing agent's session is watched through its own row under Agents, the
   // same as the reviewer's: nobody triages it from "Waiting on you", and a row
   // there would be a second listing of a pane that already has one.
-  if (session.reviewer || session.agentName || session.exited || session.state === 'exited') return null;
+  if (session.reviewer || session.agentName
+      || ((session.exited || session.state === 'exited') && session.retirement?.automatic !== true)) return null;
   const status = context ? activity(session, context) : session.activity || activity(session);
   if (!status.needsInput) return null;
   return {

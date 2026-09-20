@@ -570,8 +570,8 @@ function mergeMarkForDisplay(sessionId, patch, root) {
 // Marks a session with a color, an emoji, or both: decoration Owner (or an agent
 // he asked) puts on a session so it is findable in a long console list. Nothing
 // assigns a mark automatically, and a mark is independent of the session's name.
-// Routed through the daemon like `keep rename`, with the same registry fallback
-// when nothing is listening.
+// Routed through the daemon, which is the single writer for this registry. An
+// offline read/modify/write could lose another session's pin during daemon startup.
 commands.mark = async (argv, deps = {}) => {
   const o = parseArgs(argv, {
     emoji: 'str', color: 'str', 'no-emoji': 'bool', 'no-color': 'bool', clear: 'bool', colors: 'bool',
@@ -654,6 +654,39 @@ commands.mark = async (argv, deps = {}) => {
   const shown = mark ? [mark.emoji, mark.color].filter(Boolean).join(' ') : '';
   stdout(shown ? `marked ${named}: ${shown}` : `cleared ${named}: no mark`);
   if (unreachable) stdout("keep serve isn't running; written to the registry, the console picks it up when the daemon starts");
+};
+
+// An explicit process-lifetime preference. It is deliberately separate from
+// Watch layouts and card status: either can change without changing whether the
+// automatic retirement sweep may stop this session's current process.
+commands['keep-running'] = async (argv, deps = {}) => {
+  const o = parseArgs(argv, {});
+  const usage = 'usage: keep keep-running [<#n|session-id>] on|off';
+  if (o._.length < 1 || o._.length > 2 || !['on', 'off'].includes(o._.at(-1))) die(usage);
+  const root = deps.root || ROOT;
+  const setting = o._.at(-1) === 'on';
+  const sessionArg = o._.length === 2 ? o._[0] : null;
+  const { sessionId, num } = resolveSessionByNumberOrId(sessionArg, {
+    root,
+    currentSession: deps.currentSession || currentSession,
+    noCurrent: 'no current session: run inside a Claude or Codex session, or name one: keep keep-running <#n|session-id> on',
+  });
+  let response = null;
+  try {
+    response = await (deps.postKeepApi || postKeepApi)('/api/session-keep-running', {
+      sessionId,
+      keepRunning: setting,
+    }, 10000);
+  } catch (error) {
+    die(`keep serve did not answer (${error && error.message || error}); try again`);
+  }
+  if (response.status !== 200) {
+    let result = {};
+    try { result = JSON.parse(response.data); } catch {}
+    die(result.error || `keep serve returned an unexpected response (${response.status})`);
+  }
+  const named = num ? `${sessionNumbers.label(num)} (${sessionId})` : sessionId;
+  (deps.stdout || console.log)(`${setting ? 'keeping' : 'allowing retirement of'} ${named}`);
 };
 
 commands.project = (argv) => {
@@ -3322,6 +3355,7 @@ function helpText() {
   keep mark [<#n|session-id>] --emoji 🔥 | --color red     # mark a session so it stands out in the console
   keep mark [<#n|session-id>] --no-emoji | --no-color | --clear   # take the mark off again
   keep mark --colors                           # the eight palette colors
+  keep keep-running [<#n|session-id>] on|off   # persistently protect or release a session from automatic retirement
   keep project <id> [<path|name>] [-m "reason"]   # show or change project; preserves session links and schedule
   keep claim <card>                                # claim for the current session; run from the card's project
   keep link <card> --session <sid> --agent claude|codex|pi   # repair ownership metadata without waking or launching
@@ -3453,7 +3487,7 @@ ${stepUsage()}
   keep sync              # pull --rebase + push
   keep digest            # write digests/YYYY-MM-DD.md and print it
   keep serve             # start the dashboard server (KEEP_PORT, default 7777)
-                         # done-card sessions close after KEEP_AUTO_CLOSE_DONE_MIN (default 15); KEEP_AUTO_CLOSE=0 disables auto-close
+                         # KEEP_AUTO_CLOSE_DONE_MIN (default 15), ATTENTION_MIN (30), UNATTENDED_MIN (60); KEEP_AUTO_CLOSE=0 disables auto-close
   keep restart-daemon    # guarded daemon-only restart (requires launchd KeepAlive)
   keep accounts list [--json]
   keep accounts add <id> --agent claude|codex --label <label> --config-dir <dir>
@@ -3585,7 +3619,7 @@ module.exports = {
   tellCommandCli: commands.tell, writeOpenHandoff,
   postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE, PI_MODEL_RE,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
-  renameCommandCli: commands.rename, markCommandCli: commands.mark,
+  renameCommandCli: commands.rename, markCommandCli: commands.mark, keepRunningCommandCli: commands['keep-running'],
   accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff, transferCommandCli: commands.transfer,
   delegateCommandCli: commands.delegate,
   artifactCommandCli: commands.artifact,

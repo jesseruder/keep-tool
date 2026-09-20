@@ -7135,8 +7135,10 @@ test('a check run goes to the card thread if one is open, and otherwise opens a 
     /has no check recipe/);
 });
 
-test('the check sweep close composition refuses rather than kills, and guards its signals', async () => {
+test('the check sweep close composition refuses rather than kills, and guards its signals', async (t) => {
   const { closeEphemeralPane } = require('./serve.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-ephemeral-retirement-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const pane = { id: 'pane-check', meta: { ephemeral: 'check', sessionId: 'check-sid', agent: 'claude' } };
 
   // What the host would report for a pane that is up and has not moved.
@@ -7162,6 +7164,7 @@ test('the check sweep close composition refuses rather than kills, and guards it
   // close, so nothing is signalled and the error reaches the sweep, which leaves the pane.
   const refusing = fakeHost();
   await assert.rejects(closeEphemeralPane(pane, 'check-sid', {
+    root,
     hostRequest: refusing.request,
     withInjectionLock: (fn) => fn(),
     closeIdleSession: async () => { throw new InjectionError(409, 'the session input box has a draft'); },
@@ -7172,6 +7175,7 @@ test('the check sweep close composition refuses rather than kills, and guards it
   // A graceful close that works needs no signal at all.
   const graceful = fakeHost();
   const quiet = await closeEphemeralPane(pane, 'check-sid', {
+    root,
     hostRequest: graceful.request,
     withInjectionLock: (fn) => fn(),
     // What closeIdleSession returns on this path: the counts the caller needs to guard
@@ -7196,6 +7200,7 @@ test('the check sweep close composition refuses rather than kills, and guards it
     return stubborn.request(type, params);
   };
   const forced = await closeEphemeralPane(pane, 'check-sid', {
+    root,
     hostRequest: stubbornRequest,
     withInjectionLock: (fn) => fn(),
     closeIdleSession: async () => ({ ok: true, expectedInputCount: 3, expectedOutputCount: 9 }),
@@ -7214,6 +7219,10 @@ test('the check sweep close composition refuses rather than kills, and guards it
   let policy = null;
   const policyHost = fakeHost();
   await closeEphemeralPane(pane, 'check-sid', {
+    root,
+    loadCurrentSession: () => ({ id: 'check-sid', mtime: 123, notify: {
+      type: 'complete', message: 'check complete',
+    } }),
     hostRequest: policyHost.request,
     withInjectionLock: (fn) => fn(),
     closeIdleSession: async (_request, options) => {
@@ -7222,7 +7231,18 @@ test('the check sweep close composition refuses rather than kills, and guards it
       return { ok: true, expectedInputCount: 3, expectedOutputCount: 9 };
     },
   });
-  assert.deepEqual(policy, { automatic: true, ephemeral: true, idleMs: 0 });
+  assert.deepEqual(policy, {
+    automatic: true,
+    retirement: true,
+    ephemeral: true,
+    expectedReason: 'completed-check',
+    doneIdleMs: 0,
+    attentionIdleMs: 0,
+    unattendedIdleMs: 0,
+    idleMs: 0,
+  });
+  assert.deepEqual(require('./session-retirement').lookup(root, 'check-sid').notify,
+    { type: 'complete', message: 'check complete' });
 });
 
 test('a restarted or handed-off pane stops being the check scheduler\'s to reap', () => {

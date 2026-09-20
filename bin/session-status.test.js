@@ -101,6 +101,18 @@ test('a finished unattached session is not resurrected as a duplicate input requ
     'an unattached terminal must not hide a real unanswered question');
 });
 
+test('an automatically retired process keeps its conversation request actionable', () => {
+  const retired = { ...session, exited: true, state: 'exited', endedTurn: true,
+    retirement: { automatic: true, at: 2000, reason: 'settled-attention' },
+    lastAssistant: 'Want me to ship the follow-up?', askedProse: true };
+  const status = activity(retired, { live: false });
+  assert.equal(status.state, 'needs-input');
+  assert.equal(status.reason, 'question');
+  assert.equal(attention({ ...retired, activity: status })?.sessionId, retired.id);
+  assert.equal(attention({ ...retired, retirement: undefined, activity: status }), null,
+    'an ordinary explicit exit stays out of the live attention queue');
+});
+
 test('historical idle, completed, rate-limited and background work never imply human input', () => {
   for (const kind of ['claude', 'codex']) {
     for (const extra of [

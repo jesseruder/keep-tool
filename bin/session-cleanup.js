@@ -1,6 +1,8 @@
 'use strict';
 const IDLE_MS = 8 * 3600e3;
 const DEFAULT_DONE_IDLE_MS = 15 * 60e3;
+const DEFAULT_ATTENTION_IDLE_MS = 30 * 60e3;
+const DEFAULT_UNATTENDED_IDLE_MS = 60 * 60e3;
 
 function timeMs(value) {
   if (Number.isFinite(value)) return Number(value);
@@ -16,12 +18,17 @@ function cardsForSession(tasks, sessionId) {
 // Both paths request a graceful exit only. Unknown activity is unsafe.
 function refusal(session, pane, pinned, now = Date.now(), options = {}) {
   if (!session || !pane || !pane.alive || pane.meta?.sessionId !== session.id || pane.meta?.agent !== session.kind) return 'No matching live agent pane';
+  if (!['claude', 'codex'].includes(session.kind)) return 'Session provider does not support automatic retirement';
   if (options.restart) {
     const reason = require('./session-restart').refusal(session, pane, false, { force: options.force === true });
     return reason || (!Number.isFinite(session.mtime) ? 'Session activity time is unknown' : null);
   }
-  if (session.reviewer) return 'Fleet reviewer is protected';
-  if (!options.manual && pinned.has(pane.id)) return 'Pinned session is protected; unpin it first';
+  if (session.reviewer || session.agentName) return 'Standing agent session is protected';
+  if (options.retirement && session.keepRunningKnown !== true) return 'Keep-running preference state is unknown';
+  if (options.retirement && session.keepRunning === true) return 'Session is explicitly kept running';
+  // A saved Watch layout is presentation state. Only a viewer that is actually
+  // visible at the live host can keep an automatic retirement from proceeding.
+  if (!options.manual && !options.automatic && pinned.has(pane.id)) return 'Pinned session is protected; unpin it first';
   const nextInstruction = session.state === 'needs-input' && session.activity?.reason === 'next instruction';
   const manualScheduled = options.manual && session.state === 'waiting' && session.activity?.label === 'Waiting: scheduled check';
   // Card reviews and prose follow-up questions are not terminal dialogs.
@@ -30,20 +37,108 @@ function refusal(session, pane, pinned, now = Date.now(), options = {}) {
     session.activity?.reason === 'your review' ||
     (session.activity?.reason === 'question' && session.activity?.request?.kind === 'input')
   );
-  if ((!['idle', 'done'].includes(session.state) && !nextInstruction && !manualAttention && !manualScheduled) || session.endedTurn !== true || session.toolRunning || session.pendingBackground || require('./session-restart').blockingUnknownJobs(session).length || session.waitingFor || session.pendingQuestion || session.pendingPlan || session.rateLimit || (session.activity?.needsInput && !nextInstruction && !manualAttention)) return 'Session is active, waiting, needs input, or activity is unknown';
+  const retirementSettled = options.retirement === true
+    && ['idle', 'done', 'waiting', 'needs-input'].includes(session.state);
+  const terminalPrompt = session.pendingQuestion || session.pendingPlan
+    || ['permission', 'question'].includes(session.notify?.type)
+    || session.lifecycleForeground?.state === 'needs-input';
+  const sessionLocalTimer = session.activity?.background?.scheduled?.length
+    || session.backgroundJobs?.jobs?.some((job) => job.kind === 'scheduled' && job.status === 'pending');
+  if ((!['idle', 'done'].includes(session.state) && !nextInstruction && !manualAttention && !manualScheduled && !retirementSettled)
+      || session.endedTurn !== true || session.toolRunning || session.pendingBackground
+      || require('./session-restart').blockingUnknownJobs(session).length || session.waitingFor
+      || terminalPrompt || session.rateLimit || session.lifecycleAgents?.length || sessionLocalTimer
+      || session.lifecycleForeground?.state === 'running' || session.lifecycleForeground?.state === 'waiting'
+      || (!retirementSettled && session.activity?.needsInput && !nextInstruction && !manualAttention)) {
+    return 'Session is active, waiting, needs input, or activity is unknown';
+  }
   if (!Number.isFinite(session.mtime)) return 'Session activity time is unknown';
   const idleMs = Number.isFinite(options.idleMs) ? options.idleMs : IDLE_MS;
   const activityAt = Math.max(session.mtime, Number(options.activityAt) || 0);
   const idleLabel = idleMs === IDLE_MS ? '8 hours' : `${Math.ceil(idleMs / 60e3)} minutes`;
   if (!options.manual && now - activityAt < idleMs) return `Session has activity within the last ${idleLabel}`;
-  if (options.automatic && pane.attached !== 0) return 'Attached session or unknown viewer state is protected';
-  const outputAt = timeMs(pane.lastOutputAt);
-  if (options.automatic && (!Number.isFinite(outputAt) || now - outputAt < idleMs)) return 'Pane has recent or unknown output activity';
+  const viewers = pane.visibleAttached ?? pane.attached;
+  if (options.automatic && (!Number.isInteger(viewers) || viewers !== 0)) return 'Visible session or unknown viewer state is protected';
   const inputAt = timeMs(pane.lastInputAt);
   if (options.automatic && inputAt !== null && now - inputAt < idleMs) return 'Pane has recent input activity';
   const readAt = timeMs(pane.lastReadAt);
-  if (options.requireRead && (readAt === null || readAt < outputAt)) return 'Pane has unread output';
+  const outputAt = timeMs(pane.lastOutputAt);
+  if (options.requireRead && (readAt === null || (outputAt !== null && readAt < outputAt))) return 'Pane has unread output';
   return null;
+}
+
+function meaningfulActivityAt(session, pane) {
+  return [session?.mtime, session?.lastUserAt, session?.attentionAt, pane?.lastInputAt]
+    .map(timeMs).filter((value) => value !== null).reduce((latest, value) => Math.max(latest, value), 0);
+}
+
+function retirementPlan(session, pane, state, now = Date.now(), options = {}) {
+  const tasks = state.allTasks || state.tasks || [];
+  const cards = cardsForSession(tasks, session?.id);
+  const runningCompanion = (state.companion?.jobs || []).some((job) =>
+    [job?.sessionId, job?.session_id, job?.ownerSessionId].includes(session?.id)
+      && ['queued', 'running'].includes(job.status));
+  if (runningCompanion) return { reason: 'Session has a running Codex companion job', cards };
+
+  const activityAt = meaningfulActivityAt(session, pane);
+  const allDone = cards.length > 0 && cards.every((task) => (task.fm || task).status === 'done');
+  const durableWait = cards.some((task) => {
+    const fm = task.fm || task;
+    return fm.status === 'review' || Boolean(fm.check_after) || Boolean(fm.needs?.length)
+      || Boolean(fm.depends_on?.length);
+  });
+  // A normal ended turn is often labelled "next instruction"/needs-input. It is
+  // settled conversation, not a durable request for Owner's attention. Reserve
+  // the shorter window for an actual question/review/wait that survives process
+  // retirement in transcript or card state.
+  const conversationalWait = session?.activity?.reason === 'your review'
+    || (session?.activity?.reason === 'question' && session?.activity?.request?.kind === 'input')
+    || (session?.state === 'waiting' && session?.activity?.reason !== 'next instruction');
+  const ephemeral = pane?.meta?.ephemeral === 'check' || pane?.meta?.ephemeral === true;
+  let kind;
+  let idleMs;
+  let sinceAt = activityAt;
+  if (ephemeral && session?.endedTurn === true) {
+    kind = 'completed-check';
+    idleMs = 0;
+  } else if (allDone) {
+    kind = 'all-work-done';
+    idleMs = Number.isFinite(options.doneIdleMs) ? options.doneIdleMs : DEFAULT_DONE_IDLE_MS;
+    const legacyDoneAt = options.legacyDoneAt || (() => now);
+    const doneTimes = cards.map((task) => {
+      const fm = task.fm || task;
+      const exact = timeMs(fm.done_at);
+      if (exact !== null) return exact;
+      const observed = Number(legacyDoneAt(task));
+      const updated = timeMs(fm.updated) || 0;
+      return Math.max(Number.isFinite(observed) ? observed : now, updated);
+    });
+    sinceAt = Math.max(sinceAt, ...doneTimes);
+  } else if (durableWait || conversationalWait) {
+    kind = 'settled-attention';
+    idleMs = Number.isFinite(options.attentionIdleMs) ? options.attentionIdleMs : DEFAULT_ATTENTION_IDLE_MS;
+    const updated = cards.map((task) => timeMs((task.fm || task).updated)).filter((value) => value !== null);
+    if (updated.length) sinceAt = Math.max(sinceAt, ...updated);
+  } else {
+    kind = 'settled-unattended';
+    idleMs = Number.isFinite(options.unattendedIdleMs) ? options.unattendedIdleMs : DEFAULT_UNATTENDED_IDLE_MS;
+  }
+  const reason = refusal(session, pane, state.pinned || new Set(), now, {
+    automatic: true,
+    retirement: true,
+    idleMs,
+    activityAt: sinceAt,
+  });
+  return {
+    reason,
+    kind,
+    cards,
+    sinceAt,
+    activityAt,
+    idleMs,
+    idleMinutes: Math.max(0, Math.floor((now - sinceAt) / 60e3)),
+    notify: session?.notify || null,
+  };
 }
 
 function doneClosePlan(session, pane, state, now = Date.now(), options = {}) {
@@ -84,7 +179,8 @@ function doneClosePlan(session, pane, state, now = Date.now(), options = {}) {
 // At most one pass at a time, and one attempt per session per hour. Refusals
 // remain cheap on subsequent ticks; the close function rechecks everything.
 function startScheduler({ snapshot, close, closeShell, record, onError = () => {}, now = Date.now,
-  intervalMs = 5 * 60e3, doneIdleMs = DEFAULT_DONE_IDLE_MS }) {
+  intervalMs = 5 * 60e3, doneIdleMs = DEFAULT_DONE_IDLE_MS,
+  attentionIdleMs = DEFAULT_ATTENTION_IDLE_MS, unattendedIdleMs = DEFAULT_UNATTENDED_IDLE_MS }) {
   const attempted = new Map();
   const legacyDoneObserved = new Map();
   let busy = false;
@@ -98,8 +194,10 @@ function startScheduler({ snapshot, close, closeShell, record, onError = () => {
       for (const session of state.sessions) {
         const pane = state.panes.find((p) => p.id === session.pane);
         const at = now();
-        const plan = doneClosePlan(session, pane, state, at, {
-          idleMs: doneIdleMs,
+        const plan = retirementPlan(session, pane, state, at, {
+          doneIdleMs,
+          attentionIdleMs,
+          unattendedIdleMs,
           legacyDoneAt: (task) => {
             if (!legacyDoneObserved.has(task.id)) legacyDoneObserved.set(task.id, at);
             return legacyDoneObserved.get(task.id);
@@ -114,12 +212,16 @@ function startScheduler({ snapshot, close, closeShell, record, onError = () => {
             sessionId: session.id,
             pane: pane.id,
             cardIds: plan.cards.map((task) => task.id),
+            reason: plan.kind,
+            activityAt: plan.activityAt,
+            notify: plan.notify,
             idleMinutes: plan.idleMinutes,
             doneIdleMs,
+            idleMs: plan.idleMs,
             legacyDoneAt: Object.fromEntries(plan.cards.filter((task) => !timeMs((task.fm || task).done_at))
               .map((task) => [task.id, legacyDoneObserved.get(task.id)])),
           });
-          outcome = 'closed after done';
+          outcome = `retired: ${plan.kind}`;
         }
         catch (error) { outcome = `not closed: ${error.message}`; }
         await record({ at: now(), sessionId: session.id, pane: pane.id, outcome });
@@ -143,4 +245,7 @@ function startScheduler({ snapshot, close, closeShell, record, onError = () => {
   return { tick, stop: () => clearInterval(timer) };
 }
 
-module.exports = { refusal, doneClosePlan, startScheduler, IDLE_MS, DEFAULT_DONE_IDLE_MS };
+module.exports = {
+  refusal, meaningfulActivityAt, retirementPlan, doneClosePlan, startScheduler, IDLE_MS,
+  DEFAULT_DONE_IDLE_MS, DEFAULT_ATTENTION_IDLE_MS, DEFAULT_UNATTENDED_IDLE_MS,
+};

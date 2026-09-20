@@ -200,7 +200,7 @@ const CONSOLE_DEAD_SESSION_FIELDS = [
   'lastVerdict', 'lastVerdictAt', 'verdictConfidence', 'pendingDecision', 'pendingQuestion',
   // The session header renders its own token total beside the card's, on an exited
   // session too. It is four numbers and a count, with no updatedAt to churn.
-  'pendingPlan', 'activity', 'modelUsage', '_detailVersion',
+  'pendingPlan', 'activity', 'notify', 'retirement', 'keepRunning', 'modelUsage', '_detailVersion',
 ];
 
 const CONSOLE_DEAD_PANE_FIELDS = [

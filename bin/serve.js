@@ -1899,7 +1899,7 @@ const URGENT_DASHBOARD_MUTATIONS = new Set([
   '/api/mark-session', '/api/notifications', '/api/open', '/api/panes/spawn',
   '/api/portable-transfers', '/api/reminders', '/api/rename-session', '/api/reopen-session',
   '/api/resolve-portable-transfer', '/api/restart-daemon', '/api/restart-session', '/api/review-queue',
-  '/api/reviewtick', '/api/run', '/api/send', '/api/setaside', '/api/transfer-session',
+  '/api/reviewtick', '/api/run', '/api/send', '/api/session-keep-running', '/api/setaside', '/api/transfer-session',
 ]);
 function urgentDashboardMutation(pathname) {
   return URGENT_DASHBOARD_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname)
@@ -4831,27 +4831,35 @@ async function closeIdleSession(body, deps = {}) {
     const layouts = await keepConsole.readLayouts(path.join(deps.root || keep.ROOT, '.keep', 'layouts.json'));
     const pinned = new Set((layouts.layouts || []).flatMap((layout) => layout.ids || []));
     const checkDonePolicy = async (current, currentPane = pane, policyPane = currentPane) => {
-      if (!deps.closePolicy?.done) return null;
+      if (!deps.closePolicy?.done && !deps.closePolicy?.retirement) return null;
       const companion = await (deps.discoverCodexJobs || stalled.discoverCodexJobs)({
         root: deps.root || keep.ROOT,
         fallbackCacheMs: 0,
       }, deps);
       const allTasks = (deps.loadAll || keep.loadAll)(true);
       const legacy = deps.closePolicy.legacyDoneAt || {};
-      const plan = require('./session-cleanup').doneClosePlan(
+      const plan = (deps.closePolicy?.retirement
+        ? require('./session-cleanup').retirementPlan
+        : require('./session-cleanup').doneClosePlan)(
         current.sessions.find((candidate) => candidate.id === session.id),
         policyPane,
         { ...current, allTasks, pinned, companion },
         (deps.now || Date.now)(),
         {
           idleMs: deps.closePolicy.idleMs,
+          doneIdleMs: deps.closePolicy.doneIdleMs,
+          attentionIdleMs: deps.closePolicy.attentionIdleMs,
+          unattendedIdleMs: deps.closePolicy.unattendedIdleMs,
           legacyDoneAt: (task) => legacy[task.id],
         },
       );
       if (plan.reason) throw new InjectionError(409, plan.reason);
+      if (deps.closePolicy.expectedReason && plan.kind !== deps.closePolicy.expectedReason) {
+        throw new InjectionError(409, 'Session retirement policy changed during cleanup');
+      }
       return plan;
     };
-    await checkDonePolicy(state);
+    const checkedPlan = await checkDonePolicy(state);
     // The check sweep may only close panes that are still its own. A restart or an
     // account handoff drops `meta.ephemeral`, so a pane adopted between the sweep's
     // decision and this close belongs to whoever adopted it, not to the scheduler.
@@ -4860,7 +4868,10 @@ async function closeIdleSession(body, deps = {}) {
     }
     const cleanupSession = deps.allowTerminalRateLimit && session.kind === 'claude' && session.rateLimit
       ? { ...session, endedTurn: true, rateLimit: null } : session;
-    const reason = require('./session-cleanup').refusal(cleanupSession, pane, pinned, Date.now(), deps.closePolicy);
+    const reason = require('./session-cleanup').refusal(cleanupSession, pane, pinned, Date.now(), {
+      ...deps.closePolicy,
+      idleMs: checkedPlan?.idleMs ?? deps.closePolicy?.idleMs,
+    });
     if (reason) throw new InjectionError(409, reason);
     const checkTaskSafety = (current) => {
       const owner = current.sessions.find((s) => s.id === session.id);
@@ -4871,12 +4882,23 @@ async function closeIdleSession(body, deps = {}) {
       // ephemeral check pane: Keep opened it for one recipe, and a `check_after` on
       // that card is the schedule this very session just re-armed — holding the
       // process open for it would mean a recurring card's pane is never closed.
-      const ownsItsSchedule = deps.closePolicy?.manual || deps.closePolicy?.ephemeral;
-      if ((!ownsItsSchedule && fm.check_after) || (!deps.closePolicy?.restart && !deps.closePolicy?.ephemeral && (fm.needs?.length || fm.depends_on?.length))) throw new InjectionError(409, 'Task has a scheduled check, need, or dependency; leave the session open');
+      const ownsItsSchedule = deps.closePolicy?.manual || deps.closePolicy?.ephemeral || deps.closePolicy?.retirement;
+      if ((!ownsItsSchedule && fm.check_after) || (!deps.closePolicy?.restart && !deps.closePolicy?.ephemeral
+          && !deps.closePolicy?.retirement && (fm.needs?.length || fm.depends_on?.length))) {
+        throw new InjectionError(409, 'Task has a scheduled check, need, or dependency; leave the session open');
+      }
       // Explicit Close retires the process, not its durable scheduled recipes. The
       // scheduler opens a fresh session for the check when its owner is closed.
       if (!ownsItsSchedule && current.tasks.some((t) => { const f = t.fm || t; return f.check_after && (f.scheduled_by === session.id || f.sessions?.some((s) => s.id === session.id)); })) throw new InjectionError(409, 'Session owns a scheduled check on another card');
       if (require('./delivery').pendingForSession(path.join(deps.root || keep.ROOT, '.keep', 'delivery'), session.id)) throw new InjectionError(409, 'Session has an unconfirmed delivery');
+      const transfer = require('./account-handoff').transferInFlight(deps.root || keep.ROOT, session.id, (deps.now || Date.now)());
+      if (transfer) throw new InjectionError(409, `Session has an account transfer in flight (${transfer.status}/${transfer.phase})`);
+      if ((deps.readPendingCompactSwap || readPendingCompactSwap)(session.id, deps.autoCompactDir)) {
+        throw new InjectionError(409, 'Session has a model switch or compaction restore in flight');
+      }
+      const restart = require('./session-restart').read(path.join(deps.root || keep.ROOT, '.keep', 'session-restarts.json'))
+        .find((entry) => entry.sessionId === session.id && ['queued', 'restarting', 'recovery-needed'].includes(entry.status));
+      if (restart) throw new InjectionError(409, 'Session has a restart request in flight');
     };
     checkTaskSafety(state);
     const target = claimInjectionTarget(await resolveSessionTarget(session, { expectedPane: pane.id }, deps));
@@ -4884,21 +4906,58 @@ async function closeIdleSession(body, deps = {}) {
     const fresh = session.kind === 'claude' ? (deps.claudeSessionFor || claudeSessionFor)(session.id) : (deps.codexSessionFor || codex.sessionFor)(session.id);
     if (!fresh || typeof fresh.endedTurn !== 'boolean' || !Number.isFinite(fresh.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
     const freshEnded = fresh.endedTurn === true || (deps.allowTerminalRateLimit && fresh.rateLimit && !fresh.pendingBackground
-      && !fresh.toolRunning && !fresh.pendingQuestion && !fresh.pendingPlan && !(fresh.unknownBackgroundJobs || []).length);
+      && !fresh.toolRunning && !fresh.pendingQuestion && !fresh.pendingPlan
+      && !require('./session-restart').blockingUnknownJobs(fresh).length);
     // A forced restart already accepted uncertain background evidence upstream;
     // the transcript's turn, tool and mtime checks still have to agree.
     if (fresh.mtime !== session.mtime || !freshEnded || (!deps.closePolicy?.force && fresh.pendingBackground) || fresh.toolRunning) throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
     let verifyCodexChildren = null;
     let automaticProcessIdentity = null;
     let automaticProcessRows = null;
-    if (deps.closePolicy?.done) {
-      automaticProcessRows = await agentProcessRows(deps);
-      automaticProcessIdentity = (await liveSessionPids({ ...deps, agentProcessRows: async () => automaticProcessRows })).get(session.id);
-      if (!automaticProcessIdentity?.primary) throw new InjectionError(409, 'Session process identity could not be verified; nothing closed');
-      if (automaticProcessRows.some((process) => process.ppid === automaticProcessIdentity.pid)) {
-        throw new InjectionError(409, 'Session has child processes; leave it open');
+    let automaticHelpers = null;
+    const inspectAutomaticProcesses = async ({ initial = false, requireGone = false } = {}) => {
+      const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
+      const identity = (await (deps.liveSessionPids || liveSessionPids)({
+        ...deps, agentProcessRows: async () => rows,
+      })).get(session.id);
+      if (!identity?.primary || (!initial && (identity.pid !== automaticProcessIdentity.pid
+          || identity.pidStart !== automaticProcessIdentity.pidStart))) {
+        throw new InjectionError(409, 'Session process identity could not be verified; nothing closed');
       }
-    }
+      const parent = rows.find((process) => process.pid === identity.pid);
+      if (!parent) throw new InjectionError(409, 'Session process identity could not be verified; nothing closed');
+      let account = null;
+      try { account = accounts.forSession(session.id, session.kind, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
+      catch (error) { throw new InjectionError(409, error.message); }
+      let helpers;
+      try {
+        helpers = require('./mcp-restart').inspect({
+          root: deps.root || keep.ROOT,
+          agent: session.kind,
+          sessionId: session.id,
+          parent,
+          rows,
+          cwd: session.project || pane.cwd,
+          account,
+          env: process.env,
+        });
+      } catch (error) { throw new InjectionError(409, error.message); }
+      if (initial) {
+        automaticProcessIdentity = identity;
+        automaticProcessRows = rows;
+        automaticHelpers = helpers;
+      } else {
+        const original = new Set((automaticHelpers || []).map((helper) => `${helper.pid}:${helper.pidStart}:${helper.args}`));
+        if (helpers.some((helper) => !original.has(`${helper.pid}:${helper.pidStart}:${helper.args}`))) {
+          throw new InjectionError(409, 'Session helper processes changed during cleanup');
+        }
+      }
+      if (requireGone && !require('./mcp-restart').gone(automaticHelpers || [], rows)) {
+        throw new InjectionError(409, 'Session helper processes are still exiting; nothing force-terminated');
+      }
+      return rows;
+    };
+    if (deps.closePolicy?.retirement || deps.closePolicy?.done) await inspectAutomaticProcesses({ initial: true });
     if (session.kind === 'claude' && !(deps.closePolicy?.restart && deps.restartProof)) {
       const file = findSessionFile(session.id);
       if (!file || fs.statSync(file).size > 64 * 1024 * 1024) throw new InjectionError(409, 'Session history is too large to safely verify background completion');
@@ -4909,11 +4968,13 @@ async function closeIdleSession(body, deps = {}) {
       // ended. Automatic retirement requires no children; explicit Close may
       // override that conservative check (Codex also keeps idle runtime helpers).
       const processes = automaticProcessRows || await agentProcessRows(deps);
-      const live = await liveSessionPids({ ...deps, agentProcessRows: async () => processes });
+      const live = await (deps.liveSessionPids || liveSessionPids)({
+        ...deps, agentProcessRows: async () => processes,
+      });
       const identity = live.get(session.id);
       if (!identity || !identity.primary) throw new InjectionError(409, 'Codex process identity could not be verified; nothing closed');
       if (!deps.closePolicy?.manual) {
-        if (processes.some((p) => p.ppid === identity.pid)) throw new InjectionError(409, 'Automatic cleanup protects Codex child processes; use Close to request an explicit graceful exit');
+        if (!deps.closePolicy?.retirement && processes.some((p) => p.ppid === identity.pid)) throw new InjectionError(409, 'Automatic cleanup protects Codex child processes; use Close to request an explicit graceful exit');
         const file = (deps.codexRolloutFile || codex.rolloutFileFor)(session.id);
         if (!file || fs.statSync(file).size > 64 * 1024 * 1024) throw new InjectionError(409, 'Codex background history cannot be verified safely');
         // Remote children have no local PID. Verify durable child transcripts,
@@ -4935,16 +4996,13 @@ async function closeIdleSession(body, deps = {}) {
     let submittedPane = null;
     const unchanged = async ({ expectedInputCount = null, useAuthorizedActivity = false } = {}) => {
       let currentPane = null;
-      if (deps.closePolicy?.done) {
-        const rows = await agentProcessRows(deps);
-        const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(session.id);
-        if (!identity?.primary || identity.pid !== automaticProcessIdentity.pid
-            || rows.some((process) => process.ppid === identity.pid)) {
-          throw new InjectionError(409, 'Session process or children changed during cleanup');
-        }
+      if (deps.closePolicy?.retirement || deps.closePolicy?.done) {
+        await inspectAutomaticProcesses();
       } else if (session.kind === 'codex' && !deps.closePolicy?.manual) {
         const rows = await agentProcessRows(deps);
-        const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(session.id);
+        const identity = (await (deps.liveSessionPids || liveSessionPids)({
+          ...deps, agentProcessRows: async () => rows,
+        })).get(session.id);
         if (!identity?.primary || rows.some((p) => p.ppid === identity.pid)) throw new InjectionError(409, 'Codex child processes changed during cleanup');
       }
       const latest = session.kind === 'claude' ? (deps.claudeSessionFor || claudeSessionFor)(session.id) : (deps.codexSessionFor || codex.sessionFor)(session.id);
@@ -4955,23 +5013,24 @@ async function closeIdleSession(body, deps = {}) {
       // person did in between; only the boundary can tell that apart.
       requireNoUserActivityAfter(deps.expectedNoUserActivityAfter, latest);
       const latestEnded = latest.endedTurn === true || (deps.allowTerminalRateLimit && latest.rateLimit && !latest.pendingBackground
-        && !latest.toolRunning && !latest.pendingQuestion && !latest.pendingPlan && !(latest.unknownBackgroundJobs || []).length);
+        && !latest.toolRunning && !latest.pendingQuestion && !latest.pendingPlan
+        && !require('./session-restart').blockingUnknownJobs(latest).length);
       if (latest.mtime !== session.mtime || !latestEnded
-          || (!deps.closePolicy?.force && (latest.pendingBackground || latest.unknownBackgroundJobs?.length))
+          || (!deps.closePolicy?.force && (latest.pendingBackground
+            || require('./session-restart').blockingUnknownJobs(latest).length))
           || latest.toolRunning || latest.pendingQuestion || latest.pendingPlan) {
         throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
       }
       if (deps.closePolicy?.automatic) {
         currentPane = (await listHostPanes(deps, true))?.find((p) => p.id === pane.id);
-        if (!currentPane?.alive || currentPane.attached !== 0 || currentPane.meta?.sessionId !== session.id) throw new InjectionError(409, 'Session acquired a viewer or changed during cleanup');
+        const viewers = currentPane && (currentPane.visibleAttached ?? currentPane.attached);
+        if (!currentPane?.alive || !Number.isInteger(viewers) || viewers !== 0 || currentPane.meta?.sessionId !== session.id) throw new InjectionError(409, 'Session acquired a viewer or changed during cleanup');
         if (deps.closePolicy?.ephemeral && !currentPane.meta?.ephemeral) {
           throw new InjectionError(409, 'Pane stopped being a scheduler-opened check session during cleanup');
         }
         if (expectedInputCount !== null && currentPane.inputCount !== expectedInputCount) {
           throw new InjectionError(409, 'Session received unexpected input during cleanup');
         }
-        const currentLayouts = await keepConsole.readLayouts(path.join(deps.root || keep.ROOT, '.keep', 'layouts.json'));
-        if ((currentLayouts.layouts || []).some((layout) => layout.ids?.includes(pane.id))) throw new InjectionError(409, 'Session was pinned during cleanup');
         const currentState = await addHostSessionState(
           await (deps.buildState || buildState)({ hostPanes: [currentPane] }),
           { ...deps, panes: [currentPane] },
@@ -4991,7 +5050,7 @@ async function closeIdleSession(body, deps = {}) {
     // The input/output counts a caller needs to guard its own SIGTERM/SIGKILL. Produced
     // for automatic retirement, and for the check sweep, which passes protectInput and
     // protectOutput to manual-close and cannot enforce either without them.
-    if (deps.closePolicy?.done || deps.closePolicy?.ephemeral) {
+    if (deps.closePolicy?.retirement || deps.closePolicy?.done || deps.closePolicy?.ephemeral) {
       authorizedPane = (await listHostPanes(deps, true))?.find((candidate) => candidate.id === pane.id);
       if (!authorizedPane || !Number.isInteger(authorizedPane.inputCount)) {
         throw new InjectionError(409, 'Pane input activity could not be verified');
@@ -5028,10 +5087,15 @@ async function closeIdleSession(body, deps = {}) {
       ...(authorizedPane ? {
         expectedInputCount: authorizedPane.inputCount + 2,
         expectedOutputCount: submittedPane.outputCount,
-        beforeSignal: () => unchanged({
-          expectedInputCount: authorizedPane.inputCount + 2,
-          useAuthorizedActivity: true,
-        }),
+        beforeSignal: async () => {
+          await unchanged({
+            expectedInputCount: authorizedPane.inputCount + 2,
+            useAuthorizedActivity: true,
+          });
+          if (deps.closePolicy?.retirement || deps.closePolicy?.done) {
+            await inspectAutomaticProcesses({ requireGone: true });
+          }
+        },
       } : {}),
     };
   }, scope);
@@ -5725,7 +5789,9 @@ async function sendToSession(body, targetHint, opts, deps = {}) {
   }
 
   const session = (deps.loadCurrentSession || loadCurrentSession)(body.sessionId);
-  const target = claimInjectionTarget(await resolveSessionTarget(session, body.pane ? { expectedPane: body.pane } : targetHint, deps));
+  const target = claimInjectionTarget(await (deps.resolveSessionTarget || resolveSessionTarget)(
+    session, body.pane ? { expectedPane: body.pane } : targetHint, deps,
+  ));
   return (deps.sendToResolvedTarget || sendToResolvedTarget)(session, target, text, opts, deps);
 }
 
@@ -5760,8 +5826,26 @@ function modelCommandText(text) {
 // /api/send: lock the addressed session (and its selected pane, if any); sendToSession
 // claims the resolved pane before the precheck, so sends to other panes proceed.
 function sendToSessionLocked(body, deps = {}) {
-  const request = body && typeof body === 'object' ? body : {};
-  return withInjectionLock(() => sendToSession(request, undefined, undefined, deps),
+  const request = body && typeof body === 'object' ? { ...body } : {};
+  return withInjectionLock(async () => {
+    const root = deps.root || keep.ROOT;
+    const retirement = require('./session-retirement');
+    const entry = retirement.lookup(root, request.sessionId);
+    if (entry?.automatic === true) {
+      const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
+      if (!Array.isArray(panes)) throw new InjectionError(503, 'terminal host is unavailable; retired session cannot be resumed');
+      const live = panes.some((pane) => pane?.alive && pane.meta?.sessionId === request.sessionId
+        && ['claude', 'codex'].includes(pane.meta?.agent));
+      if (!live) {
+        await (deps.openSession || openSession)({ sessionId: request.sessionId }, deps);
+      }
+      // A successful open (or proof it was already open) makes the retirement
+      // historical. Drop the old pane hint before delivery: resume owns a new pane.
+      retirement.clear(root, request.sessionId);
+      delete request.pane;
+    }
+    return sendToSession(request, undefined, undefined, deps);
+  },
     { session: request.sessionId, pane: request.pane, model: modelCommandText(request.text) });
 }
 
@@ -6822,6 +6906,9 @@ async function openSession(body, deps = {}) {
       launch.linked = false;
     }
   }
+  if (session && launch.sessionId) {
+    try { require('./session-retirement').clear(deps.root || keep.ROOT, session.id); } catch {}
+  }
   return launch;
 }
 
@@ -7881,6 +7968,14 @@ function buildState(options = {}) {
   const dependencyCache = new Map();
   const liveHostedSessions = new Set((options.hostPanes || []).filter((pane) => pane.alive && pane.agentAlive !== false).map((pane) => pane.meta?.sessionId));
   applyHostedExitState(sessions, options.hostPanes, independentLive);
+  // Keep-running is a process preference, and automatic-retirement metadata is
+  // conversation history. Attach both before activity is derived so an unread
+  // completion preserved by retirement still produces the same attention state.
+  require('./session-retirement').apply(sessions, {
+    root: keep.ROOT,
+    panes: options.hostPanes || [],
+    write: !workerMode,
+  });
   for (const session of sessions) {
     if (['claude', 'codex'].includes(session.kind) && options.hostPanes) {
       const file = dashboardSourceFiles.get(`${session.kind}:${session.id}`)
@@ -9230,25 +9325,67 @@ async function deliverCheckToThread(task, deps = {}) {
 async function closeEphemeralPane(pane, sessionId, deps = {}) {
   const host = deps.hostRequest || hostRequest;
   const lock = deps.withInjectionLock || withInjectionLock;
-  const capabilities = await host('hello');
-  const result = await lock(() => (deps.manualClose || require('./manual-close').manualClose)(
-    { pane: pane.id, sessionId }, {
-      requireGraceful: true,
-      requireSignalGuard: true,
-      signalGuarded: capabilities.guardedKill === true,
-      protectInput: true,
-      protectOutput: true,
-      getPane: async (id) => (await host('get', { pane: id })).pane,
-      // `ephemeral` says only that Keep opened this pane for one recipe, so the card's
-      // own schedule does not pin it; `automatic` keeps every unattended-retirement
-      // guard, and `idleMs: 0` is what lets a pane that just finished its check close
-      // now instead of in eight hours.
-      graceful: (request) => (deps.closeIdleSession || closeIdleSession)(request, {
-        closePolicy: { automatic: true, ephemeral: true, idleMs: 0 },
-        withInjectionLock: (fn) => fn(),
-      }),
-      signal: (id, signal, guard) => host('guarded-kill', { pane: id, signal, ...guard }),
-    }), { pane: pane.id, session: sessionId });
+  const retirement = require('./session-retirement');
+  const root = deps.root || keep.ROOT;
+  const result = await lock(async () => {
+    let session = null;
+    try { session = (deps.loadCurrentSession || loadCurrentSession)(sessionId); } catch {}
+    const entry = retirement.begin(root, {
+      sessionId,
+      pane: pane.id,
+      reason: 'completed-check',
+      idleMinutes: 0,
+      activityAt: require('./session-cleanup').meaningfulActivityAt(session, pane) || Date.now(),
+      notify: session?.notify,
+    });
+    let exitInputStarted = false;
+    try {
+      const capabilities = await host('hello');
+      const closed = await (deps.manualClose || require('./manual-close').manualClose)(
+      { pane: pane.id, sessionId }, {
+        requireGraceful: true,
+        requireSignalGuard: true,
+        signalGuarded: capabilities.guardedKill === true,
+        protectInput: true,
+        protectOutput: true,
+        getPane: async (id) => (await host('get', { pane: id })).pane,
+        // `ephemeral` says only that Keep opened this pane for one recipe, so the card's
+        // own schedule does not pin it; `automatic` keeps every unattended-retirement
+        // guard, and `idleMs: 0` is what lets a pane that just finished its check close
+        // now instead of in eight hours.
+        graceful: (request) => (deps.closeIdleSession || closeIdleSession)(request, {
+          closePolicy: {
+            automatic: true,
+            retirement: true,
+            ephemeral: true,
+            expectedReason: 'completed-check',
+            doneIdleMs: 0,
+            attentionIdleMs: 0,
+            unattendedIdleMs: 0,
+            idleMs: 0,
+          },
+          beforeExitInput: () => { exitInputStarted = true; },
+          withInjectionLock: (fn) => fn(),
+        }),
+        signal: (id, signal, guard) => host('guarded-kill', { pane: id, signal, ...guard }),
+      });
+      retirement.finish(root, sessionId, Date.now(), entry.transactionId);
+      return closed;
+    } catch (error) {
+      if (!exitInputStarted) retirement.cancel(root, sessionId, entry.transactionId);
+      else try {
+        const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
+        const current = panes?.find((candidate) => candidate.id === pane.id);
+        if (Array.isArray(panes) && (!current || !current.alive || current.agentAlive === false
+            || current.meta?.sessionId !== sessionId)) {
+          retirement.finish(root, sessionId, Date.now(), entry.transactionId);
+        } else if (current?.alive && current.agentAlive === true && current.meta?.sessionId === sessionId) {
+          retirement.cancel(root, sessionId, entry.transactionId);
+        }
+      } catch {} // Unknown process state retains the closing snapshot.
+      throw error;
+    }
+  }, { pane: pane.id, session: sessionId });
   (deps.onChange || (() => {}))();
   return result;
 }
@@ -9869,7 +10006,8 @@ function start(deps = {}) {
   // Watch the directory so ledger creation and atomic read-state renames are seen.
   try {
     const inboxWatch = fs.watch(path.join(keep.ROOT, '.keep'), (_event, name) => {
-      if (!name || ['alerts.jsonl', 'notifications.json', 'quiet.json'].includes(String(name))) {
+      if (!name || ['alerts.jsonl', 'notifications.json', 'quiet.json',
+        'session-preferences.json', 'session-retirements.json'].includes(String(name))) {
         dashboardBuilder.invalidate({ kind: 'runtime', name });
         dashboardPublisher.invalidate();
         broadcast();

@@ -271,6 +271,8 @@ function startSchedulers(ctx) {
   restartTimer.unref();
   if (process.env.KEEP_AUTO_CLOSE !== '0') {
     const doneIdleMs = envNumber('KEEP_AUTO_CLOSE_DONE_MIN', 15) * 60e3;
+    const attentionIdleMs = envNumber('KEEP_AUTO_CLOSE_ATTENTION_MIN', 30) * 60e3;
+    const unattendedIdleMs = envNumber('KEEP_AUTO_CLOSE_UNATTENDED_MIN', 60) * 60e3;
     const cleanupSnapshot = async () => {
       // Shell verification must see new viewers/output even inside the host-list cache TTL.
       const panes = await listHostPanes({}, true);
@@ -285,6 +287,8 @@ function startSchedulers(ctx) {
     };
     require('../session-cleanup').startScheduler({
       doneIdleMs,
+      attentionIdleMs,
+      unattendedIdleMs,
       snapshot: cleanupSnapshot,
       closeShell: pane => withInjectionLock(() => require('../shell-cleanup').close(pane, {
         snapshot: cleanupSnapshot,
@@ -293,25 +297,53 @@ function startSchedulers(ctx) {
         eof: p => writeTarget({ pane: p.id }, '\x04'),
       }), { pane: pane.id }),
       close: async (body) => {
-        const hostCapabilities = await hostRequest('hello');
-        const result = await withInjectionLock(() => require('../manual-close').manualClose(body, {
-          requireGraceful: true,
-          requireSignalGuard: true,
-          signalGuarded: hostCapabilities.guardedKill === true,
-          protectInput: true,
-          protectOutput: true,
-          getPane: async (pane) => (await hostRequest('get', { pane })).pane,
-          graceful: (request) => closeIdleSession(request, {
-            closePolicy: {
-              automatic: true,
-              done: true,
-              idleMs: body.doneIdleMs,
-              legacyDoneAt: body.legacyDoneAt,
-            },
-            withInjectionLock: (fn) => fn(),
-          }),
-          signal: (pane, signal, guard) => hostRequest('guarded-kill', { pane, signal, ...guard }),
-        }), { pane: body.pane, session: body.sessionId });
+        const retirement = require('../session-retirement');
+        const result = await withInjectionLock(async () => {
+          const entry = retirement.begin(keep.ROOT, body);
+          let exitInputStarted = false;
+          try {
+            const hostCapabilities = await hostRequest('hello');
+            const closed = await require('../manual-close').manualClose(body, {
+              requireGraceful: true,
+              requireSignalGuard: true,
+              signalGuarded: hostCapabilities.guardedKill === true,
+              protectInput: true,
+              protectOutput: true,
+              getPane: async (pane) => (await hostRequest('get', { pane })).pane,
+              graceful: (request) => closeIdleSession(request, {
+                closePolicy: {
+                  automatic: true,
+                  retirement: true,
+                  expectedReason: body.reason,
+                  doneIdleMs,
+                  attentionIdleMs,
+                  unattendedIdleMs,
+                  idleMs: body.idleMs,
+                  legacyDoneAt: body.legacyDoneAt,
+                },
+                beforeExitInput: () => { exitInputStarted = true; },
+                withInjectionLock: (fn) => fn(),
+              }),
+              signal: (pane, signal, guard) => hostRequest('guarded-kill', { pane, signal, ...guard }),
+            });
+            retirement.finish(keep.ROOT, body.sessionId, Date.now(), entry.transactionId);
+            return closed;
+          } catch (error) {
+            if (!exitInputStarted) retirement.cancel(keep.ROOT, body.sessionId, entry.transactionId);
+            else try {
+              const panes = await listHostPanes({}, true);
+              const current = panes?.find((pane) => pane.id === body.pane);
+              if (Array.isArray(panes) && (!current || !current.alive || current.agentAlive === false
+                  || current.meta?.sessionId !== body.sessionId)) {
+                retirement.finish(keep.ROOT, body.sessionId, Date.now(), entry.transactionId);
+              } else if (current?.alive && current.agentAlive === true
+                  && current.meta?.sessionId === body.sessionId) {
+                retirement.cancel(keep.ROOT, body.sessionId, entry.transactionId);
+              }
+            } catch {} // Unknown process state retains the closing snapshot.
+            throw error;
+          }
+        }, { pane: body.pane, session: body.sessionId });
         keep.recordDaemonSessionClose(body.cardIds, body.sessionId, body.idleMinutes);
         broadcast();
         return result;

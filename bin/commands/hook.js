@@ -314,6 +314,8 @@ function clearClientCompletion(input) {
     try {
       const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
       if (marker.type === 'complete' && marker.source === 'codex' && marker.clientToken === token) {
+        const sid = name.slice(0, -'.json'.length);
+        if (require('../session-retirement').lookup(ROOT, sid)?.automatic === true) continue;
         fs.unlinkSync(markerFile);
       }
     } catch {}
@@ -326,7 +328,8 @@ function clearCompletionMarker(input, source) {
   const markerFile = path.join(META, 'attention', `${sid}.json`);
   try {
     const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
-    if (marker.type === 'complete' && marker.source === source) fs.unlinkSync(markerFile);
+    if (marker.type === 'complete' && marker.source === source
+        && require('../session-retirement').lookup(ROOT, sid)?.automatic !== true) fs.unlinkSync(markerFile);
   } catch {}
 }
 

@@ -44,8 +44,8 @@ test('restart cleanup admits an idle reviewer but ordinary close still protects 
   const session = { id: 'rev', kind: 'claude', reviewer: true, state: 'idle', endedTurn: true, mtime: now };
   const pane = { id: 'p', alive: true, attached: 1, meta: { sessionId: 'rev', agent: 'claude', reviewer: true } };
   assert.equal(refusal(session, pane, new Set(['p']), now, { manual: true, restart: true }), null);
-  assert.match(refusal(session, pane, new Set(), now, { manual: true }), /reviewer is protected/);
-  assert.match(refusal(session, pane, new Set(), now, { automatic: true }), /reviewer is protected/);
+  assert.match(refusal(session, pane, new Set(), now, { manual: true }), /agent session is protected/);
+  assert.match(refusal(session, pane, new Set(), now, { automatic: true }), /agent session is protected/);
   for (const patch of [{ endedTurn: false }, { pendingBackground: true }, { pendingQuestion: {} }, { toolRunning: true }]) {
     assert.ok(refusal({ ...session, ...patch }, pane, new Set(), now, { manual: true, restart: true }));
   }
@@ -139,21 +139,24 @@ test('explicit Close permits a stopped scheduled-check owner, automatic cleanup 
   }
 });
 
-test('automatic cleanup requires old output and transcript, no viewers, and no pin', () => {
+test('automatic cleanup uses transcript and input clocks, actual viewers, and not saved layout membership', () => {
   const now = Date.now();
   const session = { id: 's', kind: 'claude', state: 'needs-input', endedTurn: true, mtime: now - 2 * 86400e3, activity: { needsInput: true, reason: 'next instruction' } };
   const pane = { id: 'p', alive: true, attached: 0, lastOutputAt: new Date(session.mtime).toISOString(), meta: { sessionId: 's', agent: 'claude' } };
   const check = (patch = {}, pins = []) => refusal(session, { ...pane, ...patch }, new Set(pins), now, { automatic: true });
   assert.equal(check(), null);
-  assert.ok(check({}, ['p']));
-  for (const patch of [{ attached: 1 }, { attached: undefined }, { lastOutputAt: null }, { lastOutputAt: new Date(now).toISOString() }]) assert.ok(check(patch));
+  assert.equal(check({}, ['p']), null);
+  assert.equal(check({ lastOutputAt: null }), null);
+  assert.equal(check({ lastOutputAt: new Date(now).toISOString() }), null);
+  for (const patch of [{ attached: 1 }, { attached: undefined }]) assert.ok(check(patch));
 });
 
 test('automatic scheduler audits refusals and submissions, throttles attempts, and does not overlap', async () => {
   const { startScheduler } = require('./session-cleanup');
   let now = Date.now(), release;
   const gate = new Promise((resolve) => { release = resolve; });
-  const sessions = ['ok', 'refused', 'viewed'].map((id) => ({ id, pane: id, kind: 'claude', state: 'done', endedTurn: true, mtime: now - 2 * 86400e3 }));
+  const sessions = ['ok', 'refused', 'viewed'].map((id) => ({ id, pane: id, kind: 'claude', state: 'done', endedTurn: true,
+    keepRunningKnown: true, mtime: now - 2 * 86400e3 }));
   const panes = sessions.map((s) => ({ id: s.id, alive: true, attached: s.id === 'viewed' ? 1 : 0,
     inputCount: 0, lastOutputAt: new Date(s.mtime).toISOString(), lastReadAt: new Date(s.mtime + 1).toISOString(),
     meta: { sessionId: s.id, agent: 'claude' } }));
@@ -170,7 +173,7 @@ test('automatic scheduler audits refusals and submissions, throttles attempts, a
     await scheduler.tick();
     release(); await first;
     assert.deepEqual(closed, ['ok', 'refused']);
-    assert.deepEqual(records.map((r) => r.outcome), ['closed after done', 'not closed: draft']);
+    assert.deepEqual(records.map((r) => r.outcome), ['retired: all-work-done', 'not closed: draft']);
     await scheduler.tick(); assert.equal(closed.length, 2);
     now += 3600e3; await scheduler.tick(); assert.equal(closed.length, 4);
   } finally { scheduler.stop(); }
@@ -194,8 +197,8 @@ test('done-close policy waits from the latest done or activity time and enforces
   assert.match(doneClosePlan(session, { ...pane, lastInputAt: new Date(now - 5 * 60e3).toISOString() }, state, now).reason, /activity within/);
   assert.match(doneClosePlan(session, { ...pane, lastOutputAt: new Date(now - 5 * 60e3).toISOString(), lastReadAt: null }, state, now).reason, /activity within/);
   assert.match(doneClosePlan(session, { ...pane, lastReadAt: new Date(now - 21 * 60e3).toISOString() }, state, now).reason, /unread/);
-  assert.match(doneClosePlan(session, pane, { ...state, pinned: new Set(['p']) }, now).reason, /Pinned/);
-  assert.match(doneClosePlan(session, { ...pane, attached: 1 }, state, now).reason, /Attached/);
+  assert.equal(doneClosePlan(session, pane, { ...state, pinned: new Set(['p']) }, now).reason, null);
+  assert.match(doneClosePlan(session, { ...pane, attached: 1 }, state, now).reason, /Visible/);
   assert.match(doneClosePlan(session, pane, { ...state, allTasks: [] }, now).reason, /not linked/);
   const codex = { ...session, kind: 'codex' };
   const codexPane = { ...pane, meta: { sessionId: 's', agent: 'codex' } };
@@ -211,7 +214,8 @@ test('legacy done cards begin a conservative observation window before closing',
   const { startScheduler } = require('./session-cleanup');
   let now = Date.parse('2026-09-10T12:00:00.000Z');
   const old = new Date(now - 24 * 3600e3).toISOString();
-  const session = { id: 'legacy', pane: 'p', kind: 'claude', state: 'done', endedTurn: true, mtime: now - 24 * 3600e3 };
+  const session = { id: 'legacy', pane: 'p', kind: 'claude', state: 'done', endedTurn: true,
+    keepRunningKnown: true, mtime: now - 24 * 3600e3 };
   const pane = { id: 'p', alive: true, attached: 0, inputCount: 0, lastOutputAt: old, lastReadAt: old,
     meta: { sessionId: 'legacy', agent: 'claude' } };
   const state = { sessions: [session], panes: [pane], allTasks: [{ id: 'old-card', fm: { status: 'done', updated: old, sessions: [{ id: 'legacy' }] } }], pinned: new Set() };
@@ -464,6 +468,78 @@ test('explicit Close overrides Codex child checks but automatic cleanup and iden
       if (['manual', 'scheduled', 'scheduled-restart'].includes(mode)) { assert.equal((await operation).closing, true); assert.equal(typed, '/exit\r'); }
       else { await assert.rejects(operation, mode === 'automatic' ? /child processes/ : mode === 'scheduled-auto' ? /scheduled check/ : /identity/); assert.equal(typed, ''); }
       assert.equal(JSON.stringify(tasks), tasksBefore, 'Close leaves scheduled recipes intact');
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('automatic retirement admits only audited runtime helpers and still refuses real command children', async () => {
+  const { closeIdleSession } = require('./serve');
+  const { hash } = require('./mcp-restart');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-retirement-helper-'));
+  const rollout = path.join(root, 'rollout.jsonl');
+  const helperFile = path.join(root, 'helper');
+  const configFile = path.join(root, 'mcp.json');
+  const server = { command: helperFile, args: [] };
+  fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+  fs.writeFileSync(rollout, '{}\n');
+  fs.writeFileSync(helperFile, 'audited helper');
+  fs.writeFileSync(configFile, JSON.stringify({ mcpServers: { helper: server } }));
+  fs.writeFileSync(path.join(root, '.keep', 'mcp-restart.json'), JSON.stringify({ version: 1, servers: [{
+    agent: 'codex', restartSafe: true, audit: 'test', configFile, server: 'helper',
+    definitionSha256: hash(JSON.stringify(server)), files: { [helperFile]: hash(fs.readFileSync(helperFile)) },
+  }] }));
+  const now = Date.now();
+  const session = { id: 's', kind: 'codex', state: 'idle', endedTurn: true, keepRunningKnown: true,
+    mtime: now - 2 * 3600e3, project: root };
+  const pane = { id: 'p', pid: 100, alive: true, attached: 0, visibleAttached: 0, inputCount: 0, outputCount: 0,
+    lastInputAt: new Date(session.mtime).toISOString(), meta: { sessionId: 's', agent: 'codex' } };
+  const parent = { pid: 123, ppid: 100, pidStart: 'parent-start', agent: 'codex', interactive: true,
+    args: '/test/codex resume s' };
+  try {
+    for (const scenario of [
+      { child: { pid: 124, ppid: 123, pidStart: 'helper-start', args: helperFile } },
+      { child: { pid: 124, ppid: 123, pidStart: 'command-start', args: '/bin/bash long-running.sh' } },
+      { child: { pid: 124, ppid: 123, pidStart: 'helper-pin-start', args: helperFile }, latePin: true },
+      { child: { pid: 124, ppid: 123, pidStart: 'helper-needs-start', args: helperFile }, durableNeeds: true },
+    ]) {
+      const { child } = scenario;
+      let typed = '';
+      let builds = 0;
+      pane.inputCount = 0;
+      const rows = [parent, child];
+      const card = { id: 'card', fm: { status: 'active', updated: new Date(session.mtime).toISOString(),
+        needs: ['owner'], sessions: [{ id: 's' }] } };
+      const operation = closeIdleSession({ sessionId: 's', pane: 'p' }, {
+        root, now: () => now, closePolicy: { automatic: true, retirement: true,
+          expectedReason: scenario.durableNeeds ? 'settled-attention' : 'settled-unattended',
+          attentionIdleMs: 0, unattendedIdleMs: 0 },
+        withInjectionLock: (fn) => fn(),
+        buildState: () => ({ sessions: [{ ...session, ...(scenario.durableNeeds ? { taskId: 'card' } : {}),
+          ...(scenario.latePin && builds++ > 0 ? { keepRunning: true } : {}),
+        }], tasks: scenario.durableNeeds ? [card] : [] }),
+        loadAll: () => scenario.durableNeeds ? [card] : [],
+        codexSessionFor: () => ({ ...session }), codexRolloutFile: () => rollout,
+        agentProcessRows: async () => rows, lsof: async () => '', sleep: async () => {},
+        liveSessionPids: async () => new Map([['s', {
+          pid: parent.pid, pidStart: parent.pidStart, agent: 'codex', primary: true,
+        }]]),
+        host: { request: async (type, params) => {
+          if (type === 'list') return { panes: [{ ...pane }] };
+          if (type === 'screen') return { text: typed ? `› ${typed}\n\nstatus` : '› Ask Codex to do anything' };
+          if (type === 'input') { typed += Buffer.from(params.data, 'base64').toString(); pane.inputCount++; return {}; }
+          assert.fail(type);
+        } },
+      });
+      if (scenario.latePin) {
+        await assert.rejects(operation, /explicitly kept running/);
+        assert.equal(typed, '', 'a preference change wins the final pre-input policy check');
+      } else if (child.args === helperFile) {
+        assert.equal((await operation).closing, true);
+        assert.equal(typed, '/exit\r');
+      } else {
+        await assert.rejects(operation, /Local background processes/);
+        assert.equal(typed, '');
+      }
     }
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

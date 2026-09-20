@@ -215,7 +215,8 @@ function consoleFixture() {
         accountLabel: 'Claude Main', reviewer: true, rateLimit: { at: 5 }, lastAssistant: 'Historical preview',
         stateLine: 'Finished the review', lastVerdict: 'done', lastVerdictAt: 130, verdictConfidence: 0.9,
         pendingDecision: { id: 'd1', type: 'grade' }, pendingQuestion: 'Ship it?', pendingPlan: { text: 'plan' },
-        activity: { background: { pending: true } },
+        activity: { background: { pending: true } }, retirement: { automatic: true, at: 125, reason: 'all-work-done' },
+        keepRunning: true,
         modelUsage: { input: 1, cacheRead: 2, cacheWrite: 3, output: 4, reasoning: 0, calls: 1 },
         lastUser: 'Large user prompt', lastAssistantFull: 'Full historical tail', lastHuman: 'human', size: 999,
         opener: { via: 'keep' }, endedTurn: true, notify: { type: 'complete' }, lifecycleAgents: ['child'],
@@ -355,7 +356,7 @@ test('console state reduces every dead session and leaves live rows whole', () =
     'taskId', 'taskStatus', 'state', 'stateLabel', 'alive', 'exited', 'pane', 'mtime', 'lastUserAt',
     'turnStartedAt', 'accountId', 'account', 'accountLabel', 'reviewer', 'rateLimit', 'lastAssistant',
     'stateLine', 'lastVerdict', 'lastVerdictAt', 'verdictConfidence', 'pendingDecision',
-    'pendingQuestion', 'pendingPlan', 'activity', 'modelUsage', '_detailVersion',
+    'pendingQuestion', 'pendingPlan', 'activity', 'notify', 'retirement', 'keepRunning', 'modelUsage', '_detailVersion',
   ];
   const flagged = projected.sessions.find((session) => session.id === 'flagged-exited');
   assert.deepEqual(Object.keys(flagged).sort(), [...expectedDeadSession].sort(),
@@ -377,7 +378,7 @@ test('console state reduces every dead session and leaves live rows whole', () =
   assert.equal(flagged.account, 'claude-main-legacy', 'the legacy account field still reaches the batch count');
   assert.equal(flagged.lastAssistant, 'Historical preview');
   assert.equal(flagged.taskId, 'linked-card');
-  assert.equal(flagged.notify, undefined);
+  assert.equal(flagged.notify.type, 'complete');
   assert.equal(flagged.lastAssistantFull, undefined);
   assert.deepEqual(flagged.activity, { background: { pending: true } });
   assert.equal(typeof flagged._detailVersion, 'string');

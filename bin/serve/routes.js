@@ -425,6 +425,7 @@ function routes(ctx) {
         try {
           fs.mkdirSync(ackDir, { recursive: true });
           fs.writeFileSync(path.join(ackDir, attentionAckName(key)), JSON.stringify({ key, at: Date.now() }) + '\n');
+          if (hasSessionId) require('../session-retirement').acknowledge(keep.ROOT, body.sessionId);
         } catch (e) {
           process.stderr.write(`keep serve: acknowledgement failed: ${e.message}\n`);
           return json(res, 500, { error: 'could not save acknowledgement' });
@@ -532,6 +533,22 @@ function routes(ctx) {
         }
         broadcast();
         return json(res, 200, { ok: true, sessionId, mark: result.mark });
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/session-keep-running',
+      handle: async ({ req, res, url, body }) => {
+        const sessionId = String(body && body.sessionId || '');
+        if (!/^[A-Za-z0-9_-]+$/.test(sessionId) || typeof body?.keepRunning !== 'boolean'
+            || Object.keys(body || {}).some((key) => !['sessionId', 'keepRunning'].includes(key))) {
+          return json(res, 400, { error: 'Expected exact sessionId and boolean keepRunning' });
+        }
+        let result;
+        try { result = require('../session-retirement').setKeepRunning(keep.ROOT, sessionId, body.keepRunning); }
+        catch (error) { return json(res, 500, { error: `could not save keep-running preference: ${error.message}` }); }
+        broadcast();
+        return json(res, 200, { ok: true, ...result });
       },
     },
     {
