@@ -486,7 +486,7 @@ export function renderRail(ctx, items) {
   const clientChoice = (kind, label) => collapsed
     ? `<button data-client="${kind}" class="rail-dot ${ctx.state.providerFilter === (kind || null) ? 'on' : ''}" title="${label}" aria-label="${label}" aria-pressed="${ctx.state.providerFilter === (kind || null)}">${kind ? providerIconHTML(kind, ctx.esc) : '<span class="rail-client-all">◎</span>'}</button>`
     : `<button data-client="${kind}" class="${ctx.state.providerFilter === (kind || null) ? 'on' : ''}" aria-label="${label}" aria-pressed="${ctx.state.providerFilter === (kind || null)}">${kind ? providerIconHTML(kind, ctx.esc) : '<span class="rail-client-all">◎</span>'}<span>${label}</span></button>`;
-  const clients = `<div class="rail-clients" role="group" aria-label="Client">${collapsed ? '' : '<div class="rh">Client</div>'}${clientChoice('', 'All')}${clientChoice('claude', 'Claude Code')}${clientChoice('codex', 'Codex')}</div>`;
+  const clients = `<div class="rail-clients" role="group" aria-label="Client">${collapsed ? '' : '<div class="rh">Client</div>'}${clientChoice('', 'All')}${clientChoice('claude', 'Claude Code')}${clientChoice('codex', 'Codex')}${clientChoice('pi', 'Pi')}</div>`;
   rail.classList.toggle('collapsed', collapsed);
   rail.innerHTML = collapsed
     ? `<div class="rh"><button class="collapse" aria-expanded="false" title="Expand (⌘B)">›</button></div><button data-project="" class="rail-dot all ${ctx.state.filter ? '' : 'on'}" title="All projects">${ctx.projectIcon({ key: 'all' })}</button>${projects.map(dot).join('')}${clients}${shellButton}`

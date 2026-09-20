@@ -442,9 +442,8 @@ function sync() {
   statusButton.setAttribute('aria-expanded', String(showing('status')));
   filterButton.hidden = !triage;
   const project = ctx.state.filter && ctx.knownProjects().find((entry) => entry.key === ctx.state.filter);
-  const client = { claude: 'Claude Code', codex: 'Codex' }[ctx.state.providerFilter];
-  filterButton.textContent = [project?.name, client].filter(Boolean).join(' · ') || 'Filters';
-  filterButton.classList.toggle('on', Boolean(project || client));
+  filterButton.textContent = mobileFilterLabel(project, ctx.state.providerFilter);
+  filterButton.classList.toggle('on', Boolean(project || ctx.state.providerFilter));
   const connection = document.querySelector('#connection');
   statusButton.dataset.status = connection?.dataset.status || '';
   statusButton.querySelector('.mobile-status-label').textContent = connection?.textContent || '';
@@ -454,6 +453,11 @@ function sync() {
   badge.classList.toggle('zero', !unread);
   if (stageOpen) stageTitle.textContent = headingText() || document.querySelector('#stage .qempty b')?.textContent || '';
   alertsTab.classList.toggle('on', showing('alerts'));
+}
+
+export function mobileFilterLabel(project, providerFilter) {
+  const client = { claude: 'Claude Code', codex: 'Codex', pi: 'Pi' }[providerFilter];
+  return [project?.name, client].filter(Boolean).join(' · ') || 'Filters';
 }
 
 // The stage heading carries the session number and mark inside the same element

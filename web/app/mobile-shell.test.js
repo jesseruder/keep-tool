@@ -87,6 +87,15 @@ test('a client choice in the borrowed rail closes the mobile filter sheet', asyn
   assert.deepEqual(closed, ['client', 'project']);
 });
 
+test('mobile filter label includes Pi alone and with a project', async () => {
+  const { mobileFilterLabel } = await import('./mobile.js');
+  assert.equal(mobileFilterLabel(null, null), 'Filters');
+  assert.equal(mobileFilterLabel(null, 'claude'), 'Claude Code');
+  assert.equal(mobileFilterLabel(null, 'codex'), 'Codex');
+  assert.equal(mobileFilterLabel(null, 'pi'), 'Pi');
+  assert.equal(mobileFilterLabel({ name: 'Keep' }, 'pi'), 'Keep · Pi');
+});
+
 test('the app owns permissions, notifications and sounds', async () => {
   assert.equal(shell.notificationPermission(), 'granted');
   assert.equal(await shell.requestPermission(), 'granted');

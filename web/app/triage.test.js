@@ -105,6 +105,33 @@ test('client and project filters combine for session, pane-only, and agent rows'
     'All clients keeps unresolved agents');
 });
 
+test('Pi matches session and pane-only rows while All keeps every client', async () => {
+  const { matchesTriageFilters, matchesAgentTriageFilters } = await import('./triage.js');
+  const agent = { name: 'pi-worker', session: { id: 'old', pane: 'old-pane' } };
+  const ctx = ctxFor({
+    sessions: [{ id: 'pi-session', kind: 'pi', project: '/work/a', pane: 'pi-pane', agentName: 'pi-worker', state: 'running' },
+      { id: 'claude-session', kind: 'claude', project: '/work/a', pane: 'claude-pane' }],
+    panes: [{ id: 'pi-pane', alive: true, meta: { agent: 'pi', project: '/work/a' } },
+      { id: 'pi-only', alive: true, meta: { agent: 'pi', project: '/work/b' } },
+      { id: 'claude-pane', alive: true, meta: { agent: 'claude', project: '/work/a' } }],
+  });
+  ctx.projectOf = (path) => ({ key: path });
+  const rows = [{ kind: 'running', sessionId: 'pi-session', pane: 'pi-pane', project: '/work/a' },
+    { kind: 'pinned', pane: 'pi-only', project: '/work/b' },
+    { kind: 'recent', sessionId: 'claude-session', pane: 'claude-pane', project: '/work/a' }];
+  const visible = () => rows.filter((item) => matchesTriageFilters(ctx, item)).map((item) => item.sessionId || item.pane);
+  assert.deepEqual(visible(), ['pi-session', 'pi-only', 'claude-session']);
+  ctx.state.providerFilter = 'pi';
+  assert.deepEqual(visible(), ['pi-session', 'pi-only']);
+  assert.equal(matchesAgentTriageFilters(ctx, agent), true, 'the Pi agent resolves its stamped session');
+  ctx.state.filter = '/work/b';
+  assert.deepEqual(visible(), ['pi-only']);
+  assert.equal(matchesAgentTriageFilters(ctx, agent), false);
+  ctx.state.providerFilter = null;
+  ctx.state.filter = null;
+  assert.deepEqual(visible(), ['pi-session', 'pi-only', 'claude-session']);
+});
+
 test('changing client drops a selected agent that is now hidden', async () => {
   const { queueSelection } = await import('./triage.js');
   const ctx = ctxFor({
@@ -208,6 +235,7 @@ test('rail client controls remain separate from project controls when expanded o
     assert.ok(rail.innerHTML.indexOf('Client') < rail.innerHTML.indexOf('data-shell'));
     assert.match(rail.innerHTML, /provider-claude/);
     assert.match(rail.innerHTML, /provider-codex/);
+    assert.match(rail.innerHTML, /provider-pi/);
     renderRail(ctx, [rows[1]]);
     assert.match(rail.innerHTML, /data-project="\/work\/a" class="on"/,
       'a selected project remains visible when the client has no rows in it');
@@ -218,10 +246,14 @@ test('rail client controls remain separate from project controls when expanded o
     rail.querySelectorAll('[data-project]')[0].click();
     assert.equal(ctx.state.filter, null);
     assert.equal(ctx.state.providerFilter, 'codex');
+    renderRail(ctx, rows);
+    rail.querySelectorAll('[data-client]')[3].click();
+    assert.equal(ctx.state.providerFilter, 'pi');
     ctx.state.collapsed.rail = true;
     renderRail(ctx, rows);
     assert.match(rail.innerHTML, /class="rail-clients" role="group" aria-label="Client"/);
-    assert.equal((rail.innerHTML.match(/data-client=/g) || []).length, 3);
+    assert.equal((rail.innerHTML.match(/data-client=/g) || []).length, 4);
+    assert.match(rail.innerHTML, /provider-pi/);
     rail.querySelectorAll('[data-client]')[0].click();
     assert.equal(ctx.state.providerFilter, null);
 
