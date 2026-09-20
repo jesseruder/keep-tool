@@ -11,6 +11,22 @@ Owner has authorized this routing without a model-choice question. Honor explici
 user model choices. Single quick actions can stay in the primary when a handoff
 would cost more than it saves.
 
+## Browser Bridge for interactive checks
+
+For an interactive UI smoke check without a user-selected browser, first look for
+the `browser` MCP tools and call `tabs_context_mcp`. Use a disposable app fixture
+when the check would otherwise change live state. Before reporting browser
+verification unavailable, check whether Browser Bridge can perform the check.
+The Linux headless requirement below applies to standalone automated browser
+tests and captures, not Browser Bridge checks.
+
+Browser Bridge drives Jesse's Edge through `~/keep-tool/browser-bridge`. Use its
+`navigate`, `computer`, `read_page`, `find`, `form_input`, and other tools after
+`tabs_context_mcp`. Each session gets its own tab group; tab-scoped tools refuse
+tabs from other groups. A subagent shares its parent's MCP connection, so give a UI
+worker the tab id from `tabs_context_mcp`, not a URL to reopen. Claude in Chrome
+and the Codex Chrome plugin should stay off beside Browser Bridge.
+
 ## Headless browser tests on the Mac
 
 Run routine automated browser tests and captures in an existing Linux container or
@@ -67,16 +83,6 @@ One agent owns a browser tab or device at a time. The primary can do independent
 work while the worker drives; it must not also click, type, navigate, or rotate
 that same target. On escalation, have the worker stop and return the current state
 before another agent takes control. Reuse the worker for related follow-ups.
-
-**Browser Bridge is the browser.** Every Claude Code and Codex session on this Mac
-has the `browser` MCP server (`~/keep-tool/browser-bridge`, one shared daemon driving
-Jesse's Edge). Its tools mirror Claude in Chrome: call `tabs_context_mcp` first, then
-`navigate`, `computer`, `read_page`, `find`, `form_input`, `gif_creator` and the rest.
-Each session gets its own Edge tab group and tab-scoped tools refuse tab ids from other
-groups. A subagent shares its parent's MCP connection, so a UI worker drives the
-parent's tab group: hand it the tab id from `tabs_context_mcp`, not a URL to reopen.
-Claude in Chrome and the Codex Chrome plugin are switched off and should stay off
-beside it; they would give the model a second, account-bound copy of the same tools.
 
 ## Handoff and results
 
