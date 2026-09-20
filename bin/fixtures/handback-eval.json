@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "description": "Sanitized, hand-labeled adaptations of turn closings from September 2026, plus explicitly synthetic controls. A case is `handback` when the turn's closing text asks Owner to personally run an executable step the session could have run itself; every other ask is `ok`, including the ones it was right to make. `set` records where the shape was found: `dev` cases come from the 2026-09-13..20 window the detector was written against, `held-out` cases from 2026-09-01..12, which was read only after the rules were frozen. Text is adapted, not quoted: repository, host and person names are replaced and identifiers removed, while the sentence shape and command form — the thing under test — are preserved.",
+  "cases": [
+    {"id": "hb-01", "set": "dev", "class": "authorized-command", "source": "keep-tool session, 2026-09-15; Owner replied \"do it yourself\"",
+     "text": "**Tests:** all 30 card-usage tests pass.\n\nMy permission guard won't let me pull the main checkout, so please run:\n\n```\n! git -C ~/keep-tool pull --ff-only\n```\n\nThen I'll run `keep restart-daemon`, record the check-in, and confirm that `landed`, `unblock` and `brief` recover.",
+     "expected": "handback", "reason": "The session hands Owner a fast-forward it could have taken by leaving its worktree; Owner's next message was \"do it yourself\"."},
+
+    {"id": "hb-02", "set": "dev", "class": "authorized-command", "source": "keep-tool session, 2026-09-16; Owner replied \"do it yourself\"",
+     "text": "Both are fixed, covered by a browser test and a unit test, and the third review came back clean.\n\nThe live daemon still runs the old code. When you're ready:\n\n```\n! git -C ~/keep-tool pull --ff-only && keep restart-daemon\n```",
+     "expected": "handback", "reason": "Same step, introduced by a second-person colon line with the command fenced underneath."},
+
+    {"id": "hb-03", "set": "dev", "class": "authorized-command", "source": "keep-tool session, 2026-09-16; Owner replied \"you do it\"",
+     "text": "Landed as `46fd18f`, `d1c2ea4`, `04bc55e`; card closed.\n\nThe fix needs the main checkout pulled and the daemon restarted to take effect — that's yours to run, since I can't touch `~/keep-tool` from here:\n\n`! git -C ~/keep-tool pull --ff-only && keep restart-daemon`",
+     "expected": "handback", "reason": "\"I can't touch it from here\" is the session's own account of being blocked, and Owner rejected it. A detector that accepts that sentence cannot see this class at all."},
+
+    {"id": "hb-04", "set": "dev", "class": "authorized-command", "source": "keep-tool session, 2026-09-16; Owner replied \"you can't do that?\"",
+     "text": "## Two things only you can do\n\n1. The live daemon still runs the pre-split code. Pull the main checkout and restart:\n\n```\n! git -C ~/keep-tool pull --ff-only && keep restart-daemon\n```\n\n2. Your own machine has the handoff skills as real directories that now differ from the repo copies. This backs them up and links them:\n\n```\n! keep setup skills --pack handoff --replace\n```",
+     "expected": "handback", "reason": "A heading asserting the steps are Owner-only, over two commands the session had the tools to run."},
+
+    {"id": "hb-05", "set": "dev", "class": "authorized-command", "source": "second repository, 2026-09-15; Owner typed the command by hand",
+     "text": "The reminders process runs from the shared `~/side-repo` checkout, and this session isn't allowed to run git there. To finish, run this:\n\n```\n! git -C ~/side-repo pull --ff-only && launchctl kickstart -k gui/$(id -u)/com.example.reminders\n```\n\nOnce that's done, the switches take effect within about 20 seconds.",
+     "expected": "handback", "reason": "Owner ended up typing the command himself; the session could have left its worktree and run it."},
+
+    {"id": "hb-06", "set": "dev", "class": "authorized-command", "source": "second repository, 2026-09-16; Owner typed the command by hand",
+     "text": "So a fast-forward to the copy it already has should work, with no network needed:\n\n```\n! git -C ~/side-repo merge --ff-only origin/master\n```\n\nIf that fails too, run `! git -C ~/side-repo status` so we can see why. Uncommitted changes from another session could block the fast-forward.",
+     "expected": "handback", "reason": "A diagnostic command handed over mid-explanation. The `!` prefix is how this fleet writes \"you type this\"."},
+
+    {"id": "hb-07", "set": "dev", "class": "worktree-cleanup", "source": "web repository, 2026-09-15",
+     "text": "Every push to main runs the same gates and shows red the day a commit lands.\n\nThe worktree at `~/wt/web-repo/router-docs-contract` is landed and can be recycled with `wt rm` whenever you like.",
+     "expected": "handback", "reason": "The commonest hand-off shape in the corpus: cleanup of the session's own landed worktree, offered to Owner at his leisure."},
+
+    {"id": "hb-08", "set": "dev", "class": "worktree-cleanup", "source": "keep-tool session, 2026-09-16",
+     "text": "**Health warnings** shown by the daemon are pre-existing and unrelated.\n\nThe worktree at `~/wt/keep-tool/unpinned-new-panes` is kept on disk; `wt rm` it whenever you like.",
+     "expected": "handback", "reason": "Same shape, command first."},
+
+    {"id": "hb-09", "set": "dev", "class": "worktree-cleanup", "source": "keep-tool session, 2026-09-15",
+     "text": "Two optional items remain, both filed in Keep rather than blocking anything.\n\nThe two idle worktrees can be removed whenever you like.",
+     "expected": "handback", "reason": "Same shape with no command line at all — the referent is a worktree, which is why prose referents have to count."},
+
+    {"id": "hb-10", "set": "held-out", "class": "worktree-cleanup", "source": "keep-tool session, 2026-09-11",
+     "text": "- **card-usage health row.** A pre-existing Node syntax error from something loading the shell launcher as a module. Unrelated to this change, worth its own look.\n- **Worktree.** `~/wt/keep-tool/check-verdicts-probes` is landed and can be removed whenever you like with `wt rm`.",
+     "expected": "handback", "reason": "From the held-out window: the same cleanup hand-off inside a status list."},
+
+    {"id": "hb-11", "set": "held-out", "class": "worktree-cleanup", "source": "keep-tool session, 2026-09-12",
+     "text": "Two things to note: no review ran, per your instruction. And the worktree at `~/wt/keep-tool/portable-transfers` is still on disk — the tool couldn't verify its state to remove it, so `wt rm portable-transfers` when you want it gone.",
+     "expected": "handback", "reason": "Held-out window. The tool failed once, and the retry became Owner's."},
+
+    {"id": "hb-12", "set": "held-out", "class": "worktree-cleanup", "source": "investing repository, 2026-09-09",
+     "text": "Worth checking whether that review came back, since two cards are open against it.\n- If you want this worktree current, `git pull --rebase` or just `wt rm` it — there's nothing left in it that isn't on master.",
+     "expected": "handback", "reason": "Held-out window. Two commands, either of which the session could have run."},
+
+    {"id": "hb-13", "set": "held-out", "class": "authorized-command", "source": "registry session, 2026-09-09",
+     "text": "The next step is a `git pull --rebase origin main` in the main checkout, minding the dirty file from the other sessions, then restart the daemon. I could not do that from this session because the sandbox blocks git operations against the main checkout from a worktree, and the dirty file isn't mine.",
+     "expected": "handback", "reason": "Held-out window. The dirty file belongs to another session, but the pull and restart are the session's own standing instruction."},
+
+    {"id": "hb-14", "set": "dev", "class": "authorized-command", "source": "synthetic control",
+     "text": "The fix is on origin/master. From the original directory, run `git -C ~/keep-tool pull --ff-only` and then `keep restart-daemon` to pick it up.",
+     "expected": "handback", "reason": "Synthetic minimal form of the commonest hand-off, as a control that the rule fires without the surrounding report."},
+
+    {"id": "hb-15", "set": "dev", "class": "authorized-command", "source": "synthetic control",
+     "text": "I committed the change on the branch. You'll need to push it yourself with `git push`.",
+     "expected": "handback", "reason": "Synthetic control for the plain modal form."},
+
+    {"id": "hb-16", "set": "dev", "class": "authorized-command", "source": "synthetic control",
+     "text": "The refactor is done and the unit tests pass. Please run the full suite before we land.",
+     "expected": "handback", "reason": "Synthetic control: executable work with a prose referent and no command line."},
+
+    {"id": "ng-01", "set": "dev", "class": "permission-to-act", "source": "keep-tool session, 2026-09-13; Owner replied \"yes land\"",
+     "text": "Full suite: 1809 pass, 6 fail, and the same 5 fail identically on the untouched main checkout.\n\nMay I run `wt land`, then fast-forward the main checkout and `keep restart-daemon` so the live console picks this up?",
+     "expected": "ok", "reason": "The session asks permission to run the steps itself. Flagging this would punish exactly the behaviour the lint is meant to encourage."},
+
+    {"id": "ng-02", "set": "dev", "class": "permission-to-act", "source": "keep-tool session, 2026-09-15",
+     "text": "Should I land it? That means `wt land` to push to master, then updating the main checkout and running `keep restart-daemon`. It's this session's first push, so I'm asking first.",
+     "expected": "ok", "reason": "Same: a first-push confirmation, with the session doing the work."},
+
+    {"id": "ng-03", "set": "dev", "class": "credential", "source": "web repository, 2026-09-15",
+     "text": "**One thing I need from you.** The page is behind login, and I can't enter your password. Your browser has a tab open at the login screen. If you sign in there, I'll screenshot the page at phone widths and then run `wt land`.",
+     "expected": "ok", "reason": "A sign-in only Owner can perform."},
+
+    {"id": "ng-04", "set": "dev", "class": "credential", "source": "keep-tool session, 2026-09-18",
+     "text": "Run `claude auth login` in a real terminal. After you're signed in, I'll check the login status, and a fresh `keep open` with no account named will use it when the others are out of usage.",
+     "expected": "ok", "reason": "An interactive login. The command is executable, but the session cannot answer the prompt."},
+
+    {"id": "ng-05", "set": "dev", "class": "credential", "source": "server repository, 2026-09-15",
+     "text": "**What I need from you:** sign in to the cloud console in that tab, as root or as a user with billing permissions. Once you're in, tell me and I'll change the plan to Basic and read back the confirmation text.",
+     "expected": "ok", "reason": "A console sign-in plus a billing change."},
+
+    {"id": "ng-06", "set": "dev", "class": "confirm-gated", "source": "synthetic control",
+     "text": "The rebase is done, but the branch has diverged, so landing needs `git push --force-with-lease`. Confirm and I'll run it.",
+     "expected": "ok", "reason": "A force push is confirmed every time by policy, whoever runs it."},
+
+    {"id": "ng-07", "set": "dev", "class": "confirm-gated", "source": "admin repository, 2026-09-17",
+     "text": "Landing deploys the server and restarts the agreement comparisons at v12. There are no migrations in the range. Say \"land\" and I'll run `keep land` from the worktree, then confirm the next daily summary reads prompt v12.",
+     "expected": "ok", "reason": "A production deploy gate, with the session executing once told."},
+
+    {"id": "ng-08", "set": "dev", "class": "confirm-gated", "source": "sandbox repository, 2026-09-18",
+     "text": "The only gate left is yours: I'll ask before bumping the host bundle key to deploy. If you'd rather the deploy go ahead without another question, `keep allow <card> --grant deploy:prod --until +3d` covers it. Otherwise say \"go\" whenever you're ready.",
+     "expected": "ok", "reason": "A deliberate production checkpoint; the grant command is offered as the way to remove the gate, not as work handed over."},
+
+    {"id": "ng-09", "set": "dev", "class": "blocked-elsewhere", "source": "admin repository, 2026-09-17",
+     "text": "The alternative is the server's secrets. That needs you to add the key in prod before I can switch the code.\n\n**Landing.** Say \"land\" when you're ready. I'll then land v12, switch the config, and confirm the next daily summary.",
+     "expected": "ok", "reason": "A production secret only Owner can add, beside a landing gate."},
+
+    {"id": "ng-10", "set": "dev", "class": "tool-unavailable", "source": "sandbox repository, 2026-09-18",
+     "text": "I also saved a memory note for future sessions. A tool deployed mid-session isn't callable until you run `/mcp` to reconnect.",
+     "expected": "ok", "reason": "A slash command inside Owner's own client, which no session tool can trigger — and stated as a fact, not a request."},
+
+    {"id": "ng-11", "set": "held-out", "class": "physical", "source": "device session, 2026-09-03",
+     "text": "**Both phones now run the retrained wake word with lights, music, and messages.** Worth a quick word at the second handset to confirm it hears you without enunciating — that phone has never been tested with the new model.",
+     "expected": "ok", "reason": "Held-out window. A physical device test."},
+
+    {"id": "ng-12", "set": "held-out", "class": "credential", "source": "client repository, 2026-09-03",
+     "text": "Publishing needs your one-time code, so I'm giving you the commands:\n\n```\n! cd ~/client-repo && npm_config_otp=<code> npm run publish-packages -- --only sdk\n```\n\nI'll remove the worktree once the publish is confirmed, since nothing else is in it.",
+     "expected": "ok", "reason": "Held-out window. A registry publish needs a code from Owner's authenticator."},
+
+    {"id": "ng-13", "set": "dev", "class": "offer", "source": "synthetic control",
+     "text": "I can run the migration now if you want, or hold it until tomorrow. Say the word and I'll start it.",
+     "expected": "ok", "reason": "An offer to do the work is the opposite of handing it over."},
+
+    {"id": "ng-14", "set": "dev", "class": "informational", "source": "synthetic control",
+     "text": "For reference, the command is `keep restart-daemon`; I already ran it after landing, and the console is serving the new code.",
+     "expected": "ok", "reason": "A command mentioned, not requested."},
+
+    {"id": "ng-15", "set": "dev", "class": "own-plan", "source": "keep-tool session, 2026-09-13",
+     "text": "The follow-up card is filed and the last hardening round is with the implementer. When it returns: tests, commit, land with delivery off, restart the daemon, and mark step 4 done.",
+     "expected": "ok", "reason": "The session's own plan, written as a bare imperative list. This is the shape the bare-imperative rule keeps getting wrong."},
+
+    {"id": "ng-16", "set": "dev", "class": "own-plan", "source": "keep-tool session, 2026-09-19",
+     "text": "Then land with `keep land`, which fast-forwards the live checkout and restarts the daemon. The restart also forces every open console tab to reload, which is what makes deleting compact mode safe.",
+     "expected": "ok", "reason": "A description of what a command does, inside a proposal. Nothing is asked."},
+
+    {"id": "ng-17", "set": "dev", "class": "own-plan", "source": "synthetic control",
+     "text": "Everything is committed and the card is checked in. Next, I'll run the browser suite and report back.",
+     "expected": "ok", "reason": "The healthiest closing shape in the index; it must never read as a hand-off."},
+
+    {"id": "ng-18", "set": "dev", "class": "advice", "source": "console session, 2026-09-17",
+     "text": "Do you want the new queue type in place of escalated-first, or both? \"Both\" would mean the default queue also serves escalated items first. I recommend the queue type only. I'll build it and land it once you answer.",
+     "expected": "ok", "reason": "A product preference question."},
+
+    {"id": "ng-19", "set": "dev", "class": "advice", "source": "synthetic control",
+     "text": "Which transport would you prefer for the console, a delta stream or a full refetch on every rebuild?",
+     "expected": "ok", "reason": "An advice-only question with no executable step in it."},
+
+    {"id": "ng-20", "set": "dev", "class": "quoted-output", "source": "sandbox repository, 2026-09-18",
+     "text": "`keep sync` also printed `error: Please commit or stash them` before it reported `synced`. The push itself went through. I left those files alone because they aren't mine.",
+     "expected": "ok", "reason": "The \"please commit\" is a tool's own error text quoted back, not the session asking for anything."},
+
+    {"id": "ng-21", "set": "dev", "class": "relayed", "source": "synthetic control",
+     "text": "> please run `npm test` and tell me the result\n\nThat was the other session talking. I have already run it here: 2166 pass, 0 fail.",
+     "expected": "ok", "reason": "A quoted request from somewhere else is not this turn's ask."},
+
+    {"id": "ng-22", "set": "dev", "class": "status", "source": "game repository, 2026-09-16",
+     "text": "The uncommitted post-review changes are in the tree. Commit `58d80b16` is **not** amended yet, nothing pushed, no review or land run.\n\nNothing is in a broken state — just unlanded. Let me know how you want to proceed.",
+     "expected": "ok", "reason": "A status report naming commands that did not run. It asks for direction, not for work."},
+
+    {"id": "ng-23", "set": "held-out", "class": "own-plan", "source": "client repository, 2026-09-18",
+     "text": "Users get it only once it's in the sandbox image, and that takes a release:\n1. Bump the CLI.\n2. Run the publish workflow, dry run first.\n3. Pin the new version in the image.\n4. Validate on staging.\n\nShould I go ahead with that release?",
+     "expected": "ok", "reason": "Held-out window. A numbered release plan the session is asking permission to execute."},
+
+    {"id": "ng-24", "set": "held-out", "class": "informational", "source": "keep-tool session, 2026-09-11",
+     "text": "Native startup was verified; native touch and focus checks remain manual. Run `npm run ui:sandbox` to explore, or `npm run test:ui` for regressions. Committed locally; not pushed.",
+     "expected": "ok", "reason": "Held-out window. Documentation of how to explore the work, not a step waiting on Owner. The detector reads this as a hand-off, and it is the clearest remaining false positive class."},
+
+    {"id": "ng-25", "set": "held-out", "class": "blocked-elsewhere", "source": "registry session, 2026-09-09",
+     "text": "The daemon restart that activates the scanner change is on hold: another session has an uncommitted refactor plus untracked files in this checkout, so a restart now would load their half-done work. Say when it is safe, or restart yourself after they land.",
+     "expected": "ok", "reason": "Held-out window. Another session's uncommitted work is a real reason to wait, and the turn offers to do it on a word."}
+  ]
+}

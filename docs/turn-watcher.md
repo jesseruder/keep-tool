@@ -564,6 +564,51 @@ The fleet strip carries one line of graduation progress — how many verdicts ar
 waiting on Owner, and the agreement rate per type — so the numbers that decide
 whether a type goes live are visible without the CLI.
 
+## A signal that was measured and not shipped: handbacks
+
+A weekly retrospective proposed a final-answer lint for turns that hand Owner an
+executable step the session was already authorized to run. `bin/handback-eval.js`
+is the offline evaluation of that idea, and the answer is **no**, on numbers
+rather than on taste. It is deliberately not wired to anything: no `signalsFor`
+entry, no rule-chain branch, no daemon tick, no delivery path, and a test asserts
+that neither `turn-watcher.js`, `watcher-live.js` nor `serve.js` requires it.
+
+```
+node bin/handback-eval.js            # the curated suite in bin/fixtures/handback-eval.json
+node bin/handback-eval.js --ablate   # what each rule tier is worth
+node bin/handback-eval.js --index --since 2026-09-01 --until 2026-09-13
+```
+
+The `--index` mode re-runs the rules over the turn index — read-only, on a
+`readOnly` connection, printing redacted closings for a human to label.
+
+What it found, over the fleet's September 2026 turns. The base rate of real
+hand-offs is about **2.5%** of ended interactive turns, and they come in two
+shapes: the post-land "pull the main checkout and `keep restart-daemon`", and the
+landed worktree left for Owner to `wt rm`. Held out on a window the rules were
+never tuned against, the detector fired on 33 of 2,353 turns at **27% precision**;
+only the "whenever you like" tier reached 50%, and the bare-imperative and
+second-person-heading tiers were noise. The false positives are healthy turns —
+a session listing its own next steps as imperatives, prose describing what a
+command does, QA instructions — which is exactly the traffic a stop-time lint
+must not interrupt.
+
+Two results are worth keeping whatever happens to the idea:
+
+- **A self-declared block must not excuse the hand-off.** Every corroborated
+  hand-off in the sampled week came with a sentence explaining why the session
+  could not do it, and Owner answered three of them with "do it yourself", "you
+  do it" and "you can't do that?". A carve-out that believes the turn's own
+  account of its permissions cannot see the class it was built for. Only subject
+  matter — a credential, a device, a gated action — is a safe carve-out.
+- **Asking permission is not handing back.** "May I run `wt land`, then
+  fast-forward the main checkout and restart?" was the commonest near-miss; a
+  rule that flags it punishes the behaviour the lint wants.
+
+The better fix for the one detectable cluster is not a nudge at all: recycle
+clean, landed worktrees automatically, which `wt gc` already does after three
+days.
+
 ## Going live
 
 Everything above records what Owner would have typed and sends nothing. The live
