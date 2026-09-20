@@ -91,7 +91,7 @@ test('keep reviewed records the patches, logs a code-review entry, and keep revi
 
     const badBy = f.run(['reviewed', 'work', '--commit', sha, '--verdict', 'clean', '--by', 'nobody']);
     assert.notEqual(badBy.status, 0);
-    assert.match(badBy.stderr, /must start with one of codex, opus, claude, human/);
+    assert.match(badBy.stderr, /must start with one of codex, opus, claude, pi, human/);
 
     const badVerdict = f.run(['reviewed', 'work', '--commit', sha, '--verdict', 'maybe']);
     assert.notEqual(badVerdict.status, 0);

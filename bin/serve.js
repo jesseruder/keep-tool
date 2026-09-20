@@ -6253,7 +6253,7 @@ async function openSession(body, deps = {}) {
   }
   if (body.model != null && (typeof body.model !== 'string'
       || !keep.PI_MODEL_RE.test(body.model) && !keep.LAUNCH_MODEL_RE.test(body.model))) {
-    throw new InjectionError(400, 'model must be a valid model id');
+    throw new InjectionError(400, 'model must be a model id');
   }
   // The model rides the launched command line only; it never writes settings.json.
   const launchModel = body.model || '';
@@ -6364,7 +6364,7 @@ async function openSession(body, deps = {}) {
     throw new InjectionError(409, 'Pi does not support reserved opening delivery');
   }
   if (launchModel && !(agent === 'pi' ? keep.PI_MODEL_RE : keep.LAUNCH_MODEL_RE).test(launchModel)) {
-    throw new InjectionError(400, `model is not valid for ${agent}`);
+    throw new InjectionError(400, agent === 'pi' ? 'model is not valid for pi' : 'model must be a model id');
   }
   if (session && (typeof session.id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(session.id))) {
     throw new InjectionError(400, 'bad session id');
@@ -8262,7 +8262,7 @@ function backfillHostSessions(sessions, panes, deps = {}) {
           mtime: Math.max(Date.parse(pane.createdAt) || 0, Date.parse(piEvent?.at || '') || 0) || Date.now(),
           size: 0,
           endedTurn: agent === 'pi' ? piPhase !== 'running' : true,
-          toolRunning: agent === 'pi' && piPhase === 'running',
+          ...(agent === 'pi' ? { toolRunning: piPhase === 'running' } : {}),
           state: agent === 'pi' && piPhase === 'running' ? 'running' : 'recent',
         };
       } else {
