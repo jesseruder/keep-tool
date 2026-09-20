@@ -585,7 +585,8 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
     wrap.innerHTML = `<button class="qdis-head" data-dismiss-toggle>${ctx.state.showDismissed ? '▾' : '▸'} dismissed · ${ctx.esc(dismissed.length)}</button>${ctx.state.showDismissed ? dismissed.map((item) => {
       const entry = ctx.setAsideFor(item);
       const minutes = entry?.kind === 'snooze' ? Math.max(1, Math.ceil((entry.until - Date.now()) / 60e3)) : null;
-      const status = entry?.kind === 'dependency' ? 'waiting for dependency' : minutes === null ? 'dismissed' : `snoozed · ${minutes}m left`;
+      const remaining = minutes >= 60 ? `${Math.floor(minutes / 60)}h${minutes % 60 ? ` ${minutes % 60}m` : ''}` : `${minutes}m`;
+      const status = entry?.kind === 'dependency' ? 'waiting for dependency' : minutes === null ? 'dismissed' : `snoozed · ${remaining} left`;
       return `<div class="qdis" style="--h:${ctx.esc(ctx.projectOf(item.project).h)}"><span class="stripe"></span><span class="t">${ctx.esc(item.title || 'untitled session')} <small>${ctx.esc(status)}</small></span><button class="btn" data-restore="${ctx.esc(ctx.itemKey(item))}">Restore</button><span class="p">${ctx.projectHTML(item.project)}</span></div>`;
     }).join('') : ''}`;
     place(wrap);
@@ -789,7 +790,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   const markRunning = !item.sessionId ? ''
     : markedRunning ? '<button class="btn" data-unmark-running title="Put this session back in Waiting on you">Unmark running</button>'
     : waitingItem ? '<button class="btn" data-mark-running title="This session still has background work: list it under Running &amp; waiting until its next message or turn">Mark running</button>' : '';
-  ctx.patchHTML(stage.querySelector('.quick-actions'), `${markRunning}${item.sessionId || waitingItem ? '<button class="btn" data-snooze>Snooze 1h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}`);
+  ctx.patchHTML(stage.querySelector('.quick-actions'), `${markRunning}${item.sessionId || waitingItem ? '<button class="btn" data-snooze="60">Snooze 1h</button><button class="btn" data-snooze="1440">Snooze 24h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}`);
   const menu = stage.querySelector('.session-actions');
   patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${renameButtonsHTML(item.sessionId, session?.renamed)}${markControlsHTML(ctx.esc, item.sessionId, session?.mark)}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, item.pane, pane) : ''}`);
   installActionsMenu(menu, ctx, item.pane);
@@ -868,7 +869,6 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   }
   const pin = () => ctx.pinPane(item.pane, title);
   const dismiss = () => ctx.dismiss(item);
-  const snooze = () => ctx.setAside(item, 'snooze', 60);
   stage.querySelector('[data-pin]').onclick = pin;
   const reopenButton = stage.querySelector('[data-reopen]');
   if (reopenButton) reopenButton.onclick = async () => {
@@ -887,8 +887,9 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   if (dismissButton) dismissButton.onclick = dismiss;
   const dependencyButton = stage.querySelector('[data-wait-dependency]');
   if (dependencyButton) dependencyButton.onclick = () => ctx.setAside(item, 'dependency');
-  const snoozeButton = stage.querySelector('[data-snooze]');
-  if (snoozeButton) snoozeButton.onclick = snooze;
+  stage.querySelectorAll('[data-snooze]').forEach((button) => {
+    button.onclick = () => ctx.setAside(item, 'snooze', Number(button.dataset.snooze));
+  });
   const markRunningButton = stage.querySelector('[data-mark-running]');
   if (markRunningButton) markRunningButton.onclick = () => ctx.setAside(item, 'running');
   const unmarkRunningButton = stage.querySelector('[data-unmark-running]');

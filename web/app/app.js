@@ -462,7 +462,7 @@ async function setAside(item, kind = 'dismiss', minutes) {
     finishSetAsideWrite(key, record, entry, true);
     toast(kind === 'dependency' ? 'Waiting for dependency. New messages or changed dependencies bring it back.'
       : kind === 'running' ? 'Moved to Running & waiting. A new message or a new turn brings it back.'
-      : kind === 'snooze' ? 'Snoozed for 1 hour.' : 'Dismissed. Restore it from the collapsed row.', { label: 'Undo', run: () => restore(key) });
+      : kind === 'snooze' ? `Snoozed for ${minutes === 1440 ? '24 hours' : '1 hour'}.` : 'Dismissed. Restore it from the collapsed row.', { label: 'Undo', run: () => restore(key) });
   } catch (error) {
     finishSetAsideWrite(key, record, entry, false);
     deriveDismissed();
