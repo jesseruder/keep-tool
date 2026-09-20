@@ -40,8 +40,9 @@ commands for the user to run. The daemon's own Git pull only syncs the `~/keep`
 registry, not the Keep application.
 
 Commit on the branch already checked out. Never create a branch unless asked. Local
-commits are allowed. In Castle repositories, use the established `project: message`
-commit subject form. `wt land` rebases onto the default remote branch and pushes it.
+commits are allowed. In Castle repositories, use `project: message` as the commit
+subject; use the affected component or feature as the prefix, following repository
+history. `wt land` rebases onto the default remote branch and pushes it.
 For nontrivial code changes, obtain an independent review before pushing, resolve real
 findings, and validate the result. Pushes to an existing branch are allowed after that
 review. Each of these needs the user's explicit confirmation:
