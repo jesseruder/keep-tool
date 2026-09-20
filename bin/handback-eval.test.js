@@ -32,9 +32,21 @@ test('a bullet list splits, so an imperative bullet is still its own segment', (
   assert.equal(evaluator.detect(text).handback, true);
 });
 
-test('an offer anywhere in the tail outranks an ask earlier in it', () => {
-  assert.equal(evaluator.detect('Please run `npm test` when you get a chance. I can do it myself if you prefer.').handback, false);
+test('an offer to do the work suppresses the ask; an offer of other work does not', () => {
+  // "say the word" means the session will do the thing under discussion.
   assert.equal(evaluator.detect('Please run `npm test`. I can run it here instead — say the word.').handback, false);
+  assert.equal(evaluator.detect('The branch is ready. May I run `wt land` and restart the daemon?').handback, false);
+  // …whereas an offer of something else leaves the hand-off standing.
+  assert.equal(evaluator.detect('I can run the unit tests here. Please push the branch with `git push`.').handback, true);
+});
+
+test('list markers and bold sentence ends do not hide an imperative', () => {
+  const numbered = 'Done.\n1. Run `npm test` on the main checkout.\n2. Then restart the daemon.';
+  assert.equal(evaluator.segments(numbered).includes('1'), false, 'a list number is not a segment');
+  assert.equal(evaluator.detect(numbered).handback, true);
+  assert.equal(evaluator.detect('**Done!** Run `npm test` to confirm.').handback, true);
+  // …and the fleet's "you type this" prefix still travels with its command.
+  assert.equal(evaluator.segments('Try this: `! git -C ~/repo pull --ff-only`').some((p) => /git -C/.test(p)), true);
 });
 
 test('a session naming its own next step is never a handback', () => {
@@ -111,6 +123,7 @@ test('index rows are redacted and carry no session id unless asked', () => {
   // redacted excerpt still readable as evidence.
   assert.equal(evaluator.redact('see /home/alice/repo and /Users/bob/repo'), 'see ~/repo and ~/repo');
   assert.equal(evaluator.redact('C:\\Users\\bob\\repo failed'), '~\\repo failed');
+  assert.equal(evaluator.redact('it lives in /root/keep'), 'it lives in ~/keep');
   assert.equal(evaluator.redact('turn 1a2b3c4d-1111-2222-3333-444455556666 ended'), 'turn <SESSION> ended');
   assert.equal(evaluator.redact('mail bob@example.com'), 'mail <EMAIL>');
   assert.match(evaluator.redact(`blob ${'a1b2c3d4'.repeat(5)}`), /<HASH>/);

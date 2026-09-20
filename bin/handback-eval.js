@@ -132,7 +132,12 @@ const CARVE_OUTS = [
 // says the session will do the work once told, which is the opposite of the
 // thing being detected, and none of them appeared in any corroborated hand-off
 // in the sampled week.
-const STRONG_OFFER_RE = /\b(?:say the word|want me to\b|shall I\b|may I\b|would you like me to\b|should I\b|say ["“]?land["”]?\b|tell me to and I will|and I(?:'|’)ll (?:run|do|land|handle) )|\bI (?:can|could)(?!(?:'|’)t|not\b)\s+(?:just\s+|also\s+)?(?:run|do|land|handle|take|remove|restart|push|pull)\b/i;
+// Only forms that mean "I will do *this*, on your word". `I can run …` is
+// deliberately not here: it may be offering something else entirely — "I can run
+// the unit tests here. Please push the branch with `git push`." is a hand-off
+// with an offer beside it, not an offer of the hand-off. That form stays a
+// segment-local carve-out, where it can only suppress the ask it sits in.
+const STRONG_OFFER_RE = /\b(?:say the word|want me to\b|shall I\b|may I\b|would you like me to\b|should I\b|say ["“]?land["”]?\b|tell me to and I will|and I(?:'|’)ll (?:run|do|land|handle) )/i;
 
 // There is deliberately no "the session said it could not" carve-out.
 //
@@ -167,16 +172,22 @@ function stripRelayed(text) {
 // session hands Owner a command in this fleet, and splitting on that `!` tore
 // the ask away from the command it was asking for — which is how the first
 // version missed both of the hand-offs Owner corrected in writing.
+// A list marker is not a sentence. `1.` was being split by the period rule into
+// a segment containing the digit and another containing the item, and those
+// stray numeric segments then ate the heading scope that should have covered the
+// items themselves. Markers come off before any splitting happens.
+function withoutListMarkers(text) {
+  return String(text).replace(/(^|\n)([ \t]*)(?:[-*•]|\d+[.)])[ \t]+/g, '$1$2');
+}
+
 function segments(text) {
-  return stripRelayed(text)
-    // The bullet alternative comes before `\n+` on purpose: alternation is
-    // ordered, so with `\n+` first the newline matched alone and the `-` stayed
-    // glued to the next segment, where an anchored imperative could never see it.
-    .split(/(?:(?<=\w)!+\s+|(?<=[\w)\]`"'’”])[.?]+\s+|(?<=[\w)\]`"'’”])\.(?:\s+|$)|\n+\s*(?:[-*•]|\d+\.)\s+|\n+|^\s*(?:[-*•]|\d+\.)\s+)/)
-    // A sentence ending in `.` before a bullet is split by the period rule,
-    // which eats the newline and leaves the `-` glued to the next segment. The
-    // imperative rule is anchored, so the marker has to come off here.
-    .map((part) => part.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '').trim())
+  return withoutListMarkers(stripRelayed(text))
+    // `!` splits only after a word or a closing bracket, never after a backtick:
+    // `! git -C ~/repo pull` is how a session hands Owner a command here, and
+    // splitting there tore the ask away from the command. The trailing `\**`
+    // lets bold survive — `**Done!** Run …` is two sentences.
+    .split(/(?:(?<=[\w)\]])!+\**\s+|(?<=[\w)\]`"'’”*])[.?]+\**\s+|(?<=[\w)\]`"'’”*])\.(?:\s+|$)|\n+)/)
+    .map((part) => part.trim())
     .filter(Boolean);
 }
 
@@ -453,7 +464,7 @@ const SAMPLE_SQL = `SELECT t.id AS id, t.session_id AS session_id, t.n AS n, t.e
 // Home directories on every platform, not just this one: a report is redacted or
 // it is not, and "/Users only" is the kind of guarantee that holds until the
 // first transcript from another machine.
-const HOME_RE = /(?:\/(?:Users|home)\/[^\s/"'`]+|[A-Za-z]:\\+Users\\+[^\s\\"'`]+)/g;
+const HOME_RE = /(?:\/(?:Users|home)\/[^\s/"'`]+|\/root\b|[A-Za-z]:\\+Users\\+[^\s\\"'`]+)/g;
 const UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.]+/g;
 const LONG_HASH_RE = /\b[0-9a-f]{32,}\b/gi;
