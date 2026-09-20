@@ -32,8 +32,8 @@ test('Pi releases a preassigned pane on session switch and ignores a stale insta
     assert.equal(bound.bound, true);
     assert.equal(bound.claimed, true, 'preassigned same-id Pi pane is owned by this instance');
     await releaseSessionPane(first, 'pi', deps);
-    assert.equal(pane.meta.sessionId, null);
-    assert.equal(pane.meta.agent, 'shell');
+    assert.equal(pane.meta.sessionId, 'first', 'exited pane keeps its identity for Reopen');
+    assert.equal(pane.meta.agent, 'pi');
     assert.equal((await recordSessionPane(second, 'pi', deps)).bound, true);
     assert.equal(pane.meta.sessionId, 'second');
     const patches = requests.filter((entry) => entry.kind === 'meta').length;
@@ -41,6 +41,6 @@ test('Pi releases a preassigned pane on session switch and ignores a stale insta
     assert.equal(requests.filter((entry) => entry.kind === 'meta').length, patches);
     assert.equal(pane.meta.sessionId, 'second');
     await releaseSessionPane(second, 'pi', deps);
-    assert.equal(pane.meta.sessionId, null);
+    assert.equal(pane.meta.sessionId, 'second');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

@@ -1967,6 +1967,19 @@ async function releaseSessionPane(input, agent = 'claude', deps = {}) {
   try { record = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return; }
   if (!record || record.claimed !== true || !record.pane || record.agent !== agent) return;
   if (agent === 'pi' && (!record.piInstance || input.instance !== record.piInstance)) return;
+  // An exited Pi pane keeps its session metadata for Watch and Reopen. The
+  // released stamp below lets /new or /resume bind another id in this pane.
+  // No host patch is needed for Pi, and clearing the metadata here would make
+  // an exited managed session look like a shell.
+  if (agent === 'pi') {
+    try {
+      const current = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (current.startedAt !== record.startedAt || current.piInstance !== record.piInstance) return;
+    } catch { return; }
+    record.released = (deps.now || Date.now)();
+    (deps.writePaneRecord || writePaneRecord)(file, record);
+    return record;
+  }
   const connectHost = deps.connectHost || require('../hostclient.js').connect;
   const timeoutMs = deps.timeoutMs == null ? 1000 : deps.timeoutMs;
   const attempts = deps.attempts == null ? 3 : deps.attempts;
