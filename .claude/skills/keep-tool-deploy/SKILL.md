@@ -23,9 +23,12 @@ default branch: never edit or commit there. All work happens in a `wt` worktree.
    ...`, then `keep land <card>` (or `wt land`). A `findings` record is not superseded by
    the fix commit: re-review the fixed range first.
 4. **Read the land output.** `wt land` finishes the deploy itself: it fast-forwards the
-   main checkout to what it pushed and runs `keep restart-daemon`. If it reports a skip —
-   the main checkout was dirty or on another branch, or the restart was refused — that is
-   yours to resolve, not Owner's. The pull and restart are the `deploy` step, so other
+   main checkout to what it pushed and runs `keep restart-daemon`. Inspect any skip or
+   failure before recovering. If the checkout is already past this land, the newer landing
+   session owns the deployment: do not pull or restart it; verify health and coordinate
+   with that session. Do not discard unrelated changes or switch a busy live checkout's
+   branch. Recover only when the checkout is safe and this landing still owns the deploy.
+   The pull and restart are the `deploy` step, so other
    sessions see who is deploying instead of coordinating by note and `keep tell`:
    - leave the worktree (`ExitWorktree` with action `keep`; a worktree session cannot run
      git against another checkout),
@@ -35,7 +38,7 @@ default branch: never edit or commit there. All work happens in a `wt` worktree.
    - `keep step claim keep-tool deploy -m "<card>: <sha>"` then
      `keep step run keep-tool deploy` (the pull `--ff-only` and `keep restart-daemon`).
    A failed run keeps your claim and prints its log: a dirty or diverged main checkout
-   fails the pull, which is yours to sort out before running it again.
+   fails the pull. Coordinate with its owner and record the blocker before retrying.
 5. **Skills changed?** New or renamed skills need `keep setup skills` (and
    `keep setup hooks` when the hook text changed) so every managed account links them;
    sessions load new skills on their next start.

@@ -441,6 +441,11 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
     assert.match(launch.message, /Session: 11111111 in pane pane-1; account purpose: repair; model: opus; aim: 60m/);
     assert.match(launch.message, /Worktree: \/tmp\/wt\/keep-tool\/self-repair-/);
     assert.equal(launch.linkSession, false);
+    for (const message of [body.message, launch.message]) {
+      assert.match(message, /Recover only a reported failure this repair still owns on a safe checkout/);
+      assert.match(message, /already past this land, do not pull or restart it: the newer landing session owns/);
+      assert.doesNotMatch(message, /after that the restart is yours|after `keep land` it pulls/);
+    }
 
     // …and in the state, where the next tick can see it.
     const entry = selfRepair.loadState(root).signatures[sig];
