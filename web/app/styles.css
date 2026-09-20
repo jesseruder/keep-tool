@@ -790,10 +790,12 @@ html.mobile .stage-body { flex-direction: column; }
 html.mobile .stage-agent-log, html.mobile .stage-agent-log.collapsed { width: auto; max-height: 40%; border-left: 0; border-top: 1px solid var(--line); }
 html.mobile .term-handoff-body { gap: 16px; padding: 20px 16px; }
 html.mobile .term-handoff-open { min-width: 200px; justify-content: center; }
-/* Free text: the desktop types into xterm, the phone has this. */
+/* Free text: mobile always has this; desktop gets it when automatic retirement
+   left the conversation available but removed its terminal. */
 .mobile-reply { display: none; }
-html.mobile .mobile-reply { display: flex; gap: 8px; flex: none; padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
-html.mobile .mobile-reply input { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--panel-2); color: var(--text); font-size: 16px; }
+html.mobile .mobile-reply, .mobile-reply.desktop-retired-reply { display: flex; gap: 8px; flex: none; padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.mobile-reply input { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--panel-2); color: var(--text); }
+html.mobile .mobile-reply input { font-size: 16px; }
 
 /* Fleet: the nine-column table becomes one card per row. Branch, kind and
    account are the columns a phone can do without. */

@@ -727,3 +727,83 @@ test('an agent in needs-input appears under Agents and in no other queue', async
   assert.deepEqual(ids(ctx.recentItems()), ['work-sid'], 'Recent');
   assert.deepEqual(data.agents.map((row) => row.name), ['sandboxes'], 'and exactly one Agents row');
 });
+
+class ReplyControl {
+  constructor(text = '') {
+    this.value = '';
+    this.textContent = text;
+    this.disabled = false;
+    this.attributes = new Map();
+    this.listeners = new Map();
+  }
+  addEventListener(type, listener) { this.listeners.set(type, listener); }
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  removeAttribute(name) { this.attributes.delete(name); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  emit(type, event = {}) { return this.listeners.get(type)?.(event); }
+}
+
+function replyStage() {
+  const input = new ReplyControl();
+  const button = new ReplyControl('Send');
+  const classes = new Set(['mobile-reply']);
+  const form = new ReplyControl();
+  form.dataset = {};
+  form.classList = {
+    toggle(name, on) { if (on) classes.add(name); else classes.delete(name); },
+    contains(name) { return classes.has(name); },
+  };
+  form.querySelector = selector => selector === 'input' ? input : selector === 'button' ? button : null;
+  return { input, button, form, querySelector: selector => selector === '.mobile-reply' ? form : null };
+}
+
+test('automatic retirement exposes the desktop reply composer and labels its one send as a resume', async () => {
+  const { replyComposerHTML, syncReplyComposer, installReplyComposer } = await import('./triage.js');
+  const item = { sessionId: 'retired-session', kind: 'input' };
+  assert.match(replyComposerHTML(item, 'claude'), /class="mobile-reply"/);
+  assert.equal(replyComposerHTML(item, 'pi'), '');
+
+  const drafts = new Map();
+  const ctx = { state: { currentItem: item, replyDrafts: drafts }, refreshes: 0, toasts: [],
+    refresh() { this.refreshes += 1; }, toast(message) { this.toasts.push(message); } };
+  const first = replyStage();
+  installReplyComposer(first, ctx, item, () => assert.fail('drafting does not send'));
+  syncReplyComposer(first, { retirement: { automatic: true } });
+  assert.equal(first.form.classList.contains('desktop-retired-reply'), true);
+  assert.equal(first.button.textContent, 'Send & resume');
+  assert.equal(first.input.placeholder, 'Reply to resume this session…');
+  assert.equal(first.input.getAttribute('aria-label'), 'Reply and resume this session');
+
+  first.input.value = 'Use option A, please.';
+  first.input.emit('input');
+  const rebuilt = replyStage();
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const sends = [];
+  installReplyComposer(rebuilt, ctx, item, async (...args) => { sends.push(args); await pending; });
+  syncReplyComposer(rebuilt, { retirement: { automatic: true } });
+  assert.equal(rebuilt.input.value, 'Use option A, please.', 'a state-driven stage rebuild restores the draft');
+
+  const submitted = rebuilt.form.emit('submit', { preventDefault() {} });
+  assert.equal(rebuilt.button.disabled, true);
+  assert.equal(rebuilt.button.getAttribute('aria-busy'), 'true');
+  assert.equal(rebuilt.button.textContent, 'Sending…');
+  await rebuilt.form.emit('submit', { preventDefault() {} });
+  assert.deepEqual(sends, [['retired-session', 'Use option A, please.']], 'busy submit cannot duplicate /api/send');
+  release();
+  await submitted;
+
+  assert.equal(rebuilt.input.value, '');
+  assert.equal(drafts.has('retired-session'), false);
+  assert.equal(ctx.refreshes, 1);
+  assert.deepEqual(ctx.toasts, ['Reply sent; session resuming']);
+});
+
+test('ordinary desktop sessions keep the shared reply composer hidden', async () => {
+  const { syncReplyComposer } = await import('./triage.js');
+  const stage = replyStage();
+  syncReplyComposer(stage, { state: 'running' });
+  assert.equal(stage.form.classList.contains('desktop-retired-reply'), false);
+  assert.equal(stage.button.textContent, 'Send');
+  assert.equal(stage.input.getAttribute('aria-label'), 'Reply to this session');
+});

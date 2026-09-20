@@ -736,38 +736,64 @@ async function sendReply(ctx, item, text) {
   } catch (error) { ctx.toast(error.message); ctx.refresh(); }
 }
 
-// Free text on the phone. The desktop console types it into the terminal, but
-// the phone hands the terminal to the app, so the stage carries its own one-line
-// composer; `html.mobile` is what shows it. It stays on the item it answered
-// rather than advancing the way an option or Continue does: on a phone the stage
-// is the whole screen, and jumping to another session loses the thread.
-function mobileReplyHTML(item, provider) {
+// Free text on the phone, and on desktop when an automatically retired session
+// has no terminal to type into. It stays on the item it answered rather than
+// advancing the way an option or Continue does: the daemon's next state decides
+// whether the wait ended, and a retired session resumes inside the same /api/send.
+export function replyComposerHTML(item, provider) {
   if (!item.sessionId || provider === 'pi') return '';
   return '<form class="mobile-reply"><input type="text" name="reply" autocomplete="off" autocapitalize="sentences"'
     + ' placeholder="Reply to this session…" aria-label="Reply to this session">'
     + '<button class="btn primary" type="submit">Send</button></form>';
 }
 
-function installMobileReply(stage, ctx, item) {
+export function syncReplyComposer(stage, session) {
+  const form = stage.querySelector('.mobile-reply');
+  if (!form) return;
+  const resumes = session?.retirement?.automatic === true;
+  form.classList.toggle('desktop-retired-reply', resumes);
+  const input = form.querySelector('input');
+  const button = form.querySelector('button');
+  const prompt = resumes ? 'Reply to resume this session…' : 'Reply to this session…';
+  input.placeholder = prompt;
+  input.setAttribute('aria-label', resumes ? 'Reply and resume this session' : 'Reply to this session');
+  if (!button.disabled) button.textContent = resumes ? 'Send & resume' : 'Send';
+}
+
+export function installReplyComposer(stage, ctx, item, send = api.send) {
   const form = stage.querySelector('.mobile-reply');
   if (!form) return;
   const input = form.querySelector('input');
   const button = form.querySelector('button');
+  const drafts = ctx.state.replyDrafts ||= new Map();
+  form.dataset.sessionId = item.sessionId;
+  input.value = drafts.get(item.sessionId) || '';
+  input.addEventListener('input', () => {
+    const sessionId = form.dataset.sessionId;
+    if (sessionId) drafts.set(sessionId, input.value);
+  });
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const text = input.value.trim();
     const target = ctx.state.currentItem?.sessionId ? ctx.state.currentItem : item;
     if (!text || !target.sessionId || button.disabled) return;
     button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = 'Sending…';
     try {
-      await api.send(target.sessionId, text);
+      await send(target.sessionId, text);
       input.value = '';
+      drafts.delete(target.sessionId);
       // Deliberately not marked sent: free text may or may not end the wait, and
       // the daemon's next state is what decides. Owner stays on the session.
-      ctx.toast('Reply sent');
+      ctx.toast(form.classList.contains('desktop-retired-reply') ? 'Reply sent; session resuming' : 'Reply sent');
       ctx.refresh();
     } catch (error) { ctx.toast(error.message); }
-    finally { button.disabled = false; }
+    finally {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+      button.textContent = form.classList.contains('desktop-retired-reply') ? 'Send & resume' : 'Send';
+    }
   });
 }
 
@@ -846,12 +872,13 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     // stage is showing an agent's work. The aside is part of the skeleton and is
     // only hidden, never added or removed, so appearing next to the terminal
     // cannot rebuild the host the terminal is mounted in.
-    ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts"><span class="quick-actions"></span>${actionsMenuHTML()}</div></div><div class="brief"></div>${mobileReplyHTML(item, session?.kind || pane?.meta?.agent)}<div class="stage-body"><div class="stage-terminal"></div><aside class="stage-agent-log" hidden></aside></div>`);
+    ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts"><span class="quick-actions"></span>${actionsMenuHTML()}</div></div><div class="brief"></div>${replyComposerHTML(item, session?.kind || pane?.meta?.agent)}<div class="stage-body"><div class="stage-terminal"></div><aside class="stage-agent-log" hidden></aside></div>`);
     stage.dataset.itemKey = key;
     stage.dataset.pane = item.pane || '';
     stage.dataset.focusKey = '';
-    installMobileReply(stage, ctx, item);
+    installReplyComposer(stage, ctx, item);
   }
+  syncReplyComposer(stage, session);
   const pinLabel = ctx.isPanePinned(item.pane) ? 'Unpin from Watch' : 'Pin to Watch';
   const closable = hasLivePane && item.sessionId && ['claude', 'codex', 'pi'].includes(pane.meta?.agent);
   const dependencyAcknowledged = ctx.setAsideFor(item)?.kind === 'dependency';
