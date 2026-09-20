@@ -60,6 +60,18 @@ test('a dashboard poll cannot erase a closing retirement snapshot', () => fixtur
   assert.doesNotThrow(() => retirement.finish(root, 'closing'));
 }));
 
+test('a stale close transaction cannot cancel or finish a newer retirement', () => fixture((root) => {
+  const first = retirement.begin(root, { sessionId: 'racing', pane: 'pane', reason: 'settled-unattended',
+    idleMinutes: 60, activityAt: 1 });
+  const second = retirement.begin(root, { sessionId: 'racing', pane: 'pane', reason: 'settled-attention',
+    idleMinutes: 30, activityAt: 2 });
+  assert.equal(retirement.cancel(root, 'racing', first.transactionId), false);
+  assert.throws(() => retirement.finish(root, 'racing', Date.now(), first.transactionId), /transaction changed/);
+  assert.equal(retirement.lookup(root, 'racing').transactionId, second.transactionId);
+  assert.equal(retirement.cancel(root, 'racing', second.transactionId), true);
+  assert.equal(retirement.lookup(root, 'racing'), null);
+}));
+
 test('the real Claude SessionEnd hook preserves an unread completion during automatic retirement', () => fixture((root) => {
   const cli = path.join(__dirname, 'keep.js');
   const transcript = path.join(root, 'session.jsonl');

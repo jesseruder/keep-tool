@@ -7171,6 +7171,27 @@ test('the check sweep close composition refuses rather than kills, and guards it
   }), /draft/);
   assert.deepEqual(refusing.calls.filter((call) => ['kill', 'guarded-kill'].includes(call.type)), [],
     'a refused graceful close never reaches a signal');
+  assert.equal(require('./session-retirement').lookup(root, 'check-sid'), null,
+    'a refusal before exit input cancels only its own closing snapshot');
+
+  // If /exit was submitted and the close confirmation then times out, positive
+  // evidence that the agent is gone commits the snapshot instead of losing its
+  // unread completion in the error cleanup path.
+  const exitedDuringConfirmation = fakeHost();
+  await assert.rejects(closeEphemeralPane(pane, 'check-sid', {
+    root,
+    hostRequest: exitedDuringConfirmation.request,
+    withInjectionLock: (fn) => fn(),
+    loadCurrentSession: () => ({ id: 'check-sid', mtime: 123,
+      notify: { type: 'complete', message: 'result survived' } }),
+    closeIdleSession: async (_request, options) => {
+      options.beforeExitInput();
+      throw new Error('confirmation timed out');
+    },
+    listHostPanes: async () => [],
+  }), /confirmation timed out/);
+  assert.equal(require('./session-retirement').lookup(root, 'check-sid').status, 'retired');
+  assert.equal(require('./session-retirement').lookup(root, 'check-sid').notify.message, 'result survived');
 
   // A graceful close that works needs no signal at all.
   const graceful = fakeHost();
