@@ -10,12 +10,12 @@ const esc = (value) => String(value == null ? '' : value)
 
 const ID = 'abcdef12-0000-4000-8000-000000000001';
 
-function ctxFor(sessions = []) {
+function ctxFor(sessions = [], panes = []) {
   return {
     esc,
     data: { sessions, panes: [], accounts: [], tasks: [] },
     state: { dismissed: new Set(), markedRunning: new Set() },
-    paneMap: () => new Map(),
+    paneMap: () => new Map(panes.map((pane) => [pane.id, pane])),
     projectHTML: (project) => `<span class="pj">${esc(project)}</span>`,
     tagsHTML: () => '',
     taskFor: () => null,
@@ -35,6 +35,8 @@ test('a numbered session is listed as #12 in a fleet row, with the id in the too
 
   const html = fleetRowHTML(ctx, row, new Map());
   assert.match(html, /<span class="num-id" title="abcdef12-0000-4000-8000-000000000001">#12<\/span>/);
+  assert.match(html, /provider-icon provider-claude.*The finder/, 'the Claude Code icon precedes the title');
+  assert.match(html, /aria-label="Claude Code"/, 'the icon has an accessible provider name');
   assert.ok(!html.includes('<span class="mono faint">'), 'the badge replaces the faint uuid');
 
   // A row the daemon has not numbered (a shell, or a session scanned before the
@@ -53,18 +55,24 @@ test('the fleet filter matches a session by #12 and by 12', async () => {
     .includes('#12'));
 });
 
-test('a triage queue row shows the number before the title', async () => {
+test('a triage queue row keeps its number and provider icon before the title', async () => {
   const { queueRow } = await import('./triage.js');
-  const session = { id: ID, num: 12, title: 'The finder', state: 'running', project: '/tmp/p' };
+  const session = { id: ID, num: 12, title: 'The finder', state: 'running', project: '/tmp/p', kind: 'codex' };
   const ctx = ctxFor([session]);
 
   const running = queueRow(ctx, { kind: 'running', sessionId: ID, num: 12, title: 'The finder', project: '/tmp/p', since: Date.now() });
-  assert.ok(running.includes(`<span class="num-id" title="${ID}">#12</span>The finder`),
-    'the badge sits inside the title cell, immediately before the title');
+  assert.match(running, new RegExp(`<span class="num-id" title="${ID}">#12</span><span class="provider-icon provider-codex"[^>]+></span>The finder`),
+    'the number and icon sit inside the truncating title cell, immediately before the title');
 
   const waiting = queueRow(ctx, { kind: 'question', sessionId: ID, title: 'The finder', project: '/tmp/p', since: Date.now() });
-  assert.match(waiting, /#12<\/span>The finder/, 'the number is read off the session when the item lacks one');
+  assert.match(waiting, /#12<\/span><span class="provider-icon provider-codex"[^>]+><\/span>The finder/,
+    'the number and provider are read off the session when the item lacks both');
 
   const shell = queueRow(ctx, { kind: 'running', pane: 'pane-shell', title: 'shell', project: '/tmp/p', since: Date.now() });
   assert.ok(!shell.includes('num-id'), 'a row with no session shows no badge');
+  assert.ok(!shell.includes('provider-icon'), 'a plain shell has no provider icon');
+
+  const exitedClaude = queueRow(ctxFor([], [{ id: 'pane-claude', meta: { agent: 'claude' } }]),
+    { kind: 'running', pane: 'pane-claude', title: 'former session', project: '/tmp/p', since: Date.now() });
+  assert.match(exitedClaude, /provider-icon provider-claude/, 'a pane-only Claude Code session keeps its provider icon');
 });

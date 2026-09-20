@@ -12,6 +12,7 @@ import { stateLineHTML, installGrading } from './state-line.js';
 import { numBadgeHTML } from './session-number.js';
 import { installHeadingRename, installRenameControls, isEditing, renameButtonsHTML, titleAttrsHTML } from './session-rename.js';
 import { installMarkControls, markControlsHTML, markHTML } from './session-mark.js';
+import { providerIconHTML } from './provider-icon.js';
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
 const summaryInflight = new Map();
@@ -447,6 +448,9 @@ function renderRail(ctx, items) {
 
 export function queueRow(ctx, item) {
   const session = ctx.sessionFor(item);
+  const paneAgent = item.pane ? ctx.paneMap().get(item.pane)?.meta?.agent : '';
+  const provider = ['claude', 'codex'].includes(session?.kind) ? session.kind
+    : ['claude', 'codex'].includes(paneAgent) ? paneAgent : '';
   const title = item.title || session?.title || 'untitled session';
   const project = item.project || session?.project || '';
   const task = ctx.taskFor(item);
@@ -455,7 +459,7 @@ export function queueRow(ctx, item) {
   // Both live inside .t because .qitem is a fixed three-column grid: another
   // top-level span would shift every cell after it.
   const badge = numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)
-    + markHTML(ctx.esc, item.mark ?? session?.mark);
+    + markHTML(ctx.esc, item.mark ?? session?.mark) + providerIconHTML(provider, ctx.esc);
   if (item.kind === 'running' || item.kind === 'pinned' || item.kind === 'recent') {
     const sessionState = session ? sessionLabel(session) : item.state || 'unknown';
     // Running rows without a session are plain shells; label them like pinned ones.
