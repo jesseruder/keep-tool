@@ -747,11 +747,19 @@ export function replyComposerHTML(item, provider) {
     + '<button class="btn primary" type="submit">Send</button></form>';
 }
 
-export function syncReplyComposer(stage, session) {
+function syncReplyVisibility(form, state = {}) {
+  const sessionId = form.dataset.sessionId;
+  const visible = form.dataset.resumes === '1'
+    || state.replyPendingSends?.has(sessionId) || state.replyDrafts?.has(sessionId);
+  form.classList.toggle('desktop-session-reply', Boolean(visible));
+}
+
+export function syncReplyComposer(stage, session, state = {}) {
   const form = stage.querySelector('.mobile-reply');
   if (!form) return;
   const resumes = session?.retirement?.automatic === true;
-  form.classList.toggle('desktop-retired-reply', resumes);
+  form.dataset.resumes = resumes ? '1' : '0';
+  syncReplyVisibility(form, state);
   const input = form.querySelector('input');
   const button = form.querySelector('button');
   const prompt = resumes ? 'Reply to resume this session…' : 'Reply to this session…';
@@ -770,7 +778,7 @@ function syncReplyPending(form, pending) {
     button.textContent = 'Sending…';
   } else {
     button.removeAttribute('aria-busy');
-    button.textContent = form.classList.contains('desktop-retired-reply') ? 'Send & resume' : 'Send';
+    button.textContent = form.dataset.resumes === '1' ? 'Send & resume' : 'Send';
   }
 }
 
@@ -794,7 +802,7 @@ export function installReplyComposer(stage, ctx, item, send = api.send) {
     const target = ctx.state.currentItem?.sessionId ? ctx.state.currentItem : item;
     if (!text || !target.sessionId || pendingSends.has(target.sessionId)) return;
     const sessionId = target.sessionId;
-    const resuming = form.classList.contains('desktop-retired-reply');
+    const resuming = form.dataset.resumes === '1';
     pendingSends.add(sessionId);
     syncReplyPending(form, true);
     try {
@@ -810,7 +818,10 @@ export function installReplyComposer(stage, ctx, item, send = api.send) {
     finally {
       pendingSends.delete(sessionId);
       const current = stage.querySelector('.mobile-reply');
-      if (current?.dataset.sessionId === sessionId) syncReplyPending(current, false);
+      if (current?.dataset.sessionId === sessionId) {
+        syncReplyVisibility(current, ctx.state);
+        syncReplyPending(current, false);
+      }
     }
   });
 }
@@ -907,7 +918,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     stage.dataset.focusKey = '';
     installReplyComposer(stage, ctx, item);
   }
-  syncReplyComposer(stage, session);
+  syncReplyComposer(stage, session, ctx.state);
   const pinLabel = ctx.isPanePinned(paneId) ? 'Unpin from Watch' : 'Pin to Watch';
   const closable = hasLivePane && item.sessionId && ['claude', 'codex', 'pi'].includes(pane.meta?.agent);
   const dependencyAcknowledged = ctx.setAsideFor(item)?.kind === 'dependency';

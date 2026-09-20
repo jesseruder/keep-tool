@@ -784,7 +784,7 @@ test('automatic retirement exposes the desktop reply composer and labels its one
   const send = async (...args) => { sends.push(args); await pending; };
   installReplyComposer(first, ctx, item, send);
   syncReplyComposer(first, { retirement: { automatic: true } });
-  assert.equal(first.form.classList.contains('desktop-retired-reply'), true);
+  assert.equal(first.form.classList.contains('desktop-session-reply'), true);
   assert.equal(first.button.textContent, 'Send & resume');
   assert.equal(first.input.placeholder, 'Reply to resume this session…');
   assert.equal(first.input.getAttribute('aria-label'), 'Reply and resume this session');
@@ -821,28 +821,33 @@ test('ordinary desktop sessions keep the shared reply composer hidden', async ()
   const { syncReplyComposer } = await import('./triage.js');
   const stage = replyStage();
   syncReplyComposer(stage, { state: 'running' });
-  assert.equal(stage.form.classList.contains('desktop-retired-reply'), false);
+  assert.equal(stage.form.classList.contains('desktop-session-reply'), false);
   assert.equal(stage.button.textContent, 'Send');
   assert.equal(stage.input.getAttribute('aria-label'), 'Reply to this session');
 });
 
-test('a failed reply preserves the rebuilt draft and unlocks its current composer', async () => {
+test('a failed send after resume keeps the live-session draft visible for retry, then success hides it', async () => {
   const { syncReplyComposer, installReplyComposer } = await import('./triage.js');
   const item = { sessionId: 'retired-session', kind: 'input' };
   const ctx = { state: { currentItem: item, replyDrafts: new Map(), replyPendingSends: new Set() },
-    refresh() { assert.fail('a failed reply does not refresh'); }, toasts: [], toast(message) { this.toasts.push(message); } };
+    refreshes: 0, refresh() { this.refreshes += 1; }, toasts: [], toast(message) { this.toasts.push(message); } };
   const stage = replyStage();
   let reject;
-  const pending = new Promise((_resolve, onReject) => { reject = onReject; });
-  installReplyComposer(stage, ctx, item, () => pending);
+  const firstSend = new Promise((_resolve, onReject) => { reject = onReject; });
+  let calls = 0;
+  const send = () => (++calls === 1 ? firstSend : Promise.resolve());
+  installReplyComposer(stage, ctx, item, send);
   syncReplyComposer(stage, { retirement: { automatic: true } });
   stage.input.value = 'Keep this draft';
   stage.input.emit('input');
   const submitted = stage.form.emit('submit', { preventDefault() {} });
 
   stage.replace();
-  installReplyComposer(stage, ctx, item, () => pending);
-  syncReplyComposer(stage, { retirement: { automatic: true } });
+  installReplyComposer(stage, ctx, item, send);
+  // The resume succeeded and published a live pane before message delivery failed.
+  syncReplyComposer(stage, { state: 'running', pane: 'reply-resume-1' }, ctx.state);
+  assert.equal(stage.form.classList.contains('desktop-session-reply'), true,
+    'pending state keeps the desktop composer visible after retirement metadata clears');
   assert.equal(stage.input.disabled, true);
   assert.equal(stage.button.disabled, true);
   reject(new Error('resume failed'));
@@ -852,9 +857,19 @@ test('a failed reply preserves the rebuilt draft and unlocks its current compose
   assert.equal(stage.input.disabled, false);
   assert.equal(stage.button.disabled, false);
   assert.equal(stage.button.getAttribute('aria-busy'), null);
-  assert.equal(stage.button.textContent, 'Send & resume');
+  assert.equal(stage.button.textContent, 'Send');
+  assert.equal(stage.form.classList.contains('desktop-session-reply'), true,
+    'the saved failed-send draft keeps the live-session composer visible');
   assert.equal(ctx.state.replyDrafts.get('retired-session'), 'Keep this draft');
   assert.deepEqual(ctx.toasts, ['resume failed']);
+  assert.equal(ctx.refreshes, 0);
+
+  await stage.form.emit('submit', { preventDefault() {} });
+  assert.equal(calls, 2);
+  assert.equal(stage.input.value, '');
+  assert.equal(stage.form.classList.contains('desktop-session-reply'), false,
+    'successful retry clears the draft and hides the live-session desktop composer');
+  assert.equal(ctx.refreshes, 1);
 });
 
 test('a resumed session pane replaces the stale pane captured by its attention row', async () => {
