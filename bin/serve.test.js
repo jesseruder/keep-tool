@@ -9308,7 +9308,7 @@ test('API state exposes pane ids without copying obsolete viewer metadata', asyn
   assert.equal(state.attention[0].pane, 'pane-hosted');
 });
 
-test('API state keeps an unbound owner-opened session waiting until its first input', async () => {
+test('API state keeps an owner-opened session waiting through transport input until registration', async () => {
   const pane = { id: 'new-pane', alive: true, inputCount: 0, createdAt: '2026-09-21T01:02:03Z',
     cwd: '/tmp/project', meta: { agent: 'codex', project: '/tmp/project', awaitingOwnerInput: true } };
   const state = { sessions: [], attention: [] };
@@ -9316,9 +9316,16 @@ test('API state keeps an unbound owner-opened session waiting until its first in
   assert.deepEqual(state.attention.map((item) => ({ kind: item.kind, pane: item.pane, label: item.attentionLabel })),
     [{ kind: 'input', pane: 'new-pane', label: 'Ready for next instruction' }]);
 
-  const afterInput = { sessions: [], attention: [] };
-  await addHostSessionState(afterInput, { panes: [{ ...pane, inputCount: 1 }], codexSessionFor: () => null });
-  assert.deepEqual(afterInput.attention, [], 'typing clears temporary readiness before transcript registration');
+  const afterTransportInput = { sessions: [], attention: [] };
+  await addHostSessionState(afterTransportInput, { panes: [{ ...pane, inputCount: 7,
+    lastInputAt: '2026-09-21T01:02:04Z' }], codexSessionFor: () => null });
+  assert.equal(afterTransportInput.attention[0]?.pane, pane.id,
+    'terminal query replies and focus reports are not mistaken for an Owner instruction');
+
+  const registered = { sessions: [{ id: 'registered', pane: pane.id }], attention: [] };
+  await addHostSessionState(registered, { panes: [{ ...pane, meta: { ...pane.meta, sessionId: 'registered' } }],
+    codexSessionFor: () => null });
+  assert.deepEqual(registered.attention, [], 'session registration hands readiness to ordinary session state');
 
   const automated = { sessions: [], attention: [] };
   await addHostSessionState(automated, { panes: [{ ...pane, meta: { agent: 'codex', project: '/tmp/project', openingMessage: true } }],

@@ -8806,7 +8806,7 @@ async function addHostSessionState(state, deps = {}) {
   const boundPanes = new Set((state.sessions || []).map((session) => session.pane).filter(Boolean));
   for (const pane of panes || []) {
     if (!pane?.alive || pane.agentAlive === false || boundPanes.has(pane.id)
-        || pane.meta?.awaitingOwnerInput !== true || Number(pane.inputCount || 0) > 0) continue;
+        || pane.meta?.awaitingOwnerInput !== true) continue;
     state.attention.push({ kind: 'input', pri: 0, pane: pane.id,
       project: pane.meta?.project || pane.cwd || '', title: pane.meta?.title || pane.title || 'New session',
       detail: 'Ready for your next instruction.', attentionLabel: 'Ready for next instruction',
