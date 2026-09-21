@@ -6,6 +6,8 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const jobs = require('./pi-jobs');
 
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 function textOf(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -37,6 +39,18 @@ function finalResponse(file) {
   return text ? { ok: true, text } : { ok: false, error: 'Pi final assistant response was empty' };
 }
 
+function rpcFinished(file) {
+  let lines = [];
+  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean); } catch {}
+  for (const line of lines) {
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+    if (event?.type === 'agent_end') return true;
+    if (event?.type === 'response' && event.id === 'keep-prompt' && event.success === false) return true;
+  }
+  return false;
+}
+
 async function main() {
   const at = process.argv.indexOf('--job');
   const id = at >= 0 ? process.argv[at + 1] : '';
@@ -56,11 +70,12 @@ async function main() {
   fs.mkdirSync(job.sessionDir, { recursive: true, mode: 0o700 });
   const stdout = fs.openSync(job.stdoutFile, 'a', 0o600);
   const stderr = fs.openSync(job.stderrFile, 'a', 0o600);
-  const args = ['--print', '--mode', 'json', '--session-dir', job.sessionDir];
+  const extension = path.join(__dirname, '..', 'integrations', 'pi', 'keep.ts');
+  if (!fs.existsSync(extension)) throw new Error(`Keep Pi adapter is missing: ${extension}`);
+  const args = ['--mode', 'rpc', '--session-dir', job.sessionDir, '--extension', extension];
   if (job.provider) args.push('--provider', job.provider);
   if (job.model) args.push('--model', job.model);
   args.push('--append-system-prompt', job.instructionsFile);
-  args.push('--', job.prompt);
   const env = { ...process.env,
     KEEP_PI_JOB_ID: job.id,
     KEEP_PI_WORKER_TOKEN: job.workerToken,
@@ -82,7 +97,7 @@ async function main() {
   for (const signal of ['SIGHUP', 'SIGTERM']) process.on(signal, stop);
   try {
     child = spawn(process.env.KEEP_PI_EXECUTABLE || 'pi', args, {
-      cwd: job.cwd, env, stdio: ['ignore', stdout, stderr],
+      cwd: job.cwd, env, stdio: ['pipe', stdout, stderr],
     });
     const piStart = jobs.psStart(child.pid);
     jobs.mutate(root, id, (current) => { current.piPid = child.pid; current.piStart = piStart; return current; });
@@ -94,20 +109,46 @@ async function main() {
     fs.closeSync(stdout); fs.closeSync(stderr);
     process.exit(1);
   }
-  const result = await new Promise((resolve) => {
+  const exitPromise = new Promise((resolve) => {
     child.once('error', (error) => resolve({ error }));
     child.once('exit', (code, signal) => resolve({ code, signal }));
   });
+  let handshakeError = '';
+  const handshakeUntil = Date.now() + 10000;
+  while (Date.now() < handshakeUntil && child.exitCode === null && !child.signalCode) {
+    const current = jobs.readRaw(root, id);
+    if (current?.workerSessionId) break;
+    await wait(20);
+  }
+  if (!jobs.readRaw(root, id)?.workerSessionId) {
+    handshakeError = 'Keep Pi adapter did not authenticate the background worker';
+    stop();
+  } else {
+    child.stdin.write(`${JSON.stringify({ id: 'keep-prompt', type: 'prompt', message: job.prompt })}\n`);
+    // RPC stays resident after a turn. Close its input only after the authoritative
+    // agent_end event, so no tool can run before the authenticated start hook.
+    while (child.exitCode === null && !child.signalCode) {
+      if (rpcFinished(job.stdoutFile)) {
+        child.stdin.end();
+        break;
+      }
+      await wait(20);
+    }
+  }
+  const result = await exitPromise;
   clearTimeout(killTimer);
   fs.closeSync(stdout); fs.closeSync(stderr);
   const parsed = finalResponse(job.stdoutFile);
   jobs.mutate(root, id, (current) => {
-    if (current.cancelRequestedAt || current.status === 'cancelling' || stopping) {
+    if (current.cancelRequestedAt || current.status === 'cancelling') {
+      current.status = 'cancelling';
+      current.error = 'cancellation cleanup is still running';
+    } else if (stopping && !handshakeError) {
       current.status = 'cancelled';
       current.error = 'cancelled';
-    } else if (result.error || result.signal || result.code !== 0 || !parsed.ok) {
+    } else if (handshakeError || result.error || result.signal || result.code !== 0 || !parsed.ok) {
       current.status = 'failed';
-      current.error = result.error?.message || (result.signal ? `Pi exited on ${result.signal}`
+      current.error = handshakeError || result.error?.message || (result.signal ? `Pi exited on ${result.signal}`
         : result.code !== 0 ? `Pi exited with code ${result.code}` : parsed.error);
     } else {
       current.status = 'succeeded';
@@ -126,4 +167,4 @@ if (require.main === module) main().catch((error) => {
   process.exit(1);
 });
 
-module.exports = { textOf, finalResponse, main };
+module.exports = { textOf, finalResponse, rpcFinished, main };

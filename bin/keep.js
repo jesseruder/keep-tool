@@ -2492,15 +2492,18 @@ commands.pi = async (argv) => {
     if (provider && (provider.length > 160 || !/^[A-Za-z0-9][A-Za-z0-9_.:/-]*$/.test(provider))) die('Pi provider contains invalid characters');
     if (model && (model.length > 240 || /[\r\n\0]/.test(model))) die('Pi model contains invalid characters');
     const assigned = currentDelegation();
-    if (['invalid', 'identity-mismatch', 'stale'].includes(assigned.kind)) die(delegation.describe(assigned));
-    const parentSession = assigned.record?.parent || currentSession();
-    let card = assigned.record?.card || null;
+    if (['active', 'invalid', 'identity-mismatch', 'stale'].includes(assigned.kind)) {
+      die(`${delegation.describe(assigned)} Only a pending parent transport may launch a delegated Pi job.`);
+    }
+    const pending = assigned.kind === 'pending' ? assigned.record : null;
+    const parentSession = pending?.parent || currentSession();
+    let card = pending?.card || null;
     if (!card && parentSession) {
       try { card = taskForSession(parentSession.id)?.id || null; } catch {}
     }
     const job = piJobs.launch({
       root: ROOT, cwd, provider, model, prompt, parentSession, card,
-      delegationId: assigned.record?.id || process.env.KEEP_DELEGATION_ID || null,
+      delegationId: pending?.id || null,
     });
     console.log(job.id);
     return;

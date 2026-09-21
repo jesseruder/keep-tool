@@ -8,6 +8,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const jobs = require('./pi-jobs');
 const runner = require('./pi-job-runner');
+const KEEP_CLI = path.join(__dirname, 'keep.js');
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitFor(fn, description, timeout = 8000) {
@@ -27,34 +28,67 @@ function fixture() {
   const fake = path.join(base, 'pi');
   fs.mkdirSync(root, { recursive: true });
   fs.mkdirSync(path.join(root, 'tasks'));
+  fs.mkdirSync(path.join(root, 'archive'));
+  fs.mkdirSync(path.join(root, 'digests'));
   fs.mkdirSync(cwd, { recursive: true });
   spawnSync('git', ['init', '-q', root]);
   spawnSync('git', ['-C', root, 'config', 'user.email', 'pi-jobs@example.test']);
   spawnSync('git', ['-C', root, 'config', 'user.name', 'Pi Jobs Test']);
   fs.writeFileSync(fake, `#!/usr/bin/env node
 const fs = require('node:fs');
-const { spawn } = require('node:child_process');
+const path = require('node:path');
+const { spawn, spawnSync } = require('node:child_process');
 if (process.env.FAKE_ARGV) fs.writeFileSync(process.env.FAKE_ARGV, JSON.stringify(process.argv.slice(2)));
-const prompt = process.argv.at(-1);
 const message = (stopReason, text, errorMessage) => console.log(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason,content:text?[{type:'text',text}]:[],errorMessage}}));
-if (prompt.includes('slow')) {
-  const child = spawn(process.execPath, ['-e', 'process.on("SIGTERM",()=>{}); setInterval(()=>{},1000)'], {detached:true,stdio:'ignore'});
-  child.unref();
-  fs.writeFileSync(process.env.FAKE_DESCENDANT, String(child.pid));
-  process.on('SIGTERM', () => {});
-  setInterval(()=>{},1000);
-} else if (prompt.includes('model-error')) {
-  message('error', '', 'provider exploded');
-  console.log(JSON.stringify({type:'agent_end',messages:[]}));
-} else if (prompt.includes('incomplete')) {
-  message('stop', 'premature');
-} else {
-  message('stop', 'worker result');
-  console.log(JSON.stringify({type:'agent_end',messages:[]}));
-}
+const jobFile = path.join(process.env.KEEP_DIR, '.keep', 'pi-jobs', process.env.KEEP_PI_JOB_ID, 'job.json');
+const job = JSON.parse(fs.readFileSync(jobFile, 'utf8'));
+const sid = 'fake-' + job.id;
+const hook = spawnSync(process.execPath, [process.env.KEEP_PI_KEEP_CLI, 'hook', 'pi', 'start'], {
+  env: {...process.env, KEEP_PI_SESSION_ID: sid}, encoding:'utf8',
+  input: JSON.stringify({session_id:sid,cwd:process.cwd(),job_id:job.id,worker_token:job.workerToken,pid:process.pid})
+});
+if (hook.status !== 0) { process.stderr.write(hook.stderr || 'hook failed'); process.exit(2); }
+let buffer = '';
+process.stdin.on('data', chunk => {
+  buffer += chunk;
+  for (;;) {
+    const newline = buffer.indexOf('\\n');
+    if (newline < 0) break;
+    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+    let command; try { command = JSON.parse(line); } catch { continue; }
+    if (command.type !== 'prompt') continue;
+    const prompt = command.message;
+    if (process.env.FAKE_PROMPT) fs.writeFileSync(process.env.FAKE_PROMPT, prompt);
+    console.log(JSON.stringify({id:command.id,type:'response',command:'prompt',success:true}));
+    if (prompt.includes('slow')) {
+      const child = spawn(process.execPath, ['-e', 'process.on("SIGTERM",()=>{}); setInterval(()=>{},1000)'], {detached:true,stdio:'ignore'});
+      child.unref();
+      fs.writeFileSync(process.env.FAKE_DESCENDANT, String(child.pid));
+      if (prompt.includes('cooperative')) process.on('SIGTERM', () => process.exit(143));
+      else process.on('SIGTERM', () => {});
+      setInterval(()=>{},1000);
+    } else if (prompt.includes('model-error')) {
+      message('error', '', 'provider exploded');
+      console.log(JSON.stringify({type:'agent_end',messages:[]}));
+    } else if (prompt.includes('incomplete')) {
+      message('stop', 'premature');
+      setTimeout(() => process.exit(0), 10);
+    } else {
+      message('stop', 'worker result');
+      console.log(JSON.stringify({type:'agent_end',messages:[]}));
+    }
+  }
+});
+process.stdin.on('end', () => process.exit(0));
 `);
   fs.chmodSync(fake, 0o755);
-  return { base, root, cwd, fake, argv: path.join(base, 'argv.json'), descendant: path.join(base, 'descendant.pid') };
+  return { base, root, cwd, fake, argv: path.join(base, 'argv.json'), prompt: path.join(base, 'prompt.txt'),
+    descendant: path.join(base, 'descendant.pid') };
+}
+
+function launch(f, options) {
+  return jobs.launch({ ...options, root: f.root, cwd: f.cwd, piExecutable: f.fake,
+    env: { ...process.env, ...(options.env || {}), KEEP_PI_KEEP_CLI: KEEP_CLI } });
 }
 
 test('background Pi job keeps prompts as argv data and requires a completed final response', async (t) => {
@@ -62,10 +96,15 @@ test('background Pi job keeps prompts as argv data and requires a completed fina
   t.after(() => fs.rmSync(f.base, { recursive: true, force: true }));
   const marker = path.join(f.base, 'must-not-exist');
   const originalArgv = process.env.FAKE_ARGV;
+  const originalPrompt = process.env.FAKE_PROMPT;
   process.env.FAKE_ARGV = f.argv;
-  t.after(() => { if (originalArgv == null) delete process.env.FAKE_ARGV; else process.env.FAKE_ARGV = originalArgv; });
+  process.env.FAKE_PROMPT = f.prompt;
+  t.after(() => {
+    if (originalArgv == null) delete process.env.FAKE_ARGV; else process.env.FAKE_ARGV = originalArgv;
+    if (originalPrompt == null) delete process.env.FAKE_PROMPT; else process.env.FAKE_PROMPT = originalPrompt;
+  });
   const prompt = `finish safely; $(touch ${marker})`;
-  const launched = jobs.launch({ root: f.root, cwd: f.cwd, piExecutable: f.fake, prompt,
+  const launched = launch(f, { prompt,
     provider: 'test-provider', model: 'test/model', parentSession: { id: 'parent-one', agent: 'codex' }, card: 'card-one' });
   const done = await waitFor(() => {
     const value = jobs.read(f.root, launched.id);
@@ -75,16 +114,17 @@ test('background Pi job keeps prompts as argv data and requires a completed fina
   assert.equal(done.result, 'worker result');
   assert.equal(fs.existsSync(marker), false, 'prompt was never interpreted by a shell');
   const argv = JSON.parse(fs.readFileSync(f.argv));
-  assert.equal(argv.at(-1), prompt);
-  assert.deepEqual(argv.slice(0, 8), ['--print', '--mode', 'json', '--session-dir', done.sessionDir,
-    '--provider', 'test-provider', '--model']);
-  assert.equal(argv[8], 'test/model');
+  assert.equal(fs.readFileSync(f.prompt, 'utf8'), prompt);
+  assert.deepEqual(argv.slice(0, 6), ['--mode', 'rpc', '--session-dir', done.sessionDir, '--extension',
+    path.join(__dirname, '..', 'integrations', 'pi', 'keep.ts')]);
   assert.equal(argv.includes('--append-system-prompt'), true);
+  assert.equal(argv.includes('test-provider'), true);
+  assert.equal(argv.includes('test/model'), true);
   assert.equal(jobs.list({ root: f.root }).jobs[0].sessionId, 'parent-one');
   assert.equal(Object.hasOwn(jobs.publicJob(done), 'workerToken'), false);
 
   for (const [text, expected] of [['model-error', 'provider exploded'], ['incomplete', 'before the agent turn completed']]) {
-    const item = jobs.launch({ root: f.root, cwd: f.cwd, piExecutable: f.fake, prompt: text });
+    const item = launch(f, { prompt: text });
     const failed = await waitFor(() => {
       const value = jobs.read(f.root, item.id);
       return jobs.TERMINAL.has(value.status) && value;
@@ -100,7 +140,7 @@ test('cancel verifies the runner, terminates detached tool descendants, and reco
   const previous = process.env.FAKE_DESCENDANT;
   process.env.FAKE_DESCENDANT = f.descendant;
   t.after(() => { if (previous == null) delete process.env.FAKE_DESCENDANT; else process.env.FAKE_DESCENDANT = previous; });
-  const launched = jobs.launch({ root: f.root, cwd: f.cwd, piExecutable: f.fake, prompt: 'slow worker' });
+  const launched = launch(f, { prompt: 'slow worker' });
   const running = await waitFor(() => {
     const value = jobs.readRaw(f.root, launched.id);
     return value?.status === 'running' && value.runnerStart && value.piStart
@@ -111,20 +151,16 @@ test('cancel verifies the runner, terminates detached tool descendants, and reco
   const hookEnv = { ...process.env, KEEP_DIR: f.root, KEEP_PI_JOB_ID: running.id,
     KEEP_PI_WORKER_TOKEN: running.workerToken };
   for (const name of ['KEEP_PANE', 'CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'KEEP_PI_SESSION_ID']) delete hookEnv[name];
-  const hookInput = { session_id: 'pi-worker-session', cwd: f.cwd, job_id: running.id,
-    worker_token: running.workerToken, pid: running.piPid };
-  const hook = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'pi', 'start'], {
-    env: hookEnv, input: JSON.stringify(hookInput), encoding: 'utf8', timeout: 5000,
-  });
-  assert.equal(hook.status, 0, hook.stderr);
-  assert.equal(jobs.readRaw(f.root, running.id).workerSessionId, 'pi-worker-session');
+  const hookInput = { session_id: 'impostor', cwd: f.cwd, job_id: running.id,
+    worker_token: 'wrong', pid: running.piPid };
+  assert.equal(jobs.readRaw(f.root, running.id).workerSessionId, `fake-${running.id}`);
   const impostor = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'pi', 'start'], {
     env: { ...hookEnv, KEEP_PI_WORKER_TOKEN: 'wrong' },
-    input: JSON.stringify({ ...hookInput, session_id: 'impostor', worker_token: 'wrong' }),
+    input: JSON.stringify(hookInput),
     encoding: 'utf8', timeout: 5000,
   });
   assert.equal(impostor.status, 2);
-  assert.equal(jobs.readRaw(f.root, running.id).workerSessionId, 'pi-worker-session');
+  assert.equal(jobs.readRaw(f.root, running.id).workerSessionId, `fake-${running.id}`);
   const cancelled = jobs.cancel(f.root, running.id, { waitMs: 1000 });
   assert.equal(cancelled.status, 'cancelled');
   await waitFor(() => {
@@ -132,12 +168,29 @@ test('cancel verifies the runner, terminates detached tool descendants, and reco
   }, 'detached descendant exit');
 });
 
+test('cancel keeps cleaning a detached tool after cooperative Pi and runner exit', async (t) => {
+  const f = fixture();
+  t.after(() => fs.rmSync(f.base, { recursive: true, force: true }));
+  const launched = launch(f, { prompt: 'cooperative slow worker',
+    env: { ...process.env, FAKE_DESCENDANT: f.descendant } });
+  const running = await waitFor(() => {
+    const value = jobs.readRaw(f.root, launched.id);
+    return value?.workerSessionId && fs.existsSync(f.descendant) && value;
+  }, 'cooperative Pi job');
+  const descendant = Number(fs.readFileSync(f.descendant, 'utf8'));
+  const descendantStart = jobs.psStart(descendant);
+  const cancelled = jobs.cancel(f.root, running.id, { waitMs: 250 });
+  assert.equal(cancelled.status, 'cancelled');
+  assert.equal(jobs.sameProcess({ pid: descendant, pidStart: descendantStart }), false);
+  assert.ok(cancelled.cleanupFinishedAt >= cancelled.cancelRequestedAt);
+});
+
 test('keep pi task/status/result expose the job without its binding capability', async (t) => {
   const f = fixture();
   t.after(() => fs.rmSync(f.base, { recursive: true, force: true }));
-  const cli = path.join(__dirname, 'keep.js');
+  const cli = KEEP_CLI;
   const env = { ...process.env, KEEP_DIR: f.root, KEEP_PI_EXECUTABLE: f.fake,
-    CODEX_THREAD_ID: 'parent-cli-session' };
+    KEEP_PI_KEEP_CLI: KEEP_CLI, CODEX_THREAD_ID: 'parent-cli-session' };
   const launch = spawnSync(process.execPath, [cli, 'pi', 'task', '--background', '--cwd', f.cwd,
     '--provider', 'test-provider', '--model', 'test/model', '--', 'cli worker'], {
     env, encoding: 'utf8', timeout: 5000,
@@ -158,6 +211,63 @@ test('keep pi task/status/result expose the job without its binding capability',
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, 'worker result\n');
+});
+
+test('only a pending delegation transports to Pi; active is refused and ended launches independently', async (t) => {
+  const f = fixture();
+  t.after(() => fs.rmSync(f.base, { recursive: true, force: true }));
+  const base = { ...process.env, KEEP_DIR: f.root, KEEP_PI_EXECUTABLE: f.fake,
+    KEEP_PI_KEEP_CLI: KEEP_CLI, KEEP_NO_PUSH: '1' };
+  for (const name of ['KEEP_PANE', 'CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'KEEP_PI_SESSION_ID', 'KEEP_DELEGATION_ID']) delete base[name];
+  const run = (args, extra = {}) => spawnSync(process.execPath, [KEEP_CLI, ...args], {
+    cwd: f.cwd, env: { ...base, ...extra }, encoding: 'utf8', timeout: 10000,
+  });
+  const added = run(['add', 'Parent Pi card', '--status', 'active', '--plan', 'Run Pi worker'],
+    { CLAUDE_CODE_SESSION_ID: 'parent-claude' });
+  assert.equal(added.status, 0, added.stderr);
+  const prepared = run(['delegate', 'parent-pi-card', '--step', '1', '--prepare'],
+    { CLAUDE_CODE_SESSION_ID: 'parent-claude' });
+  assert.equal(prepared.status, 0, prepared.stderr);
+  const delegationId = prepared.stdout.match(/prepared delegation ([a-f0-9]{32})/)?.[1];
+  assert.ok(delegationId);
+  const first = run(['pi', 'task', '--background', '--cwd', f.cwd, '--', 'delegated result'],
+    { KEEP_DELEGATION_ID: delegationId });
+  assert.equal(first.status, 0, first.stderr);
+  const firstId = first.stdout.trim();
+  const delegated = await waitFor(() => {
+    const value = jobs.read(f.root, firstId);
+    return jobs.TERMINAL.has(value.status) && value;
+  }, 'delegated Pi job');
+  assert.equal(delegated.status, 'succeeded');
+  assert.equal(delegated.delegationId, delegationId);
+  assert.equal(delegated.parentSession.id, 'parent-claude');
+  const workerEnv = { KEEP_DELEGATION_ID: delegationId, KEEP_PI_SESSION_ID: delegated.workerSessionId };
+  const nested = run(['pi', 'task', '--background', '--cwd', f.cwd, '--', 'must refuse'], workerEnv);
+  assert.equal(nested.status, 1);
+  assert.match(nested.stderr, /Only a pending parent transport/);
+  const ended = run(['delegate', '--end'], workerEnv);
+  assert.equal(ended.status, 0, ended.stderr);
+  const independent = run(['pi', 'task', '--background', '--cwd', f.cwd, '--', 'independent result'], workerEnv);
+  assert.equal(independent.status, 0, independent.stderr);
+  const independentJob = jobs.readRaw(f.root, independent.stdout.trim());
+  assert.equal(independentJob.delegationId, null);
+  assert.deepEqual(independentJob.parentSession, { id: delegated.workerSessionId, agent: 'pi' });
+});
+
+test('runner fails before prompting when the authenticated adapter handshake is absent', async (t) => {
+  const f = fixture();
+  t.after(() => fs.rmSync(f.base, { recursive: true, force: true }));
+  const env = { ...process.env, FAKE_PROMPT: f.prompt };
+  delete env.KEEP_PI_KEEP_CLI;
+  const launched = jobs.launch({ root: f.root, cwd: f.cwd, piExecutable: f.fake,
+    prompt: 'must never run', env });
+  const failed = await waitFor(() => {
+    const value = jobs.read(f.root, launched.id);
+    return jobs.TERMINAL.has(value.status) && value;
+  }, 'unauthenticated Pi failure');
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.error, /adapter did not authenticate|code 1|code 2/);
+  assert.equal(fs.existsSync(f.prompt), false);
 });
 
 test('dead active jobs fail and worker authorization requires matching durable capability and identity', () => {

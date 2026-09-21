@@ -401,6 +401,25 @@ commands.hook = async (argv) => {
         process.exitCode = 2;
         return;
       }
+      let assigned = { kind: 'none' };
+      try {
+        assigned = withLock(() => delegation.registerStart(ROOT, { id: sid, agent: 'pi' }, process.env,
+          delegationDependencies({ persist: true })));
+      } catch (error) {
+        if (job) {
+          process.stderr.write(`keep hook pi start: delegation binding failed: ${error.message}\n`);
+          process.exitCode = 2;
+          return;
+        }
+      }
+      if (job?.delegationId && (assigned.kind !== 'active'
+          || assigned.record?.id !== job.delegationId
+          || assigned.record?.worker?.id !== sid
+          || assigned.record?.worker?.agent !== 'pi')) {
+        process.stderr.write('keep hook pi start: delegation did not bind to this worker\n');
+        process.exitCode = 2;
+        return;
+      }
       if (job) {
         try {
           require('../pi-jobs').mutate(ROOT, job.id, (current) => {
@@ -411,13 +430,8 @@ commands.hook = async (argv) => {
         } catch (error) {
           process.stderr.write(`keep hook pi start: ${error.message}\n`);
           process.exitCode = 2;
-          return;
         }
       }
-      try {
-        withLock(() => delegation.registerStart(ROOT, { id: sid, agent: 'pi' }, process.env,
-          delegationDependencies({ persist: true })));
-      } catch {}
       return;
     }
     if (argv[1] === 'end') {

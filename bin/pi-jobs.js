@@ -117,7 +117,15 @@ function descendants(job, rows = processRows()) {
 }
 
 function sameProcess(row) {
-  return Boolean(row?.pidStart && psStart(row.pid) === row.pidStart);
+  if (!row?.pidStart) return false;
+  try {
+    const output = execFileSync('ps', ['-o', 'lstart=,stat=', '-p', String(row.pid)], {
+      encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, LC_ALL: 'C' },
+    });
+    const match = output.match(/^\s*(.{24})\s+(\S+)/m);
+    return Boolean(match && match[1].trim() === row.pidStart && !match[2].startsWith('Z'));
+  } catch { return false; }
 }
 
 function runnerIdentity(job, options = {}) {
@@ -155,7 +163,30 @@ function workerIdentity(job) {
 }
 
 function reconcile(root, job, options = {}) {
-  if (!job || !ACTIVE.has(job.status)) return job;
+  if (!job) return job;
+  if (job.cancelRequestedAt && Array.isArray(job.cancelProcesses)) {
+    const liveChildren = job.cancelProcesses.filter(sameProcess);
+    const runnerLive = runnerIdentity(job, options);
+    if (liveChildren.length || runnerLive) {
+      if (job.status === 'cancelling') return job;
+      return mutate(root, job.id, (current) => {
+        current.status = 'cancelling';
+        current.error = 'cancellation cleanup is still running';
+        return current;
+      });
+    }
+    if (job.status !== 'cancelled' || !job.cleanupFinishedAt) {
+      return mutate(root, job.id, (current) => {
+        current.status = 'cancelled';
+        current.error = 'cancelled';
+        current.finishedAt = current.finishedAt || Date.now();
+        current.cleanupFinishedAt = Date.now();
+        return current;
+      });
+    }
+    return job;
+  }
+  if (!ACTIVE.has(job.status)) return job;
   const alive = options.processAlive ? options.processAlive(job.runnerPid, job) : processAlive(job.runnerPid);
   if (alive && (options.skipIdentity || runnerIdentity(job, options))) return job;
   // A newly spawned runner may not have recorded its start identity yet. Give it
@@ -213,7 +244,8 @@ function launch(options) {
   try {
     child = (options.spawn || spawn)(process.execPath, [path.join(__dirname, 'pi-job-runner.js'), '--job', id], {
       cwd: options.cwd,
-      env: { ...process.env, KEEP_DIR: root, ...(options.piExecutable ? { KEEP_PI_EXECUTABLE: options.piExecutable } : {}) },
+      env: { ...(options.env || process.env), KEEP_DIR: root,
+        ...(options.piExecutable ? { KEEP_PI_EXECUTABLE: options.piExecutable } : {}) },
       detached: true, stdio: 'ignore',
     });
     child.unref();
@@ -269,22 +301,30 @@ function verifiedProcessPids(rows, options = {}) {
 function cancel(root, id, options = {}) {
   let job = read(root, id);
   if (!job) throw new Error(`unknown Pi job ${id}`);
-  if (TERMINAL.has(job.status)) return job;
+  if (TERMINAL.has(job.status) && job.status !== 'cancelled') return job;
+  if (job.status === 'cancelled' && (!job.cancelProcesses || !job.cancelProcesses.some(sameProcess))) return job;
   if (!runnerIdentity(job, options)) {
-    job = reconcile(root, job);
-    if (TERMINAL.has(job.status)) return job;
-    throw new Error(`Pi job ${id} runner identity could not be verified; no process was signalled`);
+    const captured = Array.isArray(job.cancelProcesses) ? job.cancelProcesses : [];
+    if (!captured.some(sameProcess)) {
+      job = reconcile(root, job);
+      if (TERMINAL.has(job.status)) return job;
+      throw new Error(`Pi job ${id} runner identity could not be verified; no process was signalled`);
+    }
   }
+  const children = (Array.isArray(job.cancelProcesses) && job.cancelProcesses.length
+    ? job.cancelProcesses : (options.descendants || descendants(job)).map(({ pid, pidStart }) => ({ pid, pidStart })));
   job = mutate(root, id, (current) => {
-    if (TERMINAL.has(current.status)) return current;
     current.status = 'cancelling';
     current.cancelRequestedAt = current.cancelRequestedAt || Date.now();
+    current.cancelProcesses = children;
+    current.error = 'cancellation cleanup is still running';
     return current;
   });
-  const children = options.descendants || descendants(job);
-  try { (options.kill || process.kill)(-Number(job.runnerPid), 'SIGTERM'); }
-  catch (error) {
-    if (error?.code !== 'ESRCH') throw error;
+  if (runnerIdentity(job, options)) {
+    try { (options.kill || process.kill)(-Number(job.runnerPid), 'SIGTERM'); }
+    catch (error) {
+      if (error?.code !== 'ESRCH') throw error;
+    }
   }
   for (const child of children) {
     if (!sameProcess(child)) continue;
@@ -293,23 +333,19 @@ function cancel(root, id, options = {}) {
     }
   }
   const until = Date.now() + Number(options.waitMs ?? 3000);
-  while (Date.now() < until && runnerIdentity(job, options)) {
+  while (Date.now() < until && (runnerIdentity(job, options) || children.some(sameProcess))) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-    const settled = readRaw(root, id);
-    if (settled && TERMINAL.has(settled.status)) return settled;
+  }
+  for (const child of children) {
+    if (!sameProcess(child)) continue;
+    try { (options.kill || process.kill)(child.pid, 'SIGKILL'); } catch (error) {
+      if (error?.code !== 'ESRCH') throw error;
+    }
   }
   if (runnerIdentity(job, options)) {
-    for (const child of children) {
-      if (!sameProcess(child)) continue;
-      try { (options.kill || process.kill)(child.pid, 'SIGKILL'); } catch (error) {
-        if (error?.code !== 'ESRCH') throw error;
-      }
-    }
     const settleUntil = Date.now() + 500;
     while (Date.now() < settleUntil && runnerIdentity(job, options)) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-      const settled = readRaw(root, id);
-      if (settled && TERMINAL.has(settled.status)) return settled;
     }
     if (runnerIdentity(job, options)) {
       try { (options.kill || process.kill)(-Number(job.runnerPid), 'SIGKILL'); } catch (error) {
@@ -319,7 +355,24 @@ function cancel(root, id, options = {}) {
       }
     }
   }
-  return reconcile(root, readRaw(root, id), { processAlive: () => false });
+  const cleanupUntil = Date.now() + 2000;
+  while (Date.now() < cleanupUntil && (runnerIdentity(job, options) || children.some(sameProcess))) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  }
+  const survivors = children.filter(sameProcess);
+  const runnerLive = runnerIdentity(job, options);
+  return mutate(root, id, (current) => {
+    if (survivors.length || runnerLive) {
+      current.status = 'cancelling';
+      current.error = `cancellation cleanup is still waiting for ${survivors.length + Number(runnerLive)} process${survivors.length + Number(runnerLive) === 1 ? '' : 'es'}`;
+    } else {
+      current.status = 'cancelled';
+      current.error = 'cancelled';
+      current.finishedAt = current.finishedAt || Date.now();
+      current.cleanupFinishedAt = Date.now();
+    }
+    return current;
+  });
 }
 
 function authorizeWorker(root, input, env = process.env, options = {}) {
@@ -339,4 +392,5 @@ module.exports = {
   ID_RE, ACTIVE, TERMINAL, directory, jobDirectory, recordPath, atomicWrite, readRaw, read, mutate,
   records, launch, list, cancel, runnerIdentity, workerIdentity, verifiedProcessPids, authorizeWorker, psStart,
   publicJob, processRows, descendants,
+  sameProcess,
 };
