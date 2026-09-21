@@ -10373,17 +10373,17 @@ async function tellSession(body, deps = {}) {
     // does: a rate-limited newest session must not hide a ready sibling behind it.
     target = candidates.find((session) => !tell.tellRefusal(session));
     if (!target) {
-      const present = sessions.filter((session) => session && linked.has(session.id) && !skip.has(session.id))
+      // Terminal siblings (exited/deadMidTurn) are filtered out so a dead one cannot
+      // mask the self check; live busy/rate-limited/waiting siblings still appear and
+      // their refusals take precedence below.
+      const present = sessions.filter((session) => session && linked.has(session.id) && !skip.has(session.id)
+        && !session.exited && !session.deadMidTurn)
         .sort((a, b) => b.mtime - a.mtime);
       if (!present.length) {
-        // The skip set always excludes the sender, so an empty present may simply mean
-        // the only live session on this card is the sender themselves (alongside, perhaps,
-        // a keep-spawned or reviewer session). The session-mode branch already names that
-        // case 'self'; the card-mode branch must not answer with a misleading
-        // "no live session" instead.
-        const liveLinked = sessions.filter((session) => session && linked.has(session.id)
-          && !session.exited && !session.deadMidTurn);
-        if (senderId && liveLinked.some((session) => session.id === senderId)) {
+        // The skip set excludes the sender, so an empty present means the only live
+        // session linked to this card is the sender themselves.
+        if (senderId && sessions.some((session) => session && session.id === senderId
+          && !session.exited && !session.deadMidTurn)) {
           throw new InjectionError(409, 'self: a session cannot tell its own card', { reason: 'self' });
         }
         throw new InjectionError(409, `no live session on ${body.taskId}; start one with keep open ${body.taskId} --fresh -m "..."`, { reason: 'not-live' });

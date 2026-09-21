@@ -208,6 +208,36 @@ test('telling the sender\'s own card is refused as self, not as a missing live s
     });
     await assert.rejects(tellSession({ taskId: 'own-card', text: 'ping' }, shell),
       (error) => error.status === 409 && error.extra.reason === 'not-live');
+
+    // A terminal sibling (exited/deadMidTurn) must not mask the self check: the sender
+    // is the only live linked session, so the answer is still self, not exited.
+    for (const extra of [{ exited: true }, { deadMidTurn: true }]) {
+      const sibling = tellDeps(root, [liveSession('sender-session'), liveSession('terminal-sibling', extra)], {
+        loadTask: () => ({ id: 'own-card', fm: { sessions: [{ id: 'sender-session' }, { id: 'terminal-sibling' }] } }),
+        watcherSend: async () => ({}),
+      });
+      await assert.rejects(tellSession({
+        taskId: 'own-card', text: 'ping', senderSessionId: 'sender-session', senderAgent: 'claude',
+      }, sibling),
+        (error) => error.status === 409 && error.extra.reason === 'self'
+          && /cannot tell its own card/.test(error.message));
+    }
+
+    // A live sibling that is busy, holding a question, or rate-limited still reports
+    // its own state, taking precedence over the self check.
+    const fm = (sibling) => ({ id: 'own-card', fm: { sessions: [{ id: 'sender-session' }, { id: 'sibling' }] } });
+    const ownCard = async (sibling) => {
+      try { await tellSession({
+        taskId: 'own-card', text: 'ping', senderSessionId: 'sender-session', senderAgent: 'claude',
+      }, tellDeps(root, [liveSession('sender-session'), sibling], {
+        loadTask: () => fm(sibling), watcherSend: async () => ({}),
+      })); }
+      catch (error) { return error; }
+      return assert.fail('expected a refusal');
+    };
+    assert.equal((await ownCard(liveSession('sibling', { endedTurn: false }))).extra.reason, 'busy');
+    assert.equal((await ownCard(liveSession('sibling', { pendingQuestion: true }))).extra.reason, 'waiting-on-owner');
+    assert.equal((await ownCard(liveSession('sibling', { rateLimit: { at: 1 } }))).extra.reason, 'usage-limit');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
