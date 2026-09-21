@@ -61,9 +61,9 @@ calls inherit the Keep session context for `keep` CLI attribution. Keep also sca
 JSONL sessions under `~/.pi/agent/sessions`. Pane history remains the terminal host's
 scrollback.
 
-When no model is supplied, Keep launches `pi/default` on OpenRouter's
-`minimax/minimax-m3`. Pass `--model` through the Pi launch when a task needs another
-OpenRouter model.
+When no model is supplied, Keep lets Pi use the provider and model from Pi's own
+configuration. Pass a provider-qualified value such as `opencode-go/minimax-m3` with
+`--model` to override that configuration for a launch.
 
 Keep does not currently apply Claude's raw-resume guard to Pi, record post-tool step
 or deploy outcomes, relay a message into Pi (including mobile replies), or support Pi restart, transfer, handoff,

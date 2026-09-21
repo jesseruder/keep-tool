@@ -7519,15 +7519,26 @@ test('Pi passes an explicit provider-qualified model through its model flag', as
   const project = os.tmpdir();
   const id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
   const host = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-pi-model' } } : {});
+  const deps = {
+    root, host, piExtensionReady: true, randomUUID: () => id,
+    loadTask: () => ({ fm: { project, sessions: [] } }),
+    linkLaunchedSession: () => true,
+    waitForPiStart: async () => ({ phase: 'start' }),
+  };
   try {
-    const opened = await openSession({ taskId: 'card', fresh: true, agent: 'pi', model: 'opencode-go/minimax-m3' }, {
-      root, host, piExtensionReady: true, randomUUID: () => id,
-      loadTask: () => ({ fm: { project, sessions: [] } }),
-      linkLaunchedSession: () => true,
-      waitForPiStart: async () => ({ phase: 'start' }),
-    });
+    const opened = await openSession({ taskId: 'card', fresh: true, agent: 'pi', model: 'opencode-go/minimax-m3' }, deps);
     assert.match(opened.command, new RegExp(`^pi --model opencode-go/minimax-m3 --session-id ${id}$`));
     assert.doesNotMatch(opened.command, /--provider/);
+
+    const resumed = await openSession({ sessionId: id, model: 'opencode-go/minimax-m3' }, {
+      ...deps,
+      scanSessions: () => [{ id, kind: 'pi', project }],
+      resolveSessionTarget: async () => { throw new InjectionError(404, 'not live', { notLive: true }); },
+      liveSessionPids: async () => new Map(),
+      agentProcessRows: async () => [], listHostPanes: async () => [],
+    });
+    assert.match(resumed.command, new RegExp(`^pi --model opencode-go/minimax-m3 --session ${id}$`));
+    assert.doesNotMatch(resumed.command, /--provider|--session-id/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
