@@ -5408,7 +5408,13 @@ test('native handoff continuation refuses destination identity changes immediate
   const cases = [
     {
       name: 'replacement pane after readiness',
-      onScreen(state) { state.pane.pid = 999; state.pane.createdAt = 301; },
+      async onLive(state, call) {
+        if (call === 1) {
+          await Promise.resolve();
+          state.pane.pid = 999;
+          state.pane.createdAt = 301;
+        }
+      },
     },
     {
       name: 'account changes while agent proof waits',
@@ -5486,7 +5492,7 @@ test('native handoff continuation refuses destination identity changes immediate
     const accountStore = require('./accounts');
     accountStore.pinSession(sid, 'codex', 'source', { root, env });
     accountStore.stageSession(sid, 'target', 'tx-guard', { root, env });
-    const state = { pane: { id: 'pane-guard', alive: true, agentAlive: true, pid: 50, createdAt: 300,
+    const state = { pane: { id: 'pane-guard', alive: true, agentAlive: true, pid: 50, inputCount: 0, createdAt: 300,
       meta: { sessionId: sid, agent: 'codex', accountId: 'target', handoffTransactionId: 'tx-guard' } } };
     const targetIdentity = { pane: 'pane-guard', panePid: 50, paneCreatedAt: 300, sessionId: sid,
       accountId: 'target', transactionId: 'tx-guard', agentPid: 51,
@@ -6172,6 +6178,7 @@ test('a lost chunk acknowledgement resumes a resolved Codex send without duplica
   let ambiguousReplies = 2;
   let enters = 0;
   let modal = false;
+  let receiptCapability = true;
   const screen = () => {
     if (!live.draft) return '› Ask Codex to do anything';
     const rows = [];
@@ -6180,7 +6187,7 @@ test('a lost chunk acknowledgement resumes a resolved Codex send without duplica
       '  ~/keep-tool · master · Full Access'].join('\n');
   };
   const host = recordingHost(async (type, params) => {
-    if (type === 'hello') return { guardedInput: true, guardedInputReceipts: true };
+    if (type === 'hello') return { guardedInput: true, guardedInputReceipts: receiptCapability };
     if (type === 'screen') {
       const rendered = screen();
       const promptRows = live.draft ? Math.ceil(live.draft.length / 76) : 1;
@@ -6221,6 +6228,19 @@ test('a lost chunk acknowledgement resumes a resolved Codex send without duplica
   assert.equal(partial.typing.inFlightChunk, 0);
   assert.equal(live.draft.length, chunkForTyping(text, 200)[0].length,
     'the ambiguous first chunk reached the pane once');
+  const beforeTypeError = await sendToResolvedTarget({ id: 'chunk-session', kind: 'codex' }, { pane: 'pane' }, text, {
+    beforeType: async () => { throw new Error('handoff identity changed'); },
+  }, deps).then(() => null, (error) => error);
+  assert.equal(beforeTypeError.typingStarted, true, 'prior chunks survive a beforeType refusal');
+  const busyError = await sendToResolvedTarget({ id: 'chunk-session', kind: 'codex' }, { pane: 'pane' }, text, undefined, {
+    ...deps, loadDeliverySession: (id) => ({ id, endedTurn: false }),
+  }).then(() => null, (error) => error);
+  assert.equal(busyError.typingStarted, true, 'prior chunks survive a non-idle refusal');
+  receiptCapability = false;
+  const capabilityError = await send().then(() => null, (error) => error);
+  assert.match(capabilityError.message, /host reload required/);
+  assert.equal(capabilityError.typingStarted, true, 'prior chunks survive a host capability refusal');
+  receiptCapability = true;
   modal = true;
   const modalError = await send().then(() => null, (error) => error);
   assert.match(modalError.message, /showing a modal/);

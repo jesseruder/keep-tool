@@ -6188,9 +6188,9 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
       observe: observeMcp,
       precheck,
       type: async (typingProgress) => {
-        if (opts?.beforeType) await opts.beforeType();
         const resumingPartial = Boolean(typingProgress?.state);
         try {
+          if (opts?.beforeType) await opts.beforeType();
           if (resumingPartial) {
             const current = deps.loadDeliverySession ? deps.loadDeliverySession(session.id)
               : session.kind === 'claude' ? claudeSessionFor(session.id) : codex.sessionFor(session.id);
@@ -6249,9 +6249,13 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
     const failure = error instanceof InjectionError ? error : new InjectionError(409, error.message);
     // Read by bin/watcher-live.js: a reservation may only be given back when
     // nothing was typed.
-    failure.typingStarted = error?.nothingTyped && !error?.priorPartialDelivery
+    failure.typingStarted = error?.draftCleared
       ? false
-      : typingStarted || Boolean(error && error.typingStarted);
+      : error?.priorPartialDelivery
+        ? true
+        : error?.nothingTyped
+          ? false
+          : typingStarted || Boolean(error && error.typingStarted);
     throw failure;
   }
 }
