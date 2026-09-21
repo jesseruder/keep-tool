@@ -25,6 +25,13 @@ Plan here as normal — planning always happens in Claude Code, never in Codex. 
 
 The answer sticks for the rest of the session; don't re-ask per task. Don't ask at all on read-only, research, or Q&A sessions — only when code is about to change.
 
+Pi is a separate opt-in per task, on any Claude model. You may suggest a concrete
+scope and model, but launch a Pi worker only when Jesse chooses it for that task.
+A Pi choice does not replace the session's Codex/Opus/Fable choice for later tasks.
+When chosen, follow the Pi delegation guidance in `keep-sessions`; the parent still
+owns the independent review. Do not switch to Pi automatically when quotas run out
+or in an unattended session without an existing Pi choice for that task.
+
 In an **unattended session** — the SessionStart block says Keep opened it and nobody is
 reading it — there is no question to ask: `AskUserQuestion` is refused there. Hand the
 code to an Opus subagent, or to Codex Sol, and say which in the check-in.

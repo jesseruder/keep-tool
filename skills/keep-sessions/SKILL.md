@@ -108,6 +108,25 @@ project. Never `keep pane kill`, `clear` or `rm` a pane you did not create.
 
 ## Delegating one step to a worker
 
+### Pi delegation from Codex or Claude
+
+Pi workers are opt-in per task. Suggest them for isolated fixes, test additions,
+docs, or small features with clear acceptance criteria; state the scope and model
+and wait for Jesse's choice before launching. An existing choice for that task is
+enough. Quota exhaustion and approval on an earlier task do not authorize a switch.
+Preserve the orchestrator's existing defaults for other tasks.
+
+Use a managed Keep session and the ownership rules below. Give the worker the
+worktree, scope, constraints, acceptance criteria, and relevant checks. Assign the
+complete investigate/edit/verify/repair loop; request a commit, check results, and
+remaining concerns. State that the parent owns independent review and landing and
+that the worker must not launch its own reviewer or land. Preserve the existing
+review policy. Bring repeated failures or architectural decisions back to the
+parent rather than retrying the same approach indefinitely. Follow the Pi messaging
+limitations above when arranging follow-up work.
+
+### Registering a step assignment
+
 The parent session owns the Keep check-in for work delegated to another agent. Register the
 exact assignment with `keep delegate <card> --step <n> -- <command...>`. If the launcher
 cannot carry environment variables, run `--prepare` and give the printed
