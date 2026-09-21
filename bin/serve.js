@@ -6114,6 +6114,7 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
     const after = await livePaneState(target.pane, deps);
     const screen = String(snapshot?.text || '');
     if (!before || !after || before.pid !== after.pid || before.inputCount !== after.inputCount
+        || before.pid !== proof.probeState?.pid || before.inputCount !== proof.probeState?.inputCount
         || !cursorAtInputStart(screen, snapshot?.cursor)
         || normalizedText(promptText(promptLine(screen)))
           !== normalizedText(promptText(promptLine(proof.settled?.screen)))) {
@@ -6121,8 +6122,22 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
     }
     return { ...proof, stable: { pid: after.pid, inputCount: after.inputCount, screen } };
   };
+  const checkedPromptProof = async () => {
+    // Bind the probe's visual result to the counter from before its first key. Reading
+    // a new baseline only after it returns would bless Tab+Home (or any two user keys)
+    // that land in that gap as if they were the ghost suggestion we just proved.
+    const before = await livePaneState(target.pane, deps);
+    if (!before) throw new InjectionError(409, 'pane input activity could not be verified before the prompt check');
+    const proof = await precheckSessionTarget(session, target, deps);
+    const after = await livePaneState(target.pane, deps);
+    const ownInputs = proof?.kind === 'suggestion' ? 2 : 0; // probe key plus its Backspace
+    if (!after || after.pid !== before.pid || after.inputCount !== before.inputCount + ownInputs) {
+      throw new InjectionError(409, 'input arrived while the prompt was checked; message was not typed');
+    }
+    return bindPromptProof({ ...proof, probeState: { pid: after.pid, inputCount: after.inputCount } });
+  };
   const precheck = async () => {
-  promptProof = await bindPromptProof(await precheckSessionTarget(session, target, deps));
+  promptProof = await checkedPromptProof();
   if (opts && opts.compactIfCold && !session.reviewer) {
     const ttlMs = envNumber('KEEP_CACHE_TTL_MIN', 60) * 60e3;
     const minTokens = envNumber('KEEP_COMPACT_MIN_TOKENS', 80000);
@@ -6133,7 +6148,7 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
       if (afterCompactAction(result) === 'defer') {
         throw new InjectionError(409, 'compaction still in progress; deliver later');
       }
-      promptProof = await bindPromptProof(await precheckSessionTarget(session, target, deps));
+      promptProof = await checkedPromptProof();
     }
   }
   };
@@ -6174,16 +6189,22 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
       precheck,
       type: async (typingProgress) => {
         if (opts?.beforeType) await opts.beforeType();
-        if (typingProgress?.state) {
-          const current = deps.loadDeliverySession ? deps.loadDeliverySession(session.id)
-            : session.kind === 'claude' ? claudeSessionFor(session.id) : codex.sessionFor(session.id);
-          if (!current || current.endedTurn !== true || current.pendingQuestion || current.pendingPlan) {
-            throw new InjectionError(409, 'session is no longer idle enough to resume its partial delivery; no key was pressed');
+        const resumingPartial = Boolean(typingProgress?.state);
+        try {
+          if (resumingPartial) {
+            const current = deps.loadDeliverySession ? deps.loadDeliverySession(session.id)
+              : session.kind === 'claude' ? claudeSessionFor(session.id) : codex.sessionFor(session.id);
+            if (!current || current.endedTurn !== true || current.pendingQuestion || current.pendingPlan) {
+              throw new InjectionError(409, 'session is no longer idle enough to resume its partial delivery; no key was pressed');
+            }
           }
+          return await typeAndSubmit(target, text, confirmation, {
+            ...deps, deliveryTrace: trace, draftKind: session.kind, typingProgress, promptProof,
+          });
+        } catch (error) {
+          if (resumingPartial && error && typeof error === 'object') error.priorPartialDelivery = true;
+          throw error;
         }
-        return typeAndSubmit(target, text, confirmation, {
-          ...deps, deliveryTrace: trace, draftKind: session.kind, typingProgress, promptProof,
-        });
       },
       submitDraft: async () => {
         if (opts?.beforeType) await opts.beforeType();
@@ -6228,7 +6249,9 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
     const failure = error instanceof InjectionError ? error : new InjectionError(409, error.message);
     // Read by bin/watcher-live.js: a reservation may only be given back when
     // nothing was typed.
-    failure.typingStarted = typingStarted || Boolean(error && error.typingStarted);
+    failure.typingStarted = error?.nothingTyped && !error?.priorPartialDelivery
+      ? false
+      : typingStarted || Boolean(error && error.typingStarted);
     throw failure;
   }
 }

@@ -6222,13 +6222,44 @@ test('a lost chunk acknowledgement resumes a resolved Codex send without duplica
   assert.equal(live.draft.length, chunkForTyping(text, 200)[0].length,
     'the ambiguous first chunk reached the pane once');
   modal = true;
-  await assert.rejects(send(), /showing a modal/);
+  const modalError = await send().then(() => null, (error) => error);
+  assert.match(modalError.message, /showing a modal/);
+  assert.equal(modalError.typingStarted, true, 'a refusal while prior chunks exist retains the reservation');
   assert.equal(enters, 0, 'a modal appearing before resume receives no Enter');
   assert.equal(live.draft.length, chunkForTyping(text, 200)[0].length, 'modal refusal types no more bytes');
   modal = false;
   assert.deepEqual(await send(), { ok: true, delivery: 'received' });
   assert.equal(live.draft, text, 'receipt replay did not duplicate the first chunk');
   assert.equal(enters, 1, 'Enter is pressed exactly once after the full exact draft');
+});
+
+test('a rejected first guarded chunk reports that no typing started and releases its journal', async (t) => {
+  const delivery = require('./delivery');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-first-chunk-refusal-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const directory = path.join(base, 'delivery');
+  const file = path.join(base, 'rollout.jsonl'); fs.writeFileSync(file, '');
+  let inputs = 0;
+  const host = recordingHost((type, params) => {
+    if (type === 'hello') return { guardedInput: true, guardedInputReceipts: true };
+    if (type === 'screen') return { text: '› Ask Codex to do anything', cursor: { x: 2, y: 0 } };
+    if (type === 'input') {
+      inputs += 1;
+      return { dropped: true, reason: 'input arrived', inputCount: params.expectedInputCount + 1 };
+    }
+    return {};
+  });
+  const session = { id: 'first-chunk-refusal', kind: 'codex' };
+  const error = await sendToResolvedTarget(session, { pane: 'pane' }, 'do not reserve this send', undefined, {
+    host, deliveryDirectory: directory, transcriptFileForSession: () => file, sleep: async () => {},
+    listHostPanes: async () => [{ id: 'pane', pid: 6262, inputCount: 0 }],
+    loadDeliverySession: (id) => ({ id, endedTurn: true }),
+  }).then(() => null, (failure) => failure);
+  assert.match(error.message, /input arrived/);
+  assert.equal(error.typingStarted, false, 'the write-start trace cannot override an atomic nothingTyped result');
+  assert.equal(inputs, 1);
+  assert.equal(fs.existsSync(path.join(directory, `${delivery.textHash(session.id)}.json`)), false,
+    'the never-written attempt leaves no pending journal');
 });
 
 test('a lost chunk acknowledgement resumes a resolved Claude send after its prompt probe', async (t) => {
@@ -6241,11 +6272,13 @@ test('a lost chunk acknowledgement resumes a resolved Claude send after its prom
   const receipts = new Map();
   let ambiguousReplies = 2;
   let enters = 0;
+  let injectProbeGap = true;
+  let cursorHome = false;
   const suggestion = 'continue checking the rollout';
   const screen = () => `Old assistant advice: Esc to cancel\n${BOX(live.draft || suggestion)}`;
   const host = recordingHost(async (type, params) => {
     if (type === 'hello') return { guardedInput: true, guardedInputReceipts: true };
-    if (type === 'screen') return { text: screen(), cursor: { x: live.draft.length + 2, y: 2 }, cols: 500, rows: 4 };
+    if (type === 'screen') return { text: screen(), cursor: { x: cursorHome ? 2 : live.draft.length + 2, y: 2 }, cols: 500, rows: 4 };
     if (type !== 'input') return {};
     const value = Buffer.from(params.data, 'base64').toString();
     if (params.expectedInputCount === undefined) {
@@ -6274,10 +6307,23 @@ test('a lost chunk acknowledgement resumes a resolved Claude send after its prom
   const deps = {
     host, deliveryDirectory: directory, transcriptFileForSession: () => file,
     sleep: async () => {}, now: (() => { let n = 0; return () => ++n * 100; })(),
-    listHostPanes: async () => [{ id: 'pane', pid: live.pid, inputCount: live.inputCount }],
+    listHostPanes: async () => {
+      if (injectProbeGap && live.inputCount === 2) {
+        injectProbeGap = false;
+        live.inputCount += 2; // Tab accepts the suggestion; Home restores the same cursor column.
+        live.draft = suggestion;
+        cursorHome = true;
+      }
+      return [{ id: 'pane', pid: live.pid, inputCount: live.inputCount }];
+    },
     loadDeliverySession: (id) => ({ id, endedTurn: true }),
   };
   const send = () => sendToResolvedTarget({ id: 'claude-chunk-session', kind: 'claude' }, { pane: 'pane' }, text, undefined, deps);
+  await assert.rejects(send(), /input arrived while the prompt was checked/);
+  assert.equal(receipts.size, 0, 'Tab+Home in the post-probe gap prevents the first delivery chunk');
+  live.inputCount = 0;
+  live.draft = '';
+  cursorHome = false;
   await assert.rejects(send(), /lost Claude host reply/);
   const firstChunk = chunkForTyping(text, 200)[0];
   assert.equal(live.draft, firstChunk, 'the prompt probe was undone and the ambiguous chunk was written once');
