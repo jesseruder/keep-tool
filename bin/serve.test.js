@@ -5939,42 +5939,7 @@ test('a box holding more than the typed message is not submitted', async () => {
     assert.equal(mixed.inputs.includes('\r'), false, 'Enter is never pressed');
     assert.equal(mixed.inputs.includes('\x1b'), false, 'and nothing is erased either');
     assert.ok(mixed.events.some((e) => e.stage === 'draft-not-exact'));
-    // bin/delivery.js may only expire a journal it can prove never reached the model,
-    // and this refusal is that proof: the text is in the box, Enter was not attempted.
-    assert.equal(error.enterNotPressed, true, 'the refusal says Enter was never attempted');
   }
-
-  // The same claim must be absent from a send that did press Enter, or an accepted
-  // submission whose reply is lost could be swept and typed a second time.
-  const sent = draftHarness(BOX(MESSAGE));
-  assert.deepEqual(await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
-    ...sent.deps, requireExactDraft: true, discardDraftOnAbort: true,
-  }), { ok: true });
-  assert.equal(sent.inputs.includes('\r'), true, 'Enter was pressed');
-  assert.ok(sent.events.some((e) => e.stage === 'enter-sent'));
-
-  // And the case that matters most: the host took the Enter and then the reply was
-  // lost. The failure comes from past the press, so it carries no such claim, and
-  // bin/delivery.js keeps the journal as ambiguous rather than proven unsent.
-  const lost = draftHarness(BOX(MESSAGE));
-  const losingHost = {
-    calls: lost.host.calls,
-    request: async (type, params) => {
-      const result = await lost.host.request(type, params);
-      if (type === 'input' && Buffer.from(params.data, 'base64').toString().includes('\r')) {
-        throw new Error('host connection closed after the key was accepted');
-      }
-      return result;
-    },
-  };
-  const afterEnter = await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
-    ...lost.deps, host: losingHost, requireExactDraft: true, discardDraftOnAbort: true,
-  }).then(() => null, (e) => e);
-  // The host layer reports the lost reply in its own words; what matters is that
-  // it never claims the key was not pressed.
-  assert.match(afterEnter.message, /host disconnected during non-idempotent input/);
-  assert.equal(lost.inputs.includes('\r'), true, 'the pane did receive the Enter');
-  assert.equal(afterEnter.enterNotPressed, undefined, 'an accepted Enter is never reported as unpressed');
 
   // Wrapped across lines is still exactly ours — including a wrap that lands
   // mid-word, which the pane renders with no space to join on.

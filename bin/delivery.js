@@ -157,16 +157,15 @@ function partialTyping(entry) {
     || (Number.isInteger(state.acknowledgedChunks) && state.acknowledgedChunks > 0);
 }
 
-// `typedAt` is written only after type() returns, so its absence proves nothing
-// about Enter: a send whose Enter the host accepted and whose reply was then lost
-// to a crash leaves exactly the same journal as one refused at the exact-draft
-// guard. Only the pane side can tell them apart, and it says so with
-// `enterNotPressed` (bin/serve.js typedAlready). Persist that, because the sweep
-// may only expire an attempt it can prove never reached the model.
-function rememberRefusedEnter(entry, error, writeJournal) {
-  if (!error || !error.enterNotPressed || !entry.typing || Number(entry.typedAt) > 0) return;
-  entry.enterRefusedAt = Date.now();
-  try { writeJournal(); } catch {}
+// The whole message reached the pane: every chunk acknowledged, none in flight.
+// That is exactly what `typedAt` meant before 018ac71 stopped recording it for
+// per-chunk callers, and the paths below that ask "did this text get on screen"
+// have had no witness for it since.
+function completedTyping(entry) {
+  const state = entry && entry.typing;
+  return Boolean(state) && state.version === 1 && !Number.isInteger(state.inFlightChunk)
+    && Number.isInteger(state.chunkCount) && state.chunkCount > 0
+    && state.acknowledgedChunks === state.chunkCount;
 }
 
 function typingProgress(entry, writeJournal) {
@@ -238,21 +237,6 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
   const activeJournal = path.join(directory, hash(session.id) + '.json');
   let journal = activeJournal, settled = false;
   let entry;
-  const writeJournal = () => {
-    const temp = journal + '.tmp';
-    fs.writeFileSync(temp, JSON.stringify(entry), { mode: 0o600 });
-    fs.renameSync(temp, journal);
-  };
-  // Enter is about to be pressed on the draft this journal describes, so any proof
-  // that an earlier attempt never pressed it stops being true of this entry. Clear
-  // it first and durably: if the pane accepts this Enter and its reply is lost, the
-  // journal has to read as ambiguous rather than as proven unsent, or the sweep
-  // would drop it and the next send would deliver the message twice.
-  const forgetRefusedEnter = () => {
-    if (entry.enterRefusedAt === undefined) return;
-    delete entry.enterRefusedAt;
-    writeJournal();
-  };
   try { entry = JSON.parse(fs.readFileSync(journal, 'utf8')); } catch (error) {
     if (error.code !== 'ENOENT') throw error;
     journal = path.join(directory, 'settled', hash(session.id) + '.json');
@@ -268,20 +252,37 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     } else {
       const sameMessage = entry.hash === hash(text), samePane = entry.pane === pane;
       trace('retry-identity', { sameMessage, samePane });
-      if (partialTyping(entry)) {
-        if (!sameMessage || !samePane) {
-          throw new Error('Previous delivery is partially typed; no message was retyped. Inspect the session draft before retrying.');
-        }
+      // Half a message on a pane is never anyone else's to reason about, whatever
+      // its age: the draft is on that pane, and this send is for another one or for
+      // other words. Refuse before the expiry below, which would drop the record and
+      // let this send type a second copy somewhere else while the first still sits
+      // in a box somebody can submit.
+      if (partialTyping(entry) && (!sameMessage || !samePane)) {
+        throw new Error('Previous delivery is partially typed; no message was retyped. Inspect the session draft before retrying.');
+      }
+      // Resuming is for the retry that follows a lost chunk by seconds or minutes.
+      // For an entry with every chunk acknowledged there is nothing left to write,
+      // so past the stale window a resume is the only thing that can still happen to
+      // it and it happens forever: each one walks back into the same guard that
+      // refused Enter and throws again. On 2026-09-21 (delivery:343bbbb6) that cost
+      // 32 consecutive delivery sweeps and a self-repair card, because the expiry
+      // below - which had settled this exact shape before 018ac71 - sits in the
+      // branch a partial entry never takes. So an old complete one falls through to
+      // it. A genuinely unfinished one still has chunks to resume, and keeps them.
+      const expiredDraft = completedTyping(entry) && journalAgeMs(journal, entry, Date.now()) >= staleJournalMs;
+      if (partialTyping(entry) && !expiredDraft) {
         trace('partial-resume-start', {
           acknowledgedChunks: entry.typing.acknowledgedChunks,
           ambiguous: Number.isInteger(entry.typing.inFlightChunk),
         });
-        // This attempt is about to type again, and may well reach Enter.
-        forgetRefusedEnter();
+        const writeJournal = () => {
+          const temp = journal + '.tmp';
+          fs.writeFileSync(temp, JSON.stringify(entry), { mode: 0o600 });
+          fs.renameSync(temp, journal);
+        };
         try {
           await type(typingProgress(entry, writeJournal));
         } catch (error) {
-          rememberRefusedEnter(entry, error, writeJournal);
           // A resumed attempt may finish the remaining chunks and then abort at a
           // beforeEnter guard. The atomic draft clear proves none of the partial
           // message remains, so keeping its old counts would wedge every later send.
@@ -309,11 +310,17 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
         // point at a path that will never gain another line. Retyping there sends the
         // message twice. Expire it without typing: unproven delivery beats a duplicate.
         //
-        // Only for an entry whose text actually reached the pane. Without `typedAt`
-        // the typing itself failed, nothing was ever on screen, and assuming delivery
-        // would file a received receipt - and let a sweep tick consume the day - for a
-        // message nobody has seen.
-          const assumedDelivered = sameMessage && samePane && Number(entry.typedAt) > 0;
+        // Only for an entry whose text actually reached the pane - all of it. Where
+        // the typing failed part way, or failed outright, nothing recoverable was
+        // ever on screen, and assuming delivery would file a received receipt - and
+        // let a sweep tick consume the day - for a message nobody has seen.
+          const assumedDelivered = sameMessage && samePane
+            && (Number(entry.typedAt) > 0 || completedTyping(entry));
+          // A retained receipt (a scheduled check) is stamped delivered here, which
+          // is the opposite of what reconcile does when a pane disappears. The two
+          // differ in what a wrong guess costs: there the pane is gone and nothing
+          // can be typed again, so dropping the record is free; here the pane lives
+          // and no record means the next tick types the check a second time.
           trace('pending-journal-expired', { ageMs, assumedDelivered });
           if (assumedDelivered) {
             finish(directory, journal, entry);
@@ -322,7 +329,6 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
           try { fs.unlinkSync(journal); } catch (error) { if (error.code !== 'ENOENT') throw error; }
           entry = null;
         } else {
-          forgetRefusedEnter();
           await submitDraft();
         }
       }
@@ -332,6 +338,11 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     journal = activeJournal;
     await precheck();
     entry = { createdAt: Date.now(), sessionId: session.id, kind: session.kind, file, offset: fs.statSync(file).size, pane, hash: hash(text), key, receiptId: receiptId(text, key), retainReceipt };
+    const writeJournal = () => {
+      const temp = journal + '.tmp';
+      fs.writeFileSync(temp, JSON.stringify(entry), { mode: 0o600 });
+      fs.renameSync(temp, journal);
+    };
     writeJournal();
     // Rendering may lag behind input. Keep the receipt/exact-draft recovery
     // path alive even if the initial screen confirmation timed out. Never type
@@ -343,7 +354,6 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
       entry.typedAt = Date.now();
       writeJournal();
     } catch (error) {
-      rememberRefusedEnter(entry, error, writeJournal);
       // A guarded terminal submission can refuse before its first chunk (an old
       // host, an unstable input counter, or a prompt that stopped being empty).
       // The journal was intentionally created before `type()`, but this explicit
@@ -385,8 +395,6 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
   // Some TUIs absorb the first Enter while completing a paste. Retry only if
   // the original entire draft is still present, never when it was consumed.
   if (await draftMatches()) {
-    // Same reason as above: this Enter may be the one that lands.
-    forgetRefusedEnter();
     await submitDraft();
     for (let i = 0; i < attempts; i++) {
       await pause(500);
@@ -475,23 +483,21 @@ function pendingForSession(directory, sessionId) {
 // non-empty pane list nothing is retired - an empty list is a host that said
 // nothing, not a host with no panes.
 //
-// An entry with acknowledged chunks and `enterRefusedAt` is swept on age too. The
-// pane refused Enter after the characters were written, so nothing reached the model
-// and there is nothing to be duplicated by dropping the record. Its per-chunk state
-// only buys a resume from the next byte-identical send to the same pane, and by the
-// time it is this old that send is not coming; reconcile also holds the global
-// injection lock, so no typing it could interrupt is in flight. Exempting it made it
-// immortal - the sweep skipped it, the pane-absence retirement above wants `typedAt`,
-// and no send ever ran the expiry. On 2026-09-21 (delivery:343bbbb6) a Codex journal
-// whose three chunks were all acknowledged, and which then refused Enter at the
-// exact-draft guard, failed 32 consecutive sweeps and opened a repair card while its
-// pane sat alive with an empty prompt. It is dropped with no receipt at all, retained
-// or plain: a later send still meets a precheck that refuses a non-empty input box,
-// and a scheduled check is free to fall back to a headless run.
+// A journal that typed every chunk and never got its Enter is retired here too: a
+// dead pane is the one place where "nobody pressed Enter" also means nobody ever
+// will, so its receipt can no longer arrive late. While the pane lives it is left
+// alone, because that draft is still in a box somebody can submit - on 2026-09-21
+// one was, 57 minutes after the send gave up on it, and a journal deleted for being
+// unsent would have let the very next retry deliver it twice. A journal stopped mid
+// message is retired with no receipt of any kind: only part of it was ever there.
 //
-// Partial typing with no such proof is NOT swept at any age. That is the ambiguous
-// shape - Enter may have been accepted and its reply lost - and the record is the
-// only thing standing between it and a duplicate send.
+// Every chunk acknowledged says the whole text got to the pane, never that Enter
+// was refused: an Enter the host took whose reply was lost leaves the same journal.
+// A plain send settles for that reason, which is what keeps its retry from typing
+// a second copy. A retained receipt still takes the rule above and is dropped with
+// no record, so its owner may run the check again - the same trade Keep already
+// makes for a `typedAt` entry here, where Enter definitely WAS pressed. Running a
+// scheduled check twice is recoverable; stamping one delivered for good is not.
 function reconcile(directory, { now = Date.now(), staleJournalMs = STALE_JOURNAL_MS, panes = null } = {}) {
   let files;
   try { files = fs.readdirSync(directory).filter(name => name.endsWith('.json')); }
@@ -508,9 +514,9 @@ function reconcile(directory, { now = Date.now(), staleJournalMs = STALE_JOURNAL
       if (name !== hash(entry.sessionId) + '.json') continue;
       if (!received(entry)) {
         if (journalAgeMs(journal, entry, now) < staleJournalMs) continue;
-        if (!(Number(entry.typedAt) > 0) && (!partialTyping(entry) || Number(entry.enterRefusedAt) > 0)) fs.unlinkSync(journal);
-        else if (Number(entry.typedAt) > 0 && panes?.size && !panes.has(entry.pane)) {
-          if (entry.retainReceipt) fs.unlinkSync(journal);
+        if (!(Number(entry.typedAt) > 0) && !partialTyping(entry)) fs.unlinkSync(journal);
+        else if (panes?.size && !panes.has(entry.pane)) {
+          if (entry.retainReceipt || !(Number(entry.typedAt) > 0 || completedTyping(entry))) fs.unlinkSync(journal);
           else settle(journal, name);
           settled.push(entry.sessionId);
         }
