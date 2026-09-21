@@ -261,9 +261,22 @@ function writeMcpConfig(file, servers) {
 
 // A .keep-mcp.json Keep cannot prove it wrote (a hand edit, or a pre-record file whose
 // servers have since changed) is moved aside rather than trusted or allowed to block a launch.
-function setAsideMcpConfig(file) {
-  const aside = `${file}.conflict-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-  fs.renameSync(file, aside);
+// A concurrent launch may already have moved and regenerated it: only the content this launch
+// judged is moved, and the hard link never replaces an existing backup.
+function setAsideMcpConfig(file, judged) {
+  let current;
+  try { current = fs.readFileSync(file, 'utf8'); } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (current !== judged) return null;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const aside = `${file}.conflict-${stamp}-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
+  try { fs.linkSync(file, aside); } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  fs.rmSync(file, { force: true });
   fs.rmSync(mcpRecordPath(file), { force: true });
   console.warn(`keep: ${file} did not match what Keep generated; moved it to ${aside} and regenerated it`);
   return aside;
@@ -659,7 +672,7 @@ function ensureSharedMemory(account, cwd) {
       const actual = fs.readFileSync(mcpConfig, 'utf8');
       if (actual !== desired) {
         const state = sourceState(sourceAccount, sourceStateFile).value;
-        if (!keepGenerated(mcpConfig, actual, mcpServerSets(state, cwd))) mcpConflict = setAsideMcpConfig(mcpConfig);
+        if (!keepGenerated(mcpConfig, actual, mcpServerSets(state, cwd))) mcpConflict = setAsideMcpConfig(mcpConfig, actual);
         writeMcpConfig(mcpConfig, servers);
       } else if (readMcpRecord(mcpConfig) !== textDigest(desired)) recordMcpConfig(mcpConfig, desired);
     } else writeMcpConfig(mcpConfig, servers);
@@ -715,4 +728,4 @@ function compatible(sourceAccount, targetAccount, cwd) {
 }
 
 module.exports = { MANIFEST, shareSetup, readSetup, previewRefresh, missingPlugins, syncPlugins, ensureSharedMemory, compatible, effectiveMcpServers,
-  projectKey, repositoryRoot, stateFile, trustProject, trustedProjectFor, mcpConfigPath };
+  projectKey, repositoryRoot, stateFile, trustProject, trustedProjectFor, mcpConfigPath, setAsideMcpConfig };

@@ -325,6 +325,29 @@ test('an unrecorded file from before Keep recorded its writes upgrades as an unc
   } finally { f.cleanup(); }
 });
 
+test('setting a conflict aside leaves a concurrent launch\'s work alone', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-mcp-aside-'));
+  try {
+    const file = path.join(root, '.keep-mcp.json');
+    const edit = '{"mcpServers":{"mine":{}}}\n';
+    // Another launch already moved it aside, or already regenerated it.
+    assert.equal(quietly(() => setup.setAsideMcpConfig(file, edit)), null);
+    fs.writeFileSync(file, 'regenerated\n');
+    assert.equal(quietly(() => setup.setAsideMcpConfig(file, edit)), null);
+    assert.equal(fs.readFileSync(file, 'utf8'), 'regenerated\n');
+
+    // Two conflicts set aside in the same instant keep separate backups.
+    const asides = [];
+    for (const content of ['one\n', 'two\n']) {
+      fs.writeFileSync(file, content);
+      asides.push(quietly(() => setup.setAsideMcpConfig(file, content)));
+      assert.equal(fs.existsSync(file), false);
+    }
+    assert.notEqual(asides[0], asides[1]);
+    assert.deepEqual(asides.map((aside) => fs.readFileSync(aside, 'utf8')), ['one\n', 'two\n']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('only explicit builtIn accounts use the sibling Claude state file', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-state-path-'));
   try {
