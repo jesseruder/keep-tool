@@ -9909,7 +9909,10 @@ test('live companion jobs wait only their exact owning Claude session', () => {
 });
 
 test('Pi companion jobs attach only to their parent and clear after terminal state', () => {
-  const parent = { id: 'parent-session', kind: 'claude', endedTurn: true };
+  const parent = { id: 'parent-session', kind: 'claude', endedTurn: true,
+    backgroundJobs: { pending: true, uncertain: [], caughtUp: true,
+      jobs: [{ id: 'native-job', kind: 'shell', status: 'running' }] },
+    pendingBackground: true };
   const worker = { id: 'private-worker-session', kind: 'pi', endedTurn: true };
   const sessions = [parent, worker];
   applyCompanionJobs(sessions, { known: true, jobs: [
@@ -9919,15 +9922,26 @@ test('Pi companion jobs attach only to their parent and clear after terminal sta
   ] });
   assert.equal(parent.pendingBackground, true);
   assert.deepEqual(parent.backgroundJobs.jobs.map((job) => job.id),
-    ['pi-queued', 'pi-running', 'pi-cancelling']);
+    ['native-job', 'pi-queued', 'pi-running', 'pi-cancelling']);
   assert.equal(worker.pendingBackground, undefined, 'the private worker id is not a dashboard owner');
 
   applyCompanionJobs(sessions, { known: true, jobs: [
     { id: 'pi-running', sessionId: parent.id, workerSessionId: worker.id, status: 'succeeded' },
   ] });
-  assert.equal(parent.pendingBackground, false);
-  assert.equal(parent.backgroundJobs.pending, false);
-  assert.deepEqual(parent.backgroundJobs.jobs, []);
+  assert.equal(parent.pendingBackground, true, 'the native running job remains pending');
+  assert.equal(parent.backgroundJobs.pending, true);
+  assert.deepEqual(parent.backgroundJobs.jobs.map((job) => job.id), ['native-job']);
+
+  const settledParent = { id: parent.id, kind: 'claude', endedTurn: true };
+  applyCompanionJobs([settledParent], { known: true, jobs: [
+    { id: 'pi-running', sessionId: parent.id, status: 'running' },
+  ] });
+  applyCompanionJobs([settledParent], { known: true, jobs: [
+    { id: 'pi-running', sessionId: parent.id, status: 'succeeded' },
+  ] });
+  assert.equal(settledParent.pendingBackground, false, 'terminal Pi work clears its own pending state');
+  assert.equal(settledParent.backgroundJobs.pending, false);
+  assert.deepEqual(settledParent.backgroundJobs.jobs, []);
 });
 
 test('companion snapshot merges Codex and Pi jobs', async () => {
