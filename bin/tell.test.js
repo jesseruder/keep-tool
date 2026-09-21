@@ -209,6 +209,30 @@ test('telling the sender\'s own card is refused as self, not as a missing live s
     await assert.rejects(tellSession({ taskId: 'own-card', text: 'ping' }, shell),
       (error) => error.status === 409 && error.extra.reason === 'not-live');
 
+    // A live sender from another card does not make an empty addressed card its own.
+    const unrelatedEmpty = tellDeps(root, [liveSession('sender-session')], {
+      loadTask: () => ({ id: 'other-card', fm: { sessions: [] } }),
+      watcherSend: async () => ({}),
+    });
+    await assert.rejects(tellSession({
+      taskId: 'other-card', text: 'ping', senderSessionId: 'sender-session', senderAgent: 'claude',
+    }, unrelatedEmpty),
+      (error) => error.status === 409 && error.extra.reason === 'not-live'
+        && /no live session on other-card/.test(error.message));
+
+    // Nor does it make a card with only an exited linked session its own.
+    const unrelatedTerminal = tellDeps(root, [
+      liveSession('sender-session'), liveSession('terminal-session', { exited: true }),
+    ], {
+      loadTask: () => ({ id: 'other-card', fm: { sessions: [{ id: 'terminal-session' }] } }),
+      watcherSend: async () => ({}),
+    });
+    await assert.rejects(tellSession({
+      taskId: 'other-card', text: 'ping', senderSessionId: 'sender-session', senderAgent: 'claude',
+    }, unrelatedTerminal),
+      (error) => error.status === 409 && error.extra.reason === 'not-live'
+        && /no live session on other-card/.test(error.message));
+
     // A terminal sibling (exited/deadMidTurn) must not mask the self check: the sender
     // is the only live linked session, so the answer is still self, not exited.
     for (const extra of [{ exited: true }, { deadMidTurn: true }]) {

@@ -10380,9 +10380,9 @@ async function tellSession(body, deps = {}) {
         && !session.exited && !session.deadMidTurn)
         .sort((a, b) => b.mtime - a.mtime);
       if (!present.length) {
-        // The skip set excludes the sender, so an empty present means the only live
-        // session linked to this card is the sender themselves.
-        if (senderId && sessions.some((session) => session && session.id === senderId
+        // The skip set excludes the sender, so check whether the sender is the only
+        // live session linked to this card before calling the refusal self.
+        if (senderId && sessions.some((session) => session && session.id === senderId && linked.has(session.id)
           && !session.exited && !session.deadMidTurn)) {
           throw new InjectionError(409, 'self: a session cannot tell its own card', { reason: 'self' });
         }
