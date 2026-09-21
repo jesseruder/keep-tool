@@ -5932,6 +5932,118 @@ test('a box holding more than the typed message is not submitted', async () => {
   assert.equal(gone.inputs.includes('\r'), false);
 });
 
+test('a long Codex draft is submitted across composer-width wraps above its status footer', async () => {
+  // The live failure of 2026-09-21 used a 287-column pane whose Codex composer
+  // wrapped at 284 columns. The last full row ended in `sandbox-release-`; using the
+  // widest terminal row as the composer width inserted a space before `status` and
+  // made the exact-draft guard refuse a complete message after it had been typed.
+  const lead = '[keep] message from session #240 - release status landed; ';
+  const marker = 'sandbox-release-';
+  const first = `${lead}${'x'.repeat(282 - lead.length - marker.length)}${marker}`;
+  const message = `${first}status-and-rollout-waiter-script. No reply needed. `
+    + 'The remaining delivery detail continues across another wrapped row for the regression.';
+  const second = message.slice(282, 282 + 282);
+  const rest = message.slice(282 + 282);
+  const screen = [
+    'unrelated output'.padEnd(287, 'x'),
+    `› ${first}`,
+    `  ${second}`,
+    ...(rest ? [`  ${rest}`] : []),
+    '',
+    '  ~/keep-tool · master · Context 16% used · weekly 34% left · gpt-6-astra medium · Full Access · Main [default]',
+  ].join('\n');
+  assert.match(first, /sandbox-release-$/, 'the fixture wraps in the middle of the card id');
+
+  const { draftIsExactly } = require('./serve');
+  assert.equal(draftIsExactly(screen, message, 'codex'), false,
+    'the old width inference reproduces the live false refusal');
+  const harness = draftHarness((inputs) => inputs.length ? screen : '› Ask Codex to do anything');
+  await typeAndSubmit({ pane: 'p' }, message, () => true, {
+    ...harness.deps, draftKind: 'codex', requireExactDraft: true, discardDraftOnAbort: true,
+  });
+  assert.equal(harness.inputs.at(-1), '\r', 'the complete exact draft is submitted');
+
+  // Width changes do not change the answer: this is the same text wrapped at a
+  // narrower composer width, including Codex's two-cell continuation indent.
+  const narrowWidth = 91;
+  const rows = [];
+  for (let at = 0; at < message.length;) {
+    const firstRow = rows.length === 0;
+    const size = narrowWidth - 2;
+    rows.push(`${firstRow ? '› ' : '  '}${message.slice(at, at + size)}`);
+    at += size;
+  }
+  const resized = [...rows, '', '  ~/keep-tool · master · Full Access'].join('\n');
+  const resizedHarness = draftHarness((inputs) => inputs.length ? resized : '› Ask Codex to do anything');
+  await typeAndSubmit({ pane: 'p' }, message, () => true, {
+    ...resizedHarness.deps, draftKind: 'codex', requireExactDraft: true, discardDraftOnAbort: true,
+  });
+  assert.equal(resizedHarness.inputs.at(-1), '\r');
+});
+
+test('the width-independent Codex draft check still refuses mixed and blank-added input', async () => {
+  const message = 'continue with the delivery regression and report the result';
+  const footer = ['', '  ~/keep-tool · master · Full Access'];
+  const screens = [
+    [`› ${message}`, '  and delete the journal', ...footer].join('\n'),
+    [`› ${message}`, '', '  and delete the journal', ...footer].join('\n'),
+  ];
+  const { draftIsExactly } = require('./serve');
+  for (const screen of screens) {
+    assert.equal(draftIsExactly(screen, message, 'codex'), false);
+    const harness = draftHarness(screen);
+    await assert.rejects(typeAndSubmit({ pane: 'p' }, message, () => true, {
+      ...harness.deps, draftKind: 'codex', requireExactDraft: true,
+    }), /no longer holds only the typed message/);
+    assert.equal(harness.inputs.includes('\r'), false, 'mixed input is never submitted');
+  }
+});
+
+test('the long-wrap fallback requires an empty stable baseline and an atomic guarded Enter', async () => {
+  const message = `deliver ${'x'.repeat(430)} without adding a space-inside-this-token`;
+  const draft = [`› ${message.slice(0, 282)}`, `  ${message.slice(282)}`, '',
+    '  ~/keep-tool · master · Full Access'].join('\n');
+  const screen = (inputs) => inputs.length ? draft : '› Ask Codex to do anything';
+  const options = (harness) => ({
+    ...harness.deps, draftKind: 'codex', requireExactDraft: true, discardDraftOnAbort: true,
+  });
+
+  // Input during the empty-prompt read is outside Keep's send and invalidates the
+  // baseline before even the first chunk is written.
+  let baselineRead = false;
+  const racedBaseline = draftHarness(screen, (type, { inputs, foreign }) => {
+    if (type === 'screen' && inputs.length === 0 && !baselineRead) {
+      baselineRead = true;
+      foreign.count += 1;
+    }
+  });
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, message, () => true, options(racedBaseline)),
+    /input arrived while the Codex prompt was checked/);
+  assert.deepEqual(racedBaseline.inputs, [], 'an unstable baseline types nothing');
+
+  // Input after the baseline is caught by the same pid+counter guard as Enter. The
+  // host drops Enter atomically; the complete draft remains available for recovery.
+  let added = false;
+  const racedEnter = draftHarness(screen, (type, { inputs, foreign }) => {
+    if (type === 'input' && inputs.length > 0 && !added) {
+      added = true;
+      foreign.count += 1;
+    }
+  });
+  const error = await typeAndSubmit({ pane: 'p' }, message, () => true, options(racedEnter))
+    .then(() => null, (failure) => failure);
+  assert.equal(error.inputDropped, true);
+  assert.equal(racedEnter.inputs.includes('\r'), false, 'a raced Enter never reaches the pane');
+
+  // A pre-guard host would ignore the conditional input fields. Refuse it before
+  // typing instead of silently turning the guarded Enter back into an ordinary one.
+  const oldHost = draftHarness(screen);
+  oldHost.hello.guardedInput = false;
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, message, () => true, options(oldHost)),
+    /terminal host reload required/);
+  assert.deepEqual(oldHost.inputs, [], 'an unsupported host types nothing');
+});
+
 // Recovery is the one place an Enter is pressed on a draft this process did not just
 // type. deliverAttempt (bin/delivery.js) finds a pending journal for the same text and
 // pane, sees that draft still in the box, and submits it rather than typing the message
@@ -6057,6 +6169,30 @@ test('a recovered draft is submitted once, and only while the box still holds ex
     assert.equal(failure.status, 409);
     assert.equal(failure.typingStarted, true, 'a recovery Enter counts as typing');
   } finally { fs.rmSync(lost.base, { recursive: true, force: true }); }
+});
+
+test('recovery submits an unchanged long Codex draft above the status footer without retyping it', async () => {
+  const lead = '[keep] delivery result: ';
+  const marker = 'sandbox-release-';
+  const first = `${lead}${'x'.repeat(282 - lead.length - marker.length)}${marker}`;
+  const text = `${first}status-and-rollout-waiter-script is complete; no reply needed`;
+  const screen = [
+    'earlier output'.padEnd(287, 'x'),
+    `› ${text.slice(0, 282)}`,
+    `  ${text.slice(282)}`,
+    '',
+    '  ~/keep-tool · master · Context 16% used · Full Access · Main [default]',
+  ].join('\n');
+  const recovery = recoveryHarness({
+    text, kind: 'codex',
+    screenFor: () => ({ text: screen, cursorY: 2 }),
+    onEnter: (_file, receipt) => receipt(),
+  });
+  try {
+    assert.deepEqual(await recovery.send(), { ok: true, delivery: 'received' });
+    assert.deepEqual(recovery.inputs, ['\r'], 'recovery sends only Enter, never the text again');
+    assert.deepEqual(recovery.requested, [200, 200], 'the same full screen is checked immediately before Enter');
+  } finally { fs.rmSync(recovery.base, { recursive: true, force: true }); }
 });
 
 // A line Owner added below a blank one has to stop it as well. exactDraft would not
@@ -7573,11 +7709,14 @@ test('a restarted or handed-off pane stops being the check scheduler\'s to reap'
   const { adoptedPaneMeta } = require('./serve.js');
   const opened = { ephemeral: 'check', card: 'some-card', sessionId: 'sid', agent: 'claude',
     accountId: 'checks', launchedAt: 1_000_000, project: '/tmp/project',
-    opener: { kind: 'check', id: 'some-card' }, unattended: true };
+    opener: { kind: 'check', id: 'some-card' }, unattended: true,
+    awaitingOwnerInput: true, openingMessage: true };
   const adopted = adoptedPaneMeta(opened);
   // Owner restarting the pane, or moving it to another account, makes it an ordinary
   // session. Carrying `ephemeral` across would let the sweep close a pane Owner is using.
   assert.equal('ephemeral' in adopted, false);
+  assert.equal('awaitingOwnerInput' in adopted, false);
+  assert.equal('openingMessage' in adopted, false);
   assert.equal(adopted.card, 'some-card', 'everything else rides along unchanged');
   assert.equal(adopted.sessionId, 'sid');
   assert.equal(adopted.launchedAt, 1_000_000, 'the open-request dedupe still reads this');
@@ -7875,6 +8014,8 @@ test('standalone fresh agent launch uses the selected profile and one request id
     const spawn = host.calls.find((call) => call.type === 'spawn').params;
     assert.equal(spawn.cwd, fs.realpathSync(cwd)); assert.equal(spawn.meta.card, null);
     assert.equal(spawn.meta.openRequestId, 'standalone-request'); assert.equal(spawn.meta.model, 'gpt-5.6-sol');
+    assert.equal(spawn.meta.awaitingOwnerInput, true);
+    assert.equal('openingMessage' in spawn.meta, false);
     const encoded = /'--profile' '([^']+)'/.exec(spawn.args[1])?.[1];
     assert.equal(JSON.parse(Buffer.from(encoded, 'base64url')).id, 'codex-secondary');
 
@@ -7912,6 +8053,9 @@ test('standalone fresh agent launch uses the selected profile and one request id
       typeOpeningMessage: async () => assert.fail('must not type before the session id is verified'),
     }), (error) => error.status === 504 && /never registered its session id/.test(error.message));
     assert.equal(spawns, 2);
+    const messageSpawn = host.calls.filter((call) => call.type === 'spawn').at(-1).params;
+    assert.equal(messageSpawn.meta.openingMessage, true);
+    assert.equal('awaitingOwnerInput' in messageSpawn.meta, false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -9162,6 +9306,34 @@ test('API state exposes pane ids without copying obsolete viewer metadata', asyn
   assert.equal(state.sessions[0].viewer, undefined);
   assert.equal(state.sessions[1].pane, null);
   assert.equal(state.attention[0].pane, 'pane-hosted');
+});
+
+test('API state keeps an unbound owner-opened session waiting until its first input', async () => {
+  const pane = { id: 'new-pane', alive: true, inputCount: 0, createdAt: '2026-09-21T01:02:03Z',
+    cwd: '/tmp/project', meta: { agent: 'codex', project: '/tmp/project', awaitingOwnerInput: true } };
+  const state = { sessions: [], attention: [] };
+  await addHostSessionState(state, { panes: [pane], codexSessionFor: () => null });
+  assert.deepEqual(state.attention.map((item) => ({ kind: item.kind, pane: item.pane, label: item.attentionLabel })),
+    [{ kind: 'input', pane: 'new-pane', label: 'Ready for next instruction' }]);
+
+  const afterInput = { sessions: [], attention: [] };
+  await addHostSessionState(afterInput, { panes: [{ ...pane, inputCount: 1 }], codexSessionFor: () => null });
+  assert.deepEqual(afterInput.attention, [], 'typing clears temporary readiness before transcript registration');
+
+  const automated = { sessions: [], attention: [] };
+  await addHostSessionState(automated, { panes: [{ ...pane, meta: { agent: 'codex', project: '/tmp/project', openingMessage: true } }],
+    codexSessionFor: () => null });
+  assert.deepEqual(automated.attention, [], 'an automated opening message is never advertised as Owner-ready');
+});
+
+test('a registered host-only session with opening delivery pending is running, not ready', () => {
+  const added = backfillHostSessions([], [{ id: 'opening-pane', alive: true, createdAt: '2026-09-21T01:02:03Z',
+    meta: { agent: 'codex', sessionId: 'opening-session', project: '/tmp/project', openingMessage: true } }],
+  { codexSessionFor: () => null });
+  assert.equal(added[0].endedTurn, false);
+  assert.equal(added[0].toolRunning, true);
+  assert.equal(added[0].state, 'running');
+  assert.equal(require('./session-status').attention(added[0]), null);
 });
 
 test('API state adds an alive Codex host session omitted by the transcript window', async () => {

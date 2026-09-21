@@ -1,11 +1,13 @@
 const KEY = 'keep.console.session-history.v1';
 const LIMIT = 50;
-const valid = (entry) => entry && typeof entry.sessionId === 'string' && /^[A-Za-z0-9_-]+$/.test(entry.sessionId)
-  && ['triage', 'watch'].includes(entry.view);
-const clean = (entry) => ({ sessionId: entry.sessionId, view: entry.view,
+const id = (value) => typeof value === 'string' && /^[A-Za-z0-9_-]+$/.test(value);
+const valid = (entry) => entry && (id(entry.sessionId) || id(entry.paneId)) && ['triage', 'watch'].includes(entry.view);
+const clean = (entry) => ({ ...(id(entry.sessionId) ? { sessionId: entry.sessionId } : {}),
+  ...(id(entry.paneId) ? { paneId: entry.paneId } : {}), view: entry.view,
   title: String(entry.title || '').slice(0, 300), project: String(entry.project || '').slice(0, 1000),
   layout: String(entry.layout || '').slice(0, 200), at: Number(entry.at) || 0 });
-const same = (a, b) => a?.sessionId === b?.sessionId && a?.view === b?.view && a?.layout === b?.layout;
+const identity = (entry) => entry?.sessionId ? `session:${entry.sessionId}` : entry?.paneId ? `pane:${entry.paneId}` : '';
+const same = (a, b) => identity(a) === identity(b) && a?.view === b?.view && a?.layout === b?.layout;
 
 export function createSessionHistory(storage) {
   let entries = [], recent = [], index = -1;
@@ -28,15 +30,36 @@ export function createSessionHistory(storage) {
       const entry = clean(value);
       if (same(entries[index], entry)) entries[index] = entry;
       else { entries = [...entries.slice(0, index + 1), entry].slice(-LIMIT); index = entries.length - 1; }
-      recent = [entry, ...recent.filter((old) => old.sessionId !== entry.sessionId)].slice(0, LIMIT);
+      recent = [entry, ...recent.filter((old) => identity(old) !== identity(entry))].slice(0, LIMIT);
       save();
+    },
+    bindPane(paneId, sessionId, value = {}) {
+      if (!id(paneId) || !id(sessionId)) return false;
+      let changed = false;
+      const bind = (entry) => {
+        // Pane ids can be reused by in-place restart and handoff. They only supply
+        // identity while a launch is unbound; never rewrite recorded conversation
+        // history to whichever session owns that pane later.
+        if (entry.paneId !== paneId || entry.sessionId) return entry;
+        changed = true;
+        return clean({ ...entry, ...value, paneId, sessionId });
+      };
+      entries = entries.map(bind);
+      recent = recent.map(bind);
+      if (changed) {
+        // A session may have been visited after the pane entry was recorded. Keep the
+        // newest recent card, while the chronological back/forward trail stays intact.
+        recent = recent.filter((entry, at, all) => all.findIndex((candidate) => identity(candidate) === identity(entry)) === at);
+        save();
+      }
+      return changed;
     },
     move(delta) {
       const next = index + delta;
       if (!Number.isInteger(delta) || next < 0 || next >= entries.length) return null;
       index = next;
       const entry = entries[index];
-      recent = [{ ...entry, at: Date.now() }, ...recent.filter((old) => old.sessionId !== entry.sessionId)].slice(0, LIMIT);
+      recent = [{ ...entry, at: Date.now() }, ...recent.filter((old) => identity(old) !== identity(entry))].slice(0, LIMIT);
       save(); return entry;
     },
   };

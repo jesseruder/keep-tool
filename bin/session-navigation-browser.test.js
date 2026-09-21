@@ -20,9 +20,11 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
   let releaseHeldState = null;
   let nextStateMarker = null;
   const sessions = ['a', 'b'].map((id) => ({ id, kind: 'claude', title: `Session ${id}`, project: '/tmp/history-fixture', taskId: `card-${id}`, pane: `p${id}`, mtime: Date.now(), state: 'running', endedTurn: false }));
+  sessions[0].num = 237;
   const panes = sessions.map((s, i) => ({ id: s.pane, pid: 100 + i, alive: true, meta: { agent: 'claude', sessionId: s.id } }));
   const layouts = [{ name: 'Pinned', role: 'pinned', ids: ['pa', 'pb'], cols: 2 }];
-  const state = { sessions, panes, tasks: sessions.map((s) => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [], setAside: {}, health: {
+  const state = { sessions, panes, accounts: [{ id: 'codex/default', label: 'Codex', agent: 'codex', isDefault: true }],
+    tasks: sessions.map((s) => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [], setAside: {}, health: {
     daemon: { running: true, pid: 321 },
     schedulers: [
       { name: 'runs', state: 'ok', displayState: 'ok', detail: 'processed 4 runs', displayDetail: 'processed 4 runs', lastError: 'recovered old error' },
@@ -31,6 +33,7 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
   }, usage: {}, review: { events: [], stats: {} }, limitResume: {} };
   sessions.push({ id: 'recent-only', kind: 'claude', title: 'Recent only', project: '/tmp/recent-fixture', state: 'exited', exited: true, endedTurn: true, lastUserAt: Date.now() - 60000, mtime: Date.now() - 60000 });
   let shells = 0;
+  let agentsOpened = 0;
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://fixture');
     if (req.method === 'POST') posts.push(url.pathname);
@@ -68,6 +71,18 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
       if (url.pathname === '/api/panes/spawn') {
         const pane = { id: `shell${++shells}`, pid: 900 + shells, alive: true, cwd: '/tmp/history-fixture', meta: { agent: 'shell', title: 'New shell', project: '/tmp/history-fixture' } };
         panes.push(pane); res.end(JSON.stringify({ pane })); return;
+      }
+      if (url.pathname === '/api/open') {
+        let body = ''; for await (const chunk of req) body += chunk;
+        const request = JSON.parse(body);
+        const pane = { id: `new-agent${++agentsOpened}`, pid: 950 + agentsOpened, alive: true, inputCount: 0,
+          createdAt: new Date().toISOString(), cwd: request.cwd,
+          meta: { agent: request.agent, accountId: request.accountId, project: request.cwd,
+            openRequestId: request.requestId, awaitingOwnerInput: true } };
+        panes.push(pane);
+        state.attention.push({ kind: 'input', pri: 0, pane: pane.id, project: request.cwd,
+          title: 'New session', detail: 'Ready for your next instruction.', attentionLabel: 'Ready for next instruction', since: Date.now() });
+        res.end(JSON.stringify({ ok: true, pane: pane.id, sessionId: null, pendingRegistration: true })); return;
       }
       if (url.pathname === '/api/restart-session') {
         let body = ''; for await (const chunk of req) body += chunk;
@@ -253,6 +268,33 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     await evaluate("document.querySelector('[data-history-back]').click()");
     await wait("document.querySelector('#stage').dataset.itemKey === 'a'");
     await evaluate("document.querySelector('[data-history-forward]').click()");
+    await wait("document.querySelector('#stage').dataset.itemKey === 'b'");
+    // A new Codex pane is actionable before its first transcript supplies a session
+    // id. It must remain in Waiting on you while another conversation is viewed, and
+    // Back must return to that exact pane rather than skipping over the launch.
+    await evaluate(`(() => {
+      document.querySelector('#rail [data-shell]').click();
+      const kind = document.querySelector('[data-launch-kind]');
+      kind.value = 'codex'; kind.dispatchEvent(new Event('change', { bubbles: true }));
+      document.querySelector('.session-launch-card').requestSubmit();
+    })()`);
+    await wait("document.querySelector('#stage').dataset.pane === 'new-agent1' && document.querySelector('#qlist [data-key=\"waiting:new-agent1\"]')");
+    await evaluate("document.querySelector('#qlist [data-key=\"running:a\"]').click()");
+    await wait("document.querySelector('#stage').dataset.itemKey === 'a'");
+    assert.ok(await evaluate("document.querySelector('#qlist [data-key=\"waiting:new-agent1\"]')?.textContent.includes('Ready for next instruction')"),
+      'new-session readiness remains visible after navigating away');
+    await evaluate("document.querySelector('[data-history-back]').click()");
+    await wait("document.querySelector('#stage').dataset.pane === 'new-agent1'");
+    const newPane = panes.find((pane) => pane.id === 'new-agent1');
+    newPane.meta.sessionId = 'new-session';
+    sessions.push({ id: 'new-session', kind: 'codex', title: 'New session registered', project: '/tmp/history-fixture',
+      pane: newPane.id, mtime: Date.now(), state: 'running', endedTurn: false });
+    state.attention = state.attention.filter((item) => item.pane !== newPane.id);
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await wait("document.querySelector('#stage').dataset.itemKey === 'new-session'");
+    await evaluate("document.querySelector('#qlist [data-key=\"running:a\"]').click(); document.querySelector('[data-history-back]').click()");
+    await wait("document.querySelector('#stage').dataset.itemKey === 'new-session' && document.querySelector('#stage').dataset.pane === 'new-agent1'");
+    await evaluate("document.querySelector('#qlist [data-key=\"running:b\"]').click()");
     await wait("document.querySelector('#stage').dataset.itemKey === 'b'");
     await evaluate("document.querySelector('[data-mode=watch]').click(); document.querySelector('.wpane[data-pane=pa] .term').dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}))");
     await evaluate("document.querySelector('[data-history-back]').click()");

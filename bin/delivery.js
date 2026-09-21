@@ -211,6 +211,16 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
       entry.typedAt = Date.now();
       writeJournal();
     } catch (error) {
+      // A guarded terminal submission can refuse before its first chunk (an old
+      // host, an unstable input counter, or a prompt that stopped being empty).
+      // The journal was intentionally created before `type()`, but this explicit
+      // evidence says there is no partial draft to recover. Remove it immediately
+      // instead of wedging the session until stale-journal cleanup runs.
+      if (error && error.nothingTyped) {
+        trace('nothing-typed');
+        try { fs.unlinkSync(journal); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+        throw error;
+      }
       // Characters were written and then taken back off the screen under the input
       // guard, which proves the box is empty and that only our own keys touched it. So
       // this send typed nothing in the end, and it must not leave a journal entry

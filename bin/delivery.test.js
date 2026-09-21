@@ -459,6 +459,26 @@ test('a draft taken back off the screen leaves no journal and blocks no later se
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('a guarded refusal before the first character leaves no pending journal', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-notyped-'));
+  const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  let typed = 0;
+  const base = { session: { id: 's', kind: 'codex' }, pane: 'p', text: 'the tick', file, directory,
+    precheck: async () => {}, submitDraft: async () => assert.fail('unexpected Enter'),
+    draftMatches: async () => false, pause: async () => {}, attempts: 1 };
+  try {
+    await assert.rejects(deliver({ ...base, type: async () => {
+      typed += 1;
+      throw Object.assign(new Error('input baseline moved; nothing was typed'), { nothingTyped: true });
+    } }), /nothing was typed/);
+    assert.deepEqual(fs.readdirSync(directory).filter((name) => name.endsWith('.json')), []);
+
+    await assert.rejects(deliver({ ...base, type: async () => { typed += 1; } }), /unconfirmed/);
+    assert.equal(typed, 2, 'the immediate retry is not blocked by a phantom pending send');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('text typed but never submitted still counts as having reached the pane', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-noenter-'));
   const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');

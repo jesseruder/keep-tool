@@ -1050,6 +1050,12 @@ async function reload() {
       else if (generation <= pending.throughGeneration) data.panes = [...(data.panes || []), pending.pane];
       else spawnedPanes.delete(id);
     }
+    for (const pane of data.panes || []) {
+      const session = data.sessions.find((candidate) => candidate.pane === pane.id || candidate.id === pane.meta?.sessionId);
+      if (session) sessionHistory.bindPane(pane.id, session.id, {
+        title: session.title, project: session.project, at: Date.now(),
+      });
+    }
     closingSessions.reconcile(data);
     void refreshProjectChoices();
     // Drop an optimistic set-aside only once this reload started after its last write
@@ -1124,11 +1130,36 @@ function rememberSession(sessionId, view = state.mode) {
   historyControls?.update();
 }
 
+function rememberItem(item, view = state.mode) {
+  if (!item || !['triage', 'watch'].includes(view)) return;
+  const pane = item.pane && paneMap().get(item.pane);
+  const session = item.sessionId
+    ? data.sessions.find((candidate) => candidate.id === item.sessionId)
+    : item.pane ? entityForPane(item.pane).session : null;
+  if (session) {
+    if (item.pane) sessionHistory.bindPane(item.pane, session.id, {
+      title: session.title, project: session.project, at: Date.now(),
+    });
+    rememberSession(session.id, view);
+    return;
+  }
+  if (!pane?.alive) return;
+  const entity = entityForPane(pane.id);
+  sessionHistory.visit({ paneId: pane.id, view, title: entity.title, project: entity.project,
+    layout: view === 'watch' ? state.layouts[state.layout]?.name : '', at: Date.now() });
+  historyControls?.update();
+}
+
 // Navigation never opens a process, changes pin layouts, or clears dismissal.
 // A removed Watch layout/pane falls back to a read-only Triage selection.
 function navigateHistory(entry, focus = true) {
-  const session = data.sessions.find((s) => s.id === entry.sessionId);
-  const pane = session?.pane && paneMap().get(session.pane);
+  let session = entry.sessionId ? data.sessions.find((candidate) => candidate.id === entry.sessionId) : null;
+  let pane = session?.pane ? paneMap().get(session.pane)
+    : !entry.sessionId && entry.paneId ? paneMap().get(entry.paneId) : null;
+  if (!session && pane) session = entityForPane(pane.id).session;
+  if (session && entry.paneId) sessionHistory.bindPane(entry.paneId, session.id, {
+    title: session.title, project: session.project, at: entry.at,
+  });
   let layout = state.layouts.findIndex((l) => l.name === entry.layout && l.ids.includes(pane?.id));
   if (layout < 0) layout = state.layouts.findIndex((l) => l.ids.includes(pane?.id));
   const watch = entry.view === 'watch' && pane?.alive && layout >= 0;
@@ -1136,10 +1167,13 @@ function navigateHistory(entry, focus = true) {
   if (watch) { state.layout = layout; state.editing = false; }
   state.filter = null;
   state.providerFilter = null;
-  state.paneTarget = null;
   if (state.focusMode) toggleFocus(false, false);
-  state.historyTarget = { ...entry, kind: 'recent', state: 'exited', pane: null };
-  state.currentItem = session ? sessionItem('recent', session) : state.historyTarget;
+  const paneItem = !session && pane ? { kind: 'running', pane: pane.id, project: entry.project || entityForPane(pane.id).project,
+    title: entry.title || entityForPane(pane.id).title, state: pane.alive ? 'running' : 'exited' } : null;
+  state.paneTarget = !session && pane?.alive ? paneItem : null;
+  state.historyTarget = { ...entry, ...(session ? { sessionId: session.id } : {}),
+    kind: 'recent', state: 'exited', pane: null };
+  state.currentItem = session ? sessionItem('recent', session) : paneItem || state.historyTarget;
   state.selectedKey = triageKey(state.currentItem);
   state.ensureSelectedVisible = true;
   state.focused = false;
@@ -1177,6 +1211,7 @@ const ctx = {
     state.paneTarget = item; state.currentItem = item; state.selectedKey = triageKey(item);
     state.ensureSelectedVisible = true; state.focused = false; state.focusPane = paneId;
     try { localStorage.setItem('keep-mode', state.mode); } catch {}
+    rememberItem(item, 'triage');
     refresh();
     return true;
   },
@@ -1189,11 +1224,12 @@ const ctx = {
 
 historyControls = installSessionHistory({ history: sessionHistory, esc,
   describe: (entry) => {
-    const session = data.sessions.find((s) => s.id === entry.sessionId);
-    const pane = session?.pane && paneMap().get(session.pane);
-    return { title: session?.title || entry.title || entry.sessionId,
-      project: projectOf(session?.project || entry.project).name,
-      status: pane?.alive === false ? 'Closed' : session ? sessionLabel(session) : 'Not in fleet' };
+    const session = entry.sessionId && data.sessions.find((candidate) => candidate.id === entry.sessionId);
+    const pane = session?.pane ? paneMap().get(session.pane)
+      : !entry.sessionId && entry.paneId ? paneMap().get(entry.paneId) : null;
+    return { title: session?.title || entry.title || entry.sessionId || entry.paneId,
+      project: projectOf(session?.project || pane?.meta?.project || pane?.cwd || entry.project).name,
+      status: pane?.alive === false ? 'Closed' : session ? sessionLabel(session) : pane?.alive ? 'Ready for next instruction' : 'Not in fleet' };
   },
   navigate: (entry) => { navigateHistory(entry); refresh(); },
 });
@@ -1201,8 +1237,8 @@ function rememberPaneEvent(event) {
   if (!(event.target instanceof Element) || event.target.closest('button, a, input, select') && !event.target.closest('.xterm')) return;
   if (state.mode === 'watch') {
     const paneId = event.target.closest('.wpane')?.dataset.pane;
-    if (paneId) rememberSession(paneMap().get(paneId)?.meta?.sessionId);
-  } else if (state.mode === 'triage' && event.target.closest('#stage .term')) rememberSession(state.currentItem?.sessionId);
+    if (paneId) rememberItem({ pane: paneId }, 'watch');
+  } else if (state.mode === 'triage' && event.target.closest('#stage .term')) rememberItem(state.currentItem, 'triage');
 }
 document.addEventListener('pointerdown', rememberPaneEvent);
 let historyTabAt = 0;
@@ -1360,7 +1396,7 @@ function setSelected(index, explicit = false) {
     const item = items[state.selected];
     if (state.focusMode) state.focusItemKey = item ? itemKey(item) : null;
     if (item?.sessionId !== state.historyTarget?.sessionId) state.historyTarget = null;
-    rememberSession(item?.sessionId, 'triage');
+    rememberItem(item, 'triage');
     if (item?.pane && paneMap().get(item.pane)?.alive) state.focusPane = item.pane;
   }
 }
@@ -1374,8 +1410,8 @@ function moveQueue(direction, defer = false) {
 function focusTerminal(explicit = false) {
   const terminal = visibleTerminals[0];
   if (!terminal) return;
-  if (explicit) rememberSession(state.mode === 'triage' ? state.currentItem?.sessionId
-    : paneMap().get(terminal.element.closest('.wpane')?.dataset.pane)?.meta?.sessionId);
+  if (explicit) rememberItem(state.mode === 'triage' ? state.currentItem
+    : { pane: terminal.element.closest('.wpane')?.dataset.pane }, state.mode);
   state.focused = true;
   terminal.element.classList.add('focused');
   terminal.focus();

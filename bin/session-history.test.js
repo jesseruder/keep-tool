@@ -37,6 +37,22 @@ test('history persists view/layout and cursor; bounds visits and recent sessions
   assert.equal(count, 49);
 });
 
+test('an unbound pane keeps its place, migrates to its registered session, and is not rebound on reuse', () => {
+  const store = storage();
+  const h = context.createSessionHistory(store);
+  h.visit(entry('before'));
+  h.visit({ paneId: 'new-pane', view: 'triage', title: 'New session', project: '/tmp/project', at: 2 });
+  h.visit(entry('after'));
+  assert.equal(h.move(-1).paneId, 'new-pane', 'Back returns to the new session before registration');
+  assert.equal(h.bindPane('new-pane', 'registered', { title: 'Registered session' }), true);
+  assert.deepEqual({ sessionId: h.current.sessionId, paneId: h.current.paneId, title: h.current.title },
+    { sessionId: 'registered', paneId: 'new-pane', title: 'Registered session' });
+  assert.equal(h.bindPane('new-pane', 'replacement'), false, 'pane reuse cannot rewrite conversation history');
+  assert.equal(h.current.sessionId, 'registered');
+  const restored = context.createSessionHistory(store);
+  assert.equal(restored.current.sessionId, 'registered');
+});
+
 test('history fails safely for corrupt or inaccessible storage and ignores unknown modes', () => {
   for (const store of [{ getItem: () => 'bad' }, { getItem: () => { throw new Error(); }, setItem: () => { throw new Error(); } }]) {
     const h = context.createSessionHistory(store);
@@ -70,11 +86,44 @@ test('history navigation restores Watch layout; missing/closed panes stay closed
   assert.equal(state.currentItem.state, 'exited');
 });
 
+test('history navigation restores a live pane before it has a session id', () => {
+  const state = { layouts: [{ name: 'Pinned', ids: [] }], focusMode: false };
+  const pane = { id: 'new-pane', alive: true, meta: { project: '/tmp/project' } };
+  const data = { sessions: [] };
+  const history = { bindPane: () => assert.fail('an unbound pane must not bind') };
+  const c = vm.createContext({ state, data, sessionHistory: history, paneMap: () => new Map([[pane.id, pane]]),
+    entityForPane: () => ({ pane, session: null, project: '/tmp/project', title: 'New session' }),
+    toggleFocus: () => {}, sessionItem: () => assert.fail('no session exists'),
+    triageKey: (item) => `${item.kind}:${item.sessionId || item.pane}`, localStorage: storage(),
+  });
+  vm.runInContext(functionText('navigateHistory', '\nconst ctx ='), c);
+  c.navigateHistory({ paneId: pane.id, view: 'triage', title: 'New session', project: '/tmp/project' });
+  assert.equal(state.currentItem.pane, pane.id);
+  assert.equal(state.paneTarget.pane, pane.id);
+  assert.equal(state.focusPane, pane.id);
+});
+
+test('bound history never follows a reused pane when its recorded session is gone', () => {
+  const state = { layouts: [{ name: 'Pinned', ids: [] }], focusMode: false };
+  const pane = { id: 'reused-pane', alive: true };
+  const data = { sessions: [{ id: 'replacement', pane: pane.id }] };
+  const c = vm.createContext({ state, data, sessionHistory: { bindPane: () => assert.fail('already bound') },
+    paneMap: () => new Map([[pane.id, pane]]), entityForPane: () => assert.fail('must not inspect a reused pane'),
+    toggleFocus: () => {}, sessionItem: () => assert.fail('the old session is gone'),
+    triageKey: (item) => `${item.kind}:${item.sessionId || item.pane}`, localStorage: storage(),
+  });
+  vm.runInContext(functionText('navigateHistory', '\nconst ctx ='), c);
+  c.navigateHistory({ sessionId: 'old-session', paneId: pane.id, view: 'triage', title: 'Old session' });
+  assert.equal(state.currentItem.sessionId, 'old-session');
+  assert.equal(state.paneTarget, null);
+  assert.equal(state.focusPane, null);
+});
+
 test('only explicit queue selection records history and requests terminal focus', () => {
   const state = { selected: 0, focusMode: false, focusPane: null, historyTarget: null };
   const visits = [];
   const c = vm.createContext({ state, focusDebug: () => {}, triageItems: () => [{ sessionId: 'a', pane: 'p' }],
-    triageKey: (item) => item.sessionId, rememberSession: (...args) => visits.push(args), paneMap: () => new Map([['p', { alive: true }]]),
+    triageKey: (item) => item.sessionId, rememberItem: (...args) => visits.push(args), paneMap: () => new Map([['p', { alive: true }]]),
   });
   vm.runInContext(functionText('setSelected', '\nfunction moveQueue'), c);
   c.setSelected(0); assert.equal(visits.length, 0); assert.equal(state.focusPane, null);
@@ -137,7 +186,7 @@ test('Close follows Dismiss and acts immediately without a confirmation', () => 
 test('explicit selection of a different waiting row overrides automatic Focus mode', () => {
   const state = { focusMode: true, focusPane: null };
   const c = vm.createContext({ state, focusDebug: () => {}, triageItems: () => [{ sessionId: 'a', pane: 'pa' }, { sessionId: 'b', pane: 'pb' }],
-    triageKey: (item) => `waiting:${item.sessionId}`, rememberSession: () => {}, paneMap: () => new Map([['pb', { alive: true }]]),
+    triageKey: (item) => `waiting:${item.sessionId}`, rememberItem: () => {}, paneMap: () => new Map([['pb', { alive: true }]]),
     toggleFocus: (value) => { state.focusMode = value; },
   });
   vm.runInContext(functionText('setSelected', '\nfunction moveQueue'), c);

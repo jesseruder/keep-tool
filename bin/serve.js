@@ -2457,6 +2457,25 @@ function draftRegionText(screen, kind) {
   return canonicalText(out);
 }
 
+// Match the rendered rows against the text without guessing the composer's width.
+// Codex keeps a margin inside the terminal (currently three columns), while Claude's
+// ruled box and both clients' status/footer rows can be wider or narrower than the
+// editable area. Inferring a wrap from the widest row therefore turns a hard wrap in
+// `release-` / `status` into `release- status` and strands the complete draft without
+// pressing Enter.
+//
+// Terminal rendering removes a space at a soft-wrap boundary and inserts indentation
+// on continuation rows, so the only honest comparison is row fragments separated by
+// optional whitespace. Blank rows are not optional: automated messages are one line,
+// and a blank inside the composer can hide text somebody added below our draft.
+function renderedDraftMatches(screen, text, kind) {
+  const region = draftRegionLines(screen, kind);
+  if (!region || region.lines.some((line) => !line.trim())) return false;
+  const fragments = region.lines.map((line) => line.trim());
+  const escaped = fragments.map((line) => line.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return new RegExp('^' + escaped.join('\\s*') + '$').test(canonicalText(text));
+}
+
 // True only when the box holds exactly the message that was typed and nothing
 // else. Containment is not enough: Owner typing while the watcher types leaves a
 // box that contains our message and says something neither of us meant. Compared
@@ -2625,6 +2644,10 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   const chunkChars = Math.max(1, Math.floor(envNumber('KEEP_SEND_CHUNK_CHARS', 200)));
   const chunkDelayMs = envNumber('KEEP_SEND_CHUNK_DELAY_MS', 120);
   const chunks = chunkForTyping(text, chunkChars);
+  const nothingTyped = (error) => {
+    if (error && typeof error === 'object') error.nothingTyped = true;
+    return error;
+  };
   // A caller that may take its draft back has to be able to say that nothing but its
   // own keys reached the pane, and that claim starts before the first of them. Read
   // the pane now: each chunk is one input request, so after the typing the count must
@@ -2633,9 +2656,35 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   // already contain anything Owner typed while the confirmation was being polled.
   // Only when a discard is possible at all: a plain send never looks at this, and
   // every send should not pay for a pane listing it will not read.
+  let exactExpectation = null;
   const discardExpectation = deps.discardDraftOnAbort
     ? await (async () => {
-      const before = await livePaneState((target && target.pane) || 'unknown', deps);
+      const pane = (target && target.pane) || 'unknown';
+      // Codex's visual fallback below is allowed only when the input really was
+      // empty at the baseline. Read the counter on both sides of the placeholder:
+      // a key arriving during the read invalidates it, and a key after the second
+      // count makes the host reject the eventual guarded Enter. Do this before the
+      // first chunk so an old host or unverifiable pane leaves no draft behind.
+      if (deps.requireExactDraft && deps.draftKind === 'codex') {
+        let capabilities;
+        try { capabilities = await (deps.hostRequest || hostRequest)('hello', {}, deps); } catch {}
+        if (!capabilities || capabilities.guardedInput !== true) {
+          throw nothingTyped(new InjectionError(409, 'terminal host reload required before a guarded Codex message can be typed'));
+        }
+        const before = await livePaneState(pane, deps);
+        if (!before) throw nothingTyped(new InjectionError(409, 'pane input activity could not be verified before typing'));
+        let emptyScreen = '';
+        try { emptyScreen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false); }
+        catch { throw nothingTyped(new InjectionError(409, 'Codex input could not be verified empty before typing')); }
+        const after = await livePaneState(pane, deps);
+        if (!after || after.pid !== before.pid || after.inputCount !== before.inputCount) {
+          throw nothingTyped(new InjectionError(409, 'input arrived while the Codex prompt was checked; message was not typed'));
+        }
+        try { codexSendPrecheck(emptyScreen); } catch (error) { throw nothingTyped(error); }
+        exactExpectation = { pid: after.pid, inputCount: after.inputCount + chunks.length };
+        return exactExpectation;
+      }
+      const before = await livePaneState(pane, deps);
       return before && { pid: before.pid, inputCount: before.inputCount + chunks.length };
     })()
     : null;
@@ -2723,7 +2772,13 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
     try {
       exactScreen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
     } catch { exactScreen = ''; }
-    if (!draftIsExactly(exactScreen, text, deps.draftKind)) {
+    // The ordinary parser remains deliberately conservative about whether a short
+    // row is a hard wrap or a real line break. A watcher send has stronger evidence:
+    // it counted the pane before typing, knows exactly how many chunk writes it made,
+    // and can make Enter conditional on that same count. With that proof, compare all
+    // rendered fragments directly and avoid guessing the composer's width.
+    const guardedFragments = exactExpectation && renderedDraftMatches(exactScreen, text, deps.draftKind);
+    if (!draftIsExactly(exactScreen, text, deps.draftKind) && !guardedFragments) {
       deps.deliveryTrace?.('draft-not-exact');
       // Nothing is pressed and nothing is cleared: the box holds text this did
       // not write, and touching it is not this code's decision to make.
@@ -2733,7 +2788,9 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
     }
   }
   deps.deliveryTrace?.('enter-start');
-  await pressTargetKey(target, 'Enter', deps);
+  await pressTargetKey(target, 'Enter', deps, exactExpectation
+    ? { expectedInputCount: exactExpectation.inputCount, expectedPid: exactExpectation.pid }
+    : {});
   deps.deliveryTrace?.('enter-sent');
   return { ok: true };
 }
@@ -6417,13 +6474,15 @@ const freshOpenOperations = new Map();
 const reopenOpenOperations = new Map();
 
 // Pane metadata carried over when a pane is replaced — an in-place restart, a force
-// restart, an account handoff. `ephemeral` is dropped on purpose: it marks a pane the
+// restart, an account handoff. Launch-only readiness is dropped with `ephemeral`: it
+// describes the original pane before its first turn, never the adopted process.
+// `ephemeral` is dropped on purpose: it marks a pane the
 // check scheduler opened and may close on its own, and the moment Owner restarts it or
 // moves it to another account it is an ordinary session that nobody may reap. The
 // original `launchedAt` rides along because the open-request dedupe reads it; with
 // `ephemeral` gone the reaper never looks at it.
 function adoptedPaneMeta(meta) {
-  const { ephemeral, ...rest } = meta || {};
+  const { ephemeral, awaitingOwnerInput, openingMessage, ...rest } = meta || {};
   return rest;
 }
 
@@ -6433,7 +6492,7 @@ function adoptedPaneMeta(meta) {
 const RESERVED_LAUNCH_META = new Set([
   'agent', 'accountId', 'accountLabel', 'sessionId', 'model', 'project', 'card', 'repair',
   'requester', 'portableTransferId', 'reviewQueueLaunchId', 'openRequestId', 'launchedAt',
-  'opener', 'unattended',
+  'opener', 'unattended', 'awaitingOwnerInput', 'openingMessage',
 ]);
 
 // Who Keep opened a pane for, and therefore whether anybody is reading it. Resolved
@@ -6884,6 +6943,12 @@ async function openSession(body, deps = {}) {
         ...(body.portableTransferId ? { portableTransferId: body.portableTransferId } : {}),
         ...(body.reviewQueueLaunchId ? { reviewQueueLaunchId: body.reviewQueueLaunchId } : {}),
         ...(freshStandalone && body.requestId ? { openRequestId: body.requestId } : {}),
+        // A standalone console launch is actionable before Codex has written the
+        // transcript that gives it a session id. Publish that short-lived readiness
+        // from the pane itself. Automated opening delivery is marked separately so a
+        // host-only row can never advertise it as waiting for Owner before delivery.
+        ...(freshStandalone && !message ? { awaitingOwnerInput: true } : {}),
+        ...(message ? { openingMessage: true } : {}),
         // Who this pane was opened for, and whether anybody is reading it. The session
         // asks its own pane at startup: an unattended one is told not to ask questions,
         // and the question hooks refuse it if it does.
@@ -8663,9 +8728,10 @@ function backfillHostSessions(sessions, panes, deps = {}) {
           lastAssistantFull: '',
           mtime: Math.max(Date.parse(pane.createdAt) || 0, Date.parse(piEvent?.at || '') || 0) || Date.now(),
           size: 0,
-          endedTurn: agent === 'pi' ? piPhase !== 'running' : true,
-          ...(agent === 'pi' ? { toolRunning: piPhase === 'running' } : {}),
-          state: agent === 'pi' && piPhase === 'running' ? 'running' : 'recent',
+          endedTurn: agent === 'pi' ? piPhase !== 'running' : meta.openingMessage !== true,
+          ...(agent === 'pi' ? { toolRunning: piPhase === 'running' }
+            : meta.openingMessage === true ? { toolRunning: true } : {}),
+          state: (agent === 'pi' && piPhase === 'running') || meta.openingMessage === true ? 'running' : 'recent',
         };
       } else {
         session = { ...session };
@@ -8735,7 +8801,17 @@ async function addHostSessionState(state, deps = {}) {
     }
   }
   const sessionPanes = new Map((state.sessions || []).map((session) => [session.id, session.pane || null]));
+  state.attention ||= [];
   for (const item of state.attention || []) item.pane = item.sessionId ? sessionPanes.get(item.sessionId) || null : null;
+  const boundPanes = new Set((state.sessions || []).map((session) => session.pane).filter(Boolean));
+  for (const pane of panes || []) {
+    if (!pane?.alive || pane.agentAlive === false || boundPanes.has(pane.id)
+        || pane.meta?.awaitingOwnerInput !== true || Number(pane.inputCount || 0) > 0) continue;
+    state.attention.push({ kind: 'input', pri: 0, pane: pane.id,
+      project: pane.meta?.project || pane.cwd || '', title: pane.meta?.title || pane.title || 'New session',
+      detail: 'Ready for your next instruction.', attentionLabel: 'Ready for next instruction',
+      since: Date.parse(pane.createdAt) || Date.now() });
+  }
   state.panes = panes || [];
   return state;
 }
