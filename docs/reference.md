@@ -2480,7 +2480,7 @@ now; `keep review-stats` shows the last tick, why the last one was skipped, and 
 the reviewer has cost against the weekly window.
 
 Systemic suggestions belong in `keep review-idea`, rather than on an individual card:
-it creates an active `idea` card tagged `reviewer-idea`, deduplicates normalized titles,
+it creates an inbox `idea` card tagged `reviewer-idea`, deduplicates normalized titles,
 and can use `--cards a,b,c` to leave linked reviewer check-ins on the evidence cards.
 The message should name the observed pattern, cite the cards, sessions, or commits that
 demonstrate it, and propose the workflow or Keep change.

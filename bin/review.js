@@ -2706,7 +2706,9 @@ function reviewIdea(title, opts) {
         // sweep); the idea is about this Keep checkout, while keep.ROOT is the
         // separate private registry and may not be a project at all.
         project: options.project || path.resolve(__dirname, '..'),
-        status: 'active',
+        // An idea is a proposal waiting for Owner's decision, not work anyone has
+        // started: it waits in the inbox, where the console's Queue lists it.
+        status: 'inbox',
         note,
         force: true,
         withinLock: true,

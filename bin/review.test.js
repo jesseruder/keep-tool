@@ -763,6 +763,9 @@ test('review-land continues after item failure and commits successful items once
     assert.match(landed.stdout, /ack\t1\tclean-card\tok\t/);
     assert.match(landed.stdout, /note\t2\tfinding-card\tok\t/);
     assert.match(landed.stdout, /idea\t1\tBatch follow-up\tok\t/);
+    const ideaCard = fs.readFileSync(path.join(root, 'tasks', 'reviewer-idea-batch-follow-up.md'), 'utf8');
+    assert.match(ideaCard, /^status: inbox$/m, 'a landed idea waits in the inbox, not active');
+    assert.match(ideaCard, /^kind: idea$/m);
     assert.match(landed.stdout, /dismiss\t1\tsuppressed-card\tok\t/);
     const afterCommits = Number(spawnSync('git', ['-C', root, 'rev-list', '--count', 'HEAD'], { env, encoding: 'utf8' }).stdout.trim());
     assert.equal(afterCommits, beforeCommits + 1);
@@ -969,7 +972,7 @@ test('review-idea defaults its project to the code checkout and preserves an exp
     const card = fs.readFileSync(path.join(root, 'tasks', 'reviewer-idea-shared-lock-primitive.md'), 'utf8');
     const digest = fs.readFileSync(path.join(root, 'reviews', fs.readdirSync(path.join(root, 'reviews'))[0]), 'utf8');
     assert.match(card, /^title: Reviewer idea: Shared lock primitive$/m);
-    assert.match(card, /^status: active$/m);
+    assert.match(card, /^status: inbox$/m, 'an idea waits in the inbox for a decision');
     assert.match(card, /^kind: idea$/m);
     assert.match(card, /^tags: \[reviewer-idea, personal\]$/m);
     // The temp registry is also the CLI cwd; neither should become the idea project.

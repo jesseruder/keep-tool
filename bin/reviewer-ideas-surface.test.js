@@ -24,7 +24,8 @@ function isolated(script) {
 
 test('brief counts pending reviewer ideas, newest first, after findings, capped at ten', () => {
   const tasks = Array.from({ length: 12 }, (_, i) => ({
-    fm: { title: `Idea ${i}`, status: i === 11 ? 'review' : 'active',
+    // New ideas land in the inbox; older ones were filed active.
+    fm: { title: `Idea ${i}`, status: i === 11 ? 'review' : i % 2 ? 'inbox' : 'active',
       tags: ['reviewer-idea'], created: `2026-09-${String(i + 1).padStart(2, '0')}T10:00:00` },
   }));
   tasks.push({ fm: { title: 'Done idea', status: 'done', tags: ['reviewer-idea'] } },

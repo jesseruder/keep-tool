@@ -714,7 +714,7 @@ function buildBrief(input) {
     return Date.parse(stamp ? stamp.replace(' ', 'T') : task.fm.created);
   };
   const ideas = (input.tasks || []).filter((task) => task.fm
-    && (task.fm.tags || []).includes('reviewer-idea') && ['active', 'review'].includes(task.fm.status))
+    && (task.fm.tags || []).includes('reviewer-idea') && ['inbox', 'active', 'review'].includes(task.fm.status))
     .sort((a, b) => (ideaCreatedAt(b) || 0) - (ideaCreatedAt(a) || 0));
   const ideaCards = new Set(ideas);
   const reviewCards = (input.tasks || []).filter((task) => task.fm && task.fm.status === 'review' && !ideaCards.has(task))
