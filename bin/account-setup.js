@@ -219,17 +219,10 @@ function sourceState(account, override) {
 }
 
 function effectiveMcpServers(sourceAccount, cwd, options = {}) {
-  const managed = readSetup(sourceAccount);
+  // A managed source's own .keep-mcp.json is never authoritative: it is generated from this
+  // same state, and its next launch moves aside any copy Keep did not write.
   const state = sourceState(sourceAccount, options.sourceStateFile).value;
-  const { desired, legacy } = mcpServerSets(state, cwd);
-  if (!managed) return desired;
-  const generated = mcpConfigPath(sourceAccount.configDir, cwd);
-  if (!fs.existsSync(generated)) return desired;
-  const generatedText = fs.readFileSync(generated, 'utf8');
-  const actual = readJSON(generated, {}).mcpServers || {};
-  if (digest(actual) === digest(desired)) return actual;
-  if (keepGenerated(generated, generatedText, { desired, legacy })) return desired;
-  throw new Error(`managed MCP configuration conflicts for ${canonical(cwd)}`);
+  return mcpServerSets(state, cwd).desired;
 }
 
 function mcpConfigPath(configDir, cwd) {
@@ -264,6 +257,16 @@ function recordMcpConfig(file, text) {
 function writeMcpConfig(file, servers) {
   writeJSON(file, { mcpServers: servers });
   recordMcpConfig(file, mcpText(servers));
+}
+
+// A .keep-mcp.json Keep cannot prove it wrote (a hand edit, or a pre-record file whose
+// servers have since changed) is moved aside rather than trusted or allowed to block a launch.
+function setAsideMcpConfig(file) {
+  const aside = `${file}.conflict-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+  fs.renameSync(file, aside);
+  fs.rmSync(mcpRecordPath(file), { force: true });
+  console.warn(`keep: ${file} did not match what Keep generated; moved it to ${aside} and regenerated it`);
+  return aside;
 }
 
 function keepGenerated(file, text, sets) {
@@ -648,7 +651,7 @@ function ensureSharedMemory(account, cwd) {
 
   const sourceStateFile = manifest?.originStateFile || manifest?.sourceStateFile;
   const servers = effectiveMcpServers(sourceAccount, cwd, { sourceStateFile });
-  let mcpConfig = null;
+  let mcpConfig = null, mcpConflict = null;
   if (manifest) {
     mcpConfig = mcpConfigPath(account.configDir, cwd);
     const desired = mcpText(servers);
@@ -656,15 +659,13 @@ function ensureSharedMemory(account, cwd) {
       const actual = fs.readFileSync(mcpConfig, 'utf8');
       if (actual !== desired) {
         const state = sourceState(sourceAccount, sourceStateFile).value;
-        if (!keepGenerated(mcpConfig, actual, mcpServerSets(state, cwd))) {
-          throw new Error(`managed MCP configuration conflicts for ${canonical(cwd)}`);
-        }
+        if (!keepGenerated(mcpConfig, actual, mcpServerSets(state, cwd))) mcpConflict = setAsideMcpConfig(mcpConfig);
         writeMcpConfig(mcpConfig, servers);
       } else if (readMcpRecord(mcpConfig) !== textDigest(desired)) recordMcpConfig(mcpConfig, desired);
     } else writeMcpConfig(mcpConfig, servers);
   }
   return { memoryDir: targetMemory, autoMemoryDirectory: explicitMemory || targetMemory,
-    mcpConfig, mcpServerCount: Object.keys(servers).length, mcpServers: servers };
+    mcpConfig, mcpConflict, mcpServerCount: Object.keys(servers).length, mcpServers: servers };
 }
 
 function comparableSettings(configDir) {

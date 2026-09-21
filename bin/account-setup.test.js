@@ -207,7 +207,24 @@ test('MCP inheritance uses Git-reported main worktree metadata with a separate G
   }
 });
 
-test('managed MCP config upgrades only an exact legacy generated file', () => {
+// Asserts the launch moved `content` aside next to `generated` and regenerated it with a record.
+function assertSetAside(generated, content, expectedServers) {
+  const dir = path.dirname(generated);
+  const asides = fs.readdirSync(dir).filter((name) => name.startsWith(path.basename(generated) + '.conflict-'));
+  assert.equal(asides.length, 1);
+  assert.equal(fs.readFileSync(path.join(dir, asides[0]), 'utf8'), content);
+  fs.rmSync(path.join(dir, asides[0]));
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(generated, 'utf8')).mcpServers).sort(), expectedServers);
+  assert.ok(fs.existsSync(generated + '.sha256'));
+}
+
+function quietly(fn) {
+  const warn = console.warn;
+  console.warn = () => {};
+  try { return fn(); } finally { console.warn = warn; }
+}
+
+test('managed MCP config upgrades an exact legacy generated file and sets anything else aside', () => {
   const f = fixture();
   const worktree = path.join(f.root, 'repo-a-worktree');
   try {
@@ -238,15 +255,16 @@ test('managed MCP config upgrades only an exact legacy generated file', () => {
 
     const conflict = JSON.stringify({ mcpServers: { unrelated: { command: 'changed' } } }, null, 2) + '\n';
     fs.writeFileSync(generated, conflict);
-    assert.throws(() => setup.ensureSharedMemory(f.target, nested), /managed MCP configuration conflicts/);
-    assert.equal(fs.readFileSync(generated, 'utf8'), conflict);
+    const relaunched = quietly(() => setup.ensureSharedMemory(f.target, nested));
+    assert.ok(relaunched.mcpConflict);
+    assertSetAside(generated, conflict, ['exact', 'global', 'inherited']);
   } finally {
     try { git(f.repoA, 'worktree', 'remove', '--force', worktree); } catch {}
     f.cleanup();
   }
 });
 
-test('a file Keep generated from an older source server set is regenerated; hand edits still conflict', () => {
+test('a file Keep generated from an older source server set is regenerated; hand edits are set aside', () => {
   const f = fixture();
   try {
     const stateFile = path.join(f.home, '.claude.json');
@@ -270,16 +288,13 @@ test('a file Keep generated from an older source server set is regenerated; hand
 
     const edited = JSON.stringify({ mcpServers: { global: { command: 'hand-edited' } } }, null, 2) + '\n';
     fs.writeFileSync(generated, edited);
-    assert.throws(() => setup.ensureSharedMemory(f.target, f.repoA), /managed MCP configuration conflicts/);
-    assert.equal(fs.readFileSync(generated, 'utf8'), edited);
-    state.mcpServers.another = { command: 'another' };
-    fs.writeFileSync(stateFile, JSON.stringify(state));
-    assert.throws(() => setup.ensureSharedMemory(f.target, f.repoA), /managed MCP configuration conflicts/);
-    assert.equal(fs.readFileSync(generated, 'utf8'), edited);
+    assert.equal(quietly(() => setup.ensureSharedMemory(f.target, f.repoA)).mcpServers.global.command, 'global-server-v2');
+    assertSetAside(generated, edited, ['global', 'projectA']);
+    assert.equal(setup.ensureSharedMemory(f.target, f.repoA).mcpConflict, null);
   } finally { f.cleanup(); }
 });
 
-test('an unrecorded file from before Keep recorded its writes upgrades only as an unchanged subset', () => {
+test('an unrecorded file from before Keep recorded its writes upgrades as an unchanged subset, otherwise is set aside', () => {
   const f = fixture();
   try {
     const stateFile = path.join(f.home, '.claude.json');
@@ -291,7 +306,9 @@ test('an unrecorded file from before Keep recorded its writes upgrades only as a
     fs.writeFileSync(stateFile, JSON.stringify(state));
 
     fs.unlinkSync(generated + '.sha256');
-    assert.deepEqual(Object.keys(setup.ensureSharedMemory(f.target, f.repoA).mcpServers).sort(), ['added', 'global', 'projectA']);
+    const upgraded = setup.ensureSharedMemory(f.target, f.repoA);
+    assert.deepEqual(Object.keys(upgraded.mcpServers).sort(), ['added', 'global', 'projectA']);
+    assert.equal(upgraded.mcpConflict, null);
     assert.ok(fs.existsSync(generated + '.sha256'));
 
     for (const edit of [
@@ -302,8 +319,8 @@ test('an unrecorded file from before Keep recorded its writes upgrades only as a
     ]) {
       fs.writeFileSync(generated, edit);
       fs.rmSync(generated + '.sha256', { force: true });
-      assert.throws(() => setup.ensureSharedMemory(f.target, f.repoA), /managed MCP configuration conflicts/);
-      assert.equal(fs.readFileSync(generated, 'utf8'), edit);
+      assert.ok(quietly(() => setup.ensureSharedMemory(f.target, f.repoA)).mcpConflict);
+      assertSetAside(generated, edit, ['added', 'global', 'projectA']);
     }
   } finally { f.cleanup(); }
 });
