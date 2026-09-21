@@ -278,6 +278,8 @@ process.stdout.write(${JSON.stringify(JSON.stringify([
     });
     assert.equal(ideaFiles.length, 2);
     const state = JSON.parse(fs.readFileSync(path.join(fixture.root, '.keep', 'ideas', 'state.json'), 'utf8'));
+    assert.match(result.stdout, /^\{/, 'a completed run prints its result, not its skipped list');
+    assert.deepEqual(JSON.parse(result.stdout), state);
     assert.equal(state.proposed, 2);
     assert.equal(state.landed.length, 1);
     assert.equal(state.skipped.length, 1);
@@ -302,6 +304,40 @@ test('keep ideas --dry exits zero without writes', () => {
     assert.deepEqual(fs.readdirSync(path.join(fixture.root, '.keep')).sort(), before);
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('a scheduled tick that completes a sweep fires onChange and records a success', async () => {
+  const review = require('./review.js');
+  const health = require('./health.js');
+  const keep = require('./keep.js');
+  const saved = { budget: review.reviewBudget, idea: review.reviewIdea, record: health.record, now: Date.now, claude: process.env.KEEP_CLAUDE };
+  const fake = path.join(keep.ROOT, 'fake-claude');
+  fs.writeFileSync(fake, `#!/usr/bin/env node
+if (process.argv[2] === '--help') { process.stdout.write('--disallowed-tools <tools...>'); process.exit(0); }
+process.stdout.write(${JSON.stringify(JSON.stringify([validIdea('Scheduled idea')]))});
+`);
+  fs.chmodSync(fake, 0o755);
+  let started;
+  try {
+    process.env.KEEP_CLAUDE = fake;
+    Date.now = () => new Date(2026, 8, 20, 9, 0).getTime();
+    review.reviewBudget = () => ({ code: 0 });
+    review.reviewIdea = () => ({ task: { id: 'scheduled-idea' } });
+    let changed = 0;
+    const recorded = new Promise((resolve) => { health.record = (name, record) => resolve({ name, record }); });
+    started = ideas.startScheduler({ onChange: () => { changed += 1; } });
+    const { name, record } = await recorded;
+    assert.equal(name, 'ideas');
+    assert.deepEqual({ record, changed }, { record: { ok: true, skipped: false, detail: 'completed' }, changed: 1 });
+  } finally {
+    if (started) clearInterval(started.timer);
+    review.reviewBudget = saved.budget;
+    review.reviewIdea = saved.idea;
+    health.record = saved.record;
+    Date.now = saved.now;
+    if (saved.claude === undefined) delete process.env.KEEP_CLAUDE;
+    else process.env.KEEP_CLAUDE = saved.claude;
   }
 });
 
