@@ -691,7 +691,8 @@ function healthForResult(result) {
   if (result && result.skipped === 'budget' && result.code === 8) {
     return { ok: false, error: `ideas sweep could not read its budget: ${result.reason}` };
   }
-  const skipped = Boolean(result && result.skipped);
+  // A completed run's `skipped` is the list of ideas it passed over; only a string is a skip reason.
+  const skipped = typeof (result && result.skipped) === 'string';
   return { ok: true, skipped, detail: skipped ? 'nothing due' : 'completed' };
 }
 
@@ -714,7 +715,7 @@ function startScheduler({ onChange } = {}) {
       // attempt for that too: otherwise every 60s tick rebuilds the evidence and
       // reads the budget again for the rest of the claim's life, to no purpose.
       if (result.skipped === 'budget' || result.skipped === 'in progress') recordAttempt(now, result.reason);
-      if (!result.skipped && onChange) onChange();
+      if (typeof result.skipped !== 'string' && onChange) onChange();
       const record = healthForResult(result);
       if (!record.ok) process.stderr.write(`keep ideas: ${record.error}\n`);
       health.record('ideas', record);

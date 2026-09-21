@@ -2584,7 +2584,7 @@ commands.ideas = async (argv) => {
     console.log(`${ideas.renderEvidence(result.evidence)}\n\n${result.prompt}`);
     return;
   }
-  if (result.skipped) {
+  if (typeof result.skipped === 'string') {
     console.log(result.skipped === 'budget' ? `budget: ${result.reason}` : result.skipped);
     return;
   }

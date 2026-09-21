@@ -362,5 +362,11 @@ test('a budget the sweep cannot read is a health failure; an exhausted one is a 
 
     assert.deepEqual(ideas.healthForResult({ skipped: 'in progress' }), { ok: true, skipped: true, detail: 'nothing due' });
     assert.deepEqual(ideas.healthForResult({ landed: [] }), { ok: true, skipped: false, detail: 'completed' });
+    // A completed run carries `skipped` as the list of ideas it passed over; an empty
+    // array is truthy, and reading it as a skip kept a real success from clearing the streak.
+    const completed = { at: 1, model: 'fable', proposed: 2, landed: ['a', 'b'], skipped: [], day: '2026-09-20' };
+    assert.deepEqual(ideas.healthForResult(completed), { ok: true, skipped: false, detail: 'completed' });
+    const partial = { ...completed, landed: ['a'], skipped: [{ title: 'b', why: 'normalized title matches an existing idea' }] };
+    assert.deepEqual(ideas.healthForResult(partial), { ok: true, skipped: false, detail: 'completed' });
   } finally { review.reviewBudget = original; }
 });
