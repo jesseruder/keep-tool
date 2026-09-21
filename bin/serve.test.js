@@ -9014,8 +9014,9 @@ test('an auto fresh open skips a spent default, and no policy keeps the old defa
     });
     const profileId = (params) => JSON.parse(Buffer.from(
       /'--profile' '([^']+)'/.exec(params.args[1])[1], 'base64url').toString()).id;
-    const limits = (percent) => [{ label: 'week', percent, resetsAt: '2026-09-21T12:00:00.000Z' },
-      { label: '5h', percent: 10, resetsAt: '2026-09-21T12:00:00.000Z' }];
+    const resetsAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const limits = (percent) => [{ label: 'week', percent, resetsAt },
+      { label: '5h', percent: 10, resetsAt }];
     const view = (primary, second) => ({ accounts: {
       'claude/default': { agent: 'claude', limits: limits(primary), fetchedAt: Date.now() },
       'claude-secondary': { agent: 'claude', limits: limits(second), fetchedAt: Date.now() },
