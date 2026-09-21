@@ -382,12 +382,37 @@ commands.hook = async (argv) => {
   if (argv[0] === 'pi') {
     const sid = input && input.session_id;
     if (typeof sid !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sid)) return;
+    const workerJob = () => {
+      if (process.env.KEEP_PANE) return null;
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        try {
+          const found = require('../pi-jobs').authorizeWorker(ROOT, input, process.env);
+          if (found) return found;
+        } catch {}
+        if (attempt < 9) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      }
+      return null;
+    };
     if (argv[1] === 'start') {
       const pane = await recordSessionPane(input, 'pi');
-      if (!pane?.bound) {
+      const job = workerJob();
+      if (!pane?.bound && !job) {
         process.stderr.write('keep hook pi start: could not bind the host pane\n');
         process.exitCode = 2;
         return;
+      }
+      if (job) {
+        try {
+          require('../pi-jobs').mutate(ROOT, job.id, (current) => {
+            if (current.workerSessionId && current.workerSessionId !== sid) throw new Error('Pi worker session changed');
+            current.workerSessionId = sid;
+            return current;
+          });
+        } catch (error) {
+          process.stderr.write(`keep hook pi start: ${error.message}\n`);
+          process.exitCode = 2;
+          return;
+        }
       }
       try {
         withLock(() => delegation.registerStart(ROOT, { id: sid, agent: 'pi' }, process.env,
@@ -395,8 +420,20 @@ commands.hook = async (argv) => {
       } catch {}
       return;
     }
-    if (argv[1] === 'end') { await releaseSessionPane(input, 'pi'); return; }
+    if (argv[1] === 'end') {
+      const job = workerJob();
+      if (process.env.KEEP_PANE) await releaseSessionPane(input, 'pi');
+      else if (job) {
+        try { withLock(() => delegation.markProcessEnd(ROOT, { id: sid, agent: 'pi' })); } catch {}
+      }
+      return;
+    }
     if (argv[1] === 'pre-tool') {
+      if (!process.env.KEEP_PANE && !workerJob()) {
+        process.stderr.write('keep hook pi pre-tool: unverified background worker\n');
+        process.exitCode = 2;
+        return;
+      }
       const decision = guardRepairCommand(input);
       const next = decision.deny ? decision : guardStepCommand(input);
       if (next.deny) {
@@ -406,6 +443,7 @@ commands.hook = async (argv) => {
       return;
     }
     if (argv[1] === 'post-tool') {
+      if (!process.env.KEEP_PANE && !workerJob()) return;
       try { recordDeploy(input); } catch {}
       try { await recordStepRun(input); } catch {}
       return;

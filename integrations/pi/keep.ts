@@ -15,7 +15,10 @@ function hook(action: string, id: string, extra: Record<string, unknown> = {}) {
     const executable = process.env.KEEP_PI_KEEP_CLI;
     execFileSync(executable ? process.execPath : 'keep', executable
       ? [executable, 'hook', 'pi', action] : ['hook', 'pi', action], {
-      input: JSON.stringify({ session_id: id, cwd: process.cwd(), instance, ...extra }),
+      input: JSON.stringify({ session_id: id, cwd: process.cwd(), instance,
+        job_id: process.env.KEEP_PI_JOB_ID || undefined,
+        worker_token: process.env.KEEP_PI_WORKER_TOKEN || undefined,
+        pid: process.pid, ...extra }),
       encoding: 'utf8', timeout: 5000,
       env: { ...process.env, KEEP_PI_SESSION_ID: id },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -59,19 +62,23 @@ export default function (pi: any) {
     delete process.env.CODEX_SESSION_ID;
     delete process.env.CODEX_THREAD_ID;
     process.env.KEEP_PI_SESSION_ID = id;
-    if (!process.env.KEEP_PANE) return;
+    const managed = Boolean(process.env.KEEP_PANE
+      || (process.env.KEEP_PI_JOB_ID && process.env.KEEP_PI_WORKER_TOKEN));
+    if (!managed) return;
     const error = hook('start', id);
     if (error) {
       ctx.ui.notify(`Keep could not bind this Pi session: ${error.slice(0, 300)}`, 'error');
       return;
     }
-    phase(id, 'start', ctx.sessionManager.getSessionFile(), ctx.sessionManager.getLeafId());
+    if (process.env.KEEP_PANE) phase(id, 'start', ctx.sessionManager.getSessionFile(), ctx.sessionManager.getLeafId());
   });
 
   pi.on('session_shutdown', async (_event: any, ctx: any) => {
     const id = activeId;
-    if (!id || !process.env.KEEP_PANE) return;
-    if (phase(id, 'shutdown', ctx.sessionManager.getSessionFile(), ctx.sessionManager.getLeafId())) hook('end', id);
+    if (!id) return;
+    if (process.env.KEEP_PANE) {
+      if (phase(id, 'shutdown', ctx.sessionManager.getSessionFile(), ctx.sessionManager.getLeafId())) hook('end', id);
+    } else if (process.env.KEEP_PI_JOB_ID && process.env.KEEP_PI_WORKER_TOKEN) hook('end', id);
     activeId = '';
   });
 
@@ -100,7 +107,8 @@ export default function (pi: any) {
 
   // Keep's shared-step and self-repair guards apply to Pi's shell tool too.
   pi.on('tool_call', (event: any) => {
-    if (event.toolName !== 'bash' || !activeId || !process.env.KEEP_PANE) return;
+    if (event.toolName !== 'bash' || !activeId
+      || (!process.env.KEEP_PANE && !(process.env.KEEP_PI_JOB_ID && process.env.KEEP_PI_WORKER_TOKEN))) return;
     const reason = hook('pre-tool', activeId, { tool_name: 'Bash', tool_input: { command: event.input?.command } });
     if (reason) return { block: true, reason };
   });

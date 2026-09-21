@@ -2467,6 +2467,79 @@ commands.codex = async (argv) => {
   } catch (error) { die(error.message || String(error)); }
 };
 
+function renderPiJob(job) {
+  const parent = job.parentSession ? `${job.parentSession.agent} ${sessionRef(job.parentSession.id)}` : '-';
+  const detail = job.error ? ` (${job.error})` : '';
+  return `${job.id}  ${job.status}${detail}  parent ${parent}  ${job.summary}`;
+}
+
+commands.pi = async (argv) => {
+  const action = argv[0];
+  const args = argv.slice(1);
+  const piJobs = require('./pi-jobs.js');
+  if (action === 'task') {
+    const o = parseArgs(args, { background: 'bool', provider: 'str', model: 'str', cwd: 'str' });
+    const prompt = o._.join(' ').trim();
+    if (!o.background || !prompt) {
+      die('usage: keep pi task --background [--provider <name>] [--model <model>] [--cwd <dir>] -- <prompt>');
+    }
+    const cwd = path.resolve(o.cwd || process.cwd());
+    let stat;
+    try { stat = fs.statSync(cwd); } catch { die(`Pi task cwd does not exist: ${cwd}`); }
+    if (!stat.isDirectory()) die(`Pi task cwd is not a directory: ${cwd}`);
+    const provider = cleanScalar(o.provider, 'provider');
+    const model = cleanScalar(o.model, 'model');
+    if (provider && (provider.length > 160 || !/^[A-Za-z0-9][A-Za-z0-9_.:/-]*$/.test(provider))) die('Pi provider contains invalid characters');
+    if (model && (model.length > 240 || /[\r\n\0]/.test(model))) die('Pi model contains invalid characters');
+    const assigned = currentDelegation();
+    if (['invalid', 'identity-mismatch', 'stale'].includes(assigned.kind)) die(delegation.describe(assigned));
+    const parentSession = assigned.record?.parent || currentSession();
+    let card = assigned.record?.card || null;
+    if (!card && parentSession) {
+      try { card = taskForSession(parentSession.id)?.id || null; } catch {}
+    }
+    const job = piJobs.launch({
+      root: ROOT, cwd, provider, model, prompt, parentSession, card,
+      delegationId: assigned.record?.id || process.env.KEEP_DELEGATION_ID || null,
+    });
+    console.log(job.id);
+    return;
+  }
+  if (action === 'status') {
+    const o = parseArgs(args, { json: 'bool' });
+    if (o._.length > 1) die('usage: keep pi status [<job>] [--json]');
+    const value = o._[0] ? piJobs.read(ROOT, o._[0]) : piJobs.records(ROOT);
+    if (o._[0] && !value) die(`unknown Pi job ${o._[0]}`);
+    if (o.json) return process.stdout.write(`${JSON.stringify(Array.isArray(value)
+      ? value.map(piJobs.publicJob) : piJobs.publicJob(value), null, 2)}\n`);
+    if (Array.isArray(value)) {
+      if (!value.length) return console.log('No Pi jobs.');
+      for (const job of value) console.log(renderPiJob(job));
+    } else console.log(renderPiJob(value));
+    return;
+  }
+  if (action === 'result') {
+    const o = parseArgs(args, { json: 'bool' });
+    if (o._.length !== 1) die('usage: keep pi result <job> [--json]');
+    const job = piJobs.read(ROOT, o._[0]);
+    if (!job) die(`unknown Pi job ${o._[0]}`);
+    if (o.json) return process.stdout.write(`${JSON.stringify(piJobs.publicJob(job), null, 2)}\n`);
+    if (job.status !== 'succeeded') die(`Pi job ${job.id} is ${job.status}${job.error ? `: ${job.error}` : ''}`);
+    process.stdout.write(`${job.result || ''}${job.result?.endsWith('\n') ? '' : '\n'}`);
+    return;
+  }
+  if (action === 'cancel') {
+    const o = parseArgs(args, { json: 'bool' });
+    if (o._.length !== 1) die('usage: keep pi cancel <job> [--json]');
+    let job;
+    try { job = piJobs.cancel(ROOT, o._[0]); } catch (error) { die(error.message); }
+    if (o.json) return process.stdout.write(`${JSON.stringify(piJobs.publicJob(job), null, 2)}\n`);
+    console.log(`${job.id}  ${job.status}`);
+    return;
+  }
+  die('usage: keep pi task --background ... | keep pi status [job] | keep pi result <job> | keep pi cancel <job>');
+};
+
 commands.standup = async (argv) => {
   const o = parseArgs(argv, { since: 'str', dry: 'bool', show: 'bool' });
   if (o._.length) die('usage: keep standup [--since "YYYY-MM-DD HH:MM"|ISO] [--dry] [--show]');
@@ -3418,6 +3491,8 @@ ${stepUsage()}
   keep codex [--account <codex-id>] context [--json]
   keep codex [--account <codex-id>] <task|task-resume-candidate|status|result|cancel> [args]
     Run the installed Codex companion with isolated account state and credentials.
+  keep pi task --background [--provider p] [--model m] [--cwd dir] -- <prompt>
+  keep pi status [<job>] [--json] | result <job> [--json] | cancel <job> [--json]
   keep standup [--since "YYYY-MM-DD HH:MM"|ISO] [--dry] [--show]
   keep ideas [--dry] [--model <m>]
   keep landed [--dry] [--only <id>]
