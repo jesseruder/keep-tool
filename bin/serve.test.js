@@ -7274,6 +7274,35 @@ test('open resolves a unique session prefix and refuses a session running outsid
   }), /running outside the host \(pid 4242\)/);
 });
 
+test('open recreates a recycled worktree for a resumed session, once, and only for a resume', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-recycled-'));
+  const project = path.join(root, 'wt', 'repo', 'gone');
+  const id = 'abcdef12-0000-4000-8000-000000000003';
+  const scanSessions = () => [{ id, project, kind: 'claude' }];
+  const calls = [];
+  const recycledWorktree = (target) => target === project && !fs.existsSync(target) ? { repo: 'repo', name: 'gone' } : null;
+  const recreateWorktree = async (target) => {
+    calls.push(target);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fs.mkdirSync(project, { recursive: true });
+  };
+  try {
+    await assert.rejects(openSession({ fresh: true, cwd: project, agent: 'claude' }, { recycledWorktree, recreateWorktree }),
+      /project directory does not exist/, 'a fresh launch never recreates');
+    const deps = { scanSessions, recycledWorktree, recreateWorktree, resolveSessionTarget: async () => ({ pane: 'pane-1' }) };
+    const [first, second] = await Promise.all([openSession({ sessionId: id }, deps), openSession({ sessionId: id }, deps)]);
+    assert.equal(first.pane, 'pane-1');
+    assert.equal(second.pane, 'pane-1');
+    assert.deepEqual(calls, [{ repo: 'repo', name: 'gone' }], 'concurrent reopens share one creation');
+
+    fs.rmSync(project, { recursive: true });
+    await assert.rejects(openSession({ sessionId: id }, { ...deps,
+      recreateWorktree: async () => { throw Object.assign(new Error('failed'), { stderr: 'wt: branch wt/gone has unlanded commits\n' }); } }),
+    (error) => error.status === 409 && /recycled worktree and recreating it failed: wt: branch wt\/gone has unlanded commits/.test(error.message));
+    await assert.rejects(openSession({ sessionId: id }, { ...deps, recycledWorktree: () => null }), /project directory does not exist/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a console number resolves to its session, and an unknown number is a bad session id', () => {
   const { resolveSessionId } = require('./serve.js');
   const ids = ['abcdef12-0000-4000-8000-000000000001', 'abcdef99-0000-4000-8000-000000000002'];

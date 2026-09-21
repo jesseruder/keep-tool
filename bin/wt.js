@@ -463,6 +463,21 @@ function createWorktree(opts = {}) {
   }
 }
 
+// The `wt new` arguments that bring back a worktree which was recycled or removed
+// after a session recorded it as its directory: `target` must be exactly
+// <worktreeRoot>/<repo>/<name>, no longer exist, and name a repo `wt` can resolve.
+// Anything else is null, so a genuinely wrong path still fails as missing.
+function recycledWorktree(target, cfg = loadConfig()) {
+  if (typeof target !== 'string' || !path.isAbsolute(target) || fs.existsSync(target)) return null;
+  const relative = path.relative(path.resolve(expandHome(cfg.worktreeRoot)), path.resolve(target));
+  const parts = relative.split(path.sep);
+  if (parts.length !== 2 || parts[0] === '..' || !NAME_RE.test(parts[0]) || !NAME_RE.test(parts[1])) return null;
+  try {
+    if (path.basename(resolveRepo(parts[0], cfg)) !== parts[0]) return null;
+  } catch { return null; }
+  return { repo: parts[0], name: parts[1] };
+}
+
 function statusWithoutMarkers(worktree) {
   const text = git(worktree, ['status', '--porcelain', '--untracked-files=all']);
   return text.split(/\r?\n/).filter(Boolean).filter((line) => {
@@ -1238,6 +1253,7 @@ module.exports = {
   unpushedMainCommits,
   deployAfterLand,
   createWorktree,
+  recycledWorktree,
   recycleWorktree,
   landWorktree,
   listWorktrees,

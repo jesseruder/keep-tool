@@ -6810,6 +6810,34 @@ function openBudgetModel(launchModel, deps = {}) {
   return launchModel || ((account) => accountBudgetModel(account, deps));
 }
 
+// A resumed session whose recorded directory was a ~/wt worktree that has since
+// been recycled gets that worktree back (a fresh wt/<name> branch off the default
+// branch, as `wt new` makes it) instead of an unresumable "project directory does
+// not exist". `wt new` installs dependencies synchronously, so it runs as a child
+// process; concurrent reopens of the same path share one creation.
+const worktreeRecreations = new Map();
+async function recreateRecycledWorktree(project, deps = {}) {
+  const wt = require('./wt.js');
+  let target = null;
+  try { target = (deps.recycledWorktree || wt.recycledWorktree)(project); } catch {}
+  if (!target) return false;
+  let running = worktreeRecreations.get(project);
+  if (!running) {
+    const env = { ...process.env };
+    delete env.CLAUDE_CODE_SESSION_ID;
+    running = (deps.recreateWorktree || (({ repo, name }) => execFileAsync(process.execPath,
+      [path.join(__dirname, 'wt'), 'new', `${repo}/${name}`], { env, timeout: 5 * 60e3, maxBuffer: 4 * 1024 * 1024 })))(target);
+    worktreeRecreations.set(project, running);
+    console.log(`keep serve: open recreating recycled worktree ${project}`);
+    running.finally(() => { if (worktreeRecreations.get(project) === running) worktreeRecreations.delete(project); }).catch(() => {});
+  }
+  try { await running; } catch (error) {
+    const detail = String(error?.stderr || error?.message || error).trim().split('\n').pop();
+    throw new InjectionError(409, `project directory ${project} was a recycled worktree and recreating it failed: ${detail}`);
+  }
+  try { return fs.statSync(project).isDirectory(); } catch { return false; }
+}
+
 async function openSession(body, deps = {}) {
   body = body && typeof body === 'object' ? body : {};
   const freshStandalone = body.fresh === true && !body.taskId && !body.sessionId;
@@ -6925,7 +6953,11 @@ async function openSession(body, deps = {}) {
   if (typeof project !== 'string' || !project) throw new InjectionError(400, `no project for ${body.taskId ? `task ${body.taskId}` : `session ${body.sessionId || '?'}`}`);
   project = path.resolve(project.replace(/^~(?=\/|$)/, os.homedir()));
   try { if (!fs.statSync(project).isDirectory()) throw new Error(); }
-  catch { throw new InjectionError(400, 'project directory does not exist'); }
+  catch {
+    if (!session || body.fresh || !await recreateRecycledWorktree(project, deps)) {
+      throw new InjectionError(400, 'project directory does not exist');
+    }
+  }
   if (body.cwd != null) {
     let launchCwd = path.resolve(body.cwd.replace(/^~(?=\/|$)/, os.homedir()));
     try {
