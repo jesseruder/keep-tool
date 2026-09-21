@@ -487,7 +487,9 @@ function recreateRecycledWorktree(target, cfg = loadConfig()) {
     const candidate = path.resolve(expandHome(root), recycled.repo);
     if (!fs.existsSync(candidate)) continue;
     const main = mainCheckout(candidate);
-    if (main && main === fs.realpathSync(candidate)) mains.add(main);
+    // createWorktree names the destination after the canonical checkout, so a
+    // symlinked root entry whose target has another name would land elsewhere.
+    if (main && main === fs.realpathSync(candidate) && path.basename(main) === recycled.repo) mains.add(main);
   }
   if (mains.size !== 1) {
     die(mains.size ? `repo ${recycled.repo} is ambiguous: ${[...mains].join(', ')}` : `repo not found: ${recycled.repo}`);

@@ -7307,6 +7307,16 @@ test('open recreates a recycled worktree for a resumed session, once, and only f
       recreateWorktree: async () => { throw Object.assign(new Error('failed'), { stderr: 'wt: branch wt/gone has unlanded commits\n' }); } }),
     (error) => error.status === 409 && /recycled worktree and recreating it failed: wt: branch wt\/gone has unlanded commits/.test(error.message));
     await assert.rejects(openSession({ sessionId: id }, { ...deps, recycledWorktree: () => null }), /project directory does not exist/);
+
+    // A creation killed half-way leaves a directory; later resumes refuse it until it is removed.
+    await assert.rejects(openSession({ sessionId: id }, { ...deps,
+      recreateWorktree: async () => { fs.mkdirSync(project, { recursive: true }); throw new Error('killed'); } }), /recreating it failed: killed/);
+    await assert.rejects(openSession({ sessionId: id }, deps),
+      (error) => error.status === 409 && /earlier recreation did not finish; remove the partial worktree with wt rm/.test(error.message));
+    fs.rmSync(project, { recursive: true });
+    finished = false;
+    assert.equal((await openSession({ sessionId: id }, deps)).pane, 'pane-1', 'removing the partial tree lets a reopen recreate it');
+    assert.equal((await openSession({ sessionId: id }, deps)).pane, 'pane-1', 'a finished recreation leaves no record behind');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

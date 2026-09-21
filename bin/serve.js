@@ -6843,25 +6843,45 @@ function runWorktreeRecreation(project) {
     });
   });
 }
-async function awaitWorktreeRecreation(project) {
+// A creation that did not finish -- a failure, a timeout's SIGKILL, or the daemon
+// dying mid-way -- can leave a partial worktree that a later stat would accept. A
+// record written before the child starts and removed only on success marks that
+// path until the partial tree is gone (`wt rm`); a missing directory clears it.
+function worktreeRecreationRecord(project, deps = {}) {
+  const hash = require('crypto').createHash('sha256').update(project).digest('hex').slice(0, 32);
+  return path.join(deps.root || keep.ROOT, '.keep', 'worktree-recreations', `${hash}.json`);
+}
+function recreationFailure(project, detail) {
+  return new InjectionError(409, `project directory ${project} was a recycled worktree and recreating it failed: ${detail}`);
+}
+async function awaitWorktreeRecreation(project, deps = {}) {
   const running = worktreeRecreations.get(project);
-  if (!running) return;
-  try { await running; } catch (error) {
-    const detail = String(error?.stderr || error?.message || error).trim().split('\n').pop();
-    throw new InjectionError(409, `project directory ${project} was a recycled worktree and recreating it failed: ${detail}`);
+  if (running) {
+    try { await running; } catch (error) {
+      throw recreationFailure(project, String(error?.stderr || error?.message || error).trim().split('\n').pop());
+    }
+    return;
   }
+  const record = worktreeRecreationRecord(project, deps);
+  if (!fs.existsSync(record)) return;
+  if (!fs.existsSync(project)) { try { fs.unlinkSync(record); } catch {} return; }
+  throw recreationFailure(project, `an earlier recreation did not finish; remove the partial worktree with wt rm ${project} and reopen`);
 }
 async function recreateRecycledWorktree(project, deps = {}) {
   let target = null;
   try { target = (deps.recycledWorktree || require('./wt.js').recycledWorktree)(project); } catch {}
   if (!target && !worktreeRecreations.has(project)) return false;
   if (!worktreeRecreations.has(project)) {
-    const running = (deps.recreateWorktree || (() => runWorktreeRecreation(project)))(target);
+    const record = worktreeRecreationRecord(project, deps);
+    fs.mkdirSync(path.dirname(record), { recursive: true });
+    fs.writeFileSync(record, JSON.stringify({ project, startedAt: Date.now() }) + '\n');
+    const running = Promise.resolve().then(() => (deps.recreateWorktree || (() => runWorktreeRecreation(project)))(target))
+      .then(() => { try { fs.unlinkSync(record); } catch {} });
     worktreeRecreations.set(project, running);
     console.log(`keep serve: open recreating recycled worktree ${project}`);
     running.finally(() => { if (worktreeRecreations.get(project) === running) worktreeRecreations.delete(project); }).catch(() => {});
   }
-  await awaitWorktreeRecreation(project);
+  await awaitWorktreeRecreation(project, deps);
   try { return fs.statSync(project).isDirectory(); } catch { return false; }
 }
 
@@ -6979,7 +6999,7 @@ async function openSession(body, deps = {}) {
 
   if (typeof project !== 'string' || !project) throw new InjectionError(400, `no project for ${body.taskId ? `task ${body.taskId}` : `session ${body.sessionId || '?'}`}`);
   project = path.resolve(project.replace(/^~(?=\/|$)/, os.homedir()));
-  if (session && !body.fresh) await awaitWorktreeRecreation(project);
+  if (session && !body.fresh) await awaitWorktreeRecreation(project, deps);
   try { if (!fs.statSync(project).isDirectory()) throw new Error(); }
   catch {
     if (!session || body.fresh || !await recreateRecycledWorktree(project, deps)) {

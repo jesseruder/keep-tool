@@ -1054,6 +1054,12 @@ test('recycledWorktree names only a missing <root>/<repo>/<name> path; recreatio
     fs.mkdirSync(otherRoot);
     execFileSync('git', ['clone', '-q', f.origin, path.join(otherRoot, f.name)]);
     assert.throws(() => wt.recreateRecycledWorktree(missing, { ...f.cfg, roots: [f.repos, otherRoot] }), /is ambiguous/);
+    const linkRoot = path.join(f.root, 'links');
+    fs.mkdirSync(linkRoot);
+    fs.symlinkSync(f.main, path.join(linkRoot, 'alias-repo'));
+    assert.throws(() => wt.recreateRecycledWorktree(path.join(f.worktreeRoot, 'alias-repo', 'slug'), { ...f.cfg, roots: [linkRoot] }),
+      /repo not found: alias-repo/, 'a symlink to a differently named checkout would land under that name');
+    assert.equal(fs.existsSync(path.join(f.worktreeRoot, f.name, 'slug')), false);
     assert.equal(fs.existsSync(missing), false);
     assert.equal(wt.recreateRecycledWorktree(missing, f.cfg), missing);
     assert.equal(git(missing, 'rev-parse', '--abbrev-ref', 'HEAD'), 'wt/gone-slug');
