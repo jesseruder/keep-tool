@@ -329,23 +329,50 @@ test('setting a conflict aside leaves a concurrent launch\'s work alone', () => 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-mcp-aside-'));
   try {
     const file = path.join(root, '.keep-mcp.json');
-    const edit = '{"mcpServers":{"mine":{}}}\n';
-    // Another launch already moved it aside, or already regenerated it.
-    assert.equal(quietly(() => setup.setAsideMcpConfig(file, edit)), null);
-    fs.writeFileSync(file, 'regenerated\n');
-    assert.equal(quietly(() => setup.setAsideMcpConfig(file, edit)), null);
-    assert.equal(fs.readFileSync(file, 'utf8'), 'regenerated\n');
+    const desired = '{"mcpServers":{"current":{}}}\n';
+    // Another launch already moved it aside.
+    assert.equal(quietly(() => setup.setAsideMcpConfig(file, desired)), null);
+    // Another launch already regenerated it: that copy is dropped, not kept as a backup.
+    fs.writeFileSync(file, desired);
+    fs.writeFileSync(file + '.sha256', 'record\n');
+    assert.equal(quietly(() => setup.setAsideMcpConfig(file, desired)), null);
+    assert.deepEqual(fs.readdirSync(root), []);
 
     // Two conflicts set aside in the same instant keep separate backups.
     const asides = [];
     for (const content of ['one\n', 'two\n']) {
       fs.writeFileSync(file, content);
-      asides.push(quietly(() => setup.setAsideMcpConfig(file, content)));
+      asides.push(quietly(() => setup.setAsideMcpConfig(file, desired)));
       assert.equal(fs.existsSync(file), false);
     }
     assert.notEqual(asides[0], asides[1]);
     assert.deepEqual(asides.map((aside) => fs.readFileSync(aside, 'utf8')), ['one\n', 'two\n']);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('concurrent launches over one conflicting file all succeed and keep exactly one backup', async () => {
+  const f = fixture();
+  try {
+    setup.shareSetup(f.source, f.target);
+    const generated = setup.mcpConfigPath(f.targetDir, f.repoA);
+    const regenerated = fs.readFileSync(generated, 'utf8');
+    const edited = JSON.stringify({ mcpServers: { global: { command: 'hand-edited' } } }, null, 2) + '\n';
+    fs.writeFileSync(generated, edited);
+    const script = `const setup = require(${JSON.stringify(require.resolve('./account-setup'))});
+      console.warn = () => {};
+      setup.ensureSharedMemory(${JSON.stringify(f.target)}, ${JSON.stringify(f.repoA)});`;
+    const { spawn } = require('node:child_process');
+    const codes = await Promise.all(Array.from({ length: 8 }, () => new Promise((resolve) => {
+      const child = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'ignore', 'inherit'] });
+      child.on('exit', resolve);
+    })));
+    assert.deepEqual(codes, Array(8).fill(0));
+    const dir = path.dirname(generated);
+    const asides = fs.readdirSync(dir).filter((name) => name.startsWith('.keep-mcp.json.') && name !== '.keep-mcp.json.sha256');
+    assert.equal(asides.length, 1, asides.join(', '));
+    assert.equal(fs.readFileSync(path.join(dir, asides[0]), 'utf8'), edited);
+    assert.equal(fs.readFileSync(generated, 'utf8'), regenerated);
+  } finally { f.cleanup(); }
 });
 
 test('only explicit builtIn accounts use the sibling Claude state file', () => {
