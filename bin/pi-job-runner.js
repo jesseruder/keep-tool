@@ -18,7 +18,7 @@ function textOf(content) {
 function finalResponse(file) {
   let lines = [];
   try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean); } catch {}
-  let final = null, finalIndex = -1, agentEndIndex = -1;
+  let final = null, finalIndex = -1, settledIndex = -1, promptError = '';
   let index = 0;
   for (const line of lines) {
     let event;
@@ -27,11 +27,15 @@ function finalResponse(file) {
       final = event.message;
       finalIndex = index;
     }
-    if (event?.type === 'agent_end') agentEndIndex = index;
+    if (event?.type === 'agent_settled') settledIndex = index;
+    if (event?.type === 'response' && event.id === 'keep-prompt' && event.success === false) {
+      promptError = event.error || 'Pi rejected the worker prompt';
+    }
     index += 1;
   }
+  if (promptError) return { ok: false, error: promptError };
   if (!final) return { ok: false, error: 'Pi produced no final assistant response' };
-  if (agentEndIndex < finalIndex) return { ok: false, error: 'Pi exited before the agent turn completed' };
+  if (settledIndex < finalIndex) return { ok: false, error: 'Pi exited before the agent run settled' };
   if (final.stopReason === 'error' || final.stopReason === 'aborted') {
     return { ok: false, error: final.errorMessage || `Pi request ${final.stopReason}` };
   }
@@ -45,7 +49,7 @@ function rpcFinished(file) {
   for (const line of lines) {
     let event;
     try { event = JSON.parse(line); } catch { continue; }
-    if (event?.type === 'agent_end') return true;
+    if (event?.type === 'agent_settled') return true;
     if (event?.type === 'response' && event.id === 'keep-prompt' && event.success === false) return true;
   }
   return false;
@@ -125,8 +129,8 @@ async function main() {
     stop();
   } else {
     child.stdin.write(`${JSON.stringify({ id: 'keep-prompt', type: 'prompt', message: job.prompt })}\n`);
-    // RPC stays resident after a turn. Close its input only after the authoritative
-    // agent_end event, so no tool can run before the authenticated start hook.
+    // RPC stays resident after a turn. agent_end can precede retries, compaction, and
+    // queued continuations; agent_settled is the authoritative completion boundary.
     while (child.exitCode === null && !child.signalCode) {
       if (rpcFinished(job.stdoutFile)) {
         child.stdin.end();

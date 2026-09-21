@@ -70,12 +70,32 @@ process.stdin.on('data', chunk => {
     } else if (prompt.includes('model-error')) {
       message('error', '', 'provider exploded');
       console.log(JSON.stringify({type:'agent_end',messages:[]}));
+      console.log(JSON.stringify({type:'agent_settled'}));
     } else if (prompt.includes('incomplete')) {
       message('stop', 'premature');
       setTimeout(() => process.exit(0), 10);
+    } else if (prompt.includes('retry-success')) {
+      message('error', '', 'transient provider failure');
+      console.log(JSON.stringify({type:'agent_end',messages:[],willRetry:true}));
+      console.log(JSON.stringify({type:'auto_retry_start',attempt:1}));
+      setTimeout(() => {
+        message('stop', 'recovered result');
+        console.log(JSON.stringify({type:'agent_end',messages:[],willRetry:false}));
+        console.log(JSON.stringify({type:'agent_settled'}));
+      }, 50);
+    } else if (prompt.includes('queued-continuation')) {
+      message('stop', 'first result');
+      console.log(JSON.stringify({type:'agent_end',messages:[]}));
+      setTimeout(() => {
+        console.log(JSON.stringify({type:'message_end',message:{role:'user',content:[{type:'text',text:'continue'}]}}));
+        message('stop', 'continuation result');
+        console.log(JSON.stringify({type:'agent_end',messages:[]}));
+        console.log(JSON.stringify({type:'agent_settled'}));
+      }, 50);
     } else {
       message('stop', 'worker result');
       console.log(JSON.stringify({type:'agent_end',messages:[]}));
+      console.log(JSON.stringify({type:'agent_settled'}));
     }
   }
 });
@@ -123,7 +143,7 @@ test('background Pi job keeps prompts as argv data and requires a completed fina
   assert.equal(jobs.list({ root: f.root }).jobs[0].sessionId, 'parent-one');
   assert.equal(Object.hasOwn(jobs.publicJob(done), 'workerToken'), false);
 
-  for (const [text, expected] of [['model-error', 'provider exploded'], ['incomplete', 'before the agent turn completed']]) {
+  for (const [text, expected] of [['model-error', 'provider exploded'], ['incomplete', 'before the agent run settled']]) {
     const item = launch(f, { prompt: text });
     const failed = await waitFor(() => {
       const value = jobs.read(f.root, item.id);
@@ -131,6 +151,16 @@ test('background Pi job keeps prompts as argv data and requires a completed fina
     }, text);
     assert.equal(failed.status, 'failed');
     assert.match(failed.error, new RegExp(expected));
+  }
+
+  for (const [text, expected] of [['retry-success', 'recovered result'], ['queued-continuation', 'continuation result']]) {
+    const item = launch(f, { prompt: text });
+    const succeeded = await waitFor(() => {
+      const value = jobs.read(f.root, item.id);
+      return jobs.TERMINAL.has(value.status) && value;
+    }, text);
+    assert.equal(succeeded.status, 'succeeded');
+    assert.equal(succeeded.result, expected);
   }
 });
 
@@ -287,20 +317,47 @@ test('dead active jobs fail and worker authorization requires matching durable c
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('final response parser rejects error, aborted, empty, and unfinished streams', () => {
+test('RPC completion waits for settlement and returns the latest retry or continuation response', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-result-'));
   try {
     const file = path.join(root, 'events');
     const write = (...events) => fs.writeFileSync(file, events.map(JSON.stringify).join('\n') + '\n');
     write({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'ok' }] } }, { type: 'agent_end' });
+    assert.equal(runner.rpcFinished(file), false);
+    fs.appendFileSync(file, `${JSON.stringify({ type: 'agent_settled' })}\n`);
+    assert.equal(runner.rpcFinished(file), true);
     assert.deepEqual(runner.finalResponse(file), { ok: true, text: 'ok' });
     for (const reason of ['error', 'aborted']) {
-      write({ type: 'message_end', message: { role: 'assistant', stopReason: reason, content: [] } }, { type: 'agent_end' });
+      write({ type: 'message_end', message: { role: 'assistant', stopReason: reason, content: [] } }, { type: 'agent_end' }, { type: 'agent_settled' });
       assert.equal(runner.finalResponse(file).ok, false);
     }
-    write({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [] } }, { type: 'agent_end' });
+    write({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [] } }, { type: 'agent_end' }, { type: 'agent_settled' });
     assert.match(runner.finalResponse(file).error, /empty/);
     write({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'early' }] } });
-    assert.match(runner.finalResponse(file).error, /before the agent turn completed/);
+    assert.match(runner.finalResponse(file).error, /before the agent run settled/);
+
+    write(
+      { type: 'message_end', message: { role: 'assistant', stopReason: 'error', content: [], errorMessage: 'transient' } },
+      { type: 'agent_end', willRetry: true },
+      { type: 'auto_retry_start', attempt: 1 },
+      { type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'recovered' }] } },
+      { type: 'agent_end', willRetry: false },
+      { type: 'agent_settled' },
+    );
+    assert.deepEqual(runner.finalResponse(file), { ok: true, text: 'recovered' });
+
+    write(
+      { type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'first' }] } },
+      { type: 'agent_end' },
+      { type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: 'continue' }] } },
+      { type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'latest' }] } },
+      { type: 'agent_end' },
+      { type: 'agent_settled' },
+    );
+    assert.deepEqual(runner.finalResponse(file), { ok: true, text: 'latest' });
+
+    write({ id: 'keep-prompt', type: 'response', success: false, error: 'prompt refused' });
+    assert.equal(runner.rpcFinished(file), true);
+    assert.deepEqual(runner.finalResponse(file), { ok: false, error: 'prompt refused' });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
