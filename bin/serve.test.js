@@ -7312,7 +7312,7 @@ test('open recreates a recycled worktree for a resumed session, once, and only f
     await assert.rejects(openSession({ sessionId: id }, { ...deps,
       recreateWorktree: async () => { fs.mkdirSync(project, { recursive: true }); throw new Error('killed'); } }), /recreating it failed: killed/);
     await assert.rejects(openSession({ sessionId: id }, deps),
-      (error) => error.status === 409 && /earlier recreation did not finish; remove the partial worktree with wt rm/.test(error.message));
+      (error) => error.status === 409 && /earlier recreation did not finish; remove the partial worktree with wt rm --force --delete/.test(error.message));
     fs.rmSync(project, { recursive: true });
     finished = false;
     assert.equal((await openSession({ sessionId: id }, deps)).pane, 'pane-1', 'removing the partial tree lets a reopen recreate it');

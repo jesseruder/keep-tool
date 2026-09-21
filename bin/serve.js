@@ -6832,7 +6832,7 @@ function runWorktreeRecreation(project) {
     let stderr = '';
     child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-8192); });
     const timer = setTimeout(() => {
-      stderr += `\nwt: timed out after ${WORKTREE_RECREATE_TIMEOUT_MS / 1000}s; remove the partial worktree with wt rm before retrying`;
+      stderr += `\nwt: timed out after ${WORKTREE_RECREATE_TIMEOUT_MS / 1000}s; remove the partial worktree with wt rm --force --delete ${project} before retrying`;
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
     }, WORKTREE_RECREATE_TIMEOUT_MS);
     child.on('error', (error) => { clearTimeout(timer); reject(error); });
@@ -6846,7 +6846,8 @@ function runWorktreeRecreation(project) {
 // A creation that did not finish -- a failure, a timeout's SIGKILL, or the daemon
 // dying mid-way -- can leave a partial worktree that a later stat would accept. A
 // record written before the child starts and removed only on success marks that
-// path until the partial tree is gone (`wt rm`); a missing directory clears it.
+// path until the partial tree is gone (`wt rm --delete`; a plain `wt rm` recycles
+// the directory and keeps it); a missing directory clears it.
 function worktreeRecreationRecord(project, deps = {}) {
   const hash = require('crypto').createHash('sha256').update(project).digest('hex').slice(0, 32);
   return path.join(deps.root || keep.ROOT, '.keep', 'worktree-recreations', `${hash}.json`);
@@ -6865,7 +6866,7 @@ async function awaitWorktreeRecreation(project, deps = {}) {
   const record = worktreeRecreationRecord(project, deps);
   if (!fs.existsSync(record)) return;
   if (!fs.existsSync(project)) { try { fs.unlinkSync(record); } catch {} return; }
-  throw recreationFailure(project, `an earlier recreation did not finish; remove the partial worktree with wt rm ${project} and reopen`);
+  throw recreationFailure(project, `an earlier recreation did not finish; remove the partial worktree with wt rm --force --delete ${project} (or delete the directory if git does not list it as a worktree) and reopen`);
 }
 async function recreateRecycledWorktree(project, deps = {}) {
   let target = null;
