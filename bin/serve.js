@@ -6821,23 +6821,33 @@ function openBudgetModel(launchModel, deps = {}) {
 // before creation finished still waits for it (awaitWorktreeRecreation).
 const worktreeRecreations = new Map();
 const WORKTREE_RECREATE_TIMEOUT_MS = 150e3;
-function runWorktreeRecreation(project) {
+function runWorktreeRecreation(project, { timeoutMs = WORKTREE_RECREATE_TIMEOUT_MS, script: override } = {}) {
   const env = { ...process.env };
   delete env.CLAUDE_CODE_SESSION_ID;
-  const script = `try { require(${JSON.stringify(path.join(__dirname, 'wt.js'))}).recreateRecycledWorktree(process.argv[1]); }
+  const script = override || `try { require(${JSON.stringify(path.join(__dirname, 'wt.js'))}).recreateRecycledWorktree(process.argv[1]); }
     catch (error) { process.stderr.write('wt: ' + error.message + '\\n'); process.exit(1); }`;
   return new Promise((resolve, reject) => {
     const child = require('child_process').spawn(process.execPath, ['-e', script, project],
       { env, detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
+    let killed = false;
     child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-8192); });
     const timer = setTimeout(() => {
-      stderr += `\nwt: timed out after ${WORKTREE_RECREATE_TIMEOUT_MS / 1000}s; remove the partial worktree with wt rm --force --delete ${project} before retrying`;
+      killed = true;
+      stderr += `\nwt: timed out after ${timeoutMs / 1000}s; remove the partial worktree with wt rm --force --delete ${project} before retrying`;
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
-    }, WORKTREE_RECREATE_TIMEOUT_MS);
+    }, timeoutMs);
     child.on('error', (error) => { clearTimeout(timer); reject(error); });
     child.on('close', (code) => {
       clearTimeout(timer);
+      // SIGKILL skips withRepoLock's cleanup, and wt keeps a dead owner's lock for
+      // ten minutes; release it when the killed child is still the one holding it.
+      if (killed) {
+        try {
+          const lock = path.join(path.dirname(project), '.lock');
+          if (Number(fs.readFileSync(lock, 'utf8').trim()) === child.pid) fs.unlinkSync(lock);
+        } catch {}
+      }
       if (code === 0) resolve();
       else reject(Object.assign(new Error(`wt exited ${code}`), { stderr }));
     });
@@ -10992,6 +11002,7 @@ function start(deps = {}) {
 }
 
 module.exports = {
+  runWorktreeRecreation,
   repairEnvFor,
   messageWatcherDashboardState,
   prepareSessionSummary, sessionSummarySnapshot, associateDashboardSessionFiles,

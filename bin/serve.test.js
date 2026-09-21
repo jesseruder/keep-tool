@@ -7337,6 +7337,32 @@ test('open runs the real recreation child and reports its wt failure', async () 
   }
 });
 
+test('a timed-out recreation kills its process group and releases the repo lock it held', async () => {
+  const { runWorktreeRecreation } = require('./serve.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-recycled-timeout-'));
+  const project = path.join(root, 'wt', 'repo', 'gone');
+  const lock = path.join(root, 'wt', 'repo', '.lock');
+  const grandchild = path.join(root, 'grandchild.pid');
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  const script = `const fs = require('fs'); const { spawn } = require('child_process');
+    fs.writeFileSync(${JSON.stringify(lock)}, process.pid + '\\n');
+    const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    fs.writeFileSync(${JSON.stringify(grandchild)}, String(g.pid));
+    setInterval(() => {}, 1000);`;
+  try {
+    await assert.rejects(runWorktreeRecreation(project, { timeoutMs: 1500, script }),
+      (error) => /timed out after 1.5s; remove the partial worktree with wt rm --force --delete/.test(error.stderr));
+    assert.equal(fs.existsSync(lock), false, 'the killed child\'s lock is released');
+    const pid = Number(fs.readFileSync(grandchild, 'utf8'));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'the grandchild died with the group');
+
+    fs.writeFileSync(lock, '1\n');
+    await assert.rejects(runWorktreeRecreation(project, { timeoutMs: 500, script: 'setInterval(() => {}, 1000)' }));
+    assert.equal(fs.readFileSync(lock, 'utf8'), '1\n', 'a lock owned by another process is left alone');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a console number resolves to its session, and an unknown number is a bad session id', () => {
   const { resolveSessionId } = require('./serve.js');
   const ids = ['abcdef12-0000-4000-8000-000000000001', 'abcdef99-0000-4000-8000-000000000002'];
