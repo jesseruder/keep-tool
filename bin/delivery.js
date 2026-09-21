@@ -140,6 +140,86 @@ function journalAgeMs(journal, entry, now) {
   try { return now - fs.statSync(journal).mtimeMs; } catch { return 0; }
 }
 
+const INPUT_OPERATION_RE = /^[A-Za-z0-9_-]{16,128}$/;
+
+function typingOperationId(state, index) {
+  if (!state || !INPUT_OPERATION_RE.test(String(state.operationSeed || ''))
+      || !Number.isInteger(index) || index < 0 || index >= state.chunkCount) {
+    throw new Error('invalid delivery typing operation');
+  }
+  return `${state.operationSeed}-${index}`;
+}
+
+function partialTyping(entry) {
+  const state = entry && entry.typing;
+  if (!state || state.version !== 1 || Number(entry.typedAt) > 0) return false;
+  return Number.isInteger(state.inFlightChunk)
+    || (Number.isInteger(state.acknowledgedChunks) && state.acknowledgedChunks > 0);
+}
+
+function typingProgress(entry, writeJournal) {
+  const snapshot = () => entry.typing ? { ...entry.typing } : null;
+  const current = () => {
+    const state = entry.typing;
+    if (!state || state.version !== 1 || !Number.isInteger(state.chunkCount)
+        || state.chunkCount < 1 || !INPUT_OPERATION_RE.test(String(state.operationSeed || ''))) {
+      throw new Error('invalid delivery typing state');
+    }
+    return state;
+  };
+  return {
+    get state() { return snapshot(); },
+    operationId(index) { return typingOperationId(current(), index); },
+    plan({ pid, initialInputCount, chunkChars, chunkCount, operationSeed }) {
+      if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(initialInputCount) || initialInputCount < 0
+          || !Number.isInteger(chunkChars) || chunkChars < 1 || !Number.isInteger(chunkCount) || chunkCount < 1
+          || !INPUT_OPERATION_RE.test(String(operationSeed || '')) || String(operationSeed).length > 96) {
+        throw new Error('invalid delivery typing plan');
+      }
+      entry.typing = {
+        version: 1, pid, initialInputCount, chunkChars, chunkCount, operationSeed: String(operationSeed),
+        acknowledgedChunks: 0, inFlightChunk: null, prefixHash: hash(''), plannedAt: Date.now(),
+      };
+      writeJournal();
+    },
+    start(index) {
+      const state = current();
+      if (index !== state.acknowledgedChunks || index < 0 || index >= state.chunkCount) {
+        throw new Error('delivery chunk start is out of order');
+      }
+      state.inFlightChunk = index;
+      state.partialAt ||= Date.now();
+      writeJournal();
+    },
+    acknowledge(index, prefixHash) {
+      const state = current();
+      if (index !== state.acknowledgedChunks || state.inFlightChunk !== index
+          || !/^[a-f0-9]{64}$/.test(String(prefixHash || ''))) {
+        throw new Error('delivery chunk acknowledgement is out of order');
+      }
+      state.acknowledgedChunks = index + 1;
+      state.inFlightChunk = null;
+      state.prefixHash = String(prefixHash);
+      state.partialAt ||= Date.now();
+      writeJournal();
+    },
+    reject(index) {
+      const state = current();
+      if (state.inFlightChunk !== index) throw new Error('delivery chunk rejection is out of order');
+      state.inFlightChunk = null;
+      writeJournal();
+    },
+    complete() {
+      const state = current();
+      if (state.inFlightChunk !== null || state.acknowledgedChunks !== state.chunkCount) {
+        throw new Error('delivery typing completed before every chunk was acknowledged');
+      }
+      state.completedAt = Date.now();
+      writeJournal();
+    },
+  };
+}
+
 async function deliverAttempt({ session, pane, text, key, file, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, observe, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16, staleJournalMs = STALE_JOURNAL_MS }) {
   let typingError;
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -161,12 +241,30 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     } else {
       const sameMessage = entry.hash === hash(text), samePane = entry.pane === pane;
       trace('retry-identity', { sameMessage, samePane });
-      const draftPresent = await draftMatches();
-      if (!sameMessage || !samePane || !draftPresent) {
-        const ageMs = journalAgeMs(journal, entry, Date.now());
-        if (draftPresent || ageMs < staleJournalMs) {
-          throw new Error('Previous delivery is unconfirmed; no message was retyped. Inspect the session draft/transcript before retrying.');
+      if (partialTyping(entry)) {
+        if (!sameMessage || !samePane) {
+          throw new Error('Previous delivery is partially typed; no message was retyped. Inspect the session draft before retrying.');
         }
+        trace('partial-resume-start', {
+          acknowledgedChunks: entry.typing.acknowledgedChunks,
+          ambiguous: Number.isInteger(entry.typing.inFlightChunk),
+        });
+        const writeJournal = () => {
+          const temp = journal + '.tmp';
+          fs.writeFileSync(temp, JSON.stringify(entry), { mode: 0o600 });
+          fs.renameSync(temp, journal);
+        };
+        await type(typingProgress(entry, writeJournal));
+        entry.typedAt = Date.now();
+        writeJournal();
+        trace('partial-resume-ok');
+      } else {
+        const draftPresent = await draftMatches();
+        if (!sameMessage || !samePane || !draftPresent) {
+          const ageMs = journalAgeMs(journal, entry, Date.now());
+          if (draftPresent || ageMs < staleJournalMs) {
+            throw new Error('Previous delivery is unconfirmed; no message was retyped. Inspect the session draft/transcript before retrying.');
+          }
         // Same text, same pane, and the draft is gone from the box: the likeliest
         // reading is that it WAS submitted and `received` cannot see it - a session
         // that resumed writes to a new transcript, so the journal's file/offset can
@@ -177,16 +275,17 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
         // the typing itself failed, nothing was ever on screen, and assuming delivery
         // would file a received receipt - and let a sweep tick consume the day - for a
         // message nobody has seen.
-        const assumedDelivered = sameMessage && samePane && Number(entry.typedAt) > 0;
-        trace('pending-journal-expired', { ageMs, assumedDelivered });
-        if (assumedDelivered) {
-          finish(directory, journal, entry);
-          return { ok: true, delivery: 'assumed-delivered', expired: true };
+          const assumedDelivered = sameMessage && samePane && Number(entry.typedAt) > 0;
+          trace('pending-journal-expired', { ageMs, assumedDelivered });
+          if (assumedDelivered) {
+            finish(directory, journal, entry);
+            return { ok: true, delivery: 'assumed-delivered', expired: true };
+          }
+          try { fs.unlinkSync(journal); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+          entry = null;
+        } else {
+          await submitDraft();
         }
-        try { fs.unlinkSync(journal); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-        entry = null;
-      } else {
-        await submitDraft();
       }
     }
   }
@@ -204,10 +303,9 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     // path alive even if the initial screen confirmation timed out. Never type
     // again: a partial or changed draft still cannot receive Enter.
     try {
-      await type();
-      // Only now may a later expiry assume this reached the pane. The journal is
-      // written BEFORE typing so a crash mid-keystroke is still recoverable, which
-      // means its mere existence proves nothing about what is on screen.
+      await type(typingProgress(entry, writeJournal));
+      // Only a successful type() has sent Enter. A completely typed but unsubmitted
+      // draft remains partial state and may never age into assumed delivery.
       entry.typedAt = Date.now();
       writeJournal();
     } catch (error) {
@@ -234,9 +332,13 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
         throw error;
       }
       if (error.message !== 'message was typed but could not be confirmed; Enter was not pressed') throw error;
-      // The text was typed but Enter was never pressed: it did reach the pane.
-      entry.typedAt = Date.now();
-      try { writeJournal(); } catch {}
+      // The text was typed but Enter was never pressed. Leave typedAt unset: this is
+      // recoverable partial state, not evidence that the message was submitted. Keep
+      // the legacy marker only for callers without per-chunk recovery state.
+      if (!entry.typing) {
+        entry.typedAt = Date.now();
+        try { writeJournal(); } catch {}
+      }
       typingError = error;
     }
   }
@@ -351,8 +453,8 @@ function reconcile(directory, { now = Date.now(), staleJournalMs = STALE_JOURNAL
       if (name !== hash(entry.sessionId) + '.json') continue;
       if (!received(entry)) {
         if (journalAgeMs(journal, entry, now) < staleJournalMs) continue;
-        if (!(Number(entry.typedAt) > 0)) fs.unlinkSync(journal);
-        else if (panes?.size && !panes.has(entry.pane)) {
+        if (!(Number(entry.typedAt) > 0) && !partialTyping(entry)) fs.unlinkSync(journal);
+        else if (Number(entry.typedAt) > 0 && panes?.size && !panes.has(entry.pane)) {
           if (entry.retainReceipt) fs.unlinkSync(journal);
           else settle(journal, name);
           settled.push(entry.sessionId);

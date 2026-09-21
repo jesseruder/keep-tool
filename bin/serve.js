@@ -2015,6 +2015,7 @@ async function writeTarget(target, value, deps = {}, options = {}) {
     pane: target.pane,
     data: Buffer.from(String(value), 'utf8').toString('base64'),
     ...(guarded ? { expectedInputCount: options.expectedInputCount, expectedPid: options.expectedPid } : {}),
+    ...(options.operationId ? { operationId: String(options.operationId) } : {}),
   }, deps);
   if (result && result.dropped) {
     const replaced = result.reason === 'pane replaced';
@@ -2654,9 +2655,12 @@ function typedAlready(error) {
 }
 
 async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
+  const deliveryJournal = require('./delivery');
   const read = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const chunkChars = Math.max(1, Math.floor(envNumber('KEEP_SEND_CHUNK_CHARS', 200)));
+  const savedTyping = deps.typingProgress?.state || null;
+  const chunkChars = savedTyping?.chunkChars
+    || Math.max(1, Math.floor(envNumber('KEEP_SEND_CHUNK_CHARS', 200)));
   const chunkDelayMs = envNumber('KEEP_SEND_CHUNK_DELAY_MS', 120);
   const chunks = chunkForTyping(text, chunkChars);
   const nothingTyped = (error) => {
@@ -2672,42 +2676,186 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   // Only when a discard is possible at all: a plain send never looks at this, and
   // every send should not pay for a pane listing it will not read.
   let exactExpectation = null;
-  const discardExpectation = deps.discardDraftOnAbort
-    ? await (async () => {
-      const pane = (target && target.pane) || 'unknown';
-      // Codex's visual fallback below is allowed only when the input really was
-      // empty at the baseline. Read the counter on both sides of the placeholder:
-      // a key arriving during the read invalidates it, and a key after the second
-      // count makes the host reject the eventual guarded Enter. Do this before the
-      // first chunk so an old host or unverifiable pane leaves no draft behind.
-      if (deps.requireExactDraft && deps.draftKind === 'codex') {
-        let capabilities;
-        try { capabilities = await (deps.hostRequest || hostRequest)('hello', {}, deps); } catch {}
-        if (!capabilities || capabilities.guardedInput !== true) {
-          throw nothingTyped(new InjectionError(409, 'terminal host reload required before a guarded Codex message can be typed'));
-        }
-        const before = await livePaneState(pane, deps);
-        if (!before) throw nothingTyped(new InjectionError(409, 'pane input activity could not be verified before typing'));
-        let emptyScreen = '';
-        try { emptyScreen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false); }
-        catch { throw nothingTyped(new InjectionError(409, 'Codex input could not be verified empty before typing')); }
-        const after = await livePaneState(pane, deps);
-        if (!after || after.pid !== before.pid || after.inputCount !== before.inputCount) {
-          throw nothingTyped(new InjectionError(409, 'input arrived while the Codex prompt was checked; message was not typed'));
-        }
-        try { codexSendPrecheck(emptyScreen); } catch (error) { throw nothingTyped(error); }
-        exactExpectation = { pid: after.pid, inputCount: after.inputCount + chunks.length };
-        return exactExpectation;
+  // Every journaled delivery gets write-once chunks. Scheduled messages and agent
+  // notes use this path too; limiting it to watcher-only flags would miss the
+  // incidents this state is meant to recover.
+  const guardedChunks = Boolean(deps.typingProgress);
+  const pane = (target && target.pane) || 'unknown';
+  let typingState = savedTyping;
+  const stableScreen = async (expectedCount, expectedText, empty = false, alternate = null) => {
+    const before = await livePaneState(pane, deps);
+    const allowedCount = before && (before.inputCount === expectedCount
+      || (alternate && before.inputCount === alternate.count));
+    if (!before || before.pid !== typingState.pid || !allowedCount) {
+      throw new InjectionError(409, 'pane input changed while a partial delivery was checked; no key was pressed');
+    }
+    let snapshot;
+    try {
+      snapshot = deps.readScreenResult
+        ? await deps.readScreenResult(target, 200, false)
+        : await readScreenResult(target, 200, false, deps);
+    }
+    catch { throw new InjectionError(409, 'partial delivery input could not be verified; no key was pressed'); }
+    const screen = String(snapshot?.text || '');
+    const after = await livePaneState(pane, deps);
+    if (!after || after.pid !== before.pid || after.inputCount !== before.inputCount) {
+      throw new InjectionError(409, 'input arrived while a partial delivery was checked; no key was pressed');
+    }
+    const modal = deps.draftKind === 'codex'
+      ? CODEX_DIALOG_MARKERS.some((marker) => screen.includes(marker))
+      : Boolean(claudePrompts.recognize(screen)?.live)
+        || /(Enter to select|Enter to confirm|Held message|Esc to cancel)/.test(screen);
+    if (modal) throw new InjectionError(409, 'the session is showing a modal; partial delivery was not resumed');
+    const wanted = alternate && before.inputCount === alternate.count ? alternate.text : expectedText;
+    if (empty && !wanted) {
+      const check = deps.draftKind === 'codex' ? codexSendPrecheck : sendPrecheck;
+      check(screen);
+      if (deps.draftKind !== 'codex' && promptText(promptLine(screen)) !== '') {
+        throw new InjectionError(409, 'the input box was not empty; message was not typed');
       }
+    } else {
+      if (!draftIsExactly(screen, wanted, deps.draftKind)
+          && !renderedDraftMatches(screen, wanted, deps.draftKind)) {
+        throw new InjectionError(409, 'the partial delivery draft changed; no key was pressed');
+      }
+      const lines = stripTerminalAnsi(screen).split(/\r?\n/);
+      const prompt = deps.draftKind === 'codex' ? /^\s*›(?:\s|$)/ : /^\s*❯(?:\s|$)/;
+      let start = -1;
+      lines.forEach((line, index) => { if (prompt.test(line)) start = index; });
+      let end = start;
+      while (end + 1 < lines.length && lines[end + 1].trim() && !BOX_RULE_RE.test(lines[end + 1])) end += 1;
+      if (!Number.isFinite(snapshot?.cursor?.y) || snapshot.cursor.y < start || snapshot.cursor.y > end) {
+        throw new InjectionError(409, 'the cursor is no longer in the partial delivery draft; no key was pressed');
+      }
+    }
+    return screen;
+  };
+  if (guardedChunks) {
+    let capabilities;
+    try { capabilities = await (deps.hostRequest || hostRequest)('hello', {}, deps); } catch {}
+    if (!capabilities || capabilities.guardedInput !== true || capabilities.guardedInputReceipts !== true) {
+      throw nothingTyped(new InjectionError(409, 'terminal host reload required before a guarded message can be typed'));
+    }
+    if (typingState) {
+      if (typingState.chunkChars !== chunkChars || typingState.chunkCount !== chunks.length
+          || !Number.isInteger(typingState.acknowledgedChunks)
+          || typingState.acknowledgedChunks < 0 || typingState.acknowledgedChunks > chunks.length) {
+        throw new InjectionError(409, 'saved partial delivery plan does not match this message; no key was pressed');
+      }
+      const prefix = chunks.slice(0, typingState.acknowledgedChunks).join('');
+      if (deliveryJournal.textHash(prefix) !== typingState.prefixHash) {
+        throw new InjectionError(409, 'saved partial delivery prefix is invalid; no key was pressed');
+      }
+    } else {
+      const baseline = await livePaneState(pane, deps);
+      if (!baseline) throw nothingTyped(new InjectionError(409, 'pane input activity could not be verified before typing'));
+      typingState = { pid: baseline.pid, initialInputCount: baseline.inputCount };
+      try { await stableScreen(baseline.inputCount, '', true); }
+      catch (error) { throw nothingTyped(error); }
+      deps.typingProgress.plan({
+        pid: baseline.pid,
+        initialInputCount: baseline.inputCount,
+        chunkChars,
+        chunkCount: chunks.length,
+        operationSeed: `delivery_${crypto.randomUUID().replace(/-/g, '')}`,
+      });
+      typingState = deps.typingProgress.state;
+    }
+    const writeChunk = async (index) => {
+      const options = {
+        expectedPid: typingState.pid,
+        expectedInputCount: typingState.initialInputCount + index,
+        operationId: deps.typingProgress.operationId(index),
+      };
+      let failure;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try { return await writeTarget(target, chunks[index], deps, options); }
+        catch (error) {
+          if (error?.inputDropped) throw error;
+          failure = error;
+        }
+      }
+      throw failure;
+    };
+    deps.deliveryTrace?.('write-start');
+    if (Number.isInteger(typingState.inFlightChunk)) {
+      const index = typingState.inFlightChunk;
+      const prefix = chunks.slice(0, index).join('');
+      await stableScreen(
+        typingState.initialInputCount + index,
+        prefix,
+        index === 0,
+        { count: typingState.initialInputCount + index + 1, text: prefix + chunks[index] },
+      );
+      try {
+        await writeChunk(index);
+        deps.typingProgress.acknowledge(index, deliveryJournal.textHash(chunks.slice(0, index + 1).join('')));
+      } catch (error) {
+        // This operation predates this process attempt. A dropped replay can mean
+        // the host restarted after accepting it but before persisting/replaying its
+        // receipt; clearing inFlight would erase the only durable ambiguity marker.
+        throw typedAlready(error);
+      }
+      typingState = deps.typingProgress.state;
+    }
+    if (typingState.acknowledgedChunks > 0) {
+      await stableScreen(
+        typingState.initialInputCount + typingState.acknowledgedChunks,
+        chunks.slice(0, typingState.acknowledgedChunks).join(''),
+      );
+    }
+    for (let index = typingState.acknowledgedChunks; index < chunks.length; index += 1) {
+      deps.typingProgress.start(index);
+      try {
+        await writeChunk(index);
+        deps.typingProgress.acknowledge(index, deliveryJournal.textHash(chunks.slice(0, index + 1).join('')));
+      } catch (error) {
+        if (error?.inputDropped) {
+          deps.typingProgress.reject(index);
+          if (index === 0) throw nothingTyped(error);
+        }
+        throw typedAlready(error);
+      }
+      if (index + 1 < chunks.length && chunkDelayMs > 0) await sleep(chunkDelayMs);
+    }
+    deps.typingProgress.complete();
+    typingState = deps.typingProgress.state;
+    exactExpectation = {
+      pid: typingState.pid,
+      inputCount: typingState.initialInputCount + chunks.length,
+    };
+  } else if (deps.discardDraftOnAbort && deps.requireExactDraft && deps.draftKind === 'codex') {
+    // Direct (non-journaled) guarded sends retain the original stable-empty baseline.
+    let capabilities;
+    try { capabilities = await (deps.hostRequest || hostRequest)('hello', {}, deps); } catch {}
+    if (!capabilities || capabilities.guardedInput !== true) {
+      throw nothingTyped(new InjectionError(409, 'terminal host reload required before a guarded Codex message can be typed'));
+    }
+    const before = await livePaneState(pane, deps);
+    if (!before) throw nothingTyped(new InjectionError(409, 'pane input activity could not be verified before typing'));
+    let emptyScreen = '';
+    try { emptyScreen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false); }
+    catch { throw nothingTyped(new InjectionError(409, 'Codex input could not be verified empty before typing')); }
+    const after = await livePaneState(pane, deps);
+    if (!after || after.pid !== before.pid || after.inputCount !== before.inputCount) {
+      throw nothingTyped(new InjectionError(409, 'input arrived while the Codex prompt was checked; message was not typed'));
+    }
+    try { codexSendPrecheck(emptyScreen); } catch (error) { throw nothingTyped(error); }
+    exactExpectation = { pid: after.pid, inputCount: after.inputCount + chunks.length };
+  }
+  const discardExpectation = deps.discardDraftOnAbort
+    ? exactExpectation || await (async () => {
       const before = await livePaneState(pane, deps);
       return before && { pid: before.pid, inputCount: before.inputCount + chunks.length };
     })()
     : null;
   const discardDeps = { ...deps, expectedPaneState: discardExpectation };
-  deps.deliveryTrace?.('write-start');
-  for (let index = 0; index < chunks.length; index += 1) {
-    await writeTarget(target, chunks[index], deps);
-    if (index + 1 < chunks.length && chunkDelayMs > 0) await sleep(chunkDelayMs);
+  if (!guardedChunks) {
+    deps.deliveryTrace?.('write-start');
+    for (let index = 0; index < chunks.length; index += 1) {
+      await writeTarget(target, chunks[index], deps);
+      if (index + 1 < chunks.length && chunkDelayMs > 0) await sleep(chunkDelayMs);
+    }
   }
   deps.deliveryTrace?.('write-finished');
   let confirmed = false;
@@ -2782,7 +2930,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   // one in which Owner can start typing. Callers that type unprompted (the
   // watcher) demand exactness; a human-initiated send keeps the older, looser
   // check it has always had.
-  if (deps.requireExactDraft) {
+  if (deps.requireExactDraft || guardedChunks) {
     let exactScreen = '';
     try {
       exactScreen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
@@ -5989,9 +6137,18 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
       key: opts?.deliveryKey,
       observe: observeMcp,
       precheck,
-      type: async () => {
+      type: async (typingProgress) => {
         if (opts?.beforeType) await opts.beforeType();
-        return typeAndSubmit(target, text, confirmation, { ...deps, deliveryTrace: trace, draftKind: session.kind });
+        if (typingProgress?.state) {
+          const current = deps.loadDeliverySession ? deps.loadDeliverySession(session.id)
+            : session.kind === 'claude' ? claudeSessionFor(session.id) : codex.sessionFor(session.id);
+          if (!current || current.endedTurn !== true || current.pendingQuestion || current.pendingPlan) {
+            throw new InjectionError(409, 'session is no longer idle enough to resume its partial delivery; no key was pressed');
+          }
+        }
+        return typeAndSubmit(target, text, confirmation, {
+          ...deps, deliveryTrace: trace, draftKind: session.kind, typingProgress,
+        });
       },
       submitDraft: async () => {
         if (opts?.beforeType) await opts.beforeType();

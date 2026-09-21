@@ -498,3 +498,42 @@ test('text typed but never submitted still counts as having reached the pane', a
     assert.equal(typed, 1, 'and it is never typed a second time');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('partial chunk progress is durable, resumable only for the same send, and never settled for a missing pane', async () => {
+  const { reconcile, textHash } = require('./delivery');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-partial-'));
+  const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  const base = { session: { id: 'partial', kind: 'codex' }, pane: 'pane', text: 'abcdef', file, directory,
+    precheck: async () => {}, submitDraft: async () => assert.fail('unexpected recovery Enter'),
+    draftMatches: async () => false, pause: async () => {}, attempts: 1 };
+  let first = true;
+  const type = async (progress) => {
+    if (first) {
+      first = false;
+      progress.plan({ pid: 42, initialInputCount: 7, chunkChars: 3, chunkCount: 2,
+        operationSeed: 'delivery_1234567890abcdef' });
+      progress.start(0);
+      progress.acknowledge(0, textHash('abc'));
+      progress.start(1);
+      throw new Error('host acknowledgement was lost');
+    }
+    assert.equal(progress.state.inFlightChunk, 1);
+    assert.equal(progress.operationId(1), 'delivery_1234567890abcdef-1');
+    progress.acknowledge(1, textHash('abcdef'));
+    progress.complete();
+    fs.appendFileSync(file, `${JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'abcdef' }] } })}\n`);
+  };
+  try {
+    await assert.rejects(deliver({ ...base, type }), /acknowledgement was lost/);
+    const journal = path.join(directory, `${textHash('partial')}.json`);
+    const entry = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    assert.equal(entry.typedAt, undefined, 'chunk completion is not submission evidence');
+    assert.equal(entry.typing.inFlightChunk, 1);
+    assert.deepEqual(reconcile(directory, { now: Date.now() + 60 * 60e3, panes: new Set(['other']) }), [],
+      'a missing pane cannot turn a partial draft into a received send');
+    assert.equal(fs.existsSync(journal), true);
+    await assert.rejects(deliver({ ...base, text: 'different', type: async () => assert.fail('must not type') }), /partially typed/);
+    assert.deepEqual(await deliver({ ...base, type }), { ok: true, delivery: 'received' });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

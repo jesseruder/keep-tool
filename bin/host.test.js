@@ -724,6 +724,13 @@ test('handoff adopts a live PTY, rebuilds its screen, and keeps exit detection',
     await client.attach(pane.id, { replay: false, viewer: 'old-primary', primary: true }, () => {});
     await client.request('input', { pane: pane.id, data: Buffer.from('before\n').toString('base64') });
     await waitFor(async () => (await client.request('screen', { pane: pane.id })).text.includes('got:before'), 'pre-handoff input');
+    const operation = {
+      pane: pane.id, data: Buffer.from('receipt\n').toString('base64'), expectedPid: pane.pid,
+      expectedInputCount: (await client.request('get', { pane: pane.id })).pane.inputCount,
+      operationId: 'delivery-handoff-00000001',
+    };
+    const operationResult = await client.request('input', operation);
+    await waitFor(async () => (await client.request('screen', { pane: pane.id })).text.includes('got:receipt'), 'receipt before handoff');
     const activityBefore = (await client.request('get', { pane: pane.id })).pane;
     assert.equal((await client.request('get', { pane: pane.id })).pane.primary, 'old-primary');
     const disconnected = new Promise((resolve) => client.onDisconnect(resolve));
@@ -737,7 +744,7 @@ test('handoff adopts a live PTY, rebuilds its screen, and keeps exit detection',
     assert.ok(Buffer.isBuffer(record.panes[0].buffer));
     assert.deepEqual(Object.keys(record.panes[0]).sort(), [
       'alive', 'args', 'buffer', 'cmd', 'coldSnapshot', 'cols', 'createdAt', 'cwd', 'exitCode', 'exitedAt',
-      'id', 'inputCount', 'lastInputAt', 'lastOutputAt', 'lastReadAt', 'meta', 'outputCount', 'pid', 'primary',
+      'id', 'inputCount', 'inputReceipts', 'lastInputAt', 'lastOutputAt', 'lastReadAt', 'meta', 'outputCount', 'pid', 'primary',
       'pty', 'rows', 'screen', 'signal', 'terminalState', 'terminalStateOffset', 'title',
     ]);
 
@@ -753,6 +760,9 @@ test('handoff adopts a live PTY, rebuilds its screen, and keeps exit detection',
     assert.equal(adoptedActivity.lastReadAt, activityBefore.lastReadAt);
     assert.equal(adoptedActivity.inputCount, activityBefore.inputCount);
     assert.equal(adoptedActivity.outputCount, activityBefore.outputCount);
+    assert.deepEqual(await client.request('input', operation), operationResult,
+      'an adopted host replays the receipt instead of the input');
+    assert.equal((await client.request('get', { pane: pane.id })).pane.inputCount, activityBefore.inputCount);
     assert.match((await client.request('screen', { pane: pane.id })).text, /earlier/);
     await client.request('input', { pane: pane.id, data: Buffer.from('again\n').toString('base64') });
     assert.match((await client.request('get', { pane: pane.id })).pane.primary, /^viewer-/);
@@ -914,7 +924,9 @@ test('a guarded input writes only while the pane is the same process and has tak
   await withHost({}, async ({ client }) => {
     // Advertised, because a host that predates this ignores the parameter and writes
     // the key anyway; the daemon refuses to press rather than race such a host.
-    assert.equal((await client.request('hello')).guardedInput, true);
+    const hello = await client.request('hello');
+    assert.equal(hello.guardedInput, true);
+    assert.equal(hello.guardedInputReceipts, true);
     const { pane } = await client.request('spawn', {
       cmd: '/bin/sh',
       args: ['-c', "stty -echo; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done"],
@@ -970,6 +982,48 @@ test('a guarded input writes only while the pane is the same process and has tak
         pane: pane.id, data: Buffer.from('x').toString('base64'), ...params,
       }), /requires expectedInputCount and expectedPid as integers/, JSON.stringify(params));
     }
+
+    // A lost acknowledgement is retried with the same operation id. The accepted
+    // receipt wins before the now-stale count guard, so the bytes reach the pty once.
+    const operation = {
+      pane: pane.id, data: Buffer.from('idempotent\n').toString('base64'),
+      expectedInputCount: start + 2, expectedPid: pane.pid,
+      operationId: 'delivery-chunk-00000001',
+    };
+    const accepted = { accepted: true, inputCount: start + 3 };
+    assert.deepEqual(await client.request('input', operation), accepted);
+    assert.deepEqual(await client.request('input', operation), accepted);
+    assert.equal(await countOf(), start + 3, 'receipt replay does not write or count twice');
+    await waitFor(async () => (await client.request('screen', { pane: pane.id })).text.includes('got:idempotent'), 'idempotent input');
+    await assert.rejects(client.request('input', {
+      ...operation, data: Buffer.from('changed\n').toString('base64'),
+    }), /operation parameters changed/);
+    await client.request('input', {
+      pane: pane.id, data: Buffer.from('owner input\n').toString('base64'),
+    });
+    const next = await client.request('input', {
+      pane: pane.id, data: Buffer.from('next chunk\n').toString('base64'),
+      expectedInputCount: start + 3, expectedPid: pane.pid,
+      operationId: 'delivery-chunk-00000002',
+    });
+    assert.deepEqual(next, { dropped: true, reason: 'input arrived', inputCount: start + 4 },
+      'receipt replay does not weaken the next chunk guard');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal((await client.request('screen', { pane: pane.id })).text.includes('got:next chunk'), false);
+    let count = start + 4;
+    for (let index = 0; index < 256; index += 1) {
+      const result = await client.request('input', {
+        pane: pane.id, data: Buffer.from('x').toString('base64'),
+        expectedInputCount: count, expectedPid: pane.pid,
+        operationId: `delivery-eviction-${String(index).padStart(6, '0')}`,
+      });
+      count += 1;
+      assert.deepEqual(result, { accepted: true, inputCount: count });
+    }
+    assert.deepEqual(await client.request('input', operation), {
+      dropped: true, reason: 'input arrived', inputCount: count,
+    }, 'an evicted receipt fails closed on its stale original guard');
+    assert.equal(await countOf(), count, 'evicted replay writes nothing');
     await client.request('kill', { pane: pane.id });
   });
 });

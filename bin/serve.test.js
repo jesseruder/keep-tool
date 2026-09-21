@@ -5573,7 +5573,7 @@ function draftHarness(screen, onEvent = () => {}) {
   const foreign = { count: 0 };
   // What this host says it can do. A test drops a capability to stand for a host that
   // is still running the code it was started with.
-  const hello = { version: 1, guardedInput: true };
+  const hello = { version: 1, guardedInput: true, guardedInputReceipts: true };
   // The process behind the pane. `replace-exited` keeps the pane id and starts a new
   // process's count at zero, so a test moves this to stand for that.
   const live = { pid: 4242 };
@@ -6124,6 +6124,132 @@ function recoveryHarness({ text = MESSAGE, kind = 'claude', screenFor, onEnter,
       }),
   };
 }
+
+test('a lost chunk acknowledgement resumes a resolved Codex send without duplicate bytes or Enter', async (t) => {
+  const delivery = require('./delivery');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-chunk-resume-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const directory = path.join(base, 'delivery');
+  const file = path.join(base, 'rollout.jsonl');
+  fs.writeFileSync(file, '');
+  const text = `lost acknowledgement ${'x'.repeat(430)}`;
+  const live = { pid: 4242, inputCount: 0, draft: '' };
+  const receipts = new Map();
+  let ambiguousReplies = 2;
+  let enters = 0;
+  let modal = false;
+  const screen = () => {
+    if (!live.draft) return '› Ask Codex to do anything';
+    const rows = [];
+    for (let at = 0; at < live.draft.length; at += 76) rows.push(`${at ? '  ' : '› '}${live.draft.slice(at, at + 76)}`);
+    return [...rows, ...(modal ? ['', 'Press enter to confirm or esc to cancel'] : []), '',
+      '  ~/keep-tool · master · Full Access'].join('\n');
+  };
+  const host = recordingHost(async (type, params) => {
+    if (type === 'hello') return { guardedInput: true, guardedInputReceipts: true };
+    if (type === 'screen') {
+      const rendered = screen();
+      const promptRows = live.draft ? Math.ceil(live.draft.length / 76) : 1;
+      return { text: rendered, cursor: { x: 2, y: promptRows - 1 }, cols: 80, rows: rendered.split('\n').length };
+    }
+    if (type !== 'input') return {};
+    const value = Buffer.from(params.data, 'base64').toString();
+    if (params.operationId && receipts.has(params.operationId)) {
+      const prior = receipts.get(params.operationId);
+      if (ambiguousReplies > 0) { ambiguousReplies -= 1; throw new Error('lost host reply'); }
+      return prior;
+    }
+    if (live.pid !== params.expectedPid) return { dropped: true, reason: 'pane replaced', pid: live.pid, inputCount: live.inputCount };
+    if (live.inputCount !== params.expectedInputCount) return { dropped: true, reason: 'input arrived', inputCount: live.inputCount };
+    live.inputCount += 1;
+    if (value === '\r') {
+      enters += 1;
+      fs.appendFileSync(file, `${JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } })}\n`);
+    } else {
+      live.draft += value;
+    }
+    const result = { accepted: true, inputCount: live.inputCount };
+    if (params.operationId) receipts.set(params.operationId, result);
+    if (params.operationId && ambiguousReplies > 0) { ambiguousReplies -= 1; throw new Error('lost host reply'); }
+    return result;
+  });
+  const deps = {
+    host, deliveryDirectory: directory, transcriptFileForSession: () => file,
+    readScreen: async () => screen(), sleep: async () => {},
+    listHostPanes: async () => [{ id: 'pane', pid: live.pid, inputCount: live.inputCount }],
+    loadDeliverySession: (id) => ({ id, endedTurn: true }),
+  };
+  const send = () => sendToResolvedTarget({ id: 'chunk-session', kind: 'codex' }, { pane: 'pane' }, text, undefined, deps);
+  await assert.rejects(send(), /lost host reply/);
+  const journal = path.join(directory, `${delivery.textHash('chunk-session')}.json`);
+  const partial = JSON.parse(fs.readFileSync(journal, 'utf8'));
+  assert.equal(partial.typedAt, undefined);
+  assert.equal(partial.typing.inFlightChunk, 0);
+  assert.equal(live.draft.length, chunkForTyping(text, 200)[0].length,
+    'the ambiguous first chunk reached the pane once');
+  modal = true;
+  await assert.rejects(send(), /showing a modal/);
+  assert.equal(enters, 0, 'a modal appearing before resume receives no Enter');
+  assert.equal(live.draft.length, chunkForTyping(text, 200)[0].length, 'modal refusal types no more bytes');
+  modal = false;
+  assert.deepEqual(await send(), { ok: true, delivery: 'received' });
+  assert.equal(live.draft, text, 'receipt replay did not duplicate the first chunk');
+  assert.equal(enters, 1, 'Enter is pressed exactly once after the full exact draft');
+});
+
+test('a lost chunk acknowledgement resumes a resolved Claude send after its prompt probe', async (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-claude-chunk-resume-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const directory = path.join(base, 'delivery');
+  const file = path.join(base, 'transcript.jsonl'); fs.writeFileSync(file, '');
+  const text = `claude lost acknowledgement ${'y'.repeat(430)}`;
+  const live = { pid: 5252, inputCount: 0, draft: '' };
+  const receipts = new Map();
+  let ambiguousReplies = 2;
+  let enters = 0;
+  const screen = () => BOX(live.draft);
+  const host = recordingHost(async (type, params) => {
+    if (type === 'hello') return { guardedInput: true, guardedInputReceipts: true };
+    if (type === 'screen') return { text: screen(), cursor: { x: live.draft.length + 2, y: 1 }, cols: 500, rows: 3 };
+    if (type !== 'input') return {};
+    const value = Buffer.from(params.data, 'base64').toString();
+    if (params.expectedInputCount === undefined) {
+      live.inputCount += 1;
+      if (value === SUGGESTION_PROBE_KEY) live.draft += value;
+      else if (value === '\x7f') live.draft = live.draft.slice(0, -1);
+      return {};
+    }
+    if (params.operationId && receipts.has(params.operationId)) {
+      const prior = receipts.get(params.operationId);
+      if (ambiguousReplies > 0) { ambiguousReplies -= 1; throw new Error('lost Claude host reply'); }
+      return prior;
+    }
+    if (live.pid !== params.expectedPid) return { dropped: true, reason: 'pane replaced', pid: live.pid, inputCount: live.inputCount };
+    if (live.inputCount !== params.expectedInputCount) return { dropped: true, reason: 'input arrived', inputCount: live.inputCount };
+    live.inputCount += 1;
+    if (value === '\r') {
+      enters += 1;
+      fs.appendFileSync(file, `${JSON.stringify({ type: 'user', message: { role: 'user', content: text } })}\n`);
+    } else live.draft += value;
+    const result = { accepted: true, inputCount: live.inputCount };
+    if (params.operationId) receipts.set(params.operationId, result);
+    if (params.operationId && ambiguousReplies > 0) { ambiguousReplies -= 1; throw new Error('lost Claude host reply'); }
+    return result;
+  });
+  const deps = {
+    host, deliveryDirectory: directory, transcriptFileForSession: () => file,
+    readScreen: async () => screen(), sleep: async () => {}, now: (() => { let n = 0; return () => ++n * 100; })(),
+    listHostPanes: async () => [{ id: 'pane', pid: live.pid, inputCount: live.inputCount }],
+    loadDeliverySession: (id) => ({ id, endedTurn: true }),
+  };
+  const send = () => sendToResolvedTarget({ id: 'claude-chunk-session', kind: 'claude' }, { pane: 'pane' }, text, undefined, deps);
+  await assert.rejects(send(), /lost Claude host reply/);
+  const firstChunk = chunkForTyping(text, 200)[0];
+  assert.equal(live.draft, firstChunk, 'the prompt probe was undone and the ambiguous chunk was written once');
+  assert.deepEqual(await send(), { ok: true, delivery: 'received' });
+  assert.equal(live.draft, text);
+  assert.equal(enters, 1);
+});
 
 test('a recovered draft is submitted once, and only while the box still holds exactly it', async () => {
   // The box still holds exactly the message when Enter is pressed, and the receipt

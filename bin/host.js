@@ -21,6 +21,35 @@ const HANDOFF_DRAIN_MS = 2000;
 const COLD_FREEZE_CONCURRENCY = 2;
 const COLD_RESTORE_CONCURRENCY = 4;
 const PANE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const INPUT_OPERATION_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+const INPUT_RECEIPT_LIMIT = 256;
+
+function inputOperationFingerprint(params) {
+  return crypto.createHash('sha256').update(JSON.stringify([
+    String(params.pane || ''), params.expectedPid, params.expectedInputCount,
+    String(params.data || ''), params.auto === true,
+  ])).digest('hex');
+}
+
+function inputReceiptMap(value) {
+  const receipts = new Map();
+  if (value == null) return receipts;
+  if (!Array.isArray(value) || value.length > INPUT_RECEIPT_LIMIT) throw new Error('invalid input receipts in host handoff');
+  for (const item of value) {
+    if (!item || !INPUT_OPERATION_PATTERN.test(String(item.id || ''))
+        || !/^[a-f0-9]{64}$/.test(String(item.fingerprint || ''))
+        || !item.result || typeof item.result !== 'object' || Array.isArray(item.result)) {
+      throw new Error('invalid input receipt in host handoff');
+    }
+    receipts.set(String(item.id), { fingerprint: String(item.fingerprint), result: { ...item.result } });
+  }
+  return receipts;
+}
+
+function rememberInputReceipt(pane, id, fingerprint, result) {
+  pane.inputReceipts.set(id, { fingerprint, result: { ...result } });
+  while (pane.inputReceipts.size > INPUT_RECEIPT_LIMIT) pane.inputReceipts.delete(pane.inputReceipts.keys().next().value);
+}
 
 class RingBuffer {
   constructor(maxBytes = DEFAULT_BUFFER_BYTES) {
@@ -662,6 +691,7 @@ function createHost(options = {}) {
       lastOutputAt: record.lastOutputAt || null,
       lastReadAt: record.lastReadAt || null,
       inputCount: Number.isInteger(record.inputCount) ? record.inputCount : 0,
+      inputReceipts: inputReceiptMap(record.inputReceipts),
       outputCount: Number.isInteger(record.outputCount) ? record.outputCount : 0,
       title: record.title || '',
       // Viewer connections do not survive a reload. Let the first eligible viewer
@@ -823,6 +853,7 @@ function createHost(options = {}) {
         // else, because what the caller is asking about is the pair.
         return { result: {
           version: 1, replaceExited: true, guardedKill: true, compactScreen: true, guardedInput: true,
+          guardedInputReceipts: true,
           bootVersion: options.boot && options.boot.version || null,
           panes: panes.size, pid: process.pid, sock,
           residentTerminals: [...panes.values()].filter((pane) => pane.term).length,
@@ -877,6 +908,22 @@ function createHost(options = {}) {
       case 'input': {
         const pane = needPane(params.pane);
         if (!pane.alive) throw new Error('pane has exited');
+        let operationId = null;
+        let operationFingerprint = null;
+        if (params.operationId !== undefined) {
+          operationId = String(params.operationId || '');
+          if (!INPUT_OPERATION_PATTERN.test(operationId)) throw new Error('invalid input operation id');
+          if (!Number.isInteger(params.expectedInputCount) || !Number.isInteger(params.expectedPid)) {
+            throw new Error('an input operation requires a guarded input');
+          }
+          if (params.auto === true) throw new Error('an input operation cannot be automatic input');
+          operationFingerprint = inputOperationFingerprint(params);
+          const prior = pane.inputReceipts.get(operationId);
+          if (prior) {
+            if (prior.fingerprint !== operationFingerprint) throw new Error('input operation parameters changed');
+            return { result: { ...prior.result } };
+          }
+        }
         // An optional guard for a keystroke that is only safe to send while nothing
         // else has typed into the pane. A caller cannot do this for itself: it would
         // read the count, and a viewer's key could still land before its own write
@@ -894,10 +941,14 @@ function createHost(options = {}) {
             throw new Error('a guarded input requires expectedInputCount and expectedPid as integers');
           }
           if (pane.pty.pid !== params.expectedPid) {
-            return { result: { dropped: true, reason: 'pane replaced', pid: pane.pty.pid, inputCount: pane.inputCount } };
+            const result = { dropped: true, reason: 'pane replaced', pid: pane.pty.pid, inputCount: pane.inputCount };
+            if (operationId) rememberInputReceipt(pane, operationId, operationFingerprint, result);
+            return { result };
           }
           if (pane.inputCount !== params.expectedInputCount) {
-            return { result: { dropped: true, reason: 'input arrived', inputCount: pane.inputCount } };
+            const result = { dropped: true, reason: 'input arrived', inputCount: pane.inputCount };
+            if (operationId) rememberInputReceipt(pane, operationId, operationFingerprint, result);
+            return { result };
           }
         }
         const attachment = pane.attachments.get(connection);
@@ -922,7 +973,9 @@ function createHost(options = {}) {
         pane.lastInputAt = new Date().toISOString();
         pane.inputCount += 1;
         pane.pty.write(Buffer.from(String(params.data || ''), 'base64'));
-        return { result: {} };
+        const result = operationId ? { accepted: true, inputCount: pane.inputCount } : {};
+        if (operationId) rememberInputReceipt(pane, operationId, operationFingerprint, result);
+        return { result };
       }
       case 'resize': {
         const pane = needPane(params.pane);
@@ -1429,6 +1482,7 @@ function createHost(options = {}) {
           lastOutputAt: pane.lastOutputAt,
           lastReadAt: pane.lastReadAt,
           inputCount: pane.inputCount,
+          inputReceipts: [...pane.inputReceipts].map(([id, receipt]) => ({ id, ...receipt })),
           outputCount: pane.outputCount,
           title: pane.title,
           pid: pane.pty.pid,
