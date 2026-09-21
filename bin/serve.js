@@ -2054,7 +2054,10 @@ function sendPrecheck(screen) {
   const lines = String(screen || '').split(/\r?\n/);
   const bottom = lines.slice(-10);
   const hasPrompt = bottom.some((line) => /^\s*❯\s*$/.test(line));
-  const hasModal = /(Enter to select|Enter to confirm|Held message|Esc to cancel)/.test(screen);
+  let promptAt = -1;
+  lines.forEach((line, index) => { if (/^\s*❯(?:\s|$)/.test(line)) promptAt = index; });
+  const hasModal = /(Enter to select|Enter to confirm|Held message|Esc to cancel)/
+    .test(lines.slice(Math.max(0, promptAt)).join('\n'));
   if (hasModal && !hasPrompt) {
     throw new InjectionError(409, 'session is showing a modal; answer or dismiss it before sending a message', {
       screenTail: screenTail(screen),
@@ -2172,8 +2175,8 @@ async function waitForProbeUndo(target, beforeScreen, lastScreen, read, wait, no
     // No prompt line at all is Claude Code mid-render, not an empty input box — the same
     // reading classifyPromptLine takes. It proves nothing, so it only costs a poll.
     const text = line == null ? null : normalizedText(promptText(line));
-    if (text != null && !text) return;
-    if (text === beforeText && cursorAtInputStart(screen, cursor)) return;
+    if (text != null && !text) return { screen, cursor, ghost: false };
+    if (text === beforeText && cursorAtInputStart(screen, cursor)) return { screen, cursor, ghost: true };
     if (text == null || text === SUGGESTION_PROBE_KEY) {
       if (now() - startedAt >= SUGGESTION_PROBE_SETTLE_MS) break;
       continue;
@@ -2193,7 +2196,7 @@ async function probeSuggestion(target, beforeScreen, deps = {}) {
   let precheckError;
   try {
     sendPrecheck(beforeScreen);
-    return;
+    return { kind: 'empty' };
   } catch (error) {
     precheckError = error;
   }
@@ -2212,6 +2215,7 @@ async function probeSuggestion(target, beforeScreen, deps = {}) {
   // Backspace is the only thing that went wrong.
   let failure = null;
   let lastScreen = null;
+  const proof = { kind: 'suggestion', settled: null };
   try {
     try {
       await writeTarget(target, SUGGESTION_PROBE_KEY, deps);
@@ -2251,7 +2255,7 @@ async function probeSuggestion(target, beforeScreen, deps = {}) {
       const outcome = classifyPromptLine(beforeScreen, afterScreen);
       // 'empty' cannot happen here (sendPrecheck already saw text), but an empty box
       // is as safe to type into as a suggestion.
-      if (outcome === 'suggestion' || outcome === 'empty') return;
+      if (outcome === 'suggestion' || outcome === 'empty') return proof;
       const afterText = promptText(promptLine(afterScreen));
       const extra = () => ({
         screenTail: screenTail(afterScreen),
@@ -2307,7 +2311,7 @@ async function probeSuggestion(target, beforeScreen, deps = {}) {
       // later in this same tick, and the caller that is about to type.
       if (undone) {
         try {
-          await waitForProbeUndo(target, beforeScreen, lastScreen, read, wait, now, deps);
+          proof.settled = await waitForProbeUndo(target, beforeScreen, lastScreen, read, wait, now, deps);
         } catch (error) {
           if (failure == null) throw error;
           // A more specific refusal is already on its way out and wins; the unsettled
@@ -2701,25 +2705,39 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
     if (!after || after.pid !== before.pid || after.inputCount !== before.inputCount) {
       throw new InjectionError(409, 'input arrived while a partial delivery was checked; no key was pressed');
     }
+    const screenLines = stripTerminalAnsi(screen).split(/\r?\n/);
+    const promptPattern = deps.draftKind === 'codex' ? /^\s*›(?:\s|$)/ : /^\s*❯(?:\s|$)/;
+    let activeStart = -1;
+    screenLines.forEach((line, index) => { if (promptPattern.test(line)) activeStart = index; });
+    const activeRegion = screenLines.slice(Math.max(0, activeStart)).join('\n');
     const modal = deps.draftKind === 'codex'
-      ? CODEX_DIALOG_MARKERS.some((marker) => screen.includes(marker))
-      : Boolean(claudePrompts.recognize(screen)?.live)
-        || /(Enter to select|Enter to confirm|Held message|Esc to cancel)/.test(screen);
+      ? CODEX_DIALOG_MARKERS.some((marker) => activeRegion.includes(marker))
+      : Boolean(claudePrompts.recognize(activeRegion)?.live)
+        || /(Enter to select|Enter to confirm|Held message|Esc to cancel)/.test(activeRegion);
     if (modal) throw new InjectionError(409, 'the session is showing a modal; partial delivery was not resumed');
     const wanted = alternate && before.inputCount === alternate.count ? alternate.text : expectedText;
     if (empty && !wanted) {
-      const check = deps.draftKind === 'codex' ? codexSendPrecheck : sendPrecheck;
-      check(screen);
-      if (deps.draftKind !== 'codex' && promptText(promptLine(screen)) !== '') {
-        throw new InjectionError(409, 'the input box was not empty; message was not typed');
+      if (deps.draftKind === 'codex') codexSendPrecheck(screen);
+      else {
+        const visibleText = promptText(promptLine(screen));
+        if (visibleText) {
+          const proof = deps.promptProof;
+          const sameProbeState = proof?.kind === 'suggestion' && proof.settled?.ghost === true
+            && proof.stable?.pid === before.pid && proof.stable?.inputCount === before.inputCount
+            && normalizedText(promptText(promptLine(proof.settled.screen))) === normalizedText(visibleText)
+            && cursorAtInputStart(screen, snapshot?.cursor);
+          if (!sameProbeState) {
+            throw new InjectionError(409, 'the input box was not empty; message was not typed');
+          }
+        } else sendPrecheck(screen);
       }
     } else {
       if (!draftIsExactly(screen, wanted, deps.draftKind)
           && !renderedDraftMatches(screen, wanted, deps.draftKind)) {
         throw new InjectionError(409, 'the partial delivery draft changed; no key was pressed');
       }
-      const lines = stripTerminalAnsi(screen).split(/\r?\n/);
-      const prompt = deps.draftKind === 'codex' ? /^\s*›(?:\s|$)/ : /^\s*❯(?:\s|$)/;
+      const lines = screenLines;
+      const prompt = promptPattern;
       let start = -1;
       lines.forEach((line, index) => { if (prompt.test(line)) start = index; });
       let end = start;
@@ -5386,8 +5404,8 @@ async function closeIdleSession(body, deps = {}) {
 
 async function precheckSessionTarget(session, target, deps = {}) {
   const screen = await (deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps)))(target, 30, false);
-  if (session.kind === 'codex') codexSendPrecheck(screen);
-  else await probeSuggestion(target, screen, deps);
+  if (session.kind === 'codex') { codexSendPrecheck(screen); return { kind: 'empty' }; }
+  return probeSuggestion(target, screen, deps);
 }
 
 function sessionLastTurn(session, deps = {}) {
@@ -6086,8 +6104,25 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
     if (settled) trace('terminal-evidence-confirmed', { evidence: 'claude-mcp-menu' });
     return settled;
   } : null;
+  let promptProof = null;
+  const bindPromptProof = async (proof) => {
+    if (proof?.kind !== 'suggestion') return proof;
+    const before = await livePaneState(target.pane, deps);
+    const snapshot = deps.readScreenResult
+      ? await deps.readScreenResult(target, 200, false)
+      : await readScreenResult(target, 200, false, deps);
+    const after = await livePaneState(target.pane, deps);
+    const screen = String(snapshot?.text || '');
+    if (!before || !after || before.pid !== after.pid || before.inputCount !== after.inputCount
+        || !cursorAtInputStart(screen, snapshot?.cursor)
+        || normalizedText(promptText(promptLine(screen)))
+          !== normalizedText(promptText(promptLine(proof.settled?.screen)))) {
+      throw new InjectionError(409, 'the input box changed after the prompt probe; message was not typed');
+    }
+    return { ...proof, stable: { pid: after.pid, inputCount: after.inputCount, screen } };
+  };
   const precheck = async () => {
-  await precheckSessionTarget(session, target, deps);
+  promptProof = await bindPromptProof(await precheckSessionTarget(session, target, deps));
   if (opts && opts.compactIfCold && !session.reviewer) {
     const ttlMs = envNumber('KEEP_CACHE_TTL_MIN', 60) * 60e3;
     const minTokens = envNumber('KEEP_COMPACT_MIN_TOKENS', 80000);
@@ -6098,7 +6133,7 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
       if (afterCompactAction(result) === 'defer') {
         throw new InjectionError(409, 'compaction still in progress; deliver later');
       }
-      await precheckSessionTarget(session, target, deps);
+      promptProof = await bindPromptProof(await precheckSessionTarget(session, target, deps));
     }
   }
   };
@@ -6147,7 +6182,7 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
           }
         }
         return typeAndSubmit(target, text, confirmation, {
-          ...deps, deliveryTrace: trace, draftKind: session.kind, typingProgress,
+          ...deps, deliveryTrace: trace, draftKind: session.kind, typingProgress, promptProof,
         });
       },
       submitDraft: async () => {

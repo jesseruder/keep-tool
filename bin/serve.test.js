@@ -86,6 +86,7 @@ const {
   classifyPromptLine,
   probeSuggestion,
   sendPrecheck,
+  SUGGESTION_PROBE_KEY,
   SUGGESTION_PROBE_MAX_READS,
   SUGGESTION_PROBE_SETTLE_READS,
   isHostTarget,
@@ -5266,18 +5267,35 @@ test('handoff continuation receipts are bound to the staged target transcript', 
     accountId: 'target', transactionId: 'tx-handoff', agentPid: 41, agentPidStart: 'agent-start',
     ownsPane: true, sessionStartedAt: 200 };
   let draft = '';
+  let inputCount = 0;
+  const inputReceipts = new Map();
   const host = recordingHost((type, params) => {
+    if (type === 'hello') return { guardedInput: true, guardedInputReceipts: true };
     if (type === 'list') return { panes: [{ id: 'pane-target', alive: true,
-      agentAlive: true, pid: 40, createdAt: 100,
+      agentAlive: true, pid: 40, inputCount, createdAt: 100,
       meta: { sessionId: sid, agent: 'claude', accountId: 'target', handoffTransactionId: 'tx-handoff' } }] };
-    if (type === 'screen') return { text: `────────────────────\n❯ ${draft}`, cursor: { x: draft.length + 2, y: 1 } };
+    if (type === 'screen') return { text: `────────────────────\n❯ ${draft}\n────────────────────`, cursor: { x: draft.length + 2, y: 1 } };
     if (type === 'input') {
       const value = Buffer.from(params.data, 'base64').toString();
+      if (params.operationId && inputReceipts.has(params.operationId)) return inputReceipts.get(params.operationId);
+      if (params.expectedPid !== undefined && params.expectedPid !== 40) {
+        return { dropped: true, reason: 'pane replaced', pid: 40, inputCount };
+      }
+      if (params.expectedInputCount !== undefined && params.expectedInputCount !== inputCount) {
+        return { dropped: true, reason: 'input arrived', inputCount };
+      }
+      inputCount += 1;
       if (value === '\r') {
         fs.appendFileSync(targetFile, JSON.stringify({ type: 'user', sessionId: sid,
           message: { content: draft } }) + '\n');
         draft = '';
-      } else draft += value;
+      } else if (value === '\x7f') draft = draft.slice(0, -1);
+      else draft += value;
+      if (params.operationId) {
+        const result = { accepted: true, inputCount };
+        inputReceipts.set(params.operationId, result);
+        return result;
+      }
     }
     return {};
   });
@@ -5326,19 +5344,35 @@ test('Codex handoff continuation uses only the exact staged target rollout', asy
     accountId: 'codex-target', transactionId: 'codex-delivery', agentPid: 51,
     agentPidStart: 'codex-agent-start', ownsPane: true, sessionStartedAt: 400 };
   let draft = '';
+  let inputCount = 0;
+  const inputReceipts = new Map();
   const host = recordingHost((type, params) => {
+    if (type === 'hello') return { guardedInput: true, guardedInputReceipts: true };
     if (type === 'list') return { panes: [{ id: 'pane-codex-target', alive: true,
-      agentAlive: true, pid: 50, createdAt: 300,
+      agentAlive: true, pid: 50, inputCount, createdAt: 300,
       meta: { sessionId: sid, agent: 'codex', accountId: 'codex-target', handoffTransactionId: 'codex-delivery' } }] };
     if (type === 'screen') return { text: draft ? `› ${draft}` : '› Ask Codex to do anything',
       cursor: { x: draft.length + 2, y: 0 } };
     if (type === 'input') {
       const value = Buffer.from(params.data, 'base64').toString();
+      if (params.operationId && inputReceipts.has(params.operationId)) return inputReceipts.get(params.operationId);
+      if (params.expectedPid !== undefined && params.expectedPid !== 50) {
+        return { dropped: true, reason: 'pane replaced', pid: 50, inputCount };
+      }
+      if (params.expectedInputCount !== undefined && params.expectedInputCount !== inputCount) {
+        return { dropped: true, reason: 'input arrived', inputCount };
+      }
+      inputCount += 1;
       if (value === '\r') {
         fs.appendFileSync(targetFile, JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'user',
           content: [{ type: 'input_text', text: draft }] } }) + '\n');
         draft = '';
       } else draft += value;
+      if (params.operationId) {
+        const result = { accepted: true, inputCount };
+        inputReceipts.set(params.operationId, result);
+        return result;
+      }
     }
     return {};
   });
@@ -6207,10 +6241,11 @@ test('a lost chunk acknowledgement resumes a resolved Claude send after its prom
   const receipts = new Map();
   let ambiguousReplies = 2;
   let enters = 0;
-  const screen = () => BOX(live.draft);
+  const suggestion = 'continue checking the rollout';
+  const screen = () => `Old assistant advice: Esc to cancel\n${BOX(live.draft || suggestion)}`;
   const host = recordingHost(async (type, params) => {
     if (type === 'hello') return { guardedInput: true, guardedInputReceipts: true };
-    if (type === 'screen') return { text: screen(), cursor: { x: live.draft.length + 2, y: 1 }, cols: 500, rows: 3 };
+    if (type === 'screen') return { text: screen(), cursor: { x: live.draft.length + 2, y: 2 }, cols: 500, rows: 4 };
     if (type !== 'input') return {};
     const value = Buffer.from(params.data, 'base64').toString();
     if (params.expectedInputCount === undefined) {
@@ -6238,7 +6273,7 @@ test('a lost chunk acknowledgement resumes a resolved Claude send after its prom
   });
   const deps = {
     host, deliveryDirectory: directory, transcriptFileForSession: () => file,
-    readScreen: async () => screen(), sleep: async () => {}, now: (() => { let n = 0; return () => ++n * 100; })(),
+    sleep: async () => {}, now: (() => { let n = 0; return () => ++n * 100; })(),
     listHostPanes: async () => [{ id: 'pane', pid: live.pid, inputCount: live.inputCount }],
     loadDeliverySession: (id) => ({ id, endedTurn: true }),
   };

@@ -254,7 +254,20 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
           fs.writeFileSync(temp, JSON.stringify(entry), { mode: 0o600 });
           fs.renameSync(temp, journal);
         };
-        await type(typingProgress(entry, writeJournal));
+        try {
+          await type(typingProgress(entry, writeJournal));
+        } catch (error) {
+          // A resumed attempt may finish the remaining chunks and then abort at a
+          // beforeEnter guard. The atomic draft clear proves none of the partial
+          // message remains, so keeping its old counts would wedge every later send.
+          if (error?.typingStarted && error.draftCleared) {
+            trace('typed-draft-cleared');
+            try { fs.unlinkSync(journal); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+          }
+          // In particular, `nothingTyped` by itself is not cleanup evidence here:
+          // earlier acknowledged chunks still belong to this journal.
+          throw error;
+        }
         entry.typedAt = Date.now();
         writeJournal();
         trace('partial-resume-ok');

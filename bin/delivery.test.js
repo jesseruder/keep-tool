@@ -537,3 +537,36 @@ test('partial chunk progress is durable, resumable only for the same send, and n
     assert.deepEqual(await deliver({ ...base, type }), { ok: true, delivery: 'received' });
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('partial resume removes a proven cleared draft but preserves evidence when only the retry typed nothing', async () => {
+  const { textHash } = require('./delivery');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-partial-clear-'));
+  const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+  const seed = async (sessionId, directory) => {
+    const base = { session: { id: sessionId, kind: 'codex' }, pane: 'pane', text: 'abcdef', file, directory,
+      precheck: async () => {}, submitDraft: async () => assert.fail('unexpected Enter'),
+      draftMatches: async () => false, pause: async () => {}, attempts: 1 };
+    await assert.rejects(deliver({ ...base, type: async (progress) => {
+      progress.plan({ pid: 42, initialInputCount: 7, chunkChars: 3, chunkCount: 2,
+        operationSeed: `delivery_${sessionId.padEnd(16, '0')}` });
+      progress.start(0);
+      progress.acknowledge(0, textHash('abc'));
+      throw new Error('stop between chunks');
+    } }), /stop between chunks/);
+    return { base, journal: path.join(directory, `${textHash(sessionId)}.json`) };
+  };
+  try {
+    const cleared = await seed('cleared', path.join(dir, 'cleared'));
+    await assert.rejects(deliver({ ...cleared.base, type: async () => {
+      throw Object.assign(new Error('guard moved; draft cleared'), { typingStarted: true, draftCleared: true });
+    } }), /draft cleared/);
+    assert.equal(fs.existsSync(cleared.journal), false, 'an exact guarded clear releases the stale partial plan');
+
+    const untouched = await seed('untouched', path.join(dir, 'untouched'));
+    await assert.rejects(deliver({ ...untouched.base, type: async () => {
+      throw Object.assign(new Error('retry typed nothing'), { nothingTyped: true });
+    } }), /typed nothing/);
+    assert.equal(fs.existsSync(untouched.journal), true,
+      'nothingTyped on a retry does not erase chunks acknowledged by the earlier attempt');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
