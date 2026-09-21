@@ -607,12 +607,42 @@ function routes(ctx) {
         // Each call locks only its own session and pane (compaction also the model
         // key); a collision there is the same 429 the global lock used to return.
         const sessionId = body && body.sessionId;
+        // An Open from the console Queue's Inbox row: the card must still be in the
+        // inbox, or nothing launches (another tab may have closed or started it
+        // while the chooser was up). A launch that succeeds moves it to active, so
+        // the row leaves the inbox and its Done and Dismiss can no longer close a
+        // card that now has a session working on it. The move is guarded on the
+        // card still being inbox, under the registry lock.
+        const fromInbox = url.pathname === '/api/open' && body && body.fromInbox === true;
+        if (fromInbox) {
+          if (typeof body.taskId !== 'string' || !body.taskId) return json(res, 400, { error: 'an inbox open needs a card id' });
+          let card = null;
+          try { card = keep.loadTask(body.taskId); } catch {}
+          if (!card) return json(res, 400, { error: 'no task' });
+          if (card.fm.status !== 'inbox') {
+            return json(res, 409, { error: `${body.taskId} is ${card.fm.status || 'unset'}, not inbox`, code: 'NOT_INBOX' });
+          }
+          delete body.fromInbox;
+        }
         try {
           const result = url.pathname === '/api/open' ? await openSession(body)
             : url.pathname === '/api/send' ? await sendToSessionLocked(body)
               : url.pathname === '/api/compact'
                 ? await withInjectionLock(() => compactSessionById(body), { session: sessionId, model: true })
                 : await withInjectionLock(() => answerSession(body), { session: sessionId });
+          if (fromInbox) {
+            try {
+              keep.checkinTask(body.taskId, {
+                message: 'opened from console inbox', status: 'active', expectStatus: 'inbox',
+                heading: 'console', linkSession: false,
+              });
+            } catch (error) {
+              // Closed or started elsewhere while the session launched: the session
+              // stands, and the card keeps the status the other writer gave it.
+              if (error?.code !== 'STATUS_CHANGED') throw error;
+              result.statusWarning = error.message;
+            }
+          }
           broadcast();
           return json(res, 200, result);
         } catch (e) {

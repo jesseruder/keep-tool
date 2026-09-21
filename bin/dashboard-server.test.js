@@ -7,7 +7,7 @@ const http = require('node:http');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync, spawn } = require('node:child_process');
+const { execFileSync, spawn, spawnSync } = require('node:child_process');
 
 async function freePort() {
   const server = net.createServer();
@@ -189,4 +189,83 @@ test('real dashboard routes use the worker snapshot across full, console, mobile
   assert.equal(card('route-card'), before, 'a refused card is left exactly as it was');
   assert.equal((await inbox({ id: 'inbox-done', action: 'dismiss' })).status, 409, 'closing twice is refused');
   assert.equal((await inbox({ id: 'no-such-card', action: 'done' })).status, 400);
+
+  // An Open from an Inbox row on a card that has left the inbox is refused
+  // before anything launches: no pane, no session link, the card untouched.
+  const doneBefore = card('inbox-done');
+  const opened = await request(port, '/api/open', { method: 'POST', headers: { 'x-keep': '1' },
+    body: { taskId: 'inbox-done', fresh: true, agent: 'claude', fromInbox: true } });
+  assert.equal(opened.status, 409, JSON.stringify(opened.body));
+  assert.match(opened.body.error, /inbox-done is done, not inbox/);
+  assert.equal(card('inbox-done'), doneBefore, 'a refused open leaves the card as it was');
+});
+
+// The successful half of an Inbox Open needs a launch, which needs a terminal
+// host; the route is driven directly with a stand-in launcher instead, against a
+// real registry, so the status move is the one the daemon makes.
+test('an Open from the console inbox moves the card to active once the session launches', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-inbox-open-'));
+  try {
+    for (const dir of ['tasks', 'archive', 'digests', '.keep']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    fs.writeFileSync(path.join(root, 'digests', '.keep'), '');
+    const git = (...args) => execFileSync('git', ['-C', root, ...args], { stdio: 'ignore' });
+    git('init', '-q');
+    git('config', 'user.name', 'Keep Test');
+    git('config', 'user.email', 'keep@example.invalid');
+    git('commit', '-q', '--allow-empty', '-m', 'init');
+    for (const [id, status] of [['fresh-idea', 'inbox'], ['taken', 'inbox'], ['closed', 'done']]) {
+      fs.writeFileSync(path.join(root, 'tasks', `${id}.md`), [
+        '---', `title: ${id}`, `status: ${status}`, 'kind: idea', 'tags: []', 'project: ""',
+        'check_after: ""', 'check: ""', 'sessions: []', 'depends_on: []',
+        'created: 2026-01-01', 'updated: 2026-01-01T00:00', '---', '', '## 2026-01-01 00:00 — created', 'An idea.', '',
+      ].join('\n'));
+    }
+    const script = `
+      const assert = require('node:assert/strict');
+      const fs = require('node:fs');
+      const path = require('node:path');
+      const keep = require('./keep.js');
+      const { routes, matchRoute } = require('./serve/routes.js');
+      const launches = [];
+      let during = null;
+      const openSession = async (body) => { launches.push({ ...body }); if (during) during(); return { ok: true, pane: 'pane-1' }; };
+      class InjectionError extends Error {}
+      const list = routes({ keep, openSession, InjectionError, broadcast: () => {}, json: (res, status, value) => ({ status, value }) });
+      const url = new URL('http://x/api/open');
+      const post = (body) => matchRoute(list, { req: { method: 'POST', headers: {} }, url, body })
+        .handle({ req: { method: 'POST', headers: {} }, res: {}, url, body });
+      const card = (id) => fs.readFileSync(path.join(keep.ROOT, 'tasks', id + '.md'), 'utf8');
+      (async () => {
+        const opened = await post({ taskId: 'fresh-idea', fresh: true, agent: 'claude', fromInbox: true });
+        assert.equal(opened.status, 200, JSON.stringify(opened.value));
+        assert.equal(launches.length, 1);
+        assert.equal(launches[0].fromInbox, undefined, 'the launcher never sees the flag');
+        assert.match(card('fresh-idea'), /^status: active$/m);
+        assert.match(card('fresh-idea'), /— console → active\\nopened from console inbox$/m);
+
+        const refused = await post({ taskId: 'closed', fresh: true, agent: 'claude', fromInbox: true });
+        assert.equal(refused.status, 409);
+        assert.equal(launches.length, 1, 'nothing launches for a card that left the inbox');
+        assert.match(card('closed'), /^status: done$/m);
+
+        // Closed elsewhere while the session launched: the launch stands and
+        // the other writer's status wins.
+        during = () => keep.checkinTask('taken', { message: 'closed elsewhere', status: 'done', linkSession: false });
+        const raced = await post({ taskId: 'taken', fresh: true, agent: 'claude', fromInbox: true });
+        assert.equal(raced.status, 200);
+        assert.match(raced.value.statusWarning, /taken is done, not inbox/);
+        assert.match(card('taken'), /^status: done$/m);
+        assert.doesNotMatch(card('taken'), /opened from console inbox/);
+
+        // Without the flag, /api/open is what it always was.
+        during = null;
+        assert.equal((await post({ taskId: 'closed', fresh: true, agent: 'claude' })).status, 200);
+        assert.match(card('closed'), /^status: done$/m);
+      })().catch((error) => { console.error(error); process.exit(1); });
+    `;
+    const result = spawnSync(process.execPath, ['-e', script], {
+      cwd: __dirname, encoding: 'utf8', env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_ALERT_CHANNELS: 'none' },
+    });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

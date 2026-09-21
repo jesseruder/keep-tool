@@ -391,6 +391,9 @@ function knownProjects() {
   };
   for (const session of data.sessions || []) add(session.project);
   for (const pane of data.panes || []) add(pane.meta?.project || pane.cwd);
+  // The Queue lists inbox cards too, so a project whose only open work is an
+  // inbox card has to be filterable (the rail and the phone's filter sheet).
+  for (const task of data.tasks || []) if (task.fm?.status === 'inbox') add(task.fm.project);
   return [...values.values()].sort((a, b) => a.scope.localeCompare(b.scope) || a.name.localeCompare(b.name));
 }
 function projectHTML(projectPath, large = false) {
@@ -650,7 +653,7 @@ async function newSession(cwd, name, onOpened) {
     refresh();
   }
 }
-async function reopenSession({ sessionId, taskId, agent, title, stalePane, project }) {
+async function reopenSession({ sessionId, taskId, agent, title, stalePane, project, fromInbox = false }) {
   const session = sessionId ? data.sessions.find((candidate) => candidate.id === sessionId) : null;
   const pane = stalePane ? paneMap().get(stalePane) : null;
   const provider = agent || session?.kind || pane?.meta?.agent;
@@ -672,7 +675,10 @@ async function reopenSession({ sessionId, taskId, agent, title, stalePane, proje
       const operation = (async () => {
         const request = freshCard
           ? { taskId, fresh: true, agent: selection.agent, accountId: selection.accountId, requestId,
-            ...(selection.model ? { model: selection.model } : {}) }
+            ...(selection.model ? { model: selection.model } : {}),
+            // From the Queue's Inbox: refused unless the card is still in the
+            // inbox, and moved to active once the session launches.
+            ...(fromInbox ? { fromInbox: true } : {}) }
           : { sessionId, agent: provider, accountId: selection.accountId };
         let result;
         try {

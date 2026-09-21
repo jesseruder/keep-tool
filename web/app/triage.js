@@ -476,8 +476,12 @@ export function renderRail(ctx, items) {
   const agentProjects = new Set((ctx.data.agents || [])
     .filter((agent) => matchesAgentTriageFilters(ctx, agent, false))
     .map((agent) => agentProject(ctx, agent)).filter(Boolean).map((path) => ctx.projectOf(path).key));
+  // A project with inbox cards is listed so its cards can be filtered to, but
+  // the counts stay what they were: sessions waiting on you, "All" included.
+  const inboxProjects = new Set((ctx.data.tasks || []).filter((task) => task.fm?.status === 'inbox' && task.fm.project)
+    .map((task) => ctx.projectOf(task.fm.project).key));
   const projects = ctx.knownProjects().filter((project) => counts.has(project.key)
-    || agentProjects.has(project.key) || project.key === ctx.state.filter);
+    || agentProjects.has(project.key) || inboxProjects.has(project.key) || project.key === ctx.state.filter);
   const collapsed = ctx.state.collapsed.rail;
   const row = (project) => `<button data-project="${ctx.esc(project.key)}" class="${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}">${ctx.projectIcon(project)}<span>${ctx.esc(project.name)}</span><span class="c ${counts.get(project.key) ? 'hot' : ''}">${counts.get(project.key) || ''}</span></button>`;
   const dot = (project) => `<button data-project="${ctx.esc(project.key)}" class="rail-dot ${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}" title="${ctx.esc(project.name)}">${ctx.projectIcon(project)}</button>`;

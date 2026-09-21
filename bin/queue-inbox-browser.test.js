@@ -19,6 +19,7 @@ test('isolated browser: the Queue lists inbox cards, opens their notes, and clos
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-queue-inbox-browser-'));
   const detailGets = [];
   const posts = [];
+  const opens = [];
   const eventClients = new Set();
   const card = (id, fm, body) => ({ id, fm: { tags: [], sessions: [], ...fm }, body, lastLog: '' });
   // A title with no spaces is the worst case for a 390px row.
@@ -46,6 +47,16 @@ test('isolated browser: the Queue lists inbox cards, opens their notes, and clos
       const kind = url.searchParams.get('kind'); const id = url.searchParams.get('id');
       detailGets.push(`${kind}:${id}`);
       send(200, dashboardDetail(state, kind, id));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/open') {
+      let body = ''; req.on('data', (chunk) => { body += chunk; }); req.on('end', () => {
+        const request = JSON.parse(body); opens.push(request);
+        const task = state.tasks.find((candidate) => candidate.id === request.taskId);
+        if (request.fromInbox && task?.fm.status !== 'inbox') { send(409, { error: `${request.taskId} is ${task?.fm.status}, not inbox` }); return; }
+        if (request.fromInbox) task.fm.status = 'active';
+        send(200, { ok: true, pane: 'no-such-pane' });
+      });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/inbox-card') {
@@ -113,14 +124,44 @@ test('isolated browser: the Queue lists inbox cards, opens their notes, and clos
     await evaluate("document.querySelector('[data-launch-cancel]').click()");
     await wait("!document.querySelector('.session-launch-card')");
 
-    // ── Done closes the card, and the section count follows.
-    await evaluate("document.querySelector('#qlist .qinbox[data-card=\"middle-task\"] [data-inbox-action=done]').click()");
-    await wait("document.querySelectorAll('#qlist .qinbox').length === 2");
-    assert.deepEqual(posts, [{ id: 'middle-task', action: 'done' }]);
+    // ── Submitted, Open starts the session with the inbox guard, and the card
+    // leaves the inbox for active.
+    await evaluate("document.querySelector('#qlist .qinbox[data-card=\"older-bug\"] .qinbox-main').click()");
+    await wait("document.querySelector('#qlist .qinbox[data-card=\"older-bug\"] [data-inbox-open]')");
+    await evaluate("document.querySelector('#qlist .qinbox[data-card=\"older-bug\"] [data-inbox-open]').click()");
+    await wait("document.querySelector('.session-launch-card [data-launch-submit]:not([disabled])')");
+    await evaluate("document.querySelector('.session-launch-card').requestSubmit()");
+    await wait("!document.querySelector('#qlist .qinbox[data-card=\"older-bug\"]')");
+    assert.equal(opens.length, 1);
+    assert.deepEqual([opens[0].taskId, opens[0].fresh, opens[0].fromInbox], ['older-bug', true, true]);
+    await wait("!document.querySelector('.session-launch-card')");
     await wait("document.querySelector('#qlist .qinbox-head').textContent.trim() === '▾ Inbox · 2'");
+
+    // ── Done closes the card, and the section count follows.
+    await evaluate("document.querySelector('#qlist .qinbox[data-card=\"middle-task\"] .qinbox-main').click()");
+    await wait("document.querySelector('#qlist .qinbox[data-card=\"middle-task\"] [data-inbox-action=done]')");
+    await evaluate("document.querySelector('#qlist .qinbox[data-card=\"middle-task\"] [data-inbox-action=done]').click()");
+    await wait("document.querySelectorAll('#qlist .qinbox').length === 1");
+    assert.deepEqual(posts, [{ id: 'middle-task', action: 'done' }]);
+    await wait("document.querySelector('#qlist .qinbox-head').textContent.trim() === '▾ Inbox · 1'");
 
     // ── Reloaded, the section stays expanded.
     await call('Page.navigate', { url: `${origin}/` });
+    await wait("document.querySelectorAll('#qlist .qinbox').length === 1");
+
+    // ── A project whose only open work is an inbox card is in the rail, with no
+    // session count, and filtering to it narrows the Inbox.
+    state.tasks.push(card('beta-idea', { title: 'Beta only idea', status: 'inbox', kind: 'idea', project: '/tmp/inbox-beta', updated: '2026-09-19T10:00' }, 'Beta.\n'));
+    await call('Page.navigate', { url: `${origin}/` });
+    await wait("document.querySelectorAll('#qlist .qinbox').length === 2");
+    const railProjects = "[...document.querySelectorAll('#rail [data-project]:not(.all)')].map(node=>node.textContent.trim())";
+    assert.deepEqual(await evaluate(railProjects), ['inbox-alpha', 'inbox-beta'], 'inbox-only projects are listed');
+    assert.equal(await evaluate("document.querySelector('#rail .all .c').textContent"), '0', 'All still counts sessions only');
+    await evaluate("[...document.querySelectorAll('#rail [data-project]')].find(node=>node.textContent.trim()==='inbox-beta').click()");
+    await wait("document.querySelectorAll('#qlist .qinbox').length === 1");
+    assert.deepEqual(await evaluate(rows), ['beta-idea']);
+    assert.equal(await evaluate("document.querySelector('#qlist .qinbox-head').textContent.trim()"), '▾ Inbox · 1');
+    await evaluate("document.querySelector('#rail [data-project=\"\"]').click()");
     await wait("document.querySelectorAll('#qlist .qinbox').length === 2");
 
     // ── A 390px phone: the queue is the screen, and nothing scrolls sideways,
@@ -129,6 +170,8 @@ test('isolated browser: the Queue lists inbox cards, opens their notes, and clos
     await call('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
     await call('Page.navigate', { url: `${origin}/?mobile=1` });
     await wait("document.documentElement.classList.contains('mobile') && document.querySelectorAll('#qlist .qinbox').length === 2");
+    // The filter sheet is the rail, borrowed: the inbox-only project is there too.
+    assert.ok((await evaluate("[...document.querySelectorAll('#mobileFilterSheet [data-project]')].map(node=>node.textContent.trim())")).includes('inbox-beta'));
     await evaluate("document.querySelector('#qlist .qinbox[data-card=\"newest-idea\"] .qinbox-main').click()");
     await wait("document.querySelector('#qlist .qinbox[data-card=\"newest-idea\"] .qinbox-detail pre')?.textContent.includes('Pattern')");
     assert.equal(await evaluate("document.documentElement.classList.contains('mobile-stage-open')"), false, 'a card row does not push the stage');

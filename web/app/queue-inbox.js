@@ -6,7 +6,8 @@
 // so the phone does not push the stage for it. Clicking a row opens the card's
 // notes in place through the same /api/dashboard-detail path the stage and the
 // inbox dialog use; the notes carry Open (the console's open-card chooser, which
-// starts a session through /api/open), Done and Dismiss.
+// starts a session through /api/open and moves the card to active), Done and
+// Dismiss.
 import { closeInboxCard } from './api.js';
 
 const EXPANDED_KEY = 'keep.console.inbox.expanded';
@@ -101,8 +102,8 @@ function install(ctx, row) {
     } else if (button.hasAttribute('data-inbox-open')) {
       if (button.disabled) return;
       button.disabled = true;
-      try { await ctx.reopenSession({ taskId: id, title: task.fm?.title || id, project: task.fm?.project }); }
-      finally { button.disabled = false; }
+      try { await ctx.reopenSession({ taskId: id, title: task.fm?.title || id, project: task.fm?.project, fromInbox: true }); }
+      finally { button.disabled = false; await ctx.reload(); }
     } else if (button.dataset.inboxAction) {
       if (button.disabled) return;
       button.disabled = true;
