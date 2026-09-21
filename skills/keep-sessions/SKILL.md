@@ -129,6 +129,9 @@ keep delegate <card> --step <n> -- keep pi task --background --model opencode-go
 Omit `--model` to use Pi's configured default. For work without a plan, use
 `keep pi task --background` directly. Capture the job id, inspect
 `keep pi status <job> --json`, and retrieve `keep pi result <job>` when it finishes.
+Track the job until it reaches a terminal status; use a harness-tracked background
+watcher when available. Do not report the delegated task complete just because the
+launch command returned.
 The parent records the outcome on its card. A queued or running job is not a result;
 inspect failed jobs before retrying. Use `keep pi cancel <job>` to stop a worker.
 Pi workers do not accept `keep tell`; a follow-up uses a new scoped task with the
