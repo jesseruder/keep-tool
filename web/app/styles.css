@@ -188,6 +188,21 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .qdis-head:hover { color: var(--text); }
 .qdis { display: grid; grid-template-columns: 4px 1fr auto; gap: 0 10px; padding: 8px 12px 8px 10px; border-top: 1px solid var(--line); opacity: .7; align-items: center; }
 .qdis .stripe { grid-row: 1 / span 2; border-radius: 2px; background: hsl(var(--h) 60% var(--pj-dot-l)); align-self: stretch; } .qdis .t { overflow: hidden; text-overflow: ellipsis; } .qdis .p { grid-column: 2; }
+/* The Queue's Inbox: cards, not sessions. The row is one button; its notes and
+   actions open beneath it. */
+.qinbox { border-top: 1px solid var(--line); border-left: 3px solid transparent; }
+.qinbox.open { border-left-color: hsl(var(--h) 60% var(--pj-dot-l)); background: var(--panel-2); }
+.qinbox-main { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; width: 100%; min-width: 0; padding: 9px 12px 9px 11px; text-align: left; }
+.qinbox-main:hover { background: var(--panel-2); }
+.qinbox-main .t { min-width: 0; color: var(--text); font-weight: 500; overflow-wrap: anywhere; }
+.qinbox-main .w { color: var(--faint); font: 11px var(--mono); white-space: nowrap; }
+.qinbox-main .p { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 0; grid-column: 1 / span 2; min-width: 0; color: var(--muted); font-size: 11.5px; }
+.qinbox-main .pj { background: transparent; padding: 0; color: var(--muted); }
+.kind.card-kind.idea { color: var(--violet); } .kind.card-kind.bug { color: var(--bad); } .kind.card-kind.experiment { color: var(--info); }
+.qinbox-detail { padding: 0 12px 12px 11px; min-width: 0; }
+.qinbox-id { color: var(--faint); font-size: 11px; overflow-wrap: anywhere; }
+.qinbox-detail pre { max-height: 240px; overflow: auto; margin: 6px 0 10px; padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--panel); border: 1px solid var(--line); border-radius: 5px; font: 11.5px/1.5 var(--mono); }
+.qinbox-acts { display: flex; flex-wrap: wrap; gap: 6px; }
 .qempty { padding: 40px 20px; color: var(--muted); text-align: center; } .qempty b { display: block; color: var(--text); font-size: 15px; margin-bottom: 6px; }
 
 .stage { flex: 1 1 480px; min-width: 480px; display: flex; flex-direction: column; background: var(--term-bg); } .stage-empty { margin: auto; }
@@ -771,6 +786,8 @@ html.mobile.mobile-stage-open #triage .mobile-stagebar {
 html.mobile .qitem { min-height: 60px; align-content: center; padding: 12px 12px 12px 8px; }
 html.mobile .qhead.qgroup.qtoggle, html.mobile .qdis-head, html.mobile .qfocus { min-height: 48px; }
 html.mobile .qdis { min-height: 52px; padding: 10px 12px 10px 10px; }
+html.mobile .qinbox-main { min-height: 60px; padding: 12px 12px 12px 11px; }
+html.mobile .qinbox-acts .btn { min-height: 44px; flex: 1 1 0; justify-content: center; }
 html.mobile .qdis .btn, html.mobile .shead .btn, html.mobile .brief .btn,
 html.mobile .session-actions > summary, html.mobile .session-actions-content .btn,
 html.mobile .account-handoff > summary, html.mobile .term-handoff-open,

@@ -301,6 +301,29 @@ test('console state keeps only the top-level fields the console renders', () => 
   assert.equal(JSON.stringify(state), before, 'source state is not mutated');
 });
 
+// The Queue's Inbox section renders its rows from the projection alone: nothing
+// it shows may be one of the fields the console strips.
+test('console state carries what an Inbox row shows for an inbox card', () => {
+  const projected = consoleState({ tasks: [
+    { id: 'idea-card', fm: { title: 'Reviewer idea: Claims', status: 'inbox', kind: 'idea', project: '~/castle/keep-tool',
+      updated: '2026-09-20T10:00', created: '2026-09-20', tags: ['reviewer-idea'] },
+    body: '## 2026-09-20 10:00 — created\nThe proposal.', lastLog: 'The proposal.' },
+    { id: 'bug-card', fm: { title: 'Crash on open', status: 'inbox', kind: 'bug', project: '/repo', updated: '2026-09-19T09:00' },
+      body: '', lastLog: '' },
+  ] });
+  const byId = Object.fromEntries(projected.tasks.map((task) => [task.id, task]));
+  for (const [id, expected] of [
+    ['idea-card', { status: 'inbox', kind: 'idea', title: 'Reviewer idea: Claims', project: '~/castle/keep-tool', updated: '2026-09-20T10:00' }],
+    ['bug-card', { status: 'inbox', kind: 'bug', title: 'Crash on open', project: '/repo', updated: '2026-09-19T09:00' }],
+  ]) {
+    const { status, kind, title, project, updated } = byId[id].fm;
+    assert.deepEqual({ status, kind, title, project, updated }, expected, id);
+    assert.equal(typeof byId[id]._detailVersion, 'string', id + ' can load its notes through the detail route');
+    assert.equal(byId[id].body, undefined);
+  }
+  assert.equal(byId['idea-card'].createdAt, '2026-09-20T10:00', 'the age fallback when updated is missing');
+});
+
 test('console state drops closed cards nothing points at, and every card history', () => {
   const state = consoleFixture();
   const projected = consoleState(state);

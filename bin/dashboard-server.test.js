@@ -7,7 +7,7 @@ const http = require('node:http');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 
 async function freePort() {
   const server = net.createServer();
@@ -66,6 +66,20 @@ test('real dashboard routes use the worker snapshot across full, console, mobile
     'created: 2026-01-01', 'updated: 2026-01-01T00:00', '---', '',
     '## 2026-01-01 00:00 — check-in', 'Full route body.', '',
   ].join('\n'));
+  const inboxCard = (id, title) => fs.writeFileSync(path.join(root, 'tasks', `${id}.md`), [
+    '---', `title: ${title}`, 'status: inbox', 'kind: idea', 'tags: []', 'project: ""',
+    'check_after: ""', 'check: ""', 'sessions: []', 'depends_on: []',
+    'created: 2026-01-01', 'updated: 2026-01-01T00:00', '---', '',
+    '## 2026-01-01 00:00 — created', 'An idea.', '',
+  ].join('\n'));
+  inboxCard('inbox-done', 'Finished already');
+  inboxCard('inbox-dismiss', 'Not wanted');
+  // A card write commits to the registry, as it does on a real daemon.
+  const git = (...args) => execFileSync('git', ['-C', root, ...args], { stdio: 'ignore' });
+  git('init', '-q');
+  git('-c', 'user.name=Keep Test', '-c', 'user.email=keep@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'init');
+  git('config', 'user.name', 'Keep Test');
+  git('config', 'user.email', 'keep@example.invalid');
   const child = spawn(process.execPath, [path.join(__dirname, 'serve.js')], {
     cwd: path.join(__dirname, '..'),
     env: { ...process.env, KEEP_DIR: root, HOME: home, KEEP_PORT: String(port), KEEP_HOST: '127.0.0.1',
@@ -151,4 +165,28 @@ test('real dashboard routes use the worker snapshot across full, console, mobile
   assert.equal(refreshed?.status, 200);
   assert.equal(refreshed.headers['x-keep-mutation-fence'], fence);
   assert.equal((await request(port, '/api/notifications', { method: 'POST', body: {} })).status, 403);
+
+  // The Queue's Inbox rows close a card as done or not wanted, and only an inbox
+  // card: a card someone has started since the row was drawn is refused.
+  const inbox = (body, headers = { 'x-keep': '1' }) => request(port, '/api/inbox-card', { method: 'POST', headers, body });
+  const card = (id) => fs.readFileSync(path.join(root, 'tasks', `${id}.md`), 'utf8');
+  assert.equal((await inbox({ id: 'inbox-done', action: 'done' }, {})).status, 403, 'the write needs the console header');
+  assert.equal((await inbox({ id: 'inbox-done', action: 'archive' })).status, 400);
+  assert.equal((await inbox({ id: '../route-card', action: 'done' })).status, 400);
+  const done = await inbox({ id: 'inbox-done', action: 'done' });
+  assert.equal(done.status, 200, JSON.stringify(done.body));
+  assert.match(card('inbox-done'), /^status: done$/m);
+  assert.match(card('inbox-done'), /^done_at: /m);
+  assert.match(card('inbox-done'), /— console → done\ndone from console inbox$/m);
+  const dismissed = await inbox({ id: 'inbox-dismiss', action: 'dismiss' });
+  assert.equal(dismissed.status, 200, JSON.stringify(dismissed.body));
+  assert.match(card('inbox-dismiss'), /^status: done$/m);
+  assert.match(card('inbox-dismiss'), /— console → done\ndismissed from console inbox$/m);
+  const before = card('route-card');
+  const refused = await inbox({ id: 'route-card', action: 'done' });
+  assert.equal(refused.status, 409, JSON.stringify(refused.body));
+  assert.match(refused.body.error, /route-card is active, not inbox/);
+  assert.equal(card('route-card'), before, 'a refused card is left exactly as it was');
+  assert.equal((await inbox({ id: 'inbox-done', action: 'dismiss' })).status, 409, 'closing twice is refused');
+  assert.equal((await inbox({ id: 'no-such-card', action: 'done' })).status, 400);
 });

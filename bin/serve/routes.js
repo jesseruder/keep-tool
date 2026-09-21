@@ -399,6 +399,32 @@ function routes(ctx) {
         return json(res, 200, { ok: true });
       },
     },
+    // The console Queue's Inbox rows: Done and Dismiss both close the card, and
+    // the log line says which. Only an inbox card: a card someone started since
+    // the row was drawn is refused rather than closed under them.
+    {
+      method: 'POST',
+      path: '/api/inbox-card',
+      handle: async ({ req, res, url, body }) => {
+        const messages = { done: 'done from console inbox', dismiss: 'dismissed from console inbox' };
+        if (!body || typeof body.id !== 'string' || !/^[A-Za-z0-9._-]+$/.test(body.id)) {
+          return json(res, 400, { error: 'a card id is required' });
+        }
+        if (!Object.hasOwn(messages, body.action)) return json(res, 400, { error: 'action must be done or dismiss' });
+        try {
+          keep.checkinTask(body.id, {
+            message: messages[body.action], status: 'done', expectStatus: 'inbox',
+            heading: 'console', linkSession: false,
+          });
+        } catch (error) {
+          if (error?.code === 'STATUS_CHANGED') return json(res, 409, { error: error.message });
+          if (error instanceof keep.KeepError) return json(res, 400, { error: error.message });
+          throw error;
+        }
+        broadcast();
+        return json(res, 200, { ok: true, id: body.id, action: body.action });
+      },
+    },
     {
       method: 'POST',
       path: '/api/ack',

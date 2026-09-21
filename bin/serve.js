@@ -1944,7 +1944,7 @@ const HOST_PANES_SLOW_REUSE_MS = 10 * 60e3;
 const URGENT_DASHBOARD_MUTATIONS = new Set([
   '/api/abandon-account-handoff', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
   '/api/close-idle', '/api/close-session', '/api/compact', '/api/decisions/judge',
-  '/api/handoff-queue-cancel', '/api/handoff-rate-limited', '/api/handoff-session',
+  '/api/handoff-queue-cancel', '/api/handoff-rate-limited', '/api/handoff-session', '/api/inbox-card',
   '/api/mark-session', '/api/notifications', '/api/open', '/api/panes/spawn',
   '/api/portable-transfers', '/api/reminders', '/api/rename-session', '/api/reopen-session',
   '/api/resolve-portable-transfer', '/api/restart-daemon', '/api/restart-session', '/api/review-queue',

@@ -5,7 +5,7 @@ const WRITE_HEADERS = { 'content-type': 'application/json' };
 const STATE_MUTATIONS = new Set([
   '/api/abandon-account-handoff', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
   '/api/close-idle', '/api/close-session', '/api/compact', '/api/decisions/judge',
-  '/api/handoff-queue-cancel', '/api/handoff-rate-limited', '/api/handoff-session',
+  '/api/handoff-queue-cancel', '/api/handoff-rate-limited', '/api/handoff-session', '/api/inbox-card',
   '/api/mark-session', '/api/notifications', '/api/open', '/api/panes/spawn',
   '/api/portable-transfers', '/api/reminders', '/api/rename-session', '/api/reopen-session',
   '/api/resolve-portable-transfer', '/api/restart-daemon', '/api/restart-session', '/api/review-queue',
@@ -260,6 +260,7 @@ export async function putLayouts(layouts) {
 }
 export const send = (sessionId, text) => write('/api/send', { sessionId, text });
 export const answer = (sessionId, option, label) => write('/api/answer', { sessionId, option, label });
+export const closeInboxCard = (id, action) => write('/api/inbox-card', { id, action });
 export const setAside = (key, kind, minutes) => write('/api/setaside', {
   key, kind, ...(minutes === undefined ? {} : { minutes }),
 });

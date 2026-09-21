@@ -14,6 +14,7 @@ import { numBadgeHTML } from './session-number.js';
 import { installHeadingRename, installRenameControls, isEditing, renameButtonsHTML, titleAttrsHTML } from './session-rename.js';
 import { installMarkControls, markControlsHTML, markHTML } from './session-mark.js';
 import { providerIconHTML } from './provider-icon.js';
+import { placeInbox } from './queue-inbox.js';
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
 const summaryInflight = new Map();
@@ -671,6 +672,8 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
     addGroup('Selected session');
     addRows(retainedSelection, active.length - retainedSelection.length);
   }
+  // Cards, not sessions: outside `active`, so they never take the selection.
+  placeInbox(ctx, list, addGroup, place);
   if (!active.length && !dismissed.length) addGroup(emptyQueueHTML(ctx.state), '');
   if (dismissed.length) {
     const wrap = document.createElement('div');

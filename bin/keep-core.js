@@ -1504,7 +1504,7 @@ function checkinTask(id, {
   message, status, checkAfter, clearCheckAfter, check, heading, experimentId, step,
   onPass, checkEvery, probe,
   linkSession = true, commitLabel, force, withinLock = false, commit = true, dependencyWait = false,
-  next, commits, handoff,
+  next, commits, handoff, expectStatus,
 }) {
   if (handoff !== undefined && !['waiting', 'needs-input'].includes(handoff)) die('--handoff must be waiting or needs-input');
   if (!message || !String(message).trim()) die('a check-in needs a message');
@@ -1520,6 +1520,14 @@ function checkinTask(id, {
   const verified = step !== undefined && !force && !withinLock ? verifyStepBeforeLock(id, step) : null;
   const checkin = () => {
     const task = loadTask(id);
+    // A caller acting on what it last saw (the console's Inbox row) must not
+    // close a card someone has since started: checked under the lock, so the
+    // status it read and the status it replaces are the same one.
+    if (expectStatus && task.fm.status !== expectStatus) {
+      const error = new KeepError(`${id} is ${task.fm.status || 'unset'}, not ${expectStatus}`);
+      error.code = 'STATUS_CHANGED';
+      throw error;
+    }
     if (step !== undefined) {
       const parsed = parsePlan(task.body);
       if (parsed.present && !parsed.valid) {
