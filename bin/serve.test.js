@@ -9028,6 +9028,12 @@ test('portable source inspection proves an exited source gone only from a fresh,
     liveSessionPids: async () => new Map([['source-session', { pid: 7 }]]) })).processGone, false, 'a process outside the host is live');
   assert.equal((await inspect({ agentProcessRows: async () => { throw new Error('ps failed'); },
     liveSessionPids: async () => new Map() })).processGone, false, 'a failed scan proves nothing');
+  assert.equal((await inspect({ agentProcessRows: async () => [],
+    liveSessionPids: async (deps) => { deps.onEvidenceError(new Error('lsof timed out')); return new Map(); } })).processGone, false,
+  'an identity lookup that failed part-way is inconclusive');
+  let passed;
+  await inspect({ agentProcessRows: async () => [], liveSessionPids: async (deps) => { passed = deps; return new Map(); } });
+  assert.equal(passed.codexRolloutOnly, undefined, 'resume argv counts as identity');
   state.sessions[0].exited = false;
   let scanned = false;
   assert.equal((await inspect({ agentProcessRows: async () => { scanned = true; return []; } })).processGone, false);

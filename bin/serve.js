@@ -4275,7 +4275,7 @@ async function liveSessionPids(deps = {}) {
         const parent = match && parentByChild.get(Number(match[1]));
         if (parent) setLiveSession(live, match[2], parent, 'child-env');
       }
-    } catch {}
+    } catch (error) { deps.onEvidenceError?.(error); }
   }
 
   // Codex holds rollout files open. All of them are alive, but only the newest
@@ -4316,7 +4316,7 @@ async function liveSessionPids(deps = {}) {
           primary: index === 0, rolloutFile: entry.path,
         }));
       }
-    } catch {}
+    } catch (error) { deps.onEvidenceError?.(error); }
   }
 
   return live;
@@ -9706,15 +9706,17 @@ async function inspectPortableSource(sessionId, options = {}, deps = {}) {
   // The dashboard's exited state comes from host panes and a periodic process
   // ledger, which can miss a resume started outside the host; an exited source is
   // only trusted once a fresh process scan (that itself succeeded) finds no agent
-  // on this conversation.
+  // on this conversation. Every identity source counts (resume argv included, so
+  // no codexRolloutOnly), and a lookup that failed part-way is inconclusive.
   let processGone = false;
   if (session?.exited === true) {
     try {
       const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
       if (Array.isArray(rows)) {
+        let inconclusive = false;
         const live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => rows,
-          codexRolloutOnly: session.kind === 'codex' });
-        processGone = !live.has(sessionId);
+          onEvidenceError: () => { inconclusive = true; } });
+        processGone = !inconclusive && !live.has(sessionId);
       }
     } catch {}
   }

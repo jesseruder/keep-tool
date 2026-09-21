@@ -512,6 +512,9 @@ test('a source killed mid-turn with a settled transcript-replaced gap can transf
     'the source has unfinished background work', 'a service can outlive the agent');
   assert.equal(portable.sourceBusyReason({ ...killed(), processGone: false }), 'the source has unfinished background work',
     'without a fresh process scan the exited state is not trusted');
+  assert.equal(variant((s) => { s.unknownBackgroundJobs = []; s.backgroundJobs.jobs.push({ id: 'svc', kind: 'service', status: 'running' }); }),
+    'the source foreground turn is still running', 'a surviving service blocks the stale-turn exception too');
+  assert.equal(variant((s) => { s.unknownBackgroundJobs = []; }), '', 'no gap, every job finished: the dead turn is stale');
   const staleForeground = killed();
   staleForeground.processGone = false;
   staleForeground.session.unknownBackgroundJobs = [];

@@ -381,13 +381,17 @@ function exitedSource(inspection) {
 // for the ended turn the killed process never recorded (background-jobs settledGap).
 // Every recorded job must be terminal: settledGap and `pending` pass over service
 // and scheduled jobs, and a background service can outlive the agent that started it.
-function exitedGapSettled(inspection) {
+function exitedWithoutJobs(inspection) {
   const session = inspection.session;
   const jobs = session.backgroundJobs;
-  const unknown = session.unknownBackgroundJobs;
-  return exitedSource(inspection) && session.pendingBackground === false && jobs?.pending === false
-    && jobs.gapSettledIfExited === true && Array.isArray(jobs.jobs)
-    && jobs.jobs.every((job) => TERMINAL_JOB_STATES.has(job?.status))
+  return exitedSource(inspection) && !session.pendingBackground && jobs?.pending === false
+    && Array.isArray(jobs.jobs) && jobs.jobs.every((job) => TERMINAL_JOB_STATES.has(job?.status));
+}
+
+function exitedGapSettled(inspection) {
+  const unknown = inspection.session.unknownBackgroundJobs;
+  return exitedWithoutJobs(inspection) && inspection.session.pendingBackground === false
+    && inspection.session.backgroundJobs.gapSettledIfExited === true
     && Array.isArray(unknown) && unknown.length > 0 && unknown.every((entry) => entry === 'history-gap');
 }
 
@@ -415,7 +419,7 @@ function sourceBusyReason(inspection) {
     return 'the source has unfinished background work';
   }
   if (session.observation?.foreground?.state === 'active' || session.observation?.foreground?.hook?.state === 'running') {
-    if (terminalQuotaPause || exitedSource(inspection)) return '';
+    if (terminalQuotaPause || exitedWithoutJobs(inspection)) return '';
     return 'the source foreground turn is still running';
   }
   if (terminalQuotaPause) return '';
