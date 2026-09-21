@@ -141,6 +141,29 @@ test('a missing shell selection is not fabricated as an empty history row', () =
   assert.equal(c.retainedSelectionItem({ kind: 'recent', sessionId: 'gone' }).sessionId, 'gone');
 });
 
+test('an exited or vanished unbound history pane is retained as its own read-only row', () => {
+  const state = { historyTarget: { paneId: 'new-pane', view: 'triage', title: 'New session', project: '/tmp/project' },
+    paneTarget: null };
+  let panes = new Map([['new-pane', { id: 'new-pane', alive: false }]]);
+  const c = vm.createContext({ state, isClosingSession: () => false, sessionFor: () => undefined,
+    matchesTriageFilter: () => true, paneMap: () => panes });
+  vm.runInContext(functionText('retainedSelectionItem', '\nfunction triageItems'), c);
+  const exited = c.retainedSelectionItem({ kind: 'running', pane: 'new-pane', project: '/tmp/project' });
+  assert.equal(exited.pane, 'new-pane');
+  assert.equal(exited.state, 'exited');
+  panes = new Map();
+  const missing = c.retainedSelectionItem({ ...state.historyTarget, kind: 'recent', pane: null, state: 'exited' });
+  assert.equal(missing.pane, null);
+  assert.equal(missing.paneId, 'new-pane');
+  assert.equal(missing.title, 'New session');
+
+  panes = new Map([['new-pane', { id: 'new-pane', alive: true }]]);
+  state.historyTarget = { sessionId: 'old-session', paneId: 'new-pane', title: 'Old session', project: '/tmp/project' };
+  const rebound = c.retainedSelectionItem({ ...state.historyTarget, kind: 'recent', pane: 'new-pane', state: 'exited' });
+  assert.equal(rebound.sessionId, 'old-session');
+  assert.equal(rebound.pane, null, 'bound history cannot follow a reused live pane');
+});
+
 // An agent is listed by its Agents row alone. A retained row for its session
 // would be a second listing of the same pane, and an invisible last queue item
 // for j/k and the number keys to land on.

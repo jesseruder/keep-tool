@@ -362,6 +362,12 @@ function retainedSelectionItem(item) {
     if (state.paneTarget && state.paneTarget.pane === item?.pane) state.paneTarget = null;
     return null;
   }
+  if (!state.historyTarget?.sessionId && state.historyTarget?.paneId
+      && state.historyTarget.paneId === (item?.pane || item?.paneId)
+      && matchesTriageFilter(item)) {
+    const pane = paneMap().get(state.historyTarget.paneId);
+    return { ...state.historyTarget, kind: 'recent', pane: pane ? pane.id : null, state: 'exited' };
+  }
   if (state.historyTarget?.sessionId && state.historyTarget.sessionId === item?.sessionId && matchesTriageFilter(item)) return session
     ? sessionItem('recent', session) : { ...state.historyTarget, kind: 'recent', pane: null, state: 'exited' };
   return session && triageVisible(item) ? sessionItem('recent', session) : null;

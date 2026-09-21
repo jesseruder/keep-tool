@@ -81,6 +81,7 @@ const {
   setAsideCandidates,
   applySetAside,
   parseSetAsideRequest,
+  pendingPaneAttention,
   updateSetAside,
   classifyPromptLine,
   probeSuggestion,
@@ -9313,14 +9314,19 @@ test('API state keeps an owner-opened session waiting through transport input un
     cwd: '/tmp/project', meta: { agent: 'codex', project: '/tmp/project', awaitingOwnerInput: true } };
   const state = { sessions: [], attention: [] };
   await addHostSessionState(state, { panes: [pane], codexSessionFor: () => null });
-  assert.deepEqual(state.attention.map((item) => ({ kind: item.kind, pane: item.pane, label: item.attentionLabel })),
-    [{ kind: 'input', pane: 'new-pane', label: 'Ready for next instruction' }]);
+  assert.deepEqual(state.attention.map((item) => ({ key: item.key, kind: item.kind, pane: item.pane, label: item.attentionLabel })),
+    [{ key: 'new-pane', kind: 'input', pane: 'new-pane', label: 'Ready for next instruction' }]);
 
   const afterTransportInput = { sessions: [], attention: [] };
   await addHostSessionState(afterTransportInput, { panes: [{ ...pane, inputCount: 7,
     lastInputAt: '2026-09-21T01:02:04Z' }], codexSessionFor: () => null });
   assert.equal(afterTransportInput.attention[0]?.pane, pane.id,
     'terminal query replies and focus reports are not mistaken for an Owner instruction');
+
+  const prebuilt = { sessions: [], attention: pendingPaneAttention([pane], [], Date.parse(pane.createdAt)) };
+  await addHostSessionState(prebuilt, { panes: [pane], codexSessionFor: () => null });
+  assert.equal(prebuilt.attention.length, 1, 'a buildState pane row keeps its identity and is not appended twice');
+  assert.equal(prebuilt.attention[0].pane, pane.id);
 
   const registered = { sessions: [{ id: 'registered', pane: pane.id }], attention: [] };
   await addHostSessionState(registered, { panes: [{ ...pane, meta: { ...pane.meta, sessionId: 'registered' } }],
@@ -9331,6 +9337,37 @@ test('API state keeps an owner-opened session waiting through transport input un
   await addHostSessionState(automated, { panes: [{ ...pane, meta: { agent: 'codex', project: '/tmp/project', openingMessage: true } }],
     codexSessionFor: () => null });
   assert.deepEqual(automated.attention, [], 'an automated opening message is never advertised as Owner-ready');
+});
+
+test('pane readiness uses one durable Dismiss and Snooze key until registration', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pane-ready-aside-'));
+  const pane = { id: 'ready-pane', alive: true, createdAt: '2026-09-21T01:02:03Z', cwd: '/tmp/project',
+    meta: { agent: 'codex', project: '/tmp/project', awaitingOwnerInput: true } };
+  try {
+    const rows = () => pendingPaneAttention([pane], [], Date.parse(pane.createdAt));
+    const first = rows();
+    assert.equal(attentionItemKey(first[0]), pane.id);
+    applySetAside(setAsideCandidates(first, []), { root, now: 1000 });
+    const dismissed = updateSetAside({ key: pane.id, kind: 'dismiss' }, setAsideCandidates(rows(), []), { root, now: 2000 });
+    assert.equal(dismissed.kind, 'dismiss');
+    const afterReload = rows();
+    const reconciled = applySetAside(setAsideCandidates(afterReload, []), { root, now: 3000 });
+    assert.equal(afterReload[0].key, pane.id);
+    assert.equal(afterReload[0].setAside, 'dismiss');
+    assert.deepEqual(reconciled.value.items, { [pane.id]: dismissed });
+
+    updateSetAside({ key: pane.id, kind: 'clear' }, setAsideCandidates(rows(), []), { root, now: 4000 });
+    const snoozed = updateSetAside({ key: pane.id, kind: 'snooze', minutes: 60 },
+      setAsideCandidates(rows(), []), { root, now: 5000 });
+    assert.equal(applySetAside(setAsideCandidates(rows(), []), { root, now: 6000 }).value.items[pane.id].kind, 'snooze');
+
+    pane.meta.sessionId = 'registered';
+    const boundRows = pendingPaneAttention([pane], [{ id: 'registered', pane: pane.id }], 7000);
+    assert.deepEqual(boundRows, []);
+    assert.deepEqual(applySetAside(setAsideCandidates(boundRows, [{ id: 'registered', pane: pane.id, mtime: 7000 }]),
+      { root, now: 7000 }).value.items, {}, 'binding retires the pane-scoped set-aside entry');
+    assert.equal(snoozed.kind, 'snooze');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('a registered host-only session with opening delivery pending is running, not ready', () => {

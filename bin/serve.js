@@ -160,7 +160,7 @@ function attentionAckKey(item) {
     const errorHash = crypto.createHash('sha1').update(String(item.errorText || '')).digest('hex');
     return `${item.id}:${errorHash}`;
   }
-  return item.id ? `${item.id}:${item.since || item.at}` : `${item.kind}:${item.sessionId || item.taskId || ''}:${item.since}`;
+  return item.id ? `${item.id}:${item.since || item.at}` : `${item.kind}:${item.sessionId || item.taskId || item.pane || ''}:${item.since}`;
 }
 
 function attentionAckName(key) {
@@ -168,7 +168,19 @@ function attentionAckName(key) {
 }
 
 function attentionItemKey(item) {
-  return item.sessionId || item.taskId || `${item.kind}:${item.title}:${item.since}`;
+  return item.key || item.sessionId || item.taskId || item.pane || `${item.kind}:${item.title}:${item.since}`;
+}
+
+function pendingPaneAttention(panes, sessions, now = Date.now()) {
+  const boundPanes = new Set((sessions || []).map((session) => session.pane).filter(Boolean));
+  return (panes || []).flatMap((pane) => {
+    if (!pane?.alive || pane.agentAlive === false || boundPanes.has(pane.id)
+        || pane.meta?.sessionId || pane.meta?.awaitingOwnerInput !== true) return [];
+    return [{ key: pane.id, kind: 'input', pri: 0, pane: pane.id,
+      project: pane.meta?.project || pane.cwd || '', title: pane.meta?.title || pane.title || 'New session',
+      detail: 'Ready for your next instruction.', attentionLabel: 'Ready for next instruction',
+      since: Date.parse(pane.createdAt) || now }];
+  });
 }
 
 function setAsideFile(root = keep.ROOT) {
@@ -203,6 +215,7 @@ function setAsideEntryValid(entry) {
     && Number.isFinite(entry.at)
     && (typeof entry.since === 'number' || typeof entry.since === 'string')
     && (entry.kind === 'snooze' ? Number.isFinite(entry.until) : entry.until === null)
+    && (entry.paneId === undefined || typeof entry.paneId === 'string')
     && (entry.kind !== 'dependency' || (typeof entry.taskId === 'string'
       && Array.isArray(entry.dependencies) && entry.dependencies.length > 0
       && entry.dependencies.every((id) => typeof id === 'string')));
@@ -258,6 +271,7 @@ function applySetAside(attention, options = {}) {
   for (const [key, entry] of Object.entries(store.items || {})) {
     if (!setAsideEntryValid(entry)) { changed = true; continue; }
     if (entry.kind === 'snooze') {
+      if (entry.paneId && !current.has(key)) { changed = true; continue; }
       const userAt = current.get(key)?.lastUserAt;
       if (entry.until <= now || (Number.isFinite(userAt) && userAt > entry.at)) { changed = true; continue; }
       items[key] = entry;
@@ -332,6 +346,7 @@ function updateSetAside(body, attention, options = {}) {
   }
   const entry = {
     ...(input.kind === 'dependency' ? { taskId: item.taskId, dependencies: [...item.dependencies] } : {}),
+    ...(item.pane && !item.sessionId ? { paneId: item.pane } : {}),
     kind: input.kind,
     until: input.kind === 'snooze' ? now + input.minutes * 60e3 : null,
     at: now,
@@ -8435,6 +8450,10 @@ function buildState(options = {}) {
     const item = sessionAttentionItem(s, now);
     if (item) attention.push(item);
   }
+  // A message-less console launch is actionable before Codex registers its session
+  // id. Include the pane row before acknowledgement and set-aside reconciliation so
+  // Dismiss/Snooze use the same durable lifecycle as session-backed attention.
+  attention.push(...pendingPaneAttention(options.hostPanes || [], sessions, now));
   const unblockRecords = unblock.readRecords({ root: keep.ROOT, now, days: 3 });
   const unblocked = unblockRecords.map((record) => ({
     dependent: record.dependent,
@@ -8802,15 +8821,14 @@ async function addHostSessionState(state, deps = {}) {
   }
   const sessionPanes = new Map((state.sessions || []).map((session) => [session.id, session.pane || null]));
   state.attention ||= [];
-  for (const item of state.attention || []) item.pane = item.sessionId ? sessionPanes.get(item.sessionId) || null : null;
-  const boundPanes = new Set((state.sessions || []).map((session) => session.pane).filter(Boolean));
-  for (const pane of panes || []) {
-    if (!pane?.alive || pane.agentAlive === false || boundPanes.has(pane.id)
-        || pane.meta?.awaitingOwnerInput !== true) continue;
-    state.attention.push({ kind: 'input', pri: 0, pane: pane.id,
-      project: pane.meta?.project || pane.cwd || '', title: pane.meta?.title || pane.title || 'New session',
-      detail: 'Ready for your next instruction.', attentionLabel: 'Ready for next instruction',
-      since: Date.parse(pane.createdAt) || Date.now() });
+  for (const item of state.attention || []) {
+    if (item.sessionId) item.pane = sessionPanes.get(item.sessionId) || null;
+  }
+  const representedPanes = new Set(state.attention.map((item) => item.pane).filter(Boolean));
+  for (const item of pendingPaneAttention(panes, state.sessions || [])) {
+    if (representedPanes.has(item.pane)) continue;
+    item.setAside = state.setAside?.[item.key]?.kind || null;
+    state.attention.push(item);
   }
   state.panes = panes || [];
   return state;
@@ -10776,6 +10794,7 @@ module.exports = {
   setAsideCandidates,
   applySetAside,
   parseSetAsideRequest,
+  pendingPaneAttention,
   updateSetAside,
   classifyPromptLine,
   probeSuggestion,
