@@ -1042,17 +1042,29 @@ test('gc refuses all cleanup when live process cwd discovery fails', () => {
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test('recycledWorktree names only a missing <root>/<repo>/<name> path of a known repo', () => {
+test('recycledWorktree names only a missing <root>/<repo>/<name> path; recreation needs one unambiguous repo', () => {
   const f = fixture();
+  const previous = process.env.WT_NO_INSTALL;
+  process.env.WT_NO_INSTALL = '1';
   try {
     const missing = path.join(f.worktreeRoot, f.name, 'gone-slug');
     assert.deepEqual(wt.recycledWorktree(missing, f.cfg), { repo: f.name, name: 'gone-slug' });
-    assert.equal(wt.createWorktree({ repo: f.name, name: 'gone-slug', cfg: f.cfg, noInstall: true }), missing);
+    assert.throws(() => wt.recreateRecycledWorktree(path.join(f.worktreeRoot, 'unknown-repo', 'slug'), f.cfg), /repo not found: unknown-repo/);
+    const otherRoot = path.join(f.root, 'other');
+    fs.mkdirSync(otherRoot);
+    execFileSync('git', ['clone', '-q', f.origin, path.join(otherRoot, f.name)]);
+    assert.throws(() => wt.recreateRecycledWorktree(missing, { ...f.cfg, roots: [f.repos, otherRoot] }), /is ambiguous/);
+    assert.equal(fs.existsSync(missing), false);
+    assert.equal(wt.recreateRecycledWorktree(missing, f.cfg), missing);
+    assert.equal(git(missing, 'rev-parse', '--abbrev-ref', 'HEAD'), 'wt/gone-slug');
     assert.equal(wt.recycledWorktree(missing, f.cfg), null, 'an existing directory is not recycled');
-    assert.equal(wt.recycledWorktree(path.join(f.worktreeRoot, 'unknown-repo', 'slug'), f.cfg), null);
+    assert.throws(() => wt.recreateRecycledWorktree(missing, f.cfg), /not a recycled worktree path/);
     assert.equal(wt.recycledWorktree(path.join(f.worktreeRoot, f.name, 'a', 'b'), f.cfg), null, 'deeper paths do not qualify');
     assert.equal(wt.recycledWorktree(path.join(f.worktreeRoot, f.name), f.cfg), null);
     assert.equal(wt.recycledWorktree(path.join(f.root, 'elsewhere', f.name, 'slug'), f.cfg), null, 'outside the worktree root');
     assert.equal(wt.recycledWorktree(`${f.name}/slug`, f.cfg), null, 'a relative path does not qualify');
-  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+  } finally {
+    if (previous === undefined) delete process.env.WT_NO_INSTALL; else process.env.WT_NO_INSTALL = previous;
+    fs.rmSync(f.root, { recursive: true, force: true });
+  }
 });

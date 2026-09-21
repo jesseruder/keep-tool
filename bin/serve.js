@@ -6814,27 +6814,54 @@ function openBudgetModel(launchModel, deps = {}) {
 // been recycled gets that worktree back (a fresh wt/<name> branch off the default
 // branch, as `wt new` makes it) instead of an unresumable "project directory does
 // not exist". `wt new` installs dependencies synchronously, so it runs as a child
-// process; concurrent reopens of the same path share one creation.
+// process -- repository lookup included, since that runs git synchronously -- in
+// its own process group, so a timeout stops its git and install children too. The
+// bound stays under restore's 180s request timeout. Concurrent reopens of the same
+// path share one creation, and a reopen that arrives once the directory exists but
+// before creation finished still waits for it (awaitWorktreeRecreation).
 const worktreeRecreations = new Map();
-async function recreateRecycledWorktree(project, deps = {}) {
-  const wt = require('./wt.js');
-  let target = null;
-  try { target = (deps.recycledWorktree || wt.recycledWorktree)(project); } catch {}
-  if (!target) return false;
-  let running = worktreeRecreations.get(project);
-  if (!running) {
-    const env = { ...process.env };
-    delete env.CLAUDE_CODE_SESSION_ID;
-    running = (deps.recreateWorktree || (({ repo, name }) => execFileAsync(process.execPath,
-      [path.join(__dirname, 'wt'), 'new', `${repo}/${name}`], { env, timeout: 5 * 60e3, maxBuffer: 4 * 1024 * 1024 })))(target);
-    worktreeRecreations.set(project, running);
-    console.log(`keep serve: open recreating recycled worktree ${project}`);
-    running.finally(() => { if (worktreeRecreations.get(project) === running) worktreeRecreations.delete(project); }).catch(() => {});
-  }
+const WORKTREE_RECREATE_TIMEOUT_MS = 150e3;
+function runWorktreeRecreation(project) {
+  const env = { ...process.env };
+  delete env.CLAUDE_CODE_SESSION_ID;
+  const script = `try { require(${JSON.stringify(path.join(__dirname, 'wt.js'))}).recreateRecycledWorktree(process.argv[1]); }
+    catch (error) { process.stderr.write('wt: ' + error.message + '\\n'); process.exit(1); }`;
+  return new Promise((resolve, reject) => {
+    const child = require('child_process').spawn(process.execPath, ['-e', script, project],
+      { env, detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-8192); });
+    const timer = setTimeout(() => {
+      stderr += `\nwt: timed out after ${WORKTREE_RECREATE_TIMEOUT_MS / 1000}s; remove the partial worktree with wt rm before retrying`;
+      try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+    }, WORKTREE_RECREATE_TIMEOUT_MS);
+    child.on('error', (error) => { clearTimeout(timer); reject(error); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(Object.assign(new Error(`wt exited ${code}`), { stderr }));
+    });
+  });
+}
+async function awaitWorktreeRecreation(project) {
+  const running = worktreeRecreations.get(project);
+  if (!running) return;
   try { await running; } catch (error) {
     const detail = String(error?.stderr || error?.message || error).trim().split('\n').pop();
     throw new InjectionError(409, `project directory ${project} was a recycled worktree and recreating it failed: ${detail}`);
   }
+}
+async function recreateRecycledWorktree(project, deps = {}) {
+  let target = null;
+  try { target = (deps.recycledWorktree || require('./wt.js').recycledWorktree)(project); } catch {}
+  if (!target && !worktreeRecreations.has(project)) return false;
+  if (!worktreeRecreations.has(project)) {
+    const running = (deps.recreateWorktree || (() => runWorktreeRecreation(project)))(target);
+    worktreeRecreations.set(project, running);
+    console.log(`keep serve: open recreating recycled worktree ${project}`);
+    running.finally(() => { if (worktreeRecreations.get(project) === running) worktreeRecreations.delete(project); }).catch(() => {});
+  }
+  await awaitWorktreeRecreation(project);
   try { return fs.statSync(project).isDirectory(); } catch { return false; }
 }
 
@@ -6952,6 +6979,7 @@ async function openSession(body, deps = {}) {
 
   if (typeof project !== 'string' || !project) throw new InjectionError(400, `no project for ${body.taskId ? `task ${body.taskId}` : `session ${body.sessionId || '?'}`}`);
   project = path.resolve(project.replace(/^~(?=\/|$)/, os.homedir()));
+  if (session && !body.fresh) await awaitWorktreeRecreation(project);
   try { if (!fs.statSync(project).isDirectory()) throw new Error(); }
   catch {
     if (!session || body.fresh || !await recreateRecycledWorktree(project, deps)) {

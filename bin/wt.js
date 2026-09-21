@@ -463,19 +463,36 @@ function createWorktree(opts = {}) {
   }
 }
 
-// The `wt new` arguments that bring back a worktree which was recycled or removed
-// after a session recorded it as its directory: `target` must be exactly
-// <worktreeRoot>/<repo>/<name>, no longer exist, and name a repo `wt` can resolve.
-// Anything else is null, so a genuinely wrong path still fails as missing.
+// Whether `target` has the shape of a worktree that was recycled or removed after
+// a session recorded it as its directory: exactly <worktreeRoot>/<repo>/<name>,
+// and no longer there. Lexical only (no git), so the daemon can ask it inline;
+// recreateRecycledWorktree does the repository lookup.
 function recycledWorktree(target, cfg = loadConfig()) {
   if (typeof target !== 'string' || !path.isAbsolute(target) || fs.existsSync(target)) return null;
   const relative = path.relative(path.resolve(expandHome(cfg.worktreeRoot)), path.resolve(target));
   const parts = relative.split(path.sep);
   if (parts.length !== 2 || parts[0] === '..' || !NAME_RE.test(parts[0]) || !NAME_RE.test(parts[1])) return null;
-  try {
-    if (path.basename(resolveRepo(parts[0], cfg)) !== parts[0]) return null;
-  } catch { return null; }
   return { repo: parts[0], name: parts[1] };
+}
+
+// Brings such a worktree back as `wt new <repo>/<name>` would, except that the
+// repository must be unambiguous: exactly one configured root holds a main
+// checkout named <repo>. The worktree path records only the basename, so two
+// same-named checkouts could otherwise resume the session against the wrong code.
+function recreateRecycledWorktree(target, cfg = loadConfig()) {
+  const recycled = recycledWorktree(target, cfg);
+  if (!recycled) die(`not a recycled worktree path: ${target}`);
+  const mains = new Set();
+  for (const root of cfg.roots || []) {
+    const candidate = path.resolve(expandHome(root), recycled.repo);
+    if (!fs.existsSync(candidate)) continue;
+    const main = mainCheckout(candidate);
+    if (main && main === fs.realpathSync(candidate)) mains.add(main);
+  }
+  if (mains.size !== 1) {
+    die(mains.size ? `repo ${recycled.repo} is ambiguous: ${[...mains].join(', ')}` : `repo not found: ${recycled.repo}`);
+  }
+  return createWorktree({ repo: [...mains][0], name: recycled.name, cfg });
 }
 
 function statusWithoutMarkers(worktree) {
@@ -1254,6 +1271,7 @@ module.exports = {
   deployAfterLand,
   createWorktree,
   recycledWorktree,
+  recreateRecycledWorktree,
   recycleWorktree,
   landWorktree,
   listWorktrees,

@@ -7280,19 +7280,26 @@ test('open recreates a recycled worktree for a resumed session, once, and only f
   const id = 'abcdef12-0000-4000-8000-000000000003';
   const scanSessions = () => [{ id, project, kind: 'claude' }];
   const calls = [];
+  let finished = false;
   const recycledWorktree = (target) => target === project && !fs.existsSync(target) ? { repo: 'repo', name: 'gone' } : null;
   const recreateWorktree = async (target) => {
     calls.push(target);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    // wt makes the directory first and installs into it afterwards.
     fs.mkdirSync(project, { recursive: true });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    finished = true;
   };
   try {
     await assert.rejects(openSession({ fresh: true, cwd: project, agent: 'claude' }, { recycledWorktree, recreateWorktree }),
       /project directory does not exist/, 'a fresh launch never recreates');
-    const deps = { scanSessions, recycledWorktree, recreateWorktree, resolveSessionTarget: async () => ({ pane: 'pane-1' }) };
-    const [first, second] = await Promise.all([openSession({ sessionId: id }, deps), openSession({ sessionId: id }, deps)]);
-    assert.equal(first.pane, 'pane-1');
-    assert.equal(second.pane, 'pane-1');
+    const deps = { scanSessions, recycledWorktree, recreateWorktree,
+      resolveSessionTarget: async () => { assert.equal(finished, true, 'no launch before creation finished'); return { pane: 'pane-1' }; } };
+    const first = openSession({ sessionId: id }, deps);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(fs.existsSync(project), true);
+    const second = openSession({ sessionId: id }, deps);
+    assert.equal((await first).pane, 'pane-1');
+    assert.equal((await second).pane, 'pane-1');
     assert.deepEqual(calls, [{ repo: 'repo', name: 'gone' }], 'concurrent reopens share one creation');
 
     fs.rmSync(project, { recursive: true });
@@ -7301,6 +7308,23 @@ test('open recreates a recycled worktree for a resumed session, once, and only f
     (error) => error.status === 409 && /recycled worktree and recreating it failed: wt: branch wt\/gone has unlanded commits/.test(error.message));
     await assert.rejects(openSession({ sessionId: id }, { ...deps, recycledWorktree: () => null }), /project directory does not exist/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('open runs the real recreation child and reports its wt failure', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-recycled-child-'));
+  const configFile = path.join(root, 'config.json');
+  fs.writeFileSync(configFile, JSON.stringify({ worktreeRoot: path.join(root, 'wt'), roots: [path.join(root, 'repos')] }));
+  const project = path.join(root, 'wt', 'nowhere', 'gone');
+  const id = 'abcdef12-0000-4000-8000-000000000004';
+  const previous = process.env.WT_CONFIG;
+  process.env.WT_CONFIG = configFile;
+  try {
+    await assert.rejects(openSession({ sessionId: id }, { scanSessions: () => [{ id, project, kind: 'claude' }] }),
+      (error) => error.status === 409 && /recreating it failed: wt: repo not found: nowhere/.test(error.message));
+  } finally {
+    if (previous === undefined) delete process.env.WT_CONFIG; else process.env.WT_CONFIG = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('a console number resolves to its session, and an unknown number is a bad session id', () => {
