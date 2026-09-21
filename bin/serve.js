@@ -2653,8 +2653,18 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
 // Marks a failure as one that happened with characters already written to the
 // pane. Read by bin/watcher-live.js, which may only give a delivery slot back
 // when nothing was typed: an unconfirmed send is still a send.
+//
+// Every caller is an abort inside typeAndSubmit that gives up before the Enter
+// press, which is its last statement, so the failure also proves Enter was never
+// attempted. bin/delivery.js needs that proof: it writes `typedAt` only once
+// typeAndSubmit RETURNS, so a missing `typedAt` cannot by itself tell a refused
+// draft from an accepted Enter whose reply was lost. Keep new call sites on this
+// side of 'enter-start'.
 function typedAlready(error) {
-  if (error && typeof error === 'object') error.typingStarted = true;
+  if (error && typeof error === 'object') {
+    error.typingStarted = true;
+    error.enterNotPressed = true;
+  }
   return error;
 }
 

@@ -570,3 +570,156 @@ test('partial resume removes a proven cleared draft but preserves evidence when 
       'nothingTyped on a retry does not erase chunks acknowledged by the earlier attempt');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+// The delivery incident of 2026-09-21 (delivery:343bbbb6): a Codex send typed all
+// three of its chunks, then refused Enter at the exact-draft guard because the box
+// held something else. That leaves acknowledged chunks and no `typedAt` - a shape no
+// cleanup path could reach, so the watchdog reported receipt-missing every 60s while
+// the pane sat alive with an empty prompt and nothing ever sent to it again. The
+// absence of `typedAt` is not what makes it safe to drop; the pane's own proof that
+// Enter was never pressed is.
+test('the reconcile sweep expires a typed journal the pane proved it refused Enter for', async () => {
+  const { reconcile, statusForText, textHash } = require('./delivery');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-unsent-draft-'));
+  const file = path.join(dir, 'rollout.jsonl'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  // What bin/serve.js typeAndSubmit throws once every chunk is acknowledged and the
+  // last guard finds the box holding more than the typed message. typedAlready marks
+  // it: characters were written, and Enter was never attempted.
+  const refusedEnter = () => Object.assign(
+    new Error('the input box no longer holds only the typed message; Enter was not pressed'),
+    { typingStarted: true, enterNotPressed: true, draftLeftOnScreen: true });
+  const typeAll = (fail) => async (progress) => {
+    progress.plan({ pid: 42, initialInputCount: 1225, chunkChars: 9, chunkCount: 2,
+      operationSeed: 'delivery_1234567890abcdef' });
+    for (const index of [0, 1]) {
+      progress.start(index);
+      progress.acknowledge(index, textHash('chunk-' + index));
+    }
+    progress.complete();
+    throw fail();
+  };
+  const send = (session, options = {}) => deliver({ session: { id: session, kind: 'codex' }, pane: 'live',
+    text: 'the whole message', file, directory, precheck: async () => {},
+    submitDraft: async () => assert.fail('unexpected Enter'), draftMatches: async () => false,
+    pause: async () => {}, attempts: 1, type: typeAll(refusedEnter), ...options });
+  const journalFor = (session) => path.join(directory, textHash(session) + '.json');
+  const panes = new Set(['live']);
+  const later = Date.now() + 60 * 60e3;
+  try {
+    await assert.rejects(send('wedged'), /Enter was not pressed/);
+    const entry = JSON.parse(fs.readFileSync(journalFor('wedged'), 'utf8'));
+    assert.equal(entry.typedAt, undefined, 'a completed draft is not submission evidence');
+    assert.equal(entry.typing.acknowledgedChunks, entry.typing.chunkCount);
+    assert.ok(Number(entry.enterRefusedAt) > 0, 'the pane said Enter was never attempted');
+
+    // Young: the next byte-identical send may still resume it.
+    assert.deepEqual(reconcile(directory, { panes }), []);
+    assert.equal(fs.existsSync(journalFor('wedged')), true);
+
+    // Old, with the pane still listed: no resume is coming, so proven-unsent text
+    // must not outlive the stale window just because its chunks were acknowledged.
+    assert.deepEqual(reconcile(directory, { now: later, panes }), [],
+      'an unsent draft is dropped, never settled as received');
+    assert.equal(fs.existsSync(journalFor('wedged')), false);
+    assert.equal(fs.existsSync(path.join(directory, 'settled', textHash('wedged') + '.json')), false);
+
+    // The same typing with no such proof - a lost host reply, which may mean Enter
+    // WAS accepted - keeps its journal, because dropping it risks a second send.
+    await assert.rejects(send('ambiguous', { type: typeAll(() => new Error('host reply was lost')) }),
+      /host reply was lost/);
+    assert.equal(JSON.parse(fs.readFileSync(journalFor('ambiguous'), 'utf8')).enterRefusedAt, undefined);
+    assert.deepEqual(reconcile(directory, { now: later, panes }), []);
+    assert.equal(fs.existsSync(journalFor('ambiguous')), true, 'ambiguity is never swept away');
+
+    // And a scheduled check keeps no receipt either: Enter was never pressed, so its
+    // owner must still be free to run it.
+    await assert.rejects(send('check', { retainReceipt: true, key: 'check-1' }), /Enter was not pressed/);
+    assert.equal(statusForText(directory, 'the whole message', 'check-1').pending, true);
+    assert.deepEqual(reconcile(directory, { now: later, panes }), []);
+    assert.equal(fs.existsSync(journalFor('check')), false);
+    assert.equal(statusForText(directory, 'the whole message', 'check-1'), null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// A resumed attempt types again and may well reach Enter, so the earlier attempt's
+// proof must not outlive it: otherwise a resume whose Enter was accepted, and whose
+// reply was then lost, would be swept and sent a second time.
+test('a resumed attempt drops the earlier refusal proof before it types again', async () => {
+  const { reconcile, textHash } = require('./delivery');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-refusal-reset-'));
+  const file = path.join(dir, 'rollout.jsonl'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  const journal = path.join(directory, textHash('resumed') + '.json');
+  const base = { session: { id: 'resumed', kind: 'codex' }, pane: 'live', text: 'the whole message',
+    file, directory, precheck: async () => {}, submitDraft: async () => assert.fail('unexpected Enter'),
+    draftMatches: async () => false, pause: async () => {}, attempts: 1 };
+  const typeAll = (fail) => async (progress) => {
+    if (!progress.state) {
+      progress.plan({ pid: 42, initialInputCount: 4, chunkChars: 9, chunkCount: 2,
+        operationSeed: 'delivery_1234567890abcdef' });
+    }
+    for (let index = progress.state.acknowledgedChunks; index < 2; index += 1) {
+      progress.start(index);
+      progress.acknowledge(index, textHash('chunk-' + index));
+    }
+    progress.complete();
+    throw fail();
+  };
+  try {
+    await assert.rejects(deliver({ ...base, type: typeAll(() => Object.assign(
+      new Error('the input box no longer holds only the typed message; Enter was not pressed'),
+      { typingStarted: true, enterNotPressed: true })) }), /Enter was not pressed/);
+    assert.ok(Number(JSON.parse(fs.readFileSync(journal, 'utf8')).enterRefusedAt) > 0);
+
+    // The retry types again and this time only the host's reply is lost.
+    await assert.rejects(deliver({ ...base, type: typeAll(() => new Error('host reply was lost')) }),
+      /host reply was lost/);
+    assert.equal(JSON.parse(fs.readFileSync(journal, 'utf8')).enterRefusedAt, undefined,
+      'the stale proof is about the attempt that made it, not this one');
+    assert.deepEqual(reconcile(directory, { now: Date.now() + 60 * 60e3, panes: new Set(['live']) }), []);
+    assert.equal(fs.existsSync(journal), true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// The recovery Enter is a second chance to submit the very draft the refusal proof
+// was written about, so the proof has to go before it is pressed - otherwise an
+// accepted recovery Enter whose receipt never appears would leave the journal
+// claiming nothing was ever submitted, and the sweep would drop it and let the
+// message be sent again.
+test('a recovery Enter drops the refusal proof before it presses', async () => {
+  const { reconcile, textHash } = require('./delivery');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-recovery-enter-'));
+  const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  const journal = path.join(directory, textHash('recovered') + '.json');
+  let submitted = 0, polls = 0;
+  const refused = () => Object.assign(
+    new Error('message was typed but could not be confirmed; Enter was not pressed'),
+    { typingStarted: true, enterNotPressed: true });
+  try {
+    await assert.rejects(deliver({ session: { id: 'recovered', kind: 'claude' }, pane: 'live',
+      text: 'the whole message', file, directory, precheck: async () => {}, attempts: 2,
+      pause: async () => { polls += 1; },
+      // The draft turns out to be intact after the confirmation polls ran out.
+      draftMatches: async () => polls >= 2,
+      // The pane takes this Enter; no receipt ever appears for it.
+      submitDraft: async () => { submitted += 1; },
+      type: async (progress) => {
+        progress.plan({ pid: 42, initialInputCount: 4, chunkChars: 9, chunkCount: 2,
+          operationSeed: 'delivery_1234567890abcdef' });
+        for (const index of [0, 1]) {
+          progress.start(index);
+          progress.acknowledge(index, textHash('chunk-' + index));
+        }
+        progress.complete();
+        throw refused();
+      } }), /could not be confirmed/);
+    assert.equal(submitted, 1, 'the intact draft did get a recovery Enter');
+    const entry = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    assert.equal(entry.enterRefusedAt, undefined, 'the proof does not survive an Enter that may have landed');
+    assert.equal(entry.typedAt, undefined);
+    assert.deepEqual(reconcile(directory, { now: Date.now() + 60 * 60e3, panes: new Set(['live']) }), []);
+    assert.equal(fs.existsSync(journal), true, 'so the sweep leaves it alone');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
