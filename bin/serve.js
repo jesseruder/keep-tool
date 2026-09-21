@@ -87,6 +87,12 @@ const { routes: buildRequestRoutes, matchRoute } = require('./serve/routes.js');
 const { startSchedulers } = require('./serve/schedulers.js');
 const execFileAsync = promisify(execFile);
 const ATTENTION_KINDS = new Set(['question', 'plan', 'permission', 'complete', 'input', 'review', 'blocked', 'overdue', 'unblocked', 'health', 'stalled']);
+// One line of ordinary text. No ESC, no carriage return, no newline, no other C0
+// or C1 control: those are not characters in a box, they are instructions to the
+// terminal - Up recalls an earlier prompt into the composer, Enter submits what is
+// already there and starts another - and the pane's counter counts the write, never
+// what the application made of it.
+const PLAIN_ONE_LINE_RE = /^[^\u0000-\u001f\u007f-\u009f]+$/;
 const CODEX_DIALOG_MARKERS = [
   'Would you like to run the following command?',
   'Press enter to confirm or esc to cancel',
@@ -2448,7 +2454,7 @@ const BOX_RULE_RE = /^\s*[─━]{3,}/;
 // Returns null when the box cannot be read with confidence, which every caller
 // treats as "not ours": refusing is always safe, and clearing or submitting a
 // box this could not parse is not.
-function draftRegionLines(screen, kind) {
+function draftRegionLines(screen, kind, options = {}) {
   const lines = stripTerminalAnsi(String(screen || '')).split(/\r?\n/);
   const prompt = kind === 'codex' ? /^\s*›(?:\s|$)/ : /^\s*❯(?:\s|$)/;
   // The bottom of the box, found from the bottom of the screen: the input box is
@@ -2466,11 +2472,19 @@ function draftRegionLines(screen, kind) {
   }
   if (end === -1) return null;
   // The top of the box: the *first* glyph line inside it, so a second glyph typed
-  // into a draft is content rather than the start of a new one.
+  // into a draft is content rather than the start of a new one. That is the safe
+  // direction - it can only ever read MORE than the box, and more is refused.
+  //
+  // `fromLastGlyph` reads less: the last glyph alone, which is unambiguously the
+  // composer's own (the bottom of the box is found from it) where the first is not,
+  // because Codex draws no rule above its composer and this scan otherwise runs up
+  // into the transcript. Anything above the last glyph becomes invisible, so it is
+  // only ever safe for a caller holding separate proof that there is nothing up
+  // there but its own keys. typeAndSubmit is the one such caller.
   let start = -1;
   for (let i = end - 1; i >= 0; i -= 1) {
     if (BOX_RULE_RE.test(lines[i])) break;
-    if (prompt.test(lines[i])) start = i;
+    if (prompt.test(lines[i])) { start = i; if (options.fromLastGlyph) break; }
   }
   if (start === -1) return null;
   const region = lines.slice(start, end);
@@ -2493,8 +2507,8 @@ function codexComposerEnd(lines, promptLine, kind) {
 // back into that word: the pane's width is the widest line on screen, and a line
 // that reached it was cut rather than ended (the host trims trailing spaces, so a
 // line that ended on one is shorter than the pane).
-function draftRegionText(screen, kind) {
-  const region = draftRegionLines(screen, kind);
+function draftRegionText(screen, kind, options) {
+  const region = draftRegionLines(screen, kind, options);
   if (!region) return null;
   let out = '';
   region.lines.forEach((line, index) => {
@@ -2522,8 +2536,8 @@ function draftRegionText(screen, kind) {
 // on continuation rows, so the only honest comparison is row fragments separated by
 // optional whitespace. Blank rows are not optional: automated messages are one line,
 // and a blank inside the composer can hide text somebody added below our draft.
-function renderedDraftMatches(screen, text, kind) {
-  const region = draftRegionLines(screen, kind);
+function renderedDraftMatches(screen, text, kind, options) {
+  const region = draftRegionLines(screen, kind, options);
   if (!region || region.lines.some((line) => !line.trim())) return false;
   const fragments = region.lines.map((line) => line.trim());
   const escaped = fragments.map((line) => line.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
@@ -2534,8 +2548,8 @@ function renderedDraftMatches(screen, text, kind) {
 // else. Containment is not enough: Owner typing while the watcher types leaves a
 // box that contains our message and says something neither of us meant. Compared
 // in NFC, because a terminal may echo back the other spelling of the same text.
-function draftIsExactly(screen, text, kind) {
-  const draft = draftRegionText(screen, kind);
+function draftIsExactly(screen, text, kind, options) {
+  const draft = draftRegionText(screen, kind, options);
   return draft !== null && draft === canonicalText(text);
 }
 
@@ -2766,7 +2780,18 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
         } else sendPrecheck(screen);
       }
     } else {
-      if (!draftIsExactly(screen, wanted, deps.draftKind)
+      // The same reading the exact-draft guard takes below, on the same proof and
+      // the same terms. This function has just checked the pane's pid and count on
+      // both sides of the screen read, so nothing but our own keys is in the box and
+      // the block under the last glyph is the box rather than a piece of it; a modal
+      // has already been refused above. Without this a resume reads 200 rows, which
+      // on a busy Codex pane drags in far more transcript than the 30 the guard
+      // below reads, and every retry refuses a draft that is exactly right.
+      const provenComposer = deps.draftKind === 'codex'
+        && PLAIN_ONE_LINE_RE.test(wanted)
+        && (draftIsExactly(screen, wanted, 'codex', { fromLastGlyph: true })
+          || renderedDraftMatches(screen, wanted, 'codex', { fromLastGlyph: true }));
+      if (!provenComposer && !draftIsExactly(screen, wanted, deps.draftKind)
           && !renderedDraftMatches(screen, wanted, deps.draftKind)) {
         throw new InjectionError(409, 'the partial delivery draft changed; no key was pressed');
       }
@@ -2993,7 +3018,36 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
     // and can make Enter conditional on that same count. With that proof, compare all
     // rendered fragments directly and avoid guessing the composer's width.
     const guardedFragments = exactExpectation && renderedDraftMatches(exactScreen, text, deps.draftKind);
-    if (!draftIsExactly(exactScreen, text, deps.draftKind) && !guardedFragments) {
+    // Codex draws no rule above its composer, so the parse above runs up into the
+    // transcript on a busy pane and refuses a message that is exactly right: live on
+    // 2026-09-21 a 496-character draft read as 2021 characters here, and the send
+    // retried into the same refusal every minute until its journal went stale.
+    // Reading from the last glyph instead gets the composer block on its own - but
+    // that hides whatever is above it, so it is worth nothing by itself. What makes
+    // it safe is the pane's own counter: the host bumps inputCount at the only two
+    // pty writes it has, each chunk went in conditional on that count, and precheck
+    // found the box empty, so a pane still standing at exactly this send's expected
+    // count on the same process has had no key in it but ours. Then the block below
+    // the last glyph is not a fragment of the box - it is the box.
+    //
+    // The counter speaks for the keys, and only for the keys. It says nothing about
+    // what the application made of them, so this stays narrow: one line of plain
+    // text, so the bytes cannot steer the composer or submit early; no dialog on
+    // screen, because output alone can raise one after precheck and a dialog is not
+    // a composer; and the block still has to match the message, so the accept rests
+    // on what the pane shows now rather than on the loose fingerprint the screen
+    // confirmation above settles for.
+    const provenComposer = guardedChunks && exactExpectation && deps.draftKind === 'codex'
+      && PLAIN_ONE_LINE_RE.test(text)
+      && !CODEX_DIALOG_MARKERS.some((marker) => exactScreen.includes(marker))
+      && (draftIsExactly(exactScreen, text, 'codex', { fromLastGlyph: true })
+        || renderedDraftMatches(exactScreen, text, 'codex', { fromLastGlyph: true }))
+      && await (async () => {
+        const counted = await livePaneState(pane, deps);
+        return Boolean(counted && counted.pid === exactExpectation.pid
+          && counted.inputCount === exactExpectation.inputCount);
+      })();
+    if (!provenComposer && !draftIsExactly(exactScreen, text, deps.draftKind) && !guardedFragments) {
       deps.deliveryTrace?.('draft-not-exact');
       // Nothing is pressed and nothing is cleared: the box holds text this did
       // not write, and touching it is not this code's decision to make.

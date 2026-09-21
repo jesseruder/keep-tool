@@ -6041,6 +6041,249 @@ test('the width-independent Codex draft check still refuses mixed and blank-adde
   }
 });
 
+// The live failure of 2026-09-21 on a busy Codex pane. Codex fences its composer
+// with nothing, so the scan that looks for the top of the draft runs up through the
+// transcript and every older turn on screen joins it: a 496-character message read
+// as 2021 characters at this guard's own 30-row read. Both screen comparisons then
+// refuse a message that is exactly right - renderedDraftMatches too, because a
+// region dragged out of the transcript has blank rows in it - and the send retried
+// into the same refusal every minute until its journal went stale.
+//
+// The pane's own counter settles it without reading anything: the host bumps
+// inputCount at the only two pty writes it has, so a pane standing at exactly the
+// count this send expected has had no key in it but ours since precheck found the
+// box empty.
+test('a guarded send is submitted on a busy pane its own counter vouches for', async () => {
+  const message = `[keep] unblocked - decide what to do next ${'x'.repeat(240)} and report back`;
+  // Turns above the composer, with no rule anywhere: this is what the parse eats.
+  const history = [
+    '› [keep] an earlier turn that is over',
+    '',
+    '',
+    '• Noted - I will avoid overlapping changes.',
+    '',
+    '  done 9:09 AM',
+    '',
+    '',
+  ];
+  const composed = (inputs) => (inputs.length
+    ? [...history, `› ${message.slice(0, 282)}`, `  ${message.slice(282)}`, '',
+      '  ~/repo · main · Full Access'].join('\n')
+    : [...history, '› Ask Codex to do anything', '', '  ~/repo · main · Full Access'].join('\n'));
+
+  // The journal's per-chunk recorder, as bin/delivery.js supplies it.
+  const recorder = () => {
+    let state = null;
+    const plans = [];
+    return {
+      plans,
+      get state() { return state && { ...state }; },
+      operationId: (index) => `${state.operationSeed}-${index}`,
+      plan(fields) { state = { version: 1, ...fields, acknowledgedChunks: 0, inFlightChunk: null, prefixHash: textHash('') }; plans.push(fields); },
+      start(index) { state.inFlightChunk = index; },
+      acknowledge(index, prefixHash) { state.acknowledgedChunks = index + 1; state.inFlightChunk = null; state.prefixHash = prefixHash; },
+      reject() { state.inFlightChunk = null; },
+      complete() { state.completedAt = 1; },
+    };
+  };
+  const { textHash } = require('./delivery');
+  const { draftIsExactly } = require('./serve');
+  const wedged = [...history, `› ${message.slice(0, 282)}`, `  ${message.slice(282)}`, '',
+    '  ~/repo · main · Full Access'].join('\n');
+  assert.equal(draftIsExactly(wedged, message, 'codex'), false,
+    'the fixture reproduces the parse that refuses a correct draft');
+
+  const harness = draftHarness(composed);
+  await typeAndSubmit({ pane: 'p' }, message, () => true, {
+    ...harness.deps, draftKind: 'codex', requireExactDraft: true, discardDraftOnAbort: true,
+    typingProgress: recorder(),
+  });
+  assert.equal(harness.inputs.at(-1), '\r', 'the counter vouched for the box, so Enter was pressed');
+  assert.equal(harness.events.some((e) => e.stage === 'draft-not-exact'), false);
+
+  // And the counter is the whole of the claim: one key from anybody else and the
+  // send is refused again, however the screen reads.
+  let added = false;
+  const touched = draftHarness(composed, (type, { inputs, foreign }) => {
+    if (type === 'input' && inputs.length === 2 && !added) { added = true; foreign.count += 1; }
+  });
+  const error = await typeAndSubmit({ pane: 'p' }, message, () => true, {
+    ...touched.deps, draftKind: 'codex', requireExactDraft: true, discardDraftOnAbort: true,
+    typingProgress: recorder(),
+  }).then(() => null, (failure) => failure);
+  assert.ok(error, 'a pane somebody else has touched is never submitted');
+  assert.equal(touched.inputs.includes('\r'), false, 'and Enter is never pressed on it');
+});
+
+// The counter speaks for the keys and nothing else, so everything it cannot speak
+// for has to hold before the composer block is believed. Every case here has a
+// counter that adds up; each fixture is built so that exactly one condition stands
+// between it and an Enter, so deleting that condition submits it.
+// The resume half of the same failure. A partial delivery re-reads 200 rows to
+// check the prefix it already typed is still on the pane, which on a busy Codex
+// pane drags in even more transcript than the 30 the Enter guard reads - so every
+// retry refused "the partial delivery draft changed" and the send could never
+// finish. The same proof licenses the same narrow read here.
+test('a partial resume on a busy pane checks its own composer, not the turns above', async () => {
+  const { textHash } = require('./delivery');
+  const chunkChars = 200;
+  // chunkForTyping breaks at the last space inside the limit, so the first chunk is
+  // built to end on one exactly at the limit and the rest is the second.
+  const lead = '[keep] resume this delivery ';
+  const prefix = `${lead}${'x'.repeat(chunkChars - lead.length - 1)} `;
+  const message = `${prefix}tail and report back`;
+  assert.equal(prefix.length, chunkChars);
+  const above = ['› [keep] an earlier turn that is over', '', '', '  done 9:09 AM', '', ''];
+  const footer = ['  ~/repo · main · Full Access'];
+  const row = (text) => [`› ${text.slice(0, 282)}`, ...(text.length > 282 ? [`  ${text.slice(282)}`] : [])];
+  // One chunk is already acknowledged and on the pane; the retry types the rest.
+  const screen = (inputs) => [...above, ...row(inputs.length > 1 ? message : prefix.trimEnd()), '', ...footer].join('\n');
+
+  const resumed = () => {
+    const state = {
+      version: 1, pid: 4242, initialInputCount: 0, chunkChars, chunkCount: 2,
+      operationSeed: 'delivery_1234567890abcdef', acknowledgedChunks: 1, inFlightChunk: null,
+      prefixHash: textHash(prefix),
+    };
+    return {
+      get state() { return { ...state }; },
+      operationId: (index) => `${state.operationSeed}-${index}`,
+      plan() { assert.fail('a resumed send plans nothing new'); },
+      start(index) { state.inFlightChunk = index; },
+      acknowledge(index, hash) { state.acknowledgedChunks = index + 1; state.inFlightChunk = null; state.prefixHash = hash; },
+      reject() { state.inFlightChunk = null; },
+      complete() { state.completedAt = 1; },
+    };
+  };
+
+  // stableScreen reads the snapshot, not just its text: the cursor has to be inside
+  // the block it accepted, which is the composer row the glyph starts.
+  const withCursor = (harness, render) => ({
+    ...harness.deps,
+    readScreenResult: async () => ({ text: render(harness.inputs), cursor: { x: 1, y: above.length } }),
+  });
+
+  const harness = draftHarness(screen);
+  harness.inputs.push(prefix); // the chunk the earlier attempt already got in
+  await typeAndSubmit({ pane: 'p' }, message, () => true, {
+    ...withCursor(harness, screen), draftKind: 'codex', requireExactDraft: true, discardDraftOnAbort: true,
+    typingProgress: resumed(),
+  });
+  assert.equal(harness.inputs.at(-1), '\r', 'the resume finished and submitted');
+  assert.equal(harness.inputs.length, 3, 'exactly one more chunk was typed, then Enter');
+
+  // A prefix the pane is no longer showing is still refused, busy screen or not.
+  const elsewhere = () => [...above, ...row('something else entirely'), '', ...footer].join('\n');
+  const moved = draftHarness(elsewhere);
+  moved.inputs.push(prefix);
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, message, () => true, {
+    ...withCursor(moved, elsewhere), draftKind: 'codex', requireExactDraft: true, discardDraftOnAbort: true,
+    typingProgress: resumed(),
+  }), /partial delivery draft changed/);
+  assert.equal(moved.inputs.length, 1, 'nothing more was typed into a pane that moved on');
+});
+
+test('the counter does not vouch for a dialog, for control bytes, or for Claude', async () => {
+  const plain = `[keep] decide what to do next ${'x'.repeat(240)} and report back`;
+  const above = ['› [keep] an earlier turn that is over', '', '', '  done 9:09 AM', '', ''];
+  const recorder = () => {
+    let state = null;
+    return {
+      get state() { return state && { ...state }; },
+      operationId: (index) => `${state.operationSeed}-${index}`,
+      plan(fields) { state = { version: 1, ...fields, acknowledgedChunks: 0, inFlightChunk: null, prefixHash: require('./delivery').textHash('') }; },
+      start(index) { state.inFlightChunk = index; },
+      acknowledge(index, prefixHash) { state.acknowledgedChunks = index + 1; state.inFlightChunk = null; state.prefixHash = prefixHash; },
+      reject() { state.inFlightChunk = null; },
+      complete() { state.completedAt = 1; },
+    };
+  };
+  const codexSend = (harness, text) => typeAndSubmit({ pane: 'p' }, text, () => true, {
+    ...harness.deps, draftKind: 'codex', requireExactDraft: true, discardDraftOnAbort: true,
+    typingProgress: recorder(),
+  });
+  const footer = ['  ~/repo · main · Full Access'];
+  // The tail is what sits under the composer once the text is in it. Before that
+  // the pane is an ordinary empty prompt, or the baseline check refuses first.
+  const box = (text, tail) => (inputs) => (inputs.length
+    ? [...above, `› ${text.slice(0, 282)}`, ...(text.length > 282 ? [`  ${text.slice(282)}`] : []), '', ...tail].join('\n')
+    : [...above, '› Ask Codex to do anything', '', ...footer].join('\n'));
+
+
+  // Output alone can raise a dialog after precheck looked, and a dialog is not a
+  // composer however well the counter adds up.
+  const dialog = draftHarness(box(plain, ['  Would you like to run the following command?', '', ...footer]));
+  await assert.rejects(codexSend(dialog, plain), /no longer holds only the typed message/);
+  assert.equal(dialog.inputs.includes('\r'), false, 'Enter is never pressed over a dialog');
+
+  // A control byte is an instruction to the terminal, not a character in a box:
+  // the counter counts the write, never what the application did with it.
+  const steering = `\u001b[A${plain}`;
+  const steered = draftHarness(box(steering, footer));
+  await assert.rejects(codexSend(steered, steering), /no longer holds only the typed message/);
+  assert.equal(steered.inputs.includes('\r'), false, 'Enter is never pressed for a steered draft');
+
+  // Claude is fenced by its rule, so its parse was never the problem and keeps
+  // deciding. A box holding more than the message is refused, counter or no.
+  const claudeBox = (inputs) => (inputs.length ? BOX(`${plain} and also rm -rf build`) : BOX(''));
+  const claude = draftHarness(claudeBox);
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, plain, () => true, {
+    ...claude.deps, draftKind: 'claude', requireExactDraft: true, discardDraftOnAbort: true,
+    typingProgress: recorder(),
+  }), /no longer holds only the typed message/);
+  assert.equal(claude.inputs.includes('\r'), false, 'Enter is never pressed on a Claude box with more in it');
+
+  // The load-bearing one: the counter can be perfect and the pane still not be
+  // showing our message, because it says nothing about what the application did
+  // with the bytes. The composer block has to match on its own.
+  const swallowed = draftHarness((inputs) => (inputs.length
+    ? [...above, '› a completely different line the app put there', '', ...footer].join('\n')
+    : [...above, '› Ask Codex to do anything', '', ...footer].join('\n')));
+  await assert.rejects(codexSend(swallowed, plain), /no longer holds only the typed message/);
+  assert.equal(swallowed.inputs.includes('\r'), false,
+    'a counter that adds up does not make the pane show what we sent');
+
+  // A carriage return is the dangerous one, and the block comparison cannot see it:
+  // whitespace is folded before the compare, so a pane showing a space where we
+  // sent \r matches perfectly. Left alone the write would submit at the \r and type
+  // the rest into the next composer, and the counter would still add up.
+  // (ESC is not in this list: it is stripped out of the rendered screen, so the
+  // block comparison already refuses it. These two survive the fold.)
+  for (const control of ['\r', '\t']) {
+    const text = `before${control}after`;
+    const folded = draftHarness((inputs) => (inputs.length
+      ? [...above, '› before after', '', ...footer].join('\n')
+      : [...above, '› Ask Codex to do anything', '', ...footer].join('\n')));
+    const { draftIsExactly } = require('./serve');
+    assert.equal(draftIsExactly(['› before after', '', ...footer].join('\n'), text, 'codex'), true,
+      `the compare folds ${JSON.stringify(control)} away, so only the plain-text rule is left`);
+    await assert.rejects(codexSend(folded, text), /no longer holds only the typed message/);
+    assert.equal(folded.inputs.includes('\r'), false,
+      `a message carrying ${JSON.stringify(control)} is never submitted`);
+  }
+
+  // A dialog that does not happen to land inside the composer block. The block
+  // matches, the counter matches, and the dialog check is all that refuses it.
+  const overlaid = draftHarness((inputs) => (inputs.length
+    ? [...above, '  Would you like to run the following command?', '',
+      `› ${plain.slice(0, 282)}`, `  ${plain.slice(282)}`, '', ...footer].join('\n')
+    : [...above, '› Ask Codex to do anything', '', ...footer].join('\n')));
+  await assert.rejects(codexSend(overlaid, plain), /no longer holds only the typed message/);
+  assert.equal(overlaid.inputs.includes('\r'), false, 'Enter is never pressed under a dialog');
+
+  // A Claude pane whose own ruled box holds more than the message, with something
+  // further up that a Codex-shaped read would accept. Contrived on purpose: it is
+  // here so that deleting the Codex gate submits it.
+  const crossRead = draftHarness((inputs) => (inputs.length
+    ? [`› ${plain}`, '', BOX(`${plain} and also rm -rf build`)].join('\n')
+    : BOX('')));
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, plain, () => true, {
+    ...crossRead.deps, draftKind: 'claude', requireExactDraft: true, discardDraftOnAbort: true,
+    typingProgress: recorder(),
+  }), /no longer holds only the typed message/);
+  assert.equal(crossRead.inputs.includes('\r'), false, 'a Claude box is never read with the Codex glyph');
+});
+
 test('the long-wrap fallback requires an empty stable baseline and an atomic guarded Enter', async () => {
   const message = `deliver ${'x'.repeat(430)} without adding a space-inside-this-token`;
   const draft = [`› ${message.slice(0, 282)}`, `  ${message.slice(282)}`, '',
