@@ -147,7 +147,7 @@ test('isolated browser: the console is usable on a 412px touch screen',
     server.on('upgrade', (_req, socket) => socket.destroy());
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const chrome = spawn(process.env.KEEP_CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-      ['--headless=new', '--disable-gpu', '--no-first-run', '--disable-background-networking',
+      ['--headless=new', '--use-mock-keychain', '--password-store=basic', '--disable-gpu', '--no-first-run', '--disable-background-networking',
         '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
     let ws;
     try {

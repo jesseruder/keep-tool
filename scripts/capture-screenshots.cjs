@@ -68,7 +68,7 @@ async function main() {
   try {
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     chrome = spawn(process.env.KEEP_CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', [
-      '--headless=new', '--disable-gpu', '--no-first-run', '--disable-background-networking', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank',
+      '--headless=new', '--use-mock-keychain', '--password-store=basic', '--disable-gpu', '--no-first-run', '--disable-background-networking', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank',
     ], { stdio: ['ignore', 'ignore', 'pipe'] });
     const endpoint = await new Promise((resolve, reject) => {
       let output = ''; const timer = setTimeout(() => reject(new Error('Chrome startup timed out')), 10000);

@@ -69,7 +69,7 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
   });
   server.on('upgrade', (_, socket) => socket.destroy());
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const chrome = spawn(process.env.KEEP_CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', ['--headless=new', '--disable-gpu', '--no-first-run', '--disable-background-networking', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
+  const chrome = spawn(process.env.KEEP_CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', ['--headless=new', '--use-mock-keychain', '--password-store=basic', '--disable-gpu', '--no-first-run', '--disable-background-networking', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
   let ws;
   try {
     const endpoint = await new Promise((resolve, reject) => {
