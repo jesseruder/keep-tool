@@ -114,6 +114,7 @@ const {
   addHostSessionState,
   backfillHostSessions,
   createDashboardClaudeSessionResolver,
+  companionSnapshot,
   applyCompanionJobs,
   applySessionLiveness,
   resumeAfterLimit,
@@ -7647,6 +7648,33 @@ test('Pi resume refuses an unmapped external process whose argv is only pi', asy
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('Pi resume ignores a verified active background worker process', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-background-resume-'));
+  const id = '77777777-7777-4777-8777-777777777778';
+  const workerId = '66666666-6666-4666-8666-666666666666';
+  const row = {
+    pid: 4242, ppid: 4141, pidStart: 'Sun Sep 21 10:00:00 2026',
+    args: `pi --session-id ${workerId}`, agent: 'pi', interactive: true,
+  };
+  const host = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pi-resumed' } } : {});
+  const deps = {
+    root, host, piExtensionReady: true,
+    scanSessions: () => [{ id, kind: 'pi', project: os.tmpdir() }],
+    resolveSessionTarget: async () => { throw new InjectionError(404, 'not live', { notLive: true }); },
+    agentProcessRows: async () => [row],
+    verifiedPiJobPids: () => new Set([row.pid]),
+    listHostPanes: async () => [],
+    waitForPiStart: async () => ({ phase: 'start' }),
+  };
+  try {
+    const live = await liveSessionPids(deps);
+    assert.equal(live.has(workerId), false, 'a private worker session does not become a live top-level row');
+    const resumed = await openSession({ sessionId: id }, deps);
+    assert.equal(resumed.pane, 'pi-resumed');
+    assert.match(resumed.command, new RegExp(`--session ${id}$`));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('Pi host-only row follows lifecycle while its first transcript is unwritten', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-host-only-'));
   const id = '77777777-7777-4777-8777-777777777777';
@@ -9878,6 +9906,42 @@ test('live companion jobs wait only their exact owning Claude session', () => {
     'a status question does not detach a still-live owned job');
   assert.equal(activity({ ...sessions[0], pendingQuestion: { question: 'Approve?', options: ['Yes', 'No'] } }, { now }).state, 'needs-input',
     'an explicit question remains visible while its companion runs');
+});
+
+test('Pi companion jobs attach only to their parent and clear after terminal state', () => {
+  const parent = { id: 'parent-session', kind: 'claude', endedTurn: true };
+  const worker = { id: 'private-worker-session', kind: 'pi', endedTurn: true };
+  const sessions = [parent, worker];
+  applyCompanionJobs(sessions, { known: true, jobs: [
+    { id: 'pi-queued', sessionId: parent.id, workerSessionId: worker.id, status: 'queued' },
+    { id: 'pi-running', sessionId: parent.id, workerSessionId: worker.id, status: 'running' },
+    { id: 'pi-cancelling', sessionId: parent.id, workerSessionId: worker.id, status: 'cancelling' },
+  ] });
+  assert.equal(parent.pendingBackground, true);
+  assert.deepEqual(parent.backgroundJobs.jobs.map((job) => job.id),
+    ['pi-queued', 'pi-running', 'pi-cancelling']);
+  assert.equal(worker.pendingBackground, undefined, 'the private worker id is not a dashboard owner');
+
+  applyCompanionJobs(sessions, { known: true, jobs: [
+    { id: 'pi-running', sessionId: parent.id, workerSessionId: worker.id, status: 'succeeded' },
+  ] });
+  assert.equal(parent.pendingBackground, false);
+  assert.equal(parent.backgroundJobs.pending, false);
+  assert.deepEqual(parent.backgroundJobs.jobs, []);
+});
+
+test('companion snapshot merges Codex and Pi jobs', async () => {
+  const snapshot = await companionSnapshot({
+    root: '/unused',
+    discoverCodexJobs: async () => ({ known: true, complete: true, jobs: [
+      { id: 'codex-job', sessionId: 'parent', state: 'running' },
+    ] }),
+    discoverPiJobs: () => ({ known: true, discovery: 'ok', jobs: [
+      { id: 'pi-job', sessionId: 'parent', state: 'queued' },
+    ] }),
+  });
+  assert.equal(snapshot.known, true);
+  assert.deepEqual(snapshot.jobs.map((job) => job.id), ['codex-job', 'pi-job']);
 });
 
 test('buildState includes companion ownership in normal session classification', () => {

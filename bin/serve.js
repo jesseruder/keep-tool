@@ -487,10 +487,34 @@ function stallAliveIds(ledger, now) {
 }
 
 async function companionSnapshot(deps = {}) {
-  const discover = deps.discoverCodexJobs || ((options) => require('./codexjobs').list(options));
+  const injected = Boolean(deps.discoverCodexJobs || deps.discoverPiJobs);
+  const empty = () => ({ known: true, complete: true, discovery: 'ok', jobs: [] });
+  const discoverCodex = deps.discoverCodexJobs
+    || (injected ? empty : (options) => require('./codexjobs').list(options));
+  const discoverPi = deps.discoverPiJobs
+    || (injected ? empty : (options) => require('./pi-jobs').list(options));
+  const discover = async (options) => {
+    const [codexJobs, piJobs] = await Promise.all([
+      Promise.resolve(discoverCodex(options, deps)),
+      Promise.resolve(discoverPi(options, deps)),
+    ]);
+    const snapshots = [codexJobs, piJobs].filter(Boolean);
+    const known = snapshots.some((snapshot) => snapshot.known
+      ?? (snapshot.discovery && snapshot.discovery !== 'unknown'));
+    const complete = snapshots.every((snapshot) => snapshot.complete === true
+      || snapshot.discovery === 'ok');
+    return {
+      known,
+      complete,
+      discovery: !known ? 'unknown' : complete ? 'ok' : 'partial',
+      jobs: snapshots.flatMap((snapshot) => snapshot.jobs || []),
+    };
+  };
   const now = typeof deps.now === 'function' ? Number(deps.now()) : Number(deps.now ?? Date.now());
   // Injected discovery is request scoped and must not share production cache state.
-  if (deps.discoverCodexJobs) return discover({ root: deps.root || keep.ROOT, fallbackCacheMs: COMPANION_SNAPSHOT_MS }, deps);
+  if (injected) {
+    return discover({ root: deps.root || keep.ROOT, fallbackCacheMs: COMPANION_SNAPSHOT_MS });
+  }
   if (companionSnapshotCache.value && now - companionSnapshotCache.at < COMPANION_SNAPSHOT_MS) return companionSnapshotCache.value;
   if (companionSnapshotCache.pending) return companionSnapshotCache.pending;
   companionSnapshotCache.pending = discover({ root: deps.root || keep.ROOT, fallbackCacheMs: COMPANION_SNAPSHOT_MS })
@@ -511,7 +535,7 @@ function applyCompanionJobs(sessions, companion) {
   for (const job of companion.jobs || []) {
     if (!job) continue;
     const state = job.state || job.status;
-    if (!job.id || !['running', 'queued', 'stalled'].includes(state) || typeof job.sessionId !== 'string' || !job.sessionId) continue;
+    if (!job.id || !['running', 'queued', 'cancelling', 'stalled'].includes(state) || typeof job.sessionId !== 'string' || !job.sessionId) continue;
     if (!byOwner.has(job.sessionId)) byOwner.set(job.sessionId, []);
     byOwner.get(job.sessionId).push({
       id: String(job.id), kind: 'companion', status: 'pending', recurring: false,
@@ -519,18 +543,28 @@ function applyCompanionJobs(sessions, companion) {
     });
   }
   for (const session of sessions || []) {
-    const owned = byOwner.get(session.id);
-    if (!owned?.length) continue;
-    const background = session.backgroundJobs || {
+    const owned = byOwner.get(session.id) || [];
+    const existing = session.backgroundJobs;
+    const priorJobs = existing?.jobs || [];
+    const hadCompanion = priorJobs.some((job) => job.kind === 'companion');
+    if (!owned.length && !hadCompanion) continue;
+    const background = existing || {
       jobs: [], uncertain: [], caughtUp: true, turnStartedAt: session.turnStartedAt || 0,
     };
     const companionIds = new Set(owned.map((job) => job.id));
+    const nativeJobs = priorJobs.filter((job) => job.kind !== 'companion'
+      && !companionIds.has(String(job.id)));
+    const nativePending = nativeJobs.some((job) => {
+      const state = job.state || job.status;
+      return !['completed', 'failed', 'cancelled', 'succeeded', 'dead'].includes(state)
+        && !['service', 'scheduled'].includes(job.kind);
+    });
     session.backgroundJobs = {
       ...background,
-      jobs: [...(background.jobs || []).filter((job) => !companionIds.has(String(job.id))), ...owned],
-      pending: true,
+      jobs: [...nativeJobs, ...owned],
+      pending: owned.length > 0 || (hadCompanion ? nativePending : Boolean(background.pending)),
     };
-    session.pendingBackground = true;
+    session.pendingBackground = owned.length > 0 || (hadCompanion ? nativePending : Boolean(session.pendingBackground));
   }
   return sessions;
 }
@@ -4124,6 +4158,19 @@ async function agentProcessRows(deps = {}) {
   return parseProcessTable(String(result.stdout || ''));
 }
 
+function verifiedPiBackgroundPids(rows, deps = {}) {
+  try {
+    const found = (deps.verifiedPiJobPids || require('./pi-jobs').verifiedProcessPids)(rows, {
+      root: deps.root || keep.ROOT,
+    });
+    return found instanceof Set ? found : new Set();
+  } catch {
+    // Failed verification is deliberately conservative: an unverified Pi process
+    // remains eligible for the normal concurrent-resume guard.
+    return new Set();
+  }
+}
+
 function paneRecordEntries(deps = {}) {
   if (deps.paneRecords instanceof Map) return new Map(deps.paneRecords);
   const records = new Map();
@@ -4238,7 +4285,8 @@ async function liveSessionPids(deps = {}) {
     const found = await (deps.agentProcessRows || agentProcessRows)(deps);
     if (Array.isArray(found)) rows = found;
   } catch {}
-  const interactive = rows.filter((row) => row.interactive);
+  const backgroundPiPids = verifiedPiBackgroundPids(rows, deps);
+  const interactive = rows.filter((row) => row.interactive && !backgroundPiPids.has(row.pid));
   const interactiveByPid = new Map(interactive.map((row) => [row.pid, row]));
 
   // Explicit resume argv is the strongest process-to-session identity.
@@ -7315,11 +7363,12 @@ async function openSession(body, deps = {}) {
         // resume instead of risking two writers on one Pi JSONL file.
         const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
         const panes = await (deps.listHostPanes || listHostPanes)(deps, true) || [];
+        const backgroundPiPids = verifiedPiBackgroundPids(rows, deps);
         const hosts = new Set(panes.filter((pane) => pane.alive && pane.meta?.agent === 'pi')
           .map((pane) => pane.pid).filter(Number.isInteger));
         const byPid = new Map(rows.map((row) => [row.pid, row]));
         const external = rows.find((row) => {
-          if (row.agent !== 'pi' || !row.interactive) return false;
+          if (row.agent !== 'pi' || !row.interactive || backgroundPiPids.has(row.pid)) return false;
           let current = row;
           const seen = new Set();
           while (current && !seen.has(current.pid)) {
