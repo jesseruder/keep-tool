@@ -116,14 +116,31 @@ and wait for Jesse's choice before launching. An existing choice for that task i
 enough. Quota exhaustion and approval on an earlier task do not authorize a switch.
 Preserve the orchestrator's existing defaults for other tasks.
 
-Use a managed Keep session and the ownership rules below. Give the worker the
-worktree, scope, constraints, acceptance criteria, and relevant checks. Assign the
+Use `keep pi task --background` for delegated work. It runs a background worker
+without opening a desktop pane or taking ownership of the parent's card. Reserve
+`keep open --fresh --agent pi` for an interactive session or a full card handoff.
+
+Launch from the intended worktree. When delegating a plan step, register it with:
+
+```sh
+keep delegate <card> --step <n> -- keep pi task --background --model opencode-go/minimax-m3 -- 'Scoped task; parent owns card updates, independent review and landing.'
+```
+
+Omit `--model` to use Pi's configured default. For work without a plan, use
+`keep pi task --background` directly. Capture the job id, inspect
+`keep pi status <job> --json`, and retrieve `keep pi result <job>` when it finishes.
+The parent records the outcome on its card. A queued or running job is not a result;
+inspect failed jobs before retrying. Use `keep pi cancel <job>` to stop a worker.
+Pi workers do not accept `keep tell`; a follow-up uses a new scoped task with the
+prior result and current worktree state as context.
+
+Give the worker the worktree, scope, constraints, acceptance criteria, and relevant
+checks. Assign the
 complete investigate/edit/verify/repair loop; request a commit, check results, and
 remaining concerns. State that the parent owns independent review and landing and
 that the worker must not launch its own reviewer or land. Preserve the existing
 review policy. Bring repeated failures or architectural decisions back to the
-parent rather than retrying the same approach indefinitely. Follow the Pi messaging
-limitations above when arranging follow-up work.
+parent rather than retrying the same approach indefinitely.
 
 ### Registering a step assignment
 

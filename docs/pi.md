@@ -41,6 +41,31 @@ credentials and does not need an API key.
 
 ## Session lifecycle
 
+### Delegated background work
+
+Codex and Claude can delegate a scoped task to Pi without opening another desktop
+session. Pi delegation is opt-in per task. Launch from the assigned worktree:
+
+```sh
+keep pi task --background --model opencode-go/minimax-m3 -- 'Implement the scoped task, verify it, and report the commit and checks. Parent owns review and landing.'
+keep pi status <job-id> --json
+keep pi result <job-id>
+keep pi cancel <job-id>
+```
+
+Use `keep delegate <card> --step <n> -- keep pi task --background -- '<task>'`
+to associate a worker with a plan step. The parent retains the card and records the
+outcome. Job status, output, and private Pi transcripts live under
+`~/keep/.keep/pi-jobs/`; they do not create top-level desktop sessions. Running
+jobs contribute to the parent's pending background work. Omit `--model` to use
+Pi's configured default. Failed or cancelled jobs remain inspectable.
+
+Workers run a single task to completion. They do not accept interactive messages
+or `keep tell`; start a new scoped task for a follow-up. Keep's interactive session
+path below remains available when the user wants a Pi terminal or a full handoff.
+
+### Interactive sessions
+
 Keep opens a fresh Pi session with a stable Pi session id:
 
 ```sh
