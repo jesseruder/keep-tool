@@ -31,7 +31,8 @@ test('every fixture screen reads the way its json says', () => {
     assert.ok(match.options.length >= 1, `${name}: options`);
     assert.equal(match.options.filter((option) => option.highlighted).length, 1,
       `${name}: exactly one option is highlighted`);
-    assert.match(match.footer, /Enter to confirm|Esc to (cancel|exit)/i, `${name}: footer`);
+    if (expected.footer === null) assert.equal(match.footer, null, `${name}: drawn with no footer`);
+    else assert.match(match.footer, /Enter to confirm|Esc to (cancel|exit)/i, `${name}: footer`);
   }
 });
 
@@ -44,7 +45,7 @@ test('an option that wraps across rows stays one option', () => {
   assert.match(narrow.options[1].text, /^Remove worktree All changes/);
 });
 
-test('a block needs a heading, one highlighted option and a footer', () => {
+test('a block needs a heading, one highlighted option and a footer, unless its dialog is drawn without one', () => {
   const rows = [
     '  Exiting worktree session',
     '  ❯ 1. Keep worktree    Stays at /tmp/wt',
@@ -60,6 +61,74 @@ test('a block needs a heading, one highlighted option and a footer', () => {
   assert.equal(recognize([rows[0], rows[1], '  ❯ 2. Remove worktree', rows[3]].join('\n')), null);
   assert.equal(recognize(''), null);
   assert.equal(recognize('Keep worktree is what wt land assumes\n❯ '), null);
+});
+
+// After ee972e6 the compaction swap still failed "model switch unconfirmed" twice, each run
+// logging "a model-switch dialog for #8 is not answerable by Keep (/model opus)": Claude
+// Code draws Switch model? with its input guide hidden and the prompt hidden under it
+// (hideInputGuide and hidesPrompt in 2.1.274's own source), so the footer every block
+// needed is never drawn. The guideless screens are reconstructed from that source.
+test('the model switch dialog is recognized with no footer, and is live only with nothing under it', () => {
+  const read = (name) => recognize(fs.readFileSync(path.join(FIXTURES, `${name}.txt`), 'utf8'));
+  const live = read('model-switch-guideless');
+  assert.equal(live && live.kind, 'model-switch', 'the dialog as Claude Code draws it is recognized');
+  assert.equal(live.live, true, 'with only blank rows under its options it is the live UI');
+  assert.equal(live.footer, null, 'it reads as having no footer rather than borrowing a row for one');
+  assert.deepEqual(live.options.map((option) => option.text), ['Yes, switch to Opus 5', 'No, go back'],
+    'its option list ends where its paragraph does');
+  assert.equal(read('model-switch-guideless-retained-above-live').live, false,
+    'a footerless copy above a live input box is not the live UI');
+
+  // With no footer, only the option rows end the block: renderScreen trims trailing blank
+  // rows, and neither an input box nor a shell prompt leaves one between itself and the
+  // rows above it. Found by the review of 14e600f, where each of these read as live.
+  const rule = '─'.repeat(40);
+  const options = ['  ❯ 1. Yes, switch to Opus 5', '    2. No, go back'];
+  const dialog = ['  Switch model?', '  Your next response will be slower and use more tokens', '', ...options];
+  const underneath = {
+    'the dialog text typed into the input box': ['❯ /model opus', '  ⎿  Kept model as Fable 5.1', '', rule,
+      '❯ Keep escaped this again:', '  Switch model?', ...options, rule, '  ⏵⏵ auto mode on (shift+tab to cycle)'],
+    'a copy with the input box directly under it': [...dialog, rule, '❯ please fix the compaction', rule,
+      '  ⏵⏵ auto mode on (shift+tab to cycle)'],
+    'a shell prompt printed under a dead pane\'s dialog': [...dialog, 'eric@mbp keep % git reset --hard origin/mas'],
+    'an oh-my-zsh prompt under a dead pane\'s dialog': [...dialog, '➜  keep git:(master) ✗ git reset --hard'],
+    'a Codex prompt under the dialog\'s text': [...dialog, '› Keep escaped this again'],
+  };
+  for (const [what, rows] of Object.entries(underneath)) {
+    const match = recognize(rows.join('\n'));
+    assert.equal(match && match.kind, 'model-switch', `${what}: still the dialog's text`);
+    assert.equal(match.live, false, `${what}: is not the live UI`);
+    assert.deepEqual(match.options.map((option) => option.text), ['Yes, switch to Opus 5', 'No, go back'],
+      `${what}: no row under the options is read as part of them`);
+  }
+
+  // Between 73 and 76 columns the restore leg's body wraps to start a row with "5.1
+  // means", which reads as an option numbered 5 above option 1 (round-2 review of b1b23c0).
+  const restore = recognize(['  Switch model?', '  Your next response will be slower and use more tokens', '',
+    '  This conversation is cached for the current model. Switching to Fable',
+    '  5.1 means the full history gets re-read on your next message.', '',
+    '  ❯ 1. Yes, switch to Fable 5.1', '    2. No, go back', ''].join('\n'));
+  assert.equal(restore && restore.kind, 'model-switch', 'a body row that starts with "5.1" leaves the dialog known');
+  assert.deepEqual(restore.options.map((option) => option.number), [1, 2],
+    'a body row above the option list is not an option');
+
+  const goBack = recognize(['  Switch model?', '    1. Yes, switch to Opus 5', '  ❯ 2. No, go back', ''].join('\n'));
+  assert.equal(goBack && goBack.kind, 'model-switch', 'the cursor on "No, go back" is still this dialog');
+  assert.deepEqual(goBack.options.map((option) => option.number), [1, 2],
+    'the options above the cursor are part of the list');
+
+  assert.equal(recognize(['  Switch model?', '  ❯ 1. Yes, switch to Opus 5', '  ❯ 2. No, go back', ''].join('\n')),
+    null, 'a footerless list with two highlighted rows is a frame caught mid-repaint, not one dialog');
+
+  // Only a dialog Claude Code is known to draw that way. Any other still needs a footer to
+  // mark where it ends — the worktree exit prompt is pinned above.
+  assert.equal(recognize([
+    '  Restart this session on a different model?',
+    '',
+    '  ❯ 1. Yes, switch to Opus 5',
+    '    2. No, go back',
+    '',
+  ].join('\n')), null, 'an unknown dialog with no footer is not a block');
 });
 
 test('a well-formed dialog whose options are not the known ones is unknown, not invisible', () => {
@@ -156,7 +225,9 @@ test('a refusal names the dialog, and an unknown one carries its heading', () =>
 
 test('showsDialog also sees a dialog that has not finished rendering', () => {
   const half = fs.readFileSync(path.join(FIXTURES, 'model-switch-half-rendered.txt'), 'utf8');
-  assert.equal(recognize(half), null);
+  const noOptionsYet = half.slice(0, half.indexOf('❯'));
+  assert.equal(recognize(noOptionsYet), null, 'with no option drawn yet there is no block to read');
+  assert.equal(showsDialog('model-switch', noOptionsYet), true);
   assert.equal(showsDialog('model-switch', half), true);
   assert.equal(showsDialog('model-switch', '❯ 1. Yes, switch to Sonnet 5\n  2. No, go back'), true);
   assert.equal(showsDialog('model-switch', 'Set model to Sonnet 5 and saved as your default for new sessions'), false);

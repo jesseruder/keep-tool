@@ -3053,8 +3053,8 @@ test('a model switch is confirmed only after the last echo of the full command',
   assert.equal(modelSwitchConfirmed(pending, '/model sonnet'), false);
   assert.equal(modelSwitchConfirmed(`${pending}\n${oldResult}`, '/model sonnet'), true);
   assert.equal(modelSwitchConfirmed('⎿ Set model to Sonnet 5', '/model sonnet'), false);
-  assert.equal(modelSwitchDialogAnswerable(pending, '/model sonnet'), false,
-    'a dialog whose footer has not rendered is not one to press Enter at');
+  assert.equal(modelSwitchDialogAnswerable(pending, '/model sonnet'), true,
+    'Claude Code draws this dialog with no footer, so none is waited for');
   assert.equal(modelSwitchDialogAnswerable('Switch model?\n❯ 1. Yes, switch to Sonnet 5', '/model sonnet'), false,
     'a half-drawn dialog is not one to press Enter at');
 });
@@ -3320,6 +3320,73 @@ test('the model switch dialog is answered when Claude Code has taken the typed /
   assert.deepEqual(refused.keys, ['Enter'],
     'a refused Enter is not retried: somebody else is at that dialog');
   assert.equal(refused.ok, false, 'and nothing it did not send is reported as confirmed');
+});
+
+// ee972e6 made the dialog the anchor, and review-compact still failed twice more with
+// "model switch unconfirmed", each run logging "a model-switch dialog for #8 is not
+// answerable by Keep (/model opus)" and ending "Kept model as Fable 5.1" in #8's
+// transcript. Claude Code draws Switch model? with no footer at all (hideInputGuide in
+// 2.1.274's own source), and every reading here demanded "Enter to confirm". The screens
+// are reconstructed from that source: the dialog cannot be raised without spending a turn.
+test('the model switch dialog Claude Code draws without a footer is answered on both legs of the swap', async () => {
+  const forward = claudePromptFixture('model-switch-guideless');
+  const restore = forward.replace(/Opus 5/g, 'Fable 5.1');
+  const run = async (command, screenAt) => {
+    const keys = [];
+    let at = 0;
+    const ok = await waitForModelSwitch({ pane: 'pane-8' }, command, '#8', {
+      now: () => at,
+      sleep: async (ms) => { at += Math.max(1, ms); },
+      readScreen: async () => screenAt(keys.length),
+      livePaneState: async () => ({ inputCount: 7, pid: 4242 }),
+      pressTargetKey: async (target, key) => { keys.push(key); },
+    });
+    return { ok, keys };
+  };
+  const echo = (command, model) => [`❯ ${command}`,
+    `  ⎿  Set model to ${model} and saved as your default for new sessions`, '', '❯'].join('\n');
+
+  const switched = await run('/model opus', (pressed) => (pressed ? echo('/model opus', 'Opus 5') : forward));
+  assert.deepEqual(switched.keys, ['Enter'], 'the footerless dialog the swap opened is answered with one Enter');
+  assert.equal(switched.ok, true, 'and the switch to the compaction model is confirmed');
+
+  const restored = await run('/model claude-fable-5-1',
+    (pressed) => (pressed ? echo('/model claude-fable-5-1', 'Fable 5.1') : restore));
+  assert.deepEqual(restored.keys, ['Enter'], 'the restore leg answers the same dialog offering the original model');
+  assert.equal(restored.ok, true, 'and the session is confirmed back on its own model');
+
+  // At 73-76 columns the body wraps to start a row with "5.1 means", an option-shaped row.
+  const wrappedRestore = restore.replace('Switching to Fable 5.1 means', 'Switching to Fable\n  5.1 means');
+  const restoredNarrow = await run('/model claude-fable-5-1',
+    (pressed) => (pressed ? echo('/model claude-fable-5-1', 'Fable 5.1') : wrappedRestore));
+  assert.deepEqual(restoredNarrow.keys, ['Enter'],
+    'a body row that wraps to start with the model\'s version does not stop the restore being answered');
+  assert.equal(restoredNarrow.ok, true, 'and the session is confirmed back on its own model');
+
+  const retained = await run('/model opus', () => claudePromptFixture('model-switch-guideless-retained-above-live'));
+  assert.deepEqual(retained.keys, [], 'a footerless copy above a live input box never takes the Enter');
+  assert.equal(retained.ok, false, 'and the switch is reported unconfirmed instead');
+
+  // A viewer who escaped the real dialog and typed its text into the prompt within the
+  // wait: no blank row separates it from the input box's own rule below.
+  const rule = '─'.repeat(40);
+  const typedIn = ['❯ /model opus', '  ⎿  Kept model as Fable 5.1', '', rule, '❯ Keep escaped this again:',
+    '  Switch model?', '  ❯ 1. Yes, switch to Opus 5', '    2. No, go back', rule,
+    '  ⏵⏵ auto mode on (shift+tab to cycle)'].join('\n');
+  assert.deepEqual((await run('/model opus', () => typedIn)).keys, [],
+    'the dialog\'s text in a half-written message never takes the Enter that would submit it');
+
+  const goBack = forward.replace('  ❯ 1. Yes', '    1. Yes').replace('    2. No', '  ❯ 2. No');
+  assert.deepEqual((await run('/model opus', () => goBack)).keys, [],
+    'Enter is never pressed with "No, go back" under the cursor');
+  const grown = forward.replace('    2. No, go back', '    2. No, go back\n    3. Yes, and switch every session to Opus 5');
+  assert.deepEqual((await run('/model opus', () => grown)).keys, [],
+    'an option list grown an entry is a dialog whose Enter means something new');
+  assert.deepEqual((await run('/model sonnet', () => forward)).keys, [],
+    'a footerless dialog offering a model this command did not ask for is never answered');
+  const escOnly = forward.replace(/\n*$/, '\n\n  Esc to cancel\n');
+  assert.deepEqual((await run('/model opus', () => escOnly)).keys, [],
+    'a footer that is there but offers only Esc still refuses the Enter');
 });
 
 test('the worktree exit prompt is answered only when Keep worktree is the highlighted option', () => {

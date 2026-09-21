@@ -1,7 +1,7 @@
 {
   "kind": "model-switch",
   "highlighted": 1,
-  "live": true,
+  "live": false,
   "heading": "Switch model?",
   "answerable": false,
   "footer": null

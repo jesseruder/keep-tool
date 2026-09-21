@@ -3041,10 +3041,12 @@ function modelSwitchDialogVisible(screen) {
 // affordance — see bin/claude-prompts.js), "No, go back" under the cursor, an option list
 // Claude Code has since grown a third entry on, or an offer to switch to a model nobody
 // asked for. The screens each of those reads are under bin/fixtures/claude-prompts/.
+// Claude Code draws this dialog with no footer at all, so only a footer that is there has
+// to offer the Enter.
 function modelSwitchDialogOffer(screen, command) {
   const match = claudePrompts.recognize(screen);
   if (!match || !match.live || match.kind !== 'model-switch') return '';
-  if (!/Enter to confirm/i.test(match.footer || '')) return '';
+  if (match.footer !== null && !/Enter to confirm/i.test(match.footer || '')) return '';
   const options = match.options || [];
   if (options.length !== 2) return '';
   const [yes] = options;

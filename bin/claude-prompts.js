@@ -6,8 +6,9 @@
 // dialog used to get its own ad-hoc detector in serve.js, and each new dialog Claude Code
 // shipped cost a failed transfer and a debugging session. This module recognizes the
 // *shape* they all share — a heading, a numbered option list with exactly one highlighted
-// row, and a footer — so an unknown dialog is still recognized as a dialog, and a new one
-// is a fixture pair under bin/fixtures/claude-prompts/ plus (optionally) an entry here.
+// row, and a footer, except where a known dialog is drawn without one — so an unknown
+// dialog is still recognized as a dialog, and a new one is a fixture pair under
+// bin/fixtures/claude-prompts/ plus (optionally) an entry here.
 //
 // The block rules below are the ones the worktree-exit detector learned the hard way:
 // matching a *block* rather than the viewport, taking the lowest qualifying block, and
@@ -65,6 +66,9 @@ const DIALOGS = [
     kind: 'model-switch',
     heading: /Switch model\?/i,
     options: [/Yes, switch to/i],
+    // Claude Code draws this one with its input guide hidden and the prompt hidden under
+    // it (hideInputGuide, hidesPrompt), so there is no footer: the option list is its end.
+    guideless: true,
     signals: [/Switch model\?/i, /Yes, switch to/i],
     policy: { action: 'refuse', label: 'model switch' },
   },
@@ -143,14 +147,26 @@ function blockAt(lines, index) {
   for (let i = heading + 1; i < index; i += 1) if (HIGHLIGHTED.test(lines[i])) return null;
 
   const offset = lines.slice(index + 1, bottom + 1).findIndex((line) => FOOTER.test(line));
-  if (offset === -1) return null;
-  const footer = index + 1 + offset;
-  for (let i = index + 1; i <= footer; i += 1) if (HIGHLIGHTED.test(lines[i])) return null;
+  const footer = offset === -1 ? -1 : index + 1 + offset;
+  let first = heading + 1, last = footer;
+  if (footer === -1) {
+    if (!dialog || !dialog.guideless) return null;
+    // Option rows only, both ways: the screen read trims trailing blank rows, and an input
+    // box or a shell prompt sits directly under whatever is above it, so absorbing the next
+    // non-blank row as a wrap would read that row as part of a live dialog; and a body row
+    // that wraps to start "5.1 means" reads as an option above option 1. An option that
+    // wraps ends the list early instead, which leaves it unanswered.
+    first = index;
+    while (first > heading + 1 && OPTION.test(lines[first - 1])) first -= 1;
+    last = index;
+    while (last < bottom && OPTION.test(lines[last + 1])) last += 1;
+  }
+  for (let i = index + 1; i <= last; i += 1) if (HIGHLIGHTED.test(lines[i])) return null;
 
   // A narrow pane wraps an option's text onto rows of its own, so an option runs until
   // the next row that starts an option — anything before that is the wrap, not a sibling.
   const options = [];
-  for (let i = heading + 1; i < footer; i += 1) {
+  for (let i = first; i < (footer === -1 ? last + 1 : footer); i += 1) {
     const option = lines[i].match(OPTION);
     if (option) {
       options.push({ number: Number(option[1]), text: option[2], highlighted: i === index });
@@ -174,8 +190,8 @@ function blockAt(lines, index) {
     heading: lines[heading],
     options,
     highlighted: options.find((option) => option.highlighted)?.number ?? null,
-    footer: lines[footer],
-    footerRow: footer,
+    footer: footer === -1 ? null : lines[footer],
+    lastRow: last,
   };
 }
 
@@ -187,17 +203,18 @@ function recognize(screenText) {
   for (let index = 0; index < lines.length; index += 1) {
     if (!HIGHLIGHTED.test(lines[index])) continue;
     const block = blockAt(lines, index);
-    if (block && (!found || block.footerRow >= found.footerRow)) found = block;
+    if (block && (!found || block.lastRow >= found.lastRow)) found = block;
   }
   if (!found) return null;
-  const { footerRow, ...match } = found;
+  const { lastRow, ...match } = found;
   // A live modal owns the bottom of the screen: nothing but blank rows sits under its
-  // footer. A retained copy sits above whatever is open now instead, and that can be
-  // anything — a Claude input box, a Codex `›` prompt, a zsh prompt with a half-typed
-  // command, a status line — none of which wants a keystroke. Enumerating what may not
-  // appear there would miss one, so nothing may. A live modal that some rendering puts
-  // text under simply goes unrecognized, which is the timeout this already had.
-  return { ...match, live: lines.slice(footerRow + 1).every((line) => !line) };
+  // footer, or under its options when it is drawn without one. A retained copy sits above
+  // whatever is open now instead, and that can be anything — a Claude input box, a Codex
+  // `›` prompt, a zsh prompt with a half-typed command, a status line — none of which
+  // wants a keystroke. Enumerating what may not appear there would miss one, so nothing
+  // may. A live modal that some rendering puts text under simply goes unrecognized, which
+  // is the timeout this already had.
+  return { ...match, live: lines.slice(lastRow + 1).every((line) => !line) };
 }
 
 // A looser reading: is this dialog's text on screen at all? recognize() is the reliable
