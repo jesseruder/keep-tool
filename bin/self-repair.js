@@ -1669,18 +1669,18 @@ function status(options = {}) {
   const state = loadState(root);
   const open = [];
   const cooling = [];
-  const resolved = [];
+  const watching = [];
   for (const [sig, entry] of Object.entries(state.signatures)) {
     const row = { sig, ...entry };
     if (entry && entry.cardId && !entry.resolvedAt) open.push(row);
     else if (entry && entry.cooldownUntil && now < Number(entry.cooldownUntil)) cooling.push(row);
-    else resolved.push(row);
+    else watching.push(row);
   }
   return {
     config,
     day: state.day,
     openedToday: Number(state.openedToday || 0),
-    open, cooling, resolved,
+    open, cooling, watching,
   };
 }
 
@@ -1711,9 +1711,9 @@ function renderStatus(value) {
     + `${row.worktree ? `, ${row.worktree}` : ''}`
     + `, opened ${stamp(row.openedAt)}, ${row.attempts || 0} attempt(s)${state(row)}`);
   section('cooling down', value.cooling, (row) => `${row.sig} — card ${row.cardId || '(none)'}, until ${stamp(row.cooldownUntil)}`);
-  section('watching', value.resolved, (row) => `${row.sig} — first seen ${stamp(row.firstSeenAt)}`
+  section('watching', value.watching, (row) => `${row.sig} — first seen ${stamp(row.firstSeenAt)}`
     + `${row.cardId ? `, last card ${row.cardId}` : ''}${row.resolvedAt ? `, resolved ${stamp(row.resolvedAt)}` : ''}`);
-  if (!value.open.length && !value.cooling.length && !value.resolved.length) lines.push('', 'no signatures tracked');
+  if (!value.open.length && !value.cooling.length && !value.watching.length) lines.push('', 'no signatures tracked');
   return lines.join('\n');
 }
 

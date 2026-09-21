@@ -1087,13 +1087,49 @@ test('the status listing says why a row is not doing anything', () => {
   const rows = (entry) => selfRepair.renderStatus({
     config: selfRepair.DEFAULT_CONFIG, day: '2026-09-15', openedToday: 1,
     open: [{ sig: 'sched:unblock:abcd1234', cardId: 'a-repair-card', openedAt: NOW, attempts: 3, ...entry }],
-    cooling: [], resolved: [],
+    cooling: [], watching: [],
   });
   assert.match(rows({ launchGaveUp: true }), /— gave up after 3 sessions \(--reset to start over\)/);
   assert.match(rows({ relaunchDue: true }), /— relaunch due/);
   assert.match(rows({ deadSince: NOW }), /— pane unseen since 2026-09-15 12:00/);
   // A row that is simply working says none of it.
   assert.doesNotMatch(rows({ sessionId: 'abcd1234-0000', pane: 'pane-1' }), /gave up|relaunch due|pane unseen/);
+});
+
+test('status exposes the third bucket as "watching", not "resolved", to match the renderer', () => {
+  // The renderer has always called the third bucket "watching". The status JSON
+  // was labelling it "resolved", which made `--json` and the rendered output
+  // disagree. Rename it so the two spell one concept.
+  const root = makeRoot();
+  try {
+    // A signature in each of the three states, so each bucket is exercised.
+    selfRepair.mutateState((state) => {
+      state.signatures['sched:open:11111111'] = { firstSeenAt: NOW, cardId: 'open-card', openedAt: NOW };
+      state.signatures['sched:cool:22222222'] = {
+        firstSeenAt: NOW, cardId: 'cooling-card', resolvedAt: NOW - 2 * 3600e3,
+        cooldownUntil: NOW + 6 * 3600e3,
+      };
+      state.signatures['sched:seen:33333333'] = { firstSeenAt: NOW };
+      state.day = '2026-09-15';
+      state.openedToday = 0;
+    }, { root, now: NOW });
+    const value = selfRepair.status({ root, now: NOW, config: selfRepair.DEFAULT_CONFIG });
+    assert.equal('watching' in value, true, 'status JSON names the third bucket watching');
+    assert.equal('resolved' in value, false, 'the old resolved key must not reappear');
+    assert.deepEqual(value.open.map((row) => row.sig), ['sched:open:11111111']);
+    assert.deepEqual(value.cooling.map((row) => row.sig), ['sched:cool:22222222']);
+    assert.deepEqual(value.watching.map((row) => row.sig), ['sched:seen:33333333']);
+
+    // renderStatus reads from `watching`, not from a stale `resolved` key.
+    const line = selfRepair.renderStatus(value);
+    assert.match(line, /watching \(1\)/);
+    assert.match(line, /sched:seen:33333333/);
+
+    // The cycle-resolved concept is a different field on a different object —
+    // tick().result.resolved is still the array of signatures that actually
+    // cleared in that cycle, and renderStatus has no business touching it.
+    assert.equal('resolved' in value, false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('--reset works after a give-up, which is exactly what the card told Owner to do', () => {
