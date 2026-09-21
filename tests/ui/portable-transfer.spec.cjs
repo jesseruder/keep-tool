@@ -142,12 +142,16 @@ test('desktop prepares, reviews, and launches a Claude source into a chosen acco
 
 test('editing reviewed settings invalidates launch and settled-source errors are actionable', async ({ page }) => {
   await clickStageAction(page, '[data-new-portable-transfer="a"]');
-  await expect(page.locator('#toast')).toContainText('source turn has not ended');
+  const modal = page.locator('.portable-transfer-dialog');
+  await expect(modal).toBeVisible();
+  await expect(modal.locator('[role="alert"]')).toContainText('source turn has not ended');
+  await expect(modal).toContainText('Transfer unavailable');
+  await modal.locator('footer .btn').click();
+  await expect(modal).toBeHidden();
 
   fixture.state.sessions.find(session => session.id === 'a').endedTurn = true;
   fixture.publish();
   await clickStageAction(page, '[data-new-portable-transfer="a"]');
-  const modal = page.locator('.portable-transfer-dialog');
   await modal.locator('[data-prepare-transfer]').click();
   await expect(modal.locator('[data-launch-transfer]')).toBeEnabled();
   await modal.locator('[data-transfer-context]').fill('A changed continuation must be prepared again.');

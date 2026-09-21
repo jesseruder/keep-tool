@@ -823,6 +823,21 @@ test('a settled transcript-replaced gap reports as settled and rebinds without f
       { unconsumedHooks: 0, allowTerminalRateLimit: true }), false, 'only a terminal rate limit stands in for a completion');
     assert.equal(jobs.settledGap({ ...limited, recovering: true }, { unconsumedHooks: 0, allowTerminalRateLimit: true }), false);
     assert.equal(jobs.settledGap({ ...limited, gapReason: 'checkpoint-anchor' }, { unconsumedHooks: 0, allowTerminalRateLimit: true }), false);
+    // A process killed mid-turn never records a completion either; a caller that
+    // verified the process exited may drop only that requirement.
+    const killed = { ...settled, restart: { ...settled.restart, completed: false, rateLimitTerminal: false } };
+    assert.equal(jobs.settledGap(killed, { unconsumedHooks: 0 }), false);
+    assert.equal(jobs.settledGap(killed, { unconsumedHooks: 0, allowUnfinishedTurn: true }), true);
+    assert.equal(jobs.settledGap({ ...killed, restart: undefined }, { unconsumedHooks: 0, allowUnfinishedTurn: true }), true);
+    for (const patch of [
+      { jobs: { 'job:open': { id: 'open', kind: 'command', status: 'pending', eventAt: 2000 } } },
+      { calls: { 'call:open': { at: 2000 } } },
+      { gapReason: 'checkpoint-anchor' },
+      { recovering: true },
+    ]) assert.equal(jobs.settledGap({ ...killed, ...patch }, { unconsumedHooks: 0, allowUnfinishedTurn: true }), false,
+      `an unfinished turn is still refused by ${Object.keys(patch)[0]}`);
+    assert.equal(jobs.settledGap(killed, { unconsumedHooks: 1, allowUnfinishedTurn: true }), false);
+    assert.equal(jobs.read(root, 'claude', 'parent', 2300).gapSettledIfExited, true);
     assert.equal(jobs.settledGap({ ...settled, jobs: {
       'job:done': { id: 'done', kind: 'command', status: 'completed', eventAt: 2000 },
       'job:svc': { id: 'svc', kind: 'service', status: 'pending', eventAt: 2000 },

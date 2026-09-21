@@ -497,6 +497,28 @@ test('portable fallback ignores only named ledger metadata and still blocks conc
     'the source has unfinished background work');
 });
 
+test('a source killed mid-turn with a settled transcript-replaced gap can transfer; live or open work still blocks', async () => {
+  const killed = () => ({ session: { exited: true, state: 'exited', endedTurn: false,
+    runtime: { state: 'exited', liveInstances: 0 }, pendingBackground: false, unknownBackgroundJobs: ['history-gap'],
+    backgroundJobs: { pending: false, gapSettled: false, gapSettledIfExited: true, jobs: [{ id: 'a1', kind: 'agent', status: 'completed' }] },
+    observation: { foreground: { state: 'active', hook: null } } } });
+  assert.equal(portable.sourceBusyReason(killed()), '');
+  const variant = (patch) => { const inspection = killed(); patch(inspection.session); return portable.sourceBusyReason(inspection); };
+  assert.equal(variant((s) => { s.backgroundJobs.gapSettledIfExited = false; }), 'the source has unfinished background work');
+  assert.equal(variant((s) => { s.unknownBackgroundJobs = ['history-gap', 'job-x']; }), 'the source has unfinished background work');
+  assert.equal(variant((s) => { s.backgroundJobs.pending = true; s.pendingBackground = true; }), 'the source has unfinished background work');
+  assert.equal(variant((s) => { s.runtime.liveInstances = 1; }), 'the source has unfinished background work', 'a live instance is not exited');
+  assert.equal(variant((s) => { s.unknownBackgroundJobs = []; s.runtime = { state: 'live', liveInstances: 1 }; s.exited = false; s.state = 'working'; }),
+    'the source foreground turn is still running', 'a live source with an active turn still refuses');
+
+  const f = fixture();
+  f.deps.inspectSource = async () => ({ ...killed(), session: { ...killed().session, project: f.cwd } });
+  try {
+    const draft = await portable.draft({ sourceSessionId: 'source-session-1234' }, f.deps);
+    assert.equal(draft.sourceSessionId, 'source-session-1234');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test('workspace trust preserves one opening and resumes delivery to the same bound pane', async () => {
   const f = fixture();
   try {

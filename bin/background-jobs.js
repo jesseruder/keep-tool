@@ -59,10 +59,14 @@ function markGap(state, now, reason) {
 // still a child process of the agent, which mcp-restart.inspect refuses before
 // the source is stopped; an in-process agent lost that way is the same exposure
 // a forced restart already accepts.
-function settledGap(state, { unconsumedHooks, allowTerminalRateLimit = false } = {}) {
+// `allowUnfinishedTurn` drops the ended-turn requirement for a caller that has
+// verified the agent process is gone: a session killed mid-turn never records
+// `restart.completed`, so its gap could otherwise never settle, yet a dead process
+// has no turn left to launch anything from. Every other check still holds.
+function settledGap(state, { unconsumedHooks, allowTerminalRateLimit = false, allowUnfinishedTurn = false } = {}) {
   if (!state || state.gap !== true || state.gapReason !== 'transcript-replaced') return false;
   if (state.recovering || state.coldReplay) return false;
-  if (state.restart?.completed !== true
+  if (state.restart?.completed !== true && allowUnfinishedTurn !== true
       && !(allowTerminalRateLimit === true && state.restart?.rateLimitTerminal === true)) return false;
   if (unconsumedHooks !== 0) return false;
   if (!state.jobs || !state.calls || Object.keys(state.calls).length) return false;
@@ -729,6 +733,8 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       // The verdict covers a turn the API ended with a terminal rate limit too;
       // see the retired-source summary above for why the summary may report it.
       gapSettled: caughtUp === true && settledGap(state, { unconsumedHooks: consumed.length, allowTerminalRateLimit: true }),
+      // Only for a caller that has verified the agent process exited (see settledGap).
+      gapSettledIfExited: caughtUp === true && settledGap(state, { unconsumedHooks: consumed.length, allowUnfinishedTurn: true }),
       lastColdReplayAt: state.lastColdReplayAt, caughtUp, unresolvedCalls: Object.keys(state.calls).length,
       unconsumedHooks: consumed.length, bytesRead, lastReconciledAt: now };
   } finally { try { fs.unlinkSync(lock); } catch {} }
@@ -756,6 +762,8 @@ function read(root, agent, sid, now = Date.now(), staleAfter = 30 * 60e3) {
       // above -- the session-level rateLimit check, not this field, decides
       // whether a rate-limited session may be stopped.
       gapSettled: caughtUp === true && settledGap(state, { unconsumedHooks: inboxReadable ? unconsumedHooks : undefined, allowTerminalRateLimit: true }),
+      gapSettledIfExited: caughtUp === true
+        && settledGap(state, { unconsumedHooks: inboxReadable ? unconsumedHooks : undefined, allowUnfinishedTurn: true }),
       gapClearedAt: state.gapClearedAt, lastColdReplayAt: state.lastColdReplayAt,
       unresolvedCalls: Object.keys(state.calls || {}).length,
       unconsumedHooks,

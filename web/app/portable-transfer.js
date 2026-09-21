@@ -155,6 +155,18 @@ function renderDialog(ctx, state) {
   });
 }
 
+// The reopen chooser has already closed by the time a transfer is refused, so a
+// toast alone reads as nothing happening; the refusal gets the dialog instead.
+function renderUnavailable(ctx, message) {
+  const modal = ensureDialog();
+  modal.innerHTML = `<form method="dialog" class="portable-transfer-card">
+    <header><div><p class="eyebrow">Portable continuation</p><h2 id="portable-transfer-title">Transfer unavailable</h2></div><button class="btn" value="cancel" aria-label="Close transfer">✕</button></header>
+    <p class="portable-transfer-error" role="alert">${ctx.esc(message)}</p>
+    <footer><span></span><button class="btn primary" value="cancel">Close</button></footer></form>`;
+  if (!modal.open) modal.showModal();
+  queueMicrotask(() => modal.querySelector('footer .btn')?.focus());
+}
+
 export async function openPortableTransfer(ctx, sessionId, transfer) {
   let state = drafts.get(sessionId);
   try {
@@ -185,7 +197,7 @@ export async function openPortableTransfer(ctx, sessionId, transfer) {
     renderDialog(ctx, state);
     const modal = ensureDialog(); if (!modal.open) modal.showModal();
     queueMicrotask(() => modal.querySelector('[data-transfer-account]')?.focus());
-  } catch (error) { ctx.toast(`Transfer unavailable: ${error.message}`); }
+  } catch (error) { renderUnavailable(ctx, error.message || 'The transfer could not be prepared.'); }
 }
 
 async function launchLegacy(ctx, button) {

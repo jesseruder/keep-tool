@@ -367,6 +367,24 @@ function verifiedTerminalQuotaPause(inspection) {
     && session.runtime.liveInstances === 0 && session.exited === true;
 }
 
+// A source whose agent process is verifiably gone: nothing of its turn can still
+// be running, so a foreground state or ended-turn record it never got to write
+// is stale rather than evidence of work.
+function exitedSource(session) {
+  return session.exited === true && session.state === 'exited'
+    && session.runtime?.state === 'exited' && session.runtime.liveInstances === 0;
+}
+
+// The ledger's only uncertainty is a transcript-replaced gap that is settled but
+// for the ended turn the killed process never recorded (background-jobs settledGap).
+function exitedGapSettled(session) {
+  const jobs = session.backgroundJobs;
+  const unknown = session.unknownBackgroundJobs;
+  return exitedSource(session) && session.pendingBackground === false && jobs?.pending === false
+    && jobs.gapSettledIfExited === true && Array.isArray(unknown) && unknown.length > 0
+    && unknown.every((entry) => entry === 'history-gap');
+}
+
 function sourceBusyReason(inspection) {
   const session = inspection?.session;
   if (!session) return 'source session activity could not be verified';
@@ -386,11 +404,12 @@ function sourceBusyReason(inspection) {
     if (concrete || !metadataOnly || session.pendingBackground && unknown.length === 0) {
       return 'the source has unfinished background work';
     }
-  } else if (!terminalQuotaPause && (session.pendingBackground || session.unknownBackgroundJobs?.length)) {
+  } else if (!terminalQuotaPause && (session.pendingBackground || session.unknownBackgroundJobs?.length)
+      && !exitedGapSettled(session)) {
     return 'the source has unfinished background work';
   }
   if (session.observation?.foreground?.state === 'active' || session.observation?.foreground?.hook?.state === 'running') {
-    if (terminalQuotaPause) return '';
+    if (terminalQuotaPause || exitedSource(session)) return '';
     return 'the source foreground turn is still running';
   }
   if (terminalQuotaPause) return '';
