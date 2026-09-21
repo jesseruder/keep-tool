@@ -367,22 +367,28 @@ function verifiedTerminalQuotaPause(inspection) {
     && session.runtime.liveInstances === 0 && session.exited === true;
 }
 
-// A source whose agent process is verifiably gone: nothing of its turn can still
-// be running, so a foreground state or ended-turn record it never got to write
-// is stale rather than evidence of work.
-function exitedSource(session) {
-  return session.exited === true && session.state === 'exited'
+// A source whose agent process is verifiably gone -- exited in the dashboard and
+// absent from a fresh process scan (inspectPortableSource processGone): nothing of
+// its turn can still be running, so a foreground state or ended-turn record it
+// never got to write is stale rather than evidence of work.
+function exitedSource(inspection) {
+  const session = inspection.session;
+  return inspection.processGone === true && session.exited === true && session.state === 'exited'
     && session.runtime?.state === 'exited' && session.runtime.liveInstances === 0;
 }
 
 // The ledger's only uncertainty is a transcript-replaced gap that is settled but
 // for the ended turn the killed process never recorded (background-jobs settledGap).
-function exitedGapSettled(session) {
+// Every recorded job must be terminal: settledGap and `pending` pass over service
+// and scheduled jobs, and a background service can outlive the agent that started it.
+function exitedGapSettled(inspection) {
+  const session = inspection.session;
   const jobs = session.backgroundJobs;
   const unknown = session.unknownBackgroundJobs;
-  return exitedSource(session) && session.pendingBackground === false && jobs?.pending === false
-    && jobs.gapSettledIfExited === true && Array.isArray(unknown) && unknown.length > 0
-    && unknown.every((entry) => entry === 'history-gap');
+  return exitedSource(inspection) && session.pendingBackground === false && jobs?.pending === false
+    && jobs.gapSettledIfExited === true && Array.isArray(jobs.jobs)
+    && jobs.jobs.every((job) => TERMINAL_JOB_STATES.has(job?.status))
+    && Array.isArray(unknown) && unknown.length > 0 && unknown.every((entry) => entry === 'history-gap');
 }
 
 function sourceBusyReason(inspection) {
@@ -405,11 +411,11 @@ function sourceBusyReason(inspection) {
       return 'the source has unfinished background work';
     }
   } else if (!terminalQuotaPause && (session.pendingBackground || session.unknownBackgroundJobs?.length)
-      && !exitedGapSettled(session)) {
+      && !exitedGapSettled(inspection)) {
     return 'the source has unfinished background work';
   }
   if (session.observation?.foreground?.state === 'active' || session.observation?.foreground?.hook?.state === 'running') {
-    if (terminalQuotaPause || exitedSource(session)) return '';
+    if (terminalQuotaPause || exitedSource(inspection)) return '';
     return 'the source foreground turn is still running';
   }
   if (terminalQuotaPause) return '';

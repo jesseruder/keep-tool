@@ -9703,7 +9703,22 @@ async function inspectPortableSource(sessionId, options = {}, deps = {}) {
     && entry.id !== options.transferId && ['launching', 'awaiting-setup', 'ambiguous', 'done'].includes(entry.status));
   const terminalRateLimit = session && !nativeHandoff && !portableHandoff
     ? await portableTerminalRateLimitEvidence(session, state, deps) : null;
-  return { session, nativeHandoff, portableHandoff, portableFallback, terminalRateLimit, panes: state.panes || [], state };
+  // The dashboard's exited state comes from host panes and a periodic process
+  // ledger, which can miss a resume started outside the host; an exited source is
+  // only trusted once a fresh process scan (that itself succeeded) finds no agent
+  // on this conversation.
+  let processGone = false;
+  if (session?.exited === true) {
+    try {
+      const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
+      if (Array.isArray(rows)) {
+        const live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => rows,
+          codexRolloutOnly: session.kind === 'codex' });
+        processGone = !live.has(sessionId);
+      }
+    } catch {}
+  }
+  return { session, nativeHandoff, portableHandoff, portableFallback, terminalRateLimit, processGone, panes: state.panes || [], state };
 }
 
 async function assertPortablePaneBinding(expected, deps = {}) {

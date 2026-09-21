@@ -498,7 +498,7 @@ test('portable fallback ignores only named ledger metadata and still blocks conc
 });
 
 test('a source killed mid-turn with a settled transcript-replaced gap can transfer; live or open work still blocks', async () => {
-  const killed = () => ({ session: { exited: true, state: 'exited', endedTurn: false,
+  const killed = () => ({ processGone: true, session: { exited: true, state: 'exited', endedTurn: false,
     runtime: { state: 'exited', liveInstances: 0 }, pendingBackground: false, unknownBackgroundJobs: ['history-gap'],
     backgroundJobs: { pending: false, gapSettled: false, gapSettledIfExited: true, jobs: [{ id: 'a1', kind: 'agent', status: 'completed' }] },
     observation: { foreground: { state: 'active', hook: null } } } });
@@ -508,6 +508,14 @@ test('a source killed mid-turn with a settled transcript-replaced gap can transf
   assert.equal(variant((s) => { s.unknownBackgroundJobs = ['history-gap', 'job-x']; }), 'the source has unfinished background work');
   assert.equal(variant((s) => { s.backgroundJobs.pending = true; s.pendingBackground = true; }), 'the source has unfinished background work');
   assert.equal(variant((s) => { s.runtime.liveInstances = 1; }), 'the source has unfinished background work', 'a live instance is not exited');
+  assert.equal(variant((s) => { s.backgroundJobs.jobs.push({ id: 'svc', kind: 'service', status: 'running' }); }),
+    'the source has unfinished background work', 'a service can outlive the agent');
+  assert.equal(portable.sourceBusyReason({ ...killed(), processGone: false }), 'the source has unfinished background work',
+    'without a fresh process scan the exited state is not trusted');
+  const staleForeground = killed();
+  staleForeground.processGone = false;
+  staleForeground.session.unknownBackgroundJobs = [];
+  assert.equal(portable.sourceBusyReason(staleForeground), 'the source foreground turn is still running');
   assert.equal(variant((s) => { s.unknownBackgroundJobs = []; s.runtime = { state: 'live', liveInstances: 1 }; s.exited = false; s.state = 'working'; }),
     'the source foreground turn is still running', 'a live source with an active turn still refuses');
 

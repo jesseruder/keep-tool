@@ -9019,6 +9019,21 @@ test('portable source inspection treats failed native handoff as terminal and fi
   assert.equal(inspected.portableHandoff.status, 'done');
 });
 
+test('portable source inspection proves an exited source gone only from a fresh, successful process scan', async () => {
+  const state = { sessions: [{ id: 'source-session', exited: true, state: 'exited' }], panes: [], handoffs: [] };
+  const portable = { list: () => [] };
+  const inspect = (extra) => inspectPortableSource('source-session', {}, { inspectState: async () => state, portable, root: '/keep', ...extra });
+  assert.equal((await inspect({ agentProcessRows: async () => [], liveSessionPids: async () => new Map() })).processGone, true);
+  assert.equal((await inspect({ agentProcessRows: async () => [],
+    liveSessionPids: async () => new Map([['source-session', { pid: 7 }]]) })).processGone, false, 'a process outside the host is live');
+  assert.equal((await inspect({ agentProcessRows: async () => { throw new Error('ps failed'); },
+    liveSessionPids: async () => new Map() })).processGone, false, 'a failed scan proves nothing');
+  state.sessions[0].exited = false;
+  let scanned = false;
+  assert.equal((await inspect({ agentProcessRows: async () => { scanned = true; return []; } })).processGone, false);
+  assert.equal(scanned, false, 'a live source is not scanned');
+});
+
 test('portable source inspection treats an awaiting-setup successor as an active conflict', async () => {
   const state = { sessions: [{ id: 'source-session', endedTurn: true }], panes: [], handoffs: [] };
   const portable = { list: () => [{ id: 'f'.repeat(64), sourceSessionId: 'source-session', status: 'awaiting-setup' }] };
