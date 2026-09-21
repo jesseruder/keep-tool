@@ -7488,7 +7488,8 @@ test('Pi opens with a bound session id and private opening file, then resumes th
     assert.equal(first.accountId, 'pi/default');
     assert.equal(first.sent, true);
     assert.equal(first.linked, true);
-    assert.match(first.command, /pi --provider openrouter --model minimax\/minimax-m3 --session-id/);
+    assert.match(first.command, /pi --session-id/);
+    assert.doesNotMatch(first.command, /--provider|--model/);
     assert.doesNotMatch(first.command, /Inspect one file/);
     const spawned = host.calls.find((call) => call.type === 'spawn').params;
     assert.equal(spawned.meta.agent, 'pi');
@@ -7508,7 +7509,25 @@ test('Pi opens with a bound session id and private opening file, then resumes th
     });
     assert.equal(resumed.sessionId, id);
     assert.match(resumed.command, new RegExp(`--session ${id}$`));
+    assert.doesNotMatch(resumed.command, /--provider|--model/);
     assert.doesNotMatch(resumed.command, /--session-id/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Pi passes an explicit provider-qualified model through its model flag', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-model-'));
+  const project = os.tmpdir();
+  const id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const host = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-pi-model' } } : {});
+  try {
+    const opened = await openSession({ taskId: 'card', fresh: true, agent: 'pi', model: 'opencode-go/minimax-m3' }, {
+      root, host, piExtensionReady: true, randomUUID: () => id,
+      loadTask: () => ({ fm: { project, sessions: [] } }),
+      linkLaunchedSession: () => true,
+      waitForPiStart: async () => ({ phase: 'start' }),
+    });
+    assert.match(opened.command, new RegExp(`^pi --model opencode-go/minimax-m3 --session-id ${id}$`));
+    assert.doesNotMatch(opened.command, /--provider/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -7121,7 +7121,7 @@ async function openSession(body, deps = {}) {
       fs.writeFileSync(piOpeningFile, message, { flag: 'wx', mode: 0o600 });
     }
     const argv = agent === 'pi'
-      ? ['pi', '--provider', 'openrouter', '--model', commandModel || 'minimax/minimax-m3',
+      ? ['pi', ...(commandModel ? ['--model', commandModel] : []),
         session ? '--session' : '--session-id', sessionId,
         ...(piOpeningFile ? ['--', `@${piOpeningFile}`] : [])]
       : agent === 'codex'
