@@ -135,6 +135,82 @@ test('a card resolves to its live linked session, and says so when it has none',
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('telling the sender\'s own card is refused as self, not as a missing live session', async () => {
+  const root = tmpRoot('tell-own-card');
+  try {
+    // The sender is the only live session linked to its own card. The skip set excludes
+    // the sender, so `present` is empty and the caller used to get a misleading "no live
+    // session on <card>; start one with keep open <card> --fresh ..." — which is plainly
+    // wrong, because the sender is the only live session and is on the card already.
+    const sent = [];
+    const selfOnly = tellDeps(root, [liveSession('sender-session', { num: 7 })], {
+      loadTask: () => ({ id: 'own-card', fm: { sessions: [{ id: 'sender-session' }] } }),
+      watcherSend: async (request) => { sent.push(request); return {}; },
+    });
+    await assert.rejects(tellSession({
+      taskId: 'own-card', text: 'ping', senderSessionId: 'sender-session', senderAgent: 'claude',
+    }, selfOnly),
+      (error) => error.status === 409 && error.extra.reason === 'self'
+        && /cannot tell its own card/.test(error.message)
+        && !/no live session/.test(error.message));
+    assert.equal(sent.length, 0, 'nothing was typed; nothing was reserved');
+    assert.equal(fs.existsSync(tell.ledgerFile(root)), false);
+
+    // The same is true when the only other linked session is a keep-spawned run the
+    // skip set excludes for its own reasons — the sender is still the only live session
+    // left, so it is still self, not not-live.
+    fs.mkdirSync(path.join(root, '.keep', 'spawned'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'spawned', 'spawned-session'), '');
+    const spawnedAlsoLinked = tellDeps(root, [liveSession('sender-session'), liveSession('spawned-session')], {
+      loadTask: () => ({ id: 'own-card', fm: { sessions: [{ id: 'sender-session' }, { id: 'spawned-session' }] } }),
+      // Production excludes spawned/reviewer sessions by reading the marker dirs; in
+      // the test fixture we pass the same set explicitly.
+      excluded: new Set(['spawned-session']),
+      watcherSend: async () => ({}),
+    });
+    await assert.rejects(tellSession({
+      taskId: 'own-card', text: 'ping', senderSessionId: 'sender-session', senderAgent: 'claude',
+    }, spawnedAlsoLinked),
+      (error) => error.status === 409 && error.extra.reason === 'self'
+        && /cannot tell its own card/.test(error.message));
+    assert.equal(fs.existsSync(tell.ledgerFile(root)), false);
+
+    // A card with another live, non-sender linked session still routes there — the
+    // self check must not broaden delivery behaviour for the mixed case.
+    const mixed = tellDeps(root, [liveSession('sender-session'), liveSession('sibling-session')], {
+      loadTask: () => ({ id: 'own-card', fm: { sessions: [{ id: 'sender-session' }, { id: 'sibling-session' }] } }),
+      watcherSend: async (request) => { sent.push(request); return {}; },
+    });
+    const routed = await tellSession({
+      taskId: 'own-card', text: 'ping', senderSessionId: 'sender-session', senderAgent: 'claude',
+    }, mixed);
+    assert.equal(routed.sessionId, 'sibling-session');
+    assert.equal(sent.length, 1);
+
+    // A card whose only linked session is the sender and has already exited is the
+    // truly-missing-live-session case: the sender is gone, so "no live session" is
+    // the right answer.
+    const gone = tellDeps(root, [liveSession('sender-session', { exited: true })], {
+      loadTask: () => ({ id: 'own-card', fm: { sessions: [{ id: 'sender-session' }] } }),
+      watcherSend: async () => ({}),
+    });
+    await assert.rejects(tellSession({
+      taskId: 'own-card', text: 'ping', senderSessionId: 'sender-session', senderAgent: 'claude',
+    }, gone),
+      (error) => error.status === 409 && error.extra.reason === 'not-live'
+        && /no live session on own-card/.test(error.message));
+
+    // An Owner's-shell tell to the same card has no sender to exclude, so the empty
+    // present still means "no live session" — the self branch never fires.
+    const shell = tellDeps(root, [], {
+      loadTask: () => ({ id: 'own-card', fm: { sessions: [{ id: 'sender-session' }] } }),
+      watcherSend: async () => ({}),
+    });
+    await assert.rejects(tellSession({ taskId: 'own-card', text: 'ping' }, shell),
+      (error) => error.status === 409 && error.extra.reason === 'not-live');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('an envelope that cannot fit the send cap is refused rather than truncated', async () => {
   const root = tmpRoot('tell-cap');
   try {

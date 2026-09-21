@@ -10376,6 +10376,16 @@ async function tellSession(body, deps = {}) {
       const present = sessions.filter((session) => session && linked.has(session.id) && !skip.has(session.id))
         .sort((a, b) => b.mtime - a.mtime);
       if (!present.length) {
+        // The skip set always excludes the sender, so an empty present may simply mean
+        // the only live session on this card is the sender themselves (alongside, perhaps,
+        // a keep-spawned or reviewer session). The session-mode branch already names that
+        // case 'self'; the card-mode branch must not answer with a misleading
+        // "no live session" instead.
+        const liveLinked = sessions.filter((session) => session && linked.has(session.id)
+          && !session.exited && !session.deadMidTurn);
+        if (senderId && liveLinked.some((session) => session.id === senderId)) {
+          throw new InjectionError(409, 'self: a session cannot tell its own card', { reason: 'self' });
+        }
         throw new InjectionError(409, `no live session on ${body.taskId}; start one with keep open ${body.taskId} --fresh -m "..."`, { reason: 'not-live' });
       }
       const refusals = present.map((session) => tell.tellRefusal(session) || { reason: 'busy', detail: 'session is mid-turn' });
