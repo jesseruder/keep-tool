@@ -637,10 +637,19 @@ function routes(ctx) {
                 heading: 'console', linkSession: false,
               });
             } catch (error) {
-              // Closed or started elsewhere while the session launched: the session
-              // stands, and the card keeps the status the other writer gave it.
-              if (error?.code !== 'STATUS_CHANGED') throw error;
-              result.statusWarning = error.message;
+              // The session is running and linked, so the request has succeeded
+              // whatever happens to the card: a failure here must not read as a
+              // failed open, or a retry would launch a second session. Closed or
+              // started elsewhere while it launched, a busy lock, a git failure,
+              // an archived card: the card keeps whatever status it has, and the
+              // console says which.
+              let status = 'unknown';
+              try { status = keep.loadTask(body.taskId).fm.status || 'unset'; } catch {}
+              const reason = String(error?.message || error).split('\n')[0].slice(0, 300);
+              if (error?.code !== 'STATUS_CHANGED') {
+                process.stderr.write(`keep serve: inbox open of ${body.taskId} launched, but the card was not moved to active: ${reason}\n`);
+              }
+              result.statusWarning = `card left ${status}: ${reason}`;
             }
           }
           broadcast();

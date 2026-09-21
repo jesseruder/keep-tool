@@ -213,7 +213,7 @@ test('an Open from the console inbox moves the card to active once the session l
     git('config', 'user.name', 'Keep Test');
     git('config', 'user.email', 'keep@example.invalid');
     git('commit', '-q', '--allow-empty', '-m', 'init');
-    for (const [id, status] of [['fresh-idea', 'inbox'], ['taken', 'inbox'], ['closed', 'done']]) {
+    for (const [id, status] of [['fresh-idea', 'inbox'], ['taken', 'inbox'], ['closed', 'done'], ['git-broken', 'inbox']]) {
       fs.writeFileSync(path.join(root, 'tasks', `${id}.md`), [
         '---', `title: ${id}`, `status: ${status}`, 'kind: idea', 'tags: []', 'project: ""',
         'check_after: ""', 'check: ""', 'sessions: []', 'depends_on: []',
@@ -230,7 +230,12 @@ test('an Open from the console inbox moves the card to active once the session l
       let during = null;
       const openSession = async (body) => { launches.push({ ...body }); if (during) during(); return { ok: true, pane: 'pane-1' }; };
       class InjectionError extends Error {}
-      const list = routes({ keep, openSession, InjectionError, broadcast: () => {}, json: (res, status, value) => ({ status, value }) });
+      // The route's keep, with a switch to make the inbox -> active move fail the
+      // way a busy lock or a git failure would.
+      let failMove = false;
+      const routeKeep = Object.create(keep);
+      routeKeep.checkinTask = (...args) => { if (failMove) throw new Error('git commit failed: index.lock exists'); return keep.checkinTask(...args); };
+      const list = routes({ keep: routeKeep, openSession, InjectionError, broadcast: () => {}, json: (res, status, value) => ({ status, value }) });
       const url = new URL('http://x/api/open');
       const post = (body) => matchRoute(list, { req: { method: 'POST', headers: {} }, url, body })
         .handle({ req: { method: 'POST', headers: {} }, res: {}, url, body });
@@ -253,9 +258,21 @@ test('an Open from the console inbox moves the card to active once the session l
         during = () => keep.checkinTask('taken', { message: 'closed elsewhere', status: 'done', linkSession: false });
         const raced = await post({ taskId: 'taken', fresh: true, agent: 'claude', fromInbox: true });
         assert.equal(raced.status, 200);
-        assert.match(raced.value.statusWarning, /taken is done, not inbox/);
+        assert.equal(raced.value.statusWarning, 'card left done: taken is done, not inbox');
         assert.match(card('taken'), /^status: done$/m);
         assert.doesNotMatch(card('taken'), /opened from console inbox/);
+
+        // Launched, but the move itself failed: still a success, once. A 502 here
+        // would invite a retry, and a retry launches a second session.
+        failMove = true;
+        const before = launches.length;
+        const broken = await post({ taskId: 'git-broken', fresh: true, agent: 'claude', fromInbox: true });
+        failMove = false;
+        assert.equal(broken.status, 200, JSON.stringify(broken.value));
+        assert.equal(launches.length, before + 1, 'the launcher ran exactly once');
+        assert.equal(broken.value.pane, 'pane-1');
+        assert.equal(broken.value.statusWarning, 'card left inbox: git commit failed: index.lock exists');
+        assert.match(card('git-broken'), /^status: inbox$/m);
 
         // Without the flag, /api/open is what it always was.
         during = null;

@@ -702,7 +702,9 @@ async function reopenSession({ sessionId, taskId, agent, title, stalePane, proje
         await reload();
         openedPane = result.pane;
         const account = (data.accounts || []).find((entry) => entry.id === selection.accountId);
-        toast(`${freshCard ? 'Started' : 'Reopened'} "${title || taskId || sessionId}"${account ? ` on ${account.label || account.id}` : ''}`, {
+        // An inbox Open that launched but could not move its card says so: the
+        // session is running either way.
+        toast(`${freshCard ? 'Started' : 'Reopened'} "${title || taskId || sessionId}"${account ? ` on ${account.label || account.id}` : ''}${result.statusWarning ? `; ${result.statusWarning}` : ''}`, {
           label: 'Pin', run: () => pinPane(result.pane, title),
         });
         return result;

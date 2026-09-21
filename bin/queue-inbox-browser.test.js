@@ -54,8 +54,10 @@ test('isolated browser: the Queue lists inbox cards, opens their notes, and clos
         const request = JSON.parse(body); opens.push(request);
         const task = state.tasks.find((candidate) => candidate.id === request.taskId);
         if (request.fromInbox && task?.fm.status !== 'inbox') { send(409, { error: `${request.taskId} is ${task?.fm.status}, not inbox` }); return; }
-        if (request.fromInbox) task.fm.status = 'active';
-        send(200, { ok: true, pane: 'no-such-pane' });
+        // Closed elsewhere while the session launched: the launch still succeeds,
+        // and says the card did not move.
+        task.fm.status = 'done';
+        send(200, { ok: true, pane: 'no-such-pane', statusWarning: `card left done: ${task.id} is done, not inbox` });
       });
       return;
     }
@@ -124,8 +126,8 @@ test('isolated browser: the Queue lists inbox cards, opens their notes, and clos
     await evaluate("document.querySelector('[data-launch-cancel]').click()");
     await wait("!document.querySelector('.session-launch-card')");
 
-    // ── Submitted, Open starts the session with the inbox guard, and the card
-    // leaves the inbox for active.
+    // ── Submitted, Open starts the session with the inbox guard. Here the card
+    // is closed elsewhere during the launch, which the toast reports.
     await evaluate("document.querySelector('#qlist .qinbox[data-card=\"older-bug\"] .qinbox-main').click()");
     await wait("document.querySelector('#qlist .qinbox[data-card=\"older-bug\"] [data-inbox-open]')");
     await evaluate("document.querySelector('#qlist .qinbox[data-card=\"older-bug\"] [data-inbox-open]').click()");
@@ -135,6 +137,9 @@ test('isolated browser: the Queue lists inbox cards, opens their notes, and clos
     assert.equal(opens.length, 1);
     assert.deepEqual([opens[0].taskId, opens[0].fresh, opens[0].fromInbox], ['older-bug', true, true]);
     await wait("!document.querySelector('.session-launch-card')");
+    await wait("document.querySelector('#toast .toast-body')?.textContent.includes('Started')");
+    assert.match(await evaluate("document.querySelector('#toast .toast-body').textContent"),
+      /^Started "Crash when the rail collapses".*; card left done: older-bug is done, not inbox/, 'the launch reports why the card did not move');
     await wait("document.querySelector('#qlist .qinbox-head').textContent.trim() === '▾ Inbox · 2'");
 
     // ── Done closes the card, and the section count follows.
