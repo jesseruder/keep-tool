@@ -5567,7 +5567,7 @@ test('exited Codex handoff recovery launches in the frozen latest turn cwd', asy
     const result = await resumeExitedAccountHandoff({ id: 'tx-cwd', sessionId: sid, pane: pane.id, pid: pane.pid,
       agent: 'codex', cwd, cols: pane.cols, rows: pane.rows,
       resumeSpec: { argv: ['codex', '--sandbox', 'workspace-write', 'resume', sid] } }, account, null, {
-      host, agentProcessRows: async () => [],
+      host, agentProcessRows: async () => [other],
       onLaunched: async (launch) => { events.push(['launched', launch]); },
       waitForHostAgent: async (target, agent) => {
         events.push(['ready']); assert.deepEqual(target, { pane: pane.id }); assert.equal(agent, 'codex');
@@ -9023,16 +9023,23 @@ test('portable source inspection proves an exited source gone only from a fresh,
   const state = { sessions: [{ id: 'source-session', exited: true, state: 'exited' }], panes: [], handoffs: [] };
   const portable = { list: () => [] };
   const inspect = (extra) => inspectPortableSource('source-session', {}, { inspectState: async () => state, portable, root: '/keep', ...extra });
-  assert.equal((await inspect({ agentProcessRows: async () => [], liveSessionPids: async () => new Map() })).processGone, true);
-  assert.equal((await inspect({ agentProcessRows: async () => [],
+  const other = { pid: 1, ppid: 0, args: '/sbin/launchd' };
+  assert.equal((await inspect({ agentProcessRows: async () => [other], liveSessionPids: async () => new Map() })).processGone, true);
+  assert.equal((await inspect({ agentProcessRows: async () => [], liveSessionPids: async () => new Map() })).processGone, false,
+    'an empty process table proves nothing');
+  const unreadable = require('./serve').parseProcessTable('  42     1 ttys001  Mon Sep 21 10:00:00 2026 (claude)\n');
+  assert.equal(unreadable[0].argsUnavailable, true);
+  assert.equal((await inspect({ agentProcessRows: async () => [other, ...unreadable], liveSessionPids: async () => new Map() })).processGone, false,
+    'an agent whose argv could not be read may be this conversation');
+  assert.equal((await inspect({ agentProcessRows: async () => [other],
     liveSessionPids: async () => new Map([['source-session', { pid: 7 }]]) })).processGone, false, 'a process outside the host is live');
   assert.equal((await inspect({ agentProcessRows: async () => { throw new Error('ps failed'); },
     liveSessionPids: async () => new Map() })).processGone, false, 'a failed scan proves nothing');
-  assert.equal((await inspect({ agentProcessRows: async () => [],
+  assert.equal((await inspect({ agentProcessRows: async () => [other],
     liveSessionPids: async (deps) => { deps.onEvidenceError(new Error('lsof timed out')); return new Map(); } })).processGone, false,
   'an identity lookup that failed part-way is inconclusive');
   let passed;
-  await inspect({ agentProcessRows: async () => [], liveSessionPids: async (deps) => { passed = deps; return new Map(); } });
+  await inspect({ agentProcessRows: async () => [other], liveSessionPids: async (deps) => { passed = deps; return new Map(); } });
   assert.equal(passed.codexRolloutOnly, undefined, 'resume argv counts as identity');
   state.sessions[0].exited = false;
   let scanned = false;

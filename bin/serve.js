@@ -9712,8 +9712,10 @@ async function inspectPortableSource(sessionId, options = {}, deps = {}) {
   if (session?.exited === true) {
     try {
       const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
-      if (Array.isArray(rows)) {
-        let inconclusive = false;
+      if (Array.isArray(rows) && rows.length) {
+        // An agent row whose argv macOS could not read (`(claude)`) is a live
+        // process with no identity, so it could be this conversation.
+        let inconclusive = rows.some((row) => row.argsUnavailable === true && /^\((?:claude|codex|node)\)$/.test(row.args));
         const live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => rows,
           onEvidenceError: () => { inconclusive = true; } });
         processGone = !inconclusive && !live.has(sessionId);
