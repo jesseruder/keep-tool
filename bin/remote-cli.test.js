@@ -190,6 +190,19 @@ test('a resend of an interrupted run is refused by name, and nothing is printed 
   assert.equal(result.stderr, 'keep checkin: the daemon on main refused: an earlier run of this request was interrupted; inspect before retrying\n');
 });
 
+test('a command the daemon ran but could not record prints its output and then a warning', async (t) => {
+  const daemon = await stubDaemon(t, () => ({ status: 200, body: { ok: true, status: 0, stdout: 'checked in\n', stderr: 'note\n', replayed: false, journaled: false } }));
+  const { root, env } = nodeEnv(t);
+  env.KEEP_DAEMON_URL = daemon.url;
+  const result = await run(['checkin', 'card', '-m', 'x'], { env, cwd: root });
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout, 'checked in\n');
+  assert.equal(result.stderr, 'note\nkeep checkin: warning: the daemon on main ran this but could not record it; check by hand before retrying this command\n');
+  const recorded = await stubDaemon(t, () => ({ status: 200, body: { ok: true, status: 0, stdout: 'checked in\n', stderr: '', replayed: false } }));
+  const clean = await run(['checkin', 'card', '-m', 'x'], { env: { ...env, KEEP_DAEMON_URL: recorded.url }, cwd: root });
+  assert.equal(clean.stderr, '');
+});
+
 test('a refusal from the daemon is said as one, not as the command\'s output', async (t) => {
   const daemon = await stubDaemon(t, () => ({ status: 403, body: { error: 'session s is not on node aws1' } }));
   const { root, env } = nodeEnv(t);

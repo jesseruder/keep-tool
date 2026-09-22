@@ -464,3 +464,43 @@ test('a restart waits for a run in flight, and once it is stopping new requests 
   // A replay of a finished run still answers from the journal while stopping.
   assert.equal((await svc.handle(AWS1, body(root))).body.replayed, true);
 });
+
+// The command has run by the time its answer is journalled: a failed write must not
+// turn a done mutation into a refusal the node would retry.
+test('a journal write that fails after the run still answers the result, marked unrecorded', async (t) => {
+  const logged = [];
+  const root = tempDir(t);
+  const fake = fakeSpawn(() => ({ code: 0, stdout: 'checked in\n', stderr: '' }));
+  let writes = 0;
+  const io = {
+    ...fs,
+    renameSync: (from, to) => {
+      writes += 1;
+      // The started record goes through; the result does not.
+      if (writes === 2) throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+      return fs.renameSync(from, to);
+    },
+  };
+  const svc = createRegistryService({
+    root, io, spawn: fake.spawn, daemonNode: () => 'main', location: () => ({ node: 'aws1', agent: 'claude' }),
+    env: { PATH: '/usr/bin:/bin', HOME: root, LANG: 'C' }, configFile: path.join(root, 'config.json'),
+    log: (text) => logged.push(text),
+  });
+  const answer = await svc.handle(AWS1, body(root, { command: 'checkin', args: ['card', '-m', 'x'] }));
+  assert.equal(answer.status, 200);
+  assert.equal(answer.body.ok, true);
+  assert.equal(answer.body.stdout, 'checked in\n');
+  assert.equal(answer.body.journaled, false);
+  assert.equal(answer.body.replayed, false);
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /aws1 ran keep checkin but its journal entry could not be written: ENOSPC/);
+  // What is on disk is the started record, so a resend is refused, never run again.
+  const retry = await svc.handle(AWS1, body(root, { command: 'checkin', args: ['card', '-m', 'x'] }));
+  assert.equal(retry.status, 409);
+  assert.match(retry.body.error, /result was not recorded; inspect before retrying/);
+  assert.equal(fake.calls.length, 1);
+  // A normal run carries no journaled field at all.
+  const normal = await svc.handle(AWS1, body(root, { idempotencyKey: `${KEY}-ok` }));
+  assert.equal(normal.status, 200);
+  assert.equal('journaled' in normal.body, false);
+});

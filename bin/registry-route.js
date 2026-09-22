@@ -129,12 +129,13 @@ function createRegistryService(options = {}) {
   const baseEnv = options.env || process.env;
   const configFile = options.configFile || require('./config.js').configFile(baseEnv);
   const stopping = options.stopping || (() => false);
+  const log = options.log || ((text) => { try { process.stderr.write(`keep serve: ${text}\n`); } catch {} });
   const pidAlive = options.pidAlive || ((pid) => {
     try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
   });
   // Which service wrote a started record: one in this process that is no longer
-  // in flight here was lost (the process outlived a dropped service), never still
-  // running.
+  // in flight here was lost (the process outlived a dropped service, or the result
+  // could not be written), never still running.
   const instance = crypto.randomBytes(8).toString('hex');
   const journalDir = path.join(root, '.keep', 'registry-ops');
   const inflight = new Map();
@@ -303,15 +304,22 @@ function createRegistryService(options = {}) {
           throw error;
         }
         // Written before anyone is answered: a retry that arrives the moment this
-        // one returns must find it.
-        writeJournal(file, { version: 1, node: caller, digest, at: new Date(now()).toISOString(), response });
-        return response;
+        // one returns must find it. The command has run either way, so a failed
+        // write is said, not turned into an error.
+        try {
+          writeJournal(file, { version: 1, node: caller, digest, at: new Date(now()).toISOString(), response });
+          return { response, journaled: true };
+        } catch (error) {
+          log(`registry: ${caller} ran keep ${request.command} but its journal entry could not be written: ${error.message}`);
+          return { response, journaled: false };
+        }
       });
       inflight.set(file, pending);
-      let response;
-      try { response = await pending; }
+      let outcome;
+      try { outcome = await pending; }
       finally { inflight.delete(file); admitted -= 1; }
-      return { status: response.status, body: { ...response.body, replayed: false } };
+      const { response, journaled } = outcome;
+      return { status: response.status, body: { ...response.body, replayed: false, ...(journaled ? {} : { journaled: false }) } };
     } catch (error) {
       if (error instanceof RegistryError) return { status: error.status, body: { error: error.message } };
       return { status: 500, body: { error: error.message } };

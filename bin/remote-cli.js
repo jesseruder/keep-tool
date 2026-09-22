@@ -144,7 +144,16 @@ async function runRemote(command, args, deps = {}) {
   }
   const value = parsed(response);
   if ((response.status === 200 || response.status === 504) && value && Number.isInteger(value.status)) {
-    return { code: value.status === 0 && response.status === 504 ? 1 : value.status, stdout: String(value.stdout || ''), stderr: String(value.stderr || '') };
+    // The command ran but the daemon could not record its answer, so a resend of
+    // this key would be refused as interrupted and a fresh one would run it again.
+    const unrecorded = value.journaled === false
+      ? `keep ${command}: warning: the daemon on ${where.daemon} ran this but could not record it; check by hand before retrying this command\n`
+      : '';
+    return {
+      code: value.status === 0 && response.status === 504 ? 1 : value.status,
+      stdout: String(value.stdout || ''),
+      stderr: String(value.stderr || '') + unrecorded,
+    };
   }
   const why = value && value.error ? value.error : `HTTP ${response.status}`;
   return { code: 2, stdout: '', stderr: `keep ${command}: the daemon on ${where.daemon} refused: ${why}\n` };
