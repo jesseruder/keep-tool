@@ -3863,28 +3863,63 @@ const COMPACT_SWAP_CHOICE_SCAN_BYTES = 8 * 1024 * 1024;
 const COMPACT_DAEMON_ROW_WINDOW_MS = 15e3;
 const COMPACT_LEGACY_SWITCH_WINDOW_MS = 60e3;
 
-function compactDaemonTypedRow(daemon, args, stamp) {
-  if (!daemon || !Number.isFinite(stamp)) return false;
-  const text = String(args || '').trim().toLowerCase();
+// A matcher for one scan of a transcript: true for a /model row that is the daemon's own.
+// Each journalled Enter ({ at, model }) accounts for exactly one row — the first row of
+// exactly that id at or after its moment, within COMPACT_DAEMON_ROW_WINDOW_MS — and every
+// other row counts, however close: a person picking the other id seconds after a refused
+// restore, or the same id right after the daemon's own row, is a person. A second of slack
+// before `at` only for the host's and Claude Code's clocks being read a hair apart.
+// A record from before the journal accounts for one switch row in the minute after `at`.
+function compactDaemonRowMatcher(daemon) {
+  if (!daemon) return () => false;
   const switchModel = String(daemon.switchModel || '').trim().toLowerCase();
-  const restoreModel = String(daemon.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim().toLowerCase();
-  if (!text || (text !== switchModel && text !== restoreModel)) return false;
-  const typed = Array.isArray(daemon.daemonTyped) ? daemon.daemonTyped.map(Number).filter(Number.isFinite) : null;
-  if (typed) return typed.some((at) => Math.abs(stamp - at) <= COMPACT_DAEMON_ROW_WINDOW_MS);
-  const at = Number(daemon.at);
-  return text === switchModel && Number.isFinite(at) && stamp >= at && stamp - at <= COMPACT_LEGACY_SWITCH_WINDOW_MS;
+  const entries = Array.isArray(daemon.daemonTyped)
+    ? daemon.daemonTyped.map((entry) => ({ at: Number(entry && entry.at), model: String(entry && entry.model || '').trim().toLowerCase() }))
+      .filter((entry) => Number.isFinite(entry.at) && entry.model)
+    : [{ at: Number(daemon.at), model: switchModel, windowMs: COMPACT_LEGACY_SWITCH_WINDOW_MS, slackMs: 0 }]
+      .filter((entry) => Number.isFinite(entry.at) && entry.model);
+  const used = new Set();
+  return (args, stamp) => {
+    if (!Number.isFinite(stamp)) return false;
+    const text = String(args || '').trim().toLowerCase();
+    const index = entries.findIndex((entry, i) => !used.has(i) && entry.model === text
+      && stamp >= entry.at - (entry.slackMs ?? 1000) && stamp - entry.at <= (entry.windowMs ?? COMPACT_DAEMON_ROW_WINDOW_MS));
+    if (index === -1) return false;
+    used.add(index);
+    return true;
+  };
 }
 
-// Journals that the daemon is sending the Enter for one of this swap's commands, so the
-// transcript row it produces can be told from a person typing the same text. Read from the
-// file rather than any caller's copy, which may carry state the file deliberately lost.
-function noteCompactDaemonTyped(file, at, remove = false) {
+// Journals the Enter the daemon is sending for one of this swap's commands — the moment and
+// the exact id — so the transcript row it produces can be told from a person typing the
+// same text. Read from the file rather than any caller's copy, which may carry state the
+// file deliberately lost. The hooks go straight into typeAndSubmit: the moment is taken in
+// beforeEnterKey, the Enter's own, and a refused Enter takes the entry back.
+function noteCompactDaemonTyped(file, entry, remove = false) {
   try {
     const record = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!record || typeof record !== 'object' || Array.isArray(record)) return;
-    const typed = Array.isArray(record.daemonTyped) ? record.daemonTyped.filter((value) => value !== at) : [];
-    writeCompactSwapRecord(file, { ...record, daemonTyped: remove ? typed : [...typed, at] });
+    const typed = (Array.isArray(record.daemonTyped) ? record.daemonTyped : [])
+      .filter((value) => !(value && value.at === entry.at && value.model === entry.model));
+    writeCompactSwapRecord(file, { ...record, daemonTyped: remove ? typed : [...typed, entry] });
   } catch {}
+}
+
+function compactDaemonEnterHooks(file, command, clock = Date.now, onChange = () => {}) {
+  let entry = null;
+  return {
+    beforeEnterKey: () => {
+      entry = { at: clock(), model: String(command || '').replace(/^\s*\/model\s+/i, '').trim() };
+      noteCompactDaemonTyped(file, entry);
+      onChange(entry, false);
+    },
+    enterKeyDropped: () => {
+      if (!entry) return;
+      noteCompactDaemonTyped(file, entry, true);
+      onChange(entry, true);
+      entry = null;
+    },
+  };
 }
 
 function compactSwapUserModelChoice(record, file, options = {}) {
@@ -3906,6 +3941,7 @@ function compactSwapUserModelChoice(record, file, options = {}) {
   const lines = text.split(/\r?\n/);
   const switchModel = daemon ? String(daemon.switchModel || '').trim() : '';
   const restoreModel = daemon ? String(daemon.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim() : '';
+  const daemonRow = compactDaemonRowMatcher(daemon);
   let inWindow = false;
   for (let i = 0; i < lines.length; i += 1) {
     let row;
@@ -3921,7 +3957,7 @@ function compactSwapUserModelChoice(record, file, options = {}) {
       if (outcome.failed) continue;
       // Exact ids, window included: `/model claude-fable-5-1` against a pending
       // `claude-fable-5-1[1m]` restore is a person dropping the 1M window.
-      if (compactDaemonTypedRow(daemon, args, stamp)) continue;
+      if (daemonRow(args, stamp)) continue;
       // Confirmed, or at least not refused by the harness: "Kept model as …" is no change.
       if (outcome.model === '<unknown>' && !outcome.label) continue;
       return { model: args || outcome.label, reason: `/model ${args || outcome.label} was chosen after the swap` };
@@ -4431,16 +4467,10 @@ async function sweepPendingCompactSwaps(deps = {}) {
             try {
               await submit(target, record.restoreCommand, claudeTypedTextVisible, {
                 ...deps, inputBaseline, discardDraftOnAbort: true, draftKind: 'claude',
-                beforeEnterKey: () => {
-                  const typedAt = now();
-                  noteCompactDaemonTyped(record.file, typedAt);
-                  record.daemonTyped = [...(Array.isArray(record.daemonTyped) ? record.daemonTyped : []), typedAt];
-                },
-                enterKeyDropped: () => {
-                  const typedAt = record.daemonTyped && record.daemonTyped[record.daemonTyped.length - 1];
-                  noteCompactDaemonTyped(record.file, typedAt, true);
-                  if (Array.isArray(record.daemonTyped)) record.daemonTyped = record.daemonTyped.slice(0, -1);
-                },
+                ...compactDaemonEnterHooks(record.file, record.restoreCommand, now, (entry, removed) => {
+                  const typed = Array.isArray(record.daemonTyped) ? record.daemonTyped : [];
+                  record.daemonTyped = removed ? typed.filter((value) => value !== entry) : [...typed, entry];
+                }),
               });
             } catch (error) {
               if (error && error.nothingTyped) {
@@ -4621,10 +4651,8 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
     if (swap && swap.switchCommand) {
       pendingSwapFile = writePendingCompactSwap(session, swap, dir);
       try {
-        const typedAt = Date.now();
         await (deps.typeAndSubmit || typeAndSubmit)(target, swap.switchCommand, claudeTypedTextVisible, { ...deps,
-          beforeEnterKey: () => noteCompactDaemonTyped(pendingSwapFile, typedAt),
-          enterKeyDropped: () => noteCompactDaemonTyped(pendingSwapFile, typedAt, true) });
+          ...compactDaemonEnterHooks(pendingSwapFile, swap.switchCommand) });
       } catch (e) {
         result = { compacted: false, reason: String(e && e.message || e), via };
       }
@@ -4726,10 +4754,8 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
         deferral = { reason: 'model-exhausted', resetAt: Number(policy.exhaustedResetAt) || null };
       } else {
         try {
-          const typedAt = Date.now();
           await (deps.typeAndSubmit || typeAndSubmit)(target, swap.restoreCommand, claudeTypedTextVisible, { ...deps,
-            beforeEnterKey: () => noteCompactDaemonTyped(pendingSwapFile, typedAt),
-            enterKeyDropped: () => noteCompactDaemonTyped(pendingSwapFile, typedAt, true) });
+            ...compactDaemonEnterHooks(pendingSwapFile, swap.restoreCommand) });
           restored = await (deps.waitForModelSwitch || waitForModelSwitch)(target, swap.restoreCommand, sid, deps);
         } catch {}
         if (!restored) {
