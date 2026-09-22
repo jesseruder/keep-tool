@@ -1902,3 +1902,155 @@ test('an unmatched citation is retried on a schedule, not every sweep, and given
     fs.rmSync(temp, { recursive: true, force: true });
   }
 });
+
+// The daemon resolves commit dependencies on every state build. These answers are
+// remembered across builds, so each test counts the processes a repeat call starts
+// through landed.deps rather than timing anything.
+function countingDeps(t) {
+  const landed = require('./landed.js');
+  const original = { ...landed.deps };
+  const calls = { git: 0, canonical: 0 };
+  landed.deps.execFileSync = (...args) => { calls.git += 1; return original.execFileSync(...args); };
+  landed.deps.canonicalCwd = (dir) => { calls.canonical += 1; return original.canonicalCwd(dir); };
+  landed.resetCaches();
+  t.after(() => { Object.assign(landed.deps, original); landed.resetCaches(); });
+  return calls;
+}
+
+function writeLandedState(value) {
+  const keep = require('./keep.js');
+  const file = path.join(keep.ROOT, '.keep', 'landed', '_state.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  // The landed child writes by rename; so does this, so the file gets a new inode.
+  const tmp = `${file}.test.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value));
+  fs.renameSync(tmp, file);
+}
+
+test('repoFor remembers a project path, a worktree mapping and a non-repository', (t) => {
+  const landed = require('./landed.js');
+  const calls = countingDeps(t);
+  const { temp, repo, env } = landedFixture('keep-landed-repo-memo-');
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const linked = path.join(temp, 'linked');
+  runGit(['-C', repo, 'worktree', 'add', '-q', '-b', 'side', linked], { env });
+  const plain = path.join(temp, 'plain');
+  fs.mkdirSync(plain);
+
+  assert.equal(landed.repoFor({ fm: { project: repo } }), repo);
+  assert.equal(fs.realpathSync(landed.repoFor({ fm: { project: linked } })), fs.realpathSync(repo));
+  assert.equal(landed.repoFor({ fm: { project: plain } }), null);
+  assert.equal(calls.canonical, 3);
+
+  assert.equal(landed.repoFor({ fm: { project: repo } }), repo);
+  assert.equal(fs.realpathSync(landed.repoFor({ fm: { project: linked } })), fs.realpathSync(repo));
+  assert.equal(landed.repoFor({ fm: { project: plain } }), null);
+  assert.equal(calls.canonical, 3, 'repeat lookups start no worktree probe');
+  assert.equal(calls.git, 0);
+});
+
+test('isOnDefault remembers true and false answers until the repository is fetched again', (t) => {
+  const landed = require('./landed.js');
+  const calls = countingDeps(t);
+  const { temp, repo, env, sha } = landedFixture('keep-landed-ondefault-memo-');
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(repo, 'local.txt'), 'local\n');
+  runGit(['-C', repo, 'add', 'local.txt'], { env });
+  runGit(['-C', repo, 'commit', '-q', '-m', 'local'], { env });
+  const local = runGit(['-C', repo, 'rev-parse', 'HEAD'], { env });
+  writeLandedState({ fetchedAt: { [repo]: 1000 }, fetchStatus: { [repo]: { at: 1000, branch: 'main', ok: true } } });
+
+  assert.equal(landed.isOnDefault(repo, sha, 'main'), true);
+  assert.equal(landed.isOnDefault(repo, local, 'main'), false);
+  const first = calls.git;
+  assert.ok(first > 0);
+  assert.equal(landed.isOnDefault(repo, sha, 'main'), true);
+  assert.equal(landed.isOnDefault(repo, local, 'main'), false);
+  assert.equal(landed.originEvidenceUsable(repo, 'main'), true);
+  assert.equal(calls.git, first, 'remembered answers start no git process');
+
+  // A sweep's fetch, recorded by the landed child: both answers are checked again.
+  writeLandedState({ fetchedAt: { [repo]: 2000 }, fetchStatus: { [repo]: { at: 2000, branch: 'main', ok: true } } });
+  assert.equal(landed.isOnDefault(repo, sha, 'main'), true);
+  assert.equal(landed.isOnDefault(repo, local, 'main'), false);
+  assert.ok(calls.git > first, 'a new fetchedAt re-checks remembered answers');
+
+  // The tracking ref moving in this process (a fetch or push not yet recorded in
+  // the state file) also retires the remembered false.
+  runGit(['-C', repo, 'push', '-q', 'origin', 'main'], { env });
+  assert.equal(landed.isOnDefault(repo, local, 'main'), true);
+});
+
+test('defaultBranch is remembered until fetchedAt or origin HEAD changes', (t) => {
+  const landed = require('./landed.js');
+  const calls = countingDeps(t);
+  const { temp, repo, env } = landedFixture('keep-landed-branch-memo-');
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  writeLandedState({ fetchedAt: { [repo]: 1000 }, fetchStatus: {} });
+
+  assert.equal(landed.defaultBranch(repo), 'main');
+  const first = calls.git;
+  assert.ok(first > 0);
+  assert.equal(landed.defaultBranch(repo), 'main');
+  assert.equal(calls.git, first, 'a remembered branch starts no git process');
+
+  writeLandedState({ fetchedAt: { [repo]: 2000 }, fetchStatus: {} });
+  assert.equal(landed.defaultBranch(repo), 'main');
+  assert.ok(calls.git > first, 'a new fetchedAt reads origin HEAD again');
+
+  runGit(['-C', repo, 'update-ref', 'refs/remotes/origin/trunk', 'HEAD'], { env });
+  runGit(['-C', repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/trunk'], { env });
+  assert.equal(landed.defaultBranch(repo), 'trunk');
+});
+
+test('loadState serves a parsed copy until the state file is rewritten', (t) => {
+  const landed = require('./landed.js');
+  countingDeps(t);
+  writeLandedState({ fetchedAt: { '/repo': 1 }, fetchStatus: { '/repo': { at: 1, branch: 'main', ok: true } } });
+  const reads = [];
+  const readFileSync = fs.readFileSync;
+  fs.readFileSync = function (file, ...rest) { reads.push(String(file)); return readFileSync.call(this, file, ...rest); };
+  t.after(() => { fs.readFileSync = readFileSync; });
+  const stateReads = () => reads.filter((file) => file.endsWith('_state.json')).length;
+
+  const first = landed.loadState();
+  assert.equal(first.fetchedAt['/repo'], 1);
+  first.fetchedAt['/repo'] = 99; // a caller's copy is its own
+  assert.equal(landed.loadState().fetchedAt['/repo'], 1);
+  assert.equal(landed.originEvidenceUsable('/repo', 'main'), true);
+  assert.equal(stateReads(), 1, 'an unchanged file is parsed once');
+
+  writeLandedState({ fetchedAt: { '/repo': 2 }, fetchStatus: { '/repo': { at: 2, branch: 'main', ok: false } } });
+  assert.equal(landed.loadState().fetchedAt['/repo'], 2);
+  assert.equal(landed.originEvidenceUsable('/repo', 'main'), false);
+  assert.equal(stateReads(), 2);
+});
+
+test('repoFor re-checks a non-repository after five minutes and keeps a repository for good', (t) => {
+  const landed = require('./landed.js');
+  const calls = countingDeps(t);
+  let now = 1_000_000;
+  landed.deps.now = () => now;
+  let fresh = 0;
+  const freshCanonicalCwd = landed.deps.freshCanonicalCwd;
+  landed.deps.freshCanonicalCwd = (dir) => { fresh += 1; return freshCanonicalCwd(dir); };
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-landed-repo-ttl-'));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const later = path.join(temp, 'later');
+  fs.mkdirSync(later);
+  const task = { fm: { project: later } };
+
+  assert.equal(landed.repoFor(task), null);
+  runGit(['init', '-q', '--initial-branch=main', later]);
+  now += 5 * 60e3 - 1;
+  assert.equal(landed.repoFor(task), null, 'a remembered null holds inside the TTL');
+  assert.equal(calls.canonical + fresh, 1);
+
+  now += 1;
+  assert.equal(landed.repoFor(task), later, 'the re-check after the TTL finds the new repository');
+  assert.equal(fresh, 1, 'the re-check bypasses the memoized worktree lookup');
+
+  now += 24 * 3600e3;
+  assert.equal(landed.repoFor(task), later);
+  assert.equal(calls.canonical + fresh, 2, 'a repository answer does not expire');
+});

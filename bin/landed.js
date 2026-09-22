@@ -139,12 +139,45 @@ function latestDecisions() {
   return result;
 }
 
-function loadState() {
-  const state = readJson(stateFile(), {});
+// The daemon consults the fetch state for every commit dependency on every state
+// build, but only the `keep landed` child writes it, a few times an hour. One
+// stat per call is enough to tell whether the parsed copy is still the file: an
+// atomic rename always brings a new inode, so an unchanged (path, ino, mtime, size)
+// is an unchanged file.
+let stateCache = null;
+
+function fileStamp(file) {
+  try {
+    const stat = fs.statSync(file);
+    return `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+  } catch { return 'missing'; }
+}
+
+function normalizeState(state) {
   if (!state || typeof state !== 'object' || Array.isArray(state)) return { fetchedAt: {}, fetchStatus: {} };
   if (!state.fetchedAt || typeof state.fetchedAt !== 'object' || Array.isArray(state.fetchedAt)) state.fetchedAt = {};
   if (!state.fetchStatus || typeof state.fetchStatus !== 'object' || Array.isArray(state.fetchStatus)) state.fetchStatus = {};
   return state;
+}
+
+// Shared and read-only: callers that only look (originEvidenceUsable, the
+// dependency caches) use this. Anything that mutates takes loadState()'s copy.
+function cachedState() {
+  const file = stateFile();
+  const stamp = fileStamp(file);
+  if (stateCache && stateCache.file === file && stateCache.stamp === stamp) return stateCache.state;
+  const state = normalizeState(readJson(file, {}));
+  stateCache = { file, stamp, state };
+  return state;
+}
+
+function loadState() { return structuredClone(cachedState()); }
+
+// Every writer of the state file goes through here, so this process never
+// serves its own previous version even if a filesystem reported a stale stamp.
+function saveState(value) {
+  writeJsonAtomic(stateFile(), value);
+  stateCache = null;
 }
 
 // A card's local landed evidence: the records, plus the patch-id attempts that
@@ -211,23 +244,57 @@ function citedShas(entries) {
   return found;
 }
 
+// Bounded memo: a Map iterates in insertion order, so the first key is the oldest.
+function remember(map, key, value, limit) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > limit) map.delete(map.keys().next().value);
+  return value;
+}
+
+// Test seam, so tests can count the git processes the memos below save and move
+// the clock. canonicalCwd: keep-core already memoizes the same
+// isLinkedWorktree/mainCheckout pair for project inference, so repoFor shares it
+// instead of keeping a third copy. freshCanonicalCwd: the same lookup without
+// that memo, for re-checking a path that was not a repository (keep-core would
+// still hand back its first answer). execFileSync: every git call this module
+// makes itself (see git()).
+const deps = {
+  canonicalCwd: (dir) => keep.canonicalCwd(dir),
+  freshCanonicalCwd: (dir) => (wt.isLinkedWorktree(dir) ? wt.mainCheckout(dir) || dir : dir),
+  execFileSync: (...args) => childProcess.execFileSync(...args),
+  now: () => Date.now(),
+};
+
+// A project path's main checkout does not move while the daemon runs: the daemon
+// resolves commit dependencies on every state build, and without this each one
+// was two git processes. A path that is not a repository can become one (a card
+// filed before its repo is cloned), so that answer is re-checked every five
+// minutes instead of lasting until a restart. A short-lived CLI or
+// `keep landed` child asks once and exits.
+const REPO_MEMO_LIMIT = 512;
+const REPO_NULL_TTL_MS = 5 * 60e3;
+const repoMemo = new Map();
+
 function repoFor(task) {
   const project = task && task.fm && task.fm.project;
   if (!project) return null;
   const expanded = String(project).replace(/^~(?=\/|$)/, os.homedir());
   const candidate = path.resolve(expanded);
-  let repo = candidate;
+  const hit = repoMemo.get(candidate);
+  if (hit && (hit.repo != null || deps.now() - hit.at < REPO_NULL_TTL_MS)) return hit.repo;
+  let repo = null;
   try {
-    if (wt.isLinkedWorktree(candidate)) repo = wt.mainCheckout(candidate) || candidate;
-    const dotGit = path.join(repo, '.git');
-    const stat = fs.statSync(dotGit);
-    if (!stat.isDirectory() && !stat.isFile()) return null;
-    return repo;
-  } catch { return null; }
+    const main = (hit ? deps.freshCanonicalCwd(candidate) : deps.canonicalCwd(candidate)) || candidate;
+    const stat = fs.statSync(path.join(main, '.git'));
+    if (stat.isDirectory() || stat.isFile()) repo = main;
+  } catch {}
+  remember(repoMemo, candidate, { repo, at: deps.now() }, REPO_MEMO_LIMIT);
+  return repo;
 }
 
 function git(repo, args, timeout = 10e3, options = {}) {
-  return childProcess.execFileSync('git', ['-C', repo, '--no-optional-locks', ...args], {
+  return deps.execFileSync('git', ['-C', repo, '--no-optional-locks', ...args], {
     encoding: 'utf8',
     timeout,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -240,7 +307,48 @@ function refExists(repo, ref) {
   catch { return false; }
 }
 
+// What a ref answer depends on, read with stats instead of a git process: the
+// loose ref files named, packed-refs, and a reftable's table list. Any fetch,
+// push or update-ref that moves one of these refs rewrites one of those files
+// (by rename, so a new inode), in this process or any other. Null when the repo
+// has no .git directory to look in; the caller then does not cache.
+function refStamp(repo, refs) {
+  const gitDir = path.join(repo, '.git');
+  try { if (!fs.statSync(gitDir).isDirectory()) return null; } catch { return null; }
+  return [
+    ...refs.map((ref) => fileStamp(path.join(gitDir, ref))),
+    fileStamp(path.join(gitDir, 'packed-refs')),
+    fileStamp(path.join(gitDir, 'reftable', 'tables.list')),
+  ].join('|');
+}
+
+// The landed sweep's last fetch of the repository, from the state file it
+// writes. A fetch is what moves origin refs; keying on it too means a sweep's
+// fetch re-checks every remembered answer even if a ref stamp were to collide.
+function fetchGeneration(repo) {
+  const at = cachedState().fetchedAt[repo];
+  return Number.isFinite(Number(at)) ? String(Number(at)) : 'never';
+}
+
+// origin/HEAD only moves on a fetch (or by hand, which the ref stamp sees). The
+// TTL covers a repository the landed sweep never fetches, whose refs some other
+// tool may rewrite in a way this stamp does not cover.
+const DEFAULT_BRANCH_TTL_MS = 10 * 60e3;
+const BRANCH_MEMO_LIMIT = 512;
+const branchMemo = new Map();
+
 function defaultBranch(repo) {
+  const refs = ['refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master'];
+  const stamp = refStamp(repo, refs);
+  const key = stamp == null ? null : `${fetchGeneration(repo)}#${stamp}`;
+  const hit = key != null && branchMemo.get(repo);
+  if (hit && hit.key === key && Date.now() - hit.at < DEFAULT_BRANCH_TTL_MS) return hit.branch;
+  const branch = readDefaultBranch(repo);
+  if (key != null) remember(branchMemo, repo, { key, at: Date.now(), branch }, BRANCH_MEMO_LIMIT);
+  return branch;
+}
+
+function readDefaultBranch(repo) {
   try {
     const ref = git(repo, ['symbolic-ref', 'refs/remotes/origin/HEAD']).trim();
     const prefix = 'refs/remotes/origin/';
@@ -275,16 +383,41 @@ function fetchDefault(repo, branch, state, now = Date.now()) {
 }
 
 function originEvidenceUsable(repo, branch) {
-  const status = loadState().fetchStatus[repo];
+  const status = cachedState().fetchStatus[repo];
   return Boolean(status && status.ok === true && (!branch || status.branch === branch));
 }
 
+// Whether a sha is on origin/<branch> changes only when that ref moves: true can
+// turn false on a force-push, false turns true when the commit arrives. Both
+// happen through a fetch, so either answer holds until the repository's next
+// fetch (fetchedAt) or until the tracking ref's files change, whichever the
+// daemon sees first. The ref stamp is what keeps a single process (a sweep that
+// fetches mid-run, a test that moves a ref by hand) from reading an answer from
+// before its own ref update.
+const ON_DEFAULT_MEMO_LIMIT = 4096;
+const onDefaultMemo = new Map();
+
 function isOnDefault(repo, sha, branch) {
+  const stamp = refStamp(repo, [`refs/remotes/origin/${branch}`]);
+  const memoKey = `${repo}\0${branch}\0${sha}`;
+  const key = stamp == null ? null : `${fetchGeneration(repo)}#${stamp}`;
+  const hit = key != null && onDefaultMemo.get(memoKey);
+  if (hit && hit.key === key) return hit.value;
+  let value;
   try {
     git(repo, ['cat-file', '-e', `${sha}^{commit}`]);
     git(repo, ['merge-base', '--is-ancestor', sha, `refs/remotes/origin/${branch}`]);
-    return true;
-  } catch { return false; }
+    value = true;
+  } catch { value = false; }
+  if (key != null) remember(onDefaultMemo, memoKey, { key, value }, ON_DEFAULT_MEMO_LIMIT);
+  return value;
+}
+
+function resetCaches() {
+  stateCache = null;
+  repoMemo.clear();
+  branchMemo.clear();
+  onDefaultMemo.clear();
 }
 
 // Every worktree of `repo` on a branch other than the default whose work is not on
@@ -802,7 +935,7 @@ function persistState(sweepState, now) {
       const prior = fetchStatus[repo];
       if (!prior || Number(status.at) >= Number(prior.at)) fetchStatus[repo] = status;
     }
-    writeJsonAtomic(stateFile(), { ...current, fetchedAt, fetchStatus, lastSweepAt: now });
+    saveState({ ...current, fetchedAt, fetchStatus, lastSweepAt: now });
   });
 }
 
@@ -1272,6 +1405,9 @@ module.exports = {
   fetchDefault,
   originEvidenceUsable,
   isOnDefault,
+  resetCaches,
+  loadState,
+  deps,
   unlandedWorktrees,
   REBASE_SCAN_LIMIT,
   REBASE_WINDOW_MS,
