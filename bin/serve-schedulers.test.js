@@ -523,7 +523,7 @@ test('periodic schedulers read sessions from the bounded transcript index', () =
   let body = source.slice(source.indexOf('function startSchedulers('));
   const wired = (pattern) => assert.match(body, pattern);
   wired(/runs\.setEphemeralHost\(\{[\s\S]*?sessions: \(\) => periodicScan\(\),[\s\S]*?\}\);/);
-  wired(/limitresume\.startScheduler\(\{[\s\S]*?scanSessions: \(\) => periodicScan\(\),/);
+  wired(/limitresume\.startScheduler\(\{[\s\S]*?scanSessions: \(\) => periodicScan\(\)\.filter\(/);
   wired(/ctx\.sessionSnapshot : periodicScan\(\);/);
   wired(/require\('\.\.\/notes\.js'\)\.startScheduler\(\{[\s\S]*?sessions: \(\) => scanSessions\(\{ fresh: true \}\),/);
   wired(/const areaSessionDeps = \(\) => \(\{[\s\S]*?scanSessions: \(\) => scanSessions\(\),/);

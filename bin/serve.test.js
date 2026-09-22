@@ -11450,6 +11450,7 @@ test('the rate-limit policy reads only live Claude panes, with the pane account 
     { id: 'dead', alive: false, meta: { sessionId: 'dead', agent: 'claude' } },
     { id: 'gone', alive: true, agentAlive: false, meta: { sessionId: 'gone', agent: 'claude' } },
     { id: 'codex', alive: true, meta: { sessionId: 'codex', agent: 'codex' } },
+    { id: 'far@aws1', node: 'aws1', alive: true, meta: { sessionId: 'far', agent: 'claude' } },
   ];
   const sessions = await handoffPolicySessions({
     listHostPanes: async () => panes,

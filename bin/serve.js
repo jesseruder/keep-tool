@@ -7951,8 +7951,10 @@ async function handoffQueueSessions(deps = {}) {
 async function handoffPolicySessions(deps = {}) {
   const panes = await (deps.listHostPanes || listHostPanes)({}, true);
   if (!Array.isArray(panes)) return [];
+  // A transfer stops an agent and proves it from this machine's process table, so a
+  // pane on another node is never a candidate, as policyEnqueue itself refuses.
   const live = panes.filter((pane) => pane && pane.alive === true && pane.agentAlive !== false
-    && pane.meta?.agent === 'claude');
+    && pane.meta?.agent === 'claude' && !nodes.isRemotePane(pane));
   const lookup = deps.claudeSessionFor || ((id) => claudeSessionFor(id, { allowCachedMiss: true }));
   const sessions = [];
   for (const pane of hostPanesBySession(live).values()) {
