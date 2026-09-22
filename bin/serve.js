@@ -1013,7 +1013,6 @@ function inspectCloseTranscript(file, kind, deps = {}) {
       finish(new Error(`close transcript scan timed out after ${Math.round(timeoutMs / 1000)}s; leave the session open`));
       try { worker.terminate(); } catch {}
     }, timeoutMs);
-    timer.unref?.();
     const finish = (error, result) => {
       if (settled) return;
       settled = true;

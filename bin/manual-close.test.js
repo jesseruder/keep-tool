@@ -43,6 +43,22 @@ test('manual close does not report success if termination cannot be verified', a
   assert.deepEqual(f.calls, ['exit', 'SIGTERM', 'SIGKILL']);
 });
 
+// Read 1 is the initial identity read; each polling phase then reads ten times, so
+// the read before SIGTERM is the 12th and the read before SIGKILL the 23rd.
+for (const [stage, reads, calls, expected] of [
+  ['the first identity read', 1, [], /timed out \(get\)/],
+  ['the read before SIGTERM', 12, ['exit'], /timed out \(get\)/],
+  ['the read before SIGKILL', 23, ['exit', 'SIGTERM'], /SIGTERM signal sent; host did not confirm/],
+]) test(`manual close abandons a hung host read at ${stage} and signals nothing further`, async () => {
+  const f = fixture('never');
+  let count = 0;
+  const get = f.deps.getPane;
+  // The Nth read never answers; the budget timer, not the host, ends the wait.
+  f.deps.getPane = () => (++count === reads ? new Promise(() => {}) : get());
+  await assert.rejects(manualClose(body, f.deps), expected);
+  assert.deepEqual(f.calls, calls);
+});
+
 for (const mode of ['timeout', 'missing']) test(`manual close reports an unconfirmed SIGTERM after post-signal ${mode} reads`, async () => {
   const f = fixture('never');
   let signaled = false;

@@ -1,9 +1,26 @@
 'use strict';
 
+// One phase of polling: ten reads a tenth of a second apart. Every identity read
+// on this path is bounded by it, because the caller holds the injection lock.
+const READ_BUDGET_MS = 1000;
+
+// A host read may not outlive its budget: a host that never answers is abandoned
+// as a timeout (the read is idempotent and may finish on its own; a late reply
+// answers nobody, since the request id no longer has a waiter).
+function withinBudget(promise, remainingMs) {
+  return new Promise((resolve, reject) => {
+    // Not unref'd: the timer is what ends the wait, so it must keep the process
+    // alive until it fires or is cleared; a CLI close with nothing else pending
+    // would otherwise exit mid-close.
+    const timer = setTimeout(() => reject(new Error(`host request timed out (get) after ${Math.round(remainingMs)}ms of the close phase`)), Math.max(0, remainingMs));
+    promise.then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); });
+  });
+}
+
 // Explicit user Close only. Automatic retirement keeps its conservative policy.
 async function manualClose(body, deps) {
   if (!/^[a-z0-9_-]+$/i.test(body?.sessionId || '') || !/^[a-z0-9_-]+$/i.test(body?.pane || '')) throw new Error('Expected exact session and pane');
-  const initial = await deps.getPane(body.pane);
+  const initial = await withinBudget(deps.getPane(body.pane), READ_BUDGET_MS);
   if (deps.requireSignalGuard && deps.signalGuarded !== true) {
     throw new Error('Terminal host must be refreshed before automatic force close');
   }
@@ -38,13 +55,6 @@ async function manualClose(body, deps) {
   // A phase is ten polls or the wall time they were meant to take, whichever ends
   // first: a host that times out every read must not hold the injection lock for
   // ten full request timeouts, and the error reports the time actually spent.
-  // One read may not outlive the phase either: a host that never answers is
-  // abandoned at the budget (the read is idempotent and may finish on its own).
-  const withinBudget = (promise, remainingMs) => new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`host request timed out (get) after ${Math.round(remainingMs)}ms of the close phase`)), Math.max(0, remainingMs));
-    timer.unref?.();
-    promise.then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); });
-  });
   const wait = async (delay) => {
     const started = now();
     const budgetMs = 10 * delay;
@@ -88,7 +98,7 @@ async function manualClose(body, deps) {
   await gracefulResult?.beforeSignal?.();
   // The identity reads around each signal get one phase's budget too; nothing has
   // been signalled yet here, so a timeout simply fails the close.
-  verify(await withinBudget(deps.getPane(body.pane), 10 * 100));
+  verify(await withinBudget(deps.getPane(body.pane), READ_BUDGET_MS));
   const guard = () => ({
     expectedPid: initial.pid,
     expectedSessionId: body.sessionId,
@@ -101,7 +111,7 @@ async function manualClose(body, deps) {
   if (!term.confirmed) throw unconfirmed('SIGTERM', term.waitedMs, term.lastError);
   await gracefulResult?.beforeSignal?.();
   let beforeKill;
-  try { beforeKill = await withinBudget(deps.getPane(body.pane), 10 * 100); }
+  try { beforeKill = await withinBudget(deps.getPane(body.pane), READ_BUDGET_MS); }
   catch (error) { if (timedOut(error)) throw unconfirmed('SIGTERM', term.waitedMs, error); throw error; }
   if (!beforeKill) throw unconfirmed('SIGTERM', term.waitedMs);
   verify(beforeKill);
