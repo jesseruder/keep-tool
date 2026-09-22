@@ -2128,7 +2128,9 @@ async function listNodePaneResult(node, deps = {}, fresh = false, epoch = hostMu
   if (!client) return { panes: null, failure: 'unreachable', endpoint: hostEndpointExists({ ...deps, node }) };
   const now = deps.now || Date.now;
   const cached = hostPaneCaches.get(client);
-  if (!fresh && cached && now() - cached.at < HOST_PANE_CACHE_MS) return { panes: cached.panes, failure: null };
+  if (!fresh && cached && now() - cached.at < HOST_PANE_CACHE_MS) {
+    return { panes: cached.panes, failure: null, cached: true };
+  }
   try {
     const result = await requestHostClient(client, 'list', {}, deps);
     const panes = Array.isArray(result && result.panes) ? result.panes : [];
@@ -2165,8 +2167,12 @@ async function listHostPaneResult(deps = {}, fresh = false) {
   const now = deps.now || Date.now;
   const results = await Promise.all(names.map(async (node) => [node, await listNodePaneResult(node, deps, fresh, epoch)]));
   const primary = (results.find(([node]) => node === daemon) || results[0])[1];
+  // Only a list this call actually collected is remembered. A list served from the
+  // per-node cache may predate a mutation that cleared the memo, and re-seeding the
+  // memo with it would put the pre-mutation state back behind the fence.
+  const fromCache = results.some(([, result]) => result.cached);
   const remember = (panes) => {
-    if (epoch !== hostMutationEpoch) return panes;
+    if (fromCache || epoch !== hostMutationEpoch) return panes;
     const memo = deps.hostPaneMemo || lastKnownHostPaneMemo;
     memo.panes = panes;
     memo.at = now();
