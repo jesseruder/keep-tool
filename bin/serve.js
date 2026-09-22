@@ -3939,11 +3939,14 @@ function compactionSwappedModel(deps = {}) {
 // daemon still configured with `KEEP_COMPACT_VIA_MODEL=opus` types the id too; any other
 // value, full id or not, is typed as configured.
 //
-// The default is "the latest Opus", not a pinned release: the newest `claude-opus-*` id
-// a session's transcript has reported (`message.model` is always the full id). Every turn
-// scan offers its model to `noteSeenModel`, and the newest Opus is kept in
-// .keep/compact/latest-opus.json so a restart does not forget it. The floor is only a
-// lower bound — what types before any scan has seen a newer Opus — never a pin.
+// The default is "the latest Opus", not a pinned release: the newest `claude-opus-*` id a
+// transcript under the same Claude account has reported (`message.model` is always the
+// full id). Every turn scan offers its model to `noteSeenModel` with the account's config
+// dir, and the newest Opus per account is kept in .keep/latest-opus.json, outside the
+// compact directory whose stamps are swept after a week. Keying by account means an id
+// one account runs (a preview, a staggered rollout, a proxy's own ids) is never typed in
+// another. The floor is only a lower bound — what types before that account has run a
+// newer Opus — never a pin.
 const COMPACT_VIA_FLOOR_MODEL = 'claude-opus-5-5';
 
 // [major, minor] for a bare `claude-opus-<major>[-<minor>]` release id, with or without a
@@ -3971,44 +3974,63 @@ function latestOpusModel(models = [], floor = COMPACT_VIA_FLOOR_MODEL) {
 }
 
 function latestOpusFile() {
-  return path.join(autoCompactDir(), 'latest-opus.json');
+  return path.join(keep.ROOT, '.keep', 'latest-opus.json');
 }
 
-// Read once per file and then kept in memory; `noteSeenModel` updates both.
+// The Claude config dir a transcript (<dir>/projects/<project>/<id>.jsonl) or a
+// settings.json (<dir>/settings.json) belongs to; '' when the path has neither shape.
+function claudeConfigDirOf(file) {
+  if (!file) return '';
+  const resolved = path.resolve(String(file));
+  if (path.basename(resolved) === 'settings.json') return path.dirname(resolved);
+  const projects = path.dirname(path.dirname(resolved));
+  return path.basename(projects) === 'projects' && resolved.endsWith('.jsonl') ? path.dirname(projects) : '';
+}
+
+// { <config dir>: model }, read once per file and then kept in memory; `noteSeenModel`
+// updates both.
 const latestOpusSeen = new Map();
 
 function readLatestOpusSeen(file = latestOpusFile()) {
   if (!latestOpusSeen.has(file)) {
-    let model = '';
+    const byAccount = {};
     try {
       const value = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (opusModelVersion(value && value.model)) model = String(value.model).toLowerCase();
+      for (const [dir, entry] of Object.entries(value && value.accounts || {})) {
+        if (opusModelVersion(entry && entry.model)) byAccount[dir] = String(entry.model).toLowerCase();
+      }
     } catch {}
-    latestOpusSeen.set(file, model);
+    latestOpusSeen.set(file, byAccount);
   }
   return latestOpusSeen.get(file);
 }
 
-// Called with every model a turn scan reads. Writes only when a newer Opus appears, which
-// is once per release, so the scan path costs a string compare.
-function noteSeenModel(model, file = latestOpusFile()) {
+// Called with every model a turn scan reads. Writes only when an account runs a newer
+// Opus, which is once per release, so the scan path costs a string compare.
+function noteSeenModel(model, configDir, file = latestOpusFile()) {
   const candidate = String(model || '').trim().replace(/\[1m\]$/i, '').toLowerCase();
-  if (!opusModelVersion(candidate) || !newerOpus(readLatestOpusSeen(file), candidate)) return;
-  latestOpusSeen.set(file, candidate);
+  if (!configDir || !opusModelVersion(candidate)) return;
+  const byAccount = readLatestOpusSeen(file);
+  if (!newerOpus(byAccount[configDir] || '', candidate)) return;
+  byAccount[configDir] = candidate;
+  const at = new Date().toISOString();
+  const accounts = Object.fromEntries(Object.entries(byAccount).map(([dir, seen]) => [dir, { model: seen, at }]));
   const temp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(temp, `${JSON.stringify({ model: candidate, at: new Date().toISOString() })}\n`, { mode: 0o600 });
+    fs.writeFileSync(temp, `${JSON.stringify({ accounts }, null, 2)}\n`, { mode: 0o600 });
     fs.renameSync(temp, file);
   } catch {
     try { fs.unlinkSync(temp); } catch {}
   }
 }
 
-function compactViaModel(seen) {
+// `configDir` names the account the switch will be typed in; without one only the floor
+// is safe. `seen` replaces the recorded models (tests).
+function compactViaModel({ configDir = '', seen, file } = {}) {
   const value = envString('KEEP_COMPACT_VIA_MODEL', 'opus');
   if (value.toLowerCase() !== 'opus') return value;
-  return latestOpusModel(seen !== undefined ? seen : [readLatestOpusSeen()]);
+  return latestOpusModel(seen !== undefined ? seen : [configDir ? readLatestOpusSeen(file)[configDir] : '']);
 }
 
 function compactSwapPlan(session, opts) {
@@ -5089,7 +5111,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
   const policy = deps.compactionPolicy || null;
   const pendingRecordValue = session?.kind === 'claude' ? readPendingCompactSwap(session && session.id, dir) : null;
   const pendingRecord = codexCompact.isCodexCompactSwap(pendingRecordValue) ? null : pendingRecordValue;
-  const configuredVia = compactViaModel();
+  const configuredVia = compactViaModel({ configDir: claudeConfigDirOf(deps.compactSettingsFile || claudeSettingsPath()) });
   const settingsFile = deps.compactSettingsFile || claudeSettingsPath();
   if (pendingRecord && compactSwapSettingsFile(pendingRecord, deps) !== settingsFile) {
     return { compacted: false, restoreUnconfirmed: true,
@@ -7164,7 +7186,7 @@ function sessionLastTurn(session, deps = {}) {
       const settings = codexCompact.readRolloutSettings(file, deps);
       if (settings?.model) result.model = settings.model;
     }
-    if (session.kind === 'claude') noteSeenModel(result.model);
+    if (session.kind === 'claude') noteSeenModel(result.model, claudeConfigDirOf(file));
     return result;
   }
   catch { return { contextTokens: 0, model: '' }; }
@@ -7432,7 +7454,7 @@ async function compactReopenedSession(session, target, account, turn, deps = {})
       { usage: usageSnapshot(deps), now: Date.now(), accountId: account.id }),
     claudeTtlMs: envNumber('KEEP_AUTO_COMPACT_CLAUDE_TTL_MIN', envNumber('KEEP_CACHE_TTL_MIN', 60)) * 60e3,
     codexTtlMs: envNumber('KEEP_AUTO_COMPACT_CODEX_TTL_MIN', 30) * 60e3,
-    claudeFallbackModel: compactViaModel(),
+    claudeFallbackModel: compactViaModel({ configDir: session.kind === 'claude' && account.configDir ? path.resolve(account.configDir) : '' }),
     codexFallbackModel: envString('KEEP_AUTO_COMPACT_CODEX_FALLBACK_MODEL', 'gpt-5.6-sol'),
   });
   if (!policy) return null;
@@ -13125,6 +13147,7 @@ module.exports = {
   latestOpusModel,
   noteSeenModel,
   readLatestOpusSeen,
+  claudeConfigDirOf,
   shutdownSettingsRepair,
   readClaudeSettingsModel,
   linesAfterLastEcho,
