@@ -1795,6 +1795,63 @@ test('on a pane-only node the hooks bind the pane, say so, and write no registry
   } finally { await f.cleanup(); }
 });
 
+test('on a pane-only node the registry commands name the daemon node and exit 2', async () => {
+  const { encodeFrame, FrameDecoder } = require('./host.js');
+  const f = unattendedFixture();
+  const server = net.createServer((socket) => {
+    const decoder = new FrameDecoder((frame) => {
+      if (!frame || !frame.id) return;
+      socket.write(encodeFrame(frame.type === 'list'
+        ? { ok: true, id: frame.id, panes: [{ id: 'p1', alive: true, pid: 1, meta: { agent: 'shell' } }] }
+        : { ok: false, id: frame.id, error: `unsupported ${frame.type}` }));
+    }, () => socket.destroy());
+    socket.on('data', (chunk) => decoder.push(chunk));
+    socket.on('error', () => {});
+  });
+  await new Promise((resolve) => server.listen(path.join(f.root, 'host.sock'), resolve));
+  const keep = (argv, extra = { KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main' }) => runHookCli(argv, { env: f.env(extra) });
+  try {
+    const before = registrySnapshot(f.root);
+    for (const argv of [['list'], [], ['checkin', 'unread-card', '-m', 'state'], ['add', 'A card'], ['show', 'unread-card'],
+      ['tell', 'unread-card', 'hello'], ['open', 'unread-card'], ['land', 'unread-card'], ['sync'], ['serve'],
+      ['nodes', 'add', 'x'], ['node', 'ls'], ['codex', 'task', 'go'], ['init'], ['usage']]) {
+      const result = await keep(argv);
+      const cmd = argv[0] || 'list';
+      assert.equal(result.status, 2, `${argv.join(' ')}: ${result.stderr}`);
+      assert.equal(result.stderr, `keep ${cmd}: the registry lives on node main; this is node aws1\n`);
+      assert.equal(result.stdout, '');
+    }
+    assert.deepEqual(registrySnapshot(f.root), before, 'nothing under the registry was written');
+
+    // What is this machine's own still runs.
+    const panes = await keep(['pane', 'ls', '--json']);
+    assert.equal(panes.status, 0, panes.stderr);
+    assert.deepEqual(JSON.parse(panes.stdout).map((pane) => pane.id), ['p1']);
+    const help = await keep(['help']);
+    assert.equal(help.status, 0, help.stderr);
+    const { paneOnlyRefusal } = require('./keep.js');
+    const node = { KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main' };
+    for (const [cmd, args] of [['hook', ['stop']], ['host', ['ls']], ['attach', ['p1']], ['doctor', []], ['setup', ['hooks']],
+      ['nodes', []], ['nodes', ['ls']], ['nodes', ['usage', 'aws1']], ['node', ['init', 'aws1']],
+      ['codex', ['context']], ['codex', ['--account', 'codex-two', 'context', '--json']]]) {
+      assert.equal(paneOnlyRefusal(cmd, args, node), null, `${cmd} ${args.join(' ')}`);
+    }
+    // A name inherited from Object.prototype is not an entry in the table.
+    assert.match(paneOnlyRefusal('constructor', [], node), /registry lives on node main/);
+
+    // On the daemon node, nothing changes.
+    for (const env of [{}, { KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' }]) {
+      assert.equal(paneOnlyRefusal('list', [], env), null);
+      const listed = await keep(['list'], env);
+      assert.equal(listed.status, 0, listed.stderr);
+      assert.match(listed.stdout, /unread-card/);
+    }
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await f.cleanup();
+  }
+});
+
 test('with the node and daemon names equal the hooks are the hooks they always were', async () => {
   const run = async (extra) => {
     const f = unattendedFixture();

@@ -3779,10 +3779,47 @@ commands.setup = (args) => {
 commands.service = (args) => require('./setup').service(args, ROOT);
 commands.node = (args) => require('./setup').node(args, ROOT);
 
+// A machine that holds terminals for another one's registry answers only for
+// itself. This table is the whole of what runs there, and it is an allow-list on
+// purpose: every command that reads or writes the registry, including any added
+// after it, is refused by not being named here. `true` allows every form of a
+// command; a list allows those subcommands (a missing one is the command's default);
+// a function reads the arguments itself.
+const PANE_ONLY_COMMANDS = {
+  help: true,
+  hook: true, // the hooks have their own pane-only mode: bind, release, and nothing written
+  host: true,
+  pane: true,
+  attach: true,
+  doctor: true,
+  setup: true, // hooks, skills and the shell block of this machine's own agents
+  nodes: (args) => !args.length || ['ls', 'usage'].includes(args[0]) || String(args[0]).startsWith('-'),
+  node: (args) => args[0] === 'init',
+  codex: (args) => (args[0] === '--account' ? args[2] : args[0]) === 'context',
+};
+
+function paneOnlyRefusal(cmd, args, env = process.env) {
+  const where = require('./nodes.js').paneOnlyNode(env);
+  if (!where) return null;
+  const rule = Object.prototype.hasOwnProperty.call(PANE_ONLY_COMMANDS, cmd) ? PANE_ONLY_COMMANDS[cmd] : null;
+  if (rule === true || (typeof rule === 'function' && rule(args))) return null;
+  return `keep ${cmd}: the registry lives on node ${where.daemon}; this is node ${where.local}`;
+}
+module.exports.paneOnlyRefusal = paneOnlyRefusal;
+module.exports.PANE_ONLY_COMMANDS = PANE_ONLY_COMMANDS;
+
 if (require.main === module) {
   (async () => {
     try {
       const [cmd, ...rest] = process.argv.slice(2);
+      // Before the registry is even looked for: on a pane-only node the answer is
+      // where the registry is, not that there is none here.
+      const elsewhere = commands[cmd || 'list'] ? paneOnlyRefusal(cmd || 'list', rest) : null;
+      if (elsewhere) {
+        process.stderr.write(`${elsewhere}\n`);
+        process.exitCode = 2;
+        return;
+      }
       // `host` is exempt with them: the terminal host is a machine's process, not a
       // registry's, and it must start where there are no cards to read.
       // `node` joins them: `keep node init` runs on a machine that is being set up to
