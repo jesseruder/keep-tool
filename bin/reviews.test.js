@@ -536,6 +536,11 @@ test('commit and job facts are accepted only from a node, and only well formed',
     await refused([fact], /is running, not completed/,
       ['--job', 'task-running-1', '--job-fact', `task-running-1:codex-fixture:running:${new Date().toISOString()}`]);
     assert.equal(reviews.readRecords('work', f.root).length, 0, 'nothing refused was written');
+    // A job under a built-in account carries the slash accounts.js accepts.
+    const builtIn = await f.viaNode('reviewed', ['work', '--fact', fact, '--verdict', 'findings', '--by', 'codex sol',
+      '--job', 'task-done-1', '--job-fact', `task-done-1:codex/default:completed:${new Date().toISOString()}`], { raw: true });
+    assert.equal(builtIn.status, 0, builtIn.stderr);
+    assert.equal(reviews.readRecords('work', f.root).at(-1).jobAccountId, 'codex/default');
     // A fact the node hand-types is refused on the node before anything is sent.
     assert.throws(() => reviews.nodeFactArgs('reviewed', ['work', '--fact', fact], { cwd: f.tree, root: f.root }), /--fact is what keep sends from a node/);
     // A value that looks like a flag is still the value parseArgs reads it as.

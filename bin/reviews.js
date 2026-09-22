@@ -151,7 +151,9 @@ const MAX_FACTS = 200;
 const FACT_SUBJECT_LIMIT = 200;
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const PATCH_ID_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})?$/;
-const ACCOUNT_RE = /^[A-Za-z0-9._-]{1,80}$/;
+// The same shape accounts.js accepts, so a job under a built-in account
+// (`codex/default`) survives the trip from a node; a colon still cannot.
+const ACCOUNT_RE = require('./accounts').ID_RE;
 const STATUS_RE = /^[A-Za-z_-]{0,40}$/;
 
 function encodeFact(commit) {
