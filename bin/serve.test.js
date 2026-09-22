@@ -19,6 +19,7 @@ const codex = require('./codex.js');
 const { readTranscriptTail } = require('./transcripts.js');
 const {
   scanTranscript,
+  inspectCloseTranscript,
   claudeTranscriptIsInteractive,
   stallAliveIds,
   transcriptActivityMs,
@@ -144,6 +145,71 @@ const { createScreenHistoryCache } = require('./screen-history.js');
 function record(type, content) {
   return JSON.stringify({ type, message: { content } });
 }
+
+test('close transcript worker finds lifecycle facts before a multi-megabyte tail', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-close-transcript-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'large.jsonl');
+  const launch = [
+    JSON.stringify({ type: 'assistant', message: { content: [{
+      type: 'tool_use', id: 'tool-one', name: 'Bash', input: { command: 'long task', run_in_background: true },
+    }] } }),
+    JSON.stringify({ type: 'user', message: { content: [{
+      type: 'tool_result', tool_use_id: 'tool-one', content: 'Command running in background with ID: job-one',
+    }] } }),
+  ].join('\n') + '\n';
+  fs.writeFileSync(file, launch);
+  const padding = `${JSON.stringify({ type: 'progress', data: 'x'.repeat(64 * 1024) })}\n`;
+  while (fs.statSync(file).size < 5 * 1024 * 1024) fs.appendFileSync(file, padding);
+  const result = await inspectCloseTranscript(file, 'claude');
+  assert.equal(result.hasBackgroundCommands, true,
+    'the launch is found even though it sits beyond a practical tail bound');
+});
+
+test('agent process rows share one ps snapshot within the publish TTL', async () => {
+  const { agentProcessRows } = require('./serve.js');
+  const cache = { at: 0, value: null, pending: null };
+  let now = 1000;
+  let calls = 0;
+  const stamp = 'Tue Sep  8 10:00:00 2026';
+  const deps = {
+    now: () => now,
+    processRowsCache: cache,
+    execFile: async () => {
+      calls += 1;
+      return { stdout: `11 10 ttys001 ${stamp} 00:03 /test/claude --resume session-one\n` };
+    },
+  };
+  const [first, joined] = await Promise.all([agentProcessRows(deps), agentProcessRows(deps)]);
+  assert.equal(calls, 1);
+  assert.equal(first, joined);
+  assert.equal(first[0].elapsed, '00:03');
+  assert.equal(await agentProcessRows(deps), first);
+  assert.equal(calls, 1);
+  now += 2501;
+  await agentProcessRows(deps);
+  assert.equal(calls, 2);
+});
+
+test('Pi companion reconciliation consumes the shared process rows', () => {
+  const jobs = require('./pi-jobs.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-shared-rows-'));
+  try {
+    const id = '111111111111111111111111';
+    const pidStart = 'Tue Sep  8 10:00:00 2026';
+    fs.mkdirSync(jobs.jobDirectory(root, id), { recursive: true });
+    jobs.atomicWrite(jobs.recordPath(root, id), {
+      version: 1, id, status: 'running', createdAt: Date.now() - 10000, updatedAt: Date.now(),
+      runnerPid: 2147483000, runnerStart: pidStart, workerToken: 'fixture', piPid: null,
+    });
+    const processRows = [{
+      pid: 2147483000, ppid: 1, pidStart,
+      args: `/test/node /public/project/bin/pi-job-runner.js --job ${id}`,
+    }];
+    assert.equal(jobs.list({ root, processRows }).jobs[0].status, 'running',
+      'the supplied row avoids a per-record ps lookup for the synthetic pid');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 function writeCompactSwapFixture(dir, sessionId, overrides = {}) {
   fs.mkdirSync(dir, { recursive: true });

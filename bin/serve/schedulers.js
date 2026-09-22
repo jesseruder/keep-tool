@@ -1,4 +1,5 @@
 'use strict';
+const path = require('node:path');
 // keep serve — the daemon's periodic jobs.
 //
 // Every block here was moved verbatim out of start() in serve.js: the schedulers
@@ -183,6 +184,30 @@ function startLoopLagProbe({ thresholdMs = 500, intervalMs = 1000, write = (line
   return timer;
 }
 
+function createCleanupSnapshot({
+  keep, keepConsole, listHostPanes, dashboardBuild, companionSnapshot, deps = {},
+  reconcile = (root, sessions, panes) => require('../session-retirement').reconcile(root, sessions, panes),
+} = {}) {
+  return async () => {
+    // Shell verification must see new viewers/output even inside the host-list cache TTL.
+    // That freshness guarantee belongs to the pane list. The fleet build and companion
+    // discovery can use their workers and ordinary caches without weakening it.
+    const panes = await listHostPanes({}, true);
+    const companion = await companionSnapshot(deps);
+    const state = await dashboardBuild({ hostPanes: panes, companion, dashboard: true });
+    reconcile(keep.ROOT, state.sessions, panes);
+    const layouts = await keepConsole.readLayouts(path.join(keep.ROOT, '.keep', 'layouts.json'));
+    return {
+      ...state,
+      // The build's task list excludes the archive; a session on an archived card
+      // must still find it here or cleanup treats it as cardless.
+      allTasks: keep.loadAll(true),
+      companion,
+      pinned: new Set((layouts.layouts || []).flatMap((layout) => layout.ids || [])),
+    };
+  };
+}
+
 function startSchedulers(ctx) {
   const {
     TURN_INDEX_BUDGET_BYTES, TURN_INDEX_BUDGET_MS, TURN_INDEX_PRUNE_LIMIT,
@@ -273,19 +298,9 @@ function startSchedulers(ctx) {
     const doneIdleMs = envNumber('KEEP_AUTO_CLOSE_DONE_MIN', 15) * 60e3;
     const attentionIdleMs = envNumber('KEEP_AUTO_CLOSE_ATTENTION_MIN', 30) * 60e3;
     const unattendedIdleMs = envNumber('KEEP_AUTO_CLOSE_UNATTENDED_MIN', 60) * 60e3;
-    const cleanupSnapshot = async () => {
-      // Shell verification must see new viewers/output even inside the host-list cache TTL.
-      const panes = await listHostPanes({}, true);
-      const state = await addHostSessionState(await buildState({ hostPanes: panes }), { panes });
-      require('../session-retirement').reconcile(keep.ROOT, state.sessions, panes);
-      const layouts = await keepConsole.readLayouts(path.join(keep.ROOT, '.keep', 'layouts.json'));
-      return {
-        ...state,
-        allTasks: keep.loadAll(true),
-        companion: await stalled.discoverCodexJobs({ root: keep.ROOT, fallbackCacheMs: 0 }),
-        pinned: new Set((layouts.layouts || []).flatMap((layout) => layout.ids || [])),
-      };
-    };
+    const cleanupSnapshot = createCleanupSnapshot({
+      keep, keepConsole, listHostPanes, dashboardBuild, companionSnapshot, deps,
+    });
     require('../session-cleanup').startScheduler({
       doneIdleMs,
       attentionIdleMs,
@@ -655,15 +670,18 @@ function startSchedulers(ctx) {
   // Every pass is synchronous work on this event loop, and what it produces is a
   // percentage of a WEEKLY window - 30s freshness bought nothing and cost a full
   // directory walk each time. Five minutes is still 288 folds a day.
-  const foldFleetUsage = () => {
+  let fleetUsageRunning = false;
+  const foldFleetUsage = async () => {
+    if (fleetUsageRunning) return;
+    fleetUsageRunning = true;
     const startedAt = Date.now();
     try {
-      review.foldFleetUsage(24 * 1024 * 1024);
-      // Timed because every pass is synchronous work on this loop: the health row
-      // is where a fold that has grown expensive shows up.
+      await review.foldFleetUsageInWorker(24 * 1024 * 1024);
       health.record('fleet-usage', { ok: true, detail: `${Date.now() - startedAt}ms` });
     } catch (error) {
       health.record('fleet-usage', { ok: false, error });
+    } finally {
+      fleetUsageRunning = false;
     }
   };
   let cardUsageRunning = false;
@@ -703,5 +721,6 @@ function startSchedulers(ctx) {
 }
 
 module.exports = {
-  startFeatureSchedulers, startSchedulers, createRegistryPull, startLoopLagProbe, startReceiptsPoller,
+  startFeatureSchedulers, startSchedulers, createRegistryPull, createCleanupSnapshot,
+  startLoopLagProbe, startReceiptsPoller,
 };

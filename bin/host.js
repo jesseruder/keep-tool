@@ -23,6 +23,40 @@ const COLD_RESTORE_CONCURRENCY = 4;
 const PANE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const INPUT_OPERATION_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 const INPUT_RECEIPT_LIMIT = 256;
+const HOST_LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+function hostLogFile(env = process.env) {
+  return path.join(env.KEEP_DIR || path.join(os.homedir(), 'keep'), '.keep', 'host.log');
+}
+
+function rotateHostLog(options = {}) {
+  const io = options.fs || fs;
+  const file = options.file || hostLogFile(options.env);
+  const maxBytes = Number(options.maxBytes) || HOST_LOG_MAX_BYTES;
+  try {
+    if (io.statSync(file).size > maxBytes) {
+      io.truncateSync(file);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+function createHostLogger(options = {}) {
+  const checkEvery = Math.max(1, Number(options.checkEvery) || 256);
+  let writes = 0;
+  rotateHostLog(options);
+  return (line) => {
+    // launchd owns the open stdout descriptor, so truncating its target is the
+    // only rotation that does not require restarting the terminal host.
+    if (++writes % checkEvery === 0) rotateHostLog(options);
+    (options.write || ((text) => process.stdout.write(text)))(`${line}\n`);
+  };
+}
+
+function shouldLogPaneEvent(type, debug = false) {
+  return !['title', 'visibility'].includes(type) || debug === true;
+}
 
 function inputOperationFingerprint(params) {
   return crypto.createHash('sha256').update(JSON.stringify([
@@ -329,7 +363,10 @@ function createHost(options = {}) {
   const maxClientBufferBytes = clientBufferLimit(options.clientBufferBytes);
   const coldDir = path.resolve(options.coldDir || `${sock}.screens`);
   const coldIO = options.coldIO || fs.promises;
-  const log = options.log === undefined ? (line) => process.stdout.write(`${line}\n`) : options.log;
+  const log = options.log === undefined ? createHostLogger({
+    file: options.logFile, maxBytes: options.logMaxBytes, checkEvery: options.logCheckEvery,
+  }) : options.log;
+  const debugEvents = options.debug === undefined ? Boolean(process.env.KEEP_DEBUG) : options.debug === true;
   const primaryReconnectGraceMs = Math.max(0, Number(options.primaryReconnectGraceMs ?? 60e3));
   const panes = new Map();
   const connections = new Set();
@@ -527,7 +564,7 @@ function createHost(options = {}) {
     if (type === 'spawned') eventLog(`host: spawned ${pane.id} ${pane.cmd} pid ${pane.pty.pid}`);
     else if (type === 'exited') eventLog(`host: exited ${pane.id} code ${pane.exitCode} signal ${pane.signal}`);
     else if (type === 'removed') eventLog(`host: removed ${pane.id}`);
-    else eventLog(`host: ${type} ${pane.id}`);
+    else if (shouldLogPaneEvent(type, debugEvents)) eventLog(`host: ${type} ${pane.id}`);
   };
 
   const newTerminal = (cols, rows) => {
@@ -1612,6 +1649,10 @@ module.exports = {
   encodeFrame,
   decodeFrame,
   renderScreen,
+  hostLogFile,
+  rotateHostLog,
+  createHostLogger,
+  shouldLogPaneEvent,
   createHost,
   runHost,
   socketPath,

@@ -292,11 +292,19 @@ const TURN_COLUMNS = `t.id AS id, t.session_id AS session_id, t.n AS n, t.starte
 function selectTurns(options = {}) {
   const handle = turnIndex.open(options.db);
   const limit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : 5;
-  return handle.prepare(`SELECT ${TURN_COLUMNS}
-    FROM turns t JOIN sessions s ON s.id = t.session_id
-    WHERE t.ended = 1 AND t.verdict IS NULL AND s.kind = 'interactive'
-      AND COALESCE(t.ended_at, t.started_at, 0) >= ?
-    ORDER BY COALESCE(t.ended_at, t.started_at, 0) DESC LIMIT ?`).all(windowStart(options.sinceMs), limit);
+  // Split current and legacy rows so SQLite can seek both sparse partial indexes;
+  // a single OR made it prefer turns_verdict and walk every ended turn.
+  return handle.prepare(`WITH pending(id, ended_at) AS (
+      SELECT id, ended_at FROM turns INDEXED BY turns_unjudged
+        WHERE ended = 1 AND verdict IS NULL AND ended_at >= ?
+      UNION ALL
+      SELECT id, ended_at FROM turns INDEXED BY turns_unjudged_started
+        WHERE ended = 1 AND verdict IS NULL AND ended_at IS NULL AND started_at >= ?
+    )
+    SELECT ${TURN_COLUMNS}
+    FROM pending p JOIN turns t ON t.id = p.id JOIN sessions s ON s.id = t.session_id
+    WHERE s.kind = 'interactive'
+    ORDER BY p.ended_at DESC LIMIT ?`).all(windowStart(options.sinceMs), windowStart(options.sinceMs), limit);
 }
 
 function turnsForReplay(options = {}) {
@@ -304,9 +312,10 @@ function turnsForReplay(options = {}) {
   const limit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : 100;
   // A live verdict is Owner's to judge; re-scoring it would overwrite the thing
   // being measured. Only unjudged turns and earlier replays are re-runnable.
-  const where = ["s.kind = 'interactive'", 't.ended = 1', 'COALESCE(t.ended_at, t.started_at, 0) >= ?',
+  const where = ["s.kind = 'interactive'", 't.ended = 1',
+    '(t.ended_at >= ? OR (t.ended_at IS NULL AND t.started_at >= ?))',
     "(t.verdict IS NULL OR t.verdict_model LIKE '%:replay')"];
-  const params = [windowStart(options.sinceMs)];
+  const params = [windowStart(options.sinceMs), windowStart(options.sinceMs)];
   if (options.agent) { where.push('s.agent = ?'); params.push(options.agent); }
   params.push(limit);
   // Only turns with a following opener can be scored: that opener is the ground
@@ -317,7 +326,7 @@ function turnsForReplay(options = {}) {
     JOIN sessions s ON s.id = t.session_id
     JOIN turns next ON next.session_id = t.session_id AND next.n = t.n + 1
     WHERE ${where.join(' AND ')} AND next.opener_text IS NOT NULL
-    ORDER BY COALESCE(t.ended_at, t.started_at, 0) DESC LIMIT ?`).all(...params);
+    ORDER BY t.ended_at DESC LIMIT ?`).all(...params);
 }
 
 function turnFor(sessionId, n, options = {}) {

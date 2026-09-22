@@ -997,6 +997,26 @@ test('the daemon tick is off unless KEEP_WATCHER=1 and judges at most five turns
   assert.equal(failing.failures, 5);
 });
 
+test('pending-turn selection uses the sparse unjudged index and keeps legacy null ended_at rows', (t) => {
+  const dir = sandbox(t);
+  indexTurns(dir, [['first', 'Done.'], ['second', 'Done again.']]);
+  const db = turnIndex.open();
+  db.prepare('UPDATE turns SET ended_at = NULL WHERE session_id = ? AND n = 1').run(SESSION);
+  const rows = watcher.selectTurns({ sinceMs: 0, limit: 10 });
+  assert.deepEqual(rows.map((row) => row.n).sort(), [1, 2]);
+  const plan = db.prepare(`EXPLAIN QUERY PLAN WITH pending(id, ended_at) AS (
+      SELECT id, ended_at FROM turns INDEXED BY turns_unjudged
+        WHERE ended = 1 AND verdict IS NULL AND ended_at >= ?
+      UNION ALL
+      SELECT id, ended_at FROM turns INDEXED BY turns_unjudged_started
+        WHERE ended = 1 AND verdict IS NULL AND ended_at IS NULL AND started_at >= ?
+    )
+    SELECT t.id FROM pending p JOIN turns t ON t.id = p.id
+      JOIN sessions s ON s.id = t.session_id
+    WHERE s.kind = 'interactive' ORDER BY p.ended_at DESC LIMIT ?`).all(0, 0, 10);
+  assert.ok(plan.some((row) => /turns_unjudged/.test(row.detail)), JSON.stringify(plan));
+});
+
 // ---------- replay ----------
 
 test('replay scores each verdict against what Owner actually typed next', async (t) => {

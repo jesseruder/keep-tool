@@ -19,6 +19,7 @@ const { ref: sessionRef, named: sessionNamed } = require('./session-numbers.js')
 const os = require('os');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
+const { Worker } = require('node:worker_threads');
 const keep = require('./keep.js');
 const steps = require('./steps.js');
 const codex = require('./codex.js');
@@ -2208,6 +2209,36 @@ function foldFleetUsage(byteBudget) {
   const result = { backlogBytes, folded: budgetStart - Math.max(0, budget) };
   fleetFoldStatus = { at: Date.now(), backlogBytes };
   return result;
+}
+
+// The fold walks every recent transcript before it reads its bounded byte budget.
+// Under swap pressure even those metadata reads can stop the daemon for seconds, so
+// the scheduler runs the whole pass in a worker and receives only its small result.
+function foldFleetUsageInWorker(byteBudget, options = {}) {
+  const WorkerClass = options.Worker || Worker;
+  const workerFile = options.workerFile || path.join(__dirname, 'fleet-usage-worker.js');
+  return new Promise((resolve, reject) => {
+    const worker = new WorkerClass(workerFile, { workerData: { byteBudget } });
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else {
+        fleetFoldStatus = { at: Date.now(), backlogBytes: result.backlogBytes };
+        resolve(result);
+      }
+    };
+    worker.once('message', (message) => {
+      if (message?.error) finish(new Error(message.error.message || message.error));
+      else finish(null, message?.result || { backlogBytes: 0, folded: 0 });
+    });
+    worker.once('error', (error) => finish(error));
+    worker.once('exit', (code) => {
+      if (code !== 0) finish(new Error(`fleet usage worker exited ${code}`));
+      else if (!settled) finish(new Error('fleet usage worker exited without a result'));
+    });
+  });
 }
 
 // Last fold's view, so per-broadcast consumers never re-walk 4k transcript files.
@@ -4850,6 +4881,7 @@ module.exports = {
   weightedCost,
   fleetCostFromLines,
   foldFleetUsage,
+  foldFleetUsageInWorker,
   weeklyAttribution,
   reviewerWeekly,
   SEVERITIES,

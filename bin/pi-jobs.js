@@ -260,7 +260,13 @@ function launch(options) {
 }
 
 function list(options = {}) {
-  const jobs = records(options.root).map((job) => ({
+  // Dashboard publication already owns a full ps snapshot. Reusing its rows keeps
+  // reconciliation proportional to records in memory instead of one ps per job.
+  const rows = Array.isArray(options.processRows) ? options.processRows : null;
+  const jobs = records(options.root, rows ? {
+    rows,
+    processAlive: (pid) => rows.some((row) => row.pid === Number(pid)),
+  } : {}).map((job) => ({
     id: job.id,
     status: job.status,
     state: job.status,

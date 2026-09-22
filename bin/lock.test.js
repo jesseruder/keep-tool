@@ -80,3 +80,37 @@ test('a lock somebody else is holding is waited on, then refused with the lock m
       'a caller that gave up never touches the holder’s lock');
   } finally { releaseHeld(); }
 });
+
+test('withLock uses an in-process wait between attempts', () => {
+  let attempts = 0;
+  const waits = [];
+  let released = false;
+  const result = keep.withLock(() => 'done', {
+    now: () => 0,
+    acquire: () => ++attempts === 3,
+    wait: (ms) => waits.push(ms),
+    release: () => { released = true; },
+  });
+  assert.equal(result, 'done');
+  assert.deepEqual(waits, [100, 100]);
+  assert.equal(released, true);
+});
+
+test('an empty ps answer falls back to signal-zero liveness before reclaiming', () => {
+  releaseHeld();
+  fs.mkdirSync(keep.META, { recursive: true });
+  fs.mkdirSync(keep.LOCK);
+  fs.writeFileSync(ownerFile, JSON.stringify({ pid: 4242, token: 'uncertain', startedAt: 'known-start' }));
+  const old = new Date(Date.now() - 61e3);
+  fs.utimesSync(keep.LOCK, old, old);
+  assert.equal(keep.acquireLock('candidate', {
+    processStartedAt: () => '',
+    kill: () => {},
+  }), false, 'a live pid keeps its lock when ps timed out');
+  assert.equal(JSON.parse(fs.readFileSync(ownerFile, 'utf8')).token, 'uncertain');
+  assert.equal(keep.acquireLock('candidate', {
+    processStartedAt: () => '',
+    kill: () => { const error = new Error('gone'); error.code = 'ESRCH'; throw error; },
+  }), true, 'a dead pid permits reclaim');
+  releaseHeld();
+});

@@ -10,6 +10,7 @@ const os = require('os');
 const http = require('http');
 const crypto = require('crypto');
 const { execFile } = require('child_process');
+const { Worker } = require('node:worker_threads');
 const { AsyncLocalStorage } = require('async_hooks');
 const { promisify } = require('util');
 const keep = require('./keep.js');
@@ -133,6 +134,8 @@ const SCREEN_HISTORY_SCROLLBACK = 10000;
 const screenHistoryCache = createScreenHistoryCache();
 const COMPANION_SNAPSHOT_MS = 1000;
 let companionSnapshotCache = { at: 0, value: null, pending: null };
+const PROCESS_ROWS_CACHE_MS = 2500;
+let processRowsCache = { at: 0, value: null, pending: null };
 // A frozen or non-advancing clock must not spin the poll loop forever.
 const SUGGESTION_PROBE_MAX_READS = Math.ceil(SUGGESTION_PROBE_MAX_MS / SUGGESTION_PROBE_WAIT_MS) + 1;
 // The probe's Backspace is sent, not awaited — but the very next screen read is often
@@ -502,9 +505,20 @@ async function companionSnapshot(deps = {}) {
   const discoverPi = deps.discoverPiJobs
     || (injected ? empty : (options) => require('./pi-jobs').list(options));
   const discover = async (options) => {
+    // Pane annotation, Codex companion discovery, and Pi job reconciliation all
+    // need the same process table during one publication. agentProcessRows owns a
+    // short cache so this joins the pane list's read instead of spawning more ps.
+    const rows = Array.isArray(deps.processRows) ? deps.processRows
+      : injected ? null : await agentProcessRows(deps);
+    const shared = rows ? {
+      ...options,
+      processRows: rows,
+      psKnown: true,
+      psOutput: rows.map((row) => `${row.pid} ${row.elapsed || '00:00'} ${row.args || ''}`).join('\n'),
+    } : options;
     const [codexJobs, piJobs] = await Promise.all([
-      Promise.resolve(discoverCodex(options, deps)),
-      Promise.resolve(discoverPi(options, deps)),
+      Promise.resolve(discoverCodex(shared, deps)),
+      Promise.resolve(discoverPi(shared, deps)),
     ]);
     const snapshots = [codexJobs, piJobs].filter(Boolean);
     const known = snapshots.some((snapshot) => snapshot.known
@@ -975,6 +989,33 @@ function sessionBackgroundPending(info) {
       if (info.agentResumedAt?.[id] && !(state.attentionAt >= info.agentResumedAt[id])) return true;
       return !state.explicitEndTurn || state.pendingOther || state.pendingBackground;
     } catch { return true; }
+  });
+}
+
+// Graceful close needs the complete lifecycle, not the last few megabytes: a
+// background launch can be old while its completion is absent. Put that full read
+// and JSON parsing in a short-lived worker so it cannot stall the daemon loop.
+function inspectCloseTranscript(file, kind, deps = {}) {
+  if (deps.inspectCloseTranscript) return deps.inspectCloseTranscript(file, kind);
+  const WorkerClass = deps.Worker || Worker;
+  const workerFile = deps.closeTranscriptWorker || path.join(__dirname, 'close-transcript-worker.js');
+  return new Promise((resolve, reject) => {
+    const worker = new WorkerClass(workerFile, { workerData: { file, kind } });
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error); else resolve(result);
+    };
+    worker.once('message', (message) => {
+      if (message?.error) finish(new Error(message.error.message || message.error));
+      else finish(null, message?.result || {});
+    });
+    worker.once('error', (error) => finish(error));
+    worker.once('exit', (code) => {
+      if (code !== 0) finish(new Error(`close transcript worker exited ${code}`));
+      else if (!settled) finish(new Error('close transcript worker exited without a result'));
+    });
   });
 }
 
@@ -4278,7 +4319,11 @@ function parseProcessTable(output) {
   for (const line of String(output || '').split(/\r?\n/)) {
     const match = PS_TABLE_RE.exec(line);
     if (!match) continue;
-    const args = match[5];
+    const tail = match[5];
+    const elapsedMatch = /^(\S+)\s+(.*)$/.exec(tail);
+    const elapsed = elapsedMatch && /^(?:\d+-)?\d{1,2}:\d{2}(?::\d{2})?$/.test(elapsedMatch[1])
+      ? elapsedMatch[1] : null;
+    const args = elapsed ? elapsedMatch[2] : tail;
     // macOS prints the bare command name in parentheses — `(claude)` — for a process
     // whose argument vector it could not read. That row names a live process and says
     // nothing else about it, so it is neither an agent nor evidence that one is gone.
@@ -4296,6 +4341,7 @@ function parseProcessTable(output) {
       ppid: Number(match[2]),
       tty: match[3].replace(/^\/dev\//, ''),
       pidStart: match[4],
+      ...(elapsed ? { elapsed } : {}),
       args,
       agent: agentMatch && agentMatch[2],
       interactive,
@@ -4307,13 +4353,27 @@ function parseProcessTable(output) {
 
 async function agentProcessRows(deps = {}) {
   if (typeof deps.psTable === 'string') return parseProcessTable(deps.psTable);
+  const cache = deps.processRowsCache || processRowsCache;
+  const now = typeof deps.now === 'function' ? Number(deps.now()) : Number(deps.now ?? Date.now());
+  if (cache.value && now - cache.at < PROCESS_ROWS_CACHE_MS) return cache.value;
+  if (cache.pending) return cache.pending;
   // A `ps` over every process on a swapping Mac has taken well past five seconds, and
   // the timeout lands as a refused transfer or a session that looks gone. Waiting is
   // cheaper than either.
-  const result = await (deps.execFile || execFileAsync)('ps', ['-axo', 'pid=,ppid=,tty=,lstart=,args='], {
-    encoding: 'utf8', timeout: 15e3, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' },
+  cache.pending = (deps.execFile || execFileAsync)(
+    'ps', ['-axo', 'pid=,ppid=,tty=,lstart=,etime=,args='],
+    { encoding: 'utf8', timeout: 15e3, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' } },
+  ).then((result) => {
+    const value = parseProcessTable(String(result.stdout || ''));
+    cache.value = value;
+    cache.at = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
+    cache.pending = null;
+    return value;
+  }, (error) => {
+    cache.pending = null;
+    throw error;
   });
-  return parseProcessTable(String(result.stdout || ''));
+  return cache.pending;
 }
 
 function verifiedPiBackgroundPids(rows, deps = {}) {
@@ -5348,7 +5408,6 @@ async function closeIdleSession(body, deps = {}) {
       if (!deps.closePolicy?.done && !deps.closePolicy?.retirement) return null;
       const companion = await (deps.discoverCodexJobs || stalled.discoverCodexJobs)({
         root: deps.root || keep.ROOT,
-        fallbackCacheMs: 0,
       }, deps);
       const allTasks = (deps.loadAll || keep.loadAll)(true);
       let policySession = current.sessions.find((candidate) => candidate.id === session.id);
@@ -5484,9 +5543,9 @@ async function closeIdleSession(body, deps = {}) {
     if (deps.closePolicy?.retirement || deps.closePolicy?.done) await inspectAutomaticProcesses({ initial: true });
     if (session.kind === 'claude' && !(deps.closePolicy?.restart && deps.restartProof)) {
       const file = findSessionFile(session.id);
-      if (!file || fs.statSync(file).size > 64 * 1024 * 1024) throw new InjectionError(409, 'Session history is too large to safely verify background completion');
-      const lifecycle = scanTranscript(file, { full: true });
-      if (lifecycle.hasBackgroundCommands || sessionBackgroundPending(lifecycle)) throw new InjectionError(409, 'Background command completion is unverified; leave the session open');
+      if (!file) throw new InjectionError(409, 'Session history is unavailable for background completion verification');
+      const lifecycle = await inspectCloseTranscript(file, 'claude', deps);
+      if (lifecycle.hasBackgroundCommands || lifecycle.pendingBackground) throw new InjectionError(409, 'Background command completion is unverified; leave the session open');
     } else if (session.kind === 'codex') {
       // The transcript's ended turn does not prove that yielded Codex commands
       // ended. Automatic retirement requires no children; explicit Close may
@@ -5500,16 +5559,11 @@ async function closeIdleSession(body, deps = {}) {
       if (!deps.closePolicy?.manual) {
         if (!deps.closePolicy?.retirement && processes.some((p) => p.ppid === identity.pid)) throw new InjectionError(409, 'Automatic cleanup protects Codex child processes; use Close to request an explicit graceful exit');
         const file = (deps.codexRolloutFile || codex.rolloutFileFor)(session.id);
-        if (!file || fs.statSync(file).size > 64 * 1024 * 1024) throw new InjectionError(409, 'Codex background history cannot be verified safely');
+        if (!file) throw new InjectionError(409, 'Codex background history is unavailable');
         // Remote children have no local PID. Verify durable child transcripts,
-        // not expiring UI hints, before retiring a parent that used them.
-        const launched = fs.readFileSync(file, 'utf8').split('\n').some((line) => {
-          let r; try { r = JSON.parse(line); } catch { return false; }
-          if (r.type === 'event_msg' && ['SubAgentActivity', 'CollabAgentToolCall'].includes(r.payload?.item?.type)) return true;
-          const p = r.type === 'response_item' && r.payload;
-          if (!p || !['function_call', 'custom_tool_call'].includes(p.type)) return false;
-          return /spawn_agent|spawn_agents|followup_task|send_input/.test(`${p.name || ''} ${p.arguments || ''} ${p.input || ''}`);
-        });
+        // not expiring UI hints, before retiring a parent that used them. The full
+        // rollout scan stays off this event loop for the same reason as Claude's.
+        const { launched } = await inspectCloseTranscript(file, 'codex', deps);
         if (launched) {
           try { verifyCodexChildren = require('./codex-cleanup').verify(file, session.id, deps.codexChildRolloutFile || codex.findRolloutFile); }
           catch (error) { throw new InjectionError(409, error.message); }
@@ -11345,6 +11399,7 @@ module.exports = {
   claudeTranscriptIsInteractive,
   claudeSessionFromInfo,
   sessionBackgroundPending,
+  inspectCloseTranscript,
   stallAliveIds,
   companionSnapshot,
   applyCompanionJobs,

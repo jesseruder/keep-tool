@@ -1967,6 +1967,43 @@ test('fleetCostFromLines weights by price ratios and model family', () => {
   assert.ok(Math.abs(weightedCost({ in: 0, cc: 0, cr: 1e6, out: 0 }, 'fable') - 1.5) < 1e-9, 'cache reads are a tenth of input');
 });
 
+test('fleet usage worker produces the same ledger and byte result as the synchronous fold', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-fleet-worker-'));
+  try {
+    const project = path.join(root, '.claude', 'projects', 'fixture');
+    fs.mkdirSync(project, { recursive: true });
+    fs.writeFileSync(path.join(project, 'session.jsonl'), [
+      JSON.stringify({ type: 'assistant', timestamp: new Date().toISOString(), message: {
+        model: 'claude-fable-5', usage: { input_tokens: 100, output_tokens: 20 },
+      } }),
+      JSON.stringify({ type: 'user', message: { content: 'done' } }),
+    ].join('\n') + '\n');
+    const script = `
+      (async () => {
+        const fs = require('node:fs');
+        const path = require('node:path');
+        const review = require('./bin/review.js');
+        const ledger = path.join(process.env.KEEP_DIR, '.keep', 'review', '_fleet_usage.json');
+        const direct = review.foldFleetUsage(1024 * 1024);
+        const directLedger = fs.readFileSync(ledger, 'utf8');
+        fs.unlinkSync(ledger);
+        const worker = await review.foldFleetUsageInWorker(1024 * 1024);
+        const workerLedger = fs.readFileSync(ledger, 'utf8');
+        process.stdout.write(JSON.stringify({ direct, worker, same: directLedger === workerLedger }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const child = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'), encoding: 'utf8',
+      env: { ...process.env, HOME: root, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout);
+    assert.deepEqual(result.worker, result.direct);
+    assert.equal(result.same, true);
+    assert.ok(result.worker.folded > 0);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a reviewer that has never taken a turn is addressable by its bound session id', () => {
   const { pickReviewer, BOOTSTRAP_MAX_AGE_MS } = require('./review.js');
   const now = Date.now();

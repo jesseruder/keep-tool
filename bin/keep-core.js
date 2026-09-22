@@ -761,7 +761,10 @@ const lockToken = () => `${process.pid}-${Date.now().toString(36)}-${Math.random
 // blocks the next one for a minute rather than forever. Named and separate so
 // withLock below is the three lines it actually is — acquire, wait, release —
 // rather than that loop with a body threaded through it.
-function acquireLock(token) {
+function acquireLock(token, deps = {}) {
+  const now = deps.now || Date.now;
+  const startedAt = deps.processStartedAt || processStartedAt;
+  const kill = deps.kill || process.kill;
   const ownerFile = lockOwnerFile();
   for (;;) {
     try {
@@ -780,15 +783,18 @@ function acquireLock(token) {
       if (e.code !== 'EEXIST') throw e;
       let reclaimed = false;
       try {
-        if (Date.now() - fs.statSync(LOCK).mtimeMs > 60e3) {
+        if (now() - fs.statSync(LOCK).mtimeMs > 60e3) {
           let owner = null;
           try { owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8')); } catch {}
           let alive = false;
           if (owner && Number.isInteger(owner.pid) && owner.pid > 0) {
-            const actualStart = processStartedAt(owner.pid);
+            const actualStart = startedAt(owner.pid);
             if (owner.startedAt && actualStart) alive = owner.startedAt === actualStart;
             else {
-              try { process.kill(owner.pid, 0); alive = true; }
+              // `ps` can time out and return no identity while the machine is
+              // swapping. A signal-0 probe distinguishes that from a dead owner;
+              // an empty ps answer alone must never authorize lock reclamation.
+              try { kill(owner.pid, 0); alive = true; }
               catch (error) { alive = error.code === 'EPERM'; }
             }
           }
@@ -817,18 +823,27 @@ function releaseLock(token) {
   }
 }
 
-function withLock(fn) {
+const lockWaitArray = new Int32Array(new SharedArrayBuffer(4));
+function waitForLock(ms = 100) {
+  Atomics.wait(lockWaitArray, 0, 0, ms);
+}
+
+function withLock(fn, options = {}) {
   fs.mkdirSync(META, { recursive: true });
-  const deadline = Date.now() + 5000;
+  const now = options.now || Date.now;
+  const acquire = options.acquire || ((token) => acquireLock(token, options));
+  const release = options.release || releaseLock;
+  const wait = options.wait || waitForLock;
+  const deadline = now() + 5000;
   const token = lockToken();
-  while (!acquireLock(token)) {
-    if (Date.now() > deadline) die(LOCK_BUSY);
-    execFileSync('sleep', ['0.1']);
+  while (!acquire(token)) {
+    if (now() > deadline) die(LOCK_BUSY);
+    wait(100);
   }
   try {
     return fn();
   } finally {
-    releaseLock(token);
+    release(token);
   }
 }
 
@@ -1793,7 +1808,8 @@ module.exports = {
   attributeHeading, countReviewerStatusChange, sessionInTaskProject, recordScheduler, clearScheduler,
   invalidateSchedulerHandoff, recordProgressMarker, recordContribution, recordSession,
   warnSkippedSessionLink, parsePlan, renderPlan, setPlan, nextStep, demoteHeadings, appendLog,
-  recordDaemonSessionClose, lastLogLine, processStartedAt, withLock, git, commitAndPush, parseArgs,
+  recordDaemonSessionClose, lastLogLine, processStartedAt, acquireLock, waitForLock, withLock,
+  git, commitAndPush, parseArgs,
   inAgentSession, die, cleanScalar, cleanExperimentId, canonicalCwdMemo, canonicalCwd, inferProject,
   normalizeProjectPath, canonicalProjectPath, resolveProjectArg, writeJsonAtomic, activeHolds, holdFile,
   scopeForProject, fmtTask, isOverdue, parseDependency, dependencyTarget, dependencyReason, dependencyStep,

@@ -15,6 +15,8 @@ const {
   RingBuffer,
   FrameDecoder,
   createHost,
+  createHostLogger,
+  shouldLogPaneEvent,
   decodeFrame,
   encodeFrame,
   renderScreen,
@@ -1869,4 +1871,30 @@ test('compact screen bounds escaped multibyte history before framing and preserv
   assert.equal(frames.length, 1);
   term.buffer.active.getLine = () => ({ translateToString: () => '漢'.repeat(20000) });
   assert.throws(() => renderScreen(term, { compact: true }), /viewport exceeds/);
+});
+
+test('host logger truncates an oversized launchd log at start and while running', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-log-'));
+  try {
+    const file = path.join(root, 'host.log');
+    fs.writeFileSync(file, 'old log that is too large');
+    const log = createHostLogger({
+      file, maxBytes: 10, checkEvery: 1,
+      write: (text) => fs.appendFileSync(file, text),
+    });
+    assert.equal(fs.readFileSync(file, 'utf8'), '', 'startup rotation truncates the old log');
+    log('12345678901');
+    log('new');
+    assert.equal(fs.readFileSync(file, 'utf8'), 'new\n', 'the cheap periodic check caps later growth');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('high-volume title and visibility events are debug-only', () => {
+  for (const type of ['title', 'visibility']) {
+    assert.equal(shouldLogPaneEvent(type, false), false);
+    assert.equal(shouldLogPaneEvent(type, true), true);
+  }
+  for (const type of ['spawned', 'exited', 'removed', 'meta']) {
+    assert.equal(shouldLogPaneEvent(type, false), true);
+  }
 });

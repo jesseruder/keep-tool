@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -246,6 +246,13 @@ const MIGRATIONS = [
     'ALTER TABLE turn_verdicts_kept ADD COLUMN attention_state TEXT',
     'ALTER TABLE turn_verdicts_kept ADD COLUMN attention_confidence TEXT',
     'ALTER TABLE turn_verdicts_kept ADD COLUMN attention_needs_input INTEGER',
+  ] },
+  // The watcher asks only for ended turns that have no verdict. Indexing that
+  // sparse queue keeps its 30-second poll from walking every historical turn.
+  // The second index preserves old rows whose ended_at predates that column.
+  { version: 14, statements: [
+    'CREATE INDEX IF NOT EXISTS turns_unjudged ON turns(ended_at DESC) WHERE ended = 1 AND verdict IS NULL',
+    'CREATE INDEX IF NOT EXISTS turns_unjudged_started ON turns(started_at DESC) WHERE ended = 1 AND verdict IS NULL AND ended_at IS NULL',
   ] },
 ];
 

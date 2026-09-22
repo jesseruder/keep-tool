@@ -1066,7 +1066,7 @@ test('migration 13 adds the attention columns, and a parked verdict carries them
   for (const column of attention) assert.ok(turns.includes(column), `turns.${column} exists`);
   const parked = db.prepare('PRAGMA table_info(turn_verdicts_kept)').all().map((row) => row.name);
   for (const column of attention) assert.ok(parked.includes(column), `turn_verdicts_kept.${column} exists`);
-  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 13);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, turnIndex.SCHEMA_VERSION);
 
   db.prepare(`UPDATE turns SET verdict = 'continue', verdict_message = 'keep going', verdict_at = 1,
       attention_rule = 'prose-request', attention_state = 'needs-input',
@@ -1093,4 +1093,14 @@ test('the database carries its schema version, fingerprint column and journal li
   const columns = db.prepare('PRAGMA table_info(ingest_state)').all().map((row) => row.name);
   assert.ok(columns.includes('head_sha'), 'migration 2 adds the fingerprint column to a fresh database too');
   assert.equal(Object.values(db.prepare('PRAGMA journal_size_limit').get())[0], 64 * 1024 * 1024);
+});
+
+test('migration 14 creates sparse indexes for the unjudged watcher queue', (t) => {
+  tempDir(t);
+  const db = turnIndex.open();
+  const indexes = new Map(db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'index'").all()
+    .map((row) => [row.name, row.sql]));
+  assert.match(indexes.get('turns_unjudged'), /WHERE ended = 1 AND verdict IS NULL/);
+  assert.match(indexes.get('turns_unjudged_started'), /ended_at IS NULL/);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 14);
 });

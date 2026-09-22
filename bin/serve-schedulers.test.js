@@ -7,11 +7,41 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
 
-const { createRegistryPull, startLoopLagProbe, startReceiptsPoller } = require('./serve/schedulers.js');
+const { createRegistryPull, createCleanupSnapshot, startLoopLagProbe, startReceiptsPoller } = require('./serve/schedulers.js');
 
 const ROOT = '/registry/root';
+
+test('cleanup snapshot uses the dashboard worker result, its tasks, and cached companion discovery', async () => {
+  const calls = [];
+  const panes = [{ id: 'pane-one' }];
+  const tasks = [{ id: 'card-one' }];
+  const archived = [{ id: 'card-one' }, { id: 'card-archived' }];
+  const companion = { known: true, jobs: [] };
+  const snapshot = createCleanupSnapshot({
+    keep: { ROOT, loadAll: (includeArchive) => (includeArchive ? archived : tasks) },
+    keepConsole: { readLayouts: async (file) => {
+      assert.equal(file, path.join(ROOT, '.keep', 'layouts.json'));
+      return { layouts: [{ ids: ['pinned-one'] }] };
+    } },
+    listHostPanes: async (deps, fresh) => { calls.push(['panes', deps, fresh]); return panes; },
+    companionSnapshot: async () => { calls.push(['companion']); return companion; },
+    dashboardBuild: async (input) => {
+      calls.push(['build', input]);
+      return { sessions: [{ id: 'session-one' }], tasks };
+    },
+    reconcile: (root, sessions, seenPanes) => calls.push(['reconcile', root, sessions, seenPanes]),
+  });
+  const result = await snapshot();
+  assert.deepEqual(calls[0], ['panes', {}, true], 'the pane verification bypasses its cache');
+  assert.deepEqual(calls[2], ['build', { hostPanes: panes, companion, dashboard: true }]);
+  assert.equal(result.allTasks, archived, 'cleanup still sees archived cards');
+  assert.equal(result.companion, companion);
+  assert.deepEqual([...result.pinned], ['pinned-one']);
+  assert.deepEqual(calls[3], ['reconcile', ROOT, result.sessions, panes]);
+});
 
 // Which git this is, for both the answers table and the order log. The abort is
 // told apart from the rebase it follows because only the order of the two says
