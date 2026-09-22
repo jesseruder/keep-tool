@@ -98,6 +98,18 @@ function formatPaneRef(node, paneId, env = process.env) {
   return node === daemonNode(env) ? String(paneId) : `${paneId}${PANE_REF_SEPARATOR}${node}`;
 }
 
+// The one predicate for "this pane is on another machine". A ref is
+// self-describing — `<id>@<node>`, and an id naming this node parses back to bare —
+// and a pane object from a fleet listing carries `node` beside its qualified id.
+// Neither is a pane on some other node: an id with no `@` and a pane with no `node`
+// are what a single-node install has always produced, so this answers false for
+// every one of them without reading any configuration.
+function isRemotePane(ref, env = process.env) {
+  const daemon = daemonNode(env);
+  if (ref && typeof ref === 'object') return Boolean(ref.node) && ref.node !== daemon;
+  return parsePaneRef(ref, { env }).node !== daemon;
+}
+
 // One secret per node, each in its own file so a node can be added or revoked
 // without rewriting a shared one. A node presents its token to the daemon in
 // x-keep-node-token; nothing else in the registry grants that class.
@@ -130,5 +142,5 @@ function writeNodeToken(root, name) {
 module.exports = {
   NODE_NAME_RE, PANE_REF_SEPARATOR, NODE_NAME_MEMO_MS,
   daemonNode, localNode, isDaemonNode, nodeTokens, writeNodeToken,
-  configuredNodeEntries, configuredNodeNames, parsePaneRef, formatPaneRef,
+  configuredNodeEntries, configuredNodeNames, parsePaneRef, formatPaneRef, isRemotePane,
 };

@@ -10128,6 +10128,38 @@ test('API state exposes pane ids without copying obsolete viewer metadata', asyn
   assert.equal(state.attention[0].pane, 'pane-hosted');
 });
 
+test('a published session says which machine it is on, and only when it is not this one', async () => {
+  const { sessionNodeOf, remoteSession } = require('./serve');
+  const local = { id: 'p1', alive: true, node: 'main', cwd: '/tmp/project',
+    meta: { agent: 'claude', sessionId: 'here', project: '/tmp/project' } };
+  const far = { id: 'p2@aws1', hostPaneId: 'p2', alive: true, node: 'aws1', cwd: '/tmp/project',
+    meta: { agent: 'claude', sessionId: 'far', project: '/tmp/project' } };
+  const state = { sessions: [], attention: [] };
+  await addHostSessionState(state, { panes: [local, far], claudeSessionFor: () => null, codexSessionFor: () => null });
+  const bySession = new Map(state.sessions.map((session) => [session.id, session]));
+  assert.equal(bySession.get('far').node, 'aws1');
+  assert.equal(bySession.get('far').pane, 'p2@aws1');
+  // Not undefined: absent. A single-node publication carries no such key at all.
+  assert.equal(Object.prototype.hasOwnProperty.call(bySession.get('here'), 'node'), false);
+
+  // A registry session the backfill never touched is stamped the same way.
+  const registered = { sessions: [{ id: 'far' }, { id: 'here' }], attention: [] };
+  await addHostSessionState(registered, { panes: [local, far], claudeSessionFor: () => null, codexSessionFor: () => null });
+  assert.equal(registered.sessions[0].node, 'aws1');
+  assert.equal(Object.prototype.hasOwnProperty.call(registered.sessions[1], 'node'), false);
+
+  // And the predicate the daemon reads it back with answers for a ref, a stamped
+  // row and a bare session alike.
+  assert.equal(sessionNodeOf('p2@aws1'), 'aws1');
+  assert.equal(sessionNodeOf('p1'), 'main');
+  assert.equal(sessionNodeOf({ id: 'far', node: 'aws1' }), 'aws1');
+  assert.equal(sessionNodeOf({ id: 'far', pane: 'p2@aws1' }), 'aws1');
+  assert.equal(sessionNodeOf({ id: 'here', pane: 'p1' }), 'main');
+  assert.equal(sessionNodeOf(null), 'main');
+  assert.equal(remoteSession({ id: 'here', pane: 'p1' }), false);
+  assert.equal(remoteSession({ id: 'far', pane: 'p2@aws1' }), true);
+});
+
 test('API state keeps an owner-opened session waiting through transport input until registration', async () => {
   const pane = { id: 'new-pane', alive: true, inputCount: 0, createdAt: '2026-09-21T01:02:03Z',
     cwd: '/tmp/project', meta: { agent: 'codex', project: '/tmp/project', awaitingOwnerInput: true } };

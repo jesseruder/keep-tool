@@ -149,3 +149,26 @@ test('the configured node names come from the configuration and fall back to the
   const isolated = { KEEP_DIR: os.tmpdir() };
   assert.deepEqual(nodes.configuredNodeNames(isolated), ['main']);
 });
+
+test('one predicate answers whether a pane is on another machine', () => {
+  const env = { KEEP_DAEMON_NODE: 'main' };
+  // A ref is self-describing, and one naming this node is this node's.
+  assert.equal(nodes.isRemotePane('1a2b3c4d', env), false);
+  assert.equal(nodes.isRemotePane('1a2b3c4d@main', env), false);
+  assert.equal(nodes.isRemotePane('1a2b3c4d@aws1', env), true);
+  assert.equal(nodes.isRemotePane('main-build', env), false);
+  assert.equal(nodes.isRemotePane('', env), false);
+  assert.equal(nodes.isRemotePane(undefined, env), false);
+  // A pane row from a fleet listing carries the node beside its qualified id.
+  assert.equal(nodes.isRemotePane({ id: '1a2b3c4d', node: 'main' }, env), false);
+  assert.equal(nodes.isRemotePane({ id: '1a2b3c4d@aws1', node: 'aws1' }, env), true);
+  // What a single-node install produces: no node key at all, and no configuration
+  // read to say so.
+  assert.equal(nodes.isRemotePane({ id: '1a2b3c4d' }, env), false);
+  assert.equal(nodes.isRemotePane({ id: '1a2b3c4d', node: '' }, env), false);
+  assert.equal(nodes.isRemotePane(null, env), false);
+  // The daemon node's name comes from the environment, so a node that calls itself
+  // something else reads the same pane the other way round.
+  assert.equal(nodes.isRemotePane({ node: 'aws1' }, { KEEP_DAEMON_NODE: 'aws1' }), false);
+  assert.equal(nodes.isRemotePane({ node: 'main' }, { KEEP_DAEMON_NODE: 'aws1' }), true);
+});

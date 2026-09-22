@@ -828,9 +828,9 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
   // A pane on another node is left alone here even if a caller hands one over:
   // closing it and releasing its card's stamp both rest on evidence only the
   // machine running it can produce.
-  const daemonNode = require('./nodes.js').daemonNode();
+  const isRemotePane = require('./nodes.js').isRemotePane;
   const ephemeral = panes.filter((pane) => pane && pane.meta && pane.meta.ephemeral
-    && (!pane.node || pane.node === daemonNode));
+    && !isRemotePane(pane));
   if (!ephemeral.length) return [];
   let sessions = [];
   try { sessions = (host.sessions ? await host.sessions() : []) || []; } catch {}

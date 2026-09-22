@@ -1872,6 +1872,47 @@ function daemonNodeName(deps = {}) {
   return deps.daemonNode || nodes.daemonNode();
 }
 
+// Parsing a ref has to use the same daemon node the answer is compared against, or
+// a test that names one in `deps` would read its own panes as another machine's.
+// Node identity is all the node helpers read out of an environment, so this carries
+// that and nothing else.
+function paneRefEnv(deps = {}) {
+  return { KEEP_DAEMON_NODE: daemonNodeName(deps) };
+}
+
+// Which machine a session or a pane is on. The live pane answers first: a fleet
+// listing stamps `node` on every pane and qualifies its id, so a ref or a stamped
+// row is self-describing. A session whose pane is gone falls back to the durable
+// authority its launch wrote. Neither says anything on a single-node install, where
+// the answer is this machine — the only answer that install has ever had.
+function sessionNodeOf(sessionOrPane, deps = {}) {
+  const daemon = daemonNodeName(deps);
+  if (sessionOrPane == null || typeof sessionOrPane === 'string') {
+    return nodes.parsePaneRef(String(sessionOrPane == null ? '' : sessionOrPane), { env: paneRefEnv(deps) }).node;
+  }
+  if (typeof sessionOrPane !== 'object') return daemon;
+  if (sessionOrPane.node) return String(sessionOrPane.node);
+  const pane = sessionOrPane.pane;
+  if (typeof pane === 'string' && pane) {
+    const node = nodes.parsePaneRef(pane, { env: paneRefEnv(deps) }).node;
+    if (node !== daemon) return node;
+  }
+  const sessionId = sessionOrPane.sessionId || sessionOrPane.id;
+  // Authority is a file read per session, so it is asked only when there is more
+  // than one node to name: a single-node install can have recorded nothing else.
+  if (typeof sessionId === 'string' && sessionId && hostNodeNames(deps).length > 1) {
+    try {
+      const node = accounts.sessionNode(sessionId, { root: deps.root || keep.ROOT, env: deps.env || process.env });
+      if (node) return node;
+    } catch {}
+  }
+  return daemon;
+}
+
+function remoteSession(sessionOrPane, deps = {}) {
+  return sessionNodeOf(sessionOrPane, deps) !== daemonNodeName(deps);
+}
+
 function hostChannel(node, channel = 'control') {
   const key = `${node}\u0000${channel}`;
   let state = hostChannels.get(key);
@@ -6246,7 +6287,7 @@ function validatedCodexResumeCwd(agent, value) {
 // below reads it through `deps`. On the daemon node that is the local read this
 // daemon has always done, unchanged.
 async function restartSession(body, deps = {}) {
-  const paneNode = nodes.parsePaneRef(String(body.pane || '')).node;
+  const paneNode = sessionNodeOf(String(body.pane || ''), deps);
   const remotePane = paneNode !== daemonNodeName(deps);
   deps = nodeEvidence(paneNode, deps);
   const host = (type, params) => hostRequest(type, params, deps);
@@ -6770,7 +6811,7 @@ async function forceStopThenResume({ session, pane, identity, resume }, deps = {
 // settled settings.json, and if the key is busy, name the model a compaction swapped out.
 async function forceRestartSession(entry, save, deps = {}) {
   // The pane's machine answers for the pane's processes, here as in restartSession.
-  const paneNode = nodes.parsePaneRef(String(entry.pane || '')).node;
+  const paneNode = sessionNodeOf(String(entry.pane || ''), deps);
   const remotePane = paneNode !== daemonNodeName(deps);
   deps = nodeEvidence(paneNode, deps);
   let entered = false;
@@ -6879,11 +6920,11 @@ async function closeIdleSession(body, deps = {}) {
   // the local process table, and the shell close verifies a pid it can see. Until a
   // node answers those questions about itself, a pane on another machine is closed
   // only when a person asks for it by hand.
-  const paneNode = nodes.parsePaneRef(String(body.pane || ''));
+  const paneNode = nodes.parsePaneRef(String(body.pane || ''), { env: paneRefEnv(deps) });
   // An id qualified with this node's own name is this node's pane: everything below
   // compares against the ids the pane list publishes, which are bare here.
   if (!paneNode.qualified && paneNode.paneId !== body.pane) body = { ...body, pane: paneNode.paneId };
-  if (paneNode.qualified && deps.closePolicy && !deps.closePolicy.manual) {
+  if (remoteSession(body.pane, deps) && deps.closePolicy && !deps.closePolicy.manual) {
     throw new InjectionError(409, `automatic close is not available for a pane on ${paneNode.node}; close it by hand`);
   }
   const scope = { pane: body.pane, session: body.sessionId };
@@ -11124,6 +11165,10 @@ function backfillHostSessions(sessions, panes, deps = {}) {
       }
       session.id = id;
       session.pane = pane.id;
+      // The machine the pane is on, carried into the publication so no consumer has
+      // to re-derive it. Omitted on the daemon node, the way pane meta and card links
+      // omit theirs: a single-node install publishes the rows it always published.
+      if (nodes.isRemotePane(pane, paneRefEnv(deps))) session.node = pane.node;
       session.hostOnly = true;
       session.taskId = owners[id] || null;
       if (!session.accountId && typeof meta.accountId === 'string' && meta.accountId) session.accountId = meta.accountId;
@@ -11168,6 +11213,9 @@ async function addHostSessionState(state, deps = {}) {
   for (const session of state.sessions || []) {
     const pane = bySession.get(session.id);
     session.pane = pane ? pane.id : null;
+    // As in backfillHostSessions: the pane says which machine, and only when it is
+    // not this one. A registry session whose pane is here keeps no `node` key.
+    if (pane && nodes.isRemotePane(pane, paneRefEnv(deps))) session.node = pane.node;
     // The launch model from `keep open --model`, when the pane carries one.
     const launchModel = pane && pane.meta && pane.meta.model;
     if (typeof launchModel === 'string' && launchModel) session.launchModel = launchModel;
@@ -13250,6 +13298,8 @@ module.exports = {
   hostNodeEntries,
   resolvePlacement,
   nodeEvidence,
+  sessionNodeOf,
+  remoteSession,
   hostNodeNames,
   listNodePaneResult,
   sessionHostPane,

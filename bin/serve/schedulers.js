@@ -199,7 +199,7 @@ function createCleanupSnapshot({
     // an agent pid it can see. A pane on another node answers none of those questions
     // here, so it is kept out of the snapshot entirely until (landing 1b) the node
     // can answer them about itself. The dashboard build below still sees the whole fleet.
-    const local = (panes || []).filter((pane) => !pane?.node || pane.node === nodes.daemonNode());
+    const local = (panes || []).filter((pane) => !nodes.isRemotePane(pane));
     const companion = await companionSnapshot(deps);
     const state = await dashboardBuild({ hostPanes: panes, companion, dashboard: true });
     reconcile(keep.ROOT, state.sessions, local);
@@ -245,7 +245,7 @@ function startSchedulers(ctx) {
     // then releases the check's delivery stamp on the strength of a local
     // observation. An exited pane on another node is not this machine's to reap.
     listPanes: async () => (await listHostPanes({}, true) || [])
-      .filter((pane) => !pane?.node || pane.node === nodes.daemonNode()),
+      .filter((pane) => !nodes.isRemotePane(pane)),
     sessions: () => scanSessions(),
     closePane: (pane, sessionId) => closeEphemeralPane(pane, sessionId, { onChange: broadcast }),
     // A closed pane still sits in the host's list. Forget it, or the sweep re-decides
