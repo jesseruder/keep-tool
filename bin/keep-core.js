@@ -13,6 +13,7 @@ const { execFileSync, spawn } = require('child_process');
 const stepRegistry = require('./steps.js');
 const allow = require('./allow.js');
 const cardUsage = require('./card-usage.js');
+const nodes = require('./nodes.js');
 const delegation = require('./delegation.js');
 const { readTranscriptTail, textOf } = require('./transcripts.js');
 const taskParseCache = require('./stat-parse-cache').createStatParseCache({
@@ -215,6 +216,7 @@ function serializeTask(task) {
       out.push(`  - id: ${s.id}`);
       if (s.agent) out.push(`    agent: ${s.agent}`);
       if (s.at) out.push(`    at: ${s.at}`);
+      if (s.node) out.push(`    node: ${s.node}`);
     }
   }
   if (fm.needs && fm.needs.length) {
@@ -380,7 +382,13 @@ function claimSession(task, session, otherTasks) {
     changed.push(other);
   }
   const sessions = (task.fm.sessions || []).filter((entry) => entry.id !== session.id);
-  sessions.push({ id: session.id, agent: session.agent, at: nowStamp() });
+  // The node is written only when the session runs somewhere other than the daemon
+  // node: on a single-node install every entry would otherwise carry the same name,
+  // and every card would churn the first time it were relinked.
+  const node = session.node === undefined || session.node === null ? null : String(session.node);
+  if (node !== null && !nodes.NODE_NAME_RE.test(node)) throw new Error(`invalid node name: ${session.node}`);
+  const remote = node !== null && node !== nodes.daemonNode() ? { node } : {};
+  sessions.push({ id: session.id, agent: session.agent, at: nowStamp(), ...remote });
   task.fm.sessions = sessions;
   return changed;
 }
@@ -415,7 +423,7 @@ function linkLaunchedSession(taskId, session) {
     const task = all.find((entry) => entry.id === taskId);
     if (!task) return null;
     cardUsage.recordOwner(ROOT, { id: session.id, agent }, task.id);
-    const previousOwners = claimSession(task, { id: session.id, agent }, all);
+    const previousOwners = claimSession(task, { id: session.id, agent, node: session.node }, all);
     for (const previous of previousOwners) fs.writeFileSync(taskPath(previous.id), serializeTask(previous));
     fs.writeFileSync(taskPath(task.id), serializeTask(task));
     commitAndPush(`keep: open ${task.id}`);

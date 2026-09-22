@@ -256,3 +256,28 @@ test('link commits locally without pushing from a manual shell', () => {
     fs.rmSync(remote, { recursive: true, force: true });
   }
 });
+
+test('a session link carries its node only when the session runs off the daemon node', () => {
+  const f = fixture();
+  try {
+    writeTask(f, 'noded');
+    f.commit();
+    assert.equal(f.run(['link', 'noded', '--session', 'sid-remote', '--agent', 'codex', '--node', 'Laptop']).status, 1);
+    assert.match(f.run(['link', 'noded', '--session', 'sid-remote', '--agent', 'codex', '--node', 'Laptop']).stderr,
+      /node must contain only lowercase letters and digits/);
+
+    assert.equal(f.run(['link', 'noded', '--session', 'sid-remote', '--agent', 'codex', '--node', 'laptop']).status, 0);
+    const text = fs.readFileSync(path.join(f.root, 'tasks', 'noded.md'), 'utf8');
+    assert.match(text, /^ {4}node: laptop$/m);
+    const entry = f.load('noded').fm.sessions.find((s) => s.id === 'sid-remote');
+    assert.equal(entry.node, 'laptop', 'the node survives a serialize/parse round trip');
+    assert.equal(entry.agent, 'codex');
+
+    // The daemon node is the default, so naming it leaves the card exactly as a
+    // single-node install writes it.
+    assert.equal(f.run(['link', 'noded', '--session', 'sid-local', '--agent', 'codex', '--node', 'main']).status, 0);
+    const local = f.load('noded').fm.sessions.find((s) => s.id === 'sid-local');
+    assert.equal('node' in local, false);
+    assert.equal(fs.readFileSync(path.join(f.root, 'tasks', 'noded.md'), 'utf8').match(/node:/g).length, 1);
+  } finally { f.cleanup(); }
+});

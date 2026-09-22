@@ -836,15 +836,18 @@ commands.delegate = async (argv, deps = {}) => {
 };
 
 commands.link = (argv) => {
-  const o = parseArgs(argv, { session: 'str', agent: 'str' });
+  const o = parseArgs(argv, { session: 'str', agent: 'str', node: 'str' });
   const id = o._[0];
   if (o._.length !== 1 || !o.session || !o.agent) {
-    die('usage: keep link <card> --session <sid> --agent claude|codex|pi');
+    die('usage: keep link <card> --session <sid> --agent claude|codex|pi [--node <name>]');
   }
   if (!/^[A-Za-z0-9_-]+$/.test(o.session)) die('session id must contain only letters, digits, _ or -');
   if (!['claude', 'codex', 'pi'].includes(o.agent)) die('agent must be claude, codex, or pi');
+  if (o.node !== undefined && !require('./nodes.js').NODE_NAME_RE.test(o.node)) {
+    die('node must contain only lowercase letters and digits');
+  }
   if (isReviewerSession()) die('the fleet reviewer cannot link a working session to a card');
-  const linked = linkSession(id, { id: o.session, agent: o.agent });
+  const linked = linkSession(id, { id: o.session, agent: o.agent, ...(o.node === undefined ? {} : { node: o.node }) });
   if (!linked) die(`no task "${id}"`);
   console.log(`${id} linked to ${o.agent} session ${o.session}`);
 };

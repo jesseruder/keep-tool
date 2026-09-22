@@ -8491,7 +8491,8 @@ async function openSession(body, deps = {}) {
 
   if (handoff && launch.sessionId) {
     try {
-      if ((deps.linkLaunchedSession || keep.linkLaunchedSession)(body.taskId, { id: launch.sessionId, agent })) {
+      if ((deps.linkLaunchedSession || keep.linkLaunchedSession)(body.taskId,
+          { id: launch.sessionId, agent, node: nodes.daemonNode(deps.env || process.env) })) {
         launch.linked = true;
       }
     } catch (error) {
