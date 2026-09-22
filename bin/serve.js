@@ -3128,6 +3128,13 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
     try { codexSendPrecheck(emptyScreen); } catch (error) { throw nothingTyped(error); }
     exactExpectation = { pid: after.pid, inputCount: after.inputCount + chunks.length };
   }
+  // A caller that proved the box itself and holds the pane's counter from that proof
+  // (compactRestoreInputBaseline) types conditionally on it: each chunk is refused by the
+  // host if any other key reached the pane since, and so is Enter, below.
+  const inputBaseline = !guardedChunks && deps.inputBaseline
+    && Number.isInteger(deps.inputBaseline.pid) && Number.isInteger(deps.inputBaseline.inputCount)
+    ? deps.inputBaseline : null;
+  if (inputBaseline) exactExpectation = { pid: inputBaseline.pid, inputCount: inputBaseline.inputCount + chunks.length };
   const discardExpectation = deps.discardDraftOnAbort
     ? exactExpectation || await (async () => {
       const before = await livePaneState(pane, deps);
@@ -3138,7 +3145,16 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   if (!guardedChunks) {
     deps.deliveryTrace?.('write-start');
     for (let index = 0; index < chunks.length; index += 1) {
-      await writeTarget(target, chunks[index], deps);
+      if (!inputBaseline) await writeTarget(target, chunks[index], deps);
+      else {
+        try {
+          await writeTarget(target, chunks[index], deps,
+            { expectedInputCount: inputBaseline.inputCount + index, expectedPid: inputBaseline.pid });
+        } catch (error) {
+          if (error?.inputDropped && index === 0) throw nothingTyped(error);
+          throw typedAlready(error);
+        }
+      }
       if (index + 1 < chunks.length && chunkDelayMs > 0) await sleep(chunkDelayMs);
     }
   }
@@ -3215,7 +3231,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   // one in which Owner can start typing. Callers that type unprompted (the
   // watcher) demand exactness; a human-initiated send keeps the older, looser
   // check it has always had.
-  if (deps.requireExactDraft || guardedChunks) {
+  if (deps.requireExactDraft || guardedChunks || inputBaseline) {
     let exactScreen = '';
     try {
       exactScreen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
@@ -3737,6 +3753,11 @@ function compactRestoreDeferral(record, { reason, resetAt, now }) {
     restoreDeferredAt: now,
     restoreDeferredUntil: reset != null ? reset + COMPACT_RESTORE_RESET_GRACE_MS : now + Math.min(cap, base * 2 ** count),
     restoreDeferrals: count + 1,
+    // What the record's 24h expiry counts from. Kept apart from the blocking state above,
+    // which an attempt clears while it types: an attempt that then fails for some other
+    // reason must not fall back to the swap's own age and expire a days-old deferral.
+    restoreExpiryFrom: Math.max(Number(record && record.restoreExpiryFrom) || 0,
+      reset != null ? reset + COMPACT_RESTORE_RESET_GRACE_MS : now + Math.min(cap, base * 2 ** count)),
     ...(reset != null ? { restoreResetAt: reset } : {}),
   };
 }
@@ -3810,10 +3831,13 @@ function compactSwapUserModelChoice(record, file) {
     if (args != null) {
       const outcome = resolveLocalModelSwitch(args, lines.slice(i + 1, i + 1 + 64));
       if (outcome.failed) continue;
-      const own = switchModel && compactModelBase(args) === compactModelBase(switchModel);
+      // Exact ids, window included: `/model claude-fable-5-1` against a pending
+      // `claude-fable-5-1[1m]` restore is a person dropping the 1M window, and the
+      // restore would put it back.
+      const own = switchModel && args.toLowerCase() === switchModel.toLowerCase();
       if (own && !sawOwnSwitch) { sawOwnSwitch = true; continue; }
       if (own && !sawBefore) continue;
-      if (restoreModel && args && compactModelBase(args) === compactModelBase(restoreModel)) continue;
+      if (restoreModel && args && args.toLowerCase() === restoreModel.toLowerCase()) continue;
       // Confirmed, or at least not refused by the harness: "Kept model as …" is no change.
       if (outcome.model === '<unknown>' && !outcome.label) continue;
       return { model: args || outcome.label, reason: `/model ${args || outcome.label} was chosen after the swap` };
@@ -3967,6 +3991,36 @@ function compactSwapRecordAt(record) {
   try { return fs.statSync(record.file).mtimeMs; } catch { return 0; }
 }
 
+// The pane's input counter, proved against an empty (or suggestion-only) Claude box, for
+// a restore the pending-swap pass is about to type. A deferred restore can come due hours
+// after the compaction, when a person is far more likely to be at the keyboard, and
+// typeAndSubmit alone only looks for its own text somewhere on screen before pressing
+// Enter — so a draft ending in the same command could be submitted as the user's own
+// message. With this baseline every key the restore sends is conditional on the counter
+// (typeAndSubmit's inputBaseline): a key from anyone else in between and the host drops
+// ours instead, and the box must hold exactly the command before Enter. The same
+// before/probe/after reading sendToResolvedTarget takes: the probe's own two keys are the
+// only ones allowed between the two counts.
+async function compactRestoreInputBaseline(target, deps = {}) {
+  const read = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
+  const paneState = deps.livePaneState || livePaneState;
+  let capabilities;
+  try { capabilities = await (deps.hostRequest || hostRequest)('hello', {}, deps); } catch {}
+  if (!capabilities || capabilities.guardedInput !== true) {
+    throw new InjectionError(409, 'terminal host reload required before a model restore can be typed');
+  }
+  const pane = (target && target.pane) || 'unknown';
+  const before = await paneState(pane, deps);
+  if (!before) throw new InjectionError(409, 'pane input activity could not be verified before the restore');
+  const proof = await probeSuggestion(target, await read(target, 30, false), deps);
+  const after = await paneState(pane, deps);
+  const own = proof && proof.kind === 'suggestion' ? 2 : 0;
+  if (!after || after.pid !== before.pid || after.inputCount !== before.inputCount + own) {
+    throw new InjectionError(409, 'input arrived while the prompt was checked; the restore was not typed');
+  }
+  return { pid: after.pid, inputCount: after.inputCount };
+}
+
 async function sweepPendingCompactSwaps(deps = {}) {
   const summary = { checked: 0, restored: 0, dropped: 0, skipped: 0, repairedSettings: 0 };
   if (sweepInFlight) return summary;
@@ -4092,7 +4146,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
       // A deferred restore ages from when it comes due, not from the swap: a Fable week
       // can be days away, and expiring the record first would strand the session on the
       // compaction model for good.
-      const ageFrom = Math.max(compactSwapRecordAt(record),
+      const ageFrom = Math.max(compactSwapRecordAt(record), Number(record.restoreExpiryFrom) || 0,
         compactRestoreDeferred(record) ? Number(record.restoreDeferredUntil) : 0);
       const stale = now() - ageFrom > envNumber('KEEP_COMPACT_SWAP_MAX_AGE_MIN', 24 * 60) * 60e3;
       if (stale) {
@@ -4180,13 +4234,20 @@ async function sweepPendingCompactSwaps(deps = {}) {
             // to start typing, and typeAndSubmit only looks for its own command somewhere
             // in the box. Re-verify it at the moment of typing: the first probe waits for
             // its own Backspace to render, so this one reads a settled screen.
-            await probeSuggestion(target, await read(target, 30, false), deps);
+            const inputBaseline = await (deps.compactRestoreInputBaseline || compactRestoreInputBaseline)(target, deps);
+            // Again under the lock, at the last moment: a /model someone typed since the
+            // pass's first look is as much a choice as one typed before it.
+            const lateChoice = (deps.compactSwapUserModelChoice || compactSwapUserModelChoice)(record,
+              (deps.transcriptFileForSession || transcriptFileForSession)(current));
+            if (lateChoice) return { retired: lateChoice };
             // Only now, with the restore about to be typed, is the attempt a transaction in
             // flight again: until it is confirmed or re-deferred below, the record blocks
             // delivery like any other. A probe that refused above typed nothing, and a
             // deferred record it refused on stays deferred.
             if (compactRestoreDeferred(record)) writeCompactSwapRecord(record.file, withoutCompactRestoreDeferral(record));
-            await submit(target, record.restoreCommand, claudeTypedTextVisible, deps);
+            await submit(target, record.restoreCommand, claudeTypedTextVisible, {
+              ...deps, inputBaseline, discardDraftOnAbort: true, draftKind: 'claude',
+            });
             if (await waitForSwitch(target, record.restoreCommand, sid, deps)) return true;
             try {
               if (compactRestoreRateLimited(await read(target, 30, false), record.restoreCommand)) return 'rate-limited';
@@ -4198,6 +4259,12 @@ async function sweepPendingCompactSwaps(deps = {}) {
         }, { session: record.sessionId, model: true });
         if (restored === null) {
           summary.skipped += 1;
+          continue;
+        }
+        if (restored && restored.retired) {
+          try { fs.unlinkSync(record.file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+          summary.dropped += 1;
+          process.stderr.write(`keep serve: retired model restore record for ${sid}: ${restored.retired.reason}; not restoring "${String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '')}" over it\n`);
           continue;
         }
         if (restored === 'rate-limited') {

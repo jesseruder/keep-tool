@@ -256,6 +256,7 @@ function compactRestoreDeps(dir, session, calls = [], settingsFile) {
     withInjectionLock: async (fn) => fn(),
     readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-sonnet-5' }),
     repairClaudeSettingsModel: () => ({ changed: false }),
+    compactRestoreInputBaseline: async () => ({ pid: 1, inputCount: 0 }),
   };
 }
 
@@ -3961,6 +3962,9 @@ test('pending swap sweep restores through a prompt suggestion that Backspace put
   // sendPrecheck on the sweep's re-read used to refuse exactly there.
   let box = '';
   const host = recordingHost((type, params) => {
+    // The restore's own input baseline asks the host for the guard and the pane count.
+    if (type === 'hello') return { guardedInput: true };
+    if (type === 'list') return { panes: [{ id: 'pane:test', pid: 1, inputCount: inputs.length }] };
     if (type !== 'input') return {};
     const data = Buffer.from(params.data, 'base64').toString('utf8');
     inputs.push(data);
@@ -3972,7 +3976,7 @@ test('pending swap sweep restores through a prompt suggestion that Backspace put
   try {
     // Drop the no-op precheck so the production precheckSessionTarget runs: it reads the
     // screen and probes it, and the sweep probes once more just before it types.
-    const { precheckSessionTarget: _skip, ...base } = compactRestoreDeps(dir, session, calls);
+    const { precheckSessionTarget: _skip, compactRestoreInputBaseline: _real, ...base } = compactRestoreDeps(dir, session, calls);
     const summary = await sweepPendingCompactSwaps({
       ...base,
       host,
@@ -4006,6 +4010,9 @@ test('pending swap sweep refuses a draft typed after its precheck and types noth
   const swapFile = writeCompactSwapFixture(dir, session.id);
   let box = '';
   const host = recordingHost((type, params) => {
+    // The restore's own input baseline asks the host for the guard and the pane count.
+    if (type === 'hello') return { guardedInput: true };
+    if (type === 'list') return { panes: [{ id: 'pane:test', pid: 1, inputCount: inputs.length }] };
     if (type !== 'input') return {};
     const data = Buffer.from(params.data, 'base64').toString('utf8');
     inputs.push(data);
@@ -4022,7 +4029,7 @@ test('pending swap sweep refuses a draft typed after its precheck and types noth
     return screen;
   };
   try {
-    const { precheckSessionTarget: _skip, ...base } = compactRestoreDeps(dir, session, calls);
+    const { precheckSessionTarget: _skip, compactRestoreInputBaseline: _real, ...base } = compactRestoreDeps(dir, session, calls);
     const summary = await sweepPendingCompactSwaps({
       ...base,
       host,
@@ -12298,4 +12305,102 @@ test('pending swap sweep retires a record once someone picks a model by hand aft
 test('an unanswered pane list is a host timeout to the handoff, not a missing pane', async () => {
   const { inspectAccountHandoff } = require('./serve.js');
   assert.deepEqual(await inspectAccountHandoff({ sessionId: 'any', pane: 'pane-1' }, { host: null }), { hostUnavailable: true });
+});
+
+// ---- review round 1 ----
+
+test('a restore typed on a proven input baseline never submits someone else\'s draft', async () => {
+  const command = '/model claude-fable-5-1[1m]';
+  const check = (s, t) => s.includes(t);
+  // Clean: our one chunk, then Enter, both conditional on the count.
+  const clean = draftHarness((inputs) => (inputs.includes(command) ? BOX(command) : BOX('')));
+  await typeAndSubmit({ pane: 'p' }, command, check, { ...clean.deps, inputBaseline: { pid: 4242, inputCount: 0 },
+    discardDraftOnAbort: true });
+  assert.deepEqual(clean.inputs, [command, '\r']);
+  const guarded = clean.host.calls.filter((c) => c.type === 'input').map((c) => c.params.expectedInputCount);
+  assert.deepEqual(guarded, [0, 1], 'the chunk and Enter each name the count they expect');
+
+  // The reviewer's shape: a person started a draft after the probe, and it happens to end
+  // in the restore command. The host drops our first key, so nothing is typed or submitted.
+  const late = draftHarness(BOX(`User draft ${command}`));
+  late.foreign.count = 'User draft '.length;
+  const refused = await typeAndSubmit({ pane: 'p' }, command, check, { ...late.deps,
+    inputBaseline: { pid: 4242, inputCount: 0 }, discardDraftOnAbort: true }).then(() => null, (e) => e);
+  assert.ok(refused && refused.inputDropped && refused.nothingTyped);
+  assert.deepEqual(late.inputs, []);
+
+  // A key between our text and Enter: the box is not only our command any more, and even
+  // if it were, the host would refuse the Enter at the moved count.
+  let typedAt = -1;
+  const between = draftHarness((inputs) => (inputs.includes(command) ? BOX(`${command} x`) : BOX('')),
+    (type, { inputs, foreign }) => {
+      if (type === 'screen' && inputs.includes(command) && typedAt < 0) { typedAt = inputs.length; foreign.count += 2; }
+    });
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, '/model claude-fable-5-1[1m]', (s) => s.includes(command), {
+    ...between.deps, inputBaseline: { pid: 4242, inputCount: 0 }, discardDraftOnAbort: true }));
+  assert.equal(between.inputs.includes('\r'), false, 'Enter is never pressed');
+});
+
+test('the pending-swap pass rechecks a hand-picked model under the lock before typing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-late-choice-'));
+  const session = { id: 'late-choice', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  try {
+    const file = writeCompactSwapFixture(dir, session.id);
+    const calls = [];
+    let looks = 0;
+    const summary = await sweepPendingCompactSwaps({ ...compactRestoreDeps(dir, session, calls),
+      transcriptFileForSession: () => null, stderr: () => {},
+      // Nothing the first time the pass looks; the person picks a model while it works.
+      compactSwapUserModelChoice: () => (++looks === 1 ? null
+        : { model: 'claude-opus-5[1m]', reason: '/model claude-opus-5[1m] was chosen after the swap' }) });
+    assert.equal(looks, 2);
+    assert.deepEqual(calls, [], 'the restore is not typed over the late choice');
+    assert.equal(fs.existsSync(file), false);
+    assert.equal(summary.dropped, 1);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a deferred restore keeps its expiry baseline through an attempt that fails for another reason', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-expiry-baseline-'));
+  const session = { id: 'old-deferred', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  let clock = Date.parse('2026-09-10T12:00:00Z');
+  try {
+    // A swap three days old whose deferral just came due.
+    const deferral = compactRestoreDeferral({}, { reason: 'model-exhausted', resetAt: clock - 60 * 60e3 + 1, now: clock - 3 * 86400e3 });
+    const file = writeCompactSwapFixture(dir, session.id, { at: clock - 3 * 86400e3,
+      ...deferral, restoreDeferredUntil: clock - 60e3, restoreExpiryFrom: clock - 60e3 });
+    const calls = [];
+    const deps = { ...compactRestoreDeps(dir, session, calls), now: () => clock, transcriptFileForSession: () => null,
+      stderr: () => {}, waitForModelSwitch: async () => false };
+    await sweepPendingCompactSwaps(deps);
+    assert.deepEqual(calls, ['/model claude-fable-5-1[1m]']);
+    const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(after.restoreDeferredUntil, undefined, 'the unconfirmed attempt blocks again');
+    assert.equal(after.restoreExpiryFrom, clock - 60e3, 'but its expiry still counts from the deferral');
+    clock += 11 * 60e3;
+    const summary = await sweepPendingCompactSwaps(deps);
+    assert.equal(summary.dropped, 0, 'not expired on the swap\'s own three-day age');
+    assert.equal(fs.existsSync(file), true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('dropping the 1M window by hand is a choice the restore must not undo', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-window-choice-'));
+  try {
+    const at = Date.parse('2026-09-04T12:00:00Z');
+    const stamp = (offsetMs) => new Date(at + offsetMs).toISOString();
+    const modelCommand = (args, offsetMs) => JSON.stringify({ type: 'user', timestamp: stamp(offsetMs), message: { content: [{ type: 'text',
+      text: `<command-name>/model</command-name><command-message>model</command-message><command-args>${args}</command-args>` }] } });
+    const out = (text, offsetMs) => JSON.stringify({ type: 'system', subtype: 'local_command', timestamp: stamp(offsetMs),
+      content: `<local-command-stdout>${text}</local-command-stdout>` });
+    const file = path.join(dir, 't.jsonl');
+    fs.writeFileSync(file, `${[modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 1e3),
+      modelCommand('claude-fable-5-1', 5e3), out('Set model to Fable 5.1', 5e3)].join('\n')}\n`);
+    const record = { at, switchModel: 'claude-opus-5[1m]', restoreCommand: '/model claude-fable-5-1[1m]' };
+    assert.match(compactSwapUserModelChoice(record, file).reason, /\/model claude-fable-5-1 was chosen/);
+    // The restore row itself, window and all, is still the daemon's own.
+    fs.writeFileSync(file, `${[modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 1e3),
+      modelCommand('claude-fable-5-1[1m]', 5e3), out('Set model to Fable 5.1 (1M context)', 5e3)].join('\n')}\n`);
+    assert.equal(compactSwapUserModelChoice(record, file), null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

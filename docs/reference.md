@@ -2382,9 +2382,15 @@ once. A deferred record does not block delivery or daemon restarts, since the se
 deliberately left on the compaction model, and it expires 24 hours after it comes due
 rather than after the swap. The log says `MODEL RESTORE DEFERRED`. When the deferral comes
 due the restore is typed under the injection lock as usual (the record blocks again for
-that attempt) and is either confirmed, deferred again, or left unconfirmed. Second, if the
+that attempt, though its expiry keeps counting from the deferral) and is either
+confirmed, deferred again, or left unconfirmed. Every restore this pass types is
+conditional on the pane's input counter, proved against an empty box just before:
+a key from anyone else in between makes the host drop the restore's keys, and Enter is
+pressed only when the box holds exactly the command. The hand-picked-model check below
+runs again under the lock right before typing. Second, if the
 transcript shows a model someone chose by hand after the swap (a confirmed `/model` other
-than the daemon's own switch and restore rows, or an assistant turn on a third model), the
+than the daemon's own switch and restore rows, compared as exact ids so dropping the
+`[1m]` window counts, or an assistant turn on a third model), the
 pass retires the record without typing the restore or repairing `settings.json`, and logs
 `retired model restore record … not restoring … over it`.
 
