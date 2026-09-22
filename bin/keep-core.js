@@ -28,6 +28,34 @@ const META = path.join(ROOT, '.keep');
 const LOCK = path.join(META, 'lock');
 const HOLDS_DIR = path.join(META, 'holds');
 
+// The directories derived from a registry root. The module constants above are
+// this machine's own registry; a call answered on behalf of somewhere else
+// derives its paths from here instead.
+function paths(root) {
+  const meta = path.join(root, '.keep');
+  return {
+    root,
+    tasks: path.join(root, 'tasks'),
+    archive: path.join(root, 'archive'),
+    meta,
+    lock: path.join(meta, 'lock'),
+    holds: path.join(meta, 'holds'),
+  };
+}
+
+// What a call is being made on behalf of: which registry, from which directory,
+// with which environment and clock, and as whom. Omitting it means this process,
+// here, now - exactly what the module constants have always meant.
+function scopeFor(options = {}) {
+  return {
+    root: options.root || ROOT,
+    cwd: options.cwd || process.cwd(),
+    env: options.env || process.env,
+    now: options.now || Date.now,
+    identity: options.identity || null,
+  };
+}
+
 const STATUSES = ['inbox', 'active', 'waiting', 'blocked', 'landing', 'review', 'deferred', 'done'];
 const OPEN_MESSAGE_LIMIT = 2000;
 // A model id as claude --model / codex -m accept it: claude-fable-5-1, opus, gpt-5.6-sol,
@@ -243,7 +271,7 @@ function serializeTask(task) {
   return out.join('\n') + (task.body ? task.body.replace(/\s+$/, '') + '\n' : '');
 }
 
-function taskPath(id, root = ROOT) { return path.join(root === ROOT ? TASKS : path.join(root, 'tasks'), `${id}.md`); }
+function taskPath(id, root = ROOT) { return path.join(paths(root).tasks, `${id}.md`); }
 
 function loadTask(id, root = ROOT) {
   if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) die(`invalid task id "${id}"`);
@@ -269,8 +297,9 @@ function loadTaskAnywhere(id, root = ROOT) {
 
 const warnedFiles = new Set();
 
-function loadAll(includeArchive) {
-  const dirs = includeArchive ? [TASKS, ARCHIVE] : [TASKS];
+function loadAll(includeArchive, scope) {
+  const { tasks: tasksDir, archive: archiveDir } = paths(scopeFor(scope).root);
+  const dirs = includeArchive ? [tasksDir, archiveDir] : [tasksDir];
   const tasks = [];
   for (const dir of dirs) {
     if (!fs.existsSync(dir)) continue;
@@ -334,13 +363,17 @@ function slugify(title) {
   return id;
 }
 
-function currentSession() {
-  const codexId = process.env.CODEX_THREAD_ID || process.env.CODEX_SESSION_ID;
+function currentSession(scope) {
+  const { env, identity } = scopeFor(scope);
+  // A scope may carry the session on whose behalf the call is made; otherwise the
+  // answer is whichever agent's environment this process runs in.
+  if (identity) return identity;
+  const codexId = env.CODEX_THREAD_ID || env.CODEX_SESSION_ID;
   if (codexId) return { id: codexId, agent: 'codex' };
-  if (process.env.CLAUDE_CODE_SESSION_ID) {
-    return { id: process.env.CLAUDE_CODE_SESSION_ID, agent: 'claude' };
+  if (env.CLAUDE_CODE_SESSION_ID) {
+    return { id: env.CLAUDE_CODE_SESSION_ID, agent: 'claude' };
   }
-  if (process.env.KEEP_PI_SESSION_ID) return { id: process.env.KEEP_PI_SESSION_ID, agent: 'pi' };
+  if (env.KEEP_PI_SESSION_ID) return { id: env.KEEP_PI_SESSION_ID, agent: 'pi' };
   return null;
 }
 
@@ -398,58 +431,64 @@ function claimSession(task, session, otherTasks) {
 // just created the card) gives up its link as soon as the launch succeeds, so its
 // Stop hook stops steering it toward steps another session now owns; the launched
 // session takes the card's resume slot once its pane record identifies it.
-function releaseCardSession(taskId, sessionId) {
+function releaseCardSession(taskId, sessionId, scope) {
   if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sessionId)) return false;
+  const { root } = scopeFor(scope);
   return withLock(() => {
     let task;
-    try { task = loadTask(taskId); } catch { return false; }
+    try { task = loadTask(taskId, root); } catch { return false; }
     if (!task || !Array.isArray(task.fm.sessions)) return false;
     const kept = task.fm.sessions.filter((entry) => entry.id !== sessionId);
     if (kept.length === task.fm.sessions.length) return false;
-    cardUsage.recordOwner(ROOT, { id: sessionId, agent: task.fm.sessions.find(s => s.id === sessionId).agent }, null);
+    cardUsage.recordOwner(root, { id: sessionId, agent: task.fm.sessions.find(s => s.id === sessionId).agent }, null);
     task.fm.sessions = kept;
     // Metadata maintenance, not activity: keep `updated` and the board position.
-    fs.writeFileSync(taskPath(task.id), serializeTask(task));
-    commitAndPush(`keep: open ${task.id} (handoff from ${sessionId.slice(0, 8)})`);
+    fs.writeFileSync(taskPath(task.id, root), serializeTask(task));
+    commitAndPush(`keep: open ${task.id} (handoff from ${sessionId.slice(0, 8)})`, undefined, { scope });
     return true;
-  });
+  }, { scope });
 }
 
-function linkLaunchedSession(taskId, session) {
+function linkLaunchedSession(taskId, session, scope) {
   if (!session || typeof session.id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(session.id)) return null;
   const agent = ['claude', 'codex', 'pi'].includes(session.agent) ? session.agent : 'claude';
+  const { root } = scopeFor(scope);
   return withLock(() => {
-    const all = loadAll(false);
+    const all = loadAll(false, scope);
     const task = all.find((entry) => entry.id === taskId);
     if (!task) return null;
-    cardUsage.recordOwner(ROOT, { id: session.id, agent }, task.id);
+    cardUsage.recordOwner(root, { id: session.id, agent }, task.id);
     const previousOwners = claimSession(task, { id: session.id, agent, node: session.node }, all);
-    for (const previous of previousOwners) fs.writeFileSync(taskPath(previous.id), serializeTask(previous));
-    fs.writeFileSync(taskPath(task.id), serializeTask(task));
-    commitAndPush(`keep: open ${task.id}`);
+    for (const previous of previousOwners) fs.writeFileSync(taskPath(previous.id, root), serializeTask(previous));
+    fs.writeFileSync(taskPath(task.id, root), serializeTask(task));
+    commitAndPush(`keep: open ${task.id}`, undefined, { scope });
     return { linked: session.id, agent };
-  });
+  }, { scope });
 }
 
 function linkSession(taskId, session, options = {}) {
+  const scope = options.scope;
+  const { root } = scopeFor(scope);
   return withLock(() => {
-    const all = loadAll(true);
-    const task = all.find((entry) => entry.id === taskId && fs.existsSync(taskPath(entry.id)));
+    const all = loadAll(true, scope);
+    const task = all.find((entry) => entry.id === taskId && fs.existsSync(taskPath(entry.id, root)));
     if (!task) return null;
-    if (options.requireProject && !sessionInTaskProject(task)) {
+    if (options.requireProject && !sessionInTaskProject(task, scope)) {
       return { linked: false, skipped: 'outside-project', project: task.fm.project || '' };
     }
-    cardUsage.recordOwner(ROOT, session, task.id);
+    cardUsage.recordOwner(root, session, task.id);
     const previousOwners = claimSession(task, session, all);
     for (const previous of previousOwners) {
-      const file = fs.existsSync(taskPath(previous.id)) ? taskPath(previous.id) : path.join(ARCHIVE, `${previous.id}.md`);
+      const file = fs.existsSync(taskPath(previous.id, root))
+        ? taskPath(previous.id, root)
+        : path.join(paths(root).archive, `${previous.id}.md`);
       fs.writeFileSync(file, serializeTask(previous));
     }
-    fs.writeFileSync(taskPath(task.id), serializeTask(task));
+    fs.writeFileSync(taskPath(task.id, root), serializeTask(task));
     // Explicit metadata repair is always local, including from a manual shell.
-    commitAndPush(`keep: ${options.commitLabel || 'link'} ${task.id}`, ['tasks', 'archive'], { push: false });
+    commitAndPush(`keep: ${options.commitLabel || 'link'} ${task.id}`, ['tasks', 'archive'], { push: false, scope });
     return { linked: session.id, agent: session.agent };
-  });
+  }, { scope });
 }
 
 // The fleet reviewer is a normal interactive session, so every ordinary guard
@@ -505,9 +544,9 @@ function countReviewerStatusChange(taskId, status) {
 // A claim or schedule only belongs to a session working in the card's project.
 // Linked worktrees of the project count as inside it, and both sides are compared
 // by realpath so a symlinked project path still matches.
-function sessionInTaskProject(task) {
+function sessionInTaskProject(task, scope) {
   if (!task.fm.project) return true;
-  return projectMatchesCwd(task.fm.project, process.cwd());
+  return projectMatchesCwd(task.fm.project, scopeFor(scope).cwd);
 }
 
 // `sessions` is the card's resume ownership. A scheduled check has to reach the
@@ -567,7 +606,7 @@ function recordContribution(task) {
   return { linked, skipped: linked ? null : 'not-owner', session };
 }
 
-function recordSession(task) {
+function recordSession(task, scope) {
   // Creating a card claims it for the creating session. Existing-card mutations use
   // recordContribution instead; only add, claim/link, and open handoffs move links.
   // The reviewer may legitimately file a follow-up card, but must not claim it.
@@ -577,18 +616,19 @@ function recordSession(task) {
   if (!sid || !/^[A-Za-z0-9_-]+$/.test(sid)) {
     return { linked: false, skipped: 'no-session', session };
   }
-  if (!sessionInTaskProject(task)) {
+  if (!sessionInTaskProject(task, scope)) {
     return { linked: false, skipped: 'outside-project', session };
   }
   // A live session has exactly one owning card. Without removing old links the
   // dashboard resolves duplicates by filesystem iteration order, so a check-in
   // can make the session appear under an unrelated task.
-  cardUsage.recordOwner(ROOT, session, task.id);
-  const previousOwners = claimSession(task, session, loadAll(false));
+  const { root } = scopeFor(scope);
+  cardUsage.recordOwner(root, session, task.id);
+  const previousOwners = claimSession(task, session, loadAll(false, scope));
   for (const previous of previousOwners) {
     // Moving a session link is metadata maintenance, not activity on the old
     // card, so preserve its `updated` timestamp and board position.
-    fs.writeFileSync(taskPath(previous.id), serializeTask(previous));
+    fs.writeFileSync(taskPath(previous.id, root), serializeTask(previous));
   }
   recordProgressMarker(task, session);
   return { linked: true, skipped: null, session };
@@ -760,7 +800,7 @@ function ownProcessStartedAt() {
 }
 
 const LOCK_BUSY = 'could not acquire lock (.keep/lock) — another keep running?';
-const lockOwnerFile = () => path.join(LOCK, 'owner.json');
+const lockOwnerFile = (lock = LOCK) => path.join(lock, 'owner.json');
 const lockToken = () => `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
 // One attempt at the lock: true once this process holds it under `token`, false
@@ -773,7 +813,8 @@ function acquireLock(token, deps = {}) {
   const now = deps.now || Date.now;
   const startedAt = deps.processStartedAt || processStartedAt;
   const kill = deps.kill || process.kill;
-  const ownerFile = lockOwnerFile();
+  const { lock: LOCK } = paths(scopeFor(deps.scope).root);
+  const ownerFile = lockOwnerFile(LOCK);
   for (;;) {
     try {
       fs.mkdirSync(LOCK);
@@ -821,8 +862,9 @@ function acquireLock(token, deps = {}) {
 // Only ever drops a lock this process still owns: a reclaim by someone else means
 // the directory now belongs to them, and removing it would hand the registry to a
 // third writer.
-function releaseLock(token) {
-  const ownerFile = lockOwnerFile();
+function releaseLock(token, scope) {
+  const { lock: LOCK } = paths(scopeFor(scope).root);
+  const ownerFile = lockOwnerFile(LOCK);
   let owner = null;
   try { owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8')); } catch {}
   if (owner && owner.token === token) {
@@ -837,10 +879,11 @@ function waitForLock(ms = 100) {
 }
 
 function withLock(fn, options = {}) {
-  fs.mkdirSync(META, { recursive: true });
-  const now = options.now || Date.now;
-  const acquire = options.acquire || ((token) => acquireLock(token, options));
-  const release = options.release || releaseLock;
+  const scope = scopeFor(options.scope);
+  fs.mkdirSync(paths(scope.root).meta, { recursive: true });
+  const now = options.now || scope.now;
+  const acquire = options.acquire || ((token) => acquireLock(token, { ...options, scope }));
+  const release = options.release || ((token) => releaseLock(token, scope));
   const wait = options.wait || waitForLock;
   const deadline = now() + 5000;
   const token = lockToken();
@@ -855,13 +898,18 @@ function withLock(fn, options = {}) {
   }
 }
 
+// Variadic like the command it runs, so a trailing object is the scope rather
+// than another argument: every argument to git itself is a string.
 function git(...args) {
-  return execFileSync('git', ['-C', ROOT, ...args], { encoding: 'utf8' });
+  const last = args[args.length - 1];
+  const scope = scopeFor(last !== null && typeof last === 'object' ? args.pop() : undefined);
+  return execFileSync('git', ['-C', scope.root, ...args], { encoding: 'utf8' });
 }
 
-function commitAndPush(message, pathspecs = ['tasks', 'archive', 'digests'], { staged = false, push = true } = {}) {
-  if (!staged) git('add', '-A', ...pathspecs);
-  const status = git('status', '--porcelain', '-z', ...pathspecs);
+function commitAndPush(message, pathspecs = ['tasks', 'archive', 'digests'], { staged = false, push = true, scope: scopeOptions } = {}) {
+  const scope = scopeFor(scopeOptions);
+  if (!staged) git('add', '-A', ...pathspecs, scope);
+  const status = git('status', '--porcelain', '-z', ...pathspecs, scope);
   if (!status.length) return;
   // pathspec-scoped so unrelated staged files never ride along in a keep commit
   const entries = status.split('\0');
@@ -871,12 +919,12 @@ function commitAndPush(message, pathspecs = ['tasks', 'archive', 'digests'], { s
     changed.push(entry.slice(3));
     if (entry[0] === 'R' || entry[0] === 'C' || entry[1] === 'R' || entry[1] === 'C') i++;
   }
-  git('commit', '-q', '-m', message, '--', ...changed);
+  git('commit', '-q', '-m', message, '--', ...changed, scope);
   // Agent sessions must honor the user's explicit push-approval policy. Manual
   // terminal use keeps the original best-effort background sync behavior.
-  if (!push || process.env.KEEP_NO_PUSH || (inAgentSession() && process.env.KEEP_ALLOW_PUSH !== '1')) return;
+  if (!push || scope.env.KEEP_NO_PUSH || (inAgentSession(scope.env) && scope.env.KEEP_ALLOW_PUSH !== '1')) return;
   try {
-    const child = spawn('git', ['-C', ROOT, 'push', '-q', 'origin', 'HEAD'], { detached: true, stdio: 'ignore' });
+    const child = spawn('git', ['-C', scope.root, 'push', '-q', 'origin', 'HEAD'], { detached: true, stdio: 'ignore' });
     child.unref();
   } catch {}
 }
@@ -959,10 +1007,11 @@ function canonicalCwd(cwd) {
   return canonical;
 }
 
-function inferProject(explicit) {
+function inferProject(explicit, scope) {
   if (explicit) return explicit.replace(new RegExp(`^${os.homedir()}`), '~');
-  const cwd = canonicalCwd(process.cwd());
-  if (cwd === ROOT || cwd.startsWith(ROOT + path.sep)) return '';
+  const { root, cwd: from } = scopeFor(scope);
+  const cwd = canonicalCwd(from);
+  if (cwd === root || cwd.startsWith(root + path.sep)) return '';
   return cwd.replace(new RegExp(`^${os.homedir()}`), '~');
 }
 
@@ -1807,7 +1856,7 @@ function projectMatchesCwd(project, cwd) {
 }
 
 module.exports = {
-  ROOT, TASKS, ARCHIVE, META, LOCK, HOLDS_DIR, STATUSES, OPEN_MESSAGE_LIMIT, LAUNCH_MODEL_RE, PI_MODEL_RE,
+  ROOT, TASKS, ARCHIVE, META, LOCK, HOLDS_DIR, paths, scopeFor, STATUSES, OPEN_MESSAGE_LIMIT, LAUNCH_MODEL_RE, PI_MODEL_RE,
   OPEN_MESSAGE_ERROR, KINDS, CHECK_ON_PASS, MIN_CHECK_EVERY_MS, STATUS_ORDER, KeepError, isTTY, color,
   STATUS_COLOR, nowStamp, relativeDurationMs, parseWhen, stampOf, parseTask, parseFrontmatterScalar,
   serializeTask, taskPath, loadTask, loadTaskAnywhere, warnedFiles, loadAll, saveTask, recordDoneTransition,
