@@ -102,3 +102,44 @@ test('Fleet changes the persistent provider selector without replacing the searc
   assert.match(fleet.results.innerHTML, /Pi notes/);
   assert.doesNotMatch(fleet.results.innerHTML, /Other task/);
 });
+
+async function nodeFleet(panes, sessions = [{ id: 's-1', num: 4, pane: panes[0].id, project: '/work/a', title: 'Fix the bar', kind: 'codex', state: 'running' }]) {
+  const { fleetRows, fleetRowHTML } = await import('./fleet.js');
+  const map = new Map(panes.map((pane) => [pane.id, pane]));
+  const ctx = { ...context(sessions), paneMap: () => map };
+  ctx.data.panes = panes;
+  const rows = fleetRows(ctx);
+  return { ctx, rows, html: rows.map((row) => fleetRowHTML(ctx, row, map)) };
+}
+// fleetRowHTML as it rendered before nodes existed: a session row and a shell row.
+const FLEET_SESSION_ROW = '<tr><td><span class="st"><i class="running"></i>running</span></td><td><span class="provider-icon provider-codex" role="img" aria-label="Codex" title="Codex"></span>Fix the bar <span class="num-id" title="s-1">#4</span></td><td class="mono muted"></td><td class="mono info"></td><td class="mono waiting-kind"></td><td class="mono muted">now</td><td class="mono kind-codex">codex</td><td>—</td><td><button class="btn" data-pin="p1" data-title="Fix the bar" >Pin</button><button class="btn mobile-only" data-open-terminal="p1" data-session="s-1" data-title="Fix the bar">Terminal</button><button class="btn" data-close-idle="s-1" data-pane="p1">Close</button></td></tr>';
+const FLEET_SHELL_ROW = '<tr><td><span class="st"><i class="running"></i>running</span></td><td>shell <span class="mono faint">p2</span></td><td class="mono muted"></td><td class="mono info"></td><td class="mono waiting-kind"></td><td class="mono muted">now</td><td class="mono ">shell</td><td>—</td><td><button class="btn" data-pin="p2" data-title="shell" >Pin</button><button class="btn mobile-only" data-open-terminal="p2" data-session="" data-title="shell">Terminal</button></td></tr>';
+const FLEET_NODE_BADGE = '<span class="node-badge" title="runs on node aws1">aws1</span>';
+
+test('daemon-node fleet rows render byte for byte as they did before nodes', async () => {
+  for (const node of [undefined, 'main']) {
+    const { rows, html } = await nodeFleet([{ id: 'p1', node, alive: true, meta: { agent: 'codex' } },
+      { id: 'p2', node, alive: true, meta: { agent: 'shell' }, cwd: '/work/a', createdAt: 0 }]);
+    assert.deepEqual(html, [FLEET_SESSION_ROW, FLEET_SHELL_ROW]);
+    assert.equal(rows.some((row) => Object.hasOwn(row, 'node')), false, 'a daemon-node row has no node key');
+  }
+});
+
+test('fleet rows on another node carry the node badge and are found by the node name', async () => {
+  const { filterFleetRows } = await import('./fleet.js');
+  const panes = [{ id: 'p1@aws1', node: 'aws1', alive: true, meta: { agent: 'codex' } },
+    { id: 'p2@aws1', node: 'aws1', alive: true, meta: { agent: 'shell' }, cwd: '/work/a', createdAt: 0 },
+    { id: 'p3', node: 'main', alive: true, meta: { agent: 'shell' }, cwd: '/work/a', createdAt: 0 }];
+  const { ctx, rows, html } = await nodeFleet(panes);
+  const withBadge = (row) => row.replace('title="Codex"></span>', `title="Codex"></span>${FLEET_NODE_BADGE}`)
+    .replace('<td>shell ', `<td>${FLEET_NODE_BADGE}shell `).replaceAll('"p1"', '"p1@aws1"').replaceAll('"p2"', '"p2@aws1"')
+    .replace('>p2<', '>p2@aws1<');
+  assert.deepEqual(html.slice(0, 2), [withBadge(FLEET_SESSION_ROW), withBadge(FLEET_SHELL_ROW)]);
+  assert.equal(html[2], FLEET_SHELL_ROW.replaceAll('p2', 'p3'), 'the daemon pane in the same fleet keeps its plain row');
+  assert.deepEqual(filterFleetRows(ctx, rows, 'aws1', 'all').map((row) => row.pane), ['p1@aws1', 'p2@aws1']);
+  // The session's own node counts even when its pane is not published.
+  const bySession = await nodeFleet([{ id: 'p9', alive: true, meta: {} }],
+    [{ id: 's-2', pane: 'p8@aws1', node: 'aws1', project: '/work/a', title: 'Elsewhere', kind: 'claude', state: 'running' }]);
+  assert.equal(bySession.rows[0].node, 'aws1');
+  assert.match(bySession.html[0], /runs on node aws1/);
+});

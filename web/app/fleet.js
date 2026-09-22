@@ -5,6 +5,7 @@ import { numBadgeHTML, numHaystack } from './session-number.js';
 import { RENAMED_HINT } from './session-rename.js';
 import { markHTML } from './session-mark.js';
 import { providerIconHTML } from './provider-icon.js';
+import { nodeBadgeHTML, remoteNode, remotePaneNode } from './node-badge.js';
 import { runAction } from './action.js';
 const FILTER_KEY = 'keep.console.fleet.filter';
 const PROVIDER_FILTER_KEY = 'keep.console.fleet.provider';
@@ -24,7 +25,7 @@ export function filterFleetRows(ctx, rows, text = filter, provider = providerFil
     if (provider !== 'all' && row.kind !== provider) return false;
     if (!needle) return true;
     const project = ctx.projectOf(row.project);
-    return [row.title, row.id, row.taskId, project.name, project.key, project.path, row.branch, row.accountLabel, row.accountId,
+    return [row.title, row.id, row.taskId, project.name, project.key, project.path, row.branch, row.accountLabel, row.accountId, row.node,
       ...numHaystack(row.num)]
       .some((value) => String(value || '').toLowerCase().includes(needle));
   });
@@ -46,7 +47,7 @@ export function fleetRowHTML(ctx, row, panes) {
   const account = row.accountLabel || configured?.label || row.accountId;
   const badge = numBadgeHTML(ctx.esc, row.num, row.id);
   const identity = badge || `<span class="mono faint">${ctx.esc(row.id)}</span>`;
-  return `<tr><td><span class="st"><i class="${ctx.esc(row.state)}"></i>${ctx.esc(row.stateLabel || row.state)}</span></td><td${row.renamed ? ` title="${ctx.esc(RENAMED_HINT)}"` : ''}>${markHTML(ctx.esc, row.mark)}${providerIconHTML(row.kind, ctx.esc)}${ctx.esc(row.title)}${row.reviewer ? '<span class="rv">reviewer</span>' : ''} ${identity}</td><td class="mono muted">${ctx.esc(row.branch)}</td><td class="mono info">${ctx.esc(row.taskId || '')}${ctx.tagsHTML(ctx.taskFor(row))}</td><td class="mono waiting-kind">${ctx.esc(row.waiting)}</td><td class="mono muted">${ctx.esc(ctx.rel(row.since))}</td><td class="mono ${row.kind === 'codex' ? 'kind-codex' : ''}">${ctx.esc(row.kind)}</td><td>${ctx.esc(account || '—')}</td><td><button class="btn" data-pin="${ctx.esc(row.pane || '')}" data-title="${ctx.esc(row.title)}" ${row.alive && !pinned ? '' : 'disabled'}>${pinned ? 'Pinned' : 'Pin'}</button>${terminal}${reopen}${remove}</td></tr>`;
+  return `<tr><td><span class="st"><i class="${ctx.esc(row.state)}"></i>${ctx.esc(row.stateLabel || row.state)}</span></td><td${row.renamed ? ` title="${ctx.esc(RENAMED_HINT)}"` : ''}>${markHTML(ctx.esc, row.mark)}${providerIconHTML(row.kind, ctx.esc)}${nodeBadgeHTML(ctx.esc, row.node)}${ctx.esc(row.title)}${row.reviewer ? '<span class="rv">reviewer</span>' : ''} ${identity}</td><td class="mono muted">${ctx.esc(row.branch)}</td><td class="mono info">${ctx.esc(row.taskId || '')}${ctx.tagsHTML(ctx.taskFor(row))}</td><td class="mono waiting-kind">${ctx.esc(row.waiting)}</td><td class="mono muted">${ctx.esc(ctx.rel(row.since))}</td><td class="mono ${row.kind === 'codex' ? 'kind-codex' : ''}">${ctx.esc(row.kind)}</td><td>${ctx.esc(account || '—')}</td><td><button class="btn" data-pin="${ctx.esc(row.pane || '')}" data-title="${ctx.esc(row.title)}" ${row.alive && !pinned ? '' : 'disabled'}>${pinned ? 'Pinned' : 'Pin'}</button>${terminal}${reopen}${remove}</td></tr>`;
 }
 
 export function fleetRows(ctx) {
@@ -64,6 +65,9 @@ export function fleetRows(ctx) {
     if (ctx.isClosingSession(session.id, session.pane)) continue;
     panesBySession.set(session.id, session.pane);
     const pane = session.pane ? panes.get(session.pane) : null;
+    // Only a session on another machine gets the key, so a single-node fleet's rows
+    // are the objects they always were.
+    const node = remoteNode({ session, pane });
     rows.push({
       id: session.id, num: session.num, pane: session.pane, project: session.project, title: session.title || 'untitled session',
       renamed: Boolean(session.renamed), mark: session.mark,
@@ -72,6 +76,7 @@ export function fleetRows(ctx) {
       waiting: waitingBySession.get(session.id)?.kind || '', alive: Boolean(pane?.alive),
       sessionId: session.id, agent: session.kind, accountId: session.accountId || pane?.meta?.accountId || '',
       accountLabel: session.accountLabel || pane?.meta?.accountLabel || '',
+      ...(node ? { node } : {}),
     });
   }
   for (const pane of ctx.data.panes || []) {
@@ -79,6 +84,7 @@ export function fleetRows(ctx) {
     const sessionId = pane.meta?.sessionId;
     if (sessionId && panesBySession.has(sessionId)) continue;
     const agent = pane.meta?.agent;
+    const node = remotePaneNode(pane);
     if (agent !== 'shell' && agent !== 'pi' && !(['claude', 'codex'].includes(agent) && pane.alive === false)) continue;
     rows.push({
       id: sessionId || pane.id, pane: pane.id, project: pane.meta?.project || pane.cwd,
@@ -86,6 +92,7 @@ export function fleetRows(ctx) {
       state: pane.alive ? 'running' : 'exited', kind: agent, branch: '', since: pane.createdAt,
       taskId: pane.meta?.card || '', session: false, waiting: '', alive: Boolean(pane.alive),
       sessionId, agent, accountId: pane.meta?.accountId || '', accountLabel: pane.meta?.accountLabel || '',
+      ...(node ? { node } : {}),
     });
   }
 
