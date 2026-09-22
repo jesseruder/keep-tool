@@ -81,7 +81,7 @@ const ALLOWLIST = [
     file: 'bin/review.js',
     function: '(top level)',
     count: 1,
-    // DEBT: the import the two sites below use.
+    // DEBT: the import the git() site below uses.
     why: 'debt: review.js execFileSync import',
   },
   {
@@ -90,13 +90,6 @@ const ALLOWLIST = [
     count: 1,
     // DEBT: the fleet reviewer's git reads (diffs, logs) for its bundle.
     why: 'debt: review.js git(), synchronous in the reviewer tick',
-  },
-  {
-    file: 'bin/review.js',
-    function: 'scanSubagentsForCodex',
-    count: 1,
-    // DEBT: grep over transcript chunks to find the session that launched a Codex job.
-    why: 'debt: review.js grep over transcripts',
   },
   {
     file: 'bin/self-repair.js',

@@ -534,6 +534,98 @@ test('a codex handoff bundle names the parent claude session and its verificatio
   assert.match(renderCodexParent({ id: '', via: '' }, [], window).join('\n'), /^parent claude session: not resolved/);
 });
 
+test('a turn index hit names the parent of a codex session without a directory walk', (t) => {
+  const { scanSubagentsForCodex } = require('./review.js');
+  const turnIndex = require('./turn-index.js');
+  const crypto = require('node:crypto');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-index-'));
+  t.after(() => { turnIndex.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const db = path.join(dir, 'turns.sqlite');
+  const parent = crypto.randomUUID();
+  const codexId = crypto.randomUUID();
+  const projects = path.join(dir, 'projects');
+  const subagents = path.join(projects, '-tmp-demo', parent, 'subagents');
+  fs.mkdirSync(subagents, { recursive: true });
+  const now = Date.now();
+  // Subagent records carry the parent's uuid in sessionId and their own in agentId.
+  const sub = (extra) => JSON.stringify({ isSidechain: true, agentId: 'rescue1', sessionId: parent, cwd: '/tmp/demo', ...extra });
+  fs.writeFileSync(path.join(subagents, 'agent-rescue1.jsonl'), [
+    sub({ type: 'user', timestamp: new Date(now - 30e3).toISOString(), message: { role: 'user', content: 'Hand the fix to Codex' } }),
+    sub({ type: 'assistant', timestamp: new Date(now - 20e3).toISOString(), message: {
+      role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'b1', name: 'Bash', input: { command: 'codex-companion task' } }] } }),
+    sub({ type: 'user', timestamp: new Date(now - 10e3).toISOString(), message: {
+      role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b1', content: `{"status":"running","session":"${codexId}"}` }] } }),
+  ].join('\n') + '\n');
+  assert.equal(turnIndex.ingestFile(path.join(subagents, 'agent-rescue1.jsonl'), { agent: 'claude', db }).ok, true);
+  // A later subagent under another parent shows the id's tokens spaced apart: the
+  // FTS phrase matches it, and only the exact-text check keeps it out.
+  const decoy = crypto.randomUUID();
+  const decoyDir = path.join(projects, '-tmp-demo', decoy, 'subagents');
+  fs.mkdirSync(decoyDir, { recursive: true });
+  fs.writeFileSync(path.join(decoyDir, 'agent-decoy1.jsonl'), JSON.stringify({
+    isSidechain: true, agentId: 'decoy1', sessionId: decoy, cwd: '/tmp/demo', type: 'user',
+    timestamp: new Date(now - 5e3).toISOString(), message: { role: 'user', content: `tokens ${codexId.replace(/-/g, ' ')}` },
+  }) + '\n');
+  assert.equal(turnIndex.ingestFile(path.join(decoyDir, 'agent-decoy1.jsonl'), { agent: 'claude', db }).ok, true);
+  // A third subagent prints its Codex id only after 3 KiB of tool output: the
+  // index keeps the first 2 KiB of a tool result, so the id never reaches it.
+  const lateParent = crypto.randomUUID();
+  const lateCodexId = crypto.randomUUID();
+  const lateDir = path.join(projects, '-tmp-demo', lateParent, 'subagents');
+  fs.mkdirSync(lateDir, { recursive: true });
+  fs.writeFileSync(path.join(lateDir, 'agent-late1.jsonl'), JSON.stringify({
+    isSidechain: true, agentId: 'late1', sessionId: lateParent, cwd: '/tmp/demo', type: 'user',
+    timestamp: new Date(now - 8e3).toISOString(), message: { role: 'user', content: [{
+      type: 'tool_result', tool_use_id: 'c1', content: `${'build log line\n'.repeat(200)}{"session":"${lateCodexId}"}` }] },
+  }) + '\n');
+  assert.equal(turnIndex.ingestFile(path.join(lateDir, 'agent-late1.jsonl'), { agent: 'claude', db }).ok, true);
+  turnIndex.close();
+
+  let walks = 0;
+  const walk = () => { walks += 1; return 'from-the-walk'; };
+  // (a) a hit is the answer, with no walk.
+  assert.equal(scanSubagentsForCodex(codexId, now - 60e3, projects, { db, walk }), parent);
+  assert.equal(walks, 0, 'an index hit skips the walk');
+  // (b) a miss is not final: the index may simply not hold the id. A subagent last
+  // active more than an hour before the codex session began is outside the window,
+  // and an unknown id is unknown to the index; both go on to the walk.
+  assert.equal(scanSubagentsForCodex(codexId, now + 2 * 3600e3, projects, { db, walk }), 'from-the-walk');
+  assert.equal(walks, 1, 'an out-of-window miss walks once');
+  assert.equal(scanSubagentsForCodex(crypto.randomUUID(), now - 60e3, projects, { db, walk }), 'from-the-walk');
+  assert.equal(walks, 2, 'an unknown id walks once');
+  // The id past the tool-result cap: the index misses it, the stub walk is asked...
+  assert.equal(scanSubagentsForCodex(lateCodexId, now - 60e3, projects, { db, walk }), 'from-the-walk');
+  assert.equal(walks, 3);
+  // ...and the real walk reads the whole file and finds the parent.
+  assert.equal(scanSubagentsForCodex(lateCodexId, now - 60e3, projects, { db }), lateParent);
+
+  // (c) an index that cannot be asked falls back to the walk.
+  const junk = path.join(dir, 'junk.sqlite');
+  fs.writeFileSync(junk, 'not a database at all, just bytes '.repeat(200));
+  assert.equal(scanSubagentsForCodex(codexId, now - 60e3, projects, { db: junk, walk }), 'from-the-walk');
+  assert.equal(scanSubagentsForCodex(codexId, now - 60e3, projects, { db: path.join(dir, 'missing.sqlite'), walk }), 'from-the-walk');
+  assert.equal(walks, 5);
+  assert.equal(fs.existsSync(path.join(dir, 'missing.sqlite')), false, 'asking never creates an index');
+  // The real walk over the same tree reads the transcript itself.
+  assert.equal(scanSubagentsForCodex(codexId, now - 60e3, projects, { db: junk }), parent);
+});
+
+test('the subagent walk finds an id that straddles a read chunk in a large transcript', (t) => {
+  const { scanSubagentsForCodex } = require('./review.js');
+  const crypto = require('node:crypto');
+  const projects = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-walk-'));
+  t.after(() => fs.rmSync(projects, { recursive: true, force: true }));
+  const parent = crypto.randomUUID();
+  const codexId = crypto.randomUUID();
+  const subagents = path.join(projects, '-tmp-demo', parent, 'subagents');
+  fs.mkdirSync(subagents, { recursive: true });
+  // The walk reads 256 KiB at a time; put the id across the first boundary.
+  const pad = 'x'.repeat(256 * 1024 - 10);
+  fs.writeFileSync(path.join(subagents, 'agent-big.jsonl'), pad + codexId + '\n' + 'y'.repeat(300 * 1024) + '\n');
+  assert.equal(scanSubagentsForCodex(codexId, Date.now() - 60e3, projects), parent);
+  assert.equal(scanSubagentsForCodex(crypto.randomUUID(), Date.now() - 60e3, projects), '');
+});
+
 test('reviewQueue skips idea cards and reviewer-idea cards outright', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-ideas-'));
   const stamp = require('./keep.js').nowStamp().replace('T', ' ');

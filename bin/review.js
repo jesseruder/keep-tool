@@ -1088,11 +1088,66 @@ function codexParentRecord(codexId) {
 
 // Fallback for sessions started before the record existed: the codex-rescue
 // subagent's transcript, under <project>/<parent session>/subagents/, names the
-// Codex session id it launched. Bounded to subagent files touched after the Codex
-// session began, and grep does the reading.
-function scanSubagentsForCodex(codexId, sinceMs, projectsDir = PROJECTS_DIR) {
+// Codex session id it launched. The turn index already holds those transcripts,
+// so it is asked first, but only as a fast path: a hit skips the walk, and a miss
+// walks exactly as an unavailable index does. The index truncates what it stores
+// (16 KiB of text, 2 KiB of a tool result or tool input), so an id printed past
+// that point is never in it, and treating its miss as final would lose parents
+// the files still name. Both are bounded to subagents active within an hour of
+// the Codex session's start. `deps` is for tests: `db` names an index file,
+// `walk` replaces the walk.
+function scanSubagentsForCodex(codexId, sinceMs, projectsDir = PROJECTS_DIR, deps = {}) {
   if (!SESSION_ID_RE.test(String(codexId || ''))) return '';
-  const candidates = [];
+  // The index describes the real projects directory. A caller walking some other
+  // tree is asking about that tree, and must not get an answer from the operator's
+  // index instead, unless it names an index of its own.
+  const useIndex = deps.db !== undefined || projectsDir === PROJECTS_DIR;
+  if (useIndex) {
+    // null (index unavailable) and '' (no match in what it stored) both walk.
+    const indexed = codexParentFromIndex(codexId, sinceMs, deps.db);
+    if (indexed) return indexed;
+  }
+  return (deps.walk || walkSubagentsForCodex)(codexId, sinceMs, projectsDir);
+}
+
+// A subagent session row in the index carries the parent Claude session it ran
+// under, and messages_fts covers its message text. unicode61 splits a UUID-shaped
+// id on its hyphens into five tokens, so the id goes in as a quoted phrase (bare,
+// FTS5 reads the hyphens as operators); instr() then confirms the exact id, since
+// the phrase alone would also match the same tokens separated by spaces. Text is
+// capped at ingest (16 KiB, 2 KiB for tool results and inputs), so an id that
+// only appears past a cap is a miss here; the caller walks on any miss.
+// Returns the parent id, '' when the index has no match, or null when the index
+// is unavailable: missing, unopenable, or without the tables (an old schema).
+function codexParentFromIndex(codexId, sinceMs, dbFile) {
+  let handle;
+  try {
+    const turnIndex = require('./turn-index.js');
+    const { DatabaseSync } = require('node:sqlite');
+    // Its own read-only connection rather than turnIndex.open(): that one creates
+    // and migrates a missing database, and it is a process-wide handle that opening
+    // a different file would close under the daemon's other users.
+    handle = new DatabaseSync(dbFile || turnIndex.databaseFile(), { readOnly: true });
+  } catch { return null; }
+  try {
+    const floor = Number.isFinite(sinceMs) ? sinceMs - 3600e3 : 0;
+    const row = handle.prepare(`SELECT s.parent_id AS parent
+      FROM messages_fts
+      JOIN messages m ON m.id = messages_fts.rowid
+      JOIN sessions s ON s.id = m.session_id
+      WHERE messages_fts MATCH ? AND s.agent = 'claude' AND s.kind = 'subagent'
+        AND COALESCE(s.last_at, 0) >= ? AND s.parent_id IS NOT NULL AND instr(m.text, ?) > 0
+      ORDER BY s.last_at DESC LIMIT 1`).get(`"${codexId}"`, floor, codexId);
+    const parent = row && String(row.parent || '');
+    return parent && SESSION_ID_RE.test(parent) ? parent : '';
+  } catch {
+    return null;
+  } finally {
+    try { handle.close(); } catch {}
+  }
+}
+
+function walkSubagentsForCodex(codexId, sinceMs, projectsDir) {
   let projects = [];
   try { projects = fs.readdirSync(projectsDir); } catch { return ''; }
   for (const project of projects) {
@@ -1110,25 +1165,39 @@ function scanSubagentsForCodex(codexId, sinceMs, projectsDir = PROJECTS_DIR) {
         let stat;
         try { stat = fs.statSync(file); } catch { continue; }
         if (Number.isFinite(sinceMs) && stat.mtimeMs < sinceMs - 3600e3) continue;
-        candidates.push({ file, parent: entry.name });
+        // First hit wins, as grep -l did.
+        if (fileContains(file, codexId)) return entry.name;
       }
     }
   }
-  for (let i = 0; i < candidates.length; i += 200) {
-    const chunk = candidates.slice(i, i + 200);
-    let out = '';
-    try {
-      out = execFileSync('grep', ['-lF', '--', codexId, ...chunk.map((c) => c.file)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    } catch (e) {
-      out = e && typeof e.stdout === 'string' ? e.stdout : ''; // exit 1 is "no match", stdout still lists partial hits
-    }
-    const hit = out.split('\n').find(Boolean);
-    if (hit) {
-      const match = chunk.find((c) => c.file === hit);
-      if (match) return match.parent;
-    }
-  }
   return '';
+}
+
+// Reads in fixed chunks so a large transcript is never held whole, and stops at
+// the first hit. The tail of each chunk is carried over so a match straddling a
+// chunk boundary is still found. Read in-process instead of spawning grep: this
+// runs on the daemon's review tick, where a synchronous child blocks the loop.
+function fileContains(file, needle, chunkBytes = 256 * 1024) {
+  const target = Buffer.from(needle, 'utf8');
+  if (!target.length) return false;
+  let fd;
+  try { fd = fs.openSync(file, 'r'); } catch { return false; }
+  try {
+    const buf = Buffer.alloc(chunkBytes + target.length - 1);
+    let carried = 0;
+    for (;;) {
+      const read = fs.readSync(fd, buf, carried, chunkBytes, null);
+      if (read <= 0) return false;
+      const filled = carried + read;
+      if (buf.subarray(0, filled).indexOf(target) !== -1) return true;
+      carried = Math.min(target.length - 1, filled);
+      buf.copy(buf, 0, filled - carried, filled);
+    }
+  } catch {
+    return false;
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+  }
 }
 
 function resolveCodexParent(session, prior, sinceMs, opts = {}) {
