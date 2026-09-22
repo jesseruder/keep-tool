@@ -15176,3 +15176,22 @@ test('an in-place restart on another node refuses when that node cannot say what
   assert.ok(ok.state.replaced, 'the restart went ahead');
   await closeHostClient();
 });
+
+test('a Claude projects directory that does not exist yet is named in the watcher row, not failed', () => {
+  const { transcriptWatcherStartHealth } = require('./serve.js');
+  const enoent = Object.assign(new Error('no such file or directory'), { code: 'ENOENT' });
+  assert.deepEqual(transcriptWatcherStartHealth([{ accountId: 'claude/default', error: null }]),
+    { ok: true, detail: 'watching 1 of 1 Claude project root' });
+  assert.deepEqual(transcriptWatcherStartHealth([
+    { accountId: 'claude/default', error: null },
+    { accountId: 'claude/added', error: enoent },
+  ]), { ok: true, detail: 'watching 1 of 2 Claude project roots (missing: claude/added)' });
+  // Any other start failure leaves the index on sweeps alone, and says so.
+  const refused = Object.assign(new Error('too many open files'), { code: 'EMFILE' });
+  const failed = transcriptWatcherStartHealth([
+    { accountId: 'claude/default', error: refused },
+    { accountId: 'claude/added', error: enoent },
+  ]);
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /^claude\/default: too many open files; bounded scans rely on sweeps until restart$/);
+});

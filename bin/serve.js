@@ -10311,6 +10311,26 @@ function createIndexedClaudeSessionResolver(deps = {}) {
   };
 }
 
+// The transcript-watcher health row a daemon start records. A projects directory
+// that does not exist yet (an account added and never used) is nothing to watch
+// and nothing the index can miss, so it is named, not failed: the row stays ok.
+// Any other start failure leaves the bounded index on sweeps alone, which is.
+function transcriptWatcherStartHealth(starts) {
+  const list = Array.isArray(starts) ? starts : [];
+  const failed = list.find((start) => start && start.error && start.error.code !== 'ENOENT');
+  if (failed) {
+    const message = String(failed.error.message || failed.error);
+    return { ok: false, error: `${failed.accountId || 'a Claude account'}: ${message}; bounded scans rely on sweeps until restart` };
+  }
+  const missing = list.filter((start) => start && start.error).map((start) => start.accountId || 'unknown');
+  const watching = list.length - missing.length;
+  return {
+    ok: true,
+    detail: `watching ${watching} of ${list.length} Claude project root${list.length === 1 ? '' : 's'}`
+      + (missing.length ? ` (missing: ${missing.join(', ')})` : ''),
+  };
+}
+
 function scanClaudeSessions(options = {}) {
   const readOnly = options.readOnly === true;
   const sessions = [];
@@ -13246,19 +13266,29 @@ function start(deps = {}) {
     process.stderr.write(`keep serve: transcript watcher failed: ${message}; bounded scans rely on sweeps until restart\n`);
     try { health.record('transcript-watcher', { ok: false, error: `${message}; bounded scans rely on sweeps until restart` }); } catch {}
   };
-  let transcriptWatchers = 0;
+  const transcriptWatchStarts = [];
   for (const entry of claudeProjectRoots) {
-    if (watch(entry.root, { recursive: true }, (name) => {
+    // The same callback hears a start failure (synchronously, inside watch) and a
+    // later error from a watcher that did start; only the second is reported here.
+    let starting = true;
+    let startError = null;
+    watch(entry.root, { recursive: true }, (name) => {
       claudeTranscriptIndex.invalidate(entry.root, name);
       if (name) backgroundJobScheduler?.wakeFile(path.join(entry.root, String(name)));
       dashboardBuilder.invalidate({ kind: 'claude', root: entry.root, name });
       dashboardPublisher.invalidate();
-    }, transcriptWatchFailure)) transcriptWatchers += 1;
+    }, (error) => { if (starting) startError = error; else transcriptWatchFailure(error); });
+    starting = false;
+    if (startError?.code === 'ENOENT') {
+      process.stderr.write(`keep serve: cannot watch ${entry.root} (${startError.message}); relying on client polling\n`);
+    } else if (startError) {
+      process.stderr.write(`keep serve: transcript watcher failed: ${startError.message}; bounded scans rely on sweeps until restart\n`);
+    }
+    transcriptWatchStarts.push({ accountId: entry.accountId, error: startError });
   }
-  // A clean start clears a failure an earlier daemon recorded.
-  if (!transcriptWatchFailed) {
-    try { health.record('transcript-watcher', { ok: true, detail: `watching ${transcriptWatchers} Claude project root${transcriptWatchers === 1 ? '' : 's'}` }); } catch {}
-  }
+  // Recorded on every start, so a clean start clears a failure an earlier daemon
+  // recorded. A later error from a running watcher overwrites it with ok:false.
+  try { health.record('transcript-watcher', transcriptWatcherStartHealth(transcriptWatchStarts)); } catch {}
   for (const sessionsRoot of new Set(codex.configuredRoots().map((entry) => path.join(entry.configDir, 'sessions')))) {
     watch(sessionsRoot, { recursive: true }, (name) => {
       if (name) backgroundJobScheduler?.wakeFile(path.join(sessionsRoot, String(name)));
@@ -13651,6 +13681,7 @@ module.exports = {
   noteHostPaneSessions,
   createDashboardClaudeSessionResolver,
   createIndexedClaudeSessionResolver,
+  transcriptWatcherStartHealth,
   transcriptActivityMs,
   sessionNeedsInput,
   sessionTaskOwners,
