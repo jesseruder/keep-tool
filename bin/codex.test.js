@@ -192,3 +192,122 @@ test('dashboard rollout index invalidation observes new and deleted files within
     fs.rmSync(configDir, { recursive: true, force: true });
   }
 });
+
+test('isCompanionTask matches only the Codex Companion task prefix', () => {
+  assert.equal(codex.isCompanionTask('Codex Companion Task: review the diff'), true);
+  assert.equal(codex.isCompanionTask('Fix the Codex Companion Task: parser'), false);
+  assert.equal(codex.isCompanionTask(''), false);
+  assert.equal(codex.isCompanionTask(undefined), false);
+});
+
+test('sessionMetaFor reads a caller-supplied rollout without resolving the session', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-meta-'));
+  try {
+    const id = `meta-${process.pid}-${Date.now()}`;
+    // Not under any configured account root: only options.file can find it.
+    const file = path.join(dir, 'rollout-elsewhere.jsonl');
+    writeRollout(file, { id, cwd: '/meta' }, true);
+    assert.equal(codex.sessionMetaFor(id, { file }).id, id);
+    assert.equal(codex.sessionMetaFor(id, { file }).cwd, '/meta');
+    // The no-file path is covered in the isolated-HOME resolveRollout test below,
+    // so this process never searches the operator's real account folders.
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('resolveRollout searches once, caches for sessionFor and sessionMetaFor, and honours authority', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-resolve-'));
+  try {
+    const keepRoot = path.join(home, 'keep');
+    const configFile = path.join(home, 'config.json');
+    const roots = [path.join(home, 'codex-one'), path.join(home, 'codex-two')];
+    fs.mkdirSync(keepRoot, { recursive: true });
+    fs.writeFileSync(configFile, JSON.stringify({
+      version: 1,
+      accounts: [
+        { id: 'codex-one', label: 'One', agent: 'codex', configDir: roots[0] },
+        { id: 'codex-two', label: 'Two', agent: 'codex', configDir: roots[1] },
+      ],
+      defaultAccounts: { codex: 'codex-one' },
+    }));
+    // An older dated folder: resumed rollouts live in their original date dir,
+    // which no fleet scan window would index.
+    const dirs = roots.map((root) => codex.recentDateDirs(root)[10]);
+    const files = {};
+    const put = (i, id) => {
+      fs.mkdirSync(dirs[i], { recursive: true });
+      const file = path.join(dirs[i], `rollout-test-${id}.jsonl`);
+      writeRollout(file, { id, cwd: `/${i}/${id}` }, true);
+      files[`${i}:${id}`] = file;
+    };
+    put(0, 'lone'); put(0, 'other'); put(0, 'pinned'); put(1, 'pinned'); put(0, 'staged'); put(0, 'both'); put(1, 'both');
+    const authorityDir = path.join(keepRoot, '.keep', 'session-accounts');
+    fs.mkdirSync(authorityDir, { recursive: true });
+    for (const [id, accountId] of [['pinned', 'codex-two'], ['staged', 'codex-one']]) {
+      fs.writeFileSync(path.join(authorityDir, `${id}.json`), JSON.stringify({
+        version: 1, sessionId: id, agent: 'codex', accountId, updatedAt: Date.now(),
+      }));
+    }
+    const script = `
+      const fs = require('fs');
+      const path = require('path');
+      let searches = 0;
+      const readdirSync = fs.readdirSync;
+      // Every dated-folder search lists sessions/<yyyy>/<mm>/<dd>; count those reads.
+      fs.readdirSync = function (dir, ...rest) {
+        if (String(dir).split(path.sep).includes('sessions')) searches += 1;
+        return readdirSync.call(this, dir, ...rest);
+      };
+      const c = require('./bin/codex.js');
+      const accounts = require('./bin/accounts.js');
+      const reads = (fn) => { const before = searches; const value = fn(); return { value, reads: searches - before }; };
+      const oneSearch = reads(() => c.findRolloutFile('other')).reads;
+      const resolved = reads(() => c.resolveRollout('lone'));
+      const session = reads(() => c.sessionFor('lone'));
+      const meta = reads(() => c.sessionMetaFor('lone'));
+      const metaWithFile = reads(() => c.sessionMetaFor('lone', { file: resolved.value.file }));
+      const again = reads(() => c.resolveRollout('lone'));
+      const pinned = c.resolveRollout('pinned');
+      const both = c.resolveRollout('both');
+      const stagedBefore = c.resolveRollout('staged');
+      accounts.stageSession('staged', 'codex-two', 'txn-test', { root: process.env.KEEP_DIR });
+      console.log(JSON.stringify({
+        oneSearch,
+        resolved: { reads: resolved.reads, file: resolved.value.file, accountId: resolved.value.accountId,
+          isFile: resolved.value.stat.isFile(), keys: Object.keys(resolved.value).sort() },
+        session: { reads: session.reads, project: session.value.project, accountId: session.value.accountId },
+        meta: { reads: meta.reads, id: meta.value.id },
+        metaWithFile: { reads: metaWithFile.reads, id: metaWithFile.value.id },
+        again: { reads: again.reads, file: again.value.file },
+        pinned, both, stagedBefore: stagedBefore && stagedBefore.accountId,
+        stagedAfter: c.resolveRollout('staged'), stagedSession: c.sessionFor('staged'),
+        stagedMeta: c.sessionMetaFor('staged'),
+      }));
+    `;
+    const run = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, HOME: home, KEEP_DIR: keepRoot, KEEP_CONFIG: configFile },
+      encoding: 'utf8', timeout: 10000,
+    });
+    assert.equal(run.status, 0, run.stderr);
+    const result = JSON.parse(run.stdout);
+    assert.ok(result.oneSearch > 0, 'the counter sees a dated-folder search');
+    assert.equal(result.resolved.reads, result.oneSearch, 'an unindexed rollout costs exactly one search');
+    assert.equal(result.resolved.file, files['0:lone']);
+    assert.equal(result.resolved.accountId, 'codex-one');
+    assert.equal(result.resolved.isFile, true);
+    assert.deepEqual(result.resolved.keys, ['accountId', 'file', 'stat']);
+    assert.equal(result.session.reads, 0, 'sessionFor reuses the cached path');
+    assert.equal(result.session.project, '/0/lone');
+    assert.equal(result.session.accountId, 'codex-one');
+    assert.deepEqual(result.meta, { reads: 0, id: 'lone' });
+    assert.deepEqual(result.metaWithFile, { reads: 0, id: 'lone' });
+    assert.deepEqual(result.again, { reads: 0, file: files['0:lone'] });
+    assert.equal(result.pinned.file, files['1:pinned'], 'a session pinned to another account resolves there');
+    assert.equal(result.pinned.accountId, 'codex-two');
+    assert.equal(result.both, null, 'an unpinned id in two accounts is ambiguous, as in sessionFor');
+    assert.equal(result.stagedBefore, 'codex-one');
+    assert.equal(result.stagedAfter, null, 'a staged handoff resolves nothing, even from the path cache');
+    assert.equal(result.stagedSession, null);
+    assert.equal(result.stagedMeta, null);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});

@@ -349,6 +349,13 @@ function sessionFromRollout(info, stat, title, now, accountId) {
   };
 }
 
+// Codex Companion (the Claude Code plugin) names its task threads with this
+// prefix; they are delegated jobs, not fleet conversations. Exported so callers
+// that filter rows themselves (the daemon's tell path) share one definition.
+function isCompanionTask(title) {
+  return typeof title === 'string' && title.startsWith('Codex Companion Task:');
+}
+
 function scan(options = {}) {
   const candidatesById = new Map();
   const nextRolloutFiles = new Map();
@@ -368,7 +375,7 @@ function scan(options = {}) {
       } catch { continue; }
       if (!info) continue;
       const title = titles.get(info.id) || '';
-      if (title.startsWith('Codex Companion Task:')) continue;
+      if (isCompanionTask(title)) continue;
       const candidate = { file, accountId: accountRoot.accountId, configDir: accountRoot.configDir,
         session: sessionFromRollout(info, stat, title, now, accountRoot.accountId) };
       const list = candidatesById.get(info.id) || [];
@@ -438,23 +445,22 @@ function findRolloutFile(sessionId) {
   return findRolloutRecord(sessionId)?.file || null;
 }
 
-function sessionMetaFor(sessionId) {
-  try {
-    const file = findRolloutFile(sessionId);
-    return file ? readSessionMeta(file) : null;
-  } catch { return null; }
-}
-
 function rolloutFileFor(sessionId) {
   return rolloutFiles.get(String(sessionId || ''))?.file || null;
 }
 
-function sessionFor(sessionId) {
+// The one resolution path from a session id to its rollout: the last scan's map,
+// then the path cache, then (only when neither yields a live file under the
+// session's authoritative account) a single dated-folder search whose result is
+// cached. Returns the record (with configDir, which title lookup needs) and stat.
+function resolveRolloutRecord(sessionId) {
   const id = String(sessionId || '');
   let record = rolloutFiles.get(id) || sessionPathCache.get(id) || null;
   let file = record && record.file;
   const roots = new Map(configuredRoots().map((root) => [root.accountId, root]));
   let pinned = null;
+  // forSession throws for a staged handoff or an unavailable pinned account;
+  // neither has a rollout this process may treat as authoritative.
   try { pinned = require('./accounts.js').forSession(id, 'codex', {
     root: process.env.KEEP_DIR || path.join(os.homedir(), 'keep'), allowDiscovery: false,
   }); } catch { return null; }
@@ -484,6 +490,31 @@ function sessionFor(sessionId) {
     if (!stat.isFile()) return null;
     cacheSessionLookup(sessionPathCache, id, record);
   }
+  return { record, stat };
+}
+
+// Public form of the resolution sessionFor uses, so a caller that needs the file
+// (to read its meta or tail) does not search the dated folders a second time.
+function resolveRollout(sessionId) {
+  const resolved = resolveRolloutRecord(sessionId);
+  if (!resolved) return null;
+  return { file: resolved.record.file, accountId: resolved.record.accountId, stat: resolved.stat };
+}
+
+// options.file lets a caller that already resolved the rollout read its first
+// line without another lookup; otherwise resolve exactly as sessionFor would.
+function sessionMetaFor(sessionId, options = {}) {
+  try {
+    const file = (options && options.file) || resolveRollout(sessionId)?.file;
+    return file ? readSessionMeta(file) : null;
+  } catch { return null; }
+}
+
+function sessionFor(sessionId) {
+  const resolved = resolveRolloutRecord(sessionId);
+  if (!resolved) return null;
+  const { record, stat } = resolved;
+  const file = record.file;
   let info;
   const cached = sessionParseCache.get(file);
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
@@ -498,4 +529,4 @@ function sessionFor(sessionId) {
   return sessionFromRollout(info, stat, loadTitles(record.configDir).get(info.id) || '', Date.now(), record.accountId);
 }
 
-module.exports = { scan, invalidate, scanRollout, sessionFor, rolloutFileFor, findRolloutFile, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, isHeadlessSession, configuredRoots, recentDateDirs, indexedRollouts };
+module.exports = { scan, invalidate, scanRollout, sessionFor, resolveRollout, isCompanionTask, rolloutFileFor, findRolloutFile, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, isHeadlessSession, configuredRoots, recentDateDirs, indexedRollouts };
