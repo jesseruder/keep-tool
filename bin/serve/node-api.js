@@ -18,21 +18,24 @@ const path = require('node:path');
 
 const NODE_TOKEN_REREAD_MS = 5000;
 
-// The boot-time token map, plus a cheap re-read when a presented token matches no
-// entry, so `keep nodes add` does not need a daemon restart. The re-read is cached
-// for five seconds: a caller presenting garbage cannot turn every request into a
-// directory scan.
+// The boot-time token map, re-read from the directory at most once every five
+// seconds: on the first request after that long, whatever token it presents, so a
+// token `keep nodes rm` deleted stops working within five seconds; and when a
+// presented token matches no entry, so `keep nodes add` needs no daemon restart.
+// The window is what keeps a caller presenting garbage from turning every request
+// into a directory scan. A read that fails leaves no token honoured until the next.
 function createNodeTokenStore({ read, initial, now = Date.now, rereadMs = NODE_TOKEN_REREAD_MS } = {}) {
   let tokens = initial || read();
   let readAt = initial ? -Infinity : now();
+  const refresh = () => {
+    if (now() - readAt < rereadMs) return false;
+    readAt = now();
+    try { tokens = read() || {}; } catch { tokens = {}; }
+    return true;
+  };
   return {
-    current: () => tokens,
-    refresh() {
-      if (now() - readAt < rereadMs) return false;
-      readAt = now();
-      try { tokens = read() || {}; } catch {}
-      return true;
-    },
+    current: () => { refresh(); return tokens; },
+    refresh,
   };
 }
 

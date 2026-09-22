@@ -198,6 +198,34 @@ test('a token minted after boot is honoured without a restart, and the re-read i
   assert.equal((await request(server.port, { pathname: '/api/node-only', headers: { 'x-keep-node-token': 'late' } })).status, 200);
 });
 
+test('a token keep nodes rm deleted stops working within the re-read window', async (t) => {
+  const env = configEnv(t, TWO_NODES);
+  const root = env.KEEP_DIR;
+  const dir = path.join(root, '.keep', 'node-tokens');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'aws1'), 'aws1-secret\n');
+  const nodes = require('./nodes.js');
+  let clock = 0;
+  const read = () => nodes.nodeApiTokens(root, { env, log: () => {} });
+  const store = nodeApi.createNodeTokenStore({ initial: read(), read, now: () => clock });
+  const handler = nodeApi.createNodeApiHandler({
+    routes: [{ method: 'GET', path: '/api/node-only', allow: ['node'], handle: async ({ res }) => { res.end('{}'); } }],
+    matchRoute, routeDenial, principal: keepConsole.principal, tokenStore: store, readBody: async () => ({}), log: () => {},
+  });
+  const server = http.createServer(handler);
+  const port = await listen(server);
+  t.after(() => server.close());
+  const ask = () => request(port, { pathname: '/api/node-only', headers: { 'x-keep-node-token': 'aws1-secret' } });
+  assert.equal((await ask()).status, 200);
+  fs.unlinkSync(path.join(dir, 'aws1'));
+  clock += nodeApi.NODE_TOKEN_REREAD_MS;
+  assert.equal((await ask()).status, 403, 'the first request after the window re-reads, whatever token it presents');
+  // A read that fails honours nothing rather than the last map.
+  fs.writeFileSync(path.join(dir, 'aws1'), 'aws1-secret\n');
+  const failing = nodeApi.createNodeTokenStore({ initial: read(), read: () => { throw new Error('EIO'); }, now: () => clock });
+  assert.deepEqual(failing.current(), {});
+});
+
 test('the public listener never takes a node token as an identity', () => {
   const { apiRequestAuthError } = require('./serve.js');
   const req = { method: 'GET', headers: { host: '100.64.0.1:7777', 'x-keep-node-token': 'aws1-secret' }, socket: { remoteAddress: '100.64.0.2' } };

@@ -85,7 +85,8 @@ test('keep nodes rm takes the entry and the token away, and refuses the daemon n
   await capture(() => commands.nodes(['add', 'aws1', '--address', '100.64.0.2:7777']));
   const tokenFile = path.join(registryDir.root, '.keep', 'node-tokens', 'aws1');
   assert.equal(fs.existsSync(tokenFile), true);
-  await capture(() => commands.nodes(['rm', 'aws1']));
+  const said = await capture(() => commands.nodes(['rm', 'aws1']));
+  assert.match(String(said), /its access to the daemon's node API ends within 5 seconds/);
   assert.deepEqual(registryDir.read().nodes, { main: {} });
   assert.equal(fs.existsSync(tokenFile), false);
   await assert.rejects(commands.nodes(['rm', 'aws1']), /no such node/);

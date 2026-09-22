@@ -181,7 +181,8 @@ function removeNode(argv, deps) {
   const tokenFile = tokenFileFor(name);
   try { fs.unlinkSync(tokenFile); }
   catch (error) { if (error.code !== 'ENOENT') die(`removed node ${name}, but its token at ${tokenFile} could not be deleted: ${error.message}`); }
-  console.log(`Removed node ${name} and its token. Restart the daemon to stop polling it: keep restart-daemon`);
+  const window = Math.round(require('../serve/node-api.js').NODE_TOKEN_REREAD_MS / 1000);
+  console.log(`Removed node ${name} and its token; its access to the daemon's node API ends within ${window} seconds. Restart the daemon to stop polling it: keep restart-daemon`);
   if (cleared.default) console.log(`Cleared the default placement, which named ${name}.`);
   for (const project of cleared.projects) console.log(`Cleared the placement for ${project}, which named ${name}.`);
 }
