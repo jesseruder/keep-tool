@@ -2385,8 +2385,9 @@ due the restore is typed under the injection lock as usual (the record blocks ag
 that attempt, though its expiry keeps counting from the deferral) and is either
 confirmed, deferred again, or left unconfirmed. No key this pass sends is
 unguarded. It reads the pane's input counter first, then proves the session idle under
-it: no "esc to interrupt", no live dialog, no local command still finishing (the busy text is read only from the
-status rows just above the input box and its footer, not from the transcript), and an empty
+it: no "esc to interrupt", no live dialog, no local command still finishing (read from the whole screen, with the
+phrase allowed to wrap across rows, so a spinner far above the box still counts; an idle
+answer in view that quotes the phrase delays the restore until it scrolls away), and an empty
 box (the prompt-suggestion probe's comma and Backspace are themselves conditional on the
 counter). The counter must have been quiet for `KEEP_COMPACT_RESTORE_INPUT_QUIET_MS` (default
 2000) by the host's `lastInputAt`, and the idle screen is read only after a
@@ -2396,12 +2397,14 @@ count moves it, so the host drops the restore's keys; any screen read while the 
 is typed that shows "esc to interrupt" takes the draft back instead of pressing Enter,
 and Enter is pressed only when the box holds exactly the command. A restore whose first
 key the host refused typed nothing: it is not counted as an attempt, a deferred record
-keeps its deferral, and `settings.json` is left alone. The account's `settings.json`
-repair rechecks for a hand-picked model immediately before it writes, and once any
-session on that settings file has a hand-picked model, no repair writes that file again:
-the other pending records on it are stamped `settingsUserChoiceAt` (with the chosen
-value), so later passes skip their settings write-back too, while their own restores are
-still typed and only put back exactly what the file held before their own `/model`. If a key lands between the probe's comma and its Backspace, the comma
+keeps its deferral, and `settings.json` is left alone. The pass writes a
+record's pre-swap model back to `settings.json` only by compare-and-swap: the file must
+hold exactly the id that record's own compaction typed, no other pending restore may share
+the file, and no live session whose transcript moved since the swap may show a model chosen
+by hand since. Otherwise it logs `left settings.json as-is`. That covers an interrupted
+compaction whose session is gone as well as one whose restore is typed; a typed restore's
+own `/model` (which Claude Code saves as the default) is otherwise undone back to exactly
+what the file held just before it, so a person's value there stays theirs. If a key lands between the probe's comma and its Backspace, the comma
 is left with the person's key, the refusal is logged, and the record waits
 `KEEP_COMPACT_RESTORE_RETRY_MIN` before probing that session again. The hand-picked-model check below
 runs again under the lock right before typing. Second, if the

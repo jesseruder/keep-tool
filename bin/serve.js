@@ -2311,26 +2311,13 @@ function sendPrecheck(screen) {
   }
 }
 
-// The rows of a Claude screen that say whether a turn is running: the few just above the
-// input box's top rule, where the spinner line ("✻ Working… (esc to interrupt)") is
-// drawn, and everything below the prompt, which is the box's own footer. Not the
-// transcript above: an idle answer that happens to quote "esc to interrupt" is not a turn.
-// A screen with no prompt row gives every row back — without a box there is nothing to
-// tell status from transcript, and the callers read that as busy.
-function claudeLiveStatusRows(screen) {
-  const lines = String(screen || '').split(/\r?\n/);
-  let prompt = -1;
-  lines.forEach((line, index) => { if (/^\s*❯(?:\s|$)/.test(line)) prompt = index; });
-  if (prompt === -1) return lines;
-  let top = prompt - 1;
-  while (top >= 0 && prompt - top <= 12 && !BOX_RULE_RE.test(lines[top])) top -= 1;
-  if (top < 0 || !BOX_RULE_RE.test(lines[top])) top = prompt;
-  return [...lines.slice(Math.max(0, top - 3), top), ...lines.slice(prompt + 1)];
-}
-
-function claudeStatusShows(screen, pattern) {
-  return claudeLiveStatusRows(screen).some((line) => pattern.test(line));
-}
+// A turn running anywhere on a Claude screen, read the conservative way: the whole screen,
+// with the phrase allowed to wrap across rows ("esc to" at the end of one, "interrupt" at
+// the start of the next). A spinner line can sit well above the box — a todo list or
+// queued messages between them — so no narrower window is safe. The cost is accepted: an
+// answer in view that quotes "esc to interrupt" delays a restore until it scrolls away.
+const CLAUDE_TURN_RUNNING_RE = /esc\s+to\s+interrupt|Compacting[.…]/i;
+const CLAUDE_TURN_OR_DIALOG_RE = /esc\s+to\s+(?:interrupt|cancel)|Compacting[.…]/i;
 
 function promptLine(screen) {
   return String(screen || '').split(/\r?\n/).slice(-10).reverse()
@@ -3214,7 +3201,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   // session idle, but a submit the host accepted just before that count may not have
   // rendered yet. Any screen read from here to the Enter that shows a turn running
   // refuses the Enter: the counter speaks only for keys, the screen for the turn.
-  const turnRunning = (screen) => Boolean(inputBaseline) && claudeStatusShows(screen, /esc to interrupt|Compacting[.…]/i);
+  const turnRunning = (screen) => Boolean(inputBaseline) && CLAUDE_TURN_RUNNING_RE.test(String(screen || ''));
   const turnStarted = () => new InjectionError(409, 'the session started a turn while the command was typed; Enter was not pressed');
   // How long the screen is given to catch up, at 400ms a poll. Four is enough for a
   // plain message; a caller whose text makes Claude render more than the line — a
@@ -4099,7 +4086,7 @@ async function compactRestoreInputBaseline(target, deps = {}, current = null) {
         && !/esc to (?:interrupt|cancel)/i.test(screen);
     if (!complete) return null;
   }
-  if (claudeStatusShows(screen, /esc to (?:interrupt|cancel)|Compacting[.…]/i) || claudePrompts.recognize(screen)?.live) {
+  if (CLAUDE_TURN_OR_DIALOG_RE.test(screen) || claudePrompts.recognize(screen)?.live) {
     throw new InjectionError(409, 'the session is busy or showing a dialog; the restore was not typed', { screenTail: screenTail(screen) });
   }
   const proof = await probeSuggestion(target, screen, { ...deps, probeInputGuard: { pid: before.pid, inputCount: before.inputCount } });
@@ -4133,33 +4120,19 @@ async function sweepPendingCompactSwaps(deps = {}) {
     let scanError = null;
     try { sessions = scan(); } catch (e) { scanError = e; }
     // A model someone picked by hand after the swap retires the record before anything
-    // below can act on it: no restore typed over the choice, and no settings.json repair
-    // over the saved default /model just wrote (see compactSwapUserModelChoice).
+    // below can act on it: no restore typed over the choice (see compactSwapUserModelChoice).
     const retired = new Set();
-    // Settings files a person chose a model on during this pass. The file is the account's
-    // saved default, shared by every session on it: after one session's hand choice, no
-    // record's settings repair may write it this pass, and a restore typed there only
-    // puts back exactly what the file held before its own /model.
-    const userOwnedSettings = new Set();
-    // And across passes: retiring a record for a hand choice stamps every other pending
-    // record on the same settings file (settingsUserChoiceAt), because the retired record
-    // is gone and the choice could not be rediscovered next pass. A stamped record's own
-    // restore is still typed; only its settings.json write-back is dropped for good.
-    for (const record of allRecords) {
-      if (record.error || codexCompact.isCodexCompactSwap(record) || !record.settingsUserChoiceAt) continue;
-      const file = compactSwapSettingsFile(record, deps);
-      if (file) userOwnedSettings.add(file);
-    }
-    const byIdEarly = new Map((sessions || []).map((session) => [session.id, session]));
     const transcriptFor = deps.transcriptFileForSession || transcriptFileForSession;
-    // True when the record was retired (or already was) for a hand-picked model.
-    const retireOnUserChoice = (record) => {
+    const sessionById = (id) => (sessions || []).find((session) => session.id === id);
+    const userChoice = (record, session) => {
+      try { return session ? (deps.compactSwapUserModelChoice || compactSwapUserModelChoice)(record, transcriptFor(session)) : null; }
+      catch { return null; }
+    };
+    // The one retire path, for the first look and the one under the lock alike.
+    const retireOnUserChoice = (record, session = sessionById(record.sessionId)) => {
       if (retired.has(record.file)) return true;
       if (scanError || record.error || codexCompact.isCodexCompactSwap(record)) return false;
-      const session = byIdEarly.get(record.sessionId);
-      if (!session) return false;
-      let choice = null;
-      try { choice = (deps.compactSwapUserModelChoice || compactSwapUserModelChoice)(record, transcriptFor(session)); } catch {}
+      const choice = userChoice(record, session);
       if (!choice) return false;
       const sid = (sessionRef(record.sessionId) || 'unknown');
       try { fs.unlinkSync(record.file); } catch (e) {
@@ -4169,57 +4142,61 @@ async function sweepPendingCompactSwaps(deps = {}) {
         }
       }
       retired.add(record.file);
-      const ownedFile = compactSwapSettingsFile(record, deps);
-      if (ownedFile) {
-        userOwnedSettings.add(ownedFile);
-        for (const other of allRecords) {
-          if (other === record || retired.has(other.file) || other.error || codexCompact.isCodexCompactSwap(other)
-              || compactSwapSettingsFile(other, deps) !== ownedFile || other.settingsUserChoiceAt) continue;
-          Object.assign(other, { settingsUserChoiceAt: now(), settingsUserChoice: String(choice.model || ''),
-            settingsUserChoiceSession: record.sessionId });
-          try {
-            const stored = JSON.parse(fs.readFileSync(other.file, 'utf8'));
-            writeCompactSwapRecord(other.file, { ...stored, settingsUserChoiceAt: other.settingsUserChoiceAt,
-              settingsUserChoice: other.settingsUserChoice, settingsUserChoiceSession: record.sessionId });
-          } catch (e) {
-            process.stderr.write(`keep serve: could not mark ${sessionRef(other.sessionId) || 'unknown'}'s restore record with a hand-picked settings model: ${String(e && e.message || e)}\n`);
-          }
-        }
-      }
       summary.dropped += 1;
-      process.stderr.write(`keep serve: retired model restore record for ${sid}: ${choice.reason}; not restoring "${String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '')}" or repairing settings.json over it\n`);
+      process.stderr.write(`keep serve: retired model restore record for ${sid}: ${choice.reason}; not restoring "${String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '')}" over it\n`);
       return true;
     };
     for (const record of allRecords) retireOnUserChoice(record);
     const records = allRecords.filter((record) => !retired.has(record.file));
+    const finished = new Set(); // Restored this pass: their records are gone.
     const repairedSettingsRecords = new Set();
     const noteSettingsRepair = (record, repaired) => {
       if (!repaired.changed || repairedSettingsRecords.has(record.file)) return;
       repairedSettingsRecords.add(record.file);
       summary.repairedSettings += 1;
     };
-    // Repair each account's settings independently, even if its session cannot
-    // safely receive a restore command on this tick.
+    // The only way this pass writes settings.json back to a record's pre-swap model:
+    // compare-and-swap on the value this record's own daemon /model wrote (the id it
+    // typed, exactly), and only while nothing else could own the file — no other pending
+    // restore shares it, and no session (any live one whose transcript moved since the
+    // swap) shows a model chosen by hand since. settings.json is an account's saved
+    // default, so a hand choice anywhere is the person's, and it is left as-is. Returns
+    // why not, or ''.
+    const settingsRepairRefusal = (record, settingsFile, current) => {
+      const typed = String(record.switchModel || '').trim().toLowerCase();
+      if (!typed || !current.ok || String(current.value || '').trim().toLowerCase() !== typed) {
+        return 'it no longer holds the model this compaction typed';
+      }
+      if (records.some((other) => other !== record && !retired.has(other.file) && !finished.has(other.file) && !other.error
+          && !codexCompact.isCodexCompactSwap(other) && compactSwapSettingsFile(other, deps) === settingsFile)) {
+        return 'another pending model restore shares it';
+      }
+      const at = compactSwapRecordAt(record);
+      if ((sessions || []).some((session) => session && session.kind === 'claude'
+          && !(Number(session.mtime) < at) && userChoice(record, session))) {
+        return 'a model was chosen by hand since the swap';
+      }
+      return '';
+    };
+    const leftAsIs = (record, why) => process.stderr.write(`keep serve: left settings.json as-is for ${sessionRef(record.sessionId) || 'unknown'}'s model restore: ${why}\n`);
+    // Crash recovery: a compaction that died between its switch and its repair left the
+    // account's default on the compaction model. Repaired here even when its session
+    // cannot take a restore this tick — under the rule above.
     const settingsRecords = new Map();
     for (const record of records.filter((item) => !item.error && !codexCompact.isCodexCompactSwap(item))
       .sort((a, b) => compactSwapRecordAt(b) - compactSwapRecordAt(a))) {
       const file = compactSwapSettingsFile(record, deps);
       if (file && !settingsRecords.has(file)) settingsRecords.set(file, record);
     }
-    for (const [settingsFile, settingsRecord] of settingsRecords) if (!inFlightSwap && !userOwnedSettings.has(settingsFile)) {
+    for (const [settingsFile, settingsRecord] of settingsRecords) if (!inFlightSwap) {
       const sid = (sessionRef(settingsRecord.sessionId) || 'unknown');
       try {
         await lock(async () => {
           const settings = readSettings(settingsFile);
           const via = String(settingsRecord.switchModel || envString('KEEP_COMPACT_VIA_MODEL', 'opus')).trim();
           if (!settings.ok || !compactModelContainsFamily(settings.value, via)) return;
-          // Checked again here, under the lock and immediately before the write: a model
-          // someone picked since the first look is the saved default /model just wrote,
-          // and the per-record retire further down would come too late to undo a repair.
-          // Every record on this settings file counts — it is the account's default.
-          const sharing = records.filter((item) => !item.error && !codexCompact.isCodexCompactSwap(item)
-            && compactSwapSettingsFile(item, deps) === settingsFile);
-          if (sharing.map(retireOnUserChoice).some(Boolean) || userOwnedSettings.has(settingsFile)) return;
+          const refusal = settingsRepairRefusal(settingsRecord, settingsFile, settings);
+          if (refusal) { leftAsIs(settingsRecord, refusal); return; }
           const repaired = repairSettings(settingsRecord.settingsModelBefore, settingsRecord.settingsModelPresent, settingsFile);
           noteSettingsRepair(settingsRecord, repaired);
           if (repaired.changed) {
@@ -4349,26 +4326,30 @@ async function sweepPendingCompactSwaps(deps = {}) {
             throw error;
           }
           if (inputBaseline === null) return null;
-          const via = String(record.switchModel || envString('KEEP_COMPACT_VIA_MODEL', 'opus')).trim();
           const before = readSettings(settingsFile);
-          // /model also overwrites settings.json. Save a hand change so we can
-          // put it back after our command, without overwriting a later hand edit.
-          const saved = before.ok && (!compactModelContainsFamily(before.value, via) || userOwnedSettings.has(settingsFile))
-            ? { settingsModelBefore: before.value, settingsModelPresent: before.present }
-            : settingsRecords.get(settingsFile);
           const restoreModel = String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim();
-          // Only after the restore was actually typed: a pass that retired or refused
-          // before typing wrote nothing to settings.json, and anything there now is a
-          // person's.
+          // Only after the restore was actually typed (a pass that retired or refused first
+          // wrote nothing), and only to undo exactly what the restore's own /model wrote —
+          // Claude Code saves it as the default. What goes back is what the file held just
+          // before: a person's value stays theirs, and the compaction's own value goes back
+          // to the pre-swap model only under settingsRepairRefusal's rule. When that
+          // pre-swap model is the restore model itself, the restore already put it back.
           let typedRestore = false;
           const repair = () => {
-            if (!typedRestore || !saved) return;
+            if (!typedRestore || !before.ok) return;
             const after = readSettings(settingsFile);
-            if (!after.ok || (before.ok && after.value === before.value)) return;
-            // Compare-and-swap: only undo the value our own /model command wrote. Anything
-            // else is a newer hand change made while we waited, and it stays.
-            if (compactModelBase(after.value) !== compactModelBase(restoreModel)) return;
-            const repaired = repairSettings(saved.settingsModelBefore, saved.settingsModelPresent, settingsFile);
+            if (!after.ok || String(after.value || '').toLowerCase() !== restoreModel.toLowerCase()) return;
+            let value = before.value;
+            let present = before.present;
+            const refusal = settingsRepairRefusal(record, settingsFile, before);
+            if (!refusal) {
+              value = record.settingsModelBefore;
+              present = record.settingsModelPresent;
+            } else if (String(before.value || '').toLowerCase() === String(record.switchModel || '').toLowerCase()) {
+              leftAsIs(record, refusal);
+            }
+            if (present && String(value || '').toLowerCase() === restoreModel.toLowerCase()) return;
+            const repaired = repairSettings(value, present, settingsFile);
             noteSettingsRepair(record, repaired);
             if (repaired.error) {
               process.stderr.write(`keep serve: could not restore settings.json model after an interrupted compaction of ${sid}: ${repaired.error}\n`);
@@ -4382,9 +4363,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
             // the record written — moved the count, and the host refuses the restore's keys.
             // Again under the lock, at the last moment: a /model someone typed since the
             // pass's first look is as much a choice as one typed before it.
-            const lateChoice = (deps.compactSwapUserModelChoice || compactSwapUserModelChoice)(record,
-              (deps.transcriptFileForSession || transcriptFileForSession)(current));
-            if (lateChoice) return { retired: lateChoice };
+            if (retireOnUserChoice(record, current)) return { retired: true };
             // Only now, with the restore about to be typed, is the attempt a transaction in
             // flight again: until it is confirmed or re-deferred below, the record blocks
             // delivery like any other. A probe that refused above typed nothing, and a
@@ -4419,12 +4398,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
           summary.skipped += 1;
           continue;
         }
-        if (restored && restored.retired) {
-          try { fs.unlinkSync(record.file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-          summary.dropped += 1;
-          process.stderr.write(`keep serve: retired model restore record for ${sid}: ${restored.retired.reason}; not restoring "${String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '')}" over it\n`);
-          continue;
-        }
+        if (restored && restored.retired) continue;
         if (restored === 'rate-limited') {
           const restoreModel = String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim();
           const usageNow = deps.usageSnapshot !== undefined ? deps.usageSnapshot : readUsageCache();
@@ -4437,6 +4411,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
         }
         if (!restored) throw new Error(`expected "${record.restoreCommand}"`);
         fs.unlinkSync(record.file);
+        finished.add(record.file);
         summary.restored += 1;
         const restoreModel = String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '');
         process.stderr.write(`keep serve: restored claude session ${sid} to "${restoreModel}" after an interrupted compaction\n`);

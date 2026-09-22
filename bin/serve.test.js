@@ -4269,8 +4269,13 @@ test('pending swap sweep uses the newest settings snapshot and counts repaired r
     fs.writeFileSync(settingsFile, '{"model":"opus"}');
     writeCompactSwapFixture(dir, 'a-older', { at: deps.now() - 2000, settingsModelBefore: 'claude-sonnet-5' });
     writeCompactSwapFixture(dir, 'z-newer', { at: deps.now() - 1000, settingsModelBefore: 'claude-fable-5-1' });
-    assert.equal((await sweepPendingCompactSwaps(deps)).restored, 2);
-    assert.deepEqual(repairs, Array(3).fill('claude-fable-5-1'));
+    const summary = await sweepPendingCompactSwaps(deps);
+    assert.equal(summary.restored, 2);
+    // Two restores sharing one file: neither may write a pre-swap model while the other
+    // is pending, so the older one only undoes its own /model, and the newer one — alone
+    // on the file by then — puts its pre-swap model back.
+    assert.deepEqual(repairs, ['opus', 'claude-fable-5-1']);
+    assert.equal(summary.repairedSettings, 2);
     assert.equal(JSON.parse(fs.readFileSync(settingsFile)).model, 'claude-fable-5-1');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
@@ -12650,9 +12655,6 @@ test('a hand-picked model on a shared settings file stays the person\'s across p
     await sweepPendingCompactSwaps(deps);
     assert.deepEqual(calls, []);
     assert.equal(settings, 'claude-opus-5[1m]');
-    const stamped = JSON.parse(fs.readFileSync(fileA, 'utf8'));
-    assert.ok(stamped.settingsUserChoiceAt);
-    assert.equal(stamped.settingsUserChoice, 'claude-opus-5[1m]');
     // Pass 2: B's record is gone, so its choice cannot be rediscovered; A is idle now.
     bChose = false;
     a.endedTurn = true;
@@ -12663,20 +12665,97 @@ test('a hand-picked model on a shared settings file stays the person\'s across p
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('only the live status rows say a turn is running, not an answer that quotes it', async () => {
+
+// ---- review round 5 ----
+
+test('a running turn anywhere on screen refuses the restore, and a quoted phrase is allowed to delay it', async () => {
   const { compactRestoreInputBaseline } = require('./serve.js');
-  const quoted = ['Press esc to interrupt a running turn.', 'That is how you stop it.', '', '', '', '',
-    '────', '❯ ', '────', '? for shortcuts'].join('\n');
   const deps = (screen) => ({ sleep: async () => {}, hostRequest: async () => ({ guardedInput: true }),
     livePaneState: async () => ({ pid: 7, inputCount: 3 }), readScreen: async () => screen });
-  assert.deepEqual(await compactRestoreInputBaseline({ pane: 'p' }, deps(quoted)), { pid: 7, inputCount: 3 });
-  await assert.rejects(compactRestoreInputBaseline({ pane: 'p' }, deps(['answer', '✻ Working… (3s · esc to interrupt)', '',
-    '────', '❯ ', '────'].join('\n'))), /busy/);
-  // And while typing: quoted text far above the box does not stop the Enter.
+  // The spinner six rows above the box, a todo list and a queued message between them.
+  const farSpinner = ['✻ Working… (12s · esc to interrupt)', '  ⎿  ☐ migrate the table', '     ☐ backfill',
+    '     ☐ verify', '', '> queued: and then run the tests', '────', '❯ ', '────', '? for shortcuts'].join('\n');
+  await assert.rejects(compactRestoreInputBaseline({ pane: 'p' }, deps(farSpinner)), /busy/);
+  // The phrase wrapped across two rows on a narrow pane.
+  const wrapped = ['✻ Reticulating… (1m 3s · ↑ 2.1k tokens · esc to', 'interrupt)', '────', '❯ ', '────'].join('\n');
+  await assert.rejects(compactRestoreInputBaseline({ pane: 'p' }, deps(wrapped)), /busy/);
+  // Accepted cost of reading the whole screen: an idle answer quoting the phrase delays
+  // the restore until it scrolls out of view. Nothing is typed meanwhile.
+  const quoted = ['Press esc to interrupt a running turn.', '────', '❯ ', '────'].join('\n');
+  await assert.rejects(compactRestoreInputBaseline({ pane: 'p' }, deps(quoted)), /busy/);
+  // The guarded typing path reads the same way.
   const command = '/model claude-fable-5-1[1m]';
   const harness = draftHarness((inputs) => (inputs.includes(command)
-    ? `Press esc to interrupt a running turn.\n\n\n\n\n${BOX(command)}` : BOX('')));
-  await typeAndSubmit({ pane: 'p' }, command, (s, t) => s.includes(t), {
-    ...harness.deps, inputBaseline: { pid: 4242, inputCount: 0 }, discardDraftOnAbort: true });
-  assert.equal(harness.inputs.includes('\r'), true);
+    ? ['✻ Working… (esc to interrupt)', '  ⎿  ☐ a', '     ☐ b', '     ☐ c', '', '', BOX(command)].join('\n') : BOX('')));
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, command, (s, t) => s.includes(t), {
+    ...harness.deps, inputBaseline: { pid: 4242, inputCount: 0 }, discardDraftOnAbort: true }), /started a turn/);
+  assert.equal(harness.inputs.includes('\r'), false);
+});
+
+test('an old hand choice does not stop a later crashed compaction\'s settings repair', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-crash-repair-'));
+  const transcript = path.join(dir, 'c.jsonl');
+  const at = Date.parse('2026-09-04T12:00:00Z');
+  const stamp = (offsetMs) => new Date(at + offsetMs).toISOString();
+  const modelCommand = (args, offsetMs) => JSON.stringify({ type: 'user', timestamp: stamp(offsetMs), message: { content: [{ type: 'text',
+    text: `<command-name>/model</command-name><command-message>model</command-message><command-args>${args}</command-args>` }] } });
+  const out = (text, offsetMs) => JSON.stringify({ type: 'system', subtype: 'local_command', timestamp: stamp(offsetMs),
+    content: `<local-command-stdout>${text}</local-command-stdout>` });
+  try {
+    // An hour before C's swap the person chose Sonnet; C then compacted via Opus 1M and the
+    // daemon died before its repair. C's pane is gone.
+    fs.writeFileSync(transcript, `${[modelCommand('claude-sonnet-5', -3600e3), out('Set model to Sonnet 5', -3600e3),
+      modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 1e3)].join('\n')}\n`);
+    const c = { id: 'crashed-c', kind: 'claude', exited: true, endedTurn: true, mtime: at + 2e3 };
+    const file = writeCompactSwapFixture(dir, c.id, { at, switchModel: 'claude-opus-5[1m]', settingsModelBefore: 'claude-sonnet-5' });
+    let settings = 'claude-opus-5[1m]';
+    const repairs = [];
+    const summary = await sweepPendingCompactSwaps({ ...compactRestoreDeps(dir, c, []), transcriptFileForSession: () => transcript,
+      stderr: () => {},
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: settings }),
+      repairClaudeSettingsModel: (value) => { repairs.push(value); settings = value; return { changed: true }; } });
+    assert.deepEqual(repairs, ['claude-sonnet-5'], 'the file held exactly what C typed, and nobody chose since');
+    assert.equal(summary.repairedSettings, 1);
+    assert.equal(fs.existsSync(file), true, 'the restore itself waits for a live session');
+    // Anything other than exactly what C typed is left alone.
+    settings = 'claude-opus-5';
+    repairs.length = 0;
+    await sweepPendingCompactSwaps({ ...compactRestoreDeps(dir, c, []), transcriptFileForSession: () => transcript,
+      stderr: () => {},
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: settings }),
+      repairClaudeSettingsModel: (value) => { repairs.push(value); return { changed: true }; } });
+    assert.deepEqual(repairs, []);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a late hand choice retired under the lock is not overwritten by another record\'s later pass', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-late-choice-shared-'));
+  const a = { id: 'session-a', kind: 'claude', model: 'claude-opus-5', endedTurn: false };
+  const b = { id: 'session-b', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  try {
+    const fileA = writeCompactSwapFixture(dir, a.id, { at: Date.parse('2026-09-04T12:00:00Z'), switchModel: 'claude-opus-5[1m]' });
+    const fileB = writeCompactSwapFixture(dir, b.id, { at: Date.parse('2026-09-04T12:01:00Z'), switchModel: 'claude-opus-5[1m]' });
+    // B's person picks exactly the id the compactions typed, while B's pass is under way:
+    // the file then holds a value no compare-and-swap can tell from the daemon's.
+    let settings = 'claude-opus-5[1m]';
+    let bLooks = 0;
+    const calls = [];
+    const deps = { ...compactRestoreDeps(dir, a, calls),
+      scanSessions: () => [a, b], transcriptFileForSession: (session) => session.id, stderr: () => {},
+      compactSwapUserModelChoice: (_record, transcript) => (transcript === b.id && ++bLooks >= 2
+        ? { model: 'claude-opus-5[1m]', reason: '/model claude-opus-5[1m] was chosen after the swap' } : null),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: settings }),
+      repairClaudeSettingsModel: (value) => { settings = value; return { changed: true }; },
+      typeAndSubmit: async (_target, command) => { calls.push(command); settings = command.slice('/model '.length); } };
+    await sweepPendingCompactSwaps(deps);
+    assert.equal(fs.existsSync(fileB), false, 'B retired by the recheck under the lock');
+    assert.deepEqual(calls, []);
+    assert.equal(settings, 'claude-opus-5[1m]');
+    // Next pass: B's record is gone, A is idle and alone on the file.
+    a.endedTurn = true;
+    await sweepPendingCompactSwaps(deps);
+    assert.deepEqual(calls, ['/model claude-fable-5-1[1m]'], 'A is restored');
+    assert.equal(fs.existsSync(fileA), false);
+    assert.equal(settings, 'claude-opus-5[1m]', 'and B\'s choice, seen in B\'s transcript, is left in settings.json');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
