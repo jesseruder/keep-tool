@@ -13634,44 +13634,124 @@ test('a publication carries what each node is and is not saying', () => {
   assert.deepEqual(first.panes.map((pane) => pane.id), ['r1@aws1']);
 });
 
-test('a restart of a pane on another node is refused before any local process is read', async () => {
-  const { restartSession, forceRestartSession } = require('./serve');
-  // Anything that reads this machine's processes fails the test by being called:
-  // the refusal has to come first, not after a snapshot has been taken.
-  const forbidden = {
-    agentProcessRows: () => { throw new Error('the local process table must not be consulted'); },
-    forceRows: () => { throw new Error('the local process table must not be consulted'); },
-    buildState: () => { throw new Error('nothing is inspected for a remote restart'); },
-    withInjectionLock: () => { throw new Error('the injection lock must not be taken'); },
-    connectHost: () => { throw new Error('no host request is made'); },
-  };
-  for (const [call, pattern] of [
-    [() => restartSession({ sessionId: 'sess-1', pane: '1a2b@aws1', mode: 'now' }, forbidden), /^restart is not available for a pane on aws1/],
-    [() => forceRestartSession({ sessionId: 'sess-1', pane: '1a2b@aws1' }, async () => {}, forbidden), /^force restart is not available for a pane on aws1/],
-  ]) {
-    const error = await call().then(() => null, (failure) => failure);
-    assert.ok(error, 'the call must be refused');
-    assert.match(error.message, pattern);
-    assert.match(error.message, /node-local process verification lands with the process\/signal verbs/);
-    assert.equal(error.status, 409);
-  }
+test('a pane on another node is force-restarted on that node evidence, and nothing here is signalled', async (t) => {
+  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient, forceRestartSession, agentProcessRows, liveSessionPids, hostRequest } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodes(t, async ({ root }) => {
+    await closeHostClient();
+    // A registry, an account, and a `claude` on PATH that is a script: the pane on
+    // aws1 has to look like a real agent to the table that node reads. It leaves a
+    // descendant behind that outlives it, which is the case the cleanup exists for.
+    const registry = path.join(root, 'registry');
+    const configDir = path.join(registry, 'claude');
+    const fakeBin = path.join(root, 'bin');
+    for (const dir of [path.join(registry, 'tasks'), path.join(registry, '.keep'), configDir, fakeBin]) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(path.join(fakeBin, 'claude'), [
+      '#!/bin/sh',
+      'nohup sleep 300 >/dev/null 2>&1 &',
+      'printf "fake claude ready\\n"',
+      'read -r line',
+      'exit 0',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const accountsFile = path.join(root, 'accounts.json');
+    fs.writeFileSync(accountsFile, JSON.stringify({ version: 1, accounts: [
+      { id: 'claude-node', label: 'Node claude', agent: 'claude', configDir },
+    ], defaultAccounts: { claude: 'claude-node' } }));
+    const env = { KEEP_DIR: registry, KEEP_CONFIG: accountsFile };
+    const sessionId = 'remote-restart-session';
 
-  // The module refuses on its own account as well, for a caller that arrives by
-  // another route, and before it asks for a pane or a process row.
+    // Both "machines" are this one process here, so a stubbed process.kill could not
+    // tell the daemon's own signal from the node's. What it can be held to is the
+    // wire: every process read and every signal has to be addressed to aws1.
+    const asked = [];
+    const deps = { root: registry, env,
+      connectHost: async (options) => {
+        const client = await connect(options);
+        const node = options.node || 'main';
+        return {
+          ...client,
+          request: (type, params, requestOptions) => {
+            if (['process', 'signal'].includes(type)) asked.push({ node, type, params });
+            return client.request(type, params, requestOptions);
+          },
+          onDisconnect: (listener) => client.onDisconnect(listener),
+          close: () => client.close(),
+        };
+      },
+      withInjectionLock: (fn) => fn(),
+      // The graceful close: one newline, which is what this agent exits on. Nothing
+      // on the signal path runs, so anything that reaches process.kill here would be
+      // this daemon reaching across a machine boundary.
+      closeIdleSession: async (body) => {
+        await hostRequest('input', { pane: body.pane, data: Buffer.from('\n').toString('base64') }, deps);
+        return { ok: true };
+      },
+      waitForHostAgent: async () => true };
+    try {
+      const spawned = (await hostRequest('spawn', {
+        cmd: '/bin/sh', args: ['-c', `exec claude --resume ${sessionId}`],
+        cwd: root, env: { PATH: `${fakeBin}:${process.env.PATH}` },
+        meta: { agent: 'claude', sessionId, accountId: 'claude-node', accountLabel: 'Node claude' },
+      }, { ...deps, node: 'aws1' })).pane;
+      assert.match(spawned.id, /@aws1$/);
+
+      // That node's own table, read on that node: the agent and the descendant it
+      // left behind are both in it, both with the identity a signal is checked against.
+      let rows = [];
+      let child = null;
+      for (let attempt = 0; attempt < 100 && !child; attempt += 1) {
+        rows = await agentProcessRows({ ...deps, now: () => Date.now() + attempt * 5000 }, { node: 'aws1' });
+        child = rows.find((row) => row.ppid === spawned.pid && /sleep/.test(row.args)) || null;
+        if (!child) await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const agentRow = rows.find((row) => row.pid === spawned.pid);
+      assert.ok(agentRow, 'the pane process is in the node table');
+      assert.equal(agentRow.agent, 'claude');
+      assert.equal(agentRow.zombie, false);
+      assert.equal(agentRow.uid, process.getuid());
+      assert.ok(child, 'the agent left a descendant for the cleanup to reach');
+
+      // The conversation is found from that node evidence too, not from this one.
+      const live = await liveSessionPids(deps, { node: 'aws1' });
+      assert.equal(live.get(sessionId)?.pid, spawned.pid);
+
+      const saved = [];
+      const entry = { sessionId, pane: spawned.id, pid: spawned.pid, token: 'force-restart-token' };
+      asked.length = 0;
+      const result = await forceRestartSession(entry, async () => { saved.push(entry.phase); }, deps);
+      assert.equal(result.ok, true);
+      assert.equal(result.sessionId, sessionId);
+      assert.deepEqual(saved, ['prepared', 'closing', 'closed', 'resuming', 'resumed']);
+      assert.deepEqual([...new Set(asked.map((call) => call.node))], ['aws1'],
+        'every process read and every signal was addressed to the machine that owns the pid');
+      const signalled = asked.filter((call) => call.type === 'signal');
+      assert.ok(signalled.length, 'the descendant was signalled through the node');
+      assert.deepEqual(signalled[0].params,
+        { pid: child.pid, pidStart: child.pidStart, signal: 'SIGTERM' },
+        'a pid travels with the start time it was captured with, or it is not an identity');
+      assert.deepEqual(entry.processes.map((entryProcess) => entryProcess.pid).sort(),
+        [spawned.pid, child.pid].sort(), 'the tree was captured from the node table');
+      // The descendant really is gone — signalled through the node, on node evidence.
+      const after = await agentProcessRows({ ...deps, now: () => Date.now() + 1e6 }, { node: 'aws1' });
+      assert.equal(after.some((row) => row.pid === child.pid && row.pidStart === child.pidStart), false);
+    } finally {
+      await closeHostClient();
+    }
+  });
+});
+
+test('force restart no longer refuses a pane for living on another node', async () => {
+  // The refusal is gone, so the module gets as far as asking for the pane — which is
+  // where a caller that means a remote pane wanted it to get to.
   await assert.rejects(require('./force-restart.js').run({ sessionId: 'sess-1', pane: '1a2b@aws1' }, {
     save: async () => {},
-    getPane: () => { throw new Error('no host request is made'); },
-    rows: () => { throw new Error('the local process table must not be consulted'); },
-  }), /force restart is not available for a pane on aws1; node-local process verification/);
-
-  // A pane on this node, and the same id qualified with this node's own name, both
-  // go through to the ordinary path (which then fails for its own reasons).
-  for (const pane of ['1a2b', '1a2b@main']) {
-    const error = await restartSession({ sessionId: 'sess-1', pane, mode: 'now' }, {
-      withInjectionLock: () => { throw new Error('reached the ordinary restart path'); },
-    }).then(() => null, (failure) => failure);
-    assert.equal(error.message, 'reached the ordinary restart path', pane);
-  }
+    getPane: async () => { throw new Error('asked the node for its pane'); },
+    rows: async () => [],
+  }), /asked the node for its pane/);
 });
 
 test('an entry that is not even an object is a node that cannot be reached, not a node that is gone', async (t) => {

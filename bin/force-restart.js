@@ -1,14 +1,12 @@
 'use strict';
 // Explicit force restart only. Checkpoint before destructive work, retain it on
 // failure, and allow a later recovery without closing a replacement session.
+// `deps.rows` and `deps.signal` both answer for the machine the pane is on: the
+// caller points them at that node, and this module never assumes it is this one.
+// `deps.signal` is handed the captured process — pid and start time together —
+// because on another machine the comparison and the kill have to happen there, in
+// one step, and a pid on its own is not an identity.
 async function run(entry, deps) {
-  // Everything below reads this machine's process table and signals pids in it, so
-  // a pane on another node is refused here too — not only at the daemon's entry
-  // point — in case this module is ever driven from somewhere else.
-  const paneRef = require('./nodes.js').parsePaneRef(String(entry.pane || ''));
-  if (paneRef.qualified) {
-    throw Error(`force restart is not available for a pane on ${paneRef.node}; node-local process verification lands with the process/signal verbs`);
-  }
   const checkpoint = async stage => { entry.phase = stage; await deps.save(); };
   const same = (a, b) => a && b && a.pid === b.pid && a.pidStart === b.pidStart;
   const paneMatches = pane => pane && pane.id === entry.pane && pane.pid === entry.pid
@@ -80,7 +78,7 @@ async function run(entry, deps) {
   for (const signal of ['SIGTERM', 'SIGKILL']) {
     for (const old of [...entry.processes].reverse()) {
       const current = (await refresh()).find(p => p.pid === old.pid);
-      if (same(current, old) && !current.zombie) await deps.signal(old.pid, signal);
+      if (same(current, old) && !current.zombie) await deps.signal(old, signal);
     }
     await sleep(1000);
     const remaining = await refresh();

@@ -2232,11 +2232,14 @@ async function listNodePaneResult(node, deps = {}, fresh = false, epoch = hostMu
   try {
     const result = await requestHostClient(client, 'list', {}, deps);
     const panes = Array.isArray(result && result.panes) ? result.panes : [];
-    // The process table is this machine's, so it can only speak for this machine's
-    // panes; a remote pane's agent liveness is the remote node's to report.
-    if (node === daemonNodeName(deps)
-        && panes.some((p) => p?.alive && Number.isInteger(p.pid) && ['claude', 'codex'].includes(p.meta?.agent))) {
-      try { annotatePaneAgents(panes, await (deps.agentProcessRows || agentProcessRows)(deps)); } catch {}
+    // A pane's agent liveness is its own node's to report, so each node's panes are
+    // read against that node's table. A node that cannot answer leaves its panes
+    // unannotated, which says "not known here" rather than "the agent is gone".
+    if (panes.some((p) => p?.alive && Number.isInteger(p.pid) && ['claude', 'codex'].includes(p.meta?.agent))) {
+      try {
+        annotatePaneAgents(panes, await (deps.agentProcessRows || agentProcessRows)(deps, { node }),
+          { ...deps, rowsNode: node });
+      } catch {}
     }
     // A mutation that started while this list was in flight (or while it waited on
     // the process table) makes it a pre-mutation list: return it, remember nothing.
@@ -2529,13 +2532,16 @@ function hostPanesForPublish(result, memo, now, epoch = memo.epoch || 0) {
 
 function annotatePaneAgents(panes, rows, deps = {}) {
   const byPid = new Map(rows.map((row) => [row.pid, row]));
-  const daemon = daemonNodeName(deps);
+  // Whose table this is. A pane that has not been tagged with a node came from the
+  // same listing as these rows, so it is that machine's too.
+  const rowsNode = deps.rowsNode || daemonNodeName(deps);
   for (const pane of panes) {
     if (!pane?.alive || !['claude', 'codex', 'pi'].includes(pane.meta?.agent)) continue;
-    // Another node's pane has another machine's pid. Leaving agentAlive undefined
-    // says "not known here", which is the truth; reading it off this process table
-    // would be an answer about an unrelated process that happens to share a number.
-    if (pane.node && pane.node !== daemon) continue;
+    // Another machine's pane has another machine's pid. Leaving agentAlive undefined
+    // says "not known here", which is the truth; reading it off the wrong process
+    // table would be an answer about an unrelated process that happens to share a
+    // number. A node that does not answer at all leaves it undefined too — never false.
+    if (pane.node && pane.node !== rowsNode) continue;
     const root = byPid.get(pane.pid);
     if (!root) continue; // An incomplete process snapshot is not proof of exit.
     const tree = new Set([pane.pid]);
@@ -5282,47 +5288,47 @@ function sessionProjectFromTranscript(sessionId, deps = {}, agent = null) {
   return { project: '', agent: null };
 }
 
-const PS_TABLE_RE = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+([A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d \d{4})\s*(.*)$/;
+// The table both this daemon and every node agent read, parsed in one place so the
+// two never disagree about what a row means. The daemon node keeps running its own
+// `ps`; a node answers for its own machine through the `process` verb.
+const processTable = require('./process-table.js');
+const { parseProcessTable } = processTable;
 
-function parseProcessTable(output) {
-  const rows = [];
-  for (const line of String(output || '').split(/\r?\n/)) {
-    const match = PS_TABLE_RE.exec(line);
-    if (!match) continue;
-    const tail = match[5];
-    const elapsedMatch = /^(\S+)\s+(.*)$/.exec(tail);
-    const elapsed = elapsedMatch && /^(?:\d+-)?\d{1,2}:\d{2}(?::\d{2})?$/.test(elapsedMatch[1])
-      ? elapsedMatch[1] : null;
-    const args = elapsed ? elapsedMatch[2] : tail;
-    // macOS prints the bare command name in parentheses — `(claude)` — for a process
-    // whose argument vector it could not read. That row names a live process and says
-    // nothing else about it, so it is neither an agent nor evidence that one is gone.
-    const argsUnavailable = /^\([^()]*\)$/.test(args);
-    const agentMatch = argsUnavailable ? null : /(^|\/)(claude|codex|pi)(\s|$)/.exec(args);
-    const padded = ` ${args} `;
-    const interactive = Boolean(agentMatch)
-      && !padded.includes(' -p ')
-      && !args.includes('--print')
-      && !args.includes('app-server')
-      && !args.includes('task-worker')
-      && !args.includes('codex exec');
-    rows.push({
-      pid: Number(match[1]),
-      ppid: Number(match[2]),
-      tty: match[3].replace(/^\/dev\//, ''),
-      pidStart: match[4],
-      ...(elapsed ? { elapsed } : {}),
-      args,
-      agent: agentMatch && agentMatch[2],
-      interactive,
-      ...(argsUnavailable ? { argsUnavailable: true } : {}),
-    });
+// Each node's own last read of its own table, kept apart from this machine's so one
+// node's snapshot can never be mistaken for another's — the pids in them are
+// unrelated numbers that happen to share a range.
+const nodeProcessRowsCaches = new Map();
+
+async function remoteProcessRows(node, deps = {}) {
+  let cache = nodeProcessRowsCaches.get(node);
+  if (!cache) {
+    cache = { value: null, at: 0, pending: null };
+    nodeProcessRowsCaches.set(node, cache);
   }
-  return rows;
+  const now = typeof deps.now === 'function' ? Number(deps.now()) : Number(deps.now ?? Date.now());
+  if (cache.value && now - cache.at < PROCESS_ROWS_CACHE_MS) return cache.value;
+  if (cache.pending) return cache.pending;
+  // The same short cache the local read has, for the same reason: the pane list asks
+  // once per refresh, and a fleet must not answer that with a `ps` per node per second.
+  cache.pending = hostRequest('process', {}, { ...deps, node }).then((result) => {
+    const rows = Array.isArray(result && result.rows) ? result.rows : [];
+    cache.value = rows;
+    cache.at = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
+    cache.pending = null;
+    return rows;
+  }, (error) => {
+    cache.pending = null;
+    throw error;
+  });
+  return cache.pending;
 }
 
-async function agentProcessRows(deps = {}) {
+async function agentProcessRows(deps = {}, options = {}) {
   if (typeof deps.psTable === 'string') return parseProcessTable(deps.psTable);
+  // A pid only means something on the machine that issued it, so a caller asking
+  // about another node's panes is answered by that node's own table.
+  const node = options.node || daemonNodeName(deps);
+  if (node !== daemonNodeName(deps)) return remoteProcessRows(node, deps);
   const cache = deps.processRowsCache || processRowsCache;
   const now = typeof deps.now === 'function' ? Number(deps.now()) : Number(deps.now ?? Date.now());
   if (cache.value && now - cache.at < PROCESS_ROWS_CACHE_MS) return cache.value;
@@ -5466,7 +5472,59 @@ function freshSessionRead(session, deps = {}) {
   } catch { return null; }
 }
 
-async function liveSessionPids(deps = {}) {
+// Every piece of process evidence, pointed at one machine. On the daemon node these
+// are the local reads this daemon has always done, untouched. On any other node they
+// are that machine's own answers about its own processes and its own files, which is
+// the only place either means anything — and they are shaped like the local reads so
+// the judgement above them is the same judgement, wherever the pane is.
+function nodeEvidence(node, deps = {}) {
+  if (node === daemonNodeName(deps)) return deps;
+  // The mtimes come back with the paths, because the rollout files are on that
+  // machine and this one cannot stat them.
+  const mtimes = new Map();
+  return {
+    ...deps,
+    agentProcessRows: deps.agentProcessRows || ((given) => agentProcessRows(given, { node })),
+    psEnv: deps.psEnv || (async (pids) => {
+      const result = await hostRequest('process', { pids, env: true }, { ...deps, node });
+      return (result.env || []).map((entry) => `${entry.pid} CLAUDE_CODE_SESSION_ID=${entry.sessionId}`).join('\n');
+    }),
+    lsof: deps.lsof || (async (pids) => {
+      const result = await hostRequest('process', { pids, files: true }, { ...deps, node });
+      const byPid = new Map();
+      for (const entry of result.files || []) {
+        if (!byPid.has(entry.pid)) byPid.set(entry.pid, []);
+        byPid.get(entry.pid).push(entry.path);
+        mtimes.set(entry.path, entry.mtime);
+      }
+      return [...byPid].flatMap(([pid, files]) => [`p${pid}`, ...files.map((file) => `n${file}`)]).join('\n');
+    }),
+    statMtime: deps.statMtime || (async (file) => {
+      const value = mtimes.get(file);
+      if (!Number.isFinite(value)) throw new Error(`no rollout mtime for ${file} on ${node}`);
+      return value;
+    }),
+    // A forced stop re-reads the table after every signal, so this one is never
+    // cached, and the kill goes to the machine that issued the pid: the node
+    // compares the start time against its own live table and kills in the same step.
+    forceRows: deps.forceRows || (async () => {
+      const result = await hostRequest('process', {}, { ...deps, node });
+      return Array.isArray(result && result.rows) ? result.rows : [];
+    }),
+    forceSignal: deps.forceSignal || ((pid, name, pidStart) =>
+      hostRequest('signal', { pid, pidStart, signal: name }, { ...deps, node })),
+  };
+}
+
+// The node-local half of a launch, run where the pane is: in this process on the
+// daemon node, and through the node's own `prepare-launch` anywhere else.
+async function prepareLaunchOn(node, options, deps = {}) {
+  if (node === daemonNodeName(deps)) return require('./launch-prep.js').prepare(options);
+  return hostRequest('prepare-launch', options, { ...deps, node });
+}
+
+async function liveSessionPids(deps = {}, options = {}) {
+  if (options.node) deps = nodeEvidence(options.node, deps);
   const live = new Map();
   let rows = [];
   try {
@@ -5947,19 +6005,15 @@ function validatedCodexResumeCwd(agent, value) {
   return value;
 }
 
-// Restarting a session means judging a process and then stopping it, and every
-// piece of evidence for both — the `ps` table, liveSessionPids, process.kill — is
-// this machine's. None of it describes a pane on another node: a pid there is a
-// number that happens to exist here too. Refused at the entry, before a single row
-// is read, until a node can answer for its own processes.
-function assertLocalRestart(paneRef, action) {
-  const ref = nodes.parsePaneRef(String(paneRef || ''));
-  if (!ref.qualified) return ref;
-  throw new InjectionError(409, `${action} is not available for a pane on ${ref.node}; node-local process verification lands with the process/signal verbs`);
-}
-
+// Restarting a session means judging a process and then stopping it, and every piece
+// of evidence for both — the `ps` table, liveSessionPids, the kill — belongs to the
+// machine the pane is on. It is pointed at that machine here, once, and everything
+// below reads it through `deps`. On the daemon node that is the local read this
+// daemon has always done, unchanged.
 async function restartSession(body, deps = {}) {
-  assertLocalRestart(body.pane, 'restart');
+  const paneNode = nodes.parsePaneRef(String(body.pane || '')).node;
+  const remotePane = paneNode !== daemonNodeName(deps);
+  deps = nodeEvidence(paneNode, deps);
   const host = (type, params) => hostRequest(type, params, deps);
   // An explicit force discards uncertain background-job evidence only; the turn,
   // tool and process identity checks below stay exactly as strict.
@@ -6028,7 +6082,9 @@ async function restartSession(body, deps = {}) {
     }
     const cwd = deps.resumeCwd == null ? session.project || pane.cwd
       : validatedCodexResumeCwd(session.kind, deps.resumeCwd);
-    if (!cwd || !fs.statSync(cwd).isDirectory()) throw Error('Session directory is unavailable');
+    // The directory is on the machine the pane is on; this one cannot see another
+    // node's filesystem, and the spawn there fails for itself if it is gone.
+    if (!cwd || (!remotePane && !fs.statSync(cwd).isDirectory())) throw Error('Session directory is unavailable');
     let account = deps.resumeAccount || null;
     if (!account) {
       try { account = accounts.forSession(session.id, session.kind, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
@@ -6055,8 +6111,11 @@ async function restartSession(body, deps = {}) {
     // reasoning effort from config.toml, and a managed profile reads its own settings.json.
     // Hand the 429 back here, before anything is closed, rather than part way through.
     if (inheritedModel && !(session.kind === 'claude' && account.builtIn === true)) throw injectionBusyError();
+    // On another node the account's config directory is that machine's, so its
+    // shared setup is prepared there, through the node's own prepare-launch, and
+    // the argument vector carries a placeholder until it answers.
     let resumeMcpConfig = deps.resumeMcpConfig || null;
-    if (session.kind === 'claude' && account.managed) {
+    if (!remotePane && session.kind === 'claude' && account.managed) {
       try { resumeMcpConfig ||= (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(account, cwd).mcpConfig; }
       catch (error) { throw new InjectionError(409, `account shared setup is unavailable: ${error.message}`); }
     }
@@ -6097,7 +6156,8 @@ async function restartSession(body, deps = {}) {
       const launchModel = typeof requestedResumeModel === 'string' && keep.LAUNCH_MODEL_RE.test(requestedResumeModel) ? requestedResumeModel : '';
       const resumeModel = launchModel || (session.kind === 'claude' ? inheritedModel : '');
       const modelArgs = resumeModel ? (session.kind === 'codex' ? ['-m', resumeModel] : ['--model', resumeModel]) : [];
-      const mcpArgs = session.kind === 'claude' && resumeMcpConfig ? ['--mcp-config', resumeMcpConfig] : [];
+      const mcpArgs = session.kind !== 'claude' ? []
+        : remotePane ? [{ insert: 'mcpConfig' }] : resumeMcpConfig ? ['--mcp-config', resumeMcpConfig] : [];
       let argv;
       if (deps.resumeArgv != null) {
         if (session.kind !== 'codex' || !Array.isArray(deps.resumeArgv) || deps.resumeArgv.length < 3
@@ -6110,8 +6170,20 @@ async function restartSession(body, deps = {}) {
         argv = [session.kind, ...flags, ...reviewerSpec.flags, ...mcpArgs, ...modelArgs,
           session.kind === 'codex' ? 'resume' : '--resume', session.id];
       }
+      // The shell word carries a node binary and a launcher path, so for a pane on
+      // another machine it is built there. The daemon node's own path is untouched:
+      // its shared setup was already prepared above, and preparing it twice is not
+      // what this restart is for.
+      const command = remotePane
+        ? (await prepareLaunchOn(paneNode, {
+          agent: session.kind,
+          account: { id: account.id, agent: account.agent, configDir: account.configDir,
+            builtIn: account.builtIn === true, managed: account.managed === true },
+          cwd, bypass: false, argv, pi: null,
+        }, deps)).command
+        : require('./agent-launcher').profileCommand(argv, account);
       const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stoppedPane.meta?.sessionId,
-        cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
+        cmd: '/bin/zsh', args: ['-lic', `exec ${command}`], cwd,
         env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: session.id }, deps), ...reviewerSpec.env }),
         cols: pane.cols, rows: pane.rows, meta: { ...adoptedPaneMeta(pane.meta), agent: session.kind, sessionId: session.id,
           accountId: account.id, accountLabel: account.label, restartedAt: Date.now() } });
@@ -6311,18 +6383,17 @@ async function restartSession(body, deps = {}) {
 // How force-restart stops a session: the graceful manual close, then SIGTERM and
 // SIGKILL on the exact process instances it captured. Resuming is left to the caller.
 function forceStopDeps(entry, deps, host, save) {
+  // Never cached: this reads the same processes again after every signal, and a
+  // stale snapshot here is how an old process is called gone. On another node
+  // nodeEvidence has already pointed `forceRows` at that machine's `process` verb.
   const rows = deps.forceRows || (async () => {
-    const result = await execFileAsync('ps', ['-axo', 'pid=,ppid=,tty=,lstart=,stat=,args='], {
+    const result = await execFileAsync('ps', processTable.PS_FULL_ARGS, {
       encoding: 'utf8', timeout: 5000, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' },
     });
-    return String(result.stdout).split('\n').flatMap(line => {
-      const m = PS_TABLE_RE.exec(line);
-      if (!m) return [];
-      const state = /^(\S+)\s+(.*)$/.exec(m[5]);
-      if (!state) return [];
-      return parseProcessTable(`${m[1]} ${m[2]} ${m[3]} ${m[4]} ${state[2]}`).map(p => ({ ...p, zombie: state[1].includes('Z') }));
-    });
+    return processTable.parseFullProcessTable(String(result.stdout));
   });
+  const signal = deps.forceSignal
+    || (async (pid, name) => { try { process.kill(pid, name); } catch (e) { if (e.code !== 'ESRCH') throw e; } });
   return {
     save, rows, sleep: deps.sleep,
     identifyOriginal: async (sid, snapshot) => (await liveSessionPids({ ...deps, agentProcessRows: async () => snapshot })).get(sid),
@@ -6346,7 +6417,10 @@ function forceStopDeps(entry, deps, host, save) {
       graceful: request => (deps.closeIdleSession || closeIdleSession)(request, { ...deps, closePolicy: { manual: true }, withInjectionLock: fn => fn() }),
       signal: (pane, signal) => host('kill', { pane, signal, expectedPid: entry.pid }),
     }),
-    signal: deps.forceSignal || (async (pid, signal) => { try { process.kill(pid, signal); } catch (e) { if (e.code !== 'ESRCH') throw e; } }),
+    // The captured process, not a bare pid: the comparison and the kill happen on the
+    // machine that owns the pid, in one step, and a pid checked here and signalled
+    // there is no check at all. The start time rides along for the node to compare.
+    signal: async (target, name) => signal(target.pid, name, target.pidStart),
     sessionLive: async sid => (await liveSessionPids({ ...deps, agentProcessRows: rows })).has(sid),
   };
 }
@@ -6420,7 +6494,10 @@ async function forceStopThenResume({ session, pane, identity, resume }, deps = {
     if (grew) await deps.onForcedStop?.(processes.map((p) => ({ ...p })));
     for (const old of [...processes].reverse()) {
       const current = table.find((p) => p.pid === old.pid);
-      if (same(current, old) && !current.zombie) await signal(old.pid, name);
+      // The start time travels with the pid: on another machine the comparison and
+      // the kill have to happen there, together, and a pid on its own is not an
+      // identity. On this one it is the same local kill it has always been.
+      if (same(current, old) && !current.zombie) await signal(old.pid, name, old.pidStart);
     }
     for (let i = 0; i < 10; i++) {
       await sleep(200);
@@ -6449,7 +6526,10 @@ async function forceStopThenResume({ session, pane, identity, resume }, deps = {
 // Same two attempts as restartSession: hold the model key so the resumed agent reads a
 // settled settings.json, and if the key is busy, name the model a compaction swapped out.
 async function forceRestartSession(entry, save, deps = {}) {
-  assertLocalRestart(entry.pane, 'force restart');
+  // The pane's machine answers for the pane's processes, here as in restartSession.
+  const paneNode = nodes.parsePaneRef(String(entry.pane || '')).node;
+  const remotePane = paneNode !== daemonNodeName(deps);
+  deps = nodeEvidence(paneNode, deps);
   let entered = false;
   const attempt = (inheritedModel) => (deps.withInjectionLock || withInjectionLock)(async () => {
     entered = true;
@@ -6463,7 +6543,9 @@ async function forceRestartSession(entry, save, deps = {}) {
     if (!capabilities.replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
     const initial = (await host('get', { pane: entry.pane })).pane;
     const cwd = entry.original?.cwd || initial?.cwd;
-    if (!cwd || !fs.statSync(cwd).isDirectory()) throw Error('Session directory is unavailable');
+    // On another node the directory is that machine's; the resume there fails for
+    // itself if it is gone.
+    if (!cwd || (!remotePane && !fs.statSync(cwd).isDirectory())) throw Error('Session directory is unavailable');
     const resumeAgent = entry.original?.agent || initial?.meta?.agent;
     if (!['claude', 'codex'].includes(resumeAgent)) throw new InjectionError(409, 'Original agent is unavailable');
     const originalAccountId = entry.original?.meta?.accountId || initial?.meta?.accountId;
@@ -6482,8 +6564,10 @@ async function forceRestartSession(entry, save, deps = {}) {
     // config.toml, and a managed profile reads a settings.json of its own. Hand the 429
     // back here, before the close, rather than part way through the restart.
     if (inheritedModel && !(resumeAgent === 'claude' && resumeAccount.builtIn === true)) throw injectionBusyError();
+    // The account's config directory is on the machine the pane is on, so a remote
+    // resume has its shared setup prepared there instead, through prepare-launch.
     let resumeMcpConfig = null;
-    if (resumeAgent === 'claude' && resumeAccount.managed) {
+    if (!remotePane && resumeAgent === 'claude' && resumeAccount.managed) {
       try { resumeMcpConfig = (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(resumeAccount, cwd).mcpConfig; }
       catch (error) { throw new InjectionError(409, `account shared setup is unavailable: ${error.message}`); }
     }
@@ -6496,7 +6580,8 @@ async function forceRestartSession(entry, save, deps = {}) {
         const resumeModel = launchModel || (original.agent === 'claude' ? inheritedModel : '');
         const modelArgs = resumeModel ? (original.agent === 'codex' ? ['-m', resumeModel] : ['--model', resumeModel]) : [];
         const account = resumeAccount;
-        const mcpArgs = resumeMcpConfig ? ['--mcp-config', resumeMcpConfig] : [];
+        const mcpArgs = original.agent !== 'claude' ? []
+          : remotePane ? [{ insert: 'mcpConfig' }] : resumeMcpConfig ? ['--mcp-config', resumeMcpConfig] : [];
         const argv = [original.agent, ...(original.bypass ? [bypass] : []), ...reviewerSpec.flags, ...mcpArgs, ...modelArgs,
           original.agent === 'codex' ? 'resume' : '--resume', job.sessionId];
         const stopped = (await host('get', { pane: job.pane })).pane;
@@ -6505,8 +6590,18 @@ async function forceRestartSession(entry, save, deps = {}) {
             && ((expectedPid === job.pid && stopped.createdAt === original.createdAt) || stopped.meta.forceRestartToken === job.token)))) {
           throw Error('Exited pane changed before resume');
         }
+        // Built where it will run: the shell word names a node binary and a
+        // launcher path, and those are the pane's machine's, not this one's.
+        const command = remotePane
+          ? (await prepareLaunchOn(paneNode, {
+            agent: original.agent,
+            account: { id: account.id, agent: account.agent, configDir: account.configDir,
+              builtIn: account.builtIn === true, managed: account.managed === true },
+            cwd: original.cwd, bypass: false, argv, pi: null,
+          }, deps)).command
+          : require('./agent-launcher').profileCommand(argv, account);
         const result = await host('replace-exited', { paneId: job.pane, expectedPid, sessionId: stopped.meta?.sessionId,
-          cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd: original.cwd,
+          cmd: '/bin/zsh', args: ['-lic', `exec ${command}`], cwd: original.cwd,
           env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: job.sessionId }, deps), ...reviewerSpec.env }),
           cols: original.cols, rows: original.rows, meta: { ...adoptedPaneMeta(original.meta), accountId: account.id, accountLabel: account.label,
             forceRestartToken: job.token, restartedAt: Date.now() } });
@@ -12696,7 +12791,6 @@ module.exports = {
   hostClient,
   hostClientFor,
   validPaneRef,
-  assertLocalRestart,
   hostNodeEntries,
   hostNodeNames,
   listNodePaneResult,

@@ -1167,6 +1167,21 @@ function createHost(options = {}) {
         // one the daemon turns back into its own 409.
         return { result: require('./launch-prep.js').prepare(params) };
       }
+      case 'process': {
+        // This machine's process table, for this machine's panes. The bootId rides
+        // along because a pid only means anything alongside the host that saw it:
+        // a caller comparing two reads has to know they came from the same host
+        // process, not from one that restarted in between.
+        const inspected = await require('./process-table.js').inspect(params);
+        return { result: { ...inspected, bootId } };
+      }
+      case 'signal': {
+        // Judging a process on one machine and signalling it from another is no
+        // judgement at all — the pid would be a number that happens to exist in
+        // both tables. Here the comparison and the kill are one step, in the
+        // process whose machine owns the pid.
+        return { result: await require('./process-table.js').signal(params) };
+      }
       case 'replace-exited': {
         const old = needPane(params.paneId);
         if (old.alive || old.pty.pid !== params.expectedPid || old.meta?.sessionId !== params.sessionId) {

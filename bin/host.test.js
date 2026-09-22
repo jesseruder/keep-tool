@@ -2420,3 +2420,44 @@ test('a host handoff record with a spawn receipt that makes no sense is refused'
     /invalid spawn receipts in host handoff/);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+
+test('a node answers for its own processes and signals them itself', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-process-verb-'));
+  const sock = path.join(root, 'host.sock');
+  const host = createHost({ sock, log: null });
+  let client;
+  try {
+    await host.listen();
+    client = await connect({ sock });
+    const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 30'] });
+    const table = await client.request('process', {});
+    assert.equal(table.bootId, (await client.request('hello')).bootId,
+      'a pid means nothing without the host process that saw it');
+    const row = table.rows.find((entry) => entry.pid === pane.pid);
+    assert.ok(row, 'the pane process is in the table the node answered with');
+    assert.equal(row.uid, process.getuid());
+    assert.equal(row.zombie, false);
+    assert.equal(typeof row.pidStart, 'string');
+    assert.ok(row.pidStart);
+    assert.equal(table.env, undefined, 'nothing is read that was not asked for');
+    assert.equal(table.files, undefined);
+    const asked = await client.request('process', { pids: [], env: true, files: true });
+    assert.deepEqual(asked.env, [], 'no pids, nothing read');
+    assert.deepEqual(asked.files, []);
+
+    // A signal is decided and delivered in the same process that owns the pid.
+    assert.deepEqual(await client.request('signal', { pid: row.pid, pidStart: 'Mon Sep 21 00:00:00 2026', signal: 'SIGKILL' }),
+      { outcome: 'changed' });
+    assert.equal((await client.request('get', { pane: pane.id })).pane.alive, true, 'nothing was signalled');
+    assert.deepEqual(await client.request('signal', { pid: row.pid, pidStart: row.pidStart, signal: 'SIGKILL' }),
+      { outcome: 'signalled' });
+    await waitFor(async () => (await client.request('get', { pane: pane.id })).pane.alive === false, 'the pane to die');
+    await assert.rejects(client.request('signal', { pid: row.pid, pidStart: row.pidStart, signal: 'SIGUSR1' }),
+      /signal must be one of/);
+  } finally {
+    if (client) client.close();
+    await host.close().catch(() => {});
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

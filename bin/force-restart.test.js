@@ -11,7 +11,13 @@ function fixture() {
     getPane: async () => pane, rows: async () => rows, save: async () => phases.push(entry.phase), sleep: async () => {},
     identifyOriginal: async () => ({ pid: 11, pidStart: 'agent', primary: true }),
     close: async () => { assert.equal(entry.phase, 'closing'); assert.ok(entry.processes); closes++; pane.alive = false; rows = rows.filter(p => p.pid === 12).map(p => ({ ...p, ppid: 1, args: 'changed during exit' })); },
-    signal: async (pid, signal) => { signals.push({ pid, signal }); rows = rows.filter(p => p.pid !== pid); },
+    // The captured process, not a bare pid: on another machine the identity and the
+    // kill have to travel together.
+    signal: async (target, signal) => {
+      assert.equal(typeof target.pidStart, 'string');
+      signals.push({ pid: target.pid, signal });
+      rows = rows.filter(p => p.pid !== target.pid);
+    },
     sessionLive: async () => false,
     replace: async () => { replaces++; pane = { ...pane, pid: 20, alive: true, meta: { ...pane.meta, forceRestartToken: entry.token } }; return { ok: true, pane: 'p', pid: 20, sessionId: 's' }; },
   };
