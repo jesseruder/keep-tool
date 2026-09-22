@@ -437,10 +437,10 @@ const lastKnownHostPaneMemo = { panes: null, at: 0 };
 // Bumped before every request that can change the host, so a list collected
 // across a spawn or replacement is never remembered as the last known state.
 let hostMutationEpoch = 0;
-let cachedHost = null;
-let pendingHost = null;
-let hostFailureAt = 0;
-let hostFailureError = null;
+// One set of connections per node, keyed `<node>\0<channel>`. Each has its own
+// client, its own negative cache and its own failure, so a node that is down
+// cannot make its neighbours look down.
+const hostChannels = new Map();
 const HOST_FAILURE_CACHE_MS = 5000;
 const HOST_PANE_CACHE_MS = 1000;
 const HOST_CONNECT_TIMEOUT_MS = 3000;
@@ -1850,44 +1850,72 @@ function isHostTarget(target) {
   return Boolean(target && typeof target.pane === 'string' && target.pane);
 }
 
-async function hostClient(deps = {}) {
-  if (Object.prototype.hasOwnProperty.call(deps, 'host')) return deps.host || null;
+// The slow verb set. Nothing implements these yet; the routing table exists so that
+// when they arrive they take the node's second connection and a long call on one
+// node can never sit in front of a keystroke bound for another.
+const HOST_OPS_TYPES = new Set(['run', 'tail-transcript', 'prepare-launch', 'usage', 'git-state']);
+
+function daemonNodeName(deps = {}) {
+  return deps.daemonNode || nodes.daemonNode();
+}
+
+function hostChannel(node, channel = 'control') {
+  const key = `${node}\u0000${channel}`;
+  let state = hostChannels.get(key);
+  if (!state) {
+    state = { node, channel, client: null, pending: null, failureAt: 0, failureError: null };
+    hostChannels.set(key, state);
+  }
+  return state;
+}
+
+async function hostClientFor(node, deps = {}, channel = 'control') {
+  const daemon = daemonNodeName(deps);
+  if (Object.prototype.hasOwnProperty.call(deps, 'host') && node === daemon) return deps.host || null;
   const runningTests = process.env.NODE_TEST_CONTEXT
     || process.argv.some((arg) => /(?:^|\/)bin\/[^/]+\.test\.js$/.test(arg));
   if (runningTests && typeof deps.connectHost !== 'function') return null;
-  if (cachedHost && (!cachedHost.socket || !cachedHost.socket.destroyed)) return cachedHost;
-  cachedHost = null;
+  const state = hostChannel(node, channel);
+  if (state.client && (!state.client.socket || !state.client.socket.destroyed)) return state.client;
+  state.client = null;
   const now = deps.now || Date.now;
-  if (!deps.forceHostReconnect && hostFailureAt && now() - hostFailureAt < HOST_FAILURE_CACHE_MS) return null;
-  if (!pendingHost) {
+  if (!deps.forceHostReconnect && state.failureAt && now() - state.failureAt < HOST_FAILURE_CACHE_MS) return null;
+  if (!state.pending) {
     const connect = deps.connectHost
       || (deps.requireHostClient || require)('./hostclient.js').connect;
     const timeoutMs = deps.hostConnectTimeoutMs == null ? HOST_CONNECT_TIMEOUT_MS : deps.hostConnectTimeoutMs;
-    pendingHost = connect({ timeoutMs }).then((client) => {
-      cachedHost = client;
-      hostFailureAt = 0;
-      hostFailureError = null;
+    // The daemon node is reached exactly as it always was: no node name, no
+    // registry lookup, the same socket a single-node install has always used.
+    const target = node === daemon ? { timeoutMs } : { node, timeoutMs };
+    state.pending = connect(target).then((client) => {
+      state.client = client;
+      state.failureAt = 0;
+      state.failureError = null;
       if (client && typeof client.onDisconnect === 'function') {
         client.onDisconnect(() => {
-          if (cachedHost === client) {
+          if (state.client === client) {
             // A closed socket is not a failed connect: `keep host reload` closes it
             // on purpose, and the next request must reconnect at once rather than
             // sit out the negative cache.
-            cachedHost = null;
-            hostFailureAt = 0;
-            hostFailureError = null;
+            state.client = null;
+            state.failureAt = 0;
+            state.failureError = null;
           }
           hostPaneCaches.delete(client);
         });
       }
       return client;
     }).catch((error) => {
-      hostFailureAt = now();
-      hostFailureError = error;
+      state.failureAt = now();
+      state.failureError = error;
       return null;
-    }).finally(() => { pendingHost = null; });
+    }).finally(() => { state.pending = null; });
   }
-  return pendingHost;
+  return state.pending;
+}
+
+async function hostClient(deps = {}) {
+  return hostClientFor(deps.node || daemonNodeName(deps), deps, deps.hostChannel || 'control');
 }
 
 // Hang up on the terminal host and forget the cache. The daemon never wants
@@ -1898,15 +1926,19 @@ async function hostClient(deps = {}) {
 // is closed too rather than being left behind as the cached one. The next
 // hostClient() call simply reconnects.
 async function closeHostClient() {
-  if (pendingHost) await pendingHost.catch(() => null);
-  const client = cachedHost;
-  cachedHost = null;
-  hostFailureAt = 0;
-  hostFailureError = null;
-  if (!client) return false;
-  hostPaneCaches.delete(client);
-  try { client.close(); } catch {}
-  return true;
+  let closed = false;
+  for (const state of [...hostChannels.values()]) {
+    if (state.pending) await state.pending.catch(() => null);
+    const client = state.client;
+    state.client = null;
+    state.failureAt = 0;
+    state.failureError = null;
+    if (!client) continue;
+    hostPaneCaches.delete(client);
+    try { client.close(); } catch {}
+    closed = true;
+  }
+  return closed;
 }
 
 function retryableHostError(error) {
@@ -1921,11 +1953,14 @@ function hostRequestTimedOut(error) {
 }
 
 function invalidateHost(client, deps = {}, error = null) {
-  if (client && client === cachedHost) {
-    try { client.close(); } catch {}
-    cachedHost = null;
-    hostFailureAt = (deps.now || Date.now)();
-    hostFailureError = error || new Error('host connection closed');
+  if (client) {
+    for (const state of hostChannels.values()) {
+      if (state.client !== client) continue;
+      try { client.close(); } catch {}
+      state.client = null;
+      state.failureAt = (deps.now || Date.now)();
+      state.failureError = error || new Error('host connection closed');
+    }
   }
   if (client && typeof client === 'object') hostPaneCaches.delete(client);
 }
@@ -1963,6 +1998,15 @@ async function hostRequest(type, params, deps = {}) {
   // response window. The shorter reload window only bounds reconnect/reload churn.
   const deadline = wallNow() + connectBudgetMs + requestTimeoutMs;
   const idempotent = ['hello', 'list', 'get', 'screen', 'meta'].includes(type);
+  // A qualified pane names the node it lives on, so every existing call site that
+  // passes target.pane routes to the right host without knowing nodes exist. A bare
+  // pane is the daemon node's, and its params object is passed through untouched.
+  const ref = params && typeof params.pane === 'string' && params.pane
+    ? nodes.parsePaneRef(params.pane) : null;
+  const node = ref && ref.qualified ? ref.node : (deps.node || daemonNodeName(deps));
+  const request = ref && ref.qualified ? { ...params, pane: ref.paneId } : params;
+  const channel = HOST_OPS_TYPES.has(type) ? 'ops' : 'control';
+  const state = hostChannel(node, channel);
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const notRetried = (reason, error) => {
     const detail = String(error && error.message || error).trim();
@@ -1985,14 +2029,14 @@ async function hostRequest(type, params, deps = {}) {
     ));
     let connectTimer;
     const client = await Promise.race([
-      hostClient({ ...deps, forceHostReconnect, hostConnectTimeoutMs: connectTimeoutMs }),
+      hostClientFor(node, { ...deps, forceHostReconnect, hostConnectTimeoutMs: connectTimeoutMs }, channel),
       new Promise((resolve) => { connectTimer = setTimeout(() => resolve(null), remaining); }),
     ]);
     if (connectTimer) clearTimeout(connectTimer);
     if (!client) {
-      const detail = String(hostFailureError && hostFailureError.message || '').trim();
+      const detail = String(state.failureError && state.failureError.message || '').trim();
       const error = new Error(pressure.annotate(`terminal host is unavailable${detail ? `: ${detail}` : ''}`),
-        hostFailureError ? { cause: hostFailureError } : undefined);
+        state.failureError ? { cause: state.failureError } : undefined);
       if (!idempotent) throw notRetried('was unavailable', error);
       retryDeadline = Math.min(retryDeadline, wallNow() + retryMs);
       if (wallNow() >= deadline || wallNow() >= retryDeadline) throw error;
@@ -2014,14 +2058,14 @@ async function hostRequest(type, params, deps = {}) {
         lastKnownHostPaneMemo.panes = null;
         lastKnownHostPaneMemo.at = 0;
       }
-      const result = await requestHostClient(client, type, params, {
+      const result = await requestHostClient(client, type, request, {
         ...deps, hostRequestTimeoutMs: attemptTimeoutMs,
       });
       if (['spawn', 'meta', 'kill', 'remove', 'resize', 'clear'].includes(type)) hostPaneCaches.delete(client);
       return result;
     } catch (error) {
       const disconnected = retryableHostError(error)
-        || (client === cachedHost && client.socket && client.socket.destroyed);
+        || (client === state.client && client.socket && client.socket.destroyed);
       const reloading = error && error.code === 'reloading';
       const timedOut = hostRequestTimedOut(error);
       if (disconnected) invalidateHost(client, deps, error);
@@ -2056,38 +2100,97 @@ function hostEndpointExists(deps = {}) {
   // Never throws: this runs inside the dashboard refresh, and a failed lookup only
   // means the endpoint is not evidence of anything.
   try {
-    if (typeof deps.hostEndpointExists === 'function') return Boolean(deps.hostEndpointExists());
-    return fs.existsSync(deps.hostSock || require('./hostclient.js').socketPath());
+    const node = deps.node || null;
+    if (typeof deps.hostEndpointExists === 'function') return Boolean(deps.hostEndpointExists(node));
+    if (!node || node === daemonNodeName(deps)) {
+      return fs.existsSync(deps.hostSock || require('./hostclient.js').socketPath());
+    }
+    // A remote node has no socket file to look at. Being configured is all the
+    // evidence there is that a host is supposed to be answering there.
+    const resolved = require('./node-registry.js').resolveNode(node);
+    return resolved.transport === 'tcp' ? true : fs.existsSync(resolved.sock);
   } catch { return false; }
 }
 
-async function listHostPaneResult(deps = {}, fresh = false) {
-  const client = await hostClient(deps);
-  if (!client) return { panes: null, failure: 'unreachable', endpoint: hostEndpointExists(deps) };
+// The node names to collect panes from: the daemon node first, so the list a
+// single-node install produces is the list it always produced.
+function hostNodeNames(deps = {}) {
+  if (Array.isArray(deps.hostNodes)) return deps.hostNodes;
+  const daemon = daemonNodeName(deps);
+  try {
+    const names = nodes.configuredNodeNames();
+    return names.includes(daemon) ? [daemon, ...names.filter((name) => name !== daemon)] : [daemon];
+  } catch { return [daemon]; }
+}
+
+async function listNodePaneResult(node, deps = {}, fresh = false, epoch = hostMutationEpoch) {
+  const client = await hostClientFor(node, deps);
+  if (!client) return { panes: null, failure: 'unreachable', endpoint: hostEndpointExists({ ...deps, node }) };
   const now = deps.now || Date.now;
   const cached = hostPaneCaches.get(client);
   if (!fresh && cached && now() - cached.at < HOST_PANE_CACHE_MS) return { panes: cached.panes, failure: null };
   try {
-    const epoch = hostMutationEpoch;
     const result = await requestHostClient(client, 'list', {}, deps);
     const panes = Array.isArray(result && result.panes) ? result.panes : [];
-    if (panes.some((p) => p?.alive && Number.isInteger(p.pid) && ['claude', 'codex'].includes(p.meta?.agent))) {
+    // The process table is this machine's, so it can only speak for this machine's
+    // panes; a remote pane's agent liveness is the remote node's to report.
+    if (node === daemonNodeName(deps)
+        && panes.some((p) => p?.alive && Number.isInteger(p.pid) && ['claude', 'codex'].includes(p.meta?.agent))) {
       try { annotatePaneAgents(panes, await (deps.agentProcessRows || agentProcessRows)(deps)); } catch {}
     }
     // A mutation that started while this list was in flight (or while it waited on
     // the process table) makes it a pre-mutation list: return it, remember nothing.
-    if (epoch === hostMutationEpoch) {
-      hostPaneCaches.set(client, { at: now(), panes });
-      const memo = deps.hostPaneMemo || lastKnownHostPaneMemo;
-      memo.panes = panes;
-      memo.at = now();
-    }
+    if (epoch === hostMutationEpoch) hostPaneCaches.set(client, { at: now(), panes });
     return { panes, failure: null };
   } catch (error) {
     if (retryableHostError(error) || (client.socket && client.socket.destroyed)) invalidateHost(client, deps, error);
     // A client existed, so a host answered this daemon at least this far.
     return { panes: null, failure: hostFailureKind(error), endpoint: true, error };
   }
+}
+
+// A remote pane is published under `<node>-<id>` and keeps the host's own id in
+// hostPaneId, so a request can be unqualified again on the way back out.
+function qualifyNodePanes(panes, node, daemon) {
+  if (node === daemon) return panes.map((pane) => ({ ...pane, node }));
+  return panes.map((pane) => ({
+    ...pane, node, id: nodes.formatPaneRef(node, pane.id, { KEEP_DAEMON_NODE: daemon }), hostPaneId: pane.id,
+  }));
+}
+
+async function listHostPaneResult(deps = {}, fresh = false) {
+  const epoch = hostMutationEpoch;
+  const names = hostNodeNames(deps);
+  const daemon = daemonNodeName(deps);
+  const now = deps.now || Date.now;
+  const results = await Promise.all(names.map(async (node) => [node, await listNodePaneResult(node, deps, fresh, epoch)]));
+  const primary = (results.find(([node]) => node === daemon) || results[0])[1];
+  const remember = (panes) => {
+    if (epoch !== hostMutationEpoch) return panes;
+    const memo = deps.hostPaneMemo || lastKnownHostPaneMemo;
+    memo.panes = panes;
+    memo.at = now();
+    return panes;
+  };
+  // One node is the whole fleet: the result is the one the daemon has always
+  // returned, pane for pane and field for field.
+  if (results.length === 1) {
+    if (Array.isArray(primary.panes)) remember(primary.panes);
+    return primary;
+  }
+  const status = {};
+  const merged = [];
+  for (const [node, result] of results) {
+    if (node === daemon) continue;
+    status[node] = Array.isArray(result.panes)
+      ? { ok: true }
+      : { ok: false, reason: result.failure || 'unreachable' };
+    if (Array.isArray(result.panes)) merged.push(...qualifyNodePanes(result.panes, node, daemon));
+  }
+  if (!Array.isArray(primary.panes)) return { ...primary, nodes: status };
+  const panes = [...qualifyNodePanes(primary.panes, daemon, daemon), ...merged];
+  remember(panes);
+  return { panes, failure: null, nodes: status };
 }
 
 async function listHostPanes(deps = {}, fresh = false) {
@@ -2164,9 +2267,30 @@ function urgentDashboardMutation(pathname) {
 // with it are a reused older list.
 // `epoch` is memo.epoch as it was when the lookup began: a mutation bumps it, so a list
 // collected before the mutation is neither remembered nor reused for a later build.
+// The other nodes' standing, alongside the daemon node's. Their panes travel in the
+// same list, so this only says which of them answered and since when one has not.
+function nodeStatusForPublish(result, memo, now) {
+  if (!result || !result.nodes) return null;
+  const tracked = memo.nodes || (memo.nodes = {});
+  const status = {};
+  for (const [name, reported] of Object.entries(result.nodes)) {
+    const entry = tracked[name] || (tracked[name] = { failingSince: 0 });
+    if (reported.ok) {
+      entry.failingSince = 0;
+      status[name] = { ok: true };
+      continue;
+    }
+    if (!entry.failingSince) entry.failingSince = now;
+    status[name] = { ok: false, reason: reported.reason || 'unreachable', since: entry.failingSince };
+  }
+  return status;
+}
+
 function hostPanesForPublish(result, memo, now, epoch = memo.epoch || 0) {
   const current = epoch === (memo.epoch || 0);
   const panes = result ? result.panes : null;
+  const nodeStatus = nodeStatusForPublish(result, memo, now);
+  const withNodes = (host) => (nodeStatus ? { ...host, nodes: nodeStatus } : host);
   if (Array.isArray(panes)) {
     if (current) {
       memo.panes = panes;
@@ -2174,7 +2298,7 @@ function hostPanesForPublish(result, memo, now, epoch = memo.epoch || 0) {
       memo.listed = true; // survives the mutation fence: this daemon has seen a host
       memo.failingSince = 0;
     }
-    return { panes, host: { ok: true } };
+    return { panes, host: withNodes({ ok: true }) };
   }
   const reason = (result && result.failure) || 'unreachable';
   // Nothing is bound to the host socket and this daemon has never listed a pane:
@@ -2183,27 +2307,32 @@ function hostPanesForPublish(result, memo, now, epoch = memo.epoch || 0) {
   // permanent warning on a console that is telling the truth. The socket is the
   // evidence, not the memo alone, because the host outlives daemon restarts.
   if (reason === 'unreachable' && !memo.listed && !(result && result.endpoint)) {
-    return { panes, host: { ok: true } };
+    return { panes, host: withNodes({ ok: true }) };
   }
   if (current && !memo.failingSince) memo.failingSince = now;
   const reuseMs = reason === 'timeout' ? HOST_PANES_SLOW_REUSE_MS : HOST_PANES_REUSE_MS;
   const reused = current && memo.panes && now - memo.at < reuseMs ? memo.panes : null;
   return {
     panes: reused || panes,
-    host: {
+    host: withNodes({
       ok: false,
       reason,
       since: (current && memo.failingSince) || now,
       stale: Boolean(reused),
       panesAt: reused ? memo.at : null,
-    },
+    }),
   };
 }
 
-function annotatePaneAgents(panes, rows) {
+function annotatePaneAgents(panes, rows, deps = {}) {
   const byPid = new Map(rows.map((row) => [row.pid, row]));
+  const daemon = daemonNodeName(deps);
   for (const pane of panes) {
     if (!pane?.alive || !['claude', 'codex', 'pi'].includes(pane.meta?.agent)) continue;
+    // Another node's pane has another machine's pid. Leaving agentAlive undefined
+    // says "not known here", which is the truth; reading it off this process table
+    // would be an answer about an unrelated process that happens to share a number.
+    if (pane.node && pane.node !== daemon) continue;
     const root = byPid.get(pane.pid);
     if (!root) continue; // An incomplete process snapshot is not proof of exit.
     const tree = new Set([pane.pid]);
@@ -12163,6 +12292,10 @@ module.exports = {
   SUGGESTION_PROBE_SETTLE_READS,
   isHostTarget,
   hostClient,
+  hostClientFor,
+  hostNodeNames,
+  listNodePaneResult,
+  sessionHostPane,
   closeHostClient,
   hostRequest,
   listHostPanes,

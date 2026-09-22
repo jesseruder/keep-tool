@@ -24,6 +24,42 @@ function localNode(env = process.env) {
 
 function isDaemonNode(env = process.env) { return localNode(env) === daemonNode(env); }
 
+// Pane ids are the daemon node's own, bare, exactly as they always were; a pane on
+// another node is named `<node>-<id>` so that one id identifies one pane across the
+// whole fleet. Every id-keyed surface — session.pane, layouts, delivery records, the
+// console DOM, `keep pane <id>` — therefore keeps working untouched on one node.
+//
+// The node list comes from the configuration, so this is memoised: a pane list asks
+// once per pane, and the answer changes only when `keep nodes add` rewrites the file.
+let nodeNameMemo = { at: 0, key: null, names: null };
+
+function configuredNodeNames(env = process.env) {
+  const key = `${env.KEEP_CONFIG || ''}\u0000${env.KEEP_DIR || ''}`;
+  const now = Date.now();
+  if (nodeNameMemo.names && nodeNameMemo.key === key && now - nodeNameMemo.at < 1000) return nodeNameMemo.names;
+  let names;
+  try { names = require('./node-registry.js').listNodes(env).map((node) => node.name); }
+  catch { names = [daemonNode(env)]; }
+  nodeNameMemo = { at: now, key, names };
+  return names;
+}
+
+function parsePaneRef(id, options = {}) {
+  const env = options.env || process.env;
+  const value = String(id == null ? '' : id);
+  const dash = value.indexOf('-');
+  if (dash <= 0) return { node: daemonNode(env), paneId: value, qualified: false };
+  const prefix = value.slice(0, dash);
+  const names = options.nodes || configuredNodeNames(env);
+  if (!names.includes(prefix)) return { node: daemonNode(env), paneId: value, qualified: false };
+  return { node: prefix, paneId: value.slice(dash + 1), qualified: true };
+}
+
+// The inverse: a pane on the daemon node keeps the id the host gave it.
+function formatPaneRef(node, paneId, env = process.env) {
+  return node === daemonNode(env) ? String(paneId) : `${node}-${paneId}`;
+}
+
 // One secret per node, each in its own file so a node can be added or revoked
 // without rewriting a shared one. A node presents its token to the daemon in
 // x-keep-node-token; nothing else in the registry grants that class.
@@ -53,4 +89,7 @@ function writeNodeToken(root, name) {
   return token;
 }
 
-module.exports = { NODE_NAME_RE, daemonNode, localNode, isDaemonNode, nodeTokens, writeNodeToken };
+module.exports = {
+  NODE_NAME_RE, daemonNode, localNode, isDaemonNode, nodeTokens, writeNodeToken,
+  configuredNodeNames, parsePaneRef, formatPaneRef,
+};

@@ -13199,3 +13199,64 @@ test('a session that runs on another node cannot be opened from this daemon node
   assert.equal(JSON.parse(fs.readFileSync(authorityFile, 'utf8')).node, 'main',
     'an ordinary reopen leaves the node it found');
 });
+
+test('the daemon merges two nodes into one pane list and routes by the qualified id', async (t) => {
+  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const {
+    closeHostClient, listHostPaneResult, hostRequest, hostPanesForPublish, sessionHostPane, hostNodeNames,
+  } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodes(t, async ({ aws1 }) => {
+    await closeHostClient();
+    const deps = { connectHost: connect };
+    try {
+      assert.deepEqual(hostNodeNames(deps), ['main', 'aws1']);
+      const local = (await hostRequest('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 5'] }, deps)).pane;
+      const remote = (await hostRequest('spawn', {
+        cmd: '/bin/sh', args: ['-c', 'sleep 5'], meta: { sessionId: 'remote-session', agent: 'claude' },
+      }, { ...deps, node: 'aws1' })).pane;
+      const qualified = `aws1-${remote.id}`;
+
+      const listed = await listHostPaneResult(deps, true);
+      const byId = new Map(listed.panes.map((pane) => [pane.id, pane]));
+      assert.deepEqual([...byId.keys()].sort(), [local.id, qualified].sort());
+      assert.equal(byId.get(local.id).node, 'main');
+      assert.equal(byId.get(local.id).hostPaneId, undefined, 'a daemon-node pane keeps its bare id and nothing else');
+      assert.equal(byId.get(qualified).node, 'aws1');
+      assert.equal(byId.get(qualified).hostPaneId, remote.id);
+      assert.equal(byId.get(qualified).agentAlive, undefined, 'a remote agent is not looked up in this machine process table');
+      assert.deepEqual(listed.nodes, { aws1: { ok: true } });
+
+      // The qualified id is enough to reach the second host: no call site changes.
+      assert.equal((await hostRequest('get', { pane: qualified }, deps)).pane.id, remote.id);
+      assert.equal((await hostRequest('get', { pane: local.id }, deps)).pane.id, local.id);
+      await assert.rejects(hostRequest('get', { pane: 'aws1-deadbeef' }, deps), /no such pane/);
+      assert.equal(sessionHostPane(listed.panes, 'remote-session').id, qualified);
+
+      await aws1.close();
+      const down = await listHostPaneResult({ ...deps, forceHostReconnect: true }, true);
+      assert.deepEqual(down.panes.map((pane) => pane.id), [local.id], 'a down node does not disturb the daemon node');
+      assert.deepEqual(down.nodes, { aws1: { ok: false, reason: 'unreachable' } });
+      const memo = { epoch: 0 };
+      assert.deepEqual(hostPanesForPublish(down, memo, 1000).host, {
+        ok: true, nodes: { aws1: { ok: false, reason: 'unreachable', since: 1000 } },
+      });
+      assert.equal(hostPanesForPublish(down, memo, 9000).host.nodes.aws1.since, 1000, 'the outage keeps its start time');
+    } finally { await closeHostClient(); }
+  });
+});
+
+test('a single-node install publishes no node status and no node column', async () => {
+  const { hostPanesForPublish, listHostPaneResult, closeHostClient } = require('./serve');
+  const memo = { epoch: 0 };
+  assert.deepEqual(hostPanesForPublish({ panes: [{ id: 'p1' }], failure: null }, memo, 1000).host, { ok: true });
+  assert.equal(memo.nodes, undefined);
+  const panes = [{ id: 'p1', meta: {} }];
+  const host = { request: async () => ({ panes }), socket: { destroyed: false } };
+  try {
+    // The same object, untouched: no node tag, no qualified id, no nodes map.
+    const listed = await listHostPaneResult({ host }, true);
+    assert.deepEqual(listed, { panes, failure: null });
+    assert.equal(listed.panes[0], panes[0]);
+  } finally { await closeHostClient(); }
+});
