@@ -888,8 +888,8 @@ async function run(body, deps = {}) {
     // nothing about this one.
     delete current.sourceExitEnterAt;
     delete current.sourceExitTypedAt;
-    delete current.forcedProcesses;
-    delete current.forcedCaptureIncomplete;
+    // forcedProcesses and forcedCaptureIncomplete are kept: an earlier forced stop may have
+    // left captured processes running, and this attempt must stop them too.
     // A new stop attempt is forced only if this request is Owner's own; an earlier forced
     // attempt on the same record says nothing about this one.
     if (!ownerForce) delete current.ownerForce;
@@ -933,7 +933,8 @@ async function run(body, deps = {}) {
     try {
       const result = await deps.restartSession({ sessionId: session.id, pane: pane.id, pid: pane.pid, mode: 'now',
         ...(force ? { force: true } : {}) }, {
-        ...deps.restartDeps, root, env, host: wrappedHost, resumeAccount: target, ownerForce, resumeMcpConfig: compatibility.mcpConfig,
+        ...deps.restartDeps, root, env, host: wrappedHost, resumeAccount: target, ownerForce,
+        priorForcedProcesses: Array.isArray(current.forcedProcesses) ? current.forcedProcesses : [], resumeMcpConfig: compatibility.mcpConfig,
         resumeModel: current.model, resumeArgv: current.resumeSpec?.argv, resumeCwd: current.resumeSpec ? current.cwd : null,
         allowTerminalRateLimit: true,
         // The /exit is typed, every check before its Enter has passed, and the Enter is the
@@ -949,7 +950,7 @@ async function run(body, deps = {}) {
         onForcedStop: (processes, { incomplete = false } = {}) => {
           // Called again whenever the captured tree grows; the Enter is the first call.
           current.sourceExitEnterAt ||= Date.now();
-          current.forcedProcesses = processes;
+          current.forcedProcesses = processes; // already includes an earlier attempt's survivors
           if (incomplete) current.forcedCaptureIncomplete = true;
           writeOne(root, current);
         },

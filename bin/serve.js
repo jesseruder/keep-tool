@@ -6356,6 +6356,12 @@ async function forceStopThenResume({ session, pane, identity, resume }, deps = {
     }
     return processes.length > before;
   };
+  // An earlier forced stop of this transfer that did not finish may have left processes it
+  // captured running, orphaned from this tree: they are this stop's too.
+  for (const prior of Array.isArray(deps.priorForcedProcesses) ? deps.priorForcedProcesses : []) {
+    if (!prior?.pidStart || processes.some((owned) => owned.pid === prior.pid)) continue;
+    if (snapshot.some((p) => same(p, prior) && !p.zombie)) processes.push({ pid: prior.pid, pidStart: prior.pidStart });
+  }
   grow(snapshot);
   if (!processes.some((p) => p.pid === identity.pid && p.pidStart === identity.pidStart)) {
     throw Error('Agent process identity changed during restart');

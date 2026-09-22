@@ -11446,6 +11446,18 @@ test('an Owner-forced restart signals only the captured process tree and resumes
     assert.deepEqual(journals, [[10, 11, 12], [10, 11, 12, 14]]);
     assert.ok(state.signals.some(([pid]) => pid === 14));
 
+    // A retry after a stop that did not finish also stops what that stop captured and
+    // orphaned (here worker 15, reparented to launchd), and waits for it.
+    Object.assign(state, { live: new Set([10, 11, 15]), calls: [], signals: [] });
+    const orphan = { pid: 15, ppid: 1, pidStart: 'orphan-start', args: 'node worker' };
+    const retried = deps({ ownerForce: true, priorForcedProcesses: [{ pid: 15, pidStart: 'orphan-start' }, { pid: 12, pidStart: 'gone' }],
+      forceRows: async () => [...table(), ...(state.live.has(15) ? [orphan] : [])] });
+    let carried;
+    retried.onForcedStop = (processes) => { carried = processes.map((p) => p.pid).sort(); };
+    assert.equal((await restartSession(body, retried)).ok, true);
+    assert.deepEqual(carried, [10, 11, 15]);
+    assert.ok(state.signals.some(([pid]) => pid === 15));
+
     // A tree that outgrows the capture is journalled as incomplete before the stop fails.
     Object.assign(state, { live: new Set([10, 11, 12]), calls: [], signals: [] });
     const marks = [];
