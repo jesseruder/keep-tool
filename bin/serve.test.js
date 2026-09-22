@@ -5475,6 +5475,23 @@ test('a scheduler that still owns the card is not tried twice', async () => {
   assert.deepEqual(f.resolved, ['linked']);
 });
 
+test('a due check passes over a thread on another node for one here', async () => {
+  const sessions = [
+    { id: 'sched', node: 'aws1', state: 'idle', mtime: 3000, endedTurn: true },
+    { id: 'linked', state: 'idle', mtime: 2000, endedTurn: true },
+  ];
+  const f = checkDeliveryFixture({ scheduled_by: 'sched', sessions: [{ id: 'linked', agent: 'claude' }] }, sessions);
+  const result = await deliverCheckToThread(f.task, f.deps);
+  assert.equal(result.sessionId, 'linked');
+  assert.deepEqual(f.resolved, ['linked'], 'the thread on aws1 is never resolved, let alone typed into');
+  assert.deepEqual(f.sent.map((entry) => entry.id), ['linked']);
+
+  // With nothing here to take it, the check is left to open fresh on this node.
+  const alone = checkDeliveryFixture({ scheduled_by: 'sched' }, sessions.slice(0, 1));
+  assert.equal(await deliverCheckToThread(alone.task, alone.deps), null);
+  assert.deepEqual(alone.sent, []);
+});
+
 function recordingHost(handler) {
   const calls = [];
   return {
@@ -10229,6 +10246,20 @@ test('API state exposes pane ids without copying obsolete viewer metadata', asyn
   assert.equal(state.sessions[0].viewer, undefined);
   assert.equal(state.sessions[1].pane, null);
   assert.equal(state.attention[0].pane, 'pane-hosted');
+});
+
+test('a check session Keep opens for itself lands on the daemon node', async () => {
+  const { openCheckSession, resolvePlacement } = require('./serve');
+  const opens = [];
+  await openCheckSession({ taskId: 'some-card', fresh: true, agent: 'claude', message: '[keep] check' },
+    { openSession: async (body, deps) => { opens.push({ body, launchMeta: deps.launchMeta }); return { sessionId: 's1' }; } });
+  assert.equal(opens[0].body.node, 'main');
+  assert.deepEqual(opens[0].launchMeta, { ephemeral: 'check' });
+
+  // Which is what the pin is for: without it, a card whose last session ran on aws1
+  // would put its check there, where nothing can deliver to it or reap it.
+  assert.equal(resolvePlacement({ lastCardNode: 'aws1' }, { hostNodes: ['main', 'aws1'] }), 'aws1');
+  assert.equal(resolvePlacement({ node: 'main', lastCardNode: 'aws1' }, { hostNodes: ['main', 'aws1'] }), 'main');
 });
 
 test('an account handoff and a rate-limit resume refuse a session on another node', async (t) => {

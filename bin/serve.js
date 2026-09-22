@@ -9835,6 +9835,9 @@ async function launchReviewQueueSession(request, deps = {}) {
     ...(request.model ? { model: request.model } : {}),
     message: request.message,
     reviewQueueLaunchId: request.launchId,
+    // The review queue's own session, reserved and driven from here: pinned to this
+    // node like every other session Keep opens for itself.
+    node: nodes.daemonNode(deps.env || process.env),
   }, {
     ...deps,
     loadTask: deps.loadTask || keep.loadTaskAnywhere,
@@ -12192,6 +12195,14 @@ async function deliverCheckToThread(task, deps = {}) {
     if (!ordered.length) return { deferred: true, uncertain: true, reason: 'Prior delivery unconfirmed; waiting for that same session, not launching another check' };
   }
   for (const candidate of ordered) {
+    // A thread on another node cannot take a delivery this daemon can confirm. The
+    // check falls through to the next candidate, and to opening a fresh session on
+    // this node if there is none — never to a message nobody receipts.
+    const elsewhere = remoteDeliveryRefusal(candidate, deps);
+    if (elsewhere) {
+      process.stderr.write(`keep serve: delivery candidate ${candidate.id.slice(0, 8)}: ${elsewhere.message}\n`);
+      continue;
+    }
     let session;
     let target;
     try {
@@ -12306,7 +12317,12 @@ async function closeEphemeralPane(pane, sessionId, deps = {}) {
 // The scheduler's opener, used by every caller that opens a session on a card the
 // scheduler would otherwise have opened one for.
 function openCheckSession(body, openDeps) {
-  return openSession(body, { ...openDeps, launchMeta: { ephemeral: 'check' } });
+  // Pinned to this node, the way self-repair and the area sessions pin theirs: a
+  // check runs the card's recipe, is delivered and reaped from here, and must not
+  // land on another machine merely because the card's last session did.
+  const open = (openDeps && openDeps.openSession) || openSession;
+  return open({ ...body, node: nodes.daemonNode((openDeps || {}).env || process.env) },
+    { ...openDeps, launchMeta: { ephemeral: 'check' } });
 }
 
 // `keep verify <id>` and the console's "Run check now": run a card's check recipe now
@@ -12356,6 +12372,9 @@ async function runTaskNow(taskId, prompt, deps = {}) {
   (deps.loadTask || keep.loadTask)(taskId); // refuse an unknown card before opening anything
   const opened = await (deps.open || openSession)({
     taskId, fresh: true, agent: 'claude', message: taskRunMessage(taskId, prompt),
+    // Here as in openCheckSession: a run Keep starts belongs to the daemon node,
+    // whatever the card's last session did.
+    node: nodes.daemonNode(deps.env || process.env),
   }, {});
   return { ok: true, sessionId: (opened && opened.sessionId) || null, pane: (opened && opened.pane) || null };
 }
@@ -12367,6 +12386,12 @@ async function deliverUnblockToThread(task, text) {
     excludedSessionIds(),
   );
   for (const candidate of candidates) {
+    // As with a check: a thread elsewhere is passed over, not typed into.
+    const elsewhere = remoteDeliveryRefusal(candidate);
+    if (elsewhere) {
+      process.stderr.write(`keep serve: unblock candidate ${candidate.id.slice(0, 8)}: ${elsewhere.message}\n`);
+      continue;
+    }
     let session;
     let target;
     try {
@@ -12476,6 +12501,10 @@ async function tellSession(body, deps = {}) {
   if (senderId && target.id === senderId) {
     throw new InjectionError(409, 'self: a session cannot tell itself', { reason: 'self' });
   }
+  // Before the ledger is read, let alone reserved: a message this daemon cannot
+  // confirm must not spend the sender's hour either.
+  const elsewhere = remoteDeliveryRefusal(target, deps);
+  if (elsewhere) throw elsewhere;
   const marked = (dir) => {
     try { return fs.existsSync(path.join(root, '.keep', dir, target.id)); } catch { return false; }
   };
@@ -12579,6 +12608,19 @@ async function tellSession(body, deps = {}) {
   return receipt;
 }
 
+// Delivery is a message with a receipt: the text is typed into a pane, confirmed
+// against this machine's screen and transcript, and journalled here so one that was
+// left unconfirmed can be finished rather than sent twice. A session on another node
+// has none of that here — its hooks write no receipts until phase 3 — so every
+// delivery path says so by name, and no journal is ever written for a pane elsewhere.
+function remoteDeliveryRefusal(sessionOrPane, deps = {}) {
+  const node = sessionNodeOf(sessionOrPane, deps);
+  if (node === daemonNodeName(deps)) return null;
+  return new InjectionError(409,
+    `keep tell is not available for a session on ${node}; receipts arrive with phase 3`,
+    { reason: 'remote-node' });
+}
+
 // A state note reaches the sibling sessions in the same checkout as information.
 // Not a gate, not a question, and never a reason to stop: the text says so, and
 // nothing here waits for an answer. Reviewer and spawned sessions are excluded
@@ -12612,6 +12654,13 @@ async function announceStateNote(id, deps = {}) {
   const failed = [];
   for (const candidate of candidates) {
     if (candidate.reviewer) continue; // the reviewer writes no code; it has nothing to coordinate
+    // A sibling on another machine is reported as unreached rather than silently
+    // passed over: the note says something about a checkout it also has open.
+    const elsewhere = remoteDeliveryRefusal(candidate, deps);
+    if (elsewhere) {
+      failed.push({ sessionId: candidate.id, reason: elsewhere.message });
+      continue;
+    }
     try {
       await send(candidate.id, text);
       sent.push(candidate.id);
@@ -12623,6 +12672,8 @@ async function announceStateNote(id, deps = {}) {
 }
 
 function sendReviewerMessage(sessionId, text, opts) {
+  const elsewhere = remoteDeliveryRefusal({ sessionId });
+  if (elsewhere) throw elsewhere;
   return sendToSession(
     { sessionId, text },
     { ...review.readReviewerMarker(sessionId), bootstrap: Boolean(opts && opts.bootstrap) },
@@ -13393,7 +13444,7 @@ module.exports = {
   agentProcessRows, parseProcessTable, agentRowUnreadable, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession, reopenSessionOnAccount,
-  runCheckNow, runTaskNow, taskRunMessage, adoptedPaneMeta, closeEphemeralPane, resolveOpener, inheritedOpener,
+  runCheckNow, runTaskNow, openCheckSession, taskRunMessage, adoptedPaneMeta, closeEphemeralPane, resolveOpener, inheritedOpener,
   transcriptFileForSession,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,

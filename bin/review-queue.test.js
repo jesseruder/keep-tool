@@ -444,11 +444,13 @@ test('serve launcher suppresses card linking for Discuss and preserves it for St
     agent: 'claude', accountId: 'claude/default', model: '', onLaunched: () => {} };
   await launchReviewQueueSession({ ...base, action: 'discuss' }, { openSession, linkLaunchedSession: link, loadTask: () => ({}) });
   await launchReviewQueueSession({ ...base, action: 'start' }, { openSession, linkLaunchedSession: link, loadTask: () => ({}) });
+  // `node` is pinned: a queue launch is reserved, delivered and recovered from the
+  // daemon node, so it never follows a card whose last session ran on another.
   assert.deepEqual(captures.map((capture) => capture.body), [
     { taskId: 'card-one', fresh: true, agent: 'claude', accountId: 'claude/default',
-      message: 'pointer', reviewQueueLaunchId: 'launch-one' },
+      message: 'pointer', reviewQueueLaunchId: 'launch-one', node: 'main' },
     { taskId: 'card-one', fresh: true, agent: 'claude', accountId: 'claude/default',
-      message: 'pointer', reviewQueueLaunchId: 'launch-one' },
+      message: 'pointer', reviewQueueLaunchId: 'launch-one', node: 'main' },
   ]);
   assert.equal(captures[0].deps.randomUUID(), 'reserved');
   assert.equal(captures[0].deps.linkLaunchedSession(), null);

@@ -105,6 +105,34 @@ test('the daemon refuses the sender itself, the reviewer, and a keep-spawned run
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('a session on another node is refused by name, and nothing is reserved for it', async () => {
+  const root = tmpRoot('tell-remote-node');
+  try {
+    // The row the fleet publishes for a pane on aws1: the node stamp and the
+    // qualified pane id.
+    const far = liveSession('far-session', { node: 'aws1', pane: 'p1@aws1' });
+    const sent = [];
+    const deps = tellDeps(root, [far, liveSession('here-session')], {
+      loadTask: (id) => (id === 'far-card' ? { id, fm: { sessions: [{ id: 'far-session' }] } } : null),
+      watcherSend: async (request) => { sent.push(request); return {}; },
+    });
+    const refused = (error) => error.status === 409 && error.extra.reason === 'remote-node'
+      && error.message === 'keep tell is not available for a session on aws1; receipts arrive with phase 3';
+    await assert.rejects(tellSession({ sessionId: 'far-session', text: 'ping' }, deps), refused);
+    // And by card: the card's only live thread is that session.
+    await assert.rejects(tellSession({ taskId: 'far-card', text: 'ping' }, deps), refused);
+    assert.deepEqual(sent, [], 'nothing was typed at a pane whose receipt cannot be read');
+    // No hourly slot spent, and no delivery journal: the refusal lands before either.
+    assert.equal(fs.existsSync(tell.ledgerFile(root)), false);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'delivery')), false);
+
+    // The same daemon still delivers to its own, unchanged.
+    const here = await tellSession({ sessionId: 'here-session', text: 'ping' }, deps);
+    assert.equal(here.sessionId, 'here-session');
+    assert.equal(sent.length, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a card resolves to its live linked session, and says so when it has none', async () => {
   const root = tmpRoot('tell-card');
   try {
