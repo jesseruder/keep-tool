@@ -467,8 +467,14 @@ function shellProject(ctx) {
 
 export function renderRail(ctx, items) {
   const rail = document.querySelector('#rail');
-  const counted = [...new Map(items.filter((item) => item.kind === 'pinned'
-    || (item.kind === 'running' && ctx.isMarkedRunning(item))
+  // The rail follows the queue's two live groups: Waiting on you and Running &
+  // waiting. A pinned or recent session is navigation, not work in flight, so
+  // its project earns no icon — the rail would otherwise keep a row for every
+  // project ever opened, long after its last session went quiet. The caller
+  // passes those two groups only; the kind test is spelled out here as well,
+  // since renderRail is the one place that decides what an icon means.
+  const railItems = items.filter((item) => !['pinned', 'recent'].includes(item.kind));
+  const counted = [...new Map(railItems.filter((item) => (item.kind === 'running' && ctx.isMarkedRunning(item))
     || !ctx.state.dismissed.has(ctx.itemKey(item))).map((item) => [ctx.itemKey(item), item])).values()];
   const counts = new Map();
   for (const item of counted) {
@@ -1129,7 +1135,10 @@ export function renderTriage(ctx) {
     ctx.state.selectedKey = key;
     ctx.state.currentItem = focusItem || null;
   }
-  renderRail(ctx, [...items, ...ctx.runningItems(), ...ctx.pinnedItems()]
+  // Waiting on you and Running & waiting, before the project filter narrows
+  // them: the rail has to list the projects it lets you filter to. Pinned and
+  // Recent are left out on purpose — see renderRail().
+  renderRail(ctx, [...items, ...ctx.runningItems()]
     .filter((item) => !ctx.state.providerFilter || itemProvider(ctx, item) === ctx.state.providerFilter));
   const queue = renderQueue(ctx, waiting, running, pinned, recent, dismissed);
   renderStage(ctx, queue, focusItem, running, pinned);

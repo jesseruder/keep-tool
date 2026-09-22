@@ -201,10 +201,8 @@ test('Recent limits after filtering so older matching clients remain reachable',
   assert.deepEqual(Array.from(context.recentItems(), (item) => item.sessionId), ['codex-b']);
 });
 
-test('rail client controls remain separate from project controls when expanded or collapsed', async () => {
-  const { renderRail } = await import('./triage.js');
-  const previousDocument = globalThis.document;
-  const rail = {
+function railStub() {
+  return {
     classList: { toggle() {} },
     _html: '', _buttons: {},
     get innerHTML() { return this._html; },
@@ -216,6 +214,75 @@ test('rail client controls remain separate from project controls when expanded o
         .map((match) => ({ dataset: { [field]: match[1] }, addEventListener(_type, handler) { this.click = handler; } }));
     },
   };
+}
+
+// The rail's own ctx: every project is its own key, so the icons read back as paths.
+function railCtx() {
+  const ctx = ctxFor({ scopes: { names: ['personal'] } });
+  ctx.state = { filter: null, providerFilter: null, collapsed: { rail: false }, dismissed: new Set(), selected: 0 };
+  ctx.projectOf = (path) => ({ key: path, path, name: path.split('/').pop(), scope: 'personal' });
+  ctx.projectIcon = () => '<i></i>';
+  ctx.knownProjects = () => ['/work/a', '/work/b', '/work/c', '/work/d'].map(ctx.projectOf);
+  ctx.triageItems = () => [];
+  ctx.isMarkedRunning = () => false;
+  ctx.setSelected = () => {};
+  ctx.toggleCollapsed = () => {};
+  return ctx;
+}
+
+test('the rail lists the projects waiting on you or running, not every project with a session', async () => {
+  const { renderRail } = await import('./triage.js');
+  const previousDocument = globalThis.document;
+  const rail = railStub();
+  globalThis.document = { querySelector: (selector) => selector === '#rail' ? rail : null };
+  const listed = () => [...rail.innerHTML.matchAll(/data-project="([^"]*)"/g)].map((match) => match[1]);
+  try {
+    const ctx = railCtx();
+    const rows = [
+      { kind: 'question', sessionId: 'waiting', project: '/work/a' },
+      { kind: 'running', sessionId: 'running', project: '/work/b' },
+      { kind: 'pinned', sessionId: 'pinned', project: '/work/c' },
+      { kind: 'recent', sessionId: 'recent', project: '/work/d' },
+    ];
+    renderRail(ctx, rows);
+    assert.deepEqual(listed(), ['', '/work/a', '/work/b'],
+      'a project whose only session is pinned or recent gets no icon');
+    assert.match(rail.innerHTML, /data-project="\/work\/a"[^>]*>.*?<span class="c hot">1<\/span>/);
+    assert.match(rail.innerHTML, /class="all[^"]*">.*?<span class="c hot">2<\/span>/,
+      'All counts what the icons count');
+
+    // Filtering to a pinned-only project is the way back out of it: the rail
+    // keeps the current filter listed even when nothing there is waiting.
+    ctx.state.filter = '/work/c';
+    renderRail(ctx, rows);
+    assert.deepEqual(listed(), ['', '/work/a', '/work/b', '/work/c']);
+
+    ctx.state.filter = null;
+    ctx.state.dismissed = new Set(['waiting', 'marked']);
+    ctx.isMarkedRunning = (item) => item.sessionId === 'marked';
+    renderRail(ctx, [
+      { kind: 'question', sessionId: 'waiting', project: '/work/a' },
+      { kind: 'running', sessionId: 'marked', project: '/work/b' },
+    ]);
+    assert.deepEqual(listed(), ['', '/work/b'],
+      'a dismissed request drops its project; a session marked running keeps its own');
+
+    ctx.state.dismissed = new Set();
+    ctx.data.tasks = [{ id: 'one', fm: { status: 'inbox', project: '/work/d' } }];
+    renderRail(ctx, rows);
+    assert.deepEqual(listed(), ['', '/work/a', '/work/b', '/work/d'],
+      'a project with inbox cards stays filterable');
+    assert.match(rail.innerHTML, /data-project="\/work\/d"[^>]*>.*?<span class="c "><\/span>/,
+      'and is listed without a count');
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test('rail client controls remain separate from project controls when expanded or collapsed', async () => {
+  const { renderRail } = await import('./triage.js');
+  const previousDocument = globalThis.document;
+  const rail = railStub();
   globalThis.document = { querySelector: (selector) => selector === '#rail' ? rail : null };
   try {
     const ctx = ctxFor({ scopes: { names: ['personal'] } });
