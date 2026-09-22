@@ -58,11 +58,25 @@ function resolve(property, ancestors, ast) {
     if (!suffix) return null;
     result = { suffix };
   } else return null;
-  // Metadata never escapes or mutates, and the tool inventory isn't shadowed.
+  // Metadata never escapes or mutates, and the tool inventory isn't shadowed:
+  // the binding appears only as the key of a `tools[<name>.name]` dispatch, so
+  // no assignment, destructuring or loop target can rewrite what it names.
+  const parents = new Map(nodes.map(({ node, parent }) => [node, parent]));
+  let regexes = 0;
   for (const { node, parent } of nodes) {
     if (node.type === 'Identifier' && node.name === 'ALL_TOOLS' && node !== call.callee.object) return null;
-    if (node.type === 'Identifier' && node.name === name && node !== d.id
-        && !(parent?.type === 'MemberExpression' && parent.object === node && !parent.computed && !parent.optional && parent.property.name === 'name')) return null;
+    if (node.type === 'Identifier' && node.name === name && node !== d.id) {
+      const dispatch = parents.get(parent);
+      if (!(parent?.type === 'MemberExpression' && parent.object === node && !parent.computed && !parent.optional && parent.property.name === 'name'
+          && dispatch?.type === 'MemberExpression' && dispatch.computed && dispatch.property === parent
+          && dispatch.object.type === 'Identifier' && dispatch.object.name === 'tools')) return null;
+    }
+    if (node.type === 'Literal' && node.regex && ++regexes > 1 && !Array.isArray(result)) return null;
+    // No other regex instance, reflection, dynamic code or rebinding scope can reach RegExp.prototype.test.
+    if (!Array.isArray(result) && ['Super', 'WithStatement', 'ImportExpression'].includes(node.type)) return null;
+    if (!Array.isArray(result) && node.type === 'CallExpression' && node.callee.type === 'Identifier'
+        && /^set(?:Timeout|Interval|Immediate)$/.test(node.callee.name) && !/Function/.test(node.arguments[0]?.type || '')
+        && !resolver(node.arguments[0], parents)) return null;
     if (['AssignmentExpression', 'UpdateExpression', 'UnaryExpression'].includes(node.type)) {
       const target = node.left || node.argument;
       if (target?.type === 'MemberExpression' && target.object.name === name) return null;
@@ -79,8 +93,26 @@ function resolve(property, ancestors, ast) {
   return result;
 }
 
+// `new Promise(r => setTimeout(r, ms))`: the callback is the promise's own resolver.
+function resolver(arg, parents) {
+  if (arg?.type !== 'Identifier') return false;
+  for (let node = parents.get(arg); node; node = parents.get(node)) {
+    if (!/Function/.test(node.type)) continue;
+    const outer = parents.get(node);
+    return node.params.length >= 1 && node.params[0].type === 'Identifier' && node.params[0].name === arg.name
+      && outer?.type === 'NewExpression' && outer.callee.type === 'Identifier' && outer.callee.name === 'Promise'
+      && outer.arguments[0] === node && !rebound('Promise', parents);
+  }
+  return false;
+}
+// Any use of the name other than `new X(...)` or `X.member` may declare or reassign it.
+const rebound = (name, parents) => [...parents.keys()].some(node => node.type === 'Identifier' && node.name === name
+  && !['NewExpression', 'MemberExpression'].includes(parents.get(node)?.type));
+
 const REFLECTIVE = new Set(['RegExp', 'Reflect', 'Symbol', 'Object', 'Proxy', 'globalThis', 'eval', 'Function',
-  'prototype', '__proto__', 'constructor', 'defineProperty', 'defineProperties', 'setPrototypeOf', 'exec', 'lastIndex']);
+  'prototype', '__proto__', 'constructor', 'defineProperty', 'defineProperties', 'setPrototypeOf', 'exec', 'lastIndex',
+  'getPrototypeOf', 'getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', 'isPrototypeOf',
+  '__lookupGetter__', '__lookupSetter__', '__defineGetter__', '__defineSetter__', 'require', 'module', 'process']);
 
 // The literal every match of a `$`-anchored pattern must end with, or null when
 // that is not certain (alternation, flags other than `i`, a class or group or

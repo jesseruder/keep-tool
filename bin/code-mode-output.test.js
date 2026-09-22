@@ -69,6 +69,7 @@ test('an ALL_TOOLS.find by a $-anchored regex is not a child call unless its lit
     'const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));text(await tools[t.name]({}));',
     'const t=ALL_TOOLS.find(x=>/^mcp__.*__get_page_text$/i.test(x.name));const r=await tools[t.name]({tabId:1});text(r[0]);',
     'const t=ALL_TOOLS.find(x=>/browser\\.navigate$/.test(x.name));await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));await new Promise(r=>setTimeout(r,500));text(await tools[t.name]({}));',
   ]) assert.equal(hasChildCall(code), false, code);
   for (const code of [
     'const t=ALL_TOOLS.find(x=>/agent$/.test(x.name));await tools[t.name]({});', // could be spawn_agent
@@ -91,6 +92,13 @@ test('an ALL_TOOLS.find by a $-anchored regex is not a child call unless its lit
     'const {__proto__: p} = /x/;p.test=()=>true;const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));await tools[t.name]({});',
     'const k="__pro"+"to__";const {[k]: p} = /x/;p.test=()=>true;const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));await tools[t.name]({});',
     'const o={["x"]:1};const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));[t.name]=["spawn_"+"agent"];await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));({a:t.name}={a:"spawn_"+"agent"});await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));for(t.name of ["spawn_"+"agent"]){}await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>x.name==="tabs_context_mcp");[t.name]=["spawn_"+"agent"];await tools[t.name]({});',
+    'const g=/x/.__lookupGetter__("__pro"+"to__");const p=g.call(/x/);p.test=()=>true;const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));await tools[t.name]({});',
+    'const p=/x/;const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));await tools[t.name]({});',
+    'setTimeout("x");const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));await tools[t.name]({});',
     'const t=ALL_TOOLS.find(x=>/tabs_mcp$/.test(y.name));await tools[t.name]({});',
   ]) assert.equal(hasChildCall(code), true, code);
 });
