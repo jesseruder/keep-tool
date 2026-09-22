@@ -4025,6 +4025,15 @@ function noteSeenModel(model, configDir, file = latestOpusFile()) {
   }
 }
 
+// The account a Claude session runs under, read off its own transcript path — the same
+// derivation `noteSeenModel` is keyed by. Not the settings file: most compaction paths
+// pass none and would fall back to the default account's.
+function sessionClaudeConfigDir(session, deps = {}) {
+  if (!session || session.kind !== 'claude') return '';
+  try { return claudeConfigDirOf((deps.transcriptFileForSession || transcriptFileForSession)(session)); }
+  catch { return ''; }
+}
+
 // `configDir` names the account the switch will be typed in; without one only the floor
 // is safe. `seen` replaces the recorded models (tests).
 function compactViaModel({ configDir = '', seen, file } = {}) {
@@ -5111,7 +5120,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
   const policy = deps.compactionPolicy || null;
   const pendingRecordValue = session?.kind === 'claude' ? readPendingCompactSwap(session && session.id, dir) : null;
   const pendingRecord = codexCompact.isCodexCompactSwap(pendingRecordValue) ? null : pendingRecordValue;
-  const configuredVia = compactViaModel({ configDir: claudeConfigDirOf(deps.compactSettingsFile || claudeSettingsPath()) });
+  const configuredVia = compactViaModel({ configDir: sessionClaudeConfigDir(session, deps) });
   const settingsFile = deps.compactSettingsFile || claudeSettingsPath();
   if (pendingRecord && compactSwapSettingsFile(pendingRecord, deps) !== settingsFile) {
     return { compacted: false, restoreUnconfirmed: true,
@@ -13148,6 +13157,7 @@ module.exports = {
   noteSeenModel,
   readLatestOpusSeen,
   claudeConfigDirOf,
+  sessionClaudeConfigDir,
   shutdownSettingsRepair,
   readClaudeSettingsModel,
   linesAfterLastEcho,

@@ -150,6 +150,7 @@ const {
   noteSeenModel,
   readLatestOpusSeen,
   claudeConfigDirOf,
+  sessionClaudeConfigDir,
 } = require('./serve.js');
 const { createScreenHistoryCache } = require('./screen-history.js');
 
@@ -12297,6 +12298,11 @@ test('the compaction switch types a full model id, with the 1M window the restor
     assert.equal(claudeConfigDirOf(path.join(main, 'projects', '-Users-x-repo', 'abc.jsonl')), main);
     assert.equal(claudeConfigDirOf(path.join(main, 'sessions', 'abc.json')), '');
     assert.equal(claudeConfigDirOf(''), '');
+    const transcript = path.join(other, 'projects', '-Users-x-repo', 'abc.jsonl');
+    assert.equal(sessionClaudeConfigDir({ kind: 'claude', id: 'abc' }, { transcriptFileForSession: () => transcript }), other,
+      'the switch is keyed by the session\'s own account, not the default settings file');
+    assert.equal(sessionClaudeConfigDir({ kind: 'codex', id: 'abc' }, { transcriptFileForSession: () => transcript }), '');
+    assert.equal(sessionClaudeConfigDir({ kind: 'claude', id: 'abc' }, { transcriptFileForSession: () => { throw new Error('remote'); } }), '');
   } finally {
     if (prior === undefined) delete process.env.KEEP_COMPACT_VIA_MODEL; else process.env.KEEP_COMPACT_VIA_MODEL = prior;
     fs.rmSync(opusRoot, { recursive: true, force: true });
