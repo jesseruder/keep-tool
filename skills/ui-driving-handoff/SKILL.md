@@ -11,6 +11,18 @@ Owner has authorized this routing without a model-choice question. Honor explici
 user model choices. Single quick actions can stay in the primary when a handoff
 would cost more than it saves.
 
+## Dev-loop checks versus flows
+
+A check that sits inside an edit loop can stay in the primary: edit, reload, one
+probe or screenshot, then the next edit. Hand off anything that stands on its own:
+a QA pass, a playthrough, a device session, or any run of more than about five UI
+actions with no code edit between them. Browser Bridge JavaScript that drives a UI
+step by step (dispatching input, waiting, reading state) counts as UI driving, not
+as an exempt test script. Keep interpretation in the primary by asking the worker
+for screenshots and measured values, then judging them yourself. Once the primary
+has started driving, notice when the edit loop has stopped and the work has become
+a standalone flow; that is the moment to hand it off rather than keep going.
+
 ## Browser Bridge for interactive checks
 
 For an interactive UI smoke check without a user-selected browser, first look for
