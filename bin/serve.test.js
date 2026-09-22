@@ -10231,6 +10231,43 @@ test('API state exposes pane ids without copying obsolete viewer metadata', asyn
   assert.equal(state.attention[0].pane, 'pane-hosted');
 });
 
+test('an account handoff and a rate-limit resume refuse a session on another node', async (t) => {
+  const { handoffSession, handoffSessionRequest, resumeAfterLimit } = require('./serve');
+  const refusal = (error) => error.status === 409
+    && error.message === 'account handoff is not available for a session on aws1';
+  // The pane says which machine, so nothing has to be read to know this cannot run.
+  await assert.rejects(handoffSession({ sessionId: 'far', pane: 'p1@aws1', accountId: 'two' }), refusal);
+  // And the console's transfer, which would otherwise hand the refusal to the queue.
+  await assert.rejects(handoffSessionRequest({ sessionId: 'far', pane: 'p1@aws1', accountId: 'two', queueOnTransient: true },
+    { handoffSession: async () => { throw new Error('ran the transfer for a session on another machine'); } }), refusal);
+  // A transient refusal for a session on another node is not queued for a retry
+  // that could only be refused again — and the queue decision costs no state build.
+  const record = { status: 'recovery-needed', refusalClass: 'transient', intent: 'continue',
+    sessionId: 'far', pane: 'p1@aws1', reason: 'the injection lock was held' };
+  const lines = [];
+  const stderr = process.stderr.write;
+  process.stderr.write = (line) => { lines.push(String(line)); return true; };
+  let queued;
+  try {
+    queued = await require('./serve').queueRefusedHandoff({ sessionId: 'far', pane: 'p1@aws1' }, record, Date.now(), {
+      handoffQueueState: async () => { throw new Error('built fleet state for a session on another machine'); },
+    });
+  } finally { process.stderr.write = stderr; }
+  assert.equal(queued, null);
+  assert.deepEqual(lines, ['keep serve: not queuing far: the session runs on aws1\n']);
+
+  // The rate-limit resume sends keystrokes, so it is refused in its own right.
+  await assert.rejects(
+    resumeAfterLimit('far', 'continue', { hitAt: 1 }, {
+      withInjectionLock: async (fn) => fn(),
+      loadCurrentSession: () => ({ id: 'far', kind: 'claude', pane: 'p1@aws1', rateLimit: { at: 1 }, endedTurn: true }),
+      resolveSessionTarget: async () => { throw new Error('resolved a pane on another machine'); },
+    }),
+    (error) => error.status === 409
+      && error.message === 'rate-limit resume is not available for a session on aws1',
+  );
+});
+
 test('a published session says which machine it is on, and only when it is not this one', async () => {
   const { sessionNodeOf, remoteSession } = require('./serve');
   const local = { id: 'p1', alive: true, node: 'main', cwd: '/tmp/project',

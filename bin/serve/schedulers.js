@@ -226,7 +226,7 @@ function startSchedulers(ctx) {
     deps, discord, driftWakeFromVerdict, envNumber, features, forceRestartSession, fs, health, hostRequest,
     ideas, keep, keepConsole, landed, limitresume, listHostPaneResult, listHostPanes, liveSessionTick,
     liveTurnIndexSessions, loadCurrentSession, openCheckSession, openSession, path,
-    prepareSessionSummary, readLiveSessionLedger, readScreenResult, resolveSessionTarget, restartSession,
+    prepareSessionSummary, readLiveSessionLedger, readScreenResult, remoteSession, resolveSessionTarget, restartSession,
     resumeAfterLimit,
     review, reviewDeps, runs, scanSessions, sendToResolvedTarget, sendToSession, sessionSummarySnapshot, slack,
     stallAliveIds, stalled, stalledSessionSnapshot, standup, startAutoCompact, startBriefScheduler,
@@ -446,7 +446,11 @@ function startSchedulers(ctx) {
     });
   }
   limitresume.startScheduler({
-    scanSessions,
+    // The resume reads a transcript here to prove the session is parked and types
+    // "continue" into its pane on the strength of it. A session on another node has
+    // neither here, so it never reaches the decision: no ledger entry, no daily-cap
+    // spend and no dashboard skip is written for a machine this one cannot see into.
+    scanSessions: () => scanSessions().filter((session) => !remoteSession(session, deps)),
     getUsage: usage.getUsage,
     send: (sessionId, text, opts) => resumeAfterLimit(sessionId, text, opts),
     root: keep.ROOT,

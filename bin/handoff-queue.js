@@ -22,6 +22,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const accounts = require('./accounts');
+const nodes = require('./nodes.js');
 const { classifyRefusal } = require('./account-handoff');
 
 // 20s, 40s, 80s, 160s, then every 3 minutes. The first retry is deliberately
@@ -233,6 +234,10 @@ function policyEnqueue(root, sessions, now, deps, log) {
     const sourceAccountId = accountOf(session);
     const targetAccountId = sourceAccountId && map[sourceAccountId];
     if (!targetAccountId || session.kind !== 'claude' || !session.rateLimit || !session.pane) continue;
+    // A transfer stops an agent and proves it from a process table; a session on
+    // another machine answers none of that here, and the retry this entry promises
+    // could only ever be refused. Never enqueued at all.
+    if (nodes.isRemotePane(session)) continue;
     // A parked or cancelled entry is waiting on a person; the policy never
     // overrules that, so only the console's Retry starts one of those again.
     const current = readOne(root, session.id);
@@ -481,6 +486,9 @@ function batch(deps = {}) {
     if (on !== sourceAccountId) { if (named) skipped.push({ sessionId: session.id, reason: 'not on the source account' }); continue; }
     if (!session.rateLimit) { if (named) skipped.push({ sessionId: session.id, reason: 'not rate limited' }); continue; }
     if (!session.pane) { skipped.push({ sessionId: session.id, reason: 'no live pane' }); continue; }
+    // Said out loud rather than passed over, so a person who asked for every
+    // rate-limited session on an account is told which ones this machine cannot move.
+    if (nodes.isRemotePane(session)) { skipped.push({ sessionId: session.id, reason: `session runs on ${session.node}` }); continue; }
     const current = readOne(root, session.id);
     if (current && current.status === 'queued') { skipped.push({ sessionId: session.id, reason: 'already queued' }); continue; }
     enqueue(root, { sessionId: session.id, pane: session.pane, sourceAccountId, targetAccountId, force,

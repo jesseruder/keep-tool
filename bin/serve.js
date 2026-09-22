@@ -8260,6 +8260,13 @@ async function resumeAfterLimit(sessionId, text, { hitAt } = {}, deps = {}) {
   const lock = deps.withInjectionLock || withInjectionLock;
   return lock(async () => {
     const session = load(sessionId);
+    // The pane this would type into, and the transcript that says it is parked,
+    // both have to be this machine's. A direct caller is refused here the way the
+    // scheduler's session list refuses one before it ever decides.
+    const node = sessionNodeOf({ sessionId, pane: session && session.pane }, deps);
+    if (node !== daemonNodeName(deps)) {
+      throw new InjectionError(409, `rate-limit resume is not available for a session on ${node}`);
+    }
     // 'session moved on' is the one refusal that is not a failure: nothing went
     // wrong, the stall simply ended, so the caller drops the entry instead of
     // spending an attempt on it.
@@ -11529,7 +11536,20 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
   return launched;
 }
 
+// An account transfer stops one agent, rewrites this machine's account authority
+// and starts the conversation again from a transcript here, proving each step from
+// this machine's process table. A session on another node is refused before any of
+// it begins — account-handoff.run would refuse a qualified pane too, but with
+// nothing to tell a person about which machine the session is actually on.
+function refuseRemoteHandoff(body, deps = {}) {
+  const node = sessionNodeOf({ sessionId: body?.sessionId, pane: body?.pane }, deps);
+  if (node !== daemonNodeName(deps)) {
+    throw new InjectionError(409, `account handoff is not available for a session on ${node}`);
+  }
+}
+
 async function handoffSession(body, deps = {}) {
+  refuseRemoteHandoff(body, deps);
   const root = deps.root || keep.ROOT;
   const deliveryDirectory = deps.deliveryDirectory || path.join(root, '.keep', 'delivery');
   return require('./account-handoff').run(body, {
@@ -11614,6 +11634,11 @@ async function queueRefusedHandoff(body, record, requestedAt, deps = {}) {
     process.stderr.write(`keep serve: not queuing ${sessionId}: ${why}\n`);
     return null;
   };
+  // The queue's only side effect is calling handoffSession again, and that transfer
+  // cannot run from here for a session on another machine. Nothing is queued that
+  // could only ever be refused.
+  const node = sessionNodeOf({ sessionId, pane }, deps);
+  if (node !== daemonNodeName(deps)) return skip(`the session runs on ${node}`);
   // Order matters, and it is the order of how long each answer stays true. The state
   // build is the slow one, so it goes first and everything after it is fresher than it
   // is; the `ps` snapshot is next, because a process described before that build would
@@ -11663,6 +11688,9 @@ async function queueRefusedHandoff(body, record, requestedAt, deps = {}) {
 // route and does not ask: it reports the refusal to whoever typed it, unchanged.
 async function handoffSessionRequest(body, deps = {}) {
   const { queueOnTransient, ...request } = body && typeof body === 'object' ? body : {};
+  // Before the queue is offered one: a transfer that cannot run here must not be
+  // retried here either, whatever the caller asked for.
+  refuseRemoteHandoff(request, deps);
   const run = deps.handoffSession || handoffSession;
   // An Owner-forced transfer has nothing left to wait out, and a queued retry would run
   // without Owner behind it; its refusal goes straight back to the person who clicked.
@@ -13019,7 +13047,7 @@ function start(deps = {}) {
     loadCurrentSession, notifications, openCheckSession, openSession, path, portableTransferDraft,
     portableTransferPreview, preparePortableTransfer, prepareSessionSummary, projectMobileState,
     readBody, readLiveSessionLedger, readScreenResult, recentTranscriptText, recoverReviewQueueLaunch, reminders,
-    reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, resolveSessionTarget,
+    remoteSession, reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, resolveSessionTarget,
     restartSession,
     restorePlan, resumeAfterLimit, review, reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow,
     runTaskNow, runs, scanSessions, screenHistorySession, screenSession, sendSessionKeys,
@@ -13369,7 +13397,7 @@ module.exports = {
   transcriptFileForSession,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,
-  handoffQueueSessions, handoffQueueTick, handoffRateLimited, cancelQueuedHandoff, handoffSessionRequest,
+  handoffQueueSessions, handoffQueueTick, handoffRateLimited, cancelQueuedHandoff, handoffSessionRequest, queueRefusedHandoff,
   listPortableTransfers, inspectPortableSource, portableTerminalRateLimitEvidence,
   portableTransferDraft, preparePortableTransfer,
   portableTransferPreview, transferSession, resolvePortableTransfer, recoverPortableOpening,

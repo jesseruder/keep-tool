@@ -169,6 +169,9 @@ function resumeDecision({ session, usage, ledger, now, multiAccount = false } = 
   // session has no pane left to type into.
   if (s.reviewer) return skip('reviewer session');
   if (s.exited) return skip('session exited');
+  // A row that says it runs on another machine: no transcript here proves it is
+  // parked, and its pane is not this daemon's to type into.
+  if (require('./nodes.js').isRemotePane(s)) return skip(`session on ${s.node}`);
   // A question or plan on screen is addressed to Owner; "continue" would answer it.
   if (s.pendingQuestion || s.pendingPlan) return skip('waiting on a person');
   const selected = usageForSession(s, usage, multiAccount);

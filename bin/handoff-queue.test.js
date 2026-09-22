@@ -229,6 +229,30 @@ test('the policy enqueues only configured sources, holds an exhausted target, an
   assert.deepEqual(queue.list(f.root), []);
 });
 
+test('a rate-limited session on another node is never queued for a transfer', async () => {
+  const f = fixture();
+  f.write({ rateLimitHandoff: { one: 'two' } });
+  // The same session twice over, once here and once on aws1, with the qualified
+  // pane and the node stamp a fleet listing gives it.
+  const sessions = [
+    session({ id: 'session-here' }),
+    session({ id: 'session-far', pane: 'pane-1@aws1', node: 'aws1' }),
+  ];
+  const usage = { accounts: { two: { agent: 'claude', limits: [{ label: 'Fable wk', percent: 31 }] } } };
+  await queue.tick({ root: f.root, env: f.env, now: () => T, log: () => {},
+    sessions: async () => sessions, readUsageCache: () => usage,
+    handoffSession: async () => { throw Object.assign(new Error('Waiting for the turn and background work to finish'), { status: 409 }); } });
+  assert.deepEqual(queue.list(f.root).map((entry) => entry.sessionId), ['session-here'],
+    'the policy still queues this machine\'s own, and only it');
+
+  // The batch the console's button runs says why, rather than passing it over.
+  fs.rmSync(path.join(queue.dir(f.root), 'session-here.json'));
+  const result = queue.batch({ root: f.root, env: f.env, now: T, log: () => {}, sessions,
+    sourceAccountId: 'one', targetAccountId: 'two' });
+  assert.deepEqual(result.queued.map((row) => row.sessionId), ['session-here']);
+  assert.deepEqual(result.skipped, [{ sessionId: 'session-far', reason: 'session runs on aws1' }]);
+});
+
 test('an unusable rateLimitHandoff key is reported and ignored, never guessed at', async () => {
   const f = fixture();
   const lines = [];
