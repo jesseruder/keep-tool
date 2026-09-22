@@ -2,7 +2,9 @@
 
 const net = require('node:net');
 const path = require('node:path');
-const { FrameDecoder, encodeFrame } = require('./host.js');
+const {
+  FrameDecoder, encodeFrame, parseListenAddress, readNodeToken, PROTOCOL_VERSION,
+} = require('./host.js');
 const { annotate } = require('./pressure.js');
 
 // An explicit socket is answered before keep.js is required at all: a host runs
@@ -13,11 +15,13 @@ function socketPath() {
   return path.join(require('./keep.js').ROOT, '.keep', 'host.sock');
 }
 
-function connect(options = {}) {
-  const sock = options.sock || socketPath();
+function connectEndpoint(options = {}) {
+  const tcp = options.tcp || null;
+  const sock = tcp ? `${tcp.host}:${tcp.port}` : (options.sock || socketPath());
   const connectTimeoutMs = options.timeoutMs == null ? 3000 : Math.max(0, Number(options.timeoutMs) || 0);
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(sock);
+    const socket = tcp ? net.createConnection({ host: tcp.host, port: tcp.port }) : net.createConnection(sock);
+    if (tcp && typeof socket.setNoDelay === 'function') socket.setNoDelay(true);
     const pending = new Map();
     const attachments = new Map();
     const subscribers = new Set();
@@ -240,4 +244,50 @@ function connect(options = {}) {
   });
 }
 
-module.exports = { connect, socketPath };
+// A named node, resolved through the registry. An unnamed connect is untouched:
+// the daemon node's socket is reached exactly as it always was, without reading
+// the configuration at all, so a single-node install behaves as before.
+async function connectNode(options) {
+  const name = String(options.node);
+  const resolved = options.resolvedNode
+    || require('./node-registry.js').resolveNode(name, options.env || process.env);
+  if (resolved.name !== name) throw new Error(`Keep node ${name} resolved to ${resolved.name}`);
+  if (resolved.transport === 'unix') {
+    const client = await connectEndpoint({ ...options, tcp: null, sock: options.sock || resolved.sock });
+    client.node = name;
+    return client;
+  }
+  const token = readNodeToken(resolved.tokenFile);
+  const { address, port } = parseListenAddress(resolved.address);
+  const client = await connectEndpoint({ ...options, sock: null, tcp: { host: address, port } });
+  try {
+    // The first frame on a network connection, and the only one the host will read
+    // before it knows who is calling. Its reply says which machine answered.
+    const hello = await client.request('hello', { token }, {
+      ...(options.helloTimeoutMs == null ? {} : { timeoutMs: options.helloTimeoutMs }),
+    });
+    if (hello.protocol !== PROTOCOL_VERSION) {
+      throw new Error(`Keep node ${name} at ${resolved.address} speaks protocol ${hello.protocol}, this client speaks ${PROTOCOL_VERSION}`);
+    }
+    if (hello.node !== name) {
+      throw new Error(`${resolved.address} answers for Keep node ${hello.node}, not ${name}`);
+    }
+    client.node = name;
+    client.descriptor = hello;
+    return client;
+  } catch (error) {
+    client.close();
+    throw error;
+  }
+}
+
+function connect(options = {}) {
+  if (!options.node) return connectEndpoint(options);
+  return connectNode(options);
+}
+
+function resolveNode(name, env = process.env) {
+  return require('./node-registry.js').resolveNode(name, env);
+}
+
+module.exports = { connect, socketPath, resolveNode };
