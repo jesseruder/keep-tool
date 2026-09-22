@@ -11429,6 +11429,23 @@ test('an Owner-forced restart signals only the captured process tree and resumes
     assert.equal(state.replace.meta.accountId, 'claude-two');
     assert.match(state.replace.args[1], /'--resume' 'busy'/);
 
+    // A descendant spawned after the first snapshot is journalled before it is signalled.
+    Object.assign(state, { live: new Set([10, 11, 12]), calls: [], signals: [] });
+    const journals = [];
+    let snaps = 0;
+    const growing = deps({ ownerForce: true, onForcedStop: (processes) => journals.push(processes.map((p) => p.pid).sort()),
+      forceRows: async () => {
+        if (++snaps === 2) state.live.add(14);
+        return [...table(), ...(state.live.has(14) ? [{ pid: 14, ppid: 12, pidStart: 'late-start', args: 'node worker' }] : [])];
+      },
+      forceSignal: async (pid, signal) => {
+        assert.ok(journals.at(-1).includes(pid), `pid ${pid} is signalled only once journalled`);
+        state.signals.push([pid, signal]); state.live.delete(pid);
+      } });
+    assert.equal((await restartSession(body, growing)).ok, true);
+    assert.deepEqual(journals, [[10, 11, 12], [10, 11, 12, 14]]);
+    assert.ok(state.signals.some(([pid]) => pid === 14));
+
     // The pane relaunched after it was inspected: nothing may be signalled.
     Object.assign(state, { live: new Set([10, 11, 12]), calls: [], signals: [] });
     let reads = 0;

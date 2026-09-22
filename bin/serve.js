@@ -6340,6 +6340,7 @@ async function forceStopThenResume({ session, pane, identity, resume }, deps = {
   if (!shell?.pidStart) throw Error('Original process identity is incomplete');
   const processes = [{ pid: shell.pid, pidStart: shell.pidStart }];
   const grow = (table) => {
+    const before = processes.length;
     let changed = true;
     while (changed) {
       changed = false;
@@ -6349,6 +6350,7 @@ async function forceStopThenResume({ session, pane, identity, resume }, deps = {
         processes.push({ pid: p.pid, pidStart: p.pidStart }); changed = true;
       }
     }
+    return processes.length > before;
   };
   grow(snapshot);
   if (!processes.some((p) => p.pid === identity.pid && p.pidStart === identity.pidStart)) {
@@ -6362,7 +6364,8 @@ async function forceStopThenResume({ session, pane, identity, resume }, deps = {
   let remaining = processes;
   for (const name of ['SIGTERM', 'SIGKILL']) {
     const table = await rows();
-    grow(table);
+    // Anything newly captured is journalled before it is signalled, so recovery waits for it too.
+    if (grow(table)) await deps.onForcedStop?.(processes.map((p) => ({ ...p })));
     for (const old of [...processes].reverse()) {
       const current = table.find((p) => p.pid === old.pid);
       if (same(current, old) && !current.zombie) await signal(old.pid, name);

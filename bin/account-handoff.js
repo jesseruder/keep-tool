@@ -941,7 +941,9 @@ async function run(body, deps = {}) {
         // Its first signal is this transaction's Enter, and recovery accepts the stop only
         // once every one of these exact processes is gone.
         onForcedStop: (processes) => {
-          Object.assign(current, { sourceExitEnterAt: Date.now(), forcedProcesses: processes }); writeOne(root, current);
+          // Called again whenever the captured tree grows; the Enter is the first call.
+          current.sourceExitEnterAt ||= Date.now();
+          current.forcedProcesses = processes; writeOne(root, current);
         },
         onExitEnterDropped: () => { delete current.sourceExitEnterAt; writeOne(root, current); },
         // The agent this preflight actually verified. The restart re-reads `ps` and now
