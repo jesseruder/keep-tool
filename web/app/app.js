@@ -1096,7 +1096,7 @@ async function reload() {
     for (const pane of data.panes || []) {
       const session = data.sessions.find((candidate) => candidate.pane === pane.id || candidate.id === pane.meta?.sessionId);
       if (session) sessionHistory.bindPane(pane.id, session.id, {
-        title: session.title, project: session.project, at: Date.now(),
+        title: session.title, num: session.num, project: session.project, at: Date.now(),
       });
     }
     closingSessions.reconcile(data);
@@ -1171,7 +1171,7 @@ function rememberSession(sessionId, view = state.mode) {
   if (!sessionId || !['triage', 'watch'].includes(view)) return;
   const session = data.sessions.find((s) => s.id === sessionId);
   if (!session) return;
-  sessionHistory.visit({ sessionId, view, title: session.title, project: session.project,
+  sessionHistory.visit({ sessionId, view, title: session.title, num: session.num, project: session.project,
     layout: view === 'watch' ? state.layouts[state.layout]?.name : '', at: Date.now() });
   historyControls?.update();
 }
@@ -1184,7 +1184,7 @@ function rememberItem(item, view = state.mode) {
     : item.pane ? entityForPane(item.pane).session : null;
   if (session) {
     if (item.pane) sessionHistory.bindPane(item.pane, session.id, {
-      title: session.title, project: session.project, at: Date.now(),
+      title: session.title, num: session.num, project: session.project, at: Date.now(),
     });
     rememberSession(session.id, view);
     return;
@@ -1204,7 +1204,7 @@ function navigateHistory(entry, focus = true) {
     : !entry.sessionId && entry.paneId ? paneMap().get(entry.paneId) : null;
   if (!session && pane) session = entityForPane(pane.id).session;
   if (session && entry.paneId) sessionHistory.bindPane(entry.paneId, session.id, {
-    title: session.title, project: session.project, at: entry.at,
+    title: session.title, num: session.num, project: session.project, at: entry.at,
   });
   let layout = state.layouts.findIndex((l) => l.name === entry.layout && l.ids.includes(pane?.id));
   if (layout < 0) layout = state.layouts.findIndex((l) => l.ids.includes(pane?.id));
@@ -1273,7 +1273,7 @@ historyControls = installSessionHistory({ history: sessionHistory, esc,
     const session = entry.sessionId && data.sessions.find((candidate) => candidate.id === entry.sessionId);
     const pane = session?.pane ? paneMap().get(session.pane)
       : !entry.sessionId && entry.paneId ? paneMap().get(entry.paneId) : null;
-    return { title: session?.title || entry.title || entry.sessionId || entry.paneId,
+    return { title: session?.title || entry.title || entry.sessionId || entry.paneId, num: session?.num ?? entry.num,
       project: projectOf(session?.project || pane?.meta?.project || pane?.cwd || entry.project).name,
       status: pane?.alive === false ? 'Closed' : session ? sessionLabel(session) : pane?.alive ? 'Ready for next instruction' : 'Not in fleet' };
   },

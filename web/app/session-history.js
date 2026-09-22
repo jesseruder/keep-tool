@@ -1,9 +1,12 @@
+import { numBadgeHTML } from './session-number.js';
+
 const KEY = 'keep.console.session-history.v1';
 const LIMIT = 50;
 const id = (value) => typeof value === 'string' && /^[A-Za-z0-9_-]+$/.test(value);
 const valid = (entry) => entry && (id(entry.sessionId) || id(entry.paneId)) && ['triage', 'watch'].includes(entry.view);
+const num = (value) => Number.isInteger(value) && value >= 1;
 const clean = (entry) => ({ ...(id(entry.sessionId) ? { sessionId: entry.sessionId } : {}),
-  ...(id(entry.paneId) ? { paneId: entry.paneId } : {}), view: entry.view,
+  ...(id(entry.paneId) ? { paneId: entry.paneId } : {}), ...(num(entry.num) ? { num: entry.num } : {}), view: entry.view,
   title: String(entry.title || '').slice(0, 300), project: String(entry.project || '').slice(0, 1000),
   layout: String(entry.layout || '').slice(0, 200), at: Number(entry.at) || 0 });
 const identity = (entry) => entry?.sessionId ? `session:${entry.sessionId}` : entry?.paneId ? `pane:${entry.paneId}` : '';
@@ -65,6 +68,13 @@ export function createSessionHistory(storage) {
   };
 }
 
+// One row of the recently-focused list. The session's console number leads the
+// title, as it does on queue rows, so a long title's ellipsis never hides it.
+export function historyEntryHTML(entry, index, info, esc) {
+  const badge = numBadgeHTML(esc, info.num, entry.sessionId);
+  return `<button data-history-entry="${index}"><b>${badge}${esc(info.title)}</b><span>${esc(info.project)} · ${esc(info.status)} · ${entry.view === 'watch' ? 'Watch' : 'Triage'}</span></button>`;
+}
+
 export function installSessionHistory({ history, describe, navigate, esc }) {
   const root = document.querySelector('#sessionHistory');
   const back = root.querySelector('[data-history-back]');
@@ -80,8 +90,7 @@ export function installSessionHistory({ history, describe, navigate, esc }) {
     if (!pop.hidden) { close(); return; }
     const entries = history.recent;
     pop.innerHTML = '<div class="history-heading">Recently focused · saved on this device</div>' + (entries.map((entry, index) => {
-      const info = describe(entry);
-      return `<button data-history-entry="${index}"><b>${esc(info.title)}</b><span>${esc(info.project)} · ${esc(info.status)} · ${entry.view === 'watch' ? 'Watch' : 'Triage'}</span></button>`;
+      return historyEntryHTML(entry, index, describe(entry), esc);
     }).join('') || '<p>No sessions visited yet.</p>');
     pop.querySelectorAll('[data-history-entry]').forEach((button) => {
       const entry = entries[Number(button.dataset.historyEntry)];

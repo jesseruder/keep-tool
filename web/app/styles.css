@@ -39,8 +39,8 @@ html.desktop .bar { padding-left: 100px; -webkit-user-select: none; }
 .history-pop button:hover { background: var(--sel); }
 .history-pop { position: fixed; top: var(--top-bar-height); left: min(420px, 5vw); width: min(420px, 90vw); max-height: 65vh; overflow: auto; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 6px; box-shadow: var(--shadow); padding: 6px; z-index: 30; }
 .history-pop button { display: block; width: 100%; text-align: left; padding: 8px; border-radius: 4px; }
-.history-pop b, .history-pop span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.history-pop span, .history-heading { color: var(--text); font-size: 11px; }
+.history-pop b, .history-pop button > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-pop button > span, .history-heading { color: var(--text); font-size: 11px; }
 .history-heading { padding: 6px 8px; }
 .modes button { display: flex; align-items: center; gap: 8px; padding: 6px 9px; border-radius: 5px; color: var(--bar-muted); }
 .modes button:hover { color: var(--bar-text); } .modes button.on { color: var(--bar-text); background: var(--bar-sel); }
@@ -139,6 +139,7 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 /* The session's console number. Reads like the faint mono ids it stands in for. */
 .num-id { margin-left: 6px; color: var(--faint); font: 11px/1 var(--mono); font-weight: 400; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .qitem .t .num-id { margin: 0 6px 0 0; }
+.history-pop b .num-id { margin: 0 6px 0 0; }
 .shead h2 .num-id { font-size: 12px; }
 /* The machine a session runs on, shown only when it is not the daemon's own. Muted
    like the number badge: it says where, not that anything needs attention. */

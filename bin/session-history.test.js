@@ -5,8 +5,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../web/app/session-history.js'), 'utf8');
+const numbers = fs.readFileSync(path.join(__dirname, '../web/app/session-number.js'), 'utf8');
 const context = vm.createContext({});
-vm.runInContext(source.replaceAll('export function', 'function'), context);
+const script = (text) => text.replace(/^import .*$/gm, '').replaceAll('export function', 'function');
+vm.runInContext(script(numbers) + script(source), context);
+const esc = (value) => String(value).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 const entry = (sessionId, view = 'triage') => ({ sessionId, view, title: sessionId, at: 1 });
 const storage = () => { let value = null; return { getItem: () => value, setItem: (_, next) => { value = next; } }; };
 
@@ -62,8 +65,42 @@ test('history fails safely for corrupt or inaccessible storage and ignores unkno
   }
 });
 
+test('history remembers each session’s console number and drops invalid ones', () => {
+  const store = storage();
+  const h = context.createSessionHistory(store);
+  h.visit({ ...entry('a'), num: 12 });
+  h.visit({ ...entry('b'), num: 0 });
+  h.visit({ paneId: 'p', view: 'triage', num: '7', at: 1 });
+  const restored = context.createSessionHistory(store);
+  assert.deepEqual([...restored.recent].map((e) => e.num), [undefined, undefined, 12]);
+  assert.equal(h.bindPane('p', 'c', { num: 31 }), true);
+  assert.equal(h.recent[0].num, 31, 'a pane entry takes its session’s number when it binds');
+});
+
+test('a history row leads with the session number, like queue rows, and omits it when unknown', () => {
+  const info = { title: 'Fix <login>', project: 'keep', status: 'Working', num: 332 };
+  const html = context.historyEntryHTML({ sessionId: 'sess-1', view: 'watch' }, 3, info, esc);
+  assert.match(html, /^<button data-history-entry="3"><b><span class="num-id" title="sess-1">#332<\/span>Fix &lt;login&gt;<\/b>/);
+  assert.match(html, /keep · Working · Watch/);
+  const bare = context.historyEntryHTML({ paneId: 'p', view: 'triage' }, 0, { ...info, num: undefined }, esc);
+  assert.doesNotMatch(bare, /num-id|#/);
+});
+
 const app = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
 function functionText(name, next) { return app.slice(app.indexOf(`function ${name}(`), app.indexOf(next, app.indexOf(`function ${name}(`))); }
+
+// The badge is a span inside the title's <b>; the row's block/colour rule for the
+// subtitle span must not reach it, or #n drops onto its own line in body colour.
+test('history row span rules target only the subtitle, not the number badge', () => {
+  const css = fs.readFileSync(path.join(__dirname, '../web/app/styles.css'), 'utf8');
+  assert.doesNotMatch(css, /\.history-pop span\b/);
+  assert.match(css, /\.history-pop b \.num-id \{/);
+});
+
+test('the history popover describes an entry by its live session number, falling back to the saved one', () => {
+  const describe = app.slice(app.indexOf('describe: (entry) =>'), app.indexOf('navigate: (entry) =>', app.indexOf('describe: (entry) =>')));
+  assert.match(describe, /num: session\?\.num \?\? entry\.num/);
+});
 
 test('history navigation restores Watch layout; missing/closed panes stay closed in Triage', () => {
   const state = { layouts: [{ name: 'Other', ids: [] }, { name: 'Pinned', ids: ['p'] }], focusMode: true };
