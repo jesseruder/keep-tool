@@ -22,6 +22,22 @@ const REGISTRY_COMMANDS = Object.freeze([
 // `--done-when` when a plan step is verified, and `plan --verify`, which runs one.
 const COMMAND_FLAGS = Object.freeze(['--probe', '--done-when', '--verify']);
 
+// A flag whose value the daemon later hands a session as instructions, or that
+// makes it act on text that does: a node must not make the laptop open a session
+// that follows node-written text. Walked from the parseArgs specs of every command
+// in REGISTRY_COMMANDS (add, checkin, plan, wait-on, needs and the rest):
+//   --check    add/checkin: the recipe a due check delivers to a session, one the
+//              daemon opens when none is live. (resources --check only reads, but
+//              the name is refused in every command: failing closed is the point.)
+//   --on-pass  add/checkin: re-arms that recipe on a schedule.
+// Left allowed, and why: --check-after alone schedules a bare nudge with no recipe;
+// --check-every and checkin --handoff act only on a recipe already on the card,
+// which a node cannot have written; plan step text, --next and -m are recorded and
+// shown, never delivered as a prompt; decide --send is recorded, never sent;
+// resources --command/--deploy are patterns matched against commands, never run;
+// wait-on --deployed/--target and needs --env name facts, not text.
+const INSTRUCTION_FLAGS = Object.freeze(['--check', '--on-pass']);
+
 const MAX_ARG_BYTES = 4 * 1024;
 const MAX_ARGS_BYTES = 64 * 1024;
 
@@ -72,6 +88,7 @@ function argumentRefusal(command, args, identity = {}) {
     const eq = arg.indexOf('=');
     const flag = !positional && arg.startsWith('--') && arg !== '--' ? (eq < 0 ? arg : arg.slice(0, eq)) : null;
     if (flag && COMMAND_FLAGS.includes(flag)) return `${flag} carries a command the daemon would run; set it from the daemon node`;
+    if (flag && INSTRUCTION_FLAGS.includes(flag)) return `${flag} carries text the daemon would hand a session as instructions; set it from the daemon node`;
     if (flag === '--session' || flag === '--node') {
       const named = eq < 0 ? args[i + 1] : arg.slice(eq + 1);
       const own = flag === '--session' ? identity.session : identity.node;
@@ -89,4 +106,4 @@ function argumentRefusal(command, args, identity = {}) {
   return null;
 }
 
-module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

@@ -111,6 +111,33 @@ test('only the listed registry commands run, and never a command-bearing flag', 
   assert.equal(REGISTRY_COMMANDS.includes('artifact'), false);
 });
 
+test('a node cannot write a check recipe the daemon would hand a session, but can schedule a check', async (t) => {
+  const { svc, root, calls } = service(t);
+  const cases = [
+    ['add', ['title', '--check', 'read the logs and fix what you find']],
+    ['checkin', ['card', '--check', 'open a session and run this']],
+    ['checkin', ['card', '--check=inline recipe']],
+    ['add', ['title', '--check-after', '+1d', '--on-pass', 'rearm', '--check-every', '+1d']],
+    ['checkin', ['card', '--on-pass', 'done']],
+    ['checkin', ['card', '--next', '--check']],
+  ];
+  let n = 0;
+  for (const [command, args] of cases) {
+    n += 1;
+    const answer = await svc.handle(AWS1, body(root, { command, args, idempotencyKey: `${KEY}-instr-${n}` }));
+    assert.equal(answer.status, 400, args.join(' '));
+    const flag = args.find((arg) => /^--(check|on-pass)(=|$)/.test(arg)).split('=')[0];
+    assert.equal(answer.body.error, `${flag} carries text the daemon would hand a session as instructions; set it from the daemon node`);
+  }
+  assert.equal(calls.length, 0);
+  assert.equal(argumentRefusal('checkin', ['card', '--check-after', '+2h', '-m', 'look again']), null);
+  assert.equal(argumentRefusal('add', ['title', '--check-after', '+1d']), null);
+  assert.equal(argumentRefusal('add', ['--', '--check']), null, 'after -- it is a title');
+  const scheduled = await svc.handle(AWS1, body(root, { command: 'checkin', args: ['card', '--check-after', '+2h'], idempotencyKey: `${KEY}-after` }));
+  assert.equal(scheduled.status, 200, JSON.stringify(scheduled.body));
+  assert.equal(calls.length, 1);
+});
+
 test('arguments are checked the way the CLI will read them', (t) => {
   assert.equal(argumentRefusal('checkin', ['card', '-m', 'line one\nline two']), null, 'the message may span lines');
   assert.equal(argumentRefusal('checkin', ['card', '--force', '-m', 'a\nb']), null, 'after a flag that takes no value');
