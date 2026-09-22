@@ -975,8 +975,11 @@ function parseArgs(argv, spec) {
 // terminal? Claude sets CLAUDE_CODE_SESSION_ID; Codex sets one of its two markers.
 // Not a security boundary — an agent can unset an env var — but it is the same
 // signal the push policy already runs on, and it makes the honest path obvious.
+// A command the daemon runs for another node (KEEP_REMOTE_CALLER, set only by the
+// /api/registry route) is never Owner's terminal, whether or not it names a session.
 function inAgentSession(env = process.env) {
-  return Boolean(env.CLAUDE_CODE_SESSION_ID || env.CODEX_SESSION_ID || env.CODEX_THREAD_ID || env.KEEP_PI_SESSION_ID);
+  return Boolean(env.CLAUDE_CODE_SESSION_ID || env.CODEX_SESSION_ID || env.CODEX_THREAD_ID || env.KEEP_PI_SESSION_ID
+    || env.KEEP_REMOTE_CALLER);
 }
 
 // Throws (rather than exiting) so withLock's finally always releases the lock.

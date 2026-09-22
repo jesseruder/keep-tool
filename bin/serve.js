@@ -13823,6 +13823,12 @@ function start(deps = {}) {
   }
   const isLocal = (addr) => addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 
+  // Decided once at boot, like the listener it describes: whether this daemon hears
+  // from other nodes at all. On a single-node install it never does, and the node
+  // API's routes match nothing.
+  const nodeApiListen = require('./node-registry.js').nodeApiListen();
+  ctx.nodeApiEnabled = () => nodeApiListen.enabled === true;
+  ctx.registryService = nodeApiListen.enabled ? require('./registry-route.js').createRegistryService({ root: keep.ROOT }) : null;
   const requestRoutes = buildRequestRoutes(ctx);
   // Read once at boot, like the public token above. Only the node listener below
   // honours one; it re-reads the directory itself when it is shown a token it does
@@ -13940,7 +13946,7 @@ function start(deps = {}) {
   {
     const nodeApi = require('./serve/node-api.js');
     nodeApiServer = nodeApi.startNodeApi({
-      listen: require('./node-registry.js').nodeApiListen(),
+      listen: nodeApiListen,
       handler: nodeApi.createNodeApiHandler({
         routes: requestRoutes, matchRoute, routeDenial, readBody, principal: keepConsole.principal,
         tokenStore: nodeApi.createNodeTokenStore({ initial: nodeTokenMap, read: () => nodes.nodeTokens(keep.ROOT) }),

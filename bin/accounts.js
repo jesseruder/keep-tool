@@ -294,6 +294,16 @@ function sessionNode(sessionId, options = {}) {
   return record ? record.node : null;
 }
 
+// Where a session runs and which agent it is, from durable authority alone, or null
+// when the session has none. The node API checks a caller against this: a node may
+// act only for the sessions this record places on it.
+function sessionLocation(sessionId, options = {}) {
+  const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+  const env = options.env || process.env;
+  const record = readRecord(root, sessionId, env);
+  return record ? { node: record.node, agent: record.agent } : null;
+}
+
 function pinSession(sessionId, agent, accountId, options = {}) {
   if (!/^[A-Za-z0-9_-]+$/.test(String(sessionId || ''))) throw new Error('invalid session id');
   const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
@@ -410,6 +420,6 @@ function setDefault(agent, accountId, env = process.env) {
 
 module.exports = {
   AGENTS, ID_RE, CUSTOM_ID_RE, rawConfig, list, get, defaultFor, automationFor, hasMultiple, envFor, projectRoots,
-  publicState, authority, authorityFile, locateClaudeFiles, knownClaudeFile, claudeFileInAccount, claudeAccountForFile, forSession, sessionNode, pinSession,
+  publicState, authority, authorityFile, locateClaudeFiles, knownClaudeFile, claudeFileInAccount, claudeAccountForFile, forSession, sessionNode, sessionLocation, pinSession,
   stageSession, commitStaged, clearStaged, add, setDefault,
 };

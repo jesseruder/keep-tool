@@ -33,7 +33,36 @@ function routes(ctx) {
     terminalProfile,
   } = ctx;
 
+  // The node API's routes exist only where the daemon listens for nodes: on a
+  // single-node install they match nothing, and a request for one is the same 404
+  // it always was. ctx is read at request time, not destructured, so a caller that
+  // builds this list without them gets that 404 too.
+  const nodeApiEnabled = () => typeof ctx.nodeApiEnabled === 'function' && ctx.nodeApiEnabled() === true;
+  const NODE_API_ALLOW = ['node', 'admin', 'local'];
+
   return withLoopHolds([
+    {
+      // A pane-only node's registry command, run by the daemon's own CLI
+      // (bin/registry-route.js holds every rule about what may run).
+      method: 'POST',
+      path: '/api/registry',
+      allow: NODE_API_ALLOW,
+      when: nodeApiEnabled,
+      handle: async ({ res, body, principal }) => {
+        const result = await ctx.registryService.handle(principal, body);
+        return json(res, result.status, result.body);
+      },
+    },
+    {
+      method: 'GET',
+      path: '/api/registry/ping',
+      allow: NODE_API_ALLOW,
+      when: nodeApiEnabled,
+      handle: async ({ res, principal }) => {
+        const result = ctx.registryService.ping(principal);
+        return json(res, result.status, result.body);
+      },
+    },
     {
       method: 'GET',
       path: '/api/terminal-profile',
