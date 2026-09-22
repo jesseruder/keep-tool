@@ -234,7 +234,9 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
       try {
         const result = await write('/api/abandon-transfer', { sessionId, transactionId: button.dataset.handoffAbandon }, 'POST',
           { label: 'Abandoning transfer' });
-        ctx.toast(`Transfer abandoned; the session stays on ${labelForAccountId(ctx, result.sourceAccountId)}.`);
+        // An interrupted stop can leave a typed /exit in the composer that the journal
+        // never recorded; the next Enter there would end the session.
+        ctx.toast(`Transfer abandoned; the session stays on ${labelForAccountId(ctx, result.sourceAccountId)}. Check its input box for a leftover /exit before pressing Enter.`);
         await ctx.reload();
       } catch (error) { ctx.toast(`Not abandoned: ${error.message}`); }
     }, ctx);

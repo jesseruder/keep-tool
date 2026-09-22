@@ -207,7 +207,7 @@ function safe(entry) {
   return {
     ...Object.fromEntries(keys.filter((key) => entry[key] != null).map((key) => [key, entry[key]])),
     ...(portableFallbackCandidate(entry) ? { portableFallbackAvailable: true } : {}),
-    ...(abandonCandidate(entry) ? { abandonAvailable: true } : {}),
+    ...(abandonCandidate(entry) && !active.has(entry.sessionId) ? { abandonAvailable: true } : {}),
     ...(entry.phase === 'portable-fallback' && entry.portableFallbackAt ? { portableFallbackAt: entry.portableFallbackAt } : {}),
   };
 }

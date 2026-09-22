@@ -771,6 +771,9 @@ test('abandon waits out a running transfer, refuses a staged target, and takes a
     while (!release) await new Promise((resolve) => setImmediate(resolve));
     const live = handoff.readOne(f.root, f.sid);
     assert.equal(live.status, 'stopping');
+    fs.writeFileSync(path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`),
+      JSON.stringify({ ...live, updatedAt: Date.now() - 16 * 60e3 }));
+    assert.equal(handoff.list(f.root)[0].abandonAvailable, undefined, 'a running transfer is never offered, however old');
     assert.throws(() => handoff.abandon({ sessionId: f.sid, transactionId: live.id }, { root: f.root }), /still running/);
     release();
     await assert.rejects(running);
