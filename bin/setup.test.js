@@ -1107,3 +1107,14 @@ test('keep node init refuses a scope zone that hides the wildcard', (t) => {
   assert.equal(fs.existsSync(path.join(home, '.config', 'systemd', 'user', 'keep-host.service')), false);
   assert.equal(fs.existsSync(path.join(home, 'Library', 'LaunchAgents', 'games.castle.keep.host.plist')), false);
 });
+
+test('keep node init refuses an IPv4-mapped wildcard too', (t) => {
+  const { home, tokenFile } = nodeHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  for (const listen of ['[::ffff:0.0.0.0]:7777', '[::ffff:0:0]:7777', '[0:0:0:0:0:ffff:0:0]:7777']) {
+    assert.throws(() => setup.node(['init', 'aws1', '--daemon-node', 'main', '--listen', listen,
+      '--token-file', tokenFile], '/tmp/r', home), /refusing to install a service that binds/, listen);
+  }
+  assert.equal(fs.existsSync(path.join(home, 'Library', 'LaunchAgents', 'games.castle.keep.host.plist')), false);
+  assert.equal(fs.existsSync(path.join(home, '.config', 'systemd', 'user', 'keep-host.service')), false);
+});

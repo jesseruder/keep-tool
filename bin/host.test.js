@@ -12,6 +12,7 @@ const { Terminal } = require('@xterm/headless');
 const {
   parseListenAddress,
   canonicalIp,
+  unmapIpv4,
   DEFAULT_SNAPSHOT_SCROLLBACK,
   MAX_FRAME_BYTES,
   RingBuffer,
@@ -2273,5 +2274,48 @@ test('a scope zone cannot smuggle the wildcard past the bind refusal', async () 
       assert.match(refused.listenError.message, /zone|refusing to bind/, listen);
     } finally { await refused.close(); }
   }
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('an IPv4-mapped wildcard is the wildcard, under every spelling', async () => {
+  // ::ffff:0.0.0.0 is 0.0.0.0 in an IPv6 coat. Linux binds it as INADDR_ANY, and it
+  // canonicalises to ::ffff:0:0, which matches neither wildcard string.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-mapped-'));
+  const { file } = nodeTokenFile(dir);
+  let index = 0;
+  for (const listen of ['[::ffff:0.0.0.0]:0', '[::ffff:0:0]:0', '[0:0:0:0:0:ffff:0:0]:0']) {
+    const refused = createHost({ sock: path.join(dir, `m${index++}.sock`), log: null, listen, tokenFile: file });
+    try {
+      await refused.listen();
+      assert.equal(refused.listenAddress, null, listen);
+      assert.match(refused.listenError.message, /refusing to bind ::ffff:0:0 \(IPv4 0\.0\.0\.0\)/, listen);
+    } finally { await refused.close(); }
+  }
+  // A mapped address that is not the wildcard is a real interface and still binds.
+  const loopback = createHost({
+    sock: path.join(dir, 'mapped-loopback.sock'), log: null, listen: '[::ffff:127.0.0.1]:0', tokenFile: file,
+  });
+  try {
+    await loopback.listen();
+    assert.equal(loopback.listenError, null);
+    // The bound address is whatever the OS reports it as, in either spelling.
+    assert.match(loopback.listenAddress, /^\[::ffff:(?:7f00:1|127\.0\.0\.1)\]:\d+$/);
+  } finally { await loopback.close(); }
+  // And the override still means what it says.
+  const allowed = createHost({
+    sock: path.join(dir, 'mapped-any.sock'), log: null, listen: '[::ffff:0.0.0.0]:0', tokenFile: file, listenAny: true,
+  });
+  try {
+    await allowed.listen();
+    assert.equal(allowed.listenError, null);
+    // And the kernel proves the point: asked for the mapped wildcard, it binds every
+    // interface and reports the address as ::. That is what the refusal above prevents.
+    assert.match(allowed.listenAddress, /^\[(?:::|::ffff:(?:0:0|0\.0\.0\.0))\]:\d+$/);
+  } finally { await allowed.close(); }
+
+  assert.equal(unmapIpv4('::ffff:0:0'), '0.0.0.0');
+  assert.equal(unmapIpv4('::ffff:7f00:1'), '127.0.0.1');
+  assert.equal(unmapIpv4('1::ffff:0:0'), null, 'an address that merely ends in those groups is not mapped');
+  assert.equal(unmapIpv4('::'), null);
   fs.rmSync(dir, { recursive: true, force: true });
 });

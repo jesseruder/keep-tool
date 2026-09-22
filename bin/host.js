@@ -423,11 +423,35 @@ function wildcardAddress(address) {
   return ['0.0.0.0', '::'].includes(String(address));
 }
 
+// `::ffff:a.b.c.d` is an IPv4 address in an IPv6 spelling, and the kernel treats it
+// as one: `::ffff:0.0.0.0` — canonically `::ffff:0:0` — binds INADDR_ANY, every
+// interface on the machine, while reading like a specific address. Unmapped here so
+// that the IPv4 wildcard rule is applied to it under every spelling.
+//
+// Only zeros and colons may come before the ffff; that is what makes an address
+// mapped rather than one that merely ends in those two groups.
+const MAPPED_PREFIX = '(?:0{1,4}:)*:{0,2}(?:0{1,4}:)*';
+const MAPPED_DOTTED = new RegExp('^' + MAPPED_PREFIX + 'ffff:(\\d{1,3}(?:\\.\\d{1,3}){3})' + '$');
+const MAPPED_HEX = new RegExp('^' + MAPPED_PREFIX + 'ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})' + '$');
+
+function unmapIpv4(address) {
+  const text = String(address).toLowerCase();
+  const dotted = MAPPED_DOTTED.exec(text);
+  if (dotted) return net.isIP(dotted[1]) === 4 ? dotted[1] : null;
+  const hex = MAPPED_HEX.exec(text);
+  if (!hex) return null;
+  const high = parseInt(hex[1], 16);
+  const low = parseInt(hex[2], 16);
+  const mapped = [high >> 8, high & 255, low >> 8, low & 255].join('.');
+  return net.isIP(mapped) === 4 ? mapped : null;
+}
+
 // The refusal the host makes at boot, in one place so `keep node init` refuses
 // the same addresses before it writes a service that would bind them.
 function assertBindable(address, source = address) {
-  if (wildcardAddress(address)) {
-    throw new Error(`refusing to bind ${address}: set KEEP_HOST_LISTEN_ANY=1 to listen on every interface`);
+  const mapped = unmapIpv4(address);
+  if (wildcardAddress(mapped || address)) {
+    throw new Error(`refusing to bind ${address}${mapped ? ` (IPv4 ${mapped})` : ''}: set KEEP_HOST_LISTEN_ANY=1 to listen on every interface`);
   }
   return source;
 }
@@ -1897,6 +1921,7 @@ module.exports = {
   PROTOCOL_VERSION,
   canonicalIp,
   linkLocalIp,
+  unmapIpv4,
   assertBindable,
   parseListenAddress,
   readNodeToken,
