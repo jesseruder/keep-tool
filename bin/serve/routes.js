@@ -33,7 +33,7 @@ function routes(ctx) {
     terminalProfile,
   } = ctx;
 
-  return [
+  return withLoopHolds([
     {
       method: 'GET',
       path: '/api/terminal-profile',
@@ -905,7 +905,28 @@ function routes(ctx) {
       path: '/api/events',
       handle: async ({ res }) => json(res, 503, { error: 'events are served by the frontend worker' }),
     },
-  ];
+  ]);
+}
+
+// Every handler runs inside a loop hold named `<method> <path>`, so the lag probe
+// can name a route that held the event loop (bin/loop-hold.js). The one wrapper
+// sits here, where the ladder is built, rather than in each handler. The path is
+// the request's own pathname: a pattern route (an agent's name in the path) is
+// named by what was asked, which is what an operator reading serve.log wants.
+// The route object is otherwise the one declared above, so matchRoute and the
+// allow checks see exactly the same fields.
+function withLoopHolds(list) {
+  const loopHold = require('../loop-hold.js');
+  return list.map((route) => {
+    const handle = route.handle;
+    const declared = Array.isArray(route.path) ? route.path[0] : route.path;
+    return {
+      ...route,
+      handle: (args) => loopHold.run(
+        `${args?.req?.method || route.method || 'ANY'} ${args?.url?.pathname || String(declared)}`,
+        handle, args),
+    };
+  });
 }
 
 // The first route whose method, path and guard all match, or null. A route with

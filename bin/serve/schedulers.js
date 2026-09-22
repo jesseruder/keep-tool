@@ -170,19 +170,106 @@ function createRegistryPull({
 // difference, so the lateness is the measurement. launchd appends the daemon's
 // stderr to ~/keep/.keep/serve.log, which makes this the one record of a stall
 // that outlives the process it happened in.
+//
+// The line names who held the loop when bin/loop-hold.js knows: every wrapped
+// scheduler tick and HTTP route enters a hold, and the probe asks it for the likeliest
+// holder of the late window (`... stalled 2400ms during handoff-queue`). With
+// `health`, it also keeps the `loop-stalls` row; see createLoopStallHealth.
 function startLoopLagProbe({ thresholdMs = 500, intervalMs = 1000, write = (line) => process.stderr.write(line),
-  setInterval: si = setInterval, now = Date.now } = {}) {
+  setInterval: si = setInterval, now = Date.now, holds = require('../loop-hold.js'), health = null } = {}) {
   let expectedAt = now() + intervalMs;
+  let lastAt = now();
+  const stalls = health ? createLoopStallHealth({ health, thresholdMs }) : null;
   const timer = si(() => {
     const at = now();
     const lag = at - expectedAt;
-    if (lag > thresholdMs) write(`keep serve: event loop stalled ${Math.round(lag)}ms\n`);
+    if (lag > thresholdMs) {
+      let name = null;
+      try { name = holds.attribute({ since: lastAt, due: expectedAt, at }); } catch {}
+      write(`keep serve: event loop stalled ${Math.round(lag)}ms${name ? ` during ${name}` : ''}\n`);
+      stalls?.stall(at, lag, name);
+    }
+    stalls?.tick(at);
     // Measured against when this tick actually landed, so one stall is reported
     // once rather than as a lasting offset on every tick after it.
     expectedAt = at + intervalMs;
+    lastAt = at;
   }, intervalMs);
   timer?.unref?.();
   return timer;
+}
+
+// The `loop-stalls` health row.
+//
+// Rule: the row is unhealthy exactly while a stall over SEVERE_STALL_MS (5 s)
+// happened in the last hour. Five seconds is where the CLI's host and daemon
+// requests start timing out, so below it a stall is slowness and above it callers
+// see failures. Shorter stalls over the probe threshold are counted in the detail
+// (`3 stalls in the last hour, worst 7200ms during handoff-queue`) but never fail
+// the row.
+//
+// Shape, chosen around bin/self-repair.js, which opens a card once a row has
+// minFailures (5) consecutive failures and the same signature has stood for
+// minAgeMin (30 m):
+//   - a severe stall records one failure, and severe stalls less than
+//     FAILURE_SPACING_MS apart count as one episode (a swap storm produces a burst
+//     of them in a few minutes; that is one event, not five);
+//   - every CADENCE_MS the row records a skip while a severe stall is still inside
+//     the hour: the skip keeps the streak (the row stays warning/failing) and keeps
+//     it from reading `silent`, but does not add to the count;
+//   - the first cadence tick with no severe stall in the hour records ok, which
+//     zeroes the streak.
+// So one stall is one failure that clears an hour later and can never reach a
+// repair card. A card takes five separate episodes at least ten minutes apart with
+// never a clean hour between them, which is a daemon that keeps stalling and the
+// thing a repair agent should look at. The error names the attributed holder, so
+// the signature (and the card) is per culprit.
+//
+// A restarted daemon starts with an empty window: stalls from before the restart
+// are in serve.log, not in this process's memory, so its first cadence tick
+// records ok. That errs toward quiet, which is the right side for a row whose
+// failure opens a card.
+const SEVERE_STALL_MS = 5000;
+const LOOP_STALLS_CADENCE_MS = 5 * 60e3;
+const FAILURE_SPACING_MS = 10 * 60e3;
+const STALL_WINDOW_MS = 3600e3;
+
+function createLoopStallHealth({ health, thresholdMs = 500, severeMs = SEVERE_STALL_MS, cadenceMs = LOOP_STALLS_CADENCE_MS,
+  spacingMs = FAILURE_SPACING_MS, windowMs = STALL_WINDOW_MS } = {}) {
+  const stalls = [];
+  let lastRecordAt = -Infinity;
+  let lastFailureAt = -Infinity;
+  const prune = (at) => { while (stalls.length && stalls[0].at < at - windowMs) stalls.shift(); };
+  const detailOf = () => {
+    if (!stalls.length) return 'no stalls in the last hour';
+    const worst = stalls.reduce((a, b) => (b.ms > a.ms ? b : a));
+    return `${stalls.length} stall${stalls.length === 1 ? '' : 's'} in the last hour, worst ${Math.round(worst.ms)}ms`
+      + `${worst.name ? ` during ${worst.name}` : ''}`;
+  };
+  const record = (at, entry) => {
+    lastRecordAt = at;
+    try { health.record('loop-stalls', { cadenceMs, at, ...entry }); } catch {}
+  };
+  return {
+    stall(at, ms, name) {
+      if (!(ms > thresholdMs)) return;
+      prune(at);
+      stalls.push({ at, ms, name: name || null });
+      if (ms <= severeMs || at - lastFailureAt < spacingMs) return;
+      lastFailureAt = at;
+      record(at, {
+        ok: false,
+        error: `event loop stalled ${Math.round(ms)}ms${name ? ` during ${name}` : ''}`,
+        detail: detailOf(),
+      });
+    },
+    tick(at) {
+      if (at - lastRecordAt < cadenceMs) return;
+      prune(at);
+      const severe = stalls.some((stall) => stall.ms > severeMs);
+      record(at, severe ? { skipped: true, detail: detailOf() } : { ok: true, detail: detailOf() });
+    },
+  };
 }
 
 function createCleanupSnapshot({
@@ -243,6 +330,9 @@ function startSchedulers(ctx) {
     unblock, usage, watcherSend, withInjectionLock, writeTarget,
   } = ctx;
   const periodicScan = periodicSessionScan(scanSessions);
+  // Every interval tick below runs inside a loop hold named after its health row,
+  // so a stall the lag probe sees can be attributed (bin/loop-hold.js).
+  const hold = require('../loop-hold.js').wrap;
 
   runs.setOnChange(broadcast);
   runs.setDeliverer(deliverCheckToThread);
@@ -372,7 +462,7 @@ function startSchedulers(ctx) {
   });
   // Queued idle restarts need fresh safety evidence, but scanning the fleet every
   // two seconds competes with foreground work. Explicit restart-now stays immediate.
-  const restartTimer = setInterval(() => restarts.tick().catch((error) => process.stderr.write(`keep restart: ${error.message}\n`)), 10000);
+  const restartTimer = setInterval(hold('session-restart', () => restarts.tick().catch((error) => process.stderr.write(`keep restart: ${error.message}\n`))), 10000);
   restartTimer.unref();
   if (process.env.KEEP_AUTO_CLOSE !== '0') {
     const doneIdleMs = envNumber('KEEP_AUTO_CLOSE_DONE_MIN', 15) * 60e3;
@@ -598,8 +688,9 @@ function startSchedulers(ctx) {
   const liveTickMs = Number.isFinite(configuredLiveTickMs) && configuredLiveTickMs > 0
     ? configuredLiveTickMs
     : 120e3;
-  liveSessionTick();
-  setInterval(liveSessionTick, liveTickMs).unref();
+  const liveTick = hold('live-sessions', () => liveSessionTick());
+  liveTick();
+  setInterval(liveTick, liveTickMs).unref();
   let stalledRunning = false;
   const stalledTick = async () => {
     if (stalledRunning) return;
@@ -621,8 +712,9 @@ function startSchedulers(ctx) {
       stalledRunning = false;
     }
   };
-  setInterval(stalledTick, 60e3).unref();
-  setTimeout(stalledTick, 5e3).unref();
+  const heldStalledTick = hold('stalled', stalledTick);
+  setInterval(heldStalledTick, 60e3).unref();
+  setTimeout(heldStalledTick, 5e3).unref();
   // Stop hooks feed the turn index, but a session can run for hours without
   // stopping and an agent that never loaded the hooks would be missing entirely.
   // The bound is wall time and bytes, not files: this runs on the daemon's event
@@ -762,7 +854,9 @@ function startSchedulers(ctx) {
       watcherRunning = false;
     }
   };
-  const turnTicks = () => { turnIndexTick(); watcherTick(); };
+  const heldTurnIndexTick = hold('turn-index', turnIndexTick);
+  const heldWatcherTick = hold('watcher', watcherTick);
+  const turnTicks = () => { heldTurnIndexTick(); heldWatcherTick(); };
   setInterval(turnTicks, 30e3).unref();
   setTimeout(turnTicks, 10e3).unref();
   // Drip-fold fleet transcripts for the weekly attribution: ~750MB of history on a
@@ -785,7 +879,7 @@ function startSchedulers(ctx) {
     }
   };
   let cardUsageRunning = false;
-  const collectCardUsage = () => {
+  const collectCardUsage = hold('card-usage', () => {
     if (cardUsageRunning) return;
     cardUsageRunning = true;
     require('child_process').execFile(process.execPath, [path.join(__dirname, '..', 'card-usage.js')], {
@@ -798,16 +892,17 @@ function startSchedulers(ctx) {
         try { if (cardUsage.snapshot(keep.ROOT)?.backlog) setTimeout(collectCardUsage, 500).unref(); } catch {}
       }
     });
-  };
+  });
   setInterval(collectCardUsage, 30e3).unref();
   setTimeout(collectCardUsage, 1000).unref();
-  setInterval(foldFleetUsage, 5 * 60e3).unref();
-  setTimeout(foldFleetUsage, 20e3).unref();
+  const heldFoldFleetUsage = hold('fleet-usage', foldFleetUsage);
+  setInterval(heldFoldFleetUsage, 5 * 60e3).unref();
+  setTimeout(heldFoldFleetUsage, 20e3).unref();
 
   startReceiptsPoller({ keep, health });
 
-  startLoopLagProbe();
-  const pull = createRegistryPull({ keep, health });
+  startLoopLagProbe({ health });
+  const pull = hold('git-pull', createRegistryPull({ keep, health }));
   if (process.env.KEEP_SYNC === '1') {
     health.record('git-pull', { skipped: true });
     setInterval(pull, 30 * 60e3).unref();
@@ -822,5 +917,5 @@ function startSchedulers(ctx) {
 
 module.exports = {
   startFeatureSchedulers, startSchedulers, createRegistryPull, createCleanupSnapshot,
-  startLoopLagProbe, startReceiptsPoller, periodicSessionScan,
+  startLoopLagProbe, createLoopStallHealth, SEVERE_STALL_MS, startReceiptsPoller, periodicSessionScan,
 };

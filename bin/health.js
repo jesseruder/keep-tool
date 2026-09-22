@@ -47,6 +47,9 @@ const CADENCES = Object.freeze({
   lint: { cadenceMs: 30 * 60e3 },
   'git-pull': { cadenceMs: 30 * 60e3 },
   'push-receipts': { cadenceMs: 15 * 60e3 },
+  // Written by the event-loop lag probe (bin/serve/schedulers.js), not a tick of
+  // its own: a heartbeat every five minutes, plus one failure per >5 s stall.
+  'loop-stalls': { cadenceMs: 5 * 60e3 },
   digest: { onDemand: true },
   brief: { cadenceMs: DAY_MS, daily: true, hour: 8, minute: 0, windowMs: 2 * HOUR_MS },
   ideas: { cadenceMs: DAY_MS, daily: true, hour: 7, minute: 30, windowMs: 2 * HOUR_MS },

@@ -86,6 +86,10 @@ const { createDashboardWorker } = require('./dashboard-worker');
 const { createDashboardPublisher } = require('./dashboard-publisher');
 const { createUiRequestWorker } = require('./ui-request-worker');
 const { routes: buildRequestRoutes, matchRoute, routeDenial } = require('./serve/routes.js');
+// Names whoever holds the event loop, so the lag probe's stall line can say who
+// (bin/loop-hold.js). Interval ticks here run inside a hold named after their
+// health row.
+const loopHold = require('./loop-hold.js');
 const { startSchedulers } = require('./serve/schedulers.js');
 const execFileAsync = promisify(execFile);
 const ATTENTION_KINDS = new Set(['question', 'plan', 'permission', 'complete', 'input', 'review', 'blocked', 'overdue', 'unblocked', 'health', 'stalled']);
@@ -7918,8 +7922,9 @@ function startAutoCompact() {
     }
     finally { running = false; }
   };
-  setInterval(() => { void tick(); }, 30e3).unref();
-  setTimeout(() => { void tick(); }, 15e3).unref();
+  const held = loopHold.wrap('auto-compact', tick);
+  setInterval(() => { void held(); }, 30e3).unref();
+  setTimeout(() => { void held(); }, 15e3).unref();
 }
 
 // ---- the rate-limit transfer queue -------------------------------------
@@ -8007,8 +8012,9 @@ function startHandoffQueue() {
     }
     finally { running = false; }
   };
-  setInterval(() => { void tick(); }, 30e3).unref();
-  setTimeout(() => { void tick(); }, 20e3).unref();
+  const held = loopHold.wrap('handoff-queue', tick);
+  setInterval(() => { void held(); }, 30e3).unref();
+  setTimeout(() => { void held(); }, 20e3).unref();
 }
 
 function claudeMcpMenuVisible(screen) {
@@ -13044,8 +13050,9 @@ function startBriefScheduler(options = {}) {
       running = false;
     }
   };
-  tick();
-  const timer = setInterval(tick, 60e3);
+  const held = loopHold.wrap('brief', tick);
+  held();
+  const timer = setInterval(held, 60e3);
   timer.unref();
   return { tick, timer };
 }
@@ -13080,9 +13087,10 @@ function startWtGcScheduler(options = {}) {
       });
     });
   };
-  const first = later(() => { void tick(); }, options.firstRunMs ?? 5 * 60e3);
+  const held = loopHold.wrap('wt-gc', tick);
+  const first = later(() => { void held(); }, options.firstRunMs ?? 5 * 60e3);
   first.unref?.();
-  const timer = repeat(() => { void tick(); }, options.intervalMs ?? 24 * 60 * 60e3);
+  const timer = repeat(() => { void held(); }, options.intervalMs ?? 24 * 60 * 60e3);
   timer.unref?.();
   return { tick, first, timer };
 }
@@ -13297,7 +13305,7 @@ function start(deps = {}) {
       }
     } catch (error) { process.stderr.write(`keep jobs: ${error.message}\n`); }
   };
-  setInterval(jobTick, 500).unref();
+  setInterval(loopHold.wrap('background-jobs', jobTick), 500).unref();
 
   // Everything the daemon's request ladder and periodic jobs need from this
   // module and from start()'s own scope. bin/serve/routes.js and
