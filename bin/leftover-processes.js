@@ -119,7 +119,9 @@ async function environments(rows) {
     // that printed nothing (a timeout under load) read no environments at all, which
     // must not pass for "no process came from a pane".
     stdout = String(error.stdout || '');
-    if (!stdout.trim()) throw evidence(`process environments unavailable: ${error.message}`);
+    // A ps killed by the timeout may have cut its last line inside the environment,
+    // dropping a KEEP_PERSIST or session id that protects the tree.
+    if (error.killed || error.signal || !stdout.trim()) throw evidence(`process environments unavailable: ${error.message}`);
   }
   return parseEnvironments(stdout, rows);
 }
