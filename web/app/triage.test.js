@@ -270,10 +270,17 @@ test('the rail lists the projects waiting on you or running, not every project w
     ctx.state.dismissed = new Set();
     ctx.data.tasks = [{ id: 'one', fm: { status: 'inbox', project: '/work/d' } }];
     renderRail(ctx, rows);
-    assert.deepEqual(listed(), ['', '/work/a', '/work/b', '/work/d'],
-      'a project with inbox cards stays filterable');
-    assert.match(rail.innerHTML, /data-project="\/work\/d"[^>]*>.*?<span class="c "><\/span>/,
-      'and is listed without a count');
+    assert.deepEqual(listed(), ['', '/work/a', '/work/b'],
+      'an inbox card is not a session: its project stays out of the rail');
+
+    // An agent is working in its project whether or not the queue has a row for
+    // it, so it keeps its icon — listed without a count, like before.
+    ctx.data.agents = [{ name: 'sandboxes', session: { id: 'agent-one' } }];
+    ctx.data.sessions = [{ id: 'agent-one', agentName: 'sandboxes', project: '/work/c', state: 'running' }];
+    renderRail(ctx, rows);
+    assert.deepEqual(listed(), ['', '/work/a', '/work/b', '/work/c']);
+    assert.match(rail.innerHTML, /data-project="\/work\/c"[^>]*>.*?<span class="c "><\/span>/,
+      'an agent-only project is listed without a count');
   } finally {
     globalThis.document = previousDocument;
   }

@@ -394,8 +394,9 @@ function knownProjects() {
   };
   for (const session of data.sessions || []) add(session.project);
   for (const pane of data.panes || []) add(pane.meta?.project || pane.cwd);
-  // The Queue lists inbox cards too, so a project whose only open work is an
-  // inbox card has to be filterable (the rail and the phone's filter sheet).
+  // A project whose only open work is an inbox card still has to resolve — the
+  // active filter is canonicalized through here, and Watch lists these projects.
+  // The rail does not list it: only live sessions and agents earn an icon.
   for (const task of data.tasks || []) if (task.fm?.status === 'inbox') add(task.fm.project);
   return [...values.values()].sort((a, b) => a.scope.localeCompare(b.scope) || a.name.localeCompare(b.name));
 }

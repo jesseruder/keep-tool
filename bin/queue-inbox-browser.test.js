@@ -154,20 +154,17 @@ test('isolated browser: the Queue lists inbox cards, opens their notes, and clos
     await call('Page.navigate', { url: `${origin}/` });
     await wait("document.querySelectorAll('#qlist .qinbox').length === 1");
 
-    // ── A project whose only open work is an inbox card is in the rail, with no
-    // session count, and filtering to it narrows the Inbox.
+    // ── A project whose only open work is an inbox card is NOT in the rail: an
+    // icon there means a session waiting on you or running, and a card is
+    // neither. The cards stay reachable in the Inbox section itself, which is
+    // where they are read, opened and closed.
     state.tasks.push(card('beta-idea', { title: 'Beta only idea', status: 'inbox', kind: 'idea', project: '/tmp/inbox-beta', updated: '2026-09-19T10:00' }, 'Beta.\n'));
     await call('Page.navigate', { url: `${origin}/` });
     await wait("document.querySelectorAll('#qlist .qinbox').length === 2");
     const railProjects = "[...document.querySelectorAll('#rail [data-project]:not(.all)')].map(node=>node.textContent.trim())";
-    assert.deepEqual(await evaluate(railProjects), ['inbox-alpha', 'inbox-beta'], 'inbox-only projects are listed');
-    assert.equal(await evaluate("document.querySelector('#rail .all .c').textContent"), '0', 'All still counts sessions only');
-    await evaluate("[...document.querySelectorAll('#rail [data-project]')].find(node=>node.textContent.trim()==='inbox-beta').click()");
-    await wait("document.querySelectorAll('#qlist .qinbox').length === 1");
-    assert.deepEqual(await evaluate(rows), ['beta-idea']);
-    assert.equal(await evaluate("document.querySelector('#qlist .qinbox-head').textContent.trim()"), '▾ Inbox · 1');
-    await evaluate("document.querySelector('#rail [data-project=\"\"]').click()");
-    await wait("document.querySelectorAll('#qlist .qinbox').length === 2");
+    assert.deepEqual(await evaluate(railProjects), [], 'inbox-only projects are not listed');
+    assert.equal(await evaluate("document.querySelector('#rail .all .c').textContent"), '0', 'All counts sessions only');
+    assert.deepEqual(await evaluate(rows), ['newest-idea', 'beta-idea'], 'both open cards are still listed, newest first');
 
     // ── A 390px phone: the queue is the screen, and nothing scrolls sideways,
     // not even with a long unbroken title and its notes open.
@@ -175,8 +172,9 @@ test('isolated browser: the Queue lists inbox cards, opens their notes, and clos
     await call('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
     await call('Page.navigate', { url: `${origin}/?mobile=1` });
     await wait("document.documentElement.classList.contains('mobile') && document.querySelectorAll('#qlist .qinbox').length === 2");
-    // The filter sheet is the rail, borrowed: the inbox-only project is there too.
-    assert.ok((await evaluate("[...document.querySelectorAll('#mobileFilterSheet [data-project]')].map(node=>node.textContent.trim())")).includes('inbox-beta'));
+    // The filter sheet is the rail, borrowed: no inbox-only project there either.
+    assert.deepEqual(await evaluate("[...document.querySelectorAll('#mobileFilterSheet [data-project]')].map(node=>node.dataset.project)"), [''],
+      'the borrowed rail offers All and nothing else');
     await evaluate("document.querySelector('#qlist .qinbox[data-card=\"newest-idea\"] .qinbox-main').click()");
     await wait("document.querySelector('#qlist .qinbox[data-card=\"newest-idea\"] .qinbox-detail pre')?.textContent.includes('Pattern')");
     assert.equal(await evaluate("document.documentElement.classList.contains('mobile-stage-open')"), false, 'a card row does not push the stage');
