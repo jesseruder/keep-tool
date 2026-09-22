@@ -86,7 +86,9 @@ async function manualClose(body, deps) {
   if (deps.protectOutput) expectedOutputCount = gracefulResult?.expectedOutputCount;
   if ((await wait(200)).closed) return result();
   await gracefulResult?.beforeSignal?.();
-  verify(await deps.getPane(body.pane));
+  // The identity reads around each signal get one phase's budget too; nothing has
+  // been signalled yet here, so a timeout simply fails the close.
+  verify(await withinBudget(deps.getPane(body.pane), 10 * 100));
   const guard = () => ({
     expectedPid: initial.pid,
     expectedSessionId: body.sessionId,
@@ -99,7 +101,7 @@ async function manualClose(body, deps) {
   if (!term.confirmed) throw unconfirmed('SIGTERM', term.waitedMs, term.lastError);
   await gracefulResult?.beforeSignal?.();
   let beforeKill;
-  try { beforeKill = await deps.getPane(body.pane); }
+  try { beforeKill = await withinBudget(deps.getPane(body.pane), 10 * 100); }
   catch (error) { if (timedOut(error)) throw unconfirmed('SIGTERM', term.waitedMs, error); throw error; }
   if (!beforeKill) throw unconfirmed('SIGTERM', term.waitedMs);
   verify(beforeKill);
