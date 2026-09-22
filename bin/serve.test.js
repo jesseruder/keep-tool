@@ -7822,8 +7822,11 @@ test('open uses host panes for both existing sessions and new Claude and Codex l
     accountId: 'claude/default', accountLabel: 'Claude (default)', unlinked: 'creator',
     settled: true, sent: true, linked: true,
   });
-  assert.equal(claudeHost.calls[0].params.meta.sessionId, '33333333-3333-4333-8333-333333333333');
-  assert.equal('viewer' in claudeHost.calls[0].params.meta, false);
+  // By type, not by position: a launch asks the host which process it is talking
+  // to before it sends a spawn it may later have to ask about again.
+  const claudeSpawn = claudeHost.calls.find((call) => call.type === 'spawn');
+  assert.equal(claudeSpawn.params.meta.sessionId, '33333333-3333-4333-8333-333333333333');
+  assert.equal('viewer' in claudeSpawn.params.meta, false);
 
   // The launch numbers the new session, so its start hook can say which it is.
   const numbered = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-number-'));
@@ -10104,7 +10107,7 @@ test('opening an auto-closed done card resumes the same Claude and Codex session
     });
     assert.equal(result.sessionId, id);
     assert.equal(result.command, expected);
-    assert.equal(host.calls[0].params.meta.sessionId, id);
+    assert.equal(host.calls.find((call) => call.type === 'spawn').params.meta.sessionId, id);
   }
 });
 
@@ -13806,9 +13809,22 @@ test('a pane on another node is force-restarted on that node evidence, and nothi
         'every process read and every signal was addressed to the machine that owns the pid');
       const signalled = asked.filter((call) => call.type === 'signal');
       assert.ok(signalled.length, 'the descendant was signalled through the node');
-      assert.deepEqual(signalled[0].params,
-        { pid: child.pid, pidStart: child.pidStart, signal: 'SIGTERM' },
-        'a pid travels with the start time it was captured with, or it is not an identity');
+      // A whole identity, not a pid: a start time recorded to the second cannot on
+      // its own tell a reused pid from the process that was captured.
+      //
+      // And the identity that travels is the one the refresh immediately before the
+      // signal actually saw, not the one captured before the close. Both the parent
+      // and the argument vector legitimately change on the way out — this descendant
+      // has been reparented to init since its agent exited — so comparing against a
+      // capture from before the close would refuse to clean up the very processes
+      // this exists to clean up.
+      assert.equal(signalled[0].params.pid, child.pid);
+      assert.equal(signalled[0].params.pidStart, child.pidStart);
+      assert.equal(signalled[0].params.signal, 'SIGTERM');
+      assert.equal(signalled[0].params.ppid, 1, 'the parent as just observed, not as captured');
+      assert.match(signalled[0].params.args, /sleep/);
+      // The record still carries what was seen when the tree was first walked.
+      assert.equal(entry.processes.find((row) => row.pid === child.pid).ppid, child.ppid);
       assert.deepEqual(entry.processes.map((entryProcess) => entryProcess.pid).sort(),
         [spawned.pid, child.pid].sort(), 'the tree was captured from the node table');
       // The descendant really is gone — signalled through the node, on node evidence.
@@ -13985,4 +14001,243 @@ test('a card opened with --node aws1 runs on aws1, and everything that records i
       assert.match(aws1.panes.get(paneId).args.join(' '), /agent-launcher\.js/);
     } finally { await closeHostClient(); }
   });
+});
+
+
+test('a spawn is only ever asked about again of the host process that ran it', async () => {
+  const { closeHostClient, hostRequest } = require('./serve');
+  // A host that takes the spawn and then drops the connection under it. What the
+  // daemon does next depends entirely on whether the host that answers the reconnect
+  // is the same host process: only that one has the journal, so only that one can
+  // say what happened. Any other, and asking again would start a second agent.
+  const dropped = () => Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+  const makeHost = (bootId, options = {}) => {
+    const calls = [];
+    let spawns = 0;
+    return {
+      calls,
+      socket: { destroyed: false },
+      request: async (type, params) => {
+        calls.push({ type, params });
+        if (type === 'hello') return { bootId, spawnReceipts: options.spawnReceipts !== false };
+        if (type === 'spawn') {
+          spawns += 1;
+          if (spawns === 1 && options.dropFirst) throw dropped();
+          return { pane: { id: 'replayed-pane', pid: 5, createdAt: 5 } };
+        }
+        return {};
+      },
+      onDisconnect: () => ({ dispose() {} }),
+      close: () => {},
+    };
+  };
+  const params = { operationId: 'open-generation-000001', cmd: '/bin/sh', args: ['-c', 'sleep 30'] };
+
+  await closeHostClient();
+  try {
+    // A host that restarted between the send and the retry: refused outright.
+    const hosts = [makeHost('boot-one', { dropFirst: true }), makeHost('boot-two')];
+    let nth = 0;
+    const changed = await hostRequest('spawn', params, {
+      connectHost: async () => hosts[Math.min(nth++, hosts.length - 1)],
+      hostRequestTimeoutMs: 200,
+    }).then(() => null, (error) => error);
+    assert.ok(changed, 'a different host process may not be asked to finish this');
+    assert.equal(changed.code, 'host_request_not_retried');
+    assert.equal(hosts[1].calls.some((call) => call.type === 'spawn'), false,
+      'a host that never ran it is never asked to run it again');
+  } finally { await closeHostClient(); }
+
+  await closeHostClient();
+  try {
+    // The same host process, still journalling: the retry is allowed, and it goes
+    // out as a replay so the host refuses to spawn if its journal has lost it.
+    const same = makeHost('boot-one', { dropFirst: true });
+    const result = await hostRequest('spawn', params, {
+      connectHost: async () => same, hostRequestTimeoutMs: 200,
+    });
+    assert.equal(result.pane.id, 'replayed-pane');
+    const spawns = same.calls.filter((call) => call.type === 'spawn');
+    assert.equal(spawns.length, 2);
+    assert.equal(spawns[0].params.replay, undefined, 'the first attempt is not a replay');
+    assert.equal(spawns[1].params.replay, true, 'the second says so on the wire');
+  } finally { await closeHostClient(); }
+
+  await closeHostClient();
+  try {
+    // A host that does not journal spawns keeps the never-retry rule outright.
+    const plain = makeHost('boot-one', { dropFirst: true, spawnReceipts: false });
+    const refused = await hostRequest('spawn', params, {
+      connectHost: async () => plain, hostRequestTimeoutMs: 200,
+    }).then(() => null, (error) => error);
+    assert.ok(refused);
+    assert.equal(refused.code, 'host_request_not_retried');
+    assert.equal(plain.calls.filter((call) => call.type === 'spawn').length, 1);
+  } finally { await closeHostClient(); }
+});
+
+test('each node pane is judged by its own node processes, however the pids overlap', async (t) => {
+  const { withTwoNodeFleet } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient, listHostPaneResult, hostRequest, nodeEvidence } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodeFleet(t, async ({ agentPath }) => {
+    await closeHostClient();
+    const asked = [];
+    const deps = {
+      connectHost: async (options) => {
+        const node = options.node || 'main';
+        const client = await connect(options);
+        return {
+          ...client,
+          request: (type, params, requestOptions) => {
+            asked.push({ node, type });
+            return client.request(type, params, requestOptions);
+          },
+          onDisconnect: (listener) => client.onDisconnect(listener),
+          close: () => client.close(),
+        };
+      },
+      hostRemoteListTimeoutMs: 2000,
+    };
+    try {
+      const local = (await hostRequest('spawn', {
+        cmd: '/bin/sh', args: ['-c', 'sleep 30'], env: { PATH: agentPath },
+        meta: { agent: 'claude', sessionId: 'local-session' },
+      }, deps)).pane;
+      const remote = (await hostRequest('spawn', {
+        cmd: '/bin/sh', args: ['-c', 'sleep 30'], env: { PATH: agentPath },
+        meta: { agent: 'claude', sessionId: 'remote-session' },
+      }, { ...deps, node: 'aws1' })).pane;
+
+      // Two tables that happen to share their pids — which is what two machines
+      // always look like, and what one machine's table looked like for both panes
+      // before each node was asked about itself. A bare login shell where the agent
+      // should be is the one shape that proves an agent is gone, so a pane read
+      // against the wrong table is a live agent reported dead.
+      const shell = (pid, pidStart) => ({ pid, ppid: 1, pidStart, args: '/bin/zsh -l', agent: null, interactive: false });
+      const rows = { main: [shell(local.pid, 'a')], aws1: [shell(remote.pid, 'b')] };
+      const seen = [];
+      const listed = await listHostPaneResult({
+        ...deps,
+        agentProcessRows: async (given, options = {}) => {
+          seen.push(options.node);
+          return rows[options.node] || [];
+        },
+      }, true);
+      assert.deepEqual([...seen].sort(), ['aws1', 'main'], 'each node was asked about itself');
+      const byId = new Map(listed.panes.map((pane) => [pane.id, pane]));
+      assert.equal(byId.get(local.id).agentAlive, false);
+      assert.equal(byId.get(local.id).node, 'main');
+      assert.equal(byId.get(remote.id).agentAlive, false);
+      assert.equal(byId.get(remote.id).node, 'aws1');
+
+      // The readers a remote pane's restart installs answer for whichever node they
+      // are asked about, not for the one that installed them. The same deps object
+      // reaches the fleet listing above, and a reader bound to one machine answered
+      // every one of those questions with that machine's processes.
+      const wrapped = nodeEvidence('aws1', deps);
+      asked.length = 0;
+      await wrapped.psEnv([local.pid], { node: 'main' });
+      assert.deepEqual(asked.map((call) => [call.node, call.type]), [['main', 'process']],
+        'asked about the daemon node, it asks the daemon node');
+      asked.length = 0;
+      await wrapped.psEnv([remote.pid], { node: 'aws1' });
+      assert.deepEqual(asked.map((call) => [call.node, call.type]), [['aws1', 'process']]);
+      asked.length = 0;
+      await wrapped.psEnv([remote.pid]);
+      assert.deepEqual(asked.map((call) => [call.node, call.type]), [['aws1', 'process']],
+        'and with nothing named, the node whose pane installed it');
+    } finally { await closeHostClient(); }
+  });
+});
+
+test('a reopen on another node fails closed when that node cannot say what is running', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reopen-node-evidence-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const configDir = path.join(root, 'claude');
+  fs.mkdirSync(configDir);
+  const config = path.join(root, 'accounts.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'node-open', label: 'Node open', agent: 'claude', configDir },
+  ], defaultAccounts: { claude: 'node-open' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+  const session = { id: 'far-session', kind: 'claude', project: root, accountId: 'node-open' };
+  require('./accounts').pinSession(session.id, 'claude', 'node-open', { root, env, node: 'aws1' });
+  const base = {
+    root, env, scanSessions: () => [session], placementNodes: ['main', 'aws1'],
+    // No pane anywhere, which is what sends the open down the duplicate-agent path.
+    resolveSessionTarget: async () => { throw new InjectionError(404, 'no pane', { notLive: true }); },
+  };
+
+  // A node that cannot be reached says nothing about its processes, and "nothing" is
+  // not "no agent is running". Resuming on it would risk a second writer on the
+  // transcript, so the open is refused instead.
+  for (const rows of [() => { throw new Error('unreachable'); }, () => []]) {
+    await assert.rejects(openSession({ sessionId: session.id }, { ...base, agentProcessRows: async () => rows() }),
+      (error) => error.status === 409 && error.message === 'cannot verify processes on aws1');
+  }
+
+  // A node that answers, and says the agent is already running there: named, with
+  // the pid on that machine.
+  await assert.rejects(openSession({ sessionId: session.id }, {
+    ...base,
+    agentProcessRows: async () => [
+      { pid: 4242, ppid: 1, pidStart: 'x', args: 'claude --resume far-session', agent: 'claude', interactive: true },
+    ],
+  }), (error) => error.status === 409 && /is running outside the host \(pid 4242\)/.test(error.message));
+});
+
+test('two opens that disagree about the node are two requests, and the second is refused', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-node-dedupe-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const configDir = path.join(root, 'claude');
+  fs.mkdirSync(configDir);
+  const config = path.join(root, 'accounts.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'node-open', label: 'Node open', agent: 'claude', configDir },
+  ], defaultAccounts: { claude: 'node-open' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+  const session = { id: 'dedupe-session', kind: 'claude', project: root, accountId: 'node-open' };
+  require('./accounts').pinSession(session.id, 'claude', 'node-open', { root, env, node: 'aws1' });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const deps = {
+    root, env, scanSessions: () => [session], placementNodes: ['main', 'aws1'],
+    resolveSessionTarget: async () => { await gate; return { pane: 'pane-1' }; },
+  };
+
+  const first = openSession({ sessionId: session.id }, deps);
+  // While that one is in flight: the node is settled before the dedupe can answer,
+  // so an open that names the wrong machine is told so rather than being handed the
+  // in-flight open's result.
+  await assert.rejects(openSession({ sessionId: session.id, node: 'main' }, deps),
+    (error) => error.status === 409 && /runs on node aws1$/.test(error.message));
+  // And a capability pin is part of the request too, not something a running open
+  // can answer for.
+  await assert.rejects(openSession({ sessionId: session.id, needs: 'browser' }, deps),
+    (error) => error.status === 409);
+  release();
+  assert.equal((await first).pane, 'pane-1');
+});
+
+test('a standalone open is placed by the project it resolved, exactly as a card is', async (t) => {
+  const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-standalone-place-')));
+  t.after(() => fs.rmSync(project, { recursive: true, force: true }));
+  const { resolvePlacement } = require('./serve');
+  const fleet = {
+    placementNodes: [{ name: 'main', capabilities: [] }, { name: 'mini', capabilities: [] }],
+    placement: { projects: { [project]: 'mini' } },
+  };
+  // A standalone open has no card, so the only project it can be placed by is the
+  // directory it resolved for itself. Before this it had none, and placement simply
+  // did nothing for `keep open --fresh --cwd`.
+  assert.equal(resolvePlacement({ project: [null, project] }, fleet), 'mini');
+  assert.equal(resolvePlacement({ project: [null, path.join(project, 'nested')] }, fleet), 'main');
+
+  // And the key is matched however the project is spelled: a card writes `~/...`,
+  // a standalone open resolves the absolute path, and both name one directory.
+  const home = path.dirname(project);
+  const tilde = { ...fleet, env: { HOME: home }, placement: { projects: { [`~/${path.basename(project)}`]: 'mini' } } };
+  assert.equal(resolvePlacement({ project: [null, project] }, tilde), 'mini');
+  assert.equal(resolvePlacement({ project: [`~/${path.basename(project)}`, project] }, tilde), 'mini');
 });

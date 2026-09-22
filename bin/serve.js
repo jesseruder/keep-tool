@@ -421,6 +421,9 @@ let liveSessionTickInFlight = false;
 let lastAutoCompactGc = 0;
 let reviewStateCache = { at: 0, value: null };
 const hostPaneCaches = new WeakMap();
+// Which host process each connection reaches, for the one question that outlives a
+// single request: may a spawn sent on it be asked about again?
+const hostGenerations = new WeakMap();
 const lastKnownHostPaneMemo = { panes: null, at: 0 };
 // Which pane results came from a cache rather than from a host this time round.
 // Out of band because the result object itself is what a single-node install
@@ -2016,20 +2019,32 @@ async function requestHostClient(client, type, params, deps = {}) {
   }
 }
 
-// Whether the host on this node journals spawn operations, and so may be asked the
-// same spawn twice. Consulted only on the failure path: the happy path must not pay
-// a round trip for a capability it does not need, and a single-node install must go
-// on sending exactly the frames it always sent.
-async function hostJournalsSpawns(node, deps = {}, channel = 'control') {
+// Which host process this connection reaches, and whether it journals spawns.
+// Asked once per connection and remembered against the connection itself, never
+// against the node: a node name outlives a host process, and the whole point of
+// this is to tell one host process from the next one.
+async function hostGeneration(client, deps = {}) {
+  if (hostGenerations.has(client)) return hostGenerations.get(client);
+  let generation = null;
   try {
-    const client = await hostClientFor(node, deps, channel);
-    if (!client) return false;
-    if (client.descriptor && typeof client.descriptor.spawnReceipts === 'boolean') {
-      return client.descriptor.spawnReceipts === true;
+    const hello = client.descriptor && typeof client.descriptor.bootId === 'string' && client.descriptor.bootId
+      ? client.descriptor
+      : await requestHostClient(client, 'hello', {}, deps);
+    if (hello && typeof hello.bootId === 'string' && hello.bootId) {
+      generation = { bootId: hello.bootId, spawnReceipts: hello.spawnReceipts === true };
     }
-    const hello = await requestHostClient(client, 'hello', {}, deps);
-    return Boolean(hello && hello.spawnReceipts === true);
-  } catch { return false; }
+  } catch { generation = null; }
+  hostGenerations.set(client, generation);
+  return generation;
+}
+
+// Whether a spawn sent to `sent` may be replayed to `now`. Only the same host
+// process can answer for what it ran: a host that restarted has no journal, so a
+// "retry" against it would be a second spawn wearing the first one's name. The
+// receipt capability must hold on both sides, because the reply the daemon lost
+// may have come from a host that did not journal it.
+function sameSpawnGeneration(sent, now) {
+  return Boolean(sent && now && sent.bootId === now.bootId && sent.spawnReceipts && now.spawnReceipts);
 }
 
 async function hostRequest(type, params, deps = {}) {
@@ -2046,7 +2061,13 @@ async function hostRequest(type, params, deps = {}) {
   // one made rather than starting a second process. Everything else keeps the
   // never-retry rule, and a spawn without an id keeps it too.
   const journalledSpawn = type === 'spawn' && typeof params?.operationId === 'string' && params.operationId;
-  let spawnRetryAllowed = false;
+  // The host process the spawn was actually sent to, captured before it was sent.
+  // Permission to ask again is never cached: it is decided fresh on each attempt,
+  // against whichever host answers then, and dies with the connection that earned it.
+  let sentGeneration = null;
+  let replaying = false;
+  let retryReason = null;
+  let retryCause = null;
   // A qualified pane names the node it lives on, so every existing call site that
   // passes target.pane routes to the right host without knowing nodes exist. A bare
   // pane is the daemon node's, and its params object is passed through untouched.
@@ -2096,18 +2117,37 @@ async function hostRequest(type, params, deps = {}) {
       const detail = String(state.failureError && state.failureError.message || '').trim();
       const error = new Error(pressure.annotate(`terminal host is unavailable${detail ? `: ${detail}` : ''}`),
         state.failureError ? { cause: state.failureError } : undefined);
-      if (!idempotent && !spawnRetryAllowed) throw notRetried('was unavailable', error);
+      // Nothing to compare a generation against, so a spawn cannot earn a replay
+      // here either: no host answered, and no host may be assumed to be the one
+      // that ran it.
+      if (!idempotent) throw notRetried(retryReason || 'was unavailable', retryCause || error);
       retryDeadline = Math.min(retryDeadline, wallNow() + retryMs);
       if (wallNow() >= deadline || wallNow() >= retryDeadline) throw error;
       forceHostReconnect = true;
       await sleep(Math.min(50, Math.max(0, Math.min(deadline, retryDeadline) - wallNow())));
       continue;
     }
+    // Outside the try on purpose: a refusal raised in there is caught by the same
+    // catch, which would read the detail it had just appended as a retryable error
+    // and send the request round again.
+    if (journalledSpawn) {
+      const generation = await hostGeneration(client, deps);
+      if (retryReason) {
+        // A retry, and the only question that matters: is this the same host process
+        // that ran the first attempt? If it is not, nothing here knows what happened,
+        // and asking again would start a second agent.
+        if (!sameSpawnGeneration(sentGeneration, generation)) throw notRetried(retryReason, retryCause);
+        // Said on the wire, so the host refuses to spawn rather than quietly making a
+        // new pane if its journal has lost the receipt after all.
+        replaying = true;
+      } else sentGeneration = generation;
+    }
     try {
       const attemptTimeoutMs = Math.max(1, Math.min(
         requestTimeoutMs,
         deadline - wallNow(),
       ));
+      const attempt = replaying ? { ...request, replay: true } : request;
       if (!idempotent) {
         // A stale identity/activity list is safe only until this daemon changes the
         // host, and the host may execute a request whose reply timed out here, so
@@ -2120,7 +2160,7 @@ async function hostRequest(type, params, deps = {}) {
         // this mutation must not come back as that node's "last known" afterwards.
         nodePaneMemo.clear();
       }
-      const result = await requestHostClient(client, type, request, {
+      const result = await requestHostClient(client, type, attempt, {
         ...deps, hostRequestTimeoutMs: attemptTimeoutMs,
       });
       if (['spawn', 'meta', 'kill', 'remove', 'resize', 'clear'].includes(type)) hostPaneCaches.delete(client);
@@ -2136,17 +2176,20 @@ async function hostRequest(type, params, deps = {}) {
       const timedOut = hostRequestTimedOut(error);
       if (disconnected) invalidateHost(client, deps, error);
       if (!reloading && !disconnected && !timedOut) throw error;
-      if (!idempotent && !spawnRetryAllowed) {
-        // Asked here rather than before the request, so the capability costs a round
-        // trip only on the failure it would rescue.
-        if (journalledSpawn) spawnRetryAllowed = await hostJournalsSpawns(node, deps, channel);
+      if (!idempotent) {
+        const reason = reloading ? 'was reloading' : timedOut ? 'timed out' : 'disconnected';
+        // A journalled spawn that reached a host which says it journals them may be
+        // asked about again — but only of that same host, which the next attempt
+        // checks before it sends anything. Everything else, and a spawn whose first
+        // attempt never reached a host, keeps the never-retry rule.
+        if (!journalledSpawn || !sentGeneration || !sentGeneration.spawnReceipts) throw notRetried(reason, error);
+        // One replay. A second would be asking the same question of the same host.
+        if (replaying) throw notRetried(reason, error);
+        retryReason = reason;
+        retryCause = error;
         // The replay gets a budget of its own: the attempt that failed has already
         // spent this one, and a receipt is answered at once.
-        if (spawnRetryAllowed) deadline = wallNow() + connectBudgetMs + requestTimeoutMs;
-        if (!spawnRetryAllowed) {
-          const reason = reloading ? 'was reloading' : timedOut ? 'timed out' : 'disconnected';
-          throw notRetried(reason, error);
-        }
+        deadline = wallNow() + connectBudgetMs + requestTimeoutMs;
       }
       if (timedOut && timeoutRetries++ >= 1) throw error;
       if (reloading || disconnected) retryDeadline = Math.min(retryDeadline, wallNow() + retryMs);
@@ -5479,29 +5522,42 @@ function freshSessionRead(session, deps = {}) {
 // the judgement above them is the same judgement, wherever the pane is.
 function nodeEvidence(node, deps = {}) {
   if (node === daemonNodeName(deps)) return deps;
-  // The mtimes come back with the paths, because the rollout files are on that
-  // machine and this one cannot stat them.
+  // Rollout mtimes come back with the paths, because the files are on that machine
+  // and this one cannot stat them. Keyed by node as well as path: these readers
+  // travel in a deps object that a fan-out will point at other machines, and two
+  // nodes can hold rollouts at the same path.
   const mtimes = new Map();
+  const key = (where, file) => where + '\u0000' + file;
+  // Every reader takes the node it is asked about and answers for that one. The
+  // node named here is only the default — the machine whose pane started this —
+  // because the same deps object is handed to a fleet listing that asks about each
+  // node in turn, and a reader bound to one machine would answer every one of those
+  // questions with one machine's processes. That is how a pane on aws1 came to be
+  // judged by main's process table.
+  const where = (options) => (options && options.node) || node;
   return {
     ...deps,
-    agentProcessRows: deps.agentProcessRows || ((given) => agentProcessRows(given, { node })),
-    psEnv: deps.psEnv || (async (pids) => {
-      const result = await hostRequest('process', { pids, env: true }, { ...deps, node });
+    agentProcessRows: deps.agentProcessRows
+      || ((given, options = {}) => agentProcessRows(given, { node: where(options) })),
+    psEnv: deps.psEnv || (async (pids, options = {}) => {
+      const result = await hostRequest('process', { pids, env: true }, { ...deps, node: where(options) });
       return (result.env || []).map((entry) => `${entry.pid} CLAUDE_CODE_SESSION_ID=${entry.sessionId}`).join('\n');
     }),
-    lsof: deps.lsof || (async (pids) => {
-      const result = await hostRequest('process', { pids, files: true }, { ...deps, node });
+    lsof: deps.lsof || (async (pids, options = {}) => {
+      const target = where(options);
+      const result = await hostRequest('process', { pids, files: true }, { ...deps, node: target });
       const byPid = new Map();
       for (const entry of result.files || []) {
         if (!byPid.has(entry.pid)) byPid.set(entry.pid, []);
         byPid.get(entry.pid).push(entry.path);
-        mtimes.set(entry.path, entry.mtime);
+        mtimes.set(key(target, entry.path), entry.mtime);
       }
       return [...byPid].flatMap(([pid, files]) => [`p${pid}`, ...files.map((file) => `n${file}`)]).join('\n');
     }),
-    statMtime: deps.statMtime || (async (file) => {
-      const value = mtimes.get(file);
-      if (!Number.isFinite(value)) throw new Error(`no rollout mtime for ${file} on ${node}`);
+    statMtime: deps.statMtime || (async (file, options = {}) => {
+      const target = where(options);
+      const value = mtimes.get(key(target, file));
+      if (!Number.isFinite(value)) throw new Error(`no rollout mtime for ${file} on ${target}`);
       return value;
     }),
     // A forced stop re-reads the table after every signal, so this one is never
@@ -5511,8 +5567,10 @@ function nodeEvidence(node, deps = {}) {
       const result = await hostRequest('process', {}, { ...deps, node });
       return Array.isArray(result && result.rows) ? result.rows : [];
     }),
-    forceSignal: deps.forceSignal || ((pid, name, pidStart) =>
-      hostRequest('signal', { pid, pidStart, signal: name }, { ...deps, node })),
+    forceSignal: deps.forceSignal || ((pid, name, captured = {}) =>
+      hostRequest('signal', {
+        pid, pidStart: captured.pidStart, ppid: captured.ppid, args: captured.args, signal: name,
+      }, { ...deps, node })),
   };
 }
 
@@ -5524,11 +5582,15 @@ async function prepareLaunchOn(node, options, deps = {}, localDeps = {}) {
 }
 
 async function liveSessionPids(deps = {}, options = {}) {
-  if (options.node) deps = nodeEvidence(options.node, deps);
+  // The machine every read below is about. Named on each one, not bound once, so a
+  // deps object shared with a fleet listing cannot answer for the wrong machine.
+  const node = options.node || null;
+  if (node) deps = nodeEvidence(node, deps);
+  const at = node ? { node } : {};
   const live = new Map();
   let rows = [];
   try {
-    const found = await (deps.agentProcessRows || agentProcessRows)(deps);
+    const found = await (deps.agentProcessRows || agentProcessRows)(deps, at);
     if (Array.isArray(found)) rows = found;
   } catch {}
   const backgroundPiPids = verifiedPiBackgroundPids(rows, deps);
@@ -5555,7 +5617,7 @@ async function liveSessionPids(deps = {}, options = {}) {
     try {
       const pids = [...parentByChild.keys()];
       let output;
-      if (typeof deps.psEnv === 'function') output = await deps.psEnv(pids);
+      if (typeof deps.psEnv === 'function') output = await deps.psEnv(pids, at);
       else {
         // The same patience agentProcessRows now has: this read is what gives a fresh
         // TUI its session id, and losing it under load loses the whole identity.
@@ -5579,7 +5641,7 @@ async function liveSessionPids(deps = {}, options = {}) {
     try {
       const pids = codexRows.map((row) => row.pid);
       let output;
-      if (typeof deps.lsof === 'function') output = await deps.lsof(pids);
+      if (typeof deps.lsof === 'function') output = await deps.lsof(pids, at);
       else {
         const result = await (deps.execFile || execFileAsync)('lsof', ['-p', pids.join(','), '-Fpn'], {
           encoding: 'utf8', timeout: 5e3, maxBuffer: 32e6,
@@ -5601,7 +5663,7 @@ async function liveSessionPids(deps = {}, options = {}) {
         for (const entry of entries) {
           try {
             entry.mtime = typeof deps.statMtime === 'function'
-              ? Number(await deps.statMtime(entry.path))
+              ? Number(await deps.statMtime(entry.path, at))
               : fs.statSync(entry.path).mtimeMs;
           } catch { entry.mtime = -Infinity; }
         }
@@ -6419,8 +6481,9 @@ function forceStopDeps(entry, deps, host, save) {
     }),
     // The captured process, not a bare pid: the comparison and the kill happen on the
     // machine that owns the pid, in one step, and a pid checked here and signalled
-    // there is no check at all. The start time rides along for the node to compare.
-    signal: async (target, name) => signal(target.pid, name, target.pidStart),
+    // there is no check at all. The whole captured row rides along — start time,
+    // parent and arguments — because that is what the node compares against.
+    signal: async (target, name) => signal(target.pid, name, target),
     sessionLive: async sid => (await liveSessionPids({ ...deps, agentProcessRows: rows })).has(sid),
   };
 }
@@ -6494,10 +6557,11 @@ async function forceStopThenResume({ session, pane, identity, resume }, deps = {
     if (grew) await deps.onForcedStop?.(processes.map((p) => ({ ...p })));
     for (const old of [...processes].reverse()) {
       const current = table.find((p) => p.pid === old.pid);
-      // The start time travels with the pid: on another machine the comparison and
-      // the kill have to happen there, together, and a pid on its own is not an
-      // identity. On this one it is the same local kill it has always been.
-      if (same(current, old) && !current.zombie) await signal(old.pid, name, old.pidStart);
+      // The live row this process was just matched against travels with the pid: on
+      // another machine the comparison and the kill have to happen there, together,
+      // and a pid on its own is not an identity. On this one it is the same local
+      // kill it has always been.
+      if (same(current, old) && !current.zombie) await signal(old.pid, name, current);
     }
     for (let i = 0; i < 10; i++) {
       await sleep(200);
@@ -8292,6 +8356,25 @@ function placementNodes(deps = {}) {
   }
 }
 
+// Which node a project is placed on. The key in the configuration is written the
+// way a person writes a project — `~/castle/ghost-server` — and the project reaching
+// here may be that, or the absolute path a standalone open resolved for itself. Both
+// spellings name one directory, so both are compared as one: without this, placement
+// applied to card opens and quietly did nothing for `keep open --fresh --cwd`.
+function placementProjectNode(project, placement, deps = {}) {
+  const candidates = (Array.isArray(project) ? project : [project]).filter((value) => typeof value === 'string' && value);
+  if (!candidates.length) return null;
+  const home = (deps.env || process.env).HOME || os.homedir();
+  const expand = (value) => path.resolve(String(value).replace(/^~(?=\/|$)/, home));
+  const entries = Object.entries(placement.projects || {});
+  for (const candidate of candidates) {
+    const wanted = expand(candidate);
+    const hit = entries.find(([key]) => key === candidate || expand(key) === wanted);
+    if (hit) return hit[1];
+  }
+  return null;
+}
+
 function placementConfiguration(deps = {}) {
   if (deps.placement) return { default: deps.placement.default || null, projects: deps.placement.projects || {} };
   try {
@@ -8332,7 +8415,8 @@ function resolvePlacement(request = {}, deps = {}) {
     // existed names no node, and that is the daemon node by construction.
     chosen = request.lastCardNode || daemon;
   } else {
-    chosen = placementConfiguration(deps).projects[request.project || ''] || placementConfiguration(deps).default || daemon;
+    const placement = placementConfiguration(deps);
+    chosen = placementProjectNode(request.project, placement, deps) || placement.default || daemon;
   }
   const wanted = [...new Set((request.needs || []).filter(Boolean))];
   if (!wanted.length) return chosen;
@@ -8690,8 +8774,29 @@ async function openSession(body, deps = {}) {
   }
   if (body.fresh) session = null;
 
+  // Which machine this session runs on, settled before anything can dedupe against
+  // it. Two opens that disagree about the node are two different requests: the
+  // second has to be refused, not handed the first one's answer, or asking for the
+  // wrong node twice would quietly succeed.
+  let launchNode;
+  if (session) {
+    if (typeof session.id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(session.id)) {
+      throw new InjectionError(400, 'bad session id');
+    }
+    let runsOn = null;
+    try { runsOn = accounts.sessionNode(session.id, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
+    catch (error) { throw new InjectionError(409, error.message); }
+    launchNode = resolvePlacement({
+      node: body.node || null,
+      pinned: runsOn || nodes.daemonNode(deps.env || process.env),
+      needs,
+      label: `session ${sessionRef(session.id)}`,
+    }, deps);
+  }
+
   if (session && !deps.reopenOpenClaimed) {
-    const identity = JSON.stringify({ accountId: body.accountId || '', model: body.model || '', message });
+    const identity = JSON.stringify({ accountId: body.accountId || '', model: body.model || '', message,
+      node: launchNode, needs: body.needs || '' });
     const running = reopenOpenOperations.get(session.id);
     if (running) {
       if (running.identity !== identity) throw new InjectionError(409, 'session reopen is already delivering a different request');
@@ -8711,28 +8816,12 @@ async function openSession(body, deps = {}) {
   if (launchModel && !(agent === 'pi' ? keep.PI_MODEL_RE : keep.LAUNCH_MODEL_RE).test(launchModel)) {
     throw new InjectionError(400, agent === 'pi' ? 'model is not valid for pi' : 'model must be a model id');
   }
-  if (session && (typeof session.id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(session.id))) {
-    throw new InjectionError(400, 'bad session id');
-  }
   let account;
   let accountNote = '';
   let accountWarning = '';
   let reopenTurn = null;
-  // Which machine this session runs on, settled once, here, before anything is
-  // pinned, prepared or spawned. The launch, the pane meta, the account authority
-  // and the card entry all have to name the same node, and a launch that worked it
-  // out twice could disagree with itself.
-  let launchNode;
   if (session) {
-    let runsOn = null;
-    try { runsOn = accounts.sessionNode(session.id, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
-    catch (error) { throw new InjectionError(409, error.message); }
-    launchNode = resolvePlacement({
-      node: body.node || null,
-      pinned: runsOn || nodes.daemonNode(deps.env || process.env),
-      needs,
-      label: `session ${sessionRef(session.id)}`,
-    }, deps);
+    // launchNode was settled above, before the reopen dedupe could answer for it.
     try { account = accounts.forSession(session.id, agent, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
     catch (error) { throw new InjectionError(409, error.message); }
     if (!account && session.accountId) {
@@ -8759,7 +8848,10 @@ async function openSession(body, deps = {}) {
     launchNode = resolvePlacement({
       node: body.node || null,
       lastCardNode: lastCardEntry === undefined ? undefined : (lastCardEntry.node || null),
-      project: card ? card.fm.project : null,
+      // The card's project as it is written there, and the directory this open
+      // actually resolved. A standalone open has only the second, and placement has
+      // to reach it the same way it reaches a card's.
+      project: [card ? card.fm.project : null, project],
       needs: [...needs, ...(card ? (card.fm.tags || []) : []).filter((tag) => PLACEMENT_TAG_CAPABILITIES.includes(tag))],
     }, deps);
     const env = deps.env || process.env;
@@ -8825,6 +8917,9 @@ async function openSession(body, deps = {}) {
       if (existing.meta?.agent !== agent || existing.meta?.accountId !== account.id
           || path.resolve(existing.meta?.project || '') !== project
           || (existing.meta?.model || '') !== launchModel
+          // The machine is part of what was asked for: a pane on another node is not
+          // this request already satisfied, it is a different request wearing its id.
+          || (existing.node || nodes.daemonNode(deps.env || process.env)) !== launchNode
           || !Number.isFinite(Number(existing.meta?.launchedAt))) {
         throw new InjectionError(409, 'open request was already used for a different launch');
       }
@@ -8931,7 +9026,11 @@ async function openSession(body, deps = {}) {
         ? { accountSetup: { ...require('./account-setup'), trustProject: deps.trustProject } }
         : {});
     } catch (error) {
-      if (error && error.code === 'shared-setup') throw new InjectionError(409, error.message);
+      // Both are the machine saying it cannot run this account: a refusal to hand
+      // back, not a fault to retry.
+      if (error && ['shared-setup', 'account-missing'].includes(error.code)) {
+        throw new InjectionError(409, error.message);
+      }
       throw error;
     }
     const piOpeningFile = prepared.piOpeningFile || null;
@@ -9018,7 +9117,26 @@ async function openSession(body, deps = {}) {
     if (!target && !body.fresh) {
       // No host pane, but the agent may still be running in a plain terminal: a second
       // process on the same transcript would corrupt it, so refuse rather than resume.
-      const live = await (deps.liveSessionPids || liveSessionPids)(deps);
+      //
+      // The processes that could be it are on the machine this session runs on, so
+      // that is the machine asked. And this one fails closed: liveSessionPids treats
+      // an unreadable table as "nothing is running", which is the right answer for a
+      // guard that is advisory and exactly the wrong one for a guard whose job is to
+      // stop a second agent writing the same transcript. A node that cannot answer
+      // is a node this daemon may not resume on.
+      let live;
+      if (launchNode === nodes.daemonNode(deps.env || process.env)) {
+        live = await (deps.liveSessionPids || liveSessionPids)(deps);
+      } else {
+        let rows = null;
+        try { rows = await (deps.agentProcessRows || agentProcessRows)(deps, { node: launchNode }); } catch {}
+        if (!Array.isArray(rows) || !rows.length) {
+          throw new InjectionError(409, `cannot verify processes on ${launchNode}`);
+        }
+        live = await (deps.liveSessionPids || liveSessionPids)(
+          { ...deps, agentProcessRows: async () => rows }, { node: launchNode },
+        );
+      }
       const running = live.get(session.id);
       if (running) {
         throw new InjectionError(409, `session ${sessionRef(session.id)} is running outside the host (pid ${running.pid}); exit it there first, then keep open again`, { pid: running.pid });
@@ -12916,6 +13034,7 @@ module.exports = {
   validPaneRef,
   hostNodeEntries,
   resolvePlacement,
+  nodeEvidence,
   hostNodeNames,
   listNodePaneResult,
   sessionHostPane,
