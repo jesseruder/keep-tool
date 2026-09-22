@@ -187,14 +187,28 @@ test('a one-off job still working is never stopped; the same tree serving a port
   assert.equal((await leftovers.list(f.deps)).leftovers.length, 1);
 });
 
-test('dev servers, watchers and test runners are recognised by their tools', () => {
-  for (const command of ['npm run dev', 'node /r/node_modules/.bin/next dev', 'npm exec react-native start --port 8082',
-    'node /r/node_modules/vitest/dist/workers/forks.js', 'python3 -m http.server', 'uv run flask run', 'node /x/cli/dist/index.js serve /y',
-    'node /r/node_modules/.bin/jest --watch', 'node /r/node_modules/@storybook/cli/bin/index.js dev']) {
+test('servers, watchers and orphaned test workers are recognised; one-off jobs are not', () => {
+  for (const command of ['npm run dev', 'pnpm dev', 'yarn start', 'bun run dev:web', 'node /r/node_modules/.bin/next dev',
+    'npm exec react-native start --client-logs --port 8082', 'npx expo start', 'node /r/node_modules/vitest/dist/workers/forks.js',
+    'python3 -m http.server', 'uv run flask run', 'node /r/node_modules/.bin/jest --watch', 'npx vite', 'npx serve dist',
+    'node /r/node_modules/.bin/vite --port 3000', 'next-server (v15.1.0)', 'node /r/node_modules/next/dist/server/lib/start-server.js', 'npx tsc --watch']) {
     assert.equal(leftovers.DEV_TOOLS.test(command), true, command);
   }
-  for (const command of ['node scripts/replay.js --all', 'bash migrate.sh', 'python eval.py', 'make build', 'node /r/node_modules/typescript/bin/tsc -p .']) {
+  for (const command of ['node scripts/backfill.js --env dev', 'bash scripts/migrate.sh dev', 'python eval.py --split dev',
+    'npx prisma migrate dev', 'npx drizzle-kit push --config dev', 'node replay.js --cursor next', 'node /data/exports/next',
+    'python train.py --out runs/next', 'npx vitest run', 'npx jest --ci', 'python -m pytest tests/ -x', 'npx playwright test',
+    'next build', 'npx vite build', 'node scripts/replay.js --all', 'bash migrate.sh', 'node /r/node_modules/typescript/bin/tsc -p .', 'torchrun train.py']) {
     assert.equal(leftovers.DEV_TOOLS.test(command), false, command);
+  }
+});
+
+test('a listening port counts only for a node, deno or bun process that is not a debugger', async () => {
+  for (const [command, counts] of [['node dist/server.js', true], ['python train.py', false], ['node --inspect=9229 job.js', false]]) {
+    const f = fixture();
+    f.state.rows[0].command = 'bash run.sh';
+    f.state.rows[1].command = command;
+    f.state.ports.add(201);
+    assert.equal((await leftovers.list(f.deps)).leftovers.length, counts ? 1 : 0, command);
   }
 });
 

@@ -2806,9 +2806,11 @@ test runner — is swept by the daemon every five minutes (`leftovers` in
 init/launchd, it belongs to the current user, the root is a dev tool (node, a
 package runner, python, ruby, go, make, a shell, or a `node_modules` binary), it
 inherited `KEEP_PANE`, and that pane is exited or closed. The tree must also
-look like a server, watcher or test runner (vite, next, metro, jest, vitest, a
-`dev`/`serve` script and the like) or hold a listening TCP port; a one-off job
-that is still working is never stopped. It is kept while any
+look like a server or watcher (a `dev`/`start`/`serve` package script, `next dev`,
+vite, metro, expo, a `--watch` mode, a Python or Rails dev server, an orphaned
+vitest or jest worker) or have a node, deno or bun process listening on a TCP
+port (debugger ports excluded); a one-off job that is still working, including a
+finite test run, is never stopped. It is kept while any
 live pane runs the same session (Claude, Codex or Pi id) or the same card, while
 an account transfer for it is in flight, and for `KEEP_LEFTOVER_GRACE_MIN`
 (default 15) after the pane went away; a closed pane's grace is counted from the

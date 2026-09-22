@@ -26,7 +26,22 @@ const AGENT_ARGS = /@anthropic-ai\/claude-code|@openai\/codex|(?:^|\/)(?:claude|
 // What makes a tree a server, watcher or test runner rather than a one-off job that is
 // still working (a migration, a replay, an eval): a tool of that kind somewhere in it,
 // or a listening TCP port. A tree with neither is never stopped.
-const DEV_TOOLS = /(?:^|[\s/])(?:vite|next|next-server|metro|react-native\s+start|expo\s+start|webpack|webpack-dev-server|jest|vitest|mocha|playwright|nodemon|storybook|astro|nuxt|remix|parcel|http-server|live-server|ts-node-dev|tsx\s+watch|rails\s+s(?:erver)?|uvicorn|gunicorn|pytest)(?:\s|$|\()|node_modules\/(?:@[^/\s]+\/)?(?:vite|next|metro|react-native|expo|webpack|webpack-dev-server|jest|jest-worker|vitest|mocha|playwright|nodemon|storybook|astro|nuxt|parcel|ts-node-dev|tsx)\/|\s--watch\b|flask\s+run|manage\.py\s+runserver|-m\s+http\.server|\sdev(?:\s|$)|\sserve(?:\s|$)/;
+const SERVE_TOOLS = String.raw`(?:next\s+(?:dev|start)|vite(?:\s+(?:dev|serve|preview)|\s+--\S+|\s*$)|react-native\s+start|expo\s+start|webpack\s+serve|webpack-dev-server|nodemon|storybook(?:\s+dev)?|astro\s+dev|nuxt\s+dev|remix\s+dev|parcel(?:\s+serve)?(?:\s+[^b\s]|\s*$)|http-server|live-server|serve(?:\s|$)|ts-node-dev|tsx\s+watch)`;
+const DEV_TOOLS = new RegExp([
+  // A package script that runs a server or watcher, by its conventional name.
+  String.raw`(?:^|[\s/])(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+(?:dev|serve|start|watch|storybook)(?::\S*)?(?:\s|$)`,
+  // A server or watcher tool, run through a package runner or a project's .bin.
+  String.raw`(?:^|[\s/])(?:npx|pnpx|bunx|npm\s+exec|pnpm\s+exec|pnpm\s+dlx|yarn)\s+(?:--?\S+\s+)*` + SERVE_TOOLS,
+  String.raw`node_modules/\.bin/` + SERVE_TOOLS,
+  // Server processes and orphaned test workers, by the package they run from.
+  String.raw`node_modules/(?:next/dist/server/|metro/|@react-native-community/cli|@expo/cli/|webpack-dev-server/|nodemon/|@storybook/|vitest/dist/workers/|jest-worker/)`,
+  String.raw`^next-server\b`,
+  // Watch modes, and the usual Python and Ruby development servers.
+  String.raw`\s--watch(?:All)?(?:[\s=]|$)`,
+  String.raw`-m\s+http\.server|manage\.py\s+runserver|flask\s+run|uvicorn\s.*--reload|rails\s+s(?:erver)?(?:\s|$)|jekyll\s+serve|hugo\s+server`,
+].join('|'));
+// A listening port only counts as a server for these runtimes, and never a debugger's.
+const PORT_RUNTIMES = /^(?:node|nodejs|deno|bun)$/;
 const SESSION_VARS = ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'KEEP_PI_SESSION_ID'];
 const NAMES = ['KEEP_PANE', 'KEEP_PERSIST', 'KEEP_DIR', ...SESSION_VARS];
 
@@ -253,7 +268,11 @@ async function snapshot(deps = {}) {
       tool: [row, ...tree].some((member) => DEV_TOOLS.test(member.command)),
     });
   }
-  const needPorts = candidates.filter((item) => !item.tool).flatMap((item) => [item.pid, ...item.tree]);
+  const portable = (pid) => {
+    const row = rows.find((candidate) => candidate.pid === pid);
+    return row && PORT_RUNTIMES.test(path.basename(exe(row.command))) && !/\s--inspect(?:-brk)?(?:[=\s]|$)/.test(row.command);
+  };
+  const needPorts = candidates.filter((item) => !item.tool).flatMap((item) => [item.pid, ...item.tree]).filter(portable);
   const ports = await (deps.listening || listening)(needPorts);
   const result = [];
   for (const item of candidates) {
