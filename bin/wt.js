@@ -639,6 +639,31 @@ function deployAfterLand(main, defaultName, sha, opts = {}) {
   }
 }
 
+// The node's half of a deploy: this machine's checkout is not what the daemon runs,
+// so a land of a repo in DEPLOY_AFTER_LAND asks the daemon (POST /api/deploy-self)
+// to fast-forward and restart its own, and reports a skip exactly as a local deploy
+// does. Returns a promise, or null when there is nothing to deploy; never throws.
+function deployOnDaemon(main, defaultName, sha, opts = {}) {
+  const note = (text) => { try { process.stderr.write(`wt: ${text}\n`); } catch {} };
+  try {
+    if (process.env.WT_NO_DEPLOY === '1') return null;
+    const plans = opts.deployPlans || DEPLOY_AFTER_LAND;
+    const project = path.basename(main);
+    if (!plans[project]) return null;
+    const remote = require('./remote-cli.js');
+    const where = remote.remoteMode(process.env);
+    const node = require('./nodes.js').paneOnlyNode(process.env);
+    if (!where) {
+      note(`${project} runs on node ${node.daemon}, and this node has no KEEP_DAEMON_URL to ask it to deploy; it is still running the old code`);
+      return Promise.resolve({ deployed: false, why: 'no-daemon-url' });
+    }
+    return remote.deploySelf(where, { sha, project }, { note, ...(opts.deployDeps || {}) });
+  } catch (error) {
+    note(`post-land deploy failed: ${String(error && error.message || error)}`);
+    return Promise.resolve({ deployed: false, why: 'error' });
+  }
+}
+
 // Commits sitting on the main checkout's local default branch that origin does
 // not have. `wt land` rebases onto origin and would silently leave them behind,
 // and a later `git push <remote> main` from anywhere would ship them by surprise.
@@ -697,7 +722,13 @@ function landWorktree(input, opts = {}) {
   } else {
     git(worktree, ['push', 'origin', `HEAD:${defaultName}`], { stdio: ['ignore', 2, 2] });
     process.stderr.write(`landed ${count} commit(s) to origin/${defaultName}\n`);
-    if (!opts.noDeploy) deployAfterLand(main, defaultName, sha, opts);
+    if (!opts.noDeploy) {
+      // On a node that holds panes for another machine's daemon, the live checkout is
+      // the daemon's, so it is asked to deploy itself; the daemon node deploys here.
+      const deploy = opts.deploy || (require('./nodes.js').paneOnlyNode(process.env) ? deployOnDaemon : deployAfterLand);
+      const result = deploy(main, defaultName, sha, opts);
+      if (opts.onDeploy) opts.onDeploy(result);
+    }
   }
   return sha;
 }
@@ -1271,6 +1302,7 @@ module.exports = {
   barePushOfSharedRef,
   unpushedMainCommits,
   deployAfterLand,
+  deployOnDaemon,
   createWorktree,
   recycledWorktree,
   recreateRecycledWorktree,

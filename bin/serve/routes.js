@@ -64,6 +64,18 @@ function routes(ctx) {
       },
     },
     {
+      // A node landed keep-tool; the daemon fast-forwards its own checkout and
+      // restarts, with wt land's refusals (bin/deploy-self.js).
+      method: 'POST',
+      path: '/api/deploy-self',
+      allow: NODE_API_ALLOW,
+      when: nodeApiEnabled,
+      handle: async ({ res, body }) => {
+        const result = await ctx.deploySelf.handle(body);
+        return json(res, result.status, result.body);
+      },
+    },
+    {
       method: 'GET',
       path: '/api/terminal-profile',
       handle: async ({ req, res, url }) => {

@@ -13829,6 +13829,15 @@ function start(deps = {}) {
   const nodeApiListen = require('./node-registry.js').nodeApiListen();
   ctx.nodeApiEnabled = () => nodeApiListen.enabled === true;
   ctx.registryService = nodeApiListen.enabled ? require('./registry-route.js').createRegistryService({ root: keep.ROOT }) : null;
+  // The restart is the one /api/restart-daemon makes: wait for in-flight work, then
+  // mark the request and exit after the answer has gone out.
+  ctx.deploySelf = nodeApiListen.enabled ? require('./deploy-self.js').createDeploySelf({
+    restart: async () => {
+      const result = await daemonRestartGate.prepareWhenIdle();
+      setTimeout(() => { health.recordRestartRequest(); shutdown(); }, 50);
+      return result;
+    },
+  }) : null;
   const requestRoutes = buildRequestRoutes(ctx);
   // Read once at boot, like the public token above. Only the node listener below
   // honours one; it re-reads the directory itself when it is shown a token it does

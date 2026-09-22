@@ -14,6 +14,8 @@ const REGISTRY_COMMANDS = Object.freeze([
   'reviewed', 'reviewing', 'reviews', 'review-route', 'plan', 'link', 'tag', 'tags', 'hold',
   'release', 'holds', 'resources', 'who', 'deps', 'wait-on', 'decide', 'decisions', 'notes',
   'note', 'retitle', 'project', 'landed', 'health', 'stalled', 'standup',
+  // Read-only: what a node's `keep land` needs from the registry to decide a land.
+  'land-facts',
 ]);
 
 // A flag whose value is a command the daemon runs: `--probe` on its check schedule,

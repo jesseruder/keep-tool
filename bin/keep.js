@@ -1789,6 +1789,98 @@ commands.land = (argv) => {
   console.log(`  ${KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE}`);
 };
 
+// What `keep land` on another node needs from the registry to decide a land where
+// the worktree is: the card's grants, its review records, its open review
+// obligations, and whether it has opted out of auto-land. Read-only, JSON only; an
+// obligation store that cannot be read refuses, as it refuses a land here.
+commands['land-facts'] = (argv) => {
+  const o = parseArgs(argv, {});
+  const id = o._[0];
+  if (!id || o._.length > 1) die('usage: keep land-facts <card>');
+  const task = loadTask(id);
+  const reviews = require('./reviews.js');
+  const obligations = require('./review-obligations.js');
+  let open;
+  try { open = obligations.readRecords(id).filter(obligations.isOpen); }
+  catch (error) { die(error.message || String(error)); }
+  console.log(JSON.stringify({
+    id, grants: allow.readGrants(task).map(allow.formatToken), records: reviews.readRecords(id),
+    obligations: open, optOut: reviews.optOutReason(task),
+  }));
+};
+
+// `keep land` on a pane-only node that knows its daemon. The worktree is here, so
+// the range, the rebase and the push are too; the registry is on the daemon, so the
+// facts the gate reads come from it (land-facts) and the landed check-in goes to it.
+// The gate itself is implicitLandVerdict, the same one `keep land` runs, handed
+// those facts in place of the files it would read. wt land deploys keep-tool by
+// asking the daemon to deploy itself (wt.deployOnDaemon).
+async function landRemote(argv, where, deps = {}) {
+  const remote = deps.remote || require('./remote-cli.js');
+  const o = parseArgs(argv, { json: 'bool', 'dry-run': 'bool' });
+  const id = o._[0];
+  if (!id || o._.length > 1) die('usage: keep land <card> [--dry-run] [--json]\n'
+    + '  Checks keep allow <card> land, then runs wt land from the current worktree and cites the landed sha.\n'
+    + `  ${KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE}`);
+  const facts = await remote.runRemote('land-facts', [id], { where });
+  if (facts.code !== 0) {
+    if (facts.stdout) process.stdout.write(facts.stdout);
+    if (facts.stderr) process.stderr.write(facts.stderr);
+    process.exitCode = facts.code;
+    return;
+  }
+  let value;
+  try { value = JSON.parse(facts.stdout); } catch { die(`the daemon on ${where.daemon} answered land-facts with something that is not JSON`); }
+  if (!value || value.id !== id || !Array.isArray(value.grants) || !Array.isArray(value.records)
+    || !Array.isArray(value.obligations) || typeof value.optOut !== 'string') {
+    die(`the daemon on ${where.daemon} answered land-facts for ${id} in a shape this keep does not read`);
+  }
+  const obligationApi = require('./review-obligations.js');
+  const verdict = implicitLandVerdict({ id, fm: { allow: value.grants } }, {
+    records: value.records,
+    optOut: value.optOut,
+    obligations: { readRecords: () => value.obligations, outstandingFor: obligationApi.outstandingFor },
+    ...(deps.context ? { context: deps.context } : {}),
+  });
+  if (!verdict.ok) {
+    if (o.json) console.log(JSON.stringify({ id, action: 'land', ...verdict, context: undefined }, null, 2));
+    else process.stderr.write(`keep: not allowed: ${verdict.why}\n`);
+    process.exitCode = 3;
+    return;
+  }
+  const record = verdict.record || null;
+  const context = verdict.context;
+  if (!context || !context.ok) {
+    process.stderr.write(`keep: cannot land: ${(context && context.why) || 'no landable worktree here'}\n`);
+    process.exitCode = 3;
+    return;
+  }
+  if (o['dry-run']) {
+    console.log(`allowed: ${verdict.why}`);
+    for (const commit of context.commits || []) console.log(`  ${commit.sha.slice(0, 12)} ${commit.subject}`);
+    console.log(`would run wt land in ${context.worktree}`);
+    return;
+  }
+  const wt = deps.wt || require('./wt.js');
+  let deployed = null;
+  let sha;
+  try { sha = wt.landWorktree(context.worktree, { onDeploy: (result) => { deployed = result; } }); }
+  catch (error) { die(`wt land refused: ${error.message}`); }
+  if (!sha) die('wt land had nothing to push');
+  if (deployed && typeof deployed.then === 'function') await deployed;
+  const cited = record ? ` (review record ${record.id})` : '';
+  const message = `Landed ${context.branch} onto ${context.defaultBranch}${cited}.`;
+  const checkin = await remote.runRemote('checkin', [id, '--commit', sha, '-m', message], { where });
+  if (checkin.code !== 0) {
+    const why = String(checkin.stderr || '').trim().split('\n').pop() || `exit ${checkin.code}`;
+    process.stderr.write(`keep: landed ${sha} but the check-in failed: ${why}\n`
+      + `keep: record it by hand — keep checkin ${id} --commit ${sha} -m "${message}"\n`);
+  }
+  if (o.json) return console.log(JSON.stringify({ id, landed: sha, record, why: verdict.why }, null, 2));
+  console.log(`${id}: landed ${sha.slice(0, 12)} onto origin/${context.defaultBranch}${cited}`);
+  console.log(`  ${KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE}`);
+}
+
 // ---------- shadow decisions ----------
 
 commands.decide = (argv) => {
@@ -3813,6 +3905,7 @@ function paneOnlyRefusal(cmd, args, env = process.env) {
 }
 module.exports.paneOnlyRefusal = paneOnlyRefusal;
 module.exports.PANE_ONLY_COMMANDS = PANE_ONLY_COMMANDS;
+module.exports.landRemote = landRemote;
 
 if (require.main === module) {
   (async () => {
@@ -3826,6 +3919,10 @@ if (require.main === module) {
         if (result.stdout) process.stdout.write(result.stdout);
         if (result.stderr) process.stderr.write(result.stderr);
         process.exitCode = result.code;
+        return;
+      }
+      if (remote && cmd === 'land') {
+        await landRemote(rest, remote);
         return;
       }
       // Before the registry is even looked for: on a pane-only node the answer is

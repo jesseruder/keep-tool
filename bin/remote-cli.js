@@ -124,6 +124,44 @@ async function runRemote(command, args, deps = {}) {
   return { code: 2, stdout: '', stderr: `keep ${command}: the daemon on ${where.daemon} refused: ${why}\n` };
 }
 
+// Asks the daemon to deploy its own checkout of `project` at `sha`, and says what
+// happened in wt land's own words. Once, never retried: a restart that happened and
+// lost its answer is not one to ask for again. Resolves { deployed, why }; never
+// rejects.
+async function deploySelf(where, { sha, project }, deps = {}) {
+  const note = deps.note || ((text) => { try { process.stderr.write(`wt: ${text}\n`); } catch {} });
+  const request = deps.request || nodeApiRequest;
+  let response;
+  try {
+    const token = deps.token || nodeToken(deps.env || process.env, deps.readToken);
+    response = await request(where.url, '/api/deploy-self', { payload: { sha, project }, token, timeoutMs: deps.timeoutMs || 120e3 });
+  } catch (error) {
+    note(`post-land deploy on node ${where.daemon} failed: ${error.message}; it may still be running the old code`);
+    return { deployed: false, why: 'unreachable' };
+  }
+  const value = parsed(response) || {};
+  const checkout = `${where.daemon}:${value.checkout || project}`;
+  const stale = (why) => {
+    note(`${checkout}: ${why}; left it alone — it is still running the old code`);
+    return { deployed: false, why };
+  };
+  if (response.status !== 200) return stale(value.error || `HTTP ${response.status}`);
+  const to = String(value.to || '').slice(0, 12);
+  if (value.why === 'ahead') {
+    note(`${checkout} is already at ${to}, past this land; leaving its restart to the land that put it there`);
+    return { deployed: false, why: 'ahead' };
+  }
+  if (value.from && value.to && value.from !== value.to) note(`fast-forwarded ${checkout} to ${to}`);
+  else if (value.to) note(`${checkout} is already at ${to}`);
+  if (!value.restarted) {
+    note(`the daemon on ${where.daemon} did not restart (${value.why || 'no reason given'}); the code is on disk but it is still running the old build`);
+    return { deployed: false, why: 'restart' };
+  }
+  note(`restarting the daemon on ${where.daemon}`);
+  return { deployed: true };
+}
+
 module.exports = {
+  deploySelf,
   REQUEST_TIMEOUT_MS, remoteMode, daemonBase, nodeToken, nodeApiRequest, registryBody, postWithRetry, runRemote, parsed,
 };
