@@ -217,6 +217,15 @@ function createCleanupSnapshot({
   };
 }
 
+// The session scan a timer reads: bounded (see scanClaudeSessions in serve.js). A
+// tick only decides whether to act; whatever it then acts on is re-read fresh by
+// the action path (loadCurrentSession, closeEphemeralPane, the send prechecks), so a
+// transcript index up to 5 s behind costs at most one tick of delay, while a fresh
+// pass stats every transcript on the machine on every tick of every scheduler.
+function periodicSessionScan(scanSessions) {
+  return (options = {}) => scanSessions({ ...options, fresh: false });
+}
+
 function startSchedulers(ctx) {
   const {
     TURN_INDEX_BUDGET_BYTES, TURN_INDEX_BUDGET_MS, TURN_INDEX_PRUNE_LIMIT,
@@ -233,6 +242,7 @@ function startSchedulers(ctx) {
     startHandoffQueue, startWtGcScheduler, summarize, transcriptFileForSession,
     unblock, usage, watcherSend, withInjectionLock, writeTarget,
   } = ctx;
+  const periodicScan = periodicSessionScan(scanSessions);
 
   runs.setOnChange(broadcast);
   runs.setDeliverer(deliverCheckToThread);
@@ -246,7 +256,7 @@ function startSchedulers(ctx) {
     // observation. An exited pane on another node is not this machine's to reap.
     listPanes: async () => (await listHostPanes({}, true) || [])
       .filter((pane) => !nodes.isRemotePane(pane)),
-    sessions: () => scanSessions(),
+    sessions: () => periodicScan(),
     closePane: (pane, sessionId) => closeEphemeralPane(pane, sessionId, { onChange: broadcast }),
     // A closed pane still sits in the host's list. Forget it, or the sweep re-decides
     // about a dead pane on every tick and the `runs` health row never reports idle.
@@ -294,7 +304,7 @@ function startSchedulers(ctx) {
   // the system reads an expired note as a reason to stop.
   require('../notes.js').startScheduler({
     onChange: broadcast,
-    sessions: () => scanSessions(),
+    sessions: () => periodicScan(),
     send: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }),
   });
   startAutoCompact();
@@ -450,7 +460,8 @@ function startSchedulers(ctx) {
     // "continue" into its pane on the strength of it. A session on another node has
     // neither here, so it never reaches the decision: no ledger entry, no daily-cap
     // spend and no dashboard skip is written for a machine this one cannot see into.
-    scanSessions: () => scanSessions().filter((session) => !remoteSession(session, deps)),
+    // Bounded: resumeAfterLimit re-reads the session with loadCurrentSession before sending.
+    scanSessions: () => periodicScan().filter((session) => !remoteSession(session, deps)),
     getUsage: usage.getUsage,
     send: (sessionId, text, opts) => resumeAfterLimit(sessionId, text, opts),
     root: keep.ROOT,
@@ -545,6 +556,8 @@ function startSchedulers(ctx) {
     // list is how a second session gets opened, and a close decision made from
     // one would signal a pane that has come back to life.
     listPanes: () => listHostPanes(deps, true),
+    // Fresh on purpose: this tick launches, delivers and closes in the same pass,
+    // from what it reads here, and scans only when a pane carries an area session.
     scanSessions: () => scanSessions(),
     loadCurrentSession: (id) => loadCurrentSession(id),
     resolveSessionTarget: (session, hint) => resolveSessionTarget(session, hint),
@@ -667,7 +680,7 @@ function startSchedulers(ctx) {
       // A stale snapshot would be deciding from a session that has moved on, so
       // rescan rather than trust one older than the tick interval.
       const sessions = Date.now() - ctx.sessionSnapshotAt < 30e3 && ctx.sessionSnapshot.length
-        ? ctx.sessionSnapshot : scanSessions();
+        ? ctx.sessionSnapshot : periodicScan();
       // Whichever of the two was used, the snapshot clock now describes it, so a
       // later reading means the dashboard has rebuilt since.
       const sessionsAt = ctx.sessionSnapshotAt;
@@ -809,5 +822,5 @@ function startSchedulers(ctx) {
 
 module.exports = {
   startFeatureSchedulers, startSchedulers, createRegistryPull, createCleanupSnapshot,
-  startLoopLagProbe, startReceiptsPoller,
+  startLoopLagProbe, startReceiptsPoller, periodicSessionScan,
 };

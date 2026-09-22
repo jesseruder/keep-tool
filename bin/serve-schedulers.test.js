@@ -379,3 +379,26 @@ test('the cleanup snapshot never hands an automatic policy a pane on another nod
   assert.deepEqual(calls.find((call) => call[0] === 'build'),
     ['build', ['local-one', 'local-two', 'far-one@aws1']]);
 });
+
+test('periodic schedulers read sessions from the bounded transcript index', () => {
+  const { periodicSessionScan } = require('./serve/schedulers.js');
+  const calls = [];
+  const scan = periodicSessionScan((options) => { calls.push(options); return ['row']; });
+  assert.deepEqual(scan(), ['row']);
+  assert.deepEqual(scan({ readOnly: true, fresh: true }), ['row']);
+  assert.deepEqual(calls, [{ fresh: false }, { readOnly: true, fresh: false }], 'a tick cannot ask for a fresh pass');
+
+  // startSchedulers needs the whole daemon, so the wiring is read from its source:
+  // every timer that scans goes through periodicScan, and the one deliberate fresh
+  // scan is the area-session tick, which launches and delivers from what it reads.
+  const source = fs.readFileSync(path.join(__dirname, 'serve', 'schedulers.js'), 'utf8');
+  const body = source.slice(source.indexOf('function startSchedulers('));
+  const wired = (pattern) => assert.match(body, pattern);
+  wired(/runs\.setEphemeralHost\(\{[\s\S]*?sessions: \(\) => periodicScan\(\),[\s\S]*?\}\);/);
+  wired(/require\('\.\.\/notes\.js'\)\.startScheduler\(\{[\s\S]*?sessions: \(\) => periodicScan\(\),/);
+  wired(/limitresume\.startScheduler\(\{[\s\S]*?scanSessions: \(\) => periodicScan\(\),/);
+  wired(/ctx\.sessionSnapshot : periodicScan\(\);/);
+  const fresh = body.match(/\bscanSessions\(\)/g) || [];
+  assert.equal(fresh.length, 1, 'only the area-session tick scans fresh');
+  assert.match(body, /const areaSessionDeps = \(\) => \(\{[\s\S]*?scanSessions: \(\) => scanSessions\(\),/);
+});

@@ -4466,7 +4466,9 @@ async function reviewTick(deps, opts) {
   // meanwhile gets the same skip (and a drift the same parking) it would have got
   // had it been busy from the start.
   if (!options.force) {
-    const again = (deps.findReviewer || findReviewerSession)(deps.sessions ? deps.sessions() : [], meta.bootstrapAttempts);
+    // The daemon's session source is bounded for the first look; this one decides
+    // whether to type, so it asks for a fresh transcript scan.
+    const again = (deps.findReviewer || findReviewerSession)(deps.sessions ? deps.sessions({ fresh: true }) : [], meta.bootstrapAttempts);
     const recheck = shouldSendTick({
       budget, reviewer: again && again.id === reviewer.id ? again : null, queue, lastTickAt: meta.lastTickAt, now, trigger,
       drift: detail ? driftGate(meta, detail, now) : null,
@@ -4580,7 +4582,8 @@ async function reviewerCompactTick(deps) {
   // Re-scan immediately before entering the injection path. Its own prompt precheck
   // closes the remaining race, but this catches a turn that began after the first scan.
   if (options.sessions) {
-    const fresh = options.sessions().find((session) => session && session.id === reviewer.id);
+    // Fresh, unlike the first look: this is the read the injection decision rests on.
+    const fresh = options.sessions({ fresh: true }).find((session) => session && session.id === reviewer.id);
     if (!fresh) return { compacted: false, skipped: true, why: 'reviewer session disappeared' };
     reviewer = fresh;
     decision = reviewerCompactDecision({ meta, reviewer, transcriptMtime, contextTokens, now, minTokens });

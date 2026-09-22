@@ -11175,20 +11175,21 @@ test('a state build outside the dashboard resolves host-only Claude panes from o
   let factories = 0;
   const added = backfillHostSessions([], panes, {
     freshClaudeSessionFor: () => { exactCalls++; return null; },
-    createFreshClaudeSessionResolver: () => { factories++; return (id) => ({ id, kind: 'claude', mtime: 1 }); },
+    createIndexedClaudeSessionResolver: () => { factories++; return (id) => ({ id, kind: 'claude', mtime: 1 }); },
   });
   assert.equal(added.length, 3);
   assert.equal(factories, 1, 'one resolver per build');
   assert.equal(exactCalls, 0, 'no per-pane project walk');
 
-  const { createFreshClaudeSessionResolver } = require('./serve.js');
+  const { createIndexedClaudeSessionResolver } = require('./serve.js');
   const rows = [
     { id: 'indexed', accountId: 'a', file: '/a/one/indexed.jsonl', stat: { size: 1, mtimeMs: 1 } },
     { id: 'new-account', accountId: 'a', file: '/a/one/new-account.jsonl', stat: { size: 2, mtimeMs: 2 } },
   ];
   const exact = [];
-  const resolverFor = (configuredAccountIds) => createFreshClaudeSessionResolver({
+  const resolverFor = (configuredAccountIds, fresh = true) => createIndexedClaudeSessionResolver({
     rows,
+    fresh,
     accountIds: ['a'],
     configuredAccountIds,
     authority: { 'new-account': { agent: 'claude', accountId: 'added-later' } },
@@ -11213,6 +11214,103 @@ test('a state build outside the dashboard resolves host-only Claude panes from o
   assert.equal(covered('not-yet-written'), null);
   assert.equal(covered('new-account'), null);
   assert.deepEqual(exact, [['not-yet-written', true], ['new-account', false]]);
+
+  // Bounded rows (a periodic build) may not have indexed a transcript written since
+  // their last sweep, so a miss there is never taken from memory.
+  exact.length = 0;
+  const bounded = resolverFor(['a'], false);
+  assert.deepEqual(bounded('indexed'), { id: 'indexed', file: '/a/one/indexed.jsonl', accountId: 'a' });
+  assert.equal(bounded('not-yet-written'), null);
+  assert.deepEqual(exact, [['not-yet-written', false]]);
+  // Rows handed in without saying how they were read count as bounded.
+  exact.length = 0;
+  createIndexedClaudeSessionResolver({ rows, accountIds: ['a'], configuredAccountIds: ['a'], authority: {},
+    claudeSessionFor: (id, options) => { exact.push([id, options.allowCachedMiss === true]); return null; },
+  })('not-yet-written');
+  assert.deepEqual(exact, [['not-yet-written', false]]);
+});
+
+test('a transcript that appeared after a bounded build is found past a remembered miss', (t) => {
+  const { claudeSessionFor, createIndexedClaudeSessionResolver, forgetClaudeSessionMisses } = require('./serve.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-bounded-resolver-'));
+  t.after(() => { forgetClaudeSessionMisses(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const id = `late-${process.pid}-${Date.now()}`;
+  const file = path.join(dir, `${id}.jsonl`);
+  let findable = false;
+  const lookup = (sessionId, options) => claudeSessionFor(sessionId, {
+    ...options, findSessionFile: () => (findable ? file : null),
+  });
+  // An earlier build missed it and remembered the miss.
+  assert.equal(lookup(id, { allowCachedMiss: true }), null);
+  // Then its first turn landed, after the bounded index last swept.
+  const at = new Date().toISOString();
+  fs.writeFileSync(file, `${[
+    { type: 'user', sessionId: id, cwd: '/test/project', timestamp: at, message: { role: 'user', content: 'first turn' } },
+  ].map(JSON.stringify).join('\n')}\n`);
+  findable = true;
+  const resolverFor = (fresh) => createIndexedClaudeSessionResolver({
+    rows: [], fresh, accountIds: ['a'], configuredAccountIds: ['a'], authority: {}, claudeSessionFor: lookup,
+  });
+  assert.equal(resolverFor(true)(id), null, 'fresh rows that agree with the miss may keep it');
+  const found = resolverFor(false)(id);
+  assert.equal(found && found.id, id, 'bounded rows never let a remembered miss hide the transcript');
+});
+
+test('periodic scans read the bounded transcript index and action scans stay fresh', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-bounded-scan-'));
+  try {
+    const keepRoot = path.join(home, 'keep');
+    const projectDir = path.join(home, '.claude', 'projects', '-test-project');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(keepRoot, { recursive: true });
+    const at = new Date().toISOString();
+    for (let index = 0; index < 5; index += 1) {
+      const id = `bounded-${index}`;
+      fs.writeFileSync(path.join(projectDir, `${id}.jsonl`), `${[
+        { type: 'mode', mode: 'normal', sessionId: id },
+        { type: 'user', sessionId: id, cwd: '/test/project', timestamp: at, message: { role: 'user', content: 'go' } },
+        { type: 'assistant', sessionId: id, timestamp: at,
+          message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'Done' }] } },
+      ].map(JSON.stringify).join('\n')}\n`);
+    }
+    const script = `
+      ${STATE_FIXTURE_SETUP}
+      const fs = require('node:fs');
+      const projectDir = ${JSON.stringify(projectDir)};
+      const realStat = fs.statSync;
+      let stats = 0;
+      // Only the index's own stats: parsing a changed transcript stats it too.
+      fs.statSync = (...args) => {
+        if (String(args[0]).startsWith(projectDir) && String(args[0]).endsWith('.jsonl')
+          && /transcript-index\\.js/.test(new Error().stack)) stats += 1;
+        return realStat(...args);
+      };
+      const serve = require('./bin/serve.js');
+      const count = (fn) => { const before = stats; const result = fn(); return { stats: stats - before, ids: result.length }; };
+      const boundedCold = count(() => serve.scanSessions({ fresh: false, readOnly: true }));
+      const boundedWarm = count(() => serve.scanSessions({ fresh: false, readOnly: true }));
+      const action = count(() => serve.scanSessions({ readOnly: true }));
+      const explicit = count(() => serve.scanSessions({ fresh: true, readOnly: true }));
+      const boundedAfter = count(() => serve.scanSessions({ fresh: false, readOnly: true }));
+      // A transcript created since: its directory's mtime moves, so even the bounded
+      // scan lists it.
+      fs.writeFileSync(projectDir + '/bounded-late.jsonl', fs.readFileSync(projectDir + '/bounded-0.jsonl', 'utf8').replaceAll('bounded-0', 'bounded-late'));
+      const late = serve.scanSessions({ fresh: false, readOnly: true }).some((session) => session.id === 'bounded-late');
+      process.stdout.write(JSON.stringify({ boundedCold, boundedWarm, action, explicit, boundedAfter, late }));
+    `;
+    const child = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'), env: { ...process.env, HOME: home, KEEP_DIR: keepRoot, KEEP_CONFIG: '' },
+      encoding: 'utf8', timeout: 10000,
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout);
+    assert.deepEqual(result.boundedCold, { stats: 5, ids: 5 }, 'the first bounded scan stats every transcript once');
+    assert.deepEqual(result.boundedWarm, { stats: 0, ids: 5 }, 'an unchanged tree is answered from the index');
+    assert.deepEqual(result.action, { stats: 5, ids: 5 }, 'the default outside the dashboard is a fresh pass');
+    assert.deepEqual(result.explicit, { stats: 5, ids: 5 });
+    assert.deepEqual(result.boundedAfter, { stats: 0, ids: 5 }, 'a fresh pass leaves the bounded cache warm');
+    assert.equal(result.late, true);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
 test('a Claude transcript miss is reused by build paths for a short while and forgotten when a pane appears', async () => {

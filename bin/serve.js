@@ -7769,7 +7769,9 @@ async function autoCompactTick(deps = {}) {
   opts.modelResetAt = (session) => compactModelResetAt(session, {
     usage: usageSnapshot, now, accountId: claudeAccountId(session),
   });
-  const cheap = (deps.scanSessions || scanSessions)().filter((session) =>
+  // Bounded: this only picks candidates; the chosen one is re-read by
+  // loadCurrentSession under the lock before anything is typed.
+  const cheap = (deps.scanSessions || scanSessions)({ fresh: false }).filter((session) =>
     liveIds.has(session.id) && autoCompactIdleMs(session, stamps, now, opts) !== null);
   const candidates = autoCompactCandidates(
     cheap.map((session) => {
@@ -10086,10 +10088,10 @@ function claudeSessionForEntry(id, file, stat, accountId = null) {
 // A hosted session whose transcript does not exist yet (a pane opened and not yet
 // spoken to) misses on every state build, and each miss walks every account's
 // project tree. Build paths may take a recent miss as the answer for a short
-// while: the rate-limit policy source, and the fresh resolver's fallback for an id
-// its just-scanned index covers (the index has just agreed with the miss). Direct
-// action reads, and the fresh resolver's fallback for an account the index does not
-// cover, never read it. A pane appearing for the session, a spawn, or a meta change
+// while: the rate-limit policy source, and the indexed resolver's fallback for an id
+// its just-scanned fresh index covers (the index has just agreed with the miss).
+// Direct action reads, and the indexed resolver's fallback over bounded rows or for
+// an account the index does not cover, never read it. A pane appearing for the session, a spawn, or a meta change
 // for that session forgets it early.
 //
 // Longer than the 30s handoff queue tick, so each policy read lands inside the
@@ -10265,15 +10267,21 @@ function createDashboardClaudeSessionResolver(deps = {}) {
 }
 
 // The same one-snapshot resolution for a state build outside the dashboard, over
-// the rows scanClaudeSessions just read with fresh=true — which is what lets action
-// paths (inspectAccountHandoff, inspectPortableSource) use it. An id those rows do
-// not hold, or one pinned to an account the index does not cover (added since the
-// daemon started), goes to the exact lookup instead. That lookup may reuse a recent
-// miss only when the index covers every account the transcript could be in: then
-// the fresh rows have just agreed with the miss. Where it does not, the index never
-// looked, and a remembered miss could hide a first turn from an action path.
-function createFreshClaudeSessionResolver(deps = {}) {
-  const rows = deps.rows || claudeTranscriptIndex.scan({ fresh: true });
+// the rows scanClaudeSessions just read. `fresh` says how those rows were read;
+// rows handed in without it count as bounded. An id the rows do not hold, or one
+// pinned to an account the index does not cover (added since the daemon started),
+// goes to the exact lookup instead.
+//
+// That lookup may reuse a recent miss only when the rows were a fresh scan AND the
+// index covers every account the transcript could be in: then a walk has just
+// agreed with the miss. Fresh rows are what let action paths (inspectAccountHandoff,
+// inspectPortableSource) use this. Bounded rows may simply not have indexed a
+// transcript written since their last sweep, and an uncovered account was never
+// looked at, so in either case a remembered miss could hide a first turn and the
+// exact lookup walks instead.
+function createIndexedClaudeSessionResolver(deps = {}) {
+  const rowsFresh = deps.rows ? deps.fresh === true : deps.fresh !== false;
+  const rows = deps.rows || claudeTranscriptIndex.scan({ fresh: rowsFresh });
   const authority = deps.authority || accounts.authority(deps.root || keep.ROOT);
   const indexedAccounts = new Set(deps.accountIds || claudeProjectRoots.map((entry) => entry.accountId));
   // A session with no record can be in any configured account, including one the
@@ -10293,7 +10301,7 @@ function createFreshClaudeSessionResolver(deps = {}) {
       ? record.agent !== 'claude' || indexedAccounts.has(record.accountId)
       : everyAccountIndexed;
     if (known.has(id) && covered) return indexed(id);
-    return covered ? exact(id, { allowCachedMiss: true }) : exact(id, {});
+    return covered && rowsFresh ? exact(id, { allowCachedMiss: true }) : exact(id, {});
   };
 }
 
@@ -10321,8 +10329,26 @@ function scanClaudeSessions(options = {}) {
   const sessionIds = new Set();
   const accountAuthority = options.accountAuthority || accounts.authority(keep.ROOT);
   const panesBySession = options.hostPanesBySession || hostPanesBySession(options.hostPanes || []);
-  const transcriptRows = claudeTranscriptIndex.scan({ fresh: options.dashboard !== true });
-  if (typeof options.onTranscriptRows === 'function') options.onTranscriptRows(transcriptRows);
+  // Fresh re-lists every project directory and stats every transcript (tens of
+  // thousands on a long-lived machine); bounded trusts the watcher and re-stats a
+  // recent file at most every 5 s, anything older every 60 s, and costs no I/O when
+  // nothing changed. A directory whose mtime moved is always re-listed, so a new
+  // transcript is normally seen by either mode; what bounded can miss for up to 5 s
+  // is an append whose watcher event was dropped.
+  //
+  // Bounded (fresh: false) is for callers that only decide whether to act later and
+  // re-read the session they pick before touching it: the auto-compact, limit-resume,
+  // live-ledger, stall, notes, reviewer, turn-watcher and ephemeral-pane ticks. A
+  // 5 s-stale mtime there costs at most one tick of delay, because the action itself
+  // goes through loadCurrentSession or its own precheck.
+  //
+  // Fresh is for a path that acts on a named session now (restart, close, account
+  // and portable handoff inspection, delivery, resolveSessionId, tell, restore): it
+  // must not miss a transcript that exists or read one a turn behind. It stays the
+  // default outside the dashboard, so a caller nobody classified keeps it.
+  const fresh = typeof options.fresh === 'boolean' ? options.fresh : options.dashboard !== true;
+  const transcriptRows = claudeTranscriptIndex.scan({ fresh });
+  if (typeof options.onTranscriptRows === 'function') options.onTranscriptRows(transcriptRows, { fresh });
   for (const { dir, file, id, stat, accountId } of transcriptRows) {
     if (accountAuthority[id]?.accountId && accountAuthority[id].accountId !== accountId) continue;
     if (sessionIds.has(id)) continue;
@@ -10642,7 +10668,8 @@ async function liveSessionTick(deps = {}) {
     };
     const records = paneRecordEntries(deps);
     let scanned = [];
-    try { scanned = await (deps.scanSessions || scanSessions)(); } catch {}
+    // Bounded: a ledger of what was alive, refreshed every tick; nothing acts on it here.
+    try { scanned = await (deps.scanSessions || scanSessions)({ fresh: false }); } catch {}
     const scannedById = new Map(scanned.map((session) => [session.id, session]));
     const exitedIds = new Set(scanned.filter((session) => session && session.exited).map((session) => session.id));
     for (const id of exitedIds) delete ledger.sessions[id];
@@ -10795,7 +10822,8 @@ function stalledSessionSnapshot(now = Date.now()) {
   if (sessionSnapshotAt && now - lastDashboardSessionScan < 5 * 60e3) return copySessions(sessionSnapshot);
   if (lastStalledSessionScan && now - lastStalledSessionScan < 5 * 60e3) return copySessions(sessionSnapshot);
   lastStalledSessionScan = now;
-  return scanSessions({ readOnly: true });
+  // Bounded: a stall report already accepts a snapshot up to five minutes old.
+  return scanSessions({ readOnly: true, fresh: false });
 }
 
 // ---------- state assembly ----------
@@ -10903,9 +10931,11 @@ function buildState(options = {}) {
     overdue: keep.isOverdue(t),
   }));
   let dashboardTranscriptRows = null;
-  // Outside the dashboard, scanClaudeSessions indexes with fresh=true, so these rows
-  // are as current as a walk and can answer host-only panes for action paths too.
-  let freshTranscriptRows = null;
+  // Outside the dashboard these rows answer host-only panes too. By default they are
+  // a fresh scan, as current as a walk, which action paths rely on; a build asked for
+  // with fresh: false gets bounded rows, and the resolver is told which it has.
+  let indexedTranscriptRows = null;
+  let indexedTranscriptRowsFresh = false;
   // This map belongs to one build. Capture each selected source at discovery
   // time so the general-purpose 300-entry lookup LRU cannot evict an earlier
   // published session before its path is relayed to the parent.
@@ -10921,6 +10951,7 @@ function buildState(options = {}) {
   };
   const sessions = scanSessions({
     dashboard: options.dashboard === true,
+    ...(typeof options.fresh === 'boolean' ? { fresh: options.fresh } : {}),
     dashboardWorker: workerMode,
     readOnly: workerMode,
     hostPanes: options.hostPanes || [],
@@ -10929,9 +10960,12 @@ function buildState(options = {}) {
     accountAuthority: dashboardAccountAuthority,
     onSessionSource: rememberDashboardSource,
     onSettledHit: (session, jobs) => settledBackgroundJobs.set(`${session.kind}:${session.id}`, jobs),
-    onTranscriptRows: (rows) => {
+    onTranscriptRows: (rows, scan) => {
       if (options.dashboard === true) dashboardTranscriptRows = rows;
-      else freshTranscriptRows = rows;
+      else {
+        indexedTranscriptRows = rows;
+        indexedTranscriptRowsFresh = scan?.fresh === true;
+      }
     },
   });
   // scanSessions just reconciled this exact index snapshot synchronously. Reuse
@@ -10960,9 +10994,10 @@ function buildState(options = {}) {
           independentLive,
         }),
       } : {}),
-      ...(freshTranscriptRows ? {
-        createFreshClaudeSessionResolver: () => createFreshClaudeSessionResolver({
-          rows: freshTranscriptRows,
+      ...(indexedTranscriptRows ? {
+        createIndexedClaudeSessionResolver: () => createIndexedClaudeSessionResolver({
+          rows: indexedTranscriptRows,
+          fresh: indexedTranscriptRowsFresh,
           onSessionSource: rememberDashboardSource,
         }),
       } : {}),
@@ -11359,7 +11394,7 @@ function backfillHostSessions(sessions, panes, deps = {}) {
   const owners = sessionTaskOwners(deps.tasks || []);
   const added = [];
   let indexedClaudeSessionFor = null;
-  let freshIndexedClaudeSessionFor = null;
+  let nonDashboardIndexedClaudeSessionFor = null;
   for (const pane of hostPanesBySession(panes).values()) {
     try {
       const meta = pane && pane.meta;
@@ -11372,8 +11407,8 @@ function backfillHostSessions(sessions, panes, deps = {}) {
         : agent === 'pi' ? deps.piSessionFor || pi.sessionFor
         : deps.claudeSessionFor || (deps.dashboard === true
           ? (indexedClaudeSessionFor ||= (deps.createDashboardClaudeSessionResolver || createDashboardClaudeSessionResolver)())
-          : deps.createFreshClaudeSessionResolver
-            ? (freshIndexedClaudeSessionFor ||= deps.createFreshClaudeSessionResolver())
+          : deps.createIndexedClaudeSessionResolver
+            ? (nonDashboardIndexedClaudeSessionFor ||= deps.createIndexedClaudeSessionResolver())
             : deps.freshClaudeSessionFor || claudeSessionFor);
       let session = null;
       try { session = lookup(id); } catch {}
@@ -12889,7 +12924,9 @@ function driftWakeFromVerdict(turn, verdict, deps = {}) {
 const reviewDeps = {
   send: (sessionId, text, opts) => withInjectionLock(() => sendReviewerMessage(sessionId, text, opts), { session: sessionId }),
   sendPlain: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }),
-  sessions: () => scanSessions(),
+  // Bounded for finding the reviewer and deciding whether a tick is due; review.js
+  // asks for { fresh: true } on the look it takes immediately before typing.
+  sessions: (options = {}) => scanSessions({ fresh: false, ...options }),
   sessionContextTokens,
   compact: (sessionId, instruction) => withInjectionLock(() => compactSessionById({ sessionId, instruction }), { session: sessionId, model: true }),
   who: (project) => buildWhoSnapshot(project),
@@ -13580,7 +13617,7 @@ module.exports = {
   forgetClaudeSessionMisses,
   noteHostPaneSessions,
   createDashboardClaudeSessionResolver,
-  createFreshClaudeSessionResolver,
+  createIndexedClaudeSessionResolver,
   transcriptActivityMs,
   sessionNeedsInput,
   sessionTaskOwners,
