@@ -12,13 +12,35 @@ export function hostOutage(data) {
   return status && status.ok === false ? status : null;
 }
 
+function outageAge(since, now) {
+  const seconds = Math.max(0, Math.round((now - (Number(since) || now)) / 1000));
+  return seconds < 60 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
+}
+
 export function hostOutageText(status, now = Date.now()) {
   if (!status) return '';
-  const seconds = Math.max(0, Math.round((now - (Number(status.since) || now)) / 1000));
-  const age = seconds < 60 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
   const why = status.reason === 'timeout'
     ? 'terminal host not answering' : 'terminal host unreachable';
-  return `${why} ${age}`;
+  return `${why} ${outageAge(status.since, now)}`;
+}
+
+// The other machines' standing rides beside the daemon host's as hostStatus.nodes
+// (serve.js nodeStatusForPublish). Only nodes other than the daemon's are keyed, and
+// a single-node install publishes no map at all, so this is empty there. Read only:
+// an older daemon without the map and a newer console agree on "no remote outage".
+export function nodeOutages(hostStatus) {
+  const nodes = hostStatus && hostStatus.nodes;
+  if (!nodes || typeof nodes !== 'object' || Array.isArray(nodes)) return [];
+  return Object.keys(nodes).sort()
+    .filter((name) => nodes[name] && typeof nodes[name] === 'object' && nodes[name].ok === false)
+    .map((name) => ({ ...nodes[name], name }));
+}
+
+export function nodeOutageText(outage, now = Date.now()) {
+  if (!outage) return '';
+  const why = outage.reason === 'timeout' ? 'not answering'
+    : outage.reason === 'invalid' ? 'misconfigured' : 'unreachable';
+  return `${outage.name} ${why} ${outageAge(outage.since, now)}`;
 }
 
 export function sessionLabel(session) {
