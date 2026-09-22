@@ -14,6 +14,7 @@
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 // The two arguments a launch cannot know until this machine has been asked. They
@@ -45,20 +46,53 @@ function expandArgv(argv, paths) {
 
 // The profile shape agent-launcher encodes, and the only part of an account a
 // launch needs. Nothing here reads the registry: the fields arrive with the request.
-function checkedAccount(value) {
+//
+// `~` is resolved against *this* machine's home, not the daemon's. The two are the
+// same path on Jesse's fleet and will not always be; a config directory expanded
+// against somebody else's home is a directory that does not exist here, which is
+// the failure this refuses below.
+function checkedAccount(value, deps = {}) {
   const account = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
   if (!account || typeof account.id !== 'string' || !account.id
       || !['claude', 'codex', 'pi'].includes(account.agent)
       || typeof account.configDir !== 'string' || !account.configDir) {
     throw new Error('launch preparation needs an account profile');
   }
+  const home = deps.homedir || os.homedir();
   return {
     id: account.id,
     agent: account.agent,
-    configDir: account.configDir,
+    configDir: path.resolve(String(account.configDir).replace(/^~(?=\/|$)/, home)),
     builtIn: account.builtIn === true,
     managed: account.managed === true,
   };
+}
+
+// Whether this account exists on this machine at all.
+//
+// An account is a config directory holding credentials, and a launch that cannot
+// find one starts an agent that will ask a person to log in — in a pane nobody is
+// watching, on a machine nobody is looking at. Worse, the trust write below creates
+// that directory on its way past, so a mistyped or not-yet-installed account would
+// leave a plausible-looking empty profile behind and fail later, further away.
+// Checked here, before anything is created, and named as what it is.
+function assertAccountInstalled(account, deps = {}) {
+  const io = deps.fs || fs;
+  const directory = (value) => {
+    try { return io.statSync(value).isDirectory(); } catch { return false; }
+  };
+  if (!directory(account.configDir)) {
+    throw Object.assign(new Error(`account ${account.id} is not set up on this node`), { code: 'account-missing' });
+  }
+  // A shared setup is an account whose real configuration lives somewhere else on
+  // this machine. A manifest pointing at a source that is not here is half an
+  // account: ensureSharedMemory would fail obscurely, so it is named here instead.
+  const manifest = account.agent === 'claude' ? deps.readSetup(account) : null;
+  if (!manifest) return;
+  const source = manifest.originConfigDir || manifest.sourceConfigDir;
+  if (typeof source === 'string' && source && !directory(source)) {
+    throw Object.assign(new Error(`account ${account.id} is not set up on this node`), { code: 'account-missing' });
+  }
 }
 
 // Returns what the launch needs and what it changed:
@@ -76,7 +110,7 @@ function prepare(options = {}, deps = {}) {
   if (!['claude', 'codex', 'pi'].includes(agent)) {
     throw new Error('launch preparation needs a claude, codex or pi agent');
   }
-  const account = checkedAccount(options.account);
+  const account = checkedAccount(options.account, deps);
   if (account.agent !== agent) {
     throw new Error(`launch preparation for ${agent} was given a ${account.agent} account`);
   }
@@ -84,6 +118,7 @@ function prepare(options = {}, deps = {}) {
   if (!cwd) throw new Error('launch preparation needs a working directory');
   const accountSetup = deps.accountSetup || require('./account-setup.js');
   const agentLauncher = deps.agentLauncher || require('./agent-launcher.js');
+  assertAccountInstalled(account, { ...deps, readSetup: (value) => accountSetup.readSetup(value) });
 
   // A Claude account carrying a shared-setup manifest has its project memory and
   // its MCP config written here, in the config directory on this machine. The

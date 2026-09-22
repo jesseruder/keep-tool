@@ -78,8 +78,10 @@ test('a managed Claude launch writes the shared mcp config and splices its flag 
 test('a shared setup that cannot be honoured is a coded failure, not a launch', (t) => {
   const f = fixture(t);
   accountSetup.shareSetup(f.source, f.target);
-  // The manifest is still there; the source it names is not.
-  fs.rmSync(path.join(f.home, '.claude'), { recursive: true, force: true });
+  // The manifest is there, the source is there, and one shared entry is no longer
+  // the link the manifest recorded: a setup that cannot be honoured.
+  fs.rmSync(path.join(f.target.configDir, 'CLAUDE.md'));
+  fs.writeFileSync(path.join(f.target.configDir, 'CLAUDE.md'), 'not a link\n');
   const error = (() => {
     try {
       launchPrep.prepare({
@@ -92,6 +94,59 @@ test('a shared setup that cannot be honoured is a coded failure, not a launch', 
   assert.ok(error, 'the launch is refused');
   assert.equal(error.code, 'shared-setup');
   assert.match(error.message, /^account shared setup is unavailable: /);
+});
+
+test('an account that is not installed on this machine is refused before anything is created', (t) => {
+  const f = fixture(t);
+  const absent = { id: 'claude-elsewhere', agent: 'claude', configDir: path.join(f.home, '.claude-elsewhere'),
+    builtIn: false, managed: true };
+  const attempt = (account, options = {}) => {
+    try {
+      return launchPrep.prepare({
+        agent: 'claude', account, cwd: f.project, bypass: true,
+        argv: ['claude', { insert: 'mcpConfig' }], pi: null,
+      }, options) && null;
+    } catch (error) { return error; }
+  };
+
+  // A config directory that is not here is an account that is not here. Refused by
+  // name, and — the part that matters — refused *before* the trust write, which
+  // would otherwise have created the directory and left a plausible empty profile.
+  const missing = attempt(absent);
+  assert.equal(missing.code, 'account-missing');
+  assert.equal(missing.message, 'account claude-elsewhere is not set up on this node');
+  assert.equal(fs.existsSync(absent.configDir), false, 'nothing was created on the way past');
+
+  // A manifest naming a source this machine does not have is half an account.
+  accountSetup.shareSetup(f.source, f.target);
+  fs.rmSync(path.join(f.home, '.claude'), { recursive: true, force: true });
+  const halved = attempt(f.target);
+  assert.equal(halved.code, 'account-missing');
+  assert.equal(halved.message, 'account claude-work is not set up on this node');
+});
+
+test('an account directory is resolved against the home of the machine running the launch', (t) => {
+  const f = fixture(t);
+  // The daemon sends `~/.claude`; on this machine that is this machine's home, and
+  // a launch that expanded it against the daemon's would look in the wrong place.
+  const prepared = launchPrep.prepare({
+    agent: 'claude',
+    account: { id: 'claude/default', agent: 'claude', configDir: '~/.claude', builtIn: true, managed: false },
+    cwd: f.project, bypass: false, argv: ['claude', { insert: 'mcpConfig' }], pi: null,
+  }, { homedir: f.home });
+  assert.match(prepared.command, /claude/);
+
+  const elsewhere = (() => {
+    try {
+      launchPrep.prepare({
+        agent: 'claude',
+        account: { id: 'claude/default', agent: 'claude', configDir: '~/.claude', builtIn: true, managed: false },
+        cwd: f.project, bypass: false, argv: ['claude', { insert: 'mcpConfig' }], pi: null,
+      }, { homedir: path.join(f.root, 'no-such-home') });
+      return null;
+    } catch (error) { return error; }
+  })();
+  assert.equal(elsewhere.code, 'account-missing', 'another home is another machine, and this account is not on it');
 });
 
 test('a bypass launch pre-trusts the project, and a failure to do so is reported, not fatal', (t) => {
@@ -129,6 +184,7 @@ test('a Pi opening is written on the machine Pi runs on, once', (t) => {
   const f = fixture(t);
   const openingDir = path.join(f.root, 'registry', '.keep', 'pi-opening');
   const pi = { id: 'pi/default', agent: 'pi', configDir: path.join(f.home, '.pi'), builtIn: true, managed: false };
+  fs.mkdirSync(pi.configDir, { recursive: true });
   const prepared = launchPrep.prepare({
     agent: 'pi', account: pi, cwd: f.project, bypass: false,
     argv: ['pi', '--session-id', 'pi-session-1', { insert: 'piOpening' }],
@@ -151,6 +207,7 @@ test('a Pi opening is written on the machine Pi runs on, once', (t) => {
 test('a codex launch takes neither path and still gets this machine command', (t) => {
   const f = fixture(t);
   const account = { id: 'codex/default', agent: 'codex', configDir: path.join(f.home, '.codex'), builtIn: true, managed: false };
+  fs.mkdirSync(account.configDir, { recursive: true });
   const prepared = launchPrep.prepare({
     agent: 'codex', account, cwd: f.project, bypass: false,
     argv: ['codex', '--dangerously-bypass-approvals-and-sandbox', 'resume', 'abc'], pi: null,
