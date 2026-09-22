@@ -112,7 +112,10 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
   return {
     snapshot: () => entries.map((e) => ({ ...e })),
     async request(body) {
-      if (!/^[a-z0-9_-]+$/i.test(body?.sessionId || '') || !/^[a-z0-9_-]+$/i.test(body?.pane || '') || !['now', 'idle', 'cancel', 'force', 'recover'].includes(body.mode)) throw Error('Expected exact session, pane and restart mode');
+      // A pane may be named by the node it runs on (`<id>@<node>`). Restart is one
+      // of the two things a person must be able to do to a remote pane by hand; the
+      // router takes it from here and the host never sees the qualifier.
+      if (!/^[a-z0-9_-]+$/i.test(body?.sessionId || '') || !/^[A-Za-z0-9_-]{1,64}(?:@[a-z0-9]+)?$/.test(body?.pane || '') || !['now', 'idle', 'cancel', 'force', 'recover'].includes(body.mode)) throw Error('Expected exact session, pane and restart mode');
       if (['force', 'recover'].includes(body.mode) && body.confirmInterruption !== true) throw Error('Explicit interruption confirmation required');
       const recovery = entries.find(e => e.sessionId === body.sessionId && e.status === 'recovery-needed');
       if (recovery) {

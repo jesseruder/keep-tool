@@ -13258,15 +13258,22 @@ test('the daemon merges two nodes into one pane list and routes by the qualified
       assert.notEqual(replaced.pane.pid, doomed.pid);
       assert.equal((await hostRequest('get', { pane: doomed.id }, deps)).pane.alive, true);
 
-      // Manual close reaches a remote pane and its identity check passes; automatic
-      // policies do not, because nothing here can read that machine process table.
+      // A remote pane really closed, through the daemon's own path: the kill is
+      // routed to the node that owns it, and manual close then verifies that the
+      // pane it was asked about is the pane that stopped — an identity check between
+      // the qualified id the daemon holds and the reply the host sends back.
+      await hostRequest('kill', { pane: doomed.id, signal: 'SIGKILL' }, deps);
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await hostRequest('get', { pane: doomed.id }, deps)).pane.alive === false) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
       const closed = await require('./manual-close.js').manualClose(
         { sessionId: 'restart-session', pane: doomed.id },
         { getPane: async (id) => (await hostRequest('get', { pane: id }, deps)).pane },
-      ).catch((error) => error);
-      assert.equal(closed instanceof Error, true, 'a live agent pane is not closed by identity alone');
-      assert.equal(/identity changed|Expected exact session and pane/.test(closed.message), false,
-        `manual close refused a remote pane for the wrong reason: ${closed.message}`);
+      );
+      assert.deepEqual(closed, {
+        ok: true, closed: true, forced: false, sessionId: 'restart-session', pane: doomed.id,
+      });
       await assert.rejects(
         closeIdleSession({ sessionId: 'remote-session', pane: qualified }, { ...deps, closePolicy: { retirement: true } }),
         /automatic close is not available for a pane on aws1/,

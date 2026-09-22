@@ -241,7 +241,11 @@ function startSchedulers(ctx) {
   // dies at the end of its turn, has no memory, and cannot be looked at.
   runs.setOpener(openCheckSession);
   runs.setEphemeralHost({
-    listPanes: () => listHostPanes({}, true),
+    // The same boundary the cleanup snapshot keeps: this sweep closes a pane and
+    // then releases the check's delivery stamp on the strength of a local
+    // observation. An exited pane on another node is not this machine's to reap.
+    listPanes: async () => (await listHostPanes({}, true) || [])
+      .filter((pane) => !pane?.node || pane.node === nodes.daemonNode()),
     sessions: () => scanSessions(),
     closePane: (pane, sessionId) => closeEphemeralPane(pane, sessionId, { onChange: broadcast }),
     // A closed pane still sits in the host's list. Forget it, or the sweep re-decides

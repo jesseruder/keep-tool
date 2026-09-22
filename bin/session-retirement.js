@@ -80,6 +80,10 @@ function safeNotify(notify) {
 }
 
 function begin(root, plan, now = Date.now()) {
+  // A node-qualified pane (`<id>@<node>`) is refused here on purpose: retirement's
+  // identity check is an agent pid read from this machine's process table, and it
+  // has no meaning for a pane on another machine. It waits for node-local process
+  // verification (landing 1b); until then a remote pane is closed by hand.
   if (!ID.test(String(plan?.sessionId || '')) || !ID.test(String(plan?.pane || ''))) throw Error('bad retirement target');
   const current = retirements(root);
   if (!current.known) throw Error('session retirement registry is unreadable');

@@ -1288,3 +1288,28 @@ test('the fallback notice dates the streak, not the card due date', async () => 
     assert.doesNotMatch(landed.at(-1).message, /2020-01-01/);
   } finally { setOpener(null); _resetSchedulerState(); }
 });
+
+test('the ephemeral sweep leaves the panes of another node alone, exited or not', async () => {
+  const closed = [];
+  const removed = [];
+  const now = 1_000_000 + 5 * 3600e3;
+  const result = await sweepEphemeralPanes({
+    listPanes: async () => [
+      ephemeralPane({ id: 'local', meta: { card: null, sessionId: 'local-sid' } }),
+      // Ripe for reaping by every rule this sweep knows — and on another machine,
+      // where closing it and releasing its card's stamp rest on evidence this
+      // process cannot produce.
+      ephemeralPane({ id: 'r@aws1', node: 'aws1', hostPaneId: 'r', alive: false, meta: { card: 'some-card', sessionId: 'remote-sid' } }),
+    ],
+    sessions: async () => [
+      { id: 'local-sid', endedTurn: true, mtime: 1_000_000 },
+      { id: 'remote-sid', endedTurn: true, mtime: 1_000_000 },
+    ],
+    closePane: async (pane, sessionId) => { closed.push([pane.id, sessionId]); },
+    removePane: async (pane) => { removed.push(pane.id); },
+    checkinTask: () => assert.fail('a remote check must not be released from here'),
+  }, now);
+  assert.deepEqual(result, ['local']);
+  assert.deepEqual(closed, [['local', 'local-sid']]);
+  assert.deepEqual(removed, ['local']);
+});

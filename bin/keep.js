@@ -3363,8 +3363,9 @@ commands['restart-daemon'] = async (argv) => {
 commands['force-restart'] = async argv => {
   const o = parseArgs(argv, { pane: 'str', recover: 'bool' });
   const sessionId = o._[0];
-  if (o._.length !== 1 || !/^[a-z0-9_-]+$/i.test(sessionId || '') || !/^[a-z0-9_-]+$/i.test(o.pane || '')) {
-    die('usage: keep force-restart <session-id> --pane <pane-id> [--recover]');
+  // `--pane <id>@<node>` restarts a pane on another machine; the daemon routes it.
+  if (o._.length !== 1 || !/^[a-z0-9_-]+$/i.test(sessionId || '') || !/^[A-Za-z0-9_-]{1,64}(?:@[a-z0-9]+)?$/.test(o.pane || '')) {
+    die('usage: keep force-restart <session-id> --pane <pane-id>[@<node>] [--recover]');
   }
   const response = await postKeepApi('/api/restart-session', { sessionId, pane: o.pane,
     mode: o.recover ? 'recover' : 'force', confirmInterruption: true });

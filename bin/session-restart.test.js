@@ -403,3 +403,33 @@ test('a restart names the swapped-out model when the model key is busy', async (
     }
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('a restart may name a pane on another node, and refuses anything else', async (t) => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-restart-node-')), 'restarts.json');
+  t.after(() => fs.rmSync(path.dirname(file), { recursive: true, force: true }));
+  const manager = createManager({
+    file,
+    inspect: async (body) => ({
+      session: { id: body.sessionId, endedTurn: true },
+      pane: { id: body.pane, alive: true, pid: 42, meta: { sessionId: body.sessionId, agent: 'claude' } },
+    }),
+    restart: async () => ({}),
+    forceRestart: async () => ({}),
+  });
+  const queued = await manager.request({ sessionId: 'sess-1', pane: '1a2b@aws1', mode: 'idle' });
+  assert.equal(queued.pane, '1a2b@aws1', 'the node travels with the request to the router');
+  await assert.rejects(manager.request({ sessionId: 'sess-2', pane: 'a@b@c', mode: 'idle' }), /Expected exact session/);
+  await assert.rejects(manager.request({ sessionId: 'sess-2', pane: 'bad pane@aws1', mode: 'idle' }), /Expected exact session/);
+  await assert.rejects(manager.request({ sessionId: 'sess-2', pane: '1a2b@AWS1', mode: 'idle' }), /Expected exact session/);
+});
+
+test('the two automatic paths keep refusing a pane on another node', () => {
+  // Both prove what they did by reading this machine's process table, so until a
+  // node can answer for its own processes (landing 1b) they refuse rather than guess.
+  assert.throws(() => require('./session-retirement.js').begin('/tmp/nowhere', {
+    sessionId: 'sess-1', pane: '1a2b@aws1',
+  }), /bad retirement target/);
+  return assert.rejects(require('./account-handoff.js').run({
+    sessionId: 'sess-1', pane: '1a2b@aws1', accountId: 'claude/default',
+  }), /Expected exact session, pane and target account/);
+});

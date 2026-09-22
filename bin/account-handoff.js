@@ -597,6 +597,10 @@ async function requireExpectedSessionState(body, deps) {
 async function run(body, deps = {}) {
   const root = deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
   const env = deps.env || process.env;
+  // A pane qualified by node (`<id>@<node>`) is refused here on purpose: a transfer
+  // stops the source agent and proves it stopped by reading this machine's process
+  // table, which says nothing about another machine's pid. It waits for node-local
+  // process verification (landing 1b) rather than guessing.
   if (!/^[A-Za-z0-9_-]+$/.test(String(body?.sessionId || '')) || !/^[A-Za-z0-9_-]+$/.test(String(body?.pane || ''))
       || !accounts.ID_RE.test(String(body?.accountId || ''))) {
     const error = new Error('Expected exact session, pane and target account'); error.status = 400; throw error;
