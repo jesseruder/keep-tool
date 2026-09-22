@@ -383,16 +383,18 @@ function delegationDependencies(options = {}) {
   return { loadTask, parsePlan, persist: false, ...options };
 }
 
-function currentDelegation() {
-  return delegation.resolveForCommand(ROOT, process.env, currentSession(), delegationDependencies());
+function currentDelegation(scope) {
+  const { root, env } = scopeFor(scope);
+  return delegation.resolveForCommand(root, env, currentSession(scope),
+    delegationDependencies({ loadTask: (id) => loadTask(id, root) }));
 }
 
-function commandSession() {
-  const assigned = currentDelegation();
+function commandSession(scope) {
+  const assigned = currentDelegation(scope);
   if (!['pending', 'identity-mismatch', 'none'].includes(assigned.kind) && assigned.record && assigned.record.worker) {
     return assigned.record.worker;
   }
-  return currentSession();
+  return currentSession(scope);
 }
 
 // Always `keep open <id>` now, whether or not any account is managed. A raw
@@ -494,11 +496,12 @@ function linkSession(taskId, session, options = {}) {
 // The fleet reviewer is a normal interactive session, so every ordinary guard
 // treats it as a working agent. It is not one: it produces no code, and linking it
 // to a card would hand that card's resume slot to the reviewer.
-function isReviewerSession() {
-  if (process.env.KEEP_REVIEWER === '1') return true;
-  const session = currentSession();
+function isReviewerSession(scope) {
+  const { env, root } = scopeFor(scope);
+  if (env.KEEP_REVIEWER === '1') return true;
+  const session = currentSession(scope);
   if (!session) return false;
-  try { return fs.existsSync(path.join(META, 'reviewer', session.id)); } catch { return false; }
+  try { return fs.existsSync(path.join(paths(root).meta, 'reviewer', session.id)); } catch { return false; }
 }
 
 // The reviewer used to be refused every status change (exit 4, "use a wrong-status
@@ -581,10 +584,10 @@ function invalidateSchedulerHandoff(task) {
   for (const field of ['scheduled_at', 'scheduled_for', 'scheduled_intent']) delete task.fm[field];
 }
 
-function recordProgressMarker(task, session) {
+function recordProgressMarker(task, session, scope) {
   if (!session || !(task.fm.sessions || []).some((entry) => entry.id === session.id)) return false;
   try {
-    const dir = path.join(META, 'checkins');
+    const dir = path.join(paths(scopeFor(scope).root).meta, 'checkins');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, session.id), nowStamp());
     return true;
@@ -610,8 +613,11 @@ function recordSession(task, scope) {
   // Creating a card claims it for the creating session. Existing-card mutations use
   // recordContribution instead; only add, claim/link, and open handoffs move links.
   // The reviewer may legitimately file a follow-up card, but must not claim it.
-  if (isReviewerSession()) return { linked: false, skipped: 'reviewer', session: null };
-  const session = commandSession();
+  const { root, identity } = scopeFor(scope);
+  if (isReviewerSession(scope)) return { linked: false, skipped: 'reviewer', session: null };
+  // A scoped call names the session it acts for; a plain one asks this process who
+  // it is, delegation and all.
+  const session = identity && typeof identity === 'object' ? identity : commandSession(scope);
   const sid = session && session.id;
   if (!sid || !/^[A-Za-z0-9_-]+$/.test(sid)) {
     return { linked: false, skipped: 'no-session', session };
@@ -622,7 +628,6 @@ function recordSession(task, scope) {
   // A live session has exactly one owning card. Without removing old links the
   // dashboard resolves duplicates by filesystem iteration order, so a check-in
   // can make the session appear under an unrelated task.
-  const { root } = scopeFor(scope);
   cardUsage.recordOwner(root, session, task.id);
   const previousOwners = claimSession(task, session, loadAll(false, scope));
   for (const previous of previousOwners) {
@@ -630,7 +635,7 @@ function recordSession(task, scope) {
     // card, so preserve its `updated` timestamp and board position.
     fs.writeFileSync(taskPath(previous.id, root), serializeTask(previous));
   }
-  recordProgressMarker(task, session);
+  recordProgressMarker(task, session, scope);
   return { linked: true, skipped: null, session };
 }
 

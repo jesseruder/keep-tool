@@ -70,3 +70,27 @@ test('an explicit scope answers from another registry while the default scope st
     fs.rmSync(path.join(keep.ROOT, 'tasks'), { recursive: true, force: true });
   }
 });
+
+test('a scoped recordSession records the identity the scope names, in the registry it names', () => {
+  const other = registry();
+  try {
+    fs.writeFileSync(path.join(other, 'tasks', 'scoped-card.md'), card('scoped-card'));
+    const scope = { root: other, env: { CLAUDE_CODE_SESSION_ID: 'sid-process' },
+      identity: { id: 'sid-identity', agent: 'codex' } };
+
+    const task = keep.loadTask('scoped-card', other);
+    const result = keep.recordSession(task, scope);
+    assert.deepEqual(result, { linked: true, skipped: null, session: { id: 'sid-identity', agent: 'codex' } });
+    assert.equal(task.fm.sessions[0].id, 'sid-identity', 'the identity, not the process session, owns the card');
+    assert.equal(task.fm.sessions[0].agent, 'codex');
+    // Its ownership and its check-in marker went to the scoped registry, not this one.
+    assert.equal(fs.existsSync(path.join(other, '.keep', 'checkins', 'sid-identity')), true);
+    assert.equal(fs.existsSync(path.join(keep.ROOT, '.keep', 'checkins', 'sid-identity')), false);
+
+    // Without an identity, a scope with no session of its own has nobody to record.
+    const bare = keep.loadTask('scoped-card', other);
+    assert.deepEqual(keep.recordSession(bare, { root: other, env: {} }),
+      { linked: false, skipped: 'no-session', session: null });
+    assert.equal((bare.fm.sessions || []).length, 0);
+  } finally { fs.rmSync(other, { recursive: true, force: true }); }
+});
