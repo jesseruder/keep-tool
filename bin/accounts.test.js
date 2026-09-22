@@ -162,3 +162,47 @@ test('real CLI account bootstrap preserves the default config and refuses isolat
     assert.equal(fs.readFileSync(file, 'utf8'), beforeIsolatedAttempt, 'isolated KEEP_DIR cannot overwrite the default configuration');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('session authority records the node a session runs on', () => {
+  const f = fixture(), sid = 'node-session';
+  const root = f.env.KEEP_DIR;
+  const file = path.join(root, '.keep', 'session-accounts', `${sid}.json`);
+  try {
+    accounts.pinSession(sid, 'claude', 'a', { root, env: f.env });
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).node, 'main');
+    assert.equal(accounts.sessionNode(sid, { root, env: f.env }), 'main');
+    assert.equal(accounts.forSession(sid, 'claude', { root, env: f.env }).node, 'main');
+    assert.equal(accounts.authority(root, f.env)[sid].node, 'main');
+
+    // An explicit node is what a later phase pins a remote session with.
+    accounts.pinSession('remote-session', 'claude', 'a', { root, env: f.env, node: 'laptop' });
+    assert.equal(accounts.sessionNode('remote-session', { root, env: f.env }), 'laptop');
+    assert.throws(() => accounts.pinSession('bad-node-session', 'claude', 'a', { root, env: f.env, node: 'Laptop' }),
+      /invalid node name/);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts', 'bad-node-session.json')), false);
+
+    // An account handoff moves accounts, never machines.
+    accounts.stageSession('remote-session', 'b', 'tx', { root, env: f.env });
+    assert.equal(accounts.commitStaged('remote-session', 'tx', { root, env: f.env }).node, 'laptop');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('authority written before Keep named its machines reads back as the daemon node', () => {
+  const f = fixture(), sid = 'legacy-session';
+  const root = f.env.KEEP_DIR;
+  const file = path.join(root, '.keep', 'session-accounts', `${sid}.json`);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const legacy = JSON.stringify({ version: 1, sessionId: sid, agent: 'claude', accountId: 'a', updatedAt: 1 }, null, 2) + '\n';
+    fs.writeFileSync(file, legacy);
+    assert.equal(accounts.sessionNode(sid, { root, env: f.env }), 'main');
+    assert.equal(accounts.forSession(sid, 'claude', { root, env: f.env }).node, 'main');
+    assert.equal(fs.readFileSync(file, 'utf8'), legacy, 'reading backfills the node without rewriting the record');
+
+    const daemonEnv = { ...f.env, KEEP_DAEMON_NODE: 'mini' };
+    assert.equal(accounts.sessionNode(sid, { root, env: daemonEnv }), 'mini');
+
+    fs.writeFileSync(file, JSON.stringify({ version: 1, sessionId: sid, agent: 'claude', accountId: 'a', node: 'Main', updatedAt: 1 }, null, 2) + '\n');
+    assert.throws(() => accounts.sessionNode(sid, { root, env: f.env }), /invalid session node/);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});

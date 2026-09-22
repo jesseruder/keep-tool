@@ -14,6 +14,7 @@ const { Worker } = require('node:worker_threads');
 const { AsyncLocalStorage } = require('async_hooks');
 const { promisify } = require('util');
 const keep = require('./keep.js');
+const nodes = require('./nodes.js');
 const pressure = require('./pressure.js');
 const runs = require('./runs.js');
 const summarize = require('./summarize.js');
@@ -8036,7 +8037,10 @@ async function openSession(body, deps = {}) {
     if (body.accountId != null && body.accountId !== account.id) {
       throw new InjectionError(409, `session ${sessionRef(session.id)} is pinned to account ${account.id}; use handoff to transfer it`);
     }
-    if (account.managed) accounts.pinSession(session.id, agent, account.id, { root: deps.root || keep.ROOT, env: deps.env || process.env });
+    if (account.managed) {
+      accounts.pinSession(session.id, agent, account.id,
+        { root: deps.root || keep.ROOT, env: deps.env || process.env, node: nodes.daemonNode(deps.env || process.env) });
+    }
   } else {
     const env = deps.env || process.env;
     if (body.accountId != null) {
@@ -8124,7 +8128,7 @@ async function openSession(body, deps = {}) {
         }
         if (!authority) {
           (deps.pinSession || accounts.pinSession)(sessionId, agent, account.id,
-            { root: deps.root || keep.ROOT, env: deps.env || process.env });
+            { root: deps.root || keep.ROOT, env: deps.env || process.env, node: nodes.daemonNode(deps.env || process.env) });
         }
       }
       return { ok: true, existing: true, focus: 'console', pane: existing.id,
@@ -8218,6 +8222,8 @@ async function openSession(body, deps = {}) {
         accountId: account.id,
         accountLabel: account.label,
         sessionId,
+        // The machine the pane lives on. Only the daemon node spawns panes.
+        node: nodes.daemonNode(deps.env || process.env),
         // Recorded so the console and the compaction restore read the launch model
         // from the pane instead of inferring it from the transcript.
         ...(launchModel ? { model: launchModel } : {}),
@@ -8370,7 +8376,7 @@ async function openSession(body, deps = {}) {
   try {
     if (launch.sessionId) {
       (deps.pinSession || accounts.pinSession)(launch.sessionId, agent, account.id,
-        { root: deps.root || keep.ROOT, env: deps.env || process.env });
+        { root: deps.root || keep.ROOT, env: deps.env || process.env, node: nodes.daemonNode(deps.env || process.env) });
     }
     if (deps.onLaunched) await deps.onLaunched(launch);
     launchPrepared = true;
@@ -8454,7 +8460,7 @@ async function openSession(body, deps = {}) {
     }
     if (launch.sessionId && !deferReadiness) {
       (deps.pinSession || accounts.pinSession)(launch.sessionId, agent, account.id,
-        { root: deps.root || keep.ROOT, env: deps.env || process.env });
+        { root: deps.root || keep.ROOT, env: deps.env || process.env, node: nodes.daemonNode(deps.env || process.env) });
     }
   } catch (error) {
     if (error?.extra?.awaitingSetup) error.extra.launch = { pane: launch.pane, sessionId: launch.sessionId, accountId: launch.accountId };

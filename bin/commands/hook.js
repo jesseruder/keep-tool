@@ -1961,7 +1961,7 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
         if (authority && authority.id !== accountId) throw new Error('Codex SessionStart account authority changed');
         if (!authority) {
           (deps.pinSession || accountStore.pinSession)(sid, 'codex', accountId,
-            { root: deps.root || ROOT, env });
+            { root: deps.root || ROOT, env, node: require('../nodes.js').daemonNode(env) });
         }
       }
       const owner = current && current.pane && current.pane.meta && current.pane.meta.sessionId;

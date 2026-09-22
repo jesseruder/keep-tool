@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const nodes = require('./nodes.js');
 
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 const TAIL_BYTES = 256 * 1024;
@@ -54,6 +55,11 @@ function findSessionFile(id, options = {}) {
     // Preserve the legacy fallback for invalid or unavailable authority: a sole
     // file can still be read, but multiple files remain ambiguous.
     authorityFailed = true;
+  }
+  if (pinned && pinned.node && pinned.node !== nodes.daemonNode(env)) {
+    // Nothing mirrors another node's transcripts here, so reading a local file for
+    // that session would answer with the wrong machine's history.
+    throw new Error(`session ${id} runs on node ${pinned.node}; its transcript is not mirrored here`);
   }
   const matches = accounts.locateClaudeFiles(id, env);
   if (!pinned && !authorityFailed) {

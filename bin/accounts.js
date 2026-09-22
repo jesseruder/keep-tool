@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { named: sessionNamed } = require('./session-numbers.js');
+const nodes = require('./nodes.js');
 
 const AGENTS = ['claude', 'codex', 'pi'];
 const CUSTOM_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -145,14 +146,20 @@ function projectRoots(env = process.env) {
 
 function authorityDir(root) { return path.join(root, '.keep', 'session-accounts'); }
 function authorityFile(root, sessionId) { return path.join(authorityDir(root), `${sessionId}.json`); }
-function readRecord(root, sessionId) {
+function readRecord(root, sessionId, env = process.env) {
   const file = authorityFile(root, sessionId);
   try {
     const value = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!value || value.version !== 1 || value.sessionId !== sessionId || !AGENTS.includes(value.agent) || !ID_RE.test(value.accountId || '')) {
       throw new Error(`invalid session account authority: ${file}`);
     }
-    return value;
+    if (value.node !== undefined && (typeof value.node !== 'string' || !nodes.NODE_NAME_RE.test(value.node))) {
+      throw new Error(`invalid session node in session account authority: ${file}`);
+    }
+    // A record written before Keep named its machines belongs to the daemon node.
+    // Backfilling it on the way out rather than rewriting the file keeps settled
+    // authority byte-for-byte identical across a retry.
+    return value.node === undefined ? { ...value, node: nodes.daemonNode(env) } : value;
   } catch (error) {
     if (error.code === 'ENOENT') return null;
     throw error;
@@ -165,14 +172,14 @@ function writeRecord(root, value) {
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
   fs.renameSync(tmp, file);
 }
-function authority(root) {
+function authority(root, env = process.env) {
   const result = {};
   let names;
   try { names = fs.readdirSync(authorityDir(root)); } catch { return result; }
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
     const id = name.slice(0, -5);
-    try { result[id] = readRecord(root, id); } catch {}
+    try { result[id] = readRecord(root, id, env); } catch {}
   }
   return result;
 }
@@ -195,7 +202,7 @@ function locateClaudeFiles(sessionId, env = process.env) {
 function forSession(sessionId, agent = 'claude', options = {}) {
   const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
   const env = options.env || process.env;
-  const record = readRecord(root, sessionId);
+  const record = readRecord(root, sessionId, env);
   if (record) {
     if (record.agent !== agent) throw new Error(`session ${sessionNamed(sessionId)} is pinned to ${record.agent}`);
     if (record.stagedAccountId && !options.preferStaged && !options.allowStagedSource) {
@@ -204,16 +211,28 @@ function forSession(sessionId, agent = 'claude', options = {}) {
     const id = options.preferStaged && record.stagedAccountId ? record.stagedAccountId : record.accountId;
     const account = get(id, env);
     if (!account || account.agent !== agent) throw new Error(`session ${sessionNamed(sessionId)} is pinned to unavailable account ${id}`);
-    return account;
+    // A copy: the node belongs to this session, not to the account it runs on.
+    return { ...account, node: record.node };
   }
   if (options.allowDiscovery === false) return null;
   if (agent === 'claude') {
     const matches = locateClaudeFiles(sessionId, env);
     const ids = [...new Set(matches.map((entry) => entry.accountId))];
-    if (ids.length === 1) return get(ids[0], env);
+    // Discovery walks this machine's own account directories, so a session found
+    // that way runs here; without a record there is no node to report.
+    if (ids.length === 1) return { ...get(ids[0], env), node: null };
     if (ids.length > 1) throw new Error(`session ${sessionId} exists in multiple accounts without authority`);
   }
   return null;
+}
+
+// The node a session runs on according to durable authority, or null when the
+// session has none. Never discovery: an unrecorded session has no node.
+function sessionNode(sessionId, options = {}) {
+  const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+  const env = options.env || process.env;
+  const record = readRecord(root, sessionId, env);
+  return record ? record.node : null;
 }
 
 function pinSession(sessionId, agent, accountId, options = {}) {
@@ -222,12 +241,14 @@ function pinSession(sessionId, agent, accountId, options = {}) {
   const env = options.env || process.env;
   const account = get(accountId, env);
   if (!account || account.agent !== agent) throw new Error(`account ${accountId} is not a ${agent} account`);
-  const current = readRecord(root, sessionId);
+  const current = readRecord(root, sessionId, env);
   if (current && current.agent !== agent) throw new Error(`session ${sessionNamed(sessionId)} is already pinned to ${current.agent}`);
   if (current && current.accountId !== accountId && !options.transfer) {
     throw new Error(`session ${sessionNamed(sessionId)} is already pinned to account ${current.accountId}`);
   }
-  const value = { version: 1, sessionId, agent, accountId, updatedAt: Date.now(), ...(options.transactionId ? { transactionId: options.transactionId } : {}) };
+  const node = options.node === undefined ? nodes.daemonNode(env) : options.node;
+  if (typeof node !== 'string' || !nodes.NODE_NAME_RE.test(node)) throw new Error(`invalid node name: ${node}`);
+  const value = { version: 1, sessionId, agent, accountId, node, updatedAt: Date.now(), ...(options.transactionId ? { transactionId: options.transactionId } : {}) };
   writeRecord(root, value);
   return value;
 }
@@ -235,7 +256,7 @@ function pinSession(sessionId, agent, accountId, options = {}) {
 function stageSession(sessionId, targetAccountId, transactionId, options = {}) {
   const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
   const env = options.env || process.env;
-  const current = readRecord(root, sessionId);
+  const current = readRecord(root, sessionId, env);
   if (!current) throw new Error(`session ${sessionNamed(sessionId)} has no account authority`);
   const target = get(targetAccountId, env);
   if (!target || target.agent !== current.agent) throw new Error(`account ${targetAccountId} is not a ${current.agent} account`);
@@ -245,17 +266,20 @@ function stageSession(sessionId, targetAccountId, transactionId, options = {}) {
 }
 function commitStaged(sessionId, transactionId, options = {}) {
   const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
-  const current = readRecord(root, sessionId);
+  const env = options.env || process.env;
+  const current = readRecord(root, sessionId, env);
   if (!current || current.transactionId !== transactionId || !current.stagedAccountId) throw new Error('staged account authority changed');
-  const value = { version: 1, sessionId, agent: current.agent, accountId: current.stagedAccountId, transactionId, updatedAt: Date.now() };
+  // An account handoff moves the session between accounts, never between machines.
+  const value = { version: 1, sessionId, agent: current.agent, accountId: current.stagedAccountId, node: current.node, transactionId, updatedAt: Date.now() };
   writeRecord(root, value);
   return value;
 }
 function clearStaged(sessionId, transactionId, options = {}) {
   const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
-  const current = readRecord(root, sessionId);
+  const env = options.env || process.env;
+  const current = readRecord(root, sessionId, env);
   if (current && current.transactionId === transactionId && current.stagedAccountId) {
-    writeRecord(root, { version: 1, sessionId, agent: current.agent, accountId: current.accountId, updatedAt: Date.now() });
+    writeRecord(root, { version: 1, sessionId, agent: current.agent, accountId: current.accountId, node: current.node, updatedAt: Date.now() });
   }
 }
 
@@ -320,6 +344,6 @@ function setDefault(agent, accountId, env = process.env) {
 
 module.exports = {
   AGENTS, ID_RE, CUSTOM_ID_RE, rawConfig, list, get, defaultFor, automationFor, hasMultiple, envFor, projectRoots,
-  publicState, authority, authorityFile, locateClaudeFiles, forSession, pinSession,
+  publicState, authority, authorityFile, locateClaudeFiles, forSession, sessionNode, pinSession,
   stageSession, commitStaged, clearStaged, add, setDefault,
 };
