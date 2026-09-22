@@ -97,4 +97,54 @@ function isRemote(name, env = process.env) {
   return !resolveNode(name, env).daemon;
 }
 
-module.exports = { resolveNode, listNodes, isRemote, registryRoot };
+// The daemon's own listener for its nodes: an `<ip>:<port>` in config.json's
+// `nodeApi.listen`, or KEEP_NODE_API_LISTEN. It is separate from the public UI
+// server on purpose — that one's proxy stamps the admin token — and it knows only
+// node tokens.
+//
+// Answers { enabled: false } unless every condition holds: an address is given, this
+// process is the daemon node, and the configuration names at least one other node.
+// A single-node install therefore never starts it, whatever the file says. An
+// address that does not parse, or that names a wildcard, is { enabled: false, error }:
+// a listener nobody can reason about is not started.
+function nodeApiListen(env = process.env) {
+  let raw;
+  try { raw = env.KEEP_DIR && !env.KEEP_CONFIG ? {} : config.load(env); }
+  catch (error) { return { enabled: false, error: error.message }; }
+  let text = null;
+  if (raw.nodeApi !== undefined) {
+    const entry = raw.nodeApi;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return { enabled: false, error: 'invalid Keep configuration: nodeApi must be an object' };
+    }
+    const extra = Object.keys(entry).find((key) => key !== 'listen');
+    if (extra) return { enabled: false, error: `unsupported Keep nodeApi key: ${extra}` };
+    if (entry.listen !== undefined && typeof entry.listen !== 'string') {
+      return { enabled: false, error: 'invalid Keep configuration: nodeApi.listen must be a string' };
+    }
+    if (entry.listen) text = entry.listen;
+  }
+  if (typeof env.KEEP_NODE_API_LISTEN === 'string' && env.KEEP_NODE_API_LISTEN.trim()) text = env.KEEP_NODE_API_LISTEN;
+  if (!text) return { enabled: false, reason: 'not configured' };
+  const nodes = require('./nodes.js');
+  let daemon;
+  try {
+    if (!nodes.isDaemonNode(env)) return { enabled: false, reason: 'not the daemon node' };
+    daemon = nodes.daemonNode(env);
+  } catch (error) { return { enabled: false, error: error.message }; }
+  let configured;
+  try { configured = Object.keys(config.nodeConfig(raw).nodes); }
+  catch (error) { return { enabled: false, error: error.message }; }
+  if (!configured.some((name) => name !== daemon)) return { enabled: false, reason: 'no other node is configured' };
+  const host = require('./host.js');
+  let parsed;
+  try {
+    parsed = parseListenAddress(text);
+    host.assertBindable(parsed.address, text);
+  } catch (error) { return { enabled: false, error: error.message }; }
+  if (parsed.port < 1) return { enabled: false, error: `a node API address needs a port between 1 and 65535: ${text}` };
+  const shown = parsed.address.includes(':') ? `[${parsed.address}]:${parsed.port}` : `${parsed.address}:${parsed.port}`;
+  return { enabled: true, listen: shown, address: parsed.address, port: parsed.port, url: `http://${shown}` };
+}
+
+module.exports = { resolveNode, listNodes, isRemote, registryRoot, nodeApiListen };

@@ -13522,6 +13522,7 @@ function start(deps = {}) {
   let dashboardPublisher = null;
   let uiWorker = null;
   let backendServer = null;
+  let nodeApiServer = null;
   let backendSock = null;
   let retainedPublication = null;
   let announced = false;
@@ -13548,6 +13549,7 @@ function start(deps = {}) {
     uiWorker?.close();
     consoleServer?.close();
     backendServer?.close();
+    nodeApiServer?.close();
     try { if (backendSock) fs.unlinkSync(backendSock); } catch {}
     process.exit(0);
   };
@@ -13822,7 +13824,9 @@ function start(deps = {}) {
   const isLocal = (addr) => addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 
   const requestRoutes = buildRequestRoutes(ctx);
-  // Read once at boot, like the public token above. Nothing presents one yet.
+  // Read once at boot, like the public token above. Only the node listener below
+  // honours one; it re-reads the directory itself when it is shown a token it does
+  // not know, so this map is where it starts.
   const nodeTokenMap = nodes.nodeTokens(keep.ROOT);
 
   // Phone pushes carry the console's own badge count. Only the daemon has the
@@ -13835,8 +13839,9 @@ function start(deps = {}) {
     try {
       const url = new URL(req.url, 'http://localhost');
 
-      // Who is asking, resolved once. `acceptNodeTokens` is false: the daemon has
-      // no route a node may call yet, so a node token is not an identity here.
+      // Who is asking, resolved once. `acceptNodeTokens` is false: a node reaches
+      // the daemon only through the node listener (serve/node-api.js), never
+      // through this server, whose proxy stamps the admin token.
       const auth = { isLocal, token, internalToken: backendToken, nodeTokens: nodeTokenMap, acceptNodeTokens: false };
       const authError = apiRequestAuthError(req, auth);
       if (authError) return json(res, authError.status, { error: authError.error });
@@ -13929,6 +13934,21 @@ function start(deps = {}) {
   });
 
   backendServer = server;
+  // The listener for other nodes, on its own interface, when one is configured and
+  // this install has another node to hear from. A single-node install never gets
+  // one: node-registry.nodeApiListen answers disabled before anything is bound.
+  {
+    const nodeApi = require('./serve/node-api.js');
+    nodeApiServer = nodeApi.startNodeApi({
+      listen: require('./node-registry.js').nodeApiListen(),
+      handler: nodeApi.createNodeApiHandler({
+        routes: requestRoutes, matchRoute, routeDenial, readBody, principal: keepConsole.principal,
+        tokenStore: nodeApi.createNodeTokenStore({ initial: nodeTokenMap, read: () => nodes.nodeTokens(keep.ROOT) }),
+        json,
+        onMutation: () => dashboardPublisher?.invalidate(),
+      }),
+    });
+  }
   // Unix-domain socket paths are limited to roughly 100 bytes on macOS. Keep the
   // endpoint short; the random backend credential and mode 0600 provide the trust boundary.
   backendSock = path.join('/tmp', `keep-ui-${process.getuid?.() ?? 'user'}-${process.pid}.sock`);
