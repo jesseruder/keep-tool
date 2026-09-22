@@ -421,9 +421,11 @@ let liveSessionTickInFlight = false;
 let lastAutoCompactGc = 0;
 let reviewStateCache = { at: 0, value: null };
 const hostPaneCaches = new WeakMap();
+const lastKnownHostPaneMemo = { panes: null, at: 0 };
 let cachedHost = null;
 let pendingHost = null;
 let hostFailureAt = 0;
+let hostFailureError = null;
 const HOST_FAILURE_CACHE_MS = 5000;
 const HOST_PANE_CACHE_MS = 1000;
 const HOST_CONNECT_TIMEOUT_MS = 3000;
@@ -1763,21 +1765,28 @@ async function hostClient(deps = {}) {
   if (!pendingHost) {
     const connect = deps.connectHost
       || (deps.requireHostClient || require)('./hostclient.js').connect;
-    pendingHost = connect({ timeoutMs: deps.hostConnectTimeoutMs || HOST_CONNECT_TIMEOUT_MS }).then((client) => {
+    const timeoutMs = deps.hostConnectTimeoutMs == null ? HOST_CONNECT_TIMEOUT_MS : deps.hostConnectTimeoutMs;
+    pendingHost = connect({ timeoutMs }).then((client) => {
       cachedHost = client;
       hostFailureAt = 0;
+      hostFailureError = null;
       if (client && typeof client.onDisconnect === 'function') {
         client.onDisconnect(() => {
           if (cachedHost === client) {
+            // A closed socket is not a failed connect: `keep host reload` closes it
+            // on purpose, and the next request must reconnect at once rather than
+            // sit out the negative cache.
             cachedHost = null;
             hostFailureAt = 0;
+            hostFailureError = null;
           }
           hostPaneCaches.delete(client);
         });
       }
       return client;
-    }).catch(() => {
+    }).catch((error) => {
       hostFailureAt = now();
+      hostFailureError = error;
       return null;
     }).finally(() => { pendingHost = null; });
   }
@@ -1795,6 +1804,8 @@ async function closeHostClient() {
   if (pendingHost) await pendingHost.catch(() => null);
   const client = cachedHost;
   cachedHost = null;
+  hostFailureAt = 0;
+  hostFailureError = null;
   if (!client) return false;
   hostPaneCaches.delete(client);
   try { client.close(); } catch {}
@@ -1807,11 +1818,17 @@ function retryableHostError(error) {
     || /host (?:connection closed|is unavailable)|socket hang up/i.test(String(error && error.message || error));
 }
 
-function invalidateHost(client, deps = {}) {
+function hostRequestTimedOut(error) {
+  return /(?:host|terminal host) request timed out|host connect timed out|reload retry timed out/i
+    .test(String(error && error.message || error));
+}
+
+function invalidateHost(client, deps = {}, error = null) {
   if (client && client === cachedHost) {
     try { client.close(); } catch {}
     cachedHost = null;
     hostFailureAt = (deps.now || Date.now)();
+    hostFailureError = error || new Error('host connection closed');
   }
   if (client && typeof client === 'object') hostPaneCaches.delete(client);
 }
@@ -1819,36 +1836,54 @@ function invalidateHost(client, deps = {}) {
 async function requestHostClient(client, type, params, deps = {}) {
   const timeoutMs = deps.hostRequestTimeoutMs == null ? HOST_REQUEST_TIMEOUT_MS : deps.hostRequestTimeoutMs;
   let timer;
+  let pending = true;
   try {
     return await Promise.race([
       Promise.resolve().then(() => client.request(type, params || {}, { timeoutMs })),
       new Promise((resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(pressure.annotate(`host request timed out (${type})`))), timeoutMs);
+        timer = setTimeout(() => {
+          // Timers run before socket I/O callbacks. If the daemon was stalled past
+          // the deadline, give poll one turn to drain a reply the host already sent.
+          timer = setImmediate(() => {
+            if (!pending) return;
+            reject(new Error(pressure.annotate(`host request timed out (${type})`)));
+          });
+        }, timeoutMs);
       }),
     ]);
   } finally {
-    if (timer) clearTimeout(timer);
+    pending = false;
+    if (timer) { clearTimeout(timer); clearImmediate(timer); }
   }
 }
 
 async function hostRequest(type, params, deps = {}) {
   const wallNow = deps.wallNow || Date.now;
   const retryMs = deps.hostReloadRetryMs == null ? HOST_RELOAD_RETRY_MS : deps.hostReloadRetryMs;
-  const deadline = wallNow() + retryMs;
+  const requestTimeoutMs = deps.hostRequestTimeoutMs == null ? HOST_REQUEST_TIMEOUT_MS : deps.hostRequestTimeoutMs;
+  const connectBudgetMs = deps.hostConnectTimeoutMs == null ? HOST_CONNECT_TIMEOUT_MS : deps.hostConnectTimeoutMs;
+  // A reconnect has its own budget; it must not consume the request's intended
+  // response window. The shorter reload window only bounds reconnect/reload churn.
+  const deadline = wallNow() + connectBudgetMs + requestTimeoutMs;
   const idempotent = ['hello', 'list', 'get', 'screen', 'meta'].includes(type);
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const notRetried = (reason, error) => {
-    const failure = new Error(`terminal host ${reason} during non-idempotent ${type}; request was not retried`);
+    const detail = String(error && error.message || error).trim();
+    const failure = new Error(`terminal host ${reason} during non-idempotent ${type}; request was not retried${detail ? `: ${detail}` : ''}`);
     failure.code = 'host_request_not_retried';
     failure.cause = error;
     return failure;
   };
   let forceHostReconnect = false;
+  let retryDeadline = Infinity;
+  let timeoutRetries = 0;
   for (;;) {
     const remaining = deadline - wallNow();
-    if (remaining <= 0) throw new Error(pressure.annotate(`terminal host reload retry timed out (${type})`));
+    if (remaining <= 0 || wallNow() >= retryDeadline) {
+      throw new Error(pressure.annotate(`terminal host reload retry timed out (${type})`));
+    }
     const connectTimeoutMs = Math.max(1, Math.min(
-      deps.hostConnectTimeoutMs == null ? HOST_CONNECT_TIMEOUT_MS : deps.hostConnectTimeoutMs,
+      connectBudgetMs,
       remaining,
     ));
     let connectTimer;
@@ -1858,33 +1893,50 @@ async function hostRequest(type, params, deps = {}) {
     ]);
     if (connectTimer) clearTimeout(connectTimer);
     if (!client) {
-      const error = new Error('terminal host is unavailable');
+      const detail = String(hostFailureError && hostFailureError.message || '').trim();
+      const error = new Error(pressure.annotate(`terminal host is unavailable${detail ? `: ${detail}` : ''}`),
+        hostFailureError ? { cause: hostFailureError } : undefined);
       if (!idempotent) throw notRetried('was unavailable', error);
-      if (wallNow() >= deadline) throw error;
+      retryDeadline = Math.min(retryDeadline, wallNow() + retryMs);
+      if (wallNow() >= deadline || wallNow() >= retryDeadline) throw error;
       forceHostReconnect = true;
-      await sleep(Math.min(50, Math.max(0, deadline - wallNow())));
+      await sleep(Math.min(50, Math.max(0, Math.min(deadline, retryDeadline) - wallNow())));
       continue;
     }
     try {
       const attemptTimeoutMs = Math.max(1, Math.min(
-        deps.hostRequestTimeoutMs == null ? HOST_REQUEST_TIMEOUT_MS : deps.hostRequestTimeoutMs,
+        requestTimeoutMs,
         deadline - wallNow(),
       ));
       const result = await requestHostClient(client, type, params, {
         ...deps, hostRequestTimeoutMs: attemptTimeoutMs,
       });
       if (['spawn', 'meta', 'kill', 'remove', 'resize', 'clear'].includes(type)) hostPaneCaches.delete(client);
+      if (!idempotent) {
+        // A stale identity/activity list is safe only until this daemon changes the
+        // host. Never use a pre-mutation snapshot to authorize a later action.
+        lastKnownHostPaneMemo.panes = null;
+        lastKnownHostPaneMemo.at = 0;
+      }
       return result;
     } catch (error) {
-      if (client === cachedHost && client.socket && client.socket.destroyed) invalidateHost(client, deps);
-      const reloadOrDisconnect = (error && error.code === 'reloading') || retryableHostError(error);
-      if (!reloadOrDisconnect) throw error;
+      const disconnected = retryableHostError(error)
+        || (client === cachedHost && client.socket && client.socket.destroyed);
+      const reloading = error && error.code === 'reloading';
+      const timedOut = hostRequestTimedOut(error);
+      if (disconnected) invalidateHost(client, deps, error);
+      if (!reloading && !disconnected && !timedOut) throw error;
       if (!idempotent) {
-        throw notRetried(error && error.code === 'reloading' ? 'was reloading' : 'disconnected', error);
+        const reason = reloading ? 'was reloading' : timedOut ? 'timed out' : 'disconnected';
+        throw notRetried(reason, error);
       }
+      if (timedOut && timeoutRetries++ >= 1) throw error;
+      if (reloading || disconnected) retryDeadline = Math.min(retryDeadline, wallNow() + retryMs);
       if (wallNow() >= deadline) throw error;
-      forceHostReconnect = true;
-      await sleep(Math.min(50, Math.max(0, deadline - wallNow())));
+      if (reloading || disconnected) forceHostReconnect = true;
+      const retryRemaining = Math.min(deadline, retryDeadline) - wallNow();
+      if (retryRemaining <= 0) throw error;
+      await sleep(Math.min(50, Math.max(0, retryRemaining)));
     }
   }
 }
@@ -1922,16 +1974,56 @@ async function listHostPaneResult(deps = {}, fresh = false) {
       try { annotatePaneAgents(panes, await (deps.agentProcessRows || agentProcessRows)(deps)); } catch {}
     }
     hostPaneCaches.set(client, { at: now(), panes });
+    const memo = deps.hostPaneMemo || lastKnownHostPaneMemo;
+    memo.panes = panes;
+    memo.at = now();
     return { panes, failure: null };
   } catch (error) {
-    invalidateHost(client, deps);
+    if (retryableHostError(error) || (client.socket && client.socket.destroyed)) invalidateHost(client, deps, error);
     // A client existed, so a host answered this daemon at least this far.
-    return { panes: null, failure: hostFailureKind(error), endpoint: true };
+    return { panes: null, failure: hostFailureKind(error), endpoint: true, error };
   }
 }
 
 async function listHostPanes(deps = {}, fresh = false) {
   return (await listHostPaneResult(deps, fresh)).panes;
+}
+
+function lastKnownHostPanes({ maxAgeMs = HOST_PANES_SLOW_REUSE_MS } = {}, deps = {}) {
+  const memo = deps.hostPaneMemo || lastKnownHostPaneMemo;
+  const now = (deps.now || Date.now)();
+  if (!Array.isArray(memo.panes) || now - memo.at >= maxAgeMs) return null;
+  return { panes: memo.panes, ageMs: Math.max(0, now - memo.at), at: memo.at };
+}
+
+async function hostPanesForAction(deps = {}, fresh = false, maxAgeMs = HOST_PANES_SLOW_REUSE_MS) {
+  let result;
+  if (typeof deps.listHostPaneResult === 'function') result = await deps.listHostPaneResult(deps, fresh);
+  else if (typeof deps.listHostPanes === 'function') {
+    try {
+      const panes = await deps.listHostPanes(deps, fresh);
+      result = { panes, failure: Array.isArray(panes) ? null : 'unreachable' };
+    } catch (error) {
+      result = { panes: null, failure: hostFailureKind(error), error };
+    }
+  } else result = await listHostPaneResult(deps, fresh);
+  if (Array.isArray(result.panes)) return { ...result, stale: false, ageMs: 0 };
+  if (result.failure === 'timeout') {
+    const known = (deps.lastKnownHostPanes || lastKnownHostPanes)({ maxAgeMs }, deps);
+    if (known) return { ...result, ...known, stale: true };
+  }
+  return { ...result, stale: false };
+}
+
+function hostPaneVerificationError(action, result, status = 409) {
+  const cause = result && result.error;
+  const detail = String(cause && cause.message || '').trim();
+  const reason = result && result.failure === 'timeout'
+    ? `terminal host list timed out and no recent pane list is available${detail ? `: ${detail}` : ''}`
+    : `terminal host is unreachable${detail ? `: ${detail}` : ''}`;
+  const error = new InjectionError(status, `${action} cannot be verified because the ${reason}`);
+  if (cause) error.cause = cause;
+  return error;
 }
 
 // A failed host request leaves listHostPanes null. Publishing that as zero panes
@@ -2809,7 +2901,13 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   };
   if (guardedChunks) {
     let capabilities;
-    try { capabilities = await (deps.hostRequest || hostRequest)('hello', {}, deps); } catch {}
+    let capabilityError;
+    try { capabilities = await (deps.hostRequest || hostRequest)('hello', {}, deps); }
+    catch (error) { capabilityError = error; }
+    if (capabilityError && hostRequestTimedOut(capabilityError)) {
+      throw nothingTyped(new InjectionError(503,
+        `terminal host timed out while checking guarded-message support: ${capabilityError.message}`));
+    }
     if (!capabilities || capabilities.guardedInput !== true || capabilities.guardedInputReceipts !== true) {
       throw nothingTyped(new InjectionError(409, 'terminal host reload required before a guarded message can be typed'));
     }
@@ -2904,7 +3002,13 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   } else if (deps.discardDraftOnAbort && deps.requireExactDraft && deps.draftKind === 'codex') {
     // Direct (non-journaled) guarded sends retain the original stable-empty baseline.
     let capabilities;
-    try { capabilities = await (deps.hostRequest || hostRequest)('hello', {}, deps); } catch {}
+    let capabilityError;
+    try { capabilities = await (deps.hostRequest || hostRequest)('hello', {}, deps); }
+    catch (error) { capabilityError = error; }
+    if (capabilityError && hostRequestTimedOut(capabilityError)) {
+      throw nothingTyped(new InjectionError(503,
+        `terminal host timed out while checking guarded-input support: ${capabilityError.message}`));
+    }
     if (!capabilities || capabilities.guardedInput !== true) {
       throw nothingTyped(new InjectionError(409, 'terminal host reload required before a guarded Codex message can be typed'));
     }
@@ -4425,7 +4529,9 @@ async function liveSessionPids(deps = {}) {
 }
 
 async function resolveSessionTarget(session, targetHint, deps = {}) {
-  const panes = await listHostPanes(deps);
+  const listed = await hostPanesForAction(deps);
+  if (!Array.isArray(listed.panes)) throw hostPaneVerificationError('Session target', listed, 503);
+  const panes = listed.panes;
   if (targetHint?.expectedPane) {
     const selected = panes.find((pane) => pane.id === targetHint.expectedPane);
     if (!selected?.alive || selected.agentAlive === false || selected.meta?.sessionId !== session.id || selected.meta?.agent !== session.kind) {
@@ -4597,7 +4703,12 @@ async function screenHistorySession(query, deps = {}) {
 
   const tailLines = sessionLinesLimit(get('tailLines') == null ? 120 : get('tailLines'));
   const readHistoryScreen = deps.readHistoryScreen || (async (resolved, tail, innerDeps) => {
-    const hello = await hostRequest('hello', {}, innerDeps);
+    let hello;
+    try { hello = await hostRequest('hello', {}, innerDeps); }
+    catch (error) {
+      if (!hostRequestTimedOut(error)) throw error;
+      throw new InjectionError(503, `terminal host timed out while checking history support: ${error.message}`);
+    }
     if (!hello.compactScreen) throw new InjectionError(503, 'terminal host reload required to load history');
     return hostRequest('screen', {
       pane: resolved.pane,
@@ -4808,7 +4919,13 @@ async function restartSession(body, deps = {}) {
   let entered = false;
   const attempt = (inheritedModel) => (deps.withInjectionLock || withInjectionLock)(async () => {
     entered = true;
-    if (!(await host('hello')).replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
+    let capabilities;
+    try { capabilities = await host('hello'); }
+    catch (error) {
+      if (!hostRequestTimedOut(error)) throw error;
+      throw new Error(`Terminal host timed out while checking restart support: ${error.message}`, { cause: error });
+    }
+    if (!capabilities.replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
     const pane = (await host('get', { pane: body.pane })).pane;
     const session = (await (deps.buildState || buildState)({ hostPanes: [pane] })).sessions.find((s) => s.id === body.sessionId);
     if (session?.kind === 'pi') {
@@ -5109,7 +5226,13 @@ async function forceRestartSession(entry, save, deps = {}) {
   const attempt = (inheritedModel) => (deps.withInjectionLock || withInjectionLock)(async () => {
     entered = true;
     const host = (type, params) => hostRequest(type, params, deps);
-    if (!(await host('hello')).replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
+    let capabilities;
+    try { capabilities = await host('hello'); }
+    catch (error) {
+      if (!hostRequestTimedOut(error)) throw error;
+      throw new Error(`Terminal host timed out while checking restart support: ${error.message}`, { cause: error });
+    }
+    if (!capabilities.replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
     const initial = (await host('get', { pane: entry.pane })).pane;
     const cwd = entry.original?.cwd || initial?.cwd;
     if (!cwd || !fs.statSync(cwd).isDirectory()) throw Error('Session directory is unavailable');
@@ -5207,8 +5330,9 @@ async function closeIdleSession(body, deps = {}) {
   if (!/^[A-Za-z0-9_-]+$/.test(String(body.sessionId || '')) || !/^[A-Za-z0-9_-]+$/.test(String(body.pane || ''))) throw new InjectionError(400, 'Expected an exact session and pane');
   const scope = { pane: body.pane, session: body.sessionId };
   return (deps.withInjectionLock || withInjectionLock)(async () => {
-    const panes = await listHostPanes(deps, true);
-    if (!panes) throw new InjectionError(409, 'Live pane state could not be verified');
+    const listed = await hostPanesForAction(deps, true);
+    if (!Array.isArray(listed.panes)) throw hostPaneVerificationError('Live pane state', listed);
+    const panes = listed.panes;
     const state = await addHostSessionState(await (deps.buildState || buildState)({ hostPanes: panes }), { ...deps, panes });
     const session = state.sessions.find((s) => s.id === body.sessionId);
     const pane = state.panes.find((p) => p.id === body.pane);
@@ -7223,10 +7347,9 @@ async function openSession(body, deps = {}) {
     && !body.portableTransferId && !body.reviewQueueLaunchId
     && !deps.onSessionReady && !deps.onOpeningReady && !deps.onOpeningDelivered;
   if (freshStandalone && body.requestId) {
-    const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
-    if (!Array.isArray(panes)) {
-      throw new InjectionError(503, 'terminal host is unavailable; open request identity cannot be verified');
-    }
+    const listed = await hostPanesForAction(deps, true);
+    if (!Array.isArray(listed.panes)) throw hostPaneVerificationError('Open request identity', listed, 503);
+    const panes = listed.panes;
     const matches = (panes || []).filter((entry) => entry?.meta?.openRequestId === body.requestId);
     if (matches.length > 1) throw new InjectionError(409, 'open request matches multiple host panes');
     if (matches.length === 1) {
@@ -11252,6 +11375,7 @@ module.exports = {
   hostRequest,
   listHostPanes,
   listHostPaneResult,
+  lastKnownHostPanes,
   readScreenResult,
   readScreen,
   writeTarget,

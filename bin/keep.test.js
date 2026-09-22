@@ -1128,9 +1128,12 @@ test('restore opens planned sessions sequentially and continues after a failure'
   await assert.rejects(restoreCommandCli([], {
     getKeepApi: async () => { throw new Error('ECONNREFUSED'); },
   }), /keep serve isn't running \(start it or use the dashboard\)/);
+  await assert.rejects(restoreCommandCli([], {
+    getKeepApi: async () => { throw new Error('timed out after 60s; keep serve may still complete the action'); },
+  }), /did not answer while fetching the restore plan \(timed out after 60s; keep serve may still complete the action\)/);
 });
 
-test('Keep API clients destroy stalled requests and reject with timed out', async () => {
+test('Keep API clients destroy stalled requests and report the wait and uncertain completion', async () => {
   const { EventEmitter } = require('node:events');
   const originalRequest = http.request;
   const requests = [];
@@ -1146,8 +1149,9 @@ test('Keep API clients destroy stalled requests and reject with timed out', asyn
     return req;
   };
   try {
-    await assert.rejects(getKeepApi('/hang', 20), { message: 'timed out' });
-    await assert.rejects(postKeepApi('/hang', { ok: true }, 20), { message: 'timed out' });
+    const message = 'timed out after 20ms; keep serve may still complete the action';
+    await assert.rejects(getKeepApi('/hang', 20), { message });
+    await assert.rejects(postKeepApi('/hang', { ok: true }, 20), { message });
   } finally {
     http.request = originalRequest;
   }

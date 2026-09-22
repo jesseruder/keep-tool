@@ -126,19 +126,23 @@ function connect(options = {}) {
         let timer;
         const waiter = {
           resolve: (value) => {
-            if (timer) clearTimeout(timer);
+            if (timer) { clearTimeout(timer); clearImmediate(timer); }
             requestResolve(value);
           },
           reject: (error) => {
-            if (timer) clearTimeout(timer);
+            if (timer) { clearTimeout(timer); clearImmediate(timer); }
             requestReject(error);
           },
         };
         pending.set(id, waiter);
         timer = setTimeout(() => {
-          if (pending.get(id) !== waiter) return;
-          pending.delete(id);
-          waiter.reject(new Error(annotate(`host request timed out (${type})`)));
+          // Timers run before socket I/O callbacks. If this process was stalled past
+          // the deadline, give poll one turn to drain a reply the host already sent.
+          timer = setImmediate(() => {
+            if (pending.get(id) !== waiter) return;
+            pending.delete(id);
+            waiter.reject(new Error(annotate(`host request timed out (${type})`)));
+          });
         }, timeoutMs);
         socket.write(encodeFrame({ ...params, type, id }), (error) => {
           if (!error) return;

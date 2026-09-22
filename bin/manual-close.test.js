@@ -43,6 +43,25 @@ test('manual close does not report success if termination cannot be verified', a
   assert.deepEqual(f.calls, ['exit', 'SIGTERM', 'SIGKILL']);
 });
 
+for (const mode of ['timeout', 'missing']) test(`manual close reports an unconfirmed SIGTERM after post-signal ${mode} reads`, async () => {
+  const f = fixture('never');
+  let signaled = false;
+  const get = f.deps.getPane;
+  f.deps.signal = async (_pane, signal) => { f.calls.push(signal); if (signal === 'SIGTERM') signaled = true; };
+  f.deps.getPane = async () => {
+    if (!signaled) return get();
+    if (mode === 'timeout') throw new Error('host request timed out (get) [load high]');
+    return undefined;
+  };
+  await assert.rejects(manualClose(body, f.deps), (error) => {
+    assert.match(error.message, /SIGTERM signal sent; host did not confirm within 1s/);
+    assert.doesNotMatch(error.message, /identity changed/);
+    if (mode === 'timeout') assert.match(error.message, /host request timed out \(get\) \[load high\]/);
+    return true;
+  });
+  assert.deepEqual(f.calls, ['exit', 'SIGTERM']);
+});
+
 test('automatic close never turns a graceful refusal into force permission', async () => {
   const f = fixture('refusal');
   await assert.rejects(manualClose(body, { ...f.deps, requireGraceful: true }), /draft/);

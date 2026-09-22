@@ -1547,14 +1547,45 @@ test('listHostPaneResult tells a slow host apart from an absent one', async () =
   assert.deepEqual(await listHostPaneResult({ host: null, hostEndpointExists: () => true }, true),
     { panes: null, failure: 'unreachable', endpoint: true }, 'a bound socket nobody answers is a host that should be there');
   const silent = { request: () => new Promise(() => {}) };
-  assert.deepEqual(await listHostPaneResult({ host: silent, hostRequestTimeoutMs: 20 }, true),
-    { panes: null, failure: 'timeout', endpoint: true }, 'a host that holds the socket open but does not answer is slow, not gone');
+  const slow = await listHostPaneResult({ host: silent, hostRequestTimeoutMs: 20 }, true);
+  assert.deepEqual({ panes: slow.panes, failure: slow.failure, endpoint: slow.endpoint },
+    { panes: null, failure: 'timeout', endpoint: true },
+    'a host that holds the socket open but does not answer is slow, not gone');
+  assert.match(slow.error.message, /^host request timed out \(list\)(?: \[load .+\])?$/);
   assert.deepEqual(await listHostPaneResult({ host: null, hostEndpointExists: () => { throw new Error('no'); } }, true),
     { panes: null, failure: 'unreachable', endpoint: false }, 'a failed endpoint check is not evidence, and never fails the refresh');
   const broken = { request: async () => { const error = new Error('socket hang up'); error.code = 'ECONNRESET'; throw error; } };
-  assert.deepEqual(await listHostPaneResult({ host: broken }, true), { panes: null, failure: 'unreachable', endpoint: true });
+  const unreachable = await listHostPaneResult({ host: broken }, true);
+  assert.deepEqual({ ...unreachable, error: unreachable.error?.message },
+    { panes: null, failure: 'unreachable', endpoint: true, error: 'socket hang up' });
   const good = { request: async () => ({ panes: [{ id: 'p1', meta: {} }] }) };
   assert.deepEqual(await listHostPaneResult({ host: good }, true), { panes: [{ id: 'p1', meta: {} }], failure: null });
+});
+
+test('a list timeout keeps the cached host open and does not reject another pending request', async () => {
+  const { closeHostClient, listHostPaneResult } = require('./serve');
+  await closeHostClient();
+  let connects = 0; let closes = 0;
+  const client = {
+    socket: { destroyed: false },
+    onDisconnect: () => ({ dispose() {} }),
+    close() { closes += 1; this.socket.destroyed = true; },
+    request(type) {
+      if (type === 'list') return new Promise(() => {});
+      if (type === 'screen') return new Promise((resolve) => setTimeout(() => resolve({ text: 'still pending' }), 15));
+      return Promise.resolve({ type });
+    },
+  };
+  const deps = { connectHost: async () => { connects += 1; return client; } };
+  try {
+    const other = hostRequest('screen', { pane: 'p' }, { ...deps, hostRequestTimeoutMs: 50 });
+    const listed = await listHostPaneResult({ ...deps, hostRequestTimeoutMs: 5 }, true);
+    assert.equal(listed.failure, 'timeout');
+    assert.deepEqual(await other, { text: 'still pending' });
+    assert.equal(closes, 0);
+    assert.deepEqual(await hostRequest('hello', {}, deps), { type: 'hello' });
+    assert.equal(connects, 1, 'the timeout must not arm the negative cache or reconnect');
+  } finally { await closeHostClient(); }
 });
 
 test('closeHostClient hangs up the cached connection so a one-shot command can exit', async () => {
@@ -9522,7 +9553,8 @@ test('an auto fresh open with no --model judges each account on its own default 
       /'--profile' '([^']+)'/.exec(params.args[1])[1], 'base64url').toString()).id;
     // The live 2026-09-17 shape: the default account's generic buckets look fine while
     // the model a session launched there would run on is at the wall.
-    const reset = '2026-09-21T21:59:59.000Z';
+    // Relative to now: a fixed date became a limit that had already reset.
+    const reset = new Date(Date.now() + 3600e3).toISOString();
     const view = () => ({ accounts: {
       'claude-primary': { agent: 'claude', fetchedAt: Date.now(), limits: [
         { label: '5h', percent: 0, resetsAt: reset },
@@ -10781,6 +10813,13 @@ test('a host request timeout releases the injection lock', async () => {
   assert.equal(isInjectionBusy(), false);
 });
 
+test('requestHostClient lets a reply delivered after the timer callback beat its immediate', async () => {
+  const host = { request: async () => new Promise((resolve) => setTimeout(() => resolve({ ok: true }), 5)) };
+  assert.deepEqual(await hostRequest('get', { pane: 'p' }, {
+    host, hostRequestTimeoutMs: 5, hostConnectTimeoutMs: 1,
+  }), { ok: true });
+});
+
 function deferred() {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });
@@ -10968,8 +11007,9 @@ test('hostRequest reconnects through a transient core reload window', async () =
     const result = await hostRequest('hello', {}, {
       connectHost: async () => (++connects === 1 ? first : second),
       hostConnectTimeoutMs: 10,
-      hostRequestTimeoutMs: 50,
-      hostReloadRetryMs: 500,
+      hostRequestTimeoutMs: 500,
+      hostReloadRetryMs: 5000,
+      sleep: async () => {},
     });
     assert.deepEqual(result, { type: 'hello', reconnected: true });
     assert.equal(connects, 2);
@@ -11012,13 +11052,33 @@ test('hostRequest retries reloading reads but never retries a possibly-executed 
   assert.equal(spawns, 1, 'spawn must not be duplicated across a reload');
 });
 
-test('hostRequest derives each attempt timeout from the remaining reload deadline', async () => {
-  const host = { request: async () => new Promise(() => {}) };
-  const started = Date.now();
+test('hostRequest retries one idempotent timeout on the same open client', async () => {
+  let requests = 0; let closes = 0;
+  const host = {
+    close: () => { closes += 1; },
+    request: async () => {
+      requests += 1;
+      if (requests === 1) throw new Error('host request timed out (get) [load high]');
+      return { pane: { id: 'p' } };
+    },
+  };
+  assert.deepEqual(await hostRequest('get', { pane: 'p' }, {
+    host, hostRequestTimeoutMs: 100, hostConnectTimeoutMs: 10, sleep: async () => {},
+  }), { pane: { id: 'p' } });
+  assert.equal(requests, 2);
+  assert.equal(closes, 0);
+});
+
+test('hostRequest gives a request its full timeout instead of the reload retry window', async () => {
+  const timeouts = [];
+  const host = { request: async (_type, _params, options) => {
+    timeouts.push(options.timeoutMs);
+    throw new Error('fixture stops after observing the timeout');
+  } };
   await assert.rejects(hostRequest('hello', {}, {
-    host, hostReloadRetryMs: 25, hostRequestTimeoutMs: 1000,
-  }), /host request timed out \(hello\)/);
-  assert.ok(Date.now() - started < 250, 'the 25 ms reload deadline is a hard wall-clock bound');
+    host, hostReloadRetryMs: 25, hostRequestTimeoutMs: 1000, hostConnectTimeoutMs: 30,
+  }), /fixture stops/);
+  assert.deepEqual(timeouts, [1000]);
 });
 
 test('open refuses oversized messages before resolving a card or opening a pane', async () => {

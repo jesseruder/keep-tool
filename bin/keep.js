@@ -3270,7 +3270,13 @@ commands.restore = async (argv, deps = {}) => {
   const pathname = `/api/restore-plan${params.size ? `?${params}` : ''}`;
   let response;
   try { response = await (deps.getKeepApi || getKeepApi)(pathname, 60000); }
-  catch { die("keep serve isn't running (start it or use the dashboard)"); }
+  catch (error) {
+    const detail = String(error && error.message || error);
+    if (/timed out/i.test(detail)) {
+      die(`keep serve did not answer while fetching the restore plan (${detail})`);
+    }
+    die(`keep serve isn't running (start it or use the dashboard): ${detail}`);
+  }
   let plan = {};
   try { plan = JSON.parse(response.data); } catch {}
   if (response.status !== 200 || !plan.ok || !Array.isArray(plan.sessions)) {

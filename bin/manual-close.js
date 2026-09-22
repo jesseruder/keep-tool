@@ -33,12 +33,34 @@ async function manualClose(body, deps) {
   const result = (forced = false) => ({ ok: true, closed: true, forced, sessionId: body.sessionId, pane: body.pane });
   if (!initial.alive) return result();
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const timedOut = (error) => /timed out/i.test(String(error && error.message || error));
   const wait = async (delay) => {
+    let confirmed = false;
+    let lastError = null;
     for (let i = 0; i < 10; i++) {
-      if (!verify(await deps.getPane(body.pane)).alive) return true;
+      let pane;
+      try { pane = await deps.getPane(body.pane); }
+      catch (error) {
+        if (!timedOut(error)) throw error;
+        lastError = error;
+        await sleep(delay);
+        continue;
+      }
+      // After a signal, no record is not proof that the process changed identity or
+      // exited. Keep polling for an affirmative host observation within this phase.
+      if (pane) {
+        confirmed = true;
+        if (!verify(pane).alive) return { closed: true, confirmed, lastError };
+      }
       await sleep(delay);
     }
-    return !verify(await deps.getPane(body.pane)).alive;
+    return { closed: false, confirmed, lastError };
+  };
+  const unconfirmed = (signal, delay, cause) => {
+    const seconds = 10 * delay / 1000;
+    const error = new Error(`${signal} signal sent; host did not confirm within ${Number.isInteger(seconds) ? seconds : seconds.toFixed(1)}s${cause ? `: ${cause.message}` : ''}`);
+    if (cause) error.cause = cause;
+    return error;
   };
   // Try the normal /exit workflow first. If prompt/activity guards refuse it,
   // SIGTERM still gives the process a chance to clean up without typing into a draft.
@@ -49,7 +71,7 @@ async function manualClose(body, deps) {
   }
   if (deps.protectInput) expectedInputCount = gracefulResult?.expectedInputCount;
   if (deps.protectOutput) expectedOutputCount = gracefulResult?.expectedOutputCount;
-  if (await wait(200)) return result();
+  if ((await wait(200)).closed) return result();
   await gracefulResult?.beforeSignal?.();
   verify(await deps.getPane(body.pane));
   const guard = () => ({
@@ -59,11 +81,19 @@ async function manualClose(body, deps) {
     expectedOutputCount,
   });
   await deps.signal(body.pane, 'SIGTERM', deps.requireSignalGuard ? guard() : null);
-  if (await wait(100)) return result();
+  const term = await wait(100);
+  if (term.closed) return result();
+  if (!term.confirmed) throw unconfirmed('SIGTERM', 100, term.lastError);
   await gracefulResult?.beforeSignal?.();
-  verify(await deps.getPane(body.pane));
+  let beforeKill;
+  try { beforeKill = await deps.getPane(body.pane); }
+  catch (error) { if (timedOut(error)) throw unconfirmed('SIGTERM', 100, error); throw error; }
+  if (!beforeKill) throw unconfirmed('SIGTERM', 100);
+  verify(beforeKill);
   await deps.signal(body.pane, 'SIGKILL', deps.requireSignalGuard ? guard() : null);
-  if (await wait(100)) return result(true);
+  const killed = await wait(100);
+  if (killed.closed) return result(true);
+  if (!killed.confirmed) throw unconfirmed('SIGKILL', 100, killed.lastError);
   throw new Error('Termination requested but the pane is still alive');
 }
 

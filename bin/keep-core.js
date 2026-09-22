@@ -1597,6 +1597,11 @@ function checkinTask(id, {
   return withinLock ? checkin() : withLock(checkin);
 }
 
+function keepApiTimeoutError(timeoutMs) {
+  const waited = timeoutMs >= 1000 && timeoutMs % 1000 === 0 ? `${timeoutMs / 1000}s` : `${timeoutMs}ms`;
+  return new Error(`timed out after ${waited}; keep serve may still complete the action`);
+}
+
 function postKeepApi(pathname, payload, timeoutMs) {
   const body = JSON.stringify(payload);
   return new Promise((resolve, reject) => {
@@ -1618,12 +1623,12 @@ function postKeepApi(pathname, payload, timeoutMs) {
       res.on('error', reject);
       res.on('end', () => resolve({ status: res.statusCode, data }));
     });
-    req.on('error', (error) => reject(timedOut ? new Error('timed out') : error));
+    req.on('error', (error) => reject(timedOut ? keepApiTimeoutError(timeoutMs) : error));
     if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
       req.setTimeout(timeoutMs, () => {
         timedOut = true;
         req.destroy();
-        reject(new Error('timed out'));
+        reject(keepApiTimeoutError(timeoutMs));
       });
     }
     req.end(body);
@@ -1646,12 +1651,12 @@ function getKeepApi(pathname, timeoutMs) {
       res.on('error', reject);
       res.on('end', () => resolve({ status: res.statusCode, data }));
     });
-    req.on('error', (error) => reject(timedOut ? new Error('timed out') : error));
+    req.on('error', (error) => reject(timedOut ? keepApiTimeoutError(timeoutMs) : error));
     if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
       req.setTimeout(timeoutMs, () => {
         timedOut = true;
         req.destroy();
-        reject(new Error('timed out'));
+        reject(keepApiTimeoutError(timeoutMs));
       });
     }
     req.end();

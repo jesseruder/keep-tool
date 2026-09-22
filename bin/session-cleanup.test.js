@@ -253,6 +253,28 @@ test('cleanup assembles host state and protects a transferred scheduled check be
     }), /active, waiting/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('cleanup reuses a recent pane list only for a host list timeout', async () => {
+  const { closeIdleSession } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-close-stale-host-'));
+  const pane = { id: 'p', alive: true, meta: { sessionId: 's', agent: 'claude' } };
+  const session = { id: 's', kind: 'claude', state: 'running', endedTurn: false, mtime: Date.now() };
+  const base = { root, withInjectionLock: (fn) => fn(), buildState: () => ({ sessions: [session], tasks: [] }) };
+  try {
+    await assert.rejects(closeIdleSession({ sessionId: 's', pane: 'p' }, {
+      ...base,
+      listHostPaneResult: async () => ({ panes: null, failure: 'timeout', error: new Error('host request timed out (list)') }),
+      lastKnownHostPanes: () => ({ panes: [pane], ageMs: 250, at: Date.now() - 250 }),
+    }), /active, waiting/, 'the stale list reaches the normal close safety policy');
+
+    await assert.rejects(closeIdleSession({ sessionId: 's', pane: 'p' }, {
+      ...base,
+      listHostPaneResult: async () => ({ panes: null, failure: 'unreachable', error: new Error('connect ECONNREFUSED') }),
+      lastKnownHostPanes: () => assert.fail('an unreachable host must never use stale panes'),
+      buildState: () => assert.fail('unreachable host must fail before close policy evaluation'),
+    }), (error) => error.status === 409 && /terminal host is unreachable: connect ECONNREFUSED/.test(error.message));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 test('explicit cleanup protects recent, pinned, unknown, active and waiting sessions', () => {
   const now = Date.now();
   const session = { id: 's', kind: 'claude', state: 'done', endedTurn: true, mtime: now - 2 * 86400e3 };
@@ -553,11 +575,20 @@ test('automatic retirement admits only audited runtime helpers and still refuses
 
 test('Close UI sends exact target immediately and reports refusal without dismissing the session', async () => {
   const vm = require('node:vm');
-  const writes = [], toasts = [];
+  const writes = [], toasts = [], failures = [];
   const { createClosingSessions } = await import('../web/app/closing-sessions.js');
   const closingSessions = createClosingSessions();
   let fail = false, refreshes = 0, pinned = true, unpins = 0;
-  const context = vm.createContext({ write: async (...args) => { writes.push(args); if (fail) throw new Error('unsent draft'); return { closed: true }; } });
+  const context = vm.createContext({
+    write: async (...args) => { writes.push(args); if (fail) throw new Error('unsent draft'); return { closed: true }; },
+    // The console's shared busy/failure helpers, reduced to what this test observes:
+    // the button is released on settle and a failure is reported, not toasted.
+    runAction: async (button, fn) => {
+      if (button) button.disabled = true;
+      try { return await fn(); } finally { if (button) button.disabled = false; }
+    },
+    reportWriteFailure: (error, { message } = {}) => failures.push(message || error.message),
+  });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/app/close-session.js'), 'utf8').replace(/^import .*;\n/gm, '').replace('export async function', 'async function'), context);
   const ctx = { closingSessions, beginClose: (id, pane) => closingSessions.begin(id, pane),
     reload: async () => { closingSessions.reconcile({ sessions: [], panes: [] }); refreshes++; },
@@ -565,7 +596,8 @@ test('Close UI sends exact target immediately and reports refusal without dismis
     pinPane: async (pane) => { assert.equal(pane, 'p'); unpins++; pinned = false; return true; } };
   const button = { disabled: false };
   await context.closeSession(ctx, 's', 'p', button);
-  assert.equal(JSON.stringify(writes[0]), JSON.stringify(['/api/close-session', { sessionId: 's', pane: 'p' }]));
+  assert.equal(JSON.stringify(writes[0].slice(0, 2)), JSON.stringify(['/api/close-session', { sessionId: 's', pane: 'p' }]));
+  assert.equal(writes[0][3]?.label, 'Closing session', 'the write names itself for the status chip');
   assert.equal(refreshes, 1);
   assert.match(toasts.at(-1), /Session closed/);
   assert.equal(unpins, 1);
@@ -573,7 +605,7 @@ test('Close UI sends exact target immediately and reports refusal without dismis
   pinned = true;
   fail = true;
   await context.closeSession(ctx, 's', 'p', button);
-  assert.match(toasts.at(-1), /Not closed: unsent draft/);
+  assert.match(failures.at(-1), /Session was not closed; it is back in the list\. unsent draft/);
   assert.equal(refreshes, 2);
   assert.equal(closingSessions.has('s'), false);
   assert.equal(button.disabled, false);
