@@ -86,3 +86,33 @@ test('an isolated registry reads no configuration and is the single node main', 
     assert.equal(env.KEEP_CONFIG !== undefined, true);
   });
 });
+
+test('a pane ref is bare on the daemon node and qualified everywhere else', () => {
+  const names = ['main', 'aws1'];
+  const env = { KEEP_DAEMON_NODE: 'main' };
+  const ref = (value) => nodes.parsePaneRef(value, { env, nodes: names });
+  assert.deepEqual(ref('1a2b3c4d'), { node: 'main', paneId: '1a2b3c4d', qualified: false });
+  assert.deepEqual(ref('aws1-1a2b3c4d'), { node: 'aws1', paneId: '1a2b3c4d', qualified: true });
+  // A name that is not a configured node is part of the pane id, not a prefix:
+  // `keep pane new --name build-1` makes one, and it belongs to the daemon node.
+  assert.deepEqual(ref('build-1'), { node: 'main', paneId: 'build-1', qualified: false });
+  assert.deepEqual(ref('aws1-build-1'), { node: 'aws1', paneId: 'build-1', qualified: true });
+  assert.deepEqual(ref('-leading'), { node: 'main', paneId: '-leading', qualified: false });
+  assert.deepEqual(ref(''), { node: 'main', paneId: '', qualified: false });
+  assert.deepEqual(ref(undefined), { node: 'main', paneId: '', qualified: false });
+
+  assert.equal(nodes.formatPaneRef('main', '1a2b3c4d', env), '1a2b3c4d');
+  assert.equal(nodes.formatPaneRef('aws1', '1a2b3c4d', env), 'aws1-1a2b3c4d');
+  assert.deepEqual(ref(nodes.formatPaneRef('aws1', 'build-1', env)),
+    { node: 'aws1', paneId: 'build-1', qualified: true });
+});
+
+test('the configured node names come from the configuration and fall back to the daemon node', () => {
+  withConfig({ nodes: { mini: {}, laptop: { transport: 'tcp', address: '127.0.0.1:1' } }, daemonNode: 'mini' }, (env) => {
+    assert.deepEqual(nodes.configuredNodeNames({ ...env, KEEP_DAEMON_NODE: 'mini' }).sort(), ['laptop', 'mini']);
+  });
+  // An isolated registry reads no configuration, so it is the single node main —
+  // the same answer config.apply() projects into such an environment.
+  const isolated = { KEEP_DIR: os.tmpdir() };
+  assert.deepEqual(nodes.configuredNodeNames(isolated), ['main']);
+});
