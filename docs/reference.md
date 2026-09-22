@@ -1330,17 +1330,21 @@ the pane. Once typing has started the reservation stands and the refusal is
 submitted with the receipt lost, so `--wait` never retries it and the tell-log line
 carries `"delivery": "unconfirmed"`. Check the session before sending again. Before
 giving up, the send asks the turn index (`.keep/turns.sqlite`) once: a user message in
-that session's indexed transcript with the same text, in a turn that started no earlier
-than two seconds before the send (so an identical message sent just before, such as a
-repeated "continue", cannot confirm it), confirms it even when the transcript receipt
-never landed (a message longer than the index's 16 KiB text cap is matched on its stored
-prefix). The
+that session's indexed transcript with the same text, recorded at or after the moment the
+send began, confirms it even when the transcript receipt never landed. No earlier row
+counts: the agent writes its line after Enter, on the same machine's clock, so anything
+older is an earlier message with the same words (a repeated "continue"), not this one.
+The index says only that such a message was recorded, not which attempt recorded it, so
+while the text is still in the recipient's input box the box wins and nothing is
+confirmed. A message longer than the index's 16 KiB text cap is matched on the part the
+index keeps, so two messages that share their first 16 KiB cannot be told apart. The
 index can confirm only what the agent's transcript recorded, never text still sitting in
 the input box, and it lags a live session by one hook or one 30-second daemon tick, so a
 tell reported unconfirmed may still be confirmed by the daemon's minute check, which
 asks the index again and then releases the session for later sends. The next send to
-that session asks the index about the pending attempt too, so it is not refused as
-"Previous delivery is unconfirmed" once the index has recorded the earlier message. Every
+that session asks the index about the pending attempt too (unless its text is still in
+the box), so it is not refused as "Previous delivery is unconfirmed" once the index has
+recorded the earlier message. Every
 delivered tell appends one line to `.keep/tell-log.jsonl`; nothing is written to the
 card, because a message between sessions is not a decision about the work.
 

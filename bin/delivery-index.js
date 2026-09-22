@@ -23,16 +23,17 @@ const fs = require('node:fs');
 // A delivery must never wait on the index for longer than this. Readers on a WAL
 // database are rarely blocked, but a checkpoint or a migration can hold the lock.
 const BUSY_TIMEOUT_MS = 250;
-// How far before the journal's createdAt a matching row may be. The journal is
-// written before the first key is typed, and the agent writes its transcript line
-// after Enter, on the same machine and clock, so a row for this attempt is never
-// earlier than createdAt except by timestamp granularity (transcripts carry
-// milliseconds; a turn's started_at may round). Anything wider is a false-positive
-// window: a repeated identical message - a watcher "continue", a retried tell -
-// recorded just before this attempt would confirm it, and a confirmed delivery that
-// was really lost is worse than an unconfirmed one. Two seconds covers granularity
-// and nothing else.
-const WINDOW_SLACK_MS = 2e3;
+// How far before the journal's createdAt a matching row may be: not at all. Every
+// human or keep user row opens its own turn, stamped with that row's own
+// millisecond timestamp (turn-index.js handleClaudeLine / handleCodexLine), so the
+// turn's started_at is the row's time, with no rounding. The index ingests only this
+// machine's transcripts, so that time and createdAt come from the same clock. And
+// both agents write the row after Enter, which is after the journal (and createdAt)
+// was written, before the first key was typed. So a row for this attempt is never
+// earlier than createdAt, and any slack is only a window in which an identical
+// earlier message - a watcher "continue", a retried tell - confirms an attempt that
+// was really lost, which is worse than leaving it unconfirmed.
+const WINDOW_SLACK_MS = 0;
 
 const turnIndex = () => require('./turn-index.js');
 const textCap = () => turnIndex().TEXT_CAP;
@@ -46,12 +47,17 @@ function prefixHash(text, hash) {
   return trimmed.length > cap ? hash(trimmed.slice(0, cap)) : null;
 }
 
+// The index only says a message with this text was recorded. It cannot say which
+// attempt put it there, so a caller that can see the input box must also check the
+// text is not still sitting in it (see delivery.js). Two messages that share their
+// first TEXT_CAP characters are indistinguishable by rule 2.
+//
 // `entry` is a delivery journal entry: { sessionId, hash, createdAt, indexPrefixHash? }.
 // `text` is the sent text when the caller still has it (the send path does; reconcile
 // and inspect do not - the journal stores only hashes).
 //
 // Matching rule, per candidate row (same session, role user, kind human or keep,
-// turn started at or after createdAt - 60 s):
+// turn started at or after createdAt; see WINDOW_SLACK_MS):
 //   1. hash(row.text) === entry.hash. `hash` is delivery.js's, which normalises NFC
 //      and collapses whitespace exactly as the transcript receipt does, so the
 //      index's trim and its '\n\n' block join compare equal to userText's '\n'.

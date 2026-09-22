@@ -78,11 +78,12 @@ It keeps the same attention timestamp while the incident persists and clears
 when the transcript confirms receipt. Other sessions succeeding cannot clear it.
 The same minute check also asks the turn index: an attempt whose text reached the
 pane and is at least a minute old is settled as received when that session's
-indexed transcript holds a user message with the same text in a turn that started
-no earlier than two seconds before the send (clock granularity only, so an
-identical message sent just before cannot confirm it). The next send to that
-session asks the same question about the pending attempt before refusing it as
-unconfirmed. That covers a receipt that never landed
+indexed transcript holds a user message with the same text recorded at or after the
+moment the send began (the agent writes it after Enter on the same clock, so an
+older row is an earlier message with the same words). The minute check cannot see
+the input box; the next send to that session, which can, asks the same question
+about the pending attempt before refusing it as unconfirmed, and ignores the index
+while that text is still in the box. That covers a receipt that never landed
 in the transcript file the attempt was watching (a resumed session, a moved
 rollout); it cannot confirm text still in the input box, which has no transcript
 line. The index lags a live session by one hook or one 30-second tick. An attempt

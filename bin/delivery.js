@@ -262,13 +262,23 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     // index has had its chance to catch up, and a miss changes nothing. A match is
     // settled exactly as a late transcript receipt is: the same text returns as
     // recovered (never retyped), other words proceed to a fresh attempt.
-    const byIndex = () => {
+    //
+    // The index cannot say which attempt recorded a row. If this text is still in
+    // the input box, the row is some other message's, and this entry's Enter was lost:
+    // then nothing is settled and the path below runs exactly as it did before the
+    // index existed (resume or submit the exact draft). draftMatches is asked only
+    // after the index matched, so the screen is read no more often than before on
+    // every other send. It checks this send's text, so for other words it cannot see
+    // the pending text in the box; a box that is not empty still stops the new send
+    // at its precheck, and nothing is typed over it.
+    const byIndex = async () => {
       if (!(Number(entry.typedAt) > 0 || completedTyping(entry))) return false;
       if (!indexConfirms(entry, { db: indexDb, trace })) return false;
+      if (await draftMatches()) { trace('index-match-draft-present'); return false; }
       trace('pending-settled-by-index');
       return true;
     };
-    if (settled || received(entry) || byIndex()) {
+    if (settled || received(entry) || await byIndex()) {
       finish(directory, journal, entry);
       if (entry.hash === hash(text)) return { ok: true, delivery: 'received', recovered: true };
       entry = null;
@@ -435,7 +445,14 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
   // by a hook or a 30 s tick, so this is a final look, not a poll; reconcile asks
   // again every minute for whatever it misses here. It runs before a typing error is
   // rethrown too: a transcript line for this text means it was submitted after all.
-  const fromIndex = indexConfirms(entry, { text, db: indexDb, trace });
+  //
+  // The index cannot say which attempt recorded the row. A text still in the box
+  // means this attempt's Enter was lost and the row belongs to another message (an
+  // identical one sent earlier whose row was written late, e.g. from Claude's
+  // queue), so the draft on screen outranks it: no confirmation, and the attempt
+  // stays pending for the draft/submit path of the next send.
+  const fromIndex = indexConfirms(entry, { text, db: indexDb, trace })
+    && !(await draftMatches() && (trace('index-match-draft-present'), true));
   if (fromIndex) {
     trace('receipt-from-index');
     finish(directory, journal, entry);
@@ -573,6 +590,17 @@ function reconcile(directory, {
     fs.mkdirSync(path.join(directory, 'settled'), { recursive: true, mode: 0o700 });
     fs.renameSync(journal, path.join(directory, 'settled', name));
   };
+  // Asked once per sweep, and only when some journal needs it: a machine with no
+  // index would otherwise trace index-missing for every typed journal every minute.
+  let indexPresent;
+  const indexReady = () => {
+    if (indexPresent === undefined) {
+      try { indexPresent = fs.existsSync(indexDb || require('./turn-index.js').databaseFile()); }
+      catch { indexPresent = false; }
+      if (!indexPresent) require('./delivery-trace').recorder(directory, {}, null)('index-missing');
+    }
+    return indexPresent;
+  };
   for (const name of files) {
     try {
       const journal = path.join(directory, name);
@@ -583,7 +611,7 @@ function reconcile(directory, {
       let got, unreadable = null;
       try { got = received(entry); } catch (error) { got = false; unreadable = error; }
       if (!got && journalAgeMs(journal, entry, now) >= indexGraceMs
-          && (Number(entry.typedAt) > 0 || completedTyping(entry))) {
+          && (Number(entry.typedAt) > 0 || completedTyping(entry)) && indexReady()) {
         const trace = require('./delivery-trace').recorder(directory, { id: entry.sessionId, kind: entry.kind }, entry.pane);
         if (indexConfirms(entry, { db: indexDb, trace })) { trace('receipt-from-index'); got = true; unreadable = null; }
       }

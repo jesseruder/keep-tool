@@ -783,6 +783,10 @@ function indexFixture() {
   return { dir, file, directory: path.join(dir, 'journal'), db: path.join(dir, 'turns.sqlite') };
 }
 
+// A type() whose Enter the agent records: the index gets the row after the journal
+// was written, as a real transcript line is, but the watched receipt file never does.
+const recordedOnEnter = (f, sessionId, texts) => async () => indexMessages(f.dir, f.db, sessionId, texts);
+
 const plainSend = (f, sessionId, text, extra = {}) => deliver({
   session: { id: sessionId, kind: 'codex' }, pane: 'pane-' + sessionId, text, file: f.file, directory: f.directory,
   indexDb: f.db, precheck: async () => {}, type: async () => {}, submitDraft: async () => assert.fail('unexpected Enter'),
@@ -794,8 +798,8 @@ test('a delivery whose transcript receipt never lands is confirmed by the turn i
   const sessionId = generatedId('codex');
   const stages = [];
   try {
-    indexMessages(f.dir, f.db, sessionId, ['[keep] from another session: please rebase']);
-    const result = await plainSend(f, sessionId, '[keep] from another session:\n  please rebase', { trace: (stage) => stages.push(stage) });
+    const result = await plainSend(f, sessionId, '[keep] from another session:\n  please rebase', {
+      trace: (stage) => stages.push(stage), type: recordedOnEnter(f, sessionId, ['[keep] from another session: please rebase']) });
     assert.deepEqual(result, { ok: true, delivery: 'received', source: 'turn-index' });
     assert.ok(stages.includes('receipt-from-index'));
     assert.deepEqual(fs.readdirSync(f.directory).filter((name) => name.endsWith('.json')), [], 'the journal is finished');
@@ -807,12 +811,11 @@ test('a message longer than the index cap is confirmed by its stored prefix', as
   const sessionId = generatedId('codex');
   const text = 'long message '.repeat(Math.ceil(turnIndex.TEXT_CAP / 10));
   try {
-    indexMessages(f.dir, f.db, sessionId, [text]);
-    assert.equal((await plainSend(f, sessionId, text)).source, 'turn-index');
+    assert.equal((await plainSend(f, sessionId, text, { type: recordedOnEnter(f, sessionId, [text]) })).source, 'turn-index');
     // The same stored prefix under a different ending is not this message.
     const other = generatedId('codex');
-    indexMessages(f.dir, f.db, other, [text]);
-    await assert.rejects(plainSend(f, other, text.slice(0, turnIndex.TEXT_CAP - 50)), /no matching transcript receipt/);
+    await assert.rejects(plainSend(f, other, text.slice(0, turnIndex.TEXT_CAP - 50), { type: recordedOnEnter(f, other, [text]) }),
+      /no matching transcript receipt/);
   } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
 });
 
@@ -822,10 +825,10 @@ test('the turn index does not confirm other words, another session, or an old id
   const old = generatedId('codex');
   const elsewhere = generatedId('codex');
   try {
-    indexMessages(f.dir, f.db, sessionId, ['please rebase onto master']);
-    await assert.rejects(plainSend(f, sessionId, 'please rebase onto main'), /no matching transcript receipt/);
-    indexMessages(f.dir, f.db, elsewhere, ['run the tests']);
-    await assert.rejects(plainSend(f, generatedId('codex'), 'run the tests'), /no matching transcript receipt/);
+    await assert.rejects(plainSend(f, sessionId, 'please rebase onto main', { type: recordedOnEnter(f, sessionId, ['please rebase onto master']) }),
+      /no matching transcript receipt/);
+    await assert.rejects(plainSend(f, generatedId('codex'), 'run the tests', { type: recordedOnEnter(f, elsewhere, ['run the tests']) }),
+      /no matching transcript receipt/);
     // The same words sent ten minutes before this attempt answer that attempt, not this one.
     indexMessages(f.dir, f.db, old, ['continue'], Date.now() - 10 * 60e3);
     await assert.rejects(plainSend(f, old, 'continue'), /no matching transcript receipt/);
@@ -929,5 +932,126 @@ test('a pending typed journal the index confirms no longer blocks the next send'
 
     await assert.rejects(plainSend(f, unconfirmed, 'second message', { type: typeWithReceipt('second message') }),
       /Previous delivery is unconfirmed/);
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+// ---------- the index never outranks a draft still in the box ----------
+
+const ENTER_NOT_PRESSED = 'message was typed but could not be confirmed; Enter was not pressed';
+// The per-chunk path: every chunk acknowledged, typing complete, and Enter refused,
+// so the journal has completedTyping true and no typedAt.
+const typeAllChunks = (progress) => {
+  progress.plan({ pid: 42, initialInputCount: 0, chunkChars: 200, chunkCount: 1, operationSeed: 'delivery_' + crypto.randomBytes(8).toString('hex') });
+  progress.start(0);
+  progress.acknowledge(0, textHash('chunk-0'));
+  progress.complete();
+};
+const journalOf = (f, id) => JSON.parse(fs.readFileSync(path.join(f.directory, textHash(id) + '.json'), 'utf8'));
+const receiptLine = (f, text) => fs.appendFileSync(f.file, JSON.stringify({
+  type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } }) + '\n');
+
+test('the review scenario: an earlier identical confirmed send cannot confirm one whose Enter was lost', async () => {
+  const f = indexFixture();
+  const id = generatedId('codex');
+  let enters = 0;
+  try {
+    // J0: X is sent and confirmed by the index.
+    assert.equal((await plainSend(f, id, 'continue', { type: recordedOnEnter(f, id, ['continue']) })).source, 'turn-index');
+    // J1: X again at once; typed, but Enter is lost and X sits in the box.
+    await assert.rejects(plainSend(f, id, 'continue', { draftMatches: async () => true, submitDraft: async () => { enters++; } }),
+      /Delivery unconfirmed/);
+    assert.equal(enters, 1, 'the existing retry pressed Enter once and it was lost again');
+    // The next send of X finds J1 pending and submits the draft; J0's row does not recover it.
+    let onScreen = true;
+    const result = await plainSend(f, id, 'continue', {
+      draftMatches: async () => onScreen,
+      submitDraft: async () => { enters++; onScreen = false; receiptLine(f, 'continue'); },
+      type: async () => assert.fail('retyped'),
+    });
+    assert.equal(enters, 2);
+    assert.deepEqual(result, { ok: true, delivery: 'received' });
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('an index row never confirms a fully typed, unsubmitted draft that is still on screen', async () => {
+  const f = indexFixture();
+  const id = generatedId('codex');
+  const stages = [];
+  let enters = 0;
+  try {
+    // A matching row newer than createdAt exists, but the text is still in the box.
+    await assert.rejects(plainSend(f, id, 'deploy now', {
+      trace: (stage) => stages.push(stage),
+      type: async (progress) => { typeAllChunks(progress); indexMessages(f.dir, f.db, id, ['deploy now']); throw new Error(ENTER_NOT_PRESSED); },
+      draftMatches: async () => true, submitDraft: async () => { enters++; },
+    }), /Enter was not pressed/);
+    assert.ok(stages.includes('index-match-draft-present'));
+    assert.ok(!stages.includes('receipt-from-index'));
+    const entry = journalOf(f, id);
+    assert.equal(entry.typedAt, undefined);
+    assert.equal(entry.typing.acknowledgedChunks, entry.typing.chunkCount, 'completedTyping, never submitted');
+
+    // The same text again, draft still on screen: the pending path submits the draft
+    // (a complete per-chunk entry resumes, whose only remaining step is Enter) rather
+    // than recovering from the index.
+    stages.length = 0;
+    let onScreen = true, resumed = 0;
+    const result = await plainSend(f, id, 'deploy now', {
+      trace: (stage) => stages.push(stage),
+      draftMatches: async () => onScreen,
+      type: async (progress) => {
+        resumed++;
+        assert.equal(progress.state.acknowledgedChunks, progress.state.chunkCount, 'a resume with nothing left to type');
+        onScreen = false; receiptLine(f, 'deploy now');
+      },
+      submitDraft: async () => assert.fail('the resume submits'),
+    });
+    assert.equal(resumed, 1);
+    assert.ok(stages.includes('index-match-draft-present'));
+    assert.ok(!stages.includes('pending-settled-by-index'));
+    assert.deepEqual(result, { ok: true, delivery: 'received' }, 'delivered by submitting, not recovered');
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('the index look before a typing error is rethrown confirms once the draft is gone', async () => {
+  const f = indexFixture();
+  const id = generatedId('codex');
+  try {
+    // Enter was reported refused, yet the agent recorded the message and the box is empty.
+    const result = await plainSend(f, id, 'deploy now', {
+      type: async (progress) => { typeAllChunks(progress); indexMessages(f.dir, f.db, id, ['deploy now']); throw new Error(ENTER_NOT_PRESSED); },
+      draftMatches: async () => false,
+    });
+    assert.deepEqual(result, { ok: true, delivery: 'received', source: 'turn-index' });
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('the index window starts exactly at createdAt', async () => {
+  const f = indexFixture();
+  const early = generatedId('codex');
+  const exact = generatedId('codex');
+  try {
+    await assert.rejects(plainSend(f, early, 'status?', {
+      type: async () => indexMessages(f.dir, f.db, early, ['status?'], journalOf(f, early).createdAt - 1),
+    }), /no matching transcript receipt/);
+    const result = await plainSend(f, exact, 'status?', {
+      type: async () => indexMessages(f.dir, f.db, exact, ['status?'], journalOf(f, exact).createdAt),
+    });
+    assert.equal(result.source, 'turn-index');
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('reconcile looks for the index once per sweep and traces its absence once', async () => {
+  const { reconcile } = require('./delivery');
+  const f = indexFixture();
+  try {
+    for (const id of [generatedId('codex'), generatedId('codex'), generatedId('codex')]) {
+      await assert.rejects(plainSend(f, id, 'hello'), /no matching transcript receipt/);
+    }
+    const events = () => fs.readFileSync(path.join(f.directory, 'diagnostics', 'events.jsonl'), 'utf8')
+      .split('\n').filter(Boolean).map((line) => JSON.parse(line)).filter((row) => row.stage === 'index-missing');
+    const before = fs.existsSync(path.join(f.directory, 'diagnostics', 'events.jsonl')) ? events().length : 0;
+    assert.deepEqual(reconcile(f.directory, { now: Date.now() + 61e3, indexDb: f.db }), []);
+    assert.equal(events().length - before, 1);
   } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
 });
