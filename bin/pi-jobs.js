@@ -133,9 +133,13 @@ function runnerIdentity(job, options = {}) {
   if (!Number.isInteger(pid) || pid <= 0 || !job.runnerStart) return false;
   if (options.rows) {
     const row = options.rows.find((item) => item.pid === pid);
-    return Boolean(row && row.pidStart === job.runnerStart
-      && String(row.args || '').includes('pi-job-runner.js')
-      && String(row.args || '').includes(job.id));
+    if (row) {
+      return Boolean(row.pidStart === job.runnerStart
+        && String(row.args || '').includes('pi-job-runner.js')
+        && String(row.args || '').includes(job.id));
+    }
+    // A runner that started after the snapshot is absent from it, not dead: only
+    // the live table may say so.
   }
   let output = '';
   try {

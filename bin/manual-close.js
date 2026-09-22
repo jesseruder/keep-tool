@@ -38,6 +38,13 @@ async function manualClose(body, deps) {
   // A phase is ten polls or the wall time they were meant to take, whichever ends
   // first: a host that times out every read must not hold the injection lock for
   // ten full request timeouts, and the error reports the time actually spent.
+  // One read may not outlive the phase either: a host that never answers is
+  // abandoned at the budget (the read is idempotent and may finish on its own).
+  const withinBudget = (promise, remainingMs) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`host request timed out (get) after ${Math.round(remainingMs)}ms of the close phase`)), Math.max(0, remainingMs));
+    timer.unref?.();
+    promise.then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); });
+  });
   const wait = async (delay) => {
     const started = now();
     const budgetMs = 10 * delay;
@@ -45,7 +52,7 @@ async function manualClose(body, deps) {
     let lastError = null;
     for (let i = 0; i < 10 && now() - started < budgetMs; i++) {
       let pane;
-      try { pane = await deps.getPane(body.pane); }
+      try { pane = await withinBudget(deps.getPane(body.pane), budgetMs - (now() - started)); }
       catch (error) {
         if (!timedOut(error)) throw error;
         lastError = error;

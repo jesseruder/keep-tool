@@ -328,7 +328,7 @@ function turnsForReplay(options = {}) {
     JOIN sessions s ON s.id = t.session_id
     JOIN turns next ON next.session_id = t.session_id AND next.n = t.n + 1
     WHERE ${where.join(' AND ')} AND next.opener_text IS NOT NULL
-    ORDER BY t.ended_at DESC LIMIT ?`).all(...params);
+    ORDER BY COALESCE(t.ended_at, t.started_at) DESC LIMIT ?`).all(...params);
 }
 
 function turnFor(sessionId, n, options = {}) {
