@@ -605,6 +605,9 @@ async function run(body, deps = {}) {
       || !accounts.ID_RE.test(String(body?.accountId || ''))) {
     const error = new Error('Expected exact session, pane and target account'); error.status = 400; throw error;
   }
+  if (body.ownerForce !== undefined && typeof body.ownerForce !== 'boolean') {
+    const error = new Error('Account handoff ownerForce must be a boolean'); error.status = 400; throw error;
+  }
   if (body.force !== undefined && typeof body.force !== 'boolean') {
     const error = new Error('Account handoff force must be a boolean'); error.status = 400; throw error;
   }
@@ -625,7 +628,13 @@ async function run(body, deps = {}) {
   }
   // Force only tells the stop path to ignore uncertain background-job evidence;
   // a session that is genuinely mid-turn is still refused downstream.
-  const force = body.force === true;
+  // ownerForce is Owner asking for the transfer himself: the source is closed and killed
+  // rather than asked to exit, and nothing is refused for being unable to prove it idle.
+  // Only what would fail or corrupt the move still refuses (target login and setup,
+  // profile aliasing, a rollout that changes while it is copied, process identity).
+  // The rate-limit queue never sends it.
+  const ownerForce = body.ownerForce === true;
+  const force = body.force === true || ownerForce;
   const requestedIntent = body.intent == null ? null : body.intent;
   if (requestedIntent != null && !['continue', 'open-only'].includes(requestedIntent)) {
     const error = new Error('Account handoff intent must be continue or open-only'); error.status = 400; throw error;
@@ -763,7 +772,7 @@ async function run(body, deps = {}) {
           if (agent === 'claude') providerArtifacts.preflight(session.id, source, target, { root, env });
           Object.assign(current, { status: 'copying', phase: 'copying-artifacts' }); writeOne(root, current);
           const copiedPlan = copyProviderArtifacts(providerArtifacts, agent, session.id, source, target, current.id,
-            { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt });
+            { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force: current.force === true });
           if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
           current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
           writeOne(root, current);
@@ -828,7 +837,7 @@ async function run(body, deps = {}) {
       const error = new Error(current.reason); error.status = 409; error.extra = safe(current); throw error;
     }
     let artifactPlan;
-    try { artifactPlan = providerArtifacts.preflight(session.id, source, target, { root, env }); }
+    try { artifactPlan = providerArtifacts.preflight(session.id, source, target, { root, env, force }); }
     catch (error) { error.status = 409; throw error; }
     const resumeSpec = resumeSpecFor(session.id, agent, artifactPlan, deps);
     const resumeCwd = agent === 'codex' ? codexResumeCwd(resumeSpec) : session.project || pane.cwd;
@@ -890,7 +899,7 @@ async function run(body, deps = {}) {
       if (type !== 'replace-exited') return baseHost.request(type, params);
       Object.assign(current, { status: 'copying', phase: 'copying-artifacts', sourceStopVerifiedAt: Date.now() }); writeOne(root, current);
       const copiedPlan = copyProviderArtifacts(providerArtifacts, agent, session.id, source, target, current.id,
-        { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt });
+        { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force });
       if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
       current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
       writeOne(root, current);
@@ -907,7 +916,7 @@ async function run(body, deps = {}) {
     try {
       const result = await deps.restartSession({ sessionId: session.id, pane: pane.id, pid: pane.pid, mode: 'now',
         ...(force ? { force: true } : {}) }, {
-        ...deps.restartDeps, root, env, host: wrappedHost, resumeAccount: target, resumeMcpConfig: compatibility.mcpConfig,
+        ...deps.restartDeps, root, env, host: wrappedHost, resumeAccount: target, ownerForce, resumeMcpConfig: compatibility.mcpConfig,
         resumeModel: current.model, resumeArgv: current.resumeSpec?.argv, resumeCwd: current.resumeSpec ? current.cwd : null,
         allowTerminalRateLimit: true,
         // The /exit is typed, every check before its Enter has passed, and the Enter is the

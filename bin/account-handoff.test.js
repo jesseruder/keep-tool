@@ -455,6 +455,40 @@ test('Codex source policy changes after exit block target launch', async () => {
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('an Owner-forced Codex transfer forces the stop, the artifact plan, the copy and the rebind', async () => {
+  const f = fixture();
+  try {
+    const d = codexDeps(f);
+    const seen = {};
+    const provider = d.artifactProvider;
+    d.artifactProvider = { ...provider,
+      preflight: (...args) => { seen.preflight = args[3]?.force; return provider.preflight(...args); },
+      copyCodexArtifacts: (...args) => { seen.copy = args[4]?.force; return provider.copyCodexArtifacts(...args); },
+      rebindLedger: (...args) => { seen.rebind = args[4]?.force; return provider.rebindLedger(...args); } };
+    const restart = d.restartSession;
+    d.restartSession = (body, options) => { seen.stop = { force: body.force, ownerForce: options.ownerForce }; return restart(body, options); };
+    const result = await handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two', ownerForce: true }, d);
+    assert.equal(result.status, 'done');
+    assert.deepEqual(seen, { preflight: true, copy: true, rebind: true, stop: { force: true, ownerForce: true } });
+    await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two', ownerForce: 'yes' }, d),
+      /ownerForce must be a boolean/);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('an ordinary transfer asks the artifact plan and the stop for their proofs', async () => {
+  const f = fixture();
+  try {
+    const d = codexDeps(f);
+    const seen = {};
+    const provider = d.artifactProvider;
+    d.artifactProvider = { ...provider, preflight: (...args) => { seen.preflight = args[3]?.force; return provider.preflight(...args); } };
+    const restart = d.restartSession;
+    d.restartSession = (body, options) => { seen.ownerForce = options.ownerForce; return restart(body, options); };
+    assert.equal((await handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d)).status, 'done');
+    assert.deepEqual(seen, { preflight: false, ownerForce: false });
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('Codex recovery resumes an idempotent copy after the ledger already rebound', async () => {
   const f = fixture();
   try {

@@ -11378,6 +11378,63 @@ test('compact session restores the pane launch model rather than the transcript 
   }
 });
 
+test('an Owner-forced restart closes and kills a busy session and resumes it without asking for idle proof', async () => {
+  const { restartSession } = require('./serve');
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-owner-force-'));
+  try {
+    // Everything that refuses an ordinary restart at once: mid-turn, a tool running, a
+    // question on screen, unknown background jobs and a rate limit.
+    const session = { id: 'busy', kind: 'claude', state: 'working', project: cwd, endedTurn: false, toolRunning: true,
+      pendingQuestion: { text: 'which one?' }, rateLimit: { at: '2026-09-12T20:34:01.831Z' },
+      pendingBackground: true, unknownBackgroundJobs: ['bash-7'], backgroundJobs: { pending: true, jobs: [{ id: 'bash-7', status: 'pending' }] } };
+    const state = { alive: true, calls: [], signals: [] };
+    const pane = () => ({ id: 'p', pid: 10, alive: state.alive, cwd, createdAt: 'created', cols: 80, rows: 24, attached: 1,
+      meta: { sessionId: 'busy', agent: 'claude' } });
+    const agentRow = { pid: 11, ppid: 10, pidStart: 'agent-start', agent: 'claude', interactive: true, args: 'claude --resume busy' };
+    const target = { id: 'claude-two', label: 'Claude Two', agent: 'claude', configDir: cwd };
+    const deps = (extra = {}) => ({ withInjectionLock: (fn) => fn(), sleep: async () => {}, resumeAccount: target,
+      buildState: async () => ({ sessions: [session], tasks: [] }),
+      agentProcessRows: async () => state.alive ? [agentRow] : [],
+      forceRows: async () => state.alive ? [{ pid: 10, ppid: 1, pidStart: 'shell-start', args: '-zsh' }, agentRow] : [],
+      forceSignal: async (pid, signal) => { state.signals.push([pid, signal]); },
+      closeIdleSession: async () => { state.calls.push('graceful'); throw new Error('Waiting for the turn and background work to finish'); },
+      waitForHostAgent: async () => {},
+      host: { request: async (type, params) => {
+        state.calls.push(type);
+        if (type === 'hello') return { replaceExited: true };
+        if (type === 'get') return { pane: pane() };
+        if (type === 'kill') { state.alive = false; return { ok: true }; }
+        if (type === 'replace-exited') { state.replace = params; return { pane: { id: 'p', pid: 99, createdAt: 'again' } }; }
+        throw new Error(`unexpected host request ${type}`);
+      } },
+      ...extra });
+    const body = { sessionId: 'busy', pane: 'p', pid: 10, mode: 'now' };
+
+    await assert.rejects(restartSession(body, deps()), /Waiting for the turn and background work to finish/,
+      'without Owner behind it the same session is refused');
+    assert.equal(state.calls.includes('kill'), false);
+
+    const result = await restartSession(body, deps({ ownerForce: true }));
+    assert.equal(result.ok, true);
+    assert.equal(result.pid, 99);
+    assert.ok(state.calls.indexOf('graceful') < state.calls.indexOf('kill'), 'a graceful close is tried before the signal');
+    assert.equal(state.replace.meta.accountId, 'claude-two');
+    assert.match(state.replace.args[1], /'--resume' 'busy'/);
+  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('an Owner-forced console transfer is never queued; its refusal goes back to the click', async () => {
+  const { handoffSessionRequest } = require('./serve');
+  const refusal = Object.assign(new Error('Target claude account is not logged in'), { status: 409,
+    extra: { sessionId: 'sid', pane: 'p', status: 'recovery-needed', refusalClass: 'transient', intent: 'continue' } });
+  let requested;
+  await assert.rejects(handoffSessionRequest({ sessionId: 'sid', pane: 'p', accountId: 'claude-two', queueOnTransient: true, ownerForce: true },
+    { handoffSession: async (request) => { requested = request; throw refusal; },
+      handoffQueueState: async () => assert.fail('a forced transfer must not reach the queue') }), /not logged in/);
+  assert.equal(requested.ownerForce, true);
+  assert.equal('queueOnTransient' in requested, false);
+});
+
 test('a rate-limited restart is not blocked by a settled history-gap', async () => {
   const { restartSession } = require('./serve');
   // The four sessions this came from all sat at "You've reached your Fable

@@ -5946,6 +5946,12 @@ async function restartSession(body, deps = {}) {
   // An explicit force discards uncertain background-job evidence only; the turn,
   // tool and process identity checks below stay exactly as strict.
   const force = body.force === true;
+  // Owner asked for this himself (a console click, keep handoff --force): nothing is
+  // typed into the session, so no idle, draft, dialog, ledger or helper proof is asked
+  // for. The process tree is closed and killed the way force-restart does it, and the
+  // same resume below starts the conversation again. The rate-limit handoff queue never
+  // sets this; automatic work keeps every proof.
+  const ownerForce = deps.ownerForce === true;
   let exitInputStarted = false;
   const transient = (reason) => body.mode === 'idle' && !exitInputStarted
     ? new (require('./session-restart').RestartDeferred)(reason) : new InjectionError(409, reason);
@@ -5992,7 +5998,8 @@ async function restartSession(body, deps = {}) {
       && !session.toolRunning && !session.pendingQuestion && !session.pendingPlan
       && !require('./session-restart').blockingUnknownJobs(session).length;
     const restartSessionState = terminalLimit ? { ...session, endedTurn: true, rateLimit: null } : session;
-    const reason = require('./session-restart').refusal(restartSessionState, pane, body.mode === 'idle', { force });
+    const reason = ownerForce ? null
+      : require('./session-restart').refusal(restartSessionState, pane, body.mode === 'idle', { force });
     if (pane.pid !== body.pid) throw new InjectionError(409, 'Session process changed');
     if (reason) {
       if (/^Waiting |^Pause session-local scheduled jobs/.test(reason)) throw transient(reason);
@@ -6057,6 +6064,41 @@ async function restartSession(body, deps = {}) {
       throw Error('Agent process identity changed during restart');
     }
     const originalArgs = originalRows.find((p) => p.pid === originalIdentity.pid)?.args || '';
+    // Starts the conversation again in the stopped pane, on `account`. An account handoff
+    // wraps the host's replace-exited to copy the conversation first.
+    const resume = async (stoppedPane) => {
+      // Preserve an explicit permission bypass only when the old process used it.
+      // Do not apply the fresh-session defaults to a previously restricted agent.
+      const bypass = session.kind === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
+      const flags = originalArgs.split(/\s+/).includes(bypass) ? [bypass] : [];
+      const reviewerSpec = reviewerResumeSpec(session, pane, deps);
+      const requestedResumeModel = deps.resumeModel || pane.meta?.model;
+      const launchModel = typeof requestedResumeModel === 'string' && keep.LAUNCH_MODEL_RE.test(requestedResumeModel) ? requestedResumeModel : '';
+      const resumeModel = launchModel || (session.kind === 'claude' ? inheritedModel : '');
+      const modelArgs = resumeModel ? (session.kind === 'codex' ? ['-m', resumeModel] : ['--model', resumeModel]) : [];
+      const mcpArgs = session.kind === 'claude' && resumeMcpConfig ? ['--mcp-config', resumeMcpConfig] : [];
+      let argv;
+      if (deps.resumeArgv != null) {
+        if (session.kind !== 'codex' || !Array.isArray(deps.resumeArgv) || deps.resumeArgv.length < 3
+            || deps.resumeArgv.some((value) => typeof value !== 'string' || !value || /[\r\n\0]/.test(value))
+            || deps.resumeArgv[0] !== 'codex' || deps.resumeArgv.at(-2) !== 'resume' || deps.resumeArgv.at(-1) !== session.id) {
+          throw new InjectionError(409, 'Codex resume policy changed before restart');
+        }
+        argv = [...deps.resumeArgv];
+      } else {
+        argv = [session.kind, ...flags, ...reviewerSpec.flags, ...mcpArgs, ...modelArgs,
+          session.kind === 'codex' ? 'resume' : '--resume', session.id];
+      }
+      const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stoppedPane.meta?.sessionId,
+        cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
+        env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: session.id }, deps), ...reviewerSpec.env }),
+        cols: pane.cols, rows: pane.rows, meta: { ...adoptedPaneMeta(pane.meta), agent: session.kind, sessionId: session.id,
+          accountId: account.id, accountLabel: account.label, restartedAt: Date.now() } });
+      await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
+      return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid,
+        createdAt: result.pane.createdAt };
+    };
+    if (ownerForce) return forceStopThenResume({ session, pane, identity: originalIdentity, resume }, deps);
     const ledger = require('./restart-ledger');
     const file = session.kind === 'codex' ? (deps.codexRolloutFile || codex.rolloutFileFor)(session.id)
       : (deps.claudeRolloutFile || findSessionFile)(session.id);
@@ -6224,36 +6266,7 @@ async function restartSession(body, deps = {}) {
     if (!helpersStopped) throw Error('Session helper did not exit; restart stopped without killing it');
     const live = await liveSessionPids(deps);
     if (live.has(session.id)) throw Error('An agent process still owns this conversation');
-    // Preserve an explicit permission bypass only when the old process used it.
-    // Do not apply the fresh-session defaults to a previously restricted agent.
-    const bypass = session.kind === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
-    const flags = originalArgs.split(/\s+/).includes(bypass) ? [bypass] : [];
-    const reviewerSpec = reviewerResumeSpec(session, pane, deps);
-    const requestedResumeModel = deps.resumeModel || pane.meta?.model;
-    const launchModel = typeof requestedResumeModel === 'string' && keep.LAUNCH_MODEL_RE.test(requestedResumeModel) ? requestedResumeModel : '';
-    const resumeModel = launchModel || (session.kind === 'claude' ? inheritedModel : '');
-    const modelArgs = resumeModel ? (session.kind === 'codex' ? ['-m', resumeModel] : ['--model', resumeModel]) : [];
-    const mcpArgs = session.kind === 'claude' && resumeMcpConfig ? ['--mcp-config', resumeMcpConfig] : [];
-    let argv;
-    if (deps.resumeArgv != null) {
-      if (session.kind !== 'codex' || !Array.isArray(deps.resumeArgv) || deps.resumeArgv.length < 3
-          || deps.resumeArgv.some((value) => typeof value !== 'string' || !value || /[\r\n\0]/.test(value))
-          || deps.resumeArgv[0] !== 'codex' || deps.resumeArgv.at(-2) !== 'resume' || deps.resumeArgv.at(-1) !== session.id) {
-        throw new InjectionError(409, 'Codex resume policy changed before restart');
-      }
-      argv = [...deps.resumeArgv];
-    } else {
-      argv = [session.kind, ...flags, ...reviewerSpec.flags, ...mcpArgs, ...modelArgs,
-        session.kind === 'codex' ? 'resume' : '--resume', session.id];
-    }
-    const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stopped.meta?.sessionId,
-      cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
-      env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: session.id }, deps), ...reviewerSpec.env }),
-      cols: pane.cols, rows: pane.rows, meta: { ...adoptedPaneMeta(pane.meta), agent: session.kind, sessionId: session.id,
-        accountId: account.id, accountLabel: account.label, restartedAt: Date.now() } });
-    await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
-    return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid,
-      createdAt: result.pane.createdAt };
+    return resume(stopped);
   }, { pane: body.pane, session: body.sessionId, ...(inheritedModel ? {} : { model: true }) });
 
   try { return await attempt(''); }
@@ -6263,6 +6276,68 @@ async function restartSession(body, deps = {}) {
     if (!inherited) throw error;
     return attempt(inherited);
   }
+}
+
+// How force-restart stops a session: the graceful manual close, then SIGTERM and
+// SIGKILL on the exact process instances it captured. Resuming is left to the caller.
+function forceStopDeps(entry, deps, host, save) {
+  const rows = deps.forceRows || (async () => {
+    const result = await execFileAsync('ps', ['-axo', 'pid=,ppid=,tty=,lstart=,stat=,args='], {
+      encoding: 'utf8', timeout: 5000, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' },
+    });
+    return String(result.stdout).split('\n').flatMap(line => {
+      const m = PS_TABLE_RE.exec(line);
+      if (!m) return [];
+      const state = /^(\S+)\s+(.*)$/.exec(m[5]);
+      if (!state) return [];
+      return parseProcessTable(`${m[1]} ${m[2]} ${m[3]} ${m[4]} ${state[2]}`).map(p => ({ ...p, zombie: state[1].includes('Z') }));
+    });
+  });
+  return {
+    save, rows, sleep: deps.sleep,
+    identifyOriginal: async (sid, snapshot) => (await liveSessionPids({ ...deps, agentProcessRows: async () => snapshot })).get(sid),
+    verifyStarted: original => (deps.waitForHostAgent || waitForHostAgent)({ pane: entry.pane }, original.agent, deps),
+    getPane: async pane => (await host('get', { pane })).pane,
+    close: body => require('./manual-close').manualClose(body, {
+      sleep: deps.sleep,
+      getPane: async id => {
+        const pane = (await host('get', { pane: id })).pane;
+        // SessionEnd can clear the conversation link before the owning login
+        // shell exits. Normalize only this exact captured pane instance.
+        return pane?.id === entry.pane && pane.pid === entry.pid && pane.createdAt === entry.original.createdAt
+          && pane.meta?.agent === 'shell' && !pane.meta.sessionId
+          ? { ...pane, meta: { ...pane.meta, agent: entry.original.agent, sessionId: entry.sessionId } } : pane;
+      },
+      graceful: request => (deps.closeIdleSession || closeIdleSession)(request, { ...deps, closePolicy: { manual: true }, withInjectionLock: fn => fn() }),
+      signal: (pane, signal) => host('kill', { pane, signal }),
+    }),
+    signal: deps.forceSignal || (async (pid, signal) => { try { process.kill(pid, signal); } catch (e) { if (e.code !== 'ESRCH') throw e; } }),
+    sessionLive: async sid => (await liveSessionPids({ ...deps, agentProcessRows: rows })).has(sid),
+  };
+}
+
+// Owner-forced restart or handoff: stop the process tree without asking whether it is
+// idle, then resume through the caller's own resume step, which for a handoff copies the
+// conversation to the target account first.
+async function forceStopThenResume({ session, pane, identity, resume }, deps = {}) {
+  const host = (type, params) => hostRequest(type, params, deps);
+  const entry = { sessionId: session.id, pane: pane.id, pid: pane.pid, mode: 'force', token: crypto.randomUUID() };
+  const stop = forceStopDeps(entry, deps, host, async () => {});
+  return require('./force-restart').run(entry, {
+    ...stop,
+    // The process the caller verified, and no other, is the one stopped.
+    identifyOriginal: async (sid, snapshot) => {
+      const found = await stop.identifyOriginal(sid, snapshot);
+      if (!found || found.pid !== identity.pid || found.pidStart !== identity.pidStart) throw Error('Agent process identity changed during restart');
+      return found;
+    },
+    verifyStarted: undefined, // resume waits for the agent itself
+    replace: async (original, job, expectedPid) => {
+      const stopped = (await host('get', { pane: job.pane })).pane;
+      if (stopped.alive || stopped.pid !== expectedPid) throw Error('Exited pane changed before resume');
+      return resume(stopped);
+    },
+  });
 }
 
 // Same two attempts as restartSession: hold the model key so the resumed agent reads a
@@ -6306,38 +6381,8 @@ async function forceRestartSession(entry, save, deps = {}) {
       try { resumeMcpConfig = (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(resumeAccount, cwd).mcpConfig; }
       catch (error) { throw new InjectionError(409, `account shared setup is unavailable: ${error.message}`); }
     }
-    const rows = deps.forceRows || (async () => {
-      const result = await execFileAsync('ps', ['-axo', 'pid=,ppid=,tty=,lstart=,stat=,args='], {
-        encoding: 'utf8', timeout: 5000, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' },
-      });
-      return String(result.stdout).split('\n').flatMap(line => {
-        const m = PS_TABLE_RE.exec(line);
-        if (!m) return [];
-        const state = /^(\S+)\s+(.*)$/.exec(m[5]);
-        if (!state) return [];
-        return parseProcessTable(`${m[1]} ${m[2]} ${m[3]} ${m[4]} ${state[2]}`).map(p => ({ ...p, zombie: state[1].includes('Z') }));
-      });
-    });
     return require('./force-restart').run(entry, {
-      save, rows, sleep: deps.sleep,
-      identifyOriginal: async (sid, snapshot) => (await liveSessionPids({ ...deps, agentProcessRows: async () => snapshot })).get(sid),
-      verifyStarted: original => (deps.waitForHostAgent || waitForHostAgent)({ pane: entry.pane }, original.agent, deps),
-      getPane: async pane => (await host('get', { pane })).pane,
-      close: body => require('./manual-close').manualClose(body, {
-        sleep: deps.sleep,
-        getPane: async id => {
-          const pane = (await host('get', { pane: id })).pane;
-          // SessionEnd can clear the conversation link before the owning login
-          // shell exits. Normalize only this exact captured pane instance.
-          return pane?.id === entry.pane && pane.pid === entry.pid && pane.createdAt === entry.original.createdAt
-            && pane.meta?.agent === 'shell' && !pane.meta.sessionId
-            ? { ...pane, meta: { ...pane.meta, agent: entry.original.agent, sessionId: entry.sessionId } } : pane;
-        },
-        graceful: request => (deps.closeIdleSession || closeIdleSession)(request, { ...deps, closePolicy: { manual: true }, withInjectionLock: fn => fn() }),
-        signal: (pane, signal) => host('kill', { pane, signal }),
-      }),
-      signal: async (pid, signal) => { try { process.kill(pid, signal); } catch (e) { if (e.code !== 'ESRCH') throw e; } },
-      sessionLive: async sid => (await liveSessionPids({ ...deps, agentProcessRows: rows })).has(sid),
+      ...forceStopDeps(entry, deps, host, save),
       replace: async (original, job, expectedPid) => {
         const bypass = original.agent === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
         const reviewerSpec = reviewerResumeSpec({ id: job.sessionId }, original, deps);
@@ -8965,7 +9010,7 @@ async function reopenSessionOnAccount(body, deps = {}) {
       }
       const turn = rememberedTurn();
       const resumed = await (deps.handoffSession || handoffSession)({ sessionId: session.id, pane: recorded.pane,
-        accountId: target.id, intent: 'open-only' }, deps);
+        accountId: target.id, intent: 'open-only', ownerForce: true }, deps);
       return compactTarget(resumed, turn);
     }
     if (recorded?.status === 'done' && recorded.targetAccountId === target.id && recorded.intent === 'open-only') {
@@ -8995,8 +9040,9 @@ async function reopenSessionOnAccount(body, deps = {}) {
     const opened = await (deps.openSession || openSession)({ sessionId: session.id, accountId: source.id },
       { ...deps, reopenCompaction: 'skip' });
     if (!opened?.pane) throw new InjectionError(502, 'Source session did not open in a verified pane');
+    // Owner asked for this reopen, and the source is the pane just opened for it.
     const result = await (deps.handoffSession || handoffSession)({ sessionId: session.id, pane: opened.pane,
-      accountId: target.id, intent: 'open-only' }, deps);
+      accountId: target.id, intent: 'open-only', ownerForce: true }, deps);
     return compactTarget(result, turn);
   })();
   reopenOperations.set(session.id, { accountId: target.id, promise });
@@ -10859,7 +10905,9 @@ async function queueRefusedHandoff(body, record, requestedAt, deps = {}) {
 async function handoffSessionRequest(body, deps = {}) {
   const { queueOnTransient, ...request } = body && typeof body === 'object' ? body : {};
   const run = deps.handoffSession || handoffSession;
-  if (queueOnTransient !== true) return run(request, deps);
+  // An Owner-forced transfer has nothing left to wait out, and a queued retry would run
+  // without Owner behind it; its refusal goes straight back to the person who clicked.
+  if (queueOnTransient !== true || request.ownerForce === true) return run(request, deps);
   // When this transfer was asked for, so a Cancel that arrives while it runs wins.
   const requestedAt = (deps.now ? deps.now() : Date.now());
   let result;

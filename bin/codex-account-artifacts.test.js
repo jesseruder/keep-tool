@@ -117,6 +117,23 @@ test('preflight and copy expose and preserve only the verified root and owned ch
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('an Owner-forced plan reads ownership from rollout metadata and needs no job ledger', () => {
+  const f = fixture();
+  try {
+    fs.rmSync(path.join(f.root, '.keep', 'background-jobs'), { recursive: true, force: true });
+    const refusing = { Recovering, verify: () => { throw new Error('ledger proof must not run'); } };
+    assert.throws(() => artifacts.preflight(f.sid, f.records.a, f.records.b, options(f)), /restart graph is unavailable|restart proof/);
+    const preview = artifacts.preflight(f.sid, f.records.a, f.records.b, options(f, { force: true, restartLedger: refusing }));
+    assert.deepEqual(preview.artifacts.map((entry) => entry.sessionId), [f.sid, f.child, f.grandchild]);
+    assert.deepEqual(preview.artifacts[0].children, [f.child]);
+    const copied = artifacts.copyCodexArtifacts(f.sid, f.records.a, f.records.b, 'tx-forced',
+      options(f, { force: true, restartLedger: refusing }));
+    assert.equal(copied.copied.length, 3);
+    for (const entry of copied.artifacts) assert.deepEqual(fs.readFileSync(entry.target), fs.readFileSync(entry.source));
+    assert.equal(fs.existsSync(targetFor(f, 'b', f.interactedFile)), false, 'a rollout owned by another root is not copied');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('completed copy is idempotent and ledger rebind visits owned children but preserves interacted edges', () => {
   const f = fixture();
   try {

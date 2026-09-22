@@ -248,8 +248,9 @@ test('desktop launch refuses stale source or package bytes and requires authorit
     fs.appendFileSync(fresh.artifactFile, '\nmutated after review\n');
     await assert.rejects(portable.launchPrepared(fresh.requestKey, f.deps),
       (error) => error.code === 'KEEP_PORTABLE_TRANSFER_STALE');
+    // A source still working is Owner's to judge; another transfer owning it is not.
     await assert.rejects(portable.launchPrepared(staleSource.requestKey, {
-      ...f.deps, inspectSource: async () => ({ session: { endedTurn: false, toolRunning: true } }),
+      ...f.deps, inspectSource: async () => ({ session: { endedTurn: false, toolRunning: true }, nativeHandoff: {} }),
     }), (error) => error.code === 'KEEP_PORTABLE_TRANSFER_SOURCE_BUSY');
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
@@ -477,10 +478,13 @@ test('desktop draft and prepare accept a verified terminal quota pause, then lau
     assert.equal(prepared.status, 'prepared');
     assert.equal(f.opened.length, 0, 'preparing the reviewed package does not launch a successor');
 
-    session.lastUserAt = rateLimitAt + 1;
+    // Newer activity in the source is Owner's to see; a transfer that took the source
+    // over after the preview still prevents the launch.
+    const busy = f.deps.inspectSource;
+    f.deps.inspectSource = async () => ({ ...await busy(), portableHandoff: {} });
     await assert.rejects(portable.launchPrepared(prepared.requestKey, f.deps),
       (error) => error.code === 'KEEP_PORTABLE_TRANSFER_SOURCE_BUSY');
-    assert.equal(f.opened.length, 0, 'new activity after preview prevents launch');
+    assert.equal(f.opened.length, 0, 'a competing transfer after preview prevents launch');
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -594,7 +598,7 @@ test('setup retry rechecks source readiness before delivering the saved opening'
       resumeOpening: async () => assert.fail('changed source must block before delivery'),
     };
     assert.equal((await portable.launchPrepared(prepared.requestKey, launchDeps)).status, 'awaiting-setup');
-    launchDeps.inspectSource = async () => ({ session: { endedTurn: true, pendingOther: true } });
+    launchDeps.inspectSource = async () => ({ session: { endedTurn: true, pendingOther: true }, nativeHandoff: {} });
     await assert.rejects(portable.launchPrepared(prepared.requestKey, launchDeps),
       (error) => error.code === 'KEEP_PORTABLE_TRANSFER_SOURCE_BUSY');
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }

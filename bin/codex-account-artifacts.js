@@ -257,6 +257,29 @@ function graphFromLedgers(root, rootId, index, externallyResolved = new Map()) {
   return graph;
 }
 
+// An Owner-forced transfer asks for no restart proof, so the job ledgers cannot say
+// which child threads belong to the conversation. Each rollout's own session_meta
+// can: copy the root and every descendant whose parent chain leads back to it.
+function graphFromRollouts(rootId, index) {
+  const graph = [], seen = new Set();
+  function visit(id, parent, depth) {
+    if (depth > MAX_DEPTH || graph.length >= MAX_GRAPH || seen.has(id)) {
+      throw failure('Codex child rollout graph is too large or cyclic', 'KEEP_CODEX_ARTIFACT_LEDGER');
+    }
+    seen.add(id);
+    const entry = unique(index, id, parent ? 'owned child' : 'root');
+    const children = (index.byParent.get(id) || []).map((child) => child.id);
+    for (const child of children) if ((index.byId.get(child) || []).length !== 1) {
+      throw failure(`Codex child rollout ${child} is ambiguous`, 'KEEP_CODEX_ARTIFACT_SOURCE');
+    }
+    graph.push({ id, parent: parent || null, file: entry.file, relative: entry.relative,
+      children: [...new Set(children)].sort(), interacted: [] });
+    for (const child of [...new Set(children)].sort()) visit(child, id, depth + 1);
+  }
+  visit(rootId, null, 0);
+  return graph;
+}
+
 function verifyRestart(root, rootId, index, options = {}, stopped = false) {
   const restartLedger = options.restartLedger || require('./restart-ledger');
   const rootEntry = unique(index, rootId, 'root');
@@ -333,8 +356,10 @@ function buildPlan(sessionId, sourceProfile, targetProfile, options = {}, stoppe
     throw failure(`Codex session ${sessionNamed(sessionId)} is archived; unarchive it in the source account before transferring`,
       'KEEP_CODEX_ARTIFACT_ARCHIVED');
   }
-  const verified = verifyRestart(options.root, sessionId, sourceIndex, options, stopped);
-  const graph = graphFromLedgers(options.root, sessionId, sourceIndex, verified.externallyResolved);
+  const verified = options.force === true ? { unchanged: () => {} }
+    : verifyRestart(options.root, sessionId, sourceIndex, options, stopped);
+  const graph = options.force === true ? graphFromRollouts(sessionId, sourceIndex)
+    : graphFromLedgers(options.root, sessionId, sourceIndex, verified.externallyResolved);
   const targetIndex = scanProfile(target, options);
   const artifacts = graph.map((node) => {
     const sourceFile = assertPath(source.root, node.file, 'source rollout');

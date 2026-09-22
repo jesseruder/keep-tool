@@ -83,12 +83,10 @@ test('pending, failed, recovery, and done transactions describe only verified st
   assert.match(render('failed', { reason: '<unsafe>' }), /&lt;unsafe&gt;/);
   assert.match(render('recovery-needed', { reason: 'stopped' }), /Transfer interrupted/);
   assert.match(render('recovery-needed'), /data-handoff-account="claude-two"/);
-  // Force transfer is offered only for the uncertain background-job refusal.
-  assert.doesNotMatch(render('recovery-needed', { reason: 'stopped' }), /Force transfer/);
-  const forceable = render('recovery-needed', { reason: 'Waiting for the turn and background work to finish' });
-  assert.match(forceable, /data-handoff-force="1"/);
-  assert.match(forceable, /Force transfer/);
-  assert.match(forceable, /a session mid-turn is still refused/);
+  // Every click is forced, so no refusal grows a second Force button beside Retry.
+  const refused = render('recovery-needed', { reason: 'Waiting for the turn and background work to finish' });
+  assert.doesNotMatch(refused, /Force transfer|data-handoff-force/);
+  assert.match(refused, /data-handoff-account="claude-two">Retry/);
   assert.match(render('done'), /Verifying transfer to Claude Two/);
   assert.doesNotMatch(render('done'), /Continued on/);
 
@@ -122,7 +120,7 @@ test('click posts the explicit destination and only claims success after refresh
   context.installHandoffControls(container, ctx, 's', 'p');
   await button.onclick();
   assert.equal(JSON.stringify(writes), JSON.stringify([{ url: '/api/handoff-session',
-    body: { sessionId: 's', pane: 'p', accountId: 'claude-two', queueOnTransient: true } }]));
+    body: { sessionId: 's', pane: 'p', accountId: 'claude-two', queueOnTransient: true, ownerForce: true } }]));
   assert.deepEqual(toasts, ['Continued on Claude Two']);
   assert.equal(button.disabled, false);
 });

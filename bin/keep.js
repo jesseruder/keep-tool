@@ -3200,13 +3200,16 @@ commands.accounts = (argv, deps = {}) => {
 };
 
 commands.handoff = async (argv, deps = {}) => {
-  const o = parseArgs(argv, { pane: 'str', account: 'str' });
+  const o = parseArgs(argv, { pane: 'str', account: 'str', force: 'bool' });
   const sessionId = o._[0];
   if (!sessionId || o._.length !== 1 || !o.pane || !o.account) {
-    die('usage: keep handoff <session-id> --pane <pane-id> --account <target-id>');
+    die('usage: keep handoff <session-id> --pane <pane-id> --account <target-id> [--force]');
   }
+  // --force is Owner transferring it himself, the same as the console button: the source
+  // is closed and killed instead of being proven idle first.
   let response;
-  try { response = await (deps.postKeepApi || postKeepApi)('/api/handoff-session', { sessionId, pane: o.pane, accountId: o.account }, 180000); }
+  try { response = await (deps.postKeepApi || postKeepApi)('/api/handoff-session', { sessionId, pane: o.pane, accountId: o.account,
+    ...(o.force ? { ownerForce: true } : {}) }, 180000); }
   catch { die("keep serve isn't running (start it or use the dashboard)"); }
   let result = {};
   try { result = JSON.parse(response.data); } catch {}
@@ -3588,7 +3591,7 @@ ${stepUsage()}
   keep accounts add <id> --agent claude|codex --label <label> --config-dir <dir>
   keep accounts default claude|codex <id>
   keep accounts setup <id> --share-from <source-id>
-  keep handoff <session-id> --pane <pane-id> --account <target-id>
+  keep handoff <session-id> --pane <pane-id> --account <target-id> [--force]
   keep transfer <source-session-id> --account <target-id> --context <handoff.md> [--cwd <worktree>] [--prepare-only]
                          # starts a fresh conversation from a prose-only portable package; source session remains intact
                          # ambiguous launches require --resolve-session <destination-id>, never a blind second launch

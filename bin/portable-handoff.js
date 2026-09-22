@@ -427,10 +427,20 @@ function sourceBusyReason(inspection) {
   return 'the source turn has not ended';
 }
 
+// What still refuses a portable transfer Owner asked for from the console. The source
+// is never stopped, so whether it is still working is his to judge from the screen;
+// only a session that cannot be found, or one another transfer already owns, refuses.
+function sourceConflictReason(inspection) {
+  if (!inspection?.session) return 'source session activity could not be verified';
+  if (inspection.nativeHandoff) return 'source has an unresolved account handoff';
+  if (inspection.portableHandoff) return 'source has another unresolved portable transfer';
+  return '';
+}
+
 async function inspectReady(sourceSessionId, deps, options = {}) {
   if (!deps.inspectSource) throw problem('portable transfer source inspection is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
   const inspection = await deps.inspectSource(sourceSessionId, options);
-  const reason = sourceBusyReason(inspection);
+  const reason = sourceConflictReason(inspection);
   if (reason) throw problem(`portable transfer is unavailable: ${reason}`, 'KEEP_PORTABLE_TRANSFER_SOURCE_BUSY', 409);
   return inspection;
 }
@@ -803,6 +813,6 @@ async function run(request, deps = {}) {
   } finally { unlock(); }
 }
 
-module.exports = { run, draft, launchPrepared, resolvePrepared, readPreview, list, safeSummary, sourceBusyReason, verifiedTerminalQuotaPause,
+module.exports = { run, draft, launchPrepared, resolvePrepared, readPreview, list, safeSummary, sourceBusyReason, sourceConflictReason, verifiedTerminalQuotaPause,
   recordLaunch, reserveDelivery, markAwaitingSetup, recordDelivery, deliveryReceipt, openingMessage,
   extractConversation, renderPackage, defaultGitSnapshot, transactionFile, CLAUDE_DEFAULT_MODEL, CONTEXT_LIMIT };

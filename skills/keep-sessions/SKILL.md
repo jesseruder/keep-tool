@@ -199,9 +199,11 @@ when you keep the card and want one step done.
 Pi sessions cannot be moved with `keep handoff` or `keep transfer`; use Pi's own
 session controls outside Keep if the user directs that work.
 
-- `keep handoff <session-id> --pane <pane-id> --account <target-id>` moves the same
+- `keep handoff <session-id> --pane <pane-id> --account <target-id> [--force]` moves the same
   conversation between two accounts of the same provider, after verifying it is settled: no
-  running tools, background work, draft, question or permission dialog.
+  running tools, background work, draft, question or permission dialog. `--force` is Owner's
+  own transfer, the same as the console button: the source is closed and killed without that
+  verification. Pass it only when Owner asked for the move himself.
 - `keep transfer <source-session-id> --account <target-id> --context <handoff.md> [--cwd
   <worktree>] [--prepare-only]` starts a fresh conversation, on any account or provider,
   from a prose-only package. The source stays intact and must be linked to a card. An
