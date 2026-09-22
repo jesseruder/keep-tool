@@ -1389,6 +1389,12 @@ function createHost(options = {}) {
       }
       case 'kill': {
         const pane = needPane(params.pane);
+        // A caller that names the process it inspected must not signal a replacement.
+        if (params.expectedPid !== undefined && pane.pty.pid !== params.expectedPid) {
+          const error = new Error('Pane process changed; nothing signalled');
+          error.code = 'guard_rejected';
+          throw error;
+        }
         if (pane.alive) pane.pty.kill(params.signal || 'SIGTERM');
         return { result: { pane: publicPane(pane) } };
       }

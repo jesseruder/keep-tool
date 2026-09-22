@@ -11414,12 +11414,29 @@ test('an Owner-forced restart closes and kills a busy session and resumes it wit
       'without Owner behind it the same session is refused');
     assert.equal(state.calls.includes('kill'), false);
 
-    const result = await restartSession(body, deps({ ownerForce: true }));
+    const result = await restartSession(body, deps({ ownerForce: true, onExitEnter: () => state.calls.push('exit-mark') }));
     assert.equal(result.ok, true);
+    assert.ok(state.calls.indexOf('exit-mark') >= 0 && state.calls.indexOf('exit-mark') < state.calls.indexOf('kill'),
+      'the stop is journalled before anything is signalled, so recovery can prove it');
     assert.equal(result.pid, 99);
     assert.ok(state.calls.indexOf('graceful') < state.calls.indexOf('kill'), 'a graceful close is tried before the signal');
     assert.equal(state.replace.meta.accountId, 'claude-two');
     assert.match(state.replace.args[1], /'--resume' 'busy'/);
+
+    // The pane relaunched between the last process snapshot and the close: the new
+    // process is someone else's, and nothing may be closed or signalled.
+    Object.assign(state, { alive: true, calls: [], signals: [] });
+    let snapshots = 0;
+    const relaunched = deps({ ownerForce: true, forceRows: async () => {
+      if (++snapshots === 2) state.pid = 20;
+      return [{ pid: 10, ppid: 1, pidStart: 'shell-start', args: '-zsh' }, agentRow];
+    } });
+    const get = relaunched.host.request;
+    relaunched.host = { request: async (type, params) => type === 'get' && state.pid === 20
+      ? { pane: { ...pane(), pid: 20, createdAt: 'relaunched' } } : get(type, params) };
+    await assert.rejects(restartSession(body, relaunched), /Pane changed since it was inspected|Pane changed/);
+    assert.equal(state.calls.includes('kill'), false);
+    assert.deepEqual(state.signals, []);
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });
 

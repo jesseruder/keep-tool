@@ -696,6 +696,7 @@ async function run(body, deps = {}) {
     }
     requireNoLaterActivity(body, inspected?.session);
     if (current && force) current.force = true;
+    if (current && ownerForce) current.ownerForce = true;
     if (current && current.status !== 'recovery-needed') {
       Object.assign(current, { status: 'recovery-needed', reason: `Handoff interrupted during ${current.phase || 'an unknown phase'}` });
       writeOne(root, current);
@@ -771,8 +772,9 @@ async function run(body, deps = {}) {
         if (!targetWasStaged) {
           if (agent === 'claude') providerArtifacts.preflight(session.id, source, target, { root, env });
           Object.assign(current, { status: 'copying', phase: 'copying-artifacts' }); writeOne(root, current);
+          // Only Owner's own transfer skips the artifact proof; a queue entry's legacy force never does.
           const copiedPlan = copyProviderArtifacts(providerArtifacts, agent, session.id, source, target, current.id,
-            { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force: current.force === true });
+            { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force: current.ownerForce === true });
           if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
           current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
           writeOne(root, current);
@@ -837,7 +839,7 @@ async function run(body, deps = {}) {
       const error = new Error(current.reason); error.status = 409; error.extra = safe(current); throw error;
     }
     let artifactPlan;
-    try { artifactPlan = providerArtifacts.preflight(session.id, source, target, { root, env, force }); }
+    try { artifactPlan = providerArtifacts.preflight(session.id, source, target, { root, env, force: ownerForce }); }
     catch (error) { error.status = 409; throw error; }
     const resumeSpec = resumeSpecFor(session.id, agent, artifactPlan, deps);
     const resumeCwd = agent === 'codex' ? codexResumeCwd(resumeSpec) : session.project || pane.cwd;
@@ -876,8 +878,11 @@ async function run(body, deps = {}) {
     // nothing about this one.
     delete current.sourceExitEnterAt;
     delete current.sourceExitTypedAt;
+    // A new stop attempt is forced only if this request is Owner's own; an earlier forced
+    // attempt on the same record says nothing about this one.
+    if (!ownerForce) delete current.ownerForce;
     Object.assign(current, { status: 'stopping', phase: 'stopping-source', reason: '', cwd: resumeCwd,
-      pid: pane.pid, cols: pane.cols, rows: pane.rows, ...(force ? { force: true } : {}),
+      pid: pane.pid, cols: pane.cols, rows: pane.rows, ...(force ? { force: true } : {}), ...(ownerForce ? { ownerForce: true } : {}),
       // Which handoff, if any, launched the pane this transaction is about to stop — the
       // post-hoc stop proof tells that history from a relaunch after this point.
       sourcePaneHandoffTransactionId: pane.meta?.handoffTransactionId || null,
@@ -899,7 +904,7 @@ async function run(body, deps = {}) {
       if (type !== 'replace-exited') return baseHost.request(type, params);
       Object.assign(current, { status: 'copying', phase: 'copying-artifacts', sourceStopVerifiedAt: Date.now() }); writeOne(root, current);
       const copiedPlan = copyProviderArtifacts(providerArtifacts, agent, session.id, source, target, current.id,
-        { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force });
+        { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force: ownerForce });
       if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
       current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
       writeOne(root, current);

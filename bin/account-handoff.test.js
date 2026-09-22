@@ -484,7 +484,8 @@ test('an ordinary transfer asks the artifact plan and the stop for their proofs'
     d.artifactProvider = { ...provider, preflight: (...args) => { seen.preflight = args[3]?.force; return provider.preflight(...args); } };
     const restart = d.restartSession;
     d.restartSession = (body, options) => { seen.ownerForce = options.ownerForce; return restart(body, options); };
-    assert.equal((await handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d)).status, 'done');
+    // A queue entry's legacy force skips uncertain background evidence at the stop, never the artifact proof.
+    assert.equal((await handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two', force: true }, d)).status, 'done');
     assert.deepEqual(seen, { preflight: false, ownerForce: false });
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });

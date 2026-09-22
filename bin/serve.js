@@ -6302,6 +6302,11 @@ function forceStopDeps(entry, deps, host, save) {
       sleep: deps.sleep,
       getPane: async id => {
         const pane = (await host('get', { pane: id })).pane;
+        // Only the captured pane instance may be closed: a pane relaunched since the
+        // process snapshot is someone else's, and manualClose would adopt its pid.
+        if (pane && (pane.pid !== entry.pid || pane.createdAt !== entry.original.createdAt)) {
+          throw Error('Pane changed since it was inspected; nothing closed');
+        }
         // SessionEnd can clear the conversation link before the owning login
         // shell exits. Normalize only this exact captured pane instance.
         return pane?.id === entry.pane && pane.pid === entry.pid && pane.createdAt === entry.original.createdAt
@@ -6309,7 +6314,7 @@ function forceStopDeps(entry, deps, host, save) {
           ? { ...pane, meta: { ...pane.meta, agent: entry.original.agent, sessionId: entry.sessionId } } : pane;
       },
       graceful: request => (deps.closeIdleSession || closeIdleSession)(request, { ...deps, closePolicy: { manual: true }, withInjectionLock: fn => fn() }),
-      signal: (pane, signal) => host('kill', { pane, signal }),
+      signal: (pane, signal) => host('kill', { pane, signal, expectedPid: entry.pid }),
     }),
     signal: deps.forceSignal || (async (pid, signal) => { try { process.kill(pid, signal); } catch (e) { if (e.code !== 'ESRCH') throw e; } }),
     sessionLive: async sid => (await liveSessionPids({ ...deps, agentProcessRows: rows })).has(sid),
@@ -6322,7 +6327,10 @@ function forceStopDeps(entry, deps, host, save) {
 async function forceStopThenResume({ session, pane, identity, resume }, deps = {}) {
   const host = (type, params) => hostRequest(type, params, deps);
   const entry = { sessionId: session.id, pane: pane.id, pid: pane.pid, mode: 'force', token: crypto.randomUUID() };
-  const stop = forceStopDeps(entry, deps, host, async () => {});
+  // Committing to the close is this stop's Enter: journalled the same way, so an account
+  // handoff that loses the daemon between the kill and the relaunch can still prove the
+  // stop after the fact (dead pane, that exact agent process gone) and recover.
+  const stop = forceStopDeps(entry, deps, host, async () => { if (entry.phase === 'closing') await deps.onExitEnter?.(); });
   return require('./force-restart').run(entry, {
     ...stop,
     // The process the caller verified, and no other, is the one stopped.

@@ -77,6 +77,17 @@ test('replace-exited preserves pane identity and refuses live or stale processes
   });
 });
 
+test('a kill naming the pid it inspected refuses a replacement process', async () => {
+  await withHost({}, async ({ client }) => {
+    const { pane } = await client.request('spawn', { cmd: process.execPath, args: ['-e', 'setInterval(()=>{},1000)'],
+      meta: { agent: 'codex', sessionId: 'kill-pid' } });
+    await assert.rejects(client.request('kill', { pane: pane.id, expectedPid: pane.pid + 1 }), /process changed; nothing signalled/);
+    assert.equal((await client.request('get', { pane: pane.id })).pane.alive, true);
+    await client.request('kill', { pane: pane.id, signal: 'SIGKILL', expectedPid: pane.pid });
+    await waitFor(async () => !(await client.request('get', { pane: pane.id })).pane.alive, 'guarded kill by pid');
+  });
+});
+
 test('guarded kill atomically refuses stale input and output counts', async () => {
   await withHost({}, async ({ client }) => {
     const script = "process.on('SIGTERM',()=>{});process.stdin.setRawMode(true);process.stdin.on('data',()=>setTimeout(()=>process.stdout.write('late'),300));process.stdout.write('ready');setInterval(()=>{},1000)";
