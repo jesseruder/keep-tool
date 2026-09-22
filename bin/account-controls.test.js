@@ -68,6 +68,20 @@ test('a verified pre-stop Codex interruption keeps the portable continuation exp
   assert.match(html, /Start fresh continuation/);
 });
 
+test('an interrupted transfer offers Abandon only when the daemon says nothing was stopped', () => {
+  const handoff = { id: 'tx-1', sessionId: 's', pane: 'p', sourceAccountId: 'codex-main',
+    targetAccountId: 'codex-two', status: 'recovery-needed' };
+  const render = (extra) => context.handoffControls(fixture({ sessions: [{ id: 's', kind: 'codex', accountId: 'codex-main' }],
+    panes: [{ id: 'p', alive: true, meta: { agent: 'codex', sessionId: 's', accountId: 'codex-main' } }],
+    handoffs: [{ ...handoff, ...extra }] }), 's', 'p');
+  assert.match(render({ abandonAvailable: true }), /data-handoff-abandon="tx-1"[^>]*>Abandon</);
+  assert.doesNotMatch(render({}), /data-handoff-abandon/);
+  // Once abandoned, the ordinary controls come back with no failure alert.
+  const after = render({ status: 'failed', phase: 'abandoned', reason: 'Transfer abandoned by Owner' });
+  assert.doesNotMatch(after, /Transfer failed|data-handoff-abandon/);
+  assert.match(after, /data-handoff-account="codex-two"/);
+});
+
 test('recovery remains actionable when the original session and account metadata are missing', () => {
   const ctx = fixture({ sessions: [], panes: [], handoffs: [{ sessionId: 's', targetAccountId: 'claude-two', status: 'recovery-needed', reason: 'launch failed' }] });
   const html = context.handoffControls(ctx, 's', 'p');

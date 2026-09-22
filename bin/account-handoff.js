@@ -116,6 +116,16 @@ function portableFallbackCandidate(entry) {
     && !entry.sourceStopVerifiedAt && !entry.targetLaunchStartedAt
     && !entry.deliveryStartedAt && !entry.deliveredAt);
 }
+// An interrupted transfer Owner may drop, leaving the session where it is. Only one
+// that never reached the stop qualifies: nothing was typed into the source (no /exit
+// Enter committed), nothing proves it exited, and no target was staged or launched.
+// Past any of those the session is half-moved and Retry is the only way out.
+function abandonCandidate(entry) {
+  return Boolean(entry && entry.status === 'recovery-needed'
+    && ['preflight', 'stopping-source'].includes(entry.phase)
+    && !entry.sourceStopVerifiedAt && entry.sourceExitEnterAt == null
+    && !entry.targetLaunchStartedAt && !entry.deliveryStartedAt && !entry.deliveredAt);
+}
 // The stop proof, taken after the fact. The transaction writes sourceStopVerifiedAt
 // itself at the moment the restart hands it the exited pane (replace-exited); a typed
 // /exit that succeeded while a later host call timed out never gets there, and the
@@ -189,6 +199,7 @@ function safe(entry) {
   return {
     ...Object.fromEntries(keys.filter((key) => entry[key] != null).map((key) => [key, entry[key]])),
     ...(portableFallbackCandidate(entry) ? { portableFallbackAvailable: true } : {}),
+    ...(abandonCandidate(entry) ? { abandonAvailable: true } : {}),
     ...(entry.phase === 'portable-fallback' && entry.portableFallbackAt ? { portableFallbackAt: entry.portableFallbackAt } : {}),
   };
 }
@@ -1048,6 +1059,38 @@ async function abandonForPortable(body, deps = {}) {
   } finally { active.delete(body.sessionId); }
 }
 
+// Owner's "leave it where it is" for an interrupted transfer (see abandonCandidate).
+// The source was never stopped and nothing was staged, so there is nothing to undo:
+// the record goes terminal, and a queued retry of the same move is cancelled with it
+// so the queue does not re-drive what Owner just dropped. The source need not be live;
+// if it died on its own the console offers Reopen on the source account as usual.
+function abandon(body, deps = {}) {
+  const root = deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+  if (!/^[A-Za-z0-9_-]+$/.test(String(body?.sessionId || ''))
+      || !/^[A-Za-z0-9_-]+$/.test(String(body?.transactionId || ''))) {
+    const error = new Error('Expected exact session and handoff transaction'); error.status = 400; throw error;
+  }
+  if (active.has(body.sessionId)) {
+    const error = new Error('The account handoff is still running'); error.status = 409; throw error;
+  }
+  const current = readOne(root, body.sessionId);
+  if (!current || current.id !== body.transactionId || current.transactionId !== body.transactionId
+      || current.sessionId !== body.sessionId || !abandonCandidate(current)) {
+    const error = new Error('This transfer got past stopping the session; retry it instead'); error.status = 409; throw error;
+  }
+  const authority = accounts.authority(root)[body.sessionId];
+  if (authority && (authority.accountId !== current.sourceAccountId || authority.stagedAccountId)) {
+    const error = new Error('Source account authority changed after the account handoff'); error.status = 409; throw error;
+  }
+  const queue = deps.queue || require('./handoff-queue');
+  const queued = queue.readOne(root, body.sessionId);
+  if (queued && ['queued', 'parked'].includes(queued.status)) queue.cancel(root, body.sessionId, { log: deps.log });
+  Object.assign(current, { status: 'failed', phase: 'abandoned', abandonedAt: Date.now(),
+    reason: `Transfer abandoned by Owner; the session stays on ${current.sourceAccountId || 'its account'}` });
+  writeOne(root, current);
+  return { ok: true, ...safe(current) };
+}
+
 function abandonedForPortable(root, sessionId) {
   const entry = readOne(root, sessionId);
   return entry?.status === 'failed' && entry.phase === 'portable-fallback' && entry.portableFallbackAt
@@ -1055,5 +1098,5 @@ function abandonedForPortable(root, sessionId) {
       sourceOwnsPane: entry.sourceOwnsPane === true } : null;
 }
 
-module.exports = { run, abandonForPortable, abandonedForPortable, list, readOne, safe, authPreflight, permissionClass,
+module.exports = { run, abandon, abandonForPortable,abandonedForPortable, list, readOne, safe, authPreflight, permissionClass,
   loginShellOutput, classifyRefusal, transferInFlight, CONTINUATION_TEXT };

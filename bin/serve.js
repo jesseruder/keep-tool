@@ -2563,7 +2563,7 @@ const HOST_PANES_SLOW_REUSE_MS = 10 * 60e3;
 // every other write (project icons, UI debug, terminal profiles, keys) waits out the
 // background rebuild throttle. Mirrors STATE_MUTATIONS in web/app/api.js.
 const URGENT_DASHBOARD_MUTATIONS = new Set([
-  '/api/abandon-account-handoff', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
+  '/api/abandon-account-handoff', '/api/abandon-transfer', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
   '/api/close-idle', '/api/close-session', '/api/compact', '/api/decisions/judge',
   '/api/handoff-queue-cancel', '/api/handoff-rate-limited', '/api/handoff-session', '/api/inbox-card',
   '/api/mark-session', '/api/notifications', '/api/open', '/api/panes/spawn',
@@ -11967,6 +11967,10 @@ async function handoffSessionRequest(body, deps = {}) {
   return await queueRefusedHandoff(request, result, requestedAt, deps) || result;
 }
 
+function abandonTransfer(body, deps = {}) {
+  return require('./account-handoff').abandon(body, { ...deps, root: deps.root || keep.ROOT });
+}
+
 async function abandonAccountHandoff(body, deps = {}) {
   const root = deps.root || keep.ROOT;
   return require('./account-handoff').abandonForPortable(body, {
@@ -13376,7 +13380,7 @@ function start(deps = {}) {
     ATTENTION_KINDS, InjectionError, MOBILE_VIEWS,
     TURN_INDEX_BUDGET_BYTES, TURN_INDEX_BUDGET_MS, TURN_INDEX_PRUNE_LIMIT, WATCHER_CONCURRENCY,
     WATCHER_TURNS_PER_TICK, WATCHER_WINDOW_MS,
-    abandonAccountHandoff, accounts, addHostSessionState, agentProcessRows, announceStateNote,
+    abandonAccountHandoff, abandonTransfer, accounts, addHostSessionState, agentProcessRows, announceStateNote,
     answerSession, attentionAckKey, attentionAckName, buildState, cancelQueuedHandoff, cardUsage, closeEphemeralPane,
     closeIdleSession, codex, compactSessionById, companionSnapshot, consoleState, daemonRestartGate,
     dashboardDetail, deliverCheckToThread, deliverUnblockToThread, discord, driftWakeFromVerdict,
@@ -13741,6 +13745,7 @@ module.exports = {
   transcriptFileForSession,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,
+  abandonTransfer,
   handoffQueueSessions, handoffPolicySessions, handoffQueueTick, handoffRateLimited, cancelQueuedHandoff, handoffSessionRequest,
   queueRefusedHandoff,
   listPortableTransfers, inspectPortableSource, portableTerminalRateLimitEvidence,

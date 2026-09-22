@@ -140,8 +140,11 @@ export function handoffControls(ctx, sessionId, paneId) {
     && current?.id === handoff.sourceAccountId
     ? `<button class="btn" data-portable-fallback="${ctx.esc(handoff.id || handoff.transactionId || '')}">Start fresh continuation</button>` : '';
   if (handoff?.status === 'recovery-needed') {
-    // Every click is already forced (see ownerForce below), so Retry is the only button.
-    return `${parked}<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">${openOnly ? 'Reopen interrupted' : 'Transfer interrupted'}</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>${fallback}`;
+    // Every click is already forced (see ownerForce below), so Retry never needs a
+    // second variant. Abandon appears only while the daemon says nothing was stopped.
+    const abandon = handoff.abandonAvailable
+      ? `<button class="btn" data-handoff-abandon="${ctx.esc(handoff.id || handoff.transactionId || '')}" title="Drop this transfer and leave the session on ${ctx.esc(labelForAccountId(ctx, handoff.sourceAccountId))}">Abandon</button>` : '';
+    return `${parked}<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">${openOnly ? 'Reopen interrupted' : 'Transfer interrupted'}</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>${abandon}${fallback}`;
   }
   if (handoff?.status === 'done' && current?.id !== handoff.targetAccountId) {
     return `${parked}<span class="handoff-status" role="status">Verifying ${openOnly ? 'reopen on' : 'transfer to'} ${ctx.esc(targetLabel)}…</span>`;
@@ -152,8 +155,9 @@ export function handoffControls(ctx, sessionId, paneId) {
     return `${parked}<span class="handoff-status" role="status">${openOnly ? 'Opening on' : 'Continuing on'} ${ctx.esc(targetLabel)}…</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>`;
   }
 
-  const error = handoff?.status === 'failed'
-    ? `<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">${openOnly ? 'Reopen failed' : 'Transfer failed'}</span>` : '';
+  // A transfer Owner abandoned is not a failure to report; the ordinary controls return.
+  const error = handoff?.status === 'failed' && handoff.phase !== 'abandoned'
+    ?`<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">${openOnly ? 'Reopen failed' : 'Transfer failed'}</span>` : '';
   const destinations = handoffDestinations(ctx, session, pane);
   const bulk = bulkHandoffHTML(ctx, session, pane);
   if (!current || !destinations.length) return `${parked}${error}`;
@@ -217,6 +221,16 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
         ctx.toast('Queued transfer cancelled.');
         await ctx.reload();
       } catch (error) { ctx.toast(`Not cancelled: ${error.message}`); }
+    }, ctx);
+  });
+  container.querySelectorAll('[data-handoff-abandon]').forEach((button) => {
+    once(button, async () => {
+      try {
+        const result = await write('/api/abandon-transfer', { sessionId, transactionId: button.dataset.handoffAbandon }, 'POST',
+          { label: 'Abandoning transfer' });
+        ctx.toast(`Transfer abandoned; the session stays on ${labelForAccountId(ctx, result.sourceAccountId)}.`);
+        await ctx.reload();
+      } catch (error) { ctx.toast(`Not abandoned: ${error.message}`); }
     }, ctx);
   });
   container.querySelectorAll('[data-portable-fallback]').forEach((button) => {

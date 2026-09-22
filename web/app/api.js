@@ -3,7 +3,7 @@ import './shared/state-delta.js';
 const { applyConsoleDelta } = globalThis.KeepStateDelta;
 const WRITE_HEADERS = { 'content-type': 'application/json' };
 const STATE_MUTATIONS = new Set([
-  '/api/abandon-account-handoff', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
+  '/api/abandon-account-handoff', '/api/abandon-transfer', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
   '/api/close-idle', '/api/close-session', '/api/compact', '/api/decisions/judge',
   '/api/handoff-queue-cancel', '/api/handoff-rate-limited', '/api/handoff-session', '/api/inbox-card',
   '/api/mark-session', '/api/notifications', '/api/open', '/api/panes/spawn',

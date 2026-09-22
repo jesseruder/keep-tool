@@ -15,7 +15,7 @@ function routes(ctx) {
   const {
     // serve.js internals
     ATTENTION_KINDS, InjectionError, MOBILE_VIEWS,
-    abandonAccountHandoff, accounts, announceStateNote, answerSession, attentionAckKey, attentionAckName,
+    abandonAccountHandoff, abandonTransfer, accounts, announceStateNote, answerSession, attentionAckKey, attentionAckName,
     cancelQueuedHandoff, closeIdleSession, codex, compactSessionById, companionSnapshot, consoleState,
     daemonRestartGate, dashboardDetail, fs, handoffRateLimited, handoffSessionRequest, health, hostRequest,
     inspectReviewQueueLaunch,
@@ -727,6 +727,20 @@ function routes(ctx) {
         if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
         try {
           const result = cancelQueuedHandoff(body);
+          broadcast();
+          return json(res, 200, result);
+        } catch (error) {
+          return json(res, error.status || 500, { error: error.message });
+        }
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/abandon-transfer',
+      handle: async ({ req, res, url, body }) => {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        try {
+          const result = abandonTransfer(body);
           broadcast();
           return json(res, 200, result);
         } catch (error) {

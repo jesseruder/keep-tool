@@ -735,6 +735,47 @@ test('explicit portable fallback abandons only a verified pre-stop transaction w
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('Owner can abandon a transfer that never stopped its source, and it cancels a queued retry', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f, { restartSession: async () => { throw new Error('Waiting for job ledger recovery'); } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /job ledger recovery/);
+    const pending = handoff.list(f.root)[0];
+    assert.equal(pending.abandonAvailable, true);
+    const queue = require('./handoff-queue');
+    queue.enqueue(f.root, { sessionId: f.sid, pane: 'pane-1', sourceAccountId: 'one', targetAccountId: 'two' }, { log: () => {} });
+    assert.throws(() => handoff.abandon({ sessionId: f.sid, transactionId: 'other' }, { root: f.root }), /retry it instead/);
+    const abandoned = handoff.abandon({ sessionId: f.sid, transactionId: pending.id }, { root: f.root, log: () => {} });
+    assert.equal(abandoned.status, 'failed');
+    assert.equal(abandoned.phase, 'abandoned');
+    assert.match(abandoned.reason, /stays on one/);
+    assert.equal(abandoned.abandonAvailable, undefined);
+    assert.equal(abandoned.portableFallbackAvailable, undefined);
+    assert.equal(queue.readOne(f.root, f.sid).status, 'cancelled');
+    assert.equal(d.pane.alive, true);
+    assert.equal(accounts.forSession(f.sid, 'claude', { root: f.root, env: f.env }).id, 'one');
+    assert.throws(() => handoff.abandon({ sessionId: f.sid, transactionId: pending.id }, { root: f.root }), /retry it instead/);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('abandon refuses a transfer that typed its /exit, proved the stop or launched the target', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f, { restartSession: async () => { throw new Error('Waiting for job ledger recovery'); } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d));
+    const pending = handoff.list(f.root)[0];
+    const journal = path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`);
+    const original = fs.readFileSync(journal, 'utf8');
+    for (const extra of [{ sourceExitEnterAt: Date.now() }, { sourceStopVerifiedAt: Date.now() },
+      { targetLaunchStartedAt: Date.now() }, { phase: 'copying-artifacts' }, { status: 'starting' }]) {
+      fs.writeFileSync(journal, JSON.stringify({ ...JSON.parse(original), ...extra }));
+      assert.equal(handoff.list(f.root)[0].abandonAvailable, undefined, JSON.stringify(extra));
+      assert.throws(() => handoff.abandon({ sessionId: f.sid, transactionId: pending.id }, { root: f.root }),
+        (error) => error.status === 409 && /retry it instead/.test(error.message), JSON.stringify(extra));
+    }
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('a source agent the preflight could not name refuses the transfer before anything is journalled', async () => {
   const f = fixture();
   try {
