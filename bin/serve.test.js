@@ -12739,10 +12739,13 @@ test('a late hand choice retired under the lock is not overwritten by another re
     // the file then holds a value no compare-and-swap can tell from the daemon's.
     let settings = 'claude-opus-5[1m]';
     let bLooks = 0;
+    const pickAt = Date.parse('2026-09-04T12:03:00Z'); // during pass 1, before pass 2's snapshot
     const calls = [];
     const deps = { ...compactRestoreDeps(dir, a, calls),
       scanSessions: () => [a, b], transcriptFileForSession: (session) => session.id, stderr: () => {},
-      compactSwapUserModelChoice: (_record, transcript) => (transcript === b.id && ++bLooks >= 2
+      // Like the real reader, a scan that starts after the pick does not see it.
+      compactSwapUserModelChoice: (_record, transcript, options = {}) => (transcript === b.id && ++bLooks >= 2
+        && !(options.since > pickAt)
         ? { model: 'claude-opus-5[1m]', reason: '/model claude-opus-5[1m] was chosen after the swap' } : null),
       readClaudeSettingsModel: () => ({ ok: true, present: true, value: settings }),
       repairClaudeSettingsModel: (value) => { settings = value; return { changed: true }; },
@@ -12824,4 +12827,52 @@ test('the restore busy checks read the whole viewport of a tall pane', async () 
       ? (count == null ? typedTall : typedTall.split('\n').slice(-count).join('\n')) : BOX(''); } }), /started a turn/);
   assert.equal(harness.inputs.includes('\r'), false);
   assert.ok(lines.includes(null), 'the guarded confirmation reads the whole viewport');
+});
+
+// ---- review round 7 ----
+
+test('a hand pick made while the restore is typed is not overwritten by the settings snapshot', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-snapshot-choice-'));
+  const clock = Date.parse('2026-09-04T12:05:00Z');
+  const modelCommand = (args, atMs) => JSON.stringify({ type: 'user', timestamp: new Date(atMs).toISOString(), message: { content: [{ type: 'text',
+    text: `<command-name>/model</command-name><command-message>model</command-message><command-args>${args}</command-args>` }] } });
+  const out = (text, atMs) => JSON.stringify({ type: 'system', subtype: 'local_command', timestamp: new Date(atMs).toISOString(),
+    content: `<local-command-stdout>${text}</local-command-stdout>` });
+  try {
+    const a = { id: 'session-a', kind: 'claude', model: 'claude-opus-5', endedTurn: true, mtime: clock - 60e3 };
+    const b = { id: 'session-b', kind: 'claude', model: 'claude-sonnet-5', endedTurn: true, mtime: clock - 3600e3 };
+    const aTranscript = path.join(dir, 'a.jsonl');
+    const bTranscript = path.join(dir, 'b.jsonl');
+    fs.writeFileSync(aTranscript, '');
+    fs.writeFileSync(bTranscript, '');
+    const file = writeCompactSwapFixture(dir, a.id, { switchModel: 'claude-opus-5[1m]' });
+    // The shared default holds Sonnet — a person's value, which the snapshot keeps.
+    let settings = 'claude-sonnet-5';
+    const writes = [];
+    const run = (pickInB) => sweepPendingCompactSwaps({ ...compactRestoreDeps(dir, a, []), now: () => clock,
+      scanSessions: () => [a, b], stderr: () => {},
+      transcriptFileForSession: (session) => (session.id === a.id ? aTranscript : bTranscript),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: settings }),
+      repairClaudeSettingsModel: (value) => { writes.push(value); settings = value; return { changed: true }; },
+      typeAndSubmit: async (_target, command) => {
+        settings = command.slice('/model '.length); // A's restore saves Fable 1M as the default…
+        if (pickInB) { // …and while it is confirmed, B's person picks exactly that model.
+          fs.writeFileSync(bTranscript, `${[modelCommand('claude-fable-5-1[1m]', clock + 500),
+            out('Set model to Fable 5.1 (1M context)', clock + 500)].join('\n')}\n`);
+          b.mtime = clock + 500;
+          settings = 'claude-fable-5-1[1m]';
+        }
+      } });
+    await run(true);
+    assert.equal(fs.existsSync(file), false, 'A was restored');
+    assert.deepEqual(writes, [], 'the stale Sonnet snapshot is not written over B\'s pick');
+    assert.equal(settings, 'claude-fable-5-1[1m]');
+    // Without the pick, the restore's own write is undone to the snapshot as before.
+    writeCompactSwapFixture(dir, a.id, { switchModel: 'claude-opus-5[1m]' });
+    fs.writeFileSync(bTranscript, '');
+    b.mtime = clock - 3600e3;
+    settings = 'claude-sonnet-5';
+    await run(false);
+    assert.deepEqual(writes, ['claude-sonnet-5']);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

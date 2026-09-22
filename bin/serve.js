@@ -4186,22 +4186,21 @@ async function sweepPendingCompactSwaps(deps = {}) {
           && !codexCompact.isCodexCompactSwap(other) && compactSwapSettingsFile(other, deps) === settingsFile)) {
         return 'another pending model restore shares it';
       }
-      const at = compactSwapRecordAt(record);
-      const choiceIn = (session) => {
-        if (session.id === record.sessionId) return userChoice(record, session);
-        const own = records.find((other) => other.sessionId === session.id && !other.error
-          && !codexCompact.isCodexCompactSwap(other)) || null;
-        try {
-          return (deps.compactSwapUserModelChoice || compactSwapUserModelChoice)(record, transcriptFor(session),
-            { since: at, daemon: own, assistant: false });
-        } catch { return null; }
-      };
-      if ((sessions || []).some((session) => session && session.kind === 'claude'
-          && !(Number(session.mtime) < at) && choiceIn(session))) {
-        return 'a model was chosen by hand since the swap';
-      }
-      return '';
+      return handChoiceSince(record, compactSwapRecordAt(record), sessions) ? 'a model was chosen by hand since the swap' : '';
     };
+    // Whether any live session (in `sessionList`, whose transcript moved since `since`)
+    // shows a model chosen by hand since then. The record's own session exempts only its
+    // own daemon rows (its switch and restores); any other session exempts only its own
+    // pending record's rows, or none, and every other confirmed /model there counts.
+    const handChoiceSince = (record, since, sessionList) => (sessionList || []).some((session) => {
+      if (!session || session.kind !== 'claude' || Number(session.mtime) < since) return false;
+      const own = session.id === record.sessionId ? undefined
+        : records.find((other) => other.sessionId === session.id && !other.error && !codexCompact.isCodexCompactSwap(other)) || null;
+      try {
+        return Boolean((deps.compactSwapUserModelChoice || compactSwapUserModelChoice)(record, transcriptFor(session),
+          own === undefined ? { since } : { since, daemon: own, assistant: false }));
+      } catch { return false; }
+    });
     const leftAsIs = (record, why) => process.stderr.write(`keep serve: left settings.json as-is for ${sessionRef(record.sessionId) || 'unknown'}'s model restore: ${why}\n`);
     // Crash recovery: a compaction that died between its switch and its repair left the
     // account's default on the compaction model. Repaired here even when its session
@@ -4351,6 +4350,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
           }
           if (inputBaseline === null) return null;
           const before = readSettings(settingsFile);
+          const beforeAt = now();
           const restoreModel = String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim();
           // Only after the restore was actually typed (a pass that retired or refused first
           // wrote nothing), and only to undo exactly what the restore's own /model wrote —
@@ -4373,6 +4373,17 @@ async function sweepPendingCompactSwaps(deps = {}) {
               leftAsIs(record, refusal);
             }
             if (present && String(value || '').toLowerCase() === restoreModel.toLowerCase()) return;
+            // The snapshot is from before the restore was typed. A person who picked a model
+            // anywhere since — the restore's own model included — saved it as the default,
+            // and writing the snapshot back would undo that. Read fresh: the pass's session
+            // list predates the restore. A second of slack for rows stamped as it was taken.
+            let live = null;
+            try { live = scan(); } catch {}
+            if (!live) { leftAsIs(record, 'live sessions could not be read to check for a hand-picked model'); return; }
+            if (handChoiceSince(record, beforeAt - 1000, live)) {
+              leftAsIs(record, 'a model was chosen by hand while the restore was typed');
+              return;
+            }
             const repaired = repairSettings(value, present, settingsFile);
             noteSettingsRepair(record, repaired);
             if (repaired.error) {
