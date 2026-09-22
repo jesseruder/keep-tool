@@ -1286,3 +1286,61 @@ test('a tell reads its target through one reader after the first read', async ()
     assert.match(pins[1].codexFile, new RegExp(`${id}\\.jsonl$`));
   } finally { f.cleanup(); }
 });
+
+test('a tell to a named session is never answered from a cached miss; only a prefix guess is', async () => {
+  const { claudeSessionFor, forgetClaudeSessionMisses, noteHostPaneSessions } = require('./serve.js');
+  const f = transcriptFixture();
+  try {
+    // `keep open X --fresh`: a state build looks X up before its transcript exists and
+    // records a miss (allowCachedMiss, as the build's resolver passes it).
+    const fresh = crypto.randomUUID();
+    assert.equal(claudeSessionFor(fresh, { root: f.root, allowCachedMiss: true }), null);
+    f.claude(fresh);
+    // The miss is still cached: a build would still answer null from it...
+    assert.equal(claudeSessionFor(fresh, { root: f.root, allowCachedMiss: true }), null);
+    // ...but `keep tell X` a moment later reads X exactly, and delivers.
+    const sent = [];
+    const deps = fixtureDeps(f.root, {
+      listTellSessions: () => assert.fail('a full id is not listed'),
+      watcherSend: async (request) => { sent.push(request.sessionId); return {}; },
+    });
+    const result = await tellSession({ sessionId: fresh, text: 'ping' }, deps);
+    assert.equal(result.sessionId, fresh);
+    assert.deepEqual(sent, [fresh]);
+
+    // A card's linked id is named too, and read the same way.
+    const linked = crypto.randomUUID();
+    assert.equal(claudeSessionFor(linked, { root: f.root, allowCachedMiss: true }), null);
+    f.claude(linked);
+    const byCard = await tellSession({ taskId: 'fresh-card', text: 'ping' }, fixtureDeps(f.root, {
+      loadTask: () => ({ id: 'fresh-card', fm: { sessions: [{ id: linked }] } }),
+    }));
+    assert.equal(byCard.sessionId, linked);
+
+    // A value that is not a full id is a guess tried exactly before the listing: that
+    // read may take the cached miss, which is what spares it a walk of every project
+    // directory. Here the transcript exists under that very name, and the cached miss
+    // still answers, so the listing (empty) decides.
+    const guess = `g${crypto.randomUUID().replace(/-/g, '').slice(0, 11)}`;
+    assert.equal(claudeSessionFor(guess, { root: f.root, allowCachedMiss: true }), null);
+    f.claude(guess);
+    let listed = 0;
+    const guessDeps = fixtureDeps(f.root, { listTellSessions: () => { listed += 1; return []; } });
+    await assert.rejects(tellSession({ sessionId: guess, text: 'ping' }, guessDeps),
+      (error) => error.status === 400 && error.message === 'bad session id');
+    assert.equal(listed, 1);
+    // Once the miss is gone the same guess reads the transcript exactly.
+    forgetClaudeSessionMisses(guess);
+    assert.equal((await tellSession({ sessionId: guess, text: 'ping' }, guessDeps)).sessionId, guess);
+
+    // And a guess is never answered from a miss while a live pane names the id. The
+    // pane is noted first (which forgets any older miss), then a miss recorded after it.
+    const hosted = `h${crypto.randomUUID().replace(/-/g, '').slice(0, 11)}`;
+    noteHostPaneSessions([{ id: `pane-${hosted}`, pid: 4242, createdAt: 'fixture', alive: true, meta: { sessionId: hosted } }]);
+    assert.equal(claudeSessionFor(hosted, { root: f.root, allowCachedMiss: true }), null);
+    f.claude(hosted);
+    const hostedResult = await tellSession({ sessionId: hosted, text: 'ping' },
+      fixtureDeps(f.root, { listTellSessions: () => assert.fail('the exact read found it') }));
+    assert.equal(hostedResult.sessionId, hosted);
+  } finally { f.cleanup(); }
+});

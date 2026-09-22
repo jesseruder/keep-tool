@@ -12853,7 +12853,17 @@ function tellSessions(dry, deps = {}) {
 // the rollout file. A tell reads its target up to five times (the decision, three
 // re-checks inside the lock, and sendToSession's own load), and every read after the
 // first goes straight to that agent's reader instead of trying the others again.
-function loadTellSession(id, deps = {}, pin = null) {
+//
+// `options.allowCachedMiss` lets the Claude read answer from a miss recorded in the
+// last 45 s instead of walking every project directory again. A session the tell
+// names — a full id, a card's linked id — is always read exactly: `keep open X
+// --fresh` makes a pane, a state build looks X up before its transcript exists and
+// records a miss, and a `keep tell X --wait` a few seconds later must see the
+// transcript that has appeared since, not "bad session id". Only the speculative
+// reads pass it (resolveTellTarget: a prefix tried as an exact id before the listing,
+// a numeral tried as a literal id), and even then a miss is ignored while a live
+// host pane names the id.
+function loadTellSession(id, deps = {}, pin = null, options = {}) {
   const sessionId = String(id || '');
   if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return null;
   const root = deps.root || keep.ROOT;
@@ -12874,13 +12884,10 @@ function loadTellSession(id, deps = {}, pin = null) {
   let session = null;
   for (const kind of order) {
     try {
-      // allowCachedMiss: an id whose Claude lookup missed in the last 45 s is taken
-      // as still missing, so a bad id, a prefix's exact miss or a stale number does
-      // not walk every project directory again on each try. The cost is that a
-      // transcript created inside those 45 s reads as "bad session id" until the
-      // miss expires, unless a pane for it appeared (noteHostPaneSessions forgets
-      // the miss then); the sender retries, nothing is typed wrongly.
-      if (kind === 'claude') session = claudeSessionFor(sessionId, { root, interactiveOnly: true, allowCachedMiss: true });
+      if (kind === 'claude') {
+        session = claudeSessionFor(sessionId, { root, interactiveOnly: true,
+          allowCachedMiss: options.allowCachedMiss === true && !hostPaneAliveFor(sessionId) });
+      }
       else if (kind === 'codex') session = codexFleetSession(sessionId, pin);
       else session = pi.sessionFor(sessionId, { root });
     } catch { session = null; }
@@ -12899,6 +12906,14 @@ function loadTellSession(id, deps = {}, pin = null) {
   sessionMarks.apply([session], { root });
   sessionNumbers.assign([session], { root, readOnly: true });
   return session;
+}
+
+// Whether the last host pane list this daemon saw had a live pane for the session
+// (noteHostPaneSessions records one signature per session, ending in its alive
+// flag). A synchronous read of what is already known, for the loader's guard.
+function hostPaneAliveFor(sessionId) {
+  const signature = hostPaneSessionSignatures.get(String(sessionId || ''));
+  return typeof signature === 'string' && signature.endsWith('\0true');
 }
 
 // codex.sessionFor keeps exec (headless) rollouts, because an explicitly hosted one
@@ -12953,10 +12968,21 @@ function tellRowSource(dry, deps = {}) {
     if (!pins.has(id)) pins.set(id, {});
     return pins.get(id);
   };
+  // A speculative read (`{ speculative: true }`) may answer from a cached Claude
+  // miss; it is kept apart from the exact reads so a cached null can never stand in
+  // for an exact read of the same id later in the tell.
+  const guessed = new Map();
   return {
     scanned: false,
-    row: (id) => {
-      if (!loaded.has(id)) loaded.set(id, load(id, deps, pinFor(id)) || null);
+    row: (id, { speculative = false } = {}) => {
+      if (loaded.has(id)) return loaded.get(id);
+      if (speculative) {
+        if (!guessed.has(id)) guessed.set(id, load(id, deps, pinFor(id), { allowCachedMiss: true }) || null);
+        const row = guessed.get(id);
+        if (row) loaded.set(id, row);
+        return row;
+      }
+      loaded.set(id, load(id, deps, pinFor(id)) || null);
       return loaded.get(id);
     },
     peek: (id) => loaded.get(id) || null,
@@ -12981,6 +13007,11 @@ function tellRowSource(dry, deps = {}) {
 // directory for an id no transcript has. Such a session is still reachable by its
 // full id whenever #12 belongs to another session; real ids are UUIDs, so this is
 // a corner nobody has yet.
+//
+// Which exact reads are speculative (see loadTellSession): a numeral read as a
+// literal id, and a value that is not a full id, tried exactly before it is matched
+// as a prefix. A full id is a UUID, or any id with an account record; those name a
+// session and are read without a cached miss.
 function resolveTellTarget(value, source, deps = {}) {
   if (deps.resolveSessionId || source.scanned) {
     return (deps.resolveSessionId || resolveSessionId)(value, { ...deps, scanSessions: () => source.list() });
@@ -12995,7 +13026,11 @@ function resolveTellTarget(value, source, deps = {}) {
     if (row) return row;
     if (!idShaped) throw new InjectionError(400, 'bad session id');
   }
-  const exact = source.row(wanted);
+  let fullId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(wanted);
+  if (!fullId && !number) {
+    try { fullId = fs.existsSync(accounts.authorityFile(deps.root || keep.ROOT, wanted)); } catch {}
+  }
+  const exact = source.row(wanted, { speculative: !fullId });
   if (exact) return exact;
   if (number || wanted.length < 8) throw new InjectionError(400, 'bad session id');
   const matches = source.list().filter((candidate) => candidate && String(candidate.id || '').startsWith(wanted));
