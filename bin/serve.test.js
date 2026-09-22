@@ -9945,7 +9945,7 @@ test('different-account reopen serializes source opening and starts one open-onl
         currentTurn = { ...currentTurn, contextTokens: 180000, usageAt: originalUsageAt + 1000 };
         return { pane: 'source-pane' }; },
       handoffSession: async (body) => { handoffs++; assert.deepEqual(body, {
-        sessionId: session.id, pane: 'source-pane', accountId: 'target', intent: 'open-only',
+        sessionId: session.id, pane: 'source-pane', accountId: 'target', intent: 'open-only', ownerForce: true,
       }); return { ok: true, status: 'done', pane: body.pane, intent: body.intent }; },
     };
     const first = reopenSessionOnAccount({ sessionId: session.id, accountId: 'target' }, deps);
