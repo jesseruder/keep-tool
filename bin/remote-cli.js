@@ -51,6 +51,10 @@ function nodeApiRequest(base, pathname, { method = 'POST', payload, token, timeo
       port: url.port,
       path: pathname,
       method,
+      // A connection of its own: a kept-alive socket the daemon has since closed
+      // (its idle timeout, a restart) fails the request with nothing received,
+      // which would cost a ping and a wait to recover from.
+      agent: false,
       headers: {
         'x-keep': '1',
         'x-keep-node-token': token,

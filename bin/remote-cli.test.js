@@ -105,6 +105,18 @@ test('a lost answer is resent with the same key once the daemon answers its ping
   assert.equal(daemon.requests[0].body.idempotencyKey, daemon.requests[2].body.idempotencyKey);
 });
 
+test('each request to the daemon opens its own connection', async (t) => {
+  const { nodeApiRequest } = require('./remote-cli.js');
+  let connections = 0;
+  const probe = http.createServer((req, res) => { res.end('{}'); });
+  probe.on('connection', () => { connections += 1; });
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  t.after(() => probe.close());
+  const url = `http://127.0.0.1:${probe.address().port}`;
+  for (let i = 0; i < 3; i += 1) assert.equal((await nodeApiRequest(url, '/api/registry/ping', { method: 'GET', token: 't' })).status, 200);
+  assert.equal(connections, 3, 'no kept-alive socket the daemon may since have closed is reused');
+});
+
 // A daemon restarting under a check-in: the post finds nothing listening, and the
 // ping answers only after a while. The check-in is resent once, with its key, once
 // the daemon is back — never once per wait.
