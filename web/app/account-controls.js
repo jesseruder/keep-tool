@@ -120,6 +120,13 @@ export function handoffDestinations(ctx, session, pane) {
     && account.agent === current.agent && account.handoffSupported === true);
 }
 
+// Offered only while the daemon says the transfer never touched the session: an
+// interrupted one, or a working record a daemon restart orphaned (abandonCandidate).
+function abandonButtonHTML(ctx, handoff) {
+  return handoff?.abandonAvailable
+    ? `<button class="btn" data-handoff-abandon="${ctx.esc(handoff.id || handoff.transactionId || '')}" title="Drop this transfer and leave the session on ${ctx.esc(labelForAccountId(ctx, handoff.sourceAccountId))}">Abandon</button>` : '';
+}
+
 export function handoffControls(ctx, sessionId, paneId) {
   const session = (ctx.data.sessions || []).find((candidate) => candidate.id === sessionId);
   const pane = (ctx.data.panes || []).find((candidate) => candidate.id === paneId);
@@ -142,8 +149,7 @@ export function handoffControls(ctx, sessionId, paneId) {
   if (handoff?.status === 'recovery-needed') {
     // Every click is already forced (see ownerForce below), so Retry never needs a
     // second variant. Abandon appears only while the daemon says nothing was stopped.
-    const abandon = handoff.abandonAvailable
-      ? `<button class="btn" data-handoff-abandon="${ctx.esc(handoff.id || handoff.transactionId || '')}" title="Drop this transfer and leave the session on ${ctx.esc(labelForAccountId(ctx, handoff.sourceAccountId))}">Abandon</button>` : '';
+    const abandon = abandonButtonHTML(ctx, handoff);
     return `${parked}<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">${openOnly ? 'Reopen interrupted' : 'Transfer interrupted'}</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>${abandon}${fallback}`;
   }
   if (handoff?.status === 'done' && current?.id !== handoff.targetAccountId) {
@@ -152,7 +158,7 @@ export function handoffControls(ctx, sessionId, paneId) {
   if (handoff && !['done', 'failed', 'recovery-needed'].includes(handoff.status)) {
     // Retrying the same transaction joins a live request, or resumes its durable
     // journal after a daemon crash. Do not strand a persisted in-flight status.
-    return `${parked}<span class="handoff-status" role="status">${openOnly ? 'Opening on' : 'Continuing on'} ${ctx.esc(targetLabel)}…</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>`;
+    return `${parked}<span class="handoff-status" role="status">${openOnly ? 'Opening on' : 'Continuing on'} ${ctx.esc(targetLabel)}…</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>${abandonButtonHTML(ctx, handoff)}`;
   }
 
   // A transfer Owner abandoned is not a failure to report; the ordinary controls return.

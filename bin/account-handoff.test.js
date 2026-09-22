@@ -744,7 +744,7 @@ test('Owner can abandon a transfer that never stopped its source, and it cancels
     assert.equal(pending.abandonAvailable, true);
     const queue = require('./handoff-queue');
     queue.enqueue(f.root, { sessionId: f.sid, pane: 'pane-1', sourceAccountId: 'one', targetAccountId: 'two' }, { log: () => {} });
-    assert.throws(() => handoff.abandon({ sessionId: f.sid, transactionId: 'other' }, { root: f.root }), /retry it instead/);
+    assert.throws(() => handoff.abandon({ sessionId: f.sid, transactionId: 'other' }, { root: f.root }), /no longer the session's latest transfer/);
     const abandoned = handoff.abandon({ sessionId: f.sid, transactionId: pending.id }, { root: f.root, log: () => {} });
     assert.equal(abandoned.status, 'failed');
     assert.equal(abandoned.phase, 'abandoned');
@@ -754,7 +754,37 @@ test('Owner can abandon a transfer that never stopped its source, and it cancels
     assert.equal(queue.readOne(f.root, f.sid).status, 'cancelled');
     assert.equal(d.pane.alive, true);
     assert.equal(accounts.forSession(f.sid, 'claude', { root: f.root, env: f.env }).id, 'one');
-    assert.throws(() => handoff.abandon({ sessionId: f.sid, transactionId: pending.id }, { root: f.root }), /retry it instead/);
+    // A retried click whose first write landed gets the same result, not a refusal.
+    assert.equal(handoff.abandon({ sessionId: f.sid, transactionId: pending.id }, { root: f.root }).phase, 'abandoned');
+    // And a later transfer is a fresh transaction, not a resumption of the dropped one.
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /job ledger recovery/);
+    assert.notEqual(handoff.readOne(f.root, f.sid).id, pending.id);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('abandon waits out a running transfer, refuses a staged target, and takes an orphaned stop', async () => {
+  const f = fixture();
+  try {
+    let release;
+    const d = deps(f, { restartSession: () => new Promise((_resolve, reject) => { release = () => reject(new Error('Waiting for job ledger recovery')); }) });
+    const running = handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    while (!release) await new Promise((resolve) => setImmediate(resolve));
+    const live = handoff.readOne(f.root, f.sid);
+    assert.equal(live.status, 'stopping');
+    assert.throws(() => handoff.abandon({ sessionId: f.sid, transactionId: live.id }, { root: f.root }), /still running/);
+    release();
+    await assert.rejects(running);
+    const journal = path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`);
+    const interrupted = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    // A 'stopping' record a daemon restart orphaned: abandonable once past the working grace.
+    fs.writeFileSync(journal, JSON.stringify({ ...interrupted, status: 'stopping', updatedAt: Date.now() }));
+    assert.equal(handoff.list(f.root)[0].abandonAvailable, undefined, 'a fresh working record may still be moving');
+    fs.writeFileSync(journal, JSON.stringify({ ...interrupted, status: 'stopping', updatedAt: Date.now() - 16 * 60e3 }));
+    assert.equal(handoff.list(f.root)[0].abandonAvailable, true);
+    accounts.stageSession(f.sid, 'two', interrupted.id, { root: f.root, env: f.env });
+    assert.throws(() => handoff.abandon({ sessionId: f.sid, transactionId: interrupted.id }, { root: f.root }), /already staged/);
+    accounts.clearStaged(f.sid, interrupted.id, { root: f.root });
+    assert.equal(handoff.abandon({ sessionId: f.sid, transactionId: interrupted.id }, { root: f.root, log: () => {} }).phase, 'abandoned');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
@@ -767,7 +797,9 @@ test('abandon refuses a transfer that typed its /exit, proved the stop or launch
     const journal = path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`);
     const original = fs.readFileSync(journal, 'utf8');
     for (const extra of [{ sourceExitEnterAt: Date.now() }, { sourceStopVerifiedAt: Date.now() },
-      { targetLaunchStartedAt: Date.now() }, { phase: 'copying-artifacts' }, { status: 'starting' }]) {
+      { forcedProcesses: [{ pid: 12, pidStart: 'helper-start' }] }, { forcedCaptureIncomplete: true },
+      { targetLaunchStartedAt: Date.now() }, { deliveryStartedAt: Date.now() }, { deliveredAt: Date.now() },
+      { phase: 'copying-artifacts' }, { status: 'starting', updatedAt: 0 }]) {
       fs.writeFileSync(journal, JSON.stringify({ ...JSON.parse(original), ...extra }));
       assert.equal(handoff.list(f.root)[0].abandonAvailable, undefined, JSON.stringify(extra));
       assert.throws(() => handoff.abandon({ sessionId: f.sid, transactionId: pending.id }, { root: f.root }),

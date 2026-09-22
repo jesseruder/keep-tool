@@ -117,13 +117,21 @@ function portableFallbackCandidate(entry) {
     && !entry.deliveryStartedAt && !entry.deliveredAt);
 }
 // An interrupted transfer Owner may drop, leaving the session where it is. Only one
-// that never reached the stop qualifies: nothing was typed into the source (no /exit
-// Enter committed), nothing proves it exited, and no target was staged or launched.
-// Past any of those the session is half-moved and Retry is the only way out.
-function abandonCandidate(entry) {
-  return Boolean(entry && entry.status === 'recovery-needed'
-    && ['preflight', 'stopping-source'].includes(entry.phase)
+// that never reached the stop qualifies: no /exit Enter committed, no process of the
+// session signalled by an earlier forced attempt, nothing proving it exited, and no
+// target staged or launched. Past any of those the session is half-moved and Retry is
+// the only way out. (A refused stop can still leave an untaken-back /exit draft in the
+// composer; the journal does not record that, so Owner should glance at the pane.)
+// A working 'stopping' record past the working grace is one a daemon restart orphaned
+// before run() could rewrite it to recovery-needed; it qualifies on the same marks.
+function abandonCandidate(entry, now = Date.now()) {
+  if (!entry || !['preflight', 'stopping-source'].includes(entry.phase)) return false;
+  const interrupted = entry.status === 'recovery-needed'
+    || entry.status === 'stopping' && !fresh(entry, now, WORKING_GRACE_MS);
+  return Boolean(interrupted
     && !entry.sourceStopVerifiedAt && entry.sourceExitEnterAt == null
+    && !(Array.isArray(entry.forcedProcesses) && entry.forcedProcesses.length)
+    && entry.forcedCaptureIncomplete !== true
     && !entry.targetLaunchStartedAt && !entry.deliveryStartedAt && !entry.deliveredAt);
 }
 // The stop proof, taken after the fact. The transaction writes sourceStopVerifiedAt
@@ -1075,12 +1083,18 @@ function abandon(body, deps = {}) {
   }
   const current = readOne(root, body.sessionId);
   if (!current || current.id !== body.transactionId || current.transactionId !== body.transactionId
-      || current.sessionId !== body.sessionId || !abandonCandidate(current)) {
+      || current.sessionId !== body.sessionId) {
+    const error = new Error('This is no longer the session\'s latest transfer'); error.status = 409; throw error;
+  }
+  // A click retried after its first write landed finds its own result.
+  if (current.status === 'failed' && current.phase === 'abandoned') return { ok: true, ...safe(current) };
+  if (!abandonCandidate(current)) {
     const error = new Error('This transfer got past stopping the session; retry it instead'); error.status = 409; throw error;
   }
-  const authority = accounts.authority(root)[body.sessionId];
-  if (authority && (authority.accountId !== current.sourceAccountId || authority.stagedAccountId)) {
-    const error = new Error('Source account authority changed after the account handoff'); error.status = 409; throw error;
+  // Abandon writes no authority, so only a staged target (a transfer past its stop)
+  // matters here; a source pin from this transaction or elsewhere stays as it is.
+  if (accounts.authority(root)[body.sessionId]?.stagedAccountId) {
+    const error = new Error('A target account is already staged for this session; retry the transfer instead'); error.status = 409; throw error;
   }
   const queue = deps.queue || require('./handoff-queue');
   const queued = queue.readOne(root, body.sessionId);
@@ -1098,5 +1112,5 @@ function abandonedForPortable(root, sessionId) {
       sourceOwnsPane: entry.sourceOwnsPane === true } : null;
 }
 
-module.exports = { run, abandon, abandonForPortable,abandonedForPortable, list, readOne, safe, authPreflight, permissionClass,
+module.exports = { run, abandon, abandonForPortable, abandonedForPortable, list, readOne, safe, authPreflight, permissionClass,
   loginShellOutput, classifyRefusal, transferInFlight, CONTINUATION_TEXT };

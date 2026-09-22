@@ -76,6 +76,9 @@ test('an interrupted transfer offers Abandon only when the daemon says nothing w
     handoffs: [{ ...handoff, ...extra }] }), 's', 'p');
   assert.match(render({ abandonAvailable: true }), /data-handoff-abandon="tx-1"[^>]*>Abandon</);
   assert.doesNotMatch(render({}), /data-handoff-abandon/);
+  // A working record a daemon restart orphaned keeps Retry and gains Abandon.
+  assert.match(render({ status: 'stopping', abandonAvailable: true }), /Continuing on.*Retry.*data-handoff-abandon="tx-1"/s);
+  assert.doesNotMatch(render({ status: 'stopping' }), /data-handoff-abandon/);
   // Once abandoned, the ordinary controls come back with no failure alert.
   const after = render({ status: 'failed', phase: 'abandoned', reason: 'Transfer abandoned by Owner' });
   assert.doesNotMatch(after, /Transfer failed|data-handoff-abandon/);
