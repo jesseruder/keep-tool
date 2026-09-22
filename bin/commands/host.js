@@ -452,8 +452,14 @@ commands.pane = async (argv, deps = {}) => {
     } else if (subcommand === 'gc') {
       const o = parseArgs(rest, { 'dry-run': 'bool', days: 'str', max: 'str' });
       if (o._.length) die('usage: keep pane gc [--dry-run] [--days N] [--max N]');
-      // The daemon's retention sweep, run now: the same plan, against this node's
-      // own host (the daemon node's socket), so another node's panes never appear.
+      // The daemon's retention sweep, run now: the same plan, against this machine's
+      // own host socket, so another node's panes never appear. Only on the daemon
+      // node: the handoff records, restart entries and delivery journals the guards
+      // read live in the daemon's registry, and a node reading its own would see
+      // none of them and could remove a pane a daemon-side handoff resumes into.
+      if (!(deps.isDaemonNode || nodesApi.isDaemonNode)()) {
+        die(`keep pane gc runs on the daemon node (${nodesApi.daemonNode()}), whose records its guards read; this is ${nodesApi.localNode()}`);
+      }
       const retention = require('../pane-retention.js');
       const limits = {};
       if (o.days != null) limits.days = hostNumber(o.days, '--days');

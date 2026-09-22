@@ -2539,24 +2539,30 @@ are that node's to keep), and it is a `claude`, `codex`, `pi` or shell pane — 
 pane launched with no agent counts as a shell. A candidate is removed when it exited
 more than `KEEP_PANE_RETENTION_DAYS` days ago (default 7), or when there are more
 than `KEEP_PANE_RETENTION_MAX` exited candidates (default 60), oldest first down to
-the cap. The cap never takes a pane that exited within the last hour: that can be a
-restart between stopping the agent and relaunching it. A sweep removes at most
+the cap. Nothing that exited within the last hour is removed, whichever limit asked:
+that can be a restart between stopping the agent and relaunching it. A sweep removes at most
 `KEEP_PANE_RETENTION_BATCH` panes (default 25), one host request at a time, and
 leaves the rest for the next hour; a remove the host refuses is logged and decided
 again next time.
 
 It never removes a pane that something still needs: a session marked keep-running,
 an account handoff that has not reached `done` or `failed` (a handoff resumes into
-the exited pane itself), a queued transfer, a pending compaction swap, or an unsent
-delivery journal for that pane (the send path settles those). If any of those
-records cannot be read, the sweep removes nothing and says which one in its health
-row. The `pane-retention` row reads like `removed 3 of 41 exited (aged 2, over cap
-1), kept 5 (handoff 1, keep-running 4)`.
+the exited pane itself), a queued transfer, an unfinished restart (a force restart
+waiting in recovery-needed for Recover, which needs that exact pane), a pending
+compaction swap, or an unsent delivery journal for that pane (the send path settles
+those). Nor a pane someone has on screen. A graceful Claude exit turns its pane into
+a shell with no session, so only the guards that name the pane itself protect it:
+handoffs, queued transfers, restarts and delivery journals match by pane as well as
+by session; keep-running and compaction swaps match by session only. If any of those
+records cannot be read, the sweep removes nothing and its health row turns red,
+naming the record. The `pane-retention` row reads like `removed 3 of 41 exited
+(aged 2, over cap 1), kept 5 (handoff 1, keep-running 4)`.
 
 `keep pane gc --dry-run` prints the same decisions against the live pane list —
 `remove <pane> <agent> exited <date> <reason>` or `keep <pane> <reason>` — without
 removing anything; without `--dry-run` it removes them all at once, with no batch
-limit. `--days N` and `--max N` override the two limits for that run. Set
+limit. `--days N` and `--max N` override the two limits for that run. It runs only
+on the daemon node, whose registry holds the records the guards read. Set
 `KEEP_PANE_RETENTION=0` to disable the sweep.
 
 ## Fleet reviewer

@@ -87,6 +87,9 @@ test('every guard spares its pane with its own reason', () => {
     'handoff by pane': (pane) => guards({ handoffPanes: new Set([pane.id]) }),
     'handoff by session': (pane) => guards({ handoffSessions: new Set([pane.meta.sessionId]) }),
     'queued-transfer': (pane) => guards({ queued: new Set([pane.meta.sessionId]) }),
+    'queued-transfer by pane': (pane) => guards({ queuedPanes: new Set([pane.id]) }),
+    'restart by pane': (pane) => guards({ restartPanes: new Set([pane.id]) }),
+    'restart by session': (pane) => guards({ restartSessions: new Set([pane.meta.sessionId]) }),
     compaction: (pane) => guards({ compaction: new Set([pane.meta.sessionId]) }),
     'delivery by pane': (pane) => guards({ deliveryPanes: new Set([pane.id]) }),
     'delivery by unreadable journal': (pane) => guards({
@@ -169,7 +172,7 @@ function harness(options = {}) {
     record: (name, row) => rows.push([name, row]),
     write: (line) => lines.push(line),
     onChange: () => { changes += 1; },
-    readers: { compactSwaps: () => [], deliveries: () => [] },
+    readers: { compactSwaps: () => [], deliveries: () => [], ...options.readers },
     setTimeout: (fn, ms) => { timers.push(['first', ms]); return {}; },
     setInterval: (fn, ms) => { timers.push(['every', ms]); return {}; },
   });
@@ -256,4 +259,89 @@ test('keep pane gc runs the same plan, and --dry-run removes nothing', async () 
   } finally {
     console.log = log;
   }
+});
+
+test('a pane someone is viewing is kept', () => {
+  const pane = exited(9, { agent: 'claude', sessionId: sid() }, { visibleAttached: 1 });
+  const hidden = exited(9, { agent: 'claude', sessionId: sid() }, { visibleAttached: 0 });
+  const result = retention.plan([pane, hidden], { env, now: NOW, guards: guards() });
+  assert.deepEqual(removedIds(result), [hidden.id]);
+  assert.equal(result.kept[0].reason, 'viewed');
+});
+
+test('a zero-day window still never takes a pane that exited within the hour', () => {
+  const justNow = exited(10 / (24 * 60)); // ten minutes ago
+  const earlier = exited(2 / 24); // two hours ago
+  const result = retention.plan([justNow, earlier], { env: { ...env, KEEP_PANE_RETENTION_DAYS: '0' }, now: NOW, guards: guards() });
+  assert.deepEqual(removedIds(result), [earlier.id]);
+  assert.deepEqual(result.kept.map((entry) => [entry.pane, entry.reason]), [[justNow.id, 'recent']]);
+});
+
+// A graceful Claude exit leaves {agent: 'shell', sessionId: null} on the pane
+// (bin/commands/hook.js releaseSessionPane), so only a guard naming the pane holds it.
+test('a demoted pane is held by pane-keyed guards and not by session-keyed ones', () => {
+  const session = sid();
+  const byPane = {
+    handoff: { handoffPanes: (p) => new Set([p.id]) },
+    'queued-transfer': { queuedPanes: (p) => new Set([p.id]) },
+    restart: { restartPanes: (p) => new Set([p.id]) },
+    delivery: { deliveryPanes: (p) => new Set([p.id]) },
+  };
+  for (const [reason, [[key, make]]] of Object.entries(byPane).map(([r, o]) => [r, Object.entries(o)])) {
+    const pane = exited(9, { agent: 'shell', sessionId: null });
+    const result = retention.plan([pane], { env, now: NOW, guards: guards({ [key]: make(pane) }) });
+    assert.deepEqual(result.kept.map((entry) => entry.reason), [reason], reason);
+  }
+  const bySession = ['keepRunning', 'compaction', 'handoffSessions', 'queued', 'restartSessions'];
+  for (const key of bySession) {
+    const pane = exited(9, { agent: 'shell', sessionId: null });
+    const result = retention.plan([pane], { env, now: NOW, guards: guards({ [key]: new Set([session]) }) });
+    assert.deepEqual(removedIds(result), [pane.id], `${key} cannot see a demoted pane`);
+  }
+});
+
+test('an unfinished restart in session-restarts.json holds its pane and session', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pane-retention-'));
+  const file = path.join(root, '.keep', 'session-restarts.json');
+  const [interrupted, finished] = [sid(), sid()];
+  const [interruptedPane, finishedPane] = [id(), id()];
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  // What a daemon that died mid force-restart leaves behind; session-restart.js turns
+  // it into recovery-needed when the next manager loads it, and saves the file itself.
+  fs.writeFileSync(file, JSON.stringify([
+    { sessionId: interrupted, pane: interruptedPane, pid: 101, mode: 'force', status: 'restarting', at: NOW,
+      token: crypto.randomUUID(), original: { agent: 'claude', cwd: path.join(root, 'project') } },
+    { sessionId: finished, pane: finishedPane, pid: 102, mode: 'now', status: 'done', at: Date.now() },
+  ]) + '\n');
+  const manager = require('./session-restart.js').createManager({ file, inspect: async () => ({}), restart: async () => ({}) });
+  assert.equal(manager.snapshot().find((entry) => entry.sessionId === interrupted).status, 'recovery-needed');
+  const g = retention.readGuards(root, { compactSwaps: () => [], deliveries: () => [] });
+  assert.deepEqual(g.failures, []);
+  assert.ok(g.restartPanes.has(interruptedPane) && g.restartSessions.has(interrupted));
+  assert.ok(!g.restartPanes.has(finishedPane) && !g.restartSessions.has(finished), 'a done restart holds nothing');
+  const demoted = { ...exited(9, { agent: 'shell', sessionId: null }), id: interruptedPane };
+  const other = exited(9);
+  assert.deepEqual(removedIds(retention.plan([demoted, other], { env, now: NOW, guards: g })), [other.id]);
+  fs.writeFileSync(file, '{"not": "a list"}');
+  assert.deepEqual(retention.readGuards(root, { compactSwaps: () => [], deliveries: () => [] }).failures.map((f) => f.reader), ['restarts']);
+});
+
+test('a guard that cannot be read turns the health row red and removes nothing', async () => {
+  const h = harness({ panes: [exited(9)], readers: { restarts: () => { throw new Error('bad json'); } } });
+  const outcome = await h.scheduler.tick();
+  assert.equal(outcome.ok, false);
+  assert.deepEqual(h.requests, []);
+  assert.equal(h.rows[0][1].ok, false);
+  assert.equal(h.rows[0][1].error, 'could not read restarts');
+  assert.equal(h.rows[0][1].detail, 'removed 0 of 1 exited, kept 1 (unreadable 1); could not read restarts (bad json)');
+});
+
+test('keep pane gc refuses to run off the daemon node', async () => {
+  const { commands } = require('./commands/host.js');
+  let listed = false;
+  const client = { request: async () => { listed = true; return { panes: [] }; }, close() {} };
+  await assert.rejects(commands.pane(['gc', '--dry-run'], {
+    connectHost: async () => client, root: fs.mkdtempSync(path.join(os.tmpdir(), 'pane-retention-')), isDaemonNode: () => false,
+  }), /runs on the daemon node/);
+  assert.equal(listed, false);
 });

@@ -15,9 +15,19 @@
 // removes a pane only when it is old or the pile is over a cap, and never while
 // something in Keep still names it: a keep-running session, an account handoff
 // in flight (resumeExitedAccountHandoff resumes into the exited pane itself), a
-// queued transfer, a pending compaction swap, or an unsent delivery journal (a
-// journal whose pane the host stops listing is retired by delivery reconcile, and
-// that decision belongs to the send path, not to this sweep).
+// queued transfer, an unfinished restart (a force restart parked in
+// recovery-needed waits, with no time limit, for Owner to click Recover, and
+// Recover needs that exact pane), a pending compaction swap, or an unsent
+// delivery journal (a journal whose pane the host stops listing is retired by
+// delivery reconcile, and that decision belongs to the send path, not to this
+// sweep). Nor while a viewer has it on screen.
+//
+// Some guards key on the pane and some on the session, and the difference
+// matters: a graceful Claude exit demotes its pane to a shell with no session id
+// (bin/commands/hook.js releaseSessionPane), so a session-keyed guard can never
+// match that pane. By pane: handoff, queued transfer, restart, delivery. By
+// session: handoff, queued transfer, restart, compaction, keep-running, and an
+// unreadable delivery journal (whose file name is the session's hash).
 //
 // `plan` is pure so `keep pane gc --dry-run` and the tests can ask what the
 // daemon would do without a host.
@@ -29,16 +39,20 @@ const nodes = require('./nodes.js');
 const AGENTS = new Set(['claude', 'codex', 'pi', 'shell']);
 const DAY_MS = 24 * 3600e3;
 const DEFAULTS = Object.freeze({ days: 7, max: 60, batch: 25 });
-// The cap may take a pane that exited minutes ago. A pane that young can be the
-// middle of something the guards below do not read — a restart between its stop
-// and its replace-exited, the runs sweep closing its own check pane — so the cap
-// leaves anything exited within the hour for the next sweep.
-const MIN_CAP_AGE_MS = 3600e3;
+// A pane that exited minutes ago can be the middle of something the guards below
+// do not read — a plain restart between its stop and its replace-exited, the runs
+// sweep releasing its own exited check pane — so nothing younger than an hour is
+// removed, whether the cap or a short retention window (`--days 0`) asked.
+const MIN_EXITED_AGE_MS = 3600e3;
 const FIRST_RUN_MS = 10 * 60e3;
 const INTERVAL_MS = 3600e3;
 // Account-handoff statuses after which a record no longer holds its pane.
 const HANDOFF_TERMINAL = new Set(['done', 'failed']);
-const REASON_ORDER = ['handoff', 'queued-transfer', 'compaction', 'delivery', 'keep-running', 'unreadable', 'recent'];
+const REASON_ORDER = ['handoff', 'queued-transfer', 'restart', 'compaction', 'delivery', 'keep-running', 'viewed', 'unreadable', 'recent'];
+// Restart entries still holding their pane (bin/session-restart.js keeps these
+// in the file across daemon restarts; the rest are history).
+const RESTART_UNFINISHED = new Set(['queued', 'restarting', 'recovery-needed']);
+const paneKey = (value) => nodes.parsePaneRef(String(value)).paneId;
 
 function envInt(env, name, fallback) {
   const raw = env[name];
@@ -90,6 +104,15 @@ const defaultReaders = {
       ...unparsedSessions(queue.dir(root), entries).map((sessionId) => ({ sessionId, status: 'unreadable' })),
     ];
   },
+  // session-restart.js's own reader swallows a corrupt file into an empty list,
+  // which here would read as "no restart holds any pane", so this one throws.
+  restarts(root) {
+    let rows;
+    try { rows = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'session-restarts.json'), 'utf8')); }
+    catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+    if (!Array.isArray(rows)) throw new Error('session-restarts.json is not a list');
+    return rows.filter((entry) => entry && RESTART_UNFINISHED.has(entry.status));
+  },
   // serve.js owns the swap-record reader. It is required lazily and only here:
   // the daemon passes its own copy in, and `keep pane gc` is the one caller that
   // loads it this way. An unreadable record comes back carrying its session id.
@@ -109,31 +132,44 @@ const defaultReaders = {
 // see the claims on is a pane it cannot prove unclaimed.
 function readGuards(root, readers = {}) {
   const use = { ...defaultReaders, ...readers };
-  const guards = {
-    keepRunning: new Set(), handoffSessions: new Set(), handoffPanes: new Set(), queued: new Set(),
-    compaction: new Set(), deliveryPanes: new Set(), deliveryJournals: new Set(), failures: [],
-  };
+  const guards = emptyGuards();
   const read = (name, fn) => {
     try { fn(use[name](root)); } catch (error) { guards.failures.push({ reader: name, error: String(error && error.message || error) }); }
   };
   read('keepRunning', (ids) => ids.forEach((id) => guards.keepRunning.add(id)));
   read('handoffs', (entries) => entries.forEach((entry) => {
     if (entry.sessionId) guards.handoffSessions.add(entry.sessionId);
-    if (entry.pane) guards.handoffPanes.add(String(entry.pane));
+    if (entry.pane) guards.handoffPanes.add(paneKey(entry.pane));
   }));
-  read('queue', (entries) => entries.forEach((entry) => { if (entry.sessionId) guards.queued.add(entry.sessionId); }));
+  read('queue', (entries) => entries.forEach((entry) => {
+    if (entry.sessionId) guards.queued.add(entry.sessionId);
+    if (entry.pane) guards.queuedPanes.add(paneKey(entry.pane));
+  }));
+  read('restarts', (entries) => entries.forEach((entry) => {
+    if (entry.sessionId) guards.restartSessions.add(String(entry.sessionId));
+    if (entry.pane) guards.restartPanes.add(paneKey(entry.pane));
+  }));
   read('compactSwaps', (records) => records.forEach((record) => { if (record && record.sessionId) guards.compaction.add(String(record.sessionId)); }));
   read('deliveries', (issues) => issues.forEach((issue) => {
     if (issue.reason === 'journal-unreadable') guards.deliveryJournals.add(issue.journal);
-    else if (issue.pane) guards.deliveryPanes.add(nodes.parsePaneRef(issue.pane).paneId);
+    else if (issue.pane) guards.deliveryPanes.add(paneKey(issue.pane));
   }));
   return guards;
+}
+
+function emptyGuards() {
+  return {
+    keepRunning: new Set(), handoffSessions: new Set(), handoffPanes: new Set(), queued: new Set(), queuedPanes: new Set(),
+    restartSessions: new Set(), restartPanes: new Set(), compaction: new Set(), deliveryPanes: new Set(),
+    deliveryJournals: new Set(), failures: [],
+  };
 }
 
 function protection(pane, sessionId, guards) {
   if (guards.failures.length) return 'unreadable';
   if (guards.handoffPanes.has(pane.id) || (sessionId && guards.handoffSessions.has(sessionId))) return 'handoff';
-  if (sessionId && guards.queued.has(sessionId)) return 'queued-transfer';
+  if (guards.queuedPanes.has(pane.id) || (sessionId && guards.queued.has(sessionId))) return 'queued-transfer';
+  if (guards.restartPanes.has(pane.id) || (sessionId && guards.restartSessions.has(sessionId))) return 'restart';
   if (sessionId && guards.compaction.has(sessionId)) return 'compaction';
   if (guards.deliveryPanes.has(pane.id)) return 'delivery';
   if (sessionId && guards.deliveryJournals.size
@@ -151,8 +187,7 @@ function plan(panes, options = {}) {
     .filter((key) => Number.isFinite(options[key])).map((key) => [key, options[key]])) };
   const now = Number.isFinite(options.now) ? options.now : Date.now();
   const node = options.node || nodes.daemonNode(env);
-  const guards = options.guards || { failures: [], keepRunning: new Set(), handoffSessions: new Set(), handoffPanes: new Set(),
-    queued: new Set(), compaction: new Set(), deliveryPanes: new Set(), deliveryJournals: new Set() };
+  const guards = { ...emptyGuards(), ...options.guards };
   const candidates = [];
   for (const pane of panes || []) {
     if (!pane || typeof pane.id !== 'string' || pane.alive !== false || !pane.exitedAt) continue;
@@ -166,7 +201,8 @@ function plan(panes, options = {}) {
     const exitedMs = Date.parse(pane.exitedAt);
     if (!Number.isFinite(exitedMs)) continue;
     const sessionId = pane.meta && typeof pane.meta.sessionId === 'string' ? pane.meta.sessionId : null;
-    candidates.push({ pane: pane.id, agent, sessionId, exitedAt: pane.exitedAt, exitedMs });
+    candidates.push({ pane: pane.id, agent, sessionId, exitedAt: pane.exitedAt, exitedMs,
+      viewed: Number(pane.visibleAttached) > 0 });
   }
   candidates.sort((a, b) => a.exitedMs - b.exitedMs || (a.pane < b.pane ? -1 : 1));
   const cutoff = now - config.days * DAY_MS;
@@ -177,7 +213,9 @@ function plan(panes, options = {}) {
     if (!aged && !overCap) return { ...candidate, action: 'keep', reason: 'retained' };
     const guarded = protection({ id: candidate.pane }, candidate.sessionId, guards);
     if (guarded) return { ...candidate, action: 'keep', reason: guarded };
-    if (overCap && now - candidate.exitedMs < MIN_CAP_AGE_MS) return { ...candidate, action: 'keep', reason: 'recent' };
+    // Someone has it on screen right now; removing it would blank their view.
+    if (candidate.viewed) return { ...candidate, action: 'keep', reason: 'viewed' };
+    if (now - candidate.exitedMs < MIN_EXITED_AGE_MS) return { ...candidate, action: 'keep', reason: 'recent' };
     remaining -= 1;
     return { ...candidate, action: 'remove', reason: aged ? 'aged' : 'over-cap' };
   });
@@ -254,9 +292,14 @@ function startScheduler(deps = {}) {
       for (const entry of outcome.refused) write(`keep serve: pane retention could not remove ${entry.pane}: ${entry.error}\n`);
       if (outcome.removed.length) write(`keep serve: pane retention removed ${outcome.removed.length} pane(s)\n`);
       const detail = describe(result, outcome);
-      record('pane-retention', { ok: true, detail, cadenceMs: INTERVAL_MS });
+      // A guard that cannot be read stops every removal, so it is a fault to fix,
+      // not a quiet sweep: the row goes red and self-repair can see it.
+      if (result.failures.length) {
+        record('pane-retention', { ok: false, detail, cadenceMs: INTERVAL_MS,
+          error: `could not read ${result.failures.map((failure) => failure.reader).join(', ')}` });
+      } else record('pane-retention', { ok: true, detail, cadenceMs: INTERVAL_MS });
       if (outcome.removed.length) deps.onChange?.();
-      return { ok: true, detail, ...outcome };
+      return { ok: result.failures.length === 0, detail, ...outcome };
     } catch (error) {
       record('pane-retention', { ok: false, error, cadenceMs: INTERVAL_MS });
       write(`keep serve: pane retention failed: ${error.message}\n`);
@@ -272,4 +315,4 @@ function startScheduler(deps = {}) {
   return { tick, first, timer };
 }
 
-module.exports = { plan, apply, describe, readGuards, settings, startScheduler, DEFAULTS, MIN_CAP_AGE_MS, FIRST_RUN_MS, INTERVAL_MS };
+module.exports = { plan, apply, describe, readGuards, settings, startScheduler, DEFAULTS, MIN_EXITED_AGE_MS, FIRST_RUN_MS, INTERVAL_MS };
