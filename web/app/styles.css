@@ -589,7 +589,7 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
    so a short one sits beside its neighbours, and keeps enough width to stay readable. */
 .connection-slot { flex: 1 1 0; min-width: 96px; max-width: max-content; display: flex; }
 .connection-slot[hidden] { display: none; }
-.connection { display: block; min-width: 0; max-width: min(100%, 340px); padding: 4px 8px; border: 1px solid var(--bar-line); border-radius: 12px; color: var(--bar-muted); font: 11px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.connection { display: block; min-width: 0; max-width: 340px; padding: 4px 8px; border: 1px solid var(--bar-line); border-radius: 12px; color: var(--bar-muted); font: 11px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .connection[hidden] { display: none; }
 .connection[data-status="pending"] { color: var(--info); }
 .connection[data-status="reconnecting"], .connection[data-status="stale"], .connection[data-status="degraded"] { color: var(--warn); }

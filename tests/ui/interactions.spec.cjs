@@ -366,6 +366,9 @@ test('a long status chip ellipsizes instead of wrapping the top bar', async ({ p
     expect((await bar.boundingBox()).height).toBe(before);
     const chip = await page.locator('#connection').evaluate(el => ({ scroll: el.scrollWidth, client: el.clientWidth }));
     expect(chip.scroll).toBeGreaterThan(chip.client);
+    const slot = await page.locator('.connection-slot').evaluate(el => el.getBoundingClientRect().width);
+    const chipWidth = await page.locator('#connection').evaluate(el => el.getBoundingClientRect().width);
+    expect(slot - chipWidth).toBeLessThan(1);
     await page.evaluate(() => { const chip = document.querySelector('#connection'); chip.hidden = chip.parentElement.hidden = true; });
   }
 });
