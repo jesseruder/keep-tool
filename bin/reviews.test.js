@@ -76,10 +76,15 @@ function fixture() {
   };
   const card = () => require('./keep.js').parseTask(fs.readFileSync(path.join(root, 'tasks', 'work.md'), 'utf8'), 'work');
   // A command a node posts to the daemon's /api/registry, run by the route's own
-  // subprocess (KEEP_REMOTE_CALLER=aws1, the minimal env) in `cwd`.
+  // subprocess (KEEP_REMOTE_CALLER=aws1, the minimal env) in `cwd` — the project the
+  // node sends, its main checkout. reviewed/reviewing go the way the node's CLI sends
+  // them: --commit and --job resolved in the node's worktree (`from`) as facts.
   let routeKeys = 0;
   let service = null;
-  const viaNode = async (command, args, { cwd = tree, session = null } = {}) => {
+  const viaNode = async (command, args, { cwd = main, from = tree, session = null, raw = false } = {}) => {
+    if (!raw && (command === 'reviewed' || command === 'reviewing')) {
+      args = require('./reviews.js').nodeFactArgs(command, args, { cwd: from, root });
+    }
     if (!service) {
       service = require('./registry-route.js').createRegistryService({
         root,
@@ -446,5 +451,95 @@ test('a node can never attest as human, and a human record written here is uncha
     assert.equal(local.bySession, null);
     const defaulted = require('./reviews.js').cleanBy('', {});
     assert.equal(defaulted, 'human');
+  } finally { f.cleanup(); }
+});
+
+test('a node\'s review record is the local one for the same commits, apart from the node', async () => {
+  const f = fixture();
+  try {
+    f.ok(['add', 'Work', '--status', 'active', '--project', f.tree, '-m', 'Started.'], {}, f.root);
+    f.commit('one');
+    f.commit('two: with a colon, and ünïcode');
+    const args = ['work', '--commit', 'origin/master..HEAD', '--verdict', 'clean', '--by', 'codex sol', '--job', 'task-done-1'];
+    const sent = require('./reviews.js').nodeFactArgs('reviewed', args, { cwd: f.tree, root: f.root });
+    assert.equal(sent.includes('--commit'), false, 'the node sends facts, not the range');
+    assert.equal(sent.filter((arg) => arg === '--fact').length, 2);
+    assert.equal(sent[sent.indexOf('--job-fact') + 1].startsWith('task-done-1:codex-fixture:completed:'), true);
+    const remote = await f.viaNode('reviewed', args);
+    assert.equal(remote.status, 0, remote.stderr);
+    f.ok(['reviewed', ...args]);
+    const [node, local] = require('./reviews.js').readRecords('work', f.root);
+    assert.equal(node.node, 'aws1');
+    const { node: _node, id: _a, at: _b, ...nodeRest } = node;
+    const { id: _c, at: _d, ...localRest } = local;
+    assert.deepEqual(nodeRest, localRest);
+    assert.deepEqual(node.commits.map((commit) => commit.subject), ['one', 'two: with a colon, and ünïcode']);
+    // The node's gate reads it exactly as it reads the local one.
+    assert.equal(f.run(['allow', 'work', 'land']).status, 0);
+
+    // keep reviewing from a node opens an obligation over the same patches, marked with the node.
+    const waiting = await f.viaNode('reviewing', ['work', '--job', 'task-running-1', '--commit', 'origin/master..HEAD', '--json']);
+    assert.equal(waiting.status, 0, waiting.stderr);
+    const obligation = JSON.parse(waiting.stdout);
+    assert.equal(obligation.node, 'aws1');
+    assert.equal(obligation.accountId, 'codex-fixture');
+    assert.deepEqual(obligation.commits, local.commits);
+  } finally { f.cleanup(); }
+});
+
+test('commit and job facts are accepted only from a node, and only well formed', async () => {
+  const f = fixture();
+  try {
+    f.ok(['add', 'Work', '--status', 'active', '--project', f.tree, '-m', 'Started.'], {}, f.root);
+    const sha = f.commit('one');
+    const reviews = require('./reviews.js');
+    const fact = reviews.nodeFactArgs('reviewed', ['work', '--commit', sha], { cwd: f.tree, root: f.root })[2];
+    assert.match(fact, new RegExp(`^${sha}:[0-9a-f]{40}:`));
+
+    // Here, on the daemon's own terminal, facts are nobody's word.
+    const local = f.run(['reviewed', 'work', '--fact', fact, '--verdict', 'findings']);
+    assert.notEqual(local.status, 0);
+    assert.match(local.stderr, /--fact is not accepted here/);
+    const localJob = f.run(['reviewed', 'work', '--commit', sha, '--verdict', 'findings', '--job', 'task-done-1', '--job-fact', `task-done-1:codex-fixture:completed:${new Date().toISOString()}`]);
+    assert.match(localJob.stderr, /--job-fact is not accepted here/);
+    const localObligation = f.run(['reviewing', 'work', '--job', 'task-running-1', '--fact', fact]);
+    assert.match(localObligation.stderr, /--fact is not accepted here/);
+
+    // From a node, --commit is the daemon's checkout, not the node's worktree.
+    const range = await f.viaNode('reviewed', ['work', '--commit', sha, '--verdict', 'findings', '--by', 'opus'], { raw: true });
+    assert.notEqual(range.status, 0);
+    assert.match(range.stderr, /a node sends the commits it resolved in its worktree, not --commit/);
+
+    const subject = (text) => Buffer.from(text, 'utf8').toString('base64url');
+    const refused = async (facts, pattern, extra = []) => {
+      const answer = await f.viaNode('reviewed', ['work', ...facts.flatMap((value) => ['--fact', value]), '--verdict', 'findings', '--by', 'opus', ...extra], { raw: true });
+      assert.notEqual(answer.status, 0, facts.join(' '));
+      assert.match(answer.stderr, pattern);
+    };
+    const patch = 'b'.repeat(40);
+    await refused([`${sha.slice(0, 12)}:${patch}:${subject('x')}`], /is not a full commit id/);
+    await refused([`${'A'.repeat(40)}:${patch}:${subject('x')}`], /is not a full commit id/);
+    await refused([`${sha}:xyz:${subject('x')}`], /is not a patch id/);
+    await refused([`${sha}:${patch}:not base64!`], /is not base64url/);
+    await refused([`${sha}:${patch}:${subject('x')}:extra`], /is not <sha>:<patch-id>:<subject>/);
+    await refused([`${sha}:${patch}`], /is not <sha>:<patch-id>:<subject>/);
+    await refused([`${sha}:${patch}:${subject('x'.repeat(201))}`], /longer than 200 characters/);
+    await refused([`${sha}:${patch}:${subject('a\nb')}`], /line break/);
+    await refused([`${sha}:${patch}:${Buffer.from([0xff, 0xfe]).toString('base64url')}`], /not valid UTF-8/);
+    await refused(Array.from({ length: 201 }, (_, n) => `${n.toString(16).padStart(40, '0')}::`), /at most 200 --fact values/);
+    await refused([fact], /--job-fact is for job task-done-1, not --job other-job/,
+      ['--job', 'other-job', '--job-fact', `task-done-1:codex-fixture:completed:${new Date().toISOString()}`]);
+    await refused([fact], /--job-fact time is not an ISO timestamp/,
+      ['--job', 'task-done-1', '--job-fact', 'task-done-1:codex-fixture:completed:yesterday']);
+    await refused([fact], /--job-fact account is not an account id/,
+      ['--job', 'task-done-1', '--job-fact', `task-done-1:a b:completed:${new Date().toISOString()}`]);
+    await refused([fact], /is running, not completed/,
+      ['--job', 'task-running-1', '--job-fact', `task-running-1:codex-fixture:running:${new Date().toISOString()}`]);
+    assert.equal(reviews.readRecords('work', f.root).length, 0, 'nothing refused was written');
+    // A fact the node hand-types is refused on the node before anything is sent.
+    assert.throws(() => reviews.nodeFactArgs('reviewed', ['work', '--fact', fact], { cwd: f.tree, root: f.root }), /--fact is what keep sends from a node/);
+    // A value that looks like a flag is still the value parseArgs reads it as.
+    assert.deepEqual(reviews.nodeFactArgs('reviewed', ['work', '--evidence', '--commit', '-m', '--commit', '--verdict', 'findings'], { cwd: f.tree, root: f.root }),
+      ['work', '--evidence', '--commit', '-m', '--commit', '--verdict', 'findings']);
   } finally { f.cleanup(); }
 });

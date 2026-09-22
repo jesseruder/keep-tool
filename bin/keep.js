@@ -1574,17 +1574,39 @@ function reviewRecordError(fn) {
   catch (error) { if (error instanceof reviews.ReviewRecordError) die(error.message); throw error; }
 }
 
+// A node's `keep reviewed` / `keep reviewing` arrives with the commits and the job it
+// resolved in its own worktree (reviews.nodeFactArgs) rather than --commit, which the
+// daemon would resolve in its main checkout. Accepted only from a node's request
+// (KEEP_REMOTE_CALLER, set only by /api/registry), and from a node only that way.
+// Returns { commits, job } — each null when not given.
+function nodeFacts(o, reviews) {
+  const remote = process.env.KEEP_REMOTE_CALLER;
+  if (!remote) {
+    if (o.fact) die('--fact is not accepted here');
+    if (o['job-fact']) die('--job-fact is not accepted here');
+    return { commits: null, job: null };
+  }
+  if (o.commit) die('a node sends the commits it resolved in its worktree, not --commit: the daemon cannot see that worktree');
+  if (o['job-fact'] && !o.job) die('--job-fact needs the --job it describes');
+  return {
+    commits: o.fact ? reviews.parseFacts(o.fact) : null,
+    job: o['job-fact'] ? reviews.parseJobFact(o['job-fact'], o.job) : null,
+  };
+}
+
 commands.reviewed = (argv) => {
-  const o = parseArgs(argv, { commit: 'list', verdict: 'str', by: 'str', job: 'str', evidence: 'str', fallback: 'bool', json: 'bool' });
+  const o = parseArgs(argv, { commit: 'list', verdict: 'str', by: 'str', job: 'str', evidence: 'str', fallback: 'bool', json: 'bool', fact: 'list', 'job-fact': 'str' });
   const id = o._[0];
   const usage = 'usage: keep reviewed <card> --commit <sha|range>… --verdict clean|findings [--by codex|opus|claude|human…] [--job <id>] [--evidence "..."] [--fallback] [-m "..."] [--json]';
-  if (!id || o._.length > 1 || !o.commit || !o.verdict) die(usage);
+  const facts = reviewRecordError((reviews) => nodeFacts(o, reviews));
+  if (!id || o._.length > 1 || !(o.commit || facts.commits) || !o.verdict) die(usage);
   const record = reviewRecordError((reviews) => withLock(() => {
     const task = loadTask(id);
     const built = reviews.buildRecord({
       commits: o.commit, verdict: o.verdict, by: o.by, job: o.job, evidence: o.evidence,
       fallback: o.fallback, message: o.m, session: commandSession(),
-    }, reviews.gitDeps(process.cwd()));
+      ...(facts.commits ? { resolvedCommits: facts.commits } : {}),
+    }, reviews.gitDeps(process.cwd()), facts.job ? { jobFact: facts.job } : {});
     reviews.append(id, built);
     const contribution = recordContribution(task);
     // A review of somebody else's card is legitimate — it is the whole point of an
@@ -1648,7 +1670,7 @@ commands['review-route'] = (argv) => {
 // and has not answered yet. The daemon settles it from the job's own state, and until it
 // does, the implicit land grant refuses the commits it covers.
 commands.reviewing = (argv) => {
-  const o = parseArgs(argv, { commit: 'list', job: 'str', account: 'str', by: 'str', drop: 'str', json: 'bool' });
+  const o = parseArgs(argv, { commit: 'list', job: 'str', account: 'str', by: 'str', drop: 'str', json: 'bool', fact: 'list', 'job-fact': 'str' });
   const id = o._[0];
   const usage = 'usage: keep reviewing <card> --job <codex-job-id> --commit <sha|range>… [--account <codex-id>] [--by "codex sol"] [-m "..."] [--json]\n'
     + '       keep reviewing <card> --drop <obligation-id> -m "why"   # stop waiting for a review you are not going to get\n'
@@ -1660,9 +1682,11 @@ commands.reviewing = (argv) => {
     catch (error) { if (error instanceof obligations.ObligationError) die(error.message); throw error; }
   };
   loadTask(id);
+  const facts = reviewRecordError((reviews) => nodeFacts(o, reviews));
+  const named = o.commit || facts.commits;
 
   if (o.drop) {
-    if (o.job || o.commit) die(usage);
+    if (o.job || named) die(usage);
     if (!o.m) die('--drop needs -m "why": an obligation dropped without a reason is a review nobody can tell was skipped');
     // Under the registry lock, because the daemon's sweep is reading and rewriting the
     // same file every five minutes.
@@ -1680,30 +1704,31 @@ commands.reviewing = (argv) => {
     return;
   }
 
-  if (!o.job && !o.commit) {
+  if (!o.job && !named) {
     const records = translating(() => obligations.readRecords(id));
     if (o.json) return console.log(JSON.stringify({ id, obligations: records }, null, 2));
     if (!records.length) return console.log(`${id}: no pending reviews`);
     for (const record of records) console.log(obligations.summaryLine(record));
     return;
   }
-  if (!o.job || !o.commit) die(usage);
+  if (!o.job || !named) die(usage);
 
   const record = translating(() => {
     const reviews = require('./reviews.js');
     let commits;
-    try { commits = reviews.resolveCommits(o.commit, reviews.gitDeps(process.cwd())); }
+    try { commits = facts.commits || reviews.resolveCommits(o.commit, reviews.gitDeps(process.cwd())); }
     catch (error) {
       if (error instanceof reviews.ReviewRecordError) die(error.message);
       throw error;
     }
     // The job must exist before Keep will wait for it: a typo here would become a
     // review nobody is running and a card nobody can land.
-    const job = reviews.resolveJob(o.job, { root: ROOT });
+    const job = facts.job || reviews.resolveJob(o.job, { root: ROOT });
     if (!job) die(`--job "${o.job}" is not a Codex job Keep can find — run keep codex-jobs to see the live ones`);
     const built = obligations.open({
       card: id, job: o.job, accountId: o.account || job.accountId, by: o.by,
       commits, note: o.m, session: commandSession(),
+      ...(process.env.KEEP_REMOTE_CALLER ? { node: process.env.KEEP_REMOTE_CALLER } : {}),
     });
     // Under the registry lock, like every other writer of this file: the daemon's
     // sweep reads and rewrites it every five minutes, and an unlocked append is how a
@@ -3922,7 +3947,12 @@ if (require.main === module) {
       // there. Without KEEP_DAEMON_URL remoteMode is null and nothing here runs.
       const remote = require('./remote-cli.js').remoteMode(process.env);
       if (remote && require('./registry-commands.js').isRegistryCommand(cmd || 'list')) {
-        const result = await require('./remote-cli.js').runRemote(cmd || 'list', rest, { where: remote });
+        // The commits and the Codex job a review names are in this node's worktree and
+        // jobs directory, so they are resolved here and sent as facts.
+        const args = cmd === 'reviewed' || cmd === 'reviewing'
+          ? reviewRecordError((reviews) => reviews.nodeFactArgs(cmd, rest, { cwd: process.cwd(), root: ROOT }))
+          : rest;
+        const result = await require('./remote-cli.js').runRemote(cmd || 'list', args, { where: remote });
         if (result.stdout) process.stdout.write(result.stdout);
         if (result.stderr) process.stderr.write(result.stderr);
         process.exitCode = result.code;

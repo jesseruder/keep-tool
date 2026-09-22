@@ -1017,3 +1017,38 @@ test('no value in a record can throw on its way through the parser', () => {
     assert.equal(allow.decideLand({ records: [], commits: [commit('a'.repeat(40), 'p1')], obligations: [record] }).ok, false);
   } finally { box.cleanup(); }
 });
+
+test('a review another node launched is never failed on the daemon\'s view of its job', () => {
+  const now = Date.now();
+  const opened = obligations.open({ card: 'a-card', job: 'job-42', commits: [commit('a'.repeat(40), 'p1')], node: 'aws1' }, { now: now - 30 * DAY });
+  assert.equal(opened.node, 'aws1');
+  assert.equal(obligations.open({ card: 'a-card', job: 'job-42', commits: [commit('a', 'p')] }).node, undefined, 'a local one carries no node');
+  const record = { ...opened, at: new Date(now - 30 * DAY).toISOString(), stateAt: new Date(now - 30 * DAY).toISOString() };
+  for (const view of [{ job: null }, { job: null, jobUnknown: true }, { job: { status: 'failed' } }, { job: null, live: { state: 'dead' } }]) {
+    assert.equal(obligations.decide(record, { ...view, now }), null, JSON.stringify(view));
+  }
+  // Its verdict settles it, as it settles any other.
+  assert.equal(obligations.decide(record, { job: null, reviewRecords: [{ job: 'job-42', at: new Date(now).toISOString() }], now }).state, 'satisfied');
+
+  const box = fixture();
+  try {
+    box.write('a-card', [record, pending({ id: 'obl-local', job: 'job-gone', at: new Date(now - DAY).toISOString(), stateAt: new Date(now - DAY).toISOString() })]);
+    const looked = [];
+    const deps = {
+      root: box.root, withLock: nolock, now,
+      resolveJob: (job) => { looked.push(job); return null; },
+      readReviews: () => [],
+      liveJobs: new Map([['job-42', { id: 'job-42', state: 'dead', reason: 'a job of the same id here' }]]),
+      checkinTask: () => {},
+    };
+    for (let n = 0; n < 5; n += 1) obligations.settle(deps);
+    const [foreign, local] = box.read('a-card');
+    assert.equal(foreign.state, 'open');
+    assert.equal(foreign.misses, undefined, 'no miss is counted');
+    assert.equal(foreign.node, 'aws1');
+    assert.equal(local.state, 'failed', 'a local job is still looked for');
+    assert.deepEqual([...new Set(looked)], ['job-gone'], 'the foreign job is never looked for here');
+    const closed = obligations.settleFromRecord('a-card', { id: 'rev-9', job: 'job-42', verdict: 'clean', at: new Date(now).toISOString() }, box.root, now, { withLock: nolock });
+    assert.deepEqual(closed.map((entry) => entry.id), [record.id]);
+  } finally { box.cleanup(); }
+});

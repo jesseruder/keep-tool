@@ -136,6 +136,118 @@ function resolveCommits(specs, deps) {
   return commits;
 }
 
+// ---------- commit and job facts a node resolved ----------
+//
+// The daemon runs a node's `keep reviewed` / `keep reviewing` in the node's project
+// directory, which on the daemon is the main checkout, not the node's worktree: it
+// cannot resolve the node's commits or read the node's Codex jobs. The node resolves
+// them itself (nodeFactArgs) and sends what it found as hidden arguments, which the
+// daemon accepts only from a node's request (KEEP_REMOTE_CALLER) and only in this
+// shape:
+//   --fact <sha>:<patchId>:<base64url subject>[:merge]      one per commit, in order
+//   --job-fact <id>:<accountId>:<status>:<ISO time>         the --job, as the node read it
+
+const MAX_FACTS = 200;
+const FACT_SUBJECT_LIMIT = 200;
+const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const PATCH_ID_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})?$/;
+const ACCOUNT_RE = /^[A-Za-z0-9._-]{1,80}$/;
+const STATUS_RE = /^[A-Za-z_-]{0,40}$/;
+
+function encodeFact(commit) {
+  const subject = Buffer.from(String(commit.subject || '').slice(0, FACT_SUBJECT_LIMIT), 'utf8').toString('base64url');
+  return `${commit.sha}:${commit.patchId || ''}:${subject}${commit.merge ? ':merge' : ''}`;
+}
+
+function parseFacts(values) {
+  const list = Array.isArray(values) ? values : [];
+  if (!list.length) fail('--fact named no commits');
+  if (list.length > MAX_FACTS) fail(`at most ${MAX_FACTS} --fact values are accepted; review a shorter range`);
+  const seen = new Map();
+  for (const value of list) {
+    const parts = String(value).split(':');
+    if ((parts.length !== 3 && parts.length !== 4) || (parts.length === 4 && parts[3] !== 'merge')) fail(`--fact "${String(value).slice(0, 120)}" is not <sha>:<patch-id>:<subject>`);
+    const [sha, patchId, encoded] = parts;
+    if (!SHA_RE.test(sha)) fail(`--fact sha "${sha.slice(0, 80)}" is not a full commit id`);
+    if (!PATCH_ID_RE.test(patchId)) fail(`--fact patch-id "${patchId.slice(0, 80)}" is not a patch id`);
+    if (!/^[A-Za-z0-9_-]*$/.test(encoded)) fail(`--fact subject for ${sha.slice(0, 12)} is not base64url`);
+    const subject = Buffer.from(encoded, 'base64url').toString('utf8');
+    if (Buffer.from(subject, 'utf8').toString('base64url') !== encoded) fail(`--fact subject for ${sha.slice(0, 12)} is not valid UTF-8 in base64url`);
+    if (subject.length > FACT_SUBJECT_LIMIT) fail(`--fact subject for ${sha.slice(0, 12)} is longer than ${FACT_SUBJECT_LIMIT} characters`);
+    if (/[\0\r\n]/.test(subject)) fail(`--fact subject for ${sha.slice(0, 12)} contains a line break or NUL`);
+    if (seen.has(sha)) continue;
+    seen.set(sha, { sha, patchId, subject, ...(parts[3] === 'merge' ? { merge: true } : {}) });
+  }
+  return [...seen.values()];
+}
+
+function encodeJobFact(id, job) {
+  return `${id}:${job.accountId || 'legacy'}:${job.status || ''}:${job.at}`;
+}
+
+// What resolveJob would have answered on the node, for the job named by --job.
+function parseJobFact(value, jobId) {
+  const text = String(value || '');
+  const first = text.indexOf(':');
+  const second = text.indexOf(':', first + 1);
+  const third = text.indexOf(':', second + 1);
+  if (first < 0 || second < 0 || third < 0) fail('--job-fact is not <id>:<account>:<status>:<time>');
+  const id = text.slice(0, first);
+  const accountId = text.slice(first + 1, second);
+  const status = text.slice(second + 1, third);
+  const at = text.slice(third + 1);
+  if (!JOB_ID_RE.test(id)) fail(`--job-fact names "${id.slice(0, 80)}", which is not a Codex job id`);
+  if (id !== String(jobId || '').trim()) fail(`--job-fact is for job ${id}, not --job ${String(jobId || '').slice(0, 80)}`);
+  if (!ACCOUNT_RE.test(accountId)) fail('--job-fact account is not an account id');
+  if (!STATUS_RE.test(status)) fail('--job-fact status is not a job status');
+  const parsed = Date.parse(at);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== at) fail('--job-fact time is not an ISO timestamp');
+  return { file: '', accountId, status, at, workspaceRoot: '' };
+}
+
+// The arguments a node sends for `keep reviewed` / `keep reviewing`: every --commit
+// replaced by the --fact values it resolves to here, and a --job this node can find
+// followed by its --job-fact. Walks argv the way parseArgs reads it (a flag in
+// registry-commands.BOOLEAN_FLAGS takes no value, every other one takes the next
+// argument, -m takes the next argument whatever it is, `--` ends flags), so a value
+// is never mistaken for a flag. A job this node cannot find is sent as it was typed,
+// for the daemon to look for in its own jobs directories.
+function nodeFactArgs(command, args, options = {}) {
+  const { BOOLEAN_FLAGS } = require('./registry-commands.js');
+  const bools = BOOLEAN_FLAGS[command] || [];
+  const out = [];
+  const specs = [];
+  let job = null;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--') { out.push(...args.slice(i)); break; }
+    if (arg === '-m') {
+      out.push(arg);
+      if (i + 1 < args.length) out.push(args[++i]);
+      continue;
+    }
+    if (!arg.startsWith('--')) { out.push(arg); continue; }
+    const name = arg.slice(2);
+    if (name === 'fact' || name === 'job-fact') fail(`--${name} is what keep sends from a node; name the commits with --commit`);
+    if (bools.includes(name) || i + 1 >= args.length) { out.push(arg); continue; }
+    const value = args[++i];
+    if (name === 'commit') { specs.push(value); continue; }
+    if (name === 'job') job = value;
+    out.push(arg, value);
+  }
+  if (specs.length) {
+    const commits = (options.resolveCommits || resolveCommits)(specs, options.deps || gitDeps(options.cwd || process.cwd()));
+    for (const commit of commits) out.push('--fact', encodeFact(commit));
+  }
+  if (job !== null && String(job).trim()) {
+    let found = null;
+    try { found = (options.resolveJob || resolveJob)(String(job).trim(), { root: options.root || keep.ROOT }); }
+    catch { found = null; }
+    if (found) out.push('--job-fact', encodeJobFact(String(job).trim(), found));
+  }
+  return out;
+}
+
 // ---------- writing a record ----------
 
 function cleanVerdict(value) {
@@ -256,7 +368,7 @@ function buildRecord(input, deps, options = {}) {
   const bySession = sessionStamp(input.session);
   let resolved = null;
   if (job) {
-    resolved = (options.resolveJob || resolveJob)(job, options);
+    resolved = options.jobFact || (options.resolveJob || resolveJob)(job, options);
     if (!resolved) fail(`--job "${job}" is not a Codex job Keep can find — run keep codex-jobs, or cite --evidence instead`);
     if (resolved.status !== 'completed') fail(`Codex job ${job} is ${resolved.status || 'unfinished'}, not completed — a review that has not finished is not a review`);
   }
@@ -267,7 +379,8 @@ function buildRecord(input, deps, options = {}) {
     const failure = attestationFailure({ by, job, evidence, hasSession: Boolean(bySession) || Boolean(remoteCaller(options.env || process.env)) });
     if (failure) fail(`a clean review record cannot stand on this: ${failure}`);
   }
-  const commits = resolveCommits(input.commits, deps);
+  // A node's commits arrive resolved (parseFacts); everything else resolves here.
+  const commits = input.resolvedCommits || resolveCommits(input.commits, deps);
   // Why this reviewer, when it was not the usual one. A fallback review is a review;
   // what a later reader needs is to be able to tell that it was one without
   // reconstructing the day's usage limits.
@@ -409,7 +522,8 @@ function landContext(cwd = process.cwd(), deps = {}) {
 module.exports = {
   ReviewRecordError, EVIDENCE_LIMIT, EVIDENCE_MINIMUM, MESSAGE_LIMIT, VERDICTS, BY_VOCABULARY,
   reviewsDir, cardFile, readRecords, writeRecords, recordId,
-  gitDeps, resolveCommits, cleanVerdict, cleanBy, remoteCaller, cleanEvidence, resolveJob, attestationFailure,
+  gitDeps, resolveCommits, cleanVerdict, cleanBy, remoteCaller,
+  MAX_FACTS, FACT_SUBJECT_LIMIT, encodeFact, parseFacts, encodeJobFact, parseJobFact, nodeFactArgs, cleanEvidence, resolveJob, attestationFailure,
   buildRecord, append, logLine,
   autoLandConfig, optOutReason, landContext,
 };

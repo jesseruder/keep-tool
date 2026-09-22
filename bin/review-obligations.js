@@ -94,6 +94,8 @@ function readRecords(id, root = keep.ROOT, stats = null) {
       by: text(record.by, 120),
       note: text(record.note, NOTE_LIMIT),
       commits: commitsOf(record.commits),
+      // The node whose request opened it: its job is on that node, not here.
+      ...(record.node !== undefined ? { node: text(record.node, 80) } : {}),
       // Bounded, because the counters decide when an obligation ends. `-1e30 + 1` is
       // still `-1e30` in floating point, so a damaged `misses` could sit below its
       // threshold for ever while the obligation gated its commits.
@@ -203,6 +205,7 @@ function open(input, options = {}) {
     session: input.session && input.session.id
       ? { sessionId: String(input.session.id), agent: String(input.session.agent || '') }
       : null,
+    ...(input.node ? { node: String(input.node).slice(0, 80) } : {}),
   };
 }
 
@@ -315,6 +318,10 @@ function decide(record, { job, jobUnknown = false, live, discovery = 'ok', revie
   if (satisfiedByCoverage(record, reviewRecords, now)) {
     return { state: 'satisfied', note: 'an independent review of the same patches was recorded under another job' };
   }
+  // A review another node launched runs there, and its job file is there: nothing the
+  // daemon can read about the job says anything about it. It ends with its verdict
+  // (above) or a keep reviewing --drop, never on the daemon's view of a job.
+  if (record.node) return null;
   // An obligation whose verdict nobody ever records must still end. Six hours after Keep
   // said the job had finished, the session that was going to read it is not coming back.
   if (record.state === 'awaiting-verdict' && sinceState > MAX_RUNNING_MS) {
@@ -533,7 +540,10 @@ function settle(deps = {}) {
         result.considered += 1;
         let job = null;
         let jobUnknown = false;
-        try { job = resolveJob(record.job); }
+        // Another node's job is not looked for here: a job of the same id on this
+        // machine is somebody else's.
+        if (record.node) jobUnknown = true;
+        else try { job = resolveJob(record.job); }
         catch (error) {
           // The jobs directory would not answer. That is not the job's absence, and it
           // is not a reason to skip the decisions that do not depend on it either.
@@ -541,7 +551,7 @@ function settle(deps = {}) {
           result.errors.push(`${id}: could not resolve job ${record.job}: ${error.message || error}`);
         }
         const decision = decide(record, {
-          job, jobUnknown, discovery, live: liveJobs.get(record.job) || null, reviewRecords, now,
+          job, jobUnknown, discovery, live: record.node ? null : (liveJobs.get(record.job) || null), reviewRecords, now,
         });
         if (!decision) continue;
         settled.set(record.id, { next: applied(record, decision, now), moved: decision.state !== record.state });
