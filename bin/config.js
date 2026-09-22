@@ -46,6 +46,13 @@ function nodeConfig(value = {}) {
 // the one to write; a result that would not load again is refused before the write,
 // so a bad edit cannot leave an install unable to start.
 function update(mutate, env = process.env) {
+  // The same rule accounts keep: an explicit data directory is an isolated
+  // registry, and config.json belongs to the machine, not to it. Without this a
+  // `keep nodes add` run inside a test or a scratch registry would rewrite the
+  // operator's real node list.
+  if (env.KEEP_DIR && !env.KEEP_CONFIG) {
+    throw new Error('Keep configuration changes require KEEP_CONFIG when KEEP_DIR is explicitly set');
+  }
   const file = configFile(env);
   const current = fs.existsSync(file) ? load(env) : { version: 1 };
   const next = mutate(current);

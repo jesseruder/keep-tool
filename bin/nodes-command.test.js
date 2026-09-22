@@ -7,6 +7,7 @@ const path = require('node:path');
 const test = require('node:test');
 const config = require('./config.js');
 const registry = require('./node-registry.js');
+const nodes = require('./nodes.js');
 const { commands } = require('./commands/nodes.js');
 const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
 
@@ -112,4 +113,60 @@ test('keep nodes lists every node with a live hello check', async (t) => {
     assert.match(down, /aws1\s+tcp\s+\S+\s+-\s+unreachable:/);
     assert.match(down, /main \(daemon\)\s+unix\s+\S+\s+-\s+ok protocol 1/, 'a node that is down says nothing about the others');
   });
+});
+
+test('keep nodes add checks the address before it mints anything', async (t) => {
+  const registryDir = withRegistry(t);
+  for (const address of ['100.64.0.2', '100.64.0.2:0', '100.64.0.2:70000', 'aws1.example.com:7777', '100.64.0.2:abc', '[::1]']) {
+    await assert.rejects(commands.nodes(['add', 'aws1', '--address', address]), /address|port/, address);
+  }
+  // Nothing was written for any of them: no token on disk, no entry in the file.
+  assert.equal(fs.existsSync(path.join(registryDir.root, '.keep', 'node-tokens', 'aws1')), false);
+  assert.deepEqual(registryDir.read(), { version: 1 });
+  await capture(() => commands.nodes(['add', 'aws1', '--address', '[fd7a:115c:a1e0::1]:7777']));
+  assert.equal(registryDir.read().nodes.aws1.address, '[fd7a:115c:a1e0::1]:7777', 'a bracketed IPv6 address is fine');
+});
+
+test('an isolated registry never rewrites the machine configuration', async (t) => {
+  const registryDir = withRegistry(t);
+  const configFile = process.env.KEEP_CONFIG;
+  delete process.env.KEEP_CONFIG;
+  try {
+    await assert.rejects(commands.nodes(['add', 'aws1', '--address', '100.64.0.2:7777']),
+      /require KEEP_CONFIG when KEEP_DIR is explicitly set/);
+  } finally { process.env.KEEP_CONFIG = configFile; }
+  assert.deepEqual(registryDir.read(), { version: 1 });
+  // The token is not left behind either.
+  assert.equal(fs.existsSync(path.join(registryDir.root, '.keep', 'node-tokens', 'aws1')), false);
+});
+
+test('one unusable node entry is reported without taking the others down', async (t) => {
+  const registryDir = withRegistry(t, {
+    version: 1,
+    daemonNode: 'main',
+    nodes: { main: {}, broken: { transport: 'tcp' }, aws1: { transport: 'tcp', address: '100.64.0.2:7777' } },
+  });
+  assert.deepEqual(registry.listNodes().map((node) => [node.name, node.invalid === true]),
+    [['main', false], ['aws1', false], ['broken', true]]);
+  assert.match(registry.listNodes().find((node) => node.name === 'broken').reason, /needs an address/);
+  assert.throws(() => registry.resolveNode('broken'), /needs an address/);
+  assert.deepEqual(nodes.configuredNodeNames().sort(), ['aws1', 'main'], 'a broken entry is not a node to poll');
+  const listed = await capture(() => commands.nodes(['ls'], { timeoutMs: 200 }));
+  assert.match(listed, /broken\s+-\s+-\s+-\s+unusable entry: /);
+  assert.match(listed, /main \(daemon\)/);
+  assert.equal(registryDir.read().nodes.broken.transport, 'tcp', 'listing changes nothing');
+});
+
+test('the node name cache follows a rewrite of the same configuration file', async (t) => {
+  const registryDir = withRegistry(t);
+  assert.deepEqual(nodes.configuredNodeNames(), ['main']);
+  await capture(() => commands.nodes(['add', 'aws1', '--address', '100.64.0.2:7777']));
+  // Same path, new contents. The cache is short-lived by design; once it expires
+  // the new node is visible without restarting anything.
+  await new Promise((resolve) => setTimeout(resolve, nodes.NODE_NAME_MEMO_MS + 50));
+  assert.deepEqual(nodes.configuredNodeNames().sort(), ['aws1', 'main']);
+  await capture(() => commands.nodes(['rm', 'aws1']));
+  await new Promise((resolve) => setTimeout(resolve, nodes.NODE_NAME_MEMO_MS + 50));
+  assert.deepEqual(nodes.configuredNodeNames(), ['main']);
+  assert.deepEqual(registryDir.read().nodes, { main: {} });
 });

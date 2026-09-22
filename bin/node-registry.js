@@ -73,11 +73,23 @@ function resolveNode(name, env = process.env) {
 
 // The daemon node first: a caller that fans out and merges wants the node whose
 // pane ids stay bare to be the one it reads first.
+//
+// One unusable entry is reported as an unusable entry, by name and reason, and
+// never throws: a typo in one node's address must not take the whole fleet — the
+// daemon's own node included — out of every listing that reads this.
 function listNodes(env = process.env) {
   const { nodes, daemonNode } = configuration(env);
   return Object.keys(nodes)
     .sort((a, b) => (a === daemonNode ? -1 : b === daemonNode ? 1 : a.localeCompare(b)))
-    .map((name) => describeNode(name, nodes[name], daemonNode, env));
+    .map((name) => {
+      try { return describeNode(name, nodes[name], daemonNode, env); }
+      catch (error) {
+        return {
+          name, transport: null, daemon: name === daemonNode, capabilities: [],
+          invalid: true, reason: error.message,
+        };
+      }
+    });
 }
 
 function isRemote(name, env = process.env) {

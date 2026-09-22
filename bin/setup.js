@@ -608,6 +608,13 @@ function servicePlist(kind, root, envPath = process.env.PATH || '', overrides = 
 </dict></plist>\n`;
 }
 
+// systemd splits an unquoted value on whitespace and reads its own escapes in it,
+// so every path and every value goes in double quotes with the two characters that
+// syntax reserves escaped. A checkout under "Application Support" is not exotic.
+function systemdQuote(value) {
+  return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
 function hostUnit(env) {
   return [
     '[Unit]',
@@ -615,8 +622,8 @@ function hostUnit(env) {
     'After=network.target',
     '',
     '[Service]',
-    `ExecStart=${path.join(SOURCE, 'bin', 'keep')} host`,
-    ...Object.entries(env).map(([key, value]) => `Environment=${key}=${value}`),
+    `ExecStart=${systemdQuote(path.join(SOURCE, 'bin', 'keep'))} ${systemdQuote('host')}`,
+    ...Object.entries(env).map(([key, value]) => `Environment=${key}=${systemdQuote(value)}`),
     'Restart=always',
     'RestartSec=2',
     '',
@@ -640,12 +647,18 @@ function node(args, root, home = os.homedir()) {
   if (!daemonNode || !config.NODE_NAME_RE.test(daemonNode)) throw new Error(NODE_USAGE);
   if (daemonNode === name) throw new Error(`${name} cannot be its own daemon node; --daemon-node names the machine running keep serve`);
   if (!opts.listen) throw new Error(NODE_USAGE);
-  require('./host.js').parseListenAddress(opts.listen);
+  // The same refusal the host makes, made here: a node binds the interface it was
+  // given a token for, never every interface the machine happens to have.
+  const host = require('./host.js');
+  const listen = host.parseListenAddress(opts.listen);
+  if (['0.0.0.0', '::'].includes(listen.address)) {
+    throw new Error(`refusing to install a service that binds ${listen.address}; give --listen the node's own address`);
+  }
   if (!opts['token-file']) throw new Error(NODE_USAGE);
   const tokenFile = canonicalPath(opts['token-file'].replace(/^~(?=\/|$)/, home));
   // The same check the host makes at boot, made now so the failure is a sentence
   // here rather than a service that starts and quietly refuses every connection.
-  require('./host.js').readNodeToken(tokenFile);
+  host.readNodeToken(tokenFile);
   const sock = canonicalPath((opts.sock || path.join(home, 'keep', '.keep', 'host.sock')).replace(/^~(?=\/|$)/, home));
   if (Buffer.byteLength(sock) > 103) throw new Error(`socket path too long (${Buffer.byteLength(sock)} bytes, max 103): ${sock}`);
   fs.mkdirSync(path.dirname(sock), { recursive: true });
@@ -817,7 +830,7 @@ function doctor(root) {
 }
 
 module.exports = {
-  init, installHooks, installSkills, service, node, doctor, accountSetupReport, mergeHooks, servicePlist, hostUnit, quote, canonicalPath, insideSource,
+  init, installHooks, installSkills, service, node, doctor, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
   HOOK_ACTIONS, missingHooks, hookTargets, hookTarget,
   loadPacks, configuredPacks, installPackNames, skillPlans, applySkillPlans, reportSkillPlans, listPacks,
   recordPacks, recordPreflight,

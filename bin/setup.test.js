@@ -986,10 +986,10 @@ test('keep node init writes a host-only service with the node identity and no re
     Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
     const linux = capture(() => setup.node(args, '/tmp/unused-registry', home));
     const unit = fs.readFileSync(path.join(home, '.config', 'systemd', 'user', 'keep-host.service'), 'utf8');
-    assert.match(unit, /^ExecStart=.*\/bin\/keep host$/m);
-    assert.match(unit, /^Environment=KEEP_NODE_NAME=aws1$/m);
-    assert.match(unit, /^Environment=KEEP_HOST_LISTEN=100\.64\.0\.2:7777$/m);
-    assert.match(unit, /^Environment=KEEP_NODE_TOKEN_FILE=/m);
+    assert.match(unit, /^ExecStart="[^"]*\/bin\/keep" "host"$/m);
+    assert.match(unit, /^Environment=KEEP_NODE_NAME="aws1"$/m);
+    assert.match(unit, /^Environment=KEEP_HOST_LISTEN="100\.64\.0\.2:7777"$/m);
+    assert.match(unit, /^Environment=KEEP_NODE_TOKEN_FILE="/m);
     assert.match(unit, /^Restart=always$/m);
     assert.match(unit, /^WantedBy=default\.target$/m);
     assert.equal(/KEEP_DIR|KEEP_CONFIG/.test(unit), false);
@@ -1012,4 +1012,45 @@ test('keep node init refuses a token file that is missing, loose, or unnamed', (
   assert.throws(() => setup.node([...base, '--token-file', tokenFile, '--listen', 'nonsense'], '/tmp/r', home), /<ip>:<port>/);
   assert.throws(() => setup.node(['init', 'AWS1', '--daemon-node', 'main', '--listen', '1.2.3.4:7', '--token-file', tokenFile], '/tmp/r', home), /lowercase letters and digits/);
   assert.throws(() => setup.node(['init', 'aws1', '--daemon-node', 'aws1', '--listen', '1.2.3.4:7', '--token-file', tokenFile], '/tmp/r', home), /cannot be its own daemon node/);
+});
+
+test('a systemd unit quotes every path and value it was given', (t) => {
+  const { home, tokenFile } = nodeHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const spaced = path.join(home, 'Application Support');
+  fs.mkdirSync(spaced, { recursive: true });
+  const spacedToken = path.join(spaced, 'node.token');
+  fs.copyFileSync(tokenFile, spacedToken);
+  fs.chmodSync(spacedToken, 0o600);
+  const sock = path.join(home, 'host.sock');
+  const platform = process.platform;
+  try {
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+    capture(() => setup.node(['init', 'aws1', '--daemon-node', 'main', '--listen', '100.64.0.2:7777',
+      '--token-file', spacedToken, '--sock', sock], '/tmp/r', home));
+    const unit = fs.readFileSync(path.join(home, '.config', 'systemd', 'user', 'keep-host.service'), 'utf8');
+    // Unquoted, systemd would split this on the space and run something else.
+    assert.ok(unit.includes(`Environment=KEEP_NODE_TOKEN_FILE="${spacedToken}"`), unit);
+    assert.ok(spacedToken.includes(' '), 'the value under test really does contain a space');
+    assert.match(unit, /^ExecStart="[^"]*\/bin\/keep" "host"$/m);
+    for (const line of unit.split('\n').filter((entry) => entry.startsWith('Environment='))) {
+      assert.match(line, /^Environment=[A-Z_]+=".*"$/, line);
+    }
+    assert.equal(setup.systemdQuote('a"b\\c'), '"a\\"b\\\\c"');
+  } finally {
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+  }
+});
+
+test('keep node init refuses to install a service that binds every interface', (t) => {
+  const { home, tokenFile } = nodeHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  for (const listen of ['0.0.0.0:7777', '[::]:7777', '[::0]:7777']) {
+    assert.throws(() => setup.node(['init', 'aws1', '--daemon-node', 'main', '--listen', listen,
+      '--token-file', tokenFile], '/tmp/r', home), /refusing to install a service that binds/, listen);
+  }
+  assert.throws(() => setup.node(['init', 'aws1', '--daemon-node', 'main', '--listen', 'localhost:7777',
+    '--token-file', tokenFile], '/tmp/r', home), /must be an IP literal/);
+  assert.equal(fs.existsSync(path.join(home, 'Library', 'LaunchAgents', 'games.castle.keep.host.plist')), false);
+  assert.equal(fs.existsSync(path.join(home, '.config', 'systemd', 'user', 'keep-host.service')), false);
 });

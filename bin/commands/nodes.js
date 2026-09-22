@@ -23,6 +23,17 @@ function tokenFileFor(name) {
   return path.join(root(), '.keep', 'node-tokens', name);
 }
 
+// Checked before anything is written: a token minted for an address nobody can
+// dial is a secret on disk with no node to use it, and a config.json the daemon
+// then refuses to load takes every other node down with it.
+function checkedAddress(value) {
+  let parsed;
+  try { parsed = require('../host.js').parseListenAddress(value); }
+  catch (error) { return die(error.message); }
+  if (parsed.port < 1 || parsed.port > 65535) return die(`a node address needs a port between 1 and 65535: ${value}`);
+  return value;
+}
+
 // One hello per node, in parallel: the list is only useful if it says which of
 // these machines is actually answering right now.
 async function check(entry, deps) {
@@ -54,12 +65,13 @@ function renderNodes(rows) {
   const headings = ['name', 'transport', 'endpoint', 'capabilities', 'status'];
   const table = rows.map((row) => [
     row.name + (row.daemon ? ' (daemon)' : ''),
-    row.transport,
-    row.transport === 'tcp' ? row.address : row.sock,
+    row.transport || '-',
+    (row.transport === 'tcp' ? row.address : row.sock) || '-',
     row.capabilities.join(',') || '-',
-    row.reachable
-      ? `ok protocol ${row.protocol} ${row.platform || '?'} boot ${String(row.bootId || '').slice(0, 8)} ${row.panes == null ? '' : `${row.panes} panes`}`.trim()
-      : `unreachable: ${row.error}`,
+    row.invalid ? `unusable entry: ${row.reason}`
+      : row.reachable
+        ? `ok protocol ${row.protocol} ${row.platform || '?'} boot ${String(row.bootId || '').slice(0, 8)} ${row.panes == null ? '' : `${row.panes} panes`}`.trim()
+        : `unreachable: ${row.error}`,
   ]);
   const widths = headings.map((heading, index) => Math.max(heading.length, ...table.map((row) => row[index].length)));
   return [headings, ...table].map((row) => row.map((value, index) => value.padEnd(widths[index])).join('  ')).join('\n');
@@ -71,7 +83,7 @@ async function listNodes(argv, deps) {
   let entries;
   try { entries = registry.listNodes(); }
   catch (error) { die(error.message); }
-  const rows = await Promise.all(entries.map((entry) => check(entry, deps)));
+  const rows = await Promise.all(entries.map((entry) => (entry.invalid ? entry : check(entry, deps))));
   console.log(o.json ? JSON.stringify(rows) : renderNodes(rows));
 }
 
@@ -82,6 +94,7 @@ function addNode(argv, deps) {
   if (!nodes.NODE_NAME_RE.test(name)) die(`a node name is lowercase letters and digits: ${name}`);
   const daemon = nodes.daemonNode();
   if (name === daemon) die(`${name} is this install's daemon node; it is not added as a remote node`);
+  checkedAddress(o.address);
   const capabilities = String(o.capabilities || '').split(',').map((value) => value.trim()).filter(Boolean);
   // Mint the token before the entry: writeNodeToken refuses to overwrite one, so a
   // name that already has a token is a node being re-added behind its own back.
