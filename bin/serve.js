@@ -2311,6 +2311,27 @@ function sendPrecheck(screen) {
   }
 }
 
+// The rows of a Claude screen that say whether a turn is running: the few just above the
+// input box's top rule, where the spinner line ("✻ Working… (esc to interrupt)") is
+// drawn, and everything below the prompt, which is the box's own footer. Not the
+// transcript above: an idle answer that happens to quote "esc to interrupt" is not a turn.
+// A screen with no prompt row gives every row back — without a box there is nothing to
+// tell status from transcript, and the callers read that as busy.
+function claudeLiveStatusRows(screen) {
+  const lines = String(screen || '').split(/\r?\n/);
+  let prompt = -1;
+  lines.forEach((line, index) => { if (/^\s*❯(?:\s|$)/.test(line)) prompt = index; });
+  if (prompt === -1) return lines;
+  let top = prompt - 1;
+  while (top >= 0 && prompt - top <= 12 && !BOX_RULE_RE.test(lines[top])) top -= 1;
+  if (top < 0 || !BOX_RULE_RE.test(lines[top])) top = prompt;
+  return [...lines.slice(Math.max(0, top - 3), top), ...lines.slice(prompt + 1)];
+}
+
+function claudeStatusShows(screen, pattern) {
+  return claudeLiveStatusRows(screen).some((line) => pattern.test(line));
+}
+
 function promptLine(screen) {
   return String(screen || '').split(/\r?\n/).slice(-10).reverse()
     .find((line) => /^\s*❯(?:\s|$)/.test(line));
@@ -3193,7 +3214,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   // session idle, but a submit the host accepted just before that count may not have
   // rendered yet. Any screen read from here to the Enter that shows a turn running
   // refuses the Enter: the counter speaks only for keys, the screen for the turn.
-  const turnRunning = (screen) => Boolean(inputBaseline) && /esc to interrupt|Compacting[.…]/i.test(String(screen || ''));
+  const turnRunning = (screen) => Boolean(inputBaseline) && claudeStatusShows(screen, /esc to interrupt|Compacting[.…]/i);
   const turnStarted = () => new InjectionError(409, 'the session started a turn while the command was typed; Enter was not pressed');
   // How long the screen is given to catch up, at 400ms a poll. Four is enough for a
   // plain message; a caller whose text makes Claude render more than the line — a
@@ -4078,7 +4099,7 @@ async function compactRestoreInputBaseline(target, deps = {}, current = null) {
         && !/esc to (?:interrupt|cancel)/i.test(screen);
     if (!complete) return null;
   }
-  if (/esc to (?:interrupt|cancel)|Compacting[.…]/i.test(screen) || claudePrompts.recognize(screen)?.live) {
+  if (claudeStatusShows(screen, /esc to (?:interrupt|cancel)|Compacting[.…]/i) || claudePrompts.recognize(screen)?.live) {
     throw new InjectionError(409, 'the session is busy or showing a dialog; the restore was not typed', { screenTail: screenTail(screen) });
   }
   const proof = await probeSuggestion(target, screen, { ...deps, probeInputGuard: { pid: before.pid, inputCount: before.inputCount } });
@@ -4120,6 +4141,15 @@ async function sweepPendingCompactSwaps(deps = {}) {
     // record's settings repair may write it this pass, and a restore typed there only
     // puts back exactly what the file held before its own /model.
     const userOwnedSettings = new Set();
+    // And across passes: retiring a record for a hand choice stamps every other pending
+    // record on the same settings file (settingsUserChoiceAt), because the retired record
+    // is gone and the choice could not be rediscovered next pass. A stamped record's own
+    // restore is still typed; only its settings.json write-back is dropped for good.
+    for (const record of allRecords) {
+      if (record.error || codexCompact.isCodexCompactSwap(record) || !record.settingsUserChoiceAt) continue;
+      const file = compactSwapSettingsFile(record, deps);
+      if (file) userOwnedSettings.add(file);
+    }
     const byIdEarly = new Map((sessions || []).map((session) => [session.id, session]));
     const transcriptFor = deps.transcriptFileForSession || transcriptFileForSession;
     // True when the record was retired (or already was) for a hand-picked model.
@@ -4140,7 +4170,22 @@ async function sweepPendingCompactSwaps(deps = {}) {
       }
       retired.add(record.file);
       const ownedFile = compactSwapSettingsFile(record, deps);
-      if (ownedFile) userOwnedSettings.add(ownedFile);
+      if (ownedFile) {
+        userOwnedSettings.add(ownedFile);
+        for (const other of allRecords) {
+          if (other === record || retired.has(other.file) || other.error || codexCompact.isCodexCompactSwap(other)
+              || compactSwapSettingsFile(other, deps) !== ownedFile || other.settingsUserChoiceAt) continue;
+          Object.assign(other, { settingsUserChoiceAt: now(), settingsUserChoice: String(choice.model || ''),
+            settingsUserChoiceSession: record.sessionId });
+          try {
+            const stored = JSON.parse(fs.readFileSync(other.file, 'utf8'));
+            writeCompactSwapRecord(other.file, { ...stored, settingsUserChoiceAt: other.settingsUserChoiceAt,
+              settingsUserChoice: other.settingsUserChoice, settingsUserChoiceSession: record.sessionId });
+          } catch (e) {
+            process.stderr.write(`keep serve: could not mark ${sessionRef(other.sessionId) || 'unknown'}'s restore record with a hand-picked settings model: ${String(e && e.message || e)}\n`);
+          }
+        }
+      }
       summary.dropped += 1;
       process.stderr.write(`keep serve: retired model restore record for ${sid}: ${choice.reason}; not restoring "${String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '')}" or repairing settings.json over it\n`);
       return true;

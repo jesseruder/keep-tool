@@ -12626,3 +12626,57 @@ test('a probe comma left behind waits out the retry interval instead of probing 
     assert.equal(baselines, 2);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+// ---- review round 4 ----
+
+test('a hand-picked model on a shared settings file stays the person\'s across passes', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-shared-settings-durable-'));
+  const a = { id: 'session-a', kind: 'claude', model: 'claude-opus-5', endedTurn: false };
+  const b = { id: 'session-b', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  try {
+    const fileA = writeCompactSwapFixture(dir, a.id, { at: Date.parse('2026-09-04T12:00:00Z') });
+    writeCompactSwapFixture(dir, b.id, { at: Date.parse('2026-09-04T12:01:00Z') });
+    let settings = 'claude-opus-5[1m]';
+    const calls = [];
+    let bChose = true;
+    const deps = { ...compactRestoreDeps(dir, a, calls),
+      scanSessions: () => [a, b], transcriptFileForSession: (session) => session.id, stderr: () => {},
+      compactSwapUserModelChoice: (record) => (record.sessionId === b.id && bChose
+        ? { model: 'claude-opus-5[1m]', reason: '/model claude-opus-5[1m] was chosen after the swap' } : null),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: settings }),
+      repairClaudeSettingsModel: (value) => { settings = value; return { changed: true }; },
+      typeAndSubmit: async (_target, command) => { calls.push(command); settings = command.slice('/model '.length); } };
+    // Pass 1: B retires, A is busy.
+    await sweepPendingCompactSwaps(deps);
+    assert.deepEqual(calls, []);
+    assert.equal(settings, 'claude-opus-5[1m]');
+    const stamped = JSON.parse(fs.readFileSync(fileA, 'utf8'));
+    assert.ok(stamped.settingsUserChoiceAt);
+    assert.equal(stamped.settingsUserChoice, 'claude-opus-5[1m]');
+    // Pass 2: B's record is gone, so its choice cannot be rediscovered; A is idle now.
+    bChose = false;
+    a.endedTurn = true;
+    await sweepPendingCompactSwaps(deps);
+    assert.deepEqual(calls, ['/model claude-fable-5-1[1m]'], 'A\'s own restore is still typed');
+    assert.equal(settings, 'claude-opus-5[1m]', 'but no pass writes A\'s pre-swap value over B\'s choice');
+    assert.equal(fs.existsSync(fileA), false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('only the live status rows say a turn is running, not an answer that quotes it', async () => {
+  const { compactRestoreInputBaseline } = require('./serve.js');
+  const quoted = ['Press esc to interrupt a running turn.', 'That is how you stop it.', '', '', '', '',
+    '────', '❯ ', '────', '? for shortcuts'].join('\n');
+  const deps = (screen) => ({ sleep: async () => {}, hostRequest: async () => ({ guardedInput: true }),
+    livePaneState: async () => ({ pid: 7, inputCount: 3 }), readScreen: async () => screen });
+  assert.deepEqual(await compactRestoreInputBaseline({ pane: 'p' }, deps(quoted)), { pid: 7, inputCount: 3 });
+  await assert.rejects(compactRestoreInputBaseline({ pane: 'p' }, deps(['answer', '✻ Working… (3s · esc to interrupt)', '',
+    '────', '❯ ', '────'].join('\n'))), /busy/);
+  // And while typing: quoted text far above the box does not stop the Enter.
+  const command = '/model claude-fable-5-1[1m]';
+  const harness = draftHarness((inputs) => (inputs.includes(command)
+    ? `Press esc to interrupt a running turn.\n\n\n\n\n${BOX(command)}` : BOX('')));
+  await typeAndSubmit({ pane: 'p' }, command, (s, t) => s.includes(t), {
+    ...harness.deps, inputBaseline: { pid: 4242, inputCount: 0 }, discardDraftOnAbort: true });
+  assert.equal(harness.inputs.includes('\r'), true);
+});

@@ -2385,7 +2385,8 @@ due the restore is typed under the injection lock as usual (the record blocks ag
 that attempt, though its expiry keeps counting from the deferral) and is either
 confirmed, deferred again, or left unconfirmed. No key this pass sends is
 unguarded. It reads the pane's input counter first, then proves the session idle under
-it: no "esc to interrupt", no live dialog, no local command still finishing, and an empty
+it: no "esc to interrupt", no live dialog, no local command still finishing (the busy text is read only from the
+status rows just above the input box and its footer, not from the transcript), and an empty
 box (the prompt-suggestion probe's comma and Backspace are themselves conditional on the
 counter). The counter must have been quiet for `KEEP_COMPACT_RESTORE_INPUT_QUIET_MS` (default
 2000) by the host's `lastInputAt`, and the idle screen is read only after a
@@ -2397,9 +2398,10 @@ and Enter is pressed only when the box holds exactly the command. A restore whos
 key the host refused typed nothing: it is not counted as an attempt, a deferred record
 keeps its deferral, and `settings.json` is left alone. The account's `settings.json`
 repair rechecks for a hand-picked model immediately before it writes, and once any
-session on that settings file has a hand-picked model, no repair writes that file for the
-rest of the pass — a restore typed there only puts back exactly what the file held before
-its own `/model`. If a key lands between the probe's comma and its Backspace, the comma
+session on that settings file has a hand-picked model, no repair writes that file again:
+the other pending records on it are stamped `settingsUserChoiceAt` (with the chosen
+value), so later passes skip their settings write-back too, while their own restores are
+still typed and only put back exactly what the file held before their own `/model`. If a key lands between the probe's comma and its Backspace, the comma
 is left with the person's key, the refusal is logged, and the record waits
 `KEEP_COMPACT_RESTORE_RETRY_MIN` before probing that session again. The hand-picked-model check below
 runs again under the lock right before typing. Second, if the
