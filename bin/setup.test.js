@@ -957,13 +957,9 @@ function nodeHome() {
   return { home, tokenFile };
 }
 
-function capture(body) {
-  const lines = [];
-  const original = console.log;
-  console.log = (...args) => lines.push(args.join(' '));
-  try { body(); } finally { console.log = original; }
-  return lines.join('\n');
-}
+// No second capture() here: a function declaration of the same name replaced the
+// promise-aware one above for the whole file, so the doctor tests returned before
+// doctor finished and its exit code landed after they had restored theirs.
 
 test('keep node init writes a host-only service with the node identity and no registry', (t) => {
   const { home, tokenFile } = nodeHome();

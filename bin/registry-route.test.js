@@ -85,9 +85,11 @@ test('the registry route exists only where the daemon listens for nodes', async 
   const ping = matchRoute(on, { req: { method: 'GET' }, url: new URL('http://x/api/registry/ping') });
   assert.equal(ping.path, '/api/registry/ping');
   assert.deepEqual(ping.allow, ['node', 'admin', 'local']);
-  // Every other route still refuses a node.
-  const others = on.filter((entry) => !String(entry.path).startsWith('/api/registry'));
-  assert.equal(others.some((entry) => (entry.allow || []).includes('node')), false);
+  // Every other route still refuses a node: the node API is these and deploy-self.
+  const forNodes = on.filter((entry) => (entry.allow || []).includes('node')).map((entry) => entry.path);
+  assert.deepEqual(forNodes, ['/api/registry', '/api/registry/ping', '/api/deploy-self']);
+  for (const entry of on.filter((route) => forNodes.includes(route.path))) assert.equal(entry.when(), true);
+  for (const entry of off.filter((route) => forNodes.includes(route.path))) assert.equal(entry.when(), false);
 });
 
 test('only the listed registry commands run, and never a command-bearing flag', async (t) => {

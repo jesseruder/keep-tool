@@ -637,7 +637,7 @@ function hostUnit(env) {
   ].join('\n');
 }
 
-const NODE_USAGE = 'usage: keep node init <name> --daemon-node <name> --listen <ip:port> --token-file <path> [--sock <path>]';
+const NODE_USAGE = 'usage: keep node init <name> --daemon-node <name> --listen <ip:port> --token-file <path> [--sock <path>] [--daemon-url http://<ip:port>]';
 
 // `keep node init` runs on the node, not on the daemon: it installs the host on its
 // own, with no daemon and no registry, listening for the daemon that minted its
@@ -645,7 +645,7 @@ const NODE_USAGE = 'usage: keep node init <name> --daemon-node <name> --listen <
 function node(args, root, home = os.homedir()) {
   const [action, name, ...rest] = args;
   if (action !== 'init' || !name || name.startsWith('--')) throw new Error(NODE_USAGE);
-  const opts = options(rest, ['--daemon-node', '--listen', '--token-file', '--sock']);
+  const opts = options(rest, ['--daemon-node', '--listen', '--token-file', '--sock', '--daemon-url']);
   if (!config.NODE_NAME_RE.test(name)) throw new Error(`a node name is lowercase letters and digits: ${name}`);
   const daemonNode = opts['daemon-node'];
   if (!daemonNode || !config.NODE_NAME_RE.test(daemonNode)) throw new Error(NODE_USAGE);
@@ -667,6 +667,9 @@ function node(args, root, home = os.homedir()) {
   host.readNodeToken(tokenFile);
   const sock = canonicalPath((opts.sock || path.join(home, 'keep', '.keep', 'host.sock')).replace(/^~(?=\/|$)/, home));
   if (Buffer.byteLength(sock) > 103) throw new Error(`socket path too long (${Buffer.byteLength(sock)} bytes, max 103): ${sock}`);
+  // The daemon's node API, for this node's CLI to send registry commands to. Checked
+  // with the rule the CLI applies, so a service is never written with one it refuses.
+  if (opts['daemon-url'] !== undefined) require('./remote-cli.js').daemonBase(opts['daemon-url']);
   fs.mkdirSync(path.dirname(sock), { recursive: true });
   const env = {
     // Written out rather than inherited. The daemon holds the whole fleet to one home
@@ -682,6 +685,7 @@ function node(args, root, home = os.homedir()) {
     KEEP_DAEMON_NODE: daemonNode,
     KEEP_HOST_LISTEN: opts.listen,
     KEEP_NODE_TOKEN_FILE: tokenFile,
+    ...(opts['daemon-url'] !== undefined ? { KEEP_DAEMON_URL: opts['daemon-url'] } : {}),
     LANG: process.env.LANG || 'en_US.UTF-8',
   };
   const log = path.join(path.dirname(sock), 'host.log');
@@ -706,6 +710,7 @@ function node(args, root, home = os.homedir()) {
   }
   console.log('');
   console.log(`Node ${name} listens on ${opts.listen} for the daemon on ${daemonNode}; its local socket is ${sock}.`);
+  if (opts['daemon-url'] !== undefined) console.log(`Its registry commands go to the daemon's node API at ${opts['daemon-url']}.`);
 }
 
 function service(args, root) {
@@ -826,6 +831,46 @@ async function nodeHomeReport(deps = {}) {
   }));
 }
 
+// The node API, from whichever side this machine is on. On the daemon node: whether
+// the listener is configured and has an address it will bind. On a pane-only node:
+// whether KEEP_DAEMON_URL reaches the daemon, by asking its ping route with this
+// node's token. A single-node install with no nodeApi setting reports nothing.
+async function nodeApiReport(deps = {}) {
+  const env = deps.env || process.env;
+  const nodes = require('./nodes.js');
+  const where = nodes.paneOnlyNode(env);
+  if (!where) {
+    const listen = (deps.nodeApiListen || require('./node-registry.js').nodeApiListen)(env);
+    if (listen.enabled) return [{ status: 'ok', text: `node API listener configured at ${listen.listen}` }];
+    if (listen.error) {
+      return [{ status: 'FAIL', text: `node API listener: ${listen.error}`, fix: 'set nodeApi.listen in config.json to this machine\'s own <ip>:<port> (its Tailscale address)' }];
+    }
+    if (listen.reason === 'not configured') {
+      let others = [];
+      try { others = (deps.listNodes || require('./node-registry.js').listNodes)(env).filter((entry) => !entry.daemon); } catch {}
+      if (!others.length) return [];
+      return [{ status: 'optional', text: 'node API listener absent: nodes cannot run registry commands or land', fix: 'set nodeApi.listen in config.json to this machine\'s own <ip>:<port>, then keep restart-daemon' }];
+    }
+    return [{ status: 'optional', text: `node API listener not started: ${listen.reason}` }];
+  }
+  if (!env.KEEP_DAEMON_URL) {
+    return [{ status: 'optional', text: `KEEP_DAEMON_URL is not set: registry commands here are refused, not sent to ${where.daemon}`, fix: 'reinstall the host with keep node init ... --daemon-url http://<daemon node api>' }];
+  }
+  const remote = require('./remote-cli.js');
+  try {
+    const token = remote.nodeToken(env, deps.readToken);
+    const response = await (deps.request || remote.nodeApiRequest)(env.KEEP_DAEMON_URL, '/api/registry/ping', { method: 'GET', token, timeoutMs: deps.timeoutMs || 5000 });
+    const value = remote.parsed(response) || {};
+    if (response.status !== 200) return [{ status: 'FAIL', text: `the daemon at ${env.KEEP_DAEMON_URL} refused this node: ${value.error || `HTTP ${response.status}`}` }];
+    if (value.node !== where.local || value.daemon !== where.daemon) {
+      return [{ status: 'FAIL', text: `the daemon at ${env.KEEP_DAEMON_URL} answered as ${value.daemon} for node ${value.node}, not ${where.daemon} for ${where.local}` }];
+    }
+    return [{ status: 'ok', text: `daemon ${where.daemon} answers at ${env.KEEP_DAEMON_URL} (its clock: ${value.now})` }];
+  } catch (error) {
+    return [{ status: 'FAIL', text: `KEEP_DAEMON_URL ${env.KEEP_DAEMON_URL} does not reach the daemon: ${error.message}` }];
+  }
+}
+
 async function doctor(root) {
   let failed = false;
   const check = (name, fn, required = true) => {
@@ -874,7 +919,7 @@ async function doctor(root) {
     if (entry.fix) console.log(`  fix: ${entry.fix}`);
     if (entry.status === 'FAIL') failed = true;
   }
-  for (const entry of await nodeHomeReport()) {
+  for (const entry of [...await nodeHomeReport(), ...await nodeApiReport()]) {
     console.log(`${entry.status}: ${entry.text}`);
     if (entry.fix) console.log(`  fix: ${entry.fix}`);
     if (entry.status === 'FAIL') failed = true;
@@ -887,7 +932,7 @@ async function doctor(root) {
 }
 
 module.exports = {
-  init, installHooks, installSkills, service, node, doctor, nodeHomeReport, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
+  init, installHooks, installSkills, service, node, doctor, nodeHomeReport, nodeApiReport, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
   HOOK_ACTIONS, missingHooks, hookTargets, hookTarget,
   loadPacks, configuredPacks, installPackNames, skillPlans, applySkillPlans, reportSkillPlans, listPacks,
   recordPacks, recordPreflight,

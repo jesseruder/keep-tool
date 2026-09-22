@@ -72,7 +72,7 @@ function renderNodes(rows) {
   const table = rows.map((row) => [
     row.name + (row.daemon ? ' (daemon)' : ''),
     row.transport || '-',
-    (row.transport === 'tcp' ? row.address : row.sock) || '-',
+    ((row.transport === 'tcp' ? row.address : row.sock) || '-') + (row.nodeApi ? ` (node api ${row.nodeApi})` : ''),
     row.capabilities.join(',') || '-',
     // Flagged, not merely shown: a node whose home differs cannot run this install's
     // accounts at all, and the launch that finds out is a long way from here.
@@ -93,6 +93,10 @@ async function listNodes(argv, deps) {
   try { entries = registry.listNodes(); }
   catch (error) { die(error.message); }
   const rows = await Promise.all(entries.map((entry) => (entry.invalid ? entry : check(entry, deps))));
+  // The daemon's listener for its nodes, on its own row, when it has one; a
+  // single-node install never does, and its rows are what they always were.
+  const nodeApi = (deps.nodeApiListen || registry.nodeApiListen)();
+  if (nodeApi.enabled) for (const row of rows) if (row.daemon && !row.invalid) row.nodeApi = nodeApi.listen;
   console.log(o.json ? JSON.stringify(rows) : renderNodes(rows));
 }
 
@@ -132,11 +136,14 @@ function addNode(argv, deps) {
     die(error.message);
   }
   const listen = o.address;
+  // Read after the entry is written: the daemon listens for nodes only once it has one.
+  const nodeApi = (deps.nodeApiListen || registry.nodeApiListen)();
+  const daemonUrl = nodeApi.enabled ? ` --daemon-url ${nodeApi.url}` : '';
   console.log(`Added node ${name} at ${o.address}${capabilities.length ? ` (${capabilities.join(', ')})` : ''}.`);
   console.log(`Its token is written here at ${tokenFile}. It is printed once — put the same bytes on ${name}:`);
   console.log('');
   console.log(`  umask 077 && printf '%s\\n' ${token} > ~/.keep-node-token`);
-  console.log(`  keep node init ${name} --daemon-node ${daemon} --listen ${listen} --token-file ~/.keep-node-token`);
+  console.log(`  keep node init ${name} --daemon-node ${daemon} --listen ${listen} --token-file ~/.keep-node-token${daemonUrl}`);
   console.log('');
   console.log(`Then restart this daemon so it picks up the new node: keep restart-daemon`);
 }
