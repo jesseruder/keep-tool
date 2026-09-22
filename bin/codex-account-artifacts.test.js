@@ -42,7 +42,7 @@ function writeLedger(root, id, file, parent = null, children = {}) {
   const directory = path.join(root, '.keep', 'background-jobs', 'codex', id);
   fs.mkdirSync(directory, { recursive: true });
   fs.writeFileSync(path.join(directory, 'state.json'), JSON.stringify({
-    version: 1, restartVersion: 1, gap: false, recovering: false,
+    version: 1, restartVersion: require('./background-jobs').restartVersion('codex'), gap: false, recovering: false,
     source: { agent: 'codex', sid: id, file, instance: null },
     restart: { id, parent, children },
   }));

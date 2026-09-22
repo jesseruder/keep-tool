@@ -198,7 +198,7 @@ function ledgerState(root, id, file, parent, allowRecovering = false) {
   const snapshot = path.join(root, '.keep', 'background-jobs', 'codex', id, 'state.json');
   const state = readJson(snapshot);
   const restart = state?.restart;
-  if (!state || state.version !== 1 || state.restartVersion !== 1 || state.gap || (!allowRecovering && state.recovering)
+  if (!state || state.version !== 1 || state.restartVersion !== require('./background-jobs').restartVersion('codex') || state.gap || (!allowRecovering && state.recovering)
       || state.source?.agent !== 'codex' || state.source.sid !== id
       || path.resolve(state.source.file || '') !== path.resolve(file)
       || restart?.id !== id || (parent || null) !== (restart.parent || null)
