@@ -224,7 +224,7 @@ function startSchedulers(ctx) {
     addHostSessionState, agentProcessRows, broadcast, buildState, cardUsage, closeEphemeralPane,
     closeIdleSession, companionSnapshot, dashboardBuild, dashboardBuilder, deliverCheckToThread, deliverUnblockToThread,
     deps, discord, driftWakeFromVerdict, envNumber, features, forceRestartSession, fs, health, hostRequest,
-    ideas, keep, keepConsole, landed, limitresume, listHostPanes, liveSessionTick,
+    ideas, keep, keepConsole, landed, limitresume, listHostPaneResult, listHostPanes, liveSessionTick,
     liveTurnIndexSessions, loadCurrentSession, openCheckSession, openSession, path,
     prepareSessionSummary, readLiveSessionLedger, readScreenResult, resolveSessionTarget, restartSession,
     resumeAfterLimit,
@@ -265,10 +265,18 @@ function startSchedulers(ctx) {
     // id), so a replacement racing this snapshot cannot retire a live draft. An
     // unreachable host or an empty list (see findCardPane) retires nothing.
     reconcile: async () => {
-      const listed = await listHostPanes(deps, true);
-      const panes = Array.isArray(listed) && listed.length
-        ? new Set(listed.filter((pane) => typeof pane?.id === 'string').map((pane) => pane.id)) : null;
-      return withInjectionLock(() => require('../delivery').reconcile(path.join(keep.ROOT, '.keep', 'delivery'), { panes }));
+      const listed = await listHostPaneResult(deps, true);
+      const panes = Array.isArray(listed.panes) && listed.panes.length
+        ? new Set(listed.panes.filter((pane) => typeof pane?.id === 'string').map((pane) => pane.id)) : null;
+      // The nodes this list could not speak for: one that did not answer, and one
+      // whose panes came from its own memo rather than from the machine. A journal
+      // on either is unresolved, not retired.
+      const unknownNodes = new Set([
+        ...(listed.missingNodes || []),
+        ...Object.entries(listed.nodes || {}).filter(([, status]) => status.stale || !status.ok).map(([name]) => name),
+      ]);
+      return withInjectionLock(() => require('../delivery')
+        .reconcile(path.join(keep.ROOT, '.keep', 'delivery'), { panes, unknownNodes }));
     },
   });
   unblock.startScheduler({

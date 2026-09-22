@@ -2432,7 +2432,16 @@ function nodeStatusForPublish(result, memo, now) {
       continue;
     }
     if (!entry.failingSince) entry.failingSince = now;
-    status[name] = { ok: false, reason: reported.reason || 'unreachable', since: entry.failingSince };
+    status[name] = {
+      ok: false,
+      reason: reported.reason || 'unreachable',
+      since: entry.failingSince,
+      // What the panes travelling under this node's name actually are: the last
+      // thing it said, and when it said it. A console that shows them without this
+      // is showing a live machine.
+      ...(reported.stale ? { stale: true, panesAt: reported.panesAt } : {}),
+      ...(reported.detail ? { detail: reported.detail } : {}),
+    };
   }
   return status;
 }
@@ -2442,10 +2451,16 @@ function hostPanesForPublish(result, memo, now, epoch = memo.epoch || 0) {
   const panes = result ? result.panes : null;
   const nodeStatus = nodeStatusForPublish(result, memo, now);
   const withNodes = (host) => (nodeStatus ? { ...host, nodes: nodeStatus } : host);
+  // A list with a node missing from it is publishable and is not the fleet: this
+  // memo is what a later outage is reconstructed from, and reconstructing it from a
+  // partial list would report the missing node's panes as gone at the worst moment.
+  const incomplete = Boolean(result && result.missingNodes && result.missingNodes.length);
   if (Array.isArray(panes)) {
     if (current) {
-      memo.panes = panes;
-      memo.at = now;
+      if (!incomplete) {
+        memo.panes = panes;
+        memo.at = now;
+      }
       memo.listed = true; // survives the mutation fence: this daemon has seen a host
       memo.failingSince = 0;
     }
@@ -2458,16 +2473,24 @@ function hostPanesForPublish(result, memo, now, epoch = memo.epoch || 0) {
   // permanent warning on a console that is telling the truth. The socket is the
   // evidence, not the memo alone, because the host outlives daemon restarts.
   if (reason === 'unreachable' && !memo.listed && !(result && result.endpoint)) {
-    return { panes, host: withNodes({ ok: true }) };
+    // No host has ever answered here and nothing is bound to the socket — but the
+    // other nodes answered, and their panes are real. Publishing null would report
+    // a fleet that is running as an empty one.
+    return { panes: (result && result.nodePanes) || panes, host: withNodes({ ok: true }) };
   }
   if (current && !memo.failingSince) memo.failingSince = now;
   const reuseMs = reason === 'timeout' ? HOST_PANES_SLOW_REUSE_MS : HOST_PANES_REUSE_MS;
   const reused = current && memo.panes && now - memo.at < reuseMs ? memo.panes : null;
   // The daemon node is silent, but the other nodes answered. Their panes are the
-  // freshest thing there is; publishing null would report the whole fleet as gone.
+  // freshest thing there is, so they replace whatever the reused list last said
+  // about those nodes rather than losing to it.
   const fromNodes = (result && result.nodePanes) || null;
+  const answered = new Set((fromNodes || []).map((pane) => pane.node));
+  const carried = reused && fromNodes
+    ? [...reused.filter((pane) => !answered.has(pane.node)), ...fromNodes]
+    : (reused || fromNodes || panes);
   return {
-    panes: reused || fromNodes || panes,
+    panes: carried,
     host: withNodes({
       ok: false,
       reason,
@@ -12164,7 +12187,7 @@ function start(deps = {}) {
     envNumber, features, forceRestartSession, fs, handoffRateLimited, handoffSession, handoffSessionRequest, health, hostRequest,
     ideas,
     inspectReviewQueueLaunch, keep, keepConsole, landed, launchReviewQueueSession,
-    limitresume, listHostPanes, listPortableTransfers, liveSessionTick, liveTurnIndexSessions,
+    limitresume, listHostPaneResult, listHostPanes, listPortableTransfers, liveSessionTick, liveTurnIndexSessions,
     loadCurrentSession, notifications, openCheckSession, openSession, path, portableTransferDraft,
     portableTransferPreview, preparePortableTransfer, prepareSessionSummary, projectMobileState,
     readBody, readLiveSessionLedger, readScreenResult, recentTranscriptText, recoverReviewQueueLaunch, reminders,

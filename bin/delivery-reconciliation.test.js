@@ -135,3 +135,36 @@ test('retained receipts have a single owner and cannot reappear after acknowledg
     submitDraft: async () => assert.fail('unexpected Enter'), draftMatches: async () => false }), /unconfirmed/);
   assert.equal(delivery.statusForText(f.directory, 'scheduled check', 'card:date'), null);
 }));
+
+// A pane the list does not mention is normally a draft that will never be typed.
+// On a node that did not answer, it is a draft nobody can speak for.
+test('a journal on a node that did not answer is left exactly as it was', () => fixture(f => {
+  const cold = f.add('claude', 'cold start', { sessionId: 'remote-session', pane: 'r1@aws1', typedAt: Date.now() - 20 * 60e3, createdAt: Date.now() - 20 * 60e3 });
+  const gone = f.add('codex', 'really gone', { sessionId: 'gone-session', pane: 'r2@aws1', typedAt: Date.now() - 20 * 60e3, createdAt: Date.now() - 20 * 60e3 });
+  const panes = new Set(['local-1']);
+
+  // Cold start: the daemon has just come up and the remote node is unreachable, so
+  // its panes are missing from the list for a reason that says nothing about them.
+  assert.deepEqual(delivery.reconcile(f.directory, { panes, unknownNodes: new Set(['aws1']) }), []);
+  assert.ok(fs.existsSync(cold.journal));
+  assert.ok(fs.existsSync(gone.journal));
+
+  // The same after that node's memo has expired and its panes have dropped out of
+  // the merged list entirely: still unknown, still not settled.
+  assert.deepEqual(delivery.reconcile(f.directory, { panes, unknownNodes: new Set(['aws1']) }), []);
+  assert.ok(fs.existsSync(cold.journal));
+
+  // A complete list is a different statement: the node answered and did not mention
+  // the pane, so the draft really is gone and is settled as it always was.
+  const settled = delivery.reconcile(f.directory, { panes: new Set(['local-1', 'r1@aws1']), unknownNodes: new Set() });
+  assert.deepEqual(settled.sort(), ['gone-session']);
+  assert.ok(fs.existsSync(cold.journal), 'the pane the node still lists keeps its journal');
+  assert.equal(fs.existsSync(gone.journal), false);
+}));
+
+test('a journal on the daemon node is unaffected by another node being unknown', () => fixture(f => {
+  const local = f.add('claude', 'local draft', { pane: 'p1', typedAt: Date.now() - 20 * 60e3, createdAt: Date.now() - 20 * 60e3 });
+  assert.deepEqual(delivery.reconcile(f.directory, { panes: new Set(['p2']), unknownNodes: new Set(['aws1']) }),
+    [local.entry.sessionId]);
+  assert.equal(fs.existsSync(local.journal), false);
+}));

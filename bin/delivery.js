@@ -498,7 +498,16 @@ function pendingForSession(directory, sessionId) {
 // no record, so its owner may run the check again - the same trade Keep already
 // makes for a `typedAt` entry here, where Enter definitely WAS pressed. Running a
 // scheduled check twice is recoverable; stamping one delivered for good is not.
-function reconcile(directory, { now = Date.now(), staleJournalMs = STALE_JOURNAL_MS, panes = null } = {}) {
+// A journal whose pane the host no longer lists is a draft that will never be
+// typed — unless the reason the pane is not listed is that its machine did not
+// answer. `unknownNodes` names the nodes this pane list could not speak for, and a
+// journal on one of them is left exactly as it is: not deleted, not settled, not
+// counted as resolved. "I could not tell" is not "it is gone".
+function reconcile(directory, {
+  now = Date.now(), staleJournalMs = STALE_JOURNAL_MS, panes = null, unknownNodes = null,
+} = {}) {
+  const unknown = unknownNodes instanceof Set ? unknownNodes : new Set(unknownNodes || []);
+  const paneNode = (pane) => require('./nodes.js').parsePaneRef(String(pane || '')).node;
   let files;
   try { files = fs.readdirSync(directory).filter(name => name.endsWith('.json')); }
   catch (error) { if (error.code === 'ENOENT') return []; throw error; }
@@ -515,7 +524,7 @@ function reconcile(directory, { now = Date.now(), staleJournalMs = STALE_JOURNAL
       if (!received(entry)) {
         if (journalAgeMs(journal, entry, now) < staleJournalMs) continue;
         if (!(Number(entry.typedAt) > 0) && !partialTyping(entry)) fs.unlinkSync(journal);
-        else if (panes?.size && !panes.has(entry.pane)) {
+        else if (panes?.size && !panes.has(entry.pane) && !unknown.has(paneNode(entry.pane))) {
           if (entry.retainReceipt || !(Number(entry.typedAt) > 0 || completedTyping(entry))) fs.unlinkSync(journal);
           else settle(journal, name);
           settled.push(entry.sessionId);

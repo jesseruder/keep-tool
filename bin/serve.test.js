@@ -13454,3 +13454,42 @@ test('a node whose entry does not make sense is reported, not quietly dropped', 
     } finally { await closeHostClient(); }
   });
 });
+
+test('a publication carries what each node is and is not saying', () => {
+  const { hostPanesForPublish } = require('./serve');
+  const start = 1000;
+  const memo = { epoch: 0, panes: null, at: 0 };
+  const local = { id: 'p1', node: 'main' };
+  const remote = { id: 'r1@aws1', node: 'aws1' };
+  const older = { id: 'r0@aws1', node: 'aws1' };
+
+  // Everything answered: remembered as the fleet.
+  const whole = hostPanesForPublish({ panes: [local, remote], failure: null, nodes: { aws1: { ok: true } } }, memo, start);
+  assert.deepEqual(whole.host, { ok: true, nodes: { aws1: { ok: true } } });
+  assert.deepEqual(memo.panes, [local, remote]);
+
+  // One node stale: publishable, and not what the fleet is remembered as.
+  const partial = hostPanesForPublish({
+    panes: [local, older], failure: null, missingNodes: ['aws1'],
+    nodes: { aws1: { ok: false, reason: 'timeout', stale: true, panesAt: 900 } },
+  }, memo, start + 1000);
+  assert.deepEqual(partial.host.nodes.aws1, { ok: false, reason: 'timeout', since: start + 1000, stale: true, panesAt: 900 });
+  assert.deepEqual(memo.panes, [local, remote], 'the memo still holds the last whole picture');
+
+  // The daemon node silent: the nodes that did answer replace what the reused list
+  // last said about them, rather than losing to it.
+  const down = hostPanesForPublish({
+    panes: null, failure: 'unreachable', endpoint: true, nodePanes: [remote], nodes: { aws1: { ok: true } },
+  }, memo, start + 2000);
+  assert.equal(down.host.ok, false);
+  assert.deepEqual(down.panes.map((pane) => pane.id), ['p1', 'r1@aws1']);
+
+  // A daemon host that has never been seen, with nothing bound to its socket, is
+  // not an outage — but it is not an empty fleet either.
+  const cold = { epoch: 0, panes: null, at: 0 };
+  const first = hostPanesForPublish({
+    panes: null, failure: 'unreachable', endpoint: false, nodePanes: [remote], nodes: { aws1: { ok: true } },
+  }, cold, start);
+  assert.deepEqual(first.host, { ok: true, nodes: { aws1: { ok: true } } });
+  assert.deepEqual(first.panes.map((pane) => pane.id), ['r1@aws1']);
+});
