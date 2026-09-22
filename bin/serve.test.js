@@ -3146,9 +3146,10 @@ test('auto-compact tick continues after a retryable precheck failure', async (t)
   ];
   const decisions = [];
   const compacted = [];
+  const scans = [];
   const outcome = await autoCompactTick({
     sweepPendingCompactSwaps: async () => ({ checked: 0 }), gcAutoCompactStamps: () => {},
-    readAutoCompactStamps: () => ({}), scanSessions: () => sessions,
+    readAutoCompactStamps: () => ({}), scanSessions: (options) => { scans.push(options); return sessions; },
     listHostPanes: async () => sessions.map((session) => ({ alive: true, meta: { sessionId: session.id } })),
     sessionLastTurn: (session) => ({
       contextTokens: 180000, model: 'gpt-6-astra',
@@ -3169,6 +3170,7 @@ test('auto-compact tick continues after a retryable precheck failure', async (t)
   assert.equal(outcome.detail, 'compacted');
   assert.deepEqual(compacted, ['ready']);
   assert.deepEqual(decisions.map((stamp) => stamp.sessionId), ['ready']);
+  assert.deepEqual(scans, [{ fresh: false }], 'the candidate scan reads the bounded index');
 });
 
 test('auto-compact resolve-time pane exit is stamped and skipped, while other resolve errors fail', async (t) => {
@@ -7667,6 +7669,7 @@ test('live process discovery keeps argv, Claude child environment, and Codex rol
 
 test('live session tick merges direct host bindings without pane-record backfill', async () => {
   let written;
+  const scans = [];
   const processLive = new Map([['process-session', {
     pid: 41, agent: 'claude', source: 'argv', primary: true,
   }]]);
@@ -7679,11 +7682,12 @@ test('live session tick merges direct host bindings without pane-record backfill
     ledger: { sessions: {} },
     liveSessionPids: async () => processLive,
     paneRecords: new Map([['process-session', { pane: 'pane-process', cwd: '/process-project', agent: 'claude', at: 1 }]]),
-    scanSessions: () => [],
+    scanSessions: (options) => { scans.push(options); return []; },
     host,
     writeLedger: (ledger) => { written = ledger; },
   });
   assert.equal(result.ok, true);
+  assert.deepEqual(scans, [{ fresh: false }], 'the ledger tick reads the bounded index');
   assert.deepEqual(written.sessions['process-session'], {
     pid: 41, agent: 'claude', project: '/process-project', source: 'argv', primary: true, lastSeenAlive: 9000,
   });

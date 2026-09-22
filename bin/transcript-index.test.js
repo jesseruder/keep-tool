@@ -144,3 +144,16 @@ test('removed projects and root are evicted without resurrecting stale sessions'
   fs.rmSync(root, { recursive: true });
   assert.deepEqual(index.scan(), []);
 });
+
+test('a transcript replaced by rename is re-statted when its directory is re-listed, with no watcher event', t => {
+  const { root, index, write } = fixture(t);
+  const file = write('moved', 'old contents', true);
+  const before = index.scan().find(row => row.id === 'moved').stat;
+  // An account handoff writes the new copy beside the old one and renames it over.
+  const temp = path.join(root, 'project', 'moved.jsonl.tmp');
+  fs.writeFileSync(temp, 'new contents, longer than the old');
+  fs.renameSync(temp, file);
+  const after = index.scan().find(row => row.id === 'moved').stat;
+  assert.notEqual(after.ino, before.ino);
+  assert.equal(after.size, fs.statSync(file).size, 'the bounded scan returns the replacement, not the historical stat');
+});

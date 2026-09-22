@@ -3512,3 +3512,53 @@ test('a live drift wake and a parked retry cannot clobber each other in _meta.js
     assert.deepEqual(cadence.duePendingDrifts(cadence.loadMeta()), []);
   } finally { health.record = original; }
 });
+
+test('the reviewer is found from bounded rows and re-looked at fresh before anything is typed', async () => {
+  const cadence = require('./review.js');
+  const health = require('./health.js');
+  cadence.mutateMeta((meta) => { meta.drift = {}; meta.fallback = {}; meta.sweepTick = {}; delete meta.lastTickAt; });
+  const original = health.record;
+  health.record = () => {};
+  const asked = [];
+  const reviewer = { id: 'reviewer-1', kind: 'claude', state: 'idle', endedTurn: true };
+  const sent = [];
+  const deps = {
+    // The daemon's source reads bounded rows unless asked for fresh.
+    sessions: (options) => { asked.push(options === undefined ? 'default' : options); return [reviewer]; },
+    findReviewer: (sessions) => sessions[0] || null,
+    reviewBudget: () => ({ code: 0, reason: 'within budget' }),
+    lastVerdictAt: () => 0,
+    lintSnapshotAgeMs: () => 0,
+    refreshLint: async () => ({ ok: true }),
+    send: async (_id, text) => { sent.push(text); },
+  };
+  try {
+    await cadence.reviewTick(deps, { trigger: 'sweep', sweepDue: true });
+    assert.equal(sent.length, 1);
+    assert.deepEqual(asked, ['default', { fresh: true }], 'the first look is bounded, the look before typing is fresh');
+
+    // A forced tick has no re-look, so its only read is the fresh one.
+    asked.length = 0;
+    await cadence.reviewTick(deps, { force: true });
+    assert.deepEqual(asked, [{ fresh: true }]);
+  } finally { health.record = original; }
+
+  // The compaction tick: same split.
+  asked.length = 0;
+  const clock = Date.parse('2026-09-03T22:00:00Z');
+  let meta = { lastTickAt: clock - 5 * 60e3, lastCompactAt: 0, days: {} };
+  const idle = { ...reviewer, mtime: clock - 3 * 60e3 };
+  const result = await cadence.reviewerCompactTick({
+    now: () => clock,
+    loadMeta: () => meta,
+    saveMeta: (next) => { meta = next; },
+    reviewer: (sessions) => sessions[0],
+    sessions: (options) => { asked.push(options === undefined ? 'default' : options); return [idle]; },
+    transcriptMtime: () => clock - 3 * 60e3,
+    sessionContextTokens: () => 90000,
+    minTokens: 40000,
+    compact: async () => ({ compacted: true }),
+  });
+  assert.equal(result.compacted, true);
+  assert.deepEqual(asked, ['default', { fresh: true }]);
+});

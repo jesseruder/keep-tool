@@ -307,8 +307,10 @@ function createCleanupSnapshot({
 // The session scan a timer reads: bounded (see scanClaudeSessions in serve.js). A
 // tick only decides whether to act; whatever it then acts on is re-read fresh by
 // the action path (loadCurrentSession, closeEphemeralPane, the send prechecks), so a
-// transcript index up to 5 s behind costs at most one tick of delay, while a fresh
-// pass stats every transcript on the machine on every tick of every scheduler.
+// transcript index behind by a sweep (5 s for a recent transcript, 60 s for one idle
+// over 48 h) costs a tick of delay, while a fresh pass stats every transcript on the
+// machine on every tick of every scheduler. A tick that makes a final decision from
+// the rows themselves asks for fresh instead (the notes sweep, the area-session tick).
 function periodicSessionScan(scanSessions) {
   return (options = {}) => scanSessions({ ...options, fresh: false });
 }
@@ -394,7 +396,10 @@ function startSchedulers(ctx) {
   // the system reads an expired note as a reason to stop.
   require('../notes.js').startScheduler({
     onChange: broadcast,
-    sessions: () => periodicScan(),
+    // Fresh on purpose: an author absent or exited in these rows gets its note
+    // handed to Owner for good, a terminal decision a bounded index could make on a
+    // session it has not caught up with. It scans only when a note is due.
+    sessions: () => scanSessions({ fresh: true }),
     send: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }),
   });
   startAutoCompact();

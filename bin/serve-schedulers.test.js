@@ -445,16 +445,29 @@ test('periodic schedulers read sessions from the bounded transcript index', () =
   assert.deepEqual(calls, [{ fresh: false }, { readOnly: true, fresh: false }], 'a tick cannot ask for a fresh pass');
 
   // startSchedulers needs the whole daemon, so the wiring is read from its source:
-  // every timer that scans goes through periodicScan, and the one deliberate fresh
-  // scan is the area-session tick, which launches and delivers from what it reads.
+  // every timer that scans goes through periodicScan, and the deliberate fresh scans
+  // are the area-session tick (it launches and delivers from what it reads) and the
+  // notes sweep (it hands a note to Owner for good on what it reads).
   const source = fs.readFileSync(path.join(__dirname, 'serve', 'schedulers.js'), 'utf8');
-  const body = source.slice(source.indexOf('function startSchedulers('));
+  let body = source.slice(source.indexOf('function startSchedulers('));
   const wired = (pattern) => assert.match(body, pattern);
   wired(/runs\.setEphemeralHost\(\{[\s\S]*?sessions: \(\) => periodicScan\(\),[\s\S]*?\}\);/);
-  wired(/require\('\.\.\/notes\.js'\)\.startScheduler\(\{[\s\S]*?sessions: \(\) => periodicScan\(\),/);
   wired(/limitresume\.startScheduler\(\{[\s\S]*?scanSessions: \(\) => periodicScan\(\),/);
   wired(/ctx\.sessionSnapshot : periodicScan\(\);/);
-  const fresh = body.match(/\bscanSessions\(\)/g) || [];
-  assert.equal(fresh.length, 1, 'only the area-session tick scans fresh');
-  assert.match(body, /const areaSessionDeps = \(\) => \(\{[\s\S]*?scanSessions: \(\) => scanSessions\(\),/);
+  wired(/require\('\.\.\/notes\.js'\)\.startScheduler\(\{[\s\S]*?sessions: \(\) => scanSessions\(\{ fresh: true \}\),/);
+  wired(/const areaSessionDeps = \(\) => \(\{[\s\S]*?scanSessions: \(\) => scanSessions\(\),/);
+  // Strip every sanctioned use, then no reference to scanSessions may remain: not a
+  // bare call, not one with other options, not the function handed over as is.
+  const allowed = [
+    /\bruns, scanSessions, sendToResolvedTarget\b/, // the destructuring of ctx
+    /periodicSessionScan\(scanSessions\)/,
+    /scanSessions: \(\) => scanSessions\(\),/, // area-session deps
+    /sessions: \(\) => scanSessions\(\{ fresh: true \}\),/, // notes sweep
+  ];
+  for (const pattern of allowed) {
+    assert.equal((body.match(new RegExp(pattern.source, 'g')) || []).length, 1, String(pattern));
+    body = body.replace(pattern, '');
+  }
+  body = body.replace(/\bscanSessions:/g, ''); // property names handed to modules
+  assert.deepEqual(body.match(/.*\bscanSessions\b.*/g) || [], [], 'every other scan is periodicScan');
 });

@@ -10337,10 +10337,14 @@ function scanClaudeSessions(options = {}) {
   const panesBySession = options.hostPanesBySession || hostPanesBySession(options.hostPanes || []);
   // Fresh re-lists every project directory and stats every transcript (tens of
   // thousands on a long-lived machine); bounded trusts the watcher and re-stats a
-  // recent file at most every 5 s, anything older every 60 s, and costs no I/O when
-  // nothing changed. A directory whose mtime moved is always re-listed, so a new
-  // transcript is normally seen by either mode; what bounded can miss for up to 5 s
-  // is an append whose watcher event was dropped.
+  // transcript touched in the last 48 h at most every 5 s, anything older every
+  // 60 s, and costs no I/O when nothing changed. A directory whose mtime moved is
+  // re-listed and all its entries re-statted, so a created or renamed-over
+  // transcript is seen by either mode. What bounded can miss, when a watcher event
+  // is dropped (or the watcher is dead, see the transcript-watcher health row), is
+  // an append: up to 5 s for a recent transcript, and up to 60 s for one idle over
+  // 48 h. SESSION_WINDOW_MS is the same 48 h, so such a resumed session is not just
+  // late but absent from bounded rows for up to that 60 s.
   //
   // Bounded (fresh: false) is for callers that only decide whether to act later and
   // re-read the session they pick before touching it: the auto-compact, limit-resume,
@@ -13198,12 +13202,16 @@ function start(deps = {}) {
   // A focus request (mobile 'Open on Mac') is a named SSE event the console acts on.
   onFocus = (sessionId) => uiWorker?.event({ type: 'focus', data: sessionId });
 
-  const watch = (target, opts, invalidate) => {
+  const watch = (target, opts, invalidate, onFailure) => {
     try {
       const w = fs.watch(target, opts || {}, (_event, name) => { invalidate?.(name); broadcast(); });
-      w.on('error', () => {}); // a dead watch must never crash the server; the client's 30s poll covers it
+      // A dead watch must never crash the server; the client's 30s poll covers it.
+      w.on('error', (error) => onFailure?.(error));
+      return true;
     } catch (e) {
-      process.stderr.write(`keep serve: cannot watch ${target} (${e.message}); relying on client polling\n`);
+      if (onFailure) onFailure(e);
+      else process.stderr.write(`keep serve: cannot watch ${target} (${e.message}); relying on client polling\n`);
+      return false;
     }
   };
   watch(keep.TASKS, null, (name) => { dashboardBuilder.invalidate({ kind: 'tasks', name }); dashboardPublisher.invalidate(); });
@@ -13226,13 +13234,30 @@ function start(deps = {}) {
   watch(path.join(keep.ROOT, '.keep', 'unblocked'), null, (name) => { dashboardBuilder.invalidate({ kind: 'unblocked', name }); dashboardPublisher.invalidate(); });
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'review'), { recursive: true }); } catch {}
   watch(path.join(keep.ROOT, '.keep', 'review'), null, (name) => { dashboardBuilder.invalidate({ kind: 'review', name }); dashboardPublisher.invalidate(); });
+  // The bounded transcript index trusts these watchers to invalidate a changed
+  // file between its sweeps. A dead one leaves the dashboard and every periodic tick
+  // on sweeps alone (up to 5 s behind for a recent transcript, 60 s for an older
+  // one) until the daemon restarts, so say so once, and keep a health row on it.
+  let transcriptWatchFailed = false;
+  const transcriptWatchFailure = (error) => {
+    if (transcriptWatchFailed) return;
+    transcriptWatchFailed = true;
+    const message = String(error && error.message || error || 'unknown error');
+    process.stderr.write(`keep serve: transcript watcher failed: ${message}; bounded scans rely on sweeps until restart\n`);
+    try { health.record('transcript-watcher', { ok: false, error: `${message}; bounded scans rely on sweeps until restart` }); } catch {}
+  };
+  let transcriptWatchers = 0;
   for (const entry of claudeProjectRoots) {
-    watch(entry.root, { recursive: true }, (name) => {
+    if (watch(entry.root, { recursive: true }, (name) => {
       claudeTranscriptIndex.invalidate(entry.root, name);
       if (name) backgroundJobScheduler?.wakeFile(path.join(entry.root, String(name)));
       dashboardBuilder.invalidate({ kind: 'claude', root: entry.root, name });
       dashboardPublisher.invalidate();
-    });
+    }, transcriptWatchFailure)) transcriptWatchers += 1;
+  }
+  // A clean start clears a failure an earlier daemon recorded.
+  if (!transcriptWatchFailed) {
+    try { health.record('transcript-watcher', { ok: true, detail: `watching ${transcriptWatchers} Claude project root${transcriptWatchers === 1 ? '' : 's'}` }); } catch {}
   }
   for (const sessionsRoot of new Set(codex.configuredRoots().map((entry) => path.join(entry.configDir, 'sessions')))) {
     watch(sessionsRoot, { recursive: true }, (name) => {

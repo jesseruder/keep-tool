@@ -72,12 +72,19 @@ function createTranscriptIndex(root, { io = fs, now = Date.now, sweepMs = 60000,
       for (const { dir, full, stat } of rootEntries) {
         if (!stat) continue;
         let listing = directories.get(full);
+        // A re-read listing means the directory changed: a file created, removed, or
+        // replaced by rename (an account handoff writes a transcript that way). A
+        // replaced file keeps its path, so only a stat tells it apart, and a dropped
+        // watcher event would otherwise leave the old stat for a whole TTL. Re-stat
+        // every entry of a directory that was just re-listed; the rest keep theirs.
+        let relisted = false;
         if (fresh || !listing || listing.mtime !== stat.mtimeMs || listing.ino !== stat.ino || at - listing.at >= sweepMs || at < listing.at) {
           try { listing = { entries: io.readdirSync(full).filter(name => name.endsWith('.jsonl')).map((name) => ({
             file: path.join(full, name), id: name.slice(0, -6),
           })), mtime: stat.mtimeMs, ino: stat.ino, at, seen: generation }; }
           catch { inspectionFailed = true; continue; }
           directories.set(full, listing);
+          relisted = true;
         }
         listing.seen = generation;
         next = Math.min(next, listing.at + sweepMs);
@@ -85,7 +92,7 @@ function createTranscriptIndex(root, { io = fs, now = Date.now, sweepMs = 60000,
           const file = item.file;
           let entry = files.get(file);
           const ttl = entry && at - entry.stat.mtimeMs <= recentMs ? recentSweepMs : sweepMs;
-          if (fresh || !entry || dirty.has(file) || at - entry.at >= ttl || at < entry.at) {
+          if (fresh || relisted || !entry || dirty.has(file) || at - entry.at >= ttl || at < entry.at) {
             try { entry = { stat: io.statSync(file), at, seen: generation }; files.set(file, entry); }
             catch { files.delete(file); inspectionFailed = true; continue; }
           }

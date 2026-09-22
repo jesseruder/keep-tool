@@ -4417,7 +4417,9 @@ async function reviewTick(deps, opts) {
   const detail = trigger === 'drift' ? options.drift : null;
   const now = Date.now();
   const meta = loadMeta();
-  const sessions = deps.sessions ? deps.sessions() : [];
+  // The daemon's session source is bounded unless asked otherwise. A forced tick
+  // skips the re-look below and types on this read alone, so it asks for fresh here.
+  const sessions = deps.sessions ? (options.force ? deps.sessions({ fresh: true }) : deps.sessions()) : [];
   const reviewer = (deps.findReviewer || findReviewerSession)(sessions, meta.bootstrapAttempts);
   const model = reviewer ? (readReviewerMarker(reviewer.id).model || reviewerModel()) : reviewerModel();
   // Account precedence, deliberately: the session's own account if the daemon knows
