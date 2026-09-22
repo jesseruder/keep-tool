@@ -14,9 +14,13 @@ const { named: sessionNamed } = sessionNumbers;
 // Session numbers are a registry fact, and a terminal host is not: it may run on
 // a machine that keeps no cards at all. Resolve the root where it is used, and
 // answer null rather than a path into a registry that is not there.
+//
+// The test is `.keep`, which is where the numbers themselves live: a registry can
+// hold numbers for sessions before it holds a single card, and a host-only machine
+// has no such directory at all.
 function registryRoot() {
   const { ROOT } = require('../keep-core.js');
-  try { return fs.existsSync(path.join(ROOT, 'tasks')) ? ROOT : null; } catch { return null; }
+  try { return fs.existsSync(path.join(ROOT, '.keep')) ? ROOT : null; } catch { return null; }
 }
 
 const commands = {};

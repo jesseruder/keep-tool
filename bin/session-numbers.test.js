@@ -6,6 +6,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+const { spawnSync } = require('node:child_process');
+
 const numbers = require('./session-numbers.js');
 
 function root() {
@@ -176,4 +178,30 @@ test('ref and named print a session by its number, falling back to the id prefix
   // The cache follows the registry file: a number allocated later shows up.
   numbers.assign([{ id: unnumbered, mtime: 2 }], { root: dir });
   assert.equal(numbers.ref(unnumbered, { root: dir }), '#2');
+});
+
+test('a machine with no registry shows no numbers and refuses one by name', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-no-registry-'));
+  try {
+    // A directory, but not a registry: no .keep, so there are no numbers to read.
+    const script = `
+      const { renderPanePanes, resolveHostPane } = require(${JSON.stringify(path.join(__dirname, 'commands', 'host.js'))});
+      const panes = [{ id: 'p1', alive: true, cols: 80, rows: 24, title: 'one', cwd: '/tmp',
+        meta: { agent: 'claude', sessionId: 'abcdef12-0000-4000-8000-000000000001' } }];
+      const out = { table: renderPanePanes(panes) };
+      resolveHostPane({ request: async () => ({ panes }) }, '#1')
+        .then((pane) => { out.resolved = pane.id; })
+        .catch((error) => { out.error = error.message; })
+        .then(() => process.stdout.write(JSON.stringify(out)));
+    `;
+    const env = { ...process.env, KEEP_DIR: dir, KEEP_NO_PUSH: '1' };
+    for (const key of ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID']) delete env[key];
+    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', env });
+    assert.equal(result.status, 0, result.stderr);
+    const out = JSON.parse(result.stdout);
+    assert.equal(fs.existsSync(path.join(dir, '.keep')), false, 'reading numbers must not create a registry');
+    assert.ok(!out.table.includes('#'), `a registry-less machine labels no numbers: ${out.table}`);
+    assert.match(out.error, /this machine has none/);
+    assert.equal(out.resolved, undefined);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
