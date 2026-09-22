@@ -491,7 +491,7 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
         redirect: state.source };
     }
     if (state.source?.includeSidechain) includeSidechain = true;
-    if ((agent === 'codex' && state.pollVersion !== 2) || state.childStopVersion !== 3) {
+    if ((agent === 'codex' && state.pollVersion !== 3) || state.childStopVersion !== 3) {
       // Reinterpret old code-mode polls, retaining every unresolved obligation
       // until a correlated replay proves it finished or was only a poll.
       if (state.checkpoint) {
@@ -513,7 +513,7 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
         for (const key of ['observedAt', 'finalTextAt', 'finalTextBlocked', 'finalTextSeen', 'aborted']) delete state.restart[key];
         state.restart.completed = false;
       }
-      state.pollVersion = 2;
+      state.pollVersion = 3;
       state.childStopVersion = 3;
     }
     // One cold replay when the evidence contract changes. Do not mix old
@@ -535,7 +535,7 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       state = { version: 1, restartVersion: restartVersion(agent), jobs: retained, calls: {}, notices: {}, checkpoint: null,
         gap: Boolean(migration.gap), ...(migration.gap ? { gapAt: migration.gapAt, gapReason: migration.gapReason } : {}),
         restart,
-        cronVersion: 1, turnVersion: 1, pollVersion: agent === 'codex' ? 2 : undefined, childStopVersion: 3,
+        cronVersion: 1, turnVersion: 1, pollVersion: agent === 'codex' ? 3 : undefined, childStopVersion: 3,
         source: state.source, processEpoch: state.processEpoch, hookBarrier: state.hookBarrier,
         hookGeneration: state.hookGeneration, freshStartup: state.freshStartup, handoffRebind: state.handoffRebind };
     }

@@ -103,6 +103,25 @@ test('an ALL_TOOLS.find by a $-anchored regex is not a child call unless its lit
   ]) assert.equal(hasChildCall(code), true, code);
 });
 
+test('Promise.all over ids.map with a forEach print maps each slot to its id', () => {
+  const { polls } = require('./code-mode-polls');
+  const code = 'const ids=[45512,15386]; const rs=await Promise.all(ids.map(session_id=>tools.write_stdin({session_id,chars:""}))); rs.forEach((r,i)=>text(JSON.stringify({i,...r})));';
+  assert.deepEqual(polls(code), [
+    { name: 'write_stdin', target: '45512', index: 1, count: 2 },
+    { name: 'write_stdin', target: '15386', index: 2, count: 2 },
+  ]);
+  for (const bad of [
+    // A key before the spread could stand in for evidence the result lacks.
+    'const ids=[1]; const rs=await Promise.all(ids.map(session_id=>tools.write_stdin({session_id}))); rs.forEach((r,i)=>text(JSON.stringify({exit_code:0,...r})));',
+    // A key after the spread overrides the result's own fields.
+    'const ids=[1]; const rs=await Promise.all(ids.map(session_id=>tools.write_stdin({session_id}))); rs.forEach((r,i)=>text(JSON.stringify({...r,i})));',
+    // An async forEach callback prints out of order.
+    'const ids=[1,2]; const rs=await Promise.all(ids.map(session_id=>tools.write_stdin({session_id}))); rs.forEach(async (r,i)=>text(JSON.stringify(r)));',
+    // A plain arrow that does more than return the tool call's promise.
+    'const ids=[1]; const rs=await Promise.all(ids.map(session_id=>other(tools.write_stdin({session_id})))); rs.forEach(r=>text(JSON.stringify(r)));',
+  ]) assert.deepEqual(polls(bad), [], bad);
+});
+
 test('anchoredSuffix returns only a certain literal tail', () => {
   const { anchoredSuffix } = require('./static-tool-names');
   const tail = (pattern, flags = '') => anchoredSuffix({ pattern, flags });

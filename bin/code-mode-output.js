@@ -2,6 +2,8 @@
 
 // A bounded symbolic interpreter, never eval. It maps printed result slots for
 // literal loops and Promise.all. Unsupported control flow/mutation fails closed.
+const EVIDENCE = new Set(['session_id', 'exit_code', 'cell_id', 'status']);
+
 function polls(code) {
   if (typeof code !== 'string' || code.length > 2 * 1024 * 1024) return [];
   const TOOL = Symbol('tool'), UNKNOWN = Symbol('unknown');
@@ -46,6 +48,17 @@ function polls(code) {
       const value = expr(n.argument, env); if (typeof value !== 'number') fail(); return -value;
     }
     if (n.type === 'ObjectExpression') {
+      // `{i, ...r}` prints r's own fields unchanged: a final spread wins every
+      // key it has, and no other key may stand in for poll evidence it lacks.
+      const last = n.properties[n.properties.length - 1];
+      if (last?.type === 'SpreadElement' && n.properties.slice(0, -1).every(p => p.type === 'Property' && !p.computed && !p.method
+          && p.kind === 'init' && !EVIDENCE.has(p.key.name ?? p.key.value))) {
+        const spread = expr(last.argument, env);
+        if (spread?.[TOOL]) {
+          for (const p of n.properties.slice(0, -1)) if (!plain(expr(p.value, env))) fail();
+          return spread;
+        }
+      }
       const value = Object.create(null);
       for (const p of n.properties) {
         if (p.type === 'SpreadElement') {
@@ -94,17 +107,33 @@ function polls(code) {
       if (outputs.length !== before || !plain(input)) fail();
       return result(n.callee.property.name, input);
     }
+    // `rs.forEach((r, i) => ...)` with a plain arrow runs in order, synchronously.
+    if (n.callee.type === 'MemberExpression' && !n.callee.computed && !n.callee.optional && n.callee.property.name === 'forEach'
+        && n.arguments.length === 1 && !awaited) {
+      const values = expr(n.callee.object, env), fn = n.arguments[0];
+      if (!Array.isArray(values) || values.length > 64 || fn.type !== 'ArrowFunctionExpression' || fn.async
+          || fn.params.length < 1 || fn.params.length > 2) fail();
+      values.forEach((value, i) => {
+        const scope = new Map(env); bind(fn.params[0], value, scope);
+        if (fn.params[1]) bind(fn.params[1], i, scope);
+        if (fn.body.type === 'BlockStatement') statements(fn.body.body, scope); else expr(fn.body, scope);
+      });
+      return UNKNOWN;
+    }
     if (member(n.callee, 'Promise', 'all') && n.arguments.length === 1 && awaited) {
       const input = n.arguments[0];
       if (input.type === 'ArrayExpression' && input.elements.length <= 64) return input.elements.map(e => expr(e, env, true));
       if (input.type !== 'CallExpression' || input.optional || input.arguments.length !== 1
           || input.callee.type !== 'MemberExpression' || input.callee.computed || input.callee.optional || input.callee.property.name !== 'map') fail();
       const values = expr(input.callee.object, env), fn = input.arguments[0];
-      if (!Array.isArray(values) || values.length > 64 || fn.type !== 'ArrowFunctionExpression' || !fn.async || fn.params.length !== 1) fail();
+      // A plain arrow is accepted only when it returns the tool call's promise itself.
+      if (!Array.isArray(values) || values.length > 64 || fn.type !== 'ArrowFunctionExpression' || fn.params.length !== 1
+          || (!fn.async && !(fn.body.type === 'CallExpression' && fn.body.callee.type === 'MemberExpression'
+            && fn.body.callee.object.type === 'Identifier' && fn.body.callee.object.name === 'tools'))) fail();
       const start = outputs.length, mapped = values.map(value => {
         const scope = new Map(env); bind(fn.params[0], value, scope);
         if (fn.body.type === 'BlockStatement') { statements(fn.body.body, scope); return UNKNOWN; }
-        return expr(fn.body, scope);
+        return expr(fn.body, scope, !fn.async);
       });
       // These prints race; their total count is known, their ordering is not.
       outputs.fill(null, start);

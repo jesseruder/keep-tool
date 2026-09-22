@@ -1130,6 +1130,30 @@ test('labelled poll replay clears superseded launches and poll copies, not unrel
   assert.deepEqual(replay.jobs.filter(j => j.status === 'pending'), []);
 }, 'codex'));
 
+test('a Promise.all(ids.map) poll printed through forEach clears the launches it polls', () => fixture(({ root, append, sync }) => {
+  const call = (id, input) => append({ type: 'response_item', payload: { type: 'custom_tool_call', call_id: id, name: 'exec', input } });
+  const output = (id, objects) => append({ type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: id,
+    output: ['Script completed\nOutput:\n', ...objects.map(o => JSON.stringify(o))].map(text => ({ type: 'input_text', text })) } });
+  call('launch', 'const r=await Promise.allSettled([tools.exec_command({cmd:"a"}),tools.exec_command({cmd:"b"})]);r.forEach((x,i)=>text(JSON.stringify({i,...x.value})));');
+  output('launch', [{ i: 0, session_id: 11 }, { i: 1, session_id: 22 }]);
+  const poll = ids => `const ids=${JSON.stringify(ids)}; const rs=await Promise.all(ids.map(session_id=>tools.write_stdin({session_id,chars:"",yield_time_ms:1000}))); rs.forEach((r,i)=>text(JSON.stringify({i,...r})));`;
+  call('poll', poll([11, 22])); output('poll', [{ i: 0, session_id: 11 }, { i: 1, exit_code: 0 }]);
+  call('end', poll([11])); output('end', [{ i: 0, exit_code: 0 }]);
+  const settled = sync();
+  assert.deepEqual(settled.jobs.filter(j => j.status === 'pending'), []);
+  assert.deepEqual(settled.jobs.map(j => `${j.id}:${j.status}`).sort(), ['process_11:completed', 'process_22:completed']);
+  // A ledger written by the previous parser replays once and drops its superseded copies.
+  const file = path.join(root, '.keep/background-jobs/codex/parent/state.json');
+  const state = JSON.parse(fs.readFileSync(file));
+  const id = 'superseded_' + require('crypto').createHash('sha256').update('process_11:launch').digest('hex').slice(0, 24);
+  state.jobs[`job:${id}`] = { id, run: 'launch', status: 'pending', kind: 'unknown', eventAt: 1 };
+  state.pollVersion = 2;
+  fs.writeFileSync(file, JSON.stringify(state));
+  let replay;
+  for (let i = 0; i < 100; i++) { replay = sync({ budget: 200 }); if (!replay.recovering) break; }
+  assert.deepEqual(replay.jobs.filter(j => j.status === 'pending'), []);
+}, 'codex'));
+
 test('printed job examples inside stdout never create background jobs', () => fixture(({ append, sync }) => {
   append({ type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'read', output: [
     { type: 'input_text', text: 'Script completed\nOutput:\n' },
