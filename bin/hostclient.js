@@ -5,8 +5,12 @@ const path = require('node:path');
 const { FrameDecoder, encodeFrame } = require('./host.js');
 const { annotate } = require('./pressure.js');
 
+// An explicit socket is answered before keep.js is required at all: a host runs
+// on a machine that may have no configuration and no registry to read, and
+// requiring keep.js is what boots both.
 function socketPath() {
-  return process.env.KEEP_HOST_SOCK || path.join(require('./keep.js').ROOT, '.keep', 'host.sock');
+  if (process.env.KEEP_HOST_SOCK) return process.env.KEEP_HOST_SOCK;
+  return path.join(require('./keep.js').ROOT, '.keep', 'host.sock');
 }
 
 function connect(options = {}) {

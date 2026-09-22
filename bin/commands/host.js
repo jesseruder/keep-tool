@@ -3,11 +3,21 @@
 
 'use strict';
 
+const fs = require('node:fs');
+const path = require('node:path');
 const {
-  die, parseArgs, KeepError, postKeepApi, ROOT,
+  die, parseArgs, KeepError, postKeepApi,
 } = require('../keep-core.js');
 const sessionNumbers = require('../session-numbers.js');
 const { named: sessionNamed } = sessionNumbers;
+
+// Session numbers are a registry fact, and a terminal host is not: it may run on
+// a machine that keeps no cards at all. Resolve the root where it is used, and
+// answer null rather than a path into a registry that is not there.
+function registryRoot() {
+  const { ROOT } = require('../keep-core.js');
+  try { return fs.existsSync(path.join(ROOT, 'tasks')) ? ROOT : null; } catch { return null; }
+}
 
 const commands = {};
 
@@ -30,7 +40,9 @@ async function resolveHostPane(client, value) {
   // CLI never allocates numbers, it only reads what the daemon's scan wrote.
   const numbered = sessionNumbers.parseNumber(value);
   if (numbered) {
-    const found = sessionNumbers.lookup(numbered, { root: ROOT });
+    const root = registryRoot();
+    if (!root) die(`${sessionNumbers.label(numbered)} names a session in a Keep registry, and this machine has none — name the pane by its id`);
+    const found = sessionNumbers.lookup(numbered, { root });
     const hosting = found ? panes.filter((pane) => String(pane.meta && pane.meta.sessionId || '') === found.id) : [];
     if (hosting.length === 1) return hosting[0];
     if (hosting.length > 1) die(`${sessionNumbers.label(numbered)} is hosted by several panes (${hosting.map((pane) => pane.id).join(', ')})`);
@@ -66,7 +78,9 @@ function renderHostPanes(panes) {
 }
 
 function knownSessionNumbers() {
-  try { return sessionNumbers.read({ root: ROOT }).ids; } catch { return {}; }
+  const root = registryRoot();
+  if (!root) return {};
+  try { return sessionNumbers.read({ root }).ids; } catch { return {}; }
 }
 
 function renderPanePanes(panes, numbers = null) {
@@ -470,7 +484,7 @@ commands.attach = async (argv, deps = {}) => {
 };
 
 commands.reviewer = async (args) => {
-  const result = await require('../reviewer-launch').launch(args, ROOT);
+  const result = await require('../reviewer-launch').launch(args, require('../keep-core.js').ROOT);
   console.log(`Reviewer ${result.model}: pane ${result.pane}, session ${sessionNamed(result.sessionId)}`);
   if (process.stdin.isTTY && process.stdout.isTTY) await commands.attach([result.pane]);
   else console.log('Open the reviewer in the Keep console.');

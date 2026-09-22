@@ -237,8 +237,11 @@ function renderScreen(term, options = {}) {
   return result;
 }
 
+// As in hostclient.js: an explicit socket never requires keep.js, so a host boots
+// without a configuration or a registry.
 function socketPath() {
-  return process.env.KEEP_HOST_SOCK || path.join(require('./keep.js').ROOT, '.keep', 'host.sock');
+  if (process.env.KEEP_HOST_SOCK) return process.env.KEEP_HOST_SOCK;
+  return path.join(require('./keep.js').ROOT, '.keep', 'host.sock');
 }
 
 function positiveInteger(value, fallback, name) {

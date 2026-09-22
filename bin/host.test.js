@@ -1898,3 +1898,34 @@ test('high-volume title and visibility events are debug-only', () => {
     assert.equal(shouldLogPaneEvent(type, false), true);
   }
 });
+
+test('a host boots from an explicit socket alone, with no configuration and no registry', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-boot-'));
+  const home = path.join(dir, 'home');
+  fs.mkdirSync(home);
+  const sock = path.join(dir, 'host.sock');
+  // Deliberately sparse: no KEEP_DIR, no KEEP_CONFIG, and a HOME with no ~/keep
+  // in it. A node that only runs panes has none of those.
+  const child = childProcess.spawn(process.execPath, [path.join(__dirname, 'keep.js'), 'host'],
+    { env: { PATH: process.env.PATH, HOME: home, KEEP_HOST_SOCK: sock }, cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  let exited = null;
+  child.once('exit', (code) => { exited = code; });
+  let client;
+  try {
+    await waitFor(() => exited !== null || fs.existsSync(sock), `the host to listen on ${sock}`, 15000);
+    assert.equal(exited, null, `the host exited: ${output}`);
+    client = await connect({ sock });
+    const hello = await client.request('hello');
+    assert.equal(typeof hello.pid, 'number');
+    assert.equal(fs.existsSync(path.join(home, 'keep', 'tasks')), false, 'no registry was created to boot');
+    assert.deepEqual((await client.request('list')).panes, []);
+  } finally {
+    if (client) client.close();
+    child.kill('SIGTERM');
+    await waitFor(() => exited !== null, 'the host to stop', 5000).catch(() => child.kill('SIGKILL'));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

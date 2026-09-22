@@ -3731,7 +3731,9 @@ if (require.main === module) {
   (async () => {
     try {
       const [cmd, ...rest] = process.argv.slice(2);
-      if (!fs.existsSync(TASKS) && !['help', 'hook', 'init', 'doctor', 'setup', 'review-eval'].includes(cmd)) die(`no repo at ${ROOT} (set KEEP_DIR?)`);
+      // `host` is exempt with them: the terminal host is a machine's process, not a
+      // registry's, and it must start where there are no cards to read.
+      if (!fs.existsSync(TASKS) && !['help', 'hook', 'init', 'doctor', 'setup', 'review-eval', 'host'].includes(cmd)) die(`no repo at ${ROOT} (set KEEP_DIR?)`);
       const fn = commands[cmd || 'list'];
       if (!fn) die(`unknown command "${cmd}" — try \`keep help\``);
       const helpArgs = [];
