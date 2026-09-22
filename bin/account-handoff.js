@@ -133,6 +133,13 @@ function portableFallbackCandidate(entry) {
 // refused before its stop, and a source that then died on its own, skipped every check
 // the stop makes (the job ledger above all) and stays blocked. A `ps` that fails or comes back empty proves
 // nothing and stays blocked, but as a transient refusal a retry can clear.
+function paneMarkerUnchanged(current, pane) {
+  const marker = pane.meta?.handoffTransactionId || null;
+  if (!marker) return true;
+  if (marker === current.id) return false;
+  return Object.prototype.hasOwnProperty.call(current, 'sourcePaneHandoffTransactionId')
+    && marker === current.sourcePaneHandoffTransactionId;
+}
 async function verifySourceStopAfterTheFact(current, pane, deps, root) {
   const blocked = () => new Error('Source exit was not verified by the handoff transaction; recovery is blocked');
   if (current.phase !== 'stopping-source' || !Number.isFinite(current.sourceExitTypedAt)
@@ -140,7 +147,11 @@ async function verifySourceStopAfterTheFact(current, pane, deps, root) {
       || current.sourceOwnsPane !== true || !Number.isInteger(current.sourceAgentPid) || current.sourceAgentPid <= 0
       || typeof current.sourceAgentPidStart !== 'string' || !current.sourceAgentPidStart) throw blocked();
   if (!pane || pane.id !== current.pane || pane.alive !== false || pane.meta?.sessionId !== current.sessionId
-      || pane.meta?.handoffTransactionId
+      // The marker the pane carried when this transaction stopped it — an earlier
+      // transfer's, which launched this very source — is history, not a relaunch. Any
+      // other marker is a launch since: this transaction's own, or a newer one's. A
+      // record from before the marker was journalled requires none at all.
+      || !paneMarkerUnchanged(current, pane)
       || pane.meta?.accountId && pane.meta.accountId !== current.sourceAccountId
       || Number.isInteger(current.pid) && pane.pid !== current.pid) throw blocked();
   if (typeof deps.agentProcessRows !== 'function') {
@@ -848,6 +859,9 @@ async function run(body, deps = {}) {
     current.ownedSessionIds = agent === 'codex' ? artifactPlan.artifacts.map((entry) => entry.sessionId) : [session.id];
     Object.assign(current, { status: 'stopping', phase: 'stopping-source', reason: '', cwd: resumeCwd,
       pid: pane.pid, cols: pane.cols, rows: pane.rows, ...(force ? { force: true } : {}),
+      // Which handoff, if any, launched the pane this transaction is about to stop — the
+      // post-hoc stop proof tells that history from a relaunch after this point.
+      sourcePaneHandoffTransactionId: pane.meta?.handoffTransactionId || null,
       ...(trustCarried ? { trustCarried } : {}),
       ...(sourceIdentity ? { sourceAgentPid: sourceIdentity.pid, sourceAgentPidStart: sourceIdentity.pidStart,
         sourceOwnsPane: true } : {}),

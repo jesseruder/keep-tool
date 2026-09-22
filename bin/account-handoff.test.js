@@ -541,6 +541,29 @@ test('a typed /exit whose confirmation was lost is proven after the fact from a 
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('an earlier transfer\'s pane marker does not block proving a later lost stop', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f, { restartSession: async (_body, options) => {
+      options.onExitInput(); d.pane.alive = false; throw new Error('host request timed out: input');
+    } });
+    // This source was itself launched by an earlier A->B-style transfer.
+    d.pane.meta.handoffTransactionId = 'earlier-transfer';
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /host request timed out/);
+    assert.equal(handoff.readOne(f.root, f.sid).sourcePaneHandoffTransactionId, 'earlier-transfer');
+    d.agentProcessRows = async () => [{ pid: 99, pidStart: 'other' }];
+    // A marker that moved since the stop — this transaction's own, or a newer one — still refuses.
+    d.pane.meta.handoffTransactionId = handoff.readOne(f.root, f.sid).id;
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /Source exit was not verified/);
+    d.pane.meta.handoffTransactionId = 'newer-transfer';
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /Source exit was not verified/);
+    d.pane.meta.handoffTransactionId = 'earlier-transfer';
+    const recovered = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    assert.equal(recovered.status, 'done');
+    assert.equal(recovered.sourceStopVerifiedBy, 'post-hoc-ps');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('a host that did not list its panes is a transient timeout, not a missing pane', async () => {
   const f = fixture();
   try {
