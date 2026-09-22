@@ -7,7 +7,7 @@
 //
 // Nothing beyond node builtins is required: a node agent may hold no Keep registry.
 
-const { execFile } = require('node:child_process');
+const { execFile, execFileSync } = require('node:child_process');
 const { promisify } = require('node:util');
 const fs = require('node:fs');
 
@@ -149,21 +149,49 @@ async function inspect(params = {}, deps = {}) {
 }
 
 // Whether the process at this pid is still the one the caller means, and stopping it
-// if so — decided and done in one step on the machine that owns the pid, because a
-// check on one machine and a kill on another is no check at all.
+// if so — on the machine that owns the pid, because a check on one machine and a
+// kill on another is no check at all.
+//
+// One pid, read synchronously, and killed in the same tick: `ps -p <pid>` rather
+// than the whole table, because a table of every process on a loaded machine takes
+// long enough for a pid to be reused while it is being parsed, and because nothing
+// may await between the comparison and the signal.
+//
+// The window is not closed — the kernel offers no compare-and-signal, so this is the
+// same compare-then-kill the daemon-local force restart has always had, narrowed to
+// one tick with no I/O in it. What closes the gap that remains is the identity being
+// more than a pid: `lstart` is second-resolution, so a pid reused inside the same
+// second would compare equal on pid and start time alone. The parent and the
+// argument vector are compared for exactly that case, and the caller sends the
+// identity as it last observed it — the same read that decided this process was the
+// one to stop.
 const SIGNALS = ['SIGTERM', 'SIGKILL', 'SIGHUP', 'SIGINT'];
+const PS_ONE_RE = /^\s*([A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d \d{4})\s+(\d+)\s*(.*)$/;
 
-async function signal(params = {}, deps = {}) {
+function signal(params = {}, deps = {}) {
   const pid = Number(params.pid);
   if (!Number.isInteger(pid) || pid <= 0) throw new Error('signal needs a pid');
   const pidStart = String(params.pidStart || '');
   if (!pidStart) throw new Error('signal needs the process start time it was captured with');
+  if (!Number.isInteger(Number(params.ppid)) || Number(params.ppid) < 0) {
+    throw new Error('signal needs the parent the process was captured with');
+  }
+  if (typeof params.args !== 'string') throw new Error('signal needs the arguments the process was captured with');
   const name = String(params.signal || '');
   if (!SIGNALS.includes(name)) throw new Error(`signal must be one of ${SIGNALS.join(', ')}`);
-  const rows = await readFullProcessTable(deps);
-  const row = rows.find((entry) => entry.pid === pid);
-  if (!row) return { outcome: 'gone' };
-  if (row.pidStart !== pidStart) return { outcome: 'changed' };
+  let output;
+  // `ps` exits non-zero when the pid is gone, which is the answer, not a failure.
+  try {
+    output = (deps.execFileSync || execFileSync)('ps', ['-p', String(pid), '-o', 'lstart=,ppid=,args='], {
+      encoding: 'utf8', timeout: 5e3, maxBuffer: 4e6, env: { ...process.env, LC_ALL: 'C' },
+    });
+  } catch { return { outcome: 'gone' }; }
+  const line = String(output || '').split('\n').find((entry) => entry.trim());
+  const match = line ? PS_ONE_RE.exec(line) : null;
+  if (!match) return { outcome: 'gone' };
+  if (match[1] !== pidStart || Number(match[2]) !== Number(params.ppid) || match[3] !== params.args) {
+    return { outcome: 'changed' };
+  }
   try { (deps.kill || process.kill)(pid, name); }
   catch (error) {
     if (error && error.code === 'ESRCH') return { outcome: 'gone' };

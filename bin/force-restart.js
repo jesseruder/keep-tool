@@ -3,9 +3,20 @@
 // failure, and allow a later recovery without closing a replacement session.
 // `deps.rows` and `deps.signal` both answer for the machine the pane is on: the
 // caller points them at that node, and this module never assumes it is this one.
-// `deps.signal` is handed the captured process — pid and start time together —
-// because on another machine the comparison and the kill have to happen there, in
-// one step, and a pid on its own is not an identity.
+//
+// `deps.signal` is handed a whole process identity — pid, start time, parent and
+// argument vector — because on another machine the comparison and the kill have to
+// happen there, in one step, and a pid on its own is not an identity: `lstart` is
+// second-resolution, so a pid reused inside the same second compares equal on pid
+// and start time alone.
+//
+// It is handed the identity as *just observed*, not as captured when the tree was
+// first walked. The authorization to kill comes from the refresh immediately above
+// the call, so that is the read the node must still agree with; argv legitimately
+// changes during exit (a shell relabels itself, a dying process becomes a zombie
+// label), and comparing against a capture from before the close would refuse to
+// clean up exactly the processes this exists to clean up. The record keeps the
+// capture-time parent and argv too, so a recovery can say what it originally saw.
 async function run(entry, deps) {
   const checkpoint = async stage => { entry.phase = stage; await deps.save(); };
   const same = (a, b) => a && b && a.pid === b.pid && a.pidStart === b.pidStart;
@@ -21,7 +32,7 @@ async function run(entry, deps) {
       if (depth > 12 || children.length > 256) throw Error('Process tree exceeds force-restart limit');
       for (const p of rows.filter(r => r.ppid === pid)) {
         if (visited.has(p.pid) || !p.pidStart) throw Error('Process identity is incomplete');
-        visited.add(p.pid); children.push({ pid: p.pid, pidStart: p.pidStart }); walk(p.pid, depth + 1);
+        visited.add(p.pid); children.push({ pid: p.pid, pidStart: p.pidStart, ppid: p.ppid, args: p.args }); walk(p.pid, depth + 1);
       }
     };
     const shell = rows.find(p => p.pid === pane.pid);
@@ -35,7 +46,7 @@ async function run(entry, deps) {
     entry.original = { id: pane.id, pid: pane.pid, pidStart: shell.pidStart, createdAt: pane.createdAt, cwd: pane.cwd,
       cols: pane.cols, rows: pane.rows, meta: pane.meta, agent: pane.meta.agent,
       bypass: agent.args.split(/\s+/).includes(bypass) };
-    entry.processes = [{ pid: shell.pid, pidStart: shell.pidStart }, ...children];
+    entry.processes = [{ pid: shell.pid, pidStart: shell.pidStart, ppid: shell.ppid, args: shell.args }, ...children];
     await checkpoint('prepared');
   }
   const original = entry.original;
@@ -58,7 +69,7 @@ async function run(entry, deps) {
       changed = false;
       for (const p of rows) if (owned.has(p.ppid) && !owned.has(p.pid)) {
         if (!p.pidStart || entry.processes.length >= 256) throw Error('Process tree exceeds force-restart limit or lacks identity');
-        owned.add(p.pid); entry.processes.push({ pid: p.pid, pidStart: p.pidStart }); added = changed = true;
+        owned.add(p.pid); entry.processes.push({ pid: p.pid, pidStart: p.pidStart, ppid: p.ppid, args: p.args }); added = changed = true;
       }
     }
     if (added) await deps.save();
@@ -78,7 +89,9 @@ async function run(entry, deps) {
   for (const signal of ['SIGTERM', 'SIGKILL']) {
     for (const old of [...entry.processes].reverse()) {
       const current = (await refresh()).find(p => p.pid === old.pid);
-      if (same(current, old) && !current.zombie) await deps.signal(old, signal);
+      if (same(current, old) && !current.zombie) {
+        await deps.signal({ pid: old.pid, pidStart: old.pidStart, ppid: current.ppid, args: current.args }, signal);
+      }
     }
     await sleep(1000);
     const remaining = await refresh();
