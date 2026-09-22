@@ -369,3 +369,18 @@ test('a long status chip ellipsizes instead of wrapping the top bar', async ({ p
     await page.evaluate(() => { const chip = document.querySelector('#connection'); chip.hidden = chip.parentElement.hidden = true; });
   }
 });
+test('a short status chip sits beside the theme picker, uncropped', async ({ page }) => {
+  for (const width of [1800, 1500, 800]) {
+    await page.setViewportSize({ width, height: 950 });
+    await page.evaluate(() => {
+      const chip = document.querySelector('#connection');
+      chip.textContent = 'saving 1…';
+      chip.hidden = chip.parentElement.hidden = false;
+    });
+    const chip = await page.locator('#connection').evaluate(el => ({ scroll: el.scrollWidth, client: el.clientWidth, right: el.getBoundingClientRect().right, top: el.getBoundingClientRect().top }));
+    expect(chip.scroll).toBeLessThanOrEqual(chip.client);
+    const theme = await page.locator('#themePicker').evaluate(el => ({ left: el.getBoundingClientRect().left, top: el.getBoundingClientRect().top }));
+    if (Math.abs(theme.top - chip.top) < 10) expect(theme.left - chip.right).toBeLessThan(40);
+    await page.evaluate(() => { const chip = document.querySelector('#connection'); chip.hidden = chip.parentElement.hidden = true; });
+  }
+});
