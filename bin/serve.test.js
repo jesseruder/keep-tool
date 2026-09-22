@@ -6686,7 +6686,7 @@ function recoveryHarness({ text = MESSAGE, kind = 'claude', screenFor, onEnter,
     return {};
   });
   return {
-    base, file, journal, inputs, requested, receipt,
+    base, file, journal, inputs, requested, receipt, host,
     send: () => sendToResolvedTarget({ id: RECOVERY_SESSION, kind }, { pane: 'pane-recovery' },
       text, undefined, {
         host, deliveryDirectory: directory,
@@ -6952,6 +6952,41 @@ test('recovery submits an unchanged long Codex draft above the status footer wit
     assert.deepEqual(recovery.inputs, ['\r'], 'recovery sends only Enter, never the text again');
     assert.deepEqual(recovery.requested, [200, 200], 'the same full screen is checked immediately before Enter');
   } finally { fs.rmSync(recovery.base, { recursive: true, force: true }); }
+});
+
+// The turn index confirms a pending send only when the text is not in the box, and
+// it has to look at the box even while the session is mid-turn: draftMatches answers
+// false without reading the screen for a busy session, which is exactly when Claude
+// may write an earlier identical message's row late from its queue. So a busy session
+// whose box still holds the text keeps its journal; with the box empty, the indexed
+// row settles it and the same text returns as recovered, with no key pressed.
+test('a busy session keeps a pending send the index matches while its text is still in the box', async () => {
+  const turnIndex = require('./turn-index.js');
+  for (const inBox of [true, false]) {
+    const harness = recoveryHarness({
+      screenFor: () => (inBox ? BOX(MESSAGE) : BOX('')),
+    });
+    try {
+      const db = path.join(harness.base, 'turns.sqlite');
+      const transcript = path.join(harness.base, `${RECOVERY_SESSION}.jsonl`);
+      fs.writeFileSync(transcript, JSON.stringify({ type: 'user', sessionId: RECOVERY_SESSION, cwd: harness.base,
+        timestamp: new Date().toISOString(), message: { role: 'user', content: MESSAGE } }) + '\n');
+      assert.equal(turnIndex.ingestFile(transcript, { agent: 'claude', db }).ok, true);
+      turnIndex.close();
+      const send = () => sendToResolvedTarget({ id: RECOVERY_SESSION, kind: 'claude' }, { pane: 'pane-recovery' }, MESSAGE, undefined, {
+        host: harness.host, deliveryDirectory: path.dirname(harness.journal), transcriptFileForSession: () => harness.file,
+        loadDeliverySession: (id) => ({ id, endedTurn: false }), turnIndexDb: db,
+      });
+      if (inBox) {
+        await assert.rejects(send(), /Previous delivery is unconfirmed/);
+        assert.equal(fs.existsSync(harness.journal), true, 'the journal is kept');
+      } else {
+        assert.deepEqual(await send(), { ok: true, delivery: 'received', recovered: true });
+        assert.equal(fs.existsSync(harness.journal), false);
+      }
+      assert.deepEqual(harness.inputs, [], 'no key is pressed either way');
+    } finally { fs.rmSync(harness.base, { recursive: true, force: true }); }
+  }
 });
 
 // A line Owner added below a blank one has to stop it as well. exactDraft would not

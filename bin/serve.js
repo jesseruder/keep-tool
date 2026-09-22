@@ -8205,6 +8205,24 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
         matchedScreen = cursorInPrompt && matched ? String(screen.text || '') : null;
         return cursorInPrompt && matched;
       },
+      // The turn index's guard (bin/delivery.js) asks a different question from
+      // draftMatches: not "is this exact draft ready to submit" but "is this text in
+      // the box at all". draftMatches answers false without looking whenever the
+      // session is mid-turn or showing a question or plan, which is exactly when
+      // Claude may be holding an earlier identical message in its queue and write
+      // that message's row late; the index would then confirm a send whose text is
+      // still sitting in the box. So this reads the screen whatever the session is
+      // doing and applies the same exactDraft comparison, with none of the idle,
+      // cursor or nothing-after gates: each of those can only turn a draft that is
+      // there into "not there", and here that error confirms a lost message. It
+      // leaves matchedScreen alone, which belongs to the submit path.
+      draftOnScreen: async () => {
+        const screen = await readScreenResult(target, 200, false, deps);
+        const matched = exactDraft(screen.text, text, session.kind);
+        trace('index-draft-screen-check', { matched });
+        return matched;
+      },
+      indexDb: deps.turnIndexDb,
     });
   } catch (error) {
     const failure = error instanceof InjectionError ? error : new InjectionError(409, error.message);

@@ -790,7 +790,7 @@ const recordedOnEnter = (f, sessionId, texts) => async () => indexMessages(f.dir
 const plainSend = (f, sessionId, text, extra = {}) => deliver({
   session: { id: sessionId, kind: 'codex' }, pane: 'pane-' + sessionId, text, file: f.file, directory: f.directory,
   indexDb: f.db, precheck: async () => {}, type: async () => {}, submitDraft: async () => assert.fail('unexpected Enter'),
-  draftMatches: async () => false, pause: async () => {}, attempts: 1, ...extra,
+  draftMatches: async () => false, draftOnScreen: async () => false, pause: async () => {}, attempts: 1, ...extra,
 });
 
 test('a delivery whose transcript receipt never lands is confirmed by the turn index', async () => {
@@ -958,13 +958,13 @@ test('the review scenario: an earlier identical confirmed send cannot confirm on
     // J0: X is sent and confirmed by the index.
     assert.equal((await plainSend(f, id, 'continue', { type: recordedOnEnter(f, id, ['continue']) })).source, 'turn-index');
     // J1: X again at once; typed, but Enter is lost and X sits in the box.
-    await assert.rejects(plainSend(f, id, 'continue', { draftMatches: async () => true, submitDraft: async () => { enters++; } }),
+    await assert.rejects(plainSend(f, id, 'continue', { draftMatches: async () => true, draftOnScreen: async () => true, submitDraft: async () => { enters++; } }),
       /Delivery unconfirmed/);
     assert.equal(enters, 1, 'the existing retry pressed Enter once and it was lost again');
     // The next send of X finds J1 pending and submits the draft; J0's row does not recover it.
     let onScreen = true;
     const result = await plainSend(f, id, 'continue', {
-      draftMatches: async () => onScreen,
+      draftMatches: async () => onScreen, draftOnScreen: async () => onScreen,
       submitDraft: async () => { enters++; onScreen = false; receiptLine(f, 'continue'); },
       type: async () => assert.fail('retyped'),
     });
@@ -983,7 +983,7 @@ test('an index row never confirms a fully typed, unsubmitted draft that is still
     await assert.rejects(plainSend(f, id, 'deploy now', {
       trace: (stage) => stages.push(stage),
       type: async (progress) => { typeAllChunks(progress); indexMessages(f.dir, f.db, id, ['deploy now']); throw new Error(ENTER_NOT_PRESSED); },
-      draftMatches: async () => true, submitDraft: async () => { enters++; },
+      draftMatches: async () => true, draftOnScreen: async () => true, submitDraft: async () => { enters++; },
     }), /Enter was not pressed/);
     assert.ok(stages.includes('index-match-draft-present'));
     assert.ok(!stages.includes('receipt-from-index'));
@@ -998,7 +998,7 @@ test('an index row never confirms a fully typed, unsubmitted draft that is still
     let onScreen = true, resumed = 0;
     const result = await plainSend(f, id, 'deploy now', {
       trace: (stage) => stages.push(stage),
-      draftMatches: async () => onScreen,
+      draftMatches: async () => onScreen, draftOnScreen: async () => onScreen,
       type: async (progress) => {
         resumed++;
         assert.equal(progress.state.acknowledgedChunks, progress.state.chunkCount, 'a resume with nothing left to type');
@@ -1053,5 +1053,44 @@ test('reconcile looks for the index once per sweep and traces its absence once',
     const before = fs.existsSync(path.join(f.directory, 'diagnostics', 'events.jsonl')) ? events().length : 0;
     assert.deepEqual(reconcile(f.directory, { now: Date.now() + 61e3, indexDb: f.db }), []);
     assert.equal(events().length - before, 1);
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+// draftMatches is false for any session mid-turn, whatever the box holds, so the
+// index guard has its own screen check. This is the queued-Claude case: an earlier
+// identical message's row is written after this attempt began, while this text sits
+// in the box of a session that is busy.
+test('a busy session with the text still in the box is never confirmed from the index', async () => {
+  const f = indexFixture();
+  const inBox = generatedId('claude');
+  const gone = generatedId('claude');
+  const stages = [];
+  try {
+    await assert.rejects(plainSend(f, inBox, 'rebase please', {
+      trace: (stage) => stages.push(stage),
+      type: recordedOnEnter(f, inBox, ['rebase please']),
+      draftMatches: async () => false, // mid-turn: not ready to submit
+      draftOnScreen: async () => true, // but the text is in the box
+    }), /Delivery unconfirmed/);
+    assert.ok(stages.includes('index-match-draft-present'));
+    assert.equal(fs.existsSync(path.join(f.directory, textHash(inBox) + '.json')), true, 'the journal is kept');
+
+    const result = await plainSend(f, gone, 'rebase please', {
+      type: recordedOnEnter(f, gone, ['rebase please']),
+      draftMatches: async () => false, draftOnScreen: async () => false,
+    });
+    assert.equal(result.source, 'turn-index');
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('a caller that cannot see the box never confirms from the index, and a failed screen read counts as present', async () => {
+  const f = indexFixture();
+  const blind = generatedId('codex');
+  const failing = generatedId('codex');
+  try {
+    await assert.rejects(plainSend(f, blind, 'hello', { type: recordedOnEnter(f, blind, ['hello']), draftOnScreen: undefined }),
+      /Delivery unconfirmed/);
+    await assert.rejects(plainSend(f, failing, 'hello', { type: recordedOnEnter(f, failing, ['hello']),
+      draftOnScreen: async () => { throw new Error('host timed out'); } }), /Delivery unconfirmed/);
   } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
 });

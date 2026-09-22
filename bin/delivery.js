@@ -241,7 +241,20 @@ function typingProgress(entry, writeJournal) {
   };
 }
 
-async function deliverAttempt({ session, pane, text, key, file, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, observe, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16, staleJournalMs = STALE_JOURNAL_MS, indexDb }) {
+async function deliverAttempt({ session, pane, text, key, file, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, observe, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16, staleJournalMs = STALE_JOURNAL_MS, indexDb, draftOnScreen }) {
+  // The turn index says a message with this text was recorded, never which attempt
+  // recorded it, so the send path trusts it only when it can also see that the text
+  // is not in the input box. draftOnScreen answers that whatever the session is
+  // doing (draftMatches does not: it is false for any session mid-turn). A caller
+  // without it never confirms from the index here; reconcile still may, after its
+  // grace. A screen read that fails counts as the text being there.
+  const indexUsable = typeof draftOnScreen === 'function';
+  const textStillInBox = async () => {
+    let present = true;
+    try { present = Boolean(await draftOnScreen()); } catch {}
+    if (present) trace('index-match-draft-present');
+    return present;
+  };
   let typingError;
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const activeJournal = path.join(directory, hash(session.id) + '.json');
@@ -266,15 +279,15 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     // The index cannot say which attempt recorded a row. If this text is still in
     // the input box, the row is some other message's, and this entry's Enter was lost:
     // then nothing is settled and the path below runs exactly as it did before the
-    // index existed (resume or submit the exact draft). draftMatches is asked only
+    // index existed (resume or submit the exact draft). draftOnScreen is asked only
     // after the index matched, so the screen is read no more often than before on
     // every other send. It checks this send's text, so for other words it cannot see
     // the pending text in the box; a box that is not empty still stops the new send
     // at its precheck, and nothing is typed over it.
     const byIndex = async () => {
-      if (!(Number(entry.typedAt) > 0 || completedTyping(entry))) return false;
+      if (!indexUsable || !(Number(entry.typedAt) > 0 || completedTyping(entry))) return false;
       if (!indexConfirms(entry, { db: indexDb, trace })) return false;
-      if (await draftMatches()) { trace('index-match-draft-present'); return false; }
+      if (await textStillInBox()) return false;
       trace('pending-settled-by-index');
       return true;
     };
@@ -451,8 +464,8 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
   // identical one sent earlier whose row was written late, e.g. from Claude's
   // queue), so the draft on screen outranks it: no confirmation, and the attempt
   // stays pending for the draft/submit path of the next send.
-  const fromIndex = indexConfirms(entry, { text, db: indexDb, trace })
-    && !(await draftMatches() && (trace('index-match-draft-present'), true));
+  const fromIndex = indexUsable && indexConfirms(entry, { text, db: indexDb, trace })
+    && !(await textStillInBox());
   if (fromIndex) {
     trace('receipt-from-index');
     finish(directory, journal, entry);
@@ -473,7 +486,8 @@ async function deliver(options) {
   try {
     const result = await deliverAttempt({ ...options, trace,
       precheck: wrap('precheck', options.precheck), type: wrap('type-submit', options.type),
-      submitDraft: wrap('submit-draft', options.submitDraft), draftMatches: wrap('draft-check', options.draftMatches) });
+      submitDraft: wrap('submit-draft', options.submitDraft), draftMatches: wrap('draft-check', options.draftMatches),
+      draftOnScreen: typeof options.draftOnScreen === 'function' ? wrap('draft-on-screen', options.draftOnScreen) : undefined });
     trace('receipt-confirmed'); return result;
   } catch (e) { trace('attempt-unconfirmed'); throw e; }
 }

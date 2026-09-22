@@ -1342,9 +1342,14 @@ index can confirm only what the agent's transcript recorded, never text still si
 the input box, and it lags a live session by one hook or one 30-second daemon tick, so a
 tell reported unconfirmed may still be confirmed by the daemon's minute check, which
 asks the index again and then releases the session for later sends. The next send to
-that session asks the index about the pending attempt too (unless its text is still in
-the box), so it is not refused as "Previous delivery is unconfirmed" once the index has
-recorded the earlier message. Every
+that session asks the index about the pending attempt too, so it is not refused as
+"Previous delivery is unconfirmed" once the index has recorded the earlier message. A
+send of the same text first reads the input box (whether or not the session is
+mid-turn) and, if the text is still there, leaves the pending attempt alone and offers
+that draft Enter as before. A send of different text cannot compare the box with the
+earlier message; it proceeds to its own precheck, which refuses to type into a box
+that is not empty. The send path uses the index only when it can read the box; the
+daemon's minute check cannot, and relies on the timing rule alone. Every
 delivered tell appends one line to `.keep/tell-log.jsonl`; nothing is written to the
 card, because a message between sessions is not a decision about the work.
 
