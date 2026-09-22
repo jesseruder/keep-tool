@@ -92,6 +92,20 @@ test('keep nodes rm takes the entry and the token away, and refuses the daemon n
   await assert.rejects(commands.nodes(['rm', 'main']), /daemon node/);
 });
 
+test('keep nodes rm takes the placement that named the node with it', async (t) => {
+  const registryDir = withRegistry(t);
+  await capture(() => commands.nodes(['add', 'aws1', '--address', '100.64.0.2:7777']));
+  config.update((value) => ({ ...value,
+    placement: { default: 'aws1', projects: { '~/castle/ghost-server': 'aws1', '~/other': 'main' } } }));
+  // Without this the removal wrote a file that named a node it had just deleted, and
+  // the write was refused — so the node could not be removed at all.
+  const output = await capture(() => commands.nodes(['rm', 'aws1']));
+  assert.deepEqual(registryDir.read().nodes, { main: {} });
+  assert.deepEqual(registryDir.read().placement, { projects: { '~/other': 'main' } });
+  assert.match(output, /Cleared the default placement, which named aws1\./);
+  assert.match(output, /Cleared the placement for ~\/castle\/ghost-server, which named aws1\./);
+});
+
 test('a configuration that would not load again is never written', async (t) => {
   const registryDir = withRegistry(t);
   assert.throws(() => config.update(() => ({ version: 1, nodes: { main: {}, 'Bad Name': {} } })), /invalid Keep node name/);
@@ -226,11 +240,11 @@ test('a placement must name machines this install actually has', async (t) => {
   const placed = config.update((value) => ({ ...value,
     placement: { default: 'aws1', projects: { '~/castle/ghost-server': 'main' } } }));
   assert.deepEqual(config.placementConfig(placed),
-    { default: 'aws1', projects: { '~/castle/ghost-server': 'main' } });
-  assert.deepEqual(config.placementConfig({ version: 1 }), { default: null, projects: {} });
+    { default: 'aws1', projects: { '~/castle/ghost-server': 'main' }, invalid: {} });
+  assert.deepEqual(config.placementConfig({ version: 1 }), { default: null, projects: {}, invalid: {} });
 
   // A placement pointing at a machine nobody has is a launch that would fail at the
-  // last possible moment, so the file is refused instead.
+  // last possible moment, so an edit that writes one is refused.
   for (const [placement, pattern] of [
     [{ default: 'nowhere' }, /placement default names a node that is not configured: nowhere/],
     [{ projects: { '~/x': 'nowhere' } }, /placement projects\.~\/x names a node that is not configured/],
@@ -244,6 +258,45 @@ test('a placement must name machines this install actually has', async (t) => {
   }
   assert.deepEqual(registryDir.read().placement, { default: 'aws1', projects: { '~/castle/ghost-server': 'main' } },
     'nothing that would not load again was written');
+});
+
+test('a placement left naming a machine that is gone is reported, not thrown', async (t) => {
+  const registryDir = withRegistry(t, {
+    version: 1,
+    nodes: { main: {}, aws1: { transport: 'tcp', address: '100.64.0.2:7777' } },
+    placement: { default: 'aws1', projects: { '~/castle/ghost-server': 'aws1', '~/other': 'main' } },
+  });
+  // The file as it stands after somebody deletes a node by hand: the entries that
+  // named it are dropped and said by name, and everything else survives. Throwing
+  // here is what stopped `keep serve` from booting at all.
+  const orphaned = { ...registryDir.read(), nodes: { main: {} } };
+  assert.deepEqual(config.placementConfig(orphaned), {
+    default: null,
+    projects: { '~/other': 'main' },
+    invalid: {
+      default: 'Keep placement default names a node that is not configured: aws1',
+      'projects.~/castle/ghost-server': 'Keep placement projects.~/castle/ghost-server names a node that is not configured: aws1',
+    },
+  });
+  fs.writeFileSync(registryDir.configFile, `${JSON.stringify(orphaned, null, 2)}\n`);
+  const env = { KEEP_CONFIG: registryDir.configFile };
+  const warned = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk) => { warned.push(String(chunk)); return true; };
+  try { config.apply(env); } finally { process.stderr.write = write; }
+  assert.deepEqual(JSON.parse(env.KEEP_PLACEMENT), { default: null, projects: { '~/other': 'main' } },
+    'the daemon starts, placed by what is left');
+  assert.equal(warned.filter((line) => /ignoring placement/.test(line)).length, 2);
+  assert.ok(warned.some((line) => /ignoring placement default: .*not configured: aws1/.test(line)));
+
+  // And an edit of that same file goes through: the entries it inherited are not
+  // its fault, and refusing them is how a node became impossible to remove.
+  const edited = config.update((value) => ({ ...value, nodes: { ...value.nodes, mini: { transport: 'tcp', address: '100.64.0.3:7777' } } }), env);
+  assert.deepEqual(Object.keys(edited.nodes), ['main', 'mini']);
+  // Introducing one is still refused.
+  assert.throws(() => config.update((value) => ({ ...value,
+    placement: { ...value.placement, projects: { ...value.placement.projects, '~/new': 'nowhere' } } }), env),
+    /placement projects\.~\/new names a node that is not configured: nowhere/);
 });
 
 

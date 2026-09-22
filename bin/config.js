@@ -51,13 +51,20 @@ function nodeConfig(value = {}) {
 
 // Where work goes when nobody says. `default` is the node a fresh session lands on,
 // and `projects` names a node per project, keyed by the project exactly as a card
-// writes it. Both must name a configured node: a placement pointing at a machine
-// this install does not have is a launch that would fail at the last moment, so it
-// is refused when the file is read instead.
+// writes it. Both name a configured node.
+//
+// One entry that does not resolve is reported and dropped, exactly as nodeConfig
+// treats one unusable node entry: a placement is a preference, and a preference
+// naming a machine this install no longer has must not be able to stop `keep serve`
+// from booting or `keep nodes rm` from finishing the removal that caused it. The
+// placement map's own shape is still fatal, because a malformed one leaves nothing
+// to work with. An *edit* that writes such an entry is still refused, by update
+// below — introducing it is a mistake, inheriting it is a fact.
 function placementConfig(value = {}) {
   const { nodes } = nodeConfig(value);
   const placement = value.placement;
-  if (placement === undefined) return { default: null, projects: {} };
+  const invalid = {};
+  if (placement === undefined) return { default: null, projects: {}, invalid };
   if (!placement || typeof placement !== 'object' || Array.isArray(placement)) {
     throw new Error('invalid Keep configuration: placement must be an object');
   }
@@ -65,13 +72,14 @@ function placementConfig(value = {}) {
     if (!['default', 'projects'].includes(key)) throw new Error(`unsupported Keep placement key: ${key}`);
   }
   const configured = (name, where) => {
-    if (typeof name !== 'string' || !NODE_NAME_RE.test(name)) {
-      throw new Error(`invalid Keep node name in placement ${where}: ${JSON.stringify(name)}`);
-    }
-    if (!Object.prototype.hasOwnProperty.call(nodes, name)) {
-      throw new Error(`Keep placement ${where} names a node that is not configured: ${name}`);
-    }
-    return name;
+    const reason = typeof name !== 'string' || !NODE_NAME_RE.test(name)
+      ? `invalid Keep node name in placement ${where}: ${JSON.stringify(name)}`
+      : !Object.prototype.hasOwnProperty.call(nodes, name)
+        ? `Keep placement ${where} names a node that is not configured: ${name}`
+        : null;
+    if (!reason) return name;
+    invalid[where] = reason;
+    return null;
   };
   const projects = {};
   if (placement.projects !== undefined) {
@@ -80,12 +88,14 @@ function placementConfig(value = {}) {
     }
     for (const [project, name] of Object.entries(placement.projects)) {
       if (!project) throw new Error('invalid Keep placement: a project key cannot be empty');
-      projects[project] = configured(name, `projects.${project}`);
+      const target = configured(name, `projects.${project}`);
+      if (target) projects[project] = target;
     }
   }
   return {
     default: placement.default === undefined ? null : configured(placement.default, 'default'),
     projects,
+    invalid,
   };
 }
 
@@ -111,9 +121,15 @@ function update(mutate, env = process.env) {
   // is not this edit's fault and must not block fixing the rest of the file.
   const before = (() => { try { return nodeConfig(current).invalid; } catch { return {}; } })();
   const after = nodeConfig(next).invalid;
-  placementConfig(next);
   for (const [name, reason] of Object.entries(after)) {
     if (!Object.prototype.hasOwnProperty.call(before, name)) throw new Error(reason);
+  }
+  // The same rule for placement. `keep nodes rm` is what makes an entry stop
+  // resolving, so it clears the entries it invalidates itself rather than leaving
+  // one here for the next edit to trip over.
+  const placedBefore = (() => { try { return placementConfig(current).invalid; } catch { return {}; } })();
+  for (const [where, reason] of Object.entries(placementConfig(next).invalid)) {
+    if (!Object.prototype.hasOwnProperty.call(placedBefore, where)) throw new Error(reason);
   }
   let mode = 0o600;
   try { mode = fs.statSync(file).mode & 0o777; } catch {}
@@ -156,11 +172,17 @@ function apply(env = process.env) {
   // agree on which machine they are without re-reading the configuration.
   if (env.KEEP_DAEMON_NODE === undefined) env.KEEP_DAEMON_NODE = daemon;
   if (env.KEEP_NODE_NAME === undefined) env.KEEP_NODE_NAME = env.KEEP_DAEMON_NODE;
-  // Validated here, so a placement naming a machine this install does not have
-  // fails at startup rather than at the moment somebody opens a card. Projected in
-  // its checked form so nothing downstream parses the file again.
+  // Resolved here and projected in its checked form, so nothing downstream parses
+  // the file again. An entry naming a machine this install no longer has is said out
+  // loud and left out: the daemon still starts, and the sessions that entry would
+  // have placed land where they would have without it.
   const placement = placementConfig(value);
-  if (env.KEEP_PLACEMENT === undefined) env.KEEP_PLACEMENT = JSON.stringify(placement);
+  for (const [where, reason] of Object.entries(placement.invalid)) {
+    try { process.stderr.write(`keep: ignoring placement ${where}: ${reason}\n`); } catch {}
+  }
+  if (env.KEEP_PLACEMENT === undefined) {
+    env.KEEP_PLACEMENT = JSON.stringify({ default: placement.default, projects: placement.projects });
+  }
   require('../web/app/shared/scope-rules').validate(env.KEEP_SCOPES ? JSON.parse(env.KEEP_SCOPES) : undefined);
   require('./preferences').modelBudgets(env);
   return value;

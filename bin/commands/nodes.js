@@ -146,16 +146,37 @@ function removeNode(argv, deps) {
   const name = o._[0];
   if (o._.length !== 1) die('usage: keep nodes rm <name>');
   if (name === nodes.daemonNode()) die(`${name} is this install's daemon node and cannot be removed`);
+  // Placement that named this machine goes with it. A preference for a node that no
+  // longer exists is one nobody can honour, and leaving it behind would make the
+  // next edit of this file refuse over an entry this removal created.
+  const cleared = { default: false, projects: [] };
   config.update((value) => {
     const configured = { ...(value.nodes || {}) };
     if (!Object.prototype.hasOwnProperty.call(configured, name)) throw new KeepError(`no such node: ${name}`);
     delete configured[name];
-    return { ...value, nodes: configured };
+    const next = { ...value, nodes: configured };
+    const placement = value.placement;
+    if (placement && typeof placement === 'object' && !Array.isArray(placement)) {
+      const updated = { ...placement };
+      if (updated.default === name) { delete updated.default; cleared.default = true; }
+      if (updated.projects && typeof updated.projects === 'object' && !Array.isArray(updated.projects)) {
+        const projects = {};
+        for (const [project, target] of Object.entries(updated.projects)) {
+          if (target === name) cleared.projects.push(project);
+          else projects[project] = target;
+        }
+        updated.projects = projects;
+      }
+      next.placement = updated;
+    }
+    return next;
   });
   const tokenFile = tokenFileFor(name);
   try { fs.unlinkSync(tokenFile); }
   catch (error) { if (error.code !== 'ENOENT') die(`removed node ${name}, but its token at ${tokenFile} could not be deleted: ${error.message}`); }
   console.log(`Removed node ${name} and its token. Restart the daemon to stop polling it: keep restart-daemon`);
+  if (cleared.default) console.log(`Cleared the default placement, which named ${name}.`);
+  for (const project of cleared.projects) console.log(`Cleared the placement for ${project}, which named ${name}.`);
 }
 
 // What an account's usage looks like on the machine that holds its credentials.
