@@ -184,13 +184,24 @@ function createRegistryPull({
 // holder of the late window. A measured holder reads `... stalled 2400ms during
 // handoff-queue`; a heuristic guess reads `during likely <name>`. With `health`,
 // it also keeps the `loop-stalls` row; see createLoopStallHealth.
+//
+// A stall inside the probe's first STARTUP_MS is a startup stall, logged as
+// `... stalled 7200ms during startup` (with ` (<name>)` when a holder is known)
+// and never a failure on the row. The first minute pays once for module loading,
+// the first state builds and the first index scans on cold caches; every restart
+// recorded exactly one such failure, so a day of deploys read as a failing row
+// although the daemon was fine, and nobody can act on that. A stall after the first
+// minute is the daemon's steady state and counts as before. The window is measured
+// on the same monotonic clock as the lag.
 const SUSPEND_MS = 5 * 60e3;
+const STARTUP_MS = 60e3;
 
 function startLoopLagProbe({ thresholdMs = 500, intervalMs = 1000, write = (line) => process.stderr.write(line),
   setInterval: si = setInterval, now = () => require('node:perf_hooks').performance.now(), wallNow = Date.now,
-  holds = require('../loop-hold.js'), health = null, suspendMs = SUSPEND_MS } = {}) {
-  let expectedAt = now() + intervalMs;
-  let lastAt = now();
+  holds = require('../loop-hold.js'), health = null, suspendMs = SUSPEND_MS, startupMs = STARTUP_MS } = {}) {
+  const startedAt = now();
+  let expectedAt = startedAt + intervalMs;
+  let lastAt = startedAt;
   const stalls = health ? createLoopStallHealth({ health, thresholdMs }) : null;
   const timer = si(() => {
     const at = now();
@@ -200,10 +211,12 @@ function startLoopLagProbe({ thresholdMs = 500, intervalMs = 1000, write = (line
     } else if (lag > thresholdMs) {
       let blamed = null;
       try { blamed = holds.attribute({ since: lastAt, due: expectedAt, at }); } catch {}
-      const during = blamed ? ` during ${blamed.likely ? 'likely ' : ''}${blamed.name}` : '';
+      const holder = blamed ? `${blamed.likely ? 'likely ' : ''}${blamed.name}` : '';
+      const startup = at - startedAt < startupMs;
+      const during = startup ? ` during startup${holder ? ` (${holder})` : ''}` : holder ? ` during ${holder}` : '';
       write(`keep serve: event loop stalled ${Math.round(lag)}ms${during}\n`);
       // Only a measured holder goes into the health row; a guess stays in the log.
-      stalls?.stall(wallNow(), lag, blamed && !blamed.likely ? blamed.name : null);
+      stalls?.stall(wallNow(), lag, blamed && !blamed.likely ? blamed.name : null, { startup });
     }
     stalls?.tick(wallNow());
     // Measured against when this tick actually landed, so one stall (or jump) is
@@ -244,7 +257,9 @@ function startLoopLagProbe({ thresholdMs = 500, intervalMs = 1000, write = (line
 //
 // A restarted daemon starts with an empty window: stalls from before the restart
 // are in serve.log, not in this process's memory, so its first cadence tick
-// records ok.
+// records ok. A startup stall (see startLoopLagProbe) is only counted in the
+// detail, as `1 startup stall, 2 stalls in the last hour, worst ...`: it never
+// records a failure, never holds the heartbeat in skip, and is not the worst.
 const SEVERE_STALL_MS = 5000;
 const LOOP_STALLS_CADENCE_MS = 5 * 60e3;
 const FAILURE_SPACING_MS = 10 * 60e3;
@@ -257,9 +272,12 @@ function createLoopStallHealth({ health, thresholdMs = 500, severeMs = SEVERE_ST
   let lastFailureAt = -Infinity;
   const prune = (at) => { while (stalls.length && stalls[0].at < at - windowMs) stalls.shift(); };
   const detailOf = () => {
-    if (!stalls.length) return 'no stalls in the last hour';
-    const worst = stalls.reduce((a, b) => (b.ms > a.ms ? b : a));
-    return `${stalls.length} stall${stalls.length === 1 ? '' : 's'} in the last hour, worst ${Math.round(worst.ms)}ms`
+    const startups = stalls.filter((stall) => stall.startup).length;
+    const steady = stalls.filter((stall) => !stall.startup);
+    const prefix = startups ? `${startups} startup stall${startups === 1 ? '' : 's'}, ` : '';
+    if (!steady.length) return `${prefix}no ${startups ? 'other ' : ''}stalls in the last hour`;
+    const worst = steady.reduce((a, b) => (b.ms > a.ms ? b : a));
+    return `${prefix}${steady.length} stall${steady.length === 1 ? '' : 's'} in the last hour, worst ${Math.round(worst.ms)}ms`
       + `${worst.name ? ` during ${worst.name}` : ''}`;
   };
   const record = (at, entry) => {
@@ -267,11 +285,11 @@ function createLoopStallHealth({ health, thresholdMs = 500, severeMs = SEVERE_ST
     try { health.record('loop-stalls', { cadenceMs, at, ...entry }); } catch {}
   };
   return {
-    stall(at, ms, name) {
+    stall(at, ms, name, { startup = false } = {}) {
       if (!(ms > thresholdMs)) return;
       prune(at);
-      stalls.push({ at, ms, name: name || null });
-      if (ms <= severeMs || at - lastFailureAt < spacingMs) return;
+      stalls.push({ at, ms, name: name || null, startup });
+      if (startup || ms <= severeMs || at - lastFailureAt < spacingMs) return;
       lastFailureAt = at;
       record(at, {
         ok: false,
@@ -282,7 +300,7 @@ function createLoopStallHealth({ health, thresholdMs = 500, severeMs = SEVERE_ST
     tick(at) {
       if (at - lastRecordAt < cadenceMs) return;
       prune(at);
-      const severe = stalls.some((stall) => stall.ms > severeMs);
+      const severe = stalls.some((stall) => !stall.startup && stall.ms > severeMs);
       record(at, severe ? { skipped: true, detail: detailOf() } : { ok: true, detail: detailOf() });
     },
   };
@@ -943,5 +961,5 @@ function startSchedulers(ctx) {
 
 module.exports = {
   startFeatureSchedulers, startSchedulers, createRegistryPull, createCleanupSnapshot,
-  startLoopLagProbe, createLoopStallHealth, SEVERE_STALL_MS, SUSPEND_MS, startReceiptsPoller, periodicSessionScan,
+  startLoopLagProbe, createLoopStallHealth, SEVERE_STALL_MS, SUSPEND_MS, STARTUP_MS, startReceiptsPoller, periodicSessionScan,
 };

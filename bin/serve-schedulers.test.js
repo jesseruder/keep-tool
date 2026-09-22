@@ -203,7 +203,9 @@ test('a pull still running is never joined by a second one', async () => {
 });
 
 // No stall is attributed in these probe tests unless the test says so: the shared
-// tracker would otherwise see whatever else this process has wrapped.
+// tracker would otherwise see whatever else this process has wrapped. The tests
+// that are not about the startup window turn it off (startupMs: 0), so their
+// early stalls read as steady-state ones.
 const noHolds = { attribute: () => null };
 
 test('the lag probe names a tick that arrived late and stays quiet for one on time', () => {
@@ -217,6 +219,7 @@ test('the lag probe names a tick that arrived late and stays quiet for one on ti
     setInterval: (fn, ms) => { tick = fn; asked = ms; return { unref() { unrefs += 1; } }; },
     now: () => clock,
     holds: noHolds,
+    startupMs: 0,
   });
   assert.equal(asked, 1000);
   assert.equal(unrefs, 1, 'the probe never keeps the daemon alive by itself');
@@ -252,6 +255,7 @@ test('the lag probe names the hold the loop tracker blames, and marks a guess as
     wallNow: () => 1e12 + clock,
     holds: { attribute: (window) => { asked.push(window); return blame; } },
     health: { record: (name, entry) => rows.push([name, entry]) },
+    startupMs: 0,
   });
   clock = 1000;
   tick();
@@ -320,6 +324,81 @@ test('a monotonic lag past five minutes is logged as a clock jump, never a stall
   clock += 1000;
   tick();
   assert.equal(lines.length, 1, 'once per occurrence');
+});
+
+// The first minute after a (re)start pays once for module loading and cold caches.
+// A stall there is logged and counted in the detail, never recorded as a failure.
+function startupHarness(blame = null) {
+  const lines = [];
+  const rows = [];
+  let clock = 0;
+  let tick = null;
+  startLoopLagProbe({
+    write: (line) => lines.push(line),
+    setInterval: (fn) => { tick = fn; return { unref() {} }; },
+    now: () => clock,
+    wallNow: () => 1e12 + clock,
+    holds: { attribute: () => blame },
+    health: { record: (name, entry) => rows.push([name, entry]) },
+  });
+  // Every tick on time up to `at` (a jump would itself read as a stall).
+  const onTime = (at) => { while (clock + 1000 <= at) { clock += 1000; tick(); } };
+  // On time up to `at`, then a stall of `ms` on the tick after it.
+  const stallAt = (at, ms) => {
+    onTime(at);
+    clock = at + 1000 + ms; tick();
+  };
+  return { lines, rows, stallAt, onTime, failures: () => rows.filter(([, entry]) => entry.ok === false) };
+}
+
+test('a severe stall inside the first minute is a startup stall: logged, never a failure', () => {
+  const { STARTUP_MS } = require('./serve/schedulers.js');
+  assert.equal(STARTUP_MS, 60e3);
+  const probe = startupHarness({ name: 'handoff-queue', likely: false });
+  probe.stallAt(20e3, 7000);
+  assert.deepEqual(probe.lines, ['keep serve: event loop stalled 7000ms during startup (handoff-queue)\n']);
+  assert.deepEqual(probe.failures(), []);
+
+  const guessed = startupHarness({ name: 'POST /api/send', likely: true });
+  guessed.stallAt(20e3, 7000);
+  assert.deepEqual(guessed.lines, ['keep serve: event loop stalled 7000ms during startup (likely POST /api/send)\n']);
+
+  const plain = startupHarness();
+  plain.stallAt(20e3, 7000);
+  assert.deepEqual(plain.lines, ['keep serve: event loop stalled 7000ms during startup\n']);
+});
+
+test('the same stall after the first minute records a failure as before', () => {
+  const probe = startupHarness({ name: 'handoff-queue', likely: false });
+  probe.stallAt(90e3, 7000);
+  assert.deepEqual(probe.lines, ['keep serve: event loop stalled 7000ms during handoff-queue\n']);
+  assert.equal(probe.failures().length, 1);
+  assert.equal(probe.failures()[0][1].error, 'event loop stalled over 5s during handoff-queue');
+  assert.equal(probe.failures()[0][1].detail, '1 stall in the last hour, worst 7000ms during handoff-queue');
+});
+
+test('a startup stall and a later severe stall count one failure, and the detail names both', () => {
+  const probe = startupHarness({ name: 'handoff-queue', likely: false });
+  probe.stallAt(20e3, 9000);
+  probe.stallAt(120e3, 7200);
+  assert.equal(probe.failures().length, 1);
+  assert.equal(probe.failures()[0][1].detail, '1 startup stall, 1 stall in the last hour, worst 7200ms during handoff-queue',
+    'the startup stall is counted but is not the worst, although it was longer');
+  probe.onTime(10 * 60e3);
+  const last = probe.rows.at(-1)[1];
+  assert.equal(last.skipped, true, 'the steady-state stall still holds the heartbeat in skip');
+  assert.equal(last.detail, '1 startup stall, 1 stall in the last hour, worst 7200ms during handoff-queue');
+});
+
+test('the heartbeat after only a startup stall records ok', () => {
+  const probe = startupHarness();
+  probe.stallAt(20e3, 7000);
+  probe.onTime(6 * 60e3);
+  assert.deepEqual(probe.failures(), []);
+  assert.deepEqual(probe.rows.map(([, entry]) => entry.skipped || false), probe.rows.map(() => false), 'never a skip');
+  const last = probe.rows.at(-1)[1];
+  assert.equal(last.ok, true);
+  assert.equal(last.detail, '1 startup stall, no other stalls in the last hour');
 });
 
 // The loop-stalls row: unhealthy exactly while a >5 s stall is inside the hour,
