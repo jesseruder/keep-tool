@@ -1131,13 +1131,19 @@ function codexParentFromIndex(codexId, sinceMs, dbFile) {
   } catch { return null; }
   try {
     const floor = Number.isFinite(sinceMs) ? sinceMs - 3600e3 : 0;
+    // The earliest mention wins: the subagent that launched the Codex session
+    // printed its id first, and any other subagent naming it (a later reviewer or
+    // investigator) did so afterwards, perhaps while still active. Ordering by the
+    // session's last activity would pick that later reader, and resolveCodexParent's
+    // caller caches the answer, so a wrong parent would stick. Undated messages sort
+    // last, and the row id (ingest order) breaks ties.
     const row = handle.prepare(`SELECT s.parent_id AS parent
       FROM messages_fts
       JOIN messages m ON m.id = messages_fts.rowid
       JOIN sessions s ON s.id = m.session_id
       WHERE messages_fts MATCH ? AND s.agent = 'claude' AND s.kind = 'subagent'
         AND COALESCE(s.last_at, 0) >= ? AND s.parent_id IS NOT NULL AND instr(m.text, ?) > 0
-      ORDER BY s.last_at DESC LIMIT 1`).get(`"${codexId}"`, floor, codexId);
+      ORDER BY m.ts IS NULL, m.ts ASC, m.id ASC LIMIT 1`).get(`"${codexId}"`, floor, codexId);
     const parent = row && String(row.parent || '');
     return parent && SESSION_ID_RE.test(parent) ? parent : '';
   } catch {

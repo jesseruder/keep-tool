@@ -556,6 +556,18 @@ test('a turn index hit names the parent of a codex session without a directory w
     sub({ type: 'user', timestamp: new Date(now - 10e3).toISOString(), message: {
       role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b1', content: `{"status":"running","session":"${codexId}"}` }] } }),
   ].join('\n') + '\n');
+  // A later reader under another parent quotes the same id after the launch and
+  // stays active longer. It is ingested first, so neither ingest order nor last
+  // activity favours the launcher: only the earliest mention does.
+  const reader = crypto.randomUUID();
+  const readerDir = path.join(projects, '-tmp-demo', reader, 'subagents');
+  fs.mkdirSync(readerDir, { recursive: true });
+  const readerLine = (extra) => JSON.stringify({ isSidechain: true, agentId: 'reader1', sessionId: reader, cwd: '/tmp/demo', type: 'user', ...extra });
+  fs.writeFileSync(path.join(readerDir, 'agent-reader1.jsonl'), [
+    readerLine({ timestamp: new Date(now - 4e3).toISOString(), message: { role: 'user', content: `Check what codex session ${codexId} changed` } }),
+    readerLine({ timestamp: new Date(now - 1e3).toISOString(), message: { role: 'user', content: 'Still reading.' } }),
+  ].join('\n') + '\n');
+  assert.equal(turnIndex.ingestFile(path.join(readerDir, 'agent-reader1.jsonl'), { agent: 'claude', db }).ok, true);
   assert.equal(turnIndex.ingestFile(path.join(subagents, 'agent-rescue1.jsonl'), { agent: 'claude', db }).ok, true);
   // A later subagent under another parent shows the id's tokens spaced apart: the
   // FTS phrase matches it, and only the exact-text check keeps it out.
@@ -583,7 +595,8 @@ test('a turn index hit names the parent of a codex session without a directory w
 
   let walks = 0;
   const walk = () => { walks += 1; return 'from-the-walk'; };
-  // (a) a hit is the answer, with no walk.
+  // (a) a hit is the answer, with no walk, and it is the launcher's parent rather
+  // than the more recently active reader's.
   assert.equal(scanSubagentsForCodex(codexId, now - 60e3, projects, { db, walk }), parent);
   assert.equal(walks, 0, 'an index hit skips the walk');
   // (b) a miss is not final: the index may simply not hold the id. A subagent last
@@ -606,8 +619,10 @@ test('a turn index hit names the parent of a codex session without a directory w
   assert.equal(scanSubagentsForCodex(codexId, now - 60e3, projects, { db: path.join(dir, 'missing.sqlite'), walk }), 'from-the-walk');
   assert.equal(walks, 5);
   assert.equal(fs.existsSync(path.join(dir, 'missing.sqlite')), false, 'asking never creates an index');
-  // The real walk over the same tree reads the transcript itself.
-  assert.equal(scanSubagentsForCodex(codexId, now - 60e3, projects, { db: junk }), parent);
+  // The real walk over the same tree reads the transcripts itself. (Asked with the
+  // late id: codexId is named by two subagents, and the walk takes the first file
+  // in directory order, which is not a stable fixture.)
+  assert.equal(scanSubagentsForCodex(lateCodexId, now - 60e3, projects, { db: junk }), lateParent);
 });
 
 test('the subagent walk finds an id that straddles a read chunk in a large transcript', (t) => {
