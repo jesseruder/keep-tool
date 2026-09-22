@@ -14433,3 +14433,130 @@ test('a reopen on another node refuses when the evidence its agent needs could n
     prepareLaunch: () => { throw new Error('reached the launch'); },
   }), /reached the launch/);
 });
+
+// A pane on aws1, an in-place restart of it, and a node whose process table this
+// daemon could not read once the old agent was gone. The reopen path has refused on
+// that for a while; these two had not, so a resume could still start a second agent
+// on a transcript the first one was still holding.
+function remoteRestartScenario(rowsAfterExit, over = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-remote-restart-evidence-'));
+  const claudeFile = path.join(root, 'claude.jsonl');
+  const accountConfig = path.join(root, 'config.json');
+  fs.writeFileSync(accountConfig, JSON.stringify({ version: 1, accounts: [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: path.join(os.homedir(), '.claude'), useDefaultConfig: true },
+  ], defaultAccounts: { claude: 'claude/default' } }));
+  fs.writeFileSync(claudeFile, JSON.stringify({ type: 'assistant', sessionId: 'far', message: { content: [], stop_reason: 'end_turn' } }) + '\n');
+  const stamp = 'Tue Sep  8 10:00:00 2026';
+  const command = '/test/claude --resume far';
+  const agent = { pid: 11, ppid: 10, pidStart: stamp, agent: 'claude', interactive: true, args: command };
+  const session = { id: 'far', kind: 'claude', state: 'idle', endedTurn: true, project: root };
+  let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
+    cols: 200, rows: 50, meta: { sessionId: 'far', agent: 'claude' } };
+  const state = { closing: false, exited: false, replaced: null, root };
+  const answer = async (type, params) => {
+    if (type === 'hello') return { replaceExited: true };
+    if (type === 'get') return { pane: { ...pane } };
+    if (type === 'list') return { panes: [{ ...pane }] };
+    if (type === 'input') return {};
+    if (type === 'prepare-launch') return { command: 'claude --resume far' };
+    assert.equal(type, 'replace-exited');
+    state.replaced = params;
+    pane = { ...pane, alive: true, pid: 20 };
+    return { pane };
+  };
+  const deps = {
+    root, env: { KEEP_DIR: root, KEEP_CONFIG: accountConfig }, withInjectionLock: (fn) => fn(),
+    buildState: async () => ({ sessions: [session], tasks: [] }),
+    claudeRolloutFile: () => claudeFile,
+    agentProcessRows: async () => (state.exited ? rowsAfterExit() : [agent]),
+    psTable: `11 10 ttys001 ${stamp} ${command}`,
+    lsof: async () => '',
+    closeIdleSession: async (_body, guards) => { await guards.beforeClose(); state.closing = true; },
+    sleep: async () => {
+      if (state.closing) { pane = { ...pane, alive: false }; state.exited = true; }
+    },
+    readScreenResult: async () => ({ text: `${command}\n~/keep > `, cursor: { x: 9, y: 1 } }),
+    waitForHostAgent: async () => {},
+    connectHost: async () => ({
+      socket: { destroyed: false }, request: answer,
+      onDisconnect: () => ({ dispose() {} }), close: () => {},
+    }),
+    ...over,
+  };
+  return { state, deps };
+}
+
+test('a force restart on another node refuses when that node cannot say what is running', async (t) => {
+  const { forceRestartSession, closeHostClient } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-remote-force-evidence-'));
+  t.after(() => { fs.rmSync(root, { recursive: true, force: true }); return closeHostClient(); });
+  const accountConfig = path.join(root, 'config.json');
+  fs.writeFileSync(accountConfig, JSON.stringify({ version: 1, accounts: [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: path.join(os.homedir(), '.claude'), useDefaultConfig: true },
+  ], defaultAccounts: { claude: 'claude/default' } }));
+  const stamp = 'Tue Sep  8 10:00:00 2026';
+  const meta = { sessionId: 'forced', agent: 'claude' };
+  const scenario = (rows) => {
+    // Already exited: this test is about the evidence read after the close, not the
+    // close itself.
+    let pane = { id: 'p', pid: 10, createdAt: 5, cwd: root, cols: 200, rows: 50, alive: false, meta };
+    const state = { replaced: null };
+    const answer = async (type, params) => {
+      if (type === 'hello') return { replaceExited: true };
+      if (type === 'get') return { pane: { ...pane } };
+      if (type === 'prepare-launch') return { command: 'claude --resume forced' };
+      if (type === 'replace-exited') { state.replaced = params; pane = { ...pane, alive: true, pid: 20 }; return { pane }; }
+      return {};
+    };
+    const entry = { sessionId: 'forced', pane: 'p@aws1', pid: 10, token: 'force-token', processes: [],
+      original: { id: 'p@aws1', pid: 10, pidStart: stamp, createdAt: 5, cwd: root, cols: 200, rows: 50, meta, agent: 'claude', bypass: false } };
+    const deps = {
+      root, env: { KEEP_DIR: root, KEEP_CONFIG: accountConfig },
+      withInjectionLock: (fn) => fn(), sleep: async () => {},
+      forceRows: async () => rows(),
+      closeIdleSession: async () => { pane = { ...pane, alive: false }; return { ok: true }; },
+      waitForHostAgent: async () => true,
+      connectHost: async () => ({
+        socket: { destroyed: false }, request: answer,
+        onDisconnect: () => ({ dispose() {} }), close: () => {},
+      }),
+    };
+    return { entry, deps, state };
+  };
+
+  await closeHostClient();
+  // The node answers the kill sweep with nothing at all. "No conversation is live"
+  // read off that is a statement about the reader, and replacing on it is how a
+  // second agent gets started on a transcript the first one still holds.
+  const empty = scenario(() => []);
+  await assert.rejects(forceRestartSession(empty.entry, async () => {}, empty.deps),
+    (error) => error.status === 409 && error.message === 'cannot verify processes on aws1');
+  assert.equal(empty.state.replaced, null);
+
+  await closeHostClient();
+  // A node that does answer, and says nothing owns this conversation: the replace runs.
+  const ok = scenario(() => [{ pid: 10, ppid: 1, pidStart: stamp, agent: null, interactive: false, args: '/bin/zsh -l' }]);
+  assert.equal((await forceRestartSession(ok.entry, async () => {}, ok.deps)).ok, true);
+  assert.ok(ok.state.replaced, 'the force restart went ahead');
+  await closeHostClient();
+});
+
+test('an in-place restart on another node refuses when that node cannot say what is running', async (t) => {
+  const { restartSession, closeHostClient } = require('./serve');
+  await closeHostClient();
+  // The node answers, but with nothing: an empty table is "nobody could look", and
+  // the restart may not read it as "no agent owns this conversation".
+  const empty = remoteRestartScenario(() => []);
+  t.after(() => { fs.rmSync(empty.state.root, { recursive: true, force: true }); return closeHostClient(); });
+  await assert.rejects(restartSession({ sessionId: 'far', pane: 'p@aws1', pid: 10, mode: 'idle' }, empty.deps),
+    (error) => error.status === 409 && error.message === 'cannot verify processes on aws1');
+  assert.equal(empty.state.replaced, null, 'nothing was resumed on an answer nobody could stand behind');
+
+  await closeHostClient();
+  // The same restart on a node that does answer goes through.
+  const ok = remoteRestartScenario(() => [{ pid: 10, ppid: 1, pidStart: 'Tue Sep  8 10:00:00 2026', agent: null, interactive: false, args: '/bin/zsh -l' }]);
+  t.after(() => fs.rmSync(ok.state.root, { recursive: true, force: true }));
+  assert.equal((await restartSession({ sessionId: 'far', pane: 'p@aws1', pid: 10, mode: 'idle' }, ok.deps)).sessionId, 'far');
+  assert.ok(ok.state.replaced, 'the restart went ahead');
+  await closeHostClient();
+});

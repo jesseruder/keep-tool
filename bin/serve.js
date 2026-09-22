@@ -5625,6 +5625,22 @@ async function prepareLaunchOn(node, options, deps = {}, localDeps = {}) {
     { ...deps, node });
 }
 
+// Whether a liveSessionPids answer is strong enough for a guard to act on its
+// silence. That map is empty both when nothing is running and when nobody could
+// look, and for a guard whose job is to stop a second agent writing one transcript
+// those are opposite answers. The process table alone does not find every agent
+// either — a fresh Claude TUI is identified by the session id in a child's
+// environment, a Codex one by the rollout files it holds open — so a failed read of
+// the evidence this agent kind depends on means "not found for want of looking".
+//
+// Only asked about another node: on this machine these reads are local, and the
+// guards that use it have always taken their answer as it comes.
+function unverifiedProcesses(live, agent) {
+  const report = (live && live.evidence) || {};
+  const needed = agent === 'claude' ? report.env : agent === 'codex' ? report.files : 'ok';
+  return report.table === 'failed' || !(report.rows > 0) || needed === 'failed';
+}
+
 async function liveSessionPids(deps = {}, options = {}) {
   // The machine every read below is about. Named on each one, not bound once, so a
   // deps object shared with a fleet listing cannot answer for the wrong machine.
@@ -6480,6 +6496,12 @@ async function restartSession(body, deps = {}) {
     }
     if (!helpersStopped) throw Error('Session helper did not exit; restart stopped without killing it');
     const live = await liveSessionPids(deps);
+    // On another node this answer is a remote read, and a read that failed says
+    // nothing about what is running there. Resuming on that silence is how a second
+    // agent gets started on a transcript the first one is still writing.
+    if (remotePane && unverifiedProcesses(live, session.kind)) {
+      throw new InjectionError(409, `cannot verify processes on ${paneNode}`);
+    }
     if (live.has(session.id)) throw Error('An agent process still owns this conversation');
     // An earlier Owner-forced stop of this transfer may have left a process it captured
     // running; nothing resumes the conversation while one does, forced or not.
@@ -6695,8 +6717,19 @@ async function forceRestartSession(entry, save, deps = {}) {
       try { resumeMcpConfig = (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(resumeAccount, cwd).mcpConfig; }
       catch (error) { throw new InjectionError(409, `account shared setup is unavailable: ${error.message}`); }
     }
+    // Kept to hand so the guard below reads the very table the stop signals against.
+    const stop = forceStopDeps(entry, deps, host, save);
     return require('./force-restart').run(entry, {
-      ...forceStopDeps(entry, deps, host, save),
+      ...stop,
+      sessionLive: async (sid) => {
+        const live = await liveSessionPids({ ...deps, agentProcessRows: stop.rows });
+        // Same reason as the in-place restart: "not live" from a node that could not
+        // be read is not an answer a replace may be built on.
+        if (remotePane && unverifiedProcesses(live, resumeAgent)) {
+          throw new InjectionError(409, `cannot verify processes on ${paneNode}`);
+        }
+        return live.has(sid);
+      },
       replace: async (original, job, expectedPid) => {
         const bypass = original.agent === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
         const reviewerSpec = reviewerResumeSpec({ id: job.sessionId }, original, deps);
@@ -9203,20 +9236,10 @@ async function openSession(body, deps = {}) {
       } else {
         let rows = null;
         try { rows = await (deps.agentProcessRows || agentProcessRows)(deps, { node: launchNode }); } catch {}
-        if (!Array.isArray(rows) || !rows.length) {
-          throw new InjectionError(409, `cannot verify processes on ${launchNode}`);
-        }
         live = await (deps.liveSessionPids || liveSessionPids)(
           { ...deps, agentProcessRows: async () => rows }, { node: launchNode },
         );
-        // The process table alone does not find every agent. A fresh Claude TUI is
-        // identified by the session id in a child's environment, and a Codex one by
-        // the rollout files it holds open; if the read this session's kind depends on
-        // failed, the answer below is "nothing found" for want of looking, which is
-        // the one thing this guard may not act on.
-        const report = live.evidence || {};
-        const needed = agent === 'claude' ? report.env : agent === 'codex' ? report.files : 'ok';
-        if (report.table === 'failed' || needed === 'failed') {
+        if (unverifiedProcesses(live, agent)) {
           throw new InjectionError(409, `cannot verify processes on ${launchNode}`);
         }
       }
