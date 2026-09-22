@@ -6321,31 +6321,74 @@ function forceStopDeps(entry, deps, host, save) {
   };
 }
 
-// Owner-forced restart or handoff: stop the process tree without asking whether it is
-// idle, then resume through the caller's own resume step, which for a handoff copies the
-// conversation to the target account first.
+// Owner-forced restart or handoff. Nothing is typed into the session and the host is
+// never asked to signal "whatever this pane runs now": the pane's whole process tree is
+// captured once, each process by pid and start time, journalled through onForcedStop,
+// and only those exact instances are sent SIGTERM and then SIGKILL. Descendants that
+// appear while it runs join the set only through a parent already in it. The caller's
+// resume step then starts the conversation again (for a handoff, on the target account).
 async function forceStopThenResume({ session, pane, identity, resume }, deps = {}) {
   const host = (type, params) => hostRequest(type, params, deps);
-  const entry = { sessionId: session.id, pane: pane.id, pid: pane.pid, mode: 'force', token: crypto.randomUUID() };
-  // Committing to the close is this stop's Enter: journalled the same way, so an account
-  // handoff that loses the daemon between the kill and the relaunch can still prove the
-  // stop after the fact (dead pane, that exact agent process gone) and recover.
-  const stop = forceStopDeps(entry, deps, host, async () => { if (entry.phase === 'closing') await deps.onExitEnter?.(); });
-  return require('./force-restart').run(entry, {
-    ...stop,
-    // The process the caller verified, and no other, is the one stopped.
-    identifyOriginal: async (sid, snapshot) => {
-      const found = await stop.identifyOriginal(sid, snapshot);
-      if (!found || found.pid !== identity.pid || found.pidStart !== identity.pidStart) throw Error('Agent process identity changed during restart');
-      return found;
-    },
-    verifyStarted: undefined, // resume waits for the agent itself
-    replace: async (original, job, expectedPid) => {
-      const stopped = (await host('get', { pane: job.pane })).pane;
-      if (stopped.alive || stopped.pid !== expectedPid) throw Error('Exited pane changed before resume');
-      return resume(stopped);
-    },
-  });
+  const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const rows = forceStopDeps({ sessionId: session.id, pane: pane.id, pid: pane.pid }, deps, host, async () => {}).rows;
+  const signal = deps.forceSignal || (async (pid, name) => { try { process.kill(pid, name); } catch (e) { if (e.code !== 'ESRCH') throw e; } });
+  const same = (a, b) => a && b && a.pid === b.pid && a.pidStart === b.pidStart;
+  const samePane = (current) => current && current.id === pane.id && current.pid === pane.pid && current.createdAt === pane.createdAt;
+
+  const snapshot = await rows();
+  const shell = snapshot.find((p) => p.pid === pane.pid);
+  if (!shell?.pidStart) throw Error('Original process identity is incomplete');
+  const processes = [{ pid: shell.pid, pidStart: shell.pidStart }];
+  const grow = (table) => {
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const p of table) {
+        if (processes.some((owned) => owned.pid === p.pid) || !processes.some((owned) => same(owned, table.find((q) => q.pid === p.ppid)))) continue;
+        if (!p.pidStart || processes.length >= 256) throw Error('Process tree exceeds force-stop limit or lacks identity');
+        processes.push({ pid: p.pid, pidStart: p.pidStart }); changed = true;
+      }
+    }
+  };
+  grow(snapshot);
+  if (!processes.some((p) => p.pid === identity.pid && p.pidStart === identity.pidStart)) {
+    throw Error('Agent process identity changed during restart');
+  }
+  if (!samePane((await host('get', { pane: pane.id })).pane)) throw Error('Pane changed since it was inspected; nothing closed');
+  // Journalled before the first signal: a handoff that loses the daemon from here on can
+  // still prove the stop, and only once every one of these is gone.
+  await deps.onForcedStop?.(processes.map((p) => ({ ...p })));
+
+  let remaining = processes;
+  for (const name of ['SIGTERM', 'SIGKILL']) {
+    const table = await rows();
+    grow(table);
+    for (const old of [...processes].reverse()) {
+      const current = table.find((p) => p.pid === old.pid);
+      if (same(current, old) && !current.zombie) await signal(old.pid, name);
+    }
+    for (let i = 0; i < 10; i++) {
+      await sleep(200);
+      const after = await rows();
+      remaining = processes.filter((old) => after.some((p) => same(old, p) && !p.zombie));
+      if (!remaining.length) break;
+    }
+    if (!remaining.length) break;
+  }
+  if (remaining.length) throw Error('Old processes remain; recovery required');
+
+  let stopped;
+  for (let i = 0; i < 25; i++) {
+    stopped = (await host('get', { pane: pane.id })).pane;
+    if (!samePane(stopped)) throw Error('Pane changed after the forced stop; nothing resumed');
+    if (!stopped.alive) break;
+    await sleep(200);
+  }
+  if (stopped.alive) throw Error('Pane did not exit after its processes were stopped');
+  if ((await liveSessionPids({ ...deps, agentProcessRows: rows })).has(session.id)) {
+    throw Error('An agent process still owns this conversation');
+  }
+  return resume(stopped);
 }
 
 // Same two attempts as restartSession: hold the model key so the resumed agent reads a

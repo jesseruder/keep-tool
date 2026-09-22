@@ -576,6 +576,30 @@ test('a typed /exit whose confirmation was lost is proven after the fact from a 
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('a forced stop lost mid-way is recovered only once every process it signalled is gone', async () => {
+  const f = fixture();
+  try {
+    const tree = [{ pid: 10, pidStart: 'shell-start' }, { pid: 11, pidStart: 'source-start' }, { pid: 12, pidStart: 'child-start' }];
+    const d = deps(f, { restartSession: async (_body, options) => {
+      assert.equal(options.ownerForce, true);
+      options.onForcedStop(tree); d.pane.alive = false; throw new Error('host request timed out: get');
+    } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', ownerForce: true }, d), /host request timed out/);
+    const journal = handoff.readOne(f.root, f.sid);
+    assert.ok(Number.isFinite(journal.sourceExitEnterAt));
+    assert.deepEqual(journal.forcedProcesses, tree);
+    // The agent is gone but a child it started is still running and could still write.
+    d.agentProcessRows = async () => [{ pid: 12, pidStart: 'child-start' }, { pid: 99, pidStart: 'other' }];
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /forced stop is still running/);
+    assert.equal(handoff.readOne(f.root, f.sid).sourceStopVerifiedAt, undefined);
+    // A reused pid that started at another time is not that child.
+    d.agentProcessRows = async () => [{ pid: 12, pidStart: 'later' }, { pid: 99, pidStart: 'other' }];
+    const recovered = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    assert.equal(recovered.status, 'done');
+    assert.equal(recovered.sourceStopVerifiedBy, 'post-hoc-ps');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('an earlier transfer\'s pane marker does not block proving a later lost stop', async () => {
   const f = fixture();
   try {

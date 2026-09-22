@@ -167,6 +167,12 @@ async function verifySourceStopAfterTheFact(current, pane, deps, root) {
   if (rows.some((row) => row && row.pid === current.sourceAgentPid && row.pidStart === current.sourceAgentPidStart)) {
     throw new Error('Source agent is still running although its pane exited; recovery is blocked');
   }
+  // A forced stop names every process it signalled; a child that outlived the agent could
+  // still be writing the conversation that is about to be copied.
+  if (Array.isArray(current.forcedProcesses) && rows.some((row) => row && current.forcedProcesses.some((old) =>
+    old && row.pid === old.pid && row.pidStart === old.pidStart && !row.zombie))) {
+    throw new Error('A process from the forced stop is still running; recovery is blocked');
+  }
   Object.assign(current, { sourceStopVerifiedAt: Date.now(), sourceStopVerifiedBy: 'post-hoc-ps' });
   writeOne(root, current);
 }
@@ -931,6 +937,12 @@ async function run(body, deps = {}) {
         // submit, and a source that dies on its own after that was never stopped by this
         // transaction. A host that refused the Enter outright takes the mark back.
         onExitEnter: () => { current.sourceExitEnterAt = Date.now(); writeOne(root, current); },
+        // An Owner-forced stop signals the captured process tree instead of typing /exit.
+        // Its first signal is this transaction's Enter, and recovery accepts the stop only
+        // once every one of these exact processes is gone.
+        onForcedStop: (processes) => {
+          Object.assign(current, { sourceExitEnterAt: Date.now(), forcedProcesses: processes }); writeOne(root, current);
+        },
         onExitEnterDropped: () => { delete current.sourceExitEnterAt; writeOne(root, current); },
         // The agent this preflight actually verified. The restart re-reads `ps` and now
         // re-reads it again when a snapshot comes back unusable, and a patient read is

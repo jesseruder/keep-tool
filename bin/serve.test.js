@@ -11378,7 +11378,7 @@ test('compact session restores the pane launch model rather than the transcript 
   }
 });
 
-test('an Owner-forced restart closes and kills a busy session and resumes it without asking for idle proof', async () => {
+test('an Owner-forced restart signals only the captured process tree and resumes without idle proof', async () => {
   const { restartSession } = require('./serve');
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-owner-force-'));
   try {
@@ -11387,55 +11387,58 @@ test('an Owner-forced restart closes and kills a busy session and resumes it wit
     const session = { id: 'busy', kind: 'claude', state: 'working', project: cwd, endedTurn: false, toolRunning: true,
       pendingQuestion: { text: 'which one?' }, rateLimit: { at: '2026-09-12T20:34:01.831Z' },
       pendingBackground: true, unknownBackgroundJobs: ['bash-7'], backgroundJobs: { pending: true, jobs: [{ id: 'bash-7', status: 'pending' }] } };
-    const state = { alive: true, calls: [], signals: [] };
-    const pane = () => ({ id: 'p', pid: 10, alive: state.alive, cwd, createdAt: 'created', cols: 80, rows: 24, attached: 1,
+    const state = { live: new Set([10, 11, 12]), calls: [], signals: [], paneId: { pid: 10, createdAt: 'created' } };
+    const pane = () => ({ id: 'p', ...state.paneId, alive: state.live.has(10), cwd, cols: 80, rows: 24, attached: 1,
       meta: { sessionId: 'busy', agent: 'claude' } });
     const agentRow = { pid: 11, ppid: 10, pidStart: 'agent-start', agent: 'claude', interactive: true, args: 'claude --resume busy' };
+    // A child the agent started, still running, and an unrelated process that must never be touched.
+    const table = () => [{ pid: 10, ppid: 1, pidStart: 'shell-start', args: '-zsh' }, agentRow,
+      { pid: 12, ppid: 11, pidStart: 'child-start', args: 'npm test' }, { pid: 13, ppid: 1, pidStart: 'other', args: 'vim' }]
+      .filter((p) => p.pid === 13 || state.live.has(p.pid));
     const target = { id: 'claude-two', label: 'Claude Two', agent: 'claude', configDir: cwd };
     const deps = (extra = {}) => ({ withInjectionLock: (fn) => fn(), sleep: async () => {}, resumeAccount: target,
       buildState: async () => ({ sessions: [session], tasks: [] }),
-      agentProcessRows: async () => state.alive ? [agentRow] : [],
-      forceRows: async () => state.alive ? [{ pid: 10, ppid: 1, pidStart: 'shell-start', args: '-zsh' }, agentRow] : [],
-      forceSignal: async (pid, signal) => { state.signals.push([pid, signal]); },
-      closeIdleSession: async () => { state.calls.push('graceful'); throw new Error('Waiting for the turn and background work to finish'); },
+      agentProcessRows: async () => table().filter((p) => p.pid === 11),
+      forceRows: async () => table(),
+      forceSignal: async (pid, signal) => { state.calls.push('signal'); state.signals.push([pid, signal]); state.live.delete(pid); },
+      closeIdleSession: async () => assert.fail('a forced stop types nothing into the session'),
       waitForHostAgent: async () => {},
       host: { request: async (type, params) => {
         state.calls.push(type);
         if (type === 'hello') return { replaceExited: true };
         if (type === 'get') return { pane: pane() };
-        if (type === 'kill') { state.alive = false; return { ok: true }; }
         if (type === 'replace-exited') { state.replace = params; return { pane: { id: 'p', pid: 99, createdAt: 'again' } }; }
         throw new Error(`unexpected host request ${type}`);
       } },
       ...extra });
     const body = { sessionId: 'busy', pane: 'p', pid: 10, mode: 'now' };
 
-    await assert.rejects(restartSession(body, deps()), /Waiting for the turn and background work to finish/,
+    await assert.rejects(restartSession(body, { ...deps(), closeIdleSession: undefined }), /Waiting for the turn and background work to finish/,
       'without Owner behind it the same session is refused');
-    assert.equal(state.calls.includes('kill'), false);
+    assert.deepEqual(state.signals, []);
 
-    const result = await restartSession(body, deps({ ownerForce: true, onExitEnter: () => state.calls.push('exit-mark') }));
+    let journalled;
+    const result = await restartSession(body, deps({ ownerForce: true,
+      onForcedStop: (processes) => { state.calls.push('journal'); journalled = processes; } }));
     assert.equal(result.ok, true);
-    assert.ok(state.calls.indexOf('exit-mark') >= 0 && state.calls.indexOf('exit-mark') < state.calls.indexOf('kill'),
-      'the stop is journalled before anything is signalled, so recovery can prove it');
     assert.equal(result.pid, 99);
-    assert.ok(state.calls.indexOf('graceful') < state.calls.indexOf('kill'), 'a graceful close is tried before the signal');
+    assert.deepEqual(journalled.map((p) => p.pid).sort(), [10, 11, 12]);
+    assert.ok(state.calls.indexOf('journal') < state.calls.indexOf('signal'), 'the stop is journalled before any signal');
+    assert.deepEqual(state.signals.map(([pid]) => pid).sort(), [10, 11, 12], 'only the captured tree is signalled');
+    assert.equal(state.calls.includes('kill'), false, 'the host is never asked to signal whatever the pane runs now');
     assert.equal(state.replace.meta.accountId, 'claude-two');
     assert.match(state.replace.args[1], /'--resume' 'busy'/);
 
-    // The pane relaunched between the last process snapshot and the close: the new
-    // process is someone else's, and nothing may be closed or signalled.
-    Object.assign(state, { alive: true, calls: [], signals: [] });
-    let snapshots = 0;
-    const relaunched = deps({ ownerForce: true, forceRows: async () => {
-      if (++snapshots === 2) state.pid = 20;
-      return [{ pid: 10, ppid: 1, pidStart: 'shell-start', args: '-zsh' }, agentRow];
-    } });
+    // The pane relaunched after it was inspected: nothing may be signalled.
+    Object.assign(state, { live: new Set([10, 11, 12]), calls: [], signals: [] });
+    let reads = 0;
+    const relaunched = deps({ ownerForce: true });
     const get = relaunched.host.request;
-    relaunched.host = { request: async (type, params) => type === 'get' && state.pid === 20
-      ? { pane: { ...pane(), pid: 20, createdAt: 'relaunched' } } : get(type, params) };
-    await assert.rejects(restartSession(body, relaunched), /Pane changed since it was inspected|Pane changed/);
-    assert.equal(state.calls.includes('kill'), false);
+    relaunched.host = { request: async (type, params) => {
+      if (type === 'get' && ++reads >= 2) return { pane: { ...pane(), pid: 20, createdAt: 'relaunched' } };
+      return get(type, params);
+    } };
+    await assert.rejects(restartSession(body, relaunched), /Pane changed/);
     assert.deepEqual(state.signals, []);
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });
