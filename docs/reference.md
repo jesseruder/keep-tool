@@ -241,6 +241,7 @@ keep lint [--json] [--rule <name>] [--fix-hints]
 keep self-repair [--dry] [--json] [--reset <signature>] [--disable|--enable]  # what the daemon has opened on itself
 keep brief [--send]
 keep codex-jobs [--json] [--reap] [--dry]  # list companion jobs/brokers; optionally reap stale jobs, orphan pollers, and abandoned or idle brokers
+keep leftovers [--json] [--reap] [--dry]  # list (or stop) dev servers, watchers and test runners a session left running after its pane went away
 keep standup [--since "YYYY-MM-DD HH:MM"|ISO] [--dry] [--show]
 keep ideas [--dry] [--model <m>]
 keep landed [--dry] [--only <id>]
@@ -2798,3 +2799,17 @@ refuses cleanup. Only the current user's recognized interactive agent executable
 qualify; shell wrappers, headless commands, and unknown arguments are excluded.
 The reaper refreshes identity and safety evidence before SIGTERM. Use
 `keep codex-jobs --reap --dry` to inspect planned actions without sending signals.
+
+Everything else a session starts in the background — a dev server, a watcher, a
+test runner — is swept by the daemon every five minutes (`leftovers` in
+`keep health`). A process is a leftover when its parent is init/launchd, it
+belongs to the current user, it inherited `KEEP_PANE`, and that pane is exited
+or closed with no live pane carrying the same Claude session id. Once the pane
+has been gone for `KEEP_LEFTOVER_GRACE_MIN` (default 15), the process and its
+children get SIGTERM, then SIGKILL after five seconds, each signal checked
+against the pid's start time and command. Applications and system binaries,
+`claude`/`codex`/`pi`, Keep's own scripts, anything started with
+`KEEP_PERSIST=1`, and anything matching the `KEEP_LEFTOVER_EXCLUDE` regex are
+never touched. An empty or unreachable pane list stops the sweep. Stops are
+logged to serve.log; `KEEP_LEFTOVER_SWEEP=0` turns the sweep off, and
+`keep leftovers --reap --dry` shows what it would do.

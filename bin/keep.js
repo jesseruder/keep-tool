@@ -2464,6 +2464,30 @@ commands['codex-jobs'] = async (argv) => {
   console.log(renderCodexJobs(result));
 };
 
+commands.leftovers = async (argv) => {
+  const o = parseArgs(argv, { json: 'bool', reap: 'bool', dry: 'bool' });
+  if (o._.length || (o.dry && !o.reap)) die('usage: keep leftovers [--json] [--reap] [--dry]');
+  if (o.reap && isReviewerSession()) die('the fleet reviewer may list leftover processes but may not stop them');
+  const leftovers = require('./leftover-processes.js');
+  // Asked for by hand, a leftover is stopped once its pane has been gone for the
+  // grace period; a closed pane has no exit time, so it counts as gone already.
+  const deps = { keepRoot: ROOT, graceMs: Number(process.env.KEEP_LEFTOVER_GRACE_MIN || 15) * 60e3 };
+  if (o.reap) {
+    const result = await leftovers.reap({ dry: o.dry, deps });
+    if (o.json) return process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    for (const item of result.stopped) console.log(`${o.dry ? 'would stop' : 'stopped'} ${leftovers.describe(item)}`);
+    for (const item of result.waiting) console.log(`in grace ${leftovers.describe(item)}`);
+    for (const item of result.skipped) console.log(`skipped ${item.pid ? `pid ${item.pid}` : 'sweep'}: ${item.why}`);
+    if (!result.stopped.length && !result.waiting.length && !result.skipped.length) console.log('no leftover processes');
+    return;
+  }
+  const result = await leftovers.list(deps);
+  if (o.json) return process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+  if (!result.known) die(`leftover discovery unavailable: ${result.reason}`);
+  for (const item of result.leftovers) console.log(`${item.due ? 'due' : 'in grace'} ${leftovers.describe(item)}`);
+  if (!result.leftovers.length) console.log('no leftover processes');
+};
+
 commands.codex = async (argv) => {
   try {
     const result = await require('./codex-companion-account.js').run(argv, { root: ROOT, env: process.env });
@@ -3523,6 +3547,7 @@ ${stepUsage()}
                          # --reset <signature> clears one signature's cooldown and resolution
   keep stalled [--json]
   keep codex-jobs [--json] [--reap] [--dry]
+  keep leftovers [--json] [--reap] [--dry]
     List companion jobs and brokers; --reap cleans stale jobs, pollers, and brokers.
   keep codex [--account <codex-id>] context [--json]
   keep codex [--account <codex-id>] <task|task-resume-candidate|status|result|cancel> [args]

@@ -301,6 +301,40 @@ function startSchedulers(ctx) {
   // Retries the transfers a rate-limited session's move was refused for, and
   // nothing else: no launch, no input, no check skipped. See bin/handoff-queue.js.
   startHandoffQueue();
+  // Dev servers, watchers and test runners a session started in the background and
+  // left behind when its pane went away. See bin/leftover-processes.js.
+  if (process.env.KEEP_LEFTOVER_SWEEP === '0') {
+    health.record('leftovers', { disabled: true, detail: 'KEEP_LEFTOVER_SWEEP=0' });
+  } else {
+    const leftovers = require('../leftover-processes');
+    let exclude = null;
+    try { if (process.env.KEEP_LEFTOVER_EXCLUDE) exclude = new RegExp(process.env.KEEP_LEFTOVER_EXCLUDE); }
+    catch (error) { process.stderr.write(`keep serve: KEEP_LEFTOVER_EXCLUDE ignored: ${error.message}\n`); }
+    const seen = new Map();
+    let running = false;
+    const tick = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const result = await leftovers.reap({ deps: {
+          seen, exclude, keepRoot: keep.ROOT,
+          graceMs: envNumber('KEEP_LEFTOVER_GRACE_MIN', 15) * 60e3,
+          panes: () => listHostPanes({}, true),
+        } });
+        for (const item of result.stopped) process.stderr.write(`keep serve: stopped leftover ${leftovers.describe(item)}\n`);
+        const failed = result.skipped.find((item) => item.pid == null);
+        const mb = Math.round(result.stopped.reduce((sum, item) => sum + item.rssKb, 0) / 1024);
+        health.record('leftovers', failed
+          ? { ok: false, error: failed.why }
+          : { ok: true, detail: `${result.stopped.length} stopped${mb ? ` (${mb} MB)` : ''}, ${result.waiting.length} in grace` });
+      } catch (error) {
+        health.record('leftovers', { ok: false, error });
+        process.stderr.write(`keep serve: leftover sweep failed: ${error.message}\n`);
+      } finally { running = false; }
+    };
+    setInterval(() => { void tick(); }, 5 * 60e3).unref();
+    setTimeout(() => { void tick(); }, 60e3).unref();
+  }
   const restarts = require('../session-restart').createManager({
     file: path.join(keep.ROOT, '.keep', 'session-restarts.json'),
     inspect: async (body) => {
