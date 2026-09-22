@@ -936,3 +936,80 @@ test('keep setup names its subcommands and refuses an unknown one', () => {
     assert.match(bad.stderr, /keep setup skills/);
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });
+
+// --- keep node init ---------------------------------------------------------
+
+function nodeHome() {
+  // Real paths: keep node init canonicalizes what it is given, and on macOS the
+  // temporary directory is reached through a symlink.
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-node-init-')));
+  const tokenFile = path.join(home, 'node.token');
+  fs.writeFileSync(tokenFile, `${'b'.repeat(64)}\n`, { mode: 0o600 });
+  fs.chmodSync(tokenFile, 0o600);
+  return { home, tokenFile };
+}
+
+function capture(body) {
+  const lines = [];
+  const original = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  try { body(); } finally { console.log = original; }
+  return lines.join('\n');
+}
+
+test('keep node init writes a host-only service with the node identity and no registry', (t) => {
+  const { home, tokenFile } = nodeHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const sock = path.join(home, 'host.sock');
+  const args = ['init', 'aws1', '--daemon-node', 'main', '--listen', '100.64.0.2:7777',
+    '--token-file', tokenFile, '--sock', sock];
+  const platform = process.platform;
+  try {
+    Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+    const output = capture(() => setup.node(args, '/tmp/unused-registry', home));
+    const file = path.join(home, 'Library', 'LaunchAgents', 'games.castle.keep.host.plist');
+    const plist = fs.readFileSync(file, 'utf8');
+    assert.match(plist, /<key>Label<\/key><string>games\.castle\.keep\.host<\/string>/);
+    assert.match(plist, /<string>host<\/string>/);
+    for (const [key, value] of [
+      ['KEEP_HOST_SOCK', sock], ['KEEP_NODE_NAME', 'aws1'], ['KEEP_DAEMON_NODE', 'main'],
+      ['KEEP_HOST_LISTEN', '100.64.0.2:7777'], ['KEEP_NODE_TOKEN_FILE', tokenFile],
+    ]) {
+      assert.ok(plist.includes(`<key>${key}</key><string>${value}</string>`), `${key} in the plist`);
+    }
+    assert.ok(plist.includes('<key>KEEP_NODE</key>'), 'the interpreter is pinned');
+    assert.equal(/KEEP_DIR|KEEP_CONFIG/.test(plist), false, 'a node holds no registry of its own');
+    assert.match(output, /launchctl bootstrap gui\/\d+/);
+    assert.throws(() => setup.node(args, '/tmp/unused-registry', home), /manual migration/);
+    fs.rmSync(file);
+
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+    const linux = capture(() => setup.node(args, '/tmp/unused-registry', home));
+    const unit = fs.readFileSync(path.join(home, '.config', 'systemd', 'user', 'keep-host.service'), 'utf8');
+    assert.match(unit, /^ExecStart=.*\/bin\/keep host$/m);
+    assert.match(unit, /^Environment=KEEP_NODE_NAME=aws1$/m);
+    assert.match(unit, /^Environment=KEEP_HOST_LISTEN=100\.64\.0\.2:7777$/m);
+    assert.match(unit, /^Environment=KEEP_NODE_TOKEN_FILE=/m);
+    assert.match(unit, /^Restart=always$/m);
+    assert.match(unit, /^WantedBy=default\.target$/m);
+    assert.equal(/KEEP_DIR|KEEP_CONFIG/.test(unit), false);
+    assert.match(linux, /systemctl --user enable --now keep-host/);
+  } finally {
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+  }
+});
+
+test('keep node init refuses a token file that is missing, loose, or unnamed', (t) => {
+  const { home, tokenFile } = nodeHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const base = ['init', 'aws1', '--daemon-node', 'main', '--listen', '100.64.0.2:7777'];
+  assert.throws(() => setup.node([...base, '--token-file', path.join(home, 'absent')], '/tmp/r', home), /ENOENT/);
+  const loose = path.join(home, 'loose.token');
+  fs.writeFileSync(loose, 'secret\n', { mode: 0o644 });
+  fs.chmodSync(loose, 0o644);
+  assert.throws(() => setup.node([...base, '--token-file', loose], '/tmp/r', home), /must be mode 0600/);
+  assert.throws(() => setup.node(['init', 'aws1', '--daemon-node', 'main', '--token-file', tokenFile], '/tmp/r', home), /usage: keep node init/);
+  assert.throws(() => setup.node([...base, '--token-file', tokenFile, '--listen', 'nonsense'], '/tmp/r', home), /<ip>:<port>/);
+  assert.throws(() => setup.node(['init', 'AWS1', '--daemon-node', 'main', '--listen', '1.2.3.4:7', '--token-file', tokenFile], '/tmp/r', home), /lowercase letters and digits/);
+  assert.throws(() => setup.node(['init', 'aws1', '--daemon-node', 'aws1', '--listen', '1.2.3.4:7', '--token-file', tokenFile], '/tmp/r', home), /cannot be its own daemon node/);
+});

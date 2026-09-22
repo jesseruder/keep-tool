@@ -592,17 +592,95 @@ function shell(args, home = os.homedir()) {
   console.log(`Wrote the keep shell block to ${file}. Open a new shell, or run: source ${file}`);
 }
 
-function servicePlist(kind, root, envPath = process.env.PATH || '') {
+function servicePlist(kind, root, envPath = process.env.PATH || '', overrides = {}) {
   const label = `games.castle.keep.${kind}`;
-  const env = { PATH: envPath, KEEP_NODE: process.execPath, KEEP_DIR: root, KEEP_CONFIG: config.configFile(), LANG: process.env.LANG || 'en_US.UTF-8' };
+  // A node agent's host answers for another machine's registry and has none of its
+  // own, so it is given its identity and its socket instead of KEEP_DIR/KEEP_CONFIG.
+  const env = overrides.env || { PATH: envPath, KEEP_NODE: process.execPath, KEEP_DIR: root, KEEP_CONFIG: config.configFile(), LANG: process.env.LANG || 'en_US.UTF-8' };
+  const log = overrides.log || path.join(root, '.keep', `${kind}.log`);
   return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>
 <key>Label</key><string>${label}</string>
 <key>ProgramArguments</key><array><string>${xml(path.join(SOURCE, 'bin', 'keep'))}</string><string>${kind}</string></array>
 <key>EnvironmentVariables</key><dict>${Object.entries(env).map(([k, v]) => `<key>${k}</key><string>${xml(v)}</string>`).join('')}</dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-<key>StandardOutPath</key><string>${xml(path.join(root, '.keep', `${kind}.log`))}</string>
-<key>StandardErrorPath</key><string>${xml(path.join(root, '.keep', `${kind}.log`))}</string>
+<key>StandardOutPath</key><string>${xml(log)}</string>
+<key>StandardErrorPath</key><string>${xml(log)}</string>
 </dict></plist>\n`;
+}
+
+function hostUnit(env) {
+  return [
+    '[Unit]',
+    'Description=Keep terminal host',
+    'After=network.target',
+    '',
+    '[Service]',
+    `ExecStart=${path.join(SOURCE, 'bin', 'keep')} host`,
+    ...Object.entries(env).map(([key, value]) => `Environment=${key}=${value}`),
+    'Restart=always',
+    'RestartSec=2',
+    '',
+    '[Install]',
+    'WantedBy=default.target',
+    '',
+  ].join('\n');
+}
+
+const NODE_USAGE = 'usage: keep node init <name> --daemon-node <name> --listen <ip:port> --token-file <path> [--sock <path>]';
+
+// `keep node init` runs on the node, not on the daemon: it installs the host on its
+// own, with no daemon and no registry, listening for the daemon that minted its
+// token. `keep nodes add` on the daemon prints the exact line to run here.
+function node(args, root, home = os.homedir()) {
+  const [action, name, ...rest] = args;
+  if (action !== 'init' || !name || name.startsWith('--')) throw new Error(NODE_USAGE);
+  const opts = options(rest, ['--daemon-node', '--listen', '--token-file', '--sock']);
+  if (!config.NODE_NAME_RE.test(name)) throw new Error(`a node name is lowercase letters and digits: ${name}`);
+  const daemonNode = opts['daemon-node'];
+  if (!daemonNode || !config.NODE_NAME_RE.test(daemonNode)) throw new Error(NODE_USAGE);
+  if (daemonNode === name) throw new Error(`${name} cannot be its own daemon node; --daemon-node names the machine running keep serve`);
+  if (!opts.listen) throw new Error(NODE_USAGE);
+  require('./host.js').parseListenAddress(opts.listen);
+  if (!opts['token-file']) throw new Error(NODE_USAGE);
+  const tokenFile = canonicalPath(opts['token-file'].replace(/^~(?=\/|$)/, home));
+  // The same check the host makes at boot, made now so the failure is a sentence
+  // here rather than a service that starts and quietly refuses every connection.
+  require('./host.js').readNodeToken(tokenFile);
+  const sock = canonicalPath((opts.sock || path.join(home, 'keep', '.keep', 'host.sock')).replace(/^~(?=\/|$)/, home));
+  if (Buffer.byteLength(sock) > 103) throw new Error(`socket path too long (${Buffer.byteLength(sock)} bytes, max 103): ${sock}`);
+  fs.mkdirSync(path.dirname(sock), { recursive: true });
+  const env = {
+    PATH: process.env.PATH || '',
+    KEEP_NODE: process.execPath,
+    KEEP_HOST_SOCK: sock,
+    KEEP_NODE_NAME: name,
+    KEEP_DAEMON_NODE: daemonNode,
+    KEEP_HOST_LISTEN: opts.listen,
+    KEEP_NODE_TOKEN_FILE: tokenFile,
+    LANG: process.env.LANG || 'en_US.UTF-8',
+  };
+  const log = path.join(path.dirname(sock), 'host.log');
+  if (process.platform === 'darwin') {
+    const file = path.join(home, 'Library', 'LaunchAgents', 'games.castle.keep.host.plist');
+    if (fs.existsSync(file)) throw new Error(`existing service needs a manual migration: ${file}`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, servicePlist('host', root, env.PATH, { env, log }), { flag: 'wx' });
+    console.log(`Wrote ${file}. Start the host with:`);
+    console.log('');
+    console.log(`  launchctl bootstrap gui/${process.getuid()} ${file}`);
+  } else if (process.platform === 'linux') {
+    const file = path.join(home, '.config', 'systemd', 'user', 'keep-host.service');
+    if (fs.existsSync(file)) throw new Error(`existing service needs a manual migration: ${file}`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, hostUnit(env), { flag: 'wx' });
+    console.log(`Wrote ${file}. Start the host with:`);
+    console.log('');
+    console.log('  systemctl --user enable --now keep-host');
+  } else {
+    throw new Error(`keep node init supports macOS and Linux; run keep host on ${process.platform} yourself with KEEP_HOST_LISTEN and KEEP_NODE_TOKEN_FILE set`);
+  }
+  console.log('');
+  console.log(`Node ${name} listens on ${opts.listen} for the daemon on ${daemonNode}; its local socket is ${sock}.`);
 }
 
 function service(args, root) {
@@ -739,7 +817,7 @@ function doctor(root) {
 }
 
 module.exports = {
-  init, installHooks, installSkills, service, doctor, accountSetupReport, mergeHooks, servicePlist, quote, canonicalPath, insideSource,
+  init, installHooks, installSkills, service, node, doctor, accountSetupReport, mergeHooks, servicePlist, hostUnit, quote, canonicalPath, insideSource,
   HOOK_ACTIONS, missingHooks, hookTargets, hookTarget,
   loadPacks, configuredPacks, installPackNames, skillPlans, applySkillPlans, reportSkillPlans, listPacks,
   recordPacks, recordPreflight,

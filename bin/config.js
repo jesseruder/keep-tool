@@ -41,6 +41,27 @@ function nodeConfig(value = {}) {
   return { nodes: { ...value.nodes }, daemonNode: daemon };
 }
 
+// Rewrites config.json in place, atomically, keeping every key it does not touch
+// and the file's own mode. `mutate` is handed the parsed configuration and returns
+// the one to write; a result that would not load again is refused before the write,
+// so a bad edit cannot leave an install unable to start.
+function update(mutate, env = process.env) {
+  const file = configFile(env);
+  const current = fs.existsSync(file) ? load(env) : { version: 1 };
+  const next = mutate(current);
+  if (!next || typeof next !== 'object' || Array.isArray(next) || next.version !== 1) {
+    throw new Error('a Keep configuration must stay a version 1 object');
+  }
+  nodeConfig(next);
+  let mode = 0o600;
+  try { mode = fs.statSync(file).mode & 0o777; } catch {}
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, `${JSON.stringify(next, null, 2)}\n`, { mode });
+  fs.renameSync(temp, file);
+  return next;
+}
+
 function nodeNames(value = {}) { return Object.keys(nodeConfig(value).nodes); }
 function daemonNode(value = {}) { return nodeConfig(value).daemonNode; }
 
@@ -78,4 +99,4 @@ function apply(env = process.env) {
   return value;
 }
 
-module.exports = { configFile, load, apply, nodeConfig, nodeNames, daemonNode, NODE_NAME_RE };
+module.exports = { configFile, load, update, apply, nodeConfig, nodeNames, daemonNode, NODE_NAME_RE };

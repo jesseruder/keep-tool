@@ -38,6 +38,7 @@ const sessionNames = require('./session-names.js');
 const sessionMarks = require('./session-marks.js');
 const hookGroup = require('./commands/hook.js');
 const hostGroup = require('./commands/host.js');
+const nodesGroup = require('./commands/nodes.js');
 const reviewGroup = require('./commands/review.js');
 const stepGroup = require('./commands/step.js');
 const turnsGroup = require('./commands/turns.js');
@@ -3389,6 +3390,12 @@ function helpText() {
                            # print (or write to ~/.zshrc) a zsh claude() that routes
                            # --resume/-r/--continue/-c through keep open; KEEP_RAW_CLAUDE=1 bypasses
   keep service install|start|stop|restart|status
+  keep nodes                # the machines this install runs terminals on, with a live check
+  keep nodes add <name> --address <ip:port> [--capabilities a,b]
+                           # mint the node's token and print the keep node init line to run there
+  keep nodes rm <name>
+  keep node init <name> --daemon-node <name> --listen <ip:port> --token-file <path> [--sock <path>]
+                           # on the node itself: install the host-only service
   keep add "title" [--kind task|experiment|idea|chore|bug] [--file|--claim] [--tag t]… [--project p]
                    [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when]
                    [--autonomous] [--experiment-id id] [--check-after when]
@@ -3677,7 +3684,7 @@ commands.help = (argv) => {
 };
 
 // Each command group lives in its own file; their tables merge into this one.
-Object.assign(commands, hookGroup.commands, hostGroup.commands, reviewGroup.commands, stepGroup.commands, turnsGroup.commands, watcherGroup.commands);
+Object.assign(commands, hookGroup.commands, hostGroup.commands, nodesGroup.commands, reviewGroup.commands, stepGroup.commands, turnsGroup.commands, watcherGroup.commands);
 
 // ---------- main / module ----------
 
@@ -3726,6 +3733,7 @@ commands.setup = (args) => {
   return require('./setup').installHooks(args.slice(1));
 };
 commands.service = (args) => require('./setup').service(args, ROOT);
+commands.node = (args) => require('./setup').node(args, ROOT);
 
 if (require.main === module) {
   (async () => {
@@ -3733,7 +3741,9 @@ if (require.main === module) {
       const [cmd, ...rest] = process.argv.slice(2);
       // `host` is exempt with them: the terminal host is a machine's process, not a
       // registry's, and it must start where there are no cards to read.
-      if (!fs.existsSync(TASKS) && !['help', 'hook', 'init', 'doctor', 'setup', 'review-eval', 'host'].includes(cmd)) die(`no repo at ${ROOT} (set KEEP_DIR?)`);
+      // `node` joins them: `keep node init` runs on a machine that is being set up to
+      // hold terminals for another one's registry, and has none of its own.
+      if (!fs.existsSync(TASKS) && !['help', 'hook', 'init', 'doctor', 'setup', 'review-eval', 'host', 'node'].includes(cmd)) die(`no repo at ${ROOT} (set KEEP_DIR?)`);
       const fn = commands[cmd || 'list'];
       if (!fn) die(`unknown command "${cmd}" — try \`keep help\``);
       const helpArgs = [];
