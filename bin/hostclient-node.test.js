@@ -81,3 +81,41 @@ test('an unnamed connect still reaches the daemon node socket unchanged', async 
     } finally { client.close(); }
   });
 });
+
+test('a node prepares a launch on its own machine, and says so when it cannot', async (t) => {
+  await withTwoNodes(t, async ({ root }) => {
+    const path = require('node:path');
+    const project = path.join(root, 'project');
+    const configDir = path.join(root, 'claude-config');
+    fs.mkdirSync(project, { recursive: true });
+    fs.mkdirSync(configDir, { recursive: true });
+    const account = { id: 'claude/default', agent: 'claude', configDir, builtIn: false, managed: false };
+    const remote = await connect({ node: 'aws1' });
+    try {
+      const prepared = await remote.request('prepare-launch', {
+        agent: 'claude',
+        account,
+        cwd: project,
+        bypass: true,
+        argv: ['claude', '--dangerously-skip-permissions', { insert: 'mcpConfig' }, '--session-id', 'abc'],
+        pi: null,
+      });
+      assert.deepEqual(prepared.argv, ['claude', '--dangerously-skip-permissions', '--session-id', 'abc']);
+      assert.equal(prepared.mcpConfig, '');
+      // Prepared where the agent will run: the trust record is that machine's file.
+      assert.equal(prepared.trusted, true);
+      const state = JSON.parse(fs.readFileSync(path.join(configDir, '.claude.json'), 'utf8'));
+      assert.equal(state.projects[fs.realpathSync(project)].hasTrustDialogAccepted, true);
+      assert.equal(prepared.command,
+        require('./agent-launcher.js').profileCommand(prepared.argv, account));
+
+      // A refusal is an answer the caller can report, not a dropped connection.
+      const refused = await remote.request('prepare-launch', {
+        agent: 'claude', account: { id: 'x' }, cwd: project, bypass: false, argv: ['claude'], pi: null,
+      }).then(() => null, (error) => error);
+      assert.match(refused.message, /needs an account profile/);
+      // The connection is still good.
+      assert.equal((await remote.request('hello')).node, 'aws1');
+    } finally { remote.close(); }
+  });
+});

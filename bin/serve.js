@@ -8624,12 +8624,6 @@ async function openSession(body, deps = {}) {
         ...(!sessionId && allowPendingRegistration ? { pendingRegistration: true } : {}) };
     }
   }
-  let accountMcpConfig = '';
-  if (agent === 'claude' && require('./account-setup').readSetup(account)) {
-    try { accountMcpConfig = require('./account-setup').ensureSharedMemory(account, project).mcpConfig; }
-    catch (error) { throw new InjectionError(409, `account shared setup is unavailable: ${error.message}`); }
-  }
-
   // Launched Claude sessions match Owner's permission-mode class so peer
   // messages are delivered instead of being held for mode parity.
   const claudeFlags = deps.claudeFlags != null ? deps.claudeFlags
@@ -8657,34 +8651,48 @@ async function openSession(body, deps = {}) {
     // group is recognisable in the browser.
     const browserName = browserBridgeSessionName(openedSessionNumber(sessionId, deps).num, body.taskId);
     const commandModel = launchModel || inheritedModel;
-    let piOpeningFile = null;
-    if (agent === 'pi' && message) {
-      const dir = path.join(deps.root || keep.ROOT, '.keep', 'pi-opening');
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      piOpeningFile = path.join(dir, `${sessionId}-${crypto.randomUUID()}.txt`);
-      fs.writeFileSync(piOpeningFile, message, { flag: 'wx', mode: 0o600 });
-    }
-    const argv = agent === 'pi'
+    // The argument vector, with the two paths only the machine the agent runs on can
+    // produce left as placeholders: the shared Claude setup's --mcp-config and Pi's
+    // opening file. Everything else — flag order included — is decided here.
+    const argvTemplate = agent === 'pi'
       ? ['pi', ...(commandModel ? ['--model', commandModel] : []),
         session ? '--session' : '--session-id', sessionId,
-        ...(piOpeningFile ? ['--', `@${piOpeningFile}`] : [])]
+        ...(message ? [{ insert: 'piOpening' }] : [])]
       : agent === 'codex'
       ? ['codex', ...codexFlagArgs, ...(commandModel ? ['-m', commandModel] : []), ...(sessionId ? ['resume', sessionId] : [])]
-      : ['claude', ...claudeFlagArgs, ...(accountMcpConfig ? ['--mcp-config', accountMcpConfig] : []), ...(commandModel ? ['--model', commandModel] : []),
+      : ['claude', ...claudeFlagArgs, { insert: 'mcpConfig' }, ...(commandModel ? ['--model', commandModel] : []),
         ...(sessionId ? [session ? '--resume' : '--session-id', sessionId] : [])];
-    const command = argv.join(' ');
-    // A launch that bypasses permission prompts has already crossed the boundary the
-    // trust dialog guards; launches with the normal approval flags keep the dialog.
-    if (agent === 'claude' && claudeFlagArgs.includes('--dangerously-skip-permissions')) {
-      try { (deps.trustProject || require('./account-setup').trustProject)(account, project); }
-      catch (error) {
-        const detail = String(error?.message || error).replace(/[\r\n]+/g, ' ');
-        process.stderr.write(`keep serve: could not pre-trust ${project} for ${account.id}: ${detail}\n`);
-      }
+    // The node-local half of the launch: the account's shared setup, the project's
+    // trust record, Pi's opening file and the shell word that carries this machine's
+    // own node binary. On the daemon node it runs in-process, exactly as it always
+    // did; it is a separate module so the machine the pane lands on can do it itself.
+    let prepared;
+    try {
+      prepared = (deps.prepareLaunch || require('./launch-prep.js').prepare)({
+        agent,
+        account: { id: account.id, agent: account.agent, configDir: account.configDir,
+          builtIn: account.builtIn === true, managed: account.managed === true },
+        cwd: project,
+        bypass: agent === 'claude' && claudeFlagArgs.includes('--dangerously-skip-permissions'),
+        argv: argvTemplate,
+        pi: agent === 'pi' && message
+          ? { sessionId, message, openingDir: path.join(deps.root || keep.ROOT, '.keep', 'pi-opening') }
+          : null,
+      }, deps.trustProject
+        ? { accountSetup: { ...require('./account-setup'), trustProject: deps.trustProject } }
+        : {});
+    } catch (error) {
+      if (error && error.code === 'shared-setup') throw new InjectionError(409, error.message);
+      throw error;
+    }
+    const piOpeningFile = prepared.piOpeningFile || null;
+    const command = prepared.argv.join(' ');
+    if (prepared.trustError) {
+      process.stderr.write(`keep serve: could not pre-trust ${project} for ${account.id}: ${prepared.trustError}\n`);
     }
     const spawned = await hostRequest('spawn', {
       cmd: '/bin/zsh',
-      args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`],
+      args: ['-lic', `exec ${prepared.command}`],
       // A resume of a recorded repair session re-earns the marker; a fresh launch
       // carries it in deps.launchEnv, which the scheduler passes — and an internal
       // launch that named the browser itself keeps its own name.

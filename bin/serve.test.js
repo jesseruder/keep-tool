@@ -8933,7 +8933,11 @@ test('Claude launches pre-trust only projects that bypass permission prompts', a
 
     await openSession({ fresh: true, cwd, agent: 'claude', accountId: 'claude-test',
       requestId: 'trust-claude-request' }, { ...deps, claudeFlags: '--dangerously-skip-permissions' });
-    assert.deepEqual(trusted, [[require('./accounts').get('claude-test', env), fs.realpathSync(cwd)]]);
+    // The account reaches the trust call as the profile a launch travels with —
+    // the same five fields on this node or any other, never the registry record.
+    const account = require('./accounts').get('claude-test', env);
+    assert.deepEqual(trusted, [[{ id: account.id, agent: account.agent, configDir: account.configDir,
+      builtIn: account.builtIn === true, managed: account.managed === true }, fs.realpathSync(cwd)]]);
 
     await openSession({ fresh: true, cwd, agent: 'codex', accountId: 'codex/default',
       requestId: 'trust-codex-request' }, deps);

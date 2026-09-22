@@ -1088,6 +1088,20 @@ function createHost(options = {}) {
         const pane = spawnPane(params);
         return { result: { pane: publicPane(pane) } };
       }
+      case 'prepare-launch': {
+        // The node-local half of a launch, run where the agent will run: this
+        // machine's account config directory, its trust record, its `node` binary
+        // and launcher path. The daemon node calls the same module in-process, so a
+        // single-node install never arrives here. Required lazily because a node
+        // agent may hold no Keep registry at all.
+        //
+        // A refusal travels as the protocol's own failure frame — { ok: false,
+        // error, code } — so the caller can tell "this machine cannot prepare that
+        // launch, and here is why" from "the host is gone", and hand the reason
+        // straight to whoever asked. The code rides along: `shared-setup` is the
+        // one the daemon turns back into its own 409.
+        return { result: require('./launch-prep.js').prepare(params) };
+      }
       case 'replace-exited': {
         const old = needPane(params.paneId);
         if (old.alive || old.pty.pid !== params.expectedPid || old.meta?.sessionId !== params.sessionId) {
