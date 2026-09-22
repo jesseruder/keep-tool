@@ -986,6 +986,10 @@ test('keep node init writes a host-only service with the node identity and no re
       assert.ok(plist.includes(`<key>${key}</key><string>${value}</string>`), `${key} in the plist`);
     }
     assert.ok(plist.includes('<key>KEEP_NODE</key>'), 'the interpreter is pinned');
+    // The daemon holds the whole fleet to one home and compares each node's answer
+    // against its own; that answer reads HOME. A service started without one would
+    // refuse every launch for a mismatch it never had.
+    assert.ok(plist.includes(`<key>HOME</key><string>${home}</string>`), 'the home is written out');
     assert.equal(/KEEP_DIR|KEEP_CONFIG/.test(plist), false, 'a node holds no registry of its own');
     assert.match(output, /launchctl bootstrap gui\/\d+/);
     assert.throws(() => setup.node(args, '/tmp/unused-registry', home), /manual migration/);
@@ -995,6 +999,8 @@ test('keep node init writes a host-only service with the node identity and no re
     const linux = capture(() => setup.node(args, '/tmp/unused-registry', home));
     const unit = fs.readFileSync(path.join(home, '.config', 'systemd', 'user', 'keep-host.service'), 'utf8');
     assert.match(unit, /^ExecStart="[^"]*\/bin\/keep" "host"$/m);
+    assert.equal(unit.includes(`Environment=HOME="${home}"
+`), true, 'the home is written out');
     assert.match(unit, /^Environment=KEEP_NODE_NAME="aws1"$/m);
     assert.match(unit, /^Environment=KEEP_HOST_LISTEN="100\.64\.0\.2:7777"$/m);
     assert.match(unit, /^Environment=KEEP_NODE_TOKEN_FILE="/m);

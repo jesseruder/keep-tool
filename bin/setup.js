@@ -669,6 +669,12 @@ function node(args, root, home = os.homedir()) {
   if (Buffer.byteLength(sock) > 103) throw new Error(`socket path too long (${Buffer.byteLength(sock)} bytes, max 103): ${sock}`);
   fs.mkdirSync(path.dirname(sock), { recursive: true });
   const env = {
+    // Written out rather than inherited. The daemon holds the whole fleet to one home
+    // directory and compares a node's answer against its own, and that answer is this
+    // process's `os.homedir()` — which reads HOME first. A service manager that starts
+    // the host without one, or with another user's, makes the node refuse every launch
+    // for a mismatch it never had.
+    HOME: home,
     PATH: process.env.PATH || '',
     KEEP_NODE: process.execPath,
     KEEP_HOST_SOCK: sock,
