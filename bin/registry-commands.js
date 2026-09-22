@@ -77,7 +77,6 @@ const BOOLEAN_FLAGS = Object.freeze({
   'review-route': ['json'],
   reviewing: ['json'],
   reviews: ['json'],
-  'land-facts': ['json', 'dry-run'],
   decisions: ['json', 'all', 'verbose'],
   resources: ['json'],
   notes: ['all', 'json'],

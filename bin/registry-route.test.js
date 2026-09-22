@@ -174,10 +174,22 @@ test('a flag is read as taking no value exactly where that command\'s parseArgs 
   for (const command of REGISTRY_COMMANDS) {
     const at = starts.findIndex((entry) => entry.name === command);
     assert.ok(at >= 0, `keep.js defines ${command}`);
-    const text = source.slice(starts[at].i, at + 1 < starts.length ? starts[at + 1].i : source.length).join('\n');
+    // To the next top-level definition of any kind: a helper after a command (the
+    // node's allowRemote and landRemote after land-facts) is not that command's spec.
+    let end = starts[at].i + 1;
+    while (end < source.length && !/^(?:commands(?:\.|\[)|(?:async )?function |const |let |module\.exports)/.test(source[end])) end += 1;
+    const text = source.slice(starts[at].i, end).join('\n');
     const bools = new Set();
-    for (const spec of text.matchAll(/parseArgs\([^,]+,\s*(\{[^}]*\})/g)) {
-      for (const flag of spec[1].matchAll(/'?([a-z-]+)'?\s*:\s*'bool'/g)) bools.add(flag[1]);
+    const specs = [...text.matchAll(/parseArgs\([^,]+,\s*(\{[^}]*\})/g)].map((match) => match[1]);
+    // A spec held in a named constant (commands.allow's ALLOW_SPEC, shared with the
+    // node's own `keep allow <card> land`) is read from its definition.
+    for (const named of text.matchAll(/parseArgs\([^,]+,\s*([A-Z][A-Z_]*)\s*\)/g)) {
+      const definition = source.join('\n').match(new RegExp(`^const ${named[1]} = (\\{[^}]*\\});`, 'm'));
+      assert.ok(definition, `keep.js defines ${named[1]}`);
+      specs.push(definition[1]);
+    }
+    for (const spec of specs) {
+      for (const flag of spec.matchAll(/'?([a-z-]+)'?\s*:\s*'bool'/g)) bools.add(flag[1]);
     }
     assert.deepEqual([...(BOOLEAN_FLAGS[command] || [])].sort(), [...bools].sort(), command);
   }
