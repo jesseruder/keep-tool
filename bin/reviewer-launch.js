@@ -42,7 +42,11 @@ async function launch(args, root, deps = {}) {
   const argv = ['claude', ...reviewerFlags(model), ...(shared.mcpConfig ? ['--mcp-config', shared.mcpConfig] : []),
     '--session-id', sessionId, ...args.slice(1)];
   const profileCommand = (deps.profileCommand || require('./agent-launcher').profileCommand)(argv, account);
-  const client = await (deps.connect || require('./hostclient').connect)();
+  // The daemon node only, said out loud: a reviewer runs where the registry it
+  // reviews lives. Phase 1 has no way to launch one anywhere else.
+  const client = await (deps.connect || require('./hostclient').connect)({
+    node: require('./nodes.js').daemonNode(),
+  });
   try {
     const { panes } = await client.request('list');
     if (panes.some((pane) => pane.alive && pane.meta?.reviewer)) throw new Error('a hosted reviewer is already running; use the console to open it');

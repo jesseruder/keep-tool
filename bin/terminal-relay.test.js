@@ -302,3 +302,55 @@ test('a worker that never acknowledges a transfer is still killed', async (t) =>
   assert.ok(logs.some((message) => message.includes('acknowledgment timed out')));
   assert.throws(() => process.kill(relayPid, 0));
 });
+
+// A real relay worker, two real hosts, and a pane that lives on the far one: the
+// qualifier is the only thing that says which machine the viewer is asking for.
+test('a qualified pane ref routes the relay and the console to the node that owns it', async (t) => {
+  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodes(t, async ({ sock, root, main }) => {
+    const remote = await connect({ node: 'aws1' });
+    const server = http.createServer();
+    const installed = keepConsole.install({
+      server,
+      root,
+      hostSock: sock,
+      token: 'secret',
+      isLocal: () => true,
+      hostClient: async () => { throw new Error('parent must not bridge terminal traffic'); },
+      hostRequest: async () => { throw new Error('unused fixture HTTP host request'); },
+      projectIcons: { lookup: async () => ({ icons: {} }) },
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    let ws;
+    try {
+      const { pane } = await remote.request('spawn', { cmd: '/bin/cat', args: [] });
+      const qualified = `aws1-${pane.id}`;
+      ws = new WebSocket(`ws://127.0.0.1:${port}/ws/pane/${qualified}?viewer=node-route`, {
+        origin: `http://127.0.0.1:${port}`,
+      });
+      const texts = [];
+      const binaries = [];
+      ws.on('message', (data, binary) => {
+        if (binary) binaries.push(Buffer.from(data));
+        else texts.push(JSON.parse(Buffer.from(data).toString('utf8')));
+      });
+      await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+      await waitFor(() => texts.some((message) => message.t === 'attached'), 'the remote pane to attach');
+      const attached = texts.find((message) => message.t === 'attached');
+      assert.equal(attached.pane.id, qualified, 'the viewer sees the id it asked for, not the host-local one');
+      assert.equal(main.panes.size, 0, 'nothing was opened on the daemon node');
+
+      ws.send(Buffer.from('across-the-wire\n'), { binary: true });
+      await waitFor(() => Buffer.concat(binaries).includes('across-the-wire'), 'the remote pane to echo');
+      const live = await remote.request('get', { pane: pane.id });
+      assert.equal(live.pane.inputCount > 0, true, 'the keystroke reached the remote host');
+    } finally {
+      if (ws) ws.close();
+      remote.close();
+      installed.close();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});

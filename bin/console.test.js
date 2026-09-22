@@ -29,9 +29,10 @@ async function fixture(options = {}) {
   const emitPane = (type, pane) => {
     for (const subscriber of [...subscribers]) subscriber.onEvent({ ev: 'pane', type, pane: { ...pane } });
   };
-  const makeHost = () => {
+  const makeHost = (node = null) => {
     const attached = new Map();
     const host = {
+      node,
       async request(type, params) {
         calls.push({ type, params, client: clients.indexOf(host) });
         if (failures[type] > 0) {
@@ -123,7 +124,7 @@ async function fixture(options = {}) {
     isLocal: options.isLocal || (() => true),
     killGraceMs: options.killGraceMs,
     projectIcons: options.projectIcons,
-    hostClient: async () => makeHost(),
+    hostClient: async (node) => makeHost(node),
     hostRequest: (type, params) => sharedHost.request(type, params),
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -766,4 +767,67 @@ test('a token-carrying page on a LAN address may open a pane socket from its own
   });
   const [error] = await once(foreign, 'error');
   assert.match(error.message, /403/);
+});
+
+// A configuration with a second node, so a pane ref that starts with its name is
+// read as a node rather than as part of a pane id.
+function withNodes(t, names) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-console-nodes-'));
+  const configFile = path.join(dir, 'config.json');
+  fs.writeFileSync(configFile, JSON.stringify({
+    version: 1,
+    daemonNode: 'main',
+    nodes: Object.fromEntries(names.map((name) => [name,
+      name === 'main' ? {} : { transport: 'tcp', address: '127.0.0.1:65000' }])),
+  }));
+  const previous = process.env.KEEP_CONFIG;
+  process.env.KEEP_CONFIG = configFile;
+  t.after(() => {
+    if (previous === undefined) delete process.env.KEEP_CONFIG;
+    else process.env.KEEP_CONFIG = previous;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+}
+
+test('a qualified pane ref reaches the bridge with its node intact', async (t) => {
+  withNodes(t, ['main', 'aws1']);
+  const f = await fixture({ panes: { 'p-9': {} } });
+  const ws = new WebSocket(`ws://127.0.0.1:${f.port}/ws/pane/aws1-p-9?viewer=node-route`, {
+    origin: `http://127.0.0.1:${f.port}`,
+  });
+  t.after(async () => {
+    if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
+    await f.close();
+  });
+  const messages = messageCollector(ws);
+  await once(ws, 'open');
+  const frames = await messages.until(
+    (collected) => collected.some((frame) => jsonMessage(frame)?.t === 'attached'),
+    'the attached frame',
+  );
+  const attached = frames.map(jsonMessage).find((message) => message?.t === 'attached');
+  assert.equal(attached.pane.id, 'aws1-p-9', 'the viewer gets back the id it asked for');
+  assert.deepEqual(f.calls.filter((call) => call.type === 'attach').map((call) => call.params.pane), ['p-9'],
+    'the host is asked for its own bare id');
+  assert.equal(f.clients[f.clients.length - 1].node, 'aws1', 'the client was opened on the named node');
+});
+
+test('an unqualified pane ref still names the daemon node', async (t) => {
+  withNodes(t, ['main', 'aws1']);
+  const f = await fixture({ panes: { 'p-1': {} } });
+  const ws = new WebSocket(`ws://127.0.0.1:${f.port}/ws/pane/p-1?viewer=local`, {
+    origin: `http://127.0.0.1:${f.port}`,
+  });
+  t.after(async () => {
+    if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
+    await f.close();
+  });
+  const messages = messageCollector(ws);
+  await once(ws, 'open');
+  const frames = await messages.until(
+    (collected) => collected.some((frame) => jsonMessage(frame)?.t === 'attached'),
+    'the attached frame',
+  );
+  assert.equal(frames.map(jsonMessage).find((message) => message?.t === 'attached').pane.id, 'p-1');
+  assert.equal(f.clients[f.clients.length - 1].node, 'main');
 });

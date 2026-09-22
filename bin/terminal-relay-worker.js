@@ -33,8 +33,18 @@ process.on('message', (message, socket) => {
   }
   if (message.type === 'init') {
     if (bridge) return;
+    // The node table arrives resolved, so the worker never reads the configuration
+    // and a pane ref is all it needs to know which machine to open.
+    const table = message.nodes && typeof message.nodes === 'object' ? message.nodes : {};
     bridge = createTerminalBridge({
-      hostClient: () => connect({ sock: message.hostSock, timeoutMs: message.hostConnectTimeoutMs }),
+      nodes: Object.keys(table),
+      hostClient: (node) => {
+        const resolved = table[node];
+        if (!resolved) return Promise.reject(new Error(`unknown Keep node: ${node}`));
+        return connect({
+          node, resolvedNode: resolved, sock: resolved.sock, timeoutMs: message.hostConnectTimeoutMs,
+        });
+      },
     });
     const ready = () => process.send?.({ type: 'ready' });
     if (message.readyDelayMs > 0) setTimeout(ready, message.readyDelayMs);

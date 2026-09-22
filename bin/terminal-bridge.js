@@ -1,6 +1,7 @@
 'use strict';
 
 const { WebSocketServer, WebSocket } = require('ws');
+const { parsePaneRef } = require('./nodes.js');
 
 const RECONNECT_WINDOW_MS = Number(process.env.KEEP_CONSOLE_RECONNECT_MS) || 60_000;
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
@@ -52,6 +53,13 @@ function createTerminalBridge(options = {}) {
     ? Math.max(0, Number(options.attendanceRetryMs)) : ATTENDANCE_RETRY_MS;
 
   const onConnection = async (ws, pane, viewer, attachPrimary, snapshotScrollback) => {
+    // The viewer asked for a pane by its fleet-wide name. The host that owns it knows
+    // it by the bare id alone, so the qualifier is stripped on the way in and put
+    // back on everything that goes out: the console holds one id for one pane.
+    const ref = parsePaneRef(String(pane), { nodes: options.nodes });
+    const hostPane = ref.paneId;
+    const qualify = (value) => (ref.qualified && value && typeof value === 'object' && value.id === hostPane
+      ? { ...value, id: pane } : value);
     let closed = false;
     let replayEnded = false;
     let replayTimer;
@@ -96,9 +104,9 @@ function createTerminalBridge(options = {}) {
       forwardNow(data, meta);
     };
     const forwardPane = (state, event) => {
-      if (closed || state.closed || event?.ev !== 'pane' || event.pane?.id !== pane
+      if (closed || state.closed || event?.ev !== 'pane' || event.pane?.id !== hostPane
           || !['resized', 'primary', 'title', 'meta', 'visibility'].includes(event.type)) return;
-      const message = { t: 'pane', pane: event.pane };
+      const message = { t: 'pane', pane: qualify(event.pane) };
       if (!state.attached) state.pending.push({ message });
       else sendText(message);
     };
@@ -134,7 +142,7 @@ function createTerminalBridge(options = {}) {
       while (!closed) {
         let state;
         try {
-          const client = await options.hostClient();
+          const client = await options.hostClient(ref.node);
           if (!client) throw new Error('terminal host is unavailable');
           state = {
             client, attachment: null, subscription: null, closed: false,
@@ -143,7 +151,7 @@ function createTerminalBridge(options = {}) {
           replayEnded = false;
           if (replayTimer) clearTimeout(replayTimer);
           state.attachment = await client.attach(
-            pane,
+            hostPane,
             {
               snapshot: true, replay: false, viewer, primary: attachPrimary,
               ...(snapshotScrollback == null ? {} : { snapshotScrollback }),
@@ -163,7 +171,7 @@ function createTerminalBridge(options = {}) {
           current = state;
           sendText({
             t: 'attached',
-            pane: state.attachment.pane,
+            pane: qualify(state.attachment.pane),
             ...(state.attachment.history ? { history: state.attachment.history } : {}),
           });
           state.attached = true;
@@ -211,11 +219,11 @@ function createTerminalBridge(options = {}) {
     const validSize = (message) => Number.isInteger(message.cols) && message.cols >= 2 && message.cols <= 500
       && Number.isInteger(message.rows) && message.rows >= 2 && message.rows <= 300;
     const resize = (message, force = false) => hostRequest('resize', {
-      pane, cols: message.cols, rows: message.rows, ...(force ? { force: true } : {}),
+      pane: hostPane, cols: message.cols, rows: message.rows, ...(force ? { force: true } : {}),
     }).then((result) => {
       sendText({
         t: 'resize', applied: result.applied !== false,
-        primary: result.primary ?? result.pane?.primary ?? null, pane: result.pane,
+        primary: result.primary ?? result.pane?.primary ?? null, pane: qualify(result.pane),
       });
       return result;
     });
@@ -231,13 +239,13 @@ function createTerminalBridge(options = {}) {
     const markAttended = async () => {
       let client = null;
       try {
-        client = await options.hostClient();
+        client = await options.hostClient(ref.node);
         if (!client) return false;
-        const current = await client.request('get', { pane }, { timeoutMs: ATTENDANCE_TIMEOUT_MS });
+        const current = await client.request('get', { pane: hostPane }, { timeoutMs: ATTENDANCE_TIMEOUT_MS });
         // Already attended, or never marked: there is nothing left to clear.
         if (current?.pane?.meta?.unattended !== true) return true;
         await client.request('meta', {
-          pane,
+          pane: hostPane,
           patch: { unattended: false, attendedAt: Date.now(), attendedBy: 'console' },
         }, { timeoutMs: ATTENDANCE_TIMEOUT_MS });
         return true;
@@ -265,7 +273,7 @@ function createTerminalBridge(options = {}) {
       if (closed) return;
       let operation;
       if (binary) {
-        operation = hostRequest('input', { pane, data: Buffer.from(data).toString('base64') });
+        operation = hostRequest('input', { pane: hostPane, data: Buffer.from(data).toString('base64') });
         noteAttended(data);
       } else {
         let message;
@@ -280,15 +288,15 @@ function createTerminalBridge(options = {}) {
           operation = resize(message, true);
         } else if (message.t === 'visibility') {
           if (typeof message.visible !== 'boolean') return;
-          operation = hostRequest('visibility', { pane, visible: message.visible });
+          operation = hostRequest('visibility', { pane: hostPane, visible: message.visible });
         } else if (message.t === 'clear') {
-          operation = hostRequest('clear', { pane });
+          operation = hostRequest('clear', { pane: hostPane });
         } else if (message.t === 'reply') {
           if (typeof message.data !== 'string' || message.data.length % 4 !== 0
               || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(message.data)) return;
           const reply = Buffer.from(message.data, 'base64');
           if (reply.length > MAX_REPLY_BYTES) return;
-          operation = hostRequest('input', { pane, data: message.data, auto: true });
+          operation = hostRequest('input', { pane: hostPane, data: message.data, auto: true });
         } else {
           fail(new Error('unknown WebSocket message'));
           return;

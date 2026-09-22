@@ -13,8 +13,9 @@ const key = (text) => Buffer.from(text, 'latin1');
 function fakeHost(meta = {}, onRequest = null) {
   const pane = { id: 'pane-1', meta: { ...meta } };
   const clients = [];
-  const hostClient = async () => {
+  const hostClient = async (node = null) => {
     const client = {
+      node,
       requests: [],
       closed: false,
       attached: false,
@@ -28,7 +29,7 @@ function fakeHost(meta = {}, onRequest = null) {
         if (type === 'meta') { Object.assign(pane.meta, params.patch); return { pane }; }
         return {};
       },
-      attach: async () => { client.attached = true; return { pane, detach: () => {} }; },
+      attach: async (paneId) => { client.attached = true; client.attachedPane = paneId; return { pane, detach: () => {} }; },
       subscribe: async () => ({ unsubscribe: () => {} }),
       close: () => { client.closed = true; },
     };
@@ -46,9 +47,10 @@ function fakeHost(meta = {}, onRequest = null) {
 }
 
 async function bridged(host, options = {}) {
-  const bridge = createTerminalBridge({ hostClient: host.hostClient, ...options });
+  const { pane = 'pane-1', ...bridgeOptions } = options;
+  const bridge = createTerminalBridge({ hostClient: host.hostClient, ...bridgeOptions });
   const server = http.createServer();
-  server.on('upgrade', (req, socket, head) => bridge.handleUpgrade(req, socket, head, { pane: 'pane-1' }));
+  server.on('upgrade', (req, socket, head) => bridge.handleUpgrade(req, socket, head, { pane }));
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const ws = new WebSocket(`ws://127.0.0.1:${server.address().port}/`);
   const closes = [];
@@ -245,4 +247,34 @@ test('a host that is down is retried once per window, not on every keystroke', a
     bridge.close();
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test('a qualified pane is stripped for its host and restored for the viewer', async () => {
+  const host = fakeHost({ unattended: true });
+  const ws = await bridged(host, { pane: 'aws1-pane-1', nodes: ['main', 'aws1'] });
+  try {
+    await ws.settle();
+    const relay = host.relay();
+    assert.equal(relay.node, 'aws1', 'the bridge opened a client on the node the ref named');
+    assert.equal(relay.attachedPane, 'pane-1', 'the host is asked for its own id');
+    await ws.send(Buffer.from('typed'));
+    await ws.settle();
+    const input = relay.requests.find((call) => call.type === 'input');
+    assert.equal(input.params.pane, 'pane-1');
+    // The attendance clear opens its own client, and it must land on the same node.
+    const attendance = host.attendance();
+    assert.equal(attendance.length, 1);
+    assert.equal(attendance[0].node, 'aws1');
+    assert.deepEqual(host.patches().map((call) => call.params.pane), ['pane-1']);
+  } finally { await ws.close(); }
+});
+
+test('a bare pane stays exactly as it was', async () => {
+  const host = fakeHost();
+  const ws = await bridged(host);
+  try {
+    await ws.settle();
+    assert.equal(host.relay().node, 'main', 'the daemon node is the unqualified answer');
+    assert.equal(host.relay().attachedPane, 'pane-1');
+  } finally { await ws.close(); }
 });

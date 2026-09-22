@@ -82,8 +82,13 @@ function createUiRequestServer(options = {}) {
   let closing = false;
   const clients = new Set();
 
+  // A pane ref carries the node it lives on, so the UI worker reaches another
+  // machine's host the same way it reaches this one's.
+  const daemonNode = require('./nodes.js').daemonNode();
   const bridge = options.bridge || createTerminalBridge({
-    hostClient: () => hostclient.connect({ sock: options.hostSock, timeoutMs: options.hostConnectTimeoutMs }),
+    hostClient: (node) => (node && node !== daemonNode
+      ? hostclient.connect({ node, timeoutMs: options.hostConnectTimeoutMs })
+      : hostclient.connect({ sock: options.hostSock, timeoutMs: options.hostConnectTimeoutMs })),
   });
 
   const authorized = (req) => keepConsole.authorized(req, { isLocal, token });

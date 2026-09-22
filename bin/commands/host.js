@@ -25,12 +25,79 @@ function registryRoot() {
 
 const commands = {};
 
-async function connectHost(deps = {}) {
+const nodesApi = require('../nodes.js');
+
+// The daemon node is reached by its socket, exactly as it always was; any other
+// node is named, and the registry says where it is.
+async function connectHost(deps = {}, node = null) {
+  const remote = node && node !== nodesApi.daemonNode();
   try {
-    return await (deps.connectHost || require('../hostclient.js').connect)({ sock: deps.sock });
+    return await (deps.connectHost || require('../hostclient.js').connect)(
+      remote ? { node } : { sock: deps.sock },
+    );
   } catch (error) {
-    die(`terminal host is not running: ${error.message}`);
+    die(`terminal host is not running${remote ? ` on node ${node}` : ''}: ${error.message}`);
   }
+}
+
+function configuredNodes() {
+  try { return nodesApi.configuredNodeNames(); } catch { return [nodesApi.daemonNode()]; }
+}
+
+// One client per node, opened when a command first needs it and closed together.
+function nodeClients(deps) {
+  const open = new Map();
+  return {
+    async get(node) {
+      const key = node || '';
+      if (!open.has(key)) open.set(key, await connectHost(deps, node));
+      return open.get(key);
+    },
+    set(node, client) { open.set(node || '', client); },
+    close() {
+      for (const client of open.values()) {
+        try { client.close(); } catch {}
+      }
+      open.clear();
+    },
+  };
+}
+
+// Panes from one node or from all of them. With a single node configured this is
+// the list the host answered, untouched: same ids, same fields, same order.
+async function collectPanes(clients, node = null) {
+  const names = configuredNodes();
+  if (names.length < 2) return (await (await clients.get(node)).request('list')).panes;
+  const wanted = node ? [node] : names;
+  const collected = [];
+  for (const name of wanted) {
+    let panes;
+    try { panes = (await (await clients.get(name)).request('list')).panes; }
+    catch (error) {
+      process.stderr.write(`keep: node ${name} is unreachable: ${error.message}\n`);
+      continue;
+    }
+    for (const pane of panes) {
+      collected.push({ ...pane, node: name, id: nodesApi.formatPaneRef(name, pane.id) });
+    }
+  }
+  return collected;
+}
+
+// `keep pane show aws1-1a2b` names a pane on another node: resolve it there, and
+// keep the qualified id for anything printed back.
+async function resolvePaneTarget(clients, value, node = null) {
+  const ref = nodesApi.parsePaneRef(String(value || ''));
+  const target = ref.qualified ? ref.node : node;
+  const client = await clients.get(target);
+  const pane = await resolveHostPane(client, ref.qualified ? ref.paneId : value);
+  return {
+    client,
+    pane,
+    node: target || nodesApi.daemonNode(),
+    id: pane.id,
+    ref: ref.qualified ? nodesApi.formatPaneRef(ref.node, pane.id) : pane.id,
+  };
 }
 
 async function resolveHostPane(client, value) {
@@ -65,10 +132,17 @@ function hostNumber(value, flag) {
   return number;
 }
 
+// The node column appears only once a pane carries a node, which is only once more
+// than one is configured: a single-node install prints the table it always did.
 function renderHostPanes(panes) {
-  const headings = ['id', 'alive/exit', 'pid', 'size', 'attached', 'title', 'session', 'cmd'];
+  const showNode = panes.some((pane) => pane.node);
+  const headings = [
+    'id', ...(showNode ? ['node'] : []),
+    'alive/exit', 'pid', 'size', 'attached', 'title', 'session', 'cmd',
+  ];
   const rows = panes.map((pane) => [
     String(pane.id),
+    ...(showNode ? [String(pane.node || '')] : []),
     pane.alive ? 'alive' : `exit ${pane.exitCode}${pane.signal == null ? '' : `/${pane.signal}`}`,
     String(pane.pid),
     `${pane.cols}×${pane.rows}`,
@@ -89,9 +163,14 @@ function knownSessionNumbers() {
 
 function renderPanePanes(panes, numbers = null) {
   const registry = numbers || knownSessionNumbers();
-  const headings = ['id', 'state', 'size', 'primary', 'title', 'agent/session', 'cwd'];
+  const showNode = panes.some((pane) => pane.node);
+  const headings = [
+    'id', ...(showNode ? ['node'] : []),
+    'state', 'size', 'primary', 'title', 'agent/session', 'cwd',
+  ];
   const rows = panes.map((pane) => [
     String(pane.id),
+    ...(showNode ? [String(pane.node || '')] : []),
     pane.alive ? 'alive' : `exit ${pane.exitCode}${pane.signal == null ? '' : `/${pane.signal}`}`,
     `${pane.cols}×${pane.rows}`,
     String(pane.primary || ''),
@@ -186,29 +265,31 @@ commands.host = async (argv, deps = {}) => {
     return;
   }
   const [subcommand, ...rest] = argv;
+  const clients = nodeClients(deps);
   let client = await connectHost(deps);
+  clients.set(null, client);
   try {
     if (subcommand === 'ls') {
-      if (rest.length) die('usage: keep host ls');
-      const { panes } = await client.request('list');
-      console.log(renderHostPanes(panes));
+      const o = parseArgs(rest, { node: 'str' });
+      if (o._.length) die('usage: keep host ls [--node name]');
+      console.log(renderHostPanes(await collectPanes(clients, o.node || null)));
     } else if (subcommand === 'spawn') {
       const { pane } = await client.request('spawn', parseHostSpawn(rest));
       console.log(pane.id);
     } else if (subcommand === 'screen') {
       const o = parseArgs(rest, { lines: 'str', scrollback: 'str' });
       if (o._.length !== 1) die('usage: keep host screen <pane> [--lines n] [--scrollback n]');
-      const pane = await resolveHostPane(client, o._[0]);
-      const params = { pane: pane.id };
+      const target = await resolvePaneTarget(clients, o._[0]);
+      const params = { pane: target.id };
       if (o.lines != null) params.lines = hostNumber(o.lines, '--lines');
       if (o.scrollback != null) params.scrollback = hostNumber(o.scrollback, '--scrollback');
-      const screen = await client.request('screen', params);
+      const screen = await target.client.request('screen', params);
       process.stdout.write(`${screen.text}\n`);
     } else if (['kill', 'clear', 'rm'].includes(subcommand)) {
       if (rest.length !== 1) die(`usage: keep host ${subcommand} <pane>`);
-      const pane = await resolveHostPane(client, rest[0]);
+      const target = await resolvePaneTarget(clients, rest[0]);
       const type = subcommand === 'rm' ? 'remove' : subcommand;
-      await client.request(type, { pane: pane.id });
+      await target.client.request(type, { pane: target.id });
     } else if (subcommand === 'status') {
       const o = parseArgs(rest, { json: 'bool' });
       if (o._.length) die('usage: keep host status [--json]');
@@ -279,6 +360,7 @@ commands.host = async (argv, deps = {}) => {
     die(error.message);
   } finally {
     if (client) client.close();
+    clients.close();
   }
 };
 
@@ -286,21 +368,32 @@ commands.pane = async (argv, deps = {}) => {
   const [subcommand, ...rest] = argv;
   if (!subcommand) die('usage: keep pane <ls|show|new|send|screen|resize|clear|kill|rm|attach> ...');
   if (subcommand === 'attach') return commands.attach(rest, deps);
-  const client = await connectHost(deps);
+  const clients = nodeClients(deps);
   try {
     if (subcommand === 'ls') {
-      const o = parseArgs(rest, { json: 'bool' });
-      if (o._.length) die('usage: keep pane ls [--json]');
-      const { panes } = await client.request('list');
+      const o = parseArgs(rest, { json: 'bool', node: 'str' });
+      if (o._.length) die('usage: keep pane ls [--json] [--node name]');
+      const panes = await collectPanes(clients, o.node || null);
       console.log(o.json ? JSON.stringify(panes) : renderPanePanes(panes));
     } else if (subcommand === 'show') {
       const o = parseArgs(rest, { json: 'bool' });
       if (o._.length !== 1) die('usage: keep pane show <pane> [--json]');
-      const pane = await resolveHostPane(client, o._[0]);
+      const target = await resolvePaneTarget(clients, o._[0]);
+      const pane = target.ref === target.id ? target.pane : { ...target.pane, id: target.ref, node: target.node };
       console.log(o.json ? JSON.stringify(pane) : renderPaneDetails(pane));
     } else if (subcommand === 'new') {
+      const separator = rest.indexOf('--');
+      const options = separator < 0 ? rest : rest.slice(0, separator);
+      const nodeFlag = options.indexOf('--node');
+      let node = null;
+      if (nodeFlag >= 0) {
+        node = options[nodeFlag + 1];
+        if (!node) die('--node needs a node name');
+        rest.splice(rest.indexOf('--node'), 2);
+      }
+      const client = await clients.get(node);
       const { pane } = await client.request('spawn', parseHostSpawn(rest, 'keep pane new'));
-      console.log(pane.id);
+      console.log(node ? nodesApi.formatPaneRef(node, pane.id) : pane.id);
     } else if (subcommand === 'send') {
       const separator = rest.indexOf('--');
       const optionArgs = separator < 0 ? rest : rest.slice(0, separator);
@@ -315,13 +408,14 @@ commands.pane = async (argv, deps = {}) => {
         }
         text = rest.slice(separator + 1).join(' ');
       }
-      const pane = await resolveHostPane(client, o._[0]);
+      const target = await resolvePaneTarget(clients, o._[0]);
+      const pane = target.pane;
       if (!o['no-enter'] && ['claude', 'codex'].includes(pane.meta?.agent)) {
         // Agent TUIs interpret a text+CR burst as paste (CR becomes a newline).
         // Use the daemon's draft/modal checks and separate type/submit sequence.
         if (!pane.meta.sessionId) die('agent pane has no session binding; cannot safely submit');
         if (text.length > 2000) die('agent messages are limited to 2000 characters; split the message explicitly');
-        const response = await (deps.postKeepApi || postKeepApi)('/api/send', { sessionId: pane.meta.sessionId, pane: pane.id, text });
+        const response = await (deps.postKeepApi || postKeepApi)('/api/send', { sessionId: pane.meta.sessionId, pane: target.ref, text });
         let result;
         try { result = JSON.parse(response.data); } catch {}
         if (response.status !== 200 || !result?.ok || result.truncated) {
@@ -330,34 +424,34 @@ commands.pane = async (argv, deps = {}) => {
         return;
       }
       const data = Buffer.from(`${text}${o['no-enter'] ? '' : '\r'}`, 'utf8');
-      await client.request('input', { pane: pane.id, data: data.toString('base64') });
+      await target.client.request('input', { pane: target.id, data: data.toString('base64') });
     } else if (subcommand === 'screen') {
       const o = parseArgs(rest, { lines: 'str', scrollback: 'str' });
       if (o._.length !== 1) die('usage: keep pane screen <pane> [--lines n] [--scrollback n]');
-      const pane = await resolveHostPane(client, o._[0]);
-      const params = { pane: pane.id };
+      const target = await resolvePaneTarget(clients, o._[0]);
+      const params = { pane: target.id };
       if (o.lines != null) params.lines = hostNumber(o.lines, '--lines');
       if (o.scrollback != null) params.scrollback = hostNumber(o.scrollback, '--scrollback');
-      const screen = await client.request('screen', params);
+      const screen = await target.client.request('screen', params);
       process.stdout.write(`${screen.text}\n`);
     } else if (subcommand === 'resize') {
       if (rest.length !== 2) die('usage: keep pane resize <pane> <cols>x<rows>');
-      const pane = await resolveHostPane(client, rest[0]);
+      const target = await resolvePaneTarget(clients, rest[0]);
       const match = rest[1].match(/^(\d+)[x×](\d+)$/);
       if (!match) die('size must be <cols>x<rows>');
-      await client.request('resize', {
-        pane: pane.id, cols: Number(match[1]), rows: Number(match[2]), force: true,
+      await target.client.request('resize', {
+        pane: target.id, cols: Number(match[1]), rows: Number(match[2]), force: true,
         viewer: `keep-pane-${process.pid}`,
       });
     } else if (subcommand === 'clear' || subcommand === 'rm') {
       if (rest.length !== 1) die(`usage: keep pane ${subcommand} <pane>`);
-      const pane = await resolveHostPane(client, rest[0]);
-      await client.request(subcommand === 'rm' ? 'remove' : 'clear', { pane: pane.id });
+      const target = await resolvePaneTarget(clients, rest[0]);
+      await target.client.request(subcommand === 'rm' ? 'remove' : 'clear', { pane: target.id });
     } else if (subcommand === 'kill') {
       const o = parseArgs(rest, { signal: 'str' });
       if (o._.length !== 1) die('usage: keep pane kill <pane> [--signal SIG]');
-      const pane = await resolveHostPane(client, o._[0]);
-      await client.request('kill', { pane: pane.id, ...(o.signal ? { signal: o.signal } : {}) });
+      const target = await resolvePaneTarget(clients, o._[0]);
+      await target.client.request('kill', { pane: target.id, ...(o.signal ? { signal: o.signal } : {}) });
     } else {
       die('usage: keep pane <ls|show|new|send|screen|resize|clear|kill|rm|attach> ...');
     }
@@ -365,7 +459,7 @@ commands.pane = async (argv, deps = {}) => {
     if (error instanceof KeepError) throw error;
     die(error.message);
   } finally {
-    client.close();
+    clients.close();
   }
 };
 
@@ -379,11 +473,17 @@ commands.attach = async (argv, deps = {}) => {
   if (!stdin.isTTY || typeof stdin.setRawMode !== 'function') {
     die('keep attach needs a TTY on stdin');
   }
-  const client = await connectHost(deps);
+  const clients = nodeClients(deps);
+  let client;
   let pane;
-  try { pane = await resolveHostPane(client, o._[0]); }
-  catch (error) {
-    client.close();
+  let paneRef;
+  try {
+    const target = await resolvePaneTarget(clients, o._[0]);
+    client = target.client;
+    pane = target.pane;
+    paneRef = target.ref;
+  } catch (error) {
+    clients.close();
     if (error instanceof KeepError) throw error;
     die(error.message);
   }
@@ -468,7 +568,7 @@ commands.attach = async (argv, deps = {}) => {
           return;
         }
         finish();
-        stdout.write(`\r\n[keep] pane ${pane.id} exited ${exitCode}\r\n`);
+        stdout.write(`\r\n[keep] pane ${paneRef} exited ${exitCode}\r\n`);
       },
     );
     if (!finished) resize();
@@ -493,7 +593,7 @@ commands.attach = async (argv, deps = {}) => {
     process.removeListener('SIGHUP', onSighup);
     try { stdin.setRawMode(wasRaw); } catch {}
     if (!wasRaw && typeof stdin.pause === 'function') stdin.pause();
-    client.close();
+    clients.close();
   }
 };
 

@@ -39,7 +39,9 @@ function readLedger(root) {
   } catch (e) { if (e.code === 'ENOENT') return { sessions: {} }; throw e; }
 }
 async function panes() {
-  const client = await require('./hostclient').connect();
+  // The daemon node only: this sweep reads the local process table alongside the
+  // pane list, and the two are only comparable on one machine.
+  const client = await require('./hostclient').connect({ node: require('./nodes.js').daemonNode() });
   try {
     const value = await client.request('list');
     if (!Array.isArray(value.panes)) throw Error('host pane state unavailable');

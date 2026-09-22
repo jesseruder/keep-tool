@@ -12095,7 +12095,11 @@ function start(deps = {}) {
   const backendToken = crypto.randomBytes(32).toString('hex');
   consoleServer = keepConsole.install({
     server,
-    hostClient: () => require('./hostclient.js').connect({ timeoutMs: HOST_CONNECT_TIMEOUT_MS }),
+    // A viewer names the node in the pane ref it asked for; the daemon node is
+    // still reached without naming it, exactly as before.
+    hostClient: (node) => require('./hostclient.js').connect(
+      node && node !== daemonNodeName() ? { node, timeoutMs: HOST_CONNECT_TIMEOUT_MS } : { timeoutMs: HOST_CONNECT_TIMEOUT_MS },
+    ),
     hostRequest,
     hostSock: require('./hostclient.js').socketPath(),
     hostConnectTimeoutMs: HOST_CONNECT_TIMEOUT_MS,

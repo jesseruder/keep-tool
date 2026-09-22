@@ -53,6 +53,21 @@ function createTerminalRelay(options = {}) {
   let startupTimer = null;
   let sending = false;
 
+  // `hostSock` remains the daemon node's socket when a caller names one explicitly:
+  // the console passes the socket it was installed with, and that stays the local
+  // endpoint whatever the configuration says.
+  const resolveNodes = () => {
+    if (options.nodes) return typeof options.nodes === 'function' ? options.nodes() : options.nodes;
+    const daemon = require('./nodes.js').daemonNode();
+    let map = {};
+    try {
+      map = Object.fromEntries(require('./node-registry.js').listNodes().map((node) => [node.name, node]));
+    } catch { map = {}; }
+    if (!map[daemon]) map[daemon] = { name: daemon, transport: 'unix', daemon: true, capabilities: [] };
+    if (options.hostSock) map[daemon] = { ...map[daemon], sock: options.hostSock };
+    return map;
+  };
+
   const totalQueued = () => pending.length + transfers.size;
   const closeEntry = (entry, status = 503, reason = 'Service Unavailable') => {
     clearScheduled(entry.timer);
@@ -179,7 +194,11 @@ function createTerminalRelay(options = {}) {
     startupTimer.unref?.();
     spawned.send({
       type: 'init',
-      hostSock: options.hostSock,
+      // The whole registry, resolved here and sent as plain data: the worker holds
+      // no configuration of its own, and a pane on any node is reachable from the
+      // relay that accepted its viewer. Resolved per worker start, so a node added
+      // since the daemon came up is in the next worker's table.
+      nodes: resolveNodes(),
       hostConnectTimeoutMs: options.hostConnectTimeoutMs,
       readyDelayMs: options.readyDelayMs || 0,
     }, (error) => {
