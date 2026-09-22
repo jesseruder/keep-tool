@@ -337,6 +337,31 @@ function scanCodexAccount(account, deps = {}) {
   return scanCodexUsage(recentDateDirs(path.join(account.configDir, 'sessions'), deps.date || new Date()), deps);
 }
 
+// One account's usage, read on the machine whose credentials they are: the keychain
+// entry, the .credentials.json and the Codex rollout directory are all that
+// machine's. A failure comes back as a value rather than a throw, carrying the code
+// createUsageManager branches on — 429 and its retry-after above all — because a
+// caller on another machine has to be able to tell "this account is rate limited"
+// from "that machine did not answer".
+async function readAccountUsage(account, deps = {}) {
+  if (!account || !['claude', 'codex'].includes(account.agent)
+      || typeof account.configDir !== 'string' || !account.configDir) {
+    throw new Error('usage needs a claude or codex account profile');
+  }
+  try {
+    return { usage: account.agent === 'codex'
+      ? scanCodexAccount(account, deps)
+      : await fetchClaudeUsage(account, deps) };
+  } catch (error) {
+    const code = error && error.code;
+    return { failure: {
+      code: code == null ? 'response' : typeof code === 'number' ? code : String(code),
+      ...(error && error.retryAfter != null ? { retryAfter: String(error.retryAfter) } : {}),
+      message: String(error && error.message || error),
+    } };
+  }
+}
+
 function createUsageManager(deps = {}) {
   const accountApi = deps.accounts || accounts;
   const healthApi = deps.health || health;
@@ -672,5 +697,6 @@ module.exports = {
   claudeCredentialService,
   claudeToken,
   fetchClaudeUsage,
+  readAccountUsage,
   createUsageManager,
 };

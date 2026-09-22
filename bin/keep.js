@@ -3398,6 +3398,8 @@ function helpText() {
   keep nodes add <name> --address <ip:port> [--capabilities a,b]
                            # mint the node's token and print the keep node init line to run there
   keep nodes rm <name>
+  keep nodes usage <node> <account>
+                           # that account's usage as the node itself reads it
   keep node init <name> --daemon-node <name> --listen <ip:port> --token-file <path> [--sock <path>]
                            # on the node itself: install the host-only service
   keep add "title" [--kind task|experiment|idea|chore|bug] [--file|--claim] [--tag t]… [--project p]

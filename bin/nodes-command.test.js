@@ -170,3 +170,52 @@ test('the node name cache follows a rewrite of the same configuration file', asy
   assert.deepEqual(nodes.configuredNodeNames(), ['main']);
   assert.deepEqual(registryDir.read().nodes, { main: {} });
 });
+
+
+test('keep nodes usage asks the node for an account it holds the credentials for', async (t) => {
+  await withTwoNodes(t, async ({ root }) => {
+    const configDir = path.join(root, 'codex-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    const account = { id: 'codex-node', label: 'Node codex', agent: 'codex', configDir, builtIn: false, managed: false };
+    const asked = [];
+    const deps = {
+      accounts: { get: (id) => (id === account.id ? account : null) },
+      connect: async (options) => {
+        const client = await require('./hostclient.js').connect(options);
+        return { ...client, request: (type, params, requestOptions) => {
+          asked.push({ node: options.node, type, params });
+          return client.request(type, params, requestOptions);
+        }, close: () => client.close() };
+      },
+    };
+    // The rollout directory is that machine's, and it is empty, so the node answers
+    // with an idle reading — read where the credentials are, not here.
+    const idle = await capture(() => commands.nodes(['usage', 'aws1', 'codex-node'], deps));
+    assert.deepEqual(asked.map((call) => [call.node, call.type]), [['aws1', 'usage']]);
+    assert.deepEqual(asked[0].params.account, {
+      id: 'codex-node', agent: 'codex', configDir, builtIn: false, managed: false,
+    }, 'the account travels as the profile a node can act on, never as the registry record');
+    assert.equal(idle, 'codex-node on aws1: nothing reported');
+
+    const json = JSON.parse(await capture(() => commands.nodes(['usage', 'aws1', 'codex-node', '--json'], deps)));
+    assert.deepEqual(json, { usage: { windows: [], planType: null, asOf: null, idle: true } });
+
+    await assert.rejects(commands.nodes(['usage', 'aws1'], deps), /keep nodes usage/);
+    await assert.rejects(commands.nodes(['usage', 'aws1', 'nobody'], deps), /no such account: nobody/);
+    await assert.rejects(commands.nodes(['usage', 'Bad', 'codex-node'], deps), /lowercase letters and digits/);
+    await assert.rejects(commands.nodes(['usage', 'nope', 'codex-node'], deps), /cannot reach node nope/);
+  });
+});
+
+test('a usage reading is rendered from the node answer, whatever shape it takes', () => {
+  const { renderUsage } = require('./commands/nodes.js');
+  const claude = { id: 'claude-node', agent: 'claude' };
+  assert.equal(renderUsage('aws1', claude, { usage: { limits: [
+    { label: '5h', percent: 42.4 }, { label: 'week', percent: 7 },
+  ] } }), 'claude-node on aws1: 5h 42%  week 7%');
+  assert.equal(renderUsage('aws1', claude, { usage: { limits: [] } }), 'claude-node on aws1: nothing reported');
+  assert.equal(renderUsage('aws1', { id: 'codex-node', agent: 'codex' }, { usage: { windows: [{ label: 'week', percent: 3 }] } }),
+    'codex-node on aws1: week 3%');
+  assert.equal(renderUsage('aws1', claude, { failure: { code: 429, retryAfter: '120', message: '429' } }),
+    'claude-node on aws1: unavailable (429, retry after 120): 429');
+});

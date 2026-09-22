@@ -13,7 +13,7 @@ const registry = require('../node-registry.js');
 
 const commands = {};
 
-const USAGE = 'usage: keep nodes [ls] | keep nodes add <name> --address <ip:port> [--capabilities a,b] | keep nodes rm <name>';
+const USAGE = 'usage: keep nodes [ls] | keep nodes add <name> --address <ip:port> [--capabilities a,b] | keep nodes rm <name> | keep nodes usage <node> <account>';
 
 function root() {
   return require('../keep-core.js').ROOT;
@@ -149,13 +149,56 @@ function removeNode(argv, deps) {
   console.log(`Removed node ${name} and its token. Restart the daemon to stop polling it: keep restart-daemon`);
 }
 
+// What an account's usage looks like on the machine that holds its credentials.
+// A failure is printed as a failure, with the code the daemon's own usage manager
+// would have branched on, rather than as "the node is down".
+function renderUsage(node, account, result) {
+  if (result.failure) {
+    const retry = result.failure.retryAfter ? `, retry after ${result.failure.retryAfter}` : '';
+    return `${account.id} on ${node}: unavailable (${result.failure.code}${retry}): ${result.failure.message}`;
+  }
+  const snapshot = result.usage || {};
+  const entries = account.agent === 'claude' ? snapshot.limits : snapshot.windows;
+  const parts = (Array.isArray(entries) ? entries : [])
+    .map((entry) => `${entry.label} ${Math.round(Number(entry.percent))}%`);
+  return `${account.id} on ${node}: ${parts.length ? parts.join('  ') : 'nothing reported'}`;
+}
+
+async function nodeUsage(argv, deps) {
+  const o = parseArgs(argv, { json: 'bool' });
+  if (o._.length !== 2) die('usage: keep nodes usage <node> <account>');
+  const [name, accountId] = o._;
+  if (!nodes.NODE_NAME_RE.test(name)) die(`a node name is lowercase letters and digits: ${name}`);
+  const account = (deps.accounts || require('../accounts.js')).get(accountId);
+  if (!account) die(`no such account: ${accountId}`);
+  if (!['claude', 'codex'].includes(account.agent)) die(`usage is only read for a claude or codex account: ${accountId}`);
+  const connect = deps.connect || require('../hostclient.js').connect;
+  let client;
+  try { client = await connect({ node: name, timeoutMs: deps.timeoutMs == null ? 3000 : deps.timeoutMs }); }
+  catch (error) { return die(`cannot reach node ${name}: ${error.message}`); }
+  try {
+    // The credentials read can go to the network on that machine, so it gets more
+    // than the ordinary request window.
+    const result = await client.request('usage', {
+      account: { id: account.id, agent: account.agent, configDir: account.configDir,
+        builtIn: account.builtIn === true, managed: account.managed === true },
+    }, { timeoutMs: deps.usageTimeoutMs == null ? 20000 : deps.usageTimeoutMs });
+    console.log(o.json ? JSON.stringify(result) : renderUsage(name, account, result));
+  } catch (error) {
+    die(`node ${name} could not read usage for ${accountId}: ${error.message}`);
+  } finally {
+    try { client.close(); } catch {}
+  }
+}
+
 commands.nodes = async (argv, deps = {}) => {
   const [subcommand, ...rest] = argv.length ? argv : ['ls'];
   if (subcommand === 'ls') return listNodes(rest, deps);
   if (subcommand === 'add') return addNode(rest, deps);
   if (subcommand === 'rm') return removeNode(rest, deps);
+  if (subcommand === 'usage') return nodeUsage(rest, deps);
   if (subcommand.startsWith('-')) return listNodes(argv, deps);
   return die(USAGE);
 };
 
-module.exports = { commands, renderNodes, USAGE };
+module.exports = { commands, renderNodes, renderUsage, USAGE };

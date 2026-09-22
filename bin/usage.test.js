@@ -23,6 +23,7 @@ const {
   claudeToken,
   fetchClaudeUsage,
 } = require('./usage.js');
+const usage = require('./usage.js');
 
 function settleRefresh() {
   return new Promise((resolve) => setTimeout(resolve, 20));
@@ -1009,5 +1010,61 @@ test('disk cache keeps Claude snapshots keyed by account', async () => {
     const reader = createUsageManager({ accounts: fixture });
     reader.setCacheFile(file);
     for (const account of fixture.list()) assert.equal(reader._view().accounts[account.id].limits[0].percent, account.id.length);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test('readAccountUsage reads a Claude account credentials on this machine, and codes its failures', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-usage-node-'));
+  try {
+    const account = { id: 'claude-node', agent: 'claude', configDir: dir, builtIn: false, managed: false };
+    fs.writeFileSync(path.join(dir, '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'token-from-this-machine' } }));
+    const seen = [];
+    const https = (body, statusCode = 200, headers = {}) => ({
+      get: (url, options, handler) => {
+        seen.push({ url, authorization: options.headers.Authorization });
+        const request = { setTimeout() {}, on() {}, destroy() {} };
+        queueMicrotask(() => handler({
+          statusCode, headers,
+          setEncoding() {},
+          on: (event, listener) => {
+            if (event === 'data') listener(body);
+            if (event === 'end') listener();
+          },
+        }));
+        return request;
+      },
+    });
+    const ok = await usage.readAccountUsage(account, {
+      platform: 'linux', https: https(JSON.stringify({ limits: [{ kind: 'session', percent: 42 }] })),
+      now: () => 1000,
+    });
+    assert.deepEqual(seen, [{ url: 'https://api.anthropic.com/api/oauth/usage', authorization: 'Bearer token-from-this-machine' }]);
+    assert.deepEqual(ok.usage.limits, [{ label: '5h', percent: 42, windowMs: 5 * 3600e3, severity: null, resetsAt: null }]);
+    assert.equal(ok.failure, undefined);
+
+    // A rate limit is the one failure a caller has to be able to act on, so its code
+    // and its retry-after survive being answered rather than thrown.
+    const limited = await usage.readAccountUsage(account, {
+      platform: 'linux', https: https('', 429, { 'retry-after': '120' }),
+    });
+    assert.equal(limited.usage, undefined);
+    assert.equal(limited.failure.code, 429);
+    assert.equal(limited.failure.retryAfter, '120');
+
+    fs.rmSync(path.join(dir, '.credentials.json'));
+    const missing = await usage.readAccountUsage(account, { platform: 'linux', https: https('') });
+    assert.equal(missing.failure.code, 'credentials');
+
+    // A Codex account is scanned from its own rollout directory on this machine;
+    // nothing there is an idle reading, not a failure.
+    const codex = await usage.readAccountUsage(
+      { id: 'codex-node', agent: 'codex', configDir: dir, builtIn: false, managed: false }, {});
+    assert.equal(codex.failure, undefined);
+    assert.deepEqual(codex.usage, { windows: [], planType: null, asOf: null, idle: true });
+
+    await assert.rejects(usage.readAccountUsage({ id: 'x', agent: 'pi', configDir: dir }),
+      /claude or codex account profile/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

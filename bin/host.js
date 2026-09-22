@@ -1175,6 +1175,13 @@ function createHost(options = {}) {
         const inspected = await require('./process-table.js').inspect(params);
         return { result: { ...inspected, bootId } };
       }
+      case 'usage': {
+        // Read where the credentials are. Nothing on the daemon side is rewired by
+        // this: accounts do not belong to a node yet, so the usage manager goes on
+        // reading every account locally, exactly as it always has. This verb is what
+        // a node can be *asked*, and what `keep nodes usage` asks it.
+        return { result: await require('./usage.js').readAccountUsage(params.account) };
+      }
       case 'signal': {
         // Judging a process on one machine and signalling it from another is no
         // judgement at all — the pid would be a number that happens to exist in
