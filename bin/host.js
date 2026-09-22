@@ -511,10 +511,12 @@ function unmapIpv4(address) {
 
 // The refusal the host makes at boot, in one place so `keep node init` refuses
 // the same addresses before it writes a service that would bind them.
-function assertBindable(address, source = address) {
+// `remedy` is what the refusal tells the reader to do: the host's own escape hatch
+// by default, and something else for a listener that has none (the node API).
+function assertBindable(address, source = address, remedy = 'set KEEP_HOST_LISTEN_ANY=1 to listen on every interface') {
   const mapped = unmapIpv4(address);
   if (wildcardAddress(mapped || address)) {
-    throw new Error(`refusing to bind ${address}${mapped ? ` (IPv4 ${mapped})` : ''}: set KEEP_HOST_LISTEN_ANY=1 to listen on every interface`);
+    throw new Error(`refusing to bind ${address}${mapped ? ` (IPv4 ${mapped})` : ''}: ${remedy}`);
   }
   return source;
 }

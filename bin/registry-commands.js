@@ -45,15 +45,42 @@ function isRegistryCommand(command) {
   return typeof command === 'string' && REGISTRY_COMMANDS.includes(command);
 }
 
-// Flags that take no value in any registry command. Every other `--flag` is read as
-// taking the next argument, so a flag this list does not know makes the walk below
-// stricter, never looser: its value is judged as an ordinary argument, and a `-m`
-// right after it is read as that value rather than as a message.
-const BOOLEAN_FLAGS = new Set([
-  'all', 'as-owner', 'autonomous', 'brief', 'claim', 'clear-check-after', 'disagree', 'dry', 'dry-run',
-  'fallback', 'file', 'force', 'json', 'met', 'needs-you', 'overdue', 'quiet', 'raw', 'show', 'unseen',
-  'verbose', 'whole',
-]);
+// The flags each registry command reads as taking no value, copied from its
+// parseArgs spec in keep.js ('bool' entries). Per command, because one name is a
+// boolean in one command and takes a value in another: `wait-on --remove` and
+// `allow --clear` take none, `plan --remove <n>`, `resources --remove <name>`,
+// `note --clear <id>` and `review-route --clear <model>` take one. Every other
+// `--flag` is read as taking the next argument, so a flag missing here makes the
+// walk below stricter, never looser: its value is judged as an ordinary argument,
+// and a `-m` right after it is read as that value rather than as a message.
+const BOOLEAN_FLAGS = Object.freeze({
+  add: ['autonomous', 'file', 'claim', 'force', 'as-owner'],
+  checkin: ['clear-check-after', 'force'],
+  done: ['force'],
+  'wait-on': ['remove', 'whole'],
+  list: ['overdue', 'brief', 'all'],
+  overdue: ['brief'],
+  who: ['json'],
+  needs: ['met'],
+  allow: ['clear', 'quiet', 'json', 'as-owner'],
+  reviewed: ['fallback', 'json'],
+  'review-route': ['json'],
+  reviewing: ['json'],
+  reviews: ['json'],
+  'land-facts': ['json', 'dry-run'],
+  decisions: ['json', 'all', 'verbose'],
+  resources: ['json'],
+  notes: ['all', 'json'],
+  health: ['json'],
+  stalled: ['json'],
+  standup: ['dry', 'show'],
+  landed: ['disagree', 'dry'],
+  resume: ['raw'],
+});
+
+function isBooleanFlag(command, name) {
+  return Object.prototype.hasOwnProperty.call(BOOLEAN_FLAGS, command) && BOOLEAN_FLAGS[command].includes(name);
+}
 
 // Walks argv the way keep-core.parseArgs does, so a value is judged by what the CLI
 // will read it as: after `--` everything is positional, a value-taking flag takes
@@ -101,9 +128,9 @@ function argumentRefusal(command, args, identity = {}) {
     }
     if (arg === '-m') { message = i + 1; continue; }
     if (newline(arg)) return NEWLINE;
-    if (flag && eq < 0 && !BOOLEAN_FLAGS.has(flag.slice(2))) value = i + 1;
+    if (flag && eq < 0 && !isBooleanFlag(command, flag.slice(2))) value = i + 1;
   }
   return null;
 }
 
-module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, BOOLEAN_FLAGS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

@@ -9,7 +9,7 @@ const { spawnSync } = require('node:child_process');
 
 const { routes, matchRoute, routeDenial } = require('./serve/routes.js');
 const { createRegistryService } = require('./registry-route.js');
-const { REGISTRY_COMMANDS, argumentRefusal } = require('./registry-commands.js');
+const { REGISTRY_COMMANDS, BOOLEAN_FLAGS, argumentRefusal } = require('./registry-commands.js');
 
 const AWS1 = { class: 'node', node: 'aws1' };
 const KEY = 'k-0123456789abcdef';
@@ -136,6 +136,35 @@ test('a node cannot write a check recipe the daemon would hand a session, but ca
   const scheduled = await svc.handle(AWS1, body(root, { command: 'checkin', args: ['card', '--check-after', '+2h'], idempotencyKey: `${KEY}-after` }));
   assert.equal(scheduled.status, 200, JSON.stringify(scheduled.body));
   assert.equal(calls.length, 1);
+});
+
+test('a flag is read as taking no value exactly where that command\'s parseArgs reads it so', () => {
+  assert.equal(argumentRefusal('wait-on', ['c', 'u', '--remove', '-m', 'a\nb']), null);
+  assert.equal(argumentRefusal('allow', ['c', '--clear', '-m', 'a\nb']), null);
+  assert.equal(argumentRefusal('landed', ['--disagree', '-m', 'a\nb']), null);
+  // The same names take a value elsewhere, and there the -m is that value.
+  assert.match(argumentRefusal('plan', ['c', '--remove', '-m', 'a\nb']), /only the -m message/);
+  assert.match(argumentRefusal('note', ['--clear', '-m', 'a\nb']), /only the -m message/);
+  assert.match(argumentRefusal('review-route', ['--clear', '-m', 'a\nb']), /only the -m message/);
+
+  // The table is keep.js's own: every 'bool' in the parseArgs specs of a registry
+  // command, and nothing else.
+  const source = fs.readFileSync(path.join(__dirname, 'keep.js'), 'utf8').split('\n');
+  const starts = [];
+  source.forEach((line, i) => {
+    const match = line.match(/^commands(?:\.([a-z]+)|\['([a-z-]+)'\]) = /);
+    if (match) starts.push({ name: match[1] || match[2], i });
+  });
+  for (const command of REGISTRY_COMMANDS) {
+    const at = starts.findIndex((entry) => entry.name === command);
+    assert.ok(at >= 0, `keep.js defines ${command}`);
+    const text = source.slice(starts[at].i, at + 1 < starts.length ? starts[at + 1].i : source.length).join('\n');
+    const bools = new Set();
+    for (const spec of text.matchAll(/parseArgs\([^,]+,\s*(\{[^}]*\})/g)) {
+      for (const flag of spec[1].matchAll(/'?([a-z-]+)'?\s*:\s*'bool'/g)) bools.add(flag[1]);
+    }
+    assert.deepEqual([...(BOOLEAN_FLAGS[command] || [])].sort(), [...bools].sort(), command);
+  }
 });
 
 test('arguments are checked the way the CLI will read them', (t) => {

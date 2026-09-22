@@ -140,7 +140,8 @@ function nodeApiListen(env = process.env) {
   let parsed;
   try {
     parsed = parseListenAddress(text);
-    host.assertBindable(parsed.address, text);
+    // No escape hatch here: the node API never listens on every interface.
+    host.assertBindable(parsed.address, text, 'nodeApi.listen must be one address of this machine (its Tailscale address), never every interface');
   } catch (error) { return { enabled: false, error: error.message }; }
   if (parsed.port < 1) return { enabled: false, error: `a node API address needs a port between 1 and 65535: ${text}` };
   const shown = parsed.address.includes(':') ? `[${parsed.address}]:${parsed.port}` : `${parsed.address}:${parsed.port}`;

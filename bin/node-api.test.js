@@ -49,6 +49,13 @@ test('a node listener address is refused, not bound, when it is a wildcard or no
     assert.equal(answer.enabled, false, listen);
     assert.match(answer.error, /./, listen);
   }
+  // The host's escape hatch is not the node API's: it has none, and says what to set.
+  for (const listen of ['0.0.0.0:7781', '[::]:7781']) {
+    const { error } = nodeApiListen(configEnv(t, { ...TWO_NODES, nodeApi: { listen } }));
+    assert.doesNotMatch(error, /KEEP_HOST_LISTEN_ANY/, listen);
+    assert.match(error, /^refusing to bind .*: nodeApi\.listen must be one address of this machine \(its Tailscale address\), never every interface$/, listen);
+  }
+  assert.throws(() => require('./host.js').assertBindable('0.0.0.0'), /set KEEP_HOST_LISTEN_ANY=1/, 'the host keeps its own wording');
   assert.match(nodeApiListen(configEnv(t, { ...TWO_NODES, nodeApi: '100.64.0.1:7781' })).error, /nodeApi must be an object/);
   assert.match(nodeApiListen(configEnv(t, { ...TWO_NODES, nodeApi: { listen: '100.64.0.1:7781', port: 1 } })).error, /unsupported Keep nodeApi key/);
 });
