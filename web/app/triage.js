@@ -14,6 +14,7 @@ import { numBadgeHTML } from './session-number.js';
 import { installHeadingRename, installRenameControls, isEditing, renameButtonsHTML, titleAttrsHTML } from './session-rename.js';
 import { installMarkControls, markControlsHTML, markHTML } from './session-mark.js';
 import { providerIconHTML } from './provider-icon.js';
+import { nodeBadgeHTML, remoteNode } from './node-badge.js';
 import { placeInbox } from './queue-inbox.js';
 import { runAction } from './action.js';
 
@@ -552,8 +553,11 @@ export function queueRow(ctx, item) {
   // row with no session of its own (a plain shell) has no number and shows none.
   // Both live inside .t because .qitem is a fixed three-column grid: another
   // top-level span would shift every cell after it.
+  // The node chip follows the provider icon, and only for a session on another
+  // machine: a single-node console renders the row it always rendered.
+  const node = remoteNode({ item, session, pane: ctx.paneMap().get(item.pane || session?.pane) });
   const badge = numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)
-    + markHTML(ctx.esc, item.mark ?? session?.mark) + providerIconHTML(provider, ctx.esc);
+    + markHTML(ctx.esc, item.mark ?? session?.mark) + providerIconHTML(provider, ctx.esc) + nodeBadgeHTML(ctx.esc, node);
   if (item.kind === 'running' || item.kind === 'pinned' || item.kind === 'recent') {
     const sessionState = session ? sessionLabel(session) : item.state || 'unknown';
     // Running rows without a session are plain shells; label them like pinned ones.

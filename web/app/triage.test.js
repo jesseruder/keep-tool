@@ -887,3 +887,35 @@ test('a resumed session pane replaces the stale pane captured by its attention r
   assert.deepEqual(stagePane(ctx, item, { ...session, pane: 'not-published-yet' }),
     { id: 'before-retirement', pane: panes.get('before-retirement') }, 'an unavailable session hint falls back to the row');
 });
+
+function rowCtx(sessions, panes) {
+  return { esc, sessionFor: (item) => sessions.find((session) => session.id === item.sessionId), taskFor: () => null,
+    paneMap: () => new Map(panes.map((pane) => [pane.id, pane])), projectHTML: (path) => `<b>${esc(path)}</b>`,
+    tagsHTML: () => '', rel: () => '1m ago', isMarkedRunning: () => false, kindLabel: (kind) => kind };
+}
+const NODE_SESSION = { id: 's-1', num: 4, kind: 'codex', title: 'Fix the bar', project: '/work/a', state: 'running', pane: 'p1' };
+// queueRow as it rendered before nodes existed; a daemon-node row must not move a byte.
+const RUNNING_ROW = '<span class="stripe"></span><span class="t "><span class="num-id" title="s-1">#4</span><span class="provider-icon provider-codex" role="img" aria-label="Codex" title="Codex"></span>Fix the bar</span>\n      \n      <span class="p"><b>/work/a</b></span>\n      <span class="s"><span title="running" class="kind state running">running</span></span>';
+const WAITING_ROW = '<span class="stripe"></span><span class="t "><span class="num-id" title="s-1">#4</span><span class="provider-icon provider-codex" role="img" aria-label="Codex" title="Codex"></span>Fix the bar</span>\n    <span class="w num ">now</span>\n    <span class="p"><b>/work/a</b></span>\n    <span class="s"><span title="running" class="kind question">question</span>Ship it?</span>';
+const NODE_BADGE = '<span class="node-badge" title="runs on node aws1">aws1</span>';
+
+test('a daemon-node row renders byte for byte as it did before nodes', async () => {
+  const { queueRow } = await import('./triage.js');
+  for (const pane of [{ id: 'p1', alive: true, meta: { agent: 'codex' } },
+    { id: 'p1', node: 'main', alive: true, meta: { agent: 'codex' } }]) {
+    const ctx = rowCtx([NODE_SESSION], [pane]);
+    assert.equal(queueRow(ctx, { kind: 'running', sessionId: 's-1', pane: 'p1' }), RUNNING_ROW);
+    assert.equal(queueRow(ctx, { kind: 'question', sessionId: 's-1', since: Date.now(), question: 'Ship it?' }), WAITING_ROW);
+  }
+});
+
+test('a row on another node carries the node badge after the provider icon', async () => {
+  const { queueRow } = await import('./triage.js');
+  const withBadge = (html) => html.replace('title="Codex"></span>', `title="Codex"></span>${NODE_BADGE}`);
+  // From the session's own node, then from its pane alone.
+  const bySession = rowCtx([{ ...NODE_SESSION, pane: 'p1@aws1', node: 'aws1' }], [{ id: 'p1@aws1', node: 'aws1', alive: true, meta: { agent: 'codex' } }]);
+  assert.equal(queueRow(bySession, { kind: 'running', sessionId: 's-1', pane: 'p1@aws1' }), withBadge(RUNNING_ROW));
+  assert.equal(queueRow(bySession, { kind: 'question', sessionId: 's-1', since: Date.now(), question: 'Ship it?' }), withBadge(WAITING_ROW));
+  const byPane = rowCtx([{ ...NODE_SESSION, pane: 'p1@aws1' }], [{ id: 'p1@aws1', node: 'aws1', alive: true, meta: { agent: 'codex' } }]);
+  assert.equal(queueRow(byPane, { kind: 'question', sessionId: 's-1', since: Date.now(), question: 'Ship it?' }), withBadge(WAITING_ROW));
+});
