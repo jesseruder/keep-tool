@@ -4,7 +4,7 @@ let runSequence = 0;
 const labels = { shell: 'Plain shell', claude: 'Claude Code', codex: 'Codex', pi: 'Pi' };
 // Offered in the model dropdown; "Other…" still accepts any id the CLI takes.
 const modelPresets = {
-  claude: ['claude-fable-5-1', 'claude-fable-5-1[1m]', 'claude-opus-5', 'claude-opus-5[1m]', 'claude-sonnet-5', 'claude-haiku-4-5-20251001'],
+  claude: ['claude-fable-5-1', 'claude-fable-5-1[1m]', 'claude-opus-5-5', 'claude-opus-5-5[1m]', 'claude-opus-5', 'claude-opus-5[1m]', 'claude-sonnet-5', 'claude-haiku-4-5-20251001'],
   codex: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
 };
 const OTHER_MODEL = '__other__';

@@ -352,3 +352,20 @@ for (const seed of [17, 83]) test(`seed ${seed}: pointer timing and ordering var
     expect(fixture.events.slice(before).filter(e => e.event === 'input').every(e => e.pane === `p${id}`)).toBe(true);
   }
 });
+test('a long status chip ellipsizes instead of wrapping the top bar', async ({ page }) => {
+  for (const width of [1800, 1500]) {
+    await page.setViewportSize({ width, height: 950 });
+    const bar = page.locator('header.bar');
+    const before = (await bar.boundingBox()).height;
+    await page.evaluate(() => {
+      const chip = document.querySelector('#connection');
+      chip.textContent = 'terminal host not answering for 4 m · showing panes as of 4 m ago · and more';
+      chip.hidden = false;
+    });
+    await expect(page.locator('#connection')).toBeVisible();
+    expect((await bar.boundingBox()).height).toBe(before);
+    const chip = await page.locator('#connection').evaluate(el => ({ scroll: el.scrollWidth, client: el.clientWidth }));
+    expect(chip.scroll).toBeGreaterThan(chip.client);
+    await page.evaluate(() => { document.querySelector('#connection').hidden = true; });
+  }
+});

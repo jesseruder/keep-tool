@@ -584,7 +584,11 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .keys { height: 30px; flex: none; display: flex; align-items: center; gap: 18px; padding: 0 14px; border-top: 1px solid var(--bar-line); background: var(--bar-bg); color: var(--bar-muted); font-size: 11px; } .keys span { white-space: nowrap; } .keys .help-key { cursor: pointer; } .keys .note { margin-left: auto; color: var(--faint); overflow: hidden; text-overflow: ellipsis; }
 .toast { position: fixed; left: 50%; top: calc(var(--top-bar-height, 52px) + 6px); pointer-events: none; z-index: 50; }
 .toast-body { transform: translate(-50%, -6px); opacity: 0; pointer-events: auto; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 6px; padding: 9px 13px; box-shadow: var(--shadow); transition: opacity 80ms ease-out, transform 80ms ease-out; } .toast-body.show { opacity: 1; transform: translate(-50%, 0); } .toast-body button { color: var(--info); margin-left: 12px; font-weight: 500; }
-.connection { display: inline-flex; align-items: center; min-width: 0; max-width: 340px; padding: 4px 8px; border: 1px solid var(--bar-line); border-radius: 12px; color: var(--bar-muted); font: 11px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The slot has no base width, so a long status shrinks into free space and ellipsizes
+   instead of wrapping the bar onto a second row. */
+.connection-slot { flex: 1 1 0; min-width: 0; max-width: 340px; display: flex; }
+.connection-slot:has(> .connection[hidden]) { display: none; }
+.connection { display: block; min-width: 0; max-width: 100%; padding: 4px 8px; border: 1px solid var(--bar-line); border-radius: 12px; color: var(--bar-muted); font: 11px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .connection[hidden] { display: none; }
 .connection[data-status="pending"] { color: var(--info); }
 .connection[data-status="reconnecting"], .connection[data-status="stale"], .connection[data-status="degraded"] { color: var(--warn); }

@@ -1053,6 +1053,7 @@ function renderConnectionStatus() {
     reconnectingSince: refreshFailingSince || eventReconnectingSince, hostStatus: data.hostStatus,
   });
   connection.textContent = view.text;
+  connection.title = view.text;
   connection.hidden = !view.text;
   connection.dataset.status = view.status;
   clearTimeout(connectionTimer);
