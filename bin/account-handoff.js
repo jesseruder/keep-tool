@@ -116,12 +116,53 @@ function portableFallbackCandidate(entry) {
     && !entry.sourceStopVerifiedAt && !entry.targetLaunchStartedAt
     && !entry.deliveryStartedAt && !entry.deliveredAt);
 }
+// The stop proof, taken after the fact. The transaction writes sourceStopVerifiedAt
+// itself at the moment the restart hands it the exited pane (replace-exited); a typed
+// /exit that succeeded while a later host call timed out never gets there, and the
+// record then says only "stopping-source" about a source that is in fact gone. Session
+// #213 sat there refusing every retry — "Source exit was not verified by the handoff
+// transaction" — with nothing able to recover it: abandonForPortable wants a live source.
+//
+// What proves the stop instead is the same identity the transaction was going to stop,
+// read fresh: the record's own pane, still carrying this session and not relaunched by
+// this or any handoff, is no longer alive, and a new `ps` snapshot has no process with
+// the recorded pid and start time (the pid gone, or reused by a process that started at
+// another time). Only a transaction that never got past its stop qualifies, and only one
+// that recorded the identity at all — and only one whose own /exit was typed
+// (sourceExitTypedAt, journalled by the restart just before the keystroke): a restart that
+// refused before its stop, and a source that then died on its own, skipped every check
+// the stop makes (the job ledger above all) and stays blocked. A `ps` that fails or comes back empty proves
+// nothing and stays blocked, but as a transient refusal a retry can clear.
+async function verifySourceStopAfterTheFact(current, pane, deps, root) {
+  const blocked = () => new Error('Source exit was not verified by the handoff transaction; recovery is blocked');
+  if (current.phase !== 'stopping-source' || !Number.isFinite(current.sourceExitTypedAt)
+      || current.targetLaunchStartedAt || current.deliveryStartedAt || current.deliveredAt
+      || current.sourceOwnsPane !== true || !Number.isInteger(current.sourceAgentPid) || current.sourceAgentPid <= 0
+      || typeof current.sourceAgentPidStart !== 'string' || !current.sourceAgentPidStart) throw blocked();
+  if (!pane || pane.id !== current.pane || pane.alive !== false || pane.meta?.sessionId !== current.sessionId
+      || pane.meta?.handoffTransactionId
+      || pane.meta?.accountId && pane.meta.accountId !== current.sourceAccountId
+      || Number.isInteger(current.pid) && pane.pid !== current.pid) throw blocked();
+  if (typeof deps.agentProcessRows !== 'function') {
+    throw new Error('Source exit could not be verified: no process snapshot is available');
+  }
+  let rows;
+  try { rows = await deps.agentProcessRows(); } catch (error) {
+    throw new Error(`Source exit could not be verified: ps failed (${String(error && error.message || error).slice(0, 200)})`);
+  }
+  if (!Array.isArray(rows) || !rows.length) throw new Error('Source exit could not be verified: ps returned no processes');
+  if (rows.some((row) => row && row.pid === current.sourceAgentPid && row.pidStart === current.sourceAgentPidStart)) {
+    throw new Error('Source agent is still running although its pane exited; recovery is blocked');
+  }
+  Object.assign(current, { sourceStopVerifiedAt: Date.now(), sourceStopVerifiedBy: 'post-hoc-ps' });
+  writeOne(root, current);
+}
 function safe(entry) {
   if (!entry) return null;
   // sourceStopVerifiedAt is the transaction's own proof that the source agent
   // exited. Without it a 'recovery-needed' record may be a refusal that landed
   // before anything was stopped, which is a different thing entirely.
-  const keys = ['id', 'transactionId', 'sessionId', 'pane', 'agent', 'sourceAccountId', 'targetAccountId', 'intent', 'force', 'status', 'phase', 'reason', 'refusalClass', 'sourceStopVerifiedAt', 'updatedAt'];
+  const keys = ['id', 'transactionId', 'sessionId', 'pane', 'agent', 'sourceAccountId', 'targetAccountId', 'intent', 'force', 'status', 'phase', 'reason', 'refusalClass', 'sourceStopVerifiedAt', 'sourceStopVerifiedBy', 'updatedAt'];
   return {
     ...Object.fromEntries(keys.filter((key) => entry[key] != null).map((key) => [key, entry[key]])),
     ...(portableFallbackCandidate(entry) ? { portableFallbackAvailable: true } : {}),
@@ -599,6 +640,12 @@ async function run(body, deps = {}) {
       }
     } else if (!(sameTransfer && current?.status === 'failed' && current.phase === 'preflight')) current = null;
     const inspected = await deps.inspect(body);
+    // The host did not answer the pane list in time. That says nothing about the pane —
+    // least of all that it is gone — so it must not read as "needs the original pane",
+    // which parks a queued transfer as blocked on a host that is merely slow.
+    if (inspected?.hostUnavailable) {
+      const error = new Error('host request timed out listing panes; the handoff can be retried'); error.status = 409; throw error;
+    }
     const session = inspected?.session || (current ? { id: body.sessionId, kind: current.agent || 'claude', project: current.cwd } : null);
     const pane = inspected?.pane;
     if (!session || !pane || pane.id !== body.pane || (pane.meta?.sessionId && pane.meta.sessionId !== body.sessionId)) {
@@ -687,7 +734,7 @@ async function run(body, deps = {}) {
     }
     if (current?.status === 'recovery-needed' && !pane.alive) {
       try {
-        if (!current.sourceStopVerifiedAt) throw new Error('Source exit was not verified by the handoff transaction; recovery is blocked');
+        if (!current.sourceStopVerifiedAt) await verifySourceStopAfterTheFact(current, pane, deps, root);
         if (!await authPreflight(target, deps)) throw new Error(`Target ${agent} account is not logged in`);
         const recoveryCwd = session.project || current.cwd || pane.cwd;
         const compatibility = providerCompatibility(agent, source, target, recoveryCwd, current.resumeSpec, deps);
@@ -839,6 +886,11 @@ async function run(body, deps = {}) {
         ...deps.restartDeps, root, env, host: wrappedHost, resumeAccount: target, resumeMcpConfig: compatibility.mcpConfig,
         resumeModel: current.model, resumeArgv: current.resumeSpec?.argv, resumeCwd: current.resumeSpec ? current.cwd : null,
         allowTerminalRateLimit: true,
+        // Every check the restart makes before a stop has passed, and the /exit is about to
+        // be typed. Journalled before the keystroke, so a stop whose confirmation is lost
+        // afterwards can still be proven post hoc (verifySourceStopAfterTheFact) — and one
+        // that never got this far, a refusal or a crash of the source on its own, cannot.
+        onExitInput: () => { current.sourceExitTypedAt = Date.now(); writeOne(root, current); },
         // The agent this preflight actually verified. The restart re-reads `ps` and now
         // re-reads it again when a snapshot comes back unusable, and a patient read is
         // exactly where a replacement process could be adopted as the original. Naming

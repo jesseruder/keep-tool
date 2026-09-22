@@ -499,6 +499,63 @@ test('actual restart busy refusal leaves source live and does not copy artifacts
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('a typed /exit whose confirmation was lost is proven after the fact from a fresh ps', async () => {
+  const f = fixture();
+  try {
+    // The 2026-09-21 shape: the restart typed /exit, the source left, and a later host
+    // call timed out, so the transaction never reached replace-exited.
+    const d = deps(f, { restartSession: async (_body, options) => {
+      options.onExitInput();
+      d.pane.alive = false;
+      const error = new Error('host request timed out: input'); error.status = 409; throw error;
+    } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /host request timed out/);
+    const journal = () => handoff.readOne(f.root, f.sid);
+    assert.equal(journal().status, 'recovery-needed');
+    assert.equal(journal().sourceStopVerifiedAt, undefined);
+    assert.ok(Number.isFinite(journal().sourceExitTypedAt));
+
+    // No snapshot, a failed one, or an empty one proves nothing: blocked, but transient.
+    for (const rows of [undefined, async () => { throw new Error('Command failed: ps'); }, async () => []]) {
+      d.agentProcessRows = rows;
+      await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), (error) =>
+        /^Source exit could not be verified/.test(error.message) && handoff.classifyRefusal(error.message) === 'transient');
+      assert.equal(journal().sourceStopVerifiedAt, undefined);
+    }
+    // The recorded process is still there: not a stop at all.
+    d.agentProcessRows = async () => [{ pid: 11, pidStart: 'source-start' }];
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /still running/);
+    // A pane that is not the record's (another session's meta, or relaunched by a handoff).
+    d.agentProcessRows = async () => [{ pid: 11, pidStart: 'another-start' }, { pid: 12, pidStart: 'x' }];
+    d.pane.meta.handoffTransactionId = 'someone-else';
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /Source exit was not verified/);
+    delete d.pane.meta.handoffTransactionId;
+
+    // The pid reused by a process that started at another time: proven, and recovery runs.
+    const recovered = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    assert.equal(recovered.status, 'done');
+    assert.equal(recovered.sourceStopVerifiedBy, 'post-hoc-ps');
+    assert.ok(recovered.sourceStopVerifiedAt);
+    assert.equal(d.continuations(), 1);
+    assert.equal(accounts.forSession(f.sid, 'claude', { root: f.root, env: f.env }).id, 'two');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a host that did not list its panes is a transient timeout, not a missing pane', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f, { restartSession: async (_body, options) => {
+      options.onExitInput(); d.pane.alive = false; throw new Error('host request timed out: input');
+    } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d));
+    d.inspect = async () => ({ hostUnavailable: true });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), (error) =>
+      /^host request timed out/.test(error.message) && handoff.classifyRefusal(error.message) === 'transient'
+      && !/original pane/.test(error.message));
+    assert.equal(handoff.readOne(f.root, f.sid).status, 'recovery-needed', 'the record is left exactly as it was');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('explicit portable fallback abandons only a verified pre-stop transaction with the source intact', async () => {
   const f = fixture();
   try {
