@@ -171,27 +171,43 @@ function createRegistryPull({
 // stderr to ~/keep/.keep/serve.log, which makes this the one record of a stall
 // that outlives the process it happened in.
 //
-// The line names who held the loop when bin/loop-hold.js knows: every wrapped
-// scheduler tick and HTTP route enters a hold, and the probe asks it for the likeliest
-// holder of the late window (`... stalled 2400ms during handoff-queue`). With
-// `health`, it also keeps the `loop-stalls` row; see createLoopStallHealth.
+// Lateness is measured on performance.now(), the monotonic clock Node's timers
+// themselves run on. On Date.now() every lid-close read as a stall the length of
+// the sleep (one of 72 minutes in a real serve.log): the wall clock moves while the
+// machine sleeps and the timers do not. A lag beyond SUSPEND_MS on the monotonic
+// clock is still no stall (no daemon tick holds the loop for five minutes and
+// lives) but a clock jump, logged as such and kept out of the row. `wallNow` is
+// only for the health record's timestamp.
+//
+// The line names who held the loop when bin/loop-hold.js knows: the wrapped
+// scheduler ticks and HTTP routes enter holds, and the probe asks for the likeliest
+// holder of the late window. A measured holder reads `... stalled 2400ms during
+// handoff-queue`; a heuristic guess reads `during likely <name>`. With `health`,
+// it also keeps the `loop-stalls` row; see createLoopStallHealth.
+const SUSPEND_MS = 5 * 60e3;
+
 function startLoopLagProbe({ thresholdMs = 500, intervalMs = 1000, write = (line) => process.stderr.write(line),
-  setInterval: si = setInterval, now = Date.now, holds = require('../loop-hold.js'), health = null } = {}) {
+  setInterval: si = setInterval, now = () => require('node:perf_hooks').performance.now(), wallNow = Date.now,
+  holds = require('../loop-hold.js'), health = null, suspendMs = SUSPEND_MS } = {}) {
   let expectedAt = now() + intervalMs;
   let lastAt = now();
   const stalls = health ? createLoopStallHealth({ health, thresholdMs }) : null;
   const timer = si(() => {
     const at = now();
     const lag = at - expectedAt;
-    if (lag > thresholdMs) {
-      let name = null;
-      try { name = holds.attribute({ since: lastAt, due: expectedAt, at }); } catch {}
-      write(`keep serve: event loop stalled ${Math.round(lag)}ms${name ? ` during ${name}` : ''}\n`);
-      stalls?.stall(at, lag, name);
+    if (lag > suspendMs) {
+      write(`keep serve: clock jumped ${Math.round(lag)}ms (suspend?)\n`);
+    } else if (lag > thresholdMs) {
+      let blamed = null;
+      try { blamed = holds.attribute({ since: lastAt, due: expectedAt, at }); } catch {}
+      const during = blamed ? ` during ${blamed.likely ? 'likely ' : ''}${blamed.name}` : '';
+      write(`keep serve: event loop stalled ${Math.round(lag)}ms${during}\n`);
+      // Only a measured holder goes into the health row; a guess stays in the log.
+      stalls?.stall(wallNow(), lag, blamed && !blamed.likely ? blamed.name : null);
     }
-    stalls?.tick(at);
-    // Measured against when this tick actually landed, so one stall is reported
-    // once rather than as a lasting offset on every tick after it.
+    stalls?.tick(wallNow());
+    // Measured against when this tick actually landed, so one stall (or jump) is
+    // reported once rather than as a lasting offset on every tick after it.
     expectedAt = at + intervalMs;
     lastAt = at;
   }, intervalMs);
@@ -199,7 +215,10 @@ function startLoopLagProbe({ thresholdMs = 500, intervalMs = 1000, write = (line
   return timer;
 }
 
-// The `loop-stalls` health row.
+// The `loop-stalls` health row. It is for the console and serve.log, not for
+// self-repair: bin/self-repair.js excludes it, because a stall from sleep, swap or
+// a loaded machine, blamed by a heuristic, is not something a daemon-code repair
+// card can address.
 //
 // Rule: the row is unhealthy exactly while a stall over SEVERE_STALL_MS (5 s)
 // happened in the last hour. Five seconds is where the CLI's host and daemon
@@ -208,27 +227,24 @@ function startLoopLagProbe({ thresholdMs = 500, intervalMs = 1000, write = (line
 // (`3 stalls in the last hour, worst 7200ms during handoff-queue`) but never fail
 // the row.
 //
-// Shape, chosen around bin/self-repair.js, which opens a card once a row has
-// minFailures (5) consecutive failures and the same signature has stood for
-// minAgeMin (30 m):
-//   - a severe stall records one failure, and severe stalls less than
-//     FAILURE_SPACING_MS apart count as one episode (a swap storm produces a burst
-//     of them in a few minutes; that is one event, not five);
+// Shape:
+//   - a severe stall records a failure, at most one per FAILURE_SPACING_MS: a
+//     storm of them is rate limited to one failure every ten minutes, not merged
+//     into one;
 //   - every CADENCE_MS the row records a skip while a severe stall is still inside
-//     the hour: the skip keeps the streak (the row stays warning/failing) and keeps
-//     it from reading `silent`, but does not add to the count;
+//     the hour: the skip keeps the streak and keeps the row from reading `silent`,
+//     but does not add to it;
 //   - the first cadence tick with no severe stall in the hour records ok, which
 //     zeroes the streak.
-// So one stall is one failure that clears an hour later and can never reach a
-// repair card. A card takes five separate episodes at least ten minutes apart with
-// never a clean hour between them, which is a daemon that keeps stalling and the
-// thing a repair agent should look at. The error names the attributed holder, so
-// the signature (and the card) is per culprit.
+// So the row warns at one failure and reads failing at three (which puts it in
+// console attention; bin/health.js stateOf), and a single stall clears an hour
+// later. The error carries no number and names only a measured holder, so it
+// reads the same from one stall to the next; the counts and the worst stall are in
+// the detail.
 //
 // A restarted daemon starts with an empty window: stalls from before the restart
 // are in serve.log, not in this process's memory, so its first cadence tick
-// records ok. That errs toward quiet, which is the right side for a row whose
-// failure opens a card.
+// records ok.
 const SEVERE_STALL_MS = 5000;
 const LOOP_STALLS_CADENCE_MS = 5 * 60e3;
 const FAILURE_SPACING_MS = 10 * 60e3;
@@ -259,7 +275,7 @@ function createLoopStallHealth({ health, thresholdMs = 500, severeMs = SEVERE_ST
       lastFailureAt = at;
       record(at, {
         ok: false,
-        error: `event loop stalled ${Math.round(ms)}ms${name ? ` during ${name}` : ''}`,
+        error: `event loop stalled over ${severeMs / 1000}s${name ? ` during ${name}` : ''}`,
         detail: detailOf(),
       });
     },
@@ -332,8 +348,10 @@ function startSchedulers(ctx) {
     unblock, usage, watcherSend, withInjectionLock, writeTarget,
   } = ctx;
   const periodicScan = periodicSessionScan(scanSessions);
-  // Every interval tick below runs inside a loop hold named after its health row,
-  // so a stall the lag probe sees can be attributed (bin/loop-hold.js).
+  // The interval ticks this function starts itself run inside a loop hold, named
+  // after their health row where they have one and after the tick otherwise, so a
+  // stall the lag probe sees can be attributed (bin/loop-hold.js). The feature
+  // modules' own schedulers started here are not wrapped.
   const hold = require('../loop-hold.js').wrap;
 
   runs.setOnChange(broadcast);
@@ -859,9 +877,9 @@ function startSchedulers(ctx) {
       watcherRunning = false;
     }
   };
-  const heldTurnIndexTick = hold('turn-index', turnIndexTick);
-  const heldWatcherTick = hold('watcher', watcherTick);
-  const turnTicks = () => { heldTurnIndexTick(); heldWatcherTick(); };
+  // One hold for the pair: two holds entered in one callback would credit the
+  // first one's continuations to the second.
+  const turnTicks = hold('turn-ticks', () => { turnIndexTick(); return watcherTick(); });
   setInterval(turnTicks, 30e3).unref();
   setTimeout(turnTicks, 10e3).unref();
   // Drip-fold fleet transcripts for the weekly attribution: ~750MB of history on a
@@ -922,5 +940,5 @@ function startSchedulers(ctx) {
 
 module.exports = {
   startFeatureSchedulers, startSchedulers, createRegistryPull, createCleanupSnapshot,
-  startLoopLagProbe, createLoopStallHealth, SEVERE_STALL_MS, startReceiptsPoller, periodicSessionScan,
+  startLoopLagProbe, createLoopStallHealth, SEVERE_STALL_MS, SUSPEND_MS, startReceiptsPoller, periodicSessionScan,
 };

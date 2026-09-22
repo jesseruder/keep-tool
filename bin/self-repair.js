@@ -38,8 +38,11 @@ const SELF_NAME = 'self-repair';
 // opens — congestion, a busy thread, a terminal host that is not up — rather than on
 // a bug in this process. `lint` and `git-pull` fail on registry and checkout state (a
 // malformed card, a dirty or diverged checkout), which is Owner's to fix, not the
-// daemon's.
-const EXCLUDED = new Set(['runs', 'lint', 'git-pull']);
+// daemon's. `loop-stalls` fails on an event-loop stall over five seconds, which
+// sleep, swap or a loaded machine produce as readily as daemon code, and whose
+// culprit is named by a heuristic at best; a daemon-code repair card cannot address
+// that. The row is for the console and serve.log (bin/serve/schedulers.js).
+const EXCLUDED = new Set(['runs', 'lint', 'git-pull', 'loop-stalls']);
 const CADENCE_MS = 5 * MINUTE_MS;
 const FIRST_RUN_MS = 90e3;
 // A resolved signature is kept so a recurrence can link the previous card.

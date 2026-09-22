@@ -87,8 +87,8 @@ const { createDashboardPublisher } = require('./dashboard-publisher');
 const { createUiRequestWorker } = require('./ui-request-worker');
 const { routes: buildRequestRoutes, matchRoute, routeDenial } = require('./serve/routes.js');
 // Names whoever holds the event loop, so the lag probe's stall line can say who
-// (bin/loop-hold.js). Interval ticks here run inside a hold named after their
-// health row.
+// (bin/loop-hold.js). The interval ticks started here run inside a hold, named
+// after their health row where they have one and after the tick otherwise.
 const loopHold = require('./loop-hold.js');
 const { startSchedulers } = require('./serve/schedulers.js');
 const execFileAsync = promisify(execFile);

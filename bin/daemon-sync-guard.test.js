@@ -5,19 +5,26 @@
 // it, host requests included, for as long as the child runs: that is how git
 // spawns and the handoff tick ended up as multi-second stalls. This test keeps the
 // class from coming back quietly. Every synchronous spawn in the daemon's tick and
-// route files has to be on the allowlist below, with the reason it is safe.
+// route files, and in the modules whose schedulers the daemon runs in-process, has
+// to be on the allowlist below: either with the reason it is safe, or marked as
+// known debt so a new site beside it still fails.
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 
-const FILES = ['bin/serve.js', 'bin/serve/schedulers.js', 'bin/serve/routes.js', 'bin/handoff-queue.js'];
+const FILES = [
+  'bin/serve.js', 'bin/serve/schedulers.js', 'bin/serve/routes.js', 'bin/handoff-queue.js',
+  // Modules whose startScheduler the daemon calls, so their ticks run on its loop.
+  'bin/landed.js', 'bin/lint.js', 'bin/review.js', 'bin/self-repair.js',
+];
 const SYNC_SPAWN = /\b(execFileSync|spawnSync|execSync)\b/g;
 
-// Keyed by file and the enclosing top-level function; `count` is the exact number
-// of mentions there (the injectable default counts, so a new call beside the
-// allowed ones fails the count).
+// Keyed by file and the enclosing top-level declaration (a function, or the
+// `const` a top-level object or import is bound to; '(top level)' for a
+// destructured import); `count` is the exact number of mentions there (imports
+// and injectable defaults count, so a new call beside the allowed ones fails).
 const ALLOWLIST = [
   {
     file: 'bin/serve/schedulers.js',
@@ -30,6 +37,74 @@ const ALLOWLIST = [
     // woken to release it. It only runs when the fetch (asynchronous, unlocked)
     // found new commits, and with the objects already local it takes milliseconds.
     why: 'registry rebase under the registry lock, only after an async fetch found commits',
+  },
+  // ---- Known debt: synchronous today, on a daemon tick. Do not copy these; move
+  // them to an async child when their module is next touched.
+  {
+    file: 'bin/landed.js',
+    function: 'deps',
+    count: 2,
+    // DEBT: the test seam every landed.js git call goes through. The module memoizes
+    // answers (repo, default branch, commit dependencies) so a state build rarely
+    // spawns, but a cache miss spawns git synchronously on the daemon loop.
+    why: 'debt: landed.js git seam, synchronous on a cache miss',
+  },
+  {
+    file: 'bin/landed.js',
+    function: 'git',
+    count: 1,
+    // DEBT: the one caller of the seam above.
+    why: 'debt: landed.js git(), synchronous on a cache miss',
+  },
+  {
+    file: 'bin/lint.js',
+    function: '(top level)',
+    count: 1,
+    // DEBT: the import the two sites below use.
+    why: 'debt: lint.js execFileSync import',
+  },
+  {
+    file: 'bin/lint.js',
+    function: 'checkoutState',
+    count: 1,
+    // DEBT: git status of each main checkout, on the 30-minute lint tick.
+    why: 'debt: lint.js checkout status, synchronous on the lint tick',
+  },
+  {
+    file: 'bin/lint.js',
+    function: 'git',
+    count: 1,
+    // DEBT: the lint rules' local git reads, on the 30-minute lint tick.
+    why: 'debt: lint.js git(), synchronous on the lint tick',
+  },
+  {
+    file: 'bin/review.js',
+    function: '(top level)',
+    count: 1,
+    // DEBT: the import the two sites below use.
+    why: 'debt: review.js execFileSync import',
+  },
+  {
+    file: 'bin/review.js',
+    function: 'git',
+    count: 1,
+    // DEBT: the fleet reviewer's git reads (diffs, logs) for its bundle.
+    why: 'debt: review.js git(), synchronous in the reviewer tick',
+  },
+  {
+    file: 'bin/review.js',
+    function: 'scanSubagentsForCodex',
+    count: 1,
+    // DEBT: grep over transcript chunks to find the session that launched a Codex job.
+    why: 'debt: review.js grep over transcripts',
+  },
+  {
+    file: 'bin/self-repair.js',
+    function: 'patchIdOf',
+    count: 1,
+    // DEBT: git patch-id when the self-repair tick checks whether a repair card's
+    // commit landed through a reviewed patch; runs in the daemon, not a child.
+    why: 'debt: self-repair.js patch-id, synchronous in the self-repair tick',
   },
 ];
 
@@ -46,8 +121,11 @@ function syncSpawns(file) {
   const found = [];
   let enclosing = '(top level)';
   lines.forEach((line, index) => {
-    const declared = /^(?:async\s+)?function\s+([A-Za-z0-9_$]+)\s*\(/.exec(line);
+    const declared = /^(?:async\s+)?function\s*\*?\s*([A-Za-z0-9_$]+)\s*\(/.exec(line);
+    const bound = /^(?:const|let|var)\s+([A-Za-z0-9_$]+)\b/.exec(line);
     if (declared) enclosing = declared[1];
+    else if (bound) enclosing = bound[1];
+    else if (/^(?:const|let|var)\s*[{[]/.test(line) || /^module\.exports\b/.test(line)) enclosing = '(top level)';
     for (const match of codeOf(line).matchAll(SYNC_SPAWN)) {
       found.push({ file, function: enclosing, line: index + 1, name: match[1], text: line.trim() });
     }

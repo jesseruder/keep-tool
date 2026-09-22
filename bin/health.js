@@ -48,7 +48,8 @@ const CADENCES = Object.freeze({
   'git-pull': { cadenceMs: 30 * 60e3 },
   'push-receipts': { cadenceMs: 15 * 60e3 },
   // Written by the event-loop lag probe (bin/serve/schedulers.js), not a tick of
-  // its own: a heartbeat every five minutes, plus one failure per >5 s stall.
+  // its own: a heartbeat every five minutes, plus a failure per >5 s stall, at most
+  // one per ten minutes. Excluded from self-repair (bin/self-repair.js EXCLUDED).
   'loop-stalls': { cadenceMs: 5 * 60e3 },
   digest: { onDemand: true },
   // Recorded once at daemon start and once if a Claude transcript watcher dies: no

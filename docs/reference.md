@@ -2570,48 +2570,76 @@ on the daemon node, whose registry holds the records the guards read. Set
 `keep serve` runs every scheduler tick and every HTTP route on one event loop, so
 one tick that does a long synchronous walk or spawns a child synchronously holds up
 everything else, host requests included. A one-second probe timer measures how late
-it lands; more than 500 ms late, it writes to `~/keep/.keep/serve.log`:
+it lands. When it is more than 500 ms late, the probe writes to `~/keep/.keep/serve.log`:
 
     keep serve: event loop stalled 2400ms during handoff-queue
 
-The `during <name>` part comes from `bin/loop-hold.js`. Every interval tick in the
-daemon (named after its health row: `handoff-queue`, `auto-compact`, `brief`,
-`wt-gc`, `background-jobs`, `session-restart`, `live-sessions`, `stalled`,
-`turn-index`, `watcher`, `card-usage`, `fleet-usage`, `git-pull`) and every HTTP
-route (named `<method> <path>`) runs inside a hold. The probe names a hold measured
-to have held the loop into the late window first, then an async tick that was open
-across it, then the latest hold entered in it that was not measured short. When
-none applies the line ends at the duration.
+The probe measures on the monotonic clock that Node's timers run on
+(`performance.now()`), so time the machine spends asleep is not a stall. A lag over
+five minutes on that clock is logged as `keep serve: clock jumped Nms (suspend?)`
+and never counted as a stall.
+
+The `during <name>` part comes from `bin/loop-hold.js`. These run inside a hold:
+
+- the interval ticks in `bin/serve.js` and `bin/serve/schedulers.js`: `handoff-queue`,
+  `auto-compact`, `brief`, `wt-gc`, `card-usage`, `fleet-usage` and `git-pull`,
+  named after their health rows, plus `background-jobs`, `session-restart`,
+  `live-sessions`, `stalled` and `turn-ticks` (the turn index and the watcher,
+  one hold for the pair), named after their tick;
+- every HTTP route, named `<method> <path>`.
+
+The feature modules' own schedulers are not wrapped: review, landed, lint,
+self-repair, runs, delivery, limit-resume, pane-retention, session-cleanup,
+review-obligations, slack, discord, the receipts poller and the area-session tick.
+A stall one of them causes is reported under the plain message, or under a guess.
+
+The probe first names a hold measured to have held the loop into the late window,
+as `during <name>`. Failing that, it guesses. The first guess is an async tick or
+route that was open across the window. The second is the latest hold entered before
+the probe was due that was not measured or settled short. A guess is written
+`during likely <name>`. A route waiting on a lock is open too, so a guess can be
+wrong. When nothing applies, the line ends at the duration.
 
 Each wrapped tick also times its own synchronous entry, plus the continuations it
-started before the loop next reached its check phase. Over 500 ms, it writes one
-line per tick:
+started before the loop next reached its check phase. That second measure only
+counts while no other wrapped hold has started, and never past the moment the tick
+settled. Over 500 ms, the tick writes one line:
 
-    keep serve: turn-index held the loop 900ms
+    keep serve: turn-ticks held the loop 900ms
 
 That catches a hold even when the probe's timer happened to land inside it and saw
 no lateness.
 
-The `loop-stalls` health row counts the last hour: `3 stalls in the last hour,
-worst 7200ms during handoff-queue`. It is unhealthy exactly while a stall over 5 s
-is inside that hour, because 5 s is where CLI and host requests to the daemon start
-timing out. A stall under 5 s appears only in the detail. Each severe stall records
-one failure, and severe stalls less than ten minutes apart count as one. A heartbeat
-every five minutes records a skip while a severe stall is still inside the hour, so
-the streak stays but does not grow, and records ok once the hour is clear. One
-stall therefore clears itself an hour later. Self-repair needs five consecutive
-failures, so it opens a card (per attributed culprit) only for five separate
-episodes with no clean hour between them. A restarted daemon starts with an empty
-window.
+The `loop-stalls` health row summarizes the last hour, for example `3 stalls in the
+last hour, worst 7200ms during handoff-queue`. Only a measured holder is named there,
+never a guess. The row is unhealthy exactly while a stall over 5 s is inside that
+hour, because 5 s is where CLI and host requests to the daemon start timing out. A
+stall under 5 s appears only in the detail.
+
+A severe stall records a failure, at most one every ten minutes: a continuous storm
+is rate limited, not merged into one. A heartbeat every five minutes records a skip
+while a severe stall is still inside the hour, so the streak stays but does not
+grow. The first heartbeat after a clean hour records ok. The row warns at one
+failure and reads failing at three, which puts it in console attention. It never
+opens a self-repair card: `bin/self-repair.js` excludes it, because a stall from
+sleep, swap or a loaded machine, blamed by a heuristic, is not something a
+daemon-code fix addresses. A restarted daemon starts with an empty window.
 
 The rule for daemon code: no synchronous file-system walks and no synchronous
 process spawns on a tick or route path. Read sessions through the transcript index
-(`periodicSessionScan`), use the caches in `bin/landed.js`, or do the work in a
-child process spawned asynchronously. `bin/daemon-sync-guard.test.js` fails on any
-`execFileSync`, `spawnSync` or `execSync` in `bin/serve.js`, `bin/serve/routes.js`,
-`bin/serve/schedulers.js` or `bin/handoff-queue.js` that is not on its allowlist. Today the
-only entry is the registry rebase in `createRegistryPull`, which runs under the
-registry lock on purpose and only after an asynchronous fetch found new commits.
+(`periodicSessionScan`) and reuse cached answers such as `bin/landed.js`'s memos
+rather than asking again. Anything that must run a process uses `execFile` or
+`spawn` with a callback, or a worker or child. `bin/landed.js` itself still spawns
+git synchronously on a cache miss, which is known debt.
+`bin/daemon-sync-guard.test.js` fails on any `execFileSync`, `spawnSync` or
+`execSync` that is not on its allowlist. It checks `bin/serve.js`,
+`bin/serve/routes.js`, `bin/serve/schedulers.js`, `bin/handoff-queue.js`, and the
+in-process scheduler modules `bin/landed.js`, `bin/lint.js`, `bin/review.js` and
+`bin/self-repair.js`. The one intended entry is the registry rebase in
+`createRegistryPull`, which runs under the registry lock on purpose and only after
+an asynchronous fetch found new commits. The rest are listed as debt: landed.js's
+git seam, lint.js's checkout status and git reads, review.js's git reads and
+transcript grep, and self-repair.js's patch-id.
 
 ## Fleet reviewer
 

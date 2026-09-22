@@ -202,6 +202,10 @@ test('a pull still running is never joined by a second one', async () => {
   assert.equal(h.rows.length, 2);
 });
 
+// No stall is attributed in these probe tests unless the test says so: the shared
+// tracker would otherwise see whatever else this process has wrapped.
+const noHolds = { attribute: () => null };
+
 test('the lag probe names a tick that arrived late and stays quiet for one on time', () => {
   const lines = [];
   let clock = 0;
@@ -212,6 +216,7 @@ test('the lag probe names a tick that arrived late and stays quiet for one on ti
     write: (line) => lines.push(line),
     setInterval: (fn, ms) => { tick = fn; asked = ms; return { unref() { unrefs += 1; } }; },
     now: () => clock,
+    holds: noHolds,
   });
   assert.equal(asked, 1000);
   assert.equal(unrefs, 1, 'the probe never keeps the daemon alive by itself');
@@ -233,29 +238,93 @@ test('the lag probe names a tick that arrived late and stays quiet for one on ti
   assert.equal(lines.length, 1, 'the next tick is on time again: one stall is reported once');
 });
 
-test('the lag probe names the hold the loop tracker blames for the late window', () => {
+test('the lag probe names the hold the loop tracker blames, and marks a guess as likely', () => {
   const lines = [];
+  const rows = [];
   let clock = 0;
   let tick = null;
   const asked = [];
+  let blame = { name: 'handoff-queue', likely: false };
   startLoopLagProbe({
     write: (line) => lines.push(line),
     setInterval: (fn) => { tick = fn; return { unref() {} }; },
     now: () => clock,
-    holds: { attribute: (window) => { asked.push(window); return 'handoff-queue'; } },
+    wallNow: () => 1e12 + clock,
+    holds: { attribute: (window) => { asked.push(window); return blame; } },
+    health: { record: (name, entry) => rows.push([name, entry]) },
   });
   clock = 1000;
   tick();
-  clock = 4400;
+  rows.length = 0; // the first heartbeat
+  clock = 8400;
   tick();
-  assert.deepEqual(lines, ['keep serve: event loop stalled 2400ms during handoff-queue\n']);
-  assert.deepEqual(asked, [{ since: 1000, due: 2000, at: 4400 }], 'asked only on a stall, for the window since the last landing');
+  assert.deepEqual(lines, ['keep serve: event loop stalled 6400ms during handoff-queue\n']);
+  assert.deepEqual(asked, [{ since: 1000, due: 2000, at: 8400 }], 'asked only on a stall, for the window since the last landing');
+  assert.equal(rows[0][1].at, 1e12 + 8400, 'the health record keeps wall time');
+  assert.equal(rows[0][1].error, 'event loop stalled over 5s during handoff-queue');
+
+  blame = { name: 'POST /api/send', likely: true };
+  clock = 12000;
+  tick();
+  assert.equal(lines[1], 'keep serve: event loop stalled 2600ms during likely POST /api/send\n');
 });
 
-// The loop-stalls row: unhealthy exactly while a >5 s stall is inside the hour, one
-// failure per episode, so self-repair's five-consecutive-failures rule never sees
-// one stall as five.
-test('the loop-stalls row counts episodes, heartbeats with skips, and clears after an hour', () => {
+// Node's timers run on a clock that stops while the machine sleeps; Date.now does
+// not. Measured on the wall clock, every lid-close was a stall the length of the
+// sleep.
+test('a sleep is no stall: the probe measures on the monotonic clock', () => {
+  const lines = [];
+  const rows = [];
+  let mono = 0;
+  let wall = 1e12;
+  let tick = null;
+  startLoopLagProbe({
+    write: (line) => lines.push(line),
+    setInterval: (fn) => { tick = fn; return { unref() {} }; },
+    now: () => mono,
+    wallNow: () => wall,
+    holds: noHolds,
+    health: { record: (name, entry) => rows.push([name, entry]) },
+  });
+  mono = 1000; wall += 1000;
+  tick();
+  rows.length = 0;
+  // An hour asleep: the wall clock moves, the monotonic clock and the timer do not.
+  wall += 3600e3;
+  mono = 2000; wall += 1000;
+  tick();
+  assert.deepEqual(lines, [], 'nothing logged');
+  assert.deepEqual(rows.filter(([, entry]) => entry.ok === false || entry.skipped), [], 'no failure recorded, only the ok heartbeat');
+});
+
+test('a monotonic lag past five minutes is logged as a clock jump, never a stall', () => {
+  const lines = [];
+  const rows = [];
+  let clock = 0;
+  let tick = null;
+  startLoopLagProbe({
+    write: (line) => lines.push(line),
+    setInterval: (fn) => { tick = fn; return { unref() {} }; },
+    now: () => clock,
+    wallNow: () => 1e12 + clock,
+    holds: { attribute: () => { throw new Error('a jump is not attributed'); } },
+    health: { record: (name, entry) => rows.push([name, entry]) },
+  });
+  clock = 1000;
+  tick();
+  rows.length = 0;
+  clock = 2000 + 20 * 60e3;
+  tick();
+  assert.deepEqual(lines, [`keep serve: clock jumped ${20 * 60e3}ms (suspend?)\n`]);
+  assert.equal(rows.filter(([, entry]) => entry.ok === false).length, 0, 'no failure on the row');
+  clock += 1000;
+  tick();
+  assert.equal(lines.length, 1, 'once per occurrence');
+});
+
+// The loop-stalls row: unhealthy exactly while a >5 s stall is inside the hour,
+// with failures rate limited to one per ten minutes. Self-repair excludes the row.
+test('the loop-stalls row rate-limits failures, heartbeats with skips, and clears after an hour', () => {
   const { createLoopStallHealth } = require('./serve/schedulers.js');
   const rows = [];
   const stalls = createLoopStallHealth({ health: { record: (name, entry) => rows.push([name, entry]) } });
@@ -264,31 +333,33 @@ test('the loop-stalls row counts episodes, heartbeats with skips, and clears aft
   stalls.tick(0);
   assert.deepEqual(rows.shift(), ['loop-stalls', { cadenceMs: 5 * MIN, at: 0, ok: true, detail: 'no stalls in the last hour' }]);
 
-  stalls.stall(MIN, 1200, 'turn-index');
+  stalls.stall(MIN, 1200, 'turn-ticks');
   stalls.tick(MIN);
   assert.deepEqual(rows, [], 'a short stall is detail, not a failure, and the heartbeat waits for its cadence');
 
   stalls.stall(2 * MIN, 7200, 'handoff-queue');
   assert.deepEqual(rows.shift(), ['loop-stalls', {
     cadenceMs: 5 * MIN, at: 2 * MIN, ok: false,
-    error: 'event loop stalled 7200ms during handoff-queue',
+    error: 'event loop stalled over 5s during handoff-queue',
     detail: '2 stalls in the last hour, worst 7200ms during handoff-queue',
   }]);
-  stalls.stall(3 * MIN, 9000, 'handoff-queue');
-  assert.deepEqual(rows, [], 'a second severe stall inside ten minutes is the same episode');
+  stalls.stall(3 * MIN, 9000, null);
+  assert.deepEqual(rows, [], 'a second severe stall inside ten minutes records no second failure');
 
   stalls.tick(7 * MIN);
   assert.deepEqual(rows.shift(), ['loop-stalls', {
     cadenceMs: 5 * MIN, at: 7 * MIN, skipped: true,
-    detail: '3 stalls in the last hour, worst 9000ms during handoff-queue',
+    detail: '3 stalls in the last hour, worst 9000ms',
   }], 'the heartbeat keeps the streak without adding to it');
 
-  stalls.tick(64 * MIN);
+  stalls.stall(13 * MIN, 6000, null);
+  assert.equal(rows.shift()[1].error, 'event loop stalled over 5s', 'ten minutes on, a storm records its next failure');
+
+  stalls.tick(74 * MIN);
   assert.deepEqual(rows.shift(), ['loop-stalls', {
-    cadenceMs: 5 * MIN, at: 64 * MIN, ok: true, detail: 'no stalls in the last hour',
+    cadenceMs: 5 * MIN, at: 74 * MIN, ok: true, detail: 'no stalls in the last hour',
   }], 'an hour after the last severe stall the row is ok again');
 });
-
 
 // The receipts poller: one timer, rescheduled after each run, and a run that
 // outlasts its cadence is never joined by a second one.
