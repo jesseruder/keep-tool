@@ -88,6 +88,30 @@ const BOOLEAN_FLAGS = Object.freeze({
   resume: ['raw'],
 });
 
+// The arguments each registry command resolves as a project (keep-core
+// resolveProjectArg, or list's own matcher), by flag and by position in o._. The
+// daemon runs a node's command in the node's project directory, not the directory
+// the node was in, so a relative path there names something else: from a node a
+// project must be absolute, `~`-prefixed, or a bare name.
+const PROJECT_FLAGS = Object.freeze({
+  add: ['--project'],
+  list: ['--project'],
+});
+const PROJECT_POSITIONS = Object.freeze({
+  project: [1],
+  who: [0],
+  hold: [0],
+  resources: [0],
+  notes: [0],
+});
+
+function projectRefusal(value) {
+  const text = String(value);
+  if (text.startsWith('/') || text === '~' || text.startsWith('~/')) return null;
+  if (text && !text.includes('/') && !text.includes('\\') && text !== '.' && text !== '..' && !text.startsWith('~')) return null;
+  return `project "${text}" is relative to a directory the daemon does not share; give it as an absolute path, ~/…, or a bare project name`;
+}
+
 function isBooleanFlag(command, name) {
   return Object.prototype.hasOwnProperty.call(BOOLEAN_FLAGS, command) && BOOLEAN_FLAGS[command].includes(name);
 }
@@ -116,6 +140,10 @@ function argumentRefusal(command, args, identity = {}) {
   let positional = false;
   let message = -1;
   let value = -1;
+  let valueFlag = null;
+  let position = 0;
+  const projectFlags = Object.prototype.hasOwnProperty.call(PROJECT_FLAGS, command) ? PROJECT_FLAGS[command] : [];
+  const projectPositions = Object.prototype.hasOwnProperty.call(PROJECT_POSITIONS, command) ? PROJECT_POSITIONS[command] : [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (i === message) continue;
@@ -131,16 +159,41 @@ function argumentRefusal(command, args, identity = {}) {
       const own = flag === '--session' ? identity.session : identity.node;
       if (!own || named !== own) return `${flag} must name the caller's own ${flag.slice(2)}`;
     }
+    if (flag && eq >= 0 && projectFlags.includes(flag)) {
+      const refusal = projectRefusal(arg.slice(eq + 1));
+      if (refusal) return refusal;
+    }
     if (positional || i === value || arg === '--' || !arg.startsWith('-') || arg === '-') {
       if (newline(arg)) return NEWLINE;
+      if (i === value) {
+        if (projectFlags.includes(valueFlag)) {
+          const refusal = projectRefusal(arg);
+          if (refusal) return refusal;
+        }
+      } else if (positional || arg !== '--') {
+        if (projectPositions.includes(position)) {
+          const refusal = projectRefusal(arg);
+          if (refusal) return refusal;
+        }
+        position += 1;
+      }
       if (!positional && i !== value && arg === '--') positional = true;
       continue;
     }
     if (arg === '-m') { message = i + 1; continue; }
     if (newline(arg)) return NEWLINE;
-    if (flag && eq < 0 && !isBooleanFlag(command, flag.slice(2))) value = i + 1;
+    // A single-dash argument other than -m is positional to parseArgs.
+    if (!flag) {
+      if (projectPositions.includes(position)) {
+        const refusal = projectRefusal(arg);
+        if (refusal) return refusal;
+      }
+      position += 1;
+      continue;
+    }
+    if (flag && eq < 0 && !isBooleanFlag(command, flag.slice(2))) { value = i + 1; valueFlag = flag; }
   }
   return null;
 }
 
-module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, BOOLEAN_FLAGS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, BOOLEAN_FLAGS, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

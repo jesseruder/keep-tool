@@ -78,7 +78,7 @@ test('a registry command on a node with a daemon URL is posted to the daemon and
   const { idempotencyKey, ...rest } = request.body;
   assert.match(idempotencyKey, /^[a-f0-9]{32}$/);
   assert.deepEqual(rest, {
-    command: 'checkin', args: ['some-card', '-m', 'line one\nline two'], cwd: root,
+    command: 'checkin', args: ['some-card', '-m', 'line one\nline two'], cwd: root, nodeCwd: root,
     session: 'sess-aws1', agent: 'claude', pane: 'p7@aws1',
   });
   // No session in the environment: none is claimed.
@@ -250,4 +250,23 @@ test('a missing or unsafe token file is a clear error and nothing is sent', asyn
   assert.equal(badUrl.status, 2);
   assert.match(badUrl.stderr, /KEEP_DAEMON_URL must be http/);
   assert.equal(daemon.requests.length, 0);
+});
+
+test('from a linked worktree the node sends its main checkout as the cwd, and the worktree only as nodeCwd', async (t) => {
+  const daemon = await stubDaemon(t, () => ({ status: 200, body: { ok: true, status: 0, stdout: '', stderr: '', durationMs: 1, replayed: false } }));
+  const { root, env } = nodeEnv(t, { CLAUDE_CODE_SESSION_ID: 'sess-aws1' });
+  env.KEEP_DAEMON_URL = daemon.url;
+  const main = path.join(root, 'project');
+  const tree = path.join(root, 'project-wt');
+  const git = (...args) => require('node:child_process').execFileSync('git', args, { encoding: 'utf8', env: { ...env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.test', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.test' } });
+  git('init', '-q', '--initial-branch=master', main);
+  git('-C', main, 'commit', '-q', '--allow-empty', '-m', 'base');
+  git('-C', main, 'worktree', 'add', '-q', '-b', 'wt/x', tree);
+  fs.mkdirSync(path.join(tree, 'sub'));
+  await run(['claim', 'some-card'], { env, cwd: tree });
+  await run(['show', 'some-card'], { env, cwd: path.join(tree, 'sub') });
+  await run(['show', 'some-card'], { env, cwd: main });
+  assert.deepEqual(daemon.requests.map((request) => [request.body.cwd, request.body.nodeCwd]), [
+    [main, tree], [main, path.join(tree, 'sub')], [main, main],
+  ]);
 });

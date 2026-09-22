@@ -87,6 +87,17 @@ function validateRequest(body, caller, deps) {
   const refusal = argumentRefusal(command, args, { session, node: caller });
   if (refusal) refuse(400, refusal);
   const cwd = checkedCwd(body.cwd, deps.io);
+  // Where the node's command was typed: named in the journal digest and the logs,
+  // never used as a directory here, so it need not exist on the daemon.
+  let nodeCwd = null;
+  if (body.nodeCwd !== undefined && body.nodeCwd !== null) {
+    if (typeof body.nodeCwd !== 'string' || !body.nodeCwd || body.nodeCwd.includes('\0') || !path.isAbsolute(body.nodeCwd)
+      || /[\r\n]/.test(body.nodeCwd) || Buffer.byteLength(body.nodeCwd) > 4096) {
+      refuse(400, 'nodeCwd must be an absolute path');
+    }
+    if (body.nodeCwd.split(/[\\/]+/).includes('..')) refuse(400, 'nodeCwd may not contain ..');
+    nodeCwd = body.nodeCwd;
+  }
   let resolvedAgent = null;
   if (session !== null) {
     let where = null;
@@ -104,13 +115,14 @@ function validateRequest(body, caller, deps) {
     if (parsed.node !== caller) refuse(403, `pane ${body.pane} is not on node ${caller}`);
     pane = deps.formatPaneRef(parsed.node, parsed.paneId);
   }
-  return { command, args: [...args], cwd, session, agent: resolvedAgent, pane, idempotencyKey };
+  return { command, args: [...args], cwd, ...(nodeCwd !== null ? { nodeCwd } : {}), session, agent: resolvedAgent, pane, idempotencyKey };
 }
 
 function digestOf(request) {
-  return crypto.createHash('sha256')
-    .update(JSON.stringify([request.command, request.args, request.cwd, request.session, request.agent, request.pane]))
-    .digest('hex');
+  const fields = [request.command, request.args, request.cwd, request.session, request.agent, request.pane];
+  // Only when sent, so a request without one digests as it always did.
+  if (request.nodeCwd) fields.push(request.nodeCwd);
+  return crypto.createHash('sha256').update(JSON.stringify(fields)).digest('hex');
 }
 
 function createRegistryService(options = {}) {
@@ -310,7 +322,7 @@ function createRegistryService(options = {}) {
           writeJournal(file, { version: 1, node: caller, digest, at: new Date(now()).toISOString(), response });
           return { response, journaled: true };
         } catch (error) {
-          log(`registry: ${caller} ran keep ${request.command} but its journal entry could not be written: ${error.message}`);
+          log(`registry: ${caller} ran keep ${request.command}${request.nodeCwd ? ` from ${request.nodeCwd}` : ''} but its journal entry could not be written: ${error.message}`);
           return { response, journaled: false };
         }
       });

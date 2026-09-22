@@ -77,11 +77,17 @@ function nodeApiRequest(base, pathname, { method = 'POST', payload, token, timeo
 // The body a registry command is forwarded with. The session and agent come from
 // this process's environment exactly as keep-core.currentSession reads them, and a
 // pane from KEEP_PANE, qualified with this node's name.
-function registryBody(command, args, { env = process.env, cwd = process.cwd(), where, key } = {}) {
+//
+// `cwd` is the project, not the directory: a linked worktree's main checkout
+// (keep-core.canonicalCwd, computed here where the worktree is), which the daemon
+// has at the same path because the fleet shares one home. The directory itself goes
+// as `nodeCwd`, for the daemon's journal and logs only.
+function registryBody(command, args, { env = process.env, cwd = process.cwd(), where, key, canonical } = {}) {
   const core = require('./keep-core.js');
   const session = core.currentSession({ env });
+  const project = (canonical || core.canonicalCwd)(cwd);
   const body = {
-    command, args: [...args], cwd,
+    command, args: [...args], cwd: project, nodeCwd: cwd,
     idempotencyKey: key || crypto.randomBytes(16).toString('hex'),
   };
   if (session) { body.session = session.id; body.agent = session.agent; }

@@ -200,6 +200,21 @@ test('arguments are checked the way the CLI will read them', (t) => {
   assert.match(argumentRefusal('decide', ['t', '--session=other'], { session: 'me', node: 'aws1' }), /caller's own session/);
 });
 
+test('a project named relative to the node\'s directory is refused; absolute, ~ and bare names are not', () => {
+  const relative = /is relative to a directory the daemon does not share/;
+  for (const [command, args] of [
+    ['add', ['Title', '--project', './x']], ['add', ['Title', '--project', 'x/y']], ['add', ['Title', '--project=../x']],
+    ['list', ['--project', '.']], ['list', ['--project', '..']], ['project', ['card', './x']], ['project', ['card', 'code/x']],
+    ['project', ['-card', '../x']], ['who', ['./x']], ['who', ['--json', 'x/y']], ['hold', ['--for', '+15m', '../x', '-m', 'why']],
+    ['resources', ['./x', '--json']], ['notes', ['--all', '.']], ['notes', ['--', '../x']], ['add', ['Title', '--project', '~other/x']],
+  ]) assert.match(String(argumentRefusal(command, args)), relative, `${command} ${args.join(' ')}`);
+  for (const [command, args] of [
+    ['add', ['Title', '--project', '/srv/x']], ['add', ['a/b title', '--project', 'keep-tool']], ['list', ['--project', '~/code/x']],
+    ['list', ['--project', '~']], ['project', ['card']], ['project', ['card', 'keep-tool']], ['who', ['keep-tool']],
+    ['hold', ['/srv/x', '--for', '+15m', '-m', 'a/b']], ['notes', []], ['checkin', ['card', '--next', 'x/y', '-m', 'a/b']],
+  ]) assert.equal(argumentRefusal(command, args), null, `${command} ${args.join(' ')}`);
+});
+
 test('the request fields are validated before anything runs', async (t) => {
   const { svc, root, calls } = service(t);
   const cases = [
@@ -503,4 +518,54 @@ test('a journal write that fails after the run still answers the result, marked 
   const normal = await svc.handle(AWS1, body(root, { idempotencyKey: `${KEY}-ok` }));
   assert.equal(normal.status, 200);
   assert.equal('journaled' in normal.body, false);
+});
+
+test('add --claim and claim from a node worktree file the card under the main checkout', async (t) => {
+  const root = tempDir(t);
+  const home = path.join(root, 'home');
+  const registry = path.join(home, 'keep');
+  for (const dir of ['tasks', 'archive', 'digests']) fs.mkdirSync(path.join(registry, dir), { recursive: true });
+  const gitEnv = { ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.test', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.test' };
+  delete gitEnv.CLAUDE_CODE_SESSION_ID;
+  const git = (...args) => { const r = spawnSync('git', args, { env: gitEnv, encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr); };
+  git('init', '-q', registry);
+  git('-C', registry, 'config', 'user.name', 'Keep Test');
+  git('-C', registry, 'config', 'user.email', 'keep@example.test');
+  const main = path.join(home, 'project');
+  const tree = path.join(home, 'wt', 'project', 'x');
+  git('init', '-q', '--initial-branch=master', main);
+  git('-C', main, 'commit', '-q', '--allow-empty', '-m', 'base');
+  git('-C', main, 'worktree', 'add', '-q', '-b', 'wt/x', tree);
+  const svc = createRegistryService({
+    root: registry,
+    daemonNode: () => 'main',
+    location: (id) => (id === 'sess-aws1' ? { node: 'aws1', agent: 'claude' } : null),
+    env: { PATH: process.env.PATH, HOME: home, LANG: 'C' },
+    configFile: path.join(root, 'config.json'),
+  });
+  const { registryBody } = require('./remote-cli.js');
+  const where = { local: 'aws1', daemon: 'main' };
+  const nodeEnv = { CLAUDE_CODE_SESSION_ID: 'sess-aws1', KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main' };
+  const send = async (command, args, key) => {
+    const request = registryBody(command, args, { env: nodeEnv, cwd: tree, where, key });
+    assert.equal(request.cwd, main);
+    assert.equal(request.nodeCwd, tree);
+    const answer = await svc.handle(AWS1, request);
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    assert.equal(answer.body.status, 0, answer.body.stderr);
+    return answer.body;
+  };
+  await send('add', ['Node work', '--claim', '-m', 'Started.'], 'claim-add-0123456789');
+  const card = fs.readFileSync(path.join(registry, 'tasks', 'node-work.md'), 'utf8');
+  assert.match(card, /^project: ~\/project$/m);
+  assert.match(card, /sess-aws1/);
+  await send('add', ['Filed work', '--file', '-m', 'Filed.'], 'file-add-0123456789');
+  await send('claim', ['filed-work'], 'claim-card-0123456789');
+  const filed = fs.readFileSync(path.join(registry, 'tasks', 'filed-work.md'), 'utf8');
+  assert.match(filed, /^project: ~\/project$/m);
+  assert.match(filed, /sess-aws1/);
+  // A project relative to the node's directory never reaches the CLI.
+  const relative = await svc.handle(AWS1, registryBody('add', ['Elsewhere', '--project', './sub', '-m', 'x'], { env: nodeEnv, cwd: tree, where, key: 'relative-0123456789' }));
+  assert.equal(relative.status, 400);
+  assert.match(relative.body.error, /is relative to a directory the daemon does not share/);
 });
