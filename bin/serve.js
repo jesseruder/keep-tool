@@ -3938,11 +3938,77 @@ function compactionSwappedModel(deps = {}) {
 // safely" on exactly that row. The legacy alias value is read as the default id, so a
 // daemon still configured with `KEEP_COMPACT_VIA_MODEL=opus` types the id too; any other
 // value, full id or not, is typed as configured.
-const COMPACT_VIA_DEFAULT_MODEL = 'claude-opus-5-5';
+//
+// The default is "the latest Opus", not a pinned release: the newest `claude-opus-*` id
+// a session's transcript has reported (`message.model` is always the full id). Every turn
+// scan offers its model to `noteSeenModel`, and the newest Opus is kept in
+// .keep/compact/latest-opus.json so a restart does not forget it. The floor is only a
+// lower bound — what types before any scan has seen a newer Opus — never a pin.
+const COMPACT_VIA_FLOOR_MODEL = 'claude-opus-5-5';
 
-function compactViaModel() {
-  const value = envString('KEEP_COMPACT_VIA_MODEL', COMPACT_VIA_DEFAULT_MODEL);
-  return value.toLowerCase() === 'opus' ? COMPACT_VIA_DEFAULT_MODEL : value;
+// [major, minor] for a bare `claude-opus-<major>[-<minor>]` release id, with or without a
+// window suffix; null for anything else, including a date-suffixed snapshot.
+function opusModelVersion(model) {
+  const match = /^claude-opus-(\d{1,3})(?:-(\d{1,3}))?(?:\[1m\])?$/i.exec(String(model || '').trim());
+  return match ? [Number(match[1]), Number(match[2] || 0)] : null;
+}
+
+function newerOpus(a, b) {
+  const va = opusModelVersion(a);
+  const vb = opusModelVersion(b);
+  if (!vb) return false;
+  if (!va) return true;
+  return vb[0] > va[0] || (vb[0] === va[0] && vb[1] > va[1]);
+}
+
+function latestOpusModel(models = [], floor = COMPACT_VIA_FLOOR_MODEL) {
+  let best = floor;
+  for (const raw of models || []) {
+    const model = String(raw || '').trim().replace(/\[1m\]$/i, '').toLowerCase();
+    if (newerOpus(best, model)) best = model;
+  }
+  return best;
+}
+
+function latestOpusFile() {
+  return path.join(autoCompactDir(), 'latest-opus.json');
+}
+
+// Read once per file and then kept in memory; `noteSeenModel` updates both.
+const latestOpusSeen = new Map();
+
+function readLatestOpusSeen(file = latestOpusFile()) {
+  if (!latestOpusSeen.has(file)) {
+    let model = '';
+    try {
+      const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (opusModelVersion(value && value.model)) model = String(value.model).toLowerCase();
+    } catch {}
+    latestOpusSeen.set(file, model);
+  }
+  return latestOpusSeen.get(file);
+}
+
+// Called with every model a turn scan reads. Writes only when a newer Opus appears, which
+// is once per release, so the scan path costs a string compare.
+function noteSeenModel(model, file = latestOpusFile()) {
+  const candidate = String(model || '').trim().replace(/\[1m\]$/i, '').toLowerCase();
+  if (!opusModelVersion(candidate) || !newerOpus(readLatestOpusSeen(file), candidate)) return;
+  latestOpusSeen.set(file, candidate);
+  const temp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(temp, `${JSON.stringify({ model: candidate, at: new Date().toISOString() })}\n`, { mode: 0o600 });
+    fs.renameSync(temp, file);
+  } catch {
+    try { fs.unlinkSync(temp); } catch {}
+  }
+}
+
+function compactViaModel(seen) {
+  const value = envString('KEEP_COMPACT_VIA_MODEL', 'opus');
+  if (value.toLowerCase() !== 'opus') return value;
+  return latestOpusModel(seen !== undefined ? seen : [readLatestOpusSeen()]);
 }
 
 function compactSwapPlan(session, opts) {
@@ -7098,6 +7164,7 @@ function sessionLastTurn(session, deps = {}) {
       const settings = codexCompact.readRolloutSettings(file, deps);
       if (settings?.model) result.model = settings.model;
     }
+    if (session.kind === 'claude') noteSeenModel(result.model);
     return result;
   }
   catch { return { contextTokens: 0, model: '' }; }
@@ -13055,6 +13122,9 @@ module.exports = {
   compactSwapUserModelChoice,
   compactModelResetAt,
   compactViaModel,
+  latestOpusModel,
+  noteSeenModel,
+  readLatestOpusSeen,
   shutdownSettingsRepair,
   readClaudeSettingsModel,
   linesAfterLastEcho,

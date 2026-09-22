@@ -146,6 +146,9 @@ const {
   compactSwapUserModelChoice,
   compactModelResetAt,
   compactViaModel,
+  latestOpusModel,
+  noteSeenModel,
+  readLatestOpusSeen,
 } = require('./serve.js');
 const { createScreenHistoryCache } = require('./screen-history.js');
 
@@ -12254,15 +12257,35 @@ test('the model-exhausted decision carries the reset time its restore must wait 
 test('the compaction switch types a full model id, with the 1M window the restore carries', () => {
   const prior = process.env.KEEP_COMPACT_VIA_MODEL;
   try {
+    const seen = ['claude-fable-5-1[1m]', 'claude-opus-5-6[1m]', 'claude-opus-5', 'claude-opus-4-8', ''];
     delete process.env.KEEP_COMPACT_VIA_MODEL;
-    assert.equal(compactViaModel(), 'claude-opus-5-5');
+    assert.equal(compactViaModel(seen), 'claude-opus-5-6', 'the default is the newest Opus a transcript reported');
+    assert.equal(compactViaModel([]), 'claude-opus-5-5', 'before a newer Opus is seen, the floor types');
     process.env.KEEP_COMPACT_VIA_MODEL = 'opus';
-    assert.equal(compactViaModel(), 'claude-opus-5-5', 'the legacy alias default reads as the id');
+    assert.equal(compactViaModel(seen), 'claude-opus-5-6', 'the alias reads as the latest full id');
     process.env.KEEP_COMPACT_VIA_MODEL = 'claude-sonnet-5';
-    assert.equal(compactViaModel(), 'claude-sonnet-5');
+    assert.equal(compactViaModel(seen), 'claude-sonnet-5');
+    process.env.KEEP_COMPACT_VIA_MODEL = 'claude-opus-5';
+    assert.equal(compactViaModel(seen), 'claude-opus-5', 'a configured full id is never upgraded');
   } finally {
     if (prior === undefined) delete process.env.KEEP_COMPACT_VIA_MODEL; else process.env.KEEP_COMPACT_VIA_MODEL = prior;
   }
+  assert.equal(latestOpusModel(['claude-opus-5-10', 'claude-opus-5-9'], 'claude-opus-5'), 'claude-opus-5-10');
+  assert.equal(latestOpusModel(['claude-opus-6', 'claude-opus-5-9'], 'claude-opus-5'), 'claude-opus-6');
+  assert.equal(latestOpusModel(['claude-opus-4-8'], 'claude-opus-5'), 'claude-opus-5', 'an older release never undercuts the floor');
+  assert.equal(latestOpusModel(['claude-opus-7-20270101', 'claude-fable-9', 'opus', '<synthetic>'], 'claude-opus-5'),
+    'claude-opus-5', 'snapshots, other families and aliases are not releases');
+  assert.equal(latestOpusModel(['Claude-Opus-5-6[1M]'], 'claude-opus-5'), 'claude-opus-5-6', 'the window suffix and case are dropped');
+  const opusRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-latest-opus-'));
+  try {
+    const file = path.join(opusRoot, 'compact', 'latest-opus.json');
+    assert.equal(readLatestOpusSeen(file), '');
+    noteSeenModel('claude-opus-6[1m]', file);
+    noteSeenModel('claude-opus-5-9', file);
+    noteSeenModel('claude-fable-7', file);
+    assert.equal(readLatestOpusSeen(file), 'claude-opus-6', 'only a newer Opus replaces what was seen');
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).model, 'claude-opus-6', 'and it is written for the next daemon');
+  } finally { fs.rmSync(opusRoot, { recursive: true, force: true }); }
   const session = { kind: 'claude', model: 'claude-fable-5-1' };
   const opts = { via: 'claude-opus-5', families: ['fable'] };
   assert.equal(compactSwapPlan(session, { ...opts, settingsModel: 'claude-fable-5-1[1m]' }).switchCommand, '/model claude-opus-5[1m]');
