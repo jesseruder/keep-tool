@@ -34,13 +34,16 @@ const DEV_TOOLS = new RegExp([
   String.raw`(?:^|[\s/])(?:npx|pnpx|bunx|npm\s+exec|pnpm\s+exec|pnpm\s+dlx|yarn)\s+(?:--?\S+\s+)*` + SERVE_TOOLS,
   String.raw`node_modules/\.bin/` + SERVE_TOOLS,
   // Server processes and orphaned test workers, by the package they run from.
-  String.raw`node_modules/(?:next/dist/server/|metro/|@react-native-community/cli|@expo/cli/|webpack-dev-server/|nodemon/|@storybook/|vitest/dist/workers/|jest-worker/)`,
+  String.raw`node_modules/(?:next/dist/server/|metro/|@react-native-community/cli|@expo/cli/|webpack-dev-server/|nodemon/|@storybook/)`,
   String.raw`^next-server\b`,
   // Watch modes, and the usual Python and Ruby development servers.
   String.raw`\s--watch(?:All)?(?:[\s=]|$)`,
   String.raw`-m\s+http\.server|manage\.py\s+runserver|flask\s+run|uvicorn\s.*--reload|rails\s+s(?:erver)?(?:\s|$)|jekyll\s+serve|hugo\s+server`,
 ].join('|'));
 // A listening port only counts as a server for these runtimes, and never a debugger's.
+// A test worker is a leftover only when it is the tree's root: under a live runner it is
+// part of a finite run, which is never stopped.
+const ORPHAN_WORKERS = /node_modules\/(?:vitest\/dist\/workers\/|jest-worker\/)/;
 const PORT_RUNTIMES = /^(?:node|nodejs|deno|bun)$/;
 const SESSION_VARS = ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'KEEP_PI_SESSION_ID'];
 const NAMES = ['KEEP_PANE', 'KEEP_PERSIST', 'KEEP_DIR', ...SESSION_VARS];
@@ -265,7 +268,7 @@ async function snapshot(deps = {}) {
       identities: [row, ...tree].map(identity),
       due: goneFor >= graceMs,
       reason: pane ? `pane ${vars.KEEP_PANE} exited` : `pane ${vars.KEEP_PANE} is closed`,
-      tool: [row, ...tree].some((member) => DEV_TOOLS.test(member.command)),
+      tool: ORPHAN_WORKERS.test(row.command) || [row, ...tree].some((member) => DEV_TOOLS.test(member.command)),
     });
   }
   const portable = (pid) => {

@@ -189,7 +189,7 @@ test('a one-off job still working is never stopped; the same tree serving a port
 
 test('servers, watchers and orphaned test workers are recognised; one-off jobs are not', () => {
   for (const command of ['npm run dev', 'pnpm dev', 'yarn start', 'bun run dev:web', 'node /r/node_modules/.bin/next dev',
-    'npm exec react-native start --client-logs --port 8082', 'npx expo start', 'node /r/node_modules/vitest/dist/workers/forks.js',
+    'npm exec react-native start --client-logs --port 8082', 'npx expo start',
     'python3 -m http.server', 'uv run flask run', 'node /r/node_modules/.bin/jest --watch', 'npx vite', 'npx serve dist',
     'node /r/node_modules/.bin/vite --port 3000', 'next-server (v15.1.0)', 'node /r/node_modules/next/dist/server/lib/start-server.js', 'npx tsc --watch']) {
     assert.equal(leftovers.DEV_TOOLS.test(command), true, command);
@@ -200,6 +200,21 @@ test('servers, watchers and orphaned test workers are recognised; one-off jobs a
     'next build', 'npx vite build', 'node scripts/replay.js --all', 'bash migrate.sh', 'node /r/node_modules/typescript/bin/tsc -p .', 'torchrun train.py']) {
     assert.equal(leftovers.DEV_TOOLS.test(command), false, command);
   }
+});
+
+test('a finite test run keeps its workers; an orphaned worker is a leftover', async () => {
+  for (const [root, worker] of [['node /r/node_modules/.bin/vitest run', 'node /r/node_modules/vitest/dist/workers/forks.js'],
+    ['node /r/node_modules/.bin/jest --ci', 'node /r/node_modules/jest-worker/build/workers/processChild.js'],
+    ['bash ./bench-builds.sh', 'node /r/node_modules/jest-worker/build/workers/processChild.js']]) {
+    const f = fixture();
+    f.state.rows[0].command = root;
+    f.state.rows[1].command = worker;
+    assert.equal((await leftovers.list(f.deps)).leftovers.length, 0, root);
+  }
+  const f = fixture();
+  f.state.rows[0].command = 'node /r/node_modules/vitest/dist/workers/forks.js';
+  f.state.rows[1].command = 'node helper.js';
+  assert.equal((await leftovers.list(f.deps)).leftovers.length, 1);
 });
 
 test('a listening port counts only for a node, deno or bun process that is not a debugger', async () => {
