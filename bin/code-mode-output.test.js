@@ -62,6 +62,44 @@ test('computed non-child dispatch resolves only immutable literal tool names', (
   assert.equal(hasChildCall('tools['), true);
 });
 
+test('an ALL_TOOLS.find by a $-anchored regex is not a child call unless its literal tail could end a child name', () => {
+  const { hasChildCall } = require('./code-mode-polls');
+  for (const code of [
+    'const t=ALL_TOOLS.find(x=>/mcp__browser__tabs_context_mcp$/.test(x.name));text(await tools[t.name]({}));\n',
+    'const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));text(await tools[t.name]({}));',
+    'const t=ALL_TOOLS.find(x=>/^mcp__.*__get_page_text$/i.test(x.name));const r=await tools[t.name]({tabId:1});text(r[0]);',
+    'const t=ALL_TOOLS.find(x=>/browser\\.navigate$/.test(x.name));await tools[t.name]({});',
+  ]) assert.equal(hasChildCall(code), false, code);
+  for (const code of [
+    'const t=ALL_TOOLS.find(x=>/agent$/.test(x.name));await tools[t.name]({});', // could be spawn_agent
+    'const t=ALL_TOOLS.find(x=>/xspawn_agent$/.test(x.name));await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/SEND_INPUT$/i.test(x.name));await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/spawn_agent|tabs_mcp$/.test(x.name));await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/tabs_mcp/.test(x.name));await tools[t.name]({});', // unanchored
+    'const t=ALL_TOOLS.find(x=>/tabs_mcp$/m.test(x.name));await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/tabs_mc+$/.test(x.name));await tools[t.name]({});', // tail is a quantifier
+    'const t=ALL_TOOLS.find(x=>/tabs_[a-z]*$/.test(x.name));await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/tabs_mcp\\w$/.test(x.name));await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/tabs_mcp\\$/.test(x.name));await tools[t.name]({});', // literal $, unanchored
+    'const t=ALL_TOOLS.find(x=>/tabs_mcp$/.test(x.name));RegExp.prototype.test=()=>true;await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/tabs_mcp$/.test(x.name));o[k]=1;await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/tabs_mcp$/.test(x.label));await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/tabs_mcp$/.test(y.name));await tools[t.name]({});',
+  ]) assert.equal(hasChildCall(code), true, code);
+});
+
+test('anchoredSuffix returns only a certain literal tail', () => {
+  const { anchoredSuffix } = require('./static-tool-names');
+  const tail = (pattern, flags = '') => anchoredSuffix({ pattern, flags });
+  assert.equal(tail('mcp__browser__tabs_context_mcp$'), 'mcp__browser__tabs_context_mcp');
+  assert.equal(tail('^mcp__.*__get_page$'), '__get_page');
+  assert.equal(tail('a\\.b$'), 'a.b');
+  assert.equal(tail('ABC$', 'i'), 'abc');
+  assert.equal(tail('(?:x)?d$'), 'd');
+  for (const [pattern, flags] of [['abc', ''], ['a|b$', ''], ['abc$', 'g'], ['abc$', 'u'], ['ab(c)$', ''], ['ab{2}$', ''],
+    ['ab?$', ''], ['a[b$]', ''], ['a\\d$', ''], ['a\\$', ''], ['$', ''], ['a(?=b)$', '']]) assert.equal(tail(pattern, flags), null, pattern);
+});
+
 test('replay disproves obsolete dynamic-dispatch launch hints without dropping owned children', () => {
   const state = { restart: { completed: true, children: { child: 'owned' }, launches: { old: true }, mapped: {} } };
   require('./restart-evidence').consume(state, { type: 'response_item', payload: { type: 'custom_tool_call', call_id: 'old', name: 'exec',

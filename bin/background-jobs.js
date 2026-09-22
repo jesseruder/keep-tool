@@ -13,7 +13,7 @@ const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
 const STICKY_GAP_REASONS = new Set(['transcript-replaced', 'checkpoint-anchor', 'hook-transcript-mismatch']);
 // 3: the reducer reads `system`/local_command stdout and stderr rows as proof a
 // typed slash command finished; older ledgers must replay to settle a failed /compact.
-const restartVersion = agent => agent === 'claude' ? 3 : 1;
+const restartVersion = agent => agent === 'claude' ? 3 : 2;
 const hash = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const text = (v) => typeof v === 'string' ? v : Array.isArray(v) ? v.filter(x => ['text', 'input_text', 'output_text'].includes(x?.type)).map(x => x.text || '').join('\n') : '';
 

@@ -96,7 +96,11 @@ function simplePolls(code) {
 
 function hasChildCall(code) {
   if (typeof code !== 'string') return false;
-  const names = /(?:^|[._])(?:spawn_agent|spawn_agents|followup_task|send_input)$/;
+  const children = ['spawn_agent', 'spawn_agents', 'followup_task', 'send_input'];
+  const names = new RegExp(`(?:^|[._])(?:${children.join('|')})$`);
+  // A name known only by its suffix is a child call when either could end the other.
+  const child = known => Array.isArray(known) ? known.some(name => names.test(name))
+    : children.some(name => name.endsWith(known.suffix) || known.suffix.endsWith(name));
   try {
     if (code.length > 2 * 1024 * 1024) throw Error('oversized code');
     const ast = require('acorn').parse(code, { ecmaVersion: 'latest', sourceType: 'module' });
@@ -108,7 +112,7 @@ function hasChildCall(code) {
       if (node.type === 'Literal' && typeof node.value === 'string' && names.test(node.value)) return true;
       if (node.type === 'MemberExpression' && node.object.name === 'tools' && node.computed && node.property.type !== 'Literal') {
         const known = require('./static-tool-names').resolve(node.property, ancestors, ast);
-        if (!known || known.some(name => names.test(name))) return true;
+        if (!known || child(known)) return true;
       }
       if (node.type === 'MemberExpression' && names.test(node.computed ? node.property.value : node.property.name)) return true;
       if (node.type === 'CallExpression' && node.callee.type === 'Identifier' && names.test(node.callee.name)) return true;
