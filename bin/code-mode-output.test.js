@@ -84,6 +84,13 @@ test('an ALL_TOOLS.find by a $-anchored regex is not a child call unless its lit
     'const t=ALL_TOOLS.find(x=>/tabs_mcp$/.test(x.name));RegExp.prototype.test=()=>true;await tools[t.name]({});',
     'const t=ALL_TOOLS.find(x=>/tabs_mcp$/.test(x.name));o[k]=1;await tools[t.name]({});',
     'const t=ALL_TOOLS.find(x=>/tabs_mcp$/.test(x.label));await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/spawn_agen\\x74$/.test(x.name));await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/spawn_agen\\u0074$/.test(x.name));await tools[t.name]({});',
+    'const t=ALL_TOOLS.find(x=>/spawn_agen\\164$/.test(x.name));await tools[t.name]({});',
+    'const {"__proto__": p} = /x/;p.test=()=>true;const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));await tools[t.name]({});',
+    'const {__proto__: p} = /x/;p.test=()=>true;const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));await tools[t.name]({});',
+    'const k="__pro"+"to__";const {[k]: p} = /x/;p.test=()=>true;const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));await tools[t.name]({});',
+    'const o={["x"]:1};const t=ALL_TOOLS.find(x=>/tabs_context_mcp$/.test(x.name));await tools[t.name]({});',
     'const t=ALL_TOOLS.find(x=>/tabs_mcp$/.test(y.name));await tools[t.name]({});',
   ]) assert.equal(hasChildCall(code), true, code);
 });

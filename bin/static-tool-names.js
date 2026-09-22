@@ -69,6 +69,9 @@ function resolve(property, ancestors, ast) {
     }
     // A regex match is only as fixed as RegExp itself.
     if (!Array.isArray(result) && ((node.type === 'Identifier' && REFLECTIVE.has(node.name))
+        || (node.type === 'Literal' && typeof node.value === 'string' && REFLECTIVE.has(node.value))
+        || (['Property', 'PropertyDefinition', 'MethodDefinition'].includes(node.type)
+          && (node.computed || REFLECTIVE.has(node.key.name ?? node.key.value)))
         || (node.type === 'MemberExpression' && (node.computed ? !(node.object.name === 'tools'
           || (node.property.type === 'Literal' && typeof node.property.value === 'number'))
           : REFLECTIVE.has(node.property.name))))) return null;
@@ -89,8 +92,10 @@ function anchoredSuffix({ pattern, flags }) {
     const c = pattern[i];
     if (c === '\\') {
       const next = pattern[++i];
-      if (next === undefined || /[A-Za-z0-9]/.test(next)) tail = ''; // \d, \b, \1, \c… are not literals
-      else tail += next;
+      // \d, \b, \1, \x74, t… are classes, assertions or code points whose
+      // text is not the matched text; give up rather than decode them.
+      if (next === undefined || !/[.\\/\-[\]{}()*+?^$|]/.test(next)) return null;
+      tail += next;
     } else if (c === '$' && i === pattern.length - 1) return tail ? (flags ? tail.toLowerCase() : tail) : null;
     else if (/[A-Za-z0-9_\-]/.test(c)) tail += c;
     else {
