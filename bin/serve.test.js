@@ -13397,9 +13397,34 @@ test('placement answers where a session runs, and says so when nowhere will do',
     placementNodes: [{ name: 'main', capabilities: ['browser'] }, { name: 'aws1', capabilities: ['build'] }],
   }); return null; } catch (error) { return error; } })();
   assert.equal(together.message, 'no configured node has browser and build');
+
+  // A capability a card tag carried is a hint, not a demand. On a fleet where some
+  // machine claims it, the hint places the session there.
+  assert.equal(resolvePlacement({ hints: ['browser'] }, fleet), 'mini');
+  assert.equal(resolvePlacement({ hints: ['ios'], node: 'mini' }, fleet), 'mini');
+  const hintedAway = (() => { try { resolvePlacement({ node: 'aws1', hints: ['browser'] }, fleet); return null; }
+    catch (error) { return error; } })();
+  assert.equal(hintedAway.message, 'node aws1 does not have browser',
+    'a node the caller named is still told what it cannot do');
+
+  // On an install where nothing declares that capability the tag is just a word, and
+  // the session opens where it would have anyway.
+  const alone = { placementNodes: [{ name: 'main', capabilities: [] }] };
+  assert.equal(resolvePlacement({ hints: ['browser'] }, alone), 'main');
+  assert.equal(resolvePlacement({ hints: ['android'], node: 'main' }, alone), 'main');
+  assert.equal(resolvePlacement({ hints: ['browser'], lastCardNode: null }, alone), 'main');
+  const demanded = (() => { try { resolvePlacement({ needs: ['browser'] }, alone); return null; }
+    catch (error) { return error; } })();
+  assert.equal(demanded.status, 409);
+  assert.equal(demanded.message, 'no configured node has browser',
+    'asking outright is still a demand, and an install that cannot meet it says so');
+  const bothWays = (() => { try { resolvePlacement({ needs: ['browser'], hints: ['browser'] }, alone); return null; }
+    catch (error) { return error; } })();
+  assert.equal(bothWays.message, 'no configured node has browser',
+    'a tag that repeats an explicit --needs does not soften it');
 });
 
-test('a card tag that names a machine capability is a placement pin', async () => {
+test('a card tag that names a machine capability is a placement hint, not a demand', async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-tag-'));
   try {
     const host = recordingHost((type) => (type === 'spawn' ? { pane: { id: 'tag-pane', pid: 3, createdAt: 3 } } : {}));
@@ -13430,6 +13455,19 @@ test('a card tag that names a machine capability is a placement pin', async () =
     await assert.rejects(openSession({ fresh: true, cwd, agent: 'pi', node: 'mini' }, {
       ...deps, loadTask: undefined, piExtensionReady: true,
     }), (error) => error.status === 409 && error.message === 'pi sessions run on the daemon node');
+
+    // The same card on an install where nothing claims a browser: `browser` is then
+    // just a word the card is filed under, and the open goes through on the one node
+    // there is. Refusing here is what made ordinary tagged cards unopenable.
+    const single = { ...deps, placementNodes: [{ name: 'main', capabilities: [] }] };
+    const opened = await openSession({ taskId: 'card', fresh: true, agent: 'claude',
+      accountId: 'claude/default' }, single);
+    assert.equal(opened.created, 'pane');
+    assert.equal(opened.node, undefined, 'the daemon node is not named back');
+    // Asking for it outright on that same install is still a demand.
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude',
+      accountId: 'claude/default', needs: 'browser' }, single), (error) => error.status === 409
+      && error.message === 'no configured node has browser');
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });
 test('the daemon merges two nodes into one pane list and routes by the qualified id', async (t) => {

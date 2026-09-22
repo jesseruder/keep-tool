@@ -8388,9 +8388,11 @@ function shellQuoteArg(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-// A card tag that says a session needs something only some machines have. The tag
+// A card tag that may say a session needs something only some machines have. The tag
 // and the capability are spelled the same on purpose: `keep nodes add --capabilities
-// browser` and a card tagged `browser` are talking about one thing.
+// browser` and a card tagged `browser` are talking about one thing — but only on an
+// install where some node declares that capability. Everywhere else these are just
+// words somebody filed a card under, so placement takes them as hints, not demands.
 const PLACEMENT_TAG_CAPABILITIES = ['browser', 'ios', 'android'];
 
 function placementNodes(deps = {}) {
@@ -8445,10 +8447,10 @@ function placementConfiguration(deps = {}) {
 // for, then where this card last ran, then what the configuration says about this
 // project, then its default, then the daemon node.
 //
-// A capability the work needs — asked for with --needs, or carried by a card tag —
-// is then a requirement of that machine. A node the caller named is never quietly
-// swapped for another: being told "aws1 cannot do this" is the answer. A node
-// nobody named may be, because nobody asked for that one in particular.
+// A capability the work needs — asked for with --needs — is then a requirement of
+// that machine. A node the caller named is never quietly swapped for another: being
+// told "aws1 cannot do this" is the answer. A node nobody named may be, because
+// nobody asked for that one in particular.
 function resolvePlacement(request = {}, deps = {}) {
   const daemon = daemonNodeName(deps);
   const configured = placementNodes(deps);
@@ -8472,7 +8474,17 @@ function resolvePlacement(request = {}, deps = {}) {
     const placement = placementConfiguration(deps);
     chosen = placementProjectNode(request.project, placement, deps) || placement.default || daemon;
   }
-  const wanted = [...new Set((request.needs || []).filter(Boolean))];
+  // What the caller asked for outright is a demand; what a card tag carried is a
+  // hint. `browser`, `ios` and `android` are ordinary words cards were tagged with
+  // long before any machine declared a capability, so a hint no configured node can
+  // answer for is dropped in silence — otherwise every such card would refuse to open
+  // on an install whose nodes declare nothing. A hint some node does declare is held
+  // to, because on that install the tag is saying something about machines.
+  const demanded = [...new Set((request.needs || []).filter(Boolean))];
+  const hinted = [...new Set((request.hints || []).filter(Boolean))]
+    .filter((capability) => !demanded.includes(capability)
+      && configured.some((node) => (node.capabilities || []).includes(capability)));
+  const wanted = [...demanded, ...hinted];
   if (!wanted.length) return chosen;
   const satisfies = (name) => wanted.every((capability) => (capabilities.get(name) || []).includes(capability));
   if (satisfies(chosen)) return chosen;
@@ -8897,7 +8909,7 @@ async function openSession(body, deps = {}) {
   } else {
     // A fresh session: where the caller said, else where this card last ran, else
     // what the configuration says about this project, else the daemon node — and
-    // whatever the work needs, asked for outright or carried by a card tag.
+    // whatever the work needs, demanded outright or hinted at by a card tag.
     const lastCardEntry = card ? (card.fm.sessions || []).slice(-1)[0] : undefined;
     launchNode = resolvePlacement({
       node: body.node || null,
@@ -8906,7 +8918,8 @@ async function openSession(body, deps = {}) {
       // actually resolved. A standalone open has only the second, and placement has
       // to reach it the same way it reaches a card's.
       project: [card ? card.fm.project : null, project],
-      needs: [...needs, ...(card ? (card.fm.tags || []) : []).filter((tag) => PLACEMENT_TAG_CAPABILITIES.includes(tag))],
+      needs,
+      hints: (card ? (card.fm.tags || []) : []).filter((tag) => PLACEMENT_TAG_CAPABILITIES.includes(tag)),
     }, deps);
     const env = deps.env || process.env;
     if (body.accountId != null) {
