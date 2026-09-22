@@ -98,6 +98,8 @@ const {
   writeTarget,
   pressTargetKey,
   typeAndSubmit,
+  discardTypedDraft,
+  retireLeftDeliveryDrafts,
   sendToResolvedTarget,
   resolveSessionTarget,
   screenSession,
@@ -5940,6 +5942,66 @@ const BOX = (...draft) => [RULE, `❯ ${draft[0]}`, ...draft.slice(1), RULE, '? 
 // harness that cannot tell "cleared" from "still there".
 const CLEARABLE = (...draft) => (inputs) => (inputs.includes('\x1b') ? BOX('') : BOX(...draft));
 
+test('discarding a Claude draft never interrupts a running turn', async () => {
+  const running = draftHarness(BOX(MESSAGE).replace('? for shortcuts', 'esc to interrupt'));
+  const result = await discardTypedDraft({ pane: 'p' }, MESSAGE, 'claude', {
+    ...running.deps, expectedPaneState: { pid: 4242, inputCount: 0 }, stderr: () => {},
+  });
+  assert.equal(result.cleared, false);
+  assert.equal(result.reason, 'turn running');
+  assert.deepEqual(running.inputs, [], 'Escape is not pressed into the running Claude turn');
+});
+
+test('the delivery sweep retires only an unchanged idle exact draft it owns', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-left-delivery-draft-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const delivery = require('./delivery');
+  const text = '[keep] delivery that lost its before-Enter race';
+  const screen = BOX(text);
+  const make = (id, over = {}) => {
+    const file = path.join(root, `${id}.jsonl`); fs.writeFileSync(file, '');
+    const journal = path.join(root, `${delivery.textHash(id)}.json`);
+    fs.writeFileSync(journal, JSON.stringify({
+      createdAt: Date.now(), sessionId: id, kind: 'claude', file, offset: 0, pane: `pane-${id}`,
+      hash: delivery.textHash(text), receiptId: delivery.textHash(text), retainReceipt: true,
+      leftDraft: { pid: 4242, inputCount: 9, at: Date.now() }, ...over,
+    }));
+    return journal;
+  };
+  const journals = {
+    clear: make('clear'), moved: make('moved'), busy: make('busy'), changed: make('changed'),
+    legacy: make('legacy', { leftDraft: undefined }),
+  };
+  const panes = [
+    { id: 'pane-clear', pid: 4242, inputCount: 9 },
+    { id: 'pane-moved', pid: 4242, inputCount: 10 },
+    { id: 'pane-busy', pid: 4242, inputCount: 9 },
+    { id: 'pane-changed', pid: 4242, inputCount: 9 },
+    { id: 'pane-legacy', pid: 4242, inputCount: 9 },
+  ];
+  const discarded = [];
+  const retired = await retireLeftDeliveryDrafts(root, panes, {
+    loadDeliverySession: (id) => ({ endedTurn: id !== 'busy', pendingQuestion: null, pendingPlan: null }),
+    readScreenResult: async ({ pane }) => ({ text: pane === 'pane-changed' ? BOX(`${text} changed`) : screen }),
+    discardTypedDraft: async (target, visible, kind, deps) => {
+      discarded.push({ target, visible, kind, expected: deps.expectedPaneState });
+      return { cleared: true, reason: null };
+    },
+  });
+  assert.deepEqual(retired, ['clear']);
+  assert.equal(fs.existsSync(journals.clear), false, 'the failed send is deleted without a retained receipt');
+  assert.equal(fs.existsSync(path.join(root, 'receipts')), false);
+  for (const name of ['moved', 'busy', 'changed', 'legacy']) {
+    assert.equal(fs.existsSync(journals[name]), true, `${name} journal is untouched`);
+  }
+  assert.equal(discarded.length, 1);
+  assert.deepEqual(discarded[0].target, { pane: 'pane-clear' });
+  assert.equal(discarded[0].visible, text);
+  assert.equal(discarded[0].kind, 'claude');
+  assert.equal(discarded[0].expected.pid, 4242);
+  assert.equal(discarded[0].expected.inputCount, 9);
+});
+
 test('an abort after typing clears only a draft that is still ours', async () => {
   // The watcher's precondition is checked once more after the text is in the box.
   // Failing it there must leave the session as it was found: no Enter, and no
@@ -5966,6 +6028,8 @@ test('an abort after typing clears only a draft that is still ours', async () =>
   }).then(() => null, (e) => e);
   assert.equal(stuck.draftLeftOnScreen, true);
   assert.equal(stuck.draftReason, 'still there');
+  assert.deepEqual(stuck.leftDraft, { pid: 4242, inputCount: 3 },
+    'one typed chunk and both accepted Escapes are reflected in the durable pane guard');
 
   // Owner started typing into the same box. Escape would erase his words too, so
   // the box is not touched at all and the refusal says so.

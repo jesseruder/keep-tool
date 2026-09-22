@@ -341,7 +341,7 @@ function startSchedulers(ctx) {
     ideas, keep, keepConsole, landed, limitresume, listHostPaneResult, listHostPanes, liveSessionTick,
     liveTurnIndexSessions, loadCurrentSession, openCheckSession, openSession, path, pendingCompactSwaps,
     prepareSessionSummary, readLiveSessionLedger, readScreenResult, remoteSession, resolveSessionTarget, restartSession,
-    resumeAfterLimit,
+    resumeAfterLimit, retireLeftDeliveryDrafts,
     review, reviewDeps, runs, scanSessions, sendToResolvedTarget, sendToSession, sessionSummarySnapshot, slack,
     stallAliveIds, stalled, stalledSessionSnapshot, standup, startAutoCompact, startBriefScheduler,
     startHandoffQueue, startWtGcScheduler, summarize, transcriptFileForSession,
@@ -402,8 +402,11 @@ function startSchedulers(ctx) {
       // With no readable node list there is no way to name the nodes that were not
       // asked, so every pane that is not this node's counts as unknown.
       const unknownRemote = listed.configurationUnreadable === true;
-      return withInjectionLock(() => require('../delivery')
-        .reconcile(path.join(keep.ROOT, '.keep', 'delivery'), { panes, unknownNodes, unknownRemote }));
+      return withInjectionLock(async () => {
+        const directory = path.join(keep.ROOT, '.keep', 'delivery');
+        await retireLeftDeliveryDrafts(directory, listed.panes, deps);
+        return require('../delivery').reconcile(directory, { panes, unknownNodes, unknownRemote });
+      });
     },
   });
   unblock.startScheduler({

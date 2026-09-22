@@ -3300,6 +3300,10 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
     write(`keep serve: left an aborted draft on pane ${pane}: the pane's process was replaced while it was being cleared\n`);
     return { cleared: false, reason: 'pane replaced' };
   };
+  const left = (reason, detail, pid, inputCount) => {
+    write(`keep serve: left an aborted draft on pane ${pane}: ${detail}\n`);
+    return { cleared: false, reason, leftDraft: { pid, inputCount } };
+  };
   // The guarded write is a host feature, and a host from before it ignores
   // expectedInputCount and expectedPid and writes the key anyway — the very race this
   // is here to avoid, run silently and reported as a clean clear. So the host is asked
@@ -3342,10 +3346,6 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
     write(`keep serve: could not read pane ${pane} to clear an aborted draft: ${String((error && error.message) || error)}\n`);
     return { cleared: false, reason: 'unreadable screen' };
   }
-  if (!draftIsExactly(screen, text, kind)) {
-    write(`keep serve: left an aborted draft on pane ${pane}: the input box no longer holds only the typed message\n`);
-    return { cleared: false, reason: 'mixed draft' };
-  }
   // The other side of that read: the box just examined is only worth acting on if
   // nothing reached the pane while it was being read, and if it is still the same
   // process's box at all.
@@ -3353,6 +3353,20 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   if (settled === null) return unverified();
   if (settled.pid !== pid) return replaced();
   if (settled.inputCount !== count) return arrived();
+  if (!draftIsExactly(screen, text, kind)) {
+    return left('mixed draft', 'the input box no longer holds only the typed message', pid, count);
+  }
+  // 2026-09-22 delivery:f1b206c1: Escape is Claude's interrupt key while a turn is
+  // running, not a composer clear. A background notification began a turn after a
+  // watcher typed, and the attempted cleanup interrupted that turn while leaving the
+  // draft behind forever. Check the screen already bound to this exact pid/count,
+  // and check it again before the menu-closing second Escape below: cleanup may wait;
+  // somebody else's running turn may never be interrupted on its behalf.
+  const turnRunning = (value) => (kind === 'claude' || deps.refuseRunningTurn)
+    && CLAUDE_TURN_RUNNING_RE.test(String(value || ''));
+  if (turnRunning(screen)) {
+    return left('turn running', 'a Claude turn is running, so Escape was not pressed', pid, count);
+  }
   // Escape is a keystroke, not a guarantee. Read the box back after each one:
   // "cleared" is a claim about the session, so it is only made when the box is
   // actually empty. Twice at most, because a Claude slash draft has its command menu
@@ -3361,6 +3375,9 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   // into text somebody started writing during the first round trip.
   let after = screen;
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (turnRunning(after)) {
+      return left('turn running', 'a Claude turn is running, so Escape was not pressed', pid, count);
+    }
     if (attempt > 0 && !draftIsExactly(after, text, kind)) break;
     try {
       await pressTargetKey(target, 'Escape', deps, { expectedInputCount: count, expectedPid: pid });
@@ -3385,7 +3402,61 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
     if (draftRegionText(after, kind) === '') return { cleared: true, reason: null };
   }
   write(`keep serve: the draft on pane ${pane} is still there after Escape\n`);
-  return { cleared: false, reason: 'still there' };
+  return { cleared: false, reason: 'still there', leftDraft: { pid, inputCount: count } };
+}
+
+// Retire only drafts the discard-requesting delivery path positively left behind.
+// The journal keeps no message plaintext, so the visible composer is parsed with the
+// same exact-draft rules and its normalized hash is compared to the journal before it
+// is handed back to discardTypedDraft. This is intentionally separate from reconcile:
+// reconcile must preserve every other live-pane draft because a person may still press
+// Enter. Here the pid and inputCount prove nobody did, the idle transcript state proves
+// no turn or question is in flight, and discardTypedDraft rechecks both around its
+// guarded Escape.
+//
+// 2026-09-22 delivery:f1b206c1: a watcher asked to discard its aborted draft, but a
+// background-agent turn made Escape unsafe. Once that turn ended the complete draft
+// and journal otherwise had no path to retirement. Retained scheduled-check journals
+// are deleted without a receipt too: as in reconcile's dead-pane case, letting the
+// owner fall back and possibly rerun is safer than stamping an unseen check delivered.
+async function retireLeftDeliveryDrafts(directory, panes, deps = {}) {
+  if (!Array.isArray(panes) || !panes.length) return [];
+  const delivery = require('./delivery');
+  const fileSystem = deps.fs || fs;
+  const load = deps.loadDeliverySession || ((id, kind) => kind === 'claude' ? claudeSessionFor(id) : codex.sessionFor(id));
+  const read = deps.readScreenResult || ((target, lines, scrollback) => readScreenResult(target, lines, scrollback, deps));
+  const discard = deps.discardTypedDraft || discardTypedDraft;
+  let names;
+  try { names = fileSystem.readdirSync(directory).filter((name) => name.endsWith('.json')); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  const retired = [];
+  for (const name of names) {
+    const journal = path.join(directory, name);
+    try {
+      const entry = JSON.parse(fileSystem.readFileSync(journal, 'utf8'));
+      const expected = entry && entry.leftDraft;
+      if (name !== delivery.textHash(entry.sessionId) + '.json'
+          || !expected || !Number.isInteger(expected.pid) || !Number.isInteger(expected.inputCount)
+          || delivery.received(entry)) continue;
+      const pane = panes.find((candidate) => candidate && candidate.id === entry.pane);
+      if (!pane || pane.pid !== expected.pid || pane.inputCount !== expected.inputCount) continue;
+      const session = load(entry.sessionId, entry.kind);
+      if (!session || session.endedTurn !== true || session.pendingQuestion || session.pendingPlan) continue;
+      const target = { pane: entry.pane };
+      const snapshot = await read(target, 200, false);
+      const screen = String(snapshot && snapshot.text || '');
+      if (CLAUDE_TURN_RUNNING_RE.test(screen)) continue;
+      const visible = draftRegionText(screen, entry.kind);
+      if (visible === null || delivery.textHash(visible) !== entry.hash) continue;
+      const result = await discard(target, visible, entry.kind, {
+        ...deps, expectedPaneState: expected, refuseRunningTurn: true,
+      });
+      if (!result || result.cleared !== true) continue;
+      try { fileSystem.unlinkSync(journal); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      retired.push(entry.sessionId);
+    } catch {} // The ordinary health/reconcile pass keeps exposing anything uncertain.
+  }
+  return retired;
 }
 
 // Marks a failure as one that happened with characters already written to the
@@ -3666,6 +3737,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
       if (deps.discardDraftOnAbort && !discard.cleared) {
         error.draftLeftOnScreen = true;
         error.draftReason = discard.reason;
+        if (discard.leftDraft) error.leftDraft = discard.leftDraft;
       }
       if (discard.cleared) error.draftCleared = true;
     }
@@ -3711,6 +3783,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
     if (deps.discardDraftOnAbort && !discard.cleared) {
       error.draftLeftOnScreen = true;
       error.draftReason = discard.reason;
+      if (discard.leftDraft) error.leftDraft = discard.leftDraft;
     }
     // Read with typingStarted by anything that has to decide what reached the pane:
     // characters were written, and then taken back off the screen under the guard, so
@@ -13411,7 +13484,7 @@ function start(deps = {}) {
     readBody, readLiveSessionLedger, readScreenResult, recentTranscriptText, recoverReviewQueueLaunch, reminders,
     remoteSession, reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, resolveSessionTarget,
     restartSession,
-    restorePlan, resumeAfterLimit, review, reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow,
+    restorePlan, resumeAfterLimit, retireLeftDeliveryDrafts, review, reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow,
     runTaskNow, runs, scanSessions, screenHistorySession, screenSession, sendSessionKeys,
     sendStateJson, sendToResolvedTarget, sendToSession, sendToSessionLocked, sessionMarks, sessionNames, sessionSummaryFile, sessionSummarySnapshot,
     setAsideCandidates, slack, stallAliveIds, stalled, stalledSessionSnapshot, standup, tellSession,
@@ -13751,6 +13824,7 @@ module.exports = {
   pressTargetKey,
   typeAndSubmit,
   discardTypedDraft,
+  retireLeftDeliveryDrafts,
   draftRegionText,
   draftIsExactly,
   watcherSend,
