@@ -415,7 +415,15 @@ let sweepInFlight = false;
 let inFlightSwap = null;
 const daemonRestartGate = require('./daemon-restart').createGate({
   pending: () => {
-    try { return fs.readdirSync(autoCompactDir()).filter(name => name.endsWith('.swap.json')); }
+    // A restore deferred for a rate limit can be days out, and it is durable: the pass
+    // after the restart picks it up exactly as this one would. Only the others hold it.
+    try {
+      return fs.readdirSync(autoCompactDir()).filter((name) => {
+        if (!name.endsWith('.swap.json')) return false;
+        const id = name.slice(0, -'.swap.json'.length);
+        return !/^[A-Za-z0-9_-]+$/.test(id) || Boolean(compactRestoreBlocking(id, { dir: autoCompactDir() }));
+      });
+    }
     catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   },
   busy: () => sweepInFlight || injectionLocked(),
@@ -1375,6 +1383,24 @@ function localCommandStdout(record) {
   return text.startsWith(open) ? text.slice(open.length).trimStart() : null;
 }
 
+function localCommandStderr(record) {
+  const text = localCommandText(record);
+  const open = '<local-command-stderr>';
+  return text.startsWith(open) ? text.slice(open.length).trimStart() : null;
+}
+
+// A `/model` the API refused: the harness answers it with an API error (`API error: 429
+// rate_limit_error …`) instead of "Set model to …", and the session stays on the model it
+// was on. That is no model change at all, so the scan steps over it to whatever set the
+// model before. Read as ambiguous instead, a restore the daemon kept re-typing at a spent
+// model made every handoff of the session refuse "cannot be reproduced safely".
+const MODEL_SWITCH_API_ERROR_RE = /^(?:API\s+error\b|[^\n]*\brate_limit_error\b)/i;
+
+function modelSwitchApiError(output) {
+  const text = String(output == null ? '' : output).split(/\r?\n/)[0].split('</')[0].trim();
+  return MODEL_SWITCH_API_ERROR_RE.test(text);
+}
+
 // The label out of a `/model` confirmation row: `Set model to `Fable 5.1` and saved as
 // your default for new sessions` is the label `Fable 5.1`. null when the row is not a
 // "Set model to …" confirmation at all — "Kept model as …" means the switch never
@@ -1437,8 +1463,14 @@ function resolveLocalModelSwitch(args, following) {
   for (const line of following) {
     let record;
     try { record = JSON.parse(line); } catch { continue; }
+    // Refused by the API, on either output stream: not a switch. The synthetic rate-limit
+    // record is not read that way — a parked session's tail is full of those whatever the
+    // /model before them did.
+    const stderr = localCommandStderr(record);
+    if (stderr != null && modelSwitchApiError(stderr)) return { model: '<unknown>', label: '', failed: true };
     const stdout = localCommandStdout(record);
     if (stdout == null) continue;
+    if (modelSwitchApiError(stdout)) return { model: '<unknown>', label: '', failed: true };
     const label = modelSwitchLabel(stdout);
     if (label == null) return { model: '<unknown>', label: '' };
     return { model: typed || '<unknown>', label };
@@ -1459,9 +1491,19 @@ function modelEventsInText(text, newerText = '') {
     const model = genuineAssistantModel(record);
     if (model) { events.push({ kind: 'assistant', model }); continue; }
     const args = localModelSwitchArgs(record);
-    if (args != null) events.push({ kind: 'switch', args, following: () => lines.slice(i + 1).concat(newerLines) });
+    if (args != null) {
+      const following = () => lines.slice(i + 1).concat(newerLines);
+      let resolved;
+      events.push({ kind: 'switch', args, following,
+        resolve: () => (resolved ||= resolveLocalModelSwitch(args, following())) });
+    }
   }
   return events;
+}
+
+// A switch the API refused never happened; see modelSwitchApiError.
+function refusedModelSwitch(event) {
+  return event.kind === 'switch' && event.resolve().failed === true;
 }
 
 // The model over the whole file, newest slice first, as { model, source, window, label? }:
@@ -1530,6 +1572,7 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
       carryBytes = newline > 0 ? newline : 0;
       const events = modelEventsInText(text, newerText);
       let seen = events.length - 1;
+      if (assistant == null) while (seen >= 0 && refusedModelSwitch(events[seen])) seen -= 1;
       if (assistant == null && seen >= 0) {
         // The newest event in the file decides on its own when it is a switch: nothing
         // older can undo a model someone typed after it.
@@ -1540,7 +1583,7 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
       // Older slices, and the rest of this one, are searched only for the switch that
       // last set the window the assistant record is running with.
       for (; seen >= 0; seen -= 1) {
-        if (events[seen].kind === 'switch') return switchBehindAssistant(events[seen], assistant);
+        if (events[seen].kind === 'switch' && !refusedModelSwitch(events[seen])) return switchBehindAssistant(events[seen], assistant);
       }
       newerText = `${text}\n${newerText}`.slice(0, HANDOFF_MODEL_LOOKAHEAD_CHARS);
       end = start;
@@ -1559,7 +1602,7 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
 }
 
 function switchResult(event) {
-  const { model, label } = resolveLocalModelSwitch(event.args, event.following());
+  const { model, label } = event.resolve ? event.resolve() : resolveLocalModelSwitch(event.args, event.following());
   if (model !== '<unknown>') return { model, source: 'switch', window: 'exact' };
   // Nothing newer than this switch, so no record names the base model it moved to. The
   // label travels out with the sentinel: only handoffCurrentModel holds the launch
@@ -3405,13 +3448,27 @@ function compactionSwappedModel(deps = {}) {
   return keep.LAUNCH_MODEL_RE.test(model) ? model : '';
 }
 
+// The model the daemon's own compaction switch types. A full id, never the bare `opus`
+// alias the setting used to default to: `/model opus` resolves against settings nobody
+// records, is echoed back only as a display label, and a handoff reading the transcript
+// afterwards cannot reproduce it — it refused "Current Claude model cannot be reproduced
+// safely" on exactly that row. The legacy alias value is read as the default id, so a
+// daemon still configured with `KEEP_COMPACT_VIA_MODEL=opus` types the id too; any other
+// value, full id or not, is typed as configured.
+const COMPACT_VIA_DEFAULT_MODEL = 'claude-opus-5';
+
+function compactViaModel() {
+  const value = envString('KEEP_COMPACT_VIA_MODEL', COMPACT_VIA_DEFAULT_MODEL);
+  return value.toLowerCase() === 'opus' ? COMPACT_VIA_DEFAULT_MODEL : value;
+}
+
 function compactSwapPlan(session, opts) {
-  const via = String(opts && opts.via || '').trim();
-  if (!via || via.toLowerCase() === 'off' || !session || session.kind !== 'claude') return null;
+  const viaSetting = String(opts && opts.via || '').trim();
+  if (!viaSetting || viaSetting.toLowerCase() === 'off' || !session || session.kind !== 'claude') return null;
   const originalModel = String(session.model || '').trim();
   if (!originalModel) return null;
   const modelLower = originalModel.toLowerCase();
-  if (modelLower.includes(via.toLowerCase())) return null;
+  if (compactModelBase(originalModel).includes(compactModelBase(viaSetting))) return null;
   const families = Array.isArray(opts && opts.families) ? opts.families : [];
   if (!families.some((family) => {
     const needle = String(family || '').trim().toLowerCase();
@@ -3423,6 +3480,12 @@ function compactSwapPlan(session, opts) {
   const settingsModelRaw = typeof (opts && opts.settingsModel) === 'string' ? opts.settingsModel : '';
   const settingsBase = settingsModelRaw.replace(/\[1m\]$/i, '');
   const restoreModel = settingsBase.toLowerCase() === modelLower ? settingsModelRaw : originalModel;
+  // A session on a 1M window compacts on the fallback's 1M window too: its context can be
+  // far past what the 200k variant accepts, and the summary request would be refused. The
+  // window comes from the same place the restore's does. Only a full id takes the suffix;
+  // an alias (or a configured value already naming a window) is typed as configured.
+  const via = /\[1m\]$/i.test(restoreModel) && /^claude-/i.test(viaSetting) && !/\[1m\]$/i.test(viaSetting)
+    ? `${viaSetting}[1m]` : viaSetting;
   return {
     switchCommand: `/model ${via}`,
     restoreCommand: `/model ${restoreModel}`,
@@ -3624,10 +3687,146 @@ function pendingCompactRestoreFile(sessionId, deps = {}) {
   return fs.existsSync(file) ? file : null;
 }
 
+// A restore deferred for a rate limit (see deferCompactRestore) is a settled state, not a
+// transaction in flight: the session is running on the compaction model on purpose until
+// the spent model's window resets, and nothing Keep types is due before then. Blocking
+// delivery for that long wedged session #213 for a day on a Fable window that was not
+// coming back. Every other record still blocks — one mid-flight, one whose last restore
+// failed for any other reason, and one that cannot be read — because the guard exists so
+// a message never lands on a swapped model in the middle of the daemon's own typing.
+// A deferred restore that comes due is typed under the injection lock like any other.
+function compactRestoreDeferred(record) {
+  return Boolean(record && typeof record === 'object' && record.restoreDeferredReason
+    && Number.isFinite(Number(record.restoreDeferredUntil)) && Number(record.restoreDeferredUntil) > 0);
+}
+
+function compactRestoreBlocking(sessionId, deps = {}) {
+  const file = pendingCompactRestoreFile(sessionId, deps);
+  if (!file) return null;
+  try {
+    if (compactRestoreDeferred(JSON.parse(fs.readFileSync(file, 'utf8')))) return null;
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return null;
+  }
+  return file;
+}
+
 function assertCompactRestoreSettled(sessionId, deps = {}) {
-  if (pendingCompactRestoreFile(sessionId, deps)) {
+  if (compactRestoreBlocking(sessionId, deps)) {
     throw new InjectionError(409, 'model restore is pending; message was not delivered');
   }
+}
+
+// A minute or two past the reset the usage source reported, so the first attempt does
+// not land on the boundary itself and spend a retry on a window still closing.
+const COMPACT_RESTORE_RESET_GRACE_MS = 2 * 60e3;
+
+// Why a restore is being put off, and until when. With a reset time — the model-exhausted
+// decision's, or the account snapshot's for the restore model — the restore waits for it;
+// without one it backs off on its own clock, doubling per consecutive deferral
+// (KEEP_COMPACT_RESTORE_BACKOFF_MIN, default 60, capped at
+// KEEP_COMPACT_RESTORE_BACKOFF_MAX_MIN, default 360), so a Fable week with no reset on
+// record is retried a handful of times a day instead of every ten minutes.
+function compactRestoreDeferral(record, { reason, resetAt, now }) {
+  const count = Math.max(0, Number(record && record.restoreDeferrals) || 0);
+  const base = envNumber('KEEP_COMPACT_RESTORE_BACKOFF_MIN', 60) * 60e3;
+  const cap = Math.max(base, envNumber('KEEP_COMPACT_RESTORE_BACKOFF_MAX_MIN', 360) * 60e3);
+  const reset = Number.isFinite(resetAt) && resetAt > now ? resetAt : null;
+  return {
+    restoreDeferredReason: reason,
+    restoreDeferredAt: now,
+    restoreDeferredUntil: reset != null ? reset + COMPACT_RESTORE_RESET_GRACE_MS : now + Math.min(cap, base * 2 ** count),
+    restoreDeferrals: count + 1,
+    ...(reset != null ? { restoreResetAt: reset } : {}),
+  };
+}
+
+function withoutCompactRestoreDeferral(record) {
+  const next = { ...record };
+  for (const key of ['restoreDeferredReason', 'restoreDeferredAt', 'restoreDeferredUntil', 'restoreResetAt']) delete next[key];
+  return next;
+}
+
+function deferCompactRestore(file, deferral) {
+  const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error('swap record does not contain a JSON object');
+  const next = { ...record, ...compactRestoreDeferral(record, deferral) };
+  writeCompactSwapRecord(file, next);
+  return next;
+}
+
+// The restore's own /model came back refused for a rate limit: Claude Code prints the API
+// error under the command's echo. Only below that echo — an older refusal retained higher
+// up the screen says nothing about this attempt.
+function compactRestoreRateLimited(screen, command) {
+  return linesAfterLastEcho(screen, command).some((line) =>
+    /\bAPI\s+error\b[^\n]*\b429\b|\brate_limit_error\b|You've (?:hit|reached) your\b[^\n]*\blimit/i.test(line));
+}
+
+// A /model somebody chose by hand after the swap, or null. The swap record's restore is the
+// daemon undoing its own switch; once a person has picked a model since, the restore would
+// overwrite that choice — every ten minutes, in the incident that motivated this — and
+// repairing settings.json to the pre-swap value would undo the saved default they just set.
+//
+// Read from the transcript records stamped at or after the record's `at` (written just
+// before the switch was typed). The daemon's own rows are the first `/model <switchModel>`
+// and any `/model <restore>`; a refused /model changed nothing (modelSwitchApiError). Any
+// other confirmed switch is a person's — including a second `/model <switchModel>`, but
+// only when the window read reaches back past `at`, so the daemon's own first one is
+// known to be in it. A genuine assistant record on a model that is neither the swap's nor
+// the restore's is the same evidence by another path (a model changed without a /model
+// row this can see).
+const COMPACT_SWAP_CHOICE_SCAN_BYTES = 8 * 1024 * 1024;
+
+function compactSwapUserModelChoice(record, file) {
+  const at = Number(record && record.at);
+  if (!file || !Number.isFinite(at) || at <= 0) return null;
+  let text;
+  let reachedStart;
+  try {
+    const stat = fs.statSync(file);
+    const start = Math.max(0, stat.size - COMPACT_SWAP_CHOICE_SCAN_BYTES);
+    const fd = fs.openSync(file, 'r');
+    try {
+      const buffer = Buffer.alloc(stat.size - start);
+      if (fs.readSync(fd, buffer, 0, buffer.length, start) !== buffer.length) return null;
+      text = buffer.toString('utf8');
+    } finally { fs.closeSync(fd); }
+    if (start > 0) text = text.slice(text.indexOf('\n') + 1);
+    reachedStart = start === 0;
+  } catch { return null; }
+  const lines = text.split(/\r?\n/);
+  const switchModel = String(record.switchModel || '').trim();
+  const restoreModel = String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim();
+  let sawBefore = reachedStart;
+  let sawOwnSwitch = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    let row;
+    try { row = JSON.parse(lines[i]); } catch { continue; }
+    const stamp = Date.parse(row && row.timestamp || '');
+    if (!Number.isFinite(stamp)) continue;
+    if (stamp < at) { sawBefore = true; continue; }
+    const args = localModelSwitchArgs(row);
+    if (args != null) {
+      const outcome = resolveLocalModelSwitch(args, lines.slice(i + 1, i + 1 + 64));
+      if (outcome.failed) continue;
+      const own = switchModel && compactModelBase(args) === compactModelBase(switchModel);
+      if (own && !sawOwnSwitch) { sawOwnSwitch = true; continue; }
+      if (own && !sawBefore) continue;
+      if (restoreModel && args && compactModelBase(args) === compactModelBase(restoreModel)) continue;
+      // Confirmed, or at least not refused by the harness: "Kept model as …" is no change.
+      if (outcome.model === '<unknown>' && !outcome.label) continue;
+      return { model: args || outcome.label, reason: `/model ${args || outcome.label} was chosen after the swap` };
+    }
+    const model = genuineAssistantModel(row);
+    if (model && model !== '<unknown>'
+        && !(switchModel && compactModelContainsFamily(model, switchModel))
+        && !(restoreModel && compactModelBase(model) === compactModelBase(restoreModel))
+        && !(!switchModel && compactModelContainsFamily(model, 'opus'))) {
+      return { model, reason: `the session moved to ${model} after the swap` };
+    }
+  }
+  return null;
 }
 
 function pendingCompactSwaps(dir) {
@@ -3784,9 +3983,39 @@ async function sweepPendingCompactSwaps(deps = {}) {
   const readSettings = deps.readClaudeSettingsModel || readClaudeSettingsModel;
   const repairSettings = deps.repairClaudeSettingsModel || repairClaudeSettingsModel;
   try {
-    const records = pendingCompactSwaps(dir);
-    summary.checked = records.length;
-    if (!records.length) return summary;
+    const allRecords = pendingCompactSwaps(dir);
+    summary.checked = allRecords.length;
+    if (!allRecords.length) return summary;
+    let sessions;
+    let scanError = null;
+    try { sessions = scan(); } catch (e) { scanError = e; }
+    // A model someone picked by hand after the swap retires the record before anything
+    // below can act on it: no restore typed over the choice, and no settings.json repair
+    // over the saved default /model just wrote (see compactSwapUserModelChoice).
+    const retired = new Set();
+    if (!scanError) {
+      const byIdEarly = new Map((sessions || []).map((session) => [session.id, session]));
+      const transcriptFor = deps.transcriptFileForSession || transcriptFileForSession;
+      for (const record of allRecords) {
+        if (record.error || codexCompact.isCodexCompactSwap(record)) continue;
+        const session = byIdEarly.get(record.sessionId);
+        if (!session) continue;
+        let choice = null;
+        try { choice = (deps.compactSwapUserModelChoice || compactSwapUserModelChoice)(record, transcriptFor(session)); } catch {}
+        if (!choice) continue;
+        const sid = (sessionRef(record.sessionId) || 'unknown');
+        try { fs.unlinkSync(record.file); } catch (e) {
+          if (e.code !== 'ENOENT') {
+            process.stderr.write(`keep serve: could not retire model restore record for ${sid}: ${e.message}\n`);
+            continue;
+          }
+        }
+        retired.add(record.file);
+        summary.dropped += 1;
+        process.stderr.write(`keep serve: retired model restore record for ${sid}: ${choice.reason}; not restoring "${String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '')}" or repairing settings.json over it\n`);
+      }
+    }
+    const records = allRecords.filter((record) => !retired.has(record.file));
     const repairedSettingsRecords = new Set();
     const noteSettingsRepair = (record, repaired) => {
       if (!repaired.changed || repairedSettingsRecords.has(record.file)) return;
@@ -3822,9 +4051,8 @@ async function sweepPendingCompactSwaps(deps = {}) {
         }
       }
     }
-    let sessions;
-    try { sessions = scan(); }
-    catch (e) {
+    if (scanError) {
+      const e = scanError;
       for (const record of records) {
         summary.skipped += 1;
         const sid = (sessionRef(record.sessionId) || 'unknown');
@@ -3861,7 +4089,12 @@ async function sweepPendingCompactSwaps(deps = {}) {
         }
         continue;
       }
-      const stale = now() - compactSwapRecordAt(record) > envNumber('KEEP_COMPACT_SWAP_MAX_AGE_MIN', 24 * 60) * 60e3;
+      // A deferred restore ages from when it comes due, not from the swap: a Fable week
+      // can be days away, and expiring the record first would strand the session on the
+      // compaction model for good.
+      const ageFrom = Math.max(compactSwapRecordAt(record),
+        compactRestoreDeferred(record) ? Number(record.restoreDeferredUntil) : 0);
+      const stale = now() - ageFrom > envNumber('KEEP_COMPACT_SWAP_MAX_AGE_MIN', 24 * 60) * 60e3;
       if (stale) {
         try { fs.unlinkSync(record.file); } catch (e) {
           if (e.code !== 'ENOENT') {
@@ -3893,6 +4126,10 @@ async function sweepPendingCompactSwaps(deps = {}) {
       }
       if (Number.isFinite(Number(record.lastAttemptAt))
           && now() - Number(record.lastAttemptAt) < envNumber('KEEP_COMPACT_RESTORE_RETRY_MIN', 10) * 60e3) {
+        summary.skipped += 1;
+        continue;
+      }
+      if (compactRestoreDeferred(record) && now() < Number(record.restoreDeferredUntil)) {
         summary.skipped += 1;
         continue;
       }
@@ -3944,14 +4181,33 @@ async function sweepPendingCompactSwaps(deps = {}) {
             // in the box. Re-verify it at the moment of typing: the first probe waits for
             // its own Backspace to render, so this one reads a settled screen.
             await probeSuggestion(target, await read(target, 30, false), deps);
+            // Only now, with the restore about to be typed, is the attempt a transaction in
+            // flight again: until it is confirmed or re-deferred below, the record blocks
+            // delivery like any other. A probe that refused above typed nothing, and a
+            // deferred record it refused on stays deferred.
+            if (compactRestoreDeferred(record)) writeCompactSwapRecord(record.file, withoutCompactRestoreDeferral(record));
             await submit(target, record.restoreCommand, claudeTypedTextVisible, deps);
-            return await waitForSwitch(target, record.restoreCommand, sid, deps);
+            if (await waitForSwitch(target, record.restoreCommand, sid, deps)) return true;
+            try {
+              if (compactRestoreRateLimited(await read(target, 30, false), record.restoreCommand)) return 'rate-limited';
+            } catch {}
+            return false;
           } finally {
             repair();
           }
         }, { session: record.sessionId, model: true });
         if (restored === null) {
           summary.skipped += 1;
+          continue;
+        }
+        if (restored === 'rate-limited') {
+          const restoreModel = String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim();
+          const usageNow = deps.usageSnapshot !== undefined ? deps.usageSnapshot : readUsageCache();
+          const resetAt = compactModelResetAt({ model: restoreModel, accountId: record.accountId, rateLimit: session && session.rateLimit },
+            { usage: usageNow, now: now() });
+          const deferred = deferCompactRestore(record.file, { reason: 'rate-limited', resetAt, now: now() });
+          summary.skipped += 1;
+          process.stderr.write(`keep serve: MODEL RESTORE DEFERRED for claude session ${sid} (rate-limited): "${record.restoreCommand}" was refused for a rate limit; next attempt ${new Date(deferred.restoreDeferredUntil).toISOString()}\n`);
           continue;
         }
         if (!restored) throw new Error(`expected "${record.restoreCommand}"`);
@@ -4027,7 +4283,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
   const policy = deps.compactionPolicy || null;
   const pendingRecordValue = session?.kind === 'claude' ? readPendingCompactSwap(session && session.id, dir) : null;
   const pendingRecord = codexCompact.isCodexCompactSwap(pendingRecordValue) ? null : pendingRecordValue;
-  const configuredVia = envString('KEEP_COMPACT_VIA_MODEL', 'opus');
+  const configuredVia = compactViaModel();
   const settingsFile = deps.compactSettingsFile || claudeSettingsPath();
   if (pendingRecord && compactSwapSettingsFile(pendingRecord, deps) !== settingsFile) {
     return { compacted: false, restoreUnconfirmed: true,
@@ -4063,7 +4319,8 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
     const records = pendingCompactSwaps(dir).filter((record) => !record.error && !codexCompact.isCodexCompactSwap(record)
       && compactSwapSettingsFile(record, deps) === settingsFile)
       .sort((a, b) => compactSwapRecordAt(b) - compactSwapRecordAt(a));
-    if (compactModelBase(settingsModel) === compactModelBase(configuredVia) && records.length) {
+    if (records.length && [configuredVia, records[0].switchModel].some((value) =>
+      value && compactModelBase(settingsModel) === compactModelBase(value))) {
       settingsModel = records[0].settingsModelBefore;
       settingsPresent = records[0].settingsModelPresent;
       process.stderr.write(`keep serve: using the pre-swap settings.json model from pending restore record ${(sessionRef(records[0].sessionId) || 'unknown')}\n`);
@@ -4077,7 +4334,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
       settingsModel,
       settingsPresent,
     });
-    via = swap ? configuredVia : null;
+    via = swap ? String(swap.switchCommand).replace(/^\s*\/model\s+/i, '') : null;
     if (swap && deps.compactSettingsFile && deps.compactAccountId) {
       Object.assign(swap, { settingsFile, accountId: deps.compactAccountId });
     }
@@ -4179,18 +4436,39 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
     let restoreConfirmed = !swap;
     if (swap && pendingSwapFile) {
       let restored = false;
+      let deferral = null;
+      const readRestoreScreen = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
       try {
-        const screen = await (deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps)))(target, 30, false);
+        const screen = await readRestoreScreen(target, 30, false);
         if (modelSwitchDialogVisible(screen)) {
           await pressTargetKey(target, 'Escape', deps);
           process.stderr.write(`keep serve: dismissed a stale model-switch dialog for ${sid}\n`);
           await new Promise((resolve) => setTimeout(resolve, 500));
         }
       } catch {}
-      try {
-        await (deps.typeAndSubmit || typeAndSubmit)(target, swap.restoreCommand, claudeTypedTextVisible, deps);
-        restored = await (deps.waitForModelSwitch || waitForModelSwitch)(target, swap.restoreCommand, sid, deps);
-      } catch {}
+      if (policy?.reason === 'model-exhausted') {
+        // The fallback was taken because the original model's window is spent, so a
+        // restore typed now is answered with a 429 — and the record it leaves behind used
+        // to block the session and re-type the same refused /model every ten minutes. Put
+        // the restore off until that window resets instead; the session keeps running on
+        // the compaction model meanwhile, which is the only model it had anyway.
+        deferral = { reason: 'model-exhausted', resetAt: Number(policy.exhaustedResetAt) || null };
+      } else {
+        try {
+          await (deps.typeAndSubmit || typeAndSubmit)(target, swap.restoreCommand, claudeTypedTextVisible, deps);
+          restored = await (deps.waitForModelSwitch || waitForModelSwitch)(target, swap.restoreCommand, sid, deps);
+        } catch {}
+        if (!restored) {
+          // The model was not known to be spent, but the API refused the /model for a
+          // rate limit anyway: same deferral, on the backoff clock since nothing here
+          // knows the reset.
+          try {
+            if (compactRestoreRateLimited(await readRestoreScreen(target, 30, false), swap.restoreCommand)) {
+              deferral = { reason: 'rate-limited', resetAt: null };
+            }
+          } catch {}
+        }
+      }
       const repaired = (deps.repairClaudeSettingsModel || repairClaudeSettingsModel)(
         swap.settingsModelBefore, swap.settingsModelPresent, swap.settingsFile || settingsFile);
       if (repaired.changed) {
@@ -4199,11 +4477,25 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
       if (repaired.error) {
         process.stderr.write(`keep serve: could not restore settings.json model after compaction of ${sid}: ${repaired.error}\n`);
       }
+      let deferred = null;
+      if (!restored && deferral) {
+        try { deferred = deferCompactRestore(pendingSwapFile, { ...deferral, now: Date.now() }); } catch (e) {
+          process.stderr.write(`keep serve: could not defer model restore for claude session ${sid}: ${String(e && e.message || e)}\n`);
+        }
+      }
       if (restored && !repaired.error) {
         restoreConfirmed = true;
         try { fs.unlinkSync(pendingSwapFile); } catch (e) {
           process.stderr.write(`keep serve: could not clear model restore record for claude session ${sid}: ${e.message}\n`);
         }
+      } else if (deferred) {
+        // Not unconfirmed: the session is deliberately left on the compaction model, and
+        // the pending-swap pass types the restore once the deferral comes due.
+        restoreConfirmed = true;
+        process.stderr.write(`keep serve: MODEL RESTORE DEFERRED for claude session ${sid} (${deferred.restoreDeferredReason}): "${swap.restoreCommand}" is due ${new Date(deferred.restoreDeferredUntil).toISOString()}${deferred.restoreResetAt ? ' (after the model\'s limit resets)' : ' (backoff; no reset time known)'}; the session stays on ${via} until then\n`);
+        if (!result) result = { compacted: false, reason: 'model restore deferred', via };
+        result.restoreDeferred = true;
+        result.restoreDeferredUntil = deferred.restoreDeferredUntil;
       } else {
         process.stderr.write(`keep serve: MODEL RESTORE UNCONFIRMED for claude session ${sid}: expected "${swap.restoreCommand}" and account settings repair — restore it by hand\n`);
         if (!result) result = { compacted: false, reason: 'model restore unconfirmed', via };
@@ -5169,7 +5461,9 @@ async function restartSession(body, deps = {}) {
     try {
       await (deps.closeIdleSession || closeIdleSession)(body, { ...deps, allowTerminalRateLimit: terminalLimit,
         restartProof: childProof, closePolicy: { manual: true, restart: true, force }, withInjectionLock: (fn) => fn(), beforeClose: checkChildren,
-        beforeExitInput: () => { exitInputStarted = true; },
+        // onExitInput lets a caller journal that the stop itself began: an account handoff
+        // may later have to prove, after the fact, a stop whose confirmation it never saw.
+        beforeExitInput: () => { exitInputStarted = true; deps.onExitInput?.(); },
       });
     } catch (error) {
       if (!exitInputStarted && ['Session changed during cleanup; nothing closed', 'Waiting for the turn and background work to finish', 'Waiting for pending input to be resolved'].includes(error.message)) throw transient(error.message);
@@ -5766,27 +6060,59 @@ function compactModelExhausted(session, options = {}) {
   if (!model) return false;
   if (session.rateLimit && session.rateLimit.type === 'fable_weekly'
     && compactModelContainsFamily(model, 'fable')) return true;
-  const accountId = options.accountId || session.accountId;
-  if (!accountId) return false;
-  const claude = review.accountLimits(options.usage, accountId);
-  if (!claude || !Array.isArray(claude.limits) || !claude.limits.length) return false;
-  const now = Number.isFinite(options.now) ? options.now : Date.now();
-  const staleMs = Number.isFinite(options.staleMs) ? options.staleMs : COMPACT_USAGE_STALE_MS;
-  const fetchedAt = Number(claude.fetchedAt);
-  if (!Number.isFinite(fetchedAt) || fetchedAt <= 0 || now - fetchedAt > staleMs) return false;
-  // Resolve the per-model weekly bucket exactly as review.classifyBudget does: a
-  // label like "Fable wk" whose prefix is the model's family.
-  const family = review.modelFamily(model);
-  const prefix = (family === 'other' ? model : family).toLowerCase();
-  const scoped = claude.limits.find((limit) => {
-    const label = String(limit && limit.label || '').toLowerCase();
-    return label.endsWith(' wk') && prefix && label.startsWith(prefix);
-  });
+  const scoped = compactScopedLimit(model, options.accountId || session.accountId, options);
   if (!scoped) return false;
   const percent = Number(scoped.percent);
   if (!Number.isFinite(percent)) return false;
   const minHeadroom = Number.isFinite(options.minHeadroom) ? options.minHeadroom : 0;
   return percent >= 100 || 100 - percent < minHeadroom;
+}
+
+// The account's fresh per-model weekly bucket for this model ("Fable wk"), resolved
+// exactly as review.classifyBudget does, or null when the snapshot is missing, stale or
+// has no such bucket.
+function compactScopedLimit(model, accountId, options = {}) {
+  if (!model || !accountId) return null;
+  const claude = review.accountLimits(options.usage, accountId);
+  if (!claude || !Array.isArray(claude.limits) || !claude.limits.length) return null;
+  const now = Number.isFinite(options.now) ? options.now : Date.now();
+  const staleMs = Number.isFinite(options.staleMs) ? options.staleMs : COMPACT_USAGE_STALE_MS;
+  const fetchedAt = Number(claude.fetchedAt);
+  if (!Number.isFinite(fetchedAt) || fetchedAt <= 0 || now - fetchedAt > staleMs) return null;
+  const family = review.modelFamily(model);
+  const prefix = (family === 'other' ? model : family).toLowerCase();
+  return claude.limits.find((limit) => {
+    const label = String(limit && limit.label || '').toLowerCase();
+    return label.endsWith(' wk') && prefix && label.startsWith(prefix);
+  }) || null;
+}
+
+function compactResetMs(value) {
+  if (value == null || value === '') return null;
+  const number = Number(value);
+  if (Number.isFinite(number)) return number > 0 ? number : null;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+// When a spent model's own window resets, from the same two signals compactModelExhausted
+// reads: the reset the parked limit error recorded, else the account snapshot's reset for
+// the model's weekly bucket. null when neither says, or the time is already past — the
+// caller then backs off on its own clock rather than trusting a reset that did not happen.
+// A model-exhausted compaction hands this to its restore, so the restore waits for the
+// window instead of typing a /model the API is certain to answer with a 429.
+function compactModelResetAt(session, options = {}) {
+  const model = String(session && session.model || '').trim();
+  if (!model) return null;
+  const now = Number.isFinite(options.now) ? options.now : Date.now();
+  const candidates = [];
+  if (session.rateLimit && compactModelContainsFamily(model, 'fable') && session.rateLimit.type === 'fable_weekly') {
+    candidates.push(compactResetMs(session.rateLimit.resetsAt));
+  }
+  const scoped = compactScopedLimit(model, options.accountId || session.accountId, { ...options, now });
+  if (scoped) candidates.push(compactResetMs(scoped.resetsAt));
+  const future = candidates.filter((at) => at != null && at > now);
+  return future.length ? Math.max(...future) : null;
 }
 
 function autoCompactPolicy(session, now, opts) {
@@ -5842,7 +6168,7 @@ function autoCompactPolicy(session, now, opts) {
     cacheAgeMs,
     cacheTtlMs,
     targetAgeMs,
-    ...(exhausted ? { reason: 'model-exhausted' } : {}),
+    ...(exhausted ? { reason: 'model-exhausted', exhaustedResetAt: opts.modelResetAt?.(session) ?? null } : {}),
   };
 }
 
@@ -5860,11 +6186,15 @@ function reopenCompactPolicy(session, now = Date.now(), opts = {}) {
     ? (opts.codexTtlMs ?? 30 * 60e3) : (opts.claudeTtlMs ?? 60 * 60e3);
   const cacheTtlMs = session.kind === 'claude' && Number.isFinite(session.cacheTtlMs)
     ? session.cacheTtlMs : fallbackTtlMs;
-  const warm = !opts.forceCold && opts.modelExhausted?.(session) !== true
+  const exhausted = opts.modelExhausted?.(session) === true;
+  const warm = !opts.forceCold && !exhausted
     && Number.isFinite(session.usageAt) && session.usageAt > 0
     && now >= session.usageAt && now - session.usageAt < cacheTtlMs;
   return {
     path: premium && !warm ? 'cold-fallback' : 'warm-current',
+    // Same meaning as autoCompactPolicy's: the restore after this fallback must wait for
+    // the spent window rather than type a /model the API will refuse.
+    ...(premium && exhausted ? { reason: 'model-exhausted', exhaustedResetAt: opts.modelResetAt?.(session) ?? null } : {}),
     originalModel: model,
     targetModel: premium && !warm
       ? session.kind === 'codex' ? (opts.codexFallbackModel || 'gpt-5.6-sol')
@@ -5934,7 +6264,7 @@ function reopenTurnSnapshot(session, deps = {}, launchModel = '') {
 async function compactReopenedSession(session, target, account, turn, deps = {}) {
   if (deps.reopenCompaction === 'skip') return null;
   const dir = deps.dir || path.join(deps.root || keep.ROOT, '.keep', 'compact');
-  if (pendingCompactRestoreFile(session.id, { ...deps, dir })) {
+  if (compactRestoreBlocking(session.id, { ...deps, dir })) {
     throw new InjectionError(409, 'model restore is pending; opening message was not delivered');
   }
   const families = reopenPremiumFamilies();
@@ -5943,10 +6273,12 @@ async function compactReopenedSession(session, target, account, turn, deps = {})
     premiumFamilies: families,
     forceCold: deps.reopenForceCold === true,
     modelExhausted: (candidate) => compactModelExhausted(candidate,
-      { usage: usageSnapshot(deps), now: Date.now() }),
+      { usage: usageSnapshot(deps), now: Date.now(), accountId: account.id }),
+    modelResetAt: (candidate) => compactModelResetAt(candidate,
+      { usage: usageSnapshot(deps), now: Date.now(), accountId: account.id }),
     claudeTtlMs: envNumber('KEEP_AUTO_COMPACT_CLAUDE_TTL_MIN', envNumber('KEEP_CACHE_TTL_MIN', 60)) * 60e3,
     codexTtlMs: envNumber('KEEP_AUTO_COMPACT_CODEX_TTL_MIN', 30) * 60e3,
-    claudeFallbackModel: envString('KEEP_COMPACT_VIA_MODEL', 'opus'),
+    claudeFallbackModel: compactViaModel(),
     codexFallbackModel: envString('KEEP_AUTO_COMPACT_CODEX_FALLBACK_MODEL', 'gpt-5.6-sol'),
   });
   if (!policy) return null;
@@ -6119,7 +6451,7 @@ async function autoCompactTick(deps = {}) {
     models: compactModelFamilies(),
     claudeTtlMs: envNumber('KEEP_AUTO_COMPACT_CLAUDE_TTL_MIN', envNumber('KEEP_CACHE_TTL_MIN', 60)) * 60e3,
     claudeTargetMs: envNumber('KEEP_AUTO_COMPACT_CLAUDE_TARGET_MIN', 50) * 60e3,
-    claudeFallbackModel: envString('KEEP_COMPACT_VIA_MODEL', 'opus'),
+    claudeFallbackModel: compactViaModel(),
     codexTtlMs: envNumber('KEEP_AUTO_COMPACT_CODEX_TTL_MIN', 30) * 60e3,
     codexTargetMs: envNumber('KEEP_AUTO_COMPACT_CODEX_TARGET_MIN', 20) * 60e3,
     codexFallbackModel: envString('KEEP_AUTO_COMPACT_CODEX_FALLBACK_MODEL', 'gpt-5.6-sol'),
@@ -6150,6 +6482,9 @@ async function autoCompactTick(deps = {}) {
   };
   opts.modelExhausted = (session) => compactModelExhausted(session, {
     usage: usageSnapshot, now, minHeadroom, accountId: claudeAccountId(session),
+  });
+  opts.modelResetAt = (session) => compactModelResetAt(session, {
+    usage: usageSnapshot, now, accountId: claudeAccountId(session),
   });
   const cheap = (deps.scanSessions || scanSessions)().filter((session) =>
     liveIds.has(session.id) && autoCompactIdleMs(session, stamps, now, opts) !== null);
@@ -6207,6 +6542,7 @@ async function autoCompactTick(deps = {}) {
               cacheUsageAt: freshCandidate.session.usageAt,
               cacheTtlMs: freshCandidate.cacheTtlMs,
               cacheAgeMs: freshCandidate.cacheAgeMs,
+              ...(freshCandidate.reason ? { reason: freshCandidate.reason, exhaustedResetAt: freshCandidate.exhaustedResetAt ?? null } : {}),
             },
           });
         }, { session: candidate.session.id, model: true });
@@ -9497,7 +9833,9 @@ function readBody(req) {
 
 async function inspectAccountHandoff(body, deps = {}) {
   const panes = await listHostPanes(deps, true);
-  if (!panes) return {};
+  // A host that did not answer is not a missing pane: account-handoff refuses this one as
+  // a transient host timeout rather than "needs the original pane".
+  if (!panes) return { hostUnavailable: true };
   const state = await addHostSessionState(await buildState({ hostPanes: panes }), { ...deps, panes });
   const session = state.sessions.find((entry) => entry.id === body.sessionId);
   const pane = panes.find((entry) => entry.id === body.pane);
@@ -9688,6 +10026,8 @@ async function handoffSession(body, deps = {}) {
     ...deps,
     root,
     inspect: deps.inspect || ((request) => inspectAccountHandoff(request, deps)),
+    // A fresh snapshot for proving an unverified stop after the fact.
+    agentProcessRows: deps.agentProcessRows ? () => deps.agentProcessRows(deps) : () => agentProcessRows(deps),
     host: deps.host || { request: (type, params) => hostRequest(type, params, deps) },
     restartSession: deps.restartSession || restartSession,
     restartDeps: deps.restartDeps || deps,
@@ -11360,6 +11700,13 @@ module.exports = {
   pendingCompactSwaps,
   readPendingCompactSwap,
   sweepPendingCompactSwaps,
+  compactRestoreBlocking,
+  assertCompactRestoreSettled,
+  compactRestoreDeferral,
+  compactRestoreRateLimited,
+  compactSwapUserModelChoice,
+  compactModelResetAt,
+  compactViaModel,
   shutdownSettingsRepair,
   readClaudeSettingsModel,
   linesAfterLastEcho,

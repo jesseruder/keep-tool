@@ -182,7 +182,8 @@ unfinished parent eligible for restart.
 Use `keep restart-daemon` under the normal daemon hold, not `launchctl kickstart -k`.
 The command requires the launchd KeepAlive service. It refuses pending model-swap
 records (including unreadable records), active compaction, model restoration, or
-injection. Successful admission prevents new compaction/injection before the daemon
+injection. A Claude restore deferred for a rate limit (`restoreDeferredReason` on the
+record) does not hold it: it is durable and the next daemon's pass picks it up. Successful admission prevents new compaction/injection before the daemon
 exits; launchd relaunches it without stopping the terminal host. A direct OS kill
 bypasses this guard and is not a safe activation workflow.
 

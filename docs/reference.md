@@ -2344,7 +2344,10 @@ Keep keeps the pane available for inspection and does not deliver the opening me
 
 Cold Claude compactions whose transcript model matches `KEEP_AUTO_COMPACT_MODELS` (a
 comma-separated family list, default `fable`) first switch the session to
-`KEEP_COMPACT_VIA_MODEL` (default `opus`; set it to `off` to disable the swap).
+`KEEP_COMPACT_VIA_MODEL` (default `claude-opus-5`; set it to `off` to disable the swap).
+The switch types that full id, with `[1m]` appended when the session's restore model
+carries the 1M window, so the transcript names a model a handoff can reproduce; the
+legacy value `opus` is read as the default id, and any other value is typed as set.
 Auto-compact skips that switch when it can submit before the current model's prompt
 cache expires. Direct `keep compact` calls and compact-before-deliver retain the
 existing swap behavior.
@@ -2363,6 +2366,27 @@ switching and removes it only after a confirmed session restore. A retained file
 may need a manual fix. Direct `keep compact <sid>` calls and compact-before-deliver
 use this swap too; on startup, a `PENDING MODEL SWAP` line reports each retained swap
 file for manual inspection.
+
+A retained record blocks messages to its session (`model restore is pending`) and daemon
+restarts, and the pending-swap pass retries the restore every
+`KEEP_COMPACT_RESTORE_RETRY_MIN` (default 10) minutes. Two exceptions keep a spent model
+from wedging a session. When the compaction took the fallback because the original
+model's window was spent (`cold-fallback (model-exhausted)`), or the restore's `/model`
+came back with a rate-limit API error under its echo, Keep does not keep typing it: the
+record gets `restoreDeferredReason` (`model-exhausted` or `rate-limited`) and
+`restoreDeferredUntil`. That is the model's reset from the exhaustion decision or the
+account usage snapshot (plus two minutes) when one is known, else a backoff of
+`KEEP_COMPACT_RESTORE_BACKOFF_MIN` (default 60) minutes doubling per deferral up to
+`KEEP_COMPACT_RESTORE_BACKOFF_MAX_MIN` (default 360). `settings.json` is still repaired at
+once. A deferred record does not block delivery or daemon restarts, since the session is
+deliberately left on the compaction model, and it expires 24 hours after it comes due
+rather than after the swap. The log says `MODEL RESTORE DEFERRED`. When the deferral comes
+due the restore is typed under the injection lock as usual (the record blocks again for
+that attempt) and is either confirmed, deferred again, or left unconfirmed. Second, if the
+transcript shows a model someone chose by hand after the swap (a confirmed `/model` other
+than the daemon's own switch and restore rows, or an assistant turn on a third model), the
+pass retires the record without typing the restore or repairing `settings.json`, and logs
+`retired model restore record … not restoring … over it`.
 
 Auto-compact targets large eligible Claude sessions and Codex sessions running exactly
 `gpt-6-astra`. Claude eligibility still follows `KEEP_AUTO_COMPACT_MODELS` (default

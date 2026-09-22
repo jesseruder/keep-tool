@@ -139,6 +139,13 @@ const {
   prepareSessionSummary,
   associateDashboardSessionFiles,
   InjectionError,
+  compactRestoreBlocking,
+  assertCompactRestoreSettled,
+  compactRestoreDeferral,
+  compactRestoreRateLimited,
+  compactSwapUserModelChoice,
+  compactModelResetAt,
+  compactViaModel,
 } = require('./serve.js');
 const { createScreenHistoryCache } = require('./screen-history.js');
 
@@ -4333,7 +4340,7 @@ test('compact session uses the newest pending pre-swap settings when settings sa
       },
     });
     assert.equal(result.reason, 'timeout');
-    assert.deepEqual(calls, ['/model opus', '/compact', '/model claude-fable-5-1[1m]']);
+    assert.deepEqual(calls, ['/model claude-opus-5[1m]', '/compact', '/model claude-fable-5-1[1m]']);
     assert.deepEqual(repairs, [{ model: 'claude-fable-5-1[1m]', present: true }]);
   } finally {
     if (priorTimeout === undefined) delete process.env.KEEP_COMPACT_TIMEOUT_MS;
@@ -4421,7 +4428,7 @@ test('compact session accepts screen completion without transcript growth and re
     assert.equal(result.compacted, true);
     assert.equal(result.confirmedBy, 'screen');
     assert.ok(Date.now() - started < 250);
-    assert.deepEqual(calls, ['/model opus', '/compact', '/model claude-fable-5-1']);
+    assert.deepEqual(calls, ['/model claude-opus-5', '/compact', '/model claude-fable-5-1']);
     assert.deepEqual(stages, ['screen-confirmed-no-marker']);
     assert.equal(fs.readFileSync(transcript, 'utf8'), '{}\n');
   } finally {
@@ -4536,7 +4543,7 @@ test('reopen Claude swap repairs only its account settings and journals that acc
       readScreen: async () => '❯', waitForModelSwitch: async () => true,
       typeAndSubmit: async (_target, command) => {
         commands.push(command);
-        if (command === '/model opus') {
+        if (command === '/model claude-opus-5') {
           const journal = readPendingCompactSwap('profile-swap', path.join(root, 'compact'));
           assert.equal(journal.settingsFile, settingsFile);
           assert.equal(journal.accountId, 'managed');
@@ -4546,7 +4553,7 @@ test('reopen Claude swap repairs only its account settings and journals that acc
       },
     });
   assert.equal(result.restoreUnconfirmed, undefined);
-  assert.deepEqual(commands, ['/model opus', '/compact', '/model claude-fable-5-1']);
+  assert.deepEqual(commands, ['/model claude-opus-5', '/compact', '/model claude-fable-5-1']);
   assert.equal(JSON.parse(fs.readFileSync(settingsFile)).model, 'claude-sonnet-5');
   assert.equal(JSON.parse(fs.readFileSync(daemonFile)).model, 'daemon-only');
   assert.equal(pendingCompactSwaps(path.join(root, 'compact')).length, 0);
@@ -11322,7 +11329,7 @@ test('compact session restores the pane launch model rather than the transcript 
       repairClaudeSettingsModel: () => ({ changed: false }),
     });
     assert.equal(result.reason, 'timeout');
-    assert.deepEqual(calls, ['/model opus', '/compact', '/model claude-fable-5-1']);
+    assert.deepEqual(calls, ['/model claude-opus-5', '/compact', '/model claude-fable-5-1']);
   } finally {
     if (priorTimeout === undefined) delete process.env.KEEP_COMPACT_TIMEOUT_MS;
     else process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout;
@@ -12028,4 +12035,267 @@ test('the drift wake reads the verdict shape judge() actually returns', async ()
   assert.equal(driftWakeFromVerdict(turn, null, { review: reviewApi, reviewDeps: {} }), null);
   assert.equal(driftWakeFromVerdict(turn, verdict, { review: { ...reviewApi, cadenceMode: () => 'clock' }, reviewDeps: {} }), null);
   assert.equal(seen.length, 1, 'none of those reached driftWake');
+});
+
+
+// ---- 2026-09-21: an auto-compaction restore aimed at a spent model ----
+// A session was compacted through the model-exhausted cold fallback; the restore then
+// typed a /model the API refused with a 429, and the swap record left behind blocked every
+// message, re-typed the refused restore every ten minutes over a model the user picked by
+// hand, and made the handoff read the bare `/model opus` as unreproducible.
+
+function exhaustedSnapshot(now, resetsAt, percent = 100) {
+  return { accounts: { 'claude-exhausted': { identity: { agent: 'claude' },
+    snapshot: { fetchedAt: now - 60e3, limits: [{ label: 'Fable wk', percent, resetsAt }] } } } };
+}
+
+test('the model-exhausted decision carries the reset time its restore must wait for', () => {
+  const now = Date.parse('2026-09-21T12:00:00Z');
+  const reset = Date.parse('2026-09-23T08:00:00Z');
+  const session = { id: 's', kind: 'claude', model: 'claude-fable-5-1', accountId: 'claude-exhausted' };
+  assert.equal(compactModelResetAt(session, { usage: exhaustedSnapshot(now, new Date(reset).toISOString()), now }), reset);
+  assert.equal(compactModelResetAt(session, { usage: exhaustedSnapshot(now, reset), now }), reset, 'epoch ms too');
+  assert.equal(compactModelResetAt(session, { usage: exhaustedSnapshot(now, now - 1), now }), null, 'a reset already past is none');
+  assert.equal(compactModelResetAt({ ...session, rateLimit: { type: 'fable_weekly', resetsAt: '2026-09-22T00:00:00Z' } },
+    { usage: null, now }), Date.parse('2026-09-22T00:00:00Z'), 'the parked limit error names it on its own');
+  assert.equal(compactModelResetAt(session, { usage: null, now }), null);
+
+  const opts = { ttlMs: 0, maxIdleMs: 24 * 60 * 60e3, minTokens: 100000, models: ['fable'],
+    claudeTtlMs: 60 * 60e3, claudeTargetMs: 50 * 60e3, claudeFallbackModel: 'claude-opus-5',
+    modelExhausted: () => true, modelResetAt: () => reset };
+  const warm = { id: 'w', kind: 'claude', model: 'claude-fable-5-1', usageAt: now - 55 * 60e3, contextTokens: 150000 };
+  const policy = autoCompactPolicy(warm, now, opts);
+  assert.equal(policy.reason, 'model-exhausted');
+  assert.equal(policy.exhaustedResetAt, reset);
+  const reopen = reopenCompactPolicy(warm, now, { modelExhausted: () => true, modelResetAt: () => reset });
+  assert.equal(reopen.path, 'cold-fallback');
+  assert.equal(reopen.reason, 'model-exhausted');
+  assert.equal(reopen.exhaustedResetAt, reset);
+  assert.equal(reopenCompactPolicy(warm, now, { forceCold: true }).reason, undefined, 'a cold cache alone is no exhaustion');
+});
+
+test('the compaction switch types a full model id, with the 1M window the restore carries', () => {
+  const prior = process.env.KEEP_COMPACT_VIA_MODEL;
+  try {
+    delete process.env.KEEP_COMPACT_VIA_MODEL;
+    assert.equal(compactViaModel(), 'claude-opus-5');
+    process.env.KEEP_COMPACT_VIA_MODEL = 'opus';
+    assert.equal(compactViaModel(), 'claude-opus-5', 'the legacy alias default reads as the id');
+    process.env.KEEP_COMPACT_VIA_MODEL = 'claude-sonnet-5';
+    assert.equal(compactViaModel(), 'claude-sonnet-5');
+  } finally {
+    if (prior === undefined) delete process.env.KEEP_COMPACT_VIA_MODEL; else process.env.KEEP_COMPACT_VIA_MODEL = prior;
+  }
+  const session = { kind: 'claude', model: 'claude-fable-5-1' };
+  const opts = { via: 'claude-opus-5', families: ['fable'] };
+  assert.equal(compactSwapPlan(session, { ...opts, settingsModel: 'claude-fable-5-1[1m]' }).switchCommand, '/model claude-opus-5[1m]');
+  assert.equal(compactSwapPlan(session, { ...opts, settingsModel: 'claude-sonnet-5' }).switchCommand, '/model claude-opus-5');
+  assert.equal(compactSwapPlan({ ...session, model: 'claude-fable-5-1[1m]' }, { ...opts, settingsModel: '' }).switchCommand,
+    '/model claude-opus-5[1m]', 'a 1M launch model too');
+  assert.equal(compactSwapPlan({ ...session, model: 'claude-opus-5' }, opts), null, 'already on the fallback');
+  assert.equal(compactSwapPlan(session, { ...opts, via: 'claude-opus-5[1m]', settingsModel: 'claude-fable-5-1[1m]' }).switchCommand,
+    '/model claude-opus-5[1m]', 'a configured window is not doubled');
+  // Every reader of the switch still recognizes the id.
+  assert.equal(modelSwitchConfirmed('❯ /model claude-opus-5[1m]\n  ⎿  Set model to Opus 5 (1M context)', '/model claude-opus-5[1m]'), true);
+});
+
+test('a /model the API refused is not a model change to the handoff scan', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-refused-switch-'));
+  try {
+    const real = (model) => JSON.stringify({ type: 'assistant', message: { model, usage: { input_tokens: 10 } } });
+    const modelCommand = (args) => JSON.stringify({ type: 'user', message: { content: [{ type: 'text',
+      text: `<command-name>/model</command-name><command-message>model</command-message><command-args>${args}</command-args>`,
+    }] } });
+    const out = (stream, text) => JSON.stringify({ type: 'system', subtype: 'local_command',
+      content: `<local-command-${stream}>${text}</local-command-${stream}>` });
+    const resolve = (name, rows) => {
+      const file = path.join(dir, `${name}.jsonl`);
+      fs.writeFileSync(file, `${rows.join('\n')}\n`);
+      return handoffCurrentModel({ id: name, kind: 'claude' }, { meta: { model: 'claude-fable-5-1[1m]' } }, '', {
+        findSessionFile: () => file, managedSettingsFiles: [], managedPreferenceFiles: [],
+      });
+    };
+    const refusal = 'API error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"limit"}}';
+    for (const stream of ['stdout', 'stderr']) {
+      assert.equal(resolve(`refused-${stream}`, [
+        real('claude-fable-5-1'),
+        modelCommand('claude-opus-5[1m]'), out('stdout', 'Set model to Opus 5 (1M context)'),
+        real('claude-opus-5'),
+        modelCommand('claude-fable-5-1[1m]'), out(stream, refusal),
+      ]), 'claude-opus-5[1m]', `the refused restore on ${stream} is stepped over to the switch before it`);
+    }
+    assert.equal(resolve('refused-only', [real('claude-fable-5-1'), modelCommand('claude-opus-5'), out('stdout', refusal)]),
+      'claude-fable-5-1[1m]', 'with nothing else, the record and launch window stand');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a model-exhausted compaction defers its restore instead of typing it, and the deferral does not block delivery', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-deferred-test-'));
+  const dir = path.join(root, 'compact');
+  const transcript = path.join(root, 'transcript.jsonl');
+  fs.writeFileSync(transcript, '{}\n');
+  const reset = Date.now() + 36 * 60 * 60e3;
+  const calls = [];
+  const repairs = [];
+  try {
+    const result = await compactSession({ id: 'spent-fable', kind: 'claude' }, { pane: 'pane:test' }, null, {
+      dir, compactPollMs: 5, compactMarkerGraceMs: 0, compactTrace: compactTraceSpy([]),
+      compactionPolicy: { path: 'cold-fallback', originalModel: 'claude-fable-5-1', targetModel: 'claude-opus-5',
+        reason: 'model-exhausted', exhaustedResetAt: reset },
+      sessionLastTurn: () => ({ model: 'claude-fable-5-1' }),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-fable-5-1[1m]' }),
+      transcriptFileForSession: () => transcript, hostPaneModel: async () => '',
+      readScreen: async () => '❯ /compact\n  ⎿  Compacted (ctrl+o to see full summary)\n\n❯ ',
+      typeAndSubmit: async (_target, command) => { calls.push(command); },
+      waitForModelSwitch: async () => true,
+      repairClaudeSettingsModel: (value) => { repairs.push(value); return { changed: true }; },
+    });
+    assert.deepEqual(calls, ['/model claude-opus-5[1m]', '/compact'], 'no restore typed at the spent model');
+    assert.equal(result.compacted, true);
+    assert.equal(result.restoreUnconfirmed, undefined);
+    assert.equal(result.restoreDeferred, true);
+    assert.deepEqual(repairs, ['claude-fable-5-1[1m]'], 'settings.json is still put back');
+    const record = readPendingCompactSwap('spent-fable', dir);
+    assert.equal(record.restoreDeferredReason, 'model-exhausted');
+    assert.equal(record.restoreResetAt, reset);
+    assert.ok(record.restoreDeferredUntil > reset);
+    assert.equal(record.switchModel, 'claude-opus-5[1m]');
+    assert.equal(compactRestoreBlocking('spent-fable', { dir }), null);
+    assert.doesNotThrow(() => assertCompactRestoreSettled('spent-fable', { dir }));
+    // An ordinary unconfirmed record still blocks.
+    writeCompactSwapFixture(dir, 'unconfirmed');
+    assert.throws(() => assertCompactRestoreSettled('unconfirmed', { dir }), /model restore is pending/);
+    fs.writeFileSync(path.join(dir, 'garbled.swap.json'), 'not json');
+    assert.ok(compactRestoreBlocking('garbled', { dir }), 'an unreadable record blocks');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a restore refused for a rate limit on screen is deferred on the backoff clock', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-429-test-'));
+  const dir = path.join(root, 'compact');
+  const transcript = path.join(root, 'transcript.jsonl');
+  fs.writeFileSync(transcript, '{}\n');
+  const refused = '❯ /model claude-fable-5-1[1m]\n  ⎿  API error: 429 rate_limit_error\n\n❯ ';
+  let restoreTyped = false;
+  try {
+    const result = await compactSession({ id: 'refused-restore', kind: 'claude' }, { pane: 'pane:test' }, null, {
+      dir, compactPollMs: 5, compactMarkerGraceMs: 0, compactTrace: compactTraceSpy([]),
+      sessionLastTurn: () => ({ model: 'claude-fable-5-1' }),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-fable-5-1[1m]' }),
+      transcriptFileForSession: () => transcript, hostPaneModel: async () => '',
+      readScreen: async () => (restoreTyped ? refused : '❯ /compact\n  ⎿  Compacted (ctrl+o to see full summary)\n\n❯ '),
+      typeAndSubmit: async (_target, command) => { if (command === '/model claude-fable-5-1[1m]') restoreTyped = true; },
+      waitForModelSwitch: async (_target, command) => command !== '/model claude-fable-5-1[1m]',
+      repairClaudeSettingsModel: () => ({ changed: false }),
+    });
+    assert.equal(result.restoreDeferred, true);
+    assert.equal(result.restoreUnconfirmed, undefined);
+    const record = readPendingCompactSwap('refused-restore', dir);
+    assert.equal(record.restoreDeferredReason, 'rate-limited');
+    assert.equal(record.restoreResetAt, undefined);
+    assert.ok(Math.abs(record.restoreDeferredUntil - (Date.now() + 60 * 60e3)) < 60e3, 'the first backoff is an hour');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  assert.equal(compactRestoreRateLimited('❯ /model x\n ⎿ API error: 429 {"error":{"type":"rate_limit_error"}}', '/model x'), true);
+  assert.equal(compactRestoreRateLimited('API error: 429\n❯ /model x\n ⎿ Set model to X', '/model x'), false,
+    'a refusal above the echo is an older one');
+  const at = Date.parse('2026-09-21T00:00:00Z');
+  assert.equal(compactRestoreDeferral({ restoreDeferrals: 2 }, { reason: 'rate-limited', resetAt: null, now: at }).restoreDeferredUntil,
+    at + 4 * 60 * 60e3, 'doubling per deferral');
+  assert.equal(compactRestoreDeferral({ restoreDeferrals: 9 }, { reason: 'rate-limited', resetAt: null, now: at }).restoreDeferredUntil,
+    at + 6 * 60 * 60e3, 'capped');
+});
+
+test('pending swap sweep waits out a deferral, re-defers on another 429, and restores once the window is back', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-sweep-deferred-'));
+  const dir = path.join(root, 'compact');
+  const session = { id: 'deferred', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  let clock = Date.parse('2026-09-04T12:05:00Z');
+  try {
+    const file = writeCompactSwapFixture(dir, session.id, { switchModel: 'claude-opus-5[1m]',
+      restoreDeferredReason: 'model-exhausted', restoreDeferredUntil: clock + 60 * 60e3, restoreDeferrals: 1 });
+    const calls = [];
+    let screen = '❯';
+    const deps = { ...compactRestoreDeps(dir, session, calls), now: () => clock,
+      transcriptFileForSession: () => null, usageSnapshot: null,
+      readScreen: async () => screen,
+      waitForModelSwitch: async () => screen === '❯' };
+    let summary = await sweepPendingCompactSwaps(deps);
+    assert.equal(summary.skipped, 1);
+    assert.deepEqual(calls, [], 'nothing typed before the deferral comes due');
+
+    clock += 61 * 60e3;
+    screen = '❯ /model claude-fable-5-1[1m]\n  ⎿  API error: 429 rate_limit_error\n\n❯ ';
+    summary = await sweepPendingCompactSwaps(deps);
+    assert.deepEqual(calls, ['/model claude-fable-5-1[1m]']);
+    const redeferred = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(redeferred.restoreDeferredReason, 'rate-limited');
+    assert.equal(redeferred.restoreDeferrals, 2);
+    assert.equal(redeferred.restoreDeferredUntil, clock + 2 * 60 * 60e3);
+    assert.equal(compactRestoreBlocking(session.id, { dir }), null);
+
+    // Long past the ordinary 24h age, but it ages from when it comes due.
+    clock = redeferred.restoreDeferredUntil + 60e3;
+    screen = '❯';
+    summary = await sweepPendingCompactSwaps(deps);
+    assert.equal(summary.restored, 1);
+    assert.equal(fs.existsSync(file), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('pending swap sweep retires a record once someone picks a model by hand after the swap', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-sweep-user-model-'));
+  const dir = path.join(root, 'compact');
+  const transcript = path.join(root, 'transcript.jsonl');
+  const at = Date.parse('2026-09-04T12:00:00Z');
+  const stamp = (offsetMs) => new Date(at + offsetMs).toISOString();
+  const modelCommand = (args, offsetMs) => JSON.stringify({ type: 'user', timestamp: stamp(offsetMs), message: { content: [{ type: 'text',
+    text: `<command-name>/model</command-name><command-message>model</command-message><command-args>${args}</command-args>` }] } });
+  const out = (text, offsetMs) => JSON.stringify({ type: 'system', subtype: 'local_command', timestamp: stamp(offsetMs),
+    content: `<local-command-stdout>${text}</local-command-stdout>` });
+  const real = (model, offsetMs) => JSON.stringify({ type: 'assistant', timestamp: stamp(offsetMs), message: { model, usage: { input_tokens: 1 } } });
+  const refusal = 'API error: 429 rate_limit_error';
+  const record = { at, switchModel: 'opus', restoreCommand: '/model claude-fable-5-1[1m]' };
+  const choice = (rows, extra = {}) => {
+    fs.writeFileSync(transcript, `${rows.join('\n')}\n`);
+    return compactSwapUserModelChoice({ ...record, ...extra }, transcript);
+  };
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const daemonOnly = [real('claude-fable-5-1', -60e3),
+      modelCommand('opus', 1e3), out('Set model to Opus 5', 2e3), real('claude-opus-5', 3e3),
+      modelCommand('claude-fable-5-1[1m]', 4e3), out(refusal, 5e3)];
+    assert.equal(choice(daemonOnly), null, 'the daemon\'s own switch and refused restores are not a choice');
+    const handPicked = [...daemonOnly, modelCommand('claude-opus-5[1m]', 6e3), out('Set model to Opus 5 (1M context)', 7e3)];
+    assert.match(choice(handPicked).reason, /claude-opus-5\[1m\] was chosen after the swap/);
+    assert.equal(choice([...daemonOnly, modelCommand('claude-sonnet-5', 6e3), out(refusal, 7e3)]), null,
+      'a hand /model the API refused changed nothing either');
+    assert.equal(choice([modelCommand('claude-sonnet-5', -1e3), out('Set model to Sonnet 5', -1e3), ...daemonOnly]), null,
+      'a choice from before the swap is what the swap already recorded');
+    assert.match(choice([...daemonOnly, real('claude-sonnet-5', 8e3)]).reason, /moved to claude-sonnet-5/);
+    // With a full-id switch, a second /model of the same id is a person's.
+    const fullId = { switchModel: 'claude-opus-5[1m]' };
+    assert.equal(choice([real('claude-fable-5-1', -60e3), modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 2e3)], fullId), null);
+    assert.ok(choice([real('claude-fable-5-1', -60e3), modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 2e3),
+      modelCommand('claude-opus-5[1m]', 9e3), out('Set model to Opus 5 (1M context)', 9e3)], fullId));
+
+    // The sweep: retired, nothing typed, and settings.json left on the hand choice.
+    fs.writeFileSync(transcript, `${handPicked.join('\n')}\n`);
+    const session = { id: 'hand-picked', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+    const file = writeCompactSwapFixture(dir, session.id, { at, switchModel: 'opus' });
+    const calls = [];
+    const repairs = [];
+    const summary = await sweepPendingCompactSwaps({ ...compactRestoreDeps(dir, session, calls),
+      transcriptFileForSession: () => transcript,
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-opus-5[1m]' }),
+      repairClaudeSettingsModel: (value) => { repairs.push(value); return { changed: true }; } });
+    assert.equal(fs.existsSync(file), false);
+    assert.equal(summary.dropped, 1);
+    assert.deepEqual(calls, []);
+    assert.deepEqual(repairs, [], 'the saved default the person just set is not undone');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('an unanswered pane list is a host timeout to the handoff, not a missing pane', async () => {
+  const { inspectAccountHandoff } = require('./serve.js');
+  assert.deepEqual(await inspectAccountHandoff({ sessionId: 'any', pane: 'pane-1' }, { host: null }), { hostUnavailable: true });
 });
