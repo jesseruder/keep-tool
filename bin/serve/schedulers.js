@@ -1,5 +1,6 @@
 'use strict';
 const path = require('node:path');
+const nodes = require('../nodes.js');
 // keep serve — the daemon's periodic jobs.
 //
 // Every block here was moved verbatim out of start() in serve.js: the schedulers
@@ -193,12 +194,20 @@ function createCleanupSnapshot({
     // That freshness guarantee belongs to the pane list. The fleet build and companion
     // discovery can use their workers and ordinary caches without weakening it.
     const panes = await listHostPanes({}, true);
+    // Every automatic policy fed from this snapshot reasons about this machine: the
+    // shell close verifies a pid in the local process table, and retirement compares
+    // an agent pid it can see. A pane on another node answers none of those questions
+    // here, so it is kept out of the snapshot entirely until (landing 1b) the node
+    // can answer them about itself. The dashboard build below still sees the whole fleet.
+    const local = (panes || []).filter((pane) => !pane?.node || pane.node === nodes.daemonNode());
     const companion = await companionSnapshot(deps);
     const state = await dashboardBuild({ hostPanes: panes, companion, dashboard: true });
-    reconcile(keep.ROOT, state.sessions, panes);
+    reconcile(keep.ROOT, state.sessions, local);
     const layouts = await keepConsole.readLayouts(path.join(keep.ROOT, '.keep', 'layouts.json'));
     return {
       ...state,
+      // The panes every automatic policy is allowed to touch: this machine's.
+      panes: local,
       // The build's task list excludes the archive; a session on an archived card
       // must still find it here or cleanup treats it as cardless.
       allTasks: keep.loadAll(true),

@@ -349,3 +349,33 @@ test('every ctx value a scheduler is handed is destructured from ctx', () => {
     assert.ok(declared.has(name), `${name} is handed to a scheduler but never destructured from ctx`);
   }
 });
+
+test('the cleanup snapshot never hands an automatic policy a pane on another node', async () => {
+  const calls = [];
+  const panes = [
+    { id: 'local-one' },
+    { id: 'local-two', node: 'main' },
+    { id: 'far-one@aws1', node: 'aws1', hostPaneId: 'far-one' },
+  ];
+  const snapshot = createCleanupSnapshot({
+    keep: { ROOT, loadAll: () => [] },
+    keepConsole: { readLayouts: async () => ({ layouts: [] }) },
+    listHostPanes: async () => panes,
+    companionSnapshot: async () => ({ known: true, jobs: [] }),
+    dashboardBuild: async (input) => {
+      calls.push(['build', input.hostPanes.map((pane) => pane.id)]);
+      return { sessions: [], panes: input.hostPanes };
+    },
+    reconcile: (root, sessions, seenPanes) => calls.push(['reconcile', seenPanes.map((pane) => pane.id)]),
+  });
+  const result = await snapshot();
+  // Everything an automatic policy reads — the shell sweep's candidates and
+  // retirement's liveness — stops at this machine, because the pid it would check
+  // and the process table it would check it against are both this machine's.
+  assert.deepEqual(result.panes.map((pane) => pane.id), ['local-one', 'local-two']);
+  assert.deepEqual(calls.find((call) => call[0] === 'reconcile'), ['reconcile', ['local-one', 'local-two']]);
+  // The dashboard build still sees the whole fleet: this is a policy boundary,
+  // not a decision to stop showing the panes.
+  assert.deepEqual(calls.find((call) => call[0] === 'build'),
+    ['build', ['local-one', 'local-two', 'far-one@aws1']]);
+});

@@ -19,7 +19,9 @@ function withinBudget(promise, remainingMs) {
 
 // Explicit user Close only. Automatic retirement keeps its conservative policy.
 async function manualClose(body, deps) {
-  if (!/^[a-z0-9_-]+$/i.test(body?.sessionId || '') || !/^[a-z0-9_-]+$/i.test(body?.pane || '')) throw new Error('Expected exact session and pane');
+  // A pane may be named by the node it lives on (`<id>@<node>`); the host's own
+  // alphabet has no '@', so the two shapes stay distinguishable here.
+  if (!/^[a-z0-9_-]+$/i.test(body?.sessionId || '') || !/^[a-z0-9_-]{1,64}(?:@[a-z0-9]+)?$/i.test(body?.pane || '')) throw new Error('Expected exact session and pane');
   const initial = await withinBudget(deps.getPane(body.pane), READ_BUDGET_MS);
   if (deps.requireSignalGuard && deps.signalGuarded !== true) {
     throw new Error('Terminal host must be refreshed before automatic force close');
