@@ -1,4 +1,5 @@
 import * as api from './api.js';
+import { runAction } from './action.js';
 import { sessionExplanation } from './status.js';
 import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHandoff } from './account-controls.js';
 import { portableTransferControls, installPortableTransferControls } from './portable-transfer.js';
@@ -166,23 +167,15 @@ function renderGrid(ctx, layout) {
       } catch (error) { ctx.toast(error.message); }
     };
     const reopen = element.querySelector('[data-reopen]');
-    if (reopen) reopen.onclick = async () => {
-      if (reopen.disabled) return;
-      reopen.disabled = true;
-      try {
+    if (reopen) reopen.onclick = () => runAction(reopen, async () => {
         await ctx.reopenSession({
           sessionId: pane.meta?.sessionId, agent: pane.meta?.agent, title: entity.title, stalePane: pane.id,
         });
-      } finally { reopen.disabled = false; }
-    };
+      }, { label: 'Reopening…', ctx, retry: () => reopen.click() }).catch(() => {});
     const remove = element.querySelector('[data-remove-pane]');
-    if (remove) remove.onclick = async () => {
-      if (remove.disabled) return;
-      remove.disabled = true;
-      try { await ctx.removePane(pane.id); ctx.toast('Pane removed'); }
-      catch (error) { ctx.toast(`Could not remove: ${error.message}`); }
-      finally { remove.disabled = false; }
-    };
+    if (remove) remove.onclick = () => runAction(remove, async () => {
+      await ctx.removePane(pane.id); ctx.toast('Pane removed');
+    }, { label: 'Removing…', ctx, retry: () => remove.click() }).catch(() => {});
   }
   for (const child of [...grid.children]) if (!retained.has(child)) child.remove();
   if (gridChanged) ctx.scheduleTerminalFit();
@@ -228,9 +221,8 @@ export function installWatchControls(ctx) {
     if (button.disabled) return;
     const cwd = document.querySelector('#shellProject').value;
     if (!cwd) { ctx.toast('No known project directory'); return; }
-    button.disabled = true;
     button.blur();
-    try {
+    await runAction(button, async () => {
       await ctx.newSession(cwd, ctx.projectOf(cwd).name, async (pane, selection) => {
         if (!currentLayout(ctx).ids.includes(pane.id)) currentLayout(ctx).ids.push(pane.id);
         ctx.state.focusPane = pane.id;
@@ -240,7 +232,7 @@ export function installWatchControls(ctx) {
         const kind = ({ shell: 'Shell', claude: 'Claude Code', codex: 'Codex', pi: 'Pi' })[selection.kind];
         ctx.toast(`${kind} opened in ${ctx.projectOf(selection.cwd).name}`);
       });
-    } finally { button.disabled = false; }
+    }, { label: 'Opening…', ctx, retry: () => button.click() }).catch(() => {});
   });
 }
 import { closeSession } from './close-session.js';

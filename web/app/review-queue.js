@@ -175,7 +175,8 @@ async function submit(ctx, item, action, fields = {}, retry = false, requestIdOv
   form = null;
   renderReviewQueue(ctx);
   try {
-    const result = await write('/api/review-queue', { id: item.id, action, requestId: request.requestId, ...fields });
+    const result = await write('/api/review-queue', { id: item.id, action, requestId: request.requestId, ...fields }, 'POST',
+      { label: 'Updating review item' });
     pending.delete(item.id);
     await ctx.reload();
     if (result?.sessionId && !surfaceError) ctx.openReviewSession(result.sessionId);

@@ -29,6 +29,51 @@ test('state failures a daemon restart produces are marked transient, and only th
   assert.equal((await failure()).transient, false, 'a server error is not a restart');
 });
 
+test('writes time out with action context and leave the pending registry', async () => {
+  globalThis.fetch = async (_url, options) => new Promise((_resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+  });
+  const api = await import(`./api.js?timeout=${Date.now()}`);
+  const changes = [];
+  const off = api.onPendingChange(() => changes.push(api.pendingWrites().map((row) => row.label)));
+  const error = await api.write('/api/example', {}, 'POST', { label: 'Closing', timeoutMs: 5 })
+    .then(() => null, (failure) => failure);
+  off();
+  assert.equal(error.message, 'Closing timed out after 0.005 s — the daemon may still be doing it');
+  assert.equal(error.transient, true);
+  assert.equal(error.timeout, true);
+  assert.deepEqual(changes, [['Closing'], []]);
+  assert.deepEqual(api.pendingWrites(), []);
+  assert.equal(api.lastWriteFailure().label, 'Closing');
+});
+
+test('a background write is neither shown pending nor retained as a failure', async () => {
+  globalThis.fetch = async () => { throw new TypeError('offline'); };
+  const api = await import(`./api.js?background=${Date.now()}`);
+  const changes = [];
+  const off = api.onPendingChange(() => changes.push(api.pendingWrites().length));
+  const error = await api.write('/api/example', {}, 'POST', { label: 'Loading icons', background: true })
+    .then(() => null, (failure) => failure);
+  off();
+  assert.equal(error.message, 'offline', 'the caller still sees the failure');
+  assert.deepEqual(changes, [], 'nothing was published to the chip');
+  assert.equal(api.lastWriteFailure(), null, 'no sticky alert for housekeeping');
+});
+
+test('a successful write with the same label clears its retained failure', async () => {
+  let fail = true;
+  globalThis.fetch = async () => {
+    if (fail) throw new TypeError('offline');
+    return reply({ ok: true });
+  };
+  const api = await import(`./api.js?failure-lifecycle=${Date.now()}`);
+  await api.write('/api/example', {}, 'POST', { label: 'Saving' }).catch(() => {});
+  assert.equal(api.lastWriteFailure().message, 'offline');
+  fail = false;
+  await api.write('/api/example', {}, 'POST', { label: 'Saving' });
+  assert.equal(api.lastWriteFailure(), null);
+});
+
 test('fresh reads preserve the newest concurrent mutation fence and accept a restarted daemon epoch', async () => {
   const calls = [];
   let releaseOldState;

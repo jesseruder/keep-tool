@@ -1,4 +1,5 @@
 import { write } from './api.js';
+import { runAction } from './action.js';
 
 export function restartControls(ctx, sessionId) {
   const entry = [...(ctx.data.restarts || [])].reverse().find((e) => e.sessionId === sessionId);
@@ -19,19 +20,18 @@ export function installRestartControls(container, ctx, sessionId, pane) {
   container.querySelectorAll('[data-restart]').forEach((button) => {
     button.onclick = async () => {
       if (button.disabled) return;
-      button.disabled = true;
       button.blur();
       const origin = `${ctx.state.mode}:${ctx.state.selectedKey}:${ctx.state.layout}`;
       try {
-        const result = await write('/api/restart-session', { sessionId, pane, mode: button.dataset.restart });
+        const result = await runAction(button, () => write('/api/restart-session', { sessionId, pane, mode: button.dataset.restart }, 'POST', { label: 'Restarting session' }),
+          { label: button.dataset.restart === 'cancel' ? 'Cancelling…' : 'Restarting…', ctx, retry: () => button.click() });
         ctx.toast(result.status === 'failed' ? `Not restarted: ${result.reason}`
           : result.status === 'done' ? 'Session restarted; conversation and pins preserved'
           : result.status === 'cancelled' ? 'Restart cancelled' : 'Restart queued; waits for an idle, unviewed pane');
         if (result.status === 'done' && document.activeElement === document.body
             && origin === `${ctx.state.mode}:${ctx.state.selectedKey}:${ctx.state.layout}`) ctx.state.focusPane = pane;
         await ctx.reload();
-      } catch (error) { ctx.toast(`Not restarted: ${error.message}`); }
-      finally { button.disabled = false; }
+      } catch {}
     };
   });
 }

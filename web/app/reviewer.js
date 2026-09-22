@@ -1,6 +1,7 @@
 import * as api from './api.js';
 import { restartControls, installRestartControls } from './restart-session.js';
 import { accountLabelHTML, handoffControls, installHandoffControls } from './account-controls.js';
+import { runAction } from './action.js';
 
 const ACTIONS_KEY = 'keep.console.reviewer.actionsOnly';
 const SEEN_KEY = 'keep.console.reviewer.seenAt';
@@ -193,12 +194,13 @@ export function renderReviewer(ctx) {
   if (session?.pane) ctx.mount(terminal.querySelector('.review-terminal'), session.pane, { slot: 'reviewer' });
   else terminal.querySelector('.review-terminal').innerHTML = '<div class="placeholder">The reviewer is not currently attached to a host pane.</div>';
   if (changed) {
-    terminal.querySelector('[data-review-tick]').addEventListener('click', async () => {
+    terminal.querySelector('[data-review-tick]').addEventListener('click', async (event) => {
       try {
-        const result = await api.reviewTick();
+        const button = event.currentTarget;
+        const result = await runAction(button, api.reviewTick, { label: 'Sending…', ctx, retry: () => button.click() });
         ctx.toast(result.sent ? 'Reviewer tick sent.' : `Reviewer tick skipped: ${result.why || 'not sent'}`);
         ctx.reload();
-      } catch (error) { ctx.toast(error.message); }
+      } catch {}
     });
     terminal.querySelector('[data-review-stats]').addEventListener('click', (event) => {
       event.stopPropagation();

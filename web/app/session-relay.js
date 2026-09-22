@@ -1,4 +1,5 @@
 import * as api from './api.js';
+import { runAction } from './action.js';
 
 // Relay one session's last message into another live session.
 //
@@ -109,11 +110,11 @@ function renderDialog(ctx, state) {
   modal.querySelector('[data-relay-cancel]')?.addEventListener('click', () => modal.close());
   modal.querySelector('[data-relay-send]')?.addEventListener('click', async (event) => {
     const button = event.currentTarget;
-    button.disabled = true;
     state.error = '';
     const target = state.targetId;
     try {
-      await api.send(target, relayText(state.sourceAgent, state.sourceSessionId, state.text));
+      await runAction(button, () => api.send(target, relayText(state.sourceAgent, state.sourceSessionId, state.text)),
+        { label: 'Sending…', ctx, retry: () => button.click() });
       modal.close();
       ctx.toast(`relayed to ${String(target).slice(0, 8)}`);
     } catch (error) {

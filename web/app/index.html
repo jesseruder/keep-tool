@@ -23,7 +23,6 @@
 </head>
 <body>
   <header class="bar" data-tauri-drag-region>
-    <span id="connection" hidden>connecting</span>
     <nav class="modes">
       <button data-mode="triage" class="on">Triage <kbd>⌘1</kbd><span class="count zero" id="qcount">0</span></button>
       <button data-mode="watch">Watch <kbd>⌘2</kbd></button>
@@ -38,6 +37,7 @@
       <div class="history-pop" id="sessionHistoryList" hidden></div>
     </div>
     <div class="health" id="health" title="daemon health" role="button" tabindex="0"><i></i><span>daemon</span><div class="pop"></div></div>
+    <span id="connection" class="connection" data-status="connecting" role="status" aria-live="polite">connecting</span>
     <div class="theme-picker" id="themePicker"><button class="themebtn" id="themebtn" title="appearance and palette" aria-haspopup="true" aria-expanded="false">Moss · Auto</button><div class="theme-pop"></div></div>
     <button class="dockbtn" id="dockbtn" title="show the reviewer beside any mode"><span>Reviewer pane</span><span class="nw" hidden></span><kbd>R</kbd></button>
     <div class="meters num" id="meters"></div>
@@ -72,6 +72,7 @@
 
   <footer class="keys"><span><kbd>j</kbd><kbd>k</kbd> move in Triage</span><span><kbd>⌘↵</kbd> focus terminal</span><span><kbd>⌘⎋</kbd> leave terminal</span><span><kbd>1</kbd>–<kbd>9</kbd> pick in Triage</span><span><kbd>p</kbd> pin in Triage</span><span><kbd>?</kbd> all keys</span><span class="note">live Keep state · terminals stream from the host</span></footer>
   <div class="toast" id="toast"></div>
+  <section class="write-failure" id="writeFailure" role="alert" hidden></section>
   <div class="help" id="help"><div class="card"><h3>Keys</h3><dl><dt><kbd>⌘1</kbd>–<kbd>⌘5</kbd></dt><dd>Triage, Watch, Reviewer, Queue, Fleet</dd><dt><kbd>⌘B</kbd></dt><dd>Collapse / expand the project rail</dd><dt><kbd>⌘\</kbd></dt><dd>Collapse / expand the queue</dd><dt><kbd>⌘⇧B</kbd></dt><dd>Collapse / expand the Reviewer side panel</dd><dt><kbd>⌘↵</kbd></dt><dd>Focus terminal; insert a newline when already in the terminal</dd><dt><kbd>⌘⎋</kbd></dt><dd>Leave the terminal: focus the queue so j/k and the Triage keys work again</dd><dt><kbd>j</kbd> / <kbd>k</kbd></dt><dd>Move in the queue</dd><dt><kbd>1</kbd>–<kbd>9</kbd></dt><dd>Choose an option or quick reply</dd><dt><kbd>p</kbd></dt><dd>Pin or unpin from Watch</dd><dt><kbd>x</kbd></dt><dd>Dismiss with Undo</dd><dt><kbd>a</kbd> / <kbd>d</kbd></dt><dd>Agree with / disagree with the shadow verdict</dd><dt><kbd>e</kbd></dt><dd>Edit the current Watch layout</dd><dt><kbd>R</kbd></dt><dd>Toggle the reviewer dock</dd><dt><kbd>F</kbd></dt><dd>Toggle Focus: stay on the top waiting item</dd><dt>Theme button</dt><dd>appearance and palette</dd><dt><kbd>⌘F</kbd></dt><dd>Find in the focused terminal</dd><dt><kbd>⌘K</kbd></dt><dd>Clear terminal and host replay buffer</dd><dt><kbd>⌘C</kbd></dt><dd>Copy a terminal selection; Ctrl-C sends interrupt</dd></dl><p><kbd>+ session</kbd> in the rail opens a shell or agent in the active project. Running, Pinned, and Recent groups sit under the queue; <kbd>p</kbd> pins/unpins. Press any key to close.</p></div></div>
 
   <script src="/vendor/xterm.js"></script>

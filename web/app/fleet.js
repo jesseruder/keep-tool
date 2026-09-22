@@ -5,6 +5,7 @@ import { numBadgeHTML, numHaystack } from './session-number.js';
 import { RENAMED_HINT } from './session-rename.js';
 import { markHTML } from './session-mark.js';
 import { providerIconHTML } from './provider-icon.js';
+import { runAction } from './action.js';
 const FILTER_KEY = 'keep.console.fleet.filter';
 const PROVIDER_FILTER_KEY = 'keep.console.fleet.provider';
 let filter = '';
@@ -135,21 +136,13 @@ export function renderFleet(ctx) {
       await closeSession(ctx, button.dataset.closeIdle, button.dataset.pane, button);
     }));
     results.querySelectorAll('[data-pin]').forEach((button) => button.addEventListener('click', () => ctx.pinPane(button.dataset.pin, button.dataset.title)));
-    results.querySelectorAll('[data-reopen]').forEach((button) => button.addEventListener('click', async () => {
-      if (button.disabled) return;
-      button.disabled = true;
-      try {
+    results.querySelectorAll('[data-reopen]').forEach((button) => button.addEventListener('click', () => runAction(button, async () => {
         const row = rows.find((candidate) => candidate.sessionId === button.dataset.reopen);
         await ctx.reopenSession({ sessionId: button.dataset.reopen, agent: button.dataset.agent, title: button.dataset.title,
           stalePane: button.dataset.stale || undefined, project: row?.project });
-      } finally { button.disabled = false; }
-    }));
-    results.querySelectorAll('[data-remove]').forEach((button) => button.addEventListener('click', async () => {
-      if (button.disabled) return;
-      button.disabled = true;
-      try { await ctx.removePane(button.dataset.remove); ctx.toast('Pane removed'); }
-      catch (error) { ctx.toast(`Could not remove: ${error.message}`); }
-      finally { button.disabled = false; }
-    }));
+      }, { label: 'Reopening…', ctx, retry: () => button.click() }).catch(() => {})));
+    results.querySelectorAll('[data-remove]').forEach((button) => button.addEventListener('click', () => runAction(button, async () => {
+      await ctx.removePane(button.dataset.remove); ctx.toast('Pane removed');
+    }, { label: 'Removing…', ctx, retry: () => button.click() }).catch(() => {})));
   }
 }

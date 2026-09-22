@@ -9,6 +9,7 @@
 // starts a session through /api/open and moves the card to active), Done and
 // Dismiss.
 import { closeInboxCard } from './api.js';
+import { runAction } from './action.js';
 
 const EXPANDED_KEY = 'keep.console.inbox.expanded';
 let expanded = null;
@@ -78,7 +79,8 @@ async function act(ctx, task, button) {
     await closeInboxCard(task.id, action);
     ctx.toast(`${action === 'done' ? 'Done' : 'Dismissed'}: ${task.fm?.title || task.id}`);
   } catch (error) {
-    ctx.toast(error?.status === 409 ? `Not closed: ${error.message}` : `Could not update the card: ${error.message}`);
+    error.actionMessage = `The inbox card was not changed; it is back in the list. ${error.message}`;
+    throw error;
   } finally {
     // Whatever happened, the next state says where the card stands; until then a
     // failed write shows the row again.
@@ -100,14 +102,12 @@ function install(ctx, row) {
     } else if (button.hasAttribute('data-inbox-retry')) {
       void ctx.retryDetail('task', task);
     } else if (button.hasAttribute('data-inbox-open')) {
-      if (button.disabled) return;
-      button.disabled = true;
-      try { await ctx.reopenSession({ taskId: id, title: task.fm?.title || id, project: task.fm?.project, fromInbox: true }); }
-      finally { button.disabled = false; await ctx.reload(); }
+      await runAction(button, () => ctx.reopenSession({ taskId: id, title: task.fm?.title || id, project: task.fm?.project, fromInbox: true }),
+        { label: 'Opening…', ctx, retry: () => button.click() }).catch(() => {});
+      await ctx.reload();
     } else if (button.dataset.inboxAction) {
-      if (button.disabled) return;
-      button.disabled = true;
-      await act(ctx, task, button);
+      await runAction(button, () => act(ctx, task, button),
+        { label: 'Updating…', ctx, retry: () => button.click() }).catch(() => {});
     }
   });
 }

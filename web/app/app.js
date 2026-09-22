@@ -6,6 +6,8 @@ import { installNotifications } from './notifications.js';
 import { PALETTES, paletteById, swatches } from './palettes.js';
 import { applyTheme, getPalette, getPreference, onThemeChange, resolvedTheme, setPalette, setPreference, xtermTheme } from './theme.js';
 import * as api from './api.js';
+import { installActionFeedback } from './action.js';
+import { statusChipState } from './status-chip.js';
 import { humanAttention, sessionLabel, hostOutage, hostOutageText } from './status.js';
 import { createClosingSessions } from './closing-sessions.js';
 import { installInteractionGuard } from './interaction-guard.js';
@@ -479,7 +481,8 @@ async function setAside(item, kind = 'dismiss', minutes) {
     finishSetAsideWrite(key, record, entry, false);
     deriveDismissed();
     refresh();
-    toast(`Could not set aside: ${error.message}`);
+    error.actionMessage = `The item was not set aside; it is back in the list. ${error.message}`;
+    api.reportWriteFailure(error, { message: error.actionMessage, retry: () => setAside(item, kind, minutes) });
   }
 }
 function dismiss(item) { return setAside(item, 'dismiss'); }
@@ -497,7 +500,8 @@ async function restore(key) {
     finishSetAsideWrite(key, record, null, false);
     deriveDismissed();
     refresh();
-    toast(`Could not restore: ${error.message}`);
+    error.actionMessage = `The item was not restored; it is back under set aside. ${error.message}`;
+    api.reportWriteFailure(error, { message: error.actionMessage, retry: () => restore(key) });
   }
 }
 function toggleRunning() {
@@ -594,7 +598,8 @@ async function pinPane(pane, title) {
   } catch (error) {
     // Undo the optimistic edit so the client does not believe a pin the server never stored.
     if (wasPinned) pinned.ids.push(pane); else pinned.ids = pinned.ids.filter((id) => id !== pane);
-    toast(error.message);
+    error.actionMessage = `The Watch pin was not changed; the previous layout is restored. ${error.message}`;
+    api.reportWriteFailure(error, { message: error.actionMessage, retry: () => pinPane(pane, title) });
     return false;
   }
 }
@@ -922,9 +927,7 @@ function renderTop() {
     .filter((item) => !state.dismissed.has(itemKey(item))).map((item) => soundEventKey(item, sessionFor(item))));
   document.querySelector('#qcount').textContent = count;
   document.querySelector('#qcount').classList.toggle('zero', count === 0);
-  const sessionCount = data.sessions?.length || 0;
-  const paneCount = data.panes?.length || 0;
-  document.querySelector('#connection').textContent = `${sessionCount} session${sessionCount === 1 ? '' : 's'} · ${paneCount} pane${paneCount === 1 ? '' : 's'}`;
+  renderConnectionStatus();
   updateDockButton();
   renderReviewerTop(ctx);
   syncMobile();
@@ -996,7 +999,7 @@ async function refreshProjectChoices() {
     ].filter(Boolean))];
     const result = { projects: Object.create(null) };
     for (let offset = 0; offset < paths.length; offset += 200) {
-      const batch = await api.write('/api/project-icons', { projects: paths.slice(offset, offset + 200) });
+      const batch = await api.write('/api/project-icons', { projects: paths.slice(offset, offset + 200) }, 'POST', { label: 'Loading project icons', background: true });
       if (!batch?.projects || typeof batch.projects !== 'object' || Array.isArray(batch.projects)) return;
       Object.assign(result.projects, batch.projects);
     }
@@ -1021,8 +1024,10 @@ let refreshFailingSince = 0;
 let refreshFailures = 0;
 let refreshFailureToasted = false;
 let refreshMarkedReconnecting = false;
+let connectionTimer = 0;
 // What the event stream last reported; a fetch recovery must not claim "live" for it.
 let eventStreamStatus = null;
+let eventReconnectingSince = 0;
 // api.js marks the failures a restart produces: an unreachable daemon, the refresh
 // timeout, and the starting daemon's 503s. Anything else (a full action queue, a bug in
 // the API layer) is not a restart and toasts at once.
@@ -1040,6 +1045,19 @@ function refreshRecovered() {
     if (label?.dataset.status === 'reconnecting') label.dataset.status = eventStreamStatus || 'live';
   }
 }
+function renderConnectionStatus() {
+  const connection = document.querySelector('#connection');
+  const view = statusChipState({
+    pending: api.pendingWrites(), generatedAt: data.generatedAt,
+    reconnectingSince: refreshFailingSince || eventReconnectingSince, hostStatus: data.hostStatus,
+  });
+  connection.textContent = view.text;
+  connection.hidden = !view.text;
+  connection.dataset.status = view.status;
+  clearTimeout(connectionTimer);
+  connectionTimer = view.ticking ? setTimeout(() => { renderConnectionStatus(); syncMobile(); }, 1000) : 0;
+}
+api.onPendingChange(renderConnectionStatus);
 let pendingNotificationKey = null;
 let pendingReviewNavigation = null;
 async function reload() {
@@ -1561,13 +1579,17 @@ const notificationPanel = installNotifications({
   openReviewItem(entry) { return openReviewQueueNotification(ctx, entry); },
 });
 
+installActionFeedback(document.querySelector('#writeFailure'));
 document.querySelector('#connection').textContent = 'connecting';
 installNotificationClicks((key) => { pendingNotificationKey = key; reload(); });
 // Subscribe even when the first request fails. EventSource reconnects after a
 // daemon restart; every successful connection refreshes the snapshot as well.
 api.subscribe(reload, (status) => {
   eventStreamStatus = status;
-  document.querySelector('#connection').dataset.status = status;
+  if (status === 'reconnecting' && !eventReconnectingSince) eventReconnectingSince = Date.now();
+  if (status === 'live') eventReconnectingSince = 0;
+  if (!refreshFailingSince) document.querySelector('#connection').dataset.status = status;
+  renderConnectionStatus();
   if (status === 'live') reload();
 }, focusSession);
 reload();

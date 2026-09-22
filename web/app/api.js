@@ -225,54 +225,151 @@ export const getSessionSummary = (id) => request(`/api/sessionsummary?id=${encod
 export const getDashboardDetail = (kind, id) => request(`/api/dashboard-detail?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`);
 export const searchDashboardReviews = (query) => request(`/api/dashboard-review-search?q=${encodeURIComponent(query)}`);
 export const getPendingDecisions = (sessionId) => request(`/api/decisions?session=${encodeURIComponent(sessionId)}&pending=1`);
-export const judgeDecision = (id, verdict, message) => write('/api/decisions/judge', { id, verdict, message });
+export const judgeDecision = (id, verdict, message) => write('/api/decisions/judge', { id, verdict, message }, 'POST', { label: 'Judging decision' });
 export const getPortableTransfers = () => freshRequest('/api/portable-transfers');
 export const getPortableTransferDraft = (sessionId) => request(`/api/portable-transfer-draft?session=${encodeURIComponent(sessionId)}`);
 export const getPortableTransferPreview = (transferId) => request(`/api/portable-transfer-preview?id=${encodeURIComponent(transferId)}`);
-export const preparePortableTransfer = (body) => write('/api/portable-transfers', body);
-export const launchPortableTransfer = (transferId) => write('/api/transfer-session', { transferId });
-export const resolvePortableTransfer = (transferId, destinationSessionId) => write('/api/resolve-portable-transfer', { transferId, destinationSessionId });
-export const abandonAccountHandoff = (sessionId, pane, transactionId) => write('/api/abandon-account-handoff', { sessionId, pane, transactionId });
+export const preparePortableTransfer = (body) => write('/api/portable-transfers', body, 'POST', { label: 'Preparing transfer' });
+export const launchPortableTransfer = (transferId) => write('/api/transfer-session', { transferId }, 'POST', { label: 'Launching transfer' });
+export const resolvePortableTransfer = (transferId, destinationSessionId) => write('/api/resolve-portable-transfer', { transferId, destinationSessionId }, 'POST', { label: 'Resolving transfer' });
+export const abandonAccountHandoff = (sessionId, pane, transactionId) => write('/api/abandon-account-handoff', { sessionId, pane, transactionId }, 'POST', { label: 'Abandoning handoff' });
 export const getAgentEvents = (name, limit = 20) => request(`/api/agents/${encodeURIComponent(name)}/events?limit=${encodeURIComponent(limit)}`);
-export const markAgentSeen = (name) => write(`/api/agents/${encodeURIComponent(name)}/seen`);
+export const markAgentSeen = (name) => write(`/api/agents/${encodeURIComponent(name)}/seen`, {}, 'POST', { label: 'Marking agent seen', background: true });
 
-export function write(url, body, method = 'POST') {
-  return request(url, { method, headers: WRITE_HEADERS, body: JSON.stringify(body || {}) });
+// Every write is registered while it is in flight, so the header can say what the
+// console is waiting on rather than leaving a disabled button with no explanation.
+// A write that never answers used to hang forever: the daemon under load answers in
+// seconds, and sometimes not at all, so each one carries its own deadline.
+const DEFAULT_WRITE_TIMEOUT_MS = 20000;
+const OPEN_TIMEOUT_MS = 60000;
+const inFlightWrites = new Map();
+const pendingListeners = new Set();
+let writeSequence = 0;
+let failureSequence = 0;
+let writeFailureRecord = null;
+
+function notifyPending() {
+  for (const listener of [...pendingListeners]) { try { listener(); } catch {} }
 }
 
-export async function openSession(body) {
+// '/api/close-session' -> 'Close session'. Only a fallback: a call site that names
+// its action ({ label: 'Closing session' }) gets a sentence a person would write.
+function labelForUrl(url) {
+  const path = String(url).split('?')[0].replace(/^\/api\//, '').replace(/\/$/, '');
+  const words = path.split('/').filter(Boolean).join(' ').replace(/[-_]+/g, ' ').trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : 'Request';
+}
+
+export function pendingWrites() {
+  return [...inFlightWrites.values()].map((record) => ({ ...record }));
+}
+
+export function onPendingChange(listener) {
+  pendingListeners.add(listener);
+  return () => pendingListeners.delete(listener);
+}
+
+export function lastWriteFailure() {
+  return writeFailureRecord ? { ...writeFailureRecord } : null;
+}
+
+export function dismissWriteFailure(id) {
+  if (!writeFailureRecord || (id != null && writeFailureRecord.id !== id)) return false;
+  writeFailureRecord = null;
+  notifyPending();
+  return true;
+}
+
+// UI helpers add the retry closure and, for optimistic actions, an explanation
+// of what was restored. The request error keeps the id so this updates the same
+// failure instead of briefly publishing two alerts for one click.
+export function reportWriteFailure(error, { label, message, retry } = {}) {
+  const existing = writeFailureRecord?.id === error?.writeFailureId ? writeFailureRecord : null;
+  writeFailureRecord = {
+    id: existing?.id || ++failureSequence,
+    at: existing?.at || Date.now(),
+    label: existing?.label || label || 'Action failed',
+    message: message || existing?.message || error?.message || String(error),
+    retry: retry || existing?.retry || null,
+  };
+  if (error && typeof error === 'object') error.writeFailureId = writeFailureRecord.id;
+  notifyPending();
+  return writeFailureRecord;
+}
+
+// `background` writes are the console's own housekeeping (project icons, a badge
+// cleared on open): nobody clicked them, so they neither show in the chip as an
+// action in flight nor leave a sticky failure behind; they keep the deadline.
+async function trackedWrite(url, options, { label, timeoutMs = DEFAULT_WRITE_TIMEOUT_MS, retry, background = false } = {}) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 60000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const record = { id: `write-${++writeSequence}`, label: label || labelForUrl(url), url, startedAt: Date.now() };
+  if (!background) {
+    inFlightWrites.set(record.id, record);
+    notifyPending();
+  }
   try {
-    return await request('/api/open', {
-      method: 'POST', headers: WRITE_HEADERS, body: JSON.stringify(body || {}), signal: controller.signal,
-    });
+    const body = await request(url, { ...options, signal: controller.signal });
+    // The same action succeeding is what retires its sticky failure; anything else
+    // leaves it standing, because nobody has shown that this write works again.
+    if (!background && writeFailureRecord?.label === record.label) writeFailureRecord = null;
+    return body;
   } catch (error) {
-    if (controller.signal.aborted) throw new Error('Open timed out after 60 seconds');
+    if (controller.signal.aborted) {
+      const timeout = new Error(`${record.label} timed out after ${timeoutMs / 1000} s`
+        + ' — the daemon may still be doing it');
+      timeout.transient = true;
+      timeout.timeout = true;
+      if (background) throw timeout;
+      writeFailureRecord = { id: ++failureSequence, at: Date.now(), label: record.label, message: timeout.message, retry: retry || null };
+      timeout.writeFailureId = writeFailureRecord.id;
+      throw timeout;
+    }
+    if (background) throw error;
+    writeFailureRecord = { id: ++failureSequence, at: Date.now(), label: record.label,
+      message: error?.message || String(error), retry: retry || null };
+    if (error && typeof error === 'object') error.writeFailureId = writeFailureRecord.id;
     throw error;
-  } finally { clearTimeout(timer); }
+  } finally {
+    clearTimeout(timer);
+    if (!background) {
+      inFlightWrites.delete(record.id);
+      notifyPending();
+    }
+  }
 }
-export const reopenSession = (body) => write('/api/reopen-session', body);
+
+export function write(url, body, method = 'POST', options = {}) {
+  return trackedWrite(url, { method, headers: WRITE_HEADERS, body: JSON.stringify(body || {}) }, options);
+}
+
+// Opening a session starts an agent process: it is slow by nature, so it keeps the
+// minute it always had rather than the ordinary write deadline.
+export function openSession(body) {
+  return trackedWrite('/api/open', { method: 'POST', headers: WRITE_HEADERS, body: JSON.stringify(body || {}) },
+    { label: 'Opening session', timeoutMs: OPEN_TIMEOUT_MS });
+}
+export const reopenSession = (body) => write('/api/reopen-session', body, 'POST', { label: 'Opening session' });
 
 export async function putLayouts(layouts) {
-  await write('/api/layouts', { layouts }, 'PUT');
+  await write('/api/layouts', { layouts }, 'PUT', { label: 'Saving layout' });
   return getLayouts();
 }
-export const send = (sessionId, text) => write('/api/send', { sessionId, text });
-export const answer = (sessionId, option, label) => write('/api/answer', { sessionId, option, label });
-export const closeInboxCard = (id, action) => write('/api/inbox-card', { id, action });
+export const send = (sessionId, text) => write('/api/send', { sessionId, text }, 'POST', { label: 'Sending' });
+export const answer = (sessionId, option, label) => write('/api/answer', { sessionId, option, label }, 'POST', { label: 'Answering' });
+export const closeInboxCard = (id, action) => write('/api/inbox-card', { id, action }, 'POST', { label: 'Closing card' });
 export const setAside = (key, kind, minutes) => write('/api/setaside', {
   key, kind, ...(minutes === undefined ? {} : { minutes }),
-});
+}, 'POST', { label: kind === 'clear' ? 'Restoring' : 'Setting aside' });
 // An empty title clears the hand-typed name and restores automatic titling.
-export const renameSession = (sessionId, title) => write('/api/rename-session', { sessionId, title });
+export const renameSession = (sessionId, title) => write('/api/rename-session', { sessionId, title }, 'POST', { label: 'Renaming' });
 // A patch: an absent key is left alone, null or '' removes that half of the mark.
-export const markSession = (sessionId, patch) => write('/api/mark-session', { sessionId, ...patch });
-export const setSessionKeepRunning = (sessionId, keepRunning) => write('/api/session-keep-running', { sessionId, keepRunning });
-export const spawnPane = (cwd, name) => write('/api/panes/spawn', { cwd, name });
-export const killPane = (pane) => write(`/api/panes/${encodeURIComponent(pane)}/kill`);
-export const removePane = (pane) => write(`/api/panes/${encodeURIComponent(pane)}/remove`);
-export const reviewTick = () => write('/api/reviewtick', { force: true });
+export const markSession = (sessionId, patch) => write('/api/mark-session', { sessionId, ...patch }, 'POST', { label: 'Marking' });
+export const setSessionKeepRunning = (sessionId, keepRunning) => write('/api/session-keep-running', { sessionId, keepRunning }, 'POST', { label: 'Automatic close' });
+export const spawnPane = (cwd, name) => write('/api/panes/spawn', { cwd, name }, 'POST', { label: 'Opening shell' });
+export const killPane = (pane) => write(`/api/panes/${encodeURIComponent(pane)}/kill`, {}, 'POST', { label: 'Closing pane' });
+export const removePane = (pane) => write(`/api/panes/${encodeURIComponent(pane)}/remove`, {}, 'POST', { label: 'Removing pane' });
+export const reviewTick = () => write('/api/reviewtick', { force: true }, 'POST', { label: 'Reviewer tick' });
 
 export function subscribe(onChange, onStatus, onFocus, timers = globalThis) {
   const events = new EventSource('/api/events');

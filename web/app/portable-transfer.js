@@ -1,4 +1,5 @@
 import * as api from './api.js';
+import { runAction } from './action.js';
 
 const drafts = new Map();
 let dialog;
@@ -105,17 +106,20 @@ function renderDialog(ctx, state) {
     const button = event.currentTarget;
     const request = { sourceSessionId: state.draft.sourceSessionId, accountId: state.accountId,
       model: state.model.trim(), cwd: state.cwd.trim(), context: state.context };
-    button.disabled = true; modal.querySelectorAll('input, select, textarea').forEach((field) => { field.disabled = true; }); state.error = '';
+    modal.querySelectorAll('input, select, textarea').forEach((field) => { field.disabled = true; }); state.error = '';
     try {
-      const result = await api.preparePortableTransfer(request);
+      const result = await runAction(button, () => api.preparePortableTransfer(request),
+        { label: 'Preparing…', ctx, retry: () => button.click() });
       applySavedInputs(state, result, result.transfer); state.savedOnly = false; renderDialog(ctx, state);
     } catch (error) { state.error = error.message; renderDialog(ctx, state); }
   });
   modal.querySelector('[data-launch-transfer]')?.addEventListener('click', async (event) => {
     const transferId = state.transfer.id;
-    event.currentTarget.disabled = true; modal.querySelectorAll('input, select, textarea').forEach((field) => { field.disabled = true; }); state.error = '';
+    const button = event.currentTarget;
+    modal.querySelectorAll('input, select, textarea').forEach((field) => { field.disabled = true; }); state.error = '';
     try {
-      const result = await api.launchPortableTransfer(transferId);
+      const result = await runAction(button, () => api.launchPortableTransfer(transferId),
+        { label: 'Launching…', ctx, retry: () => button.click() });
       state.transfer = result.transfer; await ctx.reload();
       if (state.transfer?.destinationSessionId) {
         modal.close();
@@ -137,9 +141,10 @@ function renderDialog(ctx, state) {
     else { state.error = 'The saved successor pane is no longer available or its identity changed.'; renderDialog(ctx, state); }
   });
   modal.querySelector('[data-retry-delivery]')?.addEventListener('click', async (event) => {
-    event.currentTarget.disabled = true; state.error = '';
+    const button = event.currentTarget; state.error = '';
     try {
-      const result = await api.launchPortableTransfer(transfer.id);
+      const result = await runAction(button, () => api.launchPortableTransfer(transfer.id),
+        { label: 'Retrying…', ctx, retry: () => button.click() });
       state.transfer = result.transfer; await ctx.reload();
       if (state.transfer.destinationSessionId) { modal.close(); ctx.openReviewSession(state.transfer.destinationSessionId); }
       else renderDialog(ctx, state);
@@ -147,9 +152,10 @@ function renderDialog(ctx, state) {
   });
   modal.querySelector('[data-resolve-transfer]')?.addEventListener('click', async (event) => {
     const id = modal.querySelector('[data-transfer-resolution]').value;
-    event.currentTarget.disabled = true; state.error = '';
+    const button = event.currentTarget; state.error = '';
     try {
-      const result = await api.resolvePortableTransfer(state.transfer.id, id);
+      const result = await runAction(button, () => api.resolvePortableTransfer(state.transfer.id, id),
+        { label: 'Resolving…', ctx, retry: () => button.click() });
       state.transfer = result.transfer; await ctx.reload(); modal.close(); ctx.openReviewSession(id);
     } catch (error) { state.error = error.message; renderDialog(ctx, state); }
   });
@@ -202,15 +208,14 @@ export async function openPortableTransfer(ctx, sessionId, transfer) {
 
 async function launchLegacy(ctx, button) {
   if (button.disabled) return;
-  button.disabled = true;
   try {
-    const result = await api.launchPortableTransfer(button.dataset.portableTransfer); await ctx.reload();
+    const result = await runAction(button, () => api.launchPortableTransfer(button.dataset.portableTransfer),
+      { label: 'Launching…', ctx, retry: () => button.click() }); await ctx.reload();
     if (result.transfer?.destinationSessionId) {
       ctx.toast('Opened a fresh conversation with the saved context; the original session is preserved');
       ctx.openReviewSession(result.transfer.destinationSessionId);
     }
-  } catch (error) { await ctx.reload(); ctx.toast(`Transfer not started: ${error.message}`); }
-  finally { button.disabled = false; }
+  } catch { await ctx.reload(); }
 }
 
 export function portableTransferControls(ctx, sessionId) {

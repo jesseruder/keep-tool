@@ -25,7 +25,7 @@ export function installNotifications({
     try {
       // Bound each request; only mark the IDs the user actually saw in this snapshot.
       for (let start = 0; start < ids.length; start += 1000) {
-        await write('/api/notifications', { ids: ids.slice(start, start + 1000), action });
+        await write('/api/notifications', { ids: ids.slice(start, start + 1000), action }, 'POST', { label: 'Updating notifications' });
       }
       await reload();
     } catch (error) { toast(`Could not update notifications: ${error.message}`); }
@@ -46,7 +46,7 @@ export function installNotifications({
     if (!input) return;
     input.disabled = true;
     try {
-      await write('/api/reminders', { title: input.dataset.reminder, enabled: input.checked });
+      await write('/api/reminders', { title: input.dataset.reminder, enabled: input.checked }, 'POST', { label: 'Saving reminder' });
       await reload();
     } catch (error) {
       input.checked = !input.checked;
@@ -174,7 +174,7 @@ export function installNotifications({
   });
   async function deliver(entry) {
     try {
-      const result = await write('/api/notifications', { ids: [entry.id], action: 'claim' });
+      const result = await write('/api/notifications', { ids: [entry.id], action: 'claim' }, 'POST', { label: 'Claiming notification' });
       if (result.claimed) await notify({ title: `${entry.from === 'manual' ? 'Keep' : entry.from || 'Keep'}${entry.level === 'urgent' ? ' · Urgent' : ''}`, body: entry.text, tag: `alert:${entry.id}`, onClick: () => open(entry.id) });
     } catch { attempted.delete(entry.id); }
   }
@@ -190,7 +190,7 @@ export function installNotifications({
         // Viewing the inbox is already delivery; claim without creating a banner.
         attempted.add(entry.id);
         if (panel.open && document.hasFocus()) {
-          void write('/api/notifications', { ids: [entry.id], action: 'claim' }).catch(() => attempted.delete(entry.id));
+          void write('/api/notifications', { ids: [entry.id], action: 'claim' }, 'POST', { label: 'Claiming notification', background: true }).catch(() => attempted.delete(entry.id));
         } else void deliver(entry);
       }
     },

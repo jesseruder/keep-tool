@@ -15,6 +15,7 @@ import { installHeadingRename, installRenameControls, isEditing, renameButtonsHT
 import { installMarkControls, markControlsHTML, markHTML } from './session-mark.js';
 import { providerIconHTML } from './provider-icon.js';
 import { placeInbox } from './queue-inbox.js';
+import { runAction } from './action.js';
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
 const summaryInflight = new Map();
@@ -514,9 +515,8 @@ export function renderRail(ctx, items) {
   rail.querySelector('[data-shell]').addEventListener('click', async (event) => {
     if (ctx.state.pendingFocus) return;
     const button = event.currentTarget;
-    button.disabled = true;
     button.blur();
-    try {
+    await runAction(button, async () => {
       await ctx.newSession(shell.path, shell.name, async (pane, selection) => {
         const project = ctx.projectOf(selection.cwd);
         const title = ctx.entityForPane(pane.id).title;
@@ -538,7 +538,7 @@ export function renderRail(ctx, items) {
         ctx.toast(`${({ shell: 'Shell', claude: 'Claude Code', codex: 'Codex', pi: 'Pi' })[selection.kind]} opened in ${project.name}`,
           { label: 'Pin', run: () => ctx.pinPane(pane.id, title) });
       });
-    } finally { button.disabled = false; }
+    }, { label: 'Opening…', ctx, retry: () => button.click() }).catch(() => {});
   });
 }
 
@@ -837,14 +837,20 @@ async function chooseOption(ctx, item, number) {
   const option = item.options?.[number - 1];
   if (!option) return;
   const label = optionLabel(option);
+  const buttons = [...document.querySelectorAll('.brief [data-option]')];
+  const button = buttons.find((candidate) => Number(candidate.dataset.option) === number);
+  buttons.forEach((candidate) => { if (candidate !== button) candidate.disabled = true; });
   try {
+    await runAction(button, async () => {
     await api.answer(item.sessionId, number, label);
     ctx.state.sent.add(ctx.eventKey(item));
     ctx.state.selected += 1;
     ctx.state.focused = false;
     ctx.toast(`Answered “${label}”`);
     ctx.refresh();
-  } catch (error) { ctx.toast(error.message); }
+    }, { label: 'Answering…', ctx, retry: () => chooseOption(ctx, item, number) });
+  } catch {}
+  finally { buttons.forEach((candidate) => { if (candidate !== button) candidate.disabled = false; }); }
 }
 
 // "N running · N pinned", and the agents only when there are any: a standing
@@ -1050,16 +1056,12 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   const dismiss = () => ctx.dismiss(item);
   stage.querySelector('[data-pin]').onclick = pin;
   const reopenButton = stage.querySelector('[data-reopen]');
-  if (reopenButton) reopenButton.onclick = async () => {
-    if (reopenButton.disabled) return;
-    reopenButton.disabled = true;
-    try {
+  if (reopenButton) reopenButton.onclick = () => runAction(reopenButton, async () => {
       await ctx.reopenSession({
         sessionId: item.sessionId, taskId: !item.sessionId ? item.taskId : undefined,
         agent: session?.kind, title, stalePane: paneId || undefined, project: item.project || session?.project,
       });
-    } finally { reopenButton.disabled = false; }
-  };
+    }, { label: 'Reopening…', ctx, retry: () => reopenButton.click() }).catch(() => {});
   const dismissButton = stage.querySelector('[data-dismiss]');
   const closeButton = stage.querySelector('[data-close-session]');
   if (closeButton) closeButton.onclick = () => closeSession(ctx, item.sessionId, paneId, closeButton);

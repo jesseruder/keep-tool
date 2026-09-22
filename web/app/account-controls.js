@@ -1,5 +1,6 @@
 import { write } from './api.js';
 import { openPortableTransfer } from './portable-transfer.js';
+import { runAction } from './action.js';
 
 function accountFor(ctx, session, pane) {
   const id = session?.accountId || pane?.meta?.accountId;
@@ -170,13 +171,10 @@ function confirmedAccount(ctx, sessionId, paneId) {
   return session?.accountId || pane?.meta?.accountId;
 }
 
-function once(button, run) {
-  button.onclick = async () => {
-    if (button.disabled) return;
-    button.disabled = true;
-    try { await run(); }
-    finally { button.disabled = false; }
-  };
+function once(button, run, ctx) {
+  button.onclick = () => runAction(button, run, {
+    label: 'Working…', ctx, retry: () => button.click(),
+  }).catch(() => {});
 }
 
 export function installHandoffControls(container, ctx, sessionId, pane) {
@@ -185,7 +183,8 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
       const targetAccountId = button.dataset.bulkHandoff;
       const sourceAccountId = button.dataset.bulkSource;
       try {
-        const result = await write('/api/handoff-rate-limited', { sourceAccountId, targetAccountId });
+        const result = await write('/api/handoff-rate-limited', { sourceAccountId, targetAccountId }, 'POST',
+          { label: 'Queueing transfers', retry: () => button.click() });
         const queued = result.queued?.length || 0;
         const skipped = result.skipped?.length || 0;
         ctx.toast(queued
@@ -193,7 +192,7 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
           : `Nothing queued${skipped ? `; ${skipped} skipped` : ''}.`);
         await ctx.reload();
       } catch (error) { ctx.toast(`Not queued: ${error.message}`); }
-    });
+    }, ctx);
   });
   container.querySelectorAll('[data-queue-retry]').forEach((button) => {
     once(button, async () => {
@@ -201,7 +200,8 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
       const retried = button.dataset.queueRetry;
       try {
         const result = await write('/api/handoff-rate-limited', { sourceAccountId: button.dataset.queueSource, targetAccountId,
-          sessionIds: [retried], ...(button.dataset.queueForce === '1' ? { force: true } : {}) });
+          sessionIds: [retried], ...(button.dataset.queueForce === '1' ? { force: true } : {}) }, 'POST',
+        { label: 'Retrying transfer', retry: () => button.click() });
         // The batch decides what is still eligible. Saying "queued again" when it
         // skipped this session would leave the person watching a parked entry.
         const took = (result.queued || []).some((row) => row.sessionId === retried);
@@ -210,28 +210,25 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
           : `Not queued: ${skipped?.reason || 'this session no longer needs the transfer'}.`);
         await ctx.reload();
       } catch (error) { ctx.toast(`Not queued: ${error.message}`); }
-    });
+    }, ctx);
   });
   container.querySelectorAll('[data-queue-cancel]').forEach((button) => {
     once(button, async () => {
       try {
-        await write('/api/handoff-queue-cancel', { sessionId: button.dataset.queueCancel });
+        await write('/api/handoff-queue-cancel', { sessionId: button.dataset.queueCancel }, 'POST',
+          { label: 'Cancelling transfer', retry: () => button.click() });
         ctx.toast('Queued transfer cancelled.');
         await ctx.reload();
       } catch (error) { ctx.toast(`Not cancelled: ${error.message}`); }
-    });
+    }, ctx);
   });
   container.querySelectorAll('[data-portable-fallback]').forEach((button) => {
-    button.onclick = async () => {
-      if (button.disabled) return;
-      button.disabled = true;
-      try {
-        await write('/api/abandon-account-handoff', { sessionId, pane, transactionId: button.dataset.portableFallback });
+    button.onclick = () => runAction(button, async () => {
+        await write('/api/abandon-account-handoff', { sessionId, pane, transactionId: button.dataset.portableFallback }, 'POST',
+          { label: 'Preparing continuation' });
         await ctx.reload();
         openPortableTransfer(ctx, sessionId);
-      } catch (error) { ctx.toast(`Fresh continuation unavailable: ${error.body?.reason || error.message}`); }
-      finally { button.disabled = false; }
-    };
+      }, { label: 'Preparing…', ctx, retry: () => button.click() }).catch(() => {});
   });
   container.querySelectorAll('[data-handoff-account]').forEach((button) => {
     button.onclick = async () => {
@@ -240,15 +237,16 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
       const openOnly = latestHandoff(ctx, sessionId)?.intent === 'open-only';
       const destination = (ctx.data.accounts || []).find((account) => account.id === accountId);
       const buttons = [...container.querySelectorAll('[data-handoff-account]')];
-      buttons.forEach((candidate) => { candidate.disabled = true; });
+      buttons.forEach((candidate) => { if (candidate !== button) candidate.disabled = true; });
       button.blur();
       try {
         const force = button.dataset.handoffForce === '1';
         // queueOnTransient: a refusal that clears on its own — a busy injection lock, a
         // slow host, a `ps` snapshot taken under load — is retried in the background
         // rather than left as a record someone has to notice and click again.
-        const result = await write('/api/handoff-session', { sessionId, pane, accountId, queueOnTransient: true,
-          ...(force ? { force: true } : {}) });
+        const result = await runAction(button, () => write('/api/handoff-session', { sessionId, pane, accountId, queueOnTransient: true,
+          ...(force ? { force: true } : {}) }, 'POST', { label: openOnly ? 'Opening on account' : 'Continuing on account' }),
+        { label: openOnly ? 'Opening…' : 'Continuing…', ctx, retry: () => button.click() });
         const responseOpenOnly = result.intent === 'open-only' || openOnly;
         if (result.status === 'queued') {
           ctx.toast(`Transfer refused (${result.reason || 'it was busy'}); retrying in the background`);
