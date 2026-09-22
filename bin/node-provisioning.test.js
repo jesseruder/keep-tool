@@ -144,11 +144,27 @@ test('the ping route answers a node through the node listener, and nothing else 
 });
 
 test('doctor reports the node API from the daemon side', async () => {
+  let state = null;
   const report = (listen, others = []) => setup.nodeApiReport({
     env: {}, nodeApiListen: () => listen, listNodes: () => [{ name: 'main', daemon: true }, ...others],
+    readState: () => state, pidAlive: (pid) => pid === 4242,
   });
   assert.deepEqual(await report({ enabled: false, reason: 'not configured' }), [], 'a single-node install hears nothing about it');
-  assert.deepEqual(await report({ enabled: true, listen: '100.64.0.1:7781' }), [{ status: 'ok', text: 'node API listener configured at 100.64.0.1:7781' }]);
+  const on = { enabled: true, listen: '100.64.0.1:7781' };
+  // Configured, but the daemon has said nothing: not proof of a bound listener.
+  const silent = await report(on);
+  assert.equal(silent[0].status, 'optional');
+  assert.match(silent[0].text, /configured at 100\.64\.0\.1:7781; the running daemon has not reported binding it/);
+  state = { pid: 4242, listen: '100.64.0.1:7781', state: 'listening' };
+  assert.deepEqual(await report(on), [{ status: 'ok', text: 'node API listening at 100.64.0.1:7781' }]);
+  state = { pid: 4242, listen: '100.64.0.1:7781', state: 'retrying', error: 'listen EADDRNOTAVAIL' };
+  const retrying = await report(on);
+  assert.equal(retrying[0].status, 'FAIL');
+  assert.match(retrying[0].text, /not bound: listen EADDRNOTAVAIL; the daemon keeps retrying/);
+  state = { pid: 9999, listen: '100.64.0.1:7781', state: 'listening' };
+  assert.equal((await report(on))[0].status, 'optional', 'a record from a daemon that is gone');
+  state = { pid: 4242, listen: '100.64.0.1:7790', state: 'listening' };
+  assert.equal((await report(on))[0].status, 'optional', 'a record for another address');
   const absent = await report({ enabled: false, reason: 'not configured' }, [{ name: 'aws1', daemon: false }]);
   assert.equal(absent[0].status, 'optional');
   assert.match(absent[0].text, /node API listener absent/);

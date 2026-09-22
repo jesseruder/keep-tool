@@ -169,3 +169,77 @@ test('startNodeApi binds the configured address and says so once', async (t) => 
   await new Promise((resolve) => server.once('listening', resolve));
   assert.deepEqual(lines, ['node api listening 127.0.0.1:0']);
 });
+
+// After a reboot the daemon can start before Tailscale has brought the address up.
+// The bind is retried, 5 s doubling to 60 s, and each change of state is said once.
+test('a listener whose address is not up yet keeps trying until it binds', async (t) => {
+  const lines = [];
+  const announced = [];
+  const states = [];
+  const timers = [];
+  const failures = ['EADDRNOTAVAIL', 'EADDRNOTAVAIL', 'EADDRNOTAVAIL', 'EADDRNOTAVAIL', 'EADDRNOTAVAIL', 'EADDRINUSE'];
+  let binds = 0;
+  const server = nodeApi.startNodeApi({
+    listen: { enabled: true, listen: '127.0.0.1:0', address: '127.0.0.1', port: 0 },
+    handler: (req, res) => res.end('x'),
+    log: (line) => lines.push(line), announce: (line) => announced.push(line), onState: (value) => states.push(value),
+    bind: (srv, port, address) => {
+      binds += 1;
+      const code = failures.shift();
+      if (!code) return srv.listen(port, address);
+      const error = new Error(`listen ${code}: address not available ${address}:${port}`);
+      error.code = code;
+      return process.nextTick(() => srv.emit('error', error));
+    },
+    setTimer: (fn, ms) => { timers.push(ms); setImmediate(fn); return { ms }; },
+    clearTimer: () => {},
+  });
+  t.after(() => server.close());
+  await new Promise((resolve) => server.once('listening', resolve));
+  assert.equal(binds, 7);
+  assert.deepEqual(timers, [5000, 10000, 20000, 40000, 60000, 60000]);
+  assert.deepEqual(lines, [
+    'keep serve: node api on 127.0.0.1:0 failed: listen EADDRNOTAVAIL: address not available 127.0.0.1:0; retrying until it binds',
+    'keep serve: node api on 127.0.0.1:0 failed: listen EADDRINUSE: address not available 127.0.0.1:0; retrying until it binds',
+  ]);
+  assert.deepEqual(announced, ['node api listening 127.0.0.1:0']);
+  assert.deepEqual(states.map((value) => value.state), ['retrying', 'retrying', 'listening']);
+  assert.equal(states[2].pid, process.pid);
+  assert.equal(states[2].listen, '127.0.0.1:0');
+});
+
+test('a bind that cannot succeed later is not retried, and a closed listener stops retrying', () => {
+  const lines = [];
+  const timers = [];
+  const refused = nodeApi.startNodeApi({
+    listen: { enabled: true, listen: '127.0.0.1:1', address: '127.0.0.1', port: 1 },
+    handler: () => {}, log: (line) => lines.push(line), announce: () => {},
+    bind: () => { const error = new Error('listen EACCES'); error.code = 'EACCES'; throw error; },
+    setTimer: (fn, ms) => { timers.push(ms); return {}; },
+  });
+  assert.deepEqual(timers, []);
+  assert.deepEqual(lines, ['keep serve: node api on 127.0.0.1:1 failed: listen EACCES']);
+  refused.close(() => {});
+
+  let pending = null;
+  let cleared = false;
+  const retrying = nodeApi.startNodeApi({
+    listen: { enabled: true, listen: '127.0.0.1:1', address: '127.0.0.1', port: 1 },
+    handler: () => {}, log: () => {}, announce: () => {},
+    bind: () => { const error = new Error('listen EADDRNOTAVAIL'); error.code = 'EADDRNOTAVAIL'; throw error; },
+    setTimer: (fn) => { pending = fn; return { id: 1 }; },
+    clearTimer: () => { cleared = true; },
+  });
+  assert.ok(pending);
+  retrying.close(() => {});
+  assert.equal(cleared, true);
+});
+
+test('the listener state is written where doctor reads it', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-node-api-state-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, '.keep'));
+  assert.equal(nodeApi.readState(dir), null);
+  nodeApi.writeState(dir, { pid: 1, listen: '100.64.0.1:7781', state: 'listening' });
+  assert.deepEqual(nodeApi.readState(dir), { pid: 1, listen: '100.64.0.1:7781', state: 'listening' });
+});

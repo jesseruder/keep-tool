@@ -12,7 +12,9 @@
 //     a node is refused before a route is even looked up;
 //   - a route answers here only when it declares `allow` including 'node';
 //   - the console is not installed, so there is no WebSocket and no pane route.
+const fs = require('node:fs');
 const http = require('node:http');
+const path = require('node:path');
 
 const NODE_TOKEN_REREAD_MS = 5000;
 
@@ -88,18 +90,89 @@ function createNodeApiHandler(options) {
   };
 }
 
+// A bind that can succeed later: the address is not up yet (the laptop booted and
+// Tailscale has not brought its interface up) or another process still holds the
+// port (the previous daemon on its way out).
+const RETRYABLE_BIND = new Set(['EADDRNOTAVAIL', 'EADDRINUSE']);
+const BIND_RETRY_FIRST_MS = 5000;
+const BIND_RETRY_MAX_MS = 60e3;
+
+// Where the running daemon says what its node listener is doing, for `keep doctor`:
+// { pid, listen, state: 'listening' | 'retrying' | 'failed', error?, at }.
+function stateFile(root) { return path.join(root, '.keep', 'node-api.json'); }
+
+function writeState(root, value) {
+  const file = stateFile(root);
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+  fs.renameSync(temp, file);
+}
+
+function readState(root) {
+  try { return JSON.parse(fs.readFileSync(stateFile(root), 'utf8')); } catch { return null; }
+}
+
 // Binds the listener when `listen` says to, or returns null. A bind failure is
 // logged and the daemon carries on: its own UI and every single-node path do not
-// depend on this.
-function startNodeApi({ listen, handler, log = (line) => process.stderr.write(`${line}\n`), announce = (line) => console.log(line) }) {
+// depend on this. A retryable failure is retried, 5 s doubling to 60 s, for as long
+// as the daemon runs; each change of state is logged once, not each attempt.
+function startNodeApi({
+  listen, handler, log = (line) => process.stderr.write(`${line}\n`), announce = (line) => console.log(line),
+  onState = () => {}, bind = (server, port, address) => server.listen(port, address),
+  setTimer = setTimeout, clearTimer = clearTimeout,
+  retryFirstMs = BIND_RETRY_FIRST_MS, retryMaxMs = BIND_RETRY_MAX_MS,
+}) {
   if (!listen || !listen.enabled) {
     if (listen && listen.error) log(`keep serve: node api not started: ${listen.error}`);
     return null;
   }
   const server = http.createServer(handler);
-  server.on('error', (error) => log(`keep serve: node api on ${listen.listen} failed: ${error.message}`));
-  server.listen(listen.port, listen.address, () => announce(`node api listening ${listen.listen}`));
+  let listening = false;
+  let stopped = false;
+  let timer = null;
+  let delay = retryFirstMs;
+  let lastFailure = null;
+  const state = (value) => { try { onState({ pid: process.pid, listen: listen.listen, ...value, at: new Date().toISOString() }); } catch {} };
+  const attempt = () => {
+    timer = null;
+    if (stopped) return;
+    try { bind(server, listen.port, listen.address); }
+    catch (error) { server.emit('error', error); }
+  };
+  server.on('listening', () => {
+    listening = true;
+    lastFailure = null;
+    announce(`node api listening ${listen.listen}`);
+    state({ state: 'listening' });
+  });
+  server.on('error', (error) => {
+    if (listening || stopped) {
+      log(`keep serve: node api on ${listen.listen} failed: ${error.message}`);
+      return;
+    }
+    const retry = RETRYABLE_BIND.has(error.code);
+    const failure = `${error.code || ''} ${error.message}`;
+    if (failure !== lastFailure) {
+      lastFailure = failure;
+      log(`keep serve: node api on ${listen.listen} failed: ${error.message}${retry ? '; retrying until it binds' : ''}`);
+      state({ state: retry ? 'retrying' : 'failed', error: error.message });
+    }
+    if (!retry) return;
+    timer = setTimer(attempt, delay);
+    delay = Math.min(delay * 2, retryMaxMs);
+  });
+  const close = server.close.bind(server);
+  server.close = (callback) => {
+    stopped = true;
+    if (timer) clearTimer(timer);
+    timer = null;
+    return close(callback);
+  };
+  attempt();
   return server;
 }
 
-module.exports = { createNodeTokenStore, createNodeApiHandler, startNodeApi, NODE_TOKEN_REREAD_MS };
+module.exports = {
+  createNodeTokenStore, createNodeApiHandler, startNodeApi, NODE_TOKEN_REREAD_MS,
+  BIND_RETRY_FIRST_MS, BIND_RETRY_MAX_MS, stateFile, writeState, readState,
+};

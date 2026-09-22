@@ -841,7 +841,26 @@ async function nodeApiReport(deps = {}) {
   const where = nodes.paneOnlyNode(env);
   if (!where) {
     const listen = (deps.nodeApiListen || require('./node-registry.js').nodeApiListen)(env);
-    if (listen.enabled) return [{ status: 'ok', text: `node API listener configured at ${listen.listen}` }];
+    if (listen.enabled) {
+      // Configured is not bound: the running daemon writes what its listener is
+      // doing, and a record from a daemon that is gone, or for another address, says
+      // nothing about this one.
+      const state = deps.readState ? deps.readState()
+        : require('./serve/node-api.js').readState(deps.root || require('./keep-core.js').ROOT);
+      const alive = (pid) => {
+        if (deps.pidAlive) return deps.pidAlive(pid);
+        try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+      };
+      const current = state && Number.isInteger(state.pid) && state.listen === listen.listen && alive(state.pid);
+      if (current && state.state === 'listening') return [{ status: 'ok', text: `node API listening at ${listen.listen}` }];
+      if (current && state.state === 'retrying') {
+        return [{ status: 'FAIL', text: `node API listener configured at ${listen.listen} but not bound: ${state.error}; the daemon keeps retrying`, fix: 'check that this machine has that address (is Tailscale up?) and that nothing else holds the port' }];
+      }
+      if (current) {
+        return [{ status: 'FAIL', text: `node API listener at ${listen.listen} failed: ${state.error}`, fix: 'fix nodeApi.listen in config.json, then keep restart-daemon' }];
+      }
+      return [{ status: 'optional', text: `node API listener configured at ${listen.listen}; the running daemon has not reported binding it`, fix: 'keep restart-daemon, then run keep doctor again' }];
+    }
     if (listen.error) {
       return [{ status: 'FAIL', text: `node API listener: ${listen.error}`, fix: 'set nodeApi.listen in config.json to this machine\'s own <ip>:<port> (its Tailscale address)' }];
     }
@@ -919,7 +938,7 @@ async function doctor(root) {
     if (entry.fix) console.log(`  fix: ${entry.fix}`);
     if (entry.status === 'FAIL') failed = true;
   }
-  for (const entry of [...await nodeHomeReport(), ...await nodeApiReport()]) {
+  for (const entry of [...await nodeHomeReport(), ...await nodeApiReport({ root })]) {
     console.log(`${entry.status}: ${entry.text}`);
     if (entry.fix) console.log(`  fix: ${entry.fix}`);
     if (entry.status === 'FAIL') failed = true;

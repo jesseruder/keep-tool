@@ -13956,6 +13956,8 @@ function start(deps = {}) {
     const nodeApi = require('./serve/node-api.js');
     nodeApiServer = nodeApi.startNodeApi({
       listen: nodeApiListen,
+      // What `keep doctor` reads to say whether the listener is actually bound.
+      onState: (value) => nodeApi.writeState(keep.ROOT, value),
       handler: nodeApi.createNodeApiHandler({
         routes: requestRoutes, matchRoute, routeDenial, readBody, principal: keepConsole.principal,
         tokenStore: nodeApi.createNodeTokenStore({ initial: nodeTokenMap, read: () => nodes.nodeTokens(keep.ROOT) }),
