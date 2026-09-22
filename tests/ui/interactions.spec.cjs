@@ -352,38 +352,21 @@ for (const seed of [17, 83]) test(`seed ${seed}: pointer timing and ordering var
     expect(fixture.events.slice(before).filter(e => e.event === 'input').every(e => e.pane === `p${id}`)).toBe(true);
   }
 });
-test('a long status chip ellipsizes instead of wrapping the top bar', async ({ page }) => {
-  for (const width of [1800, 1500]) {
+test('status messages sit in the footer and never move the header', async ({ page }) => {
+  for (const width of [1800, 1500, 1200]) {
     await page.setViewportSize({ width, height: 950 });
-    const bar = page.locator('header.bar');
-    const before = (await bar.boundingBox()).height;
-    await page.evaluate(() => {
-      const chip = document.querySelector('#connection');
-      chip.textContent = 'terminal host not answering for 4 m · showing panes as of 4 m ago · and more';
-      chip.hidden = chip.parentElement.hidden = false;
-    });
-    await expect(page.locator('#connection')).toBeVisible();
-    expect((await bar.boundingBox()).height).toBe(before);
+    const box = async (selector) => page.locator(selector).evaluate(el => { const r = el.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), h: Math.round(r.height) }; });
+    const header = await box('header.bar');
+    const health = await box('#health');
+    for (const text of ['saving 1…', 'terminal host not answering for 4 m · showing panes as of 4 m ago · '.repeat(4)]) {
+      await page.evaluate((value) => { const chip = document.querySelector('#connection'); chip.textContent = value; chip.hidden = false; }, text);
+      await expect(page.locator('footer.keys #connection')).toBeVisible();
+      expect(await box('header.bar')).toEqual(header);
+      expect(await box('#health')).toEqual(health);
+      expect(await page.locator('footer.keys').evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    }
     const chip = await page.locator('#connection').evaluate(el => ({ scroll: el.scrollWidth, client: el.clientWidth }));
     expect(chip.scroll).toBeGreaterThan(chip.client);
-    const slot = await page.locator('.connection-slot').evaluate(el => el.getBoundingClientRect().width);
-    const chipWidth = await page.locator('#connection').evaluate(el => el.getBoundingClientRect().width);
-    expect(slot - chipWidth).toBeLessThan(1);
-    await page.evaluate(() => { const chip = document.querySelector('#connection'); chip.hidden = chip.parentElement.hidden = true; });
-  }
-});
-test('a short status chip sits beside the theme picker, uncropped', async ({ page }) => {
-  for (const width of [1800, 1500, 800]) {
-    await page.setViewportSize({ width, height: 950 });
-    await page.evaluate(() => {
-      const chip = document.querySelector('#connection');
-      chip.textContent = 'saving 1…';
-      chip.hidden = chip.parentElement.hidden = false;
-    });
-    const chip = await page.locator('#connection').evaluate(el => ({ scroll: el.scrollWidth, client: el.clientWidth, right: el.getBoundingClientRect().right, top: el.getBoundingClientRect().top }));
-    expect(chip.scroll).toBeLessThanOrEqual(chip.client);
-    const theme = await page.locator('#themePicker').evaluate(el => ({ left: el.getBoundingClientRect().left, top: el.getBoundingClientRect().top }));
-    if (Math.abs(theme.top - chip.top) < 10) expect(theme.left - chip.right).toBeLessThan(40);
-    await page.evaluate(() => { const chip = document.querySelector('#connection'); chip.hidden = chip.parentElement.hidden = true; });
+    await page.evaluate(() => { document.querySelector('#connection').hidden = true; });
   }
 });

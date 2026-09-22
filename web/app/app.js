@@ -23,6 +23,7 @@ import { renderFleet } from './fleet.js';
 import { numLabel } from './session-number.js';
 import { openReviewQueueNotification, renderReviewQueue, reviewQueueIdForNotification } from './review-queue.js';
 import { openSessionChooser } from './session-launcher.js';
+import { providerIconHTML } from './provider-icon.js';
 import { openPortableTransfer } from './portable-transfer.js';
 import { closeReviewerPopover, markReviewerSeen, renderDock, renderReviewer, renderReviewerTop } from './reviewer.js';
 import { createDetailStore } from './details.js';
@@ -861,7 +862,10 @@ function renderMeters() {
         const window = value.label || 'usage';
         const key = `${agent}:${window}`;
         const group = groups.get(key) || {
+          agent,
           label: `${agent === 'claude' ? 'Claude' : 'Codex'} ${window}`,
+          // The provider icon names the agent once, so each window shows only its own name.
+          short: window.replace(/\bweek$/, 'wk'),
           readings: [],
         };
         group.readings.push({ account: account.label || account.id, ...value });
@@ -869,7 +873,7 @@ function renderMeters() {
       }
     }
   }
-  document.querySelector('#meters').innerHTML = [...groups.values()].map((group) => {
+  const groupHTML = (group) => {
     const details = group.readings.map((reading) => {
       const percent = Math.max(0, Math.min(100, Number(reading.percent) || 0));
       const resetAt = reading.resetsAt == null || reading.resetsAt === '' ? NaN : new Date(reading.resetsAt).getTime();
@@ -881,8 +885,12 @@ function renderMeters() {
       return { ...reading, percent, elapsed, detail: `${reading.account}: ${Math.round(percent)}%${elapsedText}${reset}` };
     });
     const description = `${group.label}. ${details.map((reading) => reading.detail).join('. ')}`;
-    return `<span class="meter-group" tabindex="0" role="group" aria-label="${esc(description)}"><span class="meter-label">${esc(group.label)}</span><span class="meter-readings">${details.map((reading) => `<span class="meter"><i><b class="${reading.percent >= 75 ? 'warn' : ''}" style="width:${reading.percent}%"></b>${reading.elapsed == null ? '' : `<u class="${reading.elapsed < reading.percent ? 'over' : ''}" style="left:${reading.elapsed}%"></u>`}</i><span>${Math.round(reading.percent)}%</span></span>`).join('')}</span><span class="meter-details" role="tooltip">${details.map((reading) => `<span>${esc(reading.detail)}</span>`).join('')}</span></span>`;
-  }).join('') || '<span class="meter unavailable">usage unavailable</span>';
+    return `<span class="meter-group" tabindex="0" role="group" aria-label="${esc(description)}"><span class="meter-label">${esc(group.short)}</span><span class="meter-readings">${details.map((reading) => `<span class="meter"><i><b class="${reading.percent >= 75 ? 'warn' : ''}" style="width:${reading.percent}%"></b>${reading.elapsed == null ? '' : `<u class="${reading.elapsed < reading.percent ? 'over' : ''}" style="left:${reading.elapsed}%"></u>`}</i><span>${Math.round(reading.percent)}%</span></span>`).join('')}</span><span class="meter-details" role="tooltip"><b>${esc(group.label)}</b>${details.map((reading) => `<span>${esc(reading.detail)}</span>`).join('')}</span></span>`;
+  };
+  const agents = ['claude', 'codex'].map((agent) => [agent, [...groups.values()].filter((group) => group.agent === agent)]).filter(([, list]) => list.length);
+  document.querySelector('#meters').innerHTML = agents.map(([agent, list]) =>
+    `<span class="meter-agent">${providerIconHTML(agent, esc)}${list.map(groupHTML).join('')}</span>`).join('')
+    || '<span class="meter unavailable">usage unavailable</span>';
 }
 function renderHealth() {
   const health = data.health || {};
@@ -1055,7 +1063,6 @@ function renderConnectionStatus() {
   connection.textContent = view.text;
   connection.title = view.text;
   connection.hidden = !view.text;
-  connection.parentElement.hidden = !view.text;
   connection.dataset.status = view.status;
   clearTimeout(connectionTimer);
   connectionTimer = view.ticking ? setTimeout(() => { renderConnectionStatus(); syncMobile(); }, 1000) : 0;
