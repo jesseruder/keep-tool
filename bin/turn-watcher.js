@@ -294,17 +294,19 @@ function selectTurns(options = {}) {
   const limit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : 5;
   // Split current and legacy rows so SQLite can seek both sparse partial indexes;
   // a single OR made it prefer turns_verdict and walk every ended turn.
-  return handle.prepare(`WITH pending(id, ended_at) AS (
+  // A legacy row's started_at is its time for ordering, as COALESCE did before:
+  // sorting on a null ended_at would park every legacy turn behind the dated ones.
+  return handle.prepare(`WITH pending(id, at) AS (
       SELECT id, ended_at FROM turns INDEXED BY turns_unjudged
         WHERE ended = 1 AND verdict IS NULL AND ended_at >= ?
       UNION ALL
-      SELECT id, ended_at FROM turns INDEXED BY turns_unjudged_started
+      SELECT id, started_at FROM turns INDEXED BY turns_unjudged_started
         WHERE ended = 1 AND verdict IS NULL AND ended_at IS NULL AND started_at >= ?
     )
     SELECT ${TURN_COLUMNS}
     FROM pending p JOIN turns t ON t.id = p.id JOIN sessions s ON s.id = t.session_id
     WHERE s.kind = 'interactive'
-    ORDER BY p.ended_at DESC LIMIT ?`).all(windowStart(options.sinceMs), windowStart(options.sinceMs), limit);
+    ORDER BY p.at DESC LIMIT ?`).all(windowStart(options.sinceMs), windowStart(options.sinceMs), limit);
 }
 
 function turnsForReplay(options = {}) {

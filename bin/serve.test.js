@@ -1654,6 +1654,45 @@ test('a list timeout keeps the cached host open and does not reject another pend
   } finally { await closeHostClient(); }
 });
 
+test('a mutation forgets the last known pane list before its reply, and a list in flight across it is not remembered', async () => {
+  const { closeHostClient, listHostPaneResult, lastKnownHostPanes } = require('./serve');
+  await closeHostClient();
+  let releaseList = null;
+  const client = {
+    socket: { destroyed: false },
+    onDisconnect: () => ({ dispose() {} }),
+    close() { this.socket.destroyed = true; },
+    request(type) {
+      if (type === 'list') return new Promise((resolve) => { releaseList = () => resolve({ panes: [{ id: 'old', alive: true }] }); });
+      if (type === 'spawn') return new Promise(() => {});
+      return Promise.resolve({ type });
+    },
+  };
+  const deps = { connectHost: async () => client };
+  // The list is issued only once the (async) connect has settled.
+  const listIssued = async () => { while (!releaseList) await new Promise((resolve) => setImmediate(resolve)); };
+  try {
+    // A list that answers promptly is remembered.
+    const first = listHostPaneResult(deps, true);
+    await listIssued();
+    releaseList();
+    releaseList = null;
+    assert.deepEqual((await first).panes, [{ id: 'old', alive: true }]);
+    assert.deepEqual(lastKnownHostPanes({}, deps).panes, [{ id: 'old', alive: true }]);
+    // A spawn that times out may still have run on the host: the list is forgotten
+    // before the request goes out, so a later fallback cannot reuse the pre-spawn view.
+    await assert.rejects(hostRequest('spawn', { cmd: 'x' }, { ...deps, hostRequestTimeoutMs: 5 }), /timed out/);
+    assert.equal(lastKnownHostPanes({}, deps), null);
+    // A list collected across a kill answers its caller but is not remembered.
+    const stale = listHostPaneResult(deps, true);
+    await listIssued();
+    await hostRequest('kill', { pane: 'old' }, deps);
+    releaseList();
+    assert.deepEqual((await stale).panes, [{ id: 'old', alive: true }]);
+    assert.equal(lastKnownHostPanes({}, deps), null);
+  } finally { await closeHostClient(); }
+});
+
 test('closeHostClient hangs up the cached connection so a one-shot command can exit', async () => {
   const { closeHostClient } = require('./serve');
   const opened = [];

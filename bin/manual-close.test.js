@@ -53,6 +53,11 @@ for (const mode of ['timeout', 'missing']) test(`manual close reports an unconfi
     if (mode === 'timeout') throw new Error('host request timed out (get) [load high]');
     return undefined;
   };
+  // A fake clock that advances with each sleep: the error reports the time the
+  // phase actually took, and the polls are bounded by wall time, not count.
+  let clock = 0;
+  f.deps.now = () => clock;
+  f.deps.sleep = async (ms) => { clock += ms; };
   await assert.rejects(manualClose(body, f.deps), (error) => {
     assert.match(error.message, /SIGTERM signal sent; host did not confirm within 1s/);
     assert.doesNotMatch(error.message, /identity changed/);

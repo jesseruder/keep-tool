@@ -425,6 +425,9 @@ let lastAutoCompactGc = 0;
 let reviewStateCache = { at: 0, value: null };
 const hostPaneCaches = new WeakMap();
 const lastKnownHostPaneMemo = { panes: null, at: 0 };
+// Bumped before every request that can change the host, so a list collected
+// across a spawn or replacement is never remembered as the last known state.
+let hostMutationEpoch = 0;
 let cachedHost = null;
 let pendingHost = null;
 let hostFailureAt = 0;
@@ -992,6 +995,7 @@ function sessionBackgroundPending(info) {
   });
 }
 
+const CLOSE_TRANSCRIPT_TIMEOUT_MS = 30e3;
 // Graceful close needs the complete lifecycle, not the last few megabytes: a
 // background launch can be old while its completion is absent. Put that full read
 // and JSON parsing in a short-lived worker so it cannot stall the daemon loop.
@@ -999,12 +1003,21 @@ function inspectCloseTranscript(file, kind, deps = {}) {
   if (deps.inspectCloseTranscript) return deps.inspectCloseTranscript(file, kind);
   const WorkerClass = deps.Worker || Worker;
   const workerFile = deps.closeTranscriptWorker || path.join(__dirname, 'close-transcript-worker.js');
+  const timeoutMs = deps.closeTranscriptTimeoutMs == null ? CLOSE_TRANSCRIPT_TIMEOUT_MS : deps.closeTranscriptTimeoutMs;
   return new Promise((resolve, reject) => {
     const worker = new WorkerClass(workerFile, { workerData: { file, kind } });
     let settled = false;
+    // The caller holds the injection lock while this runs; a worker stuck on a
+    // swapped-out disk must not hold it for the console's whole deadline and beyond.
+    const timer = setTimeout(() => {
+      finish(new Error(`close transcript scan timed out after ${Math.round(timeoutMs / 1000)}s; leave the session open`));
+      try { worker.terminate(); } catch {}
+    }, timeoutMs);
+    timer.unref?.();
     const finish = (error, result) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       if (error) reject(error); else resolve(result);
     };
     worker.once('message', (message) => {
@@ -1949,16 +1962,19 @@ async function hostRequest(type, params, deps = {}) {
         requestTimeoutMs,
         deadline - wallNow(),
       ));
+      if (!idempotent) {
+        // A stale identity/activity list is safe only until this daemon changes the
+        // host, and the host may execute a request whose reply timed out here, so
+        // the last known list is forgotten before the request goes out, not after
+        // it is confirmed.
+        hostMutationEpoch += 1;
+        lastKnownHostPaneMemo.panes = null;
+        lastKnownHostPaneMemo.at = 0;
+      }
       const result = await requestHostClient(client, type, params, {
         ...deps, hostRequestTimeoutMs: attemptTimeoutMs,
       });
       if (['spawn', 'meta', 'kill', 'remove', 'resize', 'clear'].includes(type)) hostPaneCaches.delete(client);
-      if (!idempotent) {
-        // A stale identity/activity list is safe only until this daemon changes the
-        // host. Never use a pre-mutation snapshot to authorize a later action.
-        lastKnownHostPaneMemo.panes = null;
-        lastKnownHostPaneMemo.at = 0;
-      }
       return result;
     } catch (error) {
       const disconnected = retryableHostError(error)
@@ -2009,15 +2025,20 @@ async function listHostPaneResult(deps = {}, fresh = false) {
   const cached = hostPaneCaches.get(client);
   if (!fresh && cached && now() - cached.at < HOST_PANE_CACHE_MS) return { panes: cached.panes, failure: null };
   try {
+    const epoch = hostMutationEpoch;
     const result = await requestHostClient(client, 'list', {}, deps);
     const panes = Array.isArray(result && result.panes) ? result.panes : [];
     if (panes.some((p) => p?.alive && Number.isInteger(p.pid) && ['claude', 'codex'].includes(p.meta?.agent))) {
       try { annotatePaneAgents(panes, await (deps.agentProcessRows || agentProcessRows)(deps)); } catch {}
     }
-    hostPaneCaches.set(client, { at: now(), panes });
-    const memo = deps.hostPaneMemo || lastKnownHostPaneMemo;
-    memo.panes = panes;
-    memo.at = now();
+    // A mutation that started while this list was in flight (or while it waited on
+    // the process table) makes it a pre-mutation list: return it, remember nothing.
+    if (epoch === hostMutationEpoch) {
+      hostPaneCaches.set(client, { at: now(), panes });
+      const memo = deps.hostPaneMemo || lastKnownHostPaneMemo;
+      memo.panes = panes;
+      memo.at = now();
+    }
     return { panes, failure: null };
   } catch (error) {
     if (retryableHostError(error) || (client.socket && client.socket.destroyed)) invalidateHost(client, deps, error);

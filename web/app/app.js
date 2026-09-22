@@ -1044,6 +1044,7 @@ function refreshRecovered() {
     const label = document.querySelector('#connection');
     if (label?.dataset.status === 'reconnecting') label.dataset.status = eventStreamStatus || 'live';
   }
+  renderConnectionStatus();
 }
 function renderConnectionStatus() {
   const connection = document.querySelector('#connection');
@@ -1137,6 +1138,9 @@ async function reload() {
           label.dataset.status = 'reconnecting';
           refreshMarkedReconnecting = true;
         }
+        // The chip's own timer stops on a healthy render; a refresh that starts
+        // failing afterwards has to restart it or the chip stays blank.
+        renderConnectionStatus();
         if (!refreshFailureToasted && now - refreshFailingSince >= REFRESH_FAILURE_TOAST_MS) {
           refreshFailureToasted = true;
           toast(`State refresh failed: ${error.message}`);

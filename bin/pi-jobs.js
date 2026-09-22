@@ -263,9 +263,11 @@ function list(options = {}) {
   // Dashboard publication already owns a full ps snapshot. Reusing its rows keeps
   // reconciliation proportional to records in memory instead of one ps per job.
   const rows = Array.isArray(options.processRows) ? options.processRows : null;
+  // A runner that started after the snapshot was taken is absent from it but
+  // alive; only the live probe may say a process is gone, never the cache alone.
   const jobs = records(options.root, rows ? {
     rows,
-    processAlive: (pid) => rows.some((row) => row.pid === Number(pid)),
+    processAlive: (pid) => rows.some((row) => row.pid === Number(pid)) || processAlive(pid),
   } : {}).map((job) => ({
     id: job.id,
     status: job.status,

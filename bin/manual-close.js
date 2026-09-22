@@ -34,10 +34,16 @@ async function manualClose(body, deps) {
   if (!initial.alive) return result();
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const timedOut = (error) => /timed out/i.test(String(error && error.message || error));
+  const now = deps.now || Date.now;
+  // A phase is ten polls or the wall time they were meant to take, whichever ends
+  // first: a host that times out every read must not hold the injection lock for
+  // ten full request timeouts, and the error reports the time actually spent.
   const wait = async (delay) => {
+    const started = now();
+    const budgetMs = 10 * delay;
     let confirmed = false;
     let lastError = null;
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 10 && now() - started < budgetMs; i++) {
       let pane;
       try { pane = await deps.getPane(body.pane); }
       catch (error) {
@@ -50,14 +56,14 @@ async function manualClose(body, deps) {
       // exited. Keep polling for an affirmative host observation within this phase.
       if (pane) {
         confirmed = true;
-        if (!verify(pane).alive) return { closed: true, confirmed, lastError };
+        if (!verify(pane).alive) return { closed: true, confirmed, lastError, waitedMs: now() - started };
       }
       await sleep(delay);
     }
-    return { closed: false, confirmed, lastError };
+    return { closed: false, confirmed, lastError, waitedMs: now() - started };
   };
-  const unconfirmed = (signal, delay, cause) => {
-    const seconds = 10 * delay / 1000;
+  const unconfirmed = (signal, waitedMs, cause) => {
+    const seconds = Math.max(0, waitedMs) / 1000;
     const error = new Error(`${signal} signal sent; host did not confirm within ${Number.isInteger(seconds) ? seconds : seconds.toFixed(1)}s${cause ? `: ${cause.message}` : ''}`);
     if (cause) error.cause = cause;
     return error;
@@ -83,17 +89,17 @@ async function manualClose(body, deps) {
   await deps.signal(body.pane, 'SIGTERM', deps.requireSignalGuard ? guard() : null);
   const term = await wait(100);
   if (term.closed) return result();
-  if (!term.confirmed) throw unconfirmed('SIGTERM', 100, term.lastError);
+  if (!term.confirmed) throw unconfirmed('SIGTERM', term.waitedMs, term.lastError);
   await gracefulResult?.beforeSignal?.();
   let beforeKill;
   try { beforeKill = await deps.getPane(body.pane); }
-  catch (error) { if (timedOut(error)) throw unconfirmed('SIGTERM', 100, error); throw error; }
-  if (!beforeKill) throw unconfirmed('SIGTERM', 100);
+  catch (error) { if (timedOut(error)) throw unconfirmed('SIGTERM', term.waitedMs, error); throw error; }
+  if (!beforeKill) throw unconfirmed('SIGTERM', term.waitedMs);
   verify(beforeKill);
   await deps.signal(body.pane, 'SIGKILL', deps.requireSignalGuard ? guard() : null);
   const killed = await wait(100);
   if (killed.closed) return result(true);
-  if (!killed.confirmed) throw unconfirmed('SIGKILL', 100, killed.lastError);
+  if (!killed.confirmed) throw unconfirmed('SIGKILL', killed.waitedMs, killed.lastError);
   throw new Error('Termination requested but the pane is still alive');
 }
 
