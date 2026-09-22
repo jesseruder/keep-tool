@@ -1055,6 +1055,7 @@ function renderConnectionStatus() {
   connection.textContent = view.text;
   connection.title = view.text;
   connection.hidden = !view.text;
+  connection.parentElement.hidden = !view.text;
   connection.dataset.status = view.status;
   clearTimeout(connectionTimer);
   connectionTimer = view.ticking ? setTimeout(() => { renderConnectionStatus(); syncMobile(); }, 1000) : 0;

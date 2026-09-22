@@ -360,12 +360,12 @@ test('a long status chip ellipsizes instead of wrapping the top bar', async ({ p
     await page.evaluate(() => {
       const chip = document.querySelector('#connection');
       chip.textContent = 'terminal host not answering for 4 m · showing panes as of 4 m ago · and more';
-      chip.hidden = false;
+      chip.hidden = chip.parentElement.hidden = false;
     });
     await expect(page.locator('#connection')).toBeVisible();
     expect((await bar.boundingBox()).height).toBe(before);
     const chip = await page.locator('#connection').evaluate(el => ({ scroll: el.scrollWidth, client: el.clientWidth }));
     expect(chip.scroll).toBeGreaterThan(chip.client);
-    await page.evaluate(() => { document.querySelector('#connection').hidden = true; });
+    await page.evaluate(() => { const chip = document.querySelector('#connection'); chip.hidden = chip.parentElement.hidden = true; });
   }
 });

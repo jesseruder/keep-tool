@@ -587,7 +587,7 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 /* The slot has no base width, so a long status shrinks into free space and ellipsizes
    instead of wrapping the bar onto a second row. */
 .connection-slot { flex: 1 1 0; min-width: 0; max-width: 340px; display: flex; }
-.connection-slot:has(> .connection[hidden]) { display: none; }
+.connection-slot[hidden] { display: none; }
 .connection { display: block; min-width: 0; max-width: 100%; padding: 4px 8px; border: 1px solid var(--bar-line); border-radius: 12px; color: var(--bar-muted); font: 11px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .connection[hidden] { display: none; }
 .connection[data-status="pending"] { color: var(--info); }
