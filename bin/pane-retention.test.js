@@ -232,6 +232,7 @@ test('keep pane gc runs the same plan, and --dry-run removes nothing', async () 
   const client = {
     request: async (type, params) => {
       requests.push(type);
+      if (type === 'hello') return { node: require('./nodes.js').daemonNode() };
       if (type === 'list') return { panes };
       return { pane: { id: params.pane } };
     },
@@ -246,7 +247,7 @@ test('keep pane gc runs the same plan, and --dry-run removes nothing', async () 
   console.log = (line) => printed.push(line);
   try {
     await commands.pane(['gc', '--dry-run'], deps);
-    assert.deepEqual(requests, ['list']);
+    assert.deepEqual(requests, ['hello', 'list']);
     assert.deepEqual(printed, [
       `remove ${panes[0].id} claude exited ${panes[0].exitedAt.slice(0, 10)} aged`,
       `keep ${panes[1].id} retained`,
@@ -254,7 +255,7 @@ test('keep pane gc runs the same plan, and --dry-run removes nothing', async () 
     printed.length = 0;
     requests.length = 0;
     await commands.pane(['gc', '--days', '0'], deps);
-    assert.deepEqual(requests, ['list', 'remove', 'remove']);
+    assert.deepEqual(requests, ['hello', 'list', 'remove', 'remove']);
     assert.equal(printed.at(-1), 'removed 2 of 2 exited (aged 2)');
   } finally {
     console.log = log;
@@ -277,8 +278,10 @@ test('a zero-day window still never takes a pane that exited within the hour', (
   assert.deepEqual(result.kept.map((entry) => [entry.pane, entry.reason]), [[justNow.id, 'recent']]);
 });
 
-// A graceful Claude exit leaves {agent: 'shell', sessionId: null} on the pane
-// (bin/commands/hook.js releaseSessionPane), so only a guard naming the pane holds it.
+// A graceful Claude exit patches the pane to agent 'shell' and sessionId null
+// (bin/commands/hook.js releaseSessionPane); the host's meta handler deletes a key
+// patched to null, so the pane keeps its other meta and has no sessionId at all.
+// Only a guard naming the pane can hold it.
 test('a demoted pane is held by pane-keyed guards and not by session-keyed ones', () => {
   const session = sid();
   const byPane = {
@@ -288,13 +291,13 @@ test('a demoted pane is held by pane-keyed guards and not by session-keyed ones'
     delivery: { deliveryPanes: (p) => new Set([p.id]) },
   };
   for (const [reason, [[key, make]]] of Object.entries(byPane).map(([r, o]) => [r, Object.entries(o)])) {
-    const pane = exited(9, { agent: 'shell', sessionId: null });
+    const pane = exited(9, { agent: 'shell', project: 'demo', title: 'demo' });
     const result = retention.plan([pane], { env, now: NOW, guards: guards({ [key]: make(pane) }) });
     assert.deepEqual(result.kept.map((entry) => entry.reason), [reason], reason);
   }
   const bySession = ['keepRunning', 'compaction', 'handoffSessions', 'queued', 'restartSessions'];
   for (const key of bySession) {
-    const pane = exited(9, { agent: 'shell', sessionId: null });
+    const pane = exited(9, { agent: 'shell', project: 'demo', title: 'demo' });
     const result = retention.plan([pane], { env, now: NOW, guards: guards({ [key]: new Set([session]) }) });
     assert.deepEqual(removedIds(result), [pane.id], `${key} cannot see a demoted pane`);
   }
@@ -319,7 +322,7 @@ test('an unfinished restart in session-restarts.json holds its pane and session'
   assert.deepEqual(g.failures, []);
   assert.ok(g.restartPanes.has(interruptedPane) && g.restartSessions.has(interrupted));
   assert.ok(!g.restartPanes.has(finishedPane) && !g.restartSessions.has(finished), 'a done restart holds nothing');
-  const demoted = { ...exited(9, { agent: 'shell', sessionId: null }), id: interruptedPane };
+  const demoted = { ...exited(9, { agent: 'shell', project: 'demo', title: 'demo' }), id: interruptedPane };
   const other = exited(9);
   assert.deepEqual(removedIds(retention.plan([demoted, other], { env, now: NOW, guards: g })), [other.id]);
   fs.writeFileSync(file, '{"not": "a list"}');
@@ -338,10 +341,26 @@ test('a guard that cannot be read turns the health row red and removes nothing',
 
 test('keep pane gc refuses to run off the daemon node', async () => {
   const { commands } = require('./commands/host.js');
-  let listed = false;
-  const client = { request: async () => { listed = true; return { panes: [] }; }, close() {} };
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pane-retention-'));
+  const requests = [];
+  const client = (node) => ({
+    request: async (type) => { requests.push(type); return type === 'hello' ? { node } : { panes: [] }; },
+    close() {},
+  });
+  // The environment says so: refused before any host is asked.
   await assert.rejects(commands.pane(['gc', '--dry-run'], {
-    connectHost: async () => client, root: fs.mkdtempSync(path.join(os.tmpdir(), 'pane-retention-')), isDaemonNode: () => false,
+    connectHost: async () => client(require('./nodes.js').daemonNode()), root, isDaemonNode: () => false,
   }), /runs on the daemon node/);
-  assert.equal(listed, false);
+  assert.deepEqual(requests, []);
+  // A bare ssh shell on another node passes the env check; the host it reaches does not.
+  await assert.rejects(commands.pane(['gc', '--dry-run'], {
+    connectHost: async () => client('aws1'), root, isDaemonNode: () => true,
+  }), /runs on the daemon node .*this host is aws1/);
+  assert.deepEqual(requests, ['hello'], 'nothing is listed once the host names another node');
+  // A host booted before it named its node: the env gate is all there is, so it runs.
+  requests.length = 0;
+  await commands.pane(['gc', '--dry-run'], {
+    connectHost: async () => client(undefined), root, isDaemonNode: () => true,
+  });
+  assert.deepEqual(requests, ['hello', 'list'], 'an unnamed host is taken at the env gate\'s word');
 });

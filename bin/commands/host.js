@@ -465,6 +465,15 @@ commands.pane = async (argv, deps = {}) => {
       if (o.days != null) limits.days = hostNumber(o.days, '--days');
       if (o.max != null) limits.max = hostNumber(o.max, '--max');
       const client = await clients.get(null);
+      // The env check above is only the cheap gate: a bare ssh shell on another node
+      // has no KEEP_NODE_NAME, so it takes itself for the daemon node. The host it
+      // reached knows which node it is (its service exports the name), so ask it. A
+      // host booted before it named its node answers without one; that host predates
+      // the fleet, so the env gate is all there is.
+      const hello = await client.request('hello');
+      if (typeof hello?.node === 'string' && hello.node !== nodesApi.daemonNode()) {
+        die(`keep pane gc runs on the daemon node (${nodesApi.daemonNode()}), whose records its guards read; this host is ${hello.node}`);
+      }
       const { panes } = await client.request('list');
       const root = deps.root || registryRoot();
       if (!root) die('keep pane gc needs the Keep registry: its guards are read from <keep>/.keep');
