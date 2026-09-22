@@ -157,8 +157,9 @@ is for interactive Codex sessions, not every Claude handoff.
   unchanged failing prompt repeatedly.
 - Astra (`--model gpt-6-astra`) only after asking Owner in this session and getting a
   yes: say what Sol could not do and why Astra would. His yes covers that handoff, not
-  the card or later work.
-- Reviews follow `codex-review-runner`: Sol at medium, Astra only with Owner's yes,
+  the card or later work. An unattended session never uses Astra.
+- Reviews follow `codex-review-runner`: Sol at medium (high to settle a finding),
+  Astra only with Owner's yes,
   and the latest Opus (the `opus` alias) when every Codex account is out of usage.
 
 An explicit choice by Owner overrides these defaults. State the selected model and effort, and pass the exact `--model` and `--effort`
@@ -184,7 +185,7 @@ ladder one notch lower:
 
 The Astra column applies only once Owner has approved Astra; `xhigh` on Astra only
 when he asks for it. Reviews use the separate policy in `codex-review-runner`: Sol at
-medium, Astra only with Owner's yes.
+medium (high to settle a finding), Astra only with Owner's yes.
 For mechanical Luna handoffs, use low.
 
 The plugin only accepts `none|minimal|low|medium|high|xhigh`. Some models support `max` and `ultra`, but those are unreachable through the companion runtime used by `keep codex` — they require invoking `codex` directly.

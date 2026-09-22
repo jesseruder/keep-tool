@@ -17,24 +17,29 @@ rules. Keep the selected account explicit throughout candidate lookup, launch,
 status, result, and cancellation. A review may use a different account from the
 implementation; its own lifecycle stays bound to the review's account.
 
-Every review uses `--model gpt-5.6-sol --effort medium`, including risky,
-security-sensitive and daemon changes, and every re-review of a fix. For those, ask
-Sol for an adversarial review and name the failure modes to challenge rather than
-reaching for a bigger model. Sol at `high` is the next step when a medium review
-cannot settle a finding.
+Every review uses `--model gpt-5.6-sol` and starts at `--effort medium`, including
+risky, security-sensitive and daemon changes, and every re-review of a fix. For
+those, ask Sol for an adversarial review and name the failure modes to challenge
+rather than reaching for a bigger model. Sol at `high` is the next step when a medium
+review cannot settle a finding.
 
 Never use Astra (`gpt-6-astra`) for a review without asking Owner first, in that
 session, for that review. Say why Sol is not enough and what the Astra run would
 cost; a yes covers the one review series he approved, not the card or later work.
-Until he answers, run the Sol review. Astra xhigh requires his explicit request.
+Until he answers, run the Sol review. Astra xhigh requires his explicit request. An
+unattended session never uses Astra: when Sol at high still cannot settle a finding,
+record it on the card or file a `keep needs` rather than asking.
 
 0. Run `keep review-route`. It names the Codex account to use, or says every one of
    them is at its usage limit. In that case use the fallback it names — and only that
    one. For `opus`, run the review as a read-only subagent on the latest Opus: from
    Claude Code, the Agent tool with `model: "opus"`, which always resolves to the
    newest Opus, so never pin a versioned id like `claude-opus-5-5`. Give it the same
-   read-only review prompt, ask for the ranked findings inline in its reply, and
-   record the review with `--by "opus …" --fallback` and 80+ characters of
+   review prompt with "read-only, no edits" stated (the prompt is the only thing
+   keeping it read-only), and ask for the ranked findings inline in its reply. Steps
+   1-4 are Codex-only: an Opus review has no job id, so `keep reviewing` cannot hold
+   it, and nothing records it if the turn ends first. Wait for the subagent's reply
+   before ending the turn, then record the review with `--by "opus …" --fallback` and 80+ characters of
    `--evidence` summarising what it checked; `--fallback` is what stamps the record,
    and Keep fills in what the exhaustion was. If it says no fallback is
    configured, say so on the card and stop rather than improvising a reviewer. When a
