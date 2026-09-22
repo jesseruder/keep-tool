@@ -673,3 +673,51 @@ test('the batch and cancel routes match through the real ladder and pass their r
     assert.equal(matchRoute(list, { req: { method: 'GET', headers: { 'x-keep': '1' } }, url: new URL(`http://x${pathname}`), body: {} }), null);
   }
 });
+
+test('a tick with no policy and nothing due builds no session state at all', async () => {
+  const f = fixture();
+  let loads = 0;
+  let policyLoads = 0;
+  const result = await queue.tick({ root: f.root, env: f.env, now: () => T, log: () => {},
+    sessions: async () => { loads += 1; return [session()]; },
+    policySessions: async () => { policyLoads += 1; return [session()]; },
+    handoffSession: async () => { throw new Error('should not be called'); } });
+  assert.deepEqual(result, { ok: true, detail: 'nothing due' });
+  assert.deepEqual([loads, policyLoads], [0, 0]);
+});
+
+test('the policy scan reads the cheaper policy source, and a due entry still gets a fresh full build', async () => {
+  const f = fixture();
+  f.write({ rateLimitHandoff: { one: 'two' } });
+  const loads = [];
+  const moved = [];
+  const result = await queue.tick({ root: f.root, env: f.env, now: () => T, log: () => {},
+    sessions: async () => { loads.push('full'); return [session()]; },
+    policySessions: async () => { loads.push('policy'); return [session()]; },
+    readUsageCache: () => null,
+    handoffSession: async (body) => { moved.push(body.sessionId); return { ok: true, status: 'done' }; } });
+  assert.deepEqual(loads, ['policy', 'full'], 'one policy read, then one full build for the entry it queued');
+  assert.deepEqual(moved, ['session-a']);
+  assert.match(result.detail, /^moved 1/);
+
+  // Nothing new for the policy to queue and nothing due: only the policy source is read.
+  loads.length = 0;
+  const idle = await queue.tick({ root: f.root, env: f.env, now: () => T + 1e3, log: () => {},
+    sessions: async () => { loads.push('full'); return []; },
+    policySessions: async () => { loads.push('policy'); return []; },
+    handoffSession: async () => { throw new Error('should not be called'); } });
+  assert.deepEqual(idle, { ok: true, detail: 'nothing due' });
+  assert.deepEqual(loads, ['policy']);
+});
+
+test('a due entry is judged against the full build even with the policy off', async () => {
+  const f = fixture();
+  queue.enqueue(f.root, { sessionId: 'session-a', pane: 'pane-1', sourceAccountId: 'one', targetAccountId: 'two' },
+    { now: T, log: () => {} });
+  const loads = [];
+  await queue.tick(tickDeps(f, async () => ({ ok: true, status: 'done' }), {
+    sessions: async () => { loads.push('full'); return [session()]; },
+    policySessions: async () => { loads.push('policy'); return [session()]; },
+  }));
+  assert.deepEqual(loads, ['full']);
+});

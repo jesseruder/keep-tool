@@ -184,6 +184,22 @@ function authority(root, env = process.env) {
   return result;
 }
 
+// Where a walk last found each session, per projects root. A walk stats one
+// candidate per project directory in every account (well over a thousand on a
+// busy machine), and the state build asks about every hosted session, so a
+// session whose account is already known is answered from here with one stat.
+// Only a hit is remembered: a miss has to be walked again, because the
+// transcript appears when the session's first turn is written.
+const LOCATED_CLAUDE_FILES_LIMIT = 4096;
+const locatedClaudeFiles = new Map(); // `${projects root}\0${sessionId}` -> project directory name
+
+function rememberClaudeFile(root, sessionId, projectName) {
+  const key = `${root}\0${sessionId}`;
+  locatedClaudeFiles.delete(key);
+  locatedClaudeFiles.set(key, projectName);
+  if (locatedClaudeFiles.size > LOCATED_CLAUDE_FILES_LIMIT) locatedClaudeFiles.delete(locatedClaudeFiles.keys().next().value);
+}
+
 function locateClaudeFiles(sessionId, env = process.env) {
   const found = [];
   for (const entry of projectRoots(env)) {
@@ -192,11 +208,40 @@ function locateClaudeFiles(sessionId, env = process.env) {
     for (const projectName of projectNames) {
       const file = path.join(entry.root, projectName, `${sessionId}.jsonl`);
       try {
-        if (fs.statSync(file).isFile()) found.push({ accountId: entry.accountId, file, projectName });
+        if (fs.statSync(file).isFile()) {
+          found.push({ accountId: entry.accountId, file, projectName });
+          rememberClaudeFile(entry.root, sessionId, projectName);
+        }
       } catch {}
     }
   }
   return found;
+}
+
+// The transcript an earlier walk found for this session in one account, if it is
+// still there. Null means "not known without a walk", never "absent".
+function knownClaudeFile(sessionId, accountId, env = process.env) {
+  const entry = projectRoots(env).find((candidate) => candidate.accountId === accountId);
+  if (!entry) return null;
+  const key = `${entry.root}\0${sessionId}`;
+  const projectName = locatedClaudeFiles.get(key);
+  if (!projectName) return null;
+  const file = path.join(entry.root, projectName, `${sessionId}.jsonl`);
+  try { if (fs.statSync(file).isFile()) return { accountId, file, projectName }; } catch {}
+  locatedClaudeFiles.delete(key);
+  return null;
+}
+
+// Which configured Claude account a transcript path belongs to, from its projects
+// root alone. No walk: the file is already in hand.
+function claudeAccountForFile(file, env = process.env) {
+  const resolved = path.resolve(String(file || ''));
+  let best = null;
+  for (const candidate of projectRoots(env)) {
+    const root = path.resolve(candidate.root);
+    if (resolved.startsWith(root + path.sep) && (!best || root.length > best.root.length)) best = { root, accountId: candidate.accountId };
+  }
+  return best ? best.accountId : null;
 }
 
 function forSession(sessionId, agent = 'claude', options = {}) {
@@ -351,6 +396,6 @@ function setDefault(agent, accountId, env = process.env) {
 
 module.exports = {
   AGENTS, ID_RE, CUSTOM_ID_RE, rawConfig, list, get, defaultFor, automationFor, hasMultiple, envFor, projectRoots,
-  publicState, authority, authorityFile, locateClaudeFiles, forSession, sessionNode, pinSession,
+  publicState, authority, authorityFile, locateClaudeFiles, knownClaudeFile, claudeAccountForFile, forSession, sessionNode, pinSession,
   stageSession, commitStaged, clearStaged, add, setDefault,
 };

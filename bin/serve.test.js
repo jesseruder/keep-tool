@@ -11168,6 +11168,95 @@ test('host backfill uses indexed Claude discovery only for dashboard state', () 
   assert.equal(indexedFactories, 1);
 });
 
+test('a state build outside the dashboard resolves host-only Claude panes from one fresh index snapshot', () => {
+  const panes = ['one', 'two', 'three'].map((name) => ({ id: `pane-${name}`, alive: true,
+    meta: { sessionId: `host-${name}`, agent: 'claude' } }));
+  let exactCalls = 0;
+  let factories = 0;
+  const added = backfillHostSessions([], panes, {
+    freshClaudeSessionFor: () => { exactCalls++; return null; },
+    createFreshClaudeSessionResolver: () => { factories++; return (id) => ({ id, kind: 'claude', mtime: 1 }); },
+  });
+  assert.equal(added.length, 3);
+  assert.equal(factories, 1, 'one resolver per build');
+  assert.equal(exactCalls, 0, 'no per-pane project walk');
+
+  const { createFreshClaudeSessionResolver } = require('./serve.js');
+  const rows = [
+    { id: 'indexed', accountId: 'a', file: '/a/one/indexed.jsonl', stat: { size: 1, mtimeMs: 1 } },
+    { id: 'new-account', accountId: 'a', file: '/a/one/new-account.jsonl', stat: { size: 2, mtimeMs: 2 } },
+  ];
+  const exact = [];
+  const resolve = createFreshClaudeSessionResolver({
+    rows,
+    accountIds: ['a'],
+    authority: { 'new-account': { agent: 'claude', accountId: 'added-later' } },
+    sessionForEntry: (id, file, stat, accountId) => ({ id, file, accountId }),
+    claudeSessionFor: (id) => { exact.push(id); return null; },
+  });
+  assert.deepEqual(resolve('indexed'), { id: 'indexed', file: '/a/one/indexed.jsonl', accountId: 'a' });
+  assert.equal(resolve('not-yet-written'), null);
+  assert.equal(resolve('new-account'), null);
+  assert.deepEqual(exact, ['not-yet-written', 'new-account'],
+    'an id the snapshot does not hold, or one pinned outside it, is asked for exactly');
+});
+
+test('a Claude transcript miss is reused by build paths for a short while and forgotten when a pane appears', async () => {
+  const { claudeSessionFor, forgetClaudeSessionMisses, noteHostPaneSessions } = require('./serve.js');
+  const id = `miss-${process.pid}-${Date.now()}`;
+  let walks = 0;
+  let clock = 1_000_000;
+  const findSessionFile = () => { walks++; return null; };
+  const build = { allowCachedMiss: true, findSessionFile, now: () => clock };
+  assert.equal(claudeSessionFor(id, build), null);
+  assert.equal(claudeSessionFor(id, build), null);
+  assert.equal(walks, 1, 'a second build within the window does not walk again');
+  assert.equal(claudeSessionFor(id, { findSessionFile, now: () => clock }), null);
+  assert.equal(walks, 2, 'an action path never takes a remembered miss as its answer');
+  clock += 31e3;
+  claudeSessionFor(id, build);
+  assert.equal(walks, 3, 'the miss expires');
+  claudeSessionFor(id, build);
+  assert.equal(walks, 3);
+
+  const pane = { id: 'pane-miss', alive: true, createdAt: '2026-01-01T00:00:00Z', meta: { sessionId: id, agent: 'claude' } };
+  noteHostPaneSessions([pane]);
+  claudeSessionFor(id, build);
+  assert.equal(walks, 4, 'a pane appearing for the session forgets its miss');
+  noteHostPaneSessions([pane]);
+  claudeSessionFor(id, build);
+  assert.equal(walks, 4, 'the same pane seen again changes nothing');
+
+  // A spawn on the host is the other moment a transcript can start existing.
+  const host = { request: async () => ({ pane: { id: 'pane-new' } }) };
+  await hostRequest('spawn', { cmd: '/bin/sh' }, { host });
+  claudeSessionFor(id, build);
+  assert.equal(walks, 5, 'a spawn forgets every remembered miss');
+  forgetClaudeSessionMisses();
+});
+
+test('the rate-limit policy reads only live Claude panes, with the pane account winning', async () => {
+  const { handoffPolicySessions } = require('./serve.js');
+  const looked = [];
+  const panes = [
+    { id: 'live', alive: true, meta: { sessionId: 'limited', agent: 'claude', accountId: 'two' } },
+    { id: 'calm', alive: true, meta: { sessionId: 'calm', agent: 'claude' } },
+    { id: 'dead', alive: false, meta: { sessionId: 'dead', agent: 'claude' } },
+    { id: 'gone', alive: true, agentAlive: false, meta: { sessionId: 'gone', agent: 'claude' } },
+    { id: 'codex', alive: true, meta: { sessionId: 'codex', agent: 'codex' } },
+  ];
+  const sessions = await handoffPolicySessions({
+    listHostPanes: async () => panes,
+    claudeSessionFor: (id) => {
+      looked.push(id);
+      return { id, kind: 'claude', accountId: 'one', rateLimit: id === 'limited' ? { at: 5 } : null };
+    },
+  });
+  assert.deepEqual(looked, ['limited', 'calm']);
+  assert.deepEqual(sessions.map((row) => [row.id, row.pane, row.accountId, row.rateLimit.at]), [['limited', 'live', 'two', 5]]);
+  assert.deepEqual(await handoffPolicySessions({ listHostPanes: async () => null, claudeSessionFor: () => assert.fail() }), []);
+});
+
 test('a host request timeout releases the injection lock', async () => {
   const host = { request: async () => new Promise(() => {}) };
   await assert.rejects(hostRequest('get', { pane: 'p' }, { host, hostRequestTimeoutMs: 5 }),

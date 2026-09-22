@@ -101,3 +101,45 @@ test('a session recorded on another node is refused even when its account is gon
     accountId: 'a', node: 'main', updatedAt: 1 }, null, 2) + '\n');
   assert.equal(findSessionFile('remote-session', { root }), '/a/one/remote-session.jsonl');
 });
+
+test('a pinned session is answered from the transcript an earlier walk found, without walking again', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-transcript-direct-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const config = path.join(root, 'config.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'a', label: 'Claude A', agent: 'claude', configDir: path.join(root, 'a') },
+    { id: 'b', label: 'Claude B', agent: 'claude', configDir: path.join(root, 'b') },
+  ], defaultAccounts: { claude: 'a' } }));
+  const env = { KEEP_CONFIG: config, KEEP_DIR: path.join(root, 'registry') };
+  const registry = env.KEEP_DIR;
+  const id = `direct-${process.pid}-${Date.now()}`;
+  const write = (account, project) => {
+    const file = path.join(root, account, 'projects', project, `${id}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{}\n');
+    return file;
+  };
+  for (let n = 0; n < 5; n++) fs.mkdirSync(path.join(root, 'b', 'projects', `other-${n}`), { recursive: true });
+  const onA = write('a', 'one');
+  const onB = write('b', 'two');
+  accounts.pinSession(id, 'claude', 'b', { root: registry, env });
+
+  const originalLocate = accounts.locateClaudeFiles;
+  let walks = 0;
+  accounts.locateClaudeFiles = (...args) => { walks++; return originalLocate(...args); };
+  t.after(() => { accounts.locateClaudeFiles = originalLocate; });
+
+  assert.equal(findSessionFile(id, { root: registry, env }), onB);
+  assert.equal(walks, 1, 'the first lookup has nothing to go on but a walk');
+  assert.equal(findSessionFile(id, { root: registry, env }), onB);
+  assert.equal(findSessionFile(id, { root: registry, env }), onB);
+  assert.equal(walks, 1, 'later lookups of a pinned session stat the known file instead');
+  assert.equal(accounts.claudeAccountForFile(onB, env), 'b');
+  assert.equal(accounts.claudeAccountForFile(onA, env), 'a');
+
+  // The known file going away is not an answer: the walk runs again and the
+  // fallback rules are the ones they always were.
+  fs.rmSync(onB);
+  assert.equal(findSessionFile(id, { root: registry, env }), onA);
+  assert.equal(walks, 2);
+});

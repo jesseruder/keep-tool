@@ -67,6 +67,13 @@ function findSessionFile(id, options = {}) {
     // file can still be read, but multiple files remain ambiguous.
     authorityFailed = true;
   }
+  // A pinned session reads only its own account's transcript whenever that exists,
+  // whatever other accounts hold, so a transcript an earlier walk already found
+  // there answers without walking every account's projects again.
+  if (pinned) {
+    const known = accounts.knownClaudeFile(id, pinned.id, env);
+    if (known) return known.file;
+  }
   const matches = accounts.locateClaudeFiles(id, env);
   if (!pinned && !authorityFailed) {
     const accountIds = [...new Set(matches.map((entry) => entry.accountId))];

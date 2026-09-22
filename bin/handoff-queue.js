@@ -223,11 +223,14 @@ function policyTargets(env = process.env) {
   return map;
 }
 
-function policyEnqueue(root, sessions, now, deps, log) {
+// The policy map is read before any session is: with no key configured, which is
+// how this ships, the scan costs the daemon nothing.
+async function policyEnqueue(root, loadSessions, now, deps, log) {
   let map;
   try { map = deps.policy ? deps.policy(deps.env || process.env) : policyTargets(deps.env || process.env); }
   catch (error) { log(`policy ignored: ${error.message}`); return { enqueued: 0, exhausted: 0 }; }
   if (!Object.keys(map).length) return { enqueued: 0, exhausted: 0 };
+  const sessions = await loadSessions();
   let usage;
   const summary = { enqueued: 0, exhausted: 0 };
   for (const session of sessions) {
@@ -410,9 +413,13 @@ async function tick(deps = {}) {
   // limit cleared, and acting on the stale row would transfer it anyway.
   const loadSessions = async () => (deps.sessions ? await deps.sessions()
     : deps.buildState ? (await deps.buildState()).sessions || [] : []);
+  // The policy only enqueues; every entry it writes is judged again against a
+  // fresh full build below before anything is transferred. So it may read the
+  // cheaper source the daemon offers (live panes only), when there is one.
+  const loadPolicySessions = async () => (deps.policySessions ? await deps.policySessions() : loadSessions());
   let policy = { enqueued: 0, exhausted: 0 };
   if (deps.policy || deps.policyEnabled !== false) {
-    policy = policyEnqueue(root, await loadSessions(), now, deps, log);
+    policy = await policyEnqueue(root, loadPolicySessions, now, deps, log);
   }
   const due = list(root).filter((entry) => entry.status === 'queued' && Number(entry.nextAt || 0) <= now);
   if (!due.length) {

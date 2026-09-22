@@ -2240,6 +2240,9 @@ async function hostRequest(type, params, deps = {}) {
         ...deps, hostRequestTimeoutMs: attemptTimeoutMs,
       });
       if (['spawn', 'meta', 'kill', 'remove', 'resize', 'clear'].includes(type)) hostPaneCaches.delete(client);
+      // A spawn or a meta change can be the session's first pane or a new id on an
+      // old one; a transcript lookup that missed before it must be asked again.
+      if (type === 'spawn' || type === 'meta') forgetClaudeSessionMisses();
       // The host answers with its own id. The daemon asked about a pane it knows by
       // its fleet-wide name, and everything downstream — manual close, retirement's
       // identity checks, force-restart — compares the reply against that name, so
@@ -2367,6 +2370,7 @@ async function listNodePaneResult(node, deps = {}, fresh = false, epoch = hostMu
     // answer that arrives just after its budget still refreshes what this daemon
     // knows about that node. A node half a second too slow is stale for one read,
     // not until it happens to be quick.
+    noteHostPaneSessions(panes);
     if (epoch === hostMutationEpoch) {
       hostPaneCaches.set(client, { at: now(), panes });
       rememberNodePanes(node, panes, now(), epoch);
@@ -7925,10 +7929,35 @@ async function handoffQueueSessions(deps = {}) {
   return (await (deps.handoffQueueState || handoffQueueState)(deps)).sessions || [];
 }
 
+// What the rateLimitHandoff policy reads on every tick. Only a session with a live
+// Claude agent in a pane can be moved, so only those are resolved, each by its
+// exact lookup, instead of a full state build over every transcript and pane. The
+// policy only enqueues: an entry is transferred only after a fresh full build.
+async function handoffPolicySessions(deps = {}) {
+  const panes = await (deps.listHostPanes || listHostPanes)({}, true);
+  if (!Array.isArray(panes)) return [];
+  const live = panes.filter((pane) => pane && pane.alive === true && pane.agentAlive !== false
+    && pane.meta?.agent === 'claude');
+  const lookup = deps.claudeSessionFor || ((id) => claudeSessionFor(id, { allowCachedMiss: true }));
+  const sessions = [];
+  for (const pane of hostPanesBySession(live).values()) {
+    const id = pane.meta?.sessionId;
+    if (typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(id)) continue;
+    let session = null;
+    try { session = lookup(id); } catch {}
+    if (!session || !session.rateLimit) continue;
+    // The pane's account wins over the transcript's, as it does in addHostSessionState.
+    const accountId = typeof pane.meta.accountId === 'string' && pane.meta.accountId ? pane.meta.accountId : session.accountId;
+    sessions.push({ ...session, id, kind: 'claude', pane: pane.id, ...(accountId ? { accountId } : {}) });
+  }
+  return sessions;
+}
+
 function handoffQueueTick(deps = {}) {
   return require('./handoff-queue').tick({
     root: keep.ROOT,
     sessions: () => handoffQueueSessions(deps),
+    policySessions: () => (deps.handoffPolicySessions || handoffPolicySessions)(deps),
     readUsageCache,
     handoffSession: (body) => handoffSession(body),
     ...deps,
@@ -10046,8 +10075,52 @@ function claudeSessionForEntry(id, file, stat, accountId = null) {
   return claudeSessionFromInfo(id, info, stat, dir, reviewer, Date.now(), accountId);
 }
 
-function claudeSessionFor(sessionId) {
+// A hosted session whose transcript does not exist yet (a pane opened and not yet
+// spoken to) misses on every state build, and each miss walks every account's
+// project tree. Build paths may take a recent miss as the answer for a short
+// while; action paths never read this. A pane appearing for the session, or a
+// spawn or meta change on the host, forgets it early.
+const CLAUDE_SESSION_MISS_TTL_MS = 30e3;
+const CLAUDE_SESSION_MISS_LIMIT = 2048;
+const claudeSessionMisses = new Map(); // session id -> when the miss was seen
+const hostPaneSessionSignatures = new Map(); // session id -> the pane it was last seen in
+
+function forgetClaudeSessionMisses(sessionId) {
+  if (sessionId === undefined) claudeSessionMisses.clear();
+  else claudeSessionMisses.delete(String(sessionId));
+}
+
+// A pane that is new for its session (or a pane that replaced one) is the moment a
+// transcript can start existing, so an earlier miss for that id stops counting.
+function noteHostPaneSessions(panes) {
+  for (const pane of Array.isArray(panes) ? panes : []) {
+    const id = pane?.meta?.sessionId;
+    if (typeof id !== 'string' || !id) continue;
+    const signature = `${pane.id}\0${pane.createdAt || ''}\0${pane.pid || ''}\0${pane.alive === true}`;
+    if (hostPaneSessionSignatures.get(id) === signature) continue;
+    hostPaneSessionSignatures.delete(id);
+    hostPaneSessionSignatures.set(id, signature);
+    claudeSessionMisses.delete(id);
+    if (hostPaneSessionSignatures.size > CLAUDE_SESSION_MISS_LIMIT) {
+      hostPaneSessionSignatures.delete(hostPaneSessionSignatures.keys().next().value);
+    }
+  }
+}
+
+function rememberClaudeSessionMiss(id, now) {
+  claudeSessionMisses.delete(id);
+  claudeSessionMisses.set(id, now);
+  if (claudeSessionMisses.size > CLAUDE_SESSION_MISS_LIMIT) claudeSessionMisses.delete(claudeSessionMisses.keys().next().value);
+}
+
+function claudeSessionFor(sessionId, options = {}) {
   const id = String(sessionId || '');
+  const now = typeof options.now === 'function' ? options.now() : Date.now();
+  if (options.allowCachedMiss === true) {
+    const missedAt = claudeSessionMisses.get(id);
+    if (missedAt !== undefined && now >= missedAt && now - missedAt < CLAUDE_SESSION_MISS_TTL_MS) return null;
+  }
+  const find = options.findSessionFile || findSessionFile;
   let file = claudeSessionPathCache.get(id) || null;
   let stat;
   if (file) {
@@ -10063,14 +10136,27 @@ function claudeSessionFor(sessionId) {
     }
   }
   if (!file) {
-    file = findSessionFile(id);
-    if (!file) return null;
-    try { stat = fs.statSync(file); } catch { return null; }
-    if (!stat.isFile()) return null;
+    file = find(id);
+    if (file) {
+      try { stat = fs.statSync(file); } catch { file = null; }
+      if (file && !stat.isFile()) file = null;
+    }
+    if (!file) {
+      rememberClaudeSessionMiss(id, now);
+      return null;
+    }
   }
+  claudeSessionMisses.delete(id);
   cacheClaudeSessionLookup(claudeSessionPathCache, id, file);
+  // Durable authority only: letting forSession discover here would walk every
+  // account's project tree again for a file already in hand. With no record, the
+  // account is the one whose projects root holds that file, which is what
+  // discovery would have answered (findSessionFile already refused an ambiguous one).
   let accountId = null;
-  try { accountId = accounts.forSession(id, 'claude', { root: keep.ROOT })?.id || null; } catch {}
+  try {
+    const record = accounts.forSession(id, 'claude', { root: keep.ROOT, allowDiscovery: false });
+    accountId = record ? record.id || null : accounts.claudeAccountForFile(file);
+  } catch {}
   return claudeSessionForEntry(id, file, stat, accountId);
 }
 
@@ -10136,6 +10222,27 @@ function createDashboardClaudeSessionResolver(deps = {}) {
     if (cached?.backgroundJobs) deps.onSettledHit?.(session, cached.backgroundJobs);
     if (session) deps.onSessionSource?.(session, entry.file, entry.stat);
     return session;
+  };
+}
+
+// The same one-snapshot resolution for a state build outside the dashboard, over
+// the rows scanClaudeSessions just read with fresh=true — which is what lets action
+// paths (inspectAccountHandoff, inspectPortableSource) use it. An id those rows do
+// not hold, or one pinned to an account the index does not cover (added since the
+// daemon started), goes to the exact lookup instead. That lookup may reuse a miss
+// from the last few seconds: the fresh rows have just agreed with it.
+function createFreshClaudeSessionResolver(deps = {}) {
+  const rows = deps.rows || claudeTranscriptIndex.scan({ fresh: true });
+  const authority = deps.authority || accounts.authority(deps.root || keep.ROOT);
+  const indexedAccounts = new Set(deps.accountIds || claudeProjectRoots.map((entry) => entry.accountId));
+  const known = new Set(rows.map((row) => row.id));
+  const indexed = createDashboardClaudeSessionResolver({ ...deps, rows, authority, accountIds: [...indexedAccounts] });
+  const exact = deps.claudeSessionFor || ((id) => claudeSessionFor(id, { allowCachedMiss: true }));
+  return (sessionId) => {
+    const id = String(sessionId || '');
+    const record = authority[id];
+    const covered = !record || record.agent !== 'claude' || indexedAccounts.has(record.accountId);
+    return known.has(id) && covered ? indexed(id) : exact(id);
   };
 }
 
@@ -10745,6 +10852,9 @@ function buildState(options = {}) {
     overdue: keep.isOverdue(t),
   }));
   let dashboardTranscriptRows = null;
+  // Outside the dashboard, scanClaudeSessions indexes with fresh=true, so these rows
+  // are as current as a walk and can answer host-only panes for action paths too.
+  let freshTranscriptRows = null;
   // This map belongs to one build. Capture each selected source at discovery
   // time so the general-purpose 300-entry lookup LRU cannot evict an earlier
   // published session before its path is relayed to the parent.
@@ -10768,7 +10878,10 @@ function buildState(options = {}) {
     accountAuthority: dashboardAccountAuthority,
     onSessionSource: rememberDashboardSource,
     onSettledHit: (session, jobs) => settledBackgroundJobs.set(`${session.kind}:${session.id}`, jobs),
-    ...(options.dashboard === true ? { onTranscriptRows: (rows) => { dashboardTranscriptRows = rows; } } : {}),
+    onTranscriptRows: (rows) => {
+      if (options.dashboard === true) dashboardTranscriptRows = rows;
+      else freshTranscriptRows = rows;
+    },
   });
   // scanSessions just reconciled this exact index snapshot synchronously. Reuse
   // it for host-only rows instead of statting every project directory again.
@@ -10794,6 +10907,12 @@ function buildState(options = {}) {
           dashboardWorker: workerMode,
           hostPanesBySession: panesBySession,
           independentLive,
+        }),
+      } : {}),
+      ...(freshTranscriptRows ? {
+        createFreshClaudeSessionResolver: () => createFreshClaudeSessionResolver({
+          rows: freshTranscriptRows,
+          onSessionSource: rememberDashboardSource,
         }),
       } : {}),
     });
@@ -11189,6 +11308,7 @@ function backfillHostSessions(sessions, panes, deps = {}) {
   const owners = sessionTaskOwners(deps.tasks || []);
   const added = [];
   let indexedClaudeSessionFor = null;
+  let freshIndexedClaudeSessionFor = null;
   for (const pane of hostPanesBySession(panes).values()) {
     try {
       const meta = pane && pane.meta;
@@ -11201,7 +11321,9 @@ function backfillHostSessions(sessions, panes, deps = {}) {
         : agent === 'pi' ? deps.piSessionFor || pi.sessionFor
         : deps.claudeSessionFor || (deps.dashboard === true
           ? (indexedClaudeSessionFor ||= (deps.createDashboardClaudeSessionResolver || createDashboardClaudeSessionResolver)())
-          : deps.freshClaudeSessionFor || claudeSessionFor);
+          : deps.createFreshClaudeSessionResolver
+            ? (freshIndexedClaudeSessionFor ||= deps.createFreshClaudeSessionResolver())
+            : deps.freshClaudeSessionFor || claudeSessionFor);
       let session = null;
       try { session = lookup(id); } catch {}
       if (!session) {
@@ -13404,7 +13526,10 @@ module.exports = {
   companionSnapshot,
   applyCompanionJobs,
   claudeSessionFor,
+  forgetClaudeSessionMisses,
+  noteHostPaneSessions,
   createDashboardClaudeSessionResolver,
+  createFreshClaudeSessionResolver,
   transcriptActivityMs,
   sessionNeedsInput,
   sessionTaskOwners,
@@ -13459,7 +13584,8 @@ module.exports = {
   transcriptFileForSession,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,
-  handoffQueueSessions, handoffQueueTick, handoffRateLimited, cancelQueuedHandoff, handoffSessionRequest, queueRefusedHandoff,
+  handoffQueueSessions, handoffPolicySessions, handoffQueueTick, handoffRateLimited, cancelQueuedHandoff, handoffSessionRequest,
+  queueRefusedHandoff,
   listPortableTransfers, inspectPortableSource, portableTerminalRateLimitEvidence,
   portableTransferDraft, preparePortableTransfer,
   portableTransferPreview, transferSession, resolvePortableTransfer, recoverPortableOpening,
