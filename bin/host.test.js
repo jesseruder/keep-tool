@@ -10,6 +10,8 @@ const path = require('node:path');
 const test = require('node:test');
 const { Terminal } = require('@xterm/headless');
 const {
+  parseListenAddress,
+  canonicalIp,
   DEFAULT_SNAPSHOT_SCROLLBACK,
   MAX_FRAME_BYTES,
   RingBuffer,
@@ -2232,4 +2234,44 @@ test('bootId survives a core reload and differs between host processes', async (
     await other.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('a scope zone cannot smuggle the wildcard past the bind refusal', async () => {
+  // net.isIP() accepts a zone and the URL parser rejects one, so an address that
+  // fell back to its raw text on a canonicalisation failure would reach the bind as
+  // "::%0" — which libuv strips to "::", every interface on the machine.
+  for (const listen of ['[::%0]:7777', '[0::0%1]:7777', '[0:0:0:0:0:0:0:0%eth0]:7777', '[::0%1]:7777']) {
+    assert.throws(() => parseListenAddress(listen), /zone is only meaningful on a link-local address/, listen);
+  }
+  // A zone belongs to a link-local address, and there it is kept.
+  for (const [listen, address] of [
+    ['[fe80::1%en0]:7777', 'fe80::1%en0'],
+    ['[fe80:0:0:0:0:0:0:2%3]:7777', 'fe80::2%3'],
+    ['[febf::1%eth0]:7777', 'febf::1%eth0'],
+  ]) {
+    assert.deepEqual(parseListenAddress(listen), { address, port: 7777 }, listen);
+  }
+  // Not link-local, an empty zone, and a zone on IPv4 are all refused.
+  assert.throws(() => parseListenAddress('[fe7f::1%1]:7777'), /link-local/);
+  assert.throws(() => parseListenAddress('[2001:db8::1%1]:7777'), /link-local/);
+  assert.throws(() => parseListenAddress('[fe80::1%]:7777'), /empty zone/);
+  assert.throws(() => parseListenAddress('127.0.0.1%1:7777'), /IPv4 address takes no zone/);
+  // A canonicalisation that fails is a refusal, never a fall back to the raw text.
+  assert.throws(() => parseListenAddress('[fe80::1]:7777', () => { throw new Error('unreadable'); }),
+    /cannot read the IPv6 address/);
+  assert.throws(() => canonicalIp('::', '::', () => { throw new Error('unreadable'); }), /cannot read the IPv6 address/);
+
+  // And the host itself refuses to come up on the network for any of them.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-zone-'));
+  const { file } = nodeTokenFile(dir);
+  let index = 0;
+  for (const listen of ['[::%0]:0', '[::]:0', '[fe80::1%]:0']) {
+    const refused = createHost({ sock: path.join(dir, `z${index++}.sock`), log: null, listen, tokenFile: file });
+    try {
+      await refused.listen();
+      assert.equal(refused.listenAddress, null, listen);
+      assert.match(refused.listenError.message, /zone|refusing to bind/, listen);
+    } finally { await refused.close(); }
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
 });

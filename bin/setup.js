@@ -611,8 +611,12 @@ function servicePlist(kind, root, envPath = process.env.PATH || '', overrides = 
 // systemd splits an unquoted value on whitespace and reads its own escapes in it,
 // so every path and every value goes in double quotes with the two characters that
 // syntax reserves escaped. A checkout under "Application Support" is not exotic.
+//
+// `%` is escaped too, and outside the quotes it would still be: systemd resolves
+// its specifiers before it parses quoting, so a literal percent must be doubled
+// wherever it appears. A scoped IPv6 address — `[fe80::1%en0]:7777` — carries one.
 function systemdQuote(value) {
-  return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`;
 }
 
 function hostUnit(env) {
@@ -650,10 +654,12 @@ function node(args, root, home = os.homedir()) {
   // The same refusal the host makes, made here: a node binds the interface it was
   // given a token for, never every interface the machine happens to have.
   const host = require('./host.js');
+  // parseListenAddress refuses a hostname, an unreadable literal and a zone on
+  // anything but a link-local address; assertBindable refuses the wildcards. Both
+  // happen here, before a file is written, and not again at boot.
   const listen = host.parseListenAddress(opts.listen);
-  if (['0.0.0.0', '::'].includes(listen.address)) {
-    throw new Error(`refusing to install a service that binds ${listen.address}; give --listen the node's own address`);
-  }
+  try { host.assertBindable(listen.address, opts.listen); }
+  catch { throw new Error(`refusing to install a service that binds ${listen.address}; give --listen the node's own address`); }
   if (!opts['token-file']) throw new Error(NODE_USAGE);
   const tokenFile = canonicalPath(opts['token-file'].replace(/^~(?=\/|$)/, home));
   // The same check the host makes at boot, made now so the failure is a sentence

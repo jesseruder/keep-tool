@@ -1054,3 +1054,56 @@ test('keep node init refuses to install a service that binds every interface', (
   assert.equal(fs.existsSync(path.join(home, 'Library', 'LaunchAgents', 'games.castle.keep.host.plist')), false);
   assert.equal(fs.existsSync(path.join(home, '.config', 'systemd', 'user', 'keep-host.service')), false);
 });
+
+// systemd resolves its own specifiers before it parses quoting, so a literal % has
+// to be doubled wherever it appears. Reads the unit back the way systemd would.
+function unitValues(text) {
+  const values = {};
+  for (const line of text.split('\n')) {
+    const match = /^Environment=([A-Z_]+)=(.*)$/.exec(line);
+    if (!match) continue;
+    const quoted = match[2];
+    assert.match(quoted, /^".*"$/, line);
+    values[match[1]] = quoted.slice(1, -1)
+      .replace(/%%/g, '%')
+      .replace(/\\(["\\])/g, '$1');
+  }
+  return values;
+}
+
+test('a systemd unit doubles a literal percent in every value it writes', (t) => {
+  const { home, tokenFile } = nodeHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const odd = path.join(home, '100% keep');
+  fs.mkdirSync(odd, { recursive: true });
+  const oddToken = path.join(odd, 'node.token');
+  fs.copyFileSync(tokenFile, oddToken);
+  fs.chmodSync(oddToken, 0o600);
+  const listen = '[fe80::1%en0]:7777';
+  const platform = process.platform;
+  try {
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+    capture(() => setup.node(['init', 'aws1', '--daemon-node', 'main', '--listen', listen,
+      '--token-file', oddToken, '--sock', path.join(home, 'host.sock')], '/tmp/r', home));
+    const unit = fs.readFileSync(path.join(home, '.config', 'systemd', 'user', 'keep-host.service'), 'utf8');
+    assert.ok(unit.includes('KEEP_HOST_LISTEN="[fe80::1%%en0]:7777"'), unit);
+    const values = unitValues(unit);
+    assert.equal(values.KEEP_HOST_LISTEN, listen, 'the scoped address survives a systemd read');
+    assert.equal(values.KEEP_NODE_TOKEN_FILE, oddToken, 'so does a path with a percent in it');
+    assert.equal(/(^|[^%])%[^%]/.test(unit.split('\n').filter((line) => line.startsWith('Environment=')).join('\n')), false,
+      'no value carries an unescaped specifier');
+  } finally {
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+  }
+});
+
+test('keep node init refuses a scope zone that hides the wildcard', (t) => {
+  const { home, tokenFile } = nodeHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  for (const listen of ['[::%0]:7777', '[0::0%1]:7777', '[2001:db8::1%1]:7777']) {
+    assert.throws(() => setup.node(['init', 'aws1', '--daemon-node', 'main', '--listen', listen,
+      '--token-file', tokenFile], '/tmp/r', home), /zone is only meaningful on a link-local address/, listen);
+  }
+  assert.equal(fs.existsSync(path.join(home, '.config', 'systemd', 'user', 'keep-host.service')), false);
+  assert.equal(fs.existsSync(path.join(home, 'Library', 'LaunchAgents', 'games.castle.keep.host.plist')), false);
+});

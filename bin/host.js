@@ -366,30 +366,70 @@ function connectProbe(sock) {
 
 // `<ip>:<port>`, with a bracketed literal for IPv6. The design binds one
 // interface — the node's Tailscale address — so the form is deliberately narrow.
+// fe80::/10: the first hextet is fe80 through febf, and it is the only range in
+// which a scope zone means anything at all.
+function linkLocalIp(canonical) {
+  return /^fe[89ab][0-9a-f]:/i.test(canonical);
+}
+
+function parseIpv6(bare) {
+  return new URL(`http://[${bare}]`).hostname.replace(/^\[/, '').replace(/\]$/, '');
+}
+
 // An address names an interface, never a machine: a hostname is resolved at bind
 // time and could land on an interface nobody meant to expose. An IPv6 literal is
 // canonicalised through the URL parser, so that `::0`, `0:0:0:0:0:0:0:0` and `::`
 // are one address by the time anything decides whether it is the wildcard.
-function canonicalIp(value, source = value) {
+//
+// A `%zone` suffix is split off first. net.isIP() accepts one, the URL parser does
+// not, and a canonicalisation that fell back to the raw text would hand `::%0`
+// straight past both wildcard comparisons — where libuv drops the zone and binds
+// every interface on the machine. So the zone is separated, the address itself is
+// canonicalised or refused, and a zone survives only on a link-local address, which
+// is the only place it could have been meant.
+function canonicalIp(value, source = value, parse = parseIpv6) {
   const raw = String(value).replace(/^\[/, '').replace(/\]$/, '');
-  const family = net.isIP(raw);
+  const percent = raw.indexOf('%');
+  const bare = percent < 0 ? raw : raw.slice(0, percent);
+  const zone = percent < 0 ? '' : raw.slice(percent + 1);
+  const family = net.isIP(bare);
   if (!family) throw new Error(`a node listen address must be an IP literal, not ${JSON.stringify(raw)}: ${source}`);
-  if (family !== 6) return raw;
-  try { return new URL(`http://[${raw}]`).hostname.replace(/^\[/, '').replace(/\]$/, ''); }
-  catch { return raw; }
+  if (percent >= 0 && !zone) throw new Error(`a node listen address has an empty zone: ${source}`);
+  if (family !== 6) {
+    if (zone) throw new Error(`an IPv4 address takes no zone: ${source}`);
+    return bare;
+  }
+  let canonical;
+  // Never a fallback: an address this cannot read is an address nothing should bind.
+  try { canonical = parse(bare); }
+  catch (error) { throw new Error(`cannot read the IPv6 address ${JSON.stringify(bare)} (${error.message}): ${source}`); }
+  if (!zone) return canonical;
+  if (!linkLocalIp(canonical)) {
+    throw new Error(`a zone is only meaningful on a link-local address (fe80::/10), not ${canonical}: ${source}`);
+  }
+  return `${canonical}%${zone}`;
 }
 
-function parseListenAddress(value) {
+function parseListenAddress(value, parse = parseIpv6) {
   const text = String(value || '').trim();
   const match = /^\[([^\]]+)\]:(\d+)$/.exec(text) || /^([^:]+):(\d+)$/.exec(text);
   if (!match) throw new Error(`a node listen address must be <ip>:<port>: ${text}`);
   const port = Number(match[2]);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`invalid node listen port: ${text}`);
-  return { address: canonicalIp(match[1], text), port };
+  return { address: canonicalIp(match[1], text, parse), port };
 }
 
 function wildcardAddress(address) {
   return ['0.0.0.0', '::'].includes(String(address));
+}
+
+// The refusal the host makes at boot, in one place so `keep node init` refuses
+// the same addresses before it writes a service that would bind them.
+function assertBindable(address, source = address) {
+  if (wildcardAddress(address)) {
+    throw new Error(`refusing to bind ${address}: set KEEP_HOST_LISTEN_ANY=1 to listen on every interface`);
+  }
+  return source;
 }
 
 function formatListenAddress(bound) {
@@ -449,9 +489,7 @@ function createHost(options = {}) {
   if (listenSpec) {
     try {
       listenTarget = parseListenAddress(listenSpec);
-      if (wildcardAddress(listenTarget.address) && !allowAnyAddress) {
-        throw new Error(`refusing to bind ${listenTarget.address}: set KEEP_HOST_LISTEN_ANY=1 to listen on every interface`);
-      }
+      if (!allowAnyAddress) assertBindable(listenTarget.address, listenSpec);
       if (!tokenFile) throw new Error('a node listen address needs KEEP_NODE_TOKEN_FILE');
       tokenDigest = crypto.createHash('sha256').update(readNodeToken(tokenFile)).digest();
     } catch (error) {
@@ -1858,6 +1896,8 @@ module.exports = {
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
   canonicalIp,
+  linkLocalIp,
+  assertBindable,
   parseListenAddress,
   readNodeToken,
   RingBuffer,
