@@ -13842,7 +13842,7 @@ function start(deps = {}) {
   // Read once at boot, like the public token above. Only the node listener below
   // honours one; it re-reads the directory itself when it is shown a token it does
   // not know, so this map is where it starts.
-  const nodeTokenMap = nodes.nodeTokens(keep.ROOT);
+  const nodeTokenMap = nodes.nodeApiTokens(keep.ROOT);
 
   // Phone pushes carry the console's own badge count. Only the daemon has the
   // state it is computed from, so it hands alerts.js a reader for it rather than
@@ -13960,7 +13960,7 @@ function start(deps = {}) {
       onState: (value) => nodeApi.writeState(keep.ROOT, value),
       handler: nodeApi.createNodeApiHandler({
         routes: requestRoutes, matchRoute, routeDenial, readBody, principal: keepConsole.principal,
-        tokenStore: nodeApi.createNodeTokenStore({ initial: nodeTokenMap, read: () => nodes.nodeTokens(keep.ROOT) }),
+        tokenStore: nodeApi.createNodeTokenStore({ initial: nodeTokenMap, read: () => nodes.nodeApiTokens(keep.ROOT) }),
         json,
         onMutation: () => dashboardPublisher?.invalidate(),
       }),

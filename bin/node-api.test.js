@@ -122,6 +122,54 @@ test('the node listener answers only node tokens, and only on routes that allow 
   assert.equal((await request(port, { pathname: '/api/nothing', headers: { 'x-keep-node-token': 'aws1-secret' } })).status, 404);
 });
 
+test('a token file named after the daemon node or an unconfigured node authenticates nobody', async (t) => {
+  const env = configEnv(t, TWO_NODES);
+  const root = env.KEEP_DIR;
+  const dir = path.join(root, '.keep', 'node-tokens');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'main'), 'main-secret\n');
+  fs.writeFileSync(path.join(dir, 'mini'), 'mini-secret\n');
+  fs.writeFileSync(path.join(dir, 'aws1'), 'aws1-secret\n');
+  const logged = [];
+  const nodes = require('./nodes.js');
+  const tokens = nodes.nodeApiTokens(root, { env, log: (line) => logged.push(line) });
+  assert.deepEqual(tokens, { aws1: 'aws1-secret' });
+  assert.deepEqual(logged, [
+    `keep serve: ignoring node token ${path.join(dir, 'main')}: it names the daemon node itself`,
+    `keep serve: ignoring node token ${path.join(dir, 'mini')}: it names a node that is not configured`,
+  ]);
+  nodes.nodeApiTokens(root, { env, log: (line) => logged.push(line) });
+  assert.equal(logged.length, 2, 'said once, not on every re-read');
+
+  const { port } = await nodeServer(t, { tokens, rereadMs: 0, read: () => nodes.nodeApiTokens(root, { env, log: () => {} }) });
+  for (const token of ['main-secret', 'mini-secret']) {
+    assert.equal((await request(port, { pathname: '/api/node-only', headers: { 'x-keep-node-token': token } })).status, 403, token);
+  }
+  assert.equal((await request(port, { pathname: '/api/node-only', headers: { 'x-keep-node-token': 'aws1-secret' } })).status, 200);
+
+  // And the registry route does not rely on the map: a principal naming the daemon
+  // node is refused there, and by deploy-self.
+  const { createRegistryService } = require('./registry-route.js');
+  const svc = createRegistryService({ root, daemonNode: () => 'main', spawn: () => { throw new Error('must not run'); }, location: () => null, env: {}, configFile: env.KEEP_CONFIG });
+  const asDaemon = { class: 'node', node: 'main' };
+  assert.deepEqual((await svc.handle(asDaemon, { command: 'list', args: [], cwd: root, idempotencyKey: 'k'.repeat(20) })), { status: 403, body: { error: 'unauthorized' } });
+  assert.equal(svc.ping(asDaemon).status, 403);
+  const { routes } = require('./serve/routes.js');
+  let deployed = 0;
+  const list = routes({
+    nodeApiEnabled: () => true, json: (res, status, value) => ({ status, value }),
+    deploySelf: { handle: async () => { deployed += 1; return { status: 200, body: {} }; } },
+  });
+  const url = new URL('http://x/api/deploy-self');
+  const route = matchRoute(list, { req: { method: 'POST', headers: {} }, url, body: {} });
+  const answer = await route.handle({ req: { method: 'POST', headers: {} }, res: {}, url, body: {}, principal: asDaemon });
+  assert.deepEqual(answer, { status: 403, value: { error: 'unauthorized' } });
+  assert.equal(deployed, 0);
+  const aws1 = await route.handle({ req: { method: 'POST', headers: {} }, res: {}, url, body: {}, principal: { class: 'node', node: 'aws1' } });
+  assert.equal(aws1.status, 200);
+  assert.equal(deployed, 1);
+});
+
 test('a token minted after boot is honoured without a restart, and the re-read is rate limited', async (t) => {
   let reads = 0;
   let current = {};

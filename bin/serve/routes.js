@@ -70,7 +70,11 @@ function routes(ctx) {
       path: '/api/deploy-self',
       allow: NODE_API_ALLOW,
       when: nodeApiEnabled,
-      handle: async ({ res, body }) => {
+      handle: async ({ res, body, principal }) => {
+        // As in registry-route.callerNode: no node token speaks for the daemon node.
+        if (principal && principal.class === 'node' && principal.node === require('../nodes.js').daemonNode()) {
+          return json(res, 403, { error: 'unauthorized' });
+        }
         const result = await ctx.deploySelf.handle(body);
         return json(res, result.status, result.body);
       },

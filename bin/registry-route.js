@@ -45,6 +45,9 @@ function refuse(status, message) { throw new RegistryError(status, message); }
 function callerNode(principal, daemon) {
   if (principal && principal.class === 'node') {
     if (typeof principal.node !== 'string' || !principal.node) refuse(403, 'unauthorized');
+    // A token that names the daemon node would let a caller act as the daemon's own
+    // sessions; the token map already leaves such a file out, and this does not rely on it.
+    if (principal.node === daemon) refuse(403, 'unauthorized');
     return principal.node;
   }
   if (principal && ['admin', 'local'].includes(principal.class)) return daemon;

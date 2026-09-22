@@ -142,6 +142,30 @@ function nodeTokens(root) {
   return result;
 }
 
+// The tokens the daemon's node listener honours: only a configured node other than
+// the daemon itself. A file named after the daemon node, or after a node the
+// configuration does not list (removed, or never added), authenticates nobody; its
+// presence is said once per name rather than on every re-read.
+const ignoredTokenFiles = new Set();
+
+function nodeApiTokens(root, { env = process.env, log = (line) => process.stderr.write(`${line}\n`) } = {}) {
+  const found = Object.entries(nodeTokens(root));
+  if (!found.length) return {};
+  const daemon = daemonNode(env);
+  const configured = new Set(configuredNodeNames(env));
+  const result = {};
+  for (const [name, token] of found) {
+    const why = name === daemon ? 'names the daemon node itself' : !configured.has(name) ? 'names a node that is not configured' : null;
+    if (!why) { result[name] = token; continue; }
+    const key = `${root}\0${name}\0${why}`;
+    if (!ignoredTokenFiles.has(key)) {
+      ignoredTokenFiles.add(key);
+      try { log(`keep serve: ignoring node token ${path.join(tokenDir(root), name)}: it ${why}`); } catch {}
+    }
+  }
+  return result;
+}
+
 // Mints a node's token, refusing to overwrite one that already exists: a second
 // call would silently lock out the node holding the first.
 function writeNodeToken(root, name) {
@@ -155,6 +179,6 @@ function writeNodeToken(root, name) {
 
 module.exports = {
   NODE_NAME_RE, PANE_REF_SEPARATOR, NODE_NAME_MEMO_MS,
-  daemonNode, localNode, isDaemonNode, paneOnlyNode, nodeTokens, writeNodeToken,
+  daemonNode, localNode, isDaemonNode, paneOnlyNode, nodeTokens, nodeApiTokens, writeNodeToken,
   configuredNodeEntries, configuredNodeNames, parsePaneRef, formatPaneRef, isRemotePane,
 };
