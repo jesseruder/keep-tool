@@ -919,3 +919,30 @@ test('a row on another node carries the node badge after the provider icon', asy
   const byPane = rowCtx([{ ...NODE_SESSION, pane: 'p1@aws1' }], [{ id: 'p1@aws1', node: 'aws1', alive: true, meta: { agent: 'codex' } }]);
   assert.equal(queueRow(byPane, { kind: 'question', sessionId: 's-1', since: Date.now(), question: 'Ship it?' }), withBadge(WAITING_ROW));
 });
+
+function headingCtx() {
+  return { esc, data: { accounts: [] }, projectHTML: (path) => `<b>${esc(path)}</b>`, tagsHTML: () => '' };
+}
+// The heading as stagePane rendered it before nodes existed.
+const HEADING = '<h2 data-rename-title tabindex="0" title="Click to rename">Fix the bar<span class="num-id" title="s-1">#4</span></h2><div class="meta mono"><b>/work/a</b><span>card-a</span><span class="account-label" title="Account: work">work</span></div>';
+
+test('a daemon-node stage heading renders byte for byte as it did before nodes', async () => {
+  const { stageHeadingHTML } = await import('./triage.js');
+  const session = { ...NODE_SESSION, accountId: 'codex-work', accountLabel: 'work' };
+  for (const pane of [{ id: 'p1', alive: true, meta: {} }, { id: 'p1', node: 'main', alive: true, meta: {} }]) {
+    assert.equal(stageHeadingHTML(headingCtx(), { item: { sessionId: 's-1', taskId: 'card-a' }, session, pane, task: null,
+      title: 'Fix the bar' }), HEADING);
+  }
+});
+
+test('a stage heading on another node carries the node chip beside the account label', async () => {
+  const { stageHeadingHTML } = await import('./triage.js');
+  const pane = { id: 'p1@aws1', node: 'aws1', alive: true, meta: {} };
+  const outageNote = '<span class="host-outage">terminal host unreachable 5s</span>';
+  const expected = HEADING.replace('work</span></div>', `work</span>${NODE_BADGE}${outageNote}</div>`);
+  for (const session of [{ ...NODE_SESSION, accountId: 'codex-work', accountLabel: 'work', node: 'aws1' },
+    { ...NODE_SESSION, accountId: 'codex-work', accountLabel: 'work' }]) {
+    assert.equal(stageHeadingHTML(headingCtx(), { item: { sessionId: 's-1', taskId: 'card-a' }, session, pane, task: null,
+      title: 'Fix the bar', outageNote }), expected);
+  }
+});

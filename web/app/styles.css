@@ -143,6 +143,7 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 /* The machine a session runs on, shown only when it is not the daemon's own. Muted
    like the number badge: it says where, not that anything needs attention. */
 .node-badge { display: inline-block; margin-right: 5px; padding: 0 4px; color: var(--faint); border: 1px solid var(--line-2); border-radius: 3px; font: 10px/1.4 var(--mono); font-weight: 400; white-space: nowrap; vertical-align: .08em; }
+.shead .meta .node-badge { margin-right: 0; }
 .qitem { display: grid; grid-template-columns: 4px 1fr auto; gap: 1px 10px; padding: 10px 12px 10px 8px; border-left: 3px solid transparent; cursor: pointer; }
 .qitem:hover { background: var(--panel-2); } .qitem.sel { background: var(--sel); border-left-color: var(--accent); }
 .qitem .stripe { grid-row: 1 / span 3; border-radius: 2px; background: transparent; }

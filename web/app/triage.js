@@ -874,6 +874,14 @@ export function emptyQueueHTML(state) {
 // Attention rows are point-in-time notifications and may keep the pane that
 // existed when the wait began. Resume updates the session row and pane list in
 // one state publication, so the session's current pane wins whenever it exists.
+// The stage heading: title, number, and the meta line under it. The node chip sits
+// beside the account label for a session on another machine and is absent on the
+// daemon node, so a single-node console renders the heading it always rendered.
+export function stageHeadingHTML(ctx, { item, session, pane, task, title, outageNote = '' }) {
+  const node = remoteNode({ item, session, pane });
+  return `<h2${titleAttrsHTML(ctx.esc, item.sessionId, session?.renamed)}>${markHTML(ctx.esc, session?.mark)}${ctx.esc(title)}${numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}${nodeBadgeHTML(ctx.esc, node)}${outageNote}</div>${task ? modelUsageHTML(task.modelUsage, session?.modelUsage) : ''}`;
+}
+
 export function stagePane(ctx, item, session) {
   const panes = ctx.paneMap();
   const sessionPane = session?.pane ? panes.get(session.pane) : null;
@@ -958,7 +966,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   // An open rename editor lives inside this heading; patching it would type over
   // Owner's input on the next refresh.
   if (!isEditing(heading)) {
-    ctx.patchHTML(heading, `<h2${titleAttrsHTML(ctx.esc, item.sessionId, session?.renamed)}>${markHTML(ctx.esc, session?.mark)}${ctx.esc(title)}${numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}${outageNote}</div>${task ? modelUsageHTML(task.modelUsage, session?.modelUsage) : ''}`);
+    ctx.patchHTML(heading, stageHeadingHTML(ctx, { item, session, pane, task, title, outageNote }));
   }
   const brief = stage.querySelector('.brief');
   const ownControls = sessionControlsAllowed(session);
