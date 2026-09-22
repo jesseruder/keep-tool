@@ -14169,6 +14169,74 @@ test('a pane on another node is force-restarted on that node evidence, and nothi
   });
 });
 
+test('a pane on another node closed by hand is killed on that node, and nothing here is touched', async (t) => {
+  const { withTwoNodeFleet } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient, closeIdleSession, hostRequest } = require('./serve');
+  const { manualClose } = require('./manual-close');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodeFleet(t, async ({ root, registry, env, accountId, agentPath }) => {
+    await closeHostClient();
+    const sessionId = 'remote-close-session';
+    // Every request, by the node it was addressed to. A close that typed into the
+    // pane, read a process table, or signalled anything from here would show up.
+    const asked = [];
+    const deps = { root: registry, env,
+      connectHost: async (options) => {
+        const client = await connect(options);
+        const node = options.node || 'main';
+        return {
+          ...client,
+          request: (type, params, requestOptions) => {
+            asked.push({ node, type });
+            return client.request(type, params, requestOptions);
+          },
+          onDisconnect: (listener) => client.onDisconnect(listener),
+          close: () => client.close(),
+        };
+      },
+      withInjectionLock: (fn) => fn(),
+      // The session as the fleet would list it: idle, its turn ended. Every proof the
+      // graceful path would then ask for is in a transcript on aws1.
+      buildState: async () => ({ sessions: [{ id: sessionId, kind: 'claude', endedTurn: true, mtime: 1, project: root }], tasks: [] }),
+    };
+    try {
+      const spawned = (await hostRequest('spawn', {
+        cmd: '/bin/sh', args: ['-c', `exec claude --resume ${sessionId}`],
+        cwd: root, env: { PATH: agentPath },
+        meta: { agent: 'claude', sessionId, accountId, accountLabel: 'Node claude' },
+      }, { ...deps, node: 'aws1' })).pane;
+      assert.match(spawned.id, /@aws1$/);
+      asked.length = 0;
+
+      // Exactly what the Close button runs (routes.js), with this test's host client.
+      const graceful = [];
+      const result = await manualClose({ sessionId, pane: spawned.id }, {
+        getPane: async (pane) => (await hostRequest('get', { pane }, deps)).pane,
+        graceful: (request) => closeIdleSession(request, { ...deps, closePolicy: { manual: true } }),
+        onGracefulError: (error) => graceful.push(error.message),
+        signal: (pane, signal) => hostRequest('kill', { pane, signal }, deps),
+      });
+      assert.equal(result.ok, true);
+      assert.equal(result.closed, true);
+      assert.deepEqual(graceful,
+        ["a graceful close reads the session's transcript, which is on aws1; nothing typed"]);
+      const gone = (await hostRequest('get', { pane: spawned.id }, deps)).pane;
+      assert.equal(Boolean(gone && gone.alive), false, 'the pane on aws1 is closed');
+
+      const kills = asked.filter((call) => call.type === 'kill');
+      assert.ok(kills.length, 'the pane was signalled');
+      assert.deepEqual([...new Set(kills.map((call) => call.node))], ['aws1']);
+      assert.equal(asked.some((call) => ['input', 'signal'].includes(call.type)), false, 'nothing typed, no pid signalled');
+      // The daemon node's host is asked for its pane list, as any listing does, and
+      // for nothing else.
+      assert.deepEqual([...new Set(asked.filter((call) => call.node === 'main').map((call) => call.type))]
+        .filter((type) => !['hello', 'list'].includes(type)), []);
+    } finally {
+      await closeHostClient();
+    }
+  });
+});
+
 test('force restart no longer refuses a pane for living on another node', async () => {
   // The refusal is gone, so the module gets as far as asking for the pane — which is
   // where a caller that means a remote pane wanted it to get to.

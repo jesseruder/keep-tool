@@ -6957,6 +6957,10 @@ async function closeIdleSession(body, deps = {}) {
   if (remoteSession(body.pane, deps) && deps.closePolicy && !deps.closePolicy.manual) {
     throw new InjectionError(409, `automatic close is not available for a pane on ${paneNode.node}; close it by hand`);
   }
+  // By hand, a pane on another node is judged by that node's answers about its own
+  // processes, never by this machine's table: a pid there means nothing here.
+  const elsewhere = remoteSession(body.pane, deps) ? paneNode.node : null;
+  if (elsewhere) deps = nodeEvidence(elsewhere, deps);
   const scope = { pane: body.pane, session: body.sessionId };
   return (deps.withInjectionLock || withInjectionLock)(async () => {
     const listed = await hostPanesForAction(deps, true);
@@ -6966,6 +6970,13 @@ async function closeIdleSession(body, deps = {}) {
     const session = state.sessions.find((s) => s.id === body.sessionId);
     const pane = state.panes.find((p) => p.id === body.pane);
     if (await closeExitedCodexShell(session, pane, deps)) return { ok: true, closing: true, sessionId: session.id, pane: pane.id };
+    // Everything past here proves the session idle from its transcript, which is on
+    // the machine it runs on. The Close button's own close does not stop at that: this
+    // refusal is its graceful step declining, and manual-close goes on to signal the
+    // pane through its host, which routes by the qualified ref to that machine.
+    if (elsewhere && deps.closePolicy?.manual && !deps.closePolicy.restart) {
+      throw new InjectionError(409, `a graceful close reads the session's transcript, which is on ${elsewhere}; nothing typed`);
+    }
     const layouts = await keepConsole.readLayouts(path.join(deps.root || keep.ROOT, '.keep', 'layouts.json'));
     const pinned = new Set((layouts.layouts || []).flatMap((layout) => layout.ids || []));
     const assertRetirementPreference = () => {
