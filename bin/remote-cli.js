@@ -98,13 +98,19 @@ const PING_TIMEOUT_MS = 3000;
 // Posts, and when there was no answer at all waits with backoff until the daemon
 // answers GET /api/registry/ping, then sends the same request again with the same
 // key: the first may have run, and the key is what makes the next one safe. Nothing
-// is resent to a daemon that is not answering its ping.
+// is resent to a daemon that is not answering its ping. A 503 `daemon restarting`
+// is waited out the same way: the daemon refused it before running or recording
+// anything.
 async function postWithRetry(where, pathname, payload, deps = {}) {
   const request = deps.request || nodeApiRequest;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const waits = deps.retryWaitsMs || RETRY_WAITS_MS;
   const token = deps.token || nodeToken(deps.env || process.env, deps.readToken);
-  const send = () => request(where.url, pathname, { payload, token, timeoutMs: deps.timeoutMs });
+  const send = async () => {
+    const response = await request(where.url, pathname, { payload, token, timeoutMs: deps.timeoutMs });
+    if (response.status === 503 && (parsed(response) || {}).error === 'daemon restarting') throw new Error('daemon restarting');
+    return response;
+  };
   let lastError;
   try { return await send(); }
   catch (error) { lastError = error; }

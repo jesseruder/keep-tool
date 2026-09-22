@@ -154,6 +154,42 @@ test('a check-in that races a restart waits for the daemon and is resent once', 
   assert.equal(down.requests.filter((entry) => entry.method === 'POST').length, 1);
 });
 
+// A daemon on its way down refuses new commands before running or recording them;
+// the node waits for the next daemon and sends the same request again.
+test('a daemon restarting answers 503 and the command is resent with its key after the restart', async (t) => {
+  const { postWithRetry } = require('./remote-cli.js');
+  const daemon = await stubDaemon(t, (entry) => {
+    if (entry.url === '/api/registry/ping') return { status: 200, body: { ok: true } };
+    const posts = daemon.requests.filter((request) => request.method === 'POST').length;
+    if (posts <= 2) return { status: 503, body: { error: 'daemon restarting' } };
+    return { status: 200, body: { ok: true, status: 0, stdout: 'checked in\n', stderr: '', replayed: false } };
+  });
+  const payload = { command: 'checkin', args: ['card'], cwd: '/', idempotencyKey: 'k'.repeat(32) };
+  const response = await postWithRetry({ local: 'aws1', daemon: 'main', url: daemon.url }, '/api/registry', payload, {
+    token: 'aws1-secret', sleep: async () => {},
+  });
+  assert.equal(response.status, 200);
+  const posts = daemon.requests.filter((entry) => entry.method === 'POST');
+  assert.equal(posts.length, 3);
+  assert.deepEqual(posts.map((entry) => entry.body), [payload, payload, payload]);
+  // Any other 503 is the daemon's answer, not a restart to wait out.
+  const other = await stubDaemon(t, () => ({ status: 503, body: { error: 'something else' } }));
+  const answered = await postWithRetry({ local: 'aws1', daemon: 'main', url: other.url }, '/api/registry', payload, {
+    token: 'aws1-secret', sleep: async () => { throw new Error('no wait expected'); },
+  });
+  assert.equal(answered.status, 503);
+});
+
+test('a resend of an interrupted run is refused by name, and nothing is printed as output', async (t) => {
+  const daemon = await stubDaemon(t, () => ({ status: 409, body: { error: 'an earlier run of this request was interrupted; inspect before retrying', interrupted: true } }));
+  const { root, env } = nodeEnv(t);
+  env.KEEP_DAEMON_URL = daemon.url;
+  const result = await run(['checkin', 'card', '-m', 'x'], { env, cwd: root });
+  assert.equal(result.status, 2);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, 'keep checkin: the daemon on main refused: an earlier run of this request was interrupted; inspect before retrying\n');
+});
+
 test('a refusal from the daemon is said as one, not as the command\'s output', async (t) => {
   const daemon = await stubDaemon(t, () => ({ status: 403, body: { error: 'session s is not on node aws1' } }));
   const { root, env } = nodeEnv(t);

@@ -12,10 +12,16 @@
 // A node acts only for itself: the session it names must be one the durable
 // location record places on that node, and a pane it names must be on it.
 //
-// Every request carries an idempotency key. The response is journalled under
-// .keep/registry-ops once the command has finished, so a retried request replays
-// the answer instead of repeating the mutation, and a key reused for a different
-// request is refused.
+// Every request carries an idempotency key. A "started" record is journalled under
+// .keep/registry-ops before the command is spawned and replaced by the response
+// once it has finished, so a retried request replays the answer instead of
+// repeating the mutation, a key reused for a different request is refused, and a
+// retry of a run that never recorded its end (the daemon died or restarted under
+// it) is refused for a person to inspect rather than run a second time.
+//
+// A daemon restart waits for the runs admitted here (busy()), and once it is on
+// its way (options.stopping) nothing new is admitted: 503, nothing journalled, and
+// the node's CLI resends after the restart.
 const childProcess = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -122,9 +128,19 @@ function createRegistryService(options = {}) {
   const execPath = options.execPath || process.execPath;
   const baseEnv = options.env || process.env;
   const configFile = options.configFile || require('./config.js').configFile(baseEnv);
+  const stopping = options.stopping || (() => false);
+  const pidAlive = options.pidAlive || ((pid) => {
+    try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+  });
+  // Which service wrote a started record: one in this process that is no longer
+  // in flight here was lost (the process outlived a dropped service), never still
+  // running.
+  const instance = crypto.randomBytes(8).toString('hex');
   const journalDir = path.join(root, '.keep', 'registry-ops');
   const inflight = new Map();
   const queues = new Map();
+  // Runs admitted and not yet answered, queued ones included: what a restart waits for.
+  let admitted = 0;
   let prunedAt = -Infinity;
 
   const journalFile = (caller, key) => path.join(journalDir,
@@ -135,7 +151,8 @@ function createRegistryService(options = {}) {
     try { raw = io.readFileSync(file, 'utf8'); }
     catch (error) { if (error.code === 'ENOENT') return null; throw error; }
     const value = JSON.parse(raw);
-    if (!value || value.version !== 1 || value.node !== caller || typeof value.digest !== 'string' || !value.response) {
+    if (!value || value.version !== 1 || value.node !== caller || typeof value.digest !== 'string'
+      || (!value.response && value.started !== true)) {
       throw new RegistryError(500, `unreadable registry journal entry ${path.basename(file)}`);
     }
     return value;
@@ -265,10 +282,26 @@ function createRegistryService(options = {}) {
       const stored = readJournal(file, caller);
       if (stored) {
         if (stored.digest !== digest) return { status: 409, body: { error: 'this idempotency key was used for a different request' } };
+        if (!stored.response) return { status: 409, body: { error: unfinished(stored), interrupted: true } };
         return { status: stored.response.status, body: { ...stored.response.body, replayed: true } };
       }
+      // Checked in the same tick the run is counted, so a restart either waits for
+      // it or it is never admitted.
+      if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };
+      admitted += 1;
       const pending = serialised(caller, async () => {
-        const response = await execute(request, caller);
+        // Before the child exists: whatever happens to this daemon from here, a
+        // retry finds that the command may have run.
+        writeJournal(file, {
+          version: 1, node: caller, digest, started: true, pid: process.pid, instance, at: new Date(now()).toISOString(),
+        });
+        let response;
+        try { response = await execute(request, caller); }
+        catch (error) {
+          // Nothing was spawned, so nothing ran: a retry may run it.
+          try { io.unlinkSync(file); } catch {}
+          throw error;
+        }
         // Written before anyone is answered: a retry that arrives the moment this
         // one returns must find it.
         writeJournal(file, { version: 1, node: caller, digest, at: new Date(now()).toISOString(), response });
@@ -277,12 +310,26 @@ function createRegistryService(options = {}) {
       inflight.set(file, pending);
       let response;
       try { response = await pending; }
-      finally { inflight.delete(file); }
+      finally { inflight.delete(file); admitted -= 1; }
       return { status: response.status, body: { ...response.body, replayed: false } };
     } catch (error) {
       if (error instanceof RegistryError) return { status: error.status, body: { error: error.message } };
       return { status: 500, body: { error: error.message } };
     }
+  }
+
+  // A started record nobody here is waiting on: its run never recorded an end.
+  function unfinished(record) {
+    const at = Date.parse(record.at);
+    const pid = Number(record.pid);
+    if (record.instance === instance) {
+      return 'an earlier run of this request finished but its result was not recorded; inspect before retrying';
+    }
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && pidAlive(pid)
+      && Number.isFinite(at) && now() - at < timeoutMs) {
+      return `an earlier run of this request is still running in daemon pid ${pid}; inspect before retrying`;
+    }
+    return 'an earlier run of this request was interrupted; inspect before retrying';
   }
 
   function ping(principal) {
@@ -295,7 +342,7 @@ function createRegistryService(options = {}) {
     }
   }
 
-  return { handle, ping, journalDir };
+  return { handle, ping, journalDir, busy: () => admitted > 0 };
 }
 
 module.exports = {

@@ -343,3 +343,108 @@ test('a real keep add and keep show round-trip through the daemon\'s own CLI', a
   assert.equal(retried.body.replayed, true);
   assert.equal(fs.existsSync(path.join(root, 'tasks', 'remote-card-2.md')), false);
 });
+
+// A daemon restarted (or killed) while a node's command runs: the child is gone,
+// the node never got its answer, and its retry loop resends the same key to the
+// next daemon. That daemon must not run it again.
+test('a resend of a run the previous daemon never finished is refused, not run again', async (t) => {
+  const root = tempDir(t);
+  // The kill timer only lets the test end; the second daemon has answered long before it fires.
+  const first = service(t, { root, answer: () => 'hang', timeoutMs: 300 });
+  const lost = first.svc.handle(AWS1, body(root, { command: 'checkin', args: ['some-card', '-m', 'hi'] }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(first.calls.length, 1, 'the first daemon started the command');
+  assert.equal(first.svc.busy(), true);
+  const [file] = fs.readdirSync(path.join(root, '.keep', 'registry-ops'));
+  const record = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'registry-ops', file), 'utf8'));
+  assert.equal(record.started, true, 'the started record is on disk before the child runs');
+  assert.equal(record.pid, process.pid);
+  assert.equal(record.response, undefined);
+  // The first service is dropped mid-run; a second one on the same root is the next daemon.
+  const second = service(t, { root });
+  const resend = await second.svc.handle(AWS1, body(root, { command: 'checkin', args: ['some-card', '-m', 'hi'] }));
+  assert.equal(resend.status, 409);
+  assert.equal(resend.body.error, 'an earlier run of this request was interrupted; inspect before retrying');
+  assert.equal(second.calls.length, 0, 'nothing ran a second time');
+  // A different request under that key is still the reused-key refusal.
+  const other = await second.svc.handle(AWS1, body(root, { command: 'checkin', args: ['other-card'] }));
+  assert.equal(other.status, 409);
+  assert.match(other.body.error, /different request/);
+  assert.equal(second.calls.length, 0);
+  await lost;
+});
+
+test('a started record from another daemon process still inside the kill timeout says it is still running', async (t) => {
+  const root = tempDir(t);
+  const dir = path.join(root, '.keep', 'registry-ops');
+  const first = service(t, { root, answer: () => 'hang', timeoutMs: 300 });
+  const lost = first.svc.handle(AWS1, body(root));
+  await new Promise((resolve) => setImmediate(resolve));
+  const [file] = fs.readdirSync(dir);
+  const record = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
+  fs.writeFileSync(path.join(dir, file), JSON.stringify({ ...record, pid: 999999, instance: 'elsewhere' }));
+  const live = createRegistryService({
+    root, spawn: fakeSpawn().spawn, daemonNode: () => 'main', location: () => ({ node: 'aws1', agent: 'claude' }),
+    env: { PATH: '/usr/bin:/bin', HOME: root, LANG: 'C' }, configFile: path.join(root, 'config.json'), pidAlive: () => true,
+  });
+  const answer = await live.handle(AWS1, body(root));
+  assert.equal(answer.status, 409);
+  assert.match(answer.body.error, /still running in daemon pid 999999; inspect before retrying/);
+  const dead = createRegistryService({
+    root, spawn: fakeSpawn().spawn, daemonNode: () => 'main', location: () => ({ node: 'aws1', agent: 'claude' }),
+    env: { PATH: '/usr/bin:/bin', HOME: root, LANG: 'C' }, configFile: path.join(root, 'config.json'), pidAlive: () => false,
+  });
+  assert.equal((await dead.handle(AWS1, body(root))).body.error, 'an earlier run of this request was interrupted; inspect before retrying');
+  await lost;
+});
+
+test('a command that could not be spawned leaves no started record, so a retry runs it', async (t) => {
+  let fail = true;
+  const fake = fakeSpawn();
+  const original = fake.spawn;
+  fake.spawn = (...args) => { if (fail) { fail = false; throw new Error('EAGAIN'); } return original(...args); };
+  const { svc, root, calls } = service(t, { fake });
+  assert.equal((await svc.handle(AWS1, body(root))).status, 500);
+  assert.deepEqual(fs.readdirSync(path.join(root, '.keep', 'registry-ops')), []);
+  const retry = await svc.handle(AWS1, body(root));
+  assert.equal(retry.status, 200);
+  assert.equal(calls.length, 1);
+});
+
+test('a restart waits for a run in flight, and once it is stopping new requests get 503 and no journal', async (t) => {
+  const { createGate } = require('./daemon-restart.js');
+  let release;
+  let stopping = false;
+  const fake = fakeSpawn(() => 'hang');
+  const original = fake.spawn;
+  fake.spawn = (...args) => { const child = original(...args); release = () => child.emit('close', 0, null); return child; };
+  const root = tempDir(t);
+  const svc = createRegistryService({
+    root, spawn: fake.spawn, daemonNode: () => 'main', location: () => ({ node: 'aws1', agent: 'claude' }),
+    env: { PATH: '/usr/bin:/bin', HOME: root, LANG: 'C' }, configFile: path.join(root, 'config.json'),
+    stopping: () => stopping,
+  });
+  const gate = createGate({ busy: () => svc.busy() });
+  assert.equal(svc.busy(), false);
+  const running = svc.handle(AWS1, body(root));
+  assert.equal(svc.busy(), true, 'counted from admission, before the child is even spawned');
+  assert.throws(() => gate.prepare(), (error) => error.inFlight === true);
+  let sleeps = 0;
+  const prepared = gate.prepareWhenIdle({
+    sleep: async () => { sleeps += 1; await new Promise((resolve) => setImmediate(resolve)); if (release) { release(); release = null; } },
+  });
+  const [done, result] = await Promise.all([running, prepared]);
+  assert.equal(done.status, 200);
+  assert.equal(result.ok, true);
+  assert.ok(sleeps >= 1, 'the restart waited for the run');
+  assert.equal(gate.stopping, true);
+  stopping = gate.stopping;
+  const before = fs.readdirSync(path.join(root, '.keep', 'registry-ops'));
+  const refused = await svc.handle(AWS1, body(root, { idempotencyKey: `${KEY}-late` }));
+  assert.deepEqual(refused, { status: 503, body: { error: 'daemon restarting' } });
+  assert.deepEqual(fs.readdirSync(path.join(root, '.keep', 'registry-ops')), before, 'nothing journalled for it');
+  assert.equal(fake.calls.length, 1);
+  assert.equal(svc.busy(), false);
+  // A replay of a finished run still answers from the journal while stopping.
+  assert.equal((await svc.handle(AWS1, body(root))).body.replayed, true);
+});

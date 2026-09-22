@@ -418,8 +418,12 @@ let onChange = () => {};
 let onFocus = () => {};
 let sweepInFlight = false;
 let inFlightSwap = null;
+// A node's registry command the daemon is running (bin/registry-route.js): a
+// restart that killed it would leave its mutation half-known. Set in start() when
+// the node API is on; single-node it stays false.
+let registryRunsInFlight = () => false;
 const daemonRestartGate = require('./daemon-restart').createGate({
-  busy: () => sweepInFlight || injectionLocked(),
+  busy: () => sweepInFlight || injectionLocked() || registryRunsInFlight(),
 });
 let liveSessionTickInFlight = false;
 let lastAutoCompactGc = 0;
@@ -13828,7 +13832,10 @@ function start(deps = {}) {
   // API's routes match nothing.
   const nodeApiListen = require('./node-registry.js').nodeApiListen();
   ctx.nodeApiEnabled = () => nodeApiListen.enabled === true;
-  ctx.registryService = nodeApiListen.enabled ? require('./registry-route.js').createRegistryService({ root: keep.ROOT }) : null;
+  ctx.registryService = nodeApiListen.enabled ? require('./registry-route.js').createRegistryService({
+    root: keep.ROOT, stopping: () => daemonRestartGate.stopping,
+  }) : null;
+  if (ctx.registryService) registryRunsInFlight = () => ctx.registryService.busy();
   // The restart is the one /api/restart-daemon makes: wait for in-flight work, then
   // mark the request and exit after the answer has gone out.
   ctx.deploySelf = nodeApiListen.enabled ? require('./deploy-self.js').createDeploySelf({
