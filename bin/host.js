@@ -33,6 +33,7 @@ const PROTOCOL_VERSION = 1;
 const HELLO_FAILURE_LIMIT = 10;
 const HELLO_FAILURE_WINDOW_MS = 60e3;
 const HELLO_FAILURE_ADDRESSES = 256;
+const HELLO_DEADLINE_MS = 10e3;
 
 function hostLogFile(env = process.env) {
   return path.join(env.KEEP_DIR || path.join(os.homedir(), 'keep'), '.keep', 'host.log');
@@ -365,17 +366,30 @@ function connectProbe(sock) {
 
 // `<ip>:<port>`, with a bracketed literal for IPv6. The design binds one
 // interface — the node's Tailscale address — so the form is deliberately narrow.
+// An address names an interface, never a machine: a hostname is resolved at bind
+// time and could land on an interface nobody meant to expose. An IPv6 literal is
+// canonicalised through the URL parser, so that `::0`, `0:0:0:0:0:0:0:0` and `::`
+// are one address by the time anything decides whether it is the wildcard.
+function canonicalIp(value, source = value) {
+  const raw = String(value).replace(/^\[/, '').replace(/\]$/, '');
+  const family = net.isIP(raw);
+  if (!family) throw new Error(`a node listen address must be an IP literal, not ${JSON.stringify(raw)}: ${source}`);
+  if (family !== 6) return raw;
+  try { return new URL(`http://[${raw}]`).hostname.replace(/^\[/, '').replace(/\]$/, ''); }
+  catch { return raw; }
+}
+
 function parseListenAddress(value) {
   const text = String(value || '').trim();
   const match = /^\[([^\]]+)\]:(\d+)$/.exec(text) || /^([^:]+):(\d+)$/.exec(text);
   if (!match) throw new Error(`a node listen address must be <ip>:<port>: ${text}`);
   const port = Number(match[2]);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`invalid node listen port: ${text}`);
-  return { address: match[1], port };
+  return { address: canonicalIp(match[1], text), port };
 }
 
 function wildcardAddress(address) {
-  return ['0.0.0.0', '::', '*'].includes(String(address));
+  return ['0.0.0.0', '::'].includes(String(address));
 }
 
 function formatListenAddress(bound) {
@@ -480,21 +494,16 @@ function createHost(options = {}) {
     if (!tokenDigest || typeof value !== 'string' || !value) return false;
     return crypto.timingSafeEqual(crypto.createHash('sha256').update(value).digest(), tokenDigest);
   };
-  const helloThrottled = (remote) => {
-    const entry = helloFailures.get(remote);
-    if (!entry) return false;
-    if (Date.now() - entry.at > HELLO_FAILURE_WINDOW_MS) {
-      helloFailures.delete(remote);
-      return false;
-    }
-    return entry.count >= HELLO_FAILURE_LIMIT;
-  };
+  // Returns whether this address is now over its limit. Only a failed hello counts,
+  // and a successful one forgives the address outright, so the throttle can never
+  // keep out the node that holds the token — it only makes guessing cheap to refuse.
   const noteHelloFailure = (remote) => {
     const now = Date.now();
     const entry = helloFailures.get(remote);
     if (!entry || now - entry.at > HELLO_FAILURE_WINDOW_MS) helloFailures.set(remote, { count: 1, at: now });
     else { entry.count += 1; entry.at = now; }
     while (helloFailures.size > HELLO_FAILURE_ADDRESSES) helloFailures.delete(helloFailures.keys().next().value);
+    return helloFailures.get(remote).count > HELLO_FAILURE_LIMIT;
   };
   const validColdFile = (paneId, file) => {
     if (typeof file !== 'string') return false;
@@ -1366,18 +1375,19 @@ function createHost(options = {}) {
 
   const acceptConnection = (socket, transport) => {
     const remote = transport === 'tcp' ? String(socket.remoteAddress || 'unknown') : 'unix';
-    if (transport === 'tcp') {
-      socket.setNoDelay(true);
-      if (helloThrottled(remote)) {
-        eventLog(`host: dropped node connection from ${remote}: too many failed hellos`);
-        socket.destroy();
-        return;
-      }
-    }
     // The unix socket is reachable only by this account, so it stays token-free;
     // a network connection says who it is in its first frame or says nothing more.
     let authenticated = transport !== 'tcp';
     let refused = false;
+    let helloTimer = null;
+    if (transport === 'tcp') {
+      socket.setNoDelay(true);
+      // A connection that has not said who it is has one job and a short deadline to
+      // do it in; that deadline, not a refusal to accept, is what bounds the sockets
+      // an unauthenticated caller can hold open.
+      helloTimer = setTimeout(() => { if (!authenticated) socket.destroy(); }, HELLO_DEADLINE_MS);
+      helloTimer.unref?.();
+    }
     const connection = {
       id: `viewer-${process.pid}-${nextConnectionId++}`,
       socket,
@@ -1402,13 +1412,17 @@ function createHost(options = {}) {
       if (!authenticated) {
         if (!request || typeof request !== 'object' || request.type !== 'hello' || !tokenAccepted(request.token)) {
           refused = true;
-          noteHelloFailure(remote);
-          eventLog(`host: refused node connection from ${remote}: hello required`);
+          const throttled = noteHelloFailure(remote);
+          eventLog(`host: refused node connection from ${remote}: hello required${throttled ? ' (throttled)' : ''}`);
+          // Over the limit the connection is dropped where it stands: a guess gets
+          // no answer, not even the courtesy of one.
+          if (throttled) { socket.destroy(); return; }
           const frame = encodeFrame({ ok: false, id: (request && request.id) || null, error: 'hello required' });
           try { socket.end(frame, () => socket.destroy()); } catch { socket.destroy(); }
           return;
         }
         authenticated = true;
+        if (helloTimer) { clearTimeout(helloTimer); helloTimer = null; }
         helloFailures.delete(remote);
         eventLog(`host: node connection from ${remote} accepted`);
       }
@@ -1443,6 +1457,7 @@ function createHost(options = {}) {
     socket.on('data', (data) => decoder.push(data));
     socket.on('error', () => {});
     socket.on('close', () => {
+      if (helloTimer) { clearTimeout(helloTimer); helloTimer = null; }
       connections.delete(connection);
       detachConnection(connection, handingOff, true);
     });
@@ -1842,6 +1857,7 @@ module.exports = {
   DEFAULT_SNAPSHOT_SCROLLBACK,
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
+  canonicalIp,
   parseListenAddress,
   readNodeToken,
   RingBuffer,

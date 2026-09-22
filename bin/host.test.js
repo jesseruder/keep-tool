@@ -2100,24 +2100,111 @@ test('a node token that is not 0600 or that is missing keeps the unix socket ser
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('a wildcard bind is refused unless the override says otherwise', async () => {
+test('a wildcard bind is refused under every spelling unless the override says otherwise', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-wildcard-test-'));
   const { file } = nodeTokenFile(root);
-  const refused = createHost({ sock: path.join(root, 'a.sock'), log: null, listen: '0.0.0.0:0', tokenFile: file });
-  try {
-    await refused.listen();
-    assert.equal(refused.listenAddress, null);
-    assert.match(refused.listenError.message, /refusing to bind 0\.0\.0\.0/);
-  } finally { await refused.close(); }
+  let index = 0;
+  // Every one of these is the wildcard wearing a different hat; ::0 and the fully
+  // written-out form canonicalise to :: before anything decides what they are.
+  for (const listen of ['0.0.0.0:0', '[::]:0', '[::0]:0', '[0:0:0:0:0:0:0:0]:0']) {
+    const refused = createHost({ sock: path.join(root, `w${index++}.sock`), log: null, listen, tokenFile: file });
+    try {
+      await refused.listen();
+      assert.equal(refused.listenAddress, null, listen);
+      assert.match(refused.listenError.message, /refusing to bind (?:0\.0\.0\.0|::)/, listen);
+    } finally { await refused.close(); }
+  }
+  // A name is not an interface: it is resolved at bind time and could land anywhere.
+  for (const listen of ['localhost:7777', 'example.com:7777', 'not-an-address']) {
+    const host = createHost({ sock: path.join(root, `n${index++}.sock`), log: null, listen, tokenFile: file });
+    try {
+      await host.listen();
+      assert.equal(host.listenAddress, null, listen);
+      assert.match(host.listenError.message, /must be (?:an IP literal|<ip>:<port>)/, listen);
+    } finally { await host.close(); }
+  }
+  // A real interface address binds, and so does the wildcard once it is asked for.
+  for (const [listen, pattern] of [['127.0.0.1:0', /^127\.0\.0\.1:\d+$/], ['[::1]:0', /^\[::1\]:\d+$/]]) {
+    const host = createHost({ sock: path.join(root, `b${index++}.sock`), log: null, listen, tokenFile: file });
+    try {
+      await host.listen();
+      assert.equal(host.listenError, null, listen);
+      assert.match(host.listenAddress, pattern, listen);
+    } finally { await host.close(); }
+  }
   const allowed = createHost({
-    sock: path.join(root, 'b.sock'), log: null, listen: '0.0.0.0:0', tokenFile: file, listenAny: true,
+    sock: path.join(root, 'any.sock'), log: null, listen: '[::0]:0', tokenFile: file, listenAny: true,
   });
   try {
     await allowed.listen();
     assert.equal(allowed.listenError, null);
-    assert.match(allowed.listenAddress, /^0\.0\.0\.0:\d+$/);
+    assert.match(allowed.listenAddress, /^\[::\]:\d+$/);
   } finally { await allowed.close(); }
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('a port another process already holds leaves the unix socket serving', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-busy-port-'));
+  const { file } = nodeTokenFile(root);
+  const first = createHost({ sock: path.join(root, 'first.sock'), log: null, listen: '127.0.0.1:0', tokenFile: file });
+  let second;
+  let client;
+  try {
+    await first.listen();
+    const port = Number(first.listenAddress.split(':')[1]);
+    second = createHost({ sock: path.join(root, 'second.sock'), log: null, listen: `127.0.0.1:${port}`, tokenFile: file });
+    await second.listen();
+    assert.equal(second.listenAddress, null, 'the second host does not get the port');
+    assert.equal(second.listenError.code, 'EADDRINUSE');
+    // The local socket is a separate endpoint and is unharmed, and the failure is
+    // visible to anyone who asks rather than buried in a log.
+    client = await connect({ sock: second.sock });
+    const hello = await client.request('hello');
+    assert.equal(hello.version, 1);
+    assert.equal('listen' in hello, false);
+    assert.match(hello.listenError, /EADDRINUSE|address already in use/);
+    const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 0.1'] });
+    assert.equal((await client.request('get', { pane: pane.id })).pane.id, pane.id);
+  } finally {
+    if (client) client.close();
+    if (second) await second.close();
+    await first.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a failed hello never locks out the node that holds the token', async () => {
+  await withNodeHost({}, async ({ host, token }) => {
+    const port = Number(host.listenAddress.split(':')[1]);
+    // Well past the limit: the first few are answered, the rest are dropped where
+    // they stand, and none of it counts against the caller who knows the token.
+    for (let attempt = 0; attempt < 14; attempt += 1) {
+      const guess = rawClient(port);
+      try {
+        await guess.ready;
+        guess.send({ type: 'hello', token: 'not-the-token', id: String(attempt) });
+        const reply = await guess.next();
+        if (attempt < 10) assert.deepEqual(reply, { ok: false, id: String(attempt), error: 'hello required' }, `attempt ${attempt}`);
+        else assert.equal(reply, null, 'a guess past the limit gets no answer at all');
+        await waitFor(() => guess.closed, `the host to drop attempt ${attempt}`);
+      } finally { guess.close(); }
+    }
+    const good = rawClient(port);
+    try {
+      await good.ready;
+      good.send({ type: 'hello', token, id: 'valid' });
+      const hello = await good.next();
+      assert.equal(hello.ok, true, 'the right token is still accepted from the same address');
+      assert.equal(hello.node, 'aws1');
+      // And the address is forgiven, so the next mistake is answered again.
+      const after = rawClient(port);
+      try {
+        await after.ready;
+        after.send({ type: 'hello', token: 'wrong', id: 'after' });
+        assert.deepEqual(await after.next(), { ok: false, id: 'after', error: 'hello required' });
+      } finally { after.close(); }
+    } finally { good.close(); }
+  });
 });
 
 test('bootId survives a core reload and differs between host processes', async () => {
