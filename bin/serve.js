@@ -3836,7 +3836,7 @@ function compactionSwappedModel(deps = {}) {
 // safely" on exactly that row. The legacy alias value is read as the default id, so a
 // daemon still configured with `KEEP_COMPACT_VIA_MODEL=opus` types the id too; any other
 // value, full id or not, is typed as configured.
-const COMPACT_VIA_DEFAULT_MODEL = 'claude-opus-5';
+const COMPACT_VIA_DEFAULT_MODEL = 'claude-opus-5-5';
 
 function compactViaModel() {
   const value = envString('KEEP_COMPACT_VIA_MODEL', COMPACT_VIA_DEFAULT_MODEL);

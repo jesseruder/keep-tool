@@ -2344,7 +2344,7 @@ Keep keeps the pane available for inspection and does not deliver the opening me
 
 Cold Claude compactions whose transcript model matches `KEEP_AUTO_COMPACT_MODELS` (a
 comma-separated family list, default `fable`) first switch the session to
-`KEEP_COMPACT_VIA_MODEL` (default `claude-opus-5`; set it to `off` to disable the swap).
+`KEEP_COMPACT_VIA_MODEL` (default `claude-opus-5-5`; set it to `off` to disable the swap).
 The switch types that full id, with `[1m]` appended when the session's restore model
 carries the 1M window, so the transcript names a model a handoff can reproduce; the
 legacy value `opus` is read as the default id, and any other value is typed as set.

@@ -4357,7 +4357,7 @@ test('compact session uses the newest pending pre-swap settings when settings sa
       },
     });
     assert.equal(result.reason, 'timeout');
-    assert.deepEqual(calls, ['/model claude-opus-5[1m]', '/compact', '/model claude-fable-5-1[1m]']);
+    assert.deepEqual(calls, ['/model claude-opus-5-5[1m]', '/compact', '/model claude-fable-5-1[1m]']);
     assert.deepEqual(repairs, [{ model: 'claude-fable-5-1[1m]', present: true }]);
   } finally {
     if (priorTimeout === undefined) delete process.env.KEEP_COMPACT_TIMEOUT_MS;
@@ -4445,7 +4445,7 @@ test('compact session accepts screen completion without transcript growth and re
     assert.equal(result.compacted, true);
     assert.equal(result.confirmedBy, 'screen');
     assert.ok(Date.now() - started < 250);
-    assert.deepEqual(calls, ['/model claude-opus-5', '/compact', '/model claude-fable-5-1']);
+    assert.deepEqual(calls, ['/model claude-opus-5-5', '/compact', '/model claude-fable-5-1']);
     assert.deepEqual(stages, ['screen-confirmed-no-marker']);
     assert.equal(fs.readFileSync(transcript, 'utf8'), '{}\n');
   } finally {
@@ -4560,7 +4560,7 @@ test('reopen Claude swap repairs only its account settings and journals that acc
       readScreen: async () => '❯', waitForModelSwitch: async () => true,
       typeAndSubmit: async (_target, command) => {
         commands.push(command);
-        if (command === '/model claude-opus-5') {
+        if (command === '/model claude-opus-5-5') {
           const journal = readPendingCompactSwap('profile-swap', path.join(root, 'compact'));
           assert.equal(journal.settingsFile, settingsFile);
           assert.equal(journal.accountId, 'managed');
@@ -4570,7 +4570,7 @@ test('reopen Claude swap repairs only its account settings and journals that acc
       },
     });
   assert.equal(result.restoreUnconfirmed, undefined);
-  assert.deepEqual(commands, ['/model claude-opus-5', '/compact', '/model claude-fable-5-1']);
+  assert.deepEqual(commands, ['/model claude-opus-5-5', '/compact', '/model claude-fable-5-1']);
   assert.equal(JSON.parse(fs.readFileSync(settingsFile)).model, 'claude-sonnet-5');
   assert.equal(JSON.parse(fs.readFileSync(daemonFile)).model, 'daemon-only');
   assert.equal(pendingCompactSwaps(path.join(root, 'compact')).length, 0);
@@ -11370,7 +11370,7 @@ test('compact session restores the pane launch model rather than the transcript 
       repairClaudeSettingsModel: () => ({ changed: false }),
     });
     assert.equal(result.reason, 'timeout');
-    assert.deepEqual(calls, ['/model claude-opus-5', '/compact', '/model claude-fable-5-1']);
+    assert.deepEqual(calls, ['/model claude-opus-5-5', '/compact', '/model claude-fable-5-1']);
   } finally {
     if (priorTimeout === undefined) delete process.env.KEEP_COMPACT_TIMEOUT_MS;
     else process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout;
@@ -12248,9 +12248,9 @@ test('the compaction switch types a full model id, with the 1M window the restor
   const prior = process.env.KEEP_COMPACT_VIA_MODEL;
   try {
     delete process.env.KEEP_COMPACT_VIA_MODEL;
-    assert.equal(compactViaModel(), 'claude-opus-5');
+    assert.equal(compactViaModel(), 'claude-opus-5-5');
     process.env.KEEP_COMPACT_VIA_MODEL = 'opus';
-    assert.equal(compactViaModel(), 'claude-opus-5', 'the legacy alias default reads as the id');
+    assert.equal(compactViaModel(), 'claude-opus-5-5', 'the legacy alias default reads as the id');
     process.env.KEEP_COMPACT_VIA_MODEL = 'claude-sonnet-5';
     assert.equal(compactViaModel(), 'claude-sonnet-5');
   } finally {
@@ -12320,7 +12320,7 @@ test('a model-exhausted compaction defers its restore instead of typing it, and 
       waitForModelSwitch: async () => true,
       repairClaudeSettingsModel: (value) => { repairs.push(value); return { changed: true }; },
     });
-    assert.deepEqual(calls, ['/model claude-opus-5[1m]', '/compact'], 'no restore typed at the spent model');
+    assert.deepEqual(calls, ['/model claude-opus-5-5[1m]', '/compact'], 'no restore typed at the spent model');
     assert.equal(result.compacted, true);
     assert.equal(result.restoreUnconfirmed, undefined);
     assert.equal(result.restoreDeferred, true);
@@ -12329,7 +12329,7 @@ test('a model-exhausted compaction defers its restore instead of typing it, and 
     assert.equal(record.restoreDeferredReason, 'model-exhausted');
     assert.equal(record.restoreResetAt, reset);
     assert.ok(record.restoreDeferredUntil > reset);
-    assert.equal(record.switchModel, 'claude-opus-5[1m]');
+    assert.equal(record.switchModel, 'claude-opus-5-5[1m]');
     assert.equal(compactRestoreBlocking('spent-fable', { dir }), null);
     assert.doesNotThrow(() => assertCompactRestoreSettled('spent-fable', { dir }));
     // An ordinary unconfirmed record still blocks.
@@ -13177,7 +13177,7 @@ test('the compaction journals its switch and restore at the Enter, with the exac
       waitForModelSwitch: async () => true,
       repairClaudeSettingsModel: () => ({ changed: false }),
     });
-    assert.deepEqual(journals, ['claude-opus-5[1m]', 'claude-fable-5-1[1m]']);
+    assert.deepEqual(journals, ['claude-opus-5-5[1m]', 'claude-fable-5-1[1m]']);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
