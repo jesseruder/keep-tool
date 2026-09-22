@@ -96,57 +96,94 @@ test('a shared setup that cannot be honoured is a coded failure, not a launch', 
   assert.match(error.message, /^account shared setup is unavailable: /);
 });
 
-test('an account that is not installed on this machine is refused before anything is created', (t) => {
+test('an account that is not installed on the node is refused before anything is created', (t) => {
   const f = fixture(t);
   const absent = { id: 'claude-elsewhere', agent: 'claude', configDir: path.join(f.home, '.claude-elsewhere'),
     builtIn: false, managed: true };
-  const attempt = (account, options = {}) => {
+  const attempt = (account, extra = {}, options = { homedir: f.home }) => {
     try {
       return launchPrep.prepare({
         agent: 'claude', account, cwd: f.project, bypass: true,
-        argv: ['claude', { insert: 'mcpConfig' }], pi: null,
+        argv: ['claude', { insert: 'mcpConfig' }], pi: null, ...extra,
       }, options) && null;
     } catch (error) { return error; }
   };
 
-  // A config directory that is not here is an account that is not here. Refused by
-  // name, and — the part that matters — refused *before* the trust write, which
-  // would otherwise have created the directory and left a plausible empty profile.
-  const missing = attempt(absent);
+  // On a node: a config directory that is not there is an account that is not
+  // there. Refused by name, and — the part that matters — refused *before* the trust
+  // write, which would otherwise have created the directory and left a plausible
+  // empty profile behind to fail further away.
+  const missing = attempt(absent, { remote: true, daemonHome: f.home });
   assert.equal(missing.code, 'account-missing');
   assert.equal(missing.message, 'account claude-elsewhere is not set up on this node');
   assert.equal(fs.existsSync(absent.configDir), false, 'nothing was created on the way past');
 
-  // A manifest naming a source this machine does not have is half an account.
+  // A manifest naming a source that machine does not have is half an account.
   accountSetup.shareSetup(f.source, f.target);
   fs.rmSync(path.join(f.home, '.claude'), { recursive: true, force: true });
-  const halved = attempt(f.target);
+  const halved = attempt(f.target, { remote: true, daemonHome: f.home });
   assert.equal(halved.code, 'account-missing');
   assert.equal(halved.message, 'account claude-work is not set up on this node');
 });
 
-test('an account directory is resolved against the home of the machine running the launch', (t) => {
+test('the daemon node keeps launching accounts whose directory is not there yet', (t) => {
   const f = fixture(t);
-  // The daemon sends `~/.claude`; on this machine that is this machine's home, and
-  // a launch that expanded it against the daemon's would look in the wrong place.
+  // First run before ~/.claude exists, an unmanaged launch inheriting API
+  // credentials from the environment, a custom Codex profile whose directory the
+  // launcher creates when the agent starts: all of these launch today, and a check
+  // meant for another machine must not be what stops them here.
+  const absent = { id: 'claude/default', agent: 'claude', configDir: path.join(f.home, '.claude-not-yet'),
+    builtIn: true, managed: false };
   const prepared = launchPrep.prepare({
-    agent: 'claude',
-    account: { id: 'claude/default', agent: 'claude', configDir: '~/.claude', builtIn: true, managed: false },
-    cwd: f.project, bypass: false, argv: ['claude', { insert: 'mcpConfig' }], pi: null,
-  }, { homedir: f.home });
-  assert.match(prepared.command, /claude/);
+    agent: 'claude', account: absent, cwd: f.project, bypass: false,
+    argv: ['claude', { insert: 'mcpConfig' }], pi: null, remote: false,
+  });
+  assert.ok(prepared.command, 'the launch goes ahead, exactly as it always has');
+  // And with nothing said at all, which is how every existing caller reaches it.
+  assert.ok(launchPrep.prepare({
+    agent: 'claude', account: absent, cwd: f.project, bypass: false,
+    argv: ['claude', { insert: 'mcpConfig' }], pi: null,
+  }).command);
+});
 
-  const elsewhere = (() => {
+test('a node whose home is not the daemon home refuses the launch outright', (t) => {
+  const f = fixture(t);
+  const account = { id: 'claude/default', agent: 'claude', configDir: path.join(f.home, '.claude'),
+    builtIn: true, managed: false };
+  const prepare = (daemonHome, homedir) => {
     try {
-      launchPrep.prepare({
+      return launchPrep.prepare({
+        agent: 'claude', account, cwd: f.project, bypass: false,
+        argv: ['claude', { insert: 'mcpConfig' }], pi: null, remote: true, daemonHome,
+      }, { homedir }) && null;
+    } catch (error) { return error; }
+  };
+
+  // Keep's nodes share one home. accounts.js has already expanded `~` against the
+  // daemon's before anything reached here, so a node with a different home would be
+  // working on paths belonging to a machine it is not — and there is no `~` left to
+  // re-expand. It is refused rather than half-fixed.
+  const differs = prepare('/Users/someone-else', f.home);
+  assert.equal(differs.code, 'home-mismatch');
+  assert.equal(differs.message,
+    `home directory differs: daemon /Users/someone-else, node ${f.home}; Keep nodes must share the home directory`);
+
+  // The same home: nothing to say, and the launch prepares.
+  assert.equal(prepare(f.home, f.home), null);
+
+  // Refused before any path is looked at, so a mismatch reads as a mismatch rather
+  // than as a missing account.
+  const both = (() => {
+    try {
+      return launchPrep.prepare({
         agent: 'claude',
-        account: { id: 'claude/default', agent: 'claude', configDir: '~/.claude', builtIn: true, managed: false },
+        account: { ...account, configDir: path.join(f.home, '.claude-elsewhere') },
         cwd: f.project, bypass: false, argv: ['claude', { insert: 'mcpConfig' }], pi: null,
-      }, { homedir: path.join(f.root, 'no-such-home') });
-      return null;
+        remote: true, daemonHome: '/Users/someone-else',
+      }, { homedir: f.home }) && null;
     } catch (error) { return error; }
   })();
-  assert.equal(elsewhere.code, 'account-missing', 'another home is another machine, and this account is not on it');
+  assert.equal(both.code, 'home-mismatch');
 });
 
 test('a bypass launch pre-trusts the project, and a failure to do so is reported, not fatal', (t) => {

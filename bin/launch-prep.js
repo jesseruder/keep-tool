@@ -44,13 +44,30 @@ function expandArgv(argv, paths) {
   return expanded;
 }
 
+// Keep's nodes share one home directory — /Users/jesseruder on every machine, the
+// Linux ones included. That is a decision, not an accident, and everything that
+// travels between nodes leans on it: accounts.js expands `~` with the daemon's home
+// before an account ever reaches here, so a node whose home is somewhere else would
+// be handed absolute paths belonging to a machine it is not. Half-fixing that by
+// re-expanding `~` here would only hide it, because by then there is no `~` left.
+//
+// So it is enforced instead. The daemon sends the home it resolved paths against;
+// this machine compares it with its own and refuses the launch outright if they
+// differ, before any path is examined and before anything is written.
+function assertSharedHome(daemonHome, deps = {}) {
+  if (daemonHome == null) return;
+  const mine = deps.homedir || os.homedir();
+  if (String(daemonHome) === mine) return;
+  throw Object.assign(
+    new Error(`home directory differs: daemon ${daemonHome}, node ${mine}; Keep nodes must share the home directory`),
+    { code: 'home-mismatch' },
+  );
+}
+
 // The profile shape agent-launcher encodes, and the only part of an account a
 // launch needs. Nothing here reads the registry: the fields arrive with the request.
-//
-// `~` is resolved against *this* machine's home, not the daemon's. The two are the
-// same path on Jesse's fleet and will not always be; a config directory expanded
-// against somebody else's home is a directory that does not exist here, which is
-// the failure this refuses below.
+// `~` is expanded against this machine's home, which the check above has already
+// established is the same home the daemon expanded against.
 function checkedAccount(value, deps = {}) {
   const account = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
   if (!account || typeof account.id !== 'string' || !account.id
@@ -70,12 +87,19 @@ function checkedAccount(value, deps = {}) {
 
 // Whether this account exists on this machine at all.
 //
-// An account is a config directory holding credentials, and a launch that cannot
-// find one starts an agent that will ask a person to log in — in a pane nobody is
-// watching, on a machine nobody is looking at. Worse, the trust write below creates
-// that directory on its way past, so a mistyped or not-yet-installed account would
-// leave a plausible-looking empty profile behind and fail later, further away.
-// Checked here, before anything is created, and named as what it is.
+// An account is a config directory holding credentials, and a launch on another
+// machine that cannot find one starts an agent that will ask a person to log in —
+// in a pane nobody is watching, on a machine nobody is looking at. Worse, the trust
+// write below creates that directory on its way past, so an account that is not
+// installed there would leave a plausible-looking empty profile behind and fail
+// later, further away.
+//
+// Only for a launch on another machine. On the daemon node this would be a new
+// refusal where there has never been one, and the cases it would refuse are real:
+// a first run before `~/.claude` exists, an unmanaged launch inheriting API
+// credentials from the environment, a custom Codex profile whose directory
+// prepareProfile creates when the agent starts. Here, none of those can be true —
+// a node is set up before work is sent to it — and the failure is silent otherwise.
 function assertAccountInstalled(account, deps = {}) {
   const io = deps.fs || fs;
   const directory = (value) => {
@@ -118,7 +142,14 @@ function prepare(options = {}, deps = {}) {
   if (!cwd) throw new Error('launch preparation needs a working directory');
   const accountSetup = deps.accountSetup || require('./account-setup.js');
   const agentLauncher = deps.agentLauncher || require('./agent-launcher.js');
-  assertAccountInstalled(account, { ...deps, readSetup: (value) => accountSetup.readSetup(value) });
+  // Told, never inferred: the caller knows whether this is the daemon node calling
+  // itself in-process or a node answering for a machine the daemon cannot see, and
+  // guessing it from a hostname or a home would be guessing at the one thing the
+  // answer turns on.
+  if (options.remote === true) {
+    assertSharedHome(options.daemonHome, deps);
+    assertAccountInstalled(account, { ...deps, readSetup: (value) => accountSetup.readSetup(value) });
+  }
 
   // A Claude account carrying a shared-setup manifest has its project memory and
   // its MCP config written here, in the config directory on this machine. The
@@ -174,4 +205,4 @@ function prepare(options = {}, deps = {}) {
   };
 }
 
-module.exports = { prepare, expandArgv };
+module.exports = { prepare, expandArgv, assertSharedHome };
