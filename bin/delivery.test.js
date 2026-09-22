@@ -459,6 +459,34 @@ test('a draft taken back off the screen leaves no journal and blocks no later se
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('a failed discard records the exact pane state only when the error proves a draft was left', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-left-draft-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const directory = path.join(root, 'journal');
+  const attempt = async (id, error) => {
+    const file = path.join(root, `${id}.jsonl`); fs.writeFileSync(file, '');
+    await assert.rejects(deliver({
+      session: { id, kind: 'claude' }, pane: `pane-${id}`, text: `message-${id}`, file, directory,
+      precheck: async () => {}, type: async () => { throw error; },
+      submitDraft: async () => assert.fail('unexpected Enter'), draftMatches: async () => false,
+      pause: async () => {}, attempts: 1,
+    }), new RegExp(error.message));
+    return JSON.parse(fs.readFileSync(path.join(directory, `${textHash(id)}.json`), 'utf8'));
+  };
+  const left = await attempt('left', Object.assign(new Error('turn became busy'), {
+    typingStarted: true, draftLeftOnScreen: true, draftReason: 'turn running',
+    leftDraft: { pid: 4242, inputCount: 19 },
+  }));
+  assert.equal(left.leftDraft.pid, 4242);
+  assert.equal(left.leftDraft.inputCount, 19);
+  assert.ok(Number(left.leftDraft.at) > 0);
+
+  const ordinary = await attempt('ordinary', Object.assign(new Error('ordinary type failure'), {
+    typingStarted: true, leftDraft: { pid: 5151, inputCount: 23 },
+  }));
+  assert.equal(ordinary.leftDraft, undefined);
+});
+
 test('a guarded refusal before the first character leaves no pending journal', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-notyped-'));
   const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');

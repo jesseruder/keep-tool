@@ -178,6 +178,18 @@ function completedTyping(entry) {
     && state.acknowledgedChunks === state.chunkCount;
 }
 
+// A discard-requesting sender can leave a complete draft behind when its guarded
+// cleanup safely refuses to press Escape. Keep the exact pane incarnation and input
+// count the sender proved, so the daemon may take that draft back later only if no
+// other key has touched it. Callers that never asked for cleanup carry no such proof
+// and deliberately keep the old human-owned-draft behaviour.
+function rememberLeftDraft(entry, error, writeJournal) {
+  const left = error && error.draftLeftOnScreen && error.leftDraft;
+  if (!left || !Number.isInteger(left.pid) || !Number.isInteger(left.inputCount)) return;
+  entry.leftDraft = { pid: left.pid, inputCount: left.inputCount, at: Date.now() };
+  writeJournal();
+}
+
 function typingProgress(entry, writeJournal) {
   const snapshot = () => entry.typing ? { ...entry.typing } : null;
   const current = () => {
@@ -329,6 +341,7 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
         try {
           await type(typingProgress(entry, writeJournal));
         } catch (error) {
+          rememberLeftDraft(entry, error, writeJournal);
           // A resumed attempt may finish the remaining chunks and then abort at a
           // beforeEnter guard. The atomic draft clear proves none of the partial
           // message remains, so keeping its old counts would wedge every later send.
@@ -406,6 +419,7 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
       entry.typedAt = Date.now();
       writeJournal();
     } catch (error) {
+      rememberLeftDraft(entry, error, writeJournal);
       // A guarded terminal submission can refuse before its first chunk (an old
       // host, an unstable input counter, or a prompt that stopped being empty).
       // The journal was intentionally created before `type()`, but this explicit
