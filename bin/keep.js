@@ -3818,6 +3818,16 @@ if (require.main === module) {
   (async () => {
     try {
       const [cmd, ...rest] = process.argv.slice(2);
+      // A pane-only node that knows its daemon's node API sends registry commands
+      // there. Without KEEP_DAEMON_URL remoteMode is null and nothing here runs.
+      const remote = require('./remote-cli.js').remoteMode(process.env);
+      if (remote && require('./registry-commands.js').isRegistryCommand(cmd || 'list')) {
+        const result = await require('./remote-cli.js').runRemote(cmd || 'list', rest, { where: remote });
+        if (result.stdout) process.stdout.write(result.stdout);
+        if (result.stderr) process.stderr.write(result.stderr);
+        process.exitCode = result.code;
+        return;
+      }
       // Before the registry is even looked for: on a pane-only node the answer is
       // where the registry is, not that there is none here.
       const elsewhere = commands[cmd || 'list'] ? paneOnlyRefusal(cmd || 'list', rest) : null;
