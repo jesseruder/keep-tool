@@ -27,6 +27,14 @@ async function run(entry, deps) {
   let pane = await deps.getPane(entry.pane);
   if (!entry.original) {
     if (!paneMatches(pane) || !pane.alive) throw Error('Original pane changed; nothing closed');
+    // The process tree, captured from one `ps`. Its identities are pid plus a start
+    // time recorded to the second, which cannot rule out a process freed and replaced
+    // inside that same second: a reused pid whose replacement started in the same
+    // second matches. That window has always been here — every read below is another
+    // `ps`, and the kernel offers no way to hold a pid still — and it is the same
+    // window a pane on another node is judged by, because the node's `signal` compares
+    // the very same fields before it kills. A stronger identity (Linux /proc starttime,
+    // in clock ticks) is a follow-up rather than part of this landing.
     const rows = await deps.rows(), children = [], visited = new Set([pane.pid]);
     const walk = (pid, depth) => {
       if (depth > 12 || children.length > 256) throw Error('Process tree exceeds force-restart limit');

@@ -105,57 +105,58 @@ test('an inspection answers only what it was asked for', async () => {
   assert.deepEqual(both.files, []);
 });
 
-test('a signal is decided and delivered without ever leaving the same tick', (t) => {
+test('a signal compares a whole identity on one pid, and never blocks the host', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-process-table-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const captured = { pid: 501, pidStart: 'Mon Sep 21 09:00:00 2026', ppid: 1, args: 'claude --resume abc' };
   const live = (row = captured) => `  ${row.pidStart} ${row.ppid} ${row.args}\n`;
   const reader = (output) => {
     const calls = [];
-    return { calls, execFileSync: (cmd, args) => { calls.push([cmd, args]); return output; } };
+    return { calls, execFile: async (cmd, args) => { calls.push([cmd, args]); return { stdout: output }; } };
   };
 
-  // One pid, not the whole table: a table of every process on a loaded machine
-  // takes long enough to read that a pid can be reused while it is being parsed.
+  // One pid, not the whole table: reading every process on a loaded machine is slow
+  // enough to be its own hazard, and asynchronously, so a slow ps never stalls the
+  // terminals this host is carrying while it waits.
   const killed = [];
   const one = reader(live());
-  assert.deepEqual(table.signal({ ...captured, signal: 'SIGTERM' },
-    { execFileSync: one.execFileSync, kill: (...args) => killed.push(args) }), { outcome: 'signalled' });
+  assert.deepEqual(await table.signal({ ...captured, signal: 'SIGTERM' },
+    { execFile: one.execFile, kill: (...args) => killed.push(args) }), { outcome: 'signalled' });
   assert.deepEqual(one.calls, [['ps', ['-p', '501', '-o', 'lstart=,ppid=,args=']]]);
   assert.deepEqual(killed, [[501, 'SIGTERM']]);
 
-  const refuses = (row, why) => {
-    assert.deepEqual(table.signal({ ...captured, signal: 'SIGKILL' }, {
-      execFileSync: () => live(row),
+  const refuses = async (row, why) => {
+    assert.deepEqual(await table.signal({ ...captured, signal: 'SIGKILL' }, {
+      execFile: async () => ({ stdout: live(row) }),
       kill: () => assert.fail(why),
     }), { outcome: 'changed' }, why);
   };
   // `lstart` is recorded to the second, so a pid reused inside the same second
   // compares equal on pid and start time alone. The parent and the argument vector
   // are what tell those two processes apart.
-  refuses({ ...captured, pidStart: 'Mon Sep 21 11:00:00 2026' }, 'a reused pid must never be signalled');
-  refuses({ ...captured, ppid: 9 }, 'a process with another parent is another process');
-  refuses({ ...captured, args: 'codex resume abc' }, 'a process running something else is another process');
+  await refuses({ ...captured, pidStart: 'Mon Sep 21 11:00:00 2026' }, 'a reused pid must never be signalled');
+  await refuses({ ...captured, ppid: 9 }, 'a process with another parent is another process');
+  await refuses({ ...captured, args: 'codex resume abc' }, 'a process running something else is another process');
 
   // `ps` exits non-zero for a pid that is gone, and that is the answer.
-  assert.deepEqual(table.signal({ ...captured, signal: 'SIGKILL' }, {
-    execFileSync: () => { throw Object.assign(new Error('exit 1'), { status: 1 }); },
+  assert.deepEqual(await table.signal({ ...captured, signal: 'SIGKILL' }, {
+    execFile: async () => { throw Object.assign(new Error('exit 1'), { status: 1 }); },
     kill: () => assert.fail('a process that is gone must never be signalled'),
   }), { outcome: 'gone' });
-  assert.deepEqual(table.signal({ ...captured, signal: 'SIGKILL' }, {
-    execFileSync: () => '\n', kill: () => assert.fail('an unreadable row is not a process to signal'),
+  assert.deepEqual(await table.signal({ ...captured, signal: 'SIGKILL' }, {
+    execFile: async () => ({ stdout: '\n' }), kill: () => assert.fail('an unreadable row is not a process to signal'),
   }), { outcome: 'gone' });
   // And it went away between the read and the kill: gone, not an error.
-  assert.deepEqual(table.signal({ ...captured, signal: 'SIGKILL' }, {
-    execFileSync: () => live(),
+  assert.deepEqual(await table.signal({ ...captured, signal: 'SIGKILL' }, {
+    execFile: async () => ({ stdout: live() }),
     kill: () => { throw Object.assign(new Error('no such process'), { code: 'ESRCH' }); },
   }), { outcome: 'gone' });
 
   // A partial identity is not an identity, and is refused rather than guessed at.
-  const execFileSync = () => live();
-  assert.throws(() => table.signal({ pidStart: 'x', ppid: 1, args: 'a', signal: 'SIGTERM' }, { execFileSync }), /needs a pid/);
-  assert.throws(() => table.signal({ pid: 1, ppid: 1, args: 'a', signal: 'SIGTERM' }, { execFileSync }), /start time/);
-  assert.throws(() => table.signal({ pid: 1, pidStart: 'x', args: 'a', signal: 'SIGTERM' }, { execFileSync }), /needs the parent/);
-  assert.throws(() => table.signal({ pid: 1, pidStart: 'x', ppid: 1, signal: 'SIGTERM' }, { execFileSync }), /needs the arguments/);
-  assert.throws(() => table.signal({ ...captured, signal: 'SIGUSR1' }, { execFileSync }), /signal must be one of/);
+  const execFile = async () => ({ stdout: live() });
+  await assert.rejects(async () => table.signal({ pidStart: 'x', ppid: 1, args: 'a', signal: 'SIGTERM' }, { execFile }), /needs a pid/);
+  await assert.rejects(async () => table.signal({ pid: 1, ppid: 1, args: 'a', signal: 'SIGTERM' }, { execFile }), /start time/);
+  await assert.rejects(async () => table.signal({ pid: 1, pidStart: 'x', args: 'a', signal: 'SIGTERM' }, { execFile }), /needs the parent/);
+  await assert.rejects(async () => table.signal({ pid: 1, pidStart: 'x', ppid: 1, signal: 'SIGTERM' }, { execFile }), /needs the arguments/);
+  await assert.rejects(async () => table.signal({ ...captured, signal: 'SIGUSR1' }, { execFile }), /signal must be one of/);
 });

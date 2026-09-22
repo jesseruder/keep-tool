@@ -7,7 +7,7 @@
 //
 // Nothing beyond node builtins is required: a node agent may hold no Keep registry.
 
-const { execFile, execFileSync } = require('node:child_process');
+const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const fs = require('node:fs');
 
@@ -152,23 +152,25 @@ async function inspect(params = {}, deps = {}) {
 // if so — on the machine that owns the pid, because a check on one machine and a
 // kill on another is no check at all.
 //
-// One pid, read synchronously, and killed in the same tick: `ps -p <pid>` rather
-// than the whole table, because a table of every process on a loaded machine takes
-// long enough for a pid to be reused while it is being parsed, and because nothing
-// may await between the comparison and the signal.
+// One pid, not the whole table: reading every process on a loaded machine is slow
+// enough to be its own hazard, and this host has panes to serve while it waits. The
+// read is asynchronous for the same reason — a `ps` that blocks stalls every
+// terminal this process is carrying, and a signal is never worth that.
 //
-// The window is not closed — the kernel offers no compare-and-signal, so this is the
-// same compare-then-kill the daemon-local force restart has always had, narrowed to
-// one tick with no I/O in it. What closes the gap that remains is the identity being
-// more than a pid: `lstart` is second-resolution, so a pid reused inside the same
-// second would compare equal on pid and start time alone. The parent and the
-// argument vector are compared for exactly that case, and the caller sends the
-// identity as it last observed it — the same read that decided this process was the
-// one to stop.
+// RESIDUAL WINDOW, stated plainly: the compare and the kill are two steps, and the
+// kernel offers no compare-and-signal, so a pid freed and reused between them is not
+// ruled out. `lstart` is recorded to the second, so a replacement started inside the
+// same second matches on pid and start time; the parent and the argument vector are
+// compared to narrow that, and they are sent as the caller last observed them, but a
+// same-second replacement sharing all three remains possible. This is exactly the
+// window the daemon-local force restart has always had — it reads `ps`, decides, and
+// signals — so a pane on another node is judged no more loosely than one here. A
+// stronger identity (Linux /proc starttime, in clock ticks) is a follow-up, not part
+// of this landing.
 const SIGNALS = ['SIGTERM', 'SIGKILL', 'SIGHUP', 'SIGINT'];
 const PS_ONE_RE = /^\s*([A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d \d{4})\s+(\d+)\s*(.*)$/;
 
-function signal(params = {}, deps = {}) {
+async function signal(params = {}, deps = {}) {
   const pid = Number(params.pid);
   if (!Number.isInteger(pid) || pid <= 0) throw new Error('signal needs a pid');
   const pidStart = String(params.pidStart || '');
@@ -182,9 +184,10 @@ function signal(params = {}, deps = {}) {
   let output;
   // `ps` exits non-zero when the pid is gone, which is the answer, not a failure.
   try {
-    output = (deps.execFileSync || execFileSync)('ps', ['-p', String(pid), '-o', 'lstart=,ppid=,args='], {
+    const result = await (deps.execFile || execFileAsync)('ps', ['-p', String(pid), '-o', 'lstart=,ppid=,args='], {
       encoding: 'utf8', timeout: 5e3, maxBuffer: 4e6, env: { ...process.env, LC_ALL: 'C' },
     });
+    output = result.stdout;
   } catch { return { outcome: 'gone' }; }
   const line = String(output || '').split('\n').find((entry) => entry.trim());
   const match = line ? PS_ONE_RE.exec(line) : null;
