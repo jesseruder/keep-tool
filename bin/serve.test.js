@@ -11486,6 +11486,15 @@ test('an Owner-forced restart signals only the captured process tree and resumes
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });
 
+test('a survivor of an earlier forced stop is the same pid and start time, never a reused pid', () => {
+  const { priorForcedSurvivors } = require('./serve');
+  const prior = [{ pid: 13, pidStart: 'orphan' }, { pid: 14, pidStart: 'gone' }, { pid: 15 }, null];
+  const table = [{ pid: 13, pidStart: 'orphan' }, { pid: 14, pidStart: 'reused' }, { pid: 15 }, { pid: 16, pidStart: 'z', zombie: true }];
+  assert.deepEqual(priorForcedSurvivors(table, prior), [{ pid: 13, pidStart: 'orphan' }]);
+  assert.deepEqual(priorForcedSurvivors(table, [{ pid: 16, pidStart: 'z' }]), [], 'a zombie has already exited');
+  assert.deepEqual(priorForcedSurvivors(table, undefined), []);
+});
+
 test('an Owner-forced console transfer is never queued; its refusal goes back to the click', async () => {
   const { handoffSessionRequest } = require('./serve');
   const refusal = Object.assign(new Error('Target claude account is not logged in'), { status: 409,

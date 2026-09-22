@@ -6266,6 +6266,15 @@ async function restartSession(body, deps = {}) {
     if (!helpersStopped) throw Error('Session helper did not exit; restart stopped without killing it');
     const live = await liveSessionPids(deps);
     if (live.has(session.id)) throw Error('An agent process still owns this conversation');
+    // An earlier Owner-forced stop of this transfer may have left a process it captured
+    // running; nothing resumes the conversation while one does, forced or not.
+    const prior = Array.isArray(deps.priorForcedProcesses) ? deps.priorForcedProcesses : [];
+    if (prior.length) {
+      const table = await (deps.agentProcessRows || agentProcessRows)(deps);
+      if (priorForcedSurvivors(table, prior).length) {
+        throw Error('A process from an earlier forced stop is still running; nothing resumed');
+      }
+    }
     return resume(stopped);
   }, { pane: body.pane, session: body.sessionId, ...(inheritedModel ? {} : { model: true }) });
 
@@ -6321,6 +6330,13 @@ function forceStopDeps(entry, deps, host, save) {
   };
 }
 
+// The processes an earlier forced stop captured that are still running: the same pid and
+// the same start time, never a pid reused by a later process.
+function priorForcedSurvivors(table, prior) {
+  return (Array.isArray(prior) ? prior : []).filter((old) => old && Number.isInteger(old.pid) && typeof old.pidStart === 'string'
+    && old.pidStart && (table || []).some((p) => p && !p.zombie && p.pid === old.pid && p.pidStart === old.pidStart));
+}
+
 // Owner-forced restart or handoff. Nothing is typed into the session and the host is
 // never asked to signal "whatever this pane runs now": the pane's whole process tree is
 // captured once, each process by pid and start time, journalled through onForcedStop,
@@ -6358,9 +6374,8 @@ async function forceStopThenResume({ session, pane, identity, resume }, deps = {
   };
   // An earlier forced stop of this transfer that did not finish may have left processes it
   // captured running, orphaned from this tree: they are this stop's too.
-  for (const prior of Array.isArray(deps.priorForcedProcesses) ? deps.priorForcedProcesses : []) {
-    if (!prior?.pidStart || processes.some((owned) => owned.pid === prior.pid)) continue;
-    if (snapshot.some((p) => same(p, prior) && !p.zombie)) processes.push({ pid: prior.pid, pidStart: prior.pidStart });
+  for (const prior of priorForcedSurvivors(snapshot, deps.priorForcedProcesses)) {
+    if (!processes.some((owned) => owned.pid === prior.pid)) processes.push({ pid: prior.pid, pidStart: prior.pidStart });
   }
   grow(snapshot);
   if (!processes.some((p) => p.pid === identity.pid && p.pidStart === identity.pidStart)) {
@@ -12591,6 +12606,7 @@ module.exports = {
   restartSession,
   reviewerResumeSpec,
   forceRestartSession,
+  priorForcedSurvivors,
   applyHostedExitState,
   coldReplayDue,
   closeExitedCodexShell,
