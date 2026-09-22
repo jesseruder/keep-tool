@@ -11288,6 +11288,57 @@ test('a remembered transcript path follows the account its session was moved to'
   assert.deepEqual([after.accountId, after.size], ['b', 6], 'the new account transcript, not the remembered one');
 });
 
+function twoAccountTranscripts(t, prefix) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), `keep-${prefix}-`));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const config = path.join(base, 'config.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'a', label: 'Claude A', agent: 'claude', configDir: path.join(base, 'a') },
+    { id: 'b', label: 'Claude B', agent: 'claude', configDir: path.join(base, 'b') },
+  ], defaultAccounts: { claude: 'a' } }));
+  const env = { ...process.env, KEEP_CONFIG: config, KEEP_DIR: path.join(base, 'registry') };
+  const id = `${prefix}-${process.pid}-${Date.now()}`;
+  const write = (account, text = '{}\n') => {
+    const file = path.join(base, account, 'projects', 'project', `${id}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, text);
+    return file;
+  };
+  return { env, root: env.KEEP_DIR, id, write };
+}
+
+test('a session in the middle of an account handoff resolves with no account', (t) => {
+  const { claudeSessionFor } = require('./serve.js');
+  const accountsModule = require('./accounts');
+  const { env, root, id, write } = twoAccountTranscripts(t, 'staged');
+  write('a');
+  accountsModule.pinSession(id, 'claude', 'a', { root, env });
+  accountsModule.stageSession(id, 'b', 'transaction-1', { root, env });
+  const session = claudeSessionFor(id, { root, env });
+  assert.ok(session, 'the source transcript is still read');
+  assert.equal(session.accountId, undefined, 'an unfinished handoff has no ordinary resume account');
+});
+
+test('a session pinned to an account that holds no copy keeps its fallback transcript without walking', (t) => {
+  const { claudeSessionFor } = require('./serve.js');
+  const accountsModule = require('./accounts');
+  const { findSessionFile: realFind } = require('./transcripts');
+  const { env, root, id, write } = twoAccountTranscripts(t, 'fallback');
+  const onA = write('a');
+  accountsModule.pinSession(id, 'claude', 'b', { root, env });
+  let finds = 0;
+  const findSessionFile = (sessionId) => { finds++; return realFind(sessionId, { root, env }); };
+  const first = claudeSessionFor(id, { root, env, findSessionFile });
+  const second = claudeSessionFor(id, { root, env, findSessionFile });
+  assert.equal(finds, 1, 'the remembered fallback stands instead of a walk on every call');
+  assert.deepEqual([first.size, second.size, second.accountId], [3, 3, 'b']);
+  // Once the pinned account's copy appears where a handoff puts it, it wins.
+  assert.equal(path.basename(path.dirname(onA)), 'project');
+  write('b', '{}\n{}\n');
+  const third = claudeSessionFor(id, { root, env, findSessionFile });
+  assert.deepEqual([third.size, third.accountId, finds], [6, 'b', 1]);
+});
+
 test('the rate-limit policy reads only live Claude panes, with the pane account winning', async () => {
   const { handoffPolicySessions } = require('./serve.js');
   const looked = [];

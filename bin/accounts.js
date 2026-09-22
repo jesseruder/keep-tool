@@ -238,6 +238,16 @@ function knownClaudeFile(sessionId, accountId, env = process.env) {
 
 // Which configured Claude account a transcript path belongs to, from its projects
 // root alone. No walk: the file is already in hand.
+// The session's transcript in one account under a given project directory name,
+// if it is there: one stat, no walk. An account handoff copies a transcript into
+// the same project directory under the target account's root.
+function claudeFileInAccount(sessionId, accountId, projectName, env = process.env) {
+  const entry = projectRoots(env).find((candidate) => candidate.accountId === accountId);
+  if (!entry || !projectName || projectName !== path.basename(projectName)) return null;
+  const file = path.join(entry.root, projectName, `${sessionId}.jsonl`);
+  try { return fs.statSync(file).isFile() ? file : null; } catch { return null; }
+}
+
 function claudeAccountForFile(file, env = process.env) {
   const resolved = path.resolve(String(file || ''));
   let best = null;
@@ -400,6 +410,6 @@ function setDefault(agent, accountId, env = process.env) {
 
 module.exports = {
   AGENTS, ID_RE, CUSTOM_ID_RE, rawConfig, list, get, defaultFor, automationFor, hasMultiple, envFor, projectRoots,
-  publicState, authority, authorityFile, locateClaudeFiles, knownClaudeFile, claudeAccountForFile, forSession, sessionNode, pinSession,
+  publicState, authority, authorityFile, locateClaudeFiles, knownClaudeFile, claudeFileInAccount, claudeAccountForFile, forSession, sessionNode, pinSession,
   stageSession, commitStaged, clearStaged, add, setDefault,
 };

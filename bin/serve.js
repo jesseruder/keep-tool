@@ -10141,7 +10141,9 @@ function claudeSessionFor(sessionId, options = {}) {
   // project tree for a file this lookup finds anyway. A throw (an unfinished
   // handoff, an unavailable account) leaves it null and the cached file standing.
   let record = null;
-  try { record = accounts.forSession(id, 'claude', { root, env, allowDiscovery: false }); } catch {}
+  let recordFailed = false;
+  try { record = accounts.forSession(id, 'claude', { root, env, allowDiscovery: false }); }
+  catch { recordFailed = true; }
   let file = claudeSessionPathCache.get(id) || null;
   let stat;
   if (file) {
@@ -10157,11 +10159,20 @@ function claudeSessionFor(sessionId, options = {}) {
     }
     // An account handoff copies the transcript and leaves the source's in place, so
     // a remembered file can be the old account's, carrying its old rate limit.
-    // Authority that now names another account sends the lookup back through
-    // findSessionFile, whose pinned path answers from that account.
+    // Authority that now names another account is answered from that account's copy:
+    // the same project directory under its root (where a handoff copies to), or the
+    // file an earlier walk found there. With neither, the remembered file is what
+    // findSessionFile's own fallback would return, so it stands rather than paying
+    // a walk of every project directory on every call to reach the same answer.
     if (file && record && accounts.claudeAccountForFile(file, env) !== record.id) {
-      claudeSessionPathCache.delete(id);
-      file = null;
+      const moved = accounts.claudeFileInAccount(id, record.id, path.basename(path.dirname(file)), env)
+        || accounts.knownClaudeFile(id, record.id, env)?.file || null;
+      let movedStat = null;
+      if (moved) try { movedStat = fs.statSync(moved); } catch {}
+      if (movedStat && movedStat.isFile()) {
+        file = moved;
+        stat = movedStat;
+      }
     }
   }
   if (!file) {
@@ -10179,9 +10190,12 @@ function claudeSessionFor(sessionId, options = {}) {
   cacheClaudeSessionLookup(claudeSessionPathCache, id, file);
   // With no record, the account is the one whose projects root holds the file,
   // which is what discovery would have answered (findSessionFile already refused
-  // an ambiguous one). A record that threw names no account, as before.
+  // an ambiguous one). A record that could not be read names no account: an
+  // unfinished handoff has no ordinary resume account, as in the dashboard resolver.
   let accountId = null;
-  try { accountId = record ? record.id || null : accounts.claudeAccountForFile(file, env); } catch {}
+  if (!recordFailed) {
+    try { accountId = record ? record.id || null : accounts.claudeAccountForFile(file, env); } catch {}
+  }
   return claudeSessionForEntry(id, file, stat, accountId);
 }
 
@@ -10263,7 +10277,9 @@ function createFreshClaudeSessionResolver(deps = {}) {
   const authority = deps.authority || accounts.authority(deps.root || keep.ROOT);
   const indexedAccounts = new Set(deps.accountIds || claudeProjectRoots.map((entry) => entry.accountId));
   // A session with no record can be in any configured account, including one the
-  // index was not built with.
+  // index was not built with. This compares ids only: an account whose configDir
+  // changed under the same id still counts as indexed although the index scans its
+  // old root, until a daemon restart builds the index over the new one.
   const configuredAccounts = deps.configuredAccountIds
     || accounts.projectRoots(deps.env || process.env).map((entry) => entry.accountId);
   const everyAccountIndexed = configuredAccounts.every((accountId) => indexedAccounts.has(accountId));
