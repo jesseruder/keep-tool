@@ -13540,3 +13540,43 @@ test('a restart of a pane on another node is refused before any local process is
     assert.equal(error.message, 'reached the ordinary restart path', pane);
   }
 });
+
+test('an entry that is not even an object is a node that cannot be reached, not a node that is gone', async (t) => {
+  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient, listHostPaneResult, hostNodeEntries } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodes(t, async ({ configFile, config }) => {
+    // The shape that used to throw inside nodeConfig, collapsing the node list to
+    // the daemon node and producing no missingNodes at all — which let delivery
+    // reconciliation retire a journal for a host nobody had asked about.
+    fs.writeFileSync(configFile, JSON.stringify({ ...config, nodes: { ...config.nodes, broken: null } }));
+    await closeHostClient();
+    try {
+      assert.deepEqual(hostNodeEntries({}).map((entry) => [entry.name, entry.invalid]),
+        [['main', false], ['aws1', false], ['broken', true]]);
+      const listed = await listHostPaneResult({ connectHost: connect, hostRemoteListTimeoutMs: 500 }, true);
+      assert.deepEqual(listed.missingNodes, ['broken']);
+      assert.equal(listed.nodes.broken.reason, 'invalid');
+      assert.match(listed.nodes.broken.detail, /invalid Keep node configuration: broken/);
+      assert.equal(listed.nodes.aws1.ok, true);
+    } finally { await closeHostClient(); }
+  });
+});
+
+test('a node list nobody can read protects every remote journal', async (t) => {
+  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient, listHostPaneResult } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodes(t, async ({ configFile }) => {
+    fs.writeFileSync(configFile, '{ this is not json');
+    await closeHostClient();
+    try {
+      const listed = await listHostPaneResult({ connectHost: connect }, true);
+      // The daemon node still answers for itself. What it cannot do is say what
+      // else exists, and saying so is the whole point.
+      assert.equal(listed.configurationUnreadable, true);
+      assert.ok(Array.isArray(listed.panes));
+      assert.deepEqual(listed.missingNodes, []);
+    } finally { await closeHostClient(); }
+  });
+});

@@ -168,3 +168,17 @@ test('a journal on the daemon node is unaffected by another node being unknown',
     [local.entry.sessionId]);
   assert.equal(fs.existsSync(local.journal), false);
 }));
+
+test('with no readable node list, every remote journal is left alone', () => fixture(f => {
+  const remote = f.add('claude', 'unreachable node', {
+    sessionId: 'remote-session', pane: 'r1@aws1', typedAt: Date.now() - 20 * 60e3, createdAt: Date.now() - 20 * 60e3,
+  });
+  const local = f.add('codex', 'local draft', {
+    sessionId: 'local-session', pane: 'p1', typedAt: Date.now() - 20 * 60e3, createdAt: Date.now() - 20 * 60e3,
+  });
+  // No node could be named, so no node could be asked: every pane that is not this
+  // machine's is one nobody has heard from.
+  assert.deepEqual(delivery.reconcile(f.directory, { panes: new Set(['p2']), unknownRemote: true }), ['local-session']);
+  assert.ok(fs.existsSync(remote.journal));
+  assert.equal(fs.existsSync(local.journal), false, 'this machine still speaks for its own panes');
+}));

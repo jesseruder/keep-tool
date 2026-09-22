@@ -78,18 +78,19 @@ function resolveNode(name, env = process.env) {
 // never throws: a typo in one node's address must not take the whole fleet — the
 // daemon's own node included — out of every listing that reads this.
 function listNodes(env = process.env) {
-  const { nodes, daemonNode } = configuration(env);
-  return Object.keys(nodes)
+  const { nodes, invalid, daemonNode } = configuration(env);
+  const unusable = (name, reason) => ({
+    name, transport: null, daemon: name === daemonNode, capabilities: [], invalid: true, reason,
+  });
+  const described = Object.keys(nodes)
     .sort((a, b) => (a === daemonNode ? -1 : b === daemonNode ? 1 : a.localeCompare(b)))
     .map((name) => {
       try { return describeNode(name, nodes[name], daemonNode, env); }
-      catch (error) {
-        return {
-          name, transport: null, daemon: name === daemonNode, capabilities: [],
-          invalid: true, reason: error.message,
-        };
-      }
+      catch (error) { return unusable(name, error.message); }
     });
+  // The entries the configuration itself could not make sense of travel with them:
+  // a node nobody can reach is still a node whose panes must not be called gone.
+  return [...described, ...Object.entries(invalid || {}).map(([name, reason]) => unusable(name, reason))];
 }
 
 function isRemote(name, env = process.env) {

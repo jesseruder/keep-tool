@@ -2192,7 +2192,7 @@ function hostNodeEntries(deps = {}) {
       : { name: entry.name, invalid: entry.invalid === true, reason: entry.reason || null })));
   }
   try { return ordered(nodes.configuredNodeEntries()); }
-  catch { return [{ name: daemon, invalid: false, reason: null }]; }
+  catch (error) { return [{ name: daemon, invalid: false, reason: null, unreadable: true, detail: error.message }]; }
 }
 
 function hostNodeNames(deps = {}) {
@@ -2275,12 +2275,20 @@ async function listHostPaneResult(deps = {}, fresh = false) {
     memo.at = now();
     return panes;
   };
+  // Nobody could read the node list, so this is not "one node" — it is one node's
+  // panes and no idea what else exists. Said out loud, because the answer changes
+  // what a caller may conclude from a pane it cannot find.
+  const unreadable = entries.some((entry) => entry.unreadable);
   // One node is the whole fleet: the result is the one the daemon has always
   // returned, pane for pane and field for field.
-  if (entries.length === 1) {
+  if (entries.length === 1 && !unreadable) {
     const only = await listNodePaneResult(daemon, deps, fresh, epoch);
     if (Array.isArray(only.panes)) remember(only.panes, !cachedPaneResults.has(only));
     return only;
+  }
+  if (unreadable) {
+    const only = await listNodePaneResult(daemon, deps, fresh, epoch);
+    return { ...only, configurationUnreadable: true, nodes: {}, missingNodes: [] };
   }
   // Every node is asked at once, and each remote answer has its own, shorter budget
   // running from now. The console must never wait on a node in another building to

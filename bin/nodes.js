@@ -51,7 +51,9 @@ function configuredNodeEntries(env = process.env) {
     // Falling back silently would make a broken configuration look like a
     // single-node install, which is exactly the shape a fleet must not mistake.
     // Said once per distinct reason so a five-second scheduler cannot flood a log.
-    entries = [{ name: daemonNode(env), invalid: false, reason: null }];
+    // Marked, not merely reported: a caller that fans out has to be able to tell
+    // "this install has one node" from "nobody can say how many nodes there are".
+    entries = [{ name: daemonNode(env), invalid: false, reason: null, unreadable: true, detail: error.message }];
     const message = `keep: cannot read the node list (${error.message}); assuming the single node ${entries[0].name}`;
     if (nodeNameWarning !== message) {
       nodeNameWarning = message;

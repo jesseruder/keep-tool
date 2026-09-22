@@ -27,18 +27,26 @@ function nodeConfig(value = {}) {
   if (typeof daemon !== 'string' || !NODE_NAME_RE.test(daemon)) {
     throw new Error(`invalid Keep node name for daemonNode: ${JSON.stringify(value.daemonNode)}`);
   }
-  if (value.nodes === undefined) return { nodes: { [daemon]: {} }, daemonNode: daemon };
+  if (value.nodes === undefined) return { nodes: { [daemon]: {} }, invalid: {}, daemonNode: daemon };
   if (!value.nodes || typeof value.nodes !== 'object' || Array.isArray(value.nodes)) {
     throw new Error('invalid Keep configuration: nodes must be an object');
   }
+  // One unusable entry is reported, by name and reason, rather than thrown over the
+  // whole map. Throwing here collapsed the fleet to the daemon node, and a node that
+  // has silently ceased to exist is a node whose panes look gone — which is how a
+  // pending message on it would be thrown away. The map's own shape, and a daemonNode
+  // that names nothing usable, are still fatal: neither leaves anything to work with.
+  const nodes = {};
+  const invalid = {};
   for (const [name, entry] of Object.entries(value.nodes)) {
-    if (!NODE_NAME_RE.test(name)) throw new Error(`invalid Keep node name: ${name}`);
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error(`invalid Keep node configuration: ${name}`);
+    if (!NODE_NAME_RE.test(name)) invalid[name] = `invalid Keep node name: ${name}`;
+    else if (!entry || typeof entry !== 'object' || Array.isArray(entry)) invalid[name] = `invalid Keep node configuration: ${name}`;
+    else nodes[name] = entry;
   }
-  if (!Object.prototype.hasOwnProperty.call(value.nodes, daemon)) {
-    throw new Error(`daemonNode ${daemon} is not one of the configured nodes`);
+  if (!Object.prototype.hasOwnProperty.call(nodes, daemon)) {
+    throw new Error(invalid[daemon] || `daemonNode ${daemon} is not one of the configured nodes`);
   }
-  return { nodes: { ...value.nodes }, daemonNode: daemon };
+  return { nodes, invalid, daemonNode: daemon };
 }
 
 // Rewrites config.json in place, atomically, keeping every key it does not touch
@@ -59,7 +67,13 @@ function update(mutate, env = process.env) {
   if (!next || typeof next !== 'object' || Array.isArray(next) || next.version !== 1) {
     throw new Error('a Keep configuration must stay a version 1 object');
   }
-  nodeConfig(next);
+  // An edit may not introduce an entry nothing can use. One that was already there
+  // is not this edit's fault and must not block fixing the rest of the file.
+  const before = (() => { try { return nodeConfig(current).invalid; } catch { return {}; } })();
+  const after = nodeConfig(next).invalid;
+  for (const [name, reason] of Object.entries(after)) {
+    if (!Object.prototype.hasOwnProperty.call(before, name)) throw new Error(reason);
+  }
   let mode = 0o600;
   try { mode = fs.statSync(file).mode & 0o777; } catch {}
   fs.mkdirSync(path.dirname(file), { recursive: true });

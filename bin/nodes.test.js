@@ -56,12 +56,37 @@ test('an explicit node name in the environment wins over the configuration', () 
   });
 });
 
-test('node names are rejected by name when they are not usable', () => {
+test('an entry that is not usable is reported by name, not thrown over the whole map', () => {
+  // One bad entry used to take the fleet down to a single node, which is how a node
+  // that still exists starts to look like a machine with no panes.
+  withConfig({ nodes: { main: {}, 'Mini Server': {}, aws1: null, laptop: {} }, daemonNode: 'main' }, (env) => {
+    const value = config.apply(env);
+    assert.deepEqual(config.nodeNames(value), ['main', 'laptop']);
+    assert.deepEqual(config.nodeConfig(value).invalid, {
+      'Mini Server': 'invalid Keep node name: Mini Server',
+      aws1: 'invalid Keep node configuration: aws1',
+    });
+  });
+  // What is left to work with, though, is still checked: a daemon node that names
+  // nothing usable, and a nodes map that is not a map, are both fatal.
+  withConfig({ nodes: { main: null }, daemonNode: 'main' }, (env) => {
+    assert.throws(() => config.apply(env), /invalid Keep node configuration: main/);
+  });
   withConfig({ nodes: { 'Mini Server': {} }, daemonNode: 'main' }, (env) => {
-    assert.throws(() => config.apply(env), /invalid Keep node name: Mini Server/);
+    assert.throws(() => config.apply(env), /daemonNode main is not one of the configured nodes/);
   });
   withConfig({ nodes: { mini: {} }, daemonNode: 'Mini' }, (env) => {
     assert.throws(() => config.apply(env), /invalid Keep node name for daemonNode/);
+  });
+  withConfig({ nodes: [], daemonNode: 'main' }, (env) => {
+    assert.throws(() => config.apply(env), /nodes must be an object/);
+  });
+  // And the file-level shape is rejected exactly as it was.
+  withConfig({}, (env, dir) => {
+    fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ version: 2 }));
+    assert.throws(() => config.load(env), /unsupported Keep configuration/);
+    fs.writeFileSync(path.join(dir, 'config.json'), '{ not json');
+    assert.throws(() => config.load(env), /JSON/);
   });
   assert.throws(() => nodes.localNode({ KEEP_NODE_NAME: 'Laptop' }), /invalid node name in KEEP_NODE_NAME/);
   assert.throws(() => nodes.daemonNode({ KEEP_DAEMON_NODE: 'main node' }), /invalid node name in KEEP_DAEMON_NODE/);

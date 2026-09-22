@@ -504,10 +504,16 @@ function pendingForSession(directory, sessionId) {
 // journal on one of them is left exactly as it is: not deleted, not settled, not
 // counted as resolved. "I could not tell" is not "it is gone".
 function reconcile(directory, {
-  now = Date.now(), staleJournalMs = STALE_JOURNAL_MS, panes = null, unknownNodes = null,
+  now = Date.now(), staleJournalMs = STALE_JOURNAL_MS, panes = null, unknownNodes = null, unknownRemote = false,
 } = {}) {
   const unknown = unknownNodes instanceof Set ? unknownNodes : new Set(unknownNodes || []);
-  const paneNode = (pane) => require('./nodes.js').parsePaneRef(String(pane || '')).node;
+  const daemon = require('./nodes.js').daemonNode();
+  // `unknownRemote` is what a caller says when it cannot even name the nodes: then
+  // every pane that is not this machine's is one nobody asked about.
+  const unknownPane = (pane) => {
+    const node = require('./nodes.js').parsePaneRef(String(pane || '')).node;
+    return unknown.has(node) || (unknownRemote && node !== daemon);
+  };
   let files;
   try { files = fs.readdirSync(directory).filter(name => name.endsWith('.json')); }
   catch (error) { if (error.code === 'ENOENT') return []; throw error; }
@@ -524,7 +530,7 @@ function reconcile(directory, {
       if (!received(entry)) {
         if (journalAgeMs(journal, entry, now) < staleJournalMs) continue;
         if (!(Number(entry.typedAt) > 0) && !partialTyping(entry)) fs.unlinkSync(journal);
-        else if (panes?.size && !panes.has(entry.pane) && !unknown.has(paneNode(entry.pane))) {
+        else if (panes?.size && !panes.has(entry.pane) && !unknownPane(entry.pane)) {
           if (entry.retainReceipt || !(Number(entry.typedAt) > 0 || completedTyping(entry))) fs.unlinkSync(journal);
           else settle(journal, name);
           settled.push(entry.sessionId);

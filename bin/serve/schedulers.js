@@ -279,8 +279,11 @@ function startSchedulers(ctx) {
         ...(listed.missingNodes || []),
         ...Object.entries(listed.nodes || {}).filter(([, status]) => status.stale || !status.ok).map(([name]) => name),
       ]);
+      // With no readable node list there is no way to name the nodes that were not
+      // asked, so every pane that is not this node's counts as unknown.
+      const unknownRemote = listed.configurationUnreadable === true;
       return withInjectionLock(() => require('../delivery')
-        .reconcile(path.join(keep.ROOT, '.keep', 'delivery'), { panes, unknownNodes }));
+        .reconcile(path.join(keep.ROOT, '.keep', 'delivery'), { panes, unknownNodes, unknownRemote }));
     },
   });
   unblock.startScheduler({
