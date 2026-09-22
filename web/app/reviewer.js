@@ -1,6 +1,6 @@
 import * as api from './api.js';
 import { restartControls, installRestartControls } from './restart-session.js';
-import { accountLabelHTML, handoffControls, installHandoffControls } from './account-controls.js';
+import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHandoff } from './account-controls.js';
 import { runAction } from './action.js';
 
 const ACTIONS_KEY = 'keep.console.reviewer.actionsOnly';
@@ -215,7 +215,10 @@ export function renderReviewer(ctx) {
   // Re-rendered every refresh, not only on a structural change: the button has to
   // follow the reviewer's pane appearing and going away, and the queued/failed state.
   const restart = terminal.querySelector('.restart-controls');
-  ctx.patchHTML(restart, `${restartControls(ctx, session?.id)}${reviewerRestartHTML(ctx)}`);
+  // As in Watch and Triage: no Restart beside a transfer in progress, and a pane that
+  // restartControls will not restart still gets the disabled button explaining why.
+  const restartable = session?.id && !hasPendingHandoff(ctx, session.id, session.pane) ? restartControls(ctx, session.id) : '';
+  ctx.patchHTML(restart, restartable || reviewerRestartHTML(ctx) || '<button class="btn" disabled title="The reviewer pane cannot be restarted right now">Restart</button>');
   // Cancel has to keep working even if the pane has gone out from under a queued
   // restart, so fall back to the pane the entry was queued against.
   const queued = (ctx.data.restarts || []).find((entry) => entry.sessionId === session?.id

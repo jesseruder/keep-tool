@@ -32,7 +32,8 @@ export function installRestartControls(container, ctx, sessionId, pane) {
           { label: button.dataset.restart === 'cancel' ? 'Cancelling…' : 'Restarting…', ctx, retry: () => button.click() });
         ctx.toast(result.status === 'failed' ? `Not restarted: ${result.reason}`
           : result.status === 'done' ? 'Session restarted; conversation and pins preserved'
-          : result.status === 'cancelled' ? 'Restart cancelled' : 'Restart queued; waits for an idle, unviewed pane');
+          : result.status === 'cancelled' ? 'Restart cancelled'
+          : ownerForce.ownerForce ? 'Restart queued behind another restart; it runs next' : 'Restart queued; waits for an idle, unviewed pane');
         if (result.status === 'done' && document.activeElement === document.body
             && origin === `${ctx.state.mode}:${ctx.state.selectedKey}:${ctx.state.layout}`) ctx.state.focusPane = pane;
         await ctx.reload();

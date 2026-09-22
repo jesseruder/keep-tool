@@ -107,14 +107,20 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
         // What an earlier forced restart of this session captured and may have left
         // running; this stop waits for those too, and journals its own capture here.
         priorForcedProcesses: Array.isArray(entry.priorForcedProcesses) ? entry.priorForcedProcesses : [],
-        onForcedStop: (processes) => { entry.forcedProcesses = processes; save(); },
+        onForcedStop: (processes, { incomplete = false } = {}) => {
+          entry.forcedProcesses = processes;
+          if (incomplete) entry.forcedCaptureIncomplete = true;
+          save();
+        },
       } : {});
       entry.status = 'done'; entry.result = result; entry.at = Date.now(); save();
       return entry;
     } catch (error) {
       entry.status = entry.mode === 'force' && entry.original ? 'recovery-needed'
         : entry.mode === 'idle' && error instanceof RestartDeferred ? 'queued' : 'failed';
-      entry.reason = error.message; entry.at = Date.now(); save();
+      entry.reason = entry.forcedCaptureIncomplete
+        ? `${error.message}; some processes it started may still be running, check before restarting again` : error.message;
+      entry.at = Date.now(); save();
       return entry;
     } finally { busy = false; }
   };
@@ -143,7 +149,7 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
         return existing || { status: 'cancelled' };
       }
       if (existing) {
-        if (existing.mode !== body.mode || existing.pane !== body.pane) throw Error('A different restart is already pending; cancel it first');
+        if (existing.mode !== body.mode || existing.pane !== body.pane || Boolean(existing.ownerForce) !== (body.ownerForce === true)) throw Error('A different restart is already pending; cancel it first');
         return existing;
       }
       if (entries.filter((e) => ['queued', 'restarting', 'recovery-needed'].includes(e.status)).length >= 50) throw Error('Restart queue is full');
@@ -151,7 +157,7 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
       if (entries.some(e => e.sessionId === body.sessionId && e.status === 'recovery-needed')) throw Error('Interrupted restart requires explicit recovery');
       const raced = entries.find((e) => e.sessionId === body.sessionId && ['queued', 'restarting'].includes(e.status));
       if (raced) {
-        if (raced.mode !== body.mode || raced.pane !== body.pane) throw Error('A different restart is already pending; cancel it first');
+        if (raced.mode !== body.mode || raced.pane !== body.pane || Boolean(raced.ownerForce) !== (body.ownerForce === true)) throw Error('A different restart is already pending; cancel it first');
         return raced;
       }
       if (entries.filter((e) => ['queued', 'restarting', 'recovery-needed'].includes(e.status)).length >= 50) throw Error('Restart queue is full');
@@ -160,7 +166,8 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
         ? [...entries].reverse().find((e) => e.sessionId === body.sessionId && Array.isArray(e.forcedProcesses)) : null;
       const entry = { sessionId: body.sessionId, pane: body.pane, pid: pane.pid, mode: body.mode, status: 'queued', at: Date.now(),
         ...(body.mode === 'force' ? { token: require('node:crypto').randomUUID() } : {}),
-        ...(body.ownerForce === true ? { ownerForce: true, priorForcedProcesses: earlier?.forcedProcesses || [] } : {}) };
+        ...(body.ownerForce === true ? { ownerForce: true, priorForcedProcesses: earlier?.forcedProcesses || [],
+          reason: 'Waiting for another restart to finish' } : {}) };
       entries.push(entry); save();
       return body.mode === 'now' ? run(entry) : entry;
     },

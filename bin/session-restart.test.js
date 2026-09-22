@@ -32,6 +32,27 @@ test('Owner Restart is forced: no idle refusal, and each forced stop hands its c
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('a forced restart whose capture was incomplete says so, and forced and unforced requests never merge', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-owner-restart-incomplete-')), file = path.join(root, 'queue.json');
+  try {
+    const inspect = async () => ({ session: { id: 's', endedTurn: false },
+      pane: { id: 'p', pid: 10, alive: true, meta: { sessionId: 's', agent: 'codex' } } });
+    const manager = createManager({ file, inspect, restart: async (entry, options) => {
+      options.onForcedStop([{ pid: 11, pidStart: 'a' }], { incomplete: true });
+      throw Error('Process tree exceeds force-stop limit or lacks identity');
+    } });
+    const failed = await manager.request({ sessionId: 's', pane: 'p', mode: 'now', ownerForce: true });
+    assert.equal(failed.status, 'failed');
+    assert.equal(failed.forcedCaptureIncomplete, true);
+    assert.match(failed.reason, /may still be running/);
+
+    // A queued unforced restart is not the forced one Owner just asked for, or the reverse.
+    fs.writeFileSync(file, JSON.stringify([{ sessionId: 's', pane: 'p', pid: 10, mode: 'now', status: 'queued', at: Date.now() }]));
+    const queued = createManager({ file, inspect, restart: async () => ({ ok: true }) });
+    await assert.rejects(queued.request({ sessionId: 's', pane: 'p', mode: 'now', ownerForce: true }), /different restart is already pending/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('cancelled force entry in a stale tick snapshot is never executed', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-force-cancel-')), file = path.join(root, 'queue.json');
   try {
