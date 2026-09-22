@@ -3927,9 +3927,11 @@ function compactSwapUserModelChoice(record, file, options = {}) {
   if (!file || !Number.isFinite(at) || at <= 0) return null;
   const daemon = options.daemon === undefined ? record : options.daemon;
   let text;
+  let truncated = false;
   try {
     const stat = fs.statSync(file);
-    const start = Math.max(0, stat.size - COMPACT_SWAP_CHOICE_SCAN_BYTES);
+    const start = Math.max(0, stat.size - envNumber('KEEP_COMPACT_SWAP_CHOICE_SCAN_BYTES', COMPACT_SWAP_CHOICE_SCAN_BYTES));
+    truncated = start > 0;
     const fd = fs.openSync(file, 'r');
     try {
       const buffer = Buffer.alloc(stat.size - start);
@@ -3949,6 +3951,17 @@ function compactSwapUserModelChoice(record, file, options = {}) {
   const journal = daemon && Array.isArray(daemon.daemonTyped) ? daemon.daemonTyped.map((entry) => Number(entry && entry.at)) : [];
   const scanFrom = Math.min(at, ...(daemon ? [Number(daemon.at)] : []), ...journal.map((value) => value - 1000)
     .filter(Number.isFinite));
+  // A window that starts after the scan's start point cannot say nothing happened in the
+  // part it did not read: the choice may be exactly the row that fell out of the tail. That
+  // is "cannot prove there was no hand choice", and every caller treats it as one — no
+  // restore typed, no settings.json written.
+  if (truncated) {
+    const first = lines.map((line) => { try { return Date.parse(JSON.parse(line).timestamp || ''); } catch { return NaN; } })
+      .find(Number.isFinite);
+    if (!(first <= scanFrom)) {
+      return { model: '', incomplete: true, reason: 'the transcript is too long to verify no hand choice since the swap' };
+    }
+  }
   let inWindow = false;
   for (let i = 0; i < lines.length; i += 1) {
     let row;

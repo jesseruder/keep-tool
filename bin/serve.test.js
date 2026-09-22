@@ -13059,3 +13059,90 @@ test('a daemon row is consumed by its own Enter even when it failed or lies befo
     assert.equal(compactSwapUserModelChoice(record, file, { since: at + 608e3 }), null);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+// ---- review round 11 ----
+
+test('a transcript too long to read back to the swap retires the record rather than restore over it', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-long-transcript-'));
+  const prior = process.env.KEEP_COMPACT_SWAP_CHOICE_SCAN_BYTES;
+  process.env.KEEP_COMPACT_SWAP_CHOICE_SCAN_BYTES = '4096';
+  const at = Date.parse('2026-09-04T12:00:00Z');
+  const stamp = (offsetMs) => new Date(at + offsetMs).toISOString();
+  const modelCommand = (args, offsetMs) => JSON.stringify({ type: 'user', timestamp: stamp(offsetMs), message: { content: [{ type: 'text',
+    text: `<command-name>/model</command-name><command-message>model</command-message><command-args>${args}</command-args>` }] } });
+  const out = (text, offsetMs) => JSON.stringify({ type: 'system', subtype: 'local_command', timestamp: stamp(offsetMs),
+    content: `<local-command-stdout>${text}</local-command-stdout>` });
+  const real = (model, offsetMs) => JSON.stringify({ type: 'assistant', timestamp: stamp(offsetMs), message: { model, usage: { input_tokens: 1 } } });
+  try {
+    const transcript = path.join(dir, 't.jsonl');
+    // The person picked Opus (no window) an hour after the swap, then kept working on it
+    // until that row fell out of the tail the scan reads.
+    const rows = [modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 1e3),
+      modelCommand('claude-opus-5', 3600e3), out('Set model to Opus 5', 3600e3)];
+    for (let i = 0; i < 200; i += 1) rows.push(real('claude-opus-5', 3700e3 + i * 1e3));
+    fs.writeFileSync(transcript, `${rows.join('\n')}\n`);
+    const record = { at, switchModel: 'claude-opus-5[1m]', restoreCommand: '/model claude-fable-5-1[1m]',
+      daemonTyped: [{ at: at + 1e3, model: 'claude-opus-5[1m]' }] };
+    const choice = compactSwapUserModelChoice(record, transcript);
+    assert.equal(choice.incomplete, true);
+    assert.match(choice.reason, /too long to verify/);
+    // Read whole, the same transcript shows the pick itself.
+    delete process.env.KEEP_COMPACT_SWAP_CHOICE_SCAN_BYTES;
+    assert.match(compactSwapUserModelChoice(record, transcript).reason, /claude-opus-5 was chosen/);
+    process.env.KEEP_COMPACT_SWAP_CHOICE_SCAN_BYTES = '4096';
+
+    // The sweep: its deferral is due, and it retires instead of typing Fable.
+    const session = { id: 'long-session', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+    const file = writeCompactSwapFixture(dir, session.id, { ...record, restoreDeferredReason: 'model-exhausted',
+      restoreDeferredUntil: at + 60e3, restoreExpiryFrom: at + 60e3 });
+    const calls = [];
+    const repairs = [];
+    const logs = [];
+    const priorWrite = process.stderr.write;
+    process.stderr.write = (line) => { logs.push(String(line)); return true; };
+    let summary;
+    try {
+      summary = await sweepPendingCompactSwaps({ ...compactRestoreDeps(dir, session, calls), now: () => at + 7200e3,
+        transcriptFileForSession: () => transcript,
+        readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-opus-5' }),
+        repairClaudeSettingsModel: (value) => { repairs.push(value); return { changed: true }; } });
+    } finally { process.stderr.write = priorWrite; }
+    assert.deepEqual(calls, [], 'nothing typed');
+    assert.deepEqual(repairs, []);
+    assert.equal(fs.existsSync(file), false);
+    assert.equal(summary.dropped, 1);
+    assert.ok(logs.some((line) => /too long to verify no hand choice since the swap; not restoring/.test(line)));
+  } finally {
+    if (prior === undefined) delete process.env.KEEP_COMPACT_SWAP_CHOICE_SCAN_BYTES;
+    else process.env.KEEP_COMPACT_SWAP_CHOICE_SCAN_BYTES = prior;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an other-session transcript too long to verify skips the settings write', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-long-other-'));
+  const prior = process.env.KEEP_COMPACT_SWAP_CHOICE_SCAN_BYTES;
+  process.env.KEEP_COMPACT_SWAP_CHOICE_SCAN_BYTES = '2048';
+  const at = Date.parse('2026-09-04T12:00:00Z');
+  try {
+    const other = path.join(dir, 'b.jsonl');
+    const rows = [];
+    for (let i = 0; i < 100; i += 1) rows.push(JSON.stringify({ type: 'assistant', timestamp: new Date(at + 60e3 + i * 1e3).toISOString(),
+      message: { model: 'claude-sonnet-5', usage: { input_tokens: 1 } } }));
+    fs.writeFileSync(other, `${rows.join('\n')}\n`);
+    const a = { id: 'session-a', kind: 'claude', exited: true, endedTurn: true, mtime: at + 2e3 };
+    const b = { id: 'session-b', kind: 'claude', endedTurn: true, mtime: at + 200e3 };
+    writeCompactSwapFixture(dir, a.id, { at, switchModel: 'claude-opus-5[1m]', settingsModelBefore: 'claude-fable-5-1[1m]',
+      daemonTyped: [{ at: at + 1e3, model: 'claude-opus-5[1m]' }] });
+    const repairs = [];
+    await sweepPendingCompactSwaps({ ...compactRestoreDeps(dir, a, []), scanSessions: () => [a, b], stderr: () => {},
+      transcriptFileForSession: (session) => (session.id === a.id ? null : other),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-opus-5[1m]' }),
+      repairClaudeSettingsModel: (value) => { repairs.push(value); return { changed: true }; } });
+    assert.deepEqual(repairs, [], 'B\'s transcript could not be read back to the swap');
+  } finally {
+    if (prior === undefined) delete process.env.KEEP_COMPACT_SWAP_CHOICE_SCAN_BYTES;
+    else process.env.KEEP_COMPACT_SWAP_CHOICE_SCAN_BYTES = prior;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

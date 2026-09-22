@@ -2417,7 +2417,11 @@ moment, within 15 seconds, whether or not the API accepted it, and even when the
 only reports rows from a later moment — so a hand pick of any id near a daemon Enter, a second row of
 the same id, a restore id the daemon never typed, and a row with no timestamp all count; or an assistant turn on a third model), the
 pass retires the record without typing the restore or repairing `settings.json`, and logs
-`retired model restore record … not restoring … over it`.
+`retired model restore record … not restoring … over it`. The scan reads the last 8 MiB of a
+transcript; when that does not reach back to the swap (or the earliest daemon Enter), it
+cannot prove there was no hand choice, and it is treated as one: the record is retired
+with "the transcript is too long to verify no hand choice since the swap", and another
+session's unverifiable transcript likewise leaves `settings.json` as-is.
 
 Auto-compact targets large eligible Claude sessions and Codex sessions running exactly
 `gpt-6-astra`. Claude eligibility still follows `KEEP_AUTO_COMPACT_MODELS` (default
