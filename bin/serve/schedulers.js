@@ -319,13 +319,25 @@ function startSchedulers(ctx) {
         const result = await leftovers.reap({ deps: {
           seen, exclude, keepRoot: keep.ROOT,
           graceMs: envNumber('KEEP_LEFTOVER_GRACE_MIN', 15) * 60e3,
-          panes: () => listHostPanes({}, true),
+          // This machine's host only: a node that did not answer, or panes served from
+          // another node, say nothing about the processes running here.
+          panes: async () => {
+            const listed = await listHostPaneResult({}, true);
+            if (!Array.isArray(listed.panes)) {
+              const error = Error(`host pane state unavailable (${listed.failure || 'no list'})`);
+              error.evidence = true;
+              throw error;
+            }
+            return listed.panes;
+          },
         } });
         for (const item of result.stopped) process.stderr.write(`keep serve: stopped leftover ${leftovers.describe(item)}\n`);
         const failed = result.skipped.find((item) => item.pid == null);
         const mb = Math.round(result.stopped.reduce((sum, item) => sum + item.rssKb, 0) / 1024);
+        // Missing host or process evidence is a sweep that did not run, not a fault:
+        // host list timeouts under load are routine and must not open self-repair.
         health.record('leftovers', failed
-          ? { ok: false, error: failed.why }
+          ? (failed.evidence ? { ok: true, skipped: true, detail: failed.why } : { ok: false, error: failed.why })
           : { ok: true, detail: `${result.stopped.length} stopped${mb ? ` (${mb} MB)` : ''}, ${result.waiting.length} in grace` });
       } catch (error) {
         health.record('leftovers', { ok: false, error });

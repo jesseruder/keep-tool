@@ -6,19 +6,25 @@ const run = promisify(require('node:child_process').execFile);
 
 // A session that starts a dev server, a watcher or a test runner in the background and
 // then exits leaves that process running under launchd with nothing attached to it. Every
-// process a Keep pane starts inherits KEEP_PANE, so once the pane that started it is gone
-// the process tree has no owner left and can be stopped.
+// process a Keep pane starts inherits KEEP_PANE, so once the pane that started it is gone,
+// and no live pane carries on its session or card, the process tree has no owner left.
 //
-// Ownership is the only test. Age, CPU and memory never make a process a leftover, and
-// anything the evidence cannot speak for is left alone: a process without KEEP_PANE, one
-// whose pane (or session, after a restart into a new pane) is alive, one started with
-// KEEP_PERSIST=1, and the kinds of process a session legitimately hands off to the
-// machine: applications, system binaries, agents (bin/orphan-agents.js owns those) and
-// Keep's own detached workers, which have their own lifecycles.
+// The rule is deliberately narrow, because the cost of a wrong stop is someone's working
+// server. Age, CPU and memory never make a process a leftover. The tree's root must be a
+// dev tool (an interpreter, a package runner, a shell, a project's node_modules binary),
+// and nothing in the tree may be something a session hands off to the machine for
+// everyone: an application, a system binary, a shared helper server (adb, watchman, an
+// ssh master, a build daemon), an agent (bin/orphan-agents.js owns those), Keep itself,
+// or a process started with KEEP_PERSIST=1. Missing evidence stops the sweep.
 
 const DEFAULT_GRACE_MS = 15 * 60e3;
 const TERM_WAIT_MS = 5000;
-const AGENTS = new Set(['claude', 'codex', 'pi']);
+const DEV_ROOTS = /^(?:node|nodejs|npm|npx|yarn|pnpm|pnpx|bun|bunx|deno|tsx|ts-node|python[\d.]*|uv|uvx|ruby|bundle|rails|rake|go|cargo|make|sh|bash|zsh|dash|php)$/;
+const HELPERS = /^(?:adb|watchman|ssh|ssh-agent|gpg-agent|tmux|screen|limactl|colima|lima|qemu-system-\S+|docker|dockerd|containerd|redis-server|postgres|pg_ctl|mysqld|mongod|ollama|sccache|bazel|emulator|Xvfb|caffeinate)$/;
+const HELPER_ARGS = /\b(?:GradleDaemon|KotlinCompileDaemon|ControlMaster=(?:yes|auto)|start-server|fork-server)\b|\s-M(?:\s|$)/;
+const AGENT_ARGS = /@anthropic-ai\/claude-code|@openai\/codex|(?:^|\/)(?:claude|codex|pi)(?:\s|$)/;
+const SESSION_VARS = ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'KEEP_PI_SESSION_ID'];
+const NAMES = ['KEEP_PANE', 'KEEP_PERSIST', 'KEEP_DIR', ...SESSION_VARS];
 
 function parseRows(text) {
   return String(text).split('\n').flatMap((line) => {
@@ -28,84 +34,113 @@ function parseRows(text) {
 }
 
 async function processes() {
-  const { stdout } = await run('ps', ['-axo', 'pid=,ppid=,uid=,rss=,lstart=,args='], {
+  const { stdout } = await run('ps', ['-axww', '-o', 'pid=,ppid=,uid=,rss=,lstart=,args='], {
     encoding: 'utf8', timeout: 10000, maxBuffer: 64e6, env: { ...process.env, LC_ALL: 'C' },
   });
   const rows = parseRows(stdout);
-  if (!rows.length) throw Error('process state unavailable');
+  if (!rows.length) throw evidence('process state unavailable');
   return rows;
 }
 
-// The variables this sweep reads, per pid. Linux exposes the environment exactly; macOS
-// only through ps, which prints it after the arguments, so a variable is read as a
-// whole ` NAME=value` word there.
-const NAMES = ['KEEP_PANE', 'KEEP_PERSIST', 'CLAUDE_CODE_SESSION_ID'];
-async function environments(pids) {
+// The variables this sweep reads, for each row. Linux exposes a process's environment
+// exactly. macOS only prints it through ps, after the arguments, so the arguments the
+// first ps call saw are cut off the front before any variable is read: otherwise an
+// argument such as `sh -c "KEEP_PANE=x ..."` would stand in for the real environment.
+// A row whose line does not start with those arguments is left out, which protects it.
+function parseEnvironments(stdout, rows) {
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
   const result = new Map();
-  if (!pids.length) return result;
+  for (const line of String(stdout).split('\n')) {
+    const m = /^\s*(\d+) (.*)$/.exec(line);
+    const row = m && byPid.get(+m[1]);
+    if (!row || !m[2].startsWith(row.command)) continue;
+    const rest = m[2].slice(row.command.length);
+    const vars = {};
+    for (const name of NAMES) {
+      const found = new RegExp(` ${name}=([^ ]*)(?= |$)`).exec(rest);
+      if (found) vars[name] = found[1];
+    }
+    result.set(row.pid, vars);
+  }
+  return result;
+}
+
+async function environments(rows) {
+  const result = new Map();
+  if (!rows.length) return result;
   if (process.platform === 'linux') {
-    for (const pid of pids) {
+    for (const row of rows) {
       try {
         const vars = {};
-        for (const entry of fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0')) {
+        for (const entry of (await fs.promises.readFile(`/proc/${row.pid}/environ`, 'utf8')).split('\0')) {
           const at = entry.indexOf('=');
           if (at > 0 && NAMES.includes(entry.slice(0, at))) vars[entry.slice(0, at)] = entry.slice(at + 1);
         }
-        result.set(pid, vars);
+        result.set(row.pid, vars);
       } catch {}
     }
     return result;
   }
   let stdout = '';
   try {
-    ({ stdout } = await run('ps', ['-E', '-ww', '-o', 'pid=,command=', '-p', pids.join(',')], {
+    ({ stdout } = await run('ps', ['-E', '-ww', '-o', 'pid=,command=', '-p', rows.map((row) => row.pid).join(',')], {
       encoding: 'utf8', timeout: 10000, maxBuffer: 64e6, env: { ...process.env, LC_ALL: 'C' },
     }));
   } catch (error) {
     // ps exits 1 when one of the pids has gone; what it printed is still good.
     stdout = String(error.stdout || '');
   }
-  for (const line of stdout.split('\n')) {
-    const m = /^\s*(\d+)\s(.*)$/.exec(line);
-    if (!m) continue;
-    const vars = {};
-    for (const name of NAMES) {
-      const found = new RegExp(`(?:^| )${name}=([^ ]*)(?= |$)`).exec(m[2]);
-      if (found) vars[name] = found[1];
-    }
-    result.set(+m[1], vars);
-  }
-  return result;
+  return parseEnvironments(stdout, rows);
+}
+
+function evidence(message) {
+  const error = Error(message);
+  error.evidence = true;
+  return error;
 }
 
 async function panes() {
-  // The daemon node only: the process table read here is this machine's.
-  const client = await require('./hostclient').connect({ node: require('./nodes.js').daemonNode() });
+  // The process table read here is this machine's, so the only pane list it can be
+  // compared with is this machine's host. Anywhere but the daemon node, the CLI would
+  // be comparing local processes with another machine's panes.
+  const nodes = require('./nodes.js');
+  if (!nodes.isDaemonNode()) throw evidence(`this is node ${nodes.localNode()}, not the daemon node ${nodes.daemonNode()}`);
+  const client = await require('./hostclient').connect({ node: nodes.daemonNode() });
   try {
     const value = await client.request('list');
-    if (!Array.isArray(value.panes)) throw Error('host pane state unavailable');
+    if (!Array.isArray(value.panes)) throw evidence('host pane state unavailable');
     return value.panes;
   } finally { client.close(); }
 }
 
-function executable(command) {
-  return String(command).trim().split(/\s+/)[0] || '';
-}
+const words = (command) => String(command).trim().split(/\s+/);
+const exe = (command) => words(command)[0] || '';
 
-// Why a detached process is not this sweep's to stop, or null when nothing excludes it.
-function excluded(command, { keepRoot, extra } = {}) {
-  const exe = executable(command);
-  if (/\.app\/Contents\//.test(command) || /^\/(?:Applications|System|Library|usr\/libexec|usr\/sbin|sbin)\//.test(exe)) {
+// Why this process protects its tree, or null.
+function protects(row, vars, { keepRoot, extra } = {}) {
+  const command = row.command;
+  const file = exe(command);
+  const name = path.basename(file);
+  if (/\.app\/Contents\//.test(command) || /^\/(?:Applications|System|Library|usr\/libexec|usr\/sbin|sbin)\//.test(file)) {
     return 'application or system process';
   }
-  if (AGENTS.has(path.basename(exe))) return 'agent process';
-  // Keep's own detached workers: job runners, companions, brokers. Any checkout of this
-  // repository counts, since worktrees run their own copies while they are tested.
+  if (HELPERS.test(name) || HELPER_ARGS.test(command)) return 'shared helper';
+  if (AGENT_ARGS.test(words(command).slice(0, 2).join(' '))) return 'agent process';
+  // Keep's own detached workers: job runners, companions, brokers, a hand-started
+  // daemon. Any checkout of this repository counts, since worktrees run their own
+  // copies while they are tested, and so does the `keep` command on PATH.
   const here = path.dirname(__filename);
   if (command.includes(`${here}/`) || /\/keep-tool(?:\/[^/\s]+)?\/bin\//.test(command)
-      || (keepRoot && command.includes(`${keepRoot}/bin/`))) return 'Keep process';
+      || (keepRoot && command.includes(`${keepRoot}/bin/`))
+      || words(command).slice(0, 2).some((word) => path.basename(word) === 'keep')) return 'Keep process';
+  if (vars?.KEEP_PERSIST === '1') return 'KEEP_PERSIST=1';
   if (extra && extra.test(command)) return 'excluded by KEEP_LEFTOVER_EXCLUDE';
   return null;
+}
+
+function devRoot(command) {
+  const file = exe(command);
+  return DEV_ROOTS.test(path.basename(file)) || /\/node_modules\//.test(file);
 }
 
 function descendants(rows, pid) {
@@ -128,44 +163,61 @@ const identity = (row) => `${row.pid}|${row.started}|${row.command}`;
 const at = (value) => { const ms = Date.parse(value); return Number.isFinite(ms) ? ms : null; };
 
 // Every detached process tree a Keep pane left behind, with whether it may be stopped
-// now. `seen` (pid identity -> first time observed) lets a long-running caller hold a
-// process through the grace period when the host cannot say when its pane went away,
-// which is the case for a pane that was closed rather than one that exited.
+// now. A pane that exited says when; a closed pane has left the list and says nothing,
+// so it is only due once the caller's `seen` record (identity -> first sighting) has
+// watched it for the grace period. Without `seen` a closed pane's tree never comes due:
+// after a host crash, `keep restore` may be about to resume into exactly those sessions.
 async function snapshot(deps = {}) {
   const now = (deps.now || Date.now)();
   const graceMs = deps.graceMs ?? DEFAULT_GRACE_MS;
   const uid = deps.uid ?? process.getuid();
   const rows = await (deps.processes || processes)();
   const hosted = await (deps.panes || panes)();
-  if (!Array.isArray(rows) || !rows.length) throw Error('process state unavailable');
-  // An empty pane list is what an unreachable or restarting host looks like too; with no
-  // panes to compare against, every KEEP_PANE would read as gone.
-  if (!Array.isArray(hosted) || !hosted.length) throw Error('host pane state unavailable');
-  const byPane = new Map(hosted.map((pane) => [pane.id, pane]));
-  const liveSessions = new Set(hosted.filter((pane) => pane.alive && pane.meta?.sessionId).map((pane) => pane.meta.sessionId));
-  const roots = rows.filter((row) => row.ppid === 1 && row.uid === uid && row.pid !== process.pid
-    && !excluded(row.command, { keepRoot: deps.keepRoot, extra: deps.exclude }));
-  const env = await (deps.environments || environments)(roots.map((row) => row.pid));
+  if (!Array.isArray(rows) || !rows.length) throw evidence('process state unavailable');
+  // An empty pane list is what an unreachable or restarting host looks like too; with
+  // no panes to compare against, every KEEP_PANE would read as gone.
+  if (!Array.isArray(hosted) || !hosted.length) throw evidence('host pane state unavailable');
+  const local = hosted.filter((pane) => typeof pane?.id === 'string' && !pane.id.includes('@'));
+  const byPane = new Map(local.map((pane) => [pane.id, pane]));
+  const live = hosted.filter((pane) => pane?.alive);
+  const liveSessions = new Set(live.map((pane) => pane.meta?.sessionId).filter(Boolean));
+  const liveCards = new Set(live.map((pane) => pane.meta?.card).filter(Boolean));
+  const inFlight = deps.transferInFlight || ((sessionId) => {
+    try { return require('./account-handoff').transferInFlight(deps.keepRoot || require('./keep.js').ROOT, sessionId, now); }
+    catch { return { status: 'unknown' }; }
+  });
+  const roots = rows.filter((row) => row.ppid === 1 && row.uid === uid && row.pid !== process.pid && devRoot(row.command));
+  const trees = new Map(roots.map((row) => [row.pid, descendants(rows, row.pid)]));
+  const env = await (deps.environments || environments)([...roots, ...[...trees.values()].flat()]);
   const result = [];
   const current = new Set();
   for (const row of roots) {
     const vars = env.get(row.pid);
-    if (!vars?.KEEP_PANE || vars.KEEP_PERSIST === '1') continue;
+    if (!vars?.KEEP_PANE) continue;
+    if (deps.keepRoot && vars.KEEP_DIR && path.resolve(vars.KEEP_DIR) !== path.resolve(deps.keepRoot)) continue;
     const pane = byPane.get(vars.KEEP_PANE);
     if (pane?.alive) continue;
-    if (vars.CLAUDE_CODE_SESSION_ID && liveSessions.has(vars.CLAUDE_CODE_SESSION_ID)) continue;
+    const tree = trees.get(row.pid);
+    if ([row, ...tree].some((member) => protects(member, env.get(member.pid), { keepRoot: deps.keepRoot, extra: deps.exclude }))) continue;
+    // A session that carries on elsewhere keeps what it started: resumed or restarted
+    // into another pane (the same session id), moved or handed off (another live pane
+    // on the same card), or mid-transfer (its pane reads as exited on purpose).
+    const sessions = [...new Set([...SESSION_VARS.map((name) => vars[name]), pane?.meta?.sessionId].filter(Boolean))];
+    if (sessions.some((id) => liveSessions.has(id))) continue;
+    if (pane?.meta?.card && liveCards.has(pane.meta.card)) continue;
+    if (sessions.some((id) => inFlight(id))) continue;
     const key = identity(row);
     current.add(key);
     if (deps.seen && !deps.seen.has(key)) deps.seen.set(key, now);
     const since = [pane ? at(pane.exitedAt) : null, deps.seen ? deps.seen.get(key) : null].filter((v) => v != null);
-    const goneFor = since.length ? now - Math.max(...since) : Infinity;
-    const tree = descendants(rows, row.pid);
+    const goneFor = since.length ? now - Math.max(...since) : -Infinity;
     result.push({
       pid: row.pid, started: row.started, command: row.command,
-      pane: vars.KEEP_PANE, card: pane?.meta?.card || null, sessionId: vars.CLAUDE_CODE_SESSION_ID || pane?.meta?.sessionId || null,
+      pane: vars.KEEP_PANE, card: pane?.meta?.card || null, sessionId: sessions[0] || null,
       paneState: pane ? 'exited' : 'closed', exitedAt: pane?.exitedAt || null,
       rssKb: row.rssKb + tree.reduce((sum, child) => sum + child.rssKb, 0),
       tree: tree.map((child) => child.pid),
+      identities: [row, ...tree].map(identity),
       due: goneFor >= graceMs,
       reason: pane ? `pane ${vars.KEEP_PANE} exited` : `pane ${vars.KEEP_PANE} is closed`,
     });
@@ -176,41 +228,54 @@ async function snapshot(deps = {}) {
 
 async function list(deps = {}) {
   try { return { known: true, leftovers: await snapshot(deps) }; }
-  catch (error) { return { known: false, leftovers: [], reason: error.message }; }
+  catch (error) { return { known: false, leftovers: [], reason: error.message, evidence: error.evidence === true }; }
 }
 
-// Stop every due leftover tree: SIGTERM to the root and everything under it, then SIGKILL
-// whatever of the same processes is still there after a short wait. Each signal is sent
-// only to a pid whose start time and command still match what was inspected, so a reused
-// pid is never signalled.
+// Stop every due leftover tree. The whole picture is taken again just before any signal,
+// so a pane restarted in place or a session resumed since the first look protects its
+// tree. SIGTERM goes to each root before its children, so a supervisor does not respawn
+// what it loses; one wait covers every tree; then SIGKILL goes to whatever of the same
+// processes is still there. Every signal names a pid whose start time and command still
+// match what was inspected, so a reused pid is never signalled.
 async function reap({ dry = false, deps = {} } = {}) {
-  const found = await list(deps);
+  const first = await list(deps);
   const result = { stopped: [], skipped: [], waiting: [] };
-  if (!found.known) { result.skipped.push({ why: found.reason }); return result; }
+  if (!first.known) { result.skipped.push({ why: first.reason, evidence: first.evidence }); return result; }
+  result.waiting = first.leftovers.filter((item) => !item.due);
+  const due = first.leftovers.filter((item) => item.due);
+  if (!due.length) return result;
+  if (dry) { result.stopped = due; return result; }
+  const again = await list(deps);
+  if (!again.known) { result.skipped.push({ why: again.reason, evidence: again.evidence }); return result; }
   const kill = deps.kill || process.kill;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  for (const item of found.leftovers) {
-    if (!item.due) { result.waiting.push(item); continue; }
-    if (dry) { result.stopped.push(item); continue; }
+  const signalled = [];
+  for (const item of due) {
+    const still = again.leftovers.find((other) => other.due && other.pid === item.pid
+      && other.started === item.started && other.command === item.command);
+    if (!still) { result.skipped.push({ pid: item.pid, why: 'ownership or process changed before signal' }); continue; }
     let rows;
     try { rows = await (deps.processes || processes)(); } catch (error) { result.skipped.push({ pid: item.pid, why: error.message }); continue; }
-    const root = rows.find((row) => row.pid === item.pid);
-    if (!root || root.ppid !== 1 || root.started !== item.started || root.command !== item.command) {
+    const wanted = new Set(still.identities);
+    const targets = [rows.find((row) => row.pid === still.pid), ...descendants(rows, still.pid)]
+      .filter((row) => row && wanted.has(identity(row)));
+    if (!targets.length || targets[0].pid !== still.pid || targets[0].ppid !== 1) {
       result.skipped.push({ pid: item.pid, why: 'process changed before signal' }); continue;
     }
-    const targets = [root, ...descendants(rows, root.pid)];
-    for (const target of targets.slice().reverse()) {
+    for (const target of targets) {
       try { kill(target.pid, 'SIGTERM'); } catch {}
     }
-    await sleep(deps.termWaitMs ?? TERM_WAIT_MS);
-    let after = [];
-    try { after = await (deps.processes || processes)(); } catch {}
-    const wanted = new Set(targets.map(identity));
-    for (const row of after) {
-      if (!wanted.has(identity(row))) continue;
-      try { kill(row.pid, 'SIGKILL'); } catch {}
-    }
-    result.stopped.push(item);
+    signalled.push(...targets.map(identity));
+    result.stopped.push(still);
+  }
+  if (!signalled.length) return result;
+  await sleep(deps.termWaitMs ?? TERM_WAIT_MS);
+  let after = [];
+  try { after = await (deps.processes || processes)(); } catch {}
+  const wanted = new Set(signalled);
+  for (const row of after) {
+    if (!wanted.has(identity(row))) continue;
+    try { kill(row.pid, 'SIGKILL'); } catch {}
   }
   return result;
 }
@@ -221,4 +286,4 @@ function describe(item) {
   return `pid ${item.pid}${tree} (${mb} MB, ${item.reason}${item.card ? `, card ${item.card}` : ''}): ${item.command.slice(0, 160)}`;
 }
 
-module.exports = { DEFAULT_GRACE_MS, parseRows, environments, excluded, descendants, snapshot, list, reap, describe };
+module.exports = { DEFAULT_GRACE_MS, parseRows, parseEnvironments, environments, protects, devRoot, descendants, snapshot, list, reap, describe };

@@ -2802,14 +2802,20 @@ The reaper refreshes identity and safety evidence before SIGTERM. Use
 
 Everything else a session starts in the background — a dev server, a watcher, a
 test runner — is swept by the daemon every five minutes (`leftovers` in
-`keep health`). A process is a leftover when its parent is init/launchd, it
-belongs to the current user, it inherited `KEEP_PANE`, and that pane is exited
-or closed with no live pane carrying the same Claude session id. Once the pane
-has been gone for `KEEP_LEFTOVER_GRACE_MIN` (default 15), the process and its
-children get SIGTERM, then SIGKILL after five seconds, each signal checked
-against the pid's start time and command. Applications and system binaries,
-`claude`/`codex`/`pi`, Keep's own scripts, anything started with
-`KEEP_PERSIST=1`, and anything matching the `KEEP_LEFTOVER_EXCLUDE` regex are
-never touched. An empty or unreachable pane list stops the sweep. Stops are
-logged to serve.log; `KEEP_LEFTOVER_SWEEP=0` turns the sweep off, and
-`keep leftovers --reap --dry` shows what it would do.
+`keep health`). A process tree is a leftover when its root's parent is
+init/launchd, it belongs to the current user, the root is a dev tool (node, a
+package runner, python, ruby, go, make, a shell, or a `node_modules` binary), it
+inherited `KEEP_PANE`, and that pane is exited or closed. It is kept while any
+live pane runs the same session (Claude, Codex or Pi id) or the same card, while
+an account transfer for it is in flight, and for `KEEP_LEFTOVER_GRACE_MIN`
+(default 15) after the pane went away; a closed pane's grace is counted from the
+sweep's first sighting, so a one-off `keep leftovers --reap` never stops it.
+The whole tree is spared if any member is an application or system binary, a
+shared helper (adb, watchman, an ssh master, tmux, a Gradle or Kotlin daemon,
+database servers), an agent, a Keep process, started with `KEEP_PERSIST=1`, or
+matched by the `KEEP_LEFTOVER_EXCLUDE` regex. A due tree gets SIGTERM root first,
+then SIGKILL after five seconds, each signal checked against the pid's start time
+and command, and only after a second look confirms nothing changed. The sweep
+only runs on the daemon node, against its own host's panes; an unreachable host
+skips it. Stops are logged to serve.log; `KEEP_LEFTOVER_SWEEP=0` turns the sweep
+off, and `keep leftovers --reap --dry` shows what it would do.

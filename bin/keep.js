@@ -2469,8 +2469,9 @@ commands.leftovers = async (argv) => {
   if (o._.length || (o.dry && !o.reap)) die('usage: keep leftovers [--json] [--reap] [--dry]');
   if (o.reap && isReviewerSession()) die('the fleet reviewer may list leftover processes but may not stop them');
   const leftovers = require('./leftover-processes.js');
-  // Asked for by hand, a leftover is stopped once its pane has been gone for the
-  // grace period; a closed pane has no exit time, so it counts as gone already.
+  // Asked for by hand, a leftover is stopped once its pane has been gone for the grace
+  // period. A closed pane has no exit time and this run has not watched it, so its
+  // tree stays in grace; the daemon's sweep, which has, handles it.
   const deps = { keepRoot: ROOT, graceMs: Number(process.env.KEEP_LEFTOVER_GRACE_MIN || 15) * 60e3 };
   if (o.reap) {
     const result = await leftovers.reap({ dry: o.dry, deps });
