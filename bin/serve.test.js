@@ -10793,6 +10793,30 @@ test('dashboard Claude resolver reuses one indexed snapshot and preserves accoun
   assert.equal(rowReads, 1);
 });
 
+test('the dashboard resolver reads no transcript for a session that runs on another node', () => {
+  const rows = [
+    { id: 'local', accountId: 'a', file: '/a/one/local.jsonl', stat: { size: 1, mtimeMs: 1 } },
+    { id: 'remote', accountId: 'a', file: '/a/one/remote.jsonl', stat: { size: 2, mtimeMs: 2 } },
+  ];
+  const input = {
+    rows,
+    accountIds: ['a'],
+    authority: {
+      local: { agent: 'claude', accountId: 'a', node: 'main' },
+      remote: { agent: 'claude', accountId: 'a', node: 'laptop' },
+    },
+    sessionForEntry: (id, file, stat, accountId) => ({ id, file, stat, accountId }),
+  };
+  const resolve = createDashboardClaudeSessionResolver(input);
+  assert.equal(resolve('local').file, '/a/one/local.jsonl');
+  assert.equal(resolve('remote'), null, 'a file that shares the id is not that session transcript');
+
+  // The same rows read from the laptop's own daemon answer the other way round.
+  const fromLaptop = createDashboardClaudeSessionResolver({ ...input, env: { KEEP_DAEMON_NODE: 'laptop' } });
+  assert.equal(fromLaptop('remote').file, '/a/one/remote.jsonl');
+  assert.equal(fromLaptop('local'), null);
+});
+
 test('a host-only row shows the name and mark Owner put on that session', () => {
   const sessionNames = require('./session-names.js');
   const sessionMarks = require('./session-marks.js');
@@ -13145,4 +13169,33 @@ test('an other-session transcript too long to verify skips the settings write', 
     else process.env.KEEP_COMPACT_SWAP_CHOICE_SCAN_BYTES = prior;
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a session that runs on another node cannot be opened from this daemon node', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-node-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const configDir = path.join(root, 'claude');
+  fs.mkdirSync(configDir);
+  const config = path.join(root, 'accounts.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'node-open', label: 'Node open', agent: 'claude', configDir },
+  ], defaultAccounts: { claude: 'node-open' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+  const session = { id: 'far-session', kind: 'claude', project: root, accountId: 'node-open' };
+  const accountStore = require('./accounts');
+  accountStore.pinSession(session.id, 'claude', 'node-open', { root, env, node: 'laptop' });
+  const deps = { root, env, scanSessions: () => [session], resolveSessionTarget: async () => ({ pane: 'pane-1' }) };
+
+  await assert.rejects(openSession({ sessionId: session.id }, deps), (error) => error.status === 409
+    && /runs on node laptop; this daemon node cannot open it here/.test(error.message));
+  const authorityFile = path.join(root, '.keep', 'session-accounts', 'far-session.json');
+  const bytes = fs.readFileSync(authorityFile, 'utf8');
+
+  // The refusal is what keeps the record honest: nothing pinned it back to this node.
+  assert.equal(JSON.parse(bytes).node, 'laptop');
+  accountStore.pinSession(session.id, 'claude', 'node-open', { root, env, node: 'main', transferNode: true });
+  const opened = await openSession({ sessionId: session.id }, deps);
+  assert.equal(opened.pane, 'pane-1');
+  assert.equal(JSON.parse(fs.readFileSync(authorityFile, 'utf8')).node, 'main',
+    'an ordinary reopen leaves the node it found');
 });

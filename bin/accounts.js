@@ -246,8 +246,15 @@ function pinSession(sessionId, agent, accountId, options = {}) {
   if (current && current.accountId !== accountId && !options.transfer) {
     throw new Error(`session ${sessionNamed(sessionId)} is already pinned to account ${current.accountId}`);
   }
-  const node = options.node === undefined ? nodes.daemonNode(env) : options.node;
+  // Re-pinning is an account decision, never a move between machines: an omitted
+  // node keeps the one the record already names, and a different one is refused
+  // outright. Moving a session to another node is its own operation, and nothing
+  // asks for it yet.
+  const node = options.node === undefined ? (current ? current.node : nodes.daemonNode(env)) : options.node;
   if (typeof node !== 'string' || !nodes.NODE_NAME_RE.test(node)) throw new Error(`invalid node name: ${node}`);
+  if (current && current.node !== node && options.transferNode !== true) {
+    throw new Error(`session ${sessionNamed(sessionId)} runs on node ${current.node}; move it with a node transfer`);
+  }
   const value = { version: 1, sessionId, agent, accountId, node, updatedAt: Date.now(), ...(options.transactionId ? { transactionId: options.transactionId } : {}) };
   writeRecord(root, value);
   return value;

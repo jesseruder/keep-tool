@@ -2,6 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const accounts = require('./accounts');
 const { findSessionFile } = require('./transcripts');
 
@@ -73,4 +76,28 @@ test('single-pass transcript lookup preserves authority and ambiguity semantics'
     });
     assert.throws(() => findSessionFile('session'), /multiple accounts without authority/);
   });
+});
+
+test('a session recorded on another node is refused even when its account is gone', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-transcript-node-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, '.keep', 'session-accounts', 'remote-session.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ version: 1, sessionId: 'remote-session', agent: 'claude',
+    accountId: 'removed-account', node: 'laptop', updatedAt: 1 }, null, 2) + '\n');
+  // The account the record names no longer exists, so resolution throws — the very
+  // path that used to fall back to whatever local file shared the id.
+  const stubs = withDiscoveryStubs(t, {
+    authorityError: new Error('session remote-session is pinned to unavailable account removed-account'),
+    matches: [{ accountId: 'a', file: '/a/one/remote-session.jsonl' }],
+  });
+  assert.throws(() => findSessionFile('remote-session', { root }),
+    /session remote-session runs on node laptop; its transcript is not mirrored here/);
+  assert.deepEqual(stubs.calls(), { authorityCalls: 0, discoveryCalls: 0 },
+    'the node is read from the record, before any account resolution or discovery');
+
+  // A record on this node still resolves exactly as before.
+  fs.writeFileSync(file, JSON.stringify({ version: 1, sessionId: 'remote-session', agent: 'claude',
+    accountId: 'a', node: 'main', updatedAt: 1 }, null, 2) + '\n');
+  assert.equal(findSessionFile('remote-session', { root }), '/a/one/remote-session.jsonl');
 });

@@ -8025,6 +8025,14 @@ async function openSession(body, deps = {}) {
   let accountWarning = '';
   let reopenTurn = null;
   if (session) {
+    // Which machine the session runs on is settled before anything is pinned or
+    // resolved: this daemon can only open what runs on its own node.
+    let runsOn = null;
+    try { runsOn = accounts.sessionNode(session.id, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
+    catch (error) { throw new InjectionError(409, error.message); }
+    if (runsOn && runsOn !== nodes.daemonNode(deps.env || process.env)) {
+      throw new InjectionError(409, `session ${sessionRef(session.id)} runs on node ${runsOn}; this daemon node cannot open it here`);
+    }
     try { account = accounts.forSession(session.id, agent, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
     catch (error) { throw new InjectionError(409, error.message); }
     if (!account && session.accountId) {
@@ -8037,9 +8045,11 @@ async function openSession(body, deps = {}) {
     if (body.accountId != null && body.accountId !== account.id) {
       throw new InjectionError(409, `session ${sessionRef(session.id)} is pinned to account ${account.id}; use handoff to transfer it`);
     }
+    // No node here: the session was refused above unless it runs on this node, and
+    // a re-pin must never be what moves one.
     if (account.managed) {
       accounts.pinSession(session.id, agent, account.id,
-        { root: deps.root || keep.ROOT, env: deps.env || process.env, node: nodes.daemonNode(deps.env || process.env) });
+        { root: deps.root || keep.ROOT, env: deps.env || process.env });
     }
   } else {
     const env = deps.env || process.env;
@@ -8898,6 +8908,7 @@ function claudeSessionFor(sessionId) {
 function createDashboardClaudeSessionResolver(deps = {}) {
   const rows = deps.rows || claudeTranscriptIndex.scan();
   const authority = deps.authority || accounts.authority(deps.root || keep.ROOT);
+  const daemonNode = nodes.daemonNode(deps.env || process.env);
   const configuredAccounts = new Set(deps.accountIds || claudeProjectRoots.map((entry) => entry.accountId));
   const byId = new Map();
   for (const row of rows) {
@@ -8910,6 +8921,10 @@ function createDashboardClaudeSessionResolver(deps = {}) {
     const id = String(sessionId || '');
     const matches = byId.get(id) || [];
     const record = authority[id];
+    // A session that runs on another node has no transcript on this machine. The
+    // dashboard treats it as absent rather than reading whatever local file shares
+    // its id, which is the same answer findSessionFile gives.
+    if (record && record.node && record.node !== daemonNode) return null;
     let pinnedId = null;
     let accountId = null;
     let authorityFailed = false;

@@ -44,6 +44,17 @@ function findSessionFile(id, options = {}) {
   const accounts = require('./accounts');
   const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
   const env = options.env || process.env;
+  // Which machine the session runs on is read from the record itself, before any
+  // account is resolved: a session on another node is not readable here even when
+  // the account it was pinned to has since been removed. An unreadable record is
+  // left to the legacy fallback below, exactly as an unresolvable account is.
+  let recordedNode = null;
+  try { recordedNode = accounts.sessionNode(id, { root, env }); } catch {}
+  if (recordedNode && recordedNode !== nodes.daemonNode(env)) {
+    // Nothing mirrors another node's transcripts here, so reading a local file for
+    // that session would answer with the wrong machine's history.
+    throw new Error(`session ${id} runs on node ${recordedNode}; its transcript is not mirrored here`);
+  }
   let pinned = null;
   let authorityFailed = false;
   try {
@@ -55,11 +66,6 @@ function findSessionFile(id, options = {}) {
     // Preserve the legacy fallback for invalid or unavailable authority: a sole
     // file can still be read, but multiple files remain ambiguous.
     authorityFailed = true;
-  }
-  if (pinned && pinned.node && pinned.node !== nodes.daemonNode(env)) {
-    // Nothing mirrors another node's transcripts here, so reading a local file for
-    // that session would answer with the wrong machine's history.
-    throw new Error(`session ${id} runs on node ${pinned.node}; its transcript is not mirrored here`);
   }
   const matches = accounts.locateClaudeFiles(id, env);
   if (!pinned && !authorityFailed) {

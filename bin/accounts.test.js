@@ -206,3 +206,54 @@ test('authority written before Keep named its machines reads back as the daemon 
     assert.throws(() => accounts.sessionNode(sid, { root, env: f.env }), /invalid session node/);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
+
+test('re-pinning a session changes its account, never the machine it runs on', () => {
+  const f = fixture(), sid = 'pinned-elsewhere';
+  const root = f.env.KEEP_DIR;
+  const file = path.join(root, '.keep', 'session-accounts', `${sid}.json`);
+  try {
+    accounts.pinSession(sid, 'claude', 'a', { root, env: f.env, node: 'laptop' });
+
+    // An omitted node keeps the record's own, whatever this daemon node is called.
+    assert.equal(accounts.pinSession(sid, 'claude', 'a', { root, env: f.env }).node, 'laptop');
+    assert.equal(accounts.sessionNode(sid, { root, env: f.env }), 'laptop');
+
+    // Naming the same node is fine; naming another one is a move, and a re-pin is
+    // never how a session moves.
+    assert.equal(accounts.pinSession(sid, 'claude', 'a', { root, env: f.env, node: 'laptop' }).node, 'laptop');
+    assert.throws(() => accounts.pinSession(sid, 'claude', 'a', { root, env: f.env, node: 'main' }),
+      /runs on node laptop; move it with a node transfer/);
+    assert.equal(accounts.sessionNode(sid, { root, env: f.env }), 'laptop');
+
+    // An account transfer moves the account and leaves the node alone.
+    assert.equal(accounts.pinSession(sid, 'claude', 'b', { root, env: f.env, transfer: true }).node, 'laptop');
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).accountId, 'b');
+    assert.equal(accounts.sessionNode(sid, { root, env: f.env }), 'laptop');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('a record written before Keep named its machines is re-pinned without being moved', () => {
+  const f = fixture(), sid = 'legacy-pin';
+  const root = f.env.KEEP_DIR;
+  const file = path.join(root, '.keep', 'session-accounts', `${sid}.json`);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const legacy = JSON.stringify({ version: 1, sessionId: sid, agent: 'claude', accountId: 'a', updatedAt: 1 }, null, 2) + '\n';
+    fs.writeFileSync(file, legacy);
+
+    // Settled authority is validated on a retry, not rewritten: the backfilled node
+    // never costs the record its bytes.
+    assert.equal(accounts.forSession(sid, 'claude', { root, env: f.env }).node, 'main');
+    assert.equal(fs.readFileSync(file, 'utf8'), legacy);
+
+    // A re-pin of it is still a re-pin of a daemon-node session.
+    assert.equal(accounts.pinSession(sid, 'claude', 'a', { root, env: f.env }).node, 'main');
+    assert.throws(() => accounts.pinSession(sid, 'claude', 'a', { root, env: f.env, node: 'laptop' }),
+      /runs on node main; move it with a node transfer/);
+
+    const remoteDaemon = { ...f.env, KEEP_DAEMON_NODE: 'mini' };
+    fs.writeFileSync(file, legacy);
+    assert.equal(accounts.pinSession(sid, 'claude', 'a', { root, env: remoteDaemon }).node, 'mini',
+      'a legacy record belongs to whichever node runs the daemon');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
