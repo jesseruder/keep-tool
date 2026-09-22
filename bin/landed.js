@@ -270,8 +270,14 @@ const deps = {
 // resolves commit dependencies on every state build, and without this each one
 // was two git processes. A path that is not a repository can become one (a card
 // filed before its repo is cloned), so that answer is re-checked every five
-// minutes instead of lasting until a restart. A short-lived CLI or
-// `keep landed` child asks once and exits.
+// minutes instead of lasting until a restart. So is a path whose .git is a
+// file and that resolved to itself: that is a linked worktree whose main
+// checkout lookup failed (a git process that did not start under load, a
+// lookup during `git worktree add`), and remembering the worktree as the repo
+// would miss the fetch state keyed on the main checkout until a restart. A
+// submodule looks the same and is re-checked every five minutes for nothing,
+// which costs one lookup. A short-lived CLI or `keep landed` child asks once
+// and exits.
 const REPO_MEMO_LIMIT = 512;
 const REPO_NULL_TTL_MS = 5 * 60e3;
 const repoMemo = new Map();
@@ -282,14 +288,18 @@ function repoFor(task) {
   const expanded = String(project).replace(/^~(?=\/|$)/, os.homedir());
   const candidate = path.resolve(expanded);
   const hit = repoMemo.get(candidate);
-  if (hit && (hit.repo != null || deps.now() - hit.at < REPO_NULL_TTL_MS)) return hit.repo;
+  if (hit && (!hit.provisional || deps.now() - hit.at < REPO_NULL_TTL_MS)) return hit.repo;
   let repo = null;
+  let provisional = true;
   try {
     const main = (hit ? deps.freshCanonicalCwd(candidate) : deps.canonicalCwd(candidate)) || candidate;
     const stat = fs.statSync(path.join(main, '.git'));
-    if (stat.isDirectory() || stat.isFile()) repo = main;
+    if (stat.isDirectory() || stat.isFile()) {
+      repo = main;
+      provisional = main === candidate && !stat.isDirectory();
+    }
   } catch {}
-  remember(repoMemo, candidate, { repo, at: deps.now() }, REPO_MEMO_LIMIT);
+  remember(repoMemo, candidate, { repo, provisional, at: deps.now() }, REPO_MEMO_LIMIT);
   return repo;
 }
 
@@ -342,9 +352,9 @@ function defaultBranch(repo) {
   const stamp = refStamp(repo, refs);
   const key = stamp == null ? null : `${fetchGeneration(repo)}#${stamp}`;
   const hit = key != null && branchMemo.get(repo);
-  if (hit && hit.key === key && Date.now() - hit.at < DEFAULT_BRANCH_TTL_MS) return hit.branch;
+  if (hit && hit.key === key && deps.now() - hit.at < DEFAULT_BRANCH_TTL_MS) return hit.branch;
   const branch = readDefaultBranch(repo);
-  if (key != null) remember(branchMemo, repo, { key, at: Date.now(), branch }, BRANCH_MEMO_LIMIT);
+  if (key != null) remember(branchMemo, repo, { key, at: deps.now(), branch }, BRANCH_MEMO_LIMIT);
   return branch;
 }
 
@@ -1271,8 +1281,9 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
   return { checked, landed, decisions, fetchFailures };
 }
 
+// Runs on every daemon state build and only reads, so it takes the shared copy.
 function dashboardState() {
-  const state = loadState();
+  const state = cachedState();
   const config = loadConfig();
   const result = {
     lastSweepAt: Number.isFinite(Number(state.lastSweepAt)) ? Number(state.lastSweepAt) : null,

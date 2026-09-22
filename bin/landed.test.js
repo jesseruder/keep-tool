@@ -2001,6 +2001,22 @@ test('defaultBranch is remembered until fetchedAt or origin HEAD changes', (t) =
   runGit(['-C', repo, 'update-ref', 'refs/remotes/origin/trunk', 'HEAD'], { env });
   runGit(['-C', repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/trunk'], { env });
   assert.equal(landed.defaultBranch(repo), 'trunk');
+
+  // A repository the sweep never fetches: nothing in the key moves, so only the
+  // ten-minute TTL makes the branch be read again.
+  let now = 1_000_000;
+  landed.deps.now = () => now;
+  landed.resetCaches();
+  const before = calls.git;
+  assert.equal(landed.defaultBranch(repo), 'trunk');
+  const read = calls.git;
+  assert.ok(read > before);
+  now += 10 * 60e3 - 1;
+  assert.equal(landed.defaultBranch(repo), 'trunk');
+  assert.equal(calls.git, read, 'held inside the TTL');
+  now += 1;
+  assert.equal(landed.defaultBranch(repo), 'trunk');
+  assert.ok(calls.git > read, 'read again once the TTL has passed');
 });
 
 test('loadState serves a parsed copy until the state file is rewritten', (t) => {
@@ -2053,4 +2069,34 @@ test('repoFor re-checks a non-repository after five minutes and keeps a reposito
   now += 24 * 3600e3;
   assert.equal(landed.repoFor(task), later);
   assert.equal(calls.canonical + fresh, 2, 'a repository answer does not expire');
+});
+
+test('repoFor re-checks a linked worktree whose main checkout lookup failed', (t) => {
+  const landed = require('./landed.js');
+  countingDeps(t);
+  let now = 1_000_000;
+  landed.deps.now = () => now;
+  let failures = 1;
+  const canonicalCwd = landed.deps.canonicalCwd;
+  landed.deps.canonicalCwd = (dir) => (failures-- > 0 ? null : canonicalCwd(dir));
+  const { temp, repo, env } = landedFixture('keep-landed-repo-linked-fail-');
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const linked = path.join(temp, 'linked');
+  runGit(['-C', repo, 'worktree', 'add', '-q', '-b', 'side', linked], { env });
+  const task = { fm: { project: linked } };
+
+  assert.equal(landed.repoFor(task), linked, 'a failed lookup falls back to the worktree path');
+  now += 5 * 60e3 - 1;
+  assert.equal(landed.repoFor(task), linked, 'held inside the TTL');
+  now += 1;
+  assert.equal(fs.realpathSync(landed.repoFor(task)), fs.realpathSync(repo), 'the re-check finds the main checkout');
+});
+
+test('dashboardState reads the shared state without changing it', (t) => {
+  const landed = require('./landed.js');
+  countingDeps(t);
+  writeLandedState({ fetchedAt: {}, fetchStatus: {}, lastSweepAt: 1234 });
+  const before = JSON.stringify(landed.loadState());
+  assert.equal(landed.dashboardState().lastSweepAt, 1234);
+  assert.equal(JSON.stringify(landed.loadState()), before);
 });
