@@ -1929,3 +1929,220 @@ test('a host boots from an explicit socket alone, with no configuration and no r
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// --- node agent transport -------------------------------------------------
+
+function nodeTokenFile(root, token = 'a'.repeat(64)) {
+  const file = path.join(root, 'node.token');
+  fs.writeFileSync(file, `${token}\n`, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+  return { file, token };
+}
+
+// A raw framed client: step 1 is about what the host accepts before any client
+// exists, so these tests speak the wire rather than going through hostclient.
+function rawClient(port, address = '127.0.0.1') {
+  const socket = net.createConnection({ host: address, port });
+  const received = [];
+  const waiters = [];
+  let closed = false;
+  const deliver = (frame) => {
+    const waiter = waiters.shift();
+    if (waiter) waiter(frame);
+    else received.push(frame);
+  };
+  const decoder = new FrameDecoder(deliver, () => {});
+  socket.on('data', (chunk) => decoder.push(chunk));
+  socket.on('error', () => {});
+  socket.on('close', () => {
+    closed = true;
+    while (waiters.length) waiters.shift()(null);
+  });
+  return {
+    socket,
+    get closed() { return closed; },
+    ready: new Promise((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('error', reject);
+    }),
+    send(frame) { socket.write(encodeFrame(frame)); },
+    next() {
+      if (received.length) return Promise.resolve(received.shift());
+      if (closed) return Promise.resolve(null);
+      return new Promise((resolve) => waiters.push(resolve));
+    },
+    close() { socket.destroy(); },
+  };
+}
+
+async function withNodeHost(options, body) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-node-test-'));
+  const sock = path.join(root, 'host.sock');
+  const { file, token } = nodeTokenFile(root);
+  const host = createHost({
+    sock, log: null, listen: '127.0.0.1:0', tokenFile: file,
+    env: { ...process.env, KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main' },
+    ...options,
+  });
+  try {
+    await host.listen();
+    return await body({ host, sock, root, token, tokenFile: file });
+  } finally {
+    await host.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test('the node transport answers a hello that carries the token with a node descriptor', async () => {
+  await withNodeHost({}, async ({ host, token }) => {
+    assert.match(host.listenAddress, /^127\.0\.0\.1:\d+$/);
+    const client = rawClient(Number(host.listenAddress.split(':')[1]));
+    try {
+      await client.ready;
+      client.send({ type: 'hello', token, id: '1' });
+      const hello = await client.next();
+      assert.equal(hello.ok, true);
+      assert.equal(hello.id, '1');
+      assert.equal(hello.protocol, 1);
+      assert.equal(hello.node, 'aws1');
+      assert.equal(hello.platform, process.platform);
+      assert.equal(hello.home, os.homedir());
+      assert.equal(hello.execPath, process.execPath);
+      assert.equal(hello.hostname, os.hostname());
+      assert.match(hello.bootId, /^[0-9a-f]{32}$/);
+      assert.equal(hello.listen, host.listenAddress);
+      assert.equal(hello.tokenFile, host.tokenFile);
+      // Every field the unix callers already read is still there.
+      assert.equal(hello.version, 1);
+      assert.equal(hello.replaceExited, true);
+      assert.equal(hello.guardedInputReceipts, true);
+      assert.equal(hello.pid, process.pid);
+      client.send({ type: 'list', id: '2' });
+      assert.deepEqual((await client.next()).panes, []);
+    } finally { client.close(); }
+  });
+});
+
+test('the node transport refuses a bad token, a missing hello, and a request before hello', async () => {
+  await withNodeHost({}, async ({ host, token }) => {
+    const port = Number(host.listenAddress.split(':')[1]);
+    for (const first of [
+      { type: 'hello', token: `${token.slice(0, -1)}b`, id: 'wrong' },
+      { type: 'hello', id: 'none' },
+      { type: 'list', id: 'early' },
+    ]) {
+      const client = rawClient(port);
+      try {
+        await client.ready;
+        client.send(first);
+        const reply = await client.next();
+        assert.deepEqual(reply, { ok: false, id: first.id, error: 'hello required' }, JSON.stringify(first));
+        await waitFor(() => client.closed, `the host to drop ${first.id}`);
+      } finally { client.close(); }
+    }
+    // A refusal is not a lockout: the right token still connects afterwards.
+    const good = rawClient(port);
+    try {
+      await good.ready;
+      good.send({ type: 'hello', token, id: 'ok' });
+      assert.equal((await good.next()).ok, true);
+    } finally { good.close(); }
+  });
+});
+
+test('the unix socket needs no token and reports the same node descriptor', async () => {
+  await withNodeHost({}, async ({ sock, host }) => {
+    const client = await connect({ sock });
+    try {
+      const hello = await client.request('hello');
+      assert.equal(hello.node, 'aws1');
+      assert.equal(hello.protocol, 1);
+      assert.equal(hello.bootId, host.bootId);
+      assert.equal(hello.listen, host.listenAddress);
+    } finally { client.close(); }
+  });
+});
+
+test('a host without the node transport reports a descriptor but no listener', async () => {
+  await withHost({}, async ({ client, host }) => {
+    const hello = await client.request('hello');
+    assert.equal(hello.protocol, 1);
+    assert.match(hello.bootId, /^[0-9a-f]{32}$/);
+    assert.equal('listen' in hello, false);
+    assert.equal('tokenFile' in hello, false);
+    assert.equal('listenError' in hello, false);
+    assert.equal(host.listenAddress, null);
+  });
+});
+
+test('a node token that is not 0600 or that is missing keeps the unix socket serving', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-token-test-'));
+  const sock = path.join(root, 'host.sock');
+  const loose = path.join(root, 'loose.token');
+  fs.writeFileSync(loose, 'secret\n', { mode: 0o644 });
+  fs.chmodSync(loose, 0o644);
+  for (const [tokenFile, pattern] of [[loose, /must be mode 0600/], [path.join(root, 'absent.token'), /ENOENT/]]) {
+    const host = createHost({ sock, log: null, listen: '127.0.0.1:0', tokenFile });
+    let client;
+    try {
+      await host.listen();
+      assert.equal(host.listenAddress, null);
+      assert.match(host.listenError.message, pattern);
+      client = await connect({ sock });
+      const hello = await client.request('hello');
+      assert.equal(hello.version, 1);
+      assert.match(hello.listenError, pattern);
+    } finally {
+      if (client) client.close();
+      await host.close();
+    }
+  }
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('a wildcard bind is refused unless the override says otherwise', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-wildcard-test-'));
+  const { file } = nodeTokenFile(root);
+  const refused = createHost({ sock: path.join(root, 'a.sock'), log: null, listen: '0.0.0.0:0', tokenFile: file });
+  try {
+    await refused.listen();
+    assert.equal(refused.listenAddress, null);
+    assert.match(refused.listenError.message, /refusing to bind 0\.0\.0\.0/);
+  } finally { await refused.close(); }
+  const allowed = createHost({
+    sock: path.join(root, 'b.sock'), log: null, listen: '0.0.0.0:0', tokenFile: file, listenAny: true,
+  });
+  try {
+    await allowed.listen();
+    assert.equal(allowed.listenError, null);
+    assert.match(allowed.listenAddress, /^0\.0\.0\.0:\d+$/);
+  } finally { await allowed.close(); }
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('bootId survives a core reload and differs between host processes', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-bootid-test-'));
+  const sock = path.join(root, 'host.sock');
+  const other = createHost({ sock: path.join(root, 'other.sock'), log: null });
+  const boot = createBootstrap({ sock, log: null });
+  let client;
+  try {
+    await other.listen();
+    await boot.start();
+    client = await connect({ sock });
+    const before = (await client.request('hello')).bootId;
+    assert.match(before, /^[0-9a-f]{32}$/);
+    assert.notEqual(before, other.bootId, 'a second host process mints its own boot id');
+    assert.deepEqual(await boot.reload(), { panesAdopted: 0, fallback: false });
+    client.close();
+    client = await connect({ sock });
+    const after = await client.request('hello');
+    assert.equal(after.reloads, 1);
+    assert.equal(after.bootId, before, 'a core reload keeps the process boot id');
+  } finally {
+    if (client) client.close();
+    await boot.close();
+    await other.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

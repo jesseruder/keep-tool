@@ -223,12 +223,22 @@ commands.host = async (argv, deps = {}) => {
         sock: hello.sock || client.sock,
         reloads: hello.reloads || 0,
         lastReload: hello.lastReload || null,
+        // Only a host with the node transport configured reports these, so a
+        // single-node install's status line and JSON stay exactly as they were.
+        ...(hello.listen ? { listen: hello.listen } : {}),
+        ...(hello.tokenFile ? { tokenFile: hello.tokenFile } : {}),
+        ...(hello.listenError ? { listenError: hello.listenError } : {}),
       };
       if (o.json) console.log(JSON.stringify(status));
       else {
         const last = status.lastReload
           ? `, last reload ${status.lastReload.fallback ? 'fell back' : 'succeeded'} at ${status.lastReload.at}` : '';
-        console.log(`host pid ${status.pid}, ${status.alive} alive / ${status.exited} exited, socket ${status.sock}, boot v${status.bootVersion || '?'}, ${status.reloads} reloads${last}`);
+        const node = [
+          status.listen ? `, node transport ${status.listen}` : '',
+          status.listenError ? `, node transport failed: ${status.listenError}` : '',
+          status.tokenFile ? `, node token ${status.tokenFile}` : '',
+        ].join('');
+        console.log(`host pid ${status.pid}, ${status.alive} alive / ${status.exited} exited, socket ${status.sock}, boot v${status.bootVersion || '?'}, ${status.reloads} reloads${last}${node}`);
       }
     } else if (subcommand === 'reload') {
       if (rest.length) die('usage: keep host reload');

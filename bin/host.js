@@ -11,6 +11,8 @@ const pty = require('node-pty');
 const { Terminal } = require('@xterm/headless');
 const { SerializeAddon } = require('@xterm/addon-serialize');
 
+const { localNode } = require('./nodes.js');
+
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const DEFAULT_BUFFER_BYTES = 4 * 1024 * 1024;
 const DEFAULT_CLIENT_BUFFER_BYTES = 16 * 1024 * 1024;
@@ -24,6 +26,13 @@ const PANE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const INPUT_OPERATION_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 const INPUT_RECEIPT_LIMIT = 256;
 const HOST_LOG_MAX_BYTES = 5 * 1024 * 1024;
+// The wire contract a remote node agent speaks. The unix socket answers the same
+// frames, so this is not a second protocol: it is the number a caller checks before
+// it trusts a descriptor it reached over the network.
+const PROTOCOL_VERSION = 1;
+const HELLO_FAILURE_LIMIT = 10;
+const HELLO_FAILURE_WINDOW_MS = 60e3;
+const HELLO_FAILURE_ADDRESSES = 256;
 
 function hostLogFile(env = process.env) {
   return path.join(env.KEEP_DIR || path.join(os.homedir(), 'keep'), '.keep', 'host.log');
@@ -354,6 +363,42 @@ function connectProbe(sock) {
   });
 }
 
+// `<ip>:<port>`, with a bracketed literal for IPv6. The design binds one
+// interface — the node's Tailscale address — so the form is deliberately narrow.
+function parseListenAddress(value) {
+  const text = String(value || '').trim();
+  const match = /^\[([^\]]+)\]:(\d+)$/.exec(text) || /^([^:]+):(\d+)$/.exec(text);
+  if (!match) throw new Error(`a node listen address must be <ip>:<port>: ${text}`);
+  const port = Number(match[2]);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`invalid node listen port: ${text}`);
+  return { address: match[1], port };
+}
+
+function wildcardAddress(address) {
+  return ['0.0.0.0', '::', '*'].includes(String(address));
+}
+
+function formatListenAddress(bound) {
+  if (!bound || typeof bound !== 'object') return null;
+  return String(bound.address).includes(':') ? `[${bound.address}]:${bound.port}` : `${bound.address}:${bound.port}`;
+}
+
+// The token is the only thing between the network and every pane on this machine,
+// so a file another account can read is refused rather than quietly trusted.
+function readNodeToken(file, io = fs) {
+  const stat = io.statSync(file);
+  const mode = stat.mode & 0o777;
+  if (mode !== 0o600) {
+    throw new Error(`node token ${file} must be mode 0600 (found ${mode.toString(8).padStart(4, '0')})`);
+  }
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    throw new Error(`node token ${file} must be owned by uid ${process.getuid()} (found ${stat.uid})`);
+  }
+  const token = io.readFileSync(file, 'utf8').trim();
+  if (!token) throw new Error(`node token ${file} is empty`);
+  return token;
+}
+
 function createHost(options = {}) {
   const adopt = options.adopt || null;
   if (adopt && (adopt.version !== 1 || !Array.isArray(adopt.panes))) {
@@ -371,10 +416,41 @@ function createHost(options = {}) {
   }) : options.log;
   const debugEvents = options.debug === undefined ? Boolean(process.env.KEEP_DEBUG) : options.debug === true;
   const primaryReconnectGraceMs = Math.max(0, Number(options.primaryReconnectGraceMs ?? 60e3));
+  const env = options.env || process.env;
+  // The node agent transport. It is optional, it never touches the unix lock or the
+  // socket file, and a failure on this side leaves the unix socket serving as before.
+  const listenSpec = options.listen === undefined ? env.KEEP_HOST_LISTEN : options.listen;
+  const tokenFile = (options.tokenFile === undefined ? env.KEEP_NODE_TOKEN_FILE : options.tokenFile) || null;
+  const allowAnyAddress = options.listenAny === undefined ? env.KEEP_HOST_LISTEN_ANY === '1' : options.listenAny === true;
+  const nodeName = options.node || localNode(env);
+  // One identity per host process: a core reload carries it across in the handoff
+  // record, so a caller can tell "the same panes, new code" from "a new process".
+  const bootId = options.bootId
+    || (adopt && typeof adopt.bootId === 'string' && adopt.bootId)
+    || crypto.randomBytes(16).toString('hex');
+  let listenTarget = null;
+  let tcpAddress = null;
+  let tcpError = null;
+  let tokenDigest = null;
+  if (listenSpec) {
+    try {
+      listenTarget = parseListenAddress(listenSpec);
+      if (wildcardAddress(listenTarget.address) && !allowAnyAddress) {
+        throw new Error(`refusing to bind ${listenTarget.address}: set KEEP_HOST_LISTEN_ANY=1 to listen on every interface`);
+      }
+      if (!tokenFile) throw new Error('a node listen address needs KEEP_NODE_TOKEN_FILE');
+      tokenDigest = crypto.createHash('sha256').update(readNodeToken(tokenFile)).digest();
+    } catch (error) {
+      tcpError = error;
+      listenTarget = null;
+    }
+  }
   const panes = new Map();
   const connections = new Set();
   const subscribers = new Set();
   const server = net.createServer();
+  const tcpServer = listenTarget ? net.createServer() : null;
+  const helloFailures = new Map();
   let listening = false;
   let closing = false;
   let listenPromise = null;
@@ -397,6 +473,28 @@ function createHost(options = {}) {
 
   const eventLog = (line) => {
     try { if (typeof log === 'function') log(line); } catch {}
+  };
+  // Compared as digests so the comparison is constant time in the token's content
+  // and in its length; a shorter guess must not answer faster than a longer one.
+  const tokenAccepted = (value) => {
+    if (!tokenDigest || typeof value !== 'string' || !value) return false;
+    return crypto.timingSafeEqual(crypto.createHash('sha256').update(value).digest(), tokenDigest);
+  };
+  const helloThrottled = (remote) => {
+    const entry = helloFailures.get(remote);
+    if (!entry) return false;
+    if (Date.now() - entry.at > HELLO_FAILURE_WINDOW_MS) {
+      helloFailures.delete(remote);
+      return false;
+    }
+    return entry.count >= HELLO_FAILURE_LIMIT;
+  };
+  const noteHelloFailure = (remote) => {
+    const now = Date.now();
+    const entry = helloFailures.get(remote);
+    if (!entry || now - entry.at > HELLO_FAILURE_WINDOW_MS) helloFailures.set(remote, { count: 1, at: now });
+    else { entry.count += 1; entry.at = now; }
+    while (helloFailures.size > HELLO_FAILURE_ADDRESSES) helloFailures.delete(helloFailures.keys().next().value);
   };
   const validColdFile = (paneId, file) => {
     if (typeof file !== 'string') return false;
@@ -900,6 +998,20 @@ function createHost(options = {}) {
           coldTerminals: [...panes.values()].filter((pane) => !pane.term && pane.coldSnapshot).length,
           reloads: options.boot && options.boot.reloads || 0,
           lastReload: options.boot && options.boot.lastReload || null,
+          // The node descriptor: who answered, on what machine, as which process.
+          protocol: PROTOCOL_VERSION,
+          node: nodeName,
+          platform: process.platform,
+          home: os.homedir(),
+          execPath: process.execPath,
+          shell: env.SHELL || null,
+          bootId,
+          hostname: os.hostname(),
+          // Only when the node transport is configured, so a single-node install's
+          // hello — and every report printed from it — stays exactly as it was.
+          ...(tcpAddress ? { listen: tcpAddress } : {}),
+          ...(tokenFile ? { tokenFile } : {}),
+          ...(tcpError ? { listenError: tcpError.message } : {}),
         } };
       case 'spawn': {
         const pane = spawnPane(params);
@@ -1252,7 +1364,20 @@ function createHost(options = {}) {
     }
   };
 
-  server.on('connection', (socket) => {
+  const acceptConnection = (socket, transport) => {
+    const remote = transport === 'tcp' ? String(socket.remoteAddress || 'unknown') : 'unix';
+    if (transport === 'tcp') {
+      socket.setNoDelay(true);
+      if (helloThrottled(remote)) {
+        eventLog(`host: dropped node connection from ${remote}: too many failed hellos`);
+        socket.destroy();
+        return;
+      }
+    }
+    // The unix socket is reachable only by this account, so it stays token-free;
+    // a network connection says who it is in its first frame or says nothing more.
+    let authenticated = transport !== 'tcp';
+    let refused = false;
     const connection = {
       id: `viewer-${process.pid}-${nextConnectionId++}`,
       socket,
@@ -1273,6 +1398,20 @@ function createHost(options = {}) {
       }
     };
     const decoder = new FrameDecoder((request) => {
+      if (refused) return;
+      if (!authenticated) {
+        if (!request || typeof request !== 'object' || request.type !== 'hello' || !tokenAccepted(request.token)) {
+          refused = true;
+          noteHelloFailure(remote);
+          eventLog(`host: refused node connection from ${remote}: hello required`);
+          const frame = encodeFrame({ ok: false, id: (request && request.id) || null, error: 'hello required' });
+          try { socket.end(frame, () => socket.destroy()); } catch { socket.destroy(); }
+          return;
+        }
+        authenticated = true;
+        helloFailures.delete(remote);
+        eventLog(`host: node connection from ${remote} accepted`);
+      }
       if (reloading) {
         connection.send(encodeFrame({
           ok: false,
@@ -1307,7 +1446,10 @@ function createHost(options = {}) {
       connections.delete(connection);
       detachConnection(connection, handingOff, true);
     });
-  });
+  };
+
+  server.on('connection', (socket) => acceptConnection(socket, 'unix'));
+  if (tcpServer) tcpServer.on('connection', (socket) => acceptConnection(socket, 'tcp'));
 
   const unlink = (file) => {
     try { fs.unlinkSync(file); }
@@ -1378,6 +1520,46 @@ function createHost(options = {}) {
     }
   });
 
+  // Kept out of the unix lock/probe/unlink dance on purpose: the node transport owns
+  // no file, and it must never be able to make the local socket fail to come up.
+  const openTcpServer = async () => {
+    if (!tcpServer) {
+      if (tcpError) eventLog(`host: node transport disabled: ${tcpError.message}`);
+      return;
+    }
+    if (tcpServer.listening) return;
+    try {
+      await new Promise((resolve, reject) => {
+        const onError = (error) => { tcpServer.removeListener('listening', onListening); reject(error); };
+        const onListening = () => { tcpServer.removeListener('error', onError); resolve(); };
+        tcpServer.once('error', onError);
+        tcpServer.once('listening', onListening);
+        try {
+          tcpServer.listen({ host: listenTarget.address, port: listenTarget.port });
+        } catch (error) {
+          tcpServer.removeListener('error', onError);
+          tcpServer.removeListener('listening', onListening);
+          reject(error);
+        }
+      });
+      tcpAddress = formatListenAddress(tcpServer.address()) || String(listenSpec);
+      tcpError = null;
+      eventLog(`host: node transport listening ${tcpAddress} pid ${process.pid}`);
+    } catch (error) {
+      tcpError = error;
+      tcpAddress = null;
+      eventLog(`host: could not listen on ${listenSpec}: ${error.message}`);
+    }
+  };
+
+  const closeTcpServer = () => new Promise((resolve) => {
+    if (!tcpServer || !tcpServer.listening) {
+      tcpAddress = null;
+      return resolve();
+    }
+    tcpServer.close(() => { tcpAddress = null; resolve(); });
+  });
+
   const doListen = async () => {
     // macOS truncates sun_path at 104 bytes silently, so a long path binds a different name than we chmod.
     if (Buffer.byteLength(sock) > 103) throw new Error(`socket path too long (${Buffer.byteLength(sock)} bytes, max 103): ${sock}`);
@@ -1400,6 +1582,7 @@ function createHost(options = {}) {
       }
       fs.chmodSync(sock, 0o600);
       eventLog(`host: listening ${sock} pid ${process.pid}`);
+      await openTcpServer();
       return host;
     } catch (error) {
       if (server.listening) {
@@ -1473,6 +1656,9 @@ function createHost(options = {}) {
       // to bind. Its listen path probes and unlinks the now-stale socket immediately
       // before server.listen().
       const serverClosed = closeServer();
+      // Handed over with the socket: the replacement core binds the same port, so
+      // this one must let go of it before that bind, on both paths below.
+      const tcpClosed = closeTcpServer();
       let record;
       try {
       let drainTimer;
@@ -1538,6 +1724,7 @@ function createHost(options = {}) {
       record = {
         version: 1,
         sock,
+        bootId,
         panes: paneRecords,
       };
       } catch (error) {
@@ -1550,12 +1737,14 @@ function createHost(options = {}) {
           setPrimary(pane, null);
         }
         await serverClosed.catch(() => {});
+        await tcpClosed.catch(() => {});
         listening = false;
         try { unlink(sock); } catch {}
         await startServer();
         fs.chmodSync(sock, 0o600);
         listening = true;
         endpointOwned = true;
+        await openTcpServer();
         reloading = false;
         handingOff = false;
         handoffPromise = null;
@@ -1570,6 +1759,7 @@ function createHost(options = {}) {
       retired = true;
       dropAllConnections();
       await serverClosed;
+      await tcpClosed;
       listening = false;
       endpointOwned = false;
       for (const pane of panes.values()) {
@@ -1619,6 +1809,7 @@ function createHost(options = {}) {
       connections.clear();
       subscribers.clear();
       try { await closeServer(); } finally { listening = false; }
+      await closeTcpServer();
       if (endpointOwned) {
         endpointOwned = false;
         unlink(sock);
@@ -1633,6 +1824,9 @@ function createHost(options = {}) {
 
   const host = {
     sock, panes, server, closed, listen, close, handoff, finalizeHandoff,
+    node: nodeName, bootId, tokenFile,
+    get listenAddress() { return tcpAddress; },
+    get listenError() { return tcpError; },
     get closing() { return closing; },
     get retired() { return retired; },
     get serving() { return !retired && !reloading && listening && server.listening; },
@@ -1647,6 +1841,9 @@ async function runHost(options = {}) {
 module.exports = {
   DEFAULT_SNAPSHOT_SCROLLBACK,
   MAX_FRAME_BYTES,
+  PROTOCOL_VERSION,
+  parseListenAddress,
+  readNodeToken,
   RingBuffer,
   FrameDecoder,
   encodeFrame,
