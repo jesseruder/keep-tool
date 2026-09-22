@@ -258,6 +258,7 @@ function compactRestoreDeps(dir, session, calls = [], settingsFile) {
     repairClaudeSettingsModel: () => ({ changed: false }),
     hostRequest: async (type) => (type === 'hello' ? { guardedInput: true } : {}),
     livePaneState: async () => ({ pid: 1, inputCount: 0 }),
+    sleep: async () => {},
   };
 }
 
@@ -4017,9 +4018,9 @@ test('pending swap sweep refuses a draft typed after its precheck and types noth
     if (type === 'hello') return { guardedInput: true };
     if (type === 'list') {
       const panes = [{ id: 'pane:test', pid: 1, inputCount: count() }];
-      // Owner starts typing right after the idle proof's second count, in the gap where
+      // Owner starts typing right after the idle proof's last count, in the gap where
       // the sweep reads settings and writes its record.
-      if (++lists === 2) { foreign += 1; box = 'w'; }
+      if (++lists === 3) { foreign += 1; box = 'w'; }
       return { panes };
     }
     if (type !== 'input') return {};
@@ -12418,14 +12419,15 @@ test('the restore idle proof takes the count first and refuses a turn already ru
     hostRequest: async () => ({ guardedInput: true }),
     livePaneState: async () => { order.push('count'); return { pid: 7, inputCount: 3 }; },
     readScreen: async () => { order.push('screen'); return screen; },
+    sleep: async () => { order.push('settle'); },
   });
   // The composer is empty because the person just submitted: the probe alone would pass it.
   await assert.rejects(compactRestoreInputBaseline({ pane: 'p' }, deps('✻ Thinking… (esc to interrupt)\n────\n❯ \n────')),
     /busy or showing a dialog/);
-  assert.deepEqual(order.slice(0, 2), ['count', 'screen'], 'the count is read before the idle screen');
+  assert.deepEqual(order.slice(0, 4), ['count', 'settle', 'count', 'screen'], 'the count, a settle window, then the idle screen');
   order.length = 0;
   assert.deepEqual(await compactRestoreInputBaseline({ pane: 'p' }, deps('────\n❯ \n────\n? for shortcuts')), { pid: 7, inputCount: 3 });
-  assert.deepEqual(order, ['count', 'screen', 'count']);
+  assert.deepEqual(order, ['count', 'settle', 'count', 'screen', 'count']);
   // A local command still finishing is "not now": nothing typed, no refusal.
   assert.equal(await compactRestoreInputBaseline({ pane: 'p' }, deps('❯ /compact\n❯'), { localCommandPending: '/compact' }), null);
 });
@@ -12507,4 +12509,120 @@ test('the Enter hooks fire only for an Enter that passed every check, and hear a
     ...refused.deps, ...hooks, inputBaseline: { pid: 4242, inputCount: 0 } }));
   assert.equal(refused.inputs.includes('\r'), false);
   assert.deepEqual(marks, ['enter', 'dropped']);
+});
+
+// ---- review round 3 ----
+
+test('a guarded command refuses its Enter when any screen before it shows a turn running', async () => {
+  const command = '/model claude-fable-5-1[1m]';
+  // A submit accepted just before the baseline renders while the restore is typed.
+  const busy = draftHarness((inputs) => (inputs.includes(command)
+    ? `${BOX(command)}\n✻ Working… (esc to interrupt)` : BOX('')));
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, command, (s, t) => s.includes(t), {
+    ...busy.deps, inputBaseline: { pid: 4242, inputCount: 0 }, discardDraftOnAbort: true }), /started a turn/);
+  assert.equal(busy.inputs.includes('\r'), false);
+  // The unguarded path is unchanged: nothing here reads the screen for a turn.
+  const plain = draftHarness((inputs) => (inputs.includes(command) ? `${BOX(command)}\n(esc to interrupt)` : BOX('')));
+  await typeAndSubmit({ pane: 'p' }, command, (s, t) => s.includes(t), { ...plain.deps });
+  assert.equal(plain.inputs.includes('\r'), true);
+});
+
+test('the restore idle proof waits for a quiet counter and a settled one', async () => {
+  const { compactRestoreInputBaseline } = require('./serve.js');
+  const now = Date.parse('2026-09-21T12:00:00Z');
+  let counts = [];
+  const deps = {
+    now: () => now, sleep: async () => {},
+    hostRequest: async () => ({ guardedInput: true }),
+    livePaneState: async () => counts.shift(),
+    readScreen: async () => '────\n❯ \n────',
+  };
+  counts = [{ pid: 7, inputCount: 3, lastInputAt: new Date(now - 500).toISOString() }];
+  assert.equal(await compactRestoreInputBaseline({ pane: 'p' }, deps), null, 'input half a second ago: not now');
+  counts = [{ pid: 7, inputCount: 3 }, { pid: 7, inputCount: 4 }];
+  assert.equal(await compactRestoreInputBaseline({ pane: 'p' }, deps), null, 'a key during the settle window: not now');
+  counts = [{ pid: 7, inputCount: 3, lastInputAt: new Date(now - 60e3).toISOString() }, { pid: 7, inputCount: 3 }, { pid: 7, inputCount: 3 }];
+  assert.deepEqual(await compactRestoreInputBaseline({ pane: 'p' }, deps), { pid: 7, inputCount: 3 });
+});
+
+test('a restore whose first key the host refused is a not-now: deferral kept, settings untouched', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-refused-first-key-'));
+  const session = { id: 'refused-first', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  const clock = Date.parse('2026-09-04T12:05:00Z');
+  try {
+    const file = writeCompactSwapFixture(dir, session.id, { restoreDeferredReason: 'model-exhausted',
+      restoreDeferredUntil: clock - 60e3, restoreExpiryFrom: clock - 60e3, restoreDeferrals: 1 });
+    const repairs = [];
+    const summary = await sweepPendingCompactSwaps({ ...compactRestoreDeps(dir, session, []),
+      now: () => clock, transcriptFileForSession: () => null, stderr: () => {},
+      // The person's key landed after the baseline; the settings still hold their choice.
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-fable-5-1' }),
+      repairClaudeSettingsModel: (value) => { repairs.push(value); return { changed: true }; },
+      typeAndSubmit: async () => {
+        const error = new Error('input arrived on the pane before this keystroke; nothing was typed');
+        error.inputDropped = true; error.nothingTyped = true; throw error;
+      } });
+    assert.equal(summary.skipped, 1);
+    assert.deepEqual(repairs, []);
+    const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(after.restoreDeferredReason, 'model-exhausted', 'still deferred, so delivery is not blocked');
+    assert.equal(compactRestoreBlocking(session.id, { dir }), null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('one session\'s hand-picked model makes the shared settings file the person\'s for the pass', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-shared-settings-'));
+  const a = { id: 'session-a', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  const b = { id: 'session-b', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  try {
+    const fileA = writeCompactSwapFixture(dir, a.id, { at: Date.parse('2026-09-04T12:00:00Z') });
+    const fileB = writeCompactSwapFixture(dir, b.id, { at: Date.parse('2026-09-04T12:01:00Z') });
+    // B's person chose Opus 1M by hand; that is what the account's settings.json now says.
+    let settings = 'claude-opus-5[1m]';
+    const calls = [];
+    const summary = await sweepPendingCompactSwaps({ ...compactRestoreDeps(dir, a, calls),
+      scanSessions: () => [a, b], transcriptFileForSession: (session) => session.id, stderr: () => {},
+      compactSwapUserModelChoice: (record) => (record.sessionId === b.id
+        ? { model: 'claude-opus-5[1m]', reason: '/model claude-opus-5[1m] was chosen after the swap' } : null),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: settings }),
+      repairClaudeSettingsModel: (value) => { settings = value; return { changed: true }; },
+      // A's own restore: Claude Code saves the model it switches to as the default.
+      typeAndSubmit: async (_target, command) => { calls.push(command); settings = command.slice('/model '.length); } });
+    assert.equal(fs.existsSync(fileB), false, 'B retired');
+    assert.deepEqual(calls, ['/model claude-fable-5-1[1m]'], 'A is still restored');
+    assert.equal(fs.existsSync(fileA), false);
+    assert.equal(settings, 'claude-opus-5[1m]', 'and the saved default is the person\'s choice, not the pre-swap value');
+    assert.equal(summary.dropped, 1);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a throwing Enter hook still takes the typed draft back', async () => {
+  const command = '/exit';
+  const harness = draftHarness(CLEARABLE(command));
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, command, (s, t) => s.includes(t), {
+    ...harness.deps, discardDraftOnAbort: true, beforeEnterKey: () => { throw new Error('journal write failed'); } }),
+  (error) => /journal write failed/.test(error.message) && error.draftCleared === true);
+  assert.equal(harness.inputs.includes('\r'), false);
+  assert.equal(harness.inputs[harness.inputs.length - 1], '\x1b');
+});
+
+test('a probe comma left behind waits out the retry interval instead of probing the draft every tick', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-probe-left-'));
+  const session = { id: 'probe-left', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  let clock = Date.parse('2026-09-04T12:05:00Z');
+  try {
+    const file = writeCompactSwapFixture(dir, session.id);
+    let baselines = 0;
+    const deps = { ...compactRestoreDeps(dir, session, []), now: () => clock, transcriptFileForSession: () => null,
+      compactRestoreInputBaseline: async () => { baselines += 1;
+        throw new Error('the probe keystroke could not be undone; clear the session input box in the terminal first'); } };
+    await sweepPendingCompactSwaps(deps);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).probeRefusedAt, clock);
+    clock += 60e3;
+    await sweepPendingCompactSwaps(deps);
+    assert.equal(baselines, 1, 'no second probe a minute later');
+    clock += 10 * 60e3;
+    await sweepPendingCompactSwaps(deps);
+    assert.equal(baselines, 2);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

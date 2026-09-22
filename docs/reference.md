@@ -2387,10 +2387,21 @@ confirmed, deferred again, or left unconfirmed. No key this pass sends is
 unguarded. It reads the pane's input counter first, then proves the session idle under
 it: no "esc to interrupt", no live dialog, no local command still finishing, and an empty
 box (the prompt-suggestion probe's comma and Backspace are themselves conditional on the
-counter). A turn submitted after the count moves it, so the host drops the restore's keys;
-Enter is pressed only when the box holds exactly the command. The account's
-`settings.json` repair likewise rechecks for a hand-picked model immediately before it
-writes, and the per-attempt repair runs only after a restore was actually typed. The hand-picked-model check below
+counter). The counter must have been quiet for `KEEP_COMPACT_RESTORE_INPUT_QUIET_MS` (default
+2000) by the host's `lastInputAt`, and the idle screen is read only after a
+`KEEP_COMPACT_RESTORE_SETTLE_MS` (default 1500) window with the count unchanged, so a
+submit accepted just before the count has time to render. A turn submitted after the
+count moves it, so the host drops the restore's keys; any screen read while the restore
+is typed that shows "esc to interrupt" takes the draft back instead of pressing Enter,
+and Enter is pressed only when the box holds exactly the command. A restore whose first
+key the host refused typed nothing: it is not counted as an attempt, a deferred record
+keeps its deferral, and `settings.json` is left alone. The account's `settings.json`
+repair rechecks for a hand-picked model immediately before it writes, and once any
+session on that settings file has a hand-picked model, no repair writes that file for the
+rest of the pass — a restore typed there only puts back exactly what the file held before
+its own `/model`. If a key lands between the probe's comma and its Backspace, the comma
+is left with the person's key, the refusal is logged, and the record waits
+`KEEP_COMPACT_RESTORE_RETRY_MIN` before probing that session again. The hand-picked-model check below
 runs again under the lock right before typing. Second, if the
 transcript shows a model someone chose by hand after the swap (a confirmed `/model` other
 than the daemon's own switch and restore rows, compared as exact ids so dropping the
