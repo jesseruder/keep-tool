@@ -85,14 +85,30 @@ function registryBody(command, args, { env = process.env, cwd = process.cwd(), w
   return body;
 }
 
-// Posts once, and once more with the same key when there was no answer at all: the
-// first may have run, and the key is what makes the second safe.
+// The waits after a request that got no answer, about twenty seconds in all: long
+// enough for a daemon restart (deploy-self exits it right after answering) to come
+// back up.
+const RETRY_WAITS_MS = Object.freeze([1000, 2000, 4000, 8000, 5000]);
+const PING_TIMEOUT_MS = 3000;
+
+// Posts, and when there was no answer at all waits with backoff until the daemon
+// answers GET /api/registry/ping, then sends the same request again with the same
+// key: the first may have run, and the key is what makes the next one safe. Nothing
+// is resent to a daemon that is not answering its ping.
 async function postWithRetry(where, pathname, payload, deps = {}) {
   const request = deps.request || nodeApiRequest;
+  const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const waits = deps.retryWaitsMs || RETRY_WAITS_MS;
   const token = deps.token || nodeToken(deps.env || process.env, deps.readToken);
+  const send = () => request(where.url, pathname, { payload, token, timeoutMs: deps.timeoutMs });
   let lastError;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try { return await request(where.url, pathname, { payload, token, timeoutMs: deps.timeoutMs }); }
+  try { return await send(); }
+  catch (error) { lastError = error; }
+  for (const wait of waits) {
+    await sleep(wait);
+    try { await request(where.url, '/api/registry/ping', { method: 'GET', token, timeoutMs: PING_TIMEOUT_MS }); }
+    catch (error) { lastError = error; continue; }
+    try { return await send(); }
     catch (error) { lastError = error; }
   }
   const failure = new Error(`daemon on ${where.daemon} unreachable (${lastError && lastError.message})`);
@@ -163,5 +179,5 @@ async function deploySelf(where, { sha, project }, deps = {}) {
 
 module.exports = {
   deploySelf,
-  REQUEST_TIMEOUT_MS, remoteMode, daemonBase, nodeToken, nodeApiRequest, registryBody, postWithRetry, runRemote, parsed,
+  REQUEST_TIMEOUT_MS, RETRY_WAITS_MS, remoteMode, daemonBase, nodeToken, nodeApiRequest, registryBody, postWithRetry, runRemote, parsed,
 };

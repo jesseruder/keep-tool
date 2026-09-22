@@ -726,8 +726,14 @@ function landWorktree(input, opts = {}) {
       // On a node that holds panes for another machine's daemon, the live checkout is
       // the daemon's, so it is asked to deploy itself; the daemon node deploys here.
       const deploy = opts.deploy || (require('./nodes.js').paneOnlyNode(process.env) ? deployOnDaemon : deployAfterLand);
-      const result = deploy(main, defaultName, sha, opts);
-      if (opts.onDeploy) opts.onDeploy(result);
+      // A caller with something to record first (keep land's check-in, when the
+      // deploy restarts the daemon that records it) is handed the deploy to run
+      // itself once it has.
+      if (opts.deferDeploy) opts.deferDeploy(() => deploy(main, defaultName, sha, opts));
+      else {
+        const result = deploy(main, defaultName, sha, opts);
+        if (opts.onDeploy) opts.onDeploy(result);
+      }
     }
   }
   return sha;

@@ -93,21 +93,53 @@ test('a registry command on a node with a daemon URL is posted to the daemon and
   assert.equal(daemon.requests[2].body.pane, undefined);
 });
 
-test('a lost answer is retried once with the same key, then the daemon is called unreachable', async (t) => {
+test('a lost answer is resent with the same key once the daemon answers its ping', async (t) => {
   const daemon = await stubDaemon(t, (entry, n) => (n === 1 ? 'drop' : { status: 200, body: { ok: true, status: 0, stdout: 'done\n', stderr: '', replayed: true } }));
   const { root, env } = nodeEnv(t);
   env.KEEP_DAEMON_URL = daemon.url;
   const result = await run(['show', 'card'], { env, cwd: root });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, 'done\n');
-  assert.equal(daemon.requests.length, 2);
-  assert.equal(daemon.requests[0].body.idempotencyKey, daemon.requests[1].body.idempotencyKey);
+  assert.deepEqual(daemon.requests.map((entry) => `${entry.method} ${entry.url}`),
+    ['POST /api/registry', 'GET /api/registry/ping', 'POST /api/registry']);
+  assert.equal(daemon.requests[0].body.idempotencyKey, daemon.requests[2].body.idempotencyKey);
+});
 
+// A daemon restarting under a check-in: the post finds nothing listening, and the
+// ping answers only after a while. The check-in is resent once, with its key, once
+// the daemon is back — never once per wait.
+test('a check-in that races a restart waits for the daemon and is resent once', async (t) => {
+  const { postWithRetry, RETRY_WAITS_MS } = require('./remote-cli.js');
+  assert.ok(RETRY_WAITS_MS.reduce((a, b) => a + b, 0) >= 15000 && RETRY_WAITS_MS.reduce((a, b) => a + b, 0) <= 25000);
+  const up = Date.now() + 250;
+  const daemon = await stubDaemon(t, (entry, n) => {
+    if (n === 1 || Date.now() < up) return 'drop';
+    if (entry.url === '/api/registry/ping') return { status: 200, body: { ok: true } };
+    return { status: 200, body: { ok: true, status: 0, stdout: 'checked in\n', stderr: '', replayed: false } };
+  });
+  const slept = [];
+  const where = { local: 'aws1', daemon: 'main', url: daemon.url };
+  const payload = { command: 'checkin', args: ['card'], cwd: '/', idempotencyKey: 'k'.repeat(32) };
+  const response = await postWithRetry(where, '/api/registry', payload, {
+    token: 'aws1-secret', retryWaitsMs: [100, 100, 100, 100, 100, 100, 100],
+    sleep: (ms) => { slept.push(ms); return new Promise((resolve) => setTimeout(resolve, ms)); },
+  });
+  assert.equal(response.status, 200);
+  const posts = daemon.requests.filter((entry) => entry.method === 'POST');
+  const pings = daemon.requests.filter((entry) => entry.url === '/api/registry/ping');
+  assert.equal(posts.length, 2, 'the first post, lost, and one resend');
+  assert.ok(pings.length >= 2, 'it waited for the daemon rather than resending into a restart');
+  assert.deepEqual(posts.map((entry) => entry.body), [payload, payload]);
+  assert.equal(pings[pings.length - 1].headers['x-keep-node-token'], 'aws1-secret');
+
+  // Never answering: every wait is spent, nothing is resent, and it says so.
   const down = await stubDaemon(t, () => 'drop');
-  const gone = await run(['show', 'card'], { env: { ...env, KEEP_DAEMON_URL: down.url }, cwd: root });
-  assert.equal(gone.status, 2);
-  assert.match(gone.stderr, /^keep show: daemon on main unreachable/);
-  assert.equal(down.requests.length, 2);
+  const waits = [];
+  await assert.rejects(postWithRetry({ ...where, url: down.url }, '/api/registry', payload, {
+    token: 'aws1-secret', sleep: async (ms) => { waits.push(ms); },
+  }), /^Error: daemon on main unreachable/);
+  assert.deepEqual(waits, [...RETRY_WAITS_MS]);
+  assert.equal(down.requests.filter((entry) => entry.method === 'POST').length, 1);
 });
 
 test('a refusal from the daemon is said as one, not as the command\'s output', async (t) => {

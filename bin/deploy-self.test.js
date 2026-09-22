@@ -206,11 +206,12 @@ test('keep land on a node gates with the daemon\'s facts, pushes, checks in and 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, new RegExp(`^card: landed ${sha.slice(0, 12)} onto origin/master\\n`));
   assert.equal(git(n.origin, 'rev-parse', 'master'), sha, 'the node pushed');
-  assert.deepEqual(daemon.requests.map((entry) => entry.url), ['/api/registry', '/api/deploy-self', '/api/registry']);
+  // The check-in before the deploy: deploy-self restarts the daemon that records it.
+  assert.deepEqual(daemon.requests.map((entry) => entry.url), ['/api/registry', '/api/registry', '/api/deploy-self']);
   assert.deepEqual(daemon.requests[0].body.args, ['card']);
-  assert.deepEqual(daemon.requests[1].body, { sha, project: 'keep-tool' });
-  assert.equal(daemon.requests[1].headers['x-keep-node-token'], 'aws1-secret');
-  const checkin = daemon.requests[2].body;
+  assert.deepEqual(daemon.requests[2].body, { sha, project: 'keep-tool' });
+  assert.equal(daemon.requests[2].headers['x-keep-node-token'], 'aws1-secret');
+  const checkin = daemon.requests[1].body;
   assert.equal(checkin.command, 'checkin');
   assert.deepEqual(checkin.args, ['card', '--commit', sha, '-m', 'Landed wt/land onto master.']);
   assert.equal(checkin.session, 'sess-aws1');

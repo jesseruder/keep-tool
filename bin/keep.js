@@ -1862,19 +1862,24 @@ async function landRemote(argv, where, deps = {}) {
     return;
   }
   const wt = deps.wt || require('./wt.js');
-  let deployed = null;
+  let deploy = null;
   let sha;
-  try { sha = wt.landWorktree(context.worktree, { onDeploy: (result) => { deployed = result; } }); }
+  try { sha = wt.landWorktree(context.worktree, { deferDeploy: (run) => { deploy = run; } }); }
   catch (error) { die(`wt land refused: ${error.message}`); }
   if (!sha) die('wt land had nothing to push');
-  if (deployed && typeof deployed.then === 'function') await deployed;
   const cited = record ? ` (review record ${record.id})` : '';
   const message = `Landed ${context.branch} onto ${context.defaultBranch}${cited}.`;
+  // The check-in goes first: deploy-self answers and then restarts the daemon, so a
+  // check-in sent after it would meet a daemon on its way down.
   const checkin = await remote.runRemote('checkin', [id, '--commit', sha, '-m', message], { where });
   if (checkin.code !== 0) {
     const why = String(checkin.stderr || '').trim().split('\n').pop() || `exit ${checkin.code}`;
     process.stderr.write(`keep: landed ${sha} but the check-in failed: ${why}\n`
       + `keep: record it by hand — keep checkin ${id} --commit ${sha} -m "${message}"\n`);
+  }
+  if (deploy) {
+    const deployed = deploy();
+    if (deployed && typeof deployed.then === 'function') await deployed;
   }
   if (o.json) return console.log(JSON.stringify({ id, landed: sha, record, why: verdict.why }, null, 2));
   console.log(`${id}: landed ${sha.slice(0, 12)} onto origin/${context.defaultBranch}${cited}`);
