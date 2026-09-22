@@ -13,7 +13,11 @@ export function restartControls(ctx, sessionId) {
   if (entry?.status === 'restarting') return '<button class="btn" disabled>Restarting…</button>';
   if (entry?.status === 'queued') return `<span class="restart-reason">Restart queued: ${ctx.esc(entry.reason || 'Checking for a safe idle prompt')}</span><button class="btn" data-restart="cancel">Cancel restart</button>`;
   const failed = entry?.status === 'failed' && !replaced ? `<span title="${ctx.esc(entry.reason)}">Restart failed</span>` : '';
-  return failed;
+  // Owner's own restart is forced: the daemon stops the session's processes and resumes the
+  // conversation without waiting for an idle prompt. He can see whether it is working.
+  const button = live.length === 1
+    ? '<button class="btn" data-restart="now" data-owner-force="1" title="Restart this session now; a turn in progress is interrupted and the conversation is resumed">Restart</button>' : '';
+  return `${failed}${button}`;
 }
 
 export function installRestartControls(container, ctx, sessionId, pane) {
@@ -23,7 +27,8 @@ export function installRestartControls(container, ctx, sessionId, pane) {
       button.blur();
       const origin = `${ctx.state.mode}:${ctx.state.selectedKey}:${ctx.state.layout}`;
       try {
-        const result = await runAction(button, () => write('/api/restart-session', { sessionId, pane, mode: button.dataset.restart }, 'POST', { label: 'Restarting session' }),
+        const ownerForce = button.dataset.ownerForce === '1' ? { ownerForce: true } : {};
+        const result = await runAction(button, () => write('/api/restart-session', { sessionId, pane, mode: button.dataset.restart, ...ownerForce }, 'POST', { label: 'Restarting session' }),
           { label: button.dataset.restart === 'cancel' ? 'Cancelling…' : 'Restarting…', ctx, retry: () => button.click() });
         ctx.toast(result.status === 'failed' ? `Not restarted: ${result.reason}`
           : result.status === 'done' ? 'Session restarted; conversation and pins preserved'

@@ -3,6 +3,35 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { refusal, createManager, RestartDeferred } = require('./session-restart');
 
+test('Owner Restart is forced: no idle refusal, and each forced stop hands its capture to the next', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-owner-restart-')), file = path.join(root, 'queue.json');
+  try {
+    // Mid-turn with a tool running: an ordinary restart-now refuses it outright.
+    const inspect = async () => ({ session: { id: 's', endedTurn: false, toolRunning: true },
+      pane: { id: 'p', pid: 10, alive: true, meta: { sessionId: 's', agent: 'claude' } } });
+    const calls = [];
+    const manager = createManager({ file, inspect, restart: async (entry, options) => {
+      calls.push(options);
+      if (calls.length === 1) { options.onForcedStop([{ pid: 11, pidStart: 'a' }]); throw Error('ps timed out'); }
+      return { ok: true };
+    } });
+    assert.equal((await manager.request({ sessionId: 's', pane: 'p', mode: 'now' })).status, 'failed');
+    assert.equal(calls.length, 0, 'the unforced request never reached a restart');
+    await assert.rejects(manager.request({ sessionId: 's', pane: 'p', mode: 'idle', ownerForce: true }), /immediate restart/);
+    await assert.rejects(manager.request({ sessionId: 's', pane: 'p', mode: 'now', ownerForce: 'yes' }), /boolean/);
+
+    const first = await manager.request({ sessionId: 's', pane: 'p', mode: 'now', ownerForce: true });
+    assert.equal(first.status, 'failed');
+    assert.equal(calls[0].ownerForce, true);
+    assert.deepEqual(calls[0].priorForcedProcesses, []);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file)).find((e) => e.ownerForce).forcedProcesses, [{ pid: 11, pidStart: 'a' }],
+      'the capture is journalled durably');
+    const second = await manager.request({ sessionId: 's', pane: 'p', mode: 'now', ownerForce: true });
+    assert.equal(second.status, 'done');
+    assert.deepEqual(calls[1].priorForcedProcesses, [{ pid: 11, pidStart: 'a' }], 'the retry also stops what the last one captured');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('cancelled force entry in a stale tick snapshot is never executed', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-force-cancel-')), file = path.join(root, 'queue.json');
   try {

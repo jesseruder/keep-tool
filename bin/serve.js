@@ -415,18 +415,6 @@ let onFocus = () => {};
 let sweepInFlight = false;
 let inFlightSwap = null;
 const daemonRestartGate = require('./daemon-restart').createGate({
-  pending: () => {
-    // A restore deferred for a rate limit can be days out, and it is durable: the pass
-    // after the restart picks it up exactly as this one would. Only the others hold it.
-    try {
-      return fs.readdirSync(autoCompactDir()).filter((name) => {
-        if (!name.endsWith('.swap.json')) return false;
-        const id = name.slice(0, -'.swap.json'.length);
-        return !/^[A-Za-z0-9_-]+$/.test(id) || Boolean(compactRestoreBlocking(id, { dir: autoCompactDir() }));
-      });
-    }
-    catch (error) { if (error.code === 'ENOENT') return []; throw error; }
-  },
   busy: () => sweepInFlight || injectionLocked(),
 });
 let liveSessionTickInFlight = false;

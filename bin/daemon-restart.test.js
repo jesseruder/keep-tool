@@ -2,15 +2,13 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const { createGate } = require('./daemon-restart');
 
-test('daemon restart refuses pending swaps, active compaction and restoration, then closes admission', () => {
-  let records = [], busy = false;
-  const gate = createGate({ pending: () => records, busy: () => busy });
+test('daemon restart refuses only work in flight, then closes admission', () => {
+  let busy = false;
+  const gate = createGate({ busy: () => busy });
   const leave = gate.enter();
   assert.throws(() => gate.prepare(), /in flight/);
   leave(); leave();
-  records = [{ error: 'unreadable' }];
-  assert.throws(() => gate.prepare(), /Pending model restoration/);
-  records = []; busy = true;
+  busy = true;
   assert.throws(() => gate.prepare(), /in flight/);
   busy = false;
   assert.equal(gate.prepare().ok, true);
@@ -18,10 +16,22 @@ test('daemon restart refuses pending swaps, active compaction and restoration, t
   assert.throws(() => gate.enter(), /paused/);
 });
 
-test('unreadable pending-swap directory cannot authorize restart', () => {
-  const gate = createGate({ pending: () => { throw Error('EACCES'); } });
-  assert.throws(() => gate.prepare(), /EACCES/);
-  assert.equal(gate.stopping, false);
+test('a pending model restore does not hold a daemon restart; its record outlives the daemon', () => {
+  // createGate no longer reads the restore records at all.
+  const gate = createGate({ pending: () => [{ sessionId: 'stale' }] });
+  assert.equal(gate.prepare().ok, true);
+});
+
+test('a restart waits out a compaction that is mid-input, and refuses only after its timeout', async () => {
+  let clock = 0, busy = true;
+  const sleep = async (ms) => { clock += ms; if (clock >= 2000) busy = false; };
+  const gate = createGate({ busy: () => busy });
+  assert.equal((await gate.prepareWhenIdle({ sleep, now: () => clock })).ok, true);
+  assert.ok(clock >= 2000);
+  const stuck = createGate({ busy: () => true });
+  clock = 0;
+  await assert.rejects(stuck.prepareWhenIdle({ timeoutMs: 3000, sleep: async (ms) => { clock += ms; }, now: () => clock }), /in flight/);
+  assert.equal(stuck.stopping, false);
 });
 
 test('the restart route marks the request right before shutdown, not when it accepts it', async (t) => {

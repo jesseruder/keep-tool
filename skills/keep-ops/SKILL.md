@@ -35,13 +35,12 @@ This is for when Keep is the thing that is broken. Read state before changing an
   (runaway test runs, leaked containers; a container VM keeps its memory until the
   container app itself quits). Do not restart the host: `keep host shutdown` ends every
   pane and every session in one.
-- **`keep restart-daemon` refuses with "Pending model restoration prevents daemon
-  restart"**: a `<registry>/.keep/compact/*.swap.json` record exists — auto-compaction
-  swapped a session's model and has not confirmed the restore. If that session is live and
-  mid-compaction, wait and retry. If it has exited, the record can never clear by itself:
-  report the session id and the reason from the matching `<sid>.json` to Owner. Deleting a
-  durable restore record is Owner's call, and the record names the `settingsModelBefore`
-  that may need restoring.
+- **`keep restart-daemon` refuses with "Compaction or model restoration is in flight"**:
+  a compaction or model restore was typing into a pane for the whole minute the restart
+  waited. Look at what holds the injection lock (`keep doctor`) before retrying. A pending
+  `<registry>/.keep/compact/*.swap.json` restore no longer blocks a restart: the record is
+  durable and the next daemon's restore pass picks it up. One for a session that has
+  exited can still never clear by itself; report it to Owner, and never delete it yourself.
 - **`keep restart-daemon` refuses for another reason** (a compaction or delivery in
   flight): it is telling you a restart now would lose work. Retry in a few minutes. Never
   work around it with `launchctl` or `kill`.

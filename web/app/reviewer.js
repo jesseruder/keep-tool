@@ -171,16 +171,16 @@ export function renderReviewerTop(ctx) {
 }
 
 // The reviewer is the one session with no pane header of its own, so its restart
-// lives here. Same endpoint, same modes and the same queued/restarting/failed states
-// as a pinned pane in Watch: the guarded `idle` restart, cancellable while it waits.
+// lives here. Same endpoint and the same Owner-forced Restart as every other session.
 export function reviewerRestartHTML(ctx) {
   const { session } = liveReviewer(ctx);
   // A pending restart already renders its own state and Cancel through restartControls.
   const pending = (ctx.data.restarts || []).some((entry) => entry.sessionId === session?.id
     && ['queued', 'restarting', 'recovery-needed'].includes(entry.status));
   if (pending) return '';
-  return session?.id && session?.pane
-    ? '<button class="btn" data-restart="idle" title="Restart the reviewer once its prompt is idle and the pane is not being viewed; the conversation is resumed">Restart</button>'
+  // restartControls renders the forced Restart for a live reviewer pane, as it does for
+  // every session; this only says why there is none.
+  return session?.id && session?.pane ? ''
     : '<button class="btn" disabled title="No live reviewer pane to restart">Restart</button>';
 }
 

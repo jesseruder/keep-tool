@@ -92,14 +92,23 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
       // evidence that the original process was replaced. No input has been sent.
       if (!pane) throw new RestartDeferred('Waiting for the original pane to be observable');
       if (pane.pid !== entry.pid) throw Error('Session process changed; restart cancelled');
-      const reason = refusal(session, pane, entry.mode === 'idle');
+      // Owner clicked Restart: he can see whether the session is working, so nothing is
+      // refused for being unable to prove it idle. restartSession stops the captured
+      // process tree instead of typing /exit.
+      const reason = entry.ownerForce === true ? null : refusal(session, pane, entry.mode === 'idle');
       if (reason) {
         if (entry.mode === 'now') throw Error(reason);
         if (entry.reason !== reason) { entry.reason = reason; save(); }
         return entry;
       }
       entry.status = 'restarting'; entry.reason = ''; save();
-      const result = await restart(entry);
+      const result = await restart(entry, entry.ownerForce === true ? {
+        ownerForce: true,
+        // What an earlier forced restart of this session captured and may have left
+        // running; this stop waits for those too, and journals its own capture here.
+        priorForcedProcesses: Array.isArray(entry.priorForcedProcesses) ? entry.priorForcedProcesses : [],
+        onForcedStop: (processes) => { entry.forcedProcesses = processes; save(); },
+      } : {});
       entry.status = 'done'; entry.result = result; entry.at = Date.now(); save();
       return entry;
     } catch (error) {
@@ -117,6 +126,9 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
       // router takes it from here and the host never sees the qualifier.
       if (!/^[a-z0-9_-]+$/i.test(body?.sessionId || '') || !/^[A-Za-z0-9_-]{1,64}(?:@[a-z0-9]+)?$/.test(body?.pane || '') || !['now', 'idle', 'cancel', 'force', 'recover'].includes(body.mode)) throw Error('Expected exact session, pane and restart mode');
       if (['force', 'recover'].includes(body.mode) && body.confirmInterruption !== true) throw Error('Explicit interruption confirmation required');
+      if (body.ownerForce !== undefined && (typeof body.ownerForce !== 'boolean' || (body.ownerForce && body.mode !== 'now'))) {
+        throw Error('ownerForce is a boolean and only applies to an immediate restart');
+      }
       const recovery = entries.find(e => e.sessionId === body.sessionId && e.status === 'recovery-needed');
       if (recovery) {
         if (body.mode !== 'recover' || body.pane !== recovery.pane) throw Error('Interrupted restart requires explicit recovery');
@@ -144,8 +156,11 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
       }
       if (entries.filter((e) => ['queued', 'restarting', 'recovery-needed'].includes(e.status)).length >= 50) throw Error('Restart queue is full');
       if (!session || !pane?.alive || pane.meta?.sessionId !== body.sessionId) throw Error('Expected a live session in this pane');
+      const earlier = body.ownerForce === true
+        ? [...entries].reverse().find((e) => e.sessionId === body.sessionId && Array.isArray(e.forcedProcesses)) : null;
       const entry = { sessionId: body.sessionId, pane: body.pane, pid: pane.pid, mode: body.mode, status: 'queued', at: Date.now(),
-        ...(body.mode === 'force' ? { token: require('node:crypto').randomUUID() } : {}) };
+        ...(body.mode === 'force' ? { token: require('node:crypto').randomUUID() } : {}),
+        ...(body.ownerForce === true ? { ownerForce: true, priorForcedProcesses: earlier?.forcedProcesses || [] } : {}) };
       entries.push(entry); save();
       return body.mode === 'now' ? run(entry) : entry;
     },

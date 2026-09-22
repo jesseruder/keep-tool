@@ -2560,12 +2560,14 @@ legacy transcript ownership, and never inherits an unrelated caller's account. U
 active reviewer model. Exit codes are 0 for available, 6 for the weekly ceiling, 7 for
 the short window, and 8 when identity or usage is unavailable.
 
-The console's Fleet reviewer header has a **Restart** button beside `Tick now` and
-`Stats`. It uses the same `/api/restart-session` machinery as a pinned pane in Watch,
-in the guarded `idle` mode: the restart queues until the reviewer's turn has ended and
-stays cancellable while it waits, but does not wait for viewers of the read-only reviewer
-pane to navigate away. The button is
-disabled when there is no live reviewer pane. Because `claude --resume` inherits none
+Every live Claude or Codex session has a **Restart** in its actions (Watch and Triage),
+and the Fleet reviewer header has one beside `Tick now` and `Stats`. A click is Owner's
+own restart, so it is forced: `/api/restart-session` with `mode: 'now', ownerForce: true`
+asks for no idle prompt, stops the session's captured process tree (a turn in progress is
+interrupted, nothing is typed into it) and resumes the same conversation on the same
+account. A retry also stops any process an earlier forced restart of that session
+captured and left running. The reviewer's button is disabled when there is no live
+reviewer pane. Because `claude --resume` inherits none
 of the launch environment, both restart transactions (the guarded one and the explicit
 force/recover path) rebuild the reviewer's flags (`--model`, the prompt-suggestion
 settings) and env (`KEEP_REVIEWER`, `KEEP_DIR`, `BASH_MAX_OUTPUT_LENGTH`) from the

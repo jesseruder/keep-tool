@@ -261,7 +261,7 @@ function routes(ctx) {
       path: '/api/restart-daemon',
       handle: async ({ req, res, url, body }) => {
         try {
-          const result = daemonRestartGate.prepare();
+          const result = await daemonRestartGate.prepareWhenIdle();
           // launchd KeepAlive starts the new daemon. The terminal host and
           // its PTYs are separate processes and are not stopped here. The
           // request is marked right before exit so the new start is not read
