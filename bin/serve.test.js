@@ -12759,3 +12759,69 @@ test('a late hand choice retired under the lock is not overwritten by another re
     assert.equal(settings, 'claude-opus-5[1m]', 'and B\'s choice, seen in B\'s transcript, is left in settings.json');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+// ---- review round 6 ----
+
+test('another session picking exactly the compaction\'s id is a hand choice that stops the settings repair', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-other-session-choice-'));
+  const at = Date.parse('2026-09-04T12:00:00Z');
+  const stamp = (offsetMs) => new Date(at + offsetMs).toISOString();
+  const modelCommand = (args, offsetMs) => JSON.stringify({ type: 'user', timestamp: stamp(offsetMs), message: { content: [{ type: 'text',
+    text: `<command-name>/model</command-name><command-message>model</command-message><command-args>${args}</command-args>` }] } });
+  const out = (text, offsetMs) => JSON.stringify({ type: 'system', subtype: 'local_command', timestamp: stamp(offsetMs),
+    content: `<local-command-stdout>${text}</local-command-stdout>` });
+  try {
+    const record = { at, switchModel: 'claude-opus-5[1m]', restoreCommand: '/model claude-fable-5-1[1m]' };
+    const other = path.join(dir, 'b.jsonl');
+    // B has no pending record: its first /model of that very id is a person's, not A's daemon's.
+    fs.writeFileSync(other, `${[modelCommand('claude-opus-5[1m]', 5e3), out('Set model to Opus 5 (1M context)', 5e3)].join('\n')}\n`);
+    assert.equal(compactSwapUserModelChoice(record, other), null, 'read as A\'s own transcript it looks like A\'s switch');
+    assert.ok(compactSwapUserModelChoice(record, other, { daemon: null, assistant: false }), 'read as B\'s, it is a choice');
+    // B with a pending record of its own: B's daemon rows are exempt, a later hand pick is not.
+    const bRecord = { at: at + 4e3, switchModel: 'claude-opus-5[1m]', restoreCommand: '/model claude-fable-5-1[1m]' };
+    assert.equal(compactSwapUserModelChoice(record, other, { since: at, daemon: bRecord, assistant: false }), null);
+    fs.appendFileSync(other, `${[modelCommand('claude-opus-5[1m]', 9e3), out('Set model to Opus 5 (1M context)', 9e3)].join('\n')}\n`);
+    assert.ok(compactSwapUserModelChoice(record, other, { since: at, daemon: bRecord, assistant: false }));
+    // An assistant turn on some other model says nothing about B's settings choice.
+    const quiet = path.join(dir, 'quiet.jsonl');
+    fs.writeFileSync(quiet, `${JSON.stringify({ type: 'assistant', timestamp: stamp(5e3), message: { model: 'claude-sonnet-5', usage: { input_tokens: 1 } } })}\n`);
+    assert.equal(compactSwapUserModelChoice(record, quiet, { daemon: null, assistant: false }), null);
+
+    // The sweep: A's crash repair sees B's pick through the real reader and leaves the file.
+    fs.writeFileSync(other, `${[modelCommand('claude-opus-5[1m]', 5e3), out('Set model to Opus 5 (1M context)', 5e3)].join('\n')}\n`);
+    const aTranscript = path.join(dir, 'a.jsonl');
+    fs.writeFileSync(aTranscript, `${[modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 1e3)].join('\n')}\n`);
+    const a = { id: 'session-a', kind: 'claude', exited: true, endedTurn: true, mtime: at + 2e3 };
+    const b = { id: 'session-b', kind: 'claude', endedTurn: true, mtime: at + 6e3 };
+    writeCompactSwapFixture(dir, a.id, { at, switchModel: 'claude-opus-5[1m]', settingsModelBefore: 'claude-fable-5-1[1m]' });
+    const repairs = [];
+    const { compactSwapUserModelChoice: _real, ...base } = compactRestoreDeps(dir, a, []);
+    await sweepPendingCompactSwaps({ ...base, scanSessions: () => [a, b], stderr: () => {},
+      transcriptFileForSession: (session) => (session.id === a.id ? aTranscript : other),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-opus-5[1m]' }),
+      repairClaudeSettingsModel: (value) => { repairs.push(value); return { changed: true }; } });
+    assert.deepEqual(repairs, [], 'B\'s saved default stays');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the restore busy checks read the whole viewport of a tall pane', async () => {
+  const { compactRestoreInputBaseline } = require('./serve.js');
+  // A 60-row pane: the spinner is 50 rows up, far above the last 30.
+  const tall = ['✻ Working… (esc to interrupt)', ...Array.from({ length: 45 }, (_, i) => `  ⎿  ☐ step ${i}`),
+    '────', '❯ ', '────', '? for shortcuts'].join('\n');
+  const viewport = (screen) => async (_target, lines) => (lines == null ? screen : screen.split('\n').slice(-lines).join('\n'));
+  const deps = { sleep: async () => {}, hostRequest: async () => ({ guardedInput: true }),
+    livePaneState: async () => ({ pid: 7, inputCount: 3 }), readScreen: viewport(tall) };
+  await assert.rejects(compactRestoreInputBaseline({ pane: 'p' }, deps), /busy/);
+  // And while typing on the guarded path.
+  const command = '/model claude-fable-5-1[1m]';
+  const typedTall = ['✻ Working… (esc to interrupt)', ...Array.from({ length: 45 }, (_, i) => `  ⎿  ☐ step ${i}`), BOX(command)].join('\n');
+  const harness = draftHarness('');
+  const lines = [];
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, command, (s, t) => s.includes(t), {
+    ...harness.deps, inputBaseline: { pid: 4242, inputCount: 0 }, discardDraftOnAbort: true,
+    readScreen: async (_target, count) => { lines.push(count); return harness.inputs.includes(command)
+      ? (count == null ? typedTall : typedTall.split('\n').slice(-count).join('\n')) : BOX(''); } }), /started a turn/);
+  assert.equal(harness.inputs.includes('\r'), false);
+  assert.ok(lines.includes(null), 'the guarded confirmation reads the whole viewport');
+});

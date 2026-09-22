@@ -3212,7 +3212,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   const attempts = Number.isFinite(requested) && requested >= 1 ? Math.floor(requested) : 4;
   for (let attempt = 0; attempt < attempts && !confirmed; attempt += 1) {
     await sleep(400);
-    try { confirmation = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false); } catch { deps.deliveryTrace?.('screen-read-failed'); continue; }
+    try { confirmation = await read(target, deps.confirmationLines === undefined ? (inputBaseline ? null : 30) : deps.confirmationLines, false); } catch { deps.deliveryTrace?.('screen-read-failed'); continue; }
     if (turnRunning(confirmation)) throw await abortTyped(turnStarted());
     confirmed = confirmationCheck(confirmation, text);
     deps.deliveryTrace?.('screen-confirmation', { matched: confirmed });
@@ -3266,7 +3266,9 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   if (deps.requireExactDraft || guardedChunks || inputBaseline) {
     let exactScreen = '';
     try {
-      exactScreen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
+      // On the guarded path the whole viewport, so its turn check sees a spinner however
+      // tall the pane is.
+      exactScreen = await read(target, deps.confirmationLines === undefined ? (inputBaseline ? null : 30) : deps.confirmationLines, false);
     } catch { exactScreen = ''; }
     if (turnRunning(exactScreen)) throw await abortTyped(turnStarted());
     // The ordinary parser remains deliberately conservative about whether a short
@@ -3847,9 +3849,18 @@ function compactRestoreRateLimited(screen, command) {
 // row this can see).
 const COMPACT_SWAP_CHOICE_SCAN_BYTES = 8 * 1024 * 1024;
 
-function compactSwapUserModelChoice(record, file) {
-  const at = Number(record && record.at);
+//
+// Read against some other session's transcript (a shared settings file's other sessions),
+// the rows exempt as the daemon's are that session's own pending record's, not this
+// record's: options.daemon names that record, or null when the session has none — and
+// then every confirmed /model since options.since is a hand choice, including one of
+// exactly the id this record's compaction typed. options.assistant false drops the
+// assistant-record evidence, which only means something in the swapped session itself.
+function compactSwapUserModelChoice(record, file, options = {}) {
+  const at = Number.isFinite(options.since) ? options.since : Number(record && record.at);
   if (!file || !Number.isFinite(at) || at <= 0) return null;
+  const daemon = options.daemon === undefined ? record : options.daemon;
+  const daemonAt = daemon ? Number(daemon.at) : Infinity;
   let text;
   let reachedStart;
   try {
@@ -3865,8 +3876,8 @@ function compactSwapUserModelChoice(record, file) {
     reachedStart = start === 0;
   } catch { return null; }
   const lines = text.split(/\r?\n/);
-  const switchModel = String(record.switchModel || '').trim();
-  const restoreModel = String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim();
+  const switchModel = daemon ? String(daemon.switchModel || '').trim() : '';
+  const restoreModel = daemon ? String(daemon.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim() : '';
   let sawBefore = reachedStart;
   let sawOwnSwitch = false;
   for (let i = 0; i < lines.length; i += 1) {
@@ -3874,7 +3885,9 @@ function compactSwapUserModelChoice(record, file) {
     try { row = JSON.parse(lines[i]); } catch { continue; }
     const stamp = Date.parse(row && row.timestamp || '');
     if (!Number.isFinite(stamp)) continue;
-    if (stamp < at) { sawBefore = true; continue; }
+    if (stamp < daemonAt) sawBefore = true;
+    if (stamp < at) continue;
+    const daemonRow = stamp >= daemonAt;
     const args = localModelSwitchArgs(row);
     if (args != null) {
       const outcome = resolveLocalModelSwitch(args, lines.slice(i + 1, i + 1 + 64));
@@ -3882,15 +3895,15 @@ function compactSwapUserModelChoice(record, file) {
       // Exact ids, window included: `/model claude-fable-5-1` against a pending
       // `claude-fable-5-1[1m]` restore is a person dropping the 1M window, and the
       // restore would put it back.
-      const own = switchModel && args.toLowerCase() === switchModel.toLowerCase();
+      const own = daemonRow && switchModel && args.toLowerCase() === switchModel.toLowerCase();
       if (own && !sawOwnSwitch) { sawOwnSwitch = true; continue; }
       if (own && !sawBefore) continue;
-      if (restoreModel && args && args.toLowerCase() === restoreModel.toLowerCase()) continue;
+      if (daemonRow && restoreModel && args && args.toLowerCase() === restoreModel.toLowerCase()) continue;
       // Confirmed, or at least not refused by the harness: "Kept model as …" is no change.
       if (outcome.model === '<unknown>' && !outcome.label) continue;
       return { model: args || outcome.label, reason: `/model ${args || outcome.label} was chosen after the swap` };
     }
-    const model = genuineAssistantModel(row);
+    const model = options.assistant === false ? null : genuineAssistantModel(row);
     if (model && model !== '<unknown>'
         && !(switchModel && compactModelContainsFamily(model, switchModel))
         && !(restoreModel && compactModelBase(model) === compactModelBase(restoreModel))
@@ -4077,7 +4090,9 @@ async function compactRestoreInputBaseline(target, deps = {}, current = null) {
     envNumber('KEEP_COMPACT_RESTORE_SETTLE_MS', 1500));
   const settled = await paneState(pane, deps);
   if (!settled || settled.pid !== before.pid || settled.inputCount !== before.inputCount) return null;
-  const screen = await read(target, 30, false);
+  // The whole viewport (not scrollback): in a tall pane the spinner can sit far above the
+  // last 30 rows.
+  const screen = await read(target, null, false);
   if (current && current.localCommandPending) {
     const complete = /^\/compact(?:\s|$)/.test(current.localCommandPending)
       ? compactScreenConfirmed(screen, current.localCommandPending)
@@ -4172,8 +4187,17 @@ async function sweepPendingCompactSwaps(deps = {}) {
         return 'another pending model restore shares it';
       }
       const at = compactSwapRecordAt(record);
+      const choiceIn = (session) => {
+        if (session.id === record.sessionId) return userChoice(record, session);
+        const own = records.find((other) => other.sessionId === session.id && !other.error
+          && !codexCompact.isCodexCompactSwap(other)) || null;
+        try {
+          return (deps.compactSwapUserModelChoice || compactSwapUserModelChoice)(record, transcriptFor(session),
+            { since: at, daemon: own, assistant: false });
+        } catch { return null; }
+      };
       if ((sessions || []).some((session) => session && session.kind === 'claude'
-          && !(Number(session.mtime) < at) && userChoice(record, session))) {
+          && !(Number(session.mtime) < at) && choiceIn(session))) {
         return 'a model was chosen by hand since the swap';
       }
       return '';
