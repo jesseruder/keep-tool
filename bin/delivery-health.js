@@ -7,7 +7,7 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const { performance } = require('node:perf_hooks');
-const { received } = require('./delivery');
+const { received, indexConfirms, completedTyping } = require('./delivery');
 const STALE_MS = 2 * 60e3;
 const safeId = value => /^[A-Za-z0-9_-]{1,160}$/.test(String(value || '')) ? String(value) : 'unknown';
 
@@ -49,8 +49,14 @@ function inspect(options = {}) {
     let reason = 'receipt-missing';
     try { if (received(entry)) continue; }
     catch { reason = 'transcript-unreadable'; }
+    // The turn index recorded the message, so it did arrive; the reconcile sweep
+    // that runs before this inspection settles such a journal after a minute. One
+    // still here past the stale window is one that sweep failed to settle, which is
+    // still worth reporting, but not as an unconfirmed message. Read-only: settling
+    // is reconcile's, under the injection lock.
+    if ((Number(entry.typedAt) > 0 || completedTyping(entry)) && indexConfirms(entry, { db: options.indexDb })) reason = 'index-confirms-settling';
     const trace = events.filter(row => row.session === entry.sessionId && row.pane === entry.pane && row.at >= since - 1);
-    if (reason !== 'transcript-unreadable') {
+    if (reason === 'receipt-missing') {
       if (trace.some(row => ['enter-sent', 'submit-draft-ok'].includes(row.stage))) reason = 'receipt-missing-after-enter';
       else if (trace.some(row => ['screen-confirmation', 'draft-screen-check'].includes(row.stage) && row.matched === false)) reason = 'screen-verification-failed';
     }

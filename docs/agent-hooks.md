@@ -76,6 +76,18 @@ The warning identifies the session and pane, and distinguishes failed screen
 verification, missing receipts after Enter, and unreadable transcripts/journals.
 It keeps the same attention timestamp while the incident persists and clears
 when the transcript confirms receipt. Other sessions succeeding cannot clear it.
+The same minute check also asks the turn index: an attempt whose text reached the
+pane and is at least a minute old is settled as received when that session's
+indexed transcript holds a user message with the same text in a turn that started
+no earlier than two seconds before the send (clock granularity only, so an
+identical message sent just before cannot confirm it). The next send to that
+session asks the same question about the pending attempt before refusing it as
+unconfirmed. That covers a receipt that never landed
+in the transcript file the attempt was watching (a resumed session, a moved
+rollout); it cannot confirm text still in the input box, which has no transcript
+line. The index lags a live session by one hook or one 30-second tick. An attempt
+the index confirms but that is still unsettled at the two-minute mark is reported
+as `index-confirms-settling` rather than as a missing receipt.
 From the Keep source directory, `node bin/delivery-health.js` lists every current
 incident as JSON without message or screen contents. Rotated delivery traces help
 classify the failure; older attempts without traces are still reported as missing

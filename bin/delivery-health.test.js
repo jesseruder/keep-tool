@@ -217,3 +217,38 @@ test('a clock that stops or steps backwards cannot keep the sweep running', () =
     assert.equal(issues.length, 1, 'and the read-only inspection still runs');
   }
 }));
+
+// A journal whose message the turn index recorded did arrive. The reconcile sweep
+// settles it; if one is still here past the stale window, inspect says so rather
+// than calling the message unconfirmed, and it writes nothing itself.
+test('inspect reports a typed journal the turn index confirms as settling, and only that one', () => fixture(f => {
+  const turnIndex = require('./turn-index.js');
+  const { textHash } = require('./delivery');
+  const db = path.join(f.root, 'turns.sqlite');
+  const id = label => `${label}-${crypto.randomBytes(8).toString('hex')}`;
+  const indexed = id('codex'), untyped = id('codex'), unmatched = id('codex');
+  const stamp = new Date(f.now - 170e3).toISOString();
+  for (const [sessionId, text] of [[indexed, f.message], [untyped, f.message], [unmatched, 'other words']]) {
+    const file = path.join(f.root, `rollout-${sessionId}.jsonl`);
+    fs.writeFileSync(file, [
+      { type: 'session_meta', timestamp: stamp, payload: { id: sessionId, cwd: f.root, timestamp: stamp } },
+      { type: 'response_item', timestamp: stamp, payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } },
+    ].map(record => JSON.stringify(record)).join('\n') + '\n');
+    assert.equal(turnIndex.ingestFile(file, { agent: 'codex', db }).ok, true);
+  }
+  turnIndex.close();
+  const write = (name, sessionId, extra) => {
+    const file = path.join(f.root, name + '.jsonl'); fs.writeFileSync(file, '');
+    fs.writeFileSync(path.join(f.directory, textHash(sessionId) + '.json'), JSON.stringify({ kind: 'codex', sessionId,
+      pane: name + '-pane', file, offset: 0, createdAt: f.now - 180e3, hash: textHash(f.message), ...extra }));
+  };
+  write('indexed', indexed, { typedAt: f.now - 179e3 });
+  write('untyped', untyped, {});
+  write('unmatched', unmatched, { typedAt: f.now - 179e3 });
+  const before = fs.readdirSync(f.directory).sort();
+  const reasons = Object.fromEntries(inspect({ ...f, indexDb: db }).map(issue => [issue.sessionId, issue.reason]));
+  assert.deepEqual(reasons, { [indexed]: 'index-confirms-settling', [untyped]: 'receipt-missing', [unmatched]: 'receipt-missing' });
+  assert.deepEqual(fs.readdirSync(f.directory).sort(), before, 'inspect settles nothing');
+  // Without an index the old reasons stand.
+  assert.equal(inspect({ ...f, indexDb: path.join(f.root, 'missing.sqlite') }).find(issue => issue.sessionId === indexed).reason, 'receipt-missing');
+}));

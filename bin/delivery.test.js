@@ -747,3 +747,187 @@ test('an old fully typed journal is never expired on behalf of a different send'
     assert.equal(fs.existsSync(journal), true, 'and the record of the first copy is kept');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+// ---------- the turn index as a second witness ----------
+//
+// Every fixture below is generated: random session ids, temp directories, and a
+// synthetic Codex rollout ingested into a temporary index with turn-index's own
+// ingestFile, so the index rows have exactly the shape the daemon writes.
+const crypto = require('crypto');
+const turnIndex = require('./turn-index.js');
+
+const generatedId = (label) => `${label}-${crypto.randomBytes(8).toString('hex')}`;
+
+// Writes one rollout per session holding `texts` as typed user messages at `at`,
+// and ingests it into `db`.
+function indexMessages(dir, db, sessionId, texts, at = Date.now()) {
+  const stamp = new Date(at).toISOString();
+  const records = [
+    { type: 'session_meta', timestamp: stamp, payload: { id: sessionId, cwd: dir, timestamp: stamp, originator: 'codex-tui', source: 'cli' } },
+    ...texts.flatMap((text) => [
+      { type: 'response_item', timestamp: stamp, payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } },
+      { type: 'event_msg', timestamp: stamp, payload: { type: 'task_complete' } },
+    ]),
+  ];
+  const file = path.join(dir, `rollout-${sessionId}.jsonl`);
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const result = turnIndex.ingestFile(file, { agent: 'codex', db });
+  turnIndex.close();
+  assert.equal(result.ok, true);
+}
+
+function indexFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-index-'));
+  // The receipt transcript stays empty for good: the hook receipt never lands.
+  const file = path.join(dir, 'receipt-transcript.jsonl'); fs.writeFileSync(file, '');
+  return { dir, file, directory: path.join(dir, 'journal'), db: path.join(dir, 'turns.sqlite') };
+}
+
+const plainSend = (f, sessionId, text, extra = {}) => deliver({
+  session: { id: sessionId, kind: 'codex' }, pane: 'pane-' + sessionId, text, file: f.file, directory: f.directory,
+  indexDb: f.db, precheck: async () => {}, type: async () => {}, submitDraft: async () => assert.fail('unexpected Enter'),
+  draftMatches: async () => false, pause: async () => {}, attempts: 1, ...extra,
+});
+
+test('a delivery whose transcript receipt never lands is confirmed by the turn index', async () => {
+  const f = indexFixture();
+  const sessionId = generatedId('codex');
+  const stages = [];
+  try {
+    indexMessages(f.dir, f.db, sessionId, ['[keep] from another session: please rebase']);
+    const result = await plainSend(f, sessionId, '[keep] from another session:\n  please rebase', { trace: (stage) => stages.push(stage) });
+    assert.deepEqual(result, { ok: true, delivery: 'received', source: 'turn-index' });
+    assert.ok(stages.includes('receipt-from-index'));
+    assert.deepEqual(fs.readdirSync(f.directory).filter((name) => name.endsWith('.json')), [], 'the journal is finished');
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('a message longer than the index cap is confirmed by its stored prefix', async () => {
+  const f = indexFixture();
+  const sessionId = generatedId('codex');
+  const text = 'long message '.repeat(Math.ceil(turnIndex.TEXT_CAP / 10));
+  try {
+    indexMessages(f.dir, f.db, sessionId, [text]);
+    assert.equal((await plainSend(f, sessionId, text)).source, 'turn-index');
+    // The same stored prefix under a different ending is not this message.
+    const other = generatedId('codex');
+    indexMessages(f.dir, f.db, other, [text]);
+    await assert.rejects(plainSend(f, other, text.slice(0, turnIndex.TEXT_CAP - 50)), /no matching transcript receipt/);
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('the turn index does not confirm other words, another session, or an old identical message', async () => {
+  const f = indexFixture();
+  const sessionId = generatedId('codex');
+  const old = generatedId('codex');
+  const elsewhere = generatedId('codex');
+  try {
+    indexMessages(f.dir, f.db, sessionId, ['please rebase onto master']);
+    await assert.rejects(plainSend(f, sessionId, 'please rebase onto main'), /no matching transcript receipt/);
+    indexMessages(f.dir, f.db, elsewhere, ['run the tests']);
+    await assert.rejects(plainSend(f, generatedId('codex'), 'run the tests'), /no matching transcript receipt/);
+    // The same words sent ten minutes before this attempt answer that attempt, not this one.
+    indexMessages(f.dir, f.db, old, ['continue'], Date.now() - 10 * 60e3);
+    await assert.rejects(plainSend(f, old, 'continue'), /no matching transcript receipt/);
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('a missing turn index leaves the unconfirmed error exactly as before', async () => {
+  const f = indexFixture();
+  const sessionId = generatedId('codex');
+  const stages = [];
+  try {
+    await assert.rejects(plainSend(f, sessionId, 'hello', { trace: (stage) => stages.push(stage) }),
+      /Delivery unconfirmed: no matching transcript receipt/);
+    assert.ok(stages.includes('index-missing'));
+    assert.equal(fs.existsSync(f.db), false, 'the delivery path never creates the index');
+    assert.equal(fs.readdirSync(f.directory).filter((name) => name.endsWith('.json')).length, 1, 'the attempt is retained');
+    // A file that is not an index at all is no evidence either, and no exception.
+    fs.writeFileSync(f.db, 'not a database');
+    stages.length = 0;
+    await assert.rejects(plainSend(f, generatedId('codex'), 'hello', { trace: (stage) => stages.push(stage) }), /Delivery unconfirmed: no matching transcript receipt/);
+    assert.ok(stages.includes('index-error'));
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('reconcile settles a typed journal the turn index confirms and leaves the rest alone', async () => {
+  const { reconcile, statusForText, textHash } = require('./delivery');
+  const f = indexFixture();
+  const confirmed = generatedId('codex');
+  const other = generatedId('codex');
+  const check = generatedId('codex');
+  const untyped = generatedId('codex');
+  const long = generatedId('codex');
+  const longText = 'x'.repeat(turnIndex.TEXT_CAP + 100);
+  const journalFor = (id) => path.join(f.directory, textHash(id) + '.json');
+  try {
+    // Sent while the index had not caught up (it does not exist yet), so each is
+    // left unconfirmed with its text on the pane.
+    for (const [id, text, extra] of [[confirmed, 'ship it'], [other, 'ship it too'], [check, 'scheduled check', { retainReceipt: true, key: 'check-key' }], [long, longText]]) {
+      await assert.rejects(plainSend(f, id, text, extra), /no matching transcript receipt/);
+    }
+    assert.ok(JSON.parse(fs.readFileSync(journalFor(long), 'utf8')).indexPrefixHash, 'a long message records its indexed prefix');
+    // Typing failed before Enter: nothing reached the transcript, and it must not be looked up.
+    await assert.rejects(plainSend(f, untyped, 'never sent', { type: async () => { throw new Error('host refused'); } }), /host refused/);
+
+    indexMessages(f.dir, f.db, confirmed, ['ship it']);
+    indexMessages(f.dir, f.db, other, ['something unrelated']);
+    indexMessages(f.dir, f.db, check, ['scheduled check']);
+    indexMessages(f.dir, f.db, untyped, ['never sent']);
+    indexMessages(f.dir, f.db, long, [longText]);
+
+    // Inside the grace the send path's own last look stands; nothing is settled.
+    assert.deepEqual(reconcile(f.directory, { indexDb: f.db }), []);
+    const later = Date.now() + 61e3;
+    assert.deepEqual(reconcile(f.directory, { now: later, indexDb: f.db }).sort(), [check, confirmed, long].sort());
+    assert.equal(fs.existsSync(journalFor(confirmed)), false);
+    assert.equal(fs.existsSync(path.join(f.directory, 'settled', textHash(confirmed) + '.json')), true, 'a plain send settles as received');
+    assert.deepEqual(statusForText(f.directory, 'scheduled check', 'check-key'), { sessionId: check, kind: 'codex', received: true });
+    assert.equal(fs.existsSync(journalFor(other)), true, 'other words leave the journal unconfirmed');
+    assert.equal(fs.existsSync(journalFor(untyped)), true, 'an untyped journal keeps its old stale handling');
+    // The settled journal is recovered by the next send of the same text, without retyping.
+    assert.deepEqual(await plainSend(f, confirmed, 'ship it', { type: async () => assert.fail('retyped') }),
+      { ok: true, delivery: 'received', recovered: true });
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('an identical message recorded before the attempt does not confirm it; one recorded after does', async () => {
+  const f = indexFixture();
+  const before = generatedId('codex');
+  const after = generatedId('codex');
+  try {
+    // Ten seconds before this send: a repeated "continue", not this one.
+    indexMessages(f.dir, f.db, before, ['continue'], Date.now() - 10e3);
+    await assert.rejects(plainSend(f, before, 'continue'), /no matching transcript receipt/);
+    // Recorded by the agent after this send typed it, as a real transcript line is.
+    const result = await plainSend(f, after, 'continue', {
+      type: async () => { await new Promise((resolve) => setTimeout(resolve, 5)); indexMessages(f.dir, f.db, after, ['continue']); },
+    });
+    assert.equal(result.source, 'turn-index');
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test('a pending typed journal the index confirms no longer blocks the next send', async () => {
+  const f = indexFixture();
+  const confirmed = generatedId('codex');
+  const unconfirmed = generatedId('codex');
+  const stages = [];
+  const trace = (stage) => stages.push(stage);
+  // The next send's own receipt lands in the watched transcript the usual way.
+  const typeWithReceipt = (text) => async () => fs.appendFileSync(f.file, JSON.stringify({
+    type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } }) + '\n');
+  try {
+    await assert.rejects(plainSend(f, confirmed, 'first message'), /no matching transcript receipt/);
+    await assert.rejects(plainSend(f, unconfirmed, 'first message'), /no matching transcript receipt/);
+    // The index catches up after the first send gave up; only one session recorded it.
+    indexMessages(f.dir, f.db, confirmed, ['first message']);
+    indexMessages(f.dir, f.db, unconfirmed, ['something else']);
+
+    const result = await plainSend(f, confirmed, 'second message', { trace, type: typeWithReceipt('second message') });
+    assert.deepEqual(result, { ok: true, delivery: 'received' }, 'delivered normally, by its own transcript receipt');
+    assert.ok(stages.includes('pending-settled-by-index'));
+
+    await assert.rejects(plainSend(f, unconfirmed, 'second message', { type: typeWithReceipt('second message') }),
+      /Previous delivery is unconfirmed/);
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});

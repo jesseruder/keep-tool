@@ -25,6 +25,16 @@ function userText(record, kind) {
     ? c.filter((b) => b.type === 'text').map((b) => b.text).join('\n') : null;
 }
 
+// The turn index is a second witness, consulted only where the transcript receipt
+// has already failed to appear (see bin/delivery-index.js). Required lazily, and it
+// loads node:sqlite only inside a lookup, so the CLI paths that load this module for
+// statusForText or acknowledge never pay for SQLite. A lookup that
+// throws for any reason is no evidence, never a failed delivery.
+function indexConfirms(entry, { text, db, trace } = {}) {
+  try { return require('./delivery-index.js').lookup(entry, { text, db, trace, hash, normalize }); }
+  catch { try { trace && trace('index-error'); } catch {} return null; }
+}
+
 function received(entry) {
   const size = fs.statSync(entry.file).size;
   if (size < entry.offset) return false;
@@ -231,7 +241,7 @@ function typingProgress(entry, writeJournal) {
   };
 }
 
-async function deliverAttempt({ session, pane, text, key, file, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, observe, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16, staleJournalMs = STALE_JOURNAL_MS }) {
+async function deliverAttempt({ session, pane, text, key, file, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, observe, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16, staleJournalMs = STALE_JOURNAL_MS, indexDb }) {
   let typingError;
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const activeJournal = path.join(directory, hash(session.id) + '.json');
@@ -245,7 +255,20 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
   }
   if (entry) {
     trace('pending-journal-found');
-    if (settled || received(entry)) {
+    // A pending journal whose transcript receipt never landed would refuse this send
+    // below ("Previous delivery is unconfirmed") until the minute sweep asked the
+    // index for it. Ask here instead, for a journal whose text reached the pane. No
+    // grace period: a second send arrives after the first gave up polling, so the
+    // index has had its chance to catch up, and a miss changes nothing. A match is
+    // settled exactly as a late transcript receipt is: the same text returns as
+    // recovered (never retyped), other words proceed to a fresh attempt.
+    const byIndex = () => {
+      if (!(Number(entry.typedAt) > 0 || completedTyping(entry))) return false;
+      if (!indexConfirms(entry, { db: indexDb, trace })) return false;
+      trace('pending-settled-by-index');
+      return true;
+    };
+    if (settled || received(entry) || byIndex()) {
       finish(directory, journal, entry);
       if (entry.hash === hash(text)) return { ok: true, delivery: 'received', recovered: true };
       entry = null;
@@ -338,6 +361,12 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     journal = activeJournal;
     await precheck();
     entry = { createdAt: Date.now(), sessionId: session.id, kind: session.kind, file, offset: fs.statSync(file).size, pane, hash: hash(text), key, receiptId: receiptId(text, key), retainReceipt };
+    // The journal keeps only hashes, and the turn index keeps only the first
+    // TEXT_CAP characters of a message. For a message longer than that, record the
+    // hash of the part the index keeps, so the reconcile sweep - which never has the
+    // text - can still recognise it there.
+    const indexPrefixHash = require('./delivery-index.js').prefixHash(text, hash);
+    if (indexPrefixHash) entry.indexPrefixHash = indexPrefixHash;
     const writeJournal = () => {
       const temp = journal + '.tmp';
       fs.writeFileSync(temp, JSON.stringify(entry), { mode: 0o600 });
@@ -400,6 +429,17 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
       await pause(500);
       if (await confirmed()) { finish(directory, journal, entry); return { ok: true, delivery: 'received' }; }
     }
+  }
+  // Last, once: the transcript receipt reads one file from one offset, and the turn
+  // index sees the message wherever this session recorded it. It lags a live session
+  // by a hook or a 30 s tick, so this is a final look, not a poll; reconcile asks
+  // again every minute for whatever it misses here. It runs before a typing error is
+  // rethrown too: a transcript line for this text means it was submitted after all.
+  const fromIndex = indexConfirms(entry, { text, db: indexDb, trace });
+  if (fromIndex) {
+    trace('receipt-from-index');
+    finish(directory, journal, entry);
+    return { ok: true, delivery: 'received', source: 'turn-index' };
   }
   if (typingError) throw typingError;
   throw new Error('Delivery unconfirmed: no matching transcript receipt. Pending attempt retained; no automatic retyping.');
@@ -503,8 +543,19 @@ function pendingForSession(directory, sessionId) {
 // answer. `unknownNodes` names the nodes this pane list could not speak for, and a
 // journal on one of them is left exactly as it is: not deleted, not settled, not
 // counted as resolved. "I could not tell" is not "it is gone".
+//
+// A journal whose text reached the pane (typedAt, or every chunk acknowledged) and
+// whose transcript receipt is still missing after INDEX_GRACE_MS is looked up in the
+// turn index. If the session's transcript recorded the message, it settles exactly
+// as a transcript receipt would. On 2026-09-17 a tell's receipt never landed while
+// the message sat in the Codex transcript, and the unconfirmed journal refused every
+// later send to that session until it went stale; this settles it within a minute.
+// The grace leaves the send path, which asks the index itself, to finish first.
+const INDEX_GRACE_MS = 60e3;
+
 function reconcile(directory, {
   now = Date.now(), staleJournalMs = STALE_JOURNAL_MS, panes = null, unknownNodes = null, unknownRemote = false,
+  indexDb, indexGraceMs = INDEX_GRACE_MS,
 } = {}) {
   const unknown = unknownNodes instanceof Set ? unknownNodes : new Set(unknownNodes || []);
   const daemon = require('./nodes.js').daemonNode();
@@ -527,7 +578,17 @@ function reconcile(directory, {
       const journal = path.join(directory, name);
       const entry = JSON.parse(fs.readFileSync(journal, 'utf8'));
       if (name !== hash(entry.sessionId) + '.json') continue;
-      if (!received(entry)) {
+      // An unreadable transcript used to skip the entry outright (the catch below);
+      // it still does unless the index can speak for the message.
+      let got, unreadable = null;
+      try { got = received(entry); } catch (error) { got = false; unreadable = error; }
+      if (!got && journalAgeMs(journal, entry, now) >= indexGraceMs
+          && (Number(entry.typedAt) > 0 || completedTyping(entry))) {
+        const trace = require('./delivery-trace').recorder(directory, { id: entry.sessionId, kind: entry.kind }, entry.pane);
+        if (indexConfirms(entry, { db: indexDb, trace })) { trace('receipt-from-index'); got = true; unreadable = null; }
+      }
+      if (unreadable) throw unreadable;
+      if (!got) {
         if (journalAgeMs(journal, entry, now) < staleJournalMs) continue;
         if (!(Number(entry.typedAt) > 0) && !partialTyping(entry)) fs.unlinkSync(journal);
         else if (panes?.size && !panes.has(entry.pane) && !unknownPane(entry.pane)) {
@@ -548,5 +609,5 @@ function reconcile(directory, {
   }
   return settled;
 }
-module.exports = { deliver, received, reconcile, userText, statusForText, acknowledge, pendingForSession,
-  settleObserved, textHash: hash, STALE_JOURNAL_MS };
+module.exports = { deliver, received, indexConfirms, reconcile, userText, statusForText, acknowledge, pendingForSession,
+  settleObserved, completedTyping, textHash: hash, STALE_JOURNAL_MS, INDEX_GRACE_MS };
