@@ -14241,3 +14241,115 @@ test('a standalone open is placed by the project it resolved, exactly as a card 
   assert.equal(resolvePlacement({ project: [null, project] }, tilde), 'mini');
   assert.equal(resolvePlacement({ project: [`~/${path.basename(project)}`, project] }, tilde), 'mini');
 });
+
+
+test('the hello that decides whether a spawn may be retried never spends the spawn own window', async () => {
+  const { closeHostClient, hostRequest } = require('./serve');
+  // A host whose hello is slow. Finding out whether a request *could* be retried is
+  // a convenience; the request itself is not, and the one must never eat the other.
+  const makeHost = (hello) => {
+    const calls = [];
+    return {
+      calls,
+      socket: { destroyed: false },
+      request: async (type, params, options) => {
+        calls.push({ type, params, timeoutMs: options && options.timeoutMs });
+        if (type === 'hello') return hello();
+        return { pane: { id: 'budget-pane', pid: 1, createdAt: 1 } };
+      },
+      onDisconnect: () => ({ dispose() {} }),
+      close: () => {},
+    };
+  };
+  const params = { operationId: 'open-budget-00000001', cmd: '/bin/sh', args: ['-c', 'sleep 30'] };
+
+  await closeHostClient();
+  try {
+    // Six seconds of the clock spent on the hello, and the spawn still goes out with
+    // the whole eight it came in with.
+    let now = 1000;
+    const slow = makeHost(async () => { now += 6000; return { bootId: 'boot-one', spawnReceipts: true }; });
+    await hostRequest('spawn', params, { connectHost: async () => slow, wallNow: () => now });
+    const spawn = slow.calls.find((call) => call.type === 'spawn');
+    assert.equal(spawn.timeoutMs, 8000, 'the spawn keeps its full request window');
+  } finally { await closeHostClient(); }
+
+  await closeHostClient();
+  try {
+    // A hello that never answers is not a spawn that never runs. It times out on its
+    // own short budget, the spawn goes out with everything it had, and the answer
+    // "this connection has no journal" is not remembered — the next spawn asks again
+    // rather than inheriting one slow moment as a permanent verdict.
+    const mute = makeHost(() => new Promise(() => {}));
+    const started = Date.now();
+    const result = await hostRequest('spawn', params, {
+      connectHost: async () => mute, hostGenerationTimeoutMs: 60,
+    });
+    assert.equal(result.pane.id, 'budget-pane');
+    assert.ok(Date.now() - started < 3000, 'the spawn did not wait out a request timeout for a hello');
+    const spawn = mute.calls.find((call) => call.type === 'spawn');
+    assert.equal(spawn.timeoutMs, 8000);
+    // Asked again next time, rather than written off.
+    await hostRequest('spawn', { ...params, operationId: 'open-budget-00000002' }, {
+      connectHost: async () => mute, hostGenerationTimeoutMs: 60,
+    });
+    assert.equal(mute.calls.filter((call) => call.type === 'hello').length, 2);
+  } finally { await closeHostClient(); }
+
+  await closeHostClient();
+  try {
+    // Ten opens starting at once cost one hello, not ten.
+    let resolveHello;
+    const shared = makeHost(() => new Promise((resolve) => { resolveHello = resolve; }));
+    const deps = { connectHost: async () => shared };
+    const both = Promise.all([
+      hostRequest('spawn', { ...params, operationId: 'open-budget-00000003' }, deps),
+      hostRequest('spawn', { ...params, operationId: 'open-budget-00000004' }, deps),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(shared.calls.filter((call) => call.type === 'hello').length, 1,
+      'concurrent first spawns share one hello');
+    resolveHello({ bootId: 'boot-one', spawnReceipts: true });
+    await both;
+    assert.equal(shared.calls.filter((call) => call.type === 'hello').length, 1);
+  } finally { await closeHostClient(); }
+});
+
+test('a reopen on another node refuses when the evidence its agent needs could not be read', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reopen-evidence-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const configDir = path.join(root, 'claude');
+  fs.mkdirSync(configDir);
+  const config = path.join(root, 'accounts.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'node-open', label: 'Node open', agent: 'claude', configDir },
+  ], defaultAccounts: { claude: 'node-open' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+  const session = { id: 'evidence-session', kind: 'claude', project: root, accountId: 'node-open' };
+  require('./accounts').pinSession(session.id, 'claude', 'node-open', { root, env, node: 'aws1' });
+  // A table that answers, and a Claude TUI in it whose own argv does not name a
+  // session. The only thing that could identify it is the session id its children
+  // carry in their environment — which is exactly the read being failed here.
+  const rows = [
+    { pid: 100, ppid: 1, pidStart: 'a', args: 'claude', agent: 'claude', interactive: true },
+    { pid: 101, ppid: 100, pidStart: 'b', args: 'node hook', agent: null, interactive: false },
+  ];
+  const base = {
+    root, env, scanSessions: () => [session], placementNodes: ['main', 'aws1'],
+    agentProcessRows: async () => rows,
+    resolveSessionTarget: async () => { throw new InjectionError(404, 'no pane', { notLive: true }); },
+  };
+
+  // An empty map for want of looking is not "no agent is running", and resuming on
+  // it risks two writers on one transcript.
+  await assert.rejects(openSession({ sessionId: session.id }, {
+    ...base, psEnv: async () => { throw new Error('the node could not read process environments'); },
+  }), (error) => error.status === 409 && error.message === 'cannot verify processes on aws1');
+
+  // The same read succeeding, and finding nothing: the open carries on to its launch.
+  await assert.rejects(openSession({ sessionId: session.id }, {
+    ...base,
+    psEnv: async () => '',
+    prepareLaunch: () => { throw new Error('reached the launch'); },
+  }), /reached the launch/);
+});

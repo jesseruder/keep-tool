@@ -461,12 +461,20 @@ function accountLines() {
     .map((entry) => `${entry.status}: ${entry.text}${entry.fix ? `\n  fix: ${entry.fix}` : ''}`).join('\n');
 }
 
+// Awaits a body that returns a promise — doctor asks the other nodes what their
+// home directory is, so it has to be one — and stays synchronous for bodies that do
+// not, so every existing caller reads the same.
 function capture(fn) {
   const lines = [];
   const log = console.log;
   console.log = (...args) => lines.push(args.map(String).join(' '));
-  try { fn(); } finally { console.log = log; }
-  return lines.join('\n');
+  const done = () => { console.log = log; return lines.join('\n'); };
+  let result;
+  try { result = fn(); } catch (error) { done(); throw error; }
+  if (result && typeof result.then === 'function') {
+    return result.then(done, (error) => { done(); throw error; });
+  }
+  return done();
 }
 
 function linkTargets(home, skill) {
@@ -788,30 +796,30 @@ test('keep setup skills --list reports every pack and writes nothing', () => {
   } finally { f.cleanup(); }
 });
 
-test('keep doctor reports required and optional skill packs', () => {
+test('keep doctor reports required and optional skill packs', async () => {
   const f = hooksFixture();
   const exitCode = process.exitCode;
   try {
     setup.applySkillPlans(setup.skillPlans(['core']));
-    const printed = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    const printed = await capture(() => setup.doctor(path.join(f.base, 'registry')));
     assert.match(printed, /^ok: skill pack core$/m);
     assert.match(printed, /^optional: skill pack handoff$/m);
     assert.match(printed, /^ {2}fix: keep setup skills --pack handoff$/m);
 
     // Codex reads `~/.agents/skills`: a pack linked in one home only is not installed.
     fs.rmSync(path.join(f.home, '.agents', 'skills', 'fleet-review'));
-    const half = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    const half = await capture(() => setup.doctor(path.join(f.base, 'registry')));
     assert.match(half, /^FAIL: skill pack core$/m);
     assert.match(half, /^ {2}fix: keep setup skills$/m);
 
     fs.rmSync(path.join(f.home, '.claude', 'skills', 'fleet-review'));
-    const missing = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    const missing = await capture(() => setup.doctor(path.join(f.base, 'registry')));
     assert.match(missing, /^FAIL: skill pack core$/m);
     assert.match(missing, /^ {2}fix: keep setup skills$/m);
   } finally { process.exitCode = exitCode; f.cleanup(); }
 });
 
-test('keep doctor reports shared account setup drift for every nondefault account', () => {
+test('keep doctor reports shared account setup drift for every nondefault account', async () => {
   const f = hooksFixture();
   const exitCode = process.exitCode;
   const accounts = require('./accounts');
@@ -847,7 +855,7 @@ test('keep doctor reports shared account setup drift for every nondefault accoun
     fs.writeFileSync(path.join(codexSource.configDir, 'config.toml'), 'model = "source-model"\n\n[features]\nhooks = false\n');
     fs.unlinkSync(path.join(claudeTarget.configDir, 'CLAUDE.md'));
     // The one full doctor run: it prints these lines and fails the check.
-    const behind = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    const behind = await capture(() => setup.doctor(path.join(f.base, 'registry')));
     assert.match(behind, /^FAIL: Codex account codex-alt shared setup behind \(1 value: features\.hooks\)$/m);
     assert.match(behind, /^ {2}fix: keep accounts setup codex-alt --share-from codex\/default$/m);
     assert.match(behind, /^FAIL: Claude account automation shared setup behind \(1 entry: CLAUDE\.md\)$/m);
@@ -863,7 +871,7 @@ test('keep doctor reports shared account setup drift for every nondefault accoun
   } finally { process.exitCode = exitCode; f.cleanup(); }
 });
 
-test('keep doctor reports a pending compaction swap as deferred rather than drift', () => {
+test('keep doctor reports a pending compaction swap as deferred rather than drift', async () => {
   const f = hooksFixture();
   const exitCode = process.exitCode;
   const prior = process.env.KEEP_DIR;
@@ -883,7 +891,7 @@ test('keep doctor reports a pending compaction swap as deferred rather than drif
       transcriptFile: path.join(target.configDir, 'sessions', 'swap-session.jsonl') }) + '\n');
     fs.writeFileSync(path.join(target.configDir, 'config.toml'), 'model = "fallback-model"\n\n[features]\nhooks = true\n');
 
-    const deferred = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    const deferred = await capture(() => setup.doctor(path.join(f.base, 'registry')));
     assert.match(deferred, /^ok: Codex account codex-alt shared setup in sync \(model keys deferred: compaction swap pending\)$/m);
 
     // The compaction restores the model it saved and drops its record.
@@ -897,7 +905,7 @@ test('keep doctor reports a pending compaction swap as deferred rather than drif
   }
 });
 
-test('keep doctor reports a conflicted or unreadable account without stopping', () => {
+test('keep doctor reports a conflicted or unreadable account without stopping', async () => {
   const f = hooksFixture();
   const exitCode = process.exitCode;
   const accounts = require('./accounts');
@@ -910,7 +918,7 @@ test('keep doctor reports a conflicted or unreadable account without stopping', 
     codexSetup.shareSetup(source, target);
     fs.writeFileSync(sourceConfig, 'model = "source-model"\n\n[features]\nhooks = false\n');
     fs.writeFileSync(path.join(target.configDir, 'config.toml'), 'model = "source-model"\n\n[features]\nhooks = "maybe"\n');
-    const conflicted = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    const conflicted = await capture(() => setup.doctor(path.join(f.base, 'registry')));
     assert.match(conflicted, /^FAIL: Codex account codex-alt shared setup conflicts \(1 value: features\.hooks\)$/m);
     assert.match(conflicted, new RegExp(`^ {2}fix: resolve those values in .*config\\.toml, then keep accounts setup codex-alt --share-from codex/default$`, 'm'));
 
@@ -1117,4 +1125,41 @@ test('keep node init refuses an IPv4-mapped wildcard too', (t) => {
   }
   assert.equal(fs.existsSync(path.join(home, 'Library', 'LaunchAgents', 'games.castle.keep.host.plist')), false);
   assert.equal(fs.existsSync(path.join(home, '.config', 'systemd', 'user', 'keep-host.service')), false);
+});
+
+
+test('keep doctor fails an install whose nodes do not share its home directory', async () => {
+  const setup = require('./setup');
+  const listNodes = () => [
+    { name: 'main', daemon: true, invalid: false },
+    { name: 'aws1', daemon: false, invalid: false },
+    { name: 'broken', daemon: false, invalid: true },
+  ];
+  const connectTo = (home) => async () => ({
+    descriptor: null,
+    request: async () => ({ home }),
+    close: () => {},
+  });
+
+  // A single-node install has nothing to ask and says nothing, so doctor's output is
+  // exactly what it always was.
+  assert.deepEqual(await setup.nodeHomeReport({ listNodes: () => [{ name: 'main', daemon: true, invalid: false }] }), []);
+
+  const shared = await setup.nodeHomeReport({ listNodes, connect: connectTo('/Users/jesseruder'), homedir: '/Users/jesseruder' });
+  assert.deepEqual(shared, [{ status: 'ok', text: 'node aws1 shares this home (/Users/jesseruder)' }]);
+
+  const differs = await setup.nodeHomeReport({ listNodes, connect: connectTo('/home/ubuntu'), homedir: '/Users/jesseruder' });
+  assert.equal(differs[0].status, 'FAIL');
+  assert.equal(differs[0].text,
+    'node aws1 has home /home/ubuntu, not /Users/jesseruder; Keep nodes must share the home directory');
+  assert.match(differs[0].fix, /^give aws1 the home \/Users\/jesseruder/);
+
+  // Unreachable is not the same as wrong: keep nodes reports reachability, and a
+  // node that is merely switched off must not fail this install's doctor.
+  const down = await setup.nodeHomeReport({
+    listNodes, homedir: '/Users/jesseruder',
+    connect: async () => { throw new Error('connect ECONNREFUSED'); },
+  });
+  assert.equal(down[0].status, 'optional');
+  assert.match(down[0].text, /node aws1 could not be asked: connect ECONNREFUSED/);
 });

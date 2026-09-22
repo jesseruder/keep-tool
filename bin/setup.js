@@ -780,7 +780,47 @@ function accountSetupReport() {
   return lines;
 }
 
-function doctor(root) {
+// Keep's nodes share one home directory, and everything that travels between them
+// leans on it: an account's paths are expanded against the daemon's home long before
+// they reach the machine that has to open them. A node whose home is somewhere else
+// cannot run this install's accounts at all — it refuses the launch — and the place
+// to find that out is here, not at the moment somebody opens a card on it.
+//
+// A single-node install has nothing to ask and says nothing, so its output is
+// unchanged.
+async function nodeHomeReport(deps = {}) {
+  let entries;
+  try { entries = (deps.listNodes || require('./node-registry.js').listNodes)(); }
+  catch { return []; }
+  const remote = entries.filter((entry) => !entry.daemon && !entry.invalid);
+  if (!remote.length) return [];
+  const connect = deps.connect || require('./hostclient.js').connect;
+  const home = deps.homedir || os.homedir();
+  return Promise.all(remote.map(async (entry) => {
+    let client = null;
+    try {
+      client = await connect({ node: entry.name, timeoutMs: deps.timeoutMs == null ? 3000 : deps.timeoutMs });
+      const hello = client.descriptor || await client.request('hello');
+      if (!hello || typeof hello.home !== 'string' || !hello.home) {
+        return { status: 'optional', text: `node ${entry.name} did not say what its home directory is` };
+      }
+      if (hello.home === home) return { status: 'ok', text: `node ${entry.name} shares this home (${home})` };
+      return {
+        status: 'FAIL',
+        text: `node ${entry.name} has home ${hello.home}, not ${home}; Keep nodes must share the home directory`,
+        fix: `give ${entry.name} the home ${home}, or remove it with keep nodes rm ${entry.name}`,
+      };
+    } catch (error) {
+      // Unreachable is not the same as wrong: `keep nodes` is where reachability is
+      // reported, and a node that is merely off must not fail this install's doctor.
+      return { status: 'optional', text: `node ${entry.name} could not be asked: ${error.message}` };
+    } finally {
+      if (client) { try { client.close(); } catch {} }
+    }
+  }));
+}
+
+async function doctor(root) {
   let failed = false;
   const check = (name, fn, required = true) => {
     let ok = false; try { ok = Boolean(fn()); } catch {}
@@ -828,6 +868,11 @@ function doctor(root) {
     if (entry.fix) console.log(`  fix: ${entry.fix}`);
     if (entry.status === 'FAIL') failed = true;
   }
+  for (const entry of await nodeHomeReport()) {
+    console.log(`${entry.status}: ${entry.text}`);
+    if (entry.fix) console.log(`  fix: ${entry.fix}`);
+    if (entry.status === 'FAIL') failed = true;
+  }
   // Optional features are switches, not health: report what this machine has
   // chosen rather than passing or failing it.
   console.log(`features: ${features.list().map((feature) => `${feature.name} ${feature.enabled ? 'on' : 'off'}`).join(', ')}`);
@@ -836,7 +881,7 @@ function doctor(root) {
 }
 
 module.exports = {
-  init, installHooks, installSkills, service, node, doctor, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
+  init, installHooks, installSkills, service, node, doctor, nodeHomeReport, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
   HOOK_ACTIONS, missingHooks, hookTargets, hookTarget,
   loadPacks, configuredPacks, installPackNames, skillPlans, applySkillPlans, reportSkillPlans, listPacks,
   recordPacks, recordPreflight,

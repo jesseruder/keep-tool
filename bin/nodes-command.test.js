@@ -101,17 +101,17 @@ test('a configuration that would not load again is never written', async (t) => 
 test('keep nodes lists every node with a live hello check', async (t) => {
   await withTwoNodes(t, async ({ address, aws1 }) => {
     const first = await capture(() => commands.nodes([], { timeoutMs: 2000 }));
-    assert.match(first, /^name\s+transport\s+endpoint\s+capabilities\s+status/m);
-    assert.match(first, /main \(daemon\)\s+unix\s+\S+host\.sock\s+-\s+ok protocol 1/);
-    assert.match(first, new RegExp(`aws1\\s+tcp\\s+${address.replace('.', '\\.')}\\s+-\\s+ok protocol 1`));
+    assert.match(first, /^name\s+transport\s+endpoint\s+capabilities\s+home\s+status/m);
+    assert.match(first, /main \(daemon\)\s+unix\s+\S+host\.sock\s+-\s+\S+\s+ok protocol 1/);
+    assert.match(first, new RegExp(`aws1\\s+tcp\\s+${address.replace('.', '\\.')}\\s+-\\s+\\S+\\s+ok protocol 1`));
     const json = JSON.parse(await capture(() => commands.nodes(['ls', '--json'], { timeoutMs: 2000 })));
     assert.deepEqual(json.map((row) => [row.name, row.reachable]), [['main', true], ['aws1', true]]);
     assert.equal(json[1].bootId, aws1.bootId);
 
     await aws1.close();
     const down = await capture(() => commands.nodes(['ls'], { timeoutMs: 500 }));
-    assert.match(down, /aws1\s+tcp\s+\S+\s+-\s+unreachable:/);
-    assert.match(down, /main \(daemon\)\s+unix\s+\S+\s+-\s+ok protocol 1/, 'a node that is down says nothing about the others');
+    assert.match(down, /aws1\s+tcp\s+\S+\s+-\s+-\s+unreachable:/);
+    assert.match(down, /main \(daemon\)\s+unix\s+\S+\s+-\s+\S+\s+ok protocol 1/, 'a node that is down says nothing about the others');
   });
 });
 
@@ -152,7 +152,7 @@ test('one unusable node entry is reported without taking the others down', async
   assert.throws(() => registry.resolveNode('broken'), /needs an address/);
   assert.deepEqual(nodes.configuredNodeNames().sort(), ['aws1', 'main'], 'a broken entry is not a node to poll');
   const listed = await capture(() => commands.nodes(['ls'], { timeoutMs: 200 }));
-  assert.match(listed, /broken\s+-\s+-\s+-\s+unusable entry: /);
+  assert.match(listed, /broken\s+-\s+-\s+-\s+-\s+unusable entry: /);
   assert.match(listed, /main \(daemon\)/);
   assert.equal(registryDir.read().nodes.broken.transport, 'tcp', 'listing changes nothing');
 });
@@ -244,4 +244,26 @@ test('a placement must name machines this install actually has', async (t) => {
   }
   assert.deepEqual(registryDir.read().placement, { default: 'aws1', projects: { '~/castle/ghost-server': 'main' } },
     'nothing that would not load again was written');
+});
+
+
+test('keep nodes shows each node home and flags one that does not match', async (t) => {
+  await withTwoNodes(t, async () => {
+    // Keep's nodes share one home directory; an account's paths are expanded against
+    // the daemon's home long before they are sent, so a node with a different home
+    // cannot run them at all. Worth saying here rather than at launch time.
+    const matching = await capture(() => commands.nodes(['ls'], { timeoutMs: 2000 }));
+    assert.match(matching, new RegExp(`aws1\\s+tcp\\s+\\S+\\s+-\\s+${require('node:os').homedir()}\\s+ok protocol 1`));
+    assert.equal(/differs!/.test(matching), false);
+
+    const mismatched = await capture(() => commands.nodes(['ls'], {
+      timeoutMs: 2000, homedir: '/Users/somebody-else',
+    }));
+    assert.match(mismatched, /\(differs!\)/);
+    const json = JSON.parse(await capture(() => commands.nodes(['ls', '--json'], {
+      timeoutMs: 2000, homedir: '/Users/somebody-else',
+    })));
+    assert.equal(json.find((row) => row.name === 'aws1').home, require('node:os').homedir());
+    assert.equal(json.find((row) => row.name === 'aws1').homeMatches, false);
+  });
 });

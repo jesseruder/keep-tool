@@ -49,6 +49,12 @@ async function check(entry, deps) {
       protocol: hello.protocol ?? null,
       bootId: hello.bootId || null,
       platform: hello.platform || null,
+      home: hello.home || null,
+      // Keep's nodes share one home directory, and everything that travels between
+      // them leans on it: an account's paths are expanded against the daemon's home
+      // before they are ever sent. A node with a different home cannot run them, and
+      // refuses the launch, so it is worth saying here rather than at launch time.
+      homeMatches: hello.home == null ? null : hello.home === (deps.homedir || require('node:os').homedir()),
       panes: hello.panes ?? null,
       ms: (deps.now ? deps.now() : Date.now()) - started,
     };
@@ -62,12 +68,15 @@ async function check(entry, deps) {
 }
 
 function renderNodes(rows) {
-  const headings = ['name', 'transport', 'endpoint', 'capabilities', 'status'];
+  const headings = ['name', 'transport', 'endpoint', 'capabilities', 'home', 'status'];
   const table = rows.map((row) => [
     row.name + (row.daemon ? ' (daemon)' : ''),
     row.transport || '-',
     (row.transport === 'tcp' ? row.address : row.sock) || '-',
     row.capabilities.join(',') || '-',
+    // Flagged, not merely shown: a node whose home differs cannot run this install's
+    // accounts at all, and the launch that finds out is a long way from here.
+    !row.reachable || row.home == null ? '-' : row.homeMatches ? row.home : `${row.home} (differs!)`,
     row.invalid ? `unusable entry: ${row.reason}`
       : row.reachable
         ? `ok protocol ${row.protocol} ${row.platform || '?'} boot ${String(row.bootId || '').slice(0, 8)} ${row.panes == null ? '' : `${row.panes} panes`}`.trim()

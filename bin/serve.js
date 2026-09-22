@@ -424,6 +424,8 @@ const hostPaneCaches = new WeakMap();
 // Which host process each connection reaches, for the one question that outlives a
 // single request: may a spawn sent on it be asked about again?
 const hostGenerations = new WeakMap();
+// The hello in flight for a connection, so concurrent first spawns share one.
+const hostGenerationRequests = new WeakMap();
 const lastKnownHostPaneMemo = { panes: null, at: 0 };
 // Which pane results came from a cache rather than from a host this time round.
 // Out of band because the result object itself is what a single-node install
@@ -446,6 +448,9 @@ const HOST_REQUEST_TIMEOUT_MS = 8000;
 // as silent rather than allowed to hold up the panes on this machine.
 const HOST_REMOTE_LIST_TIMEOUT_MS = 1500;
 const HOST_RELOAD_RETRY_MS = 3000;
+// Long enough for a healthy host to say who it is, short enough that a sick one
+// cannot spend a spawn's window telling us it could have been retried.
+const HOST_GENERATION_TIMEOUT_MS = 2000;
 
 // ---------- session scanning ----------
 
@@ -2023,19 +2028,38 @@ async function requestHostClient(client, type, params, deps = {}) {
 // Asked once per connection and remembered against the connection itself, never
 // against the node: a node name outlives a host process, and the whole point of
 // this is to tell one host process from the next one.
+//
+// It has a short budget of its own, because it is a convenience and the spawn is
+// not: the spawn's own deadline must not be spent finding out whether it could be
+// retried. A hello that fails or takes too long simply means "no journal on this
+// connection" — the spawn goes out with its whole window and may not be retried —
+// and that answer is never cached, so the next spawn on the same connection asks
+// again rather than inheriting one slow moment as a permanent verdict.
+//
+// Concurrent first spawns share one hello: the in-flight promise is remembered, so
+// ten opens starting at once cost one round trip, not ten.
 async function hostGeneration(client, deps = {}) {
   if (hostGenerations.has(client)) return hostGenerations.get(client);
-  let generation = null;
-  try {
-    const hello = client.descriptor && typeof client.descriptor.bootId === 'string' && client.descriptor.bootId
-      ? client.descriptor
-      : await requestHostClient(client, 'hello', {}, deps);
-    if (hello && typeof hello.bootId === 'string' && hello.bootId) {
-      generation = { bootId: hello.bootId, spawnReceipts: hello.spawnReceipts === true };
-    }
-  } catch { generation = null; }
-  hostGenerations.set(client, generation);
-  return generation;
+  if (hostGenerationRequests.has(client)) return hostGenerationRequests.get(client);
+  if (client.descriptor && typeof client.descriptor.bootId === 'string' && client.descriptor.bootId) {
+    const known = { bootId: client.descriptor.bootId, spawnReceipts: client.descriptor.spawnReceipts === true };
+    hostGenerations.set(client, known);
+    return known;
+  }
+  const timeoutMs = deps.hostGenerationTimeoutMs == null
+    ? HOST_GENERATION_TIMEOUT_MS : deps.hostGenerationTimeoutMs;
+  const pending = requestHostClient(client, 'hello', {}, { ...deps, hostRequestTimeoutMs: timeoutMs })
+    .then((hello) => {
+      if (!hello || typeof hello.bootId !== 'string' || !hello.bootId) return null;
+      const generation = { bootId: hello.bootId, spawnReceipts: hello.spawnReceipts === true };
+      // Only a real answer is remembered. A refusal is this connection saying it has
+      // no journal, which is true now and need not be true in a second's time.
+      hostGenerations.set(client, generation);
+      return generation;
+    }, () => null)
+    .finally(() => { hostGenerationRequests.delete(client); });
+  hostGenerationRequests.set(client, pending);
+  return pending;
 }
 
 // Whether a spawn sent to `sent` may be replayed to `now`. Only the same host
@@ -2131,7 +2155,12 @@ async function hostRequest(type, params, deps = {}) {
     // catch, which would read the detail it had just appended as a retryable error
     // and send the request round again.
     if (journalledSpawn) {
+      const askedAt = wallNow();
       const generation = await hostGeneration(client, deps);
+      // The hello has a budget of its own, so the spawn keeps the whole window it
+      // came in with: finding out whether a request could be retried must never be
+      // what stops it having time to run.
+      deadline += wallNow() - askedAt;
       if (retryReason) {
         // A retry, and the only question that matters: is this the same host process
         // that ran the first attempt? If it is not, nothing here knows what happened,
@@ -5577,8 +5606,17 @@ function nodeEvidence(node, deps = {}) {
 // The node-local half of a launch, run where the pane is: in this process on the
 // daemon node, and through the node's own `prepare-launch` anywhere else.
 async function prepareLaunchOn(node, options, deps = {}, localDeps = {}) {
-  if (node === daemonNodeName(deps)) return require('./launch-prep.js').prepare(options, localDeps);
-  return hostRequest('prepare-launch', options, { ...deps, node });
+  // `remote` is told, not inferred: it decides whether the machine preparing the
+  // launch may assume the account is already installed there, and only the caller
+  // knows whether this is the daemon node preparing for itself.
+  if (node === daemonNodeName(deps)) {
+    return require('./launch-prep.js').prepare({ ...options, remote: false }, localDeps);
+  }
+  // Keep's nodes share one home directory, and accounts.js has already expanded `~`
+  // against this one before any path reached here. The node compares it with its own
+  // and refuses rather than working on paths that belong to another machine.
+  return hostRequest('prepare-launch', { ...options, remote: true, daemonHome: os.homedir() },
+    { ...deps, node });
 }
 
 async function liveSessionPids(deps = {}, options = {}) {
@@ -5588,11 +5626,20 @@ async function liveSessionPids(deps = {}, options = {}) {
   if (node) deps = nodeEvidence(node, deps);
   const at = node ? { node } : {};
   const live = new Map();
+  // What this answer is actually built on. Every read below can fail, and a caller
+  // that only ever sees an empty map cannot tell "nothing is running" from "nobody
+  // could look" — which for a guard whose job is to stop a second agent writing one
+  // transcript are opposite answers. Reported rather than swallowed; whether a gap
+  // is fatal is the caller's to decide, and only the caller knows what it needed.
+  const evidence = { table: 'ok', rows: 0, env: 'skipped', files: 'skipped' };
+  live.evidence = evidence;
   let rows = [];
   try {
     const found = await (deps.agentProcessRows || agentProcessRows)(deps, at);
     if (Array.isArray(found)) rows = found;
-  } catch {}
+    else evidence.table = 'failed';
+  } catch { evidence.table = 'failed'; }
+  evidence.rows = rows.length;
   const backgroundPiPids = verifiedPiBackgroundPids(rows, deps);
   const interactive = rows.filter((row) => row.interactive && !backgroundPiPids.has(row.pid));
   const interactiveByPid = new Map(interactive.map((row) => [row.pid, row]));
@@ -5614,6 +5661,7 @@ async function liveSessionPids(deps = {}, options = {}) {
     if (parent) parentByChild.set(child.pid, parent);
   }
   if (parentByChild.size) {
+    evidence.env = 'ok';
     try {
       const pids = [...parentByChild.keys()];
       let output;
@@ -5631,13 +5679,14 @@ async function liveSessionPids(deps = {}, options = {}) {
         const parent = match && parentByChild.get(Number(match[1]));
         if (parent) setLiveSession(live, match[2], parent, 'child-env');
       }
-    } catch (error) { deps.onEvidenceError?.(error); }
+    } catch (error) { evidence.env = 'failed'; deps.onEvidenceError?.(error); }
   }
 
   // Codex holds rollout files open. All of them are alive, but only the newest
   // rollout for a TUI is the session that should be restored.
   const codexRows = interactive.filter((row) => row.agent === 'codex');
   if (codexRows.length) {
+    evidence.files = 'ok';
     try {
       const pids = codexRows.map((row) => row.pid);
       let output;
@@ -5665,14 +5714,19 @@ async function liveSessionPids(deps = {}, options = {}) {
             entry.mtime = typeof deps.statMtime === 'function'
               ? Number(await deps.statMtime(entry.path, at))
               : fs.statSync(entry.path).mtimeMs;
-          } catch { entry.mtime = -Infinity; }
+          } catch {
+            // The mtime is what orders one TUI's rollouts; without it this cannot
+            // say which conversation is the live one, so the read is incomplete.
+            entry.mtime = -Infinity;
+            evidence.files = 'failed';
+          }
         }
         entries.sort((a, b) => b.mtime - a.mtime || a.path.localeCompare(b.path));
         entries.forEach((entry, index) => setLiveSession(live, entry.id, row, 'rollout', {
           primary: index === 0, rolloutFile: entry.path,
         }));
       }
-    } catch (error) { deps.onEvidenceError?.(error); }
+    } catch (error) { evidence.files = 'failed'; deps.onEvidenceError?.(error); }
   }
 
   return live;
@@ -9028,7 +9082,7 @@ async function openSession(body, deps = {}) {
     } catch (error) {
       // Both are the machine saying it cannot run this account: a refusal to hand
       // back, not a fault to retry.
-      if (error && ['shared-setup', 'account-missing'].includes(error.code)) {
+      if (error && ['shared-setup', 'account-missing', 'home-mismatch'].includes(error.code)) {
         throw new InjectionError(409, error.message);
       }
       throw error;
@@ -9136,6 +9190,16 @@ async function openSession(body, deps = {}) {
         live = await (deps.liveSessionPids || liveSessionPids)(
           { ...deps, agentProcessRows: async () => rows }, { node: launchNode },
         );
+        // The process table alone does not find every agent. A fresh Claude TUI is
+        // identified by the session id in a child's environment, and a Codex one by
+        // the rollout files it holds open; if the read this session's kind depends on
+        // failed, the answer below is "nothing found" for want of looking, which is
+        // the one thing this guard may not act on.
+        const report = live.evidence || {};
+        const needed = agent === 'claude' ? report.env : agent === 'codex' ? report.files : 'ok';
+        if (report.table === 'failed' || needed === 'failed') {
+          throw new InjectionError(409, `cannot verify processes on ${launchNode}`);
+        }
       }
       const running = live.get(session.id);
       if (running) {
