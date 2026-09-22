@@ -132,13 +132,19 @@ function spawnReceiptMap(value) {
   if (value == null) return receipts;
   if (!Array.isArray(value) || value.length > INPUT_RECEIPT_LIMIT) throw new Error('invalid spawn receipts in host handoff');
   for (const item of value) {
+    // Every field a replay is decided by, checked here rather than trusted: the
+    // pid and createdAt are what tell "this is still the pane this operation made"
+    // from "somebody reused the id", and a snapshot that disagrees with them would
+    // answer a replay with a pane description that was never true.
     if (!item || !INPUT_OPERATION_PATTERN.test(String(item.id || ''))
         || !/^[a-f0-9]{64}$/.test(String(item.fingerprint || ''))
         || !PANE_ID_PATTERN.test(String(item.paneId || ''))
-        || !Number.isInteger(item.pid)
-        || typeof item.createdAt !== 'string' || !item.createdAt
+        || !Number.isInteger(item.pid) || item.pid <= 0
+        || typeof item.createdAt !== 'string' || !Number.isFinite(Date.parse(item.createdAt))
         || !item.pane || typeof item.pane !== 'object' || Array.isArray(item.pane)
-        || item.pane.id !== String(item.paneId)) {
+        || item.pane.id !== String(item.paneId)
+        || item.pane.pid !== item.pid
+        || item.pane.createdAt !== item.createdAt) {
       throw new Error('invalid spawn receipt in host handoff');
     }
     receipts.set(String(item.id), {

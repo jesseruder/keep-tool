@@ -2434,7 +2434,8 @@ test('a host handoff record with a spawn receipt that makes no sense is refused'
   const sock = path.join(dir, 'host.sock');
   const base = { version: 1, sock, panes: [] };
   const sound = { id: 'open-spawn-receipt-0001', fingerprint: 'a'.repeat(64), paneId: 'p1',
-    pid: 7, createdAt: '2026-09-21T09:00:00.000Z', pane: { id: 'p1', alive: true } };
+    pid: 7, createdAt: '2026-09-21T09:00:00.000Z',
+    pane: { id: 'p1', pid: 7, createdAt: '2026-09-21T09:00:00.000Z', alive: true } };
   for (const receipt of [
     { ...sound, id: 'short' },
     { ...sound, fingerprint: 'nope' },
@@ -2444,7 +2445,12 @@ test('a host handoff record with a spawn receipt that makes no sense is refused'
     { ...sound, pane: null },
     // A receipt whose remembered pane is not the pane it names could answer a
     // replay with somebody else's pane.
-    { ...sound, pane: { id: 'p2', alive: true } },
+    { ...sound, pid: 0 },
+    { ...sound, createdAt: 'not a time' },
+    { ...sound, pane: { id: 'p2', pid: 7, createdAt: sound.createdAt, alive: true } },
+    // A snapshot that disagrees with the receipt would describe a pane that never was.
+    { ...sound, pane: { ...sound.pane, pid: 9 } },
+    { ...sound, pane: { ...sound.pane, createdAt: '2026-01-01T00:00:00.000Z' } },
   ]) {
     assert.throws(() => createHost({ sock, log: null, adopt: { ...base, spawnReceipts: [receipt] } }),
       /invalid spawn receipt in host handoff/);
@@ -2518,8 +2524,9 @@ test('a receipt the journal has had to forget answers "unknown", never a second 
   const full = Array.from({ length: 256 }, (unused, index) => {
     const id = `open-evicted-${String(index).padStart(10, '0')}`;
     const paneId = `pane${index}`;
-    return { id, fingerprint: 'a'.repeat(64), paneId, pid: 1000 + index,
-      createdAt: '2026-09-21T09:00:00.000Z', pane: { id: paneId, alive: false } };
+    const createdAt = '2026-09-21T09:00:00.000Z';
+    return { id, fingerprint: 'a'.repeat(64), paneId, pid: 1000 + index, createdAt,
+      pane: { id: paneId, pid: 1000 + index, createdAt, alive: false } };
   });
   const host = createHost({ sock, log: null, adopt: { version: 1, sock, panes: [], spawnReceipts: full } });
   let client;
