@@ -344,6 +344,7 @@ const HOOK_DEFS = [
   { event: 'SessionStart', action: 'session-start', matcher: '' },
   { event: 'SessionEnd', action: 'session-end', matcher: '' },
   { event: 'Stop', action: 'stop', matcher: '' },
+  { event: 'UserPromptSubmit', action: 'prompt', matcher: '' },
   { event: 'Notification', action: 'notification', matcher: '' },
   { event: 'PreToolUse', action: 'pre-bash', matcher: 'Bash' },
   { event: 'PreToolUse', action: 'pre-question', matcher: 'AskUserQuestion' },

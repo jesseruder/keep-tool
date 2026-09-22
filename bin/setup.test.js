@@ -146,7 +146,7 @@ test('an account carrying only the Bash guard is reported and gains just the que
       },
     }, null, 2) + '\n');
     assert.deepEqual(setup.missingHooks(f.accountSettings),
-      ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'post-bash']);
+      ['session-start', 'session-end', 'stop', 'prompt', 'notification', 'pre-question', 'post-bash']);
 
     setup.installHooks(['--account', 'automation']);
     assert.deepEqual(setup.missingHooks(f.accountSettings), []);

@@ -15,6 +15,7 @@ is never replaced without `keep setup skills --replace`, which backs it up first
 | SessionStart | `keep hook session-start` |
 | SessionEnd | `keep hook session-end` |
 | Stop | `keep hook stop` |
+| UserPromptSubmit | `keep hook prompt` (the compaction hint, as model context) |
 | Notification | `keep hook notification` |
 | PreToolUse (Bash) | `keep hook pre-bash` |
 | PreToolUse (AskUserQuestion) | `keep hook pre-question` |

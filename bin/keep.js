@@ -3118,20 +3118,42 @@ commands.verify = async (argv, deps = {}) => {
   die(result.error || `keep serve returned an unexpected response (${response.status})`);
 };
 
-commands.compact = async (argv) => {
-  const sessionId = argv[0];
-  if (!sessionId) die('usage: keep compact <sessionId>');
+commands.compact = async (argv, deps = {}) => {
+  const o = parseArgs(argv, { 'when-idle': 'bool' });
+  let sessionId = o._[0];
+  // Bare `keep compact` is an agent asking for its own session, and a session cannot
+  // be compacted mid-turn, which is where this command runs: so it is always a request
+  // the daemon carries out at the next idle moment.
+  const own = !sessionId;
+  if (own) {
+    sessionId = (deps.commandSession || commandSession)()?.id;
+    if (!sessionId) die('usage: keep compact <sessionId> [--when-idle]  (bare `keep compact` only works inside an agent session)');
+  }
+  const request = own || o['when-idle'] === true;
   let response;
   try {
-    response = await postKeepApi('/api/compact', { sessionId });
+    response = request
+      ? await (deps.postKeepApi || postKeepApi)('/api/compact-request',
+        { sessionId, by: own ? 'agent' : 'api', ...(o.m ? { reason: o.m } : {}) })
+      : await (deps.postKeepApi || postKeepApi)('/api/compact', { sessionId });
   } catch {
     die('keep serve isn\'t running (start it or use the dashboard)');
   }
   let result = {};
   try { result = JSON.parse(response.data); } catch {}
-  if (response.status === 200) {
-    console.log(JSON.stringify(result, null, 2));
+  if (response.status === 200 && request && result.requested) {
+    const expires = new Date(result.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    (deps.log || console.log)(`compaction requested for ${sessionRef(result.sessionId || sessionId)}; the daemon compacts it at the next idle moment (expires ${expires})`);
     return;
+  }
+  if (response.status === 200 && !request) {
+    (deps.log || console.log)(JSON.stringify(result, null, 2));
+    return;
+  }
+  // The daemon's own 'not found' for a path it has no route for: a daemon started
+  // before this CLI learned to ask. A missing session is a 404 with its own error.
+  if (request && response.status === 404 && result.error === 'not found') {
+    die('this keep serve predates compaction requests; it needs a restart (keep restart-daemon) before keep compact can ask');
   }
   die(result.error || `keep serve returned an unexpected response (${response.status})`);
 };
@@ -3770,6 +3792,10 @@ ${stepUsage()}
   keep probe <id>      # run this card's probe now (exit 1 = failed); no check-in, no daemon
   keep verify <id>     # run this task's check recipe now, in its thread or a fresh session (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)
+  keep compact [<sid> --when-idle] [-m "reason"]
+                         # bare, from inside a session: ask the daemon to compact this session
+                         # at its next idle moment (on its own model when the sweep would);
+                         # use it at a stopping point: a card done, a land, a long keep wait
   keep open <card|session-id|#n> [--fresh] [--agent claude|codex|pi] [--account <id>] [--model <id>] [--node <name>] [--needs <capability>] [-m "opening message" | --message-file <path>]
                          # --node runs it on that machine; --needs picks one with that capability
                          # #n is the console's session number (12, #12 and s12 all work);
@@ -3879,7 +3905,7 @@ ${stepUsage()}
                          # a type is refused until 30 of its decisions are graded at 90% (--force overrules)
                          # keep watcher live off stops every delivery immediately
 
-  keep hook session-start|session-end|stop|notification|lifecycle|pre-bash|post-bash
+  keep hook session-start|session-end|stop|notification|lifecycle|pre-bash|post-bash|prompt
                          # Claude context, enforcement, notifications and observation-only lifecycle records
   keep hook codex <start|stop|question|approval|complete|end|client-end|pre-tool|post-tool|lifecycle>
                          # Codex attention, lifecycle and Stop enforcement hooks
@@ -3934,7 +3960,7 @@ module.exports = {
   recordStepRun, codexToolInput, codexExitCode,
   codexJobText, renderCodexJobs,
   codexCommandCli: commands.codex,
-  commandUsage, helpText, formatOpenResult, openCommand: commands.open, verifyCommand: commands.verify,
+  commandUsage, helpText, formatOpenResult, openCommand: commands.open, verifyCommand: commands.verify, compactCommand: commands.compact,
   tellCommandCli: commands.tell, writeOpenHandoff,
   postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE, PI_MODEL_RE,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,

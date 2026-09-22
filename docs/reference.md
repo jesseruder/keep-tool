@@ -263,6 +263,9 @@ keep verify <id>       # run a check recipe now, in its thread or a fresh sessio
                        # Owner-initiated: never refused by, and never counted against,
                        # the scheduler's one-open-per-card-per-day allowance
 keep compact <sid>     # compact a live Claude or Codex session (needs keep serve)
+keep compact [<sid> --when-idle] [-m "reason"]
+                       # bare, from inside a session: ask the daemon to compact this
+                       # session at its next idle moment (see Auto-compact below)
 keep resume [--raw]    # post-restart: active tasks + keep open commands (--raw prints the bare CLI form)
 keep setup hooks [--account <id>]  # install the Keep hooks in every managed Claude account
                        # (without --account it installs the core and recorded skill packs too)
@@ -271,6 +274,7 @@ keep setup skills [--pack <name>]… [--replace] [--list]
 keep setup --shell [--write]   # the zsh claude() that routes resumes through keep open
 keep sync              # pull --rebase + push
 keep hook session-start  # used by the Claude Code SessionStart hook
+keep hook prompt         # used by the Claude Code UserPromptSubmit hook (compaction hint)
 
 keep turns show <session-id|card-id> [--last N] [--json]     # indexed turns for a session or card
 keep turns search "<query>" [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]
@@ -2482,6 +2486,38 @@ are retained separately. A compacted session is not re-compacted until it grows 
 the token floor again. A busy or precheck failure remains retryable; a submitted timeout
 is stamped so the daemon cannot start a duplicate compaction.
 Run `dry` for a day and review that log before enabling `on`.
+
+An agent can say when it is at a stopping point, which the daemon cannot see from
+outside: bare `keep compact` inside a session (or `POST /api/compact-request`
+with `{ sessionId }`) writes `.keep/compact/<sessionId>.request.json` and returns
+without compacting. The request has its own path so that a daemon older than the CLI
+answers 404 (the CLI then says it needs a restart) instead of compacting at once. The
+next tick (every 30 seconds) treats a requested session as a candidate once it has been
+idle `KEEP_COMPACT_REQUEST_IDLE_MIN` (default 1) minutes and holds at least
+`KEEP_COMPACT_REQUEST_MIN_TOKENS` (default 30000), skipping the cache-target wait: a
+warm cache compacts on the current model at once, and a cold or five-minute cache takes
+the fallback at once. A request works on any Claude or Codex model: one outside the
+sweep's families (`KEEP_AUTO_COMPACT_MODELS`, `gpt-6-astra`) has no fallback, so it
+compacts on its own model whatever the cache age, even with no usage record, unless
+that model's window is spent, when the request waits. Everything else still applies —
+busy and waiting sessions, live panes, other nodes, the per-mtime stamp — and requested
+sessions go first. A session with a pending model-swap record (`.swap.json`) is not
+compacted on request until the record clears; the request stays. A request expires
+after `KEEP_COMPACT_REQUEST_TTL_MIN` (default 30) minutes, is spent by any attempt (a
+retryable skip keeps it), and is refused for Pi and reviewer sessions and for a session
+on another node. A new Claude prompt voids it: `keep hook prompt` deletes the request,
+because new work arrived before the idle moment and the agent can ask again at the end
+of that turn; a Stop block that sends the agent on with more work voids it the same
+way. Codex has no prompt hook, so a Codex request is voided only by expiry, an
+attempt, or a Stop block. Requests are honoured even with `KEEP_AUTO_COMPACT=off`, where the tick
+considers requested sessions only; `dry` logs them as `would`. Their stamps and
+`_log.jsonl` entries carry `requested: true` with `requestBy` (`agent` or `api`) and
+`requestReason`. When the context is above `KEEP_COMPACT_HINT_MIN_TOKENS` (default
+150000), Keep suggests `keep compact` to the model once per two hours per session: from
+the Claude `UserPromptSubmit` hook (`keep hook prompt`) as additional context at the
+start of a turn, or appended to a reason the Stop hook already blocks with (Claude or
+Codex). It never blocks a prompt or a stop on its own, and says nothing while a request
+is pending.
 
 ## wt — worktrees
 

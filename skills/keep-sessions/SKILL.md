@@ -184,6 +184,10 @@ when you keep the card and want one step done.
 - `keep compact <sid>` compacts a live Claude or Codex session. Pi compaction is not
   Keep-managed. Check in first: the
   compacted session reads the card, not its old context.
+- Bare `keep compact`, run from inside your own session, is a request: a session cannot
+  be compacted mid-turn, so the daemon compacts it at its next idle moment (on its own
+  model when the sweep would: a warm cache, or a model the sweep does not cover). Use it at a stopping point — a card done, a land, a
+  long `keep wait`; `keep compact <sid> --when-idle` makes the same request for another session.
 - `keep rename "title"` names the current session by hand in the console and stops its
   automatic title from changing; `keep rename <#n|session-id> "title"` names another
   session; `--clear` hands it back to automatic titles.

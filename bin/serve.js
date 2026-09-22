@@ -60,7 +60,7 @@ const claudePrompts = require('./claude-prompts.js');
 const { normalizedText } = claudePrompts;
 
 const PORT = parseInt(process.env.KEEP_PORT || '7777', 10);
-const { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscriptTail, findSessionFile } = transcripts;
+const { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscriptTail, lastTurnUsage, findSessionFile } = transcripts;
 const WEB_ROOT = path.join(__dirname, '..', 'web');
 const SESSION_WINDOW_MS = 48 * 3600e3; // ignore transcripts older than this
 const TURN_INDEX_BUDGET_MS = 150; // how long one turn-index tick may hold the event loop
@@ -1213,115 +1213,6 @@ function afterCompactAction(result) {
   if (result && result.compacted) return 'proceed';
   const outcome = typeof result === 'string' ? result : result && result.reason;
   return outcome === 'timeout' ? 'defer' : 'proceed';
-}
-
-function lastTurnUsage(lines, kind) {
-  const records = Array.isArray(lines) ? lines : String(lines || '').split(/\r?\n/);
-  let result = { contextTokens: 0, model: '', usageAt: null, cacheTtlMs: null };
-  let sawClaudeUsage = false;
-  let claudeCacheTtlMs = null;
-  let claudeCacheTtlModel = '';
-  let codexModel = '';
-  let codexUsageResult = null;
-  let codexTokenCountResult = null;
-  const latestBoundary = kind === 'claude' ? records.map((line) => {
-    try { return typeof line === 'string' ? JSON.parse(line) : line; } catch { return null; }
-  }).filter((record) => record?.type === 'system' && record.subtype === 'compact_boundary'
-    && Number.isFinite(Date.parse(record.timestamp))).at(-1) : null;
-  const boundaryAt = latestBoundary ? Date.parse(latestBoundary.timestamp) : null;
-  let boundaryModelAt = -Infinity;
-  if (latestBoundary) {
-    result.contextTokens = Number(latestBoundary.compactMetadata?.postTokens) || 0;
-    result.usageAt = boundaryAt;
-  }
-  for (const line of records) {
-    let record;
-    try { record = typeof line === 'string' ? JSON.parse(line) : line; } catch { continue; }
-    if (kind === 'claude' && record && !record.isSidechain && record.type === 'assistant'
-        && record.message && record.message.usage) {
-      const recordAt = Date.parse(record.timestamp);
-      if (boundaryAt && (!Number.isFinite(recordAt) || recordAt <= boundaryAt)) {
-        if (Number.isFinite(recordAt) && recordAt >= boundaryModelAt) {
-          result.model = String(record.message.model || '');
-          boundaryModelAt = recordAt;
-        }
-        continue;
-      }
-      const usage = record.message.usage;
-      let contextTokens = Number(usage.input_tokens || 0) + Number(usage.cache_creation_input_tokens || 0)
-        + Number(usage.cache_read_input_tokens || 0);
-      if (!Number.isFinite(contextTokens)) contextTokens = 0;
-      const cacheCreation = usage.cache_creation || {};
-      const hasFiveMinute = Number(cacheCreation.ephemeral_5m_input_tokens || 0) > 0;
-      const hasOneHour = Number(cacheCreation.ephemeral_1h_input_tokens || 0) > 0;
-      const model = String(record.message.model || '');
-      const inferredTtlMs = hasFiveMinute ? 5 * 60e3 : hasOneHour ? 60 * 60e3 : null;
-      if (inferredTtlMs) {
-        claudeCacheTtlMs = inferredTtlMs;
-        claudeCacheTtlModel = model;
-      } else if (claudeCacheTtlModel !== model) {
-        claudeCacheTtlMs = null;
-        claudeCacheTtlModel = model;
-      }
-      result = {
-        contextTokens,
-        model,
-        usageAt: Date.parse(record.timestamp) || null,
-        cacheTtlMs: claudeCacheTtlMs,
-      };
-      sawClaudeUsage = true;
-    } else if (kind === 'claude' && !latestBoundary && sawClaudeUsage && record && record.type === 'system'
-        && record.subtype === 'compact_boundary') {
-      result.contextTokens = Number(record.compactMetadata && record.compactMetadata.postTokens) || 0;
-    } else if (kind === 'codex' && record && record.type === 'session_meta') {
-      codexModel = String(record.payload?.base_instructions?.provenance?.model || codexModel);
-    } else if (kind === 'codex' && record && record.type === 'turn_context') {
-      codexModel = String(record.payload?.model || codexModel);
-    } else if (kind === 'codex' && record && record.type === 'event_msg'
-        && record.payload?.type === 'thread_settings_applied') {
-      codexModel = String(record.payload.thread_settings?.model || codexModel);
-    } else if (kind === 'codex' && record?.type === 'token_usage_record' && record.payload?.usage) {
-      const usage = record.payload.usage;
-      const contextTokens = Number(usage.input_tokens || 0);
-      if (Number.isFinite(contextTokens) && contextTokens > 0) {
-        codexUsageResult = {
-          contextTokens,
-          model: codexModel,
-          usageAt: Date.parse(record.timestamp) || null,
-          cacheTtlMs: null,
-        };
-      }
-    } else if (kind === 'codex' && record?.type === 'compacted') {
-      // The matched usage in this row is the cost of producing the summary, not
-      // the smaller context after replacement. Hold at zero until a later real
-      // request supplies the new context; bookkeeping token_count rows can lag.
-      codexUsageResult = {
-        contextTokens: 0,
-        model: codexModel,
-        usageAt: Date.parse(record.timestamp) || null,
-        cacheTtlMs: null,
-      };
-    } else if (kind === 'codex' && record && record.type === 'event_msg' && record.payload
-        && record.payload.type === 'token_count' && record.payload.info && record.payload.info.last_token_usage) {
-      const usage = record.payload.info.last_token_usage;
-      // Codex input_tokens already includes cached_input_tokens.
-      let contextTokens = Number(usage.input_tokens || 0);
-      if (!Number.isFinite(contextTokens)) contextTokens = 0;
-      codexTokenCountResult = {
-        contextTokens,
-        model: codexModel,
-        usageAt: Date.parse(record.timestamp) || null,
-        cacheTtlMs: null,
-      };
-    }
-  }
-  if (kind === 'codex') {
-    result = codexUsageResult || codexTokenCountResult || result;
-    if (codexModel && result.usageAt && codexModel !== result.model) {
-      result = { ...result, model: codexModel, usageAt: null };
-    } else if (codexModel) result.model = codexModel;
-  }
-  return result;
 }
 
 // Claude writes quota and API failures as synthetic assistant records. They can
@@ -7430,7 +7321,10 @@ function autoCompactIdleMs(session, stamps, now, opts) {
   // `waiting` is Claude Code's idle_prompt: the turn ended and Owner has not typed, which is exactly the idle state targeted here.
   if (session.notify && ['permission', 'question'].includes(session.notify.type)) return null; // Owner must answer a real prompt first.
   const idleMs = now - Number(session.mtime);
-  const minIdleMs = Number.isFinite(opts.minIdleMs) ? opts.minIdleMs : opts.ttlMs;
+  // An agent that asked to be compacted said it is at a stopping point, so a short
+  // quiet spell is enough; the sweep has no such word and waits on the cache clock.
+  const minIdleMs = opts.requested?.(session) === true && Number.isFinite(opts.requestIdleMs) ? opts.requestIdleMs
+    : Number.isFinite(opts.minIdleMs) ? opts.minIdleMs : opts.ttlMs;
   if (!Number.isFinite(idleMs) || idleMs < minIdleMs || idleMs > opts.maxIdleMs) return null;
   return idleMs;
 }
@@ -7519,14 +7413,29 @@ function compactModelResetAt(session, options = {}) {
 function autoCompactPolicy(session, now, opts) {
   const model = String(session?.model || '').trim().toLowerCase();
   const models = Array.isArray(opts.models) ? opts.models : [];
+  let swept;
   if (session?.kind === 'claude') {
-    if (!model || !models.some((family) => {
+    swept = Boolean(model) && models.some((family) => {
       const needle = String(family).trim().toLowerCase();
       return needle && model.includes(needle);
-    })) return null;
+    });
   } else if (session?.kind === 'codex') {
-    if (model !== 'gpt-6-astra') return null;
+    swept = model === 'gpt-6-astra';
   } else return null;
+  if (!swept) {
+    // The sweep leaves these models alone, but an agent that asked is compacted on its
+    // own model: no fallback swap exists for them (compactSwapPlan needs a family), so
+    // a cold cache still compacts on the current model, and there is no warm window to
+    // wait for or miss. That holds without a usage record too — the model is all it
+    // needs. `ownModel` tells the tick not to hold it to a cache deadline.
+    if (!model || opts.requested?.(session) !== true) return null;
+    // Unless that model's own window is spent: /compact would be answered with the limit
+    // message and hold the model lock until it timed out. The request waits or expires.
+    if (opts.modelExhausted?.(session) === true) return null;
+    const cacheAgeMs = Number.isFinite(session.usageAt) && session.usageAt > 0 ? now - session.usageAt : null;
+    return { path: 'warm-current', originalModel: model, targetModel: model, cacheAgeMs, cacheTtlMs: null,
+      targetAgeMs: 0, ownModel: true };
+  }
   const usageAt = session.usageAt;
   if (!Number.isFinite(usageAt) || usageAt <= 0) return null;
   const fallbackTtlMs = session.kind === 'codex'
@@ -7539,10 +7448,13 @@ function autoCompactPolicy(session, now, opts) {
   // at all. Both waiting-for-a-warm-cache rules below exist only to reuse that cache;
   // neither is worth anything once the model refuses the turn.
   const exhausted = opts.modelExhausted?.(session) === true;
+  // The waits below guess when a session has stopped for good. An agent that asked
+  // for compaction has already said so, so a requested session never waits on them.
+  const requested = opts.requested?.(session) === true;
   // A five-minute Claude cache is too short to justify an immediate compaction.
   // Leave the session alone for an hour, then compact through the cheaper model.
   if (session.kind === 'claude' && session.cacheTtlMs === 5 * 60e3 && !exhausted) {
-    const targetAgeMs = 60 * 60e3;
+    const targetAgeMs = requested ? 0 : 60 * 60e3;
     if (cacheAgeMs < targetAgeMs) return null;
     return {
       path: 'cold-fallback',
@@ -7557,7 +7469,7 @@ function autoCompactPolicy(session, now, opts) {
   const configuredTarget = session.kind === 'codex'
     ? (opts.codexTargetMs ?? cacheTtlMs - leadMs)
     : (opts.claudeTargetMs ?? cacheTtlMs - leadMs);
-  const targetAgeMs = Math.min(configuredTarget, Math.max(0, cacheTtlMs - leadMs));
+  const targetAgeMs = requested ? 0 : Math.min(configuredTarget, Math.max(0, cacheTtlMs - leadMs));
   if (cacheAgeMs < targetAgeMs) return null;
   const warm = !exhausted && cacheAgeMs < cacheTtlMs;
   return {
@@ -7725,7 +7637,11 @@ function autoCompactCandidates(sessions, stamps, now, opts) {
     const policy = autoCompactPolicy(session, now, opts);
     if (!policy) continue;
     const contextTokens = Number(session.contextTokens);
-    if (!Number.isFinite(contextTokens) || contextTokens < opts.minTokens) continue; // Avoid lossy work on small contexts.
+    // A requested compaction has its own, lower floor: the agent knows its old context
+    // is done with, which the sweep can only assume of a much larger one.
+    const requested = opts.requested?.(session) === true;
+    const minTokens = requested && Number.isFinite(opts.requestMinTokens) ? opts.requestMinTokens : opts.minTokens;
+    if (!Number.isFinite(contextTokens) || contextTokens < minTokens) continue; // Avoid lossy work on small contexts.
     const stamp = stamps instanceof Map ? stamps.get(session.id) : stamps && stamps[session.id];
     if (stamp && stamp.mtime === session.mtime) {
       // A warm attempt that hit the model's own limit ends as `timeout` (Claude Code
@@ -7739,16 +7655,80 @@ function autoCompactCandidates(sessions, stamps, now, opts) {
         && !done.includes(stamp.result);
       if (!warmCanFallBack) continue;
     }
-    candidates.push({ session, idleMs, contextTokens, ...policy });
+    candidates.push({ session, idleMs, contextTokens, ...policy, ...(requested ? { requested: true } : {}) });
   }
   return candidates.sort((a, b) =>
-    Number(a.path !== 'warm-current') - Number(b.path !== 'warm-current')
+    Number(!a.requested) - Number(!b.requested)
+      || Number(a.path !== 'warm-current') - Number(b.path !== 'warm-current')
       || (a.session.usageAt + a.cacheTtlMs) - (b.session.usageAt + b.cacheTtlMs)
       || b.contextTokens - a.contextTokens);
 }
 
 function autoCompactDir() {
   return path.join(keep.ROOT, '.keep', 'compact');
+}
+
+// ---- compaction an agent asked for ----
+//
+// The daemon cannot tell from outside when a session is at a good stopping point;
+// the agent can. `keep compact` from inside a session leaves a request here, and the
+// next idle tick compacts that session without waiting out the cache clock. A request
+// is a hint, not a promise: it expires, and a missing or unreadable one just means
+// the sweep's own rules apply.
+function compactRequestFile(sessionId, dir) {
+  return path.join(dir, `${sessionId}.request.json`);
+}
+
+function writeCompactRequest(sessionId, options = {}) {
+  const id = String(sessionId || '');
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error('bad compact session id');
+  const now = Number.isFinite(options.now) ? options.now : Date.now();
+  const ttlMs = Number.isFinite(options.ttlMs) ? options.ttlMs : envNumber('KEEP_COMPACT_REQUEST_TTL_MIN', 30) * 60e3;
+  const reason = normalizedText(options.reason).slice(0, 300);
+  const record = {
+    sessionId: id, at: now, expiresAt: now + ttlMs, by: options.by === 'agent' ? 'agent' : 'api',
+    ...(reason ? { reason } : {}),
+  };
+  writeCompactSwapRecord(compactRequestFile(id, options.dir || autoCompactDir()), record);
+  return record;
+}
+
+function readCompactRequest(sessionId, dir = autoCompactDir()) {
+  const id = String(sessionId || '');
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) return null;
+  try {
+    const record = JSON.parse(fs.readFileSync(compactRequestFile(id, dir), 'utf8'));
+    return record && typeof record === 'object' && !Array.isArray(record) && record.sessionId === id ? record : null;
+  } catch { return null; }
+}
+
+function clearCompactRequest(sessionId, dir = autoCompactDir()) {
+  if (!/^[A-Za-z0-9_-]+$/.test(String(sessionId || ''))) return;
+  try { fs.unlinkSync(compactRequestFile(sessionId, dir)); }
+  catch (e) { if (e.code !== 'ENOENT') throw e; }
+}
+
+function expiredCompactRequest(record, now = Date.now()) {
+  return !record || !Number.isFinite(record.expiresAt) || record.expiresAt <= now;
+}
+
+// Every live request, once per tick. An expired or unreadable one is deleted here, so
+// an agent that asked and then carried on working is not compacted an hour later.
+function readCompactRequests(dir = autoCompactDir(), now = Date.now()) {
+  const requests = new Map();
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return requests; }
+  for (const name of names) {
+    if (!name.endsWith('.request.json')) continue;
+    const id = name.slice(0, -'.request.json'.length);
+    const record = readCompactRequest(id, dir);
+    if (expiredCompactRequest(record, now)) {
+      try { clearCompactRequest(id, dir); } catch {}
+      continue;
+    }
+    requests.set(id, record);
+  }
+  return requests;
 }
 
 function gcAutoCompactStamps(now) {
@@ -7759,7 +7739,7 @@ function gcAutoCompactStamps(now) {
   let names = [];
   try { names = fs.readdirSync(dir); } catch { return; }
   for (const name of names) {
-    if (!name.endsWith('.json') || name.endsWith('.swap.json')) continue;
+    if (!name.endsWith('.json') || name.endsWith('.swap.json') || name.endsWith('.request.json')) continue;
     try {
       const file = path.join(dir, name);
       if (fs.statSync(file).mtimeMs < cutoff) fs.unlinkSync(file);
@@ -7772,7 +7752,7 @@ function readAutoCompactStamps() {
   let names = [];
   try { names = fs.readdirSync(autoCompactDir()); } catch { return stamps; }
   for (const name of names) {
-    if (!name.endsWith('.json') || name.endsWith('.swap.json')) continue;
+    if (!name.endsWith('.json') || name.endsWith('.swap.json') || name.endsWith('.request.json')) continue;
     try {
       const stamp = JSON.parse(fs.readFileSync(path.join(autoCompactDir(), name), 'utf8'));
       if (stamp && typeof stamp.sessionId === 'string') stamps[stamp.sessionId] = stamp;
@@ -7805,7 +7785,7 @@ function writeAutoCompactDecision(stamp) {
 }
 
 function logAutoCompactDecision(candidate, stamp) {
-  const sid = sessionRef(candidate.session.id);
+  const sid = sessionRef(candidate.session.id) + (stamp.requested ? ' (requested)' : '');
   const title = JSON.stringify(normalizedText(candidate.session.title).slice(0, 120));
   const idle = Math.round(candidate.idleMs / 60e3);
   const context = Math.round(candidate.contextTokens / 1000);
@@ -7845,14 +7825,34 @@ function recordCompactRestoreHealth(summary) {
 
 async function autoCompactTick(deps = {}) {
   recordCompactRestoreHealth(await (deps.sweepPendingCompactSwaps || sweepPendingCompactSwaps)());
-  const mode = envString('KEEP_AUTO_COMPACT', 'off').toLowerCase();
-  if (!['dry', 'on'].includes(mode)) return { ok: true, detail: 'nothing due' };
+  const configuredMode = envString('KEEP_AUTO_COMPACT', 'off').toLowerCase();
+  const sweep = ['dry', 'on'].includes(configuredMode);
   const now = Date.now();
+  // Read before the mode check: an agent that asked to be compacted asked explicitly,
+  // so its request is honoured even where the sweep is off. With the sweep off the
+  // tick then considers the requested sessions only, and runs them as `on` would.
+  const dir = deps.autoCompactDir || autoCompactDir();
+  const requests = (deps.readCompactRequests || readCompactRequests)(dir, now);
+  if (!sweep && !requests.size) return { ok: true, detail: 'nothing due' };
+  const mode = sweep ? configuredMode : 'on';
+  // A session with a pending model-swap record is not compacted on request. Its restore
+  // (or a deferred one, waiting out a spent window) owns what model it runs next, and a
+  // compaction would type that restore straight after, which is the wedge the deferral
+  // exists to prevent. The request file stays, so it runs once the record clears.
+  const swapPending = new Set();
+  if (requests.size) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch {}
+    for (const name of names) if (name.endsWith('.swap.json')) swapPending.add(name.slice(0, -'.swap.json'.length));
+  }
   const opts = {
     minIdleMs: 0,
     ttlMs: 0,
     maxIdleMs: envNumber('KEEP_AUTO_COMPACT_MAX_IDLE_MIN', 1440) * 60e3,
     minTokens: envNumber('KEEP_AUTO_COMPACT_MIN_TOKENS', 100000),
+    requested: (session) => requests.has(session?.id) && !swapPending.has(session?.id),
+    requestIdleMs: envNumber('KEEP_COMPACT_REQUEST_IDLE_MIN', 1) * 60e3,
+    requestMinTokens: envNumber('KEEP_COMPACT_REQUEST_MIN_TOKENS', 30000),
     models: compactModelFamilies(),
     claudeTtlMs: envNumber('KEEP_AUTO_COMPACT_CLAUDE_TTL_MIN', envNumber('KEEP_CACHE_TTL_MIN', 60)) * 60e3,
     claudeTargetMs: envNumber('KEEP_AUTO_COMPACT_CLAUDE_TARGET_MIN', 50) * 60e3,
@@ -7894,7 +7894,8 @@ async function autoCompactTick(deps = {}) {
   // Bounded: this only picks candidates; the chosen one is re-read by
   // loadCurrentSession under the lock before anything is typed.
   const cheap = (deps.scanSessions || scanSessions)({ fresh: false }).filter((session) =>
-    liveIds.has(session.id) && autoCompactIdleMs(session, stamps, now, opts) !== null);
+    (sweep || opts.requested(session))
+    && liveIds.has(session.id) && autoCompactIdleMs(session, stamps, now, opts) !== null);
   const candidates = autoCompactCandidates(
     cheap.map((session) => {
       // The pane says which machine the agent is on; the cheap scanSessions row
@@ -7953,7 +7954,9 @@ async function autoCompactTick(deps = {}) {
               path: freshCandidate.path,
               originalModel: freshCandidate.originalModel,
               targetModel: freshCandidate.targetModel,
-              cacheUsageAt: freshCandidate.session.usageAt,
+              // A requested compaction on a model with no fallback has no warm window to
+              // miss, so the transaction's cache-deadline refusal must not apply to it.
+              cacheUsageAt: freshCandidate.ownModel ? null : freshCandidate.session.usageAt,
               cacheTtlMs: freshCandidate.cacheTtlMs,
               cacheAgeMs: freshCandidate.cacheAgeMs,
               ...(freshCandidate.reason ? { reason: freshCandidate.reason, exhaustedResetAt: freshCandidate.exhaustedResetAt ?? null } : {}),
@@ -7981,8 +7984,17 @@ async function autoCompactTick(deps = {}) {
       break;
     }
     if (!attempted) return { ok: true, detail: 'nothing due' };
+    // The request is spent once an attempt was made, whatever its outcome: the stamp
+    // says what happened, and a retryable skip above never reaches here, so that
+    // request waits for the next tick. An agent that still wants it can ask again. A
+    // request held back by a pending swap is spent too if the sweep compacted anyway.
+    if (candidate.requested || (result === 'compacted' && requests.has(candidate.session.id))) {
+      try { (deps.clearCompactRequest || clearCompactRequest)(candidate.session.id, dir); }
+      catch (e) { process.stderr.write(`keep serve: could not clear the compaction request for ${sessionRef(candidate.session.id)}: ${e.message}\n`); }
+    }
   }
 
+  const request = candidate.requested ? requests.get(candidate.session.id) : null;
   const stamp = {
     sessionId: candidate.session.id,
     mtime: candidate.session.mtime,
@@ -7996,6 +8008,11 @@ async function autoCompactTick(deps = {}) {
     // Why this path, when it was not the cache clock that chose it. `reason` below
     // is the failure text, so the policy's reason gets its own field.
     ...(candidate.reason ? { pathReason: candidate.reason } : {}),
+    // So _log.jsonl tells the agent-driven compactions from the sweep's own.
+    ...(request ? {
+      requested: true, requestBy: String(request.by || ''),
+      ...(request.reason ? { requestReason: String(request.reason) } : {}),
+    } : {}),
     cacheAgeMs: compactedResult?.submissionCacheAgeMs ?? candidate.cacheAgeMs,
     cacheTtlMs: candidate.cacheTtlMs,
     targetAgeMs: candidate.targetAgeMs,
@@ -8508,6 +8525,25 @@ async function compactSessionById(body) {
   const target = claimInjectionTarget(await resolveSessionTarget(session, null));
   await precheckSessionTarget(session, target);
   return compactSession(session, target, body.instruction || (session.reviewer ? review.DEFAULT_REVIEW_COMPACT_INSTRUCTION : undefined));
+}
+
+// `keep compact` from inside a session: leave a request for the idle tick rather than
+// compact now. The caller is usually mid-turn — that is where the command runs — and
+// a session cannot be compacted while its own turn is in progress. Takes no lock:
+// nothing is typed, and the tick re-checks everything under the lock before it acts.
+function requestSessionCompaction(body, deps = {}) {
+  body = body && typeof body === 'object' ? body : {};
+  const session = (deps.loadCurrentSession || loadCurrentSession)(body.sessionId);
+  if (session.kind === 'pi') throw new InjectionError(409, 'Pi automatic compaction is unavailable');
+  // Reviewers have their own context-pressure policy, which the sweep also leaves them to.
+  if (session.reviewer) throw new InjectionError(409, 'a reviewer session is compacted by its own policy, not on request');
+  // The tick never compacts a session on another node, so a request for one would
+  // only sit there until it expired.
+  refuseRemoteCompaction(session, deps);
+  const record = writeCompactRequest(session.id, {
+    by: body.by === 'agent' ? 'agent' : 'api', reason: body.reason, dir: deps.dir,
+  });
+  return { ok: true, requested: true, sessionId: session.id, expiresAt: record.expiresAt };
 }
 
 async function answerSessionQuestion(body, session, deps = {}) {
@@ -13840,7 +13876,7 @@ function start(deps = {}) {
     WATCHER_TURNS_PER_TICK, WATCHER_WINDOW_MS,
     abandonAccountHandoff, abandonTransfer, accounts, addHostSessionState, agentProcessRows, announceStateNote,
     answerSession, attentionAckKey, attentionAckName, buildState, cancelQueuedHandoff, cardUsage, closeEphemeralPane,
-    closeIdleSession, codex, compactSessionById, companionSnapshot, consoleState, daemonRestartGate,
+    closeIdleSession, codex, compactSessionById, requestSessionCompaction, companionSnapshot, consoleState, daemonRestartGate,
     dashboardDetail, deliverCheckToThread, deliverUnblockToThread, discord, driftWakeFromVerdict,
     envNumber, features, forceRestartSession, fs, handoffRateLimited, handoffSession, handoffSessionRequest, health, hostRequest,
     ideas,
@@ -14092,6 +14128,13 @@ module.exports = {
   autoCompactCandidates,
   autoCompactOutcome,
   autoCompactTick,
+  readCompactRequest,
+  readCompactRequests,
+  writeCompactRequest,
+  clearCompactRequest,
+  expiredCompactRequest,
+  requestSessionCompaction,
+  readAutoCompactStamps,
   compactSession,
   compactSessionTransaction,
   compactRequestTelemetry,

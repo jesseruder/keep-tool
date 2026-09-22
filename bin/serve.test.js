@@ -2919,6 +2919,284 @@ test('auto-compact waits an hour before sending five-minute Claude caches throug
   assert.equal(autoCompactCandidates([coldSession], { [base.id]: { ...failedWarm, result: 'timeout' } }, now, opts).length, 0);
 });
 
+test('a requested compaction skips the cache wait and has its own floors, but still waits for an idle session', () => {
+  const now = Date.parse('2026-09-01T12:00:00Z');
+  const asked = new Set();
+  const opts = {
+    minIdleMs: 0, ttlMs: 0, maxIdleMs: 1440 * 60e3, minTokens: 100000, models: ['fable'],
+    claudeTtlMs: 60 * 60e3, claudeTargetMs: 50 * 60e3, claudeFallbackModel: 'opus',
+    codexTtlMs: 30 * 60e3, codexTargetMs: 20 * 60e3, codexFallbackModel: 'gpt-5.6-sol',
+    requested: (session) => asked.has(session.id), requestIdleMs: 60e3, requestMinTokens: 30000,
+  };
+  const session = (id, idleMin, contextTokens, extra = {}) => ({
+    id, kind: 'claude', mtime: now - idleMin * 60e3, endedTurn: true, contextTokens,
+    model: 'claude-fable-5-1', usageAt: now - idleMin * 60e3, ...extra,
+  });
+  const ids = (list) => list.map((candidate) => candidate.session.id);
+
+  // Minute 2 of a warm hour-long cache: the sweep waits until minute 50, a request does not.
+  asked.add('asked');
+  const [warm] = autoCompactCandidates([session('unasked', 2, 140000), session('asked', 2, 140000)], {}, now, opts);
+  assert.deepEqual([warm.session.id, warm.path, warm.targetModel, warm.targetAgeMs, warm.requested],
+    ['asked', 'warm-current', 'claude-fable-5-1', 0, true]);
+  assert.deepEqual(ids(autoCompactCandidates([session('unasked', 49, 140000)], {}, now, opts)), []);
+  assert.deepEqual(ids(autoCompactCandidates([session('unasked', 50, 140000)], {}, now, opts)), ['unasked']);
+
+  // The request's own floors: 30k tokens instead of 100k, and one quiet minute.
+  assert.deepEqual(ids(autoCompactCandidates([session('asked', 2, 40000)], {}, now, opts)), ['asked']);
+  assert.deepEqual(ids(autoCompactCandidates([session('asked', 2, 29999)], {}, now, opts)), []);
+  assert.deepEqual(ids(autoCompactCandidates([session('unasked', 55, 40000)], {}, now, opts)), []);
+  assert.deepEqual(ids(autoCompactCandidates([session('asked', 0.5, 140000)], {}, now, opts)), [],
+    'a session that asked a moment ago may still be finishing its turn');
+
+  // A request never overrides a session that is busy or waiting on somebody.
+  for (const extra of [{ endedTurn: false }, { pendingQuestion: { question: 'Which?' } }, { pendingPlan: true },
+    { pendingBackground: true }, { notify: { type: 'permission' } }, { exited: true }]) {
+    assert.deepEqual(ids(autoCompactCandidates([session('asked', 5, 140000, extra)], {}, now, opts)), [],
+      JSON.stringify(extra));
+  }
+  // Nor repeats a compaction already made for this transcript.
+  const done = session('asked', 5, 140000);
+  assert.deepEqual(ids(autoCompactCandidates([done], { asked: { mtime: done.mtime, result: 'compacted' } }, now, opts)), []);
+
+  // Cold, or on a five-minute cache: straight to the cold fallback, no hour-long wait.
+  const short = autoCompactPolicy(session('asked', 2, 140000, { cacheTtlMs: 5 * 60e3 }), now, opts);
+  assert.deepEqual([short.path, short.targetModel, short.targetAgeMs], ['cold-fallback', 'opus', 0]);
+  assert.equal(autoCompactPolicy(session('unasked', 2, 140000, { cacheTtlMs: 5 * 60e3 }), now, opts), null);
+  const cold = autoCompactPolicy(session('asked', 70, 140000), now, opts);
+  assert.deepEqual([cold.path, cold.targetModel], ['cold-fallback', 'opus']);
+
+  // A model outside the sweep compacts on request on its own model, whatever the cache
+  // age and with or without a usage record: there is no fallback swap for it.
+  asked.add('asked-opus').add('asked-sonnet').add('asked-sol');
+  for (const [candidate, model] of [
+    [session('asked-opus', 2, 140000, { model: 'claude-opus-5-5' }), 'claude-opus-5-5'],
+    [session('asked-opus', 300, 140000, { model: 'claude-opus-5-5' }), 'claude-opus-5-5'],
+    [session('asked-sonnet', 2, 140000, { model: 'claude-sonnet-5', usageAt: undefined }), 'claude-sonnet-5'],
+    [session('asked-sol', 90, 140000, { kind: 'codex', model: 'gpt-5.6-sol' }), 'gpt-5.6-sol'],
+  ]) {
+    const [picked] = autoCompactCandidates([candidate], {}, now, opts);
+    assert.deepEqual([picked?.path, picked?.originalModel, picked?.targetModel, picked?.ownModel],
+      ['warm-current', model, model, true], candidate.id);
+  }
+  assert.deepEqual(ids(autoCompactCandidates([session('unasked', 90, 140000, { model: 'claude-opus-5-5' })], {}, now, opts)), [],
+    'the sweep itself still leaves Opus alone');
+  // Its own window spent, /compact would only be answered with the limit: the request waits.
+  const spentOpus = { ...opts, modelExhausted: (candidate) => candidate.model === 'claude-opus-5-5' };
+  assert.deepEqual(ids(autoCompactCandidates([session('asked-opus', 2, 140000, { model: 'claude-opus-5-5' })], {}, now, spentOpus)), []);
+  assert.deepEqual(ids(autoCompactCandidates([session('asked-sonnet', 2, 140000, { model: 'claude-sonnet-5' })], {}, now, spentOpus)),
+    ['asked-sonnet'], 'only the spent model waits');
+  assert.equal(autoCompactPolicy(session('asked', 70, 140000), now, opts).ownModel, undefined,
+    'a swept family keeps its own warm and cold rules on request');
+
+  // Requested sessions go first, even a cold one ahead of the sweep's warm one.
+  asked.add('asked-cold');
+  assert.deepEqual(ids(autoCompactCandidates([session('unasked', 55, 300000), session('asked-cold', 70, 140000)], {}, now, opts)),
+    ['asked-cold', 'unasked']);
+});
+
+test('compaction requests are written atomically, expire, and are ignored by every other compact-dir reader', (t) => {
+  const { writeCompactRequest, readCompactRequest, readCompactRequests, clearCompactRequest,
+    expiredCompactRequest, readAutoCompactStamps } = require('./serve.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-request-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const now = Date.parse('2026-09-01T12:00:00Z');
+  const record = writeCompactRequest('asked', { dir, now, by: 'agent', reason: 'card done' });
+  assert.deepEqual(record, { sessionId: 'asked', at: now, expiresAt: now + 30 * 60e3, by: 'agent', reason: 'card done' });
+  assert.deepEqual(readCompactRequest('asked', dir), record);
+  assert.deepEqual(fs.readdirSync(dir), ['asked.request.json'], 'no temp file is left behind');
+  assert.equal(expiredCompactRequest(record, now + 30 * 60e3 - 1), false);
+  assert.equal(expiredCompactRequest(record, now + 30 * 60e3), true);
+  assert.equal(expiredCompactRequest(null, now), true);
+
+  writeCompactRequest('stale', { dir, now: now - 31 * 60e3, by: 'api' });
+  fs.writeFileSync(path.join(dir, 'garbled.request.json'), '{nope');
+  const requests = readCompactRequests(dir, now);
+  assert.deepEqual([...requests.keys()], ['asked']);
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['asked.request.json'], 'expired and unreadable requests are deleted');
+
+  // A request is not a swap record, so the restore sweep and pane retention never see it.
+  assert.deepEqual(pendingCompactSwaps(dir), []);
+  writeCompactSwapFixture(dir, 'swapped');
+  assert.deepEqual(pendingCompactSwaps(dir).map((swap) => swap.sessionId), ['swapped']);
+
+  // Nor a decision stamp: read as one, it would stand in for the session's real stamp.
+  const live = path.join(process.env.KEEP_DIR, '.keep', 'compact');
+  fs.mkdirSync(live, { recursive: true });
+  t.after(() => fs.rmSync(live, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(live, 'asked.json'), JSON.stringify({ sessionId: 'asked', mtime: 1, result: 'compacted' }));
+  writeCompactRequest('asked', { dir: live, now });
+  writeCompactRequest('only-asked', { dir: live, now });
+  assert.deepEqual(readAutoCompactStamps(), { asked: { sessionId: 'asked', mtime: 1, result: 'compacted' } });
+
+  clearCompactRequest('asked', dir);
+  clearCompactRequest('asked', dir); // already gone is fine
+  assert.equal(readCompactRequest('asked', dir), null);
+});
+
+test('POST /api/compact-request files a compaction request, and /api/compact has no request form', async (t) => {
+  const { requestSessionCompaction, readCompactRequest } = require('./serve.js');
+  const { routes, matchRoute } = require('./serve/routes');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-request-route-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const sessions = {
+    'agent-session': { id: 'agent-session', kind: 'claude' },
+    'pi-session': { id: 'pi-session', kind: 'pi' },
+    'reviewer-session': { id: 'reviewer-session', kind: 'claude', reviewer: true },
+    'far-session': { id: 'far-session', kind: 'claude', node: 'aws1' },
+  };
+  const deps = { dir, loadCurrentSession: (id) => {
+    if (!sessions[id]) throw new InjectionError(404, 'no session');
+    return sessions[id];
+  } };
+  const result = requestSessionCompaction({ sessionId: 'agent-session', by: 'agent', reason: 'landed' }, deps);
+  assert.deepEqual(Object.keys(result).sort(), ['expiresAt', 'ok', 'requested', 'sessionId']);
+  assert.equal(result.requested, true);
+  const saved = readCompactRequest('agent-session', dir);
+  assert.deepEqual([saved.by, saved.reason, saved.expiresAt], ['agent', 'landed', result.expiresAt]);
+  const refused = (id) => assert.throws(() => requestSessionCompaction({ sessionId: id }, deps),
+    (error) => error instanceof InjectionError && error.status === (id === 'missing' ? 404 : 409));
+  for (const id of ['pi-session', 'reviewer-session', 'far-session', 'missing']) refused(id);
+  assert.equal(readCompactRequest('reviewer-session', dir), null);
+
+  // The route: its own path, so a daemon too old to know it answers 404 rather than
+  // compacting now; no lock is taken. /api/compact is the immediate compaction, as before.
+  const calls = [];
+  const list = routes({
+    InjectionError,
+    json: (res, status, value) => ({ status, value }),
+    requestSessionCompaction: (body) => { calls.push(body); return { ok: true, requested: true, sessionId: body.sessionId }; },
+    withInjectionLock: () => assert.fail('a request takes no injection lock'),
+  });
+  const match = (pathname, body) => matchRoute(list, { req: { method: 'POST' }, url: new URL(`http://x${pathname}`), body });
+  const body = { sessionId: 'agent-session', by: 'agent' };
+  const answer = await match('/api/compact-request', body).handle({ req: { method: 'POST' }, res: {}, url: new URL('http://x/api/compact-request'), body });
+  assert.deepEqual(answer, { status: 200, value: { ok: true, requested: true, sessionId: 'agent-session' } });
+  assert.deepEqual(calls, [body]);
+  assert.deepEqual(match('/api/compact', { sessionId: 'agent-session', when: 'idle' }).path,
+    ['/api/open', '/api/send', '/api/compact', '/api/answer'], '/api/compact has no request form');
+});
+
+test('auto-compact tick honours a request with the sweep off, clears it once attempted, and keeps it on a retryable skip', async (t) => {
+  const prior = process.env.KEEP_AUTO_COMPACT;
+  delete process.env.KEEP_AUTO_COMPACT;
+  t.after(() => prior === undefined ? delete process.env.KEEP_AUTO_COMPACT : process.env.KEEP_AUTO_COMPACT = prior);
+  const now = Date.now();
+  // Two minutes idle on a warm Astra cache: nothing the sweep would touch yet.
+  const sessions = [
+    { id: 'asked', kind: 'codex', endedTurn: true, mtime: now - 2 * 60e3 },
+    { id: 'sweepable', kind: 'codex', endedTurn: true, mtime: now - 25 * 60e3 },
+  ];
+  let requests = new Map([['asked', { sessionId: 'asked', by: 'agent', reason: 'card done', expiresAt: now + 60e3 }]]);
+  const cleared = [];
+  const compacted = [];
+  const decisions = [];
+  let scans = 0;
+  const deps = {
+    sweepPendingCompactSwaps: async () => ({ checked: 0 }), gcAutoCompactStamps: () => {},
+    readAutoCompactStamps: () => ({}),
+    readCompactRequests: () => requests,
+    clearCompactRequest: (id) => cleared.push(id),
+    scanSessions: () => { scans += 1; return sessions; },
+    listHostPanes: async () => sessions.map((session) => ({ alive: true, meta: { sessionId: session.id } })),
+    sessionLastTurn: (session) => ({ contextTokens: 60000, model: 'gpt-6-astra', usageAt: session.mtime }),
+    withInjectionLock: async (fn) => fn(),
+    loadCurrentSession: (id) => sessions.find((session) => session.id === id),
+    resolveSessionTarget: async (session) => ({ pane: `pane-${session.id}` }),
+    readScreen: async () => '› Ask Codex to do anything',
+    compactSession: async (session, _target, _instruction, options) => {
+      compacted.push([session.id, options.compactionPolicy.path]);
+      return { compacted: true, originalModel: 'gpt-6-astra', compactionModel: 'gpt-6-astra' };
+    },
+    writeAutoCompactDecision: (stamp) => decisions.push(stamp), logAutoCompactDecision: () => {},
+  };
+
+  // A lock the tick cannot take is a retryable skip: the request stays for the next tick.
+  const busy = await autoCompactTick({ ...deps, withInjectionLock: async () => { throw new InjectionError(429, 'busy'); } });
+  assert.deepEqual(busy, { ok: true, detail: 'nothing due' });
+  assert.deepEqual(cleared, []);
+  // So is a session that moved on between the scan and the lock.
+  const moved = await autoCompactTick({ ...deps, loadCurrentSession: (id) => ({ ...sessions.find((s) => s.id === id), mtime: now }) });
+  assert.deepEqual(moved, { ok: true, detail: 'nothing due' });
+  assert.deepEqual(cleared, []);
+
+  const outcome = await autoCompactTick(deps);
+  assert.equal(outcome.detail, 'compacted');
+  assert.deepEqual(compacted, [['asked', 'warm-current']], 'only the requested session, with the sweep off');
+  assert.deepEqual(cleared, ['asked']);
+  assert.deepEqual([decisions[0].requested, decisions[0].requestBy, decisions[0].requestReason, decisions[0].mode],
+    [true, 'agent', 'card done', 'on']);
+
+  // A requested session on a model the sweep leaves alone, long cold: compacted on its
+  // own model, with no cache deadline for the transaction to refuse on.
+  const policies = [];
+  sessions.push({ id: 'asked-sol', kind: 'codex', endedTurn: true, mtime: now - 90 * 60e3 });
+  requests = new Map([['asked-sol', { sessionId: 'asked-sol', by: 'agent', expiresAt: now + 60e3 }]]);
+  const own = await autoCompactTick({ ...deps,
+    sessionLastTurn: (session) => ({ contextTokens: 60000, model: session.id === 'asked-sol' ? 'gpt-5.6-sol' : 'gpt-6-astra', usageAt: session.mtime }),
+    compactSession: async (session, _target, _instruction, options) => {
+      policies.push([session.id, options.compactionPolicy]);
+      return { compacted: true, originalModel: 'gpt-5.6-sol', compactionModel: 'gpt-5.6-sol' };
+    } });
+  assert.equal(own.detail, 'compacted');
+  assert.deepEqual(policies.map(([id, policy]) => [id, policy.path, policy.originalModel, policy.targetModel, policy.cacheUsageAt]),
+    [['asked-sol', 'warm-current', 'gpt-5.6-sol', 'gpt-5.6-sol', null]]);
+  sessions.pop();
+
+  // No request and the sweep off: the tick does not even scan.
+  requests = new Map();
+  const before = scans;
+  assert.deepEqual(await autoCompactTick(deps), { ok: true, detail: 'nothing due' });
+  assert.equal(scans, before);
+
+  // Dry mode logs a request as `would`, like everything else, and leaves it in place.
+  process.env.KEEP_AUTO_COMPACT = 'dry';
+  requests = new Map([['asked', { sessionId: 'asked', by: 'api', expiresAt: now + 60e3 }]]);
+  decisions.length = 0;
+  assert.equal((await autoCompactTick(deps)).detail, 'would');
+  assert.deepEqual([decisions[0].sessionId, decisions[0].result, decisions[0].requested], ['asked', 'would', true]);
+  assert.deepEqual(cleared, ['asked', 'asked-sol'], 'dry mode clears nothing');
+});
+
+test('a pending model-swap record holds a compaction request back without spending it', async (t) => {
+  const { writeCompactRequest, readCompactRequest } = require('./serve.js');
+  const prior = process.env.KEEP_AUTO_COMPACT;
+  delete process.env.KEEP_AUTO_COMPACT;
+  t.after(() => prior === undefined ? delete process.env.KEEP_AUTO_COMPACT : process.env.KEEP_AUTO_COMPACT = prior);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-request-swap-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const now = Date.now();
+  // A session parked on a model the sweep does not cover — the way a deferred restore
+  // leaves one — asks to be compacted. Compacting now would type the pending restore
+  // straight after it, into the window the deferral is waiting out.
+  const session = { id: 'parked', kind: 'codex', endedTurn: true, mtime: now - 5 * 60e3 };
+  writeCompactRequest('parked', { dir, now, by: 'agent' });
+  const swapFile = writeCompactSwapFixture(dir, 'parked');
+  const compacted = [];
+  const deps = {
+    autoCompactDir: dir,
+    sweepPendingCompactSwaps: async () => ({ checked: 0 }), gcAutoCompactStamps: () => {},
+    readAutoCompactStamps: () => ({}), scanSessions: () => [session],
+    listHostPanes: async () => [{ alive: true, meta: { sessionId: session.id } }],
+    sessionLastTurn: () => ({ contextTokens: 60000, model: 'gpt-5.6-sol', usageAt: session.mtime }),
+    withInjectionLock: async (fn) => fn(),
+    loadCurrentSession: () => session,
+    resolveSessionTarget: async () => ({ pane: 'pane-parked' }),
+    readScreen: async () => '› Ask Codex to do anything',
+    compactSession: async (current) => { compacted.push(current.id); return { compacted: true }; },
+    writeAutoCompactDecision: () => {}, logAutoCompactDecision: () => {},
+  };
+  assert.deepEqual(await autoCompactTick(deps), { ok: true, detail: 'no eligible sessions' });
+  assert.deepEqual(compacted, []);
+  assert.equal(readCompactRequest('parked', dir)?.by, 'agent', 'the request survives the tick');
+
+  // Once the record clears, the same request is carried out.
+  fs.unlinkSync(swapFile);
+  assert.equal((await autoCompactTick(deps)).detail, 'compacted');
+  assert.deepEqual(compacted, ['parked']);
+  assert.equal(readCompactRequest('parked', dir), null);
+});
+
 test('reopen compaction uses cache warmth immediately and an explicit premium family list', () => {
   const now = Date.parse('2026-09-20T12:00:00Z');
   const base = { kind: 'claude', model: 'claude-fable-5-1', contextTokens: 150000,

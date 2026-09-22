@@ -16,7 +16,7 @@ function routes(ctx) {
     // serve.js internals
     ATTENTION_KINDS, InjectionError, MOBILE_VIEWS,
     abandonAccountHandoff, abandonTransfer, accounts, announceStateNote, answerSession, attentionAckKey, attentionAckName,
-    cancelQueuedHandoff, closeIdleSession, codex, compactSessionById, companionSnapshot, consoleState,
+    cancelQueuedHandoff, closeIdleSession, codex, compactSessionById, requestSessionCompaction, companionSnapshot, consoleState,
     daemonRestartGate, dashboardDetail, fs, handoffRateLimited, handoffSessionRequest, health, hostRequest,
     inspectReviewQueueLaunch,
     keep, launchReviewQueueSession, listHostPanes, listPortableTransfers, notifications,
@@ -642,6 +642,22 @@ function routes(ctx) {
         catch (e) {
           if (e instanceof InjectionError) return json(res, e.status, { error: e.message });
           return json(res, 502, { error: String(e && e.message || e).slice(0, 500) });
+        }
+      },
+    },
+    // `keep compact` from inside a session: a request the idle tick carries out, not a
+    // compaction now. No injection lock, because nothing is typed here. Its own path,
+    // not a field on /api/compact: a daemon older than the CLI answers an unknown path
+    // with a 404, where it would read the request as "compact now" and type /compact
+    // into the calling session mid-turn.
+    {
+      method: 'POST',
+      path: '/api/compact-request',
+      handle: async ({ res, body }) => {
+        try { return json(res, 200, requestSessionCompaction(body)); }
+        catch (e) {
+          if (e instanceof InjectionError) return json(res, e.status, { error: e.message });
+          return json(res, 500, { error: String(e && e.message || e).slice(0, 500) });
         }
       },
     },

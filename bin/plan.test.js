@@ -332,6 +332,122 @@ test('Stop auto-continues a linked card once per step and advances after plan --
   } finally { f.cleanup(); }
 });
 
+// An assistant turn whose usage says how large the context now is.
+function sized(contextTokens, text = 'Done.') {
+  return `${JSON.stringify({
+    type: 'assistant', timestamp: new Date().toISOString(),
+    message: { model: 'claude-fable-5-1', usage: { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: contextTokens - 10 },
+      content: [{ type: 'text', text }] },
+  })}\n`;
+}
+
+function prompt(fixture, linked, transcript, extraEnv = {}) {
+  return spawnSync(process.execPath, [CLI, 'hook', 'prompt'], {
+    encoding: 'utf8',
+    cwd: linked.project,
+    env: { ...fixture.env, CLAUDE_CODE_SESSION_ID: linked.sid, ...extraEnv },
+    input: JSON.stringify({ session_id: linked.sid, transcript_path: transcript, cwd: linked.project, hook_event_name: 'UserPromptSubmit' }),
+  });
+}
+
+const HINT_280K = '[keep] context is 280k tokens. When this turn reaches a stopping point, run keep compact so the daemon compacts the session while it is idle.';
+
+test('the prompt hook hints at keep compact above the context threshold, once per window, as model context', () => {
+  const f = registryFixture();
+  try {
+    const project = path.join(f.root, 'unlinked-project');
+    fs.mkdirSync(project, { recursive: true });
+    const quiet = { sid: 'claude-hint-session', project };
+    const transcript = path.join(f.root, 'hint.jsonl');
+
+    fs.writeFileSync(transcript, interactive() + sized(140000));
+    const below = prompt(f, quiet, transcript);
+    assert.equal(below.status, 0, below.stderr);
+    assert.equal(below.stdout, '', 'below the threshold there is nothing to say');
+
+    fs.appendFileSync(transcript, sized(280000));
+    // A turn the Stop hook lets end says nothing: the hint is for the model, and a
+    // Stop hook's own message would only reach the user.
+    assert.equal(stop(f, quiet, transcript).stdout, '');
+    const above = prompt(f, quiet, transcript);
+    assert.equal(above.status, 0, above.stderr);
+    assert.deepEqual(JSON.parse(above.stdout),
+      { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: HINT_280K } });
+    assert.equal(prompt(f, quiet, transcript).stdout, '', 'at most once per window');
+
+    // The threshold is configurable; the window is per session.
+    const other = { sid: 'claude-hint-other', project };
+    assert.equal(prompt(f, other, transcript, { KEEP_COMPACT_HINT_MIN_TOKENS: '300000' }).stdout, '');
+    // Keep's own headless runs and the reviewer are never told.
+    assert.equal(prompt(f, other, transcript, { KEEP_RUN: '1' }).stdout, '');
+  } finally { f.cleanup(); }
+});
+
+test('a new prompt voids a pending compaction request, and a Stop block says nothing while one is pending', () => {
+  const f = registryFixture();
+  try {
+    const project = path.join(f.root, 'unlinked-project');
+    fs.mkdirSync(project, { recursive: true });
+    const compactDir = path.join(f.root, '.keep', 'compact');
+    fs.mkdirSync(compactDir, { recursive: true });
+    const requestFile = (sid) => path.join(compactDir, `${sid}.request.json`);
+    const transcript = path.join(f.root, 'void.jsonl');
+    fs.writeFileSync(transcript, interactive() + sized(40000));
+
+    // The agent asked, then Owner replied before the idle moment: that new work would be
+    // compacted away, so the request goes. Another session's request is not touched.
+    const asked = { sid: 'claude-void-session', project };
+    fs.writeFileSync(requestFile(asked.sid), '{}');
+    fs.writeFileSync(requestFile('claude-void-other'), '{}');
+    const voided = prompt(f, asked, transcript);
+    assert.equal(voided.status, 0, voided.stderr);
+    assert.equal(voided.stdout, '', 'a small context still gets no hint');
+    assert.equal(fs.existsSync(requestFile(asked.sid)), false);
+    assert.equal(fs.existsSync(requestFile('claude-void-other')), true);
+    // With no request there is nothing to remove, and nothing else changes.
+    const again = prompt(f, asked, transcript);
+    assert.equal(again.status, 0, again.stderr);
+    assert.equal(again.stdout, '');
+    assert.deepEqual(fs.readdirSync(compactDir), ['claude-void-other.request.json']);
+
+    // Above the threshold, the voided request no longer silences the hint.
+    const large = path.join(f.root, 'void-large.jsonl');
+    fs.writeFileSync(large, interactive() + sized(280000));
+    fs.writeFileSync(requestFile(asked.sid), '{}');
+    assert.match(prompt(f, asked, large).stdout, /additionalContext/);
+    assert.equal(fs.existsSync(requestFile(asked.sid)), false);
+
+    // A Stop block while a request is still pending carries no hint (it has asked), and
+    // voids the request: the block sends the agent on with more work, like a new prompt.
+    const linked = writeLinkedCard(f, { sid: 'claude-void-linked' });
+    fs.writeFileSync(requestFile(linked.sid), '{}');
+    const blocked = JSON.parse(stop(f, linked, large).stdout);
+    assert.equal(blocked.decision, 'block');
+    assert.doesNotMatch(blocked.reason, /keep compact/);
+    assert.equal(fs.existsSync(requestFile(linked.sid)), false, 'a block voids the request');
+  } finally { f.cleanup(); }
+});
+
+test('a Stop block carries the compaction hint, and shares its window with the prompt hook', () => {
+  const f = registryFixture();
+  try {
+    const linked = writeLinkedCard(f, { sid: 'claude-hint-linked' });
+    const transcript = path.join(f.root, 'hint-linked.jsonl');
+    fs.writeFileSync(transcript, interactive() + sized(280000, 'Finished a chunk.'));
+    const blocked = JSON.parse(stop(f, linked, transcript).stdout);
+    assert.equal(blocked.decision, 'block');
+    assert.match(blocked.reason, /Continue with step 1 of 2[\s\S]*\n\n\[keep\] context is 280k tokens\. When this turn reaches a stopping point, run keep compact/);
+    assert.equal(prompt(f, linked, transcript).stdout, '', 'the block already said it this window');
+
+    // And the other way round: once the prompt hook has said it, a block does not repeat it.
+    const second = writeLinkedCard(f, { sid: 'claude-hint-second' });
+    assert.match(prompt(f, second, transcript).stdout, /additionalContext/);
+    const quietBlock = JSON.parse(stop(f, second, transcript).stdout);
+    assert.equal(quietBlock.decision, 'block');
+    assert.doesNotMatch(quietBlock.reason, /keep compact/);
+  } finally { f.cleanup(); }
+});
+
 test('Codex Stop shares the plan policy and emits exactly one JSON result', () => {
   const f = registryFixture();
   try {

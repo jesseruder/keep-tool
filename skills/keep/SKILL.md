@@ -58,6 +58,9 @@ Load the situational skill when its moment comes, not before:
   read-only, and keep it under a minute. `keep plan <id> --verify <n|next>` runs one on
   demand. `--force` lands a step whose criterion is wrong, with a check-in that says why.
 - **Before finishing substantive work**: check in the current state and next step.
+- **At a stopping point with a large context** — after the final check-in on a card,
+  after a land, or before a long `keep wait` — run `keep compact`. Keep compacts the
+  session at its next idle moment, and the compacted session reads the card, not its old context.
 - **Questions about current work**: answer from `keep list`, `keep overdue`, and
   `keep resume`.
 - **Durable artifacts**: never cite a `/tmp` path in a check recipe or check-in;

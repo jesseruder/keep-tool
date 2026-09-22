@@ -36,6 +36,118 @@ function readTranscriptTail(file) {
   return text;
 }
 
+// The context size and model of a transcript's last real turn, from its usage
+// records. Here rather than in serve.js so the Stop hook reads the same number the
+// daemon's compaction sweep does without loading the server module.
+function lastTurnUsage(lines, kind) {
+  const records = Array.isArray(lines) ? lines : String(lines || '').split(/\r?\n/);
+  let result = { contextTokens: 0, model: '', usageAt: null, cacheTtlMs: null };
+  let sawClaudeUsage = false;
+  let claudeCacheTtlMs = null;
+  let claudeCacheTtlModel = '';
+  let codexModel = '';
+  let codexUsageResult = null;
+  let codexTokenCountResult = null;
+  const latestBoundary = kind === 'claude' ? records.map((line) => {
+    try { return typeof line === 'string' ? JSON.parse(line) : line; } catch { return null; }
+  }).filter((record) => record?.type === 'system' && record.subtype === 'compact_boundary'
+    && Number.isFinite(Date.parse(record.timestamp))).at(-1) : null;
+  const boundaryAt = latestBoundary ? Date.parse(latestBoundary.timestamp) : null;
+  let boundaryModelAt = -Infinity;
+  if (latestBoundary) {
+    result.contextTokens = Number(latestBoundary.compactMetadata?.postTokens) || 0;
+    result.usageAt = boundaryAt;
+  }
+  for (const line of records) {
+    let record;
+    try { record = typeof line === 'string' ? JSON.parse(line) : line; } catch { continue; }
+    if (kind === 'claude' && record && !record.isSidechain && record.type === 'assistant'
+        && record.message && record.message.usage) {
+      const recordAt = Date.parse(record.timestamp);
+      if (boundaryAt && (!Number.isFinite(recordAt) || recordAt <= boundaryAt)) {
+        if (Number.isFinite(recordAt) && recordAt >= boundaryModelAt) {
+          result.model = String(record.message.model || '');
+          boundaryModelAt = recordAt;
+        }
+        continue;
+      }
+      const usage = record.message.usage;
+      let contextTokens = Number(usage.input_tokens || 0) + Number(usage.cache_creation_input_tokens || 0)
+        + Number(usage.cache_read_input_tokens || 0);
+      if (!Number.isFinite(contextTokens)) contextTokens = 0;
+      const cacheCreation = usage.cache_creation || {};
+      const hasFiveMinute = Number(cacheCreation.ephemeral_5m_input_tokens || 0) > 0;
+      const hasOneHour = Number(cacheCreation.ephemeral_1h_input_tokens || 0) > 0;
+      const model = String(record.message.model || '');
+      const inferredTtlMs = hasFiveMinute ? 5 * 60e3 : hasOneHour ? 60 * 60e3 : null;
+      if (inferredTtlMs) {
+        claudeCacheTtlMs = inferredTtlMs;
+        claudeCacheTtlModel = model;
+      } else if (claudeCacheTtlModel !== model) {
+        claudeCacheTtlMs = null;
+        claudeCacheTtlModel = model;
+      }
+      result = {
+        contextTokens,
+        model,
+        usageAt: Date.parse(record.timestamp) || null,
+        cacheTtlMs: claudeCacheTtlMs,
+      };
+      sawClaudeUsage = true;
+    } else if (kind === 'claude' && !latestBoundary && sawClaudeUsage && record && record.type === 'system'
+        && record.subtype === 'compact_boundary') {
+      result.contextTokens = Number(record.compactMetadata && record.compactMetadata.postTokens) || 0;
+    } else if (kind === 'codex' && record && record.type === 'session_meta') {
+      codexModel = String(record.payload?.base_instructions?.provenance?.model || codexModel);
+    } else if (kind === 'codex' && record && record.type === 'turn_context') {
+      codexModel = String(record.payload?.model || codexModel);
+    } else if (kind === 'codex' && record && record.type === 'event_msg'
+        && record.payload?.type === 'thread_settings_applied') {
+      codexModel = String(record.payload.thread_settings?.model || codexModel);
+    } else if (kind === 'codex' && record?.type === 'token_usage_record' && record.payload?.usage) {
+      const usage = record.payload.usage;
+      const contextTokens = Number(usage.input_tokens || 0);
+      if (Number.isFinite(contextTokens) && contextTokens > 0) {
+        codexUsageResult = {
+          contextTokens,
+          model: codexModel,
+          usageAt: Date.parse(record.timestamp) || null,
+          cacheTtlMs: null,
+        };
+      }
+    } else if (kind === 'codex' && record?.type === 'compacted') {
+      // The matched usage in this row is the cost of producing the summary, not
+      // the smaller context after replacement. Hold at zero until a later real
+      // request supplies the new context; bookkeeping token_count rows can lag.
+      codexUsageResult = {
+        contextTokens: 0,
+        model: codexModel,
+        usageAt: Date.parse(record.timestamp) || null,
+        cacheTtlMs: null,
+      };
+    } else if (kind === 'codex' && record && record.type === 'event_msg' && record.payload
+        && record.payload.type === 'token_count' && record.payload.info && record.payload.info.last_token_usage) {
+      const usage = record.payload.info.last_token_usage;
+      // Codex input_tokens already includes cached_input_tokens.
+      let contextTokens = Number(usage.input_tokens || 0);
+      if (!Number.isFinite(contextTokens)) contextTokens = 0;
+      codexTokenCountResult = {
+        contextTokens,
+        model: codexModel,
+        usageAt: Date.parse(record.timestamp) || null,
+        cacheTtlMs: null,
+      };
+    }
+  }
+  if (kind === 'codex') {
+    result = codexUsageResult || codexTokenCountResult || result;
+    if (codexModel && result.usageAt && codexModel !== result.model) {
+      result = { ...result, model: codexModel, usageAt: null };
+    } else if (codexModel) result.model = codexModel;
+  }
+  return result;
+}
+
 function readTranscript(file) {
   return fs.readFileSync(file, 'utf8');
 }
@@ -91,4 +203,4 @@ function findSessionFile(id, options = {}) {
   return matches[0]?.file || null;
 }
 
-module.exports = { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscript, readTranscriptTail, findSessionFile };
+module.exports = { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscript, readTranscriptTail, lastTurnUsage, findSessionFile };

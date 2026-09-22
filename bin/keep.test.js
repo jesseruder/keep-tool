@@ -973,6 +973,63 @@ test('verify says where the check went, and never reports a headless run', async
   await assert.rejects(verifyCommand([], { postKeepApi: async () => assert.fail('no id, no request') }), /usage: keep verify/);
 });
 
+test('bare keep compact asks the daemon to compact the calling session when it is next idle', async () => {
+  const { compactCommand } = require('./keep.js');
+  const calls = [];
+  const lines = [];
+  const expiresAt = Date.parse('2026-09-01T12:30:00Z');
+  const deps = (session) => ({
+    commandSession: () => session,
+    log: (line) => lines.push(line),
+    postKeepApi: async (url, body) => {
+      calls.push({ url, body });
+      return { status: 200, data: JSON.stringify(url === '/api/compact-request'
+        ? { ok: true, requested: true, sessionId: body.sessionId, expiresAt } : { compacted: true }) };
+    },
+  });
+
+  await compactCommand([], deps({ id: 'agent-session-id', agent: 'claude' }));
+  assert.deepEqual(calls.pop(), { url: '/api/compact-request', body: { sessionId: 'agent-session-id', by: 'agent' } });
+  assert.match(lines.pop(), /^compaction requested for \S+; the daemon compacts it at the next idle moment \(expires .+\)$/);
+
+  await compactCommand(['-m', 'card done'], deps({ id: 'agent-session-id', agent: 'codex' }));
+  assert.deepEqual(calls.pop().body, { sessionId: 'agent-session-id', by: 'agent', reason: 'card done' });
+
+  // With an id it still compacts now, unless asked to wait for the idle moment.
+  await compactCommand(['other-session-id'], deps(null));
+  assert.deepEqual(calls.pop(), { url: '/api/compact', body: { sessionId: 'other-session-id' } });
+  await compactCommand(['other-session-id', '--when-idle'], deps(null));
+  assert.deepEqual(calls.pop(), { url: '/api/compact-request', body: { sessionId: 'other-session-id', by: 'api' } });
+
+  // Outside an agent session there is nothing to ask for.
+  await assert.rejects(compactCommand([], deps(null)), /bare `keep compact` only works inside an agent session/);
+  assert.equal(calls.length, 0);
+  await assert.rejects(compactCommand([], {
+    ...deps({ id: 'agent-session-id', agent: 'claude' }),
+    postKeepApi: async () => ({ status: 409, data: JSON.stringify({ error: 'Pi automatic compaction is unavailable' }) }),
+  }), /Pi automatic compaction/);
+  // A daemon older than this CLI has no such route: it needs a restart, and nothing is compacted.
+  await assert.rejects(compactCommand([], {
+    ...deps({ id: 'agent-session-id', agent: 'claude' }),
+    postKeepApi: async () => ({ status: 404, data: JSON.stringify({ error: 'not found' }) }),
+  }), /needs a restart \(keep restart-daemon\)/);
+  await assert.rejects(compactCommand([], {
+    ...deps({ id: 'agent-session-id', agent: 'claude' }),
+    postKeepApi: async () => ({ status: 404, data: JSON.stringify({ error: 'no session' }) }),
+  }), /^(?!.*restart).*no session/);
+
+  // The real CLI, from a shell with no agent session in its environment.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-cli-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    const env = { ...process.env, KEEP_DIR: root };
+    for (const key of ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'KEEP_PI_SESSION_ID', 'KEEP_DELEGATION_ID']) delete env[key];
+    const bare = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'compact'], { encoding: 'utf8', env });
+    assert.notEqual(bare.status, 0);
+    assert.match(bare.stderr, /usage: keep compact <sessionId> \[--when-idle\]/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('open CLI posts card or session identity and formats one-line results', async () => {
   const { openCommand, formatOpenResult } = require('./keep.js');
   const calls = [];
