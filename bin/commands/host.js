@@ -90,7 +90,9 @@ async function resolvePaneTarget(clients, value, node = null) {
   const ref = nodesApi.parsePaneRef(String(value || ''));
   const target = ref.qualified ? ref.node : node;
   const client = await clients.get(target);
-  const pane = await resolveHostPane(client, ref.qualified ? ref.paneId : value);
+  // Always the parsed id: `p@main` names the daemon node's own pane `p`, and the
+  // host — and the listing this is matched against — know it by that name alone.
+  const pane = await resolveHostPane(client, ref.paneId);
   return {
     client,
     pane,

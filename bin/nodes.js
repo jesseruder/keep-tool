@@ -28,33 +28,42 @@ function isDaemonNode(env = process.env) { return localNode(env) === daemonNode(
 
 // The node list comes from the configuration, so this is memoised: a caller may ask
 // once per pane, and the answer changes only when `keep nodes add` rewrites the file.
-let nodeNameMemo = { at: 0, key: null, names: null };
+let nodeEntryMemo = { at: 0, key: null, entries: null };
 let nodeNameWarning = null;
 
-function configuredNodeNames(env = process.env) {
+// Every configured node, including the ones whose entry does not make sense: a
+// caller that fans out has to know a node exists before it can report that it
+// cannot be reached. Dropping them here is how a typo turns into "that machine has
+// no panes" instead of "that machine's entry is unusable".
+function configuredNodeEntries(env = process.env) {
   const key = `${env.KEEP_CONFIG || ''}\u0000${env.KEEP_DIR || ''}`;
   const now = Date.now();
-  if (nodeNameMemo.names && nodeNameMemo.key === key && now - nodeNameMemo.at < NODE_NAME_MEMO_MS) return nodeNameMemo.names;
-  let names;
+  if (nodeEntryMemo.entries && nodeEntryMemo.key === key && now - nodeEntryMemo.at < NODE_NAME_MEMO_MS) {
+    return nodeEntryMemo.entries;
+  }
+  let entries;
   try {
-    names = require('./node-registry.js')
+    entries = require('./node-registry.js')
       .listNodes(env)
-      .filter((node) => !node.invalid)
-      .map((node) => node.name);
+      .map((node) => ({ name: node.name, invalid: node.invalid === true, reason: node.reason || null }));
     nodeNameWarning = null;
   } catch (error) {
     // Falling back silently would make a broken configuration look like a
     // single-node install, which is exactly the shape a fleet must not mistake.
     // Said once per distinct reason so a five-second scheduler cannot flood a log.
-    names = [daemonNode(env)];
-    const message = `keep: cannot read the node list (${error.message}); assuming the single node ${names[0]}`;
+    entries = [{ name: daemonNode(env), invalid: false, reason: null }];
+    const message = `keep: cannot read the node list (${error.message}); assuming the single node ${entries[0].name}`;
     if (nodeNameWarning !== message) {
       nodeNameWarning = message;
       try { process.stderr.write(`${message}\n`); } catch {}
     }
   }
-  nodeNameMemo = { at: now, key, names };
-  return names;
+  nodeEntryMemo = { at: now, key, entries };
+  return entries;
+}
+
+function configuredNodeNames(env = process.env) {
+  return configuredNodeEntries(env).filter((entry) => !entry.invalid).map((entry) => entry.name);
 }
 
 // Pane ids are the daemon node's own, bare, exactly as they always were; a pane on
@@ -119,5 +128,5 @@ function writeNodeToken(root, name) {
 module.exports = {
   NODE_NAME_RE, PANE_REF_SEPARATOR, NODE_NAME_MEMO_MS,
   daemonNode, localNode, isDaemonNode, nodeTokens, writeNodeToken,
-  configuredNodeNames, parsePaneRef, formatPaneRef,
+  configuredNodeEntries, configuredNodeNames, parsePaneRef, formatPaneRef,
 };

@@ -3000,3 +3000,36 @@ test('keep mark reports the daemon\'s own refusal', async () => {
     }), /bad session id/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('keep pane resolves a pane qualified with the daemon node own name', async () => {
+  const { paneCommandCli } = require('./keep.js');
+  const requests = [];
+  const pane = {
+    id: 'p', alive: true, exitCode: null, signal: null, pid: 7, cols: 80, rows: 24,
+    primary: null, title: '', cwd: '/tmp', cmd: '/bin/sh', args: [], meta: { agent: 'shell' },
+  };
+  const connectHost = async (options) => {
+    requests.push(['connect', options]);
+    return {
+      async request(type, params = {}) {
+        requests.push([type, params]);
+        if (type === 'list') return { panes: [pane] };
+        return { pane };
+      },
+      close() {},
+    };
+  };
+  const output = [];
+  const originalLog = console.log;
+  console.log = (value) => output.push(String(value));
+  try {
+    // `p@main` is this node's own pane p. The host has never heard the qualified
+    // form, and the listing it is matched against carries the bare id.
+    await paneCommandCli(['show', 'p@main', '--json'], { connectHost });
+    assert.equal(JSON.parse(output.pop()).id, 'p');
+    assert.deepEqual(requests.filter((call) => call[0] === 'connect').map((call) => call[1].node), [undefined],
+      'the daemon node is still reached by its socket, not by name');
+    await paneCommandCli(['screen', 'p@main'], { connectHost });
+    assert.deepEqual(requests.filter((call) => call[0] === 'screen').map((call) => call[1].pane), ['p']);
+  } finally { console.log = originalLog; }
+});

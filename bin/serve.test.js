@@ -13358,3 +13358,99 @@ test('a single-node install publishes no node status and no node column', async 
     assert.equal(listed.panes[0], panes[0]);
   } finally { await closeHostClient(); }
 });
+
+test('a node memo follows the last answer, the whole picture, and the mutation fence', async (t) => {
+  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient, listHostPaneResult, hostRequest } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodes(t, async () => {
+    await closeHostClient();
+    let delayMs = 0;
+    let real = null;
+    // The remote host, reachable but slow: the shape a loaded machine or a
+    // congested tailnet link takes, and the one case a fixed budget has to survive.
+    const slow = {
+      socket: { destroyed: false },
+      request: async (...args) => {
+        if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+        return real.request(...args);
+      },
+      onDisconnect: () => ({ dispose() {} }),
+      close: () => {},
+    };
+    const deps = {
+      connectHost: async (options) => {
+        if (options.node !== 'aws1') return connect(options);
+        real = real || await connect(options);
+        return slow;
+      },
+      hostRemoteListTimeoutMs: 60,
+    };
+    try {
+      const local = (await hostRequest('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 5'] }, deps)).pane;
+      const remote = (await hostRequest('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 5'] }, { ...deps, node: 'aws1' })).pane;
+      const memo = { epoch: 0, panes: null, at: 0 };
+      const list = () => listHostPaneResult({ ...deps, hostPaneMemo: memo }, true);
+
+      // Too slow, and nothing known about it yet: missing, and the merged memo is
+      // not written from a picture with a hole in it.
+      delayMs = 300;
+      const first = await list();
+      assert.deepEqual(first.missingNodes, ['aws1']);
+      assert.equal(first.nodes.aws1.reason, 'timeout');
+      assert.equal(first.nodes.aws1.stale, undefined);
+      assert.deepEqual(first.panes.map((pane) => pane.id), [local.id]);
+      assert.equal(memo.panes, null, 'an incomplete list is not remembered as the fleet');
+
+      // Its answer lands a moment later. That still refreshes what this daemon knows
+      // about the node, so the next read shows its panes rather than nothing.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const second = await list();
+      assert.deepEqual(second.missingNodes, ['aws1']);
+      assert.equal(second.nodes.aws1.stale, true);
+      assert.ok(Number.isFinite(second.nodes.aws1.panesAt));
+      assert.deepEqual(second.panes.map((pane) => pane.id).sort(), [local.id, remote.id].sort());
+      assert.equal(memo.panes, null, 'still incomplete: those panes are remembered, not observed');
+
+      // Both nodes answer: now the fleet is complete and the merged memo is written.
+      delayMs = 0;
+      const third = await list();
+      assert.equal(third.missingNodes, undefined);
+      assert.deepEqual(third.nodes, { aws1: { ok: true } });
+      assert.deepEqual(memo.panes.map((pane) => pane.id).sort(), [local.id, remote.id].sort());
+
+      // A mutation clears what every node was last known to hold, not just this one.
+      await hostRequest('clear', { pane: local.id }, deps);
+      delayMs = 300;
+      const fenced = await list();
+      assert.deepEqual(fenced.missingNodes, ['aws1']);
+      assert.equal(fenced.nodes.aws1.stale, undefined, 'a pre-mutation remote list does not come back');
+      assert.deepEqual(fenced.panes.map((pane) => pane.id), [local.id]);
+    } finally { await closeHostClient(); }
+  });
+});
+
+test('a node whose entry does not make sense is reported, not quietly dropped', async (t) => {
+  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient, listHostPaneResult, hostNodeEntries } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodes(t, async ({ configFile, config }) => {
+    fs.writeFileSync(configFile, JSON.stringify({
+      ...config, nodes: { ...config.nodes, broken: { transport: 'tcp' } },
+    }));
+    await closeHostClient();
+    const deps = { connectHost: connect, hostRemoteListTimeoutMs: 500 };
+    try {
+      assert.deepEqual(hostNodeEntries(deps).map((entry) => [entry.name, entry.invalid]),
+        [['main', false], ['aws1', false], ['broken', true]]);
+      const listed = await listHostPaneResult(deps, true);
+      // Dropping it would say "that machine has no panes"; what is true is that
+      // nobody can tell, and the reason is in the configuration.
+      assert.deepEqual(listed.missingNodes, ['broken']);
+      assert.equal(listed.nodes.broken.ok, false);
+      assert.equal(listed.nodes.broken.reason, 'invalid');
+      assert.match(listed.nodes.broken.detail, /needs an address/);
+      assert.equal(listed.nodes.aws1.ok, true);
+    } finally { await closeHostClient(); }
+  });
+});

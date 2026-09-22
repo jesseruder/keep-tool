@@ -2048,7 +2048,10 @@ async function hostRequest(type, params, deps = {}) {
     .map((key) => [key, nodes.parsePaneRef(params[key])]);
   const qualifiedRef = refs.find(([, value]) => value.qualified);
   const node = qualifiedRef ? qualifiedRef[1].node : (deps.node || daemon);
-  const request = qualifiedRef
+  // `p@main` is the daemon node's own pane under a name the host has never heard:
+  // normalise every ref that differs from its pane id, not only the ones that
+  // resolved to another node.
+  const request = refs.some(([key, value]) => params[key] !== value.paneId)
     ? { ...params, ...Object.fromEntries(refs.map(([key, value]) => [key, value.paneId])) }
     : params;
   const channel = HOST_OPS_TYPES.has(type) ? 'ops' : 'control';
@@ -2103,6 +2106,9 @@ async function hostRequest(type, params, deps = {}) {
         hostMutationEpoch += 1;
         lastKnownHostPaneMemo.panes = null;
         lastKnownHostPaneMemo.at = 0;
+        // The per-node memos are behind the same fence: a remote list from before
+        // this mutation must not come back as that node's "last known" afterwards.
+        nodePaneMemo.clear();
       }
       const result = await requestHostClient(client, type, request, {
         ...deps, hostRequestTimeoutMs: attemptTimeoutMs,
@@ -2162,15 +2168,35 @@ function hostEndpointExists(deps = {}) {
   } catch { return false; }
 }
 
-// The node names to collect panes from: the daemon node first, so the list a
-// single-node install produces is the list it always produced.
-function hostNodeNames(deps = {}) {
-  if (Array.isArray(deps.hostNodes)) return deps.hostNodes;
+// The nodes to collect panes from: the daemon node first, so the list a single-node
+// install produces is the list it always produced. An entry that does not make sense
+// travels with the rest, marked, because a node nobody can reach is still a node
+// whose panes this daemon must not report as gone.
+//
+// The daemon node is never treated as invalid: it is reached through its own socket
+// without consulting the registry at all, and a typo in its entry must not cost this
+// machine its own pane list.
+function hostNodeEntries(deps = {}) {
   const daemon = daemonNodeName(deps);
-  try {
-    const names = nodes.configuredNodeNames();
-    return names.includes(daemon) ? [daemon, ...names.filter((name) => name !== daemon)] : [daemon];
-  } catch { return [daemon]; }
+  const ordered = (entries) => {
+    const known = entries.some((entry) => entry.name === daemon)
+      ? entries : [{ name: daemon, invalid: false, reason: null }, ...entries];
+    return [
+      ...known.filter((entry) => entry.name === daemon).map((entry) => ({ ...entry, invalid: false })),
+      ...known.filter((entry) => entry.name !== daemon),
+    ];
+  };
+  if (Array.isArray(deps.hostNodes)) {
+    return ordered(deps.hostNodes.map((entry) => (typeof entry === 'string'
+      ? { name: entry, invalid: false, reason: null }
+      : { name: entry.name, invalid: entry.invalid === true, reason: entry.reason || null })));
+  }
+  try { return ordered(nodes.configuredNodeEntries()); }
+  catch { return [{ name: daemon, invalid: false, reason: null }]; }
+}
+
+function hostNodeNames(deps = {}) {
+  return hostNodeEntries(deps).filter((entry) => !entry.invalid).map((entry) => entry.name);
 }
 
 async function listNodePaneResult(node, deps = {}, fresh = false, epoch = hostMutationEpoch) {
@@ -2196,7 +2222,15 @@ async function listNodePaneResult(node, deps = {}, fresh = false, epoch = hostMu
     }
     // A mutation that started while this list was in flight (or while it waited on
     // the process table) makes it a pre-mutation list: return it, remember nothing.
-    if (epoch === hostMutationEpoch) hostPaneCaches.set(client, { at: now(), panes });
+    //
+    // The node's own memo is written here, not where the fan-out merges, so an
+    // answer that arrives just after its budget still refreshes what this daemon
+    // knows about that node. A node half a second too slow is stale for one read,
+    // not until it happens to be quick.
+    if (epoch === hostMutationEpoch) {
+      hostPaneCaches.set(client, { at: now(), panes });
+      rememberNodePanes(node, panes, now(), epoch);
+    }
     return { panes, failure: null };
   } catch (error) {
     if (retryableHostError(error) || (client.socket && client.socket.destroyed)) invalidateHost(client, deps, error);
@@ -2207,7 +2241,7 @@ async function listNodePaneResult(node, deps = {}, fresh = false, epoch = hostMu
 
 // Each node's own last known list, kept apart from the merged memo so that one
 // node falling silent neither empties its panes nor overwrites what the others said.
-function rememberNodePanes(node, panes, at, epoch) {
+function rememberNodePanes(node, panes, at, epoch = hostMutationEpoch) {
   if (epoch !== hostMutationEpoch) return;
   nodePaneMemo.set(node, { panes, at });
 }
@@ -2228,7 +2262,7 @@ function qualifyNodePanes(panes, node, daemon) {
 
 async function listHostPaneResult(deps = {}, fresh = false) {
   const epoch = hostMutationEpoch;
-  const names = hostNodeNames(deps);
+  const entries = hostNodeEntries(deps);
   const daemon = daemonNodeName(deps);
   const now = deps.now || Date.now;
   const remember = (panes, complete) => {
@@ -2243,7 +2277,7 @@ async function listHostPaneResult(deps = {}, fresh = false) {
   };
   // One node is the whole fleet: the result is the one the daemon has always
   // returned, pane for pane and field for field.
-  if (names.length === 1) {
+  if (entries.length === 1) {
     const only = await listNodePaneResult(daemon, deps, fresh, epoch);
     if (Array.isArray(only.panes)) remember(only.panes, !cachedPaneResults.has(only));
     return only;
@@ -2252,15 +2286,18 @@ async function listHostPaneResult(deps = {}, fresh = false) {
   // running from now. The console must never wait on a node in another building to
   // hear what the panes on this machine are doing.
   const budgetMs = deps.hostRemoteListTimeoutMs == null ? HOST_REMOTE_LIST_TIMEOUT_MS : deps.hostRemoteListTimeoutMs;
-  const inFlight = new Map(names.map((node) => [node, listNodePaneResult(node, deps, fresh, epoch)]));
-  const others = names.filter((node) => node !== daemon).map(async (node) => {
+  const inFlight = new Map(entries.filter((entry) => !entry.invalid)
+    .map((entry) => [entry.name, listNodePaneResult(entry.name, deps, fresh, epoch)]));
+  const others = entries.filter((entry) => entry.name !== daemon).map(async (entry) => {
+    // An entry nobody can resolve is asked nothing and reported as unusable.
+    if (entry.invalid) return [entry.name, { panes: null, failure: 'invalid', detail: entry.reason }];
     let timer;
     const result = await Promise.race([
-      inFlight.get(node),
+      inFlight.get(entry.name),
       new Promise((resolve) => { timer = setTimeout(() => resolve({ panes: null, failure: 'timeout', late: true }), budgetMs); }),
     ]);
     if (timer) clearTimeout(timer);
-    return [node, result];
+    return [entry.name, result];
   });
   const primary = await inFlight.get(daemon);
   const settled = await Promise.all(others);
@@ -2270,8 +2307,10 @@ async function listHostPaneResult(deps = {}, fresh = false) {
   let complete = Array.isArray(primary.panes) && !cachedPaneResults.has(primary);
   for (const [node, result] of settled) {
     if (Array.isArray(result.panes)) {
-      if (!cachedPaneResults.has(result)) rememberNodePanes(node, result.panes, now(), epoch);
-      else complete = false;
+      // A list this call did not collect — one served from the node's own second-old
+      // cache — is true enough to publish and not fresh enough to call the fleet
+      // complete: the merged memo is what a later outage is reconstructed from.
+      if (cachedPaneResults.has(result)) complete = false;
       status[node] = { ok: true };
       merged.push(...qualifyNodePanes(result.panes, node, daemon));
       continue;
@@ -2283,11 +2322,12 @@ async function listHostPaneResult(deps = {}, fresh = false) {
     status[node] = {
       ok: false,
       reason: result.failure || 'unreachable',
+      ...(result.detail ? { detail: result.detail } : {}),
       ...(known ? { stale: true, panesAt: known.at } : {}),
     };
     missingNodes.push(node);
     if (known) merged.push(...qualifyNodePanes(known.panes, node, daemon));
-    else if (nodePaneMemo.has(node)) complete = false;
+    complete = false;
   }
   if (!Array.isArray(primary.panes)) {
     // The daemon node is the one whose failure the console reports, but the other
@@ -6296,6 +6336,9 @@ async function closeIdleSession(body, deps = {}) {
   // node answers those questions about itself, a pane on another machine is closed
   // only when a person asks for it by hand.
   const paneNode = nodes.parsePaneRef(String(body.pane || ''));
+  // An id qualified with this node's own name is this node's pane: everything below
+  // compares against the ids the pane list publishes, which are bare here.
+  if (!paneNode.qualified && paneNode.paneId !== body.pane) body = { ...body, pane: paneNode.paneId };
   if (paneNode.qualified && deps.closePolicy && !deps.closePolicy.manual) {
     throw new InjectionError(409, `automatic close is not available for a pane on ${paneNode.node}; close it by hand`);
   }
@@ -12436,6 +12479,7 @@ module.exports = {
   hostClient,
   hostClientFor,
   validPaneRef,
+  hostNodeEntries,
   hostNodeNames,
   listNodePaneResult,
   sessionHostPane,
