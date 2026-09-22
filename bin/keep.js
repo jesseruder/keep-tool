@@ -3361,6 +3361,8 @@ commands.resume = async (argv, deps = {}) => {
       console.log(`  ${record.dependent} — ${record.upstream} is done${record.gaveUp ? ` (${record.gaveUp})` : ''}`);
     }
   }
+  let daemon = null;
+  try { daemon = require('./nodes.js').daemonNode(); } catch {}
   for (const t of tasks) {
     console.log(fmtTask(t));
     const s = (t.fm.sessions || [])[t.fm.sessions ? t.fm.sessions.length - 1 : 0];
@@ -3371,7 +3373,11 @@ commands.resume = async (argv, deps = {}) => {
       // command, where a trailing word would become an argument.
       const numbered = !o.raw && s.id ? sessionNumbers.lookup(s.id, { root: ROOT }) : null;
       const num = numbered ? `  ${sessionNumbers.label(numbered.num)}` : '';
-      console.log(color('90', `      ${proj}${resumeCommand(s, process.env, { raw: Boolean(o.raw) })}${num}`));
+      // A session on another machine says which, after its number. The card records
+      // a node only when it is not the daemon's, so single-node output is unchanged;
+      // --raw stays bare for the same reason the label does.
+      const node = !o.raw && s.node && s.node !== daemon ? `${num ? ' ' : '  '}@${s.node}` : '';
+      console.log(color('90', `      ${proj}${resumeCommand(s, process.env, { raw: Boolean(o.raw) })}${num}${node}`));
     }
   }
 };
