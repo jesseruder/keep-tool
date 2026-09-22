@@ -1151,19 +1151,19 @@ test('keep doctor fails an install whose nodes do not share its home directory',
   // exactly what it always was.
   assert.deepEqual(await setup.nodeHomeReport({ listNodes: () => [{ name: 'main', daemon: true, invalid: false }] }), []);
 
-  const shared = await setup.nodeHomeReport({ listNodes, connect: connectTo('/Users/jesseruder'), homedir: '/Users/jesseruder' });
-  assert.deepEqual(shared, [{ status: 'ok', text: 'node aws1 shares this home (/Users/jesseruder)' }]);
+  const shared = await setup.nodeHomeReport({ listNodes, connect: connectTo('/Users/someone'), homedir: '/Users/someone' });
+  assert.deepEqual(shared, [{ status: 'ok', text: 'node aws1 shares this home (/Users/someone)' }]);
 
-  const differs = await setup.nodeHomeReport({ listNodes, connect: connectTo('/home/ubuntu'), homedir: '/Users/jesseruder' });
+  const differs = await setup.nodeHomeReport({ listNodes, connect: connectTo('/home/ubuntu'), homedir: '/Users/someone' });
   assert.equal(differs[0].status, 'FAIL');
   assert.equal(differs[0].text,
-    'node aws1 has home /home/ubuntu, not /Users/jesseruder; Keep nodes must share the home directory');
-  assert.match(differs[0].fix, /^give aws1 the home \/Users\/jesseruder/);
+    'node aws1 has home /home/ubuntu, not /Users/someone; Keep nodes must share the home directory');
+  assert.match(differs[0].fix, /^give aws1 the home \/Users\/someone/);
 
   // Unreachable is not the same as wrong: keep nodes reports reachability, and a
   // node that is merely switched off must not fail this install's doctor.
   const down = await setup.nodeHomeReport({
-    listNodes, homedir: '/Users/jesseruder',
+    listNodes, homedir: '/Users/someone',
     connect: async () => { throw new Error('connect ECONNREFUSED'); },
   });
   assert.equal(down[0].status, 'optional');

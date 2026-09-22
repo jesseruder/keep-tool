@@ -44,7 +44,7 @@ function expandArgv(argv, paths) {
   return expanded;
 }
 
-// Keep's nodes share one home directory — /Users/jesseruder on every machine, the
+// Keep's nodes share one home directory — the same path on every machine, the
 // Linux ones included. That is a decision, not an accident, and everything that
 // travels between nodes leans on it: accounts.js expands `~` with the daemon's home
 // before an account ever reaches here, so a node whose home is somewhere else would
