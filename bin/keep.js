@@ -198,7 +198,7 @@ commands.add = (argv) => {
   if (!title.trim()) die('usage: keep add "title" [--kind k] [--file|--claim] [--tag t] [--project p] [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when] [--autonomous] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--status s] [--force] [--as-owner] [-m note]');
   // Creating a card with grants is granting. Gated exactly like `keep allow
   // --grant`, or the refusal there would be one `keep add --allow` away.
-  if ((o.allow || o.until) && inAgentSession() && !(o['as-owner'] && process.env.KEEP_OWNER === '1')) {
+  if ((o.allow || o.until) && inAgentSession() && !(o['as-owner'] && process.env.KEEP_OWNER === '1' && !process.env.KEEP_REMOTE_CALLER)) {
     die('only Owner grants. Create the card without --allow/--until and ask him for "keep allow <card> --grant …". '
       + 'If Owner is running this himself from an agent session, pass --as-owner with KEEP_OWNER=1 in the environment.');
   }
@@ -1520,7 +1520,9 @@ commands.allow = (argv) => {
   // grants; this is that sentence with an exit code behind it.
   // Revoking and clearing only ever reduce authority, so they stay open.
   const widening = Boolean(o.grant || o.until);
-  if (widening && inAgentSession() && !(o['as-owner'] && process.env.KEEP_OWNER === '1')) {
+  // A node's request (KEEP_REMOTE_CALLER) is never Owner's terminal, so --as-owner
+  // does not open this for it whatever reaches its environment.
+  if (widening && inAgentSession() && !(o['as-owner'] && process.env.KEEP_OWNER === '1' && !process.env.KEEP_REMOTE_CALLER)) {
     die(`only Owner grants. Never grant on your own card — end the turn and ask him for "keep allow ${id} --grant …". `
       + 'If Owner is running this himself from an agent session, pass --as-owner with KEEP_OWNER=1 in the environment.');
   }

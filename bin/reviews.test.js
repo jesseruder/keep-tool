@@ -75,7 +75,29 @@ function fixture() {
     return git(tree, ['rev-parse', 'HEAD']);
   };
   const card = () => require('./keep.js').parseTask(fs.readFileSync(path.join(root, 'tasks', 'work.md'), 'utf8'), 'work');
-  return { base, root, origin, main, tree, jobsDir, env, run, ok, commit, card,
+  // A command a node posts to the daemon's /api/registry, run by the route's own
+  // subprocess (KEEP_REMOTE_CALLER=aws1, the minimal env) in `cwd`.
+  let routeKeys = 0;
+  let service = null;
+  const viaNode = async (command, args, { cwd = tree, session = null } = {}) => {
+    if (!service) {
+      service = require('./registry-route.js').createRegistryService({
+        root,
+        daemonNode: () => 'main',
+        location: (id) => (id === 'node-session' ? { node: 'aws1', agent: 'claude' } : null),
+        env: { PATH: process.env.PATH, HOME: base, LANG: 'C' },
+        configFile: path.join(base, 'config.json'),
+      });
+    }
+    routeKeys += 1;
+    const answer = await service.handle({ class: 'node', node: 'aws1' }, {
+      command, args, cwd, idempotencyKey: `review-key-${String(routeKeys).padStart(8, '0')}`,
+      ...(session ? { session, agent: 'claude' } : {}),
+    });
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    return answer.body;
+  };
+  return { base, root, origin, main, tree, jobsDir, env, run, ok, commit, card, viaNode,
     cleanup: () => fs.rmSync(base, { recursive: true, force: true }) };
 }
 
@@ -375,5 +397,54 @@ test('keep reviewed on a card another session owns warns and still files', () =>
     assert.equal(out.status, 0, out.stderr);
     assert.match(out.stderr, /work is claimed by owning-s, not this codex session visiting/);
     assert.equal(require('./reviews.js').readRecords('work', f.root).length, 1, 'filed anyway');
+  } finally { f.cleanup(); }
+});
+
+test('a node can never attest as human, and a human record written here is unchanged', async () => {
+  const f = fixture();
+  const long = 'read every hunk of the retry path and re-ran bin/delivery.test.js; the double-send is gone';
+  try {
+    f.ok(['add', 'Work', '--status', 'active', '--project', f.tree, '-m', 'Started.'], {}, f.root);
+    const sha = f.commit('one');
+
+    const human = await f.viaNode('reviewed', ['work', '--commit', sha, '--verdict', 'clean', '--by', 'human jesse']);
+    assert.notEqual(human.status, 0);
+    assert.match(human.stderr, /a node cannot record a human review/);
+    const humanSession = await f.viaNode('reviewed', ['work', '--commit', sha, '--verdict', 'findings', '--by', 'Human'], { session: 'node-session' });
+    assert.notEqual(humanSession.status, 0);
+    assert.match(humanSession.stderr, /a node cannot record a human review/);
+    // With no session and no --by, a record here would be Owner's; from a node it is refused.
+    const bare = await f.viaNode('reviewed', ['work', '--commit', sha, '--verdict', 'findings']);
+    assert.notEqual(bare.status, 0);
+    assert.match(bare.stderr, /a node cannot record a human review — name the reviewer with --by codex\|opus\|claude\|pi/);
+    assert.equal(require('./reviews.js').readRecords('work', f.root).length, 0, 'nothing refused was written');
+
+    // A node session without --by is recorded as its agent, and stamped with the node.
+    const byAgent = await f.viaNode('reviewed', ['work', '--commit', sha, '--verdict', 'findings'], { session: 'node-session' });
+    assert.equal(byAgent.status, 0, byAgent.stderr);
+    const opus = await f.viaNode('reviewed', ['work', '--commit', sha, '--verdict', 'clean', '--by', 'opus', '--evidence', long]);
+    assert.equal(opus.status, 0, opus.stderr);
+    const records = require('./reviews.js').readRecords('work', f.root);
+    assert.deepEqual(records.map((record) => [record.by, record.node]), [['claude', 'aws1'], ['opus', 'aws1']]);
+
+    // Owner's grant is not a node's either, --as-owner or not.
+    for (const args of [['allow', 'work', '--grant', 'push'], ['allow', 'work', '--grant', 'push', '--as-owner'], ['allow', 'work', '--until', '+7d']]) {
+      const refused = await f.viaNode(args[0], args.slice(1), { cwd: f.root });
+      assert.notEqual(refused.status, 0);
+      assert.match(refused.stderr, /only Owner grants/);
+    }
+    const created = await f.viaNode('add', ['Node granted', '--allow', 'land', '--as-owner', '-m', 'x'], { cwd: f.root });
+    assert.notEqual(created.status, 0);
+    assert.match(created.stderr, /only Owner grants/);
+    assert.equal(f.card().fm.allow, undefined);
+
+    // Here, with no session, the record is Owner's, in exactly the shape it always had.
+    f.ok(['reviewed', 'work', '--commit', sha, '--verdict', 'clean', '--by', 'human jesse']);
+    const local = require('./reviews.js').readRecords('work', f.root).pop();
+    assert.deepEqual(Object.keys(local), ['id', 'at', 'by', 'job', 'jobAccountId', 'jobAt', 'verdict', 'evidence', 'commits', 'bySession', 'message']);
+    assert.equal(local.by, 'human jesse');
+    assert.equal(local.bySession, null);
+    const defaulted = require('./reviews.js').cleanBy('', {});
+    assert.equal(defaulted, 'human');
   } finally { f.cleanup(); }
 });

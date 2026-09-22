@@ -144,18 +144,30 @@ function cleanVerdict(value) {
   return verdict;
 }
 
+// The node a command came from when the daemon runs it for one (KEEP_REMOTE_CALLER,
+// set only by the /api/registry route), else ''. Such a command is never Owner's own
+// terminal, whether or not it names a session.
+function remoteCaller(env = process.env) {
+  return env && typeof env.KEEP_REMOTE_CALLER === 'string' ? env.KEEP_REMOTE_CALLER : '';
+}
+
 function cleanBy(value, env = process.env) {
   const agent = Boolean(env.CLAUDE_CODE_SESSION_ID || env.CODEX_SESSION_ID || env.CODEX_THREAD_ID || env.KEEP_PI_SESSION_ID);
+  const node = remoteCaller(env);
   const text = notes.scrub(value == null ? '' : value).slice(0, 120);
   if (!text) {
     if (env.CODEX_SESSION_ID || env.CODEX_THREAD_ID) return 'codex';
     if (env.CLAUDE_CODE_SESSION_ID) return 'claude';
     if (env.KEEP_PI_SESSION_ID) return 'pi';
+    // No session and no --by is Owner's terminal on this machine, and only here: a
+    // node's request is never read as a human, so it has to say who reviewed.
+    if (node) fail(`a node cannot record a human review — name the reviewer with --by ${BY_VOCABULARY.filter((word) => word !== 'human').join('|')}`);
     return 'human';
   }
   if (!BY_RE.test(text)) {
     fail(`--by "${text}" must start with one of ${BY_VOCABULARY.join(', ')} — e.g. --by "codex sol" or --by human`);
   }
+  if (/^human\b/i.test(text) && node) fail('a node cannot record a human review');
   // `human` is the one value that needs no other evidence, so it is the one an
   // agent must not be able to write about its own work. The record would carry a
   // bySession anyway; refusing here says why instead of leaving a record that
@@ -237,7 +249,8 @@ function sessionStamp(session) {
 function buildRecord(input, deps, options = {}) {
   const now = options.now || Date.now();
   const verdict = cleanVerdict(input.verdict);
-  const by = cleanBy(input.by, options.env);
+  const by = cleanBy(input.by, options.env || process.env);
+  const remote = remoteCaller(options.env || process.env);
   const evidence = cleanEvidence(input.evidence);
   const job = notes.scrub(input.job == null ? '' : input.job).slice(0, 200);
   const bySession = sessionStamp(input.session);
@@ -251,7 +264,7 @@ function buildRecord(input, deps, options = {}) {
   // rather than written and quietly distrusted later; a findings record is never
   // authority, so it is recorded whatever it cites.
   if (verdict === 'clean') {
-    const failure = attestationFailure({ by, job, evidence, hasSession: Boolean(bySession) });
+    const failure = attestationFailure({ by, job, evidence, hasSession: Boolean(bySession) || Boolean(remoteCaller(options.env || process.env)) });
     if (failure) fail(`a clean review record cannot stand on this: ${failure}`);
   }
   const commits = resolveCommits(input.commits, deps);
@@ -288,6 +301,9 @@ function buildRecord(input, deps, options = {}) {
     commits,
     bySession,
     message: notes.scrub(input.message == null ? '' : input.message).slice(0, MESSAGE_LIMIT),
+    // Which node asked the daemon to write this, so a reader (and allow.js) can tell
+    // a record that came over the node API from one written on this machine.
+    ...(remote ? { node: remote } : {}),
   };
 }
 
@@ -393,7 +409,7 @@ function landContext(cwd = process.cwd(), deps = {}) {
 module.exports = {
   ReviewRecordError, EVIDENCE_LIMIT, EVIDENCE_MINIMUM, MESSAGE_LIMIT, VERDICTS, BY_VOCABULARY,
   reviewsDir, cardFile, readRecords, writeRecords, recordId,
-  gitDeps, resolveCommits, cleanVerdict, cleanBy, cleanEvidence, resolveJob, attestationFailure,
+  gitDeps, resolveCommits, cleanVerdict, cleanBy, remoteCaller, cleanEvidence, resolveJob, attestationFailure,
   buildRecord, append, logLine,
   autoLandConfig, optOutReason, landContext,
 };

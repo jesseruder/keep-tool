@@ -340,6 +340,10 @@ test('the attestation bar: what each kind of reviewer has to cite', () => {
   const impersonated = allow.decideLand({ records: [record({ by: 'human jesse', job: '', jobAccountId: '', evidence: '' })], commits: [COMMIT_A] });
   assert.equal(impersonated.ok, false);
   assert.match(impersonated.why, /marked human but was written from inside an agent session/);
+  // A record another node asked the daemon to write is never Owner's terminal either.
+  const fromNode = allow.decideLand({ records: [record({ by: 'human jesse', job: '', jobAccountId: '', evidence: '', bySession: null, node: 'aws1' })], commits: [COMMIT_A] });
+  assert.equal(fromNode.ok, false);
+  assert.match(fromNode.why, /marked human but came from node aws1/);
 });
 
 test('an opt-out, an unusable worktree and an empty range each name themselves', () => {

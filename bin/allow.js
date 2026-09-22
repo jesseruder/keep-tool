@@ -235,6 +235,7 @@ function attestationFailure(record) {
     // A record written from inside an agent session is never human testimony,
     // whatever `by` says. `keep reviewed` refuses to write one; a hand-edited
     // file can still hold one.
+    if (record && record.node) return `is marked human but came from node ${record.node}, which is never Owner's own terminal`;
     return record && record.bySession ? 'is marked human but was written from inside an agent session' : '';
   }
   if (/^codex\b/i.test(by)) {
