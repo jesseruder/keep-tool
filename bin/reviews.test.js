@@ -543,3 +543,90 @@ test('commit and job facts are accepted only from a node, and only well formed',
       ['work', '--evidence', '--commit', '-m', '--commit', '--verdict', 'findings']);
   } finally { f.cleanup(); }
 });
+
+// ---------- end to end: review on a node, then its land gate ----------
+
+// The daemon's node API in miniature: /api/registry and its ping, served by the real
+// registry service (the daemon's own CLI in a subprocess) for node aws1's token.
+async function nodeApi(f) {
+  const http = require('node:http');
+  const service = require('./registry-route.js').createRegistryService({
+    root: f.root,
+    daemonNode: () => 'main',
+    location: (id) => (id === 'sess-aws1' ? { node: 'aws1', agent: 'claude' } : null),
+    env: { PATH: process.env.PATH, HOME: f.base, LANG: 'C' },
+    configFile: path.join(f.base, 'config.json'),
+  });
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let data = '';
+    req.on('data', (chunk) => { data += chunk; });
+    req.on('end', async () => {
+      const principal = req.headers['x-keep-node-token'] === 'aws1-secret' ? { class: 'node', node: 'aws1' } : null;
+      const answer = req.url === '/api/registry/ping' ? service.ping(principal)
+        : req.url === '/api/registry' && req.method === 'POST' ? await service.handle(principal, JSON.parse(data || '{}'))
+          : { status: 404, body: { error: 'not found' } };
+      if (req.url === '/api/registry') requests.push(JSON.parse(data || '{}'));
+      res.writeHead(answer.status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(answer.body));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const tokenFile = path.join(f.base, 'node-token');
+  fs.writeFileSync(tokenFile, 'aws1-secret\n', { mode: 0o600 });
+  const env = {
+    ...f.env, KEEP_DIR: path.join(f.base, 'no-registry-on-the-node'), KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main',
+    KEEP_NODE_TOKEN_FILE: tokenFile, KEEP_DAEMON_URL: `http://127.0.0.1:${server.address().port}`, CLAUDE_CODE_SESSION_ID: 'sess-aws1',
+  };
+  for (const name of ['KEEP_PANE', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'KEEP_PI_SESSION_ID', 'KEEP_CONFIG']) delete env[name];
+  const run = (args) => new Promise((resolve) => {
+    const child = require('node:child_process').spawn(process.execPath, [CLI, ...args], { cwd: f.tree, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (status) => resolve({ status, stdout, stderr }));
+  });
+  return { run, requests, close: () => new Promise((resolve) => server.close(resolve)) };
+}
+
+test('a review recorded from a node worktree lets keep allow land there answer 0 for exactly those patches', async () => {
+  const f = fixture();
+  const api = await nodeApi(f);
+  const evidence = 'read the whole range on the node: the fact encoding, the daemon-side validation and the land gate agree';
+  try {
+    f.ok(['add', 'Work', '--status', 'active', '--project', f.main, '-m', 'Started.'], {}, f.root);
+    f.commit('one');
+    f.commit('two');
+
+    const unreviewed = await api.run(['allow', 'work', 'land']);
+    assert.equal(unreviewed.status, 3, unreviewed.stderr);
+
+    const reviewed = await api.run(['reviewed', 'work', '--commit', 'origin/master..HEAD', '--verdict', 'clean',
+      '--by', 'opus subagent on the node', '--evidence', evidence]);
+    assert.equal(reviewed.status, 0, reviewed.stderr);
+    assert.match(reviewed.stdout, /work: recorded clean review rev-[a-z0-9-]+ over 2 commit\(s\) by opus subagent on the node/);
+    const sent = api.requests.find((request) => request.command === 'reviewed');
+    assert.equal(sent.cwd, f.main, 'the project, not the worktree');
+    assert.equal(sent.nodeCwd, f.tree);
+    assert.equal(sent.args.includes('--commit'), false);
+    const [record] = require('./reviews.js').readRecords('work', f.root);
+    assert.equal(record.node, 'aws1');
+    assert.deepEqual(record.bySession, { sessionId: 'sess-aws1', agent: 'claude' });
+    assert.deepEqual(record.commits.map((commit) => commit.sha), git(f.tree, ['rev-list', '--reverse', 'origin/master..HEAD']).split('\n'));
+
+    const allowed = await api.run(['allow', 'work', 'land']);
+    assert.equal(allowed.status, 0, allowed.stdout + allowed.stderr);
+    assert.match(allowed.stdout, new RegExp(`^allowed: reviewed clean: 2 commit\\(s\\) by opus subagent on the node at .* \\(record ${record.id}\\)\\n$`));
+
+    // The same commits rewritten with different content are not the patches reviewed.
+    fs.appendFileSync(path.join(f.tree, 'work.txt'), 'slipped in after the review\n');
+    git(f.tree, ['commit', '-q', '-a', '--amend', '--no-edit']);
+    const changed = await api.run(['allow', 'work', 'land']);
+    assert.notEqual(changed.status, 0);
+    assert.match(changed.stdout, /^not allowed: no land grant, and [0-9a-f]{12} \("two"\) has no review record/);
+  } finally {
+    await api.close();
+    f.cleanup();
+  }
+});
