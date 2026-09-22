@@ -29,7 +29,12 @@ function fakeHost(meta = {}, onRequest = null) {
         if (type === 'meta') { Object.assign(pane.meta, params.patch); return { pane }; }
         return {};
       },
-      attach: async (paneId) => { client.attached = true; client.attachedPane = paneId; return { pane, detach: () => {} }; },
+      attach: async (paneId, attachOptions, onData, onExit) => {
+        client.attached = true;
+        client.attachedPane = paneId;
+        client.onExit = onExit;
+        return { pane, detach: () => {} };
+      },
       subscribe: async () => ({ unsubscribe: () => {} }),
       close: () => { client.closed = true; },
     };
@@ -276,5 +281,27 @@ test('a bare pane stays exactly as it was', async () => {
     await ws.settle();
     assert.equal(host.relay().node, 'main', 'the daemon node is the unqualified answer');
     assert.equal(host.relay().attachedPane, 'pane-1');
+  } finally { await ws.close(); }
+});
+
+test('a bridge whose remote host drops reconnects to the same node', async () => {
+  const host = fakeHost();
+  const ws = await bridged(host, { pane: 'pane-1@aws1' });
+  try {
+    await ws.settle();
+    const first = host.relay();
+    assert.equal(first.node, 'aws1');
+    // What a host restart, a core reload or a dropped tailnet link looks like here.
+    first.onExit({ disconnected: true });
+    await ws.settle();
+    const attached = host.clients.filter((client) => client.attached);
+    assert.equal(attached.length, 2, 'the bridge opened a second connection');
+    assert.equal(attached[1].node, 'aws1', 'to the node the ref named, not to the daemon node');
+    assert.equal(attached[1].attachedPane, 'pane-1', 'and asked for the host own id again');
+    assert.equal(first.closed, true, 'the dropped connection is let go');
+    // And it is usable again: a keystroke lands on the new connection.
+    await ws.send(Buffer.from('typed'));
+    await ws.settle();
+    assert.deepEqual(attached[1].requests.filter((call) => call.type === 'input').map((call) => call.params.pane), ['pane-1']);
   } finally { await ws.close(); }
 });
