@@ -1846,6 +1846,14 @@ function screenTail(screen) {
   return String(screen || '').split(/\r?\n/).slice(-30).join('\n').slice(-600);
 }
 
+// A pane a request may name: a host's own id, or that id qualified by the node it
+// lives on. The host's alphabet has no '@', so the two shapes cannot be confused.
+const PANE_REF_RE = /^[A-Za-z0-9_-]{1,64}(?:@[a-z0-9]+)?$/;
+
+function validPaneRef(value) {
+  return PANE_REF_RE.test(String(value == null ? '' : value));
+}
+
 function isHostTarget(target) {
   return Boolean(target && typeof target.pane === 'string' && target.pane);
 }
@@ -5435,7 +5443,7 @@ function historyLinesLimit(value) {
 // Only a live pane the console itself spawned as a shell is reachable this way: an agent
 // pane still goes through its session, where the injection safety checks live.
 async function shellPaneTarget(paneId, deps = {}) {
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(String(paneId || ''))) throw new InjectionError(400, 'bad pane id');
+  if (!validPaneRef(paneId)) throw new InjectionError(400, 'bad pane id');
   const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
   const pane = (panes || []).find((entry) => entry.id === paneId);
   if (!pane) throw new InjectionError(404, 'no such pane');
@@ -6166,7 +6174,7 @@ async function forceRestartSession(entry, save, deps = {}) {
 }
 
 async function closeIdleSession(body, deps = {}) {
-  if (!/^[A-Za-z0-9_-]+$/.test(String(body.sessionId || '')) || !/^[A-Za-z0-9_-]+$/.test(String(body.pane || ''))) throw new InjectionError(400, 'Expected an exact session and pane');
+  if (!/^[A-Za-z0-9_-]+$/.test(String(body.sessionId || '')) || !validPaneRef(body.pane)) throw new InjectionError(400, 'Expected an exact session and pane');
   const scope = { pane: body.pane, session: body.sessionId };
   return (deps.withInjectionLock || withInjectionLock)(async () => {
     const listed = await hostPanesForAction(deps, true);
@@ -12303,6 +12311,7 @@ module.exports = {
   isHostTarget,
   hostClient,
   hostClientFor,
+  validPaneRef,
   hostNodeNames,
   listNodePaneResult,
   sessionHostPane,

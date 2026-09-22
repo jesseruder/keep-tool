@@ -251,7 +251,7 @@ test('a host that is down is retried once per window, not on every keystroke', a
 
 test('a qualified pane is stripped for its host and restored for the viewer', async () => {
   const host = fakeHost({ unattended: true });
-  const ws = await bridged(host, { pane: 'aws1-pane-1', nodes: ['main', 'aws1'] });
+  const ws = await bridged(host, { pane: 'pane-1@aws1' });
   try {
     await ws.settle();
     const relay = host.relay();

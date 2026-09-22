@@ -792,7 +792,7 @@ function withNodes(t, names) {
 test('a qualified pane ref reaches the bridge with its node intact', async (t) => {
   withNodes(t, ['main', 'aws1']);
   const f = await fixture({ panes: { 'p-9': {} } });
-  const ws = new WebSocket(`ws://127.0.0.1:${f.port}/ws/pane/aws1-p-9?viewer=node-route`, {
+  const ws = new WebSocket(`ws://127.0.0.1:${f.port}/ws/pane/p-9%40aws1?viewer=node-route`, {
     origin: `http://127.0.0.1:${f.port}`,
   });
   t.after(async () => {
@@ -806,7 +806,7 @@ test('a qualified pane ref reaches the bridge with its node intact', async (t) =
     'the attached frame',
   );
   const attached = frames.map(jsonMessage).find((message) => message?.t === 'attached');
-  assert.equal(attached.pane.id, 'aws1-p-9', 'the viewer gets back the id it asked for');
+  assert.equal(attached.pane.id, 'p-9@aws1', 'the viewer gets back the id it asked for');
   assert.deepEqual(f.calls.filter((call) => call.type === 'attach').map((call) => call.params.pane), ['p-9'],
     'the host is asked for its own bare id');
   assert.equal(f.clients[f.clients.length - 1].node, 'aws1', 'the client was opened on the named node');

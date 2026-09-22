@@ -13215,7 +13215,7 @@ test('the daemon merges two nodes into one pane list and routes by the qualified
       const remote = (await hostRequest('spawn', {
         cmd: '/bin/sh', args: ['-c', 'sleep 5'], meta: { sessionId: 'remote-session', agent: 'claude' },
       }, { ...deps, node: 'aws1' })).pane;
-      const qualified = `aws1-${remote.id}`;
+      const qualified = `${remote.id}@aws1`;
 
       const listed = await listHostPaneResult(deps, true);
       const byId = new Map(listed.panes.map((pane) => [pane.id, pane]));
@@ -13230,7 +13230,7 @@ test('the daemon merges two nodes into one pane list and routes by the qualified
       // The qualified id is enough to reach the second host: no call site changes.
       assert.equal((await hostRequest('get', { pane: qualified }, deps)).pane.id, remote.id);
       assert.equal((await hostRequest('get', { pane: local.id }, deps)).pane.id, local.id);
-      await assert.rejects(hostRequest('get', { pane: 'aws1-deadbeef' }, deps), /no such pane/);
+      await assert.rejects(hostRequest('get', { pane: 'deadbeef@aws1' }, deps), /no such pane/);
       assert.equal(sessionHostPane(listed.panes, 'remote-session').id, qualified);
 
       await aws1.close();

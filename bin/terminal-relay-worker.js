@@ -37,7 +37,6 @@ process.on('message', (message, socket) => {
     // and a pane ref is all it needs to know which machine to open.
     const table = message.nodes && typeof message.nodes === 'object' ? message.nodes : {};
     bridge = createTerminalBridge({
-      nodes: Object.keys(table),
       hostClient: (node) => {
         const resolved = table[node];
         if (!resolved) return Promise.reject(new Error(`unknown Keep node: ${node}`));

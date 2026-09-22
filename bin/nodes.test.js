@@ -88,23 +88,31 @@ test('an isolated registry reads no configuration and is the single node main', 
 });
 
 test('a pane ref is bare on the daemon node and qualified everywhere else', () => {
-  const names = ['main', 'aws1'];
   const env = { KEEP_DAEMON_NODE: 'main' };
-  const ref = (value) => nodes.parsePaneRef(value, { env, nodes: names });
+  const ref = (value) => nodes.parsePaneRef(value, { env });
   assert.deepEqual(ref('1a2b3c4d'), { node: 'main', paneId: '1a2b3c4d', qualified: false });
-  assert.deepEqual(ref('aws1-1a2b3c4d'), { node: 'aws1', paneId: '1a2b3c4d', qualified: true });
-  // A name that is not a configured node is part of the pane id, not a prefix:
-  // `keep pane new --name build-1` makes one, and it belongs to the daemon node.
-  assert.deepEqual(ref('build-1'), { node: 'main', paneId: 'build-1', qualified: false });
-  assert.deepEqual(ref('aws1-build-1'), { node: 'aws1', paneId: 'build-1', qualified: true });
-  assert.deepEqual(ref('-leading'), { node: 'main', paneId: '-leading', qualified: false });
+  assert.deepEqual(ref('1a2b3c4d@aws1'), { node: 'aws1', paneId: '1a2b3c4d', qualified: true });
+  // A hyphen is a legal pane-id character, so it can never be the separator: a pane
+  // named after the daemon node, or after another node, is still a local pane.
+  assert.deepEqual(ref('main-build'), { node: 'main', paneId: 'main-build', qualified: false });
+  assert.deepEqual(ref('ab-build'), { node: 'main', paneId: 'ab-build', qualified: false });
+  assert.deepEqual(ref('ab-build@ab'), { node: 'ab', paneId: 'ab-build', qualified: true });
+  // The last '@' wins, and a ref naming the daemon node is normalised back to bare.
+  assert.deepEqual(ref('a@b@aws1'), { node: 'aws1', paneId: 'a@b', qualified: true });
+  assert.deepEqual(ref('1a2b@main'), { node: 'main', paneId: '1a2b', qualified: false });
   assert.deepEqual(ref(''), { node: 'main', paneId: '', qualified: false });
   assert.deepEqual(ref(undefined), { node: 'main', paneId: '', qualified: false });
 
   assert.equal(nodes.formatPaneRef('main', '1a2b3c4d', env), '1a2b3c4d');
-  assert.equal(nodes.formatPaneRef('aws1', '1a2b3c4d', env), 'aws1-1a2b3c4d');
-  assert.deepEqual(ref(nodes.formatPaneRef('aws1', 'build-1', env)),
-    { node: 'aws1', paneId: 'build-1', qualified: true });
+  assert.equal(nodes.formatPaneRef('aws1', '1a2b3c4d', env), '1a2b3c4d@aws1');
+  // Round trip: every ref the fleet can build parses back to itself.
+  for (const value of ['1a2b3c4d', 'main-build', 'ab-build', '1a2b3c4d@aws1', 'main-build@aws1', 'ab-build@ab']) {
+    const parsed = ref(value);
+    assert.equal(nodes.formatPaneRef(parsed.node, parsed.paneId, env), value, value);
+  }
+  // A pane id the host could mint never contains the separator, whatever it is named.
+  const PANE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+  assert.equal(PANE_ID_PATTERN.test(nodes.PANE_REF_SEPARATOR), false);
 });
 
 test('the configured node names come from the configuration and fall back to the daemon node', () => {

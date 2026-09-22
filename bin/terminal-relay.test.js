@@ -326,8 +326,8 @@ test('a qualified pane ref routes the relay and the console to the node that own
     let ws;
     try {
       const { pane } = await remote.request('spawn', { cmd: '/bin/cat', args: [] });
-      const qualified = `aws1-${pane.id}`;
-      ws = new WebSocket(`ws://127.0.0.1:${port}/ws/pane/${qualified}?viewer=node-route`, {
+      const qualified = `${pane.id}@aws1`;
+      ws = new WebSocket(`ws://127.0.0.1:${port}/ws/pane/${encodeURIComponent(qualified)}?viewer=node-route`, {
         origin: `http://127.0.0.1:${port}`,
       });
       const texts = [];

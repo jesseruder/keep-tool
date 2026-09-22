@@ -56,7 +56,7 @@ function createTerminalBridge(options = {}) {
     // The viewer asked for a pane by its fleet-wide name. The host that owns it knows
     // it by the bare id alone, so the qualifier is stripped on the way in and put
     // back on everything that goes out: the console holds one id for one pane.
-    const ref = parsePaneRef(String(pane), { nodes: options.nodes });
+    const ref = parsePaneRef(String(pane));
     const hostPane = ref.paneId;
     const qualify = (value) => (ref.qualified && value && typeof value === 'object' && value.id === hostPane
       ? { ...value, id: pane } : value);
