@@ -26,6 +26,20 @@ function localNode(env = process.env) {
 
 function isDaemonNode(env = process.env) { return localNode(env) === daemonNode(env); }
 
+// A machine that holds terminals for another one's registry: its hooks and its CLI
+// must not write a registry of their own. null on the daemon node, which is every
+// single-node install. A name that does not parse is not proof of being the daemon,
+// so it answers as a pane-only node — refusing there is recoverable, writing a
+// second registry is not.
+function paneOnlyNode(env = process.env) {
+  try {
+    if (isDaemonNode(env)) return null;
+    return { local: localNode(env), daemon: daemonNode(env) };
+  } catch {
+    return { local: String(env.KEEP_NODE_NAME || '?'), daemon: String(env.KEEP_DAEMON_NODE || 'main') };
+  }
+}
+
 // The node list comes from the configuration, so this is memoised: a caller may ask
 // once per pane, and the answer changes only when `keep nodes add` rewrites the file.
 let nodeEntryMemo = { at: 0, key: null, entries: null };
@@ -141,6 +155,6 @@ function writeNodeToken(root, name) {
 
 module.exports = {
   NODE_NAME_RE, PANE_REF_SEPARATOR, NODE_NAME_MEMO_MS,
-  daemonNode, localNode, isDaemonNode, nodeTokens, writeNodeToken,
+  daemonNode, localNode, isDaemonNode, paneOnlyNode, nodeTokens, writeNodeToken,
   configuredNodeEntries, configuredNodeNames, parsePaneRef, formatPaneRef, isRemotePane,
 };

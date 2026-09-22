@@ -47,6 +47,17 @@ test('configured nodes name the daemon node and default this machine to it', () 
   });
 });
 
+test('a pane-only node is any machine that is not the daemon node, and a name that does not parse is one', () => {
+  assert.equal(nodes.paneOnlyNode({}), null);
+  assert.equal(nodes.paneOnlyNode({ KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' }), null);
+  assert.equal(nodes.paneOnlyNode({ KEEP_DAEMON_NODE: 'mini' }), null);
+  assert.deepEqual(nodes.paneOnlyNode({ KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main' }),
+    { local: 'aws1', daemon: 'main' });
+  assert.deepEqual(nodes.paneOnlyNode({ KEEP_NODE_NAME: 'aws1' }), { local: 'aws1', daemon: 'main' });
+  assert.deepEqual(nodes.paneOnlyNode({ KEEP_NODE_NAME: 'Not A Name', KEEP_DAEMON_NODE: 'main' }),
+    { local: 'Not A Name', daemon: 'main' });
+});
+
 test('an explicit node name in the environment wins over the configuration', () => {
   withConfig({ nodes: { mini: {}, laptop: {} }, daemonNode: 'mini' }, (env) => {
     const explicit = { ...env, KEEP_NODE_NAME: 'laptop' };

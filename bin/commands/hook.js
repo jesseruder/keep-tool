@@ -365,6 +365,212 @@ function sessionNumberContext(sessionId) {
     + 'call other sessions #n rather than by a uuid prefix; keep tell, keep open and keep pane accept #n.';
 }
 
+// ---------- pane-only nodes ----------
+
+// A session on a machine that holds terminals for another one's registry. Until
+// phase 3 carries its hooks to the daemon, nothing here may write a registry: one
+// on this machine would be a second, diverging copy, and the daemon's is out of
+// reach. What stays is what the terminal host on this machine needs: the pane is
+// bound to the session at start and released at the end, so the console can show
+// it and Owner can type into it, restart it and close it.
+function paneOnlyNotice(where) {
+  return `Keep: this session is unmanaged on node ${where.local}; the daemon is on ${where.daemon}. `
+    + 'keep checkin and other registry commands are not available here until phase 3.';
+}
+
+function remoteHookTarget(input, deps = {}) {
+  const env = deps.env || process.env;
+  const sid = input && input.session_id;
+  if (env.KEEP_RUN || !env.KEEP_PANE || typeof sid !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sid)) return null;
+  return { sid, pane: env.KEEP_PANE };
+}
+
+// recordSessionPane's host half, and none of its record. The owner check is the
+// pane's own meta, which a release on this node clears, so there is no released
+// stamp on disk to consult. A Codex session proves from its rollout here that it
+// owns a pane Keep launched, or one another session still names, before taking it.
+async function bindRemotePane(input, agent, deps = {}) {
+  const target = remoteHookTarget(input, deps);
+  if (!target) return null;
+  const { sid, pane } = target;
+  const cwd = input.cwd || process.cwd();
+  const connectHost = deps.connectHost || require('../hostclient.js').connect;
+  const ownsPane = deps.codexOwnsPane || require('../codex-pane').ownsPane;
+  const timeoutMs = deps.timeoutMs == null ? 1000 : deps.timeoutMs;
+  const attempts = deps.attempts == null ? 3 : deps.attempts;
+  const result = { pane, bound: false };
+  for (let attempt = 0; attempt < attempts && !result.bound && !result.boundTo; attempt += 1) {
+    let client;
+    try {
+      client = await connectHost({ timeoutMs: deps.timeoutMs == null ? 500 : deps.timeoutMs });
+      const current = await client.request('get', { pane }, { timeoutMs });
+      const meta = (current && current.pane && current.pane.meta) || {};
+      const owner = meta.sessionId;
+      const launchedCodex = agent === 'codex' && !owner && meta.openRequestId != null;
+      if ((owner && owner !== sid) || launchedCodex) {
+        const owns = agent === 'codex' && current.pane.alive === true
+          && await ownsPane(sid, current.pane, deps);
+        if (!owns) {
+          if (owner) result.boundTo = owner;
+          break;
+        }
+      }
+      await client.request('meta', { pane, patch: { sessionId: sid, agent, project: cwd } }, { timeoutMs });
+      result.bound = true;
+    } catch {
+      if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, deps.retryMs == null ? 400 : deps.retryMs));
+    } finally {
+      if (client) client.close();
+    }
+  }
+  return result;
+}
+
+// releaseSessionPane's host half: only a pane that still names this session is
+// cleared, so one that has already been taken by another session is left alone.
+async function releaseRemotePane(input, deps = {}) {
+  const target = remoteHookTarget(input, deps);
+  if (!target) return null;
+  const { sid, pane } = target;
+  const connectHost = deps.connectHost || require('../hostclient.js').connect;
+  const timeoutMs = deps.timeoutMs == null ? 1000 : deps.timeoutMs;
+  const attempts = deps.attempts == null ? 3 : deps.attempts;
+  const deadline = Date.now() + 2500;
+  const remaining = (limit) => Math.max(1, Math.min(limit, deadline - Date.now()));
+  for (let attempt = 0; attempt < attempts && Date.now() < deadline; attempt += 1) {
+    let client;
+    try {
+      client = await connectHost({ timeoutMs: remaining(deps.timeoutMs == null ? 500 : deps.timeoutMs) });
+      const current = await client.request('get', { pane }, { timeoutMs: remaining(timeoutMs) });
+      if (current?.pane?.meta?.sessionId !== sid) return { pane, released: false };
+      await client.request('meta', { pane, patch: { sessionId: null, agent: 'shell' } }, { timeoutMs: remaining(timeoutMs) });
+      return { pane, released: true };
+    } catch {
+      if (attempt < attempts - 1 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, remaining(deps.retryMs == null ? 400 : deps.retryMs)));
+      }
+    } finally {
+      if (client) client.close();
+    }
+  }
+  return { pane, released: false };
+}
+
+// The guards in front of a command. The raw-resume guard reads only the command and
+// the environment, so it holds here exactly as it does on the daemon node. The step
+// and self-repair guards answer from the registry, which is not on this machine, and
+// a guard that cannot answer refuses rather than allows: a command the step registry
+// could gate (a deploy) is refused, and a repair session is never let through by a
+// land record nobody here can read.
+function remoteCommandGuard(input, where, env = process.env) {
+  const resume = guardResumeCommand(input, env);
+  if (resume.deny) return resume;
+  if (!input || input.tool_name !== 'Bash') return { deny: false, reason: '' };
+  const command = input.tool_input && input.tool_input.command;
+  if (!command) return { deny: false, reason: '' };
+  if (env.KEEP_REPAIR === '1') {
+    const repair = guardRepairCommand(input, env, { selfRepair: { cardForSession: () => null, landedFor: () => null } });
+    if (repair.deny) {
+      return { deny: true, reason: `keep: the self-repair land record is not available on node ${where.local}; ${repair.reason}` };
+    }
+  }
+  if (env.KEEP_STEP_OK !== '1') {
+    let deploy = null;
+    try { deploy = deployCommand(command); } catch { deploy = { target: 'this command' }; }
+    if (deploy) {
+      return { deny: true, reason: `keep: the step guard is not available on node ${where.local} (its registry is on `
+        + `${where.daemon}), so a deploy to ${deploy.target} is refused here; run it from a session on ${where.daemon}. `
+        + 'KEEP_STEP_OK=1 bypasses the guard.' };
+    }
+  }
+  return { deny: false, reason: '' };
+}
+
+// Every hook action on a pane-only node. Nothing below reads or writes ROOT or META.
+async function remoteHook(argv, input, where, deps = {}) {
+  const env = deps.env || process.env;
+  const refuse = (decision) => {
+    process.stderr.write(`${decision.reason}\n`);
+    process.exitCode = 2;
+  };
+  const kind = argv[0];
+  if (kind === 'session-start') {
+    try { await bindRemotePane(input, 'claude', deps); } catch {}
+    console.log(paneOnlyNotice(where));
+    return;
+  }
+  if (kind === 'session-end') {
+    try { await releaseRemotePane(input, deps); } catch {}
+    return;
+  }
+  if (kind === 'pre-bash') {
+    let decision;
+    // Fail closed: a guard that threw has not said the command is safe.
+    try { decision = remoteCommandGuard(input, where, env); } catch (error) {
+      decision = { deny: true, reason: `keep: the command guard is not available on node ${where.local}: ${error && error.message || error}` };
+    }
+    if (decision.deny) refuse(decision);
+    return;
+  }
+  if (kind === 'codex') {
+    // Codex hooks always answer with JSON, as on the daemon node.
+    let out = {};
+    try {
+      if (argv[1] === 'start') {
+        await bindRemotePane(input, 'codex', deps);
+        out = { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: paneOnlyNotice(where) } };
+      } else if (argv[1] === 'end') {
+        await releaseRemotePane(input, deps);
+      } else if (argv[1] === 'pre-tool') {
+        const normalized = codexToolInput(input);
+        let decision = { deny: false };
+        try { if (normalized) decision = remoteCommandGuard(normalized, where, env); } catch (error) {
+          decision = { deny: true, reason: `keep: the command guard is not available on node ${where.local}: ${error && error.message || error}` };
+        }
+        if (decision.deny) {
+          console.log(JSON.stringify({
+            decision: 'block',
+            reason: decision.reason,
+            hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: decision.reason },
+          }));
+          refuse(decision);
+          return;
+        }
+      }
+    } catch {}
+    console.log(JSON.stringify(out));
+    return;
+  }
+  if (kind === 'pi') {
+    // A Pi pane keeps its session metadata after the agent exits (Watch and Reopen
+    // read it), so its end releases nothing; its start still has to bind.
+    if (argv[1] === 'start') {
+      let bound = null;
+      try { bound = await bindRemotePane(input, 'pi', deps); } catch {}
+      if (!bound || !bound.bound) {
+        process.stderr.write('keep hook pi start: could not bind the host pane\n');
+        process.exitCode = 2;
+      }
+      return;
+    }
+    if (argv[1] === 'pre-tool') {
+      if (!env.KEEP_PANE) {
+        process.stderr.write('keep hook pi pre-tool: unverified background worker\n');
+        process.exitCode = 2;
+        return;
+      }
+      let decision;
+      try { decision = remoteCommandGuard(input, where, env); } catch (error) {
+        decision = { deny: true, reason: `keep: the command guard is not available on node ${where.local}: ${error && error.message || error}` };
+      }
+      if (decision.deny) refuse(decision);
+    }
+    return;
+  }
+  // stop, notification, pre-question, lifecycle, post-bash and anything newer: what
+  // they read and write is the registry, which is on the daemon node. Exit 0, silently.
+}
+
 commands.hook = async (argv) => {
   let input = {};
   let codexInputValid = false;
@@ -375,6 +581,8 @@ commands.hook = async (argv) => {
       codexInputValid = Boolean(input && typeof input === 'object' && !Array.isArray(input));
     } catch {}
   }
+  const paneOnly = require('../nodes.js').paneOnlyNode(process.env);
+  if (paneOnly) return remoteHook(argv, input, paneOnly);
   if (argv[0] === 'lifecycle') {
     try { require('../session-lifecycle').record(ROOT, input); } catch {}
     return; // Observation only: never block or inject context.
@@ -2395,6 +2603,6 @@ function stopHook(input, agent = 'claude', options = {}) {
   return true;
 }
 
-module.exports = { commands, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
+module.exports = { commands, bindRemotePane, releaseRemotePane, remoteCommandGuard, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
   openerDescription, unattendedContext, unattendedState, enforcedUnattendedState, recordedUnattended,
   UNATTENDED_DENY_REASON, UNATTENDED_STOP_REASON };

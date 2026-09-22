@@ -1708,6 +1708,114 @@ test('the Codex start hook carries the unattended block in additionalContext', a
   } finally { await f.cleanup(); }
 });
 
+// Every file under the registry with its bytes, so a hook that writes anything at all
+// (a pane record, an attention marker, a lifecycle line) shows up as a difference.
+function registrySnapshot(root) {
+  const out = {};
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(file);
+      else if (entry.isFile()) out[path.relative(root, file)] = fs.readFileSync(file, 'utf8');
+    }
+  };
+  walk(root);
+  return out;
+}
+
+test('on a pane-only node the hooks bind the pane, say so, and write no registry', async () => {
+  const f = unattendedFixture();
+  const remote = { KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main' };
+  const hook = (argv, sid, pane, extra = {}, payload = {}) => runHookCli(['hook', ...argv], {
+    env: f.env({ ...remote, KEEP_PANE: pane, ...extra }),
+    input: JSON.stringify({ session_id: sid, cwd: f.project, ...payload }),
+  });
+  try {
+    await f.startHost();
+    const pane = f.hostPane('far-session', { sessionId: null, agent: 'shell' });
+    const before = registrySnapshot(f.root);
+
+    const started = await hook(['session-start'], 'far-session', pane);
+    assert.equal(started.status, 0, started.stderr);
+    assert.equal(started.stdout, 'Keep: this session is unmanaged on node aws1; the daemon is on main. '
+      + 'keep checkin and other registry commands are not available here until phase 3.\n');
+    // The host on this machine still learns whose pane it is.
+    assert.equal(f.panes.get(pane).meta.sessionId, 'far-session');
+    assert.equal(f.panes.get(pane).meta.agent, 'claude');
+
+    // The observation hooks say nothing and write nothing.
+    for (const argv of [['stop'], ['notification'], ['pre-question'], ['lifecycle'], ['post-bash']]) {
+      const result = await hook(argv, 'far-session', pane, {}, {
+        notification_type: 'permission_prompt', message: 'Permission needed', hook_event_name: 'Stop',
+        tool_name: argv[0] === 'pre-question' ? 'AskUserQuestion' : 'Bash',
+        tool_input: { command: 'git push heroku main' }, tool_response: { stdout: '' },
+      });
+      assert.equal(result.status, 0, `${argv[0]}: ${result.stderr}`);
+      assert.equal(result.stdout, '', argv[0]);
+    }
+
+    // pre-bash: the raw-resume guard holds as everywhere; a deploy the step registry
+    // could gate is refused by name; anything else runs.
+    const bash = (command, extra) => hook(['pre-bash'], 'far-session', pane, extra,
+      { tool_name: 'Bash', tool_input: { command } });
+    const resumed = await bash('claude --resume abc');
+    assert.equal(resumed.status, 2);
+    assert.match(resumed.stderr, /raw claude --resume bypasses Keep's launcher/);
+    const deploy = await bash('git push heroku main');
+    assert.equal(deploy.status, 2);
+    assert.match(deploy.stderr, /^keep: the step guard is not available on node aws1 \(its registry is on main\)/);
+    assert.equal((await bash('git push heroku main', { KEEP_STEP_OK: '1' })).status, 0);
+    const plain = await bash('ls -la');
+    assert.equal(plain.status, 0, plain.stderr);
+    assert.equal(plain.stderr, '');
+    const repair = await bash('keep restart-daemon', { KEEP_REPAIR: '1' });
+    assert.equal(repair.status, 2);
+    assert.match(repair.stderr, /^keep: the self-repair land record is not available on node aws1; keep guard:/);
+
+    const ended = await hook(['session-end'], 'far-session', pane);
+    assert.equal(ended.status, 0, ended.stderr);
+    assert.equal(f.panes.get(pane).meta.sessionId, null, 'released on the host here');
+    assert.equal(f.panes.get(pane).meta.agent, 'shell');
+
+    // A pane another session holds is not taken.
+    const held = f.hostPane('holder-session', {});
+    await hook(['session-start'], 'nested-session', held);
+    assert.equal(f.panes.get(held).meta.sessionId, 'holder-session');
+
+    // Codex: the same notice as context, and JSON as always.
+    const codexPane = f.hostPane('codex-far', { sessionId: null, agent: 'shell' });
+    const codex = await hook(['codex', 'start'], 'codex-far', codexPane);
+    assert.equal(codex.status, 0, codex.stderr);
+    assert.match(JSON.parse(codex.stdout).hookSpecificOutput.additionalContext, /unmanaged on node aws1/);
+    assert.equal(f.panes.get(codexPane).meta.sessionId, 'codex-far');
+    const codexStop = await hook(['codex', 'stop'], 'codex-far', codexPane);
+    assert.equal(codexStop.stdout, '{}\n');
+
+    assert.deepEqual(registrySnapshot(f.root), before, 'nothing under the registry was written');
+  } finally { await f.cleanup(); }
+});
+
+test('with the node and daemon names equal the hooks are the hooks they always were', async () => {
+  const run = async (extra) => {
+    const f = unattendedFixture();
+    try {
+      await f.startHost();
+      const pane = f.hostPane('same-session', { opener: { kind: 'owner' } });
+      const result = await runHookCli(['hook', 'session-start'], {
+        env: f.env({ KEEP_PANE: pane, ...extra }), input: JSON.stringify({ session_id: 'same-session', cwd: f.project }),
+      });
+      const record = f.readRecord('same-session');
+      return { status: result.status, stdout: result.stdout.split(f.root).join('<root>'),
+        record: { ...record, at: 0, startedAt: 0, cwd: record.cwd.split(f.root).join('<root>') } };
+    } finally { await f.cleanup(); }
+  };
+  const unset = await run({});
+  const equal = await run({ KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' });
+  assert.equal(unset.status, 0);
+  assert.ok(unset.stdout.startsWith('[keep — work registry]'));
+  assert.deepEqual(equal, unset);
+});
+
 test('AskUserQuestion is denied in an unattended session and nowhere else', async () => {
   const f = unattendedFixture();
   const run = (sid, pane) => runHookCli(['hook', 'pre-question'], {
