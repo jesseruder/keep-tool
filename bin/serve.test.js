@@ -15347,3 +15347,265 @@ test('a Claude projects directory that does not exist yet is named in the watche
   assert.equal(failed.ok, false);
   assert.match(failed.error, /^claude\/default: too many open files; bounded scans rely on sweeps until restart$/);
 });
+
+// ---------- loadCurrentSession: one exact read per action, never a fleet scan ----------
+
+// A private account configuration for one test (as bin/tell.test.js builds it): a
+// Claude and a Codex account in temp directories, HOME pointed away from the
+// operator's. The registry is the test-env one (keep.ROOT), where the daemon's
+// readers look for authority, markers and retirement state. scanSessions always ends
+// in codex.scan, pi.scan and the live-title pass, and none of them is on the
+// per-session path, so `fleetScans` records any fleet scan the action made.
+function exactLoaderFixture() {
+  const keepModule = require('./keep.js');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-exact-loader-'));
+  const claudeDir = path.join(base, 'claude');
+  const codexDir = path.join(base, 'codex');
+  const home = path.join(base, 'home');
+  for (const dir of [claudeDir, codexDir, home]) fs.mkdirSync(dir, { recursive: true });
+  const config = path.join(base, 'config.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'claude-a', label: 'Claude A', agent: 'claude', configDir: claudeDir },
+    { id: 'codex-a', label: 'Codex A', agent: 'codex', configDir: codexDir },
+  ], defaultAccounts: { claude: 'claude-a', codex: 'codex-a' } }));
+  const saved = { KEEP_CONFIG: process.env.KEEP_CONFIG, HOME: process.env.HOME };
+  process.env.KEEP_CONFIG = config;
+  process.env.HOME = home;
+  const root = keepModule.ROOT;
+  const created = [];
+  const projectDir = path.join(claudeDir, 'projects', '-test-project');
+  fs.mkdirSync(projectDir, { recursive: true });
+  const ts = (at) => new Date(at).toISOString();
+  const user = (id, text, at) => ({ type: 'user', sessionId: id, uuid: crypto.randomUUID(), cwd: '/test/project',
+    isSidechain: false, timestamp: ts(at), message: { role: 'user', content: text } });
+  const assistant = (id, text, at, extra = {}) => ({ type: 'assistant', sessionId: id, uuid: crypto.randomUUID(),
+    isSidechain: false, timestamp: ts(at),
+    message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text }] }, ...extra });
+  const claude = (id, rows, at = Date.now()) => {
+    const file = path.join(projectDir, `${id}.jsonl`);
+    const all = [{ type: 'permission-mode', permissionMode: 'default', sessionId: id }, ...rows];
+    fs.writeFileSync(file, `${all.map((row) => JSON.stringify(row)).join('\n')}\n`);
+    fs.utimesSync(file, new Date(at), new Date(at));
+    return file;
+  };
+  const append = (file, rows) => fs.appendFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+  const codexRollout = (id) => {
+    const now = new Date();
+    const dir = path.join(codexDir, 'sessions', String(now.getFullYear()),
+      String(now.getMonth() + 1).padStart(2, '0'), String(now.getDate()).padStart(2, '0'));
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date(now.getTime() - 5000).toISOString();
+    const rows = [
+      { type: 'session_meta', timestamp: stamp, payload: { id, cwd: '/test/project', originator: 'codex_cli_rs', source: 'cli' } },
+      { type: 'event_msg', timestamp: stamp, payload: { type: 'user_message', message: 'hello' } },
+      { type: 'event_msg', timestamp: stamp, payload: { type: 'agent_message', message: 'Done.' } },
+      { type: 'event_msg', timestamp: stamp, payload: { type: 'task_complete' } },
+    ];
+    const file = path.join(dir, `rollout-2026-01-01T00-00-00-${id}.jsonl`);
+    fs.writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+    const written = new Date(now.getTime() - 5000);
+    fs.utimesSync(file, written, written);
+    return file;
+  };
+  const registryFile = (dir, name, content) => {
+    const file = path.join(root, '.keep', dir, name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content);
+    created.push(file);
+    return file;
+  };
+  const titlesModule = require('./titles.js');
+  const piModule = require('./pi.js');
+  const originals = { codexScan: codex.scan, piScan: piModule.scan, titles: titlesModule.applyLiveTitles };
+  const fleetScans = [];
+  codex.scan = (...args) => { fleetScans.push('codex.scan'); return originals.codexScan(...args); };
+  piModule.scan = (...args) => { fleetScans.push('pi.scan'); return originals.piScan(...args); };
+  titlesModule.applyLiveTitles = (...args) => { fleetScans.push('titles'); return originals.titles(...args); };
+  const cleanup = () => {
+    codex.scan = originals.codexScan;
+    piModule.scan = originals.piScan;
+    titlesModule.applyLiveTitles = originals.titles;
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    for (const file of created) fs.rmSync(file, { force: true });
+    fs.rmSync(base, { recursive: true, force: true });
+  };
+  return { root, claude, append, user, assistant, codexRollout, registryFile, fleetScans, cleanup };
+}
+
+test('loadCurrentSession reads one real transcript, keeps the scan\'s refusals, and never scans the fleet', () => {
+  const { loadCurrentSession, loadSessionExact } = require('./serve.js');
+  const f = exactLoaderFixture();
+  try {
+    const id = crypto.randomUUID();
+    const at = Date.now() - 5000;
+    f.claude(id, [f.user(id, 'hello', at), f.assistant(id, 'Done.', at)], at);
+    const row = loadCurrentSession(id);
+    assert.equal(row.id, id);
+    assert.equal(row.kind, 'claude');
+    assert.equal(row.accountId, 'claude-a');
+    assert.equal(row.endedTurn, true);
+    assert.equal(row.exited, false);
+    assert.equal(row.project, '/test/project');
+    assert.equal(row.lastUser, 'hello');
+    assert.equal(row.pane, undefined, 'a scan row never carried a pane either');
+
+    // The attention marker is attached as the scan attaches it.
+    const markedAt = Date.now();
+    f.registryFile('attention', `${id}.json`, JSON.stringify({ type: 'permission', at: markedAt, mt: markedAt, message: 'Allow Bash?' }));
+    assert.deepEqual(loadCurrentSession(id).notify, { type: 'permission', message: 'Allow Bash?' });
+
+    assert.throws(() => loadCurrentSession('../x'), (error) => error.status === 400 && error.message === 'bad session id');
+    // A keep-spawned run: the scan dropped it, so an action still finds no session.
+    const spawned = crypto.randomUUID();
+    f.claude(spawned, [f.user(spawned, 'hi', at), f.assistant(spawned, 'ok', at)], at);
+    f.registryFile('spawned', spawned, '');
+    assert.throws(() => loadCurrentSession(spawned), (error) => error.status === 404 && error.message === 'no session');
+    // Outside the 48 h window, as the scan.
+    const stale = crypto.randomUUID();
+    const old = Date.now() - 3 * 86400e3;
+    f.claude(stale, [f.user(stale, 'hi', old), f.assistant(stale, 'ok', old)], old);
+    assert.throws(() => loadCurrentSession(stale), (error) => error.status === 404);
+    // Recorded on another node: the loader's bare row, which loadCurrentSession
+    // refuses as "no session" because it has no kind.
+    const far = crypto.randomUUID();
+    f.registryFile('session-accounts', `${far}.json`, JSON.stringify({
+      version: 1, sessionId: far, agent: 'claude', accountId: 'claude-a', node: 'aws1',
+    }));
+    assert.deepEqual(loadSessionExact(far, { deps: { hostNodes: ['main', 'aws1'] } }), { id: far, node: 'aws1', mtime: 0 });
+    assert.deepEqual(f.fleetScans, [], 'nothing scanned the fleet');
+  } finally { f.cleanup(); }
+});
+
+test('limit-resume\'s loader sees the rate limit in a real transcript, resumes, and refuses once Owner typed', async () => {
+  const { resumeAfterLimit } = require('./serve.js');
+  const f = exactLoaderFixture();
+  try {
+    const id = crypto.randomUUID();
+    const at = Date.now() - 60e3;
+    const hitAt = new Date(at).toISOString();
+    const limitText = "You've hit your limit · resets 5pm";
+    const file = f.claude(id, [f.user(id, 'go on', at - 1000), f.assistant(id, limitText, at, {
+      isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429,
+      message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: limitText }] },
+    })], at);
+    const sent = [];
+    const deps = {
+      resolveSessionTarget: async () => ({ pane: 'fixture-pane' }),
+      readScreen: async () => ['output', '─'.repeat(40), '❯', ''].join('\n'),
+      sendToResolvedTarget: async (session, target, text) => {
+        sent.push([session.id, target.pane, text, session.rateLimit.at]);
+        return { ok: true };
+      },
+      withInjectionLock: async (fn) => fn(),
+    };
+    assert.deepEqual(await resumeAfterLimit(id, 'continue', { hitAt }, deps), { ok: true });
+    assert.deepEqual(sent, [[id, 'fixture-pane', 'continue', hitAt]]);
+    // Owner typed since: the transcript no longer carries the limit.
+    f.append(file, [f.user(id, 'never mind', Date.now())]);
+    await assert.rejects(resumeAfterLimit(id, 'continue', { hitAt }, deps),
+      (error) => error.status === 409 && /session moved on before resume \(no longer parked on that limit\)/.test(error.message));
+    assert.equal(sent.length, 1);
+    assert.deepEqual(f.fleetScans, [], 'nothing scanned the fleet');
+  } finally { f.cleanup(); }
+});
+
+test('the watcher\'s freshSession sees the turn end in a real transcript without a fleet scan', () => {
+  const { loadCurrentSession } = require('./serve.js');
+  const { sessionReady } = require('./watcher-live.js');
+  const f = exactLoaderFixture();
+  try {
+    const id = crypto.randomUUID();
+    const at = Date.now() - 5000;
+    const file = f.claude(id, [f.user(id, 'work on it', at)], at);
+    // The schedulers wire freshSession to loadCurrentSession; sessionReady is what
+    // revalidate asks of the row it returns.
+    assert.equal(sessionReady(loadCurrentSession(id)), 'the session is mid-turn');
+    f.append(file, [f.assistant(id, 'Done.', Date.now())]);
+    assert.equal(sessionReady(loadCurrentSession(id)), null);
+    assert.deepEqual(f.fleetScans, [], 'nothing scanned the fleet');
+  } finally { f.cleanup(); }
+});
+
+test('the watcher send\'s in-lock precondition refuses a session that took a turn, reading only that session', async () => {
+  const { loadCurrentSession, watcherSend } = require('./serve.js');
+  const { sessionReady } = require('./watcher-live.js');
+  const f = exactLoaderFixture();
+  try {
+    const id = crypto.randomUUID();
+    const at = Date.now() - 5000;
+    const file = f.claude(id, [f.user(id, 'hello', at), f.assistant(id, 'Done.', at)], at);
+    const precondition = async () => {
+      const reason = sessionReady(loadCurrentSession(id));
+      return reason ? `moved-on: ${reason}` : null;
+    };
+    const typed = [];
+    const sendDeps = {
+      resolveSessionTarget: async () => ({ pane: 'fixture-pane' }),
+      // sendToSession's own load (the real loadCurrentSession) passed; between it and
+      // the first character Owner starts a turn, so the guard before typing refuses.
+      sendToResolvedTarget: async (session, target, text, opts) => {
+        assert.equal(session.id, id);
+        f.append(file, [f.user(id, 'actually, wait', Date.now())]);
+        await opts.beforeType();
+        typed.push(text);
+        return {};
+      },
+    };
+    await assert.rejects(watcherSend({ sessionId: id, pane: 'fixture-pane', text: 'carry on', precondition },
+      { withInjectionLock: async (fn) => fn(), sendDeps }),
+      (error) => error.status === 409 && error.message === 'moved-on: the session is mid-turn');
+    assert.deepEqual(typed, []);
+    assert.deepEqual(f.fleetScans, [], 'nothing scanned the fleet');
+  } finally { f.cleanup(); }
+});
+
+test('closing a check pane on an exited session proceeds, its activity read from the transcript', async () => {
+  const { closeEphemeralPane, loadCurrentSession } = require('./serve.js');
+  const retirement = require('./session-retirement');
+  const f = exactLoaderFixture();
+  const id = crypto.randomUUID();
+  try {
+    const at = Date.now() - 60e3;
+    f.claude(id, [f.user(id, 'check it', at - 2000), f.assistant(id, 'Checked.', at - 1000),
+      f.user(id, '<local-command-stdout>Bye!</local-command-stdout>', at)], at);
+    const row = loadCurrentSession(id);
+    assert.equal(row.exited, true);
+    const closes = [];
+    const result = await closeEphemeralPane({ id: 'fixture-pane', pid: 4242, agentPid: 4243 }, id, {
+      root: f.root,
+      withInjectionLock: async (fn) => fn(),
+      hostRequest: async (type) => (type === 'hello' ? { guardedKill: true } : {}),
+      manualClose: async (request) => { closes.push(request); return { ok: true, closed: true }; },
+    });
+    assert.deepEqual(result, { ok: true, closed: true });
+    assert.deepEqual(closes, [{ pane: 'fixture-pane', sessionId: id }]);
+    const entry = retirement.lookup(f.root, id);
+    assert.equal(entry.status, 'retired');
+    assert.equal(entry.activityAt, row.mtime, 'the retirement snapshot carries the transcript\'s activity');
+    assert.deepEqual(f.fleetScans, [], 'nothing scanned the fleet');
+  } finally {
+    try { retirement.clear(f.root, id); } catch {}
+    f.cleanup();
+  }
+});
+
+test('answering a Codex approval finds a rollout no scan indexed, and refuses without a live marker', async () => {
+  const { answerSession } = require('./serve.js');
+  const f = exactLoaderFixture();
+  try {
+    const id = crypto.randomUUID();
+    f.codexRollout(id);
+    const reached = [];
+    const deps = { resolveSessionTarget: async (session) => { reached.push(session.id); throw new Error('stop: target reached'); } };
+    await assert.rejects(answerSession({ sessionId: id, approval: 'yes' }, deps),
+      (error) => error.status === 409 && error.message === 'this Codex session no longer has a live permission request');
+    const markedAt = Date.now();
+    f.registryFile('attention', `${id}.json`, JSON.stringify({ source: 'codex', type: 'permission', at: markedAt, mt: markedAt, message: 'Run ls?' }));
+    await assert.rejects(answerSession({ sessionId: id, approval: 'yes' }, deps), /stop: target reached/);
+    assert.deepEqual(reached, [id]);
+    assert.deepEqual(f.fleetScans, [], 'nothing scanned the fleet');
+  } finally { f.cleanup(); }
+});

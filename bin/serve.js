@@ -5600,10 +5600,26 @@ function validateTranscriptAnswer(pending, option, label) {
   }
 }
 
+// One session, read exactly, for an action about to touch it: a compaction, an
+// answer, limit-resume, the turn-watcher's last look, a check or unblock delivery,
+// an ephemeral close, an area delivery, a Codex swap recovery and sendToSession's
+// in-lock load. It used to be scanSessions().find(id): a fresh fleet scan (every
+// project directory re-listed, ~24,000 transcripts statted, every recent tail
+// parsed) to return one row. loadSessionExact builds the same row from that
+// session's own transcript; see it for what the row carries and what it skips.
+//
+// Parity with the old scan row, which is all these callers ever had: scanSessions
+// never ran buildState's host passes (applySessionLiveness, applyHostedExitState,
+// backfillHostSessions, addHostSessionState), so neither row carries a pane, a
+// host-derived exited or deadMidTurn; `exited` is the transcript's own in both.
+// Two scan-only details are left out on purpose: the live-title pass (no caller
+// here reads `title`), and the snapshot refresh a scan did as a side effect.
+// A keep-spawned run is still "no session" here, as the scan dropped it; so is a
+// session recorded on another node, which has no transcript here to read.
 function loadCurrentSession(id) {
   if (!/^[A-Za-z0-9_-]+$/.test(String(id || ''))) throw new InjectionError(400, 'bad session id');
-  const session = scanSessions().find((candidate) => candidate.id === id);
-  if (!session) throw new InjectionError(404, 'no session');
+  const session = loadSessionExact(id, { excludeSpawned: true });
+  if (!session || !session.kind) throw new InjectionError(404, 'no session');
   return session;
 }
 
@@ -8427,7 +8443,7 @@ function sendToSessionLocked(body, deps = {}) {
 // tick ago, from a snapshot of the transcript, and outside the injection lock —
 // in between, Owner can have typed, the session can have started a tool, or a
 // permission prompt can have appeared. So every precondition is checked again
-// here, inside the lock, against a freshly scanned session and the live screen:
+// here, inside the lock, against a freshly read session and the live screen:
 // "continue" typed into a session that moved on is an answer to whatever is
 // actually on screen. `hitAt` pins the decision to the exact limit event.
 async function resumeAfterLimit(sessionId, text, { hitAt } = {}, deps = {}) {
@@ -8532,7 +8548,11 @@ function liveCodexPermissionMarker(session) {
   let rolloutMtime;
   try {
     marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
-    const rolloutFile = codex.rolloutFileFor(session.id);
+    // resolveRollout reads the scan map itself and checks it against the session's
+    // account, where rolloutFileFor alone would trust a rollout the session left
+    // behind on its source account; answerSession's load no longer scans
+    // (loadCurrentSession), so this is also what finds a rollout no scan walked.
+    const rolloutFile = codex.resolveRollout(session.id)?.file;
     if (!rolloutFile) throw new Error('missing rollout');
     rolloutMtime = fs.statSync(rolloutFile).mtimeMs;
   } catch {
@@ -12572,6 +12592,10 @@ async function deliverCheckToThread(task, deps = {}) {
   const text = runs.checkDeliveryMessage(task);
   const prior = require('./delivery').statusForText(deps.deliveryDirectory || path.join(keep.ROOT, '.keep', 'delivery'), text, runs.checkDeliveryKey(task));
   if (prior?.received) return { sessionId: prior.sessionId, kind: prior.kind, delivery: 'received' };
+  // Picking stays on the scan: a card can link many old sessions, and an exact read
+  // of each one no index names (no authority record, a Codex id, one that ended days
+  // ago) walks every Claude project directory, which costs more than one scan. The
+  // chosen candidate is then read exactly (loadCurrentSession) before it is typed into.
   const { candidates, busy } = pickDeliveryCandidates(
     checkDeliveryIds(task),
     (deps.scanSessions || scanSessions)(),
@@ -12773,6 +12797,7 @@ async function runTaskNow(taskId, prompt, deps = {}) {
 }
 
 async function deliverUnblockToThread(task, text) {
+  // On the scan for the same reason as deliverCheckToThread's pick.
   const { candidates, busy } = pickDeliveryCandidates(
     (task.fm.sessions || []).map((session) => session && session.id),
     scanSessions(),
@@ -12867,7 +12892,30 @@ function tellSessions(dry, deps = {}) {
 // reads pass it (resolveTellTarget: a prefix tried as an exact id before the listing,
 // a numeral tried as a literal id), and even then a miss is ignored while a live
 // host pane names the id.
+//
+// The same reader serves loadCurrentSession (loadSessionExact below), which asks for
+// `excludeSpawned`: an action path keeps the scan's answer for a keep-spawned run.
 function loadTellSession(id, deps = {}, pin = null, options = {}) {
+  return loadSessionExact(id, { deps, pin, allowCachedMiss: options.allowCachedMiss === true });
+}
+
+// A keep-spawned run as scanClaudeSessions judges one: a marker under .keep/spawned
+// younger than seven days (the scan deletes an older one and lists the session).
+function spawnedRecently(root, sessionId, now) {
+  try { return now - fs.statSync(path.join(root, '.keep', 'spawned', sessionId)).mtimeMs <= 7 * 86400e3; }
+  catch { return false; }
+}
+
+// loadSessionExact(id, { deps, pin, allowCachedMiss, excludeSpawned }) returns a
+// row, a bare { id, node, mtime: 0 } row for a session on another node, or null.
+// One transcript read (a stat, and the tail when it changed): no fleet scan, and no
+// project-directory walk when an authority record names the agent. `deps` carries
+// root / env / hostNodes as the tell passes them; `pin` and `allowCachedMiss` are
+// the tell's (see above); `excludeSpawned` drops a keep-spawned Claude run as
+// scanClaudeSessions does.
+function loadSessionExact(id, options = {}) {
+  const deps = options.deps || {};
+  const pin = options.pin || null;
   const sessionId = String(id || '');
   if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return null;
   const root = deps.root || keep.ROOT;
@@ -12891,6 +12939,7 @@ function loadTellSession(id, deps = {}, pin = null, options = {}) {
       if (kind === 'claude') {
         session = claudeSessionFor(sessionId, { root, interactiveOnly: true,
           allowCachedMiss: options.allowCachedMiss === true && !hostPaneAliveFor(sessionId) });
+        if (session && options.excludeSpawned === true && spawnedRecently(root, sessionId, Date.now())) return null;
       }
       else if (kind === 'codex') session = codexFleetSession(sessionId, pin);
       else session = pi.sessionFor(sessionId, { root });
@@ -12929,17 +12978,34 @@ function hostPaneAliveFor(sessionId) {
 // tell: from the file the last scan indexed, else the one found by name (a walk of
 // the dated folders, which codex.sessionMetaFor would repeat on every call), and
 // the file is kept on the pin for the re-reads.
+//
+// codex.resolveRollout, where this codex.js has it, is sessionFor's own resolution
+// made public: it searches the dated folders at most once and caches the file, so the
+// meta is read from the very file sessionFor then reads, and sessionFor searches for
+// nothing. Without it, the older pair (the scan's index, else a search by name).
 function codexFleetSession(sessionId, pin = null) {
-  const session = codex.sessionFor(sessionId);
-  if (!session) return null;
-  if (!pin?.codexChecked) {
-    const file = pin?.codexFile || codex.rolloutFileFor(sessionId) || codex.findRolloutFile(sessionId);
+  const resolve = typeof codex.resolveRollout === 'function' ? codex.resolveRollout : null;
+  const fleetMeta = (file) => {
     let meta = null;
     try { meta = file ? codex.readSessionMeta(file) : null; } catch {}
-    if (!meta || codex.isChildSession(meta) || codex.isHeadlessSession(meta)) return null;
+    return Boolean(meta) && !codex.isChildSession(meta) && !codex.isHeadlessSession(meta);
+  };
+  if (resolve && !pin?.codexChecked) {
+    let resolved = null;
+    try { resolved = resolve(sessionId); } catch {}
+    if (!resolved || !fleetMeta(resolved.file)) return null;
+    if (pin) { pin.codexFile = resolved.file; pin.codexChecked = true; }
+  }
+  const session = codex.sessionFor(sessionId);
+  if (!session) return null;
+  if (!pin?.codexChecked && !resolve) {
+    const file = pin?.codexFile || codex.rolloutFileFor(sessionId) || codex.findRolloutFile(sessionId);
+    if (!fleetMeta(file)) return null;
     if (pin) { pin.codexFile = file; pin.codexChecked = true; }
   }
-  if (String(session.title || '').startsWith('Codex Companion Task:')) return null;
+  const companion = typeof codex.isCompanionTask === 'function'
+    ? codex.isCompanionTask(session.title) : String(session.title || '').startsWith('Codex Companion Task:');
+  if (companion) return null;
   return session;
 }
 
@@ -14068,6 +14134,9 @@ module.exports = {
   deliverCheckToThread,
   tellSession,
   loadTellSession,
+  loadCurrentSession,
+  loadSessionExact,
+  answerSession,
   shouldCompactFirst,
   lastTurnUsage,
   sessionLastTurn,
