@@ -13500,3 +13500,43 @@ test('a publication carries what each node is and is not saying', () => {
   assert.deepEqual(first.host, { ok: true, nodes: { aws1: { ok: true } } });
   assert.deepEqual(first.panes.map((pane) => pane.id), ['r1@aws1']);
 });
+
+test('a restart of a pane on another node is refused before any local process is read', async () => {
+  const { restartSession, forceRestartSession } = require('./serve');
+  // Anything that reads this machine's processes fails the test by being called:
+  // the refusal has to come first, not after a snapshot has been taken.
+  const forbidden = {
+    agentProcessRows: () => { throw new Error('the local process table must not be consulted'); },
+    forceRows: () => { throw new Error('the local process table must not be consulted'); },
+    buildState: () => { throw new Error('nothing is inspected for a remote restart'); },
+    withInjectionLock: () => { throw new Error('the injection lock must not be taken'); },
+    connectHost: () => { throw new Error('no host request is made'); },
+  };
+  for (const [call, pattern] of [
+    [() => restartSession({ sessionId: 'sess-1', pane: '1a2b@aws1', mode: 'now' }, forbidden), /^restart is not available for a pane on aws1/],
+    [() => forceRestartSession({ sessionId: 'sess-1', pane: '1a2b@aws1' }, async () => {}, forbidden), /^force restart is not available for a pane on aws1/],
+  ]) {
+    const error = await call().then(() => null, (failure) => failure);
+    assert.ok(error, 'the call must be refused');
+    assert.match(error.message, pattern);
+    assert.match(error.message, /node-local process verification lands with the process\/signal verbs/);
+    assert.equal(error.status, 409);
+  }
+
+  // The module refuses on its own account as well, for a caller that arrives by
+  // another route, and before it asks for a pane or a process row.
+  await assert.rejects(require('./force-restart.js').run({ sessionId: 'sess-1', pane: '1a2b@aws1' }, {
+    save: async () => {},
+    getPane: () => { throw new Error('no host request is made'); },
+    rows: () => { throw new Error('the local process table must not be consulted'); },
+  }), /force restart is not available for a pane on aws1; node-local process verification/);
+
+  // A pane on this node, and the same id qualified with this node's own name, both
+  // go through to the ordinary path (which then fails for its own reasons).
+  for (const pane of ['1a2b', '1a2b@main']) {
+    const error = await restartSession({ sessionId: 'sess-1', pane, mode: 'now' }, {
+      withInjectionLock: () => { throw new Error('reached the ordinary restart path'); },
+    }).then(() => null, (failure) => failure);
+    assert.equal(error.message, 'reached the ordinary restart path', pane);
+  }
+});

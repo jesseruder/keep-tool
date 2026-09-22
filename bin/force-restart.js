@@ -2,6 +2,13 @@
 // Explicit force restart only. Checkpoint before destructive work, retain it on
 // failure, and allow a later recovery without closing a replacement session.
 async function run(entry, deps) {
+  // Everything below reads this machine's process table and signals pids in it, so
+  // a pane on another node is refused here too — not only at the daemon's entry
+  // point — in case this module is ever driven from somewhere else.
+  const paneRef = require('./nodes.js').parsePaneRef(String(entry.pane || ''));
+  if (paneRef.qualified) {
+    throw Error(`force restart is not available for a pane on ${paneRef.node}; node-local process verification lands with the process/signal verbs`);
+  }
   const checkpoint = async stage => { entry.phase = stage; await deps.save(); };
   const same = (a, b) => a && b && a.pid === b.pid && a.pidStart === b.pidStart;
   const paneMatches = pane => pane && pane.id === entry.pane && pane.pid === entry.pid

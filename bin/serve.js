@@ -5921,7 +5921,19 @@ function validatedCodexResumeCwd(agent, value) {
   return value;
 }
 
+// Restarting a session means judging a process and then stopping it, and every
+// piece of evidence for both — the `ps` table, liveSessionPids, process.kill — is
+// this machine's. None of it describes a pane on another node: a pid there is a
+// number that happens to exist here too. Refused at the entry, before a single row
+// is read, until a node can answer for its own processes.
+function assertLocalRestart(paneRef, action) {
+  const ref = nodes.parsePaneRef(String(paneRef || ''));
+  if (!ref.qualified) return ref;
+  throw new InjectionError(409, `${action} is not available for a pane on ${ref.node}; node-local process verification lands with the process/signal verbs`);
+}
+
 async function restartSession(body, deps = {}) {
+  assertLocalRestart(body.pane, 'restart');
   const host = (type, params) => hostRequest(type, params, deps);
   // An explicit force discards uncertain background-job evidence only; the turn,
   // tool and process identity checks below stay exactly as strict.
@@ -6248,6 +6260,7 @@ async function restartSession(body, deps = {}) {
 // Same two attempts as restartSession: hold the model key so the resumed agent reads a
 // settled settings.json, and if the key is busy, name the model a compaction swapped out.
 async function forceRestartSession(entry, save, deps = {}) {
+  assertLocalRestart(entry.pane, 'force restart');
   let entered = false;
   const attempt = (inheritedModel) => (deps.withInjectionLock || withInjectionLock)(async () => {
     entered = true;
@@ -12502,6 +12515,7 @@ module.exports = {
   hostClient,
   hostClientFor,
   validPaneRef,
+  assertLocalRestart,
   hostNodeEntries,
   hostNodeNames,
   listNodePaneResult,
