@@ -13336,12 +13336,18 @@ test('a session that runs on another node is opened there, and never moved by as
   // Asking for nothing in particular routes it to the node it lives on.
   const opened = await openSession({ sessionId: session.id }, deps);
   assert.equal(opened.pane, 'pane-1');
+  // And the answer says which machine to go and look at. Without this `keep open`
+  // handed back a pane id and no idea where it was.
+  assert.equal(opened.node, 'laptop');
+  assert.match(require('./keep.js').formatOpenResult(opened), /pane pane-1 on node laptop/);
   assert.equal(JSON.parse(fs.readFileSync(authorityFile, 'utf8')).node, 'laptop',
     'an ordinary reopen leaves the node it found');
 
   // And a session recorded here opens here, exactly as it always did.
   accountStore.pinSession(session.id, 'claude', 'node-open', { root, env, node: 'main', transferNode: true });
-  assert.equal((await openSession({ sessionId: session.id, node: 'main' }, deps)).pane, 'pane-1');
+  const here = await openSession({ sessionId: session.id, node: 'main' }, deps);
+  assert.equal(here.pane, 'pane-1');
+  assert.equal(here.node, undefined, 'a single machine is never named back');
   assert.equal(JSON.parse(fs.readFileSync(authorityFile, 'utf8')).node, 'main');
 });
 

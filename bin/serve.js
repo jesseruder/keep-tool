@@ -9058,6 +9058,9 @@ async function openSession(body, deps = {}) {
         }
       }
       return { ok: true, existing: true, focus: 'console', pane: existing.id,
+        // Named the same way a created pane names it, and for the same reason: the
+        // caller is being told where to look, and on a fleet that is half the answer.
+        ...(launchNode === nodes.daemonNode(deps.env || process.env) ? {} : { node: launchNode }),
         sessionId, ...openedSessionNumber(sessionId, deps),
         accountId: account.id, accountLabel: account.label,
         ...(accountNote ? { accountNote } : {}), ...(accountWarning ? { accountWarning } : {}),
@@ -9282,6 +9285,9 @@ async function openSession(body, deps = {}) {
           sessionId: session.id,
           ...(session.num ? { num: session.num } : openedSessionNumber(session.id, deps)),
           pane: target.pane,
+          // A pane already running on another machine is still a pane on another
+          // machine, and `keep open` says so here exactly as it does for a new one.
+          ...(launchNode === nodes.daemonNode(deps.env || process.env) ? {} : { node: launchNode }),
         };
         if (message) {
           assertCompactRestoreSettled(session.id, deps);
