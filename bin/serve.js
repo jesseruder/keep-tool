@@ -3400,7 +3400,7 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
       after = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
     } catch (error) {
       write(`keep serve: could not confirm the cleared draft on pane ${pane}: ${String((error && error.message) || error)}\n`);
-      return { cleared: false, reason: 'unconfirmed clear' };
+      return { cleared: false, reason: 'unconfirmed clear', leftDraft: { pid, inputCount: count + 1 } };
     }
     // After the read, not before it: this is what says the screen just read is a
     // screen only our own Escape changed.

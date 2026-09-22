@@ -5962,6 +5962,26 @@ test('discarding an idle Claude draft ignores running-turn words inside the comp
   assert.deepEqual(idle.inputs, ['\x1b'], 'the idle draft is cleared with one Escape');
 });
 
+test('an unconfirmed draft clear advances the retry guard after the accepted Escape', async () => {
+  const expected = 9;
+  const unreadable = draftHarness(BOX(MESSAGE));
+  unreadable.foreign.count = expected;
+  let reads = 0;
+  const result = await discardTypedDraft({ pane: 'p' }, MESSAGE, 'claude', {
+    ...unreadable.deps,
+    expectedPaneState: { pid: 4242, inputCount: expected },
+    readScreen: async () => {
+      if (reads++ === 0) return BOX(MESSAGE);
+      throw new Error('screen read failed');
+    },
+    stderr: () => {},
+  });
+  assert.equal(result.cleared, false);
+  assert.equal(result.reason, 'unconfirmed clear');
+  assert.deepEqual(result.leftDraft, { pid: 4242, inputCount: expected + 1 });
+  assert.deepEqual(unreadable.inputs, ['\x1b'], 'the guarded Escape was accepted before the read failed');
+});
+
 test('the delivery sweep retires only an unchanged idle exact draft it owns', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-left-delivery-draft-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
