@@ -475,6 +475,36 @@ test('an Owner-forced Codex transfer forces the stop, the artifact plan, the cop
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('a child thread that appears before a forced Codex stop is adopted, not a stuck transfer', async () => {
+  const f = fixture();
+  try {
+    const d = codexDeps(f);
+    const late = { sessionId: 'late-child', parentSessionId: d.sid, children: [], interacted: [],
+      source: path.join(f.profiles.codex, 'sessions', 'rollout-late-child.jsonl'),
+      target: path.join(f.profiles.codexTwo, 'sessions', 'rollout-late-child.jsonl') };
+    const grown = { ...d.plan, artifacts: [...d.plan.artifacts, late] };
+    const provider = d.artifactProvider;
+    d.artifactProvider = { ...provider, copyCodexArtifacts: (...args) => { provider.copyCodexArtifacts(...args); return grown; },
+      rebindLedger: (...args) => { provider.rebindLedger(...args); return { rebound: grown.artifacts.map((entry) => ({ sessionId: entry.sessionId })) }; } };
+    const result = await handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two', ownerForce: true }, d);
+    assert.equal(result.status, 'done');
+    assert.deepEqual(handoff.readOne(f.root, d.sid).ownedSessionIds.sort(), [d.child, 'late-child', d.sid].sort());
+    assert.equal(accounts.forSession('late-child', 'codex', { root: f.root, env: f.env }).id, 'codex-two',
+      'the adopted child moves with the conversation');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('an ordinary Codex transfer still refuses a graph that changed across its stop', async () => {
+  const f = fixture();
+  try {
+    const d = codexDeps(f);
+    const provider = d.artifactProvider;
+    d.artifactProvider = { ...provider, copyCodexArtifacts: (...args) => {
+      provider.copyCodexArtifacts(...args); return { ...d.plan, artifacts: d.plan.artifacts.slice(0, 1) }; } };
+    await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d), /graph changed/);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('an ordinary transfer asks the artifact plan and the stop for their proofs', async () => {
   const f = fixture();
   try {

@@ -289,6 +289,17 @@ function clearStagedAuthorities(entry, root) {
   for (const sessionId of ownedSessionIds(entry)) accounts.clearStaged(sessionId, entry.id, { root });
 }
 
+// An Owner-forced stop does not wait for the conversation to be idle, so a child thread
+// can appear between the preflight and the kill. The graph copied after the stop is then
+// the conversation's own: adopt it, and pin any new child to the source before staging.
+function adoptOwnedGraph(entry, plan, source, root, env) {
+  if (!Array.isArray(plan?.artifacts) || !plan.artifacts.some((artifact) => artifact.sessionId === entry.sessionId)) {
+    throw new Error('Codex owned conversation graph changed during handoff');
+  }
+  entry.ownedSessionIds = plan.artifacts.map((artifact) => artifact.sessionId);
+  pinSourceAuthority(entry, source, root, env);
+}
+
 function verifyOwnedGraph(entry, plan) {
   if (!entry?.ownedSessionIds || !Array.isArray(plan?.artifacts)
       || JSON.stringify(plan.artifacts.map((artifact) => artifact.sessionId).sort())
@@ -785,7 +796,8 @@ async function run(body, deps = {}) {
           // Only Owner's own transfer skips the artifact proof; a queue entry's legacy force never does.
           const copiedPlan = copyProviderArtifacts(providerArtifacts, agent, session.id, source, target, current.id,
             { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force: current.ownerForce === true });
-          if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
+          if (agent === 'codex' && current.ownerForce === true) adoptOwnedGraph(current, copiedPlan, source, root, env);
+          else if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
           current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
           writeOne(root, current);
           (deps.rebindLedger || providerArtifacts.rebindLedger)(session.id, source, target, current.id,
@@ -917,7 +929,8 @@ async function run(body, deps = {}) {
       Object.assign(current, { status: 'copying', phase: 'copying-artifacts', sourceStopVerifiedAt: Date.now() }); writeOne(root, current);
       const copiedPlan = copyProviderArtifacts(providerArtifacts, agent, session.id, source, target, current.id,
         { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force: ownerForce });
-      if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
+      if (agent === 'codex' && ownerForce) adoptOwnedGraph(current, copiedPlan, source, root, env);
+      else if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
       current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
       writeOne(root, current);
       verifyFrozenResumeSpec(current, artifactPlan, deps);

@@ -5948,8 +5948,8 @@ async function restartSession(body, deps = {}) {
   const force = body.force === true;
   // Owner asked for this himself (a console click, keep handoff --force): nothing is
   // typed into the session, so no idle, draft, dialog, ledger or helper proof is asked
-  // for. The process tree is closed and killed the way force-restart does it, and the
-  // same resume below starts the conversation again. The rate-limit handoff queue never
+  // for. forceStopThenResume signals the captured process tree directly, and the same
+  // resume below starts the conversation again. The rate-limit handoff queue never
   // sets this; automatic work keeps every proof.
   const ownerForce = deps.ownerForce === true;
   let exitInputStarted = false;
@@ -5998,8 +5998,11 @@ async function restartSession(body, deps = {}) {
       && !session.toolRunning && !session.pendingQuestion && !session.pendingPlan
       && !require('./session-restart').blockingUnknownJobs(session).length;
     const restartSessionState = terminalLimit ? { ...session, endedTurn: true, rateLimit: null } : session;
-    const reason = ownerForce ? null
+    // Forced or not, there has to be a live session in its own pane to stop.
+    const reason = ownerForce
+      ? (!session || !pane?.alive || pane.meta?.sessionId !== session.id ? 'Session is not live in its original pane' : null)
       : require('./session-restart').refusal(restartSessionState, pane, body.mode === 'idle', { force });
+    if (ownerForce && reason) throw new InjectionError(409, reason);
     if (pane.pid !== body.pid) throw new InjectionError(409, 'Session process changed');
     if (reason) {
       if (/^Waiting |^Pause session-local scheduled jobs/.test(reason)) throw transient(reason);
