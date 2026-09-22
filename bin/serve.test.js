@@ -3000,6 +3000,109 @@ test('auto-compact tick filters dead panes before reading context or spending a 
   assert.equal(decisions.length, 1);
 });
 
+test('auto-compact never picks a session running on another node', async (t) => {
+  const { withTwoNodeFleet } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient, listHostPanes, hostRequest } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  const previous = process.env.KEEP_AUTO_COMPACT;
+  process.env.KEEP_AUTO_COMPACT = 'dry';
+  t.after(() => {
+    if (previous === undefined) delete process.env.KEEP_AUTO_COMPACT;
+    else process.env.KEEP_AUTO_COMPACT = previous;
+  });
+  await withTwoNodeFleet(t, async ({ root, registry, env, accountId, agentPath }) => {
+    await closeHostClient();
+    const fleetDeps = { root: registry, env, connectHost: connect };
+    try {
+      const spawn = async (node, sessionId) => (await hostRequest('spawn', {
+        cmd: '/bin/sh', args: ['-c', `exec claude --resume ${sessionId}`],
+        cwd: root, env: { PATH: agentPath },
+        meta: { agent: 'claude', sessionId, accountId, accountLabel: 'Node claude' },
+      }, { ...fleetDeps, node })).pane;
+      await spawn('main', 'compact-here');
+      const far = await spawn('aws1', 'compact-far');
+      assert.match(far.id, /@aws1$/);
+      const mtime = Date.now() - 2 * 60 * 60e3;
+      const sessions = ['compact-here', 'compact-far']
+        .map((id) => ({ id, kind: 'claude', endedTurn: true, mtime, accountId }));
+      const reads = [];
+      const decisions = [];
+      const outcome = await autoCompactTick({
+        ...fleetDeps,
+        sweepPendingCompactSwaps: async () => ({ checked: 0 }),
+        gcAutoCompactStamps: () => {},
+        readAutoCompactStamps: () => ({}),
+        scanSessions: () => sessions,
+        // The real fleet listing, through both hosts: the node stamp and the
+        // qualified pane id are the ones the daemon publishes.
+        listHostPanes: async () => listHostPanes(fleetDeps, true),
+        sessionLastTurn: (session) => {
+          reads.push(session.id);
+          return { contextTokens: 140000, model: 'claude-fable-5-1', usageAt: mtime };
+        },
+        writeAutoCompactDecision: (stamp) => decisions.push(stamp),
+        logAutoCompactDecision: () => {},
+      });
+      assert.equal(outcome.ok, true);
+      // Not merely dropped at the end: the session on aws1 never had its context read.
+      assert.deepEqual(reads, ['compact-here']);
+      assert.deepEqual(decisions.map((stamp) => stamp.sessionId), ['compact-here'],
+        'the daemon node still compacts its own, exactly as before');
+    } finally {
+      await closeHostClient();
+    }
+  });
+});
+
+test('compaction and its model swap refuse a session on another node', async (t) => {
+  const { compactSession, compactSessionTransaction, writePendingCompactSwap,
+    sweepPendingCompactSwaps, autoCompactCandidates: candidates } = require('./serve');
+  const session = { id: 'far-session', kind: 'claude' };
+  const refusal = (error) => error.status === 409
+    && error.message === 'compaction is not available for a session on aws1';
+  // The console's compact button reaches compactSession; the Codex cold fallback
+  // reaches the transaction directly. Both refuse, and before any lock is taken.
+  await assert.rejects(compactSession(session, { pane: 'p1@aws1' }, null), refusal);
+  await assert.rejects(compactSessionTransaction(session, { pane: 'p1@aws1' }, null), refusal);
+  assert.throws(() => writePendingCompactSwap({ id: 'far-session', node: 'aws1' },
+    { originalModel: 'claude-fable-5-1', restoreCommand: '/model claude-fable-5-1' }), refusal);
+
+  // The candidate rule drops it wherever the row came from.
+  const now = Date.now();
+  const row = (extra) => ({ id: 'far-session', kind: 'claude', endedTurn: true, mtime: now - 2 * 60 * 60e3,
+    contextTokens: 140000, model: 'claude-fable-5-1', usageAt: now - 2 * 60 * 60e3, ...extra });
+  const opts = { ttlMs: 0, maxIdleMs: 1440 * 60e3, minTokens: 100000, models: ['fable'],
+    claudeTtlMs: 60 * 60e3, claudeTargetMs: 50 * 60e3, claudeFallbackModel: 'opus',
+    codexTtlMs: 30 * 60e3, codexTargetMs: 20 * 60e3, codexFallbackModel: 'gpt-5.6-sol' };
+  assert.deepEqual(candidates([row({ node: 'aws1' })], {}, now, opts), []);
+  assert.deepEqual(candidates([row()], {}, now, opts).map((candidate) => candidate.session.id), ['far-session']);
+
+  // And the restore sweep leaves a record whose session is elsewhere exactly where
+  // it is: this machine's settings.json is not the one that was swapped.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-remote-restore-test-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const registry = path.join(dir, 'registry');
+  fs.mkdirSync(path.join(registry, '.keep', 'session-accounts'), { recursive: true });
+  fs.writeFileSync(path.join(registry, '.keep', 'session-accounts', 'far-session.json'),
+    `${JSON.stringify({ version: 1, sessionId: 'far-session', agent: 'claude', accountId: 'claude-node', node: 'aws1', updatedAt: now })}\n`);
+  const swapFile = writeCompactSwapFixture(path.join(dir, 'compact'), 'far-session');
+  let settingsReads = 0;
+  const summary = await sweepPendingCompactSwaps({
+    dir: path.join(dir, 'compact'),
+    root: registry,
+    // Durable authority is only consulted when there is more than one node to name.
+    hostNodes: ['main', 'aws1'],
+    now: () => Date.parse('2026-09-04T12:05:00Z'),
+    scanSessions: () => [{ id: 'far-session', kind: 'claude', model: 'claude-opus-5', endedTurn: true }],
+    withInjectionLock: async (fn) => fn(),
+    readClaudeSettingsModel: () => { settingsReads += 1; return { ok: true, present: true, value: 'opus' }; },
+    typeAndSubmit: async () => { throw new Error('typed a restore into a pane on another machine'); },
+  });
+  assert.deepEqual(summary, { checked: 1, restored: 0, dropped: 0, skipped: 1, repairedSettings: 0 });
+  assert.equal(settingsReads, 0, "this machine's settings.json was never even read for it");
+  assert.equal(fs.existsSync(swapFile), true, 'the record is left for the node that owns it');
+});
+
 test('auto-compact tick dispatches Codex Astra with a fresh warm policy and records telemetry', async (t) => {
   const prior = process.env.KEEP_AUTO_COMPACT;
   process.env.KEEP_AUTO_COMPACT = 'on';

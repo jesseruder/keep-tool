@@ -4266,6 +4266,10 @@ function writeCompactSwapRecord(file, record) {
 function writePendingCompactSwap(session, plan, dir = autoCompactDir(), at = Date.now()) {
   const sessionId = String(session && session.id || '');
   if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new Error('bad compact session id');
+  // The record is this machine's promise to put its own settings.json back. It is
+  // never written for a session elsewhere, where neither the swap nor the restore
+  // would be ours to make.
+  refuseRemoteCompaction(session);
   const file = path.join(dir, `${sessionId}.swap.json`);
   const record = {
     sessionId,
@@ -4801,7 +4805,18 @@ async function sweepPendingCompactSwaps(deps = {}) {
       return true;
     };
     for (const record of allRecords) retireOnUserChoice(record);
-    const records = allRecords.filter((record) => !retired.has(record.file));
+    // A record whose session runs on another node is not this machine's to act on:
+    // the settings.json it would repair is this machine's, and the restore would be
+    // typed into a pane elsewhere. Left exactly where it is, and counted as skipped
+    // so the health row says the sweep did not settle it.
+    const elsewhere = new Set(allRecords.filter((record) => !retired.has(record.file)
+      && remoteSession({ id: record.sessionId }, deps)).map((record) => record.file));
+    for (const record of allRecords) {
+      if (!elsewhere.has(record.file)) continue;
+      summary.skipped += 1;
+      process.stderr.write(`keep serve: model restore for claude session ${sessionRef(record.sessionId) || 'unknown'} belongs to node ${sessionNodeOf({ id: record.sessionId }, deps)}\n`);
+    }
+    const records = allRecords.filter((record) => !retired.has(record.file) && !elsewhere.has(record.file));
     const finished = new Set(); // Restored this pass: their records are gone.
     const repairedSettingsRecords = new Set();
     const noteSettingsRepair = (record, repaired) => {
@@ -5124,7 +5139,19 @@ async function hostPaneModel(target, deps = {}) {
 // mid-compaction or on the swapped model) and the model key (inFlightSwap and
 // settings.json are shared, so compactions still run one at a time). It does
 // not hold any other pane.
+// Every part of a compaction is local: the instruction is typed into a pane, the
+// transcript it reads is this machine's, and the model it switches to is written
+// into this machine's settings.json and put back from a record kept here. A session
+// on another node is refused at the door, before any lock or gate is taken.
+function refuseRemoteCompaction(sessionOrPane, deps = {}) {
+  const node = sessionNodeOf(sessionOrPane, deps);
+  if (node !== daemonNodeName(deps)) {
+    throw new InjectionError(409, `compaction is not available for a session on ${node}`);
+  }
+}
+
 async function compactSession(session, target, instruction, deps = {}) {
+  refuseRemoteCompaction(isHostTarget(target) ? target.pane : session, deps);
   const leave = daemonRestartGate.enter();
   try {
     return await (deps.withInjectionLock || withInjectionLock)(
@@ -5154,6 +5181,9 @@ async function compactSession(session, target, instruction, deps = {}) {
 }
 
 async function compactSessionTransaction(session, target, instruction, deps = {}) {
+  // Again here, not only in compactSession: the Codex cold fallback calls straight
+  // into this, and so does anything else holding a transaction directly.
+  refuseRemoteCompaction(isHostTarget(target) ? target.pane : session, deps);
   const sid = (sessionRef(session && session.id) || 'unknown');
   process.stderr.write(`keep serve: compacting ${session && session.kind || 'unknown'} session ${sid}\n`);
   const dir = deps.dir || autoCompactDir();
@@ -7541,6 +7571,10 @@ async function compactReopenedSession(session, target, account, turn, deps = {})
 function autoCompactCandidates(sessions, stamps, now, opts) {
   const candidates = [];
   for (const session of sessions || []) {
+    // A session on another node is never a candidate: everything a compaction does
+    // is local to the machine running the agent. The node comes from the pane the
+    // tick already holds, so this costs no lookup.
+    if (nodes.isRemotePane(session, paneRefEnv(opts))) continue;
     const idleMs = autoCompactIdleMs(session, stamps, now, opts);
     if (idleMs === null) continue;
     const policy = autoCompactPolicy(session, now, opts);
@@ -7715,7 +7749,14 @@ async function autoCompactTick(deps = {}) {
   const cheap = (deps.scanSessions || scanSessions)().filter((session) =>
     liveIds.has(session.id) && autoCompactIdleMs(session, stamps, now, opts) !== null);
   const candidates = autoCompactCandidates(
-    cheap.map((session) => ({ ...session, ...(deps.sessionLastTurn || sessionLastTurn)(session) })),
+    cheap.map((session) => {
+      // The pane says which machine the agent is on; the cheap scanSessions row
+      // cannot. A session on another node is stamped and left there — its transcript
+      // is not here to read, and autoCompactCandidates drops it for the same reason.
+      const pane = panesBySession.get(session.id);
+      if (nodes.isRemotePane(pane)) return { ...session, node: pane.node };
+      return { ...session, ...(deps.sessionLastTurn || sessionLastTurn)(session) };
+    }),
     stamps,
     now,
     opts,
@@ -13184,6 +13225,7 @@ module.exports = {
   autoCompactOutcome,
   autoCompactTick,
   compactSession,
+  compactSessionTransaction,
   compactRequestTelemetry,
   hasCompactionMarker,
   compactSwapPlan,
@@ -13192,6 +13234,7 @@ module.exports = {
   afterCompactAction,
   pendingCompactSwaps,
   readPendingCompactSwap,
+  writePendingCompactSwap,
   sweepPendingCompactSwaps,
   compactRestoreBlocking,
   compactRestoreInputBaseline,
