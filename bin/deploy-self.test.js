@@ -247,3 +247,82 @@ test('keep land on a node refuses on the daemon\'s facts and reports a refused d
   assert.equal(gone.status, 1);
   assert.equal(gone.stderr, 'keep: no card "card"\n');
 });
+
+// ---------- keep allow <card> land on a node ----------
+
+test('keep allow <card> land on a node answers from the daemon\'s facts and the worktree here', async (t) => {
+  const n = nodeWorktree(t);
+  const sha = git(n.tree, 'rev-parse', 'HEAD');
+  const patchId = require('./reviews.js').gitDeps(n.tree).patchId(sha);
+  const facts = { id: 'card', grants: [], records: [], obligations: [], optOut: '', until: '' };
+  const daemon = await stubDaemon(t, ({ body }) => {
+    if (body.command === 'land-facts') return { status: 200, body: { status: 0, stdout: `${JSON.stringify(facts)}\n`, stderr: '' } };
+    return { status: 200, body: { status: 0, stdout: 'forwarded\n', stderr: '' } };
+  });
+  const env = { ...n.env, KEEP_DAEMON_URL: daemon.url };
+
+  const unreviewed = await runKeep(['allow', 'card', 'land'], { env, cwd: n.tree });
+  assert.equal(unreviewed.status, 3);
+  assert.equal(unreviewed.stdout, `not allowed: no land grant, and ${sha.slice(0, 12)} ("node work") has no review record — run keep reviewed <card> --commit ${sha.slice(0, 12)} --verdict clean\n`);
+  assert.equal(unreviewed.stderr, '');
+  assert.deepEqual(daemon.requests.map((entry) => [entry.body.command, entry.body.args]), [['land-facts', ['card']]]);
+
+  const record = {
+    id: 'rev-1', at: new Date().toISOString(), by: 'opus', job: '', jobAccountId: '', jobAt: '', verdict: 'clean',
+    evidence: 'x'.repeat(90), commits: [{ sha: 'f'.repeat(40), patchId, subject: 'node work' }], bySession: { sessionId: 'sess-aws1', agent: 'claude' }, message: '', node: 'aws1',
+  };
+  facts.records = [record];
+  const allowed = await runKeep(['allow', 'card', 'land'], { env, cwd: n.tree });
+  assert.equal(allowed.status, 0, allowed.stderr);
+  assert.equal(allowed.stdout, `allowed: reviewed clean: 1 commit(s) by opus at ${record.at} (record rev-1)\n`);
+  const json = JSON.parse((await runKeep(['allow', 'card', 'LAND', '--json'], { env, cwd: n.tree })).stdout);
+  assert.equal(json.id, 'card');
+  assert.equal(json.action, 'LAND');
+  assert.equal(json.ok, true);
+  assert.equal(json.implicit, true);
+  assert.equal(json.record.id, 'rev-1');
+  assert.equal((await runKeep(['allow', 'card', 'land', '--quiet'], { env, cwd: n.tree })).stdout, '');
+
+  // A new commit the record does not cover takes it away again.
+  fs.writeFileSync(path.join(n.tree, 'c.txt'), 'changed\n');
+  git(n.tree, 'commit', '-q', '-am', 'unreviewed change');
+  const stale = await runKeep(['allow', 'card', 'land'], { env, cwd: n.tree });
+  assert.equal(stale.status, 3);
+  assert.match(stale.stdout, /^not allowed: no land grant, and [0-9a-f]{12} \("unreviewed change"\) has no review record/);
+
+  // An open obligation from the daemon refuses by name.
+  facts.obligations = [{ id: 'obl-1', at: new Date().toISOString(), card: 'card', job: 'job-1', accountId: 'codex-a', by: 'codex', commits: [{ sha, patchId, subject: 'node work' }], state: 'open', stateAt: new Date().toISOString(), note: '', session: null, node: 'aws1' }];
+  const waiting = await runKeep(['allow', 'card', 'land'], { env, cwd: n.tree });
+  assert.equal(waiting.status, 3);
+  assert.match(waiting.stdout, /a review launched for these commits has no verdict yet: job job-1 on codex-a/);
+  facts.obligations = [];
+
+  // An explicit grant is decided as allow.decide decides it, allow_until included.
+  facts.grants = ['land'];
+  const granted = await runKeep(['allow', 'card', 'land', '--json'], { env, cwd: n.tree });
+  assert.equal(granted.status, 0);
+  assert.deepEqual(JSON.parse(granted.stdout), { id: 'card', action: 'land', ok: true, why: 'card grants land', grant: 'land' });
+  facts.until = '2000-01-01';
+  const lapsed = JSON.parse((await runKeep(['allow', 'card', 'land', '--json'], { env, cwd: n.tree })).stdout);
+  assert.equal(lapsed.implicit, true, 'an expired grant falls to the implicit path, as it does on the daemon');
+
+  // Everything else keep allow does is the daemon's.
+  const before = daemon.requests.length;
+  const push = await runKeep(['allow', 'card', 'push'], { env, cwd: n.tree });
+  assert.equal(push.stdout, 'forwarded\n');
+  assert.deepEqual(daemon.requests.slice(before).map((entry) => [entry.body.command, entry.body.args]), [['allow', ['card', 'push']]]);
+  await runKeep(['allow', 'card'], { env, cwd: n.tree });
+  assert.equal(daemon.requests.at(-1).body.command, 'allow');
+
+  // Facts from a daemon that does not send allow_until are not read as "no expiry".
+  delete facts.until;
+  const old = await runKeep(['allow', 'card', 'land'], { env, cwd: n.tree });
+  assert.equal(old.status, 1);
+  assert.match(old.stderr, /answered land-facts for card in a shape this keep does not read/);
+
+  // A card the daemon does not have is its own answer.
+  const missing = await stubDaemon(t, () => ({ status: 200, body: { status: 1, stdout: '', stderr: 'keep: no card "card"\n' } }));
+  const gone = await runKeep(['allow', 'card', 'land'], { env: { ...env, KEEP_DAEMON_URL: missing.url }, cwd: n.tree });
+  assert.equal(gone.status, 1);
+  assert.equal(gone.stderr, 'keep: no card "card"\n');
+});

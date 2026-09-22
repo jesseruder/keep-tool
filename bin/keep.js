@@ -1470,18 +1470,48 @@ function implicitLandVerdict(task, deps = {}) {
   return { ...verdict, context };
 }
 
+const ALLOW_SPEC = { grant: 'list', revoke: 'list', until: 'str', clear: 'bool', amount: 'str', quiet: 'bool', json: 'bool', 'as-owner': 'bool' };
+const ALLOW_USAGE = 'usage: keep allow <id> [<action> [--amount n]] [--grant a,b] [--revoke a,b] [--until when] [--clear] [--quiet] [--json] [--as-owner]';
+
+// allow.js throws AllowError, which the top-level handler does not know; every
+// path here converts it so bad input prints `keep: …` and exits, not a stack.
+function translatingAllow(fn) {
+  try { return fn(); }
+  catch (error) { if (error instanceof allow.AllowError) die(error.message); throw error; }
+}
+
+// `keep allow <card> <action>`: the answer, printed and given an exit status. The same
+// for the card read here and for one a node reads from its daemon (allowRemote),
+// which hands the land gate the daemon's facts in `landDeps`.
+function answerAllow(id, task, request, o, landDeps = {}) {
+  let verdict = translatingAllow(() => allow.decide(task, request, { amount: o.amount }));
+  // No explicit grant covers `land`, so ask the reviewed-patch question instead.
+  // Nothing else gets an implicit path: a land is the one action whose evidence
+  // Keep can verify byte for byte.
+  if (!verdict.ok && String(request).trim().toLowerCase() === 'land') {
+    const implicit = implicitLandVerdict(task, landDeps);
+    verdict = {
+      ok: implicit.ok, why: implicit.why, ...(implicit.grant ? { grant: implicit.grant } : {}), implicit: true,
+      ...(implicit.record ? { record: implicit.record } : {}),
+      // The blocker that carried the refusal, so --json says which review is still
+      // out rather than only spelling it in the prose.
+      ...(implicit.obligation ? { obligation: implicit.obligation } : {}),
+    };
+  }
+  if (o.json) console.log(JSON.stringify({ id, action: request, ...verdict }, null, 2));
+  else if (!o.quiet) console.log(verdict.ok ? `allowed: ${verdict.why}` : `not allowed: ${verdict.why}`);
+  // Exit 3, not 1: an agent must be able to tell "you may not" from "that
+  // command was wrong". `if keep allow c push; then …` reads naturally.
+  if (!verdict.ok) process.exitCode = 3;
+}
+
 commands.allow = (argv) => {
-  const o = parseArgs(argv, { grant: 'list', revoke: 'list', until: 'str', clear: 'bool', amount: 'str', quiet: 'bool', json: 'bool', 'as-owner': 'bool' });
+  const o = parseArgs(argv, ALLOW_SPEC);
   const id = o._[0];
-  const usage = 'usage: keep allow <id> [<action> [--amount n]] [--grant a,b] [--revoke a,b] [--until when] [--clear] [--quiet] [--json] [--as-owner]';
+  const usage = ALLOW_USAGE;
   if (!id) die(usage);
   const mutating = Boolean(o.grant || o.revoke || o.clear || o.until);
-  // allow.js throws AllowError, which the top-level handler does not know; every
-  // path here converts it so bad input prints `keep: …` and exits, not a stack.
-  const translating = (fn) => {
-    try { return fn(); }
-    catch (error) { if (error instanceof allow.AllowError) die(error.message); throw error; }
-  };
+  const translating = translatingAllow;
   const request = o._[1];
   if (o._.length > 2) die(usage);
   if (mutating && request) die('keep allow either checks one action or changes the grants, not both');
@@ -1492,25 +1522,7 @@ commands.allow = (argv) => {
       if (o.json) return console.log(JSON.stringify({ id, grants: allow.readGrants(task).map(allow.formatToken), until: task.fm.allow_until || '', expired: Boolean(allow.expired(task, Date.now())) }, null, 2));
       return console.log(`${id}: ${formatAllow(task)}`);
     }
-    let verdict = translating(() => allow.decide(task, request, { amount: o.amount }));
-    // No explicit grant covers `land`, so ask the reviewed-patch question instead.
-    // Nothing else gets an implicit path: a land is the one action whose evidence
-    // Keep can verify byte for byte.
-    if (!verdict.ok && String(request).trim().toLowerCase() === 'land') {
-      const implicit = implicitLandVerdict(task);
-      verdict = {
-        ok: implicit.ok, why: implicit.why, ...(implicit.grant ? { grant: implicit.grant } : {}), implicit: true,
-        ...(implicit.record ? { record: implicit.record } : {}),
-        // The blocker that carried the refusal, so --json says which review is still
-        // out rather than only spelling it in the prose.
-        ...(implicit.obligation ? { obligation: implicit.obligation } : {}),
-      };
-    }
-    if (o.json) console.log(JSON.stringify({ id, action: request, ...verdict }, null, 2));
-    else if (!o.quiet) console.log(verdict.ok ? `allowed: ${verdict.why}` : `not allowed: ${verdict.why}`);
-    // Exit 3, not 1: an agent must be able to tell "you may not" from "that
-    // command was wrong". `if keep allow c push; then …` reads naturally.
-    if (!verdict.ok) process.exitCode = 3;
+    answerAllow(id, task, request, o);
     return;
   }
 
@@ -1833,6 +1845,9 @@ commands['land-facts'] = (argv) => {
   console.log(JSON.stringify({
     id, grants: allow.readGrants(task).map(allow.formatToken), records: reviews.readRecords(id),
     obligations: open, optOut: reviews.optOutReason(task),
+    // The card's allow_until, so a node's `keep allow <card> land` decides the explicit
+    // grant exactly as allow.decide does here.
+    until: String(task.fm.allow_until || ''),
   }));
 };
 
@@ -1842,6 +1857,59 @@ commands['land-facts'] = (argv) => {
 // The gate itself is implicitLandVerdict, the same one `keep land` runs, handed
 // those facts in place of the files it would read. wt land deploys keep-tool by
 // asking the daemon to deploy itself (wt.deployOnDaemon).
+// The daemon's land-facts for a card, or null after printing the daemon's own answer
+// and setting the exit status (no card, an unreadable store). `until` is required
+// only by the callers that decide explicit grants with allow.decide.
+async function fetchLandFacts(id, where, remote, { needUntil = false } = {}) {
+  const facts = await remote.runRemote('land-facts', [id], { where });
+  if (facts.code !== 0) {
+    if (facts.stdout) process.stdout.write(facts.stdout);
+    if (facts.stderr) process.stderr.write(facts.stderr);
+    process.exitCode = facts.code;
+    return null;
+  }
+  let value;
+  try { value = JSON.parse(facts.stdout); } catch { die(`the daemon on ${where.daemon} answered land-facts with something that is not JSON`); }
+  if (!value || value.id !== id || !Array.isArray(value.grants) || !Array.isArray(value.records)
+    || !Array.isArray(value.obligations) || typeof value.optOut !== 'string'
+    || (needUntil && typeof value.until !== 'string')) {
+    die(`the daemon on ${where.daemon} answered land-facts for ${id} in a shape this keep does not read`);
+  }
+  return value;
+}
+
+// What implicitLandVerdict reads, from the daemon's facts instead of the files here.
+function landFactsDeps(value, deps = {}) {
+  const obligationApi = require('./review-obligations.js');
+  return {
+    records: value.records,
+    optOut: value.optOut,
+    obligations: { readRecords: () => value.obligations, outstandingFor: obligationApi.outstandingFor },
+    ...(deps.context ? { context: deps.context } : {}),
+  };
+}
+
+// `keep allow <card> land` on a node that knows its daemon: the question is about the
+// worktree here, so it is answered here, from the daemon's facts, by the same code
+// and in the same words as on the daemon node (answerAllow). Anything else `keep
+// allow` does goes to the daemon (allowRemoteHandles says which).
+function allowRemoteHandles(argv) {
+  let o;
+  try { o = parseArgs(argv, ALLOW_SPEC); } catch { return false; }
+  const mutating = Boolean(o.grant || o.revoke || o.clear || o.until);
+  return !mutating && o._.length === 2 && String(o._[1]).trim().toLowerCase() === 'land';
+}
+
+async function allowRemote(argv, where, deps = {}) {
+  const remote = deps.remote || require('./remote-cli.js');
+  const o = parseArgs(argv, ALLOW_SPEC);
+  const [id, request] = o._;
+  if (!id || o._.length !== 2) die(ALLOW_USAGE);
+  const value = await fetchLandFacts(id, where, remote, { needUntil: true });
+  if (!value) return;
+  answerAllow(id, { id, fm: { allow: value.grants, allow_until: value.until } }, request, o, landFactsDeps(value, deps));
+}
+
 async function landRemote(argv, where, deps = {}) {
   const remote = deps.remote || require('./remote-cli.js');
   const o = parseArgs(argv, { json: 'bool', 'dry-run': 'bool' });
@@ -1849,26 +1917,9 @@ async function landRemote(argv, where, deps = {}) {
   if (!id || o._.length > 1) die('usage: keep land <card> [--dry-run] [--json]\n'
     + '  Checks keep allow <card> land, then runs wt land from the current worktree and cites the landed sha.\n'
     + `  ${KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE}`);
-  const facts = await remote.runRemote('land-facts', [id], { where });
-  if (facts.code !== 0) {
-    if (facts.stdout) process.stdout.write(facts.stdout);
-    if (facts.stderr) process.stderr.write(facts.stderr);
-    process.exitCode = facts.code;
-    return;
-  }
-  let value;
-  try { value = JSON.parse(facts.stdout); } catch { die(`the daemon on ${where.daemon} answered land-facts with something that is not JSON`); }
-  if (!value || value.id !== id || !Array.isArray(value.grants) || !Array.isArray(value.records)
-    || !Array.isArray(value.obligations) || typeof value.optOut !== 'string') {
-    die(`the daemon on ${where.daemon} answered land-facts for ${id} in a shape this keep does not read`);
-  }
-  const obligationApi = require('./review-obligations.js');
-  const verdict = implicitLandVerdict({ id, fm: { allow: value.grants } }, {
-    records: value.records,
-    optOut: value.optOut,
-    obligations: { readRecords: () => value.obligations, outstandingFor: obligationApi.outstandingFor },
-    ...(deps.context ? { context: deps.context } : {}),
-  });
+  const value = await fetchLandFacts(id, where, remote);
+  if (!value) return;
+  const verdict = implicitLandVerdict({ id, fm: { allow: value.grants } }, landFactsDeps(value, deps));
   if (!verdict.ok) {
     if (o.json) console.log(JSON.stringify({ id, action: 'land', ...verdict, context: undefined }, null, 2));
     else process.stderr.write(`keep: not allowed: ${verdict.why}\n`);
@@ -3938,6 +3989,7 @@ function paneOnlyRefusal(cmd, args, env = process.env) {
 module.exports.paneOnlyRefusal = paneOnlyRefusal;
 module.exports.PANE_ONLY_COMMANDS = PANE_ONLY_COMMANDS;
 module.exports.landRemote = landRemote;
+module.exports.allowRemote = allowRemote;
 
 if (require.main === module) {
   (async () => {
@@ -3946,6 +3998,10 @@ if (require.main === module) {
       // A pane-only node that knows its daemon's node API sends registry commands
       // there. Without KEEP_DAEMON_URL remoteMode is null and nothing here runs.
       const remote = require('./remote-cli.js').remoteMode(process.env);
+      if (remote && cmd === 'allow' && allowRemoteHandles(rest)) {
+        await allowRemote(rest, remote);
+        return;
+      }
       if (remote && require('./registry-commands.js').isRegistryCommand(cmd || 'list')) {
         // The commits and the Codex job a review names are in this node's worktree and
         // jobs directory, so they are resolved here and sent as facts.
