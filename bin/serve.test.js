@@ -5952,6 +5952,16 @@ test('discarding a Claude draft never interrupts a running turn', async () => {
   assert.deepEqual(running.inputs, [], 'Escape is not pressed into the running Claude turn');
 });
 
+test('discarding an idle Claude draft ignores running-turn words inside the composer', async () => {
+  const text = 'the draft itself says esc to interrupt';
+  const idle = draftHarness(CLEARABLE(text));
+  const result = await discardTypedDraft({ pane: 'p' }, text, 'claude', {
+    ...idle.deps, expectedPaneState: { pid: 4242, inputCount: 0 }, stderr: () => {},
+  });
+  assert.equal(result.cleared, true);
+  assert.deepEqual(idle.inputs, ['\x1b'], 'the idle draft is cleared with one Escape');
+});
+
 test('the delivery sweep retires only an unchanged idle exact draft it owns', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-left-delivery-draft-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -5970,13 +5980,19 @@ test('the delivery sweep retires only an unchanged idle exact draft it owns', as
   };
   const journals = {
     clear: make('clear'), moved: make('moved'), busy: make('busy'), changed: make('changed'),
+    retry: make('retry'), stuck: make('stuck'), same: make('same'),
     legacy: make('legacy', { leftDraft: undefined }),
   };
+  const original = Object.fromEntries(['moved', 'busy', 'changed', 'stuck', 'same', 'legacy']
+    .map((name) => [name, fs.readFileSync(journals[name], 'utf8')]));
   const panes = [
     { id: 'pane-clear', pid: 4242, inputCount: 9 },
     { id: 'pane-moved', pid: 4242, inputCount: 10 },
     { id: 'pane-busy', pid: 4242, inputCount: 9 },
     { id: 'pane-changed', pid: 4242, inputCount: 9 },
+    { id: 'pane-retry', pid: 4242, inputCount: 9 },
+    { id: 'pane-stuck', pid: 4242, inputCount: 9 },
+    { id: 'pane-same', pid: 4242, inputCount: 9 },
     { id: 'pane-legacy', pid: 4242, inputCount: 9 },
   ];
   const discarded = [];
@@ -5985,21 +6001,37 @@ test('the delivery sweep retires only an unchanged idle exact draft it owns', as
     readScreenResult: async ({ pane }) => ({ text: pane === 'pane-changed' ? BOX(`${text} changed`) : screen }),
     discardTypedDraft: async (target, visible, kind, deps) => {
       discarded.push({ target, visible, kind, expected: deps.expectedPaneState });
+      if (target.pane === 'pane-retry') {
+        return { cleared: false, reason: 'still there', leftDraft: { pid: 4242, inputCount: 11 } };
+      }
+      if (target.pane === 'pane-stuck') return { cleared: false, reason: 'still there' };
+      if (target.pane === 'pane-same') {
+        return { cleared: false, reason: 'still there', leftDraft: { pid: 4242, inputCount: 9 } };
+      }
       return { cleared: true, reason: null };
     },
   });
   assert.deepEqual(retired, ['clear']);
   assert.equal(fs.existsSync(journals.clear), false, 'the failed send is deleted without a retained receipt');
   assert.equal(fs.existsSync(path.join(root, 'receipts')), false);
-  for (const name of ['moved', 'busy', 'changed', 'legacy']) {
-    assert.equal(fs.existsSync(journals[name]), true, `${name} journal is untouched`);
+  for (const name of ['moved', 'busy', 'changed', 'retry', 'stuck', 'same', 'legacy']) {
+    assert.equal(fs.existsSync(journals[name]), true, `${name} journal is retained`);
   }
-  assert.equal(discarded.length, 1);
-  assert.deepEqual(discarded[0].target, { pane: 'pane-clear' });
-  assert.equal(discarded[0].visible, text);
-  assert.equal(discarded[0].kind, 'claude');
-  assert.equal(discarded[0].expected.pid, 4242);
-  assert.equal(discarded[0].expected.inputCount, 9);
+  for (const name of Object.keys(original)) {
+    assert.equal(fs.readFileSync(journals[name], 'utf8'), original[name], `${name} journal bytes are untouched`);
+  }
+  const retried = JSON.parse(fs.readFileSync(journals.retry, 'utf8'));
+  assert.deepEqual({ pid: retried.leftDraft.pid, inputCount: retried.leftDraft.inputCount },
+    { pid: 4242, inputCount: 11 });
+  assert.ok(Number(retried.leftDraft.at) > 0);
+  assert.equal(fs.statSync(journals.retry).mode & 0o777, 0o600);
+  assert.equal(discarded.length, 4);
+  const cleared = discarded.find((item) => item.target.pane === 'pane-clear');
+  assert.deepEqual(cleared.target, { pane: 'pane-clear' });
+  assert.equal(cleared.visible, text);
+  assert.equal(cleared.kind, 'claude');
+  assert.equal(cleared.expected.pid, 4242);
+  assert.equal(cleared.expected.inputCount, 9);
 });
 
 test('an abort after typing clears only a draft that is still ours', async () => {

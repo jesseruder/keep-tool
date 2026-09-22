@@ -2785,13 +2785,18 @@ function sendPrecheck(screen) {
   }
 }
 
-// A turn running anywhere on a Claude screen, read the conservative way: the whole screen,
-// with the phrase allowed to wrap across rows ("esc to" at the end of one, "interrupt" at
-// the start of the next). A spinner line can sit well above the box — a todo list or
-// queued messages between them — so no narrower window is safe. The cost is accepted: an
-// answer in view that quotes "esc to interrupt" delays a restore until it scrolls away.
+// A turn running on a Claude screen, with the phrase allowed to wrap across rows
+// ("esc to" at the end of one, "interrupt" at the start of the next). Callers that
+// may have typed those words into the composer exclude that parsed region below.
 const CLAUDE_TURN_RUNNING_RE = /esc\s+to\s+interrupt|Compacting[.…]/i;
 const CLAUDE_TURN_OR_DIALOG_RE = /esc\s+to\s+(?:interrupt|cancel)|Compacting[.…]/i;
+
+function claudeTurnRunningOutsideDraft(screen, kind) {
+  const region = draftRegionLines(screen, kind);
+  if (!region) return CLAUDE_TURN_RUNNING_RE.test(String(screen || ''));
+  return CLAUDE_TURN_RUNNING_RE.test(region.before.join('\n'))
+    || CLAUDE_TURN_RUNNING_RE.test(region.after.join('\n'));
+}
 
 function promptLine(screen) {
   return String(screen || '').split(/\r?\n/).slice(-10).reverse()
@@ -3178,7 +3183,12 @@ function draftRegionLines(screen, kind, options = {}) {
   if (start === -1) return null;
   const region = lines.slice(start, end);
   region[0] = region[0].replace(prompt, '');
-  return { lines: region, width: Math.max(0, ...lines.map((line) => line.length)) };
+  return {
+    lines: region,
+    width: Math.max(0, ...lines.map((line) => line.length)),
+    before: lines.slice(0, start),
+    after: lines.slice(end + 1),
+  };
 }
 
 // Where a Codex composer ends: above the last blank-separated block on screen,
@@ -3363,7 +3373,7 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   // and check it again before the menu-closing second Escape below: cleanup may wait;
   // somebody else's running turn may never be interrupted on its behalf.
   const turnRunning = (value) => (kind === 'claude' || deps.refuseRunningTurn)
-    && CLAUDE_TURN_RUNNING_RE.test(String(value || ''));
+    && claudeTurnRunningOutsideDraft(value, kind);
   if (turnRunning(screen)) {
     return left('turn running', 'a Claude turn is running, so Escape was not pressed', pid, count);
   }
@@ -3445,13 +3455,23 @@ async function retireLeftDeliveryDrafts(directory, panes, deps = {}) {
       const target = { pane: entry.pane };
       const snapshot = await read(target, 200, false);
       const screen = String(snapshot && snapshot.text || '');
-      if (CLAUDE_TURN_RUNNING_RE.test(screen)) continue;
+      if (claudeTurnRunningOutsideDraft(screen, entry.kind)) continue;
       const visible = draftRegionText(screen, entry.kind);
       if (visible === null || delivery.textHash(visible) !== entry.hash) continue;
       const result = await discard(target, visible, entry.kind, {
         ...deps, expectedPaneState: expected, refuseRunningTurn: true,
       });
-      if (!result || result.cleared !== true) continue;
+      if (!result || result.cleared !== true) {
+        const left = result && result.leftDraft;
+        if (left && Number.isInteger(left.pid) && Number.isInteger(left.inputCount)
+            && (left.pid !== expected.pid || left.inputCount !== expected.inputCount)) {
+          entry.leftDraft = { ...left, at: Date.now() };
+          const temp = journal + '.tmp';
+          fileSystem.writeFileSync(temp, JSON.stringify(entry), { mode: 0o600 });
+          fileSystem.renameSync(temp, journal);
+        }
+        continue;
+      }
       try { fileSystem.unlinkSync(journal); } catch (error) { if (error.code !== 'ENOENT') throw error; }
       retired.push(entry.sessionId);
     } catch {} // The ordinary health/reconcile pass keeps exposing anything uncertain.
