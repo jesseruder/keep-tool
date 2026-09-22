@@ -2452,11 +2452,21 @@ async function probeSuggestion(target, beforeScreen, deps = {}) {
   let failure = null;
   let lastScreen = null;
   const proof = { kind: 'suggestion', settled: null };
+  // A caller holding the pane's input counter (compactRestoreInputBaseline) gets both of
+  // the probe's keys conditional on it: the comma at that count, its Backspace at one
+  // more. Unguarded, a key someone typed after the comma landed would be the one the
+  // Backspace deleted, and the comma would be left in their draft.
+  const probeGuard = deps.probeInputGuard && Number.isInteger(deps.probeInputGuard.pid)
+    && Number.isInteger(deps.probeInputGuard.inputCount) ? deps.probeInputGuard : null;
   try {
     try {
-      await writeTarget(target, SUGGESTION_PROBE_KEY, deps);
+      await writeTarget(target, SUGGESTION_PROBE_KEY, deps, probeGuard
+        ? { expectedInputCount: probeGuard.inputCount, expectedPid: probeGuard.pid } : {});
       typed = true;
     } catch (error) {
+      // Refused by the host's guard: the key never reached the pane, so there is nothing
+      // to watch for and nothing to undo.
+      if (error && error.inputDropped) throw error;
       // A write that reported failure may still have delivered the keystroke. Watch
       // for the probe's own signature — never for "something changed", which would
       // Backspace a character the user typed at the same moment.
@@ -2526,7 +2536,8 @@ async function probeSuggestion(target, beforeScreen, deps = {}) {
     if (typed) {
       let undone = false;
       try {
-        await pressTargetKey(target, 'Backspace', deps);
+        await pressTargetKey(target, 'Backspace', deps, probeGuard
+          ? { expectedInputCount: probeGuard.inputCount + 1, expectedPid: probeGuard.pid } : {});
         undone = true;
       } catch (error) {
         const message = 'the probe keystroke could not be undone; clear the session input box in the terminal first';
@@ -3280,10 +3291,21 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
       }));
     }
   }
+  // Every check above has passed and the next key is the Enter. A caller that has to
+  // journal "this submit was committed" (an account handoff's stop proof) does it here —
+  // not when typing starts, since a draft taken back or refused never became a submit —
+  // and is told when the host refused the Enter outright, which is the only answer that
+  // proves it did not land. A transport failure stays ambiguous and keeps the mark.
+  if (deps.beforeEnterKey) await deps.beforeEnterKey();
   deps.deliveryTrace?.('enter-start');
-  await pressTargetKey(target, 'Enter', deps, exactExpectation
-    ? { expectedInputCount: exactExpectation.inputCount, expectedPid: exactExpectation.pid }
-    : {});
+  try {
+    await pressTargetKey(target, 'Enter', deps, exactExpectation
+      ? { expectedInputCount: exactExpectation.inputCount, expectedPid: exactExpectation.pid }
+      : {});
+  } catch (error) {
+    if (error && error.inputDropped && deps.enterKeyDropped) await deps.enterKeyDropped();
+    throw error;
+  }
   deps.deliveryTrace?.('enter-sent');
   return { ok: true };
 }
@@ -3991,17 +4013,22 @@ function compactSwapRecordAt(record) {
   try { return fs.statSync(record.file).mtimeMs; } catch { return 0; }
 }
 
-// The pane's input counter, proved against an empty (or suggestion-only) Claude box, for
-// a restore the pending-swap pass is about to type. A deferred restore can come due hours
-// after the compaction, when a person is far more likely to be at the keyboard, and
-// typeAndSubmit alone only looks for its own text somewhere on screen before pressing
-// Enter — so a draft ending in the same command could be submitted as the user's own
-// message. With this baseline every key the restore sends is conditional on the counter
-// (typeAndSubmit's inputBaseline): a key from anyone else in between and the host drops
-// ours instead, and the box must hold exactly the command before Enter. The same
-// before/probe/after reading sendToResolvedTarget takes: the probe's own two keys are the
-// only ones allowed between the two counts.
-async function compactRestoreInputBaseline(target, deps = {}) {
+// The pane's input counter, and under it the proof that the session is idle with an empty
+// (or suggestion-only) Claude box, for a restore the pending-swap pass is about to type.
+// A deferred restore can come due hours after the compaction, when a person is far more
+// likely to be at the keyboard, and typeAndSubmit alone only looks for its own text
+// somewhere on screen before pressing Enter.
+//
+// The count is read first and everything else is read after it. That order is the whole
+// point: a turn someone submits after the count is in the count, so the host refuses
+// every key the restore sends (typeAndSubmit's inputBaseline); a turn submitted before it
+// is on the screen this then reads — "esc to interrupt", a live dialog, an unfinished
+// local command — and refuses here. The suggestion probe's own two keys are conditional on
+// the same count (probeInputGuard), so nothing on this path is ever typed unguarded, and
+// they are the only keys allowed between the two counts.
+//
+// null means "not now, and nothing was typed": a local command still finishing.
+async function compactRestoreInputBaseline(target, deps = {}, current = null) {
   const read = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
   const paneState = deps.livePaneState || livePaneState;
   let capabilities;
@@ -4012,7 +4039,19 @@ async function compactRestoreInputBaseline(target, deps = {}) {
   const pane = (target && target.pane) || 'unknown';
   const before = await paneState(pane, deps);
   if (!before) throw new InjectionError(409, 'pane input activity could not be verified before the restore');
-  const proof = await probeSuggestion(target, await read(target, 30, false), deps);
+  const screen = await read(target, 30, false);
+  if (current && current.localCommandPending) {
+    const complete = /^\/compact(?:\s|$)/.test(current.localCommandPending)
+      ? compactScreenConfirmed(screen, current.localCommandPending)
+      : modelSwitchConfirmed(screen, current.localCommandPending)
+        && Boolean(promptLine(screen))
+        && !/esc to (?:interrupt|cancel)/i.test(screen);
+    if (!complete) return null;
+  }
+  if (/esc to (?:interrupt|cancel)|Compacting[.…]/i.test(screen) || claudePrompts.recognize(screen)?.live) {
+    throw new InjectionError(409, 'the session is busy or showing a dialog; the restore was not typed', { screenTail: screenTail(screen) });
+  }
+  const proof = await probeSuggestion(target, screen, { ...deps, probeInputGuard: { pid: before.pid, inputCount: before.inputCount } });
   const after = await paneState(pane, deps);
   const own = proof && proof.kind === 'suggestion' ? 2 : 0;
   if (!after || after.pid !== before.pid || after.inputCount !== before.inputCount + own) {
@@ -4029,7 +4068,6 @@ async function sweepPendingCompactSwaps(deps = {}) {
   const dir = deps.dir || autoCompactDir();
   const scan = deps.scanSessions || scanSessions;
   const resolve = deps.resolveSessionTarget || resolveSessionTarget;
-  const precheck = deps.precheckSessionTarget || precheckSessionTarget;
   const read = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
   const submit = deps.typeAndSubmit || typeAndSubmit;
   const waitForSwitch = deps.waitForModelSwitch || waitForModelSwitch;
@@ -4047,28 +4085,30 @@ async function sweepPendingCompactSwaps(deps = {}) {
     // below can act on it: no restore typed over the choice, and no settings.json repair
     // over the saved default /model just wrote (see compactSwapUserModelChoice).
     const retired = new Set();
-    if (!scanError) {
-      const byIdEarly = new Map((sessions || []).map((session) => [session.id, session]));
-      const transcriptFor = deps.transcriptFileForSession || transcriptFileForSession;
-      for (const record of allRecords) {
-        if (record.error || codexCompact.isCodexCompactSwap(record)) continue;
-        const session = byIdEarly.get(record.sessionId);
-        if (!session) continue;
-        let choice = null;
-        try { choice = (deps.compactSwapUserModelChoice || compactSwapUserModelChoice)(record, transcriptFor(session)); } catch {}
-        if (!choice) continue;
-        const sid = (sessionRef(record.sessionId) || 'unknown');
-        try { fs.unlinkSync(record.file); } catch (e) {
-          if (e.code !== 'ENOENT') {
-            process.stderr.write(`keep serve: could not retire model restore record for ${sid}: ${e.message}\n`);
-            continue;
-          }
+    const byIdEarly = new Map((sessions || []).map((session) => [session.id, session]));
+    const transcriptFor = deps.transcriptFileForSession || transcriptFileForSession;
+    // True when the record was retired (or already was) for a hand-picked model.
+    const retireOnUserChoice = (record) => {
+      if (retired.has(record.file)) return true;
+      if (scanError || record.error || codexCompact.isCodexCompactSwap(record)) return false;
+      const session = byIdEarly.get(record.sessionId);
+      if (!session) return false;
+      let choice = null;
+      try { choice = (deps.compactSwapUserModelChoice || compactSwapUserModelChoice)(record, transcriptFor(session)); } catch {}
+      if (!choice) return false;
+      const sid = (sessionRef(record.sessionId) || 'unknown');
+      try { fs.unlinkSync(record.file); } catch (e) {
+        if (e.code !== 'ENOENT') {
+          process.stderr.write(`keep serve: could not retire model restore record for ${sid}: ${e.message}\n`);
+          return true; // Still a choice: nothing may be typed or repaired over it.
         }
-        retired.add(record.file);
-        summary.dropped += 1;
-        process.stderr.write(`keep serve: retired model restore record for ${sid}: ${choice.reason}; not restoring "${String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '')}" or repairing settings.json over it\n`);
       }
-    }
+      retired.add(record.file);
+      summary.dropped += 1;
+      process.stderr.write(`keep serve: retired model restore record for ${sid}: ${choice.reason}; not restoring "${String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '')}" or repairing settings.json over it\n`);
+      return true;
+    };
+    for (const record of allRecords) retireOnUserChoice(record);
     const records = allRecords.filter((record) => !retired.has(record.file));
     const repairedSettingsRecords = new Set();
     const noteSettingsRepair = (record, repaired) => {
@@ -4091,6 +4131,13 @@ async function sweepPendingCompactSwaps(deps = {}) {
           const settings = readSettings(settingsFile);
           const via = String(settingsRecord.switchModel || envString('KEEP_COMPACT_VIA_MODEL', 'opus')).trim();
           if (!settings.ok || !compactModelContainsFamily(settings.value, via)) return;
+          // Checked again here, under the lock and immediately before the write: a model
+          // someone picked since the first look is the saved default /model just wrote,
+          // and the per-record retire further down would come too late to undo a repair.
+          // Every record on this settings file counts — it is the account's default.
+          const sharing = records.filter((item) => !item.error && !codexCompact.isCodexCompactSwap(item)
+            && compactSwapSettingsFile(item, deps) === settingsFile);
+          if (sharing.map(retireOnUserChoice).some(Boolean)) return;
           const repaired = repairSettings(settingsRecord.settingsModelBefore, settingsRecord.settingsModelPresent, settingsFile);
           noteSettingsRepair(settingsRecord, repaired);
           if (repaired.changed) {
@@ -4116,6 +4163,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
     }
     const byId = new Map((sessions || []).map((session) => [session.id, session]));
     for (const record of records) {
+      if (retired.has(record.file)) continue;
       const sid = (sessionRef(record.sessionId) || 'unknown');
       const session = byId.get(record.sessionId);
       if (codexCompact.isCodexCompactSwap(record)) {
@@ -4193,19 +4241,12 @@ async function sweepPendingCompactSwaps(deps = {}) {
           const current = scan().find((candidate) => candidate.id === record.sessionId);
           if (compactRestoreBusy(current)) return null;
           const target = claimInjectionTarget(await resolve(current, null, deps));
-          if (current.localCommandPending) {
-            const screen = await read(target, 30, false);
-            const complete = /^\/compact(?:\s|$)/.test(current.localCommandPending)
-              ? compactScreenConfirmed(screen, current.localCommandPending)
-              : modelSwitchConfirmed(screen, current.localCommandPending)
-                && Boolean(promptLine(screen))
-                && !/esc to (?:interrupt|cancel)/i.test(screen);
-            if (!complete) return null;
-          }
-          // typeAndSubmit confirms the typed command, but does not check the input box
-          // or modal before typing — precheck does, and for a Claude session it is the
-          // suggestion probe.
-          await precheck(current, target, deps);
+          // The idle proof and the input count it is bound to (see
+          // compactRestoreInputBaseline). It replaces precheckSessionTarget here, whose
+          // suggestion probe types unguarded: every key this pass sends is conditional
+          // on this count, from the probe's comma to the restore's Enter.
+          const inputBaseline = await (deps.compactRestoreInputBaseline || compactRestoreInputBaseline)(target, deps, current);
+          if (inputBaseline === null) return null;
           const via = String(record.switchModel || envString('KEEP_COMPACT_VIA_MODEL', 'opus')).trim();
           const before = readSettings(settingsFile);
           // /model also overwrites settings.json. Save a hand change so we can
@@ -4214,7 +4255,12 @@ async function sweepPendingCompactSwaps(deps = {}) {
             ? { settingsModelBefore: before.value, settingsModelPresent: before.present }
             : settingsRecords.get(settingsFile);
           const restoreModel = String(record.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim();
+          // Only after the restore was actually typed: a pass that retired or refused
+          // before typing wrote nothing to settings.json, and anything there now is a
+          // person's.
+          let typedRestore = false;
           const repair = () => {
+            if (!typedRestore) return;
             const after = readSettings(settingsFile);
             if (!after.ok || (before.ok && after.value === before.value)) return;
             // Compare-and-swap: only undo the value our own /model command wrote. Anything
@@ -4230,11 +4276,8 @@ async function sweepPendingCompactSwaps(deps = {}) {
             record.at = compactSwapRecordAt(record); // Preserve mtime-based age across retry writes.
             record.lastAttemptAt = now();
             writeCompactSwapRecord(record.file, record);
-            // Reading settings and writing the record above take long enough for someone
-            // to start typing, and typeAndSubmit only looks for its own command somewhere
-            // in the box. Re-verify it at the moment of typing: the first probe waits for
-            // its own Backspace to render, so this one reads a settled screen.
-            const inputBaseline = await (deps.compactRestoreInputBaseline || compactRestoreInputBaseline)(target, deps);
+            // Anyone who started typing since the baseline — while settings were read and
+            // the record written — moved the count, and the host refuses the restore's keys.
             // Again under the lock, at the last moment: a /model someone typed since the
             // pass's first look is as much a choice as one typed before it.
             const lateChoice = (deps.compactSwapUserModelChoice || compactSwapUserModelChoice)(record,
@@ -4245,6 +4288,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
             // delivery like any other. A probe that refused above typed nothing, and a
             // deferred record it refused on stays deferred.
             if (compactRestoreDeferred(record)) writeCompactSwapRecord(record.file, withoutCompactRestoreDeferral(record));
+            typedRestore = true;
             await submit(target, record.restoreCommand, claudeTypedTextVisible, {
               ...deps, inputBaseline, discardDraftOnAbort: true, draftKind: 'claude',
             });
@@ -5528,9 +5572,13 @@ async function restartSession(body, deps = {}) {
     try {
       await (deps.closeIdleSession || closeIdleSession)(body, { ...deps, allowTerminalRateLimit: terminalLimit,
         restartProof: childProof, closePolicy: { manual: true, restart: true, force }, withInjectionLock: (fn) => fn(), beforeClose: checkChildren,
-        // onExitInput lets a caller journal that the stop itself began: an account handoff
-        // may later have to prove, after the fact, a stop whose confirmation it never saw.
-        beforeExitInput: () => { exitInputStarted = true; deps.onExitInput?.(); },
+        beforeExitInput: () => { exitInputStarted = true; },
+        // onExitEnter lets a caller journal that the /exit's Enter is being sent, after
+        // every check before it passed; onExitEnterDropped that the host refused it. An
+        // account handoff may later have to prove, after the fact, a stop whose
+        // confirmation it never saw, and only a committed Enter is a stop to prove.
+        beforeEnterKey: deps.onExitEnter ? () => deps.onExitEnter() : undefined,
+        enterKeyDropped: deps.onExitEnterDropped ? () => deps.onExitEnterDropped() : undefined,
       });
     } catch (error) {
       if (!exitInputStarted && ['Session changed during cleanup; nothing closed', 'Waiting for the turn and background work to finish', 'Waiting for pending input to be resolved'].includes(error.message)) throw transient(error.message);
@@ -11768,6 +11816,7 @@ module.exports = {
   readPendingCompactSwap,
   sweepPendingCompactSwaps,
   compactRestoreBlocking,
+  compactRestoreInputBaseline,
   assertCompactRestoreSettled,
   compactRestoreDeferral,
   compactRestoreRateLimited,

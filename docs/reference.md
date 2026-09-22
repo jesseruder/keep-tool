@@ -2383,10 +2383,14 @@ deliberately left on the compaction model, and it expires 24 hours after it come
 rather than after the swap. The log says `MODEL RESTORE DEFERRED`. When the deferral comes
 due the restore is typed under the injection lock as usual (the record blocks again for
 that attempt, though its expiry keeps counting from the deferral) and is either
-confirmed, deferred again, or left unconfirmed. Every restore this pass types is
-conditional on the pane's input counter, proved against an empty box just before:
-a key from anyone else in between makes the host drop the restore's keys, and Enter is
-pressed only when the box holds exactly the command. The hand-picked-model check below
+confirmed, deferred again, or left unconfirmed. No key this pass sends is
+unguarded. It reads the pane's input counter first, then proves the session idle under
+it: no "esc to interrupt", no live dialog, no local command still finishing, and an empty
+box (the prompt-suggestion probe's comma and Backspace are themselves conditional on the
+counter). A turn submitted after the count moves it, so the host drops the restore's keys;
+Enter is pressed only when the box holds exactly the command. The account's
+`settings.json` repair likewise rechecks for a hand-picked model immediately before it
+writes, and the per-attempt repair runs only after a restore was actually typed. The hand-picked-model check below
 runs again under the lock right before typing. Second, if the
 transcript shows a model someone chose by hand after the swap (a confirmed `/model` other
 than the daemon's own switch and restore rows, compared as exact ids so dropping the

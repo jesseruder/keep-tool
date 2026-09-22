@@ -256,7 +256,8 @@ function compactRestoreDeps(dir, session, calls = [], settingsFile) {
     withInjectionLock: async (fn) => fn(),
     readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-sonnet-5' }),
     repairClaudeSettingsModel: () => ({ changed: false }),
-    compactRestoreInputBaseline: async () => ({ pid: 1, inputCount: 0 }),
+    hostRequest: async (type) => (type === 'hello' ? { guardedInput: true } : {}),
+    livePaneState: async () => ({ pid: 1, inputCount: 0 }),
   };
 }
 
@@ -3882,7 +3883,7 @@ test('pending swap sweep repairs settings without typing exited, absent, or unsa
       locked = true;
       try { return await fn(); } finally { locked = false; }
     };
-    if (scenario === 'precheck') deps.precheckSessionTarget = async () => { throw new Error('unsafe target'); };
+    if (scenario === 'precheck') deps.compactRestoreInputBaseline = async () => { throw new Error('unsafe target'); };
     try {
       const summary = await sweepPendingCompactSwaps(deps);
       assert.deepEqual(summary, { checked: 1, restored: 0, dropped: 0, skipped: 1, repairedSettings: 1 });
@@ -3976,7 +3977,7 @@ test('pending swap sweep restores through a prompt suggestion that Backspace put
   try {
     // Drop the no-op precheck so the production precheckSessionTarget runs: it reads the
     // screen and probes it, and the sweep probes once more just before it types.
-    const { precheckSessionTarget: _skip, compactRestoreInputBaseline: _real, ...base } = compactRestoreDeps(dir, session, calls);
+    const { livePaneState: _count, ...base } = compactRestoreDeps(dir, session, calls);
     const summary = await sweepPendingCompactSwaps({
       ...base,
       host,
@@ -3990,12 +3991,11 @@ test('pending swap sweep restores through a prompt suggestion that Backspace put
     });
     assert.deepEqual(summary, { checked: 1, restored: 1, dropped: 0, skipped: 0, repairedSettings: 0 });
     assert.deepEqual(calls, ['/model claude-fable-5-1[1m]']);
-    // Each probe settles before the next reader looks, so the second one still sees a
-    // suggestion rather than the first one's `,`.
-    assert.deepEqual(inputs, [',', '\x7f', ',', '\x7f']);
-    assert.deepEqual(order, [
-      'input:,', 'input:\x7f', 'input:,', 'input:\x7f', 'type:/model claude-fable-5-1[1m]',
-    ]);
+    // One probe — the idle proof's own — settled before the restore is typed.
+    assert.deepEqual(inputs, [',', '\x7f']);
+    assert.deepEqual(order, ['input:,', 'input:\x7f', 'type:/model claude-fable-5-1[1m]']);
+    const guards = host.calls.filter((c) => c.type === 'input').map((c) => c.params.expectedInputCount);
+    assert.deepEqual(guards, [0, 1], 'the probe comma and its Backspace are conditional on the count');
     assert.equal(fs.existsSync(swapFile), false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -4009,38 +4009,42 @@ test('pending swap sweep refuses a draft typed after its precheck and types noth
   const inputs = [];
   const swapFile = writeCompactSwapFixture(dir, session.id);
   let box = '';
+  let foreign = 0;
+  let lists = 0;
+  // A host that honours the guard exactly: a count that no longer agrees writes nothing.
+  const count = () => inputs.length + foreign;
   const host = recordingHost((type, params) => {
-    // The restore's own input baseline asks the host for the guard and the pane count.
     if (type === 'hello') return { guardedInput: true };
-    if (type === 'list') return { panes: [{ id: 'pane:test', pid: 1, inputCount: inputs.length }] };
+    if (type === 'list') {
+      const panes = [{ id: 'pane:test', pid: 1, inputCount: count() }];
+      // Owner starts typing right after the idle proof's second count, in the gap where
+      // the sweep reads settings and writes its record.
+      if (++lists === 2) { foreign += 1; box = 'w'; }
+      return { panes };
+    }
     if (type !== 'input') return {};
+    if (params.expectedInputCount !== undefined && params.expectedInputCount !== count()) {
+      return { dropped: true, reason: 'input arrived', inputCount: count() };
+    }
     const data = Buffer.from(params.data, 'base64').toString('utf8');
     inputs.push(data);
     box = data === '\x7f' ? box.slice(0, -1) : box + data;
     return {};
   });
-  // Reads 1-3 are the precheck's probe and its settled undo. Owner starts typing right
-  // after it, in the gap where the sweep reads settings and writes its record.
-  let reads = 0;
-  const readScreen = async () => {
-    reads += 1;
-    const screen = box ? suggestionScreenWithBox(box) : REVIEWER_SUGGESTION_BEFORE;
-    if (reads === 3) box = 'wait, stop';
-    return screen;
-  };
+  const readScreen = async () => (box ? suggestionScreenWithBox(box) : REVIEWER_SUGGESTION_BEFORE);
   try {
-    const { precheckSessionTarget: _skip, compactRestoreInputBaseline: _real, ...base } = compactRestoreDeps(dir, session, calls);
+    const { livePaneState: _count, hostRequest: _hello, typeAndSubmit: _mock, ...base } = compactRestoreDeps(dir, session, calls);
     const summary = await sweepPendingCompactSwaps({
       ...base,
       host,
       wait: async () => {},
+      sleep: async () => {},
       readScreen,
       readScreenResult: withCursor(readScreen),
       stderr: () => {},
     });
     assert.deepEqual(summary, { checked: 1, restored: 0, dropped: 0, skipped: 1, repairedSettings: 0 });
-    assert.deepEqual(calls, [], 'nothing is typed into a box that filled up after the precheck');
-    assert.deepEqual(inputs, [',', '\x7f', ',', '\x7f'], 'only the two probes and their undos');
+    assert.deepEqual(inputs, [',', '\x7f'], 'only the probe and its undo; the restore key was refused');
     assert.equal(fs.existsSync(swapFile), true, 'the record survives for the next tick');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -12403,4 +12407,104 @@ test('dropping the 1M window by hand is a choice the restore must not undo', () 
       modelCommand('claude-fable-5-1[1m]', 5e3), out('Set model to Fable 5.1 (1M context)', 5e3)].join('\n')}\n`);
     assert.equal(compactSwapUserModelChoice(record, file), null);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---- review round 2 ----
+
+test('the restore idle proof takes the count first and refuses a turn already running', async () => {
+  const { compactRestoreInputBaseline } = require('./serve.js');
+  const order = [];
+  const deps = (screen) => ({
+    hostRequest: async () => ({ guardedInput: true }),
+    livePaneState: async () => { order.push('count'); return { pid: 7, inputCount: 3 }; },
+    readScreen: async () => { order.push('screen'); return screen; },
+  });
+  // The composer is empty because the person just submitted: the probe alone would pass it.
+  await assert.rejects(compactRestoreInputBaseline({ pane: 'p' }, deps('✻ Thinking… (esc to interrupt)\n────\n❯ \n────')),
+    /busy or showing a dialog/);
+  assert.deepEqual(order.slice(0, 2), ['count', 'screen'], 'the count is read before the idle screen');
+  order.length = 0;
+  assert.deepEqual(await compactRestoreInputBaseline({ pane: 'p' }, deps('────\n❯ \n────\n? for shortcuts')), { pid: 7, inputCount: 3 });
+  assert.deepEqual(order, ['count', 'screen', 'count']);
+  // A local command still finishing is "not now": nothing typed, no refusal.
+  assert.equal(await compactRestoreInputBaseline({ pane: 'p' }, deps('❯ /compact\n❯'), { localCommandPending: '/compact' }), null);
+});
+
+test('a guarded probe never deletes a key someone typed after its comma', async () => {
+  const inputs = [];
+  let foreign = 0;
+  let box = '';
+  const count = () => inputs.length + foreign;
+  const host = recordingHost((type, params) => {
+    if (type !== 'input') return {};
+    if (params.expectedInputCount !== undefined && params.expectedInputCount !== count()) {
+      return { dropped: true, reason: 'input arrived', inputCount: count() };
+    }
+    const data = Buffer.from(params.data, 'base64').toString('utf8');
+    inputs.push(data);
+    box = data === '\x7f' ? box.slice(0, -1) : box + data;
+    // The person's X lands right after our comma.
+    if (data === ',') { foreign += 1; box += 'X'; }
+    return {};
+  });
+  const readScreen = async () => (box ? suggestionScreenWithBox(box) : REVIEWER_SUGGESTION_BEFORE);
+  await assert.rejects(probeSuggestion({ pane: 'p' }, REVIEWER_SUGGESTION_BEFORE, {
+    host, wait: async () => {}, readScreen, readScreenResult: withCursor(readScreen), stderr: () => {},
+    probeInputGuard: { pid: 1, inputCount: 0 },
+  }));
+  assert.deepEqual(inputs, [','], 'the Backspace was refused rather than eating the X');
+  assert.match(box, /X/);
+  // And a comma the count already moved past is never typed at all.
+  inputs.length = 0; foreign = 5; box = '';
+  await assert.rejects(probeSuggestion({ pane: 'p' }, REVIEWER_SUGGESTION_BEFORE, {
+    host, wait: async () => {}, readScreen, readScreenResult: withCursor(readScreen), stderr: () => {},
+    probeInputGuard: { pid: 1, inputCount: 0 },
+  }), (error) => Boolean(error.inputDropped));
+  assert.deepEqual(inputs, []);
+});
+
+test('the account settings repair rechecks a hand-picked model right before it writes', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-settings-choice-'));
+  const session = { id: 'settings-choice', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  try {
+    const file = writeCompactSwapFixture(dir, session.id);
+    let looks = 0;
+    const repairs = [];
+    const calls = [];
+    const summary = await sweepPendingCompactSwaps({ ...compactRestoreDeps(dir, session, calls),
+      transcriptFileForSession: () => null, stderr: () => {},
+      // Settings still say the compaction model: the repair pass would put Fable back.
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-opus-5[1m]' }),
+      repairClaudeSettingsModel: (value) => { repairs.push(value); return { changed: true }; },
+      compactSwapUserModelChoice: () => (++looks === 1 ? null
+        : { model: 'claude-opus-5[1m]', reason: '/model claude-opus-5[1m] was chosen after the swap' }) });
+    assert.deepEqual(repairs, [], 'the saved default the person just chose is not overwritten');
+    assert.deepEqual(calls, []);
+    assert.equal(fs.existsSync(file), false);
+    assert.equal(summary.dropped, 1);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the Enter hooks fire only for an Enter that passed every check, and hear a refused one', async () => {
+  const command = '/exit';
+  const marks = [];
+  const hooks = { beforeEnterKey: () => marks.push('enter'), enterKeyDropped: () => marks.push('dropped') };
+  // Taken back before Enter: no mark.
+  const aborted = draftHarness(CLEARABLE(command));
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, command, (s, t) => s.includes(t), {
+    ...aborted.deps, ...hooks, discardDraftOnAbort: true, beforeEnter: async () => { throw new Error('changed'); } }));
+  assert.deepEqual(marks, []);
+  // Committed.
+  const clean = draftHarness(BOX(command));
+  await typeAndSubmit({ pane: 'p' }, command, (s, t) => s.includes(t), { ...clean.deps, ...hooks });
+  assert.deepEqual(marks, ['enter']);
+  // The host refused the Enter itself: the mark is told.
+  marks.length = 0;
+  const refused = draftHarness(BOX(command), (type, { inputs, foreign }) => {
+    if (type === 'screen' && inputs.length === 1) foreign.count += 1;
+  });
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, command, (s, t) => s.includes(t), {
+    ...refused.deps, ...hooks, inputBaseline: { pid: 4242, inputCount: 0 } }));
+  assert.equal(refused.inputs.includes('\r'), false);
+  assert.deepEqual(marks, ['enter', 'dropped']);
 });
