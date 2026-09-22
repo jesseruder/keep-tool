@@ -2079,7 +2079,13 @@ async function hostRequest(type, params, deps = {}) {
   // A reconnect has its own budget; it must not consume the request's intended
   // response window. The shorter reload window only bounds reconnect/reload churn.
   let deadline = wallNow() + connectBudgetMs + requestTimeoutMs;
-  const idempotent = ['hello', 'list', 'get', 'screen', 'meta'].includes(type);
+  // Every request that only reads the host. `process` and `usage` are reads like the
+  // rest: they ask a node about its own process table and an account's usage and change
+  // nothing. Counting them as mutations made the annotation a listing does for a live
+  // agent pane — a `process` call every 2.5s — clear the memo that outage listing is
+  // built from, so a slow node holding an agent pane dropped off the list entirely
+  // instead of staying on it marked stale.
+  const idempotent = ['hello', 'list', 'get', 'screen', 'meta', 'process', 'usage'].includes(type);
   // A spawn naming an operation id is the one non-idempotent request that may be
   // asked again: the host journals it, so a second ask returns the pane the first
   // one made rather than starting a second process. Everything else keeps the

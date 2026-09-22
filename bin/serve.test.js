@@ -13621,6 +13621,48 @@ test('a node that goes quiet holds up nothing and loses no panes', async (t) => 
   });
 });
 
+test('a node holding an agent pane keeps that pane when it goes quiet', async (t) => {
+  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient, listHostPaneResult, hostRequest } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodes(t, async () => {
+    await closeHostClient();
+    const mute = {
+      socket: { destroyed: false },
+      request: () => new Promise(() => {}),
+      onDisconnect: () => ({ dispose() {} }),
+      close: () => {},
+    };
+    let silent = false;
+    const deps = {
+      connectHost: (options) => (silent && options.node === 'aws1' ? Promise.resolve(mute) : connect(options)),
+      hostRemoteListTimeoutMs: 50,
+    };
+    try {
+      const local = (await hostRequest('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 30'] }, deps)).pane;
+      // An agent pane, so listing it asks that node for its process table. That read
+      // used to count as a mutation of the host, which cleared the very memo the
+      // listing then wanted to write — so the node's panes were never remembered,
+      // and the first slow refresh dropped them with no stale marker at all.
+      const remote = (await hostRequest('spawn', {
+        cmd: '/bin/sh', args: ['-c', 'sleep 30'], meta: { sessionId: 'agent-session', agent: 'claude' },
+      }, { ...deps, node: 'aws1' })).pane;
+      // A real budget for the first read: this one pays for the remote process table.
+      assert.equal((await listHostPaneResult({ ...deps, hostRemoteListTimeoutMs: 2000 }, true)).panes.length, 2,
+        'both nodes answered once');
+
+      silent = true;
+      await closeHostClient();
+      const listed = await listHostPaneResult(deps, true);
+      assert.deepEqual(listed.panes.map((pane) => pane.id).sort(), [local.id, remote.id].sort(),
+        'the agent pane is still the last thing that node said');
+      assert.deepEqual(listed.missingNodes, ['aws1']);
+      assert.equal(listed.nodes.aws1.ok, false);
+      assert.equal(listed.nodes.aws1.stale, true);
+    } finally { await closeHostClient(); }
+  });
+});
+
 test('a single-node install publishes no node status and no node column', async () => {
   const { hostPanesForPublish, listHostPaneResult, closeHostClient } = require('./serve');
   const memo = { epoch: 0 };
