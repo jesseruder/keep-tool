@@ -113,12 +113,14 @@ test('frontend preserves public auth and strips spoofed backend identity before 
   assert.equal((await request(f.port, '/api/portable-transfers')).status, 403);
   const response = await request(f.port, '/api/action', {
     method: 'POST', headers: {
-      'x-keep': '1', 'x-keep-proxy-token': 'attacker', 'x-forwarded-for': '127.0.0.1',
+      'x-keep': '1', 'x-keep-proxy-token': 'attacker', 'x-keep-node-token': 'attacker-node',
+      'x-forwarded-for': '127.0.0.1',
     }, body: '{}',
   });
   assert.equal(response.status, 200);
   assert.equal(f.seen.length, 1);
   assert.equal(f.seen[0].headers['x-keep-proxy-token'], 'private-secret');
+  assert.equal(f.seen[0].headers['x-keep-node-token'], undefined, 'nothing through this hop may claim to be a node');
   assert.equal(f.seen[0].headers['x-forwarded-for'], undefined);
   assert.equal(f.seen[0].headers.host, 'keep-private');
 });

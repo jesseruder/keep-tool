@@ -216,6 +216,9 @@ function createUiRequestServer(options = {}) {
     // authenticated by the private per-process token and never needs to see it.
     delete headers.cookie;
     delete headers['x-keep-proxy-token'];
+    // A node speaks to the daemon directly. Nothing that arrives through this
+    // public hop may claim to be one.
+    delete headers['x-keep-node-token'];
     delete headers['x-forwarded-for'];
     delete headers['x-forwarded-host'];
     delete headers['x-forwarded-proto'];

@@ -677,6 +677,51 @@ test('the daemon authorizes tokens and loopback only — a cookie is never autho
   assert.equal(authorized({}), false);
 });
 
+test('every grant is a named principal, and a node token is only an identity where it is accepted', () => {
+  const deps = { isLocal: (addr) => addr === '127.0.0.1', token: 'secret', internalToken: 'private',
+    nodeTokens: { laptop: 'laptop-secret', mini: 'mini-secret' } };
+  const principal = (headers, extra = {}, remoteAddress = '10.0.0.7') => keepConsole.principal(
+    { headers: { host: '10.0.0.4:7777', ...headers }, socket: { remoteAddress } }, { ...deps, ...extra });
+  assert.deepEqual(principal({ 'x-keep-proxy-token': 'private' }), { class: 'proxy' });
+  assert.deepEqual(principal({ host: 'localhost:7777' }, {}, '127.0.0.1'), { class: 'local' });
+  assert.deepEqual(principal({ 'x-keep-token': 'secret' }), { class: 'admin' });
+  assert.equal(principal({}), null);
+  assert.equal(principal({ 'x-keep-token': 'wrong' }), null);
+
+  assert.equal(principal({ 'x-keep-node-token': 'laptop-secret' }), null,
+    'a node token is refused where nodes are not accepted');
+  assert.deepEqual(principal({ 'x-keep-node-token': 'laptop-secret' }, { acceptNodeTokens: true }),
+    { class: 'node', node: 'laptop' });
+  assert.deepEqual(principal({ 'x-keep-node-token': 'mini-secret' }, { acceptNodeTokens: true }),
+    { class: 'node', node: 'mini' });
+  assert.equal(principal({ 'x-keep-node-token': 'wrong' }, { acceptNodeTokens: true }), null);
+  assert.equal(principal({}, { acceptNodeTokens: true, nodeTokens: { laptop: '' } }), null,
+    'an empty token file grants nothing');
+
+  // authorized() is the same three grants it has always been.
+  const authorized = (headers, extra = {}) => keepConsole.authorized(
+    { headers: { host: '10.0.0.4:7777', ...headers }, socket: { remoteAddress: '10.0.0.7' } }, { ...deps, ...extra });
+  assert.equal(authorized({ 'x-keep-token': 'secret' }), true);
+  assert.equal(authorized({ 'x-keep-node-token': 'laptop-secret' }), false);
+  assert.equal(authorized({ 'x-keep-node-token': 'laptop-secret' }, { acceptNodeTokens: true }), true);
+});
+
+test('a route answers only the principal classes it allows', () => {
+  const { routeAllows, routeDenial, DEFAULT_ALLOW } = require('./serve/routes.js');
+  const open = { path: '/api/state' };
+  const adminOnly = { path: '/api/state', allow: ['admin'] };
+  assert.deepEqual(DEFAULT_ALLOW, ['proxy', 'local', 'admin']);
+  for (const value of ['proxy', 'local', 'admin']) {
+    assert.equal(routeAllows(open, { class: value }), true);
+    assert.equal(routeDenial(open, { class: value }), null);
+  }
+  assert.equal(routeAllows(open, { class: 'node', node: 'laptop' }), false, 'no route is a node\'s to call yet');
+  assert.deepEqual(routeDenial(open, { class: 'node', node: 'laptop' }), { status: 403, error: 'forbidden for node' });
+  assert.deepEqual(routeDenial(adminOnly, { class: 'local' }), { status: 403, error: 'forbidden for local' });
+  assert.equal(routeDenial(adminOnly, { class: 'admin' }), null);
+  assert.deepEqual(routeDenial(open, null), { status: 403, error: 'forbidden for unauthorized' });
+});
+
 test('the cookie parser reads one value and refuses everything shaped like it', () => {
   const read = (header) => keepConsole.cookieValue(header, 'keep-session');
   assert.equal(read('keep-session=abc'), 'abc');

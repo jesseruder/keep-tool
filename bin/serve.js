@@ -85,7 +85,7 @@ const {
 const { createDashboardWorker } = require('./dashboard-worker');
 const { createDashboardPublisher } = require('./dashboard-publisher');
 const { createUiRequestWorker } = require('./ui-request-worker');
-const { routes: buildRequestRoutes, matchRoute } = require('./serve/routes.js');
+const { routes: buildRequestRoutes, matchRoute, routeDenial } = require('./serve/routes.js');
 const { startSchedulers } = require('./serve/schedulers.js');
 const execFileAsync = promisify(execFile);
 const ATTENTION_KINDS = new Set(['question', 'plan', 'permission', 'complete', 'input', 'review', 'blocked', 'overdue', 'unblocked', 'health', 'stalled']);
@@ -11888,6 +11888,8 @@ function start(deps = {}) {
   const isLocal = (addr) => addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 
   const requestRoutes = buildRequestRoutes(ctx);
+  // Read once at boot, like the public token above. Nothing presents one yet.
+  const nodeTokenMap = nodes.nodeTokens(keep.ROOT);
 
   // Phone pushes carry the console's own badge count. Only the daemon has the
   // state it is computed from, so it hands alerts.js a reader for it rather than
@@ -11899,8 +11901,18 @@ function start(deps = {}) {
     try {
       const url = new URL(req.url, 'http://localhost');
 
-      const authError = apiRequestAuthError(req, { isLocal, token, internalToken: backendToken });
+      // Who is asking, resolved once. `acceptNodeTokens` is false: the daemon has
+      // no route a node may call yet, so a node token is not an identity here.
+      const auth = { isLocal, token, internalToken: backendToken, nodeTokens: nodeTokenMap, acceptNodeTokens: false };
+      const authError = apiRequestAuthError(req, auth);
       if (authError) return json(res, authError.status, { error: authError.error });
+      const principal = keepConsole.principal(req, auth);
+      const forbidden = (route) => {
+        const denial = routeDenial(route, principal);
+        if (!denial) return false;
+        json(res, denial.status, { error: denial.error });
+        return true;
+      };
 
       if (req.method === 'POST') {
         // custom header forces a CORS preflight, which no other origin passes —
@@ -11909,7 +11921,10 @@ function start(deps = {}) {
         try { body = await readBody(req); } catch (e) { return json(res, 400, { error: e.message }); }
         try {
           const route = matchRoute(requestRoutes, { req, url, body });
-          if (route) return await route.handle({ req, res, url, body });
+          if (route) {
+            if (forbidden(route)) return;
+            return await route.handle({ req, res, url, body, principal });
+          }
           return json(res, 404, { error: 'not found' });
         } catch (e) {
           if (e instanceof keep.KeepError) return json(res, 400, { error: e.message });
@@ -11918,7 +11933,10 @@ function start(deps = {}) {
       }
 
       const route = matchRoute(requestRoutes, { req, url });
-      if (route) return await route.handle({ req, res, url });
+      if (route) {
+        if (forbidden(route)) return;
+        return await route.handle({ req, res, url, principal });
+      }
       res.writeHead(404);
       res.end('not found');
     } catch (e) {

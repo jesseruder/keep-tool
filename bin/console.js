@@ -64,10 +64,31 @@ function cookieValue(header, name) {
   return '';
 }
 
+// Who is asking, or null for nobody. The three grants that have always let a
+// request in are named rather than collapsed into a boolean, so a route can
+// require more than "authorized": the frontend worker's private per-process
+// token ('proxy'), a loopback client asking for a loopback host ('local'), and
+// the public bearer token from .keep/token ('admin').
+//
+// A node token is the fourth, and the only one a route has to opt into: it names
+// a machine that connects to the daemon, and it is honoured only where
+// `acceptNodeTokens` is explicitly true, so a listener that has not thought
+// about nodes cannot be entered with one.
+function principal(req, deps) {
+  if (tokenMatches(req.headers['x-keep-proxy-token'], deps.internalToken)) return { class: 'proxy' };
+  if (deps.isLocal(req.socket.remoteAddress) && localHost(req.headers.host)) return { class: 'local' };
+  if (tokenMatches(req.headers['x-keep-token'], deps.token)) return { class: 'admin' };
+  if (deps.acceptNodeTokens === true) {
+    const presented = req.headers['x-keep-node-token'];
+    for (const [node, token] of Object.entries(deps.nodeTokens || {})) {
+      if (tokenMatches(presented, token)) return { class: 'node', node };
+    }
+  }
+  return null;
+}
+
 function authorized(req, deps) {
-  return tokenMatches(req.headers['x-keep-proxy-token'], deps.internalToken)
-    || (deps.isLocal(req.socket.remoteAddress) && localHost(req.headers.host))
-    || tokenMatches(req.headers['x-keep-token'], deps.token);
+  return Boolean(principal(req, deps));
 }
 
 function writeDenied(res) {
@@ -412,5 +433,5 @@ function install(input) {
 
 module.exports = {
   VENDOR, install, validateLayouts, readLayouts, writeLayouts,
-  sameOrigin, upgradeOriginAllowed, authorized, tokenMatches, cookieValue, staticPath, serveFile,
+  sameOrigin, upgradeOriginAllowed, authorized, principal, tokenMatches, cookieValue, staticPath, serveFile,
 };

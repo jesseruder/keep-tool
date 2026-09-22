@@ -926,4 +926,22 @@ function matchRoute(list, { req, url, body }) {
   return null;
 }
 
-module.exports = { routes, matchRoute };
+// The classes a route answers when it names none. A node is never among them:
+// no route is a node's to call yet, and a route that becomes one says so with
+// its own `allow`.
+const DEFAULT_ALLOW = ['proxy', 'local', 'admin'];
+
+function routeAllows(route, principal) {
+  if (!principal) return false;
+  return (route.allow || DEFAULT_ALLOW).includes(principal.class);
+}
+
+// The 403 a dispatcher answers with, or null when the principal may proceed. The
+// class is named so a refusal reads as "you are the wrong caller", not "your
+// token is wrong".
+function routeDenial(route, principal) {
+  if (routeAllows(route, principal)) return null;
+  return { status: 403, error: `forbidden for ${principal ? principal.class : 'unauthorized'}` };
+}
+
+module.exports = { routes, matchRoute, routeAllows, routeDenial, DEFAULT_ALLOW };
