@@ -2016,6 +2016,22 @@ async function requestHostClient(client, type, params, deps = {}) {
   }
 }
 
+// Whether the host on this node journals spawn operations, and so may be asked the
+// same spawn twice. Consulted only on the failure path: the happy path must not pay
+// a round trip for a capability it does not need, and a single-node install must go
+// on sending exactly the frames it always sent.
+async function hostJournalsSpawns(node, deps = {}, channel = 'control') {
+  try {
+    const client = await hostClientFor(node, deps, channel);
+    if (!client) return false;
+    if (client.descriptor && typeof client.descriptor.spawnReceipts === 'boolean') {
+      return client.descriptor.spawnReceipts === true;
+    }
+    const hello = await requestHostClient(client, 'hello', {}, deps);
+    return Boolean(hello && hello.spawnReceipts === true);
+  } catch { return false; }
+}
+
 async function hostRequest(type, params, deps = {}) {
   const wallNow = deps.wallNow || Date.now;
   const retryMs = deps.hostReloadRetryMs == null ? HOST_RELOAD_RETRY_MS : deps.hostReloadRetryMs;
@@ -2023,8 +2039,14 @@ async function hostRequest(type, params, deps = {}) {
   const connectBudgetMs = deps.hostConnectTimeoutMs == null ? HOST_CONNECT_TIMEOUT_MS : deps.hostConnectTimeoutMs;
   // A reconnect has its own budget; it must not consume the request's intended
   // response window. The shorter reload window only bounds reconnect/reload churn.
-  const deadline = wallNow() + connectBudgetMs + requestTimeoutMs;
+  let deadline = wallNow() + connectBudgetMs + requestTimeoutMs;
   const idempotent = ['hello', 'list', 'get', 'screen', 'meta'].includes(type);
+  // A spawn naming an operation id is the one non-idempotent request that may be
+  // asked again: the host journals it, so a second ask returns the pane the first
+  // one made rather than starting a second process. Everything else keeps the
+  // never-retry rule, and a spawn without an id keeps it too.
+  const journalledSpawn = type === 'spawn' && typeof params?.operationId === 'string' && params.operationId;
+  let spawnRetryAllowed = false;
   // A qualified pane names the node it lives on, so every existing call site that
   // passes target.pane routes to the right host without knowing nodes exist. A bare
   // pane is the daemon node's, and its params object is passed through untouched.
@@ -2074,7 +2096,7 @@ async function hostRequest(type, params, deps = {}) {
       const detail = String(state.failureError && state.failureError.message || '').trim();
       const error = new Error(pressure.annotate(`terminal host is unavailable${detail ? `: ${detail}` : ''}`),
         state.failureError ? { cause: state.failureError } : undefined);
-      if (!idempotent) throw notRetried('was unavailable', error);
+      if (!idempotent && !spawnRetryAllowed) throw notRetried('was unavailable', error);
       retryDeadline = Math.min(retryDeadline, wallNow() + retryMs);
       if (wallNow() >= deadline || wallNow() >= retryDeadline) throw error;
       forceHostReconnect = true;
@@ -2114,9 +2136,17 @@ async function hostRequest(type, params, deps = {}) {
       const timedOut = hostRequestTimedOut(error);
       if (disconnected) invalidateHost(client, deps, error);
       if (!reloading && !disconnected && !timedOut) throw error;
-      if (!idempotent) {
-        const reason = reloading ? 'was reloading' : timedOut ? 'timed out' : 'disconnected';
-        throw notRetried(reason, error);
+      if (!idempotent && !spawnRetryAllowed) {
+        // Asked here rather than before the request, so the capability costs a round
+        // trip only on the failure it would rescue.
+        if (journalledSpawn) spawnRetryAllowed = await hostJournalsSpawns(node, deps, channel);
+        // The replay gets a budget of its own: the attempt that failed has already
+        // spent this one, and a receipt is answered at once.
+        if (spawnRetryAllowed) deadline = wallNow() + connectBudgetMs + requestTimeoutMs;
+        if (!spawnRetryAllowed) {
+          const reason = reloading ? 'was reloading' : timedOut ? 'timed out' : 'disconnected';
+          throw notRetried(reason, error);
+        }
       }
       if (timedOut && timeoutRetries++ >= 1) throw error;
       if (reloading || disconnected) retryDeadline = Math.min(retryDeadline, wallNow() + retryMs);
@@ -8636,6 +8666,15 @@ async function openSession(body, deps = {}) {
   const codexFlagArgs = String(codexFlags || '').trim().split(/\s+/).filter(Boolean);
   const launchedAt = (deps.now || Date.now)();
   const openedFor = resolveOpener(body, deps);
+  // Names this launch's spawn to the host, so a reply lost to a timeout or a core
+  // reload can be asked for again instead of starting a second agent on the same
+  // work. An open request id is the caller's own name for the same attempt and is
+  // carried as a digest of itself, because the host's operation ids are 16-128
+  // characters and an open request id may be shorter. One id per invocation: a
+  // retry inside this call is the same operation, a new call is a new one.
+  const spawnOperationId = body.requestId
+    ? `open-${crypto.createHash('sha256').update(String(body.requestId)).digest('hex').slice(0, 32)}`
+    : crypto.randomUUID();
 
   // `inheritedModel` is set only when the launch could not hold the model key and is
   // naming settings.json's model itself; it rides the command line exactly like an
@@ -8691,6 +8730,7 @@ async function openSession(body, deps = {}) {
       process.stderr.write(`keep serve: could not pre-trust ${project} for ${account.id}: ${prepared.trustError}\n`);
     }
     const spawned = await hostRequest('spawn', {
+      operationId: spawnOperationId,
       cmd: '/bin/zsh',
       args: ['-lic', `exec ${prepared.command}`],
       // A resume of a recorded repair session re-earns the marker; a fresh launch

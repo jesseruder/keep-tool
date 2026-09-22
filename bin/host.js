@@ -95,6 +95,45 @@ function rememberInputReceipt(pane, id, fingerprint, result) {
   while (pane.inputReceipts.size > INPUT_RECEIPT_LIMIT) pane.inputReceipts.delete(pane.inputReceipts.keys().next().value);
 }
 
+// Key order is not part of what a caller asked for, and a retry that rebuilt its
+// env or meta in another order is still the same request.
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (!value || typeof value !== 'object') return value === undefined ? null : value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableValue(value[key])]));
+}
+
+// A spawn is the one request that cannot be retried blind: a lost reply leaves a
+// process running that the caller does not know about, and asking again starts a
+// second one. The journal is the host's, not a pane's, because at the moment the
+// operation is named there is no pane yet.
+function spawnOperationFingerprint(params) {
+  return crypto.createHash('sha256').update(JSON.stringify([
+    String(params.cmd || ''),
+    (params.args == null ? [] : params.args).map(String),
+    params.cwd == null ? null : String(params.cwd),
+    params.cols === undefined ? null : params.cols,
+    params.rows === undefined ? null : params.rows,
+    stableValue(params.env),
+    stableValue(params.meta),
+  ])).digest('hex');
+}
+
+function spawnReceiptMap(value) {
+  const receipts = new Map();
+  if (value == null) return receipts;
+  if (!Array.isArray(value) || value.length > INPUT_RECEIPT_LIMIT) throw new Error('invalid spawn receipts in host handoff');
+  for (const item of value) {
+    if (!item || !INPUT_OPERATION_PATTERN.test(String(item.id || ''))
+        || !/^[a-f0-9]{64}$/.test(String(item.fingerprint || ''))
+        || !PANE_ID_PATTERN.test(String(item.paneId || ''))) {
+      throw new Error('invalid spawn receipt in host handoff');
+    }
+    receipts.set(String(item.id), { fingerprint: String(item.fingerprint), paneId: String(item.paneId) });
+  }
+  return receipts;
+}
+
 class RingBuffer {
   constructor(maxBytes = DEFAULT_BUFFER_BYTES) {
     if (!Number.isFinite(Number(maxBytes)) || Number(maxBytes) < 0) {
@@ -522,6 +561,10 @@ function createHost(options = {}) {
     }
   }
   const panes = new Map();
+  // One journal for the whole host, carried across a core reload with the panes it
+  // names: a caller retrying a spawn after a lost reply has to reach the same
+  // answer whether or not the code swapped underneath it.
+  const spawnReceipts = spawnReceiptMap(adopt && adopt.spawnReceipts);
   const connections = new Set();
   const subscribers = new Set();
   const server = net.createServer();
@@ -1063,6 +1106,9 @@ function createHost(options = {}) {
         return { result: {
           version: 1, replaceExited: true, guardedKill: true, compactScreen: true, guardedInput: true,
           guardedInputReceipts: true,
+          // spawnReceipts: a spawn naming an operationId is journalled, so a caller
+          // whose reply was lost may ask again instead of starting a second process.
+          spawnReceipts: true,
           bootVersion: options.boot && options.boot.version || null,
           panes: panes.size, pid: process.pid, sock,
           residentTerminals: [...panes.values()].filter((pane) => pane.term).length,
@@ -1085,7 +1131,26 @@ function createHost(options = {}) {
           ...(tcpError ? { listenError: tcpError.message } : {}),
         } };
       case 'spawn': {
+        if (params.operationId === undefined) {
+          const pane = spawnPane(params);
+          return { result: { pane: publicPane(pane) } };
+        }
+        const operationId = String(params.operationId || '');
+        if (!INPUT_OPERATION_PATTERN.test(operationId)) throw new Error('invalid spawn operation id');
+        const fingerprint = spawnOperationFingerprint(params);
+        const prior = spawnReceipts.get(operationId);
+        if (prior) {
+          // The same operation, asked again: the answer is the pane it already
+          // made, read live so alive, pid and the rest describe it now rather than
+          // at the moment it started.
+          if (prior.fingerprint !== fingerprint) throw new Error('spawn operation parameters changed');
+          const existing = panes.get(prior.paneId);
+          if (!existing) throw new Error('the pane this spawn operation created no longer exists');
+          return { result: { pane: publicPane(existing) } };
+        }
         const pane = spawnPane(params);
+        spawnReceipts.set(operationId, { fingerprint, paneId: pane.id });
+        while (spawnReceipts.size > INPUT_RECEIPT_LIMIT) spawnReceipts.delete(spawnReceipts.keys().next().value);
         return { result: { pane: publicPane(pane) } };
       }
       case 'prepare-launch': {
@@ -1822,6 +1887,11 @@ function createHost(options = {}) {
         version: 1,
         sock,
         bootId,
+        // Only the receipts whose pane came across: one naming a pane that is gone
+        // could only answer a replay with a refusal, and it would hold a slot.
+        spawnReceipts: [...spawnReceipts]
+          .filter(([, receipt]) => paneRecords.some((pane) => pane.id === receipt.paneId))
+          .map(([id, receipt]) => ({ id, ...receipt })),
         panes: paneRecords,
       };
       } catch (error) {

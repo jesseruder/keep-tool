@@ -13713,3 +13713,81 @@ test('a node list nobody can read protects every remote journal', async (t) => {
     } finally { await closeHostClient(); }
   });
 });
+
+
+test('a spawn whose reply is lost is asked again, and the host answers with the same pane', async (t) => {
+  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient, hostRequest } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodes(t, async ({ main }) => {
+    await closeHostClient();
+    // A host that receives the spawn and runs it, and a reply that never reaches
+    // this daemon: the exact shape a timeout under load takes, and the one that
+    // used to leave a second agent running on the same work.
+    let swallow = true;
+    const dropReply = (client) => ({
+      ...client,
+      request: (type, params, options) => {
+        if (type === 'spawn' && swallow) {
+          swallow = false;
+          client.request(type, params, options).catch(() => {});
+          return new Promise(() => {});
+        }
+        return client.request(type, params, options);
+      },
+      onDisconnect: (listener) => client.onDisconnect(listener),
+      close: () => client.close(),
+    });
+    const deps = {
+      connectHost: async (options) => dropReply(await connect(options)),
+      hostRequestTimeoutMs: 200,
+    };
+    try {
+      const params = {
+        operationId: 'open-lost-reply-000001', cmd: '/bin/sh', args: ['-c', 'sleep 30'],
+        meta: { agent: 'claude', sessionId: 'lost-reply-session' },
+      };
+      const spawned = await hostRequest('spawn', params, deps);
+      assert.ok(spawned.pane.id);
+      assert.equal(main.panes.size, 1, 'the retry answered from the journal; nothing started twice');
+      assert.equal([...main.panes.keys()][0], spawned.pane.id);
+
+      // The rule everything else still lives by: a spawn nobody named cannot be
+      // asked again, because asking again is what starts a second process.
+      swallow = true;
+      await closeHostClient();
+      await assert.rejects(
+        hostRequest('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 30'] }, deps),
+        (error) => error.code === 'host_request_not_retried' && /timed out during non-idempotent spawn/.test(error.message),
+      );
+    } finally { await closeHostClient(); }
+  });
+});
+
+test('every launched pane names its spawn, so a lost reply can be asked about', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-operation-'));
+  try {
+    const host = recordingHost((type) => (type === 'spawn' ? { pane: { id: 'op-pane', pid: 9, createdAt: 9 } } : {}));
+    const deps = { host, listHostPanes: async () => [], waitForHostAgent: async () => true,
+      verifyFreshOpenPane: async () => null, pinSession: () => {}, trustProject: () => true };
+    await openSession({ fresh: true, cwd, agent: 'claude', accountId: 'claude/default' }, deps);
+    const first = host.calls.find((call) => call.type === 'spawn').params.operationId;
+    assert.match(first, /^[A-Za-z0-9_-]{16,128}$/, 'the host accepts ids of this shape');
+
+    host.calls.length = 0;
+    await openSession({ fresh: true, cwd, agent: 'claude', accountId: 'claude/default' }, deps);
+    const second = host.calls.find((call) => call.type === 'spawn').params.operationId;
+    assert.notEqual(second, first, 'a new open is a new operation');
+
+    // An open request id is the caller's own name for one attempt: the same request
+    // twice is the same operation, so a retry of it can never spawn twice.
+    const named = async () => {
+      host.calls.length = 0;
+      await openSession({ fresh: true, cwd, agent: 'claude', accountId: 'claude/default', requestId: 'r1' }, deps);
+      return host.calls.find((call) => call.type === 'spawn').params.operationId;
+    };
+    const once = await named();
+    assert.match(once, /^[A-Za-z0-9_-]{16,128}$/);
+    assert.equal(await named(), once);
+  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+});

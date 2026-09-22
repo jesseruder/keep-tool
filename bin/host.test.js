@@ -2330,3 +2330,93 @@ test('an IPv4-mapped wildcard is the wildcard, under every spelling', async () =
   assert.equal(unmapIpv4('::'), null);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+
+test('a spawn operation is journalled, replays to the same pane, and survives a core reload', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-spawn-receipt-'));
+  const sock = path.join(root, 'host.sock');
+  const first = createHost({ sock, log: null });
+  let active = first;
+  let client;
+  try {
+    await first.listen();
+    client = await connect({ sock });
+    const params = {
+      operationId: 'open-spawn-receipt-0001',
+      cmd: '/bin/sh', args: ['-c', 'sleep 30'], cwd: root, cols: 100, rows: 30,
+      env: { KEEP_TEST: '1' }, meta: { agent: 'claude', sessionId: 'sess-1' },
+    };
+    const { pane } = await client.request('spawn', params);
+    assert.ok(pane.id);
+
+    // The same operation, asked again: the same pane, read live rather than
+    // remembered, and no second process.
+    const replay = await client.request('spawn', { ...params, env: { KEEP_TEST: '1' } });
+    assert.equal(replay.pane.id, pane.id);
+    assert.equal(replay.pane.pid, pane.pid);
+    assert.deepEqual((await client.request('list')).panes.map((entry) => entry.id), [pane.id]);
+
+    // Key order is not part of the request; a different command is.
+    assert.equal((await client.request('spawn', {
+      ...params, meta: { sessionId: 'sess-1', agent: 'claude' },
+    })).pane.id, pane.id);
+    await assert.rejects(client.request('spawn', { ...params, args: ['-c', 'sleep 31'] }),
+      /spawn operation parameters changed/);
+    await assert.rejects(client.request('spawn', { ...params, operationId: 'short' }),
+      /invalid spawn operation id/);
+
+    // An unnamed spawn is journalled by nothing and starts its own pane, as always.
+    const anonymous = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 30'] });
+    assert.notEqual(anonymous.pane.id, pane.id);
+    assert.equal((await client.request('hello')).spawnReceipts, true);
+
+    // The journal rides the handoff: new code, same panes, same answers.
+    const disconnected = new Promise((resolve) => client.onDisconnect(resolve));
+    const record = await first.handoff();
+    await disconnected;
+    assert.deepEqual(record.spawnReceipts.map((receipt) => receipt.id), ['open-spawn-receipt-0001']);
+    assert.equal(record.spawnReceipts[0].paneId, pane.id);
+    active = createHost({ sock, log: null, adopt: record });
+    first.finalizeHandoff();
+    await active.listen();
+    client = await connect({ sock });
+    assert.equal((await client.request('spawn', params)).pane.id, pane.id, 'the replay crosses the reload');
+    await assert.rejects(client.request('spawn', { ...params, cwd: '/tmp' }),
+      /spawn operation parameters changed/);
+    assert.equal((await client.request('list')).panes.length, 2);
+
+    // A receipt naming a pane that is gone answers with a refusal, never a spawn.
+    await client.request('kill', { pane: pane.id, signal: 'SIGKILL' });
+    await waitFor(async () => (await client.request('get', { pane: pane.id })).pane.alive === false, 'the pane to exit');
+    await client.request('remove', { pane: pane.id });
+    await assert.rejects(client.request('spawn', params), /no longer exists/);
+    assert.equal((await client.request('list')).panes.length, 1, 'a lost receipt does not start a replacement');
+
+    // And a receipt with no pane does not travel to the next core.
+    const second = await active.handoff();
+    assert.deepEqual(second.spawnReceipts, []);
+    active.finalizeHandoff();
+  } finally {
+    if (client) client.close();
+    await active.close().catch(() => {});
+    if (active !== first) await first.close().catch(() => {});
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a host handoff record with a spawn receipt that makes no sense is refused', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-spawn-receipt-bad-'));
+  const sock = path.join(dir, 'host.sock');
+  const base = { version: 1, sock, panes: [] };
+  for (const receipt of [
+    { id: 'short', fingerprint: 'a'.repeat(64), paneId: 'p1' },
+    { id: 'open-spawn-receipt-0001', fingerprint: 'nope', paneId: 'p1' },
+    { id: 'open-spawn-receipt-0001', fingerprint: 'a'.repeat(64), paneId: 'not a pane id' },
+  ]) {
+    assert.throws(() => createHost({ sock, log: null, adopt: { ...base, spawnReceipts: [receipt] } }),
+      /invalid spawn receipt in host handoff/);
+  }
+  assert.throws(() => createHost({ sock, log: null, adopt: { ...base, spawnReceipts: 'no' } }),
+    /invalid spawn receipts in host handoff/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
