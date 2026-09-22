@@ -600,6 +600,22 @@ test('a forced stop lost mid-way is recovered only once every process it signall
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('a forced stop whose capture overflowed never proves itself after the fact', async () => {
+  const f = fixture();
+  try {
+    const tree = [{ pid: 11, pidStart: 'source-start' }];
+    const d = deps(f, { restartSession: async (_body, options) => {
+      options.onForcedStop(tree); options.onForcedStop(tree, { incomplete: true }); d.pane.alive = false;
+      throw new Error('Process tree exceeds force-stop limit or lacks identity');
+    } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', ownerForce: true }, d), /force-stop limit/);
+    assert.equal(handoff.readOne(f.root, f.sid).forcedCaptureIncomplete, true);
+    d.agentProcessRows = async () => [{ pid: 99, pidStart: 'other' }];
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /could not capture every process/);
+    assert.equal(handoff.readOne(f.root, f.sid).sourceStopVerifiedAt, undefined);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('an earlier transfer\'s pane marker does not block proving a later lost stop', async () => {
   const f = fixture();
   try {

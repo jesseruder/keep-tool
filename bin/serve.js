@@ -6346,7 +6346,11 @@ async function forceStopThenResume({ session, pane, identity, resume }, deps = {
       changed = false;
       for (const p of table) {
         if (processes.some((owned) => owned.pid === p.pid) || !processes.some((owned) => same(owned, table.find((q) => q.pid === p.ppid)))) continue;
-        if (!p.pidStart || processes.length >= 256) throw Error('Process tree exceeds force-stop limit or lacks identity');
+        if (!p.pidStart || processes.length >= 256) {
+          const error = Error('Process tree exceeds force-stop limit or lacks identity');
+          error.incompleteCapture = true;
+          throw error;
+        }
         processes.push({ pid: p.pid, pidStart: p.pidStart }); changed = true;
       }
     }
@@ -6365,7 +6369,13 @@ async function forceStopThenResume({ session, pane, identity, resume }, deps = {
   for (const name of ['SIGTERM', 'SIGKILL']) {
     const table = await rows();
     // Anything newly captured is journalled before it is signalled, so recovery waits for it too.
-    if (grow(table)) await deps.onForcedStop?.(processes.map((p) => ({ ...p })));
+    // A capture that could not finish is journalled as incomplete, which recovery never accepts.
+    let grew;
+    try { grew = grow(table); } catch (error) {
+      if (error.incompleteCapture) await deps.onForcedStop?.(processes.map((p) => ({ ...p })), { incomplete: true });
+      throw error;
+    }
+    if (grew) await deps.onForcedStop?.(processes.map((p) => ({ ...p })));
     for (const old of [...processes].reverse()) {
       const current = table.find((p) => p.pid === old.pid);
       if (same(current, old) && !current.zombie) await signal(old.pid, name);

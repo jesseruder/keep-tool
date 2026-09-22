@@ -11446,6 +11446,20 @@ test('an Owner-forced restart signals only the captured process tree and resumes
     assert.deepEqual(journals, [[10, 11, 12], [10, 11, 12, 14]]);
     assert.ok(state.signals.some(([pid]) => pid === 14));
 
+    // A tree that outgrows the capture is journalled as incomplete before the stop fails.
+    Object.assign(state, { live: new Set([10, 11, 12]), calls: [], signals: [] });
+    const marks = [];
+    let rounds = 0;
+    const flooding = deps({ ownerForce: true, onForcedStop: (processes, options) => marks.push({ n: processes.length, incomplete: options?.incomplete === true }),
+      forceRows: async () => {
+        const base = table();
+        if (++rounds < 2) return base;
+        return [...base, ...Array.from({ length: 300 }, (_, i) => ({ pid: 1000 + i, ppid: 12, pidStart: `s${i}`, args: 'spawned' }))];
+      } });
+    await assert.rejects(restartSession(body, flooding), /force-stop limit/);
+    assert.equal(marks.at(-1).incomplete, true);
+    assert.equal(marks.at(-1).n, 256);
+
     // The pane relaunched after it was inspected: nothing may be signalled.
     Object.assign(state, { live: new Set([10, 11, 12]), calls: [], signals: [] });
     let reads = 0;

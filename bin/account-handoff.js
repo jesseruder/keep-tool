@@ -167,6 +167,10 @@ async function verifySourceStopAfterTheFact(current, pane, deps, root) {
   if (rows.some((row) => row && row.pid === current.sourceAgentPid && row.pidStart === current.sourceAgentPidStart)) {
     throw new Error('Source agent is still running although its pane exited; recovery is blocked');
   }
+  // A forced stop that could not capture its whole tree cannot prove it stopped all of it.
+  if (current.forcedCaptureIncomplete === true) {
+    throw new Error('The forced stop could not capture every process; recovery is blocked');
+  }
   // A forced stop names every process it signalled; a child that outlived the agent could
   // still be writing the conversation that is about to be copied.
   if (Array.isArray(current.forcedProcesses) && rows.some((row) => row && current.forcedProcesses.some((old) =>
@@ -884,6 +888,8 @@ async function run(body, deps = {}) {
     // nothing about this one.
     delete current.sourceExitEnterAt;
     delete current.sourceExitTypedAt;
+    delete current.forcedProcesses;
+    delete current.forcedCaptureIncomplete;
     // A new stop attempt is forced only if this request is Owner's own; an earlier forced
     // attempt on the same record says nothing about this one.
     if (!ownerForce) delete current.ownerForce;
@@ -940,10 +946,12 @@ async function run(body, deps = {}) {
         // An Owner-forced stop signals the captured process tree instead of typing /exit.
         // Its first signal is this transaction's Enter, and recovery accepts the stop only
         // once every one of these exact processes is gone.
-        onForcedStop: (processes) => {
+        onForcedStop: (processes, { incomplete = false } = {}) => {
           // Called again whenever the captured tree grows; the Enter is the first call.
           current.sourceExitEnterAt ||= Date.now();
-          current.forcedProcesses = processes; writeOne(root, current);
+          current.forcedProcesses = processes;
+          if (incomplete) current.forcedCaptureIncomplete = true;
+          writeOne(root, current);
         },
         onExitEnterDropped: () => { delete current.sourceExitEnterAt; writeOne(root, current); },
         // The agent this preflight actually verified. The restart re-reads `ps` and now
