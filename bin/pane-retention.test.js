@@ -191,6 +191,16 @@ test('the sweep removes at most one batch, oldest first, and says what it deferr
   assert.equal(h.changes(), 1);
 });
 
+test('an infinite batch, as keep pane gc asks for, removes the whole plan', async () => {
+  const retention = require('./pane-retention.js');
+  const panes = Array.from({ length: 30 }, (_, i) => exited(40 - i));
+  const result = retention.plan(panes, { now: Date.now(), env: { KEEP_PANE_RETENTION_BATCH: '2' } });
+  const requests = [];
+  const outcome = await retention.apply(result, async (type, params) => { requests.push([type, params.pane]); }, { batch: Infinity });
+  assert.equal(requests.length, 30, 'every planned pane is asked');
+  assert.equal(outcome.deferred, 0);
+});
+
 test('a refused remove is logged and does not fail the sweep', async () => {
   const panes = [exited(9), exited(8)];
   const h = harness({ panes, refuse: new Set([panes[0].id]) });

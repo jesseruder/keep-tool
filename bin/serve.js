@@ -10368,14 +10368,17 @@ function scanClaudeSessions(options = {}) {
   //
   // Bounded (fresh: false) is for callers that only decide whether to act later and
   // re-read the session they pick before touching it: the auto-compact, limit-resume,
-  // live-ledger, stall, notes, reviewer, turn-watcher and ephemeral-pane ticks. A
+  // live-ledger, stall, reviewer first-look, turn-watcher and ephemeral-pane ticks. A
   // 5 s-stale mtime there costs at most one tick of delay, because the action itself
-  // goes through loadCurrentSession or its own precheck.
+  // goes through loadCurrentSession or its own precheck. The notes sweep stays fresh:
+  // it hands a note to Owner for good when the author is absent.
   //
   // Fresh is for a path that acts on a named session now (restart, close, account
-  // and portable handoff inspection, delivery, resolveSessionId, tell, restore): it
-  // must not miss a transcript that exists or read one a turn behind. It stays the
-  // default outside the dashboard, so a caller nobody classified keeps it.
+  // and portable handoff inspection, delivery, restore): it must not miss a
+  // transcript that exists or read one a turn behind. It stays the default outside
+  // the dashboard, so a caller nobody classified keeps it. resolveSessionId and a dry
+  // tell reuse sessionSnapshot when it is under 5 s old, whichever scan wrote it, as
+  // they did with dashboard builds before scans had a mode.
   const fresh = typeof options.fresh === 'boolean' ? options.fresh : options.dashboard !== true;
   const transcriptRows = claudeTranscriptIndex.scan({ fresh });
   if (typeof options.onTranscriptRows === 'function') options.onTranscriptRows(transcriptRows, { fresh });

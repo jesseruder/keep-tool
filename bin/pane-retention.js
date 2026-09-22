@@ -254,7 +254,8 @@ function describe(result, outcome = {}) {
 // A refused remove (the pane came back to life, or was replaced) is reported and
 // left for the next sweep to decide afresh.
 async function apply(result, hostRequest, options = {}) {
-  const limit = Number.isFinite(options.batch) ? options.batch : result.config.batch;
+  // Infinity is a valid batch: a manual `keep pane gc` asks for the whole plan.
+  const limit = typeof options.batch === 'number' && options.batch > 0 ? options.batch : result.config.batch;
   const chosen = result.remove.slice(0, limit);
   const removed = [];
   const refused = [];

@@ -236,8 +236,6 @@ function knownClaudeFile(sessionId, accountId, env = process.env) {
   return null;
 }
 
-// Which configured Claude account a transcript path belongs to, from its projects
-// root alone. No walk: the file is already in hand.
 // The session's transcript in one account under a given project directory name,
 // if it is there: one stat, no walk. An account handoff copies a transcript into
 // the same project directory under the target account's root.
@@ -248,6 +246,8 @@ function claudeFileInAccount(sessionId, accountId, projectName, env = process.en
   try { return fs.statSync(file).isFile() ? file : null; } catch { return null; }
 }
 
+// Which configured Claude account a transcript path belongs to, from its projects
+// root alone. No walk: the file is already in hand.
 function claudeAccountForFile(file, env = process.env) {
   const resolved = path.resolve(String(file || ''));
   let best = null;
