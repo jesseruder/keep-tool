@@ -225,7 +225,7 @@ function startSchedulers(ctx) {
     closeIdleSession, companionSnapshot, dashboardBuild, dashboardBuilder, deliverCheckToThread, deliverUnblockToThread,
     deps, discord, driftWakeFromVerdict, envNumber, features, forceRestartSession, fs, health, hostRequest,
     ideas, keep, keepConsole, landed, limitresume, listHostPaneResult, listHostPanes, liveSessionTick,
-    liveTurnIndexSessions, loadCurrentSession, openCheckSession, openSession, path,
+    liveTurnIndexSessions, loadCurrentSession, openCheckSession, openSession, path, pendingCompactSwaps,
     prepareSessionSummary, readLiveSessionLedger, readScreenResult, remoteSession, resolveSessionTarget, restartSession,
     resumeAfterLimit,
     review, reviewDeps, runs, scanSessions, sendToResolvedTarget, sendToSession, sessionSummarySnapshot, slack,
@@ -470,6 +470,19 @@ function startSchedulers(ctx) {
   if (process.env.KEEP_WT_GC === '0') {
     health.record('wt-gc', { disabled: true, detail: 'KEEP_WT_GC=0' });
   } else startWtGcScheduler({ onChange: broadcast });
+  // Exited panes older than a week, or past the cap, leave the host's list: every
+  // state build resolves every pane, dead ones included. Only this node's panes,
+  // and never one a handoff, queued transfer, compaction swap, unsent delivery or
+  // keep-running preference still names. See bin/pane-retention.js.
+  require('../pane-retention.js').startScheduler({
+    root: keep.ROOT,
+    listPanes: () => listHostPanes({}, true),
+    hostRequest,
+    record: health.record,
+    onChange: broadcast,
+    // serve.js owns this reader, and this file may not require serve.js.
+    readers: { compactSwaps: (root) => pendingCompactSwaps(path.join(root, '.keep', 'compact')) },
+  });
   // The daemon watching itself: a failure signature that keeps coming back gets
   // one card, one worktree and one agent. It never restarts this process — that
   // stays Owner's, and `keep hook pre-bash` refuses it from inside the run.

@@ -368,7 +368,7 @@ commands.host = async (argv, deps = {}) => {
 
 commands.pane = async (argv, deps = {}) => {
   const [subcommand, ...rest] = argv;
-  if (!subcommand) die('usage: keep pane <ls|show|new|send|screen|resize|clear|kill|rm|attach> ...');
+  if (!subcommand) die('usage: keep pane <ls|show|new|send|screen|resize|clear|kill|rm|gc|attach> ...');
   if (subcommand === 'attach') return commands.attach(rest, deps);
   const clients = nodeClients(deps);
   try {
@@ -449,13 +449,39 @@ commands.pane = async (argv, deps = {}) => {
       if (rest.length !== 1) die(`usage: keep pane ${subcommand} <pane>`);
       const target = await resolvePaneTarget(clients, rest[0]);
       await target.client.request(subcommand === 'rm' ? 'remove' : 'clear', { pane: target.id });
+    } else if (subcommand === 'gc') {
+      const o = parseArgs(rest, { 'dry-run': 'bool', days: 'str', max: 'str' });
+      if (o._.length) die('usage: keep pane gc [--dry-run] [--days N] [--max N]');
+      // The daemon's retention sweep, run now: the same plan, against this node's
+      // own host (the daemon node's socket), so another node's panes never appear.
+      const retention = require('../pane-retention.js');
+      const limits = {};
+      if (o.days != null) limits.days = hostNumber(o.days, '--days');
+      if (o.max != null) limits.max = hostNumber(o.max, '--max');
+      const client = await clients.get(null);
+      const { panes } = await client.request('list');
+      const root = deps.root || registryRoot();
+      if (!root) die('keep pane gc needs the Keep registry: its guards are read from <keep>/.keep');
+      const result = retention.plan(panes, { ...limits, now: deps.now, guards: retention.readGuards(root, deps.readers) });
+      for (const failure of result.failures) process.stderr.write(`keep: could not read ${failure.reader}: ${failure.error}\n`);
+      const date = (entry) => new Date(entry.exitedMs).toISOString().slice(0, 10);
+      for (const entry of result.decisions) {
+        console.log(entry.action === 'remove'
+          ? `remove ${entry.pane} ${entry.agent} exited ${date(entry)} ${entry.reason}`
+          : `keep ${entry.pane} ${entry.reason}`);
+      }
+      if (o['dry-run']) return;
+      // A manual run is not held to the sweep's batch: the operator asked for all of it.
+      const outcome = await retention.apply(result, (type, params) => client.request(type, params), { batch: Infinity });
+      for (const entry of outcome.refused) process.stderr.write(`keep: could not remove ${entry.pane}: ${entry.error}\n`);
+      console.log(retention.describe(result, outcome));
     } else if (subcommand === 'kill') {
       const o = parseArgs(rest, { signal: 'str' });
       if (o._.length !== 1) die('usage: keep pane kill <pane> [--signal SIG]');
       const target = await resolvePaneTarget(clients, o._[0]);
       await target.client.request('kill', { pane: target.id, ...(o.signal ? { signal: o.signal } : {}) });
     } else {
-      die('usage: keep pane <ls|show|new|send|screen|resize|clear|kill|rm|attach> ...');
+      die('usage: keep pane <ls|show|new|send|screen|resize|clear|kill|rm|gc|attach> ...');
     }
   } catch (error) {
     if (error instanceof KeepError) throw error;

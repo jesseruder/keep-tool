@@ -2525,6 +2525,40 @@ a freed tree has nothing to survive into, so it is removed at once. `--dry-run` 
 table without changing anything. `keep serve` runs this sweep daily; set
 `KEEP_WT_GC=0` to disable it.
 
+## Exited-pane retention
+
+The terminal host keeps a pane after its process exits, so its screen can still be
+read and the session reopened in place. It keeps it until something removes it, and
+for agent panes nothing used to: one morning the host held 264 panes with 18 alive,
+144 of them exited a week or two earlier, and every daemon state build resolves every
+pane, dead ones included.
+
+`keep serve` now sweeps them, ten minutes after it starts and hourly after that. A
+pane is a candidate when it has exited, it is on this machine (another node's panes
+are that node's to keep), and it is a `claude`, `codex`, `pi` or shell pane — a
+pane launched with no agent counts as a shell. A candidate is removed when it exited
+more than `KEEP_PANE_RETENTION_DAYS` days ago (default 7), or when there are more
+than `KEEP_PANE_RETENTION_MAX` exited candidates (default 60), oldest first down to
+the cap. The cap never takes a pane that exited within the last hour: that can be a
+restart between stopping the agent and relaunching it. A sweep removes at most
+`KEEP_PANE_RETENTION_BATCH` panes (default 25), one host request at a time, and
+leaves the rest for the next hour; a remove the host refuses is logged and decided
+again next time.
+
+It never removes a pane that something still needs: a session marked keep-running,
+an account handoff that has not reached `done` or `failed` (a handoff resumes into
+the exited pane itself), a queued transfer, a pending compaction swap, or an unsent
+delivery journal for that pane (the send path settles those). If any of those
+records cannot be read, the sweep removes nothing and says which one in its health
+row. The `pane-retention` row reads like `removed 3 of 41 exited (aged 2, over cap
+1), kept 5 (handoff 1, keep-running 4)`.
+
+`keep pane gc --dry-run` prints the same decisions against the live pane list —
+`remove <pane> <agent> exited <date> <reason>` or `keep <pane> <reason>` — without
+removing anything; without `--dry-run` it removes them all at once, with no batch
+limit. `--days N` and `--max N` override the two limits for that run. Set
+`KEEP_PANE_RETENTION=0` to disable the sweep.
+
 ## Fleet reviewer
 
 ### Running it
