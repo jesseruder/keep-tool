@@ -13304,7 +13304,7 @@ test('an other-session transcript too long to verify skips the settings write', 
   }
 });
 
-test('a session that runs on another node cannot be opened from this daemon node', async (t) => {
+test('a session that runs on another node is opened there, and never moved by asking', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-node-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const configDir = path.join(root, 'claude');
@@ -13317,22 +13317,118 @@ test('a session that runs on another node cannot be opened from this daemon node
   const session = { id: 'far-session', kind: 'claude', project: root, accountId: 'node-open' };
   const accountStore = require('./accounts');
   accountStore.pinSession(session.id, 'claude', 'node-open', { root, env, node: 'laptop' });
-  const deps = { root, env, scanSessions: () => [session], resolveSessionTarget: async () => ({ pane: 'pane-1' }) };
+  const targets = [];
+  const deps = { root, env, scanSessions: () => [session],
+    placementNodes: ['main', 'laptop'],
+    resolveSessionTarget: async (resolved, hint, callDeps) => { targets.push(callDeps.node); return { pane: 'pane-1' }; } };
 
-  await assert.rejects(openSession({ sessionId: session.id }, deps), (error) => error.status === 409
-    && /runs on node laptop; this daemon node cannot open it here/.test(error.message));
+  // Where it runs is where it runs. Asking for this machine instead is refused —
+  // a session is not moved by opening it.
+  await assert.rejects(openSession({ sessionId: session.id, node: 'main' }, deps), (error) => error.status === 409
+    && /^session .* runs on node laptop$/.test(error.message));
   const authorityFile = path.join(root, '.keep', 'session-accounts', 'far-session.json');
-  const bytes = fs.readFileSync(authorityFile, 'utf8');
+  assert.equal(JSON.parse(fs.readFileSync(authorityFile, 'utf8')).node, 'laptop',
+    'the refusal is what keeps the record honest: nothing pinned it back to this node');
 
-  // The refusal is what keeps the record honest: nothing pinned it back to this node.
-  assert.equal(JSON.parse(bytes).node, 'laptop');
-  accountStore.pinSession(session.id, 'claude', 'node-open', { root, env, node: 'main', transferNode: true });
+  // Asking for nothing in particular routes it to the node it lives on.
   const opened = await openSession({ sessionId: session.id }, deps);
   assert.equal(opened.pane, 'pane-1');
-  assert.equal(JSON.parse(fs.readFileSync(authorityFile, 'utf8')).node, 'main',
+  assert.equal(JSON.parse(fs.readFileSync(authorityFile, 'utf8')).node, 'laptop',
     'an ordinary reopen leaves the node it found');
+
+  // And a session recorded here opens here, exactly as it always did.
+  accountStore.pinSession(session.id, 'claude', 'node-open', { root, env, node: 'main', transferNode: true });
+  assert.equal((await openSession({ sessionId: session.id, node: 'main' }, deps)).pane, 'pane-1');
+  assert.equal(JSON.parse(fs.readFileSync(authorityFile, 'utf8')).node, 'main');
 });
 
+test('placement answers where a session runs, and says so when nowhere will do', () => {
+  const { resolvePlacement } = require('./serve');
+  const fleet = {
+    placementNodes: [
+      { name: 'main', capabilities: [] },
+      { name: 'aws1', capabilities: ['build'] },
+      { name: 'mini', capabilities: ['build', 'browser', 'ios'] },
+    ],
+    placement: { default: 'aws1', projects: { '~/castle/ghost-server': 'mini' } },
+  };
+
+  // A session that exists runs where it runs.
+  assert.equal(resolvePlacement({ pinned: 'aws1' }, fleet), 'aws1');
+  assert.equal(resolvePlacement({ pinned: 'aws1', node: 'aws1' }, fleet), 'aws1');
+  const moved = (() => { try { resolvePlacement({ pinned: 'aws1', node: 'mini', label: 'session s1' }, fleet); return null; }
+    catch (error) { return error; } })();
+  assert.equal(moved.status, 409);
+  assert.equal(moved.message, 'session s1 runs on node aws1');
+
+  // A fresh one: what the caller asked for, then where the card last ran, then the
+  // project, then the default, then the daemon node.
+  assert.equal(resolvePlacement({ node: 'mini' }, fleet), 'mini');
+  assert.equal(resolvePlacement({ lastCardNode: 'mini', project: '~/castle/ghost-server' }, fleet), 'mini');
+  assert.equal(resolvePlacement({ lastCardNode: 'aws1', project: '~/castle/ghost-server' }, fleet), 'aws1');
+  assert.equal(resolvePlacement({ lastCardNode: null }, fleet), 'main',
+    'a card entry written before nodes existed names the daemon node');
+  assert.equal(resolvePlacement({ project: '~/castle/ghost-server' }, fleet), 'mini');
+  assert.equal(resolvePlacement({ project: '~/other' }, fleet), 'aws1');
+  assert.equal(resolvePlacement({}, { placementNodes: fleet.placementNodes }), 'main',
+    'nothing configured, nothing asked: the daemon node');
+
+  // A capability the work needs is a requirement of the machine it lands on.
+  assert.equal(resolvePlacement({ needs: ['build'] }, fleet), 'aws1', 'the default already has it');
+  assert.equal(resolvePlacement({ needs: ['browser'] }, fleet), 'mini',
+    'a choice nobody made may be moved to a node that can do the work');
+  assert.equal(resolvePlacement({ lastCardNode: 'aws1', needs: ['ios'] }, fleet), 'mini');
+  const named = (() => { try { resolvePlacement({ node: 'aws1', needs: ['browser'] }, fleet); return null; }
+    catch (error) { return error; } })();
+  assert.equal(named.status, 409);
+  assert.equal(named.message, 'node aws1 does not have browser');
+  const pinnedShort = (() => { try { resolvePlacement({ pinned: 'aws1', needs: ['ios'] }, fleet); return null; }
+    catch (error) { return error; } })();
+  assert.equal(pinnedShort.message, 'node aws1 does not have ios',
+    'a session is told what its own machine cannot do, not quietly moved off it');
+  const nowhere = (() => { try { resolvePlacement({ needs: ['android'] }, fleet); return null; }
+    catch (error) { return error; } })();
+  assert.equal(nowhere.status, 409);
+  assert.equal(nowhere.message, 'no configured node has android');
+  const together = (() => { try { resolvePlacement({ needs: ['browser', 'build'] }, {
+    placementNodes: [{ name: 'main', capabilities: ['browser'] }, { name: 'aws1', capabilities: ['build'] }],
+  }); return null; } catch (error) { return error; } })();
+  assert.equal(together.message, 'no configured node has browser and build');
+});
+
+test('a card tag that names a machine capability is a placement pin', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-tag-'));
+  try {
+    const host = recordingHost((type) => (type === 'spawn' ? { pane: { id: 'tag-pane', pid: 3, createdAt: 3 } } : {}));
+    const deps = {
+      host, listHostPanes: async () => [], waitForHostAgent: async () => true,
+      pinSession: () => {}, trustProject: () => true, linkLaunchedSession: () => true,
+      placementNodes: [{ name: 'main', capabilities: [] }, { name: 'mini', capabilities: ['browser'] }],
+      loadTask: () => ({ fm: { project: cwd, sessions: [], tags: ['castle', 'browser'] } }),
+    };
+    // Nothing named a node, and the card says the work needs a browser: it lands on
+    // the machine that has one.
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude',
+      accountId: 'claude/default', node: 'main' }, deps), (error) => error.status === 409
+      && error.message === 'node main does not have browser');
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude',
+      accountId: 'claude/default', needs: 'gpu' }, deps), (error) => error.status === 409
+      && error.message === 'no configured node has gpu');
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude',
+      accountId: 'claude/default', node: 'nowhere' }, deps), (error) => error.status === 400
+      && error.message === 'node nowhere is not configured');
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude',
+      accountId: 'claude/default', node: 'Bad Name' }, deps), (error) => error.status === 400
+      && error.message === 'node must be a node name');
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude',
+      accountId: 'claude/default', needs: '  ' }, deps), (error) => error.status === 400
+      && error.message === 'needs must be a capability name');
+    // Pi keeps its events file in this registry, so it stays on the daemon node.
+    await assert.rejects(openSession({ fresh: true, cwd, agent: 'pi', node: 'mini' }, {
+      ...deps, loadTask: undefined, piExtensionReady: true,
+    }), (error) => error.status === 409 && error.message === 'pi sessions run on the daemon node');
+  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+});
 test('the daemon merges two nodes into one pane list and routes by the qualified id', async (t) => {
   const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
   const {
@@ -13870,4 +13966,58 @@ test('every launched pane names its spawn, so a lost reply can be asked about', 
     assert.match(once, /^[A-Za-z0-9_-]{16,128}$/);
     assert.equal(await named(), once);
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+});
+
+
+test('a card opened with --node aws1 runs on aws1, and everything that records it says so', async (t) => {
+  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodes(t, async ({ root, aws1, configFile, config }) => {
+    await closeHostClient();
+    const registry = path.join(root, 'registry');
+    const configDir = path.join(registry, 'claude');
+    const project = path.join(root, 'project');
+    const fakeBin = path.join(root, 'bin');
+    for (const dir of [path.join(registry, 'tasks'), path.join(registry, '.keep'), configDir, project, fakeBin]) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(path.join(fakeBin, 'claude'),
+      '#!/bin/sh\nprintf "fake claude ready\\n"\nwhile IFS= read -r line; do :; done\n', { mode: 0o755 });
+    // One file: an install's config.json holds its accounts and its nodes together,
+    // and a placement is only meaningful read alongside the node list.
+    fs.writeFileSync(configFile, JSON.stringify({ ...config, accounts: [
+      { id: 'claude-node', label: 'Node claude', agent: 'claude', configDir },
+    ], defaultAccounts: { claude: 'claude-node' } }));
+    const env = { KEEP_DIR: registry, KEEP_CONFIG: configFile };
+    const linked = [];
+    try {
+      const opened = await openSession({ taskId: 'card', fresh: true, agent: 'claude', node: 'aws1' }, {
+        root: registry, env, connectHost: connect,
+        loadTask: () => ({ fm: { project, sessions: [] } }),
+        claudeFlags: '',
+        launchEnv: { PATH: `${fakeBin}:${process.env.PATH}` },
+        waitForHostAgent: async () => true,
+        linkLaunchedSession: (cardId, entry) => { linked.push({ cardId, entry }); return true; },
+      });
+      // The pane is on aws1, and it is named the way the whole fleet names it.
+      assert.equal(opened.node, 'aws1', 'the result says where it went');
+      assert.match(opened.pane, /@aws1$/);
+      const paneId = opened.pane.slice(0, opened.pane.lastIndexOf('@'));
+      assert.ok(aws1.panes.has(paneId), 'the pane really is on that host');
+      assert.equal([...(await connect({ node: 'main' }).then(async (client) => {
+        try { return (await client.request('list')).panes; } finally { client.close(); }
+      }))].length, 0, 'and nothing was started here');
+      assert.equal(aws1.panes.get(paneId).meta.node, 'aws1', 'the pane meta records its machine');
+
+      // The account authority and the card entry both name it too, so nothing later
+      // has to guess where this session lives.
+      const authority = path.join(registry, '.keep', 'session-accounts', `${opened.sessionId}.json`);
+      assert.equal(JSON.parse(fs.readFileSync(authority, 'utf8')).node, 'aws1');
+      assert.deepEqual(linked, [{ cardId: 'card', entry: { id: opened.sessionId, agent: 'claude', node: 'aws1' } }]);
+
+      // The shell word was built on aws1, with that machine's own node binary.
+      assert.match(aws1.panes.get(paneId).args.join(' '), /agent-launcher\.js/);
+    } finally { await closeHostClient(); }
+  });
 });

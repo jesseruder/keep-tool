@@ -2944,7 +2944,10 @@ function openedSessionName(result) {
 
 function formatOpenResult(result) {
   const sent = result.sent ? ' (message sent)' : '';
-  if (result.existing && result.pane) return `session ${openedSessionName(result)} is running in pane ${result.pane}; open it in the console${sent}`;
+  // Only when it is not this machine: a single-node install never mentions a node,
+  // because it has never had to.
+  const onNode = result.node ? ` on node ${result.node}` : '';
+  if (result.existing && result.pane) return `session ${openedSessionName(result)} is running in pane ${result.pane}${onNode}; open it in the console${sent}`;
   const session = result.sessionId ? ` as ${openedSessionName(result)}` : '';
   // The account id, not its label: it is what `--account` takes back.
   const on = result.accountId ? ` on ${result.accountId}` : '';
@@ -2954,7 +2957,7 @@ function formatOpenResult(result) {
   const tail = handoff.length ? `; ${handoff.join(', ')}` : '';
   // Only an auto-selected open that had to pass over an account carries a note.
   const note = result.accountNote ? `\n${result.accountNote}` : '';
-  if (result.created === 'pane') return `opened pane ${result.pane}: ${result.command}${session}${on}${sent}${tail}${note}`;
+  if (result.created === 'pane') return `opened pane ${result.pane}${onNode}: ${result.command}${session}${on}${sent}${tail}${note}`;
   return `opened session${session}${on}${sent}${tail}${note}`;
 }
 
@@ -3015,10 +3018,16 @@ function writeOpenHandoff(id, message, task, options = {}) {
 }
 
 commands.open = async (argv, deps = {}) => {
-  const o = parseArgs(argv, { fresh: 'bool', agent: 'str', model: 'str', account: 'str', 'message-file': 'str' });
+  const o = parseArgs(argv, { fresh: 'bool', agent: 'str', model: 'str', account: 'str', 'message-file': 'str', node: 'str', needs: 'str' });
   let id = o._[0];
-  if (!id) die('usage: keep open <card|session-id|#n> [--fresh] [--agent claude|codex|pi] [--account <id>] [--model <id>] [-m "opening message" | --message-file <path>]');
+  if (!id) die('usage: keep open <card|session-id|#n> [--fresh] [--agent claude|codex|pi] [--account <id>] [--model <id>] [--node <name>] [--needs <capability>] [-m "opening message" | --message-file <path>]');
   if (o.agent && !['claude', 'codex', 'pi'].includes(o.agent)) die('agent must be claude, codex, or pi');
+  // Which machine to run on, and what that machine has to be able to do. The daemon
+  // checks both against its own node list; this is only the shape.
+  if (o.node != null && !require('./nodes.js').NODE_NAME_RE.test(o.node)) {
+    die('--node must contain only lowercase letters and digits');
+  }
+  if (o.needs != null && !String(o.needs).trim()) die('--needs needs a capability name');
   // --model goes on the launched command line only (claude --model / codex -m), so it
   // applies to that process and never touches ~/.claude/settings.json.
   if (o.model != null && !PI_MODEL_RE.test(o.model) && !LAUNCH_MODEL_RE.test(o.model)) die('--model must be a model id');
@@ -3052,6 +3061,8 @@ commands.open = async (argv, deps = {}) => {
       if (caller) payload.callerAccountId = caller;
     }
     if (o.model != null) payload.model = o.model;
+    if (o.node != null) payload.node = o.node;
+    if (o.needs != null) payload.needs = String(o.needs).trim();
     if (message != null) payload.message = message;
     // The launching session hands the card over; the daemon unlinks it once the new session is on the card.
     const self = (deps.currentSession || currentSession)();
@@ -3552,7 +3563,8 @@ ${stepUsage()}
   keep probe <id>      # run this card's probe now (exit 1 = failed); no check-in, no daemon
   keep verify <id>     # run this task's check recipe now, in its thread or a fresh session (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)
-  keep open <card|session-id|#n> [--fresh] [--agent claude|codex|pi] [--account <id>] [--model <id>] [-m "opening message" | --message-file <path>]
+  keep open <card|session-id|#n> [--fresh] [--agent claude|codex|pi] [--account <id>] [--model <id>] [--node <name>] [--needs <capability>] [-m "opening message" | --message-file <path>]
+                         # --node runs it on that machine; --needs picks one with that capability
                          # #n is the console's session number (12, #12 and s12 all work);
                          # a fresh launch without --account picks the caller's account, then the
                          # default, skipping accounts that are out of usage;

@@ -907,6 +907,8 @@ async function launchSession(context, deps, say) {
     opened = await deps.openSession({
       fresh: true,
       cwd: tree.path,
+      // An area agent reads and writes this registry, so it runs beside it.
+      node: require('./nodes.js').daemonNode(),
       agent: 'claude',
       accountId: account || undefined,
       model: MODEL,

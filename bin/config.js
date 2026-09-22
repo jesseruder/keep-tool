@@ -49,6 +49,46 @@ function nodeConfig(value = {}) {
   return { nodes, invalid, daemonNode: daemon };
 }
 
+// Where work goes when nobody says. `default` is the node a fresh session lands on,
+// and `projects` names a node per project, keyed by the project exactly as a card
+// writes it. Both must name a configured node: a placement pointing at a machine
+// this install does not have is a launch that would fail at the last moment, so it
+// is refused when the file is read instead.
+function placementConfig(value = {}) {
+  const { nodes } = nodeConfig(value);
+  const placement = value.placement;
+  if (placement === undefined) return { default: null, projects: {} };
+  if (!placement || typeof placement !== 'object' || Array.isArray(placement)) {
+    throw new Error('invalid Keep configuration: placement must be an object');
+  }
+  for (const key of Object.keys(placement)) {
+    if (!['default', 'projects'].includes(key)) throw new Error(`unsupported Keep placement key: ${key}`);
+  }
+  const configured = (name, where) => {
+    if (typeof name !== 'string' || !NODE_NAME_RE.test(name)) {
+      throw new Error(`invalid Keep node name in placement ${where}: ${JSON.stringify(name)}`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(nodes, name)) {
+      throw new Error(`Keep placement ${where} names a node that is not configured: ${name}`);
+    }
+    return name;
+  };
+  const projects = {};
+  if (placement.projects !== undefined) {
+    if (!placement.projects || typeof placement.projects !== 'object' || Array.isArray(placement.projects)) {
+      throw new Error('invalid Keep configuration: placement.projects must be an object');
+    }
+    for (const [project, name] of Object.entries(placement.projects)) {
+      if (!project) throw new Error('invalid Keep placement: a project key cannot be empty');
+      projects[project] = configured(name, `projects.${project}`);
+    }
+  }
+  return {
+    default: placement.default === undefined ? null : configured(placement.default, 'default'),
+    projects,
+  };
+}
+
 // Rewrites config.json in place, atomically, keeping every key it does not touch
 // and the file's own mode. `mutate` is handed the parsed configuration and returns
 // the one to write; a result that would not load again is refused before the write,
@@ -71,6 +111,7 @@ function update(mutate, env = process.env) {
   // is not this edit's fault and must not block fixing the rest of the file.
   const before = (() => { try { return nodeConfig(current).invalid; } catch { return {}; } })();
   const after = nodeConfig(next).invalid;
+  placementConfig(next);
   for (const [name, reason] of Object.entries(after)) {
     if (!Object.prototype.hasOwnProperty.call(before, name)) throw new Error(reason);
   }
@@ -115,9 +156,14 @@ function apply(env = process.env) {
   // agree on which machine they are without re-reading the configuration.
   if (env.KEEP_DAEMON_NODE === undefined) env.KEEP_DAEMON_NODE = daemon;
   if (env.KEEP_NODE_NAME === undefined) env.KEEP_NODE_NAME = env.KEEP_DAEMON_NODE;
+  // Validated here, so a placement naming a machine this install does not have
+  // fails at startup rather than at the moment somebody opens a card. Projected in
+  // its checked form so nothing downstream parses the file again.
+  const placement = placementConfig(value);
+  if (env.KEEP_PLACEMENT === undefined) env.KEEP_PLACEMENT = JSON.stringify(placement);
   require('../web/app/shared/scope-rules').validate(env.KEEP_SCOPES ? JSON.parse(env.KEEP_SCOPES) : undefined);
   require('./preferences').modelBudgets(env);
   return value;
 }
 
-module.exports = { configFile, load, update, apply, nodeConfig, nodeNames, daemonNode, NODE_NAME_RE };
+module.exports = { configFile, load, update, apply, nodeConfig, placementConfig, nodeNames, daemonNode, NODE_NAME_RE };

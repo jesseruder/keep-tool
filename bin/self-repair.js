@@ -1141,6 +1141,9 @@ async function launchRepair(candidate, cardId, artifacts, context) {
     opened = await deps.openSession({
       taskId: cardId,
       fresh: true,
+      // The repair agent runs where the daemon it is repairing runs, whatever the
+      // card last did or the configuration would otherwise choose.
+      node: require('./nodes.js').daemonNode(),
       cwd: created.path,
       agent: 'claude',
       accountId: deps.accountId(),

@@ -5518,8 +5518,8 @@ function nodeEvidence(node, deps = {}) {
 
 // The node-local half of a launch, run where the pane is: in this process on the
 // daemon node, and through the node's own `prepare-launch` anywhere else.
-async function prepareLaunchOn(node, options, deps = {}) {
-  if (node === daemonNodeName(deps)) return require('./launch-prep.js').prepare(options);
+async function prepareLaunchOn(node, options, deps = {}, localDeps = {}) {
+  if (node === daemonNodeName(deps)) return require('./launch-prep.js').prepare(options, localDeps);
   return hostRequest('prepare-launch', options, { ...deps, node });
 }
 
@@ -8270,6 +8270,84 @@ function shellQuoteArg(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
+// A card tag that says a session needs something only some machines have. The tag
+// and the capability are spelled the same on purpose: `keep nodes add --capabilities
+// browser` and a card tagged `browser` are talking about one thing.
+const PLACEMENT_TAG_CAPABILITIES = ['browser', 'ios', 'android'];
+
+function placementNodes(deps = {}) {
+  if (Array.isArray(deps.placementNodes)) {
+    return deps.placementNodes.map((node) => (typeof node === 'string'
+      ? { name: node, capabilities: [] }
+      : { name: node.name, capabilities: node.capabilities || [] }));
+  }
+  try {
+    return require('./node-registry.js').listNodes(deps.env || process.env)
+      .filter((node) => !node.invalid)
+      .map((node) => ({ name: node.name, capabilities: node.capabilities || [] }));
+  } catch {
+    // Nobody could read the node list, so this install is one node as far as any
+    // launch is concerned: the daemon node, with nothing claimed about it.
+    return [{ name: daemonNodeName(deps), capabilities: [] }];
+  }
+}
+
+function placementConfiguration(deps = {}) {
+  if (deps.placement) return { default: deps.placement.default || null, projects: deps.placement.projects || {} };
+  try {
+    const value = JSON.parse((deps.env || process.env).KEEP_PLACEMENT || '{}');
+    return { default: value.default || null, projects: value.projects || {} };
+  } catch { return { default: null, projects: {} }; }
+}
+
+// Which machine a session runs on.
+//
+// A session that already exists runs where it already runs: its transcript, its
+// account's credentials and its working tree are all on that machine, and no open
+// may move it. A fresh one takes the first answer available: what the caller asked
+// for, then where this card last ran, then what the configuration says about this
+// project, then its default, then the daemon node.
+//
+// A capability the work needs — asked for with --needs, or carried by a card tag —
+// is then a requirement of that machine. A node the caller named is never quietly
+// swapped for another: being told "aws1 cannot do this" is the answer. A node
+// nobody named may be, because nobody asked for that one in particular.
+function resolvePlacement(request = {}, deps = {}) {
+  const daemon = daemonNodeName(deps);
+  const configured = placementNodes(deps);
+  const capabilities = new Map(configured.map((node) => [node.name, node.capabilities || []]));
+  let chosen;
+  let named = false;
+  if (request.pinned) {
+    if (request.node && request.node !== request.pinned) {
+      throw new InjectionError(409, `${request.label || 'this session'} runs on node ${request.pinned}`);
+    }
+    chosen = request.pinned;
+    named = true;
+  } else if (request.node) {
+    chosen = request.node;
+    named = true;
+  } else if (request.lastCardNode !== undefined) {
+    // A card that has run before runs there again. An entry written before nodes
+    // existed names no node, and that is the daemon node by construction.
+    chosen = request.lastCardNode || daemon;
+  } else {
+    chosen = placementConfiguration(deps).projects[request.project || ''] || placementConfiguration(deps).default || daemon;
+  }
+  const wanted = [...new Set((request.needs || []).filter(Boolean))];
+  if (!wanted.length) return chosen;
+  const satisfies = (name) => wanted.every((capability) => (capabilities.get(name) || []).includes(capability));
+  if (satisfies(chosen)) return chosen;
+  if (named) {
+    const missing = wanted.find((capability) => !(capabilities.get(chosen) || []).includes(capability));
+    throw new InjectionError(409, `node ${chosen} does not have ${missing}`);
+  }
+  const alternative = configured.find((node) => satisfies(node.name));
+  if (alternative) return alternative.name;
+  const unavailable = wanted.find((capability) => !configured.some((node) => (node.capabilities || []).includes(capability)));
+  throw new InjectionError(409, `no configured node has ${unavailable || wanted.join(' and ')}`);
+}
+
 const freshOpenOperations = new Map();
 const reopenOpenOperations = new Map();
 
@@ -8522,8 +8600,22 @@ async function openSession(body, deps = {}) {
   if (body.requestId != null && (typeof body.requestId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(body.requestId))) {
     throw new InjectionError(400, 'bad open request id');
   }
+  // Which machine to run on, and what that machine has to be able to do. Both are
+  // checked here, against this install's own node list, so a name nobody has is a
+  // refusal before anything is resolved rather than a launch that fails at the end.
+  if (body.node != null && (typeof body.node !== 'string' || !nodes.NODE_NAME_RE.test(body.node))) {
+    throw new InjectionError(400, 'node must be a node name');
+  }
+  if (body.node != null && !placementNodes(deps).some((node) => node.name === body.node)) {
+    throw new InjectionError(400, `node ${body.node} is not configured`);
+  }
+  if (body.needs != null && (typeof body.needs !== 'string' || !body.needs.trim())) {
+    throw new InjectionError(400, 'needs must be a capability name');
+  }
+  const needs = body.needs == null ? [] : [String(body.needs).trim()];
   if (freshStandalone && body.requestId && !deps.freshOpenClaimed) {
-    const identity = JSON.stringify({ cwd: body.cwd, agent: body.agent, accountId: body.accountId, model: body.model || '' });
+    const identity = JSON.stringify({ cwd: body.cwd, agent: body.agent, accountId: body.accountId,
+      model: body.model || '', node: body.node || '', needs: body.needs || '' });
     const running = freshOpenOperations.get(body.requestId);
     if (running) {
       if (running.identity !== identity) throw new InjectionError(409, 'open request is already launching a different selection');
@@ -8537,9 +8629,11 @@ async function openSession(body, deps = {}) {
 
   let project;
   let session;
+  let card = null;
   if (body.taskId) {
     let task;
     try { task = (deps.loadTask || keep.loadTask)(body.taskId); } catch {}
+    card = task || null;
     if (!task) throw new InjectionError(400, 'no task');
     project = task.fm.project;
     if (!body.fresh) session = (task.fm.sessions || []).slice(-1)[0];
@@ -8624,15 +8718,21 @@ async function openSession(body, deps = {}) {
   let accountNote = '';
   let accountWarning = '';
   let reopenTurn = null;
+  // Which machine this session runs on, settled once, here, before anything is
+  // pinned, prepared or spawned. The launch, the pane meta, the account authority
+  // and the card entry all have to name the same node, and a launch that worked it
+  // out twice could disagree with itself.
+  let launchNode;
   if (session) {
-    // Which machine the session runs on is settled before anything is pinned or
-    // resolved: this daemon can only open what runs on its own node.
     let runsOn = null;
     try { runsOn = accounts.sessionNode(session.id, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
     catch (error) { throw new InjectionError(409, error.message); }
-    if (runsOn && runsOn !== nodes.daemonNode(deps.env || process.env)) {
-      throw new InjectionError(409, `session ${sessionRef(session.id)} runs on node ${runsOn}; this daemon node cannot open it here`);
-    }
+    launchNode = resolvePlacement({
+      node: body.node || null,
+      pinned: runsOn || nodes.daemonNode(deps.env || process.env),
+      needs,
+      label: `session ${sessionRef(session.id)}`,
+    }, deps);
     try { account = accounts.forSession(session.id, agent, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
     catch (error) { throw new InjectionError(409, error.message); }
     if (!account && session.accountId) {
@@ -8645,13 +8745,23 @@ async function openSession(body, deps = {}) {
     if (body.accountId != null && body.accountId !== account.id) {
       throw new InjectionError(409, `session ${sessionRef(session.id)} is pinned to account ${account.id}; use handoff to transfer it`);
     }
-    // No node here: the session was refused above unless it runs on this node, and
+    // No node here: the session's own node is what this open resolved against, and
     // a re-pin must never be what moves one.
     if (account.managed) {
       accounts.pinSession(session.id, agent, account.id,
         { root: deps.root || keep.ROOT, env: deps.env || process.env });
     }
   } else {
+    // A fresh session: where the caller said, else where this card last ran, else
+    // what the configuration says about this project, else the daemon node — and
+    // whatever the work needs, asked for outright or carried by a card tag.
+    const lastCardEntry = card ? (card.fm.sessions || []).slice(-1)[0] : undefined;
+    launchNode = resolvePlacement({
+      node: body.node || null,
+      lastCardNode: lastCardEntry === undefined ? undefined : (lastCardEntry.node || null),
+      project: card ? card.fm.project : null,
+      needs: [...needs, ...(card ? (card.fm.tags || []) : []).filter((tag) => PLACEMENT_TAG_CAPABILITIES.includes(tag))],
+    }, deps);
     const env = deps.env || process.env;
     if (body.accountId != null) {
       account = accounts.get(body.accountId, env);
@@ -8689,6 +8799,11 @@ async function openSession(body, deps = {}) {
     }
   }
   if (agent === 'pi' && !account.builtIn) throw new InjectionError(400, 'Pi currently supports only pi/default');
+  // Pi's events file lives in this registry, and the extension that writes it talks
+  // to this daemon. Until that travels, a Pi session belongs to the daemon node.
+  if (agent === 'pi' && launchNode !== nodes.daemonNode(deps.env || process.env)) {
+    throw new InjectionError(409, 'pi sessions run on the daemon node');
+  }
   if (agent === 'pi' && deps.piExtensionReady !== true
       && !fs.existsSync(path.join(os.homedir(), '.pi', 'agent', 'extensions', 'keep.ts'))) {
     throw new InjectionError(409, 'Pi Keep extension is not installed at ~/.pi/agent/extensions/keep.ts');
@@ -8738,7 +8853,7 @@ async function openSession(body, deps = {}) {
         }
         if (!authority) {
           (deps.pinSession || accounts.pinSession)(sessionId, agent, account.id,
-            { root: deps.root || keep.ROOT, env: deps.env || process.env, node: nodes.daemonNode(deps.env || process.env) });
+            { root: deps.root || keep.ROOT, env: deps.env || process.env, node: launchNode });
         }
       }
       return { ok: true, existing: true, focus: 'console', pane: existing.id,
@@ -8797,12 +8912,12 @@ async function openSession(body, deps = {}) {
       : ['claude', ...claudeFlagArgs, { insert: 'mcpConfig' }, ...(commandModel ? ['--model', commandModel] : []),
         ...(sessionId ? [session ? '--resume' : '--session-id', sessionId] : [])];
     // The node-local half of the launch: the account's shared setup, the project's
-    // trust record, Pi's opening file and the shell word that carries this machine's
-    // own node binary. On the daemon node it runs in-process, exactly as it always
-    // did; it is a separate module so the machine the pane lands on can do it itself.
+    // trust record, Pi's opening file and the shell word that carries the node binary
+    // of the machine the pane lands on. On the daemon node it runs in-process,
+    // exactly as it always did.
     let prepared;
     try {
-      prepared = (deps.prepareLaunch || require('./launch-prep.js').prepare)({
+      prepared = await (deps.prepareLaunch || ((options, local) => prepareLaunchOn(launchNode, options, deps, local)))({
         agent,
         account: { id: account.id, agent: account.agent, configDir: account.configDir,
           builtIn: account.builtIn === true, managed: account.managed === true },
@@ -8850,8 +8965,8 @@ async function openSession(body, deps = {}) {
         accountId: account.id,
         accountLabel: account.label,
         sessionId,
-        // The machine the pane lives on. Only the daemon node spawns panes.
-        node: nodes.daemonNode(deps.env || process.env),
+        // The machine the pane lives on.
+        node: launchNode,
         // Recorded so the console and the compaction restore read the launch model
         // from the pane instead of inferring it from the transcript.
         ...(launchModel ? { model: launchModel } : {}),
@@ -8879,10 +8994,11 @@ async function openSession(body, deps = {}) {
         ...(openedFor.unattended ? { unattended: true } : {}),
         launchedAt,
       },
-    }, deps);
+    }, { ...deps, node: launchNode });
     const pane = spawned && spawned.pane && spawned.pane.id;
     if (!pane) throw new Error('terminal host did not return a pane');
     return { ok: true, created: 'pane', command, pane, sessionId,
+      ...(launchNode === nodes.daemonNode(deps.env || process.env) ? {} : { node: launchNode }),
       ...openedSessionNumber(sessionId, deps),
       accountId: account.id, accountLabel: account.label,
       ...(accountNote ? { accountNote } : {}), ...(accountWarning ? { accountWarning } : {}),
@@ -8954,7 +9070,14 @@ async function openSession(body, deps = {}) {
       }, { pane: target.pane, session: session.id, model: modelCommandText(message) });
     }
     if (agent !== 'pi' && deps.reopenCompaction !== 'skip') {
-      reopenTurn = reopenTurnSnapshot({ ...session, kind: agent }, deps, launchModel);
+      if (launchNode === nodes.daemonNode(deps.env || process.env)) {
+        reopenTurn = reopenTurnSnapshot({ ...session, kind: agent }, deps, launchModel);
+      } else {
+        // The compaction reads and rewrites the transcript, and the transcript is on
+        // the other machine. Said out loud rather than skipped quietly: a reopen that
+        // normally restores the turn is doing less than usual here.
+        process.stderr.write(`keep serve: not restoring ${sessionRef(session.id)}'s turn; it runs on node ${launchNode}, where this daemon cannot read its transcript\n`);
+      }
     }
   }
 
@@ -9004,7 +9127,7 @@ async function openSession(body, deps = {}) {
   try {
     if (launch.sessionId) {
       (deps.pinSession || accounts.pinSession)(launch.sessionId, agent, account.id,
-        { root: deps.root || keep.ROOT, env: deps.env || process.env, node: nodes.daemonNode(deps.env || process.env) });
+        { root: deps.root || keep.ROOT, env: deps.env || process.env, node: launchNode });
     }
     if (deps.onLaunched) await deps.onLaunched(launch);
     launchPrepared = true;
@@ -9088,7 +9211,7 @@ async function openSession(body, deps = {}) {
     }
     if (launch.sessionId && !deferReadiness) {
       (deps.pinSession || accounts.pinSession)(launch.sessionId, agent, account.id,
-        { root: deps.root || keep.ROOT, env: deps.env || process.env, node: nodes.daemonNode(deps.env || process.env) });
+        { root: deps.root || keep.ROOT, env: deps.env || process.env, node: launchNode });
     }
   } catch (error) {
     if (error?.extra?.awaitingSetup) error.extra.launch = { pane: launch.pane, sessionId: launch.sessionId, accountId: launch.accountId };
@@ -9120,7 +9243,7 @@ async function openSession(body, deps = {}) {
   if (handoff && launch.sessionId) {
     try {
       if ((deps.linkLaunchedSession || keep.linkLaunchedSession)(body.taskId,
-          { id: launch.sessionId, agent, node: nodes.daemonNode(deps.env || process.env) })) {
+          { id: launch.sessionId, agent, node: launchNode })) {
         launch.linked = true;
       }
     } catch (error) {
@@ -12792,6 +12915,7 @@ module.exports = {
   hostClientFor,
   validPaneRef,
   hostNodeEntries,
+  resolvePlacement,
   hostNodeNames,
   listNodePaneResult,
   sessionHostPane,

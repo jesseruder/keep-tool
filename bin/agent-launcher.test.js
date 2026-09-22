@@ -37,7 +37,10 @@ test('every host pane the daemon launches an agent into carries the marker', () 
   const lines = source.split('\n');
   const sites = [];
   lines.forEach((line, index) => {
-    if (line.includes("'-lic'") && line.includes('profileCommand(')) sites.push(index);
+    // The login-shell exec itself, however the command word was built: since a pane
+    // may land on another machine, that word can come back from that machine's own
+    // prepare-launch rather than from profileCommand on this line.
+    if (line.includes("'-lic'") && line.includes('exec ')) sites.push(index);
   });
   assert.equal(sites.length >= 4, true, `expected the known launcher spawn sites, found ${sites.length}`);
   for (const index of sites) {

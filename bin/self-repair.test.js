@@ -423,6 +423,9 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
     assert.equal(body.accountId, 'claude-repair');
     assert.equal(body.model, 'opus');
     assert.equal(body.cwd, `/tmp/wt/keep-tool/${calls.worktrees[0]}`);
+    // The repair agent runs beside the daemon it is repairing, whatever the card
+    // last did or the configuration would otherwise choose.
+    assert.equal(body.node, require('./nodes.js').daemonNode());
     // The guard that refuses `keep restart-daemon` keys on this and nothing else.
     assert.deepEqual(calls.runs[0].openDeps, { launchEnv: { KEEP_REPAIR: '1' } });
 

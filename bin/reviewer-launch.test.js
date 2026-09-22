@@ -33,6 +33,8 @@ test('reviewer launches in a host-owned Claude pane with a pinned session and re
   assert.equal(spawn.meta.reviewer, true);
   assert.equal(spawn.meta.accountId, 'reviewer-account');
   assert.equal(spawn.meta.accountLabel, 'Reviewer account');
+  // A reviewer reads the registry it reviews, so it runs beside it and says so.
+  assert.equal(spawn.meta.node, require('./nodes.js').daemonNode());
   assert.equal(result.accountId, 'reviewer-account');
   assert.equal(spawn.env.KEEP_REVIEWER, '1');
   assert.equal(spawn.env.KEEP_DIR, '/tmp/private registry');

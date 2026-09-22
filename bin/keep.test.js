@@ -1002,6 +1002,12 @@ test('open CLI posts card or session identity and formats one-line results', asy
   assert.equal(formatOpenResult({ created: 'pane', pane: 'pane-1', command: 'claude', sessionId: 'new', sent: true, linked: true, unlinked: 'me' }), 'opened pane pane-1: claude as new (message sent); card now owned by new, me unlinked');
   assert.equal(formatOpenResult({ created: 'pane', pane: 'pane-1', command: 'claude', sessionId: 'new', linked: true }), 'opened pane pane-1: claude as new; card now owned by new');
   assert.equal(formatOpenResult({ existing: true, pane: 'pane-1', sessionId: 'sid', sent: true }), 'session sid is running in pane pane-1; open it in the console (message sent)');
+  // The node is named only when it is not this machine: a single-node install has
+  // never had a node to mention, and still does not.
+  assert.equal(formatOpenResult({ created: 'pane', pane: 'p1@aws1', node: 'aws1', command: 'claude', sessionId: 'new' }),
+    'opened pane p1@aws1 on node aws1: claude as new');
+  assert.equal(formatOpenResult({ existing: true, pane: 'p1@aws1', node: 'aws1', sessionId: 'sid' }),
+    'session sid is running in pane p1@aws1 on node aws1; open it in the console');
   await assert.rejects(openCommand(['card', '-m', '  '], deps), /-m needs a message/);
   deps.currentSession = () => ({ id: 'me', agent: 'claude' });
   await openCommand(['card', '--fresh', '--model', 'claude-fable-5-1'], deps);

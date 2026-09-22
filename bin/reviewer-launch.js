@@ -60,6 +60,7 @@ async function launch(args, root, deps = {}) {
       // The fleet reviewer is nobody's conversation: it spawns outside openSession, so
       // the unattended mark is stamped here or it would never carry one.
       meta: { agent: 'claude', reviewer: true, sessionId, project: root, launchedAt: Date.now(),
+        node: require('./nodes.js').daemonNode(),
         opener: { kind: 'reviewer' }, unattended: true,
         accountId: account.id, accountLabel: account.label,
         reviewerModel: model, reviewerBashOutput: reviewerBashOutput() },

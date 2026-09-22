@@ -1082,6 +1082,8 @@ test('a request id names one launch for all time, across generations', async () 
     const first = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
     assert.equal(first.launch.state, 'launched');
     assert.equal(deps.calls.opens[0].body.requestId, 'area-sandboxes-g1');
+    // An area agent reads and writes this registry, so it runs beside it.
+    assert.equal(deps.calls.opens[0].body.node, require('./nodes.js').daemonNode());
     assert.equal(record(fixture).generation, 1);
 
     // Close it as idle again and launch once more. The id must NOT come back

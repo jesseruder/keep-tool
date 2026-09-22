@@ -219,3 +219,29 @@ test('a usage reading is rendered from the node answer, whatever shape it takes'
   assert.equal(renderUsage('aws1', claude, { failure: { code: 429, retryAfter: '120', message: '429' } }),
     'claude-node on aws1: unavailable (429, retry after 120): 429');
 });
+
+
+test('a placement must name machines this install actually has', async (t) => {
+  const registryDir = withRegistry(t, { version: 1, nodes: { main: {}, aws1: { transport: 'tcp', address: '100.64.0.2:7777' } } });
+  const placed = config.update((value) => ({ ...value,
+    placement: { default: 'aws1', projects: { '~/castle/ghost-server': 'main' } } }));
+  assert.deepEqual(config.placementConfig(placed),
+    { default: 'aws1', projects: { '~/castle/ghost-server': 'main' } });
+  assert.deepEqual(config.placementConfig({ version: 1 }), { default: null, projects: {} });
+
+  // A placement pointing at a machine nobody has is a launch that would fail at the
+  // last possible moment, so the file is refused instead.
+  for (const [placement, pattern] of [
+    [{ default: 'nowhere' }, /placement default names a node that is not configured: nowhere/],
+    [{ projects: { '~/x': 'nowhere' } }, /placement projects\.~\/x names a node that is not configured/],
+    [{ default: 'Bad Name' }, /invalid Keep node name in placement default/],
+    [{ somethingElse: 'aws1' }, /unsupported Keep placement key: somethingElse/],
+    [{ projects: [] }, /placement\.projects must be an object/],
+    [{ projects: { '': 'main' } }, /a project key cannot be empty/],
+    ['aws1', /placement must be an object/],
+  ]) {
+    assert.throws(() => config.update((value) => ({ ...value, placement })), pattern, JSON.stringify(placement));
+  }
+  assert.deepEqual(registryDir.read().placement, { default: 'aws1', projects: { '~/castle/ghost-server': 'main' } },
+    'nothing that would not load again was written');
+});
