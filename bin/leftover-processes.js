@@ -115,8 +115,11 @@ async function environments(rows) {
       encoding: 'utf8', timeout: 10000, maxBuffer: 64e6, env: { ...process.env, LC_ALL: 'C' },
     }));
   } catch (error) {
-    // ps exits 1 when one of the pids has gone; what it printed is still good.
+    // ps exits 1 when one of the pids has gone; what it printed is still good. A ps
+    // that printed nothing (a timeout under load) read no environments at all, which
+    // must not pass for "no process came from a pane".
     stdout = String(error.stdout || '');
+    if (!stdout.trim()) throw evidence(`process environments unavailable: ${error.message}`);
   }
   return parseEnvironments(stdout, rows);
 }
@@ -257,8 +260,9 @@ async function snapshot(deps = {}) {
     const key = identity(row);
     current.add(key);
     if (deps.seen && !deps.seen.has(key)) deps.seen.set(key, now);
-    const since = [pane ? at(pane.exitedAt) : null, deps.seen ? deps.seen.get(key) : null].filter((v) => v != null);
-    const goneFor = since.length ? now - Math.max(...since) : -Infinity;
+    // An exited pane says when it went; only a closed one is timed from the sighting.
+    const since = pane && at(pane.exitedAt) != null ? at(pane.exitedAt) : deps.seen ? deps.seen.get(key) : null;
+    const goneFor = since != null ? now - since : -Infinity;
     candidates.push({
       pid: row.pid, started: row.started, command: row.command,
       pane: vars.KEEP_PANE, card: pane?.meta?.card || null, sessionId: sessions[0] || null,

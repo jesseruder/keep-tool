@@ -117,6 +117,11 @@ test('the grace period holds a recent exit, and a closed pane until the sweep it
   result = await leftovers.reap({ deps });
   assert.equal(result.stopped.length, 1);
 
+  // A pane that exited an hour ago is due on the sweep's first sighting, as after a
+  // daemon restart; its exit time, not the sighting, starts the grace period.
+  const e = fixture();
+  assert.equal((await leftovers.reap({ deps: { ...e.deps, seen: new Map() } })).stopped.length, 1);
+
   // A one-off run has watched nothing: after a host crash, keep restore may be about
   // to resume into a closed pane's session.
   const h = fixture();
