@@ -3942,27 +3942,39 @@ function compactSwapUserModelChoice(record, file, options = {}) {
   const switchModel = daemon ? String(daemon.switchModel || '').trim() : '';
   const restoreModel = daemon ? String(daemon.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim() : '';
   const daemonRow = compactDaemonRowMatcher(daemon);
+  // The daemon's entries are consumed by their own rows from the swap (or its earliest
+  // journalled Enter) onward, even rows older than `since`: an entry whose row lies before
+  // `since` must not be left over to absorb a later hand row. `since` only decides which
+  // of the remaining rows are reported.
+  const journal = daemon && Array.isArray(daemon.daemonTyped) ? daemon.daemonTyped.map((entry) => Number(entry && entry.at)) : [];
+  const scanFrom = Math.min(at, ...(daemon ? [Number(daemon.at)] : []), ...journal.map((value) => value - 1000)
+    .filter(Number.isFinite));
   let inWindow = false;
   for (let i = 0; i < lines.length; i += 1) {
     let row;
     try { row = JSON.parse(lines[i]); } catch { continue; }
     const stamp = Date.parse(row && row.timestamp || '');
+    let report = true;
     if (Number.isFinite(stamp)) {
-      if (stamp < at) continue;
-      inWindow = true;
+      if (stamp < scanFrom) continue;
+      report = stamp >= at;
+      if (report) inWindow = true;
     } else if (!inWindow) continue;
     const args = localModelSwitchArgs(row);
     if (args != null) {
+      // Exact ids, window included: `/model claude-fable-5-1` against a pending
+      // `claude-fable-5-1[1m]` restore is a person dropping the 1M window. Matched before
+      // the outcome is read: a daemon /model the API refused is still the row its Enter
+      // produced, and its entry is spent on it rather than on the person's retry.
+      if (daemonRow(args, stamp)) continue;
+      if (!report) continue;
       const outcome = resolveLocalModelSwitch(args, lines.slice(i + 1, i + 1 + 64));
       if (outcome.failed) continue;
-      // Exact ids, window included: `/model claude-fable-5-1` against a pending
-      // `claude-fable-5-1[1m]` restore is a person dropping the 1M window.
-      if (daemonRow(args, stamp)) continue;
       // Confirmed, or at least not refused by the harness: "Kept model as …" is no change.
       if (outcome.model === '<unknown>' && !outcome.label) continue;
       return { model: args || outcome.label, reason: `/model ${args || outcome.label} was chosen after the swap` };
     }
-    const model = options.assistant === false ? null : genuineAssistantModel(row);
+    const model = options.assistant === false || !report ? null : genuineAssistantModel(row);
     if (model && model !== '<unknown>'
         && !(switchModel && compactModelContainsFamily(model, switchModel))
         && !(restoreModel && compactModelBase(model) === compactModelBase(restoreModel))

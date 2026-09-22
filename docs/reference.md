@@ -2413,7 +2413,8 @@ than the daemon's own switch and restore rows, compared as exact ids so dropping
 `[1m]` window counts; each Enter the daemon sends for the swap is journalled on the
 record as `daemonTyped` (`{ at, model }`, taken at the Enter itself), and each entry
 accounts for exactly one row — the first `/model` of exactly that id at or after that
-moment, within 15 seconds — so a hand pick of any id near a daemon Enter, a second row of
+moment, within 15 seconds, whether or not the API accepted it, and even when the scan
+only reports rows from a later moment — so a hand pick of any id near a daemon Enter, a second row of
 the same id, a restore id the daemon never typed, and a row with no timestamp all count; or an assistant turn on a third model), the
 pass retires the record without typing the restore or repairing `settings.json`, and logs
 `retired model restore record … not restoring … over it`.

@@ -13027,3 +13027,35 @@ test('the compaction journals its switch and restore at the Enter, with the exac
     assert.deepEqual(journals, ['claude-opus-5[1m]', 'claude-fable-5-1[1m]']);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+// ---- review round 10 ----
+
+test('a daemon row is consumed by its own Enter even when it failed or lies before the scan start', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-consume-own-row-'));
+  const at = Date.parse('2026-09-04T12:00:00Z');
+  const stamp = (offsetMs) => new Date(at + offsetMs).toISOString();
+  const modelCommand = (args, offsetMs) => JSON.stringify({ type: 'user', timestamp: stamp(offsetMs), message: { content: [{ type: 'text',
+    text: `<command-name>/model</command-name><command-message>model</command-message><command-args>${args}</command-args>` }] } });
+  const out = (text, offsetMs) => JSON.stringify({ type: 'system', subtype: 'local_command', timestamp: stamp(offsetMs),
+    content: `<local-command-stdout>${text}</local-command-stdout>` });
+  const file = path.join(dir, 't.jsonl');
+  const write = (rows) => fs.writeFileSync(file, `${rows.join('\n')}\n`);
+  const record = { at, switchModel: 'claude-opus-5[1m]', restoreCommand: '/model claude-fable-5-1[1m]',
+    daemonTyped: [{ at: at + 1e3, model: 'claude-opus-5[1m]' }, { at: at + 600e3, model: 'claude-fable-5-1[1m]' }] };
+  const switchRows = [modelCommand('claude-opus-5[1m]', 1.2e3), out('Set model to Opus 5 (1M context)', 1.2e3)];
+  try {
+    // The daemon's restore is refused with a 429; the person retries the same id 5s later
+    // and it succeeds. The refused row spends the daemon's entry, so the retry is a choice.
+    write([...switchRows, modelCommand('claude-fable-5-1[1m]', 600.3e3), out('API error: 429 rate_limit_error', 600.3e3),
+      modelCommand('claude-fable-5-1[1m]', 605e3), out('Set model to Fable 5.1 (1M context)', 605e3)]);
+    assert.match(compactSwapUserModelChoice(record, file).reason, /claude-fable-5-1\[1m\] was chosen/);
+    // A scan starting after the daemon's own restore row (the snapshot recheck): that row is
+    // still the one its entry consumes, so a hand row of the same id after `since` counts.
+    write([...switchRows, modelCommand('claude-fable-5-1[1m]', 600.3e3), out('Set model to Fable 5.1 (1M context)', 600.3e3),
+      modelCommand('claude-fable-5-1[1m]', 610e3), out('Set model to Fable 5.1 (1M context)', 610e3)]);
+    assert.ok(compactSwapUserModelChoice(record, file, { since: at + 608e3 }));
+    // And with nothing after `since`, nothing is reported — the rows before it are history.
+    write([...switchRows, modelCommand('claude-fable-5-1[1m]', 600.3e3), out('Set model to Fable 5.1 (1M context)', 600.3e3)]);
+    assert.equal(compactSwapUserModelChoice(record, file, { since: at + 608e3 }), null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
