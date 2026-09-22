@@ -2370,6 +2370,18 @@ test('a spawn operation is journalled, replays to the same pane, and survives a 
     assert.notEqual(anonymous.pane.id, pane.id);
     assert.equal((await client.request('hello')).spawnReceipts, true);
 
+    // A replay is the caller saying "I already sent this". A host that has never
+    // heard of the operation says so rather than starting anything, which is what
+    // stops a retry that reached a different host process from becoming a second
+    // agent on the same work.
+    await assert.rejects(client.request('spawn', {
+      ...params, operationId: 'open-spawn-receipt-0002', replay: true,
+    }), /unknown spawn operation/);
+    await assert.rejects(client.request('spawn', {
+      cmd: '/bin/sh', args: ['-c', 'sleep 30'], replay: true,
+    }), /a spawn replay needs an operation id/);
+    assert.equal((await client.request('list')).panes.length, 2, 'a replay never spawns');
+
     // The journal rides the handoff: new code, same panes, same answers.
     const disconnected = new Promise((resolve) => client.onDisconnect(resolve));
     const record = await first.handoff();
@@ -2385,17 +2397,30 @@ test('a spawn operation is journalled, replays to the same pane, and survives a 
       /spawn operation parameters changed/);
     assert.equal((await client.request('list')).panes.length, 2);
 
-    // A receipt naming a pane that is gone answers with a refusal, never a spawn.
+    // A pane this operation made and somebody has since removed: the operation did
+    // happen, so it is answered with what the caller was told at the time, marked
+    // not alive. Never a second spawn.
     await client.request('kill', { pane: pane.id, signal: 'SIGKILL' });
     await waitFor(async () => (await client.request('get', { pane: pane.id })).pane.alive === false, 'the pane to exit');
     await client.request('remove', { pane: pane.id });
-    await assert.rejects(client.request('spawn', params), /no longer exists/);
-    assert.equal((await client.request('list')).panes.length, 1, 'a lost receipt does not start a replacement');
+    const removed = await client.request('spawn', params);
+    assert.equal(removed.pane.id, pane.id);
+    assert.equal(removed.pane.alive, false);
+    assert.equal((await client.request('list')).panes.length, 1, 'a removed pane does not get a replacement');
 
-    // And a receipt with no pane does not travel to the next core.
+    // And that receipt rides the next handoff too, so remove → reload → replay is
+    // still answered from the journal rather than becoming a fresh spawn.
     const second = await active.handoff();
-    assert.deepEqual(second.spawnReceipts, []);
+    assert.deepEqual(second.spawnReceipts.map((receipt) => receipt.id), ['open-spawn-receipt-0001']);
+    const third = createHost({ sock, log: null, adopt: second });
     active.finalizeHandoff();
+    active = third;
+    await third.listen();
+    client = await connect({ sock });
+    const afterReload = await client.request('spawn', { ...params, replay: true });
+    assert.equal(afterReload.pane.id, pane.id);
+    assert.equal(afterReload.pane.alive, false);
+    assert.equal((await client.request('list')).panes.length, 1, 'still no replacement');
   } finally {
     if (client) client.close();
     await active.close().catch(() => {});
@@ -2408,10 +2433,18 @@ test('a host handoff record with a spawn receipt that makes no sense is refused'
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-spawn-receipt-bad-'));
   const sock = path.join(dir, 'host.sock');
   const base = { version: 1, sock, panes: [] };
+  const sound = { id: 'open-spawn-receipt-0001', fingerprint: 'a'.repeat(64), paneId: 'p1',
+    pid: 7, createdAt: '2026-09-21T09:00:00.000Z', pane: { id: 'p1', alive: true } };
   for (const receipt of [
-    { id: 'short', fingerprint: 'a'.repeat(64), paneId: 'p1' },
-    { id: 'open-spawn-receipt-0001', fingerprint: 'nope', paneId: 'p1' },
-    { id: 'open-spawn-receipt-0001', fingerprint: 'a'.repeat(64), paneId: 'not a pane id' },
+    { ...sound, id: 'short' },
+    { ...sound, fingerprint: 'nope' },
+    { ...sound, paneId: 'not a pane id' },
+    { ...sound, pid: 'seven' },
+    { ...sound, createdAt: '' },
+    { ...sound, pane: null },
+    // A receipt whose remembered pane is not the pane it names could answer a
+    // replay with somebody else's pane.
+    { ...sound, pane: { id: 'p2', alive: true } },
   ]) {
     assert.throws(() => createHost({ sock, log: null, adopt: { ...base, spawnReceipts: [receipt] } }),
       /invalid spawn receipt in host handoff/);
@@ -2446,15 +2479,108 @@ test('a node answers for its own processes and signals them itself', async () =>
     assert.deepEqual(asked.env, [], 'no pids, nothing read');
     assert.deepEqual(asked.files, []);
 
-    // A signal is decided and delivered in the same process that owns the pid.
-    assert.deepEqual(await client.request('signal', { pid: row.pid, pidStart: 'Mon Sep 21 00:00:00 2026', signal: 'SIGKILL' }),
+    // A signal is decided and delivered in the same process that owns the pid, and
+    // the identity it is decided against is the whole one: a start time recorded to
+    // the second is not enough on its own to tell a reused pid from the original.
+    const identity = { pid: row.pid, pidStart: row.pidStart, ppid: row.ppid, args: row.args };
+    assert.deepEqual(await client.request('signal', { ...identity, pidStart: 'Mon Sep 21 00:00:00 2026', signal: 'SIGKILL' }),
       { outcome: 'changed' });
+    assert.deepEqual(await client.request('signal', { ...identity, ppid: row.ppid + 1, signal: 'SIGKILL' }),
+      { outcome: 'changed' }, 'a different parent is a different process');
+    assert.deepEqual(await client.request('signal', { ...identity, args: `${row.args} --something-else`, signal: 'SIGKILL' }),
+      { outcome: 'changed' }, 'a different argument vector is a different process');
+    assert.deepEqual(await client.request('signal', { ...identity, pid: 2147483, signal: 'SIGKILL' }),
+      { outcome: 'gone' });
     assert.equal((await client.request('get', { pane: pane.id })).pane.alive, true, 'nothing was signalled');
-    assert.deepEqual(await client.request('signal', { pid: row.pid, pidStart: row.pidStart, signal: 'SIGKILL' }),
+    assert.deepEqual(await client.request('signal', { ...identity, signal: 'SIGKILL' }),
       { outcome: 'signalled' });
     await waitFor(async () => (await client.request('get', { pane: pane.id })).pane.alive === false, 'the pane to die');
-    await assert.rejects(client.request('signal', { pid: row.pid, pidStart: row.pidStart, signal: 'SIGUSR1' }),
+    await assert.rejects(client.request('signal', { ...identity, signal: 'SIGUSR1' }),
       /signal must be one of/);
+    await assert.rejects(client.request('signal', { pid: row.pid, pidStart: row.pidStart, signal: 'SIGKILL' }),
+      /needs the parent/);
+    await assert.rejects(client.request('signal', { pid: row.pid, pidStart: row.pidStart, ppid: row.ppid, signal: 'SIGKILL' }),
+      /needs the arguments/);
+  } finally {
+    if (client) client.close();
+    await host.close().catch(() => {});
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test('a receipt the journal has had to forget answers "unknown", never a second spawn', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-receipt-evicted-'));
+  const sock = path.join(root, 'host.sock');
+  // A journal already at its bound. The bound is what keeps a long-lived host from
+  // remembering every spawn it ever ran; what must not happen when it bites is a
+  // replay quietly turning back into a spawn.
+  const full = Array.from({ length: 256 }, (unused, index) => {
+    const id = `open-evicted-${String(index).padStart(10, '0')}`;
+    const paneId = `pane${index}`;
+    return { id, fingerprint: 'a'.repeat(64), paneId, pid: 1000 + index,
+      createdAt: '2026-09-21T09:00:00.000Z', pane: { id: paneId, alive: false } };
+  });
+  const host = createHost({ sock, log: null, adopt: { version: 1, sock, panes: [], spawnReceipts: full } });
+  let client;
+  try {
+    await host.listen();
+    client = await connect({ sock });
+    // Still remembered: a replay of it is answered by the journal, which refuses it
+    // for the reason that matters — these are not the parameters it ran.
+    await assert.rejects(client.request('spawn', {
+      operationId: full[0].id, replay: true, cmd: '/bin/sh', args: ['-c', 'sleep 30'],
+    }), /spawn operation parameters changed/);
+
+    // One more journalled spawn pushes the oldest receipt out.
+    const fresh = await client.request('spawn', {
+      operationId: 'open-evicts-the-oldest-01', cmd: '/bin/sh', args: ['-c', 'sleep 30'],
+    });
+    assert.ok(fresh.pane.id);
+    await assert.rejects(client.request('spawn', {
+      operationId: full[0].id, replay: true, cmd: '/bin/sh', args: ['-c', 'sleep 30'],
+    }), /unknown spawn operation/, 'an evicted receipt is unknown, not an invitation to spawn');
+    assert.equal((await client.request('list')).panes.length, 1, 'and nothing was started for it');
+  } finally {
+    if (client) client.close();
+    await host.close().catch(() => {});
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a replay never hands back a pane that is no longer the process this spawn started', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-receipt-reuse-'));
+  const sock = path.join(root, 'host.sock');
+  const host = createHost({ sock, log: null });
+  let client;
+  try {
+    await host.listen();
+    client = await connect({ sock });
+    const params = {
+      operationId: 'open-pane-reuse-000001', paneId: 'reused',
+      cmd: '/bin/sh', args: ['-c', 'exit 0'], meta: { agent: 'claude', sessionId: 'sess-reuse' },
+    };
+    const { pane } = await client.request('spawn', params);
+    await waitFor(async () => (await client.request('get', { pane: pane.id })).pane.alive === false, 'the pane to exit');
+
+    // replace-exited keeps the pane id and starts a different process under it. A
+    // replay of the original spawn must not hand that process back as though this
+    // operation had made it — that pane belongs to whoever asked for the replacement.
+    const replaced = await client.request('replace-exited', {
+      paneId: pane.id, expectedPid: pane.pid, sessionId: 'sess-reuse',
+      cmd: '/bin/sh', args: ['-c', 'sleep 30'],
+    });
+    assert.equal(replaced.pane.id, pane.id);
+    assert.notEqual(replaced.pane.pid, pane.pid);
+    assert.deepEqual(await client.request('spawn', { ...params, replay: true }),
+      { pane: null, outcome: 'pane replaced' });
+    assert.equal((await client.request('list')).panes.length, 1, 'and nothing was started instead');
+
+    // The pane id is part of what was asked for, too: the same operation naming a
+    // different pane is not this operation, and is refused rather than answered from
+    // a receipt about some other pane.
+    await assert.rejects(client.request('spawn', { ...params, paneId: 'notreused' }),
+      /spawn operation parameters changed/);
   } finally {
     if (client) client.close();
     await host.close().catch(() => {});

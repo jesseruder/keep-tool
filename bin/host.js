@@ -116,9 +116,17 @@ function spawnOperationFingerprint(params) {
     params.rows === undefined ? null : params.rows,
     stableValue(params.env),
     stableValue(params.meta),
+    // A caller-chosen pane id is part of what was asked for: the same command in a
+    // pane named something else is a different request, and answering it from this
+    // receipt would hand back a pane the caller never asked about.
+    params.paneId == null ? null : String(params.paneId),
   ])).digest('hex');
 }
 
+// What a receipt has to remember to answer a replay honestly: which pane it made,
+// which process that pane was, and what it told the caller at the time. The pane
+// snapshot is kept so a pane that has since been removed can still be answered —
+// the operation did happen, and the honest answer is "it ran, and it is not alive".
 function spawnReceiptMap(value) {
   const receipts = new Map();
   if (value == null) return receipts;
@@ -126,10 +134,20 @@ function spawnReceiptMap(value) {
   for (const item of value) {
     if (!item || !INPUT_OPERATION_PATTERN.test(String(item.id || ''))
         || !/^[a-f0-9]{64}$/.test(String(item.fingerprint || ''))
-        || !PANE_ID_PATTERN.test(String(item.paneId || ''))) {
+        || !PANE_ID_PATTERN.test(String(item.paneId || ''))
+        || !Number.isInteger(item.pid)
+        || typeof item.createdAt !== 'string' || !item.createdAt
+        || !item.pane || typeof item.pane !== 'object' || Array.isArray(item.pane)
+        || item.pane.id !== String(item.paneId)) {
       throw new Error('invalid spawn receipt in host handoff');
     }
-    receipts.set(String(item.id), { fingerprint: String(item.fingerprint), paneId: String(item.paneId) });
+    receipts.set(String(item.id), {
+      fingerprint: String(item.fingerprint),
+      paneId: String(item.paneId),
+      pid: item.pid,
+      createdAt: String(item.createdAt),
+      pane: { ...item.pane },
+    });
   }
   return receipts;
 }
@@ -1131,7 +1149,14 @@ function createHost(options = {}) {
           ...(tcpError ? { listenError: tcpError.message } : {}),
         } };
       case 'spawn': {
+        // `replay: true` says the caller is asking again about a spawn it already
+        // sent. It is the whole contract: a replay may only ever be answered from
+        // the journal, never by starting something. A host that has never heard of
+        // the operation — a different host process, or a receipt evicted by the
+        // bound — says so, and the caller is left to look rather than to spawn a
+        // second agent on the same work.
         if (params.operationId === undefined) {
+          if (params.replay === true) throw new Error('a spawn replay needs an operation id');
           const pane = spawnPane(params);
           return { result: { pane: publicPane(pane) } };
         }
@@ -1140,18 +1165,28 @@ function createHost(options = {}) {
         const fingerprint = spawnOperationFingerprint(params);
         const prior = spawnReceipts.get(operationId);
         if (prior) {
-          // The same operation, asked again: the answer is the pane it already
-          // made, read live so alive, pid and the rest describe it now rather than
-          // at the moment it started.
           if (prior.fingerprint !== fingerprint) throw new Error('spawn operation parameters changed');
           const existing = panes.get(prior.paneId);
-          if (!existing) throw new Error('the pane this spawn operation created no longer exists');
+          // The pane id is the caller's to reuse, and `replace-exited` keeps it
+          // across a new process. A pane wearing that id which is not the process
+          // this operation started is somebody else's pane: say so rather than hand
+          // it over as though this spawn had made it.
+          if (existing && (existing.pty.pid !== prior.pid || existing.createdAt !== prior.createdAt)) {
+            return { result: { pane: null, outcome: 'pane replaced' } };
+          }
+          // Gone, but it did run: the answer is what the caller was told at the
+          // time, marked as no longer alive.
+          if (!existing) return { result: { pane: { ...prior.pane, alive: false } } };
           return { result: { pane: publicPane(existing) } };
         }
+        if (params.replay === true) throw new Error('unknown spawn operation');
         const pane = spawnPane(params);
-        spawnReceipts.set(operationId, { fingerprint, paneId: pane.id });
+        const snapshot = publicPane(pane);
+        spawnReceipts.set(operationId, {
+          fingerprint, paneId: pane.id, pid: pane.pty.pid, createdAt: pane.createdAt, pane: snapshot,
+        });
         while (spawnReceipts.size > INPUT_RECEIPT_LIMIT) spawnReceipts.delete(spawnReceipts.keys().next().value);
-        return { result: { pane: publicPane(pane) } };
+        return { result: { pane: snapshot } };
       }
       case 'prepare-launch': {
         // The node-local half of a launch, run where the agent will run: this
@@ -1909,11 +1944,12 @@ function createHost(options = {}) {
         version: 1,
         sock,
         bootId,
-        // Only the receipts whose pane came across: one naming a pane that is gone
-        // could only answer a replay with a refusal, and it would hold a slot.
-        spawnReceipts: [...spawnReceipts]
-          .filter(([, receipt]) => paneRecords.some((pane) => pane.id === receipt.paneId))
-          .map(([id, receipt]) => ({ id, ...receipt })),
+        // Every receipt, including one whose pane is gone. Dropping those turned
+        // remove-then-reload into a host that had never heard of the operation, and
+        // a caller replaying it would have been told to look for a pane that had in
+        // fact run. The receipt can still answer that honestly; the journal is the
+        // record of what happened, not a list of what is still alive.
+        spawnReceipts: [...spawnReceipts].map(([id, receipt]) => ({ id, ...receipt })),
         panes: paneRecords,
       };
       } catch (error) {
