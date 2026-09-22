@@ -128,10 +128,12 @@ function portableFallbackCandidate(entry) {
 // this or any handoff, is no longer alive, and a new `ps` snapshot has no process with
 // the recorded pid and start time (the pid gone, or reused by a process that started at
 // another time). Only a transaction that never got past its stop qualifies, and only one
-// that recorded the identity at all — and only one whose own /exit was typed
-// (sourceExitTypedAt, journalled by the restart just before the keystroke): a restart that
-// refused before its stop, and a source that then died on its own, skipped every check
-// the stop makes (the job ledger above all) and stays blocked. A `ps` that fails or comes back empty proves
+// that recorded the identity at all — and only one whose own /exit Enter was committed
+// (sourceExitEnterAt, journalled by the restart after every check before that key passed,
+// cleared when the host refused it and at the start of every new stop attempt): a restart
+// that refused before its stop, or took its /exit draft back, and a source that then died
+// on its own, skipped every check the stop makes (the job ledger above all) and stays
+// blocked. A `ps` that fails or comes back empty proves
 // nothing and stays blocked, but as a transient refusal a retry can clear.
 function paneMarkerUnchanged(current, pane) {
   const marker = pane.meta?.handoffTransactionId || null;
@@ -142,7 +144,7 @@ function paneMarkerUnchanged(current, pane) {
 }
 async function verifySourceStopAfterTheFact(current, pane, deps, root) {
   const blocked = () => new Error('Source exit was not verified by the handoff transaction; recovery is blocked');
-  if (current.phase !== 'stopping-source' || !Number.isFinite(current.sourceExitTypedAt)
+  if (current.phase !== 'stopping-source' || !Number.isFinite(current.sourceExitEnterAt)
       || current.targetLaunchStartedAt || current.deliveryStartedAt || current.deliveredAt
       || current.sourceOwnsPane !== true || !Number.isInteger(current.sourceAgentPid) || current.sourceAgentPid <= 0
       || typeof current.sourceAgentPidStart !== 'string' || !current.sourceAgentPidStart) throw blocked();
@@ -857,6 +859,10 @@ async function run(body, deps = {}) {
     current.agent = agent;
     current.intent = intent;
     current.ownedSessionIds = agent === 'codex' ? artifactPlan.artifacts.map((entry) => entry.sessionId) : [session.id];
+    // A new stop attempt starts with no committed Enter: an earlier attempt's mark says
+    // nothing about this one.
+    delete current.sourceExitEnterAt;
+    delete current.sourceExitTypedAt;
     Object.assign(current, { status: 'stopping', phase: 'stopping-source', reason: '', cwd: resumeCwd,
       pid: pane.pid, cols: pane.cols, rows: pane.rows, ...(force ? { force: true } : {}),
       // Which handoff, if any, launched the pane this transaction is about to stop — the
@@ -900,11 +906,14 @@ async function run(body, deps = {}) {
         ...deps.restartDeps, root, env, host: wrappedHost, resumeAccount: target, resumeMcpConfig: compatibility.mcpConfig,
         resumeModel: current.model, resumeArgv: current.resumeSpec?.argv, resumeCwd: current.resumeSpec ? current.cwd : null,
         allowTerminalRateLimit: true,
-        // Every check the restart makes before a stop has passed, and the /exit is about to
-        // be typed. Journalled before the keystroke, so a stop whose confirmation is lost
-        // afterwards can still be proven post hoc (verifySourceStopAfterTheFact) — and one
-        // that never got this far, a refusal or a crash of the source on its own, cannot.
-        onExitInput: () => { current.sourceExitTypedAt = Date.now(); writeOne(root, current); },
+        // The /exit is typed, every check before its Enter has passed, and the Enter is the
+        // next key. Journalled before that key, so a stop whose confirmation is lost to a
+        // later host timeout can still be proven post hoc (verifySourceStopAfterTheFact).
+        // Nothing earlier counts: a draft that was refused or taken back never became a
+        // submit, and a source that dies on its own after that was never stopped by this
+        // transaction. A host that refused the Enter outright takes the mark back.
+        onExitEnter: () => { current.sourceExitEnterAt = Date.now(); writeOne(root, current); },
+        onExitEnterDropped: () => { delete current.sourceExitEnterAt; writeOne(root, current); },
         // The agent this preflight actually verified. The restart re-reads `ps` and now
         // re-reads it again when a snapshot comes back unusable, and a patient read is
         // exactly where a replacement process could be adopted as the original. Naming

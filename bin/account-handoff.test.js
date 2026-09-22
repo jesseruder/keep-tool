@@ -505,7 +505,7 @@ test('a typed /exit whose confirmation was lost is proven after the fact from a 
     // The 2026-09-21 shape: the restart typed /exit, the source left, and a later host
     // call timed out, so the transaction never reached replace-exited.
     const d = deps(f, { restartSession: async (_body, options) => {
-      options.onExitInput();
+      options.onExitEnter();
       d.pane.alive = false;
       const error = new Error('host request timed out: input'); error.status = 409; throw error;
     } });
@@ -513,7 +513,7 @@ test('a typed /exit whose confirmation was lost is proven after the fact from a 
     const journal = () => handoff.readOne(f.root, f.sid);
     assert.equal(journal().status, 'recovery-needed');
     assert.equal(journal().sourceStopVerifiedAt, undefined);
-    assert.ok(Number.isFinite(journal().sourceExitTypedAt));
+    assert.ok(Number.isFinite(journal().sourceExitEnterAt));
 
     // No snapshot, a failed one, or an empty one proves nothing: blocked, but transient.
     for (const rows of [undefined, async () => { throw new Error('Command failed: ps'); }, async () => []]) {
@@ -545,7 +545,7 @@ test('an earlier transfer\'s pane marker does not block proving a later lost sto
   const f = fixture();
   try {
     const d = deps(f, { restartSession: async (_body, options) => {
-      options.onExitInput(); d.pane.alive = false; throw new Error('host request timed out: input');
+      options.onExitEnter(); d.pane.alive = false; throw new Error('host request timed out: input');
     } });
     // This source was itself launched by an earlier A->B-style transfer.
     d.pane.meta.handoffTransactionId = 'earlier-transfer';
@@ -564,11 +564,44 @@ test('an earlier transfer\'s pane marker does not block proving a later lost sto
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('only a committed /exit Enter from this attempt proves a lost stop', async () => {
+  const f = fixture();
+  try {
+    let mode = 'dropped';
+    const d = deps(f, { restartSession: async (_body, options) => {
+      if (mode === 'dropped') {
+        // The host refused the Enter: nothing was submitted, the mark is taken back.
+        options.onExitEnter(); options.onExitEnterDropped();
+        const error = new Error('input arrived on the pane before this keystroke; nothing was typed'); error.status = 409; throw error;
+      }
+      if (mode === 'committed') { options.onExitEnter(); throw new Error('host request timed out: input'); }
+      // A later attempt that refuses before its /exit is ever submitted.
+      throw new Error('Waiting for the turn and background work to finish');
+    } });
+    d.agentProcessRows = async () => [{ pid: 99, pidStart: 'other' }];
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /nothing was typed/);
+    assert.equal(handoff.readOne(f.root, f.sid).sourceExitEnterAt, undefined);
+    d.pane.alive = false; // then the source crashes on its own
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /Source exit was not verified/);
+
+    // A committed Enter whose source nevertheless stayed up, then a retry that refuses
+    // before its own Enter: the retry starts with no mark, so a later crash proves nothing.
+    d.pane.alive = true; mode = 'committed';
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /host request timed out/);
+    assert.ok(Number.isFinite(handoff.readOne(f.root, f.sid).sourceExitEnterAt));
+    mode = 'refused';
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /Waiting for the turn/);
+    assert.equal(handoff.readOne(f.root, f.sid).sourceExitEnterAt, undefined);
+    d.pane.alive = false;
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /Source exit was not verified/);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('a host that did not list its panes is a transient timeout, not a missing pane', async () => {
   const f = fixture();
   try {
     const d = deps(f, { restartSession: async (_body, options) => {
-      options.onExitInput(); d.pane.alive = false; throw new Error('host request timed out: input');
+      options.onExitEnter(); d.pane.alive = false; throw new Error('host request timed out: input');
     } });
     await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d));
     d.inspect = async () => ({ hostUnavailable: true });
