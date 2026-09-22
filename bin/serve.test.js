@@ -12289,11 +12289,11 @@ test('pending swap sweep retires a record once someone picks a model by hand aft
     assert.equal(choice([modelCommand('claude-sonnet-5', -1e3), out('Set model to Sonnet 5', -1e3), ...daemonOnly]), null,
       'a choice from before the swap is what the swap already recorded');
     assert.match(choice([...daemonOnly, real('claude-sonnet-5', 8e3)]).reason, /moved to claude-sonnet-5/);
-    // With a full-id switch, a second /model of the same id is a person's.
-    const fullId = { switchModel: 'claude-opus-5[1m]' };
+    // With a full-id switch the daemon journalled, a later /model of the same id is a person's.
+    const fullId = { switchModel: 'claude-opus-5[1m]', daemonTyped: [at + 1e3] };
     assert.equal(choice([real('claude-fable-5-1', -60e3), modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 2e3)], fullId), null);
     assert.ok(choice([real('claude-fable-5-1', -60e3), modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 2e3),
-      modelCommand('claude-opus-5[1m]', 9e3), out('Set model to Opus 5 (1M context)', 9e3)], fullId));
+      modelCommand('claude-opus-5[1m]', 60e3), out('Set model to Opus 5 (1M context)', 60e3)], fullId));
 
     // The sweep: retired, nothing typed, and settings.json left on the hand choice.
     fs.writeFileSync(transcript, `${handPicked.join('\n')}\n`);
@@ -12406,7 +12406,7 @@ test('dropping the 1M window by hand is a choice the restore must not undo', () 
     const file = path.join(dir, 't.jsonl');
     fs.writeFileSync(file, `${[modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 1e3),
       modelCommand('claude-fable-5-1', 5e3), out('Set model to Fable 5.1', 5e3)].join('\n')}\n`);
-    const record = { at, switchModel: 'claude-opus-5[1m]', restoreCommand: '/model claude-fable-5-1[1m]' };
+    const record = { at, switchModel: 'claude-opus-5[1m]', restoreCommand: '/model claude-fable-5-1[1m]', daemonTyped: [at + 1e3, at + 5e3] };
     assert.match(compactSwapUserModelChoice(record, file).reason, /\/model claude-fable-5-1 was chosen/);
     // The restore row itself, window and all, is still the daemon's own.
     fs.writeFileSync(file, `${[modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 1e3),
@@ -12781,9 +12781,9 @@ test('another session picking exactly the compaction\'s id is a hand choice that
     assert.equal(compactSwapUserModelChoice(record, other), null, 'read as A\'s own transcript it looks like A\'s switch');
     assert.ok(compactSwapUserModelChoice(record, other, { daemon: null, assistant: false }), 'read as B\'s, it is a choice');
     // B with a pending record of its own: B's daemon rows are exempt, a later hand pick is not.
-    const bRecord = { at: at + 4e3, switchModel: 'claude-opus-5[1m]', restoreCommand: '/model claude-fable-5-1[1m]' };
+    const bRecord = { at: at + 4e3, switchModel: 'claude-opus-5[1m]', restoreCommand: '/model claude-fable-5-1[1m]', daemonTyped: [at + 5e3] };
     assert.equal(compactSwapUserModelChoice(record, other, { since: at, daemon: bRecord, assistant: false }), null);
-    fs.appendFileSync(other, `${[modelCommand('claude-opus-5[1m]', 9e3), out('Set model to Opus 5 (1M context)', 9e3)].join('\n')}\n`);
+    fs.appendFileSync(other, `${[modelCommand('claude-opus-5[1m]', 70e3), out('Set model to Opus 5 (1M context)', 70e3)].join('\n')}\n`);
     assert.ok(compactSwapUserModelChoice(record, other, { since: at, daemon: bRecord, assistant: false }));
     // An assistant turn on some other model says nothing about B's settings choice.
     const quiet = path.join(dir, 'quiet.jsonl');
@@ -12874,5 +12874,91 @@ test('a hand pick made while the restore is typed is not overwritten by the sett
     settings = 'claude-sonnet-5';
     await run(false);
     assert.deepEqual(writes, ['claude-sonnet-5']);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---- review round 8 ----
+
+test('a daemon row is the daemon\'s only when it typed that command then', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-daemon-typed-'));
+  const at = Date.parse('2026-09-04T12:00:00Z');
+  const stamp = (offsetMs) => new Date(at + offsetMs).toISOString();
+  const modelCommand = (args, offsetMs) => JSON.stringify({ type: 'user', ...(offsetMs == null ? {} : { timestamp: stamp(offsetMs) }),
+    message: { content: [{ type: 'text',
+      text: `<command-name>/model</command-name><command-message>model</command-message><command-args>${args}</command-args>` }] } });
+  const out = (text, offsetMs) => JSON.stringify({ type: 'system', subtype: 'local_command', ...(offsetMs == null ? {} : { timestamp: stamp(offsetMs) }),
+    content: `<local-command-stdout>${text}</local-command-stdout>` });
+  const file = path.join(dir, 't.jsonl');
+  const write = (rows) => fs.writeFileSync(file, `${rows.join('\n')}\n`);
+  const base = { at, switchModel: 'claude-opus-5[1m]', restoreCommand: '/model claude-fable-5-1[1m]' };
+  try {
+    const own = [modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 1e3),
+      modelCommand('claude-fable-5-1[1m]', 600e3), out('Set model to Fable 5.1 (1M context)', 600e3)];
+    write(own);
+    // The daemon typed its switch at +1s and its restore at +10m: both rows are its own.
+    assert.equal(compactSwapUserModelChoice({ ...base, daemonTyped: [at + 1e3, at + 600e3] }, file), null);
+    // A deferred record that never typed a restore exempts nothing but its switch: the same
+    // restore-id row is a person's.
+    assert.match(compactSwapUserModelChoice({ ...base, daemonTyped: [at + 1e3] }, file).reason, /claude-fable-5-1\[1m\] was chosen/);
+    // A hand pick of the same id a minute after the daemon's typed restore counts.
+    write([...own, modelCommand('claude-fable-5-1[1m]', 660e3), out('Set model to Fable 5.1 (1M context)', 660e3)]);
+    assert.ok(compactSwapUserModelChoice({ ...base, daemonTyped: [at + 1e3, at + 600e3] }, file));
+    // A /model row with no timestamp inside the window is not exempt.
+    write([modelCommand('claude-opus-5[1m]', 1e3), out('Set model to Opus 5 (1M context)', 1e3),
+      modelCommand('claude-opus-5[1m]'), out('Set model to Opus 5 (1M context)')]);
+    assert.ok(compactSwapUserModelChoice({ ...base, daemonTyped: [at + 1e3] }, file));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a hand pick of a deferred record\'s restore id in its session is not overwritten by another restore\'s cleanup', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-deferred-restore-id-'));
+  const clock = Date.parse('2026-09-04T12:05:00Z');
+  const modelCommand = (args, atMs) => JSON.stringify({ type: 'user', timestamp: new Date(atMs).toISOString(), message: { content: [{ type: 'text',
+    text: `<command-name>/model</command-name><command-message>model</command-message><command-args>${args}</command-args>` }] } });
+  const out = (text, atMs) => JSON.stringify({ type: 'system', subtype: 'local_command', timestamp: new Date(atMs).toISOString(),
+    content: `<local-command-stdout>${text}</local-command-stdout>` });
+  try {
+    const a = { id: 'session-a', kind: 'claude', model: 'claude-opus-5', endedTurn: true, mtime: clock - 60e3 };
+    const b = { id: 'session-b', kind: 'claude', model: 'claude-opus-5', endedTurn: false, mtime: clock - 3600e3 };
+    const aTranscript = path.join(dir, 'a.jsonl');
+    const bTranscript = path.join(dir, 'b.jsonl');
+    fs.writeFileSync(aTranscript, '');
+    fs.writeFileSync(bTranscript, '');
+    const bAt = clock - 30 * 60e3;
+    const fileA = writeCompactSwapFixture(dir, a.id, { at: clock - 40 * 60e3, switchModel: 'claude-opus-5[1m]', daemonTyped: [clock - 40 * 60e3 + 1e3] });
+    // B's restore is deferred: the daemon typed only B's switch.
+    writeCompactSwapFixture(dir, b.id, { at: bAt, switchModel: 'claude-opus-5[1m]', daemonTyped: [bAt + 1e3],
+      restoreDeferredReason: 'model-exhausted', restoreDeferredUntil: clock + 3600e3 });
+    let settings = 'claude-sonnet-5';
+    const writes = [];
+    await sweepPendingCompactSwaps({ ...compactRestoreDeps(dir, a, []), now: () => clock,
+      scanSessions: () => [a, b], stderr: () => {},
+      transcriptFileForSession: (session) => (session.id === a.id ? aTranscript : bTranscript),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: settings }),
+      repairClaudeSettingsModel: (value) => { writes.push(value); settings = value; return { changed: true }; },
+      typeAndSubmit: async (_target, command) => {
+        settings = command.slice('/model '.length);
+        // While A's restore is confirmed, B's person picks Fable 1M by hand — the very text
+        // of B's own (never typed) restore.
+        fs.writeFileSync(bTranscript, `${[modelCommand('claude-fable-5-1[1m]', clock + 500),
+          out('Set model to Fable 5.1 (1M context)', clock + 500)].join('\n')}\n`);
+        b.mtime = clock + 500;
+      } });
+    assert.equal(fs.existsSync(fileA), false, 'A restored');
+    assert.deepEqual(writes, [], 'the Sonnet snapshot is not written over B\'s pick');
+    assert.equal(settings, 'claude-fable-5-1[1m]');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the pending-swap pass journals the restore Enter it sends', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-journal-typed-'));
+  const session = { id: 'journal', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  const clock = Date.parse('2026-09-04T12:05:00Z');
+  try {
+    const file = writeCompactSwapFixture(dir, session.id, { daemonTyped: [] });
+    await sweepPendingCompactSwaps({ ...compactRestoreDeps(dir, session, []), now: () => clock,
+      transcriptFileForSession: () => null, stderr: () => {}, waitForModelSwitch: async () => false,
+      typeAndSubmit: async (_target, _command, _check, options) => { await options.beforeEnterKey(); } });
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).daemonTyped, [clock]);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

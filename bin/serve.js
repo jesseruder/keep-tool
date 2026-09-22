@@ -3721,6 +3721,8 @@ function writePendingCompactSwap(session, plan, dir = autoCompactDir(), at = Dat
     settingsModelPresent: plan.settingsModelPresent,
     ...(plan.settingsFile ? { settingsFile: plan.settingsFile, accountId: plan.accountId } : {}),
     at,
+    // Every Enter the daemon sends for this swap's commands (see noteCompactDaemonTyped).
+    daemonTyped: [],
   };
   writeCompactSwapRecord(file, record);
   return file;
@@ -3839,30 +3841,57 @@ function compactRestoreRateLimited(screen, command) {
 // overwrite that choice — every ten minutes, in the incident that motivated this — and
 // repairing settings.json to the pre-swap value would undo the saved default they just set.
 //
-// Read from the transcript records stamped at or after the record's `at` (written just
-// before the switch was typed). The daemon's own rows are the first `/model <switchModel>`
-// and any `/model <restore>`; a refused /model changed nothing (modelSwitchApiError). Any
-// other confirmed switch is a person's — including a second `/model <switchModel>`, but
-// only when the window read reaches back past `at`, so the daemon's own first one is
-// known to be in it. A genuine assistant record on a model that is neither the swap's nor
-// the restore's is the same evidence by another path (a model changed without a /model
-// row this can see).
-const COMPACT_SWAP_CHOICE_SCAN_BYTES = 8 * 1024 * 1024;
-
+// Read from the transcript records stamped at or after `since` (the record's `at`, written
+// just before the switch was typed, unless the caller names another moment). A refused
+// /model changed nothing (modelSwitchApiError). A /model row is the daemon's own only when
+// the daemon really typed that command then: its text is the swap's switch or restore, and
+// its timestamp falls within COMPACT_DAEMON_ROW_WINDOW_MS of a moment the swap record says
+// the daemon sent that Enter (daemonTyped, journalled by noteCompactDaemonTyped). Matching
+// by text alone let a person's pick of exactly the restore id pass as a restore the daemon
+// never typed. A record from before the journal existed has only its switch to go by, in
+// the minute after `at`. Any other confirmed /model is a person's, and so is one whose row
+// carries no timestamp once the window has begun — leaving settings.json alone is the
+// conservative outcome. A genuine assistant record on a model that is neither the swap's
+// nor the restore's is the same evidence by another path.
 //
 // Read against some other session's transcript (a shared settings file's other sessions),
-// the rows exempt as the daemon's are that session's own pending record's, not this
-// record's: options.daemon names that record, or null when the session has none — and
-// then every confirmed /model since options.since is a hand choice, including one of
-// exactly the id this record's compaction typed. options.assistant false drops the
-// assistant-record evidence, which only means something in the swapped session itself.
+// the daemon rows are that session's own pending record's: options.daemon names that
+// record, or null when the session has none, and then every confirmed /model counts.
+// options.assistant false drops the assistant-record evidence, which only means something
+// in the swapped session itself.
+const COMPACT_SWAP_CHOICE_SCAN_BYTES = 8 * 1024 * 1024;
+const COMPACT_DAEMON_ROW_WINDOW_MS = 15e3;
+const COMPACT_LEGACY_SWITCH_WINDOW_MS = 60e3;
+
+function compactDaemonTypedRow(daemon, args, stamp) {
+  if (!daemon || !Number.isFinite(stamp)) return false;
+  const text = String(args || '').trim().toLowerCase();
+  const switchModel = String(daemon.switchModel || '').trim().toLowerCase();
+  const restoreModel = String(daemon.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim().toLowerCase();
+  if (!text || (text !== switchModel && text !== restoreModel)) return false;
+  const typed = Array.isArray(daemon.daemonTyped) ? daemon.daemonTyped.map(Number).filter(Number.isFinite) : null;
+  if (typed) return typed.some((at) => Math.abs(stamp - at) <= COMPACT_DAEMON_ROW_WINDOW_MS);
+  const at = Number(daemon.at);
+  return text === switchModel && Number.isFinite(at) && stamp >= at && stamp - at <= COMPACT_LEGACY_SWITCH_WINDOW_MS;
+}
+
+// Journals that the daemon is sending the Enter for one of this swap's commands, so the
+// transcript row it produces can be told from a person typing the same text. Read from the
+// file rather than any caller's copy, which may carry state the file deliberately lost.
+function noteCompactDaemonTyped(file, at, remove = false) {
+  try {
+    const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!record || typeof record !== 'object' || Array.isArray(record)) return;
+    const typed = Array.isArray(record.daemonTyped) ? record.daemonTyped.filter((value) => value !== at) : [];
+    writeCompactSwapRecord(file, { ...record, daemonTyped: remove ? typed : [...typed, at] });
+  } catch {}
+}
+
 function compactSwapUserModelChoice(record, file, options = {}) {
   const at = Number.isFinite(options.since) ? options.since : Number(record && record.at);
   if (!file || !Number.isFinite(at) || at <= 0) return null;
   const daemon = options.daemon === undefined ? record : options.daemon;
-  const daemonAt = daemon ? Number(daemon.at) : Infinity;
   let text;
-  let reachedStart;
   try {
     const stat = fs.statSync(file);
     const start = Math.max(0, stat.size - COMPACT_SWAP_CHOICE_SCAN_BYTES);
@@ -3873,32 +3902,26 @@ function compactSwapUserModelChoice(record, file, options = {}) {
       text = buffer.toString('utf8');
     } finally { fs.closeSync(fd); }
     if (start > 0) text = text.slice(text.indexOf('\n') + 1);
-    reachedStart = start === 0;
   } catch { return null; }
   const lines = text.split(/\r?\n/);
   const switchModel = daemon ? String(daemon.switchModel || '').trim() : '';
   const restoreModel = daemon ? String(daemon.restoreCommand || '').replace(/^\s*\/model\s+/i, '').trim() : '';
-  let sawBefore = reachedStart;
-  let sawOwnSwitch = false;
+  let inWindow = false;
   for (let i = 0; i < lines.length; i += 1) {
     let row;
     try { row = JSON.parse(lines[i]); } catch { continue; }
     const stamp = Date.parse(row && row.timestamp || '');
-    if (!Number.isFinite(stamp)) continue;
-    if (stamp < daemonAt) sawBefore = true;
-    if (stamp < at) continue;
-    const daemonRow = stamp >= daemonAt;
+    if (Number.isFinite(stamp)) {
+      if (stamp < at) continue;
+      inWindow = true;
+    } else if (!inWindow) continue;
     const args = localModelSwitchArgs(row);
     if (args != null) {
       const outcome = resolveLocalModelSwitch(args, lines.slice(i + 1, i + 1 + 64));
       if (outcome.failed) continue;
       // Exact ids, window included: `/model claude-fable-5-1` against a pending
-      // `claude-fable-5-1[1m]` restore is a person dropping the 1M window, and the
-      // restore would put it back.
-      const own = daemonRow && switchModel && args.toLowerCase() === switchModel.toLowerCase();
-      if (own && !sawOwnSwitch) { sawOwnSwitch = true; continue; }
-      if (own && !sawBefore) continue;
-      if (daemonRow && restoreModel && args && args.toLowerCase() === restoreModel.toLowerCase()) continue;
+      // `claude-fable-5-1[1m]` restore is a person dropping the 1M window.
+      if (compactDaemonTypedRow(daemon, args, stamp)) continue;
       // Confirmed, or at least not refused by the harness: "Kept model as …" is no change.
       if (outcome.model === '<unknown>' && !outcome.label) continue;
       return { model: args || outcome.label, reason: `/model ${args || outcome.label} was chosen after the swap` };
@@ -4408,6 +4431,16 @@ async function sweepPendingCompactSwaps(deps = {}) {
             try {
               await submit(target, record.restoreCommand, claudeTypedTextVisible, {
                 ...deps, inputBaseline, discardDraftOnAbort: true, draftKind: 'claude',
+                beforeEnterKey: () => {
+                  const typedAt = now();
+                  noteCompactDaemonTyped(record.file, typedAt);
+                  record.daemonTyped = [...(Array.isArray(record.daemonTyped) ? record.daemonTyped : []), typedAt];
+                },
+                enterKeyDropped: () => {
+                  const typedAt = record.daemonTyped && record.daemonTyped[record.daemonTyped.length - 1];
+                  noteCompactDaemonTyped(record.file, typedAt, true);
+                  if (Array.isArray(record.daemonTyped)) record.daemonTyped = record.daemonTyped.slice(0, -1);
+                },
               });
             } catch (error) {
               if (error && error.nothingTyped) {
@@ -4588,7 +4621,10 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
     if (swap && swap.switchCommand) {
       pendingSwapFile = writePendingCompactSwap(session, swap, dir);
       try {
-        await (deps.typeAndSubmit || typeAndSubmit)(target, swap.switchCommand, claudeTypedTextVisible, deps);
+        const typedAt = Date.now();
+        await (deps.typeAndSubmit || typeAndSubmit)(target, swap.switchCommand, claudeTypedTextVisible, { ...deps,
+          beforeEnterKey: () => noteCompactDaemonTyped(pendingSwapFile, typedAt),
+          enterKeyDropped: () => noteCompactDaemonTyped(pendingSwapFile, typedAt, true) });
       } catch (e) {
         result = { compacted: false, reason: String(e && e.message || e), via };
       }
@@ -4690,7 +4726,10 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
         deferral = { reason: 'model-exhausted', resetAt: Number(policy.exhaustedResetAt) || null };
       } else {
         try {
-          await (deps.typeAndSubmit || typeAndSubmit)(target, swap.restoreCommand, claudeTypedTextVisible, deps);
+          const typedAt = Date.now();
+          await (deps.typeAndSubmit || typeAndSubmit)(target, swap.restoreCommand, claudeTypedTextVisible, { ...deps,
+            beforeEnterKey: () => noteCompactDaemonTyped(pendingSwapFile, typedAt),
+            enterKeyDropped: () => noteCompactDaemonTyped(pendingSwapFile, typedAt, true) });
           restored = await (deps.waitForModelSwitch || waitForModelSwitch)(target, swap.restoreCommand, sid, deps);
         } catch {}
         if (!restored) {

@@ -2410,7 +2410,10 @@ is left with the person's key, the refusal is logged, and the record waits
 runs again under the lock right before typing. Second, if the
 transcript shows a model someone chose by hand after the swap (a confirmed `/model` other
 than the daemon's own switch and restore rows, compared as exact ids so dropping the
-`[1m]` window counts, or an assistant turn on a third model), the
+`[1m]` window counts; a row is the daemon's only when its text matches and its timestamp
+is within 15 seconds of an Enter the daemon journalled on the swap record as
+`daemonTyped`, so a hand pick of exactly a restore id the daemon never typed, or typed at
+another time, still counts, and a row with no timestamp counts; or an assistant turn on a third model), the
 pass retires the record without typing the restore or repairing `settings.json`, and logs
 `retired model restore record … not restoring … over it`.
 
