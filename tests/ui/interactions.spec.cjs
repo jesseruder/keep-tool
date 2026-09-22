@@ -370,3 +370,21 @@ test('status messages sit in the footer and never move the header', async ({ pag
     await page.evaluate(() => { document.querySelector('#connection').hidden = true; });
   }
 });
+test('a busy desktop header keeps its controls on one row and moves only the meters', async ({ page }) => {
+  await page.evaluate(() => {
+    document.documentElement.classList.add('desktop');
+    document.querySelector('#qcount').textContent = '128';
+    document.querySelector('#qcount').classList.remove('zero');
+    for (const badge of document.querySelectorAll('.modes [data-mode="reviewer"] .nw, #dockbtn .nw')) { badge.hidden = false; badge.textContent = '12 new'; }
+    document.querySelectorAll('#sessionHistory button').forEach((button) => { button.disabled = false; });
+    document.querySelector('#soundButton').hidden = false;
+  });
+  for (const width of [1620, 1590, 1560, 1520, 1500, 1450]) {
+    await page.setViewportSize({ width, height: 950 });
+    const tops = await page.evaluate(() => [...document.querySelector('header.bar').children]
+      .filter((el) => el.id !== 'meters' && el.getBoundingClientRect().width > 0)
+      .map((el) => Math.round(el.getBoundingClientRect().top + el.getBoundingClientRect().height / 2)));
+    expect(Math.max(...tops) - Math.min(...tops), `controls share a row at ${width}`).toBeLessThan(12);
+    expect(await page.locator('.bar').evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+  }
+});
