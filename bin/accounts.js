@@ -205,15 +205,19 @@ function locateClaudeFiles(sessionId, env = process.env) {
   for (const entry of projectRoots(env)) {
     let projectNames;
     try { projectNames = fs.readdirSync(entry.root); } catch { continue; }
+    let first = null;
     for (const projectName of projectNames) {
       const file = path.join(entry.root, projectName, `${sessionId}.jsonl`);
       try {
         if (fs.statSync(file).isFile()) {
           found.push({ accountId: entry.accountId, file, projectName });
-          rememberClaudeFile(entry.root, sessionId, projectName);
+          first ||= projectName;
         }
       } catch {}
     }
+    // The first match in walk order, which is the one findSessionFile picks within
+    // an account.
+    if (first) rememberClaudeFile(entry.root, sessionId, first);
   }
   return found;
 }

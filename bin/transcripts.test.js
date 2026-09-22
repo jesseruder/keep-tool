@@ -142,4 +142,22 @@ test('a pinned session is answered from the transcript an earlier walk found, wi
   fs.rmSync(onB);
   assert.equal(findSessionFile(id, { root: registry, env }), onA);
   assert.equal(walks, 2);
+
+  // Two copies in one account: the direct path answers with the copy the walk
+  // itself chose, the first in walk order, not whichever it saw last.
+  const twice = `${id}-twice`;
+  const copy = (project) => {
+    const file = path.join(root, 'b', 'projects', project, `${twice}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{}\n');
+    return file;
+  };
+  const copies = [copy('aaa-first'), copy('zzz-last')];
+  accounts.pinSession(twice, 'claude', 'b', { root: registry, env });
+  const walked = findSessionFile(twice, { root: registry, env });
+  assert.ok(copies.includes(walked));
+  assert.equal(walks, 3);
+  assert.equal(findSessionFile(twice, { root: registry, env }), walked);
+  assert.equal(findSessionFile(twice, { root: registry, env }), walked);
+  assert.equal(walks, 3);
 });

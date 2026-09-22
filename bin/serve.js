@@ -2242,7 +2242,15 @@ async function hostRequest(type, params, deps = {}) {
       if (['spawn', 'meta', 'kill', 'remove', 'resize', 'clear'].includes(type)) hostPaneCaches.delete(client);
       // A spawn or a meta change can be the session's first pane or a new id on an
       // old one; a transcript lookup that missed before it must be asked again.
-      if (type === 'spawn' || type === 'meta') forgetClaudeSessionMisses();
+      // A meta patch concerns one pane, so only that pane's session is asked again
+      // (the id the patch sets, else the one the reply's pane carries); a spawn, or a
+      // meta change naming no session, forgets them all.
+      if (type === 'spawn') forgetClaudeSessionMisses();
+      else if (type === 'meta') {
+        const named = [params?.patch?.sessionId, result?.pane?.meta?.sessionId].filter((id) => typeof id === 'string' && id);
+        if (named.length) for (const id of named) forgetClaudeSessionMisses(id);
+        else forgetClaudeSessionMisses();
+      }
       // The host answers with its own id. The daemon asked about a pane it knows by
       // its fleet-wide name, and everything downstream — manual close, retirement's
       // identity checks, force-restart — compares the reply against that name, so
@@ -10078,9 +10086,15 @@ function claudeSessionForEntry(id, file, stat, accountId = null) {
 // A hosted session whose transcript does not exist yet (a pane opened and not yet
 // spoken to) misses on every state build, and each miss walks every account's
 // project tree. Build paths may take a recent miss as the answer for a short
-// while; action paths never read this. A pane appearing for the session, or a
-// spawn or meta change on the host, forgets it early.
-const CLAUDE_SESSION_MISS_TTL_MS = 30e3;
+// while: the rate-limit policy source, and the fresh resolver's fallback for an id
+// its just-scanned index covers (the index has just agreed with the miss). Direct
+// action reads, and the fresh resolver's fallback for an account the index does not
+// cover, never read it. A pane appearing for the session, a spawn, or a meta change
+// for that session forgets it early.
+//
+// Longer than the 30s handoff queue tick, so each policy read lands inside the
+// window of the previous tick's miss instead of racing its expiry.
+const CLAUDE_SESSION_MISS_TTL_MS = 45e3;
 const CLAUDE_SESSION_MISS_LIMIT = 2048;
 const claudeSessionMisses = new Map(); // session id -> when the miss was seen
 const hostPaneSessionSignatures = new Map(); // session id -> the pane it was last seen in
@@ -10120,7 +10134,14 @@ function claudeSessionFor(sessionId, options = {}) {
     const missedAt = claudeSessionMisses.get(id);
     if (missedAt !== undefined && now >= missedAt && now - missedAt < CLAUDE_SESSION_MISS_TTL_MS) return null;
   }
-  const find = options.findSessionFile || findSessionFile;
+  const root = options.root || keep.ROOT;
+  const env = options.env || process.env;
+  const find = options.findSessionFile || ((sessionId) => findSessionFile(sessionId, { root, env }));
+  // Durable authority only: letting forSession discover would walk every account's
+  // project tree for a file this lookup finds anyway. A throw (an unfinished
+  // handoff, an unavailable account) leaves it null and the cached file standing.
+  let record = null;
+  try { record = accounts.forSession(id, 'claude', { root, env, allowDiscovery: false }); } catch {}
   let file = claudeSessionPathCache.get(id) || null;
   let stat;
   if (file) {
@@ -10132,6 +10153,14 @@ function claudeSessionFor(sessionId, options = {}) {
     if (file && !stat.isFile()) {
       claudeSessionPathCache.delete(id);
       claudeSessionParseCache.delete(file);
+      file = null;
+    }
+    // An account handoff copies the transcript and leaves the source's in place, so
+    // a remembered file can be the old account's, carrying its old rate limit.
+    // Authority that now names another account sends the lookup back through
+    // findSessionFile, whose pinned path answers from that account.
+    if (file && record && accounts.claudeAccountForFile(file, env) !== record.id) {
+      claudeSessionPathCache.delete(id);
       file = null;
     }
   }
@@ -10148,15 +10177,11 @@ function claudeSessionFor(sessionId, options = {}) {
   }
   claudeSessionMisses.delete(id);
   cacheClaudeSessionLookup(claudeSessionPathCache, id, file);
-  // Durable authority only: letting forSession discover here would walk every
-  // account's project tree again for a file already in hand. With no record, the
-  // account is the one whose projects root holds that file, which is what
-  // discovery would have answered (findSessionFile already refused an ambiguous one).
+  // With no record, the account is the one whose projects root holds the file,
+  // which is what discovery would have answered (findSessionFile already refused
+  // an ambiguous one). A record that threw names no account, as before.
   let accountId = null;
-  try {
-    const record = accounts.forSession(id, 'claude', { root: keep.ROOT, allowDiscovery: false });
-    accountId = record ? record.id || null : accounts.claudeAccountForFile(file);
-  } catch {}
+  try { accountId = record ? record.id || null : accounts.claudeAccountForFile(file, env); } catch {}
   return claudeSessionForEntry(id, file, stat, accountId);
 }
 
@@ -10229,20 +10254,30 @@ function createDashboardClaudeSessionResolver(deps = {}) {
 // the rows scanClaudeSessions just read with fresh=true — which is what lets action
 // paths (inspectAccountHandoff, inspectPortableSource) use it. An id those rows do
 // not hold, or one pinned to an account the index does not cover (added since the
-// daemon started), goes to the exact lookup instead. That lookup may reuse a miss
-// from the last few seconds: the fresh rows have just agreed with it.
+// daemon started), goes to the exact lookup instead. That lookup may reuse a recent
+// miss only when the index covers every account the transcript could be in: then
+// the fresh rows have just agreed with the miss. Where it does not, the index never
+// looked, and a remembered miss could hide a first turn from an action path.
 function createFreshClaudeSessionResolver(deps = {}) {
   const rows = deps.rows || claudeTranscriptIndex.scan({ fresh: true });
   const authority = deps.authority || accounts.authority(deps.root || keep.ROOT);
   const indexedAccounts = new Set(deps.accountIds || claudeProjectRoots.map((entry) => entry.accountId));
+  // A session with no record can be in any configured account, including one the
+  // index was not built with.
+  const configuredAccounts = deps.configuredAccountIds
+    || accounts.projectRoots(deps.env || process.env).map((entry) => entry.accountId);
+  const everyAccountIndexed = configuredAccounts.every((accountId) => indexedAccounts.has(accountId));
   const known = new Set(rows.map((row) => row.id));
   const indexed = createDashboardClaudeSessionResolver({ ...deps, rows, authority, accountIds: [...indexedAccounts] });
-  const exact = deps.claudeSessionFor || ((id) => claudeSessionFor(id, { allowCachedMiss: true }));
+  const exact = deps.claudeSessionFor || ((id, options) => claudeSessionFor(id, options));
   return (sessionId) => {
     const id = String(sessionId || '');
     const record = authority[id];
-    const covered = !record || record.agent !== 'claude' || indexedAccounts.has(record.accountId);
-    return known.has(id) && covered ? indexed(id) : exact(id);
+    const covered = record
+      ? record.agent !== 'claude' || indexedAccounts.has(record.accountId)
+      : everyAccountIndexed;
+    if (known.has(id) && covered) return indexed(id);
+    return covered ? exact(id, { allowCachedMiss: true }) : exact(id, {});
   };
 }
 

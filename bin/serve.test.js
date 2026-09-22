@@ -11187,18 +11187,32 @@ test('a state build outside the dashboard resolves host-only Claude panes from o
     { id: 'new-account', accountId: 'a', file: '/a/one/new-account.jsonl', stat: { size: 2, mtimeMs: 2 } },
   ];
   const exact = [];
-  const resolve = createFreshClaudeSessionResolver({
+  const resolverFor = (configuredAccountIds) => createFreshClaudeSessionResolver({
     rows,
     accountIds: ['a'],
+    configuredAccountIds,
     authority: { 'new-account': { agent: 'claude', accountId: 'added-later' } },
     sessionForEntry: (id, file, stat, accountId) => ({ id, file, accountId }),
-    claudeSessionFor: (id) => { exact.push(id); return null; },
+    claudeSessionFor: (id, options) => { exact.push([id, options.allowCachedMiss === true]); return null; },
   });
-  assert.deepEqual(resolve('indexed'), { id: 'indexed', file: '/a/one/indexed.jsonl', accountId: 'a' });
-  assert.equal(resolve('not-yet-written'), null);
+  // An account configured since the index was built: a session with no record may
+  // live there, so even an indexed id is asked for exactly, and never from a
+  // remembered miss.
+  const resolve = resolverFor(['a', 'added-later']);
   assert.equal(resolve('new-account'), null);
-  assert.deepEqual(exact, ['not-yet-written', 'new-account'],
-    'an id the snapshot does not hold, or one pinned outside it, is asked for exactly');
+  assert.equal(resolve('not-yet-written'), null);
+  assert.equal(resolve('indexed'), null);
+  assert.deepEqual(exact, [['new-account', false], ['not-yet-written', false], ['indexed', false]],
+    'where the index never looked, the exact lookup is asked without any remembered miss');
+
+  // Every configured account indexed: the snapshot answers, and a miss the fresh
+  // rows agree with may be reused.
+  exact.length = 0;
+  const covered = resolverFor(['a']);
+  assert.deepEqual(covered('indexed'), { id: 'indexed', file: '/a/one/indexed.jsonl', accountId: 'a' });
+  assert.equal(covered('not-yet-written'), null);
+  assert.equal(covered('new-account'), null);
+  assert.deepEqual(exact, [['not-yet-written', true], ['new-account', false]]);
 });
 
 test('a Claude transcript miss is reused by build paths for a short while and forgotten when a pane appears', async () => {
@@ -11214,6 +11228,9 @@ test('a Claude transcript miss is reused by build paths for a short while and fo
   assert.equal(claudeSessionFor(id, { findSessionFile, now: () => clock }), null);
   assert.equal(walks, 2, 'an action path never takes a remembered miss as its answer');
   clock += 31e3;
+  claudeSessionFor(id, build);
+  assert.equal(walks, 2, 'still remembered one handoff-queue tick later');
+  clock += 15e3;
   claudeSessionFor(id, build);
   assert.equal(walks, 3, 'the miss expires');
   claudeSessionFor(id, build);
@@ -11232,7 +11249,43 @@ test('a Claude transcript miss is reused by build paths for a short while and fo
   await hostRequest('spawn', { cmd: '/bin/sh' }, { host });
   claudeSessionFor(id, build);
   assert.equal(walks, 5, 'a spawn forgets every remembered miss');
+
+  // A meta patch forgets only the session it concerns.
+  const metaHost = (sessionId) => ({ request: async () => ({ pane: { id: 'pane-meta', meta: { sessionId } } }) });
+  await hostRequest('meta', { pane: 'pane-meta', patch: { title: 'x' } }, { host: metaHost('some-other-session') });
+  claudeSessionFor(id, build);
+  assert.equal(walks, 5, 'a meta change on another session leaves this miss alone');
+  await hostRequest('meta', { pane: 'pane-meta', patch: { sessionId: id } }, { host: metaHost(id) });
+  claudeSessionFor(id, build);
+  assert.equal(walks, 6, 'a meta change naming this session forgets its miss');
   forgetClaudeSessionMisses();
+});
+
+test('a remembered transcript path follows the account its session was moved to', (t) => {
+  const { claudeSessionFor } = require('./serve.js');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-moved-transcript-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const config = path.join(base, 'config.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'a', label: 'Claude A', agent: 'claude', configDir: path.join(base, 'a') },
+    { id: 'b', label: 'Claude B', agent: 'claude', configDir: path.join(base, 'b') },
+  ], defaultAccounts: { claude: 'a' } }));
+  const env = { ...process.env, KEEP_CONFIG: config, KEEP_DIR: path.join(base, 'registry') };
+  const root = env.KEEP_DIR;
+  const id = `moved-${process.pid}-${Date.now()}`;
+  // A handoff copies the transcript and leaves the source's copy where it was.
+  for (const [account, text] of [['a', '{}\n'], ['b', '{}\n{}\n']]) {
+    const file = path.join(base, account, 'projects', 'project', `${id}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, text);
+  }
+  const accountsModule = require('./accounts');
+  accountsModule.pinSession(id, 'claude', 'a', { root, env });
+  const before = claudeSessionFor(id, { root, env });
+  assert.deepEqual([before.accountId, before.size], ['a', 3]);
+  accountsModule.pinSession(id, 'claude', 'b', { root, env, transfer: true });
+  const after = claudeSessionFor(id, { root, env });
+  assert.deepEqual([after.accountId, after.size], ['b', 6], 'the new account transcript, not the remembered one');
 });
 
 test('the rate-limit policy reads only live Claude panes, with the pane account winning', async () => {
