@@ -145,18 +145,21 @@ this launcher.
 
 ## Codex model
 
-Pass `--model` explicitly for each handoff. Owner's standing preference is to spend
-Sol on implementation and routine review, reserving Astra for difficult work.
+Pass `--model` explicitly for each handoff. Owner's standing preference is to use
+Sol for implementation and review, and Astra only when he approves it.
 This replaces the old rule to inherit the global model and check it against the
-highest-priority cached model. Leave `~/.codex/config.toml` unchanged: its Astra
-default is for interactive Codex sessions, not every Claude handoff.
+highest-priority cached model. Leave `~/.codex/config.toml` unchanged: its default
+is for interactive Codex sessions, not every Claude handoff.
 
 - Default implementation: `--model gpt-5.6-sol`.
 - Clearly mechanical, bounded work: `gpt-5.6-terra` or `gpt-5.6-luna` when appropriate.
-- Difficult work that needs Astra's judgment, or a substantive issue Sol could not
-  resolve: `--model gpt-6-astra`. Do not retry an unchanged failing prompt repeatedly.
-- Reviews follow `codex-review-runner`: Sol at medium routinely, Astra at high for
-  risky/security-sensitive changes or difficult unresolved findings.
+- Difficult work, daemon code included: Sol at a higher effort. Do not retry an
+  unchanged failing prompt repeatedly.
+- Astra (`--model gpt-6-astra`) only after asking Owner in this session and getting a
+  yes: say what Sol could not do and why Astra would. His yes covers that handoff, not
+  the card or later work.
+- Reviews follow `codex-review-runner`: Sol at medium, Astra only with Owner's yes,
+  and the latest Opus (the `opus` alias) when every Codex account is out of usage.
 
 An explicit choice by Owner overrides these defaults. State the selected model and effort, and pass the exact `--model` and `--effort`
 flags to `keep codex`. Do not ask again just to
@@ -179,8 +182,9 @@ ladder one notch lower:
 | normal feature work, multi-file changes | `high` | `medium` |
 | gnarly debugging, architecture decisions, anything that already failed once | `xhigh` | `high` |
 
-`xhigh` on Astra only when Owner asks for it. Reviews use the separate policy in
-`codex-review-runner`: Sol at medium routinely, Astra at high for deep reviews.
+The Astra column applies only once Owner has approved Astra; `xhigh` on Astra only
+when he asks for it. Reviews use the separate policy in `codex-review-runner`: Sol at
+medium, Astra only with Owner's yes.
 For mechanical Luna handoffs, use low.
 
 The plugin only accepts `none|minimal|low|medium|high|xhigh`. Some models support `max` and `ultra`, but those are unreachable through the companion runtime used by `keep codex` — they require invoking `codex` directly.

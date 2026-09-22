@@ -1,6 +1,6 @@
 ---
 name: codex-review-runner
-description: Run an independent Codex review after nontrivial code changes using Keep's account-aware background task launcher, then record it on the card (keep reviewed) and land through Keep (keep land). Use for routine and adversarial Codex reviews from Claude Code, and before pushing or landing reviewed commits.
+description: Run an independent Codex review after nontrivial code changes using Keep's account-aware background task launcher, then record it on the card (keep reviewed) and land through Keep (keep land). Sol by default, Astra only with Owner's yes, the latest Opus when every Codex account is out of usage. Use for routine and adversarial reviews from Claude Code, and before pushing or landing reviewed commits.
 ---
 
 # Running a Codex review
@@ -17,16 +17,26 @@ rules. Keep the selected account explicit throughout candidate lookup, launch,
 status, result, and cancellation. A review may use a different account from the
 implementation; its own lifecycle stays bound to the review's account.
 
-Use `--model gpt-5.6-sol --effort medium` routinely. For risky or security-sensitive
-changes, or difficult findings the routine review could not resolve, use
-`--model gpt-6-astra --effort high` and request an adversarial review. Choose one
-initially, not both. Astra xhigh requires Owner's explicit request.
+Every review uses `--model gpt-5.6-sol --effort medium`, including risky,
+security-sensitive and daemon changes, and every re-review of a fix. For those, ask
+Sol for an adversarial review and name the failure modes to challenge rather than
+reaching for a bigger model. Sol at `high` is the next step when a medium review
+cannot settle a finding.
+
+Never use Astra (`gpt-6-astra`) for a review without asking Owner first, in that
+session, for that review. Say why Sol is not enough and what the Astra run would
+cost; a yes covers the one review series he approved, not the card or later work.
+Until he answers, run the Sol review. Astra xhigh requires his explicit request.
 
 0. Run `keep review-route`. It names the Codex account to use, or says every one of
    them is at its usage limit. In that case use the fallback it names — and only that
-   one — and record the review with `--by "opus …" --fallback` and 80+ characters of
-   `--evidence`; `--fallback` is what stamps the record, and Keep fills in what the
-   exhaustion was. If it says no fallback is
+   one. For `opus`, run the review as a read-only subagent on the latest Opus: from
+   Claude Code, the Agent tool with `model: "opus"`, which always resolves to the
+   newest Opus, so never pin a versioned id like `claude-opus-5-5`. Give it the same
+   read-only review prompt, ask for the ranked findings inline in its reply, and
+   record the review with `--by "opus …" --fallback` and 80+ characters of
+   `--evidence` summarising what it checked; `--fallback` is what stamps the record,
+   and Keep fills in what the exhaustion was. If it says no fallback is
    configured, say so on the card and stop rather than improvising a reviewer. When a
    Codex launch fails on a usage limit, record it with
    `keep review-route --exhausted <account> --until <reset> -m "..."` so the next
