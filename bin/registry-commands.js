@@ -13,7 +13,10 @@ const REGISTRY_COMMANDS = Object.freeze([
   'add', 'checkin', 'claim', 'done', 'list', 'show', 'resume', 'overdue', 'needs', 'allow',
   'reviewed', 'reviewing', 'reviews', 'review-route', 'plan', 'link', 'tag', 'tags', 'hold',
   'release', 'holds', 'resources', 'who', 'deps', 'wait-on', 'decide', 'decisions', 'notes',
-  'note', 'retitle', 'project', 'landed', 'health', 'stalled', 'standup',
+  'retitle', 'project', 'landed', 'health', 'stalled', 'standup',
+  // Not `note`: posting one makes the daemon type it into every live session in the
+  // project (/api/notes/announce), the laptop's included. It waits for an announce
+  // that knows which node wrote the note.
   // Read-only: what a node's `keep land` needs from the registry to decide a land.
   'land-facts',
 ]);
@@ -32,10 +35,17 @@ const COMMAND_FLAGS = Object.freeze(['--probe', '--done-when', '--verify']);
 //   --on-pass  add/checkin: re-arms that recipe on a schedule.
 // Left allowed, and why: --check-after alone schedules a bare nudge with no recipe;
 // --check-every and checkin --handoff act only on a recipe already on the card,
-// which a node cannot have written; plan step text, --next and -m are recorded and
-// shown, never delivered as a prompt; decide --send is recorded, never sent;
-// resources --command/--deploy are patterns matched against commands, never run;
-// wait-on --deployed/--target and needs --env name facts, not text.
+// which a node cannot have written; --next and -m are recorded and shown; decide
+// --send is recorded, never sent; resources --command/--deploy are patterns
+// matched against commands, never run; wait-on --deployed/--target and needs --env
+// name facts, not text.
+// Card titles (add, retitle) and plan step text DO reach laptop sessions: the
+// daemon quotes them into the check and unblock prompts it delivers. They are
+// trusted node input, by the same trust that lets a node push to master and land:
+// a node with a token is one of Owner's own machines, and what this list keeps it
+// from is writing a recipe or a command, not naming its own work. `note`, whose
+// text the daemon types straight into every live session in the project, is left
+// out of REGISTRY_COMMANDS until that announce knows which node wrote the note.
 const INSTRUCTION_FLAGS = Object.freeze(['--check', '--on-pass']);
 
 const MAX_ARG_BYTES = 4 * 1024;

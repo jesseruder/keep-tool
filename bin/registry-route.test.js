@@ -111,6 +111,22 @@ test('only the listed registry commands run, and never a command-bearing flag', 
   assert.equal(REGISTRY_COMMANDS.includes('artifact'), false);
 });
 
+// A note is announced by typing it into every live session in the project, the
+// laptop's included: node-written text a laptop session would read as a message.
+// Reading notes is fine.
+test('keep note is not run for a node, and keep notes is', async (t) => {
+  const { svc, root, calls } = service(t);
+  const note = await svc.handle(AWS1, body(root, { command: 'note', args: ['-m', 'deploying now'], idempotencyKey: `${KEY}-note` }));
+  assert.equal(note.status, 400);
+  assert.equal(note.body.error, '"note" is not a registry command');
+  assert.equal(calls.length, 0);
+  assert.equal(REGISTRY_COMMANDS.includes('note'), false);
+  const notes = await svc.handle(AWS1, body(root, { command: 'notes', args: [], idempotencyKey: `${KEY}-notes` }));
+  assert.equal(notes.status, 200, JSON.stringify(notes.body));
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args.slice(1), ['notes']);
+});
+
 test('a node cannot write a check recipe the daemon would hand a session, but can schedule a check', async (t) => {
   const { svc, root, calls } = service(t);
   const cases = [
