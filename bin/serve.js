@@ -10189,7 +10189,12 @@ function claudeSessionFromInfo(id, info, stat, dir, reviewer, now, accountId = n
   };
 }
 
-function claudeSessionForEntry(id, file, stat, accountId = null) {
+// `interactiveOnly` applies the fleet scan's filter (claudeTranscriptIsInteractive,
+// the same predicate scanClaudeSessions skips on): a caller that must not reach a
+// session the fleet would not list, such as a tell, gets null for a headless
+// `claude -p` transcript. Without it an exact lookup keeps any transcript, which is
+// what hosted-pane backfill and delivery prechecks want.
+function claudeSessionForEntry(id, file, stat, accountId = null, options = {}) {
   let info;
   const cached = claudeSessionParseCache.get(file);
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
@@ -10198,6 +10203,7 @@ function claudeSessionForEntry(id, file, stat, accountId = null) {
     info = scanTranscript(file);
     cacheClaudeSessionLookup(claudeSessionParseCache, file, { mtimeMs: stat.mtimeMs, size: stat.size, info });
   }
+  if (options.interactiveOnly === true && !claudeTranscriptIsInteractive(file, info, stat)) return null;
   const dir = path.basename(path.dirname(file));
   let reviewer = false;
   try { reviewer = fs.readdirSync(path.join(keep.ROOT, '.keep', 'reviewer')).includes(id); } catch {}
@@ -10317,7 +10323,7 @@ function claudeSessionFor(sessionId, options = {}) {
   if (!recordFailed) {
     try { accountId = record ? record.id || null : accounts.claudeAccountForFile(file, env); } catch {}
   }
-  return claudeSessionForEntry(id, file, stat, accountId);
+  return claudeSessionForEntry(id, file, stat, accountId, { interactiveOnly: options.interactiveOnly === true });
 }
 
 // Host-only sessions were absent from the recent-session result, but their old
@@ -10528,23 +10534,7 @@ function scanClaudeSessions(options = {}) {
     if (ageMs > SESSION_WINDOW_MS) continue;
     const session = cached ? cached.session : claudeSessionFromInfo(id, info, stat, dir, reviewers.has(id), now, accountId);
     if (cached?.backgroundJobs) options.onSettledHit?.(session, cached.backgroundJobs);
-    try {
-      const markerFile = path.join(attentionDir, `${id}.json`);
-      const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
-      if (marker.source !== 'codex') {
-        const at = Number(marker.at);
-        // Liveness follows timestamped conversation activity, not raw file writes:
-        // Claude appends untimestamped metadata when old sessions are reopened.
-        // Prefer the mtime captured at hook time (mt); fall back to wall-clock for
-        // markers written by older hooks.
-        const ref = Number.isFinite(Number(marker.mt)) ? Number(marker.mt) + 1500 : at + 5000;
-        if (!Number.isFinite(at) || now - at > 24 * 3600e3 || activityMs > ref) {
-          if (!readOnly) try { fs.unlinkSync(markerFile); } catch {}
-        } else if (['permission', 'waiting', 'complete'].includes(marker.type)) {
-          session.notify = { type: marker.type, message: String(marker.message || '').slice(0, 200) };
-        }
-      }
-    } catch {}
+    attachClaudeMarker(session, attentionDir, now, activityMs, readOnly);
     sessions.push(session);
     options.onSessionSource?.(session, file, stat);
   }
@@ -10567,6 +10557,31 @@ function scanClaudeSessions(options = {}) {
   } catch {}
   sessions.sort((a, b) => b.mtime - a.mtime);
   return sessions;
+}
+
+// A Claude session's attention marker, as the hooks wrote it: a pending permission
+// prompt, an idle wait, or a completed turn. Shared by the fleet scan and the
+// per-session read a tell makes (loadTellSession), so the two cannot disagree about
+// whether a session is holding a prompt. A stale marker is deleted only by a caller
+// that may write.
+function attachClaudeMarker(session, attentionDir, now, activityMs, readOnly) {
+  try {
+    const markerFile = path.join(attentionDir, `${session.id}.json`);
+    const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
+    if (marker.source !== 'codex') {
+      const at = Number(marker.at);
+      // Liveness follows timestamped conversation activity, not raw file writes:
+      // Claude appends untimestamped metadata when old sessions are reopened.
+      // Prefer the mtime captured at hook time (mt); fall back to wall-clock for
+      // markers written by older hooks.
+      const ref = Number.isFinite(Number(marker.mt)) ? Number(marker.mt) + 1500 : at + 5000;
+      if (!Number.isFinite(at) || now - at > 24 * 3600e3 || activityMs > ref) {
+        if (!readOnly) try { fs.unlinkSync(markerFile); } catch {}
+      } else if (['permission', 'waiting', 'complete'].includes(marker.type)) {
+        session.notify = { type: marker.type, message: String(marker.message || '').slice(0, 200) };
+      }
+    }
+  } catch {}
 }
 
 function attachCodexMarkers(sessions, attentionDir, now, options = {}) {
@@ -12797,6 +12812,160 @@ function tellSessions(dry, deps = {}) {
   return scan({ readOnly: true, allocateNumbers: false });
 }
 
+// A tell names its sessions: one id, a console number, or a card's linked ids. The
+// fleet scan answers for every session on the machine — it re-lists every project
+// directory, stats every transcript (tens of thousands) and parses every recent
+// tail — and on the daemon that held the event loop for over a second per tell, of
+// which the tell used one row. This builds the same row for one id from the
+// per-session readers the delivery prechecks already use (claudeSessionFor,
+// codex.sessionFor, pi.sessionFor: a stat and, when the transcript moved, a re-read
+// of its tail), plus the parts of the scan a tell's guards and receipt read: the
+// attention marker (a pending permission prompt), hand-typed names and marks, and
+// the console number, read-only. It writes nothing: no stale marker is deleted and
+// no number allocated, both of which the next fleet scan still does.
+//
+// A session the scan would not list is not a target here either, and each skip is
+// the scan's own predicate, not a copy of it:
+//   - Claude: claudeTranscriptIsInteractive (via claudeSessionFor's interactiveOnly),
+//     so a headless `claude -p` transcript is absent; the account authority pins
+//     the file as it does for the scan.
+//   - Codex: codex.isChildSession / codex.isHeadlessSession on the rollout's
+//     session_meta, the pair scanRollout filters on (codex.sessionFor itself already
+//     drops children but keeps exec runs), and the scan's Companion-task title skip.
+//     A staged handoff or an ambiguous unpinned id has no row from sessionFor either.
+//   - The 48 h window on the row's activity time, for Claude and Codex; the scan
+//     applies none to Pi, so neither does this.
+// The one skip deliberately not repeated is keep-spawned: the scan drops those rows,
+// and a tell reading one here refuses it by name (keep-spawned) instead of calling
+// the id unknown, which is the answer the sender can act on.
+//
+// So an unknown id still reads as "bad session id" and a card's stale link as not
+// live. One on another node has no transcript here; it comes back as a bare row
+// carrying its node, so the tell refuses it by name (remoteDeliveryRefusal), and
+// with mtime 0 so a card ranks a local sibling first.
+function loadTellSession(id, deps = {}) {
+  const sessionId = String(id || '');
+  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return null;
+  const root = deps.root || keep.ROOT;
+  const node = sessionNodeOf({ id: sessionId }, deps);
+  if (node !== daemonNodeName(deps)) return { id: sessionId, node, mtime: 0 };
+  // The account record names the agent when there is one, which spares a Codex or
+  // Pi id the walk a Claude miss makes of every project directory.
+  let agent = null;
+  try { agent = JSON.parse(fs.readFileSync(accounts.authorityFile(root, sessionId), 'utf8')).agent || null; } catch {}
+  const order = ['claude', 'codex', 'pi'].includes(agent) ? [agent] : ['claude', 'codex', 'pi'];
+  let session = null;
+  for (const kind of order) {
+    try {
+      if (kind === 'claude') session = claudeSessionFor(sessionId, { root, interactiveOnly: true });
+      else if (kind === 'codex') session = codexFleetSession(sessionId);
+      else session = pi.sessionFor(sessionId, { root });
+    } catch { session = null; }
+    if (session) break;
+  }
+  if (!session) return null;
+  const now = Date.now();
+  if (session.kind !== 'pi' && !(now - Number(session.mtime) <= SESSION_WINDOW_MS)) return null;
+  const attentionDir = path.join(root, '.keep', 'attention');
+  if (session.kind === 'claude') attachClaudeMarker(session, attentionDir, now, Number(session.mtime), true);
+  else if (session.kind === 'codex') attachCodexMarkers([session], attentionDir, now, { readOnly: true });
+  sessionNames.apply([session], { root });
+  sessionMarks.apply([session], { root });
+  sessionNumbers.assign([session], { root, readOnly: true });
+  return session;
+}
+
+// codex.sessionFor keeps exec (headless) rollouts, because an explicitly hosted one
+// is a conversation there. The fleet scan does not list them, nor children, nor a
+// Companion task, and a tell targets only what the fleet lists. The title prefix is
+// the one codex.js scan() tests inline; it has no exported predicate to share.
+function codexFleetSession(sessionId) {
+  const session = codex.sessionFor(sessionId);
+  if (!session) return null;
+  const meta = codex.sessionMetaFor(sessionId);
+  if (!meta || codex.isChildSession(meta) || codex.isHeadlessSession(meta)) return null;
+  if (String(session.title || '').startsWith('Codex Companion Task:')) return null;
+  return session;
+}
+
+// Where a tell's rows come from. `row(id)` is one session's row (null when there is
+// none), `peek(id)` a row already in hand without reading anything, `list()` every
+// session (only a prefix needs it), and `fresh(id)` a new read for the re-check
+// inside the injection lock.
+//
+// A dry run keeps the snapshot path tellSessions gives it: it promises to write
+// nothing, and a snapshot under 5 s old costs nothing. A caller that injects
+// `scanSessions` (the tests) gets its rows from that scan, as before. Every other
+// real tell reads the sessions it names and nothing else.
+function tellRowSource(dry, deps = {}) {
+  if (dry || deps.scanSessions) {
+    let rows = null;
+    const all = () => (rows ||= tellSessions(dry, deps));
+    const find = (id) => all().find((session) => session && session.id === id) || null;
+    return {
+      scanned: true,
+      row: find,
+      peek: find,
+      list: all,
+      fresh: (id) => tellSessions(false, deps).find((session) => session && session.id === id) || null,
+    };
+  }
+  const load = deps.loadTellSession || loadTellSession;
+  const loaded = new Map();
+  return {
+    scanned: false,
+    row: (id) => {
+      if (!loaded.has(id)) loaded.set(id, load(id, deps) || null);
+      return loaded.get(id);
+    },
+    peek: (id) => loaded.get(id) || null,
+    // A prefix is the one address that names no session until it is matched against
+    // the ids that exist, so it is the one case that lists. Bounded is enough to
+    // find the id: the row the tell then acts on is read fresh with row(), and the
+    // injection lock reads it again before the first character.
+    list: () => (deps.listTellSessions || (() => (Date.now() - sessionSnapshotAt < 5000 && sessionSnapshot.length
+      ? copySessions(sessionSnapshot)
+      : scanSessions({ readOnly: true, allocateNumbers: false, fresh: false }))))(),
+    fresh: (id) => load(id, deps) || null,
+  };
+}
+
+// resolveSessionId's addressing — an exact id, a console number (`#12`, `12`,
+// `s12`), or a prefix of eight characters or more — answered from the named rows
+// instead of the fleet. A number goes through the numbers registry read-only, as
+// `keep pane` resolves one (bin/commands/host.js resolveHostPane). resolveSessionId
+// lets a session literally named `12` win over #12; here a number is looked up
+// first and read as a literal id only when no session holds it, because trying a
+// numeral as an id first would cost every numbered tell a walk of every project
+// directory for an id no transcript has. Such a session is still reachable by its
+// full id whenever #12 belongs to another session; real ids are UUIDs, so this is
+// a corner nobody has yet.
+function resolveTellTarget(value, source, deps = {}) {
+  if (deps.resolveSessionId || source.scanned) {
+    return (deps.resolveSessionId || resolveSessionId)(value, { ...deps, scanSessions: () => source.list() });
+  }
+  const wanted = String(value || '');
+  const number = sessionNumbers.parseNumber(wanted);
+  const idShaped = /^[A-Za-z0-9_-]+$/.test(wanted);
+  if (!number && !idShaped) throw new InjectionError(400, 'bad session id');
+  if (number) {
+    const found = sessionNumbers.lookup(number, { root: deps.root || keep.ROOT });
+    const row = found ? source.row(found.id) : null;
+    if (row) return row;
+    if (!idShaped) throw new InjectionError(400, 'bad session id');
+  }
+  const exact = source.row(wanted);
+  if (exact) return exact;
+  if (number || wanted.length < 8) throw new InjectionError(400, 'bad session id');
+  const matches = source.list().filter((candidate) => candidate && String(candidate.id || '').startsWith(wanted));
+  if (matches.length > 1) {
+    throw new InjectionError(400, `session prefix ${wanted} is ambiguous (${matches.map((candidate) => candidate.id.slice(0, 12)).join(', ')})`);
+  }
+  const row = matches.length ? source.row(matches[0].id) : null;
+  if (!row) throw new InjectionError(400, 'bad session id');
+  return row;
+}
+
 // `keep tell`: one session addressing another. Everything that decides whether the
 // message may be typed at all — the frame, the target-state guards, the hourly brake —
 // is data in bin/tell.js; this is the part that needs the daemon's live view.
@@ -12823,7 +12992,7 @@ async function tellSession(body, deps = {}) {
   if (body.senderCard != null && !tell.CARD_ID_RE.test(String(body.senderCard))) {
     throw new InjectionError(400, 'bad sender card id');
   }
-  const sessions = tellSessions(dry, deps);
+  const source = tellRowSource(dry, deps);
   const excluded = deps.excluded || excludedSessionIds();
   const senderId = body.senderSessionId ? String(body.senderSessionId) : '';
 
@@ -12839,6 +13008,13 @@ async function tellSession(body, deps = {}) {
     // holding. Ranked by tell.js's order, and the most recently active wins a tie.
     const skip = new Set([...excluded, ...(senderId ? [senderId] : [])]);
     const linked = new Set((task.fm.sessions || []).map((entry) => entry && entry.id).filter(Boolean));
+    // Only the card's own sessions are read. The reviewer and keep-spawned runs are
+    // skipped below whatever their state, so their rows are not needed; the sender's
+    // is, even when it is excluded, because the self check asks whether it is live.
+    const sessions = [...linked]
+      .filter((id) => !excluded.has(id) || id === senderId)
+      .map((id) => source.row(id))
+      .filter(Boolean);
     const { candidates } = pickDeliveryCandidates([...linked], sessions, skip);
     // Its predicate does not know about a usage limit or a turn that died, and ours
     // does: a rate-limited newest session must not hide a ready sibling behind it.
@@ -12864,7 +13040,7 @@ async function tellSession(body, deps = {}) {
       throw new InjectionError(409, `${worst.reason}: ${worst.detail} (on ${body.taskId})`, { reason: worst.reason });
     }
   } else {
-    target = (deps.resolveSessionId || resolveSessionId)(body.sessionId, { ...deps, scanSessions: () => sessions });
+    target = resolveTellTarget(body.sessionId, source, deps);
   }
 
   if (senderId && target.id === senderId) {
@@ -12891,7 +13067,9 @@ async function tellSession(body, deps = {}) {
     sessionId: senderId || null,
     agent: body.senderAgent === 'codex' ? 'codex' : 'claude',
     card: body.senderCard || null,
-    name: tell.sessionName(sessions.find((row) => row.id === senderId)
+    // Named from a row already in hand, else the numbers registry: the sender is not
+    // read just to be named.
+    name: tell.sessionName((senderId && source.peek(senderId))
       || (senderId ? { id: senderId, ...(sessionNumbers.lookup(senderId, { root }) || {}) } : null)),
   };
   const envelope = tell.tellEnvelope(sender, text);
@@ -12926,16 +13104,26 @@ async function tellSession(body, deps = {}) {
   // reaches the CLI structurally and `--wait` keeps its one retryable state.
   let movedOnVerdict = null;
   try {
+    // sendToSession loads the session it sends to (deps.loadCurrentSession), and its
+    // default is a fresh fleet scan. The tell hands it the target's own read instead,
+    // so from decision to Enter nothing scans the fleet. It is at least as fresh as a
+    // scan row: the same transcript read, taken at that moment.
+    const loadForSend = (id) => {
+      const row = source.fresh(id);
+      if (!row) throw new InjectionError(404, 'no session');
+      return row;
+    };
     await (deps.watcherSend || watcherSend)({
       sessionId: target.id,
       text: envelope,
       precondition: async () => {
-        const fresh = (tellSessions(false, deps)).find((row) => row.id === target.id);
+        // The target alone, read again: this runs three times inside the lock.
+        const fresh = source.fresh(target.id);
         const moved = tell.tellRefusal(fresh);
         movedOnVerdict = moved;
         return moved ? `${moved.reason}: ${moved.detail}` : null;
       },
-    }, deps);
+    }, { ...deps, sendDeps: { ...(deps.sendDeps || {}), loadCurrentSession: loadForSend } });
   } catch (error) {
     // An error after the first character may have arrived: the text can be sitting in
     // the box, or submitted with the receipt lost. Keeping the reservation is the
@@ -13748,6 +13936,7 @@ module.exports = {
   checkDeliveryIds,
   deliverCheckToThread,
   tellSession,
+  loadTellSession,
   shouldCompactFirst,
   lastTurnUsage,
   sessionLastTurn,
