@@ -13731,33 +13731,11 @@ test('a publication carries what each node is and is not saying', () => {
 });
 
 test('a pane on another node is force-restarted on that node evidence, and nothing here is signalled', async (t) => {
-  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const { withTwoNodeFleet } = require('./fixtures/two-node-hosts.js');
   const { closeHostClient, forceRestartSession, agentProcessRows, liveSessionPids, hostRequest } = require('./serve');
   const { connect } = require('./hostclient.js');
-  await withTwoNodes(t, async ({ root }) => {
+  await withTwoNodeFleet(t, async ({ root, registry, env, accountId, agentPath }) => {
     await closeHostClient();
-    // A registry, an account, and a `claude` on PATH that is a script: the pane on
-    // aws1 has to look like a real agent to the table that node reads. It leaves a
-    // descendant behind that outlives it, which is the case the cleanup exists for.
-    const registry = path.join(root, 'registry');
-    const configDir = path.join(registry, 'claude');
-    const fakeBin = path.join(root, 'bin');
-    for (const dir of [path.join(registry, 'tasks'), path.join(registry, '.keep'), configDir, fakeBin]) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(path.join(fakeBin, 'claude'), [
-      '#!/bin/sh',
-      'nohup sleep 300 >/dev/null 2>&1 &',
-      'printf "fake claude ready\\n"',
-      'read -r line',
-      'exit 0',
-      '',
-    ].join('\n'), { mode: 0o755 });
-    const accountsFile = path.join(root, 'accounts.json');
-    fs.writeFileSync(accountsFile, JSON.stringify({ version: 1, accounts: [
-      { id: 'claude-node', label: 'Node claude', agent: 'claude', configDir },
-    ], defaultAccounts: { claude: 'claude-node' } }));
-    const env = { KEEP_DIR: registry, KEEP_CONFIG: accountsFile };
     const sessionId = 'remote-restart-session';
 
     // Both "machines" are this one process here, so a stubbed process.kill could not
@@ -13788,10 +13766,12 @@ test('a pane on another node is force-restarted on that node evidence, and nothi
       },
       waitForHostAgent: async () => true };
     try {
+      // The fixture's agent leaves a descendant behind when asked, which is the
+      // case the cleanup after a force restart exists for.
       const spawned = (await hostRequest('spawn', {
         cmd: '/bin/sh', args: ['-c', `exec claude --resume ${sessionId}`],
-        cwd: root, env: { PATH: `${fakeBin}:${process.env.PATH}` },
-        meta: { agent: 'claude', sessionId, accountId: 'claude-node', accountLabel: 'Node claude' },
+        cwd: root, env: { PATH: agentPath, KEEP_TEST_CHILD: '1' },
+        meta: { agent: 'claude', sessionId, accountId, accountLabel: 'Node claude' },
       }, { ...deps, node: 'aws1' })).pane;
       assert.match(spawned.id, /@aws1$/);
 
@@ -13799,7 +13779,7 @@ test('a pane on another node is force-restarted on that node evidence, and nothi
       // left behind are both in it, both with the identity a signal is checked against.
       let rows = [];
       let child = null;
-      for (let attempt = 0; attempt < 100 && !child; attempt += 1) {
+      for (let attempt = 0; attempt < 40 && !child; attempt += 1) {
         rows = await agentProcessRows({ ...deps, now: () => Date.now() + attempt * 5000 }, { node: 'aws1' });
         child = rows.find((row) => row.ppid === spawned.pid && /sleep/.test(row.args)) || null;
         if (!child) await new Promise((resolve) => setTimeout(resolve, 50));
@@ -13970,33 +13950,18 @@ test('every launched pane names its spawn, so a lost reply can be asked about', 
 
 
 test('a card opened with --node aws1 runs on aws1, and everything that records it says so', async (t) => {
-  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const { withTwoNodeFleet } = require('./fixtures/two-node-hosts.js');
   const { closeHostClient } = require('./serve');
   const { connect } = require('./hostclient.js');
-  await withTwoNodes(t, async ({ root, aws1, configFile, config }) => {
+  await withTwoNodeFleet(t, async ({ aws1, registry, env, project, agentPath }) => {
     await closeHostClient();
-    const registry = path.join(root, 'registry');
-    const configDir = path.join(registry, 'claude');
-    const project = path.join(root, 'project');
-    const fakeBin = path.join(root, 'bin');
-    for (const dir of [path.join(registry, 'tasks'), path.join(registry, '.keep'), configDir, project, fakeBin]) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(path.join(fakeBin, 'claude'),
-      '#!/bin/sh\nprintf "fake claude ready\\n"\nwhile IFS= read -r line; do :; done\n', { mode: 0o755 });
-    // One file: an install's config.json holds its accounts and its nodes together,
-    // and a placement is only meaningful read alongside the node list.
-    fs.writeFileSync(configFile, JSON.stringify({ ...config, accounts: [
-      { id: 'claude-node', label: 'Node claude', agent: 'claude', configDir },
-    ], defaultAccounts: { claude: 'claude-node' } }));
-    const env = { KEEP_DIR: registry, KEEP_CONFIG: configFile };
     const linked = [];
     try {
       const opened = await openSession({ taskId: 'card', fresh: true, agent: 'claude', node: 'aws1' }, {
         root: registry, env, connectHost: connect,
         loadTask: () => ({ fm: { project, sessions: [] } }),
         claudeFlags: '',
-        launchEnv: { PATH: `${fakeBin}:${process.env.PATH}` },
+        launchEnv: { PATH: agentPath },
         waitForHostAgent: async () => true,
         linkLaunchedSession: (cardId, entry) => { linked.push({ cardId, entry }); return true; },
       });

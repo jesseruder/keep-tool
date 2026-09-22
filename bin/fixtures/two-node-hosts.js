@@ -69,4 +69,56 @@ async function withTwoNodes(t, body) {
   }
 }
 
-module.exports = { withTwoNodes };
+// An agent that behaves the way the daemon's evidence expects one to: it is called
+// `claude`, so `ps` names it as an agent; it takes `--resume <id>`, so the process
+// table names the conversation; it leaves a descendant behind when asked, which is
+// the case a force restart's cleanup exists for; and it exits on one newline, which
+// is what a graceful close sends.
+const FAKE_CLAUDE = [
+  '#!/bin/sh',
+  // An `if`, not `cmd && cmd &`: the latter backgrounds the whole list, so the
+  // descendant would hang off a subshell instead of off the agent itself.
+  'if [ -n "$KEEP_TEST_CHILD" ]; then',
+  '  nohup sleep 300 >/dev/null 2>&1 &',
+  'fi',
+  'printf "fake claude ready\\n"',
+  'read -r line',
+  'exit 0',
+  '',
+].join('\n');
+
+// The two hosts, plus everything a launch needs to be real: a registry of its own,
+// one managed Claude account whose config directory exists, a project to run in, and
+// that agent on PATH. Enough for a card to be opened on aws1, or a pane there to be
+// restarted, without any of it being mocked.
+async function withTwoNodeFleet(t, body) {
+  return withTwoNodes(t, async (fleet) => {
+    const registry = path.join(fleet.root, 'registry');
+    const configDir = path.join(registry, 'claude');
+    const project = path.join(fleet.root, 'project');
+    const fakeBin = path.join(fleet.root, 'bin');
+    for (const dir of [path.join(registry, 'tasks'), path.join(registry, '.keep'), configDir, project, fakeBin]) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(path.join(fakeBin, 'claude'), FAKE_CLAUDE, { mode: 0o755 });
+    const account = { id: 'claude-node', label: 'Node claude', agent: 'claude', configDir };
+    // One file: an install's config.json holds its accounts and its nodes together,
+    // and a placement is only meaningful read alongside the node list.
+    const config = { ...fleet.config, accounts: [account], defaultAccounts: { claude: account.id } };
+    fs.writeFileSync(fleet.configFile, `${JSON.stringify(config, null, 2)}\n`);
+    return body({
+      ...fleet,
+      config,
+      registry,
+      configDir,
+      project,
+      fakeBin,
+      account,
+      accountId: account.id,
+      env: { KEEP_DIR: registry, KEEP_CONFIG: fleet.configFile },
+      agentPath: `${fakeBin}:${process.env.PATH}`,
+    });
+  });
+}
+
+module.exports = { withTwoNodes, withTwoNodeFleet, FAKE_CLAUDE };
