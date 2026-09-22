@@ -3905,9 +3905,14 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   return { ok: true };
 }
 
+// rolloutFileFor only knows the rollouts a codex.scan() has walked. A session opened
+// since the last scan, or any session right after a daemon restart, is not in it;
+// a caller that reaches one without a fleet scan first (a tell reads only the session
+// it names) would otherwise hand delivery a null path. findRolloutFile locates it by
+// the id in its file name, as sessionSummaryFile already does.
 function transcriptFileForSession(session) {
   return session.kind === 'codex'
-    ? codex.rolloutFileFor(session.id)
+    ? codex.rolloutFileFor(session.id) || codex.findRolloutFile(session.id)
     : session.kind === 'pi' ? session.sessionFile || pi.fileFor(session.id)
     : findSessionFile(session.id);
 }
@@ -12841,27 +12846,48 @@ function tellSessions(dry, deps = {}) {
 //
 // So an unknown id still reads as "bad session id" and a card's stale link as not
 // live. One on another node has no transcript here; it comes back as a bare row
-// carrying its node, so the tell refuses it by name (remoteDeliveryRefusal), and
-// with mtime 0 so a card ranks a local sibling first.
-function loadTellSession(id, deps = {}) {
+// carrying its node, so a tell to it by id is refused by name
+// (remoteDeliveryRefusal). A card leaves such a row out (see tellSession).
+//
+// `pin`, when given, remembers what the first read found: the agent, and for Codex
+// the rollout file. A tell reads its target up to five times (the decision, three
+// re-checks inside the lock, and sendToSession's own load), and every read after the
+// first goes straight to that agent's reader instead of trying the others again.
+function loadTellSession(id, deps = {}, pin = null) {
   const sessionId = String(id || '');
   if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return null;
   const root = deps.root || keep.ROOT;
   const node = sessionNodeOf({ id: sessionId }, deps);
   if (node !== daemonNodeName(deps)) return { id: sessionId, node, mtime: 0 };
-  // The account record names the agent when there is one, which spares a Codex or
-  // Pi id the walk a Claude miss makes of every project directory.
-  let agent = null;
-  try { agent = JSON.parse(fs.readFileSync(accounts.authorityFile(root, sessionId), 'utf8')).agent || null; } catch {}
-  const order = ['claude', 'codex', 'pi'].includes(agent) ? [agent] : ['claude', 'codex', 'pi'];
+  // Which reader to try first. A Claude miss walks every project directory (well
+  // over a thousand), so it goes last whenever something cheaper names the agent:
+  // the account record, or a rollout the last Codex scan indexed (a map lookup).
+  let order;
+  if (pin?.kind) order = [pin.kind];
+  else {
+    let agent = null;
+    try { agent = JSON.parse(fs.readFileSync(accounts.authorityFile(root, sessionId), 'utf8')).agent || null; } catch {}
+    if (['claude', 'codex', 'pi'].includes(agent)) order = [agent];
+    else if (codex.rolloutFileFor(sessionId)) order = ['codex', 'claude', 'pi'];
+    else order = ['claude', 'codex', 'pi'];
+  }
   let session = null;
   for (const kind of order) {
     try {
-      if (kind === 'claude') session = claudeSessionFor(sessionId, { root, interactiveOnly: true });
-      else if (kind === 'codex') session = codexFleetSession(sessionId);
+      // allowCachedMiss: an id whose Claude lookup missed in the last 45 s is taken
+      // as still missing, so a bad id, a prefix's exact miss or a stale number does
+      // not walk every project directory again on each try. The cost is that a
+      // transcript created inside those 45 s reads as "bad session id" until the
+      // miss expires, unless a pane for it appeared (noteHostPaneSessions forgets
+      // the miss then); the sender retries, nothing is typed wrongly.
+      if (kind === 'claude') session = claudeSessionFor(sessionId, { root, interactiveOnly: true, allowCachedMiss: true });
+      else if (kind === 'codex') session = codexFleetSession(sessionId, pin);
       else session = pi.sessionFor(sessionId, { root });
     } catch { session = null; }
-    if (session) break;
+    if (session) {
+      if (pin) pin.kind = kind;
+      break;
+    }
   }
   if (!session) return null;
   const now = Date.now();
@@ -12879,11 +12905,21 @@ function loadTellSession(id, deps = {}) {
 // is a conversation there. The fleet scan does not list them, nor children, nor a
 // Companion task, and a tell targets only what the fleet lists. The title prefix is
 // the one codex.js scan() tests inline; it has no exported predicate to share.
-function codexFleetSession(sessionId) {
+//
+// The meta is the rollout's first line and never changes, so it is read once per
+// tell: from the file the last scan indexed, else the one found by name (a walk of
+// the dated folders, which codex.sessionMetaFor would repeat on every call), and
+// the file is kept on the pin for the re-reads.
+function codexFleetSession(sessionId, pin = null) {
   const session = codex.sessionFor(sessionId);
   if (!session) return null;
-  const meta = codex.sessionMetaFor(sessionId);
-  if (!meta || codex.isChildSession(meta) || codex.isHeadlessSession(meta)) return null;
+  if (!pin?.codexChecked) {
+    const file = pin?.codexFile || codex.rolloutFileFor(sessionId) || codex.findRolloutFile(sessionId);
+    let meta = null;
+    try { meta = file ? codex.readSessionMeta(file) : null; } catch {}
+    if (!meta || codex.isChildSession(meta) || codex.isHeadlessSession(meta)) return null;
+    if (pin) { pin.codexFile = file; pin.codexChecked = true; }
+  }
   if (String(session.title || '').startsWith('Codex Companion Task:')) return null;
   return session;
 }
@@ -12912,10 +12948,15 @@ function tellRowSource(dry, deps = {}) {
   }
   const load = deps.loadTellSession || loadTellSession;
   const loaded = new Map();
+  const pins = new Map();
+  const pinFor = (id) => {
+    if (!pins.has(id)) pins.set(id, {});
+    return pins.get(id);
+  };
   return {
     scanned: false,
     row: (id) => {
-      if (!loaded.has(id)) loaded.set(id, load(id, deps) || null);
+      if (!loaded.has(id)) loaded.set(id, load(id, deps, pinFor(id)) || null);
       return loaded.get(id);
     },
     peek: (id) => loaded.get(id) || null,
@@ -12926,7 +12967,7 @@ function tellRowSource(dry, deps = {}) {
     list: () => (deps.listTellSessions || (() => (Date.now() - sessionSnapshotAt < 5000 && sessionSnapshot.length
       ? copySessions(sessionSnapshot)
       : scanSessions({ readOnly: true, allocateNumbers: false, fresh: false }))))(),
-    fresh: (id) => load(id, deps) || null,
+    fresh: (id) => load(id, deps, pinFor(id)) || null,
   };
 }
 
@@ -13011,10 +13052,20 @@ async function tellSession(body, deps = {}) {
     // Only the card's own sessions are read. The reviewer and keep-spawned runs are
     // skipped below whatever their state, so their rows are not needed; the sender's
     // is, even when it is excluded, because the self check asks whether it is live.
-    const sessions = [...linked]
+    const rows = [...linked]
       .filter((id) => !excluded.has(id) || id === senderId)
       .map((id) => source.row(id))
       .filter(Boolean);
+    // A session on another node cannot take a tell yet, so it is no candidate, and
+    // its refusal must not stand in for a local one: a card with a busy local thread
+    // answers busy (which --wait sits out), and one whose local threads are gone
+    // answers not-live with the open hint. It is named only when nothing local is
+    // there at all and the row shows it live: a fleet row carries its state, while
+    // the bare row loadTellSession returns for a remote id says nothing either way,
+    // and the scan this replaced never listed one.
+    const sessions = rows.filter((session) => !remoteSession(session, deps));
+    const remoteLive = rows.find((session) => remoteSession(session, deps) && !skip.has(session.id)
+      && !session.exited && !session.deadMidTurn && (session.state !== undefined || session.endedTurn !== undefined));
     const { candidates } = pickDeliveryCandidates([...linked], sessions, skip);
     // Its predicate does not know about a usage limit or a turn that died, and ours
     // does: a rate-limited newest session must not hide a ready sibling behind it.
@@ -13033,6 +13084,7 @@ async function tellSession(body, deps = {}) {
           && !session.exited && !session.deadMidTurn)) {
           throw new InjectionError(409, 'self: a session cannot tell its own card', { reason: 'self' });
         }
+        if (remoteLive) throw remoteDeliveryRefusal(remoteLive, deps);
         throw new InjectionError(409, `no live session on ${body.taskId}; start one with keep open ${body.taskId} --fresh -m "..."`, { reason: 'not-live' });
       }
       const refusals = present.map((session) => tell.tellRefusal(session) || { reason: 'busy', detail: 'session is mid-turn' });

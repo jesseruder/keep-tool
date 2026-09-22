@@ -1165,3 +1165,124 @@ test('a real tell never scans the fleet, from the decision through the send', as
     f.cleanup();
   }
 });
+
+test('a tell to a Codex session no scan has seen delivers through the real send path', async () => {
+  const f = transcriptFixture();
+  try {
+    const id = crypto.randomUUID();
+    const rollout = f.codexRollout(id);
+    // A fake Codex pane: the composer shows what was typed, and Enter submits it into
+    // the rollout the way Codex does, so delivery can confirm it from the transcript.
+    // No codex.scan() has run in this process for this rollout, so the only way the
+    // delivery finds the file is transcriptFileForSession's lookup by name.
+    const live = { pid: 4242, inputCount: 0, draft: '' };
+    let enters = 0;
+    const screen = () => {
+      if (!live.draft) return '› Ask Codex to do anything';
+      const rows = [];
+      for (let at = 0; at < live.draft.length; at += 76) rows.push(`${at ? '  ' : '› '}${live.draft.slice(at, at + 76)}`);
+      return [...rows, '', '  ~/test/project · main · Full Access'].join('\n');
+    };
+    const host = {
+      request: async (type, params) => {
+        if (type === 'hello') return { guardedInput: true, guardedInputReceipts: true };
+        if (type === 'screen') {
+          const rendered = screen();
+          const promptRows = live.draft ? Math.ceil(live.draft.length / 76) : 1;
+          return { text: rendered, cursor: { x: 2, y: promptRows - 1 }, cols: 80, rows: rendered.split('\n').length };
+        }
+        if (type !== 'input') return {};
+        const value = Buffer.from(params.data, 'base64').toString();
+        if (live.pid !== params.expectedPid) return { dropped: true, reason: 'pane replaced', pid: live.pid, inputCount: live.inputCount };
+        if (live.inputCount !== params.expectedInputCount) return { dropped: true, reason: 'input arrived', inputCount: live.inputCount };
+        live.inputCount += 1;
+        if (value === '\r') {
+          enters += 1;
+          fs.appendFileSync(rollout, `${JSON.stringify({ type: 'response_item', timestamp: new Date().toISOString(),
+            payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: live.draft }] } })}\n`);
+          live.draft = '';
+        } else {
+          live.draft += value;
+        }
+        return { accepted: true, inputCount: live.inputCount };
+      },
+    };
+    const deps = fixtureDeps(f.root, {
+      sendDeps: {
+        host,
+        deliveryDirectory: path.join(f.root, '.keep', `delivery-${id}`),
+        readScreen: async () => screen(),
+        sleep: async () => {},
+        listHostPanes: async () => [{ id: 'fixture-pane', pid: live.pid, inputCount: live.inputCount, alive: true,
+          meta: { sessionId: id, agent: 'codex' } }],
+        resolveSessionTarget: async () => ({ pane: 'fixture-pane' }),
+      },
+    });
+    delete deps.watcherSend;
+    const result = await tellSession({ sessionId: id, text: 'ping' }, deps);
+    assert.equal(result.sessionId, id);
+    assert.equal(result.kind, 'codex');
+    assert.equal(enters, 1);
+    assert.match(fs.readFileSync(rollout, 'utf8'), /it grants no approval or permission: ping/);
+  } finally { f.cleanup(); }
+});
+
+test('a card answers for its local sessions, not for a link on another node', async () => {
+  const f = transcriptFixture();
+  try {
+    const busy = crypto.randomUUID();
+    const gone = crypto.randomUUID();
+    const far = crypto.randomUUID();
+    const rows = new Map([
+      [busy, liveSession(busy, { endedTurn: false, mtime: 5 })],
+      [gone, liveSession(gone, { exited: true, mtime: 5 })],
+    ]);
+    // The real reader for the remote link (a bare row from its authority record),
+    // injected rows for the local ones.
+    f.registryFile('session-accounts', `${far}.json`, JSON.stringify({
+      version: 1, sessionId: far, agent: 'claude', accountId: 'claude-a', node: 'aws1',
+    }));
+    const card = (ids) => fixtureDeps(f.root, {
+      hostNodes: ['main', 'aws1'],
+      loadTask: () => ({ id: 'split-card', fm: { sessions: ids.map((id) => ({ id })) } }),
+      loadTellSession: (id, deps, pin) => (rows.has(id) ? { ...rows.get(id) } : loadTellSession(id, deps, pin)),
+    });
+    // A busy local thread is busy, which --wait sits out, whatever is linked on aws1.
+    await assert.rejects(tellSession({ taskId: 'split-card', text: 'ping' }, card([busy, far])),
+      (error) => error.status === 409 && error.extra.reason === 'busy'
+        && error.message === 'busy: session is mid-turn (on split-card)');
+    // Local threads all gone: not-live with the open hint, as before.
+    await assert.rejects(tellSession({ taskId: 'split-card', text: 'ping' }, card([gone, far])),
+      (error) => error.status === 409 && error.extra.reason === 'not-live'
+        && /^no live session on split-card; start one with keep open split-card --fresh/.test(error.message));
+    // A tell to the remote id itself is still refused by name.
+    await assert.rejects(tellSession({ sessionId: far, text: 'ping' }, card([])),
+      (error) => error.status === 409 && error.extra.reason === 'remote-node');
+  } finally { f.cleanup(); }
+});
+
+test('a tell reads its target through one reader after the first read', async () => {
+  const f = transcriptFixture();
+  try {
+    const id = crypto.randomUUID();
+    f.codexRollout(id);
+    const pins = [];
+    const deps = fixtureDeps(f.root, {
+      loadTellSession: (sessionId, loaderDeps, pin) => {
+        pins.push(pin ? { ...pin } : null);
+        return loadTellSession(sessionId, loaderDeps, pin);
+      },
+      watcherSend: async (request) => {
+        assert.equal(await request.precondition(), null);
+        return {};
+      },
+    });
+    await tellSession({ sessionId: id, text: 'ping' }, deps);
+    // The first read found Codex and its rollout; the re-check was pinned to both.
+    assert.equal(pins.length, 2);
+    assert.deepEqual(pins[0], {});
+    assert.equal(pins[1].kind, 'codex');
+    assert.equal(pins[1].codexChecked, true);
+    assert.match(pins[1].codexFile, new RegExp(`${id}\\.jsonl$`));
+  } finally { f.cleanup(); }
+});

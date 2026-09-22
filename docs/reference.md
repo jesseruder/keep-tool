@@ -2646,7 +2646,8 @@ opens a self-repair card: `bin/self-repair.js` excludes it, because a stall from
 sleep, swap or a loaded machine, blamed by a heuristic, is not something a
 daemon-code fix addresses. A restarted daemon starts with an empty window.
 A stall in the probe's first minute is logged as `keep serve: event loop stalled
-7200ms during startup` (with ` (<name>)` when a holder is known) and only counted in
+7200ms during startup` (with ` (<name>)` when a holder was measured, and
+` (likely <name>)` when it is a guess) and only counted in
 the detail, as `1 startup stall, ...`: module loading and cold caches hold the loop
 once on every start, so it never records a failure or holds the row in skip.
 
