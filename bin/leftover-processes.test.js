@@ -16,6 +16,7 @@ function fixture() {
       { id: 'bbbb2222', alive: true, meta: { sessionId: 's-2', card: 'b-card' } }],
     env: new Map([[200, { KEEP_PANE: 'aaaa1111', CLAUDE_CODE_SESSION_ID: 's-1' }], [201, { KEEP_PANE: 'aaaa1111' }]]),
     transfers: new Set(),
+    ports: new Set(),
   };
   const signals = [];
   const deps = {
@@ -23,6 +24,7 @@ function fixture() {
     processes: async () => state.rows.map((row) => ({ ...row })),
     panes: async () => state.panes,
     environments: async (rows) => new Map(rows.filter((row) => state.env.has(row.pid)).map((row) => [row.pid, state.env.get(row.pid)])),
+    listening: async (pids) => new Set(pids.filter((pid) => state.ports.has(pid))),
     transferInFlight: (id) => (state.transfers.has(id) ? { status: 'working' } : null),
     kill: (pid, signal) => {
       signals.push([pid, signal]);
@@ -172,6 +174,36 @@ test('the macOS environment is read after the arguments, never from them', () =>
   assert.deepEqual(env.get(5), { KEEP_PANE: 'realpane', KEEP_PERSIST: '1' });
   assert.deepEqual(env.get(6), { KEEP_PANE: 'abcd1234', CODEX_THREAD_ID: 't-1' });
   assert.equal(env.has(7), false, 'a process whose arguments changed is unknown, so protected');
+});
+
+test('a one-off job still working is never stopped; the same tree serving a port is', async () => {
+  const f = fixture();
+  f.state.rows[0].command = 'bash migrate.sh';
+  f.state.rows[1].command = 'node scripts/replay.js --all';
+  assert.equal((await leftovers.list(f.deps)).leftovers.length, 0);
+  await leftovers.reap({ deps: f.deps });
+  assert.deepEqual(f.signals, []);
+  f.state.ports.add(201);
+  assert.equal((await leftovers.list(f.deps)).leftovers.length, 1);
+});
+
+test('dev servers, watchers and test runners are recognised by their tools', () => {
+  for (const command of ['npm run dev', 'node /r/node_modules/.bin/next dev', 'npm exec react-native start --port 8082',
+    'node /r/node_modules/vitest/dist/workers/forks.js', 'python3 -m http.server', 'uv run flask run', 'node /x/cli/dist/index.js serve /y',
+    'node /r/node_modules/.bin/jest --watch', 'node /r/node_modules/@storybook/cli/bin/index.js dev']) {
+    assert.equal(leftovers.DEV_TOOLS.test(command), true, command);
+  }
+  for (const command of ['node scripts/replay.js --all', 'bash migrate.sh', 'python eval.py', 'make build', 'node /r/node_modules/typescript/bin/tsc -p .']) {
+    assert.equal(leftovers.DEV_TOOLS.test(command), false, command);
+  }
+});
+
+test('remote panes do not make an empty local list trustworthy', async () => {
+  const f = fixture();
+  f.state.panes = [{ id: 'cccc3333@aws1', alive: true, meta: {} }];
+  const result = await leftovers.reap({ deps: f.deps });
+  assert.equal(result.skipped[0].evidence, true);
+  assert.deepEqual(f.signals, []);
 });
 
 test('ps rows parse with rss and start time', () => {

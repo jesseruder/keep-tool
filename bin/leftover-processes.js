@@ -23,6 +23,10 @@ const DEV_ROOTS = /^(?:node|nodejs|npm|npx|yarn|pnpm|pnpx|bun|bunx|deno|tsx|ts-n
 const HELPERS = /^(?:adb|watchman|ssh|ssh-agent|gpg-agent|tmux|screen|limactl|colima|lima|qemu-system-\S+|docker|dockerd|containerd|redis-server|postgres|pg_ctl|mysqld|mongod|ollama|sccache|bazel|emulator|Xvfb|caffeinate)$/;
 const HELPER_ARGS = /\b(?:GradleDaemon|KotlinCompileDaemon|ControlMaster=(?:yes|auto)|start-server|fork-server)\b|\s-M(?:\s|$)/;
 const AGENT_ARGS = /@anthropic-ai\/claude-code|@openai\/codex|(?:^|\/)(?:claude|codex|pi)(?:\s|$)/;
+// What makes a tree a server, watcher or test runner rather than a one-off job that is
+// still working (a migration, a replay, an eval): a tool of that kind somewhere in it,
+// or a listening TCP port. A tree with neither is never stopped.
+const DEV_TOOLS = /(?:^|[\s/])(?:vite|next|next-server|metro|react-native\s+start|expo\s+start|webpack|webpack-dev-server|jest|vitest|mocha|playwright|nodemon|storybook|astro|nuxt|remix|parcel|http-server|live-server|ts-node-dev|tsx\s+watch|rails\s+s(?:erver)?|uvicorn|gunicorn|pytest)(?:\s|$|\()|node_modules\/(?:@[^/\s]+\/)?(?:vite|next|metro|react-native|expo|webpack|webpack-dev-server|jest|jest-worker|vitest|mocha|playwright|nodemon|storybook|astro|nuxt|parcel|ts-node-dev|tsx)\/|\s--watch\b|flask\s+run|manage\.py\s+runserver|-m\s+http\.server|\sdev(?:\s|$)|\sserve(?:\s|$)/;
 const SESSION_VARS = ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'KEEP_PI_SESSION_ID'];
 const NAMES = ['KEEP_PANE', 'KEEP_PERSIST', 'KEEP_DIR', ...SESSION_VARS];
 
@@ -34,9 +38,15 @@ function parseRows(text) {
 }
 
 async function processes() {
-  const { stdout } = await run('ps', ['-axww', '-o', 'pid=,ppid=,uid=,rss=,lstart=,args='], {
+  let stdout;
+  try {
+    ({ stdout } = await run('ps', ['-axww', '-o', 'pid=,ppid=,uid=,rss=,lstart=,args='], {
     encoding: 'utf8', timeout: 10000, maxBuffer: 64e6, env: { ...process.env, LC_ALL: 'C' },
-  });
+    }));
+  } catch (error) {
+    // A ps that times out under memory pressure is a sweep that could not look.
+    throw evidence(`process state unavailable: ${error.message}`);
+  }
   const rows = parseRows(stdout);
   if (!rows.length) throw evidence('process state unavailable');
   return rows;
@@ -91,6 +101,23 @@ async function environments(rows) {
     stdout = String(error.stdout || '');
   }
   return parseEnvironments(stdout, rows);
+}
+
+// The pids among these that hold a listening TCP socket.
+async function listening(pids) {
+  const result = new Set();
+  if (!pids.length) return result;
+  let stdout = '';
+  try {
+    ({ stdout } = await run('lsof', ['-nP', '-a', '-iTCP', '-sTCP:LISTEN', '-p', pids.join(','), '-Fp'], {
+      encoding: 'utf8', timeout: 10000, maxBuffer: 16e6,
+    }));
+  } catch (error) {
+    // lsof exits 1 when none of the pids listens; anything it printed still counts.
+    stdout = String(error.stdout || '');
+  }
+  for (const line of stdout.split('\n')) if (/^p\d+$/.test(line)) result.add(+line.slice(1));
+  return result;
 }
 
 function evidence(message) {
@@ -176,8 +203,11 @@ async function snapshot(deps = {}) {
   if (!Array.isArray(rows) || !rows.length) throw evidence('process state unavailable');
   // An empty pane list is what an unreachable or restarting host looks like too; with
   // no panes to compare against, every KEEP_PANE would read as gone.
-  if (!Array.isArray(hosted) || !hosted.length) throw evidence('host pane state unavailable');
+  if (!Array.isArray(hosted)) throw evidence('host pane state unavailable');
   const local = hosted.filter((pane) => typeof pane?.id === 'string' && !pane.id.includes('@'));
+  // Only this machine's panes can speak for its processes; other nodes' panes do not
+  // make an empty local list trustworthy.
+  if (!local.length) throw evidence('host pane state unavailable');
   const byPane = new Map(local.map((pane) => [pane.id, pane]));
   const live = hosted.filter((pane) => pane?.alive);
   const liveSessions = new Set(live.map((pane) => pane.meta?.sessionId).filter(Boolean));
@@ -189,7 +219,7 @@ async function snapshot(deps = {}) {
   const roots = rows.filter((row) => row.ppid === 1 && row.uid === uid && row.pid !== process.pid && devRoot(row.command));
   const trees = new Map(roots.map((row) => [row.pid, descendants(rows, row.pid)]));
   const env = await (deps.environments || environments)([...roots, ...[...trees.values()].flat()]);
-  const result = [];
+  const candidates = [];
   const current = new Set();
   for (const row of roots) {
     const vars = env.get(row.pid);
@@ -211,7 +241,7 @@ async function snapshot(deps = {}) {
     if (deps.seen && !deps.seen.has(key)) deps.seen.set(key, now);
     const since = [pane ? at(pane.exitedAt) : null, deps.seen ? deps.seen.get(key) : null].filter((v) => v != null);
     const goneFor = since.length ? now - Math.max(...since) : -Infinity;
-    result.push({
+    candidates.push({
       pid: row.pid, started: row.started, command: row.command,
       pane: vars.KEEP_PANE, card: pane?.meta?.card || null, sessionId: sessions[0] || null,
       paneState: pane ? 'exited' : 'closed', exitedAt: pane?.exitedAt || null,
@@ -220,7 +250,16 @@ async function snapshot(deps = {}) {
       identities: [row, ...tree].map(identity),
       due: goneFor >= graceMs,
       reason: pane ? `pane ${vars.KEEP_PANE} exited` : `pane ${vars.KEEP_PANE} is closed`,
+      tool: [row, ...tree].some((member) => DEV_TOOLS.test(member.command)),
     });
+  }
+  const needPorts = candidates.filter((item) => !item.tool).flatMap((item) => [item.pid, ...item.tree]);
+  const ports = await (deps.listening || listening)(needPorts);
+  const result = [];
+  for (const item of candidates) {
+    const serving = item.tool || [item.pid, ...item.tree].some((pid) => ports.has(pid));
+    if (!serving) { if (deps.seen) deps.seen.delete(identity(item)); continue; }
+    result.push(item);
   }
   if (deps.seen) for (const key of deps.seen.keys()) if (!current.has(key)) deps.seen.delete(key);
   return result;
@@ -286,4 +325,4 @@ function describe(item) {
   return `pid ${item.pid}${tree} (${mb} MB, ${item.reason}${item.card ? `, card ${item.card}` : ''}): ${item.command.slice(0, 160)}`;
 }
 
-module.exports = { DEFAULT_GRACE_MS, parseRows, parseEnvironments, environments, protects, devRoot, descendants, snapshot, list, reap, describe };
+module.exports = { DEFAULT_GRACE_MS, DEV_TOOLS, listening, parseRows, parseEnvironments, environments, protects, devRoot, descendants, snapshot, list, reap, describe };

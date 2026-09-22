@@ -155,6 +155,10 @@ background-terminal wake-up is not yet verified.
 
 ## Conventions
 
+- A dev server, watcher or test runner you start in the background is stopped about
+  15 minutes after your pane exits unless a live pane carries on your session or
+  card. Start it with `KEEP_PERSIST=1` when it must outlive you, and say so in a
+  check-in.
 - Write check-ins as state + next step, not a diary. Keep them to one or two sentences.
 - If a Stop reminder names your next step, continue with it. If you need Owner, end
   your turn with a question — the reminder does not repeat for that step.
