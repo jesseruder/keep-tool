@@ -135,6 +135,8 @@ test('a hook post is refused unless it is a Claude event for a session and pane 
     const answer = await hooks.handle(who, request);
     assert.equal(answer.status, status, `${JSON.stringify(request).slice(0, 160)}: ${JSON.stringify(answer.body)}`);
     assert.match(answer.body.error, message);
+    // Only the refusal of the session as not on the node is named; a pane's is not.
+    assert.equal(answer.body.code, /^session \S+ is not on node /.test(answer.body.error) ? 'SESSION_NOT_ON_NODE' : undefined, answer.body.error);
   }
   assert.equal(calls.length, 0, 'nothing ran');
   assert.equal(fs.existsSync(path.join(root, '.keep', 'registry-ops')), false, 'nothing journalled');
@@ -1381,6 +1383,7 @@ test('a Codex start posted before its pane is bound is refused uncached: the pro
   const refused = await hooks.handle(AWS1, start);
   assert.equal(refused.status, 403);
   assert.equal(refused.body.error, 'session codex-aws1 is not on node aws1');
+  assert.equal(refused.body.code, 'SESSION_NOT_ON_NODE', 'named, so the node can tell it from a refusal of its pane');
   assert.equal(calls.length, 0);
   // The node's bind lands a few milliseconds later; its first prompt follows at once.
   host.panes = [latePane()];

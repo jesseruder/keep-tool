@@ -98,7 +98,10 @@ const DIRTY_MAX_BYTES = 4096;
 const SHA_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const BRANCH_RE = /^[A-Za-z0-9._/-]{1,200}$/;
 
-function refuse(status, message) { throw new RegistryError(status, message); }
+function refuse(status, message, code) { throw new RegistryError(status, message, code); }
+// The refusal of a session the location record does not place on the caller: named, so
+// a node's Codex start can tell it from any other refusal (bin/commands/hook.js).
+const SESSION_NOT_ON_NODE = 'SESSION_NOT_ON_NODE';
 
 const isObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 
@@ -449,7 +452,7 @@ function validateRequest(body, caller, deps) {
   if (!sessionless) {
     let where = null;
     try { where = deps.location(sessionId); } catch { where = null; }
-    if (!where || where.node !== caller) refuse(403, `session ${sessionId} is not on node ${caller}`);
+    if (!where || where.node !== caller) refuse(403, `session ${sessionId} is not on node ${caller}`, SESSION_NOT_ON_NODE);
     if (where.agent !== agent) refuse(403, `session ${sessionId} is a ${where.agent} session, not ${agent}`);
     if (accountId && where.accountId && accountId !== where.accountId) {
       refuse(403, `session ${sessionId} runs on account ${where.accountId}, not ${accountId}`);
@@ -657,7 +660,7 @@ function createHookService(options = {}) {
         };
       });
     } catch (error) {
-      if (error instanceof RegistryError) return { status: error.status, body: { error: error.message } };
+      if (error instanceof RegistryError) return { status: error.status, body: { error: error.message, ...(error.code ? { code: error.code } : {}) } };
       return { status: 500, body: { error: error.message } };
     }
   }
@@ -672,12 +675,12 @@ function createHookService(options = {}) {
       const session = matching(sessionId, SESSION_RE, 'session id');
       let where = null;
       try { where = shared.location(session); } catch { where = null; }
-      if (!where || where.node !== caller) refuse(403, `session ${session} is not on node ${caller}`);
+      if (!where || where.node !== caller) refuse(403, `session ${session} is not on node ${caller}`, SESSION_NOT_ON_NODE);
       // A Codex session's pre-tool refuses by the same fingerprints a Claude one's pre-bash does.
       if (where.agent !== 'claude' && where.agent !== 'codex') refuse(403, `session ${session} is a ${where.agent} session, not claude or codex`);
       return { status: 200, body: { steps: publishedFingerprints(root), repairSession: isRepairSession(repairDeps, session, root) } };
     } catch (error) {
-      if (error instanceof RegistryError) return { status: error.status, body: { error: error.message } };
+      if (error instanceof RegistryError) return { status: error.status, body: { error: error.message, ...(error.code ? { code: error.code } : {}) } };
       return { status: 500, body: { error: error.message } };
     }
   }

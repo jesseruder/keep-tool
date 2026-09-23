@@ -42,9 +42,11 @@ const JOURNAL_TTL_MS = 7 * 24 * 60 * 60e3;
 const PRUNE_EVERY_MS = 60 * 60e3;
 
 class RegistryError extends Error {
-  constructor(status, message) {
+  // `code`, when given, is a refusal's machine-readable name, answered beside its text.
+  constructor(status, message, code) {
     super(message);
     this.status = status;
+    if (code) this.code = code;
   }
 }
 

@@ -734,6 +734,9 @@ const CODEX_START_ONE_ATTEMPT_MS = 1500;
 // The start posted again after a late bind: only with this much of the deadline left,
 // and ending this much before it, so the answer is still out in time.
 const CODEX_START_REPOST_MIN_MS = 300;
+// What a daemon that predates the refusal's code answers for a session not on the node.
+const sessionNotOnNode = (why, sessionId) => typeof why === 'string' && typeof sessionId === 'string'
+  && why.startsWith(`session ${sessionId} is not on node `) && /^[A-Za-z0-9_.-]+$/.test(why.slice(`session ${sessionId} is not on node `.length));
 const CODEX_START_REPOST_MARGIN_MS = 150;
 
 // The Codex hooks a node whose daemon is known carries to it: the daemon runs its own
@@ -860,7 +863,11 @@ async function carriedCodexHook(action, input, where, deps = {}) {
         // want of a location record, and the bind just named the session on the pane,
         // which is what the daemon adopts it by. Post the start once more in what is
         // left of the deadline, so the daemon registers it and its answer is printed.
-        const refused = first && first.delivered === false && /\bis not on node\b/.test(String(first.why || ''));
+        // Only the refusal of this session as not on the node (by its code, or from a
+        // daemon that answers no code, by its exact text): a refusal of the pane, or of
+        // anything else, is not one a bind can change.
+        const refused = first && first.delivered === false && (first.code === 'SESSION_NOT_ON_NODE'
+          || (first.code === undefined && sessionNotOnNode(first.why, input.session_id)));
         const left = startedAt + total - now() - CODEX_START_REPOST_MARGIN_MS;
         if (!late && bound && refused && left >= CODEX_START_REPOST_MIN_MS) {
           const again = await run({ startedAt: now(), idempotencyKey,

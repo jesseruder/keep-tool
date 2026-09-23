@@ -241,7 +241,7 @@ test('the queue replays in order, with its own keys, once, before the next event
 
 test('a refusal is not queued, and a queue past its cap drops the oldest', async (t) => {
   const f = fixture(t);
-  const daemon = await stubDaemon(t, () => ({ status: 403, body: { error: 'session sess-aws1 is not on node aws1' } }));
+  const daemon = await stubDaemon(t, () => ({ status: 403, body: { error: 'session sess-aws1 is not on node aws1', code: 'SESSION_NOT_ON_NODE' } }));
   const refused = await f.hook('stop', daemon.url);
   assert.equal(refused.status, 0);
   assert.deepEqual(f.queue(), []);
@@ -813,7 +813,7 @@ test('a Codex start the daemon refused before its pane was bound is posted once 
     } finally { process.stdout.write = write; }
     return { posts, written: written.join('') };
   };
-  const refusedFirst = [{ delivered: false, why: 'session codex-aws1 is not on node aws1', queued: false },
+  const refusedFirst = [{ delivered: false, why: 'session codex-aws1 is not on node aws1', code: 'SESSION_NOT_ON_NODE', queued: false },
     { delivered: true, value: { status: 0, stdout: `${context}\n`, stderr: '' } }];
   const hostCalls = [];
   const reposted = await run(refusedFirst, hostCalls);
@@ -823,9 +823,22 @@ test('a Codex start the daemon refused before its pane was bound is posted once 
   assert.equal(reposted.posts[1].key, reposted.posts[0].key, 'the same idempotency key');
   assert.ok(reposted.posts[1].budget > 0 && reposted.posts[1].budget <= 2600, `inside the start's deadline (${reposted.posts[1].budget} ms)`);
   assert.equal(reposted.written, `${context}\n`, 'the daemon\'s answer to the second post');
-  // Any other failure is not posted again.
-  const other = await run([{ delivered: false, why: 'timed out', queued: true }], []);
-  assert.equal(other.posts.length, 1);
+  // A daemon that answers no code is read by the refusal's exact text.
+  const legacy = await run([{ delivered: false, why: 'session codex-aws1 is not on node aws1', queued: false }, refusedFirst[1]], []);
+  assert.equal(legacy.posts.length, 2);
+  // Any other failure is not posted again: a refusal of the pane rather than the
+  // session, of another session, one with another code, or no refusal at all.
+  for (const first of [
+    { delivered: false, why: 'timed out', queued: true },
+    { delivered: false, why: 'pane p2@main is not on node aws1', queued: false },
+    { delivered: false, why: 'pane p2@main is not on node aws1', code: 'SOMETHING_ELSE', queued: false },
+    { delivered: false, why: 'session codex-other is not on node aws1', queued: false },
+    { delivered: false, why: 'session codex-aws1 is not on node aws1 (and more)', queued: false },
+    { delivered: false, why: 'session codex-aws1 is not on node aws1', code: 'SOMETHING_ELSE', queued: false },
+  ]) {
+    const other = await run([first, refusedFirst[1]], []);
+    assert.equal(other.posts.length, 1, JSON.stringify(first));
+  }
   // Nor is a refusal when the bind did not happen.
   const unbound = [];
   const noBind = await (async () => {

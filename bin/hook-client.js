@@ -277,7 +277,8 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
       if (plan) advance(plan.end);
       return { ok: response.status === 200, retry: false, value, why: response.status === 504 ? 'the daemon stopped the hook' : '' };
     }
-    return { ok: false, retry: response.status >= 500, why: value.error || `HTTP ${response.status}` };
+    return { ok: false, retry: response.status >= 500, why: value.error || `HTTP ${response.status}`,
+      ...(typeof value.code === 'string' ? { code: value.code } : {}) };
   }
 }
 
@@ -411,7 +412,8 @@ async function runHook(event, input, where, deps = {}) {
   if (result.ok) return { delivered: true, value: result.value };
   // A hook the daemon stopped has run and been journalled: a resend would only
   // replay it. Anything else it answered is a refusal a resend would repeat.
-  return { delivered: false, why: result.why, queued: result.retry ? queue(event, input, identity, key, fired, env) : false };
+  return { delivered: false, why: result.why, ...(result.code ? { code: result.code } : {}),
+    queued: result.retry ? queue(event, input, identity, key, fired, env) : false };
 }
 
 function queue(event, input, identity, key, fired, env) {
