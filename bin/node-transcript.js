@@ -189,6 +189,6 @@ async function handle(params, options = {}) {
 }
 
 module.exports = {
-  handle, open, validate, generationOf,
+  handle, open, validate, generationOf, nodeAccount,
   TAIL_MAX_BYTES, MATCH_MAX_WAIT_MS, MATCH_POLL_MS, REQUEST_MAX_READ_BYTES,
 };

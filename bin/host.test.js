@@ -2782,3 +2782,221 @@ test('a match on a growing transcript reads each byte once across its polls, a l
     assert.equal(answer.checkedTo, fs.statSync(node.file).size);
   } finally { node.cleanup(); }
 });
+
+// ---------- the artifacts verb ----------
+
+// A node with one Claude account and, when asked, one session's artifacts under it:
+// the transcript, its session tree with a subagent transcript, a superseded tree under
+// another project, and its file history. Two of these stand for the two ends of a
+// move: the same account id and the same relative paths, each under its own home.
+function artifactNode(name, options = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `keep-host-artifacts-${name}-`));
+  const configDir = path.join(root, 'claude-a');
+  fs.mkdirSync(path.join(configDir, 'projects'), { recursive: true });
+  const configFile = path.join(root, 'config.json');
+  fs.writeFileSync(configFile, JSON.stringify({
+    version: 1,
+    accounts: [{ id: 'claude-a', label: 'Claude A', agent: 'claude', configDir }],
+    defaultAccounts: { claude: 'claude-a' },
+  }));
+  const sid = 'sess-move';
+  const put = (rel, text) => {
+    const file = path.join(configDir, ...rel.split('/'));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, text);
+    return file;
+  };
+  if (options.session !== false) {
+    put(`projects/-work-project/${sid}.jsonl`, `${JSON.stringify({ type: 'user', message: { content: 'hello' } })}\n`.repeat(3));
+    put(`projects/-work-project/${sid}/subagents/agent-a1.jsonl`, '{"type":"assistant"}\n');
+    put(`projects/-work-other/${sid}.superseded-1/subagents/agent-b2.jsonl`, '{"type":"assistant","old":true}\n');
+    put(`file-history/${sid}/f9764a6b1dfc35ba@v2`, 'file body\n');
+  }
+  return {
+    root, configDir, sid, put,
+    env: { ...process.env, KEEP_CONFIG: configFile, HOME: root },
+    account: { id: 'claude-a', configDir },
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+const sha256 = (bytes) => require('node:crypto').createHash('sha256').update(bytes).digest('hex');
+const txId = 'move-tx-0001';
+
+// Copies every listed file from one node to the other through the verb alone: ranged
+// reads on the source, staged pieces on the target, then one publish.
+async function carry(from, to, source, target, pieceBytes = 16) {
+  const base = { sessionId: source.sid };
+  const listed = await from.request('artifacts', { ...base, op: 'list', account: source.account });
+  for (const file of listed.files) {
+    let offset = 0;
+    do {
+      const piece = await from.request('artifacts', { ...base, op: 'read', account: source.account, relPath: file.relPath, from: offset, length: pieceBytes });
+      const staged = await to.request('artifacts', { ...base, op: 'stage', account: target.account, tx: txId,
+        relPath: file.relPath, from: offset, bytes: piece.bytes, size: file.size, sha256: file.sha256 });
+      assert.equal(staged.needFrom, undefined);
+      offset += pieceBytes;
+    } while (offset < file.size);
+  }
+  return { listed, entries: listed.files.map(({ relPath, sha256: digest, size }) => ({ relPath, sha256: digest, size })) };
+}
+
+test('a node lists, reads, stages and publishes a session\'s artifacts, and the bytes arrive whole', async () => {
+  const source = artifactNode('source');
+  const target = artifactNode('target', { session: false });
+  try {
+    await withHost({ env: source.env }, async ({ client: from }) => {
+      await withHost({ env: target.env }, async ({ client: to }) => {
+        assert.equal((await to.request('hello')).artifacts, 1, 'the verb is advertised');
+        const { listed, entries } = await carry(from, to, source, target);
+        assert.equal(listed.projectName, '-work-project');
+        assert.deepEqual(listed.files.map((file) => file.relPath).sort(), [
+          'file-history/sess-move/f9764a6b1dfc35ba@v2',
+          'projects/-work-other/sess-move.superseded-1/subagents/agent-b2.jsonl',
+          'projects/-work-project/sess-move.jsonl',
+          'projects/-work-project/sess-move/subagents/agent-a1.jsonl',
+        ]);
+        for (const file of listed.files) {
+          assert.equal(file.sha256, sha256(fs.readFileSync(path.join(source.configDir, file.relPath))));
+        }
+        // Nothing is in place before the publish.
+        assert.equal(fs.existsSync(path.join(target.configDir, 'projects', '-work-project', 'sess-move.jsonl')), false);
+        const published = await to.request('artifacts', { op: 'publish', sessionId: source.sid, account: target.account, tx: txId, entries });
+        assert.deepEqual(published.published.map((entry) => entry.action), entries.map(() => 'created'));
+        for (const file of listed.files) {
+          assert.deepEqual(fs.readFileSync(path.join(target.configDir, file.relPath)), fs.readFileSync(path.join(source.configDir, file.relPath)));
+        }
+        // A publish asked again (its reply was lost) changes nothing and says so.
+        const again = await to.request('artifacts', { op: 'publish', sessionId: source.sid, account: target.account, tx: txId, entries });
+        assert.deepEqual(again.published.map((entry) => entry.action), entries.map(() => 'unchanged'));
+        const listedThere = await to.request('artifacts', { op: 'list', sessionId: source.sid, account: target.account });
+        assert.deepEqual(listedThere.files.map((file) => [file.relPath, file.sha256]), listed.files.map((file) => [file.relPath, file.sha256]));
+        assert.deepEqual(await to.request('artifacts', { op: 'abort', account: target.account, tx: txId }), { tx: txId, removed: true });
+        assert.equal(fs.existsSync(path.join(target.configDir, '.keep-move', txId)), false);
+      });
+    });
+  } finally { source.cleanup(); target.cleanup(); }
+});
+
+test('a stage keeps offset continuity, a retransmit is a no-op, and a wrong digest is thrown away', async () => {
+  const node = artifactNode('stage', { session: false });
+  try {
+    await withHost({ env: node.env }, async ({ client }) => {
+      const bytes = Buffer.from('0123456789abcdef');
+      const base = { op: 'stage', sessionId: node.sid, account: node.account, tx: txId,
+        relPath: 'projects/-work-project/sess-move.jsonl', size: bytes.length, sha256: sha256(bytes) };
+      const first = await client.request('artifacts', { ...base, from: 0, bytes: bytes.subarray(0, 8).toString('base64') });
+      assert.equal(first.staged, 8);
+      assert.equal(first.complete, false);
+      assert.equal((await client.request('artifacts', { ...base, from: 0, bytes: bytes.subarray(0, 8).toString('base64') })).staged, 8,
+        'the same piece again is a no-op');
+      await assert.rejects(client.request('artifacts', { ...base, from: 0, bytes: Buffer.from('XXXXXXXX').toString('base64') }),
+        (error) => error.code === 'artifacts-refused', 'other bytes at the same place are refused');
+      const gap = await client.request('artifacts', { ...base, from: 12, bytes: bytes.subarray(12).toString('base64') });
+      assert.equal(gap.needFrom, 8, 'a gap is answered with where to resume, and nothing is written');
+      const done = await client.request('artifacts', { ...base, from: 8, bytes: bytes.subarray(8).toString('base64') });
+      assert.equal(done.complete, true);
+      await assert.rejects(client.request('artifacts', { ...base, sha256: sha256(Buffer.from('other')), from: 16, bytes: '' }),
+        (error) => error.code === 'artifacts-refused', 'a file is declared once per transaction');
+
+      const bad = { ...base, relPath: 'projects/-work-project/sess-move/subagents/agent-x.jsonl', sha256: sha256(Buffer.from('not these bytes')) };
+      await assert.rejects(client.request('artifacts', { ...bad, from: 0, bytes: bytes.toString('base64') }),
+        (error) => error.code === 'artifacts-digest');
+      assert.equal(fs.existsSync(path.join(node.configDir, '.keep-move', txId, 'files', ...bad.relPath.split('/'))), false,
+        'a stage that does not verify is removed');
+      await assert.rejects(client.request('artifacts', { ...base, relPath: 'file-history/sess-move/big', size: 3 * 1024 ** 3, from: 0, bytes: '' }),
+        (error) => error.code === 'artifacts-invalid', 'a file larger than a transaction carries');
+      await assert.rejects(client.request('artifacts', { ...base, relPath: 'file-history/sess-move/big', size: 2 * 1024 ** 3, from: 0, bytes: '' }),
+        (error) => error.code === 'artifacts-refused', 'a transaction carries at most 2 GiB in all');
+      const huge = Buffer.alloc(4 * 1024 * 1024 + 1).toString('base64');
+      await assert.rejects(client.request('artifacts', { ...base, relPath: 'file-history/sess-move/x', size: 5 * 1024 * 1024, from: 0,
+        sha256: sha256(Buffer.alloc(1)), bytes: huge }), (error) => error.code === 'artifacts-invalid', 'a piece is at most 4 MiB');
+    });
+  } finally { node.cleanup(); }
+});
+
+test('a publish never overwrites a live transcript a move did not put there, and replaces one a move left behind', async () => {
+  const source = artifactNode('src2');
+  const target = artifactNode('dst2', { session: false });
+  try {
+    await withHost({ env: source.env }, async ({ client: from }) => {
+      await withHost({ env: target.env }, async ({ client: to }) => {
+        const live = target.put(`projects/-work-project/${source.sid}.jsonl`, '{"type":"user","live":true}\n');
+        const { entries } = await carry(from, to, source, target);
+        await assert.rejects(to.request('artifacts', { op: 'publish', sessionId: source.sid, account: target.account, tx: txId, entries }),
+          (error) => error.code === 'artifacts-conflict');
+        assert.equal(fs.readFileSync(live, 'utf8'), '{"type":"user","live":true}\n', 'the live transcript is untouched');
+        assert.equal(fs.existsSync(path.join(target.configDir, 'file-history', source.sid)), false, 'nothing else moved either');
+        // The session left this node earlier: what it left is a copy a move may replace.
+        await to.request('artifacts', { op: 'release', sessionId: source.sid, account: target.account });
+        const published = await to.request('artifacts', { op: 'publish', sessionId: source.sid, account: target.account, tx: txId, entries });
+        assert.equal(published.published.find((entry) => entry.relPath.endsWith('sess-move.jsonl')).action, 'replaced');
+        assert.equal(fs.readFileSync(live, 'utf8'), fs.readFileSync(path.join(source.configDir, 'projects', '-work-project', 'sess-move.jsonl'), 'utf8'));
+        assert.equal(fs.readFileSync(path.join(target.configDir, '.keep-move', txId, 'backup', 'projects', '-work-project', 'sess-move.jsonl'), 'utf8'),
+          '{"type":"user","live":true}\n', 'the replaced file is kept in the transaction');
+      });
+    });
+  } finally { source.cleanup(); target.cleanup(); }
+});
+
+test('the artifacts verb reads and writes only a session\'s artifacts under the node\'s own account, never through a link', async () => {
+  const node = artifactNode('refuse');
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-artifacts-elsewhere-'));
+  try {
+    await withHost({ env: node.env }, async ({ client }) => {
+      const code = (wanted) => (error) => error.code === wanted;
+      const read = (fields) => client.request('artifacts', { op: 'read', sessionId: node.sid, account: node.account, from: 0, length: 10, ...fields });
+      for (const relPath of ['projects/-work-project/other.jsonl', 'settings.json', 'projects/-work-project/sess-move.jsonl.bak',
+        'file-history/other/x', 'projects/-work-project/sess-move', '.keep-move/provenance/sess-move.json']) {
+        await assert.rejects(read({ relPath }), code('artifacts-refused'), relPath);
+      }
+      for (const relPath of ['../claude-a/projects/-work-project/sess-move.jsonl', '/etc/passwd', 'projects/-work-project/sess-move/../../x',
+        'projects//sess-move.jsonl', 'projects/-work-project/sess-move/a b']) {
+        await assert.rejects(read({ relPath }), code('artifacts-invalid'), relPath);
+      }
+      await assert.rejects(read({ relPath: 'projects/-work-project/sess-move.jsonl', length: 4 * 1024 * 1024 + 1 }), code('artifacts-invalid'));
+      await assert.rejects(read({ relPath: 'projects/-work-project/sess-move.jsonl', sessionId: '../x' }), code('artifacts-invalid'));
+      await assert.rejects(read({ relPath: 'projects/-work-project/sess-move.jsonl', account: { id: 'claude-b', configDir: node.configDir } }),
+        code('artifacts-refused'), 'an account this node does not have');
+      await assert.rejects(read({ relPath: 'projects/-work-project/sess-move.jsonl', account: { id: 'claude-a', configDir: elsewhere } }),
+        code('artifacts-refused'), 'the right id under another directory');
+      // A file that is a link, and a list that meets one.
+      fs.writeFileSync(path.join(elsewhere, 'secret'), 'not yours');
+      const link = path.join(node.configDir, 'projects', '-work-project', 'sess-move', 'subagents', 'agent-link.jsonl');
+      fs.symlinkSync(path.join(elsewhere, 'secret'), link);
+      await assert.rejects(read({ relPath: 'projects/-work-project/sess-move/subagents/agent-link.jsonl' }), code('artifacts-refused'));
+      await assert.rejects(client.request('artifacts', { op: 'list', sessionId: node.sid, account: node.account }), code('artifacts-refused'),
+        'a list with a link in it refuses rather than leaving the file behind');
+      fs.unlinkSync(link);
+      // A publish into a directory that is a link to somewhere else.
+      fs.mkdirSync(path.join(elsewhere, 'tree'));
+      fs.symlinkSync(path.join(elsewhere, 'tree'), path.join(node.configDir, 'file-history', 'sess-link'));
+      const empty = sha256(Buffer.alloc(0));
+      const stageEmpty = (relPath) => client.request('artifacts', { op: 'stage', sessionId: 'sess-link', account: node.account, tx: txId,
+        relPath, from: 0, bytes: '', size: 0, sha256: empty });
+      await stageEmpty('projects/-work-project/sess-link.jsonl');
+      await stageEmpty('file-history/sess-link/x');
+      await assert.rejects(client.request('artifacts', { op: 'publish', sessionId: 'sess-link', account: node.account, tx: txId,
+        entries: [{ relPath: 'projects/-work-project/sess-link.jsonl', size: 0, sha256: empty },
+          { relPath: 'file-history/sess-link/x', size: 0, sha256: empty }] }),
+      code('artifacts-refused'), 'a publish through a linked directory is refused');
+      assert.deepEqual(fs.readdirSync(path.join(elsewhere, 'tree')), [], 'nothing was written through the link');
+      assert.equal(fs.existsSync(path.join(node.configDir, 'projects', '-work-project', 'sess-link.jsonl')), false,
+        'and nothing else of that publish was put in place');
+      await assert.rejects(client.request('artifacts', { op: 'abort', account: node.account, tx: '../../x' }), code('artifacts-invalid'));
+      // The cwd probe and the hook-state drop.
+      assert.deepEqual(await client.request('artifacts', { op: 'cwd', path: node.configDir }), { path: node.configDir, exists: true, directory: true });
+      assert.equal((await client.request('artifacts', { op: 'cwd', path: path.join(node.root, 'nope') })).exists, false);
+      await assert.rejects(client.request('artifacts', { op: 'cwd', path: 'relative' }), code('artifacts-invalid'));
+      const hookClient = require('./hook-client.js');
+      fs.mkdirSync(path.dirname(hookClient.cursorFile(node.env, node.sid)), { recursive: true });
+      fs.writeFileSync(hookClient.cursorFile(node.env, node.sid), '{}');
+      const dropped = await client.request('artifacts', { op: 'drop-session', sessionId: node.sid });
+      assert.equal(dropped.cursor, true);
+      assert.equal(fs.existsSync(hookClient.cursorFile(node.env, node.sid)), false);
+    });
+  } finally {
+    node.cleanup();
+    fs.rmSync(elsewhere, { recursive: true, force: true });
+  }
+});

@@ -1136,6 +1136,10 @@ function createHost(options = {}) {
           // for the sessions it runs, which is how the daemon confirms a delivery to a
           // pane on this machine. A number, so a later shape can say it is a later one.
           transcript: 1,
+          // artifacts: this host answers the `artifacts` verb (bin/session-artifacts.js),
+          // which lists, reads, stages and publishes a Claude session's files under one
+          // of this node's own accounts, so a session can be moved onto or off it.
+          artifacts: 1,
           // spawnReceipts: a spawn naming an operationId is journalled, so a caller
           // whose reply was lost may ask again instead of starting a second process.
           spawnReceipts: true,
@@ -1213,6 +1217,12 @@ function createHost(options = {}) {
         // straight to whoever asked. The code rides along: `shared-setup` is the
         // one the daemon turns back into its own 409.
         return { result: require('./launch-prep.js').prepare(params) };
+      }
+      case 'artifacts': {
+        // A session's files, for a move between nodes. Every path is built here from
+        // this node's own account directory and a relative path the module checks
+        // against the shapes a session's artifacts can have; refusals carry a code.
+        return { result: await require('./session-artifacts.js').handle(params, { env }) };
       }
       case 'process': {
         // This machine's process table, for this machine's panes. The bootId rides
