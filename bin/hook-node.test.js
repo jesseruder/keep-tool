@@ -246,3 +246,74 @@ test('a fresh Codex on aws1 that binds its pane late is adopted by the daemon, a
     assert.deepEqual(fs.readdirSync(nodeRegistry), [], 'the node wrote no registry of its own');
   });
 });
+
+test('a Pi session on aws1 starts, has its step command refused by the daemon, and ends, all on the daemon\'s registry', async (t) => {
+  await withTwoNodeFleet(t, async (fleet) => {
+    const url = await daemonNodeApi(t, fleet);
+    const PI_SID = '56565656-7878-4989-8a8a-bcbcbcbcbcbc';
+    const instance = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    // The daemon launched this Pi session on aws1 (openSession pins it there and names
+    // it on the pane it spawns).
+    require('./accounts.js').pinSession(PI_SID, 'pi', 'pi/default', { root: fleet.registry, node: 'aws1' });
+    const remote = await connect({ node: 'aws1' });
+    let paneId;
+    try {
+      paneId = (await remote.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 30'] })).pane.id;
+      await remote.request('meta', { pane: paneId, patch: { sessionId: PI_SID, agent: 'pi', project: fleet.project } });
+    } finally { remote.close(); }
+    const paneMeta = async () => {
+      const client = await connect({ node: 'aws1' });
+      try { return (await client.request('get', { pane: paneId })).pane.meta; } finally { client.close(); }
+    };
+
+    // A step the daemon's registry gates, in a checkout the node reports on.
+    const git = (...args) => require('node:child_process').execFileSync('git', ['-C', fleet.project, ...args], { stdio: 'ignore' });
+    git('init', '-q');
+    fs.mkdirSync(path.join(fleet.registry, 'steps'), { recursive: true });
+    fs.writeFileSync(path.join(fleet.registry, 'steps', 'project.json'), JSON.stringify({ project: fleet.project,
+      steps: { apply: { guard: ['terraform apply'] } } }));
+
+    // The node shares the fleet's home, as every Keep node does; its registry directory
+    // is its own and must stay empty.
+    const nodeRegistry = path.join(fleet.root, 'node-registry');
+    fs.mkdirSync(nodeRegistry);
+    const tokenFile = path.join(fleet.root, 'node-api-token');
+    fs.writeFileSync(tokenFile, 'aws1-api-secret\n', { mode: 0o600 });
+    const nodeEnv = { PATH: process.env.PATH, HOME: fleet.root, LANG: 'C', KEEP_DIR: nodeRegistry, KEEP_NO_PUSH: '1',
+      KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main', KEEP_HOST_SOCK: path.join(fleet.root, 'aws1.sock'),
+      KEEP_DAEMON_URL: url, KEEP_NODE_TOKEN_FILE: tokenFile, KEEP_PANE: paneId, KEEP_AGENT_ACCOUNT_ID: 'pi/default',
+      KEEP_PI_SESSION_ID: PI_SID };
+    const hook = (action, extra = {}) => run(['hook', 'pi', action], nodeEnv,
+      { session_id: PI_SID, cwd: fleet.project, instance, pid: 4242, ...extra });
+
+    // start: the daemon's pane record names aws1 and the extension instance; the pane is bound.
+    const started = await hook('start');
+    assert.deepEqual(started, { status: 0, stdout: '', stderr: '' });
+    const record = JSON.parse(fs.readFileSync(path.join(fleet.registry, '.keep', 'panes', `${PI_SID}.json`), 'utf8'));
+    assert.equal(record.node, 'aws1');
+    assert.equal(record.pane, `${paneId}@aws1`);
+    assert.equal(record.agent, 'pi');
+    assert.equal(record.bound, true);
+    assert.equal(record.claimed, true);
+    assert.equal(record.piInstance, instance);
+    assert.equal((await paneMeta()).sessionId, PI_SID);
+
+    // pre-tool: the daemon's step guard, on the node's facts, blocks the step; the rest runs.
+    const refused = await hook('pre-tool', { tool_name: 'Bash', tool_input: { command: 'terraform apply' } });
+    assert.equal(refused.status, 2);
+    assert.match(refused.stderr, /^keep guard: `terraform apply` is step apply on /);
+    const plain = await hook('pre-tool', { tool_name: 'Bash', tool_input: { command: 'ls -la' } });
+    assert.deepEqual(plain, { status: 0, stdout: '', stderr: '' });
+
+    // end: the daemon's record is released for this instance, and the pane keeps its
+    // session for Watch and Reopen, as on the daemon node.
+    const ended = await hook('end');
+    assert.deepEqual(ended, { status: 0, stdout: '', stderr: '' });
+    const released = JSON.parse(fs.readFileSync(path.join(fleet.registry, '.keep', 'panes', `${PI_SID}.json`), 'utf8'));
+    assert.ok(Number.isFinite(released.released), 'the daemon\'s pane record is released');
+    assert.equal((await paneMeta()).sessionId, PI_SID);
+
+    assert.deepEqual(fs.readdirSync(nodeRegistry), [], 'the node wrote no registry of its own');
+    assert.equal(fs.existsSync(path.join(fleet.root, '.keep-node', 'hook-queue')), false, 'nothing had to be queued');
+  });
+});

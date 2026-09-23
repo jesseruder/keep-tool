@@ -857,3 +857,139 @@ test('a Codex start the daemon refused before its pane was bound is posted once 
   assert.deepEqual(unbound, ['get']);
   assert.equal(noBind.length, 1);
 });
+
+// ---------- Pi hooks ----------
+
+const PI_INSTANCE = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+
+test('the Pi events: their budgets fit the extension\'s 5 s, none carries a transcript, and only start and end are queued', () => {
+  const client = require('./hook-client.js');
+  assert.deepEqual(client.PI_EVENTS, ['pi-start', 'pi-end', 'pi-pre-tool']);
+  for (const event of client.PI_EVENTS) {
+    assert.ok(client.EVENTS.includes(event), event);
+    assert.ok(client.BUDGET_MS[event] < 5000, `${event} ends inside the extension's timeout`);
+    assert.ok(client.TRANSCRIPTLESS.has(event), `${event} carries no transcript`);
+  }
+  assert.deepEqual([client.BUDGET_MS['pi-start'], client.BUDGET_MS['pi-pre-tool'], client.BUDGET_MS['pi-end']], [3000, 3000, 2000]);
+  assert.equal(client.QUEUED.has('pi-start'), true);
+  assert.equal(client.QUEUED.has('pi-end'), true);
+  assert.equal(client.QUEUED.has('pi-pre-tool'), false, 'a guard delivered late guards nothing');
+  assert.equal(client.ENDS.has('pi-end'), true);
+});
+
+test('a Pi hook posts as the Pi session, with only what the daemon\'s keep hook pi reads', async (t) => {
+  const client = require('./hook-client.js');
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-client-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const posts = [];
+  const request = async (url, pathname, { payload }) => {
+    posts.push({ pathname, payload });
+    if (pathname.startsWith('/api/hook/context')) return { status: 200, data: JSON.stringify({ steps: [], repairSession: false }) };
+    return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: '', stderr: '', replayed: false }) };
+  };
+  const env = { HOME: home, KEEP_PANE: 'p3', KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main', KEEP_AGENT_ACCOUNT_ID: 'pi/default',
+    KEEP_STEP_OK: '1', KEEP_REVIEWER: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', KEEP_CODEX_CLIENT_TOKEN: 'tok' };
+  const where = { url: 'http://127.0.0.1:1', local: 'aws1', daemon: 'main' };
+  const input = { session_id: 'pi-aws1', cwd: home, instance: PI_INSTANCE, pid: 4242, job_id: 'job', worker_token: 'secret' };
+  const deps = { env, token: 'aws1-secret', request };
+  const started = await client.runPiHook('start', input, where, deps);
+  assert.equal(started.delivered, true);
+  const start = posts[0].payload;
+  assert.equal(start.event, 'pi-start');
+  assert.equal(start.transcript, null);
+  assert.deepEqual(start.input, { session_id: 'pi-aws1', cwd: home, instance: PI_INSTANCE, pid: 4242 }, 'no worker job id or token');
+  assert.deepEqual(start.identity, { agent: 'pi', sessionId: 'pi-aws1', pane: 'p3@aws1', accountId: 'pi/default', env: { KEEP_STEP_OK: '1' } });
+  await client.runPiHook('end', input, where, deps);
+  assert.equal(posts[1].payload.event, 'pi-end');
+  const pre = await client.runPiHook('pre-tool', { ...input, tool_name: 'Bash', tool_input: { command: 'ls' } }, where, deps);
+  assert.equal(pre.delivered, true);
+  assert.deepEqual(posts.slice(2).map((post) => post.pathname), ['/api/hook/context?session=pi-aws1', '/api/hook']);
+  const tool = posts[3].payload;
+  assert.equal(tool.event, 'pi-pre-tool');
+  assert.deepEqual(tool.input, { session_id: 'pi-aws1', cwd: home, tool_name: 'Bash', tool_input: { command: 'ls' },
+    repo_facts: { paths: { [home]: { top: null, main: null } }, deploy: null, head: {} } });
+  assert.equal(await client.runPiHook('post-tool', input, where, deps), null, 'not a carried Pi hook');
+});
+
+// `keep hook pi <action>` on aws1, as the Keep Pi extension runs it.
+function piHook(f, action, url, input = {}, extra = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CLI, 'hook', 'pi', action], {
+      env: f.env(url, { KEEP_PANE: 'p3', KEEP_AGENT_ACCOUNT_ID: 'pi/default', KEEP_PI_SESSION_ID: 'pi-aws1', ...extra }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', (status) => resolve({ status, stdout, stderr }));
+    child.stdin.end(JSON.stringify({ session_id: 'pi-aws1', cwd: f.home, instance: PI_INSTANCE, pid: 4242, ...input }));
+  });
+}
+
+test('a Pi pre-tool on a node blocks on the daemon\'s deny, and fails closed for a deploy when the daemon does not answer', async (t) => {
+  const f = fixture(t);
+  const refusal = 'keep guard: `terraform apply` is step apply on ~/infra\n';
+  const daemon = await stubDaemon(t, (body, n, url) => (url.startsWith('/api/hook/context') ? CONTEXT
+    : { status: 200, body: { ok: false, status: /terraform/.test(body.input.tool_input.command) ? 2 : 0, stdout: '',
+      stderr: /terraform/.test(body.input.tool_input.command) ? refusal : '', replayed: false } }));
+  const bash = (url, command, extra) => piHook(f, 'pre-tool', url, { tool_name: 'Bash', tool_input: { command } }, extra);
+  assert.deepEqual(await bash(daemon.url, 'terraform apply'), { status: 2, stdout: '', stderr: refusal });
+  const post = daemon.posts.find((entry) => entry.url === '/api/hook').body;
+  assert.equal(post.event, 'pi-pre-tool');
+  assert.equal(post.identity.agent, 'pi');
+  assert.deepEqual(await bash(daemon.url, 'ls'), { status: 0, stdout: '', stderr: '' });
+  // The raw-resume guard answers here first, as for a Claude pre-bash.
+  const before = daemon.posts.length;
+  assert.equal((await bash(daemon.url, 'claude --resume abc')).status, 2);
+  assert.equal(daemon.posts.length, before);
+
+  const closed = await closedUrl();
+  const deploy = await bash(closed, 'git push heroku main');
+  assert.equal(deploy.status, 2);
+  assert.match(deploy.stderr, /did not answer this command's guard .*, so a deploy to heroku \(remote heroku\) is refused here/);
+  // The step fingerprints the daemon last published (cached from the context above).
+  const step = await bash(closed, 'terraform apply');
+  assert.equal(step.status, 2);
+  assert.match(step.stderr, /`terraform apply`, a gated step's command, is refused here/);
+  assert.deepEqual(await bash(closed, 'ls -la'), { status: 0, stdout: '', stderr: '' });
+  // A pane-less Pi (a background worker) is not one a node runs.
+  const worker = await bash(daemon.url, 'ls', { KEEP_PANE: '' });
+  assert.equal(worker.status, 2);
+  assert.match(worker.stderr, /unverified background worker/);
+  assert.deepEqual(f.queue(), [], 'a pre-tool is never queued');
+});
+
+test('a Pi start and end on a node post to the daemon, and are queued, logged and answered when it does not answer', async (t) => {
+  const f = fixture(t);
+  const daemon = await stubDaemon(t, () => ({ status: 200, body: { ok: true, status: 0, stdout: '', stderr: '', replayed: false } }));
+  // No host here (KEEP_HOST_SOCK points nowhere): the daemon's bind is what counts.
+  const started = await piHook(f, 'start', daemon.url);
+  assert.deepEqual(started, { status: 0, stdout: '', stderr: '' });
+  assert.deepEqual(daemon.posts.map((post) => post.body.event), ['pi-start']);
+  assert.deepEqual(daemon.posts[0].body.input, { session_id: 'pi-aws1', cwd: f.home, instance: PI_INSTANCE, pid: 4242 });
+  const ended = await piHook(f, 'end', daemon.url);
+  assert.deepEqual(ended, { status: 0, stdout: '', stderr: '' });
+  assert.deepEqual(daemon.posts.map((post) => post.body.event), ['pi-start', 'pi-end']);
+
+  // The daemon could not bind it and the node cannot either: the start fails, with the daemon's reason.
+  const refusing = await stubDaemon(t, () => ({ status: 200, body: { ok: false, status: 2, stdout: '', stderr: 'keep hook pi start: could not bind the host pane\n', replayed: false } }));
+  const unbound = await piHook(f, 'start', refusing.url);
+  assert.equal(unbound.status, 2);
+  assert.equal(unbound.stderr, 'keep hook pi start: could not bind the host pane\n');
+
+  // Nobody answers: the start fails (no pane was bound anywhere) but is queued for the
+  // daemon's record, and the end is queued after it; both are logged.
+  const closed = await closedUrl();
+  const lonely = await piHook(f, 'start', closed, { session_id: 'pi-later' }, { KEEP_PI_SESSION_ID: 'pi-later' });
+  assert.equal(lonely.status, 2);
+  assert.match(lonely.stderr, /could not bind the host pane/);
+  assert.deepEqual(f.queue().map((entry) => entry.event), ['pi-start']);
+  const gone = await piHook(f, 'end', closed, { session_id: 'pi-later' }, { KEEP_PI_SESSION_ID: 'pi-later' });
+  assert.equal(gone.status, 0);
+  assert.deepEqual(f.queue().map((entry) => entry.event), ['pi-end'], 'an end drops what its session still had queued');
+  const log = fs.readFileSync(path.join(f.home, '.keep-node', 'hook.log'), 'utf8');
+  assert.match(log, /pi start for session pi-later: the daemon did not take it .*; queued/);
+  assert.match(log, /pi end for session pi-later: the daemon did not take it .*; queued/);
+});

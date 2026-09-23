@@ -1,5 +1,5 @@
 'use strict';
-// A Claude hook on a pane-only node that knows where its daemon is.
+// A Claude, Codex or Pi hook on a pane-only node that knows where its daemon is.
 //
 // The node posts the event to the daemon's POST /api/hook (bin/hook-route.js) with
 // the transcript bytes the daemon's mirror does not have yet, and prints what the
@@ -33,7 +33,11 @@ const CLAUDE_EVENTS = ['session-start', 'session-end', 'stop', 'notification', '
 // A Codex session's hooks, `keep hook codex <action>` posted as `codex-<action>`.
 const CODEX_EVENTS = ['codex-start', 'codex-end', 'codex-client-end', 'codex-stop', 'codex-question', 'codex-approval',
   'codex-complete', 'codex-lifecycle', 'codex-pre-tool', 'codex-post-tool'];
-const EVENTS = [...CLAUDE_EVENTS, ...CODEX_EVENTS];
+// A Pi session's hooks, `keep hook pi <action>` posted as `pi-<action>`: the three the
+// Keep Pi extension (integrations/pi/keep.ts) calls. Pi keeps no transcript Keep reads
+// through a hook, so none of them carries one.
+const PI_EVENTS = ['pi-start', 'pi-end', 'pi-pre-tool'];
+const EVENTS = [...CLAUDE_EVENTS, ...CODEX_EVENTS, ...PI_EVENTS];
 // Codex kills a hook at the timeout its hooks.json gives it (3 s for start, end,
 // question and approval; 10 s for stop; 5 s for lifecycle; 20 s for the tool hooks),
 // and a killed hook prints nothing, so every Codex budget ends inside that timeout
@@ -43,19 +47,26 @@ const BUDGET_MS = Object.freeze({
   'pre-bash': 5000, 'post-bash': 3000,
   'codex-start': 2000, 'codex-end': 2000, 'codex-client-end': 3000, 'codex-stop': 9000, 'codex-question': 2500,
   'codex-approval': 2500, 'codex-complete': 2500, 'codex-lifecycle': 3000, 'codex-pre-tool': 5000, 'codex-post-tool': 3000,
+  // The Pi extension kills its hook at 5 s and takes that as a failure (a pre-tool
+  // failure blocks the call), so each budget leaves room for the node's own work after
+  // it: a start's pane bind, a pre-tool's local guard when the daemon does not answer.
+  'pi-start': 3000, 'pi-end': 2000, 'pi-pre-tool': 3000,
 });
 // The events whose post carries no transcript bytes: the daemon's hook for them
 // reads the command and the repository facts, never the transcript, and a pre-bash
 // stands in front of every command the session runs. A Codex post-tool does carry
 // them: the daemon reads the command's exit code from the rollout.
-const TRANSCRIPTLESS = new Set(['pre-bash', 'post-bash', 'codex-pre-tool', 'codex-client-end']);
+const TRANSCRIPTLESS = new Set(['pre-bash', 'post-bash', 'codex-pre-tool', 'codex-client-end', ...PI_EVENTS]);
 // What is worth delivering late. A question's moment has passed, and a session's end
 // is answered by the pane release this node does itself. A post-bash only records
 // (a deploy, a step run), so it is as good late; a pre-bash is not.
+// A Pi start and end are: the daemon's pane record (and the released stamp a later
+// /new or /resume in the same pane rebinds by) is written whenever they arrive.
 const QUEUED = new Set(['session-start', 'stop', 'notification', 'lifecycle', 'post-bash',
-  'codex-start', 'codex-stop', 'codex-approval', 'codex-complete', 'codex-lifecycle', 'codex-post-tool']);
+  'codex-start', 'codex-stop', 'codex-approval', 'codex-complete', 'codex-lifecycle', 'codex-post-tool',
+  'pi-start', 'pi-end']);
 // The events that end a session: what it still has queued is dropped.
-const ENDS = new Set(['session-end', 'codex-end']);
+const ENDS = new Set(['session-end', 'codex-end', 'pi-end']);
 const QUEUE_MAX = 200;
 const REPLAY_MS = 5000;
 const CHUNK_BYTES = 4 * 1024 * 1024;
@@ -68,7 +79,7 @@ const TEXT_CAPS = Object.freeze({ last_assistant_message: 64 * 1024, message: 40
 // What the daemon's hook needs to run at all, never dropped to fit.
 const KEPT_FIELDS = new Set(['session_id', 'transcript_path', 'cwd', 'hook_event_name', 'stop_hook_active', 'permission_mode',
   'source', 'reason', 'notification_type', 'tool_name', 'agent_id', 'prompt_id', 'tool_use_id',
-  'turn_id', 'call_id', 'client_token', 'repo_facts']);
+  'turn_id', 'call_id', 'client_token', 'repo_facts', 'instance', 'pid']);
 const ACCOUNT_RE = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex|pi)\/default)$/;
 // The session's own environment the daemon's hook reads, and the shape the daemon
 // accepts for each (bin/hook-route.js FORWARDED_ENV). Nothing else is sent.
@@ -154,7 +165,8 @@ function snapshotOf(transcriptPath) {
 function identityOf(input, env, where, event) {
   const nodes = require('./nodes.js');
   const codex = CODEX_EVENTS.includes(event);
-  const identity = { agent: codex ? 'codex' : 'claude' };
+  const piEvent = PI_EVENTS.includes(event);
+  const identity = { agent: codex ? 'codex' : piEvent ? 'pi' : 'claude' };
   if (typeof input.session_id === 'string') identity.sessionId = input.session_id;
   if (env.KEEP_PANE) identity.pane = nodes.formatPaneRef(where.local, env.KEEP_PANE, env);
   if (ACCOUNT_RE.test(env.KEEP_AGENT_ACCOUNT_ID || '')) identity.accountId = env.KEEP_AGENT_ACCOUNT_ID;
@@ -164,6 +176,8 @@ function identityOf(input, env, where, event) {
   const forwarded = {};
   for (const [key, re] of Object.entries(FORWARDED_ENV)) {
     if (!codex && key.startsWith('KEEP_CODEX_')) continue;
+    // A Pi hook reads only the step guard's bypass of its session's environment.
+    if (piEvent && key !== 'KEEP_STEP_OK') continue;
     if (typeof source[key] === 'string' && re.test(source[key])) forwarded[key] = source[key];
   }
   if (Object.keys(forwarded).length) identity.env = forwarded;
@@ -557,10 +571,14 @@ async function runBashHook(event, input, where, deps = {}) {
   const budget = (deps.budgets || BUDGET_MS)[event];
   const command = input && input.tool_input && typeof input.tool_input.command === 'string' ? input.tool_input.command : '';
   const sessionId = input && typeof input.session_id === 'string' && SESSION_RE.test(input.session_id) ? input.session_id : '';
-  const { context, incomplete, repoFacts } = await commandFacts({ event, sessionId, cwd: input.cwd, command, where, deps, budget, started });
+  // A Pi pre-tool is a pre-bash in everything the facts are computed for.
+  const pre = event === 'pre-bash' || event === 'pi-pre-tool';
+  const { context, incomplete, repoFacts } = await commandFacts({
+    event: pre ? 'pre-bash' : event, sessionId, cwd: input.cwd, command, where, deps, budget, started,
+  });
   // A command that could be a gated step, in a repository that did not answer: the
   // daemon would judge it on facts that are not there, so it is not asked.
-  if (event === 'pre-bash' && incomplete && require('./repo-facts.js').fingerprintMatch(command, context.steps)) {
+  if (pre && incomplete && require('./repo-facts.js').fingerprintMatch(command, context.steps)) {
     return { delivered: false, why: 'the repository did not answer in time', context, incomplete };
   }
   const carried = { session_id: input.session_id, cwd: input.cwd, tool_name: 'Bash', tool_input: { command }, repo_facts: repoFacts };
@@ -604,6 +622,22 @@ async function runCodexToolHook(event, input, normalized, where, deps = {}) {
   return { ...(outcome || { delivered: false, why: 'this hook is not carried' }), context, incomplete };
 }
 
+// A Pi hook (`keep hook pi <action>`), carried as `pi-<action>`. The input posted is
+// rebuilt from what the daemon's `keep hook pi` reads: the session, its directory and
+// the extension instance (whose end may release only what its own start bound), and
+// for a pre-tool the command with this node's repository facts, as runBashHook
+// carries a Claude pre-bash. A background worker's job id and token are never sent:
+// Pi workers do not run on nodes. Resolves as runHook does (runBashHook for pre-tool).
+async function runPiHook(action, input, where, deps = {}) {
+  const event = `pi-${action}`;
+  if (!PI_EVENTS.includes(event) || !input || typeof input !== 'object') return null;
+  if (event === 'pi-pre-tool') return runBashHook(event, input, where, deps);
+  const carried = { session_id: input.session_id, cwd: input.cwd };
+  if (typeof input.instance === 'string') carried.instance = input.instance;
+  if (Number.isSafeInteger(input.pid) && input.pid > 0) carried.pid = input.pid;
+  return runHook(event, carried, where, deps);
+}
+
 // For `keep doctor` on a node: how much is waiting, and the newest cursor.
 function report(env = process.env) {
   const queued = queueFiles(env).length;
@@ -621,7 +655,7 @@ function report(env = process.env) {
 }
 
 module.exports = {
-  runHook, runBashHook, runCodexToolHook, deliver, logLine, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
+  runHook, runBashHook, runCodexToolHook, runPiHook, deliver, logLine, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
   hookContext, contextFile, CONTEXT_TTL_MS,
-  EVENTS, CLAUDE_EVENTS, CODEX_EVENTS, BUDGET_MS, QUEUE_MAX, CHUNK_BYTES, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
+  EVENTS, CLAUDE_EVENTS, CODEX_EVENTS, PI_EVENTS, TRANSCRIPTLESS, QUEUED, ENDS, BUDGET_MS, QUEUE_MAX, CHUNK_BYTES, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
 };

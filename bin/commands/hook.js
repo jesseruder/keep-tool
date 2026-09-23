@@ -445,11 +445,11 @@ function sessionNumberContext(sessionId) {
 // here may write a registry: one on this machine would be a second, diverging copy.
 // What stays is what the terminal host on this machine needs: the pane is bound to
 // the session at start and released at the end, so the console can show it and
-// Owner can type into it, restart it and close it. With KEEP_DAEMON_URL a Claude or
-// Codex session's hooks (its command guards and deploy and step records among them)
-// and every registry command go to the daemon; this notice is then what a start says
-// when the daemon did not answer it (`url`, agent claude or codex). A Pi session's
-// hooks are not carried yet.
+// Owner can type into it, restart it and close it. With KEEP_DAEMON_URL a Claude,
+// Codex or Pi session's hooks (its command guards and deploy and step records among
+// them) and every registry command go to the daemon; this notice is then what a
+// Claude or Codex start says when the daemon did not answer it (`url`, agent claude
+// or codex). A Pi start prints nothing: the Pi extension shows no hook output.
 const NODE_UNAVAILABLE = 'Not available on this node: keep tell, keep open, keep codex task, and admin commands'
   + ' such as keep serve, keep restart-daemon and keep nodes add.';
 
@@ -462,8 +462,8 @@ function paneOnlyNotice(where, options = {}) {
   const reach = options.agent === 'claude' || options.agent === 'codex'
     ? `Its hooks, the command guards and the deploy and step records among them, and its registry commands reach the daemon at ${options.url}; `
       + 'the daemon did not answer this start, so it is queued and resent with the next hook.'
-    : `Registry commands (keep checkin, keep add, keep reviewed, keep land and the rest) reach the daemon at ${options.url}; this session's hooks do not yet: `
-      + 'a Pi session on a node refuses deploys by name and records no deploy or step run.';
+    : `Registry commands (keep checkin, keep add, keep reviewed, keep land and the rest) reach the daemon at ${options.url}; `
+      + 'a Pi session\'s start, end and command guard reach it too, and when the daemon does not answer a command\'s guard the node refuses deploys by name.';
   return `${head}${reach} ${NODE_UNAVAILABLE}`;
 }
 
@@ -894,6 +894,96 @@ async function carriedCodexHook(action, input, where, deps = {}) {
   console.log(out || '{}');
 }
 
+// The Pi hooks a node whose daemon is known carries to it: the three the Keep Pi
+// extension calls, run there as the daemon's own `keep hook pi <action>`.
+const CARRIED_PI_ACTIONS = ['start', 'end', 'pre-tool'];
+// The extension kills its hook at 5 s and reads that as a failure: a start's post and
+// its pane bind share this deadline from when the hook process started.
+const PI_START_DEADLINE_MS = 4300;
+const PI_START_BIND_MIN_MS = 600;
+
+// A Pi hook on a node whose daemon is known. The extension reads only the exit code
+// and stderr: a non-zero exit is a failure, and for a pre-tool, stderr is the reason
+// the Bash call is blocked. So:
+//   start     the daemon first (its pane record and the bind it does through this
+//             node's host, which is what lets /new or /resume rebind a released
+//             pane), then the bind here, which finds the pane bound or does it. It
+//             fails only when neither bound it. A start the daemon did not take is
+//             queued and resent with the next hook, and said so in ~/.keep-node/hook.log.
+//   pre-tool  the raw-resume guard here, then the daemon's step and self-repair guards
+//             on this node's repository facts; a daemon that does not answer never
+//             lets through what remoteCommandGuard refuses (deploys, commands matching
+//             the step fingerprints it last published, a repair session's restarts).
+//   end       the daemon's release stamp (queued when it does not answer). The pane's
+//             meta is left as it is, as on the daemon node: an exited Pi pane keeps
+//             its session for Watch and Reopen.
+async function carriedPiHook(action, input, where, deps = {}) {
+  const env = deps.env || process.env;
+  const client = deps.hookClient || require('../hook-client.js');
+  const sid = input && typeof input.session_id === 'string' ? input.session_id : '';
+  const log = (text) => { try { client.logLine(env, text); } catch {} };
+  const post = () => Promise.resolve()
+    .then(() => client.runPiHook(action, input, where, deps))
+    .then((outcome) => outcome || { delivered: false, why: 'this hook is not carried' },
+      (error) => ({ delivered: false, why: error && error.message || String(error) }));
+  const refuse = (reason) => {
+    process.stderr.write(`${reason}\n`);
+    process.exitCode = 2;
+  };
+  if (action === 'pre-tool') {
+    if (!env.KEEP_PANE) return refuse('keep hook pi pre-tool: unverified background worker');
+    let resume;
+    try { resume = guardResumeCommand(input, env); } catch (error) {
+      resume = { deny: true, reason: `keep: the command guard is not available on node ${where.local}: ${error && error.message || error}` };
+    }
+    if (resume.deny) return refuse(resume.reason);
+    const command = input && input.tool_name === 'Bash' && input.tool_input ? input.tool_input.command : null;
+    if (typeof command !== 'string' || !command) return;
+    const outcome = await post();
+    if (outcome.delivered) {
+      const value = outcome.value || {};
+      if (value.stderr) process.stderr.write(String(value.stderr));
+      if (Number.isInteger(value.status) && value.status !== 0) process.exitCode = value.status;
+      return;
+    }
+    const context = outcome.context || {};
+    let decision;
+    try {
+      decision = remoteCommandGuard(input, where, env, {
+        unanswered: outcome.why || 'no answer', steps: Array.isArray(context.steps) ? context.steps : [],
+        repairSession: context.repairSession,
+      });
+    } catch (error) {
+      decision = { deny: true, reason: `keep: the command guard is not available on node ${where.local}: ${error && error.message || error}` };
+    }
+    if (decision.deny) refuse(decision.reason);
+    return;
+  }
+  if (action === 'start') {
+    const now = deps.now || Date.now;
+    const startedAt = Number.isFinite(deps.hookStartedAt) ? deps.hookStartedAt : Date.now() - process.uptime() * 1000;
+    const outcome = await post();
+    if (!outcome.delivered) {
+      log(`pi start for session ${sid}: the daemon did not take it (${outcome.why || 'no answer'})${outcome.queued ? '; queued' : ''}`);
+    }
+    const total = deps.piStartDeadlineMs == null ? PI_START_DEADLINE_MS : deps.piStartDeadlineMs;
+    const bindMs = Math.max(PI_START_BIND_MIN_MS, startedAt + total - now());
+    let bound = null;
+    try { bound = await bindRemotePane(input, 'pi', { ...deps, deadline: Date.now() + bindMs }); } catch {}
+    const daemonBound = outcome.delivered && outcome.value && outcome.value.status === 0;
+    if (daemonBound || (bound && bound.bound)) return;
+    const said = outcome.delivered && outcome.value && outcome.value.stderr ? String(outcome.value.stderr).trim() : '';
+    refuse(said || 'keep hook pi start: could not bind the host pane');
+    return;
+  }
+  if (action === 'end') {
+    const outcome = await post();
+    if (!outcome.delivered) {
+      log(`pi end for session ${sid}: the daemon did not take it (${outcome.why || 'no answer'})${outcome.queued ? '; queued' : ''}`);
+    }
+  }
+}
+
 // Every hook action on a pane-only node. Nothing below reads or writes ROOT or META.
 async function remoteHook(argv, input, where, deps = {}) {
   const env = deps.env || process.env;
@@ -962,6 +1052,11 @@ async function remoteHook(argv, input, where, deps = {}) {
     } catch {}
     console.log(JSON.stringify(out));
     return;
+  }
+  if (kind === 'pi' && CARRIED_PI_ACTIONS.includes(argv[1])) {
+    let remote = null;
+    try { remote = require('../remote-cli.js').remoteMode(env); } catch { remote = null; }
+    if (remote) return carriedPiHook(argv[1], input, remote, deps);
   }
   if (kind === 'pi') {
     // A Pi pane keeps its session metadata after the agent exits (Watch and Reopen

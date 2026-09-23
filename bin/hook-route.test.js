@@ -108,7 +108,8 @@ test('a hook post is refused unless it is a Claude event for a session and pane 
     [AWS1, body({ event: 'pre-bash', input: { session_id: 'sess-aws1', cwd: '/x' } }), 400, /pre-bash is for Bash only/],
     [AWS1, body({ event: 'post-bash', input: { session_id: 'sess-aws1', cwd: '/x' } }), 400, /post-bash is for Bash only/],
     [AWS1, body({ identity: { agent: 'codex', sessionId: 'codex-aws1' } }), 400, /stop is a Claude hook/],
-    [AWS1, body({ identity: { agent: 'pi', sessionId: 'pi-aws1' } }), 400, /only Claude and Codex hooks/],
+    [AWS1, body({ identity: { agent: 'pi', sessionId: 'pi-aws1' } }), 400, /stop is a claude hook, not a pi one/],
+    [AWS1, body({ identity: { agent: 'gemini', sessionId: 'sess-aws1' } }), 400, /only Claude, Codex and Pi hooks/],
     [AWS1, body({ identity: { agent: 'claude', sessionId: 'sess-main' }, input: { session_id: 'sess-main', cwd: '/x' } }), 403, /session sess-main is not on node aws1/],
     [AWS1, body({ identity: { agent: 'claude', sessionId: 'nobody' }, input: { session_id: 'nobody', cwd: '/x' } }), 403, /is not on node aws1/],
     [AWS1, body({ identity: { agent: 'claude', sessionId: 'codex-aws1' }, input: { session_id: 'codex-aws1', cwd: '/x' } }), 403, /is a codex session/],
@@ -664,7 +665,6 @@ test('the hook context publishes the step fingerprints and whether the daemon la
   card = '';
   for (const [who, session, status, message] of [
     [AWS1, 'sess-main', 403, /not on node aws1/],
-    [AWS1, 'pi-aws1', 403, /is a pi session/],
     [AWS1, '../x', 400, /invalid session id/],
     [AWS1, null, 400, /invalid session id/],
     [{ class: 'admin' }, 'sess-aws1', 403, /for sessions on other nodes/],
@@ -1448,4 +1448,158 @@ test('a Codex post the route would refuse on its own adopts nothing', async (t) 
     assert.equal(host.asked, 0, name);
     assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts')), false, name);
   }
+});
+
+// ---------- Pi hooks through the route ----------
+
+const PI_INSTANCE = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+
+function piBody(event, input = {}, extra = {}) {
+  return {
+    event,
+    input: { session_id: 'pi-aws1', cwd: '/home/node/project', instance: PI_INSTANCE, pid: 4242,
+      job_id: 'job-dropped', worker_token: 'token-dropped', ...input },
+    identity: { agent: 'pi', sessionId: 'pi-aws1', pane: 'p3@aws1' },
+    transcript: null,
+    idempotencyKey: `${KEY}-${event}-${Math.random().toString(36).slice(2)}`,
+    ...extra,
+  };
+}
+
+test('a Pi post is refused unless it is a pi-* event for a Pi session on the calling node, in its input shape', async (t) => {
+  const { hooks, calls, root } = services(t);
+  const cwd = path.join(root, 'wt', 'infra', 'feature');
+  const cases = [
+    [piBody('pi-start', {}, { identity: { agent: 'pi', sessionId: 'sess-aws1' } }), 403, /is a claude session, not pi/],
+    [body({ identity: { agent: 'claude', sessionId: 'pi-aws1' }, input: { session_id: 'pi-aws1', cwd: '/x' } }), 403, /is a pi session, not claude/],
+    [piBody('stop'), 400, /stop is a claude hook, not a pi one/],
+    [piBody('pi-start', {}, { identity: { agent: 'claude', sessionId: 'sess-aws1' } }), 400, /pi-start is a pi hook, not a claude one/],
+    [piBody('codex-start'), 400, /codex-start is a codex hook, not a pi one/],
+    [piBody('pi-post-tool'), 400, /is not a hook event/],
+    [piBody('transcript', {}, { transcript: transcript('x') }), 400, /a Pi session posts no transcript/],
+    [piBody('pi-start', {}, { transcript: transcript('x') }), 400, /a Pi hook carries no transcript/],
+    [piBody('pi-start', { session_id: 'other' }), 400, /must be the identity's session/],
+    [piBody('pi-start', { cwd: 'relative' }), 400, /input.cwd must be an absolute path/],
+    [piBody('pi-start', { instance: 'not-a-uuid' }), 400, /invalid input.instance/],
+    [piBody('pi-start', { pid: -1 }), 400, /input.pid must be a process id/],
+    [piBody('pi-pre-tool', { tool_name: 'Bash', tool_input: { command: 'ls' } }), 400, /repo_facts is required/],
+    [piBody('pi-pre-tool', { tool_name: 'Read', tool_input: { command: 'ls' }, repo_facts: NO_FACTS }), 400, /pi-pre-tool is for Bash only/],
+    [piBody('pi-pre-tool', { cwd, tool_name: 'Bash', tool_input: { command: 'x'.repeat(65 * 1024) }, repo_facts: NO_FACTS }), 400, /longer than/],
+    [piBody('pi-start', {}, { identity: { agent: 'pi', sessionId: 'pi-aws1', pane: 'p3@other' } }), 403, /is not on node aws1/],
+  ];
+  for (const [request, status, message] of cases) {
+    const answer = await hooks.handle(AWS1, request);
+    assert.equal(answer.status, status, `${request.event}: ${JSON.stringify(answer.body)}`);
+    assert.match(answer.body.error, message);
+  }
+  assert.equal(calls.length, 0, 'nothing ran');
+  // Never adopted: a Pi session names itself at its open and is pinned there.
+  const unknown = await hooks.handle(AWS1, piBody('pi-start', { session_id: 'pi-unknown' }, { identity: { agent: 'pi', sessionId: 'pi-unknown', pane: 'p3@aws1' } }));
+  assert.equal(unknown.status, 403);
+  assert.equal(unknown.body.code, 'SESSION_NOT_ON_NODE');
+});
+
+test('each Pi event runs the daemon\'s keep hook pi <action> on its rebuilt input, with no transcript and the Pi identity', async (t) => {
+  let card = '';
+  const { hooks, calls, root } = services(t, { cardForSession: () => card,
+    answer: (call) => (call.args[3] === 'pre-tool' ? { code: 2, stdout: '', stderr: 'keep guard: refused\n' } : { code: 0, stdout: '', stderr: '' }) });
+  const start = await hooks.handle(AWS1, piBody('pi-start', {}, { identity: { agent: 'pi', sessionId: 'pi-aws1', pane: 'p3@aws1',
+    env: { KEEP_STEP_OK: '1', KEEP_REPAIR: '1', KEEP_CODEX_CLIENT_TOKEN: 'x' } } }));
+  assert.equal(start.status, 200, JSON.stringify(start.body));
+  assert.deepEqual(start.body, { ok: true, status: 0, stdout: '', stderr: '', replayed: false });
+  assert.deepEqual(calls[0].args.slice(1), ['hook', 'pi', 'start']);
+  assert.deepEqual(JSON.parse(calls[0].stdin), { session_id: 'pi-aws1', cwd: '/home/node/project', instance: PI_INSTANCE, pid: 4242 },
+    'no transcript path, no worker job id or token');
+  const env = calls[0].options.env;
+  assert.equal(env.KEEP_PI_SESSION_ID, 'pi-aws1');
+  assert.equal(env.CLAUDE_CODE_SESSION_ID, undefined);
+  assert.equal(env.KEEP_HOOK_NODE, 'aws1');
+  assert.equal(env.KEEP_REMOTE_CALLER, 'aws1');
+  assert.equal(env.KEEP_PANE, 'p3@aws1');
+  assert.equal(env.KEEP_STEP_OK, '1');
+  assert.equal(env.KEEP_REPAIR, undefined, 'the node\'s word is dropped');
+  assert.equal(fs.existsSync(path.join(root, '.keep', 'transcript-mirrors')), false, 'nothing mirrored');
+
+  const end = await hooks.handle(AWS1, piBody('pi-end'));
+  assert.equal(end.status, 200);
+  assert.deepEqual(calls[1].args.slice(1), ['hook', 'pi', 'end']);
+
+  const cwd = path.join(root, 'wt', 'infra', 'feature');
+  const facts = { paths: { [cwd]: { top: cwd, main: path.join(root, 'infra') } }, deploy: null, head: {} };
+  const pre = await hooks.handle(AWS1, piBody('pi-pre-tool', { cwd, tool_name: 'Bash', tool_input: { command: 'terraform apply', timeout: 5 }, repo_facts: facts }));
+  assert.equal(pre.status, 200);
+  assert.deepEqual([pre.body.status, pre.body.stderr], [2, 'keep guard: refused\n']);
+  assert.deepEqual(calls[2].args.slice(1), ['hook', 'pi', 'pre-tool']);
+  const preInput = JSON.parse(calls[2].stdin);
+  assert.deepEqual(preInput.tool_input, { command: 'terraform apply' });
+  assert.deepEqual(preInput.repo_facts, facts);
+  assert.equal(calls[2].options.env.KEEP_REPAIR, undefined);
+  card = 'repair-card';
+  await hooks.handle(AWS1, piBody('pi-pre-tool', { cwd, tool_name: 'Bash', tool_input: { command: 'ls' }, repo_facts: facts }));
+  assert.equal(calls.at(-1).options.env.KEEP_REPAIR, '1', 'the daemon launched it to repair itself');
+  await hooks.handle(AWS1, piBody('pi-start'));
+  assert.equal(calls.at(-1).options.env.KEEP_REPAIR, undefined, 'only a pre-tool carries it');
+  // The hook context answers a Pi session too: its pre-tool computes its facts by the fingerprints.
+  assert.equal(hooks.context(AWS1, 'pi-aws1').status, 200);
+});
+
+test('a Pi pre-tool on the daemon judges a node\'s shell command by the node\'s facts, as a Claude pre-bash is judged', async (t) => {
+  const root = registry(t);
+  stepsRegistry(root);
+  let card = '';
+  const { hooks } = services(t, { root, realSpawn: true, cardForSession: () => card });
+  const cwd = path.join(root, 'wt', 'infra', 'feature');
+  const run = async (command, paths = { [cwd]: { top: cwd, main: path.join(root, 'infra') } }) => {
+    const answer = await hooks.handle(AWS1, piBody('pi-pre-tool', { cwd, tool_name: 'Bash', tool_input: { command },
+      repo_facts: { paths, deploy: null, head: {} } }));
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    return answer.body;
+  };
+  const refused = await run('terraform apply -auto-approve');
+  assert.equal(refused.status, 2, refused.stderr);
+  assert.match(refused.stderr, /^keep guard: `terraform apply` is step apply on ~\/infra/);
+  const unreported = await run('terraform apply', {});
+  assert.equal(unreported.status, 2);
+  assert.match(unreported.stderr, /node aws1 did not report the repository/);
+  assert.equal((await run('ls -la')).status, 0);
+  card = 'repair-card';
+  const repair = await run('keep restart-daemon');
+  assert.equal(repair.status, 2);
+  assert.match(repair.stderr, /restarts the daemon you were launched to repair/);
+});
+
+test('on the daemon a node Pi start binds the pane on that node\'s host with its instance, and its end stamps the release', async (t) => {
+  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const hook = require('./commands/hook.js');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodes(t, async ({ root, configFile }) => {
+    const remote = await connect({ node: 'aws1' });
+    const local = await connect({ node: 'main' });
+    try {
+      const { pane } = await remote.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 5'] });
+      await remote.request('meta', { pane: pane.id, patch: { sessionId: 'pi-aws1', agent: 'pi' } });
+      const { pane: mainPane } = await local.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 5'] });
+      const env = { KEEP_CONFIG: configFile, KEEP_DAEMON_NODE: 'main', KEEP_NODE_NAME: 'main', KEEP_HOOK_NODE: 'aws1',
+        KEEP_REMOTE_CALLER: 'aws1', KEEP_PANE: `${pane.id}@aws1` };
+      const input = { session_id: 'pi-aws1', cwd: '/home/node/project', instance: PI_INSTANCE };
+      const record = await hook.recordSessionPane(input, 'pi', { root, env, retryMs: 1 });
+      assert.equal(record.bound, true);
+      assert.equal(record.claimed, true, 'the launched pane already named this session');
+      assert.equal(record.node, 'aws1');
+      assert.equal(record.pane, `${pane.id}@aws1`);
+      assert.equal(record.piInstance, PI_INSTANCE);
+      const meta = (await remote.request('get', { pane: pane.id })).pane.meta;
+      assert.equal(meta.sessionId, 'pi-aws1');
+      assert.equal(meta.agent, 'pi');
+      assert.equal(meta.project, '/home/node/project');
+      assert.equal((await local.request('get', { pane: mainPane.id })).pane.meta.sessionId, undefined, 'the daemon\'s pane was never touched');
+
+      // Another instance's end releases nothing; this one's stamps the record and
+      // leaves the pane's meta for Watch and Reopen.
+      assert.equal(await hook.releaseSessionPane({ ...input, instance: 'ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee' }, 'pi', { root, env }), undefined);
+      const released = await hook.releaseSessionPane(input, 'pi', { root, env });
+      assert.ok(released && Number.isFinite(released.released));
+      assert.equal((await remote.request('get', { pane: pane.id })).pane.meta.sessionId, 'pi-aws1');
+    } finally { remote.close(); local.close(); }
+  });
 });

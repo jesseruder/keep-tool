@@ -1,5 +1,5 @@
 'use strict';
-// POST /api/hook — a Claude or Codex session's hook on a pane-only node, run on the daemon.
+// POST /api/hook — a Claude, Codex or Pi session's hook on a pane-only node, run on the daemon.
 //
 // The node's hook sends the event, its stdin JSON and the transcript bytes the
 // daemon does not have yet. The bytes are appended to the session's transcript
@@ -12,8 +12,8 @@
 // argv is `hook <event>` from a fixed list, and the stdin is the rewritten object.
 // A node acts only for a session the location record places on it with the agent the
 // event is for (a Claude event for a Claude session, a codex-* event for a Codex
-// one, whose mirror is its rollout), only on that session's mirror, and only with a
-// pane on itself. A fresh Codex open of the daemon's with no location record yet,
+// one, whose mirror is its rollout, a pi-* event for a Pi one, which has no mirror),
+// only on that session's mirror, and only with a pane on itself. A fresh Codex open of the daemon's with no location record yet,
 // whose pane on the caller now names it, is adopted first (bin/late-adoption.js).
 // The run goes through the registry route's journal (bin/registry-route.js), so a
 // resent event replays its answer instead of running again, and a restart waits for
@@ -30,7 +30,12 @@ const EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-que
 // A Codex session's hooks: `codex-<action>` runs the daemon's `keep hook codex <action>`.
 const CODEX_ACTIONS = ['start', 'end', 'client-end', 'stop', 'question', 'approval', 'complete', 'lifecycle', 'pre-tool', 'post-tool'];
 const CODEX_EVENTS = CODEX_ACTIONS.map((action) => `codex-${action}`);
-const agentOf = (event) => (CODEX_EVENTS.includes(event) ? 'codex' : 'claude');
+// A Pi session's hooks, the three the Keep Pi extension calls: `pi-<action>` runs the
+// daemon's `keep hook pi <action>`. None carries a transcript.
+const PI_ACTIONS = ['start', 'end', 'pre-tool'];
+const PI_EVENTS = PI_ACTIONS.map((action) => `pi-${action}`);
+const agentOf = (event) => (CODEX_EVENTS.includes(event) ? 'codex' : PI_EVENTS.includes(event) ? 'pi' : 'claude');
+const isHookEvent = (event) => EVENTS.includes(event) || CODEX_EVENTS.includes(event) || PI_EVENTS.includes(event);
 // A post that carries only transcript bytes: every chunk of a long delta but the last.
 const TRANSCRIPT_ONLY = 'transcript';
 const HOOK_TIMEOUT_MS = 20e3;
@@ -411,6 +416,31 @@ function cleanCodexInput(event, input, sessionId, options = {}) {
   return out;
 }
 
+// The Pi extension's instance id (a random UUID), which a Pi end must match to
+// release what its start bound.
+const PI_INSTANCE_RE = /^[a-f0-9-]{36}$/;
+
+// A Pi hook's stdin, rebuilt from what `keep hook pi <action>` reads: the session,
+// its directory, the extension instance and process, and for a pre-tool the Bash
+// command with the node's repository facts (bashInput, as for Claude's pre-bash). A
+// background worker's job id and token are dropped: Pi workers do not run on nodes.
+function cleanPiInput(event, input, sessionId, options = {}) {
+  if (!isObject(input)) refuse(400, 'input must be the hook\'s stdin object');
+  let size;
+  try { size = Buffer.byteLength(JSON.stringify(input)); } catch { refuse(400, 'input is not JSON'); }
+  if (size > INPUT_MAX_BYTES) refuse(400, `input is larger than ${INPUT_MAX_BYTES} bytes`);
+  if (input.session_id !== sessionId) refuse(400, 'input.session_id must be the identity\'s session');
+  const out = { session_id: sessionId, cwd: absolutePath(input.cwd, 'input.cwd') };
+  const has = (key) => input[key] !== undefined && input[key] !== null;
+  if (has('instance')) out.instance = matching(input.instance, PI_INSTANCE_RE, 'input.instance');
+  if (has('pid')) {
+    if (!Number.isSafeInteger(input.pid) || input.pid <= 0) refuse(400, 'input.pid must be a process id');
+    out.pid = input.pid;
+  }
+  if (event === 'pi-pre-tool') bashInput(input, event, out, options.home || os.homedir());
+  return out;
+}
+
 function cleanTranscript(value) {
   if (value === undefined || value === null) return null;
   if (!isObject(value)) refuse(400, 'transcript must be an object or null');
@@ -433,14 +463,16 @@ function cleanTranscript(value) {
 function validateRequest(body, caller, deps) {
   if (!isObject(body)) refuse(400, 'the request body must be an object');
   const { event } = body;
-  if (event !== TRANSCRIPT_ONLY && !EVENTS.includes(event) && !CODEX_EVENTS.includes(event)) {
+  if (event !== TRANSCRIPT_ONLY && !isHookEvent(event)) {
     refuse(400, `${JSON.stringify(String(event))} is not a hook event`);
   }
   const identity = body.identity;
   if (!isObject(identity)) refuse(400, 'identity is required');
-  if (identity.agent !== 'claude' && identity.agent !== 'codex') refuse(400, 'only Claude and Codex hooks are carried to the daemon');
+  if (!['claude', 'codex', 'pi'].includes(identity.agent)) refuse(400, 'only Claude, Codex and Pi hooks are carried to the daemon');
   const agent = identity.agent;
+  if (agent === 'pi' && event === TRANSCRIPT_ONLY) refuse(400, 'a Pi session posts no transcript');
   if (event !== TRANSCRIPT_ONLY && agentOf(event) !== agent) {
+    if (agent === 'pi' || agentOf(event) === 'pi') refuse(400, `${event} is a ${agentOf(event)} hook, not a ${agent} one; a Pi session posts pi-* events`);
     refuse(400, agent === 'codex' ? `${event} is a Claude hook; a Codex session posts codex-* events` : `${event} is a Codex hook, not a Claude one`);
   }
   // A Codex client-end is the launcher's, after the TUI exited: it names no session,
@@ -484,6 +516,7 @@ function validateRequest(body, caller, deps) {
     pane = deps.formatPaneRef(parsed.node, parsed.paneId);
   }
   const transcript = cleanTranscript(body.transcript);
+  if (agent === 'pi' && transcript) refuse(400, 'a Pi hook carries no transcript');
   if (event === TRANSCRIPT_ONLY) {
     if (!transcript) refuse(400, 'a transcript post carries a transcript');
     return { event, agent, sessionId, accountId, pane, transcript, firedAt, env };
@@ -494,6 +527,7 @@ function validateRequest(body, caller, deps) {
   }
   const input = agent === 'codex'
     ? cleanCodexInput(event, body.input, sessionId, { home: deps.home })
+    : agent === 'pi' ? cleanPiInput(event, body.input, sessionId, { home: deps.home })
     : cleanInput(event, body.input, sessionId, { home: deps.home });
   return { event, agent, sessionId, accountId, pane, transcript, firedAt, env, input, idempotencyKey: body.idempotencyKey };
 }
@@ -609,8 +643,10 @@ function createHookService(options = {}) {
       // on the caller, so a post the route would refuse on its own pins nothing. A post
       // that names no pane is not from one of Keep's panes (every host pane carries
       // KEEP_PANE, and the node's own bind needs it), so it never asks the node's host.
+      // Never a Pi session: its id is assigned and pinned at open, so there is nothing to adopt.
       const identity = isObject(body) && isObject(body.identity) ? body.identity : null;
-      const ofItsAgent = identity && typeof identity.pane === 'string' && identity.pane !== '' && (body.event === TRANSCRIPT_ONLY
+      const ofItsAgent = identity && identity.agent !== 'pi' && typeof identity.pane === 'string' && identity.pane !== ''
+        && (body.event === TRANSCRIPT_ONLY
         || ((EVENTS.includes(body.event) || CODEX_EVENTS.includes(body.event)) && agentOf(body.event) === identity.agent));
       if (ofItsAgent && typeof shared.adopt === 'function' && shared.unlocated(identity.sessionId)) {
         validateRequest(body, caller, { ...deps, location: () => ({ node: caller, agent: identity.agent }) });
@@ -631,11 +667,13 @@ function createHookService(options = {}) {
         }
         // The daemon never reads the node's path: the hook reads the mirror, whether
         // or not this post carried bytes for it. A client-end names no session and
-        // reads no transcript.
-        const input = request.sessionId
+        // reads no transcript, and a Pi hook has none.
+        const input = request.sessionId && request.agent !== 'pi'
           ? { ...request.input, transcript_path: mirror.paths(root, caller, request.sessionId).file } : request.input;
         const hookRequest = { ...request, input };
-        const argv = request.agent === 'codex' ? ['hook', 'codex', request.event.slice('codex-'.length)] : ['hook', request.event];
+        const argv = request.agent === 'codex' ? ['hook', 'codex', request.event.slice('codex-'.length)]
+          : request.agent === 'pi' ? ['hook', 'pi', request.event.slice('pi-'.length)]
+          : ['hook', request.event];
         // The forwarded session env first, so nothing it names can replace the
         // route's own variables below it.
         const env = {
@@ -646,7 +684,8 @@ function createHookService(options = {}) {
           ...(request.firedAt ? { KEEP_HOOK_FIRED_AT: String(request.firedAt) } : {}),
           // The self-repair guard's marker, from the daemon's own record of which
           // sessions it launched to repair it, never from the node.
-          ...(request.event === 'pre-bash' && isRepairSession(repairDeps, request.sessionId, root) ? { KEEP_REPAIR: '1' } : {}),
+          ...((request.event === 'pre-bash' || request.event === 'pi-pre-tool')
+            && isRepairSession(repairDeps, request.sessionId, root) ? { KEEP_REPAIR: '1' } : {}),
         };
         const answer = await shared.journaled({
           caller, key: request.idempotencyKey, digest: digestOf(hookRequest), queue: `hook\0${caller}\0${scope}`,
@@ -672,7 +711,7 @@ function createHookService(options = {}) {
 
   // GET /api/hook/context?session=<id>: what a node's pre-bash hook reads before
   // it posts, and falls back on when the daemon does not answer the post. Only for
-  // a Claude session the location record places on the calling node.
+  // a Claude, Codex or Pi session the location record places on the calling node.
   function context(principal, sessionId) {
     try {
       const caller = shared.callerNode(principal);
@@ -681,8 +720,9 @@ function createHookService(options = {}) {
       let where = null;
       try { where = shared.location(session); } catch { where = null; }
       if (!where || where.node !== caller) refuse(403, `session ${session} is not on node ${caller}`, SESSION_NOT_ON_NODE);
-      // A Codex session's pre-tool refuses by the same fingerprints a Claude one's pre-bash does.
-      if (where.agent !== 'claude' && where.agent !== 'codex') refuse(403, `session ${session} is a ${where.agent} session, not claude or codex`);
+      // A Codex session's pre-tool, and a Pi one's, refuse by the same fingerprints a
+      // Claude one's pre-bash does, and compute their repository facts by them.
+      if (!['claude', 'codex', 'pi'].includes(where.agent)) refuse(403, `session ${session} is a ${where.agent} session, not claude, codex or pi`);
       return { status: 200, body: { steps: publishedFingerprints(root), repairSession: isRepairSession(repairDeps, session, root) } };
     } catch (error) {
       if (error instanceof RegistryError) return { status: error.status, body: { error: error.message, ...(error.code ? { code: error.code } : {}) } };
@@ -694,6 +734,6 @@ function createHookService(options = {}) {
 }
 
 module.exports = {
-  createHookService, validateRequest, cleanInput, cleanCodexInput, digestOf, publishedFingerprints,
-  cleanRepoFacts, EVENTS, CODEX_EVENTS, CODEX_ACTIONS, FINGERPRINTS_MAX, FINGERPRINT_MAX_BYTES, COMMAND_MAX_BYTES, TRANSCRIPT_ONLY, HOOK_TIMEOUT_MS, INPUT_MAX_BYTES, BODY_MAX_BYTES, TEXT_MAX, FORWARDED_ENV,
+  createHookService, validateRequest, cleanInput, cleanCodexInput, cleanPiInput, digestOf, publishedFingerprints,
+  cleanRepoFacts, EVENTS, CODEX_EVENTS, CODEX_ACTIONS, PI_EVENTS, PI_ACTIONS, FINGERPRINTS_MAX, FINGERPRINT_MAX_BYTES, COMMAND_MAX_BYTES, TRANSCRIPT_ONLY, HOOK_TIMEOUT_MS, INPUT_MAX_BYTES, BODY_MAX_BYTES, TEXT_MAX, FORWARDED_ENV,
 };
