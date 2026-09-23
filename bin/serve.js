@@ -3951,13 +3951,14 @@ async function requireNodeArtifacts(node, deps = {}) {
 
 function nodeArtifacts(node, account, deps = {}) {
   if (!node || node === daemonNodeName(deps)) throw new Error('nodeArtifacts is for another node');
-  if (!account || typeof account.id !== 'string' || typeof account.configDir !== 'string') {
-    throw new InjectionError(400, 'nodeArtifacts needs an account with an id and a config directory');
-  }
   const request = async (params) => {
+    const unscoped = params.op === 'cwd' || params.op === 'drop-session';
+    // Only the two ops that name no account may be asked without one.
+    if (!unscoped && (!account || typeof account.id !== 'string' || typeof account.configDir !== 'string')) {
+      throw new InjectionError(400, 'nodeArtifacts needs an account with an id and a config directory');
+    }
     await requireNodeArtifacts(node, deps);
-    const scoped = params.op === 'cwd' || params.op === 'drop-session'
-      ? params : { ...params, account: { id: account.id, configDir: account.configDir } };
+    const scoped = unscoped ? params : { ...params, account: { id: account.id, configDir: account.configDir } };
     return (deps.hostRequest || hostRequest)('artifacts', scoped,
       { ...deps, node, hostRequestTimeoutMs: ARTIFACTS_TIMEOUT_MS[params.op] || HOST_REQUEST_TIMEOUT_MS });
   };
@@ -6891,7 +6892,9 @@ async function restartSession(body, deps = {}) {
       return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid,
         createdAt: result.pane.createdAt };
     };
-    if (ownerForce) return forceStopThenResume({ session, pane, identity: originalIdentity, resume }, deps);
+    // A session move (bin/session-move.js) stops the session here and resumes it on
+    // another machine: `afterStop` is handed the stopped pane in place of the resume.
+    if (ownerForce) return forceStopThenResume({ session, pane, identity: originalIdentity, resume: deps.afterStop || resume }, deps);
     const ledger = require('./restart-ledger');
     const file = session.kind === 'codex' ? (deps.codexRolloutFile || codex.rolloutFileFor)(session.id)
       : (deps.claudeRolloutFile || findSessionFile)(session.id);
@@ -7074,7 +7077,7 @@ async function restartSession(body, deps = {}) {
         throw Error('A process from an earlier forced stop is still running; nothing resumed');
       }
     }
-    return resume(stopped);
+    return deps.afterStop ? deps.afterStop(stopped) : resume(stopped);
   }, { pane: body.pane, session: body.sessionId, ...(inheritedModel ? {} : { model: true }) });
 
   try { return await attempt(''); }
@@ -9716,6 +9719,15 @@ async function openSession(body, deps = {}) {
       needs,
       label: `session ${sessionRef(session.id)}`,
     }, deps);
+    // A session being moved between nodes is stopped on purpose while its files are
+    // carried: only the move itself may start it again. A single-node install has
+    // never recorded a move, so it never reads the directory.
+    if (hostNodeNames(deps).length > 1) {
+      const moving = require('./session-move').inFlight(deps.root || keep.ROOT, session.id);
+      if (moving && deps.moveTransactionId !== moving.id) {
+        throw new InjectionError(409, `session ${sessionRef(session.id)} is being moved from ${moving.from} to ${moving.to} (${moving.id}, ${moving.status}); keep move --recover ${moving.id} or --abandon ${moving.id}`);
+      }
+    }
   }
 
   if (session && !deps.reopenOpenClaimed) {
@@ -12434,6 +12446,183 @@ async function handoffSession(body, deps = {}) {
   });
 }
 
+// ---------- keep move: a Claude session from one node to another ----------
+//
+// bin/session-move.js is the state machine; these are the machines it acts on. Every
+// check that asks a node something fails closed: a node that does not answer is a
+// node nothing is moved to or from.
+
+// The account as a node keeps it. The fleet shares one home, so it is this machine's
+// record; a test that gives a node a home of its own says otherwise through deps.
+function moveNodeAccount(node, account, deps = {}) {
+  return deps.moveNodeAccount ? deps.moveNodeAccount(node, account) : account;
+}
+
+function moveEndpoint(node, account, deps = {}) {
+  return node === daemonNodeName(deps)
+    ? localSessionArtifacts(account, deps)
+    : nodeArtifacts(node, moveNodeAccount(node, account, deps), deps);
+}
+
+// No agent process for this conversation on `node`, from that node's own table; a
+// table that cannot be read proves nothing and refuses.
+async function requireNoAgentOn(node, sessionId, deps = {}) {
+  let live;
+  if (node === daemonNodeName(deps)) live = await (deps.liveSessionPids || liveSessionPids)(deps);
+  else {
+    let rows = null;
+    try { rows = await (deps.agentProcessRows || agentProcessRows)(deps, { node }); } catch {}
+    live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => rows }, { node });
+    if (unverifiedProcesses(live, 'claude')) throw new InjectionError(409, `cannot verify processes on ${node}`);
+  }
+  if (live.has(sessionId)) throw new InjectionError(409, `an agent process still owns ${sessionRef(sessionId)} on ${node}`);
+}
+
+async function inspectSessionMove(sessionId, deps = {}) {
+  const root = deps.root || keep.ROOT;
+  const env = deps.env || process.env;
+  const daemon = daemonNodeName(deps);
+  let location = null;
+  try { location = accounts.sessionLocation(sessionId, { root, env }); }
+  catch (error) { throw new InjectionError(409, error.message); }
+  const from = location ? location.node : daemon;
+  let session = null;
+  try { session = await loadSessionForAction(sessionId, deps); }
+  catch (error) { if (!(error instanceof InjectionError) || error.status !== 404) throw error; }
+  const panes = await listHostPanes(deps, true);
+  if (!Array.isArray(panes)) throw new InjectionError(409, 'the terminal hosts did not list their panes; nothing was moved');
+  const pane = panes.find((entry) => entry && entry.alive !== false && entry.meta && entry.meta.sessionId === sessionId) || null;
+  const agent = (location && location.agent) || (session && session.kind) || (pane && pane.meta.agent) || null;
+  let account = null;
+  if (agent) {
+    try { account = accounts.forSession(sessionId, agent, { root, env }); }
+    catch (error) { throw new InjectionError(409, error.message); }
+  }
+  let args = '';
+  if (pane) {
+    const node = sessionNodeOf(pane, deps);
+    let rows = null;
+    try { rows = await (deps.agentProcessRows || agentProcessRows)(deps, { node }); } catch {}
+    const live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => rows }, { node });
+    const identity = live.get(sessionId);
+    if (!identity) throw new InjectionError(409, `the agent process of ${sessionRef(sessionId)} could not be verified on ${node}`);
+    args = ((rows || []).find((row) => row.pid === identity.pid) || {}).args || '';
+  }
+  let model = launchModelId(pane && pane.meta && pane.meta.model) || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(args)?.[1]) || '';
+  if (!model && session && from === daemon && agent === 'claude') {
+    try { model = handoffCurrentModel(session, pane, args, deps) || ''; } catch { model = '<unknown>'; }
+  }
+  const record = readPaneRecord(sessionId, deps);
+  return {
+    agent, from, account, session,
+    pane: pane ? { id: pane.id, pid: pane.pid, createdAt: pane.createdAt, node: sessionNodeOf(pane, deps) } : null,
+    cwd: (session && session.project) || (pane && (pane.meta.project || pane.cwd)) || (record && record.cwd) || null,
+    model, bypass: args.split(/\s+/).includes('--dangerously-skip-permissions'),
+  };
+}
+
+function sessionMoveDeps(deps = {}) {
+  const root = deps.root || keep.ROOT;
+  const env = deps.env || process.env;
+  const daemon = daemonNodeName(deps);
+  const accountOf = (record) => {
+    const account = accounts.get(record.accountId, env);
+    if (!account || account.agent !== 'claude') throw new InjectionError(409, `account ${record.accountId} is not a Claude account here`);
+    return account;
+  };
+  return {
+    root, env, daemonNode: daemon,
+    nodeNames: () => placementNodes(deps).map((node) => node.name),
+    inspect: (sessionId) => inspectSessionMove(sessionId, deps),
+    requireNode: (node) => requireNodeArtifacts(node, deps),
+    cwdExists: async (node, cwd) => {
+      if (node === daemon) { try { return fs.statSync(cwd).isDirectory(); } catch { return false; } }
+      const answer = await nodeArtifacts(node, null, deps).cwd(cwd);
+      return answer && answer.directory === true;
+    },
+    pendingDelivery: (sessionId) => require('./delivery').pendingForSessionAsync(path.join(root, '.keep', 'delivery'), sessionId,
+      { receiptFor: (entry) => deliveryReceiptFor(entry, deps) }),
+    busy: async (sessionId) => {
+      const handoff = require('./account-handoff').transferInFlight(root, sessionId);
+      if (handoff) return `an account handoff is ${handoff.status} (${handoff.phase})`;
+      if (compactRestoreBlocking(sessionId, deps)) return 'a compaction has not restored its model yet';
+      return null;
+    },
+    stop: async (record) => {
+      const panes = await listHostPanes(deps, true);
+      if (!Array.isArray(panes)) throw new InjectionError(409, 'the terminal hosts did not list their panes');
+      const pane = record.pane && panes.find((entry) => entry.id === record.pane.id);
+      if (pane && pane.alive && pane.pid === record.pane.pid && pane.meta && pane.meta.sessionId === record.sessionId) {
+        await (deps.restartSession || restartSession)({ sessionId: record.sessionId, pane: pane.id, pid: pane.pid, mode: 'now' },
+          { ...deps, ownerForce: record.ownerForce === true, afterStop: async (stopped) => ({ ok: true, stopped: stopped && stopped.id }) });
+      }
+      // Proven again from the source's own table whether or not it was just stopped.
+      await requireNoAgentOn(record.from, record.sessionId, deps);
+    },
+    transfer: (record) => {
+      const account = accountOf(record);
+      return artifactTransport.transfer({ sessionId: record.sessionId, tx: record.id,
+        from: moveEndpoint(record.from, account, deps), to: moveEndpoint(record.to, account, deps) });
+    },
+    location: (sessionId) => accounts.sessionLocation(sessionId, { root, env }),
+    pin: (record) => accounts.pinSession(record.sessionId, 'claude', record.accountId,
+      { root, env, node: record.to, transferNode: true }),
+    open: async (record) => {
+      // The target has no agent for this conversation before one is started there.
+      const launch = await (deps.openSession || openSession)({ sessionId: record.sessionId, node: record.to, accountId: record.accountId,
+        ...(record.model ? { model: record.model } : {}) },
+      { ...deps, claudeFlags: record.bypass ? '--dangerously-skip-permissions' : '', reopenCompaction: 'skip', moveTransactionId: record.id });
+      return launch;
+    },
+    waitForPaneRecord: async (record) => {
+      const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+      const deadline = Date.now() + (deps.moveStartTimeoutMs || 45000);
+      for (;;) {
+        const found = readPaneRecord(record.sessionId, deps);
+        if (found && found.pane === record.launch.pane && Number(found.startedAt) >= Number(record.launchStartedAt)
+            && (found.node || daemon) === record.to) return found;
+        if (Date.now() >= deadline) return null;
+        await sleep(250);
+      }
+    },
+    relink: (record) => {
+      const card = keep.loadAll(false).find((task) => (task.fm.sessions || []).some((entry) => entry.id === record.sessionId));
+      if (!card) return null;
+      (deps.linkLaunchedSession || keep.linkLaunchedSession)(card.id, { id: record.sessionId, agent: 'claude', node: record.to });
+      return card.id;
+    },
+    cleanup: async (record) => {
+      const warnings = [];
+      const account = accountOf(record);
+      // The stopped pane on the source, which nothing will run again.
+      if (record.pane) {
+        try { await hostRequest('remove', { pane: record.pane.id }, deps); }
+        catch (error) { warnings.push(`the stopped pane ${record.pane.id} was not removed: ${error.message}`); }
+      }
+      // What the session left on the source is a copy a later move back may replace.
+      try { await moveEndpoint(record.from, account, deps).release(record.sessionId); }
+      catch (error) { warnings.push(`the copy left on ${record.from} was not released: ${error.message}`); }
+      if (record.from !== daemon) {
+        // The daemon's mirror of the node's transcript, and the node's own hook state.
+        const mirror = require('./transcript-mirror').paths(root, record.from, record.sessionId);
+        for (const file of [mirror.file, mirror.sidecar]) { try { fs.unlinkSync(file); } catch {} }
+        try { await nodeArtifacts(record.from, moveNodeAccount(record.from, account, deps), deps).dropSession(record.sessionId); }
+        catch (error) { warnings.push(`${record.from} did not drop its hook state: ${error.message}`); }
+      }
+      return warnings;
+    },
+    abortStage: async (record) => {
+      const account = accountOf(record);
+      await moveEndpoint(record.to, account, deps).abort(record.id);
+    },
+    ...(deps.moveDeps || {}),
+  };
+}
+
+async function moveSession(body, deps = {}) {
+  return require('./session-move').moveSession(body, sessionMoveDeps(deps));
+}
+
 // The rate limit this session carries now, which is the event a queue entry exists
 // for. Three different answers, and the queue acts differently on each: a stamp is
 // the event to watch, `null` is "watched, and there is no limit", and `undefined` is
@@ -14673,6 +14862,9 @@ module.exports = {
   localSessionArtifacts,
   pushSession,
   pullSession,
+  moveSession,
+  sessionMoveDeps,
+  inspectSessionMove,
   remoteSessionFreshness, unansweredNodes,
   remoteSessionRead,
   loadRemoteSession,
