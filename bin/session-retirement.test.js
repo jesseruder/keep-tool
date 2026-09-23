@@ -165,15 +165,18 @@ test('pure retirement policy uses meaningful clocks and the approved 15/30/60 mi
   assert.equal(plan.kind, 'all-work-done');
   assert.equal(plan.reason, null, 'saved layout membership is not a process keepalive');
 
-  plan = retirementPlan({ ...base, state: 'needs-input', activity: { needsInput: true, reason: 'next instruction' } }, pane,
-    { allTasks: [linked('active')], pinned: new Set() }, now);
+  const ready = { ...base, state: 'needs-input', activity: { needsInput: true, reason: 'next instruction' } };
+  assert.match(retirementPlan(ready, pane, { allTasks: [linked('active')], pinned: new Set() }, now).reason,
+    /listed under Waiting on you/);
+  plan = retirementPlan(ready, pane, { allTasks: [linked('active')], pinned: new Set(),
+    setAside: { session: { kind: 'dismiss' } } }, now);
   assert.equal(plan.kind, 'settled-unattended');
   assert.equal(plan.idleMs, 60 * 60e3);
   assert.equal(plan.reason, null);
 
   plan = retirementPlan({ ...base, state: 'needs-input', activity: {
     needsInput: true, reason: 'your review', request: { kind: 'review' },
-  } }, pane, { allTasks: [linked('active')], pinned: new Set() }, now);
+  } }, pane, { allTasks: [linked('active')], pinned: new Set(), setAside: { session: { kind: 'snooze' } } }, now);
   assert.equal(plan.kind, 'settled-attention');
   assert.equal(plan.idleMs, 30 * 60e3);
   assert.equal(plan.reason, null);
@@ -191,6 +194,31 @@ test('pure retirement policy uses meaningful clocks and the approved 15/30/60 mi
     { allTasks: [], pinned: new Set() }, now).reason, /Visible/);
   assert.match(retirementPlan(base, { ...pane, visibleAttached: undefined, attached: undefined },
     { allTasks: [], pinned: new Set() }, now).reason, /unknown viewer/);
+});
+
+test('automatic retirement never closes a session listed under Waiting on you or Running & waiting', () => {
+  const { retirementPlan } = require('./session-cleanup');
+  const now = Date.now();
+  const pane = { id: 'p', alive: true, visibleAttached: 0, attached: 0, meta: { sessionId: 's', agent: 'claude' } };
+  const base = { id: 's', kind: 'claude', state: 'idle', endedTurn: true, mtime: now - 2 * 86400e3, keepRunningKnown: true };
+  const done = { id: 'c', fm: { status: 'done', done_at: new Date(now - 86400e3).toISOString(), sessions: [{ id: 's' }] } };
+  const state = { allTasks: [done], pinned: new Set(), attention: [] };
+  assert.equal(retirementPlan(base, pane, state, now).reason, null);
+  const listed = (patch, extra = {}) => retirementPlan({ ...base, ...patch }, pane, { ...state, ...extra }, now).reason;
+  for (const status of ['running', 'waiting']) {
+    assert.match(listed({ state: status }), /Running & waiting/, status);
+    assert.match(listed({ state: status }, { setAside: { s: { kind: 'dismiss' } } }), /Running & waiting/, status);
+  }
+  assert.match(listed({}, { setAside: { s: { kind: 'running' } } }), /Running & waiting/);
+  const ready = { state: 'needs-input', activity: { needsInput: true, reason: 'next instruction' } };
+  assert.match(listed(ready), /Waiting on you/);
+  assert.match(listed(ready, { attention: undefined }), /Waiting on you/);
+  assert.match(listed({}, { attention: [{ kind: 'input', sessionId: 's' }] }), /Waiting on you/);
+  for (const kind of ['dismiss', 'snooze', 'dependency']) {
+    assert.equal(listed(ready, { setAside: { s: { kind } } }), null, kind);
+  }
+  // Keep's own check pane still closes once its check is done.
+  assert.equal(retirementPlan({ ...base, ...ready }, { ...pane, meta: { ...pane.meta, ephemeral: 'check' } }, state, now).reason, null);
 });
 
 test('settled history gap is consistent while real work, prompts, timers and standing agents stay protected', () => {
