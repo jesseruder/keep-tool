@@ -404,8 +404,12 @@ async function run(record, deps, options = {}) {
   }
 }
 
+// The refusal of a second move of a session this process is already moving: named
+// (reason in-flight), so a console that lost the race says so instead of failing.
+const alreadyRunning = (sessionId) => refusal(409, `a move of ${sessionId} is already running`, { reason: 'in-flight' });
+
 function exclusive(sessionId, work) {
-  if (active.has(sessionId)) throw refusal(409, `a move of ${sessionId} is already running`);
+  if (active.has(sessionId)) throw alreadyRunning(sessionId);
   const promise = Promise.resolve().then(work).finally(() => active.delete(sessionId));
   active.set(sessionId, promise);
   return promise;
@@ -534,7 +538,7 @@ async function moveSession(body, deps = {}) {
     throw refusal(409, `move ${existing.id} of ${body.sessionId} is ${existing.status}; keep move --recover ${existing.id} or --abandon ${existing.id}`,
       safe(existing));
   }
-  if (active.has(body.sessionId)) throw refusal(409, `a move of ${body.sessionId} is already running`);
+  if (active.has(body.sessionId)) throw alreadyRunning(body.sessionId);
   const plan = await preflight(body, deps);
   if (body.dry === true) return { ok: true, dry: true, ...plan };
   return exclusive(body.sessionId, () => {

@@ -230,13 +230,36 @@ test('a preflight refusal of the real move is a toast too, and the controls come
   assert.equal(ctx.refreshes, 2, 'once to show the move, once to take it back');
   assert.equal(context.moveControlsHTML(ctx, session(), { live: true }).includes('data-move-node="aws1"'), true);
 
-  // A 409 naming no reason (a move already running here) is not a preflight answer.
+  // A 409 naming no reason is not a preflight answer (an older daemon's race).
   const other = fixture();
   reset([{ ok: true, dry: true }, { error: { status: 409, message: 'a move of s is already running', body: { error: 'a move of s is already running' } } }]);
   install(other, { '[data-move-node]': [aws1] });
   await aws1.click();
   assert.deepEqual(context.reported, ['a move of s is already running']);
   assert.deepEqual(other.toasts, []);
+});
+
+test('losing the race to another console\'s move of the same session is a toast, not the sticky banner', async () => {
+  const aws1 = button({ moveNode: 'aws1' });
+  const inFlight = { error: { status: 409, message: 'a move of s is already running',
+    body: { error: 'a move of s is already running', reason: 'in-flight' } } };
+  // At the real move: the other console's move began between this one's check and click.
+  const ctx = fixture();
+  reset([{ ok: true, dry: true }, inFlight]);
+  install(ctx, { '[data-move-node]': [aws1] });
+  await aws1.click();
+  assert.deepEqual(ctx.toasts, ['A move of this session is already running']);
+  assert.deepEqual(context.dismissed, [2]);
+  assert.deepEqual(context.reported, []);
+  assert.equal(ctx.reloads, 1, 'the reload shows the running move\'s step');
+  // Already at the check.
+  const early = fixture();
+  reset([inFlight]);
+  install(early, { '[data-move-node]': [aws1] });
+  await aws1.click();
+  assert.equal(context.writes.length, 1, 'no real move is posted');
+  assert.deepEqual(early.toasts, ['A move of this session is already running']);
+  assert.deepEqual(context.reported, []);
 });
 
 test('a second click while the real move runs posts nothing', async () => {

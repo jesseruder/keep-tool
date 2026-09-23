@@ -89,11 +89,20 @@ async function alreadyMoving(ctx, error) {
   await ctx.reload();
 }
 
+// Another console (or the CLI) started a move of this session a moment ago, and this
+// process is running it: nothing here was stopped, and the reload shows its step.
+async function raced(ctx, error) {
+  dismissWriteFailure(error.writeFailureId);
+  ctx.toast('A move of this session is already running');
+  await ctx.reload();
+}
+
 async function moveTo(ctx, sessionId, node) {
   try {
     await write('/api/move-session', { sessionId, node, ownerForce: true, dry: true }, 'POST', { label: 'Checking move' });
   } catch (error) {
     if (!refused(error)) throw error;
+    if (error.body?.reason === 'in-flight') return raced(ctx, error);
     // Nothing was stopped: say why, and leave the controls as they were.
     if (error.body?.id && error.body?.status) {
       // A move of this session is journalled already. Still in flight (started from
@@ -117,6 +126,7 @@ async function moveTo(ctx, sessionId, node) {
   } catch (error) {
     if (error.body?.status === 'recovery-needed') return recoveryNeeded(ctx, error);
     if (!refusedAtMove(error)) throw error;
+    if (error.body.reason === 'in-flight') { localMoves.delete(sessionId); return raced(ctx, error); }
     // Nothing was stopped: the controls go back to what they were.
     localMoves.delete(sessionId);
     ctx.refresh?.();

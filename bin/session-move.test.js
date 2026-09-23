@@ -120,6 +120,25 @@ test('a move stops the source, carries, flips once, starts the target and verifi
   } finally { w.cleanup(); }
 });
 
+test('a second move of a session this process is already moving is refused by name (in-flight)', async () => {
+  const w = world();
+  try {
+    // Two requests pass the checks before the preflight together; the second to reach
+    // the lock is the one refused.
+    const [first, second] = await Promise.allSettled([
+      move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps),
+      move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps),
+    ]);
+    assert.equal(first.status, 'fulfilled', first.reason && first.reason.stack);
+    assert.equal(first.value.status, 'done');
+    assert.equal(second.status, 'rejected');
+    assert.equal(second.reason.status, 409);
+    assert.equal(second.reason.message, `a move of ${SID} is already running`);
+    assert.deepEqual(second.reason.extra, { reason: 'in-flight' });
+    assert.equal(w.state.pins, 1, 'one move ran');
+  } finally { w.cleanup(); }
+});
+
 test('the preflight refuses before anything is stopped', async () => {
   const cases = [
     [{ nodes: ['main'] }, /no other node is configured/],
