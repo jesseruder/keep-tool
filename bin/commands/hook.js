@@ -1511,6 +1511,8 @@ function deployEntry(input) {
   // judged against the local tracking ref; nothing fetches inside a hook
   if (provenance.branch) bits.push(provenance.onOrigin ? `on origin/${provenance.branch} (local tracking ref)` : `not on origin/${provenance.branch} at deploy time (local tracking ref)`);
   bits.push(`repo ${tilde(provenance.repo)}`);
+  // Whose word the provenance is: a node's, read from its own checkout.
+  if (nodeFacts) bits[bits.length - 1] += ` (as node ${process.env.KEEP_HOOK_NODE} read it)`;
   let message = bits.join(' — ') + `\nCommand: \`${shownCmd}\``;
   if (failed) message += `\nThe command reported failure; treat this as an attempt, not a release.`;
   else if (exitUnknown) message += `\nExit status unknown (Codex hook without a rollout record); confirm the release landed.`;

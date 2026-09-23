@@ -903,7 +903,7 @@ test('a deploy on the node is recorded on its card with the provenance the node 
   }));
   assert.equal(answer.status, 200, JSON.stringify(answer.body));
   assert.equal(answer.body.status, 0, answer.body.stderr);
-  assert.match(f.card(), /— deployed\ndeployed aaaaaaa to heroku \(remote heroku\) — \+dirty: 1 file \(scratch\.txt\) — not on origin\/main at deploy time \(local tracking ref\) — repo ~\/wt\/infra\/feature\nCommand: `git push heroku main`/);
+  assert.match(f.card(), /— deployed\ndeployed aaaaaaa to heroku \(remote heroku\) — \+dirty: 1 file \(scratch\.txt\) — not on origin\/main at deploy time \(local tracking ref\) — repo ~\/wt\/infra\/feature \(as node aws1 read it\)\nCommand: `git push heroku main`/);
   // Provenance from another directory than the one the command ran in is none at all.
   const elsewhere = await hooks.handle(AWS1, postBody(f.root, 'git push heroku main', {
     deploy: { dir: path.join(f.root, 'other'), repo: cwd, sha, dirty: [], branch: 'main', onOrigin: true },
