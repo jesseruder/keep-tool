@@ -98,6 +98,38 @@ function holderAt(record, phase) {
   return BEFORE_FLIP.includes(phase) ? record.from : record.to;
 }
 
+// How a side's artifacts now differ from what the copy recorded, or null when they
+// are the same: a file missing or with another digest, and (when `exact`) a file the
+// copy did not record. Named, a few at a time.
+function digestDifference(expected, actual, exact = true) {
+  const differences = [];
+  for (const [relPath, sha256] of Object.entries(expected || {})) {
+    if (!Object.prototype.hasOwnProperty.call(actual || {}, relPath)) differences.push(`${relPath} is gone`);
+    else if (actual[relPath] !== sha256) differences.push(`${relPath} differs`);
+  }
+  if (exact) {
+    for (const relPath of Object.keys(actual || {})) {
+      if (!Object.prototype.hasOwnProperty.call(expected || {}, relPath)) differences.push(`${relPath} is new`);
+    }
+  }
+  if (!differences.length) return null;
+  return differences.slice(0, 3).join(', ') + (differences.length > 3 ? ` and ${differences.length - 3} more` : '');
+}
+
+// The side a step is about to give up, listed now and compared with the copy. The
+// source must still be exactly what was carried; the target exactly what the publish
+// left there (a record from before that was kept compares the carried files only).
+async function sideDifference(record, side, deps) {
+  const manifest = record.manifest;
+  if (!manifest || !manifest.digests) return null;
+  const node = side === 'source' ? record.from : record.to;
+  let actual;
+  try { actual = await deps.digestsOn(record, node); }
+  catch (error) { return `${node} could not list them: ${error && error.message || error}`; }
+  if (side === 'source') return digestDifference(manifest.digests, actual, true);
+  return manifest.targetDigests ? digestDifference(manifest.targetDigests, actual, true) : digestDifference(manifest.digests, actual, false);
+}
+
 function recoveryMessage(record) {
   const holder = record.holder;
   const before = BEFORE_FLIP.includes(record.phase);
@@ -178,6 +210,16 @@ async function run(record, deps, options = {}) {
     }
     record.stopReprovedAt = now();
   };
+  // A stopped source that nonetheless holds other bytes than the ones carried (someone
+  // ran it and stopped it again, or wrote to it) is not the session the target has:
+  // nothing more is given up for this move, and the session has to be moved afresh.
+  const sourceUnchanged = async (outcome) => {
+    const difference = await sideDifference(record, 'source', deps);
+    if (difference) {
+      throw Object.assign(new Error(`source changed since the copy; ${outcome} (${record.from}: ${difference}). `
+        + 'Abandon this move and move the session again with a fresh move'), { status: 409, reason: 'source-changed' });
+    }
+  };
   try {
     if (record.status === 'stopping') {
       // Resolves only once the source is proven stopped on its own node.
@@ -192,7 +234,8 @@ async function run(record, deps, options = {}) {
       if (!proven) await reprove('before its files are carried');
       const carried = await deps.transfer(record);
       record.manifest = { files: carried.files.length, bytes: carried.bytes,
-        digests: Object.fromEntries(carried.files.map((file) => [file.relPath, file.sha256])) };
+        digests: Object.fromEntries(carried.files.map((file) => [file.relPath, file.sha256])),
+        ...(Array.isArray(carried.landed) ? { targetDigests: Object.fromEntries(carried.landed.map((file) => [file.relPath, file.sha256])) } : {}) };
       record.status = 'staged'; save();
     }
     phase = record.status;
@@ -200,6 +243,7 @@ async function run(record, deps, options = {}) {
       const location = await deps.location(record.sessionId);
       if (!location || location.node === record.from) {
         await reprove('before the location record is flipped');
+        await sourceUnchanged('nothing was flipped or launched');
         await deps.pin(record);
       } else if (location.node !== record.to) {
         throw new Error(`the location record names ${location.node}, neither end of this move`);
@@ -216,6 +260,7 @@ async function run(record, deps, options = {}) {
       // journal says, nothing launches (or is waited for) until the source's table
       // says it is stopped now.
       await reprove(record.status === 'verifying' ? 'while the target is starting' : 'before the target is launched');
+      await sourceUnchanged('nothing was launched');
       if (options.resumed && (record.status === 'starting' || record.status === 'verifying')) {
         // A recovery after a launch was asked for: whether the target runs it decides
         // between waiting for its start once more and launching it again.
@@ -271,6 +316,8 @@ async function run(record, deps, options = {}) {
     record.phase = phase;
     record.holder = holderAt(record, phase);
     record.reason = String(error && error.message || error);
+    if (error && typeof error.reason === 'string') record.reasonCode = error.reason;
+    else delete record.reasonCode;
     record.status = 'recovery-needed';
     record.message = recoveryMessage(record);
     save();
@@ -312,7 +359,7 @@ async function recover(tx, deps) {
     // Continue from the step that did not finish, or from the one a daemon that went
     // away was in the middle of.
     if (record.status === 'recovery-needed') record.status = ORDER.includes(record.phase) ? record.phase : 'stopping';
-    delete record.reason; delete record.message; delete record.holder;
+    delete record.reason; delete record.reasonCode; delete record.message; delete record.holder;
     writeMove(root, record);
     return run(record, deps, { resumed: true });
   });
@@ -346,6 +393,13 @@ async function abandonAfterFlip(record, deps) {
     if (!target || target.running) {
       throw refusal(409, `move ${record.id} cannot be abandoned: ${record.sessionId} is running on ${record.to}`
         + `${target && target.pane ? ` in pane ${target.pane}` : ''}; keep move --recover ${record.id} finishes the move instead`);
+    }
+    // What the flip back gives up is the target's copy: it must still be the one the
+    // copy left there. A target that ran the session holds bytes the source does not.
+    const difference = back ? null : await sideDifference(record, 'target', deps);
+    if (difference) {
+      throw refusal(409, `target changed since the copy; abandon refused (${record.to}: ${difference}). `
+        + `keep move --recover ${record.id} finishes the move on ${record.to}, and a fresh move takes it back`, { reason: 'target-changed' });
     }
     if (!back) {
       record.abandonedBack = { at: now(), from: record.to, to: record.from };
@@ -412,4 +466,4 @@ async function moveSession(body, deps = {}) {
   });
 }
 
-module.exports = { moveSession, inFlight, readMove, listMoves, safe, TX_RE, IN_FLIGHT };
+module.exports = { moveSession, inFlight, readMove, listMoves, safe, digestDifference, TX_RE, IN_FLIGHT };

@@ -164,6 +164,28 @@ test('a session moves to aws1 and back, its bytes proven on each side, never run
       assert.equal(fs.existsSync(cursor), false, 'aws1 dropped its hook cursor');
       assert.equal(require('./session-move.js').inFlight(fleet.registry, SID), null);
 
+      // A source that gains bytes after the copy is not given up: nothing flips, and
+      // the way on is an abandon and a fresh move.
+      const realTransfer = serve.sessionMoveDeps(deps).transfer;
+      moveDeps.transfer = async (record) => {
+        const carried = await realTransfer(record);
+        fs.appendFileSync(path.join(fleet.configDir, 'projects', '-work-project', `${SID}.jsonl`), line({ type: 'user', message: { content: 'late' } }));
+        return carried;
+      };
+      let changedId;
+      await assert.rejects(serve.moveSession({ sessionId: SID, node: 'aws1' }, deps), (error) => {
+        changedId = error.extra.id;
+        return /source changed since the copy; nothing was flipped or launched \(main: projects\/-work-project\/sess-node-move.jsonl differs\)/.test(error.message);
+      });
+      assert.equal(accounts.sessionNode(SID, { root: fleet.registry }), 'main');
+      assert.equal((await serve.moveSession({ abandon: changedId }, deps)).status, 'abandoned');
+      delete moveDeps.transfer;
+      source = { node: 'main', pane: await spawn('main') };
+      const fresh = await serve.moveSession({ sessionId: SID, node: 'aws1' }, deps);
+      assert.equal(fresh.status, 'done', fresh.message);
+      assert.deepEqual(digestsOf(fleet.aws1ConfigDir), digestsOf(fleet.configDir), 'the fresh move carried the late bytes');
+      assert.match(fs.readFileSync(path.join(fleet.aws1ConfigDir, 'projects', '-work-project', `${SID}.jsonl`), 'utf8'), /late/);
+
       // Nothing else may resume a session while a move owns it.
       const stuck = { version: 1, id: `mv-${'c'.repeat(24)}`, sessionId: SID, from: 'main', to: 'aws1', status: 'copying', createdAt: Date.now() };
       fs.writeFileSync(path.join(fleet.registry, '.keep', 'session-moves', `${stuck.id}.json`), JSON.stringify(stuck));
@@ -361,5 +383,18 @@ test('the cleanup removes the source pane only while it is exited and no agent r
     const unread = await cleanup(exited, '');
     assert.deepEqual(unread.removed, []);
     assert.match(unread.warnings, /was not removed: the process table on main could not be read/);
+
+    // The source's copy is released only while it is exactly what was carried.
+    const rel = `projects/-work-project/${SID}.jsonl`;
+    fs.mkdirSync(path.join(root, 'claude', 'projects', '-work-project'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'claude', ...rel.split('/')), '{"type":"user"}\n');
+    const provenance = path.join(root, 'claude', '.keep-move', 'provenance', `${SID}.json`);
+    const withManifest = (digest) => serve.sessionMoveDeps({ root, env, daemonNode: 'main', psTable: idle, listHostPanes: async () => [],
+      hostRequest: async () => ({}) }).cleanup({ ...record, pane: null, manifest: { digests: { [rel]: digest } } });
+    const changed = (await withManifest('0'.repeat(64))).join('\n');
+    assert.match(changed, /source changed since the copy \(main: projects\/-work-project\/sess-node-move.jsonl differs\); its copy was not released/);
+    assert.equal(fs.existsSync(provenance), false);
+    await withManifest(sha256(Buffer.from('{"type":"user"}\n')));
+    assert.equal(fs.existsSync(provenance), true, 'an unchanged source is released');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

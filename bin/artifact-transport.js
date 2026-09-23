@@ -113,6 +113,9 @@ async function transfer({ sessionId, tx, from, to, pieceBytes = PIECE_BYTES }) {
   return {
     sessionId, tx, projectName: listed.projectName, bytes: listed.bytes,
     files: entries, published: published.published,
+    // Everything the target holds for the session once the publish landed: what a
+    // later look at the target is compared with.
+    landed: [...landed.values()].map(({ relPath, sha256 }) => ({ relPath, sha256 })),
   };
 }
 

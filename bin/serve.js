@@ -12541,6 +12541,12 @@ function sessionMoveDeps(deps = {}) {
   const env = deps.env || process.env;
   const daemon = daemonNodeName(deps);
   const listPanes = () => (deps.listHostPanes || listHostPanes)(deps, true);
+  // A side's artifacts for the session as that side lists them now, by digest.
+  const digestsOn = async (record, node) => {
+    const listed = await moveEndpoint(node, accountOf(record), deps).list(record.sessionId);
+    if (!listed || !Array.isArray(listed.files)) throw new Error(`${node} listed no files`);
+    return Object.fromEntries(listed.files.map((file) => [file.relPath, file.sha256]));
+  };
   const accountOf = (record) => {
     const account = accounts.get(record.accountId, env);
     if (!account || account.agent !== 'claude') throw new InjectionError(409, `account ${record.accountId} is not a Claude account here`);
@@ -12599,6 +12605,7 @@ function sessionMoveDeps(deps = {}) {
       // Proven again from the source's own table whether or not it was just stopped.
       await requireNoAgentOn(record.from, record.sessionId, deps);
     },
+    digestsOn,
     // The same proof, asked again before the flip and before every launch.
     requireStopped: (record) => requireNoAgentOn(record.from, record.sessionId, deps),
     // Whether the target runs the session now: a live pane for it there, or an agent
@@ -12667,9 +12674,15 @@ function sessionMoveDeps(deps = {}) {
           else if (pane) await (deps.hostRequest || hostRequest)('remove', { pane: record.pane.id }, deps);
         } catch (error) { warnings.push(`the stopped pane ${record.pane.id} was not removed: ${error.message}`); }
       }
-      // What the session left on the source is a copy a later move back may replace.
-      try { await moveEndpoint(record.from, account, deps).release(record.sessionId); }
-      catch (error) { warnings.push(`the copy left on ${record.from} was not released: ${error.message}`); }
+      // What the session left on the source is a copy a later move back may replace,
+      // but only while it is still exactly what was carried: a source that changed
+      // since the copy holds bytes the target does not, and is not given up.
+      try {
+        const difference = record.manifest && record.manifest.digests
+          ? require('./session-move').digestDifference(record.manifest.digests, await digestsOn(record, record.from)) : null;
+        if (difference) warnings.push(`source changed since the copy (${record.from}: ${difference}); its copy was not released`);
+        else await moveEndpoint(record.from, account, deps).release(record.sessionId);
+      } catch (error) { warnings.push(`the copy left on ${record.from} was not released: ${error.message}`); }
       if (record.from !== daemon) {
         // The daemon's mirror of the node's transcript, and the node's own hook state.
         const mirror = require('./transcript-mirror').paths(root, record.from, record.sessionId);

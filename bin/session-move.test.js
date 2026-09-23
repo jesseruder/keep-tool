@@ -54,7 +54,14 @@ function world(options = {}) {
       assert.equal(state.stopped, true, 'nothing is carried before the source is stopped');
       if (options.reviveAfter === 'transfer') state.revived = true;
       failing('transfer');
-      return { files: [{ relPath: `projects/-work-project/${SID}.jsonl`, sha256: 'a'.repeat(64), size: 10 }], bytes: 10 };
+      return { files: [{ relPath: `projects/-work-project/${SID}.jsonl`, sha256: 'a'.repeat(64), size: 10 }], bytes: 10,
+        landed: [{ relPath: `projects/-work-project/${SID}.jsonl`, sha256: 'a'.repeat(64) }] };
+    },
+    // Each side's artifacts by digest: what was carried, unless `state.changed[node]`
+    // says that side gained or rewrote bytes since.
+    digestsOn: async (record, node) => {
+      state.listed = [...(state.listed || []), node];
+      return { [`projects/-work-project/${SID}.jsonl`]: 'a'.repeat(64), ...((state.changed || {})[node] || {}) };
     },
     location: async () => ({ node: state.node, agent: 'claude', accountId: 'claude-a' }),
     pin: async (record) => { steps.push(['pin', record.to]); failing('pin'); state.node = record.to; state.pins += 1; },
@@ -249,6 +256,66 @@ test('a source started again after the flip blocks the launch, and a recovery pr
     assert.equal((await move.moveSession({ recover: id }, w.deps)).status, 'done');
     assert.deepEqual(names(w.steps).slice(0, 2), ['reprove', 'open']);
     assert.equal(w.state.pins, 1);
+  } finally { w.cleanup(); }
+});
+
+test('a source that gained bytes after the copy blocks the flip, and on a recovery the launch', async () => {
+  const transcript = `projects/-work-project/${SID}.jsonl`;
+  // Before the flip: nothing is flipped.
+  const w = world();
+  const transfer = w.deps.transfer;
+  w.deps.transfer = async (record) => {
+    const carried = await transfer(record);
+    w.state.changed = { main: { [`file-history/${SID}/new@v1`]: 'b'.repeat(64) } };
+    return carried;
+  };
+  try {
+    let id;
+    await assert.rejects(move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps), (error) => {
+      id = error.extra.id;
+      return error.extra.phase === 'staged' && error.extra.reasonCode === 'source-changed'
+        && /source changed since the copy; nothing was flipped or launched \(main: file-history\/sess-moving\/new@v1 is new\)/.test(error.message)
+        && /move the session again with a fresh move/.test(error.message);
+    });
+    assert.equal(w.state.pins, 0);
+    w.steps.length = 0;
+    await assert.rejects(move.moveSession({ recover: id }, w.deps), /source changed since the copy; nothing was flipped or launched/);
+    assert.equal(names(w.steps).includes('pin'), false);
+    // The way out is the abandon and a fresh move.
+    assert.equal((await move.moveSession({ abandon: id }, w.deps)).status, 'abandoned');
+  } finally { w.cleanup(); }
+
+  // After the flip, before the launch (a recovery hours later): nothing is launched.
+  const after = world({ fail: { open: true } });
+  try {
+    let id;
+    await assert.rejects(move.moveSession({ sessionId: SID, node: 'aws1' }, after.deps), (error) => { id = error.extra.id; return true; });
+    after.state.changed = { main: { [transcript]: 'c'.repeat(64) } };
+    after.steps.length = 0;
+    await assert.rejects(move.moveSession({ recover: id }, after.deps),
+      (error) => /source changed since the copy; nothing was launched \(main: projects\/-work-project\/sess-moving.jsonl differs\)/.test(error.message));
+    assert.deepEqual(names(after.steps), ['reprove'], 'nothing launched');
+    // Unchanged again (a mistaken alarm): the recovery goes on.
+    after.state.changed = {};
+    assert.equal((await move.moveSession({ recover: id }, after.deps)).status, 'done');
+    assert.ok(after.state.listed.includes('main'));
+  } finally { after.cleanup(); }
+});
+
+test('a target that gained bytes after the copy refuses the abandon back; an unchanged one passes', async () => {
+  const w = world({ fail: { open: true } });
+  try {
+    let id;
+    await assert.rejects(move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps), (error) => { id = error.extra.id; return true; });
+    w.state.changed = { aws1: { [`projects/-work-project/${SID}/subagents/agent-z.jsonl`]: 'd'.repeat(64) } };
+    w.steps.length = 0;
+    await assert.rejects(move.moveSession({ abandon: id }, w.deps),
+      (error) => error.extra.reason === 'target-changed'
+        && /target changed since the copy; abandon refused \(aws1: projects\/-work-project\/sess-moving\/subagents\/agent-z.jsonl is new\)/.test(error.message));
+    assert.equal(names(w.steps).includes('pinBack'), false);
+    assert.equal(w.state.node, 'aws1');
+    w.state.changed = {};
+    assert.equal((await move.moveSession({ abandon: id }, w.deps)).status, 'abandoned-back');
   } finally { w.cleanup(); }
 });
 

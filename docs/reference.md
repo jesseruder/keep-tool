@@ -1289,7 +1289,13 @@ The move is journalled in `.keep/session-moves/<tx>.json` through `stopping`, `c
 `staged`, `pinned`, `starting`, `verifying` and `done`. The source is proven stopped on
 its own node before anything is carried, from that node's own process table (a table
 that cannot be read proves nothing and refuses, on the daemon node too), and proven so
-again before the flip and before every launch, on a recovery as on the first run; the
+again before the flip and before every launch, on a recovery as on the first run. Every
+step that gives a side up also lists that side's files and compares them by digest with
+what the copy recorded: the flip and every launch check the source, an abandon after
+the flip checks the target, and the cleanup releases the source's copy only if it is
+unchanged. A side that changed since the copy refuses (`source changed since the copy;
+nothing was flipped or launched`, `target changed since the copy; abandon refused`):
+such a session has to be moved again with a fresh move (abandon this one first). The
 session's location record
 (`.keep/session-accounts/<sid>.json`) flips to the target exactly once, after the target
 holds the verified bytes and before the target starts; the target is launched through

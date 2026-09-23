@@ -238,7 +238,9 @@ session controls outside Keep if the user directs that work.
   again or waits once more, as the target's state says), or `keep move --abandon <tx>`
   to leave it where it was; after the flip an abandon puts the record back on the source,
   and only once neither node runs the session. Until then `keep open` refuses to resume
-  that session.
+  that session. A side whose files changed since the copy (`source changed since the
+  copy`, `target changed since the copy`) is never given up: abandon the move and move
+  the session again with a fresh move.
 - Moving someone's working session is Owner's call unless the card grants it.
 
 ## Ending and hiding sessions
