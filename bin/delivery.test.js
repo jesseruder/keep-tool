@@ -1267,3 +1267,31 @@ test('a node journal is never read as a local file, and never answered by a call
     /Previous delivery could not be checked: .*cannot be asked from here/);
   } finally { f.cleanup(); }
 });
+
+test('a node\'s yes about a journal replaced while it was asked settles nothing, and a journal gone meanwhile does not throw', async () => {
+  const f = remoteDeliveryFixture('replaced');
+  try {
+    const { statusForTextAsync } = require('./delivery');
+    const entry = { createdAt: Date.now() - 5000, sessionId: 'remote-session', kind: 'claude', file: f.file, offset: 0,
+      pane: 'p7@aws1', hash: textHash('same text'), node: 'aws1', retainReceipt: true, key: 'k' };
+    fs.mkdirSync(f.directory, { recursive: true });
+    const journal = path.join(f.directory, textHash('remote-session') + '.json');
+    fs.writeFileSync(journal, JSON.stringify(entry));
+    // While the node is being asked, a send to the same session finishes the old
+    // journal and writes its own at the same path; its message is being typed now.
+    const newer = JSON.stringify({ ...entry, createdAt: Date.now(), offset: 120 });
+    const status = await statusForTextAsync(f.directory, 'same text', 'k', {
+      receiptFor: async () => { fs.writeFileSync(journal, newer); return true; },
+    });
+    assert.equal(status.sessionId, 'remote-session');
+    assert.equal(fs.readFileSync(journal, 'utf8'), newer, 'the newer journal survives');
+    assert.equal(fs.existsSync(path.join(f.directory, 'receipts')), false, 'no receipt was saved for it');
+
+    // The journal is removed while the node is asked: no ENOENT out of the status read.
+    fs.writeFileSync(journal, JSON.stringify(entry));
+    await statusForTextAsync(f.directory, 'same text', 'k', {
+      receiptFor: async () => { fs.unlinkSync(journal); return true; },
+    });
+    assert.equal(fs.existsSync(journal), false);
+  } finally { f.cleanup(); }
+});

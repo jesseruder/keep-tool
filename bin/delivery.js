@@ -633,15 +633,30 @@ async function statusForTextAsync(directory, text, key, { receiptFor } = {}) {
     const entry = JSON.parse(fs.readFileSync(item.file, 'utf8'));
     if (key ? entry.key !== key : entry.hash !== hash(text)) continue;
     let confirmed = item.settled;
+    let asked = false;
     if (!confirmed) {
       if (!entry.node) confirmed = received(entry);
       else if (typeof receiptFor === 'function') {
+        asked = true;
         try { confirmed = (await receiptFor(entry)) === true; } catch { confirmed = false; }
       }
     }
-    if (confirmed && entry.retainReceipt) {
+    // The node's answer came back over the network, outside the injection lock: a send
+    // to the same session may have finished this journal and written its own at the
+    // same path meanwhile. The answer settles only the journal it was about.
+    let current = !asked;
+    if (asked && confirmed && entry.retainReceipt) {
+      try {
+        const now = JSON.parse(fs.readFileSync(item.file, 'utf8'));
+        const name = path.basename(item.file);
+        current = nodeReceiptKey(name, now) === nodeReceiptKey(name, entry);
+      } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    }
+    if (confirmed && entry.retainReceipt && current) {
       saveReceipt(directory, entry);
-      fs.unlinkSync(item.file);
+      if (asked) {
+        try { fs.unlinkSync(item.file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      } else fs.unlinkSync(item.file);
     }
     return { sessionId: entry.sessionId, kind: entry.kind, received: confirmed, pending: !confirmed };
   }
