@@ -395,10 +395,15 @@ function publishedFingerprints(root) {
 }
 
 // Whether the daemon's self-repair scheduler launched this session for a repair
-// card. Never the node's word: its KEEP_REPAIR is not forwarded. A record that
-// cannot be read answers yes, which only ever refuses more.
-function isRepairSession(cardForSession, sessionId, root) {
-  try { return Boolean(cardForSession(sessionId, root)); } catch { return true; }
+// card. Never the node's word: its KEEP_REPAIR is not forwarded. cardForSession
+// reads a state file that loadState answers as empty when it is corrupt, so the
+// file is checked first: one that is there and unreadable answers yes, as does a
+// lookup that throws. Yes only ever refuses more.
+function isRepairSession(deps, sessionId, root) {
+  try {
+    if (deps.stateUnreadable(root)) return true;
+    return Boolean(deps.cardForSession(sessionId, root));
+  } catch { return true; }
 }
 
 function createHookService(options = {}) {
@@ -411,7 +416,10 @@ function createHookService(options = {}) {
   const now = shared.now;
   // The fleet shares one home path; the node's repository facts must lie under it.
   const home = options.home || (shared.baseEnv && shared.baseEnv.HOME) || os.homedir();
-  const cardForSession = options.cardForSession || ((sessionId, at) => require('./self-repair.js').cardForSession(sessionId, at));
+  const repairDeps = {
+    cardForSession: options.cardForSession || ((sessionId, at) => require('./self-repair.js').cardForSession(sessionId, at)),
+    stateUnreadable: options.repairStateUnreadable || ((at) => require('./self-repair.js').stateUnreadable(at)),
+  };
   // One request at a time per session, from the append to the answer: the mirror's
   // continuity check and the run that reads it must not interleave.
   const sessions = new Map();
@@ -484,7 +492,7 @@ function createHookService(options = {}) {
           ...(request.firedAt ? { KEEP_HOOK_FIRED_AT: String(request.firedAt) } : {}),
           // The self-repair guard's marker, from the daemon's own record of which
           // sessions it launched to repair it, never from the node.
-          ...(request.event === 'pre-bash' && isRepairSession(cardForSession, request.sessionId, root) ? { KEEP_REPAIR: '1' } : {}),
+          ...(request.event === 'pre-bash' && isRepairSession(repairDeps, request.sessionId, root) ? { KEEP_REPAIR: '1' } : {}),
         };
         const answer = await shared.journaled({
           caller, key: request.idempotencyKey, digest: digestOf(hookRequest), queue: `hook\0${caller}\0${request.sessionId}`,
@@ -520,7 +528,7 @@ function createHookService(options = {}) {
       try { where = shared.location(session); } catch { where = null; }
       if (!where || where.node !== caller) refuse(403, `session ${session} is not on node ${caller}`);
       if (where.agent !== 'claude') refuse(403, `session ${session} is a ${where.agent} session, not claude`);
-      return { status: 200, body: { steps: publishedFingerprints(root), repairSession: isRepairSession(cardForSession, session, root) } };
+      return { status: 200, body: { steps: publishedFingerprints(root), repairSession: isRepairSession(repairDeps, session, root) } };
     } catch (error) {
       if (error instanceof RegistryError) return { status: error.status, body: { error: error.message } };
       return { status: 500, body: { error: error.message } };

@@ -227,6 +227,18 @@ function loadState(root = keep.ROOT, write = process.stderr.write.bind(process.s
   };
 }
 
+// Whether the state file is there but is not the state object loadState reads:
+// loadState answers empty for it, which drops every repair session's marker, and
+// a caller deciding a guard by it must be able to tell that from "no repairs".
+function stateUnreadable(root = keep.ROOT) {
+  let text;
+  try { text = fs.readFileSync(stateFile(root), 'utf8'); } catch (error) { return !(error && error.code === 'ENOENT'); }
+  try {
+    const value = JSON.parse(text);
+    return !value || typeof value !== 'object' || Array.isArray(value);
+  } catch { return true; }
+}
+
 function pruneState(state, now) {
   for (const [sig, entry] of Object.entries(state.signatures)) {
     const resolvedAt = Number(entry && entry.resolvedAt) || 0;
@@ -1836,7 +1848,7 @@ function reset(sig, options = {}) {
 module.exports = {
   SELF_NAME, CADENCE_MS, DEFAULT_CONFIG, MAX_BUDGET_MIN, CLEARED_FOR_MS, RESOLVED_TTL_MS, PLAN,
   configFile, loadConfig, saveConfig,
-  stateDir, stateFile, loadState, mutateState, pruneState,
+  stateDir, stateFile, loadState, stateUnreadable, mutateState, pruneState,
   normalizeError, signatureHash, signatures, signatureClear, deliveryRowOf,
   readTail, readLogExcerpt, scrubBlock, redactSecrets, collectEvidence, stageEvidence, deliveryEvidence,
   cardTitle, symptomNote, buildRecipe, openingMessage, repairAccountId,

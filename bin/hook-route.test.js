@@ -657,6 +657,7 @@ test('the hook context publishes the step fingerprints and whether the daemon la
   assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, true);
   card = 'throw';
   assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, true, 'a record that cannot be read refuses more, never less');
+  card = '';
   for (const [who, session, status, message] of [
     [AWS1, 'sess-main', 403, /not on node aws1/],
     [AWS1, 'codex-aws1', 403, /is a codex session/],
@@ -953,4 +954,23 @@ test('a step run by hand on the node is recorded at the node\'s HEAD, and a sha 
   const { finalizeStep } = require('./commands/step.js');
   await assert.rejects(finalizeStep({ project: '~/infra', steps: {} }, 'apply', {}, { nodeSha: true, sha: '' }),
     /ran on another node, which did not report the commit it ran from/);
+});
+
+test('a self-repair state file that is there but unreadable makes every node session a repair session', async (t) => {
+  const { hooks, calls, root } = services(t);
+  const stateFile = require('./self-repair.js').stateFile(root);
+  assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, false, 'no state file: no repairs');
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, JSON.stringify({ signatures: { sig: { sessionId: 'sess-other', cardId: 'repair-card' } } }));
+  assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, false, 'another session\'s repair');
+  fs.writeFileSync(stateFile, JSON.stringify({ signatures: { sig: { sessionId: 'sess-aws1', cardId: 'repair-card' } } }));
+  assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, true, 'this session\'s repair');
+  for (const corrupt of ['{ not json', '[]', 'null']) {
+    fs.writeFileSync(stateFile, corrupt);
+    assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, true, corrupt);
+  }
+  // The pre-bash run gets the marker too.
+  const answer = await hooks.handle(AWS1, bashBody(root, 'ls'));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(calls.at(-1).options.env.KEEP_REPAIR, '1');
 });
