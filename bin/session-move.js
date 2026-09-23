@@ -78,14 +78,59 @@ function listMoves(root) {
   }).filter(Boolean);
 }
 
+// Finished journals are history: a done or abandoned move is pruned once it is a week
+// old, in the same sweep that reads it, at most once an hour. A move that still wants
+// a person (recovery-needed, or any status in flight) is never pruned.
+const PRUNE_AFTER_MS = 7 * 24 * 60 * 60e3;
+const PRUNE_EVERY_MS = 60 * 60e3;
+const FINISHED = ['done', 'abandoned', 'abandoned-back'];
+const lastPrune = new Map(); // moves dir -> when it was last pruned
+// Parsed journals by path, with the (inode, mtime, size) they were parsed at: a state
+// build re-reads only a journal that changed. Every write is a rename, so a changed
+// journal is a new inode. The records are shared between builds: read-only.
+const journalCache = new Map();
+
+function prunable(record, stat, now) {
+  if (!record || !FINISHED.includes(record.status)) return false;
+  const at = Math.max(Number(record.updatedAt) || 0, Number(stat.mtimeMs) || 0);
+  return now - at >= PRUNE_AFTER_MS;
+}
+
 // The same listing without blocking the loop, for the console's state build: one
-// directory read per build, whatever the number of sessions.
-async function listMovesAsync(root) {
+// directory read and a stat per journal per build, a read only of what changed.
+async function listMovesAsync(root, options = {}) {
+  const now = options.now !== undefined ? options.now : Date.now();
+  const dir = movesDir(root);
   let names = [];
-  try { names = await fs.promises.readdir(movesDir(root)); } catch { return []; }
+  try { names = await fs.promises.readdir(dir); } catch { return []; }
+  const prune = now - (lastPrune.get(dir) || 0) >= PRUNE_EVERY_MS;
+  if (prune) lastPrune.set(dir, now);
+  const seen = new Set();
   const records = await Promise.all(names.filter((name) => /^mv-[a-f0-9]{24}\.json$/.test(name)).map(async (name) => {
-    try { return JSON.parse(await fs.promises.readFile(path.join(movesDir(root), name), 'utf8')); } catch { return null; }
+    const file = path.join(dir, name);
+    seen.add(file);
+    let stat;
+    try { stat = await fs.promises.stat(file); } catch { journalCache.delete(file); return null; }
+    const cached = journalCache.get(file);
+    let record;
+    if (cached && cached.ino === stat.ino && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      record = cached.record;
+    } else {
+      // Stat before the read: a journal replaced in between is read new and keyed old,
+      // so the next build sees the new key and reads it again.
+      try { record = JSON.parse(await fs.promises.readFile(file, 'utf8')); } catch { record = null; }
+      journalCache.set(file, { ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size, record });
+    }
+    if (prune && prunable(record, stat, now)) {
+      try { await fs.promises.unlink(file); } catch {}
+      journalCache.delete(file);
+      return null;
+    }
+    return record;
   }));
+  for (const file of journalCache.keys()) {
+    if (path.dirname(file) === dir && !seen.has(file)) journalCache.delete(file);
+  }
   return records.filter(Boolean);
 }
 
@@ -502,4 +547,4 @@ async function moveSession(body, deps = {}) {
   });
 }
 
-module.exports = { moveSession, inFlight, readMove, listMoves, listMovesAsync, isRunning, safe, digestDifference, TX_RE, IN_FLIGHT };
+module.exports = { moveSession, inFlight, readMove, listMoves, listMovesAsync, PRUNE_AFTER_MS, PRUNE_EVERY_MS, isRunning, safe, digestDifference, TX_RE, IN_FLIGHT };

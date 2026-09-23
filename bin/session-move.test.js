@@ -516,3 +516,49 @@ test('a move request is validated before anything is asked', async () => {
     assert.deepEqual(w.steps, []);
   } finally { w.cleanup(); }
 });
+
+test('the console listing prunes week-old finished journals once an hour and re-reads only changed ones', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-session-move-list-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dir = path.join(root, '.keep', 'session-moves');
+  fs.mkdirSync(dir, { recursive: true });
+  const now = Date.parse('2026-09-20T12:00:00Z');
+  const week = move.PRUNE_AFTER_MS;
+  const tx = (n) => `mv-${String(n).padStart(24, '0')}`;
+  const write = (n, status, updatedAt) => {
+    const file = path.join(dir, `${tx(n)}.json`);
+    fs.writeFileSync(file, JSON.stringify({ id: tx(n), sessionId: `s${n}`, status, updatedAt }));
+    fs.utimesSync(file, new Date(updatedAt), new Date(updatedAt));
+  };
+  write(1, 'done', now - week); // exactly a week: pruned
+  write(2, 'done', now - week + 1); // a millisecond short: kept
+  write(3, 'abandoned', now - 2 * week);
+  write(4, 'abandoned-back', now - 2 * week);
+  write(5, 'recovery-needed', now - 30 * week); // wants a person: kept forever
+  write(6, 'copying', now - 30 * week);
+  const ids = (records) => records.map((record) => record.id).sort();
+
+  const reads = [];
+  const readFile = fs.promises.readFile;
+  fs.promises.readFile = async (file, ...rest) => { reads.push(path.basename(String(file))); return readFile(file, ...rest); };
+  t.after(() => { fs.promises.readFile = readFile; });
+
+  assert.deepEqual(ids(await move.listMovesAsync(root, { now })), [tx(2), tx(5), tx(6)]);
+  assert.deepEqual(fs.readdirSync(dir).sort(), [tx(2), tx(5), tx(6)].map((id) => `${id}.json`));
+  assert.equal(reads.length, 6, 'the first listing parses every journal');
+
+  // Nothing changed: every journal comes from the cache.
+  reads.length = 0;
+  assert.deepEqual(ids(await move.listMovesAsync(root, { now: now + 1000 })), [tx(2), tx(5), tx(6)]);
+  assert.deepEqual(reads, []);
+
+  // A rewritten journal is read again, alone; the next sweep is an hour off, so a
+  // journal that became prunable in between stays until then.
+  write(2, 'done', now - 2 * week);
+  write(7, 'done', now - 2 * week);
+  assert.deepEqual(ids(await move.listMovesAsync(root, { now: now + 2000 })), [tx(2), tx(5), tx(6), tx(7)]);
+  assert.deepEqual(reads.sort(), [`${tx(2)}.json`, `${tx(7)}.json`]);
+  reads.length = 0;
+  assert.deepEqual(ids(await move.listMovesAsync(root, { now: now + move.PRUNE_EVERY_MS })), [tx(5), tx(6)]);
+  assert.deepEqual(reads, [], 'the sweep prunes from the cache without a read');
+});
