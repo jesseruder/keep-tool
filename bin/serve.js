@@ -12575,6 +12575,8 @@ function sessionMoveDeps(deps = {}) {
       // Proven again from the source's own table whether or not it was just stopped.
       await requireNoAgentOn(record.from, record.sessionId, deps);
     },
+    // The same proof, asked again before the flip and before every launch.
+    requireStopped: (record) => requireNoAgentOn(record.from, record.sessionId, deps),
     transfer: (record) => {
       const account = accountOf(record);
       return artifactTransport.transfer({ sessionId: record.sessionId, tx: record.id,

@@ -43,9 +43,15 @@ function world(options = {}) {
     pendingDelivery: async () => options.pendingDelivery === true,
     busy: async () => options.busy || null,
     stop: async (record) => { steps.push(['stop', record.from]); failing('stop'); state.stopped = true; },
+    // The source's table read again; `state.revived` is someone starting it by hand.
+    requireStopped: async (record) => {
+      steps.push(['reprove', record.from]);
+      if (state.revived) throw Object.assign(new Error(`an agent process still owns ${SID} on ${record.from}`), { status: 409 });
+    },
     transfer: async (record) => {
       steps.push(['transfer', record.from, record.to]);
       assert.equal(state.stopped, true, 'nothing is carried before the source is stopped');
+      if (options.reviveAfter === 'transfer') state.revived = true;
       failing('transfer');
       return { files: [{ relPath: `projects/-work-project/${SID}.jsonl`, sha256: 'a'.repeat(64), size: 10 }], bytes: 10 };
     },
@@ -70,13 +76,15 @@ function world(options = {}) {
 }
 
 const names = (steps) => steps.map((step) => step[0]);
+const moves = (steps) => names(steps).filter((name) => name !== 'reprove');
 
 test('a move stops the source, carries, flips once, starts the target and verifies it, in that order', async () => {
   const w = world();
   try {
     const result = await move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps);
     assert.equal(result.status, 'done');
-    assert.deepEqual(names(w.steps), ['requireNode', 'cwdExists', 'stop', 'transfer', 'pin', 'open', 'wait', 'relink', 'cleanup']);
+    assert.deepEqual(names(w.steps), ['requireNode', 'cwdExists', 'stop', 'transfer', 'reprove', 'pin', 'reprove', 'open', 'wait', 'relink', 'cleanup'],
+      'the source is proven stopped again before the flip and before the launch');
     assert.deepEqual(w.steps.find((step) => step[0] === 'requireNode'), ['requireNode', 'aws1'], 'the node end is asked for the verb');
     assert.equal(w.state.pins, 1);
     const record = move.readMove(w.root, result.id);
@@ -158,7 +166,7 @@ for (const [point, phase, holder, reached] of FAILURES) {
         return error.status === 409 && error.extra.status === 'recovery-needed' && error.extra.phase === phase
           && error.extra.holder === holder && new RegExp(`names ${holder}, which holds its verified bytes`).test(error.message);
       });
-      assert.deepEqual(names(w.steps).filter((name) => !['requireNode', 'cwdExists'].includes(name)), reached);
+      assert.deepEqual(moves(w.steps).filter((name) => !['requireNode', 'cwdExists'].includes(name)), reached);
       assert.equal(w.state.node, holder, 'the location record names the holder');
       assert.equal(w.state.pins, ['main'].includes(holder) ? 0 : 1);
       // Nothing else may resume or move it meanwhile.
@@ -174,6 +182,67 @@ for (const [point, phase, holder, reached] of FAILURES) {
     } finally { w.cleanup(); }
   });
 }
+
+test('a source started again after the copy is caught before the flip, and nothing launches', async () => {
+  const w = world({ reviveAfter: 'transfer' });
+  try {
+    let id;
+    await assert.rejects(move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps), (error) => {
+      id = error.extra.id;
+      return error.extra.phase === 'staged' && error.extra.holder === 'main'
+        && /main is not proven stopped before the location record is flipped: an agent process still owns/.test(error.message);
+    });
+    assert.deepEqual(moves(w.steps).slice(-2), ['stop', 'transfer']);
+    assert.equal(w.state.pins, 0, 'the record still names the source');
+    // A recovery reads the table again, and refuses while it still runs there.
+    w.steps.length = 0;
+    await assert.rejects(move.moveSession({ recover: id }, w.deps), /not proven stopped/);
+    assert.deepEqual(names(w.steps), ['reprove']);
+    // Stopped again: the recovery goes on from the verified stage.
+    w.state.revived = false;
+    w.steps.length = 0;
+    assert.equal((await move.moveSession({ recover: id }, w.deps)).status, 'done');
+    assert.deepEqual(names(w.steps), ['reprove', 'pin', 'reprove', 'open', 'wait', 'relink', 'cleanup']);
+  } finally { w.cleanup(); }
+});
+
+test('a source started again after the flip blocks the launch, and a recovery proves it stopped again first', async () => {
+  const w = world();
+  // Revived between the flip and the launch.
+  const pin = w.deps.pin;
+  w.deps.pin = async (record) => { await pin(record); w.state.revived = true; };
+  try {
+    let id;
+    await assert.rejects(move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps), (error) => {
+      id = error.extra.id;
+      return error.extra.phase === 'pinned' && /main is not proven stopped before the target is launched/.test(error.message);
+    });
+    assert.equal(names(w.steps).includes('open'), false, 'the target was never launched');
+    assert.equal(w.state.node, 'aws1', 'the record stays flipped');
+    const record = move.readMove(w.root, id);
+    assert.equal(record.launchStartedAt, undefined);
+    w.steps.length = 0;
+    await assert.rejects(move.moveSession({ recover: id }, w.deps), /before the target is launched/);
+    assert.equal(names(w.steps).includes('open'), false);
+    w.state.revived = false;
+    w.steps.length = 0;
+    assert.equal((await move.moveSession({ recover: id }, w.deps)).status, 'done');
+    assert.deepEqual(names(w.steps).slice(0, 2), ['reprove', 'open']);
+    assert.equal(w.state.pins, 1);
+  } finally { w.cleanup(); }
+});
+
+test('a recovery from the copy proves the source stopped before carrying anything', async () => {
+  const w = world({ fail: { transfer: true } });
+  try {
+    let id;
+    await assert.rejects(move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps), (error) => { id = error.extra.id; return true; });
+    w.state.revived = true;
+    w.steps.length = 0;
+    await assert.rejects(move.moveSession({ recover: id }, w.deps), /not proven stopped before its files are carried/);
+    assert.deepEqual(names(w.steps), ['reprove']);
+  } finally { w.cleanup(); }
+});
 
 test('an abandon before the flip clears the target stage and leaves the session on its source; after the flip it is refused', async () => {
   const w = world({ fail: { transfer: true } });

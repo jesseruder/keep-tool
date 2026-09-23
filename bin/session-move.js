@@ -154,16 +154,31 @@ async function run(record, deps) {
   const save = () => writeMove(root, record);
   const warnings = [];
   let phase = record.status;
+  // Proven in this run, not taken from the journal: a recovery may come hours later,
+  // and the source can have been started again meanwhile (by hand, or by anything
+  // that did not ask about the move). So the source's own table is read again before
+  // its files are carried on a recovery, before the flip, and before every launch.
+  let proven = false;
+  const reprove = async (when) => {
+    try { await deps.requireStopped(record); }
+    catch (error) {
+      throw Object.assign(new Error(`${record.from} is not proven stopped ${when}: ${error && error.message || error}`),
+        { status: error && error.status });
+    }
+    record.stopReprovedAt = now();
+  };
   try {
     if (record.status === 'stopping') {
       // Resolves only once the source is proven stopped on its own node.
       await deps.stop(record);
       record.stopVerifiedAt = now();
+      proven = true;
       record.status = 'copying'; save();
     }
     phase = record.status;
     if (record.status === 'copying') {
       if (!record.stopVerifiedAt) throw new Error('the source was not proven stopped');
+      if (!proven) await reprove('before its files are carried');
       const carried = await deps.transfer(record);
       record.manifest = { files: carried.files.length, bytes: carried.bytes,
         digests: Object.fromEntries(carried.files.map((file) => [file.relPath, file.sha256])) };
@@ -173,6 +188,7 @@ async function run(record, deps) {
     if (record.status === 'staged') {
       const location = await deps.location(record.sessionId);
       if (!location || location.node === record.from) {
+        await reprove('before the location record is flipped');
         await deps.pin(record);
       } else if (location.node !== record.to) {
         throw new Error(`the location record names ${location.node}, neither end of this move`);
@@ -184,6 +200,9 @@ async function run(record, deps) {
     if (record.status === 'pinned' || record.status === 'starting') {
       const location = await deps.location(record.sessionId);
       if (!location || location.node !== record.to) throw new Error(`the location record does not name ${record.to}`);
+      // The copy can take minutes, and a recovery can come much later: whatever the
+      // journal says, nothing launches until the source's table says it is stopped now.
+      await reprove('before the target is launched');
       record.launchStartedAt ||= now();
       record.status = 'starting'; save();
       phase = record.status;
