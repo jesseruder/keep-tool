@@ -1393,7 +1393,9 @@ function resolveLocalModelSwitch(args, following) {
     if (modelSwitchApiError(stdout)) return { model: '<unknown>', label: '', failed: true };
     const label = modelSwitchLabel(stdout);
     if (label == null) return { model: '<unknown>', label: '' };
-    return { model: typed || '<unknown>', label, saved: modelSwitchSavedDefault(stdout) };
+    const saved = modelSwitchSavedDefault(stdout);
+    const savedAt = saved ? Date.parse(record.timestamp) : NaN;
+    return { model: typed || '<unknown>', label, ...(saved && Number.isFinite(savedAt) ? { saved: true, savedAt } : {}) };
   }
   return { model: '<unknown>', label: '' };
 }
@@ -1522,12 +1524,12 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
 }
 
 function switchResult(event) {
-  const { model, label, saved } = event.resolve ? event.resolve() : resolveLocalModelSwitch(event.args, event.following());
+  const { model, label, saved, savedAt } = event.resolve ? event.resolve() : resolveLocalModelSwitch(event.args, event.following());
   if (model !== '<unknown>') return { model, source: 'switch', window: 'exact' };
   // Nothing newer than this switch, so no record names the base model it moved to. The
   // label travels out with the sentinel: only handoffCurrentModel holds the launch
   // metadata and account settings that could prove it.
-  return { model, source: 'switch', window: 'unknown', label, ...(saved ? { saved: true } : {}) };
+  return { model, source: 'switch', window: 'unknown', label, ...(saved ? { saved: true, savedAt } : {}) };
 }
 
 // A `/model` older than the newest assistant record: the record confirms the base model,
@@ -1685,6 +1687,26 @@ function managedPreferenceFiles() {
 // resolved the way bin/account-handoff.js resolves it and no other account is consulted.
 // Anything unresolvable — no account, no readable file, a value `claude --model` would
 // not take — is '' and leaves the handoff refusing.
+// The settings a confirmed "saved as your default" switch wrote, but only while nothing has
+// written that file since: every session on the account shares it, and a compaction swap
+// types its own /model into it and then restores an older value. Its mtime has to sit
+// within a few seconds of the confirmation row, so any later write fails closed.
+const SAVED_SWITCH_SETTINGS_SLACK_MS = 5000;
+function savedSwitchSettingsModel(session, savedAt, deps = {}) {
+  try {
+    const account = (deps.forSession || accounts.forSession)(session.id, 'claude', {
+      root: deps.root || keep.ROOT, env: deps.env || process.env,
+    });
+    if (!account || typeof account.configDir !== 'string' || !account.configDir) return '';
+    const file = path.join(account.configDir, 'settings.json');
+    const mtime = (deps.settingsMtimeMs || ((p) => fs.statSync(p).mtimeMs))(file);
+    if (!Number.isFinite(savedAt) || !Number.isFinite(mtime)
+        || Math.abs(mtime - savedAt) > SAVED_SWITCH_SETTINGS_SLACK_MS) return '';
+    const read = deps.readAccountSettings || readAccountSettingsModel;
+    return launchModelId(read(file));
+  } catch { return ''; }
+}
+
 function sourceAccountSettingsModel(session, deps = {}) {
   try {
     const account = (deps.forSession || accounts.forSession)(session.id, 'claude', {
@@ -1720,7 +1742,7 @@ function handoffCurrentModel(session, pane, processArgs, deps = {}) {
   // record's own `claude-fable-5-1` are the same model with different windows.
   const launch = launchModelId(pane?.meta?.model)
     || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(String(processArgs || ''))?.[1]);
-  const { model, source, window, label, labelReference, saved } = found;
+  const { model, source, window, label, labelReference, saved, savedAt } = found;
   // A `/model` that named no launchable id — the picker, or a bare alias — left the model
   // it moved to only in the label the harness echoed. Something else has to prove the base
   // that label narrows: the assistant record right after the switch when there is one, and
@@ -1733,17 +1755,19 @@ function handoffCurrentModel(session, pane, processArgs, deps = {}) {
   if (model === '<unknown>' && label) {
     const reference = labelReference || launch;
     if ((reference || saved) && !customModelPickerPossible(session, processArgs, deps)) {
+      // No turn since the switch: a switch the harness confirmed it saved as the default
+      // wrote the full id, window included, into the account's settings.json, and it is
+      // newer evidence than the launch. The picker's Fable 5.1 row is the 1M model with no
+      // "(1M context)" in its label, so only this id carries its window. It is taken
+      // verbatim when the file is untouched since, the label names its base, and the label
+      // does not ask for a 1M window the id lacks; anything else falls through.
+      if (!labelReference && saved) {
+        const configured = savedSwitchSettingsModel(session, savedAt, deps);
+        if (configured && modelIdForSwitchLabel(label, configured)
+            && !(/\b1m\b/i.test(label) && !/\[1m\]$/i.test(configured))) return configured;
+      }
       const labelled = reference ? modelIdForSwitchLabel(label, reference) : '';
       if (labelled) return labelled;
-      // No turn since the switch, and a launch that named no model or a different one: a
-      // switch the harness confirmed it saved as the default wrote the full id, window
-      // included, into the account's settings.json. That id is the proof when the label
-      // names it, and it is taken verbatim. A label it does not match (someone saved
-      // another model since) still fails closed.
-      if (!labelReference && saved) {
-        const configured = sourceAccountSettingsModel(session, deps);
-        if (configured && modelIdForSwitchLabel(label, configured)) return configured;
-      }
     }
   }
   if (model === '<unknown>') return model;
