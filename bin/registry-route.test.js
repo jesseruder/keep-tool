@@ -783,8 +783,9 @@ test('late adoption refuses a session this machine knows, one with any daemon pa
 });
 
 // The adoption helper itself on adoptingService's layout, so a refusal's reason can be read.
-function directAdoption(t, panes, options = {}) {
-  const service = adoptingService(t, panes);
+function directAdoption(t, panes, options = {}, launch = null) {
+  const service = adoptingService(t, panes, launch ? { noLaunch: true } : {});
+  if (launch) recordLateLaunch(service.root, service.now, launch);
   const adoption = require('./late-adoption.js').createLateAdoption({
     root: service.root, env: service.env, daemonNode: () => 'main', now: service.now,
     hostConnect: service.host.connect, ...options,
@@ -872,6 +873,45 @@ test('a launch record consumed between the host lookup and the pin, or one that 
     assert.equal(pinned(stuck), false);
     fs.chmodSync(dir, 0o700);
   }
+});
+
+test('a card open\'s launch puts the adopted session on that card, releases the handing session, and still adopts when the link fails', async (t) => {
+  const linked = [];
+  const released = [];
+  const logged = [];
+  const card = directAdoption(t, [lateCodexPane({ card: 'some-other-card' })], {
+    linkLaunchedSession: (cardId, session) => { linked.push({ cardId, session }); return { linked: session.id }; },
+    releaseCardSession: (cardId, sessionId) => { released.push({ cardId, sessionId }); return true; },
+    log: (line) => logged.push(line),
+  }, { card: 'the-card', requester: 'handing-session' });
+  let result = await card.adopt();
+  assert.equal(result.adopted, true, result.why);
+  // The card is the daemon's record of the open, never the pane's meta.
+  assert.deepEqual(linked, [{ cardId: 'the-card', session: { id: 'codex-late', agent: 'codex', node: 'aws1' } }]);
+  assert.deepEqual(released, [{ cardId: 'the-card', sessionId: 'handing-session' }]);
+  assert.equal(result.linked, true);
+  // A link that throws is reported; the session is pinned and adopted all the same,
+  // and the handing session keeps the card.
+  released.length = 0;
+  const failing = directAdoption(t, [lateCodexPane()], {
+    linkLaunchedSession: () => { throw new Error('registry locked'); },
+    releaseCardSession: (cardId, sessionId) => { released.push({ cardId, sessionId }); return true; },
+    log: (line) => logged.push(line),
+  }, { card: 'the-card', requester: 'handing-session' });
+  result = await failing.adopt();
+  assert.equal(result.adopted, true, result.why);
+  assert.equal(result.linked, false);
+  assert.deepEqual(released, []);
+  assert.deepEqual(require('./accounts.js').sessionLocation('codex-late', { root: failing.root, env: failing.env }),
+    { node: 'aws1', agent: 'codex', accountId: 'codex-node' });
+  assert.ok(logged.some((line) => /could not be linked to card the-card: registry locked/.test(line)), logged.join('\n'));
+  // A launch with no card links nothing.
+  const plain = directAdoption(t, [lateCodexPane()], {
+    linkLaunchedSession: () => { throw new Error('never called'); },
+  });
+  result = await plain.adopt();
+  assert.equal(result.adopted, true);
+  assert.equal(result.linked, undefined);
 });
 
 test('late adoption gives up on a node host that never answers its hello within about two seconds, well inside a start\'s deadline', async (t) => {

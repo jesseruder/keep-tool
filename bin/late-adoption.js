@@ -49,6 +49,7 @@ const PANE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const ACCOUNT_RE = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex|pi)\/default)$/;
 const AGENTS = ['codex'];
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const CARD_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const LAUNCH_TTL_MS = 24 * 60 * 60e3;
 const LAUNCHES_DIR = 'node-codex-launches';
 
@@ -59,14 +60,19 @@ const launchFile = (root, node, requestId) => path.join(launchesDir(root),
   `${crypto.createHash('sha256').update(`${node}\0${requestId}`).digest('hex')}.json`);
 
 // What openSession writes when it spawns a fresh Codex pane on another node that may
-// register only later: the pane and the launch facts it put in the pane's meta. Old
-// records are pruned on the way.
+// register only later: the pane and the launch facts it put in the pane's meta, and
+// for a card open the card (and the session that handed it over), which late adoption
+// links the session to once it registers. Old records are pruned on the way.
 function recordNodeCodexLaunch(root, launch, options = {}) {
   const now = options.now || Date.now;
-  const { node, requestId, accountId, launchedAt, pane, project } = launch || {};
+  const { node, requestId, accountId, launchedAt, pane, project, card, requester } = launch || {};
   if (typeof node !== 'string' || !node || !REQUEST_ID_RE.test(String(requestId || ''))
     || typeof accountId !== 'string' || !ACCOUNT_RE.test(accountId) || !Number.isFinite(launchedAt)
     || typeof pane !== 'string' || !PANE_ID_RE.test(pane)) throw new Error('an incomplete node Codex launch');
+  if (card != null && (typeof card !== 'string' || !CARD_RE.test(card))) throw new Error('a node Codex launch with an invalid card');
+  if (requester != null && (typeof requester !== 'string' || !SESSION_RE.test(requester))) {
+    throw new Error('a node Codex launch with an invalid requester');
+  }
   const dir = launchesDir(root);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   let names = [];
@@ -77,7 +83,8 @@ function recordNodeCodexLaunch(root, launch, options = {}) {
   const file = launchFile(root, node, requestId);
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, node, openRequestId: requestId, accountId, launchedAt, pane,
-    ...(typeof project === 'string' ? { project } : {}), at: now() })}\n`, { mode: 0o600 });
+    ...(typeof project === 'string' ? { project } : {}), ...(card ? { card } : {}), ...(requester ? { requester } : {}),
+    at: now() })}\n`, { mode: 0o600 });
   fs.renameSync(tmp, file);
   return file;
 }
@@ -174,6 +181,12 @@ function createLateAdoption(options = {}) {
   const connect = options.hostConnect
     || ((node, timeoutMs, helloTimeoutMs) => require('./hostclient.js').connect({ node, env, timeoutMs, helloTimeoutMs }));
   const log = options.log || (() => {});
+  // Puts a session on a card, as openSession does once a card open learns its session.
+  const linkLaunchedSession = options.linkLaunchedSession
+    || ((card, session) => require('./keep-core.js').linkLaunchedSession(card, session, { root }));
+  // And takes the card from the session that handed it over, as openSession does.
+  const releaseCardSession = options.releaseCardSession
+    || ((card, sessionId) => require('./keep-core.js').releaseCardSession(card, sessionId, { root }));
   // Whether this machine knows the session itself: a Claude transcript or a Codex
   // rollout of it under any account here (walkedLocally, the authority), or one the
   // shared lookups find. A look that fails says yes; the walk's own failure throws,
@@ -302,7 +315,27 @@ function createLateAdoption(options = {}) {
       log(`late adoption: ${agent} session ${sessionId} on ${caller} was pinned but its pane record could not be written: ${error.message}`);
     }
     log(`late adoption: ${agent} session ${sessionId} adopted on ${caller} in pane ${ref} (account ${accountId})`);
-    return { adopted: true, pane: ref, accountId };
+    // A card open that returned pending: the session goes on the card now, before the
+    // route runs its hook, so the hook finds the card. The card is the daemon's own
+    // record of the open, never the pane's word. The pin has happened, so a link that
+    // fails is reported, not a refusal.
+    let linked;
+    if (typeof launch.card === 'string' && CARD_RE.test(launch.card)) {
+      try {
+        linked = Boolean(linkLaunchedSession(launch.card, { id: sessionId, agent, node: caller }));
+        if (!linked) log(`late adoption: ${agent} session ${sessionId} could not be linked to card ${launch.card}: no such card`);
+      } catch (error) {
+        linked = false;
+        log(`late adoption: ${agent} session ${sessionId} could not be linked to card ${launch.card}: ${error && error.message || error}`);
+      }
+      // Only once the new session is on the card does the one that handed it over leave.
+      if (linked && typeof launch.requester === 'string' && SESSION_RE.test(launch.requester) && launch.requester !== sessionId) {
+        try { releaseCardSession(launch.card, launch.requester); } catch (error) {
+          log(`late adoption: ${launch.requester} could not be unlinked from card ${launch.card}: ${error && error.message || error}`);
+        }
+      }
+    }
+    return { adopted: true, pane: ref, accountId, ...(linked !== undefined ? { card: launch.card, linked } : {}) };
   }
 
   // Whether a session has no location record at all, read synchronously, so a route

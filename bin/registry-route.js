@@ -152,6 +152,8 @@ function createRegistryService(options = {}) {
     root, env: { ...baseEnv, KEEP_CONFIG: configFile }, now, nodes, daemonNode, location, log,
     ...(options.hostConnect ? { hostConnect: options.hostConnect } : {}),
     ...(options.locatedLocally ? { locatedLocally: options.locatedLocally } : {}),
+    ...(options.linkLaunchedSession ? { linkLaunchedSession: options.linkLaunchedSession } : {}),
+    ...(options.releaseCardSession ? { releaseCardSession: options.releaseCardSession } : {}),
   });
   const pidAlive = options.pidAlive || ((pid) => {
     try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
