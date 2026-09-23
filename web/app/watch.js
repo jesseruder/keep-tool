@@ -3,6 +3,7 @@ import { runAction } from './action.js';
 import { sessionExplanation } from './status.js';
 import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHandoff } from './account-controls.js';
 import { portableTransferControls, installPortableTransferControls } from './portable-transfer.js';
+import { installMoveControls, moveControlsHTML } from './move-controls.js';
 import { actionsMenuHTML, installActionsMenu, installKeepRunningControl, keepRunningControlHTML,
   patchActionsMenu, rendererControlsHTML } from './session-actions.js';
 import { numBadgeHTML } from './session-number.js';
@@ -131,10 +132,12 @@ function renderGrid(ctx, layout) {
     const portable = providerControls && (closable || pendingHandoff) && !entity.session?.reviewer ? portableTransferControls(ctx, pane.meta.sessionId) : '';
     const handoff = providerControls && (closable || pendingHandoff) && !entity.session?.reviewer ? handoffControls(ctx, pane.meta.sessionId, pane.id) : '';
     const restart = providerControls && closable && !pendingHandoff && !entity.session?.reviewer ? restartControls(ctx, pane.meta.sessionId) : '';
+    const move = providerControls && !entity.session?.reviewer
+      ? moveControlsHTML(ctx, entity.session, { live: Boolean(closable), pendingHandoff }) : '';
     const keepRunning = providerControls && closable && entity.session && !entity.session.reviewer && !entity.session.agentName
       ? keepRunningControlHTML(entity.session) : '';
     const menu = element.querySelector('.session-actions');
-    patchActionsMenu(ctx, menu, `<button class="btn" data-unpin>Unpin from Watch</button>${closable ? '<button class="btn" data-close-session>Close session</button>' : ''}${shell ? `<button class="btn" data-kill>${pane.alive ? 'Kill shell' : 'Remove shell'}</button>` : ''}${exitedAgent && !pendingHandoff ? `<button class="btn" data-reopen>${entity.session?.retirement?.automatic === true ? 'Resume' : 'Reopen'}</button><button class="btn" data-remove-pane>Remove pane</button>` : ''}${keepRunning}${renameButtonsHTML(entity.session?.id, entity.renamed)}${markControlsHTML(ctx.esc, entity.session?.id, entity.mark)}<div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${rendererControlsHTML(ctx, pane.id, pane)}`);
+    patchActionsMenu(ctx, menu, `<button class="btn" data-unpin>Unpin from Watch</button>${closable ? '<button class="btn" data-close-session>Close session</button>' : ''}${shell ? `<button class="btn" data-kill>${pane.alive ? 'Kill shell' : 'Remove shell'}</button>` : ''}${exitedAgent && !pendingHandoff ? `<button class="btn" data-reopen>${entity.session?.retirement?.automatic === true ? 'Resume' : 'Reopen'}</button><button class="btn" data-remove-pane>Remove pane</button>` : ''}${keepRunning}${renameButtonsHTML(entity.session?.id, entity.renamed)}${markControlsHTML(ctx.esc, entity.session?.id, entity.mark)}<div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><div class="move-controls">${move}</div><span class="restart-controls">${restart}</span>${rendererControlsHTML(ctx, pane.id, pane)}`);
     installActionsMenu(menu, ctx, pane.id);
     if (keepRunning) installKeepRunningControl(menu, ctx, entity.session, api.setSessionKeepRunning);
     installRenameControls(menu, ctx, heading, entity.session?.id, entity.title, api.renameSession);
@@ -142,6 +145,7 @@ function renderGrid(ctx, layout) {
     installHeadingRename(heading, ctx, entity.session?.id, entity.title, api.renameSession);
     if (portable) installPortableTransferControls(menu.querySelector('.portable-transfer-controls'), ctx);
     if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, pane.meta.sessionId, pane.id);
+    if (move) installMoveControls(menu.querySelector('.move-controls'), ctx, pane.meta.sessionId);
     if (restart) installRestartControls(menu.querySelector('.restart-controls'), ctx, pane.meta.sessionId, pane.id);
     retained.add(element);
     const closeButton = element.querySelector('[data-close-session]');

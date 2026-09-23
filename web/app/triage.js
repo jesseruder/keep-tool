@@ -4,6 +4,7 @@ import { closeSession } from './close-session.js';
 import { restartControls, installRestartControls } from './restart-session.js';
 import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHandoff } from './account-controls.js';
 import { portableTransferControls, installPortableTransferControls } from './portable-transfer.js';
+import { installMoveControls, moveControlsHTML } from './move-controls.js';
 import { relayControlsHTML, installRelayControls } from './session-relay.js';
 import { sessionLabel, sessionExplanation, backgroundLabel, hostOutage, hostOutageText } from './status.js';
 import { retainSelection, selectionIndex } from './selection.js';
@@ -980,6 +981,10 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   const portable = providerControls && item.sessionId && ownControls ? portableTransferControls(ctx, item.sessionId) : '';
   const handoff = providerControls && (closable || pendingHandoff) && ownControls ? handoffControls(ctx, item.sessionId, paneId) : '';
   const restart = providerControls && closable && !pendingHandoff && ownControls ? restartControls(ctx, item.sessionId) : '';
+  // Moving to another machine: offered on a live Claude session, and a move the state
+  // carries stays on screen after the stop took its pane.
+  const move = providerControls && item.sessionId && ownControls
+    ? moveControlsHTML(ctx, session, { live: Boolean(closable), pendingHandoff }) : '';
   // The reviewer and every other agent are not working sessions: relaying into
   // or out of one would put the agent's own words in a card's session, which is
   // what `keep nudge` exists for.
@@ -992,7 +997,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     : waitingItem ? '<button class="btn" data-mark-running title="This session still has background work: list it under Running &amp; waiting until its next message or turn">Mark running</button>' : '';
   ctx.patchHTML(stage.querySelector('.quick-actions'), `${markRunning}${item.sessionId || waitingItem ? '<button class="btn" data-snooze="60">Snooze 1h</button><button class="btn" data-snooze="1440">Snooze 24h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}`);
   const menu = stage.querySelector('.session-actions');
-  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${paneId ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${keepRunning}${renameButtonsHTML(item.sessionId, session?.renamed)}${markControlsHTML(ctx.esc, item.sessionId, session?.mark)}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, paneId, pane) : ''}`);
+  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${paneId ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${keepRunning}${renameButtonsHTML(item.sessionId, session?.renamed)}${markControlsHTML(ctx.esc, item.sessionId, session?.mark)}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><div class="move-controls">${move}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, paneId, pane) : ''}`);
   installActionsMenu(menu, ctx, paneId);
   if (keepRunning) installKeepRunningControl(menu, ctx, session, api.setSessionKeepRunning);
   installRenameControls(menu, ctx, heading, item.sessionId, title, api.renameSession);
@@ -1001,6 +1006,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   if (relay) installRelayControls(menu.querySelector('.relay-controls'), ctx);
   if (portable) installPortableTransferControls(menu.querySelector('.portable-transfer-controls'), ctx);
   if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, item.sessionId, paneId);
+  if (move) installMoveControls(menu.querySelector('.move-controls'), ctx, item.sessionId);
   if (restart) installRestartControls(menu.querySelector('.restart-controls'), ctx, item.sessionId, paneId);
   const briefChanged = ctx.patchHTML(brief, briefHTML(ctx, item, session));
   installGrading(brief, ctx, session);
