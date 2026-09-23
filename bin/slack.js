@@ -1322,13 +1322,16 @@ function startScheduler(options = {}) {
   }
   health.record('slack', { skipped: true });
   let running = false;
+  // The reset a deferral was last logged for: said once per retryAt, not per poll.
+  let deferredLoggedFor = null;
+  const log = options.log || ((line) => process.stderr.write(line));
   const tick = async () => {
     if (running) return;
     running = true;
     let failures = 0;
     let failureError = '';
     try {
-      const decisions = await poll();
+      const decisions = await (options.poll || poll)();
       process.stderr.write(`keep slack: polled ${decisions.length} new message${decisions.length === 1 ? '' : 's'}\n`);
       failures = decisions.incidentFailures && Number(decisions.incidentFailures.count) || 0;
       failureError = failures ? String(decisions.incidentFailures.error || 'write failed') : '';
@@ -1348,8 +1351,18 @@ function startScheduler(options = {}) {
         });
       } else health.record('slack', { ok: true, detail: `${decisions.length} messages` });
     } catch (error) {
-      health.record('slack', { ok: false, error });
-      process.stderr.write(`keep slack: ${error.message}\n`);
+      if (error && error.code === 'ACCOUNT_DEFERRED') {
+        // The automation pool is spent: the classifier was never started, and the
+        // messages stay behind the cursor for the poll after the reset. Not a fault.
+        health.record('slack', { ok: true, skipped: true, detail: error.message });
+        if (deferredLoggedFor !== error.retryAt) {
+          deferredLoggedFor = error.retryAt;
+          log(`keep slack: ${error.message}\n`);
+        }
+      } else {
+        health.record('slack', { ok: false, error });
+        process.stderr.write(`keep slack: ${error.message}\n`);
+      }
     } finally { running = false; }
   };
   const interval = setInterval(() => { void tick(); }, config().intervalMin * 60e3);

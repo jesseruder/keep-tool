@@ -2024,3 +2024,14 @@ test('the pause note is retried when its check-in fails, and the marker never ou
     assert.doesNotMatch(selfRepair.renderStatus(selfRepair.status({ root, now: NOW + 40 * 60e3, config: off })), /project missing/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('the repair account comes from the account policy, a spent pool pins none, and a failing policy falls back', () => {
+  const asked = [];
+  const pick = (answer) => (options) => { asked.push(options.purpose); if (answer instanceof Error) throw answer; return answer; };
+  assert.equal(selfRepair.repairAccountId({}, { selectAccount: pick({ account: 'claude-secondary' }) }), 'claude-secondary');
+  assert.equal(selfRepair.repairAccountId({}, { selectAccount: pick({ account: null, deferred: true, retryAt: 1 }) }), undefined);
+  // The harness registry has no accounts: the built-in default, as before the pool existed.
+  assert.equal(selfRepair.repairAccountId(process.env, { selectAccount: pick(new Error('broken')) }), 'claude/default');
+  assert.equal(selfRepair.repairAccountId(process.env), 'claude/default', 'single-account install: unchanged');
+  assert.deepEqual(asked, ['repair', 'repair', 'repair']);
+});

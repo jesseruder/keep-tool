@@ -333,7 +333,8 @@ function cleanProse(value) {
 function runModel(prompt, model) {
   return new Promise((resolve, reject) => {
     const sessionId = crypto.randomUUID();
-    const env = summarize.automationEnv('standup').env;
+    // Model-aware: a spent Fable bucket must not stop a Sonnet standup.
+    const env = summarize.automationEnv('standup', process.env, undefined, { model }).env;
     delete env.CLAUDE_CODE_SESSION_ID;
     let child;
     try {

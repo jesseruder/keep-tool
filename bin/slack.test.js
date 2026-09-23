@@ -870,3 +870,40 @@ if (tool === 'slack_thread') { fs.appendFileSync(${JSON.stringify(calls)}, args.
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('a poll the account policy deferred is a healthy skip, logged once per reset', async () => {
+  const slack = require('./slack.js');
+  const health = require('./health.js');
+  fs.mkdirSync(path.dirname(slack.CONFIG_FILE), { recursive: true });
+  fs.writeFileSync(slack.CONFIG_FILE, JSON.stringify({ channels: ['#errors'] }));
+  const records = [];
+  const original = health.record;
+  health.record = (name, options) => records.push({ name, options });
+  const lines = [];
+  let retryAt = 1_900_000_000_000;
+  const deferred = () => Object.assign(new Error('automation pool exhausted for haiku; retrying at later'),
+    { code: 'ACCOUNT_DEFERRED', retryAt });
+  try {
+    const scheduler = slack.startScheduler({ poll: async () => { throw deferred(); }, log: (line) => lines.push(line) });
+    clearInterval(scheduler.interval);
+    clearTimeout(scheduler.first);
+    await scheduler.tick();
+    await scheduler.tick();
+    const polls = records.filter((row) => row.name === 'slack').slice(1);
+    assert.deepEqual(polls.map((row) => [row.options.ok, row.options.skipped]), [[true, true], [true, true]]);
+    assert.match(polls[0].options.detail, /automation pool exhausted/);
+    assert.equal(lines.length, 1, 'said once for this reset');
+    retryAt += 3600e3;
+    await scheduler.tick();
+    assert.equal(lines.length, 2, 'and once more for a new one');
+    // Any other failure still turns the row red.
+    const failing = slack.startScheduler({ poll: async () => { throw new Error('slack is down'); }, log: () => {} });
+    clearInterval(failing.interval);
+    clearTimeout(failing.first);
+    await failing.tick();
+    assert.equal(records.at(-1).options.ok, false);
+  } finally {
+    health.record = original;
+    fs.rmSync(slack.CONFIG_FILE, { force: true });
+  }
+});

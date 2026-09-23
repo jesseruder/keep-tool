@@ -989,7 +989,17 @@ function launchModel(config, env = process.env, write = process.stderr.write.bin
 // The repair session spends against a real Claude account, so it has to name one.
 // Falls back through automationAccounts.claude to the default, so nothing needs
 // configuring for it to work; undefined means "whatever the default is".
-function repairAccountId(env = process.env) {
+//
+// The account comes from bin/account-budget.js (`automationAccounts.repair` while it has
+// room, else the pool's best). A spent pool answers undefined, as an unresolvable account
+// always has; repairs are never deferred. With no pool, or if the policy throws, the
+// fixed assignment as before.
+function repairAccountId(env = process.env, deps = {}) {
+  try {
+    const choice = (deps.selectAccount || require('./account-budget.js').select)({ purpose: 'repair', env });
+    if (choice.deferred) return undefined;
+    if (choice.account) return choice.account;
+  } catch {}
   try { return require('./accounts.js').automationFor('claude', 'repair', env).id; }
   catch { return undefined; }
 }

@@ -2100,3 +2100,18 @@ test('dashboardState reads the shared state without changing it', (t) => {
   assert.equal(landed.dashboardState().lastSweepAt, 1234);
   assert.equal(JSON.stringify(landed.loadState()), before);
 });
+
+test('the landed scheduler asks the account policy for the model it will call, and a rules-only run is never deferred', () => {
+  const landed = require('./landed.js');
+  const asked = [];
+  const deferred = () => { throw Object.assign(new Error('automation pool exhausted'), { code: 'ACCOUNT_DEFERRED', retryAt: 1 }); };
+  const ok = (purpose, _env, _api, options) => { asked.push([purpose, options.model]); return { env: { PICKED: '1' } }; };
+  assert.deepEqual(landed.schedulerEnv({ judge: 'haiku', closeDry: false }, { automationEnv: ok }), { PICKED: '1' });
+  assert.deepEqual(landed.schedulerEnv({ judge: 'rules', closeDry: true, shadowJudge: 'claude-sonnet-5' }, { automationEnv: ok }), { PICKED: '1' });
+  assert.deepEqual(asked, [['landed', 'claude-haiku-4-5-20251001'], ['landed', 'claude-sonnet-5']]);
+  // Rules only: no model runs, so a spent pool does not stop it.
+  assert.equal(landed.judgeModel({ judge: 'rules', closeDry: false }), null);
+  assert.equal(landed.schedulerEnv({ judge: 'rules', closeDry: false }, { automationEnv: deferred }).KEEP_RUN, '1');
+  // A run that would call a model is deferred.
+  assert.throws(() => landed.schedulerEnv({ judge: 'veto', closeDry: false }, { automationEnv: deferred }), { code: 'ACCOUNT_DEFERRED' });
+});

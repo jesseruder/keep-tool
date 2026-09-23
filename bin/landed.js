@@ -773,7 +773,8 @@ function judgePrompt(entryText, task) {
 function runModel(prompt, model, timeout = MODEL_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const sessionId = crypto.randomUUID();
-    const env = summarize.automationEnv('landed').env;
+    // Model-aware: a spent Fable bucket must not stop a Haiku judge.
+    const env = summarize.automationEnv('landed', process.env, undefined, { model: resolveModel(model) }).env;
     delete env.CLAUDE_CODE_SESSION_ID;
     delete env.KEEP_PI_SESSION_ID;
     let child;
@@ -1364,6 +1365,25 @@ function schedulerInterval() {
   return Number.isFinite(value) && value > 0 ? value * 60e3 : DEFAULT_INTERVAL_MIN * 60e3;
 }
 
+// The model a `keep landed` run will call with this config, or null for a rules-only run.
+function judgeModel(config = loadConfig()) {
+  if (config.closeDry) return config.shadowJudge || null;
+  return config.judge === 'haiku' || config.judge === 'veto' ? 'haiku' : null;
+}
+
+// The environment the daemon runs `keep landed` in, on the account the policy picks
+// for the model it will call. A rules-only run calls no model, so a spent pool does
+// not stop it; a run that would call one is deferred (the throw below).
+function schedulerEnv(config = loadConfig(), deps = {}) {
+  const model = judgeModel(config);
+  const automationEnv = deps.automationEnv || summarize.automationEnv;
+  try { return automationEnv('landed', process.env, undefined, model ? { model: resolveModel(model) } : {}).env; }
+  catch (error) {
+    if (error && error.code === 'ACCOUNT_DEFERRED' && !model) return { ...process.env, KEEP_RUN: '1' };
+    throw error;
+  }
+}
+
 function startScheduler({ onChange } = {}) {
   let running = false;
   let interval = null;
@@ -1372,7 +1392,7 @@ function startScheduler({ onChange } = {}) {
     running = true;
     try {
       childProcess.execFile(process.execPath, [path.join(__dirname, 'keep.js'), 'landed'], {
-        env: summarize.automationEnv('landed').env,
+        env: schedulerEnv(),
         // 8 shadow calls × 90 s = 12 min worst case, well inside 30 minutes.
         timeout: DAEMON_TIMEOUT_MS,
         maxBuffer: 4 << 20,
@@ -1407,6 +1427,8 @@ function startScheduler({ onChange } = {}) {
 }
 
 module.exports = {
+  judgeModel,
+  schedulerEnv,
   DEFAULT_CONFIG,
   JUDGE_PROMPT_VERSION,
   SHADOW_LIMIT,
