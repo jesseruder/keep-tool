@@ -366,7 +366,9 @@ test('the ideas sweep resolves its own automation account, falling back to the d
   const bare = accountsFixture(null);
   try {
     assert.equal(ideas.ideasAccountId(configured.env), 'claude-secondary');
-    assert.equal(ideas.ideasAccountId(bare.env), 'claude-default', 'no `ideas` purpose still resolves');
+    // No `ideas` purpose still resolves: to the automation pool, which leaves out the
+    // interactive default.
+    assert.equal(ideas.ideasAccountId(bare.env), 'claude-secondary', 'no `ideas` purpose still resolves');
     assert.equal(ideas.ideasAccountId({ KEEP_CONFIG: path.join(bare.root, 'nope.json') }), 'claude/default',
       'with no accounts configured at all it still names the built-in account, never nothing');
   } finally {

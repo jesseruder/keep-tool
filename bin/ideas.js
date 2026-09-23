@@ -551,9 +551,10 @@ function captureModelOutput(child, timeoutMs = MODEL_TIMEOUT_MS, deps = {}) {
   });
 }
 
-function runModel(prompt, model) {
+function runModel(prompt, model, accountId) {
   const sessionId = crypto.randomUUID();
-  const env = summarize.automationEnv('ideas').env;
+  // The account the budget was just checked against, so the two cannot disagree.
+  const env = summarize.automationEnv('ideas', process.env, undefined, { model, ...(accountId ? { accountId } : {}) }).env;
   delete env.CLAUDE_CODE_SESSION_ID;
   delete env.KEEP_PI_SESSION_ID;
   try {
@@ -605,18 +606,30 @@ function cachedBudget(root) {
 
 // The sweep spends against a real Claude account, so it has to name one: with more
 // than one configured an unpinned budget read is code 8 and the sweep never runs.
-// Falls back to automationAccounts.claude and then the default, so no config change
-// is needed to keep working.
-function ideasAccountId(env = process.env) {
-  try { return require('./accounts.js').automationFor('claude', 'ideas', env).id; }
-  catch { return undefined; }
+// The account comes from bin/account-budget.js: `automationAccounts.ideas` while it
+// has room for the model, else the automation pool's best account; with no pool,
+// automationAccounts.claude and then the default, so no config change is needed.
+function ideasAccountChoice(env = process.env, model) {
+  try { return require('./account-budget.js').select({ purpose: 'ideas', model, env }); }
+  catch { return { account: undefined }; }
+}
+function ideasAccountId(env = process.env, model) {
+  const choice = ideasAccountChoice(env, model);
+  return choice.deferred ? undefined : choice.account || undefined;
 }
 
 async function run({ now = Date.now(), dry = false, model, accountId } = {}) {
   now = Number(now);
   if (!Number.isFinite(now)) throw new Error('ideas sweep needs a valid time');
   model = model || process.env.KEEP_IDEAS_MODEL || 'fable';
-  const budget = review.reviewBudget(model, cachedBudget(keep.ROOT), accountId === undefined ? ideasAccountId() : accountId);
+  if (accountId === undefined) {
+    const choice = ideasAccountChoice(process.env, model);
+    // Every pool account's window is spent: the governor's own "exhausted" (6), a
+    // healthy skip that retries on the sweep's schedule.
+    if (choice.deferred) return { skipped: 'budget', reason: choice.reason, code: 6, retryAt: choice.retryAt };
+    accountId = choice.account;
+  }
+  const budget = review.reviewBudget(model, cachedBudget(keep.ROOT), accountId);
   if (budget.code !== 0) return { skipped: 'budget', reason: budget.reason, code: budget.code };
   const evidence = buildEvidence({ now, root: keep.ROOT });
   const prompt = buildPrompt(evidence, now);
@@ -633,7 +646,7 @@ async function run({ now = Date.now(), dry = false, model, accountId } = {}) {
   if (!claimed) return { skipped: 'in progress' };
 
   try {
-    const raw = await runModel(prompt, model);
+    const raw = await runModel(prompt, model, accountId);
     const ideas = parseIdeas(raw, allCardIds());
     const existing = loadTasks(keep.ROOT, true).filter((task) => task.fm.kind === 'idea');
     const titles = new Set(existing.map((task) => normalizeSweepTitle(task.fm.title)).filter(Boolean));

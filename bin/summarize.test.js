@@ -7,7 +7,7 @@ const { headlessSettingsArgs, automationEnv } = require('./summarize.js');
 const { profileEnvironment } = require('./agent-launcher.js');
 const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm'), { EventEmitter } = require('node:events');
 
-function fixture(run, failSpawn = false) {
+function fixture(run, failSpawn = false, extra = {}) {
   const files = new Map(), children = [], removed = [], directories = [];
   const fakeFs = { existsSync: () => true, mkdirSync() {},
     mkdtempSync(prefix) { const dir = prefix + directories.length; directories.push(dir); return dir; },
@@ -16,8 +16,9 @@ function fixture(run, failSpawn = false) {
     writeFileSync(file, value) { files.set(file, value); },
     renameSync(from, to) { files.set(to, files.get(from)); files.delete(from); },
   };
-  const context = vm.createContext({ module: { exports: {} }, process: { pid: 123, env: { KEEP_DIR: '/unrelated-keep-registry', CLAUDE_CODE_SESSION_ID: 'parent', CODEX_THREAD_ID: 'parent', KEEP_TASK: 'unrelated-card', ANTHROPIC_API_KEY: 'test-key' }, stderr: { write() {} } }, setTimeout: () => 1, clearTimeout() {},
-    require: name => name === 'fs' ? fakeFs : name === './keep.js' ? { ROOT: '/unrelated-keep-checkout' } : name === 'child_process' ? {
+  const context = vm.createContext({ module: { exports: {} }, process: { pid: 123, env: { KEEP_DIR: '/unrelated-keep-registry', CLAUDE_CODE_SESSION_ID: 'parent', CODEX_THREAD_ID: 'parent', KEEP_TASK: 'unrelated-card', ANTHROPIC_API_KEY: 'test-key' }, stderr: { write() {} } }, setTimeout: extra.setTimeout || (() => 1), clearTimeout() {},
+    ...(extra.Date ? { Date: extra.Date } : {}),
+    require: name => name === './account-budget.js' && extra.budget ? extra.budget : name === 'fs' ? fakeFs : name === './keep.js' ? { ROOT: '/unrelated-keep-checkout' } : name === 'child_process' ? {
       spawn(cmd, args, options) {
         if (failSpawn) throw Error('spawn failed');
         const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
@@ -72,6 +73,55 @@ test('synchronous spawn failures also clean their temporary directory', () => fi
   summary.getSummary('failed', 'source', 'instruction');
   assert.deepEqual(removed, directories);
 }, true));
+
+test('a job the account policy defers waits in the queue for the reset instead of being spawned', () => {
+  let clock = 1_800_000_000_000;
+  const retryAt = clock + 5 * 3600e3;
+  let spent = true;
+  const selections = [];
+  class AccountDeferredError extends Error {
+    constructor(choice) { super(choice.reason); this.code = 'ACCOUNT_DEFERRED'; this.retryAt = choice.retryAt; }
+  }
+  const budget = {
+    AccountDeferredError,
+    select: (options) => {
+      selections.push(options.purpose);
+      return spent ? { account: null, deferred: true, retryAt, reason: 'automation pool exhausted' }
+        : { account: 'claude/default', record: { id: 'claude/default', label: 'Default', agent: 'claude', configDir: '/profiles/default' } };
+    },
+  };
+  const timers = [];
+  fixture(({ summary, children, directories }) => {
+    summary.getSummary('deferred', 'source text', 'Summarize');
+    assert.equal(children.length, 0, 'nothing was spawned into a spent pool');
+    assert.equal(directories.length, 0, 'not even a work directory');
+    assert.deepEqual(selections, ['summarize']);
+    assert.equal(timers.length, 1, 'a wake-up is set for the reset');
+    assert.equal(timers[0].delay, 3600e3, 'capped at an hour, then re-armed');
+
+    // A repeat request refreshes the waiting job; it is neither failed nor doubled.
+    summary.getSummary('deferred', 'source text, newer', 'Summarize');
+    assert.equal(children.length, 0);
+
+    // Before the reset a wake-up re-arms without asking the policy again.
+    clock += 3600e3;
+    timers.shift().fn();
+    assert.equal(children.length, 0);
+    assert.deepEqual(selections, ['summarize']);
+
+    // At the reset the job runs, once, with the newest source.
+    spent = false;
+    clock = retryAt;
+    timers.at(-1).fn();
+    assert.equal(children.length, 1);
+    assert.match(children[0].args[children[0].args.indexOf('-p') + 1], /source text, newer/);
+    assert.deepEqual(selections, ['summarize', 'summarize']);
+  }, false, {
+    Date: { now: () => clock },
+    setTimeout: (fn, delay) => { timers.push({ fn, delay }); return { unref() {} }; },
+    budget,
+  });
+});
 
 test('previous-title feedback does not invalidate an unchanged source after the cooldown', () => fixture(({ summary, children }) => {
   const { liveTitle } = require('./titles');

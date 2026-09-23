@@ -577,7 +577,9 @@ function classify(prompt, model, deps = {}) {
   return new Promise((resolve, reject) => {
     const sessionId = (deps.randomUUID || crypto.randomUUID)();
     const inheritedEnv = deps.env || process.env;
-    const selected = (deps.automationEnv || summarize.automationEnv)('slack', inheritedEnv, deps.accountApi);
+    // A spent automation pool throws here, before anything is spawned, and the
+    // promise rejects with the reset time rather than a classifier "exited 1".
+    const selected = (deps.automationEnv || summarize.automationEnv)('slack', inheritedEnv, deps.accountApi, { model });
     const env = { ...selected.env };
     for (const key of ['CLAUDE_CODE_SESSION_ID', 'CLAUDE_PROJECT_DIR', 'CLAUDECODE',
       'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'KEEP_SESSION_ID', 'KEEP_TASK', 'OLDPWD']) delete env[key];

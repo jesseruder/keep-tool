@@ -28,7 +28,7 @@ const HEALTH_NAME = 'account-budget';
 function review() { return require('./review.js'); }
 function staleMs() { return review().USAGE_STALE_MS || 30 * 60e3; }
 
-function defaultRoot(env = process.env) { return env.KEEP_DIR || path.join(os.homedir(), 'keep'); }
+function defaultRoot(env = process.env) { return env.KEEP_DIR || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'); }
 
 function readUsageCache(root = defaultRoot()) {
   try { return JSON.parse(fs.readFileSync(path.join(root, '.keep', 'usage-cache.json'), 'utf8')); }
