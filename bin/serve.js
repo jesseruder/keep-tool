@@ -4114,6 +4114,13 @@ async function cachedRemoteSession(node, sessionId, deps = {}) {
 // fails is no signal (null).
 const remotePiEventCache = new Map(); // `${node}\0${sessionId}` -> { at, event, pending }
 
+// What the last read of that phase said, without asking (undefined before any read
+// answered): a listing whose read runs past its budget publishes this meanwhile.
+function peekRemotePiEvent(node, sessionId) {
+  const entry = remotePiEventCache.get(`${node}\0${sessionId}`);
+  return entry && entry.at ? entry.event : undefined;
+}
+
 async function cachedRemotePiEvent(node, sessionId, deps = {}) {
   const key = `${node}\0${sessionId}`;
   let entry = remotePiEventCache.get(key);
@@ -4164,6 +4171,11 @@ async function remoteSessionFreshness(panes, deps = {}, { skipNodes = null } = {
       // A Pi session on a node has no transcript row here: what the node gives is its
       // phase, which the host-only row (backfillHostSessions) takes its turn state from.
       if (pane.meta.agent === 'pi') {
+        // The last answer first, so a node read slower than the budget below leaves
+        // the row on its cached phase this cycle rather than on none; the read, when
+        // it lands in time, replaces it.
+        const cached = (deps.peekRemotePiEvent || peekRemotePiEvent)(pane.node, id);
+        if (cached !== undefined) out[id] = { id, kind: 'pi', node: pane.node, piEvent: cached || null };
         const piEvent = await (deps.cachedRemotePiEvent || cachedRemotePiEvent)(pane.node, id, deps);
         out[id] = { id, kind: 'pi', node: pane.node, piEvent: piEvent || null };
         return;

@@ -486,6 +486,29 @@ test('a Pi pane on a node gets its turn state from the phase file its node reads
   } finally { f.cleanup(); }
 });
 
+test('a Pi phase read slower than the listing budget publishes the cached phase meanwhile, and the next cycle the fresh one', async () => {
+  const f = piFixture('aws9', 'pi-remote-3');
+  try {
+    const first = await serve.remoteSessionFreshness([f.pane], f.deps);
+    assert.equal(first['pi-remote-3'].piEvent.phase, 'running');
+    // The node now answers late: past the listing's budget.
+    f.advance(3000);
+    f.setEvent({ id: 'pi-remote-3', phase: 'settled', at: new Date().toISOString() });
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const slow = { ...f.deps, hostRemoteListTimeoutMs: 20,
+      hostRequest: async (...args) => { await gate; return f.deps.hostRequest(...args); } };
+    const late = await serve.remoteSessionFreshness([f.pane], slow);
+    assert.equal(late['pi-remote-3'].piEvent.phase, 'running', 'the cached phase, not no row');
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // The read finished into the cache: the next cycle has it without asking again.
+    const next = await serve.remoteSessionFreshness([f.pane], f.deps);
+    assert.equal(next['pi-remote-3'].piEvent.phase, 'settled');
+    assert.equal(f.asked.length, 2);
+  } finally { f.cleanup(); }
+});
+
 test('piEventFor reads the registry on the daemon node and the node otherwise, and a failed node read is no signal', async () => {
   const f = piFixture('aws8', 'pi-remote-2');
   try {
