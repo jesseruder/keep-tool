@@ -201,12 +201,16 @@ test('a fresh Codex on aws1 that binds its pane late is adopted by the daemon, a
     // because Codex names its session only at its first submitted turn.
     const remote = await connect({ node: 'aws1' });
     let paneId;
+    const paneLaunchedAt = Date.now();
     try {
       paneId = (await remote.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 30'], cwd: fleet.project, meta: {
         agent: 'codex', accountId: 'codex-node', node: 'aws1', project: fleet.project, openRequestId: 'open-late-1',
-        launchedAt: Date.now(), opener: { kind: 'owner' },
+        launchedAt: paneLaunchedAt, opener: { kind: 'owner' },
       } })).pane.id;
     } finally { remote.close(); }
+    // What openSession records when it spawns such a pane (bin/serve.test.js runs the real one).
+    require('./late-adoption.js').recordNodeCodexLaunch(fleet.registry, { node: 'aws1', requestId: 'open-late-1',
+      accountId: 'codex-node', launchedAt: paneLaunchedAt, pane: paneId, project: fleet.project });
 
     const tokenFile = path.join(fleet.root, 'node-api-token');
     fs.writeFileSync(tokenFile, 'aws1-api-secret\n', { mode: 0o600 });

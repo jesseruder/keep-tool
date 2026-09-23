@@ -10,9 +10,9 @@
 // refused outright.
 //
 // A node acts only for itself: the session it names must be one the durable
-// location record places on that node, and a pane it names must be on it. A session
-// with no location record at all whose one live pane on the caller names it is
-// adopted first (bin/late-adoption.js).
+// location record places on that node, and a pane it names must be on it. A fresh
+// Codex open of the daemon's with no location record yet, whose pane on the caller
+// now names it, is adopted first (bin/late-adoption.js).
 //
 // Every request carries an idempotency key. A "started" record is journalled under
 // .keep/registry-ops before the command is spawned and replaced by the response
@@ -149,6 +149,7 @@ function createRegistryService(options = {}) {
   const lateAdoption = options.lateAdoption || require('./late-adoption.js').createLateAdoption({
     root, env: { ...baseEnv, KEEP_CONFIG: configFile }, now, nodes, daemonNode, location, log,
     ...(options.hostConnect ? { hostConnect: options.hostConnect } : {}),
+    ...(options.locatedLocally ? { locatedLocally: options.locatedLocally } : {}),
   });
   const pidAlive = options.pidAlive || ((pid) => {
     try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }

@@ -601,13 +601,22 @@ const lateCodexPane = (meta = {}, extra = {}) => ({
     openRequestId: 'req-1', launchedAt: 1_700_000_000_000, opener: { kind: 'owner' }, ...meta },
 });
 
-function adoptingService(t, panes, extra = {}) {
+// The daemon's record of the fresh open that spawned lateCodexPane, as openSession writes it.
+function recordLateLaunch(root, now, extra = {}) {
+  require('./late-adoption.js').recordNodeCodexLaunch(root, { node: 'aws1', requestId: 'req-1', accountId: 'codex-node',
+    launchedAt: 1_700_000_000_000, pane: 'p7', project: '/home/node/project', ...extra }, { now });
+}
+
+function adoptingService(t, panes, options = {}) {
+  const { noLaunch, ...extra } = options;
   const root = tempDir(t);
   const configFile = path.join(root, 'config.json');
   fs.mkdirSync(path.join(root, 'codex-home'));
+  fs.mkdirSync(path.join(root, 'claude-home'));
   fs.writeFileSync(configFile, `${JSON.stringify({ version: 1, daemonNode: 'main', nodes: { main: {}, aws1: {} },
-    accounts: [{ id: 'codex-node', label: 'Node codex', agent: 'codex', configDir: path.join(root, 'codex-home') }],
-    defaultAccounts: { codex: 'codex-node' } })}\n`);
+    accounts: [{ id: 'codex-node', label: 'Node codex', agent: 'codex', configDir: path.join(root, 'codex-home') },
+      { id: 'claude-node', label: 'Node claude', agent: 'claude', configDir: path.join(root, 'claude-home') }],
+    defaultAccounts: { codex: 'codex-node', claude: 'claude-node' } })}\n`);
   const env = { PATH: '/usr/bin:/bin', HOME: root, LANG: 'C', KEEP_CONFIG: configFile };
   const accounts = require('./accounts.js');
   const host = fakeNodeHost(panes);
@@ -619,7 +628,8 @@ function adoptingService(t, panes, extra = {}) {
     location: (id) => accounts.sessionLocation(id, { root, env }),
     hostConnect: host.connect, log: (line) => logged.push(line), ...extra,
   });
-  return { svc, root, host, logged, calls: fake.calls, tick: (ms) => { clock += ms; }, env };
+  if (!noLaunch) recordLateLaunch(root, () => clock);
+  return { svc, root, host, logged, calls: fake.calls, tick: (ms) => { clock += ms; }, env, now: () => clock };
 }
 
 const lateBody = (root, extra = {}) => body(root, { session: 'codex-late', agent: 'codex', pane: 'p7@aws1', ...extra });
@@ -722,4 +732,58 @@ test('no pane naming the session yet is never remembered: the node\'s own bind l
   const adopted = await svc.handle(AWS1, lateBody(root));
   assert.equal(adopted.status, 200, JSON.stringify(adopted.body));
   assert.equal(host.asked, 3);
+});
+
+test('late adoption refuses a session this machine knows, one with any daemon pane record, and a pane whose open the daemon never recorded', async (t) => {
+  const refusedAs = async (name, service, extra = {}) => {
+    const answer = await service.svc.handle(AWS1, lateBody(service.root, extra));
+    assert.equal(answer.status, 403, `${name}: ${JSON.stringify(answer.body)}`);
+    assert.equal(answer.body.error, 'session codex-late is not on node aws1', name);
+    assert.equal(fs.existsSync(path.join(service.root, '.keep', 'session-accounts')), false, `${name}: nothing pinned`);
+  };
+  // A Claude transcript of that id in one of this machine's accounts, found by discovery.
+  const claude = adoptingService(t, [lateCodexPane()]);
+  fs.mkdirSync(path.join(claude.root, 'claude-home', 'projects', 'p'), { recursive: true });
+  fs.writeFileSync(path.join(claude.root, 'claude-home', 'projects', 'p', 'codex-late.jsonl'), '{}\n');
+  await refusedAs('a local Claude transcript', claude);
+  // A rollout of that id under one of this machine's Codex accounts.
+  const codex = adoptingService(t, [lateCodexPane()]);
+  const day = new Date();
+  const dir = path.join(codex.root, 'codex-home', 'sessions', String(day.getFullYear()),
+    String(day.getMonth() + 1).padStart(2, '0'), String(day.getDate()).padStart(2, '0'));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'rollout-2026-01-01T00-00-00-codex-late.jsonl'), '{}\n');
+  await refusedAs('a local rollout', codex);
+  // A daemon pane record, even one naming this node.
+  const recorded = adoptingService(t, [lateCodexPane()]);
+  fs.mkdirSync(path.join(recorded.root, '.keep', 'panes'), { recursive: true });
+  fs.writeFileSync(path.join(recorded.root, '.keep', 'panes', 'codex-late.json'), JSON.stringify({ pane: 'p7@aws1', node: 'aws1', agent: 'codex' }));
+  await refusedAs('a daemon pane record', recorded);
+  // No launch record at all, or one that does not match the pane's launch facts.
+  await refusedAs('no launch record', adoptingService(t, [lateCodexPane()], { noLaunch: true }));
+  for (const [name, facts] of [['another launch time', { launchedAt: 1_700_000_000_001 }], ['another pane', { pane: 'p8' }],
+    ['another account', { accountId: 'codex-other' }]]) {
+    const service = adoptingService(t, [lateCodexPane()], { noLaunch: true });
+    recordLateLaunch(service.root, service.now, facts);
+    await refusedAs(name, service);
+  }
+  const otherNode = adoptingService(t, [lateCodexPane()], { noLaunch: true });
+  recordLateLaunch(otherNode.root, otherNode.now, { node: 'aws2' });
+  await refusedAs('a launch on another node', otherNode);
+  // A pane with no open request id: not a fresh open.
+  await refusedAs('no open request', adoptingService(t, [lateCodexPane({ openRequestId: undefined })]));
+  // A launch older than a day.
+  const stale = adoptingService(t, [lateCodexPane()]);
+  stale.tick(require('./late-adoption.js').LAUNCH_TTL_MS + 1);
+  await refusedAs('a launch record past its day', stale);
+  // A Claude session is never adopted: it is registered at its launch.
+  const claudeSession = adoptingService(t, [lateCodexPane({ agent: 'claude', accountId: 'claude-node' })]);
+  assert.equal((await claudeSession.svc.handle(AWS1, lateBody(claudeSession.root, { agent: 'claude' }))).status, 403);
+  assert.equal(claudeSession.host.asked, 0);
+});
+
+test('a launch record adopts one session, once', async (t) => {
+  const { svc, root } = adoptingService(t, [lateCodexPane()]);
+  assert.equal((await svc.handle(AWS1, lateBody(root))).status, 200);
+  assert.equal(require('./late-adoption.js').readNodeCodexLaunch(root, 'aws1', 'req-1', { now: () => 1_800_000_000_000 }), null, 'consumed');
 });

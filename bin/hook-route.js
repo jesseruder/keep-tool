@@ -13,10 +13,11 @@
 // A node acts only for a session the location record places on it with the agent the
 // event is for (a Claude event for a Claude session, a codex-* event for a Codex
 // one, whose mirror is its rollout), only on that session's mirror, and only with a
-// pane on itself. A session with no location record whose one live pane on the
-// caller names it is adopted first (bin/late-adoption.js). The run goes through the
-// registry route's journal (bin/registry-route.js), so a resent event replays its
-// answer instead of running again, and a restart waits for it. The transcript
+// pane on itself. A fresh Codex open of the daemon's with no location record yet,
+// whose pane on the caller now names it, is adopted first (bin/late-adoption.js).
+// The run goes through the registry route's journal (bin/registry-route.js), so a
+// resent event replays its answer instead of running again, and a restart waits for
+// it. The transcript
 // append is outside the journal and needs none: a post must start where the mirror
 // ends, so a resend of bytes already appended writes nothing and says where to go on.
 const crypto = require('node:crypto');

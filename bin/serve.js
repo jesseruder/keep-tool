@@ -10324,6 +10324,19 @@ async function openSession(body, deps = {}) {
   const target = { pane: launch.pane };
   let launchPrepared = false;
   try {
+    // A fresh Codex on another node may name its session only at its first turn, after
+    // this open has returned pending: the daemon's record of the launch is what lets the
+    // hook and registry routes adopt it then (bin/late-adoption.js).
+    if (allowPendingRegistration && !launch.sessionId && launchNode !== nodes.daemonNode(deps.env || process.env)) {
+      try {
+        (deps.recordNodeCodexLaunch || require('./late-adoption.js').recordNodeCodexLaunch)(deps.root || keep.ROOT, {
+          node: launchNode, requestId: body.requestId, accountId: account.id, launchedAt,
+          pane: nodes.parsePaneRef(launch.pane, { env: deps.env || process.env }).paneId, project,
+        });
+      } catch (error) {
+        process.stderr.write(`keep serve: could not record the Codex launch in ${launch.pane}: ${error.message}\n`);
+      }
+    }
     if (launch.sessionId) {
       (deps.pinSession || accounts.pinSession)(launch.sessionId, agent, account.id,
         { root: deps.root || keep.ROOT, env: deps.env || process.env, node: launchNode });

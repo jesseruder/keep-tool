@@ -1288,6 +1288,9 @@ function adoptingServices(t, panes, overrides = {}) {
     },
   });
   const hooks = createHookService({ root, registry });
+  // The daemon's record of the fresh open that spawned latePane, as openSession writes it.
+  require('./late-adoption.js').recordNodeCodexLaunch(root, { node: 'aws1', requestId: 'req-1', accountId: 'codex-node',
+    launchedAt: 1_700_000_000_000, pane: 'p2', project: '/home/node/project' }, { now: () => clock });
   return { root, hooks, host, calls: fake.calls, logged, env, tick: (ms) => { clock += ms; } };
 }
 
@@ -1322,14 +1325,15 @@ test('a Codex hook for a session the daemon never heard register is adopted from
   assert.equal(host.asked, 1);
 });
 
-test('a Claude hook is adopted the same way, from a Claude pane', async (t) => {
-  const { root, hooks, env } = adoptingServices(t, [latePane({ agent: 'claude', accountId: 'claude-node', sessionId: 'sess-late' })]);
+test('a Claude hook is never adopted, even from a Claude pane: a Claude session on a node is registered at its launch', async (t) => {
+  const { root, hooks, host } = adoptingServices(t, [latePane({ agent: 'claude', accountId: 'claude-node', sessionId: 'sess-late' })]);
   const answer = await hooks.handle(AWS1, body({
     input: { session_id: 'sess-late', transcript_path: '/home/node/.claude/projects/p/sess-late.jsonl', cwd: '/home/node/project', hook_event_name: 'Stop', stop_hook_active: false },
     identity: { agent: 'claude', sessionId: 'sess-late', pane: 'p2@aws1' },
   }));
-  assert.equal(answer.status, 200, JSON.stringify(answer.body));
-  assert.equal(require('./accounts.js').sessionLocation('sess-late', { root, env }).agent, 'claude');
+  assert.equal(answer.status, 403);
+  assert.equal(host.asked, 0);
+  assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts')), false);
 });
 
 test('a late hook is refused as before for a pane of another agent, two panes, an unknown account, and within five seconds of a refusal', async (t) => {

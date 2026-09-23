@@ -16046,7 +16046,7 @@ const FAKE_CODEX = [
   '',
 ].join('\n');
 
-async function openCodexOnAws1(t, ids) {
+async function openCodexOnAws1(t, ids, after = null) {
   const { withTwoNodeFleet } = require('./fixtures/two-node-hosts.js');
   const { closeHostClient } = require('./serve');
   const { connect } = require('./hostclient.js');
@@ -16097,6 +16097,7 @@ async function openCodexOnAws1(t, ids) {
         authority: (id) => { try { return JSON.parse(fs.readFileSync(path.join(registry, '.keep', 'session-accounts', `${id}.json`), 'utf8')); } catch { return null; } },
       };
       outcome.authorities = ids.map((id) => outcome.authority(id));
+      if (after) outcome.after = await after({ opened, registry, env, aws1, paneId, connect });
     } finally { await closeHostClient(); }
   });
   return outcome;
@@ -16112,6 +16113,32 @@ test('a fresh Codex opened on aws1 is registered from the rollout its pane began
   assert.equal(authorities[0].node, 'aws1', 'the account record places it on aws1');
   assert.equal(authorities[0].accountId, 'codex-node');
   assert.equal(paneMeta.sessionId, id, 'the pane on aws1 names it');
+});
+
+test('a fresh Codex on aws1 left pending is adopted later by the routes from the launch the open recorded, once its pane is bound', async (t) => {
+  const lateId = 'dddddddd-1111-2222-3333-444444444444';
+  const { error, opened, after } = await openCodexOnAws1(t, [], async ({ registry, env, paneId, connect }) => {
+    const lateAdoption = require('./late-adoption.js');
+    const meta = (await (async () => {
+      const client = await connect({ node: 'aws1' });
+      try { return (await client.request('get', { pane: paneId })).pane.meta; } finally { client.close(); }
+    })());
+    const launch = lateAdoption.readNodeCodexLaunch(registry, 'aws1', meta.openRequestId);
+    // The node's own late bind at the first turn.
+    const client = await connect({ node: 'aws1' });
+    try { await client.request('meta', { pane: paneId, patch: { sessionId: lateId, agent: 'codex', project: meta.project } }); }
+    finally { client.close(); }
+    const adoption = lateAdoption.createLateAdoption({ root: registry, env: { ...process.env, ...env }, daemonNode: () => 'main' });
+    const adopted = await adoption.adopt('aws1', lateId, 'codex', { pane: `${paneId}@aws1` });
+    return { launch, meta, adopted, again: lateAdoption.readNodeCodexLaunch(registry, 'aws1', meta.openRequestId) };
+  });
+  assert.equal(error, null, error && error.stack);
+  assert.equal(opened.pendingRegistration, true);
+  assert.equal(after.launch.openRequestId, 'open-codex-1', 'the open recorded its launch');
+  assert.equal(after.launch.launchedAt, after.meta.launchedAt);
+  assert.equal(after.launch.accountId, 'codex-node');
+  assert.equal(after.adopted.adopted, true, JSON.stringify(after.adopted));
+  assert.equal(after.again, null, 'used once');
 });
 
 test('a fresh Codex on aws1 whose launch began no rollout, or two, is not adopted and stays pending', async (t) => {
