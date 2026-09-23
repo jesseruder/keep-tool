@@ -3941,6 +3941,74 @@ function claudeSessionFromTail(id, tail, options = {}) {
   return options.node ? { ...session, node: options.node } : session;
 }
 
+// ---------- a node session's freshness, for the publication ----------
+//
+// The console's idle and attention states and the stalled detector read a row's
+// size, mtime and endedTurn. A local row has them from its transcript; a row for a
+// pane on another node gets them from that node: a `stat` every listing cycle (at
+// most once per 2.5 s per session, the process rows' cache), and a `tail` only when
+// the stat says the transcript changed. Only for a Claude pane whose session the
+// authority record places on the node that lists it. A node that does not answer
+// leaves its rows as they were, without a transcript size.
+const REMOTE_TRANSCRIPT_CACHE_MS = PROCESS_ROWS_CACHE_MS;
+const REMOTE_TRANSCRIPT_CACHE_LIMIT = 512;
+const remoteTranscriptCache = new Map(); // `${node}\0${sessionId}` -> { at, stat, tail, accountId, pending }
+
+async function cachedRemoteSession(node, sessionId, deps = {}) {
+  const key = `${node}\0${sessionId}`;
+  let entry = remoteTranscriptCache.get(key);
+  if (!entry) {
+    entry = { at: 0, stat: null, tail: null, accountId: null, pending: null };
+    remoteTranscriptCache.set(key, entry);
+    while (remoteTranscriptCache.size > REMOTE_TRANSCRIPT_CACHE_LIMIT) {
+      remoteTranscriptCache.delete(remoteTranscriptCache.keys().next().value);
+    }
+  }
+  const now = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
+  const model = () => claudeSessionFromTail(sessionId, entry.tail, { root: deps.root || keep.ROOT, accountId: entry.accountId, node });
+  if (entry.tail && now - entry.at < REMOTE_TRANSCRIPT_CACHE_MS) return model();
+  if (!entry.pending) {
+    entry.pending = (async () => {
+      const session = { id: sessionId, kind: 'claude', node };
+      const client = nodeTranscript(node, session, deps);
+      const stat = await client.stat();
+      const same = entry.tail && entry.stat && stat.size === entry.stat.size
+        && stat.mtimeMs === entry.stat.mtimeMs && stat.generation === entry.stat.generation;
+      if (!same) {
+        const tail = await client.tail();
+        entry.tail = tail;
+        entry.accountId = nodeTranscriptAccount(session, deps).id;
+      }
+      entry.stat = stat;
+      entry.at = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
+    })().finally(() => { entry.pending = null; });
+  }
+  await entry.pending;
+  return model();
+}
+
+// { sessionId: row } for the live Claude panes on other nodes in a listing, or null
+// when there are none (a single-node install always). Each is read in parallel; one
+// whose node does not answer, or whose session is not recorded on the node that lists
+// it, is simply absent.
+async function remoteSessionFreshness(panes, deps = {}) {
+  const env = paneRefEnv(deps);
+  const wanted = (Array.isArray(panes) ? panes : []).filter((pane) => pane && pane.alive
+    && nodes.isRemotePane(pane, env) && pane.meta && pane.meta.agent === 'claude'
+    && typeof pane.meta.sessionId === 'string' && /^[A-Za-z0-9_-]+$/.test(pane.meta.sessionId));
+  if (!wanted.length) return null;
+  const out = {};
+  await Promise.all(wanted.map(async (pane) => {
+    const id = pane.meta.sessionId;
+    try {
+      if (sessionNodeOf({ id }, deps) !== pane.node) return;
+      const session = await (deps.cachedRemoteSession || cachedRemoteSession)(pane.node, id, deps);
+      if (session) out[id] = session;
+    } catch {}
+  }));
+  return Object.keys(out).length ? out : null;
+}
+
 // A remote session's current model, straight off its node: what claudeSessionFor is
 // for a local one. Only Claude so far; a Codex rollout's state needs its first line
 // as well as its tail, which the verb does not yet send, so one is refused by name.
@@ -11403,6 +11471,7 @@ function buildState(options = {}) {
   if (Object.prototype.hasOwnProperty.call(options, 'hostPanes')) {
     backfillHostSessions(sessions, options.hostPanes, {
       tasks,
+      ...(options.nodeSessions ? { nodeSessions: options.nodeSessions } : {}),
       codexSessionFor: options.codexSessionFor || (workerMode ? (id) => dashboardCodexSessionFor(id, {
         accountAuthority: dashboardAccountAuthority,
         hostPanesBySession: panesBySession,
@@ -11842,6 +11911,15 @@ function backfillHostSessions(sessions, panes, deps = {}) {
             : deps.freshClaudeSessionFor || claudeSessionFor);
       let session = null;
       try { session = lookup(id); } catch {}
+      // A session on another node has no transcript here. Its node's own read, taken
+      // for this listing (remoteSessionFreshness), stands in for the local one: size,
+      // mtime, endedTurn and the rest, as a local row has them. Without one the row is
+      // the pane's alone and carries no transcript size, so nothing - the stalled
+      // detector included - judges it by a size nobody read.
+      const remotePane = !session && nodes.isRemotePane(pane, paneRefEnv(deps));
+      const fromNode = remotePane && deps.nodeSessions && Object.prototype.hasOwnProperty.call(deps.nodeSessions, id)
+        ? deps.nodeSessions[id] : null;
+      if (fromNode && fromNode.id === id && fromNode.node === pane.node && fromNode.kind === agent) session = { ...fromNode };
       if (!session) {
         const piEvent = agent === 'pi' ? pi.eventFor(id, path.join(deps.root || keep.ROOT, '.keep', 'pi-events')) : null;
         const piPhase = piEvent?.phase || '';
@@ -11860,6 +11938,7 @@ function backfillHostSessions(sessions, panes, deps = {}) {
             : meta.openingMessage === true ? { toolRunning: true } : {}),
           state: (agent === 'pi' && piPhase === 'running') || meta.openingMessage === true ? 'running' : 'recent',
         };
+        if (remotePane) delete session.size;
       } else {
         session = { ...session };
       }
@@ -13905,6 +13984,9 @@ function start(deps = {}) {
   const dashboardBuild = (options) => dashboardBuilder.build({
     hostPanes: options.hostPanes || [],
     companion: options.companion || null,
+    // Sessions on other nodes, as their nodes read them (remoteSessionFreshness). Only
+    // present when there are any, so a single-node build input is what it always was.
+    ...(options.nodeSessions ? { nodeSessions: options.nodeSessions } : {}),
   });
   const publishedPanes = { panes: null, at: 0, epoch: 0 };
   let lastPaneEpoch = 0;
@@ -13928,7 +14010,9 @@ function start(deps = {}) {
       );
       await reviewQueue.reconcile({ inspectLaunch: (active) => inspectReviewQueueLaunch(active) });
       const companion = await companionSnapshot(deps);
-      return { hostPanes: listed.panes, hostStatus: listed.host, companion, mutationFence: capturedMutationFence };
+      const nodeSessions = await remoteSessionFreshness(listed.panes, deps);
+      return { hostPanes: listed.panes, hostStatus: listed.host, companion, mutationFence: capturedMutationFence,
+        ...(nodeSessions ? { nodeSessions } : {}) };
     },
     // hostStatus rides beside the build input, not inside it: it changes on every
     // second a silent host stays silent, and the worker keys its dedupe on the input.
@@ -14460,6 +14544,7 @@ module.exports = {
   nodeTranscript,
   nodeTranscriptFileForSession,
   deliveryReceiptFor,
+  remoteSessionFreshness,
   remoteSessionRead,
   loadRemoteSession,
   loadSessionForAction,

@@ -214,3 +214,98 @@ test('a send a node cannot confirm is refused before anything is typed', async (
   assert.equal(serve.remoteDeliveryRefusal({ id: 'x', kind: 'codex' }, deps), null, 'a session here is never refused');
   assert.match(serve.remoteDeliveryRefusal({ id: 'x', node: 'aws1' }, deps).message, /a session whose agent is not known on aws1/);
 });
+
+// ---------- a node session's freshness in the publication ----------
+
+function freshnessFixture(node, sid) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-remote-freshness-'));
+  fs.mkdirSync(path.join(root, '.keep', 'session-accounts'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.keep', 'session-accounts', `${sid}.json`), JSON.stringify({
+    version: 1, sessionId: sid, agent: 'claude', accountId: 'claude/default', node,
+  }));
+  let bytes = Buffer.from(claudeTranscript());
+  let mtimeMs = Date.now() - 4000;
+  const asked = [];
+  let silent = false;
+  let clock = Date.now();
+  const hostRequest = async (type, params, options) => {
+    asked.push(type === 'transcript' ? params.op : type);
+    if (silent) throw new Error('host request timed out');
+    if (type === 'hello') return { transcript: 1 };
+    const stat = { path: `/node/home/.claude/projects/-work-project/${sid}.jsonl`, size: bytes.length, mtimeMs, generation: 'g1' };
+    if (params.op === 'stat') return stat;
+    if (params.op === 'tail') return { ...stat, bytes: bytes.toString('base64'), from: 0 };
+    throw new Error('unexpected');
+  };
+  const pane = { id: `p1@${node}`, node, hostPaneId: 'p1', alive: true, agentAlive: true, createdAt: new Date(Date.now() - 3600e3).toISOString(),
+    meta: { agent: 'claude', sessionId: sid, openingMessage: true } };
+  return {
+    root, pane, asked,
+    deps: { root, hostNodes: ['main', node], hostRequest, now: () => clock },
+    advance: (ms) => { clock += ms; },
+    append: (line) => { bytes = Buffer.concat([bytes, Buffer.from(line)]); mtimeMs = Date.now(); },
+    setSilent: (value) => { silent = value; },
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+test('a row for a pane on a node carries its transcript size, mtime and endedTurn from that node', async () => {
+  const f = freshnessFixture('aws6', 'sess-fresh');
+  try {
+    const read = await serve.remoteSessionFreshness([f.pane, { id: 'p9', alive: true, meta: { agent: 'claude', sessionId: 'local-one' } }], f.deps);
+    assert.deepEqual(Object.keys(read), ['sess-fresh'], 'only the pane on another node is asked about');
+    const model = read['sess-fresh'];
+    assert.equal(model.size, Buffer.byteLength(claudeTranscript()));
+    assert.equal(model.endedTurn, true);
+    assert.equal(model.node, 'aws6');
+    assert.deepEqual(f.asked, ['hello', 'stat', 'tail']);
+
+    // Within 2.5 s nothing is asked again; after it, a stat, and a tail only on change.
+    await serve.remoteSessionFreshness([f.pane], f.deps);
+    assert.deepEqual(f.asked, ['hello', 'stat', 'tail']);
+    f.advance(3000);
+    await serve.remoteSessionFreshness([f.pane], f.deps);
+    assert.deepEqual(f.asked, ['hello', 'stat', 'tail', 'stat']);
+    f.advance(3000);
+    f.append(`${JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'next thing' } })}\n`);
+    const changed = (await serve.remoteSessionFreshness([f.pane], f.deps))['sess-fresh'];
+    assert.deepEqual(f.asked.slice(-2), ['stat', 'tail']);
+    assert.equal(changed.endedTurn, false, 'a turn started on the node shows as one here');
+    assert.equal(changed.state, 'running');
+
+    // The row the publication builds from it: the node's size and mtime, not the pane's.
+    const sessions = [];
+    serve.backfillHostSessions(sessions, [f.pane], { root: f.root, hostNodes: ['main', 'aws6'], claudeSessionFor: () => null,
+      nodeSessions: { 'sess-fresh': changed } });
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].size, changed.size);
+    assert.equal(sessions[0].mtime, changed.mtime);
+    assert.equal(sessions[0].endedTurn, false);
+    assert.equal(sessions[0].node, 'aws6');
+    assert.equal(sessions[0].pane, 'p1@aws6');
+    assert.equal(sessions[0].hostOnly, true);
+  } finally { f.cleanup(); }
+});
+
+test('a node that does not answer leaves its row without a transcript size, which is never stalled', async () => {
+  const f = freshnessFixture('aws5', 'sess-silent');
+  try {
+    f.setSilent(true);
+    assert.equal(await serve.remoteSessionFreshness([f.pane], f.deps), null);
+    const sessions = [];
+    serve.backfillHostSessions(sessions, [f.pane], { root: f.root, hostNodes: ['main', 'aws5'], claudeSessionFor: () => null });
+    assert.equal(sessions.length, 1);
+    assert.equal('size' in sessions[0], false, 'no size nobody read');
+    assert.equal(sessions[0].node, 'aws5');
+    // The pane says an opening message is in flight, so the row reads as running; with
+    // no size the stalled detector passes it by however long it has been seen.
+    assert.equal(sessions[0].state, 'running');
+    const { detectStalledSessions } = require('./stalled.js');
+    const observations = { 'sess-silent': { size: 0, at: Date.now() - 24 * 3600e3 } };
+    assert.deepEqual(detectStalledSessions(sessions, Date.now(), { observations }), []);
+    // A pane whose session the authority record does not place on that node is not asked about.
+    const stranger = { ...f.pane, meta: { ...f.pane.meta, sessionId: 'sess-not-recorded' } };
+    f.setSilent(false);
+    assert.equal(await serve.remoteSessionFreshness([stranger], f.deps), null);
+  } finally { f.cleanup(); }
+});
