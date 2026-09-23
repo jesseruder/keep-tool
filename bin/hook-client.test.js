@@ -59,7 +59,8 @@ function fixture(t) {
   const env = (url, extra = {}) => {
     const value = { ...process.env, HOME: home, KEEP_DIR: registry, KEEP_NO_PUSH: '1', KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main',
       KEEP_DAEMON_URL: url, KEEP_NODE_TOKEN_FILE: tokenFile, KEEP_AGENT_ACCOUNT_ID: 'claude-node', ...extra };
-    for (const key of ['CLAUDE_CODE_SESSION_ID', 'KEEP_PANE', 'KEEP_RUN', 'KEEP_CONFIG', 'CODEX_THREAD_ID', 'KEEP_REVIEWER', 'KEEP_HOST_SOCK']) {
+    for (const key of ['CLAUDE_CODE_SESSION_ID', 'KEEP_PANE', 'KEEP_RUN', 'KEEP_CONFIG', 'CODEX_THREAD_ID', 'KEEP_REVIEWER', 'KEEP_HOST_SOCK',
+      'KEEP_AUTO_CONTINUE', 'CLAUDE_CODE_ENTRYPOINT', 'KEEP_DELEGATION_ID']) {
       if (!(key in extra)) delete value[key];
     }
     value.KEEP_HOST_SOCK = path.join(base, 'no-host.sock');

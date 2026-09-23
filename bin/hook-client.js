@@ -46,6 +46,14 @@ const TEXT_CAPS = Object.freeze({ last_assistant_message: 64 * 1024, message: 40
 const KEPT_FIELDS = new Set(['session_id', 'transcript_path', 'cwd', 'hook_event_name', 'stop_hook_active', 'permission_mode',
   'source', 'reason', 'notification_type', 'tool_name', 'agent_id', 'prompt_id', 'tool_use_id']);
 const ACCOUNT_RE = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex|pi)\/default)$/;
+// The session's own environment the daemon's hook reads, and the shape the daemon
+// accepts for each (bin/hook-route.js FORWARDED_ENV). Nothing else is sent.
+const FORWARDED_ENV = Object.freeze({
+  KEEP_REVIEWER: /^(?:0|1|true|false)$/,
+  KEEP_AUTO_CONTINUE: /^(?:0|1|true|false)$/,
+  CLAUDE_CODE_ENTRYPOINT: /^[A-Za-z0-9_.-]{1,128}$/,
+  KEEP_DELEGATION_ID: /^[A-Za-z0-9_-]{1,128}$/,
+});
 
 function stateDir(env = process.env) { return path.join(env.HOME || os.homedir(), '.keep-node'); }
 function cursorFile(env, sid) { return path.join(stateDir(env), 'mirror', `${sid}.json`); }
@@ -119,6 +127,11 @@ function identityOf(input, env, where) {
   const identity = { agent: 'claude', sessionId: input.session_id };
   if (env.KEEP_PANE) identity.pane = nodes.formatPaneRef(where.local, env.KEEP_PANE, env);
   if (ACCOUNT_RE.test(env.KEEP_AGENT_ACCOUNT_ID || '')) identity.accountId = env.KEEP_AGENT_ACCOUNT_ID;
+  const forwarded = {};
+  for (const [key, re] of Object.entries(FORWARDED_ENV)) {
+    if (typeof env[key] === 'string' && re.test(env[key])) forwarded[key] = env[key];
+  }
+  if (Object.keys(forwarded).length) identity.env = forwarded;
   return identity;
 }
 
@@ -379,5 +392,5 @@ function report(env = process.env) {
 
 module.exports = {
   runHook, deliver, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
-  EVENTS, BUDGET_MS, QUEUE_MAX, CHUNK_BYTES, INPUT_MAX_BYTES, TEXT_CAPS,
+  EVENTS, BUDGET_MS, QUEUE_MAX, CHUNK_BYTES, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
 };

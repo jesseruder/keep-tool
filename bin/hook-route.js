@@ -46,6 +46,15 @@ const HOOK_EVENT_NAMES = {
     'UserPromptSubmit', 'Stop', 'SessionStart', 'SessionEnd', 'Interrupt'],
 };
 const PRUNE_EVERY_MS = 60 * 60e3;
+// What the daemon's hook code reads from a session's own environment, forwarded by
+// the node in identity.env: a flag, a short token or an id each, never more. Any
+// other key is dropped; a listed one of another shape refuses the request.
+const FORWARDED_ENV = Object.freeze({
+  KEEP_REVIEWER: /^(?:0|1|true|false)$/,
+  KEEP_AUTO_CONTINUE: /^(?:0|1|true|false)$/,
+  CLAUDE_CODE_ENTRYPOINT: /^[A-Za-z0-9_.-]{1,128}$/,
+  KEEP_DELEGATION_ID: /^[A-Za-z0-9_-]{1,128}$/,
+});
 
 function refuse(status, message) { throw new RegistryError(status, message); }
 
@@ -175,6 +184,14 @@ function validateRequest(body, caller, deps) {
     if (!Number.isSafeInteger(identity.firedAt) || identity.firedAt <= 0) refuse(400, 'identity.firedAt must be a time in milliseconds');
     firedAt = Math.min(identity.firedAt, deps.now ? deps.now() : Date.now());
   }
+  const env = {};
+  if (identity.env !== undefined && identity.env !== null) {
+    if (!isObject(identity.env)) refuse(400, 'identity.env must be an object');
+    for (const [key, re] of Object.entries(FORWARDED_ENV)) {
+      if (identity.env[key] === undefined || identity.env[key] === null) continue;
+      env[key] = matching(identity.env[key], re, `identity.env.${key}`);
+    }
+  }
   let pane = null;
   if (identity.pane !== undefined && identity.pane !== null) {
     if (typeof identity.pane !== 'string') refuse(400, 'invalid pane ref');
@@ -186,13 +203,13 @@ function validateRequest(body, caller, deps) {
   const transcript = cleanTranscript(body.transcript);
   if (event === TRANSCRIPT_ONLY) {
     if (!transcript) refuse(400, 'a transcript post carries a transcript');
-    return { event, sessionId, accountId, pane, transcript, firedAt };
+    return { event, sessionId, accountId, pane, transcript, firedAt, env };
   }
   if (typeof body.idempotencyKey !== 'string' || !KEY_RE.test(body.idempotencyKey)) {
     refuse(400, 'idempotencyKey must be 16-128 letters, digits, _ or -');
   }
   const input = cleanInput(event, body.input, sessionId);
-  return { event, sessionId, accountId, pane, transcript, firedAt, input, idempotencyKey: body.idempotencyKey };
+  return { event, sessionId, accountId, pane, transcript, firedAt, env, input, idempotencyKey: body.idempotencyKey };
 }
 
 // The transcript is left out: its bytes are applied before the journal is read,
@@ -200,7 +217,7 @@ function validateRequest(body, caller, deps) {
 // only a queued resend of an event carries.
 function digestOf(request) {
   return crypto.createHash('sha256').update(`hook:${JSON.stringify([
-    request.event, request.input, request.sessionId, request.pane, request.accountId,
+    request.event, request.input, request.sessionId, request.pane, request.accountId, request.env,
   ])}`).digest('hex');
 }
 
@@ -274,7 +291,10 @@ function createHookService(options = {}) {
         // or not this post carried bytes for it.
         const input = { ...request.input, transcript_path: mirror.paths(root, caller, request.sessionId).file };
         const hookRequest = { ...request, input };
+        // The forwarded session env first, so nothing it names can replace the
+        // route's own variables below it.
         const env = {
+          ...request.env,
           ...shared.childEnv({ session: request.sessionId, agent: 'claude', pane: request.pane }, caller, daemon),
           KEEP_HOOK_NODE: caller,
           ...(request.accountId ? { KEEP_AGENT_ACCOUNT_ID: request.accountId } : {}),
@@ -307,5 +327,5 @@ function createHookService(options = {}) {
 
 module.exports = {
   createHookService, validateRequest, cleanInput, digestOf,
-  EVENTS, TRANSCRIPT_ONLY, HOOK_TIMEOUT_MS, INPUT_MAX_BYTES, BODY_MAX_BYTES, TEXT_MAX,
+  EVENTS, TRANSCRIPT_ONLY, HOOK_TIMEOUT_MS, INPUT_MAX_BYTES, BODY_MAX_BYTES, TEXT_MAX, FORWARDED_ENV,
 };

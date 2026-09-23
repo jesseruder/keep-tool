@@ -488,3 +488,85 @@ test('the daemon refuses a final message past its cap, and the node cuts one to 
   assert.deepEqual(JSON.parse(calls.at(-1).stdin).tool_input, { command: 'cat big.log' });
   assert.deepEqual(calls.at(-1).args.slice(1), ['hook', 'lifecycle']);
 });
+
+test('the session env the daemon\'s hook reads is forwarded from an allow-list, and nothing else', async (t) => {
+  const { hooks, calls, root } = services(t);
+  const answer = await hooks.handle(AWS1, body({ identity: { agent: 'claude', sessionId: 'sess-aws1', env: {
+    KEEP_REVIEWER: '1', KEEP_AUTO_CONTINUE: '0', CLAUDE_CODE_ENTRYPOINT: 'sdk-ts', KEEP_DELEGATION_ID: 'a1b2c3',
+    PATH: '/elsewhere', NODE_OPTIONS: '--require /tmp/x.js', KEEP_DIR: '/elsewhere', KEEP_HOOK_NODE: 'main', KEEP_REVIEWER_NAME: 'x',
+  } } }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  const { env } = calls[0].options;
+  assert.equal(env.KEEP_REVIEWER, '1');
+  assert.equal(env.KEEP_AUTO_CONTINUE, '0');
+  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, 'sdk-ts');
+  assert.equal(env.KEEP_DELEGATION_ID, 'a1b2c3');
+  assert.equal(env.PATH, process.env.PATH, 'unknown keys dropped');
+  assert.equal(env.NODE_OPTIONS, undefined);
+  assert.equal(env.KEEP_REVIEWER_NAME, undefined);
+  assert.equal(env.KEEP_DIR, root);
+  assert.equal(env.KEEP_HOOK_NODE, 'aws1');
+
+  // Without identity.env the child has none of them.
+  await hooks.handle(AWS1, body({ idempotencyKey: `${KEY}-plain` }));
+  for (const key of ['KEEP_REVIEWER', 'KEEP_AUTO_CONTINUE', 'CLAUDE_CODE_ENTRYPOINT', 'KEEP_DELEGATION_ID']) {
+    assert.equal(calls[1].options.env[key], undefined, key);
+  }
+
+  for (const [value, message] of [
+    ['yes', /identity.env must be an object/],
+    [{ KEEP_REVIEWER: 'yes please' }, /invalid identity.env.KEEP_REVIEWER/],
+    [{ KEEP_AUTO_CONTINUE: 0 }, /invalid identity.env.KEEP_AUTO_CONTINUE/],
+    [{ CLAUDE_CODE_ENTRYPOINT: 'sdk ts; rm' }, /invalid identity.env.CLAUDE_CODE_ENTRYPOINT/],
+    [{ KEEP_DELEGATION_ID: 'x'.repeat(129) }, /invalid identity.env.KEEP_DELEGATION_ID/],
+    [{ KEEP_DELEGATION_ID: '../d' }, /invalid identity.env.KEEP_DELEGATION_ID/],
+  ]) {
+    const refused = await hooks.handle(AWS1, body({ idempotencyKey: `${KEY}-bad`, identity: { agent: 'claude', sessionId: 'sess-aws1', env: value } }));
+    assert.equal(refused.status, 400, JSON.stringify(value));
+    assert.match(refused.body.error, message);
+  }
+  assert.equal(calls.length, 2);
+});
+
+test('the node forwards its session env, and the daemon\'s hook honours it', async (t) => {
+  const client = require('./hook-client.js');
+  const where = { url: 'http://127.0.0.1:1', local: 'aws1', daemon: 'main' };
+  const identity = (env) => {
+    let sent;
+    return client.runHook('notification', { session_id: 'sess-aws1', cwd: '/x' }, where, { env: { HOME: tempDir(t), ...env }, token: 't',
+      request: async (url, pathname, { payload }) => { sent = payload.identity; return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: '' }) }; },
+    }).then(() => sent);
+  };
+  assert.deepEqual((await identity({ KEEP_REVIEWER: '1', KEEP_AUTO_CONTINUE: '0', CLAUDE_CODE_ENTRYPOINT: 'cli', KEEP_DELEGATION_ID: 'd1', PATH: '/bin', KEEP_REVIEWER_NAME: 'x' })).env,
+    { KEEP_REVIEWER: '1', KEEP_AUTO_CONTINUE: '0', CLAUDE_CODE_ENTRYPOINT: 'cli', KEEP_DELEGATION_ID: 'd1' });
+  assert.deepEqual((await identity({ KEEP_REVIEWER: 'maybe', CLAUDE_CODE_ENTRYPOINT: 'cli' })).env, { CLAUDE_CODE_ENTRYPOINT: 'cli' }, 'a value the daemon would refuse is not sent');
+  assert.equal((await identity({})).env, undefined);
+
+  const { hooks, root } = services(t, { root: registry(t), realSpawn: true });
+  const stop = (text, env, key) => hooks.handle(AWS1, body({
+    identity: { agent: 'claude', sessionId: 'sess-aws1', ...(env ? { env } : {}) }, idempotencyKey: key,
+    input: { session_id: 'sess-aws1', cwd: '/home/node/project', hook_event_name: 'Stop', stop_hook_active: false },
+    transcript: transcript(text, { fromOffset: 0, generation: key.replace(/[^A-Za-z0-9]/g, '') }),
+  }));
+  // A reviewer on the node: five edits and no check-in, and no nag.
+  const edits = `${JSON.stringify({ type: 'mode', mode: 'default' })}\n${toolUse('Edit').repeat(5)}`
+    + `${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Done.' }] } })}\n`;
+  const reviewer = await stop(edits, { KEEP_REVIEWER: '1' }, `${KEY}-reviewer`);
+  assert.equal(reviewer.status, 200, JSON.stringify(reviewer.body));
+  assert.equal(reviewer.body.stdout, '', reviewer.body.stderr);
+  assert.equal(fs.existsSync(path.join(root, '.keep', 'nagged', 'sess-aws1')), false);
+
+  // A card linked to the session with a next step: auto-continued, unless the
+  // session said KEEP_AUTO_CONTINUE=0.
+  fs.writeFileSync(path.join(root, 'tasks', 'planned-card.md'), ['---', 'title: Planned card', 'status: active', 'kind: task',
+    'project: /home/node/project', 'sessions:', '  - id: sess-aws1', '    agent: claude', '    at: 2026-09-02T12:00',
+    'created: 2026-09-02', 'updated: 2026-09-02T12:00', '---', '## Plan', '- [ ] First step', '- [ ] Second step', ''].join('\n'));
+  fs.rmSync(path.join(root, '.keep', 'stopcheck'), { recursive: true, force: true });
+  const quiet = `${JSON.stringify({ type: 'mode', mode: 'default' })}\n${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Finished a chunk.' }] } })}\n`;
+  const off = await stop(quiet, { KEEP_AUTO_CONTINUE: '0' }, `${KEY}-off`);
+  assert.equal(off.status, 200, JSON.stringify(off.body));
+  assert.equal(off.body.stdout, '', off.body.stderr);
+  fs.rmSync(path.join(root, '.keep', 'stopcheck'), { recursive: true, force: true });
+  const on = await stop(quiet, null, `${KEY}-on`);
+  assert.match(JSON.parse(on.body.stdout).reason, /^\[keep\] Your card planned-card has a next step\./);
+});
