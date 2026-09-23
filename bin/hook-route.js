@@ -351,8 +351,10 @@ function cleanCodexInput(event, input, sessionId, options = {}) {
     out.hook_event_name = matching(input.hook_event_name, /^[A-Za-z]{1,64}$/, 'input.hook_event_name');
     if (!HOOK_EVENT_NAMES[event].includes(out.hook_event_name)) refuse(400, `input.hook_event_name ${out.hook_event_name} is not a ${event} event`);
   } else if (event === 'codex-lifecycle') refuse(400, 'input.hook_event_name is required for codex-lifecycle');
-  // Codex's model, permission mode and agent type are not read by any of its hooks,
-  // so they are dropped with everything else unknown.
+  // The Stop guard reads the permission mode (a session in plan mode is not nagged), so
+  // it is admitted as Claude's is. Codex's model and agent type are read by none of
+  // its hooks, and are dropped with everything else unknown.
+  if (has('permission_mode')) out.permission_mode = matching(input.permission_mode, /^[A-Za-z]{1,32}$/, 'input.permission_mode');
   if (has('source')) out.source = matching(input.source, /^[a-z_]{1,32}$/, 'input.source');
   for (const key of ['turn_id', 'agent_id']) if (has(key)) out[key] = matching(input[key], ID_RE, `input.${key}`);
   if (has('stop_hook_active')) {

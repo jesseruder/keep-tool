@@ -1005,6 +1005,7 @@ test('a Codex post is refused unless it is a codex-* event for a Codex session o
     [codexBody('codex-stop', {}, { identity: { agent: 'codex', sessionId: 'codex-aws1', accountId: 'codex-other' } }), 403, /runs on account codex-node/],
     [codexBody('codex-stop', { hook_event_name: 'SessionStart' }), 400, /is not a codex-stop event/],
     [codexBody('codex-stop', { stop_hook_active: 'no' }), 400, /stop_hook_active must be a boolean/],
+    [codexBody('codex-stop', { permission_mode: 'on-request' }), 400, /invalid input.permission_mode/],
     [codexBody('codex-lifecycle'), 400, /hook_event_name is required/],
     [codexBody('codex-stop', { cwd: 'relative' }), 400, /input.cwd must be an absolute path/],
     [codexBody('codex-pre-tool', { tool_name: 'shell', tool_input: { command: 'ls' } }), 400, /repo_facts is required/],
@@ -1035,10 +1036,10 @@ test('each Codex event runs the daemon\'s keep hook codex <action> on its rebuil
   const project = path.join(root, 'project');
   const facts = { paths: { [project]: { top: project, main: project } }, deploy: null, head: {} };
   const expected = {
-    'codex-start': [{ hook_event_name: 'SessionStart', source: 'startup', model: 'gpt-x', permission_mode: 'whatever' },
+    'codex-start': [{ hook_event_name: 'SessionStart', source: 'startup', model: 'gpt-x', agent_type: 'x' },
       { hook_event_name: 'SessionStart', source: 'startup' }],
-    'codex-stop': [{ hook_event_name: 'Stop', stop_hook_active: false, turn_id: 'turn-1', last_assistant_message: 'done', extra: 1 },
-      { hook_event_name: 'Stop', stop_hook_active: false, turn_id: 'turn-1', last_assistant_message: 'done' }],
+    'codex-stop': [{ hook_event_name: 'Stop', stop_hook_active: false, turn_id: 'turn-1', last_assistant_message: 'done', permission_mode: 'plan', extra: 1 },
+      { hook_event_name: 'Stop', stop_hook_active: false, turn_id: 'turn-1', last_assistant_message: 'done', permission_mode: 'plan' }],
     'codex-question': [{ hook_event_name: 'PreToolUse', tool_name: 'request_user_input', tool_input: { questions: [{ title: 'Pick?', options: [{ label: 'A', description: 'x' }], secret: 1 }] } },
       { hook_event_name: 'PreToolUse', tool_name: 'request_user_input', tool_input: { questions: [{ options: [{ label: 'A' }], title: 'Pick?' }] } }],
     'codex-approval': [{ hook_event_name: 'PermissionRequest', tool_name: 'shell', tool_input: { description: 'run ls', command: 'ls', tool_name: 'shell' } },
