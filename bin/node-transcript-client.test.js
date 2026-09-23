@@ -117,3 +117,42 @@ test('a session on aws1 is loaded for an action from its node, and never from a 
     } finally { await serve.closeHostClient(); }
   });
 });
+
+test('a journal\'s receipt is the node\'s answer about the file the journal recorded, and nothing else', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-receipt-for-'));
+  try {
+    fs.mkdirSync(path.join(root, '.keep', 'session-accounts'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'session-accounts', 'sess-receipt.json'), JSON.stringify({
+      version: 1, sessionId: 'sess-receipt', agent: 'claude', accountId: 'claude/default', node: 'aws8',
+    }));
+    let answer = null;
+    const sent = [];
+    const deps = {
+      root,
+      hostRequest: async (type, params, options) => {
+        if (type === 'hello') return { transcript: 1 };
+        sent.push({ params, node: options.node, reply: options.hostRequestTimeoutMs });
+        return answer;
+      },
+    };
+    const entry = { sessionId: 'sess-receipt', kind: 'claude', node: 'aws8', file: '/node/home/.claude/projects/-p/sess-receipt.jsonl',
+      offset: 120, hash: 'a'.repeat(64), generation: '1:2:3' };
+    answer = { path: entry.file, generation: '1:2:3', matched: true };
+    assert.equal(await serve.deliveryReceiptFor(entry, deps, 500), true);
+    assert.equal(sent[0].node, 'aws8');
+    assert.equal(sent[0].reply, 2500, 'the reply window is the node\'s wait plus two seconds');
+    assert.deepEqual({ ...sent[0].params, account: undefined }, {
+      op: 'match', kind: 'claude', sessionId: 'sess-receipt', account: undefined, fromOffset: 120, hash: 'a'.repeat(64), timeoutMs: 500,
+    });
+    assert.equal(sent[0].params.account.id, 'claude/default');
+    assert.equal(sent[0].params.path, undefined, 'the node is never told which path to read');
+    answer = { path: '/node/home/.claude/projects/-other/sess-receipt.jsonl', generation: '1:2:3', matched: true };
+    assert.equal(await serve.deliveryReceiptFor(entry, deps), false, 'another file is not the journal\'s file');
+    answer = { path: entry.file, generation: '9:9:9', matched: true };
+    assert.equal(await serve.deliveryReceiptFor(entry, deps), false, 'nor is the same path re-created');
+    answer = { path: entry.file, generation: '1:2:3', matched: false };
+    assert.equal(await serve.deliveryReceiptFor(entry, deps), false);
+    answer = {};
+    await assert.rejects(serve.deliveryReceiptFor(entry, deps), /gave no receipt answer/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

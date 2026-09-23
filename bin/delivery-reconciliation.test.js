@@ -182,3 +182,90 @@ test('with no readable node list, every remote journal is left alone', () => fix
   assert.ok(fs.existsSync(remote.journal));
   assert.equal(fs.existsSync(local.journal), false, 'this machine still speaks for its own panes');
 }));
+
+// ---------- journals on another node, answered by that node ----------
+
+// A typed, stale journal for a session on aws1 whose pane the node still lists. Its
+// `file` is the node's path: nothing here may open it (received() refuses a node
+// journal outright), so the answers come only from receiptFor.
+function nodeJournal(f, text, overrides = {}) {
+  return f.add('claude', text, {
+    sessionId: `node-session-${hash(text).slice(0, 8)}`, pane: 'r1@aws1', node: 'aws1',
+    typedAt: Date.now() - 20 * 60e3, createdAt: Date.now() - 20 * 60e3, ...overrides,
+  });
+}
+
+test('a node journal is kept while its node says the text is not there', () => fixture(async f => {
+  const x = nodeJournal(f, 'not there yet');
+  const before = fs.readFileSync(x.journal, 'utf8');
+  const asked = [];
+  const settled = await delivery.reconcileAsync(f.directory, {
+    panes: new Set(['r1@aws1']), receiptFor: async (entry) => { asked.push(entry.sessionId); return false; },
+  });
+  assert.deepEqual(settled, []);
+  assert.deepEqual(asked, [x.entry.sessionId]);
+  assert.equal(fs.readFileSync(x.journal, 'utf8'), before, 'kept, byte for byte');
+}));
+
+test('a node journal settles when its node says the text is there', () => fixture(async f => {
+  // A scheduled check's journal: settling it files the receipt its owner reads.
+  const x = nodeJournal(f, 'it landed', { retainReceipt: true });
+  const settled = await delivery.reconcileAsync(f.directory, { panes: new Set(['r1@aws1']), receiptFor: async () => true });
+  assert.deepEqual(settled, [x.entry.sessionId]);
+  assert.equal(fs.existsSync(x.journal), false);
+  const receipt = JSON.parse(fs.readFileSync(path.join(f.directory, 'receipts', hash('it landed') + '.json'), 'utf8'));
+  assert.deepEqual(receipt, { sessionId: x.entry.sessionId, kind: 'claude', received: true, node: 'aws1' });
+}));
+
+test('a node journal whose node does not answer is left untouched, even with its pane absent', () => fixture(async f => {
+  const x = nodeJournal(f, 'nobody answered');
+  const untyped = nodeJournal(f, 'never typed', { typedAt: undefined });
+  const before = [fs.readFileSync(x.journal, 'utf8'), fs.readFileSync(untyped.journal, 'utf8')];
+  // A complete pane list without the pane: for a local journal this retires it.
+  const settled = await delivery.reconcileAsync(f.directory, {
+    panes: new Set(['local-1']), receiptFor: async () => { throw new Error('host request timed out (transcript)'); },
+  });
+  assert.deepEqual(settled, []);
+  assert.deepEqual([fs.readFileSync(x.journal, 'utf8'), fs.readFileSync(untyped.journal, 'utf8')], before);
+  // And with no way to ask at all, the same.
+  assert.deepEqual(delivery.reconcile(f.directory, { panes: new Set(['local-1']) }), []);
+  assert.deepEqual([fs.readFileSync(x.journal, 'utf8'), fs.readFileSync(untyped.journal, 'utf8')], before);
+}));
+
+test('a node that answers "not there" gets the same expiry a local journal does', () => fixture(async f => {
+  // Typed, and its pane is gone from a list the node answered: settled as a plain send,
+  // exactly the local rule. Never typed and stale: dropped, exactly the local rule.
+  const typed = nodeJournal(f, 'pane gone');
+  const untyped = nodeJournal(f, 'never typed', { typedAt: undefined });
+  const settled = await delivery.reconcileAsync(f.directory, { panes: new Set(['local-1']), receiptFor: async () => false });
+  assert.deepEqual(settled, [typed.entry.sessionId]);
+  assert.equal(fs.existsSync(typed.journal), false);
+  assert.equal(fs.existsSync(untyped.journal), false);
+}));
+
+test('with no node journals, reconcileAsync is reconcile and asks nobody', () => fixture(async f => {
+  const local = f.add('claude', 'local draft', { pane: 'p1', typedAt: Date.now() - 20 * 60e3, createdAt: Date.now() - 20 * 60e3 });
+  const settled = await delivery.reconcileAsync(f.directory, {
+    panes: new Set(['p2']), receiptFor: async () => assert.fail('no node journal, no question'),
+  });
+  assert.deepEqual(settled, [local.entry.sessionId]);
+}));
+
+test('the health inspection reports a node journal by its node\'s answer', () => fixture(async f => {
+  const x = nodeJournal(f, 'health check');
+  const name = path.basename(x.journal);
+  const key = delivery.nodeReceiptKey(name, x.entry);
+  const unanswered = inspect({ root: f.root, staleMs: 0 });
+  assert.equal(unanswered.length, 1);
+  assert.equal(unanswered[0].reason, 'node-unanswered');
+  assert.equal(unanswered[0].node, 'aws1');
+  assert.equal(inspect({ root: f.root, staleMs: 0, nodeReceipts: new Map([[key, false]]) })[0].reason, 'receipt-missing');
+  assert.deepEqual(inspect({ root: f.root, staleMs: 0, nodeReceipts: new Map([[key, true]]) }), []);
+  // The sweep gathers the answers itself when it is given a way to ask.
+  const recorded = [];
+  const health = { record: (name, value) => recorded.push(value) };
+  const issues = await require('./delivery-health').sweep({ root: f.root, health, receiptFor: async () => false });
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].reason, 'receipt-missing');
+  assert.equal(recorded.at(-1).ok, false);
+}));

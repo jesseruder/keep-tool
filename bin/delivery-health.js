@@ -7,7 +7,7 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const { performance } = require('node:perf_hooks');
-const { received, indexConfirms, completedTyping } = require('./delivery');
+const { received, indexConfirms, completedTyping, nodeReceiptKey, collectNodeReceipts } = require('./delivery');
 const STALE_MS = 2 * 60e3;
 const safeId = value => /^[A-Za-z0-9_-]{1,160}$/.test(String(value || '')) ? String(value) : 'unknown';
 
@@ -47,8 +47,17 @@ function inspect(options = {}) {
     const since = Number.isFinite(entry.createdAt) && entry.createdAt > 0 ? entry.createdAt : stat.mtimeMs;
     if (now - since < (options.staleMs ?? STALE_MS)) continue;
     let reason = 'receipt-missing';
-    try { if (received(entry)) continue; }
-    catch { reason = 'transcript-unreadable'; }
+    if (entry.node) {
+      // A journal on a node is judged by that node's answer (options.nodeReceipts,
+      // gathered by sweep). No answer is reported as such: the delivery may well have
+      // landed, but nothing here has seen it do so.
+      const answer = options.nodeReceipts instanceof Map ? options.nodeReceipts.get(nodeReceiptKey(name, entry)) : undefined;
+      if (answer === true) continue;
+      if (answer !== false) reason = 'node-unanswered';
+    } else {
+      try { if (received(entry)) continue; }
+      catch { reason = 'transcript-unreadable'; }
+    }
     // The turn index recorded the message, so it did arrive; the reconcile sweep
     // that runs before this inspection settles such a journal after a minute. One
     // still here past the stale window is one that sweep failed to settle, which is
@@ -60,7 +69,8 @@ function inspect(options = {}) {
       if (trace.some(row => ['enter-sent', 'submit-draft-ok'].includes(row.stage))) reason = 'receipt-missing-after-enter';
       else if (trace.some(row => ['screen-confirmation', 'draft-screen-check'].includes(row.stage) && row.matched === false)) reason = 'screen-verification-failed';
     }
-    issues.push({ sessionId: safeId(entry.sessionId), agent: entry.kind, pane: safeId(entry.pane), since, ageMs: Math.max(0, now - since), reason });
+    issues.push({ sessionId: safeId(entry.sessionId), agent: entry.kind, pane: safeId(entry.pane), since, ageMs: Math.max(0, now - since), reason,
+      ...(entry.node ? { node: safeId(entry.node) } : {}) });
   }
   return issues.sort((a, b) => (a.since || 0) - (b.since || 0));
 }
@@ -148,6 +158,14 @@ async function reconcileWithRetry(options) {
 async function sweep(options = {}) {
   try {
     await reconcileWithRetry(options);
+    // A node's journals are asked of their nodes before the read-only inspection, which
+    // cannot wait on a request. Without a receiptFor (a single-node install) nothing is
+    // asked, and the tick is the one it always was.
+    if (typeof options.receiptFor === 'function') {
+      const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+      const directory = options.directory || path.join(root, '.keep', 'delivery');
+      return tick({ ...options, nodeReceipts: await collectNodeReceipts(directory, options.receiptFor) });
+    }
     return tick(options);
   } catch {
     (options.health || require('./health')).record('delivery', { ok: false, error: 'Delivery reconciliation could not run' });

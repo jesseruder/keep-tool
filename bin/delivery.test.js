@@ -1122,3 +1122,148 @@ test('a caller that cannot see the box never confirms from the index, and a fail
       draftOnScreen: async () => { throw new Error('host timed out'); } }), /Delivery unconfirmed/);
   } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
 });
+
+// ---------- a delivery to a session on another node ----------
+
+// A node as delivery sees one: its own path and size for the transcript, and a
+// receipt it answers from what it read there. The "node" here reads a file in a temp
+// directory with the same matcher the real host uses (matchesFrom); what matters is
+// that deliver never opens entry.file itself.
+function fakeNode(file, options = {}) {
+  const { matchesFrom } = require('./delivery');
+  const calls = [];
+  let looks = 0;
+  return {
+    calls,
+    remote: {
+      node: 'aws1',
+      stat: async () => {
+        calls.push('stat');
+        return { path: file, size: fs.statSync(file).size, generation: 'gen-1' };
+      },
+      receipt: async (entry, { timeoutMs }) => {
+        calls.push(['receipt', timeoutMs]);
+        if (options.silent && options.silent()) throw new Error('host request timed out (transcript)');
+        // The node's long poll: a look now and one every 500 ms until the wait is spent.
+        for (let look = 0; look <= Math.floor(timeoutMs / 500); look += 1) {
+          looks += 1;
+          if (options.beforeLook) options.beforeLook(looks);
+          if (matchesFrom(file, entry.offset, { kind: entry.kind, hash: entry.hash }).matched) return true;
+        }
+        return false;
+      },
+    },
+  };
+}
+
+function remoteDeliveryFixture(name) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `keep-remote-delivery-${name}-`));
+  const file = path.join(root, 'node-transcript.jsonl');
+  fs.writeFileSync(file, `${JSON.stringify({ type: 'user', message: { content: 'earlier' } })}\n`);
+  const directory = path.join(root, 'journal');
+  const userLine = (text) => `${JSON.stringify({ type: 'user', message: { role: 'user', content: text } })}\n`;
+  return { root, file, directory, userLine, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+}
+
+test('a delivery to a node session journals the node and is confirmed by the node\'s receipt', async () => {
+  const f = remoteDeliveryFixture('confirmed');
+  try {
+    const offsetAtSend = fs.statSync(f.file).size;
+    let journalled = null;
+    // The agent writes the user line only after the node has looked twice.
+    const node = fakeNode(f.file, { beforeLook: (n) => { if (n === 3) fs.appendFileSync(f.file, f.userLine('hello node')); } });
+    const result = await deliver({
+      session: { id: 'remote-session', kind: 'claude' }, pane: 'p7@aws1', text: 'hello node', file: null, remote: node.remote,
+      directory: f.directory, retainReceipt: true, key: 'card:check',
+      precheck: async () => {},
+      type: async () => {
+        journalled = JSON.parse(fs.readFileSync(path.join(f.directory, textHash('remote-session') + '.json'), 'utf8'));
+      },
+      submitDraft: async () => assert.fail('no Enter retry is needed'), draftMatches: async () => false,
+      pause: async () => assert.fail('the node does the waiting, not this process'), attempts: 16,
+    });
+    assert.equal(result.delivery, 'received');
+    assert.equal(journalled.node, 'aws1');
+    assert.equal(journalled.file, f.file, 'the node\'s own path, recorded');
+    assert.equal(journalled.offset, offsetAtSend, 'from the node\'s size when typing started');
+    assert.equal(journalled.generation, 'gen-1');
+    // One stat, then the node's long polls: 16 × 500 ms is at most nine seconds a request.
+    assert.equal(node.calls[0], 'stat');
+    assert.deepEqual(node.calls.slice(1).map((call) => call[1]), [8000]);
+    // Settled: the active journal is gone and the retained receipt names the node.
+    assert.equal(fs.existsSync(path.join(f.directory, textHash('remote-session') + '.json')), false);
+    const receipts = fs.readdirSync(path.join(f.directory, 'receipts'));
+    assert.equal(receipts.length, 1);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.directory, 'receipts', receipts[0]), 'utf8')),
+      { sessionId: 'remote-session', kind: 'claude', received: true, node: 'aws1' });
+  } finally { f.cleanup(); }
+});
+
+test('a node that stops answering leaves the delivery unconfirmed and its journal exactly as it was', async () => {
+  const f = remoteDeliveryFixture('silent');
+  try {
+    let silent = false;
+    const node = fakeNode(f.file, { silent: () => silent });
+    const base = {
+      session: { id: 'remote-session', kind: 'claude' }, pane: 'p7@aws1', text: 'hello node', file: null, remote: node.remote,
+      directory: f.directory, precheck: async () => {}, submitDraft: async () => assert.fail('no Enter'),
+      draftMatches: async () => false, pause: async () => {}, attempts: 2,
+    };
+    await assert.rejects(deliver({ ...base, type: async () => { silent = true; } }),
+      /Delivery unconfirmed: aws1 did not answer for the transcript receipt .*Pending attempt retained; no automatic retyping/);
+    const journal = path.join(f.directory, textHash('remote-session') + '.json');
+    const before = fs.readFileSync(journal, 'utf8');
+    assert.equal(JSON.parse(before).node, 'aws1');
+    assert.equal(Number(JSON.parse(before).typedAt) > 0, true);
+
+    // The next send to that session asks the node about the pending one first. Still
+    // silent: nothing is typed and the journal is not touched.
+    let typed = 0;
+    await assert.rejects(deliver({ ...base, text: 'another message', type: async () => { typed += 1; } }),
+      /Previous delivery could not be checked: aws1 did not answer/);
+    assert.equal(typed, 0);
+    assert.equal(fs.readFileSync(journal, 'utf8'), before);
+
+    // It answers, and the line is there: the earlier message is recovered, not retyped.
+    silent = false;
+    fs.appendFileSync(f.file, f.userLine('hello node'));
+    const recovered = await deliver({ ...base, type: async () => { typed += 1; } });
+    assert.equal(recovered.recovered, true);
+    assert.equal(typed, 0);
+    assert.equal(fs.existsSync(journal), false);
+  } finally { f.cleanup(); }
+});
+
+test('a node journal is never read as a local file, and never answered by a caller with no node to ask', async () => {
+  const f = remoteDeliveryFixture('guarded');
+  try {
+    const { received, statusForText, pendingForSession, statusForTextAsync, pendingForSessionAsync } = require('./delivery');
+    fs.appendFileSync(f.file, f.userLine('already there'));
+    const entry = { createdAt: Date.now(), sessionId: 'remote-session', kind: 'claude', file: f.file, offset: 0,
+      pane: 'p7@aws1', hash: textHash('already there'), node: 'aws1', retainReceipt: true, key: 'k' };
+    assert.throws(() => received(entry), /the receipt for a delivery on aws1 is that node's to give/);
+    fs.mkdirSync(f.directory, { recursive: true });
+    const journal = path.join(f.directory, textHash('remote-session') + '.json');
+    fs.writeFileSync(journal, JSON.stringify(entry));
+    // A synchronous caller cannot ask: pending, and nothing moves.
+    assert.deepEqual(statusForText(f.directory, 'already there', 'k'),
+      { sessionId: 'remote-session', kind: 'claude', received: false, pending: true });
+    assert.equal(pendingForSession(f.directory, 'remote-session'), true);
+    assert.ok(fs.existsSync(journal));
+    // An async one asks; a node that does not answer is still pending.
+    assert.equal((await statusForTextAsync(f.directory, 'already there', 'k', { receiptFor: async () => { throw new Error('silent'); } })).pending, true);
+    assert.equal(await pendingForSessionAsync(f.directory, 'remote-session', { receiptFor: async () => false }), true);
+    assert.ok(fs.existsSync(journal));
+    // A yes settles it as a local receipt would.
+    assert.equal((await statusForTextAsync(f.directory, 'already there', 'k', { receiptFor: async () => true })).received, true);
+    assert.equal(fs.existsSync(journal), false);
+
+    // A send whose pending journal is on a node, made without a way to ask that node,
+    // stops before typing.
+    fs.writeFileSync(journal, JSON.stringify(entry));
+    await assert.rejects(deliver({ session: { id: 'remote-session', kind: 'claude' }, pane: 'p7@aws1', text: 'x', file: f.file,
+      directory: f.directory, precheck: async () => {}, type: async () => assert.fail('typed'), submitDraft: async () => {},
+      draftMatches: async () => false, pause: async () => {}, attempts: 1 }),
+    /Previous delivery could not be checked: .*cannot be asked from here/);
+  } finally { f.cleanup(); }
+});

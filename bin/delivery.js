@@ -113,7 +113,9 @@ function saveReceipt(directory, entry) {
   const dir = path.join(directory, 'receipts');
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const file = path.join(dir, (entry.receiptId || entry.hash) + '.json');
-  fs.writeFileSync(file + '.tmp', JSON.stringify({ sessionId: entry.sessionId, kind: entry.kind, received: true }), { mode: 0o600 });
+  // A receipt from a node says which node gave it; a local one is written as it always was.
+  fs.writeFileSync(file + '.tmp', JSON.stringify({ sessionId: entry.sessionId, kind: entry.kind, received: true,
+    ...(entry.node ? { node: entry.node } : {}) }), { mode: 0o600 });
   fs.renameSync(file + '.tmp', file);
 }
 
@@ -273,7 +275,35 @@ function typingProgress(entry, writeJournal) {
   };
 }
 
-async function deliverAttempt({ session, pane, text, key, file, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, observe, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16, staleJournalMs = STALE_JOURNAL_MS, indexDb, draftOnScreen }) {
+// A delivery to a session on another node. The daemon types into the pane as it
+// does anywhere (by pane ref, through that node's host) and only the receipt moves:
+// `remote` is { node, stat(), receipt(entry, { timeoutMs }) }, where stat() is the
+// node's own path and size for the session's transcript right now (journalled, never
+// opened here), and receipt() asks the node whether it has seen the text since the
+// journalled offset, waiting on the node for up to timeoutMs. receipt() answers true
+// only for text the node read in the transcript; a node that does not answer throws,
+// and every path below then leaves the journal exactly as it was.
+const REMOTE_MATCH_MAX_MS = 9000;
+
+function remoteFor(entry, remote) {
+  if (!remote || typeof remote.receipt !== 'function' || remote.node !== entry.node) {
+    throw new Error(`the receipt for a delivery on ${entry.node} cannot be asked from here; no message was typed`);
+  }
+  return remote;
+}
+
+async function remoteMatched(entry, remote, timeoutMs) {
+  let matched;
+  try { matched = await remoteFor(entry, remote).receipt(entry, { timeoutMs }); }
+  catch (error) {
+    const failure = new Error(`${entry.node} did not answer for the transcript receipt (${String(error && error.message || error)})`);
+    failure.nodeUnanswered = true;
+    throw failure;
+  }
+  return matched === true;
+}
+
+async function deliverAttempt({ session, pane, text, key, file, remote = null, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, observe, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16, staleJournalMs = STALE_JOURNAL_MS, indexDb, draftOnScreen }) {
   // The turn index says a message with this text was recorded, never which attempt
   // recorded it, so the send path trusts it only when it can also see that the text
   // is not in the input box. draftOnScreen answers that whatever the session is
@@ -323,7 +353,17 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
       trace('pending-settled-by-index');
       return true;
     };
-    if (settled || received(entry) || await byIndex()) {
+    // A journal on a node is asked of that node. If it does not answer, nothing here
+    // can know whether the earlier message landed, so this send stops before typing and
+    // the journal stays as it is.
+    const pendingReceived = async () => {
+      if (!entry.node) return received(entry);
+      try { return await remoteMatched(entry, remote, 0); }
+      catch (error) {
+        throw new Error(`Previous delivery could not be checked: ${error.message}; no message was typed.`);
+      }
+    };
+    if (settled || await pendingReceived() || await byIndex()) {
       finish(directory, journal, entry);
       if (entry.hash === hash(text)) return { ok: true, delivery: 'received', recovered: true };
       entry = null;
@@ -416,7 +456,18 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
   if (!entry) {
     journal = activeJournal;
     await precheck();
+    if (remote) {
+      // The node's own path and size, taken now, just before the first character:
+      // the offset a receipt is looked for from, exactly as a local file's size is.
+      const where = await remote.stat();
+      if (!where || typeof where.path !== 'string' || !where.path || !Number.isSafeInteger(where.size) || where.size < 0) {
+        throw Object.assign(new Error(`${remote.node} did not say where the transcript is; no message was typed`), { nothingTyped: true });
+      }
+      entry = { createdAt: Date.now(), sessionId: session.id, kind: session.kind, file: where.path, offset: where.size, pane, hash: hash(text), key, receiptId: receiptId(text, key), retainReceipt,
+        node: remote.node, ...(typeof where.generation === 'string' ? { generation: where.generation } : {}) };
+    } else {
     entry = { createdAt: Date.now(), sessionId: session.id, kind: session.kind, file, offset: fs.statSync(file).size, pane, hash: hash(text), key, receiptId: receiptId(text, key), retainReceipt };
+    }
     // The journal keeps only hashes, and the turn index keeps only the first
     // TEXT_CAP characters of a message. For a message longer than that, record the
     // hash of the part the index keeps, so the reconcile sweep - which never has the
@@ -474,18 +525,37 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     }
   }
   const confirmed = async () => received(entry) || matchingSettled(directory, entry) || Boolean(observe && await observe());
-  for (let i = 0; i < attempts; i++) {
-    await pause(500);
-    if (await confirmed()) { finish(directory, journal, entry); return { ok: true, delivery: 'received' }; }
-  }
+  // On a node the node does the waiting: it looks every 500 ms for as long as the local
+  // loop would, in one request (or one per 500 ms while a terminal-native receipt has
+  // to be looked for between its looks). A node that stops answering ends the attempt
+  // as unconfirmed, with the journal kept.
+  const remoteConfirmed = async () => {
+    let left = attempts * 500;
+    while (left > 0) {
+      const slice = observe ? Math.min(500, left) : Math.min(REMOTE_MATCH_MAX_MS, left);
+      left -= slice;
+      let matched;
+      try { matched = await remoteMatched(entry, remote, slice); }
+      catch (error) {
+        throw new Error(`Delivery unconfirmed: ${error.message}. Pending attempt retained; no automatic retyping.`);
+      }
+      if (matched || matchingSettled(directory, entry) || Boolean(observe && await observe())) return true;
+    }
+    return false;
+  };
+  const waitForReceipt = entry.node ? remoteConfirmed : async () => {
+    for (let i = 0; i < attempts; i++) {
+      await pause(500);
+      if (await confirmed()) return true;
+    }
+    return false;
+  };
+  if (await waitForReceipt()) { finish(directory, journal, entry); return { ok: true, delivery: 'received' }; }
   // Some TUIs absorb the first Enter while completing a paste. Retry only if
   // the original entire draft is still present, never when it was consumed.
   if (await draftMatches()) {
     await submitDraft();
-    for (let i = 0; i < attempts; i++) {
-      await pause(500);
-      if (await confirmed()) { finish(directory, journal, entry); return { ok: true, delivery: 'received' }; }
-    }
+    if (await waitForReceipt()) { finish(directory, journal, entry); return { ok: true, delivery: 'received' }; }
   }
   // Last, once: the transcript receipt reads one file from one offset, and the turn
   // index sees the message wherever this session recorded it. It lags a live session
@@ -537,7 +607,38 @@ function statusForText(directory, text, key) {
   for (const item of files) {
     const entry = JSON.parse(fs.readFileSync(item.file, 'utf8'));
     if (key ? entry.key !== key : entry.hash !== hash(text)) continue;
-    const confirmed = item.settled || received(entry);
+    // A synchronous caller cannot ask a node, so a node's journal is pending to it:
+    // never received on no evidence, never deleted. statusForTextAsync asks the node.
+    const confirmed = item.settled || (entry.node ? false : received(entry));
+    if (confirmed && entry.retainReceipt) {
+      saveReceipt(directory, entry);
+      fs.unlinkSync(item.file);
+    }
+    return { sessionId: entry.sessionId, kind: entry.kind, received: confirmed, pending: !confirmed };
+  }
+  return null;
+}
+// statusForText, with a node's journal answered by that node (`receiptFor(entry)`,
+// resolving true/false, throwing when the node does not answer). An unanswered one is
+// pending, exactly as statusForText reports it. A local journal is read as there.
+async function statusForTextAsync(directory, text, key, { receiptFor } = {}) {
+  try { return JSON.parse(fs.readFileSync(path.join(directory, 'receipts', receiptId(text, key) + '.json'), 'utf8')); }
+  catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const files = [];
+  for (const dir of [directory, path.join(directory, 'settled')]) {
+    try { files.push(...fs.readdirSync(dir).filter(f => f.endsWith('.json')).map(file => ({ file: path.join(dir, file), settled: dir !== directory }))); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  for (const item of files) {
+    const entry = JSON.parse(fs.readFileSync(item.file, 'utf8'));
+    if (key ? entry.key !== key : entry.hash !== hash(text)) continue;
+    let confirmed = item.settled;
+    if (!confirmed) {
+      if (!entry.node) confirmed = received(entry);
+      else if (typeof receiptFor === 'function') {
+        try { confirmed = (await receiptFor(entry)) === true; } catch { confirmed = false; }
+      }
+    }
     if (confirmed && entry.retainReceipt) {
       saveReceipt(directory, entry);
       fs.unlinkSync(item.file);
@@ -556,10 +657,63 @@ function pendingForSession(directory, sessionId) {
   let entry;
   try { entry = JSON.parse(fs.readFileSync(journal, 'utf8')); }
   catch (e) { if (e.code === 'ENOENT') return false; throw e; }
+  // Pending to a caller that cannot ask its node (see pendingForSessionAsync).
+  if (entry.node) return true;
   if (!received(entry)) return true;
   saveReceipt(directory, entry);
   fs.unlinkSync(journal);
   return false;
+}
+
+// pendingForSession, with a node's journal asked of its node: received settles it as
+// a local receipt does; "not seen" or no answer at all leaves it pending and untouched.
+async function pendingForSessionAsync(directory, sessionId, { receiptFor } = {}) {
+  const journal = path.join(directory, hash(sessionId) + '.json');
+  let entry;
+  try { entry = JSON.parse(fs.readFileSync(journal, 'utf8')); }
+  catch (e) { if (e.code === 'ENOENT') return false; throw e; }
+  if (!entry.node) return pendingForSession(directory, sessionId);
+  let got = false;
+  if (typeof receiptFor === 'function') {
+    try { got = (await receiptFor(entry)) === true; } catch { got = false; }
+  }
+  if (!got) return true;
+  // Read again: the journal must still be the one the node answered about.
+  let now;
+  try { now = JSON.parse(fs.readFileSync(journal, 'utf8')); } catch (e) { if (e.code === 'ENOENT') return false; throw e; }
+  if (nodeReceiptKey(path.basename(journal), now) !== nodeReceiptKey(path.basename(journal), entry)) return true;
+  saveReceipt(directory, entry);
+  fs.unlinkSync(journal);
+  return false;
+}
+
+// Which journal a node's answer is about: its file name plus everything that makes one
+// attempt a different attempt, so an answer about a journal that has since been
+// replaced is never applied to its replacement.
+function nodeReceiptKey(name, entry) {
+  return JSON.stringify([name, entry && entry.node, entry && entry.createdAt, entry && entry.hash, entry && entry.offset, entry && entry.file]);
+}
+
+// Asks each node journal's node once, all at the same time, and returns what they
+// said: key -> true/false. A node that did not answer is simply absent from the map,
+// which every reader below takes as "unknown": the journal is left as it is.
+async function collectNodeReceipts(directory, receiptFor) {
+  const answers = new Map();
+  if (typeof receiptFor !== 'function') return answers;
+  let files;
+  try { files = fs.readdirSync(directory).filter(name => name.endsWith('.json')); }
+  catch (error) { if (error.code === 'ENOENT') return answers; throw error; }
+  const asks = [];
+  for (const name of files) {
+    let entry;
+    try { entry = JSON.parse(fs.readFileSync(path.join(directory, name), 'utf8')); } catch { continue; }
+    if (!entry || !entry.node || name !== hash(entry.sessionId) + '.json') continue;
+    asks.push(Promise.resolve().then(() => receiptFor(entry)).then((value) => {
+      if (value === true || value === false) answers.set(nodeReceiptKey(name, entry), value);
+    }, () => {}));
+  }
+  await Promise.all(asks);
+  return answers;
 }
 
 // Call under the daemon's injection lock, just like normal delivery recovery.
@@ -620,7 +774,7 @@ const INDEX_GRACE_MS = 60e3;
 
 function reconcile(directory, {
   now = Date.now(), staleJournalMs = STALE_JOURNAL_MS, panes = null, unknownNodes = null, unknownRemote = false,
-  indexDb, indexGraceMs = INDEX_GRACE_MS,
+  indexDb, indexGraceMs = INDEX_GRACE_MS, nodeReceipts = null,
 } = {}) {
   const unknown = unknownNodes instanceof Set ? unknownNodes : new Set(unknownNodes || []);
   const daemon = require('./nodes.js').daemonNode();
@@ -657,7 +811,16 @@ function reconcile(directory, {
       // An unreadable transcript used to skip the entry outright (the catch below);
       // it still does unless the index can speak for the message.
       let got, unreadable = null;
-      try { got = received(entry); } catch (error) { got = false; unreadable = error; }
+      if (entry.node) {
+        // Its node's answer, asked before this sweep (reconcileAsync). No answer - the
+        // node was silent, or nobody asked - is "I could not tell": the journal is left
+        // exactly as it is, as a journal on an unknown node is below.
+        const answer = nodeReceipts instanceof Map ? nodeReceipts.get(nodeReceiptKey(name, entry)) : undefined;
+        if (answer !== true && answer !== false) continue;
+        got = answer;
+      } else {
+        try { got = received(entry); } catch (error) { got = false; unreadable = error; }
+      }
       if (!got && journalAgeMs(journal, entry, now) >= indexGraceMs
           && (Number(entry.typedAt) > 0 || completedTyping(entry)) && indexReady()) {
         const trace = require('./delivery-trace').recorder(directory, { id: entry.sessionId, kind: entry.kind }, entry.pane);
@@ -685,5 +848,21 @@ function reconcile(directory, {
   }
   return settled;
 }
-module.exports = { deliver, received, matchesFrom, indexConfirms, reconcile, userText, statusForText, acknowledge, pendingForSession,
+// reconcile, with every node journal's receipt asked of its node first (in parallel,
+// one request each, under whatever bound receiptFor applies). With no node journals
+// this is reconcile itself, called exactly as before.
+async function reconcileAsync(directory, options = {}) {
+  const { receiptFor, ...rest } = options;
+  let files;
+  try { files = fs.readdirSync(directory).filter(name => name.endsWith('.json')); }
+  catch (error) { if (error.code === 'ENOENT') return reconcile(directory, rest); throw error; }
+  const anyNode = files.some((name) => {
+    try { return Boolean(JSON.parse(fs.readFileSync(path.join(directory, name), 'utf8')).node); } catch { return false; }
+  });
+  if (!anyNode) return reconcile(directory, rest);
+  return reconcile(directory, { ...rest, nodeReceipts: await collectNodeReceipts(directory, receiptFor) });
+}
+
+module.exports = { deliver, received, matchesFrom, indexConfirms, reconcile, reconcileAsync, userText, statusForText, statusForTextAsync, acknowledge, pendingForSession, pendingForSessionAsync,
+  collectNodeReceipts, nodeReceiptKey, REMOTE_MATCH_MAX_MS,
   settleObserved, completedTyping, textHash: hash, STALE_JOURNAL_MS, INDEX_GRACE_MS };

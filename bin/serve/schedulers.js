@@ -363,7 +363,7 @@ function startSchedulers(ctx) {
     review, reviewDeps, runs, scanSessions, sendToResolvedTarget, sendToSession, sessionSummarySnapshot, slack,
     stallAliveIds, stalled, stalledSessionSnapshot, standup, startAutoCompact, startBriefScheduler,
     startHandoffQueue, startWtGcScheduler, summarize, transcriptFileForSession,
-    unblock, usage, watcherSend, withInjectionLock, writeTarget,
+    unblock, usage, watcherSend, withInjectionLock, writeTarget, deliveryReceiptFor,
   } = ctx;
   const periodicScan = periodicSessionScan(scanSessions);
   // The interval ticks this function starts itself run inside a loop hold, named
@@ -399,7 +399,11 @@ function startSchedulers(ctx) {
   usage.setOnChange(broadcast);
   usage.setCacheFile(path.join(keep.ROOT, '.keep', 'usage-cache.json'));
   runs.startScheduler();
-  require('../delivery-health').startScheduler({ root: keep.ROOT, onChange: broadcast,
+  // A journal written for a session on another node is asked of that node: one
+  // single look each (no wait on the node), in parallel. One that does not answer is
+  // left as it is by reconcile and reported by the health tick as unanswered.
+  const receiptFor = (entry) => deliveryReceiptFor(entry, deps, 0);
+  require('../delivery-health').startScheduler({ root: keep.ROOT, onChange: broadcast, receiptFor,
     // Global on purpose: reconcile reads every session's pending delivery record, so no
     // delivery may be mid-flight anywhere. It is synchronous file work, so the hold is brief.
     // The pane list is read first, outside the lock: a typed entry whose pane the host no
@@ -423,7 +427,7 @@ function startSchedulers(ctx) {
       return withInjectionLock(async () => {
         const directory = path.join(keep.ROOT, '.keep', 'delivery');
         await retireLeftDeliveryDrafts(directory, listed.panes, deps);
-        return require('../delivery').reconcile(directory, { panes, unknownNodes, unknownRemote });
+        return require('../delivery').reconcileAsync(directory, { panes, unknownNodes, unknownRemote, receiptFor });
       });
     },
   });

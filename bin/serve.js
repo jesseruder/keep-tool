@@ -3901,6 +3901,21 @@ async function nodeTranscriptFileForSession(session, deps = {}) {
   return { node, path: stat.path, size: stat.size, mtimeMs: stat.mtimeMs, generation: stat.generation };
 }
 
+// A delivery journal's receipt, asked of the node it names (delivery.js's receiptFor
+// and remote.receipt). True only when the node read the text in the transcript the
+// journal recorded: a node now answering about a different file (another path, or
+// the same path re-created) has not seen it there. A node that does not answer, or
+// cannot be asked, throws, which every caller takes as "leave the journal alone".
+async function deliveryReceiptFor(entry, deps = {}, timeoutMs = 0) {
+  if (!entry || !entry.node) throw new Error('not a node delivery journal');
+  const result = await nodeTranscript(entry.node, { id: entry.sessionId, kind: entry.kind }, deps)
+    .match(entry.offset, entry.hash, { timeoutMs });
+  if (!result || typeof result.matched !== 'boolean') throw new Error(`${entry.node} gave no receipt answer`);
+  if (result.path !== entry.file) return false;
+  if (typeof entry.generation === 'string' && result.generation !== entry.generation) return false;
+  return result.matched;
+}
+
 // The text readTranscriptTail would have returned for the same bytes: a tail that
 // does not start at the beginning drops its partial first line.
 function tailText(tail) {
@@ -12177,7 +12192,8 @@ async function handoffSession(body, deps = {}) {
     waitForAccountRecord: deps.waitForAccountRecord || ((sid, pane, accountId, after) => waitForAccountRecord(sid, pane, accountId, after, deps)),
     continueSession: deps.continueSession || ((sessionId, text, options) => continueAccountHandoff(sessionId, body.pane, body.accountId,
       text, options?.deliveryId, options, { ...deps, deliveryDirectory })),
-    deliveryStatus: deps.deliveryStatus || ((_sessionId, text, deliveryId) => require('./delivery').statusForText(deliveryDirectory, text, deliveryId)),
+    deliveryStatus: deps.deliveryStatus || ((_sessionId, text, deliveryId) => require('./delivery').statusForTextAsync(deliveryDirectory, text, deliveryId,
+      { receiptFor: (entry) => deliveryReceiptFor(entry, deps) })),
     verifyTargetSpec: deps.verifyTargetSpec || (async (entry, target) => {
       if (!entry.resumeSpec) return true;
       const verified = require('./codex-handoff-support').readResumeSpec(entry.targetTranscript, entry.sessionId);
@@ -12789,7 +12805,8 @@ function checkDeliveryIds(task) {
 
 async function deliverCheckToThread(task, deps = {}) {
   const text = runs.checkDeliveryMessage(task);
-  const prior = require('./delivery').statusForText(deps.deliveryDirectory || path.join(keep.ROOT, '.keep', 'delivery'), text, runs.checkDeliveryKey(task));
+  const prior = await require('./delivery').statusForTextAsync(deps.deliveryDirectory || path.join(keep.ROOT, '.keep', 'delivery'), text, runs.checkDeliveryKey(task),
+    { receiptFor: (entry) => deliveryReceiptFor(entry, deps) });
   if (prior?.received) return { sessionId: prior.sessionId, kind: prior.kind, delivery: 'received' };
   // Picking stays on the scan: a card can link many old sessions, and an exact read
   // of each one no index names (no authority record, a Codex id, one that ended days
@@ -14055,7 +14072,7 @@ function start(deps = {}) {
     sendStateJson, sendToResolvedTarget, sendToSession, sendToSessionLocked, sessionMarks, sessionNames, sessionSummaryFile, sessionSummarySnapshot,
     setAsideCandidates, slack, stallAliveIds, stalled, stalledSessionSnapshot, standup, tellSession,
     startAutoCompact, startBriefScheduler, startHandoffQueue, startWtGcScheduler, summarize,
-    transcriptFileForSession, pendingCompactSwaps,
+    transcriptFileForSession, pendingCompactSwaps, deliveryReceiptFor,
     transferSession,
     unblock, updateSetAside, usage, wantsConsoleState, watcherSend,
     withInjectionLock, writeTarget, writeToShellPane,
@@ -14394,6 +14411,7 @@ module.exports = {
   claudeSessionFromTail,
   nodeTranscript,
   nodeTranscriptFileForSession,
+  deliveryReceiptFor,
   remoteSessionRead,
   loadRemoteSession,
   loadSessionForAction,
