@@ -923,6 +923,36 @@ function hookDeliveryReport(deps = {}) {
 // not failed. Only on a pane-only node; the daemon node's own profiles are its own.
 const CODEX_HOOK_ACTIONS = ['start', 'stop', 'end', 'pre-tool', 'post-tool', 'question', 'approval', 'lifecycle'];
 
+// Codex asks, at a fresh session's start, for a review of every hook in hooks.json it
+// holds no trust entry for ("New hook, review required"), and a pane parked there never
+// reaches its prompt. The entries live in config.toml as [hooks.state."<dir>/hooks.json:
+// <event>:<group>:<index>"]. Counted by presence only: the trusted_hash inside is
+// Codex's to compute and check, so an entry for an edited hook still counts here.
+function codexHookTrustRow(dir, name, trustKeys, real) {
+  const label = `Codex hook trust (${name})`;
+  const fix = `copy the [hooks.state] tables from a profile that has accepted these hooks (the same hooks.json bytes at the same path; keep accounts setup <id> --share-from <source> does it between profiles on one machine), or press t once per hook in a fresh Codex there`;
+  let parsed;
+  try {
+    parsed = require('@iarna/toml').parse(fs.readFileSync(path.join(dir, 'config.toml'), 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return { status: 'FAIL', text: `${label}: no config.toml, so none of the ${trustKeys.length} hooks in ${name}/hooks.json has a trust entry; a fresh Codex there stops at 'review required' for each`, fix };
+    }
+    const reason = String(error && error.message || error).split('\n')[0].slice(0, 200);
+    return { status: 'FAIL', text: `${label}: config.toml unreadable (${reason}); its hook trust entries cannot be counted`,
+      fix: `fix the TOML in ${name}/config.toml` };
+  }
+  const state = parsed && parsed.hooks && typeof parsed.hooks.state === 'object' && !Array.isArray(parsed.hooks.state) ? parsed.hooks.state : {};
+  // Codex names the profile by the path it was given; a link to it is the same profile.
+  const prefixes = [...new Set([dir, real(dir)])].map((prefix) => `${prefix}${path.sep}`);
+  const trusted = (key) => prefixes.some((prefix) => Object.prototype.hasOwnProperty.call(state, `${prefix}${key}`));
+  const missing = trustKeys.filter((key) => !trusted(key)).length;
+  if (missing) {
+    return { status: 'FAIL', text: `${label}: ${missing} of ${trustKeys.length} hooks in ${name}/hooks.json have no trust entry in config.toml (checked by presence, not hash); a fresh Codex there stops at 'review required' for each`, fix };
+  }
+  return { status: 'ok', text: `${label}: all ${trustKeys.length} hooks in hooks.json have a trust entry in config.toml (checked by presence, not hash)` };
+}
+
 function codexHooksReport(deps = {}) {
   const env = deps.env || process.env;
   const where = require('./nodes.js').paneOnlyNode(env);
@@ -947,12 +977,18 @@ function codexHooksReport(deps = {}) {
       continue;
     }
     const commands = [];
-    for (const groups of Object.values((hooks && hooks.hooks) || {})) {
-      for (const group of Array.isArray(groups) ? groups : []) {
-        for (const hook of Array.isArray(group && group.hooks) ? group.hooks : []) {
-          if (hook && typeof hook.command === 'string') commands.push(hook.command);
-        }
-      }
+    // Codex's trust key for each hook: `<this dir>/hooks.json:<event>:<group>:<index>`,
+    // the event in snake case (PreToolUse is pre_tool_use).
+    const trustKeys = [];
+    for (const [event, groups] of Object.entries((hooks && hooks.hooks) || {})) {
+      const snake = event.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+      (Array.isArray(groups) ? groups : []).forEach((group, groupIndex) => {
+        (Array.isArray(group && group.hooks) ? group.hooks : []).forEach((hook, hookIndex) => {
+          if (!hook || typeof hook.command !== 'string') return;
+          commands.push(hook.command);
+          trustKeys.push(`hooks.json:${snake}:${groupIndex}:${hookIndex}`);
+        });
+      });
     }
     const wired = new Set();
     const elsewhere = new Set();
@@ -980,6 +1016,7 @@ function codexHooksReport(deps = {}) {
     rows.push(problems.length
       ? { status: 'FAIL', text: `Codex hooks (${name}): ${problems.join('; ')}`, fix: `wire keep hook codex <action> to ${keepBin} in ${name}/hooks.json and set [features] hooks = true in ${name}/config.toml` }
       : { status: 'ok', text: `Codex hooks (${name}) reach ${keepBin}` });
+    if (trustKeys.length) rows.push(codexHookTrustRow(dir, name, trustKeys, real));
   }
   const lsof = (deps.hasLsof || require('./process-table.js').hasLsof)();
   const linux = (deps.platform || process.platform) === 'linux';

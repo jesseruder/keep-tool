@@ -138,6 +138,18 @@ never absent. `keep doctor` on a node checks each `~/.codex*` profile: a hooks.j
 `keep hook codex` commands point at this node's checkout for every action, and
 `[features] hooks = true` in its config.toml; and says whether lsof is installed.
 
+Codex also stops a fresh session at a trust review ("New hook, review required", press
+`t`) for every hook in hooks.json that has no trust entry in config.toml: a
+`[hooks.state."<profile>/hooks.json:<event>:<group>:<index>"]` table holding the
+`trusted_hash` Codex computed when the hook was accepted. A pane parked there never
+reaches its prompt, so the open's wait for it times out. `keep doctor` on a node counts
+those entries for each profile's hooks.json and fails with how many are missing; it
+checks presence only, never the hash, which is Codex's. `keep accounts setup <id>
+--share-from <source>` carries the tables between profiles on one machine, so on a node
+run it there, on the node; nothing copies them from another node. Otherwise copy the
+`[hooks.state]` tables from a profile that accepted the same hooks.json bytes at the same
+path, or answer the review once per hook in a fresh Codex on the node.
+
 Restart/resume existing agent sessions in a controlled manner to load new hooks. The reviewer launcher sets
 `KEEP_REVIEWER=1`, allowing the SessionStart hook to register it for daemon ticks.
 

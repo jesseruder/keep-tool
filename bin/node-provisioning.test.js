@@ -245,7 +245,8 @@ test('doctor on a node checks every Codex profile\'s hooks against this checkout
   assert.deepEqual(setup.codexHooksReport({ env: { HOME: home, KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' }, keepBin }), [], 'the daemon node\'s profiles are its own');
   assert.deepEqual(report(), [{ status: 'ok', text: 'lsof absent: Codex sessions\' open rollouts are read from /proc' }], 'no Codex here: only the lsof row');
 
-  profile('.codex', hooks(keepBin, all), 'model = "x"\n\n[features]\n# on\nhooks = true\n\n[other]\nhooks = false\n');
+  const trusted = all.flatMap((action, n) => [0, 1].map((index) => `[hooks.state."${home}/.codex/hooks.json:event${n}:0:${index}"]\ntrusted_hash = "h"\n`)).join('\n');
+  profile('.codex', hooks(keepBin, all), `model = "x"\n\n[features]\n# on\nhooks = true\n\n[other]\nhooks = false\n\n${trusted}`);
   profile('.codex-secondary', hooks('/opt/elsewhere/keep-tool/bin/keep', all), '[features]\nhooks = true\n');
   profile('.codex-third', hooks(keepBin, ['start', 'stop']), '[features]\nhooks = false\n');
   profile('.codex-fourth', undefined, '[features]\nhooks = true\n');
@@ -254,19 +255,73 @@ test('doctor on a node checks every Codex profile\'s hooks against this checkout
   const rows = report();
   assert.deepEqual(rows.map((row) => [row.status, row.text]), [
     ['ok', `Codex hooks (~/.codex) reach ${keepBin}`],
+    ['ok', 'Codex hook trust (~/.codex): all 16 hooks in hooks.json have a trust entry in config.toml (checked by presence, not hash)'],
     ['FAIL', `Codex hooks (~/.codex-fifth): hooks.json unreadable: ${(() => { try { JSON.parse('{ not json'); } catch (error) { return error.message; } })()}; its sessions on aws1 run unguarded and unregistered`],
     ['FAIL', 'Codex hooks (~/.codex-fourth): no hooks.json; its sessions on aws1 run unguarded and unregistered'],
     ['FAIL', `Codex hooks (~/.codex-secondary): commands point at /opt/elsewhere/keep-tool/bin/keep, not this node's ${keepBin}; not wired: ${all.join(', ')}`],
+    ['FAIL', 'Codex hook trust (~/.codex-secondary): 16 of 16 hooks in ~/.codex-secondary/hooks.json have no trust entry in config.toml (checked by presence, not hash); a fresh Codex there stops at \'review required\' for each'],
     ['FAIL', `Codex hooks (~/.codex-third): not wired: end, pre-tool, post-tool, question, approval, lifecycle; [features] hooks = true is not set in config.toml`],
+    ['FAIL', 'Codex hook trust (~/.codex-third): 4 of 4 hooks in ~/.codex-third/hooks.json have no trust entry in config.toml (checked by presence, not hash); a fresh Codex there stops at \'review required\' for each'],
     ['ok', 'lsof absent: Codex sessions\' open rollouts are read from /proc'],
   ]);
-  assert.match(rows[2].fix, /wire keep hook codex <action> to .*keep-tool\/bin\/keep in ~\/\.codex\/hooks\.json/);
+  assert.match(rows[3].fix, /wire keep hook codex <action> to .*keep-tool\/bin\/keep in ~\/\.codex\/hooks\.json/);
   // A link to this checkout is this checkout.
   const linked = path.join(home, 'keep-link');
   fs.symlinkSync(path.join(home, 'keep-tool'), linked);
   assert.equal(report({ keepBin: path.join(linked, 'bin', 'keep') })[0].status, 'ok');
   assert.deepEqual(report({ hasLsof: () => true }).at(-1), { status: 'ok', text: 'lsof present: Codex sessions\' open rollouts are read with it' });
   assert.deepEqual(report({ platform: 'darwin' }).at(-1).status, 'optional');
+});
+
+test('doctor on a node counts each Codex hook\'s trust entry in config.toml, by presence', (t) => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-trust-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { HOME: home, KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main', KEEP_DAEMON_URL: 'http://100.64.0.1:7781' };
+  const keepBin = path.join(home, 'keep-tool', 'bin', 'keep');
+  fs.mkdirSync(path.dirname(keepBin), { recursive: true });
+  fs.writeFileSync(keepBin, '#!/bin/sh\n', { mode: 0o755 });
+  const dir = path.join(home, '.codex');
+  fs.mkdirSync(dir);
+  // Codex's own shape: PascalCase events, two groups on PreToolUse, and a group of two.
+  const command = (action) => ({ type: 'command', command: `${keepBin} hook codex ${action}` });
+  fs.writeFileSync(path.join(dir, 'hooks.json'), JSON.stringify({ hooks: {
+    SessionStart: [{ hooks: [command('start')] }],
+    Stop: [{ hooks: [command('stop'), { type: 'command', command: 'echo also' }] }],
+    SessionEnd: [{ hooks: [command('end')] }],
+    PreToolUse: [{ matcher: 'x', hooks: [command('pre-tool')] }, { hooks: [command('approval')] }],
+    PostToolUse: [{ hooks: [command('post-tool')] }],
+    PermissionRequest: [{ hooks: [command('question')] }],
+    UserPromptSubmit: [{ hooks: [command('lifecycle')] }],
+  } }));
+  const keys = ['session_start:0:0', 'stop:0:0', 'stop:0:1', 'session_end:0:0', 'pre_tool_use:0:0', 'pre_tool_use:1:0',
+    'post_tool_use:0:0', 'permission_request:0:0', 'user_prompt_submit:0:0'];
+  const table = (prefix, key) => `[hooks.state."${prefix}/hooks.json:${key}"]\ntrusted_hash = "sha256:0"\n`;
+  const config = (entries) => fs.writeFileSync(path.join(dir, 'config.toml'), `[features]\nhooks = true\n\n${entries.join('\n')}`);
+  const trust = () => setup.codexHooksReport({ env, keepBin, hasLsof: () => true }).find((row) => row.text.startsWith('Codex hook trust'));
+
+  assert.deepEqual(setup.codexHooksReport({ env: { HOME: home, KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' }, keepBin }), [],
+    'the daemon node reports nothing, as before');
+  config(keys.map((key) => table(dir, key)));
+  assert.deepEqual(trust(), { status: 'ok', text: 'Codex hook trust (~/.codex): all 9 hooks in hooks.json have a trust entry in config.toml (checked by presence, not hash)' });
+  assert.equal(setup.codexHooksReport({ env, keepBin, hasLsof: () => true })[0].status, 'ok', 'the wiring row is unchanged');
+
+  // Two left out, and one for another profile's hooks.json, which is not this one's.
+  config([...keys.slice(2).map((key) => table(dir, key)), table(path.join(home, '.codex-secondary'), keys[0])]);
+  const partial = trust();
+  assert.equal(partial.status, 'FAIL');
+  assert.equal(partial.text, 'Codex hook trust (~/.codex): 2 of 9 hooks in ~/.codex/hooks.json have no trust entry in config.toml (checked by presence, not hash); a fresh Codex there stops at \'review required\' for each');
+  assert.match(partial.fix, /copy the \[hooks\.state\] tables from a profile that has accepted these hooks/);
+  assert.match(partial.fix, /press t once per hook/);
+
+  fs.rmSync(path.join(dir, 'config.toml'));
+  assert.deepEqual([trust().status, trust().text], ['FAIL',
+    'Codex hook trust (~/.codex): no config.toml, so none of the 9 hooks in ~/.codex/hooks.json has a trust entry; a fresh Codex there stops at \'review required\' for each']);
+
+  fs.writeFileSync(path.join(dir, 'config.toml'), '[features]\nhooks = true\n[hooks.state."unterminated\n');
+  const broken = trust();
+  assert.equal(broken.status, 'FAIL');
+  assert.match(broken.text, /^Codex hook trust \(~\/\.codex\): config\.toml unreadable \(.+\); its hook trust entries cannot be counted$/);
+  assert.doesNotMatch(broken.text, /\n/);
 });
 
 test('doctor on a node says whether the Keep Pi extension is where Pi looks for it', (t) => {
