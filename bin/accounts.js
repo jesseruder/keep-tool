@@ -301,7 +301,7 @@ function sessionLocation(sessionId, options = {}) {
   const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
   const env = options.env || process.env;
   const record = readRecord(root, sessionId, env);
-  return record ? { node: record.node, agent: record.agent } : null;
+  return record ? { node: record.node, agent: record.agent, ...(record.accountId ? { accountId: record.accountId } : {}) } : null;
 }
 
 function pinSession(sessionId, agent, accountId, options = {}) {

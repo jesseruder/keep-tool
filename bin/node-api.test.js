@@ -326,3 +326,22 @@ test('the listener state is written where doctor reads it', (t) => {
   nodeApi.writeState(dir, { pid: 1, listen: '100.64.0.1:7781', state: 'listening' });
   assert.deepEqual(nodeApi.readState(dir), { pid: 1, listen: '100.64.0.1:7781', state: 'listening' });
 });
+
+test('only the hook route reads a body past the default limit', async (t) => {
+  const limits = [];
+  const routes = ['/api/hook', '/api/registry'].map((pathname) => ({ method: 'POST', path: pathname, allow: ['node'],
+    handle: async ({ res }) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{}'); } }));
+  const store = nodeApi.createNodeTokenStore({ initial: { aws1: 'aws1-secret' }, read: () => ({ aws1: 'aws1-secret' }) });
+  const handler = nodeApi.createNodeApiHandler({
+    routes, matchRoute, routeDenial, principal: keepConsole.principal, tokenStore: store, log: () => {},
+    readBody: (req, ...limit) => new Promise((resolve) => { limits.push(limit); req.resume(); req.on('end', () => resolve({})); }),
+    bodyLimit: (pathname) => (pathname === '/api/hook' ? require('./hook-route.js').BODY_MAX_BYTES : undefined),
+  });
+  const server = http.createServer(handler);
+  const port = await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+  t.after(() => server.close());
+  const headers = { 'x-keep-node-token': 'aws1-secret', 'x-keep': '1' };
+  assert.equal((await request(port, { method: 'POST', pathname: '/api/hook', headers, body: {} })).status, 200);
+  assert.equal((await request(port, { method: 'POST', pathname: '/api/registry', headers, body: {} })).status, 200);
+  assert.deepEqual(limits, [[7 * 1024 * 1024], []], 'the registry route reads with the default');
+});

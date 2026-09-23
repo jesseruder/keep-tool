@@ -51,6 +51,7 @@ function createNodeApiHandler(options) {
   const {
     routes, matchRoute, routeDenial, readBody, principal, tokenStore,
     json = writeJson, onMutation = null, log = (line) => process.stderr.write(`${line}\n`),
+    bodyLimit = () => undefined,
   } = options;
   const identify = (req) => {
     const auth = () => ({
@@ -73,7 +74,8 @@ function createNodeApiHandler(options) {
       let body;
       if (req.method === 'POST') {
         if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
-        try { body = await readBody(req); } catch (error) { return json(res, 400, { error: error.message }); }
+        const limit = bodyLimit(url.pathname);
+        try { body = await (limit ? readBody(req, limit) : readBody(req)); } catch (error) { return json(res, 400, { error: error.message }); }
       }
       const route = matchRoute(routes, { req, url, body });
       if (!route) return json(res, 404, { error: 'not found' });

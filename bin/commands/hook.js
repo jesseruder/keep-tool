@@ -2048,6 +2048,34 @@ function unattendedContext(agent, description) {
 
 const ATTENDED = { unattended: false, opener: null };
 
+// A hook the daemon runs for a Claude session on another node: bin/hook-route.js
+// sets KEEP_HOOK_NODE beside KEEP_REMOTE_CALLER, both naming that node. The
+// session's pane is on that node's host, so the host is reached there, and a pane is
+// named to it by its bare id; a pane ref for any other node is refused before it is
+// sent. Without KEEP_HOOK_NODE this is the local connect it always was.
+function hookHostConnect(env = process.env) {
+  const hostclient = require('../hostclient.js');
+  const node = env.KEEP_HOOK_NODE;
+  if (!node) return hostclient.connect;
+  return async (options = {}) => {
+    const nodes = require('../nodes.js');
+    if (node !== env.KEEP_REMOTE_CALLER || !nodes.NODE_NAME_RE.test(node) || node === nodes.daemonNode(env)) {
+      throw new Error(`KEEP_HOOK_NODE ${node} is not the node this hook runs for`);
+    }
+    const client = await hostclient.connect({ ...options, node, env });
+    const request = client.request.bind(client);
+    client.request = (type, params, requestOptions) => {
+      if (params && params.pane !== undefined) {
+        const ref = nodes.parsePaneRef(params.pane, { env });
+        if (ref.node !== node || !ref.qualified) return Promise.reject(new Error(`pane ${params.pane} is not on node ${node}`));
+        params = { ...params, pane: ref.paneId };
+      }
+      return request(type, params, requestOptions);
+    };
+    return client;
+  };
+}
+
 // The startup record this session's own pane hook wrote, when it wrote one. Usable in
 // one direction only: a record that says attended, or carries no mark at all, lets a
 // hook skip the host round trip below, because under-reporting `unattended` only ever
@@ -2073,7 +2101,7 @@ async function unattendedState(sessionId, deps = {}) {
   const env = deps.env || process.env;
   const pane = deps.pane || env.KEEP_PANE || '';
   if (!pane) return ATTENDED;
-  const connectHost = deps.connectHost || require('../hostclient.js').connect;
+  const connectHost = deps.connectHost || hookHostConnect(env);
   const timeoutMs = deps.timeoutMs == null ? 500 : deps.timeoutMs;
   let client;
   try {
@@ -2136,7 +2164,8 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
     ? env.KEEP_AGENT_ACCOUNT_ID : null;
   const piInstance = agent === 'pi' && typeof input.instance === 'string' && /^[a-f0-9-]{36}$/.test(input.instance)
     ? input.instance : null;
-  const record = { at, startedAt, cwd, agent, pane, claimed, ...(accountId ? { accountId } : {}),
+  const record = { at, startedAt, cwd, agent, pane, claimed, ...(env.KEEP_HOOK_NODE ? { node: env.KEEP_HOOK_NODE } : {}),
+    ...(accountId ? { accountId } : {}),
     ...(piInstance ? { piInstance } : {}) };
   fs.mkdirSync(dir, { recursive: true });
   (deps.writePaneRecord || writePaneRecord)(file, record);
@@ -2147,7 +2176,7 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
   // Bind the pane to this session unless another session already owns it: a nested
   // agent inherits KEEP_PANE from its parent and must not steal the parent's pane.
   // The host may be mid-reload, so a failed attempt is retried briefly.
-  const connectHost = deps.connectHost || require('../hostclient.js').connect;
+  const connectHost = deps.connectHost || hookHostConnect(env);
   const timeoutMs = deps.timeoutMs == null ? 1000 : deps.timeoutMs;
   const attempts = deps.attempts == null ? 3 : deps.attempts;
   record.bound = false;
@@ -2251,7 +2280,7 @@ async function releaseSessionPane(input, agent = 'claude', deps = {}) {
     (deps.writePaneRecord || writePaneRecord)(file, record);
     return record;
   }
-  const connectHost = deps.connectHost || require('../hostclient.js').connect;
+  const connectHost = deps.connectHost || hookHostConnect(deps.env || process.env);
   const timeoutMs = deps.timeoutMs == null ? 1000 : deps.timeoutMs;
   const attempts = deps.attempts == null ? 3 : deps.attempts;
   // Leave time to persist the release before the SessionEnd hook's 3 s deadline.
@@ -2674,5 +2703,5 @@ function stopHookChecks(input, agent, options, sid, transcript, hint) {
 }
 
 module.exports = { commands, bindRemotePane, releaseRemotePane, remoteCommandGuard, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
-  openerDescription, unattendedContext, unattendedState, enforcedUnattendedState, recordedUnattended,
+  openerDescription, unattendedContext, unattendedState, enforcedUnattendedState, recordedUnattended, hookHostConnect,
   UNATTENDED_DENY_REASON, UNATTENDED_STOP_REASON };

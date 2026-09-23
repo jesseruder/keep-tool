@@ -11782,12 +11782,12 @@ function sessionTaskOwners(tasks) {
   return Object.fromEntries(Object.entries(owners).map(([id, owner]) => [id, owner.taskId]));
 }
 
-function readBody(req) {
+function readBody(req, maxBytes = 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let data = '';
     req.on('data', (c) => {
       data += c;
-      if (data.length > 1024 * 1024) { reject(new Error('body too large')); req.destroy(); }
+      if (data.length > maxBytes) { reject(new Error('body too large')); req.destroy(); }
     });
     req.on('end', () => {
       try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new Error('bad JSON body')); }
@@ -13938,6 +13938,10 @@ function start(deps = {}) {
     root: keep.ROOT, stopping: () => daemonRestartGate.stopping,
   }) : null;
   if (ctx.registryService) registryRunsInFlight = () => ctx.registryService.busy();
+  // A node's Claude hooks, through the registry service's journal and restart gate.
+  ctx.hookService = ctx.registryService ? require('./hook-route.js').createHookService({
+    root: keep.ROOT, stopping: () => daemonRestartGate.stopping, registry: ctx.registryService,
+  }) : null;
   // The restart is the one /api/restart-daemon makes: wait for in-flight work, then
   // mark the request and exit after the answer has gone out.
   ctx.deploySelf = nodeApiListen.enabled ? require('./deploy-self.js').createDeploySelf({
@@ -14069,6 +14073,8 @@ function start(deps = {}) {
       onState: (value) => nodeApi.writeState(keep.ROOT, value),
       handler: nodeApi.createNodeApiHandler({
         routes: requestRoutes, matchRoute, routeDenial, readBody, principal: keepConsole.principal,
+        // A hook post carries up to 4 MiB of transcript, base64-encoded.
+        bodyLimit: (pathname) => (pathname === '/api/hook' ? require('./hook-route.js').BODY_MAX_BYTES : undefined),
         tokenStore: nodeApi.createNodeTokenStore({ initial: nodeTokenMap, read: () => nodes.nodeApiTokens(keep.ROOT) }),
         json,
         onMutation: () => dashboardPublisher?.invalidate(),

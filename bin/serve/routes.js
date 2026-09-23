@@ -54,6 +54,18 @@ function routes(ctx) {
       },
     },
     {
+      // A Claude hook on a pane-only node, run by the daemon's own `keep hook`
+      // against the session's transcript mirror (bin/hook-route.js).
+      method: 'POST',
+      path: '/api/hook',
+      allow: NODE_API_ALLOW,
+      when: nodeApiEnabled,
+      handle: async ({ res, body, principal }) => {
+        const result = await ctx.hookService.handle(principal, body);
+        return json(res, result.status, result.body);
+      },
+    },
+    {
       method: 'GET',
       path: '/api/registry/ping',
       allow: NODE_API_ALLOW,

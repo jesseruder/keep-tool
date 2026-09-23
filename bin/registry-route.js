@@ -225,14 +225,25 @@ function createRegistryService(options = {}) {
 
   function execute(request, caller) {
     const daemon = daemonNode();
+    return spawnKeep([request.command, ...request.args], { cwd: request.cwd, env: childEnv(request, caller, daemon) });
+  }
+
+  // The daemon's own CLI, with a fixed program and argv entries (no shell), output
+  // capped and a timeout that kills it. stdin is closed unless `stdin` is given,
+  // and then it is written and closed. Resolves { status: 200 | 504, body }.
+  function spawnKeep(argv, { cwd, env, stdin = null, timeoutMs: limitMs = timeoutMs }) {
     return new Promise((resolve, reject) => {
       const started = now();
       let child;
       try {
-        child = spawn(execPath, [keepBin, request.command, ...request.args], {
-          cwd: request.cwd, env: childEnv(request, caller, daemon), stdio: ['ignore', 'pipe', 'pipe'], shell: false,
+        child = spawn(execPath, [keepBin, ...argv], {
+          cwd, env, stdio: [stdin === null ? 'ignore' : 'pipe', 'pipe', 'pipe'], shell: false,
         });
       } catch (error) { reject(error); return; }
+      if (stdin !== null && child.stdin) {
+        child.stdin.on('error', () => {});
+        child.stdin.end(stdin);
+      }
       const collect = () => ({ chunks: [], bytes: 0, truncated: false });
       const out = collect();
       const err = collect();
@@ -251,7 +262,7 @@ function createRegistryService(options = {}) {
       const timer = setTimeout(() => {
         timedOut = true;
         try { child.kill('SIGKILL'); } catch {}
-      }, timeoutMs);
+      }, limitMs);
       child.on('error', (error) => {
         spawned = false;
         clearTimeout(timer);
@@ -266,7 +277,7 @@ function createRegistryService(options = {}) {
           ok: !timedOut && status === 0,
           status,
           stdout: text(out),
-          stderr: text(err) + (timedOut ? `\nkeep: the daemon stopped this command after ${Math.round(timeoutMs / 1000)}s\n` : ''),
+          stderr: text(err) + (timedOut ? `\nkeep: the daemon stopped this command after ${Math.round(limitMs / 1000)}s\n` : ''),
           durationMs: now() - started,
           ...(timedOut ? { timedOut: true } : {}),
           ...(signal && !timedOut ? { signal } : {}),
@@ -286,56 +297,67 @@ function createRegistryService(options = {}) {
         parsePaneRef: (ref) => nodes.parsePaneRef(ref),
         formatPaneRef: (node, paneId) => nodes.formatPaneRef(node, paneId),
       });
-      prune();
-      const digest = digestOf(request);
-      const file = journalFile(caller, request.idempotencyKey);
-      // A second request with the same key waits for the first, then reads what it
-      // left, exactly as a retry after it would.
-      while (inflight.has(file)) await inflight.get(file).catch(() => {});
-      const stored = readJournal(file, caller);
-      if (stored) {
-        if (stored.digest !== digest) return { status: 409, body: { error: 'this idempotency key was used for a different request' } };
-        if (!stored.response) return { status: 409, body: { error: unfinished(stored), interrupted: true } };
-        return { status: stored.response.status, body: { ...stored.response.body, replayed: true } };
-      }
-      // Checked in the same tick the run is counted, so a restart either waits for
-      // it or it is never admitted.
-      if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };
-      admitted += 1;
-      const pending = serialised(caller, async () => {
-        // Before the child exists: whatever happens to this daemon from here, a
-        // retry finds that the command may have run.
-        writeJournal(file, {
-          version: 1, node: caller, digest, started: true, pid: process.pid, instance, at: new Date(now()).toISOString(),
-        });
-        let response;
-        try { response = await execute(request, caller); }
-        catch (error) {
-          // Nothing was spawned, so nothing ran: a retry may run it.
-          try { io.unlinkSync(file); } catch {}
-          throw error;
-        }
-        // Written before anyone is answered: a retry that arrives the moment this
-        // one returns must find it. The command has run either way, so a failed
-        // write is said, not turned into an error.
-        try {
-          writeJournal(file, { version: 1, node: caller, digest, at: new Date(now()).toISOString(), response });
-          return { response, journaled: true };
-        } catch (error) {
-          log(`registry: ${caller} ran keep ${request.command}${request.nodeCwd ? ` from ${request.nodeCwd}` : ''} but its journal entry could not be written: ${error.message}`);
-          return { response, journaled: false };
-        }
+      return await journaled({
+        caller, key: request.idempotencyKey, digest: digestOf(request), queue: caller,
+        run: () => execute(request, caller),
+        what: `keep ${request.command}${request.nodeCwd ? ` from ${request.nodeCwd}` : ''}`,
       });
-      inflight.set(file, pending);
-      let outcome;
-      try { outcome = await pending; }
-      finally { inflight.delete(file); admitted -= 1; }
-      const { response, journaled } = outcome;
-      return { status: response.status, body: { ...response.body, replayed: false, ...(journaled ? {} : { journaled: false }) } };
     } catch (error) {
       if (error instanceof RegistryError) return { status: error.status, body: { error: error.message } };
       return { status: 500, body: { error: error.message } };
     }
+  }
+
+  // One request under its idempotency key: a stored answer is replayed, a key used
+  // for another request or a run that never recorded its end is refused, and
+  // otherwise `run` is called once, serialised on `queue`, between a started record
+  // and its response. Throws RegistryError for an unreadable journal entry.
+  async function journaled({ caller, key, digest, queue, run, what }) {
+    prune();
+    const file = journalFile(caller, key);
+    // A second request with the same key waits for the first, then reads what it
+    // left, exactly as a retry after it would.
+    while (inflight.has(file)) await inflight.get(file).catch(() => {});
+    const stored = readJournal(file, caller);
+    if (stored) {
+      if (stored.digest !== digest) return { status: 409, body: { error: 'this idempotency key was used for a different request' } };
+      if (!stored.response) return { status: 409, body: { error: unfinished(stored), interrupted: true } };
+      return { status: stored.response.status, body: { ...stored.response.body, replayed: true } };
+    }
+    // Checked in the same tick the run is counted, so a restart either waits for
+    // it or it is never admitted.
+    if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };
+    admitted += 1;
+    const pending = serialised(queue, async () => {
+      // Before the child exists: whatever happens to this daemon from here, a
+      // retry finds that the command may have run.
+      writeJournal(file, {
+        version: 1, node: caller, digest, started: true, pid: process.pid, instance, at: new Date(now()).toISOString(),
+      });
+      let response;
+      try { response = await run(); }
+      catch (error) {
+        // Nothing was spawned, so nothing ran: a retry may run it.
+        try { io.unlinkSync(file); } catch {}
+        throw error;
+      }
+      // Written before anyone is answered: a retry that arrives the moment this
+      // one returns must find it. The command has run either way, so a failed
+      // write is said, not turned into an error.
+      try {
+        writeJournal(file, { version: 1, node: caller, digest, at: new Date(now()).toISOString(), response });
+        return { response, journaled: true };
+      } catch (error) {
+        log(`registry: ${caller} ran ${what} but its journal entry could not be written: ${error.message}`);
+        return { response, journaled: false };
+      }
+    });
+    inflight.set(file, pending);
+    let outcome;
+    try { outcome = await pending; }
+    finally { inflight.delete(file); admitted -= 1; }
+    const { response, journaled: recorded } = outcome;
+    return { status: response.status, body: { ...response.body, replayed: false, ...(recorded ? {} : { journaled: false }) } };
   }
 
   // A started record nobody here is waiting on: its run never recorded an end.
@@ -362,7 +384,17 @@ function createRegistryService(options = {}) {
     }
   }
 
-  return { handle, ping, journalDir, busy: () => admitted > 0 };
+  // What bin/hook-route.js runs its requests through: the same caller rule, journal,
+  // serialisation, restart gate and subprocess, so a restart waits for both kinds.
+  const shared = {
+    root, daemonNode, location, nodes, now, baseEnv,
+    callerNode: (principal) => callerNode(principal, daemonNode()),
+    journaled, spawnKeep, childEnv,
+    parsePaneRef: (ref) => nodes.parsePaneRef(ref),
+    formatPaneRef: (node, paneId) => nodes.formatPaneRef(node, paneId),
+  };
+
+  return { handle, ping, journalDir, busy: () => admitted > 0, shared };
 }
 
 module.exports = {
