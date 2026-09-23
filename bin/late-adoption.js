@@ -23,8 +23,10 @@
 // does not have, a record that places the session elsewhere) is remembered for
 // NEGATIVE_TTL_MS per (node, session), so a flood of refused posts asks the host once;
 // one that can is not: no pane names the session yet (the node's own bind lands
-// milliseconds after its start posts) or two do. A host that could not be asked, and
-// a pane other than the one the request names, are remembered for SHORT_TTL_MS.
+// milliseconds after its start posts) or two do, nor one the request itself caused (a
+// pane other than the one it names). A host that could not be asked is remembered for
+// SHORT_TTL_MS. What is remembered is keyed by the request's agent and pane as well,
+// so one request's refusal never turns away another's.
 // The routes exist only on the node listener: a single-node install
 // never gets here.
 const crypto = require('node:crypto');
@@ -154,7 +156,7 @@ function createLateAdoption(options = {}) {
     if (meta.node !== undefined && meta.node !== null && meta.node !== caller) {
       return refusal(`the pane says it is on ${meta.node}`);
     }
-    if (requestPane && requestPane !== pane.id) return refusal(`the request names pane ${requestPane}, not ${pane.id}`, SHORT_TTL_MS);
+    if (requestPane && requestPane !== pane.id) return refusal(`the request names pane ${requestPane}, not ${pane.id}`, 0);
     const accountId = meta.accountId;
     if (typeof accountId !== 'string' || !ACCOUNT_RE.test(accountId)) return refusal('the pane names no account');
     let account = null;
@@ -223,7 +225,7 @@ function createLateAdoption(options = {}) {
       if (!parsed || parsed.node !== caller) return { adopted: false, why: 'the pane is not on the caller' };
       requestPane = parsed.paneId;
     }
-    const key = `${caller}\0${sessionId}`;
+    const key = `${caller}\0${sessionId}\0${agent}\0${requestPane || ''}`;
     const until = refusedUntil.get(key);
     if (until !== undefined) {
       if (until > now()) return { adopted: false, why: 'refused moments ago', cached: true };

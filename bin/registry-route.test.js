@@ -811,3 +811,19 @@ test('late adoption gives up on a node host that never answers its hello within 
   assert.match(result.why, /could not be asked/);
   assert.ok(elapsed < 2000, `bounded by the hello timeout (${elapsed} ms)`);
 });
+
+test('a request naming the wrong pane neither blocks nor delays the right one', async (t) => {
+  const { svc, root, host } = adoptingService(t, [lateCodexPane()]);
+  const wrong = await svc.handle(AWS1, lateBody(root, { pane: 'p8@aws1', idempotencyKey: 'k-wrong-pane-0123456789' }));
+  assert.equal(wrong.status, 403);
+  const right = await svc.handle(AWS1, lateBody(root));
+  assert.equal(right.status, 200, JSON.stringify(right.body));
+  assert.equal(host.asked, 2);
+  // A refusal that is remembered is remembered for that request's pane only.
+  const other = adoptingService(t, [lateCodexPane({ agent: 'claude' })]);
+  assert.equal((await other.svc.handle(AWS1, lateBody(other.root))).status, 403);
+  assert.equal((await other.svc.handle(AWS1, lateBody(other.root, { pane: null, idempotencyKey: 'k-no-pane-0123456789' }))).status, 403);
+  assert.equal(other.host.asked, 2, 'a request naming no pane is asked for on its own');
+  assert.equal((await other.svc.handle(AWS1, lateBody(other.root, { pane: null, idempotencyKey: 'k-no-pane-1123456789' }))).status, 403);
+  assert.equal(other.host.asked, 2);
+});
