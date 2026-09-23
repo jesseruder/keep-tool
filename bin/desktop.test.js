@@ -217,3 +217,60 @@ test('native notifications carry their session key and recover early and subsequ
   await context.acknowledgeNotificationClick('early-session');
   assert.equal(pending, 'next-session', 'an older navigation must not clear a newer click');
 });
+
+// The chooser's `node` reaches /api/open for a new session and a card's first
+// conversation, and nothing is sent when it was left on Automatic.
+function openFlowContext(selection, result) {
+  const opens = [];
+  const toasts = [];
+  const context = vm.createContext({
+    api: { openSession: async (body) => { opens.push(body); return result; }, reopenSession: async () => assert.fail('not a reopen') },
+    data: { sessions: [], panes: [], accounts: [] },
+    reopeningSessions: new Map(),
+    reload: async () => {}, paneMap: () => new Map(), taskFor: () => null, toast: (message) => toasts.push(message),
+    openSessionChooser: async (_ctx, options) => { context.chooserOptions = options; await options.onSubmit(selection); return true; },
+    openPortableTransfer() {}, pinPane() {}, dropPane: async () => {}, startShell: async () => assert.fail('not a shell'),
+    ctx: { openReviewPane() {} }, crypto: { randomUUID: () => 'request-1' },
+    state: {}, projectOf: () => ({ name: 'repo' }), refresh() {},
+  });
+  vm.runInContext(app.slice(app.indexOf('async function startChosenSession'), app.indexOf('async function removePane')), context);
+  return { context, opens, toasts };
+}
+
+test('a new session sends the chosen node to /api/open, and none on Automatic', async () => {
+  for (const [node, expected] of [['aws1', { node: 'aws1' }], [undefined, {}]]) {
+    const selection = { kind: 'claude', agent: 'claude', accountId: 'claude-main', model: '', cwd: '/repo', ...(node ? { node } : {}) };
+    const { context, opens, toasts } = openFlowContext(selection, { pane: 'p1' });
+    await context.newSession('/repo', 'repo', async () => {});
+    assert.equal(context.chooserOptions.chooseNode, true);
+    assert.deepEqual(JSON.parse(JSON.stringify(opens)), [{ fresh: true, cwd: '/repo', agent: 'claude', accountId: 'claude-main', requestId: 'request-1', ...expected }]);
+    assert.deepEqual(toasts, []);
+  }
+});
+
+test('a fresh Codex on another node that registers later is reported as started', async () => {
+  const selection = { kind: 'codex', agent: 'codex', accountId: 'codex-main', model: '', cwd: '/repo', node: 'aws1' };
+  const { context, toasts } = openFlowContext(selection, { pane: 'p1@aws1', node: 'aws1', sessionId: null, pendingRegistration: true });
+  await context.newSession('/repo', 'repo', async () => {});
+  assert.deepEqual(toasts, ['Started codex on aws1; it registers at its first turn']);
+});
+
+test("a card's first conversation sends the chosen node, and a reopen offers no machine", async () => {
+  for (const [node, expected] of [['aws1', { node: 'aws1' }], [undefined, {}]]) {
+    const selection = { kind: 'claude', agent: 'claude', accountId: 'claude-main', model: '', ...(node ? { node } : {}) };
+    const { context, opens } = openFlowContext(selection, { pane: 'p1' });
+    await context.reopenSession({ taskId: 'card-1', title: 'Card' });
+    assert.equal(context.chooserOptions.chooseNode, true);
+    assert.deepEqual(JSON.parse(JSON.stringify(opens)), [{ taskId: 'card-1', fresh: true, agent: 'claude', accountId: 'claude-main', requestId: 'request-1', ...expected }]);
+  }
+  const pending = openFlowContext({ kind: 'codex', agent: 'codex', accountId: 'codex-main', model: '', node: 'aws1' },
+    { pane: 'p1@aws1', node: 'aws1', sessionId: null, pendingRegistration: true, card: 'card-1' });
+  await pending.context.reopenSession({ taskId: 'card-1', title: 'Card' });
+  assert.deepEqual(pending.toasts, ['Started codex on aws1; it registers at its first turn']);
+
+  const reopen = openFlowContext({ kind: 'claude', agent: 'claude', accountId: 'claude-main', model: '' }, { pane: 'p2' });
+  reopen.context.data.sessions.push({ id: 's1', kind: 'claude', accountId: 'claude-main' });
+  await reopen.context.reopenSession({ sessionId: 's1', title: 'Old' });
+  assert.equal(reopen.context.chooserOptions.chooseNode, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(reopen.opens)), [{ sessionId: 's1', agent: 'claude', accountId: 'claude-main' }]);
+});

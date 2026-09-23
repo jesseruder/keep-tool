@@ -20,6 +20,18 @@ function ensureDialog() {
   return dialog;
 }
 
+// The machines the daemon publishes (serve.js addNodeState), daemon node first. A
+// one-node install publishes just its own, and an older daemon none: either way the
+// chooser shows no Machine field and sends no `node`.
+function nodesFor(ctx) {
+  return Array.isArray(ctx.data?.nodes) ? ctx.data.nodes.filter((node) => node && typeof node.name === 'string' && node.name) : [];
+}
+
+function nodeLabel(node) {
+  if (node.daemon) return `${node.name} (this machine)`;
+  return node.ok === false ? `${node.name} (unreachable: ${node.reason || 'no answer'})` : node.name;
+}
+
 function accountsFor(ctx, agent) {
   return (ctx.data.accounts || []).filter((account) => account.agent === agent);
 }
@@ -48,8 +60,17 @@ export function openSessionChooser(ctx, options) {
       pi: options.models?.pi ?? (options.agent === 'pi' ? options.model || '' : ''),
     },
     customModel: {},
+    // '' is Automatic: no `node` is sent, and the daemon's placement decides.
+    node: '',
     error: '', busy: false, bound: false,
   };
+  const nodes = options.chooseNode === true ? nodesFor(ctx) : [];
+  const daemonNode = nodes.find((node) => node.daemon)?.name || '';
+  const nodeChoice = () => nodes.length >= 2 && state.kind !== 'shell';
+  // Pi runs on the daemon node only, so it is named rather than left to placement,
+  // which could otherwise pick the card's last node and be refused.
+  const chosenNode = () => (!nodeChoice() ? undefined
+    : state.kind === 'pi' ? daemonNode || undefined : state.node || undefined);
 
   for (const kind of ['claude', 'codex', 'pi']) state.customModel[kind] = isCustomModel(kind, state.models[kind]);
 
@@ -74,6 +95,10 @@ export function openSessionChooser(ctx, options) {
     const modelField = state.kind === 'shell' || options.showModel === false ? ''
       : `<label>Model<select data-launch-model ${locked}>${modelOptions.map(([value, text]) => `<option value="${ctx.esc(value)}" ${value === selectedModel ? 'selected' : ''}>${ctx.esc(text)}</option>`).join('')}</select>${customModel
         ? `<input data-launch-model-custom aria-label="Model id" autocomplete="off" spellcheck="false" ${locked} value="${ctx.esc(model)}" placeholder="Model id">` : ''}</label>`;
+    const nodeField = !nodeChoice() ? ''
+      : state.kind === 'pi'
+        ? `<label>Machine <span>Pi sessions run on this machine only</span><select data-launch-node disabled><option value="${ctx.esc(daemonNode)}" selected>${ctx.esc(nodeLabel(nodes.find((node) => node.daemon) || { name: daemonNode, daemon: true }))}</option></select></label>`
+        : `<label>Machine<select data-launch-node ${locked}><option value="" ${state.node ? '' : 'selected'}>Automatic</option>${nodes.map((node) => `<option value="${ctx.esc(node.name)}" ${node.name === state.node ? 'selected' : ''} ${node.ok === false ? 'disabled' : ''}>${ctx.esc(nodeLabel(node))}</option>`).join('')}</select></label>`;
     const projectField = options.editableDirectory
       ? `<label class="wide">Directory <span>Absolute path to an existing directory</span><input data-launch-directory autocomplete="off" spellcheck="false" ${state.busy || state.bound ? 'disabled' : ''} value="${ctx.esc(state.directory)}" placeholder="/absolute/path/to/project"></label>`
       : `<div class="session-launch-value wide"><span>Project</span><strong class="mono">${ctx.esc(options.project || 'Unknown project')}</strong></div>`;
@@ -82,7 +107,7 @@ export function openSessionChooser(ctx, options) {
     modal.dataset.launchRun = runId;
     modal.innerHTML = `<form method="dialog" class="session-launch-card">
       <header><div><span class="eyebrow">${ctx.esc(options.eyebrow || 'Session')}</span><h2 id="session-launch-title">${ctx.esc(options.title || 'New session')}</h2><p>${ctx.esc(options.description || '')}</p></div><button class="btn" type="button" data-launch-cancel ${state.busy ? 'disabled' : ''} aria-label="Close">Close</button></header>
-      <div class="session-launch-fields">${providerField}${accountField}${modelField}${projectField}</div>
+      <div class="session-launch-fields">${providerField}${accountField}${modelField}${nodeField}${projectField}</div>
       ${unavailable ? `<p class="session-launch-error" role="alert">${ctx.esc(unavailable)}</p>` : state.error ? `<p class="session-launch-error" role="alert">${ctx.esc(state.error)}</p>` : ''}
       <footer>${options.onTransfer ? `<button class="btn" type="button" data-launch-transfer ${state.busy || state.bound ? 'disabled' : ''}>Transfer context…</button>` : '<span></span>'}<button class="btn" type="button" data-launch-cancel ${state.busy ? 'disabled' : ''}>Cancel</button><button class="btn primary" type="submit" data-launch-submit ${state.busy || noAccount || !state.accountId && state.kind !== 'shell' ? 'disabled' : ''}>${ctx.esc(state.busy ? 'Opening…' : state.bound ? 'Resume setup' : options.confirmLabel || 'Open')}</button></footer>
     </form>`;
@@ -104,6 +129,10 @@ export function openSessionChooser(ctx, options) {
       render();
       queueMicrotask(() => modal.querySelector(custom ? '[data-launch-model-custom]' : '[data-launch-model]')?.focus());
     });
+    modal.querySelector('[data-launch-node]')?.addEventListener('change', (event) => {
+      if (state.busy || state.kind === 'pi') return;
+      state.node = event.target.value;
+    });
     modal.querySelector('[data-launch-model-custom]')?.addEventListener('input', (event) => { state.models[state.kind] = event.target.value; });
     modal.querySelector('[data-launch-directory]')?.addEventListener('input', (event) => { state.directory = event.target.value; });
     modal.querySelectorAll('[data-launch-cancel]').forEach((button) => button.addEventListener('click', () => { if (!state.busy) modal.close(); }));
@@ -123,11 +152,13 @@ export function openSessionChooser(ctx, options) {
         return;
       }
       if (options.editableDirectory) state.directory = directory;
+      const node = chosenNode();
       state.busy = true; state.error = ''; render();
       try {
         await options.onSubmit({ kind: state.kind, agent: state.kind === 'shell' ? null : state.kind,
           accountId: state.kind === 'shell' ? null : state.accountId,
           model: state.kind === 'shell' ? '' : String(state.models[state.kind] || '').trim(),
+          ...(node ? { node } : {}),
           ...(options.editableDirectory ? { cwd: directory } : {}) });
         if (modal.open && modal.dataset.launchRun === runId) modal.close();
       } catch (error) {

@@ -619,10 +619,16 @@ async function startShell(cwd, name) {
 async function startChosenSession(cwd, name, selection, requestId) {
   if (selection.kind === 'shell') return startShell(cwd, name);
   const result = await api.openSession({ fresh: true, cwd, agent: selection.agent, accountId: selection.accountId, requestId,
-    ...(selection.model ? { model: selection.model } : {}) });
+    ...(selection.model ? { model: selection.model } : {}), ...(selection.node ? { node: selection.node } : {}) });
   await reload();
+  // A fresh Codex on another node with no opening message has no session id until
+  // its first turn: started, not failed.
+  if (result.pendingRegistration) toast(pendingRegistrationText(selection, result));
   return paneMap().get(result.pane) || { id: result.pane,
     meta: { agent: selection.agent, accountId: selection.accountId, project: cwd } };
+}
+function pendingRegistrationText(selection, result) {
+  return `Started ${selection.agent} on ${result.node || selection.node || 'its machine'}; it registers at its first turn`;
 }
 async function newSession(cwd, name, onOpened) {
   const requestId = globalThis.crypto?.randomUUID?.() || `open-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -631,7 +637,7 @@ async function newSession(cwd, name, onOpened) {
   await openSessionChooser(ctx, {
     title: 'New session', description: 'Choose what to open and where.', project: cwd,
     directory: cwd, editableDirectory: true,
-    kinds: ['shell', 'claude', 'codex', 'pi'], initialKind: 'shell', confirmLabel: 'Open session',
+    kinds: ['shell', 'claude', 'codex', 'pi'], initialKind: 'shell', confirmLabel: 'Open session', chooseNode: true,
     models: { claude: 'claude-fable-5-1', codex: '' },
     async onSubmit(selection) {
       state.pendingFocus = true;
@@ -674,6 +680,8 @@ async function reopenSession({ sessionId, taskId, agent, title, stalePane, proje
     description: freshCard ? 'Start the first conversation for this card.' : 'Resume this conversation without sending a new instruction. Large conversations compact automatically.',
     project: launchProject, kinds: freshCard ? ['claude', 'codex', 'pi'] : [provider], initialKind: freshCard ? 'claude' : provider,
     accountId: currentAccountId, requireRecordedAccount: !freshCard, showModel: freshCard, confirmLabel: freshCard ? 'Start conversation' : 'Reopen',
+    // Only a card's first conversation picks a machine: an existing one resumes where it runs.
+    chooseNode: freshCard,
     models: freshCard ? { claude: 'claude-fable-5-1', codex: '' } : undefined,
     onTransfer: sessionId ? () => openPortableTransfer(ctx, sessionId) : null,
     async onSubmit(selection) {
@@ -683,6 +691,7 @@ async function reopenSession({ sessionId, taskId, agent, title, stalePane, proje
         const request = freshCard
           ? { taskId, fresh: true, agent: selection.agent, accountId: selection.accountId, requestId,
             ...(selection.model ? { model: selection.model } : {}),
+            ...(selection.node ? { node: selection.node } : {}),
             // From the Queue's Inbox: refused unless the card is still in the
             // inbox, and moved to active once the session launches.
             ...(fromInbox ? { fromInbox: true } : {}) }
@@ -711,7 +720,8 @@ async function reopenSession({ sessionId, taskId, agent, title, stalePane, proje
         const account = (data.accounts || []).find((entry) => entry.id === selection.accountId);
         // An inbox Open that launched but could not move its card says so: the
         // session is running either way.
-        toast(`${freshCard ? 'Started' : 'Reopened'} "${title || taskId || sessionId}"${account ? ` on ${account.label || account.id}` : ''}${result.statusWarning ? `; ${result.statusWarning}` : ''}`, {
+        toast(result.pendingRegistration ? pendingRegistrationText(selection, result)
+          : `${freshCard ? 'Started' : 'Reopened'} "${title || taskId || sessionId}"${account ? ` on ${account.label || account.id}` : ''}${result.statusWarning ? `; ${result.statusWarning}` : ''}`, {
           label: 'Pin', run: () => pinPane(result.pane, title),
         });
         return result;
