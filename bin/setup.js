@@ -891,6 +891,31 @@ async function nodeApiReport(deps = {}) {
   }
 }
 
+// Hook delivery, from whichever side this machine is on. On a node with a daemon
+// URL: how many hook events wait in its queue, and the newest transcript cursor. On
+// the daemon node with a node API: how much each node's transcript mirrors hold.
+function hookDeliveryReport(deps = {}) {
+  const env = deps.env || process.env;
+  const where = require('./nodes.js').paneOnlyNode(env);
+  if (where) {
+    if (!env.KEEP_DAEMON_URL) return [];
+    const { queued, newest } = require('./hook-client.js').report(env);
+    const cursor = newest
+      ? `newest transcript cursor: session ${newest.session} at ${Number(newest.sent) || 0} bytes, ${new Date(newest.mtimeMs).toISOString()}`
+      : 'no transcript cursors yet';
+    if (!queued) return [{ status: 'ok', text: `hook queue empty; ${cursor}` }];
+    return [{ status: 'optional', text: `hook queue: ${queued} event(s) waiting for ${where.daemon}; ${cursor}`,
+      fix: 'the next hook resends them once the daemon answers; keep doctor above says whether it does' }];
+  }
+  const listen = (deps.nodeApiListen || require('./node-registry.js').nodeApiListen)(env);
+  if (!listen.enabled) return [];
+  const usage = require('./transcript-mirror.js').usage(deps.root || require('./keep-core.js').ROOT);
+  const names = Object.keys(usage).sort();
+  if (!names.length) return [{ status: 'ok', text: 'transcript mirrors: none yet' }];
+  const mib = (bytes) => `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  return [{ status: 'ok', text: `transcript mirrors: ${names.map((name) => `${name} ${mib(usage[name].bytes)} in ${usage[name].mirrors} mirror(s)`).join(', ')}` }];
+}
+
 async function doctor(root) {
   let failed = false;
   const check = (name, fn, required = true) => {
@@ -939,7 +964,7 @@ async function doctor(root) {
     if (entry.fix) console.log(`  fix: ${entry.fix}`);
     if (entry.status === 'FAIL') failed = true;
   }
-  for (const entry of [...await nodeHomeReport(), ...await nodeApiReport({ root })]) {
+  for (const entry of [...await nodeHomeReport(), ...await nodeApiReport({ root }), ...hookDeliveryReport({ root })]) {
     console.log(`${entry.status}: ${entry.text}`);
     if (entry.fix) console.log(`  fix: ${entry.fix}`);
     if (entry.status === 'FAIL') failed = true;
@@ -952,7 +977,7 @@ async function doctor(root) {
 }
 
 module.exports = {
-  init, installHooks, installSkills, service, node, doctor, nodeHomeReport, nodeApiReport, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
+  init, installHooks, installSkills, service, node, doctor, nodeHomeReport, nodeApiReport, hookDeliveryReport, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
   HOOK_ACTIONS, missingHooks, hookTargets, hookTarget,
   loadPacks, configuredPacks, installPackNames, skillPlans, applySkillPlans, reportSkillPlans, listPacks,
   recordPacks, recordPreflight,

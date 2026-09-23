@@ -367,15 +367,27 @@ function sessionNumberContext(sessionId) {
 
 // ---------- pane-only nodes ----------
 
-// A session on a machine that holds terminals for another one's registry. Until
-// phase 3 carries its hooks to the daemon, nothing here may write a registry: one
-// on this machine would be a second, diverging copy, and the daemon's is out of
-// reach. What stays is what the terminal host on this machine needs: the pane is
-// bound to the session at start and released at the end, so the console can show
-// it and Owner can type into it, restart it and close it.
-function paneOnlyNotice(where) {
-  return `Keep: this session is unmanaged on node ${where.local}; the daemon is on ${where.daemon}. `
-    + 'keep checkin and other registry commands are not available here until phase 3.';
+// A session on a machine that holds terminals for another one's registry. Nothing
+// here may write a registry: one on this machine would be a second, diverging copy.
+// What stays is what the terminal host on this machine needs: the pane is bound to
+// the session at start and released at the end, so the console can show it and
+// Owner can type into it, restart it and close it. With KEEP_DAEMON_URL a Claude
+// session's hooks and every registry command go to the daemon; this notice is then
+// what a start says when the daemon did not answer it (`url`, agent claude), or
+// what a Codex start says, whose hooks are not carried yet.
+const NODE_UNAVAILABLE = 'Not available on this node: keep tell, keep open, keep codex task, and admin commands'
+  + ' such as keep serve, keep restart-daemon and keep nodes add.';
+
+function paneOnlyNotice(where, options = {}) {
+  const head = `Keep: this session is unmanaged on node ${where.local}; the daemon is on ${where.daemon}. `;
+  if (!options.url) {
+    return `${head}keep checkin and other registry commands are not available here: this node has no KEEP_DAEMON_URL`
+      + ' (keep node init --daemon-url).';
+  }
+  const reach = options.agent === 'claude'
+    ? `Its hooks and registry commands reach the daemon at ${options.url}; the daemon did not answer this start, so it is queued and resent with the next hook.`
+    : `Registry commands (keep checkin, keep add, keep reviewed, keep land and the rest) reach the daemon at ${options.url}; this session's hooks do not yet.`;
+  return `${head}${reach} ${NODE_UNAVAILABLE}`;
 }
 
 function remoteHookTarget(input, deps = {}) {
@@ -515,7 +527,7 @@ async function carriedHook(kind, input, where, deps = {}) {
   }
   // Undelivered: each event's safe default. A stop is let through, a question is
   // allowed, an end has released this node's pane, and a start says what it is.
-  if (kind === 'session-start') console.log(paneOnlyNotice(where));
+  if (kind === 'session-start') console.log(paneOnlyNotice(where, { url: where.url, agent: 'claude' }));
 }
 
 // Every hook action on a pane-only node. Nothing below reads or writes ROOT or META.
@@ -554,7 +566,8 @@ async function remoteHook(argv, input, where, deps = {}) {
     try {
       if (argv[1] === 'start') {
         await bindRemotePane(input, 'codex', deps);
-        out = { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: paneOnlyNotice(where) } };
+        const remote = require('../remote-cli.js').remoteMode(env);
+        out = { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: paneOnlyNotice(where, { url: remote && remote.url, agent: 'codex' }) } };
       } else if (argv[1] === 'end') {
         await releaseRemotePane(input, deps);
       } else if (argv[1] === 'pre-tool') {

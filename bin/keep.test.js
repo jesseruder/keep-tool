@@ -1795,7 +1795,8 @@ test('on a pane-only node the hooks bind the pane, say so, and write no registry
     const started = await hook(['session-start'], 'far-session', pane);
     assert.equal(started.status, 0, started.stderr);
     assert.equal(started.stdout, 'Keep: this session is unmanaged on node aws1; the daemon is on main. '
-      + 'keep checkin and other registry commands are not available here until phase 3.\n');
+      + 'keep checkin and other registry commands are not available here: this node has no KEEP_DAEMON_URL'
+      + ' (keep node init --daemon-url).\n');
     // The host on this machine still learns whose pane it is.
     assert.equal(f.panes.get(pane).meta.sessionId, 'far-session');
     assert.equal(f.panes.get(pane).meta.agent, 'claude');

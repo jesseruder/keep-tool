@@ -160,7 +160,9 @@ test('a daemon that is not there gets each event\'s safe default, and the delive
   const url = await closedUrl();
   const start = await f.hook('session-start', url);
   assert.equal(start.status, 0);
-  assert.match(start.stdout, /^Keep: this session is unmanaged on node aws1; the daemon is on main\./);
+  assert.equal(start.stdout, 'Keep: this session is unmanaged on node aws1; the daemon is on main. '
+    + `Its hooks and registry commands reach the daemon at ${url}; the daemon did not answer this start, so it is queued and resent with the next hook. `
+    + 'Not available on this node: keep tell, keep open, keep codex task, and admin commands such as keep serve, keep restart-daemon and keep nodes add.\n');
   for (const event of ['stop', 'notification', 'lifecycle', 'pre-question', 'session-end']) {
     const result = await f.hook(event, url, { hook_event_name: event === 'lifecycle' ? 'PreToolUse' : undefined });
     assert.deepEqual(result, { status: 0, stdout: '', stderr: '' }, event);
@@ -260,7 +262,17 @@ test('without KEEP_DAEMON_URL the hooks are the pane-only hooks they were', asyn
   const before = snapshot(f.registry);
   const start = await f.hook('session-start', '', {}, { KEEP_DAEMON_URL: '' });
   assert.equal(start.status, 0);
-  assert.match(start.stdout, /^Keep: this session is unmanaged on node aws1/);
+  assert.match(start.stdout, /^Keep: this session is unmanaged on node aws1; the daemon is on main\. keep checkin and other registry commands are not available here: this node has no KEEP_DAEMON_URL/);
+  // A Codex start with a daemon URL: registry commands reach it, its hooks do not yet.
+  const codex = await new Promise((resolve) => {
+    const child = spawn(process.execPath, [CLI, 'hook', 'codex', 'start'], { env: f.env('http://127.0.0.1:9'), stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.once('close', () => resolve(stdout));
+    child.stdin.end(JSON.stringify({ session_id: 'codex-aws1', cwd: '/home/node/project' }));
+  });
+  assert.match(JSON.parse(codex).hookSpecificOutput.additionalContext,
+    /Registry commands \(keep checkin, keep add, keep reviewed, keep land and the rest\) reach the daemon at http:\/\/127\.0\.0\.1:9; this session's hooks do not yet\. Not available on this node: keep tell/);
   const stop = await f.hook('stop', '', {}, { KEEP_DAEMON_URL: '' });
   assert.deepEqual(stop, { status: 0, stdout: '', stderr: '' });
   assert.equal(fs.existsSync(path.join(f.home, '.keep-node')), false, 'no delivery state either');

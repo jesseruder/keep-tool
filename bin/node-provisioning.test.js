@@ -192,3 +192,34 @@ test('doctor on a pane-only node says whether KEEP_DAEMON_URL reaches the daemon
   assert.equal(down[0].status, 'FAIL');
   assert.match(down[0].text, /does not reach the daemon/);
 });
+
+test('doctor reports hook delivery: the queue and cursor on a node, the mirrors on the daemon', (t) => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-hook-doctor-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { HOME: home, KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main', KEEP_DAEMON_URL: 'http://100.64.0.1:7781' };
+  assert.deepEqual(setup.hookDeliveryReport({ env: { ...env, KEEP_DAEMON_URL: '' } }), [], 'nothing to deliver to');
+  assert.deepEqual(setup.hookDeliveryReport({ env }), [{ status: 'ok', text: 'hook queue empty; no transcript cursors yet' }]);
+  const client = require('./hook-client.js');
+  fs.mkdirSync(path.join(home, '.keep-node', 'mirror'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.keep-node', 'mirror', 'older.json'), JSON.stringify({ generation: 'g', sent: 5 }));
+  fs.utimesSync(path.join(home, '.keep-node', 'mirror', 'older.json'), new Date(1_600_000_000_000), new Date(1_600_000_000_000));
+  fs.writeFileSync(path.join(home, '.keep-node', 'mirror', 'sess-new.json'), JSON.stringify({ generation: 'g', sent: 1234 }));
+  fs.utimesSync(path.join(home, '.keep-node', 'mirror', 'sess-new.json'), new Date(1_700_000_000_000), new Date(1_700_000_000_000));
+  client.enqueue(env, { event: 'stop', body: { input: { session_id: 's', cwd: '/x' }, identity: { agent: 'claude', sessionId: 's' }, idempotencyKey: 'k-00000000000000001' } });
+  client.enqueue(env, { event: 'notification', body: { input: { session_id: 's', cwd: '/x' }, identity: { agent: 'claude', sessionId: 's' }, idempotencyKey: 'k-00000000000000002' } });
+  const [queued] = setup.hookDeliveryReport({ env });
+  assert.equal(queued.status, 'optional');
+  assert.equal(queued.text, 'hook queue: 2 event(s) waiting for main; newest transcript cursor: session sess-new at 1234 bytes, 2023-11-14T22:13:20.000Z');
+
+  // The daemon side: nothing without a node API, then bytes per node.
+  const root = path.join(home, 'registry');
+  const daemonEnv = { KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' };
+  assert.deepEqual(setup.hookDeliveryReport({ env: daemonEnv, root, nodeApiListen: () => ({ enabled: false }) }), []);
+  const on = () => ({ enabled: true, listen: '100.64.0.1:7781' });
+  assert.deepEqual(setup.hookDeliveryReport({ env: daemonEnv, root, nodeApiListen: on }), [{ status: 'ok', text: 'transcript mirrors: none yet' }]);
+  require('./transcript-mirror.js').append({ root, node: 'aws1', sessionId: 'sess-1', generation: 'g', fromOffset: 0,
+    bytes: Buffer.alloc(3 * 1024 * 1024, 0x61), size: 3 * 1024 * 1024, mtimeMs: 1_700_000_000_000, sourcePath: '/home/node/t.jsonl' });
+  const [mirrors] = setup.hookDeliveryReport({ env: daemonEnv, root, nodeApiListen: on });
+  assert.equal(mirrors.status, 'ok');
+  assert.equal(mirrors.text, 'transcript mirrors: aws1 3.0 MiB in 1 mirror(s)');
+});
