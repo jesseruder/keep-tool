@@ -398,3 +398,39 @@ test('the cleanup removes the source pane only while it is exited and no agent r
     assert.equal(fs.existsSync(provenance), true, 'an unchanged source is released');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('an abandon back drops what the target kept for the session: its hook state and the daemon\'s mirror of it', async () => {
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-move-drop-'));
+  try {
+    const config = path.join(root, 'config.json');
+    fs.mkdirSync(path.join(root, 'claude'));
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [{ id: 'claude-a', label: 'Claude A', agent: 'claude', configDir: path.join(root, 'claude') }],
+      defaultAccounts: { claude: 'claude-a' } }));
+    const env = { ...process.env, KEEP_CONFIG: config };
+    delete env.CLAUDE_CODE_SESSION_ID;
+    const mirror = require('./transcript-mirror.js').paths(root, 'aws1', SID);
+    fs.mkdirSync(path.dirname(mirror.file), { recursive: true });
+    fs.writeFileSync(mirror.file, 'mirror');
+    fs.writeFileSync(mirror.sidecar, '{}');
+    const asked = [];
+    const hostRequest = async (type, params, options) => {
+      if (type === 'hello') return { artifacts: 1, transcript: 1 };
+      asked.push([type, params.op, params.sessionId, options.node]);
+      return { dropped: true };
+    };
+    const record = { id: `mv-${'f'.repeat(24)}`, sessionId: SID, from: 'main', to: 'aws1', accountId: 'claude-a' };
+    const warnings = await serve.sessionMoveDeps({ root, env, daemonNode: 'main', hostRequest }).dropTarget(record);
+    assert.deepEqual(warnings, []);
+    assert.deepEqual(asked, [['artifacts', 'drop-session', SID, 'aws1']]);
+    assert.equal(fs.existsSync(mirror.file), false);
+    assert.equal(fs.existsSync(mirror.sidecar), false);
+    // A node that does not answer is a warning, not a failure; the daemon node keeps nothing to drop.
+    const failing = await serve.sessionMoveDeps({ root, env, daemonNode: 'main', hostRequest: async (type) => {
+      if (type === 'hello') return { artifacts: 1, transcript: 1 };
+      throw new Error('aws1 did not answer');
+    } }).dropTarget(record);
+    assert.match(failing.join('\n'), /aws1 did not drop its hook state: aws1 did not answer/);
+    assert.deepEqual(await serve.sessionMoveDeps({ root, env, daemonNode: 'main', hostRequest: async () => assert.fail('nothing to ask') })
+      .dropTarget({ ...record, from: 'aws1', to: 'main' }), []);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

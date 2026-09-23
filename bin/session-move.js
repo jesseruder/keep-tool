@@ -411,6 +411,10 @@ async function abandonAfterFlip(record, deps) {
     catch (error) { warnings.push(`the copy on ${record.to} was not released: ${error && error.message || error}`); }
     try { await deps.abortStage(record); }
     catch (error) { warnings.push(`the transaction on ${record.to} was not cleared: ${error && error.message || error}`); }
+    // Whatever the target kept for the session (its hook queue and cursor, and the
+    // daemon's mirror of its transcript) goes too, as after a move off it.
+    try { warnings.push(...((await deps.dropTarget(record)) || [])); }
+    catch (error) { warnings.push(`${record.to} did not drop its state for ${record.sessionId}: ${error && error.message || error}`); }
     Object.assign(record, { status: 'abandoned-back', abandonedAt: now(),
       message: `move ${record.id} abandoned after the flip; ${record.sessionId}'s record names ${record.from} again, stopped: keep open ${record.sessionId} resumes it there` });
     if (warnings.length) record.warnings = warnings;

@@ -12541,6 +12541,19 @@ function sessionMoveDeps(deps = {}) {
   const env = deps.env || process.env;
   const daemon = daemonNodeName(deps);
   const listPanes = () => (deps.listHostPanes || listHostPanes)(deps, true);
+  // What a node the session left keeps for it: the daemon's mirror of that node's
+  // transcript and the node's own hook queue and cursor. Nothing on the daemon node.
+  const dropNodeState = async (record, node) => {
+    const warnings = [];
+    if (node === daemon) return warnings;
+    const mirror = require('./transcript-mirror').paths(root, node, record.sessionId);
+    for (const file of [mirror.file, mirror.sidecar]) {
+      try { fs.unlinkSync(file); } catch (error) { if (error.code !== 'ENOENT') warnings.push(`the daemon's mirror of ${node} was not removed: ${error.message}`); }
+    }
+    try { await nodeArtifacts(node, moveNodeAccount(node, accountOf(record), deps), deps).dropSession(record.sessionId); }
+    catch (error) { warnings.push(`${node} did not drop its hook state: ${error.message}`); }
+    return warnings;
+  };
   // A side's artifacts for the session as that side lists them now, by digest.
   const digestsOn = async (record, node) => {
     const listed = await moveEndpoint(node, accountOf(record), deps).list(record.sessionId);
@@ -12621,6 +12634,8 @@ function sessionMoveDeps(deps = {}) {
     // The abandon's flip back, the only other flip a move makes.
     pinBack: (record) => accounts.pinSession(record.sessionId, 'claude', record.accountId,
       { root, env, node: record.from, transferNode: true }),
+    // The abandon's flip back leaves the target the same way a move leaves its source.
+    dropTarget: (record) => dropNodeState(record, record.to),
     releaseTarget: (record) => moveEndpoint(record.to, accountOf(record), deps).release(record.sessionId),
     transfer: (record) => {
       const account = accountOf(record);
@@ -12683,13 +12698,7 @@ function sessionMoveDeps(deps = {}) {
         if (difference) warnings.push(`source changed since the copy (${record.from}: ${difference}); its copy was not released`);
         else await moveEndpoint(record.from, account, deps).release(record.sessionId);
       } catch (error) { warnings.push(`the copy left on ${record.from} was not released: ${error.message}`); }
-      if (record.from !== daemon) {
-        // The daemon's mirror of the node's transcript, and the node's own hook state.
-        const mirror = require('./transcript-mirror').paths(root, record.from, record.sessionId);
-        for (const file of [mirror.file, mirror.sidecar]) { try { fs.unlinkSync(file); } catch {} }
-        try { await nodeArtifacts(record.from, moveNodeAccount(record.from, account, deps), deps).dropSession(record.sessionId); }
-        catch (error) { warnings.push(`${record.from} did not drop its hook state: ${error.message}`); }
-      }
+      warnings.push(...await dropNodeState(record, record.from));
       // The transaction on the target: its emptied stage, its publish record and the
       // backups of what the publish replaced. The provenance record lives beside it,
       // not in it, and stays.

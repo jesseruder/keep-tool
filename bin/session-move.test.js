@@ -81,6 +81,7 @@ function world(options = {}) {
     },
     pinBack: async (record) => { steps.push(['pinBack', record.from]); failing('pinBack'); state.node = record.from; state.backs = (state.backs || 0) + 1; },
     releaseTarget: async (record) => { steps.push(['release', record.to]); },
+    dropTarget: async (record) => { steps.push(['drop', record.to]); return []; },
     waitForPaneRecord: async (record) => {
       steps.push(['wait', record.launch.pane]);
       failing('wait');
@@ -424,7 +425,7 @@ test('an abandon after the flip puts the record back on the source once neither 
     const abandoned = await move.moveSession({ abandon: id }, w.deps);
     assert.equal(abandoned.status, 'abandoned-back');
     assert.match(abandoned.message, /names main again, stopped: keep open sess-moving resumes it there/);
-    assert.deepEqual(names(w.steps), ['reprove', 'target', 'pinBack', 'release', 'abort']);
+    assert.deepEqual(names(w.steps), ['reprove', 'target', 'pinBack', 'release', 'abort', 'drop']);
     assert.equal(w.state.node, 'main');
     assert.equal(w.state.backs, 1);
     const record = move.readMove(w.root, id);
@@ -458,7 +459,7 @@ test('an abandon whose flip back landed before its journal did finishes without 
     w.deps.abortStage = abortStage;
     w.steps.length = 0;
     assert.equal((await move.moveSession({ abandon: id }, w.deps)).status, 'abandoned-back');
-    assert.deepEqual(names(w.steps), ['reprove', 'target', 'release', 'abort']);
+    assert.deepEqual(names(w.steps), ['reprove', 'target', 'release', 'abort', 'drop']);
     assert.equal(w.state.backs, 1, 'the record was flipped back once');
   } finally { w.cleanup(); }
 });
