@@ -2778,6 +2778,38 @@ test('handoff model resolution follows a /model typed after the newest assistant
       real('claude-fable-5-1'), modelCommand('opus'), stdout('Set model to Opus 5 (1M context)'), synthetic,
     ], {}, { meta: { model: 'claude-opus-5[1m]' } }), 'claude-opus-5[1m]',
     'and the label keeps the wide window the session was launched with');
+    // A picker switch with no turn since, on a session resumed without --model (#213): the
+    // only record of the full id is what the harness saved into the account's settings.
+    const savedPicker = [
+      real('claude-opus-5'), modelCommand(''),
+      stdout('Set model to `Fable 5.1` and saved as your default for new sessions'), synthetic,
+    ];
+    const savedAccount = (model, extra = {}) => ({
+      forSession: () => ({ configDir: '/acct' }), managedPreferenceFiles: [],
+      readSettingsFile: (file) => (file === '/acct/settings.json' ? { model, ...extra } : null),
+      readAccountSettings: (file) => (file === '/acct/settings.json' ? model : ''),
+    });
+    assert.equal(resolve('picker-saved-no-launch', savedPicker, savedAccount('claude-fable-5-1[1m]'), { meta: {} },
+      'claude --resume adaa69dd'), 'claude-fable-5-1[1m]',
+    'the saved default is the switch\'s own full id, window included, and the label names it');
+    assert.equal(resolve('picker-saved-other-launch', savedPicker, savedAccount('claude-fable-5-1'),
+      { meta: { model: 'claude-opus-5[1m]' } }), 'claude-fable-5-1',
+    'a launch model the switch moved away from does not stop the saved default proving it');
+    assert.equal(resolve('picker-saved-mismatch', savedPicker, savedAccount('claude-opus-5[1m]'), { meta: {} },
+      'claude --resume adaa69dd'), '<unknown>',
+    'a saved default that is not the model the label names was saved by someone else');
+    assert.equal(resolve('picker-saved-custom-rows', savedPicker,
+      savedAccount('claude-fable-5-1[1m]', { modelPicker: { options: [] } }), { meta: {} },
+      'claude --resume adaa69dd'), '<unknown>', 'renamed picker rows still disqualify every label');
+    assert.equal(resolve('picker-unsaved-no-launch', [
+      real('claude-opus-5'), modelCommand(''), stdout('Set model to `Fable 5.1` for this session only'), synthetic,
+    ], savedAccount('claude-fable-5-1[1m]'), { meta: {} }, 'claude --resume adaa69dd'), '<unknown>',
+    'a switch that did not save the default says nothing about what settings hold');
+    assert.equal(resolve('picker-saved-then-answered-mismatch', [
+      modelCommand(''), stdout('Set model to `Fable 5.1` and saved as your default for new sessions'),
+      real('claude-opus-5'), synthetic,
+    ], savedAccount('claude-fable-5-1[1m]'), { meta: {} }, 'claude --resume adaa69dd'), '<unknown>',
+    'a record after the switch that contradicts the label is not overruled by settings');
     assert.equal(resolve('alias-launch-narrowed', [
       real('claude-fable-5-1'), modelCommand('opus'), stdout('Set model to Opus 5'), synthetic,
     ], {}, { meta: { model: 'claude-opus-5[1m]' } }), 'claude-opus-5',

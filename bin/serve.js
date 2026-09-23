@@ -1341,6 +1341,14 @@ function modelSwitchLabel(stdout) {
   return rest.replace(/\s+(?:and saved\b|for this session\b|·).*$/i, '').trim();
 }
 
+// Whether the confirmation says the harness also wrote the choice into settings.json:
+// `Set model to `Fable 5.1` and saved as your default for new sessions`. Only then is the
+// account's settings model a record of this very switch rather than of some earlier one.
+function modelSwitchSavedDefault(stdout) {
+  const text = String(stdout == null ? '' : stdout).split(/\r?\n/)[0].split('</')[0];
+  return /\band saved as your default\b/i.test(text) && !/couldn't save/i.test(text);
+}
+
 // `Fable 5.1 (1M context)` → family `fable`, version `5-1`. Both are needed: a label with
 // no family, or none of the version digits that tell `claude-opus-5` from
 // `claude-opus-5-1`, names no model this could match.
@@ -1385,7 +1393,7 @@ function resolveLocalModelSwitch(args, following) {
     if (modelSwitchApiError(stdout)) return { model: '<unknown>', label: '', failed: true };
     const label = modelSwitchLabel(stdout);
     if (label == null) return { model: '<unknown>', label: '' };
-    return { model: typed || '<unknown>', label };
+    return { model: typed || '<unknown>', label, saved: modelSwitchSavedDefault(stdout) };
   }
   return { model: '<unknown>', label: '' };
 }
@@ -1514,12 +1522,12 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
 }
 
 function switchResult(event) {
-  const { model, label } = event.resolve ? event.resolve() : resolveLocalModelSwitch(event.args, event.following());
+  const { model, label, saved } = event.resolve ? event.resolve() : resolveLocalModelSwitch(event.args, event.following());
   if (model !== '<unknown>') return { model, source: 'switch', window: 'exact' };
   // Nothing newer than this switch, so no record names the base model it moved to. The
   // label travels out with the sentinel: only handoffCurrentModel holds the launch
-  // metadata that could prove it.
-  return { model, source: 'switch', window: 'unknown', label };
+  // metadata and account settings that could prove it.
+  return { model, source: 'switch', window: 'unknown', label, ...(saved ? { saved: true } : {}) };
 }
 
 // A `/model` older than the newest assistant record: the record confirms the base model,
@@ -1712,7 +1720,7 @@ function handoffCurrentModel(session, pane, processArgs, deps = {}) {
   // record's own `claude-fable-5-1` are the same model with different windows.
   const launch = launchModelId(pane?.meta?.model)
     || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(String(processArgs || ''))?.[1]);
-  const { model, source, window, label, labelReference } = found;
+  const { model, source, window, label, labelReference, saved } = found;
   // A `/model` that named no launchable id — the picker, or a bare alias — left the model
   // it moved to only in the label the harness echoed. Something else has to prove the base
   // that label narrows: the assistant record right after the switch when there is one, and
@@ -1724,9 +1732,18 @@ function handoffCurrentModel(session, pane, processArgs, deps = {}) {
   // resolving, so the ordinary path still reads no settings at all.
   if (model === '<unknown>' && label) {
     const reference = labelReference || launch;
-    if (reference && !customModelPickerPossible(session, processArgs, deps)) {
-      const labelled = modelIdForSwitchLabel(label, reference);
+    if ((reference || saved) && !customModelPickerPossible(session, processArgs, deps)) {
+      const labelled = reference ? modelIdForSwitchLabel(label, reference) : '';
       if (labelled) return labelled;
+      // No turn since the switch, and a launch that named no model or a different one: a
+      // switch the harness confirmed it saved as the default wrote the full id, window
+      // included, into the account's settings.json. That id is the proof when the label
+      // names it, and it is taken verbatim. A label it does not match (someone saved
+      // another model since) still fails closed.
+      if (!labelReference && saved) {
+        const configured = sourceAccountSettingsModel(session, deps);
+        if (configured && modelIdForSwitchLabel(label, configured)) return configured;
+      }
     }
   }
   if (model === '<unknown>') return model;
