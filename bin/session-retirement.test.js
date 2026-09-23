@@ -205,10 +205,10 @@ test('automatic retirement never closes a session listed under Waiting on you or
   const state = { allTasks: [done], pinned: new Set(), attention: [] };
   assert.equal(retirementPlan(base, pane, state, now).reason, null);
   const listed = (patch, extra = {}) => retirementPlan({ ...base, ...patch }, pane, { ...state, ...extra }, now).reason;
-  for (const status of ['running', 'waiting']) {
-    assert.match(listed({ state: status }), /Running & waiting/, status);
-    assert.match(listed({ state: status }, { setAside: { s: { kind: 'dismiss' } } }), /Running & waiting/, status);
-  }
+  for (const status of ['running', 'waiting']) assert.match(listed({ state: status }), /Running & waiting/, status);
+  // Dismissed off Running & waiting, a parked session is no longer listed; refusal()
+  // still keeps a running one open.
+  assert.equal(listed({ state: 'waiting' }, { setAside: { s: { kind: 'dismiss' } } }), null);
   assert.match(listed({}, { setAside: { s: { kind: 'running' } } }), /Running & waiting/);
   const ready = { state: 'needs-input', activity: { needsInput: true, reason: 'next instruction' } };
   assert.match(listed(ready), /Waiting on you/);
@@ -217,8 +217,12 @@ test('automatic retirement never closes a session listed under Waiting on you or
   for (const kind of ['dismiss', 'snooze', 'dependency']) {
     assert.equal(listed(ready, { setAside: { s: { kind } } }), null, kind);
   }
-  // Keep's own check pane still closes once its check is done.
-  assert.equal(retirementPlan({ ...base, ...ready }, { ...pane, meta: { ...pane.meta, ephemeral: 'check' } }, state, now).reason, null);
+  // Keep's own check pane still closes once its check is done, until Owner types into it.
+  const check = { ...pane, meta: { ...pane.meta, ephemeral: 'check', unattended: true } };
+  assert.equal(retirementPlan({ ...base, ...ready }, check, state, now).kind, 'completed-check');
+  assert.equal(retirementPlan({ ...base, ...ready }, check, state, now).reason, null);
+  assert.match(retirementPlan({ ...base, ...ready }, { ...check, meta: { ...check.meta, unattended: false } }, state, now).reason,
+    /Waiting on you/);
 });
 
 test('settled history gap is consistent while real work, prompts, timers and standing agents stay protected', () => {

@@ -74,15 +74,16 @@ function meaningfulActivityAt(session, pane) {
 
 // The console's two working lists, as web/app/app.js builds them: Running &
 // waiting is every running or waiting session plus any marked running, and
-// Waiting on you is every human attention item nobody set aside. A session in
-// either stays until Owner moves it out; Dismiss and Snooze are what do that.
+// Waiting on you is every human attention item; a Dismiss, Snooze or dependency
+// set-aside takes a row off both. A session on either list stays until Owner moves it out.
 // A session asking for input counts as listed even when the attention list
 // misses it, since a gap there must not read as permission.
 const HUMAN_ATTENTION_KINDS = new Set(['question', 'permission', 'plan', 'input']);
 function consoleListing(session, state) {
   const aside = state.setAside?.[session?.id]?.kind;
-  if (['running', 'waiting'].includes(session?.state) || aside === 'running') return 'Running & waiting';
+  if (aside === 'running') return 'Running & waiting';
   if (aside) return null;
+  if (['running', 'waiting'].includes(session?.state)) return 'Running & waiting';
   const asking = session?.state === 'needs-input' || session?.activity?.needsInput
     || (state.attention || []).some((item) => item?.sessionId === session?.id && HUMAN_ATTENTION_KINDS.has(item.kind));
   return asking ? 'Waiting on you' : null;
@@ -91,8 +92,11 @@ function consoleListing(session, state) {
 function retirementPlan(session, pane, state, now = Date.now(), options = {}) {
   const tasks = state.allTasks || state.tasks || [];
   const cards = cardsForSession(tasks, session?.id);
-  // A Keep-opened check pane is the scheduler's own, and closes once its check is done.
-  const ephemeralCheck = pane?.meta?.ephemeral === 'check' || pane?.meta?.ephemeral === true;
+  // A Keep-opened check pane is the scheduler's own, and closes once its check is
+  // done, until Owner types into it: the console clears `unattended` on that first
+  // keystroke, and from then on the pane is Owner's like any other.
+  const ephemeralCheck = (pane?.meta?.ephemeral === 'check' || pane?.meta?.ephemeral === true)
+    && pane?.meta?.unattended === true;
   const listed = ephemeralCheck ? null : consoleListing(session, state);
   if (listed) return { reason: `Session is listed under ${listed}`, cards };
   const runningCompanion = (state.companion?.jobs || []).some((job) =>
@@ -114,11 +118,10 @@ function retirementPlan(session, pane, state, now = Date.now(), options = {}) {
   const conversationalWait = session?.activity?.reason === 'your review'
     || (session?.activity?.reason === 'question' && session?.activity?.request?.kind === 'input')
     || (session?.state === 'waiting' && session?.activity?.reason !== 'next instruction');
-  const ephemeral = pane?.meta?.ephemeral === 'check' || pane?.meta?.ephemeral === true;
   let kind;
   let idleMs;
   let sinceAt = activityAt;
-  if (ephemeral && session?.endedTurn === true) {
+  if (ephemeralCheck && session?.endedTurn === true) {
     kind = 'completed-check';
     idleMs = 0;
   } else if (allDone) {
