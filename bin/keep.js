@@ -3470,7 +3470,17 @@ commands.move = async (argv, deps = {}) => {
   let response;
   // A move carries a session's whole transcript between machines: give it room.
   try { response = await (deps.postKeepApi || postKeepApi)('/api/move-session', body, 30 * 60e3); }
-  catch { die("keep serve isn't running (start it or use the dashboard)"); }
+  catch (error) {
+    // Only a refused connection means the daemon is not there. A timeout is a move
+    // that may still be running (or may have stopped part way and be journalled),
+    // and anything else is said as it is.
+    if (error && error.code === 'ECONNREFUSED') die("keep serve isn't running (start it or use the dashboard)");
+    const message = String(error && error.message || error);
+    if (/^timed out after /.test(message)) {
+      die(`keep move ${message}; a move that stopped part way is journalled under .keep/session-moves/ and continues with keep move --recover <tx>`);
+    }
+    die(`keep move could not get an answer from keep serve: ${message}`);
+  }
   let result = {};
   try { result = JSON.parse(response.data); } catch {}
   if (response.status !== 200 || !result.ok) die(result.error || `keep serve returned an unexpected response (${response.status})`);

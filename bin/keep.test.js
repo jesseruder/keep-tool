@@ -3327,6 +3327,16 @@ test('keep move says what the daemon refused, and refuses a malformed request be
     const refused = moveStub(() => ({ status: 409, body: { error: 'keep move needs another node, and no other node is configured' } }));
     await assert.rejects(moveCommandCli(['sess-x', '--node', 'aws1'], { root, postKeepApi: refused.postKeepApi, stdout: () => {} }),
       /no other node is configured/);
+    // What went wrong on the way is said as it is: only a refused connection is a
+    // daemon that is not running, and a timeout is a timeout.
+    const failing = (error) => ({ postKeepApi: async () => { throw error; } });
+    await assert.rejects(moveCommandCli(['sess-x', '--node', 'aws1'], { root, ...failing(Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })), stdout: () => {} }),
+      /keep serve isn't running/);
+    await assert.rejects(moveCommandCli(['sess-x', '--node', 'aws1'], { root, ...failing(new Error('timed out after 1800s; keep serve may still complete the action')), stdout: () => {} }),
+      (error) => /^keep move timed out after 1800s; keep serve may still complete the action; .*keep move --recover <tx>/.test(error.message)
+        && !/isn't running/.test(error.message));
+    await assert.rejects(moveCommandCli(['sess-x', '--node', 'aws1'], { root, ...failing(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })), stdout: () => {} }),
+      /keep move could not get an answer from keep serve: socket hang up/);
     const never = { postKeepApi: async () => assert.fail('a malformed move must not reach the daemon') };
     for (const argv of [[], ['sess-x'], ['--node', 'aws1'], ['sess-x', 'sess-y', '--node', 'aws1'], ['--recover', 'mv-x', '--abandon', 'mv-y'],
       ['sess-x', '--recover', `mv-${'c'.repeat(24)}`], ['#99', '--node', 'aws1']]) {
