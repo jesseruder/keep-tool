@@ -720,7 +720,9 @@ function createHookService(options = {}) {
   // `pane` and `agent` are the node's identity for the session, as a post carries them:
   // a Codex session the daemon never heard register is adopted first, as handle()
   // adopts one, so a pre-tool that asks before any post has been admitted is answered.
-  // A request naming no pane never asks the node's host.
+  // A request naming no pane never asks the node's host. The pane is read, and checked,
+  // only for a Codex ask: a Claude or Pi one is answered by its location record alone,
+  // whatever pane it names, as it always was.
   async function context(principal, sessionId, options = {}) {
     try {
       const caller = shared.callerNode(principal);
@@ -729,7 +731,7 @@ function createHookService(options = {}) {
       const agent = options.agent === undefined || options.agent === null || options.agent === '' ? null : options.agent;
       if (agent !== null && !['claude', 'codex', 'pi'].includes(agent)) refuse(400, 'agent must be claude, codex or pi');
       let pane = null;
-      if (options.pane !== undefined && options.pane !== null && options.pane !== '') {
+      if (agent === 'codex' && options.pane !== undefined && options.pane !== null && options.pane !== '') {
         if (typeof options.pane !== 'string') refuse(400, 'invalid pane ref');
         let parsed;
         try { parsed = shared.parsePaneRef(options.pane); } catch { refuse(400, 'invalid pane ref'); }

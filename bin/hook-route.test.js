@@ -1510,6 +1510,13 @@ test('the hook context for a located Claude session on a node is what it was, wh
   assert.deepEqual(await hooks.context(AWS1, 'sess-aws1', { agent: 'claude', pane: 'p1@aws1' }), before);
   assert.deepEqual(await hooks.context(AWS1, 'sess-aws1', { agent: 'codex', pane: 'p1@aws1' }), before, 'a located session is never adopted');
   assert.equal((await hooks.context(AWS1, 'sess-main', { agent: 'claude', pane: 'p1@aws1' })).status, 403, 'the daemon node\'s session stays refused');
+  // Only a Codex ask has its pane checked: a Claude or Pi ask naming a malformed or
+  // foreign pane is answered by its location record, as before.
+  for (const pane of ['p2/../x@aws1', 'p1@main', 'p1@elsewhere']) {
+    assert.deepEqual(await hooks.context(AWS1, 'sess-aws1', { agent: 'claude', pane }), before, `claude ${pane}`);
+    assert.equal((await hooks.context(AWS1, 'pi-aws1', { agent: 'pi', pane })).status, 200, `pi ${pane}`);
+    assert.notEqual((await hooks.context(AWS1, 'codex-aws1', { agent: 'codex', pane })).status, 200, `codex ${pane}`);
+  }
 });
 
 // ---------- Pi hooks through the route ----------
