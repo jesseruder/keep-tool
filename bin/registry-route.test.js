@@ -782,6 +782,57 @@ test('late adoption refuses a session this machine knows, one with any daemon pa
   assert.equal(claudeSession.host.asked, 0);
 });
 
+// The adoption helper itself on adoptingService's layout, so a refusal's reason can be read.
+function directAdoption(t, panes, options = {}) {
+  const service = adoptingService(t, panes);
+  const adoption = require('./late-adoption.js').createLateAdoption({
+    root: service.root, env: service.env, daemonNode: () => 'main', now: service.now,
+    hostConnect: service.host.connect, ...options,
+  });
+  return { ...service, adoption, adopt: () => adoption.adopt('aws1', 'codex-late', 'codex', { pane: 'p7@aws1' }) };
+}
+
+test('late adoption walks every local transcript and rollout folder, and a folder it cannot read refuses', { skip: process.getuid && process.getuid() === 0 ? 'root reads every folder' : false }, async (t) => {
+  const pinned = (service) => fs.existsSync(path.join(service.root, '.keep', 'session-accounts'));
+  const locked = (dir) => { fs.mkdirSync(dir, { recursive: true }); fs.chmodSync(dir, 0o000); t.after(() => { try { fs.chmodSync(dir, 0o700); } catch {} }); };
+  // An unreadable Claude projects root: the session cannot be ruled out.
+  const projects = directAdoption(t, [lateCodexPane()]);
+  locked(path.join(projects.root, 'claude-home', 'projects'));
+  let result = await projects.adopt();
+  assert.equal(result.adopted, false);
+  assert.match(result.why, /could not be ruled out locally/);
+  assert.equal(pinned(projects), false);
+  // An unreadable dated Codex folder, however old.
+  const dated = directAdoption(t, [lateCodexPane()]);
+  locked(path.join(dated.root, 'codex-home', 'sessions', '2021', '03', '04'));
+  result = await dated.adopt();
+  assert.equal(result.adopted, false);
+  assert.match(result.why, /could not be ruled out locally/);
+  assert.equal(pinned(dated), false);
+  // A rollout in a dated folder far past the shared lookup's 92 days, or archived.
+  for (const where of [['sessions', '2020', '01', '01'], ['archived_sessions']]) {
+    const old = directAdoption(t, [lateCodexPane()]);
+    const dir = path.join(old.root, 'codex-home', ...where);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'rollout-2020-01-01T00-00-00-codex-late.jsonl'), '{}\n');
+    result = await old.adopt();
+    assert.equal(result.adopted, false, where.join('/'));
+    assert.equal(result.why, 'the session is known on the daemon itself', where.join('/'));
+    assert.equal(pinned(old), false);
+  }
+  // A layout with folders but nothing of the session still adopts.
+  const clean = directAdoption(t, [lateCodexPane()]);
+  fs.mkdirSync(path.join(clean.root, 'claude-home', 'projects', 'p'), { recursive: true });
+  fs.writeFileSync(path.join(clean.root, 'claude-home', 'projects', 'p', 'codex-other.jsonl'), '{}\n');
+  const day = path.join(clean.root, 'codex-home', 'sessions', '2020', '01', '01');
+  fs.mkdirSync(day, { recursive: true });
+  fs.writeFileSync(path.join(day, 'rollout-2020-01-01T00-00-00-codex-other.jsonl'), '{}\n');
+  fs.writeFileSync(path.join(clean.root, 'codex-home', 'sessions', 'stray-file'), '');
+  result = await clean.adopt();
+  assert.equal(result.adopted, true, result.why);
+  assert.equal(pinned(clean), true);
+});
+
 test('a launch record adopts one session, once', async (t) => {
   const { svc, root } = adoptingService(t, [lateCodexPane()]);
   assert.equal((await svc.handle(AWS1, lateBody(root))).status, 200);

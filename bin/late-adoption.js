@@ -90,6 +90,61 @@ function readNodeCodexLaunch(root, node, requestId, options = {}) {
   } catch { return null; }
 }
 
+// ---------- whether this machine knows a session ----------
+
+// A missing directory or file is an answer (not here); any other failure to look is not.
+const ABSENT_CODES = new Set(['ENOENT', 'ENOTDIR']);
+function lookedIn(error) {
+  if (error && ABSENT_CODES.has(error.code)) return;
+  const reason = error && (error.code || error.message) || String(error);
+  throw new Error(`the session could not be ruled out locally (${reason})`);
+}
+function namesIn(dir) {
+  try { return fs.readdirSync(dir); } catch (error) { lookedIn(error); return []; }
+}
+function presentAt(file) {
+  try { fs.lstatSync(file); return true; } catch (error) { lookedIn(error); return false; }
+}
+
+// Whether any account on this machine has a transcript or rollout of `sessionId`, by a
+// walk of its own: <configDir>/projects/*/<id>.jsonl for Claude, and for Codex every
+// dated folder <configDir>/sessions/YYYY/MM/DD (no recency window: a resumed session
+// writes to its original day) plus the flat archived_sessions. The shared lookups
+// (transcripts.claudeFilesInProjects, codex.rolloutFilesIn) skip what they cannot
+// read and keep to 92 days, which is right for them and wrong here: a session this
+// machine knows must never be pinned to a node because a folder was unreadable, the
+// process was out of descriptors, or the rollout is old. So every failure other than
+// a missing path throws (the caller counts that as known), and the walk is exactly
+// that deep, never recursive. Synchronous: it runs once per adoption, after every
+// cheaper check has passed.
+function walkedLocally(sessionId, accountList) {
+  if (!SESSION_RE.test(String(sessionId || ''))) throw new Error('not a session id');
+  const suffix = `-${sessionId}.jsonl`;
+  const rollout = (name) => name.startsWith('rollout-') && name.endsWith(suffix);
+  for (const account of accountList) {
+    if (!account || typeof account.configDir !== 'string' || !account.configDir) continue;
+    if (account.agent === 'claude') {
+      const projects = path.join(account.configDir, 'projects');
+      for (const project of namesIn(projects)) {
+        if (presentAt(path.join(projects, project, `${sessionId}.jsonl`))) return true;
+      }
+    } else if (account.agent === 'codex') {
+      const sessions = path.join(account.configDir, 'sessions');
+      for (const year of namesIn(sessions)) {
+        const yearDir = path.join(sessions, year);
+        for (const month of namesIn(yearDir)) {
+          const monthDir = path.join(yearDir, month);
+          for (const day of namesIn(monthDir)) {
+            if (namesIn(path.join(monthDir, day)).some(rollout)) return true;
+          }
+        }
+      }
+      if (namesIn(path.join(account.configDir, 'archived_sessions')).some(rollout)) return true;
+    }
+  }
+  return false;
+}
+
 function createLateAdoption(options = {}) {
   const root = options.root;
   if (!root) throw new Error('createLateAdoption needs the registry root');
@@ -101,17 +156,14 @@ function createLateAdoption(options = {}) {
   const connect = options.hostConnect
     || ((node, timeoutMs) => require('./hostclient.js').connect({ node, env, timeoutMs, helloTimeoutMs: HELLO_TIMEOUT_MS }));
   const log = options.log || (() => {});
-  // Whether this machine knows the session itself: a Claude transcript found by
-  // discovery, or a rollout under one of its Codex accounts. A failed look says yes.
+  // Whether this machine knows the session itself: a Claude transcript or a Codex
+  // rollout of it under any account here (walkedLocally, the authority), or one the
+  // shared lookups find. A look that fails says yes; the walk's own failure throws,
+  // so the refusal says why.
   const locatedLocally = options.locatedLocally || ((sessionId) => {
+    if (walkedLocally(sessionId, accounts.list(env))) return true;
     try { if (accounts.forSession(sessionId, 'claude', { root, env, allowDiscovery: true })) return true; } catch { return true; }
     try { if (require('./transcripts.js').findSessionFile(sessionId, { root, env })) return true; } catch { return true; }
-    try {
-      const codex = require('./codex.js');
-      for (const account of accounts.list(env)) {
-        if (account.agent === 'codex' && codex.rolloutFilesIn(account.configDir, sessionId).length) return true;
-      }
-    } catch { return true; }
     return false;
   });
   const daemonNode = options.daemonNode || (() => nodes.daemonNode(env));
@@ -171,7 +223,10 @@ function createLateAdoption(options = {}) {
     // Nothing on this machine knows the session: no pane record of the daemon's, no
     // transcript or rollout of it here.
     if (fs.existsSync(paneFile(sessionId))) return refusal('the daemon already has a pane record for the session');
-    if (locatedLocally(sessionId)) return refusal('the session is known on the daemon itself');
+    let known;
+    try { known = locatedLocally(sessionId); } catch (error) { known = error; }
+    if (known instanceof Error) return refusal(known.message);
+    if (known) return refusal('the session is known on the daemon itself');
     // Checked again at the last moment: a hook that registered it meanwhile is the answer.
     let where;
     try { where = location(sessionId); } catch { return refusal('the location record is unreadable'); }
@@ -246,4 +301,4 @@ function createLateAdoption(options = {}) {
   return { adopt, unlocated };
 }
 
-module.exports = { createLateAdoption, recordNodeCodexLaunch, readNodeCodexLaunch, NEGATIVE_TTL_MS, SHORT_TTL_MS, LAUNCH_TTL_MS };
+module.exports = { createLateAdoption, recordNodeCodexLaunch, readNodeCodexLaunch, walkedLocally, NEGATIVE_TTL_MS, SHORT_TTL_MS, LAUNCH_TTL_MS };
