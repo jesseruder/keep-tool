@@ -934,4 +934,14 @@ test('a step run by hand on the node is recorded at the node\'s HEAD, and a sha 
   const unclaimed = await hooks.handle(AWS1, postBody(f.root, 'terraform apply', { head: { [cwd]: known } }));
   assert.match(unclaimed.body.stderr, /ran by hand with no claim; the ledger is unchanged/);
   assert.equal(ledger().runs.length, 2);
+  // Facts that ran out before HEAD: not recorded at all, never at this disk's origin.
+  claim();
+  const headless = await hooks.handle(AWS1, postBody(f.root, 'terraform apply', { head: {} }, { stdout: 'Apply complete! ami-0badf00dcafe', stderr: '' }));
+  assert.equal(headless.body.status, 0, headless.body.stderr);
+  assert.match(headless.body.stderr, /step apply ran by hand but could not be recorded \(the node did not report HEAD\); record it: keep step done ~\/infra apply --sha <the commit it ran from>/);
+  assert.equal(ledger().runs.length, 2, 'nothing recorded');
+  // And finalizeStep itself refuses a node run without a sha.
+  const { finalizeStep } = require('./commands/step.js');
+  await assert.rejects(finalizeStep({ project: '~/infra', steps: {} }, 'apply', {}, { nodeSha: true, sha: '' }),
+    /ran on another node, which did not report the commit it ran from/);
 });

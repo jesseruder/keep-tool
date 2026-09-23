@@ -2111,6 +2111,12 @@ async function recordStepRun(input) {
       artifact = matches[matches.length - 1] || '';
     } catch {}
   }
+  // A session on another node whose HEAD did not arrive: never recorded at a
+  // revision of this disk's choosing (finalizeStep would fall back to origin).
+  if (nodeFacts && !sha) {
+    process.stderr.write(`keep: step ${match.name} ran by hand but could not be recorded (the node did not report HEAD); record it: keep step done ${registry.project} ${match.name}${artifact ? ` --artifact ${artifact}` : ''} --sha <the commit it ran from>\n`);
+    return { recorded: false, error: 'the node did not report HEAD' };
+  }
   // finalizeStep identifies the actor from the environment; the hook's session is
   // the only identity that matters here, whatever else the shell inherited.
   delete process.env.CODEX_THREAD_ID;

@@ -509,6 +509,10 @@ function waiterRetrySuffix(notify) {
 }
 
 async function finalizeStep(registry, name, step, options = {}) {
+  // A run on another node is recorded at the HEAD that node read, or not at all.
+  if (options.nodeSha && !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(String(options.sha || ''))) {
+    die(`step ${name} ran on another node, which did not report the commit it ran from; record it with --sha`);
+  }
   const finalized = withLock(() => {
     const ledger = stepRegistry.loadLedger(registry.project, name);
     let run = null;
