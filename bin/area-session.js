@@ -86,7 +86,9 @@ const WORKTREE_TIMEOUT_MS = 5 * MINUTE_MS;
 // for as long as the area exists. Never the main checkout.
 const WORKTREE_NAME = 'responder';
 const ROLE = 'incident-responder';
-const MODEL = 'fable';
+// The alias, never a pinned id: `opus` resolves to the newest Opus the Claude
+// installation offers, so the responder follows Opus releases without a code change.
+const MODEL = 'opus';
 // One batch is one message typed into a terminal, so it is bounded by the size of
 // its own encoded body rather than by a count of events. Events are added in seq
 // order until the next one would not fit, and the rest wait for the next tick: a
@@ -804,6 +806,9 @@ async function runArea(name, entry, options = {}, deps = {}) {
           record = writeRecord(agentName, {
             session: { id: report.launch.id || '', pane: report.launch.pane || '', startedAt: now },
             launch: { attempts: Number(launch.attempts || 0) + 1, lastAt: now, deadSince: 0 },
+            // What this launch actually ran on, so a record made under an older
+            // default does not keep reporting it.
+            model: MODEL, account,
             lifecycle: 'working',
             restarts: Number(record.restarts || 0) + (String(record.session.id || '') ? 1 : 0),
           }, { root, now });

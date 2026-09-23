@@ -171,7 +171,7 @@ function cursor(fixture, name = 'sandboxes') {
 // gets its seq from the emit lock.
 function feed(fixture, events, options = {}) {
   agents.ensure('sandboxes', {
-    role: 'incident-responder', area: 'sandboxes', model: 'fable',
+    role: 'incident-responder', area: 'sandboxes', model: 'opus',
     lastDeliveredSeq: 0, lastDeliveredAt: 0,
     session: options.session === null ? undefined
       : { id: 'sess-1', pane: 'pane-1', startedAt: options.startedAt || NOW - 30 * MINUTE },
@@ -199,7 +199,7 @@ test('the first tick installs the recipe, creates the record, and opens exactly 
     assert.equal(body.cwd, fixture.worktree);
     assert.equal(body.agent, 'claude');
     assert.equal(body.accountId, 'claude-secondary');
-    assert.equal(body.model, 'fable');
+    assert.equal(body.model, 'opus');
     // openSession's own dedupe, keyed to the attempt rather than a clock, so two
     // ticks trying the same attempt are one open.
     assert.equal(body.requestId, 'area-sandboxes-g1');
@@ -221,7 +221,7 @@ test('the first tick installs the recipe, creates the record, and opens exactly 
     assert.equal(saved.session.pane, 'pane-1');
     assert.equal(saved.session.startedAt, NOW);
     assert.equal(saved.role, 'incident-responder');
-    assert.equal(saved.model, 'fable');
+    assert.equal(saved.model, 'opus');
     assert.equal(saved.cwd, fixture.worktree);
     assert.equal(saved.area, 'sandboxes');
     assert.equal(saved.launchLease, null, 'the lease is released whatever the tick decided');
@@ -1325,9 +1325,15 @@ test('an idle session with nothing open is closed gracefully, and the next tick 
 
     state.panes = [];
     state.sessions = [];
+    // A record made under an older default keeps saying so until a launch
+    // proves otherwise: the relaunch records what it actually ran on.
+    agents.writeRecord('sandboxes', { model: 'fable' }, { root: fixture.root });
     const relaunched = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
     assert.equal(relaunched.launch.state, 'launched');
     assert.equal(deps.calls.opens.length, 1);
+    assert.equal(deps.calls.opens[0].body.model, 'opus');
+    assert.equal(record(fixture).model, 'opus');
+    assert.equal(record(fixture).account, 'claude-secondary');
   } finally { cleanup(fixture.root); }
 });
 

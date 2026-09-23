@@ -1901,7 +1901,7 @@ exactly as `self-repair.js` creates its worktrees (`wt.createWorktree` is synchr
 end to end and would stall every scheduler for ~30 s), a finished tree is reused as it
 stands, and a half-built one is removed through `wt` and rebuilt — which is why the tree
 is only touched when no session is live in it. `agents.ensure` then creates the record
-(`role: incident-responder`, `model: fable`, the area's `account`, project, cwd, area),
+(`role: incident-responder`, `model: opus` (the alias, so it tracks the newest Opus), the area's `account`, project, cwd, area),
 because an event for a name with no record is dropped. If no session is live, one
 interactive session is opened through serve.js `openSession({fresh: true, cwd, agent:
 'claude', accountId, model, requestId, message: <bootstrap>})` with `launchEnv:
