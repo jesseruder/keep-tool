@@ -753,6 +753,12 @@ function claudeTranscriptIsInteractive(file, info, stat) {
 
 function scanTranscript(file, options = {}) {
   const text = options.full ? fs.readFileSync(file, 'utf8') : readTranscriptTail(file);
+  return scanTranscriptText(text, file, options);
+}
+
+// The scan itself, over text already in hand. `file` is only recorded as where a
+// background agent's own transcripts live; a node's tail passes null.
+function scanTranscriptText(text, file, options = {}) {
   const out = { title: '', cwd: '', gitBranch: '', lastUser: '', lastHuman: '', lastUserAt: null, lastAssistant: '', lastTs: '' };
   const pending = new Map();
   const bgAgents = new Set(); // launched background agents with no completion notification yet
@@ -1762,10 +1768,12 @@ function isHostTarget(target) {
   return Boolean(target && typeof target.pane === 'string' && target.pane);
 }
 
-// The slow verb set. Nothing implements these yet; the routing table exists so that
-// when they arrive they take the node's second connection and a long call on one
-// node can never sit in front of a keystroke bound for another.
-const HOST_OPS_TYPES = new Set(['run', 'tail-transcript', 'prepare-launch', 'usage', 'git-state']);
+// The slow verb set: they take the node's second connection, so a long call on one
+// node can never sit in front of a keystroke bound for another. `transcript` goes
+// further and has a connection of its own (HOST_CHANNEL_BY_TYPE): a receipt's long
+// poll waits up to nine seconds, and a launch's prepare must not queue behind it.
+const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state']);
+const HOST_CHANNEL_BY_TYPE = new Map([['transcript', 'transcript']]);
 
 function daemonNodeName(deps = {}) {
   return deps.daemonNode || nodes.daemonNode();
@@ -2025,7 +2033,7 @@ async function hostRequest(type, params, deps = {}) {
   // agent pane — a `process` call every 2.5s — clear the memo that outage listing is
   // built from, so a slow node holding an agent pane dropped off the list entirely
   // instead of staying on it marked stale.
-  const idempotent = ['hello', 'list', 'get', 'screen', 'meta', 'process', 'usage'].includes(type);
+  const idempotent = ['hello', 'list', 'get', 'screen', 'meta', 'process', 'usage', 'transcript'].includes(type);
   // A spawn naming an operation id is the one non-idempotent request that may be
   // asked again: the host journals it, so a second ask returns the pane the first
   // one made rather than starting a second process. Everything else keeps the
@@ -2055,7 +2063,7 @@ async function hostRequest(type, params, deps = {}) {
   const request = refs.some(([key, value]) => params[key] !== value.paneId)
     ? { ...params, ...Object.fromEntries(refs.map(([key, value]) => [key, value.paneId])) }
     : params;
-  const channel = HOST_OPS_TYPES.has(type) ? 'ops' : 'control';
+  const channel = HOST_CHANNEL_BY_TYPE.get(type) || (HOST_OPS_TYPES.has(type) ? 'ops' : 'control');
   const state = hostChannel(node, channel);
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const notRetried = (reason, error) => {
@@ -3806,10 +3814,165 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
 // it names) would otherwise hand delivery a null path. findRolloutFile locates it by
 // the id in its file name, as sessionSummaryFile already does.
 function transcriptFileForSession(session) {
+  // A session on another node has no file here, and whatever local file shares its id
+  // is some other machine's history. Its transcript is read through its node
+  // (nodeTranscriptFileForSession); to every synchronous caller of this one it is
+  // simply unavailable, the answer each of them already handles, and never a local path.
+  if (session && session.node && session.node !== daemonNodeName()) return null;
   return session.kind === 'codex'
     ? codex.rolloutFileFor(session.id) || codex.findRolloutFile(session.id)
     : session.kind === 'pi' ? session.sessionFile || pi.fileFor(session.id)
     : findSessionFile(session.id);
+}
+
+// ---------- a node's transcripts, through its host ----------
+//
+// The daemon never opens a node's path as a file. It asks the node's host, whose
+// `transcript` verb (bin/node-transcript.js) resolves the file itself from the
+// session's kind, id and account and re-validates that account against its own
+// configuration. The daemon's part is naming the account (the session's authority
+// record, never discovery) and refusing clearly when the node's host predates the verb.
+
+// hello answers, per node, for the capability check. A yes is remembered briefly;
+// a no is asked again every time, so a node whose host was just updated is used at once.
+const nodeTranscriptCapability = new Map();
+const NODE_TRANSCRIPT_CAPABILITY_MS = 60e3;
+
+async function requireNodeTranscript(node, deps = {}) {
+  const now = Date.now();
+  const known = nodeTranscriptCapability.get(node);
+  if (known && now - known < NODE_TRANSCRIPT_CAPABILITY_MS) return;
+  const hello = await (deps.hostRequest || hostRequest)('hello', {}, { ...deps, node });
+  if (!hello || !(Number(hello.transcript) >= 1)) {
+    nodeTranscriptCapability.delete(node);
+    throw new InjectionError(409,
+      `the terminal host on ${node} predates the transcript verb, so no delivery to its sessions can be confirmed; update keep-tool on ${node} and reload its host`,
+      { reason: 'remote-node' });
+  }
+  nodeTranscriptCapability.set(node, now);
+}
+
+function nodeTranscriptAccount(session, deps = {}) {
+  let account = null;
+  try {
+    account = accounts.forSession(session.id, session.kind, {
+      root: deps.root || keep.ROOT, env: deps.env || process.env, allowDiscovery: false,
+    });
+  } catch (error) {
+    throw new InjectionError(409, `the account of ${session.id} could not be resolved: ${error.message}`, { reason: 'remote-node' });
+  }
+  if (!account || typeof account.id !== 'string' || typeof account.configDir !== 'string') {
+    throw new InjectionError(409, `${session.id} has no account record naming where its transcript lives`, { reason: 'remote-node' });
+  }
+  return { id: account.id, configDir: account.configDir };
+}
+
+// { stat(), tail(length), match(offset, hash, { timeoutMs }) } for one session on one
+// node. Each call is one request on the node's transcript connection; a match's own
+// wait (at most nine seconds on the node) gets two more on top as its reply window.
+function nodeTranscript(node, session, deps = {}) {
+  if (!node || node === daemonNodeName(deps)) throw new Error('nodeTranscript is for a session on another node');
+  if (!session || !/^[A-Za-z0-9_-]+$/.test(String(session.id || '')) || !['claude', 'codex', 'pi'].includes(session.kind)) {
+    throw new InjectionError(400, 'bad session for a node transcript');
+  }
+  const ask = async (op, extra = {}, replyTimeoutMs = null) => {
+    await requireNodeTranscript(node, deps);
+    const account = nodeTranscriptAccount(session, deps);
+    return (deps.hostRequest || hostRequest)('transcript',
+      { op, kind: session.kind, sessionId: session.id, account, ...extra },
+      { ...deps, node, ...(replyTimeoutMs == null ? {} : { hostRequestTimeoutMs: replyTimeoutMs }) });
+  };
+  return {
+    node,
+    stat: () => ask('stat'),
+    tail: (length) => ask('tail', length ? { length } : {}),
+    match: (offset, hash, options = {}) => {
+      const timeoutMs = Math.max(0, Math.min(9000, Math.floor(Number(options.timeoutMs) || 0)));
+      return ask('match', { fromOffset: offset, hash, timeoutMs }, timeoutMs + 2000);
+    },
+  };
+}
+
+// Where a remote session's transcript is, as its node sees it right now: the node's
+// own path (to be recorded, never opened here) and its size.
+async function nodeTranscriptFileForSession(session, deps = {}) {
+  const node = session && session.node;
+  const stat = await nodeTranscript(node, session, deps).stat();
+  return { node, path: stat.path, size: stat.size, mtimeMs: stat.mtimeMs, generation: stat.generation };
+}
+
+// The text readTranscriptTail would have returned for the same bytes: a tail that
+// does not start at the beginning drops its partial first line.
+function tailText(tail) {
+  let text = Buffer.from(String(tail && tail.bytes || ''), 'base64').toString('utf8');
+  if (Number(tail && tail.from) > 0) text = text.slice(text.indexOf('\n') + 1);
+  return text;
+}
+
+// The Claude session model from a node's tail: the same scan and the same row
+// claudeSessionForEntry builds from a file here, from the same bytes. Two things are
+// the node's and cannot be read from here, so they are answered conservatively: a
+// background agent's own transcript (its launch still counts as pending) and the
+// interactive marker past the tail (a transcript longer than the tail is taken as
+// the interactive session its pane says it is).
+function claudeSessionFromTail(id, tail, options = {}) {
+  const info = { ...scanTranscriptText(tailText(tail), null), backgroundParentFile: null, backgroundAgents: undefined };
+  const stat = { size: Number(tail.size) || 0, mtimeMs: Number(tail.mtimeMs) || 0 };
+  if (options.interactiveOnly === true && !info.interactive && stat.size <= TAIL_BYTES) return null;
+  let reviewer = false;
+  try { reviewer = fs.readdirSync(path.join(options.root || keep.ROOT, '.keep', 'reviewer')).includes(id); } catch {}
+  const dir = path.basename(path.dirname(String(tail.path || '')));
+  const session = claudeSessionFromInfo(id, info, stat, dir, reviewer, Date.now(), options.accountId || null);
+  return options.node ? { ...session, node: options.node } : session;
+}
+
+// A remote session's current model, straight off its node: what claudeSessionFor is
+// for a local one. Only Claude so far; a Codex rollout's state needs its first line
+// as well as its tail, which the verb does not yet send, so one is refused by name.
+async function remoteSessionRead(id, deps = {}) {
+  const sessionId = String(id || '');
+  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new InjectionError(400, 'bad session id');
+  const node = sessionNodeOf({ id: sessionId }, deps);
+  if (node === daemonNodeName(deps)) return null;
+  let location = null;
+  try { location = accounts.sessionLocation(sessionId, { root: deps.root || keep.ROOT, env: deps.env || process.env }); } catch {}
+  if (!location) throw new InjectionError(404, 'no session');
+  if (location.agent !== 'claude') throw remoteDeliveryRefusal({ id: sessionId, node }, deps, location.agent);
+  const session = { id: sessionId, kind: 'claude', node };
+  const account = nodeTranscriptAccount(session, deps);
+  const tail = await nodeTranscript(node, session, deps).tail();
+  return claudeSessionFromTail(sessionId, tail, {
+    root: deps.root || keep.ROOT, accountId: account.id, node, interactiveOnly: deps.interactiveOnly === true,
+  });
+}
+
+// loadCurrentSession for a session the fleet places on another node: the row a local
+// one gets from loadSessionExact (the 48 h window, keep-spawned left out, attention
+// marker, name, marks and number), built from the node's tail, plus `node`. Async,
+// because the tail is a request; loadCurrentSession itself is unchanged, and still
+// answers "no session" for such an id to every synchronous caller.
+async function loadRemoteSession(id, deps = {}) {
+  const session = await remoteSessionRead(id, deps);
+  if (!session) return null;
+  const root = deps.root || keep.ROOT;
+  const now = Date.now();
+  if (!(now - Number(session.mtime) <= SESSION_WINDOW_MS)) throw new InjectionError(404, 'no session');
+  if (spawnedRecently(root, session.id, now)) throw new InjectionError(404, 'no session');
+  attachClaudeMarker(session, path.join(root, '.keep', 'attention'), now, Number(session.mtime), true);
+  sessionNames.apply([session], { root });
+  sessionMarks.apply([session], { root });
+  sessionNumbers.assign([session], { root, readOnly: true });
+  return session;
+}
+
+// The session a send acts on: loadCurrentSession here, loadRemoteSession for one on
+// another node. A single-node install never takes the second branch.
+async function loadSessionForAction(id, deps = {}) {
+  if (hostNodeNames(deps).length > 1 && /^[A-Za-z0-9_-]+$/.test(String(id || ''))
+      && sessionNodeOf({ id: String(id) }, deps) !== daemonNodeName(deps)) {
+    return loadRemoteSession(id, deps);
+  }
+  return loadCurrentSession(id);
 }
 
 function appendedBytes(file, offset) {
@@ -14227,6 +14390,13 @@ module.exports = {
   startWtGcScheduler,
   buildWhoSnapshot,
   scanTranscript,
+  scanTranscriptText,
+  claudeSessionFromTail,
+  nodeTranscript,
+  nodeTranscriptFileForSession,
+  remoteSessionRead,
+  loadRemoteSession,
+  loadSessionForAction,
   claudeTranscriptIsInteractive,
   claudeSessionFromInfo,
   sessionBackgroundPending,
