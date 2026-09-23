@@ -203,21 +203,11 @@ function rememberClaudeFile(root, sessionId, projectName) {
 function locateClaudeFiles(sessionId, env = process.env) {
   const found = [];
   for (const entry of projectRoots(env)) {
-    let projectNames;
-    try { projectNames = fs.readdirSync(entry.root); } catch { continue; }
-    let first = null;
-    for (const projectName of projectNames) {
-      const file = path.join(entry.root, projectName, `${sessionId}.jsonl`);
-      try {
-        if (fs.statSync(file).isFile()) {
-          found.push({ accountId: entry.accountId, file, projectName });
-          first ||= projectName;
-        }
-      } catch {}
-    }
+    const inRoot = require('./transcripts.js').claudeFilesInProjects(entry.root, sessionId);
+    for (const match of inRoot) found.push({ accountId: entry.accountId, file: match.file, projectName: match.projectName });
     // The first match in walk order, which is the one findSessionFile picks within
     // an account.
-    if (first) rememberClaudeFile(entry.root, sessionId, first);
+    if (inRoot.length) rememberClaudeFile(entry.root, sessionId, inRoot[0].projectName);
   }
   return found;
 }

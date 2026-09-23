@@ -35,20 +35,31 @@ function indexConfirms(entry, { text, db, trace } = {}) {
   catch { try { trace && trace('index-error'); } catch {} return null; }
 }
 
-function received(entry) {
-  const size = fs.statSync(entry.file).size;
-  if (size < entry.offset) return false;
-  const fd = fs.openSync(entry.file, 'r');
+// Does the transcript, read from `offset`, carry the user message whose hash is
+// `wanted`? The one receipt test, shared by the daemon (received, below, on a file
+// of its own) and by a node's host (bin/node-transcript.js, on a file it opened for
+// a session it runs), so the two can never disagree about what counts as seen.
+// `source` is a path or an open descriptor. `maxBytes` bounds one call: a caller
+// that has to answer within a budget stops there and says how far it looked. It
+// needs nothing from the daemon, and reads nothing but the one file.
+function matchesFrom(source, offset, { kind, hash: wanted, maxBytes = Infinity } = {}) {
+  const owned = typeof source !== 'number';
+  const size = owned ? fs.statSync(source).size : fs.fstatSync(source).size;
+  if (size < offset) return { matched: false, checkedTo: offset, bytesRead: 0 };
+  const fd = owned ? fs.openSync(source, 'r') : source;
+  let offsetNow = offset, bytesRead = 0;
   try {
     const decoder = new (require('string_decoder').StringDecoder)('utf8');
     const bytes = Buffer.alloc(256 * 1024);
-    let offset = entry.offset, partial = '';
-    let compactEligible = entry.kind === 'codex' && entry.hash === hash('/compact');
+    let partial = '';
+    let compactEligible = kind === 'codex' && wanted === hash('/compact');
     let startedTurns = 0;
-    while (offset < size) {
-      const n = fs.readSync(fd, bytes, 0, Math.min(bytes.length, size - offset), offset);
+    const found = () => ({ matched: true, checkedTo: offsetNow, bytesRead });
+    while (offsetNow < size && bytesRead < maxBytes) {
+      const n = fs.readSync(fd, bytes, 0, Math.min(bytes.length, size - offsetNow, maxBytes - bytesRead), offsetNow);
       if (!n) break;
-      offset += n;
+      offsetNow += n;
+      bytesRead += n;
       const lines = (partial + decoder.write(bytes.subarray(0, n))).split('\n');
       partial = lines.pop();
       for (const line of lines) {
@@ -56,24 +67,24 @@ function received(entry) {
           const record = JSON.parse(line);
           // Claude can accept input into its queue without ever writing a user
           // message (including when it absorbs the input into the current turn).
-          if (entry.kind === 'claude' && !record.isSidechain) {
+          if (kind === 'claude' && !record.isSidechain) {
             const queuedText = record.type === 'queue-operation' && (!record.operation || record.operation === 'enqueue') ? record.content
               : record.type === 'attachment' && record.attachment?.type === 'queued_command' ? record.attachment.prompt : null;
-            if (typeof queuedText === 'string' && hash(queuedText) === entry.hash) return true;
+            if (typeof queuedText === 'string' && hash(queuedText) === wanted) return found();
           }
-          const text = userText(record, entry.kind);
-          if (text !== null && hash(text) === entry.hash) return true;
+          const text = userText(record, kind);
+          if (text !== null && hash(text) === wanted) return found();
           // Claude records accepted local commands as structured user messages,
           // rather than as the literal slash command Keep submitted.
-          if (entry.kind === 'claude' && text !== null) {
+          if (kind === 'claude' && text !== null) {
             const command = text.match(/^<command-name>(\/[^<>\s]+)<\/command-name>\s*<command-message>[^<>]*<\/command-message>\s*<command-args>([^<>]*)<\/command-args>$/);
-            if (command && hash(command[1] + (command[2].trim() ? ' ' + command[2].trim() : '')) === entry.hash) return true;
+            if (command && hash(command[1] + (command[2].trim() ? ' ' + command[2].trim() : '')) === wanted) return found();
           }
           // Codex /compact has no ordinary user receipt. Accept its native
           // completion only before any intervening conversational work/turn.
           // A later automatic compaction must not acknowledge an old draft.
           if (compactEligible) {
-            if (record.type === 'compacted') return true;
+            if (record.type === 'compacted') return found();
             if (record.type === 'response_item' || (record.type === 'event_msg' &&
                 (['user_message', 'agent_message', 'task_complete', 'turn_aborted', 'error'].includes(record.payload?.type)
                   || (record.payload?.type === 'task_started' && ++startedTurns > 1)))) compactEligible = false;
@@ -82,8 +93,17 @@ function received(entry) {
         catch {}
       }
     }
-    return false;
-  } finally { fs.closeSync(fd); }
+    return { matched: false, checkedTo: offsetNow, bytesRead };
+  } finally { if (owned) fs.closeSync(fd); }
+}
+
+// A journal written for a session on another node names that node's path, which is
+// not a file here: its receipt is that node's to give (bin/node-transcript.js), and
+// asking this machine's filesystem about it would read whatever happens to share the
+// name. Refused rather than answered false, so no caller can mistake it for "not yet".
+function received(entry) {
+  if (entry && entry.node) throw new Error(`the receipt for a delivery on ${entry.node} is that node's to give`);
+  return matchesFrom(entry.file, entry.offset, { kind: entry.kind, hash: entry.hash }).matched;
 }
 
 // One pending attempt per session, retained across daemon restarts. Never retype
@@ -665,5 +685,5 @@ function reconcile(directory, {
   }
   return settled;
 }
-module.exports = { deliver, received, indexConfirms, reconcile, userText, statusForText, acknowledge, pendingForSession,
+module.exports = { deliver, received, matchesFrom, indexConfirms, reconcile, userText, statusForText, acknowledge, pendingForSession,
   settleObserved, completedTyping, textHash: hash, STALE_JOURNAL_MS, INDEX_GRACE_MS };

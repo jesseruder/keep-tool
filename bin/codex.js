@@ -423,22 +423,33 @@ function findRolloutRecord(sessionId) {
   const matches = [];
   for (const root of configuredRoots()) {
     if (pinned && root.accountId !== pinned.id) continue;
-    for (const dir of recentDateDirs(root.configDir)) {
-      let names;
-      try { names = fs.readdirSync(dir); } catch { continue; }
-      for (const name of names) {
-        if (!name.startsWith('rollout-') || !name.endsWith(suffix)) continue;
-        const file = path.join(dir, name);
-        try {
-          const stat = fs.statSync(file);
-          if (stat.isFile()) matches.push({ file, mtimeMs: stat.mtimeMs, accountId: root.accountId, configDir: root.configDir });
-        } catch {}
-      }
+    for (const match of rolloutFilesIn(root.configDir, sessionId, suffix)) {
+      matches.push({ file: match.file, mtimeMs: match.mtimeMs, accountId: root.accountId, configDir: root.configDir });
     }
   }
   if (!pinned && new Set(matches.map((entry) => entry.accountId)).size > 1) return null;
   matches.sort((a, b) => b.mtimeMs - a.mtimeMs);
   return matches[0] || null;
+}
+
+// Every rollout for this session under one Codex config directory's dated folders,
+// in walk order. Pure: it takes the directory rather than resolving an account, so
+// a node's host can answer for one of its own accounts with the same search.
+function rolloutFilesIn(configDir, sessionId, suffix = `-${sessionId}.jsonl`) {
+  const found = [];
+  for (const dir of recentDateDirs(configDir)) {
+    let names;
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const name of names) {
+      if (!name.startsWith('rollout-') || !name.endsWith(suffix)) continue;
+      const file = path.join(dir, name);
+      try {
+        const stat = fs.statSync(file);
+        if (stat.isFile()) found.push({ file, mtimeMs: stat.mtimeMs });
+      } catch {}
+    }
+  }
+  return found;
 }
 
 function findRolloutFile(sessionId) {
@@ -529,4 +540,4 @@ function sessionFor(sessionId) {
   return sessionFromRollout(info, stat, loadTitles(record.configDir).get(info.id) || '', Date.now(), record.accountId);
 }
 
-module.exports = { scan, invalidate, scanRollout, sessionFor, resolveRollout, isCompanionTask, rolloutFileFor, findRolloutFile, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, isHeadlessSession, configuredRoots, recentDateDirs, indexedRollouts };
+module.exports = { scan, invalidate, scanRollout, sessionFor, resolveRollout, isCompanionTask, rolloutFileFor, findRolloutFile, rolloutFilesIn, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, isHeadlessSession, configuredRoots, recentDateDirs, indexedRollouts };

@@ -2594,3 +2594,161 @@ test('a replay never hands back a pane that is no longer the process this spawn 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ---------- the transcript verb ----------
+
+// A node's own accounts, as its keep config names them, and one Claude transcript
+// under one of them. The host is given that environment, which is all it ever reads
+// accounts from.
+function transcriptNode(name) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `keep-host-transcript-${name}-`));
+  const configDir = path.join(root, 'claude-a');
+  const project = path.join(configDir, 'projects', '-work-project');
+  fs.mkdirSync(project, { recursive: true });
+  const configFile = path.join(root, 'config.json');
+  fs.writeFileSync(configFile, JSON.stringify({
+    version: 1,
+    accounts: [{ id: 'claude-a', label: 'Claude A', agent: 'claude', configDir }],
+    defaultAccounts: { claude: 'claude-a' },
+  }));
+  const file = path.join(project, 'sess-transcript.jsonl');
+  const user = (text) => `${JSON.stringify({ type: 'user', message: { role: 'user', content: text } })}\n`;
+  fs.writeFileSync(file, user('first message') + user('second message'));
+  return {
+    root, configDir, project, file, user,
+    env: { ...process.env, KEEP_CONFIG: configFile },
+    account: { id: 'claude-a', configDir },
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+test('a node answers stat, tail and match for a transcript of its own account', async () => {
+  const node = transcriptNode('ops');
+  try {
+    await withHost({ env: node.env }, async ({ client }) => {
+      assert.equal((await client.request('hello')).transcript, 1, 'the verb is advertised');
+      const asked = { kind: 'claude', sessionId: 'sess-transcript', account: node.account };
+      const stat = await client.request('transcript', { ...asked, op: 'stat' });
+      const onDisk = fs.statSync(node.file);
+      assert.equal(stat.path, node.file);
+      assert.equal(stat.size, onDisk.size);
+      assert.equal(stat.mtimeMs, onDisk.mtimeMs);
+      assert.equal(stat.generation, `${onDisk.dev}:${onDisk.ino}:${Math.round(onDisk.birthtimeMs || 0)}`);
+
+      const tail = await client.request('transcript', { ...asked, op: 'tail', length: 20 });
+      assert.equal(tail.from, onDisk.size - 20);
+      assert.deepEqual(Buffer.from(tail.bytes, 'base64'), fs.readFileSync(node.file).subarray(onDisk.size - 20));
+      const whole = await client.request('transcript', { ...asked, op: 'tail' });
+      assert.equal(whole.from, 0, 'a short transcript comes back whole by default');
+      assert.equal(Buffer.from(whole.bytes, 'base64').toString('utf8'), fs.readFileSync(node.file, 'utf8'));
+
+      const { textHash } = require('./delivery.js');
+      const seen = await client.request('transcript', { ...asked, op: 'match', fromOffset: 0, hash: textHash('second message') });
+      assert.equal(seen.matched, true);
+      assert.equal(seen.path, node.file);
+      // From past the line, the same text is not there: the offset is the journal's.
+      const past = await client.request('transcript', { ...asked, op: 'match', fromOffset: onDisk.size, hash: textHash('second message') });
+      assert.equal(past.matched, false);
+      assert.equal(past.checkedTo, onDisk.size);
+      await assert.rejects(client.request('transcript', { ...asked, op: 'tail', length: 256 * 1024 + 1 }),
+        (error) => error.code === 'transcript-invalid');
+      await assert.rejects(client.request('transcript', { ...asked, op: 'match', fromOffset: 0, hash: textHash('x'), timeoutMs: 9001 }),
+        (error) => error.code === 'transcript-invalid');
+      await assert.rejects(client.request('transcript', { ...asked, sessionId: 'sess-none', op: 'stat' }),
+        (error) => error.code === 'transcript-missing');
+    });
+  } finally { node.cleanup(); }
+});
+
+test('a match waits for the line, returns as soon as it lands, and never holds up the connection', async () => {
+  const node = transcriptNode('poll');
+  try {
+    await withHost({ env: node.env }, async ({ client }) => {
+      const { textHash } = require('./delivery.js');
+      const size = fs.statSync(node.file).size;
+      const asked = { kind: 'claude', sessionId: 'sess-transcript', account: node.account, op: 'match', fromOffset: size };
+      const started = Date.now();
+      const waiting = client.request('transcript', { ...asked, hash: textHash('typed later'), timeoutMs: 6000 }, { timeoutMs: 9000 });
+      // The same connection answers other requests while the poll waits.
+      const listedAt = Date.now();
+      assert.deepEqual((await client.request('list')).panes, []);
+      assert.ok(Date.now() - listedAt < 400, 'a list is not queued behind a long poll');
+      await delay(700);
+      fs.appendFileSync(node.file, node.user('typed later'));
+      const answer = await waiting;
+      assert.equal(answer.matched, true);
+      assert.ok(Date.now() - started < 3000, `returned early on the match (${Date.now() - started} ms)`);
+      assert.equal(answer.size, fs.statSync(node.file).size);
+
+      // Nothing arrives: the answer is "not seen" once the wait is spent, not before.
+      const quietAt = Date.now();
+      const quiet = await client.request('transcript', { ...asked, fromOffset: answer.size, hash: textHash('never'), timeoutMs: 600 });
+      assert.equal(quiet.matched, false);
+      assert.ok(Date.now() - quietAt >= 550, 'the wait was spent before answering no');
+    });
+  } finally { node.cleanup(); }
+});
+
+test('a node reads only its own account directories, never through a link, and never a caller path', async () => {
+  const node = transcriptNode('refusals');
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-transcript-elsewhere-'));
+  try {
+    await withHost({ env: node.env }, async ({ client }) => {
+      const refusedAs = (code) => (error) => error.code === code;
+      const ask = (fields) => client.request('transcript', { kind: 'claude', op: 'stat', sessionId: 'sess-transcript', account: node.account, ...fields });
+      // A directory the node has not configured, even one shaped like an account.
+      const foreign = path.join(elsewhere, 'claude-b');
+      fs.mkdirSync(path.join(foreign, 'projects', '-p'), { recursive: true });
+      fs.writeFileSync(path.join(foreign, 'projects', '-p', 'sess-transcript.jsonl'), node.user('not yours'));
+      await assert.rejects(ask({ account: { id: 'claude-a', configDir: foreign } }), refusedAs('transcript-refused'));
+      await assert.rejects(ask({ account: { id: 'claude-b', configDir: node.configDir } }), refusedAs('transcript-refused'),
+        'the right directory under another name is not this account');
+      await assert.rejects(ask({ kind: 'codex' }), refusedAs('transcript-refused'), 'nor is it a codex account');
+      // Ids and paths that are not ids.
+      for (const sessionId of ['../claude-a/projects/-work-project/sess-transcript', 'a/b', '', 'x'.repeat(129)]) {
+        await assert.rejects(ask({ sessionId }), refusedAs('transcript-invalid'), sessionId);
+      }
+      await assert.rejects(ask({ account: { id: 'claude-a', configDir: 'relative/dir' } }), refusedAs('transcript-invalid'));
+      await assert.rejects(ask({ path: node.file, account: undefined }), refusedAs('transcript-invalid'),
+        'a path is never a way to name a transcript');
+      // A transcript that is a link, to a file outside the account or inside it.
+      const outside = path.join(elsewhere, 'outside.jsonl');
+      fs.writeFileSync(outside, node.user('outside'));
+      fs.symlinkSync(outside, path.join(node.project, 'sess-out.jsonl'));
+      await assert.rejects(ask({ sessionId: 'sess-out' }), refusedAs('transcript-refused'));
+      fs.symlinkSync(node.file, path.join(node.project, 'sess-in.jsonl'));
+      await assert.rejects(ask({ sessionId: 'sess-in' }), refusedAs('transcript-refused'));
+      // A project directory that leads out of the account.
+      const escaped = path.join(elsewhere, 'escaped-project');
+      fs.mkdirSync(escaped);
+      fs.writeFileSync(path.join(escaped, 'sess-esc.jsonl'), node.user('escaped'));
+      fs.symlinkSync(escaped, path.join(node.configDir, 'projects', '-escaped'));
+      await assert.rejects(ask({ sessionId: 'sess-esc' }), refusedAs('transcript-refused'));
+      // And the transcript that is its own still answers.
+      assert.equal((await ask({})).path, node.file);
+    });
+  } finally {
+    node.cleanup();
+    fs.rmSync(elsewhere, { recursive: true, force: true });
+  }
+});
+
+test('one transcript request reads at most its budget, and says so', async () => {
+  const node = transcriptNode('cap');
+  try {
+    const { handle } = require('./node-transcript.js');
+    const { textHash } = require('./delivery.js');
+    const filler = `${JSON.stringify({ type: 'assistant', message: { content: 'x'.repeat(1000) } })}\n`;
+    fs.appendFileSync(node.file, filler.repeat(300));
+    fs.appendFileSync(node.file, node.user('at the very end'));
+    const asked = { kind: 'claude', sessionId: 'sess-transcript', account: node.account, op: 'match', fromOffset: 0 };
+    const found = await handle({ ...asked, hash: textHash('at the very end') }, { env: node.env });
+    assert.equal(found.matched, true, 'within the default budget the line is found');
+    const capped = await handle({ ...asked, hash: textHash('at the very end'), timeoutMs: 2000 },
+      { env: node.env, maxReadBytes: 64 * 1024 });
+    assert.equal(capped.matched, false, 'past the budget nothing is claimed');
+    assert.equal(capped.capped, true);
+    assert.equal(capped.checkedTo, 64 * 1024);
+    assert.equal(require('./node-transcript.js').REQUEST_MAX_READ_BYTES, 32 * 1024 * 1024);
+  } finally { node.cleanup(); }
+});

@@ -1132,6 +1132,10 @@ function createHost(options = {}) {
         return { result: {
           version: 1, replaceExited: true, guardedKill: true, compactScreen: true, guardedInput: true,
           guardedInputReceipts: true,
+          // transcript: this host answers the `transcript` verb (bin/node-transcript.js)
+          // for the sessions it runs, which is how the daemon confirms a delivery to a
+          // pane on this machine. A number, so a later shape can say it is a later one.
+          transcript: 1,
           // spawnReceipts: a spawn naming an operationId is journalled, so a caller
           // whose reply was lost may ask again instead of starting a second process.
           spawnReceipts: true,
@@ -1585,6 +1589,29 @@ function createHost(options = {}) {
     }
   };
 
+  let transcriptsInFlight = 0;
+  const TRANSCRIPTS_IN_FLIGHT_MAX = 32;
+  const runTranscript = (connection, socket, request) => {
+    const respond = (response) => {
+      if (socket.destroyed) return;
+      connection.send(encodeFrame(response));
+    };
+    if (transcriptsInFlight >= TRANSCRIPTS_IN_FLIGHT_MAX) {
+      respond({ ok: false, id: request.id, error: 'too many transcript requests in flight', code: 'transcript-busy' });
+      return;
+    }
+    transcriptsInFlight += 1;
+    Promise.resolve()
+      .then(() => require('./node-transcript.js').handle(request, { env, closed: () => socket.destroyed }))
+      .then((result) => respond({ ok: true, id: request.id, ...result }), (error) => {
+        const response = { ok: false, id: request.id, error: error.message };
+        if (error && error.code) response.code = String(error.code);
+        respond(response);
+      })
+      .catch(() => {})
+      .finally(() => { transcriptsInFlight -= 1; });
+  };
+
   const acceptConnection = (socket, transport) => {
     const remote = transport === 'tcp' ? String(socket.remoteAddress || 'unknown') : 'unix';
     // The unix socket is reachable only by this account, so it stays token-free;
@@ -1645,6 +1672,14 @@ function createHost(options = {}) {
           error: 'host reloading',
           code: 'reloading',
         }));
+        return;
+      }
+      // A transcript read may wait up to nine seconds for a line to appear, and the
+      // connection's queue answers one request at a time: run it beside the queue, so
+      // a long poll never holds back a keystroke or a screen read behind it. Bounded
+      // per host, since each one holds a descriptor and a timer.
+      if (request && typeof request === 'object' && request.type === 'transcript') {
+        runTranscript(connection, socket, request);
         return;
       }
       connection.queue = connection.queue.then(async () => {

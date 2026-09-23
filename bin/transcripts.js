@@ -148,6 +148,28 @@ function lastTurnUsage(lines, kind) {
   return result;
 }
 
+// Every project directory under one Claude projects root that holds this session's
+// transcript, in walk order. Pure: it takes the root rather than resolving an
+// account, so a node's host can answer for one of its own accounts (see
+// bin/node-transcript.js) with the very lookup the daemon uses for its own.
+function claudeFilesInProjects(projectsRoot, sessionId) {
+  const found = [];
+  let projectNames;
+  try { projectNames = fs.readdirSync(projectsRoot); } catch { return found; }
+  for (const projectName of projectNames) {
+    const file = path.join(projectsRoot, projectName, `${sessionId}.jsonl`);
+    try {
+      if (fs.statSync(file).isFile()) found.push({ file, projectName });
+    } catch {}
+  }
+  return found;
+}
+
+// The same, from an account's config directory: <configDir>/projects/*/<id>.jsonl.
+function claudeFilesIn(configDir, sessionId) {
+  return claudeFilesInProjects(path.join(configDir, 'projects'), sessionId);
+}
+
 function readTranscript(file) {
   return fs.readFileSync(file, 'utf8');
 }
@@ -203,4 +225,5 @@ function findSessionFile(id, options = {}) {
   return matches[0]?.file || null;
 }
 
-module.exports = { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscript, readTranscriptTail, lastTurnUsage, findSessionFile };
+module.exports = { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscript, readTranscriptTail, lastTurnUsage, findSessionFile,
+  claudeFilesIn, claudeFilesInProjects };
