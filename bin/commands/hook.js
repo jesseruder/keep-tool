@@ -908,8 +908,12 @@ const PI_START_BIND_MIN_MS = 600;
 //   start     the daemon first (its pane record and the bind it does through this
 //             node's host, which is what lets /new or /resume rebind a released
 //             pane), then the bind here, which finds the pane bound or does it. It
-//             fails only when neither bound it. A start the daemon did not take is
-//             queued and resent with the next hook, and said so in ~/.keep-node/hook.log.
+//             fails only when neither bound it. The session a /new or /resume starts
+//             has no location record yet: the daemon adopts it from this start, by the
+//             extension instance and pid it carries and the earlier session's shutdown
+//             phase here (bin/late-adoption.js, the Pi rule). A start the daemon did
+//             not take is queued and resent with the next hook, and said so in
+//             ~/.keep-node/hook.log.
 //   pre-tool  the raw-resume guard here, then the daemon's step and self-repair guards
 //             on this node's repository facts; a daemon that does not answer never
 //             lets through what remoteCommandGuard refuses (deploys, commands matching

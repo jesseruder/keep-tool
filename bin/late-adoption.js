@@ -9,8 +9,10 @@
 // the hook and registry routes refuse everything the session posts.
 //
 // Before refusing such a session, both routes ask this helper. Everything the node's
-// host says about its panes is the node's own word, so that word alone never adopts:
-// only a Codex session (a Claude one on a node is registered at its launch) whose one
+// host says about its panes is the node's own word, so that word alone never adopts.
+// There are two rules, one per agent, and neither ever stands in for the other.
+//
+// Codex: a session (a Claude one on a node is registered at its launch) whose one
 // live pane on the caller carries the launch facts of a fresh Codex open the daemon
 // itself recorded for that node (recordNodeCodexLaunch, written by openSession when it
 // spawns the pane, kept 24 h and used once), with an account this install has for
@@ -26,8 +28,23 @@
 // milliseconds after its start posts) or two do, nor one the request itself caused (a
 // pane other than the one it names). A host that could not be asked, and no pane for
 // a request that names none (never one of Keep's panes), is remembered for
-// SHORT_TTL_MS. The routes do not ask at all for a request that names no pane. What is remembered is keyed by the request's agent and pane as well,
-// so one request's refusal never turns away another's.
+// SHORT_TTL_MS. The routes do not ask at all for a request that names no pane. What
+// is remembered is keyed by the request's agent and pane as well, so one request's
+// refusal never turns away another's.
+//
+// Pi: `/new` or `/resume` inside a Pi session on a node starts session B in the same
+// Pi process, and only the session the daemon opened (A) was pinned. B is adopted from
+// B's own start (the only Pi post that names the extension instance and the process)
+// when the pane that start names is alive and still names A as a Pi pane, and A is
+// the daemon's own: A's location record places it on the caller as a Pi session, and
+// A's pane record here names that pane and that extension instance. The node's word
+// is then A's phase file, read through the node's host (the `transcript` verb's
+// pi-event op): A shut down under the same extension instance and process id as B's
+// start carries, which is what the extension writes just before a /new's start. B is
+// pinned to the caller with A's account, its pane record written, A's pane record
+// stamped released and naming B as its successor (so A hands over once), and B put
+// on the open card A is on. Anything less adopts nothing, and a Pi request that
+// carries no instance and pid (every Pi post but a start) never asks the host.
 // The routes exist only on the node listener: a single-node install
 // never gets here.
 const crypto = require('node:crypto');
@@ -48,7 +65,8 @@ const CACHE_MAX = 1024;
 const SESSION_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const PANE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const ACCOUNT_RE = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex|pi)\/default)$/;
-const AGENTS = ['codex'];
+const AGENTS = ['codex', 'pi'];
+const PI_INSTANCE_RE = /^[a-f0-9-]{36}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const CARD_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const LAUNCH_TTL_MS = 24 * 60 * 60e3;
@@ -215,6 +233,20 @@ function createLateAdoption(options = {}) {
     return false;
   });
   const daemonNode = options.daemonNode || (() => nodes.daemonNode(env));
+  // The open card a session is on, newest link first, from the daemon's registry
+  // (hook.js newestTaskForSession asks the same of its own snapshot).
+  const cardOfSession = options.cardOfSession || ((sessionId) => {
+    let best = null;
+    for (const task of require('./keep-core.js').loadAll(false, { root })) {
+      if (!task || !task.fm || task.fm.status === 'done') continue;
+      for (const entry of task.fm.sessions || []) {
+        if (!entry || entry.id !== sessionId) continue;
+        const at = String(entry.at || '');
+        if (!best || at > best.at) best = { id: task.id, at };
+      }
+    }
+    return best ? best.id : null;
+  });
   const refusedUntil = new Map();
   const inflight = new Map();
 
@@ -233,7 +265,9 @@ function createLateAdoption(options = {}) {
   // A real clock, never the injected one: the deadline is wall time on this process.
   const elapsedSince = (began) => Number(process.hrtime.bigint() - began) / 1e6;
 
-  async function livePanesNaming(caller, sessionId) {
+  // One question for the caller's host under one deadline: `ask(client, left)` runs on
+  // a connection opened for it, `left()` being the time still to spend.
+  async function askHost(caller, ask) {
     const began = process.hrtime.bigint();
     const left = () => LOOKUP_DEADLINE_MS - elapsedSince(began);
     let timer;
@@ -251,12 +285,7 @@ function createLateAdoption(options = {}) {
       // A connection that lands after the deadline gave up is closed here.
       if (expired) { try { connected.close(); } catch {} throw new Error('the lookup ran out of time'); }
       client = connected;
-      const remaining = Math.min(REQUEST_TIMEOUT_MS, left());
-      if (!(remaining > 0)) throw new Error('the lookup ran out of time before the list');
-      const listed = await client.request('list', {}, { timeoutMs: remaining });
-      const panes = Array.isArray(listed && listed.panes) ? listed.panes : [];
-      return panes.filter((pane) => pane && pane.alive === true && pane.meta && typeof pane.meta === 'object'
-        && pane.meta.sessionId === sessionId);
+      return ask(client, left);
     })();
     lookup.catch(() => {});
     try {
@@ -266,6 +295,20 @@ function createLateAdoption(options = {}) {
       expired = true;
       if (client) { try { client.close(); } catch {} }
     }
+  }
+
+  // The caller's live panes with meta, as its host lists them.
+  async function listPanes(client, left) {
+    const remaining = Math.min(REQUEST_TIMEOUT_MS, left());
+    if (!(remaining > 0)) throw new Error('the lookup ran out of time before the list');
+    const listed = await client.request('list', {}, { timeoutMs: remaining });
+    return (Array.isArray(listed && listed.panes) ? listed.panes : [])
+      .filter((pane) => pane && pane.alive === true && pane.meta && typeof pane.meta === 'object');
+  }
+
+  async function livePanesNaming(caller, sessionId) {
+    return askHost(caller, async (client, left) => (await listPanes(client, left))
+      .filter((pane) => pane.meta.sessionId === sessionId));
   }
 
   // A refusal, remembered for `ttl` ms (none when 0).
@@ -371,6 +414,128 @@ function createLateAdoption(options = {}) {
     return { adopted: true, pane: ref, accountId, ...(linked !== undefined ? { card: launch.card, linked } : {}) };
   }
 
+  const readRecord = (file) => {
+    try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) {
+      if (error && error.code === 'ENOENT') return null;
+      throw error;
+    }
+  };
+  const writeRecord = (file, value) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+    fs.writeFileSync(tmp, JSON.stringify(value));
+    fs.renameSync(tmp, file);
+  };
+
+  // The Pi rule (see the header): B, a session a /new or /resume started in the Pi
+  // process whose pane still names A. `pi` is B's start: its extension instance and pid.
+  async function attemptPi(caller, sessionId, requestPane, pi, verify) {
+    // One connection: the pane the start names, then the phase file of the session it
+    // still names. Nothing here is the daemon's own word yet; that is checked after.
+    const seen = await askHost(caller, async (client, left) => {
+      const panes = await listPanes(client, left);
+      const pane = panes.find((entry) => entry.id === requestPane) || null;
+      const naming = panes.filter((entry) => entry.meta.sessionId === sessionId).length;
+      const previous = pane && pane.meta.agent === 'pi' && typeof pane.meta.sessionId === 'string'
+        && SESSION_RE.test(pane.meta.sessionId) && pane.meta.sessionId !== sessionId ? pane.meta.sessionId : null;
+      if (!previous || naming) return { pane, naming, previous, event: null };
+      const remaining = Math.min(REQUEST_TIMEOUT_MS, left());
+      if (!(remaining > 0)) throw new Error('the lookup ran out of time before the phase file');
+      const answer = await client.request('transcript', { op: 'pi-event', kind: 'pi', sessionId: previous }, { timeoutMs: remaining });
+      return { pane, naming, previous, event: answer && answer.event && typeof answer.event === 'object' ? answer.event : null };
+    });
+    const { pane, previous, event } = seen;
+    // Nothing is remembered for the moments a pane takes to change hands.
+    if (seen.naming) return refusal(`a live pane on ${caller} already names session ${sessionId}`, 0);
+    if (!pane) return refusal(`no live pane ${requestPane} on ${caller}`, 0);
+    const meta = pane.meta;
+    if (meta.agent !== 'pi') return refusal(`the pane runs ${meta.agent}, not pi`);
+    if (meta.node !== undefined && meta.node !== null && meta.node !== caller) return refusal(`the pane says it is on ${meta.node}`);
+    if (!previous) return refusal('the pane names no earlier Pi session');
+    // A must be the daemon's own: placed on the caller as a Pi session, with a pane
+    // record here for this pane and this extension instance.
+    let before;
+    try { before = location(previous); } catch { return refusal(`the location record of ${previous} is unreadable`); }
+    if (!before || before.node !== caller || before.agent !== 'pi') {
+      return refusal(`the pane's earlier session ${previous} is not a Pi session the daemon placed on ${caller}`);
+    }
+    const accountId = typeof before.accountId === 'string' && ACCOUNT_RE.test(before.accountId) ? before.accountId : 'pi/default';
+    let account = null;
+    try { account = accounts.get(accountId, env); } catch { account = null; }
+    if (!account || account.agent !== 'pi') return refusal(`account ${accountId} is not a configured pi account`);
+    const ref = nodes.formatPaneRef(caller, pane.id, env);
+    let prior;
+    try { prior = readRecord(paneFile(previous)); } catch (error) {
+      return refusal(`the pane record of ${previous} is unreadable: ${error && (error.code || error.message) || error}`);
+    }
+    if (!prior || prior.pane !== ref || prior.agent !== 'pi' || prior.piInstance !== pi.instance) {
+      return refusal(`the daemon's pane record of ${previous} does not name pane ${ref} and this extension instance`);
+    }
+    if (typeof prior.successor === 'string' && prior.successor !== sessionId) {
+      return refusal(`session ${previous} already handed its pane to ${prior.successor}`);
+    }
+    // The node's word: A shut down in this very process, under this instance.
+    if (!event || event.id !== previous || event.phase !== 'shutdown') {
+      return refusal(`session ${previous} has not shut down on ${caller}`, 0);
+    }
+    if (event.instance !== pi.instance || event.pid !== pi.pid) {
+      return refusal(`session ${previous} shut down in another Pi process or extension instance`);
+    }
+    if (typeof verify === 'function') {
+      try { verify({ node: caller, agent: 'pi', accountId }); } catch (error) {
+        return refusal(`the request does not fit the session it would adopt: ${error && error.message || error}`, 0);
+      }
+    }
+    // Nothing on this machine knows B: no pane record, no phase file of the daemon
+    // node's own, and (checked again at the last moment) no location record.
+    if (fs.existsSync(paneFile(sessionId))) return refusal('the daemon already has a pane record for the session');
+    if (fs.existsSync(path.join(root, '.keep', 'pi-events', `${sessionId}.json`))) {
+      return refusal('the session is known on the daemon itself');
+    }
+    let where;
+    try { where = location(sessionId); } catch { return refusal('the location record is unreadable'); }
+    if (where) return { adopted: false, why: 'the session already has a location record', located: true };
+    // Everything from here to the return is synchronous, so no second adoption can
+    // take A's pane in between.
+    try {
+      accounts.pinSession(sessionId, 'pi', accountId, { root, env, node: caller });
+    } catch (error) { return refusal(error.message); }
+    const cwd = typeof meta.project === 'string' && path.isAbsolute(meta.project) ? meta.project
+      : (typeof pane.cwd === 'string' ? pane.cwd : '');
+    const at = now();
+    // Not bound yet: the pane still names A until the route's hook binds it for B.
+    try {
+      writeRecord(paneFile(sessionId), {
+        at, startedAt: at, cwd, agent: 'pi', pane: ref, claimed: true, node: caller, accountId, bound: false,
+        piInstance: pi.instance, unattended: meta.unattended === true, opener: meta.opener || null,
+      });
+    } catch (error) {
+      log(`late adoption: pi session ${sessionId} on ${caller} was pinned but its pane record could not be written: ${error.message}`);
+    }
+    // A released, so B's start may take the pane; named as handed over, so only once.
+    try {
+      writeRecord(paneFile(previous), { ...prior, released: Number.isFinite(prior.released) ? prior.released : at, successor: sessionId });
+    } catch (error) {
+      log(`late adoption: pi session ${previous} on ${caller} could not be marked released: ${error.message}`);
+    }
+    log(`late adoption: pi session ${sessionId} adopted on ${caller} in pane ${ref} after ${previous} (account ${accountId})`);
+    let card = null;
+    try { card = cardOfSession(previous); } catch (error) {
+      log(`late adoption: the card of pi session ${previous} could not be read: ${error && error.message || error}`);
+    }
+    let linked;
+    if (typeof card === 'string' && CARD_RE.test(card)) {
+      try {
+        linked = Boolean(linkLaunchedSession(card, { id: sessionId, agent: 'pi', node: caller }));
+        if (!linked) log(`late adoption: pi session ${sessionId} could not be linked to card ${card}: no such card`);
+      } catch (error) {
+        linked = false;
+        log(`late adoption: pi session ${sessionId} could not be linked to card ${card}: ${error && error.message || error}`);
+      }
+    }
+    return { adopted: true, pane: ref, accountId, previous, ...(linked !== undefined ? { card, linked } : {}) };
+  }
+
   // Whether a session has no location record at all, read synchronously, so a route
   // whose session has one never waits a tick for this helper. An unreadable record is
   // not a missing one.
@@ -379,10 +544,12 @@ function createLateAdoption(options = {}) {
     try { return !location(sessionId); } catch { return false; }
   }
 
-  // Adopts `sessionId` for `caller` when it has no location record at all and the
-  // caller's host shows its one live pane; otherwise does nothing. Never throws.
+  // Adopts `sessionId` for `caller` when it has no location record at all and its
+  // agent's rule holds (the header); otherwise does nothing. Never throws.
   // `options.verify(where)`, when given, is the route's check of its request against
   // the location the adoption would write; one that throws adopts nothing.
+  // `options.pi` ({ instance, pid }, a Pi start's) is what the Pi rule needs: a Pi
+  // request without it, or without a pane, never asks the host.
   async function adopt(caller, sessionId, agent, options = {}) {
     if (typeof caller !== 'string' || !caller || caller === daemonNode()) return { adopted: false, why: 'not a node' };
     if (typeof sessionId !== 'string' || !SESSION_RE.test(sessionId) || !AGENTS.includes(agent)) {
@@ -398,7 +565,16 @@ function createLateAdoption(options = {}) {
       if (!parsed || parsed.node !== caller) return { adopted: false, why: 'the pane is not on the caller' };
       requestPane = parsed.paneId;
     }
-    const key = `${caller}\0${sessionId}\0${agent}\0${requestPane || ''}`;
+    let pi = null;
+    if (agent === 'pi') {
+      const given = options.pi && typeof options.pi === 'object' ? options.pi : {};
+      if (!requestPane || typeof given.instance !== 'string' || !PI_INSTANCE_RE.test(given.instance)
+        || !Number.isSafeInteger(given.pid) || given.pid <= 0) {
+        return { adopted: false, why: 'a Pi session is adopted only from its start, in its pane' };
+      }
+      pi = { instance: given.instance, pid: given.pid };
+    }
+    const key = `${caller}\0${sessionId}\0${agent}\0${requestPane || ''}${pi ? `\0${pi.instance}\0${pi.pid}` : ''}`;
     const until = refusedUntil.get(key);
     if (until !== undefined) {
       if (until > now()) return { adopted: false, why: 'refused moments ago', cached: true };
@@ -407,7 +583,10 @@ function createLateAdoption(options = {}) {
     if (inflight.has(key)) return inflight.get(key);
     const run = (async () => {
       let result;
-      try { result = await attempt(caller, sessionId, agent, requestPane, options.verify); }
+      try {
+        result = pi ? await attemptPi(caller, sessionId, requestPane, pi, options.verify)
+          : await attempt(caller, sessionId, agent, requestPane, options.verify);
+      }
       catch (error) { result = refusal(`the host on ${caller} could not be asked: ${error && error.message || error}`, SHORT_TTL_MS); }
       if (!result.adopted) remember(key, result.ttl);
       return result;

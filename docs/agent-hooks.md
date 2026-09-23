@@ -75,7 +75,11 @@ end 2 s.
 - **start.** The daemon writes the pane record (naming the node and the extension
   instance) and binds the pane through the node's host; the node then binds it too, or
   finds it bound. The start fails only when neither bound it. A start the daemon did not
-  take is queued, resent with the next hook and noted in `~/.keep-node/hook.log`.
+  take is queued, resent with the next hook and noted in `~/.keep-node/hook.log`. The
+  session a `/new` or `/resume` starts inside Pi is adopted from its start
+  (`bin/late-adoption.js`): the pane still names a Pi session the daemon placed on that
+  node, whose pane record names the same extension instance and whose phase file on the
+  node says it shut down in the same process.
 - **pre-tool.** The raw-resume guard runs on the node first. The command then goes with
   the node's repository facts (computed by the fingerprints from `GET /api/hook/context`,
   which answers Pi sessions too) to the daemon's step and self-repair guards. A daemon that

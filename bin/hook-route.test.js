@@ -1555,7 +1555,7 @@ test('a Pi post is refused unless it is a pi-* event for a Pi session on the cal
     assert.match(answer.body.error, message);
   }
   assert.equal(calls.length, 0, 'nothing ran');
-  // Never adopted: a Pi session names itself at its open and is pinned there.
+  // Not adopted: nothing on aws1's host shows a Pi session this pane took over (see the /new tests below).
   const unknown = await hooks.handle(AWS1, piBody('pi-start', { session_id: 'pi-unknown' }, { identity: { agent: 'pi', sessionId: 'pi-unknown', pane: 'p3@aws1' } }));
   assert.equal(unknown.status, 403);
   assert.equal(unknown.body.code, 'SESSION_NOT_ON_NODE');
@@ -1664,4 +1664,126 @@ test('on the daemon a node Pi start binds the pane on that node\'s host with its
       assert.equal((await remote.request('get', { pane: pane.id })).pane.meta.sessionId, 'pi-aws1');
     } finally { remote.close(); local.close(); }
   });
+});
+
+// ---------- /new or /resume inside a Pi session on a node (bin/late-adoption.js, Pi rule) ----------
+
+// The daemon opened Pi session pi-a on aws1 in pane p3 (pinned, its pane record naming
+// the pane and the extension instance); `host` is aws1's host: its panes, and the
+// phase files its transcript verb reads.
+function piAdoptingServices(t, overrides = {}) {
+  const root = tempDir(t);
+  const configFile = path.join(root, 'config.json');
+  fs.writeFileSync(configFile, `${JSON.stringify({ version: 1, daemonNode: 'main', nodes: { main: {}, aws1: {} } })}\n`);
+  const env = { PATH: process.env.PATH, HOME: root, LANG: 'C', KEEP_CONFIG: configFile };
+  const accounts = require('./accounts.js');
+  accounts.pinSession('pi-a', 'pi', 'pi/default', { root, env, node: 'aws1' });
+  fs.mkdirSync(path.join(root, '.keep', 'panes'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.keep', 'panes', 'pi-a.json'), JSON.stringify({ at: 1, startedAt: 1, cwd: '/home/node/project',
+    agent: 'pi', pane: 'p3@aws1', claimed: true, node: 'aws1', accountId: 'pi/default', bound: true, piInstance: PI_INSTANCE,
+    ...(overrides.priorRecord || {}) }));
+  const host = {
+    asked: [],
+    panes: [{ id: 'p3', alive: true, cwd: '/home/node/project',
+      meta: { agent: 'pi', accountId: 'pi/default', sessionId: 'pi-a', node: 'aws1', project: '/home/node/project', ...(overrides.meta || {}) } }],
+    events: { 'pi-a': { id: 'pi-a', phase: 'shutdown', at: '2026-09-23T10:00:00.000Z', pid: 4242, instance: PI_INSTANCE, ...(overrides.event || {}) } },
+  };
+  const fake = fakeSpawn(() => ({ code: 0, stdout: '' }));
+  const logged = [];
+  const linked = [];
+  const registry = createRegistryService({
+    root, spawn: fake.spawn, daemonNode: () => 'main', env, configFile, log: (line) => logged.push(line),
+    location: (id) => accounts.sessionLocation(id, { root, env }),
+    cardOfSession: (id) => (id === 'pi-a' ? 'pi-card' : null),
+    linkLaunchedSession: (card, session) => { linked.push([card, session]); return { linked: session.id }; },
+    hostConnect: async (node) => {
+      assert.equal(node, 'aws1');
+      return {
+        request: async (type, params) => {
+          host.asked.push(type === 'transcript' ? `${type}:${params.op}:${params.sessionId}` : type);
+          if (type === 'list') return { panes: host.panes };
+          assert.equal(type, 'transcript');
+          assert.deepEqual(params, { op: 'pi-event', kind: 'pi', sessionId: params.sessionId });
+          return { event: host.events[params.sessionId] || null };
+        },
+        close: () => {},
+      };
+    },
+  });
+  const hooks = createHookService({ root, registry });
+  return { root, env, hooks, host, calls: fake.calls, logged, linked };
+}
+
+const piStartOf = (sessionId, input = {}, extra = {}) => piBody('pi-start', { session_id: sessionId, ...input },
+  { identity: { agent: 'pi', sessionId, pane: 'p3@aws1' }, ...extra });
+
+test('a /new inside a Pi session on a node is adopted from its start: pinned, its pane taken over, and put on the card', async (t) => {
+  const { root, env, hooks, host, calls, logged, linked } = piAdoptingServices(t);
+  const answer = await hooks.handle(AWS1, piStartOf('pi-b'));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.deepEqual(host.asked, ['list', 'transcript:pi-event:pi-a'], 'one listing, then the earlier session\'s phase file');
+  assert.deepEqual(require('./accounts.js').sessionLocation('pi-b', { root, env }), { node: 'aws1', agent: 'pi', accountId: 'pi/default' });
+  const record = readJson(path.join(root, '.keep', 'panes', 'pi-b.json'));
+  assert.deepEqual(withoutTimes(record), { cwd: '/home/node/project', agent: 'pi', pane: 'p3@aws1', claimed: true, node: 'aws1',
+    accountId: 'pi/default', bound: false, piInstance: PI_INSTANCE, unattended: false, opener: null });
+  const prior = readJson(path.join(root, '.keep', 'panes', 'pi-a.json'));
+  assert.ok(Number.isFinite(prior.released), 'the earlier session is released, so the start can bind its pane');
+  assert.equal(prior.successor, 'pi-b');
+  assert.deepEqual(linked, [['pi-card', { id: 'pi-b', agent: 'pi', node: 'aws1' }]]);
+  assert.deepEqual(calls.at(-1).args, [CLI, 'hook', 'pi', 'start']);
+  assert.equal(calls.at(-1).options.env.KEEP_AGENT_ACCOUNT_ID, 'pi/default');
+  assert.match(logged.join('\n'), /late adoption: pi session pi-b adopted on aws1 in pane p3@aws1 after pi-a \(account pi\/default\)/);
+  // Placed now: its next post never asks the host.
+  const end = await hooks.handle(AWS1, piBody('pi-end', { session_id: 'pi-b' }, { identity: { agent: 'pi', sessionId: 'pi-b', pane: 'p3@aws1' } }));
+  assert.equal(end.status, 200);
+  assert.equal(host.asked.length, 2);
+  // A handed over once: another session naming A's pane and instance is refused.
+  const again = await hooks.handle(AWS1, piStartOf('pi-c'));
+  assert.equal(again.status, 403);
+  assert.equal(require('./accounts.js').sessionLocation('pi-c', { root, env }), null);
+});
+
+test('a Pi start is adopted only on A\'s shutdown in the same process and instance, from the daemon\'s own A, and only from a start', async (t) => {
+  const cases = [
+    ['A still running', { event: { phase: 'settled' } }],
+    ['no phase file', { event: { id: 'someone-else' } }],
+    ['another instance shut A down', { event: { instance: 'ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee' } }],
+    ['another process shut A down', { event: { pid: 777 } }],
+    ['A\'s pane record names another instance', { priorRecord: { piInstance: 'ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee' } }],
+    ['A\'s pane record names another pane', { priorRecord: { pane: 'p9@aws1' } }],
+    ['A already handed over', { priorRecord: { successor: 'pi-z' } }],
+    ['the pane runs Codex', { meta: { agent: 'codex' } }],
+    ['the pane says it is elsewhere', { meta: { node: 'main' } }],
+    ['the pane names no session', { meta: { sessionId: null } }],
+  ];
+  for (const [name, overrides] of cases) {
+    const { root, env, hooks, calls, linked } = piAdoptingServices(t, overrides);
+    const answer = await hooks.handle(AWS1, piStartOf('pi-b'));
+    assert.equal(answer.status, 403, `${name}: ${JSON.stringify(answer.body)}`);
+    assert.equal(answer.body.code, 'SESSION_NOT_ON_NODE', name);
+    assert.equal(calls.length, 0, name);
+    assert.equal(require('./accounts.js').sessionLocation('pi-b', { root, env }), null, name);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'panes', 'pi-b.json')), false, name);
+    assert.deepEqual(linked, [], name);
+  }
+  // A that the daemon never placed on the caller.
+  const unplaced = piAdoptingServices(t);
+  fs.rmSync(path.join(unplaced.root, '.keep', 'session-accounts'), { recursive: true, force: true });
+  assert.equal((await unplaced.hooks.handle(AWS1, piStartOf('pi-b'))).status, 403);
+  assert.equal(require('./accounts.js').sessionLocation('pi-b', { root: unplaced.root, env: unplaced.env }), null);
+  // Only a start asks: a pre-tool or an end of the unknown session never reaches the host.
+  const { hooks, host } = piAdoptingServices(t);
+  const pre = await hooks.handle(AWS1, piBody('pi-pre-tool', { session_id: 'pi-b', tool_name: 'Bash', tool_input: { command: 'ls' }, repo_facts: NO_FACTS },
+    { identity: { agent: 'pi', sessionId: 'pi-b', pane: 'p3@aws1' } }));
+  assert.equal(pre.status, 403);
+  assert.equal(pre.body.code, 'SESSION_NOT_ON_NODE');
+  const end = await hooks.handle(AWS1, piBody('pi-end', { session_id: 'pi-b' }, { identity: { agent: 'pi', sessionId: 'pi-b', pane: 'p3@aws1' } }));
+  assert.equal(end.status, 403);
+  // Nor a start with no pane, instance or pid.
+  assert.equal((await hooks.handle(AWS1, piStartOf('pi-b', {}, { identity: { agent: 'pi', sessionId: 'pi-b' } }))).status, 403);
+  assert.equal((await hooks.handle(AWS1, piStartOf('pi-b', { instance: null, pid: null }))).status, 403);
+  assert.deepEqual(host.asked, []);
+  // The hook context never adopts a Pi session: it carries no instance or pid.
+  assert.equal((await hooks.context(AWS1, 'pi-b', { agent: 'pi', pane: 'p3@aws1' })).status, 403);
+  assert.deepEqual(host.asked, []);
 });

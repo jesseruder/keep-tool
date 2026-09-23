@@ -13,8 +13,10 @@
 // A node acts only for a session the location record places on it with the agent the
 // event is for (a Claude event for a Claude session, a codex-* event for a Codex
 // one, whose mirror is its rollout, a pi-* event for a Pi one, which has no mirror),
-// only on that session's mirror, and only with a pane on itself. A fresh Codex open of the daemon's with no location record yet,
-// whose pane on the caller now names it, is adopted first (bin/late-adoption.js).
+// only on that session's mirror, and only with a pane on itself. A fresh Codex open of
+// the daemon's with no location record yet, whose pane on the caller now names it, is
+// adopted first (bin/late-adoption.js), as is a Pi session a /new or /resume started in
+// the Pi process of a session the daemon opened there.
 // The run goes through the registry route's journal (bin/registry-route.js), so a
 // resent event replays its answer instead of running again, and a restart waits for
 // it. The transcript append is outside the journal and needs none: a post must start
@@ -643,17 +645,20 @@ function createHookService(options = {}) {
       // on the caller, so a post the route would refuse on its own pins nothing. A post
       // that names no pane is not from one of Keep's panes (every host pane carries
       // KEEP_PANE, and the node's own bind needs it), so it never asks the node's host.
-      // Never a Pi session: its id is assigned and pinned at open, so there is nothing to adopt.
+      // A Pi session is asked about only from its start: the one Pi post that names the
+      // extension instance and process a /new or /resume inside Pi is adopted by.
       const identity = isObject(body) && isObject(body.identity) ? body.identity : null;
-      const ofItsAgent = identity && identity.agent !== 'pi' && typeof identity.pane === 'string' && identity.pane !== ''
-        && (body.event === TRANSCRIPT_ONLY
-        || ((EVENTS.includes(body.event) || CODEX_EVENTS.includes(body.event)) && agentOf(body.event) === identity.agent));
+      const piStart = identity && identity.agent === 'pi' && body.event === 'pi-start';
+      const ofItsAgent = identity && typeof identity.pane === 'string' && identity.pane !== ''
+        && (piStart || (identity.agent !== 'pi' && (body.event === TRANSCRIPT_ONLY
+        || ((EVENTS.includes(body.event) || CODEX_EVENTS.includes(body.event)) && agentOf(body.event) === identity.agent))));
       if (ofItsAgent && typeof shared.adopt === 'function' && shared.unlocated(identity.sessionId)) {
-        validateRequest(body, caller, { ...deps, location: () => ({ node: caller, agent: identity.agent }) });
+        const checked = validateRequest(body, caller, { ...deps, location: () => ({ node: caller, agent: identity.agent }) });
         // And again inside the adoption, with the account it would pin, before it pins:
         // a post naming another account is refused with nothing pinned.
         const verify = (where) => validateRequest(body, caller, { ...deps, location: () => where });
-        await shared.adopt(caller, identity.sessionId, identity.agent, { pane: identity.pane, verify });
+        await shared.adopt(caller, identity.sessionId, identity.agent, { pane: identity.pane, verify,
+          ...(piStart ? { pi: { instance: checked.input.instance, pid: checked.input.pid } } : {}) });
       }
       const request = validateRequest(body, caller, deps);
       if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };

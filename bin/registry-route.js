@@ -154,6 +154,7 @@ function createRegistryService(options = {}) {
     ...(options.locatedLocally ? { locatedLocally: options.locatedLocally } : {}),
     ...(options.linkLaunchedSession ? { linkLaunchedSession: options.linkLaunchedSession } : {}),
     ...(options.releaseCardSession ? { releaseCardSession: options.releaseCardSession } : {}),
+    ...(options.cardOfSession ? { cardOfSession: options.cardOfSession } : {}),
   });
   const pidAlive = options.pidAlive || ((pid) => {
     try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }

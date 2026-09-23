@@ -313,6 +313,36 @@ test('a Pi session on aws1 starts, has its step command refused by the daemon, a
     assert.ok(Number.isFinite(released.released), 'the daemon\'s pane record is released');
     assert.equal((await paneMeta()).sessionId, PI_SID);
 
+    // A session the daemon never placed on aws1: its pre-tool is refused by the daemon
+    // (403) and falls back to the node's own guard, on the fingerprints last published.
+    const STRANGER = '12121212-3434-4545-8686-979797979797';
+    const stranger = (command) => run(['hook', 'pi', 'pre-tool'], { ...nodeEnv, KEEP_PI_SESSION_ID: STRANGER },
+      { session_id: STRANGER, cwd: fleet.project, instance, pid: 4242, tool_name: 'Bash', tool_input: { command } });
+    const fallback = await stranger('terraform apply');
+    assert.equal(fallback.status, 2);
+    assert.match(fallback.stderr, /terraform apply/);
+    assert.deepEqual(await stranger('ls -la'), { status: 0, stdout: '', stderr: '' });
+
+    // /new inside Pi: the extension writes the first session's shutdown (this process,
+    // this instance) on the node, ends it, and starts the next in the same pane, which
+    // still names the first. The daemon adopts the next from its start and binds it.
+    const events = path.join(process.env.KEEP_DIR, '.keep', 'pi-events');
+    fs.mkdirSync(events, { recursive: true });
+    fs.writeFileSync(path.join(events, `${PI_SID}.json`), `${JSON.stringify({ id: PI_SID, phase: 'shutdown',
+      at: new Date().toISOString(), pid: 4242, instance, sessionFile: null, leafId: null })}\n`);
+    const NEXT = '67676767-8989-4a9a-8b8b-cdcdcdcdcdcd';
+    const next = await run(['hook', 'pi', 'start'], { ...nodeEnv, KEEP_PI_SESSION_ID: NEXT },
+      { session_id: NEXT, cwd: fleet.project, instance, pid: 4242 });
+    assert.deepEqual(next, { status: 0, stdout: '', stderr: '' });
+    assert.deepEqual(require('./accounts.js').sessionLocation(NEXT, { root: fleet.registry }),
+      { node: 'aws1', agent: 'pi', accountId: 'pi/default' });
+    const nextRecord = JSON.parse(fs.readFileSync(path.join(fleet.registry, '.keep', 'panes', `${NEXT}.json`), 'utf8'));
+    assert.equal(nextRecord.pane, `${paneId}@aws1`);
+    assert.equal(nextRecord.bound, true);
+    assert.equal(nextRecord.piInstance, instance);
+    assert.equal((await paneMeta()).sessionId, NEXT);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(fleet.registry, '.keep', 'panes', `${PI_SID}.json`), 'utf8')).successor, NEXT);
+
     assert.deepEqual(fs.readdirSync(nodeRegistry), [], 'the node wrote no registry of its own');
     assert.equal(fs.existsSync(path.join(fleet.root, '.keep-node', 'hook-queue')), false, 'nothing had to be queued');
   });

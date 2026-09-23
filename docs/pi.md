@@ -108,6 +108,12 @@ transcript preview for a Pi session on a node yet: its row comes from the pane a
 phase. `keep tell`, `keep move`, Pi background jobs and Review Queue launches stay
 unavailable for Pi on a node, as they are on the daemon node (moves: Claude only).
 
+A `/new` or `/resume` inside a Pi session on a node starts another session in the same
+Pi process. The daemon adopts it from its start: the pane still names the session Keep
+opened, whose phase file on the node says it shut down under the same extension
+instance and process. The new session is placed on that node, takes over the pane,
+and goes on the card the first one was on.
+
 Keep also refuses `keep open <Pi session>` while any interactive Pi process outside a
 Keep Pi host pane is running. Pi sets its process title to `pi` and hides the session
 arguments, so Keep cannot safely prove which external session it would resume. Exit the
