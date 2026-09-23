@@ -73,9 +73,13 @@ test('auth preflight fails closed without exposing auth output', async () => {
 });
 test('auth subprocess accepts stderr status and bounds hung or excessive output', async (t) => {
   const account = { agent: 'codex', configDir: '/profile' };
-  // The preflight runs through `zsh -lic`; an empty ZDOTDIR keeps the operator's
-  // login profile, which can take ~15s under load, out of the deadlines below.
-  const env = { ...process.env, ZDOTDIR: temp(t) };
+  // The preflight runs through `zsh -lic`; a ZDOTDIR of empty startup files keeps the
+  // operator's login profile, which can take ~15s under load, out of the deadlines
+  // below. Empty files, not none: a zsh with no startup files at all (Ubuntu's) runs
+  // its new-user wizard instead.
+  const zdotdir = temp(t);
+  for (const name of ['.zshenv', '.zshrc']) fs.writeFileSync(path.join(zdotdir, name), '');
+  const env = { ...process.env, ZDOTDIR: zdotdir };
   assert.equal(await support.authPreflight(account, { env, profileCommand: () => "/bin/sh -c 'printf \"Logged in using ChatGPT\\n\" >&2'" }), true);
   assert.equal(await support.authPreflight(account, { env, profileCommand: () => "/bin/sh -c 'printf \"Logged in using ChatGPT\\n\"; exit 1'" }), false);
   assert.equal(await support.authPreflight(account, { env, profileCommand: () => '/bin/sleep 5', timeoutMs: 100 }), false);

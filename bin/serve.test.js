@@ -16005,15 +16005,18 @@ async function openCodexOnAws1(t, ids) {
     fs.writeFileSync(configFile, `${JSON.stringify({ ...config, accounts: [...config.accounts, codexAccount],
       defaultAccounts: { ...config.defaultAccounts, codex: codexAccount.id } }, null, 2)}\n`);
     fs.writeFileSync(path.join(fakeBin, 'codex'), FAKE_CODEX, { mode: 0o755 });
+    // Empty startup files, not none: a zsh with no startup files at all (Ubuntu's)
+    // opens its new-user wizard in the pane instead of running the command.
     const zdotdir = path.join(root, 'zdotdir');
     fs.mkdirSync(zdotdir);
+    for (const name of ['.zshenv', '.zshrc']) fs.writeFileSync(path.join(zdotdir, name), '');
     try {
       let opened = null;
       let error = null;
       try {
         opened = await openSession({ fresh: true, agent: 'codex', node: 'aws1', cwd: project, accountId: codexAccount.id, requestId: 'open-codex-1' }, {
           root: registry, env, connectHost: connect, codexFlags: '',
-          // An empty ZDOTDIR: the pane's login shell reads none of this machine's own
+          // A ZDOTDIR of empty files: the pane's login shell reads none of this machine's own
           // rc files, so nothing puts a real codex ahead of the fake on PATH.
           launchEnv: { PATH: agentPath, ZDOTDIR: zdotdir, KEEP_TEST_CODEX_IDS: ids.join(' ') },
           // What the real wait waits for: the TUI up, which the fake says once its
