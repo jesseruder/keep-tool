@@ -75,6 +75,29 @@ test('only a live pane that still names the requester and the card keeps a hando
   assert.equal(handoffs.handingOver(card('card-a'), []), false);
 });
 
+test('a TCP node that accepts and never answers its hello counts as in flight, well inside 2 s', async (t) => {
+  const net = require('node:net');
+  const root = tempRoot(t);
+  const sockets = [];
+  const silent = net.createServer((socket) => { sockets.push(socket); });
+  await new Promise((resolve) => silent.listen(0, '127.0.0.1', resolve));
+  t.after(() => { for (const socket of sockets) socket.destroy(); return new Promise((resolve) => silent.close(resolve)); });
+  const tokenFile = path.join(root, 'aws1.token');
+  fs.writeFileSync(tokenFile, `${'a'.repeat(64)}\n`, { mode: 0o600 });
+  const configFile = path.join(root, 'config.json');
+  fs.writeFileSync(configFile, JSON.stringify({ version: 1, daemonNode: 'main',
+    nodes: { main: {}, aws1: { transport: 'tcp', address: `127.0.0.1:${silent.address().port}`, tokenFile } } }));
+  const env = { HOME: root, KEEP_CONFIG: configFile, KEEP_DAEMON_NODE: 'main', KEEP_NODE_NAME: 'main' };
+  handoffs.record(root, { requester: 'req-1', card: 'card-a', pane: 'p4@aws1' });
+  const began = Date.now();
+  const live = await handoffs.liveHandoffs(root, 'req-1', { env });
+  const took = Date.now() - began;
+  assert.deepEqual(live, [{ card: 'card-a', sessionId: null }], 'a host that cannot be asked keeps the handoff in flight');
+  assert.ok(sockets.length >= 1, 'the node accepted the connection');
+  assert.ok(took < 2000, `the ask gave up at its own deadlines (${took} ms), not the 8 s hello default`);
+  assert.deepEqual(handoffs.pendingFor(root, 'req-1').map((entry) => entry.card), ['card-a'], 'and the record is kept');
+});
+
 // ---------- the requester's Stop hook, through the real CLI and a real host ----------
 
 function registry(t) {

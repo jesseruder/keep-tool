@@ -85,7 +85,10 @@ async function liveHandoffs(root, requester, deps = {}) {
   if (!pending.length) return [];
   const env = deps.env || process.env;
   const nodes = deps.nodes || require('./nodes.js');
-  const connect = deps.connectHost || ((node) => require('./hostclient.js').connect({ node, env, timeoutMs: LOOKUP_TIMEOUT_MS }));
+  // Connect, a TCP node's hello and the get each get LOOKUP_TIMEOUT_MS, so a node that
+  // accepts and then stalls costs a Stop about 1.5 s, well inside its hook budget.
+  const connect = deps.connectHost || ((node) => require('./hostclient.js').connect({
+    node, env, timeoutMs: LOOKUP_TIMEOUT_MS, helloTimeoutMs: LOOKUP_TIMEOUT_MS }));
   const out = [];
   await Promise.all(pending.map(async (entry) => {
     let ref;
