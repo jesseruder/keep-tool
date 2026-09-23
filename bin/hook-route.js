@@ -46,6 +46,10 @@ const HOOK_EVENT_NAMES = {
     'UserPromptSubmit', 'Stop', 'SessionStart', 'SessionEnd', 'Interrupt'],
 };
 const PRUNE_EVERY_MS = 60 * 60e3;
+// What GET /api/hook/context publishes of the step registries: the command
+// fingerprints the step guard matches, as strings, and no more of them than this.
+const FINGERPRINTS_MAX = 256;
+const FINGERPRINT_MAX_BYTES = 200;
 // What the daemon's hook code reads from a session's own environment, forwarded by
 // the node in identity.env: a flag, a short token or an id each, never more. Any
 // other key is dropped; a listed one of another shape refuses the request.
@@ -254,6 +258,35 @@ function digestOf(request) {
   ])}`).digest('hex');
 }
 
+// Every guarded step's command fingerprints (steps.stepFingerprints), deduplicated
+// and bounded: what a node's pre-bash hook needs to tell whether a command could be
+// a gated step before it computes that command's repository facts, and what it
+// refuses by when the daemon cannot answer. Data only; a fingerprint that is not
+// one printable line is left out.
+function publishedFingerprints(root) {
+  const stepRegistry = require('./steps.js');
+  const out = new Set();
+  for (const registry of stepRegistry.registeredSteps(root)) {
+    for (const step of Object.values(registry.steps || {})) {
+      let list = [];
+      try { list = stepRegistry.stepFingerprints(step); } catch { list = []; }
+      for (const value of list) {
+        const text = String(value).trim();
+        if (!text || /[\u0000-\u001f\u007f]/.test(text) || Buffer.byteLength(text) > FINGERPRINT_MAX_BYTES) continue;
+        out.add(text);
+      }
+    }
+  }
+  return [...out].sort().slice(0, FINGERPRINTS_MAX);
+}
+
+// Whether the daemon's self-repair scheduler launched this session for a repair
+// card. Never the node's word: its KEEP_REPAIR is not forwarded. A record that
+// cannot be read answers yes, which only ever refuses more.
+function isRepairSession(cardForSession, sessionId, root) {
+  try { return Boolean(cardForSession(sessionId, root)); } catch { return true; }
+}
+
 function createHookService(options = {}) {
   const registry = options.registry;
   if (!registry || !registry.shared) throw new Error('createHookService needs the registry service');
@@ -262,6 +295,7 @@ function createHookService(options = {}) {
   const stopping = options.stopping || (() => false);
   const timeoutMs = options.timeoutMs || HOOK_TIMEOUT_MS;
   const now = shared.now;
+  const cardForSession = options.cardForSession || ((sessionId, at) => require('./self-repair.js').cardForSession(sessionId, at));
   // One request at a time per session, from the append to the answer: the mirror's
   // continuity check and the run that reads it must not interleave.
   const sessions = new Map();
@@ -355,10 +389,29 @@ function createHookService(options = {}) {
     }
   }
 
-  return { handle };
+  // GET /api/hook/context?session=<id>: what a node's pre-bash hook reads before
+  // it posts, and falls back on when the daemon does not answer the post. Only for
+  // a Claude session the location record places on the calling node.
+  function context(principal, sessionId) {
+    try {
+      const caller = shared.callerNode(principal);
+      if (caller === shared.daemonNode()) refuse(403, 'the hook route is for sessions on other nodes');
+      const session = matching(sessionId, SESSION_RE, 'session id');
+      let where = null;
+      try { where = shared.location(session); } catch { where = null; }
+      if (!where || where.node !== caller) refuse(403, `session ${session} is not on node ${caller}`);
+      if (where.agent !== 'claude') refuse(403, `session ${session} is a ${where.agent} session, not claude`);
+      return { status: 200, body: { steps: publishedFingerprints(root), repairSession: isRepairSession(cardForSession, session, root) } };
+    } catch (error) {
+      if (error instanceof RegistryError) return { status: error.status, body: { error: error.message } };
+      return { status: 500, body: { error: error.message } };
+    }
+  }
+
+  return { handle, context };
 }
 
 module.exports = {
-  createHookService, validateRequest, cleanInput, digestOf,
-  EVENTS, TRANSCRIPT_ONLY, HOOK_TIMEOUT_MS, INPUT_MAX_BYTES, BODY_MAX_BYTES, TEXT_MAX, FORWARDED_ENV,
+  createHookService, validateRequest, cleanInput, digestOf, publishedFingerprints,
+  EVENTS, FINGERPRINTS_MAX, FINGERPRINT_MAX_BYTES, TRANSCRIPT_ONLY, HOOK_TIMEOUT_MS, INPUT_MAX_BYTES, BODY_MAX_BYTES, TEXT_MAX, FORWARDED_ENV,
 };

@@ -11,6 +11,9 @@
 //   ~/.keep-node/hook-queue/<seq>.json  events that could not be delivered, replayed
 //                                    in order, with their own keys, before the next post.
 //   ~/.keep-node/hook.log            what the queue dropped, and why.
+//   ~/.keep-node/hook-context.json   { at, steps, sessions: { <sid>: { repairSession, at } } }:
+//                                    what GET /api/hook/context last said, asked
+//                                    again after a minute and kept past it.
 //
 // An event is delivered against the transcript as it stood when the event fired:
 // its generation and size are taken first, and the delta in front of it stops at
@@ -56,6 +59,7 @@ const FORWARDED_ENV = Object.freeze({
 });
 
 function stateDir(env = process.env) { return path.join(env.HOME || os.homedir(), '.keep-node'); }
+function contextFile(env) { return path.join(stateDir(env), 'hook-context.json'); }
 function cursorFile(env, sid) { return path.join(stateDir(env), 'mirror', `${sid}.json`); }
 function queueDir(env) { return path.join(stateDir(env), 'hook-queue'); }
 function logFile(env) { return path.join(stateDir(env), 'hook.log'); }
@@ -388,6 +392,57 @@ function queue(event, input, identity, key, fired, env) {
   } catch { return false; }
 }
 
+// ---------- the daemon's hook context ----------
+
+const CONTEXT_TTL_MS = 60e3;
+const CONTEXT_FETCH_MS = 1500;
+const CONTEXT_SESSIONS_MAX = 64;
+const FINGERPRINTS_MAX = 256;
+const FINGERPRINT_MAX_BYTES = 200;
+
+// The published fingerprints, if that is what they are: at most 256 printable
+// one-line strings of at most 200 bytes. Anything else is not a list to match by.
+function validSteps(value) {
+  return Array.isArray(value) && value.length <= FINGERPRINTS_MAX && value.every((item) => typeof item === 'string'
+    && item.trim() && !/[\u0000-\u001f\u007f]/.test(item) && Buffer.byteLength(item) <= FINGERPRINT_MAX_BYTES);
+}
+
+function readContextCache(env) {
+  const value = readJson(contextFile(env));
+  if (!value || !Number.isFinite(value.at) || !validSteps(value.steps)) return null;
+  const sessions = value.sessions && typeof value.sessions === 'object' && !Array.isArray(value.sessions) ? value.sessions : {};
+  return { at: value.at, steps: value.steps, sessions };
+}
+
+// What the daemon says a pre-bash hook needs: { steps, repairSession, fresh }. From
+// the cache while it is under a minute old for this session; else asked, within
+// `timeoutMs`. When the daemon does not answer, the cache as it stands, however old,
+// with `fresh: false`: a node that cannot reach its daemon still refuses by the
+// last list it had. repairSession is null when nothing has ever been said of it.
+async function hookContext({ env, where, token, sessionId, timeoutMs = CONTEXT_FETCH_MS, deps = {} }) {
+  const now = deps.now || Date.now;
+  const cached = readContextCache(env);
+  const known = cached && cached.sessions[sessionId] && typeof cached.sessions[sessionId].repairSession === 'boolean'
+    ? cached.sessions[sessionId] : null;
+  if (cached && known && now() - cached.at < CONTEXT_TTL_MS && now() - (known.at || 0) < CONTEXT_TTL_MS) {
+    return { steps: cached.steps, repairSession: known.repairSession, fresh: true };
+  }
+  const stale = { steps: cached ? cached.steps : [], repairSession: known ? known.repairSession : null, fresh: false };
+  if (!(timeoutMs > 0) || !token) return stale;
+  let answer;
+  try {
+    const request = deps.request || require('./remote-cli.js').nodeApiRequest;
+    const response = await request(where.url, `/api/hook/context?session=${encodeURIComponent(sessionId)}`, { method: 'GET', token, timeoutMs });
+    answer = response.status === 200 ? parsed(response) : null;
+  } catch { answer = null; }
+  if (!answer || !validSteps(answer.steps) || typeof answer.repairSession !== 'boolean') return stale;
+  const at = now();
+  const sessions = { ...(cached ? cached.sessions : {}), [sessionId]: { repairSession: answer.repairSession, at } };
+  const kept = Object.entries(sessions).sort((a, b) => (b[1].at || 0) - (a[1].at || 0)).slice(0, CONTEXT_SESSIONS_MAX);
+  try { writeAtomic(contextFile(env), { at, steps: answer.steps, sessions: Object.fromEntries(kept) }); } catch {}
+  return { steps: answer.steps, repairSession: answer.repairSession, fresh: true };
+}
+
 // For `keep doctor` on a node: how much is waiting, and the newest cursor.
 function report(env = process.env) {
   const queued = queueFiles(env).length;
@@ -406,5 +461,6 @@ function report(env = process.env) {
 
 module.exports = {
   runHook, deliver, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
+  hookContext, contextFile, CONTEXT_TTL_MS,
   EVENTS, BUDGET_MS, QUEUE_MAX, CHUNK_BYTES, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
 };

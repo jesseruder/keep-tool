@@ -66,6 +66,18 @@ function routes(ctx) {
       },
     },
     {
+      // What a node's pre-bash hook needs before it posts: the step fingerprints
+      // and whether the session is a self-repair agent (bin/hook-route.js).
+      method: 'GET',
+      path: '/api/hook/context',
+      allow: ['node'],
+      when: nodeApiEnabled,
+      handle: async ({ res, url, principal }) => {
+        const result = ctx.hookService.context(principal, url.searchParams.get('session'));
+        return json(res, result.status, result.body);
+      },
+    },
+    {
       method: 'GET',
       path: '/api/registry/ping',
       allow: NODE_API_ALLOW,

@@ -62,7 +62,7 @@ function services(t, overrides = {}) {
     env: { PATH: process.env.PATH, HOME: root, LANG: 'C', ...(overrides.env || {}) },
     configFile: path.join(root, 'config.json'),
   });
-  const hooks = createHookService({ root, registry, stopping: overrides.stopping });
+  const hooks = createHookService({ root, registry, stopping: overrides.stopping, cardForSession: overrides.cardForSession });
   return { root, registry, hooks, calls: fake.calls };
 }
 
@@ -614,4 +614,106 @@ test('a question\'s input reaches the hook in a bounded shape', async (t) => {
   assert.equal(first.options.length, 19, 'twenty at most, the non-option dropped');
   assert.deepEqual(first.options.slice(0, 3), [{ label: 'One' }, 'Two', { label: 'o0' }]);
   assert.deepEqual(tool.questions.slice(1), [{ question: 'Second?' }, { question: 'Third?' }]);
+});
+
+// ---------- the hook context a node's pre-bash reads ----------
+
+function stepsRegistry(root) {
+  fs.mkdirSync(path.join(root, 'steps'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'steps', 'infra.json'), JSON.stringify({ project: path.join(root, 'infra'), steps: {
+    apply: { command: 'cd infra && terraform apply -auto-approve' },
+    bake: { guard: ['build_packer_image.sh', 'terraform apply'] },
+    deploy: { guard: false, command: 'keep restart-daemon' },
+    odd: { guard: ['two\nlines', 'x'.repeat(300)] },
+  } }));
+  fs.writeFileSync(path.join(root, 'steps', 'broken.json'), '{ not json');
+}
+
+test('the hook context is on the node API only, for nodes', async () => {
+  const fake = { context: () => ({ status: 200, body: { steps: [], repairSession: false } }) };
+  const json = (res, status, value) => ({ status, value });
+  const req = { method: 'GET' };
+  const url = new URL('http://x/api/hook/context?session=sess-aws1');
+  assert.equal(matchRoute(routes({ json, hookService: fake }), { req, url }), null);
+  const route = matchRoute(routes({ json, nodeApiEnabled: () => true, hookService: fake }), { req, url });
+  assert.equal(route.path, '/api/hook/context');
+  assert.equal(routeDenial(route, AWS1), null);
+  assert.deepEqual(routeDenial(route, { class: 'admin' }), { status: 403, error: 'forbidden for admin' });
+  assert.deepEqual(await route.handle({ req, res: {}, url, principal: AWS1 }), { status: 200, value: { steps: [], repairSession: false } });
+});
+
+test('the hook context publishes the step fingerprints and whether the daemon launched the session to repair it', async (t) => {
+  const root = tempDir(t);
+  stepsRegistry(root);
+  let card = '';
+  const { hooks, calls } = services(t, { root, cardForSession: (sessionId, at) => {
+    assert.equal(sessionId, 'sess-aws1');
+    assert.equal(at, root);
+    if (card === 'throw') throw new Error('unreadable');
+    return card;
+  } });
+  assert.deepEqual(hooks.context(AWS1, 'sess-aws1'), { status: 200, body: { steps: ['build_packer_image.sh', 'terraform apply'], repairSession: false } });
+  card = 'repair-card';
+  assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, true);
+  card = 'throw';
+  assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, true, 'a record that cannot be read refuses more, never less');
+  for (const [who, session, status, message] of [
+    [AWS1, 'sess-main', 403, /not on node aws1/],
+    [AWS1, 'codex-aws1', 403, /is a codex session/],
+    [AWS1, '../x', 400, /invalid session id/],
+    [AWS1, null, 400, /invalid session id/],
+    [{ class: 'admin' }, 'sess-aws1', 403, /for sessions on other nodes/],
+    [{ class: 'node', node: 'main' }, 'sess-aws1', 403, /unauthorized/],
+  ]) {
+    const answer = hooks.context(who, session);
+    assert.equal(answer.status, status, JSON.stringify(answer));
+    assert.match(answer.body.error, message);
+  }
+  assert.equal(calls.length, 0, 'nothing ran');
+  // Bounded: at most 256 fingerprints.
+  fs.writeFileSync(path.join(root, 'steps', 'many.json'), JSON.stringify({ project: path.join(root, 'many'),
+    steps: Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`s${i}`, { guard: [`tool${String(i).padStart(3, '0')} run`] }])) }));
+  assert.equal(hooks.context(AWS1, 'sess-aws1').body.steps.length, 256);
+});
+
+test('a node asks for the hook context at most once a minute, and keeps the last answer when the daemon is gone', async (t) => {
+  const client = require('./hook-client.js');
+  const env = { HOME: tempDir(t) };
+  const where = { url: 'http://127.0.0.1:1', local: 'aws1', daemon: 'main' };
+  let clock = 1_000_000;
+  let answer = { status: 200, data: JSON.stringify({ steps: ['terraform apply'], repairSession: false }) };
+  const asked = [];
+  const deps = { now: () => clock, request: async (url, pathname, options) => {
+    asked.push({ pathname, method: options.method, token: options.token });
+    if (answer === 'down') throw new Error('connect ECONNREFUSED');
+    return answer;
+  } };
+  const context = (sessionId = 'sess-aws1') => client.hookContext({ env, where, token: 't', sessionId, deps });
+  assert.deepEqual(await context(), { steps: ['terraform apply'], repairSession: false, fresh: true });
+  assert.deepEqual(asked, [{ pathname: '/api/hook/context?session=sess-aws1', method: 'GET', token: 't' }]);
+  clock += 30e3;
+  assert.deepEqual(await context(), { steps: ['terraform apply'], repairSession: false, fresh: true });
+  assert.equal(asked.length, 1, 'from the cache within the minute');
+  // Another session is asked for: whether it is a repair session is its own.
+  answer = { status: 200, data: JSON.stringify({ steps: ['terraform apply'], repairSession: true }) };
+  assert.equal((await context('sess-other')).repairSession, true);
+  assert.equal(asked.length, 2);
+  clock += 31e3;
+  answer = 'down';
+  assert.deepEqual(await context(), { steps: ['terraform apply'], repairSession: false, fresh: false }, 'the last answer, marked stale');
+  assert.equal(asked.length, 3);
+  // An answer that is not a fingerprint list is not taken.
+  for (const bad of [{ steps: 'terraform apply', repairSession: false }, { steps: ['a\nb'], repairSession: false },
+    { steps: ['ok'], repairSession: 'no' }, { steps: Array.from({ length: 257 }, (_, i) => `s${i}`), repairSession: false }]) {
+    answer = { status: 200, data: JSON.stringify(bad) };
+    assert.deepEqual(await context(), { steps: ['terraform apply'], repairSession: false, fresh: false }, JSON.stringify(bad).slice(0, 60));
+  }
+  answer = { status: 403, data: JSON.stringify({ error: 'nope' }) };
+  assert.equal((await context()).fresh, false);
+  const cache = JSON.parse(fs.readFileSync(client.contextFile(env), 'utf8'));
+  assert.deepEqual(cache.steps, ['terraform apply']);
+  assert.deepEqual(Object.keys(cache.sessions).sort(), ['sess-aws1', 'sess-other']);
+  // Nothing ever said: no fingerprints, and nothing known of the session.
+  assert.deepEqual(await client.hookContext({ env: { HOME: tempDir(t) }, where, token: 't', sessionId: 'sess-aws1', deps }),
+    { steps: [], repairSession: null, fresh: false });
 });
