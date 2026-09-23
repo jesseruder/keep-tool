@@ -8,19 +8,42 @@ const app = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
 const shell = fs.readFileSync(path.join(__dirname, '../web/app/shell.js'), 'utf8').replace(/^export /gm, '');
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
+// The reload slice runs two kinds of timer: the reload retry, and the status chip's
+// one-second tick (renderConnectionStatus, which clears its own before re-arming).
+// Kept apart by id, so clearing one never cancels the other; `retry()` is the pending
+// reload retry, or null. The chip tick is never run: it only re-renders the chip.
+const CHIP_TICK_MS = 1000;
+function reloadTimers() {
+  const timers = new Map();
+  let next = 0;
+  return {
+    setTimeout(fn, ms) { timers.set(++next, { fn, ms }); return next; },
+    clearTimeout(id) { timers.delete(id); },
+    retry() { return [...timers.values()].find((timer) => timer.ms !== CHIP_TICK_MS)?.fn || null; },
+  };
+}
+// The chip's view, as app.js imports it.
+const statusChip = () => import('../web/app/status-chip.js');
+
 test('startup subscribes despite a failed request, retries, and refreshes on reconnect', async () => {
-  let onStatus, retry, attempts = 0, renders = 0, iconRefreshes = 0;
+  let onStatus, attempts = 0, renders = 0, iconRefreshes = 0;
   const label = { dataset: {} };
+  const timers = reloadTimers();
+  const { statusChipState } = await statusChip();
   const context = vm.createContext({
+    statusChipState, syncMobile() {},
     document: { querySelector: () => label },
     api: {
       subscribe(_change, status) { onStatus = status; },
       getState() { return ++attempts === 1 ? Promise.reject(Error('offline')) : Promise.resolve({ panes: [] }); },
       getLayouts: async () => [],
       getPortableTransfers: async () => ({ transfers: [] }),
+      // The slice includes the status chip's subscription to in-flight writes.
+      onPendingChange() { return () => {}; },
+      pendingWrites: () => [],
     },
     detailStore: { reconcile() {} },
-    setTimeout(fn) { retry = fn; return 1; }, clearTimeout() { retry = null; },
+    setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout,
     reloadGeneration: 0, appliedReloadGeneration: 0, layoutRevision: 0, layoutSavesPending: 0,
     closingSessions: { reconcile() {} },
     data: {}, optimisticSetAside: new Map(), pruneSetAsideOverrides() {}, droppedPanes: new Set(), spawnedPanes: new Map(),
@@ -35,12 +58,12 @@ test('startup subscribes despite a failed request, retries, and refreshes on rec
   vm.runInContext(app.slice(app.indexOf("document.querySelector('#connection').textContent = 'connecting';")), context);
   await settle();
   assert.equal(typeof onStatus, 'function');
-  assert.equal(typeof retry, 'function');
+  assert.equal(typeof timers.retry(), 'function');
   assert.equal(renders, 0);
-  await retry();
+  await timers.retry()();
   assert.equal(renders, 1);
   assert.equal(iconRefreshes, 1);
-  assert.equal(retry, null);
+  assert.equal(timers.retry(), null);
   onStatus('live');
   await settle();
   assert.equal(renders, 2);
@@ -49,10 +72,14 @@ test('startup subscribes despite a failed request, retries, and refreshes on rec
 });
 
 test('a daemon restart retries quietly; only a long outage or a real error toasts', async () => {
-  let retry, clock = 1_000_000, failure = null;
+  let clock = 1_000_000, failure = null;
   const toasts = [];
   const label = { dataset: { status: 'live' } };
+  const timers = reloadTimers();
+  const retry = () => timers.retry()();
+  const { statusChipState } = await statusChip();
   const context = vm.createContext({
+    statusChipState: (input) => statusChipState(input, clock), syncMobile() {},
     Date: { now: () => clock },
     document: { querySelector: () => label },
     api: {
@@ -60,9 +87,12 @@ test('a daemon restart retries quietly; only a long outage or a real error toast
       getState() { return failure ? Promise.reject(failure) : Promise.resolve({ panes: [] }); },
       getLayouts: async () => [],
       getPortableTransfers: async () => ({ transfers: [] }),
+      // The slice includes the status chip's subscription to in-flight writes.
+      onPendingChange() { return () => {}; },
+      pendingWrites: () => [],
     },
     detailStore: { reconcile() {} },
-    setTimeout(fn) { retry = fn; return 1; }, clearTimeout() { retry = null; },
+    setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout,
     reloadGeneration: 0, appliedReloadGeneration: 0, layoutRevision: 0, layoutSavesPending: 0,
     closingSessions: { reconcile() {} },
     data: {}, optimisticSetAside: new Map(), pruneSetAsideOverrides() {}, droppedPanes: new Set(), spawnedPanes: new Map(),
@@ -79,7 +109,7 @@ test('a daemon restart retries quietly; only a long outage or a real error toast
   await reload();
   assert.deepEqual(toasts, [], 'a restarting daemon does not toast');
   assert.equal(label.dataset.status, 'reconnecting');
-  assert.equal(typeof retry, 'function');
+  assert.equal(typeof timers.retry(), 'function');
   clock += 20e3;
   failure = unreachable();
   await retry();
@@ -87,15 +117,15 @@ test('a daemon restart retries quietly; only a long outage or a real error toast
   failure = null;
   await retry();
   assert.equal(label.dataset.status, 'live', 'recovery clears the reconnecting state');
-  assert.equal(retry, null);
+  assert.equal(timers.retry(), null);
 
   failure = unreachable();
   await reload();
-  vm.runInContext("eventStreamStatus = 'reconnecting'", context);
+  vm.runInContext("eventStreamStatus = 'reconnecting'; eventReconnectingSince = Date.now()", context);
   failure = null;
   await retry();
   assert.equal(label.dataset.status, 'reconnecting', 'a fetch recovery leaves the event stream status alone');
-  vm.runInContext("eventStreamStatus = 'live'", context);
+  vm.runInContext("eventStreamStatus = 'live'; eventReconnectingSince = 0", context);
   label.dataset.status = 'live';
 
   failure = Object.assign(Error('dashboard action queue is full'), { status: 503, transient: false });

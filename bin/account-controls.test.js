@@ -7,8 +7,18 @@ const source = fs.readFileSync(path.join(__dirname, '../web/app/account-controls
   .replaceAll('export function', 'function');
 // `writeResult`, when a test sets it on the context, is what write() answers with;
 // otherwise it keeps the single-session handoff's shape.
+// runAction (web/app/action.js) is the module's busy-button wrapper: the button is
+// disabled while the action runs, an early click on a disabled one does nothing, and a
+// failure is reported (the sticky banner) and rethrown to the caller.
 const context = vm.createContext({ write: async (url, body) => { writes.push({ url, body }); return context.writeResult || { status: 'done' }; },
-  openPortableTransfer() {}, writeResult: null });
+  openPortableTransfer() {}, writeResult: null, reported: [],
+  async runAction(button, fn) {
+    if (button?.disabled) return undefined;
+    if (button) button.disabled = true;
+    try { return await fn(); }
+    catch (error) { context.reported.push(error.message); throw error; }
+    finally { if (button) button.disabled = false; }
+  } });
 vm.runInContext(source, context);
 
 // installHandoffControls binds several attributes; a stub that answered every
