@@ -228,6 +228,28 @@ test('a preflight refusal of the real move is a toast too, and the controls come
   assert.deepEqual(other.toasts, []);
 });
 
+test('a second click while the real move runs posts nothing', async () => {
+  const ctx = fixture();
+  let finish;
+  reset([{ ok: true, dry: true }, () => new Promise((resolve) => { finish = () => resolve({ ok: true, status: 'done', to: 'aws1' }); })]);
+  const aws1 = button({ moveNode: 'aws1' });
+  const main = button({ moveNode: 'main' });
+  install(ctx, { '[data-move-node]': [aws1, main] });
+  const first = aws1.click();
+  while (!finish) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(context.writes.length, 2);
+  await aws1.click();
+  await main.click();
+  // A re-render while it runs offers no buttons to click at all.
+  assert.doesNotMatch(context.moveControlsHTML(ctx, session(), { live: true }), /data-move-node/);
+  assert.equal(context.writes.length, 2, 'neither the same nor another node was posted');
+  finish();
+  await first;
+  assert.deepEqual(ctx.toasts, ['Moved to aws1']);
+  assert.equal(aws1.disabled, false);
+  assert.equal(main.disabled, false);
+});
+
 test('Retry and Abandon post the move id and report what the daemon says', async () => {
   const ctx = fixture();
   reset([{ ok: true, status: 'done', to: 'aws1', launch: { pane: 'p4@aws1' } },

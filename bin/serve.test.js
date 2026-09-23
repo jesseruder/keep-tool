@@ -16619,3 +16619,30 @@ test('console node state keeps the transcript path bound to a session row it rep
     assert.equal(sessionSources.get(staleRow), '/transcripts/stale.jsonl');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('a session carrying a move keeps it through the console projection, live or exited', async () => {
+  const { addNodeState } = require('./serve');
+  const { consoleState } = require('./dashboard-state');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-move-state-'));
+  try {
+    const dir = path.join(root, '.keep', 'session-moves');
+    fs.mkdirSync(dir, { recursive: true });
+    const tx = (n) => `mv-${String(n).padStart(24, '0')}`;
+    fs.writeFileSync(path.join(dir, `${tx(1)}.json`), JSON.stringify({ id: tx(1), sessionId: 'live', from: 'main', to: 'aws1', status: 'copying', createdAt: 1 }));
+    fs.writeFileSync(path.join(dir, `${tx(2)}.json`), JSON.stringify({ id: tx(2), sessionId: 'stopped', from: 'main', to: 'aws1',
+      status: 'recovery-needed', phase: 'starting', message: 'stopped while starting', createdAt: 2 }));
+    const sessionMove = { ...require('./session-move'), running: () => ['live'], isRunning: (id) => id === 'live' };
+    const state = { sessions: [
+      { id: 'live', kind: 'claude', alive: true, state: 'working', pane: 'p1', observation: { big: true } },
+      { id: 'stopped', kind: 'claude', alive: false, exited: true, state: 'exited', pane: null, lastAssistantFull: 'x' },
+    ] };
+    await addNodeState(state, { ok: true, nodes: { aws1: { ok: true } } }, { root, sessionMove, daemonNode: 'main', placementNodes: ['main', 'aws1'] });
+    const projected = consoleState(state);
+    assert.deepEqual(projected.nodes.map((node) => node.name), ['main', 'aws1']);
+    const byId = Object.fromEntries(projected.sessions.map((session) => [session.id, session]));
+    assert.deepEqual(byId.live.move, { id: tx(1), to: 'aws1', from: 'main', status: 'in-flight', phase: 'copying' });
+    assert.equal(byId.live.observation, undefined, 'the projection still drops the detail');
+    assert.deepEqual(byId.stopped.move, { id: tx(2), to: 'aws1', from: 'main', status: 'recovery-needed', phase: 'starting', message: 'stopped while starting' });
+    assert.equal(byId.stopped.lastAssistantFull, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
