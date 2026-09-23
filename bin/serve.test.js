@@ -9878,6 +9878,27 @@ test('a Codex update notice with no prompt is waited out and named; with its pro
       && /waiting at its update prompt \(0\.155\.1 -> 0\.156\.1\)/.test(error.message));
   assert.ok(now < 2000, 'refused at once, not after the whole wait');
   assert.deepEqual([...new Set(requests)], ['screen']);
+  // Codex's own option alone under the sparkle-less notice still refuses on the second read.
+  now = 0;
+  screen = 'Update available! 0.155.1 -> 0.156.1\n\n  1. Update now\n  2. Skip\n  3. Skip until next version\n';
+  await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),
+    (error) => error.status === 409 && error.extra.awaitingUpdate === true);
+  assert.ok(now > 0 && now < 2000, 'on the second read');
+  // "Press enter to continue" under the notice is another dialog's (the model-migration
+  // prompt): not refused, but the timeout still names the update, and that it asks.
+  now = 0;
+  screen = '✨ Update available! 0.155.1 -> 0.156.1\n\n  Codex now defaults to a newer model.\n  Press enter to continue\n';
+  await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),
+    (error) => error.status === 504 && error.extra.awaitingUpdate === true
+      && /waiting at its update prompt \(0\.155\.1 -> 0\.156\.1\), and a prompt under it waits for an answer; answer it in the pane/.test(error.message));
+  assert.ok(now >= 45e3, 'waited out, not refused');
+  // The update text quoted inside a tool result is not Codex's notice: the generic timeout.
+  now = 0;
+  screen = '• Ran grep -r update\n  └ log: "✨ Update available! 0.155.1 -> 0.156.1"\n    3. Skip until next version\n    Update now (runs `npm install -g @openai/codex`)\n';
+  await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),
+    (error) => error.status === 504 && error.extra.awaitingUpdate === undefined
+      && /codex session in pane-update never showed an empty prompt/.test(error.message));
+  assert.ok(now >= 45e3);
   // A generic timeout is still generic, and a Claude pane never reads the notice.
   now = 0; screen = 'loading...';
   await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),

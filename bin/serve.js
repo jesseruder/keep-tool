@@ -9207,20 +9207,27 @@ function agentPromptVisible(agent, screen) {
 // it is information, and the prompt below it still takes a message; as the startup
 // update prompt ("Update now (runs `npm install -g @openai/codex`)", "Skip", "Skip
 // until next version", "Press enter to continue") it holds the pane before any prompt,
-// and Keep never answers it: it would install software on Owner's machine. Returns
-// { from, to, prompt } for a screen showing the notice, null otherwise.
+// and Keep never answers it: it would install software on Owner's machine. The notice
+// is read only at a line's start (quoted text in a tool result is not Codex's own), and
+// the prompt only by its own options: "Press enter to continue" or "[y/N]" under a
+// notice can be another dialog's (the model-migration prompt), so they only enrich the
+// timeout's message. Returns { from, to, prompt, asks } for a screen showing the
+// notice, null otherwise.
 const CODEX_UPDATE_VERSION = String.raw`v?(\d{1,4}\.\d{1,4}\.\d{1,4}(?:[-+][0-9A-Za-z.]{1,24})?)`;
-const CODEX_UPDATE_RE = new RegExp(String.raw`Update available!\s{0,8}${CODEX_UPDATE_VERSION}\s{0,8}(?:->|→)\s{0,8}${CODEX_UPDATE_VERSION}`);
-const CODEX_UPDATE_PROMPT_RE = /Skip until next version|Update now \(runs|Press enter to continue|\[y\/N\]/i;
+const CODEX_UPDATE_RE = new RegExp(String.raw`^\s{0,40}(?:✨\s{0,8})?Update available!\s{0,8}${CODEX_UPDATE_VERSION}\s{0,8}(?:->|→)\s{0,8}${CODEX_UPDATE_VERSION}`);
+const CODEX_UPDATE_PROMPT_RE = /Update now \(runs|Skip until next version/;
+const CODEX_UPDATE_ASKS_RE = /Press enter to continue|\[y\/N\]/i;
 
 function codexUpdateNotice(screen) {
   const lines = stripTerminalAnsi(String(screen || '')).split(/\r?\n/);
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const match = CODEX_UPDATE_RE.exec(lines[index].slice(0, 400));
     if (!match) continue;
-    // The prompt's options sit under its title; a "Press enter" further off is another screen's.
-    const prompt = lines.slice(index + 1, index + 13).some((line) => CODEX_UPDATE_PROMPT_RE.test(line));
-    return { from: match[1], to: match[2], prompt };
+    // The prompt's options sit under its title; anything further off is another screen's.
+    const under = lines.slice(index + 1, index + 13);
+    const prompt = under.some((line) => CODEX_UPDATE_PROMPT_RE.test(line));
+    const asks = prompt || under.some((line) => CODEX_UPDATE_ASKS_RE.test(line));
+    return { from: match[1], to: match[2], prompt, asks };
   }
   return null;
 }
@@ -9228,7 +9235,8 @@ function codexUpdateNotice(screen) {
 function codexUpdateMessage(target, notice, deps = {}) {
   let node = '';
   try { node = sessionNodeOf(String(target.pane || ''), deps); } catch { node = ''; }
-  return `codex in ${target.pane} is waiting at its update prompt (${notice.from} -> ${notice.to}); answer it in the pane or update Codex on ${node || 'its node'}`;
+  const asking = notice.asks && !notice.prompt ? ', and a prompt under it waits for an answer' : '';
+  return `codex in ${target.pane} is waiting at its update prompt (${notice.from} -> ${notice.to})${asking}; answer it in the pane or update Codex on ${node || 'its node'}`;
 }
 
 // Under the injection lock: the prompt seen a moment ago must still be there
