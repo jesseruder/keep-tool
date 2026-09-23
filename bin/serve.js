@@ -12791,23 +12791,50 @@ async function addHostSessionState(state, deps = {}) {
   return state;
 }
 
+// What the last builds read of each exited session's location record, by its file:
+// a record whose (mtimeMs, size) has not changed is not read again. The worker keeps
+// this across its 5 s builds; bounded, oldest out first.
+const stoppedNodeCache = new Map(); // file -> { mtimeMs, size, node }
+const STOPPED_NODE_CACHE_MAX = 4096;
+
+function cachedSessionNode(sessionId, root, env, read) {
+  const file = accounts.authorityFile(root, sessionId);
+  let stat;
+  try { stat = fs.statSync(file); } catch (error) {
+    stoppedNodeCache.delete(file);
+    if (error && error.code === 'ENOENT') return null;
+    throw error;
+  }
+  const hit = stoppedNodeCache.get(file);
+  if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit.node;
+  // A record that does not read is not cached: it throws again next build, as before.
+  const node = read(sessionId, { root, env });
+  stoppedNodeCache.delete(file);
+  stoppedNodeCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, node });
+  while (stoppedNodeCache.size > STOPPED_NODE_CACHE_MAX) stoppedNodeCache.delete(stoppedNodeCache.keys().next().value);
+  return node;
+}
+
 // Where an exited session lives, from its location record: the pane that said so is
 // gone (or is an old one on the machine it left), and the console still names the
 // machine and offers a move from there. `node` keeps its live meaning, named only when
 // it is not the daemon's own; `nodeRecorded` says the record exists, so the daemon's
 // node is known rather than assumed. Only on a fleet: a single-node install has one
-// answer and reads nothing. Sync reads, one small file per exited session: this runs
-// in the dashboard build worker, never on the daemon's loop.
+// answer and reads nothing. Sync, one stat per exited session and a read only for a
+// record that changed (cachedSessionNode): this runs in the dashboard build worker,
+// never on the daemon's loop.
 function addStoppedSessionNodes(state, deps = {}) {
   if (!Array.isArray(state?.sessions) || hostNodeNames(deps).length < 2) return state;
   const root = deps.root || keep.ROOT;
   const env = deps.env || process.env;
   const daemon = daemonNodeName(deps);
+  const lookup = deps.sessionNode
+    || ((id) => cachedSessionNode(id, root, env, deps.readSessionNode || accounts.sessionNode));
   for (const session of state.sessions) {
     if (!session || typeof session.id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(session.id)) continue;
     if (!(session.exited === true || session.state === 'exited' || session.alive === false)) continue;
     let node = null;
-    try { node = (deps.sessionNode || accounts.sessionNode)(session.id, { root, env }); } catch {}
+    try { node = lookup(session.id, { root, env }); } catch {}
     if (!node) continue;
     session.nodeRecorded = true;
     if (node !== daemon) session.node = node;

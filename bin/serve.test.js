@@ -16839,6 +16839,37 @@ test('an exited session publishes the node its location record names, through th
   assert.equal(single.sessions[0].nodeRecorded, undefined);
 });
 
+test('an exited session\'s location record is read again only when its file changed', () => {
+  const { addStoppedSessionNodes } = require('./serve');
+  const accounts = require('./accounts.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-stopped-node-cache-'));
+  try {
+    const env = { HOME: root, KEEP_DIR: root, KEEP_DAEMON_NODE: 'main' };
+    accounts.pinSession('stopped-a', 'claude', 'claude/default', { root, env, node: 'aws1' });
+    const reads = [];
+    const deps = { root, env, daemonNode: 'main', hostNodes: ['main', 'aws1'],
+      readSessionNode: (id, options) => { reads.push(id); return accounts.sessionNode(id, options); } };
+    const build = () => {
+      const state = { sessions: [{ id: 'stopped-a', kind: 'claude', exited: true, state: 'exited' },
+        { id: 'stopped-none', kind: 'claude', exited: true, state: 'exited' }] };
+      addStoppedSessionNodes(state, deps);
+      return state.sessions;
+    };
+    assert.equal(build()[0].node, 'aws1');
+    assert.equal(build()[0].node, 'aws1');
+    assert.deepEqual(reads, ['stopped-a'], 'one read for two builds; a missing record is a stat, not a read');
+    // The session moves back: its record changes, and the next build reads it.
+    const file = accounts.authorityFile(root, 'stopped-a');
+    const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+    fs.writeFileSync(file, `${JSON.stringify({ ...record, node: 'main', updatedAt: record.updatedAt + 1 }, null, 2)}\n`);
+    fs.utimesSync(file, new Date(), new Date(Date.now() + 5000));
+    const moved = build()[0];
+    assert.equal(moved.node, undefined);
+    assert.equal(moved.nodeRecorded, true);
+    assert.deepEqual(reads, ['stopped-a', 'stopped-a']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 // ---------- Pi on a node ----------
 
 // A fresh Pi card open on aws1: aws1's host says it reads Pi phase files, its
