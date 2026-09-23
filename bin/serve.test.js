@@ -16484,8 +16484,14 @@ test('a card open links the launched session before the requester leaves, and a 
   const logged = [];
   const stderr = process.stderr.write;
   process.stderr.write = (line) => { logged.push(String(line)); return true; };
-  let thrown, missing, failedOpen;
+  let thrown, missing, failedOpen, discussed;
   try {
+    // A review-queue discussion links nothing on purpose, and logs nothing for it.
+    discussed = await remoteCardOpen(t, { agent: 'claude' }, {
+      randomUUID: () => '11111111-2222-4333-8444-999999999999',
+      linkLaunchedSession: require('./serve.js').skipCardLink,
+    });
+    assert.deepEqual(logged.filter((line) => /could not link/.test(line)), [], 'no failed link is logged for a discussion');
     thrown = await remoteCardOpen(t, { agent: 'claude' }, {
       randomUUID: () => '11111111-2222-4333-8444-666666666666',
       linkLaunchedSession: () => { throw new Error('registry locked'); },
@@ -16510,6 +16516,9 @@ test('a card open links the launched session before the requester leaves, and a 
   assert.ok(logged.some((line) => /could not link .* to card: no such card/.test(line)), logged.join(''));
   assert.ok(failedOpen.error, 'the open fails');
   assert.deepEqual(failedOpen.order, [], 'neither linked nor released');
+  assert.equal(discussed.error, null, discussed.error && discussed.error.stack);
+  assert.deepEqual(discussed.order, [], 'neither linked nor released');
+  assert.equal(discussed.opened.linked, undefined);
 });
 
 test('a pending card open on aws1 that learns its session itself links it once, releases the requester once, and consumes its launch record', async (t) => {

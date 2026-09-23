@@ -10836,8 +10836,10 @@ async function openSession(body, deps = {}) {
   }
 
   // The launched session goes on the card first; only then does the one that handed
-  // it over leave, so a failed link leaves the card with its requester.
-  if (handoff && launch.sessionId) {
+  // it over leave, so a failed link leaves the card with its requester. A launch that
+  // must not take the card (a review-queue discussion) links nothing on purpose, and
+  // says nothing about it.
+  if (handoff && launch.sessionId && deps.linkLaunchedSession !== skipCardLink) {
     try {
       if ((deps.linkLaunchedSession || keep.linkLaunchedSession)(body.taskId,
           { id: launch.sessionId, agent, node: launchNode })) {
@@ -11016,6 +11018,10 @@ function resolveReviewLaunchSelection(body, deps = {}) {
   return { agent, accountId: account.id, model, ...(body.node ? { node: body.node } : {}) };
 }
 
+// The link a launch that must not take its card passes openSession: it links
+// nothing, and openSession, knowing it by identity, logs no failed link for it.
+function skipCardLink() { return null; }
+
 async function launchReviewQueueSession(request, deps = {}) {
   const open = deps.openSession || openSession;
   return open({
@@ -11041,7 +11047,7 @@ async function launchReviewQueueSession(request, deps = {}) {
     // A discussion is an advisory conversation. It must not take the parent
     // card's ownership/resume slot merely because somebody opened the item.
     linkLaunchedSession: request.action === 'discuss'
-      ? () => null
+      ? skipCardLink
       : (deps.linkLaunchedSession || keep.linkLaunchedSession),
   });
 }
@@ -15645,7 +15651,7 @@ module.exports = {
   listPortableTransfers, inspectPortableSource, portableTerminalRateLimitEvidence,
   portableTransferDraft, preparePortableTransfer,
   portableTransferPreview, transferSession, resolvePortableTransfer, recoverPortableOpening,
-  resolveReviewLaunchSelection, launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
+  resolveReviewLaunchSelection, launchReviewQueueSession, skipCardLink, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
   waitForHostAgent, waitForHostSessionId, adoptNodeCodexLaunch, addHostSessionState, addStoppedSessionNodes,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,
   claudeMcpMenuVisible,
