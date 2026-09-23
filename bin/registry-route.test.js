@@ -827,3 +827,21 @@ test('a request naming the wrong pane neither blocks nor delays the right one', 
   assert.equal((await other.svc.handle(AWS1, lateBody(other.root, { pane: null, idempotencyKey: 'k-no-pane-1123456789' }))).status, 403);
   assert.equal(other.host.asked, 2);
 });
+
+test('a request the route would refuse on its own adopts nothing', async (t) => {
+  const cases = [
+    ['not a registry command', { command: 'serve' }, 400],
+    ['a short key', { idempotencyKey: 'short' }, 400],
+    ['a command-bearing flag', { command: 'checkin', args: ['card', '--probe', 'rm -rf ~'] }, 400],
+    ['a cwd the daemon lacks', { cwd: '/no/such/dir' }, 400],
+    ['a pane on another node', { pane: 'p7@aws2' }, 403],
+  ];
+  for (const [name, extra, status] of cases) {
+    const { svc, root, host } = adoptingService(t, [lateCodexPane()]);
+    const answer = await svc.handle(AWS1, lateBody(root, extra));
+    assert.equal(answer.status, status, `${name}: ${JSON.stringify(answer.body)}`);
+    assert.equal(host.asked, 0, `${name}: the host was not asked`);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts')), false, `${name}: nothing pinned`);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'panes')), false, `${name}: no pane record`);
+  }
+});

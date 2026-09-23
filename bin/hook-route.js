@@ -17,9 +17,9 @@
 // whose pane on the caller now names it, is adopted first (bin/late-adoption.js).
 // The run goes through the registry route's journal (bin/registry-route.js), so a
 // resent event replays its answer instead of running again, and a restart waits for
-// it. The transcript
-// append is outside the journal and needs none: a post must start where the mirror
-// ends, so a resend of bytes already appended writes nothing and says where to go on.
+// it. The transcript append is outside the journal and needs none: a post must start
+// where the mirror ends, so a resend of bytes already appended writes nothing and
+// says where to go on.
 const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
@@ -599,17 +599,19 @@ function createHookService(options = {}) {
       // Only for a session on another node: the daemon's own sessions run their hooks
       // themselves, and a caller naming the daemon would route its panes to itself.
       if (caller === daemon) refuse(403, 'the hook route is for sessions on other nodes');
+      const deps = { location: shared.location, parsePaneRef: shared.parsePaneRef, formatPaneRef: shared.formatPaneRef, now, home };
       // A session the caller's host shows but the daemon never heard register
-      // (bin/late-adoption.js), asked only for a well-formed event of its agent.
+      // (bin/late-adoption.js), asked only for a well-formed event of its agent, and
+      // only for a post that is otherwise sound: checked first as if the session were
+      // on the caller, so a post the route would refuse on its own pins nothing.
       const identity = isObject(body) && isObject(body.identity) ? body.identity : null;
       const ofItsAgent = identity && (body.event === TRANSCRIPT_ONLY
         || ((EVENTS.includes(body.event) || CODEX_EVENTS.includes(body.event)) && agentOf(body.event) === identity.agent));
       if (ofItsAgent && typeof shared.adopt === 'function' && shared.unlocated(identity.sessionId)) {
+        validateRequest(body, caller, { ...deps, location: () => ({ node: caller, agent: identity.agent }) });
         await shared.adopt(caller, identity.sessionId, identity.agent, { pane: typeof identity.pane === 'string' ? identity.pane : null });
       }
-      const request = validateRequest(body, caller, {
-        location: shared.location, parsePaneRef: shared.parsePaneRef, formatPaneRef: shared.formatPaneRef, now, home,
-      });
+      const request = validateRequest(body, caller, deps);
       if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };
       pruneMirrors();
       const scope = request.sessionId || '\0client-end';

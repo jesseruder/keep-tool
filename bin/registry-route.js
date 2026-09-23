@@ -301,15 +301,20 @@ function createRegistryService(options = {}) {
     try {
       const daemon = daemonNode();
       const caller = callerNode(principal, daemon);
-      if (caller !== daemon && body && typeof body === 'object' && typeof body.session === 'string'
-        && typeof body.agent === 'string' && lateAdoption.unlocated(body.session)) {
-        await lateAdoption.adopt(caller, body.session, body.agent, { pane: typeof body.pane === 'string' ? body.pane : null });
-      }
-      const request = validateRequest(body, caller, {
+      const deps = {
         io, location,
         parsePaneRef: (ref) => nodes.parsePaneRef(ref),
         formatPaneRef: (node, paneId) => nodes.formatPaneRef(node, paneId),
-      });
+      };
+      // A session the daemon never heard register (bin/late-adoption.js) is adopted
+      // only for a request that is otherwise sound: checked first as if the session
+      // were on the caller, so a request the route would refuse on its own pins nothing.
+      if (caller !== daemon && body && typeof body === 'object' && typeof body.session === 'string'
+        && typeof body.agent === 'string' && lateAdoption.unlocated(body.session)) {
+        validateRequest(body, caller, { ...deps, location: () => ({ node: caller, agent: body.agent }) });
+        await lateAdoption.adopt(caller, body.session, body.agent, { pane: typeof body.pane === 'string' ? body.pane : null });
+      }
+      const request = validateRequest(body, caller, deps);
       return await journaled({
         caller, key: request.idempotencyKey, digest: digestOf(request), queue: caller,
         run: () => execute(request, caller),
