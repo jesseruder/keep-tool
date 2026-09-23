@@ -187,10 +187,30 @@ test('with no pool the fixed assignment stands, exactly as before', () => {
   assert.equal(budget.select({ ...quiet, purpose: 'slack', accountApi: bare }).account, 'background');
 });
 
+// A health store the way bin/health.js keeps one: shared by every "process" handed it.
+function fakeHealth() {
+  const store = {};
+  const records = [];
+  let clock = 0;
+  return {
+    records, store,
+    row: (name) => store[name] || null,
+    clipError: (message) => String(message),
+    record(name, options) {
+      records.push({ name, options });
+      const prior = store[name] || {};
+      clock += 1;
+      store[name] = options.ok === false
+        ? { ...prior, consecutiveFailures: Number(prior.consecutiveFailures || 0) + 1, lastError: options.error, lastErrorAt: clock }
+        : { ...prior, consecutiveFailures: 0, lastOkAt: clock };
+    },
+  };
+}
+
 test('a deferral writes one account-budget health row, and a later selection clears it', () => {
   budget.resetHealthMemory();
-  const records = [];
-  const health = { record: (name, options) => records.push({ name, options }) };
+  const health = fakeHealth();
+  const { records } = health;
   const spent = usage({ 'claude-secondary': reading(limits({ week: 100 })), 'claude-tertiary': reading(limits({ week: 100 })) });
   const fine = usage({ 'claude-secondary': reading(limits({ week: 10 })) });
   const base = { now: NOW, accountApi: accountsApi(), health };
@@ -208,10 +228,10 @@ test('a deferral writes one account-budget health row, and a later selection cle
   budget.resetHealthMemory();
 });
 
-test('health: the first success in a process writes ok, one success clears every purpose, and expired deferrals drop out', () => {
+test('health: a missing row is written ok, one success clears every purpose, and expired deferrals drop out', () => {
   budget.resetHealthMemory();
-  const records = [];
-  const health = { record: (name, options) => records.push({ name, options }) };
+  const health = fakeHealth();
+  const { records } = health;
   const spent = usage({
     'claude-secondary': reading(limits({ week: 100, weekReset: NOW + 3 * HOUR })),
     'claude-tertiary': reading(limits({ week: 100, weekReset: NOW + 4 * HOUR })),
@@ -219,8 +239,7 @@ test('health: the first success in a process writes ok, one success clears every
   const fine = usage({ 'claude-secondary': reading(limits({ week: 10 })) });
   const base = { accountApi: accountsApi(), health };
 
-  // (a) A fresh process's first success writes ok, clearing whatever red row the CLI
-  // or a previous daemon left behind.
+  // (a) No stored row yet: the first success writes ok.
   budget.select({ ...base, now: NOW, purpose: 'summarize', usage: fine });
   assert.deepEqual(records.map((row) => row.options.ok), [true]);
 
@@ -248,6 +267,59 @@ test('health: the first success in a process writes ok, one success clears every
     usage: fine, exclude: ['claude-secondary'] });
   assert.equal(none.deferred, true);
   assert.equal(records.length, count, 'no health row for it');
+  budget.resetHealthMemory();
+});
+
+test('health is decided from the stored row, across processes', () => {
+  const health = fakeHealth();
+  const { records } = health;
+  const spent = usage({ 'claude-secondary': reading(limits({ week: 100 })), 'claude-tertiary': reading(limits({ week: 100 })) });
+  const fine = usage({ 'claude-secondary': reading(limits({ week: 10 })) });
+  const base = { now: NOW, accountApi: accountsApi(), health };
+
+  // `keep reviewer` (one process) leaves the row red...
+  budget.resetHealthMemory();
+  budget.select({ ...base, purpose: 'reviewer', usage: spent });
+  assert.equal(health.store['account-budget'].consecutiveFailures, 1);
+  // ...and the daemon (another, which has written ok before in its own life) clears it
+  // on its next success, because the stored row is what counts.
+  budget.resetHealthMemory();
+  budget.select({ ...base, purpose: 'summarize', usage: fine });
+  budget.select({ ...base, purpose: 'summarize', usage: fine });
+  assert.deepEqual(records.map((row) => row.options.ok), [false, true], 'cleared once, not rewritten');
+
+  // The daemon's deferral is live; a child's success writes ok; the daemon's next
+  // deferral, with the same message it wrote before, is written red again.
+  budget.resetHealthMemory();
+  budget.select({ ...base, purpose: 'summarize', usage: spent });
+  const daemonMessage = records.at(-1).options.error;
+  budget.select({ ...base, purpose: 'ideas', usage: fine }); // the child
+  budget.resetHealthMemory();
+  budget.select({ ...base, purpose: 'summarize', usage: spent });
+  assert.deepEqual(records.slice(-3).map((row) => row.options.ok), [false, true, false]);
+  assert.equal(records.at(-1).options.error, daemonMessage);
+  budget.resetHealthMemory();
+});
+
+test('with no current reading anywhere, the preferred account breaks the tie ahead of pool order', () => {
+  const rows = budget.rank(['a', 'b', 'c'], null, { now: NOW, preferredId: 'c' });
+  assert.deepEqual(rows.map((row) => [row.id, row.unknown]), [['c', true], ['a', true], ['b', true]]);
+  const api = accountsApi({ automationAccounts: { reviewer: 'claude-tertiary' } });
+  assert.equal(budget.select({ ...quiet, purpose: 'reviewer', accountApi: api, usage: null }).account, 'claude-tertiary');
+});
+
+test('a preferred account outside the pool is ignored, and said once', () => {
+  budget.resetHealthMemory();
+  const lines = [];
+  const stderr = { write: (line) => lines.push(line) };
+  const value = usage({ 'claude-secondary': reading(limits({ week: 50 })), 'claude-tertiary': reading(limits({ week: 60 })) });
+  for (let i = 0; i < 3; i += 1) {
+    const choice = budget.select({ ...quiet, purpose: 'incident-responder', preferredId: 'claude/default', accountApi: accountsApi(),
+      usage: value, stderr });
+    assert.equal(choice.account, 'claude-secondary');
+  }
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /incident-responder prefers claude\/default, which is not in the automation pool; ignored/);
   budget.resetHealthMemory();
 });
 

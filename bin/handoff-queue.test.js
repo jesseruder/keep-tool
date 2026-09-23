@@ -364,6 +364,34 @@ test('a rate-limited session on another node is never queued for a transfer', as
   assert.deepEqual(result.skipped, [{ sessionId: 'session-far', reason: 'session runs on aws1' }]);
 });
 
+test('an unusable automationPool is said once per process, not on every tick, and held sessions write no health', async () => {
+  const budget = require('./account-budget');
+  budget.resetHealthMemory();
+  const f = fixture();
+  f.write({ automationPool: ['nope'] });
+  const lines = [];
+  const logs = [];
+  const stderr = { write: (line) => lines.push(line) };
+  for (let i = 0; i < 3; i += 1) {
+    await queue.tick({ root: f.root, env: f.env, now: () => T, log: (line) => logs.push(line), stderr,
+      sessions: async () => [session({ unattended: true })], handoffSession: async () => { throw new Error('should not be called'); } });
+  }
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^keep accounts: automationPool ignored: /);
+  assert.deepEqual(logs, [], 'nothing per tick');
+  assert.deepEqual(queue.list(f.root), [], 'no pool, no key: nothing moves');
+
+  // A session held against a spent pool asks select with no health row.
+  budget.resetHealthMemory();
+  f.write();
+  const asked = [];
+  await queue.tick({ root: f.root, env: f.env, now: () => T, log: () => {},
+    sessions: async () => [session({ unattended: true })],
+    selectAccount: (options) => { asked.push(options); return { account: null, deferred: true, retryAt: T + 1, reason: 'spent' }; },
+    handoffSession: async () => { throw new Error('should not be called'); } });
+  assert.deepEqual(asked.map((options) => [options.purpose, options.recordHealth]), [['handoff', false]]);
+});
+
 test('an unusable rateLimitHandoff key is reported and ignored, never guessed at', async () => {
   const f = fixture();
   const lines = [];

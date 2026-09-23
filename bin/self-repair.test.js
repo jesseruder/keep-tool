@@ -2029,9 +2029,37 @@ test('the repair account comes from the account policy, a spent pool pins none, 
   const asked = [];
   const pick = (answer) => (options) => { asked.push(options.purpose); if (answer instanceof Error) throw answer; return answer; };
   assert.equal(selfRepair.repairAccountId({}, { selectAccount: pick({ account: 'claude-secondary' }) }), 'claude-secondary');
-  assert.equal(selfRepair.repairAccountId({}, { selectAccount: pick({ account: null, deferred: true, retryAt: 1 }) }), undefined);
   // The harness registry has no accounts: the built-in default, as before the pool existed.
+  assert.equal(selfRepair.repairAccountId(process.env, { selectAccount: pick({ account: null, deferred: true, retryAt: 1 }) }), 'claude/default');
   assert.equal(selfRepair.repairAccountId(process.env, { selectAccount: pick(new Error('broken')) }), 'claude/default');
   assert.equal(selfRepair.repairAccountId(process.env), 'claude/default', 'single-account install: unchanged');
   assert.deepEqual(asked, ['repair', 'repair', 'repair']);
+});
+
+test('a spent pool leaves the repair on its configured account, never unpinned onto the interactive default', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-repair-account-'));
+  try {
+    const dirs = Object.fromEntries(['default', 'secondary', 'tertiary'].map((id) => [id, path.join(root, id)]));
+    for (const dir of Object.values(dirs)) fs.mkdirSync(dir, { recursive: true });
+    const config = path.join(root, 'config.json');
+    fs.writeFileSync(config, JSON.stringify({
+      version: 1,
+      accounts: [
+        { id: 'claude-default', label: 'Default', agent: 'claude', configDir: dirs.default },
+        { id: 'claude-secondary', label: 'Secondary', agent: 'claude', configDir: dirs.secondary },
+        { id: 'claude-tertiary', label: 'Tertiary', agent: 'claude', configDir: dirs.tertiary },
+      ],
+      defaultAccounts: { claude: 'claude-default' },
+      automationAccounts: { repair: 'claude-tertiary' },
+    }));
+    const registry = path.join(root, 'registry');
+    fs.mkdirSync(path.join(registry, '.keep'), { recursive: true });
+    const spent = { identity: { agent: 'claude' }, snapshot: { fetchedAt: Date.now(), limits: [
+      { label: 'week', percent: 100, resetsAt: new Date(Date.now() + 3600e3).toISOString() }] } };
+    fs.writeFileSync(path.join(registry, '.keep', 'usage-cache.json'),
+      JSON.stringify({ version: 2, accounts: { 'claude-secondary': spent, 'claude-tertiary': spent } }));
+    const env = { KEEP_CONFIG: config, KEEP_DIR: registry };
+    const quiet = (options) => require('./account-budget.js').select({ ...options, recordHealth: false });
+    assert.equal(selfRepair.repairAccountId(env, { selectAccount: quiet }), 'claude-tertiary');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

@@ -512,7 +512,26 @@ function standupDue(meta, now = Date.now(), clock = standupClock(), tz) {
   return !attemptedAt || at - attemptedAt >= 15 * 60e3;
 }
 
+// What a failed standup run records. A spent automation pool is waited out, not a
+// fault: a healthy skip, logged once per reset time. `state` carries that reset across
+// ticks.
+function recordFailure(error, state = {}, deps = {}) {
+  const healthApi = deps.health || health;
+  const log = deps.log || ((line) => process.stderr.write(line));
+  if (error && error.code === 'ACCOUNT_DEFERRED') {
+    healthApi.record('standup', { ok: true, skipped: true, detail: error.message });
+    if (state.deferredLoggedFor !== error.retryAt) {
+      state.deferredLoggedFor = error.retryAt;
+      log(`keep standup: ${error.message}\n`);
+    }
+    return;
+  }
+  healthApi.record('standup', { ok: false, error });
+  log(`keep standup: ${error.message}\n`);
+}
+
 function startScheduler({ onChange } = {}) {
+  const failures = {};
   const configuredClock = standupClock();
   const clock = configuredClock.invalid ? DEFAULT_CLOCK : configuredClock;
   if (configuredClock.invalid) process.stderr.write('keep standup: invalid KEEP_STANDUP_AT; using 11:30\n');
@@ -530,8 +549,7 @@ function startScheduler({ onChange } = {}) {
       if (!result.skipped && onChange) onChange();
       health.record('standup', { ok: true, skipped: Boolean(result.skipped), detail: result.skipped ? 'nothing due' : 'generated' });
     } catch (error) {
-      health.record('standup', { ok: false, error });
-      process.stderr.write(`keep standup: ${error.message}\n`);
+      recordFailure(error, failures);
       try {
         keep.withLock(() => {
           const meta = loadMeta();
@@ -551,6 +569,7 @@ function startScheduler({ onChange } = {}) {
 }
 
 module.exports = {
+  recordFailure,
   pacificParts,
   zonedTime,
   previousStandupCutoff,

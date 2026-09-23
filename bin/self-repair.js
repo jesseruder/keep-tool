@@ -991,14 +991,13 @@ function launchModel(config, env = process.env, write = process.stderr.write.bin
 // configuring for it to work; undefined means "whatever the default is".
 //
 // The account comes from bin/account-budget.js (`automationAccounts.repair` while it has
-// room, else the pool's best). A spent pool answers undefined, as an unresolvable account
-// always has; repairs are never deferred. With no pool, or if the policy throws, the
-// fixed assignment as before.
+// room, else the pool's best). Repairs are never deferred: a spent pool, an empty one,
+// or a policy that throws all fall through to the fixed assignment as before —
+// never to undefined, which openSession would turn into the owner's interactive default.
 function repairAccountId(env = process.env, deps = {}) {
   try {
     const choice = (deps.selectAccount || require('./account-budget.js').select)({ purpose: 'repair', env });
-    if (choice.deferred) return undefined;
-    if (choice.account) return choice.account;
+    if (!choice.deferred && choice.account) return choice.account;
   } catch {}
   try { return require('./accounts.js').automationFor('claude', 'repair', env).id; }
   catch { return undefined; }

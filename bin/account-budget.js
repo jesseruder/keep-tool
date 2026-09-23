@@ -177,6 +177,8 @@ function rank(candidates, usage, options = {}) {
       return num(a.weekPercent) - num(b.weekPercent) || num(a.scopedPercent) - num(b.scopedPercent)
         || num(a.shortPercent) - num(b.shortPercent);
     }
+    // No current reading anywhere (the poller is down): the preference breaks the tie.
+    if (pa === 2) return (b.id === options.preferredId) - (a.id === options.preferredId);
     if (pa === 3) {
       const ra = Number.isFinite(a.resetsAt) ? a.resetsAt : Number.MAX_SAFE_INTEGER;
       const rb = Number.isFinite(b.resetsAt) ? b.resetsAt : Number.MAX_SAFE_INTEGER;
@@ -200,23 +202,42 @@ function describe(rows) {
 
 // ---------- health ----------
 
-// One row for the whole pool. Deferrals are remembered per purpose in-process. A red
-// row is rewritten only when its content changes; an ok row is written by the first
-// success in this process and by any success after a red write, so a red row left by
-// the CLI or by a previous daemon is cleared by the next success here.
+// One row for the whole pool, shared by every process that selects (the daemon,
+// `keep reviewer`, a `keep landed` child, `keep ideas`). Whether to write is decided
+// from the row as stored, never from this process's memory: a success writes ok
+// whenever the stored row is not ok, and a deferral writes red whenever the stored row
+// is not red with the same message. Deferrals are remembered per purpose in-process
+// only to compose that message; a success clears them, and expired ones drop out.
 const deferredByPurpose = new Map();
-let lastWritten = null;
 
-function writeHealth(options, healthApi) {
-  try { (healthApi || require('./health.js')).record(HEALTH_NAME, options); } catch {}
+function healthApiOf(healthApi) { return healthApi || require('./health.js'); }
+
+function storedRow(api) {
+  try { return typeof api.row === 'function' ? api.row(HEALTH_NAME) : null; } catch { return null; }
+}
+
+function storedOk(row) {
+  if (!row) return false;
+  const failures = Number(row.consecutiveFailures || 0);
+  if (!failures) return true;
+  // A streak left behind by an older red write is cleared by a later ok.
+  return Number(row.lastOkAt || 0) > Number(row.lastErrorAt || 0);
+}
+
+function clip(message, api) {
+  return typeof api.clipError === 'function' ? api.clipError(message) : String(message);
+}
+
+function writeHealth(api, options) {
+  try { api.record(HEALTH_NAME, options); } catch {}
 }
 
 function noteSuccess(healthApi) {
   // Room for one purpose means the pool is not exhausted: every remembered deferral goes.
   deferredByPurpose.clear();
-  if (lastWritten === 'ok') return;
-  lastWritten = 'ok';
-  writeHealth({ ok: true, detail: 'automation pool has room' }, healthApi);
+  const api = healthApiOf(healthApi);
+  if (storedOk(storedRow(api))) return;
+  writeHealth(api, { ok: true, detail: 'automation pool has room' });
 }
 
 function noteDeferral(purpose, retryAt, now, healthApi) {
@@ -224,14 +245,14 @@ function noteDeferral(purpose, retryAt, now, healthApi) {
   for (const [name, at] of [...deferredByPurpose]) if (!(at > now)) deferredByPurpose.delete(name);
   const entries = [...deferredByPurpose.entries()].sort((a, b) => a[1] - b[1]);
   if (!entries.length) return;
-  const signature = `red:${JSON.stringify(entries)}`;
-  if (signature === lastWritten) return;
-  lastWritten = signature;
   const message = `automation pool exhausted until ${when(entries[0][1])} (${entries.map(([name, at]) => `${name} ${when(at)}`).join(', ')})`;
-  writeHealth({ ok: false, error: message, detail: message }, healthApi);
+  const api = healthApiOf(healthApi);
+  const row = storedRow(api);
+  if (row && !storedOk(row) && row.lastError === clip(message, api)) return;
+  writeHealth(api, { ok: false, error: message, detail: message });
 }
 
-function resetHealthMemory() { deferredByPurpose.clear(); lastWritten = null; warnedPool = false; }
+function resetHealthMemory() { deferredByPurpose.clear(); warnedPool = false; warnedPreferred.clear(); }
 
 // ---------- selection ----------
 
@@ -245,6 +266,24 @@ class AccountDeferredError extends Error {
 }
 
 let warnedPool = false;
+const warnedPreferred = new Set();
+
+function warn(stderr, line) {
+  try { (stderr || process.stderr).write(line); } catch {}
+}
+
+// The pool, or [] when the configured list cannot be used: said once per process, for
+// select and for the handoff policy alike, never once per call or per tick.
+function poolOrEmpty(env = process.env, accountApi = require('./accounts.js'), stderr) {
+  try { return pool(env, accountApi); }
+  catch (error) {
+    if (!warnedPool) {
+      warnedPool = true;
+      warn(stderr, `keep accounts: automationPool ignored: ${error && error.message || error}\n`);
+    }
+    return [];
+  }
+}
 
 // { account, record, reason, ranked } or { account: null, deferred: true, retryAt, reason, ranked }.
 // `account` is an id; `record` is the account entry when one is known.
@@ -267,15 +306,13 @@ function select(options = {}) {
       preferredId = map && typeof map[purpose] === 'string' ? map[purpose] : undefined;
     } catch { preferredId = undefined; }
   }
-  let all;
-  try { all = pool(env, accountApi); }
-  catch (error) {
-    // A broken list must not stop every job: said once, then the fixed assignment.
-    if (!warnedPool) {
-      warnedPool = true;
-      try { (options.stderr || process.stderr).write(`keep accounts: automationPool ignored: ${error && error.message || error}\n`); } catch {}
-    }
-    all = [];
+  // A broken list must not stop every job: said once, then the fixed assignment.
+  const all = poolOrEmpty(env, accountApi, options.stderr);
+  if (all.length && preferredId && !all.some((entry) => entry.id === preferredId) && !warnedPreferred.has(preferredId)) {
+    // An account outside the pool (say an area pinned to the interactive default) is
+    // not spent by automation; said once rather than dropped silently.
+    warnedPreferred.add(preferredId);
+    warn(options.stderr, `keep accounts: ${purpose || 'automation'} prefers ${preferredId}, which is not in the automation pool; ignored\n`);
   }
   if (!all.length) {
     if (options.fallback === false) return { account: null, record: null, reason: 'no automation pool', ranked: [] };
@@ -322,5 +359,5 @@ function selectOrThrow(options = {}) {
 
 module.exports = {
   DEFER_FALLBACK_MS, HEALTH_NAME, AccountDeferredError,
-  pool, rank, select, selectOrThrow, describe, readUsageCache, when, resetHealthMemory, minHeadroomFor,
+  pool, poolOrEmpty, rank, select, selectOrThrow, describe, readUsageCache, when, resetHealthMemory, minHeadroomFor,
 };

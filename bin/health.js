@@ -121,6 +121,13 @@ function unrequestedStarts(daemon, since) {
     .map(Number).filter((value) => Number.isFinite(value) && value >= since && !requested.has(value));
 }
 
+// One scheduler's stored row, as written: a single small read, for a writer that
+// decides whether to record from what is on disk rather than from its own memory.
+function row(name) {
+  const value = readStore()[name];
+  return value && typeof value === 'object' ? value : null;
+}
+
 function persist(value) {
   try {
     writeStore(value);
@@ -459,6 +466,8 @@ module.exports = {
   CADENCES,
   RETIRED,
   record,
+  row,
+  clipError,
   codeCommit,
   recordRestartRequest,
   unrequestedStarts,

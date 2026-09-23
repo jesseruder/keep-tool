@@ -155,15 +155,21 @@ assignment. Every automation launch — the reviewer, incident responders
   the earliest reset among the spent accounts, or 30 minutes when none is known. The
   `account-budget` row in `keep health` reads "automation pool exhausted until
   ‹time›" while anything is deferred (reset times already passed are dropped), and any
-  later successful selection, for any purpose, clears it.
+  later successful selection, for any purpose and in any process (the daemon, `keep
+  reviewer`, a `keep landed` child), clears it: each writer decides from the stored
+  row, not its own memory. The rate-limit handoff does not write this row; a held
+  session shows as `policy held N session(s)` in the queue's log instead.
 - With an empty pool — a single Claude account, or `"automationPool": []` — every
   purpose runs on its fixed `automationAccounts` entry exactly as before, and the
   rate-limit handoff below only acts on `rateLimitHandoff` keys. An `automationPool`
   that cannot be used is reported once per process on stderr (`keep accounts:
   automationPool ignored: …`) and treated the same way.
 - `repair` (daemon self-repair) also takes its account from the pool. A repair is never
-  deferred: when the pool is spent it launches without a pinned account, as it did when
-  its account could not be resolved.
+  deferred: when the pool is spent it runs on its configured account
+  (`automationAccounts.repair`, else `automationAccounts.claude`), as before the pool.
+- A preferred account outside the pool (say an area pinned to the interactive default)
+  is ignored, and said once per process on stderr. With no current reading anywhere,
+  the preferred account is still tried first.
 
 The fleet reviewer's budget governor reads the windows of the account the live
 reviewer pane was actually launched on (its pane `meta.accountId`), not the config map.

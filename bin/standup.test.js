@@ -266,3 +266,21 @@ test('real CLI standup --dry prints the fenced prompt without calling a model', 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('a standup the account policy deferred is a healthy skip, logged once per reset', () => {
+  const { recordFailure } = require('./standup.js');
+  const records = [];
+  const lines = [];
+  const deps = { health: { record: (name, options) => records.push({ name, options }) }, log: (line) => lines.push(line) };
+  const state = {};
+  const deferred = (retryAt) => Object.assign(new Error('automation pool exhausted for claude-sonnet-5'), { code: 'ACCOUNT_DEFERRED', retryAt });
+  recordFailure(deferred(1000), state, deps);
+  recordFailure(deferred(1000), state, deps);
+  assert.deepEqual(records.map((row) => [row.name, row.options.ok, row.options.skipped]),
+    [['standup', true, true], ['standup', true, true]]);
+  assert.equal(lines.length, 1);
+  recordFailure(deferred(2000), state, deps);
+  assert.equal(lines.length, 2, 'a new reset is said again');
+  recordFailure(new Error('model exited 1'), state, deps);
+  assert.equal(records.at(-1).options.ok, false, 'anything else is still a failure');
+});

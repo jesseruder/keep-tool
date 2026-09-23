@@ -239,8 +239,12 @@ async function policyEnqueue(root, loadSessions, now, deps, log) {
   try { map = deps.policy ? deps.policy(env) : policyTargets(env); }
   catch (error) { log(`policy ignored: ${error.message}`); return { enqueued: 0, exhausted: 0 }; }
   let poolIds = [];
-  try { poolIds = (deps.pool || accountBudget.pool)(env).map((account) => account.id); }
-  catch (error) { log(`automation pool ignored: ${error.message}`); poolIds = []; }
+  // A list that cannot be used is said once per process (shared with select's guard),
+  // not on every thirty-second tick, and leaves only the rateLimitHandoff keys.
+  try {
+    poolIds = (deps.pool ? deps.pool(env) : accountBudget.poolOrEmpty(env, undefined, deps.stderr))
+      .map((account) => account.id);
+  } catch (error) { log(`automation pool ignored: ${error.message}`); poolIds = []; }
   if (!Object.keys(map).length && !poolIds.length) return { enqueued: 0, exhausted: 0 };
   const sessions = await loadSessions();
   let usage;
@@ -271,7 +275,10 @@ async function policyEnqueue(root, loadSessions, now, deps, log) {
     if (!targetAccountId && poolIds.length) {
       let choice = null;
       try {
-        choice = (deps.selectAccount || accountBudget.select)({ purpose: 'handoff', model, env, usage, now,
+        // No health row from here: a held session is re-asked every tick and would
+        // flip the account-budget row against other purposes' successes. The queue
+        // logs "policy held N session(s)" and has its own handoff-queue row.
+        choice = (deps.selectAccount || accountBudget.select)({ purpose: 'handoff', model, env, usage, now, recordHealth: false,
           exclude: [sourceAccountId], fallback: false });
       } catch (error) { log(`automation pool ignored: ${error.message}`); }
       if (choice && !choice.deferred && choice.account && choice.account !== sourceAccountId) targetAccountId = choice.account;
