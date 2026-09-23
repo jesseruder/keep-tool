@@ -112,7 +112,8 @@ test('failed Close restores session and pin without stealing a newer selection',
   await expect(page.locator('#qlist [data-key="running:a"]')).toHaveCount(0, { timeout: 100 });
   await page.locator('#qlist [data-key="running:c"]').click();
   await selected(page, 'c');
-  await expect(page.locator('#toast')).toContainText('Not closed: Fixture close failure');
+  // A failed write is the sticky failure banner now, not a toast (8de9823).
+  await expect(page.locator('#writeFailure')).toContainText('Session was not closed; it is back in the list. Fixture close failure');
   await expect(page.locator('#qlist [data-key="running:a"]')).toBeVisible();
   await expect(page.locator('#qlist [data-key="pinned:a"]')).toHaveCount(1);
   await selected(page, 'c');
@@ -179,7 +180,8 @@ test('account handoff sends the explicit destination and confirms refreshed iden
   await expect(page.locator('#stage .account-label')).toHaveText('Claude Two');
   const requests = fixture.events.filter(event => event.event === 'request' && event.path === '/api/handoff-session');
   expect(requests).toHaveLength(1);
-  expect(requests[0].body).toEqual({ sessionId: 'a', pane: 'pa', accountId: 'claude-two' });
+  // ownerForce: Owner clicked; queueOnTransient: a busy source is retried by the queue.
+  expect(requests[0].body).toEqual({ sessionId: 'a', pane: 'pa', accountId: 'claude-two', queueOnTransient: true, ownerForce: true });
 });
 
 test('account limit groups remain complete and reveal their account details on desktop', async ({ page }) => {

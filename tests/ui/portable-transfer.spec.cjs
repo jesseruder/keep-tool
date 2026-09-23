@@ -36,7 +36,7 @@ test('native Codex transfer keeps the session id and the portable action remains
   await expect(page.locator('#stage .account-label')).toHaveText('Codex Two');
   const requests = fixture.events.filter(event => event.event === 'request' && event.path === '/api/handoff-session');
   expect(requests).toHaveLength(1);
-  expect(requests[0].body).toEqual({ sessionId: 'b', pane: 'pb', accountId: 'codex-two' });
+  expect(requests[0].body).toEqual({ sessionId: 'b', pane: 'pb', accountId: 'codex-two', queueOnTransient: true, ownerForce: true });
 });
 
 test('prepared Codex transfer starts a fresh successor, focuses it, and preserves the source', async ({ page }) => {

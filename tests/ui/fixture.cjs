@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { WebSocketServer } = require('ws');
-const { dashboardDetail } = require('../../bin/dashboard-state');
+const { consoleState, dashboardDetail } = require('../../bin/dashboard-state');
 
 async function createFixture() {
   const root = path.resolve(__dirname, '../..');
@@ -138,7 +138,10 @@ async function createFixture() {
           json({ ok: true, transfer, preview: portablePreviews.get(transfer.id) || '',
             ...(portableInputs.has(transfer.id) ? { inputs: portableInputs.get(transfer.id) } : {}) }); return;
         }
-        if (url.pathname === '/api/state') { json(state); return; }
+        // The console asks for console=1, and the daemon answers it with its console
+        // projection: an exited row without its full text, which the console then
+        // loads on demand. Serving the raw state skipped that path altogether.
+        if (url.pathname === '/api/state') { json(url.searchParams.get('console') === '1' ? consoleState(state) : state); return; }
         if (url.pathname === '/api/panes/spawn' && req.method === 'POST') {
           const id = `shell-${++launchSequence}`;
           const pane = { id, pid: 700 + launchSequence, alive: true, cwd: input.cwd,
