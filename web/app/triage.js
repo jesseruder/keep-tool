@@ -556,7 +556,7 @@ export function queueRow(ctx, item) {
   const project = item.project || session?.project || '';
   const task = ctx.taskFor(item);
   // "#12" ahead of the title, with the hand-set emoji between it and the title
-  // (the mark's color tints the whole row instead, via markRowClass). A
+  // (the mark's color becomes the title's text color, via markRowClass). A
   // row with no session of its own (a plain shell) has no number and shows none.
   // Both live inside .t because .qitem is a fixed three-column grid: another
   // top-level span would shift every cell after it.

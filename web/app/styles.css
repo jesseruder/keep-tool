@@ -5,19 +5,19 @@
      dark-by-default, light-on-demand shape. */
   --mark-red: #e06c5c; --mark-orange: #e0904c; --mark-yellow: #e6b04a; --mark-green: #7ac48a;
   --mark-teal: #5cc0b4; --mark-blue: #73aad2; --mark-purple: #a58be0; --mark-pink: #dd83b4;
-  --mark-fill: 55%; --mark-fill-hover: 51%; --mark-fill-sel: 47%;
+  --mark-text: 100%;
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
     --mark-red: #c9403a; --mark-orange: #c4701a; --mark-yellow: #c48a12; --mark-green: #4f8f5a;
     --mark-teal: #2f8a80; --mark-blue: #3c7ea6; --mark-purple: #6c71c4; --mark-pink: #b8447f;
-    --mark-fill: 70%; --mark-fill-hover: 65%; --mark-fill-sel: 60%;
+    --mark-text: 62%;
   }
 }
 :root[data-theme="light"] {
   --mark-red: #c9403a; --mark-orange: #c4701a; --mark-yellow: #c48a12; --mark-green: #4f8f5a;
   --mark-teal: #2f8a80; --mark-blue: #3c7ea6; --mark-purple: #6c71c4; --mark-pink: #b8447f;
-  --mark-fill: 70%; --mark-fill-hover: 65%; --mark-fill-sel: 60%;
+  --mark-text: 62%;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 var(--sans); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
@@ -288,24 +288,14 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .mark-dot.mark-blue, .mark-swatch.mark-blue { background: var(--mark-blue); }
 .mark-dot.mark-purple, .mark-swatch.mark-purple { background: var(--mark-purple); }
 .mark-dot.mark-pink, .mark-swatch.mark-pink { background: var(--mark-pink); }
-/* A colored session's queue row is filled with a darkened shade of its mark
-   instead of showing a dot, and every line of it switches to white. The fill
-   shares (--mark-fill, per theme) keep white at 5.5:1 or better on all eight
-   colors, and hover and selected only darken. The state and kind labels drop
-   their own colors too: green or amber text on a colored row is unreadable. */
+/* A colored session's queue row shows its mark as the title's text color instead
+   of a dot. --mark-text (per theme) keeps it at about 4.5:1 or better on the queue's
+   normal, hover and selected backgrounds for all eight colors. */
 .qitem.mark-red { --row-mark: var(--mark-red); } .qitem.mark-orange { --row-mark: var(--mark-orange); }
 .qitem.mark-yellow { --row-mark: var(--mark-yellow); } .qitem.mark-green { --row-mark: var(--mark-green); }
 .qitem.mark-teal { --row-mark: var(--mark-teal); } .qitem.mark-blue { --row-mark: var(--mark-blue); }
 .qitem.mark-purple { --row-mark: var(--mark-purple); } .qitem.mark-pink { --row-mark: var(--mark-pink); }
-.qitem.marked { --mark-ink: #fff; background: color-mix(in srgb, var(--row-mark) var(--mark-fill), black); }
-.qitem.marked:hover { background: color-mix(in srgb, var(--row-mark) var(--mark-fill-hover), black); }
-.qitem.marked.sel { background: color-mix(in srgb, var(--row-mark) var(--mark-fill-sel), black); border-left-color: var(--mark-ink); }
-.qitem.marked :is(.t, .t.untitled, .kind, .provider-icon, .project-icon) { color: var(--mark-ink); }
-.qitem.marked :is(.num-id, .w, .w.long, .p, .pj, .pj .wt, .card, .s, .node-badge) { color: color-mix(in srgb, var(--mark-ink) 85%, transparent); }
-.qitem.marked .node-badge { border-color: color-mix(in srgb, var(--mark-ink) 40%, transparent); }
-/* The accent and ok stripes are the same yellow and green as two of the marks, so
-   a stripe on a colored row gets a white outline to stay visible. */
-.qitem.marked:is(.k-question, .k-permission, .k-plan, .k-rateLimit, .k-complete, .k-running) .stripe { box-shadow: 0 0 0 1px var(--mark-ink); }
+.qitem.marked :is(.t, .t.untitled) { color: color-mix(in srgb, var(--row-mark) var(--mark-text), black); }
 /* The Actions-menu block that sets one: one column, except that the emoji field
    and the picker's toggle share a row. */
 .mark-controls { display: grid; grid-template-columns: auto 1fr; gap: 4px 0; align-items: center; }
