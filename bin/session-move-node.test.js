@@ -176,3 +176,43 @@ test('keep move on an install with one node refuses and changes nothing', async 
     assert.equal(fs.existsSync(path.join(root, '.keep', 'session-moves')), false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+// serve.js's own wiring of the move with the machines faked: every preflight answer
+// is injected, and the steps after it are serve.js's real ones unless a test says
+// otherwise.
+function wiredMove(options = {}) {
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-move-wired-'));
+  const steps = [];
+  const moveDeps = {
+    nodeNames: () => ['main', 'aws1'],
+    inspect: async () => ({ agent: 'claude', from: 'main', account: { id: 'claude-a', agent: 'claude', configDir: '/nowhere' },
+      session: { id: SID, kind: 'claude', endedTurn: true, project: '/work/project' }, pane: null, cwd: '/work/project', model: '', bypass: false }),
+    requireNode: async () => {},
+    cwdExists: async () => true,
+    targetReady: async () => {},
+    pendingDelivery: async () => false,
+    transfer: async () => { steps.push('transfer'); throw new Error('nothing is carried in this test'); },
+    ...(options.moveDeps || {}),
+  };
+  return {
+    root, steps,
+    deps: { root, daemonNode: 'main', listHostPanes: async () => [], ...(options.deps || {}), moveDeps },
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+test('a process table the daemon node cannot read refuses the move before anything is carried', async () => {
+  const w = wiredMove({ deps: { agentProcessRows: async () => { throw new Error('ps timed out'); } } });
+  try {
+    await assert.rejects(serve.moveSession({ sessionId: SID, node: 'aws1' }, w.deps),
+      (error) => error.extra.status === 'recovery-needed' && error.extra.phase === 'stopping' && error.extra.holder === 'main'
+        && /process table on main could not be read/.test(error.message));
+    assert.deepEqual(w.steps, [], 'nothing was carried');
+    // An empty answer is no answer either.
+    const empty = wiredMove({ deps: { psTable: '' } });
+    try {
+      await assert.rejects(serve.moveSession({ sessionId: SID, node: 'aws1' }, empty.deps), /process table on main could not be read/);
+      assert.deepEqual(empty.steps, []);
+    } finally { empty.cleanup(); }
+  } finally { w.cleanup(); }
+});

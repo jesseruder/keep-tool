@@ -12464,18 +12464,33 @@ function moveEndpoint(node, account, deps = {}) {
     : nodeArtifacts(node, moveNodeAccount(node, account, deps), deps);
 }
 
-// No agent process for this conversation on `node`, from that node's own table; a
-// table that cannot be read proves nothing and refuses.
-async function requireNoAgentOn(node, sessionId, deps = {}) {
+// Whether an agent process for this conversation runs on `node`, from that node's own
+// table read now (not the listing's short cache, which may predate the stop being
+// proven). A table that cannot be read, or a Claude row whose session could not be
+// named, proves nothing either way and refuses, on the daemon node as on any other:
+// this is the only stop proof when the stop had no live Keep pane to close.
+async function agentLiveOn(node, sessionId, deps = {}) {
   let live;
-  if (node === daemonNodeName(deps)) live = await (deps.liveSessionPids || liveSessionPids)(deps);
-  else {
+  if (node === daemonNodeName(deps)) {
+    live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, processRowsCache: { value: null, at: 0, pending: null } });
+  } else {
+    nodeProcessRowsCaches.delete(node);
     let rows = null;
     try { rows = await (deps.agentProcessRows || agentProcessRows)(deps, { node }); } catch {}
     live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => rows }, { node });
-    if (unverifiedProcesses(live, 'claude')) throw new InjectionError(409, `cannot verify processes on ${node}`);
   }
-  if (live.has(sessionId)) throw new InjectionError(409, `an agent process still owns ${sessionRef(sessionId)} on ${node}`);
+  if (unverifiedProcesses(live, 'claude')) {
+    throw new InjectionError(409, `the process table on ${node} could not be read, so whether ${sessionRef(sessionId)} still runs there is unproven`,
+      { reason: 'processes-unverified' });
+  }
+  return live.has(sessionId);
+}
+
+// No agent process for this conversation on `node`; anything short of that proof refuses.
+async function requireNoAgentOn(node, sessionId, deps = {}) {
+  if (await agentLiveOn(node, sessionId, deps)) {
+    throw new InjectionError(409, `an agent process still owns ${sessionRef(sessionId)} on ${node}`, { reason: 'source-running' });
+  }
 }
 
 async function inspectSessionMove(sessionId, deps = {}) {
@@ -12525,6 +12540,7 @@ function sessionMoveDeps(deps = {}) {
   const root = deps.root || keep.ROOT;
   const env = deps.env || process.env;
   const daemon = daemonNodeName(deps);
+  const listPanes = () => (deps.listHostPanes || listHostPanes)(deps, true);
   const accountOf = (record) => {
     const account = accounts.get(record.accountId, env);
     if (!account || account.agent !== 'claude') throw new InjectionError(409, `account ${record.accountId} is not a Claude account here`);
@@ -12549,7 +12565,7 @@ function sessionMoveDeps(deps = {}) {
       return null;
     },
     stop: async (record) => {
-      const panes = await listHostPanes(deps, true);
+      const panes = await listPanes();
       if (!Array.isArray(panes)) throw new InjectionError(409, 'the terminal hosts did not list their panes');
       const pane = record.pane && panes.find((entry) => entry.id === record.pane.id);
       if (pane && pane.alive && pane.pid === record.pane.pid && pane.meta && pane.meta.sessionId === record.sessionId) {
