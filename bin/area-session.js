@@ -639,6 +639,18 @@ function areasForAgent(cfg, agentName) {
     .map(([name]) => name);
 }
 
+// Which account a launch runs on. An unreadable pool configuration is reported on
+// stderr by nothing else here, so it keeps the configured account rather than
+// stopping the responder.
+function chooseAccount(preferredId, root, deps = {}) {
+  const select = deps.selectAccount || require('./account-budget').select;
+  try {
+    return select({ purpose: 'incident-responder', model: MODEL, preferredId, root });
+  } catch (error) {
+    return { account: preferredId, reason: `account policy unavailable: ${oneLine(error && error.message || error, 200)}` };
+  }
+}
+
 // One area, one tick. Launch, then deliver, then consider a restart — in that
 // order, because a session that was just launched has the bootstrap to read and a
 // session about to be closed must not be handed events first.
@@ -679,7 +691,10 @@ async function runArea(name, entry, options = {}, deps = {}) {
     return report;
   }
   report.cwd = cwd;
+  // The area's configured account is a preference: bin/account-budget.js launches on
+  // it while it has room, and on the automation pool's best account when it does not.
   const account = String(entry.account || '') || incidents.DEFAULT_ACCOUNT;
+  let choice = null;
   // `lastDeliveredSeq` is this module's cursor into the agent's feed: the seq of
   // the newest event a send has been CONFIRMED to have delivered. `lastDeliveredAt`
   // beside it is when that happened, which is one of the clocks idleness is
@@ -727,7 +742,7 @@ async function runArea(name, entry, options = {}, deps = {}) {
       // for launches that never come up, not for a session that has been running
       // for a week.
       const patch = {};
-      if (launch.attempts || launch.deadSince) patch.launch = { attempts: 0, lastAt: Number(launch.lastAt || 0) || 0, deadSince: 0 };
+      if (launch.attempts || launch.deadSince || launch.deferredUntil) patch.launch = { attempts: 0, lastAt: Number(launch.lastAt || 0) || 0, deadSince: 0 };
       if (seen.id && seen.id !== String(record.session.id || '')) {
         patch.session = { id: seen.id, pane: seen.pane || '', startedAt: Number(record.session.startedAt || 0) || now };
       } else if (seen.pane && seen.pane !== String(record.session.pane || '')) {
@@ -750,8 +765,23 @@ async function runArea(name, entry, options = {}, deps = {}) {
         report.launch = { state: 'skipped', reason: `${MAX_LAUNCH_ATTEMPTS} launches produced no live session; nothing more is tried until one does` };
       } else if (Number(launch.lastAt || 0) && now - Number(launch.lastAt) < LAUNCH_RETRY_MS) {
         report.launch = { state: 'waiting', reason: `last launch was ${Math.round((now - Number(launch.lastAt)) / MINUTE_MS)}m ago; retrying after ${Math.round(LAUNCH_RETRY_MS / MINUTE_MS)}m` };
+      } else if (Number(launch.deferredUntil || 0) > now) {
+        // The automation pool was spent when this was last tried. Nothing is spent on
+        // asking again before the earliest reset it named.
+        report.launch = { state: 'deferred', retryAt: Number(launch.deferredUntil),
+          reason: String(launch.deferredReason || 'the automation pool is exhausted') };
+      } else if ((choice = chooseAccount(account, root, deps)).deferred) {
+        // Not a failed launch: nothing was started, so `attempts` and `lastAt` stay as
+        // they are and no backoff builds up. The next tick at or after retryAt asks again.
+        if (!dry) {
+          record = writeRecord(agentName, {
+            launch: { ...launch, deferredUntil: choice.retryAt, deferredReason: oneLine(choice.reason, 400) },
+          }, { root, now });
+          changed = true;
+        }
+        report.launch = { state: 'deferred', retryAt: choice.retryAt, reason: choice.reason };
       } else if (dry) {
-        report.launch = { state: 'would-launch', cwd, account, model: MODEL };
+        report.launch = { state: 'would-launch', cwd, account: choice.account, model: MODEL };
       } else {
         lease = claimLaunchLease(agentName, root, now, deps);
         if (lease.held) {
@@ -788,7 +818,7 @@ async function runArea(name, entry, options = {}, deps = {}) {
           return report;
         }
         report.launch = await launchSession({
-          agentName, area: name, cwd, repo, account, record, root, now,
+          agentName, area: name, cwd, repo, account: choice.account, record, root, now,
           requestId: lease.requestId || launchRequestId(agentName, record.generation),
           lease,
         }, deps, say);
@@ -807,8 +837,9 @@ async function runArea(name, entry, options = {}, deps = {}) {
             session: { id: report.launch.id || '', pane: report.launch.pane || '', startedAt: now },
             launch: { attempts: Number(launch.attempts || 0) + 1, lastAt: now, deadSince: 0 },
             // What this launch actually ran on, so a record made under an older
-            // default does not keep reporting it.
-            model: MODEL, account,
+            // default, or a preference the account policy passed over, does not keep
+            // reporting it.
+            model: MODEL, account: choice.account,
             lifecycle: 'working',
             restarts: Number(record.restarts || 0) + (String(record.session.id || '') ? 1 : 0),
           }, { root, now });

@@ -391,6 +391,50 @@ test('three launches that never come up stop, and a live session clears the coun
   } finally { cleanup(fixture.root); }
 });
 
+test('a spent automation pool defers the launch without spending an attempt, and the relaunch lands on the policy\'s account', async () => {
+  const fixture = makeRoot();
+  try {
+    const state = { panes: [], sessions: [] };
+    const deps = makeDeps(fixture, state);
+    const retryAt = NOW + 5 * HOUR;
+    const asked = [];
+    let pool = 'spent';
+    deps.selectAccount = (options) => {
+      asked.push(options);
+      return pool === 'spent'
+        ? { account: null, deferred: true, retryAt, reason: 'automation pool exhausted for opus; retrying at later' }
+        : { account: 'claude-tertiary', reason: 'most headroom in the automation pool' };
+    };
+
+    const first = sandboxes(await tick(fixture, deps));
+    assert.deepEqual([first.launch.state, first.launch.retryAt], ['deferred', retryAt]);
+    assert.match(first.launch.reason, /automation pool exhausted/);
+    assert.equal(deps.calls.opens.length, 0, 'nothing was launched');
+    assert.deepEqual(asked.map((options) => [options.purpose, options.model, options.preferredId]),
+      [['incident-responder', 'opus', 'claude-secondary']]);
+    assert.equal(record(fixture).launch.attempts, 0, 'a deferral is not a failed launch');
+    assert.equal(record(fixture).launch.lastAt, 0);
+
+    // Before the reset nothing is asked again.
+    const waiting = sandboxes(await tick(fixture, deps, { now: NOW + HOUR }));
+    assert.deepEqual([waiting.launch.state, waiting.launch.retryAt], ['deferred', retryAt]);
+    assert.equal(asked.length, 1);
+    assert.equal(record(fixture).launch.attempts, 0);
+
+    // At the reset the policy is asked again and the launch goes to its account.
+    pool = 'room';
+    const launched = sandboxes(await tick(fixture, deps, { now: retryAt }));
+    assert.equal(launched.launch.state, 'launched');
+    assert.equal(asked.length, 2);
+    assert.equal(deps.calls.opens.length, 1);
+    assert.equal(deps.calls.opens[0].body.accountId, 'claude-tertiary');
+    const after = record(fixture);
+    assert.equal(after.account, 'claude-tertiary', 'the record says what the launch actually ran on');
+    assert.equal(after.launch.attempts, 1);
+    assert.equal(after.launch.deferredUntil, undefined);
+  } finally { cleanup(fixture.root); }
+});
+
 test('a live pane stamped with the agent name is adopted rather than doubled', async () => {
   const fixture = makeRoot();
   try {
