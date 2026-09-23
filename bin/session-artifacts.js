@@ -428,13 +428,18 @@ async function publish(root, params) {
     if (current && owned[entry.relPath] !== current.sha256 && mine[entry.relPath] !== current.sha256) {
       throw coded(`${entry.relPath} on this node differs from what the move carries, and no move put it there`, 'artifacts-conflict');
     }
+    if (current) {
+      // Where the replaced file will be kept, decided now: a link on the way refuses
+      // (resolveUnder), and so does a backup already there.
+      const backup = resolveUnder(dir, ['backup', ...entry.parts]);
+      if (lstatOrNull(backup)) throw coded(`a backup of ${entry.relPath} is already in move transaction ${tx}`, 'artifacts-conflict');
+    }
     plan.push({ ...entry, target, stagedFile, action: current ? 'replaced' : 'created' });
   }
   for (const item of plan) {
     if (item.action === 'unchanged') continue;
     if (item.action === 'replaced') {
       const backup = resolveUnder(dir, ['backup', ...item.parts], { create: true });
-      if (lstatOrNull(backup)) throw coded(`a backup of ${item.relPath} is already in move transaction ${tx}`, 'artifacts-conflict');
       fs.renameSync(item.target, backup);
     }
     const target = resolveUnder(root, item.parts, { create: true });

@@ -2939,6 +2939,52 @@ test('a publish never overwrites a live transcript a move did not put there, and
   } finally { source.cleanup(); target.cleanup(); }
 });
 
+test('a publish that cannot keep a backup of what it replaces refuses before it renames anything', async () => {
+  const source = artifactNode('src3');
+  const target = artifactNode('dst3');
+  try {
+    await withHost({ env: source.env }, async ({ client: from }) => {
+      await withHost({ env: target.env }, async ({ client: to }) => {
+        // aws1 holds an older copy the session left there: two files a move may replace.
+        const transcript = target.put(`projects/-work-project/${source.sid}.jsonl`, '{"type":"user","old":true}\n');
+        const history = target.put(`file-history/${source.sid}/f9764a6b1dfc35ba@v2`, 'old body\n');
+        await to.request('artifacts', { op: 'release', sessionId: source.sid, account: target.account });
+        const { entries } = await carry(from, to, source, target);
+        const publish = () => to.request('artifacts', { op: 'publish', sessionId: source.sid, account: target.account, tx: txId, entries });
+        const untouched = () => {
+          assert.equal(fs.readFileSync(transcript, 'utf8'), '{"type":"user","old":true}\n', 'the transcript was not replaced');
+          assert.equal(fs.readFileSync(history, 'utf8'), 'old body\n');
+        };
+        const backup = path.join(target.configDir, '.keep-move', txId, 'backup');
+
+        // A backup already where the file-history one would go (the last entry replaced).
+        fs.mkdirSync(path.join(backup, 'file-history', source.sid), { recursive: true });
+        fs.writeFileSync(path.join(backup, 'file-history', source.sid, 'f9764a6b1dfc35ba@v2'), 'someone else\'s');
+        await assert.rejects(publish(), (error) => error.code === 'artifacts-conflict' && /a backup of file-history/.test(error.message));
+        untouched();
+        assert.equal(fs.existsSync(path.join(backup, 'projects')), false, 'the transcript was not backed up either');
+
+        // A link on the way to the backups.
+        fs.rmSync(backup, { recursive: true, force: true });
+        const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-artifacts-backup-'));
+        try {
+          fs.symlinkSync(elsewhere, backup);
+          await assert.rejects(publish(), (error) => error.code === 'artifacts-refused' && /symbolic link/.test(error.message));
+          untouched();
+          assert.deepEqual(fs.readdirSync(elsewhere), [], 'nothing was written through the link');
+        } finally { fs.rmSync(elsewhere, { recursive: true, force: true }); }
+
+        // Cleared, the same publish replaces both and keeps both.
+        fs.unlinkSync(backup);
+        const published = await publish();
+        assert.deepEqual(published.published.filter((entry) => entry.action === 'replaced').map((entry) => entry.relPath).sort(),
+          [`file-history/${source.sid}/f9764a6b1dfc35ba@v2`, `projects/-work-project/${source.sid}.jsonl`]);
+        assert.equal(fs.readFileSync(path.join(backup, 'file-history', source.sid, 'f9764a6b1dfc35ba@v2'), 'utf8'), 'old body\n');
+      });
+    });
+  } finally { source.cleanup(); target.cleanup(); }
+});
+
 test('the artifacts verb reads and writes only a session\'s artifacts under the node\'s own account, never through a link', async () => {
   const node = artifactNode('refuse');
   const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-artifacts-elsewhere-'));
