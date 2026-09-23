@@ -43,8 +43,8 @@ function refusedAtMove(error) {
 // state still carries is shown whether or not its pane survived the stop.
 export function moveControlsHTML(ctx, session, { live = false, pendingHandoff = false } = {}) {
   if (!session?.id || (session.kind || session.agent) !== 'claude' || pendingHandoff) return '';
-  const nodes = nodesOf(ctx);
-  if (nodes.length < 2) return '';
+  // A move the state carries is shown whatever the node list now says: one that needs
+  // recovery keeps Retry and Abandon after the configuration drops to one node.
   const move = session.move;
   if (move?.status === 'recovery-needed') {
     const message = move.message || `the move to ${move.to} stopped while ${move.phase || 'moving'}`;
@@ -56,6 +56,8 @@ export function moveControlsHTML(ctx, session, { live = false, pendingHandoff = 
   if (move?.status === 'in-flight') {
     return `<span class="handoff-status" role="status">Moving to ${ctx.esc(move.to || 'another machine')}…${move.phase ? ` (${ctx.esc(move.phase)})` : ''}</span>`;
   }
+  const nodes = nodesOf(ctx);
+  if (nodes.length < 2) return '';
   const local = localMoves.get(session.id);
   if (local) return `<span class="handoff-status" role="status">Moving to ${ctx.esc(local)}…</span>`;
   if (!live) return '';

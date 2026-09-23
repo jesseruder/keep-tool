@@ -97,6 +97,12 @@ test('a move that needs recovery shows its message with Retry and Abandon', () =
   assert.match(html, /data-move-abandon="mv-000000000000000000000002"[^>]*>Abandon</);
   assert.doesNotMatch(html, /data-move-node/);
   assert.match(context.moveControlsHTML(fixture(), session({ move: { ...move, interrupted: true } }), {}), /Move to aws1 interrupted/);
+  // The configuration dropped to one node (or an older daemon lists none): a move that
+  // still needs recovery keeps its buttons, and one in flight keeps its status.
+  for (const nodes of [[fleet[0]], undefined]) {
+    assert.match(context.moveControlsHTML(fixture({ nodes }), session({ move }), {}), /data-move-recover=.*data-move-abandon=/);
+    assert.match(context.moveControlsHTML(fixture({ nodes }), session({ move: { ...move, status: 'in-flight' } }), {}), /Moving to aws1…/);
+  }
 });
 
 test('a click checks the move dry, then moves forced with the long deadline, and reports the pane', async () => {
