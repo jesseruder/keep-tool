@@ -1270,8 +1270,13 @@ Before anything stops, the move refuses when:
 - a node end's host predates the `artifacts` verb (update keep-tool there and reload its
   host);
 - the session's working directory does not exist on the target;
-- a message to the session is still unconfirmed, an account handoff is in flight, or a
-  compaction has not restored its model;
+- the target does not have the session's account (its own configuration must name it
+  and its directory must be there), or could not launch it: the target runs
+  `prepare-launch` in its check form, which validates the shared home, the account and
+  a shared setup's MCP configuration and writes nothing;
+- a message to the session is still unconfirmed, an account handoff is in flight, a
+  compaction has not restored its model, or a restart for it is queued, running or
+  waiting for recovery;
 - the session is working (its turn has not ended) and `--force` was not given;
 - the session is live on a node other than the daemon's and `--force` was not given: the
   graceful stop proves background work from the transcript, which the daemon cannot
@@ -1282,7 +1287,10 @@ as with `keep handoff --force`: the source is signalled instead of being asked t
 
 The move is journalled in `.keep/session-moves/<tx>.json` through `stopping`, `copying`,
 `staged`, `pinned`, `starting`, `verifying` and `done`. The source is proven stopped on
-its own node before anything is carried; the session's location record
+its own node before anything is carried, from that node's own process table (a table
+that cannot be read proves nothing and refuses, on the daemon node too), and proven so
+again before the flip and before every launch, on a recovery as on the first run; the
+session's location record
 (`.keep/session-accounts/<sid>.json`) flips to the target exactly once, after the target
 holds the verified bytes and before the target starts; the target is launched through
 `keep open` pinned to the new record, and the move waits for its session-start. Then the
@@ -1294,9 +1302,16 @@ backups of any files its publish replaced go with it; only the provenance record
 (`<configDir>/.keep-move/provenance/<sid>.json`) stays. A move that fails
 is left `recovery-needed` with a message naming the node that holds the verified bytes
 (the source before the flip, the target after it): `keep move --recover <tx>` continues
-from the step that failed, and `keep move --abandon <tx>` clears the target's stage and
-leaves the session where it was (refused once the record has flipped). While a move owns
-a session, `keep open` refuses to resume it.
+from the step that failed. A recovery after the launch asks the target whether it runs
+the session: if nothing does, it is launched again under the same transaction; if it
+does, its session-start is waited for once more, and a start that never comes is said
+plainly. `keep move --abandon <tx>` before the flip clears the target's stage and leaves
+the session where it was; after the flip it is allowed once the source is proven
+stopped and the target proven not running the session, and it flips the record back to
+the source (the second flip, journalled as `abandoned-back`), leaves the target's copy
+released for a later move, and ends the move. While a move owns a session, `keep open`
+refuses to resume it. The card's link to the session keeps its place: only its `node`
+changes, committed locally without a push.
 
 **Worktrees.** A session whose cwd is a `~/wt/` worktree needs that worktree on the
 target before it can move: nothing carries a working tree, and the preflight refuses with

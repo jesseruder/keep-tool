@@ -225,17 +225,20 @@ session controls outside Keep if the user directs that work.
   nothing.
 - Preconditions: more than one node configured; a Claude session (Codex and Pi are
   refused for now); the target's host advertises the `artifacts` verb; the session's cwd
-  exists on the target; no unconfirmed message, account handoff or pending compaction
-  restore; the turn has ended. A session live on a node other than the daemon's leaves it
+  exists on the target; the target has the account and could launch it; no unconfirmed
+  message, account handoff, pending compaction restore or queued restart; the turn has
+  ended. A session live on a node other than the daemon's leaves it
   only with `--force` for now, and `--force` is Owner's forced stop: pass it only when
   Owner asked for the move himself.
 - Worktrees: a session whose cwd is a `~/wt/` worktree needs that worktree on the target
   first. Push its branch, create the worktree there with `wt` from the same branch, then
   move.
 - A move that stops part way names the node that holds the session's verified bytes and
-  the command that continues it: `keep move --recover <tx>`, or `keep move --abandon <tx>`
-  to leave it where it was (only before the record flips). Until then `keep open`
-  refuses to resume that session.
+  the command that continues it: `keep move --recover <tx>` (after the launch it launches
+  again or waits once more, as the target's state says), or `keep move --abandon <tx>`
+  to leave it where it was; after the flip an abandon puts the record back on the source,
+  and only once neither node runs the session. Until then `keep open` refuses to resume
+  that session.
 - Moving someone's working session is Owner's call unless the card grants it.
 
 ## Ending and hiding sessions
