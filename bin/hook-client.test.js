@@ -312,3 +312,37 @@ test('a session whose end comes before its queued start never has the start repl
   await f.hook('lifecycle', daemon.url, { hook_event_name: 'PostToolUse' });
   assert.equal(daemon.posts.some((post) => post.body.event === 'session-start'), false);
 });
+
+test('hooks that enqueue at the same moment each keep their entry', async (t) => {
+  const f = fixture(t);
+  const client = require('./hook-client.js');
+  // Several processes, released together, each enqueuing as fast as it can: every
+  // one computes the next number from the same directory at nearly the same time.
+  const workers = 4;
+  const each = 25;
+  const go = Date.now() + 400;
+  const script = `
+    const client = require(${JSON.stringify(path.join(__dirname, 'hook-client.js'))});
+    const env = { HOME: ${JSON.stringify(f.home)} };
+    while (Date.now() < ${go}) {}
+    for (let i = 0; i < ${each}; i += 1) {
+      client.enqueue(env, { event: 'notification', body: { input: { session_id: 'sess-aws1', cwd: '/x', w: process.argv[1], i },
+        identity: { agent: 'claude', sessionId: 'sess-aws1' }, idempotencyKey: 'k' + process.argv[1] + '-' + String(i).padStart(16, '0') } });
+    }`;
+  await Promise.all(Array.from({ length: workers }, (_, w) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['-e', script, String(w)], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', (status) => (status === 0 ? resolve() : reject(new Error(stderr))));
+  })));
+  const queued = f.queue();
+  assert.equal(queued.length, workers * each, 'no entry lost to another with the same number');
+  assert.equal(new Set(queued.map((entry) => entry.seq)).size, workers * each);
+  assert.equal(new Set(queued.map((entry) => entry.body.idempotencyKey)).size, workers * each);
+  for (let w = 0; w < workers; w += 1) {
+    const mine = queued.filter((entry) => entry.body.input.w === String(w)).map((entry) => entry.body.input.i);
+    assert.deepEqual(mine, [...mine].sort((a, b) => a - b), 'each process\'s entries in its order');
+  }
+  assert.equal(fs.readdirSync(client.stateDir({ HOME: f.home })).some((name) => name.endsWith('.tmp')), false, 'nothing left aside');
+});

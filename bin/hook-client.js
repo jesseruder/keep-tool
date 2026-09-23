@@ -206,9 +206,27 @@ function enqueue(env, entry) {
   const counter = path.join(stateDir(env), 'hook-queue.seq');
   const names = queueFiles(env);
   const last = names.length ? Number(names.at(-1).slice(0, 16)) : 0;
-  const seq = Math.max(last, Number(readJson(counter)) || 0) + 1;
-  writeAtomic(counter, seq);
-  writeAtomic(path.join(dir, `${String(seq).padStart(16, '0')}.json`), { seq, ...entry, queuedAt: new Date().toISOString() });
+  let seq = Math.max(last, Number(readJson(counter)) || 0) + 1;
+  // Two hooks may enqueue at once and pick the same number. The entry is written
+  // aside and linked into place, which fails when the name is taken (and never
+  // shows a replay a half-written file); the loser takes the next number.
+  const temp = path.join(stateDir(env), `hook-queue.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+  const queuedAt = new Date().toISOString();
+  try {
+    for (let attempt = 0; ; attempt += 1) {
+      fs.writeFileSync(temp, `${JSON.stringify({ seq, ...entry, queuedAt })}\n`, { mode: 0o600 });
+      try {
+        fs.linkSync(temp, path.join(dir, `${String(seq).padStart(16, '0')}.json`));
+        break;
+      } catch (error) {
+        if (error.code !== 'EEXIST' || attempt >= QUEUE_MAX) throw error;
+        seq += 1;
+      }
+    }
+  } finally {
+    try { fs.unlinkSync(temp); } catch {}
+  }
+  try { writeAtomic(counter, Math.max(seq, Number(readJson(counter)) || 0)); } catch {}
   const all = queueFiles(env);
   for (const name of all.slice(0, Math.max(0, all.length - QUEUE_MAX))) { try { fs.unlinkSync(path.join(dir, name)); } catch {} }
 }
