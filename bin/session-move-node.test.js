@@ -341,6 +341,27 @@ test('the move relinks the card\'s entry for the session in place, through relin
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('the move\'s relink reaches the real relinkSessionNode through the daemon\'s own wiring', () => {
+  const keep = require('./keep-core.js');
+  const { spawnSync } = require('node:child_process');
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-move-relink-real-'));
+  try {
+    for (const dir of ['tasks', 'archive']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    assert.equal(spawnSync('git', ['init', '-q', '--initial-branch=main', root]).status, 0);
+    for (const [key, value] of [['user.name', 'Keep Test'], ['user.email', 'keep@example.test']]) {
+      assert.equal(spawnSync('git', ['-C', root, 'config', key, value]).status, 0);
+    }
+    const task = keep.parseTask(keep.serializeTask({ id: 'moving-card', fm: { title: 'x', status: 'active', kind: 'task', tags: ['personal'],
+      project: '', created: '2026-09-21', updated: '2026-09-21T08:00' }, body: 'x\n' }), 'moving-card');
+    task.fm.sessions = [{ id: SID, agent: 'claude', at: '2026-09-21T08:00' }, { id: 'sid-other', agent: 'claude', at: '2026-09-21T09:00' }];
+    fs.writeFileSync(path.join(root, 'tasks', 'moving-card.md'), keep.serializeTask(task));
+    // No relinkSessionNode injected: the daemon's own reference must resolve to a function.
+    assert.equal(serve.sessionMoveDeps({ root, daemonNode: 'main' }).relink({ sessionId: SID, to: 'aws1' }), 'moving-card');
+    assert.deepEqual(keep.loadTask('moving-card', root).fm.sessions,
+      [{ id: SID, agent: 'claude', at: '2026-09-21T08:00', node: 'aws1' }, { id: 'sid-other', agent: 'claude', at: '2026-09-21T09:00' }]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a restart queued for the session refuses the move before anything stops', async () => {
   const stopped = [];
   const w = wiredMove({ moveDeps: { stop: async () => { stopped.push('stop'); } } });
