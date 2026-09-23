@@ -12,7 +12,7 @@ import { actionsMenuHTML, installActionsMenu, installKeepRunningControl, keepRun
 import { stateLineHTML, installGrading } from './state-line.js';
 import { numBadgeHTML } from './session-number.js';
 import { installHeadingRename, installRenameControls, isEditing, renameButtonsHTML, titleAttrsHTML } from './session-rename.js';
-import { installMarkControls, markControlsHTML, markHTML } from './session-mark.js';
+import { installMarkControls, markControlsHTML, markHTML, markRowClass } from './session-mark.js';
 import { providerIconHTML } from './provider-icon.js';
 import { nodeBadgeHTML, remoteNode } from './node-badge.js';
 import { placeInbox } from './queue-inbox.js';
@@ -554,7 +554,8 @@ export function queueRow(ctx, item) {
   const title = item.title || session?.title || 'untitled session';
   const project = item.project || session?.project || '';
   const task = ctx.taskFor(item);
-  // "#12" ahead of the title, with the hand-set mark between it and the title. A
+  // "#12" ahead of the title, with the hand-set emoji between it and the title
+  // (the mark's color tints the whole row instead, via markRowClass). A
   // row with no session of its own (a plain shell) has no number and shows none.
   // Both live inside .t because .qitem is a fixed three-column grid: another
   // top-level span would shift every cell after it.
@@ -562,7 +563,7 @@ export function queueRow(ctx, item) {
   // machine: a single-node console renders the row it always rendered.
   const node = remoteNode({ item, session, pane: ctx.paneMap().get(item.pane || session?.pane) });
   const badge = numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)
-    + markHTML(ctx.esc, item.mark ?? session?.mark) + providerIconHTML(provider, ctx.esc) + nodeBadgeHTML(ctx.esc, node);
+    + markHTML(ctx.esc, item.mark ?? session?.mark, { dot: false }) + providerIconHTML(provider, ctx.esc) + nodeBadgeHTML(ctx.esc, node);
   if (item.kind === 'running' || item.kind === 'pinned' || item.kind === 'recent') {
     const sessionState = session ? sessionLabel(session) : item.state || 'unknown';
     // Running rows without a session are plain shells; label them like pinned ones.
@@ -643,7 +644,7 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
     }
     const html = queueRow(ctx, item);
     ctx.patchHTML(row, html);
-    row.className = `qitem k-${item.kind}${index === ctx.state.selected ? ' sel' : ''}`;
+    row.className = `qitem k-${item.kind}${index === ctx.state.selected ? ' sel' : ''}${markRowClass(item.mark ?? ctx.sessionFor(item)?.mark)}`;
     row.dataset.index = index;
     place(row);
   });

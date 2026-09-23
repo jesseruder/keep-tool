@@ -154,6 +154,16 @@ test('a mark renders as an emoji, a color dot, or both, and nothing when unmarke
     'the emoji comes first, so the dot sits closest to the title');
 });
 
+test('a queue row shows the color as its background, not a dot', async () => {
+  const { markHTML, markRowClass } = await import('./session-mark.js');
+  assert.equal(markHTML(esc, { color: 'red' }, { dot: false }), '', 'a color-only mark leaves no inline markup');
+  assert.equal(markHTML(esc, { color: 'teal', emoji: '🔥' }, { dot: false }), '<span class="mark">🔥</span>');
+  assert.equal(markRowClass({ color: 'blue' }), ' marked mark-blue');
+  assert.equal(markRowClass({ emoji: '🔥' }), '');
+  assert.equal(markRowClass({ color: 'chartreuse' }), '', 'a color outside the palette tints nothing');
+  assert.equal(markRowClass(null), '');
+});
+
 test('the emoji is escaped, never interpolated', async () => {
   const { markHTML } = await import('./session-mark.js');
   const html = markHTML(esc, { emoji: '<img src=x>' });

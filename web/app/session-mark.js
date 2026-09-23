@@ -14,7 +14,7 @@ export const PALETTE = ['red', 'orange', 'yellow', 'green', 'teal', 'blue', 'pur
 const escapeHTML = (value) => String(value == null ? '' : value)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-function colorOf(mark) {
+export function colorOf(mark) {
   const color = mark?.color;
   return PALETTE.includes(color) ? color : '';
 }
@@ -25,13 +25,22 @@ function emojiOf(mark) {
 }
 
 // Sits immediately before the title text. An unmarked session renders nothing at
-// all, so every title that has no mark keeps exactly the markup it had.
-export function markHTML(esc = escapeHTML, mark) {
+// all, so every title that has no mark keeps exactly the markup it had. The
+// triage queue passes `dot: false` because it shows the color as the row's
+// background instead (see `markRowClass`).
+export function markHTML(esc = escapeHTML, mark, { dot: showDot = true } = {}) {
   const emoji = emojiOf(mark);
-  const color = colorOf(mark);
+  const color = showDot ? colorOf(mark) : '';
   if (!emoji && !color) return '';
   const dot = color ? `<i class="mark-dot mark-${color}" title="${esc(color)}"></i>` : '';
   return `<span class="mark">${esc(emoji)}${dot}</span>`;
+}
+
+// Classes for a queue row whose session carries a color: the row's background
+// takes the tint. Empty for an uncolored session.
+export function markRowClass(mark) {
+  const color = colorOf(mark);
+  return color ? ` marked mark-${color}` : '';
 }
 
 // The Actions-menu block: eight swatches, a small emoji field with the picker's
