@@ -350,6 +350,22 @@ function recordClaudeCompletion(input) {
     mt,
     source: 'claude',
   }));
+  stampNodeFiredAt(path.join(dir, `${sid}.json`));
+}
+
+// A node's queued event replayed on the daemon (bin/hook-route.js sets
+// KEEP_HOOK_FIRED_AT beside KEEP_HOOK_NODE): the attention marker it just wrote
+// says when the event fired, not when it arrived. Nothing without KEEP_HOOK_NODE.
+function stampNodeFiredAt(markerFile) {
+  if (!process.env.KEEP_HOOK_NODE) return;
+  const firedAt = Number(process.env.KEEP_HOOK_FIRED_AT);
+  if (!Number.isSafeInteger(firedAt) || firedAt <= 0) return;
+  try {
+    const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
+    if (!(firedAt < Number(marker.at))) return;
+    marker.at = firedAt;
+    fs.writeFileSync(markerFile, JSON.stringify(marker));
+  } catch {}
 }
 
 // Agents repeat the handle they are given, so a session learns its own number at
@@ -874,6 +890,7 @@ commands.hook = async (argv) => {
         at: now,
         mt,
       }));
+      stampNodeFiredAt(path.join(dir, `${sid}.json`));
       for (const f of fs.readdirSync(dir)) {
         if (!f.endsWith('.json')) continue;
         try {

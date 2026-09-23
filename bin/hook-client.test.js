@@ -163,7 +163,7 @@ test('a daemon that is not there gets each event\'s safe default, and the delive
   assert.equal(start.stdout, 'Keep: this session is unmanaged on node aws1; the daemon is on main. '
     + `Its hooks and registry commands reach the daemon at ${url}; the daemon did not answer this start, so it is queued and resent with the next hook. `
     + 'Not available on this node: keep tell, keep open, keep codex task, and admin commands such as keep serve, keep restart-daemon and keep nodes add.\n');
-  for (const event of ['stop', 'notification', 'lifecycle', 'pre-question', 'session-end']) {
+  for (const event of ['stop', 'notification', 'lifecycle', 'pre-question']) {
     const result = await f.hook(event, url, { hook_event_name: event === 'lifecycle' ? 'PreToolUse' : undefined });
     assert.deepEqual(result, { status: 0, stdout: '', stderr: '' }, event);
   }
@@ -171,8 +171,16 @@ test('a daemon that is not there gets each event\'s safe default, and the delive
   assert.deepEqual(queued.map((entry) => entry.event), ['session-start', 'stop', 'notification', 'lifecycle']);
   assert.deepEqual(queued.map((entry) => entry.seq), [1, 2, 3, 4]);
   assert.equal(queued[1].body.input.stop_hook_active, true, 'a late stop cannot hold a turn');
-  assert.equal(queued[0].body.transcript, undefined, 'no bytes kept in the queue');
   assert.equal(JSON.stringify(queued).includes('"bytes"'), false);
+  const stat = fs.statSync(f.transcript);
+  assert.deepEqual(queued[0].body.transcript, { generation: `${stat.dev}:${stat.ino}:${Math.round(stat.birthtimeMs)}`, size: 8, mtimeMs: stat.mtimeMs },
+    'where the transcript ended when the event fired');
+  assert.ok(queued.every((entry) => Number.isSafeInteger(entry.body.identity.firedAt)), 'and when it fired');
+  // The session's end drops what it had queued: nothing of it may be replayed after.
+  const end = await f.hook('session-end', url, { hook_event_name: 'SessionEnd' });
+  assert.deepEqual(end, { status: 0, stdout: '', stderr: '' });
+  assert.deepEqual(f.queue(), []);
+  assert.match(fs.readFileSync(path.join(f.home, '.keep-node', 'hook.log'), 'utf8'), /dropped queued session-start for session sess-aws1 \(seq 1\): the session ended/);
 
   // A daemon that answers too late: the stop gives up at its own bound and lets the session stop.
   const slow = await stubDaemon(t, () => 'hang');
@@ -197,10 +205,16 @@ test('the queue replays in order, with its own keys, once, before the next event
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(daemon.posts.map((post) => post.body.event), ['stop', 'notification', 'lifecycle']);
   assert.deepEqual(daemon.posts.slice(0, 2).map((post) => post.body.idempotencyKey), keys);
-  // The first replay carries the whole transcript the daemon never got; the rest nothing new.
+  // The first replay carries the transcript as it stood when the stop fired, and no
+  // more; the notification saw nothing new; the live event sends the rest.
   assert.equal(daemon.posts[0].body.transcript.fromOffset, 0);
-  assert.equal(Buffer.from(daemon.posts[0].body.transcript.bytes, 'base64').toString(), '{"n":1}\n{"n":2}\n');
-  assert.equal(daemon.posts[1].body.transcript.fromOffset, 16);
+  assert.equal(Buffer.from(daemon.posts[0].body.transcript.bytes, 'base64').toString(), '{"n":1}\n');
+  assert.equal(daemon.posts[1].body.transcript.fromOffset, 8);
+  assert.equal(daemon.posts[1].body.transcript.bytes, '');
+  assert.equal(daemon.posts[2].body.transcript.fromOffset, 8);
+  assert.equal(Buffer.from(daemon.posts[2].body.transcript.bytes, 'base64').toString(), '{"n":2}\n');
+  assert.equal(typeof daemon.posts[0].body.identity.firedAt, 'number', 'a replay says when it fired');
+  assert.equal(daemon.posts[2].body.identity.firedAt, undefined, 'a live event does not');
   assert.deepEqual(f.queue(), []);
 
   await f.hook('lifecycle', daemon.url, { hook_event_name: 'PostToolUse' });
@@ -277,4 +291,24 @@ test('without KEEP_DAEMON_URL the hooks are the pane-only hooks they were', asyn
   assert.deepEqual(stop, { status: 0, stdout: '', stderr: '' });
   assert.equal(fs.existsSync(path.join(f.home, '.keep-node')), false, 'no delivery state either');
   assert.deepEqual(snapshot(f.registry), before);
+});
+
+test('a session whose end comes before its queued start never has the start replayed', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.transcript, '{"n":1}\n');
+  const url = await closedUrl();
+  await f.hook('session-start', url, { hook_event_name: 'SessionStart', source: 'startup' });
+  await f.hook('stop', url, { hook_event_name: 'Stop' });
+  assert.deepEqual(f.queue().map((entry) => entry.event), ['session-start', 'stop']);
+  // Another session's queued event is not this end's to drop.
+  await f.hook('notification', url, { session_id: 'sess-other', notification_type: 'idle_prompt' });
+
+  const daemon = await stubDaemon(t, () => ran(''));
+  const end = await f.hook('session-end', daemon.url, { hook_event_name: 'SessionEnd', reason: 'exit' });
+  assert.equal(end.status, 0, end.stderr);
+  assert.deepEqual(daemon.posts.map((post) => `${post.body.event}:${post.body.identity.sessionId}`),
+    ['notification:sess-other', 'session-end:sess-aws1'], 'the start and stop were dropped, never sent');
+  assert.deepEqual(f.queue(), []);
+  await f.hook('lifecycle', daemon.url, { hook_event_name: 'PostToolUse' });
+  assert.equal(daemon.posts.some((post) => post.body.event === 'session-start'), false);
 });

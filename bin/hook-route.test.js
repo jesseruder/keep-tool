@@ -325,3 +325,128 @@ test('on the daemon a node hook binds and reads the pane on that node\'s host, a
     } finally { remote.close(); local.close(); }
   });
 });
+
+// ---------- a node's queue, replayed through the route ----------
+
+// The node's hook client, in process, posting straight into the route; `down()`
+// says whether the daemon is unreachable for this post.
+function nodeClient(t, hooks, root, down) {
+  const client = require('./hook-client.js');
+  const home = tempDir(t, 'keep-hook-node-home-');
+  const transcriptFile = path.join(home, 'sess-aws1.jsonl');
+  const env = { HOME: home, KEEP_AGENT_ACCOUNT_ID: 'claude-node' };
+  const seen = [];
+  const request = async (url, pathname, { payload }) => {
+    if (down()) throw new Error('connect ECONNREFUSED');
+    const answer = await hooks.handle(AWS1, payload);
+    seen.push({ payload, answer, stopcheck: readStopcheck(root) });
+    return { status: answer.status, data: JSON.stringify(answer.body) };
+  };
+  const where = { url: 'http://127.0.0.1:1', local: 'aws1', daemon: 'main' };
+  const run = (event, extra = {}) => client.runHook(event,
+    { session_id: 'sess-aws1', transcript_path: transcriptFile, cwd: '/home/node/project', ...extra },
+    where, { env, token: 'aws1-secret', request });
+  const queueDir = client.queueDir(env);
+  const queued = () => { try { return fs.readdirSync(queueDir).sort().map((name) => path.join(queueDir, name)); } catch { return []; } };
+  return { run, seen, transcriptFile, queued, env };
+}
+
+function readStopcheck(root) {
+  try { return JSON.parse(fs.readFileSync(path.join(root, '.keep', 'stopcheck', 'sess-aws1.json'), 'utf8')); } catch { return null; }
+}
+
+test('a start replayed after the transcript grew anchors the stop evidence where it fired, and the stop still nags', async (t) => {
+  const { hooks, root } = services(t, { root: registry(t), realSpawn: true });
+  let down = true;
+  const node = nodeClient(t, hooks, root, () => down);
+  const opening = `${JSON.stringify({ type: 'mode', mode: 'default' })}\n`;
+  fs.writeFileSync(node.transcriptFile, opening);
+  const start = await node.run('session-start', { hook_event_name: 'SessionStart', source: 'startup' });
+  assert.equal(start.delivered, false);
+  assert.equal(start.queued, true);
+
+  // A whole turn of work happens before the daemon is back.
+  fs.appendFileSync(node.transcriptFile, `${toolUse('Edit').repeat(5)}${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Done.' }] } })}\n`);
+  down = false;
+  const stop = await node.run('stop', { hook_event_name: 'Stop', stop_hook_active: false });
+  assert.equal(stop.delivered, true, stop.why);
+  assert.deepEqual(node.seen.map((post) => post.payload.event), ['session-start', 'stop']);
+  const replayed = node.seen[0];
+  assert.equal(replayed.answer.status, 200, JSON.stringify(replayed.answer.body));
+  assert.equal(Buffer.from(replayed.payload.transcript.bytes, 'base64').toString(), opening, 'the start carried only what it saw');
+  assert.equal(replayed.stopcheck.offset, Buffer.byteLength(opening), 'anchored where the start fired, not at the mirror\'s end now');
+  assert.equal(JSON.parse(stop.value.stdout).decision, 'block', 'the turn\'s edits are still judged');
+  assert.equal(readStopcheck(root).edits, 5);
+  assert.deepEqual(node.queued(), []);
+});
+
+test('a queued event whose transcript was replaced is dropped, and a replayed stop\'s marker carries the time it fired', async (t) => {
+  const { hooks, root } = services(t, { root: registry(t), realSpawn: true });
+  let down = true;
+  const node = nodeClient(t, hooks, root, () => down);
+  const opening = `${JSON.stringify({ type: 'mode', mode: 'default' })}\n`;
+  fs.writeFileSync(node.transcriptFile, opening);
+  const markerFile = path.join(root, '.keep', 'attention', 'sess-aws1.json');
+  // They fired an hour ago, as far as the entries say.
+  const firedAt = Date.now() - 3600e3;
+  const backdate = () => {
+    for (const file of node.queued()) {
+      const entry = JSON.parse(fs.readFileSync(file, 'utf8'));
+      entry.body.identity.firedAt = firedAt;
+      fs.writeFileSync(file, JSON.stringify(entry));
+    }
+  };
+
+  // A stop, replayed: its completion marker says when it fired.
+  await node.run('stop', { hook_event_name: 'Stop', stop_hook_active: false });
+  assert.equal(node.queued().length, 1);
+  backdate();
+  down = false;
+  const first = await node.run('lifecycle', { hook_event_name: 'PostToolUse' });
+  assert.equal(first.delivered, true, first.why);
+  assert.deepEqual(node.seen.map((post) => post.payload.event), ['stop', 'lifecycle']);
+  assert.equal(node.seen[0].answer.status, 200, JSON.stringify(node.seen[0].answer.body));
+  const complete = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
+  assert.equal(complete.type, 'complete');
+  assert.equal(complete.at, firedAt, 'the completion is stamped when the stop fired');
+
+  // A notification, replayed: the same.
+  down = true;
+  await node.run('notification', { hook_event_name: 'Notification', notification_type: 'idle_prompt', message: 'waiting' });
+  backdate();
+  down = false;
+  await node.run('lifecycle', { hook_event_name: 'PostToolUse' });
+  const waiting = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
+  assert.equal(waiting.type, 'waiting');
+  assert.equal(waiting.at, firedAt);
+
+  // The transcript is replaced (a new file at the same path) before a queued event
+  // can go: that entry is dropped, with a line in the node's log.
+  down = true;
+  await node.run('notification', { hook_event_name: 'Notification', notification_type: 'idle_prompt' });
+  assert.equal(node.queued().length, 1);
+  fs.rmSync(node.transcriptFile);
+  fs.writeFileSync(node.transcriptFile, opening);
+  down = false;
+  const posts = node.seen.length;
+  const next = await node.run('lifecycle', { hook_event_name: 'PostToolUse' });
+  assert.equal(next.delivered, true, next.why);
+  assert.deepEqual(node.seen.slice(posts).map((post) => post.payload.event), ['lifecycle'], 'the stale entry never reached the daemon');
+  assert.deepEqual(node.queued(), []);
+  assert.match(fs.readFileSync(require('./hook-client.js').logFile(node.env), 'utf8'),
+    /dropped queued notification for session sess-aws1 \(seq \d+\): the transcript was replaced after the event fired/);
+});
+
+test('on the daemon node KEEP_HOOK_FIRED_AT alone changes nothing', async (t) => {
+  const root = registry(t);
+  const transcriptFile = path.join(root, 'sess-local.jsonl');
+  fs.writeFileSync(transcriptFile, `${JSON.stringify({ type: 'mode', mode: 'default' })}\n`);
+  const env = { PATH: process.env.PATH, HOME: root, LANG: 'C', KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_SYNC: '0',
+    KEEP_CONFIG: path.join(root, 'config.json'), CLAUDE_CODE_SESSION_ID: 'sess-local', KEEP_HOOK_FIRED_AT: '1000' };
+  const before = Date.now();
+  const result = await runLocal(['hook', 'stop'], { env,
+    input: JSON.stringify({ session_id: 'sess-local', transcript_path: transcriptFile, cwd: root, hook_event_name: 'Stop' }) });
+  assert.equal(result.status, 0, result.stderr);
+  const marker = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'attention', 'sess-local.json'), 'utf8'));
+  assert.ok(marker.at >= before, 'stamped now, as always');
+});

@@ -168,6 +168,13 @@ function validateRequest(body, caller, deps) {
   if (accountId && where.accountId && accountId !== where.accountId) {
     refuse(403, `session ${sessionId} runs on account ${where.accountId}, not ${accountId}`);
   }
+  // When a replayed event fired, on the node's clock: the time its attention marker
+  // carries. Never later than now.
+  let firedAt = null;
+  if (identity.firedAt !== undefined && identity.firedAt !== null) {
+    if (!Number.isSafeInteger(identity.firedAt) || identity.firedAt <= 0) refuse(400, 'identity.firedAt must be a time in milliseconds');
+    firedAt = Math.min(identity.firedAt, deps.now ? deps.now() : Date.now());
+  }
   let pane = null;
   if (identity.pane !== undefined && identity.pane !== null) {
     if (typeof identity.pane !== 'string') refuse(400, 'invalid pane ref');
@@ -179,17 +186,18 @@ function validateRequest(body, caller, deps) {
   const transcript = cleanTranscript(body.transcript);
   if (event === TRANSCRIPT_ONLY) {
     if (!transcript) refuse(400, 'a transcript post carries a transcript');
-    return { event, sessionId, accountId, pane, transcript };
+    return { event, sessionId, accountId, pane, transcript, firedAt };
   }
   if (typeof body.idempotencyKey !== 'string' || !KEY_RE.test(body.idempotencyKey)) {
     refuse(400, 'idempotencyKey must be 16-128 letters, digits, _ or -');
   }
   const input = cleanInput(event, body.input, sessionId);
-  return { event, sessionId, accountId, pane, transcript, input, idempotencyKey: body.idempotencyKey };
+  return { event, sessionId, accountId, pane, transcript, firedAt, input, idempotencyKey: body.idempotencyKey };
 }
 
 // The transcript is left out: its bytes are applied before the journal is read,
-// and a resend of the same event may carry a different delta.
+// and a resend of the same event may carry a different delta. So is firedAt, which
+// only a queued resend of an event carries.
 function digestOf(request) {
   return crypto.createHash('sha256').update(`hook:${JSON.stringify([
     request.event, request.input, request.sessionId, request.pane, request.accountId,
@@ -252,7 +260,7 @@ function createHookService(options = {}) {
       // themselves, and a caller naming the daemon would route its panes to itself.
       if (caller === daemon) refuse(403, 'the hook route is for sessions on other nodes');
       const request = validateRequest(body, caller, {
-        location: shared.location, parsePaneRef: shared.parsePaneRef, formatPaneRef: shared.formatPaneRef,
+        location: shared.location, parsePaneRef: shared.parsePaneRef, formatPaneRef: shared.formatPaneRef, now,
       });
       if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };
       pruneMirrors();
@@ -270,6 +278,7 @@ function createHookService(options = {}) {
           ...shared.childEnv({ session: request.sessionId, agent: 'claude', pane: request.pane }, caller, daemon),
           KEEP_HOOK_NODE: caller,
           ...(request.accountId ? { KEEP_AGENT_ACCOUNT_ID: request.accountId } : {}),
+          ...(request.firedAt ? { KEEP_HOOK_FIRED_AT: String(request.firedAt) } : {}),
         };
         const answer = await shared.journaled({
           caller, key: request.idempotencyKey, digest: digestOf(hookRequest), queue: `hook\0${caller}\0${request.sessionId}`,

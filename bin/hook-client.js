@@ -10,6 +10,13 @@
 //                                    session's transcript the daemon has.
 //   ~/.keep-node/hook-queue/<seq>.json  events that could not be delivered, replayed
 //                                    in order, with their own keys, before the next post.
+//   ~/.keep-node/hook.log            what the queue dropped, and why.
+//
+// An event is delivered against the transcript as it stood when the event fired:
+// its generation and size are taken first, and the delta in front of it stops at
+// that size, whenever it is sent. A replay therefore shows the daemon the mirror
+// that event saw, never a later turn's bytes (the next event sends those), and an
+// entry whose transcript was replaced since is dropped.
 //
 // Every wait is bounded per event, because Claude waits on the hook. A daemon that
 // does not answer in time gets each event's safe default: a stop is let through, a
@@ -36,6 +43,18 @@ const ACCOUNT_RE = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex|pi)\/default)$/
 function stateDir(env = process.env) { return path.join(env.HOME || os.homedir(), '.keep-node'); }
 function cursorFile(env, sid) { return path.join(stateDir(env), 'mirror', `${sid}.json`); }
 function queueDir(env) { return path.join(stateDir(env), 'hook-queue'); }
+function logFile(env) { return path.join(stateDir(env), 'hook.log'); }
+const LOG_MAX_BYTES = 1024 * 1024;
+
+// One line to ~/.keep-node/hook.log, the file cut short when it grows past 1 MiB.
+function logLine(env, text) {
+  try {
+    const file = logFile(env);
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    try { if (fs.statSync(file).size > LOG_MAX_BYTES) fs.truncateSync(file, 0); } catch {}
+    fs.appendFileSync(file, `${new Date().toISOString()} ${text}\n`, { mode: 0o600 });
+  } catch {}
+}
 
 function writeAtomic(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -81,6 +100,13 @@ function readRange(file, from, to) {
   } finally { fs.closeSync(fd); }
 }
 
+// The transcript as it stands now: what an event fired against. null when there is
+// no transcript to send.
+function snapshotOf(transcriptPath) {
+  const stat = transcriptStat(transcriptPath);
+  return stat ? { generation: generationOf(stat), size: stat.size, mtimeMs: stat.mtimeMs } : null;
+}
+
 function identityOf(input, env, where) {
   const nodes = require('./nodes.js');
   const identity = { agent: 'claude', sessionId: input.session_id };
@@ -95,10 +121,12 @@ function parsed(response) {
   try { return JSON.parse(response.data); } catch { return null; }
 }
 
-// Delivers one event, with the transcript delta in front of it. Resolves
-// { ok: true, value } with the daemon's answer, or { ok: false, retry, why } where
-// `retry` says whether a later resend could succeed.
-async function deliver({ event, input, identity, key, transcriptPath, deadline, where, token, env, deps }) {
+// Delivers one event, with the transcript delta in front of it, up to `snapshot`:
+// the transcript's { generation, size, mtimeMs } when the event fired (null: it had
+// none, and none is sent). Resolves { ok: true, value } with the daemon's answer, or
+// { ok: false, retry, why } where `retry` says whether a later resend could succeed;
+// `stale` says the transcript was replaced since the event fired.
+async function deliver({ event, input, identity, key, transcriptPath, snapshot, deadline, where, token, env, deps }) {
   const request = deps.request || require('./remote-cli.js').nodeApiRequest;
   const now = deps.now || Date.now;
   const sid = identity.sessionId;
@@ -110,14 +138,23 @@ async function deliver({ event, input, identity, key, transcriptPath, deadline, 
   let resends = 0;
   let from = null;
   for (;;) {
-    const stat = transcriptStat(transcriptPath);
+    const stat = snapshot ? transcriptStat(transcriptPath) : null;
     let plan = null;
-    if (stat) {
-      const generation = generationOf(stat);
+    if (snapshot) {
+      const generation = stat ? generationOf(stat) : null;
+      if (generation !== snapshot.generation) {
+        return { ok: false, retry: false, stale: true, why: 'the transcript was replaced after the event fired' };
+      }
       const cursor = readCursor(env, sid);
       if (from === null) from = cursor && cursor.generation === generation && cursor.sent <= stat.size ? cursor.sent : 0;
       if (from > stat.size) from = 0;
-      plan = { generation, size: stat.size, mtimeMs: stat.mtimeMs, path: transcriptPath };
+      // `size` is the source's size now, so a mirror that is ahead is never taken
+      // for a truncated source; the bytes stop where the event saw the file end.
+      const end = Math.min(stat.size, snapshot.size);
+      plan = { generation, size: stat.size, end, mtimeMs: end === snapshot.size ? snapshot.mtimeMs : stat.mtimeMs, path: transcriptPath };
+      // The mirror already holds more than this event saw (another hook sent it):
+      // the event goes without bytes, and the mirror is left as it is.
+      if (from > end) plan = null;
     }
     const piece = (start, end) => ({
       path: plan.path, generation: plan.generation, fromOffset: start, size: plan.size, mtimeMs: plan.mtimeMs,
@@ -127,7 +164,7 @@ async function deliver({ event, input, identity, key, transcriptPath, deadline, 
     let response;
     try {
       // Every chunk of a long delta but the last goes on its own.
-      while (plan && plan.size - from > CHUNK_BYTES) {
+      while (plan && plan.end - from > CHUNK_BYTES) {
         const chunk = await send({ event: 'transcript', identity, transcript: piece(from, from + CHUNK_BYTES) });
         const value = parsed(chunk) || {};
         if (chunk.status === 200) { from += CHUNK_BYTES; advance(from); continue; }
@@ -138,7 +175,7 @@ async function deliver({ event, input, identity, key, transcriptPath, deadline, 
         }
         return { ok: false, retry: chunk.status >= 500, why: value.error || `HTTP ${chunk.status}` };
       }
-      response = await send({ event, input, identity, transcript: plan ? piece(from, plan.size) : null, idempotencyKey: key });
+      response = await send({ event, input, identity, transcript: plan ? piece(from, plan.end) : null, idempotencyKey: key });
     } catch (error) {
       return { ok: false, retry: true, why: error.message };
     }
@@ -149,7 +186,7 @@ async function deliver({ event, input, identity, key, transcriptPath, deadline, 
       continue;
     }
     if ((response.status === 200 || response.status === 504) && Number.isInteger(value.status)) {
-      if (plan) advance(plan.size);
+      if (plan) advance(plan.end);
       return { ok: response.status === 200, retry: false, value, why: response.status === 504 ? 'the daemon stopped the hook' : '' };
     }
     return { ok: false, retry: response.status >= 500, why: value.error || `HTTP ${response.status}` };
@@ -160,8 +197,9 @@ function queueFiles(env) {
   try { return fs.readdirSync(queueDir(env)).filter((name) => /^\d{16}\.json$/.test(name)).sort(); } catch { return []; }
 }
 
-// Kept for later, oldest dropped past QUEUE_MAX. The transcript bytes are not kept:
-// a replay sends whatever the mirror is missing when it runs.
+// Kept for later, oldest dropped past QUEUE_MAX. The transcript bytes are not kept,
+// only where the transcript ended when the event fired: a replay sends what the
+// mirror is missing up to there, and no further.
 function enqueue(env, entry) {
   const dir = queueDir(env);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -187,13 +225,30 @@ async function replayQueue({ env, where, token, deadline, deps }) {
     if (!entry || !EVENTS.includes(entry.event) || !entry.body || !entry.body.identity) { try { fs.unlinkSync(file); } catch {} continue; }
     const result = await deliver({
       event: entry.event, input: entry.body.input, identity: entry.body.identity, key: entry.body.idempotencyKey,
-      transcriptPath: entry.body.transcriptPath, deadline, where, token, env, deps,
+      transcriptPath: entry.body.transcriptPath, snapshot: entry.body.transcript || null, deadline, where, token, env, deps,
     });
     if (!result.ok && result.retry) break;
+    if (result.stale) {
+      logLine(env, `dropped queued ${entry.event} for session ${entry.body.identity.sessionId} (seq ${entry.seq}): ${result.why}`);
+    }
     try { fs.unlinkSync(file); } catch {}
     sent += 1;
   }
   return sent;
+}
+
+// Removes a session's queued events. A session's end is the last thing it sends:
+// a start or a stop replayed after it would bind or mark a session that is gone.
+function dropSession(env, sessionId) {
+  let dropped = 0;
+  for (const name of queueFiles(env)) {
+    const file = path.join(queueDir(env), name);
+    const entry = readJson(file);
+    if (!entry || !entry.body || !entry.body.identity || entry.body.identity.sessionId !== sessionId) continue;
+    try { fs.unlinkSync(file); dropped += 1; } catch {}
+    logLine(env, `dropped queued ${entry.event} for session ${sessionId} (seq ${entry.seq}): the session ended`);
+  }
+  return dropped;
 }
 
 // One hook event, delivered. Resolves null when this event is not carried (the
@@ -204,36 +259,45 @@ async function runHook(event, input, where, deps = {}) {
   if (!EVENTS.includes(event) || env.KEEP_RUN) return null;
   if (!input || typeof input !== 'object' || typeof input.session_id !== 'string' || !SESSION_RE.test(input.session_id)) return null;
   const started = now();
+  // First, before any wait: the transcript as this event saw it.
+  const snapshot = snapshotOf(input.transcript_path);
   const budget = (deps.budgets || BUDGET_MS)[event];
   const deadline = started + budget;
   const identity = identityOf(input, env, where);
   const key = newKey();
+  const fired = { snapshot, firedAt: Date.now() };
+  if (event === 'session-end') dropSession(env, input.session_id);
   let token;
   try {
     require('./remote-cli.js').daemonBase(where.url);
     token = deps.token || require('./remote-cli.js').nodeToken(env, deps.readToken);
   } catch (error) {
-    return { delivered: false, why: error.message, queued: queue(event, input, identity, key, env) };
+    return { delivered: false, why: error.message, queued: queue(event, input, identity, key, fired, env) };
   }
   // What an earlier event could not deliver goes first, so the daemon sees them in
   // order; never more than half this event's own wait.
   try {
     await replayQueue({ env, where, token, deadline: Math.min(started + REPLAY_MS, started + budget / 2), deps });
   } catch {}
-  const result = await deliver({ event, input, identity, key, transcriptPath: input.transcript_path, deadline, where, token, env, deps });
+  const result = await deliver({ event, input, identity, key, transcriptPath: input.transcript_path, snapshot, deadline, where, token, env, deps });
   if (result.ok) return { delivered: true, value: result.value };
   // A hook the daemon stopped has run and been journalled: a resend would only
   // replay it. Anything else it answered is a refusal a resend would repeat.
-  return { delivered: false, why: result.why, queued: result.retry ? queue(event, input, identity, key, env) : false };
+  return { delivered: false, why: result.why, queued: result.retry ? queue(event, input, identity, key, fired, env) : false };
 }
 
-function queue(event, input, identity, key, env) {
+function queue(event, input, identity, key, fired, env) {
   if (!QUEUED.has(event)) return false;
-  // A stop delivered late cannot hold a turn that has already ended; replayed, it
-  // records the turn and never nags.
+  // A stop delivered late cannot hold a turn that has already ended: replayed with
+  // stop_hook_active it never blocks, because the evaluator returns before it scans,
+  // so the turn's evidence is left for the next live stop to judge. What the replay
+  // does write is the completion marker, stamped with `firedAt`, and the turn index.
   const replayInput = event === 'stop' ? { ...input, stop_hook_active: true } : input;
   try {
-    enqueue(env, { event, body: { input: replayInput, identity, idempotencyKey: key, transcriptPath: input.transcript_path } });
+    enqueue(env, { event, body: {
+      input: replayInput, identity: { ...identity, firedAt: fired.firedAt }, idempotencyKey: key,
+      transcriptPath: input.transcript_path, transcript: fired.snapshot,
+    } });
     return true;
   } catch { return false; }
 }
@@ -255,6 +319,6 @@ function report(env = process.env) {
 }
 
 module.exports = {
-  runHook, deliver, replayQueue, enqueue, report, generationOf, stateDir, queueDir, cursorFile,
+  runHook, deliver, replayQueue, enqueue, dropSession, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
   EVENTS, BUDGET_MS, QUEUE_MAX, CHUNK_BYTES,
 };
