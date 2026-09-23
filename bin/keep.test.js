@@ -3355,8 +3355,10 @@ test('the move route answers local and admin callers only, never a node or the p
   const req = { method: 'POST' };
   const route = matchRoute(list, { req, url: new URL('http://x/api/move-session'), body: {} });
   assert.equal(route.path, '/api/move-session');
-  for (const cls of ['local', 'admin']) assert.equal(routeAllows(route, { class: cls }), true, cls);
-  for (const cls of ['node', 'proxy']) assert.equal(routeAllows(route, { class: cls, node: 'aws1' }), false, cls);
+  // The CLI on the daemon node reaches the daemon through the UI worker, as the proxy
+  // class, so proxy must be allowed; a node token never is.
+  for (const cls of ['proxy', 'local', 'admin']) assert.equal(routeAllows(route, { class: cls }), true, cls);
+  assert.equal(routeAllows(route, { class: 'node', node: 'aws1' }), false, 'node');
   assert.deepEqual(await route.handle({ res: null, body: { sessionId: 's', node: 'aws1' } }), { status: 200, value: { ok: true, status: 'done' } });
   assert.deepEqual(await route.handle({ res: null, body: { sessionId: 's', node: 'nowhere' } }),
     { status: 400, value: { error: 'node nowhere is not configured', reason: 'x' } });

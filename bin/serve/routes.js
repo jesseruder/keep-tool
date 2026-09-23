@@ -778,11 +778,12 @@ function routes(ctx) {
     },
     {
       // keep move: a Claude session from one node to another (bin/session-move.js).
-      // Local and admin only in this landing: the console has no button for it, and
-      // no node may ask for one.
+      // The daemon node's own callers only: the CLI arrives through the UI worker as
+      // the proxy class, the console as proxy too (no button yet), and no node may
+      // ask for one, so this is the default allow list with node left out.
       method: 'POST',
       path: '/api/move-session',
-      allow: ['local', 'admin'],
+      allow: ['proxy', 'local', 'admin'],
       handle: async ({ res, body }) => {
         try {
           const result = await ctx.moveSession(body);
