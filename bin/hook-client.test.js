@@ -457,3 +457,73 @@ test('a daemon that does not answer a pre-bash refuses what it could have refuse
   assert.match(refusedOld.stderr, /is not a hook event/);
   assert.equal((await bash(old.url, 'ls')).status, 0);
 });
+
+// ---------- post-bash ----------
+
+test('a post-bash posts the command, its response cut to fit and this node\'s repo facts, and queues when the daemon is not there', async (t) => {
+  const f = fixture(t);
+  const git = (cwd, ...args) => require('node:child_process').execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const repo = path.join(f.home, 'app');
+  fs.mkdirSync(repo);
+  git(repo, 'init', '-q', '--initial-branch=main');
+  git(repo, 'config', 'user.email', 'keep@example.test');
+  git(repo, 'config', 'user.name', 'Keep Test');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+  git(repo, 'add', '.');
+  git(repo, 'commit', '-qm', 'a');
+  const head = git(repo, 'rev-parse', 'HEAD');
+  const daemon = await stubDaemon(t, (body, n, url) => (url.startsWith('/api/hook/context') ? CONTEXT
+    : { status: 200, body: { ok: true, status: 0, stdout: '', stderr: 'keep: recorded\n', replayed: false } }));
+  const result = await f.hook('post-bash', daemon.url, { cwd: repo, hook_event_name: 'PostToolUse', tool_name: 'Bash',
+    tool_input: { command: 'git push heroku main' }, tool_response: { stdout: 'pushed', stderr: '', interrupted: false, isImage: false } });
+  assert.deepEqual(result, { status: 0, stdout: '', stderr: 'keep: recorded\n' });
+  const post = daemon.posts.find((entry) => entry.url === '/api/hook').body;
+  assert.equal(post.event, 'post-bash');
+  assert.equal(post.transcript, null);
+  assert.deepEqual(post.input.tool_response, { stdout: 'pushed', stderr: '', interrupted: false });
+  assert.deepEqual(post.input.repo_facts, {
+    paths: { [repo]: { top: repo, main: repo } },
+    deploy: { dir: repo, repo, sha: head, dirty: [], branch: null, onOrigin: null },
+    head: { [repo]: head },
+  });
+
+  // No daemon: nothing said, and the record waits in the queue with its facts.
+  const url = await closedUrl();
+  const queued = await f.hook('post-bash', url, { cwd: repo, tool_name: 'Bash', tool_input: { command: 'terraform apply' }, tool_response: { stdout: 'ok' } });
+  assert.deepEqual(queued, { status: 0, stdout: '', stderr: '' });
+  const [entry] = f.queue();
+  assert.equal(entry.event, 'post-bash');
+  assert.deepEqual(entry.body.input.repo_facts.head, { [repo]: head });
+  assert.equal(entry.body.transcript, null);
+  // Replayed before the next event, once.
+  await f.hook('notification', daemon.url);
+  const replayed = daemon.posts.filter((item) => item.url === '/api/hook').map((item) => item.body.event);
+  assert.deepEqual(replayed, ['post-bash', 'post-bash', 'notification']);
+  assert.deepEqual(f.queue(), []);
+});
+
+test('a post-bash response is cut to 64 KiB a field, its end kept, and further when the whole would not fit', async (t) => {
+  const client = require('./hook-client.js');
+  const where = { url: 'http://127.0.0.1:1', local: 'aws1', daemon: 'main' };
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-hook-client-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const sent = [];
+  const deps = { env: { HOME: home }, token: 't', request: async (url, pathname, { payload }) => {
+    if (pathname.startsWith('/api/hook/context')) return { status: 200, data: JSON.stringify({ steps: [], repairSession: false }) };
+    sent.push(payload);
+    return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: '', stderr: '' }) };
+  } };
+  const long = `${'x'.repeat(100 * 1024)}THE END`;
+  const post = (response, command = 'ls') => client.runBashHook('post-bash', { session_id: 'sess-aws1', cwd: home, tool_name: 'Bash',
+    tool_input: { command }, tool_response: response }, where, deps).then(() => sent.at(-1).input);
+  const one = await post({ stdout: long, stderr: 'short', exit_code: 1, interrupted: false, isImage: false });
+  assert.equal(Buffer.byteLength(one.tool_response.stdout), 64 * 1024);
+  assert.ok(one.tool_response.stdout.endsWith('THE END'), 'the end kept');
+  assert.deepEqual({ ...one.tool_response, stdout: '' }, { stdout: '', stderr: 'short', exit_code: 1, interrupted: false });
+  // Three long fields and a long command: cut until the whole fits what the daemon takes.
+  const all = await post({ stdout: long, stderr: long, output: long }, `echo ${'y'.repeat(60 * 1024)}`);
+  assert.ok(Buffer.byteLength(JSON.stringify(all)) <= client.INPUT_MAX_BYTES);
+  assert.ok(all.tool_response.stdout.endsWith('THE END'));
+  assert.equal(all.tool_input.command.length, 5 + 60 * 1024, 'the command is never cut');
+  assert.equal(typeof (await post('plain output')).tool_response, 'string');
+});

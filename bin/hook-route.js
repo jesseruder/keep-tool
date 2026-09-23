@@ -22,7 +22,7 @@ const path = require('node:path');
 const mirror = require('./transcript-mirror.js');
 const { RegistryError } = require('./registry-route.js');
 
-const EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'lifecycle', 'pre-bash'];
+const EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'lifecycle', 'pre-bash', 'post-bash'];
 // A post that carries only transcript bytes: every chunk of a long delta but the last.
 const TRANSCRIPT_ONLY = 'transcript';
 const HOOK_TIMEOUT_MS = 20e3;
@@ -43,6 +43,7 @@ const HOOK_EVENT_NAMES = {
   notification: ['Notification'],
   'pre-question': ['PreToolUse'],
   'pre-bash': ['PreToolUse'],
+  'post-bash': ['PostToolUse'],
   // session-lifecycle.js EVENTS: what `keep hook lifecycle` records.
   lifecycle: ['SubagentStart', 'SubagentStop', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest',
     'UserPromptSubmit', 'Stop', 'SessionStart', 'SessionEnd', 'Interrupt'],
@@ -191,6 +192,28 @@ function cleanRepoFacts(value, home) {
   return out;
 }
 
+// What a Bash call answered, as the deploy and step-run recorders read it: its
+// output fields as strings of at most 64 KiB, its exit code, whether it was
+// interrupted. A bare string is output. Nothing else of it reaches the hook.
+function bashResponse(value) {
+  if (typeof value === 'string') return text(value, 'input.tool_response', TEXT_MAX);
+  if (!isObject(value)) refuse(400, 'input.tool_response must be an object or a string');
+  const out = {};
+  for (const key of ['stdout', 'stderr', 'output']) {
+    if (value[key] !== undefined && value[key] !== null) out[key] = text(value[key], `input.tool_response.${key}`, TEXT_MAX);
+  }
+  for (const key of ['exit_code', 'exitCode']) {
+    if (value[key] === undefined || value[key] === null) continue;
+    if (!Number.isSafeInteger(value[key])) refuse(400, `input.tool_response.${key} must be an integer`);
+    out[key] = value[key];
+  }
+  if (value.interrupted !== undefined && value.interrupted !== null) {
+    if (typeof value.interrupted !== 'boolean') refuse(400, 'input.tool_response.interrupted must be a boolean');
+    out.interrupted = value.interrupted;
+  }
+  return out;
+}
+
 // A Bash hook's tool call: the command and nothing else of its input.
 function bashInput(input, event, out, home) {
   if (input.tool_name !== 'Bash') refuse(400, `${event} is for Bash only`);
@@ -245,7 +268,10 @@ function cleanInput(event, input, sessionId, options = {}) {
     }
     if (has('tool_use_id')) out.tool_use_id = matching(input.tool_use_id, ID_RE, 'input.tool_use_id');
   }
-  if (event === 'pre-bash') bashInput(input, event, out, options.home || os.homedir());
+  if (event === 'pre-bash' || event === 'post-bash') bashInput(input, event, out, options.home || os.homedir());
+  if (event === 'post-bash' && input.tool_response !== undefined && input.tool_response !== null) {
+    out.tool_response = bashResponse(input.tool_response);
+  }
   if (event === 'lifecycle') {
     for (const key of ['agent_id', 'prompt_id', 'tool_use_id']) {
       if (has(key)) out[key] = matching(input[key], ID_RE, `input.${key}`);

@@ -204,6 +204,11 @@ function gitAt(cwd, args, options = {}) {
   return typeof output === 'string' ? output.trim() : '';
 }
 
+// Whether this checkout has the commit: a node's HEAD may be one it has not pushed.
+function localCommitExists(project, sha) {
+  try { gitAt(stepRegistry.expandProject(project), ['cat-file', '-e', `${sha}^{commit}`]); return true; } catch { return false; }
+}
+
 function resolveLocalSha(project, ref) {
   try { return gitAt(stepRegistry.expandProject(project), ['rev-parse', `${ref}^{commit}`]); } catch { die(`cannot resolve git revision "${ref}" in ${project}`); }
 }
@@ -518,7 +523,12 @@ async function finalizeStep(registry, name, step, options = {}) {
     // A daemon deploy is recorded at what the main checkout holds after it ran:
     // the run started from whatever the caller had checked out, which the pull moved on.
     const deployed = step.since === 'daemon' && !options.sha ? 'HEAD' : '';
-    const sha = resolveLocalSha(registry.project, options.sha || deployed || run && run.sha || `origin/${branch}`);
+    // A hand run on another node is recorded at the HEAD that node read (options.nodeSha),
+    // which this checkout may not have yet: kept as given and marked unverified, never
+    // replaced by a revision the run was not from, and never taken as landed.
+    const unverified = Boolean(options.nodeSha && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(String(options.sha || ''))
+      && !localCommitExists(registry.project, options.sha));
+    const sha = unverified ? options.sha : resolveLocalSha(registry.project, options.sha || deployed || run && run.sha || `origin/${branch}`);
     if (step.from === 'landed') {
       try { gitAt(stepRegistry.expandProject(registry.project), ['merge-base', '--is-ancestor', sha, `origin/${branch}`]); }
       catch { die(`${sha.slice(0, 7)} is not an ancestor of origin/${branch}; landed steps must complete from a landed revision`); }
@@ -541,6 +551,7 @@ async function finalizeStep(registry, name, step, options = {}) {
       run = {
         id: `run-${Date.now().toString(36)}`, sha, startedAt: nowStamp(), endedAt: nowStamp(), exitCode: 0,
         status: 'done', finalizedAt: nowStamp(), by, task: '', cwd: process.cwd(), logFile: '', artifact, note: options.note || '',
+        ...(unverified ? { unverified: true } : {}),
       };
       ledger.runs.push(run);
     } else {
@@ -551,6 +562,7 @@ async function finalizeStep(registry, name, step, options = {}) {
       run.finalizedAt = nowStamp();
       run.artifact = artifact;
       if (options.note) run.note = options.note;
+      if (unverified) run.unverified = true;
     }
     stepRegistry.saveLedger(registry.project, name, ledger);
     const claim = releaseStepClaim(registry.project, name, { force: options.force });

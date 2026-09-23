@@ -105,7 +105,7 @@ test('a hook post is refused unless it is a Claude event for a session and pane 
   const { hooks, calls, root } = services(t);
   const cases = [
     [AWS1, body({ event: 'pre-bash', input: { session_id: 'sess-aws1', cwd: '/x' } }), 400, /pre-bash is for Bash only/],
-    [AWS1, body({ event: 'post-bash' }), 400, /is not a hook event/],
+    [AWS1, body({ event: 'post-bash', input: { session_id: 'sess-aws1', cwd: '/x' } }), 400, /post-bash is for Bash only/],
     [AWS1, body({ identity: { agent: 'codex', sessionId: 'codex-aws1' } }), 400, /only Claude hooks/],
     [AWS1, body({ identity: { agent: 'claude', sessionId: 'sess-main' }, input: { session_id: 'sess-main', cwd: '/x' } }), 403, /session sess-main is not on node aws1/],
     [AWS1, body({ identity: { agent: 'claude', sessionId: 'nobody' }, input: { session_id: 'nobody', cwd: '/x' } }), 403, /is not on node aws1/],
@@ -821,4 +821,117 @@ test('a registered step on the daemon refuses its command on the node, by the no
   const repair = await run('keep restart-daemon');
   assert.equal(repair.status, 2);
   assert.match(repair.stderr, /keep guard: `keep restart-daemon` restarts the daemon you were launched to repair/);
+});
+
+// ---------- post-bash through the route ----------
+
+function gitIn(cwd, ...args) {
+  return require('node:child_process').execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+
+// A registry root that is a git checkout (check-ins commit), a card linked to the
+// node's session, and ~/infra as a project with a registered step.
+function recordingRegistry(t) {
+  const root = registry(t);
+  fs.writeFileSync(path.join(root, '.gitignore'), '.keep/\n');
+  gitIn(root, 'init', '-q');
+  gitIn(root, 'config', 'user.email', 'keep@example.test');
+  gitIn(root, 'config', 'user.name', 'Keep Test');
+  stepsRegistry(root);
+  const infra = path.join(root, 'infra');
+  fs.mkdirSync(infra);
+  gitIn(infra, 'init', '-q', '--initial-branch=main');
+  gitIn(infra, 'config', 'user.email', 'keep@example.test');
+  gitIn(infra, 'config', 'user.name', 'Keep Test');
+  fs.writeFileSync(path.join(infra, 'main.tf'), '# infra\n');
+  gitIn(infra, 'add', '.');
+  gitIn(infra, 'commit', '-qm', 'infra');
+  fs.writeFileSync(path.join(root, 'tasks', 'ship-card.md'), ['---', 'title: Ship it', 'status: active', 'kind: task', 'tags: [personal]',
+    `project: ${infra}`, 'sessions:', '  - id: sess-aws1', '    agent: claude', '    at: 2026-09-02T12:00',
+    'created: 2026-09-02', 'updated: 2026-09-02T12:00', '---', '', '## 2026-09-02 12:00 — check-in', 'Working.', ''].join('\n'));
+  gitIn(root, 'add', '.');
+  gitIn(root, 'commit', '-qm', 'fixture');
+  return { root, infra, card: () => fs.readFileSync(path.join(root, 'tasks', 'ship-card.md'), 'utf8') };
+}
+
+function postBody(root, command, facts, response = { stdout: '', stderr: '', interrupted: false }) {
+  const cwd = path.join(root, 'wt', 'infra', 'feature');
+  return body({
+    event: 'post-bash', idempotencyKey: `${KEY}-${Math.random().toString(36).slice(2)}`,
+    identity: { agent: 'claude', sessionId: 'sess-aws1' },
+    input: { session_id: 'sess-aws1', cwd, hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command },
+      tool_response: response, repo_facts: { paths: { [cwd]: { top: cwd, main: path.join(root, 'infra') } }, deploy: null, head: {}, ...facts } },
+  });
+}
+
+test('a post-bash post carries the call\'s response in a bounded shape', async (t) => {
+  const { hooks, calls, root } = services(t);
+  const withResponse = (response) => postBody(root, 'ls', {}, response);
+  for (const [response, message] of [
+    [{ stdout: 'x'.repeat(65 * 1024) }, /stdout is longer than/],
+    [{ exit_code: '1' }, /exit_code must be an integer/],
+    [{ interrupted: 'no' }, /interrupted must be a boolean/],
+    [7, /must be an object or a string/],
+  ]) {
+    const answer = await hooks.handle(AWS1, withResponse(response));
+    assert.equal(answer.status, 400, JSON.stringify(response));
+    assert.match(answer.body.error, message);
+  }
+  assert.equal((await hooks.handle(AWS1, withResponse({ stdout: 'out', stderr: 'err', exitCode: 0, interrupted: false, isImage: false, extra: 'x' }))).status, 200);
+  assert.deepEqual(JSON.parse(calls[0].stdin).tool_response, { stdout: 'out', stderr: 'err', exitCode: 0, interrupted: false });
+  assert.deepEqual(calls[0].args.slice(1), ['hook', 'post-bash']);
+  assert.equal(calls[0].options.env.KEEP_REPAIR, undefined);
+});
+
+test('a deploy on the node is recorded on its card with the provenance the node read', async (t) => {
+  const f = recordingRegistry(t);
+  const { hooks } = services(t, { root: f.root, realSpawn: true, env: { KEEP_PORT: '65432' } });
+  const cwd = path.join(f.root, 'wt', 'infra', 'feature');
+  const sha = 'a'.repeat(40);
+  const answer = await hooks.handle(AWS1, postBody(f.root, 'git push heroku main', {
+    deploy: { dir: cwd, repo: cwd, sha, dirty: ['scratch.txt'], branch: 'main', onOrigin: false },
+  }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(answer.body.status, 0, answer.body.stderr);
+  assert.match(f.card(), /— deployed\ndeployed aaaaaaa to heroku \(remote heroku\) — \+dirty: 1 file \(scratch\.txt\) — not on origin\/main at deploy time \(local tracking ref\) — repo ~\/wt\/infra\/feature\nCommand: `git push heroku main`/);
+  // Provenance from another directory than the one the command ran in is none at all.
+  const elsewhere = await hooks.handle(AWS1, postBody(f.root, 'git push heroku main', {
+    deploy: { dir: path.join(f.root, 'other'), repo: cwd, sha, dirty: [], branch: 'main', onOrigin: true },
+  }));
+  assert.equal(elsewhere.status, 200);
+  assert.match(f.card(), /Deployed to heroku \(remote heroku\) from ~\/wt\/infra\/feature, which is not a git checkout/);
+});
+
+test('a step run by hand on the node is recorded at the node\'s HEAD, and a sha this disk has never seen does not break the hook', async (t) => {
+  const f = recordingRegistry(t);
+  const { hooks } = services(t, { root: f.root, realSpawn: true, env: { KEEP_PORT: '65432' } });
+  const cwd = path.join(f.root, 'wt', 'infra', 'feature');
+  const claim = () => {
+    const env = { ...process.env, HOME: f.root, KEEP_DIR: f.root, KEEP_NO_PUSH: '1', KEEP_PORT: '65432', CLAUDE_CODE_SESSION_ID: 'sess-aws1' };
+    for (const key of ['CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'KEEP_PANE', 'KEEP_CONFIG']) delete env[key];
+    const out = require('node:child_process').spawnSync(process.execPath, [CLI, 'step', 'claim', '~/infra', 'apply', '--task', 'ship-card', '--for', '+30m', '-m', 'apply'],
+      { cwd: f.infra, env, encoding: 'utf8' });
+    assert.equal(out.status, 0, out.stderr);
+  };
+  const ledger = () => JSON.parse(fs.readFileSync(path.join(f.root, '.keep', 'steps', 'infra', 'apply.json'), 'utf8'));
+  // Unpushed on the node: this disk has never seen it.
+  claim();
+  const nodeOnly = 'b'.repeat(40);
+  const first = await hooks.handle(AWS1, postBody(f.root, 'terraform apply -auto-approve', { head: { [cwd]: nodeOnly } }, { stdout: 'Apply complete!', stderr: '' }));
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  assert.equal(first.body.status, 0, first.body.stderr);
+  assert.match(first.body.stderr, /recorded step apply done from bbbbbbb and released hold-/);
+  const run = ledger().runs.at(-1);
+  assert.deepEqual([run.status, run.sha, run.unverified, run.by.sessionId], ['done', nodeOnly, true, 'sess-aws1']);
+  // A sha this disk has is recorded as it always was.
+  claim();
+  const known = gitIn(f.infra, 'rev-parse', 'HEAD');
+  const second = await hooks.handle(AWS1, postBody(f.root, 'terraform apply', { head: { [cwd]: known } }, { stdout: 'Apply complete!', stderr: '' }));
+  assert.equal(second.body.status, 0, second.body.stderr);
+  const verified = ledger().runs.at(-1);
+  assert.deepEqual([verified.sha, verified.unverified], [known, undefined]);
+  // Without a claim of its own the node's run records nothing, as for a local session.
+  const unclaimed = await hooks.handle(AWS1, postBody(f.root, 'terraform apply', { head: { [cwd]: known } }));
+  assert.match(unclaimed.body.stderr, /ran by hand with no claim; the ledger is unchanged/);
+  assert.equal(ledger().runs.length, 2);
 });

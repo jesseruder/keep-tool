@@ -29,18 +29,19 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'lifecycle', 'pre-bash'];
+const EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'lifecycle', 'pre-bash', 'post-bash'];
 const BUDGET_MS = Object.freeze({
   'session-start': 8000, 'session-end': 2000, stop: 10000, notification: 3000, lifecycle: 3000, 'pre-question': 3000,
-  'pre-bash': 5000,
+  'pre-bash': 5000, 'post-bash': 3000,
 });
 // The events whose post carries no transcript bytes: the daemon's hook for them
 // reads the command and the repository facts, never the transcript, and a pre-bash
 // stands in front of every command the session runs.
-const TRANSCRIPTLESS = new Set(['pre-bash']);
+const TRANSCRIPTLESS = new Set(['pre-bash', 'post-bash']);
 // What is worth delivering late. A question's moment has passed, and a session's end
-// is answered by the pane release this node does itself.
-const QUEUED = new Set(['session-start', 'stop', 'notification', 'lifecycle']);
+// is answered by the pane release this node does itself. A post-bash only records
+// (a deploy, a step run), so it is as good late; a pre-bash is not.
+const QUEUED = new Set(['session-start', 'stop', 'notification', 'lifecycle', 'post-bash']);
 const QUEUE_MAX = 200;
 const REPLAY_MS = 5000;
 const CHUNK_BYTES = 4 * 1024 * 1024;
@@ -453,8 +454,29 @@ async function hookContext({ env, where, token, sessionId, timeoutMs = CONTEXT_F
 
 // ---------- Bash hooks ----------
 
-// A pre-bash hook: the daemon's context (the step fingerprints), the repository
-// facts for this command computed here, then the post. The input posted is
+// What a Bash call answered, cut to what the daemon takes: each output field at
+// most `max` bytes, its end kept (where a failure, and the artifact the step
+// recorder looks for, are), the exit code and whether it was interrupted.
+const RESPONSE_TEXT_MAX = 64 * 1024;
+function clipTail(value, max) {
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.length <= max) return value;
+  let start = bytes.length - max;
+  while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start += 1;
+  return bytes.subarray(start).toString('utf8');
+}
+function responseOf(value, max = RESPONSE_TEXT_MAX) {
+  if (typeof value === 'string') return clipTail(value, max);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const out = {};
+  for (const key of ['stdout', 'stderr', 'output']) if (typeof value[key] === 'string') out[key] = clipTail(value[key], max);
+  for (const key of ['exit_code', 'exitCode']) if (Number.isSafeInteger(value[key])) out[key] = value[key];
+  if (typeof value.interrupted === 'boolean') out.interrupted = value.interrupted;
+  return out;
+}
+
+// A pre-bash or post-bash hook: the daemon's context (the step fingerprints), the
+// repository facts for this command computed here, then the post. The input posted is
 // rebuilt from what the daemon's hook reads, and nothing else of the tool call.
 // Resolves as runHook does, plus `context`, what the daemon last published, so a
 // caller that has to fail closed has the fingerprints to refuse by.
@@ -491,6 +513,15 @@ async function runBashHook(event, input, where, deps = {}) {
     repo_facts: repo ? { paths: repo.paths, deploy: repo.deploy, head: repo.head } : { paths: {}, deploy: null, head: {} } };
   for (const key of ['transcript_path', 'hook_event_name', 'permission_mode', 'tool_use_id']) {
     if (input[key] !== undefined && input[key] !== null) carried[key] = input[key];
+  }
+  if (event === 'post-bash' && input.tool_response !== undefined && input.tool_response !== null) {
+    // Cut further while the whole would not fit: fitInput would otherwise drop the
+    // response, and a recorder without it cannot tell a failure.
+    for (let max = RESPONSE_TEXT_MAX; ; max = Math.floor(max / 2)) {
+      carried.tool_response = responseOf(input.tool_response, max);
+      if (jsonBytes(carried) <= INPUT_MAX_BYTES - 1024 || max <= 1024) break;
+    }
+    if (carried.tool_response === undefined) delete carried.tool_response;
   }
   const outcome = await runHook(event, carried, where, { ...deps, startedAt: started });
   return { ...(outcome || { delivered: false, why: 'this hook is not carried' }), context, incomplete };

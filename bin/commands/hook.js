@@ -578,8 +578,8 @@ async function carriedPreBash(input, where, deps = {}) {
 
 // The Claude events a node whose daemon is known (KEEP_DAEMON_URL) carries to it:
 // the daemon runs its own hook for them against the session's transcript mirror
-// (bin/hook-client.js here, bin/hook-route.js there). pre-bash goes the same way
-// with this node's repository facts (carriedPreBash).
+// (bin/hook-client.js here, bin/hook-route.js there). pre-bash and post-bash go the
+// same way with this node's repository facts (carriedPreBash, carriedPostBash).
 const CARRIED_EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'lifecycle'];
 
 async function carriedHook(kind, input, where, deps = {}) {
@@ -608,6 +608,24 @@ async function carriedHook(kind, input, where, deps = {}) {
   if (kind === 'session-start') console.log(paneOnlyNotice(where, { url: where.url, agent: 'claude' }));
 }
 
+// post-bash for a Claude session whose daemon is known: the daemon's deploy and
+// step-run recorders, on this node's repository facts. Only ever records, so a
+// daemon that does not answer has it queued and resent, and the session hears nothing.
+async function carriedPostBash(input, where, deps = {}) {
+  if (!input || input.tool_name !== 'Bash') return;
+  const command = input.tool_input && input.tool_input.command;
+  if (typeof command !== 'string' || !command) return;
+  const client = deps.hookClient || require('../hook-client.js');
+  let outcome;
+  try { outcome = await client.runBashHook('post-bash', input, where, deps); } catch { outcome = null; }
+  if (outcome && outcome.delivered) {
+    const value = outcome.value || {};
+    if (value.stdout) process.stdout.write(String(value.stdout));
+    if (value.stderr) process.stderr.write(String(value.stderr));
+    if (Number.isInteger(value.status) && value.status !== 0) process.exitCode = value.status;
+  }
+}
+
 // Every hook action on a pane-only node. Nothing below reads or writes ROOT or META.
 async function remoteHook(argv, input, where, deps = {}) {
   const env = deps.env || process.env;
@@ -616,9 +634,9 @@ async function remoteHook(argv, input, where, deps = {}) {
     process.exitCode = 2;
   };
   const kind = argv[0];
-  if (kind === 'pre-bash') {
+  if (kind === 'pre-bash' || kind === 'post-bash') {
     const remote = require('../remote-cli.js').remoteMode(env);
-    if (remote) return carriedPreBash(input, remote, deps);
+    if (remote) return (kind === 'pre-bash' ? carriedPreBash : carriedPostBash)(input, remote, deps);
   }
   if (CARRIED_EVENTS.includes(kind)) {
     const remote = require('../remote-cli.js').remoteMode(env);
@@ -1471,7 +1489,8 @@ function deployEntry(input) {
   const exitUnknown = Boolean(response && typeof response === 'object' && response.exit_unknown);
   const baseDir = input.cwd || process.cwd();
   const deployDir = deploy.dir ? path.resolve(baseDir, deploy.dir.replace(/^~(?=\/|$)/, os.homedir())) : baseDir;
-  const provenance = deployProvenance(deployDir, deploy.ref);
+  const nodeFacts = nodeRepoFacts(input);
+  const provenance = nodeFacts ? nodeDeployProvenance(nodeFacts, deployDir) : deployProvenance(deployDir, deploy.ref);
   const home = os.homedir();
   const tilde = (value) => String(value || '').split(home).join('~');
   const shownCmd = redactCommand(command);
@@ -1509,6 +1528,15 @@ function nodeRepoFacts(input) {
     deploy: facts && facts.deploy && typeof facts.deploy === 'object' ? facts.deploy : null,
     head: table(facts && facts.head),
   };
+}
+
+// The provenance a node read where the deploy ran, when it ran in the directory
+// this hook resolves from the same command; anything else is no provenance.
+function nodeDeployProvenance(nodeFacts, deployDir) {
+  const deploy = nodeFacts.deploy;
+  if (!deploy || deploy.dir !== deployDir || typeof deploy.repo !== 'string' || typeof deploy.sha !== 'string') return null;
+  return { repo: deploy.repo, sha: deploy.sha, dirty: Array.isArray(deploy.dirty) ? deploy.dirty.map(String) : [],
+    branch: typeof deploy.branch === 'string' ? deploy.branch : null, onOrigin: typeof deploy.onOrigin === 'boolean' ? deploy.onOrigin : null };
 }
 
 // ---------- gated steps run by hand ----------
@@ -2067,7 +2095,10 @@ async function recordStepRun(input) {
     return { recorded: false, failed: true };
   }
   let sha = '';
-  try {
+  const nodeFacts = nodeRepoFacts(input);
+  // A session on another node: HEAD as that node read it after the command.
+  if (nodeFacts) sha = Object.prototype.hasOwnProperty.call(nodeFacts.head, ctx.top) ? String(nodeFacts.head[ctx.top]) : '';
+  else try {
     sha = execFileSync('git', ['-C', ctx.top, 'rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 10e3, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   } catch {}
   let artifact = '';
@@ -2086,6 +2117,7 @@ async function recordStepRun(input) {
     await finalizeStep(registry, match.name, match.step, {
       sha, artifact, note: `recorded by the post-bash hook from \`${shownCmd}\``,
       expectedClaimId: claim.id,
+      ...(nodeFacts ? { nodeSha: true } : {}),
     });
     process.stderr.write(`keep: recorded step ${match.name} done from ${sha.slice(0, 7)}${artifact ? ` (${artifact})` : ''} and released ${claim.id}\n`);
     return { recorded: true, sha, artifact };
@@ -2845,6 +2877,6 @@ function stopHookChecks(input, agent, options, sid, transcript, hint) {
   return true;
 }
 
-module.exports = { commands, bindRemotePane, releaseRemotePane, remoteCommandGuard, carriedPreBash, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
+module.exports = { commands, bindRemotePane, releaseRemotePane, remoteCommandGuard, carriedPreBash, carriedPostBash, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
   openerDescription, unattendedContext, unattendedState, enforcedUnattendedState, recordedUnattended, hookHostConnect,
   UNATTENDED_DENY_REASON, UNATTENDED_STOP_REASON };
