@@ -42,6 +42,9 @@ const CADENCES = Object.freeze({
   leftovers: { cadenceMs: 5 * 60e3 },
   'limit-resume': { cadenceMs: 60e3 },
   usage: { onDemand: true },
+  // Written by bin/account-budget.js when an automation launch finds its whole pool
+  // spent, and again when one finds room. On demand: there is no tick to be late.
+  'account-budget': { onDemand: true },
   'fleet-usage': { cadenceMs: 5 * 60e3 },
   'card-usage': { cadenceMs: 30e3 },
   lint: { cadenceMs: 30 * 60e3 },

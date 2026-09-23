@@ -5002,6 +5002,7 @@ module.exports = {
   saveMeta,
   sessionLiveness,
   classifyBudget,
+  USAGE_STALE_MS,
   accountLimits,
   reviewBudget,
   reviewerAccountId,
