@@ -286,5 +286,25 @@ test("runtime paths follow BROWSER_BRIDGE_RUNTIME_DIR", () => {
   const env = { BROWSER_BRIDGE_RUNTIME_DIR: "/tmp/bb-test" };
   assert.equal(runtimeDir(env), "/tmp/bb-test");
   assert.equal(socketPath(env), "/tmp/bb-test/bridge.sock");
-  assert.match(runtimeDir({ HOME: "/Users/example" }), /Application Support\/BrowserBridge$/);
+  assert.equal(runtimeDir({ ...env, XDG_STATE_HOME: "/home/test/.state" }, "linux"), "/tmp/bb-test");
+  assert.match(runtimeDir({ HOME: "/Users/example" }, "darwin"), /Application Support\/BrowserBridge$/);
+});
+
+test("on Linux the runtime directory is the XDG state directory", () => {
+  assert.equal(runtimeDir({ HOME: "/home/test" }, "linux"), "/home/test/.local/state/browser-bridge");
+  assert.equal(
+    runtimeDir({ HOME: "/home/test", XDG_STATE_HOME: "/home/test/.state" }, "linux"),
+    "/home/test/.state/browser-bridge",
+  );
+  // The spec says a relative value is invalid and must be ignored.
+  assert.equal(
+    runtimeDir({ HOME: "/home/test", XDG_STATE_HOME: "state" }, "linux"),
+    "/home/test/.local/state/browser-bridge",
+  );
+  assert.equal(socketPath({ HOME: "/home/test" }, "linux"), "/home/test/.local/state/browser-bridge/bridge.sock");
+  // macOS ignores XDG_STATE_HOME: its paths are the ones an existing install already has.
+  assert.equal(
+    runtimeDir({ HOME: "/Users/example", XDG_STATE_HOME: "/Users/example/.state" }, "darwin"),
+    "/Users/example/Library/Application Support/BrowserBridge",
+  );
 });

@@ -317,29 +317,58 @@ export class LineDecoder {
 
 // --- runtime paths --------------------------------------------------------
 
-export function runtimeDir(env = process.env) {
+/**
+ * Where the socket, the logs, daemon.json and the launcher live. macOS keeps it under
+ * Application Support; Linux follows the XDG base directory spec's state directory, which
+ * is for exactly this (logs, sockets' neighbours, things that should survive a reboot but
+ * are not configuration). A relative XDG_STATE_HOME is invalid by that spec and is ignored.
+ *
+ * `platform` is a parameter only so the installer can plan for another machine; everything
+ * that runs here takes the default.
+ */
+export function runtimeDir(env = process.env, platform = process.platform) {
   if (env.BROWSER_BRIDGE_RUNTIME_DIR) return path.resolve(env.BROWSER_BRIDGE_RUNTIME_DIR);
-  return path.join(env.HOME || homedir(), "Library", "Application Support", "BrowserBridge");
+  const home = env.HOME || homedir();
+  if (platform === "linux") {
+    const state = env.XDG_STATE_HOME && path.isAbsolute(env.XDG_STATE_HOME)
+      ? env.XDG_STATE_HOME
+      : path.join(home, ".local", "state");
+    return path.join(state, "browser-bridge");
+  }
+  return path.join(home, "Library", "Application Support", "BrowserBridge");
 }
 
-export function socketPath(env = process.env) {
-  return path.join(runtimeDir(env), "bridge.sock");
+export function socketPath(env = process.env, platform = process.platform) {
+  return path.join(runtimeDir(env, platform), "bridge.sock");
 }
 
-export function logPath(env = process.env) {
-  return path.join(runtimeDir(env), "host.log");
+export function logPath(env = process.env, platform = process.platform) {
+  return path.join(runtimeDir(env, platform), "host.log");
 }
 
-export function screenshotsDir(env = process.env) {
-  return path.join(runtimeDir(env), "screenshots");
+export function screenshotsDir(env = process.env, platform = process.platform) {
+  return path.join(runtimeDir(env, platform), "screenshots");
 }
 
-export function configPath(env = process.env) {
-  return path.join(runtimeDir(env), "config.json");
+export function configPath(env = process.env, platform = process.platform) {
+  return path.join(runtimeDir(env, platform), "config.json");
 }
 
-export function launcherPath(env = process.env) {
-  return path.join(runtimeDir(env), "native-host");
+export function launcherPath(env = process.env, platform = process.platform) {
+  return path.join(runtimeDir(env, platform), "native-host");
+}
+
+/**
+ * The scratch profile bin/headless-edge.js runs Edge on, where no display means there is no
+ * everyday browser profile to borrow. It reads native messaging manifests from its own
+ * NativeMessagingHosts/, which is why the installer writes a copy there.
+ */
+export function edgeProfileDir(env = process.env, platform = process.platform) {
+  return path.join(runtimeDir(env, platform), "edge-profile");
+}
+
+export function edgeLogPath(env = process.env, platform = process.platform) {
+  return path.join(runtimeDir(env, platform), "edge.log");
 }
 
 // --- the shared MCP daemon ------------------------------------------------
@@ -352,17 +381,17 @@ export function launcherPath(env = process.env) {
  */
 export const DEFAULT_DAEMON_PORT = 47331;
 
-export function daemonConfigPath(env = process.env) {
-  return path.join(runtimeDir(env), "daemon.json");
+export function daemonConfigPath(env = process.env, platform = process.platform) {
+  return path.join(runtimeDir(env, platform), "daemon.json");
 }
 
-export function daemonLogPath(env = process.env) {
-  return path.join(runtimeDir(env), "daemon.log");
+export function daemonLogPath(env = process.env, platform = process.platform) {
+  return path.join(runtimeDir(env, platform), "daemon.log");
 }
 
 /** Which MCP session id had which browser sessionKey; see mcp/registry.js. */
-export function sessionsPath(env = process.env) {
-  return path.join(runtimeDir(env), "sessions.json");
+export function sessionsPath(env = process.env, platform = process.platform) {
+  return path.join(runtimeDir(env, platform), "sessions.json");
 }
 
 /**
@@ -375,10 +404,10 @@ export function sessionsPath(env = process.env) {
  * install from before it existed has a token and no secret; the daemon says so and the
  * installer adds one without touching the token.
  */
-export function readDaemonConfig(env = process.env) {
+export function readDaemonConfig(env = process.env, platform = process.platform) {
   let parsed;
   try {
-    parsed = JSON.parse(fs.readFileSync(daemonConfigPath(env), "utf8"));
+    parsed = JSON.parse(fs.readFileSync(daemonConfigPath(env, platform), "utf8"));
   } catch {
     return null;
   }
