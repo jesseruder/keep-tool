@@ -8477,6 +8477,18 @@ test('open uses host panes for both existing sessions and new Claude and Codex l
     waitForHostAgent: async () => true,
     waitForHostSessionId: async () => null,
   }), (error) => error.status === 504 && /never registered its session id/.test(error.message));
+  // A request id changes nothing on the daemon node: only a card open on another node
+  // is left pending for late adoption.
+  const named = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-named' } } : {});
+  await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'codex', requestId: 'card-request-1' }, {
+    host: named,
+    loadTask: () => ({ fm: { project, sessions: [] } }),
+    waitForHostAgent: async () => true,
+    waitForHostSessionId: async () => null,
+  }), (error) => error.status === 504 && /never registered its session id/.test(error.message));
+  const spawnMeta = named.calls.find((call) => call.type === 'spawn').params.meta;
+  assert.equal(spawnMeta.openRequestId, undefined);
+  assert.equal(named.calls.some((call) => call.type === 'list'), false, 'no dedupe listing either');
 });
 
 test('dead-session reopen compacts the ready pane before its opening message and dedupes concurrent opens', async (t) => {
@@ -16046,7 +16058,8 @@ const FAKE_CODEX = [
   '',
 ].join('\n');
 
-async function openCodexOnAws1(t, ids, after = null) {
+// `options.body` adds to the open's body; `options.deps({ project })` to its deps.
+async function openCodexOnAws1(t, ids, after = null, options = {}) {
   const { withTwoNodeFleet } = require('./fixtures/two-node-hosts.js');
   const { closeHostClient } = require('./serve');
   const { connect } = require('./hostclient.js');
@@ -16067,8 +16080,12 @@ async function openCodexOnAws1(t, ids, after = null) {
     try {
       let opened = null;
       let error = null;
+      let openBody;
+      let openDeps;
       try {
-        opened = await openSession({ fresh: true, agent: 'codex', node: 'aws1', cwd: project, accountId: codexAccount.id, requestId: 'open-codex-1' }, {
+        openBody = { fresh: true, agent: 'codex', node: 'aws1', cwd: project, accountId: codexAccount.id, requestId: 'open-codex-1', ...(options.body || {}) };
+        openDeps = {
+          ...(options.deps ? options.deps({ project }) : {}),
           root: registry, env, connectHost: connect, codexFlags: '',
           // A ZDOTDIR of empty files: the pane's login shell reads none of this machine's own
           // rc files, so nothing puts a real codex ahead of the fake on PATH.
@@ -16088,7 +16105,8 @@ async function openCodexOnAws1(t, ids, after = null) {
             } finally { client.close(); }
             throw new Error(`the fake codex never came up: ${JSON.stringify(screen).slice(-2000)}`);
           },
-        });
+        };
+        opened = await openSession(openBody, openDeps);
       } catch (caught) { error = caught; }
       const paneId = opened && opened.pane ? opened.pane.slice(0, opened.pane.lastIndexOf('@')) : null;
       outcome = {
@@ -16097,7 +16115,7 @@ async function openCodexOnAws1(t, ids, after = null) {
         authority: (id) => { try { return JSON.parse(fs.readFileSync(path.join(registry, '.keep', 'session-accounts', `${id}.json`), 'utf8')); } catch { return null; } },
       };
       outcome.authorities = ids.map((id) => outcome.authority(id));
-      if (after) outcome.after = await after({ opened, registry, env, aws1, paneId, connect });
+      if (after) outcome.after = await after({ opened, registry, env, aws1, paneId, connect, open: () => openSession(openBody, openDeps) });
     } finally { await closeHostClient(); }
   });
   return outcome;
@@ -16153,6 +16171,48 @@ test('a fresh Codex on aws1 left pending is adopted later by the routes from the
   assert.equal(after.launch.accountId, 'codex-node');
   assert.equal(after.adopted.adopted, true, JSON.stringify(after.adopted));
   assert.equal(after.again, null, 'used once');
+});
+
+test('a fresh Codex card open on aws1 with no message returns pending with a launch record naming the card, and a retry reuses its pane', async (t) => {
+  const linked = [];
+  const released = [];
+  const { error, opened, paneMeta, after } = await openCodexOnAws1(t, [], async ({ registry, open }) => {
+    const launch = require('./late-adoption.js').readNodeCodexLaunch(registry, 'aws1', 'open-codex-1');
+    const again = await open();
+    return { launch, again };
+  }, {
+    body: { taskId: 'card', requester: 'handing-session' },
+    deps: ({ project }) => ({
+      loadTask: () => ({ id: 'card', fm: { project, sessions: [] } }),
+      linkLaunchedSession: (cardId, entry) => { linked.push({ cardId, entry }); return true; },
+      releaseCardSession: (cardId, requester) => { released.push({ cardId, requester }); return true; },
+    }),
+  });
+  assert.equal(error, null, error && error.stack);
+  assert.equal(opened.sessionId, null);
+  assert.equal(opened.pendingRegistration, true);
+  assert.equal(opened.card, 'card');
+  assert.match(opened.registrationNote, /no Codex rollout begun/);
+  assert.match(opened.pane, /@aws1$/);
+  assert.equal(opened.node, 'aws1');
+  assert.deepEqual(linked, [], 'nothing linked yet: late adoption links it when it registers');
+  assert.deepEqual(released, [], 'and the handing session keeps the card until then');
+  assert.equal(opened.unlinked, undefined);
+  assert.equal(paneMeta.openRequestId, 'open-codex-1');
+  assert.equal(paneMeta.card, 'card');
+  assert.equal(after.launch.card, 'card', 'the record names the card');
+  assert.equal(after.launch.requester, 'handing-session');
+  assert.equal(after.launch.pane, opened.pane.slice(0, opened.pane.lastIndexOf('@')));
+  // What `keep open` prints for it.
+  assert.equal(require('./keep.js').formatOpenResult(opened),
+    `opened pane ${opened.pane} on node aws1: ${opened.command} on codex-node; its session is pending: it registers at its first turn and is then linked to card`);
+  // The same request again finds its pane rather than starting a second Codex.
+  assert.equal(after.again.existing, true);
+  assert.equal(after.again.pane.split('@')[0], opened.pane.split('@')[0]);
+  assert.equal(after.again.pendingRegistration, true);
+  assert.equal(after.again.card, 'card');
+  assert.equal(require('./keep.js').formatOpenResult(after.again),
+    `pane ${after.again.pane} on node aws1 is already running this open; its session is pending: it registers at its first turn and is then linked to card; open it in the console`);
 });
 
 test('a fresh Codex on aws1 whose launch began no rollout, or two, is not adopted and stays pending', async (t) => {

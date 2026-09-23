@@ -9762,9 +9762,12 @@ async function openSession(body, deps = {}) {
     throw new InjectionError(400, 'needs must be a capability name');
   }
   const needs = body.needs == null ? [] : [String(body.needs).trim()];
-  if (freshStandalone && body.requestId && !deps.freshOpenClaimed) {
+  // A card open with a request id joins the same in-flight dedupe: a fresh Codex card
+  // open on another node can return pending, and a retry of it must not start a second.
+  if ((freshStandalone || (body.taskId && !body.sessionId)) && body.requestId && !deps.freshOpenClaimed) {
     const identity = JSON.stringify({ cwd: body.cwd, agent: body.agent, accountId: body.accountId,
-      model: body.model || '', node: body.node || '', needs: body.needs || '' });
+      model: body.model || '', node: body.node || '', needs: body.needs || '',
+      ...(body.taskId ? { taskId: body.taskId, fresh: body.fresh === true, message: body.message || '' } : {}) });
     const running = freshOpenOperations.get(body.requestId);
     if (running) {
       if (running.identity !== identity) throw new InjectionError(409, 'open request is already launching a different selection');
@@ -9975,13 +9978,22 @@ async function openSession(body, deps = {}) {
       && !fs.existsSync(path.join(os.homedir(), '.pi', 'agent', 'extensions', 'keep.ts'))) {
     throw new InjectionError(409, 'Pi Keep extension is not installed at ~/.pi/agent/extensions/keep.ts');
   }
-  const allowPendingRegistration = freshStandalone && agent === 'codex' && !message && Boolean(body.requestId)
+  // A fresh card open on another node, named by a request id: it has no session yet,
+  // so it may register late (below), and a retry with the same id finds its pane.
+  const nodeCardRequest = Boolean(body.taskId) && !session && Boolean(body.requestId)
+    && launchNode !== nodes.daemonNode(deps.env || process.env);
+  // A fresh Codex with no opening message names its session only at its first turn,
+  // which may come long after the open returns: the open returns pending instead of
+  // failing. Standalone, anywhere; on a card, only on another node (on the daemon node
+  // a card open still waits for its session and fails without one, as it always has).
+  const allowPendingRegistration = (freshStandalone || nodeCardRequest) && agent === 'codex' && !message
+    && Boolean(body.requestId)
     && !body.portableTransferId && !body.reviewQueueLaunchId
     && !deps.onSessionReady && !deps.onOpeningReady && !deps.onOpeningDelivered;
   const deferReadiness = freshStandalone && agent === 'claude' && !message
     && !body.portableTransferId && !body.reviewQueueLaunchId
     && !deps.onSessionReady && !deps.onOpeningReady && !deps.onOpeningDelivered;
-  if (freshStandalone && body.requestId) {
+  if ((freshStandalone || nodeCardRequest) && body.requestId) {
     const listed = await hostPanesForAction(deps, true);
     if (!Array.isArray(listed.panes)) throw hostPaneVerificationError('Open request identity', listed, 503);
     const panes = listed.panes;
@@ -9995,6 +10007,8 @@ async function openSession(body, deps = {}) {
           // The machine is part of what was asked for: a pane on another node is not
           // this request already satisfied, it is a different request wearing its id.
           || (existing.node || nodes.daemonNode(deps.env || process.env)) !== launchNode
+          // A card's request is that card's: the same id on another card, or on none, is not it.
+          || (existing.meta?.card || null) !== (body.taskId || null)
           || !Number.isFinite(Number(existing.meta?.launchedAt))) {
         throw new InjectionError(409, 'open request was already used for a different launch');
       }
@@ -10034,7 +10048,7 @@ async function openSession(body, deps = {}) {
         accountId: account.id, accountLabel: account.label,
         ...(accountNote ? { accountNote } : {}), ...(accountWarning ? { accountWarning } : {}),
         agent, recoverable: existing.agentAlive === false,
-        ...(!sessionId && allowPendingRegistration ? { pendingRegistration: true } : {}) };
+        ...(!sessionId && allowPendingRegistration ? { pendingRegistration: true, ...(body.taskId ? { card: body.taskId } : {}) } : {}) };
     }
   }
   // Launched Claude sessions match Owner's permission-mode class so peer
@@ -10157,7 +10171,7 @@ async function openSession(body, deps = {}) {
         requester: body.requester || null,
         ...(body.portableTransferId ? { portableTransferId: body.portableTransferId } : {}),
         ...(body.reviewQueueLaunchId ? { reviewQueueLaunchId: body.reviewQueueLaunchId } : {}),
-        ...(freshStandalone && body.requestId ? { openRequestId: body.requestId } : {}),
+        ...((freshStandalone || nodeCardRequest) && body.requestId ? { openRequestId: body.requestId } : {}),
         // A standalone console launch is actionable before Codex has written the
         // transcript that gives it a session id. Publish that short-lived readiness
         // from the pane itself. Automated opening delivery is marked separately so a
@@ -10309,8 +10323,12 @@ async function openSession(body, deps = {}) {
   }
   const handoff = Boolean(body.taskId) && !session;
   let releasePending = handoff && Boolean(body.requester);
+  // A card open left pending keeps the requester on the card until its session is:
+  // late adoption releases it once it links the new one (the launch record names it).
+  let releaseWithSession = false;
   const release = () => {
     if (!releasePending) return;
+    if (releaseWithSession && !launch.sessionId) return;
     try {
       if ((deps.releaseCardSession || keep.releaseCardSession)(body.taskId, body.requester)) {
         launch.unlinked = body.requester;
@@ -10347,8 +10365,11 @@ async function openSession(body, deps = {}) {
         (deps.recordNodeCodexLaunch || require('./late-adoption.js').recordNodeCodexLaunch)(deps.root || keep.ROOT, {
           node: launchNode, requestId: body.requestId, accountId: account.id, launchedAt,
           pane: nodes.parsePaneRef(launch.pane, { env: deps.env || process.env }).paneId, project,
+          // A card open: late adoption puts the session on the card when it registers.
+          ...(body.taskId ? { card: body.taskId } : {}), ...(body.taskId && body.requester ? { requester: body.requester } : {}),
         });
         nodeLaunchRecorded = true;
+        if (body.taskId) releaseWithSession = true;
       } catch (error) {
         process.stderr.write(`keep serve: could not record the Codex launch in ${launch.pane}: ${error.message}\n`);
       }
@@ -10388,7 +10409,11 @@ async function openSession(body, deps = {}) {
         consumeNodeLaunch();
         if (!adopted.sessionId) launch.registrationNote = adopted.why;
       }
-      if (!launch.sessionId) launch.pendingRegistration = true;
+      if (!launch.sessionId) {
+        launch.pendingRegistration = true;
+        // Late adoption puts the session on this card when it registers.
+        if (body.taskId) launch.card = body.taskId;
+      }
     } else if (!launch.sessionId && (handoff || freshStandalone || deps.onSessionReady)) {
       launch.sessionId = await (deps.waitForHostSessionId || waitForHostSessionId)(launch.pane, deps);
       let adoption = null;
@@ -10451,7 +10476,8 @@ async function openSession(body, deps = {}) {
         throw new InjectionError(409, 'opening-message reservation changed after instructions were sent');
       }
     }
-    if (!launch.sessionId && handoff) {
+    // A card open left pending is linked by late adoption when its session registers.
+    if (!launch.sessionId && handoff && !launch.pendingRegistration) {
       launch.sessionId = await (deps.waitForHostSessionId || waitForHostSessionId)(launch.pane, deps);
       if (!launch.sessionId) {
         throw new InjectionError(504, `${agent} started in host pane ${launch.pane} but never registered its session id`);

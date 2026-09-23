@@ -1047,6 +1047,10 @@ test('open CLI posts card or session identity and formats one-line results', asy
   await openCommand(['card', '--fresh', '--agent', 'codex'], deps);
   await openCommand(['sid'], deps);
   await openCommand(['card', '--fresh', '-m', 'Work the batch'], deps);
+  // A card open names itself with a fresh request id each time; a session open does not.
+  assert.match(calls[0].body.requestId, /^[0-9a-f-]{36}$/);
+  assert.notEqual(calls[0].body.requestId, calls[2].body.requestId);
+  for (const call of calls) delete call.body.requestId;
   assert.deepEqual(calls[0], { url: '/api/open', body: { taskId: 'card', fresh: true, agent: 'codex', accountPolicy: 'auto', requester: 'me' } });
   assert.equal(calls[1].body.sessionId, 'sid');
   assert.equal(calls[1].body.message, undefined);
@@ -1065,10 +1069,17 @@ test('open CLI posts card or session identity and formats one-line results', asy
     'opened pane p1@aws1 on node aws1: claude as new');
   assert.equal(formatOpenResult({ existing: true, pane: 'p1@aws1', node: 'aws1', sessionId: 'sid' }),
     'session sid is running in pane p1@aws1 on node aws1; open it in the console');
+  // A fresh Codex on a node that has not named its session yet, on a card or not.
+  assert.equal(formatOpenResult({ created: 'pane', pane: 'p1@aws1', node: 'aws1', command: 'codex', sessionId: null, accountId: 'codex-a', pendingRegistration: true, card: 'card' }),
+    'opened pane p1@aws1 on node aws1: codex on codex-a; its session is pending: it registers at its first turn and is then linked to card');
+  assert.equal(formatOpenResult({ created: 'pane', pane: 'p1@aws1', node: 'aws1', command: 'codex', sessionId: null, pendingRegistration: true }),
+    'opened pane p1@aws1 on node aws1: codex; its session is pending: it registers at its first turn');
+  assert.equal(formatOpenResult({ existing: true, pane: 'p1', node: 'aws1', sessionId: null, pendingRegistration: true, card: 'card' }),
+    'pane p1 on node aws1 is already running this open; its session is pending: it registers at its first turn and is then linked to card; open it in the console');
   await assert.rejects(openCommand(['card', '-m', '  '], deps), /-m needs a message/);
   deps.currentSession = () => ({ id: 'me', agent: 'claude' });
-  await openCommand(['card', '--fresh', '--model', 'claude-fable-5-1'], deps);
-  assert.deepEqual(calls.at(-1).body, { taskId: 'card', fresh: true, agent: undefined, accountPolicy: 'auto', model: 'claude-fable-5-1', requester: 'me' });
+  await openCommand(['card', '--fresh', '--model', 'claude-fable-5-1'], { ...deps, requestId: 'fixed-request-id' });
+  assert.deepEqual(calls.at(-1).body, { taskId: 'card', fresh: true, agent: undefined, accountPolicy: 'auto', model: 'claude-fable-5-1', requester: 'me', requestId: 'fixed-request-id' });
   await openCommand(['card', '--fresh', '--agent', 'codex', '--model', 'gpt-5.6-sol'], deps);
   assert.equal(calls.at(-1).body.model, 'gpt-5.6-sol');
   await assert.rejects(openCommand(['card', '--model', 'opus; rm -rf /'], deps), /--model must be a model id/);

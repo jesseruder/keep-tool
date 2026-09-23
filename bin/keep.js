@@ -3169,6 +3169,11 @@ function formatOpenResult(result) {
   // Only when it is not this machine: a single-node install never mentions a node,
   // because it has never had to.
   const onNode = result.node ? ` on node ${result.node}` : '';
+  // A fresh Codex on another node that has not named its session yet: it does at its
+  // first turn, and a card open's session is put on the card then.
+  const pending = result.pendingRegistration && !result.sessionId
+    ? `; its session is pending: it registers at its first turn${result.card ? ` and is then linked to ${result.card}` : ''}` : '';
+  if (result.existing && result.pane && pending) return `pane ${result.pane}${onNode} is already running this open${pending}; open it in the console`;
   if (result.existing && result.pane) return `session ${openedSessionName(result)} is running in pane ${result.pane}${onNode}; open it in the console${sent}`;
   const session = result.sessionId ? ` as ${openedSessionName(result)}` : '';
   // The account id, not its label: it is what `--account` takes back.
@@ -3179,7 +3184,7 @@ function formatOpenResult(result) {
   const tail = handoff.length ? `; ${handoff.join(', ')}` : '';
   // Only an auto-selected open that had to pass over an account carries a note.
   const note = result.accountNote ? `\n${result.accountNote}` : '';
-  if (result.created === 'pane') return `opened pane ${result.pane}${onNode}: ${result.command}${session}${on}${sent}${tail}${note}`;
+  if (result.created === 'pane') return `opened pane ${result.pane}${onNode}: ${result.command}${session}${on}${sent}${tail}${pending}${note}`;
   return `opened session${session}${on}${sent}${tail}${note}`;
 }
 
@@ -3286,6 +3291,10 @@ commands.open = async (argv, deps = {}) => {
     if (o.node != null) payload.node = o.node;
     if (o.needs != null) payload.needs = String(o.needs).trim();
     if (message != null) payload.message = message;
+    // A card open names itself, as the console's does: a fresh Codex on another node
+    // may return pending, and the daemon records the launch under this id so the
+    // session is put on the card when it registers.
+    if (task) payload.requestId = deps.requestId || require('node:crypto').randomUUID();
     // The launching session hands the card over; the daemon unlinks it once the new session is on the card.
     const self = (deps.currentSession || currentSession)();
     if (task && self && self.id) payload.requester = self.id;
