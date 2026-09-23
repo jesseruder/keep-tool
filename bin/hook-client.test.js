@@ -34,7 +34,7 @@ async function stubDaemon(t, answer) {
     req.on('end', () => {
       const body = data ? JSON.parse(data) : {};
       posts.push({ url: req.url, token: req.headers['x-keep-node-token'], body });
-      const result = answer(body, posts.length);
+      const result = answer(body, posts.length, req.url);
       if (result === 'hang') { hung.push(res); return; }
       res.writeHead(result.status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(result.body));
@@ -385,4 +385,75 @@ test('another session\'s queued events do not hold this session\'s event back', 
   assert.equal(result.stdout, 'context\n');
   assert.deepEqual(daemon.posts.map((post) => post.body.event), ['notification', 'session-start']);
   assert.deepEqual(f.queue().map((entry) => entry.body.identity.sessionId), ['sess-other']);
+});
+
+// ---------- pre-bash ----------
+
+const CONTEXT = { status: 200, body: { steps: ['terraform apply'], repairSession: false } };
+
+test('a pre-bash asks for the context, posts the command with this node\'s repository facts and no transcript, and prints the daemon\'s decision', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.transcript, '{"n":1}\n');
+  const refusal = 'keep guard: `terraform apply` is step apply on ~/infra\n';
+  const daemon = await stubDaemon(t, (body, n, url) => (url.startsWith('/api/hook/context') ? CONTEXT
+    : { status: 200, body: { ok: false, status: /terraform/.test(body.input.tool_input.command) ? 2 : 0, stdout: '', stderr: /terraform/.test(body.input.tool_input.command) ? refusal : '', replayed: false } }));
+  const bash = (command, extra = {}) => f.hook('pre-bash', daemon.url, { cwd: f.home, hook_event_name: 'PreToolUse', tool_name: 'Bash',
+    tool_input: { command, description: 'x', timeout: 1000 } }, extra);
+  const refused = await bash('cd ~ && terraform apply', { KEEP_STEP_OK: '0', KEEP_REPAIR: '1' });
+  assert.deepEqual(refused, { status: 2, stdout: '', stderr: refusal });
+  assert.deepEqual(daemon.posts.map((post) => post.url), ['/api/hook/context?session=sess-aws1', '/api/hook']);
+  const post = daemon.posts[1].body;
+  assert.equal(post.event, 'pre-bash');
+  assert.equal(post.transcript, null, 'no transcript bytes');
+  assert.deepEqual(post.input, { session_id: 'sess-aws1', cwd: f.home, tool_name: 'Bash', tool_input: { command: 'cd ~ && terraform apply' },
+    repo_facts: { paths: { [f.home]: { top: null, main: null } }, deploy: null, head: {} }, transcript_path: f.transcript, hook_event_name: 'PreToolUse' });
+  assert.deepEqual(post.identity.env, { KEEP_STEP_OK: '0' }, 'the session\'s bypass, never KEEP_REPAIR');
+  const plain = await bash('ls');
+  assert.deepEqual(plain, { status: 0, stdout: '', stderr: '' });
+  assert.equal(daemon.posts.filter((entry) => entry.url.startsWith('/api/hook/context')).length, 1, 'the context from the cache');
+  // The raw-resume guard answers here, before anything is asked.
+  const before = daemon.posts.length;
+  const resumed = await bash('claude --resume abc');
+  assert.equal(resumed.status, 2);
+  assert.match(resumed.stderr, /raw claude --resume bypasses Keep's launcher/);
+  assert.equal(daemon.posts.length, before);
+  assert.deepEqual(f.queue(), [], 'a pre-bash is never queued');
+});
+
+test('a daemon that does not answer a pre-bash refuses what it could have refused and lets the rest through', async (t) => {
+  const f = fixture(t);
+  const cache = path.join(f.home, '.keep-node', 'hook-context.json');
+  fs.mkdirSync(path.dirname(cache), { recursive: true });
+  fs.writeFileSync(cache, JSON.stringify({ at: 1, steps: ['terraform apply'], sessions: { 'sess-aws1': { repairSession: true, at: 1 } } }));
+  const url = await closedUrl();
+  const bash = (target, command, extra) => f.hook('pre-bash', target, { cwd: f.home, tool_name: 'Bash', tool_input: { command } }, extra);
+  const step = await bash(url, 'terraform apply');
+  assert.equal(step.status, 2);
+  assert.match(step.stderr, /^keep: the daemon on main did not answer this command's guard \(.*\), so `terraform apply`, a gated step's command, is refused here; run it again once the daemon answers\. KEEP_STEP_OK=1 bypasses the guard\.\n$/);
+  const deploy = await bash(url, 'git push heroku main');
+  assert.equal(deploy.status, 2);
+  assert.match(deploy.stderr, /did not answer this command's guard .*, so a deploy to heroku \(remote heroku\) is refused here/);
+  // The last word on this session was that it is a repair session.
+  const restart = await bash(url, 'keep restart-daemon');
+  assert.equal(restart.status, 2);
+  assert.match(restart.stderr, /and this is a self-repair session; keep guard: `keep restart-daemon` restarts the daemon/);
+  assert.equal((await bash(url, 'terraform apply', { KEEP_STEP_OK: '1' })).status, 0, 'the bypass holds as it does locally');
+  const plain = await bash(url, 'ls -la');
+  assert.deepEqual(plain, { status: 0, stdout: '', stderr: '' });
+  assert.deepEqual(f.queue(), []);
+
+  // A daemon that hangs: refused inside the budget.
+  const slow = await stubDaemon(t, () => 'hang');
+  const began = Date.now();
+  const late = await bash(slow.url, 'terraform apply');
+  assert.equal(late.status, 2, late.stderr);
+  assert.ok(Date.now() - began < 8000, 'bounded');
+  const allowed = await bash(slow.url, 'ls');
+  assert.equal(allowed.status, 0);
+  // A refusal of the post (here: the daemon has no such route yet) reads the same as no answer.
+  const old = await stubDaemon(t, (body, n, target) => (target.startsWith('/api/hook/context') ? { status: 404, body: { error: 'not found' } } : { status: 400, body: { error: '"pre-bash" is not a hook event' } }));
+  const refusedOld = await bash(old.url, 'terraform apply');
+  assert.equal(refusedOld.status, 2);
+  assert.match(refusedOld.stderr, /is not a hook event/);
+  assert.equal((await bash(old.url, 'ls')).status, 0);
 });

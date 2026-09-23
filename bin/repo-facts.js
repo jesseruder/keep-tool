@@ -87,7 +87,8 @@ function computeRepoFacts({ cwd, command, event, fingerprints = [], home = os.ho
     }
   };
   const text = typeof command === 'string' ? command : '';
-  const base = typeof cwd === 'string' && path.isAbsolute(cwd) ? path.resolve(cwd) : process.cwd();
+  // As given, not normalised: the daemon's hook looks the cwd up by the same string.
+  const base = typeof cwd === 'string' && path.isAbsolute(cwd) ? cwd : process.cwd();
   // The prefilter: only a command that could be a step or a deploy is worth more
   // than its cwd. Every cd target counts, wherever the step turns out to be.
   const step = fingerprintMatch(text, fingerprints);

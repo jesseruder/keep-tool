@@ -104,7 +104,7 @@ test('the hook route is on the node API only, beside the registry route', async 
 test('a hook post is refused unless it is a Claude event for a session and pane on the calling node', async (t) => {
   const { hooks, calls, root } = services(t);
   const cases = [
-    [AWS1, body({ event: 'pre-bash' }), 400, /is not a hook event/],
+    [AWS1, body({ event: 'pre-bash', input: { session_id: 'sess-aws1', cwd: '/x' } }), 400, /pre-bash is for Bash only/],
     [AWS1, body({ event: 'post-bash' }), 400, /is not a hook event/],
     [AWS1, body({ identity: { agent: 'codex', sessionId: 'codex-aws1' } }), 400, /only Claude hooks/],
     [AWS1, body({ identity: { agent: 'claude', sessionId: 'sess-main' }, input: { session_id: 'sess-main', cwd: '/x' } }), 403, /session sess-main is not on node aws1/],
@@ -716,4 +716,109 @@ test('a node asks for the hook context at most once a minute, and keeps the last
   // Nothing ever said: no fingerprints, and nothing known of the session.
   assert.deepEqual(await client.hookContext({ env: { HOME: tempDir(t) }, where, token: 't', sessionId: 'sess-aws1', deps }),
     { steps: [], repairSession: null, fresh: false });
+});
+
+// ---------- pre-bash through the route ----------
+
+function bashBody(root, command, extra = {}) {
+  const cwd = path.join(root, 'wt', 'infra', 'feature');
+  return body({
+    event: 'pre-bash', idempotencyKey: `${KEY}-${Math.random().toString(36).slice(2)}`,
+    identity: { agent: 'claude', sessionId: 'sess-aws1', ...(extra.identity || {}) },
+    input: { session_id: 'sess-aws1', cwd, hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_use_id: 'toolu_1',
+      tool_input: { command, description: 'dropped', timeout: 5 },
+      // The node's worktree of ~/infra, which is not on this disk at all: only its facts say where it is.
+      repo_facts: extra.facts || { paths: { [cwd]: { top: cwd, main: path.join(root, 'infra') } }, deploy: null, head: {} } },
+  });
+}
+
+test('a pre-bash post is refused unless it is a Bash command with repository facts of the right shape', async (t) => {
+  const { hooks, calls, root } = services(t);
+  const cwd = path.join(root, 'wt', 'infra', 'feature');
+  const facts = (value) => bashBody(root, 'ls', { facts: value });
+  const withInput = (patch) => { const request = bashBody(root, 'ls'); Object.assign(request.input, patch); return request; };
+  const cases = [
+    [withInput({ tool_name: 'Read' }), /pre-bash is for Bash only/],
+    [withInput({ tool_input: 'ls' }), /tool_input must be an object/],
+    [withInput({ tool_input: { command: 'x'.repeat(65 * 1024) } }), /tool_input.command is longer than/],
+    [withInput({ repo_facts: undefined }), /repo_facts is required/],
+    [withInput({ hook_event_name: 'PostToolUse' }), /is not a pre-bash event/],
+    [facts({ paths: { '/etc': { top: null, main: null } } }), /must be under the home/],
+    [facts({ paths: { [cwd]: { top: '/opt/x', main: null } } }), /repo_facts top must be under the home/],
+    [facts({ paths: { [cwd]: { top: `${root}/../x`, main: null } } }), /may not contain \.\./],
+    [facts({ paths: { [cwd]: 'top' } }), /entry must be an object/],
+    [facts({ paths: Object.fromEntries(Array.from({ length: 9 }, (_, i) => [path.join(root, `d${i}`), { top: null, main: null }])) }), /more than 8 paths/],
+    [facts({ head: { [cwd]: 'HEAD' } }), /invalid repo_facts.head sha/],
+    [facts({ deploy: { dir: cwd, repo: cwd, sha: 'a'.repeat(40), dirty: [], branch: 'main; rm -rf', onOrigin: true } }), /invalid repo_facts.deploy.branch/],
+    [facts({ deploy: { dir: cwd, repo: cwd, sha: 'a'.repeat(40), dirty: ['x'.repeat(3000), 'y'.repeat(3000)], branch: 'main', onOrigin: true } }), /dirty is longer than 4096/],
+    [facts({ deploy: { dir: cwd, repo: cwd, sha: 'a'.repeat(40), dirty: [], branch: 'main', onOrigin: 'yes' } }), /onOrigin must be a boolean/],
+  ];
+  for (const [request, message] of cases) {
+    const answer = await hooks.handle(AWS1, request);
+    assert.equal(answer.status, 400, `${JSON.stringify(request.input).slice(0, 200)}: ${JSON.stringify(answer.body)}`);
+    assert.match(answer.body.error, message);
+  }
+  assert.equal(calls.length, 0, 'nothing ran');
+
+  // A good one reaches the hook with the command, the facts and nothing else of the call.
+  const good = bashBody(root, 'ls');
+  assert.equal((await hooks.handle(AWS1, good)).status, 200);
+  const input = JSON.parse(calls[0].stdin);
+  assert.deepEqual(input.tool_input, { command: 'ls' });
+  assert.deepEqual(input.repo_facts, { paths: { [cwd]: { top: cwd, main: path.join(root, 'infra') } }, deploy: null, head: {} });
+  assert.equal(input.tool_use_id, 'toolu_1');
+  assert.deepEqual(calls[0].args.slice(1), ['hook', 'pre-bash']);
+});
+
+test('KEEP_REPAIR reaches a node\'s pre-bash only from the daemon\'s own repair record', async (t) => {
+  let card = '';
+  const { hooks, calls, root } = services(t, { cardForSession: () => card });
+  const post = async (env) => {
+    const answer = await hooks.handle(AWS1, bashBody(root, 'keep restart-daemon', { identity: { env } }));
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    return calls.at(-1).options.env;
+  };
+  const forwarded = await post({ KEEP_REPAIR: '1', KEEP_STEP_OK: '1', KEEP_RAW_CLAUDE: '1' });
+  assert.equal(forwarded.KEEP_REPAIR, undefined, 'the node\'s word is dropped');
+  assert.equal(forwarded.KEEP_STEP_OK, '1', 'the session\'s own bypasses are forwarded');
+  assert.equal(forwarded.KEEP_RAW_CLAUDE, '1');
+  card = 'repair-card';
+  assert.equal((await post({})).KEEP_REPAIR, '1', 'the daemon launched it to repair itself');
+  // Only a pre-bash carries it.
+  await hooks.handle(AWS1, body({ idempotencyKey: `${KEY}-stop` }));
+  assert.equal(calls.at(-1).options.env.KEEP_REPAIR, undefined);
+});
+
+test('a registered step on the daemon refuses its command on the node, by the node\'s facts, and lets the rest through', async (t) => {
+  const root = registry(t);
+  stepsRegistry(root);
+  let card = '';
+  const { hooks } = services(t, { root, realSpawn: true, cardForSession: () => card });
+  const run = async (command, extra) => {
+    const answer = await hooks.handle(AWS1, bashBody(root, command, extra));
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    return answer.body;
+  };
+  const refused = await run('terraform apply -auto-approve');
+  assert.equal(refused.status, 2, refused.stderr);
+  assert.match(refused.stderr, /^keep guard: `terraform apply` is step apply on ~\/infra, which runs through Keep/);
+  // Walking into it from elsewhere on the node is the same command.
+  const home = root;
+  const walked = await run(`cd ${path.join(home, 'wt', 'infra', 'feature')} && terraform apply`, { facts: { paths: {
+    [path.join(root, 'wt', 'infra', 'feature')]: { top: path.join(root, 'wt', 'infra', 'feature'), main: path.join(root, 'infra') },
+  } } });
+  assert.equal(walked.status, 2, walked.stderr);
+  // Without the facts the daemon knows nothing of the node's worktree: the facts are what decided.
+  assert.equal((await run('terraform apply', { facts: { paths: {} } })).status, 0);
+  assert.equal((await run('terraform apply', { identity: { env: { KEEP_STEP_OK: '1' } } })).status, 0, 'the session\'s own bypass');
+  const plain = await run('ls -la && git status');
+  assert.deepEqual([plain.status, plain.stdout, plain.stderr], [0, '', '']);
+  // The resume guard holds on the daemon too.
+  assert.equal((await run('claude --resume abc')).status, 2);
+  // A repair session's restart: refused only when the daemon says it is one.
+  assert.equal((await run('keep restart-daemon', { identity: { env: { KEEP_REPAIR: '1' } } })).status, 0);
+  card = 'repair-card';
+  const repair = await run('keep restart-daemon');
+  assert.equal(repair.status, 2);
+  assert.match(repair.stderr, /keep guard: `keep restart-daemon` restarts the daemon you were launched to repair/);
 });

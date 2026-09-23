@@ -490,34 +490,96 @@ async function releaseRemotePane(input, deps = {}) {
 // a guard that cannot answer refuses rather than allows: a command the step registry
 // could gate (a deploy) is refused, and a repair session is never let through by a
 // land record nobody here can read.
-function remoteCommandGuard(input, where, env = process.env) {
+//
+// A Claude session whose daemon is known asks the daemon first (carriedPreBash);
+// this is then what it falls back on when the daemon did not answer, with
+// `options.unanswered` saying why, `options.steps` the step fingerprints the daemon
+// last published (a command that matches one is refused as well), and
+// `options.repairSession` the daemon's last word on whether this is a repair session.
+function remoteCommandGuard(input, where, env = process.env, options = {}) {
   const resume = guardResumeCommand(input, env);
   if (resume.deny) return resume;
   if (!input || input.tool_name !== 'Bash') return { deny: false, reason: '' };
   const command = input.tool_input && input.tool_input.command;
   if (!command) return { deny: false, reason: '' };
-  if (env.KEEP_REPAIR === '1') {
-    const repair = guardRepairCommand(input, env, { selfRepair: { cardForSession: () => null, landedFor: () => null } });
+  const unanswered = options.unanswered ? `the daemon on ${where.daemon} did not answer this command's guard (${options.unanswered})` : '';
+  if (env.KEEP_REPAIR === '1' || options.repairSession === true) {
+    const repair = guardRepairCommand(input, { ...env, KEEP_REPAIR: '1' }, { selfRepair: { cardForSession: () => null, landedFor: () => null } });
     if (repair.deny) {
-      return { deny: true, reason: `keep: the self-repair land record is not available on node ${where.local}; ${repair.reason}` };
+      return { deny: true, reason: unanswered
+        ? `keep: ${unanswered}, and this is a self-repair session; ${repair.reason}`
+        : `keep: the self-repair land record is not available on node ${where.local}; ${repair.reason}` };
     }
   }
   if (env.KEEP_STEP_OK !== '1') {
     let deploy = null;
     try { deploy = deployCommand(command); } catch { deploy = { target: 'this command' }; }
+    if (deploy && unanswered) {
+      return { deny: true, reason: `keep: ${unanswered}, so a deploy to ${deploy.target} is refused here; run it again once `
+        + `the daemon answers. KEEP_STEP_OK=1 bypasses the guard.` };
+    }
     if (deploy) {
       return { deny: true, reason: `keep: the step guard is not available on node ${where.local} (its registry is on `
         + `${where.daemon}), so a deploy to ${deploy.target} is refused here; run it from a session on ${where.daemon}. `
+        + 'KEEP_STEP_OK=1 bypasses the guard.' };
+    }
+    let step = null;
+    try { step = options.steps ? require('../repo-facts.js').fingerprintMatch(command, options.steps) : null; } catch { step = { fingerprint: command }; }
+    if (step) {
+      return { deny: true, reason: `keep: ${unanswered || `the step guard on ${where.daemon} could not be asked`}, so `
+        + `\`${step.fingerprint}\`, a gated step's command, is refused here; run it again once the daemon answers. `
         + 'KEEP_STEP_OK=1 bypasses the guard.' };
     }
   }
   return { deny: false, reason: '' };
 }
 
+// pre-bash for a Claude session whose daemon is known: the raw-resume guard here,
+// first, as everywhere; then the daemon's own guards (step, self-repair) on the
+// repository facts computed here, and what it answered is the answer. A daemon
+// that did not answer, or answered anything but a run of its hook, never lets a
+// command through that it could have refused: remoteCommandGuard refuses deploys
+// and anything matching the step fingerprints it last published.
+async function carriedPreBash(input, where, deps = {}) {
+  const env = deps.env || process.env;
+  const refuse = (decision) => {
+    process.stderr.write(`${decision.reason}\n`);
+    process.exitCode = 2;
+  };
+  const resume = guardResumeCommand(input, env);
+  if (resume.deny) return refuse(resume);
+  if (!input || input.tool_name !== 'Bash') return;
+  const command = input.tool_input && input.tool_input.command;
+  if (typeof command !== 'string' || !command) return;
+  const client = deps.hookClient || require('../hook-client.js');
+  let outcome;
+  try { outcome = await client.runBashHook('pre-bash', input, where, deps); } catch (error) {
+    outcome = { delivered: false, why: error && error.message || String(error) };
+  }
+  if (outcome && outcome.delivered) {
+    const value = outcome.value || {};
+    if (value.stdout) process.stdout.write(String(value.stdout));
+    if (value.stderr) process.stderr.write(String(value.stderr));
+    if (Number.isInteger(value.status) && value.status !== 0) process.exitCode = value.status;
+    return;
+  }
+  const context = (outcome && outcome.context) || {};
+  let decision;
+  try {
+    decision = remoteCommandGuard(input, where, env, {
+      unanswered: (outcome && outcome.why) || 'no answer', steps: Array.isArray(context.steps) ? context.steps : [],
+      repairSession: context.repairSession,
+    });
+  } catch (error) {
+    decision = { deny: true, reason: `keep: the command guard is not available on node ${where.local}: ${error && error.message || error}` };
+  }
+  if (decision.deny) refuse(decision);
+}
+
 // The Claude events a node whose daemon is known (KEEP_DAEMON_URL) carries to it:
 // the daemon runs its own hook for them against the session's transcript mirror
-// (bin/hook-client.js here, bin/hook-route.js there). The pre-bash guards and the
-// post-bash recorders stay as below until they can be answered from here.
+// (bin/hook-client.js here, bin/hook-route.js there). pre-bash goes the same way
+// with this node's repository facts (carriedPreBash).
 const CARRIED_EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'lifecycle'];
 
 async function carriedHook(kind, input, where, deps = {}) {
@@ -554,6 +616,10 @@ async function remoteHook(argv, input, where, deps = {}) {
     process.exitCode = 2;
   };
   const kind = argv[0];
+  if (kind === 'pre-bash') {
+    const remote = require('../remote-cli.js').remoteMode(env);
+    if (remote) return carriedPreBash(input, remote, deps);
+  }
   if (CARRIED_EVENTS.includes(kind)) {
     const remote = require('../remote-cli.js').remoteMode(env);
     if (remote) return carriedHook(kind, input, remote, deps);
@@ -1429,6 +1495,22 @@ function deployEntry(input) {
   return { heading: failed ? 'deploy failed' : 'deployed', message };
 }
 
+// A hook the daemon runs for a session on another node (bin/hook-route.js sets
+// KEEP_HOOK_NODE) reads the repository facts that node computed and posted with
+// the event (bin/repo-facts.js) instead of running git here, where that session's
+// checkout is not. null for the daemon node's own sessions, whose hooks run git as
+// they always have. What the node did not post reads as nothing known.
+function nodeRepoFacts(input) {
+  if (!process.env.KEEP_HOOK_NODE) return null;
+  const facts = input && input.repo_facts;
+  const table = (value) => (value && typeof value === 'object' && !Array.isArray(value) ? value : {});
+  return {
+    paths: table(facts && facts.paths),
+    deploy: facts && facts.deploy && typeof facts.deploy === 'object' ? facts.deploy : null,
+    head: table(facts && facts.head),
+  };
+}
+
 // ---------- gated steps run by hand ----------
 
 // Sessions holding a step claim kept running terraform apply and AMI bakes
@@ -1451,8 +1533,18 @@ function stepMatchForInput(input, now = Date.now()) {
     .map((target) => path.resolve(cwd, target.replace(/^~(?=\/|$)/, home)))];
   const paths = [...bases];
   let top = cwd;
+  const nodeFacts = nodeRepoFacts(input);
   for (const base of bases) {
     let baseTop;
+    if (nodeFacts) {
+      // A session on another node: the toplevel and main checkout that node read.
+      const known = Object.prototype.hasOwnProperty.call(nodeFacts.paths, base) ? nodeFacts.paths[base] : null;
+      if (!known || typeof known.top !== 'string' || !known.top) continue;
+      paths.push(known.top);
+      if (base === cwd) top = known.top;
+      if (typeof known.main === 'string' && known.main) paths.push(known.main);
+      continue;
+    }
     try {
       baseTop = execFileSync('git', ['-C', base, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: 10e3, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     } catch { continue; }
@@ -1603,6 +1695,8 @@ const RESTART_ENDPOINT = '/api/restart-daemon';
 function repairMainCheckouts() {
   const base = path.join(os.homedir(), 'keep-tool');
   const out = new Set([path.resolve(base)]);
+  // A session on another node: this disk's links say nothing about that node's.
+  if (process.env.KEEP_HOOK_NODE) return out;
   try { out.add(fs.realpathSync(base)); } catch {}
   return out;
 }
@@ -1617,6 +1711,9 @@ function repairResolvePath(value, cwd) {
     .replace(/^\$(?:HOME(?![A-Za-z0-9_])|\{HOME\})/, os.homedir());
   if (!raw) return '';
   const absolute = path.resolve(cwd || process.cwd(), raw).replace(/\/\.git$/, '');
+  // A command from a session on another node names that node's paths, taken as
+  // given: resolving them against this disk would follow links that are not there.
+  if (process.env.KEEP_HOOK_NODE) return absolute;
   try { return fs.realpathSync(absolute); } catch { return absolute; }
 }
 
@@ -2748,6 +2845,6 @@ function stopHookChecks(input, agent, options, sid, transcript, hint) {
   return true;
 }
 
-module.exports = { commands, bindRemotePane, releaseRemotePane, remoteCommandGuard, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
+module.exports = { commands, bindRemotePane, releaseRemotePane, remoteCommandGuard, carriedPreBash, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
   openerDescription, unattendedContext, unattendedState, enforcedUnattendedState, recordedUnattended, hookHostConnect,
   UNATTENDED_DENY_REASON, UNATTENDED_STOP_REASON };

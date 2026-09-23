@@ -17,11 +17,12 @@
 // append is outside the journal and needs none: a post must start where the mirror
 // ends, so a resend of bytes already appended writes nothing and says where to go on.
 const crypto = require('node:crypto');
+const os = require('node:os');
 const path = require('node:path');
 const mirror = require('./transcript-mirror.js');
 const { RegistryError } = require('./registry-route.js');
 
-const EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'lifecycle'];
+const EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'lifecycle', 'pre-bash'];
 // A post that carries only transcript bytes: every chunk of a long delta but the last.
 const TRANSCRIPT_ONLY = 'transcript';
 const HOOK_TIMEOUT_MS = 20e3;
@@ -41,6 +42,7 @@ const HOOK_EVENT_NAMES = {
   stop: ['Stop'],
   notification: ['Notification'],
   'pre-question': ['PreToolUse'],
+  'pre-bash': ['PreToolUse'],
   // session-lifecycle.js EVENTS: what `keep hook lifecycle` records.
   lifecycle: ['SubagentStart', 'SubagentStop', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest',
     'UserPromptSubmit', 'Stop', 'SessionStart', 'SessionEnd', 'Interrupt'],
@@ -58,7 +60,17 @@ const FORWARDED_ENV = Object.freeze({
   KEEP_AUTO_CONTINUE: /^(?:0|1|true|false)$/,
   CLAUDE_CODE_ENTRYPOINT: /^[A-Za-z0-9_.-]{1,128}$/,
   KEEP_DELEGATION_ID: /^[A-Za-z0-9_-]{1,128}$/,
+  // The two bypasses a session sets for itself, trusted as they are on the daemon
+  // node. KEEP_REPAIR is not among them: the daemon decides that (isRepairSession).
+  KEEP_STEP_OK: /^[A-Za-z0-9_.-]{1,32}$/,
+  KEEP_RAW_CLAUDE: /^[A-Za-z0-9_.-]{1,32}$/,
 });
+// A Bash command, and the repository facts the node posts with it (bin/repo-facts.js).
+const COMMAND_MAX_BYTES = 64 * 1024;
+const FACT_PATHS_MAX = 8;
+const DIRTY_MAX_BYTES = 4096;
+const SHA_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+const BRANCH_RE = /^[A-Za-z0-9._/-]{1,200}$/;
 
 function refuse(status, message) { throw new RegistryError(status, message); }
 
@@ -114,10 +126,85 @@ function matching(value, re, name) {
   return value;
 }
 
+// A path in the node's repository facts: absolute, no .., and under the fleet's
+// shared home, which is the only place a registered step's project can be.
+function homePath(value, name, home) {
+  absolutePath(value, name);
+  if (value !== home && !value.startsWith(home + path.sep)) refuse(400, `${name} must be under the home`);
+  return value;
+}
+
+function table(value, name) {
+  if (!isObject(value)) refuse(400, `${name} must be an object`);
+  const keys = Object.keys(value);
+  if (keys.length > FACT_PATHS_MAX) refuse(400, `${name} names more than ${FACT_PATHS_MAX} paths`);
+  return keys;
+}
+
+// input.repo_facts, rebuilt: { paths: { base: { top, main } }, deploy, head }. Data
+// the daemon's hook reads in place of the git it would run for a local session;
+// nothing in it is ever run, and a field of the wrong shape refuses the request.
+function cleanRepoFacts(value, home) {
+  if (!isObject(value)) refuse(400, 'input.repo_facts is required for a Bash hook');
+  const out = { paths: {}, deploy: null, head: {} };
+  if (value.paths !== undefined) {
+    for (const base of table(value.paths, 'repo_facts.paths')) {
+      homePath(base, 'a repo_facts path', home);
+      const entry = value.paths[base];
+      if (!isObject(entry)) refuse(400, 'a repo_facts.paths entry must be an object');
+      const fact = {};
+      for (const key of ['top', 'main']) {
+        fact[key] = entry[key] === null || entry[key] === undefined ? null : homePath(entry[key], `repo_facts ${key}`, home);
+      }
+      out.paths[base] = fact;
+    }
+  }
+  if (value.head !== undefined) {
+    for (const top of table(value.head, 'repo_facts.head')) {
+      homePath(top, 'a repo_facts.head path', home);
+      out.head[top] = matching(value.head[top], SHA_RE, 'repo_facts.head sha');
+    }
+  }
+  if (value.deploy !== undefined && value.deploy !== null) {
+    const deploy = value.deploy;
+    if (!isObject(deploy)) refuse(400, 'repo_facts.deploy must be an object or null');
+    if (!Array.isArray(deploy.dirty)) refuse(400, 'repo_facts.deploy.dirty must be a list');
+    let bytes = 0;
+    const dirty = deploy.dirty.map((file) => {
+      text(file, 'a repo_facts.deploy.dirty entry', DIRTY_MAX_BYTES);
+      bytes += Buffer.byteLength(file);
+      return file;
+    });
+    if (bytes > DIRTY_MAX_BYTES) refuse(400, `repo_facts.deploy.dirty is longer than ${DIRTY_MAX_BYTES} bytes`);
+    if (deploy.onOrigin !== null && deploy.onOrigin !== undefined && typeof deploy.onOrigin !== 'boolean') {
+      refuse(400, 'repo_facts.deploy.onOrigin must be a boolean or null');
+    }
+    out.deploy = {
+      dir: homePath(deploy.dir, 'repo_facts.deploy.dir', home),
+      repo: homePath(deploy.repo, 'repo_facts.deploy.repo', home),
+      sha: matching(deploy.sha, SHA_RE, 'repo_facts.deploy.sha'),
+      dirty,
+      branch: deploy.branch === null || deploy.branch === undefined ? null : matching(deploy.branch, BRANCH_RE, 'repo_facts.deploy.branch'),
+      onOrigin: typeof deploy.onOrigin === 'boolean' ? deploy.onOrigin : null,
+    };
+  }
+  return out;
+}
+
+// A Bash hook's tool call: the command and nothing else of its input.
+function bashInput(input, event, out, home) {
+  if (input.tool_name !== 'Bash') refuse(400, `${event} is for Bash only`);
+  out.tool_name = 'Bash';
+  if (!isObject(input.tool_input)) refuse(400, 'input.tool_input must be an object');
+  out.tool_input = { command: text(input.tool_input.command, 'input.tool_input.command', COMMAND_MAX_BYTES) };
+  if (input.tool_use_id !== undefined && input.tool_use_id !== null) out.tool_use_id = matching(input.tool_use_id, ID_RE, 'input.tool_use_id');
+  out.repo_facts = cleanRepoFacts(input.repo_facts, home);
+}
+
 // The hook's stdin, as Claude Code sends it for this event, rebuilt from the fields
 // the daemon's hook code reads. Anything else is dropped; a known field of the
 // wrong shape refuses the request.
-function cleanInput(event, input, sessionId) {
+function cleanInput(event, input, sessionId, options = {}) {
   if (!isObject(input)) refuse(400, 'input must be the hook\'s stdin object');
   let size;
   try { size = Buffer.byteLength(JSON.stringify(input)); } catch { refuse(400, 'input is not JSON'); }
@@ -158,6 +245,7 @@ function cleanInput(event, input, sessionId) {
     }
     if (has('tool_use_id')) out.tool_use_id = matching(input.tool_use_id, ID_RE, 'input.tool_use_id');
   }
+  if (event === 'pre-bash') bashInput(input, event, out, options.home || os.homedir());
   if (event === 'lifecycle') {
     for (const key of ['agent_id', 'prompt_id', 'tool_use_id']) {
       if (has(key)) out[key] = matching(input[key], ID_RE, `input.${key}`);
@@ -245,7 +333,7 @@ function validateRequest(body, caller, deps) {
   if (typeof body.idempotencyKey !== 'string' || !KEY_RE.test(body.idempotencyKey)) {
     refuse(400, 'idempotencyKey must be 16-128 letters, digits, _ or -');
   }
-  const input = cleanInput(event, body.input, sessionId);
+  const input = cleanInput(event, body.input, sessionId, { home: deps.home });
   return { event, sessionId, accountId, pane, transcript, firedAt, env, input, idempotencyKey: body.idempotencyKey };
 }
 
@@ -295,6 +383,8 @@ function createHookService(options = {}) {
   const stopping = options.stopping || (() => false);
   const timeoutMs = options.timeoutMs || HOOK_TIMEOUT_MS;
   const now = shared.now;
+  // The fleet shares one home path; the node's repository facts must lie under it.
+  const home = options.home || (shared.baseEnv && shared.baseEnv.HOME) || os.homedir();
   const cardForSession = options.cardForSession || ((sessionId, at) => require('./self-repair.js').cardForSession(sessionId, at));
   // One request at a time per session, from the append to the answer: the mirror's
   // continuity check and the run that reads it must not interleave.
@@ -344,7 +434,7 @@ function createHookService(options = {}) {
       // themselves, and a caller naming the daemon would route its panes to itself.
       if (caller === daemon) refuse(403, 'the hook route is for sessions on other nodes');
       const request = validateRequest(body, caller, {
-        location: shared.location, parsePaneRef: shared.parsePaneRef, formatPaneRef: shared.formatPaneRef, now,
+        location: shared.location, parsePaneRef: shared.parsePaneRef, formatPaneRef: shared.formatPaneRef, now, home,
       });
       if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };
       pruneMirrors();
@@ -366,6 +456,9 @@ function createHookService(options = {}) {
           KEEP_HOOK_NODE: caller,
           ...(request.accountId ? { KEEP_AGENT_ACCOUNT_ID: request.accountId } : {}),
           ...(request.firedAt ? { KEEP_HOOK_FIRED_AT: String(request.firedAt) } : {}),
+          // The self-repair guard's marker, from the daemon's own record of which
+          // sessions it launched to repair it, never from the node.
+          ...(request.event === 'pre-bash' && isRepairSession(cardForSession, request.sessionId, root) ? { KEEP_REPAIR: '1' } : {}),
         };
         const answer = await shared.journaled({
           caller, key: request.idempotencyKey, digest: digestOf(hookRequest), queue: `hook\0${caller}\0${request.sessionId}`,
@@ -413,5 +506,5 @@ function createHookService(options = {}) {
 
 module.exports = {
   createHookService, validateRequest, cleanInput, digestOf, publishedFingerprints,
-  EVENTS, FINGERPRINTS_MAX, FINGERPRINT_MAX_BYTES, TRANSCRIPT_ONLY, HOOK_TIMEOUT_MS, INPUT_MAX_BYTES, BODY_MAX_BYTES, TEXT_MAX, FORWARDED_ENV,
+  cleanRepoFacts, EVENTS, FINGERPRINTS_MAX, FINGERPRINT_MAX_BYTES, COMMAND_MAX_BYTES, TRANSCRIPT_ONLY, HOOK_TIMEOUT_MS, INPUT_MAX_BYTES, BODY_MAX_BYTES, TEXT_MAX, FORWARDED_ENV,
 };

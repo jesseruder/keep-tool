@@ -29,10 +29,15 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'lifecycle'];
+const EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'lifecycle', 'pre-bash'];
 const BUDGET_MS = Object.freeze({
   'session-start': 8000, 'session-end': 2000, stop: 10000, notification: 3000, lifecycle: 3000, 'pre-question': 3000,
+  'pre-bash': 5000,
 });
+// The events whose post carries no transcript bytes: the daemon's hook for them
+// reads the command and the repository facts, never the transcript, and a pre-bash
+// stands in front of every command the session runs.
+const TRANSCRIPTLESS = new Set(['pre-bash']);
 // What is worth delivering late. A question's moment has passed, and a session's end
 // is answered by the pane release this node does itself.
 const QUEUED = new Set(['session-start', 'stop', 'notification', 'lifecycle']);
@@ -56,6 +61,8 @@ const FORWARDED_ENV = Object.freeze({
   KEEP_AUTO_CONTINUE: /^(?:0|1|true|false)$/,
   CLAUDE_CODE_ENTRYPOINT: /^[A-Za-z0-9_.-]{1,128}$/,
   KEEP_DELEGATION_ID: /^[A-Za-z0-9_-]{1,128}$/,
+  KEEP_STEP_OK: /^[A-Za-z0-9_.-]{1,32}$/,
+  KEEP_RAW_CLAUDE: /^[A-Za-z0-9_.-]{1,32}$/,
 });
 
 function stateDir(env = process.env) { return path.join(env.HOME || os.homedir(), '.keep-node'); }
@@ -341,9 +348,10 @@ async function runHook(event, input, where, deps = {}) {
   const now = deps.now || Date.now;
   if (!EVENTS.includes(event) || env.KEEP_RUN) return null;
   if (!input || typeof input !== 'object' || typeof input.session_id !== 'string' || !SESSION_RE.test(input.session_id)) return null;
-  const started = now();
+  // A Bash hook's budget runs from before it read the context and the repository.
+  const started = Number.isFinite(deps.startedAt) ? deps.startedAt : now();
   // First, before any wait: the transcript as this event saw it.
-  const snapshot = snapshotOf(input.transcript_path);
+  const snapshot = TRANSCRIPTLESS.has(event) ? null : snapshotOf(input.transcript_path);
   input = fitInput(input);
   const budget = (deps.budgets || BUDGET_MS)[event];
   const deadline = started + budget;
@@ -443,6 +451,51 @@ async function hookContext({ env, where, token, sessionId, timeoutMs = CONTEXT_F
   return { steps: answer.steps, repairSession: answer.repairSession, fresh: true };
 }
 
+// ---------- Bash hooks ----------
+
+// A pre-bash hook: the daemon's context (the step fingerprints), the repository
+// facts for this command computed here, then the post. The input posted is
+// rebuilt from what the daemon's hook reads, and nothing else of the tool call.
+// Resolves as runHook does, plus `context`, what the daemon last published, so a
+// caller that has to fail closed has the fingerprints to refuse by.
+async function runBashHook(event, input, where, deps = {}) {
+  const env = deps.env || process.env;
+  const now = deps.now || Date.now;
+  const started = now();
+  const budget = (deps.budgets || BUDGET_MS)[event];
+  const facts = require('./repo-facts.js');
+  const command = input && input.tool_input && typeof input.tool_input.command === 'string' ? input.tool_input.command : '';
+  let token = null;
+  try {
+    require('./remote-cli.js').daemonBase(where.url);
+    token = deps.token || require('./remote-cli.js').nodeToken(env, deps.readToken);
+  } catch { token = null; }
+  const sessionId = input && typeof input.session_id === 'string' && SESSION_RE.test(input.session_id) ? input.session_id : '';
+  const context = sessionId
+    ? await hookContext({ env, where, token, sessionId, timeoutMs: token ? Math.min(CONTEXT_FETCH_MS, budget / 4) : 0, deps })
+    : { steps: [], repairSession: null, fresh: false };
+  let repo = null;
+  try {
+    repo = (deps.computeRepoFacts || facts.computeRepoFacts)({
+      cwd: input.cwd, command, event, fingerprints: context.steps, home: env.HOME || os.homedir(),
+      budgetMs: Math.max(0, Math.min(facts.BUDGET_MS, started + budget / 2 - now())),
+    });
+  } catch { repo = null; }
+  const incomplete = !repo || repo.incomplete === true;
+  // A command that could be a gated step, in a repository that did not answer: the
+  // daemon would judge it on facts that are not there, so it is not asked.
+  if (event === 'pre-bash' && incomplete && facts.fingerprintMatch(command, context.steps)) {
+    return { delivered: false, why: 'the repository did not answer in time', context, incomplete };
+  }
+  const carried = { session_id: input.session_id, cwd: input.cwd, tool_name: 'Bash', tool_input: { command },
+    repo_facts: repo ? { paths: repo.paths, deploy: repo.deploy, head: repo.head } : { paths: {}, deploy: null, head: {} } };
+  for (const key of ['transcript_path', 'hook_event_name', 'permission_mode', 'tool_use_id']) {
+    if (input[key] !== undefined && input[key] !== null) carried[key] = input[key];
+  }
+  const outcome = await runHook(event, carried, where, { ...deps, startedAt: started });
+  return { ...(outcome || { delivered: false, why: 'this hook is not carried' }), context, incomplete };
+}
+
 // For `keep doctor` on a node: how much is waiting, and the newest cursor.
 function report(env = process.env) {
   const queued = queueFiles(env).length;
@@ -460,7 +513,7 @@ function report(env = process.env) {
 }
 
 module.exports = {
-  runHook, deliver, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
+  runHook, runBashHook, deliver, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
   hookContext, contextFile, CONTEXT_TTL_MS,
   EVENTS, BUDGET_MS, QUEUE_MAX, CHUNK_BYTES, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
 };
