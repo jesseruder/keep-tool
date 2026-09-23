@@ -862,6 +862,75 @@ test('late adoption walks every local transcript and rollout folder, and a folde
   assert.equal(pinned(clean), true);
 });
 
+test('late adoption walks the default ~/.claude and ~/.codex even when configured accounts leave them out', { skip: process.getuid && process.getuid() === 0 ? 'root reads every folder' : false }, async (t) => {
+  // adoptingService configures codex-home and claude-home only; HOME is its root.
+  const roots = require('./late-adoption.js').accountRoots(require('./accounts.js'), directAdoption(t, []).env);
+  assert.deepEqual(roots.filter((account) => account.agent !== 'pi').map((account) => path.basename(account.configDir)).sort(),
+    ['.claude', '.codex', 'claude-home', 'codex-home']);
+  const pinned = (service) => fs.existsSync(path.join(service.root, '.keep', 'session-accounts'));
+  for (const where of [['.codex', 'sessions', '2020', '01', '01'], ['.codex', 'archived_sessions']]) {
+    const service = directAdoption(t, [lateCodexPane()]);
+    const dir = path.join(service.root, ...where);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'rollout-2020-01-01T00-00-00-codex-late.jsonl'), '{}\n');
+    const result = await service.adopt();
+    assert.equal(result.adopted, false, where.join('/'));
+    assert.equal(result.why, 'the session is known on the daemon itself', where.join('/'));
+    assert.equal(pinned(service), false);
+  }
+  const claude = directAdoption(t, [lateCodexPane()]);
+  fs.mkdirSync(path.join(claude.root, '.claude', 'projects', 'p'), { recursive: true });
+  fs.writeFileSync(path.join(claude.root, '.claude', 'projects', 'p', 'codex-late.jsonl'), '{}\n');
+  let result = await claude.adopt();
+  assert.equal(result.adopted, false);
+  assert.equal(result.why, 'the session is known on the daemon itself');
+  // An unreadable default home fails closed like any account root.
+  const locked = directAdoption(t, [lateCodexPane()]);
+  const sessions = path.join(locked.root, '.codex', 'sessions');
+  fs.mkdirSync(sessions, { recursive: true });
+  fs.chmodSync(sessions, 0o000);
+  t.after(() => { try { fs.chmodSync(sessions, 0o700); } catch {} });
+  result = await locked.adopt();
+  assert.equal(result.adopted, false);
+  assert.match(result.why, /could not be ruled out locally/);
+  assert.equal(pinned(locked), false);
+  // Missing default homes are an answer: the session is adopted.
+  const clean = directAdoption(t, [lateCodexPane()]);
+  assert.equal((await clean.adopt()).adopted, true);
+});
+
+test('two concurrent adoptions of one session under different cache keys pin it once', async (t) => {
+  const accounts = require('./accounts.js');
+  const pins = [];
+  const counting = { ...accounts, pinSession: (...args) => { pins.push(args[0]); return accounts.pinSession(...args); } };
+  const service = directAdoption(t, [lateCodexPane()], { accounts: counting });
+  // One names its pane, the other names none: two keys, both correct.
+  const [named, bare] = await Promise.all([
+    service.adoption.adopt('aws1', 'codex-late', 'codex', { pane: 'p7@aws1' }),
+    service.adoption.adopt('aws1', 'codex-late', 'codex', {}),
+  ]);
+  assert.equal([named, bare].filter((result) => result.adopted).length, 1, JSON.stringify([named, bare]));
+  assert.deepEqual(pins, ['codex-late']);
+  assert.deepEqual(accounts.sessionLocation('codex-late', { root: service.root, env: service.env }),
+    { node: 'aws1', agent: 'codex', accountId: 'codex-node' });
+});
+
+test('a request the adoption would pin to another account than its own is refused before anything is pinned', async (t) => {
+  const service = directAdoption(t, [lateCodexPane()]);
+  const seen = [];
+  const result = await service.adoption.adopt('aws1', 'codex-late', 'codex', { pane: 'p7@aws1', verify: (where) => {
+    seen.push(where);
+    throw new Error('session codex-late runs on account codex-node, not codex-other');
+  } });
+  assert.deepEqual(seen, [{ node: 'aws1', agent: 'codex', accountId: 'codex-node' }]);
+  assert.equal(result.adopted, false);
+  assert.match(result.why, /does not fit the session it would adopt: .*not codex-other/);
+  assert.equal(fs.existsSync(path.join(service.root, '.keep', 'session-accounts')), false, 'nothing pinned');
+  assert.ok(require('./late-adoption.js').readNodeCodexLaunch(service.root, 'aws1', 'req-1', { now: service.now }), 'the launch record is kept');
+  // Not remembered: the right request right after it adopts.
+  assert.equal((await service.adopt()).adopted, true);
+});
+
 test('a launch record adopts one session, once', async (t) => {
   const { svc, root } = adoptingService(t, [lateCodexPane()]);
   assert.equal((await svc.handle(AWS1, lateBody(root))).status, 200);

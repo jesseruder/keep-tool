@@ -23,12 +23,13 @@ function physical(value) {
   }
 }
 
-function builtIn(agent) {
+// The built-in account of an agent: its default home under `home` (this user's by default).
+function builtIn(agent, home = os.homedir()) {
   return {
     id: `${agent}/default`,
     label: agent === 'claude' ? 'Claude (default)' : agent === 'codex' ? 'Codex (default)' : 'Pi (default)',
     agent,
-    configDir: path.join(os.homedir(), `.${agent}`),
+    configDir: path.join(home, `.${agent}`),
     builtIn: true,
   };
 }
@@ -409,7 +410,7 @@ function setDefault(agent, accountId, env = process.env) {
 }
 
 module.exports = {
-  AGENTS, ID_RE, CUSTOM_ID_RE, rawConfig, list, get, defaultFor, automationFor, hasMultiple, envFor, projectRoots,
+  AGENTS, ID_RE, CUSTOM_ID_RE, rawConfig, builtIn, list, get, defaultFor, automationFor, hasMultiple, envFor, projectRoots,
   publicState, authority, authorityFile, locateClaudeFiles, knownClaudeFile, claudeFileInAccount, claudeAccountForFile, forSession, sessionNode, sessionLocation, pinSession,
   stageSession, commitStaged, clearStaged, add, setDefault,
 };

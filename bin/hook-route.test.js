@@ -1401,6 +1401,22 @@ test('a Codex start posted before its pane is bound is refused uncached: the pro
   assert.equal(require('./accounts.js').sessionLocation('codex-aws1', { root, env }).node, 'aws1');
 });
 
+test('a late Codex hook naming another account than its pane\'s is refused with nothing pinned, and the right one is still adopted', async (t) => {
+  const { root, hooks, host, calls, env } = adoptingServices(t, [latePane()]);
+  const post = (accountId, key) => codexBody('codex-stop', { hook_event_name: 'Stop', stop_hook_active: false }, {
+    identity: { agent: 'codex', sessionId: 'codex-aws1', pane: 'p2@aws1', accountId }, idempotencyKey: `${KEY}-${key}` });
+  const wrong = await hooks.handle(AWS1, post('claude-node', 'wrong-account'));
+  assert.equal(wrong.status, 403, JSON.stringify(wrong.body));
+  assert.equal(wrong.body.error, 'session codex-aws1 is not on node aws1');
+  assert.equal(host.asked, 1);
+  assert.equal(calls.length, 0);
+  assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts')), false, 'nothing pinned');
+  assert.ok(require('./late-adoption.js').readNodeCodexLaunch(root, 'aws1', 'req-1', { now: () => 1_800_000_000_000 }), 'the launch record is kept');
+  const right = await hooks.handle(AWS1, post('codex-node', 'right-account'));
+  assert.equal(right.status, 200, JSON.stringify(right.body));
+  assert.equal(require('./accounts.js').sessionLocation('codex-aws1', { root, env }).accountId, 'codex-node');
+});
+
 test('a Codex hook on a node that names no pane (a Codex Keep did not open) never asks the node\'s host', async (t) => {
   const { root, hooks, host, calls } = adoptingServices(t, [latePane()]);
   for (let i = 0; i < 4; i += 1) {

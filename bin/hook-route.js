@@ -614,7 +614,10 @@ function createHookService(options = {}) {
         || ((EVENTS.includes(body.event) || CODEX_EVENTS.includes(body.event)) && agentOf(body.event) === identity.agent));
       if (ofItsAgent && typeof shared.adopt === 'function' && shared.unlocated(identity.sessionId)) {
         validateRequest(body, caller, { ...deps, location: () => ({ node: caller, agent: identity.agent }) });
-        await shared.adopt(caller, identity.sessionId, identity.agent, { pane: identity.pane });
+        // And again inside the adoption, with the account it would pin, before it pins:
+        // a post naming another account is refused with nothing pinned.
+        const verify = (where) => validateRequest(body, caller, { ...deps, location: () => where });
+        await shared.adopt(caller, identity.sessionId, identity.agent, { pane: identity.pane, verify });
       }
       const request = validateRequest(body, caller, deps);
       if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };

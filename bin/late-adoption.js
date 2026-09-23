@@ -171,6 +171,22 @@ function walkedLocally(sessionId, accountList) {
   return false;
 }
 
+// Every account root walkedLocally reads: the configured accounts, and the default
+// ~/.claude and ~/.codex as well. Once accounts are configured, list() leaves the
+// default homes out unless one is listed (or useDefaultConfig), yet a session run
+// there by hand is still one this machine knows. The home is the daemon's own (HOME
+// in its environment), as the built-in accounts use it.
+function accountRoots(accounts, env) {
+  const listed = accounts.list(env);
+  const home = typeof env.HOME === 'string' && path.isAbsolute(env.HOME) ? env.HOME : require('node:os').homedir();
+  const seen = new Set(listed.filter((account) => account && typeof account.configDir === 'string')
+    .map((account) => `${account.agent}\0${path.resolve(account.configDir)}`));
+  const defaults = ['claude', 'codex'].map((agent) => (typeof accounts.builtIn === 'function'
+    ? accounts.builtIn(agent, home) : { agent, configDir: path.join(home, `.${agent}`) }))
+    .filter((account) => !seen.has(`${account.agent}\0${path.resolve(account.configDir)}`));
+  return [...listed, ...defaults];
+}
+
 function createLateAdoption(options = {}) {
   const root = options.root;
   if (!root) throw new Error('createLateAdoption needs the registry root');
@@ -193,7 +209,7 @@ function createLateAdoption(options = {}) {
   // shared lookups find. A look that fails says yes; the walk's own failure throws,
   // so the refusal says why.
   const locatedLocally = options.locatedLocally || ((sessionId) => {
-    if (walkedLocally(sessionId, accounts.list(env))) return true;
+    if (walkedLocally(sessionId, accountRoots(accounts, env))) return true;
     try { if (accounts.forSession(sessionId, 'claude', { root, env, allowDiscovery: true })) return true; } catch { return true; }
     try { if (require('./transcripts.js').findSessionFile(sessionId, { root, env })) return true; } catch { return true; }
     return false;
@@ -256,7 +272,7 @@ function createLateAdoption(options = {}) {
   const refusal = (why, ttl = NEGATIVE_TTL_MS) => ({ adopted: false, why, ttl });
 
   // Resolves { adopted: true, pane, accountId } or { adopted: false, why, ttl }.
-  async function attempt(caller, sessionId, agent, requestPane) {
+  async function attempt(caller, sessionId, agent, requestPane, verify) {
     const matches = await livePanesNaming(caller, sessionId);
     // No pane naming the session is not remembered for a request that names its pane:
     // the node's own bind lands milliseconds after its start posts, and that post is
@@ -284,6 +300,14 @@ function createLateAdoption(options = {}) {
     const launch = readNodeCodexLaunch(root, caller, meta.openRequestId, { now });
     if (!launch || launch.accountId !== accountId || launch.launchedAt !== meta.launchedAt || launch.pane !== pane.id) {
       return refusal('the pane carries no fresh Codex open the daemon recorded for this node');
+    }
+    // The route's own check of the request, now against the account the adoption would
+    // pin: a request it would refuse for that account pins nothing. Its own fault, so
+    // not remembered.
+    if (typeof verify === 'function') {
+      try { verify({ node: caller, agent, accountId }); } catch (error) {
+        return refusal(`the request does not fit the session it would adopt: ${error && error.message || error}`, 0);
+      }
     }
     const ref = nodes.formatPaneRef(caller, pane.id, env);
     // Nothing on this machine knows the session: no pane record of the daemon's, no
@@ -357,6 +381,8 @@ function createLateAdoption(options = {}) {
 
   // Adopts `sessionId` for `caller` when it has no location record at all and the
   // caller's host shows its one live pane; otherwise does nothing. Never throws.
+  // `options.verify(where)`, when given, is the route's check of its request against
+  // the location the adoption would write; one that throws adopts nothing.
   async function adopt(caller, sessionId, agent, options = {}) {
     if (typeof caller !== 'string' || !caller || caller === daemonNode()) return { adopted: false, why: 'not a node' };
     if (typeof sessionId !== 'string' || !SESSION_RE.test(sessionId) || !AGENTS.includes(agent)) {
@@ -381,7 +407,7 @@ function createLateAdoption(options = {}) {
     if (inflight.has(key)) return inflight.get(key);
     const run = (async () => {
       let result;
-      try { result = await attempt(caller, sessionId, agent, requestPane); }
+      try { result = await attempt(caller, sessionId, agent, requestPane, options.verify); }
       catch (error) { result = refusal(`the host on ${caller} could not be asked: ${error && error.message || error}`, SHORT_TTL_MS); }
       if (!result.adopted) remember(key, result.ttl);
       return result;
@@ -393,4 +419,4 @@ function createLateAdoption(options = {}) {
   return { adopt, unlocated };
 }
 
-module.exports = { createLateAdoption, recordNodeCodexLaunch, readNodeCodexLaunch, consumeNodeCodexLaunch, walkedLocally, LOOKUP_DEADLINE_MS, NEGATIVE_TTL_MS, SHORT_TTL_MS, LAUNCH_TTL_MS };
+module.exports = { createLateAdoption, recordNodeCodexLaunch, readNodeCodexLaunch, consumeNodeCodexLaunch, walkedLocally, accountRoots, LOOKUP_DEADLINE_MS, NEGATIVE_TTL_MS, SHORT_TTL_MS, LAUNCH_TTL_MS };

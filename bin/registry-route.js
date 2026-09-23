@@ -318,7 +318,10 @@ function createRegistryService(options = {}) {
         && typeof body.agent === 'string' && typeof body.pane === 'string' && body.pane !== ''
         && lateAdoption.unlocated(body.session)) {
         validateRequest(body, caller, { ...deps, location: () => ({ node: caller, agent: body.agent }) });
-        await lateAdoption.adopt(caller, body.session, body.agent, { pane: body.pane });
+        // Checked again inside the adoption against the location it would write, before
+        // it pins. A registry request names no account, so today that is the same check.
+        const verify = (where) => validateRequest(body, caller, { ...deps, location: () => where });
+        await lateAdoption.adopt(caller, body.session, body.agent, { pane: body.pane, verify });
       }
       const request = validateRequest(body, caller, deps);
       return await journaled({
