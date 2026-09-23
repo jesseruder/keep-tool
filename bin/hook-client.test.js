@@ -782,3 +782,62 @@ test('a Codex start on a node answers inside its 3 s timeout however slow the da
   assert.match(JSON.parse(bound.written).hookSpecificOutput.additionalContext, /the daemon is on main/);
   assert.ok(bound.elapsed < 3000, `inside Codex's timeout (${bound.elapsed} ms)`);
 });
+
+test('a Codex start the daemon refused before its pane was bound is posted once more after the bind, under the same key', async (t) => {
+  const hook = require('./commands/hook.js');
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-start-repost-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { HOME: home, KEEP_PANE: 'p2', KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main', KEEP_DAEMON_URL: 'http://127.0.0.1:1' };
+  const where = { url: env.KEEP_DAEMON_URL, local: 'aws1', daemon: 'main' };
+  const input = { session_id: 'codex-aws1', cwd: home, transcript_path: path.join(home, 'r.jsonl') };
+  const context = '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"[keep] You are session #9."}}';
+  const run = async (answers, hostCalls) => {
+    const posts = [];
+    const hookClient = { BUDGET_MS: require('./hook-client.js').BUDGET_MS, runHook: async (event, given, at, deps) => {
+      posts.push({ event, key: deps.idempotencyKey, budget: deps.budgets && deps.budgets[event] });
+      return answers[posts.length - 1];
+    } };
+    const connectHost = async () => ({
+      request: async (type) => { hostCalls.push(type); return type === 'get' ? { pane: { alive: true, pid: 1, meta: {} } } : {}; },
+      close() {},
+    });
+    const written = [];
+    const write = process.stdout.write;
+    process.stdout.write = (chunk, ...rest) => {
+      if (typeof chunk !== 'string') return write.call(process.stdout, chunk, ...rest);
+      written.push(chunk);
+      return true;
+    };
+    try {
+      await hook.carriedCodexHook('start', input, where, { env, hookStartedAt: Date.now(), hookClient, connectHost, exit: () => {} });
+    } finally { process.stdout.write = write; }
+    return { posts, written: written.join('') };
+  };
+  const refusedFirst = [{ delivered: false, why: 'session codex-aws1 is not on node aws1', queued: false },
+    { delivered: true, value: { status: 0, stdout: `${context}\n`, stderr: '' } }];
+  const hostCalls = [];
+  const reposted = await run(refusedFirst, hostCalls);
+  assert.deepEqual(hostCalls, ['get', 'meta'], 'bound first');
+  assert.equal(reposted.posts.length, 2);
+  assert.match(reposted.posts[0].key, /^[0-9a-f]{32}$/);
+  assert.equal(reposted.posts[1].key, reposted.posts[0].key, 'the same idempotency key');
+  assert.ok(reposted.posts[1].budget > 0 && reposted.posts[1].budget <= 2600, `inside the start's deadline (${reposted.posts[1].budget} ms)`);
+  assert.equal(reposted.written, `${context}\n`, 'the daemon\'s answer to the second post');
+  // Any other failure is not posted again.
+  const other = await run([{ delivered: false, why: 'timed out', queued: true }], []);
+  assert.equal(other.posts.length, 1);
+  // Nor is a refusal when the bind did not happen.
+  const unbound = [];
+  const noBind = await (async () => {
+    const posts = [];
+    const hookClient = { BUDGET_MS: {}, runHook: async (event, given, at, deps) => { posts.push(deps.idempotencyKey); return refusedFirst[0]; } };
+    const connectHost = async () => ({ request: async (type) => { unbound.push(type); return type === 'get' ? { pane: { alive: true, pid: 1, meta: { sessionId: 'someone-else' } } } : {}; }, close() {} });
+    const write = process.stdout.write;
+    process.stdout.write = (chunk, ...rest) => (typeof chunk !== 'string' ? write.call(process.stdout, chunk, ...rest) : true);
+    try { await hook.carriedCodexHook('start', input, where, { env, hookStartedAt: Date.now(), hookClient, connectHost, exit: () => {} }); }
+    finally { process.stdout.write = write; }
+    return posts;
+  })();
+  assert.deepEqual(unbound, ['get']);
+  assert.equal(noBind.length, 1);
+});

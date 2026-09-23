@@ -385,7 +385,8 @@ async function runHook(event, input, where, deps = {}) {
   const budget = (deps.budgets || BUDGET_MS)[event];
   const deadline = started + budget;
   const identity = identityOf(input, env, where, event);
-  const key = newKey();
+  // A caller that posts one event twice (a Codex start after its late bind) passes its key.
+  const key = typeof deps.idempotencyKey === 'string' && /^[A-Za-z0-9_-]{16,128}$/.test(deps.idempotencyKey) ? deps.idempotencyKey : newKey();
   const fired = { snapshot, firedAt: Date.now() };
   if (ENDS.has(event)) dropSession(env, input.session_id);
   let token;

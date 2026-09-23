@@ -1353,7 +1353,7 @@ test('a late hook is refused as before for a pane of another agent, two panes, a
     assert.deepEqual(logged, [], name);
   }
   // The negative cache: a flood asks the host once, and after five seconds asks again.
-  const { hooks, host, tick } = adoptingServices(t, []);
+  const { hooks, host, tick } = adoptingServices(t, [latePane({ accountId: 'codex-elsewhere' })]);
   for (let i = 0; i < 4; i += 1) assert.equal((await hooks.handle(AWS1, start({ idempotencyKey: `${KEY}-flood-${i}` }))).status, 403);
   assert.equal(host.asked, 1);
   host.panes = [latePane()];
@@ -1368,4 +1368,28 @@ test('a late hook is refused as before for a pane of another agent, two panes, a
   require('./accounts.js').pinSession('codex-aws1', 'codex', 'codex-node', { root: placed.root, env: placed.env, node: 'main' });
   assert.equal((await placed.hooks.handle(AWS1, start())).status, 403);
   assert.equal(placed.host.asked, 0);
+});
+
+test('a Codex start posted before its pane is bound is refused uncached: the prompt right after the bind is adopted, and the re-posted start registers', async (t) => {
+  const { root, hooks, host, calls, env } = adoptingServices(t, []);
+  const start = codexBody('codex-start', { hook_event_name: 'SessionStart', source: 'startup' }, {
+    identity: { agent: 'codex', sessionId: 'codex-aws1', pane: 'p2@aws1' }, idempotencyKey: `${KEY}-late-start` });
+  const refused = await hooks.handle(AWS1, start);
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.error, 'session codex-aws1 is not on node aws1');
+  assert.equal(calls.length, 0);
+  // The node's bind lands a few milliseconds later; its first prompt follows at once.
+  host.panes = [latePane()];
+  const prompt = await hooks.handle(AWS1, codexBody('codex-lifecycle', { hook_event_name: 'UserPromptSubmit', turn_id: 't1' }, {
+    identity: { agent: 'codex', sessionId: 'codex-aws1', pane: 'p2@aws1' }, idempotencyKey: `${KEY}-late-prompt` }));
+  assert.equal(prompt.status, 200, JSON.stringify(prompt.body));
+  assert.deepEqual(calls.at(-1).args, [CLI, 'hook', 'codex', 'lifecycle']);
+  assert.equal(host.asked, 2);
+  // The node posts its start again under the same key: it runs, once.
+  const again = await hooks.handle(AWS1, start);
+  assert.equal(again.status, 200, JSON.stringify(again.body));
+  assert.equal(again.body.replayed, false);
+  assert.deepEqual(calls.at(-1).args, [CLI, 'hook', 'codex', 'start']);
+  assert.equal(calls.length, 2);
+  assert.equal(require('./accounts.js').sessionLocation('codex-aws1', { root, env }).node, 'aws1');
 });

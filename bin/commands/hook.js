@@ -731,6 +731,10 @@ async function carriedPostBash(input, where, deps = {}) {
 const CODEX_START_DEADLINE_MS = 2600;
 const CODEX_START_BIND_MIN_MS = 600;
 const CODEX_START_ONE_ATTEMPT_MS = 1500;
+// The start posted again after a late bind: only with this much of the deadline left,
+// and ending this much before it, so the answer is still out in time.
+const CODEX_START_REPOST_MIN_MS = 300;
+const CODEX_START_REPOST_MARGIN_MS = 150;
 
 // The Codex hooks a node whose daemon is known carries to it: the daemon runs its own
 // `keep hook codex <action>` for them against the session's rollout mirror.
@@ -836,16 +840,33 @@ async function carriedCodexHook(action, input, where, deps = {}) {
       const now = deps.now || Date.now;
       const startedAt = Number.isFinite(deps.hookStartedAt) ? deps.hookStartedAt : Date.now() - process.uptime() * 1000;
       const total = deps.codexStartDeadlineMs == null ? CODEX_START_DEADLINE_MS : deps.codexStartDeadlineMs;
-      out = answerOf(await run({ startedAt }));
+      // One key for both posts of this start, so a daemon that did run the first
+      // replays it rather than running it twice.
+      const idempotencyKey = require('node:crypto').randomBytes(16).toString('hex');
+      const first = await run({ startedAt, idempotencyKey });
+      out = answerOf(first);
       if (valid) {
         const bindMs = Math.max(CODEX_START_BIND_MIN_MS, startedAt + total - now());
         let timer;
+        let bound = false;
         const late = await Promise.race([
           bindRemotePane(input, 'codex', { ...deps, deadline: Date.now() + bindMs,
-            ...(bindMs < CODEX_START_ONE_ATTEMPT_MS ? { attempts: 1 } : {}) }).then(() => false, () => false),
+            ...(bindMs < CODEX_START_ONE_ATTEMPT_MS ? { attempts: 1 } : {}) })
+            .then((result) => { bound = Boolean(result && result.bound); return false; }, () => false),
           new Promise((resolve) => { timer = setTimeout(() => resolve(true), bindMs); }),
         ]);
         clearTimeout(timer);
+        // A fresh Codex the daemon has not adopted yet: its first post was refused for
+        // want of a location record, and the bind just named the session on the pane,
+        // which is what the daemon adopts it by. Post the start once more in what is
+        // left of the deadline, so the daemon registers it and its answer is printed.
+        const refused = first && first.delivered === false && /\bis not on node\b/.test(String(first.why || ''));
+        const left = startedAt + total - now() - CODEX_START_REPOST_MARGIN_MS;
+        if (!late && bound && refused && left >= CODEX_START_REPOST_MIN_MS) {
+          const again = await run({ startedAt: now(), idempotencyKey,
+            budgets: { ...client.BUDGET_MS, [event]: left } });
+          if (again && again.delivered) out = answerOf(again);
+        }
         if (late) {
           try { require('../hook-client.js').logLine(deps.env || process.env, `codex start for session ${input.session_id}: the pane bind was still running at the ${total} ms deadline; answered without it`); } catch {}
           // Whatever the bind is still waiting on (a host, ps, lsof) must not keep

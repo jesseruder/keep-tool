@@ -682,7 +682,7 @@ test('late adoption refuses a pane of another agent, two panes naming the sessio
 });
 
 test('a refused late adoption is remembered for five seconds per node and session, so a flood asks the host once', async (t) => {
-  const { svc, root, host, tick } = adoptingService(t, []);
+  const { svc, root, host, tick } = adoptingService(t, [lateCodexPane({ agent: 'claude' })]);
   for (let i = 0; i < 5; i += 1) {
     const answer = await svc.handle(AWS1, lateBody(root, { idempotencyKey: `k-flood-${i}-0123456789` }));
     assert.equal(answer.status, 403);
@@ -691,7 +691,7 @@ test('a refused late adoption is remembered for five seconds per node and sessio
   // Another session on the same node is asked for on its own.
   await svc.handle(AWS1, lateBody(root, { session: 'codex-other', pane: null }));
   assert.equal(host.asked, 2);
-  // Once the refusal has lapsed and the late bind has landed, it is adopted.
+  // Once the refusal has lapsed and the pane is the session's, it is adopted.
   host.panes = [lateCodexPane()];
   tick(4_000);
   assert.equal((await svc.handle(AWS1, lateBody(root))).status, 403);
@@ -711,4 +711,15 @@ test('late adoption never asks a host for a session that has a location record, 
   // A host that cannot be reached refuses as before.
   const down = adoptingService(t, [], { hostConnect: async () => { throw new Error('connect ECONNREFUSED'); } });
   assert.equal((await down.svc.handle(AWS1, lateBody(down.root))).status, 403);
+});
+
+test('no pane naming the session yet is never remembered: the node\'s own bind lands a moment after its start posts', async (t) => {
+  const { svc, root, host } = adoptingService(t, []);
+  assert.equal((await svc.handle(AWS1, lateBody(root, { idempotencyKey: 'k-before-bind-0123456789' }))).status, 403);
+  assert.equal((await svc.handle(AWS1, lateBody(root, { idempotencyKey: 'k-before-bind-1123456789' }))).status, 403);
+  assert.equal(host.asked, 2, 'asked each time');
+  host.panes = [lateCodexPane()];
+  const adopted = await svc.handle(AWS1, lateBody(root));
+  assert.equal(adopted.status, 200, JSON.stringify(adopted.body));
+  assert.equal(host.asked, 3);
 });

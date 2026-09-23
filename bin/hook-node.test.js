@@ -228,9 +228,7 @@ test('a fresh Codex on aws1 that binds its pane late is adopted by the daemon, a
     try {
       await binder.request('meta', { pane: paneId, patch: { sessionId: LATE, agent: 'codex', project: fleet.project } });
     } finally { binder.close(); }
-    // Past the refusal the daemon remembers for five seconds.
-    await new Promise((resolve) => setTimeout(resolve, require('./late-adoption.js').NEGATIVE_TTL_MS + 100));
-
+    // At once: a refusal for want of a bound pane is never remembered.
     const checked = await runArgs(['checkin', 'late-work', '-m', 'Checked in from the node after the late bind.'], nodeEnv, fleet.project);
     assert.equal(checked.status, 0, checked.stderr);
     assert.match(fs.readFileSync(path.join(fleet.registry, 'tasks', 'late-work.md'), 'utf8'), /Checked in from the node after the late bind\./);

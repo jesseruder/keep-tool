@@ -14,14 +14,20 @@
 // for that agent, and the daemon has no pane record placing the session anywhere else:
 // then the location record is pinned to the caller (accounts.pinSession) and the
 // daemon's pane record written as the hook's node branch writes it (recordSessionPane).
-// Anything short of that adopts nothing and the route refuses as before. A refusal is
-// remembered for NEGATIVE_TTL_MS per (node, session), so a flood of refused posts asks
-// the host once. The routes exist only on the node listener: a single-node install
+// Anything short of that adopts nothing and the route refuses as before. A refusal
+// that cannot change in a moment (a pane of another agent, an account this install
+// does not have, a record that places the session elsewhere) is remembered for
+// NEGATIVE_TTL_MS per (node, session), so a flood of refused posts asks the host once;
+// one that can is not: no pane names the session yet (the node's own bind lands
+// milliseconds after its start posts) or two do. A host that could not be asked, and
+// a pane other than the one the request names, are remembered for SHORT_TTL_MS.
+// The routes exist only on the node listener: a single-node install
 // never gets here.
 const fs = require('node:fs');
 const path = require('node:path');
 
 const NEGATIVE_TTL_MS = 5e3;
+const SHORT_TTL_MS = 500;
 const CONNECT_TIMEOUT_MS = 1000;
 const REQUEST_TIMEOUT_MS = 1500;
 const CACHE_MAX = 1024;
@@ -47,13 +53,14 @@ function createLateAdoption(options = {}) {
 
   const paneFile = (sessionId) => path.join(root, '.keep', 'panes', `${sessionId}.json`);
 
-  function remember(key) {
+  function remember(key, ttl) {
+    if (!(ttl > 0)) return;
     if (refusedUntil.size >= CACHE_MAX) {
       const at = now();
       for (const [entry, until] of refusedUntil) if (until <= at) refusedUntil.delete(entry);
       if (refusedUntil.size >= CACHE_MAX) refusedUntil.delete(refusedUntil.keys().next().value);
     }
-    refusedUntil.set(key, now() + NEGATIVE_TTL_MS);
+    refusedUntil.set(key, now() + ttl);
   }
 
   async function livePanesNaming(caller, sessionId) {
@@ -68,38 +75,41 @@ function createLateAdoption(options = {}) {
     }
   }
 
-  // Resolves { adopted: true, pane, accountId } or { adopted: false, why }.
+  // A refusal, remembered for `ttl` ms (none when 0).
+  const refusal = (why, ttl = NEGATIVE_TTL_MS) => ({ adopted: false, why, ttl });
+
+  // Resolves { adopted: true, pane, accountId } or { adopted: false, why, ttl }.
   async function attempt(caller, sessionId, agent, requestPane) {
     const matches = await livePanesNaming(caller, sessionId);
-    if (matches.length !== 1) return { adopted: false, why: `${matches.length} live panes on ${caller} name session ${sessionId}` };
+    if (matches.length !== 1) return refusal(`${matches.length} live panes on ${caller} name session ${sessionId}`, 0);
     const [pane] = matches;
     const meta = pane.meta;
-    if (typeof pane.id !== 'string' || !PANE_ID_RE.test(pane.id)) return { adopted: false, why: 'the pane has no usable id' };
-    if (meta.agent !== agent) return { adopted: false, why: `the pane runs ${meta.agent}, not ${agent}` };
+    if (typeof pane.id !== 'string' || !PANE_ID_RE.test(pane.id)) return refusal('the pane has no usable id');
+    if (meta.agent !== agent) return refusal(`the pane runs ${meta.agent}, not ${agent}`);
     if (meta.node !== undefined && meta.node !== null && meta.node !== caller) {
-      return { adopted: false, why: `the pane says it is on ${meta.node}` };
+      return refusal(`the pane says it is on ${meta.node}`);
     }
-    if (requestPane && requestPane !== pane.id) return { adopted: false, why: `the request names pane ${requestPane}, not ${pane.id}` };
+    if (requestPane && requestPane !== pane.id) return refusal(`the request names pane ${requestPane}, not ${pane.id}`, SHORT_TTL_MS);
     const accountId = meta.accountId;
-    if (typeof accountId !== 'string' || !ACCOUNT_RE.test(accountId)) return { adopted: false, why: 'the pane names no account' };
+    if (typeof accountId !== 'string' || !ACCOUNT_RE.test(accountId)) return refusal('the pane names no account');
     let account = null;
     try { account = accounts.get(accountId, env); } catch { account = null; }
-    if (!account || account.agent !== agent) return { adopted: false, why: `account ${accountId} is not a configured ${agent} account` };
+    if (!account || account.agent !== agent) return refusal(`account ${accountId} is not a configured ${agent} account`);
     const ref = nodes.formatPaneRef(caller, pane.id, env);
     // The daemon's own pane record, when there is one, must already say this node.
     let prior = null;
     try { prior = JSON.parse(fs.readFileSync(paneFile(sessionId), 'utf8')); }
-    catch (error) { if (error.code !== 'ENOENT') return { adopted: false, why: 'the daemon\'s pane record is unreadable' }; }
+    catch (error) { if (error.code !== 'ENOENT') return refusal('the daemon\'s pane record is unreadable'); }
     if (prior && (typeof prior !== 'object' || prior.node !== caller)) {
-      return { adopted: false, why: 'the daemon\'s pane record places the session elsewhere' };
+      return refusal('the daemon\'s pane record places the session elsewhere');
     }
     // Checked again at the last moment: a hook that registered it meanwhile is the answer.
     let where;
-    try { where = location(sessionId); } catch { return { adopted: false, why: 'the location record is unreadable' }; }
+    try { where = location(sessionId); } catch { return refusal('the location record is unreadable'); }
     if (where) return { adopted: false, why: 'the session already has a location record', located: true };
     try {
       accounts.pinSession(sessionId, agent, accountId, { root, env, node: caller });
-    } catch (error) { return { adopted: false, why: error.message }; }
+    } catch (error) { return refusal(error.message); }
     const cwd = typeof meta.project === 'string' && path.isAbsolute(meta.project) ? meta.project
       : (typeof pane.cwd === 'string' ? pane.cwd : '');
     const at = now();
@@ -156,8 +166,8 @@ function createLateAdoption(options = {}) {
     const run = (async () => {
       let result;
       try { result = await attempt(caller, sessionId, agent, requestPane); }
-      catch (error) { result = { adopted: false, why: `the host on ${caller} could not be asked: ${error && error.message || error}` }; }
-      if (!result.adopted && !result.located) remember(key);
+      catch (error) { result = refusal(`the host on ${caller} could not be asked: ${error && error.message || error}`, SHORT_TTL_MS); }
+      if (!result.adopted) remember(key, result.ttl);
       return result;
     })();
     inflight.set(key, run);
@@ -167,4 +177,4 @@ function createLateAdoption(options = {}) {
   return { adopt, unlocated };
 }
 
-module.exports = { createLateAdoption, NEGATIVE_TTL_MS };
+module.exports = { createLateAdoption, NEGATIVE_TTL_MS, SHORT_TTL_MS };
