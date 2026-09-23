@@ -716,3 +716,58 @@ test('a Codex post-tool posts the command and its response with the rollout in f
   assert.deepEqual(onlyJson(await codexRun(f, 'post-tool', url, input)), {});
   assert.deepEqual(f.queue().map((entry) => entry.event), ['codex-post-tool']);
 });
+
+test('a Codex start on a node answers inside its 3 s timeout however slow the daemon and the host are', async (t) => {
+  const hook = require('./commands/hook.js');
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-start-deadline-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { HOME: home, KEEP_PANE: 'p2', KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main', KEEP_DAEMON_URL: 'http://127.0.0.1:1' };
+  const where = { url: env.KEEP_DAEMON_URL, local: 'aws1', daemon: 'main' };
+  const input = { session_id: 'codex-aws1', cwd: home, transcript_path: path.join(home, 'r.jsonl') };
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  // A daemon that takes the whole post budget and answers nothing.
+  const slowDaemon = (ms) => ({ runHook: async () => { await delay(ms); return { delivered: false, why: 'timed out' }; } });
+  const host = (answerMs, calls) => async () => ({
+    request: async (type) => {
+      calls.push(type);
+      if (answerMs === Infinity) return new Promise(() => {});
+      await delay(answerMs);
+      return type === 'get' ? { pane: { alive: true, pid: 1, meta: {} } } : {};
+    },
+    close() {},
+  });
+  const run = async (deps) => {
+    const written = [];
+    const write = process.stdout.write;
+    let exited = null;
+    // The hook writes strings; the test runner's own reports (buffers) pass through.
+    process.stdout.write = (chunk, ...rest) => {
+      if (typeof chunk !== 'string') return write.call(process.stdout, chunk, ...rest);
+      written.push(chunk);
+      const callback = rest.find((arg) => typeof arg === 'function');
+      if (callback) callback();
+      return true;
+    };
+    const began = Date.now();
+    try {
+      await hook.carriedCodexHook('start', input, where, { env, exit: (code) => { exited = code; }, ...deps });
+    } finally { process.stdout.write = write; }
+    return { written: written.join(''), exited, elapsed: Date.now() - began };
+  };
+
+  // A stalled host: the bind is cut at the deadline, `{}` is the answer, and the hook exits.
+  const stalled = [];
+  const cut = await run({ hookClient: slowDaemon(2000), connectHost: host(Infinity, stalled) });
+  assert.equal(cut.written, '{}\n');
+  assert.equal(cut.exited, 0);
+  assert.ok(cut.elapsed >= 2500 && cut.elapsed < 2900, `answered at the deadline (${cut.elapsed} ms)`);
+  assert.match(fs.readFileSync(path.join(home, '.keep-node', 'hook.log'), 'utf8'), /codex start for session codex-aws1: the pane bind was still running at the 2600 ms deadline/);
+
+  // A daemon that used more than its share: the bind still gets 600 ms, one attempt, and binds.
+  const late = [];
+  const bound = await run({ hookClient: slowDaemon(2400), connectHost: host(100, late) });
+  assert.equal(bound.exited, null, 'no forced exit');
+  assert.deepEqual(late, ['get', 'meta'], 'one attempt, bound');
+  assert.match(JSON.parse(bound.written).hookSpecificOutput.additionalContext, /the daemon is on main/);
+  assert.ok(bound.elapsed < 3000, `inside Codex's timeout (${bound.elapsed} ms)`);
+});

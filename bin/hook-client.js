@@ -618,7 +618,7 @@ function report(env = process.env) {
 }
 
 module.exports = {
-  runHook, runBashHook, runCodexToolHook, deliver, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
+  runHook, runBashHook, runCodexToolHook, deliver, logLine, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
   hookContext, contextFile, CONTEXT_TTL_MS,
   EVENTS, CLAUDE_EVENTS, CODEX_EVENTS, BUDGET_MS, QUEUE_MAX, CHUNK_BYTES, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
 };

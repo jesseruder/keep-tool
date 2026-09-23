@@ -485,14 +485,18 @@ async function bindRemotePane(input, agent, deps = {}) {
   const cwd = input.cwd || process.cwd();
   const connectHost = deps.connectHost || require('../hostclient.js').connect;
   const ownsPane = deps.codexOwnsPane || require('../codex-pane').ownsPane;
+  // `deps.deadline` (an absolute time) bounds every wait below, as releaseRemotePane's
+  // own deadline does; without it the waits are what they always were.
+  const deadline = Number.isFinite(deps.deadline) ? deps.deadline : Infinity;
+  const within = (limit) => (deadline === Infinity ? limit : Math.max(1, Math.min(limit, deadline - Date.now())));
   const timeoutMs = deps.timeoutMs == null ? 1000 : deps.timeoutMs;
   const attempts = deps.attempts == null ? 3 : deps.attempts;
   const result = { pane, bound: false };
-  for (let attempt = 0; attempt < attempts && !result.bound && !result.boundTo; attempt += 1) {
+  for (let attempt = 0; attempt < attempts && !result.bound && !result.boundTo && Date.now() < deadline; attempt += 1) {
     let client;
     try {
-      client = await connectHost({ timeoutMs: deps.timeoutMs == null ? 500 : deps.timeoutMs });
-      const current = await client.request('get', { pane }, { timeoutMs });
+      client = await connectHost({ timeoutMs: within(deps.timeoutMs == null ? 500 : deps.timeoutMs) });
+      const current = await client.request('get', { pane }, { timeoutMs: within(timeoutMs) });
       const meta = (current && current.pane && current.pane.meta) || {};
       const owner = meta.sessionId;
       const launchedCodex = agent === 'codex' && !owner && meta.openRequestId != null;
@@ -504,10 +508,12 @@ async function bindRemotePane(input, agent, deps = {}) {
           break;
         }
       }
-      await client.request('meta', { pane, patch: { sessionId: sid, agent, project: cwd } }, { timeoutMs });
+      await client.request('meta', { pane, patch: { sessionId: sid, agent, project: cwd } }, { timeoutMs: within(timeoutMs) });
       result.bound = true;
     } catch {
-      if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, deps.retryMs == null ? 400 : deps.retryMs));
+      if (attempt < attempts - 1 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, within(deps.retryMs == null ? 400 : deps.retryMs)));
+      }
     } finally {
       if (client) client.close();
     }
@@ -717,6 +723,15 @@ async function carriedPostBash(input, where, deps = {}) {
   }
 }
 
+// A Codex start on a node is killed by Codex at its 3 s hooks.json timeout, and a killed
+// hook prints nothing. So the post and the pane bind after it share one deadline from
+// the hook's start: the bind gets what the post left, never less than 600 ms (one
+// attempt when that is all it has), and a hook still binding at the deadline prints
+// `{}`, says so in ~/.keep-node/hook.log, and exits.
+const CODEX_START_DEADLINE_MS = 2600;
+const CODEX_START_BIND_MIN_MS = 600;
+const CODEX_START_ONE_ATTEMPT_MS = 1500;
+
 // The Codex hooks a node whose daemon is known carries to it: the daemon runs its own
 // `keep hook codex <action>` for them against the session's rollout mirror.
 const CARRIED_CODEX_ACTIONS = ['start', 'end', 'client-end', 'stop', 'question', 'approval', 'complete', 'lifecycle', 'pre-tool', 'post-tool'];
@@ -801,8 +816,28 @@ async function carriedCodexHook(action, input, where, deps = {}) {
     if (action === 'start') {
       // The daemon first, as for Claude, so its record knows this session claimed the
       // pane; the bind here then finds it bound, or does it when the daemon could not.
+      const now = deps.now || Date.now;
+      const startedAt = now();
+      const total = deps.codexStartDeadlineMs == null ? CODEX_START_DEADLINE_MS : deps.codexStartDeadlineMs;
       outcome = await run();
-      try { if (valid) await bindRemotePane(input, 'codex', deps); } catch {}
+      if (valid) {
+        const bindMs = Math.max(CODEX_START_BIND_MIN_MS, startedAt + total - now());
+        let timer;
+        const late = await Promise.race([
+          bindRemotePane(input, 'codex', { ...deps, deadline: Date.now() + bindMs,
+            ...(bindMs < CODEX_START_ONE_ATTEMPT_MS ? { attempts: 1 } : {}) }).then(() => false, () => false),
+          new Promise((resolve) => { timer = setTimeout(() => resolve(true), bindMs); }),
+        ]);
+        clearTimeout(timer);
+        if (late) {
+          try { require('../hook-client.js').logLine(deps.env || process.env, `codex start for session ${input.session_id}: the pane bind was still running at the ${total} ms deadline; answered {}`); } catch {}
+          // Whatever the bind is still waiting on (a host, ps, lsof) must not keep
+          // Codex waiting past its timeout: answer, and exit once the answer is out.
+          const exit = deps.exit || process.exit;
+          process.stdout.write('{}\n', () => exit(0));
+          return;
+        }
+      }
     } else if (action === 'end') {
       [outcome] = await Promise.all([run(), valid ? releaseRemotePane(input, deps).catch(() => null) : null]);
     } else {
@@ -3105,6 +3140,6 @@ function stopHookChecks(input, agent, options, sid, transcript, hint) {
   return true;
 }
 
-module.exports = { commands, bindRemotePane, releaseRemotePane, remoteCommandGuard, carriedPreBash, carriedPostBash, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
+module.exports = { commands, carriedCodexHook, bindRemotePane, releaseRemotePane, remoteCommandGuard, carriedPreBash, carriedPostBash, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
   openerDescription, unattendedContext, unattendedState, enforcedUnattendedState, recordedUnattended, hookHostConnect,
   UNATTENDED_DENY_REASON, UNATTENDED_STOP_REASON };
