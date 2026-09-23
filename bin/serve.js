@@ -3991,14 +3991,21 @@ async function cachedRemoteSession(node, sessionId, deps = {}) {
 // when there are none (a single-node install always). Each is read in parallel; one
 // whose node does not answer, or whose session is not recorded on the node that lists
 // it, is simply absent.
-async function remoteSessionFreshness(panes, deps = {}) {
+//
+// The console never waits on a node in another building: a node this listing could
+// not hear from (`skipNodes`: its remembered panes are still listed) is not asked at
+// all, and the reads that are asked share the remote-list budget listHostPaneResult
+// gives a node's pane list. A read still running at the deadline leaves its row
+// without a size this cycle; it finishes into the cache for the next one.
+async function remoteSessionFreshness(panes, deps = {}, { skipNodes = null } = {}) {
   const env = paneRefEnv(deps);
+  const skip = new Set(skipNodes || []);
   const wanted = (Array.isArray(panes) ? panes : []).filter((pane) => pane && pane.alive
-    && nodes.isRemotePane(pane, env) && pane.meta && pane.meta.agent === 'claude'
+    && nodes.isRemotePane(pane, env) && !skip.has(pane.node) && pane.meta && pane.meta.agent === 'claude'
     && typeof pane.meta.sessionId === 'string' && /^[A-Za-z0-9_-]+$/.test(pane.meta.sessionId));
   if (!wanted.length) return null;
   const out = {};
-  await Promise.all(wanted.map(async (pane) => {
+  const reads = Promise.all(wanted.map(async (pane) => {
     const id = pane.meta.sessionId;
     try {
       if (sessionNodeOf({ id }, deps) !== pane.node) return;
@@ -4006,7 +4013,22 @@ async function remoteSessionFreshness(panes, deps = {}) {
       if (session) out[id] = session;
     } catch {}
   }));
-  return Object.keys(out).length ? out : null;
+  const budgetMs = deps.hostRemoteListTimeoutMs == null ? HOST_REMOTE_LIST_TIMEOUT_MS : deps.hostRemoteListTimeoutMs;
+  let timer;
+  await Promise.race([reads, new Promise((resolve) => { timer = setTimeout(resolve, budgetMs); })]);
+  clearTimeout(timer);
+  const answered = { ...out };
+  return Object.keys(answered).length ? answered : null;
+}
+
+// The nodes a pane listing could not hear from this time: named missing, or reported
+// as anything but ok. Their panes are what they last said, and nothing is asked of them.
+function unansweredNodes(result) {
+  const names = new Set((result && result.missingNodes) || []);
+  for (const [name, status] of Object.entries((result && result.nodes) || {})) {
+    if (!status || status.ok !== true) names.add(name);
+  }
+  return [...names];
 }
 
 // A remote session's current model, straight off its node: what claudeSessionFor is
@@ -14027,12 +14049,11 @@ function start(deps = {}) {
       // before the mutation may have filled it with the panes the mutation changed.
       const freshPanes = paneEpoch !== lastPaneEpoch;
       lastPaneEpoch = paneEpoch;
-      const listed = hostPanesForPublish(
-        await listHostPaneResult(deps, freshPanes), publishedPanes, Date.now(), paneEpoch,
-      );
+      const listedResult = await listHostPaneResult(deps, freshPanes);
+      const listed = hostPanesForPublish(listedResult, publishedPanes, Date.now(), paneEpoch);
       await reviewQueue.reconcile({ inspectLaunch: (active) => inspectReviewQueueLaunch(active) });
       const companion = await companionSnapshot(deps);
-      const nodeSessions = await remoteSessionFreshness(listed.panes, deps);
+      const nodeSessions = await remoteSessionFreshness(listed.panes, deps, { skipNodes: unansweredNodes(listedResult) });
       return { hostPanes: listed.panes, hostStatus: listed.host, companion, mutationFence: capturedMutationFence,
         ...(nodeSessions ? { nodeSessions } : {}) };
     },
@@ -14566,7 +14587,7 @@ module.exports = {
   nodeTranscript,
   nodeTranscriptFileForSession,
   deliveryReceiptFor,
-  remoteSessionFreshness,
+  remoteSessionFreshness, unansweredNodes,
   remoteSessionRead,
   loadRemoteSession,
   loadSessionForAction,

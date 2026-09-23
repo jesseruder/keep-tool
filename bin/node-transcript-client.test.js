@@ -361,3 +361,29 @@ test('a node that does not answer leaves its row without a transcript size, whic
     assert.equal(await serve.remoteSessionFreshness([stranger], f.deps), null);
   } finally { f.cleanup(); }
 });
+
+test('a silent node adds no wait to the publication: its panes are not asked about, and a slow read is cut at the list budget', async () => {
+  const f = freshnessFixture('aws4', 'sess-slow');
+  try {
+    // The listing could not hear from aws4 (its remembered panes are still listed).
+    const listing = { panes: [f.pane], failure: null, nodes: { main: { ok: true }, aws4: { ok: false, reason: 'timeout', stale: true } },
+      missingNodes: ['aws4'] };
+    assert.deepEqual(serve.unansweredNodes(listing), ['aws4']);
+    assert.deepEqual(serve.unansweredNodes({ panes: [], failure: null }), [], 'a single-node listing names nobody');
+    let started = Date.now();
+    assert.equal(await serve.remoteSessionFreshness(listing.panes, f.deps, { skipNodes: serve.unansweredNodes(listing) }), null);
+    assert.deepEqual(f.asked, [], 'nothing was asked of the silent node');
+    assert.ok(Date.now() - started < 200);
+
+    // A node that answered the list but hangs on the read: the publication step waits
+    // for the budget and no longer, and the row goes without a size this cycle.
+    let release;
+    const hanging = new Promise((resolve) => { release = resolve; });
+    const deps = { ...f.deps, hostRemoteListTimeoutMs: 60, cachedRemoteSession: async () => { await hanging; return { id: 'sess-slow', size: 1 }; } };
+    started = Date.now();
+    assert.equal(await serve.remoteSessionFreshness([f.pane], deps, { skipNodes: [] }), null);
+    const waited = Date.now() - started;
+    assert.ok(waited >= 50 && waited < 1000, `waited ${waited} ms`);
+    release();
+  } finally { f.cleanup(); }
+});
