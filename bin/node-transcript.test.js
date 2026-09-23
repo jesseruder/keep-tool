@@ -76,3 +76,52 @@ test('pi-event fails, rather than saying "none", on a phase file it cannot read'
   fs.writeFileSync(file, JSON.stringify({ id: ID, phase: 'running', pad: 'x'.repeat(70 * 1024) }));
   await assert.rejects(ask(f), (error) => error.code === 'transcript-unreadable' && /too large/.test(error.message));
 });
+
+// The `meta` op: what a Codex session's rollout says about itself, read on the node
+// that has it: its session_meta line and the model of its last turn.
+function codexFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-node-meta-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const configDir = path.join(root, 'codex');
+  const now = new Date();
+  const day = path.join(configDir, 'sessions', String(now.getFullYear()),
+    String(now.getMonth() + 1).padStart(2, '0'), String(now.getDate()).padStart(2, '0'));
+  fs.mkdirSync(day, { recursive: true });
+  const account = { id: 'codex-a', agent: 'codex', configDir };
+  return { root, configDir, day, account, options: { accounts: () => [account] } };
+}
+
+const line = (value) => `${JSON.stringify(value)}\n`;
+
+test('meta answers a Codex rollout\'s session_meta and its last turn\'s model', async (t) => {
+  const f = codexFixture(t);
+  const file = path.join(f.day, `rollout-2026-09-23T10-00-00-${ID}.jsonl`);
+  fs.writeFileSync(file, line({ type: 'session_meta', payload: { id: ID, cwd: '/work/project', originator: 'codex-tui', model: 'gpt-meta' } })
+    + line({ type: 'turn_context', payload: { model: 'gpt-first', cwd: '/work/project' } })
+    + line({ type: 'event_msg', payload: { type: 'user_message', message: 'hi' } })
+    + line({ type: 'turn_context', payload: { model: 'gpt-last', cwd: '/work/project' } }));
+  const answer = await handle({ op: 'meta', kind: 'codex', sessionId: ID, account: { id: 'codex-a', configDir: f.configDir } }, f.options);
+  assert.equal(answer.path, file);
+  assert.equal(answer.model, 'gpt-last');
+  assert.deepEqual(answer.meta, { id: ID, cwd: '/work/project', model: 'gpt-meta', originator: 'codex-tui', parentThreadId: null, child: false, headless: false });
+  // The same answer for a rollout on the daemon's own machine, with no account check.
+  const local = require('./node-transcript.js').rolloutMeta(f.configDir, ID);
+  assert.equal(local.model, 'gpt-last');
+  assert.equal(local.meta.id, ID);
+  // A rollout with no turn yet has no last model.
+  fs.writeFileSync(file, line({ type: 'session_meta', payload: { id: ID, cwd: '/work/project' } }));
+  assert.equal((await handle({ op: 'meta', kind: 'codex', sessionId: ID, account: { id: 'codex-a', configDir: f.configDir } }, f.options)).model, null);
+});
+
+test('meta says transcript-missing for a session with no rollout, and refuses a malformed request', async (t) => {
+  const f = codexFixture(t);
+  const ask = (extra) => handle({ op: 'meta', kind: 'codex', sessionId: ID, account: { id: 'codex-a', configDir: f.configDir }, ...extra }, f.options);
+  await assert.rejects(ask({}), (error) => error.code === 'transcript-missing');
+  assert.equal(require('./node-transcript.js').rolloutMeta(f.configDir, ID), null);
+  for (const sessionId of ['../escape', '', 'a/b', 7]) {
+    await assert.rejects(ask({ sessionId }), (error) => error.code === 'transcript-invalid', String(sessionId));
+  }
+  await assert.rejects(ask({ kind: 'claude' }), (error) => error.code === 'transcript-invalid' && /for codex rollouts/.test(error.message));
+  await assert.rejects(ask({ account: { id: 'codex-b', configDir: f.configDir } }), (error) => error.code === 'transcript-refused');
+  assert.equal(require('./node-transcript.js').rolloutMeta(f.configDir, '../x'), null);
+});

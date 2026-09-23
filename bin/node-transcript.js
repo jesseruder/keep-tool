@@ -24,6 +24,11 @@
 //            `cwd` when one is given. How the daemon finds a fresh Codex
 //            launch's session, which names itself nowhere else until its first turn.
 //            Every file is opened as `open` opens one, and only its first 256 KiB read.
+//   meta  -> { ...stat, meta, model }: Codex only, naming a session: its rollout's
+//            session_meta line (id, cwd, model, originator, parent thread, child,
+//            headless) from at most its first 256 KiB, and the model of the last
+//            turn_context in its last 256 KiB (what it last ran on), or null. How a
+//            move learns what a Codex session on a node runs on.
 //   pi-event -> { event }: Pi only, naming a session and no account: the phase file the
 //            Keep Pi extension (integrations/pi/keep.ts) writes on this node,
 //            <KEEP_DIR || ~/keep>/.keep/pi-events/<id>.json, parsed, or null when there
@@ -39,7 +44,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const KINDS = new Set(['claude', 'codex', 'pi']);
-const OPS = new Set(['stat', 'tail', 'match', 'find', 'pi-event']);
+const OPS = new Set(['stat', 'tail', 'match', 'find', 'meta', 'pi-event']);
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const ACCOUNT_ID_RE = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex|pi)\/default)$/;
 const HASH_RE = /^[a-f0-9]{64}$/;
@@ -74,8 +79,9 @@ function generationOf(stat) {
 
 function validate(params) {
   if (!params || typeof params !== 'object') throw invalid('a transcript request must be an object');
-  if (!OPS.has(params.op)) throw invalid('transcript op must be stat, tail, match, find or pi-event');
+  if (!OPS.has(params.op)) throw invalid('transcript op must be stat, tail, match, find, meta or pi-event');
   if (!KINDS.has(params.kind)) throw invalid('transcript kind must be claude, codex or pi');
+  if (params.op === 'meta' && params.kind !== 'codex') throw invalid('transcript meta is for codex rollouts');
   if (params.op === 'pi-event') {
     if (params.kind !== 'pi') throw invalid('transcript pi-event is for pi sessions');
     if (typeof params.sessionId !== 'string' || !PI_EVENT_ID_RE.test(params.sessionId)) throw invalid('transcript session id is not a session id');
@@ -195,6 +201,71 @@ function sessionMetaOf(fd, size) {
 
 const shortText = (value, max = 256) => (typeof value === 'string' && value.length <= max ? value : null);
 
+const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:[\]/-]{0,127}$/;
+
+// The model of the last turn_context in the rollout's last 256 KiB, or null: what a
+// resumed Codex conversation last ran on. A partial first line is skipped.
+function lastTurnModel(fd, size) {
+  const from = Math.max(0, size - TAIL_MAX_BYTES);
+  const buffer = Buffer.alloc(size - from);
+  let got = 0;
+  while (got < buffer.length) {
+    const n = fs.readSync(fd, buffer, got, buffer.length - got, from + got);
+    if (!n) break;
+    got += n;
+  }
+  const lines = buffer.subarray(0, got).toString('utf8').split('\n');
+  if (from > 0) lines.shift();
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (!lines[index].includes('"turn_context"')) continue;
+    let record;
+    try { record = JSON.parse(lines[index]); } catch { continue; }
+    if (record && record.type === 'turn_context' && record.payload && typeof record.payload.model === 'string') {
+      return MODEL_RE.test(record.payload.model) ? record.payload.model : null;
+    }
+  }
+  return null;
+}
+
+// What one opened rollout says about its conversation: its session_meta (bounded, as
+// `find` reads one) and its last turn's model. Shared by the `meta` op and the
+// daemon's own read of a rollout on its machine (rolloutMeta).
+function describeRollout(fd, stat) {
+  const codex = require('./codex.js');
+  const meta = sessionMetaOf(fd, stat.size);
+  return {
+    meta: meta ? {
+      id: shortText(meta.id, 128) || shortText(meta.session_id, 128), cwd: shortText(meta.cwd, 4096),
+      model: shortText(meta.model, 128), originator: shortText(meta.originator),
+      parentThreadId: shortText(meta.parent_thread_id, 160), child: codex.isChildSession(meta), headless: codex.isHeadlessSession(meta),
+    } : null,
+    model: lastTurnModel(fd, stat.size),
+  };
+}
+
+// The `meta` op: the session's newest rollout under the account, opened and checked
+// as `open` opens one.
+function rolloutMetaOp(params, options = {}) {
+  const { fd, file, stat } = open(params, options);
+  try { return { ...describe(file, stat), ...describeRollout(fd, stat) }; }
+  finally { fs.closeSync(fd); }
+}
+
+// The same answer for a rollout on this machine under a config directory the caller
+// has already resolved (the daemon's own account record), or null when it has none.
+function rolloutMeta(configDir, sessionId) {
+  if (typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId) || typeof configDir !== 'string') return null;
+  const found = require('./codex.js').rolloutFilesIn(configDir, sessionId).sort((a, b) => b.mtimeMs - a.mtimeMs)[0];
+  if (!found) return null;
+  let fd;
+  try { fd = fs.openSync(found.file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)); } catch { return null; }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) return null;
+    return { ...describe(found.file, stat), ...describeRollout(fd, stat) };
+  } finally { fs.closeSync(fd); }
+}
+
 // The Codex rollouts this node's account has written since `sinceMs`: newest first,
 // at most FIND_MAX, each opened and checked as `open` does one.
 function find(params, options = {}) {
@@ -288,6 +359,7 @@ function piEvent(params, options = {}) {
 async function handle(params, options = {}) {
   if (params && params.op === 'find') return find(params, options);
   if (params && params.op === 'pi-event') return piEvent(params, options);
+  if (params && params.op === 'meta') return rolloutMetaOp(params, options);
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const now = options.now || Date.now;
   const closed = options.closed || (() => false);
@@ -338,6 +410,6 @@ async function handle(params, options = {}) {
 }
 
 module.exports = {
-  handle, open, find, piEvent, validate, generationOf, nodeAccount, FIND_MAX,
+  handle, open, find, piEvent, rolloutMeta, validate, generationOf, nodeAccount, FIND_MAX,
   TAIL_MAX_BYTES, MATCH_MAX_WAIT_MS, MATCH_POLL_MS, REQUEST_MAX_READ_BYTES,
 };
