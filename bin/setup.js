@@ -923,21 +923,43 @@ function hookDeliveryReport(deps = {}) {
 // not failed. Only on a pane-only node; the daemon node's own profiles are its own.
 const CODEX_HOOK_ACTIONS = ['start', 'stop', 'end', 'pre-tool', 'post-tool', 'question', 'approval', 'lifecycle'];
 
-// Codex asks, at a fresh session's start, for a review of every hook in hooks.json it
-// holds no trust entry for ("New hook, review required"), and a pane parked there never
-// reaches its prompt. The entries live in config.toml as [hooks.state."<dir>/hooks.json:
-// <event>:<group>:<index>"]. Counted by presence only: the trusted_hash inside is
-// Codex's to compute and check, so an entry for an edited hook still counts here.
+// The trust keys of the hooks a config.toml defines inline, as Codex names them:
+// `config.toml:<event>:<group>:<index>` (relative to the profile), from [[hooks.<Event>]]
+// groups shaped as hooks.json's are. [hooks.state] is the trust entries, not a hook.
+function inlineHookTrustKeys(parsed) {
+  const keys = [];
+  const hooks = parsed && typeof parsed.hooks === 'object' && !Array.isArray(parsed.hooks) ? parsed.hooks : {};
+  for (const [event, groups] of Object.entries(hooks)) {
+    if (event === 'state' || !Array.isArray(groups)) continue;
+    const snake = event.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+    groups.forEach((group, groupIndex) => {
+      (Array.isArray(group && group.hooks) ? group.hooks : []).forEach((hook, hookIndex) => {
+        if (hook && typeof hook.command === 'string') keys.push(`config.toml:${snake}:${groupIndex}:${hookIndex}`);
+      });
+    });
+  }
+  return keys;
+}
+
+// Codex asks, at a fresh session's start, for a review of every hook it holds no trust
+// entry for ("New hook, review required"), and a pane parked there never reaches its
+// prompt. The entries live in config.toml as [hooks.state."<dir>/hooks.json:<event>:
+// <group>:<index>"], and for a hook defined inline in config.toml itself as
+// [hooks.state."<dir>/config.toml:..."]. Counted by presence only: the trusted_hash
+// inside is Codex's to compute and check, so an entry for an edited hook still counts.
+// `trustKeys` are hooks.json's; config.toml's own are read here. Null when there are none.
 function codexHookTrustRow(dir, name, trustKeys, real) {
   const label = `Codex hook trust (${name})`;
-  const fix = `copy the [hooks.state] tables from a profile that has accepted these hooks (the same hooks.json bytes at the same path; keep accounts setup <id> --share-from <source> does it between profiles on one machine), or press t once per hook in a fresh Codex there`;
+  const fix = `copy the [hooks.state] tables from a profile that has accepted these same hooks, rebasing each copied key from that profile's path to ${name}'s (a key names the profile it was accepted in; keep accounts setup <id> --share-from <source> does both between profiles on one machine), or press t once per hook in a fresh Codex there`;
   let parsed;
   try {
     parsed = require('@iarna/toml').parse(fs.readFileSync(path.join(dir, 'config.toml'), 'utf8'));
   } catch (error) {
     if (error.code === 'ENOENT') {
+      if (!trustKeys.length) return null;
       return { status: 'FAIL', text: `${label}: no config.toml, so none of the ${trustKeys.length} hooks in ${name}/hooks.json has a trust entry; a fresh Codex there stops at 'review required' for each`, fix };
     }
+    if (!trustKeys.length) return null;
     const reason = String(error && error.message || error).split('\n')[0].slice(0, 200);
     return { status: 'FAIL', text: `${label}: config.toml unreadable (${reason}); its hook trust entries cannot be counted`,
       fix: `fix the TOML in ${name}/config.toml` };
@@ -946,11 +968,16 @@ function codexHookTrustRow(dir, name, trustKeys, real) {
   // Codex names the profile by the path it was given; a link to it is the same profile.
   const prefixes = [...new Set([dir, real(dir)])].map((prefix) => `${prefix}${path.sep}`);
   const trusted = (key) => prefixes.some((prefix) => Object.prototype.hasOwnProperty.call(state, `${prefix}${key}`));
-  const missing = trustKeys.filter((key) => !trusted(key)).length;
+  const inline = inlineHookTrustKeys(parsed);
+  const all = [...trustKeys, ...inline];
+  if (!all.length) return null;
+  // Where the hooks are, as the text names them: hooks.json's alone read as before.
+  const where = inline.length ? (trustKeys.length ? 'hooks.json and config.toml' : 'config.toml') : 'hooks.json';
+  const missing = all.filter((key) => !trusted(key)).length;
   if (missing) {
-    return { status: 'FAIL', text: `${label}: ${missing} of ${trustKeys.length} hooks in ${name}/hooks.json have no trust entry in config.toml (checked by presence, not hash); a fresh Codex there stops at 'review required' for each`, fix };
+    return { status: 'FAIL', text: `${label}: ${missing} of ${all.length} hooks in ${inline.length ? `${name}'s ${where}` : `${name}/hooks.json`} have no trust entry in config.toml (checked by presence, not hash); a fresh Codex there stops at 'review required' for each`, fix };
   }
-  return { status: 'ok', text: `${label}: all ${trustKeys.length} hooks in hooks.json have a trust entry in config.toml (checked by presence, not hash)` };
+  return { status: 'ok', text: `${label}: all ${all.length} hooks in ${where} have a trust entry in config.toml (checked by presence, not hash)` };
 }
 
 function codexHooksReport(deps = {}) {
@@ -963,8 +990,12 @@ function codexHooksReport(deps = {}) {
   const tilde = (file) => (file.startsWith(home + path.sep) ? `~${file.slice(home.length)}` : file);
   let profiles = [];
   try {
+    // A profile that is a link to a directory is a profile too (its trust keys may
+    // name either path, which codexHookTrustRow accepts).
+    const isDirectory = (entry) => entry.isDirectory()
+      || (entry.isSymbolicLink() && (() => { try { return fs.statSync(path.join(home, entry.name)).isDirectory(); } catch { return false; } })());
     profiles = fs.readdirSync(home, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && /^\.codex(?:-[A-Za-z0-9_.-]+)?$/.test(entry.name))
+      .filter((entry) => /^\.codex(?:-[A-Za-z0-9_.-]+)?$/.test(entry.name) && isDirectory(entry))
       .map((entry) => path.join(home, entry.name)).sort();
   } catch {}
   const rows = [];
@@ -1016,7 +1047,8 @@ function codexHooksReport(deps = {}) {
     rows.push(problems.length
       ? { status: 'FAIL', text: `Codex hooks (${name}): ${problems.join('; ')}`, fix: `wire keep hook codex <action> to ${keepBin} in ${name}/hooks.json and set [features] hooks = true in ${name}/config.toml` }
       : { status: 'ok', text: `Codex hooks (${name}) reach ${keepBin}` });
-    if (trustKeys.length) rows.push(codexHookTrustRow(dir, name, trustKeys, real));
+    const trustRow = codexHookTrustRow(dir, name, trustKeys, real);
+    if (trustRow) rows.push(trustRow);
   }
   const lsof = (deps.hasLsof || require('./process-table.js').hasLsof)();
   const linux = (deps.platform || process.platform) === 'linux';
@@ -1067,7 +1099,9 @@ function codexVersionReport(deps = {}) {
   try { result = (deps.run || (() => spawnSync('codex', ['--version'], { timeout: 10000, encoding: 'utf8' })))(); } catch { result = null; }
   if (!result || result.status !== 0) return [{ status: 'optional', text: 'Codex CLI: codex --version did not answer' }];
   const line = String(result.stdout || '').split(/\r?\n/).map((text) => text.trim()).find(Boolean) || '';
-  const version = line.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 80) || 'no version printed';
+  // Whole escape sequences (CSI, OSC, two-byte), then any control byte left.
+  const version = line.replace(/\x1b\[[0-?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]/g, '')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 80) || 'no version printed';
   const where = require('./nodes.js').paneOnlyNode(env);
   return [{ status: 'ok', text: `Codex CLI: ${version}${where
     ? `; ${where.daemon}'s version is not reported to this node, so compare it with codex --version there by hand` : ''}` }];

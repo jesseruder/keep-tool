@@ -1178,6 +1178,9 @@ test('keep doctor reports which Codex runs here, and on a node says to compare i
   const long = setup.codexVersionReport({ env: daemonEnv, run: ran(`\x1b[31m${'9'.repeat(500)}\n`) })[0];
   assert.equal(long.text.length, 'Codex CLI: '.length + 80);
   assert.doesNotMatch(long.text, /\x1b/);
+  assert.doesNotMatch(long.text, /\[31m/, 'the whole escape sequence goes, not only its ESC');
+  assert.deepEqual(setup.codexVersionReport({ env: daemonEnv, run: ran('\x1b[1mcodex-cli\x1b[0m 0.156.1\x1b]0;title\x07\n') }),
+    [{ status: 'ok', text: 'Codex CLI: codex-cli 0.156.1' }]);
   assert.deepEqual(setup.codexVersionReport({ env: daemonEnv, run: ran('', 0) }), [{ status: 'ok', text: 'Codex CLI: no version printed' }]);
   // No Codex is optional, as it was.
   for (const run of [ran('', 1), () => ({ status: null, error: new Error('ENOENT') }), () => { throw new Error('spawn'); }]) {

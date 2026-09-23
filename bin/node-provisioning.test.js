@@ -310,8 +310,35 @@ test('doctor on a node counts each Codex hook\'s trust entry in config.toml, by 
   const partial = trust();
   assert.equal(partial.status, 'FAIL');
   assert.equal(partial.text, 'Codex hook trust (~/.codex): 2 of 9 hooks in ~/.codex/hooks.json have no trust entry in config.toml (checked by presence, not hash); a fresh Codex there stops at \'review required\' for each');
-  assert.match(partial.fix, /copy the \[hooks\.state\] tables from a profile that has accepted these hooks/);
+  assert.match(partial.fix, /copy the \[hooks\.state\] tables from a profile that has accepted these same hooks/);
+  assert.match(partial.fix, /rebasing each copied key from that profile's path to ~\/\.codex's/);
   assert.match(partial.fix, /press t once per hook/);
+
+  // Hooks defined inline in config.toml are Codex's too, keyed by config.toml's path.
+  const inline = `[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "echo inline"\n\n`;
+  const inlineTable = (key) => `[hooks.state."${dir}/config.toml:${key}"]\ntrusted_hash = "sha256:0"\n`;
+  config([inline, ...keys.map((key) => table(dir, key))]);
+  assert.deepEqual(trust(), { status: 'FAIL', text: 'Codex hook trust (~/.codex): 1 of 10 hooks in ~/.codex\'s hooks.json and config.toml have no trust entry in config.toml (checked by presence, not hash); a fresh Codex there stops at \'review required\' for each',
+    fix: trust().fix });
+  config([inline, ...keys.map((key) => table(dir, key)), inlineTable('stop:0:0')]);
+  assert.deepEqual(trust(), { status: 'ok', text: 'Codex hook trust (~/.codex): all 10 hooks in hooks.json and config.toml have a trust entry in config.toml (checked by presence, not hash)' });
+
+  // A profile reached through a link: a key under its real path counts, as Codex may
+  // have been given either. And a hooks.json that is itself a link is read through it.
+  const realProfile = path.join(home, 'profiles', 'codex-real');
+  fs.mkdirSync(path.dirname(realProfile), { recursive: true });
+  fs.renameSync(dir, realProfile);
+  fs.symlinkSync(realProfile, dir);
+  const shared = path.join(home, 'shared-hooks.json');
+  fs.renameSync(path.join(realProfile, 'hooks.json'), shared);
+  fs.symlinkSync(shared, path.join(realProfile, 'hooks.json'));
+  fs.writeFileSync(path.join(realProfile, 'config.toml'), `[features]\nhooks = true\n\n${keys.map((key) => table(realProfile, key)).join('\n')}`);
+  assert.deepEqual(trust(), { status: 'ok', text: 'Codex hook trust (~/.codex): all 9 hooks in hooks.json have a trust entry in config.toml (checked by presence, not hash)' },
+    'realpath-only keys, through a linked hooks.json');
+  fs.unlinkSync(dir);
+  fs.renameSync(realProfile, dir);
+  fs.unlinkSync(path.join(dir, 'hooks.json'));
+  fs.renameSync(shared, path.join(dir, 'hooks.json'));
 
   fs.rmSync(path.join(dir, 'config.toml'));
   assert.deepEqual([trust().status, trust().text], ['FAIL',
