@@ -61,11 +61,22 @@ function world(options = {}) {
       steps.push(['open', record.to]);
       assert.equal(state.node, record.to, 'the target starts only once the record names it');
       failing('open');
-      return { pane: record.to === 'main' ? 'p9' : 'p9@aws1', pid: 99, createdAt: 't1' };
+      state.launches = (state.launches || 0) + 1;
+      state.targetPane = `p${8 + state.launches}${record.to === 'main' ? '' : `@${record.to}`}`;
+      return { pane: state.targetPane, pid: 99, createdAt: 't1' };
     },
+    // What runs the session on the target now; `state.targetPane` is its live pane.
+    targetState: async () => {
+      steps.push(['target']);
+      failing('target');
+      return { running: Boolean(state.targetPane), pane: state.targetPane || null };
+    },
+    pinBack: async (record) => { steps.push(['pinBack', record.from]); failing('pinBack'); state.node = record.from; state.backs = (state.backs || 0) + 1; },
+    releaseTarget: async (record) => { steps.push(['release', record.to]); },
     waitForPaneRecord: async (record) => {
       steps.push(['wait', record.launch.pane]);
       failing('wait');
+      if (state.noStart) return null; // the wait timed out
       return { pane: record.launch.pane, startedAt: Date.now() };
     },
     relink: async () => { steps.push(['relink']); return 'card-1'; },
@@ -178,7 +189,10 @@ for (const [point, phase, holder, reached] of FAILURES) {
       assert.equal(w.state.pins, 1, 'the record flipped exactly once across both runs');
       assert.equal(w.state.node, 'aws1');
       assert.ok(!names(w.steps).includes('pin') || holder === 'main', 'a recovery after the flip does not pin again');
-      if (holder === 'aws1') assert.ok(!names(w.steps).includes('stop') && !names(w.steps).includes('transfer'));
+      if (holder === 'aws1') {
+        assert.ok(!names(w.steps).includes('stop') && !names(w.steps).includes('transfer'));
+        assert.deepEqual(names(w.steps).slice(0, 2), ['reprove', 'target'], 'a recovery after the flip proves the source stopped, then asks the target');
+      }
     } finally { w.cleanup(); }
   });
 }
@@ -244,7 +258,7 @@ test('a recovery from the copy proves the source stopped before carrying anythin
   } finally { w.cleanup(); }
 });
 
-test('an abandon before the flip clears the target stage and leaves the session on its source; after the flip it is refused', async () => {
+test('an abandon before the flip clears the target stage and leaves the session on its source', async () => {
   const w = world({ fail: { transfer: true } });
   try {
     let id;
@@ -256,13 +270,124 @@ test('an abandon before the flip clears the target stage and leaves the session 
     assert.equal(w.state.node, 'main');
     assert.equal(move.inFlight(w.root, SID), null);
   } finally { w.cleanup(); }
-  const after = world({ fail: { open: true } });
+});
+
+// A move that failed after the flip, with its id.
+async function failedAfterFlip(w) {
+  let id;
+  await assert.rejects(move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps), (error) => { id = error.extra.id; return true; });
+  assert.equal(w.state.node, 'aws1');
+  w.steps.length = 0;
+  return id;
+}
+
+test('a recovery after the launch launches again when the target does not run the session', async () => {
+  const w = world({ fail: { wait: true } });
   try {
-    let id;
-    await assert.rejects(move.moveSession({ sessionId: SID, node: 'aws1' }, after.deps), (error) => { id = error.extra.id; return true; });
-    await assert.rejects(move.moveSession({ abandon: id }, after.deps), /past the flip .* --recover/);
-    assert.equal(after.steps.some((step) => step[0] === 'abort'), false);
-  } finally { after.cleanup(); }
+    const id = await failedAfterFlip(w);
+    assert.match(move.readMove(w.root, id).message, /--abandon mv-[a-f0-9]+ puts it back on main once neither node runs it/);
+    const first = move.readMove(w.root, id).launchStartedAt;
+    w.state.targetPane = null; // the launched pane died before it started
+    const recovered = await move.moveSession({ recover: id }, w.deps);
+    assert.equal(recovered.status, 'done');
+    assert.deepEqual(names(w.steps), ['reprove', 'target', 'open', 'wait', 'relink', 'cleanup']);
+    const record = move.readMove(w.root, id);
+    assert.equal(record.relaunches, 1);
+    assert.equal(record.launch.pane, 'p10@aws1', 'the new launch is the one waited for');
+    assert.ok(record.launchStartedAt >= first);
+    assert.equal(w.state.pins, 1);
+  } finally { w.cleanup(); }
+});
+
+test('a recovery after the launch waits once more when the target runs it, and says plainly when it never starts', async () => {
+  const w = world({ fail: { wait: true } });
+  try {
+    const id = await failedAfterFlip(w);
+    w.state.noStart = true;
+    await assert.rejects(move.moveSession({ recover: id }, w.deps),
+      /sess-moving is running on aws1 in pane p9@aws1, but its session-start never reported, again/);
+    assert.deepEqual(names(w.steps), ['reprove', 'target', 'wait'], 'nothing was launched a second time');
+    w.state.noStart = false;
+    w.steps.length = 0;
+    const recovered = await move.moveSession({ recover: id }, w.deps);
+    assert.equal(recovered.status, 'done');
+    assert.deepEqual(names(w.steps), ['reprove', 'target', 'wait', 'relink', 'cleanup']);
+    assert.match(recovered.warnings.join('\n'), /never reported; waited for it once more/);
+    assert.equal(w.state.launches, 1);
+  } finally { w.cleanup(); }
+});
+
+test('a recovery from a launch that failed part way adopts the pane it left running', async () => {
+  const w = world();
+  const open = w.deps.open;
+  w.deps.open = async (record) => { await open(record); throw new Error('the host answered late'); };
+  try {
+    const id = await failedAfterFlip(w);
+    w.deps.open = open;
+    const recovered = await move.moveSession({ recover: id }, w.deps);
+    assert.equal(recovered.status, 'done');
+    assert.deepEqual(names(w.steps), ['reprove', 'target', 'wait', 'relink', 'cleanup']);
+    assert.equal(move.readMove(w.root, id).launch.pane, 'p9@aws1');
+  } finally { w.cleanup(); }
+});
+
+test('an abandon after the flip puts the record back on the source once neither node runs the session', async () => {
+  const w = world({ fail: { open: true } });
+  try {
+    const id = await failedAfterFlip(w);
+    // Refused while the source runs again, while the target runs it, or while either is unproven.
+    w.state.revived = true;
+    await assert.rejects(move.moveSession({ abandon: id }, w.deps), /cannot be abandoned: main is not proven stopped/);
+    w.state.revived = false;
+    w.state.targetPane = 'p7@aws1';
+    await assert.rejects(move.moveSession({ abandon: id }, w.deps), /cannot be abandoned: sess-moving is running on aws1 in pane p7@aws1/);
+    w.state.targetPane = null;
+    w.state.fail.target = Object.assign(new Error('the process table on aws1 could not be read'), { status: 409 });
+    await assert.rejects(move.moveSession({ abandon: id }, w.deps), /whether aws1 runs sess-moving is unproven/);
+    assert.equal(names(w.steps).includes('pinBack'), false);
+    assert.equal(w.state.node, 'aws1');
+    // Proven: the second flip, the target's copy released, the move ended.
+    w.steps.length = 0;
+    const abandoned = await move.moveSession({ abandon: id }, w.deps);
+    assert.equal(abandoned.status, 'abandoned-back');
+    assert.match(abandoned.message, /names main again, stopped: keep open sess-moving resumes it there/);
+    assert.deepEqual(names(w.steps), ['reprove', 'target', 'pinBack', 'release', 'abort']);
+    assert.equal(w.state.node, 'main');
+    assert.equal(w.state.backs, 1);
+    const record = move.readMove(w.root, id);
+    assert.deepEqual([record.abandonedBack.from, record.abandonedBack.to], ['aws1', 'main']);
+    assert.equal(move.inFlight(w.root, SID), null, 'the move no longer owns the session');
+    // Asked again, it is already done; and a new move may start.
+    assert.equal((await move.moveSession({ abandon: id }, w.deps)).status, 'abandoned-back');
+    assert.equal(w.state.backs, 1);
+    assert.equal((await move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps)).status, 'done');
+  } finally { w.cleanup(); }
+});
+
+test('an abandon whose flip back landed before its journal did finishes without flipping again', async () => {
+  const w = world({ fail: { open: true } });
+  try {
+    const id = await failedAfterFlip(w);
+    const releaseTarget = w.deps.releaseTarget;
+    const abortStage = w.deps.abortStage;
+    w.deps.releaseTarget = async () => { throw new Error('aws1 did not answer'); };
+    w.deps.abortStage = async () => { throw new Error('aws1 did not answer'); };
+    const abandoned = await move.moveSession({ abandon: id }, w.deps);
+    assert.equal(abandoned.status, 'abandoned-back');
+    assert.equal(abandoned.warnings.length, 2, 'a release that failed is reported, not fatal');
+    // Rewind the journal to just after the flip back, as a daemon that went away
+    // there would have left it.
+    const record = move.readMove(w.root, id);
+    const rewound = { ...record, status: 'recovery-needed', phase: 'starting' };
+    delete rewound.warnings;
+    fs.writeFileSync(path.join(w.root, '.keep', 'session-moves', `${id}.json`), JSON.stringify(rewound));
+    w.deps.releaseTarget = releaseTarget;
+    w.deps.abortStage = abortStage;
+    w.steps.length = 0;
+    assert.equal((await move.moveSession({ abandon: id }, w.deps)).status, 'abandoned-back');
+    assert.deepEqual(names(w.steps), ['reprove', 'target', 'release', 'abort']);
+    assert.equal(w.state.backs, 1, 'the record was flipped back once');
+  } finally { w.cleanup(); }
 });
 
 test('a move request is validated before anything is asked', async () => {

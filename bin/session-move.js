@@ -11,7 +11,13 @@
 //   pinned    -> the location record names the target (the single flip)
 //   starting  -> the target is launched through openSession, pinned to the new record
 //   verifying -> the target's session-start has reported its pane
-//   done | recovery-needed | abandoned
+//   done | recovery-needed | abandoned | abandoned-back
+//
+// A recovery after a launch asks the target whether it runs the session: if not, it
+// is launched again under the same transaction; if so, its start is waited for once
+// more. An abandon before the flip clears the target's stage; after it, only once
+// neither node runs the session, it flips the record back to the source (the second
+// flip, journalled as abandoned-back) and leaves the target's copy released.
 //
 // A session is never running on two nodes at once: nothing launches before the source
 // is proven stopped, the flip happens once between the copy and the launch, and a
@@ -32,6 +38,7 @@ const TX_RE = /^mv-[a-f0-9]{24}$/;
 const IN_FLIGHT = ['stopping', 'copying', 'staged', 'pinned', 'starting', 'verifying', 'recovery-needed'];
 const ORDER = ['stopping', 'copying', 'staged', 'pinned', 'starting', 'verifying', 'done'];
 const BEFORE_FLIP = ['stopping', 'copying', 'staged'];
+const AFTER_FLIP = ['pinned', 'starting', 'verifying'];
 
 const active = new Map(); // sessionId -> promise
 
@@ -96,7 +103,8 @@ function recoveryMessage(record) {
   const before = BEFORE_FLIP.includes(record.phase);
   return `move ${record.id} of ${record.sessionId} stopped while ${record.phase}: ${record.reason}. `
     + `Its location record names ${holder}, which holds its verified bytes. `
-    + `keep move --recover ${record.id} continues${before ? `; keep move --abandon ${record.id} leaves it on ${record.from}` : ''}.`;
+    + `keep move --recover ${record.id} continues; keep move --abandon ${record.id} `
+    + (before ? `leaves it on ${record.from}.` : `puts it back on ${record.from} once neither node runs it.`);
 }
 
 async function preflight(body, deps) {
@@ -148,7 +156,7 @@ async function preflight(body, deps) {
   };
 }
 
-async function run(record, deps) {
+async function run(record, deps, options = {}) {
   const root = rootOf(deps);
   const now = deps.now || Date.now;
   const save = () => writeMove(root, record);
@@ -197,12 +205,37 @@ async function run(record, deps) {
       record.status = 'pinned'; save();
     }
     phase = record.status;
-    if (record.status === 'pinned' || record.status === 'starting') {
+    let waitingAgain = null;
+    if (AFTER_FLIP.includes(record.status)) {
       const location = await deps.location(record.sessionId);
       if (!location || location.node !== record.to) throw new Error(`the location record does not name ${record.to}`);
       // The copy can take minutes, and a recovery can come much later: whatever the
-      // journal says, nothing launches until the source's table says it is stopped now.
-      await reprove('before the target is launched');
+      // journal says, nothing launches (or is waited for) until the source's table
+      // says it is stopped now.
+      await reprove(record.status === 'verifying' ? 'while the target is starting' : 'before the target is launched');
+      if (options.resumed && (record.status === 'starting' || record.status === 'verifying')) {
+        // A recovery after a launch was asked for: whether the target runs it decides
+        // between waiting for its start once more and launching it again.
+        const target = await deps.targetState(record);
+        if (target && target.running) {
+          if (target.pane) record.launch = { ...(record.launch || {}), pane: target.pane };
+          if (!record.launch || !record.launch.pane) {
+            throw new Error(`an agent for ${record.sessionId} runs on ${record.to}, but in no pane this move can name`);
+          }
+          waitingAgain = `${record.sessionId} is running on ${record.to} in pane ${record.launch.pane}, but its session-start never reported`;
+          warnings.push(`${waitingAgain}; waited for it once more`);
+          record.status = 'verifying'; save();
+        } else {
+          // Nothing runs it there: launch it again, under this transaction.
+          if (record.launch || record.status === 'verifying') record.relaunches = (record.relaunches || 0) + 1;
+          delete record.launch;
+          record.launchStartedAt = now();
+          record.status = 'starting'; save();
+        }
+      }
+    }
+    phase = record.status;
+    if (record.status === 'pinned' || record.status === 'starting') {
       record.launchStartedAt ||= now();
       record.status = 'starting'; save();
       phase = record.status;
@@ -215,7 +248,9 @@ async function run(record, deps) {
     phase = record.status;
     if (record.status === 'verifying') {
       const started = await deps.waitForPaneRecord(record);
-      if (!started) throw new Error(`the resumed session on ${record.to} did not report its start`);
+      if (!started) {
+        throw new Error(waitingAgain ? `${waitingAgain}, again` : `the resumed session on ${record.to} did not report its start`);
+      }
       record.started = { pane: started.pane, startedAt: started.startedAt };
       try {
         const linked = await deps.relink(record);
@@ -274,10 +309,57 @@ async function recover(tx, deps) {
     // Continue from the step that did not finish, or from the one a daemon that went
     // away was in the middle of.
     if (record.status === 'recovery-needed') record.status = ORDER.includes(record.phase) ? record.phase : 'stopping';
-    if (record.status === 'pinned') record.status = 'starting';
     delete record.reason; delete record.message; delete record.holder;
     writeMove(root, record);
-    return run(record, deps);
+    return run(record, deps, { resumed: true });
+  });
+}
+
+// Past the flip the record names the target, which holds verified bytes; the way
+// back is a second, explicit flip, and only when neither machine can be running the
+// session: the source proven stopped on its own table and the target proven not
+// running it on its own. The target's published copy stays where it is, released (a
+// later move there may replace it), and the move ends, so keep open resumes the
+// session on its source again.
+async function abandonAfterFlip(record, deps) {
+  const root = rootOf(deps);
+  const now = deps.now || Date.now;
+  return exclusive(record.sessionId, async () => {
+    const location = await deps.location(record.sessionId);
+    // A flip back that happened before the journal could say so is not done twice.
+    const back = Boolean(location && location.node === record.from && record.abandonedBack);
+    if (!back && (!location || location.node !== record.to)) {
+      throw refusal(409, `the location record of ${record.sessionId} names ${location ? location.node : 'no node'}, not ${record.to}; nothing was changed`);
+    }
+    try { await deps.requireStopped(record); }
+    catch (error) {
+      throw refusal(409, `move ${record.id} cannot be abandoned: ${record.from} is not proven stopped: ${error && error.message || error}`);
+    }
+    let target;
+    try { target = await deps.targetState(record); }
+    catch (error) {
+      throw refusal(409, `move ${record.id} cannot be abandoned: whether ${record.to} runs ${record.sessionId} is unproven: ${error && error.message || error}`);
+    }
+    if (!target || target.running) {
+      throw refusal(409, `move ${record.id} cannot be abandoned: ${record.sessionId} is running on ${record.to}`
+        + `${target && target.pane ? ` in pane ${target.pane}` : ''}; keep move --recover ${record.id} finishes the move instead`);
+    }
+    if (!back) {
+      record.abandonedBack = { at: now(), from: record.to, to: record.from };
+      writeMove(root, record);
+      await deps.pinBack(record);
+    }
+    const warnings = [];
+    try { await deps.releaseTarget(record); }
+    catch (error) { warnings.push(`the copy on ${record.to} was not released: ${error && error.message || error}`); }
+    try { await deps.abortStage(record); }
+    catch (error) { warnings.push(`the transaction on ${record.to} was not cleared: ${error && error.message || error}`); }
+    Object.assign(record, { status: 'abandoned-back', abandonedAt: now(),
+      message: `move ${record.id} abandoned after the flip; ${record.sessionId}'s record names ${record.from} again, stopped: keep open ${record.sessionId} resumes it there` });
+    if (warnings.length) record.warnings = warnings;
+    delete record.holder;
+    writeMove(root, record);
+    return { ok: true, ...safe(record) };
   });
 }
 
@@ -285,11 +367,10 @@ async function abandon(tx, deps) {
   const root = rootOf(deps);
   const record = readMove(root, tx);
   if (!record) throw refusal(404, `no move ${tx}`);
-  if (record.status === 'abandoned') return { ok: true, ...safe(record) };
+  if (record.status === 'abandoned' || record.status === 'abandoned-back') return { ok: true, ...safe(record) };
+  if (!IN_FLIGHT.includes(record.status)) throw refusal(409, `move ${tx} is ${record.status}; there is nothing to abandon`);
   const phase = record.status === 'recovery-needed' ? record.phase : record.status;
-  if (!IN_FLIGHT.includes(record.status) || !BEFORE_FLIP.includes(phase)) {
-    throw refusal(409, `move ${tx} is past the flip (its record names ${record.to}); keep move --recover ${tx} instead`);
-  }
+  if (!BEFORE_FLIP.includes(phase)) return abandonAfterFlip(record, deps);
   return exclusive(record.sessionId, async () => {
     const location = await deps.location(record.sessionId);
     if (location && location.node !== record.from) {

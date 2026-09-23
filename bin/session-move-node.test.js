@@ -216,3 +216,33 @@ test('a process table the daemon node cannot read refuses the move before anythi
     } finally { empty.cleanup(); }
   } finally { w.cleanup(); }
 });
+
+test('the target is found running by its live pane or by its own process table, and unproven when that table is unreadable', async () => {
+  const record = { id: `mv-${'d'.repeat(24)}`, sessionId: SID, from: 'aws1', to: 'main', accountId: 'claude-a' };
+  const idle = '11 10 ttys001 Tue Sep  8 10:00:00 2026 /bin/zsh';
+  const state = (deps) => serve.sessionMoveDeps({ daemonNode: 'main', listHostPanes: async () => [], psTable: idle, ...deps }).targetState(record);
+  assert.deepEqual(await state({}), { running: false, pane: null, agent: false });
+  const pane = { id: 'p4', alive: true, meta: { sessionId: SID }, node: 'main' };
+  assert.deepEqual(await state({ listHostPanes: async () => [pane] }), { running: true, pane: 'p4', agent: false });
+  assert.equal((await state({ listHostPanes: async () => [{ ...pane, alive: false }] })).running, false, 'a dead pane runs nothing');
+  assert.equal((await state({ listHostPanes: async () => [{ ...pane, id: 'p4@aws1', node: 'aws1' }] })).running, false, 'a pane on the other node is not the target');
+  assert.deepEqual(await state({ psTable: `${idle}\n12 10 ttys002 Tue Sep  8 10:00:00 2026 /test/claude --resume ${SID}` }),
+    { running: true, pane: null, agent: true });
+  await assert.rejects(state({ psTable: '' }), /process table on main could not be read/);
+  await assert.rejects(state({ listHostPanes: async () => null }), /did not list their panes/);
+});
+
+test('the abandon\'s flip back names the source in the location record again', () => {
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-move-back-'));
+  try {
+    const config = path.join(root, 'config.json');
+    fs.mkdirSync(path.join(root, 'claude'));
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [{ id: 'claude-a', label: 'Claude A', agent: 'claude', configDir: path.join(root, 'claude') }], defaultAccounts: { claude: 'claude-a' } }));
+    const env = { ...process.env, KEEP_CONFIG: config };
+    delete env.CLAUDE_CODE_SESSION_ID;
+    accounts.pinSession(SID, 'claude', 'claude-a', { root, env, node: 'main' });
+    accounts.pinSession(SID, 'claude', 'claude-a', { root, env, node: 'aws1', transferNode: true });
+    serve.sessionMoveDeps({ root, env, daemonNode: 'main' }).pinBack({ sessionId: SID, accountId: 'claude-a', from: 'main', to: 'aws1' });
+    assert.equal(accounts.sessionNode(SID, { root, env }), 'main');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

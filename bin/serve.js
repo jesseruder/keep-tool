@@ -12577,6 +12577,20 @@ function sessionMoveDeps(deps = {}) {
     },
     // The same proof, asked again before the flip and before every launch.
     requireStopped: (record) => requireNoAgentOn(record.from, record.sessionId, deps),
+    // Whether the target runs the session now: a live pane for it there, or an agent
+    // process in the target's own table. An unreadable table throws (unproven).
+    targetState: async (record) => {
+      const panes = await listPanes();
+      if (!Array.isArray(panes)) throw new InjectionError(409, 'the terminal hosts did not list their panes');
+      const pane = panes.find((entry) => entry && entry.alive !== false && entry.meta && entry.meta.sessionId === record.sessionId
+        && sessionNodeOf(entry, deps) === record.to) || null;
+      const agent = await agentLiveOn(record.to, record.sessionId, deps);
+      return { running: Boolean(pane) || agent, pane: pane ? pane.id : null, agent };
+    },
+    // The abandon's flip back, the only other flip a move makes.
+    pinBack: (record) => accounts.pinSession(record.sessionId, 'claude', record.accountId,
+      { root, env, node: record.from, transferNode: true }),
+    releaseTarget: (record) => moveEndpoint(record.to, accountOf(record), deps).release(record.sessionId),
     transfer: (record) => {
       const account = accountOf(record);
       return artifactTransport.transfer({ sessionId: record.sessionId, tx: record.id,

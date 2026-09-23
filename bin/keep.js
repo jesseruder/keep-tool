@@ -3481,7 +3481,11 @@ commands.move = async (argv, deps = {}) => {
       + `${result.pane ? `, stopping pane ${result.pane.id}` : ', no live pane'}`);
     return;
   }
-  if (result.status === 'abandoned') { stdout(result.message); return; }
+  if (result.status === 'abandoned' || result.status === 'abandoned-back') {
+    stdout(result.message);
+    for (const warning of result.warnings || []) stdout(`  note: ${warning}`);
+    return;
+  }
   stdout(`moved ${result.sessionId} from ${result.from} to ${result.to}${result.launch ? ` in pane ${result.launch.pane}` : ''}`
     + ` (${result.files} file${result.files === 1 ? '' : 's'}, ${result.bytes} bytes; move ${result.id})`);
   for (const warning of result.warnings || []) stdout(`  note: ${warning}`);

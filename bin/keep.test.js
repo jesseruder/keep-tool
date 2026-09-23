@@ -3311,6 +3311,12 @@ test('keep move posts the session, the node and Owner\'s force to the daemon and
     assert.deepEqual(recoverOut, [`move ${tx} abandoned; sess-moving stays on main`]);
     await moveCommandCli(['--recover', tx], { root, postKeepApi: recover.postKeepApi, stdout: () => {} });
     assert.deepEqual(recover.calls[1].body, { recover: tx });
+    // An abandon after the flip says where the record went back to, and what it left.
+    const back = moveStub(() => ({ status: 200, body: { ok: true, status: 'abandoned-back',
+      message: `move ${tx} abandoned after the flip; sess-moving's record names main again`, warnings: ['the copy on aws1 was not released: x'] } }));
+    const backOut = [];
+    await moveCommandCli(['--abandon', tx], { root, postKeepApi: back.postKeepApi, stdout: (line) => backOut.push(line) });
+    assert.deepEqual(backOut, [`move ${tx} abandoned after the flip; sess-moving's record names main again`, '  note: the copy on aws1 was not released: x']);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
