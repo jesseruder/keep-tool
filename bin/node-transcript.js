@@ -167,9 +167,12 @@ async function handle(params, options = {}) {
     const { matchesFrom } = require('./delivery.js');
     const deadline = now() + timeoutMs;
     let budget = options.maxReadBytes || REQUEST_MAX_READ_BYTES;
+    // Each poll picks up where the last one stopped (offset, partial line, decoder),
+    // so the budget is spent on bytes read once, not on the same bytes every 500 ms.
+    const resume = {};
     for (;;) {
       const current = fs.fstatSync(fd);
-      const result = matchesFrom(fd, params.fromOffset, { kind: params.kind, hash: params.hash, maxBytes: budget });
+      const result = matchesFrom(fd, params.fromOffset, { kind: params.kind, hash: params.hash, maxBytes: budget, resume });
       budget -= result.bytesRead;
       const answer = { ...describe(file, current), matched: result.matched, checkedTo: result.checkedTo };
       if (result.matched) return answer;

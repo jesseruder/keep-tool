@@ -42,26 +42,37 @@ function indexConfirms(entry, { text, db, trace } = {}) {
 // `source` is a path or an open descriptor. `maxBytes` bounds one call: a caller
 // that has to answer within a budget stops there and says how far it looked. It
 // needs nothing from the daemon, and reads nothing but the one file.
-function matchesFrom(source, offset, { kind, hash: wanted, maxBytes = Infinity } = {}) {
+//
+// `resume`, an object the caller keeps between calls on the same file and the same
+// question, carries where the last call stopped (the offset, the partial line and the
+// decoder's pending bytes, and the Codex /compact eligibility), so a caller that polls
+// a growing file reads each byte once instead of re-scanning from `offset` every time.
+// Without it every call starts from `offset`, as it always has.
+function matchesFrom(source, offset, { kind, hash: wanted, maxBytes = Infinity, resume = null } = {}) {
+  const state = resume && typeof resume === 'object' ? resume : {};
+  if (!state.decoder) {
+    Object.assign(state, {
+      offset, partial: '', decoder: new (require('string_decoder').StringDecoder)('utf8'),
+      compactEligible: kind === 'codex' && wanted === hash('/compact'), startedTurns: 0,
+    });
+  }
   const owned = typeof source !== 'number';
   const size = owned ? fs.statSync(source).size : fs.fstatSync(source).size;
-  if (size < offset) return { matched: false, checkedTo: offset, bytesRead: 0 };
+  if (size < state.offset) return { matched: false, checkedTo: state.offset, bytesRead: 0 };
   const fd = owned ? fs.openSync(source, 'r') : source;
-  let offsetNow = offset, bytesRead = 0;
+  let offsetNow = state.offset, bytesRead = 0;
   try {
-    const decoder = new (require('string_decoder').StringDecoder)('utf8');
+    const decoder = state.decoder;
     const bytes = Buffer.alloc(256 * 1024);
-    let partial = '';
-    let compactEligible = kind === 'codex' && wanted === hash('/compact');
-    let startedTurns = 0;
     const found = () => ({ matched: true, checkedTo: offsetNow, bytesRead });
     while (offsetNow < size && bytesRead < maxBytes) {
       const n = fs.readSync(fd, bytes, 0, Math.min(bytes.length, size - offsetNow, maxBytes - bytesRead), offsetNow);
       if (!n) break;
       offsetNow += n;
       bytesRead += n;
-      const lines = (partial + decoder.write(bytes.subarray(0, n))).split('\n');
-      partial = lines.pop();
+      state.offset = offsetNow;
+      const lines = (state.partial + decoder.write(bytes.subarray(0, n))).split('\n');
+      state.partial = lines.pop();
       for (const line of lines) {
         try {
           const record = JSON.parse(line);
@@ -83,11 +94,11 @@ function matchesFrom(source, offset, { kind, hash: wanted, maxBytes = Infinity }
           // Codex /compact has no ordinary user receipt. Accept its native
           // completion only before any intervening conversational work/turn.
           // A later automatic compaction must not acknowledge an old draft.
-          if (compactEligible) {
+          if (state.compactEligible) {
             if (record.type === 'compacted') return found();
             if (record.type === 'response_item' || (record.type === 'event_msg' &&
                 (['user_message', 'agent_message', 'task_complete', 'turn_aborted', 'error'].includes(record.payload?.type)
-                  || (record.payload?.type === 'task_started' && ++startedTurns > 1)))) compactEligible = false;
+                  || (record.payload?.type === 'task_started' && ++state.startedTurns > 1)))) state.compactEligible = false;
           }
         }
         catch {}

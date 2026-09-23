@@ -2752,3 +2752,33 @@ test('one transcript request reads at most its budget, and says so', async () =>
     assert.equal(require('./node-transcript.js').REQUEST_MAX_READ_BYTES, 32 * 1024 * 1024);
   } finally { node.cleanup(); }
 });
+
+test('a match on a growing transcript reads each byte once across its polls, a line and a character split between them included', async () => {
+  const node = transcriptNode('grow');
+  try {
+    const { handle } = require('./node-transcript.js');
+    const { textHash } = require('./delivery.js');
+    const filler = `${JSON.stringify({ type: 'assistant', message: { content: 'x'.repeat(1000) } })}\n`;
+    fs.appendFileSync(node.file, filler.repeat(100));
+    // The line that answers, split inside its multi-byte character across two polls.
+    const wanted = 'café is open';
+    const line = Buffer.from(node.user(wanted));
+    const cut = line.indexOf(Buffer.from('é')) + 1;
+    const growth = [Buffer.from(filler.repeat(10)), Buffer.from(filler.repeat(10)), line.subarray(0, cut), line.subarray(cut)];
+    let clock = 0;
+    let polls = 0;
+    const options = {
+      env: node.env,
+      now: () => clock,
+      sleep: async (ms) => { clock += ms; polls += 1; const next = growth.shift(); if (next) fs.appendFileSync(node.file, next); },
+      // Enough to read the file once, and far short of re-reading it on every poll.
+      maxReadBytes: fs.statSync(node.file).size + 40 * 1024,
+    };
+    const answer = await handle({ kind: 'claude', sessionId: 'sess-transcript', account: node.account, op: 'match',
+      fromOffset: 0, hash: textHash(wanted), timeoutMs: 9000 }, options);
+    assert.equal(answer.matched, true);
+    assert.equal(answer.capped, undefined);
+    assert.equal(polls, 4, 'matched on the poll after the line was completed');
+    assert.equal(answer.checkedTo, fs.statSync(node.file).size);
+  } finally { node.cleanup(); }
+});
