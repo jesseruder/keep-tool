@@ -223,3 +223,48 @@ test('doctor reports hook delivery: the queue and cursor on a node, the mirrors 
   assert.equal(mirrors.status, 'ok');
   assert.equal(mirrors.text, 'transcript mirrors: aws1 3.0 MiB in 1 mirror(s)');
 });
+
+test('doctor on a node checks every Codex profile\'s hooks against this checkout, and says whether lsof is here', (t) => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-doctor-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { HOME: home, KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main', KEEP_DAEMON_URL: 'http://100.64.0.1:7781' };
+  const keepBin = path.join(home, 'keep-tool', 'bin', 'keep');
+  fs.mkdirSync(path.dirname(keepBin), { recursive: true });
+  fs.writeFileSync(keepBin, '#!/bin/sh\n', { mode: 0o755 });
+  const hooks = (bin, actions) => ({ hooks: Object.fromEntries(actions.map((action, n) => [`Event${n}`,
+    [{ hooks: [{ type: 'command', command: `${bin} hook codex ${action}`, timeout: 3 }, { type: 'command', command: 'echo unrelated' }] }]])) });
+  const all = ['start', 'stop', 'end', 'pre-tool', 'post-tool', 'question', 'approval', 'lifecycle'];
+  const profile = (name, value, toml) => {
+    const dir = path.join(home, name);
+    fs.mkdirSync(dir);
+    if (value !== undefined) fs.writeFileSync(path.join(dir, 'hooks.json'), typeof value === 'string' ? value : JSON.stringify(value));
+    if (toml !== undefined) fs.writeFileSync(path.join(dir, 'config.toml'), toml);
+  };
+  const report = (extra = {}) => setup.codexHooksReport({ env, keepBin, hasLsof: () => false, platform: 'linux', ...extra });
+
+  assert.deepEqual(setup.codexHooksReport({ env: { HOME: home, KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' }, keepBin }), [], 'the daemon node\'s profiles are its own');
+  assert.deepEqual(report(), [{ status: 'ok', text: 'lsof absent: Codex sessions\' open rollouts are read from /proc' }], 'no Codex here: only the lsof row');
+
+  profile('.codex', hooks(keepBin, all), 'model = "x"\n\n[features]\n# on\nhooks = true\n\n[other]\nhooks = false\n');
+  profile('.codex-secondary', hooks('/opt/elsewhere/keep-tool/bin/keep', all), '[features]\nhooks = true\n');
+  profile('.codex-third', hooks(keepBin, ['start', 'stop']), '[features]\nhooks = false\n');
+  profile('.codex-fourth', undefined, '[features]\nhooks = true\n');
+  profile('.codex-fifth', '{ not json', '');
+  profile('.codexy', hooks(keepBin, all), '');
+  const rows = report();
+  assert.deepEqual(rows.map((row) => [row.status, row.text]), [
+    ['ok', `Codex hooks (~/.codex) reach ${keepBin}`],
+    ['FAIL', `Codex hooks (~/.codex-fifth): hooks.json unreadable: ${(() => { try { JSON.parse('{ not json'); } catch (error) { return error.message; } })()}; its sessions on aws1 run unguarded and unregistered`],
+    ['FAIL', 'Codex hooks (~/.codex-fourth): no hooks.json; its sessions on aws1 run unguarded and unregistered'],
+    ['FAIL', `Codex hooks (~/.codex-secondary): commands point at /opt/elsewhere/keep-tool/bin/keep, not this node's ${keepBin}; not wired: ${all.join(', ')}`],
+    ['FAIL', `Codex hooks (~/.codex-third): not wired: end, pre-tool, post-tool, question, approval, lifecycle; [features] hooks = true is not set in config.toml`],
+    ['ok', 'lsof absent: Codex sessions\' open rollouts are read from /proc'],
+  ]);
+  assert.match(rows[2].fix, /wire keep hook codex <action> to .*keep-tool\/bin\/keep in ~\/\.codex\/hooks\.json/);
+  // A link to this checkout is this checkout.
+  const linked = path.join(home, 'keep-link');
+  fs.symlinkSync(path.join(home, 'keep-tool'), linked);
+  assert.equal(report({ keepBin: path.join(linked, 'bin', 'keep') })[0].status, 'ok');
+  assert.deepEqual(report({ hasLsof: () => true }).at(-1), { status: 'ok', text: 'lsof present: Codex sessions\' open rollouts are read with it' });
+  assert.deepEqual(report({ platform: 'darwin' }).at(-1).status, 'optional');
+});

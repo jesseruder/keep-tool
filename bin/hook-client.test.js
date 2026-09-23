@@ -601,7 +601,9 @@ test('a Codex answer on the node is always JSON: {} for anything else and when t
   }
   const start = await codexRun(f, 'start', url, codexInput(f));
   assert.equal(start.status, 0);
-  assert.match(onlyJson(start).hookSpecificOutput.additionalContext, /the daemon is on main/);
+  assert.match(onlyJson(start).hookSpecificOutput.additionalContext, new RegExp('^Keep: this session is unmanaged on node aws1; the daemon is on main\\. '
+    + 'Its hooks, the command guards and the deploy and step records among them, and its registry commands reach the daemon at '
+    + `${url.replace(/[.]/g, '\\.')}; the daemon did not answer this start, so it is queued and resent with the next hook\\. Not available on this node: keep tell`));
   // Malformed stdin: still JSON, nothing posted.
   const garbage = await codexRun(f, 'stop', weird.url, 'not json');
   assert.deepEqual(onlyJson(garbage), {});

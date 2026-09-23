@@ -445,11 +445,11 @@ function sessionNumberContext(sessionId) {
 // here may write a registry: one on this machine would be a second, diverging copy.
 // What stays is what the terminal host on this machine needs: the pane is bound to
 // the session at start and released at the end, so the console can show it and
-// Owner can type into it, restart it and close it. With KEEP_DAEMON_URL a Claude
-// session's hooks (its command guards and deploy and step records among them) and
-// every registry command go to the daemon; this notice is then what a start says
-// when the daemon did not answer it (`url`, agent claude), or what a Codex start
-// says, whose hooks are not carried yet (nor are Pi's).
+// Owner can type into it, restart it and close it. With KEEP_DAEMON_URL a Claude or
+// Codex session's hooks (its command guards and deploy and step records among them)
+// and every registry command go to the daemon; this notice is then what a start says
+// when the daemon did not answer it (`url`, agent claude or codex). A Pi session's
+// hooks are not carried yet.
 const NODE_UNAVAILABLE = 'Not available on this node: keep tell, keep open, keep codex task, and admin commands'
   + ' such as keep serve, keep restart-daemon and keep nodes add.';
 
@@ -459,11 +459,11 @@ function paneOnlyNotice(where, options = {}) {
     return `${head}keep checkin and other registry commands are not available here: this node has no KEEP_DAEMON_URL`
       + ' (keep node init --daemon-url).';
   }
-  const reach = options.agent === 'claude'
+  const reach = options.agent === 'claude' || options.agent === 'codex'
     ? `Its hooks, the command guards and the deploy and step records among them, and its registry commands reach the daemon at ${options.url}; `
       + 'the daemon did not answer this start, so it is queued and resent with the next hook.'
     : `Registry commands (keep checkin, keep add, keep reviewed, keep land and the rest) reach the daemon at ${options.url}; this session's hooks do not yet: `
-      + 'a Codex or Pi session on a node refuses deploys by name and records no deploy or step run.';
+      + 'a Pi session on a node refuses deploys by name and records no deploy or step run.';
   return `${head}${reach} ${NODE_UNAVAILABLE}`;
 }
 

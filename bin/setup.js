@@ -916,6 +916,80 @@ function hookDeliveryReport(deps = {}) {
   return [{ status: 'ok', text: `transcript mirrors: ${names.map((name) => `${name} ${mib(usage[name].bytes)} in ${usage[name].mirrors} mirror(s)`).join(', ')}` }];
 }
 
+// Codex on a node: every Codex profile under this home (~/.codex, ~/.codex-*) wires its
+// hooks to this node's checkout with hooks switched on, or its sessions run with no
+// guard and are never registered. And whether lsof is here: without it a Linux node
+// reads its Codex sessions' open rollouts from /proc, so its absence is reported,
+// not failed. Only on a pane-only node; the daemon node's own profiles are its own.
+const CODEX_HOOK_ACTIONS = ['start', 'stop', 'end', 'pre-tool', 'post-tool', 'question', 'approval', 'lifecycle'];
+
+function codexHooksReport(deps = {}) {
+  const env = deps.env || process.env;
+  const where = require('./nodes.js').paneOnlyNode(env);
+  if (!where) return [];
+  const home = env.HOME || os.homedir();
+  const keepBin = deps.keepBin || path.join(path.resolve(__dirname, '..'), 'bin', 'keep');
+  const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
+  const tilde = (file) => (file.startsWith(home + path.sep) ? `~${file.slice(home.length)}` : file);
+  let profiles = [];
+  try {
+    profiles = fs.readdirSync(home, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^\.codex(?:-[A-Za-z0-9_.-]+)?$/.test(entry.name))
+      .map((entry) => path.join(home, entry.name)).sort();
+  } catch {}
+  const rows = [];
+  for (const dir of profiles) {
+    const name = tilde(dir);
+    let hooks = null;
+    try { hooks = JSON.parse(fs.readFileSync(path.join(dir, 'hooks.json'), 'utf8')); } catch (error) {
+      rows.push({ status: 'FAIL', text: `Codex hooks (${name}): ${error.code === 'ENOENT' ? 'no hooks.json' : `hooks.json unreadable: ${error.message}`}; its sessions on ${where.local} run unguarded and unregistered`,
+        fix: `wire keep hook codex <action> to ${keepBin} in ~/.codex/hooks.json; a managed profile shares it on its next Keep launch` });
+      continue;
+    }
+    const commands = [];
+    for (const groups of Object.values((hooks && hooks.hooks) || {})) {
+      for (const group of Array.isArray(groups) ? groups : []) {
+        for (const hook of Array.isArray(group && group.hooks) ? group.hooks : []) {
+          if (hook && typeof hook.command === 'string') commands.push(hook.command);
+        }
+      }
+    }
+    const wired = new Set();
+    const elsewhere = new Set();
+    for (const command of commands) {
+      const match = /^\s*(\S+)\s+hook\s+codex\s+([a-z-]+)/.exec(command);
+      if (!match) continue;
+      if (real(match[1]) !== real(keepBin)) elsewhere.add(match[1]);
+      else wired.add(match[2]);
+    }
+    const missing = CODEX_HOOK_ACTIONS.filter((action) => !wired.has(action));
+    let enabled = false;
+    try {
+      const toml = fs.readFileSync(path.join(dir, 'config.toml'), 'utf8');
+      let section = '';
+      for (const line of toml.split(/\r?\n/)) {
+        const header = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(line);
+        if (header) { section = header[1].trim(); continue; }
+        if (section === 'features' && /^\s*hooks\s*=\s*true\s*(?:#.*)?$/.test(line)) enabled = true;
+      }
+    } catch {}
+    const problems = [];
+    if (elsewhere.size) problems.push(`commands point at ${[...elsewhere].join(', ')}, not this node's ${keepBin}`);
+    if (missing.length) problems.push(`not wired: ${missing.join(', ')}`);
+    if (!enabled) problems.push('[features] hooks = true is not set in config.toml');
+    rows.push(problems.length
+      ? { status: 'FAIL', text: `Codex hooks (${name}): ${problems.join('; ')}`, fix: `wire keep hook codex <action> to ${keepBin} in ${name}/hooks.json and set [features] hooks = true in ${name}/config.toml` }
+      : { status: 'ok', text: `Codex hooks (${name}) reach ${keepBin}` });
+  }
+  const lsof = (deps.hasLsof || require('./process-table.js').hasLsof)();
+  const linux = (deps.platform || process.platform) === 'linux';
+  rows.push({ status: lsof || linux ? 'ok' : 'optional',
+    text: lsof ? 'lsof present: Codex sessions\' open rollouts are read with it'
+      : linux ? 'lsof absent: Codex sessions\' open rollouts are read from /proc'
+      : 'lsof absent: Codex sessions here cannot be matched to their panes' });
+  return rows;
+}
+
 async function doctor(root) {
   let failed = false;
   const check = (name, fn, required = true) => {
@@ -964,7 +1038,7 @@ async function doctor(root) {
     if (entry.fix) console.log(`  fix: ${entry.fix}`);
     if (entry.status === 'FAIL') failed = true;
   }
-  for (const entry of [...await nodeHomeReport(), ...await nodeApiReport({ root }), ...hookDeliveryReport({ root })]) {
+  for (const entry of [...await nodeHomeReport(), ...await nodeApiReport({ root }), ...hookDeliveryReport({ root }), ...codexHooksReport()]) {
     console.log(`${entry.status}: ${entry.text}`);
     if (entry.fix) console.log(`  fix: ${entry.fix}`);
     if (entry.status === 'FAIL') failed = true;
@@ -977,7 +1051,7 @@ async function doctor(root) {
 }
 
 module.exports = {
-  init, installHooks, installSkills, service, node, doctor, nodeHomeReport, nodeApiReport, hookDeliveryReport, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
+  init, installHooks, installSkills, service, node, doctor, nodeHomeReport, nodeApiReport, hookDeliveryReport, codexHooksReport, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
   HOOK_ACTIONS, missingHooks, hookTargets, hookTarget,
   loadPacks, configuredPacks, installPackNames, skillPlans, applySkillPlans, reportSkillPlans, listPacks,
   recordPacks, recordPreflight,

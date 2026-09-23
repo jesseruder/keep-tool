@@ -29,11 +29,12 @@ Use the same checkout path and `KEEP_CONFIG` prefix as the installed commands.
 
 ### Sessions on another node
 
-A Claude session on a pane-only node whose daemon is known (`KEEP_DAEMON_URL`, set by
-`keep node init --daemon-url`) runs the same hook commands; they post to the daemon's
-node API (`POST /api/hook`) and print what the daemon's own `keep hook <event>` printed.
-Every Claude event in the table is carried: session-start, session-end, stop,
-notification, pre-question, lifecycle, and the Bash pair.
+A Claude or Codex session on a pane-only node whose daemon is known (`KEEP_DAEMON_URL`,
+set by `keep node init --daemon-url`) runs the same hook commands; they post to the
+daemon's node API (`POST /api/hook`) and print what the daemon's own `keep hook <event>`
+printed. Every Claude event in the table is carried: session-start, session-end, stop,
+notification, pre-question, lifecycle, and the Bash pair. So is every Codex adapter
+below (see "Codex sessions on another node").
 
 - **pre-bash.** The raw `claude --resume` guard runs on the node first, as everywhere.
   The node then reads the daemon's step fingerprints (`GET /api/hook/context`, kept in
@@ -56,9 +57,56 @@ notification, pre-question, lifecycle, and the Bash pair.
   A daemon that does not answer within 3 s has the record queued and resent with the next
   hook.
 
-Not carried yet: Codex and Pi hooks on a node. They bind and release the node's pane,
-refuse deploy commands by name, and record nothing. Without `KEEP_DAEMON_URL` every hook
-on a node is pane-only in that way.
+Not carried yet: Pi hooks on a node. They bind and release the node's pane, refuse
+deploy commands by name, and record nothing. Without `KEEP_DAEMON_URL` every hook on a
+node, Claude's and Codex's included, is pane-only in that way.
+
+### Codex sessions on another node
+
+`keep hook codex <action>` on a node with `KEEP_DAEMON_URL` posts `codex-<action>` to the
+daemon with the rollout bytes the daemon's mirror does not have yet, and the daemon runs
+its own `keep hook codex <action>` against that mirror
+(`.keep/transcript-mirrors/<node>/<session>.jsonl`). The daemon admits the event only for
+a session its account record places on that node as a Codex session. What each action
+does there is what it does for a Codex session on the daemon node: start registers the
+pane (the record names the node) and anchors the stop evidence, stop runs the Stop
+guard and writes the completion marker, question and approval write attention markers
+with the mirror's time, pre-tool and post-tool are the step guard and the deploy and
+step-run recorders on the node's repository facts (as for Claude's Bash pair), and
+client-end (the launcher's, with only the launch token) clears the completions of that
+node's sessions that carry the token. The session's `KEEP_CODEX_CLIENT_TOKEN` is
+forwarded, and a `CLAUDE_CODE_SESSION_ID` it inherited is forwarded as
+`KEEP_CODEX_PARENT_SESSION`, recorded as its parent only when that Claude session is on
+the same node.
+
+Codex waits on every hook for JSON, so the node always prints one JSON value: the
+daemon's output when it is JSON, `{}` otherwise and whenever the daemon does not answer.
+Each wait ends inside the timeout Codex's hooks.json gives the hook: start 2 s (the pane
+bind follows it), end 2 s, question, approval and complete 2.5 s, lifecycle and
+post-tool 3 s, pre-tool 5 s, stop 9 s. A pre-tool the daemon did not answer, or answered
+without a decision, is refused exactly as a Claude pre-bash is (deploy commands and the
+last published step fingerprints; exit 2 with the block JSON); anything else runs.
+Start, stop, approval, complete, lifecycle and post-tool are queued and resent when the
+daemon does not answer; a question is allowed, and an end has released the node's pane.
+
+A fresh Codex session names itself only when its first turn fires SessionStart, and the
+daemon admits that only for a session it already places on the node. So `keep open
+--agent codex --node <node> --fresh` asks the node's host for the Codex rollouts its
+account has begun since the launch in the launch's directory (the `transcript` verb's
+`find`, host capability `transcript: 2`), and adopts one only when it is the only one,
+the pane is still the launch's and unbound, and the node's process table shows the
+pane's process holding that rollout open. The session's account record then names it
+and its node, and the pane is bound to it on the node's host. With no rollout yet, or
+more than one, nothing is adopted: the open answers `pendingRegistration` with a
+`registrationNote` saying why. The node's own start hook still binds the pane at the
+first turn, but the daemon, with no record placing that session on the node, refuses
+its hooks.
+
+A node identifies its Codex processes' open rollouts with lsof, and on a Linux node
+without lsof from `/proc/<pid>/fd`; a read that fails leaves the session unverified,
+never absent. `keep doctor` on a node checks each `~/.codex*` profile: a hooks.json whose
+`keep hook codex` commands point at this node's checkout for every action, and
+`[features] hooks = true` in its config.toml; and says whether lsof is installed.
 
 Restart/resume existing agent sessions in a controlled manner to load new hooks. The reviewer launcher sets
 `KEEP_REVIEWER=1`, allowing the SessionStart hook to register it for daemon ticks.
