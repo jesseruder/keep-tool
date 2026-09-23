@@ -12,10 +12,15 @@ export function remotePaneNode(pane) {
   return node && typeof pane.id === 'string' && pane.id.endsWith(`@${node}`) ? node : '';
 }
 
+// An exited session whose location record the daemon read (`nodeRecorded`, serve.js
+// addStoppedSessionNodes) is where that record says: its `node`, or none for the
+// daemon's own, whatever machine an old pane of it is still on. The move controls read
+// the same record, so the badge and the move's source always agree.
 export function remoteNode({ item, session, pane } = {}) {
   for (const source of [item, session]) {
     if (source && typeof source.node === 'string' && source.node) return source.node;
   }
+  if (session && session.nodeRecorded === true) return '';
   return remotePaneNode(pane);
 }
 
