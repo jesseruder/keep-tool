@@ -156,3 +156,61 @@ test('a journal\'s receipt is the node\'s answer about the file the journal reco
     await assert.rejects(serve.deliveryReceiptFor(entry, deps), /gave no receipt answer/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('keep pane send to an agent pane on aws1 reaches that session instead of "no session"', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pane-send-remote-'));
+  try {
+    const sid = 'sess-pane-send';
+    fs.mkdirSync(path.join(root, '.keep', 'session-accounts'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'session-accounts', `${sid}.json`), JSON.stringify({
+      version: 1, sessionId: sid, agent: 'claude', accountId: 'claude/default', node: 'aws7',
+    }));
+    // The node's transcript, as bytes over the wire.
+    const bytes = Buffer.from(claudeTranscript());
+    const reached = [];
+    const deps = {
+      root,
+      hostNodes: ['main', 'aws7'],
+      hostRequest: async (type, params) => {
+        if (type === 'hello') return { transcript: 1 };
+        if (type === 'transcript' && params.op === 'tail') {
+          return { path: '/node/home/.claude/projects/-work-project/sess-pane-send.jsonl', size: bytes.length,
+            mtimeMs: Date.now() - 5000, generation: 'g', bytes: bytes.toString('base64'), from: 0 };
+        }
+        throw new Error(`unexpected ${type}`);
+      },
+      resolveSessionTarget: async (session, hint) => {
+        assert.equal(hint.expectedPane, 'p3@aws7');
+        return { pane: hint.expectedPane };
+      },
+      sendToResolvedTarget: async (session, target, text) => {
+        reached.push({ id: session.id, node: session.node, kind: session.kind, pane: target.pane, text });
+        return { ok: true };
+      },
+    };
+    // What `keep pane send p3@aws7 -- hello` posts for an agent pane.
+    const result = await serve.sendToSessionLocked({ sessionId: sid, pane: 'p3@aws7', text: 'hello' }, deps);
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(reached, [{ id: sid, node: 'aws7', kind: 'claude', pane: 'p3@aws7', text: 'hello' }]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a send a node cannot confirm is refused before anything is typed', async () => {
+  const typed = [];
+  const deps = {
+    hostNodes: ['main', 'aws1'],
+    hostRequest: async (type) => { typed.push(type); throw new Error(`unexpected ${type}`); },
+  };
+  // A Codex session there: its receipt needs what the verb does not send yet.
+  await assert.rejects(serve.sendToResolvedTarget({ id: 'sess-codex', kind: 'codex', node: 'aws1' }, { pane: 'p1@aws1' }, 'hi', {}, deps),
+    (error) => error.status === 409 && error.extra.reason === 'remote-node'
+      && /a codex session on aws1/.test(error.message));
+  // A pane on one machine and a session on another: nothing is sent anywhere.
+  await assert.rejects(serve.sendToResolvedTarget({ id: 'sess-split', kind: 'claude', node: 'aws1' }, { pane: 'p1' }, 'hi', {}, deps),
+    (error) => error.status === 409 && /pane p1 is on main but session sess-split is on aws1/.test(error.message));
+  assert.deepEqual(typed, []);
+  // What is still refused is named by remoteDeliveryRefusal; a Claude session there is not.
+  assert.equal(serve.remoteDeliveryRefusal({ id: 'x', node: 'aws1', kind: 'claude' }, deps), null);
+  assert.equal(serve.remoteDeliveryRefusal({ id: 'x', kind: 'codex' }, deps), null, 'a session here is never refused');
+  assert.match(serve.remoteDeliveryRefusal({ id: 'x', node: 'aws1' }, deps).message, /a session whose agent is not known on aws1/);
+});

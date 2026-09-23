@@ -107,31 +107,35 @@ test('the daemon refuses the sender itself, the reviewer, and a keep-spawned run
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('a session on another node is refused by name, and nothing is reserved for it', async () => {
+test('a Claude session on another node is told like a local one; any other agent there is refused by name', async () => {
   const root = tmpRoot('tell-remote-node');
   try {
     // The row the fleet publishes for a pane on aws1: the node stamp and the
-    // qualified pane id.
+    // qualified pane id. Its receipt is aws1's to give, so it takes a tell.
     const far = liveSession('far-session', { node: 'aws1', pane: 'p1@aws1' });
+    const farCodex = liveSession('far-codex', { kind: 'codex', node: 'aws1', pane: 'p2@aws1' });
     const sent = [];
-    const deps = tellDeps(root, [far, liveSession('here-session')], {
+    const deps = tellDeps(root, [far, farCodex, liveSession('here-session')], {
       loadTask: (id) => (id === 'far-card' ? { id, fm: { sessions: [{ id: 'far-session' }] } } : null),
       watcherSend: async (request) => { sent.push(request); return {}; },
     });
-    const refused = (error) => error.status === 409 && error.extra.reason === 'remote-node'
-      && error.message === 'keep tell is not available for a session on aws1; receipts arrive with phase 3';
-    await assert.rejects(tellSession({ sessionId: 'far-session', text: 'ping' }, deps), refused);
+    assert.equal((await tellSession({ sessionId: 'far-session', text: 'ping' }, deps)).sessionId, 'far-session');
     // And by card: the card's only live thread is that session.
-    await assert.rejects(tellSession({ taskId: 'far-card', text: 'ping' }, deps), refused);
-    assert.deepEqual(sent, [], 'nothing was typed at a pane whose receipt cannot be read');
-    // No hourly slot spent, and no delivery journal: the refusal lands before either.
-    assert.equal(fs.existsSync(tell.ledgerFile(root)), false);
-    assert.equal(fs.existsSync(path.join(root, '.keep', 'delivery')), false);
+    assert.equal((await tellSession({ taskId: 'far-card', text: 'ping' }, deps)).sessionId, 'far-session');
+    assert.deepEqual(sent.map((request) => request.sessionId), ['far-session', 'far-session']);
+    assert.equal(tell.loadLedger(root).targets['far-session'].length, 2);
+
+    // A Codex session there cannot be confirmed yet: refused by name, before the ledger.
+    await assert.rejects(tellSession({ sessionId: 'far-codex', text: 'ping' }, deps),
+      (error) => error.status === 409 && error.extra.reason === 'remote-node'
+        && error.message === "delivery is not available for a codex session on aws1 yet; only a Claude session's receipt can be read on a node");
+    assert.equal(tell.loadLedger(root).targets['far-codex'], undefined);
+    assert.equal(sent.length, 2);
 
     // The same daemon still delivers to its own, unchanged.
     const here = await tellSession({ sessionId: 'here-session', text: 'ping' }, deps);
     assert.equal(here.sessionId, 'here-session');
-    assert.equal(sent.length, 1);
+    assert.equal(sent.length, 3);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -1005,6 +1009,22 @@ function transcriptFixture() {
   return { root, claude, codexRollout, registryFile, cleanup };
 }
 
+// A node's host as the daemon's hostRequest sees it: hello, with or without the
+// transcript verb, and the verb's tail answered from a file standing in for the node's
+// own transcript (bytes over the wire; the daemon is never handed a path to open).
+function fakeNodeHost({ transcript = 1, files = {}, asked = [] } = {}) {
+  return async (type, params, options) => {
+    asked.push([type, options && options.node, params && params.op]);
+    if (type === 'hello') return transcript ? { version: 1, transcript } : { version: 1 };
+    const file = type === 'transcript' && files[params.sessionId];
+    if (file && params.op === 'tail') {
+      const stat = fs.statSync(file);
+      return { path: file, size: stat.size, mtimeMs: stat.mtimeMs, generation: 'g', bytes: fs.readFileSync(file).toString('base64'), from: 0 };
+    }
+    throw new Error(`no ${type} ${params && params.op} for that here`);
+  };
+}
+
 // The daemon's own readers, no injected rows, no injected loader: only the parts that
 // would touch a host, the ledger lock or a real pane are stubbed.
 function fixtureDeps(root, overrides = {}) {
@@ -1071,7 +1091,7 @@ test('loadTellSession reads a real Codex rollout, and skips the children and exe
   } finally { f.cleanup(); }
 });
 
-test('a headless Claude transcript, one outside the window, and a remote session are not local targets', async () => {
+test('a headless Claude transcript and one outside the window are not targets; a remote session is read from its node', async () => {
   const f = transcriptFixture();
   try {
     // `claude -p` writes no TUI records: the scan does not list it, and a tell cannot reach it.
@@ -1088,18 +1108,48 @@ test('a headless Claude transcript, one outside the window, and a remote session
     await assert.rejects(tellSession({ sessionId: stale, text: 'ping' }, fixtureDeps(f.root)),
       (error) => error.status === 400 && error.message === 'bad session id');
 
-    // A session whose authority record names another node has no transcript here and
-    // is refused by name, before any slot is reserved.
+    // A session whose authority record names another node has no transcript here: the
+    // bare row is replaced by its node's read, and the tell goes through, the re-checks
+    // inside the lock and the send's own load reading that node again.
     const far = crypto.randomUUID();
+    const farFile = f.claude(far, { at: Date.now() - 2000 });
     f.registryFile('session-accounts', `${far}.json`, JSON.stringify({
       version: 1, sessionId: far, agent: 'claude', accountId: 'claude-a', node: 'aws1',
     }));
-    const deps = fixtureDeps(f.root, { hostNodes: ['main', 'aws1'] });
+    const asked = [];
+    const sent = [];
+    const deps = fixtureDeps(f.root, {
+      hostNodes: ['main', 'aws1', 'aws2'],
+      hostRequest: fakeNodeHost({ files: { [far]: farFile }, asked }),
+      watcherSend: async (request, options) => {
+        assert.equal(await request.precondition(), null, 'idle on its node, so not moved on');
+        const row = await options.sendDeps.loadCurrentSession(request.sessionId);
+        assert.equal(row.node, 'aws1');
+        assert.equal(row.endedTurn, true);
+        sent.push(request.sessionId);
+        return {};
+      },
+    });
     assert.deepEqual(loadTellSession(far, deps), { id: far, node: 'aws1', mtime: 0 });
-    await assert.rejects(tellSession({ sessionId: far, text: 'ping' }, deps),
-      (error) => error.status === 409 && error.extra.reason === 'remote-node'
-        && error.message === 'keep tell is not available for a session on aws1; receipts arrive with phase 3');
-    assert.equal(fs.existsSync(tell.ledgerFile(f.root)) && Boolean(tell.loadLedger(f.root).targets?.[far]?.length), false);
+    const told = await tellSession({ sessionId: far, text: 'ping' }, deps);
+    assert.equal(told.sessionId, far);
+    assert.deepEqual(sent, [far]);
+    assert.ok(asked.some(([type, node, op]) => type === 'transcript' && node === 'aws1' && op === 'tail'));
+    assert.equal(tell.loadLedger(f.root).targets[far].length, 1);
+
+    // A node whose host predates the transcript verb: refused by name, before any
+    // slot is reserved, and no transcript request goes out.
+    const older = crypto.randomUUID();
+    f.registryFile('session-accounts', `${older}.json`, JSON.stringify({
+      version: 1, sessionId: older, agent: 'claude', accountId: 'claude-a', node: 'aws2',
+    }));
+    const olderAsked = [];
+    await assert.rejects(tellSession({ sessionId: older, text: 'ping' }, fixtureDeps(f.root, {
+      hostNodes: ['main', 'aws1', 'aws2'], hostRequest: fakeNodeHost({ transcript: 0, asked: olderAsked }),
+    })), (error) => error.status === 409 && error.extra.reason === 'remote-node'
+      && /^the terminal host on aws2 predates the transcript verb/.test(error.message));
+    assert.deepEqual(olderAsked.map(([type]) => type), ['hello']);
+    assert.equal(Boolean(tell.loadLedger(f.root).targets?.[older]?.length), false);
   } finally { f.cleanup(); }
 });
 
@@ -1227,7 +1277,7 @@ test('a tell to a Codex session no scan has seen delivers through the real send 
   } finally { f.cleanup(); }
 });
 
-test('a card answers for its local sessions, not for a link on another node', async () => {
+test('a card answers for its local and remote sessions alike, and a busy local one is not hidden by a silent node', async () => {
   const f = transcriptFixture();
   try {
     const busy = crypto.randomUUID();
@@ -1247,17 +1297,26 @@ test('a card answers for its local sessions, not for a link on another node', as
       loadTask: () => ({ id: 'split-card', fm: { sessions: ids.map((id) => ({ id })) } }),
       loadTellSession: (id, deps, pin) => (rows.has(id) ? { ...rows.get(id) } : loadTellSession(id, deps, pin)),
     });
-    // A busy local thread is busy, which --wait sits out, whatever is linked on aws1.
+    // aws1 does not answer: a busy local thread is still busy, which --wait sits out.
     await assert.rejects(tellSession({ taskId: 'split-card', text: 'ping' }, card([busy, far])),
       (error) => error.status === 409 && error.extra.reason === 'busy'
         && error.message === 'busy: session is mid-turn (on split-card)');
-    // Local threads all gone: not-live with the open hint, as before.
+    // Local threads all gone and aws1 silent: the node is named, not a missing session.
     await assert.rejects(tellSession({ taskId: 'split-card', text: 'ping' }, card([gone, far])),
+      (error) => error.status === 409 && error.extra.reason === 'remote-node'
+        && /^the session on aws1 could not be read from its node/.test(error.message));
+    // No linked thread at all: not-live with the open hint, as before.
+    await assert.rejects(tellSession({ taskId: 'split-card', text: 'ping' }, card([gone])),
       (error) => error.status === 409 && error.extra.reason === 'not-live'
         && /^no live session on split-card; start one with keep open split-card --fresh/.test(error.message));
-    // A tell to the remote id itself is still refused by name.
-    await assert.rejects(tellSession({ sessionId: far, text: 'ping' }, card([])),
-      (error) => error.status === 409 && error.extra.reason === 'remote-node');
+    // aws1 answers, and its idle thread is the card's live one.
+    const farFile = f.claude(far, { at: Date.now() - 2000 });
+    const sent = [];
+    const answering = (ids) => ({ ...card(ids), hostRequest: fakeNodeHost({ files: { [far]: farFile } }),
+      watcherSend: async (request) => { sent.push(request.sessionId); return {}; } });
+    assert.equal((await tellSession({ taskId: 'split-card', text: 'ping' }, answering([gone, far]))).sessionId, far);
+    assert.equal((await tellSession({ sessionId: far, text: 'ping' }, answering([]))).sessionId, far);
+    assert.deepEqual(sent, [far, far]);
   } finally { f.cleanup(); }
 });
 

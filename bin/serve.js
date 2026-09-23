@@ -8356,6 +8356,32 @@ async function observeClaudeMcpMenu(session, target, deps = {}) {
 
 async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   if (session.kind === 'pi') throw new InjectionError(409, 'Pi API message delivery is unavailable; type in its terminal pane');
+  // Where this send is confirmed. The pane says where the keys go and the session
+  // where its transcript is; a send whose two answers disagree is refused, and one on
+  // another node takes its receipt from that node (deliver's `remote`). On a
+  // single-node install both answers are this machine and `remote` stays null.
+  const daemonNode = daemonNodeName(deps);
+  const paneNode = nodes.parsePaneRef(String(target && target.pane || ''), { env: paneRefEnv(deps) }).node;
+  const sessionNode = session.node ? String(session.node) : paneNode;
+  if (paneNode !== sessionNode) {
+    throw new InjectionError(409, `pane ${target.pane} is on ${paneNode} but session ${session.id} is on ${sessionNode}; nothing was sent`);
+  }
+  let remote = null;
+  if (sessionNode !== daemonNode) {
+    const unsupported = remoteDeliveryRefusal({ id: session.id, node: sessionNode }, deps, session.kind);
+    if (unsupported) throw unsupported;
+    const onNode = { ...session, node: sessionNode };
+    remote = {
+      node: sessionNode,
+      stat: () => nodeTranscriptFileForSession(onNode, deps),
+      receipt: (entry, { timeoutMs } = {}) => deliveryReceiptFor(entry, deps, timeoutMs),
+    };
+  }
+  // The same session read fresh, for the resume and draft checks below: off the local
+  // transcript here, off the node's tail for a session elsewhere.
+  const loadDeliverySession = (id) => (deps.loadDeliverySession ? deps.loadDeliverySession(id)
+    : remote ? remoteSessionRead(id, deps)
+    : session.kind === 'claude' ? claudeSessionFor(id) : codex.sessionFor(id));
   claimInjectionTarget(target);
   assertCompactRestoreSettled(session.id, deps);
   const pendingDirectory = deps.deliveryDirectory || path.join(keep.ROOT, '.keep', 'delivery');
@@ -8456,7 +8482,7 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
     // recovered only while its native menu is still positively identified.
     if (observeMcp) await observeMcp();
     return await delivery.deliver({
-      session, pane: target.pane, text, file: (deps.transcriptFileForSession || transcriptFileForSession)(session), directory: pendingDirectory, trace,
+      session, pane: target.pane, text, file: remote ? null : (deps.transcriptFileForSession || transcriptFileForSession)(session), remote, directory: pendingDirectory, trace,
       retainReceipt: opts?.retainReceipt === true,
       key: opts?.deliveryKey,
       observe: observeMcp,
@@ -8466,8 +8492,7 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
         try {
           if (opts?.beforeType) await opts.beforeType();
           if (resumingPartial) {
-            const current = deps.loadDeliverySession ? deps.loadDeliverySession(session.id)
-              : session.kind === 'claude' ? claudeSessionFor(session.id) : codex.sessionFor(session.id);
+            const current = await loadDeliverySession(session.id);
             if (!current || current.endedTurn !== true || current.pendingQuestion || current.pendingPlan) {
               throw new InjectionError(409, 'session is no longer idle enough to resume its partial delivery; no key was pressed');
             }
@@ -8501,8 +8526,7 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
         return pressTargetKey(target, 'Enter', deps);
       },
       draftMatches: async () => {
-        const current = deps.loadDeliverySession ? deps.loadDeliverySession(session.id)
-          : session.kind === 'claude' ? claudeSessionFor(session.id) : codex.sessionFor(session.id);
+        const current = await loadDeliverySession(session.id);
         trace('draft-session-state', { idle: current?.endedTurn === true, question: Boolean(current?.pendingQuestion), plan: Boolean(current?.pendingPlan) });
         if (!current || current.endedTurn !== true || current.pendingQuestion || current.pendingPlan) return false;
         const screen = await readScreenResult(target, 200, false, deps);
@@ -8569,7 +8593,9 @@ async function sendToSession(body, targetHint, opts, deps = {}) {
     return typeAndSubmit(bootTarget, text, claudeTypedTextVisible, deps);
   }
 
-  const session = (deps.loadCurrentSession || loadCurrentSession)(body.sessionId);
+  // A session on another node is read from its node (loadSessionForAction); every
+  // other one exactly as before. Awaited, so an injected loader may be either kind.
+  const session = await (deps.loadCurrentSession || ((id) => loadSessionForAction(id, deps)))(body.sessionId);
   const target = claimInjectionTarget(await (deps.resolveSessionTarget || resolveSessionTarget)(
     session, body.pane ? { expectedPane: body.pane } : targetHint, deps,
   ));
@@ -12828,18 +12854,13 @@ async function deliverCheckToThread(task, deps = {}) {
     if (!ordered.length) return { deferred: true, uncertain: true, reason: 'Prior delivery unconfirmed; waiting for that same session, not launching another check' };
   }
   for (const candidate of ordered) {
-    // A thread on another node cannot take a delivery this daemon can confirm. The
-    // check falls through to the next candidate, and to opening a fresh session on
-    // this node if there is none — never to a message nobody receipts.
-    const elsewhere = remoteDeliveryRefusal(candidate, deps);
-    if (elsewhere) {
-      process.stderr.write(`keep serve: delivery candidate ${candidate.id.slice(0, 8)}: ${elsewhere.message}\n`);
-      continue;
-    }
+    // A thread on another node is a candidate like any other: it is read from its
+    // node and its receipt is that node's (sendToResolvedTarget). One that cannot be
+    // read or confirmed there is passed over as a closed one is.
     let session;
     let target;
     try {
-      session = (deps.loadCurrentSession || loadCurrentSession)(candidate.id);
+      session = await (deps.loadCurrentSession || ((id) => loadSessionForAction(id, deps)))(candidate.id);
       target = await (deps.resolveSessionTarget || resolveSessionTarget)(session, null);
     } catch (e) {
       process.stderr.write(`keep serve: delivery candidate ${candidate.id.slice(0, 8)} is closed: ${String(e && e.message || e)}\n`);
@@ -13020,16 +13041,11 @@ async function deliverUnblockToThread(task, text) {
     excludedSessionIds(),
   );
   for (const candidate of candidates) {
-    // As with a check: a thread elsewhere is passed over, not typed into.
-    const elsewhere = remoteDeliveryRefusal(candidate);
-    if (elsewhere) {
-      process.stderr.write(`keep serve: unblock candidate ${candidate.id.slice(0, 8)}: ${elsewhere.message}\n`);
-      continue;
-    }
+    // As with a check: a thread elsewhere is read from its node and confirmed there.
     let session;
     let target;
     try {
-      session = loadCurrentSession(candidate.id);
+      session = await loadSessionForAction(candidate.id);
       target = await resolveSessionTarget(session, null);
     } catch (error) {
       process.stderr.write(`keep serve: unblock candidate ${candidate.id.slice(0, 8)} is closed: ${String(error && error.message || error)}\n`);
@@ -13373,20 +13389,20 @@ async function tellSession(body, deps = {}) {
     // Only the card's own sessions are read. The reviewer and keep-spawned runs are
     // skipped below whatever their state, so their rows are not needed; the sender's
     // is, even when it is excluded, because the self check asks whether it is live.
-    const rows = [...linked]
+    // A session on another node is read from its node (the bare row loadTellSession
+    // returns for one says nothing about its state), and is then a candidate like any
+    // other. One its node could not answer for is no candidate, and its refusal does
+    // not stand in for a local one: a card with a busy local thread still answers busy
+    // (which --wait sits out). It is named only when nothing local is there at all. One
+    // its node has no live transcript for is simply absent, as a stale local one is.
+    const rows = (await Promise.all([...linked]
       .filter((id) => !excluded.has(id) || id === senderId)
       .map((id) => source.row(id))
+      .filter(Boolean)
+      .map((row) => (source.scanned ? row : readRemoteTellRow(row, deps)))))
       .filter(Boolean);
-    // A session on another node cannot take a tell yet, so it is no candidate, and
-    // its refusal must not stand in for a local one: a card with a busy local thread
-    // answers busy (which --wait sits out), and one whose local threads are gone
-    // answers not-live with the open hint. It is named only when nothing local is
-    // there at all and the row shows it live: a fleet row carries its state, while
-    // the bare row loadTellSession returns for a remote id says nothing either way,
-    // and the scan this replaced never listed one.
-    const sessions = rows.filter((session) => !remoteSession(session, deps));
-    const remoteLive = rows.find((session) => remoteSession(session, deps) && !skip.has(session.id)
-      && !session.exited && !session.deadMidTurn && (session.state !== undefined || session.endedTurn !== undefined));
+    const sessions = rows.filter((session) => !session.remoteUnreadable);
+    const remoteUnreadable = rows.find((session) => session.remoteUnreadable && !skip.has(session.id));
     const { candidates } = pickDeliveryCandidates([...linked], sessions, skip);
     // Its predicate does not know about a usage limit or a turn that died, and ours
     // does: a rate-limited newest session must not hide a ready sibling behind it.
@@ -13405,7 +13421,7 @@ async function tellSession(body, deps = {}) {
           && !session.exited && !session.deadMidTurn)) {
           throw new InjectionError(409, 'self: a session cannot tell its own card', { reason: 'self' });
         }
-        if (remoteLive) throw remoteDeliveryRefusal(remoteLive, deps);
+        if (remoteUnreadable) throw remoteUnreadable.remoteUnreadable;
         throw new InjectionError(409, `no live session on ${body.taskId}; start one with keep open ${body.taskId} --fresh -m "..."`, { reason: 'not-live' });
       }
       const refusals = present.map((session) => tell.tellRefusal(session) || { reason: 'busy', detail: 'session is mid-turn' });
@@ -13414,15 +13430,26 @@ async function tellSession(body, deps = {}) {
     }
   } else {
     target = resolveTellTarget(body.sessionId, source, deps);
+    // A bare row for a session on another node becomes that node's read of it. Any
+    // refusal (its host predates the transcript verb, it is not a Claude session, the
+    // node did not answer) lands here, before the ledger is read, let alone reserved:
+    // a message this daemon cannot confirm must not spend the sender's hour either.
+    if (!source.scanned && bareRemoteRow(target, deps)) target = await loadRemoteSession(target.id, deps);
   }
 
   if (senderId && target.id === senderId) {
     throw new InjectionError(409, 'self: a session cannot tell itself', { reason: 'self' });
   }
-  // Before the ledger is read, let alone reserved: a message this daemon cannot
-  // confirm must not spend the sender's hour either.
+  // What a node still cannot confirm (anything but a Claude session there) is refused
+  // by name here, before the ledger is read.
   const elsewhere = remoteDeliveryRefusal(target, deps);
   if (elsewhere) throw elsewhere;
+  // The same read, again, for the re-checks inside the lock and for the send itself:
+  // off the node for a session elsewhere, off the tell's own source for any other.
+  const remoteTarget = !source.scanned && remoteSession(target, deps);
+  const freshTarget = remoteTarget
+    ? async (id) => { try { return await loadRemoteSession(id, deps); } catch { return null; } }
+    : async (id) => source.fresh(id);
   const marked = (dir) => {
     try { return fs.existsSync(path.join(root, '.keep', dir, target.id)); } catch { return false; }
   };
@@ -13481,8 +13508,8 @@ async function tellSession(body, deps = {}) {
     // default is a fresh fleet scan. The tell hands it the target's own read instead,
     // so from decision to Enter nothing scans the fleet. It is at least as fresh as a
     // scan row: the same transcript read, taken at that moment.
-    const loadForSend = (id) => {
-      const row = source.fresh(id);
+    const loadForSend = async (id) => {
+      const row = await freshTarget(id);
       if (!row) throw new InjectionError(404, 'no session');
       return row;
     };
@@ -13491,7 +13518,7 @@ async function tellSession(body, deps = {}) {
       text: envelope,
       precondition: async () => {
         // The target alone, read again: this runs three times inside the lock.
-        const fresh = source.fresh(target.id);
+        const fresh = await freshTarget(target.id);
         const moved = tell.tellRefusal(fresh);
         movedOnVerdict = moved;
         return moved ? `${moved.reason}: ${moved.detail}` : null;
@@ -13538,16 +13565,44 @@ async function tellSession(body, deps = {}) {
   return receipt;
 }
 
+// The bare { id, node, mtime: 0 } row loadSessionExact returns for a session on another
+// node: no agent, no state, nothing a tell can decide on.
+function bareRemoteRow(row, deps = {}) {
+  return Boolean(row && row.node && row.node !== daemonNodeName(deps) && row.kind === undefined);
+}
+
+// A card's linked row, with a bare remote one replaced by its node's read. A node that
+// has no live transcript for it (404) makes it absent, like a stale local session; any
+// other failure keeps the row, marked with the refusal to give if nothing else is left.
+async function readRemoteTellRow(row, deps = {}) {
+  if (!bareRemoteRow(row, deps)) return row;
+  try { return await loadRemoteSession(row.id, deps); }
+  catch (error) {
+    if (error instanceof InjectionError && error.status === 404) return null;
+    const refusal = error instanceof InjectionError && error.status === 409 ? error
+      : new InjectionError(409, `the session on ${row.node} could not be read from its node: ${String(error && error.message || error)}`, { reason: 'remote-node' });
+    return { ...row, remoteUnreadable: refusal };
+  }
+}
+
 // Delivery is a message with a receipt: the text is typed into a pane, confirmed
-// against this machine's screen and transcript, and journalled here so one that was
-// left unconfirmed can be finished rather than sent twice. A session on another node
-// has none of that here — its hooks write no receipts until phase 3 — so every
-// delivery path says so by name, and no journal is ever written for a pane elsewhere.
-function remoteDeliveryRefusal(sessionOrPane, deps = {}) {
+// against the session's transcript, and journalled here so one that was left
+// unconfirmed can be finished rather than sent twice. For a Claude session on another
+// node the receipt is that node's (the `transcript` verb, bin/node-transcript.js),
+// so it takes a delivery like a local one. What still cannot is anything else there:
+// a Codex session's state needs its rollout's first line as well as its tail, which
+// the verb does not send yet, and a Pi session takes no API delivery anywhere. For
+// those, and for a session whose agent is not known, every delivery path says so by
+// name, and no journal is ever written. Null for a session on this machine, and for a
+// Claude one elsewhere. `kind` names the agent when the caller has it.
+function remoteDeliveryRefusal(sessionOrPane, deps = {}, kind = undefined) {
   const node = sessionNodeOf(sessionOrPane, deps);
   if (node === daemonNodeName(deps)) return null;
+  const agent = kind !== undefined ? kind
+    : sessionOrPane && typeof sessionOrPane === 'object' ? sessionOrPane.kind : undefined;
+  if (agent === 'claude') return null;
   return new InjectionError(409,
-    `keep tell is not available for a session on ${node}; receipts arrive with phase 3`,
+    `delivery is not available for ${agent ? `a ${agent} session` : 'a session whose agent is not known'} on ${node} yet; only a Claude session's receipt can be read on a node`,
     { reason: 'remote-node' });
 }
 
@@ -13584,13 +13639,8 @@ async function announceStateNote(id, deps = {}) {
   const failed = [];
   for (const candidate of candidates) {
     if (candidate.reviewer) continue; // the reviewer writes no code; it has nothing to coordinate
-    // A sibling on another machine is reported as unreached rather than silently
-    // passed over: the note says something about a checkout it also has open.
-    const elsewhere = remoteDeliveryRefusal(candidate, deps);
-    if (elsewhere) {
-      failed.push({ sessionId: candidate.id, reason: elsewhere.message });
-      continue;
-    }
+    // A sibling on another machine gets the note like a local one (sendToSession reads
+    // it from its node); if it cannot, it is reported as unreached with the reason.
     try {
       await send(candidate.id, text);
       sent.push(candidate.id);
@@ -13602,8 +13652,6 @@ async function announceStateNote(id, deps = {}) {
 }
 
 function sendReviewerMessage(sessionId, text, opts) {
-  const elsewhere = remoteDeliveryRefusal({ sessionId });
-  if (elsewhere) throw elsewhere;
   return sendToSession(
     { sessionId, text },
     { ...review.readReviewerMarker(sessionId), bootstrap: Boolean(opts && opts.bootstrap) },
@@ -14474,7 +14522,7 @@ module.exports = {
   draftRegionText,
   draftIsExactly,
   watcherSend,
-  resolveSessionTarget,
+  resolveSessionTarget, remoteDeliveryRefusal,
   resolveSessionId, screenSession, screenHistorySession, sendSessionKeys, shellPaneTarget, stripTerminalAnsi, writeToShellPane,
   agentProcessRows, parseProcessTable, agentRowUnreadable, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,

@@ -5757,21 +5757,24 @@ test('a scheduler that still owns the card is not tried twice', async () => {
   assert.deepEqual(f.resolved, ['linked']);
 });
 
-test('a due check passes over a thread on another node for one here', async () => {
+test('a due check goes to the thread that scheduled it on another node like one here', async () => {
   const sessions = [
-    { id: 'sched', node: 'aws1', state: 'idle', mtime: 3000, endedTurn: true },
+    { id: 'sched', kind: 'claude', node: 'aws1', state: 'idle', mtime: 3000, endedTurn: true },
     { id: 'linked', state: 'idle', mtime: 2000, endedTurn: true },
   ];
+  // Its receipt is aws1's, so it is resolved and typed into first, as the scheduler.
   const f = checkDeliveryFixture({ scheduled_by: 'sched', sessions: [{ id: 'linked', agent: 'claude' }] }, sessions);
   const result = await deliverCheckToThread(f.task, f.deps);
-  assert.equal(result.sessionId, 'linked');
-  assert.deepEqual(f.resolved, ['linked'], 'the thread on aws1 is never resolved, let alone typed into');
-  assert.deepEqual(f.sent.map((entry) => entry.id), ['linked']);
+  assert.equal(result.sessionId, 'sched');
+  assert.deepEqual(f.resolved, ['sched']);
+  assert.deepEqual(f.sent.map((entry) => entry.id), ['sched']);
 
-  // With nothing here to take it, the check is left to open fresh on this node.
-  const alone = checkDeliveryFixture({ scheduled_by: 'sched' }, sessions.slice(0, 1));
-  assert.equal(await deliverCheckToThread(alone.task, alone.deps), null);
-  assert.deepEqual(alone.sent, []);
+  // When that thread cannot be read or reached there, the check falls through to one
+  // here, as it does past a closed local one.
+  const closed = checkDeliveryFixture({ scheduled_by: 'sched', sessions: [{ id: 'linked', agent: 'claude' }] }, sessions, ['sched']);
+  assert.equal((await deliverCheckToThread(closed.task, closed.deps)).sessionId, 'linked');
+  assert.deepEqual(closed.resolved, ['sched', 'linked']);
+  assert.deepEqual(closed.sent.map((entry) => entry.id), ['linked']);
 });
 
 function recordingHost(handler) {
