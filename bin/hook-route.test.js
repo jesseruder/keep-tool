@@ -570,3 +570,48 @@ test('the node forwards its session env, and the daemon\'s hook honours it', asy
   const on = await stop(quiet, null, `${KEY}-on`);
   assert.match(JSON.parse(on.body.stdout).reason, /^\[keep\] Your card planned-card has a next step\./);
 });
+
+test('the location record\'s account is the one the hook runs with; the node\'s only fills a gap', async (t) => {
+  const locations = {
+    'sess-aws1': { node: 'aws1', agent: 'claude', accountId: 'claude-node' },
+    'sess-bare': { node: 'aws1', agent: 'claude' },
+  };
+  const { hooks, calls } = services(t, { locations });
+  const post = (sessionId, accountId, key) => hooks.handle(AWS1, body({ idempotencyKey: key,
+    identity: { agent: 'claude', sessionId, ...(accountId ? { accountId } : {}) },
+    input: { session_id: sessionId, cwd: '/home/node/project', hook_event_name: 'Stop' } }));
+  assert.equal((await post('sess-aws1', null, `${KEY}-1`)).status, 200);
+  assert.equal(calls.at(-1).options.env.KEEP_AGENT_ACCOUNT_ID, 'claude-node', 'the record, though the node named none');
+  assert.equal((await post('sess-bare', 'claude-said', `${KEY}-2`)).status, 200);
+  assert.equal(calls.at(-1).options.env.KEEP_AGENT_ACCOUNT_ID, 'claude-said', 'the node\'s, where the record has none');
+  assert.equal((await post('sess-bare', null, `${KEY}-3`)).status, 200);
+  assert.equal(calls.at(-1).options.env.KEEP_AGENT_ACCOUNT_ID, undefined);
+  assert.equal((await post('sess-aws1', 'claude-other', `${KEY}-4`)).status, 403, 'a contradiction is still refused');
+});
+
+test('a question\'s input reaches the hook in a bounded shape', async (t) => {
+  const { hooks, calls } = services(t);
+  const answer = await hooks.handle(AWS1, body({ event: 'pre-question', input: {
+    session_id: 'sess-aws1', cwd: '/home/node/project', hook_event_name: 'PreToolUse', tool_name: 'AskUserQuestion', tool_use_id: 'toolu_9',
+    tool_input: {
+      questions: [
+        { question: 'q'.repeat(10 * 1024), header: 'Pick', multiSelect: false, extra: 'x'.repeat(1000),
+          options: [{ label: 'One', description: 'd'.repeat(2000) }, 'Two', 7, ...Array.from({ length: 30 }, (_, i) => ({ label: `o${i}` }))] },
+        'not a question', { question: 'Second?' }, { question: 'Third?' }, { question: 'Fourth?' }, { question: 'Fifth?' },
+      ],
+      answers: { nested: { deep: 'x'.repeat(4000) } },
+    },
+  } }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  const { tool_input: tool } = JSON.parse(calls[0].stdin);
+  assert.deepEqual(Object.keys(tool), ['questions']);
+  assert.equal(tool.questions.length, 3, 'four at most read, the malformed one skipped');
+  const [first] = tool.questions;
+  assert.equal(Buffer.byteLength(first.question), 4096);
+  assert.equal(first.header, 'Pick');
+  assert.equal(first.multiSelect, false);
+  assert.equal(first.extra, undefined);
+  assert.equal(first.options.length, 19, 'twenty at most, the non-option dropped');
+  assert.deepEqual(first.options.slice(0, 3), [{ label: 'One' }, 'Two', { label: 'o0' }]);
+  assert.deepEqual(tool.questions.slice(1), [{ question: 'Second?' }, { question: 'Third?' }]);
+});

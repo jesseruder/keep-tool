@@ -322,6 +322,14 @@ function dropSession(env, sessionId) {
   return dropped;
 }
 
+// Whether any of this session's events still wait in the queue.
+function pendingFor(env, sessionId) {
+  return queueFiles(env).some((name) => {
+    const entry = readJson(path.join(queueDir(env), name));
+    return Boolean(entry && entry.body && entry.body.identity && entry.body.identity.sessionId === sessionId);
+  });
+}
+
 // One hook event, delivered. Resolves null when this event is not carried (the
 // caller keeps today's behaviour), else { delivered, value?, why? }.
 async function runHook(event, input, where, deps = {}) {
@@ -351,6 +359,12 @@ async function runHook(event, input, where, deps = {}) {
   try {
     await replayQueue({ env, where, token, deadline: Math.min(started + REPLAY_MS, started + budget / 2), deps });
   } catch {}
+  // The replay ran out of time (or the daemon stopped answering) with this
+  // session's earlier events still waiting: this one must not overtake them. It
+  // waits behind them, and gets its safe default now; the next hook drains more.
+  if (pendingFor(env, input.session_id)) {
+    return { delivered: false, why: 'earlier events of this session are still queued', queued: queue(event, input, identity, key, fired, env) };
+  }
   const result = await deliver({ event, input, identity, key, transcriptPath: input.transcript_path, snapshot, deadline, where, token, env, deps });
   if (result.ok) return { delivered: true, value: result.value };
   // A hook the daemon stopped has run and been journalled: a resend would only

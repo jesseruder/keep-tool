@@ -74,6 +74,37 @@ function text(value, name, max = TEXT_MAX) {
   return value;
 }
 
+// A string cut to at most \`max\` UTF-8 bytes, on a character boundary.
+function clipBytes(value, max) {
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.length <= max) return value;
+  let end = max;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString('utf8');
+}
+
+// AskUserQuestion's input, reduced to a bounded shape: at most four questions, each
+// question at most 4 KiB, a header and up to twenty option labels of 256 bytes,
+// and multiSelect. Nothing else of it reaches the hook.
+function questionInput(tool) {
+  const questions = [];
+  for (const question of Array.isArray(tool.questions) ? tool.questions.slice(0, 4) : []) {
+    if (!isObject(question)) continue;
+    const item = {};
+    if (typeof question.question === 'string') item.question = clipBytes(question.question, 4096);
+    if (typeof question.header === 'string') item.header = clipBytes(question.header, 256);
+    if (Array.isArray(question.options)) {
+      item.options = question.options.slice(0, 20).map((option) => {
+        if (typeof option === 'string') return clipBytes(option, 256);
+        return isObject(option) && typeof option.label === 'string' ? { label: clipBytes(option.label, 256) } : null;
+      }).filter(Boolean);
+    }
+    if (typeof question.multiSelect === 'boolean') item.multiSelect = question.multiSelect;
+    questions.push(item);
+  }
+  return { questions };
+}
+
 function matching(value, re, name) {
   if (typeof value !== 'string' || !re.test(value)) refuse(400, `invalid ${name}`);
   return value;
@@ -119,7 +150,7 @@ function cleanInput(event, input, sessionId) {
     out.tool_name = 'AskUserQuestion';
     if (has('tool_input')) {
       if (!isObject(input.tool_input)) refuse(400, 'input.tool_input must be an object');
-      out.tool_input = input.tool_input;
+      out.tool_input = questionInput(input.tool_input);
     }
     if (has('tool_use_id')) out.tool_use_id = matching(input.tool_use_id, ID_RE, 'input.tool_use_id');
   }
@@ -177,6 +208,8 @@ function validateRequest(body, caller, deps) {
   if (accountId && where.accountId && accountId !== where.accountId) {
     refuse(403, `session ${sessionId} runs on account ${where.accountId}, not ${accountId}`);
   }
+  // The daemon's record is the authority; the node's word only fills a gap in it.
+  if (typeof where.accountId === 'string' && ACCOUNT_RE.test(where.accountId)) accountId = where.accountId;
   // When a replayed event fired, on the node's clock: the time its attention marker
   // carries. Never later than now.
   let firedAt = null;

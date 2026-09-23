@@ -347,3 +347,42 @@ test('hooks that enqueue at the same moment each keep their entry', async (t) =>
   }
   assert.equal(fs.readdirSync(client.stateDir({ HOME: f.home })).some((name) => name.endsWith('.tmp')), false, 'nothing left aside');
 });
+
+test('an event never overtakes its session\'s events the replay could not finish', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.transcript, '{"n":1}\n');
+  const url = await closedUrl();
+  await f.hook('stop', url, { hook_event_name: 'Stop' });
+  await f.hook('notification', url, { session_id: 'sess-other', notification_type: 'idle_prompt' });
+  assert.deepEqual(f.queue().map((entry) => entry.event), ['stop', 'notification']);
+
+  // The daemon takes the replayed stop and never answers it: the replay's time runs
+  // out with the stop still queued, so the new event waits behind it.
+  const slow = await stubDaemon(t, () => 'hang');
+  const result = await f.hook('lifecycle', slow.url, { hook_event_name: 'PostToolUse' });
+  assert.deepEqual(result, { status: 0, stdout: '', stderr: '' }, 'the safe default');
+  assert.deepEqual(slow.posts.map((post) => post.body.event), ['stop'], 'nothing posted ahead of it');
+  assert.deepEqual(f.queue().map((entry) => `${entry.event}:${entry.body.identity.sessionId}`),
+    ['stop:sess-aws1', 'notification:sess-other', 'lifecycle:sess-aws1'], 'queued behind it, in order');
+
+  // A daemon that answers: the queue drains in order, then the new event goes.
+  const daemon = await stubDaemon(t, () => ran(''));
+  const next = await f.hook('lifecycle', daemon.url, { hook_event_name: 'PostToolUse' });
+  assert.equal(next.status, 0, next.stderr);
+  assert.deepEqual(daemon.posts.map((post) => `${post.body.event}:${post.body.identity.sessionId}`),
+    ['stop:sess-aws1', 'notification:sess-other', 'lifecycle:sess-aws1', 'lifecycle:sess-aws1'], 'drained in order, then the new one');
+  assert.deepEqual(f.queue(), []);
+});
+
+test('another session\'s queued events do not hold this session\'s event back', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.transcript, '{"n":1}\n');
+  const url = await closedUrl();
+  await f.hook('notification', url, { session_id: 'sess-other', notification_type: 'idle_prompt' });
+  // The daemon never answers sess-other's replay, and answers this session.
+  const daemon = await stubDaemon(t, (body) => (body.identity.sessionId === 'sess-other' ? 'hang' : ran('context\n')));
+  const result = await f.hook('session-start', daemon.url, { hook_event_name: 'SessionStart', source: 'startup' });
+  assert.equal(result.stdout, 'context\n');
+  assert.deepEqual(daemon.posts.map((post) => post.body.event), ['notification', 'session-start']);
+  assert.deepEqual(f.queue().map((entry) => entry.body.identity.sessionId), ['sess-other']);
+});
