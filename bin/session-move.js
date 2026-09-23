@@ -78,6 +78,22 @@ function listMoves(root) {
   }).filter(Boolean);
 }
 
+// The same listing without blocking the loop, for the console's state build: one
+// directory read per build, whatever the number of sessions.
+async function listMovesAsync(root) {
+  let names = [];
+  try { names = await fs.promises.readdir(movesDir(root)); } catch { return []; }
+  const records = await Promise.all(names.filter((name) => /^mv-[a-f0-9]{24}\.json$/.test(name)).map(async (name) => {
+    try { return JSON.parse(await fs.promises.readFile(path.join(movesDir(root), name), 'utf8')); } catch { return null; }
+  }));
+  return records.filter(Boolean);
+}
+
+// Whether this process is running a move of the session right now. A journal that
+// says a move is in flight while nothing here runs it was left by a daemon that went
+// away: it waits for a recover or an abandon like a move that failed.
+function isRunning(sessionId) { return active.has(sessionId); }
+
 // The move of this session that has not finished, if any. Anything but done and
 // abandoned counts: a move that failed part way still owns the session until it is
 // recovered or abandoned.
@@ -486,4 +502,4 @@ async function moveSession(body, deps = {}) {
   });
 }
 
-module.exports = { moveSession, inFlight, readMove, listMoves, safe, digestDifference, TX_RE, IN_FLIGHT };
+module.exports = { moveSession, inFlight, readMove, listMoves, listMovesAsync, isRunning, safe, digestDifference, TX_RE, IN_FLIGHT };

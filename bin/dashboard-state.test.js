@@ -218,6 +218,7 @@ function consoleFixture() {
         activity: { background: { pending: true } }, retirement: { automatic: true, at: 125, reason: 'all-work-done' },
         keepRunning: true,
         modelUsage: { input: 1, cacheRead: 2, cacheWrite: 3, output: 4, reasoning: 0, calls: 1 },
+        move: { id: 'mv-000000000000000000000001', to: 'aws1', from: 'main', status: 'recovery-needed', phase: 'copying' },
         lastUser: 'Large user prompt', lastAssistantFull: 'Full historical tail', lastHuman: 'human', size: 999,
         opener: { via: 'keep' }, endedTurn: true, notify: { type: 'complete' }, lifecycleAgents: ['child'],
         askedProse: false, waitingFor: null, attentionAt: 115, localCommandPending: false,
@@ -270,6 +271,7 @@ function consoleFixture() {
           terminalRendererTrial: 'webgl', openRequestId: 'req-2', launchedBy: 'keep' } },
     ],
     hostStatus: { ok: true },
+    nodes: [{ name: 'main', daemon: true, capabilities: [], ok: true }],
   };
 }
 
@@ -283,7 +285,7 @@ test('console state keeps only the top-level fields the console renders', () => 
   const expectedKeys = [
     'generatedAt', 'shadowDecisions', 'scopes', 'projectCatalog', 'restarts', 'tasks', 'sessions',
     'attention', 'setAside', 'notifications', 'reminders', 'limitResume', 'health', 'usage',
-    'reviewQueue', 'accounts', 'handoffs', 'handoffQueue', 'review', 'agents', 'panes', 'hostStatus',
+    'reviewQueue', 'accounts', 'handoffs', 'handoffQueue', 'review', 'agents', 'panes', 'hostStatus', 'nodes',
   ];
   assert.deepEqual(Object.keys(projected).sort(), [...expectedKeys].sort(),
     'exactly the fields the console renders, and the fixture publishes every one of them');
@@ -380,6 +382,7 @@ test('console state reduces every dead session and leaves live rows whole', () =
     'turnStartedAt', 'accountId', 'account', 'accountLabel', 'reviewer', 'rateLimit', 'lastAssistant',
     'stateLine', 'lastVerdict', 'lastVerdictAt', 'verdictConfidence', 'pendingDecision',
     'pendingQuestion', 'pendingPlan', 'activity', 'notify', 'retirement', 'keepRunning', 'modelUsage', '_detailVersion',
+    'move',
   ];
   const flagged = projected.sessions.find((session) => session.id === 'flagged-exited');
   assert.deepEqual(Object.keys(flagged).sort(), [...expectedDeadSession].sort(),

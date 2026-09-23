@@ -2518,7 +2518,7 @@ const URGENT_DASHBOARD_MUTATIONS = new Set([
   '/api/abandon-account-handoff', '/api/abandon-transfer', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
   '/api/close-idle', '/api/close-session', '/api/compact', '/api/decisions/judge',
   '/api/handoff-queue-cancel', '/api/handoff-rate-limited', '/api/handoff-session', '/api/inbox-card',
-  '/api/mark-session', '/api/notifications', '/api/open', '/api/panes/spawn',
+  '/api/mark-session', '/api/move-session', '/api/notifications', '/api/open', '/api/panes/spawn',
   '/api/portable-transfers', '/api/reminders', '/api/rename-session', '/api/reopen-session',
   '/api/resolve-portable-transfer', '/api/restart-daemon', '/api/restart-session', '/api/review-queue',
   '/api/reviewtick', '/api/run', '/api/send', '/api/session-keep-running', '/api/setaside', '/api/transfer-session',
@@ -9417,6 +9417,76 @@ function placementNodes(deps = {}) {
   }
 }
 
+// The machines a console may offer a new session or a move to, the daemon node first:
+// what each one can do, and whether it answered the last pane list. Reachability is
+// the host status's own (only the other nodes are in it); the daemon node is always
+// reachable as far as its own console is concerned. A single-node install lists just
+// the daemon node, so the console has one code path and hides the choice.
+function consoleNodes(hostStatus, deps = {}) {
+  const daemon = daemonNodeName(deps);
+  const configured = placementNodes(deps);
+  const reach = (hostStatus && hostStatus.nodes) || {};
+  const own = configured.find((node) => node.name === daemon) || { name: daemon, capabilities: [] };
+  return [own, ...configured.filter((node) => node.name !== daemon)].map((node) => {
+    const capabilities = Array.isArray(node.capabilities) ? [...node.capabilities] : [];
+    if (node.name === daemon) return { name: node.name, daemon: true, capabilities, ok: true };
+    const status = Object.prototype.hasOwnProperty.call(reach, node.name) ? reach[node.name] : null;
+    if (status && status.ok === false) {
+      return { name: node.name, daemon: false, capabilities, ok: false, reason: status.reason || 'unreachable' };
+    }
+    return { name: node.name, daemon: false, capabilities, ok: true };
+  });
+}
+
+// A session's unfinished move, as the console renders it: moving (no buttons), or
+// waiting for a person (Retry / Abandon). Done and abandoned moves are history. A
+// journal that says a move is in flight while this process runs none was left by a
+// daemon that went away, and waits for the same recover or abandon as a failed one.
+function consoleMove(record, running) {
+  const failed = record.status === 'recovery-needed';
+  const interrupted = !failed && !running;
+  const phase = failed ? record.phase : record.status;
+  const back = ['stopping', 'copying', 'staged'].includes(phase)
+    ? `leaves it on ${record.from}` : `puts it back on ${record.from} once neither node runs it`;
+  return {
+    id: record.id, to: record.to, from: record.from,
+    status: failed || interrupted ? 'recovery-needed' : 'in-flight',
+    ...(phase ? { phase } : {}),
+    ...(record.reasonCode ? { reasonCode: record.reasonCode } : {}),
+    ...(failed && record.message ? { message: record.message } : {}),
+    ...(interrupted ? { interrupted: true,
+      message: `move ${record.id} of ${record.sessionId} was interrupted while ${phase}; Retry continues it, Abandon ${back}.` } : {}),
+  };
+}
+
+// Adds `nodes` to a state build and `move` to each session with an unfinished move.
+// One journal listing per build. Session rows are replaced, never edited, so a
+// state object another waiter holds keeps what it was built with.
+async function addNodeState(state, hostStatus, deps = {}) {
+  const sessionMove = deps.sessionMove || require('./session-move');
+  state.nodes = consoleNodes(hostStatus, deps);
+  let records = [];
+  try { records = await sessionMove.listMovesAsync(deps.root || keep.ROOT); } catch {}
+  const moves = new Map();
+  for (const record of records) {
+    if (!record || typeof record.sessionId !== 'string' || !sessionMove.IN_FLIGHT.includes(record.status)) continue;
+    const held = moves.get(record.sessionId);
+    if (held && (Number(held.createdAt) || 0) >= (Number(record.createdAt) || 0)) continue;
+    moves.set(record.sessionId, record);
+  }
+  if (!Array.isArray(state.sessions)) return state;
+  state.sessions = state.sessions.map((session) => {
+    const record = session && moves.get(session.id);
+    if (record) return { ...session, move: consoleMove(record, sessionMove.isRunning(record.sessionId)) };
+    if (session && Object.prototype.hasOwnProperty.call(session, 'move')) {
+      const { move: _stale, ...rest } = session;
+      return rest;
+    }
+    return session;
+  });
+  return state;
+}
+
 // Which node a project is placed on. The key in the configuration is written the
 // way a person writes a project — `~/castle/ghost-server` — and the project reaching
 // here may be that, or the absolute path a standalone open resolved for itself. Both
@@ -14658,11 +14728,15 @@ function start(deps = {}) {
     },
     // hostStatus rides beside the build input, not inside it: it changes on every
     // second a silent host stays silent, and the worker keys its dedupe on the input.
-    build: async (input) => ({
-      state: Object.assign(await dashboardBuild(input), { hostStatus: input.hostStatus || { ok: true } }),
-      portableTransfers: listPortableTransfers(),
-      mutationFence: input.mutationFence,
-    }),
+    // `nodes` and each session's unfinished move ride beside it for the same reason:
+    // a node's reachability and a move's journal change without the input changing.
+    build: async (input) => {
+      const hostStatus = input.hostStatus || { ok: true };
+      const state = Object.assign(await dashboardBuild(input), { hostStatus });
+      try { await addNodeState(state, hostStatus, deps); }
+      catch (error) { process.stderr.write(`keep serve: node state skipped: ${error.message}\n`); }
+      return { state, portableTransfers: listPortableTransfers(), mutationFence: input.mutationFence };
+    },
     publish: (publication) => {
       retainedPublication = publication;
       uiWorker?.publish(publication);
@@ -14709,6 +14783,9 @@ function start(deps = {}) {
   watch(path.join(keep.ROOT, '.keep', 'attention'), null, (name) => { dashboardBuilder.invalidate({ kind: 'attention', name }); dashboardPublisher.invalidate(); });
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'unblocked'), { recursive: true }); } catch {}
   watch(path.join(keep.ROOT, '.keep', 'unblocked'), null, (name) => { dashboardBuilder.invalidate({ kind: 'unblocked', name }); dashboardPublisher.invalidate(); });
+  // A move writes its journal at every step; the console shows the step it is on.
+  try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'session-moves'), { recursive: true }); } catch {}
+  watch(path.join(keep.ROOT, '.keep', 'session-moves'), null, () => dashboardPublisher.invalidate());
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'review'), { recursive: true }); } catch {}
   watch(path.join(keep.ROOT, '.keep', 'review'), null, (name) => { dashboardBuilder.invalidate({ kind: 'review', name }); dashboardPublisher.invalidate(); });
   // The bounded transcript index trusts these watchers to invalidate a changed
@@ -15191,6 +15268,8 @@ module.exports = {
   pushSession,
   pullSession,
   moveSession,
+  addNodeState,
+  consoleNodes,
   sessionMoveDeps,
   inspectSessionMove,
   remoteSessionFreshness, unansweredNodes,

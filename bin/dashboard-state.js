@@ -186,6 +186,8 @@ const CONSOLE_STATE_KEYS = [
   'generatedAt', 'shadowDecisions', 'scopes', 'projectCatalog', 'restarts', 'tasks', 'sessions',
   'attention', 'setAside', 'notifications', 'reminders', 'limitResume', 'health', 'usage',
   'reviewQueue', 'accounts', 'handoffs', 'handoffQueue', 'review', 'agents', 'panes', 'hostStatus',
+  // The machines the console may start a session on or move one to (serve.js addNodeState).
+  'nodes',
 ];
 
 // An exited session is a list row and a transcript link; the console never reads
@@ -201,6 +203,9 @@ const CONSOLE_DEAD_SESSION_FIELDS = [
   // The session header renders its own token total beside the card's, on an exited
   // session too. It is four numbers and a count, with no updatedAt to churn.
   'pendingPlan', 'activity', 'notify', 'retirement', 'keepRunning', 'modelUsage', '_detailVersion',
+  // A move stops the session before it resumes it elsewhere, so the row it is shown on
+  // is often an exited one; a failed move waits there for Retry or Abandon.
+  'move',
 ];
 
 const CONSOLE_DEAD_PANE_FIELDS = [

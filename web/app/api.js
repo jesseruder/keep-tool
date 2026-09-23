@@ -6,7 +6,7 @@ const STATE_MUTATIONS = new Set([
   '/api/abandon-account-handoff', '/api/abandon-transfer', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
   '/api/close-idle', '/api/close-session', '/api/compact', '/api/decisions/judge',
   '/api/handoff-queue-cancel', '/api/handoff-rate-limited', '/api/handoff-session', '/api/inbox-card',
-  '/api/mark-session', '/api/notifications', '/api/open', '/api/panes/spawn',
+  '/api/mark-session', '/api/move-session', '/api/notifications', '/api/open', '/api/panes/spawn',
   '/api/portable-transfers', '/api/reminders', '/api/rename-session', '/api/reopen-session',
   '/api/resolve-portable-transfer', '/api/restart-daemon', '/api/restart-session', '/api/review-queue',
   '/api/reviewtick', '/api/run', '/api/send', '/api/session-keep-running', '/api/setaside', '/api/transfer-session',

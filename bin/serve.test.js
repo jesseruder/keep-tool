@@ -16252,3 +16252,60 @@ test('a fresh Codex on aws1 whose launch began no rollout, or two, is not adopte
   assert.deepEqual(two.authorities, [null, null], 'neither is pinned');
   assert.equal(two.paneMeta.sessionId, null);
 });
+
+test('console node state lists the daemon node first with reachability from the host status', () => {
+  const { consoleNodes } = require('./serve');
+  const deps = { daemonNode: 'main', placementNodes: [
+    { name: 'aws1', capabilities: ['linux'] }, { name: 'main', capabilities: ['browser'] }, { name: 'mini', capabilities: [] },
+  ] };
+  const nodes = consoleNodes({ ok: true, nodes: { aws1: { ok: false, reason: 'timeout', since: 5, stale: true }, mini: { ok: true } } }, deps);
+  assert.deepEqual(nodes, [
+    { name: 'main', daemon: true, capabilities: ['browser'], ok: true },
+    { name: 'aws1', daemon: false, capabilities: ['linux'], ok: false, reason: 'timeout' },
+    { name: 'mini', daemon: false, capabilities: [], ok: true },
+  ]);
+  // A single-node install still publishes its one node, so the console has one path.
+  assert.deepEqual(consoleNodes({ ok: true }, { daemonNode: 'main', placementNodes: ['main'] }),
+    [{ name: 'main', daemon: true, capabilities: [], ok: true }]);
+  // A host that never listed a node says nothing against it; a silent host whose
+  // status has no nodes at all leaves every other node offered.
+  assert.equal(consoleNodes({ ok: false }, deps)[1].ok, true);
+});
+
+test('console node state publishes in-flight and recovery-needed moves on their sessions, not finished ones', async () => {
+  const { addNodeState } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-move-state-'));
+  try {
+    const dir = path.join(root, '.keep', 'session-moves');
+    fs.mkdirSync(dir, { recursive: true });
+    const tx = (n) => `mv-${String(n).padStart(24, '0')}`;
+    const write = (record) => fs.writeFileSync(path.join(dir, `${record.id}.json`), JSON.stringify(record));
+    write({ id: tx(1), sessionId: 'moving', from: 'main', to: 'aws1', status: 'copying', createdAt: 10 });
+    write({ id: tx(2), sessionId: 'failed', from: 'main', to: 'aws1', status: 'recovery-needed', phase: 'starting',
+      reasonCode: 'source-changed', reason: 'the source changed', message: 'move stopped while starting', createdAt: 20 });
+    write({ id: tx(3), sessionId: 'finished', from: 'main', to: 'aws1', status: 'done', createdAt: 30 });
+    write({ id: tx(4), sessionId: 'dropped', from: 'main', to: 'aws1', status: 'abandoned', createdAt: 40 });
+    write({ id: tx(5), sessionId: 'back', from: 'main', to: 'aws1', status: 'abandoned-back', createdAt: 50 });
+    write({ id: tx(6), sessionId: 'orphan', from: 'main', to: 'aws1', status: 'staged', createdAt: 60 });
+    fs.writeFileSync(path.join(dir, 'not-a-move.json'), '{}');
+    const running = new Set(['moving']);
+    const sessionMove = { ...require('./session-move'), isRunning: (id) => running.has(id) };
+    const original = { id: 'finished', title: 'Done', move: { id: 'stale' } };
+    const state = { sessions: [{ id: 'moving' }, { id: 'failed' }, original, { id: 'dropped' }, { id: 'back' }, { id: 'orphan' }, { id: 'plain' }] };
+    await addNodeState(state, { ok: true, nodes: { aws1: { ok: true } } },
+      { root, sessionMove, daemonNode: 'main', placementNodes: ['main', 'aws1'] });
+    assert.deepEqual(state.nodes.map((node) => node.name), ['main', 'aws1']);
+    const byId = Object.fromEntries(state.sessions.map((session) => [session.id, session]));
+    assert.deepEqual(byId.moving.move, { id: tx(1), to: 'aws1', from: 'main', status: 'in-flight', phase: 'copying' });
+    assert.deepEqual(byId.failed.move, { id: tx(2), to: 'aws1', from: 'main', status: 'recovery-needed', phase: 'starting',
+      reasonCode: 'source-changed', message: 'move stopped while starting' });
+    for (const id of ['finished', 'dropped', 'back', 'plain']) assert.equal(byId[id].move, undefined, id);
+    assert.deepEqual(original.move, { id: 'stale' }, 'a row is replaced, never edited');
+    // A journal in flight that no move here is running was left by a daemon that went
+    // away: it is offered Retry and Abandon like a failed one.
+    assert.equal(byId.orphan.move.status, 'recovery-needed');
+    assert.equal(byId.orphan.move.phase, 'staged');
+    assert.equal(byId.orphan.move.interrupted, true);
+    assert.match(byId.orphan.move.message, /interrupted while staged.*leaves it on main/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
