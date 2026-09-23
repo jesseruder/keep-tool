@@ -10,6 +10,7 @@
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const fs = require('node:fs');
+const path = require('node:path');
 
 const execFileAsync = promisify(execFile);
 
@@ -86,6 +87,11 @@ async function readFullProcessTable(deps = {}) {
 // Which of these processes is a Claude agent that exported its session id. macOS
 // hands out another process's environment through `ps -E`; Linux has no such flag,
 // and the same answer is in /proc. Both are limited to the pids asked about.
+//
+// On Linux, `deps.codex` also asks for the id a Codex TUI exports to its children
+// (CODEX_THREAD_ID), reported apart as { pid, sessionId, agent: 'codex' } so no
+// reader takes it for a Claude session. Without it the answer is what it always was;
+// on macOS the option is not read.
 async function readSessionEnv(pids, deps = {}) {
   const wanted = [...new Set((pids || []).map(Number).filter(Number.isInteger))];
   if (!wanted.length) return [];
@@ -95,10 +101,17 @@ async function readSessionEnv(pids, deps = {}) {
     for (const pid of wanted) {
       let bytes;
       try { bytes = io.readFileSync(`/proc/${pid}/environ`, 'utf8'); } catch { continue; }
+      let claude = null;
+      let codex = null;
       for (const entry of String(bytes).split('\0')) {
-        const match = /^CLAUDE_CODE_SESSION_ID=([A-Za-z0-9_-]+)$/.exec(entry);
-        if (match) { found.push({ pid, sessionId: match[1] }); break; }
+        const match = claude ? null : /^CLAUDE_CODE_SESSION_ID=([A-Za-z0-9_-]+)$/.exec(entry);
+        if (match) claude = match[1];
+        const thread = deps.codex === true && !codex ? /^CODEX_THREAD_ID=([A-Za-z0-9_-]+)$/.exec(entry) : null;
+        if (thread) codex = thread[1];
+        if (claude && (codex || deps.codex !== true)) break;
       }
+      if (claude) found.push({ pid, sessionId: claude });
+      if (codex) found.push({ pid, sessionId: codex, agent: 'codex' });
     }
     return found;
   }
@@ -115,9 +128,14 @@ async function readSessionEnv(pids, deps = {}) {
 // Which Codex rollout files these processes hold open, and when each was last
 // written. The mtime travels with the path because the file is on this machine and
 // the caller may not be.
+//
+// A Linux machine without lsof reads the same answer from /proc/<pid>/fd (below);
+// lsof is still what is asked wherever it is installed, and everywhere else a read
+// that fails throws, so the caller's evidence says it failed rather than found nothing.
 async function readOpenRollouts(pids, deps = {}) {
   const wanted = [...new Set((pids || []).map(Number).filter(Number.isInteger))];
   if (!wanted.length) return [];
+  if ((deps.platform || process.platform) === 'linux' && !(deps.hasLsof || hasLsof)(deps)) return readProcRollouts(wanted, deps);
   const result = await (deps.execFile || execFileAsync)('lsof', ['-p', wanted.join(','), '-Fpn'], {
     encoding: 'utf8', timeout: 5e3, maxBuffer: 32e6,
   });
@@ -136,6 +154,47 @@ async function readOpenRollouts(pids, deps = {}) {
   return files;
 }
 
+// Whether lsof is on this machine's PATH.
+function hasLsof(deps = {}) {
+  const io = fs;
+  const dirs = String((deps.env || process.env).PATH || '/usr/bin:/bin:/usr/sbin:/sbin').split(':').filter(Boolean);
+  return dirs.some((dir) => {
+    try { io.accessSync(path.join(dir, 'lsof'), fs.constants.X_OK); return true; } catch { return false; }
+  });
+}
+
+// A rollout by the path a descriptor links to: Codex keeps them under a
+// `sessions/` tree, named rollout-<time>-<uuid>.jsonl.
+const PROC_ROLLOUT_RE = /^(\/(?:[^/\0]+\/)*sessions\/(?:[^/\0]+\/)*rollout-[^/\0]*-([0-9a-f-]{36})\.jsonl)$/;
+const PROC_FDS_MAX = 4096;
+
+// readOpenRollouts from /proc: each asked pid's descriptors, read as links. A pid that
+// is gone holds nothing, as lsof would say; one whose descriptors cannot be read
+// (another user's process) fails the whole read, as lsof failing does.
+function readProcRollouts(wanted, deps = {}) {
+  const io = deps.fs || fs;
+  const files = [];
+  for (const pid of wanted) {
+    const dir = `/proc/${pid}/fd`;
+    let names;
+    try { names = io.readdirSync(dir); } catch (error) {
+      if (error && error.code === 'ENOENT') continue;
+      throw new Error(`cannot read the open files of ${pid}: ${error && error.message || error}`);
+    }
+    for (const name of names.slice(0, PROC_FDS_MAX)) {
+      if (!/^\d+$/.test(String(name))) continue;
+      let target;
+      try { target = io.readlinkSync(`${dir}/${name}`); } catch { continue; }
+      const match = PROC_ROLLOUT_RE.exec(String(target));
+      if (!match || files.some((entry) => entry.pid === pid && entry.path === match[1])) continue;
+      let mtime = null;
+      try { mtime = io.statSync(match[1]).mtimeMs; } catch {}
+      files.push({ pid, path: match[1], id: match[2], mtime });
+    }
+  }
+  return files;
+}
+
 // The table, and whichever of the two per-pid reads the caller asked for. One call,
 // so a caller on another machine pays one round trip for one machine's answer.
 async function inspect(params = {}, deps = {}) {
@@ -143,7 +202,8 @@ async function inspect(params = {}, deps = {}) {
   const pids = Array.isArray(params.pids)
     ? params.pids.map(Number).filter((pid) => Number.isInteger(pid) && pid > 0) : [];
   const result = { rows };
-  if (params.env === true) result.env = await readSessionEnv(pids, deps);
+  // codexEnv: the Codex thread ids as well, on Linux (readSessionEnv).
+  if (params.env === true) result.env = await readSessionEnv(pids, params.codexEnv === true ? { ...deps, codex: true } : deps);
   if (params.files === true) result.files = await readOpenRollouts(pids, deps);
   return result;
 }
@@ -206,5 +266,5 @@ async function signal(params = {}, deps = {}) {
 module.exports = {
   PS_TABLE_RE, FULL_PS_TABLE_RE, PS_ROWS_ARGS, PS_FULL_ARGS, SIGNALS,
   parseProcessTable, parseFullProcessTable, readFullProcessTable,
-  readSessionEnv, readOpenRollouts, inspect, signal,
+  readSessionEnv, readOpenRollouts, readProcRollouts, hasLsof, inspect, signal,
 };

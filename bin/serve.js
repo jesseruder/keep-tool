@@ -6120,7 +6120,9 @@ function nodeEvidence(node, deps = {}) {
       || ((given, options = {}) => agentProcessRows(given, { node: where(options) })),
     psEnv: deps.psEnv || (async (pids, options = {}) => {
       const result = await hostRequest('process', { pids, env: true }, { ...deps, node: where(options) });
-      return (result.env || []).map((entry) => `${entry.pid} CLAUDE_CODE_SESSION_ID=${entry.sessionId}`).join('\n');
+      // A Codex thread id (asked for only with codexEnv) is never a Claude session's.
+      return (result.env || []).filter((entry) => !entry.agent || entry.agent === 'claude')
+        .map((entry) => `${entry.pid} CLAUDE_CODE_SESSION_ID=${entry.sessionId}`).join('\n');
     }),
     lsof: deps.lsof || (async (pids, options = {}) => {
       const target = where(options);
@@ -15036,6 +15038,7 @@ module.exports = {
   hostNodeEntries,
   resolvePlacement,
   nodeEvidence,
+  unverifiedProcesses,
   sessionNodeOf,
   remoteSession,
   hostNodeNames,

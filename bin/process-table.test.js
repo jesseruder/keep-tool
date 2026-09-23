@@ -98,6 +98,7 @@ test('an inspection answers only what it was asked for', async () => {
   assert.deepEqual(Object.keys(plain), ['rows']);
   const both = await table.inspect({ pids: [501], env: true, files: true }, {
     platform: 'linux',
+    hasLsof: () => true,
     execFile: async (cmd, args) => (cmd === 'lsof' ? { stdout: '' } : { stdout }),
     fs: { readFileSync: () => 'CLAUDE_CODE_SESSION_ID=abc\0' },
   });
@@ -159,4 +160,91 @@ test('a signal compares a whole identity on one pid, and never blocks the host',
   await assert.rejects(async () => table.signal({ pid: 1, pidStart: 'x', args: 'a', signal: 'SIGTERM' }, { execFile }), /needs the parent/);
   await assert.rejects(async () => table.signal({ pid: 1, pidStart: 'x', ppid: 1, signal: 'SIGTERM' }, { execFile }), /needs the arguments/);
   await assert.rejects(async () => table.signal({ ...captured, signal: 'SIGUSR1' }, { execFile }), /signal must be one of/);
+});
+
+// ---------- Codex on Linux ----------
+
+const ROLLOUT = (id) => `/home/node/.codex/sessions/2026/09/22/rollout-2026-09-22T10-00-00-${id}.jsonl`;
+const ID_A = '11111111-2222-3333-4444-555555555555';
+const ID_B = '66666666-7777-8888-9999-000000000000';
+
+test('on Linux a Codex thread id is read from /proc only when asked for, and reported as Codex\'s', async () => {
+  const environ = {
+    '/proc/7/environ': ['PATH=/usr/bin', 'CODEX_THREAD_ID=thread-seven', ''].join('\0'),
+    '/proc/8/environ': ['CODEX_THREAD_ID=thread-eight', 'CLAUDE_CODE_SESSION_ID=eight', ''].join('\0'),
+  };
+  const deps = { platform: 'linux', fs: { readFileSync: (file) => {
+    if (environ[file]) return environ[file];
+    throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+  } }, execFile: () => assert.fail('no ps -E on Linux') };
+  assert.deepEqual(await table.readSessionEnv([7, 8, 9], deps), [{ pid: 8, sessionId: 'eight' }], 'unchanged without the option');
+  assert.deepEqual(await table.readSessionEnv([7, 8, 9], { ...deps, codex: true }), [
+    { pid: 7, sessionId: 'thread-seven', agent: 'codex' },
+    { pid: 8, sessionId: 'eight' },
+    { pid: 8, sessionId: 'thread-eight', agent: 'codex' },
+  ]);
+  const inspected = await table.inspect({ pids: [7], env: true, codexEnv: true }, { ...deps, execFile: async () => ({ stdout: '' }) });
+  assert.deepEqual(inspected.env, [{ pid: 7, sessionId: 'thread-seven', agent: 'codex' }]);
+});
+
+test('on macOS the ps -E read is what it always was, codex option or not', async () => {
+  const calls = [];
+  const found = await table.readSessionEnv([11], { platform: 'darwin', codex: true, execFile: async (cmd, args) => {
+    calls.push([cmd, args]);
+    return { stdout: '  11 codex CODEX_THREAD_ID=t CLAUDE_CODE_SESSION_ID=one\n' };
+  } });
+  assert.deepEqual(calls, [['ps', ['-E', '-o', 'pid=,args=', '-p', '11']]]);
+  assert.deepEqual(found, [{ pid: 11, sessionId: 'one' }]);
+});
+
+function procFs(links, { unreadable = [] } = {}) {
+  return {
+    readdirSync: (dir) => {
+      const pid = Number(/^\/proc\/(\d+)\/fd$/.exec(dir)[1]);
+      if (unreadable.includes(pid)) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      if (!links[pid]) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      return Object.keys(links[pid]);
+    },
+    readlinkSync: (file) => {
+      const [, pid, fd] = /^\/proc\/(\d+)\/fd\/(\d+)$/.exec(file);
+      return links[pid][fd];
+    },
+    statSync: (file) => ({ mtimeMs: file.includes(ID_A) ? 1000 : 2000 }),
+  };
+}
+
+test('a Linux node without lsof reads the open rollouts from /proc, only for the asked pids', async () => {
+  const links = {
+    21: { 0: '/dev/pts/3', 1: 'pipe:[123]', 5: ROLLOUT(ID_A), 6: ROLLOUT(ID_A), 7: `${ROLLOUT(ID_B)} (deleted)`, 8: '/home/node/notes/rollout-x-11111111-2222-3333-4444-555555555555.txt' },
+    22: { 4: ROLLOUT(ID_B) },
+    99: { 3: ROLLOUT(ID_B) },
+  };
+  const files = await table.readOpenRollouts([21, 22, 23], { platform: 'linux', hasLsof: () => false, fs: procFs(links),
+    execFile: () => assert.fail('no lsof here') });
+  assert.deepEqual(files, [
+    { pid: 21, path: ROLLOUT(ID_A), id: ID_A, mtime: 1000 },
+    { pid: 22, path: ROLLOUT(ID_B), id: ID_B, mtime: 2000 },
+  ], 'one rollout per open file, a deleted one and a non-rollout left out, a pid that is gone holding nothing, and never pid 99');
+  await assert.rejects(table.readOpenRollouts([21, 24], { platform: 'linux', hasLsof: () => false, fs: procFs(links, { unreadable: [24] }) }),
+    /cannot read the open files of 24/, 'a read that fails is a failure, never an empty answer');
+  // lsof is preferred wherever it is installed.
+  const calls = [];
+  await table.readOpenRollouts([21], { platform: 'linux', hasLsof: () => true, fs: procFs(links),
+    execFile: async (cmd, args) => { calls.push([cmd, args]); return { stdout: '' }; } });
+  assert.deepEqual(calls, [['lsof', ['-p', '21', '-Fpn']]]);
+  assert.equal(typeof table.hasLsof(), 'boolean');
+});
+
+test('a node whose open-file read failed leaves a Codex session unverified, never found absent', async () => {
+  const serve = require('./serve.js');
+  const rows = [{ pid: 30, ppid: 1, tty: 'pts/1', pidStart: 'Mon Sep 21 09:00:00 2026', args: 'codex', agent: 'codex', interactive: true }];
+  const failed = await serve.liveSessionPids({ agentProcessRows: async () => rows, lsof: async () => { throw new Error('cannot read the open files of 30'); } });
+  assert.equal(failed.size, 0);
+  assert.equal(failed.evidence.files, 'failed');
+  assert.equal(serve.unverifiedProcesses(failed, 'codex'), true);
+  const found = await serve.liveSessionPids({ agentProcessRows: async () => rows, statMtime: async () => 5,
+    lsof: async () => ['p30', `n${ROLLOUT(ID_A)}`].join('\n') });
+  assert.equal(found.get(ID_A).pid, 30);
+  assert.equal(found.get(ID_A).source, 'rollout');
+  assert.equal(serve.unverifiedProcesses(found, 'codex'), false);
 });
