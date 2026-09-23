@@ -10323,6 +10323,21 @@ async function openSession(body, deps = {}) {
 
   const target = { pane: launch.pane };
   let launchPrepared = false;
+  // Set while the daemon holds a record of this launch that late adoption could still use.
+  let nodeLaunchRecorded = false;
+  // Once this open knows the session, its launch record is consumed, so late adoption
+  // can never take it again. A record that cannot be deleted is reported, not fatal:
+  // late adoption refuses a session that has a location record anyway.
+  const consumeNodeLaunch = () => {
+    if (!nodeLaunchRecorded || !launch.sessionId) return;
+    nodeLaunchRecorded = false;
+    try {
+      (deps.consumeNodeCodexLaunch || require('./late-adoption.js').consumeNodeCodexLaunch)(
+        deps.root || keep.ROOT, launchNode, body.requestId);
+    } catch (error) {
+      process.stderr.write(`keep serve: could not consume the Codex launch record for ${launch.pane}: ${error.message}\n`);
+    }
+  };
   try {
     // A fresh Codex on another node may name its session only at its first turn, after
     // this open has returned pending: the daemon's record of the launch is what lets the
@@ -10333,6 +10348,7 @@ async function openSession(body, deps = {}) {
           node: launchNode, requestId: body.requestId, accountId: account.id, launchedAt,
           pane: nodes.parsePaneRef(launch.pane, { env: deps.env || process.env }).paneId, project,
         });
+        nodeLaunchRecorded = true;
       } catch (error) {
         process.stderr.write(`keep serve: could not record the Codex launch in ${launch.pane}: ${error.message}\n`);
       }
@@ -10363,11 +10379,13 @@ async function openSession(body, deps = {}) {
       launch.sessionId = await (deps.verifyFreshOpenPane || verifyFreshOpenPane)(launch, {
         agent, accountId: account.id, requestId: body.requestId, launchedAt, project, model: launchModel,
       }, deps);
+      consumeNodeLaunch();
       if (!launch.sessionId && launchNode !== nodes.daemonNode(deps.env || process.env)) {
         const adopted = await (deps.adoptNodeCodexLaunch || adoptNodeCodexLaunch)(launch, {
           agent, accountId: account.id, requestId: body.requestId, launchedAt, project, model: launchModel, node: launchNode, account,
         }, deps);
         launch.sessionId = adopted.sessionId;
+        consumeNodeLaunch();
         if (!adopted.sessionId) launch.registrationNote = adopted.why;
       }
       if (!launch.sessionId) launch.pendingRegistration = true;
@@ -10439,6 +10457,9 @@ async function openSession(body, deps = {}) {
         throw new InjectionError(504, `${agent} started in host pane ${launch.pane} but never registered its session id`);
       }
     }
+    // Every later path that learned the session (the handoff's wait, a portable
+    // successor's) consumes the record too, before the pin.
+    consumeNodeLaunch();
     if (launch.sessionId && !deferReadiness) {
       (deps.pinSession || accounts.pinSession)(launch.sessionId, agent, account.id,
         { root: deps.root || keep.ROOT, env: deps.env || process.env, node: launchNode });

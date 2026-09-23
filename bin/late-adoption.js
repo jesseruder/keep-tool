@@ -93,6 +93,21 @@ function readNodeCodexLaunch(root, node, requestId, options = {}) {
   } catch { return null; }
 }
 
+// Consumes the record of a launch whose session is now known, so it can never adopt
+// again: true when this call deleted it, false when it was already gone. Any other
+// failure throws. Called by late adoption before it pins, and by openSession when the
+// open itself learns the session.
+function consumeNodeCodexLaunch(root, node, requestId) {
+  if (typeof node !== 'string' || !node || !REQUEST_ID_RE.test(String(requestId || ''))) return false;
+  try {
+    fs.unlinkSync(launchFile(root, node, requestId));
+    return true;
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
 // ---------- whether this machine knows a session ----------
 
 // A missing directory or file is an answer (not here); any other failure to look is not.
@@ -260,14 +275,20 @@ function createLateAdoption(options = {}) {
     let where;
     try { where = location(sessionId); } catch { return refusal('the location record is unreadable'); }
     if (where) return { adopted: false, why: 'the session already has a location record', located: true };
+    // Used once, and consumed before anything is pinned: a record another adoption or
+    // the open itself consumed meanwhile has its session already, and one that cannot
+    // be deleted could adopt again, so either way nothing is pinned.
+    let consumed;
+    try { consumed = consumeNodeCodexLaunch(root, caller, meta.openRequestId); } catch (error) {
+      return refusal(`the launch record could not be consumed: ${error && (error.code || error.message) || error}`, SHORT_TTL_MS);
+    }
+    if (!consumed) return refusal('the launch record was consumed meanwhile, by another adoption or the open itself');
     try {
       accounts.pinSession(sessionId, agent, accountId, { root, env, node: caller });
     } catch (error) { return refusal(error.message); }
     const cwd = typeof meta.project === 'string' && path.isAbsolute(meta.project) ? meta.project
       : (typeof pane.cwd === 'string' ? pane.cwd : '');
     const at = now();
-    // Used once: the launch has its session now.
-    try { fs.unlinkSync(launchFile(root, caller, meta.openRequestId)); } catch {}
     const record = {
       at, startedAt: at, cwd, agent, pane: ref, claimed: true, node: caller, accountId, bound: true,
       unattended: meta.unattended === true, opener: meta.opener || null,
@@ -330,4 +351,4 @@ function createLateAdoption(options = {}) {
   return { adopt, unlocated };
 }
 
-module.exports = { createLateAdoption, recordNodeCodexLaunch, readNodeCodexLaunch, walkedLocally, LOOKUP_DEADLINE_MS, NEGATIVE_TTL_MS, SHORT_TTL_MS, LAUNCH_TTL_MS };
+module.exports = { createLateAdoption, recordNodeCodexLaunch, readNodeCodexLaunch, consumeNodeCodexLaunch, walkedLocally, LOOKUP_DEADLINE_MS, NEGATIVE_TTL_MS, SHORT_TTL_MS, LAUNCH_TTL_MS };

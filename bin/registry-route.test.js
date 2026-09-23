@@ -839,6 +839,41 @@ test('a launch record adopts one session, once', async (t) => {
   assert.equal(require('./late-adoption.js').readNodeCodexLaunch(root, 'aws1', 'req-1', { now: () => 1_800_000_000_000 }), null, 'consumed');
 });
 
+test('a launch record consumed between the host lookup and the pin, or one that cannot be deleted, pins nothing', async (t) => {
+  const lateAdoption = require('./late-adoption.js');
+  const pinned = (service) => fs.existsSync(path.join(service.root, '.keep', 'session-accounts'));
+  // The open (or another adoption) consumes the record while this one is asking: the
+  // last-moment location check is the step just before the pin.
+  let service;
+  let looks = 0;
+  service = directAdoption(t, [lateCodexPane()], {
+    location: () => {
+      looks += 1;
+      if (looks === 2) assert.equal(lateAdoption.consumeNodeCodexLaunch(service.root, 'aws1', 'req-1'), true);
+      return null;
+    },
+  });
+  let result = await service.adopt();
+  assert.equal(looks, 2);
+  assert.equal(result.adopted, false);
+  assert.match(result.why, /consumed meanwhile/);
+  assert.equal(pinned(service), false);
+  assert.equal(fs.existsSync(path.join(service.root, '.keep', 'panes', 'codex-late.json')), false);
+  assert.equal(lateAdoption.consumeNodeCodexLaunch(service.root, 'aws1', 'req-1'), false, 'already gone');
+  // A record that cannot be deleted could adopt again, so it adopts nothing now.
+  if (!(process.getuid && process.getuid() === 0)) {
+    const stuck = directAdoption(t, [lateCodexPane()]);
+    const dir = path.join(stuck.root, '.keep', 'node-codex-launches');
+    fs.chmodSync(dir, 0o500);
+    t.after(() => { try { fs.chmodSync(dir, 0o700); } catch {} });
+    result = await stuck.adopt();
+    assert.equal(result.adopted, false);
+    assert.match(result.why, /the launch record could not be consumed/);
+    assert.equal(pinned(stuck), false);
+    fs.chmodSync(dir, 0o700);
+  }
+});
+
 test('late adoption gives up on a node host that never answers its hello within about two seconds, well inside a start\'s deadline', async (t) => {
   const net = require('node:net');
   const sockets = [];

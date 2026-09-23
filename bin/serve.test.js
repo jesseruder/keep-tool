@@ -16115,6 +16115,20 @@ test('a fresh Codex opened on aws1 is registered from the rollout its pane began
   assert.equal(paneMeta.sessionId, id, 'the pane on aws1 names it');
 });
 
+test('a fresh Codex on aws1 that the open itself registers leaves no launch record for late adoption', async (t) => {
+  const id = 'eeeeeeee-1111-2222-3333-444444444444';
+  const { opened, error, after } = await openCodexOnAws1(t, [id], async ({ registry }) => {
+    const dir = path.join(registry, '.keep', 'node-codex-launches');
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch {}
+    return { names, launch: require('./late-adoption.js').readNodeCodexLaunch(registry, 'aws1', 'open-codex-1') };
+  });
+  assert.equal(error, null, error && error.stack);
+  assert.equal(opened.sessionId, id, JSON.stringify(opened));
+  assert.equal(after.launch, null, 'consumed by the open');
+  assert.deepEqual(after.names.filter((name) => name.endsWith('.json')), [], 'no record left behind');
+});
+
 test('a fresh Codex on aws1 left pending is adopted later by the routes from the launch the open recorded, once its pane is bound', async (t) => {
   const lateId = 'dddddddd-1111-2222-3333-444444444444';
   const { error, opened, after } = await openCodexOnAws1(t, [], async ({ registry, env, paneId, connect }) => {
