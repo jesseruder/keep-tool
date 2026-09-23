@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 import {
@@ -18,6 +22,7 @@ import {
   encodeNative,
   extensionIdFromKey,
   isChunk,
+  isMainModule,
   runtimeDir,
   socketPath,
 } from "../host/protocol.js";
@@ -307,4 +312,23 @@ test("on Linux the runtime directory is the XDG state directory", () => {
     runtimeDir({ HOME: "/Users/example", XDG_STATE_HOME: "/Users/example/.state" }, "darwin"),
     "/Users/example/Library/Application Support/BrowserBridge",
   );
+});
+
+test("a module is main by its real path, whatever its URL has to encode", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-main-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const real = path.join(dir, "100% real é", "entry.js");
+  fs.mkdirSync(path.dirname(real));
+  fs.writeFileSync(real, "");
+  const link = path.join(dir, "linked entry.js");
+  fs.symlinkSync(real, link);
+  // What Node hands the module: the URL of the resolved file, percent-encoded.
+  const url = pathToFileURL(fs.realpathSync(real)).href;
+  assert.notEqual(url, `file://${real}`, "the naive comparison would fail here");
+
+  assert.equal(isMainModule(url, real), true);
+  assert.equal(isMainModule(url, link), true);
+  assert.equal(isMainModule(url, path.join(dir, "other.js")), false, "a path that does not exist");
+  assert.equal(isMainModule(url, undefined), false, "no script at all, as under a REPL");
+  assert.equal(isMainModule(url, link + "x"), false);
 });

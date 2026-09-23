@@ -17,7 +17,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-import { DEFAULT_DAEMON_PORT, readDaemonConfig, sessionsPath, socketPath } from "../host/protocol.js";
+import { DEFAULT_DAEMON_PORT, isMainModule, readDaemonConfig, sessionsPath, socketPath } from "../host/protocol.js";
 import { BridgeClient } from "./client.js";
 import {
   MAX_HEADER_VALUE_LENGTH,
@@ -728,6 +728,6 @@ export async function main(env = process.env) {
   return daemon;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
   await main();
 }

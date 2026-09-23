@@ -21,7 +21,7 @@
 // Nothing here may import the MCP SDK: this runs on every request, and loading the SDK and
 // zod cost ~60 ms a time. `test/headers.test.js` holds that line.
 
-import { readDaemonConfig } from "../host/protocol.js";
+import { isMainModule, readDaemonConfig } from "../host/protocol.js";
 import { encodeHeaderValue, guessAgent, guessAccount, sanitizeHeaderValue } from "../mcp/identity.js";
 
 export function buildHeaders(env = process.env) {
@@ -61,6 +61,6 @@ export function main(env = process.env, write = (text) => process.stdout.write(t
   write(`${JSON.stringify(headers)}\n`);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
   main();
 }

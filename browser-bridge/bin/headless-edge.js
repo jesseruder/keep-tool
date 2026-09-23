@@ -21,7 +21,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { EXTENSION_ID, edgeProfileDir } from "../host/protocol.js";
+import { EXTENSION_ID, edgeProfileDir, isMainModule } from "../host/protocol.js";
 
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const DEFAULT_EDGE = "/usr/bin/microsoft-edge";
@@ -309,6 +309,6 @@ async function main(argv) {
   supervisor.start();
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
   await main(process.argv.slice(2));
 }

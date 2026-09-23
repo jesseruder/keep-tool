@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { endianness, homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // --- identity -------------------------------------------------------------
 
@@ -424,4 +425,22 @@ export function readDaemonConfig(env = process.env, platform = process.platform)
 
 export function daemonUrl(port) {
   return `http://127.0.0.1:${port}/mcp`;
+}
+
+// --- entrypoints ------------------------------------------------------------
+
+/**
+ * Whether the module at `moduleUrl` (its `import.meta.url`) is the script Node was started
+ * with. Comparing the URL with `file://${argv[1]}` is wrong for any path with a space, a `%`
+ * or a non-ASCII character (the URL is percent-encoded) and for one reached through a
+ * symlink (the URL is the real path), and a service whose script is never "main" either
+ * does nothing or restarts forever. So both sides are resolved to real file paths.
+ */
+export function isMainModule(moduleUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  try {
+    return fs.realpathSync(fileURLToPath(moduleUrl)) === fs.realpathSync(argv1);
+  } catch {
+    return false;
+  }
 }

@@ -34,6 +34,7 @@ import {
   daemonUrl,
   edgeLogPath,
   edgeProfileDir,
+  isMainModule,
   launcherPath,
   readDaemonConfig,
   runtimeDir,
@@ -1347,6 +1348,6 @@ function nextSteps(plan, options = {}) {
   return lines.join("\n");
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
   await main(process.argv.slice(2), process.env, { platform: process.platform });
 }
