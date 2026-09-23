@@ -981,8 +981,11 @@ test('a card open\'s launch puts the adopted session on that card, releases the 
     releaseCardSession: (cardId, sessionId) => { released.push({ cardId, sessionId }); return true; },
     log: (line) => logged.push(line),
   }, { card: 'the-card', requester: 'handing-session' });
+  // The open left pending kept its handoff record (bin/open-handoffs.js); adoption ends it.
+  require('./open-handoffs.js').record(card.root, { requester: 'handing-session', card: 'the-card', pane: 'p2@aws1' });
   let result = await card.adopt();
   assert.equal(result.adopted, true, result.why);
+  assert.deepEqual(require('./open-handoffs.js').pendingFor(card.root, 'handing-session'), [], 'the handoff is over');
   // The card is the daemon's record of the open, never the pane's meta.
   assert.deepEqual(linked, [{ cardId: 'the-card', session: { id: 'codex-late', agent: 'codex', node: 'aws1' } }]);
   assert.deepEqual(released, [{ cardId: 'the-card', sessionId: 'handing-session' }]);

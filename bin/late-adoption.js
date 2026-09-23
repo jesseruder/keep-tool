@@ -410,6 +410,8 @@ function createLateAdoption(options = {}) {
           log(`late adoption: ${launch.requester} could not be unlinked from card ${launch.card}: ${error && error.message || error}`);
         }
       }
+      // The open's handoff is over (bin/open-handoffs.js), linked or not.
+      if (typeof launch.requester === 'string') require('./open-handoffs.js').clear(root, launch.requester, launch.card);
     }
     return { adopted: true, pane: ref, accountId, ...(linked !== undefined ? { card: launch.card, linked } : {}) };
   }

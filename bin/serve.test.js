@@ -16521,6 +16521,39 @@ test('a card open links the launched session before the requester leaves, and a 
   assert.equal(discussed.opened.linked, undefined);
 });
 
+test('a card open records its handoff while the requester is still on the card, and removes it when the open is over', async (t) => {
+  const handoffs = require('./open-handoffs.js');
+  let seenAtLink = null;
+  let recordedIn = null;
+  const ok = await remoteCardOpen(t, { agent: 'claude' }, {
+    randomUUID: () => '11111111-2222-4333-8444-aaaaaaaaaaaa',
+    recordOpenHandoff: (root, value) => { recordedIn = root; return handoffs.record(root, value); },
+    linkLaunchedSession: (cardId, entry) => {
+      seenAtLink = handoffs.pendingFor(recordedIn, 'handing-session');
+      return { linked: entry.id };
+    },
+  });
+  assert.equal(ok.error, null, ok.error && ok.error.stack);
+  assert.deepEqual(seenAtLink.map((entry) => [entry.card, entry.pane]), [['card', 'p1@aws1']], 'recorded while the link was in flight');
+  assert.deepEqual(handoffs.pendingFor(ok.root, 'handing-session'), [], 'and removed once the requester left');
+
+  // An open that fails leaves the requester on the card, and no record.
+  const failed = await remoteCardOpen(t, { agent: 'claude', message: 'Begin.' }, {
+    randomUUID: () => '11111111-2222-4333-8444-bbbbbbbbbbbb',
+    typeOpeningMessage: async () => { throw new Error('the pane stopped echoing'); },
+  });
+  assert.ok(failed.error);
+  assert.deepEqual(handoffs.pendingFor(failed.root, 'handing-session'), []);
+
+  // One left pending keeps it for late adoption.
+  const pending = await remoteCardOpen(t, { agent: 'codex', requestId: 'open-handoff-pending-1' }, {
+    adoptNodeCodexLaunch: async () => ({ sessionId: null, why: 'no Codex rollout begun' }),
+  });
+  assert.equal(pending.error, null, pending.error && pending.error.stack);
+  assert.equal(pending.opened.pendingRegistration, true);
+  assert.deepEqual(handoffs.pendingFor(pending.root, 'handing-session').map((entry) => entry.card), ['card']);
+});
+
 test('a pending card open on aws1 that learns its session itself links it once, releases the requester once, and consumes its launch record', async (t) => {
   const run = await remoteCardOpen(t, { agent: 'codex', requestId: 'open-learned-1' }, {
     host: (type, params, state) => (type === 'get'

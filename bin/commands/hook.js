@@ -154,8 +154,8 @@ function codexHook(kind, input) {
     }
     // The pane is what says whether anybody is reading this session, and the Stop
     // hook itself is synchronous, so the read happens here.
-    return enforcedUnattendedState(input.session_id).then((unattended) => {
-      const blocked = stopHook(input, 'codex', { unattended }) === true;
+    return Promise.all([enforcedUnattendedState(input.session_id), openHandoffsOf(input.session_id)]).then(([unattended, openHandoffs]) => {
+      const blocked = stopHook(input, 'codex', { unattended, openHandoffs }) === true;
       indexTurns(input, 'codex');
       if (blocked) return true;
       return codexHook('complete', input);
@@ -1242,7 +1242,8 @@ commands.hook = async (argv) => {
       // host round trip for a session it already knows somebody is reading.
       let unattended = ATTENDED;
       try { unattended = await enforcedUnattendedState(input && input.session_id); } catch {}
-      const blocked = stopHook(input, 'claude', { unattended }) === true;
+      const openHandoffs = await openHandoffsOf(input && input.session_id);
+      const blocked = stopHook(input, 'claude', { unattended, openHandoffs }) === true;
       if (!blocked) recordClaudeCompletion(input);
     } catch {}
     indexTurns(input, 'claude');
@@ -1786,8 +1787,18 @@ function readCodexParent(root, sid) {
   } catch { return null; }
 }
 
-function autoContinueTask(sid) {
-  return taskForSession(sid);
+// The card this session's Stop hook may continue it on: its newest open card, unless
+// an open it requested is still handing that card over (bin/open-handoffs.js), whose
+// launched session is not linked to it yet. `handoffs` is what openHandoffsOf found.
+function autoContinueTask(sid, handoffs = []) {
+  const task = taskForSession(sid);
+  return require('../open-handoffs.js').handingOver(task, handoffs) ? null : task;
+}
+
+// The opens this session requested whose panes are still up, read before the
+// synchronous Stop hook runs: a readdir when there are none. Never throws.
+async function openHandoffsOf(sid) {
+  try { return await require('../open-handoffs.js').liveHandoffs(ROOT, sid); } catch { return []; }
 }
 
 // ---------- deploy provenance ----------
@@ -3164,7 +3175,7 @@ function stopHookChecks(input, agent, options, sid, transcript, hint) {
   const checkedIn = checkinMt > startedAt && Date.now() - checkinMt < MARKER_FRESH_MS;
   const recentlyNagged = naggedMt > startedAt && Date.now() - naggedMt < MARKER_FRESH_MS;
   const shouldNag = !checkedIn && !recentlyNagged && hasSubstantiveStopEvidence(state);
-  const task = process.env.KEEP_AUTO_CONTINUE === '0' ? null : autoContinueTask(sid);
+  const task = process.env.KEEP_AUTO_CONTINUE === '0' ? null : autoContinueTask(sid, options.openHandoffs);
   const parsed = task ? parsePlan(task.body) : { steps: [] };
   const next = task ? nextStep(task) : null;
 

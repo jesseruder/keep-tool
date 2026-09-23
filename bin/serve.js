@@ -10648,6 +10648,25 @@ async function openSession(body, deps = {}) {
     }
   };
 
+  // While the requester is still on the card, its Stop hook must not auto-continue it
+  // onto the steps this open is handing over (bin/open-handoffs.js): recorded once the
+  // pane is up, removed once the open is over, kept for late adoption when pending.
+  let handoffRecorded = false;
+  if (releasePending && launch.pane) {
+    try {
+      (deps.recordOpenHandoff || require('./open-handoffs.js').record)(deps.root || keep.ROOT,
+        { requester: body.requester, card: body.taskId, pane: launch.pane });
+      handoffRecorded = true;
+    } catch (error) {
+      process.stderr.write(`keep serve: could not record the handoff of ${body.taskId}: ${error.message}\n`);
+    }
+  }
+  const clearHandoff = () => {
+    if (!handoffRecorded) return;
+    handoffRecorded = false;
+    require('./open-handoffs.js').clear(deps.root || keep.ROOT, body.requester, body.taskId);
+  };
+
   const target = { pane: launch.pane };
   // Set while the daemon holds a record of this launch that late adoption could still use.
   let nodeLaunchRecorded = false;
@@ -10832,6 +10851,8 @@ async function openSession(body, deps = {}) {
         ...(session ? { code: 'OPEN_EXISTING_PANE' } : {}), launch: started };
       else if (error && typeof error === 'object') error.launch ||= started;
     }
+    // The requester keeps the card: the handoff is over.
+    clearHandoff();
     throw error;
   }
 
@@ -10853,6 +10874,8 @@ async function openSession(body, deps = {}) {
     }
     if (launch.linked === true) release();
   }
+  // Over, whether the requester left or kept the card, unless late adoption finishes it.
+  if (!launch.pendingRegistration) clearHandoff();
   if (session && launch.sessionId) {
     try { require('./session-retirement').clear(deps.root || keep.ROOT, session.id); } catch {}
   }
