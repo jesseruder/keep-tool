@@ -26,6 +26,7 @@ const pi = require('./pi.js');
 const codexCompact = require('./codex-compact.js');
 const transcripts = require('./transcripts.js');
 const accounts = require('./accounts.js');
+const artifactTransport = require('./artifact-transport.js');
 const openAccount = require('./open-account.js');
 const tell = require('./tell.js');
 const review = require('./review.js');
@@ -1772,8 +1773,10 @@ function isHostTarget(target) {
 // node can never sit in front of a keystroke bound for another. `transcript` goes
 // further and has a connection of its own (HOST_CHANNEL_BY_TYPE): a receipt's long
 // poll waits up to nine seconds, and a launch's prepare must not queue behind it.
-const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state']);
-const HOST_CHANNEL_BY_TYPE = new Map([['transcript', 'transcript']]);
+const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state', 'artifacts']);
+// `artifacts` carries a moving session's files in 4 MiB frames: a connection of its
+// own, so a move never sits in front of a receipt, a launch or a keystroke.
+const HOST_CHANNEL_BY_TYPE = new Map([['transcript', 'transcript'], ['artifacts', 'artifacts']]);
 
 function daemonNodeName(deps = {}) {
   return deps.daemonNode || nodes.daemonNode();
@@ -2033,7 +2036,12 @@ async function hostRequest(type, params, deps = {}) {
   // agent pane — a `process` call every 2.5s — clear the memo that outage listing is
   // built from, so a slow node holding an agent pane dropped off the list entirely
   // instead of staying on it marked stale.
-  const idempotent = ['hello', 'list', 'get', 'screen', 'meta', 'process', 'usage', 'transcript'].includes(type);
+  const idempotent = ['hello', 'list', 'get', 'screen', 'meta', 'process', 'usage', 'transcript'].includes(type)
+    // An artifacts read or list changes nothing, a stage is continuity-checked on the
+    // node (the same piece again is a no-op), and an abort only removes a stage. A
+    // publish, a release and a queue drop are asked once: their caller looks before
+    // it asks again.
+    || (type === 'artifacts' && ['list', 'read', 'stage', 'abort', 'cwd'].includes(params && params.op));
   // A spawn naming an operation id is the one non-idempotent request that may be
   // asked again: the host journals it, so a second ask returns the pane the first
   // one made rather than starting a second process. Everything else keeps the
@@ -3914,6 +3922,77 @@ async function deliveryReceiptFor(entry, deps = {}, timeoutMs = 0) {
   if (result.path !== entry.file) return false;
   if (typeof entry.generation === 'string' && result.generation !== entry.generation) return false;
   return result.matched;
+}
+
+// ---------- a moving session's files, on a node ----------
+//
+// The daemon's end of the `artifacts` verb (bin/session-artifacts.js on the node):
+// the same interface artifact-transport's localArtifacts gives for this machine, so a
+// push to a node and a pull from one are one walk with the ends swapped. The node
+// re-validates the account and builds every path itself; nothing here names a path on
+// the node beyond the relative ones its own list returned.
+const nodeArtifactsCapability = new Map();
+const NODE_ARTIFACTS_CAPABILITY_MS = 60e3;
+const ARTIFACTS_TIMEOUT_MS = { list: 120e3, read: 30e3, stage: 30e3, publish: 120e3, release: 120e3, abort: 30e3, cwd: 8e3, 'drop-session': 8e3 };
+
+async function requireNodeArtifacts(node, deps = {}) {
+  const now = Date.now();
+  const known = nodeArtifactsCapability.get(node);
+  if (known && now - known < NODE_ARTIFACTS_CAPABILITY_MS) return;
+  const hello = await (deps.hostRequest || hostRequest)('hello', {}, { ...deps, node });
+  if (!hello || !(Number(hello.artifacts) >= 1) || !(Number(hello.transcript) >= 1)) {
+    nodeArtifactsCapability.delete(node);
+    throw new InjectionError(409,
+      `the terminal host on ${node} predates the artifacts verb, so no session can be moved to or from it; update keep-tool on ${node} and reload its host`,
+      { reason: 'remote-node' });
+  }
+  nodeArtifactsCapability.set(node, now);
+}
+
+function nodeArtifacts(node, account, deps = {}) {
+  if (!node || node === daemonNodeName(deps)) throw new Error('nodeArtifacts is for another node');
+  if (!account || typeof account.id !== 'string' || typeof account.configDir !== 'string') {
+    throw new InjectionError(400, 'nodeArtifacts needs an account with an id and a config directory');
+  }
+  const request = async (params) => {
+    await requireNodeArtifacts(node, deps);
+    const scoped = params.op === 'cwd' || params.op === 'drop-session'
+      ? params : { ...params, account: { id: account.id, configDir: account.configDir } };
+    return (deps.hostRequest || hostRequest)('artifacts', scoped,
+      { ...deps, node, hostRequestTimeoutMs: ARTIFACTS_TIMEOUT_MS[params.op] || HOST_REQUEST_TIMEOUT_MS });
+  };
+  return {
+    ...artifactTransport.endpoint(request, { where: node }),
+    cwd: (cwdPath) => request({ op: 'cwd', path: cwdPath }),
+    dropSession: (sessionId) => request({ op: 'drop-session', sessionId }),
+  };
+}
+
+function localSessionArtifacts(account, deps = {}) {
+  return artifactTransport.localArtifacts(account, { env: deps.env || process.env, where: daemonNodeName(deps) });
+}
+
+// This machine's copy of a session, carried onto `toNode` under the same account (the
+// fleet shares one home, so the node's account is this one unless a caller that knows
+// otherwise names it). Resolves the transfer's manifest; throws before the publish if
+// the source changed while it was carried.
+async function pushSession(sessionId, fromLocalAccount, toNode, options = {}) {
+  const deps = options.deps || {};
+  return artifactTransport.transfer({
+    sessionId, tx: options.tx, pieceBytes: options.pieceBytes,
+    from: options.from || localSessionArtifacts(fromLocalAccount, deps),
+    to: nodeArtifacts(toNode, options.nodeAccount || fromLocalAccount, deps),
+  });
+}
+
+// A node's copy of a session, carried here under the same account.
+async function pullSession(sessionId, fromNode, toLocalAccount, options = {}) {
+  const deps = options.deps || {};
+  return artifactTransport.transfer({
+    sessionId, tx: options.tx, pieceBytes: options.pieceBytes,
+    from: nodeArtifacts(fromNode, options.nodeAccount || toLocalAccount, deps),
+    to: options.to || localSessionArtifacts(toLocalAccount, deps),
+  });
 }
 
 // The text readTranscriptTail would have returned for the same bytes: a tail that
@@ -14590,6 +14669,10 @@ module.exports = {
   nodeTranscript,
   nodeTranscriptFileForSession,
   deliveryReceiptFor,
+  nodeArtifacts,
+  localSessionArtifacts,
+  pushSession,
+  pullSession,
   remoteSessionFreshness, unansweredNodes,
   remoteSessionRead,
   loadRemoteSession,

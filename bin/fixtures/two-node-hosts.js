@@ -12,7 +12,11 @@ const { createHost } = require('../host.js');
 
 const ENV_KEYS = ['KEEP_CONFIG', 'KEEP_HOST_SOCK', 'KEEP_DAEMON_NODE', 'KEEP_NODE_NAME'];
 
-async function withTwoNodes(t, body) {
+// With `{ nodeHome: true }` the aws1 host gets a home and a keep config of its own
+// (aws1Home, aws1ConfigFile), the way a real node has its own disk: what it reads and
+// writes for its accounts is then provably not the daemon's copy. Without it, both
+// hosts share this process's environment, exactly as before.
+async function withTwoNodes(t, body, options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-two-nodes-'));
   const sock = path.join(root, 'host.sock');
   const remoteSock = path.join(root, 'aws1.sock');
@@ -22,9 +26,13 @@ async function withTwoNodes(t, body) {
   fs.chmodSync(tokenFile, 0o600);
   const configFile = path.join(root, 'config.json');
   const previous = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+  const aws1Home = options.nodeHome ? path.join(root, 'aws1-home') : null;
+  const aws1ConfigFile = options.nodeHome ? path.join(root, 'aws1-config.json') : null;
+  if (aws1Home) fs.mkdirSync(aws1Home);
   const main = createHost({ sock, log: null, node: 'main' });
   const aws1 = createHost({
     sock: remoteSock, log: null, node: 'aws1', listen: '127.0.0.1:0', tokenFile,
+    ...(aws1Home ? { env: { ...process.env, HOME: aws1Home, KEEP_CONFIG: aws1ConfigFile } } : {}),
   });
   let cleaned = false;
   const cleanup = async () => {
@@ -49,6 +57,7 @@ async function withTwoNodes(t, body) {
       nodes: { main: {}, aws1: { transport: 'tcp', address: aws1.listenAddress, tokenFile } },
     };
     fs.writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`);
+    if (aws1ConfigFile) fs.writeFileSync(aws1ConfigFile, `${JSON.stringify(config, null, 2)}\n`);
     process.env.KEEP_CONFIG = configFile;
     process.env.KEEP_HOST_SOCK = sock;
     process.env.KEEP_DAEMON_NODE = 'main';
@@ -63,6 +72,7 @@ async function withTwoNodes(t, body) {
       main,
       aws1,
       address: aws1.listenAddress,
+      ...(aws1Home ? { aws1Home, aws1ConfigFile } : {}),
     });
   } finally {
     await cleanup();
@@ -91,7 +101,7 @@ const FAKE_CLAUDE = [
 // one managed Claude account whose config directory exists, a project to run in, and
 // that agent on PATH. Enough for a card to be opened on aws1, or a pane there to be
 // restarted, without any of it being mocked.
-async function withTwoNodeFleet(t, body) {
+async function withTwoNodeFleet(t, body, options = {}) {
   return withTwoNodes(t, async (fleet) => {
     const registry = path.join(fleet.root, 'registry');
     const configDir = path.join(registry, 'claude');
@@ -106,7 +116,17 @@ async function withTwoNodeFleet(t, body) {
     // and a placement is only meaningful read alongside the node list.
     const config = { ...fleet.config, accounts: [account], defaultAccounts: { claude: account.id } };
     fs.writeFileSync(fleet.configFile, `${JSON.stringify(config, null, 2)}\n`);
+    // The node's own copy of the same account: the same id, under its own home.
+    let aws1 = {};
+    if (fleet.aws1Home) {
+      const aws1ConfigDir = path.join(fleet.aws1Home, 'claude');
+      fs.mkdirSync(aws1ConfigDir, { recursive: true });
+      const aws1Account = { ...account, configDir: aws1ConfigDir };
+      fs.writeFileSync(fleet.aws1ConfigFile, `${JSON.stringify({ ...config, accounts: [aws1Account] }, null, 2)}\n`);
+      aws1 = { aws1ConfigDir, aws1Account };
+    }
     return body({
+      ...aws1,
       ...fleet,
       config,
       registry,
@@ -118,7 +138,7 @@ async function withTwoNodeFleet(t, body) {
       env: { KEEP_DIR: registry, KEEP_CONFIG: fleet.configFile },
       agentPath: `${fakeBin}:${process.env.PATH}`,
     });
-  });
+  }, options);
 }
 
 module.exports = { withTwoNodes, withTwoNodeFleet, FAKE_CLAUDE };
