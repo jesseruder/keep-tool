@@ -530,5 +530,23 @@ test('piEventFor reads the registry on the daemon node and the node otherwise, a
     f.setEvent({ id: 'pi-remote-2', phase: 'start', at: new Date().toISOString() });
     const started = await serve.waitForPiStart('pi-remote-2', Date.now(), { ...f.deps, now: Date.now, sleep: async () => {} }, 'aws8');
     assert.equal(started.phase, 'start');
+
+    // Clock skew: a node's start stamped up to 5 s before the daemon's launch is this
+    // launch's; the daemon node's own phase keeps its 1 s.
+    let clock = 1_900_000_000_000;
+    const waitDeps = { ...f.deps, now: () => clock, sleep: async (ms) => { clock += ms; } };
+    const at = (ms) => new Date(1_900_000_000_000 - ms).toISOString();
+    f.setEvent({ id: 'pi-remote-2', phase: 'start', at: at(4000) });
+    assert.equal((await serve.waitForPiStart('pi-remote-2', clock, waitDeps, 'aws8')).phase, 'start');
+    clock = 1_900_000_000_000;
+    f.setEvent({ id: 'pi-remote-2', phase: 'start', at: at(6000) });
+    await assert.rejects(serve.waitForPiStart('pi-remote-2', clock, waitDeps, 'aws8'), (error) => error.status === 504);
+    clock = 1_900_000_000_000;
+    f.setEvent({ id: 'pi-remote-2', phase: 'start', at: at(500) });
+    fs.writeFileSync(path.join(local, 'pi-remote-2.json'), JSON.stringify({ id: 'pi-remote-2', phase: 'start', at: at(4000) }));
+    await assert.rejects(serve.waitForPiStart('pi-remote-2', clock, waitDeps, 'main'), (error) => error.status === 504);
+    // Both reads take the daemon node from the same place openSession does.
+    assert.equal((await serve.piEventFor('pi-remote-2', 'elsewhere', { ...f.deps, env: { KEEP_DAEMON_NODE: 'elsewhere' } })).phase, 'start',
+      'the launch env names the daemon node: its phase file is the registry\'s');
   } finally { f.cleanup(); }
 });

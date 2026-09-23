@@ -1823,6 +1823,14 @@ function daemonNodeName(deps = {}) {
   return deps.daemonNode || nodes.daemonNode();
 }
 
+// The daemon node as openSession names it for a launch (from the launch's env), with
+// a caller's deps.daemonNode still first. A Pi open's node checks and its phase reads
+// (piEventFor, waitForPiStart) all compare the launch node with this one, so the two
+// can never disagree about whether a phase file is local.
+function launchDaemonNode(deps = {}) {
+  return deps.daemonNode || nodes.daemonNode(deps.env || process.env);
+}
+
 // Parsing a ref has to use the same daemon node the answer is compared against, or
 // a test that names one in `deps` would read its own panes as another machine's.
 // Node identity is all the node helpers read out of an environment, so this carries
@@ -9511,7 +9519,7 @@ async function readNodePiEvent(sessionId, node, deps = {}) {
 
 async function piEventFor(sessionId, node, deps = {}) {
   if (!/^[A-Za-z0-9_-]+$/.test(String(sessionId || ''))) return null;
-  if (!node || node === daemonNodeName(deps)) {
+  if (!node || node === launchDaemonNode(deps)) {
     return (deps.piEventFor || pi.eventFor)(sessionId, path.join(deps.root || keep.ROOT, '.keep', 'pi-events'));
   }
   try { return await readNodePiEvent(sessionId, node, deps); } catch { return null; }
@@ -9546,13 +9554,22 @@ async function assertNodePiReady(node, account, project, deps = {}) {
   }
 }
 
+// A start phase stamped on another node is stamped by that node's clock, and
+// launchedAt by this one's: node clocks drift (an NTP step, a VM resumed from
+// suspend), and a start a few seconds "before" its launch is still this launch's, since
+// a fresh session id has no earlier phase file. So another node's phase gets 5 s of
+// slack; the daemon node's own keeps its 1 s.
+const PI_START_SLACK_MS = 1000;
+const PI_START_NODE_SLACK_MS = 5000;
+
 async function waitForPiStart(id, launchedAt, deps = {}, node = null) {
   const now = deps.now || Date.now;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + 12000;
+  const slack = node && node !== launchDaemonNode(deps) ? PI_START_NODE_SLACK_MS : PI_START_SLACK_MS;
   while (now() < deadline) {
     const event = await piEventFor(id, node, deps);
-    if (event && Date.parse(event.at || '') >= launchedAt - 1000 && event.phase !== 'shutdown') return event;
+    if (event && Date.parse(event.at || '') >= launchedAt - slack && event.phase !== 'shutdown') return event;
     await sleep(150);
   }
   throw new InjectionError(504, `Pi started but its Keep extension did not register session ${sessionRef(id)}; check the pane for extension errors`);
@@ -10252,7 +10269,7 @@ async function openSession(body, deps = {}) {
   // The extension writes its phase file on the machine Pi runs on, and its hooks
   // reach this daemon from there (carried by the node's CLI). On the daemon node the
   // extension is checked here; on another node that node answers for itself.
-  if (agent === 'pi' && launchNode !== nodes.daemonNode(deps.env || process.env)) {
+  if (agent === 'pi' && launchNode !== launchDaemonNode(deps)) {
     await (deps.assertNodePiReady || assertNodePiReady)(launchNode, account, project, deps);
   } else if (agent === 'pi' && deps.piExtensionReady !== true
       && !fs.existsSync(path.join(os.homedir(), '.pi', 'agent', 'extensions', 'keep.ts'))) {
