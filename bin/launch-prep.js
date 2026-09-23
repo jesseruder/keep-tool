@@ -119,6 +119,16 @@ function assertAccountInstalled(account, deps = {}) {
   }
 }
 
+// Whether the Keep Pi extension is installed on this machine, where the Pi it
+// launches will look for it: ~/.pi/agent/extensions/keep.ts, followed through its
+// link. Without it a Pi session never registers, so the daemon asks before it starts
+// one on another node.
+function piExtensionInstalled(deps = {}) {
+  const io = deps.fs || fs;
+  try { return io.statSync(path.join(deps.homedir || os.homedir(), '.pi', 'agent', 'extensions', 'keep.ts')).isFile(); }
+  catch { return false; }
+}
+
 // Returns what the launch needs and what it changed:
 //   mcpConfig      the --mcp-config path a shared Claude setup wrote, or ''
 //   trusted        true when this call accepted the trust dialog, false when it was
@@ -129,6 +139,7 @@ function assertAccountInstalled(account, deps = {}) {
 //   argv           the argument vector with those paths spliced in
 //   command        the shell word the pane execs, carrying this machine's execPath
 //                  and launcher path
+//   piExtension    for a Pi launch only: whether the Keep Pi extension is installed here
 function prepare(options = {}, deps = {}) {
   const agent = String(options.agent || '');
   if (!['claude', 'codex', 'pi'].includes(agent)) {
@@ -171,7 +182,8 @@ function prepare(options = {}, deps = {}) {
         throw Object.assign(new Error(`account shared setup is unavailable: ${error.message}`), { code: 'shared-setup' });
       }
     }
-    return { checked: true, account: account.id, sharedSetup };
+    return { checked: true, account: account.id, sharedSetup,
+      ...(agent === 'pi' ? { piExtension: piExtensionInstalled(deps) } : {}) };
   }
 
   // A Claude account carrying a shared-setup manifest has its project memory and
@@ -225,7 +237,8 @@ function prepare(options = {}, deps = {}) {
     piOpeningFile,
     argv,
     command: agentLauncher.profileCommand(argv, account),
+    ...(agent === 'pi' ? { piExtension: piExtensionInstalled(deps) } : {}),
   };
 }
 
-module.exports = { prepare, expandArgv, assertSharedHome };
+module.exports = { prepare, expandArgv, assertSharedHome, piExtensionInstalled };

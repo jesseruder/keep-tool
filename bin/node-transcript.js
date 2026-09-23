@@ -24,6 +24,12 @@
 //            `cwd` when one is given. How the daemon finds a fresh Codex
 //            launch's session, which names itself nowhere else until its first turn.
 //            Every file is opened as `open` opens one, and only its first 256 KiB read.
+//   pi-event -> { event }: Pi only, naming a session and no account: the phase file the
+//            Keep Pi extension (integrations/pi/keep.ts) writes on this node,
+//            <KEEP_DIR || ~/keep>/.keep/pi-events/<id>.json, parsed, or null when there
+//            is none. The path is this node's own, built here from the id; a file that
+//            is there and cannot be read or parsed is an error, not "none". How the
+//            daemon follows a Pi session's turn state on a node.
 //
 // Every refusal carries a code, so the daemon can tell "this node will not read
 // that" (transcript-refused), "there is nothing to read yet" (transcript-missing)
@@ -33,7 +39,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const KINDS = new Set(['claude', 'codex', 'pi']);
-const OPS = new Set(['stat', 'tail', 'match', 'find']);
+const OPS = new Set(['stat', 'tail', 'match', 'find', 'pi-event']);
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const ACCOUNT_ID_RE = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex|pi)\/default)$/;
 const HASH_RE = /^[a-f0-9]{64}$/;
@@ -45,6 +51,10 @@ const FIND_MAX = 20;
 const FIND_SCAN_MAX = 2000;
 const META_MAX_BYTES = 256 * 1024;
 const ROLLOUT_NAME_RE = /^rollout-[^/]*\.jsonl$/;
+// The id shape the Pi extension names its phase file by.
+const PI_EVENT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const PI_EVENT_MAX_BYTES = 64 * 1024;
+const PI_PHASES = new Set(['start', 'running', 'settled', 'shutdown', 'prompt']);
 
 function coded(message, code) {
   const error = new Error(message);
@@ -64,8 +74,13 @@ function generationOf(stat) {
 
 function validate(params) {
   if (!params || typeof params !== 'object') throw invalid('a transcript request must be an object');
-  if (!OPS.has(params.op)) throw invalid('transcript op must be stat, tail, match or find');
+  if (!OPS.has(params.op)) throw invalid('transcript op must be stat, tail, match, find or pi-event');
   if (!KINDS.has(params.kind)) throw invalid('transcript kind must be claude, codex or pi');
+  if (params.op === 'pi-event') {
+    if (params.kind !== 'pi') throw invalid('transcript pi-event is for pi sessions');
+    if (typeof params.sessionId !== 'string' || !PI_EVENT_ID_RE.test(params.sessionId)) throw invalid('transcript session id is not a session id');
+    return;
+  }
   if (params.op === 'find') {
     if (params.kind !== 'codex') throw invalid('transcript find is for codex rollouts');
     if (params.sessionId !== undefined) throw invalid('transcript find names no session');
@@ -226,8 +241,53 @@ function find(params, options = {}) {
   return { rollouts };
 }
 
+// The Pi extension's phase file for one session on this node: parsed and checked as
+// the daemon's own pi.eventFor checks one (its id, a known phase), or null when there
+// is none, or none that is this session's. Read O_NOFOLLOW and bounded; a file that
+// exists and cannot be read is an error, so the daemon can tell it from "no signal yet".
+function piEvent(params, options = {}) {
+  validate(params);
+  const env = options.env || process.env;
+  const root = env.KEEP_DIR || path.join(env.HOME || require('node:os').homedir(), 'keep');
+  const file = path.join(root, '.keep', 'pi-events', `${params.sessionId}.json`);
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return { event: null };
+    if (error && error.code === 'ELOOP') throw refused('the Pi phase file is a symbolic link');
+    throw coded(`the Pi phase file could not be read: ${error.message}`, 'transcript-unreadable');
+  }
+  let text;
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw refused('the Pi phase file is not a file');
+    if (stat.size > PI_EVENT_MAX_BYTES) throw coded('the Pi phase file is too large', 'transcript-unreadable');
+    const buffer = Buffer.alloc(stat.size);
+    let got = 0;
+    while (got < buffer.length) {
+      const n = fs.readSync(fd, buffer, got, buffer.length - got, got);
+      if (!n) break;
+      got += n;
+    }
+    text = buffer.subarray(0, got).toString('utf8');
+  } finally { fs.closeSync(fd); }
+  let value;
+  try { value = JSON.parse(text); } catch (error) {
+    throw coded(`the Pi phase file is not JSON: ${error.message}`, 'transcript-unreadable');
+  }
+  if (!value || typeof value !== 'object' || value.id !== params.sessionId || !PI_PHASES.has(value.phase)) return { event: null };
+  const short = (entry, max = 256) => (typeof entry === 'string' && entry.length <= max ? entry : null);
+  return { event: {
+    id: value.id, phase: value.phase, at: short(value.at, 64),
+    ...(Number.isSafeInteger(value.pid) ? { pid: value.pid } : {}),
+    instance: short(value.instance, 64), sessionFile: short(value.sessionFile, 4096), leafId: short(value.leafId, 128),
+  } };
+}
+
 async function handle(params, options = {}) {
   if (params && params.op === 'find') return find(params, options);
+  if (params && params.op === 'pi-event') return piEvent(params, options);
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const now = options.now || Date.now;
   const closed = options.closed || (() => false);
@@ -278,6 +338,6 @@ async function handle(params, options = {}) {
 }
 
 module.exports = {
-  handle, open, find, validate, generationOf, nodeAccount, FIND_MAX,
+  handle, open, find, piEvent, validate, generationOf, nodeAccount, FIND_MAX,
   TAIL_MAX_BYTES, MATCH_MAX_WAIT_MS, MATCH_POLL_MS, REQUEST_MAX_READ_BYTES,
 };

@@ -284,6 +284,32 @@ test('a Pi opening is written on the machine Pi runs on, once', (t) => {
   }, { randomUUID: () => path.basename(prepared.piOpeningFile).replace(/^pi-session-1-|\.txt$/g, '') }), /EEXIST/);
 });
 
+test('a Pi launch, and a check for one, say whether the Keep Pi extension is installed on this machine', (t) => {
+  const f = fixture(t);
+  const pi = { id: 'pi/default', agent: 'pi', configDir: path.join(f.home, '.pi'), builtIn: true, managed: false };
+  fs.mkdirSync(pi.configDir, { recursive: true });
+  const ask = (check) => launchPrep.prepare({
+    agent: 'pi', account: pi, cwd: f.project, bypass: false, argv: ['pi', '--session-id', 'pi-ext-1'], pi: null,
+    ...(check ? { check: true, remote: true, daemonHome: f.home } : {}),
+  }, { homedir: f.home });
+  assert.equal(ask(true).piExtension, false, 'nothing linked yet');
+  assert.equal(ask(false).piExtension, false);
+  const extensions = path.join(pi.configDir, 'agent', 'extensions');
+  fs.mkdirSync(extensions, { recursive: true });
+  // A link to a checkout's copy, as docs/pi.md installs it, is followed.
+  fs.writeFileSync(path.join(f.root, 'keep.ts'), '// extension\n');
+  fs.symlinkSync(path.join(f.root, 'keep.ts'), path.join(extensions, 'keep.ts'));
+  assert.equal(ask(true).piExtension, true);
+  assert.equal(ask(false).piExtension, true);
+  // A dangling link is no extension.
+  fs.rmSync(path.join(f.root, 'keep.ts'));
+  assert.equal(ask(true).piExtension, false);
+  // Only Pi reports it.
+  const codex = { id: 'codex/default', agent: 'codex', configDir: path.join(f.home, '.codex'), builtIn: true, managed: false };
+  fs.mkdirSync(codex.configDir, { recursive: true });
+  assert.equal('piExtension' in launchPrep.prepare({ agent: 'codex', account: codex, cwd: f.project, check: true, argv: ['codex'] }), false);
+});
+
 test('a codex launch takes neither path and still gets this machine command', (t) => {
   const f = fixture(t);
   const account = { id: 'codex/default', agent: 'codex', configDir: path.join(f.home, '.codex'), builtIn: true, managed: false };
