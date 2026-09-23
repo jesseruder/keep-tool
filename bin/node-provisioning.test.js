@@ -268,3 +268,38 @@ test('doctor on a node checks every Codex profile\'s hooks against this checkout
   assert.deepEqual(report({ hasLsof: () => true }).at(-1), { status: 'ok', text: 'lsof present: Codex sessions\' open rollouts are read with it' });
   assert.deepEqual(report({ platform: 'darwin' }).at(-1).status, 'optional');
 });
+
+test('doctor on a node says whether the Keep Pi extension is where Pi looks for it', (t) => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-doctor-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { HOME: home, KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main', KEEP_DAEMON_URL: 'http://100.64.0.1:7781' };
+  const source = path.join(home, 'keep-tool', 'integrations', 'pi', 'keep.ts');
+  fs.mkdirSync(path.dirname(source), { recursive: true });
+  fs.writeFileSync(source, '// extension\n');
+  const report = (extra = {}) => setup.piExtensionReport({ env, piExtensionSource: source, ...extra });
+
+  assert.deepEqual(setup.piExtensionReport({ env: { HOME: home, KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' }, piExtensionSource: source }), [],
+    'the daemon node checks its own at open');
+  const missing = report();
+  assert.equal(missing.length, 1);
+  assert.equal(missing[0].status, 'optional');
+  assert.equal(missing[0].text, 'Pi Keep extension not installed at ~/.pi/agent/extensions/keep.ts: Pi sessions cannot be opened on aws1');
+  assert.equal(missing[0].fix, `mkdir -p ~/.pi/agent/extensions && ln -s ${source} ~/.pi/agent/extensions/keep.ts`);
+
+  const link = path.join(home, '.pi', 'agent', 'extensions', 'keep.ts');
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  fs.symlinkSync(source, link);
+  assert.deepEqual(report(), [{ status: 'ok', text: `Pi Keep extension linked to ${source}` }]);
+
+  // A copy of its own, or a link somewhere else, is still an extension Pi loads.
+  fs.rmSync(link);
+  fs.writeFileSync(link, '// a copy\n');
+  assert.deepEqual(report(), [{ status: 'ok', text: `Pi Keep extension installed at ~/.pi/agent/extensions/keep.ts (${link})` }]);
+
+  // A link whose target is gone is none.
+  fs.rmSync(link);
+  fs.symlinkSync(path.join(home, 'gone.ts'), link);
+  const dangling = report();
+  assert.equal(dangling[0].status, 'optional');
+  assert.match(dangling[0].text, /a link to nothing/);
+});

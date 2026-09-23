@@ -95,10 +95,24 @@ or deploy outcomes, relay a message into Pi (including mobile replies), or suppo
 Keep-managed compaction, or Review Queue automatic launches. Those actions stay
 unavailable instead of being emulated.
 
+### On another node
+
+`keep open <card> --agent pi --fresh --node <node>` runs Pi in a pane on that node. The
+node must have Pi and the extension installed at `~/.pi/agent/extensions/keep.ts` (`keep
+doctor` on the node reports it), and a terminal host new enough to read Pi phase files;
+otherwise the open is refused before a pane is started. The extension's hooks reach the
+daemon from there (see [agent integration](agent-hooks.md), "Pi sessions on another
+node"), and the daemon reads the phase file through the node, so the console shows the
+session's turn state and a Pi question as it does for a local one. The console has no
+transcript preview for a Pi session on a node yet: its row comes from the pane and the
+phase. `keep tell`, `keep move`, Pi background jobs and Review Queue launches stay
+unavailable for Pi on a node, as they are on the daemon node (moves: Claude only).
+
 Keep also refuses `keep open <Pi session>` while any interactive Pi process outside a
 Keep Pi host pane is running. Pi sets its process title to `pi` and hides the session
 arguments, so Keep cannot safely prove which external session it would resume. Exit the
-external Pi process, then retry the open.
+external Pi process, then retry the open. For a session on another node, that node's
+processes and panes are the ones checked.
 
 ## Verify
 

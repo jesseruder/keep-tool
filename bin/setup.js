@@ -990,6 +990,36 @@ function codexHooksReport(deps = {}) {
   return rows;
 }
 
+// Pi on a node: whether the Keep Pi extension is where Pi on this machine looks for it.
+// Without it a Pi session opened here never registers, and the daemon refuses to open
+// one (keep open --agent pi --node <this node>). Optional: a node need not run Pi.
+// Only on a pane-only node; the daemon node's open checks its own.
+function piExtensionReport(deps = {}) {
+  const env = deps.env || process.env;
+  const where = require('./nodes.js').paneOnlyNode(env);
+  if (!where) return [];
+  const home = env.HOME || os.homedir();
+  const link = path.join(home, '.pi', 'agent', 'extensions', 'keep.ts');
+  const source = deps.piExtensionSource || path.join(path.resolve(__dirname, '..'), 'integrations', 'pi', 'keep.ts');
+  const fix = `mkdir -p ~/.pi/agent/extensions && ln -s ${source} ~/.pi/agent/extensions/keep.ts`;
+  let linked = false;
+  try { fs.lstatSync(link); linked = true; } catch {}
+  let file = false;
+  try { file = fs.statSync(link).isFile(); } catch {}
+  if (!linked) {
+    return [{ status: 'optional', text: `Pi Keep extension not installed at ~/.pi/agent/extensions/keep.ts: Pi sessions cannot be opened on ${where.local}`, fix }];
+  }
+  if (!file) {
+    return [{ status: 'optional', text: 'Pi Keep extension at ~/.pi/agent/extensions/keep.ts is a link to nothing', fix: `rm ~/.pi/agent/extensions/keep.ts && ${fix}` }];
+  }
+  let real = link;
+  try { real = fs.realpathSync(link); } catch {}
+  let expected = source;
+  try { expected = fs.realpathSync(source); } catch {}
+  return [{ status: 'ok', text: real === expected ? `Pi Keep extension linked to ${source}`
+    : `Pi Keep extension installed at ~/.pi/agent/extensions/keep.ts (${real})` }];
+}
+
 async function doctor(root) {
   let failed = false;
   const check = (name, fn, required = true) => {
@@ -1038,7 +1068,7 @@ async function doctor(root) {
     if (entry.fix) console.log(`  fix: ${entry.fix}`);
     if (entry.status === 'FAIL') failed = true;
   }
-  for (const entry of [...await nodeHomeReport(), ...await nodeApiReport({ root }), ...hookDeliveryReport({ root }), ...codexHooksReport()]) {
+  for (const entry of [...await nodeHomeReport(), ...await nodeApiReport({ root }), ...hookDeliveryReport({ root }), ...codexHooksReport(), ...piExtensionReport()]) {
     console.log(`${entry.status}: ${entry.text}`);
     if (entry.fix) console.log(`  fix: ${entry.fix}`);
     if (entry.status === 'FAIL') failed = true;
@@ -1051,7 +1081,7 @@ async function doctor(root) {
 }
 
 module.exports = {
-  init, installHooks, installSkills, service, node, doctor, nodeHomeReport, nodeApiReport, hookDeliveryReport, codexHooksReport, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
+  init, installHooks, installSkills, service, node, doctor, nodeHomeReport, nodeApiReport, hookDeliveryReport, codexHooksReport, piExtensionReport, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
   HOOK_ACTIONS, missingHooks, hookTargets, hookTarget,
   loadPacks, configuredPacks, installPackNames, skillPlans, applySkillPlans, reportSkillPlans, listPacks,
   recordPacks, recordPreflight,

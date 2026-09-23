@@ -31,6 +31,10 @@ card link. All of this needs `keep serve` running.
   saved verbatim in committed `.keep/handoffs/` files; the session gets a one-line pointer.
 - Say who verifies and who lands. A handed-off session owns its own tests and its own
   independent review unless you state that you are staying around to do them.
+- `--node <name>` launches a fresh session on another configured node, for Claude, Codex
+  and Pi alike. A Pi open there is refused unless that node has the Pi Keep extension
+  installed (`keep doctor` on the node says). A Pi session on a node still takes no
+  `keep tell` and cannot be moved.
 
 ### Which account it runs on
 

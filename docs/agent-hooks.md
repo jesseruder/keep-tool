@@ -29,12 +29,13 @@ Use the same checkout path and `KEEP_CONFIG` prefix as the installed commands.
 
 ### Sessions on another node
 
-A Claude or Codex session on a pane-only node whose daemon is known (`KEEP_DAEMON_URL`,
+A Claude, Codex or Pi session on a pane-only node whose daemon is known (`KEEP_DAEMON_URL`,
 set by `keep node init --daemon-url`) runs the same hook commands; they post to the
 daemon's node API (`POST /api/hook`) and print what the daemon's own `keep hook <event>`
 printed. Every Claude event in the table is carried: session-start, session-end, stop,
 notification, pre-question, lifecycle, and the Bash pair. So is every Codex adapter
-below (see "Codex sessions on another node").
+below (see "Codex sessions on another node"), and the three Pi hooks (see "Pi sessions
+on another node").
 
 - **pre-bash.** The raw `claude --resume` guard runs on the node first, as everywhere.
   The node then reads the daemon's step fingerprints (`GET /api/hook/context`, kept in
@@ -57,9 +58,38 @@ below (see "Codex sessions on another node").
   A daemon that does not answer within 3 s has the record queued and resent with the next
   hook.
 
-Not carried yet: Pi hooks on a node. They bind and release the node's pane, refuse
-deploy commands by name, and record nothing. Without `KEEP_DAEMON_URL` every hook on a
-node, Claude's and Codex's included, is pane-only in that way.
+Without `KEEP_DAEMON_URL` every hook on a node, Claude's, Codex's and Pi's, is
+pane-only: it binds (and for Claude and Codex releases) the node's pane, refuses deploy
+commands by name, and records nothing.
+
+### Pi sessions on another node
+
+The Keep Pi extension (`integrations/pi/keep.ts`) calls `keep hook pi start|end|pre-tool`.
+On a node with `KEEP_DAEMON_URL` each is posted as `pi-<action>` and the daemon runs its
+own `keep hook pi <action>` with `KEEP_HOOK_NODE` set, for a session its account record
+places on that node as a Pi session. None carries a transcript. The extension kills a
+hook at 5 s and treats a failure as one (a failed pre-tool blocks the Bash call, its
+stderr the reason), so each post has a budget inside that: start 3 s, pre-tool 3 s,
+end 2 s.
+
+- **start.** The daemon writes the pane record (naming the node and the extension
+  instance) and binds the pane through the node's host; the node then binds it too, or
+  finds it bound. The start fails only when neither bound it. A start the daemon did not
+  take is queued, resent with the next hook and noted in `~/.keep-node/hook.log`.
+- **pre-tool.** The raw-resume guard runs on the node first. The command then goes with
+  the node's repository facts (computed by the fingerprints from `GET /api/hook/context`,
+  which answers Pi sessions too) to the daemon's step and self-repair guards. A daemon that
+  does not answer is treated as for a Claude pre-bash: deploys, the last published step
+  fingerprints and, for a repair session, its restarts are refused; anything else runs.
+  Never queued.
+- **end.** The daemon stamps its pane record released for that instance (queued when it
+  does not answer). The pane's meta is left as it is: an exited Pi pane keeps its session
+  for Watch and Reopen, as on the daemon node.
+
+The extension's phase file stays on the node, under the node's `~/keep/.keep/pi-events`.
+The daemon reads it through the node host's `transcript` verb (`pi-event`, host capability
+`transcript: 3`), at most once per 2.5 s per session, for the console's turn state.
+`keep doctor` on a node says whether `~/.pi/agent/extensions/keep.ts` is installed there.
 
 ### Codex sessions on another node
 
