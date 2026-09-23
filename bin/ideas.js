@@ -543,8 +543,10 @@ function captureModelOutput(child, timeoutMs = MODEL_TIMEOUT_MS, deps = {}) {
       clearTimeout(killTimer);
       if (terminationError) finish(code, terminationError);
       else if (code !== 0) {
-        // claude prints a refusal (no credits, no such model) on stdout, not stderr.
-        const said = stderr.trim() ? stderr : Buffer.concat(stdout, stdoutBytes).toString('utf8').slice(-2000);
+        // claude prints a refusal (no credits, no such model) on stdout, not stderr, and
+        // may print a config warning on stderr at the same time: name both.
+        const said = [stderr.trim().slice(0, 240), Buffer.concat(stdout, stdoutBytes).toString('utf8').trim().slice(-240)]
+          .filter(Boolean).join(' · ');
         finish(code, new Error(`ideas generator exited ${code}${said.trim() ? `: ${clip(said, 500)}` : ''}`));
       }
       else finish(code);

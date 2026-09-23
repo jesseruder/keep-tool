@@ -129,16 +129,17 @@ test('captureModelOutput terminates oversized output and rejects only on close',
   await rejection;
 });
 
-test('captureModelOutput names what claude printed on stdout when it exits non-zero with no stderr', async () => {
+test('captureModelOutput names what claude printed on stdout as well as stderr when it exits non-zero', async () => {
   const child = new EventEmitter();
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
   child.kill = () => {};
   const result = ideas.captureModelOutput(child);
   child.stdout.write('Fable 5.1 requires usage credits. Switch to another model.\n');
+  child.stderr.write('Claude configuration file not found\n');
   await new Promise((resolve) => setImmediate(resolve));
   child.emit('close', 1);
-  await assert.rejects(result, /^Error: ideas generator exited 1: Fable 5\.1 requires usage credits/);
+  await assert.rejects(result, /^Error: ideas generator exited 1: Claude configuration file not found · Fable 5\.1 requires usage credits/);
 });
 
 test('captureModelOutput charges the deadline only for time it watched', async () => {
