@@ -457,6 +457,64 @@ test('serve launcher suppresses card linking for Discuss and preserves it for St
   assert.equal(captures[1].deps.linkLaunchedSession, link);
 });
 
+test('a review launch carries the machine picked to the launch, records it, and a retry cannot change it', async () => {
+  const f = fixture();
+  try {
+    const resolveLaunchSelection = async (body) => ({ agent: body.agent || 'claude', accountId: body.accountId || 'claude/default',
+      model: body.model || '', ...(body.node ? { node: body.node } : {}) });
+    const launches = [];
+    await queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'on-aws1', agent: 'claude', accountId: 'claude/default', node: 'aws1' }, {
+      ...f.deps, resolveLaunchSelection, launch: async (request) => {
+        launches.push(request);
+        await request.onLaunched({ pane: 'p1@aws1', sessionId: request.sessionId });
+        return { sessionId: request.sessionId };
+      },
+    });
+    assert.equal(launches.length, 1);
+    assert.equal(launches[0].node, 'aws1');
+    assert.equal(queue.loadStore(f.root).items['idea:idea-one'].requests['on-aws1'].node, 'aws1');
+    await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'on-aws1', agent: 'claude', accountId: 'claude/default', node: 'mini' },
+      { ...f.deps, resolveLaunchSelection, launch: async () => assert.fail('a different machine must not launch') }),
+    (error) => error.status === 409);
+    await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'defer', until: new Date(Date.now() + 60e3).toISOString(), node: 'aws1' }, f.deps),
+      (error) => error.status === 400 && /node are only valid for launch actions/.test(error.message));
+    await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'discuss', node: 'AWS 1' }, f.deps),
+      (error) => error.status === 400 && /bad review queue node/.test(error.message));
+  } finally { f.cleanup(); }
+});
+
+test('a review launch whose response was lost recovers under the machine it was reserved for', async () => {
+  const f = fixture();
+  try {
+    const resolveLaunchSelection = async (body) => ({ agent: body.agent || 'claude', accountId: body.accountId || 'claude/default',
+      model: body.model || '', ...(body.node ? { node: body.node } : {}) });
+    await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'lost-aws1', agent: 'claude', accountId: 'claude/default', node: 'aws1' },
+      { ...f.deps, resolveLaunchSelection, randomUUID: () => 'lost-session', launch: async () => { throw new Error('spawn response lost'); } }),
+    /spawn response lost/);
+    const item = queue.snapshot({ ...f.deps }).items.find((entry) => entry.id === 'idea:idea-one');
+    assert.equal(item.launchState.node, 'aws1', 'the console resubmits what launchState says');
+    let recovered = 0;
+    const recoveryDeps = { ...f.deps, resolveLaunchSelection,
+      inspectLaunch: async () => ({ state: 'present', pane: 'p2@aws1' }),
+      recoverLaunch: async (active, hooks) => { recovered += 1; assert.equal(active.node, 'aws1'); await hooks.onReady(); await hooks.onDelivered(); } };
+    // The daemon's own reconcile resubmits the reservation's selection, machine included.
+    const results = await queue.reconcile(recoveryDeps);
+    assert.equal(results[0].ok, true, String(results[0].error && results[0].error.message));
+    assert.equal(results[0].sessionId, 'lost-session');
+    assert.equal(recovered, 1);
+  } finally { f.cleanup(); }
+});
+
+test('the serve launcher opens a review conversation on the machine picked, else on the daemon node', async () => {
+  const captures = [];
+  const openSession = async (body) => { captures.push(body); return { sessionId: 's' }; };
+  const base = { taskId: 'card-one', message: 'pointer', sessionId: 'reserved', launchId: 'launch-one',
+    agent: 'claude', accountId: 'claude/default', model: '', action: 'discuss', onLaunched: () => {} };
+  await launchReviewQueueSession({ ...base, node: 'aws1' }, { openSession, loadTask: () => ({}) });
+  await launchReviewQueueSession(base, { openSession, loadTask: () => ({}) });
+  assert.deepEqual(captures.map((body) => body.node), ['aws1', 'main']);
+});
+
 test('server recovery distinguishes unavailable, absent, exited, and live host panes and types once', async () => {
   const active = { sessionId: 'reserved', launchId: 'launch-one', agent: 'claude', accountId: 'claude/default',
     pane: 'pane-live', pointer: 'read pointer', action: 'discuss' };

@@ -210,6 +210,7 @@ function launchFields(launch) {
     agent: selection.agent,
     accountId: selection.accountId,
     ...(selection.model ? { model: selection.model } : {}),
+    ...(selection.node ? { node: selection.node } : {}),
   } : {};
 }
 
@@ -221,9 +222,12 @@ async function chooseLaunch(ctx, item, action) {
     description: 'Choose the account for this new conversation.', project: item.project || item.card || '',
     kinds: ['claude', 'codex'], initialKind: 'claude', confirmLabel: label,
     models: { claude: 'claude-fable-5-1', codex: '' },
+    // The Machine select, as a new session from the rail has it; Automatic sends none.
+    chooseNode: true,
     async onSubmit(selection) {
       opened = await submit(ctx, item, action, { agent: selection.agent, accountId: selection.accountId,
-        ...(selection.model ? { model: selection.model } : {}) }, false, null, false, true);
+        ...(selection.model ? { model: selection.model } : {}),
+        ...(selection.node ? { node: selection.node } : {}) }, false, null, false, true);
     },
   });
   if (opened?.sessionId) {

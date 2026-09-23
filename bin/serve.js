@@ -10814,7 +10814,15 @@ function resolveReviewLaunchSelection(body, deps = {}) {
   }
   const model = body.model || '';
   if (model && !keep.LAUNCH_MODEL_RE.test(model)) throw new reviewQueue.QueueError(400, 'review queue model is invalid');
-  return { agent, accountId: account.id, model };
+  // The machine picked in the chooser, checked as /api/open checks it. None named is
+  // the daemon node, where the review queue has always opened its conversations.
+  if (body.node != null && (typeof body.node !== 'string' || !nodes.NODE_NAME_RE.test(body.node))) {
+    throw new reviewQueue.QueueError(400, 'node must be a node name');
+  }
+  if (body.node != null && !placementNodes(deps).some((node) => node.name === body.node)) {
+    throw new reviewQueue.QueueError(400, `node ${body.node} is not configured`);
+  }
+  return { agent, accountId: account.id, model, ...(body.node ? { node: body.node } : {}) };
 }
 
 async function launchReviewQueueSession(request, deps = {}) {
@@ -10827,9 +10835,10 @@ async function launchReviewQueueSession(request, deps = {}) {
     ...(request.model ? { model: request.model } : {}),
     message: request.message,
     reviewQueueLaunchId: request.launchId,
-    // The review queue's own session, reserved and driven from here: pinned to this
-    // node like every other session Keep opens for itself.
-    node: nodes.daemonNode(deps.env || process.env),
+    // The review queue's own session, reserved and driven from here: on the machine
+    // Owner picked in the chooser, else pinned to this node like every other session
+    // Keep opens for itself.
+    node: request.node || nodes.daemonNode(deps.env || process.env),
   }, {
     ...deps,
     loadTask: deps.loadTask || keep.loadTaskAnywhere,

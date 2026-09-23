@@ -9717,6 +9717,16 @@ test('review launch rejects unknown explicit accounts and replaced panes before 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('review launch takes a configured node as /api/open does, and refuses one this install does not have', () => {
+  const deps = { placementNodes: ['main', 'aws1'] };
+  assert.equal(resolveReviewLaunchSelection({ agent: 'claude', node: 'aws1' }, deps).node, 'aws1');
+  assert.equal(Object.prototype.hasOwnProperty.call(resolveReviewLaunchSelection({ agent: 'claude' }, deps), 'node'), false);
+  assert.throws(() => resolveReviewLaunchSelection({ agent: 'claude', node: 'mini' }, deps),
+    (error) => error.status === 400 && /node mini is not configured/.test(error.message));
+  assert.throws(() => resolveReviewLaunchSelection({ agent: 'claude', node: 'Not A Node' }, deps),
+    (error) => error.status === 400 && /node must be a node name/.test(error.message));
+});
+
 test('portable transfer API lists safe records and launches only an existing transfer id', async () => {
   const id = 'a'.repeat(64);
   const safe = { id, status: 'prepared', sourceSessionId: 'source-session-1234', sourceAgent: 'codex',

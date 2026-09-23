@@ -176,6 +176,7 @@ function publicItem(source, meta = {}, now = Date.now()) {
       ...(active.agent ? { agent: active.agent } : {}),
       ...(active.accountId ? { accountId: active.accountId } : {}),
       ...(active.model ? { model: active.model } : {}),
+      ...(active.node ? { node: active.node } : {}),
       recoverable: Boolean(active.error && (!active.phase || ['reserved', 'spawned'].includes(active.phase))),
       at: active.at,
       ...(active.error ? { message: active.error } : {}),
@@ -201,7 +202,7 @@ function snapshot(options = {}) {
 
 function validateRequest(body, now) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new QueueError(400, 'bad review queue request');
-  const allowed = new Set(['id', 'action', 'requestId', 'until', 'reason', 'agent', 'accountId', 'model']);
+  const allowed = new Set(['id', 'action', 'requestId', 'until', 'reason', 'agent', 'accountId', 'model', 'node']);
   if (Object.keys(body).some((key) => !allowed.has(key))) throw new QueueError(400, 'bad review queue request');
   if (typeof body.id !== 'string' || !/^(?:idea:[a-z0-9][a-z0-9-]*|finding:[a-z0-9][a-z0-9-]*:[A-Za-z0-9_-]+)$/.test(body.id)) {
     throw new QueueError(400, 'bad review queue item id');
@@ -219,8 +220,8 @@ function validateRequest(body, now) {
     if (body.reason.length > 2000) throw new QueueError(400, 'dismiss reason is limited to 2000 characters');
   } else if (body.reason != null) throw new QueueError(400, 'reason is only valid for dismiss');
   const launch = ['discuss', 'start'].includes(body.action);
-  if (!launch && (body.agent != null || body.accountId != null || body.model != null)) {
-    throw new QueueError(400, 'agent, account and model are only valid for launch actions');
+  if (!launch && (body.agent != null || body.accountId != null || body.model != null || body.node != null)) {
+    throw new QueueError(400, 'agent, account, model and node are only valid for launch actions');
   }
   if (body.agent != null && !['claude', 'codex'].includes(body.agent)) throw new QueueError(400, 'bad review queue agent');
   if (body.accountId != null && (typeof body.accountId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(body.accountId))) {
@@ -228,6 +229,11 @@ function validateRequest(body, now) {
   }
   if (body.model != null && (typeof body.model !== 'string' || !keep.LAUNCH_MODEL_RE.test(body.model))) {
     throw new QueueError(400, 'bad review queue model');
+  }
+  // The machine the conversation runs on, as /api/open takes it; whether this install
+  // has that node is resolveLaunchSelection's to say.
+  if (body.node != null && (typeof body.node !== 'string' || !/^[a-z0-9]+$/.test(body.node))) {
+    throw new QueueError(400, 'bad review queue node');
   }
 }
 
@@ -237,7 +243,8 @@ function sameLaunchSelection(record, selection) {
     && typeof record.model === 'string' && ['claude', 'codex'].includes(selection.agent)
     && typeof selection.accountId === 'string' && selection.accountId
     && typeof selection.model === 'string' && record.agent === selection.agent
-    && record.accountId === selection.accountId && (record.model || '') === (selection.model || ''));
+    && record.accountId === selection.accountId && (record.model || '') === (selection.model || '')
+    && (record.node || '') === (selection.node || ''));
 }
 
 function relatedContext(source, sources) {
@@ -346,14 +353,16 @@ async function act(body, deps = {}) {
   const launchActions = ['discuss', 'start'].includes(body.action);
   const savedSelection = initialRequest && initialRequest.action === body.action ? initialRequest
     : initialMeta.activeLaunch?.requestId === requestId ? initialMeta.activeLaunch : null;
-  const omittedSelection = body.agent == null && body.accountId == null && body.model == null;
+  const omittedSelection = body.agent == null && body.accountId == null && body.model == null && body.node == null;
   if (launchActions && omittedSelection && initialMeta.activeLaunch?.requestId === requestId && !sameLaunchSelection(savedSelection, savedSelection)) {
     throw new QueueError(409, 'saved review queue launch has no verified account selection; open the existing pane to inspect it');
   }
   const selection = launchActions ? omittedSelection && sameLaunchSelection(savedSelection, savedSelection)
-    ? { agent: savedSelection.agent, accountId: savedSelection.accountId, model: savedSelection.model || '' }
+    ? { agent: savedSelection.agent, accountId: savedSelection.accountId, model: savedSelection.model || '',
+      ...(savedSelection.node ? { node: savedSelection.node } : {}) }
     : await (deps.resolveLaunchSelection || (async (value) => ({
       agent: value.agent || 'claude', accountId: value.accountId || null, model: value.model || '',
+      ...(value.node ? { node: value.node } : {}),
     })))(body)
     : null;
   if (launchActions && (!selection || !['claude', 'codex'].includes(selection.agent)
@@ -763,7 +772,8 @@ async function reconcile(deps = {}) {
   for (const active of pending) {
     try {
       results.push(await act({ id: active.id, action: active.action, requestId: active.requestId,
-        agent: active.agent, accountId: active.accountId, ...(active.model ? { model: active.model } : {}) }, deps));
+        agent: active.agent, accountId: active.accountId, ...(active.model ? { model: active.model } : {}),
+        ...(active.node ? { node: active.node } : {}) }, deps));
     } catch (error) {
       results.push({ ok: false, id: active.id, status: error.status || 500, error });
     }

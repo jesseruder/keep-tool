@@ -63,3 +63,21 @@ test('the Machine select starts a new session on the node picked', async ({ page
   const open = fixture.events.find(event => event.event === 'request' && event.path === '/api/open');
   expect(open.body).toMatchObject({ fresh: true, agent: 'claude', node: 'aws1' });
 });
+
+test('the review queue chooser offers the Machine select and sends the node picked', async ({ page }) => {
+  fixture.state.reviewQueue.items.push({ id: 'idea:on-aws1', type: 'idea', card: 'card-review', title: 'Review on aws1',
+    body: 'Start this on another machine.', project: fixture.state.sessions[0].project, status: 'needs-decision', at: Date.now(), sessions: [] });
+  fixture.state.reviewQueue.counts['needs-decision'] = 1;
+  fixture.publish();
+  await page.locator('[data-mode=review-queue]').click();
+  await page.locator('[data-review-action=start]').click();
+  const chooser = page.locator('.session-launch-dialog');
+  await expect(chooser.locator('[data-launch-node]')).toHaveValue('');
+  await expect(chooser.locator('[data-launch-node] option[value="mini"]')).toHaveAttribute('disabled', '');
+  await chooser.locator('[data-launch-node]').selectOption('aws1');
+  await chooser.locator('[data-launch-submit]').click();
+  await expect(chooser).not.toBeVisible();
+  const review = fixture.events.filter(event => event.event === 'request' && event.path === '/api/review-queue');
+  expect(review).toHaveLength(1);
+  expect(review[0].body).toMatchObject({ id: 'idea:on-aws1', action: 'start', agent: 'claude', accountId: 'claude-main', node: 'aws1' });
+});
