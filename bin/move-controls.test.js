@@ -70,6 +70,22 @@ test('a live Claude session is offered every other machine, an unreachable one d
   assert.doesNotMatch(remote, /data-move-node="aws1"/);
 });
 
+test('a Watch pane moves the session it names, from where that session is, not another row bound to the pane', () => {
+  const own = session({ id: 'own', node: undefined, nodeRecorded: true });
+  const bound = session({ id: 'bound', node: 'aws1' });
+  const ctx = { ...fixture(), sessionFor: ({ sessionId }) => (sessionId === 'own' ? own : null) };
+  const pane = { id: 'p1', meta: { sessionId: 'own', agent: 'claude' } };
+  const chosen = context.paneMoveSession(ctx, pane, { session: bound });
+  assert.equal(chosen, own, 'the pane\'s own session');
+  const html = context.moveControlsHTML(ctx, chosen, { live: true });
+  assert.match(html, /title="Stops this session on main /, 'its current node is the daemon\'s, not the bound row\'s aws1');
+  assert.match(html, /data-move-node="aws1"/);
+  assert.doesNotMatch(html, /data-move-node="main"/);
+  // A pane that names no session falls back to its entity's row.
+  assert.equal(context.paneMoveSession(ctx, { id: 'p2', meta: { agent: 'claude' } }, { session: bound }), bound);
+  assert.equal(context.paneMoveSession(ctx, { id: 'p3' }, {}), undefined);
+});
+
 test('move controls stay hidden on one node, for other agents, during a handoff, and on a session with no live pane', () => {
   assert.equal(context.moveControlsHTML(fixture({ nodes: [fleet[0]] }), session(), { live: true }), '');
   assert.equal(context.moveControlsHTML(fixture({ nodes: undefined }), session(), { live: true }), '', 'an older daemon publishes no nodes');

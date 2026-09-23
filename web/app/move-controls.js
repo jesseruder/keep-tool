@@ -74,6 +74,13 @@ export function moveControlsHTML(ctx, session, { live = false, pendingHandoff = 
   }).join('')}</div></details>`;
 }
 
+// The session a Watch pane's move controls act on: the pane's own when it names one,
+// so the current node the controls show and the session they post are one identity;
+// the pane's entity may be another row bound to it. Its entity's otherwise.
+export function paneMoveSession(ctx, pane, entity) {
+  return pane?.meta?.sessionId ? ctx.sessionFor({ sessionId: pane.meta.sessionId }) : entity?.session;
+}
+
 // A move that stopped part way: the daemon journalled it as recovery-needed, and the
 // reloaded state renders Retry and Abandon. The banner would only repeat that.
 async function recoveryNeeded(ctx, error) {

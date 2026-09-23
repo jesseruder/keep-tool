@@ -3,7 +3,7 @@ import { runAction } from './action.js';
 import { sessionExplanation } from './status.js';
 import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHandoff } from './account-controls.js';
 import { portableTransferControls, installPortableTransferControls } from './portable-transfer.js';
-import { installMoveControls, moveControlsHTML } from './move-controls.js';
+import { installMoveControls, moveControlsHTML, paneMoveSession } from './move-controls.js';
 import { actionsMenuHTML, installActionsMenu, installKeepRunningControl, keepRunningControlHTML,
   patchActionsMenu, rendererControlsHTML } from './session-actions.js';
 import { numBadgeHTML } from './session-number.js';
@@ -132,10 +132,7 @@ function renderGrid(ctx, layout) {
     const portable = providerControls && (closable || pendingHandoff) && !entity.session?.reviewer ? portableTransferControls(ctx, pane.meta.sessionId) : '';
     const handoff = providerControls && (closable || pendingHandoff) && !entity.session?.reviewer ? handoffControls(ctx, pane.meta.sessionId, pane.id) : '';
     const restart = providerControls && closable && !pendingHandoff && !entity.session?.reviewer ? restartControls(ctx, pane.meta.sessionId) : '';
-    // The session a move acts on is the pane's own when it names one, so the current
-    // node the controls show and the session they post are the same identity; the
-    // entity's may be another row bound to this pane.
-    const moveSession = pane.meta?.sessionId ? ctx.sessionFor({ sessionId: pane.meta.sessionId }) : entity.session;
+    const moveSession = paneMoveSession(ctx, pane, entity);
     const move = providerControls && moveSession && !moveSession.reviewer
       ? moveControlsHTML(ctx, moveSession, { live: Boolean(closable), pendingHandoff }) : '';
     const keepRunning = providerControls && closable && entity.session && !entity.session.reviewer && !entity.session.agentName
