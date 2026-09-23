@@ -9506,12 +9506,20 @@ async function addNodeState(state, hostStatus, deps = {}) {
     moves.set(record.sessionId, record);
   }
   if (!Array.isArray(state.sessions)) return state;
+  // A replaced row keeps the transcript path the build bound to the row it replaces:
+  // the session summary reads it from this map, keyed by the row object.
+  const sources = deps.sessionSources || dashboardSessionSources;
+  const replaced = (session, copy) => {
+    const file = sources.get(session);
+    if (file) sources.set(copy, file);
+    return copy;
+  };
   state.sessions = state.sessions.map((session) => {
     const record = session && moves.get(session.id);
-    if (record) return { ...session, move: consoleMove(record, running(record.sessionId)) };
+    if (record) return replaced(session, { ...session, move: consoleMove(record, running(record.sessionId)) });
     if (session && Object.prototype.hasOwnProperty.call(session, 'move')) {
       const { move: _stale, ...rest } = session;
-      return rest;
+      return replaced(session, rest);
     }
     return session;
   });

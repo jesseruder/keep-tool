@@ -16594,3 +16594,28 @@ test('console node state does not call a move interrupted when it finishes, or s
     assert.equal(byId.orphan.move.interrupted, true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('console node state keeps the transcript path bound to a session row it replaces', async () => {
+  const { addNodeState } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-move-state-'));
+  try {
+    const dir = path.join(root, '.keep', 'session-moves');
+    fs.mkdirSync(dir, { recursive: true });
+    const id = `mv-${'0'.repeat(23)}1`;
+    fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ id, sessionId: 'moving', from: 'main', to: 'aws1', status: 'copying', createdAt: 1 }));
+    const sessionSources = new WeakMap();
+    const moving = { id: 'moving' };
+    const stale = { id: 'stale', move: { id: 'old' } };
+    const plain = { id: 'plain' };
+    for (const row of [moving, stale, plain]) sessionSources.set(row, `/transcripts/${row.id}.jsonl`);
+    const sessionMove = { ...require('./session-move'), isRunning: () => true };
+    const state = { sessions: [moving, stale, plain] };
+    await addNodeState(state, { ok: true }, { root, sessionMove, sessionSources, daemonNode: 'main', placementNodes: ['main', 'aws1'] });
+    const [movingRow, staleRow, plainRow] = state.sessions;
+    assert.notEqual(movingRow, moving, 'the row carrying the move is a copy');
+    assert.notEqual(staleRow, stale, 'the row losing a stale move is a copy');
+    assert.equal(plainRow, plain);
+    assert.equal(sessionSources.get(movingRow), '/transcripts/moving.jsonl');
+    assert.equal(sessionSources.get(staleRow), '/transcripts/stale.jsonl');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
