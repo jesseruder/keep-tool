@@ -593,3 +593,46 @@ test('a Codex session whose compaction swap record or restart ledger names this 
     assert.equal((await serve.moveSession({ sessionId: SID, node: 'aws1', dry: true }, w.deps)).dry, true);
   } finally { w.cleanup(); }
 });
+
+test('the stop proof for a Codex session reads its open rollouts, and a failed read refuses where a Claude one would not look', async () => {
+  const r = codexRegistry('aws1');
+  try {
+    const deps = (extra) => serve.sessionMoveDeps({ root: r.root, env: r.env, daemonNode: 'main',
+      agentProcessRows: async () => [codexRow(61, 1, 'codex -m gpt resume other-thread')], statMtime: async () => 1, ...extra });
+    const codex = { from: 'aws1', sessionId: CODEX_SID, agent: 'codex' };
+    await deps({ lsof: async () => '' }).requireStopped(codex);
+    await assert.rejects(deps({ lsof: async () => `p61\nn${rolloutPath}` }).requireStopped(codex),
+      (error) => error.extra.reason === 'source-running', 'the process holding its rollout is the session');
+    await assert.rejects(deps({ lsof: async () => { throw new Error('lsof timed out'); } }).requireStopped(codex),
+      (error) => error.status === 409 && error.extra.reason === 'processes-unverified');
+    // The same unreadable files say nothing about a Claude session, which is found by
+    // another read, exactly as before.
+    await deps({ lsof: async () => { throw new Error('lsof timed out'); } }).requireStopped({ ...codex, agent: 'claude' });
+  } finally { r.cleanup(); }
+});
+
+test('a resumed Codex that has not taken a turn is verified by its own process on the target, and its pane record written', async () => {
+  const r = codexRegistry('aws1');
+  try {
+    const pane = { id: 'p5@aws1', node: 'aws1', alive: true, pid: 70, meta: { sessionId: CODEX_SID, agent: 'codex', unattended: true } };
+    const record = { id: `mv-${'a'.repeat(24)}`, sessionId: CODEX_SID, agent: 'codex', from: 'main', to: 'aws1', accountId: 'codex-a',
+      cwd: '/work/project', launch: { pane: 'p5@aws1', pid: 70 }, launchStartedAt: Date.now() - 1 };
+    const wait = (rows) => serve.sessionMoveDeps({ root: r.root, env: r.env, daemonNode: 'main', moveStartTimeoutMs: 300, sleep: async () => {},
+      listHostPanes: async () => [pane], agentProcessRows: async () => rows, lsof: async () => `p72\nn${rolloutPath}`, statMtime: async () => 1 })
+      .waitForPaneRecord(record);
+    const shell = { pid: 70, ppid: 1, args: '/bin/zsh', tty: 'x', pidStart: 'x' };
+    const launcher = { pid: 71, ppid: 70, args: 'node agent-launcher.js', tty: 'x', pidStart: 'x' };
+    // The rollout is held by a process that is not under the launch's pane: no start.
+    assert.equal(await wait([shell, launcher, codexRow(72, 1, `codex -m gpt resume ${CODEX_SID}`)]), null);
+    assert.equal(fs.existsSync(path.join(r.root, '.keep', 'panes', `${CODEX_SID}.json`)), false);
+    const started = await wait([shell, launcher, codexRow(72, 71, `codex -m gpt resume ${CODEX_SID}`)]);
+    assert.equal(started.pane, 'p5@aws1');
+    const written = JSON.parse(fs.readFileSync(path.join(r.root, '.keep', 'panes', `${CODEX_SID}.json`), 'utf8'));
+    assert.deepEqual({ ...written, at: 0, startedAt: 0 }, { at: 0, startedAt: 0, cwd: '/work/project', agent: 'codex', pane: 'p5@aws1', claimed: true,
+      node: 'aws1', accountId: 'codex-a', bound: true, unattended: true, opener: null, moveTransactionId: record.id });
+    // A Claude move never stands in for its session-start.
+    fs.rmSync(path.join(r.root, '.keep', 'panes', `${CODEX_SID}.json`));
+    assert.equal(await serve.sessionMoveDeps({ root: r.root, env: r.env, daemonNode: 'main', moveStartTimeoutMs: 1, sleep: async () => {},
+      verifyMovedCodexPane: async () => assert.fail('not for Claude') }).waitForPaneRecord({ ...record, agent: 'claude' }), null);
+  } finally { r.cleanup(); }
+});

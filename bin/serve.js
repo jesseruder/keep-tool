@@ -13308,6 +13308,51 @@ function codexMoveObstacle(sessionId, deps = {}) {
   return null;
 }
 
+// A resumed Codex's start, from the target's own evidence: the launch's pane is still
+// live and names the session, and an agent process under that pane runs it (its argv
+// says `resume <id>`, or it holds the rollout open). Codex fires SessionStart only at
+// its first turn, so an idle resumed session would otherwise never report. Written as
+// the pane record late adoption writes (bound, claimed, on its node, its account),
+// and resolved; null when the evidence is not there (yet).
+async function verifyMovedCodexPane(record, deps = {}) {
+  const daemon = daemonNodeName(deps);
+  const node = record.to;
+  const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
+  const pane = Array.isArray(panes) ? panes.find((entry) => entry && entry.id === record.launch.pane) : null;
+  if (!pane || pane.alive === false || !Number.isInteger(pane.pid) || !pane.meta || pane.meta.sessionId !== record.sessionId
+      || (pane.meta.agent && pane.meta.agent !== 'codex') || sessionNodeOf(pane, deps) !== node
+      || (Number.isInteger(record.launch.pid) && pane.pid !== record.launch.pid)) return null;
+  let rows = null;
+  try { rows = await (deps.agentProcessRows || agentProcessRows)(deps, node === daemon ? {} : { node }); } catch {}
+  if (!Array.isArray(rows)) return null;
+  const live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => rows }, node === daemon ? {} : { node });
+  if (unverifiedProcesses(live, 'codex')) return null;
+  const identity = live.get(record.sessionId);
+  if (!identity || identity.agent !== 'codex') return null;
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  let row = byPid.get(identity.pid);
+  const seen = new Set();
+  let under = false;
+  while (row && !seen.has(row.pid)) {
+    if (row.pid === pane.pid) { under = true; break; }
+    seen.add(row.pid);
+    row = byPid.get(row.ppid);
+  }
+  if (!under && identity.pid !== pane.pid) return null;
+  const at = Date.now();
+  const written = {
+    at, startedAt: at, cwd: record.cwd, agent: 'codex', pane: record.launch.pane, claimed: true,
+    ...(node === daemon ? {} : { node }), accountId: record.accountId, bound: true,
+    unattended: pane.meta.unattended === true, opener: pane.meta.opener || null, moveTransactionId: record.id,
+  };
+  const file = path.join(deps.root || keep.ROOT, '.keep', 'panes', `${record.sessionId}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  fs.writeFileSync(temp, JSON.stringify(written));
+  fs.renameSync(temp, file);
+  return written;
+}
+
 function sessionMoveDeps(deps = {}) {
   const root = deps.root || keep.ROOT;
   const env = deps.env || process.env;
@@ -13401,11 +13446,11 @@ function sessionMoveDeps(deps = {}) {
           { ...deps, ownerForce: record.ownerForce === true, afterStop: async (stopped) => ({ ok: true, stopped: stopped && stopped.id }) });
       }
       // Proven again from the source's own table whether or not it was just stopped.
-      await requireNoAgentOn(record.from, record.sessionId, deps);
+      await requireNoAgentOn(record.from, record.sessionId, deps, agentOf(record));
     },
     digestsOn,
     // The same proof, asked again before the flip and before every launch.
-    requireStopped: (record) => requireNoAgentOn(record.from, record.sessionId, deps),
+    requireStopped: (record) => requireNoAgentOn(record.from, record.sessionId, deps, agentOf(record)),
     // Whether the target runs the session now: a live pane for it there, or an agent
     // process in the target's own table. An unreadable table throws (unproven).
     //
@@ -13418,14 +13463,14 @@ function sessionMoveDeps(deps = {}) {
       if (!Array.isArray(panes)) throw new InjectionError(409, 'the terminal hosts did not list their panes');
       const open = panes.filter((entry) => entry && entry.alive !== false && entry.agentAlive !== false && entry.meta
         && entry.meta.sessionId === record.sessionId && sessionNodeOf(entry, deps) === record.to);
-      const agent = await agentLiveOn(record.to, record.sessionId, deps);
+      const agent = await agentLiveOn(record.to, record.sessionId, deps, agentOf(record));
       const proven = open.find((entry) => entry.agentAlive === true) || null;
       const pane = proven || open[0] || null;
       const unproven = Boolean(pane) && !proven && !agent;
       return { running: Boolean(pane) || agent, pane: pane ? pane.id : null, agent, ...(unproven ? { unproven: true } : {}) };
     },
     // The abandon's flip back, the only other flip a move makes.
-    pinBack: (record) => accounts.pinSession(record.sessionId, 'claude', record.accountId,
+    pinBack: (record) => accounts.pinSession(record.sessionId, agentOf(record), record.accountId,
       { root, env, node: record.from, transferNode: true }),
     // The abandon's flip back leaves the target the same way a move leaves its source.
     dropTarget: (record) => dropNodeState(record, record.to),
@@ -13436,22 +13481,37 @@ function sessionMoveDeps(deps = {}) {
         from: moveEndpoint(record.from, account, deps), to: moveEndpoint(record.to, account, deps) });
     },
     location: (sessionId) => accounts.sessionLocation(sessionId, { root, env }),
-    pin: (record) => accounts.pinSession(record.sessionId, 'claude', record.accountId,
+    pin: (record) => accounts.pinSession(record.sessionId, agentOf(record), record.accountId,
       { root, env, node: record.to, transferNode: true }),
     open: async (record) => {
       // The target has no agent for this conversation before one is started there.
+      // A Codex session resumes with `codex [flags] [-m model] resume <id>`, in the
+      // permission class its source ran in (Keep's default when none was read).
+      const flags = agentOf(record) === 'codex'
+        ? (typeof record.flags === 'string' ? { codexFlags: record.flags } : {})
+        : { claudeFlags: record.bypass ? '--dangerously-skip-permissions' : '' };
       const launch = await (deps.openSession || openSession)({ sessionId: record.sessionId, node: record.to, accountId: record.accountId,
         ...(record.model ? { model: record.model } : {}) },
-      { ...deps, claudeFlags: record.bypass ? '--dangerously-skip-permissions' : '', reopenCompaction: 'skip', moveTransactionId: record.id });
+      { ...deps, ...flags, reopenCompaction: 'skip', moveTransactionId: record.id });
       return launch;
     },
     waitForPaneRecord: async (record) => {
       const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
       const deadline = Date.now() + (deps.moveStartTimeoutMs || 45000);
+      const codex = agentOf(record) === 'codex';
+      let nextEvidence = 0;
       for (;;) {
         const found = readPaneRecord(record.sessionId, deps);
         if (found && found.pane === record.launch.pane && Number(found.startedAt) >= Number(record.launchStartedAt)
             && (found.node || daemon) === record.to) return found;
+        // A resumed Codex reports its start only at its first turn: its own process
+        // evidence on the target stands in for it, asked every two seconds.
+        if (codex && Date.now() >= nextEvidence) {
+          nextEvidence = Date.now() + 2000;
+          let verified = null;
+          try { verified = await (deps.verifyMovedCodexPane || verifyMovedCodexPane)(record, deps); } catch {}
+          if (verified) return verified;
+        }
         if (Date.now() >= deadline) return null;
         await sleep(250);
       }
@@ -13474,7 +13534,7 @@ function sessionMoveDeps(deps = {}) {
       // somebody started again is left running, and said so.
       if (record.pane) {
         try {
-          await requireNoAgentOn(record.from, record.sessionId, deps);
+          await requireNoAgentOn(record.from, record.sessionId, deps, agentOf(record));
           const panes = await listPanes();
           if (!Array.isArray(panes)) throw new Error('the terminal hosts did not list their panes');
           const pane = panes.find((entry) => entry && entry.id === record.pane.id);
