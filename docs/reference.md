@@ -901,9 +901,12 @@ calling a model or writing state; `--model` overrides `KEEP_IDEAS_MODEL` (defaul
 `fable`). The daemon runs it every day at local `KEEP_IDEAS_AT` (default `07:30`) and
 retries failures every 30 minutes until noon.
 
-The sweep spends against `accounts.automationFor('claude', 'ideas')` — the same
-automation-purpose mechanism as `reviewer` and `watcher`, falling back to
+The sweep spends against the account the automation policy picks for the `ideas`
+purpose (`automationAccounts.ideas` while it has room, else the `automationPool`
+account with the most; see [automation pool](accounts.md#automation-pool) for the
+pool, the default-account exclusion, and deferral). With no pool it falls back to
 `automationAccounts.claude` and then the Claude default, so no config change is needed.
+A pool with no room for the model is a code-6 skip.
 Its budget is read against that account: without one, a fleet with more than one Claude
 account reports `reviewer account is unknown in multi-account mode` and the sweep never
 runs. An exhausted window (budget code 6 or 7) is recorded as a healthy skip; a budget
