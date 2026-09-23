@@ -35,9 +35,12 @@ const path = require('node:path');
 
 const NEGATIVE_TTL_MS = 5e3;
 const SHORT_TTL_MS = 500;
+// The whole host lookup (connect, the TCP hello, the list) runs under one deadline,
+// so it ends well inside a node's 2.6 s Codex start deadline. Each step keeps its own
+// cap as an upper bound, and the list gets only what connect and hello left.
+const LOOKUP_DEADLINE_MS = 2000;
 const CONNECT_TIMEOUT_MS = 1000;
-// Over TCP the host's hello frame has its own wait (8 s by default): bounded here too,
-// so a lookup ends well inside a node's 2.6 s Codex start deadline.
+// Over TCP the host's hello frame has its own wait (8 s by default): bounded here too.
 const HELLO_TIMEOUT_MS = 1000;
 const REQUEST_TIMEOUT_MS = 1500;
 const CACHE_MAX = 1024;
@@ -154,7 +157,7 @@ function createLateAdoption(options = {}) {
   const accounts = options.accounts || require('./accounts.js');
   const location = options.location || ((sessionId) => accounts.sessionLocation(sessionId, { root, env }));
   const connect = options.hostConnect
-    || ((node, timeoutMs) => require('./hostclient.js').connect({ node, env, timeoutMs, helloTimeoutMs: HELLO_TIMEOUT_MS }));
+    || ((node, timeoutMs, helloTimeoutMs) => require('./hostclient.js').connect({ node, env, timeoutMs, helloTimeoutMs }));
   const log = options.log || (() => {});
   // Whether this machine knows the session itself: a Claude transcript or a Codex
   // rollout of it under any account here (walkedLocally, the authority), or one the
@@ -182,15 +185,41 @@ function createLateAdoption(options = {}) {
     refusedUntil.set(key, now() + ttl);
   }
 
+  // A real clock, never the injected one: the deadline is wall time on this process.
+  const elapsedSince = (began) => Number(process.hrtime.bigint() - began) / 1e6;
+
   async function livePanesNaming(caller, sessionId) {
-    const client = await connect(caller, CONNECT_TIMEOUT_MS);
-    try {
-      const listed = await client.request('list', {}, { timeoutMs: REQUEST_TIMEOUT_MS });
+    const began = process.hrtime.bigint();
+    const left = () => LOOKUP_DEADLINE_MS - elapsedSince(began);
+    let timer;
+    let client = null;
+    let expired = false;
+    const deadline = new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
+        expired = true;
+        reject(new Error(`the lookup ran past ${LOOKUP_DEADLINE_MS} ms`));
+      }, LOOKUP_DEADLINE_MS);
+    });
+    deadline.catch(() => {});
+    const lookup = (async () => {
+      const connected = await connect(caller, Math.min(CONNECT_TIMEOUT_MS, left()), Math.min(HELLO_TIMEOUT_MS, left()));
+      // A connection that lands after the deadline gave up is closed here.
+      if (expired) { try { connected.close(); } catch {} throw new Error('the lookup ran out of time'); }
+      client = connected;
+      const remaining = Math.min(REQUEST_TIMEOUT_MS, left());
+      if (!(remaining > 0)) throw new Error('the lookup ran out of time before the list');
+      const listed = await client.request('list', {}, { timeoutMs: remaining });
       const panes = Array.isArray(listed && listed.panes) ? listed.panes : [];
       return panes.filter((pane) => pane && pane.alive === true && pane.meta && typeof pane.meta === 'object'
         && pane.meta.sessionId === sessionId);
+    })();
+    lookup.catch(() => {});
+    try {
+      return await Promise.race([lookup, deadline]);
     } finally {
-      try { client.close(); } catch {}
+      clearTimeout(timer);
+      expired = true;
+      if (client) { try { client.close(); } catch {} }
     }
   }
 
@@ -301,4 +330,4 @@ function createLateAdoption(options = {}) {
   return { adopt, unlocated };
 }
 
-module.exports = { createLateAdoption, recordNodeCodexLaunch, readNodeCodexLaunch, walkedLocally, NEGATIVE_TTL_MS, SHORT_TTL_MS, LAUNCH_TTL_MS };
+module.exports = { createLateAdoption, recordNodeCodexLaunch, readNodeCodexLaunch, walkedLocally, LOOKUP_DEADLINE_MS, NEGATIVE_TTL_MS, SHORT_TTL_MS, LAUNCH_TTL_MS };

@@ -863,6 +863,43 @@ test('late adoption gives up on a node host that never answers its hello within 
   assert.ok(elapsed < 2000, `bounded by the hello timeout (${elapsed} ms)`);
 });
 
+test('late adoption gives up within its two-second lookup deadline on a host that answers hello but never its list', async (t) => {
+  const net = require('node:net');
+  const { FrameDecoder, encodeFrame, PROTOCOL_VERSION } = require('./host.js');
+  const sockets = [];
+  const asked = [];
+  // Hello answers only after 900 ms, so a list with its own full cap would run to 2.4 s.
+  const mute = net.createServer((socket) => {
+    sockets.push(socket);
+    const decoder = new FrameDecoder((frame) => {
+      asked.push(frame.type);
+      if (frame.type === 'hello') {
+        setTimeout(() => { if (!socket.destroyed) socket.write(encodeFrame({ ok: true, id: frame.id, protocol: PROTOCOL_VERSION, node: 'aws1' })); }, 900);
+      }
+    }, () => socket.destroy());
+    socket.on('data', (data) => decoder.push(data));
+    socket.on('error', () => {});
+  });
+  await new Promise((resolve) => mute.listen(0, '127.0.0.1', resolve));
+  t.after(() => { for (const socket of sockets) socket.destroy(); return new Promise((resolve) => mute.close(resolve)); });
+  const root = tempDir(t);
+  const tokenFile = path.join(root, 'aws1.token');
+  fs.writeFileSync(tokenFile, 'a'.repeat(64) + '\n', { mode: 0o600 });
+  const configFile = path.join(root, 'config.json');
+  fs.writeFileSync(configFile, `${JSON.stringify({ version: 1, daemonNode: 'main',
+    nodes: { main: {}, aws1: { transport: 'tcp', address: `127.0.0.1:${mute.address().port}`, tokenFile } } })}\n`);
+  const adoption = require('./late-adoption.js').createLateAdoption({
+    root, env: { PATH: '/usr/bin:/bin', HOME: root, KEEP_CONFIG: configFile }, daemonNode: () => 'main',
+  });
+  const began = Date.now();
+  const result = await adoption.adopt('aws1', 'codex-late', 'codex', {});
+  const elapsed = Date.now() - began;
+  assert.deepEqual(asked, ['hello', 'list'], 'it did ask for the list');
+  assert.equal(result.adopted, false);
+  assert.match(result.why, /could not be asked/);
+  assert.ok(elapsed >= 1800 && elapsed < 2100, `bounded by the lookup deadline (${elapsed} ms)`);
+});
+
 test('a request naming the wrong pane neither blocks nor delays the right one', async (t) => {
   const { svc, root, host } = adoptingService(t, [lateCodexPane()]);
   const wrong = await svc.handle(AWS1, lateBody(root, { pane: 'p8@aws1', idempotencyKey: 'k-wrong-pane-0123456789' }));
