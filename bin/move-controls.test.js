@@ -175,6 +175,30 @@ test('any other failure of the real move keeps the failure banner', async () => 
   assert.equal(ctx.reloads, 0);
 });
 
+test('a preflight refusal of the real move is a toast too, and the controls come back', async () => {
+  const ctx = fixture();
+  reset([{ ok: true, dry: true }, { error: { status: 409, message: 's is busy: a delivery is typing',
+    body: { error: 's is busy: a delivery is typing', reason: 'busy' } } }]);
+  const aws1 = button({ moveNode: 'aws1' });
+  install(ctx, { '[data-move-node]': [aws1] });
+  await aws1.click();
+  assert.equal(context.writes.length, 2);
+  assert.deepEqual(ctx.toasts, ['Not moved: s is busy: a delivery is typing']);
+  assert.deepEqual(context.dismissed, [2], 'the refusal is a toast, not a sticky failure');
+  assert.deepEqual(context.reported, []);
+  assert.equal(ctx.reloads, 0);
+  assert.equal(ctx.refreshes, 2, 'once to show the move, once to take it back');
+  assert.equal(context.moveControlsHTML(ctx, session(), { live: true }).includes('data-move-node="aws1"'), true);
+
+  // A 409 naming no reason (a move already running here) is not a preflight answer.
+  const other = fixture();
+  reset([{ ok: true, dry: true }, { error: { status: 409, message: 'a move of s is already running', body: { error: 'a move of s is already running' } } }]);
+  install(other, { '[data-move-node]': [aws1] });
+  await aws1.click();
+  assert.deepEqual(context.reported, ['a move of s is already running']);
+  assert.deepEqual(other.toasts, []);
+});
+
 test('Retry and Abandon post the move id and report what the daemon says', async () => {
   const ctx = fixture();
   reset([{ ok: true, status: 'done', to: 'aws1', launch: { pane: 'p4@aws1' } },

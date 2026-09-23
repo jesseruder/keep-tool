@@ -30,6 +30,14 @@ function refused(error) {
   return !error?.transient && !error?.timeout && [400, 404, 409].includes(error?.status);
 }
 
+// The same preflight refusing the real move: the session became busy, or a delivery
+// went pending, between the check and the click's move. It names a reason code and
+// nothing was stopped, so it is a toast too. Any 4xx that names one counts.
+function refusedAtMove(error) {
+  return !error?.transient && !error?.timeout && Number(error?.status) >= 400 && Number(error?.status) < 500
+    && typeof error?.body?.reason === 'string' && Boolean(error.body.reason);
+}
+
 // The session's move controls, or '' when none apply. `live` is whether the session
 // has a live pane here: only a running session is offered a move, while a move the
 // state still carries is shown whether or not its pane survived the stop.
@@ -91,7 +99,13 @@ async function moveTo(ctx, sessionId, node) {
       { label: 'Moving session', timeoutMs: MOVE_TIMEOUT_MS });
   } catch (error) {
     if (error.body?.status === 'recovery-needed') return recoveryNeeded(ctx, error);
-    throw error;
+    if (!refusedAtMove(error)) throw error;
+    // Nothing was stopped: the controls go back to what they were.
+    localMoves.delete(sessionId);
+    ctx.refresh?.();
+    dismissWriteFailure(error.writeFailureId);
+    ctx.toast(`Not moved: ${error.body?.error || error.message}`);
+    return undefined;
   } finally {
     localMoves.delete(sessionId);
   }
