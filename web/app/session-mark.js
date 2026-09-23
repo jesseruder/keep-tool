@@ -26,8 +26,8 @@ function emojiOf(mark) {
 
 // Sits immediately before the title text. An unmarked session renders nothing at
 // all, so every title that has no mark keeps exactly the markup it had. The
-// triage queue passes `dot: false` because it shows the color as the title's
-// text color instead (see `markRowClass`).
+// triage queue passes `dot: false` because it shows the color on the row itself
+// instead (see `markRowClass`; styles.css decides how).
 export function markHTML(esc = escapeHTML, mark, { dot: showDot = true } = {}) {
   const emoji = emojiOf(mark);
   const color = showDot ? colorOf(mark) : '';
@@ -36,8 +36,8 @@ export function markHTML(esc = escapeHTML, mark, { dot: showDot = true } = {}) {
   return `<span class="mark">${esc(emoji)}${dot}</span>`;
 }
 
-// Classes for a queue row whose session carries a color: the row's title
-// takes it as its text color. Empty for an uncolored session.
+// Classes for a queue row whose session carries a color, which styles.css
+// turns into the row's color treatment. Empty for an uncolored session.
 export function markRowClass(mark) {
   const color = colorOf(mark);
   return color ? ` marked mark-${color}` : '';
