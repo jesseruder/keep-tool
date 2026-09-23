@@ -18,8 +18,9 @@ const STALL_MS = 10000;
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 // Returns null when fd 0 is a terminal (run by hand: never block on a TTY) or is not
-// open; otherwise the whole input as a string (possibly empty).
-function readStdin({ fd = 0, isatty = tty.isatty, stallMs = STALL_MS } = {}) {
+// open; otherwise the whole input as a string (possibly empty). `readSync` is fs's
+// unless a test stands in for the descriptor.
+function readStdin({ fd = 0, isatty = tty.isatty, stallMs = STALL_MS, readSync = fs.readSync } = {}) {
   if (isatty(fd)) return null;
   const chunks = [];
   let lastProgress = Date.now();
@@ -27,7 +28,7 @@ function readStdin({ fd = 0, isatty = tty.isatty, stallMs = STALL_MS } = {}) {
     const buffer = Buffer.allocUnsafe(CHUNK);
     let read;
     try {
-      read = fs.readSync(fd, buffer, 0, CHUNK, null);
+      read = readSync(fd, buffer, 0, CHUNK, null);
     } catch (error) {
       if (error.code === 'EAGAIN' || error.code === 'EWOULDBLOCK') {
         if (Date.now() - lastProgress > stallMs) break;

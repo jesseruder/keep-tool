@@ -316,6 +316,8 @@ commands['review-land'] = async (argv) => {
   let raw;
   try {
     raw = o.file ? fs.readFileSync(path.resolve(o.file), 'utf8') : require('../stdin.js').readStdin({ isatty: () => false });
+    // A stdin that is not open reads as null, which JSON.parse would take for `null`.
+    if (raw === null) throw new Error('cannot read stdin');
   } catch (error) {
     const out = new KeepError('cannot read review-land input: ' + error.message);
     out.exitCode = 2;
