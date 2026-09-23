@@ -7,7 +7,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
-  readStats, parseMeminfo, parseVmStat, parseSwapUsage, countAgents, readCode,
+  readStats, parseMeminfo, parseVmStat, parseSwapUsage, countAgents, readCode, processCode,
 } = require('./node-stats.js');
 
 test('readStats on this machine answers the required fields in sane ranges', async () => {
@@ -60,6 +60,8 @@ test('a failing statfs, vm_stat, sysctl or ps leaves those fields out and never 
     },
     statfs: () => { throw new Error('sync throw'); },
     processRows: async () => { throw new Error('ps failed'); },
+    // A root this process has not loaded, read through the broken fs above.
+    codeRoot: path.join(os.tmpdir(), 'keep-node-stats-no-such-checkout'),
   });
   assert.deepEqual(Object.keys(broken).sort(), ['at', 'platform']);
 });
@@ -131,6 +133,42 @@ test('the code is read from HEAD, a worktree pointer, loose and packed refs', ()
     fs.writeFileSync(path.join(own, 'HEAD'), `${other}\n`);
     assert.equal(readCode({ codeRoot: tree }), '1234567', 'a detached HEAD is its own answer');
     assert.equal(readCode({ codeRoot: path.join(root, 'missing') }), undefined);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a statfs that never answers cannot hold the read: it resolves by its deadline, partial', async () => {
+  const started = Date.now();
+  // The deadline's timer is unref'd, so it never keeps a process alive on its own; a
+  // host or a daemon always has its loop held open, and this test holds it the same way.
+  const alive = setInterval(() => {}, 1000);
+  let stats;
+  try {
+    stats = await readStats({ statfs: () => new Promise(() => {}), cpuSampleMs: 5, agents: false, now: started });
+  } finally { clearInterval(alive); }
+  assert.ok(Date.now() - started < 2000, `took ${Date.now() - started}ms`);
+  assert.equal(stats.partial, true);
+  assert.equal(stats.diskRoot, undefined);
+  assert.ok(stats.memTotal > 0, 'what did land is kept');
+  assert.equal(typeof stats.cpuBusyPct, 'number');
+  assert.equal(typeof stats.clockOffsetMs, 'number');
+  const whole = await readStats({ cpuSampleMs: 5, agents: false });
+  assert.equal(whole.partial, undefined, 'a read that finishes in time is not marked');
+});
+
+test('the code is the commit this process loaded, not a checkout changed since', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-node-stats-code-'));
+  try {
+    fs.mkdirSync(path.join(root, '.git'));
+    fs.writeFileSync(path.join(root, '.git', 'HEAD'), 'abcdef1234567890abcdef1234567890abcdef12\n');
+    const first = await readStats({ codeRoot: root, cpuSampleMs: 1, agents: false });
+    assert.equal(first.code, 'abcdef1');
+    fs.writeFileSync(path.join(root, '.git', 'HEAD'), '1234567abcdef1234567abcdef1234567abcdef1\n');
+    const later = await readStats({ codeRoot: root, cpuSampleMs: 1, agents: false });
+    assert.equal(later.code, 'abcdef1', 'a pull without a restart does not change what is running');
+    assert.equal(processCode({ codeRoot: root }), 'abcdef1');
+    assert.equal(readCode({ codeRoot: root }), '1234567', 'the disk itself did change');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

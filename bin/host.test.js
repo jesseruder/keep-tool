@@ -3129,3 +3129,19 @@ test('a node answers its stats beside the queue, with the caller\'s clock offset
     assert.equal(noClock.clockOffsetMs, undefined, 'no caller clock, no offset');
   });
 });
+
+test('a stats read that hangs on a disk answers partial and never leaves the host busy', async () => {
+  const statsOptions = { statfs: () => new Promise(() => {}), deadlineMs: 300, cpuSampleMs: 5, agents: false };
+  await withHost({ statsOptions }, async ({ client }) => {
+    // As many as the host runs at once, every one of them stuck on the same mount.
+    const answers = await Promise.all([1, 2, 3, 4].map(() => client.request('stats', { now: Date.now() })));
+    for (const { stats } of answers) {
+      assert.equal(stats.partial, true);
+      assert.equal(stats.diskRoot, undefined);
+    }
+    // Each one released its slot: the next request is answered, not refused.
+    const next = await client.request('stats', { now: Date.now() });
+    assert.equal(next.stats.partial, true);
+    assert.equal(typeof next.stats.panes, 'number');
+  });
+});

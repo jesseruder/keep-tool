@@ -1628,6 +1628,8 @@ function createHost(options = {}) {
     statsInFlight += 1;
     Promise.resolve()
       .then(() => require('./node-stats.js').readStats({
+        // A test seam only: an injected statfs or deadline for the bounded read.
+        ...(options.statsOptions || {}),
         now: request.now,
         panes: [...panes.values()].filter((pane) => pane.alive).length,
         hostVersion: {

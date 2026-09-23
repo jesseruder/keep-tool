@@ -21,6 +21,10 @@ const path = require('node:path');
 const CPU_SAMPLE_MS = 250;
 const SUBPROCESS_TIMEOUT_MS = 700;
 const SMALL_FILE_MAX_BYTES = 1 << 20;
+// The whole read's budget. A statfs on a network-mounted home can hang for as long
+// as the mount does; past this the answer is whatever was gathered, marked partial,
+// so neither the host's in-flight count nor the daemon's poller is held by it.
+const STATS_DEADLINE_MS = 1500;
 
 function run(deps, file, args) {
   const exec = deps.execFile || execFile;
@@ -217,6 +221,23 @@ function readCode(deps = {}) {
   return undefined;
 }
 
+// The commit this process loaded, read once per checkout root and remembered: a
+// checkout pulled since the process started is not the code it is running, and the
+// read then never touches the disk again.
+const loadedCode = new Map();
+function processCode(deps = {}) {
+  const root = path.resolve(deps.codeRoot || path.join(__dirname, '..'));
+  if (!loadedCode.has(root)) {
+    let code;
+    try { code = readCode({ ...deps, codeRoot: root }); } catch {}
+    loadedCode.set(root, code);
+  }
+  return loadedCode.get(root);
+}
+// Read at load, so even the first answer names what was loaded, not what is on disk
+// by the time somebody asks.
+processCode();
+
 // One machine's stats. `options.now` is the caller's clock when it asked: the
 // answer's clockOffsetMs is this machine's clock minus that, one-way latency
 // included. `panes` and `hostVersion` are the host's to supply; `processRows`
@@ -239,28 +260,41 @@ async function readStats(options = {}) {
   if (Array.isArray(load) && load.length >= 3 && load.slice(0, 3).every((value) => Number.isFinite(value))) {
     [out.load1, out.load5, out.load15] = load.slice(0, 3).map((value) => Math.round(value * 100) / 100);
   }
-  const home = deps.home || safe(() => system.homedir());
-  const [memory, busy, diskRoot, diskHome, rows] = await Promise.all([
-    readMemory(deps, platform).catch(() => ({})),
-    sampleCpuBusy(deps).catch(() => undefined),
-    readDisk(deps, deps.rootPath || '/'),
-    readDisk(deps, home),
-    deps.agents === false ? Promise.resolve(null) : readAgentRows(deps).catch(() => null),
-  ]);
-  Object.assign(out, memory);
-  if (busy != null) out.cpuBusyPct = busy;
-  if (diskRoot) out.diskRoot = diskRoot;
-  if (diskHome) out.diskHome = diskHome;
   if (Number.isInteger(deps.panes) && deps.panes >= 0) out.panes = deps.panes;
-  if (Array.isArray(rows)) out.agentProcesses = countAgents(rows);
   if (deps.hostVersion && typeof deps.hostVersion === 'object') out.hostVersion = { ...deps.hostVersion };
-  const code = safe(() => readCode(deps));
+  const code = safe(() => processCode(deps));
   if (code) out.code = code;
   const now = deps.now == null ? NaN : Number(deps.now);
   if (Number.isFinite(now)) out.clockOffsetMs = at - now;
-  return out;
+  // Each slow read writes its own fields as it lands, so a deadline that passes
+  // first still answers with everything that did.
+  const home = deps.home || safe(() => system.homedir());
+  let done = false;
+  const land = (write) => (value) => { if (!done) write(value); };
+  const reads = Promise.all([
+    readMemory(deps, platform).catch(() => ({})).then(land((memory) => Object.assign(out, memory))),
+    sampleCpuBusy(deps).catch(() => undefined).then(land((busy) => { if (busy != null) out.cpuBusyPct = busy; })),
+    readDisk(deps, deps.rootPath || '/').then(land((disk) => { if (disk) out.diskRoot = disk; })),
+    readDisk(deps, home).then(land((disk) => { if (disk) out.diskHome = disk; })),
+    (deps.agents === false ? Promise.resolve(null) : readAgentRows(deps).catch(() => null))
+      .then(land((rows) => { if (Array.isArray(rows)) out.agentProcesses = countAgents(rows); })),
+  ]).then(() => false);
+  const deadlineMs = deps.deadlineMs == null ? STATS_DEADLINE_MS : Math.max(0, Number(deps.deadlineMs) || 0);
+  let timer;
+  const expired = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(true), deadlineMs);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+  });
+  try {
+    const late = await Promise.race([reads, expired]);
+    done = true;
+    return late ? { ...out, partial: true } : out;
+  } finally {
+    done = true;
+    clearTimeout(timer);
+  }
 }
 
 module.exports = {
-  CPU_SAMPLE_MS, readStats, parseMeminfo, parseVmStat, parseSwapUsage, countAgents, readCode,
+  CPU_SAMPLE_MS, STATS_DEADLINE_MS, readStats, processCode, parseMeminfo, parseVmStat, parseSwapUsage, countAgents, readCode,
 };
