@@ -98,6 +98,59 @@ That profile reads native messaging manifests from its own directory, so copy
 `com.keep.browser_bridge.json` into `/tmp/bb-profile/NativeMessagingHosts/` before the
 extension connects. The real Edge profile reads the one the installer wrote.
 
+### Linux: a headless Edge on a machine with no display
+
+On Linux the same `node bin/install.js` plans for systemd instead of launchd, and runs
+Edge itself, since there is nobody at a screen to click **Load unpacked**:
+
+- The runtime directory is `$XDG_STATE_HOME/browser-bridge`, or
+  `~/.local/state/browser-bridge` (`BROWSER_BRIDGE_RUNTIME_DIR` still wins). It holds the
+  launcher, `daemon.json`, `bridge.sock`, `host.log`, `daemon.log`, `edge.log` and the Edge
+  profile, `edge-profile/`.
+- The native messaging manifest goes to `~/.config/microsoft-edge/NativeMessagingHosts/`,
+  and a second copy to `<profile>/NativeMessagingHosts/`, which is where a profile started
+  with `--user-data-dir` looks. `--user-data-dir <dir>` picks another profile.
+- Two systemd user units in `~/.config/systemd/user/`:
+  `browser-bridge-daemon.service` runs `mcp/daemon.js`, and `browser-bridge-edge.service`
+  (after the daemon) runs `bin/headless-edge.js`. The installer runs
+  `systemctl --user daemon-reload`, then `enable --now` for a new unit or `restart` for an
+  existing one. The units only outlive a logout with lingering on
+  (`loginctl enable-linger $USER`).
+- `bin/headless-edge.js` starts `microsoft-edge --headless=new` on the profile with
+  `--remote-debugging-pipe --enable-unsafe-extension-debugging`, holds the pipe (fds 3
+  and 4, NUL-terminated JSON), sends `Extensions.loadUnpacked` for this checkout's
+  `extension/` on every start and logs the id it got back to `edge.log`: it must be
+  `goijgcbiphelgdlpjmpepfkihboonjbg`. If Edge exits, the wrapper starts it again with a
+  growing backoff; SIGTERM takes Edge down with it and stops.
+- Registration is the same `claude mcp add-json` into every `~/.claude*` config, with this
+  machine's node, so any Claude session started afterwards has the `browser` tools.
+
+To check it: `systemctl --user status browser-bridge-daemon browser-bridge-edge`,
+`curl -s http://127.0.0.1:47331/healthz`, `edge.log` for the extension id, and
+`host.log` for `extension ready`. `claude mcp list` should show `browser` connected.
+
+**After a landing, re-run `node bin/install.js` from the checkout the units should run.**
+The launcher and both units hold absolute paths (node, the checkout), so an install from a
+worktree keeps running the worktree until the installer is run again from the main
+checkout.
+
+The profile starts logged out of everything. If a session needs a site login that it
+cannot do itself through `form_input`, log the profile in by hand once, over the DevTools
+screencast:
+
+```sh
+systemctl --user stop browser-bridge-edge
+microsoft-edge --headless=new --user-data-dir="$HOME/.local/state/browser-bridge/edge-profile" \
+  --remote-debugging-port=9222 https://example.com/login
+# from the laptop: ssh -L 9222:127.0.0.1:9222 <node>, then edge://inspect → Configure →
+# localhost:9222, and Inspect the tab: the screencast takes clicks and typing.
+# When logged in, stop that Edge and:
+systemctl --user start browser-bridge-edge
+```
+
+Cookies live in the profile, so they survive restarts of the unit. Anything a session can
+reach through that profile, every session on the machine can reach.
+
 ## Using it
 
 Tool names and input schemas match the Claude in Chrome extension, so the habits carry
