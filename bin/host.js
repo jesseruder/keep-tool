@@ -1140,9 +1140,10 @@ function createHost(options = {}) {
           // adds `meta`, a Codex rollout's session_meta and last turn's model.
           transcript: 4,
           // artifacts: this host answers the `artifacts` verb (bin/session-artifacts.js),
-          // which lists, reads, stages and publishes a Claude session's files under one
-          // of this node's own accounts, so a session can be moved onto or off it.
-          artifacts: 1,
+          // which lists, reads, stages and publishes a session's files under one of
+          // this node's own accounts, so a session can be moved onto or off it. 2 adds
+          // `kind: 'codex'`: a Codex session's root and child-thread rollouts.
+          artifacts: 2,
           // spawnReceipts: a spawn naming an operationId is journalled, so a caller
           // whose reply was lost may ask again instead of starting a second process.
           spawnReceipts: true,

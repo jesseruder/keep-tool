@@ -1,11 +1,19 @@
 'use strict';
-// The `artifacts` verb: what a node's host does so a Claude session can be moved onto
-// it or off it. A session's artifacts are its transcript, its session trees (the
+// The `artifacts` verb: what a node's host does so a session can be moved onto it or
+// off it. A Claude session's artifacts are its transcript, its session trees (the
 // primary `<sid>/` beside the transcript and any `<sid>.superseded-*` tree under any
-// project) and its file history, all under one account's config directory. Every
-// node shares the home path, so the same relative paths name the same artifacts on
-// both machines, and that is all that ever travels: a path relative to the account
-// directory, checked here against the shapes a session's artifacts can have.
+// project) and its file history. A Codex session's (`kind: 'codex'`) are its root
+// rollout, `sessions/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl`, and the rollout of every
+// child thread whose parent chain leads back to it (each rollout's own session_meta
+// says whose it is), under `sessions/` or `archived_sessions/`; never the account's
+// session index, history or sqlite files, which are not a conversation's state. Either
+// way everything is under one account's config directory. Every node shares the home
+// path, so the same relative paths name the same artifacts on both machines, and that
+// is all that ever travels: a path relative to the account directory, checked here
+// against the shapes a session's artifacts can have.
+//
+// Every request may name `kind` ('claude' when it names none, which is all an older
+// daemon sends); the account must be one of this node's accounts of that agent.
 //
 //   list    { sessionId, account }                    -> { projectName, files: [{ relPath, size, mtimeMs, mode, sha256 }], bytes }
 //   read    { sessionId, account, relPath, from, length ≤ 4 MiB } -> { relPath, size, mtimeMs, from, bytes, eof }
@@ -42,6 +50,9 @@ const TX_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_FILES = 50000;
 const MOVE_DIR = '.keep-move';
 const OPS = new Set(['list', 'read', 'stage', 'publish', 'release', 'abort', 'cwd', 'drop-session', 'account']);
+const KINDS = new Set(['claude', 'codex']);
+const ROLLOUT_NAME_RE = /^rollout-[A-Za-z0-9._:+=@-]+\.jsonl$/;
+const META_MAX_BYTES = 256 * 1024;
 
 function coded(message, code) {
   const error = new Error(message);
@@ -66,6 +77,12 @@ function validTx(params) {
   return params.tx;
 }
 
+function validKind(params) {
+  const kind = params.kind === undefined ? 'claude' : params.kind;
+  if (!KINDS.has(kind)) throw invalid('artifacts kind must be claude or codex');
+  return kind;
+}
+
 function validAccount(params) {
   const account = params.account;
   if (!account || typeof account !== 'object' || typeof account.id !== 'string'
@@ -78,9 +95,10 @@ function validAccount(params) {
 // is resolved against.
 function accountRoot(params, options = {}) {
   validAccount(params);
+  const kind = validKind(params);
   let account;
   try {
-    account = require('./node-transcript.js').nodeAccount({ kind: 'claude', account: params.account }, options);
+    account = require('./node-transcript.js').nodeAccount({ kind, account: params.account }, options);
   } catch (error) { throw refused(error.message); }
   let stat;
   try { stat = fs.statSync(account.root); } catch { stat = null; }
@@ -88,14 +106,33 @@ function accountRoot(params, options = {}) {
   return account.root;
 }
 
+// A Codex rollout's shape: dated under `sessions/`, or flat under `archived_sessions/`
+// for a child thread. The root rollout names the session at the end of its file name;
+// an archived root is refused by name, as the account handoff refuses one. Child
+// rollouts name their own threads, so the shape is all that can be checked here, and
+// a read checks the file's own session_meta besides (codexRolloutReadable).
+function codexScopedParts(parts, relPath, sessionId) {
+  const name = parts[parts.length - 1];
+  if (parts[0] === 'sessions' && parts.length === 5 && /^\d{4}$/.test(parts[1]) && /^\d{2}$/.test(parts[2])
+      && /^\d{2}$/.test(parts[3]) && ROLLOUT_NAME_RE.test(name)) return parts;
+  if (parts[0] === 'archived_sessions' && parts.length === 2 && ROLLOUT_NAME_RE.test(name)) {
+    if (name.endsWith(`-${sessionId}.jsonl`)) {
+      throw coded(`Codex session ${sessionId} is archived on this node; unarchive it before moving it`, 'artifacts-archived');
+    }
+    return parts;
+  }
+  throw refused(`${relPath} is not an artifact of session ${sessionId}`);
+}
+
 // A relative path the session's artifacts can have, split into its parts, or a
 // refusal. The shapes are exactly the ones account-artifacts moves between accounts.
-function scopedParts(relPath, sessionId) {
+function scopedParts(relPath, sessionId, kind = 'claude') {
   if (typeof relPath !== 'string' || !relPath || relPath.length > 4096 || relPath.includes('\\')) {
     throw invalid('artifacts path must be a relative path');
   }
   const parts = relPath.split('/');
   if (!parts.every((part) => plainName(part, NAME_RE))) throw invalid(`artifacts path has a part that is not a plain name: ${relPath}`);
+  if (kind === 'codex') return codexScopedParts(parts, relPath, sessionId);
   if (parts[0] === 'projects' && parts.length >= 3 && plainName(parts[1], SLUG_RE)) {
     if (parts.length === 3 && parts[2] === `${sessionId}.jsonl`) return parts;
     if (parts.length >= 4 && (parts[2] === sessionId || parts[2].startsWith(`${sessionId}.superseded-`))) return parts;
@@ -202,7 +239,53 @@ function walkTree(root, parts, out) {
   }
 }
 
-function artifactParts(root, sessionId) {
+// A Codex session's rollouts: the root, found by its session_meta id, and every child
+// rollout reachable through parent_thread_id, walked by the same scan and graph the
+// account handoff's forced copy uses (bin/codex-account-artifacts.js): a link, an
+// unsupported entry, an ambiguous id or a cyclic graph anywhere refuses the list.
+function codexArtifactParts(root, sessionId) {
+  const artifacts = require('./codex-account-artifacts.js');
+  let index;
+  try { index = artifacts.scanProfile({ root }); } catch (error) { throw refused(error.message); }
+  const roots = index.byId.get(sessionId) || [];
+  if (!roots.length) throw coded(`no Codex rollout for ${sessionId} on this node`, 'artifacts-missing');
+  if (roots.some((entry) => entry.relative.split(path.sep)[0] === 'archived_sessions')) {
+    throw coded(`Codex session ${sessionId} is archived on this node; unarchive it before moving it`, 'artifacts-archived');
+  }
+  if (roots.length === 1 && roots[0].parent) throw refused(`${sessionId} is a child thread of ${roots[0].parent}; move the conversation it belongs to`);
+  let graph;
+  try { graph = artifacts.graphFromRollouts(sessionId, index); } catch (error) { throw refused(error.message); }
+  const files = graph.map((node) => node.relative.split(path.sep));
+  for (const parts of files) codexScopedParts(parts, parts.join('/'), parts === files[0] ? sessionId : '');
+  if (!files[0][files[0].length - 1].endsWith(`-${sessionId}.jsonl`)) {
+    throw refused(`the rollout of ${sessionId} is not named for it (${files[0].join('/')})`);
+  }
+  return { projectName: null, files };
+}
+
+// Whether an open rollout may be read for this session: it is the session's own (its
+// session_meta names it) or a child thread's (it names a parent). Never another
+// top-level conversation of the account, whose file name merely has the shape.
+function codexRolloutReadable(fd, size, sessionId) {
+  const buffer = Buffer.alloc(Math.min(size, META_MAX_BYTES));
+  let got = 0;
+  while (got < buffer.length) {
+    const n = fs.readSync(fd, buffer, got, buffer.length - got, got);
+    if (!n) break;
+    got += n;
+  }
+  const text = buffer.subarray(0, got).toString('utf8');
+  const newline = text.indexOf('\n');
+  let row = null;
+  try { row = JSON.parse(newline === -1 ? text : text.slice(0, newline)); } catch {}
+  const meta = row && row.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
+  if (!meta) return false;
+  if ((meta.id || meta.session_id) === sessionId) return true;
+  return Boolean(meta.parent_thread_id || (meta.source && meta.source.subagent));
+}
+
+function artifactParts(root, sessionId, kind = 'claude') {
+  if (kind === 'codex') return codexArtifactParts(root, sessionId);
   const projects = path.join(root, 'projects');
   const projectsStat = lstatOrNull(projects);
   if (projectsStat && (projectsStat.isSymbolicLink() || !projectsStat.isDirectory())) throw refused('projects is not a plain directory');
@@ -240,8 +323,8 @@ function artifactParts(root, sessionId) {
   return { projectName: transcripts[0][1], files };
 }
 
-async function list(root, sessionId) {
-  const { projectName, files } = artifactParts(root, sessionId);
+async function list(root, sessionId, kind = 'claude') {
+  const { projectName, files } = artifactParts(root, sessionId, kind);
   const out = [];
   let bytes = 0;
   for (const parts of files) {
@@ -261,8 +344,8 @@ function wholeNumber(value, label, max = Number.MAX_SAFE_INTEGER) {
   return value;
 }
 
-function read(root, params) {
-  const parts = scopedParts(params.relPath, params.sessionId);
+function read(root, params, kind = 'claude') {
+  const parts = scopedParts(params.relPath, params.sessionId, kind);
   const from = wholeNumber(params.from, 'artifacts read from');
   const length = wholeNumber(params.length, 'artifacts read length', REQUEST_MAX_BYTES);
   const file = resolveUnder(root, parts);
@@ -275,6 +358,9 @@ function read(root, params) {
   try {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile()) throw refused(`${params.relPath} is not a regular file`);
+    if (kind === 'codex' && !codexRolloutReadable(fd, stat.size, params.sessionId)) {
+      throw refused(`${params.relPath} is not a rollout of session ${params.sessionId} or of one of its threads`);
+    }
     const want = Math.max(0, Math.min(length, stat.size - from));
     const buffer = Buffer.alloc(want);
     let got = 0;
@@ -318,10 +404,10 @@ function decodeBytes(value) {
   return bytes;
 }
 
-async function stage(root, params) {
+async function stage(root, params, kind = 'claude') {
   const sessionId = params.sessionId;
   const tx = validTx(params);
-  const parts = scopedParts(params.relPath, sessionId);
+  const parts = scopedParts(params.relPath, sessionId, kind);
   const size = wholeNumber(params.size, 'artifacts stage size', TX_MAX_BYTES);
   const from = wholeNumber(params.from, 'artifacts stage from', size);
   if (typeof params.sha256 !== 'string' || !HASH_RE.test(params.sha256)) throw invalid('artifacts stage needs the file\'s sha256');
@@ -389,7 +475,7 @@ function writeProvenance(root, sessionId, files, extra = {}) {
   writeJson(provenanceFile(root, sessionId, true), { version: 1, sessionId, files, updatedAt: Date.now(), ...extra });
 }
 
-async function publish(root, params) {
+async function publish(root, params, kind = 'claude') {
   const sessionId = params.sessionId;
   const tx = validTx(params);
   if (!Array.isArray(params.entries) || !params.entries.length || params.entries.length > MAX_FILES) {
@@ -400,13 +486,15 @@ async function publish(root, params) {
     if (!entry || typeof entry !== 'object' || typeof entry.sha256 !== 'string' || !HASH_RE.test(entry.sha256)) {
       throw invalid('each published entry names a path and a sha256');
     }
-    const parts = scopedParts(entry.relPath, sessionId);
+    const parts = scopedParts(entry.relPath, sessionId, kind);
     if (seen.has(entry.relPath)) throw invalid(`${entry.relPath} is published twice`);
     seen.add(entry.relPath);
     return { relPath: entry.relPath, sha256: entry.sha256, size: wholeNumber(entry.size, 'published size', TX_MAX_BYTES), parts };
   });
-  if (!entries.some((entry) => entry.parts[0] === 'projects' && entry.parts.length === 3)) {
-    throw invalid('a publish carries the session\'s transcript');
+  if (kind === 'codex'
+    ? !entries.some((entry) => entry.parts[0] === 'sessions' && entry.parts[4].endsWith(`-${sessionId}.jsonl`))
+    : !entries.some((entry) => entry.parts[0] === 'projects' && entry.parts.length === 3)) {
+    throw invalid(kind === 'codex' ? 'a publish carries the session\'s root rollout' : 'a publish carries the session\'s transcript');
   }
   const dir = txDir(root, tx, false);
   const meta = lstatOrNull(dir) ? readMeta(dir) : null;
@@ -453,8 +541,8 @@ async function publish(root, params) {
 
 // The session has moved away from this account: what is here now is a copy the
 // session left behind, and a later move back may replace it.
-async function release(root, sessionId) {
-  const listed = await list(root, sessionId);
+async function release(root, sessionId, kind = 'claude') {
+  const listed = await list(root, sessionId, kind);
   const owned = (readProvenance(root, sessionId) || {}).files || {};
   const files = { ...owned, ...Object.fromEntries(listed.files.map((file) => [file.relPath, file.sha256])) };
   writeProvenance(root, sessionId, files, { released: true });
@@ -496,16 +584,17 @@ async function handle(params, options = {}) {
   if (params.op === 'cwd') return cwd(params);
   if (params.op === 'drop-session') return dropSession(params, options);
   const root = accountRoot(params, options);
+  const kind = validKind(params);
   // Asked before a move stops anything: the account is one this node has configured,
   // and its directory is there to receive the session.
   if (params.op === 'account') return { account: params.account.id, directory: true };
   if (params.op === 'abort') return abort(root, params);
   const sessionId = validSession(params);
-  if (params.op === 'list') return list(root, sessionId);
-  if (params.op === 'read') return read(root, params);
-  if (params.op === 'stage') return stage(root, params);
-  if (params.op === 'publish') return publish(root, params);
-  return release(root, sessionId);
+  if (params.op === 'list') return list(root, sessionId, kind);
+  if (params.op === 'read') return read(root, params, kind);
+  if (params.op === 'stage') return stage(root, params, kind);
+  if (params.op === 'publish') return publish(root, params, kind);
+  return release(root, sessionId, kind);
 }
 
 module.exports = {

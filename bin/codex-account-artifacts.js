@@ -685,4 +685,6 @@ function rebindLedger(sessionId, source, target, transactionId, options = {}) {
   return { ...publicPlan(plan), rebound };
 }
 
-module.exports = { preflight, copyCodexArtifacts, rebindLedger };
+// scanProfile and graphFromRollouts are also how a node lists a Codex session's
+// rollouts for a move between nodes (bin/session-artifacts.js).
+module.exports = { preflight, copyCodexArtifacts, rebindLedger, scanProfile, graphFromRollouts };

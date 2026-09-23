@@ -1,5 +1,6 @@
 'use strict';
-// Carries one Claude session's artifacts from one end to the other: this machine's
+// Carries one session's artifacts (Claude's, or a Codex session's rollouts when the
+// account is a Codex one) from one end to the other: this machine's
 // account (in-process, bin/session-artifacts.js) or a node's (its host's `artifacts`
 // verb, through serve.js nodeArtifacts). Both ends speak the same interface, so a push
 // to a node and a pull from one are the same walk with the ends swapped:
@@ -25,7 +26,8 @@ function failure(message, code = 'KEEP_MOVE_ARTIFACTS') {
 // This machine's end: the same module a node's host runs, called in-process with
 // this machine's account configuration.
 function localArtifacts(account, options = {}) {
-  const handle = (params) => require('./session-artifacts.js').handle({ ...params, account: { id: account.id, configDir: account.configDir } },
+  const handle = (params) => require('./session-artifacts.js').handle({ ...params, account: { id: account.id, configDir: account.configDir },
+    ...(account.agent === 'codex' ? { kind: 'codex' } : {}) },
     { env: options.env || process.env, ...(options.accounts ? { accounts: options.accounts } : {}) });
   return endpoint(handle, { where: options.where || 'this machine' });
 }
@@ -91,7 +93,8 @@ async function carryFile(from, to, sessionId, tx, file, pieceBytes) {
 async function transfer({ sessionId, tx, from, to, pieceBytes = PIECE_BYTES }) {
   const listed = await from.list(sessionId);
   const source = manifest(listed);
-  if (![...source.keys()].some((relPath) => /^projects\/[^/]+\/[^/]+\.jsonl$/.test(relPath))) {
+  const rootRollout = new RegExp(`^sessions/\\d{4}/\\d{2}/\\d{2}/rollout-[^/]*-${String(sessionId).replace(/[^A-Za-z0-9_-]/g, '')}\\.jsonl$`);
+  if (![...source.keys()].some((relPath) => /^projects\/[^/]+\/[^/]+\.jsonl$/.test(relPath) || rootRollout.test(relPath))) {
     throw failure(`${from.where} listed no transcript for ${sessionId}`);
   }
   for (const file of source.values()) await carryFile(from, to, sessionId, tx, file, pieceBytes);

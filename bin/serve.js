@@ -3980,22 +3980,34 @@ async function deliveryReceiptFor(entry, deps = {}, timeoutMs = 0) {
 // push to a node and a pull from one are one walk with the ends swapped. The node
 // re-validates the account and builds every path itself; nothing here names a path on
 // the node beyond the relative ones its own list returned.
+// node -> { at, version }: when its host last said it answers the verb, and which one.
 const nodeArtifactsCapability = new Map();
 const NODE_ARTIFACTS_CAPABILITY_MS = 60e3;
+// The artifacts verb version a Codex session's move needs: 2 carries its rollouts.
+const CODEX_ARTIFACTS_VERSION = 2;
 const ARTIFACTS_TIMEOUT_MS = { list: 120e3, read: 30e3, stage: 30e3, publish: 120e3, release: 120e3, abort: 30e3, cwd: 8e3, 'drop-session': 8e3, account: 8e3 };
 
-async function requireNodeArtifacts(node, deps = {}) {
+// `minimum` is the verb version the move needs: 1 for a Claude session, 2 for a Codex
+// one. A host that answers an older one is refused by name, never asked and left to
+// fail on a kind it does not know.
+async function requireNodeArtifacts(node, deps = {}, minimum = 1) {
   const now = Date.now();
   const known = nodeArtifactsCapability.get(node);
-  if (known && now - known < NODE_ARTIFACTS_CAPABILITY_MS) return;
+  if (known && now - known.at < NODE_ARTIFACTS_CAPABILITY_MS && known.version >= minimum) return;
   const hello = await (deps.hostRequest || hostRequest)('hello', {}, { ...deps, node });
-  if (!hello || !(Number(hello.artifacts) >= 1) || !(Number(hello.transcript) >= 1)) {
+  const version = hello ? Number(hello.artifacts) : 0;
+  if (!hello || !(version >= 1) || !(Number(hello.transcript) >= 1)) {
     nodeArtifactsCapability.delete(node);
     throw new InjectionError(409,
       `the terminal host on ${node} predates the artifacts verb, so no session can be moved to or from it; update keep-tool on ${node} and reload its host`,
       { reason: 'remote-node' });
   }
-  nodeArtifactsCapability.set(node, now);
+  nodeArtifactsCapability.set(node, { at: now, version });
+  if (!(version >= minimum)) {
+    throw new InjectionError(409,
+      `the terminal host on ${node} predates Codex moves (its artifacts verb is version ${version}), so no Codex session can be moved to or from it; update keep-tool on ${node} and reload its host`,
+      { reason: 'remote-node' });
+  }
 }
 
 function nodeArtifacts(node, account, deps = {}) {
@@ -4006,8 +4018,10 @@ function nodeArtifacts(node, account, deps = {}) {
     if (!unscoped && (!account || typeof account.id !== 'string' || typeof account.configDir !== 'string')) {
       throw new InjectionError(400, 'nodeArtifacts needs an account with an id and a config directory');
     }
-    await requireNodeArtifacts(node, deps);
-    const scoped = unscoped ? params : { ...params, account: { id: account.id, configDir: account.configDir } };
+    // A Codex account's files are its rollouts: the node is told so, and must know how.
+    const codex = Boolean(account && account.agent === 'codex');
+    await requireNodeArtifacts(node, deps, codex ? CODEX_ARTIFACTS_VERSION : 1);
+    const scoped = unscoped ? params : { ...params, account: { id: account.id, configDir: account.configDir }, ...(codex ? { kind: 'codex' } : {}) };
     return (deps.hostRequest || hostRequest)('artifacts', scoped,
       { ...deps, node, hostRequestTimeoutMs: ARTIFACTS_TIMEOUT_MS[params.op] || HOST_REQUEST_TIMEOUT_MS });
   };
