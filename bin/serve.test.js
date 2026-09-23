@@ -16235,6 +16235,111 @@ test('a fresh Codex card open on aws1 with no message returns pending with a lau
     `pane ${after.again.pane} on node aws1 is already running this open; its session is pending: it registers at its first turn and is then linked to card; open it in the console`);
 });
 
+test('an open\'s own adoption whose pane bind fails or settles on another session learns nothing and drops the launch record', async () => {
+  const { adoptNodeCodexLaunch } = require('./serve');
+  const lateAdoption = require('./late-adoption.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-adopt-bind-'));
+  try {
+    const project = path.join(root, 'project');
+    const launchedAt = 1_700_000_000_000;
+    const launch = { pane: 'p1@aws1', pid: 11, createdAt: 12 };
+    const account = { id: 'codex-node', configDir: '/home/node/.codex-node' };
+    const expected = { agent: 'codex', accountId: account.id, requestId: 'open-bind-1', launchedAt, project, model: '',
+      node: 'aws1', account };
+    const baseMeta = { agent: 'codex', accountId: account.id, openRequestId: 'open-bind-1', launchedAt, project };
+    const run = async (mode) => {
+      lateAdoption.recordNodeCodexLaunch(root, { node: 'aws1', requestId: 'open-bind-1', accountId: account.id, launchedAt, pane: 'p1', project });
+      let bound = null;
+      const pins = [];
+      const hostRequest = async (type, params) => {
+        if (type === 'hello') return { transcript: 2 };
+        if (type === 'transcript') return { rollouts: [{ id: 'found-session' }] };
+        if (type === 'get') return { pane: { id: launch.pane, alive: true, pid: 11, createdAt: 12, meta: { ...baseMeta, ...(bound ? { sessionId: bound } : {}) } } };
+        if (type === 'meta') {
+          if (mode === 'throws') throw new Error('host went away');
+          bound = mode === 'other' ? 'someone-else' : params.patch.sessionId;
+          return {};
+        }
+        throw new Error(`unexpected ${type}`);
+      };
+      const result = await adoptNodeCodexLaunch(launch, expected, {
+        root, daemonNode: 'main', hostRequest, codexOwnsPane: async () => true, accountForSession: () => null,
+        pinSession: (id) => pins.push(id),
+      });
+      return { result, pins, record: lateAdoption.readNodeCodexLaunch(root, 'aws1', 'open-bind-1') };
+    };
+    const ok = await run('ok');
+    assert.equal(ok.result.sessionId, 'found-session');
+    assert.ok(ok.record, 'a held bind leaves the record for the open to consume');
+    lateAdoption.consumeNodeCodexLaunch(root, 'aws1', 'open-bind-1');
+    for (const mode of ['throws', 'other']) {
+      const { result, record } = await run(mode);
+      assert.equal(result.sessionId, null, mode);
+      assert.equal(result.launchDropped, true, mode);
+      assert.match(result.why, mode === 'throws' ? /could not be bound to .*host went away/ : /was bound to someone-else instead/);
+      assert.equal(record, null, `${mode}: nothing is left for late adoption to take`);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// A card open on aws1 against a fake aws1 host that records every request. `options`
+// overrides deps; `options.host(type, params, state)` answers a request first when it
+// returns something. Resolves { opened, error, calls, linked, released, order, listed, root }.
+async function remoteCardOpen(t, body, options = {}) {
+  const { closeHostClient } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-remote-card-open-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, 'project');
+  fs.mkdirSync(project);
+  const { host, ...extra } = options;
+  const state = { calls: [], meta: null, order: [], linked: [], released: [], listed: 0 };
+  const client = {
+    request: async (type, params = {}) => {
+      state.calls.push({ type, params });
+      const answered = host ? await host(type, params, state) : undefined;
+      if (answered !== undefined) return answered;
+      if (type === 'hello') return { bootId: 'aws1-boot', spawnReceipts: true, transcript: 2 };
+      if (type === 'spawn') { state.meta = params.meta; return { pane: { id: 'p1', pid: 5, createdAt: 6 } }; }
+      if (type === 'get') return { pane: { id: 'p1', alive: true, pid: 5, createdAt: 6, meta: state.meta } };
+      if (type === 'transcript') return { rollouts: [] };
+      if (type === 'list') return { panes: [] };
+      return {};
+    },
+    close() {},
+    onDisconnect: () => ({ dispose() {} }),
+  };
+  await closeHostClient();
+  let opened = null;
+  let error = null;
+  try {
+    opened = await openSession({ taskId: 'card', fresh: true, node: 'aws1', requester: 'handing-session', ...body }, {
+      root, env: { PATH: process.env.PATH, HOME: root, KEEP_DIR: root, KEEP_DAEMON_NODE: 'main' },
+      placementNodes: [{ name: 'main', capabilities: [] }, { name: 'aws1', capabilities: [] }],
+      connectHost: async () => client,
+      listHostPanes: async () => { state.listed += 1; return []; },
+      loadTask: () => ({ id: 'card', fm: { project, sessions: [] } }),
+      waitForHostAgent: async () => true, trustProject: () => true, codexFlags: '', claudeFlags: '',
+      prepareLaunch: async (launch) => ({ argv: [launch.agent], command: launch.agent }),
+      typeOpeningMessage: async () => {},
+      linkLaunchedSession: (cardId, entry) => { state.order.push('link'); state.linked.push({ cardId, entry }); return { linked: entry.id }; },
+      releaseCardSession: (cardId, requester) => { state.order.push('release'); state.released.push({ cardId, requester }); return true; },
+      ...extra,
+    });
+  } catch (caught) { error = caught; } finally { await closeHostClient(); }
+  return { opened, error, root, project, ...state };
+}
+
+test('a pending card open on aws1 whose own adoption dropped the launch record fails, and the requester keeps the card', async (t) => {
+  const run = await remoteCardOpen(t, { agent: 'codex', requestId: 'open-dropped-1' }, {
+    adoptNodeCodexLaunch: async () => ({ sessionId: null, why: 'host pane p1@aws1 was bound to someone-else instead', launchDropped: true }),
+  });
+  assert.ok(run.error, 'the open fails');
+  assert.equal(run.error.status, 504);
+  assert.match(run.error.message, /could not be registered: host pane p1@aws1 was bound to someone-else instead/);
+  assert.deepEqual(run.released, [], 'the requester keeps the card');
+  assert.deepEqual(run.linked, []);
+});
+
 test('a fresh Codex on aws1 whose launch began no rollout, or two, is not adopted and stays pending', async (t) => {
   const none = await openCodexOnAws1(t, []);
   assert.equal(none.error, null, none.error && none.error.stack);

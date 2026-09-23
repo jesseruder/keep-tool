@@ -9246,7 +9246,7 @@ async function waitForHostAgent(target, agent, deps = {}) {
 
 async function readHostSessionId(pane, deps = {}) {
   try {
-    const result = await hostRequest('get', { pane }, deps);
+    const result = await (deps.hostRequest || hostRequest)('get', { pane }, deps);
     const sessionId = result && result.pane && result.pane.meta && result.pane.meta.sessionId;
     return typeof sessionId === 'string' && /^[A-Za-z0-9_-]+$/.test(sessionId) ? sessionId : null;
   } catch { return null; }
@@ -9254,7 +9254,7 @@ async function readHostSessionId(pane, deps = {}) {
 
 async function verifyFreshOpenPane(launch, expected, deps = {}) {
   let result;
-  try { result = await hostRequest('get', { pane: launch.pane }, deps); }
+  try { result = await (deps.hostRequest || hostRequest)('get', { pane: launch.pane }, deps); }
   catch {
     throw new InjectionError(503, `host pane ${launch.pane} could not be verified after ${expected.agent} opened`);
   }
@@ -9339,12 +9339,33 @@ async function adoptNodeCodexLaunch(launch, expected, deps = {}) {
     });
   } catch (error) { return refuse(error.message); }
   if (authority && authority.id !== expected.account.id) return refuse(`session ${sessionRef(sessionId)} is pinned to account ${authority.id}`);
+  // Pinned before the bind, so the node's hooks for it, once the pane names it, find
+  // it placed and never race late adoption for the launch record.
   (deps.pinSession || accounts.pinSession)(sessionId, 'codex', expected.account.id,
     { root: deps.root || keep.ROOT, env: deps.env || process.env, node });
-  await request('meta', { pane: launch.pane, patch: { sessionId, agent: 'codex', project: expected.project } }, deps);
-  const settled = await readHostSessionId(launch.pane, deps);
-  if (settled !== sessionId) return refuse(`host pane ${launch.pane} was bound to ${settled || 'nothing'} instead`);
-  return { sessionId };
+  let settled = null;
+  let bindError = null;
+  try {
+    await request('meta', { pane: launch.pane, patch: { sessionId, agent: 'codex', project: expected.project } }, deps);
+    settled = await readHostSessionId(launch.pane, deps);
+  } catch (error) { bindError = error; }
+  if (!bindError && settled === sessionId) return { sessionId };
+  // The bind did not hold: the open learns no session, and the launch record goes
+  // too, or late adoption could later take whatever session that pane names.
+  let dropped = false;
+  if (expected.requestId != null) {
+    try {
+      (deps.consumeNodeCodexLaunch || require('./late-adoption.js').consumeNodeCodexLaunch)(
+        deps.root || keep.ROOT, node, expected.requestId);
+      dropped = true;
+    } catch (error) {
+      process.stderr.write(`keep serve: could not drop the Codex launch record for ${launch.pane}: ${error.message}\n`);
+    }
+  }
+  const why = bindError
+    ? `host pane ${launch.pane} could not be bound to ${sessionRef(sessionId)}: ${bindError && bindError.message || bindError}`
+    : `host pane ${launch.pane} was bound to ${settled || 'nothing'} instead`;
+  return { ...refuse(why), ...(dropped ? { launchDropped: true } : {}) };
 }
 
 async function waitForHostSessionId(pane, deps = {}) {
@@ -10484,6 +10505,12 @@ async function openSession(body, deps = {}) {
         launch.sessionId = adopted.sessionId;
         consumeNodeLaunch();
         if (!adopted.sessionId) launch.registrationNote = adopted.why;
+        // A bind that did not hold dropped the launch record: nothing can adopt this
+        // session later, so the open does not say it will.
+        if (!adopted.sessionId && adopted.launchDropped) {
+          nodeLaunchRecorded = false;
+          throw new InjectionError(504, `${agent} started in host pane ${launch.pane} but its session could not be registered: ${adopted.why}`);
+        }
       }
       if (!launch.sessionId) {
         launch.pendingRegistration = true;
