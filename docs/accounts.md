@@ -135,15 +135,18 @@ assignment. Every automation launch — the reviewer, incident responders
   (`defaultAccounts.claude`, or an account with `useDefaultConfig`). The default is the
   owner's interactive account and is only ever spent by automation when
   `automationPool` names it explicitly.
-- The preferred account (`automationAccounts[purpose]`) is used while it has room for
-  the model being run. Otherwise the pool account with the lowest `week` percent wins
+- The preferred account (`automationAccounts[purpose]`) wins only when a current
+  reading shows at least the budget governor's minimum headroom (`KEEP_REVIEW_MIN_HEADROOM`,
+  default 10%, or the model family's `minHeadroom`) on its `week`, the model's own bucket
+  and `5h`. Otherwise it is ranked like the others: the lowest `week` percent wins
   (ties: the model's own weekly bucket, then the `5h` window). An account is spent when
-  its `week` is at 100%, or when the model has its own bucket (Fable: `Fable wk`) and
-  that one is. Opus, Sonnet and Haiku have no bucket of their own, so only the shared
-  week caps them.
-- Readings come from `~/keep/.keep/usage-cache.json`. A missing or stale (over 30
-  minutes) reading is *unknown*: never counted as spent, but ranked after every account
-  with a current reading that shows room.
+  its `week` or `5h` is at 100%, or when the model has its own bucket (Fable:
+  `Fable wk`) and that one is. Opus, Sonnet and Haiku have no bucket of their own, and
+  work that names no model is capped by the `week` and `5h` only.
+- Readings come from `~/keep/.keep/usage-cache.json`. A window at 100% whose reset is
+  unknown or still ahead is spent whatever the reading's age. Otherwise a missing or
+  stale (over 30 minutes) reading is *unknown*: ranked after every account with a
+  current reading that shows room.
 - When every pool account is spent the work is **deferred**, not launched into a
   refusal: `keep reviewer` refuses with the retry time and each account's windows; an
   incident responder reports launch state `deferred` with `retryAt` without spending a
@@ -151,10 +154,16 @@ assignment. Every automation launch — the reviewer, incident responders
   `landed`, `standup` and ideas skip and try again on their own schedule. `retryAt` is
   the earliest reset among the spent accounts, or 30 minutes when none is known. The
   `account-budget` row in `keep health` reads "automation pool exhausted until
-  ‹time›" while anything is deferred, and clears on the next successful selection.
+  ‹time›" while anything is deferred (reset times already passed are dropped), and any
+  later successful selection, for any purpose, clears it.
 - With an empty pool — a single Claude account, or `"automationPool": []` — every
   purpose runs on its fixed `automationAccounts` entry exactly as before, and the
-  rate-limit handoff below only acts on `rateLimitHandoff` keys.
+  rate-limit handoff below only acts on `rateLimitHandoff` keys. An `automationPool`
+  that cannot be used is reported once per process on stderr (`keep accounts:
+  automationPool ignored: …`) and treated the same way.
+- `repair` (daemon self-repair) also takes its account from the pool. A repair is never
+  deferred: when the pool is spent it launches without a pinned account, as it did when
+  its account could not be resolved.
 
 The fleet reviewer's budget governor reads the windows of the account the live
 reviewer pane was actually launched on (its pane `meta.accountId`), not the config map.
@@ -217,9 +226,9 @@ A queued session shows **Moving to ‹account›** with its last refusal and a *
 }
 ```
 
-Each queue tick enqueues every rate-limited Claude session, without `force`, and the ordinary queue rules above take it from there. `rateLimitHandoff` is an optional **override**: a session on a listed source moves to its named target while that target has room for the session's model. Every other rate-limited session — and a listed one whose target is spent — moves to the [automation pool](#automation-pool)'s best account for its model, never back onto its own source. The pair must name two existing accounts for the same provider and must not name the same account twice; an unusable key is reported on stderr once per tick and ignored rather than guessed at. A target whose `week`, or the session model's own weekly bucket, the usage snapshot shows at 100% is not moved onto; an unknown or stale snapshot is never read as exhausted. When nothing has room the session is held and the tick logs `policy held N session(s)`. A parked or cancelled entry is waiting on a person, so the policy never re-queues it — only the console's **Retry** does.
+Each queue tick enqueues rate-limited Claude sessions, without `force`, and the ordinary queue rules above take it from there. A `rateLimitHandoff` key is the owner's opt-in for a source account: **every** rate-limited session on it moves to the named target while that target has room for the session's model, and to the [automation pool](#automation-pool)'s best account when it does not. On a source with no key, only **unattended** sessions — ones Keep started by itself, whose pane carries `unattended` or `reviewer` — move to the pool's best account; the owner's own sessions stay put. A target is never the session's own source. The model comes from the pane's launch record, else the transcript. A session the queue moved less than 30 minutes ago (`MOVE_COOLDOWN_MS`) is not moved again automatically, so two accounts whose spent 5h windows the snapshot has not caught cannot bounce it back and forth. The pair must name two existing accounts for the same provider and must not name the same account twice; an unusable key is reported on stderr once per tick and ignored rather than guessed at. A target whose `week`, `5h`, or the session model's own weekly bucket the usage snapshot shows at 100% (with that window's reset still ahead) is not moved onto, however old the reading; a missing reading is never read as exhausted. When nothing has room the session is held and the tick logs `policy held N session(s)`. A parked or cancelled entry is waiting on a person, so the policy never re-queues it — only the console's **Retry** does.
 
-With no `rateLimitHandoff` key and an empty automation pool (a single Claude account, or `"automationPool": []`), nothing is ever queued automatically, and the only way a session moves is the single-session button, the batch button, or `keep handoff`. With a pool, the policy runs with no key at all.
+With no `rateLimitHandoff` key and an empty automation pool (a single Claude account, or `"automationPool": []`), nothing is ever queued automatically, and the only way a session moves is the single-session button, the batch button, or `keep handoff`. With a pool, the policy runs with no key at all, for unattended sessions only.
 
 A session that has been auto-compacted carries a permanent job-ledger history gap that no replay can clear. That gap alone no longer refuses a transfer: once the ledger is caught up with no open job, no unresolved call, no unconsumed hook and a completed restart record, the gap only describes history that predates the compaction, and the full restart proof still runs. Every other kind of gap still requires an explicit forced transfer.
 

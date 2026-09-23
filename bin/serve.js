@@ -8540,7 +8540,13 @@ async function handoffPolicySessions(deps = {}) {
     if (!session || !session.rateLimit) continue;
     // The pane's account wins over the transcript's, as it does in addHostSessionState.
     const accountId = typeof pane.meta.accountId === 'string' && pane.meta.accountId ? pane.meta.accountId : session.accountId;
-    sessions.push({ ...session, id, kind: 'claude', pane: pane.id, ...(accountId ? { accountId } : {}) });
+    // The model the policy picks a target for, from the pane's launch record first.
+    const model = launchModelId(pane.meta?.model) || session.model || '';
+    // Whether Keep started it by itself: without a rateLimitHandoff key for its
+    // source, only these are moved onto the automation pool.
+    const unattended = pane.meta?.unattended === true || pane.meta?.reviewer === true;
+    sessions.push({ ...session, id, kind: 'claude', pane: pane.id, ...(accountId ? { accountId } : {}),
+      ...(model ? { model } : {}), unattended });
   }
   return sessions;
 }

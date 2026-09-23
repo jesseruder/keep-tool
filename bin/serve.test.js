@@ -11962,6 +11962,26 @@ test('the rate-limit policy reads only live Claude panes, with the pane account 
   assert.deepEqual(await handoffPolicySessions({ listHostPanes: async () => null, claudeSessionFor: () => assert.fail() }), []);
 });
 
+test('the rate-limit policy rows carry the pane\'s launch model and whether Keep started the session', async () => {
+  const { handoffPolicySessions } = require('./serve.js');
+  const panes = [
+    { id: 'p1', alive: true, meta: { sessionId: 'reviewer', agent: 'claude', model: 'claude-fable-5-1', reviewer: true } },
+    { id: 'p2', alive: true, meta: { sessionId: 'responder', agent: 'claude', model: 'opus', unattended: true } },
+    { id: 'p3', alive: true, meta: { sessionId: 'mine', agent: 'claude' } },
+  ];
+  const sessions = await handoffPolicySessions({
+    listHostPanes: async () => panes,
+    claudeSessionFor: (id) => ({ id, kind: 'claude', accountId: 'one', rateLimit: { at: 5 },
+      ...(id === 'mine' ? { model: 'claude-sonnet-5' } : {}) }),
+  });
+  assert.deepEqual(sessions.map((row) => [row.id, row.model, row.unattended]), [
+    ['reviewer', 'claude-fable-5-1', true],
+    ['responder', 'opus', true],
+    // No launch model on the pane: the transcript's.
+    ['mine', 'claude-sonnet-5', false],
+  ]);
+});
+
 test('a host request timeout releases the injection lock', async () => {
   const host = { request: async () => new Promise(() => {}) };
   await assert.rejects(hostRequest('get', { pane: 'p' }, { host, hostRequestTimeoutMs: 5 }),

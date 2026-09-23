@@ -36,6 +36,10 @@ const DEFAULT_MAX_MIN = 45;
 const MOVED_VISIBLE_MS = 60 * 60e3;
 const SETTLED_KEEP_MS = 24 * 60 * 60e3;
 const PARKED_KEEP_MS = 7 * 24 * 60 * 60e3;
+// How soon after a session was moved the policy may move it again. Two accounts can
+// each show weekly room with a spent 5h window the snapshot has not caught; without a
+// floor a session would bounce between them on every tick.
+const MOVE_COOLDOWN_MS = 30 * 60e3;
 
 const SESSION_RE = /^[A-Za-z0-9_-]+$/;
 // The session-id shape bin/portable-handoff.js and serve.js already validate. A
@@ -194,9 +198,10 @@ function accountOf(session) {
 }
 
 // Whether the account a session would be moved onto has no room for its model: the
-// shared week or the model's own weekly bucket spent (with no model known, any
-// model bucket). bin/account-budget.js reads it: an unknown or stale snapshot is
-// never "exhausted", because guessing wrong would silently stop the policy.
+// shared week, the 5h window or the model's own weekly bucket spent (with no model
+// known, the week and 5h only). bin/account-budget.js reads it: any reading showing a
+// window at 100% with its reset still ahead counts, however old; a missing snapshot
+// is never "exhausted", because guessing wrong would silently stop the policy.
 function targetExhausted(usage, accountId, model, now) {
   const [row] = accountBudget.rank([accountId], usage, { model, now });
   return Boolean(row && row.exhausted);
@@ -243,8 +248,11 @@ async function policyEnqueue(root, loadSessions, now, deps, log) {
   for (const session of sessions) {
     const sourceAccountId = accountOf(session);
     if (!sourceAccountId || session.kind !== 'claude' || !session.rateLimit || !session.pane) continue;
-    // Neither an override for this source nor a pool to choose from.
-    if (!map[sourceAccountId] && !poolIds.length) continue;
+    // Neither an override for this source nor a pool to choose from. Without a key for
+    // its source, the pool only takes unattended work (the reviewer, responders, other
+    // sessions Keep started by itself): the owner's own sessions move automatically only
+    // off a source they opted in with a rateLimitHandoff key.
+    if (!map[sourceAccountId] && (!poolIds.length || session.unattended !== true)) continue;
     // A transfer stops an agent and proves it from a process table; a session on
     // another machine answers none of that here, and the retry this entry promises
     // could only ever be refused. Never enqueued at all.
@@ -253,6 +261,9 @@ async function policyEnqueue(root, loadSessions, now, deps, log) {
     // overrules that, so only the console's Retry starts one of those again.
     const current = readOne(root, session.id);
     if (current && ['queued', 'parked', 'cancelled'].includes(current.status)) continue;
+    // Moved a moment ago: an automatic move never chains faster than the cooldown.
+    if (current && current.status === 'moved'
+        && now - Number(current.movedAt || current.updatedAt || 0) < MOVE_COOLDOWN_MS) continue;
     if (usage === undefined) usage = deps.readUsageCache ? deps.readUsageCache() : null;
     const model = session.model || undefined;
     let targetAccountId = map[sourceAccountId] || null;
@@ -526,7 +537,7 @@ function batch(deps = {}) {
 }
 
 module.exports = {
-  BACKOFF_BASE_MS, BACKOFF_MAX_MS, DEFAULT_MAX_MIN, MOVED_VISIBLE_MS, STATUSES,
+  BACKOFF_BASE_MS, BACKOFF_MAX_MS, DEFAULT_MAX_MIN, MOVED_VISIBLE_MS, MOVE_COOLDOWN_MS, STATUSES,
   dir, readOne, list, visible, enqueue, cancel, tick, batch, backoffMs, maxMinutes, policyTargets, targetExhausted,
   transferPastStop,
 };

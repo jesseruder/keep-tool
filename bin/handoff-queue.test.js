@@ -200,7 +200,7 @@ test('the policy enqueues only configured sources, holds an exhausted target, an
   const f = fixture();
   f.write({ rateLimitHandoff: { one: 'two' } });
   const sessions = [
-    session({ id: 'session-a' }),
+    session({ id: 'session-a', model: 'claude-fable-5-1' }),
     session({ id: 'session-b', accountId: 'two' }),
     session({ id: 'session-c', rateLimit: null }),
     session({ id: 'session-d', kind: 'codex' }),
@@ -234,10 +234,58 @@ test('the policy enqueues only configured sources, holds an exhausted target, an
   await queue.tick(deps(null));
   assert.deepEqual(queue.list(f.root), []);
 
-  // No key with a pool: the policy runs, and the pool names the target.
+  // No key with a pool: the owner's own session stays where it is...
   f.write();
   await queue.tick(deps(null));
+  assert.deepEqual(queue.list(f.root), []);
+
+  // ...and an unattended one moves to the account the pool names.
+  sessions[0] = session({ id: 'session-a', model: 'claude-fable-5-1', unattended: true });
+  await queue.tick(deps(null));
   assert.deepEqual(queue.list(f.root).map((entry) => [entry.sessionId, entry.targetAccountId]), [['session-a', 'two']]);
+});
+
+test('a source with a rateLimitHandoff key moves attended sessions too, to its target and else the pool', async () => {
+  const f = fixture();
+  const three = path.join(f.base, 'three');
+  fs.mkdirSync(three, { recursive: true });
+  const config = JSON.parse(fs.readFileSync(f.config, 'utf8'));
+  config.accounts.push({ id: 'three', label: 'Three', agent: 'claude', configDir: three });
+  config.rateLimitHandoff = { one: 'two' };
+  fs.writeFileSync(f.config, JSON.stringify(config));
+  // Attended: no `unattended` mark.
+  const sessions = [session({ id: 'session-a', model: 'claude-opus-5' })];
+  await queue.tick({ root: f.root, env: f.env, now: () => T, log: () => {}, sessions: async () => sessions,
+    readUsageCache: () => ({ accounts: { two: reading([{ label: 'week', percent: 100 }]), three: reading([{ label: 'week', percent: 20 }]) } }),
+    handoffSession: async () => { throw Object.assign(new Error('Waiting for the turn and background work to finish'), { status: 409 }); } });
+  assert.deepEqual(queue.list(f.root).map((entry) => entry.targetAccountId), ['three']);
+});
+
+test('a session moved less than the cooldown ago is not moved again by the policy', async () => {
+  const f = fixture();
+  const three = path.join(f.base, 'three');
+  fs.mkdirSync(three, { recursive: true });
+  const config = JSON.parse(fs.readFileSync(f.config, 'utf8'));
+  config.accounts.push({ id: 'three', label: 'Three', agent: 'claude', configDir: three });
+  fs.writeFileSync(f.config, JSON.stringify(config));
+  // Moved from two to three a minute ago, and rate-limited again on arrival: both
+  // accounts show weekly room, their 5h windows not yet in the snapshot.
+  queue.enqueue(f.root, { sessionId: 'session-a', pane: 'pane-1', sourceAccountId: 'two', targetAccountId: 'three' },
+    { now: T - 2 * 60e3, log: () => {} });
+  const file = path.join(queue.dir(f.root), 'session-a.json');
+  const moved = { ...JSON.parse(fs.readFileSync(file, 'utf8')), status: 'moved', movedAt: T - 60e3, updatedAt: T - 60e3 };
+  fs.writeFileSync(file, JSON.stringify(moved));
+  const sessions = [session({ id: 'session-a', accountId: 'three', unattended: true, model: 'claude-opus-5' })];
+  const calls = [];
+  const run = (at) => queue.tick({ root: f.root, env: f.env, now: () => at, log: () => {}, sessions: async () => sessions,
+    readUsageCache: () => ({ accounts: { two: reading([{ label: 'week', percent: 10 }]), three: reading([{ label: 'week', percent: 20 }]) } }),
+    handoffSession: async (body) => { calls.push(body); throw Object.assign(new Error('Waiting for the turn and background work to finish'), { status: 409 }); } });
+  await run(T);
+  assert.equal(entryFor(f.root, 'session-a').status, 'moved', 'held inside the cooldown');
+  assert.deepEqual(calls, []);
+  await run(T - 60e3 + queue.MOVE_COOLDOWN_MS);
+  assert.equal(entryFor(f.root, 'session-a').status, 'queued', 'eligible again once the cooldown has passed');
+  assert.equal(entryFor(f.root, 'session-a').targetAccountId, 'two');
 });
 
 test('the pool names the target when the configured one is spent, holds when every candidate is, and the override wins while usable', async () => {
@@ -279,10 +327,11 @@ test('the pool names the target when the configured one is spent, holds when eve
   assert.deepEqual(queue.list(f.root).map((entry) => entry.targetAccountId), ['two']);
   clear();
 
-  // With no override, the pool's best account (never the source, never the default).
+  // With no override, an unattended session goes to the pool's best account (never
+  // the source, never the default).
   config.rateLimitHandoff = undefined;
   fs.writeFileSync(f.config, JSON.stringify(config));
-  sessions[0] = session({ id: 'session-a', accountId: 'two', model: 'claude-fable-5-1' });
+  sessions[0] = session({ id: 'session-a', accountId: 'two', model: 'claude-fable-5-1', unattended: true });
   await run({ accounts: {
     one: reading([{ label: 'week', percent: 0 }]),
     two: reading([{ label: 'week', percent: 100 }]),
@@ -331,19 +380,27 @@ test('an unusable rateLimitHandoff key is reported and ignored, never guessed at
   assert.deepEqual(queue.policyTargets(f.env), { one: 'two' });
 });
 
-test('the target check reads only weekly windows, and unknown or stale usage is never exhausted', () => {
+test('the target check: a spent window counts however old the reading, a missing one never does', () => {
   const spent = (limits, fetchedAt = T - 60e3) => ({ accounts: { two: { identity: { agent: 'claude' }, snapshot: { limits, fetchedAt } } } });
   assert.equal(queue.targetExhausted(null, 'two', undefined, T), false);
   assert.equal(queue.targetExhausted({ accounts: {} }, 'two', undefined, T), false);
   assert.equal(queue.targetExhausted(spent([]), 'two', undefined, T), false);
-  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 10 }, { label: '5h', percent: 100 }]), 'two', undefined, T), false);
-  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 10 }, { label: 'Fable wk', percent: 99.4 }]), 'two', undefined, T), false);
-  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 10 }, { label: 'Fable wk', percent: 100 }]), 'two', undefined, T), true);
+  // The 5h window counts: a target that would refuse the continuation on arrival.
+  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 10 }, { label: '5h', percent: 100 }]), 'two', undefined, T), true);
+  const fable = 'claude-fable-5-1';
+  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 10 }, { label: 'Fable wk', percent: 99.4 }]), 'two', fable, T), false);
+  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 10 }, { label: 'Fable wk', percent: 100 }]), 'two', fable, T), true);
   assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 100 }]), 'two', 'claude-opus-5', T), true);
-  // A Fable bucket does not cap an Opus session.
+  // A Fable bucket does not cap an Opus session, nor a session whose model is unknown.
   assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 10 }, { label: 'Fable wk', percent: 100 }]), 'two', 'claude-opus-5', T), false);
-  // Stale is unknown.
-  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 100 }], T - 31 * 60e3), 'two', undefined, T), false);
+  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 10 }, { label: 'Fable wk', percent: 100 }]), 'two', undefined, T), false);
+  // Stale, with no `week`, or with no agent field: a spent window is still spent.
+  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 100 }], T - 31 * 60e3), 'two', undefined, T), true);
+  assert.equal(queue.targetExhausted(spent([{ label: 'Fable wk', percent: 100 }], T - 9 * 3600e3), 'two', fable, T), true);
+  assert.equal(queue.targetExhausted({ accounts: { two: { limits: [{ label: 'Opus wk', percent: 100 }] } } }, 'two', 'claude-opus-5', T), true);
+  // A spent window whose reset has passed is not.
+  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 100, resetsAt: new Date(T - 60e3).toISOString() }], T - 9 * 3600e3),
+    'two', undefined, T), false);
 });
 
 test('the batch selects rate-limited sessions on the named source and reports every skip', () => {
