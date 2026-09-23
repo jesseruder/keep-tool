@@ -4040,9 +4040,12 @@ async function remoteSessionRead(id, deps = {}) {
   const node = sessionNodeOf({ id: sessionId }, deps);
   if (node === daemonNodeName(deps)) return null;
   let location = null;
-  try { location = accounts.sessionLocation(sessionId, { root: deps.root || keep.ROOT, env: deps.env || process.env }); } catch {}
-  if (!location) throw new InjectionError(404, 'no session');
-  if (location.agent !== 'claude') throw remoteDeliveryRefusal({ id: sessionId, node }, deps, location.agent);
+  try { location = (deps.sessionLocation || accounts.sessionLocation)(sessionId, { root: deps.root || keep.ROOT, env: deps.env || process.env }); } catch {}
+  // A session placed on another node whose agent cannot be named is refused by name
+  // (remoteDeliveryRefusal), never called unknown: it exists, and it is not here.
+  if (!location || location.agent !== 'claude') {
+    throw remoteDeliveryRefusal({ id: sessionId, node }, deps, location && location.agent ? location.agent : null);
+  }
   const session = { id: sessionId, kind: 'claude', node };
   const account = nodeTranscriptAccount(session, deps);
   const tail = await nodeTranscript(node, session, deps).tail();

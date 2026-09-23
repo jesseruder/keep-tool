@@ -215,6 +215,24 @@ test('a send a node cannot confirm is refused before anything is typed', async (
   assert.match(serve.remoteDeliveryRefusal({ id: 'x', node: 'aws1' }, deps).message, /a session whose agent is not known on aws1/);
 });
 
+test('a session placed on a node whose agent cannot be named is refused by name, not called unknown', async () => {
+  const sid = 'sess-agent-unknown';
+  const root = authorityRoot(sid, 'aws1');
+  try {
+    const asked = [];
+    const deps = {
+      root,
+      hostNodes: ['main', 'aws1'],
+      sessionLocation: () => null,
+      hostRequest: async (type) => { asked.push(type); throw new Error(`unexpected ${type}`); },
+    };
+    await assert.rejects(serve.loadSessionForAction(sid, deps), (error) => error.status === 409
+      && error.extra.reason === 'remote-node'
+      && /a session whose agent is not known on aws1/.test(error.message));
+    assert.deepEqual(asked, [], 'nothing was asked of the node');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 function authorityRoot(sid, node) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-send-authority-'));
   fs.mkdirSync(path.join(root, '.keep', 'session-accounts'), { recursive: true });
