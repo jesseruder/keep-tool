@@ -629,6 +629,111 @@ async function carriedPostBash(input, where, deps = {}) {
   }
 }
 
+// The Codex hooks a node whose daemon is known carries to it: the daemon runs its own
+// `keep hook codex <action>` for them against the session's rollout mirror.
+const CARRIED_CODEX_ACTIONS = ['start', 'end', 'client-end', 'stop', 'question', 'approval', 'complete', 'lifecycle', 'pre-tool', 'post-tool'];
+
+// A daemon's answer as Codex must hear it: its stdout when that is one JSON value,
+// else nothing (the caller prints `{}`).
+function codexJsonAnswer(value) {
+  const text = String((value && value.stdout) || '').trim();
+  if (!text) return null;
+  try { JSON.parse(text); return text; } catch { return null; }
+}
+
+function codexBlock(reason) {
+  console.log(JSON.stringify({
+    decision: 'block',
+    reason,
+    hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason },
+  }));
+  process.stderr.write(`${reason}\n`);
+  process.exitCode = 2;
+}
+
+// A Codex hook on a node whose daemon is known. Codex waits on every hook for JSON,
+// so every path prints exactly one JSON value: what the daemon's hook printed when
+// that is JSON, `{}` otherwise and on any failure. A pre-tool the daemon did not
+// answer, or answered with anything but a run of its hook that printed JSON, never
+// lets a command through that remoteCommandGuard would refuse; a deny, the daemon's
+// or this node's, is the block JSON and exit 2, as on the daemon node.
+async function carriedCodexHook(action, input, where, deps = {}) {
+  const env = deps.env || process.env;
+  const client = deps.hookClient || require('../hook-client.js');
+  const event = `codex-${action}`;
+  const valid = Boolean(input && typeof input === 'object' && !Array.isArray(input));
+  if (action === 'pre-tool' || action === 'post-tool') {
+    let normalized = null;
+    try { normalized = valid ? codexToolInput(input) : null; } catch { normalized = null; }
+    if (!normalized) { console.log('{}'); return; }
+    if (action === 'pre-tool') {
+      let resume;
+      try { resume = guardResumeCommand(normalized, env); } catch (error) {
+        resume = { deny: true, reason: `keep: the command guard is not available on node ${where.local}: ${error && error.message || error}` };
+      }
+      if (resume.deny) { codexBlock(resume.reason); return; }
+    }
+    let outcome;
+    try { outcome = await client.runCodexToolHook(event, input, normalized, where, deps); } catch (error) {
+      outcome = { delivered: false, why: error && error.message || String(error) };
+    }
+    const value = outcome && outcome.delivered ? outcome.value || {} : null;
+    const answer = value && codexJsonAnswer(value);
+    if (action === 'post-tool') {
+      if (value && value.stderr) process.stderr.write(String(value.stderr));
+      console.log(answer || '{}');
+      return;
+    }
+    if (answer && (value.status === 0 || value.status === 2)) {
+      if (value.stderr) process.stderr.write(String(value.stderr));
+      console.log(answer);
+      if (value.status === 2) process.exitCode = 2;
+      return;
+    }
+    const context = (outcome && outcome.context) || {};
+    const why = value ? `its hook answered ${Number.isInteger(value.status) ? `status ${value.status}` : 'nothing'} without a decision`
+      : (outcome && outcome.why) || 'no answer';
+    let decision;
+    try {
+      decision = remoteCommandGuard(normalized, where, env, {
+        unanswered: why, steps: Array.isArray(context.steps) ? context.steps : [], repairSession: context.repairSession,
+      });
+    } catch (error) {
+      decision = { deny: true, reason: `keep: the command guard is not available on node ${where.local}: ${error && error.message || error}` };
+    }
+    if (decision.deny) codexBlock(decision.reason);
+    else console.log('{}');
+    return;
+  }
+  let out = null;
+  try {
+    const run = () => (valid ? client.runHook(event, input, where, deps) : Promise.resolve(null))
+      .catch((error) => ({ delivered: false, why: error.message }));
+    let outcome;
+    if (action === 'start') {
+      // The daemon first, as for Claude, so its record knows this session claimed the
+      // pane; the bind here then finds it bound, or does it when the daemon could not.
+      outcome = await run();
+      try { if (valid) await bindRemotePane(input, 'codex', deps); } catch {}
+    } else if (action === 'end') {
+      [outcome] = await Promise.all([run(), valid ? releaseRemotePane(input, deps).catch(() => null) : null]);
+    } else {
+      outcome = await run();
+    }
+    if (outcome && outcome.delivered) {
+      const value = outcome.value || {};
+      if (value.stderr) process.stderr.write(String(value.stderr));
+      out = codexJsonAnswer(value);
+      // The daemon refused the question (nobody reads this session): its deny is the answer.
+      if (out && action === 'question' && value.status === 2) process.exitCode = 2;
+    } else if (action === 'start') {
+      out = JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart',
+        additionalContext: paneOnlyNotice(where, { url: where.url, agent: 'codex' }) } });
+    }
+  } catch { out = null; }
+  console.log(out || '{}');
+}
+
 // Every hook action on a pane-only node. Nothing below reads or writes ROOT or META.
 async function remoteHook(argv, input, where, deps = {}) {
   const env = deps.env || process.env;
@@ -662,6 +767,11 @@ async function remoteHook(argv, input, where, deps = {}) {
     }
     if (decision.deny) refuse(decision);
     return;
+  }
+  if (kind === 'codex' && CARRIED_CODEX_ACTIONS.includes(argv[1])) {
+    let remote = null;
+    try { remote = require('../remote-cli.js').remoteMode(env); } catch { remote = null; }
+    if (remote) return carriedCodexHook(argv[1], input, remote, deps);
   }
   if (kind === 'codex') {
     // Codex hooks always answer with JSON, as on the daemon node.

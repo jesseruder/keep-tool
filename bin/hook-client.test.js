@@ -279,16 +279,15 @@ test('without KEEP_DAEMON_URL the hooks are the pane-only hooks they were', asyn
   const start = await f.hook('session-start', '', {}, { KEEP_DAEMON_URL: '' });
   assert.equal(start.status, 0);
   assert.match(start.stdout, /^Keep: this session is unmanaged on node aws1; the daemon is on main\. keep checkin and other registry commands are not available here: this node has no KEEP_DAEMON_URL/);
-  // A Codex start with a daemon URL: registry commands reach it, its hooks do not yet.
+  // A Codex start without a daemon URL: the pane-only JSON it always printed.
   const codex = await new Promise((resolve) => {
-    const child = spawn(process.execPath, [CLI, 'hook', 'codex', 'start'], { env: f.env('http://127.0.0.1:9'), stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [CLI, 'hook', 'codex', 'start'], { env: f.env(''), stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     child.once('close', () => resolve(stdout));
     child.stdin.end(JSON.stringify({ session_id: 'codex-aws1', cwd: '/home/node/project' }));
   });
-  assert.match(JSON.parse(codex).hookSpecificOutput.additionalContext,
-    /Registry commands \(keep checkin, keep add, keep reviewed, keep land and the rest\) reach the daemon at http:\/\/127\.0\.0\.1:9; this session's hooks do not yet: a Codex or Pi session on a node refuses deploys by name and records no deploy or step run\. Not available on this node: keep tell/);
+  assert.match(JSON.parse(codex).hookSpecificOutput.additionalContext, /this node has no KEEP_DAEMON_URL/);
   const stop = await f.hook('stop', '', {}, { KEEP_DAEMON_URL: '' });
   assert.deepEqual(stop, { status: 0, stdout: '', stderr: '' });
   assert.equal(fs.existsSync(path.join(f.home, '.keep-node')), false, 'no delivery state either');
@@ -527,4 +526,175 @@ test('a post-bash response is cut to 64 KiB a field, its end kept, and further w
   assert.ok(all.tool_response.stdout.endsWith('THE END'));
   assert.equal(all.tool_input.command.length, 5 + 60 * 1024, 'the command is never cut');
   assert.equal(typeof (await post('plain output')).tool_response, 'string');
+});
+
+// ---------- Codex ----------
+
+// `keep hook codex <action>` on the node, as Codex runs it.
+function codexRun(f, action, url, input, extra = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CLI, 'hook', 'codex', action], {
+      env: f.env(url, { KEEP_AGENT_ACCOUNT_ID: 'codex-node', ...extra }), stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', (status) => resolve({ status, stdout, stderr }));
+    child.stdin.end(typeof input === 'string' ? input : JSON.stringify(input));
+  });
+}
+
+function codexInput(f, extra = {}) {
+  return { session_id: 'codex-aws1', transcript_path: f.transcript, cwd: f.home, ...extra };
+}
+
+// Exactly one JSON value on stdout, as Codex needs.
+function onlyJson(result) {
+  const text = result.stdout.trim();
+  assert.doesNotThrow(() => JSON.parse(text), `stdout is JSON: ${JSON.stringify(result.stdout)}`);
+  assert.equal(result.stdout.split('\n').filter(Boolean).length, 1, 'one line');
+  return JSON.parse(text);
+}
+
+test('each Codex action is posted as codex-<action> for the Codex session, and the node prints the daemon\'s JSON', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.transcript, `${JSON.stringify({ type: 'session_meta', payload: { id: 'codex-aws1' } })}\n`);
+  const context = '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"from the daemon"}}\n';
+  const daemon = await stubDaemon(t, (body) => (body.event === 'codex-start' ? ran(context) : ran('{}\n')));
+  const actions = { start: { hook_event_name: 'SessionStart', source: 'startup' }, stop: { hook_event_name: 'Stop', stop_hook_active: false },
+    approval: { hook_event_name: 'PermissionRequest', tool_name: 'shell' }, complete: {}, lifecycle: { hook_event_name: 'UserPromptSubmit', turn_id: 't1' },
+    question: { hook_event_name: 'PreToolUse', tool_name: 'request_user_input' }, end: { hook_event_name: 'SessionEnd' } };
+  for (const [action, input] of Object.entries(actions)) {
+    const result = await codexRun(f, action, daemon.url, codexInput(f, input), { KEEP_CODEX_CLIENT_TOKEN: 'launch-tok', CLAUDE_CODE_SESSION_ID: 'claude-parent' });
+    assert.equal(result.status, 0, `${action}: ${result.stderr}`);
+    assert.deepEqual(onlyJson(result), JSON.parse(action === 'start' ? context : '{}'), action);
+    const post = daemon.posts.at(-1).body;
+    assert.equal(post.event, `codex-${action}`);
+    assert.deepEqual(post.identity, { agent: 'codex', sessionId: 'codex-aws1', accountId: 'codex-node',
+      env: { KEEP_CODEX_CLIENT_TOKEN: 'launch-tok', KEEP_CODEX_PARENT_SESSION: 'claude-parent' } }, action);
+    assert.deepEqual(post.input, codexInput(f, input), action);
+  }
+  // The first post carried the rollout, and the rest had nothing new to send.
+  assert.equal(Buffer.from(daemon.posts[0].body.transcript.bytes, 'base64').toString(), fs.readFileSync(f.transcript, 'utf8'));
+  assert.equal(daemon.posts[0].body.transcript.path, f.transcript);
+  // A Claude event never forwards the Codex-only variables.
+  await f.hook('notification', daemon.url, { notification_type: 'idle_prompt' }, { KEEP_CODEX_CLIENT_TOKEN: 'launch-tok' });
+  assert.equal(daemon.posts.at(-1).body.identity.env, undefined);
+});
+
+test('a Codex answer on the node is always JSON: {} for anything else and when the daemon is not there', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.transcript, '{"n":1}\n');
+  const weird = await stubDaemon(t, () => ran('not json\n', 1));
+  for (const action of ['stop', 'approval', 'lifecycle', 'end', 'question']) {
+    const result = await codexRun(f, action, weird.url, codexInput(f, action === 'lifecycle' ? { hook_event_name: 'Stop' } : {}));
+    assert.equal(result.status, 0, action);
+    assert.deepEqual(onlyJson(result), {}, action);
+  }
+  const url = await closedUrl();
+  for (const action of ['stop', 'approval', 'complete', 'lifecycle', 'end', 'question', 'client-end']) {
+    const result = await codexRun(f, action, url, action === 'client-end' ? { client_token: 'launch-tok' } : codexInput(f, action === 'lifecycle' ? { hook_event_name: 'Stop' } : {}));
+    assert.equal(result.status, 0, action);
+    assert.deepEqual(onlyJson(result), {}, action);
+  }
+  const start = await codexRun(f, 'start', url, codexInput(f));
+  assert.equal(start.status, 0);
+  assert.match(onlyJson(start).hookSpecificOutput.additionalContext, /the daemon is on main/);
+  // Malformed stdin: still JSON, nothing posted.
+  const garbage = await codexRun(f, 'stop', weird.url, 'not json');
+  assert.deepEqual(onlyJson(garbage), {});
+  // The stop, approval, complete and lifecycle queued, and the end dropped them with
+  // the rest of its session's queue; the start after it waits. Never an end, a
+  // question or a client-end.
+  assert.deepEqual(f.queue().map((entry) => entry.event), ['codex-start']);
+});
+
+test('a Codex question the daemon refuses is the deny JSON and exit 2; a stop block is printed as the daemon wrote it', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.transcript, '{"n":1}\n');
+  const deny = '{"decision":"block","reason":"nobody reads this"}\n';
+  const block = '{"decision":"block","reason":"[keep] check in"}\n';
+  const daemon = await stubDaemon(t, (body) => (body.event === 'codex-question' ? { status: 200, body: { ok: false, status: 2, stdout: deny, stderr: 'nobody reads this\n', replayed: false } } : ran(block)));
+  const question = await codexRun(f, 'question', daemon.url, codexInput(f, { tool_name: 'request_user_input' }));
+  assert.equal(question.status, 2);
+  assert.deepEqual(onlyJson(question), JSON.parse(deny));
+  const stop = await codexRun(f, 'stop', daemon.url, codexInput(f));
+  assert.equal(stop.status, 0);
+  assert.deepEqual(onlyJson(stop), JSON.parse(block));
+});
+
+test('a Codex client-end posts its launch token with no session', async (t) => {
+  const f = fixture(t);
+  const daemon = await stubDaemon(t, () => ran('{}\n'));
+  const result = await codexRun(f, 'client-end', daemon.url, { client_token: 'launch-tok' }, { KEEP_CODEX_CLIENT_TOKEN: 'launch-tok', KEEP_PANE: 'p2' });
+  assert.deepEqual(onlyJson(result), {});
+  const [post] = daemon.posts;
+  assert.equal(post.body.event, 'codex-client-end');
+  assert.deepEqual(post.body.identity, { agent: 'codex', pane: 'p2@aws1', accountId: 'codex-node', env: { KEEP_CODEX_CLIENT_TOKEN: 'launch-tok' } });
+  assert.deepEqual(post.body.input, { client_token: 'launch-tok' });
+  assert.equal(post.body.transcript, null);
+});
+
+test('a Codex pre-tool posts the shell command with this node\'s repository facts, and fails closed as a Claude pre-bash does', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.transcript, '{"n":1}\n');
+  const block = (reason) => JSON.stringify({ decision: 'block', reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } });
+  const daemon = await stubDaemon(t, (body, n, url) => {
+    if (url.startsWith('/api/hook/context')) return CONTEXT;
+    const refused = /terraform/.test(body.input.tool_input.command);
+    return { status: 200, body: { ok: !refused, status: refused ? 2 : 0, stdout: refused ? `${block('step apply')}\n` : '{}\n', stderr: refused ? 'step apply\n' : '', replayed: false } };
+  });
+  const shell = (url, command, extra = {}, tool = 'shell') => codexRun(f, 'pre-tool', url, codexInput(f, { hook_event_name: 'PreToolUse', tool_name: tool,
+    call_id: 'call-1', tool_input: { command: ['bash', '-lc', command], workdir: f.home, timeout_ms: 1000 } }), extra);
+  const refused = await shell(daemon.url, 'terraform apply');
+  assert.equal(refused.status, 2);
+  assert.deepEqual(onlyJson(refused), JSON.parse(block('step apply')));
+  const post = daemon.posts.find((entry) => entry.url === '/api/hook').body;
+  assert.equal(post.event, 'codex-pre-tool');
+  assert.equal(post.transcript, null, 'no rollout bytes in front of a command');
+  assert.deepEqual(post.input, { session_id: 'codex-aws1', cwd: f.home, tool_name: 'shell', tool_input: { command: 'terraform apply', workdir: f.home },
+    repo_facts: { paths: { [f.home]: { top: null, main: null } }, deploy: null, head: {} }, transcript_path: f.transcript, hook_event_name: 'PreToolUse', tool_use_id: 'call-1' });
+  assert.deepEqual(onlyJson(await shell(daemon.url, 'ls')), {});
+  // Not a shell call: nothing asked, nothing refused.
+  const before = daemon.posts.length;
+  assert.deepEqual(onlyJson(await shell(daemon.url, 'terraform apply', {}, 'apply_patch')), {});
+  assert.equal(daemon.posts.length, before);
+
+  // The daemon not there: a step fingerprint (from the cached context) and a deploy are refused, the rest allowed.
+  const url = await closedUrl();
+  const step = await shell(url, 'terraform apply');
+  assert.equal(step.status, 2);
+  assert.match(onlyJson(step).reason, /did not answer this command's guard .*`terraform apply`, a gated step's command, is refused here/);
+  const deploy = await shell(url, 'git push heroku main');
+  assert.equal(deploy.status, 2);
+  assert.match(onlyJson(deploy).reason, /a deploy to heroku \(remote heroku\) is refused here/);
+  assert.deepEqual(onlyJson(await shell(url, 'ls')), {});
+  // A daemon whose hook failed without a decision is no answer either.
+  const broken = await stubDaemon(t, (body, n, target) => (target.startsWith('/api/hook/context') ? CONTEXT : ran('Error: boom\n', 1)));
+  const failed = await shell(broken.url, 'terraform apply');
+  assert.equal(failed.status, 2);
+  assert.match(onlyJson(failed).reason, /status 1 without a decision/);
+  assert.deepEqual(onlyJson(await shell(broken.url, 'ls')), {});
+  assert.deepEqual(f.queue(), [], 'a pre-tool is never queued');
+});
+
+test('a Codex post-tool posts the command and its response with the rollout in front of it, and queues when the daemon is not there', async (t) => {
+  const f = fixture(t);
+  const item = { type: 'event_msg', payload: { type: 'item_completed', item: { type: 'CommandExecution', id: 'call-9', command: ['bash', '-lc', 'make'], exit_code: 3 } } };
+  fs.writeFileSync(f.transcript, `${JSON.stringify(item)}\n`);
+  const daemon = await stubDaemon(t, (body, n, url) => (url.startsWith('/api/hook/context') ? CONTEXT : ran('{}\n')));
+  const input = codexInput(f, { hook_event_name: 'PostToolUse', tool_name: 'exec_command', tool_use_id: 'call-9',
+    tool_input: { cmd: 'make' }, tool_response: 'made\n' });
+  assert.deepEqual(onlyJson(await codexRun(f, 'post-tool', daemon.url, input)), {});
+  const post = daemon.posts.find((entry) => entry.url === '/api/hook').body;
+  assert.equal(post.event, 'codex-post-tool');
+  assert.equal(Buffer.from(post.transcript.bytes, 'base64').toString(), fs.readFileSync(f.transcript, 'utf8'), 'the rollout, for the exit code');
+  assert.equal(post.input.tool_response.exit_code, 3, 'read from this node\'s rollout');
+  assert.equal(post.input.tool_response.stdout, 'made\n');
+  assert.deepEqual(post.input.tool_input, { command: 'make', workdir: f.home });
+  const url = await closedUrl();
+  assert.deepEqual(onlyJson(await codexRun(f, 'post-tool', url, input)), {});
+  assert.deepEqual(f.queue().map((entry) => entry.event), ['codex-post-tool']);
 });

@@ -1,5 +1,5 @@
 'use strict';
-// POST /api/hook — a Claude session's hook on a pane-only node, run on the daemon.
+// POST /api/hook — a Claude or Codex session's hook on a pane-only node, run on the daemon.
 //
 // The node's hook sends the event, its stdin JSON and the transcript bytes the
 // daemon does not have yet. The bytes are appended to the session's transcript
@@ -10,10 +10,12 @@
 //
 // Nothing from the body is run: the program is this checkout's bin/keep.js, the
 // argv is `hook <event>` from a fixed list, and the stdin is the rewritten object.
-// A node acts only for a Claude session the location record places on it, only on
-// that session's mirror, and only with a pane on itself. The run goes through the
-// registry route's journal (bin/registry-route.js), so a resent event replays its
-// answer instead of running again, and a restart waits for it. The transcript
+// A node acts only for a session the location record places on it with the agent the
+// event is for (a Claude event for a Claude session, a codex-* event for a Codex
+// one, whose mirror is its rollout), only on that session's mirror, and only with a
+// pane on itself. The run goes through the registry route's journal
+// (bin/registry-route.js), so a resent event replays its answer instead of running
+// again, and a restart waits for it. The transcript
 // append is outside the journal and needs none: a post must start where the mirror
 // ends, so a resend of bytes already appended writes nothing and says where to go on.
 const crypto = require('node:crypto');
@@ -23,6 +25,10 @@ const mirror = require('./transcript-mirror.js');
 const { RegistryError } = require('./registry-route.js');
 
 const EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'lifecycle', 'pre-bash', 'post-bash'];
+// A Codex session's hooks: `codex-<action>` runs the daemon's `keep hook codex <action>`.
+const CODEX_ACTIONS = ['start', 'end', 'client-end', 'stop', 'question', 'approval', 'complete', 'lifecycle', 'pre-tool', 'post-tool'];
+const CODEX_EVENTS = CODEX_ACTIONS.map((action) => `codex-${action}`);
+const agentOf = (event) => (CODEX_EVENTS.includes(event) ? 'codex' : 'claude');
 // A post that carries only transcript bytes: every chunk of a long delta but the last.
 const TRANSCRIPT_ONLY = 'transcript';
 const HOOK_TIMEOUT_MS = 20e3;
@@ -47,6 +53,18 @@ const HOOK_EVENT_NAMES = {
   // session-lifecycle.js EVENTS: what `keep hook lifecycle` records.
   lifecycle: ['SubagentStart', 'SubagentStop', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest',
     'UserPromptSubmit', 'Stop', 'SessionStart', 'SessionEnd', 'Interrupt'],
+  // What Codex names the events its hooks.json wires to `keep hook codex <action>`.
+  'codex-start': ['SessionStart'],
+  'codex-end': ['SessionEnd'],
+  'codex-client-end': [],
+  'codex-stop': ['Stop'],
+  'codex-question': ['PreToolUse'],
+  'codex-approval': ['PermissionRequest'],
+  'codex-complete': ['Stop'],
+  'codex-pre-tool': ['PreToolUse'],
+  'codex-post-tool': ['PostToolUse'],
+  'codex-lifecycle': ['SubagentStart', 'SubagentStop', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest',
+    'UserPromptSubmit', 'Stop', 'SessionStart', 'SessionEnd', 'Interrupt'],
 };
 const PRUNE_EVERY_MS = 60 * 60e3;
 // What GET /api/hook/context publishes of the step registries: the command
@@ -65,6 +83,11 @@ const FORWARDED_ENV = Object.freeze({
   // node. KEEP_REPAIR is not among them: the daemon decides that (isRepairSession).
   KEEP_STEP_OK: /^[A-Za-z0-9_.-]{1,32}$/,
   KEEP_RAW_CLAUDE: /^[A-Za-z0-9_.-]{1,32}$/,
+  // A Codex session's launch token (bin/agent-launcher.js), which its attention
+  // markers carry and its client-end clears by; and the Claude session a Codex one
+  // was started from, which the daemon records only when it is on the same node.
+  KEEP_CODEX_CLIENT_TOKEN: /^[A-Za-z0-9._-]{1,128}$/,
+  KEEP_CODEX_PARENT_SESSION: /^[A-Za-z0-9_-]{1,128}$/,
 });
 // A Bash command, and the repository facts the node posts with it (bin/repo-facts.js).
 const COMMAND_MAX_BYTES = 64 * 1024;
@@ -290,6 +313,93 @@ function cleanInput(event, input, sessionId, options = {}) {
   return out;
 }
 
+const CLIENT_TOKEN_RE = /^[A-Za-z0-9._-]{1,256}$/;
+const TOOL_NAME_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
+const COMMAND_ARGS_MAX = 256;
+
+// A Codex shell call's command: a script, or an argv array of strings, bounded as a
+// Bash command is. Nothing of it is run; the daemon's step guard and recorders read it.
+function codexCommand(value) {
+  if (typeof value === 'string') return text(value, 'input.tool_input.command', COMMAND_MAX_BYTES);
+  if (!Array.isArray(value) || !value.length || value.length > COMMAND_ARGS_MAX) {
+    refuse(400, 'input.tool_input.command must be a string or a list of at most 256 strings');
+  }
+  let bytes = 0;
+  for (const arg of value) {
+    text(arg, 'an input.tool_input.command entry', COMMAND_MAX_BYTES);
+    bytes += Buffer.byteLength(arg);
+  }
+  if (bytes > COMMAND_MAX_BYTES) refuse(400, `input.tool_input.command is longer than ${COMMAND_MAX_BYTES} bytes`);
+  return [...value];
+}
+
+// A Codex hook's stdin, rebuilt from the fields `keep hook codex <action>` reads, as
+// cleanInput does for Claude's. client-end carries only its launch token and no
+// session: the daemon's hook clears the markers that carry that token, and only for
+// sessions on the calling node (KEEP_HOOK_NODE).
+function cleanCodexInput(event, input, sessionId, options = {}) {
+  if (!isObject(input)) refuse(400, 'input must be the hook\'s stdin object');
+  let size;
+  try { size = Buffer.byteLength(JSON.stringify(input)); } catch { refuse(400, 'input is not JSON'); }
+  if (size > INPUT_MAX_BYTES) refuse(400, `input is larger than ${INPUT_MAX_BYTES} bytes`);
+  const has = (key) => input[key] !== undefined && input[key] !== null;
+  if (event === 'codex-client-end') return { client_token: matching(input.client_token, CLIENT_TOKEN_RE, 'input.client_token') };
+  if (input.session_id !== sessionId) refuse(400, 'input.session_id must be the identity\'s session');
+  const out = { session_id: sessionId, cwd: absolutePath(input.cwd, 'input.cwd') };
+  if (has('transcript_path')) text(input.transcript_path, 'input.transcript_path', PATH_MAX);
+  if (has('hook_event_name')) {
+    out.hook_event_name = matching(input.hook_event_name, /^[A-Za-z]{1,64}$/, 'input.hook_event_name');
+    if (!HOOK_EVENT_NAMES[event].includes(out.hook_event_name)) refuse(400, `input.hook_event_name ${out.hook_event_name} is not a ${event} event`);
+  } else if (event === 'codex-lifecycle') refuse(400, 'input.hook_event_name is required for codex-lifecycle');
+  // Codex's model, permission mode and agent type are not read by any of its hooks,
+  // so they are dropped with everything else unknown.
+  if (has('source')) out.source = matching(input.source, /^[a-z_]{1,32}$/, 'input.source');
+  for (const key of ['turn_id', 'agent_id']) if (has(key)) out[key] = matching(input[key], ID_RE, `input.${key}`);
+  if (has('stop_hook_active')) {
+    if (typeof input.stop_hook_active !== 'boolean') refuse(400, 'input.stop_hook_active must be a boolean');
+    out.stop_hook_active = input.stop_hook_active;
+  }
+  if (has('last_assistant_message')) out.last_assistant_message = text(input.last_assistant_message, 'input.last_assistant_message');
+  if (has('tool_name')) out.tool_name = matching(input.tool_name, TOOL_NAME_RE, 'input.tool_name');
+  for (const key of ['tool_use_id', 'call_id']) if (has(key)) out[key] = matching(input[key], ID_RE, `input.${key}`);
+  if (event === 'codex-question' && has('tool_input')) {
+    if (!isObject(input.tool_input)) refuse(400, 'input.tool_input must be an object');
+    out.tool_input = questionInput(input.tool_input);
+    // codexAttentionMarker reads a question's title where it has no question text.
+    const first = Array.isArray(input.tool_input.questions) && isObject(input.tool_input.questions[0]) ? input.tool_input.questions[0] : null;
+    if (first && typeof first.title === 'string' && out.tool_input.questions[0]) out.tool_input.questions[0].title = clipBytes(first.title, 4096);
+  }
+  if (event === 'codex-approval' && has('tool_input')) {
+    if (!isObject(input.tool_input)) refuse(400, 'input.tool_input must be an object');
+    const tool = {};
+    if (typeof input.tool_input.description === 'string') tool.description = clipBytes(input.tool_input.description, 4096);
+    for (const key of ['tool_name', 'toolName']) {
+      if (typeof input.tool_input[key] === 'string') tool[key] = matching(input.tool_input[key], TOOL_NAME_RE, `input.tool_input.${key}`);
+    }
+    out.tool_input = tool;
+  }
+  if (event === 'codex-pre-tool' || event === 'codex-post-tool') {
+    if (!out.tool_name) refuse(400, `${event} needs input.tool_name`);
+    if (!isObject(input.tool_input)) refuse(400, 'input.tool_input must be an object');
+    const tool = { command: codexCommand(input.tool_input.command) };
+    for (const key of ['workdir', 'cwd']) {
+      if (input.tool_input[key] !== undefined && input.tool_input[key] !== null) tool[key] = absolutePath(input.tool_input[key], `input.tool_input.${key}`);
+    }
+    out.tool_input = tool;
+    out.repo_facts = cleanRepoFacts(input.repo_facts, options.home || os.homedir());
+    if (event === 'codex-post-tool' && has('tool_response')) out.tool_response = bashResponse(input.tool_response);
+  }
+  if (event === 'codex-lifecycle' && has('tool_input')) {
+    if (!isObject(input.tool_input)) refuse(400, 'input.tool_input must be an object');
+    const tool = {};
+    for (const key of ['command', 'cmd', 'code', 'description']) {
+      if (typeof input.tool_input[key] === 'string') tool[key] = input.tool_input[key].slice(0, 4096);
+    }
+    out.tool_input = tool;
+  }
+  return out;
+}
+
 function cleanTranscript(value) {
   if (value === undefined || value === null) return null;
   if (!isObject(value)) refuse(400, 'transcript must be an object or null');
@@ -312,22 +422,33 @@ function cleanTranscript(value) {
 function validateRequest(body, caller, deps) {
   if (!isObject(body)) refuse(400, 'the request body must be an object');
   const { event } = body;
-  if (event !== TRANSCRIPT_ONLY && !EVENTS.includes(event)) refuse(400, `${JSON.stringify(String(event))} is not a hook event`);
+  if (event !== TRANSCRIPT_ONLY && !EVENTS.includes(event) && !CODEX_EVENTS.includes(event)) {
+    refuse(400, `${JSON.stringify(String(event))} is not a hook event`);
+  }
   const identity = body.identity;
   if (!isObject(identity)) refuse(400, 'identity is required');
-  if (identity.agent !== 'claude') refuse(400, 'only Claude hooks are carried to the daemon');
-  const sessionId = matching(identity.sessionId, SESSION_RE, 'session id');
+  if (identity.agent !== 'claude' && identity.agent !== 'codex') refuse(400, 'only Claude and Codex hooks are carried to the daemon');
+  const agent = identity.agent;
+  if (event !== TRANSCRIPT_ONLY && agentOf(event) !== agent) {
+    refuse(400, agent === 'codex' ? `${event} is a Claude hook; a Codex session posts codex-* events` : `${event} is a Codex hook, not a Claude one`);
+  }
+  // A Codex client-end is the launcher's, after the TUI exited: it names no session,
+  // only the launch token, and the daemon's hook acts on this node's sessions alone.
+  const sessionless = event === 'codex-client-end' && (identity.sessionId === undefined || identity.sessionId === null);
+  const sessionId = sessionless ? null : matching(identity.sessionId, SESSION_RE, 'session id');
   let accountId = null;
   if (identity.accountId !== undefined && identity.accountId !== null) accountId = matching(identity.accountId, ACCOUNT_RE, 'account id');
-  let where = null;
-  try { where = deps.location(sessionId); } catch { where = null; }
-  if (!where || where.node !== caller) refuse(403, `session ${sessionId} is not on node ${caller}`);
-  if (where.agent !== 'claude') refuse(403, `session ${sessionId} is a ${where.agent} session, not claude`);
-  if (accountId && where.accountId && accountId !== where.accountId) {
-    refuse(403, `session ${sessionId} runs on account ${where.accountId}, not ${accountId}`);
+  if (!sessionless) {
+    let where = null;
+    try { where = deps.location(sessionId); } catch { where = null; }
+    if (!where || where.node !== caller) refuse(403, `session ${sessionId} is not on node ${caller}`);
+    if (where.agent !== agent) refuse(403, `session ${sessionId} is a ${where.agent} session, not ${agent}`);
+    if (accountId && where.accountId && accountId !== where.accountId) {
+      refuse(403, `session ${sessionId} runs on account ${where.accountId}, not ${accountId}`);
+    }
+    // The daemon's record is the authority; the node's word only fills a gap in it.
+    if (typeof where.accountId === 'string' && ACCOUNT_RE.test(where.accountId)) accountId = where.accountId;
   }
-  // The daemon's record is the authority; the node's word only fills a gap in it.
-  if (typeof where.accountId === 'string' && ACCOUNT_RE.test(where.accountId)) accountId = where.accountId;
   // When a replayed event fired, on the node's clock: the time its attention marker
   // carries. Never later than now.
   let firedAt = null;
@@ -354,13 +475,16 @@ function validateRequest(body, caller, deps) {
   const transcript = cleanTranscript(body.transcript);
   if (event === TRANSCRIPT_ONLY) {
     if (!transcript) refuse(400, 'a transcript post carries a transcript');
-    return { event, sessionId, accountId, pane, transcript, firedAt, env };
+    return { event, agent, sessionId, accountId, pane, transcript, firedAt, env };
   }
+  if (sessionless && transcript) refuse(400, 'a client-end without a session carries no transcript');
   if (typeof body.idempotencyKey !== 'string' || !KEY_RE.test(body.idempotencyKey)) {
     refuse(400, 'idempotencyKey must be 16-128 letters, digits, _ or -');
   }
-  const input = cleanInput(event, body.input, sessionId, { home: deps.home });
-  return { event, sessionId, accountId, pane, transcript, firedAt, env, input, idempotencyKey: body.idempotencyKey };
+  const input = agent === 'codex'
+    ? cleanCodexInput(event, body.input, sessionId, { home: deps.home })
+    : cleanInput(event, body.input, sessionId, { home: deps.home });
+  return { event, agent, sessionId, accountId, pane, transcript, firedAt, env, input, idempotencyKey: body.idempotencyKey };
 }
 
 // The transcript is left out: its bytes are applied before the journal is read,
@@ -472,21 +596,25 @@ function createHookService(options = {}) {
       });
       if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };
       pruneMirrors();
-      return await inSession(`${caller}\0${request.sessionId}`, async () => {
+      const scope = request.sessionId || '\0client-end';
+      return await inSession(`${caller}\0${scope}`, async () => {
         if (request.transcript) {
           const applied = applyTranscript(request, caller);
           if (applied.status) return applied;
           if (request.event === TRANSCRIPT_ONLY) return { status: 200, body: { ok: true, size: applied.size } };
         }
         // The daemon never reads the node's path: the hook reads the mirror, whether
-        // or not this post carried bytes for it.
-        const input = { ...request.input, transcript_path: mirror.paths(root, caller, request.sessionId).file };
+        // or not this post carried bytes for it. A client-end names no session and
+        // reads no transcript.
+        const input = request.sessionId
+          ? { ...request.input, transcript_path: mirror.paths(root, caller, request.sessionId).file } : request.input;
         const hookRequest = { ...request, input };
+        const argv = request.agent === 'codex' ? ['hook', 'codex', request.event.slice('codex-'.length)] : ['hook', request.event];
         // The forwarded session env first, so nothing it names can replace the
         // route's own variables below it.
         const env = {
           ...request.env,
-          ...shared.childEnv({ session: request.sessionId, agent: 'claude', pane: request.pane }, caller, daemon),
+          ...shared.childEnv({ session: request.sessionId, agent: request.agent, pane: request.pane }, caller, daemon),
           KEEP_HOOK_NODE: caller,
           ...(request.accountId ? { KEEP_AGENT_ACCOUNT_ID: request.accountId } : {}),
           ...(request.firedAt ? { KEEP_HOOK_FIRED_AT: String(request.firedAt) } : {}),
@@ -495,9 +623,9 @@ function createHookService(options = {}) {
           ...(request.event === 'pre-bash' && isRepairSession(repairDeps, request.sessionId, root) ? { KEEP_REPAIR: '1' } : {}),
         };
         const answer = await shared.journaled({
-          caller, key: request.idempotencyKey, digest: digestOf(hookRequest), queue: `hook\0${caller}\0${request.sessionId}`,
-          run: () => shared.spawnKeep(['hook', request.event], { cwd: root, env, stdin: JSON.stringify(input), timeoutMs }),
-          what: `keep hook ${request.event} for session ${request.sessionId}`,
+          caller, key: request.idempotencyKey, digest: digestOf(hookRequest), queue: `hook\0${caller}\0${scope}`,
+          run: () => shared.spawnKeep(argv, { cwd: root, env, stdin: JSON.stringify(input), timeoutMs }),
+          what: `keep ${argv.join(' ')} for ${request.sessionId ? `session ${request.sessionId}` : `node ${caller}`}`,
         });
         if (answer.status !== 200 && answer.status !== 504) return answer;
         const value = answer.body || {};
@@ -527,7 +655,8 @@ function createHookService(options = {}) {
       let where = null;
       try { where = shared.location(session); } catch { where = null; }
       if (!where || where.node !== caller) refuse(403, `session ${session} is not on node ${caller}`);
-      if (where.agent !== 'claude') refuse(403, `session ${session} is a ${where.agent} session, not claude`);
+      // A Codex session's pre-tool refuses by the same fingerprints a Claude one's pre-bash does.
+      if (where.agent !== 'claude' && where.agent !== 'codex') refuse(403, `session ${session} is a ${where.agent} session, not claude or codex`);
       return { status: 200, body: { steps: publishedFingerprints(root), repairSession: isRepairSession(repairDeps, session, root) } };
     } catch (error) {
       if (error instanceof RegistryError) return { status: error.status, body: { error: error.message } };
@@ -539,6 +668,6 @@ function createHookService(options = {}) {
 }
 
 module.exports = {
-  createHookService, validateRequest, cleanInput, digestOf, publishedFingerprints,
-  cleanRepoFacts, EVENTS, FINGERPRINTS_MAX, FINGERPRINT_MAX_BYTES, COMMAND_MAX_BYTES, TRANSCRIPT_ONLY, HOOK_TIMEOUT_MS, INPUT_MAX_BYTES, BODY_MAX_BYTES, TEXT_MAX, FORWARDED_ENV,
+  createHookService, validateRequest, cleanInput, cleanCodexInput, digestOf, publishedFingerprints,
+  cleanRepoFacts, EVENTS, CODEX_EVENTS, CODEX_ACTIONS, FINGERPRINTS_MAX, FINGERPRINT_MAX_BYTES, COMMAND_MAX_BYTES, TRANSCRIPT_ONLY, HOOK_TIMEOUT_MS, INPUT_MAX_BYTES, BODY_MAX_BYTES, TEXT_MAX, FORWARDED_ENV,
 };

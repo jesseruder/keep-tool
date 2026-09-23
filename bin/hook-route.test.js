@@ -48,7 +48,8 @@ function fakeSpawn(answer = () => ({ code: 0, stdout: '', stderr: '' })) {
 const LOCATIONS = {
   'sess-aws1': { node: 'aws1', agent: 'claude', accountId: 'claude-node' },
   'sess-main': { node: 'main', agent: 'claude' },
-  'codex-aws1': { node: 'aws1', agent: 'codex' },
+  'codex-aws1': { node: 'aws1', agent: 'codex', accountId: 'codex-node' },
+  'pi-aws1': { node: 'aws1', agent: 'pi' },
 };
 
 function services(t, overrides = {}) {
@@ -106,7 +107,8 @@ test('a hook post is refused unless it is a Claude event for a session and pane 
   const cases = [
     [AWS1, body({ event: 'pre-bash', input: { session_id: 'sess-aws1', cwd: '/x' } }), 400, /pre-bash is for Bash only/],
     [AWS1, body({ event: 'post-bash', input: { session_id: 'sess-aws1', cwd: '/x' } }), 400, /post-bash is for Bash only/],
-    [AWS1, body({ identity: { agent: 'codex', sessionId: 'codex-aws1' } }), 400, /only Claude hooks/],
+    [AWS1, body({ identity: { agent: 'codex', sessionId: 'codex-aws1' } }), 400, /stop is a Claude hook/],
+    [AWS1, body({ identity: { agent: 'pi', sessionId: 'pi-aws1' } }), 400, /only Claude and Codex hooks/],
     [AWS1, body({ identity: { agent: 'claude', sessionId: 'sess-main' }, input: { session_id: 'sess-main', cwd: '/x' } }), 403, /session sess-main is not on node aws1/],
     [AWS1, body({ identity: { agent: 'claude', sessionId: 'nobody' }, input: { session_id: 'nobody', cwd: '/x' } }), 403, /is not on node aws1/],
     [AWS1, body({ identity: { agent: 'claude', sessionId: 'codex-aws1' }, input: { session_id: 'codex-aws1', cwd: '/x' } }), 403, /is a codex session/],
@@ -660,7 +662,7 @@ test('the hook context publishes the step fingerprints and whether the daemon la
   card = '';
   for (const [who, session, status, message] of [
     [AWS1, 'sess-main', 403, /not on node aws1/],
-    [AWS1, 'codex-aws1', 403, /is a codex session/],
+    [AWS1, 'pi-aws1', 403, /is a pi session/],
     [AWS1, '../x', 400, /invalid session id/],
     [AWS1, null, 400, /invalid session id/],
     [{ class: 'admin' }, 'sess-aws1', 403, /for sessions on other nodes/],
@@ -670,6 +672,7 @@ test('the hook context publishes the step fingerprints and whether the daemon la
     assert.equal(answer.status, status, JSON.stringify(answer));
     assert.match(answer.body.error, message);
   }
+  assert.equal(hooks.context(AWS1, 'codex-aws1').status, 200, 'a Codex pre-tool refuses by the same fingerprints');
   assert.equal(calls.length, 0, 'nothing ran');
   // Bounded: at most 256 fingerprints.
   fs.writeFileSync(path.join(root, 'steps', 'many.json'), JSON.stringify({ project: path.join(root, 'many'),
@@ -973,4 +976,121 @@ test('a self-repair state file that is there but unreadable makes every node ses
   const answer = await hooks.handle(AWS1, bashBody(root, 'ls'));
   assert.equal(answer.status, 200, JSON.stringify(answer.body));
   assert.equal(calls.at(-1).options.env.KEEP_REPAIR, '1');
+});
+
+// ---------- Codex sessions ----------
+
+const CODEX_ROLLOUT = '/home/node/.codex/sessions/2026/09/22/rollout-2026-09-22T10-00-00-codex-aws1.jsonl';
+
+function codexBody(event, input = {}, extra = {}) {
+  return {
+    event,
+    input: { session_id: 'codex-aws1', transcript_path: CODEX_ROLLOUT, cwd: '/home/node/project', ...input },
+    identity: { agent: 'codex', sessionId: 'codex-aws1', pane: 'p2@aws1', accountId: 'codex-node' },
+    transcript: null,
+    idempotencyKey: `${KEY}-${event}`,
+    ...extra,
+  };
+}
+
+const NO_FACTS = { paths: {}, deploy: null, head: {} };
+
+test('a Codex post is refused unless it is a codex-* event for a Codex session on the calling node, in its input shape', async (t) => {
+  const { hooks, calls, root } = services(t);
+  const cases = [
+    [codexBody('codex-stop', {}, { identity: { agent: 'claude', sessionId: 'sess-aws1' } }), 400, /codex-stop is a Codex hook/],
+    [codexBody('codex-stop', { session_id: 'sess-aws1' }, { identity: { agent: 'codex', sessionId: 'sess-aws1' } }), 403, /is a claude session, not codex/],
+    [codexBody('codex-stop', { session_id: 'sess-main' }, { identity: { agent: 'codex', sessionId: 'sess-main' } }), 403, /not on node aws1/],
+    [codexBody('codex-stop', {}, { identity: { agent: 'codex', sessionId: 'codex-aws1', pane: 'p2@main' } }), 403, /is not on node aws1/],
+    [codexBody('codex-stop', {}, { identity: { agent: 'codex', sessionId: 'codex-aws1', accountId: 'codex-other' } }), 403, /runs on account codex-node/],
+    [codexBody('codex-stop', { hook_event_name: 'SessionStart' }), 400, /is not a codex-stop event/],
+    [codexBody('codex-stop', { stop_hook_active: 'no' }), 400, /stop_hook_active must be a boolean/],
+    [codexBody('codex-lifecycle'), 400, /hook_event_name is required/],
+    [codexBody('codex-stop', { cwd: 'relative' }), 400, /input.cwd must be an absolute path/],
+    [codexBody('codex-pre-tool', { tool_name: 'shell', tool_input: { command: 'ls' } }), 400, /repo_facts is required/],
+    [codexBody('codex-pre-tool', { tool_input: { command: 'ls' }, repo_facts: NO_FACTS }), 400, /needs input.tool_name/],
+    [codexBody('codex-pre-tool', { tool_name: 'shell', tool_input: { command: 'x'.repeat(70 * 1024) }, repo_facts: NO_FACTS }), 400, /longer than/],
+    [codexBody('codex-pre-tool', { tool_name: 'shell', tool_input: { command: [1, 2] }, repo_facts: NO_FACTS }), 400, /must be a string/],
+    [codexBody('codex-pre-tool', { tool_name: 'shell', tool_input: { command: 'ls', workdir: '/a/../b' }, repo_facts: NO_FACTS }), 400, /may not contain \.\./],
+    [codexBody('codex-post-tool', { tool_name: 'shell', tool_input: { command: 'ls' }, repo_facts: NO_FACTS, tool_response: { exit_code: 'one' } }), 400, /exit_code must be an integer/],
+    [codexBody('codex-client-end', { client_token: 'bad token' }), 400, /invalid input.client_token/],
+    [codexBody('codex-client-end', { client_token: 'x'.repeat(257) }), 400, /invalid input.client_token/],
+    [codexBody('codex-client-end', { client_token: 'tok' }, { identity: { agent: 'codex' }, transcript: transcript('x') }), 400, /carries no transcript/],
+    [codexBody('codex-stop', {}, { identity: { agent: 'codex', sessionId: 'codex-aws1', env: { KEEP_CODEX_CLIENT_TOKEN: 'a b' } } }), 400, /identity.env.KEEP_CODEX_CLIENT_TOKEN/],
+    [codexBody('codex-nonsense'), 400, /is not a hook event/],
+  ];
+  for (const [request, status, message] of cases) {
+    const answer = await hooks.handle(AWS1, request);
+    assert.equal(answer.status, status, `${JSON.stringify(request).slice(0, 200)}: ${JSON.stringify(answer.body)}`);
+    assert.match(answer.body.error, message);
+  }
+  assert.equal(calls.length, 0, 'nothing ran');
+  assert.equal(fs.existsSync(path.join(root, '.keep', 'transcript-mirrors')), false, 'nothing mirrored');
+});
+
+test('each Codex event runs the daemon\'s keep hook codex <action> on its rebuilt input, the rollout mirrored', async (t) => {
+  const { hooks, calls, root } = services(t, { answer: () => ({ code: 0, stdout: '{}\n' }) });
+  const mirrorFile = path.join(root, '.keep', 'transcript-mirrors', 'aws1', 'codex-aws1.jsonl');
+  const rollout = `${JSON.stringify({ type: 'session_meta', payload: { id: 'codex-aws1', originator: 'codex-tui' } })}\n`;
+  const project = path.join(root, 'project');
+  const facts = { paths: { [project]: { top: project, main: project } }, deploy: null, head: {} };
+  const expected = {
+    'codex-start': [{ hook_event_name: 'SessionStart', source: 'startup', model: 'gpt-x', permission_mode: 'whatever' },
+      { hook_event_name: 'SessionStart', source: 'startup' }],
+    'codex-stop': [{ hook_event_name: 'Stop', stop_hook_active: false, turn_id: 'turn-1', last_assistant_message: 'done', extra: 1 },
+      { hook_event_name: 'Stop', stop_hook_active: false, turn_id: 'turn-1', last_assistant_message: 'done' }],
+    'codex-question': [{ hook_event_name: 'PreToolUse', tool_name: 'request_user_input', tool_input: { questions: [{ title: 'Pick?', options: [{ label: 'A', description: 'x' }], secret: 1 }] } },
+      { hook_event_name: 'PreToolUse', tool_name: 'request_user_input', tool_input: { questions: [{ options: [{ label: 'A' }], title: 'Pick?' }] } }],
+    'codex-approval': [{ hook_event_name: 'PermissionRequest', tool_name: 'shell', tool_input: { description: 'run ls', command: 'ls', tool_name: 'shell' } },
+      { hook_event_name: 'PermissionRequest', tool_name: 'shell', tool_input: { description: 'run ls', tool_name: 'shell' } }],
+    'codex-complete': [{ last_assistant_message: 'ok' }, { last_assistant_message: 'ok' }],
+    'codex-lifecycle': [{ hook_event_name: 'SubagentStart', agent_id: 'child-1', turn_id: 't', tool_input: { command: 'ls', env: 'x' } },
+      { hook_event_name: 'SubagentStart', agent_id: 'child-1', turn_id: 't', tool_input: { command: 'ls' } }],
+    'codex-pre-tool': [{ hook_event_name: 'PreToolUse', tool_name: 'shell', call_id: 'call-1', tool_input: { command: ['bash', '-lc', 'ls'], workdir: '/home/node/project', timeout: 5 }, repo_facts: facts },
+      { hook_event_name: 'PreToolUse', tool_name: 'shell', call_id: 'call-1', tool_input: { command: ['bash', '-lc', 'ls'], workdir: '/home/node/project' }, repo_facts: facts }],
+    'codex-post-tool': [{ hook_event_name: 'PostToolUse', tool_name: 'shell', tool_use_id: 'call-2', tool_input: { command: 'ls' }, repo_facts: facts, tool_response: { stdout: 'a\n', exit_code: 0, big: 'x' } },
+      { hook_event_name: 'PostToolUse', tool_name: 'shell', tool_use_id: 'call-2', tool_input: { command: 'ls' }, repo_facts: facts, tool_response: { stdout: 'a\n', exit_code: 0 } }],
+    'codex-end': [{ hook_event_name: 'SessionEnd' }, { hook_event_name: 'SessionEnd' }],
+  };
+  let first = true;
+  for (const [event, [input, cleaned]] of Object.entries(expected)) {
+    const answer = await hooks.handle(AWS1, codexBody(event, input, {
+      identity: { agent: 'codex', sessionId: 'codex-aws1', pane: 'p2@aws1', env: { KEEP_CODEX_CLIENT_TOKEN: 'launch-tok', KEEP_CODEX_PARENT_SESSION: 'sess-aws1', KEEP_REPAIR: '1' } },
+      transcript: first ? { ...transcript(rollout), path: CODEX_ROLLOUT } : null,
+    }));
+    first = false;
+    assert.equal(answer.status, 200, `${event}: ${JSON.stringify(answer.body)}`);
+    assert.equal(answer.body.stdout, '{}\n');
+    const call = calls.at(-1);
+    assert.deepEqual(call.args, [CLI, 'hook', 'codex', event.slice('codex-'.length)], event);
+    assert.deepEqual(JSON.parse(call.stdin), { session_id: 'codex-aws1', cwd: '/home/node/project', ...cleaned, transcript_path: mirrorFile }, event);
+    const env = call.options.env;
+    assert.equal(env.CODEX_THREAD_ID, 'codex-aws1');
+    assert.equal(env.CLAUDE_CODE_SESSION_ID, undefined);
+    assert.equal(env.KEEP_HOOK_NODE, 'aws1');
+    assert.equal(env.KEEP_PANE, 'p2@aws1');
+    assert.equal(env.KEEP_AGENT_ACCOUNT_ID, 'codex-node', 'the location record\'s account');
+    assert.equal(env.KEEP_CODEX_CLIENT_TOKEN, 'launch-tok');
+    assert.equal(env.KEEP_CODEX_PARENT_SESSION, 'sess-aws1');
+    assert.equal(env.KEEP_REPAIR, undefined, 'never forwarded');
+  }
+  assert.equal(fs.readFileSync(mirrorFile, 'utf8'), rollout, 'the rollout is mirrored under the node\'s own directory');
+});
+
+test('a Codex client-end names no session: only its token reaches the hook, and nothing is mirrored', async (t) => {
+  const { hooks, calls, root } = services(t, { answer: () => ({ code: 0, stdout: '{}\n' }) });
+  const answer = await hooks.handle(AWS1, {
+    event: 'codex-client-end', input: { client_token: 'launch-tok', other: 1 },
+    identity: { agent: 'codex', pane: 'p2@aws1', env: { KEEP_CODEX_CLIENT_TOKEN: 'launch-tok' } }, transcript: null, idempotencyKey: `${KEY}-ce`,
+  });
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  const [call] = calls;
+  assert.deepEqual(call.args, [CLI, 'hook', 'codex', 'client-end']);
+  assert.deepEqual(JSON.parse(call.stdin), { client_token: 'launch-tok' });
+  assert.equal(call.options.env.CODEX_THREAD_ID, undefined);
+  assert.equal(call.options.env.KEEP_HOOK_NODE, 'aws1');
+  assert.equal(fs.existsSync(path.join(root, '.keep', 'transcript-mirrors')), false);
+  // With a session it is that session's, and must be on the caller.
+  const other = await hooks.handle(AWS1, { ...codexBody('codex-client-end', { client_token: 'tok' }), identity: { agent: 'codex', sessionId: 'sess-main' } });
+  assert.equal(other.status, 403);
 });
