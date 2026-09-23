@@ -636,3 +636,192 @@ test('a resumed Codex that has not taken a turn is verified by its own process o
       verifyMovedCodexPane: async () => assert.fail('not for Claude') }).waitForPaneRecord({ ...record, agent: 'claude' }), null);
   } finally { r.cleanup(); }
 });
+
+// ---------- a real Codex move between two hosts ----------
+
+// Each node sees the processes under its own panes and none under the other's: the
+// two hosts share one machine here, and a real node's table holds only its own.
+function nodeProcessRows() {
+  return async (_given, options = {}) => {
+    const node = options.node || 'main';
+    const other = node === 'main' ? 'aws1' : 'main';
+    const rows = await serve.agentProcessRows({ daemonNode: 'main', processRowsCache: { value: null, at: 0, pending: null } }, {});
+    const listed = await onNode(other, (client) => client.request('list', {}));
+    const roots = new Set((listed.panes || []).filter((pane) => pane.alive).map((pane) => pane.pid));
+    const byPid = new Map(rows.map((row) => [row.pid, row]));
+    const underOther = (row) => {
+      const seen = new Set();
+      for (let at = row; at && !seen.has(at.pid); at = byPid.get(at.ppid)) {
+        if (roots.has(at.pid)) return true;
+        seen.add(at.pid);
+      }
+      return false;
+    };
+    return rows.filter((row) => !underOther(row));
+  };
+}
+
+async function screenOf(ref) {
+  const at = ref.lastIndexOf('@');
+  const node = at === -1 ? 'main' : ref.slice(at + 1);
+  const pane = at === -1 ? ref : ref.slice(0, at);
+  return onNode(node, (client) => client.request('screen', { pane }));
+}
+
+// The fake is up once it says so; a pane that says anything else is shown in the failure.
+async function waitForFakeCodex(target) {
+  let screen = null;
+  for (let tries = 0; tries < 300; tries += 1) {
+    screen = await screenOf(target.pane);
+    if (/fake codex ready/.test(JSON.stringify(screen))) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`the fake codex never came up in ${target.pane}: ${JSON.stringify(screen).slice(-1500)}`);
+}
+
+// A graceful exit of the fake: one newline, as a close sends, then the pane is gone.
+async function stopPane(ref, pid) {
+  const at = ref.lastIndexOf('@');
+  const node = at === -1 ? 'main' : ref.slice(at + 1);
+  const pane = at === -1 ? ref : ref.slice(0, at);
+  await onNode(node, (client) => client.request('input', { pane, data: Buffer.from('\r').toString('base64') }));
+  for (let i = 0; i < 300; i += 1) {
+    const current = await onNode(node, async (client) => (await client.request('get', { pane })).pane);
+    if (!current.alive) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  await onNode(node, (client) => client.request('kill', { pane, expectedPid: pid, signal: 'SIGKILL' }));
+  await waitDead(node, pane);
+}
+
+const MOVE_SID = 'c0dec0de-1111-4000-8000-00000000abcd';
+const MOVE_CHILD = 'c0dec0de-2222-4000-8000-00000000abcd';
+
+test('a Codex session moves to aws1 and back through real hosts, resumed by id, its rollouts proven on each side', async (t) => {
+  await withTwoNodeFleet(t, async (fleet) => {
+    await serve.closeHostClient();
+    const zdotdir = path.join(fleet.root, 'zdotdir');
+    fs.mkdirSync(zdotdir);
+    for (const name of ['.zshenv', '.zshrc']) fs.writeFileSync(path.join(zdotdir, name), '');
+    try {
+      const line = (value) => `${JSON.stringify(value)}\n`;
+      const rel = {
+        root: `sessions/2026/09/20/rollout-2026-09-20T10-00-00-${MOVE_SID}.jsonl`,
+        child: `sessions/2026/09/21/rollout-2026-09-21T11-00-00-${MOVE_CHILD}.jsonl`,
+      };
+      const file = (dir, name) => path.join(dir, ...rel[name].split('/'));
+      fs.mkdirSync(path.dirname(file(fleet.codexDir, 'root')), { recursive: true });
+      fs.mkdirSync(path.dirname(file(fleet.codexDir, 'child')), { recursive: true });
+      fs.writeFileSync(file(fleet.codexDir, 'root'), line({ type: 'session_meta', payload: { id: MOVE_SID, cwd: fleet.project, originator: 'codex-tui' } })
+        + line({ type: 'turn_context', payload: { model: 'gpt-test-rollout', cwd: fleet.project } })
+        + line({ type: 'event_msg', payload: { type: 'user_message', message: 'start' } })
+        + line({ type: 'event_msg', payload: { type: 'task_complete' } }));
+      fs.writeFileSync(file(fleet.codexDir, 'child'), line({ type: 'session_meta', payload: { id: MOVE_CHILD, parent_thread_id: MOVE_SID, cwd: fleet.project } }));
+      // The account's own index is not the conversation's, and stays where it is.
+      fs.writeFileSync(path.join(fleet.codexDir, 'session_index.jsonl'), line({ id: MOVE_SID, thread_name: 'title' }));
+      accounts.pinSession(MOVE_SID, 'codex', fleet.codexAccount.id, { root: fleet.registry, node: 'main' });
+
+      const events = [];
+      const base = {
+        root: fleet.registry, connectHost: connect, daemonNode: 'main',
+        moveNodeAccount: (node, account) => (node === 'aws1' ? (account.agent === 'codex' ? fleet.aws1CodexAccount : fleet.aws1Account) : account),
+        agentProcessRows: nodeProcessRows(),
+        launchEnv: { PATH: fleet.agentPath, ZDOTDIR: zdotdir },
+        waitForHostAgent: waitForFakeCodex,
+        scanSessions: () => [{ id: MOVE_SID, kind: 'codex', project: fleet.project, mtime: Date.now() }],
+        // aws1 has a home of its own here, so its launch names its own copy of the
+        // account; on a real fleet the shared home makes these the same path.
+        prepareLaunch: undefined,
+      };
+      const launchOn = (node) => (options, local) => (node === 'aws1'
+        ? onNode('aws1', (client) => client.request('prepare-launch', { ...options, account: { ...options.account, configDir: fleet.aws1CodexDir },
+          remote: true, daemonHome: require('node:os').homedir() }))
+        : require('./launch-prep.js').prepare({ ...options, remote: false }, local));
+
+      // The session runs on main first, launched by keep open the way the move will.
+      const opened = await serve.openSession({ sessionId: MOVE_SID }, { ...base, codexFlags: '', prepareLaunch: launchOn('main') });
+      let source = { pane: opened.pane, pid: opened.pid };
+      assert.match(fs.readFileSync(file(fleet.codexDir, 'root'), 'utf8'), /keep_test_resumed/, 'the fake resumed the rollout on main');
+
+      const moveDeps = {
+        stop: async (record) => {
+          await stopPane(source.pane, source.pid);
+          events.push(['stopped', record.from, Date.now()]);
+        },
+        open: async (record) => {
+          const launch = await serve.sessionMoveDeps({ ...base, prepareLaunch: launchOn(record.to) }).open(record);
+          events.push(['started', record.to, Date.now()]);
+          source = { pane: launch.pane, pid: launch.pid };
+          return launch;
+        },
+        relink: async () => null,
+      };
+      const deps = { ...base, moveDeps };
+
+      // The plan: the model from the rollout's last turn, no bypass flag on the source.
+      const plan = await serve.moveSession({ sessionId: MOVE_SID, node: 'aws1', dry: true }, deps);
+      assert.deepEqual([plan.agent, plan.from, plan.to, plan.cwd, plan.model, plan.flags],
+        ['codex', 'main', 'aws1', fleet.project, 'gpt-test-rollout', '']);
+
+      const mainRoot = fs.readFileSync(file(fleet.codexDir, 'root'));
+      const there = await serve.moveSession({ sessionId: MOVE_SID, node: 'aws1' }, deps);
+      assert.equal(there.status, 'done', there.message);
+      assert.deepEqual(there.warnings, undefined, 'the source pane removed, its copy released, nothing left over');
+      assert.equal(there.files, 2, 'the root rollout and its child thread');
+      assert.equal(accounts.sessionNode(MOVE_SID, { root: fleet.registry }), 'aws1');
+      assert.deepEqual(fs.readFileSync(file(fleet.aws1CodexDir, 'child')), fs.readFileSync(file(fleet.codexDir, 'child')));
+      const aws1Root = fs.readFileSync(file(fleet.aws1CodexDir, 'root'), 'utf8');
+      assert.ok(aws1Root.startsWith(mainRoot.toString()), 'aws1 holds main\'s rollout, byte for byte');
+      assert.equal(aws1Root.split('keep_test_resumed').length - 1, 2, 'and the resume on aws1 appended to that same file');
+      assert.equal(fs.existsSync(path.join(fleet.aws1CodexDir, 'session_index.jsonl')), false, 'the session index did not travel');
+      const started = JSON.parse(fs.readFileSync(path.join(fleet.registry, '.keep', 'panes', `${MOVE_SID}.json`), 'utf8'));
+      assert.equal(started.pane, source.pane);
+      assert.equal(started.node, 'aws1');
+      assert.equal(started.moveTransactionId, there.id, 'the target\'s own process stood in for its session-start');
+      assert.match(source.pane, /@aws1$/);
+      assert.match(JSON.stringify(await screenOf(source.pane)), /fake codex ready/);
+      assert.ok(events.find((event) => event[0] === 'stopped')[2] <= events.find((event) => event[0] === 'started')[2]);
+      assert.ok(fs.existsSync(path.join(fleet.codexDir, '.keep-move', 'provenance', `${MOVE_SID}.json`)), 'main\'s copy is released');
+      assert.deepEqual(fs.readdirSync(path.join(fleet.aws1CodexDir, '.keep-move')), ['provenance']);
+      const journal = require('./session-move.js').readMove(fleet.registry, there.id);
+      assert.equal(journal.agent, 'codex');
+      assert.equal(journal.flags, '');
+
+      // Back: live on aws1, it leaves only with Owner's force.
+      await assert.rejects(serve.moveSession({ sessionId: MOVE_SID, node: 'main' }, deps), (error) => error.extra && error.extra.reason === 'remote-graceful');
+      events.length = 0;
+      const back = await serve.moveSession({ sessionId: MOVE_SID, node: 'main', ownerForce: true }, deps);
+      assert.equal(back.status, 'done', back.message);
+      assert.deepEqual(back.warnings, undefined);
+      assert.equal(accounts.sessionNode(MOVE_SID, { root: fleet.registry }), 'main');
+      const home = fs.readFileSync(file(fleet.codexDir, 'root'), 'utf8');
+      assert.ok(home.startsWith(aws1Root), 'main holds what aws1 wrote');
+      assert.equal(home.split('keep_test_resumed').length - 1, 3, 'resumed again on main, in the same file');
+      assert.doesNotMatch(source.pane, /@/);
+      assert.equal(require('./session-move.js').readMove(fleet.registry, back.id).model, 'gpt-test-rollout', 'the model it was launched with on aws1');
+
+      // A launch that fails after the flip, abandoned: the record goes back to main
+      // once neither node runs the session, and aws1 keeps a released copy.
+      const realOpen = moveDeps.open;
+      moveDeps.open = async () => { throw new Error('aws1 would not launch it'); };
+      let failedId;
+      await assert.rejects(serve.moveSession({ sessionId: MOVE_SID, node: 'aws1' }, deps), (error) => {
+        failedId = error.extra.id;
+        return error.extra.status === 'recovery-needed' && error.extra.holder === 'aws1';
+      });
+      assert.equal(accounts.sessionNode(MOVE_SID, { root: fleet.registry }), 'aws1');
+      const abandoned = await serve.moveSession({ abandon: failedId }, deps);
+      assert.equal(abandoned.status, 'abandoned-back', abandoned.message);
+      assert.deepEqual(abandoned.warnings, undefined);
+      assert.equal(accounts.sessionNode(MOVE_SID, { root: fleet.registry }), 'main');
+      assert.ok(fs.existsSync(path.join(fleet.aws1CodexDir, '.keep-move', 'provenance', `${MOVE_SID}.json`)));
+      moveDeps.open = realOpen;
+      // Stopped on main now; keep open resumes it there again.
+      const again = await serve.openSession({ sessionId: MOVE_SID }, { ...base, codexFlags: '', prepareLaunch: launchOn('main') });
+      assert.doesNotMatch(again.pane, /@/);
+      await stopPane(again.pane, again.pid);
+    } finally {
+      await serve.closeHostClient();
+    }
+  }, { nodeHome: true, codex: true });
+});

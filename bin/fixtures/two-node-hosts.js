@@ -97,10 +97,36 @@ const FAKE_CLAUDE = [
   '',
 ].join('\n');
 
+// A Codex TUI that resumes the way the daemon's evidence expects one to: called
+// `codex`, it takes `resume <id>` (after whatever flags), finds that conversation's
+// rollout under $CODEX_HOME/sessions, appends a line to it and holds it open, says it
+// is ready, and exits on one newline. A resume of a conversation it cannot find says
+// so and waits, so the pane shows why.
+const FAKE_CODEX_RESUME = [
+  '#!/bin/sh',
+  'id=""',
+  'prev=""',
+  'for arg in "$@"; do',
+  '  if [ "$prev" = "resume" ]; then id="$arg"; fi',
+  '  prev="$arg"',
+  'done',
+  'if [ -z "$id" ]; then printf "fake codex: no resume id\\n"; exit 2; fi',
+  'f="$(find "$CODEX_HOME/sessions" -name "rollout-*-$id.jsonl" -type f 2>/dev/null | head -n 1)"',
+  'if [ -z "$f" ]; then printf "fake codex: no rollout for %s\\n" "$id"; read -r line; exit 3; fi',
+  'printf \'{"type":"event_msg","payload":{"type":"keep_test_resumed"}}\\n\' >> "$f"',
+  'exec 3>>"$f"',
+  'printf "fake codex ready\\n"',
+  'read -r line',
+  'exit 0',
+  '',
+].join('\n');
+
 // The two hosts, plus everything a launch needs to be real: a registry of its own,
 // one managed Claude account whose config directory exists, a project to run in, and
 // that agent on PATH. Enough for a card to be opened on aws1, or a pane there to be
-// restarted, without any of it being mocked.
+// restarted, without any of it being mocked. With `{ codex: true }` a managed Codex
+// account joins it (on aws1 too, under aws1's own home with `nodeHome`), with
+// FAKE_CODEX_RESUME on PATH as `codex`.
 async function withTwoNodeFleet(t, body, options = {}) {
   return withTwoNodes(t, async (fleet) => {
     const registry = path.join(fleet.root, 'registry');
@@ -112,9 +138,16 @@ async function withTwoNodeFleet(t, body, options = {}) {
     }
     fs.writeFileSync(path.join(fakeBin, 'claude'), FAKE_CLAUDE, { mode: 0o755 });
     const account = { id: 'claude-node', label: 'Node claude', agent: 'claude', configDir };
+    const codexDir = path.join(registry, 'codex');
+    const codexAccount = options.codex ? { id: 'codex-node', label: 'Node codex', agent: 'codex', configDir: codexDir } : null;
+    if (codexAccount) {
+      fs.mkdirSync(codexDir, { recursive: true });
+      fs.writeFileSync(path.join(fakeBin, 'codex'), FAKE_CODEX_RESUME, { mode: 0o755 });
+    }
     // One file: an install's config.json holds its accounts and its nodes together,
     // and a placement is only meaningful read alongside the node list.
-    const config = { ...fleet.config, accounts: [account], defaultAccounts: { claude: account.id } };
+    const config = { ...fleet.config, accounts: [account, ...(codexAccount ? [codexAccount] : [])],
+      defaultAccounts: { claude: account.id, ...(codexAccount ? { codex: codexAccount.id } : {}) } };
     fs.writeFileSync(fleet.configFile, `${JSON.stringify(config, null, 2)}\n`);
     // The node's own copy of the same account: the same id, under its own home.
     let aws1 = {};
@@ -122,11 +155,16 @@ async function withTwoNodeFleet(t, body, options = {}) {
       const aws1ConfigDir = path.join(fleet.aws1Home, 'claude');
       fs.mkdirSync(aws1ConfigDir, { recursive: true });
       const aws1Account = { ...account, configDir: aws1ConfigDir };
-      fs.writeFileSync(fleet.aws1ConfigFile, `${JSON.stringify({ ...config, accounts: [aws1Account] }, null, 2)}\n`);
-      aws1 = { aws1ConfigDir, aws1Account };
+      const aws1CodexDir = codexAccount ? path.join(fleet.aws1Home, 'codex') : null;
+      const aws1CodexAccount = codexAccount ? { ...codexAccount, configDir: aws1CodexDir } : null;
+      if (aws1CodexDir) fs.mkdirSync(aws1CodexDir, { recursive: true });
+      fs.writeFileSync(fleet.aws1ConfigFile, `${JSON.stringify({ ...config,
+        accounts: [aws1Account, ...(aws1CodexAccount ? [aws1CodexAccount] : [])] }, null, 2)}\n`);
+      aws1 = { aws1ConfigDir, aws1Account, ...(aws1CodexAccount ? { aws1CodexDir, aws1CodexAccount } : {}) };
     }
     return body({
       ...aws1,
+      ...(codexAccount ? { codexDir, codexAccount } : {}),
       ...fleet,
       config,
       registry,
@@ -141,4 +179,4 @@ async function withTwoNodeFleet(t, body, options = {}) {
   }, options);
 }
 
-module.exports = { withTwoNodes, withTwoNodeFleet, FAKE_CLAUDE };
+module.exports = { withTwoNodes, withTwoNodeFleet, FAKE_CLAUDE, FAKE_CODEX_RESUME };
