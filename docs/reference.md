@@ -1288,7 +1288,10 @@ holds the verified bytes and before the target starts; the target is launched th
 `keep open` pinned to the new record, and the move waits for its session-start. Then the
 card's session link is rewritten with the new node, the stopped pane is removed, the copy
 left behind is released for a later move back, and a move off a node also drops the
-daemon's transcript mirror for it and the node's hook queue and cursor. A move that fails
+daemon's transcript mirror for it and the node's hook queue and cursor. A finished move
+deletes its transaction directory on the target, `<configDir>/.keep-move/<tx>/`, and the
+backups of any files its publish replaced go with it; only the provenance record
+(`<configDir>/.keep-move/provenance/<sid>.json`) stays. A move that fails
 is left `recovery-needed` with a message naming the node that holds the verified bytes
 (the source before the flip, the target after it): `keep move --recover <tx>` continues
 from the step that failed, and `keep move --abandon <tx>` clears the target's stage and

@@ -12663,6 +12663,11 @@ function sessionMoveDeps(deps = {}) {
         try { await nodeArtifacts(record.from, moveNodeAccount(record.from, account, deps), deps).dropSession(record.sessionId); }
         catch (error) { warnings.push(`${record.from} did not drop its hook state: ${error.message}`); }
       }
+      // The transaction on the target: its emptied stage, its publish record and the
+      // backups of what the publish replaced. The provenance record lives beside it,
+      // not in it, and stays.
+      try { await moveEndpoint(record.to, account, deps).abort(record.id); }
+      catch (error) { warnings.push(`the move's transaction on ${record.to} was not cleared: ${error.message}`); }
       return warnings;
     },
     abortStage: async (record) => {

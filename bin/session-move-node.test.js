@@ -132,6 +132,11 @@ test('a session moves to aws1 and back, its bytes proven on each side, never run
         'the stopped pane on main is removed');
       assert.ok(fs.existsSync(path.join(fleet.configDir, '.keep-move', 'provenance', `${SID}.json`)),
         'main\'s copy is released for a later move back');
+      assert.deepEqual(fs.readdirSync(path.join(fleet.aws1ConfigDir, '.keep-move')), ['provenance'],
+        'the finished transaction is gone from aws1; its provenance stays');
+      assert.ok(fs.existsSync(path.join(fleet.aws1ConfigDir, '.keep-move', 'provenance', `${SID}.json`)));
+      await assert.rejects(require('./artifact-transport.js').localArtifacts(fleet.account, { accounts: () => [fleet.account] }).abort('provenance'),
+        (error) => error.code === 'artifacts-invalid', 'the provenance directory is never a transaction');
 
       // The session works on aws1, and aws1 has hook state and a daemon mirror for it.
       fs.appendFileSync(path.join(fleet.aws1ConfigDir, 'projects', '-work-project', `${SID}.jsonl`), line({ type: 'user', message: { content: 'on aws1' } }));
@@ -151,6 +156,8 @@ test('a session moves to aws1 and back, its bytes proven on each side, never run
       assert.deepEqual(digestsOf(fleet.configDir), digestsOf(fleet.aws1ConfigDir), 'main holds what aws1 wrote');
       assert.match(fs.readFileSync(path.join(fleet.configDir, 'projects', '-work-project', `${SID}.jsonl`), 'utf8'), /on aws1/);
       assert.equal(accounts.sessionNode(SID, { root: fleet.registry }), 'main');
+      assert.deepEqual(fs.readdirSync(path.join(fleet.configDir, '.keep-move')), ['provenance'],
+        'the transaction that replaced main\'s old copy is gone, backups with it');
       assert.ok(events.find((event) => event[0] === 'stopped')[2] <= events.find((event) => event[0] === 'started')[2]);
       assert.equal(fs.existsSync(path.join(mirror, `${SID}.jsonl`)), false, 'the daemon\'s mirror of aws1 is gone');
       assert.equal(fs.existsSync(path.join(mirror, `${SID}.json`)), false);

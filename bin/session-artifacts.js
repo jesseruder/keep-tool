@@ -59,7 +59,10 @@ function validSession(params) {
 }
 
 function validTx(params) {
-  if (typeof params.tx !== 'string' || !TX_RE.test(params.tx)) throw invalid('artifacts transaction id is not a transaction id');
+  // `provenance` is the directory beside the transactions, never one of them.
+  if (typeof params.tx !== 'string' || !TX_RE.test(params.tx) || params.tx === 'provenance') {
+    throw invalid('artifacts transaction id is not a transaction id');
+  }
   return params.tx;
 }
 
