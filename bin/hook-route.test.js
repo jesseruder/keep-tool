@@ -450,3 +450,41 @@ test('on the daemon node KEEP_HOOK_FIRED_AT alone changes nothing', async (t) =>
   const marker = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'attention', 'sess-local.json'), 'utf8'));
   assert.ok(marker.at >= before, 'stamped now, as always');
 });
+
+test('the daemon refuses a final message past its cap, and the node cuts one to fit before it posts', async (t) => {
+  const route = require('./hook-route.js');
+  const client = require('./hook-client.js');
+  assert.equal(client.INPUT_MAX_BYTES, route.INPUT_MAX_BYTES, 'the node fits the daemon\'s caps');
+  assert.equal(client.TEXT_CAPS.last_assistant_message, route.TEXT_MAX);
+
+  const { hooks, calls, root } = services(t);
+  const stop = (message, key) => body({ idempotencyKey: key,
+    input: { session_id: 'sess-aws1', cwd: '/home/node/project', hook_event_name: 'Stop', last_assistant_message: message } });
+  assert.equal((await hooks.handle(AWS1, stop('x'.repeat(route.TEXT_MAX), `${KEY}-at`))).status, 200, 'at the cap');
+  const over = await hooks.handle(AWS1, stop('x'.repeat(route.TEXT_MAX + 1), `${KEY}-over`));
+  assert.equal(over.status, 400);
+  assert.match(over.body.error, /last_assistant_message is longer than 65536 bytes/);
+  assert.equal(calls.length, 1);
+
+  // The node: a long final report (two-byte characters, so the cut must land between
+  // them) is still a stop the daemon runs, with the report's head.
+  const node = nodeClient(t, hooks, root, () => false);
+  fs.writeFileSync(node.transcriptFile, '{"n":1}\n');
+  const report = 'é'.repeat(50 * 1024);
+  const stopped = await node.run('stop', { hook_event_name: 'Stop', stop_hook_active: false, last_assistant_message: report });
+  assert.equal(stopped.delivered, true, stopped.why);
+  const sent = JSON.parse(calls.at(-1).stdin).last_assistant_message;
+  assert.ok(Buffer.byteLength(sent) <= route.TEXT_MAX && Buffer.byteLength(sent) >= route.TEXT_MAX - 1);
+  assert.ok(report.startsWith(sent), 'a prefix, cut on a character boundary');
+
+  // A tool's result far past the whole input's cap: the largest field goes, the rest stays.
+  const lifecycle = await node.run('lifecycle', { hook_event_name: 'PostToolUse', tool_name: 'Read', tool_use_id: 'toolu_1',
+    tool_input: { command: 'cat big.log' }, tool_response: { content: 'y'.repeat(300 * 1024) } });
+  assert.equal(lifecycle.delivered, true, lifecycle.why);
+  const posted = node.seen.at(-1).payload.input;
+  assert.equal(posted.tool_response, undefined);
+  assert.deepEqual(posted.tool_input, { command: 'cat big.log' });
+  assert.equal(posted.tool_use_id, 'toolu_1');
+  assert.deepEqual(JSON.parse(calls.at(-1).stdin).tool_input, { command: 'cat big.log' });
+  assert.deepEqual(calls.at(-1).args.slice(1), ['hook', 'lifecycle']);
+});

@@ -38,6 +38,13 @@ const REPLAY_MS = 5000;
 const CHUNK_BYTES = 4 * 1024 * 1024;
 const NEED_FROM_RETRIES = 3;
 const SESSION_RE = /^[A-Za-z0-9_-]{1,128}$/;
+// The daemon's caps (bin/hook-route.js): the whole stdin object, and the fields it
+// refuses past a length. What is longer is cut here, never refused there.
+const INPUT_MAX_BYTES = 256 * 1024;
+const TEXT_CAPS = Object.freeze({ last_assistant_message: 64 * 1024, message: 4096, title: 1024 });
+// What the daemon's hook needs to run at all, never dropped to fit.
+const KEPT_FIELDS = new Set(['session_id', 'transcript_path', 'cwd', 'hook_event_name', 'stop_hook_active', 'permission_mode',
+  'source', 'reason', 'notification_type', 'tool_name', 'agent_id', 'prompt_id', 'tool_use_id']);
 const ACCOUNT_RE = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex|pi)\/default)$/;
 
 function stateDir(env = process.env) { return path.join(env.HOME || os.homedir(), '.keep-node'); }
@@ -113,6 +120,39 @@ function identityOf(input, env, where) {
   if (env.KEEP_PANE) identity.pane = nodes.formatPaneRef(where.local, env.KEEP_PANE, env);
   if (ACCOUNT_RE.test(env.KEEP_AGENT_ACCOUNT_ID || '')) identity.accountId = env.KEEP_AGENT_ACCOUNT_ID;
   return identity;
+}
+
+// A string cut to at most \`max\` UTF-8 bytes, on a character boundary.
+function clipBytes(value, max) {
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.length <= max) return value;
+  let end = max;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString('utf8');
+}
+
+const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value));
+
+// The stdin object cut to what the daemon accepts: the capped text fields
+// truncated (a long final report is still a stop, and the daemon's hook reads only
+// its first 12000 characters), then, while the whole is still too large, the
+// largest other field dropped. The daemon's own caps stay refusals.
+function fitInput(input) {
+  const out = { ...input };
+  for (const [key, max] of Object.entries(TEXT_CAPS)) {
+    if (typeof out[key] === 'string') out[key] = clipBytes(out[key], max);
+  }
+  while (jsonBytes(out) > INPUT_MAX_BYTES) {
+    let largest = null;
+    for (const key of Object.keys(out)) {
+      if (KEPT_FIELDS.has(key) || out[key] === undefined) continue;
+      const size = jsonBytes(out[key]);
+      if (!largest || size > largest.size) largest = { key, size };
+    }
+    if (!largest) break;
+    delete out[largest.key];
+  }
+  return out;
 }
 
 function newKey() { return crypto.randomBytes(16).toString('hex'); }
@@ -279,6 +319,7 @@ async function runHook(event, input, where, deps = {}) {
   const started = now();
   // First, before any wait: the transcript as this event saw it.
   const snapshot = snapshotOf(input.transcript_path);
+  input = fitInput(input);
   const budget = (deps.budgets || BUDGET_MS)[event];
   const deadline = started + budget;
   const identity = identityOf(input, env, where);
@@ -337,6 +378,6 @@ function report(env = process.env) {
 }
 
 module.exports = {
-  runHook, deliver, replayQueue, enqueue, dropSession, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
-  EVENTS, BUDGET_MS, QUEUE_MAX, CHUNK_BYTES,
+  runHook, deliver, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
+  EVENTS, BUDGET_MS, QUEUE_MAX, CHUNK_BYTES, INPUT_MAX_BYTES, TEXT_CAPS,
 };

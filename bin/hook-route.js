@@ -307,5 +307,5 @@ function createHookService(options = {}) {
 
 module.exports = {
   createHookService, validateRequest, cleanInput, digestOf,
-  EVENTS, TRANSCRIPT_ONLY, HOOK_TIMEOUT_MS, INPUT_MAX_BYTES, BODY_MAX_BYTES,
+  EVENTS, TRANSCRIPT_ONLY, HOOK_TIMEOUT_MS, INPUT_MAX_BYTES, BODY_MAX_BYTES, TEXT_MAX,
 };
