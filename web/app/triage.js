@@ -140,10 +140,13 @@ export function agentEventText(event) {
   return event ? String(event.text || event.title || event.kind || '') : '';
 }
 
+// The node chip follows the name for an agent whose session runs on another
+// machine, as it does beside a working session's provider icon.
 export function agentRowHTML(ctx, agent) {
   const badge = agentBadge(agent);
   const last = agent?.lastEvent || null;
-  return `<span class="stripe"></span><span class="t">${ctx.esc(agent.name)}</span>
+  const node = remoteNode({ session: agentSession(ctx, agent), pane: agentPane(ctx, agent) });
+  return `<span class="stripe"></span><span class="t">${ctx.esc(agent.name)}${nodeBadgeHTML(ctx.esc, node)}</span>
     <span class="w">${badge ? `<span class="abadge ${badge.tone}">${ctx.esc(badge.count)}</span>` : ''}</span>
     <span class="p"><span class="kind agent-life">${ctx.esc(agentLifecycleLabel(agent))}</span>${ctx.esc(agent.role || '')}</span>
     <span class="s">${last ? `${ctx.esc(agentEventText(last))} <span class="w num">${ctx.esc(ctx.rel(last.at))}</span>` : 'no events yet'}</span>`;

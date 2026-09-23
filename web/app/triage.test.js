@@ -413,6 +413,26 @@ test('the badge counts unseen events and turns red only for needs-you', async ()
   assert.match(agentRowHTML(ctx, LOUD_ROW), /<span class="abadge hot">1<\/span>/);
 });
 
+test('an agent on another node carries the node chip; one on the daemon node does not', async () => {
+  const { agentRowHTML } = await import('./triage.js');
+  // The reviewer's session is flagged `reviewer`, so the row finds it by the
+  // agent's own session pointer rather than by a stamped agentName.
+  const remote = ctxFor({
+    sessions: [{ id: 'r1', kind: 'claude', reviewer: true, node: 'aws1', pane: 'pane-r@aws1' }],
+    panes: [{ id: 'pane-r@aws1', node: 'aws1', alive: true }],
+  });
+  const row = { ...REVIEWER_ROW, session: { id: 'r1', pane: 'pane-r@aws1' } };
+  assert.match(agentRowHTML(remote, row),
+    /<span class="t">fleet-reviewer<span class="node-badge" title="runs on node aws1">aws1<\/span><\/span>/);
+
+  const local = ctxFor({
+    sessions: [{ id: 'r1', kind: 'claude', reviewer: true, pane: 'pane-r' }],
+    panes: [{ id: 'pane-r', node: 'main', alive: true }],
+  });
+  assert.equal(agentRowHTML(local, REVIEWER_ROW).includes('node-badge'), false);
+  assert.equal(agentRowHTML(ctxFor(), REVIEWER_ROW).includes('node-badge'), false, 'no session resolved is no chip');
+});
+
 test('the pane a row opens is the live one, or none at all', async () => {
   const { agentLivePane } = await import('./triage.js');
   const live = ctxFor({ agents: [QUIET_ROW], panes: [{ id: 'pane-1', alive: true }] });

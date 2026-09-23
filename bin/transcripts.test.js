@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const accounts = require('./accounts');
-const { findSessionFile } = require('./transcripts');
+const { findSessionFile, readableSessionFile } = require('./transcripts');
 
 function withDiscoveryStubs(t, { pinned = null, authorityError = null, matches = [] } = {}) {
   const originalForSession = accounts.forSession;
@@ -100,6 +100,31 @@ test('a session recorded on another node is refused even when its account is gon
   fs.writeFileSync(file, JSON.stringify({ version: 1, sessionId: 'remote-session', agent: 'claude',
     accountId: 'a', node: 'main', updatedAt: 1 }, null, 2) + '\n');
   assert.equal(findSessionFile('remote-session', { root }), '/a/one/remote-session.jsonl');
+});
+
+test('a reader is given the mirror of a session on another node, and nothing local', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-transcript-readable-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const record = path.join(root, '.keep', 'session-accounts', 'remote-session.json');
+  fs.mkdirSync(path.dirname(record), { recursive: true });
+  fs.writeFileSync(record, JSON.stringify({ version: 1, sessionId: 'remote-session', agent: 'claude',
+    accountId: 'a', node: 'laptop', updatedAt: 1 }, null, 2) + '\n');
+  const stubs = withDiscoveryStubs(t, { matches: [{ accountId: 'a', file: '/a/one/remote-session.jsonl' }] });
+
+  // Nothing mirrored yet: no file, rather than the local one that shares the id.
+  assert.equal(readableSessionFile('remote-session', { root }), null);
+  const mirror = path.join(root, '.keep', 'transcript-mirrors', 'laptop', 'remote-session.jsonl');
+  fs.mkdirSync(path.dirname(mirror), { recursive: true });
+  fs.writeFileSync(mirror, '{"type":"user"}\n');
+  assert.equal(readableSessionFile('remote-session', { root }), mirror);
+  assert.deepEqual(stubs.calls(), { authorityCalls: 0, discoveryCalls: 0 });
+  // The strict lookup still refuses: its callers deliver, move or verify against the file.
+  assert.throws(() => findSessionFile('remote-session', { root }), /runs on node laptop/);
+
+  // On this node the reader gets exactly what findSessionFile answers.
+  fs.writeFileSync(record, JSON.stringify({ version: 1, sessionId: 'remote-session', agent: 'claude',
+    accountId: 'a', node: 'main', updatedAt: 1 }, null, 2) + '\n');
+  assert.equal(readableSessionFile('remote-session', { root }), '/a/one/remote-session.jsonl');
 });
 
 test('a pinned session is answered from the transcript an earlier walk found, without walking again', (t) => {

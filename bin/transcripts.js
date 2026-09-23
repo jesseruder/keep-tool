@@ -225,5 +225,23 @@ function findSessionFile(id, options = {}) {
   return matches[0]?.file || null;
 }
 
+// A file this machine can read the session's history from, for readers only (the
+// reviewer, summaries). A session on another node is read from the daemon's mirror
+// of its transcript (bin/transcript-mirror.js), which trails the node by one hook
+// post, or null when nothing has been mirrored yet. findSessionFile still refuses
+// such a session: its callers deliver, move or verify against the file, and a
+// mirror is not the session's own transcript.
+function readableSessionFile(id, options = {}) {
+  const accounts = require('./accounts');
+  const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+  const env = options.env || process.env;
+  let recordedNode = null;
+  try { recordedNode = accounts.sessionNode(id, { root, env }); } catch {}
+  if (recordedNode && recordedNode !== nodes.daemonNode(env)) {
+    try { return require('./transcript-mirror.js').stat(root, recordedNode, id)?.path || null; } catch { return null; }
+  }
+  return findSessionFile(id, options);
+}
+
 module.exports = { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscript, readTranscriptTail, lastTurnUsage, findSessionFile,
-  claudeFilesIn, claudeFilesInProjects };
+  readableSessionFile, claudeFilesIn, claudeFilesInProjects };

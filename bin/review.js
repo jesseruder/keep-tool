@@ -27,7 +27,7 @@ const health = require('./health.js');
 const probes = require('./review-probes.js');
 const quality = require('./review-quality.js');
 const related = require('./review-related.js');
-const { PROJECTS_DIR, findSessionFile, readTranscript, textOf: transcriptTextOf } = require('./transcripts.js');
+const { PROJECTS_DIR, readableSessionFile, readTranscript, textOf: transcriptTextOf } = require('./transcripts.js');
 
 const META = path.join(keep.ROOT, '.keep');
 const REVIEW_DIR = path.join(META, 'review');
@@ -581,9 +581,9 @@ function contributorSessionsForEntries(entries, ownerSessions, excluded) {
 
 function locateSession(session) {
   // Frontmatter is only as trustworthy as whatever wrote it; codex.findRolloutFile
-  // validates, findSessionFile does not.
+  // validates, readableSessionFile does not.
   if (!SESSION_ID_RE.test(String(session.id || ''))) return null;
-  return session.agent === 'codex' ? codex.findRolloutFile(session.id) : findSessionFile(session.id);
+  return session.agent === 'codex' ? codex.findRolloutFile(session.id) : readableSessionFile(session.id);
 }
 
 // ---------- reviewer state ----------
@@ -1565,7 +1565,7 @@ function buildBundle(taskId, opts = {}) {
       try { mtimeMs = fs.statSync(file).mtimeMs; } catch {}
       const window = codexWindow(session, sessions, mtimeMs, Date.now());
       let verification = [];
-      const parentFile = parent.id ? findSessionFile(parent.id) : null;
+      const parentFile = parent.id ? readableSessionFile(parent.id) : null;
       if (parentFile) {
         try { verification = verificationCommands(readDeltaLines(parentFile, 0).lines, startMs, window.endMs); } catch {}
       }
@@ -2090,7 +2090,7 @@ function reviewerUsage(opts) {
   ledger.sessions = ledger.sessions || {};
   let dirty = false;
   for (const sid of markerIds(REVIEWER_DIR)) {
-    const file = findSessionFile(sid);
+    const file = readableSessionFile(sid);
     if (!file) continue;
     let size;
     try { size = fs.statSync(file).size; } catch { continue; }
@@ -3710,7 +3710,7 @@ function reviewStats() {
   try { usage = reviewerUsage(); } catch {}
   const today = keep.nowStamp().slice(0, 10);
   let transcript = null;
-  const current = markers.find((marker) => !marker.ended && findSessionFile(marker.id));
+  const current = markers.find((marker) => !marker.ended && readableSessionFile(marker.id));
   if (current) {
     if (transcriptMetricsCache.result && transcriptMetricsCache.sessionId === current.id
         && now - transcriptMetricsCache.at < 5 * 60e3) transcript = transcriptMetricsCache.result;
@@ -3720,7 +3720,7 @@ function reviewStats() {
         transcript = {
           sessionId: current.id,
           ...reviewerTranscriptMetrics(
-            readTranscript(findSessionFile(current.id)), today, ticks,
+            readTranscript(readableSessionFile(current.id)), today, ticks,
             ((meta.days || {})[today] || {}).compacts,
           ),
         };
@@ -4219,7 +4219,7 @@ function readTailText(file, bytes) {
 }
 
 function lastTickCost(sessionId) {
-  const file = SESSION_ID_RE.test(String(sessionId || '')) ? findSessionFile(sessionId) : null;
+  const file = SESSION_ID_RE.test(String(sessionId || '')) ? readableSessionFile(sessionId) : null;
   if (!file) return null;
   let messages = null;
   try { messages = lastTickMessageCount(readTailText(file, LAST_TICK_TAIL_BYTES)); } catch { return null; }
@@ -4669,7 +4669,7 @@ async function reviewerCompactTick(deps) {
   let transcriptMtime;
   if (options.transcriptMtime) transcriptMtime = options.transcriptMtime(reviewer);
   else {
-    const file = findSessionFile(reviewer.id);
+    const file = readableSessionFile(reviewer.id);
     try { transcriptMtime = file ? fs.statSync(file).mtimeMs : NaN; } catch { transcriptMtime = NaN; }
   }
   const contextTokens = options.sessionContextTokens ? options.sessionContextTokens(reviewer) : 0;

@@ -395,7 +395,8 @@ function sessionSummaryFile(session, deps = {}) {
   const reader = deps.codex || codex;
   return session && (session.kind === 'codex'
     ? reader.rolloutFileFor(session.id) || reader.findRolloutFile(session.id)
-    : (deps.findSessionFile || findSessionFile)(session.id));
+    // A summary only reads, so a session on another node is summarized from its mirror.
+    : (deps.findSessionFile || transcripts.readableSessionFile)(session.id));
 }
 function prepareSessionSummary(session, options = {}, deps = {}) {
   const file = deps.file || sessionSummaryFile(session, deps);
