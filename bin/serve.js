@@ -13386,6 +13386,25 @@ function sessionMoveDeps(deps = {}) {
     return account;
   };
   const agentOf = (record) => record.agent || 'claude';
+  // Waits (bounded) for a fresh listing in which the source's pane is gone, exited, or
+  // shown with no agent in it. Agent-agnostic: the agent has already been proven gone
+  // from the source's process table; this is the pane list catching up with that.
+  const sourcePaneGone = async (record) => {
+    const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    const deadline = Date.now() + (deps.moveStopPaneTimeoutMs || 15000);
+    for (;;) {
+      const panes = await listPanes();
+      const pane = Array.isArray(panes) ? panes.find((entry) => entry && entry.id === record.pane.id) : undefined;
+      if (Array.isArray(panes) && (!pane || pane.alive === false || pane.agentAlive === false
+          || !pane.meta || pane.meta.sessionId !== record.sessionId)) return;
+      if (Date.now() >= deadline) {
+        throw new InjectionError(409, Array.isArray(panes)
+          ? `the pane ${record.pane.id} on ${record.from} is still listed as running ${sessionRef(record.sessionId)} after its agent stopped`
+          : 'the terminal hosts did not list their panes after the stop');
+      }
+      await sleep(250);
+    }
+  };
   return {
     root, env, daemonNode: daemon,
     nodeNames: () => placementNodes(deps).map((node) => node.name),
@@ -13447,6 +13466,12 @@ function sessionMoveDeps(deps = {}) {
       }
       // Proven again from the source's own table whether or not it was just stopped.
       await requireNoAgentOn(record.from, record.sessionId, deps, agentOf(record));
+      // And the source's pane seen gone from a listing taken now: the launch judges
+      // the session's panes from a listing, and one taken before the stop (the pane
+      // cache is a second long, and this stop's own list above fills it) would still
+      // show the source live and refuse the target's start. A pane still listed live
+      // with no agent in it proven gone refuses the stop, which the recovery retries.
+      if (record.pane) await sourcePaneGone(record);
     },
     digestsOn,
     // The same proof, asked again before the flip and before every launch.
@@ -13490,9 +13515,12 @@ function sessionMoveDeps(deps = {}) {
       const flags = agentOf(record) === 'codex'
         ? (typeof record.flags === 'string' ? { codexFlags: record.flags } : {})
         : { claudeFlags: record.bypass ? '--dangerously-skip-permissions' : '' };
+      // The launch reads the session's panes from a fresh listing, never the second-long
+      // cache: one filled before the stop still shows the source's pane live.
+      const listing = deps.listHostPaneResult || deps.listHostPanes ? {} : { listHostPaneResult: (given) => listHostPaneResult(given, true) };
       const launch = await (deps.openSession || openSession)({ sessionId: record.sessionId, node: record.to, accountId: record.accountId,
         ...(record.model ? { model: record.model } : {}) },
-      { ...deps, ...flags, reopenCompaction: 'skip', moveTransactionId: record.id });
+      { ...deps, ...listing, ...flags, reopenCompaction: 'skip', moveTransactionId: record.id });
       return launch;
     },
     waitForPaneRecord: async (record) => {

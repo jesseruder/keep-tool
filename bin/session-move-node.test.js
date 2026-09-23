@@ -639,17 +639,19 @@ test('a resumed Codex that has not taken a turn is verified by its own process o
 
 // ---------- a real Codex move between two hosts ----------
 
-// Each node sees the processes under its own panes and none under the other's: the
-// two hosts share one machine here, and a real node's table holds only its own.
+// Each node sees the agents under its own panes and no other agent: the two hosts
+// share one machine here, and a real node's table holds only its own. Agents outside
+// this run (another run of this file, a person's own sessions) are not either node's,
+// and their pids coming and going would only make the open-file read racy. Every
+// other row stays, so a table is never empty.
 function nodeProcessRows() {
   return async (_given, options = {}) => {
     const node = options.node || 'main';
-    const other = node === 'main' ? 'aws1' : 'main';
     const rows = await serve.agentProcessRows({ daemonNode: 'main', processRowsCache: { value: null, at: 0, pending: null } }, {});
-    const listed = await onNode(other, (client) => client.request('list', {}));
+    const listed = await onNode(node, (client) => client.request('list', {}));
     const roots = new Set((listed.panes || []).filter((pane) => pane.alive).map((pane) => pane.pid));
     const byPid = new Map(rows.map((row) => [row.pid, row]));
-    const underOther = (row) => {
+    const underOwn = (row) => {
       const seen = new Set();
       for (let at = row; at && !seen.has(at.pid); at = byPid.get(at.ppid)) {
         if (roots.has(at.pid)) return true;
@@ -657,7 +659,7 @@ function nodeProcessRows() {
       }
       return false;
     };
-    return rows.filter((row) => !underOther(row));
+    return rows.filter((row) => !row.agent || underOwn(row));
   };
 }
 
@@ -679,23 +681,36 @@ async function waitForFakeCodex(target) {
   throw new Error(`the fake codex never came up in ${target.pane}: ${JSON.stringify(screen).slice(-1500)}`);
 }
 
-// A graceful exit of the fake: one newline, as a close sends, then the pane is gone.
+// A graceful exit of the fake: one newline, as a close sends, then the pane is gone
+// from its host's own list (bounded; a fake that does not exit is killed, and the
+// list must still say so).
 async function stopPane(ref, pid) {
   const at = ref.lastIndexOf('@');
   const node = at === -1 ? 'main' : ref.slice(at + 1);
   const pane = at === -1 ? ref : ref.slice(0, at);
+  const listedExited = async () => {
+    const listed = await onNode(node, (client) => client.request('list', {}));
+    const current = (listed.panes || []).find((entry) => entry.id === pane);
+    return !current || current.alive === false;
+  };
   await onNode(node, (client) => client.request('input', { pane, data: Buffer.from('\r').toString('base64') }));
   for (let i = 0; i < 300; i += 1) {
-    const current = await onNode(node, async (client) => (await client.request('get', { pane })).pane);
-    if (!current.alive) return;
+    if (await listedExited()) return;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   await onNode(node, (client) => client.request('kill', { pane, expectedPid: pid, signal: 'SIGKILL' }));
-  await waitDead(node, pane);
+  for (let i = 0; i < 100; i += 1) {
+    if (await listedExited()) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`pane ${pane} on ${node} is still listed alive`);
 }
 
-const MOVE_SID = 'c0dec0de-1111-4000-8000-00000000abcd';
-const MOVE_CHILD = 'c0dec0de-2222-4000-8000-00000000abcd';
+// Fresh for every run: the fakes are real processes on this machine, and a second run
+// of this file at the same time (the suite's own, beside a rerun) must not find this
+// run's agent holding its session.
+const MOVE_SID = crypto.randomUUID();
+const MOVE_CHILD = crypto.randomUUID();
 
 test('a Codex session moves to aws1 and back through real hosts, resumed by id, its rollouts proven on each side', async (t) => {
   await withTwoNodeFleet(t, async (fleet) => {
@@ -824,4 +839,29 @@ test('a Codex session moves to aws1 and back through real hosts, resumed by id, 
       await serve.closeHostClient();
     }
   }, { nodeHome: true, codex: true });
+});
+
+test('the stop resolves only once a fresh listing shows the source pane gone, so the launch never sees it live', async () => {
+  const idle = '11 10 ttys001 Tue Sep  8 10:00:00 2026 /bin/zsh';
+  const record = { id: `mv-${'b'.repeat(24)}`, sessionId: SID, agent: 'codex', from: 'main', to: 'aws1', accountId: 'codex-a',
+    pane: { id: 'p1', pid: 42 } };
+  const live = { id: 'p1', pid: 42, alive: true, agentAlive: true, meta: { sessionId: SID } };
+  const stop = (lists) => {
+    const asked = [];
+    const stopped = [];
+    return { asked, stopped, run: serve.sessionMoveDeps({ daemonNode: 'main', psTable: idle, moveStopPaneTimeoutMs: 50, sleep: async () => {},
+      listHostPanes: async (_deps, fresh) => { asked.push(fresh); return lists.length > 1 ? lists.shift() : lists[0]; },
+      restartSession: async () => { stopped.push('stop'); } }).stop(record) };
+  };
+  // The listing catches up with the stop: first still live, then exited.
+  const catching = stop([[live], [live], [{ ...live, alive: false }]]);
+  await catching.run;
+  assert.deepEqual(catching.stopped, ['stop']);
+  assert.ok(catching.asked.length >= 3 && catching.asked.every((fresh) => fresh === true), 'every listing is a fresh one');
+  // A pane shown with no agent in it, or gone from the list, is stopped too.
+  await stop([[live], [{ ...live, agentAlive: false }]]).run;
+  await stop([[live], []]).run;
+  // One still listed live after the agent is gone refuses the stop, by name.
+  await assert.rejects(stop([[live]]).run, (error) => error.status === 409
+    && /the pane p1 on main is still listed as running .* after its agent stopped/.test(error.message));
 });
