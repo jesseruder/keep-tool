@@ -9474,13 +9474,30 @@ async function adoptNodeCodexLaunch(launch, expected, deps = {}) {
   // The bind did not hold: the open learns no session, and the launch record goes
   // too, or late adoption could later take whatever session that pane names.
   let dropped = false;
+  let card = null;
   if (expected.requestId != null) {
+    // Read before it goes: the card a card open recorded, which nothing else would
+    // put the session on once the record is consumed.
+    const recorded = (deps.readNodeCodexLaunch || require('./late-adoption.js').readNodeCodexLaunch)(
+      deps.root || keep.ROOT, node, expected.requestId);
+    card = recorded && typeof recorded.card === 'string' ? recorded.card : null;
     try {
       (deps.consumeNodeCodexLaunch || require('./late-adoption.js').consumeNodeCodexLaunch)(
         deps.root || keep.ROOT, node, expected.requestId);
       dropped = true;
     } catch (error) {
       process.stderr.write(`keep serve: could not drop the Codex launch record for ${launch.pane}: ${error.message}\n`);
+    }
+  }
+  // The session is pinned to the node all the same: on the card, so it is not left
+  // placed but ownerless. The requester keeps the card too; the open fails.
+  if (dropped && card && deps.linkLaunchedSession !== skipCardLink) {
+    try {
+      if (!(deps.linkLaunchedSession || keep.linkLaunchedSession)(card, { id: sessionId, agent: 'codex', node })) {
+        process.stderr.write(`keep serve: could not link ${sessionRef(sessionId)} to ${card}: no such card\n`);
+      }
+    } catch (error) {
+      process.stderr.write(`keep serve: could not link ${sessionRef(sessionId)} to ${card}: ${error.message}\n`);
     }
   }
   const why = bindError

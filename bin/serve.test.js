@@ -16321,10 +16321,11 @@ test('an open\'s own adoption whose pane bind fails or settles on another sessio
     const expected = { agent: 'codex', accountId: account.id, requestId: 'open-bind-1', launchedAt, project, model: '',
       node: 'aws1', account };
     const baseMeta = { agent: 'codex', accountId: account.id, openRequestId: 'open-bind-1', launchedAt, project };
-    const run = async (mode) => {
-      lateAdoption.recordNodeCodexLaunch(root, { node: 'aws1', requestId: 'open-bind-1', accountId: account.id, launchedAt, pane: 'p1', project });
+    const run = async (mode, recorded = {}) => {
+      lateAdoption.recordNodeCodexLaunch(root, { node: 'aws1', requestId: 'open-bind-1', accountId: account.id, launchedAt, pane: 'p1', project, ...recorded });
       let bound = null;
       const pins = [];
+      const linked = [];
       const hostRequest = async (type, params) => {
         if (type === 'hello') return { transcript: 2 };
         if (type === 'transcript') return { rollouts: [{ id: 'found-session' }] };
@@ -16339,8 +16340,9 @@ test('an open\'s own adoption whose pane bind fails or settles on another sessio
       const result = await adoptNodeCodexLaunch(launch, expected, {
         root, daemonNode: 'main', hostRequest, codexOwnsPane: async () => true, accountForSession: () => null,
         pinSession: (id) => pins.push(id),
+        linkLaunchedSession: (cardId, session) => { linked.push([cardId, session]); return { linked: session.id }; },
       });
-      return { result, pins, record: lateAdoption.readNodeCodexLaunch(root, 'aws1', 'open-bind-1') };
+      return { result, pins, linked, record: lateAdoption.readNodeCodexLaunch(root, 'aws1', 'open-bind-1') };
     };
     const ok = await run('ok');
     assert.equal(ok.result.sessionId, 'found-session');
@@ -16353,6 +16355,13 @@ test('an open\'s own adoption whose pane bind fails or settles on another sessio
       assert.match(result.why, mode === 'throws' ? /could not be bound to .*host went away/ : /was bound to someone-else instead/);
       assert.equal(record, null, `${mode}: nothing is left for late adoption to take`);
     }
+    // A card open's record names its card: the session, pinned all the same, goes on it
+    // rather than being left placed and ownerless. A plain open links nothing.
+    const onCard = await run('other', { card: 'the-card', requester: 'handing-session' });
+    assert.equal(onCard.result.launchDropped, true);
+    assert.deepEqual(onCard.pins, ['found-session']);
+    assert.deepEqual(onCard.linked, [['the-card', { id: 'found-session', agent: 'codex', node: 'aws1' }]]);
+    assert.deepEqual((await run('throws')).linked, []);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
