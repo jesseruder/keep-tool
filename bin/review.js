@@ -4666,6 +4666,19 @@ async function reviewerCompactTick(deps) {
     ? options.reviewer(sessions, meta)
     : findReviewerSession(sessions, meta.bootstrapAttempts);
   if (!reviewer) return { compacted: false, skipped: true, why: 'no live reviewer session registered' };
+  // Compaction types into the pane, and the daemon refuses that on another node
+  // (refuseRemoteCompaction), so a reviewer there is skipped rather than failed.
+  // The node comes from the session's location record: the scanned rows carry no
+  // `node`, and may be a stale local copy from before the session moved.
+  const daemonNode = (options.daemonNode || (() => require('./nodes.js').daemonNode()))();
+  let reviewerNode = null;
+  try {
+    reviewerNode = (options.sessionNode || ((id) => require('./accounts').sessionNode(id)))(reviewer.id);
+  } catch {}
+  reviewerNode ||= reviewer.node || null;
+  if (reviewerNode && reviewerNode !== daemonNode) {
+    return { compacted: false, skipped: true, why: `reviewer runs on node ${reviewerNode}; compaction there is not supported yet` };
+  }
   let transcriptMtime;
   if (options.transcriptMtime) transcriptMtime = options.transcriptMtime(reviewer);
   else {

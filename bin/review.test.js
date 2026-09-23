@@ -1654,6 +1654,28 @@ test('reviewerCompactTick waits for an idle, clear, over-threshold reviewer and 
   meta.lastTickAt = clock;
   assert.equal((await run({ ...base, mtime: clock - 3 * 60e3 }, 90000)).compacted, true);
   assert.equal(compactCalls, 2);
+
+  // A reviewer on another node is skipped before anything is read or typed. Its
+  // scanned row carries no `node` (a stale local copy); the location record decides.
+  clock += 1000;
+  meta.lastTickAt = clock;
+  const reviewer = { ...base, mtime: clock - 3 * 60e3 };
+  const remote = await reviewerCompactTick({
+    now: () => clock,
+    loadMeta: () => meta,
+    saveMeta: (next) => { meta = next; },
+    reviewer: () => reviewer,
+    sessions: () => [reviewer],
+    sessionNode: (id) => (id === 'reviewer-one' ? 'aws1' : null),
+    daemonNode: () => 'main',
+    transcriptMtime: () => { throw new Error('read a remote reviewer'); },
+    sessionContextTokens: () => { throw new Error('read a remote reviewer'); },
+    minTokens: 40000,
+    compact: async () => { compactCalls += 1; return { compacted: true }; },
+  });
+  assert.equal(remote.skipped, true);
+  assert.match(remote.why, /runs on node aws1/);
+  assert.equal(compactCalls, 2);
 });
 
 test('reviewer compaction accepts an idle waiting marker but rejects permission prompts', () => {
