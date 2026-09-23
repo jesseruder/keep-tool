@@ -4108,6 +4108,36 @@ async function cachedRemoteSession(node, sessionId, deps = {}) {
   return model();
 }
 
+// A Pi session's phase on another node, for the publication: the node's own phase
+// file (piEventFor), read at most once per 2.5 s per session as a Claude session's
+// transcript is. A read that fails keeps what the last one said; the first one that
+// fails is no signal (null).
+const remotePiEventCache = new Map(); // `${node}\0${sessionId}` -> { at, event, pending }
+
+async function cachedRemotePiEvent(node, sessionId, deps = {}) {
+  const key = `${node}\0${sessionId}`;
+  let entry = remotePiEventCache.get(key);
+  if (!entry) {
+    entry = { at: 0, event: null, pending: null };
+    remotePiEventCache.set(key, entry);
+    while (remotePiEventCache.size > REMOTE_TRANSCRIPT_CACHE_LIMIT) {
+      remotePiEventCache.delete(remotePiEventCache.keys().next().value);
+    }
+  }
+  const now = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
+  if (entry.at && now - entry.at < REMOTE_TRANSCRIPT_CACHE_MS) return entry.event;
+  if (!entry.pending) {
+    entry.pending = (async () => {
+      try {
+        entry.event = await readNodePiEvent(sessionId, node, deps);
+        entry.at = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
+      } catch {}
+    })().finally(() => { entry.pending = null; });
+  }
+  await entry.pending;
+  return entry.event;
+}
+
 // { sessionId: row } for the live Claude panes on other nodes in a listing, or null
 // when there are none (a single-node install always). Each is read in parallel; one
 // whose node does not answer, or whose session is not recorded on the node that lists
@@ -4122,7 +4152,8 @@ async function remoteSessionFreshness(panes, deps = {}, { skipNodes = null } = {
   const env = paneRefEnv(deps);
   const skip = new Set(skipNodes || []);
   const wanted = (Array.isArray(panes) ? panes : []).filter((pane) => pane && pane.alive
-    && nodes.isRemotePane(pane, env) && !skip.has(pane.node) && pane.meta && pane.meta.agent === 'claude'
+    && nodes.isRemotePane(pane, env) && !skip.has(pane.node) && pane.meta
+    && (pane.meta.agent === 'claude' || pane.meta.agent === 'pi')
     && typeof pane.meta.sessionId === 'string' && /^[A-Za-z0-9_-]+$/.test(pane.meta.sessionId));
   if (!wanted.length) return null;
   const out = {};
@@ -4130,6 +4161,13 @@ async function remoteSessionFreshness(panes, deps = {}, { skipNodes = null } = {
     const id = pane.meta.sessionId;
     try {
       if (sessionNodeOf({ id }, deps) !== pane.node) return;
+      // A Pi session on a node has no transcript row here: what the node gives is its
+      // phase, which the host-only row (backfillHostSessions) takes its turn state from.
+      if (pane.meta.agent === 'pi') {
+        const piEvent = await (deps.cachedRemotePiEvent || cachedRemotePiEvent)(pane.node, id, deps);
+        out[id] = { id, kind: 'pi', node: pane.node, piEvent: piEvent || null };
+        return;
+      }
       const session = await (deps.cachedRemoteSession || cachedRemoteSession)(pane.node, id, deps);
       if (session) out[id] = session;
     } catch {}
@@ -9380,13 +9418,56 @@ async function waitForHostSessionId(pane, deps = {}) {
   return null;
 }
 
-async function waitForPiStart(id, launchedAt, deps = {}) {
+// The Keep Pi extension's phase for one session, read where the session runs: the
+// registry's own .keep/pi-events on the daemon node, exactly as always, and the
+// node's through its `transcript` verb (op pi-event) anywhere else. The node read
+// throws when the node cannot answer; piEventFor takes that as no signal.
+async function readNodePiEvent(sessionId, node, deps = {}) {
+  const answer = await (deps.hostRequest || hostRequest)('transcript',
+    { op: 'pi-event', kind: 'pi', sessionId }, { ...deps, node });
+  const event = answer && answer.event;
+  return event && typeof event === 'object' && event.id === sessionId
+    && ['start', 'running', 'settled', 'shutdown', 'prompt'].includes(event.phase) ? event : null;
+}
+
+async function piEventFor(sessionId, node, deps = {}) {
+  if (!/^[A-Za-z0-9_-]+$/.test(String(sessionId || ''))) return null;
+  if (!node || node === daemonNodeName(deps)) {
+    return (deps.piEventFor || pi.eventFor)(sessionId, path.join(deps.root || keep.ROOT, '.keep', 'pi-events'));
+  }
+  try { return await readNodePiEvent(sessionId, node, deps); } catch { return null; }
+}
+
+// Whether a Pi session can be started on another node: its host reads Pi phase files
+// (transcript verb 3), Pi's account is set up there, and the Keep Pi extension is
+// installed where that Pi will look for it. Asked of the node itself, before the pane.
+async function assertNodePiReady(node, account, project, deps = {}) {
+  const hello = await (deps.hostRequest || hostRequest)('hello', {}, { ...deps, node });
+  if (!hello || !(Number(hello.transcript) >= 3)) {
+    throw new InjectionError(409, `the terminal host on ${node} cannot read Pi session state; update keep-tool on ${node} and reload its host`);
+  }
+  let checked;
+  try {
+    checked = await prepareLaunchOn(node, {
+      agent: 'pi', check: true, cwd: project, argv: ['pi'],
+      account: { id: account.id, agent: account.agent, configDir: account.configDir,
+        builtIn: account.builtIn === true, managed: account.managed === true },
+    }, deps);
+  } catch (error) {
+    if (error && ['shared-setup', 'account-missing', 'home-mismatch'].includes(error.code)) throw new InjectionError(409, error.message);
+    throw error;
+  }
+  if (!checked || checked.piExtension !== true) {
+    throw new InjectionError(409, `Pi Keep extension is not installed on ${node}`);
+  }
+}
+
+async function waitForPiStart(id, launchedAt, deps = {}, node = null) {
   const now = deps.now || Date.now;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + 12000;
   while (now() < deadline) {
-    const event = (deps.piEventFor || pi.eventFor)(id,
-      path.join(deps.root || keep.ROOT, '.keep', 'pi-events'));
+    const event = await piEventFor(id, node, deps);
     if (event && Date.parse(event.at || '') >= launchedAt - 1000 && event.phase !== 'shutdown') return event;
     await sleep(150);
   }
@@ -10084,12 +10165,12 @@ async function openSession(body, deps = {}) {
     }
   }
   if (agent === 'pi' && !account.builtIn) throw new InjectionError(400, 'Pi currently supports only pi/default');
-  // Pi's events file lives in this registry, and the extension that writes it talks
-  // to this daemon. Until that travels, a Pi session belongs to the daemon node.
+  // The extension writes its phase file on the machine Pi runs on, and its hooks
+  // reach this daemon from there (carried by the node's CLI). On the daemon node the
+  // extension is checked here; on another node that node answers for itself.
   if (agent === 'pi' && launchNode !== nodes.daemonNode(deps.env || process.env)) {
-    throw new InjectionError(409, 'pi sessions run on the daemon node');
-  }
-  if (agent === 'pi' && deps.piExtensionReady !== true
+    await (deps.assertNodePiReady || assertNodePiReady)(launchNode, account, project, deps);
+  } else if (agent === 'pi' && deps.piExtensionReady !== true
       && !fs.existsSync(path.join(os.homedir(), '.pi', 'agent', 'extensions', 'keep.ts'))) {
     throw new InjectionError(409, 'Pi Keep extension is not installed at ~/.pi/agent/extensions/keep.ts');
   }
@@ -10336,11 +10417,15 @@ async function openSession(body, deps = {}) {
       // stop a second agent writing the same transcript. A node that cannot answer
       // is a node this daemon may not resume on.
       let live;
-      if (launchNode === nodes.daemonNode(deps.env || process.env)) {
+      const onDaemonNode = launchNode === nodes.daemonNode(deps.env || process.env);
+      // The node's process rows, read once and used by the Pi guard below as well.
+      let nodeRows = null;
+      if (onDaemonNode) {
         live = await (deps.liveSessionPids || liveSessionPids)(deps);
       } else {
         let rows = null;
         try { rows = await (deps.agentProcessRows || agentProcessRows)(deps, { node: launchNode }); } catch {}
+        nodeRows = rows;
         live = await (deps.liveSessionPids || liveSessionPids)(
           { ...deps, agentProcessRows: async () => rows }, { node: launchNode },
         );
@@ -10356,9 +10441,14 @@ async function openSession(body, deps = {}) {
         // Pi overwrites its argv with process.title="pi", so a raw external TUI
         // cannot be mapped to a session id by ps. Refuse an uncertain concurrent
         // resume instead of risking two writers on one Pi JSONL file.
-        const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
-        const panes = await (deps.listHostPanes || listHostPanes)(deps, true) || [];
-        const backgroundPiPids = verifiedPiBackgroundPids(rows, deps);
+        //
+        // On another node the rows are that node's (read above, and verified there),
+        // the host panes are that node's, and no Pi background worker runs there.
+        const rows = onDaemonNode ? await (deps.agentProcessRows || agentProcessRows)(deps) : (nodeRows || []);
+        const daemonNode = nodes.daemonNode(deps.env || process.env);
+        const panes = (await (deps.listHostPanes || listHostPanes)(deps, true) || [])
+          .filter((pane) => onDaemonNode || (pane.node || daemonNode) === launchNode);
+        const backgroundPiPids = onDaemonNode ? verifiedPiBackgroundPids(rows, deps) : new Set();
         const hosts = new Set(panes.filter((pane) => pane.alive && pane.meta?.agent === 'pi')
           .map((pane) => pane.pid).filter(Number.isInteger));
         const byPid = new Map(rows.map((row) => [row.pid, row]));
@@ -10501,7 +10591,7 @@ async function openSession(body, deps = {}) {
     if (agent === 'pi') {
       // Pi receives the opening message as a positional prompt. Its extension
       // reports turn state; no Claude/Codex composer probing is involved.
-      await (deps.waitForPiStart || waitForPiStart)(launch.sessionId, launchedAt, deps);
+      await (deps.waitForPiStart || waitForPiStart)(launch.sessionId, launchedAt, deps, launchNode);
       launch.settled = true;
       launch.sent = Boolean(message);
     } else if (deferReadiness) {
@@ -12414,9 +12504,13 @@ function backfillHostSessions(sessions, panes, deps = {}) {
       const remotePane = !session && nodes.isRemotePane(pane, paneRefEnv(deps));
       const fromNode = remotePane && deps.nodeSessions && Object.prototype.hasOwnProperty.call(deps.nodeSessions, id)
         ? deps.nodeSessions[id] : null;
-      if (fromNode && fromNode.id === id && fromNode.node === pane.node && fromNode.kind === agent) session = { ...fromNode };
+      const fromThisNode = Boolean(fromNode && fromNode.id === id && fromNode.node === pane.node && fromNode.kind === agent);
+      // A Pi session on another node brings its phase, not a row: the row is the pane's.
+      if (fromThisNode && agent !== 'pi') session = { ...fromNode };
       if (!session) {
-        const piEvent = agent === 'pi' ? pi.eventFor(id, path.join(deps.root || keep.ROOT, '.keep', 'pi-events')) : null;
+        const piEvent = agent !== 'pi' ? null
+          : remotePane ? (fromThisNode && fromNode.piEvent && fromNode.piEvent.id === id ? fromNode.piEvent : null)
+          : pi.eventFor(id, path.join(deps.root || keep.ROOT, '.keep', 'pi-events'));
         const piPhase = piEvent?.phase || '';
         session = {
           id,
@@ -12433,6 +12527,14 @@ function backfillHostSessions(sessions, panes, deps = {}) {
             : meta.openingMessage === true ? { toolRunning: true } : {}),
           state: (agent === 'pi' && piPhase === 'running') || meta.openingMessage === true ? 'running' : 'recent',
         };
+        // A Pi session on a node has only this row, so its phase says what pi.parse
+        // says of a local one: idle after a turn, and waiting when Pi asks something.
+        if (agent === 'pi' && remotePane && piEvent) {
+          const ended = ['settled', 'start', 'prompt'].includes(piPhase);
+          if (ended && Date.now() - session.mtime < 3600e3) session.state = 'idle';
+          session.attentionAt = Date.parse(piEvent.at || '') || session.mtime;
+          if (piPhase === 'prompt') session.pendingQuestion = { question: 'Pi is waiting for input.' };
+        }
         if (remotePane) delete session.size;
       } else {
         session = { ...session };
@@ -15363,7 +15465,7 @@ module.exports = {
   consoleNodes,
   sessionMoveDeps,
   inspectSessionMove,
-  remoteSessionFreshness, unansweredNodes,
+  remoteSessionFreshness, unansweredNodes, piEventFor, waitForPiStart, cachedRemotePiEvent,
   remoteSessionRead,
   loadRemoteSession,
   loadSessionForAction,

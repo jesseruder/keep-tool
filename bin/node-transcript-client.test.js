@@ -405,3 +405,107 @@ test('a silent node adds no wait to the publication: its panes are not asked abo
     release();
   } finally { f.cleanup(); }
 });
+
+// ---------- a Pi session's phase on a node ----------
+
+function piFixture(node, sid) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-remote-pi-phase-'));
+  fs.mkdirSync(path.join(root, '.keep', 'session-accounts'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.keep', 'session-accounts', `${sid}.json`), JSON.stringify({
+    version: 1, sessionId: sid, agent: 'pi', accountId: 'pi/default', node,
+  }));
+  const asked = [];
+  let event = { id: sid, phase: 'running', at: new Date().toISOString(), instance: 'i-1' };
+  let silent = false;
+  let clock = Date.now();
+  const hostRequest = async (type, params, options) => {
+    asked.push([type, params && params.op, options.node]);
+    if (silent) throw new Error('host request timed out');
+    if (type === 'transcript' && params.op === 'pi-event' && params.kind === 'pi' && params.sessionId === sid) return { event };
+    throw new Error(`unexpected ${type}`);
+  };
+  const pane = { id: `p1@${node}`, node, hostPaneId: 'p1', alive: true, agentAlive: true, createdAt: new Date(Date.now() - 3600e3).toISOString(),
+    meta: { agent: 'pi', sessionId: sid, project: '/work/project', card: 'card' } };
+  return {
+    root, pane, asked,
+    deps: { root, hostNodes: ['main', node], hostRequest, now: () => clock },
+    advance: (ms) => { clock += ms; },
+    setEvent: (value) => { event = value; },
+    setSilent: (value) => { silent = value; },
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+test('a Pi pane on a node gets its turn state from the phase file its node reads', async () => {
+  const f = piFixture('aws7', 'pi-remote-1');
+  try {
+    const read = await serve.remoteSessionFreshness([f.pane], f.deps);
+    assert.deepEqual(Object.keys(read), ['pi-remote-1']);
+    assert.equal(read['pi-remote-1'].kind, 'pi');
+    assert.equal(read['pi-remote-1'].piEvent.phase, 'running');
+    assert.deepEqual(f.asked, [['transcript', 'pi-event', 'aws7']]);
+    // One read per session per cycle window.
+    await serve.remoteSessionFreshness([f.pane], f.deps);
+    assert.equal(f.asked.length, 1);
+
+    const build = (nodeSessions) => {
+      const sessions = [];
+      serve.backfillHostSessions(sessions, [f.pane], { root: f.root, hostNodes: ['main', 'aws7'], piSessionFor: () => null, nodeSessions });
+      return sessions[0];
+    };
+    const running = build(read);
+    assert.equal(running.kind, 'pi');
+    assert.equal(running.node, 'aws7');
+    assert.equal(running.hostOnly, true);
+    assert.equal(running.project, '/work/project', 'the row is the pane\'s');
+    assert.equal(running.state, 'running');
+    assert.equal(running.toolRunning, true);
+    assert.equal(running.endedTurn, false);
+    assert.equal('size' in running, false);
+
+    f.advance(3000);
+    f.setEvent({ id: 'pi-remote-1', phase: 'prompt', at: new Date().toISOString() });
+    const asking = build(await serve.remoteSessionFreshness([f.pane], f.deps));
+    assert.equal(asking.state, 'idle');
+    assert.equal(asking.endedTurn, true);
+    assert.deepEqual(asking.pendingQuestion, { question: 'Pi is waiting for input.' });
+
+    // A node that stops answering keeps what it last said, and a row with no phase at
+    // all is the pane's alone.
+    f.advance(3000);
+    f.setSilent(true);
+    const kept = await serve.remoteSessionFreshness([f.pane], f.deps);
+    assert.equal(kept['pi-remote-1'].piEvent.phase, 'prompt');
+    const bare = build(null);
+    assert.equal(bare.state, 'recent');
+    assert.equal(bare.endedTurn, true);
+    assert.equal(bare.pendingQuestion, undefined);
+    // A phase that names another session is not this one's.
+    const wrong = build({ 'pi-remote-1': { id: 'pi-remote-1', kind: 'pi', node: 'aws7', piEvent: { id: 'someone', phase: 'running' } } });
+    assert.equal(wrong.state, 'recent');
+  } finally { f.cleanup(); }
+});
+
+test('piEventFor reads the registry on the daemon node and the node otherwise, and a failed node read is no signal', async () => {
+  const f = piFixture('aws8', 'pi-remote-2');
+  try {
+    const local = path.join(f.root, '.keep', 'pi-events');
+    fs.mkdirSync(local, { recursive: true });
+    fs.writeFileSync(path.join(local, 'pi-remote-2.json'), JSON.stringify({ id: 'pi-remote-2', phase: 'settled', at: 'x' }));
+    assert.equal((await serve.piEventFor('pi-remote-2', 'main', f.deps)).phase, 'settled');
+    assert.equal((await serve.piEventFor('pi-remote-2', null, f.deps)).phase, 'settled');
+    assert.deepEqual(f.asked, [], 'the daemon node is never asked through a host');
+    assert.equal((await serve.piEventFor('pi-remote-2', 'aws8', f.deps)).phase, 'running');
+    f.setSilent(true);
+    assert.equal(await serve.piEventFor('pi-remote-2', 'aws8', f.deps), null);
+    f.setSilent(false);
+    f.setEvent({ id: 'pi-remote-2', phase: 'nonsense' });
+    assert.equal(await serve.piEventFor('pi-remote-2', 'aws8', f.deps), null);
+    assert.equal(await serve.piEventFor('../x', 'aws8', f.deps), null);
+
+    // waitForPiStart through the node: resolves on the node's start phase.
+    f.setEvent({ id: 'pi-remote-2', phase: 'start', at: new Date().toISOString() });
+    const started = await serve.waitForPiStart('pi-remote-2', Date.now(), { ...f.deps, now: Date.now, sleep: async () => {} }, 'aws8');
+    assert.equal(started.phase, 'start');
+  } finally { f.cleanup(); }
+});

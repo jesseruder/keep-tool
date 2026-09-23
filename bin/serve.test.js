@@ -14607,10 +14607,14 @@ test('a card tag that names a machine capability is a placement hint, not a dema
     await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude',
       accountId: 'claude/default', needs: '  ' }, deps), (error) => error.status === 400
       && error.message === 'needs must be a capability name');
-    // Pi keeps its events file in this registry, so it stays on the daemon node.
+    // A Pi session may run on another node; that node answers for its own Pi
+    // extension (the daemon's piExtensionReady speaks only for the daemon node).
+    const askedPi = [];
     await assert.rejects(openSession({ fresh: true, cwd, agent: 'pi', node: 'mini' }, {
       ...deps, loadTask: undefined, piExtensionReady: true,
-    }), (error) => error.status === 409 && error.message === 'pi sessions run on the daemon node');
+      assertNodePiReady: async (node) => { askedPi.push(node); throw new InjectionError(409, `Pi Keep extension is not installed on ${node}`); },
+    }), (error) => error.status === 409 && error.message === 'Pi Keep extension is not installed on mini');
+    assert.deepEqual(askedPi, ['mini']);
 
     // The same card on an install where nothing claims a browser: `browser` is then
     // just a word the card is filed under, and the open goes through on the one node
@@ -16691,4 +16695,127 @@ test('an exited session publishes the node its location record names, through th
   addStoppedSessionNodes(single, { ...deps, hostNodes: ['main'] });
   assert.deepEqual(asked, []);
   assert.equal(single.sessions[0].nodeRecorded, undefined);
+});
+
+// ---------- Pi on a node ----------
+
+// A fresh Pi card open on aws1: aws1's host says it reads Pi phase files, its
+// prepare-launch check says the extension is there, and the start phase is read
+// through aws1's transcript verb. `answers` overrides what aws1 says.
+function remotePiOpen(t, answers = {}, body = {}, extra = {}) {
+  const id = '12121212-3434-4565-8787-909090909090';
+  const seen = { phase: 0 };
+  return remoteCardOpen(t, { agent: 'pi', message: 'Begin here.', ...body }, {
+    randomUUID: () => id,
+    host: async (type, params) => {
+      if (type === 'hello') return answers.hello || { bootId: 'aws1-boot', spawnReceipts: true, transcript: 3 };
+      if (type === 'prepare-launch') return answers.check || { checked: true, account: 'pi/default', sharedSetup: false, piExtension: true };
+      if (type === 'transcript' && params.op === 'pi-event') {
+        seen.phase += 1;
+        if (answers.phase) return answers.phase(params);
+        return { event: { id: params.sessionId, phase: 'start', at: new Date().toISOString(), instance: 'x' } };
+      }
+      return undefined;
+    },
+    ...extra,
+  }).then((run) => ({ ...run, id, seen }));
+}
+
+test('a fresh Pi open on aws1 asks aws1 whether it can run Pi, launches there and reads its start through aws1', async (t) => {
+  const run = await remotePiOpen(t);
+  assert.equal(run.error, null, run.error && run.error.stack);
+  assert.equal(run.opened.sessionId, run.id);
+  assert.equal(run.opened.node, 'aws1');
+  assert.equal(run.opened.accountId, 'pi/default');
+  assert.equal(run.opened.settled, true);
+  assert.equal(run.opened.sent, true);
+  const check = run.calls.find((call) => call.type === 'prepare-launch');
+  assert.equal(check.params.check, true);
+  assert.equal(check.params.agent, 'pi');
+  assert.equal(check.params.remote, true, 'aws1 is told it answers for itself');
+  const spawn = run.calls.find((call) => call.type === 'spawn');
+  assert.ok(run.calls.indexOf(check) < run.calls.indexOf(spawn), 'asked before the pane exists');
+  assert.equal(spawn.params.meta.agent, 'pi');
+  assert.equal(spawn.params.meta.node, 'aws1');
+  assert.equal(spawn.params.env.KEEP_PI_SESSION_ID, run.id);
+  assert.equal(spawn.params.env.KEEP_PI_KEEP_CLI, path.join(__dirname, 'keep.js'), 'the shared home puts the same checkout there');
+  const phase = run.calls.find((call) => call.type === 'transcript');
+  assert.deepEqual(phase.params, { op: 'pi-event', kind: 'pi', sessionId: run.id });
+  const location = require('./accounts.js').sessionLocation(run.id, { root: run.root, env: { HOME: run.root, KEEP_DIR: run.root, KEEP_DAEMON_NODE: 'main' } });
+  assert.equal(location.node, 'aws1');
+  assert.equal(location.agent, 'pi');
+  assert.deepEqual(run.linked.map((entry) => entry.entry.node), ['aws1']);
+});
+
+test('a Pi open on aws1 is refused before any pane when aws1 has no Pi extension or cannot read Pi phases', async (t) => {
+  const missing = await remotePiOpen(t, { check: { checked: true, account: 'pi/default', sharedSetup: false, piExtension: false } });
+  assert.equal(missing.error && missing.error.status, 409);
+  assert.equal(missing.error.message, 'Pi Keep extension is not installed on aws1');
+  assert.equal(missing.calls.some((call) => call.type === 'spawn'), false);
+
+  const old = await remotePiOpen(t, { hello: { bootId: 'aws1-boot', spawnReceipts: true, transcript: 2 } });
+  assert.equal(old.error && old.error.status, 409);
+  assert.match(old.error.message, /terminal host on aws1 cannot read Pi session state; update keep-tool on aws1/);
+  assert.equal(old.calls.some((call) => call.type === 'spawn' || call.type === 'prepare-launch'), false);
+
+  const unset = await remotePiOpen(t, {}, {}, {
+    host: async (type) => {
+      if (type === 'hello') return { transcript: 3 };
+      if (type === 'prepare-launch') throw Object.assign(new Error('account pi/default is not set up on this node'), { code: 'account-missing' });
+      return undefined;
+    },
+  });
+  assert.equal(unset.error && unset.error.status, 409);
+  assert.equal(unset.calls.some((call) => call.type === 'spawn'), false);
+});
+
+test('a Pi open on aws1 whose start never shows on aws1 fails as a daemon-node one does', async (t) => {
+  let clock = 1_000_000;
+  const run = await remotePiOpen(t, { phase: () => ({ event: null }) }, {}, {
+    now: () => clock, sleep: async (ms) => { clock += ms; },
+  });
+  assert.equal(run.error && run.error.status, 504);
+  assert.match(run.error.message, /Keep extension did not register session/);
+  assert.ok(run.seen.phase > 1, 'aws1 was asked until the deadline');
+});
+
+test('a Pi resume on aws1 reads aws1\'s processes and panes for an external Pi', async (t) => {
+  const id = '34343434-5656-4787-8989-010101010101';
+  const make = (rows, panes) => ({
+    root: fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-node-resume-')),
+    rows, panes,
+  });
+  for (const [label, rows, panes, refused] of [
+    ['an external Pi on aws1', [{ pid: 700, ppid: 1, args: 'pi', agent: 'pi', interactive: true }], [], true],
+    ['a Pi under an aws1 pane', [{ pid: 700, ppid: 600, args: 'pi', agent: 'pi', interactive: true }, { pid: 600, ppid: 1, args: 'zsh' }],
+      [{ id: 'p6@aws1', node: 'aws1', alive: true, pid: 600, meta: { agent: 'pi' } }], false],
+    ['a Pi under a pane on another node with the same pid', [{ pid: 700, ppid: 600, args: 'pi', agent: 'pi', interactive: true }, { pid: 600, ppid: 1, args: 'zsh' }],
+      [{ id: 'p6', node: 'main', alive: true, pid: 600, meta: { agent: 'pi' } }], true],
+  ]) {
+    const f = make(rows, panes);
+    t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+    fs.mkdirSync(path.join(f.root, '.keep', 'session-accounts'), { recursive: true });
+    fs.writeFileSync(path.join(f.root, '.keep', 'session-accounts', `${id}.json`), JSON.stringify({
+      version: 1, sessionId: id, agent: 'pi', accountId: 'pi/default', node: 'aws1',
+    }));
+    const asked = [];
+    const deps = {
+      root: f.root, env: { PATH: process.env.PATH, HOME: f.root, KEEP_DIR: f.root, KEEP_DAEMON_NODE: 'main' },
+      placementNodes: [{ name: 'main', capabilities: [] }, { name: 'aws1', capabilities: [] }],
+      hostNodes: ['main', 'aws1'],
+      scanSessions: () => [{ id, kind: 'pi', project: f.root }],
+      resolveSessionTarget: async () => { throw new InjectionError(404, 'not live', { notLive: true }); },
+      agentProcessRows: async (_deps, options = {}) => { asked.push(options.node || 'main'); return f.rows; },
+      liveSessionPids: async () => Object.assign(new Map(), { evidence: { table: 'ok', rows: f.rows.length } }),
+      listHostPanes: async () => f.panes,
+      verifiedPiJobPids: () => assert.fail('no Pi background worker runs on a node'),
+      assertNodePiReady: async () => {},
+      prepareLaunch: async () => { throw new Error('reached the launch'); },
+    };
+    let error = null;
+    try { await openSession({ sessionId: id }, deps); } catch (caught) { error = caught; }
+    assert.deepEqual(asked, ['aws1'], `${label}: aws1's table, once`);
+    if (refused) assert.match(error && error.message, /Pi process outside Keep is running \(pid 700\)/, label);
+    else assert.equal(error && error.message, 'reached the launch', label);
+  }
 });
