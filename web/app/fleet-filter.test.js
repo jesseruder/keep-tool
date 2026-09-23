@@ -23,6 +23,7 @@ class FakeFleet extends FakeElement {
     this.select = null;
     this.count = null;
     this.shadow = null;
+    this.nodes = null;
     this.results = null;
   }
   set innerHTML(html) {
@@ -33,11 +34,12 @@ class FakeFleet extends FakeElement {
     this.select = new FakeElement();
     this.count = new FakeElement();
     this.shadow = new FakeElement();
+    this.nodes = html.includes('fleet-nodes') ? new FakeElement() : null;
     this.results = new FakeElement();
   }
   querySelector(selector) {
     return ({ '.fleetbar': this.bar, '.fleetbar input': this.input, '.fleetbar select': this.select,
-      '.fleet-count': this.count, '.fleet-shadow': this.shadow, '.fleet-results': this.results })[selector] || null;
+      '.fleet-count': this.count, '.fleet-shadow': this.shadow, '.fleet-nodes': this.nodes, '.fleet-results': this.results })[selector] || null;
   }
 }
 
@@ -142,4 +144,23 @@ test('fleet rows on another node carry the node badge and are found by the node 
     [{ id: 's-2', pane: 'p8@aws1', node: 'aws1', project: '/work/a', title: 'Elsewhere', kind: 'claude', state: 'running' }]);
   assert.equal(bySession.rows[0].node, 'aws1');
   assert.match(bySession.html[0], /runs on node aws1/);
+});
+
+test('Fleet shows a stats card per node on a fleet and nothing for one machine', async () => {
+  globalThis.sessionStorage = { getItem: () => null, setItem: () => {} };
+  const fleet = new FakeFleet();
+  globalThis.document = { querySelector: (selector) => selector === '#fleet' ? fleet : null };
+  const { renderFleet } = await import('./fleet.js');
+  const stats = { memTotal: 16 * 1024 ** 3, memAvailable: 8 * 1024 ** 3, cpuCount: 4, cpuBusyPct: 12, load1: 0.4, sampledAt: Date.now(), stale: false };
+  const ctx = context();
+  ctx.data.nodes = [{ name: 'main', daemon: true, capabilities: [], ok: true, stats }];
+  renderFleet(ctx);
+  assert.equal(fleet.nodes.innerHTML, '', 'one machine: no cards');
+  assert.equal(fleet.nodes.hidden, true);
+  ctx.data.nodes = [...ctx.data.nodes, { name: 'aws1', daemon: false, capabilities: [], ok: true, stats: { ...stats, cpuBusyPct: 97 } }];
+  renderFleet(ctx);
+  assert.equal(fleet.nodes.hidden, false);
+  assert.equal((fleet.nodes.innerHTML.match(/<section class="node-card/g) || []).length, 2);
+  assert.match(fleet.nodes.innerHTML, /<section class="node-card warn"[^>]*><header><b>aws1<\/b>/);
+  assert.match(fleet.nodes.innerHTML, /<dt>memory<\/dt><dd class="">8\/16 GB · 8 GB available \(50%\)<\/dd>/);
 });

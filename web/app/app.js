@@ -20,6 +20,7 @@ import { createSessionHistory, installSessionHistory } from './session-history.j
 import { installTriageControls, matchesTriageFilters, renderTriage } from './triage.js';
 import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
+import { nodeStripHTML, nodeStatsHealthRowsHTML } from './node-stats.js';
 import { numLabel } from './session-number.js';
 import { openReviewQueueNotification, renderReviewQueue, reviewQueueIdForNotification } from './review-queue.js';
 import { openSessionChooser } from './session-launcher.js';
@@ -929,7 +930,10 @@ function renderHealth() {
   const hostRow = outage
     ? `<dt>terminal host</dt><dd class="bad">${esc(hostOutageText(outage))}${outage.stale && outage.panesAt ? ` · panes last listed ${esc(rel(outage.panesAt))}` : ' · no pane list'}</dd>`
     : '';
-  button.querySelector('.pop').innerHTML = `<b>keep serve</b> · pid ${esc(health.daemon?.pid || '—')}${enable}<dl>${hostRow}${rows.map((row) => `<dt>${esc(row.name)}</dt><dd class="${['failing', 'silent', 'never'].includes(row.displayState) ? 'bad' : row.displayState === 'warning' ? 'warning' : ''}">${esc(row.displayState)}${row.displayDetail ? ` · ${esc(row.displayDetail)}` : ''}</dd>`).join('')}</dl>`;
+  // Each machine's numbers, a single-node install's one included: this is where a
+  // lone machine shows them, since the header strip is a fleet's.
+  const nodeRows = nodeStatsHealthRowsHTML(esc, data);
+  button.querySelector('.pop').innerHTML = `<b>keep serve</b> · pid ${esc(health.daemon?.pid || '—')}${enable}<dl>${hostRow}${nodeRows}${rows.map((row) => `<dt>${esc(row.name)}</dt><dd class="${['failing', 'silent', 'never'].includes(row.displayState) ? 'bad' : row.displayState === 'warning' ? 'warning' : ''}">${esc(row.displayState)}${row.displayDetail ? ` · ${esc(row.displayDetail)}` : ''}</dd>`).join('')}</dl>`;
   button.querySelector('.notify-enable')?.addEventListener('click', async (event) => {
     event.stopPropagation();
     const permission = await requestPermission();
@@ -937,8 +941,18 @@ function renderHealth() {
     renderHealth();
   });
 }
+// Memory, CPU, load and disk per machine, beside the daemon health. Only a fleet of
+// two or more nodes shows it; everything else leaves the header as it was.
+function renderNodeStrip() {
+  const strip = document.querySelector('#nodeStrip');
+  if (!strip) return;
+  const html = nodeStripHTML(esc, data);
+  strip.hidden = !html;
+  patchHTML(strip, html);
+}
 function renderTop() {
   renderMeters();
+  renderNodeStrip();
   renderHealth();
   const count = queueItems().filter((item) => !state.dismissed.has(itemKey(item))).length;
   setBadge(count + (data.notifications || []).filter((entry) => !entry.read).length);
