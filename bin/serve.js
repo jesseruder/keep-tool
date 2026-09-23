@@ -9230,6 +9230,76 @@ async function verifyFreshOpenPane(launch, expected, deps = {}) {
   return sessionId;
 }
 
+// A fresh Codex launch on another node. Codex names its session only when its first
+// turn fires SessionStart, and on a node that hook reaches the daemon only for a
+// session the daemon already places there: so the daemon asks the node which rollouts
+// its account has begun since the launch, in the launch's directory (the transcript
+// verb's `find`), and adopts one only when it is the only one there, the pane is still
+// this launch's and unbound, and the node's own process table shows the pane's
+// process holding that rollout open. Then the session's account record names it and
+// its node, and the pane is bound to it on the node's host. Anything short of that
+// adopts nothing, and says why.
+const NODE_CODEX_FIND_SLACK_MS = 10e3;
+
+async function adoptNodeCodexLaunch(launch, expected, deps = {}) {
+  const node = expected.node;
+  const request = deps.hostRequest || hostRequest;
+  const refuse = (why) => ({ sessionId: null, why });
+  if (!node || node === daemonNodeName(deps)) return refuse('not a launch on another node');
+  let hello = null;
+  try { hello = await request('hello', {}, { ...deps, node }); } catch {}
+  if (!hello || !(Number(hello.transcript) >= 2)) return refuse(`the terminal host on ${node} cannot list its rollouts (update keep-tool there)`);
+  let found;
+  try {
+    found = await request('transcript', {
+      op: 'find', kind: 'codex', account: { id: expected.account.id, configDir: expected.account.configDir },
+      sinceMs: Math.max(0, Math.floor(expected.launchedAt - NODE_CODEX_FIND_SLACK_MS)), cwd: expected.project,
+    }, { ...deps, node });
+  } catch (error) { return refuse(`${node} could not list its Codex rollouts: ${error && error.message || error}`); }
+  const candidates = (Array.isArray(found && found.rollouts) ? found.rollouts : []).filter((entry) => entry
+    && typeof entry.id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(entry.id) && entry.child !== true && entry.headless !== true);
+  const ids = [...new Set(candidates.map((entry) => entry.id))];
+  if (!ids.length) return refuse(`no Codex rollout begun in ${expected.project} on ${node} since the launch`);
+  if (ids.length > 1) return refuse(`${ids.length} Codex rollouts begun in ${expected.project} on ${node} since the launch; which is this one's cannot be told`);
+  const [sessionId] = ids;
+  const entry = candidates.find((candidate) => candidate.id === sessionId);
+  // Still this launch's pane, and nobody's yet (a SessionStart that did reach the
+  // daemon meanwhile has bound it, and that binding is the answer).
+  const bound = await verifyFreshOpenPane(launch, expected, deps);
+  if (bound) return { sessionId: bound };
+  let pane;
+  try { pane = (await request('get', { pane: launch.pane }, deps))?.pane; } catch {}
+  if (!pane) return refuse(`host pane ${launch.pane} could not be read again`);
+  let owns = false;
+  try {
+    owns = await (deps.codexOwnsPane || require('./codex-pane').ownsPane)(sessionId, pane, {
+      node,
+      sessionMetaFor: () => ({ id: sessionId, ...(entry.originator ? { originator: entry.originator } : {}) }),
+      // Uncached: the process that began the rollout is seconds old, younger than the
+      // table the pane list keeps for a moment.
+      agentProcessRows: async () => {
+        const result = await request('process', {}, { ...deps, node });
+        return Array.isArray(result && result.rows) ? result.rows : [];
+      },
+      liveSessionPids: (given) => liveSessionPids({ ...deps, ...given }, { node }),
+    });
+  } catch { owns = false; }
+  if (!owns) return refuse(`rollout ${sessionId} on ${node} is not held open by the process in ${launch.pane}`);
+  let authority;
+  try {
+    authority = (deps.accountForSession || accounts.forSession)(sessionId, 'codex', {
+      root: deps.root || keep.ROOT, env: deps.env || process.env, allowDiscovery: false,
+    });
+  } catch (error) { return refuse(error.message); }
+  if (authority && authority.id !== expected.account.id) return refuse(`session ${sessionRef(sessionId)} is pinned to account ${authority.id}`);
+  (deps.pinSession || accounts.pinSession)(sessionId, 'codex', expected.account.id,
+    { root: deps.root || keep.ROOT, env: deps.env || process.env, node });
+  await request('meta', { pane: launch.pane, patch: { sessionId, agent: 'codex', project: expected.project } }, deps);
+  const settled = await readHostSessionId(launch.pane, deps);
+  if (settled !== sessionId) return refuse(`host pane ${launch.pane} was bound to ${settled || 'nothing'} instead`);
+  return { sessionId };
+}
+
 async function waitForHostSessionId(pane, deps = {}) {
   const now = deps.now || Date.now;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -10239,9 +10309,27 @@ async function openSession(body, deps = {}) {
       launch.sessionId = await (deps.verifyFreshOpenPane || verifyFreshOpenPane)(launch, {
         agent, accountId: account.id, requestId: body.requestId, launchedAt, project, model: launchModel,
       }, deps);
+      if (!launch.sessionId && launchNode !== nodes.daemonNode(deps.env || process.env)) {
+        const adopted = await (deps.adoptNodeCodexLaunch || adoptNodeCodexLaunch)(launch, {
+          agent, accountId: account.id, requestId: body.requestId, launchedAt, project, model: launchModel, node: launchNode, account,
+        }, deps);
+        launch.sessionId = adopted.sessionId;
+        if (!adopted.sessionId) launch.registrationNote = adopted.why;
+      }
       if (!launch.sessionId) launch.pendingRegistration = true;
     } else if (!launch.sessionId && (handoff || freshStandalone || deps.onSessionReady)) {
       launch.sessionId = await (deps.waitForHostSessionId || waitForHostSessionId)(launch.pane, deps);
+      let adoption = null;
+      if (!launch.sessionId && agent === 'codex' && launchNode !== nodes.daemonNode(deps.env || process.env)) {
+        adoption = await (deps.adoptNodeCodexLaunch || adoptNodeCodexLaunch)(launch, {
+          agent, accountId: account.id, requestId: freshStandalone ? body.requestId : undefined, launchedAt, project,
+          model: launchModel, node: launchNode, account,
+        }, deps);
+        launch.sessionId = adoption.sessionId;
+      }
+      if (!launch.sessionId && adoption) {
+        throw new InjectionError(504, `${agent} started in host pane ${launch.pane} but never registered its session id: ${adoption.why}`);
+      }
       if (!launch.sessionId) {
         throw new InjectionError(504, `${agent} started in host pane ${launch.pane} but never registered its session id`);
       }
@@ -15075,7 +15163,7 @@ module.exports = {
   portableTransferDraft, preparePortableTransfer,
   portableTransferPreview, transferSession, resolvePortableTransfer, recoverPortableOpening,
   resolveReviewLaunchSelection, launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
-  waitForHostAgent, waitForHostSessionId, addHostSessionState,
+  waitForHostAgent, waitForHostSessionId, adoptNodeCodexLaunch, addHostSessionState,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,
   claudeMcpMenuVisible,
   resumeAfterLimit,

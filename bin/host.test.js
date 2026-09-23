@@ -2626,7 +2626,7 @@ test('a node answers stat, tail and match for a transcript of its own account', 
   const node = transcriptNode('ops');
   try {
     await withHost({ env: node.env }, async ({ client }) => {
-      assert.equal((await client.request('hello')).transcript, 1, 'the verb is advertised');
+      assert.equal((await client.request('hello')).transcript, 2, 'the verb is advertised, find with it');
       const asked = { kind: 'claude', sessionId: 'sess-transcript', account: node.account };
       const stat = await client.request('transcript', { ...asked, op: 'stat' });
       const onDisk = fs.statSync(node.file);
@@ -3043,6 +3043,60 @@ test('the artifacts verb reads and writes only a session\'s artifacts under the 
     });
   } finally {
     node.cleanup();
+    fs.rmSync(elsewhere, { recursive: true, force: true });
+  }
+});
+
+test('a node finds the Codex rollouts its account began since a launch, in a directory, and nothing else', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-transcript-find-'));
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-transcript-find-out-'));
+  try {
+    const { handle } = require('./node-transcript.js');
+    const configDir = path.join(root, 'codex-a');
+    const now = new Date();
+    const day = path.join(configDir, 'sessions', String(now.getFullYear()), String(now.getMonth() + 1).padStart(2, '0'), String(now.getDate()).padStart(2, '0'));
+    fs.mkdirSync(day, { recursive: true });
+    const accounts = () => [{ id: 'codex-a', agent: 'codex', configDir }];
+    const since = Date.now() - 1000;
+    const iso = (ms) => new Date(ms).toISOString();
+    const write = (name, meta, extra = '') => {
+      const file = path.join(day, name);
+      fs.writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: meta })}\n${extra}`);
+      return file;
+    };
+    const id = (n) => `0000000${n}-1111-2222-3333-444444444444`;
+    const fresh = write(`rollout-x-${id(1)}.jsonl`, { id: id(1), cwd: '/work/project', originator: 'codex-tui', source: 'cli', model: 'gpt-x', timestamp: iso(Date.now()) });
+    write(`rollout-x-${id(2)}.jsonl`, { id: id(2), cwd: '/work/project', timestamp: iso(since - 3600e3) }, '{"n":2}\n');
+    write(`rollout-x-${id(3)}.jsonl`, { id: id(3), cwd: '/work/other', timestamp: iso(Date.now()) });
+    write(`rollout-x-${id(4)}.jsonl`, { id: id(4), cwd: '/work/project', parent_thread_id: id(1), timestamp: iso(Date.now()) });
+    fs.writeFileSync(path.join(day, `rollout-x-${id(5)}.jsonl`), '{"type":"event_msg"}\n');
+    const outside = path.join(elsewhere, 'rollout-out.jsonl');
+    fs.writeFileSync(outside, `${JSON.stringify({ type: 'session_meta', payload: { id: id(6), cwd: '/work/project', timestamp: iso(Date.now()) } })}\n`);
+    fs.symlinkSync(outside, path.join(day, `rollout-x-${id(6)}.jsonl`));
+    fs.writeFileSync(path.join(day, 'notes.jsonl'), 'x');
+
+    const asked = { op: 'find', kind: 'codex', account: { id: 'codex-a', configDir }, sinceMs: since };
+    const found = await handle({ ...asked, cwd: '/work/project' }, { accounts });
+    assert.deepEqual(found.rollouts.map((entry) => [entry.id, entry.child]).sort(), [[id(1), false], [id(4), true]],
+      'begun since, in the directory; an older session still writing, another directory, a file without its meta line and a link are not');
+    const first = found.rollouts.find((entry) => entry.id === id(1));
+    assert.equal(first.path, fresh);
+    assert.equal(first.model, 'gpt-x');
+    assert.equal(first.originator, 'codex-tui');
+    assert.equal(first.headless, false);
+    assert.equal((await handle(asked, { accounts })).rollouts.length, 3, 'without a cwd, every directory');
+
+    for (let n = 0; n < 25; n += 1) write(`rollout-y-${String(n).padStart(8, '0')}-1111-2222-3333-444444444444.jsonl`, { id: `many-${n}`, cwd: '/work/many', timestamp: iso(Date.now()) });
+    assert.equal((await handle({ ...asked, cwd: '/work/many' }, { accounts })).rollouts.length, 20, 'at most twenty');
+
+    const refusedAs = (code) => (error) => error.code === code;
+    await assert.rejects(handle({ ...asked, sessionId: id(1) }, { accounts }), refusedAs('transcript-invalid'));
+    await assert.rejects(handle({ ...asked, kind: 'claude' }, { accounts }), refusedAs('transcript-invalid'));
+    await assert.rejects(handle({ ...asked, sinceMs: -1 }, { accounts }), refusedAs('transcript-invalid'));
+    await assert.rejects(handle({ ...asked, cwd: 'relative' }, { accounts }), refusedAs('transcript-invalid'));
+    await assert.rejects(handle({ ...asked, account: { id: 'codex-a', configDir: elsewhere } }, { accounts }), refusedAs('transcript-refused'));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(elsewhere, { recursive: true, force: true });
   }
 });

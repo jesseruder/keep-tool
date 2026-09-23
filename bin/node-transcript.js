@@ -16,6 +16,14 @@
 //   match -> { ...stat, matched, checkedTo }: delivery.matchesFrom from `fromOffset`
 //            for `hash`, looked at again every 500 ms until it matches or
 //            `timeoutMs` (at most 9 s) runs out.
+//   find  -> { rollouts: [{ path, size, mtimeMs, generation, id, cwd, createdMs, model,
+//            originator, child, headless }] }: Codex only, and with no session id: the
+//            newest (at most 20) rollouts under the account's own sessions directory
+//            begun since `sinceMs` (session_meta's timestamp, else the file's birth),
+//            each with what its session_meta line says, and only those whose cwd is
+//            `cwd` when one is given. How the daemon finds a fresh Codex
+//            launch's session, which names itself nowhere else until its first turn.
+//            Every file is opened as `open` opens one, and only its first 256 KiB read.
 //
 // Every refusal carries a code, so the daemon can tell "this node will not read
 // that" (transcript-refused), "there is nothing to read yet" (transcript-missing)
@@ -25,7 +33,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const KINDS = new Set(['claude', 'codex', 'pi']);
-const OPS = new Set(['stat', 'tail', 'match']);
+const OPS = new Set(['stat', 'tail', 'match', 'find']);
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const ACCOUNT_ID_RE = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex|pi)\/default)$/;
 const HASH_RE = /^[a-f0-9]{64}$/;
@@ -33,6 +41,10 @@ const TAIL_MAX_BYTES = 256 * 1024;
 const MATCH_MAX_WAIT_MS = 9000;
 const MATCH_POLL_MS = 500;
 const REQUEST_MAX_READ_BYTES = 32 * 1024 * 1024;
+const FIND_MAX = 20;
+const FIND_SCAN_MAX = 2000;
+const META_MAX_BYTES = 256 * 1024;
+const ROLLOUT_NAME_RE = /^rollout-[^/]*\.jsonl$/;
 
 function coded(message, code) {
   const error = new Error(message);
@@ -52,9 +64,16 @@ function generationOf(stat) {
 
 function validate(params) {
   if (!params || typeof params !== 'object') throw invalid('a transcript request must be an object');
-  if (!OPS.has(params.op)) throw invalid('transcript op must be stat, tail or match');
+  if (!OPS.has(params.op)) throw invalid('transcript op must be stat, tail, match or find');
   if (!KINDS.has(params.kind)) throw invalid('transcript kind must be claude, codex or pi');
-  if (typeof params.sessionId !== 'string' || !SESSION_ID_RE.test(params.sessionId)) {
+  if (params.op === 'find') {
+    if (params.kind !== 'codex') throw invalid('transcript find is for codex rollouts');
+    if (params.sessionId !== undefined) throw invalid('transcript find names no session');
+    if (!Number.isSafeInteger(params.sinceMs) || params.sinceMs < 0) throw invalid('transcript find needs sinceMs');
+    if (params.cwd !== undefined && (typeof params.cwd !== 'string' || !path.isAbsolute(params.cwd) || /[\0\r\n]/.test(params.cwd))) {
+      throw invalid('transcript find cwd must be an absolute path');
+    }
+  } else if (typeof params.sessionId !== 'string' || !SESSION_ID_RE.test(params.sessionId)) {
     throw invalid('transcript session id is not a session id');
   }
   const account = params.account;
@@ -99,6 +118,10 @@ function open(params, options = {}) {
   const account = nodeAccount(params, options);
   const file = candidates(params, account)[0];
   if (!file) throw coded(`no ${params.kind} transcript for ${params.sessionId} on this node`, 'transcript-missing');
+  return openChecked(params, account, file);
+}
+
+function openChecked(params, account, file) {
   const real = realpath(file);
   if (!real || !real.startsWith(account.root + path.sep)) throw refused('the transcript is not under its account directory');
   let fd;
@@ -138,7 +161,73 @@ function tail(fd, stat, length) {
   return { bytes: buffer.subarray(0, read).toString('base64'), from };
 }
 
+// The session_meta line a rollout starts with, from at most its first 256 KiB.
+function sessionMetaOf(fd, size) {
+  const buffer = Buffer.alloc(Math.min(size, META_MAX_BYTES));
+  let got = 0;
+  while (got < buffer.length) {
+    const n = fs.readSync(fd, buffer, got, buffer.length - got, got);
+    if (!n) break;
+    got += n;
+  }
+  const text = buffer.subarray(0, got).toString('utf8');
+  const newline = text.indexOf('\n');
+  if (newline === -1 && got >= META_MAX_BYTES) return null;
+  let record;
+  try { record = JSON.parse(newline === -1 ? text : text.slice(0, newline)); } catch { return null; }
+  return record && record.type === 'session_meta' && record.payload && typeof record.payload === 'object' ? record.payload : null;
+}
+
+const shortText = (value, max = 256) => (typeof value === 'string' && value.length <= max ? value : null);
+
+// The Codex rollouts this node's account has written since `sinceMs`: newest first,
+// at most FIND_MAX, each opened and checked as `open` does one.
+function find(params, options = {}) {
+  validate(params);
+  const account = nodeAccount(params, options);
+  const codex = require('./codex.js');
+  const seen = [];
+  let scanned = 0;
+  for (const dir of codex.recentDateDirs(account.configDir)) {
+    let names;
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const name of names) {
+      if (!ROLLOUT_NAME_RE.test(name) || scanned >= FIND_SCAN_MAX) continue;
+      scanned += 1;
+      const file = path.join(dir, name);
+      let stat;
+      try { stat = fs.lstatSync(file); } catch { continue; }
+      if (stat.isFile() && stat.mtimeMs >= params.sinceMs) seen.push({ file, mtimeMs: stat.mtimeMs });
+    }
+  }
+  seen.sort((a, b) => b.mtimeMs - a.mtimeMs || a.file.localeCompare(b.file));
+  const rollouts = [];
+  for (const { file } of seen) {
+    if (rollouts.length >= FIND_MAX) break;
+    let opened;
+    try { opened = openChecked(params, account, file); } catch { continue; }
+    try {
+      const meta = sessionMetaOf(opened.fd, opened.stat.size);
+      const id = meta && (shortText(meta.id, 128) || shortText(meta.session_id, 128));
+      if (!id || !SESSION_ID_RE.test(id)) continue;
+      const cwd = shortText(meta.cwd, 4096);
+      if (params.cwd !== undefined && (!cwd || path.resolve(cwd) !== path.resolve(params.cwd))) continue;
+      // When the session began, not when it last wrote: a session already running in
+      // the same directory keeps writing its rollout, and is not a launch since then.
+      const began = Date.parse(shortText(meta.timestamp, 64) || '');
+      const createdMs = Number.isFinite(began) ? began : (opened.stat.birthtimeMs > 0 ? opened.stat.birthtimeMs : opened.stat.mtimeMs);
+      if (createdMs < params.sinceMs) continue;
+      rollouts.push({
+        ...describe(file, opened.stat), id, cwd, createdMs, model: shortText(meta.model), originator: shortText(meta.originator),
+        child: codex.isChildSession(meta), headless: codex.isHeadlessSession(meta),
+      });
+    } finally { fs.closeSync(opened.fd); }
+  }
+  return { rollouts };
+}
+
 async function handle(params, options = {}) {
+  if (params && params.op === 'find') return find(params, options);
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const now = options.now || Date.now;
   const closed = options.closed || (() => false);
@@ -189,6 +278,6 @@ async function handle(params, options = {}) {
 }
 
 module.exports = {
-  handle, open, validate, generationOf, nodeAccount,
+  handle, open, find, validate, generationOf, nodeAccount, FIND_MAX,
   TAIL_MAX_BYTES, MATCH_MAX_WAIT_MS, MATCH_POLL_MS, REQUEST_MAX_READ_BYTES,
 };

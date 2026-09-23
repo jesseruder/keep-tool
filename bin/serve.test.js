@@ -15969,3 +15969,108 @@ test('answering a Codex approval finds a rollout no scan indexed, and refuses wi
     assert.deepEqual(f.fleetScans, [], 'nothing scanned the fleet');
   } finally { f.cleanup(); }
 });
+
+
+// A Codex TUI as the daemon's evidence sees one: called `codex`, so `ps` names it an
+// agent, it begins its rollout(s) under $CODEX_HOME/sessions at launch with a
+// session_meta line, and it holds them open until it is told to exit.
+const FAKE_CODEX = [
+  '#!/bin/sh',
+  'day="$CODEX_HOME/sessions/$(date +%Y/%m/%d)"',
+  'mkdir -p "$day"',
+  'now="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"',
+  'n=3',
+  'for id in $KEEP_TEST_CODEX_IDS; do',
+  '  f="$day/rollout-$(date +%Y-%m-%dT%H-%M-%S)-$id.jsonl"',
+  '  printf \'{"type":"session_meta","payload":{"id":"%s","cwd":"%s","originator":"codex-tui","source":"cli","timestamp":"%s"}}\\n\' "$id" "$PWD" "$now" > "$f"',
+  '  eval "exec $n>>\\"\\$f\\""',
+  '  n=$((n+1))',
+  'done',
+  'printf "fake codex ready\\n"',
+  'read -r line',
+  'exit 0',
+  '',
+].join('\n');
+
+async function openCodexOnAws1(t, ids) {
+  const { withTwoNodeFleet } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  let outcome;
+  await withTwoNodeFleet(t, async ({ aws1, registry, env, project, fakeBin, agentPath, config, configFile, root }) => {
+    await closeHostClient();
+    const codexHome = path.join(root, 'codex-home');
+    fs.mkdirSync(codexHome, { recursive: true });
+    const codexAccount = { id: 'codex-node', label: 'Node codex', agent: 'codex', configDir: codexHome };
+    fs.writeFileSync(configFile, `${JSON.stringify({ ...config, accounts: [...config.accounts, codexAccount],
+      defaultAccounts: { ...config.defaultAccounts, codex: codexAccount.id } }, null, 2)}\n`);
+    fs.writeFileSync(path.join(fakeBin, 'codex'), FAKE_CODEX, { mode: 0o755 });
+    const zdotdir = path.join(root, 'zdotdir');
+    fs.mkdirSync(zdotdir);
+    try {
+      let opened = null;
+      let error = null;
+      try {
+        opened = await openSession({ fresh: true, agent: 'codex', node: 'aws1', cwd: project, accountId: codexAccount.id, requestId: 'open-codex-1' }, {
+          root: registry, env, connectHost: connect, codexFlags: '',
+          // An empty ZDOTDIR: the pane's login shell reads none of this machine's own
+          // rc files, so nothing puts a real codex ahead of the fake on PATH.
+          launchEnv: { PATH: agentPath, ZDOTDIR: zdotdir, KEEP_TEST_CODEX_IDS: ids.join(' ') },
+          // What the real wait waits for: the TUI up, which the fake says once its
+          // rollouts are begun.
+          waitForHostAgent: async (target) => {
+            const paneId = target.pane.slice(0, target.pane.lastIndexOf('@'));
+            const client = await connect({ node: 'aws1' });
+            let screen = null;
+            try {
+              for (let tries = 0; tries < 200; tries += 1) {
+                screen = await client.request('screen', { pane: paneId });
+                if (/fake codex ready/.test(JSON.stringify(screen))) return true;
+                await new Promise((resolve) => setTimeout(resolve, 50));
+              }
+            } finally { client.close(); }
+            throw new Error(`the fake codex never came up: ${JSON.stringify(screen).slice(-2000)}`);
+          },
+        });
+      } catch (caught) { error = caught; }
+      const paneId = opened && opened.pane ? opened.pane.slice(0, opened.pane.lastIndexOf('@')) : null;
+      outcome = {
+        opened, error, registry,
+        paneMeta: paneId ? aws1.panes.get(paneId).meta : null,
+        authority: (id) => { try { return JSON.parse(fs.readFileSync(path.join(registry, '.keep', 'session-accounts', `${id}.json`), 'utf8')); } catch { return null; } },
+      };
+      outcome.authorities = ids.map((id) => outcome.authority(id));
+    } finally { await closeHostClient(); }
+  });
+  return outcome;
+}
+
+test('a fresh Codex opened on aws1 is registered from the rollout its pane began, pinned there and bound on its host', async (t) => {
+  const id = 'aaaaaaaa-1111-2222-3333-444444444444';
+  const { opened, error, paneMeta, authorities } = await openCodexOnAws1(t, [id]);
+  assert.equal(error, null, error && error.stack);
+  assert.equal(opened.node, 'aws1');
+  assert.equal(opened.sessionId, id, JSON.stringify(opened));
+  assert.equal(opened.pendingRegistration, undefined);
+  assert.equal(authorities[0].node, 'aws1', 'the account record places it on aws1');
+  assert.equal(authorities[0].accountId, 'codex-node');
+  assert.equal(paneMeta.sessionId, id, 'the pane on aws1 names it');
+});
+
+test('a fresh Codex on aws1 whose launch began no rollout, or two, is not adopted and stays pending', async (t) => {
+  const none = await openCodexOnAws1(t, []);
+  assert.equal(none.error, null, none.error && none.error.stack);
+  assert.equal(none.opened.sessionId, null);
+  assert.equal(none.opened.pendingRegistration, true);
+  assert.match(none.opened.registrationNote, /no Codex rollout begun in .* on aws1 since the launch/);
+  assert.equal(none.paneMeta.sessionId, null);
+
+  const ids = ['bbbbbbbb-1111-2222-3333-444444444444', 'cccccccc-1111-2222-3333-444444444444'];
+  const two = await openCodexOnAws1(t, ids);
+  assert.equal(two.error, null, two.error && two.error.stack);
+  assert.equal(two.opened.sessionId, null);
+  assert.equal(two.opened.pendingRegistration, true);
+  assert.match(two.opened.registrationNote, /2 Codex rollouts begun .* which is this one's cannot be told/);
+  assert.deepEqual(two.authorities, [null, null], 'neither is pinned');
+  assert.equal(two.paneMeta.sessionId, null);
+});

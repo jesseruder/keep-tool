@@ -498,7 +498,7 @@ async function bindRemotePane(input, agent, deps = {}) {
       const launchedCodex = agent === 'codex' && !owner && meta.openRequestId != null;
       if ((owner && owner !== sid) || launchedCodex) {
         const owns = agent === 'codex' && current.pane.alive === true
-          && await ownsPane(sid, current.pane, deps);
+          && await ownsPane(sid, current.pane, { ...nodeLocalCodexEvidence(input), ...deps });
         if (!owns) {
           if (owner) result.boundTo = owner;
           break;
@@ -513,6 +513,36 @@ async function bindRemotePane(input, agent, deps = {}) {
     }
   }
   return result;
+}
+
+// What codex-pane.ownsPane reads on this node: the rollout Codex named in the hook's
+// input for the session's meta, and this machine's open rollouts through
+// process-table.readOpenRollouts, which a Linux node without lsof answers from /proc.
+// A read that fails leaves the session unfound, so the pane is not taken.
+function nodeLocalCodexEvidence(input) {
+  const file = input && typeof input.transcript_path === 'string' ? input.transcript_path : null;
+  const mtimes = new Map();
+  return {
+    ...(file ? { sessionMetaFor: (sessionId) => require('../codex').sessionMetaFor(sessionId, { file }) } : {}),
+    liveSessionPids: (given) => require('../serve').liveSessionPids({
+      ...given,
+      lsof: async (pids) => {
+        const files = await require('../process-table.js').readOpenRollouts(pids);
+        const byPid = new Map();
+        for (const entry of files) {
+          if (!byPid.has(entry.pid)) byPid.set(entry.pid, []);
+          byPid.get(entry.pid).push(entry.path);
+          mtimes.set(entry.path, entry.mtime);
+        }
+        return [...byPid].flatMap(([pid, paths]) => [`p${pid}`, ...paths.map((entry) => `n${entry}`)]).join('\n');
+      },
+      statMtime: async (entry) => {
+        const value = mtimes.get(entry);
+        if (!Number.isFinite(value)) throw new Error(`no rollout mtime for ${entry}`);
+        return value;
+      },
+    }),
+  };
 }
 
 // releaseSessionPane's host half: only a pane that still names this session is

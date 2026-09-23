@@ -1134,8 +1134,9 @@ function createHost(options = {}) {
           guardedInputReceipts: true,
           // transcript: this host answers the `transcript` verb (bin/node-transcript.js)
           // for the sessions it runs, which is how the daemon confirms a delivery to a
-          // pane on this machine. A number, so a later shape can say it is a later one.
-          transcript: 1,
+          // pane on this machine. A number, so a later shape can say it is a later one:
+          // 2 adds `find`, the Codex rollouts written since a launch.
+          transcript: 2,
           // artifacts: this host answers the `artifacts` verb (bin/session-artifacts.js),
           // which lists, reads, stages and publishes a Claude session's files under one
           // of this node's own accounts, so a session can be moved onto or off it.
