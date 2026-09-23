@@ -212,6 +212,25 @@ for (const [point, phase, holder, reached] of FAILURES) {
   });
 }
 
+test('a source whose agent exited late says so, and that a recovery usually succeeds', async () => {
+  const late = world({ fail: { stop: new Error('An agent process still owns this conversation') } });
+  try {
+    let id;
+    await assert.rejects(move.moveSession({ sessionId: SID, node: 'aws1' }, late.deps), (error) => {
+      id = error.extra.id;
+      return error.extra.phase === 'stopping' && /The source's agent exited late/.test(error.message)
+        && new RegExp(`keep move --recover ${id} usually succeeds`).test(error.message);
+    });
+    assert.equal((await move.moveSession({ recover: id }, late.deps)).status, 'done');
+  } finally { late.cleanup(); }
+  // Any other stop failure keeps the plain message.
+  const other = world({ fail: { stop: true } });
+  try {
+    await assert.rejects(move.moveSession({ sessionId: SID, node: 'aws1' }, other.deps),
+      (error) => /stop failed/.test(error.message) && !/exited late/.test(error.message));
+  } finally { other.cleanup(); }
+});
+
 test('a source started again after the copy is caught before the flip, and nothing launches', async () => {
   const w = world({ reviveAfter: 'transfer' });
   try {

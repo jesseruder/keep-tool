@@ -6706,6 +6706,30 @@ function validatedCodexResumeCwd(agent, value) {
   return value;
 }
 
+// A move proves its source stopped before the target starts, and the pane exiting is
+// not yet that proof: children of the agent that still carry the session in their
+// environment (an MCP server, a subagent) can outlive the pane by a moment. Only a
+// move waits them out, reading the table every 500 ms for up to 15 s; the single read
+// after this, unchanged, still decides. A restart on its own node never comes here.
+async function waitForMovedSessionProcesses(session, remotePane, deps, sleep) {
+  const started = Date.now();
+  const polls = Math.ceil((deps.moveStopWaitMs ?? 15000) / 500);
+  for (let i = 0; ; i++) {
+    const live = await liveSessionPids(deps);
+    // An unreadable remote table proves nothing either way; the read after this refuses it.
+    if (remotePane && unverifiedProcesses(live, session.kind)) return;
+    if (!live.has(session.id)) {
+      process.stderr.write(`keep serve: move stop: no agent process owns ${session.id} ${Date.now() - started}ms after its pane exited (${i + 1} reads)\n`);
+      return;
+    }
+    if (i + 1 >= polls) {
+      process.stderr.write(`keep serve: move stop: an agent process still owns ${session.id} ${Date.now() - started}ms after its pane exited (${i + 1} reads)\n`);
+      return;
+    }
+    await sleep(500);
+  }
+}
+
 // Restarting a session means judging a process and then stopping it, and every piece
 // of evidence for both — the `ps` table, liveSessionPids, the kill — belongs to the
 // machine the pane is on. It is pointed at that machine here, once, and everything
@@ -7060,6 +7084,7 @@ async function restartSession(body, deps = {}) {
       await sleep(200);
     }
     if (!helpersStopped) throw Error('Session helper did not exit; restart stopped without killing it');
+    if (deps.afterStop) await waitForMovedSessionProcesses(session, remotePane, deps, sleep);
     const live = await liveSessionPids(deps);
     // On another node this answer is a remote read, and a read that failed says
     // nothing about what is running there. Resuming on that silence is how a second

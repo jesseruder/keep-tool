@@ -137,10 +137,17 @@ function closeByHand(record, target) {
     + `close pane ${target.pane} on ${record.to} first`;
 }
 
+// The stop's own last read of the source's table, after its wait for the agent's
+// children to go, still found one: the source exited late, and nothing was copied.
+const LATE_EXIT = 'An agent process still owns this conversation';
+
 function recoveryMessage(record) {
   const holder = record.holder;
   const before = BEFORE_FLIP.includes(record.phase);
   return `move ${record.id} of ${record.sessionId} stopped while ${record.phase}: ${record.reason}. `
+    + (record.phase === 'stopping' && record.reason === LATE_EXIT
+      ? `The source's agent exited late, after the stop had finished waiting for it; keep move --recover ${record.id} usually succeeds once it has gone. `
+      : '')
     + `Its location record names ${holder}, which holds its verified bytes. `
     + `keep move --recover ${record.id} continues; keep move --abandon ${record.id} `
     + (before ? `leaves it on ${record.from}.` : `puts it back on ${record.from} once neither node runs it.`);

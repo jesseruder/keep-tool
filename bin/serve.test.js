@@ -12746,6 +12746,85 @@ test('agentRowUnreadable covers only the snapshots that describe nothing', () =>
   assert.equal(agentRowUnreadable([{ pid: 10, ppid: 1, args: '/bin/zsh -l' }], identity), false);
 });
 
+test('a move\'s stop waits out session processes that outlive the pane; a restart on its own node reads once', async () => {
+  const { restartSession } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-move-late-exit-'));
+  const claudeFile = path.join(root, 'claude.jsonl');
+  const accountConfig = path.join(root, 'config.json');
+  fs.writeFileSync(accountConfig, JSON.stringify({ version: 1, accounts: [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: path.join(os.homedir(), '.claude'), useDefaultConfig: true },
+  ], defaultAccounts: { claude: 'claude/default' } }));
+  fs.writeFileSync(claudeFile, JSON.stringify({ type: 'assistant', sessionId: 'late', message: { content: [], stop_reason: 'end_turn' } }) + '\n');
+  const stamp = 'Tue Sep  8 10:00:00 2026';
+  const command = '/test/claude --resume late';
+  const agent = { pid: 11, ppid: 10, pidStart: stamp, agent: 'claude', interactive: true, args: command };
+  // A subagent of the stopped agent, still carrying the session a moment after the pane exited.
+  const straggler = { pid: 31, ppid: 1, pidStart: stamp, agent: 'claude', interactive: true, args: command };
+  const shell = { pid: 10, ppid: 1, pidStart: stamp, agent: null, interactive: false, args: '/bin/zsh -l' };
+  const scenario = (lingerPolls, extraDeps = () => ({})) => {
+    const session = { id: 'late', kind: 'claude', state: 'idle', endedTurn: true, project: root };
+    let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
+      cols: 200, rows: 50, meta: { sessionId: 'late', agent: 'claude' } };
+    const state = { closing: false, exited: false, polls: 0, replaced: null, after: null };
+    const deps = {
+      root, env: { KEEP_DIR: root, KEEP_CONFIG: accountConfig }, withInjectionLock: (fn) => fn(),
+      buildState: async () => ({ sessions: [session], tasks: [] }),
+      claudeRolloutFile: () => claudeFile,
+      // Once the pane is gone, the straggler is in the table until the stop has polled lingerPolls times.
+      agentProcessRows: async () => (!state.exited ? [agent] : state.polls < lingerPolls ? [shell, straggler] : [shell]),
+      psTable: `11 10 ttys001 ${stamp} ${command}`,
+      lsof: async () => '',
+      closeIdleSession: async (_body, guards) => { await guards.beforeClose(); state.closing = true; },
+      sleep: async (ms) => {
+        if (ms === 500) state.polls += 1;
+        if (state.closing) { pane = { ...pane, alive: false }; state.exited = true; }
+      },
+      readScreenResult: async () => ({ text: `${command}\n~/keep > `, cursor: { x: 9, y: 1 } }),
+      waitForHostAgent: async () => {},
+      host: { request: async (type, params) => {
+        if (type === 'hello') return { replaceExited: true };
+        if (type === 'get') return { pane: { ...pane } };
+        if (type === 'list') return { panes: [{ ...pane }] };
+        if (type === 'input') return {};
+        assert.equal(type, 'replace-exited');
+        state.replaced = params;
+        pane = { ...pane, alive: true, pid: 20 };
+        return { pane };
+      } },
+      ...extraDeps(state),
+    };
+    return { state, run: () => restartSession({ sessionId: 'late', pane: 'p', pid: 10, mode: 'now' }, deps) };
+  };
+  const moving = (extra = {}) => (state) => ({ ...extra, afterStop: async (stopped) => { state.after = stopped.id; return { ok: true, stopped: stopped.id }; } });
+  try {
+    // The move: the straggler is there for two polls and gone on the third, and the stop is proven.
+    const late = scenario(2, moving());
+    const lateLog = [];
+    const write = process.stderr.write;
+    process.stderr.write = (chunk, ...rest) => { lateLog.push(String(chunk)); return true; };
+    let result;
+    try { result = await late.run(); } finally { process.stderr.write = write; }
+    assert.deepEqual(result, { ok: true, stopped: 'p' });
+    assert.equal(late.state.polls, 2, 'two 500 ms waits, then the table was clear');
+    assert.equal(late.state.replaced, null, 'a move never resumes on the source');
+    assert.ok(lateLog.some((line) => /move stop: no agent process owns late \d+ms after its pane exited \(3 reads\)/.test(line)), lateLog.join(''));
+
+    // A straggler that never goes still refuses the move, after the bounded wait.
+    const stuck = scenario(Infinity, moving({ moveStopWaitMs: 2000 }));
+    process.stderr.write = () => true;
+    try { await assert.rejects(stuck.run(), /^Error: An agent process still owns this conversation$/); }
+    finally { process.stderr.write = write; }
+    assert.equal(stuck.state.polls, 3, 'four reads, three waits');
+    assert.equal(stuck.state.after, null, 'nothing past the stop ran');
+
+    // A restart on its own node reads once, as it always has, and refuses the same straggler.
+    const local = scenario(2);
+    await assert.rejects(local.run(), /^Error: An agent process still owns this conversation$/);
+    assert.equal(local.state.polls, 0, 'no move wait on a local restart');
+    assert.equal(local.state.replaced, null);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a ps snapshot that missed the agent is read again instead of refusing the restart', async () => {
   const { restartSession } = require('./serve');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-ps-reread-'));
