@@ -78,13 +78,26 @@ async function recoveryNeeded(ctx, error) {
   await ctx.reload();
 }
 
+async function alreadyMoving(ctx, error) {
+  dismissWriteFailure(error.writeFailureId);
+  const phase = error.body.status === 'in-flight' ? error.body.phase : error.body.status;
+  ctx.toast(`A move to ${error.body.to || 'another machine'} is already running${phase ? ` (${phase})` : ''}`);
+  await ctx.reload();
+}
+
 async function moveTo(ctx, sessionId, node) {
   try {
     await write('/api/move-session', { sessionId, node, ownerForce: true, dry: true }, 'POST', { label: 'Checking move' });
   } catch (error) {
     if (!refused(error)) throw error;
     // Nothing was stopped: say why, and leave the controls as they were.
-    if (error.body?.id && error.body?.status) return recoveryNeeded(ctx, error);
+    if (error.body?.id && error.body?.status) {
+      // A move of this session is journalled already. Still in flight (started from
+      // the CLI, or by another console) it is running, not waiting for anyone; the
+      // reloaded state shows its step.
+      if (error.body.status !== 'recovery-needed') return alreadyMoving(ctx, error);
+      return recoveryNeeded(ctx, error);
+    }
     dismissWriteFailure(error.writeFailureId);
     ctx.toast(`Not moved: ${error.body?.error || error.message}`);
     return undefined;

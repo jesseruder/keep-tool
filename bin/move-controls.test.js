@@ -150,6 +150,29 @@ test('a dry check that fails for another reason keeps the failure banner', async
   assert.deepEqual(context.dismissed, []);
 });
 
+test('a dry run against a journalled move says whether it is running or waiting for recovery', async () => {
+  const id = 'mv-000000000000000000000005';
+  const ctx = fixture();
+  reset([{ error: { status: 409, message: `move ${id} of s is copying`,
+    body: { error: `move ${id} of s is copying; keep move --recover ${id} or --abandon ${id}`, id, sessionId: 's', from: 'main', to: 'aws1', status: 'copying' } } }]);
+  const aws1 = button({ moveNode: 'aws1' });
+  install(ctx, { '[data-move-node]': [aws1] });
+  await aws1.click();
+  assert.equal(context.writes.length, 1, 'no real move');
+  assert.deepEqual(ctx.toasts, ['A move to aws1 is already running (copying)']);
+  assert.deepEqual(context.dismissed, [1]);
+  assert.deepEqual(context.reported, []);
+  assert.equal(ctx.reloads, 1, 'the reloaded state shows the running move');
+
+  const failed = fixture();
+  reset([{ error: { status: 409, message: `move ${id} of s is recovery-needed`,
+    body: { error: `move ${id} of s is recovery-needed`, id, to: 'aws1', status: 'recovery-needed', message: 'stopped while starting' } } }]);
+  install(failed, { '[data-move-node]': [aws1] });
+  await aws1.click();
+  assert.deepEqual(failed.toasts, ['Move needs recovery: stopped while starting']);
+  assert.equal(failed.reloads, 1);
+});
+
 test('a move that stops part way toasts its message and reloads into Retry and Abandon', async () => {
   const ctx = fixture();
   reset([{ ok: true, dry: true }, { error: { status: 409, message: 'move mv-1 stopped while copying',
