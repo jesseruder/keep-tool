@@ -1,6 +1,6 @@
 ---
 name: keep-sessions
-description: Start, hand off to, message, inspect, delegate to, or move other agent sessions through Keep - keep open (--fresh, --agent, --account, --model, -m), keep tell, keep delegate, keep pane screen, keep restore, keep compact, keep handoff and keep transfer. Use when asked to start a new session, open a session on a card, hand a card to another session, message or check on another session, pick which account or model a session runs on, or move a rate-limited session to another account.
+description: Start, hand off to, message, inspect, delegate to, or move other agent sessions through Keep - keep open (--fresh, --agent, --account, --model, -m), keep tell, keep delegate, keep pane screen, keep restore, keep compact, keep handoff, keep transfer and keep move. Use when asked to start a new session, open a session on a card, hand a card to another session, message or check on another session, pick which account or model a session runs on, move a rate-limited session to another account, or move a session to another node.
 ---
 
 # Keep — other sessions
@@ -215,6 +215,28 @@ session controls outside Keep if the user directs that work.
   `--resolve-session <destination-id>`.
 - Both interrupt or replace someone's working session, so they are Owner's call unless the
   card grants it. `docs/accounts.md` in the keep-tool checkout has the full rules.
+
+## Moving a session to another node
+
+- `keep move <#n|session-id> --node <name> [--force] [--dry]` stops a Claude session,
+  carries its transcript, session trees and file history to the other node, verifies
+  them there by digest, flips the session's location record once, and resumes it there
+  on the same account, model and permission class. `--dry` prints the plan and changes
+  nothing.
+- Preconditions: more than one node configured; a Claude session (Codex and Pi are
+  refused for now); the target's host advertises the `artifacts` verb; the session's cwd
+  exists on the target; no unconfirmed message, account handoff or pending compaction
+  restore; the turn has ended. A session live on a node other than the daemon's leaves it
+  only with `--force` for now, and `--force` is Owner's forced stop: pass it only when
+  Owner asked for the move himself.
+- Worktrees: a session whose cwd is a `~/wt/` worktree needs that worktree on the target
+  first. Push its branch, create the worktree there with `wt` from the same branch, then
+  move.
+- A move that stops part way names the node that holds the session's verified bytes and
+  the command that continues it: `keep move --recover <tx>`, or `keep move --abandon <tx>`
+  to leave it where it was (only before the record flips). Until then `keep open`
+  refuses to resume that session.
+- Moving someone's working session is Owner's call unless the card grants it.
 
 ## Ending and hiding sessions
 

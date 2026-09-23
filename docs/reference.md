@@ -302,6 +302,9 @@ keep review-stats [--json]                               # last tick, skips, per
 keep nudge <id> --session <sid> --key <k> -m "..." [--send]  # message a live agent (dry-run default)
 keep tell <card|session-id|#n> -m "..." | --message-file <path> [--wait <dur>] [--dry] [--json]
                        # one session addressing another (needs keep serve)
+keep move <#n|session-id> --node <name> [--force] [--dry] [--json]
+keep move --recover <tx> | --abandon <tx>
+                       # a Claude session to another node (needs keep serve; see "Moving a session to another node")
 ```
 
 `keep claim <card>` assigns the current Claude or Codex session to an existing card.
@@ -1239,6 +1242,68 @@ inherit a bypass.
 
 `keep resume` prints `keep open <id>` for every session; `keep resume --raw` prints the
 bare `claude --resume` / `codex resume` form for a human who knows what it gives up.
+
+## Moving a session to another node
+
+`keep move <#n|session-id> --node <name>` stops a Claude session where it runs, carries
+its files to the other node, and resumes it there: the same conversation, on the same
+account, with the same model and permission class. It is the fleet's way to drain a
+machine (the laptop to `aws1` and back); `keep handoff` still moves a session between
+accounts on one machine, and `keep transfer` is still the fresh portable continuation.
+
+What moves is the session's own files under its account's config directory: the
+transcript `projects/<slug>/<sid>.jsonl`, its session tree `projects/<slug>/<sid>/`, any
+`<sid>.superseded-*` tree under another project, and `file-history/<sid>/`. Every node
+shares one home path, so they land at the same paths on the other machine. A node's host
+answers the `artifacts` verb for this (`bin/session-artifacts.js`): it lists and reads a
+session's files, stages what it is sent under `<configDir>/.keep-move/<tx>/` (4 MiB a
+piece, verified by sha256 when whole, 2 GiB a move), and publishes by rename. A publish
+never overwrites a file that differs from what the move carries unless a move put it
+there or the session left it behind in an earlier move; a live transcript nobody moved
+is refused, not replaced.
+
+Before anything stops, the move refuses when:
+
+- only one node is configured (`keep move needs another node`), or the session is
+  already on the node named;
+- the session is not a Claude session (Codex and Pi are refused by name for now);
+- a node end's host predates the `artifacts` verb (update keep-tool there and reload its
+  host);
+- the session's working directory does not exist on the target;
+- a message to the session is still unconfirmed, an account handoff is in flight, or a
+  compaction has not restored its model;
+- the session is working (its turn has not ended) and `--force` was not given;
+- the session is live on a node other than the daemon's and `--force` was not given: the
+  graceful stop proves background work from the transcript, which the daemon cannot
+  read on another node, so a move off a node is Owner's forced stop for now.
+
+`--dry` prints what the move would do and changes nothing. `--force` is Owner's own move,
+as with `keep handoff --force`: the source is signalled instead of being asked to exit.
+
+The move is journalled in `.keep/session-moves/<tx>.json` through `stopping`, `copying`,
+`staged`, `pinned`, `starting`, `verifying` and `done`. The source is proven stopped on
+its own node before anything is carried; the session's location record
+(`.keep/session-accounts/<sid>.json`) flips to the target exactly once, after the target
+holds the verified bytes and before the target starts; the target is launched through
+`keep open` pinned to the new record, and the move waits for its session-start. Then the
+card's session link is rewritten with the new node, the stopped pane is removed, the copy
+left behind is released for a later move back, and a move off a node also drops the
+daemon's transcript mirror for it and the node's hook queue and cursor. A move that fails
+is left `recovery-needed` with a message naming the node that holds the verified bytes
+(the source before the flip, the target after it): `keep move --recover <tx>` continues
+from the step that failed, and `keep move --abandon <tx>` clears the target's stage and
+leaves the session where it was (refused once the record has flipped). While a move owns
+a session, `keep open` refuses to resume it.
+
+**Worktrees.** A session whose cwd is a `~/wt/` worktree needs that worktree on the
+target before it can move: nothing carries a working tree, and the preflight refuses with
+`cwd-missing`. Create it there from the same branch first — on the target, `wt` in the
+repo's main checkout with the same slug, then check out the session's branch in it (push
+the branch from the source first if it has unpushed commits) — and move the session
+after.
+
+The route is `POST /api/move-session`, for local and admin callers only; no node may ask
+for a move, and the console has no button for it yet.
 
 ## Which account a fresh open lands on
 
