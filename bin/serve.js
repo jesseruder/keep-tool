@@ -12523,6 +12523,31 @@ async function addHostSessionState(state, deps = {}) {
   return state;
 }
 
+// Where an exited session lives, from its location record: the pane that said so is
+// gone (or is an old one on the machine it left), and the console still names the
+// machine and offers a move from there. `node` keeps its live meaning, named only when
+// it is not the daemon's own; `nodeRecorded` says the record exists, so the daemon's
+// node is known rather than assumed. Only on a fleet: a single-node install has one
+// answer and reads nothing. Sync reads, one small file per exited session: this runs
+// in the dashboard build worker, never on the daemon's loop.
+function addStoppedSessionNodes(state, deps = {}) {
+  if (!Array.isArray(state?.sessions) || hostNodeNames(deps).length < 2) return state;
+  const root = deps.root || keep.ROOT;
+  const env = deps.env || process.env;
+  const daemon = daemonNodeName(deps);
+  for (const session of state.sessions) {
+    if (!session || typeof session.id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(session.id)) continue;
+    if (!(session.exited === true || session.state === 'exited' || session.alive === false)) continue;
+    let node = null;
+    try { node = (deps.sessionNode || accounts.sessionNode)(session.id, { root, env }); } catch {}
+    if (!node) continue;
+    session.nodeRecorded = true;
+    if (node !== daemon) session.node = node;
+    else delete session.node;
+  }
+  return state;
+}
+
 function buildWhoSnapshot(project) {
   const tasks = keep.loadAll(false);
   const sessions = scanSessions();
@@ -15418,7 +15443,7 @@ module.exports = {
   portableTransferDraft, preparePortableTransfer,
   portableTransferPreview, transferSession, resolvePortableTransfer, recoverPortableOpening,
   resolveReviewLaunchSelection, launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
-  waitForHostAgent, waitForHostSessionId, adoptNodeCodexLaunch, addHostSessionState,
+  waitForHostAgent, waitForHostSessionId, adoptNodeCodexLaunch, addHostSessionState, addStoppedSessionNodes,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,
   claudeMcpMenuVisible,
   resumeAfterLimit,

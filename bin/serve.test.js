@@ -16656,3 +16656,39 @@ test('a session carrying a move keeps it through the console projection, live or
     assert.equal(byId.stopped.lastAssistantFull, undefined);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('an exited session publishes the node its location record names, through the console projection', () => {
+  const { addStoppedSessionNodes } = require('./serve');
+  const { consoleState } = require('./dashboard-state');
+  const records = { remote: 'aws1', here: 'main', moved: 'main' };
+  const asked = [];
+  const deps = { daemonNode: 'main', hostNodes: ['main', 'aws1'],
+    sessionNode: (id) => { asked.push(id); if (id === 'broken') throw new Error('invalid record'); return records[id] || null; } };
+  const state = { sessions: [
+    { id: 'remote', kind: 'claude', exited: true, state: 'exited', pane: null, lastAssistantFull: 'x' },
+    { id: 'here', kind: 'claude', alive: false, state: 'exited' },
+    // Its last pane was on aws1, but it was moved back since: the record wins.
+    { id: 'moved', kind: 'claude', exited: true, state: 'exited', node: 'aws1' },
+    { id: 'unrecorded', kind: 'codex', exited: true, state: 'exited' },
+    { id: 'broken', kind: 'claude', exited: true, state: 'exited' },
+    { id: 'live', kind: 'claude', alive: true, state: 'working', node: 'aws1' },
+  ] };
+  addStoppedSessionNodes(state, deps);
+  assert.deepEqual(asked, ['remote', 'here', 'moved', 'unrecorded', 'broken'], 'a live session keeps what its pane says');
+  const byId = Object.fromEntries(consoleState(state).sessions.map((session) => [session.id, session]));
+  assert.equal(byId.remote.node, 'aws1');
+  assert.equal(byId.remote.nodeRecorded, true);
+  assert.equal(byId.remote.lastAssistantFull, undefined);
+  assert.equal(byId.here.node, undefined, 'the daemon node is never named');
+  assert.equal(byId.here.nodeRecorded, true);
+  assert.equal(byId.moved.node, undefined);
+  for (const id of ['unrecorded', 'broken']) assert.equal(byId[id].nodeRecorded, undefined, id);
+  assert.equal(byId.live.node, 'aws1');
+
+  // One node: nothing is read and nothing is published.
+  asked.length = 0;
+  const single = { sessions: [{ id: 'remote', kind: 'claude', exited: true, state: 'exited' }] };
+  addStoppedSessionNodes(single, { ...deps, hostNodes: ['main'] });
+  assert.deepEqual(asked, []);
+  assert.equal(single.sessions[0].nodeRecorded, undefined);
+});

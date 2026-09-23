@@ -219,6 +219,7 @@ function consoleFixture() {
         keepRunning: true,
         modelUsage: { input: 1, cacheRead: 2, cacheWrite: 3, output: 4, reasoning: 0, calls: 1 },
         move: { id: 'mv-000000000000000000000001', to: 'aws1', from: 'main', status: 'recovery-needed', phase: 'copying' },
+        node: 'aws1', nodeRecorded: true,
         lastUser: 'Large user prompt', lastAssistantFull: 'Full historical tail', lastHuman: 'human', size: 999,
         opener: { via: 'keep' }, endedTurn: true, notify: { type: 'complete' }, lifecycleAgents: ['child'],
         askedProse: false, waitingFor: null, attentionAt: 115, localCommandPending: false,
@@ -382,7 +383,7 @@ test('console state reduces every dead session and leaves live rows whole', () =
     'turnStartedAt', 'accountId', 'account', 'accountLabel', 'reviewer', 'rateLimit', 'lastAssistant',
     'stateLine', 'lastVerdict', 'lastVerdictAt', 'verdictConfidence', 'pendingDecision',
     'pendingQuestion', 'pendingPlan', 'activity', 'notify', 'retirement', 'keepRunning', 'modelUsage', '_detailVersion',
-    'move',
+    'move', 'node', 'nodeRecorded',
   ];
   const flagged = projected.sessions.find((session) => session.id === 'flagged-exited');
   assert.deepEqual(Object.keys(flagged).sort(), [...expectedDeadSession].sort(),

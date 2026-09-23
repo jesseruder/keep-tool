@@ -39,8 +39,10 @@ function refusedAtMove(error) {
 }
 
 // The session's move controls, or '' when none apply. `live` is whether the session
-// has a live pane here: only a running session is offered a move, while a move the
-// state still carries is shown whether or not its pane survived the stop.
+// has a live pane here. A running session is offered a move, and so is a stopped one
+// whose location record the daemon published (`nodeRecorded`): keep move carries a
+// stopped session as well. A move the state still carries is shown whether or not its
+// pane survived the stop.
 export function moveControlsHTML(ctx, session, { live = false, pendingHandoff = false } = {}) {
   if (!session?.id || (session.kind || session.agent) !== 'claude' || pendingHandoff) return '';
   // A move the state carries is shown whatever the node list now says: one that needs
@@ -60,7 +62,7 @@ export function moveControlsHTML(ctx, session, { live = false, pendingHandoff = 
   if (nodes.length < 2) return '';
   const local = localMoves.get(session.id);
   if (local) return `<span class="handoff-status" role="status">Moving to ${ctx.esc(local)}…</span>`;
-  if (!live) return '';
+  if (!live && session.nodeRecorded !== true) return '';
   const current = session.node || daemonNodeName(ctx);
   const targets = nodes.filter((node) => node.name !== current);
   if (!targets.length) return '';

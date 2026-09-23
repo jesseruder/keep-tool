@@ -81,3 +81,18 @@ test('the review queue chooser offers the Machine select and sends the node pick
   expect(review).toHaveLength(1);
   expect(review[0].body).toMatchObject({ id: 'idea:on-aws1', action: 'start', agent: 'claude', accountId: 'claude-main', node: 'aws1' });
 });
+
+test('an exited session on another machine shows where it is and can be moved from there', async ({ page }) => {
+  const pane = fixture.state.panes.find(candidate => candidate.id === 'pa');
+  pane.alive = false; pane.agentAlive = false; pane.node = 'aws1';
+  fixture.update('a', { exited: true, state: 'exited', alive: false, node: 'aws1', nodeRecorded: true });
+  await expect(page.locator('#stage .shead .node-badge')).toHaveText('aws1');
+  await openMove(page);
+  await expect(page.locator('#stage [data-move-node="aws1"]')).toHaveCount(0);
+  await page.locator('#stage [data-move-node="main"]').click();
+  await expect(page.locator('#toast')).toContainText('Moved to main');
+  expect(moves()).toEqual([
+    { sessionId: 'a', node: 'main', ownerForce: true, dry: true },
+    { sessionId: 'a', node: 'main', ownerForce: true },
+  ]);
+});

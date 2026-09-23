@@ -562,3 +562,15 @@ test('the console listing prunes week-old finished journals once an hour and re-
   assert.deepEqual(ids(await move.listMovesAsync(root, { now: now + move.PRUNE_EVERY_MS })), [tx(5), tx(6)]);
   assert.deepEqual(reads, [], 'the sweep prunes from the cache without a read');
 });
+
+test('a dry run of a stopped session passes the preflight and plans its move with no pane', async () => {
+  const w = world({ noPane: true, from: 'aws1', session: { endedTurn: false } });
+  try {
+    const plan = await move.moveSession({ sessionId: SID, node: 'main', ownerForce: true, dry: true }, w.deps);
+    assert.equal(plan.dry, true);
+    assert.equal(plan.from, 'aws1');
+    assert.equal(plan.to, 'main');
+    assert.equal(plan.pane, null, 'nothing to stop: its pane is gone');
+    assert.deepEqual(move.listMoves(w.root), [], 'a dry run journals nothing');
+  } finally { w.cleanup(); }
+});

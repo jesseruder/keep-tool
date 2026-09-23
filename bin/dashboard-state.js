@@ -206,6 +206,9 @@ const CONSOLE_DEAD_SESSION_FIELDS = [
   // A move stops the session before it resumes it elsewhere, so the row it is shown on
   // is often an exited one; a failed move waits there for Retry or Abandon.
   'move',
+  // Which machine an exited session's location record names (serve.js
+  // addStoppedSessionNodes): its node badge, and where a move of it starts from.
+  'node', 'nodeRecorded',
 ];
 
 const CONSOLE_DEAD_PANE_FIELDS = [

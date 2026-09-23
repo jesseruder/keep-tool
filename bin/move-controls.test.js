@@ -79,6 +79,17 @@ test('move controls stay hidden on one node, for other agents, during a handoff,
   assert.equal(context.moveControlsHTML(fixture(), null, { live: true }), '');
 });
 
+test('a stopped session whose location is recorded is offered a move from the machine it is on', () => {
+  const stopped = context.moveControlsHTML(fixture(), session({ exited: true, node: 'aws1', nodeRecorded: true }), { live: false });
+  assert.match(stopped, /title="Stops this session on aws1[^"]*">Move to another machine/);
+  assert.match(stopped, /data-move-node="main"/);
+  assert.doesNotMatch(stopped, /data-move-node="aws1"/);
+  const here = context.moveControlsHTML(fixture(), session({ exited: true, nodeRecorded: true }), { live: false });
+  assert.match(here, /data-move-node="aws1"/);
+  assert.equal(context.moveControlsHTML(fixture(), session({ exited: true, node: 'aws1' }), { live: false }), '',
+    'a node from an old pane alone is not a recorded location');
+});
+
 test('an in-flight move shows its step and no buttons, live pane or not', () => {
   const move = { id: 'mv-000000000000000000000001', to: 'aws1', from: 'main', status: 'in-flight', phase: 'copying' };
   for (const live of [true, false]) {
