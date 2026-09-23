@@ -159,6 +159,27 @@ test('keep-running updates use the mutation fence and exact boolean contract', a
   assert.equal(calls[1].headers['x-keep-after-mutation'], 'epoch:7');
 });
 
+test('a refused write that carries a fence holds the next state read to it', async () => {
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), headers: { ...(options.headers || {}) } });
+    if (String(url) === '/api/move-session') {
+      return reply({ error: 'move stopped while copying', status: 'recovery-needed' }, 'epoch:4', 409);
+    }
+    if (String(url) === '/api/send') return reply({ error: 'busy' }, null, 409);
+    return reply({ sessions: [] }, 'epoch:4');
+  };
+  const api = await import(`./api.js?refused-fence=${Date.now()}`);
+  const error = await api.write('/api/move-session', { sessionId: 's', node: 'aws1' }).then(() => null, (failure) => failure);
+  assert.equal(error.status, 409);
+  await api.getState();
+  assert.equal(calls.at(-1).headers['x-keep-after-mutation'], 'epoch:4');
+  // Satisfied, the fence is cleared; an unfenced refusal sets none.
+  await api.send('s', 'hi').catch(() => {});
+  await api.getState();
+  assert.equal(calls.at(-1).headers['x-keep-after-mutation'], undefined);
+});
+
 test('out-of-order write responses cannot regress the pending mutation fence', async () => {
   let releaseFirst;
   const calls = [];

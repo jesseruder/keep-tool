@@ -166,6 +166,23 @@ test('real dashboard routes use the worker snapshot across full, console, mobile
   assert.equal(refreshed.headers['x-keep-mutation-fence'], fence);
   assert.equal((await request(port, '/api/notifications', { method: 'POST', body: {} })).status, 403);
 
+  // A move journalled as recovery-needed answers 409, and that answer is fenced: the
+  // console's reload after it must wait for a state that shows Retry and Abandon. A
+  // refusal that changed nothing is not fenced.
+  const stuck = `mv-${'0'.repeat(23)}9`;
+  fs.mkdirSync(path.join(root, '.keep', 'session-moves'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.keep', 'session-moves', `${stuck}.json`), JSON.stringify({
+    version: 1, id: stuck, sessionId: 'stuck-session', from: 'main', to: 'aws1', status: 'recovery-needed', phase: 'copying', createdAt: 1,
+  }));
+  const moveRefused = await request(port, '/api/move-session', { method: 'POST', headers: { 'x-keep': '1' }, body: { sessionId: 'stuck-session', node: 'aws1' } });
+  assert.equal(moveRefused.status, 409, JSON.stringify(moveRefused.body));
+  assert.equal(moveRefused.body.status, 'recovery-needed');
+  const [fenceEpoch, fenceSequence] = fence.split(':');
+  assert.equal(moveRefused.headers['x-keep-mutation-fence'], `${fenceEpoch}:${Number(fenceSequence) + 1}`);
+  const moveBad = await request(port, '/api/move-session', { method: 'POST', headers: { 'x-keep': '1' }, body: { sessionId: '../x', node: 'aws1' } });
+  assert.equal(moveBad.status, 400);
+  assert.equal(moveBad.headers['x-keep-mutation-fence'], undefined);
+
   // The Queue's Inbox rows close a card as done or not wanted, and only an inbox
   // card: a card someone has started since the row was drawn is refused.
   const inbox = (body, headers = { 'x-keep': '1' }) => request(port, '/api/inbox-card', { method: 'POST', headers, body });

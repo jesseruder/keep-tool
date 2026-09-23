@@ -802,6 +802,12 @@ function routes(ctx) {
           broadcast();
           return json(res, 200, result);
         } catch (error) {
+          // A move that stopped part way was journalled as recovery-needed: the
+          // console's reload after this 409 must see Retry and Abandon, so it is fenced.
+          if (error.extra && error.extra.status === 'recovery-needed') {
+            res.keepStateChanged = true;
+            broadcast();
+          }
           return json(res, error.status || 500, { error: error.message, ...(error.extra || {}) });
         }
       },

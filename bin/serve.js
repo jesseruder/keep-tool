@@ -15122,12 +15122,13 @@ function start(deps = {}) {
   // successful authoritative request receives a core-owned fence only after its
   // mutation has completed, at writeHead. Dashboard builds capture the fence in
   // prepare(), so an older in-flight build can never satisfy a post-write reload.
+  // A route whose refusal still changed state (res.keepStateChanged) is fenced too.
   server.prependListener('request', (req, res) => {
     if (req.method === 'GET' || req.method === 'HEAD') return;
     const writeHead = res.writeHead;
     let fenced = false;
     res.writeHead = function fencedWriteHead(status, ...args) {
-      if (!fenced && status >= 200 && status < 300) {
+      if (!fenced && ((status >= 200 && status < 300) || res.keepStateChanged === true)) {
         fenced = true;
         mutationSequence += 1;
         res.setHeader('x-keep-mutation-fence', mutationFence());

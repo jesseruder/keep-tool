@@ -54,6 +54,12 @@ function rememberMutationFence(fence, observedAtStart) {
   }
 }
 
+function stateMutation(pathname, method) {
+  return (method || 'GET') !== 'GET'
+    && (STATE_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname)
+      || /^\/api\/agents\/[^/]+\/seen$/.test(pathname));
+}
+
 // Read routes that expose session or handoff detail demand the header too — it forces
 // a CORS preflight, so a hostile page cannot reach them. Sending it on every request
 // keeps a newly guarded GET from 403ing the whole dashboard reload.
@@ -79,6 +85,10 @@ async function request(url, options = {}) {
   try { body = text ? JSON.parse(text) : null; } catch {}
   if (!response.ok) {
     if (response.status === 403) reportUnauthorized();
+    // A refusal that still changed state (a move journalled as recovery-needed) carries
+    // a fence too: the reload after it waits for a state built after the change.
+    const refusedFence = response.headers.get('x-keep-mutation-fence') || '';
+    if (refusedFence && stateMutation(pathname, options.method)) rememberMutationFence(refusedFence, observedFenceAtStart);
     const error = new Error(body?.error || text || `${response.status} ${response.statusText}`);
     error.status = response.status;
     error.body = body;
@@ -113,10 +123,7 @@ async function request(url, options = {}) {
       stateAfterMutation = '';
     }
   }
-  else if ((options.method || 'GET') !== 'GET'
-      && (STATE_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname)
-        || /^\/api\/agents\/[^/]+\/seen$/.test(pathname))
-      && fence) rememberMutationFence(fence, observedFenceAtStart);
+  else if (stateMutation(pathname, options.method) && fence) rememberMutationFence(fence, observedFenceAtStart);
   return body;
 }
 
