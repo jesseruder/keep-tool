@@ -9231,12 +9231,17 @@ function agentPromptVisible(agent, screen) {
 // is read only at a line's start (quoted text in a tool result is not Codex's own), and
 // the prompt only by its own options: "Press enter to continue" or "[y/N]" under a
 // notice can be another dialog's (the model-migration prompt), so they only enrich the
-// timeout's message. Returns { from, to, prompt, asks } for a screen showing the
-// notice, null otherwise.
+// timeout's message, which names the dialog when it is one Codex is known to show:
+// the model-migration prompt ("Press enter to continue" with no update options) and
+// the hook trust review ("review required"). Returns { from, to, prompt, asks, dialog }
+// for a screen showing the notice (dialog null, 'model-migration' or 'hook-trust'),
+// null otherwise. The sparkle may carry an emoji presentation selector (U+FE0F).
 const CODEX_UPDATE_VERSION = String.raw`v?(\d{1,4}\.\d{1,4}\.\d{1,4}(?:[-+][0-9A-Za-z.]{1,24})?)`;
-const CODEX_UPDATE_RE = new RegExp(String.raw`^\s{0,40}(?:✨\s{0,8})?Update available!\s{0,8}${CODEX_UPDATE_VERSION}\s{0,8}(?:->|→)\s{0,8}${CODEX_UPDATE_VERSION}`);
+const CODEX_UPDATE_RE = new RegExp(String.raw`^\s{0,40}(?:✨\uFE0F?\s{0,8})?Update available!\s{0,8}${CODEX_UPDATE_VERSION}\s{0,8}(?:->|→)\s{0,8}${CODEX_UPDATE_VERSION}`);
 const CODEX_UPDATE_PROMPT_RE = /Update now \(runs|Skip until next version/;
 const CODEX_UPDATE_ASKS_RE = /Press enter to continue|\[y\/N\]/i;
+const CODEX_MIGRATION_ASKS_RE = /Press enter to continue/i;
+const CODEX_HOOK_TRUST_RE = /review required/i;
 
 function codexUpdateNotice(screen) {
   const lines = stripTerminalAnsi(String(screen || '')).split(/\r?\n/);
@@ -9247,17 +9252,31 @@ function codexUpdateNotice(screen) {
     const under = lines.slice(index + 1, index + 13);
     const prompt = under.some((line) => CODEX_UPDATE_PROMPT_RE.test(line));
     const asks = prompt || under.some((line) => CODEX_UPDATE_ASKS_RE.test(line));
-    return { from: match[1], to: match[2], prompt, asks };
+    const dialog = prompt ? null : under.some((line) => CODEX_HOOK_TRUST_RE.test(line)) ? 'hook-trust'
+      : under.some((line) => CODEX_MIGRATION_ASKS_RE.test(line)) ? 'model-migration' : null;
+    return { from: match[1], to: match[2], prompt, asks, dialog };
   }
   return null;
 }
 
 function codexUpdateMessage(target, notice, deps = {}) {
+  // Another dialog Codex is known to show, under a notice from its history: named for
+  // itself, since the update is not what holds the pane.
+  if (notice.dialog === 'model-migration') {
+    return `codex in ${target.pane} is waiting at its model migration prompt; answer it in the pane`;
+  }
+  if (notice.dialog === 'hook-trust') {
+    return `codex in ${target.pane} is waiting at its hook trust review (see keep doctor's Codex hook trust row); answer it in the pane`;
+  }
   let node = '';
   try { node = sessionNodeOf(String(target.pane || ''), deps); } catch { node = ''; }
   const asking = notice.asks && !notice.prompt ? ', and a prompt under it waits for an answer' : '';
   return `codex in ${target.pane} is waiting at its update prompt (${notice.from} -> ${notice.to})${asking}; answer it in the pane or update Codex on ${node || 'its node'}`;
 }
+
+// What a refusal that names the notice carries: awaitingUpdate only when it is the
+// update that holds the pane, else which other dialog does (additive).
+const codexNoticeExtra = (notice) => (notice.dialog ? { awaitingDialog: notice.dialog } : { awaitingUpdate: true });
 
 // Under the injection lock: the prompt seen a moment ago must still be there
 // (the agent may have exited back to a shell), then type like a live delivery.
@@ -9357,7 +9376,7 @@ async function waitForHostAgent(target, agent, deps = {}) {
   const notice = agent === 'codex' ? codexUpdateNotice(screen) : null;
   if (notice) {
     throw new InjectionError(504, `${codexUpdateMessage(target, notice, deps)}; message not sent`, {
-      awaitingUpdate: true, screenTail: screenTail(screen),
+      ...codexNoticeExtra(notice), screenTail: screenTail(screen),
     });
   }
   throw new InjectionError(504, `${agent} session in ${target.pane} never showed an empty prompt; message not sent`, {

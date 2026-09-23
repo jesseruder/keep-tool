@@ -9884,14 +9884,31 @@ test('a Codex update notice with no prompt is waited out and named; with its pro
   await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),
     (error) => error.status === 409 && error.extra.awaitingUpdate === true);
   assert.ok(now > 0 && now < 2000, 'on the second read');
-  // "Press enter to continue" under the notice is another dialog's (the model-migration
-  // prompt): not refused, but the timeout still names the update, and that it asks.
+  // "Press enter to continue" under the notice is the model-migration prompt's: not
+  // refused, and the timeout names that prompt, not the update.
   now = 0;
   screen = '✨ Update available! 0.155.1 -> 0.156.1\n\n  Codex now defaults to a newer model.\n  Press enter to continue\n';
   await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),
+    (error) => error.status === 504 && error.extra.awaitingUpdate === undefined && error.extra.awaitingDialog === 'model-migration'
+      && error.message === 'codex in pane-update is waiting at its model migration prompt; answer it in the pane; message not sent');
+  assert.ok(now >= 45e3, 'waited out, not refused');
+  // The hook trust review under the notice is named, with where to look.
+  now = 0;
+  screen = '✨️ Update available! 0.155.1 -> 0.156.1\n\n  Hooks: review required\n  2 hooks changed since you last trusted them\n';
+  await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),
+    (error) => error.status === 504 && error.extra.awaitingDialog === 'hook-trust'
+      && error.message === 'codex in pane-update is waiting at its hook trust review (see keep doctor\'s Codex hook trust row); answer it in the pane; message not sent');
+  // Any other ask under it keeps the update wording, and says that it asks.
+  now = 0;
+  screen = '✨ Update available! 0.155.1 -> 0.156.1\n\n  Continue anyway? [y/N]\n';
+  await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),
     (error) => error.status === 504 && error.extra.awaitingUpdate === true
       && /waiting at its update prompt \(0\.155\.1 -> 0\.156\.1\), and a prompt under it waits for an answer; answer it in the pane/.test(error.message));
-  assert.ok(now >= 45e3, 'waited out, not refused');
+  // The sparkle with its emoji presentation selector is the same notice, prompt and all.
+  now = 0;
+  screen = '  ✨\uFE0F Update available! 0.155.1 -> 0.156.1\n\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n';
+  await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),
+    (error) => error.status === 409 && error.extra.awaitingUpdate === true);
   // The update text quoted inside a tool result is not Codex's notice: the generic timeout.
   now = 0;
   screen = '• Ran grep -r update\n  └ log: "✨ Update available! 0.155.1 -> 0.156.1"\n    3. Skip until next version\n    Update now (runs `npm install -g @openai/codex`)\n';
