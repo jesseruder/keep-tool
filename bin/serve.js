@@ -12581,6 +12581,11 @@ function sessionMoveDeps(deps = {}) {
       const handoff = require('./account-handoff').transferInFlight(root, sessionId);
       if (handoff) return `an account handoff is ${handoff.status} (${handoff.phase})`;
       if (compactRestoreBlocking(sessionId, deps)) return 'a compaction has not restored its model yet';
+      // A restart queued for idle (or one running, or one waiting for recovery) would
+      // stop and resume the session on the node it knew, under the move.
+      const restart = require('./session-restart').read(path.join(root, '.keep', 'session-restarts.json'))
+        .find((entry) => entry.sessionId === sessionId && ['queued', 'restarting', 'recovery-needed'].includes(entry.status));
+      if (restart) return `a restart is ${restart.status}${restart.mode ? ` (${restart.mode})` : ''}; cancel it or let it finish first`;
       return null;
     },
     stop: async (record) => {

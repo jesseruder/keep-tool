@@ -311,6 +311,26 @@ test('the move relinks the card\'s entry for the session in place, through relin
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('a restart queued for the session refuses the move before anything stops', async () => {
+  const stopped = [];
+  const w = wiredMove({ moveDeps: { stop: async () => { stopped.push('stop'); } } });
+  try {
+    const file = path.join(w.root, '.keep', 'session-restarts.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const entry = (sessionId, status) => ({ sessionId, pane: 'p1', pid: 42, mode: 'idle', status, at: Date.now() });
+    // Another session's restart, and this one's finished restart, are no obstacle to a dry run.
+    fs.writeFileSync(file, JSON.stringify([entry('sess-other', 'queued'), entry(SID, 'done')]));
+    assert.equal((await serve.moveSession({ sessionId: SID, node: 'aws1', dry: true }, w.deps)).dry, true);
+    for (const status of ['queued', 'restarting', 'recovery-needed']) {
+      fs.writeFileSync(file, JSON.stringify([entry(SID, status)]));
+      await assert.rejects(serve.moveSession({ sessionId: SID, node: 'aws1' }, w.deps),
+        (error) => error.status === 409 && error.extra.reason === 'busy' && new RegExp(`busy: a restart is ${status} \\(idle\\)`).test(error.message), status);
+    }
+    assert.deepEqual(stopped, []);
+    assert.equal(fs.existsSync(path.join(w.root, '.keep', 'session-moves')), false);
+  } finally { w.cleanup(); }
+});
+
 test('the cleanup removes the source pane only while it is exited and no agent runs the session there', async () => {
   const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-move-cleanup-'));
   try {
