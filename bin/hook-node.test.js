@@ -159,3 +159,88 @@ test('a Claude session on aws1 starts, is stopped by the daemon\'s evaluator, an
     assert.equal(fs.existsSync(path.join(nodeHome, '.keep-node', 'hook-queue')), false, 'nothing had to be queued');
   });
 });
+
+function runArgs(argv, env, cwd) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CLI, ...argv], { env, cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+test('a fresh Codex on aws1 that binds its pane late is adopted by the daemon, and its keep checkin goes through', async (t) => {
+  await withTwoNodeFleet(t, async (fleet) => {
+    const url = await daemonNodeApi(t, fleet);
+    const LATE = 'codex-late-e2e';
+    // The install's Codex account beside the fleet's Claude one.
+    const codexDir = path.join(fleet.registry, 'codex');
+    fs.mkdirSync(codexDir, { recursive: true });
+    const config = JSON.parse(fs.readFileSync(fleet.configFile, 'utf8'));
+    config.accounts.push({ id: 'codex-node', label: 'Node codex', agent: 'codex', configDir: codexDir });
+    config.defaultAccounts.codex = 'codex-node';
+    fs.writeFileSync(fleet.configFile, `${JSON.stringify(config, null, 2)}\n`);
+
+    // A card on the daemon's registry (a git repository, as a real one is) for the
+    // session to check in on.
+    const gitEnv = { PATH: process.env.PATH, HOME: fleet.root, LANG: 'C' };
+    const { spawnSync } = require('node:child_process');
+    for (const dir of ['archive', 'digests']) fs.mkdirSync(path.join(fleet.registry, dir), { recursive: true });
+    assert.equal(spawnSync('git', ['init', '-q', fleet.registry], { env: gitEnv }).status, 0);
+    spawnSync('git', ['-C', fleet.registry, 'config', 'user.name', 'Keep Test'], { env: gitEnv });
+    spawnSync('git', ['-C', fleet.registry, 'config', 'user.email', 'keep@example.test'], { env: gitEnv });
+    const daemonEnv = { PATH: process.env.PATH, HOME: fleet.root, LANG: 'C', KEEP_DIR: fleet.registry, KEEP_CONFIG: fleet.configFile,
+      KEEP_NO_PUSH: '1', KEEP_SYNC: '0', KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' };
+    const added = await runArgs(['add', 'Late work', '--file', '-m', 'Filed.'], daemonEnv, fleet.project);
+    assert.equal(added.status, 0, added.stderr);
+
+    // The daemon's open: a Codex pane on aws1 with its launch facts and no session yet,
+    // because Codex names its session only at its first submitted turn.
+    const remote = await connect({ node: 'aws1' });
+    let paneId;
+    try {
+      paneId = (await remote.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 30'], cwd: fleet.project, meta: {
+        agent: 'codex', accountId: 'codex-node', node: 'aws1', project: fleet.project, openRequestId: 'open-late-1',
+        launchedAt: Date.now(), opener: { kind: 'owner' },
+      } })).pane.id;
+    } finally { remote.close(); }
+
+    const tokenFile = path.join(fleet.root, 'node-api-token');
+    fs.writeFileSync(tokenFile, 'aws1-api-secret\n', { mode: 0o600 });
+    const nodeRegistry = path.join(fleet.root, 'node-registry');
+    fs.mkdirSync(nodeRegistry);
+    const nodeEnv = { PATH: process.env.PATH, HOME: path.join(fleet.root, 'node-home'), LANG: 'C', KEEP_DIR: nodeRegistry,
+      KEEP_NO_PUSH: '1', KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main', KEEP_HOST_SOCK: path.join(fleet.root, 'aws1.sock'),
+      KEEP_DAEMON_URL: url, KEEP_NODE_TOKEN_FILE: tokenFile, KEEP_PANE: paneId, KEEP_AGENT_ACCOUNT_ID: 'codex-node',
+      CODEX_THREAD_ID: LATE };
+    fs.mkdirSync(nodeEnv.HOME);
+
+    // Before the first turn: the daemon has nothing to adopt, and says so as it always did.
+    const early = await runArgs(['checkin', 'late-work', '-m', 'Too early.'], nodeEnv, fleet.project);
+    assert.notEqual(early.status, 0);
+    assert.match(early.stderr, new RegExp(`session ${LATE} is not on node aws1`));
+
+    // The first turn: the node's own hook binds the pane, as bindRemotePane writes it.
+    const binder = await connect({ node: 'aws1' });
+    try {
+      await binder.request('meta', { pane: paneId, patch: { sessionId: LATE, agent: 'codex', project: fleet.project } });
+    } finally { binder.close(); }
+    // Past the refusal the daemon remembers for five seconds.
+    await new Promise((resolve) => setTimeout(resolve, require('./late-adoption.js').NEGATIVE_TTL_MS + 100));
+
+    const checked = await runArgs(['checkin', 'late-work', '-m', 'Checked in from the node after the late bind.'], nodeEnv, fleet.project);
+    assert.equal(checked.status, 0, checked.stderr);
+    assert.match(fs.readFileSync(path.join(fleet.registry, 'tasks', 'late-work.md'), 'utf8'), /Checked in from the node after the late bind\./);
+    assert.deepEqual(require('./accounts.js').sessionLocation(LATE, { root: fleet.registry }),
+      { node: 'aws1', agent: 'codex', accountId: 'codex-node' });
+    const record = JSON.parse(fs.readFileSync(path.join(fleet.registry, '.keep', 'panes', `${LATE}.json`), 'utf8'));
+    assert.equal(record.pane, `${paneId}@aws1`);
+    assert.equal(record.node, 'aws1');
+    assert.equal(record.agent, 'codex');
+    assert.equal(record.accountId, 'codex-node');
+    assert.deepEqual(fs.readdirSync(nodeRegistry), [], 'the node wrote no registry of its own');
+  });
+});

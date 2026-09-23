@@ -581,3 +581,134 @@ test('add --claim and claim from a node worktree file the card under the main ch
   assert.equal(relative.status, 400);
   assert.match(relative.body.error, /is relative to a directory the daemon does not share/);
 });
+
+// ---------- late adoption (bin/late-adoption.js) ----------
+
+// A node host stand-in that lists the panes it is given and counts how often it is asked.
+function fakeNodeHost(panes) {
+  const host = { asked: 0, panes };
+  host.connect = async (node) => {
+    host.asked += 1;
+    host.node = node;
+    return { request: async (type) => { assert.equal(type, 'list'); return { panes: host.panes }; }, close: () => {} };
+  };
+  return host;
+}
+
+const lateCodexPane = (meta = {}, extra = {}) => ({
+  id: 'p7', alive: true, cwd: '/home/node/project', ...extra,
+  meta: { agent: 'codex', accountId: 'codex-node', sessionId: 'codex-late', node: 'aws1', project: '/home/node/project',
+    openRequestId: 'req-1', launchedAt: 1_700_000_000_000, opener: { kind: 'owner' }, ...meta },
+});
+
+function adoptingService(t, panes, extra = {}) {
+  const root = tempDir(t);
+  const configFile = path.join(root, 'config.json');
+  fs.mkdirSync(path.join(root, 'codex-home'));
+  fs.writeFileSync(configFile, `${JSON.stringify({ version: 1, daemonNode: 'main', nodes: { main: {}, aws1: {} },
+    accounts: [{ id: 'codex-node', label: 'Node codex', agent: 'codex', configDir: path.join(root, 'codex-home') }],
+    defaultAccounts: { codex: 'codex-node' } })}\n`);
+  const env = { PATH: '/usr/bin:/bin', HOME: root, LANG: 'C', KEEP_CONFIG: configFile };
+  const accounts = require('./accounts.js');
+  const host = fakeNodeHost(panes);
+  const logged = [];
+  let clock = 1_800_000_000_000;
+  const fake = fakeSpawn();
+  const svc = createRegistryService({
+    root, spawn: fake.spawn, daemonNode: () => 'main', env, configFile, now: () => clock,
+    location: (id) => accounts.sessionLocation(id, { root, env }),
+    hostConnect: host.connect, log: (line) => logged.push(line), ...extra,
+  });
+  return { svc, root, host, logged, calls: fake.calls, tick: (ms) => { clock += ms; }, env };
+}
+
+const lateBody = (root, extra = {}) => body(root, { session: 'codex-late', agent: 'codex', pane: 'p7@aws1', ...extra });
+
+test('a Codex session the daemon never heard register is adopted from its one pane on the node, and its command runs', async (t) => {
+  const { svc, root, host, logged, calls, env } = adoptingService(t, [lateCodexPane(), { id: 'p8', alive: true, meta: { agent: 'shell' } }]);
+  const answer = await svc.handle(AWS1, lateBody(root));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(host.node, 'aws1', 'the caller\'s own host was asked');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.env.CODEX_THREAD_ID, 'codex-late');
+  assert.deepEqual(require('./accounts.js').sessionLocation('codex-late', { root, env }),
+    { node: 'aws1', agent: 'codex', accountId: 'codex-node' });
+  const record = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'panes', 'codex-late.json'), 'utf8'));
+  assert.equal(record.pane, 'p7@aws1');
+  assert.equal(record.node, 'aws1');
+  assert.equal(record.agent, 'codex');
+  assert.equal(record.accountId, 'codex-node');
+  assert.equal(record.claimed, true);
+  assert.equal(record.bound, true);
+  assert.equal(record.cwd, '/home/node/project');
+  assert.equal(logged.filter((line) => /late adoption: codex session codex-late adopted on aws1/.test(line)).length, 1);
+  // Adopted once: the next request reads the record and never asks the host again.
+  const again = await svc.handle(AWS1, lateBody(root, { idempotencyKey: 'k-again-0123456789' }));
+  assert.equal(again.status, 200);
+  assert.equal(host.asked, 1);
+});
+
+test('late adoption refuses a pane of another agent, two panes naming the session, an unknown account and a pane the request does not name', async (t) => {
+  const cases = [
+    ['wrong agent', [lateCodexPane({ agent: 'claude' })], {}],
+    ['two panes', [lateCodexPane(), lateCodexPane({}, { id: 'p9' })], {}],
+    ['unknown account', [lateCodexPane({ accountId: 'codex-elsewhere' })], {}],
+    ['no account', [lateCodexPane({ accountId: undefined })], {}],
+    ['dead pane', [lateCodexPane({}, { alive: false })], {}],
+    ['no pane', [], {}],
+    ['another pane named', [lateCodexPane()], { pane: 'p8@aws1' }],
+    ['a pane that says another node', [lateCodexPane({ node: 'aws2' })], {}],
+  ];
+  for (const [name, panes, extra] of cases) {
+    const { svc, root, calls, logged } = adoptingService(t, panes);
+    const answer = await svc.handle(AWS1, lateBody(root, extra));
+    assert.equal(answer.status, 403, `${name}: ${JSON.stringify(answer.body)}`);
+    assert.equal(answer.body.error, 'session codex-late is not on node aws1', name);
+    assert.equal(calls.length, 0, `${name}: nothing ran`);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts')), false, `${name}: nothing pinned`);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'panes', 'codex-late.json')), false, `${name}: no pane record`);
+    assert.deepEqual(logged, [], name);
+  }
+  // A Claude request for the Codex pane's session is not adopted as either.
+  const { svc, root } = adoptingService(t, [lateCodexPane()]);
+  const claude = await svc.handle(AWS1, lateBody(root, { agent: 'claude' }));
+  assert.equal(claude.status, 403);
+  // Nor one whose daemon pane record places the session on the daemon.
+  const local = adoptingService(t, [lateCodexPane()]);
+  fs.mkdirSync(path.join(local.root, '.keep', 'panes'), { recursive: true });
+  fs.writeFileSync(path.join(local.root, '.keep', 'panes', 'codex-late.json'), JSON.stringify({ pane: '4', agent: 'codex' }));
+  assert.equal((await local.svc.handle(AWS1, lateBody(local.root))).status, 403);
+  assert.equal(fs.existsSync(path.join(local.root, '.keep', 'session-accounts')), false);
+});
+
+test('a refused late adoption is remembered for five seconds per node and session, so a flood asks the host once', async (t) => {
+  const { svc, root, host, tick } = adoptingService(t, []);
+  for (let i = 0; i < 5; i += 1) {
+    const answer = await svc.handle(AWS1, lateBody(root, { idempotencyKey: `k-flood-${i}-0123456789` }));
+    assert.equal(answer.status, 403);
+  }
+  assert.equal(host.asked, 1);
+  // Another session on the same node is asked for on its own.
+  await svc.handle(AWS1, lateBody(root, { session: 'codex-other', pane: null }));
+  assert.equal(host.asked, 2);
+  // Once the refusal has lapsed and the late bind has landed, it is adopted.
+  host.panes = [lateCodexPane()];
+  tick(4_000);
+  assert.equal((await svc.handle(AWS1, lateBody(root))).status, 403);
+  assert.equal(host.asked, 2);
+  tick(1_001);
+  const adopted = await svc.handle(AWS1, lateBody(root));
+  assert.equal(adopted.status, 200, JSON.stringify(adopted.body));
+  assert.equal(host.asked, 3);
+});
+
+test('late adoption never asks a host for a session that has a location record, nor for the daemon\'s own caller', async (t) => {
+  const { svc, root, host, env } = adoptingService(t, [lateCodexPane()]);
+  require('./accounts.js').pinSession('codex-late', 'codex', 'codex-node', { root, env, node: 'main' });
+  assert.equal((await svc.handle(AWS1, lateBody(root))).status, 403);
+  assert.equal((await svc.handle({ class: 'admin' }, lateBody(root, { pane: null }))).status, 200);
+  assert.equal(host.asked, 0);
+  // A host that cannot be reached refuses as before.
+  const down = adoptingService(t, [], { hostConnect: async () => { throw new Error('connect ECONNREFUSED'); } });
+  assert.equal((await down.svc.handle(AWS1, lateBody(down.root))).status, 403);
+});

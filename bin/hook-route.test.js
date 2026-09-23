@@ -1257,3 +1257,115 @@ test('a Codex pre-tool on the daemon judges a node\'s shell command by the node\
   const plain = await run('ls -la');
   assert.deepEqual([plain.status, JSON.parse(plain.stdout)], [0, {}]);
 });
+
+// ---------- late adoption (bin/late-adoption.js) ----------
+
+// The services over a real location record and a fake host for aws1 that lists `panes`.
+function adoptingServices(t, panes, overrides = {}) {
+  const root = tempDir(t);
+  const configFile = path.join(root, 'config.json');
+  fs.mkdirSync(path.join(root, 'codex-home'));
+  fs.mkdirSync(path.join(root, 'claude-home'));
+  fs.writeFileSync(configFile, `${JSON.stringify({ version: 1, daemonNode: 'main', nodes: { main: {}, aws1: {} },
+    accounts: [
+      { id: 'codex-node', label: 'Node codex', agent: 'codex', configDir: path.join(root, 'codex-home') },
+      { id: 'claude-node', label: 'Node claude', agent: 'claude', configDir: path.join(root, 'claude-home') },
+    ],
+    defaultAccounts: { codex: 'codex-node', claude: 'claude-node' } })}\n`);
+  const env = { PATH: process.env.PATH, HOME: root, LANG: 'C', KEEP_CONFIG: configFile };
+  const accounts = require('./accounts.js');
+  const host = { asked: 0, panes };
+  const fake = fakeSpawn(overrides.answer || (() => ({ code: 0, stdout: '{}\n' })));
+  let clock = 1_800_000_000_000;
+  const logged = [];
+  const registry = createRegistryService({
+    root, spawn: fake.spawn, daemonNode: () => 'main', env, configFile, now: () => clock, log: (line) => logged.push(line),
+    location: (id) => accounts.sessionLocation(id, { root, env }),
+    hostConnect: async (node) => {
+      host.asked += 1;
+      assert.equal(node, 'aws1');
+      return { request: async (type) => { assert.equal(type, 'list'); return { panes: host.panes }; }, close: () => {} };
+    },
+  });
+  const hooks = createHookService({ root, registry });
+  return { root, hooks, host, calls: fake.calls, logged, env, tick: (ms) => { clock += ms; } };
+}
+
+const latePane = (meta = {}, extra = {}) => ({
+  id: 'p2', alive: true, cwd: '/home/node/project', ...extra,
+  meta: { agent: 'codex', accountId: 'codex-node', sessionId: 'codex-aws1', node: 'aws1', project: '/home/node/project',
+    openRequestId: 'req-1', launchedAt: 1_700_000_000_000, ...meta },
+});
+
+test('a Codex hook for a session the daemon never heard register is adopted from its one pane on the node, then runs', async (t) => {
+  const { root, hooks, host, calls, logged, env } = adoptingServices(t, [latePane(), { id: 'p3', alive: true, meta: { agent: 'shell' } }]);
+  const answer = await hooks.handle(AWS1, codexBody('codex-start', { hook_event_name: 'SessionStart', source: 'startup' }, {
+    identity: { agent: 'codex', sessionId: 'codex-aws1', pane: 'p2@aws1' },
+  }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(host.asked, 1);
+  assert.deepEqual(require('./accounts.js').sessionLocation('codex-aws1', { root, env }),
+    { node: 'aws1', agent: 'codex', accountId: 'codex-node' });
+  const record = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'panes', 'codex-aws1.json'), 'utf8'));
+  assert.equal(record.pane, 'p2@aws1');
+  assert.equal(record.node, 'aws1');
+  assert.equal(record.agent, 'codex');
+  assert.equal(record.accountId, 'codex-node');
+  assert.equal(record.bound, true);
+  assert.deepEqual(calls.at(-1).args, [CLI, 'hook', 'codex', 'start']);
+  assert.equal(calls.at(-1).options.env.KEEP_AGENT_ACCOUNT_ID, 'codex-node', 'the adopted record\'s account');
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /late adoption: codex session codex-aws1 adopted on aws1 in pane p2@aws1 \(account codex-node\)/);
+  // The next hook reads the record: no second question to the host.
+  const stop = await hooks.handle(AWS1, codexBody('codex-stop', { hook_event_name: 'Stop', stop_hook_active: false }));
+  assert.equal(stop.status, 200, JSON.stringify(stop.body));
+  assert.equal(host.asked, 1);
+});
+
+test('a Claude hook is adopted the same way, from a Claude pane', async (t) => {
+  const { root, hooks, env } = adoptingServices(t, [latePane({ agent: 'claude', accountId: 'claude-node', sessionId: 'sess-late' })]);
+  const answer = await hooks.handle(AWS1, body({
+    input: { session_id: 'sess-late', transcript_path: '/home/node/.claude/projects/p/sess-late.jsonl', cwd: '/home/node/project', hook_event_name: 'Stop', stop_hook_active: false },
+    identity: { agent: 'claude', sessionId: 'sess-late', pane: 'p2@aws1' },
+  }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(require('./accounts.js').sessionLocation('sess-late', { root, env }).agent, 'claude');
+});
+
+test('a late hook is refused as before for a pane of another agent, two panes, an unknown account, and within five seconds of a refusal', async (t) => {
+  const start = (extra = {}) => codexBody('codex-start', { hook_event_name: 'SessionStart', source: 'startup' }, {
+    identity: { agent: 'codex', sessionId: 'codex-aws1', pane: 'p2@aws1' }, ...extra });
+  const cases = [
+    ['wrong agent', [latePane({ agent: 'claude', accountId: 'claude-node' })]],
+    ['two panes', [latePane(), latePane({}, { id: 'p4' })]],
+    ['unknown account', [latePane({ accountId: 'codex-elsewhere' })]],
+    ['a Claude account on a Codex pane', [latePane({ accountId: 'claude-node' })]],
+    ['no pane', []],
+  ];
+  for (const [name, panes] of cases) {
+    const { root, hooks, calls, logged } = adoptingServices(t, panes);
+    const answer = await hooks.handle(AWS1, start());
+    assert.equal(answer.status, 403, `${name}: ${JSON.stringify(answer.body)}`);
+    assert.equal(answer.body.error, 'session codex-aws1 is not on node aws1', name);
+    assert.equal(calls.length, 0, name);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts')), false, name);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'panes')), false, name);
+    assert.deepEqual(logged, [], name);
+  }
+  // The negative cache: a flood asks the host once, and after five seconds asks again.
+  const { hooks, host, tick } = adoptingServices(t, []);
+  for (let i = 0; i < 4; i += 1) assert.equal((await hooks.handle(AWS1, start({ idempotencyKey: `${KEY}-flood-${i}` }))).status, 403);
+  assert.equal(host.asked, 1);
+  host.panes = [latePane()];
+  tick(4_999);
+  assert.equal((await hooks.handle(AWS1, start())).status, 403);
+  assert.equal(host.asked, 1);
+  tick(2);
+  assert.equal((await hooks.handle(AWS1, start())).status, 200);
+  assert.equal(host.asked, 2);
+  // A session already placed elsewhere is never adopted, and the host never asked.
+  const placed = adoptingServices(t, [latePane()]);
+  require('./accounts.js').pinSession('codex-aws1', 'codex', 'codex-node', { root: placed.root, env: placed.env, node: 'main' });
+  assert.equal((await placed.hooks.handle(AWS1, start())).status, 403);
+  assert.equal(placed.host.asked, 0);
+});

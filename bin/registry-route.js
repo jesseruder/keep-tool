@@ -10,7 +10,9 @@
 // refused outright.
 //
 // A node acts only for itself: the session it names must be one the durable
-// location record places on that node, and a pane it names must be on it.
+// location record places on that node, and a pane it names must be on it. A session
+// with no location record at all whose one live pane on the caller names it is
+// adopted first (bin/late-adoption.js).
 //
 // Every request carries an idempotency key. A "started" record is journalled under
 // .keep/registry-ops before the command is spawned and replaced by the response
@@ -142,6 +144,12 @@ function createRegistryService(options = {}) {
   const configFile = options.configFile || require('./config.js').configFile(baseEnv);
   const stopping = options.stopping || (() => false);
   const log = options.log || ((text) => { try { process.stderr.write(`keep serve: ${text}\n`); } catch {} });
+  // A session the caller's host shows but the daemon never heard register
+  // (bin/late-adoption.js): asked before a request naming it is refused.
+  const lateAdoption = options.lateAdoption || require('./late-adoption.js').createLateAdoption({
+    root, env: { ...baseEnv, KEEP_CONFIG: configFile }, now, nodes, daemonNode, location, log,
+    ...(options.hostConnect ? { hostConnect: options.hostConnect } : {}),
+  });
   const pidAlive = options.pidAlive || ((pid) => {
     try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
   });
@@ -292,6 +300,10 @@ function createRegistryService(options = {}) {
     try {
       const daemon = daemonNode();
       const caller = callerNode(principal, daemon);
+      if (caller !== daemon && body && typeof body === 'object' && typeof body.session === 'string'
+        && typeof body.agent === 'string' && lateAdoption.unlocated(body.session)) {
+        await lateAdoption.adopt(caller, body.session, body.agent, { pane: typeof body.pane === 'string' ? body.pane : null });
+      }
       const request = validateRequest(body, caller, {
         io, location,
         parsePaneRef: (ref) => nodes.parsePaneRef(ref),
@@ -389,7 +401,7 @@ function createRegistryService(options = {}) {
   const shared = {
     root, daemonNode, location, nodes, now, baseEnv,
     callerNode: (principal) => callerNode(principal, daemonNode()),
-    journaled, spawnKeep, childEnv,
+    journaled, spawnKeep, childEnv, adopt: lateAdoption.adopt, unlocated: lateAdoption.unlocated,
     parsePaneRef: (ref) => nodes.parsePaneRef(ref),
     formatPaneRef: (node, paneId) => nodes.formatPaneRef(node, paneId),
   };

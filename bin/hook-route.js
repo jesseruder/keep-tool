@@ -13,9 +13,10 @@
 // A node acts only for a session the location record places on it with the agent the
 // event is for (a Claude event for a Claude session, a codex-* event for a Codex
 // one, whose mirror is its rollout), only on that session's mirror, and only with a
-// pane on itself. The run goes through the registry route's journal
-// (bin/registry-route.js), so a resent event replays its answer instead of running
-// again, and a restart waits for it. The transcript
+// pane on itself. A session with no location record whose one live pane on the
+// caller names it is adopted first (bin/late-adoption.js). The run goes through the
+// registry route's journal (bin/registry-route.js), so a resent event replays its
+// answer instead of running again, and a restart waits for it. The transcript
 // append is outside the journal and needs none: a post must start where the mirror
 // ends, so a resend of bytes already appended writes nothing and says where to go on.
 const crypto = require('node:crypto');
@@ -597,6 +598,14 @@ function createHookService(options = {}) {
       // Only for a session on another node: the daemon's own sessions run their hooks
       // themselves, and a caller naming the daemon would route its panes to itself.
       if (caller === daemon) refuse(403, 'the hook route is for sessions on other nodes');
+      // A session the caller's host shows but the daemon never heard register
+      // (bin/late-adoption.js), asked only for a well-formed event of its agent.
+      const identity = isObject(body) && isObject(body.identity) ? body.identity : null;
+      const ofItsAgent = identity && (body.event === TRANSCRIPT_ONLY
+        || ((EVENTS.includes(body.event) || CODEX_EVENTS.includes(body.event)) && agentOf(body.event) === identity.agent));
+      if (ofItsAgent && typeof shared.adopt === 'function' && shared.unlocated(identity.sessionId)) {
+        await shared.adopt(caller, identity.sessionId, identity.agent, { pane: typeof identity.pane === 'string' ? identity.pane : null });
+      }
       const request = validateRequest(body, caller, {
         location: shared.location, parsePaneRef: shared.parsePaneRef, formatPaneRef: shared.formatPaneRef, now, home,
       });
