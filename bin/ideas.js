@@ -34,6 +34,10 @@ const WATCH_GAP_MS = 4 * WATCH_TICK_MS;
 const WATCH_CEILING_FACTOR = 4;
 const CLAIM_MAX_AGE_MS = MODEL_TIMEOUT_MS * WATCH_CEILING_FACTOR + 4 * 60e3;
 const MODEL_OUTPUT_MAX = 1024 * 1024;
+// Fable is billed from usage credits, not the subscription. With none, claude prints
+// "Fable 5.1 requires usage credits…" on stdout and exits 1, and the sweep failed every
+// 30 minutes until noon (2026-09-23). It runs on this model instead for that sweep.
+const CREDITS_FALLBACK_MODEL = 'opus';
 const RAW_OUTPUT_MAX = 200000;
 const REVIEW_TAIL_MAX = 200000;
 const DEFAULT_CLOCK = { hour: 7, minute: 30, invalid: false };
@@ -538,7 +542,11 @@ function captureModelOutput(child, timeoutMs = MODEL_TIMEOUT_MS, deps = {}) {
       closed = true;
       clearTimeout(killTimer);
       if (terminationError) finish(code, terminationError);
-      else if (code !== 0) finish(code, new Error(`ideas generator exited ${code}${stderr.trim() ? `: ${clip(stderr, 500)}` : ''}`));
+      else if (code !== 0) {
+        // claude prints a refusal (no credits, no such model) on stdout, not stderr.
+        const said = stderr.trim() ? stderr : Buffer.concat(stdout, stdoutBytes).toString('utf8').slice(-2000);
+        finish(code, new Error(`ideas generator exited ${code}${said.trim() ? `: ${clip(said, 500)}` : ''}`));
+      }
       else finish(code);
     });
     function finish(code, error) {
@@ -646,7 +654,17 @@ async function run({ now = Date.now(), dry = false, model, accountId } = {}) {
   if (!claimed) return { skipped: 'in progress' };
 
   try {
-    const raw = await runModel(prompt, model, accountId);
+    let raw;
+    try {
+      raw = await runModel(prompt, model, accountId);
+    } catch (error) {
+      if (model === CREDITS_FALLBACK_MODEL || !/requires usage credits/i.test(error && error.message || '')) throw error;
+      const fallbackBudget = review.reviewBudget(CREDITS_FALLBACK_MODEL, cachedBudget(keep.ROOT), accountId);
+      if (fallbackBudget.code !== 0) throw error;
+      process.stderr.write(`keep ideas: ${model} needs usage credits; running on ${CREDITS_FALLBACK_MODEL}\n`);
+      model = CREDITS_FALLBACK_MODEL;
+      raw = await runModel(prompt, model, accountId);
+    }
     const ideas = parseIdeas(raw, allCardIds());
     const existing = loadTasks(keep.ROOT, true).filter((task) => task.fm.kind === 'idea');
     const titles = new Set(existing.map((task) => normalizeSweepTitle(task.fm.title)).filter(Boolean));

@@ -898,7 +898,8 @@ tool-free model seven days of fenced Keep evidence, avoids ideas already filed o
 already shipped, and lands at most three `kind: idea` cards through the reviewer's
 normal duplicate checks. `--dry` prints the evidence and prompt without
 calling a model or writing state; `--model` overrides `KEEP_IDEAS_MODEL` (default
-`fable`). The daemon runs it every day at local `KEEP_IDEAS_AT` (default `07:30`) and
+`fable`). When the model needs usage credits the account does not have, that sweep
+runs on `opus` instead (budget-checked on the same account). The daemon runs it every day at local `KEEP_IDEAS_AT` (default `07:30`) and
 retries failures every 30 minutes until noon.
 
 The sweep spends against the account the automation policy picks for the `ideas`

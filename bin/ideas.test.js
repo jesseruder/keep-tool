@@ -129,6 +129,18 @@ test('captureModelOutput terminates oversized output and rejects only on close',
   await rejection;
 });
 
+test('captureModelOutput names what claude printed on stdout when it exits non-zero with no stderr', async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => {};
+  const result = ideas.captureModelOutput(child);
+  child.stdout.write('Fable 5.1 requires usage credits. Switch to another model.\n');
+  await new Promise((resolve) => setImmediate(resolve));
+  child.emit('close', 1);
+  await assert.rejects(result, /^Error: ideas generator exited 1: Fable 5\.1 requires usage credits/);
+});
+
 test('captureModelOutput charges the deadline only for time it watched', async () => {
   const child = new EventEmitter();
   child.stdout = new PassThrough();
@@ -289,6 +301,31 @@ process.stdout.write(${JSON.stringify(JSON.stringify([
     const digestFile = fs.readdirSync(path.join(fixture.root, 'reviews'))[0];
     const digest = fs.readFileSync(path.join(fixture.root, 'reviews', digestFile), 'utf8');
     assert.match(digest, /^\[low\] review \(fable sweep\)$/m);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+// 2026-09-23: neither account had usage credits for Fable, so every sweep exited 1.
+test('a sweep whose model needs usage credits runs on opus instead', () => {
+  const fixture = registry('keep-ideas-credits-');
+  try {
+    const fake = path.join(fixture.root, 'fake-claude');
+    const models = path.join(fixture.root, 'models.log');
+    fs.writeFileSync(fake, `#!/usr/bin/env node
+if (process.argv[2] === '--help') { process.stdout.write('--disallowed-tools <tools...>'); process.exit(0); }
+const model = process.argv[process.argv.indexOf('--model') + 1];
+require('fs').appendFileSync(${JSON.stringify(models)}, model + '\\n');
+if (model === 'fable') { process.stdout.write('Fable 5.1 requires usage credits. Switch to another model.\\n'); process.exit(1); }
+process.stdout.write(${JSON.stringify(JSON.stringify([validIdea('Credits fallback idea')]))});
+`);
+    fs.chmodSync(fake, 0o755);
+    const result = runCli(fixture, ['ideas', '--model', 'fable'], { KEEP_CLAUDE: fake });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(fs.readFileSync(models, 'utf8').trim().split('\n'), ['fable', 'opus']);
+    const state = JSON.parse(fs.readFileSync(path.join(fixture.root, '.keep', 'ideas', 'state.json'), 'utf8'));
+    assert.equal(state.model, 'opus');
+    assert.equal(state.landed.length, 1);
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
