@@ -130,6 +130,13 @@ async function sideDifference(record, side, deps) {
   return manifest.targetDigests ? digestDifference(manifest.targetDigests, actual, true) : digestDifference(manifest.digests, actual, false);
 }
 
+// A pane for the session still open on the target with no agent proven in it or gone
+// from it: nothing a move can decide for Owner.
+function closeByHand(record, target) {
+  return `pane ${target.pane} on ${record.to} is open for ${record.sessionId}, and whether an agent runs in it is unproven; `
+    + `close pane ${target.pane} on ${record.to} first`;
+}
+
 function recoveryMessage(record) {
   const holder = record.holder;
   const before = BEFORE_FLIP.includes(record.phase);
@@ -265,6 +272,7 @@ async function run(record, deps, options = {}) {
         // A recovery after a launch was asked for: whether the target runs it decides
         // between waiting for its start once more and launching it again.
         const target = await deps.targetState(record);
+        if (target && target.unproven) throw new Error(closeByHand(record, target));
         if (target && target.running) {
           if (target.pane) record.launch = { ...(record.launch || {}), pane: target.pane };
           if (!record.launch || !record.launch.pane) {
@@ -390,6 +398,7 @@ async function abandonAfterFlip(record, deps) {
     catch (error) {
       throw refusal(409, `move ${record.id} cannot be abandoned: whether ${record.to} runs ${record.sessionId} is unproven: ${error && error.message || error}`);
     }
+    if (target && target.unproven) throw refusal(409, `move ${record.id} cannot be abandoned: ${closeByHand(record, target)}`, { reason: 'target-pane' });
     if (!target || target.running) {
       throw refusal(409, `move ${record.id} cannot be abandoned: ${record.sessionId} is running on ${record.to}`
         + `${target && target.pane ? ` in pane ${target.pane}` : ''}; keep move --recover ${record.id} finishes the move instead`);

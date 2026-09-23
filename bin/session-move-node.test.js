@@ -290,8 +290,16 @@ test('the target is found running by its live pane or by its own process table, 
   const idle = '11 10 ttys001 Tue Sep  8 10:00:00 2026 /bin/zsh';
   const state = (deps) => serve.sessionMoveDeps({ daemonNode: 'main', listHostPanes: async () => [], psTable: idle, ...deps }).targetState(record);
   assert.deepEqual(await state({}), { running: false, pane: null, agent: false });
-  const pane = { id: 'p4', alive: true, meta: { sessionId: SID }, node: 'main' };
+  const pane = { id: 'p4', alive: true, agentAlive: true, meta: { sessionId: SID }, node: 'main' };
   assert.deepEqual(await state({ listHostPanes: async () => [pane] }), { running: true, pane: 'p4', agent: false });
+  // A pane back at its shell (its agent proven gone) runs nothing; one with no agent
+  // proven either way is unproven, and named.
+  assert.deepEqual(await state({ listHostPanes: async () => [{ ...pane, agentAlive: false }] }), { running: false, pane: null, agent: false });
+  const lingering = { ...pane, agentAlive: undefined };
+  assert.deepEqual(await state({ listHostPanes: async () => [lingering] }), { running: true, pane: 'p4', agent: false, unproven: true });
+  assert.deepEqual(await state({ listHostPanes: async () => [lingering],
+    psTable: `${idle}\n12 10 ttys002 Tue Sep  8 10:00:00 2026 /test/claude --resume ${SID}` }), { running: true, pane: 'p4', agent: true },
+  'an agent in the table proves the pane runs it');
   assert.equal((await state({ listHostPanes: async () => [{ ...pane, alive: false }] })).running, false, 'a dead pane runs nothing');
   assert.equal((await state({ listHostPanes: async () => [{ ...pane, id: 'p4@aws1', node: 'aws1' }] })).running, false, 'a pane on the other node is not the target');
   assert.deepEqual(await state({ psTable: `${idle}\n12 10 ttys002 Tue Sep  8 10:00:00 2026 /test/claude --resume ${SID}` }),

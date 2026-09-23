@@ -77,6 +77,7 @@ function world(options = {}) {
     targetState: async () => {
       steps.push(['target']);
       failing('target');
+      if (state.lingering) return { running: true, pane: state.lingering, agent: false, unproven: true };
       return { running: Boolean(state.targetPane), pane: state.targetPane || null };
     },
     pinBack: async (record) => { steps.push(['pinBack', record.from]); failing('pinBack'); state.node = record.from; state.backs = (state.backs || 0) + 1; },
@@ -317,6 +318,27 @@ test('a target that gained bytes after the copy refuses the abandon back; an unc
     assert.equal(w.state.node, 'aws1');
     w.state.changed = {};
     assert.equal((await move.moveSession({ abandon: id }, w.deps)).status, 'abandoned-back');
+  } finally { w.cleanup(); }
+});
+
+test('a target pane with no agent proven in it is named to close by hand, and neither recovery nor abandon acts past it', async () => {
+  const w = world({ fail: { wait: true } });
+  try {
+    const id = await failedAfterFlip(w);
+    w.state.targetPane = null;
+    w.state.lingering = 'p9@aws1';
+    await assert.rejects(move.moveSession({ recover: id }, w.deps),
+      /pane p9@aws1 on aws1 is open for sess-moving, and whether an agent runs in it is unproven; close pane p9@aws1 on aws1 first/);
+    assert.deepEqual(names(w.steps), ['reprove', 'target'], 'nothing waited on or launched');
+    w.steps.length = 0;
+    await assert.rejects(move.moveSession({ abandon: id }, w.deps),
+      (error) => error.extra.reason === 'target-pane' && /cannot be abandoned: pane p9@aws1 on aws1 is open .* close pane p9@aws1 on aws1 first/.test(error.message));
+    assert.equal(names(w.steps).includes('pinBack'), false);
+    // Closed by hand: the recovery launches it again.
+    w.state.lingering = null;
+    w.steps.length = 0;
+    assert.equal((await move.moveSession({ recover: id }, w.deps)).status, 'done');
+    assert.deepEqual(names(w.steps).slice(0, 3), ['reprove', 'target', 'open']);
   } finally { w.cleanup(); }
 });
 

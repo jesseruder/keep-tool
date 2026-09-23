@@ -1311,7 +1311,9 @@ is left `recovery-needed` with a message naming the node that holds the verified
 from the step that failed. A recovery after the launch asks the target whether it runs
 the session: if nothing does, it is launched again under the same transaction; if it
 does, its session-start is waited for once more, and a start that never comes is said
-plainly. `keep move --abandon <tx>` before the flip clears the target's stage and leaves
+plainly. A pane for the session left open on the target with no agent proven in it
+blocks both the recovery and the abandon, which name it: close it by hand
+(`close pane <ref> on <node> first`); a pane back at its shell counts as not running. `keep move --abandon <tx>` before the flip clears the target's stage and leaves
 the session where it was; after the flip it is allowed once the source is proven
 stopped and the target proven not running the session, and it flips the record back to
 the source (the second flip, journalled as `abandoned-back`), leaves the target's copy

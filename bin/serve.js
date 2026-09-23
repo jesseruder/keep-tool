@@ -12623,13 +12623,21 @@ function sessionMoveDeps(deps = {}) {
     requireStopped: (record) => requireNoAgentOn(record.from, record.sessionId, deps),
     // Whether the target runs the session now: a live pane for it there, or an agent
     // process in the target's own table. An unreadable table throws (unproven).
+    //
+    // A pane whose agent is proven gone (agentAlive false: the pane is back at its
+    // shell) runs nothing. A pane still open with no agent proven in it either way is
+    // `unproven`: the move neither waits on it nor launches beside it, and the refusal
+    // names the pane to close by hand.
     targetState: async (record) => {
       const panes = await listPanes();
       if (!Array.isArray(panes)) throw new InjectionError(409, 'the terminal hosts did not list their panes');
-      const pane = panes.find((entry) => entry && entry.alive !== false && entry.meta && entry.meta.sessionId === record.sessionId
-        && sessionNodeOf(entry, deps) === record.to) || null;
+      const open = panes.filter((entry) => entry && entry.alive !== false && entry.agentAlive !== false && entry.meta
+        && entry.meta.sessionId === record.sessionId && sessionNodeOf(entry, deps) === record.to);
       const agent = await agentLiveOn(record.to, record.sessionId, deps);
-      return { running: Boolean(pane) || agent, pane: pane ? pane.id : null, agent };
+      const proven = open.find((entry) => entry.agentAlive === true) || null;
+      const pane = proven || open[0] || null;
+      const unproven = Boolean(pane) && !proven && !agent;
+      return { running: Boolean(pane) || agent, pane: pane ? pane.id : null, agent, ...(unproven ? { unproven: true } : {}) };
     },
     // The abandon's flip back, the only other flip a move makes.
     pinBack: (record) => accounts.pinSession(record.sessionId, 'claude', record.accountId,
