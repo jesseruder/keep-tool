@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // Registers the native messaging host with Edge (and Chrome on request), keeps the shared
-// MCP daemon alive through launchd, and points every Claude config directory and Codex
-// home on this machine at it over loopback HTTP.
+// MCP daemon alive through launchd (systemd on Linux), and points every Claude config
+// directory and Codex home on this machine at it over loopback HTTP.
 //
 //   node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
-//                       [--rotate-token] [--dry-run] [--uninstall]
+//                       [--user-data-dir <dir>] [--rotate-token] [--dry-run] [--uninstall]
 //
 // Nothing here is clever on purpose: --dry-run prints every file it would write, every
 // config edit it would make and every command it would run, so the whole thing can be
@@ -12,6 +12,10 @@
 //
 // The launchd job runs *this checkout's* mcp/daemon.js, so a landing does not reach
 // sessions until the daemon has been reloaded. Re-running the installer is what does it.
+//
+// On Linux there is no desktop Edge to borrow: a second systemd user unit runs
+// bin/headless-edge.js, which keeps a headless Edge on a scratch profile with the extension
+// loaded. The installer writes that profile a manifest of its own (--user-data-dir).
 
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -28,21 +32,43 @@ import {
   daemonConfigPath,
   daemonLogPath,
   daemonUrl,
+  edgeLogPath,
+  edgeProfileDir,
   launcherPath,
   readDaemonConfig,
   runtimeDir,
 } from "../host/protocol.js";
 
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const CODEX_FALLBACK = "/Users/jesseruder/.local/bin/codex";
 const LAUNCHCTL = "/bin/launchctl";
+/** Found on PATH when it runs; every systemd distribution has it there. */
+const SYSTEMCTL = "systemctl";
 /** How long `launchctl bootstrap` gets to bring the daemon up before we complain. */
 const HEALTH_TIMEOUT_MS = 10_000;
 
+/**
+ * Which machine the plan is for. The executable passes the real `process.platform`; a caller
+ * that says nothing gets macOS, the platform this installer was written for, so a plan built
+ * by a test reads the same on whichever host runs it. Linux is asked for by name.
+ */
+const DEFAULT_PLATFORM = "darwin";
+const PLATFORMS = ["darwin", "linux"];
+
+/** Relative to HOME on macOS, to XDG_CONFIG_HOME (default ~/.config) on Linux. */
 const BROWSER_DIRS = {
-  edge: ["Library", "Application Support", "Microsoft Edge", "NativeMessagingHosts"],
-  chrome: ["Library", "Application Support", "Google", "Chrome", "NativeMessagingHosts"],
+  darwin: {
+    edge: ["Library", "Application Support", "Microsoft Edge", "NativeMessagingHosts"],
+    chrome: ["Library", "Application Support", "Google", "Chrome", "NativeMessagingHosts"],
+  },
+  linux: {
+    edge: ["microsoft-edge", "NativeMessagingHosts"],
+    chrome: ["google-chrome", "NativeMessagingHosts"],
+  },
 };
+const BROWSERS = Object.keys(BROWSER_DIRS.darwin);
+
+export const DAEMON_UNIT = "browser-bridge-daemon.service";
+export const EDGE_UNIT = "browser-bridge-edge.service";
 
 export function parseArgs(argv) {
   const options = {
@@ -61,23 +87,42 @@ export function parseArgs(argv) {
     else if (arg === "--chrome-too") options.browsers = ["edge", "chrome"];
     else if (arg === "--browser") {
       const value = argv[++index];
-      if (!BROWSER_DIRS[value]) throw new Error(`--browser must be edge or chrome, not ${value}`);
+      if (!BROWSERS.includes(value)) throw new Error(`--browser must be edge or chrome, not ${value}`);
       options.browsers = [value];
+    } else if (arg === "--user-data-dir") {
+      const value = argv[++index];
+      if (!value || value.startsWith("--")) throw new Error("--user-data-dir needs a directory");
+      options.userDataDir = path.resolve(value);
     } else if (arg === "--help" || arg === "-h") options.help = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
   return options;
 }
 
-export function hostManifestPath(browser, env = process.env) {
-  return path.join(env.HOME, ...BROWSER_DIRS[browser], `${HOST_NAME}.json`);
+function xdgConfigHome(env) {
+  return env.XDG_CONFIG_HOME && path.isAbsolute(env.XDG_CONFIG_HOME)
+    ? env.XDG_CONFIG_HOME
+    : path.join(env.HOME, ".config");
 }
 
-export function hostManifest(env = process.env) {
+export function hostManifestPath(browser, env = process.env, platform = DEFAULT_PLATFORM) {
+  const base = platform === "linux" ? xdgConfigHome(env) : env.HOME;
+  return path.join(base, ...BROWSER_DIRS[platform][browser], `${HOST_NAME}.json`);
+}
+
+/**
+ * A browser started with --user-data-dir reads native messaging manifests from that
+ * directory and not from the per-user one, so a scratch profile needs its own copy.
+ */
+export function profileManifestPath(userDataDir) {
+  return path.join(userDataDir, "NativeMessagingHosts", `${HOST_NAME}.json`);
+}
+
+export function hostManifest(env = process.env, platform = DEFAULT_PLATFORM) {
   return {
     name: HOST_NAME,
     description: "Browser Bridge: local agent sessions drive this browser",
-    path: launcherPath(env),
+    path: launcherPath(env, platform),
     type: "stdio",
     allowed_origins: [EXTENSION_ORIGIN],
   };
@@ -98,12 +143,15 @@ export function commandLine(...parts) {
   return parts.map((part) => (/^[\w@%+=:,./-]+$/.test(part) ? part : shellQuote(part))).join(" ");
 }
 
-export function launcherScript(nodePath, projectDir = PROJECT_DIR) {
+export function launcherScript(nodePath, projectDir = PROJECT_DIR, runtime = null) {
   // Edge launches native hosts with a minimal environment: no PATH, no nvm shims, so
   // both paths are absolute and there is nothing to resolve at run time. They are also
   // quoted: a checkout under a path with a space would otherwise become two arguments.
   const script = path.join(projectDir, "host", "native-host.js");
-  return `#!/bin/sh\nexec ${shellQuote(nodePath)} ${shellQuote(script)} "$@"\n`;
+  // On Linux the runtime directory can move with XDG_STATE_HOME, which a systemd service
+  // and a login shell need not agree on, so the one the installer chose is pinned here.
+  const pin = runtime ? `export BROWSER_BRIDGE_RUNTIME_DIR=${shellQuote(runtime)}\n` : "";
+  return `#!/bin/sh\n${pin}exec ${shellQuote(nodePath)} ${shellQuote(script)} "$@"\n`;
 }
 
 // --- the shared daemon ----------------------------------------------------
@@ -118,8 +166,8 @@ export function launcherScript(nodePath, projectDir = PROJECT_DIR) {
  * its tab group. `--rotate-token` does both deliberately. An install from before the secret
  * existed gains one without its token changing.
  */
-export function daemonSettings(options, env = process.env) {
-  const existing = readDaemonConfig(env);
+export function daemonSettings(options, env = process.env, platform = DEFAULT_PLATFORM) {
+  const existing = readDaemonConfig(env, platform);
   const rotate = Boolean(options.rotateToken);
   const token = !rotate && existing?.token ? existing.token : randomBytes(32).toString("hex");
   const secret = !rotate && existing?.secret ? existing.secret : randomBytes(32).toString("hex");
@@ -157,7 +205,7 @@ function plistString(value) {
  * session and never logs a tool's arguments.
  */
 export function daemonPlist(nodePath, env = process.env, projectDir = PROJECT_DIR) {
-  const log = daemonLogPath(env);
+  const log = daemonLogPath(env, "darwin");
   const entries = [
     ["Label", DAEMON_LABEL],
     ["ProgramArguments", [nodePath, path.join(projectDir, "mcp", "daemon.js")]],
@@ -189,6 +237,107 @@ ${body}
 </dict>
 </plist>
 `;
+}
+
+// --- systemd, on Linux ------------------------------------------------------
+//
+// The same job as the plist, as a user unit: `Restart=always` is KeepAlive, `RestartSec=5`
+// is ThrottleInterval, and `WantedBy=default.target` with lingering on is RunAtLoad without
+// anyone having to log in.
+
+/**
+ * systemd splits an unquoted value on whitespace and reads its own escapes in it, so every
+ * argument and every environment value goes in double quotes with the two characters that
+ * syntax reserves escaped. `%` is doubled as well, inside quotes or not: systemd resolves its
+ * specifiers before it parses quoting. The same rule bin/setup.js applies to Keep's own unit.
+ */
+export function systemdQuote(value) {
+  return `"${systemdLine(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
+}
+
+/**
+ * For the settings that take the rest of the line as one path and do no unquoting
+ * (WorkingDirectory=, StandardOutput=append:): only the specifiers need escaping.
+ */
+function systemdPath(value) {
+  return systemdLine(value).replace(/%/g, "%%");
+}
+
+/** A newline would end the setting and start another one, so no value may carry one. */
+function systemdLine(value) {
+  const text = String(value);
+  if (/[\r\n]/.test(text)) throw new Error(`a systemd unit cannot hold a value with a line break: ${JSON.stringify(text)}`);
+  return text;
+}
+
+export function systemdUnitDir(env = process.env) {
+  return path.join(xdgConfigHome(env), "systemd", "user");
+}
+
+export function daemonUnitPath(env = process.env) {
+  return path.join(systemdUnitDir(env), DAEMON_UNIT);
+}
+
+export function edgeUnitPath(env = process.env) {
+  return path.join(systemdUnitDir(env), EDGE_UNIT);
+}
+
+/**
+ * BROWSER_BRIDGE_RUNTIME_DIR is written out rather than left to XDG_STATE_HOME: the user
+ * manager's environment is not the installer's shell's, and the daemon, the native host and
+ * daemon.json have to agree on one directory.
+ */
+export function daemonUnit(nodePath, env = process.env, projectDir = PROJECT_DIR) {
+  const log = daemonLogPath(env, "linux");
+  return [
+    "[Unit]",
+    "Description=Browser Bridge MCP daemon",
+    "",
+    "[Service]",
+    `ExecStart=${systemdQuote(nodePath)} ${systemdQuote(path.join(projectDir, "mcp", "daemon.js"))}`,
+    `WorkingDirectory=${systemdPath(projectDir)}`,
+    `Environment=BROWSER_BRIDGE_RUNTIME_DIR=${systemdQuote(runtimeDir(env, "linux"))}`,
+    `StandardOutput=append:${systemdPath(log)}`,
+    `StandardError=append:${systemdPath(log)}`,
+    "Restart=always",
+    "RestartSec=5",
+    "",
+    "[Install]",
+    "WantedBy=default.target",
+    "",
+  ].join("\n");
+}
+
+/**
+ * The headless Edge, supervised twice over: headless-edge.js restarts Edge itself with a
+ * backoff, and systemd restarts the wrapper if the wrapper dies. `on-failure` rather than
+ * `always` because the wrapper exits 0 only when it was told to stop. KillMode=mixed sends
+ * the stop signal to the wrapper alone, so it can close Edge down in order; anything still
+ * left in the cgroup after that is killed outright.
+ */
+export function edgeUnit(nodePath, env = process.env, projectDir = PROJECT_DIR) {
+  const log = edgeLogPath(env, "linux");
+  return [
+    "[Unit]",
+    "Description=Browser Bridge headless Edge",
+    `After=${DAEMON_UNIT}`,
+    `Wants=${DAEMON_UNIT}`,
+    "",
+    "[Service]",
+    `ExecStart=${systemdQuote(nodePath)} ${systemdQuote(path.join(projectDir, "bin", "headless-edge.js"))}`,
+    `WorkingDirectory=${systemdPath(projectDir)}`,
+    `Environment=BROWSER_BRIDGE_RUNTIME_DIR=${systemdQuote(runtimeDir(env, "linux"))}`,
+    `StandardOutput=append:${systemdPath(log)}`,
+    `StandardError=append:${systemdPath(log)}`,
+    "Restart=on-failure",
+    "RestartSec=5",
+    "KillMode=mixed",
+    "TimeoutStopSec=15",
+    "",
+    "[Install]",
+    "WantedBy=default.target",
+    "",
+  ].join("\n");
 }
 
 function which(command) {
@@ -466,6 +615,9 @@ export function withoutTomlTable(text, name) {
 }
 
 export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) {
+  const platform = options.platform ?? DEFAULT_PLATFORM;
+  if (!PLATFORMS.includes(platform)) throw new Error(`Browser Bridge installs on macOS and Linux, not ${platform}`);
+  const linux = platform === "linux";
   const nodePath = process.execPath;
   const serverPath = path.join(projectDir, "mcp", "server.js");
   const daemonPath = path.join(projectDir, "mcp", "daemon.js");
@@ -475,42 +627,57 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
   const commands = [];
   const edits = [];
   // --stdio is the old shape exactly: a process per session, no daemon, no launchd job.
-  const daemon = options.uninstall || options.stdio ? null : daemonSettings(options, env);
+  const daemon = options.uninstall || options.stdio ? null : daemonSettings(options, env, platform);
   const url = daemon ? daemonUrl(daemon.port) : null;
+  // The headless Edge's profile is a scratch directory with no manifest of its own until one
+  // is written there. On a Mac the everyday profile reads the per-user one, so only an
+  // explicit --user-data-dir gets a copy.
+  const userDataDir = options.userDataDir ?? (linux ? edgeProfileDir(env, platform) : null);
+  const serviceFile = linux ? daemonUnitPath(env) : daemonPlistPath(env);
 
   if (options.stdio && !options.uninstall) {
     // Keep the launcher and the browser manifests - the extension still needs them - but the
     // launchd job and its plist go, because nothing is registered against the daemon.
-    removals.push(daemonPlistPath(env));
+    removals.push(serviceFile);
   }
 
   if (options.uninstall) {
-    removals.push(launcherPath(env));
+    removals.push(launcherPath(env, platform));
     // Always both browsers: an install that once used --chrome-too must not leave
     // Chrome pointing at a launcher this run is deleting.
-    for (const browser of Object.keys(BROWSER_DIRS)) removals.push(hostManifestPath(browser, env));
+    for (const browser of BROWSERS) removals.push(hostManifestPath(browser, env, platform));
+    if (userDataDir) removals.push(profileManifestPath(userDataDir));
     // daemon.json stays: it holds the token, and a reinstall must not invalidate the
     // registrations of sessions that are still running.
-    removals.push(daemonPlistPath(env));
+    removals.push(serviceFile);
+    if (linux) removals.push(edgeUnitPath(env));
   } else {
     files.push({
-      path: launcherPath(env),
-      content: launcherScript(nodePath, projectDir),
+      path: launcherPath(env, platform),
+      content: launcherScript(nodePath, projectDir, linux ? runtimeDir(env, platform) : null),
       mode: 0o700,
     });
+    const manifest = `${JSON.stringify(hostManifest(env, platform), null, 2)}\n`;
     for (const browser of options.browsers) {
       files.push({
-        path: hostManifestPath(browser, env),
-        content: `${JSON.stringify(hostManifest(env), null, 2)}\n`,
+        path: hostManifestPath(browser, env, platform),
+        content: manifest,
         mode: 0o644,
       });
     }
+    if (userDataDir) files.push({ path: profileManifestPath(userDataDir), content: manifest, mode: 0o644 });
   }
+
+  // Read before anything is written: whether a unit is new decides between `enable --now`
+  // and a restart.
+  const unitExisted = linux
+    ? { [DAEMON_UNIT]: fs.existsSync(daemonUnitPath(env)), [EDGE_UNIT]: fs.existsSync(edgeUnitPath(env)) }
+    : null;
 
   if (daemon) {
     if (daemon.fresh) {
       files.push({
-        path: daemonConfigPath(env),
+        path: daemonConfigPath(env, platform),
         content: `${JSON.stringify({ port: daemon.port, token: daemon.token, secret: daemon.secret }, null, 2)}\n`,
         mode: 0o600,
         // Neither of these may reach a terminal or a log: the token drives the browser and the
@@ -521,20 +688,27 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
       });
     }
     files.push({
-      path: daemonPlistPath(env),
-      content: daemonPlist(nodePath, env, projectDir),
+      path: serviceFile,
+      content: linux ? daemonUnit(nodePath, env, projectDir) : daemonPlist(nodePath, env, projectDir),
       mode: 0o644,
     });
     // launchd creates its output file 0644, and the daemon logs one line per session. Creating
     // it first (and tightening it if it is already there) keeps the session names and tags out
     // of anything else's reach - a log is a file like any other.
-    files.push({ path: daemonLogPath(env), mode: 0o600, append: true, content: "" });
+    files.push({ path: daemonLogPath(env, platform), mode: 0o600, append: true, content: "" });
+  }
+
+  if (linux && !options.uninstall) {
+    // Written for --stdio too: the per-session servers still reach the browser through the
+    // extension, and on Linux this unit is the only thing that loads it.
+    files.push({ path: edgeUnitPath(env), content: edgeUnit(nodePath, env, projectDir), mode: 0o644 });
+    files.push({ path: edgeLogPath(env, platform), mode: 0o600, append: true, content: "" });
   }
 
   // --stdio has to take the job out too: leaving it loaded would keep a daemon listening on
   // the port with nothing registered against it, and the next landing would restart it.
   const launchd =
-    options.uninstall || options.stdio || daemon
+    !linux && (options.uninstall || options.stdio || daemon)
       ? {
           uid: typeof process.getuid === "function" ? process.getuid() : 501,
           label: DAEMON_LABEL,
@@ -547,6 +721,8 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
             : false,
         }
       : null;
+
+  const systemd = linux ? systemdPlan(options, env, daemon, unitExisted) : null;
 
   const claudeBin = which("claude");
   for (const { dir, useEnv } of claudeConfigDirs(env)) {
@@ -586,7 +762,9 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
     });
   }
 
-  const codexBin = options.stdio ? which("codex") ?? (fs.existsSync(CODEX_FALLBACK) ? CODEX_FALLBACK : null) : null;
+  // Where the Codex installer puts it, for when this runs without a login shell's PATH.
+  const codexInstalled = path.join(env.HOME, ".local", "bin", "codex");
+  const codexBin = options.stdio ? which("codex") ?? (fs.existsSync(codexInstalled) ? codexInstalled : null) : null;
   for (const home of codexHomes(env)) {
     const label = `codex (${path.basename(home)})`;
     if (options.stdio) {
@@ -628,6 +806,8 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
     commands,
     edits,
     launchd,
+    // Only on Linux, so a macOS plan has exactly the keys it always had.
+    ...(systemd ? { systemd, userDataDir, edgeLog: edgeLogPath(env, platform) } : {}),
     nodePath,
     serverPath,
     daemonPath,
@@ -727,6 +907,78 @@ async function waitForGone(commands, { run, sleep }) {
   return run(commands.print) !== 0;
 }
 
+// --- talking to systemd ----------------------------------------------------
+//
+// No teardown race to work around here: `daemon-reload` is synchronous and `restart` waits
+// for the old process to go. What matters is the order - units are stopped before their
+// files are removed (a unit whose file is gone can still be stopped, but not disabled, and
+// its symlink would be left dangling), and started only after daemon-reload has read the
+// new files.
+
+/**
+ * `systemctl --user` finds the user manager through XDG_RUNTIME_DIR, which a shell reached
+ * over ssh or a Keep session may not have. With lingering on, the manager is always at
+ * /run/user/<uid>.
+ */
+function systemdPlan(options, env, daemon, unitExisted) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const runtime = env.XDG_RUNTIME_DIR || (uid === null ? null : `/run/user/${uid}`);
+  const stop = [];
+  const start = [];
+  if (options.uninstall) stop.push(DAEMON_UNIT, EDGE_UNIT);
+  else {
+    if (daemon) start.push({ unit: DAEMON_UNIT, existed: unitExisted[DAEMON_UNIT] });
+    else stop.push(DAEMON_UNIT);
+    start.push({ unit: EDGE_UNIT, existed: unitExisted[EDGE_UNIT] });
+  }
+  return {
+    env: runtime ? { XDG_RUNTIME_DIR: runtime } : {},
+    stop,
+    start,
+    // The unit whose state says whether the daemon is up; null when there is no daemon.
+    daemon: daemon ? DAEMON_UNIT : null,
+    unitDir: systemdUnitDir(env),
+  };
+}
+
+function systemctlCommand(systemd, args, { quiet = false } = {}) {
+  return {
+    label: `systemctl --user ${args[0]}`,
+    bin: SYSTEMCTL,
+    name: "systemctl",
+    args: ["--user", ...args],
+    env: systemd.env,
+    optional: true,
+    quiet,
+  };
+}
+
+/** Runs before any file is removed. */
+export function stopUnits(systemd, { run }) {
+  for (const unit of systemd.stop) run(systemctlCommand(systemd, ["disable", "--now", unit]));
+}
+
+/**
+ * Runs after every file is written. A unit that is new is enabled and started in one go; one
+ * that was already there is restarted, because a landing changes the code it runs and not
+ * the unit, and `enable --now` leaves a running service alone. Returns `{loaded, how}` for
+ * the daemon's unit, the same shape reloadDaemon gives.
+ */
+export function startUnits(systemd, { run, write = (text) => process.stdout.write(text) }) {
+  run(systemctlCommand(systemd, ["daemon-reload"]));
+  for (const { unit, existed } of systemd.start) {
+    if (existed) {
+      run(systemctlCommand(systemd, ["enable", unit]));
+      if (run(systemctlCommand(systemd, ["restart", unit])) !== 0) write(`restarting ${unit} failed\n`);
+    } else if (run(systemctlCommand(systemd, ["enable", "--now", unit])) !== 0) {
+      write(`enabling ${unit} failed\n`);
+    }
+  }
+  if (!systemd.daemon) return { loaded: false, how: systemd.stop.length ? "disabled" : "nothing to start" };
+  const active = run(systemctlCommand(systemd, ["is-active", "--quiet", systemd.daemon], { quiet: true })) === 0;
+  return { loaded: active, how: active ? "started" : "not active" };
+}
+
 function claudeFallback(entry, dir, env) {
   const block = JSON.stringify({ mcpServers: { browser: entry } }, null, 2);
   return `Add this to ${claudeConfigFile(dir, env)}:\n${block}`;
@@ -782,6 +1034,18 @@ export function renderPlan(plan, options) {
       lines.push(`     if loaded: bootout gui/${uid}/${label}, then poll print until it is gone`);
       lines.push(`     then: bootstrap gui/${uid} ${plist} (up to 5 attempts, 1 s apart)`);
     }
+  }
+  if (plan.systemd) {
+    const { stop, start } = plan.systemd;
+    const prefix = describeCommand(systemctlCommand(plan.systemd, []));
+    // Stopping comes first in a real run: it happens before the unit files are removed.
+    for (const unit of stop) lines.push(`run  ${prefix} disable --now ${unit}   (before any removal; failure ignored)`);
+    lines.push(`run  ${prefix} daemon-reload`);
+    for (const { unit, existed } of start) {
+      if (existed) lines.push(`run  ${prefix} enable ${unit}, then restart ${unit}   (the unit was already there)`);
+      else lines.push(`run  ${prefix} enable --now ${unit}   (a new unit)`);
+    }
+    if (plan.systemd.daemon) lines.push(`run  ${prefix} is-active --quiet ${plan.systemd.daemon}   (is it up?)`);
   }
   if (plan.daemon) {
     lines.push(`wait for ${plan.url.replace("/mcp", "/healthz")} to answer (up to 10 s)`);
@@ -947,10 +1211,14 @@ function runCommand(command) {
 const HELP = `Browser Bridge installer
 
   node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
-                      [--rotate-token] [--dry-run] [--uninstall]
+                      [--user-data-dir <dir>] [--rotate-token] [--dry-run] [--uninstall]
 
   --browser <name>  which browser's native messaging directory to write (default: edge)
   --chrome-too      write both Edge's and Chrome's
+  --user-data-dir <dir>
+                    also write the manifest into <dir>/NativeMessagingHosts, for a browser
+                    started with --user-data-dir=<dir> (on Linux this defaults to the
+                    headless Edge's profile, <runtime dir>/edge-profile)
   --stdio           register one stdio MCP server per session instead of the daemon
   --rotate-token    replace the daemon token and the key-derivation secret. No registration
                     changes: the helper reads the token from daemon.json each time, so a live
@@ -962,16 +1230,21 @@ const HELP = `Browser Bridge installer
   --uninstall       remove the manifests, the launchd job and the registrations
                     (daemon.json, and so the token, is kept)
 
+On Linux the launchd job is two systemd user units instead: ${DAEMON_UNIT} for the
+daemon and ${EDGE_UNIT} for a headless Edge with the extension loaded.
+
 Re-run it after every landing: the launchd job runs this checkout's files, so a code
 change only reaches sessions once the daemon has been restarted, which this does.
 `;
 
 /**
  * `hooks` is how the tests get at the two things that would otherwise reach out of the
- * process: `run` executes a planned command (launchctl, claude, codex) and `health` polls
- * the daemon. Everything else is files, and the tests give it a temporary HOME.
+ * process: `run` executes a planned command (launchctl, systemctl, claude, codex) and
+ * `health` polls the daemon. Everything else is files, and the tests give it a temporary
+ * HOME. `platform` is which machine to plan for; the executable passes process.platform.
  */
 export async function main(argv, env = process.env, hooks = {}) {
+  const platform = hooks.platform ?? DEFAULT_PLATFORM;
   const run = hooks.run ?? runCommand;
   const health = hooks.health ?? waitForHealth;
   const sleep = hooks.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -988,20 +1261,28 @@ export async function main(argv, env = process.env, hooks = {}) {
     return;
   }
 
-  const plan = buildPlan(options, env);
+  let plan;
+  try {
+    plan = buildPlan({ ...options, platform }, env);
+  } catch (error) {
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 2;
+    return;
+  }
   if (options.dryRun) {
     process.stdout.write(`${renderPlan(plan, options)}\n`);
     if (!options.uninstall) process.stdout.write(`\n${nextSteps(plan, options)}\n`);
     return;
   }
 
-  fs.mkdirSync(runtimeDir(env), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(runtimeDir(env, platform), { recursive: true, mode: 0o700 });
   if (plan.daemon?.secretChanged) {
     process.stdout.write(
       "the key-derivation secret changed, so every running session gets a new tab group and\n" +
         "the daemon will drop the session names it remembered\n",
     );
   }
+  if (plan.systemd) stopUnits(plan.systemd, { run });
   for (const file of plan.files) writeFile(file);
   for (const target of plan.removals) removeFile(target);
   for (const edit of plan.edits ?? []) applyEdit(edit);
@@ -1009,19 +1290,24 @@ export async function main(argv, env = process.env, hooks = {}) {
 
   let reloaded = null;
   if (plan.launchd) reloaded = await reloadDaemon(plan.launchd, { run, sleep });
+  if (plan.systemd) reloaded = startUnits(plan.systemd, { run });
 
   if (plan.daemon) {
-    const status = reloaded?.loaded === false ? { ok: false, reason: "the launchd job is not loaded" } : await health(plan.url.replace("/mcp", "/healthz"));
+    const notLoaded = plan.systemd ? `${plan.systemd.daemon} is not active` : "the launchd job is not loaded";
+    const status = reloaded?.loaded === false ? { ok: false, reason: notLoaded } : await health(plan.url.replace("/mcp", "/healthz"));
     if (status.ok) {
       process.stdout.write(`daemon up on port ${status.port} (pid ${status.pid}), ${status.sessions} session(s)\n`);
     } else {
       // Never "installed" while /healthz is dark: that is exactly how a reload once left
       // every session without a browser and said nothing.
+      const byHand = plan.systemd
+        ? `  systemctl --user status ${plan.systemd.daemon}\n` + `  systemctl --user restart ${plan.systemd.daemon}\n`
+        : `  launchctl bootout gui/${plan.launchd.uid}/${plan.launchd.label}\n` +
+          `  launchctl bootstrap gui/${plan.launchd.uid} ${plan.launchd.plist}\n`;
       process.stdout.write(
         `\nTHE DAEMON IS DOWN (${status.reason}; ${reloaded?.how ?? "not reloaded"}).\n` +
-          `Look at ${daemonLogPath(env)}, then start it by hand:\n` +
-          `  launchctl bootout gui/${plan.launchd.uid}/${plan.launchd.label}\n` +
-          `  launchctl bootstrap gui/${plan.launchd.uid} ${plan.launchd.plist}\n` +
+          `Look at ${daemonLogPath(env, platform)}, then start it by hand:\n` +
+          byHand +
           `  curl -s http://127.0.0.1:${plan.daemon.port}/healthz\n`,
       );
       process.exitCode = 1;
@@ -1033,14 +1319,21 @@ export async function main(argv, env = process.env, hooks = {}) {
 }
 
 function nextSteps(plan, options = {}) {
-  const lines = [
-    "Load the extension:",
-    "  1. Open edge://extensions and turn on Developer mode.",
-    `  2. "Load unpacked" and pick ${path.join(PROJECT_DIR, "extension")}`,
-    `  3. The id must come out as ${EXTENSION_ID} (the manifest "key" pins it).`,
-    "  4. Open the extension's popup: it should say connected.",
-    "",
-  ];
+  const lines = plan.systemd
+    ? [
+        `The extension: ${EDGE_UNIT} runs a headless Edge on ${plan.userDataDir}`,
+        `  and loads ${path.join(PROJECT_DIR, "extension")} into it on every start.`,
+        `  ${plan.edgeLog} should say it loaded ${EXTENSION_ID}.`,
+        "",
+      ]
+    : [
+        "Load the extension:",
+        "  1. Open edge://extensions and turn on Developer mode.",
+        `  2. "Load unpacked" and pick ${path.join(PROJECT_DIR, "extension")}`,
+        `  3. The id must come out as ${EXTENSION_ID} (the manifest "key" pins it).`,
+        "  4. Open the extension's popup: it should say connected.",
+        "",
+      ];
   if (options.stdio || !plan.daemon) lines.push(`MCP server: ${plan.nodePath} ${plan.serverPath}`);
   else {
     lines.push(`MCP daemon: ${plan.nodePath} ${plan.daemonPath}`);
@@ -1052,5 +1345,5 @@ function nextSteps(plan, options = {}) {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  await main(process.argv.slice(2));
+  await main(process.argv.slice(2), process.env, { platform: process.platform });
 }
