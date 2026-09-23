@@ -162,7 +162,8 @@ test('a daemon that is not there gets each event\'s safe default, and the delive
   const start = await f.hook('session-start', url);
   assert.equal(start.status, 0);
   assert.equal(start.stdout, 'Keep: this session is unmanaged on node aws1; the daemon is on main. '
-    + `Its hooks and registry commands reach the daemon at ${url}; the daemon did not answer this start, so it is queued and resent with the next hook. `
+    + `Its hooks, the command guards and the deploy and step records among them, and its registry commands reach the daemon at ${url}; `
+    + 'the daemon did not answer this start, so it is queued and resent with the next hook. '
     + 'Not available on this node: keep tell, keep open, keep codex task, and admin commands such as keep serve, keep restart-daemon and keep nodes add.\n');
   for (const event of ['stop', 'notification', 'lifecycle', 'pre-question']) {
     const result = await f.hook(event, url, { hook_event_name: event === 'lifecycle' ? 'PreToolUse' : undefined });
@@ -287,7 +288,7 @@ test('without KEEP_DAEMON_URL the hooks are the pane-only hooks they were', asyn
     child.stdin.end(JSON.stringify({ session_id: 'codex-aws1', cwd: '/home/node/project' }));
   });
   assert.match(JSON.parse(codex).hookSpecificOutput.additionalContext,
-    /Registry commands \(keep checkin, keep add, keep reviewed, keep land and the rest\) reach the daemon at http:\/\/127\.0\.0\.1:9; this session's hooks do not yet\. Not available on this node: keep tell/);
+    /Registry commands \(keep checkin, keep add, keep reviewed, keep land and the rest\) reach the daemon at http:\/\/127\.0\.0\.1:9; this session's hooks do not yet: a Codex or Pi session on a node refuses deploys by name and records no deploy or step run\. Not available on this node: keep tell/);
   const stop = await f.hook('stop', '', {}, { KEEP_DAEMON_URL: '' });
   assert.deepEqual(stop, { status: 0, stdout: '', stderr: '' });
   assert.equal(fs.existsSync(path.join(f.home, '.keep-node')), false, 'no delivery state either');

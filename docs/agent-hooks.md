@@ -27,6 +27,39 @@ Claude installations, also configure `SubagentStart` and `SubagentStop` to invok
 hints; transcript reconciliation remains the fallback when hooks are missing.
 Use the same checkout path and `KEEP_CONFIG` prefix as the installed commands.
 
+### Sessions on another node
+
+A Claude session on a pane-only node whose daemon is known (`KEEP_DAEMON_URL`, set by
+`keep node init --daemon-url`) runs the same hook commands; they post to the daemon's
+node API (`POST /api/hook`) and print what the daemon's own `keep hook <event>` printed.
+Every Claude event in the table is carried: session-start, session-end, stop,
+notification, pre-question, lifecycle, and the Bash pair.
+
+- **pre-bash.** The raw `claude --resume` guard runs on the node first, as everywhere.
+  The node then reads the daemon's step fingerprints (`GET /api/hook/context`, kept in
+  `~/.keep-node/hook-context.json` and asked again after a minute), computes the
+  command's repository facts where the checkout is (toplevel and main checkout of the
+  cwd and of every `cd` target when the command could be a step or a deploy; at most
+  8 directories, 3 s per git call), and posts them with the command. The daemon runs its
+  step and self-repair guards on those facts instead of running git itself. The session's
+  own `KEEP_STEP_OK` and `KEEP_RAW_CLAUDE` are forwarded; `KEEP_REPAIR` never is: the
+  daemon sets it from its own record of the repair sessions it launched. A daemon that
+  does not answer within 5 s (or refuses the post) never lets through what it could have
+  refused: the node refuses deploy commands, commands matching the last fingerprints it
+  was given, and, for a session the daemon last called a repair session, what the repair
+  guard refuses without a land record; anything else runs. Never queued.
+- **post-bash.** The deploy and step-run records, from the node's facts: a deploy's
+  provenance (checkout, sha, uncommitted files, whether the sha is on origin by the
+  node's tracking ref) and HEAD after a step. A step run at a sha the daemon's checkout
+  does not have (not pushed yet) is recorded at that sha with `unverified: true`, and a
+  `landed` step refuses it. The response's output fields are cut to their last 64 KiB.
+  A daemon that does not answer within 3 s has the record queued and resent with the next
+  hook.
+
+Not carried yet: Codex and Pi hooks on a node. They bind and release the node's pane,
+refuse deploy commands by name, and record nothing. Without `KEEP_DAEMON_URL` every hook
+on a node is pane-only in that way.
+
 Restart/resume existing agent sessions in a controlled manner to load new hooks. The reviewer launcher sets
 `KEEP_REVIEWER=1`, allowing the SessionStart hook to register it for daemon ticks.
 
