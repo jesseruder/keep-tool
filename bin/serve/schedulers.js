@@ -399,37 +399,12 @@ function startSchedulers(ctx) {
   usage.setOnChange(broadcast);
   usage.setCacheFile(path.join(keep.ROOT, '.keep', 'usage-cache.json'));
   runs.startScheduler();
-  // A journal written for a session on another node is asked of that node: one
-  // single look each (no wait on the node), in parallel. One that does not answer is
-  // left as it is by reconcile and reported by the health tick as unanswered.
-  const receiptFor = (entry) => deliveryReceiptFor(entry, deps, 0);
-  require('../delivery-health').startScheduler({ root: keep.ROOT, onChange: broadcast, receiptFor,
-    // Global on purpose: reconcile reads every session's pending delivery record, so no
-    // delivery may be mid-flight anywhere. It is synchronous file work, so the hold is brief.
-    // The pane list is read first, outside the lock: a typed entry whose pane the host no
-    // longer lists at all is retired. Exited panes still count (replace-exited keeps the
-    // id), so a replacement racing this snapshot cannot retire a live draft. An
-    // unreachable host or an empty list (see findCardPane) retires nothing.
-    reconcile: async () => {
-      const listed = await listHostPaneResult(deps, true);
-      const panes = Array.isArray(listed.panes) && listed.panes.length
-        ? new Set(listed.panes.filter((pane) => typeof pane?.id === 'string').map((pane) => pane.id)) : null;
-      // The nodes this list could not speak for: one that did not answer, and one
-      // whose panes came from its own memo rather than from the machine. A journal
-      // on either is unresolved, not retired.
-      const unknownNodes = new Set([
-        ...(listed.missingNodes || []),
-        ...Object.entries(listed.nodes || {}).filter(([, status]) => status.stale || !status.ok).map(([name]) => name),
-      ]);
-      // With no readable node list there is no way to name the nodes that were not
-      // asked, so every pane that is not this node's counts as unknown.
-      const unknownRemote = listed.configurationUnreadable === true;
-      return withInjectionLock(async () => {
-        const directory = path.join(keep.ROOT, '.keep', 'delivery');
-        await retireLeftDeliveryDrafts(directory, listed.panes, deps);
-        return require('../delivery').reconcileAsync(directory, { panes, unknownNodes, unknownRemote, receiptFor });
-      });
-    },
+  require('../delivery-health').startScheduler({ root: keep.ROOT, onChange: broadcast,
+    reconcile: createDeliveryReconcile({
+      directory: path.join(keep.ROOT, '.keep', 'delivery'), deps,
+      listHostPaneResult, withInjectionLock, retireLeftDeliveryDrafts,
+      receiptFor: (entry) => deliveryReceiptFor(entry, deps, 0),
+    }),
   });
   unblock.startScheduler({
     onChange: broadcast,
@@ -963,7 +938,55 @@ function startSchedulers(ctx) {
   return { restarts };
 }
 
+// The delivery watchdog's reconcile, one attempt. Global on purpose: reconcile reads
+// every session's pending delivery record, so no delivery may be mid-flight anywhere,
+// and the hold must stay brief: it is synchronous file work under the lock, and
+// nothing that waits on the network.
+//
+// The pane list is read first, outside the lock: a typed entry whose pane the host no
+// longer lists at all is retired. Exited panes still count (replace-exited keeps the
+// id), so a replacement racing this snapshot cannot retire a live draft. An
+// unreachable host or an empty list (see findCardPane) retires nothing.
+//
+// With more than one node, a journal written for a session on another node is asked
+// of that node before the lock is taken: one single look each (no wait on the node),
+// in parallel, and a node the pane list could not hear from is not asked at all. The
+// answers are applied under the lock, where reconcile matches each to the journal it
+// was about (nodeReceiptKey), so a journal replaced meanwhile takes no answer and is
+// left as it is. They are handed to the watchdog's inspection on `context`, so each
+// node journal is asked once per attempt, not again for the health report. A
+// single-node listing (no `nodes`) takes the reconcile it always did, reading each
+// journal once and asking nobody.
+function createDeliveryReconcile({ directory, deps = {}, listHostPaneResult, withInjectionLock, retireLeftDeliveryDrafts, receiptFor }) {
+  const delivery = require('../delivery');
+  return async (context = {}) => {
+    const listed = await listHostPaneResult(deps, true);
+    const panes = Array.isArray(listed.panes) && listed.panes.length
+      ? new Set(listed.panes.filter((pane) => typeof pane?.id === 'string').map((pane) => pane.id)) : null;
+    // The nodes this list could not speak for: one that did not answer, and one
+    // whose panes came from its own memo rather than from the machine. A journal
+    // on either is unresolved, not retired.
+    const unknownNodes = new Set([
+      ...(listed.missingNodes || []),
+      ...Object.entries(listed.nodes || {}).filter(([, status]) => status.stale || !status.ok).map(([name]) => name),
+    ]);
+    // With no readable node list there is no way to name the nodes that were not
+    // asked, so every pane that is not this node's counts as unknown.
+    const unknownRemote = listed.configurationUnreadable === true;
+    let nodeReceipts = null;
+    if (listed.nodes && !unknownRemote && typeof receiptFor === 'function') {
+      nodeReceipts = await delivery.collectNodeReceipts(directory, receiptFor, { skipNodes: unknownNodes });
+      context.nodeReceipts = nodeReceipts;
+    }
+    return withInjectionLock(async () => {
+      await retireLeftDeliveryDrafts(directory, listed.panes, deps);
+      return delivery.reconcile(directory, { panes, unknownNodes, unknownRemote, ...(nodeReceipts ? { nodeReceipts } : {}) });
+    });
+  };
+}
+
 module.exports = {
+  createDeliveryReconcile,
   startFeatureSchedulers, startSchedulers, createRegistryPull, createCleanupSnapshot,
   startLoopLagProbe, createLoopStallHealth, SEVERE_STALL_MS, SUSPEND_MS, STARTUP_MS, startReceiptsPoller, periodicSessionScan,
 };

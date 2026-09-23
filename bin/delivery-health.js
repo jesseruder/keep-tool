@@ -122,7 +122,7 @@ const RECONCILE_POLL_MS = 500;
 // boundary that ends it.
 const duration = (value, fallback) => Number.isSafeInteger(value) && value >= 0 ? value : fallback;
 
-async function reconcileWithRetry(options) {
+async function reconcileWithRetry(options, context = {}) {
   if (!options.reconcile) return;
   const waitMs = duration(options.reconcileWaitMs, RECONCILE_WAIT_MS);
   const pollMs = Math.max(1, duration(options.reconcilePollMs, RECONCILE_POLL_MS));
@@ -139,7 +139,7 @@ async function reconcileWithRetry(options) {
   const deadline = clock() + waitMs;
   const maxAttempts = Math.ceil(waitMs / pollMs) + 1;
   for (let attempt = 0; ; attempt += 1) {
-    try { return await options.reconcile(); }
+    try { return await options.reconcile(context); }
     // Anything but contention is a real fault, and stays the caller's to record.
     catch (error) { if (!error || error.status !== 429) throw error; }
     // Busy for the whole window: inspect without mutating, as before. Tested on both
@@ -157,10 +157,15 @@ async function reconcileWithRetry(options) {
 
 async function sweep(options = {}) {
   try {
-    await reconcileWithRetry(options);
-    // A node's journals are asked of their nodes before the read-only inspection, which
-    // cannot wait on a request. Without a receiptFor (a single-node install) nothing is
-    // asked, and the tick is the one it always was.
+    // The reconcile may hand back what the nodes said about their journals
+    // (context.nodeReceipts, asked before it took the lock); the read-only inspection
+    // judges the same journals by the same answers instead of asking each node again.
+    const context = {};
+    await reconcileWithRetry(options, context);
+    if (context.nodeReceipts instanceof Map) return tick({ ...options, nodeReceipts: context.nodeReceipts });
+    // A reconcile that shares nothing leaves the asking to receiptFor, if given. With
+    // neither (a single-node install) nothing is asked, and the tick is the one it
+    // always was.
     if (typeof options.receiptFor === 'function') {
       const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
       const directory = options.directory || path.join(root, '.keep', 'delivery');

@@ -269,3 +269,78 @@ test('the health inspection reports a node journal by its node\'s answer', () =>
   assert.equal(issues[0].reason, 'receipt-missing');
   assert.equal(recorded.at(-1).ok, false);
 }));
+
+// ---------- the daemon's reconcile: node answers asked outside the injection lock ----------
+
+function daemonReconcile(f, listing, receiptFor, events = []) {
+  const { createDeliveryReconcile } = require('./serve/schedulers.js');
+  let locked = false;
+  return createDeliveryReconcile({
+    directory: f.directory,
+    listHostPaneResult: async () => listing,
+    withInjectionLock: async (fn) => { locked = true; events.push('lock'); try { return await fn(); } finally { locked = false; events.push('unlock'); } },
+    retireLeftDeliveryDrafts: async () => [],
+    receiptFor: receiptFor && (async (entry) => { events.push(`ask ${entry.node}${locked ? ' (locked)' : ''}`); return receiptFor(entry); }),
+  });
+}
+
+test('node receipts are asked before the injection lock, never of a node the list could not hear from, and once per sweep', () => fixture(async f => {
+  const heard = nodeJournal(f, 'on aws1', { retainReceipt: true });
+  const silent = nodeJournal(f, 'on aws2', { pane: 'r1@aws2', node: 'aws2' });
+  const before = fs.readFileSync(silent.journal, 'utf8');
+  const listing = { panes: [{ id: 'r1@aws1' }, { id: 'r1@aws2' }], failure: null,
+    nodes: { main: { ok: true }, aws1: { ok: true }, aws2: { ok: false, reason: 'timeout', stale: true } }, missingNodes: ['aws2'] };
+  const events = [];
+  const context = {};
+  const settled = await daemonReconcile(f, listing, async () => true, events)(context);
+  assert.deepEqual(events, ['ask aws1', 'lock', 'unlock'], 'asked before the lock, and aws2 not at all');
+  assert.deepEqual(settled, [heard.entry.sessionId]);
+  assert.equal(fs.existsSync(heard.journal), false);
+  assert.equal(fs.readFileSync(silent.journal, 'utf8'), before, 'the silent node\'s journal is untouched');
+  assert.ok(context.nodeReceipts instanceof Map);
+
+  // A journal replaced between the ask and the lock takes no answer.
+  const replaced = nodeJournal(f, 'replaced meanwhile');
+  const newer = JSON.stringify({ ...replaced.entry, createdAt: Date.now(), typedAt: Date.now(), offset: 99 });
+  await daemonReconcile(f, listing, async (entry) => {
+    if (entry.sessionId === replaced.entry.sessionId) fs.writeFileSync(replaced.journal, newer);
+    return true;
+  })({});
+  assert.equal(fs.readFileSync(replaced.journal, 'utf8'), newer);
+
+  // The whole sweep: each node journal is asked once, and the health report judges it
+  // by that answer rather than asking again.
+  fs.rmSync(replaced.journal);
+  const asked = [];
+  const recorded = [];
+  const issues = await require('./delivery-health').sweep({ root: f.root, health: { record: (name, value) => recorded.push(value) },
+    reconcile: daemonReconcile(f, { ...listing, nodes: { ...listing.nodes, aws2: { ok: true } }, missingNodes: [] },
+      async (entry) => { asked.push(entry.node); return false; }) });
+  assert.deepEqual(asked.sort(), ['aws2'], 'aws2 asked once');
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].reason, 'receipt-missing', 'judged by the answer the reconcile got');
+}));
+
+test('a single-node sweep reads each journal exactly as it did before node receipts, and asks nobody', () => fixture(async f => {
+  const typed = { pane: 'p1', typedAt: Date.now() - 20 * 60e3, createdAt: Date.now() - 20 * 60e3 };
+  f.add('claude', 'first draft', typed);
+  f.add('codex', 'second draft', typed);
+  const listing = { panes: [{ id: 'p1' }], failure: null };
+  const reads = async (reconcile) => {
+    const counted = [];
+    const original = fs.readFileSync;
+    fs.readFileSync = function (file, ...rest) {
+      if (String(file).startsWith(f.directory) && String(file).endsWith('.json')) counted.push(path.basename(String(file)));
+      return original.call(this, file, ...rest);
+    };
+    try {
+      await require('./delivery-health').sweep({ root: f.root, health: { record: () => {} }, reconcile });
+    } finally { fs.readFileSync = original; }
+    return counted.sort();
+  };
+  // What the watchdog did before: reconcile, then inspect.
+  const baseline = await reads(async () => delivery.reconcile(f.directory, { panes: new Set(['p1']), unknownNodes: new Set(), unknownRemote: false }));
+  const now = await reads(daemonReconcile(f, listing, async () => assert.fail('a single node asks nobody')));
+  assert.ok(baseline.length > 0);
+  assert.deepEqual(now, baseline);
+}));

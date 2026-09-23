@@ -711,10 +711,13 @@ function nodeReceiptKey(name, entry) {
 
 // Asks each node journal's node once, all at the same time, and returns what they
 // said: key -> true/false. A node that did not answer is simply absent from the map,
-// which every reader below takes as "unknown": the journal is left as it is.
-async function collectNodeReceipts(directory, receiptFor) {
+// which every reader below takes as "unknown": the journal is left as it is. `skipNodes`
+// names nodes not to ask at all (a pane list that could not hear from them): their
+// journals get no answer, exactly as if they had been asked and stayed silent.
+async function collectNodeReceipts(directory, receiptFor, { skipNodes = null } = {}) {
   const answers = new Map();
   if (typeof receiptFor !== 'function') return answers;
+  const skip = skipNodes instanceof Set ? skipNodes : new Set(skipNodes || []);
   let files;
   try { files = fs.readdirSync(directory).filter(name => name.endsWith('.json')); }
   catch (error) { if (error.code === 'ENOENT') return answers; throw error; }
@@ -723,6 +726,7 @@ async function collectNodeReceipts(directory, receiptFor) {
     let entry;
     try { entry = JSON.parse(fs.readFileSync(path.join(directory, name), 'utf8')); } catch { continue; }
     if (!entry || !entry.node || name !== hash(entry.sessionId) + '.json') continue;
+    if (skip.has(String(entry.node))) continue;
     asks.push(Promise.resolve().then(() => receiptFor(entry)).then((value) => {
       if (value === true || value === false) answers.set(nodeReceiptKey(name, entry), value);
     }, () => {}));
