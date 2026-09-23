@@ -315,7 +315,7 @@ commands['review-land'] = async (argv) => {
   }
   let raw;
   try {
-    raw = o.file ? fs.readFileSync(path.resolve(o.file), 'utf8') : fs.readFileSync(0, 'utf8');
+    raw = o.file ? fs.readFileSync(path.resolve(o.file), 'utf8') : require('../stdin.js').readStdin({ isatty: () => false });
   } catch (error) {
     const out = new KeepError('cannot read review-land input: ' + error.message);
     out.exitCode = 2;

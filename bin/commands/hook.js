@@ -995,10 +995,14 @@ async function remoteHook(argv, input, where, deps = {}) {
 commands.hook = async (argv) => {
   let input = {};
   let codexInputValid = false;
-  // stdin only when piped — run by hand in a terminal this must not block on a TTY
-  if (!process.stdin.isTTY) {
+  // stdin only when piped — run by hand in a terminal this must not block on a TTY.
+  // Never touch process.stdin here: it turns the pipe non-blocking and a hook input
+  // past the pipe buffer (a large tool response, a long last message) reads as empty.
+  let raw = null;
+  try { raw = require('../stdin.js').readStdin(); } catch {}
+  if (raw != null) {
     try {
-      input = JSON.parse(fs.readFileSync(0, 'utf8'));
+      input = JSON.parse(raw);
       codexInputValid = Boolean(input && typeof input === 'object' && !Array.isArray(input));
     } catch {}
   }

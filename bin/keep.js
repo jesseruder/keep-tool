@@ -2956,7 +2956,7 @@ commands.incidents = async (argv, cliDeps = {}) => {
   if (subcommand === 'parse') {
     const o = parseArgs(rest, { json: 'bool' });
     if (o._.length !== 1) die('usage: keep incidents parse <file|->');
-    const raw = o._[0] === '-' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(o._[0], 'utf8');
+    const raw = o._[0] === '-' ? require('./stdin.js').readStdin({ isatty: () => false }) : fs.readFileSync(o._[0], 'utf8');
     let payload;
     try { payload = JSON.parse(raw); } catch { payload = { text: raw }; }
     const messages = (Array.isArray(payload) ? payload : [payload]).filter((message) => message && typeof message === 'object');

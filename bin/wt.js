@@ -1171,7 +1171,8 @@ function resolveRemoveArgs(positionals, cfg) {
 }
 
 function readStdin() {
-  try { return fs.readFileSync(0, 'utf8'); } catch { return ''; }
+  // EAGAIN-tolerant: a non-blocking inherited pipe must not read a large hook input as empty.
+  try { return require('./stdin.js').readStdin({ isatty: () => false }) || ''; } catch { return ''; }
 }
 
 function pathIsUnder(candidate, root) {
