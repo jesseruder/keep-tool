@@ -166,6 +166,8 @@ test("--user-data-dir puts the profile's manifest where it is told, on either pl
   const profile = path.join(env.HOME, "profiles", "work");
   const linux = buildPlan({ ...LINUX, userDataDir: profile }, env);
   assert.ok(linux.files.some((file) => file.path === profileManifestPath(profile)));
+  // The wrapper is started on the same profile the manifest was copied into.
+  assert.ok(linux.files.find((file) => file.path === edgeUnitPath(env)).content.includes(`"--user-data-dir" "${profile}"`));
   assert.equal(linux.files.some((file) => file.path.includes("edge-profile")), false);
 
   // A Mac has a desktop profile that reads the per-user manifest, so it writes a copy only
@@ -207,7 +209,11 @@ test("the Edge unit follows the daemon, restarts on failure and stops the wrappe
   const unit = edgeUnit("/opt/node/bin/node", { HOME: "/home/test" }, "/srv/bb");
   assert.match(unit, new RegExp(`^After=${DAEMON_UNIT.replace(".", "\\.")}$`, "m"));
   assert.match(unit, new RegExp(`^Wants=${DAEMON_UNIT.replace(".", "\\.")}$`, "m"));
-  assert.match(unit, /^ExecStart="\/opt\/node\/bin\/node" "\/srv\/bb\/bin\/headless-edge\.js"$/m);
+  assert.match(
+    unit,
+    /^ExecStart="\/opt\/node\/bin\/node" "\/srv\/bb\/bin\/headless-edge\.js" "--user-data-dir" "\/home\/test\/\.local\/state\/browser-bridge\/edge-profile"$/m,
+  );
+  assert.match(edgeUnit("/opt/node/bin/node", { HOME: "/home/test" }, "/srv/bb", "/home/test/p"), /"--user-data-dir" "\/home\/test\/p"$/m);
   assert.match(unit, /^Restart=on-failure$/m);
   assert.match(unit, /^KillMode=mixed$/m);
   assert.match(unit, /^StandardOutput=append:\/home\/test\/\.local\/state\/browser-bridge\/edge\.log$/m);

@@ -315,8 +315,9 @@ export function daemonUnit(nodePath, env = process.env, projectDir = PROJECT_DIR
  * the stop signal to the wrapper alone, so it can close Edge down in order; anything still
  * left in the cgroup after that is killed outright.
  */
-export function edgeUnit(nodePath, env = process.env, projectDir = PROJECT_DIR) {
+export function edgeUnit(nodePath, env = process.env, projectDir = PROJECT_DIR, userDataDir = edgeProfileDir(env, "linux")) {
   const log = edgeLogPath(env, "linux");
+  const script = path.join(projectDir, "bin", "headless-edge.js");
   return [
     "[Unit]",
     "Description=Browser Bridge headless Edge",
@@ -324,7 +325,9 @@ export function edgeUnit(nodePath, env = process.env, projectDir = PROJECT_DIR) 
     `Wants=${DAEMON_UNIT}`,
     "",
     "[Service]",
-    `ExecStart=${systemdQuote(nodePath)} ${systemdQuote(path.join(projectDir, "bin", "headless-edge.js"))}`,
+    // The profile is named even when it is the default, so the unit and the manifest copy the
+    // installer wrote cannot disagree about where it is.
+    `ExecStart=${[nodePath, script, "--user-data-dir", userDataDir].map(systemdQuote).join(" ")}`,
     `WorkingDirectory=${systemdPath(projectDir)}`,
     `Environment=BROWSER_BRIDGE_RUNTIME_DIR=${systemdQuote(runtimeDir(env, "linux"))}`,
     `StandardOutput=append:${systemdPath(log)}`,
@@ -701,7 +704,7 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
   if (linux && !options.uninstall) {
     // Written for --stdio too: the per-session servers still reach the browser through the
     // extension, and on Linux this unit is the only thing that loads it.
-    files.push({ path: edgeUnitPath(env), content: edgeUnit(nodePath, env, projectDir), mode: 0o644 });
+    files.push({ path: edgeUnitPath(env), content: edgeUnit(nodePath, env, projectDir, userDataDir), mode: 0o644 });
     files.push({ path: edgeLogPath(env, platform), mode: 0o600, append: true, content: "" });
   }
 
