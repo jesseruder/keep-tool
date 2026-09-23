@@ -827,9 +827,12 @@ test('a Codex start the daemon refused before its pane was bound is posted once 
   const legacy = await run([{ delivered: false, why: 'session codex-aws1 is not on node aws1', queued: false }, refusedFirst[1]], []);
   assert.equal(legacy.posts.length, 2);
   // Any other failure is not posted again: a refusal of the pane rather than the
-  // session, of another session, one with another code, or no refusal at all.
+  // session, of another session, one with another code, no refusal at all, or a first
+  // post that 5xx-queued (its replay delivers it), whatever it says.
   for (const first of [
     { delivered: false, why: 'timed out', queued: true },
+    { delivered: false, why: 'HTTP 503', queued: true },
+    { delivered: false, why: 'session codex-aws1 is not on node aws1', code: 'SESSION_NOT_ON_NODE', queued: true },
     { delivered: false, why: 'pane p2@main is not on node aws1', queued: false },
     { delivered: false, why: 'pane p2@main is not on node aws1', code: 'SOMETHING_ELSE', queued: false },
     { delivered: false, why: 'session codex-other is not on node aws1', queued: false },

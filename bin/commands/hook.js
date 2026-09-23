@@ -865,8 +865,9 @@ async function carriedCodexHook(action, input, where, deps = {}) {
         // left of the deadline, so the daemon registers it and its answer is printed.
         // Only the refusal of this session as not on the node (by its code, or from a
         // daemon that answers no code, by its exact text): a refusal of the pane, or of
-        // anything else, is not one a bind can change.
-        const refused = first && first.delivered === false && (first.code === 'SESSION_NOT_ON_NODE'
+        // anything else, is not one a bind can change. Never a post that was queued (a
+        // 5xx or no answer): its replay delivers it, and a second post would run it twice.
+        const refused = first && first.delivered === false && !first.queued && (first.code === 'SESSION_NOT_ON_NODE'
           || (first.code === undefined && sessionNotOnNode(first.why, input.session_id)));
         const left = startedAt + total - now() - CODEX_START_REPOST_MARGIN_MS;
         if (!late && bound && refused && left >= CODEX_START_REPOST_MIN_MS) {
