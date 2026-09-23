@@ -15,6 +15,8 @@ async function createFixture() {
   let revision = 0, ticks = 0, timer;
   let closeDelay = 1200, closeFails = false, layoutFails = false;
   let handoffRecoversOnce = false;
+  // Off by default, so every other spec sees the one-node console it always did.
+  let moveRefusal = null;
   let openDelay = 0, openFailsAfterSpawn = false, reopenFails = false, reviewFailsOnce = false, reviewPartialOnce = false, launchSequence = 0;
   const openRequests = new Map();
   const detailFailures = new Map();
@@ -280,6 +282,23 @@ async function createFixture() {
           publish(); json({ ok: true, transactionId: transaction.id, sessionId: session.id, pane: pane.id,
             sourceAccountId: transaction.sourceAccountId, targetAccountId: account.id, status: 'done' }); return;
         }
+        if (url.pathname === '/api/move-session' && req.method === 'POST') {
+          if (input.recover || input.abandon) { json({ error: 'Fixture has no move journal' }, 404); return; }
+          const session = sessions.find(s => s.id === input.sessionId);
+          const node = (state.nodes || []).find(n => n.name === input.node);
+          if (!session || session.kind !== 'claude') { json({ error: 'Fixture moves Claude sessions only', reason: 'agent' }, 409); return; }
+          if (!node) { json({ error: `node ${input.node} is not configured` }, 400); return; }
+          const from = session.node || state.nodes.find(n => n.daemon).name;
+          if (from === node.name) { json({ error: `session ${session.id} is already on ${node.name}`, reason: 'same-node' }, 409); return; }
+          if (moveRefusal) { json({ error: moveRefusal.error, reason: moveRefusal.reason }, 409); return; }
+          if (input.dry) { json({ ok: true, dry: true, sessionId: session.id, from, to: node.name }); return; }
+          const pane = panes.find(p => p.id === session.pane);
+          if (node.daemon) delete session.node; else session.node = node.name;
+          if (pane) pane.node = node.name;
+          publish();
+          json({ ok: true, id: 'mv-000000000000000000000001', sessionId: session.id, from, to: node.name, status: 'done',
+            started: { pane: session.pane } }); return;
+        }
         if (url.pathname === '/api/abandon-account-handoff') {
           const session = sessions.find(s => s.id === input.sessionId && s.pane === input.pane);
           const pane = panes.find(p => p.id === input.pane && p.meta.sessionId === input.sessionId);
@@ -389,6 +408,9 @@ async function createFixture() {
       if ('closeFails' in options) closeFails = options.closeFails;
       if ('layoutFails' in options) layoutFails = options.layoutFails;
       if ('handoffRecoversOnce' in options) handoffRecoversOnce = options.handoffRecoversOnce;
+      // A fleet: the daemon node and one other, as the daemon publishes `nodes`.
+      if ('nodes' in options) { if (options.nodes) state.nodes = options.nodes; else delete state.nodes; publish(); }
+      if ('moveRefusal' in options) moveRefusal = options.moveRefusal;
       if ('openDelay' in options) openDelay = options.openDelay;
       if ('openFailsAfterSpawn' in options) openFailsAfterSpawn = options.openFailsAfterSpawn;
       if ('reopenFails' in options) reopenFails = options.reopenFails;
