@@ -486,6 +486,38 @@ function remoteCommandGuard(input, where, env = process.env) {
   return { deny: false, reason: '' };
 }
 
+// The Claude events a node whose daemon is known (KEEP_DAEMON_URL) carries to it:
+// the daemon runs its own hook for them against the session's transcript mirror
+// (bin/hook-client.js here, bin/hook-route.js there). The pre-bash guards and the
+// post-bash recorders stay as below until they can be answered from here.
+const CARRIED_EVENTS = ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'lifecycle'];
+
+async function carriedHook(kind, input, where, deps = {}) {
+  const client = deps.hookClient || require('../hook-client.js');
+  const run = () => client.runHook(kind, input, where, deps).catch((error) => ({ delivered: false, why: error.message }));
+  let outcome;
+  if (kind === 'session-start') {
+    // The daemon binds the pane first, so its record knows this session claimed it;
+    // the bind here then finds it already bound, or does it when the daemon could not.
+    outcome = await run();
+    try { await bindRemotePane(input, 'claude', deps); } catch {}
+  } else if (kind === 'session-end') {
+    [outcome] = await Promise.all([run(), releaseRemotePane(input, deps).catch(() => null)]);
+  } else {
+    outcome = await run();
+  }
+  if (outcome && outcome.delivered) {
+    const value = outcome.value || {};
+    if (value.stdout) process.stdout.write(String(value.stdout));
+    if (value.stderr) process.stderr.write(String(value.stderr));
+    if (Number.isInteger(value.status) && value.status !== 0) process.exitCode = value.status;
+    return;
+  }
+  // Undelivered: each event's safe default. A stop is let through, a question is
+  // allowed, an end has released this node's pane, and a start says what it is.
+  if (kind === 'session-start') console.log(paneOnlyNotice(where));
+}
+
 // Every hook action on a pane-only node. Nothing below reads or writes ROOT or META.
 async function remoteHook(argv, input, where, deps = {}) {
   const env = deps.env || process.env;
@@ -494,6 +526,10 @@ async function remoteHook(argv, input, where, deps = {}) {
     process.exitCode = 2;
   };
   const kind = argv[0];
+  if (CARRIED_EVENTS.includes(kind)) {
+    const remote = require('../remote-cli.js').remoteMode(env);
+    if (remote) return carriedHook(kind, input, remote, deps);
+  }
   if (kind === 'session-start') {
     try { await bindRemotePane(input, 'claude', deps); } catch {}
     console.log(paneOnlyNotice(where));
