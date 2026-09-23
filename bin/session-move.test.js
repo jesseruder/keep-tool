@@ -40,6 +40,7 @@ function world(options = {}) {
     }),
     requireNode: async (node) => { steps.push(['requireNode', node]); failing('requireNode'); },
     cwdExists: async (node, cwd) => { steps.push(['cwdExists', node, cwd]); return options.cwdMissing !== true; },
+    targetReady: async (node, plan) => { steps.push(['targetReady', node, plan.accountId, plan.cwd]); failing('targetReady'); },
     pendingDelivery: async () => options.pendingDelivery === true,
     busy: async () => options.busy || null,
     stop: async (record) => { steps.push(['stop', record.from]); failing('stop'); state.stopped = true; },
@@ -94,7 +95,7 @@ test('a move stops the source, carries, flips once, starts the target and verifi
   try {
     const result = await move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps);
     assert.equal(result.status, 'done');
-    assert.deepEqual(names(w.steps), ['requireNode', 'cwdExists', 'stop', 'transfer', 'reprove', 'pin', 'reprove', 'open', 'wait', 'relink', 'cleanup'],
+    assert.deepEqual(names(w.steps), ['requireNode', 'cwdExists', 'targetReady', 'stop', 'transfer', 'reprove', 'pin', 'reprove', 'open', 'wait', 'relink', 'cleanup'],
       'the source is proven stopped again before the flip and before the launch');
     assert.deepEqual(w.steps.find((step) => step[0] === 'requireNode'), ['requireNode', 'aws1'], 'the node end is asked for the verb');
     assert.equal(w.state.pins, 1);
@@ -121,6 +122,10 @@ test('the preflight refuses before anything is stopped', async () => {
     [{ session: { endedTurn: false } }, /is working/],
     [{ model: '<unknown>' }, /model .* cannot be established/],
     [{ fail: { requireNode: Object.assign(new Error('the terminal host on aws1 predates the artifacts verb'), { status: 409 }) } }, /predates/],
+    [{ fail: { targetReady: Object.assign(new Error('aws1 cannot take claude-a: claude-a is not a claude account on this node'), { status: 409 }) } },
+      /aws1 cannot take claude-a/],
+    [{ fail: { targetReady: Object.assign(new Error('aws1 could not launch claude-a: account shared setup is unavailable: invalid JSON'), { status: 409 }) } },
+      /could not launch claude-a: account shared setup/],
   ];
   for (const [options, pattern] of cases) {
     const w = world(options);
@@ -152,7 +157,8 @@ test('a dry run answers the plan and changes nothing', async () => {
     assert.equal(plan.dry, true);
     assert.equal(plan.from, 'main');
     assert.equal(plan.to, 'aws1');
-    assert.deepEqual(names(w.steps), ['requireNode', 'cwdExists']);
+    assert.deepEqual(names(w.steps), ['requireNode', 'cwdExists', 'targetReady']);
+    assert.deepEqual(w.steps.at(-1), ['targetReady', 'aws1', 'claude-a', '/work/project'], 'the target is asked for the account and the launch');
     assert.deepEqual(move.listMoves(w.root), []);
   } finally { w.cleanup(); }
 });
@@ -177,7 +183,7 @@ for (const [point, phase, holder, reached] of FAILURES) {
         return error.status === 409 && error.extra.status === 'recovery-needed' && error.extra.phase === phase
           && error.extra.holder === holder && new RegExp(`names ${holder}, which holds its verified bytes`).test(error.message);
       });
-      assert.deepEqual(moves(w.steps).filter((name) => !['requireNode', 'cwdExists'].includes(name)), reached);
+      assert.deepEqual(moves(w.steps).filter((name) => !['requireNode', 'cwdExists', 'targetReady'].includes(name)), reached);
       assert.equal(w.state.node, holder, 'the location record names the holder');
       assert.equal(w.state.pins, ['main'].includes(holder) ? 0 : 1);
       // Nothing else may resume or move it meanwhile.

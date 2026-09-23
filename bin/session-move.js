@@ -139,6 +139,9 @@ async function preflight(body, deps) {
   if (!(await deps.cwdExists(to, cwd))) {
     throw refusal(409, `${cwd} does not exist on ${to}; create it there first${/\/wt\//.test(cwd) ? ' (a worktree: run wt there from the same branch)' : ''}`, { reason: 'cwd-missing' });
   }
+  // The account and the launch, asked of the target now: found missing after the
+  // stop, they would leave a stopped session nothing can start.
+  await deps.targetReady(to, { accountId: account.id, cwd });
   if (await deps.pendingDelivery(body.sessionId)) {
     throw refusal(409, `a message to ${body.sessionId} is still unconfirmed; the move waits until it is settled`, { reason: 'pending-delivery' });
   }

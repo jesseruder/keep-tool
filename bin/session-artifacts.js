@@ -15,6 +15,7 @@
 //   release { sessionId, account }                    -> { files }: the session left this node; what it left behind is ours to replace
 //   abort   { account, tx }                           -> { removed }
 //   cwd     { path }                                  -> { path, exists, directory }
+//   account { account }                               -> { account, directory: true }: this node has the account, and its directory
 //   drop-session { sessionId }                        -> { dropped }: this node's hook queue and mirror cursor for the session
 //
 // Nothing here takes a path from the caller beyond a relative one that must name a
@@ -40,7 +41,7 @@ const REQUEST_MAX_BYTES = 4 * 1024 * 1024;
 const TX_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_FILES = 50000;
 const MOVE_DIR = '.keep-move';
-const OPS = new Set(['list', 'read', 'stage', 'publish', 'release', 'abort', 'cwd', 'drop-session']);
+const OPS = new Set(['list', 'read', 'stage', 'publish', 'release', 'abort', 'cwd', 'drop-session', 'account']);
 
 function coded(message, code) {
   const error = new Error(message);
@@ -487,6 +488,9 @@ async function handle(params, options = {}) {
   if (params.op === 'cwd') return cwd(params);
   if (params.op === 'drop-session') return dropSession(params, options);
   const root = accountRoot(params, options);
+  // Asked before a move stops anything: the account is one this node has configured,
+  // and its directory is there to receive the session.
+  if (params.op === 'account') return { account: params.account.id, directory: true };
   if (params.op === 'abort') return abort(root, params);
   const sessionId = validSession(params);
   if (params.op === 'list') return list(root, sessionId);

@@ -168,6 +168,45 @@ test('a session moves to aws1 and back, its bytes proven on each side, never run
   }, { nodeHome: true });
 });
 
+test('the target is asked for the account and for the launch before anything stops', async (t) => {
+  await withTwoNodeFleet(t, async (fleet) => {
+    await serve.closeHostClient();
+    try {
+      const transcript = path.join(fleet.configDir, 'projects', '-work-project', `${SID}.jsonl`);
+      fs.mkdirSync(path.dirname(transcript), { recursive: true });
+      fs.writeFileSync(transcript, '{"type":"user"}\n');
+      accounts.pinSession(SID, 'claude', fleet.accountId, { root: fleet.registry, node: 'main' });
+      const stopped = [];
+      const deps = (moveNodeAccount) => ({
+        root: fleet.registry, connectHost: connect, moveNodeAccount,
+        moveDeps: {
+          inspect: async () => ({ agent: 'claude', from: 'main', account: accounts.get(fleet.accountId),
+            session: { id: SID, kind: 'claude', endedTurn: true, project: fleet.project }, pane: null, cwd: fleet.project, model: '', bypass: true }),
+          stop: async () => { stopped.push('stop'); },
+        },
+      });
+      const onAws1 = (account) => (node, local) => (node === 'aws1' ? account : local);
+
+      // An account aws1's own configuration does not name.
+      await assert.rejects(serve.moveSession({ sessionId: SID, node: 'aws1' }, deps(onAws1({ ...fleet.aws1Account, id: 'claude-ghost' }))),
+        (error) => error.status === 409 && /^aws1 cannot take claude-node: claude-ghost is not a claude account on this node/.test(error.message));
+      // An account whose shared setup aws1 cannot derive a launch from.
+      fs.writeFileSync(path.join(fleet.aws1Home, 'state.json'), '{ not json');
+      fs.writeFileSync(path.join(fleet.aws1ConfigDir, '.keep-shared-setup.json'), JSON.stringify({
+        version: 1, sourceConfigDir: fleet.aws1ConfigDir, originStateFile: path.join(fleet.aws1Home, 'state.json') }));
+      await assert.rejects(serve.moveSession({ sessionId: SID, node: 'aws1' }, deps(onAws1(fleet.aws1Account))),
+        (error) => error.status === 409 && /^aws1 could not launch claude-node: account shared setup is unavailable: invalid JSON/.test(error.message));
+
+      assert.deepEqual(stopped, [], 'nothing was stopped');
+      assert.equal(fs.existsSync(path.join(fleet.registry, '.keep', 'session-moves')), false, 'nothing was journalled');
+      assert.equal(fs.existsSync(path.join(fleet.aws1ConfigDir, 'projects')), false, 'nothing was written on aws1');
+      assert.equal(accounts.sessionNode(SID, { root: fleet.registry }), 'main');
+    } finally {
+      await serve.closeHostClient();
+    }
+  }, { nodeHome: true });
+});
+
 test('keep move on an install with one node refuses and changes nothing', async () => {
   const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-move-single-'));
   try {

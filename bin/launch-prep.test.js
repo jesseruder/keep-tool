@@ -126,6 +126,49 @@ test('an account that is not installed on the node is refused before anything is
   assert.equal(halved.message, 'account claude-work is not set up on this node');
 });
 
+test('a check asks whether the launch could be prepared and writes nothing', (t) => {
+  const f = fixture(t);
+  accountSetup.shareSetup(f.source, f.target);
+  const tree = (dir) => {
+    const out = [];
+    const walk = (at) => {
+      for (const name of fs.readdirSync(at).sort()) {
+        const full = path.join(at, name);
+        out.push(path.relative(dir, full));
+        if (fs.lstatSync(full).isDirectory()) walk(full);
+      }
+    };
+    walk(dir);
+    return out;
+  };
+  const before = [tree(f.home), tree(f.project)];
+  const check = (account, extra = {}, options = { homedir: f.home }) => {
+    try {
+      return launchPrep.prepare({ agent: 'claude', account, cwd: f.project, check: true, ...extra }, options);
+    } catch (error) { return error; }
+  };
+  // A managed account with its shared setup: answered, with nothing written (a real
+  // prepare writes the MCP config and the memory links here).
+  for (const extra of [{ remote: true, daemonHome: f.home }, { remote: false }]) {
+    assert.deepEqual(check(f.target, extra), { checked: true, account: 'claude-work', sharedSetup: true });
+  }
+  assert.deepEqual(check(f.source, { remote: true, daemonHome: f.home }), { checked: true, account: 'claude/default', sharedSetup: false });
+  assert.deepEqual([tree(f.home), tree(f.project)], before, 'nothing was written');
+
+  // What a launch would be refused for, it is refused for here, on either kind of node.
+  const absent = { id: 'claude-elsewhere', agent: 'claude', configDir: path.join(f.home, '.claude-elsewhere'), builtIn: false, managed: true };
+  for (const extra of [{ remote: true, daemonHome: f.home }, { remote: false }]) {
+    const missing = check(absent, extra);
+    assert.equal(missing.code, 'account-missing', JSON.stringify(extra));
+    assert.equal(fs.existsSync(absent.configDir), false);
+  }
+  assert.equal(check(f.target, { remote: true, daemonHome: '/elsewhere' }).code, 'home-mismatch');
+  fs.writeFileSync(path.join(f.home, '.claude.json'), '{ not json');
+  const unshared = check(f.target, { remote: true, daemonHome: f.home });
+  assert.equal(unshared.code, 'shared-setup');
+  assert.match(unshared.message, /^account shared setup is unavailable: invalid JSON/);
+});
+
 test('the daemon node keeps launching accounts whose directory is not there yet', (t) => {
   const f = fixture(t);
   // First run before ~/.claude exists, an unmanaged launch inheriting API

@@ -40,6 +40,7 @@ function endpoint(request, meta = {}) {
     publish: (sessionId, tx, entries) => request({ op: 'publish', sessionId, tx, entries }),
     release: (sessionId) => request({ op: 'release', sessionId }),
     abort: (tx) => request({ op: 'abort', tx }),
+    account: () => request({ op: 'account' }),
   };
 }
 

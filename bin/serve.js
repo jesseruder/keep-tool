@@ -3933,7 +3933,7 @@ async function deliveryReceiptFor(entry, deps = {}, timeoutMs = 0) {
 // the node beyond the relative ones its own list returned.
 const nodeArtifactsCapability = new Map();
 const NODE_ARTIFACTS_CAPABILITY_MS = 60e3;
-const ARTIFACTS_TIMEOUT_MS = { list: 120e3, read: 30e3, stage: 30e3, publish: 120e3, release: 120e3, abort: 30e3, cwd: 8e3, 'drop-session': 8e3 };
+const ARTIFACTS_TIMEOUT_MS = { list: 120e3, read: 30e3, stage: 30e3, publish: 120e3, release: 120e3, abort: 30e3, cwd: 8e3, 'drop-session': 8e3, account: 8e3 };
 
 async function requireNodeArtifacts(node, deps = {}) {
   const now = Date.now();
@@ -12555,6 +12555,25 @@ function sessionMoveDeps(deps = {}) {
       if (node === daemon) { try { return fs.statSync(cwd).isDirectory(); } catch { return false; } }
       const answer = await nodeArtifacts(node, null, deps).cwd(cwd);
       return answer && answer.directory === true;
+    },
+    // Asked of the target before anything stops: it has the account (its own config
+    // names it and its directory is there), and it could prepare the launch (shared
+    // home, account installed, shared setup and MCP config derivable), writing nothing.
+    targetReady: async (node, plan) => {
+      const account = accountOf(plan);
+      try { await moveEndpoint(node, account, deps).account(); }
+      catch (error) {
+        throw new InjectionError(409, `${node} cannot take ${plan.accountId}: ${error.message}`, { reason: 'target-account' });
+      }
+      const onNode = moveNodeAccount(node, account, deps);
+      try {
+        await (deps.prepareLaunchOn || prepareLaunchOn)(node, {
+          agent: 'claude', cwd: plan.cwd, check: true,
+          account: { id: onNode.id, agent: 'claude', configDir: onNode.configDir, builtIn: onNode.builtIn === true, managed: onNode.managed === true },
+        }, deps);
+      } catch (error) {
+        throw new InjectionError(409, `${node} could not launch ${plan.accountId}: ${error.message}`, { reason: 'target-launch' });
+      }
     },
     pendingDelivery: (sessionId) => require('./delivery').pendingForSessionAsync(path.join(root, '.keep', 'delivery'), sessionId,
       { receiptFor: (entry) => deliveryReceiptFor(entry, deps) }),

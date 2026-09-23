@@ -150,6 +150,29 @@ function prepare(options = {}, deps = {}) {
     assertSharedHome(options.daemonHome, deps);
     assertAccountInstalled(account, { ...deps, readSetup: (value) => accountSetup.readSetup(value) });
   }
+  // `check: true` asks whether this machine could prepare the launch, and writes
+  // nothing: the account installed here (on the daemon node too, since the caller
+  // is about to put a session's files under it), the shared home, and a shared
+  // setup whose MCP configuration can be derived. A session move asks this of its
+  // target before it stops anything.
+  if (options.check === true) {
+    if (options.remote !== true) assertAccountInstalled(account, { ...deps, readSetup: (value) => accountSetup.readSetup(value) });
+    let sharedSetup = false;
+    if (agent === 'claude') {
+      try {
+        const manifest = accountSetup.readSetup(account);
+        if (manifest) {
+          sharedSetup = true;
+          const source = manifest.originConfigDir || manifest.sourceConfigDir || account.configDir;
+          accountSetup.effectiveMcpServers({ id: manifest.sourceAccountId || account.id, agent: 'claude', configDir: source },
+            cwd, { sourceStateFile: manifest.originStateFile || manifest.sourceStateFile });
+        }
+      } catch (error) {
+        throw Object.assign(new Error(`account shared setup is unavailable: ${error.message}`), { code: 'shared-setup' });
+      }
+    }
+    return { checked: true, account: account.id, sharedSetup };
+  }
 
   // A Claude account carrying a shared-setup manifest has its project memory and
   // its MCP config written here, in the config directory on this machine. The
