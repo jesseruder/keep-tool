@@ -712,11 +712,33 @@ function createHookService(options = {}) {
   // GET /api/hook/context?session=<id>: what a node's pre-bash hook reads before
   // it posts, and falls back on when the daemon does not answer the post. Only for
   // a Claude, Codex or Pi session the location record places on the calling node.
-  function context(principal, sessionId) {
+  // `pane` and `agent` are the node's identity for the session, as a post carries them:
+  // a Codex session the daemon never heard register is adopted first, as handle()
+  // adopts one, so a pre-tool that asks before any post has been admitted is answered.
+  // A request naming no pane never asks the node's host.
+  async function context(principal, sessionId, options = {}) {
     try {
       const caller = shared.callerNode(principal);
       if (caller === shared.daemonNode()) refuse(403, 'the hook route is for sessions on other nodes');
       const session = matching(sessionId, SESSION_RE, 'session id');
+      const agent = options.agent === undefined || options.agent === null || options.agent === '' ? null : options.agent;
+      if (agent !== null && !['claude', 'codex', 'pi'].includes(agent)) refuse(400, 'agent must be claude, codex or pi');
+      let pane = null;
+      if (options.pane !== undefined && options.pane !== null && options.pane !== '') {
+        if (typeof options.pane !== 'string') refuse(400, 'invalid pane ref');
+        let parsed;
+        try { parsed = shared.parsePaneRef(options.pane); } catch { refuse(400, 'invalid pane ref'); }
+        if (!parsed || !PANE_ID_RE.test(parsed.paneId)) refuse(400, 'invalid pane ref');
+        if (parsed.node !== caller) refuse(403, `pane ${options.pane} is not on node ${caller}`);
+        pane = shared.formatPaneRef(parsed.node, parsed.paneId);
+      }
+      if (agent === 'codex' && pane && typeof shared.adopt === 'function' && shared.unlocated(session)) {
+        const verify = (where) => {
+          if (!where || where.node !== caller) refuse(403, `session ${session} is not on node ${caller}`, SESSION_NOT_ON_NODE);
+          if (where.agent !== agent) refuse(403, `session ${session} is a ${where.agent} session, not ${agent}`);
+        };
+        await shared.adopt(caller, session, agent, { pane, verify });
+      }
       let where = null;
       try { where = shared.location(session); } catch { where = null; }
       if (!where || where.node !== caller) refuse(403, `session ${session} is not on node ${caller}`, SESSION_NOT_ON_NODE);

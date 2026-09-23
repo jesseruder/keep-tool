@@ -475,7 +475,12 @@ function readContextCache(env) {
 // `timeoutMs`. When the daemon does not answer, the cache as it stands, however old,
 // with `fresh: false`: a node that cannot reach its daemon still refuses by the
 // last list it had. repairSession is null when nothing has ever been said of it.
-async function hookContext({ env, where, token, sessionId, timeoutMs = CONTEXT_FETCH_MS, deps = {} }) {
+//
+// `agent` and `pane` name the session as its posts do, so the daemon can adopt a Codex
+// session it never heard register before it answers (bin/late-adoption.js). That runs
+// under the adoption's own deadline, and this ask never waits past `timeoutMs`: a slow
+// adoption answers as the daemon not answering does.
+async function hookContext({ env, where, token, sessionId, agent, pane, timeoutMs = CONTEXT_FETCH_MS, deps = {} }) {
   const now = deps.now || Date.now;
   const cached = readContextCache(env);
   const known = cached && cached.sessions[sessionId] && typeof cached.sessions[sessionId].repairSession === 'boolean'
@@ -488,7 +493,10 @@ async function hookContext({ env, where, token, sessionId, timeoutMs = CONTEXT_F
   let answer;
   try {
     const request = deps.request || require('./remote-cli.js').nodeApiRequest;
-    const response = await request(where.url, `/api/hook/context?session=${encodeURIComponent(sessionId)}`, { method: 'GET', token, timeoutMs });
+    const query = new URLSearchParams({ session: sessionId });
+    if (typeof agent === 'string' && agent) query.set('agent', agent);
+    if (typeof pane === 'string' && pane) query.set('pane', pane);
+    const response = await request(where.url, `/api/hook/context?${query}`, { method: 'GET', token, timeoutMs });
     answer = response.status === 200 ? parsed(response) : null;
   } catch { answer = null; }
   if (!answer || !validSteps(answer.steps) || typeof answer.repairSession !== 'boolean') return stale;
@@ -525,7 +533,7 @@ function responseOf(value, max = RESPONSE_TEXT_MAX) {
 // The step fingerprints the daemon last published and this command's repository
 // facts, computed inside the first half of the hook's budget. `incomplete` says a
 // repository did not answer in time.
-async function commandFacts({ event, sessionId, cwd, command, where, deps, budget, started }) {
+async function commandFacts({ event, agent, sessionId, cwd, command, where, deps, budget, started }) {
   const env = deps.env || process.env;
   const now = deps.now || Date.now;
   const facts = require('./repo-facts.js');
@@ -534,8 +542,11 @@ async function commandFacts({ event, sessionId, cwd, command, where, deps, budge
     require('./remote-cli.js').daemonBase(where.url);
     token = deps.token || require('./remote-cli.js').nodeToken(env, deps.readToken);
   } catch { token = null; }
+  // The pane as a post's identity names it (identityOf).
+  let pane = null;
+  try { pane = env.KEEP_PANE ? require('./nodes.js').formatPaneRef(where.local, env.KEEP_PANE, env) : null; } catch { pane = null; }
   const context = sessionId
-    ? await hookContext({ env, where, token, sessionId, timeoutMs: token ? Math.min(CONTEXT_FETCH_MS, budget / 4) : 0, deps })
+    ? await hookContext({ env, where, token, sessionId, agent, pane, timeoutMs: token ? Math.min(CONTEXT_FETCH_MS, budget / 4) : 0, deps })
     : { steps: [], repairSession: null, fresh: false };
   let repo = null;
   try {
@@ -575,7 +586,8 @@ async function runBashHook(event, input, where, deps = {}) {
   // A Pi pre-tool is a pre-bash in everything the facts are computed for.
   const pre = event === 'pre-bash' || event === 'pi-pre-tool';
   const { context, incomplete, repoFacts } = await commandFacts({
-    event: pre ? 'pre-bash' : event, sessionId, cwd: input.cwd, command, where, deps, budget, started,
+    event: pre ? 'pre-bash' : event, agent: PI_EVENTS.includes(event) ? 'pi' : 'claude',
+    sessionId, cwd: input.cwd, command, where, deps, budget, started,
   });
   // A command that could be a gated step, in a repository that did not answer: the
   // daemon would judge it on facts that are not there, so it is not asked.
@@ -607,7 +619,7 @@ async function runCodexToolHook(event, input, normalized, where, deps = {}) {
   const base = input && typeof input.cwd === 'string' && path.isAbsolute(input.cwd) ? input.cwd : process.cwd();
   const workdir = path.resolve(base, normalized && typeof normalized.cwd === 'string' ? normalized.cwd : base);
   const { context, incomplete, repoFacts } = await commandFacts({
-    event: pre ? 'pre-bash' : 'post-bash', sessionId, cwd: workdir, command, where, deps, budget, started,
+    event: pre ? 'pre-bash' : 'post-bash', agent: 'codex', sessionId, cwd: workdir, command, where, deps, budget, started,
   });
   if (pre && incomplete && require('./repo-facts.js').fingerprintMatch(command, context.steps)) {
     return { delivered: false, why: 'the repository did not answer in time', context, incomplete };

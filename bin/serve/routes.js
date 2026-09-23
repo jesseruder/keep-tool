@@ -73,7 +73,8 @@ function routes(ctx) {
       allow: ['node'],
       when: nodeApiEnabled,
       handle: async ({ res, url, principal }) => {
-        const result = ctx.hookService.context(principal, url.searchParams.get('session'));
+        const result = await ctx.hookService.context(principal, url.searchParams.get('session'),
+          { pane: url.searchParams.get('pane'), agent: url.searchParams.get('agent') });
         return json(res, result.status, result.body);
       },
     },

@@ -635,9 +635,19 @@ function stepsRegistry(root) {
 }
 
 test('the hook context is on the node API only, for nodes', async () => {
-  const fake = { context: () => ({ status: 200, body: { steps: [], repairSession: false } }) };
+  // The service answers after a tick: the route awaits it (it may adopt first).
+  const asked = [];
+  const fake = { context: async (...args) => {
+    asked.push(args);
+    await new Promise((resolve) => setImmediate(resolve));
+    return { status: 200, body: { steps: [], repairSession: false } };
+  } };
   const json = (res, status, value) => ({ status, value });
   const req = { method: 'GET' };
+  const withIdentity = new URL('http://x/api/hook/context?session=codex-aws1&agent=codex&pane=p2%40aws1');
+  const identified = matchRoute(routes({ json, nodeApiEnabled: () => true, hookService: fake }), { req, url: withIdentity });
+  assert.deepEqual(await identified.handle({ req, res: {}, url: withIdentity, principal: AWS1 }), { status: 200, value: { steps: [], repairSession: false } });
+  assert.deepEqual(asked.pop(), [AWS1, 'codex-aws1', { pane: 'p2@aws1', agent: 'codex' }]);
   const url = new URL('http://x/api/hook/context?session=sess-aws1');
   assert.equal(matchRoute(routes({ json, hookService: fake }), { req, url }), null);
   const route = matchRoute(routes({ json, nodeApiEnabled: () => true, hookService: fake }), { req, url });
@@ -657,11 +667,11 @@ test('the hook context publishes the step fingerprints and whether the daemon la
     if (card === 'throw') throw new Error('unreadable');
     return card;
   } });
-  assert.deepEqual(hooks.context(AWS1, 'sess-aws1'), { status: 200, body: { steps: ['build_packer_image.sh', 'terraform apply'], repairSession: false } });
+  assert.deepEqual(await hooks.context(AWS1, 'sess-aws1'), { status: 200, body: { steps: ['build_packer_image.sh', 'terraform apply'], repairSession: false } });
   card = 'repair-card';
-  assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, true);
+  assert.equal((await hooks.context(AWS1, 'sess-aws1')).body.repairSession, true);
   card = 'throw';
-  assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, true, 'a record that cannot be read refuses more, never less');
+  assert.equal((await hooks.context(AWS1, 'sess-aws1')).body.repairSession, true, 'a record that cannot be read refuses more, never less');
   card = '';
   for (const [who, session, status, message] of [
     [AWS1, 'sess-main', 403, /not on node aws1/],
@@ -670,16 +680,16 @@ test('the hook context publishes the step fingerprints and whether the daemon la
     [{ class: 'admin' }, 'sess-aws1', 403, /for sessions on other nodes/],
     [{ class: 'node', node: 'main' }, 'sess-aws1', 403, /unauthorized/],
   ]) {
-    const answer = hooks.context(who, session);
+    const answer = await hooks.context(who, session);
     assert.equal(answer.status, status, JSON.stringify(answer));
     assert.match(answer.body.error, message);
   }
-  assert.equal(hooks.context(AWS1, 'codex-aws1').status, 200, 'a Codex pre-tool refuses by the same fingerprints');
+  assert.equal((await hooks.context(AWS1, 'codex-aws1')).status, 200, 'a Codex pre-tool refuses by the same fingerprints');
   assert.equal(calls.length, 0, 'nothing ran');
   // Bounded: at most 256 fingerprints.
   fs.writeFileSync(path.join(root, 'steps', 'many.json'), JSON.stringify({ project: path.join(root, 'many'),
     steps: Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`s${i}`, { guard: [`tool${String(i).padStart(3, '0')} run`] }])) }));
-  assert.equal(hooks.context(AWS1, 'sess-aws1').body.steps.length, 256);
+  assert.equal((await hooks.context(AWS1, 'sess-aws1')).body.steps.length, 256);
 });
 
 test('a node asks for the hook context at most once a minute, and keeps the last answer when the daemon is gone', async (t) => {
@@ -964,15 +974,15 @@ test('a step run by hand on the node is recorded at the node\'s HEAD, and a sha 
 test('a self-repair state file that is there but unreadable makes every node session a repair session', async (t) => {
   const { hooks, calls, root } = services(t);
   const stateFile = require('./self-repair.js').stateFile(root);
-  assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, false, 'no state file: no repairs');
+  assert.equal((await hooks.context(AWS1, 'sess-aws1')).body.repairSession, false, 'no state file: no repairs');
   fs.mkdirSync(path.dirname(stateFile), { recursive: true });
   fs.writeFileSync(stateFile, JSON.stringify({ signatures: { sig: { sessionId: 'sess-other', cardId: 'repair-card' } } }));
-  assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, false, 'another session\'s repair');
+  assert.equal((await hooks.context(AWS1, 'sess-aws1')).body.repairSession, false, 'another session\'s repair');
   fs.writeFileSync(stateFile, JSON.stringify({ signatures: { sig: { sessionId: 'sess-aws1', cardId: 'repair-card' } } }));
-  assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, true, 'this session\'s repair');
+  assert.equal((await hooks.context(AWS1, 'sess-aws1')).body.repairSession, true, 'this session\'s repair');
   for (const corrupt of ['{ not json', '[]', 'null']) {
     fs.writeFileSync(stateFile, corrupt);
-    assert.equal(hooks.context(AWS1, 'sess-aws1').body.repairSession, true, corrupt);
+    assert.equal((await hooks.context(AWS1, 'sess-aws1')).body.repairSession, true, corrupt);
   }
   // The pre-bash run gets the marker too.
   const answer = await hooks.handle(AWS1, bashBody(root, 'ls'));
@@ -1450,6 +1460,58 @@ test('a Codex post the route would refuse on its own adopts nothing', async (t) 
   }
 });
 
+test('the hook context adopts a Codex session the daemon never heard register, as a post does, before it answers', async (t) => {
+  const { root, hooks, host, env, logged } = adoptingServices(t, [latePane()]);
+  const answer = await hooks.context(AWS1, 'codex-aws1', { agent: 'codex', pane: 'p2@aws1' });
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.deepEqual(Object.keys(answer.body).sort(), ['repairSession', 'steps'], 'the answer keeps its shape');
+  assert.equal(answer.body.repairSession, false);
+  assert.equal(host.asked, 1);
+  assert.deepEqual(require('./accounts.js').sessionLocation('codex-aws1', { root, env }),
+    { node: 'aws1', agent: 'codex', accountId: 'codex-node' });
+  assert.match(logged[0], /late adoption: codex session codex-aws1 adopted on aws1 in pane p2@aws1/);
+  // Placed now: the next ask reads the record and never asks the host.
+  assert.equal((await hooks.context(AWS1, 'codex-aws1', { agent: 'codex', pane: 'p2@aws1' })).status, 200);
+  assert.equal(host.asked, 1);
+});
+
+test('the hook context adopts nothing for a request naming no pane, another agent, or a pane off the caller', async (t) => {
+  const cases = [
+    ['no pane', { agent: 'codex' }, 403, 'SESSION_NOT_ON_NODE'],
+    ['an empty pane', { agent: 'codex', pane: '' }, 403, 'SESSION_NOT_ON_NODE'],
+    ['no agent', { pane: 'p2@aws1' }, 403, 'SESSION_NOT_ON_NODE'],
+    ['a Claude agent', { agent: 'claude', pane: 'p2@aws1' }, 403, 'SESSION_NOT_ON_NODE'],
+    ['a pane on another node', { agent: 'codex', pane: 'p2@main' }, 403, undefined],
+    ['a malformed pane', { agent: 'codex', pane: 'p2/../x@aws1' }, 400, undefined],
+    ['an unknown agent', { agent: 'shell', pane: 'p2@aws1' }, 400, undefined],
+  ];
+  for (const [name, options, status, code] of cases) {
+    const { root, hooks, host } = adoptingServices(t, [latePane()]);
+    const answer = await hooks.context(AWS1, 'codex-aws1', options);
+    assert.equal(answer.status, status, `${name}: ${JSON.stringify(answer.body)}`);
+    assert.equal(answer.body.code, code, name);
+    assert.equal(host.asked, 0, name);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts')), false, name);
+  }
+  // A pane on the node that is not the session's: asked, and nothing adopted.
+  const other = adoptingServices(t, [latePane()]);
+  const refused = await other.hooks.context(AWS1, 'codex-aws1', { agent: 'codex', pane: 'p9@aws1' });
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.code, 'SESSION_NOT_ON_NODE');
+  assert.equal(fs.existsSync(path.join(other.root, '.keep', 'session-accounts')), false);
+});
+
+test('the hook context for a located Claude session on a node is what it was, whatever it names', async (t) => {
+  const root = tempDir(t);
+  stepsRegistry(root);
+  const { hooks } = services(t, { root });
+  const before = await hooks.context(AWS1, 'sess-aws1');
+  assert.equal(before.status, 200);
+  assert.deepEqual(await hooks.context(AWS1, 'sess-aws1', { agent: 'claude', pane: 'p1@aws1' }), before);
+  assert.deepEqual(await hooks.context(AWS1, 'sess-aws1', { agent: 'codex', pane: 'p1@aws1' }), before, 'a located session is never adopted');
+  assert.equal((await hooks.context(AWS1, 'sess-main', { agent: 'claude', pane: 'p1@aws1' })).status, 403, 'the daemon node\'s session stays refused');
+});
+
 // ---------- Pi hooks through the route ----------
 
 const PI_INSTANCE = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
@@ -1540,7 +1602,7 @@ test('each Pi event runs the daemon\'s keep hook pi <action> on its rebuilt inpu
   await hooks.handle(AWS1, piBody('pi-start'));
   assert.equal(calls.at(-1).options.env.KEEP_REPAIR, undefined, 'only a pre-tool carries it');
   // The hook context answers a Pi session too: its pre-tool computes its facts by the fingerprints.
-  assert.equal(hooks.context(AWS1, 'pi-aws1').status, 200);
+  assert.equal((await hooks.context(AWS1, 'pi-aws1')).status, 200);
 });
 
 test('a Pi pre-tool on the daemon judges a node\'s shell command by the node\'s facts, as a Claude pre-bash is judged', async (t) => {

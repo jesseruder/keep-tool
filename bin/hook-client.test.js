@@ -417,7 +417,7 @@ test('a pre-bash asks for the context, posts the command with this node\'s repos
     tool_input: { command, description: 'x', timeout: 1000 } }, extra);
   const refused = await bash('cd ~ && terraform apply', { KEEP_STEP_OK: '0', KEEP_REPAIR: '1' });
   assert.deepEqual(refused, { status: 2, stdout: '', stderr: refusal });
-  assert.deepEqual(daemon.posts.map((post) => post.url), ['/api/hook/context?session=sess-aws1', '/api/hook']);
+  assert.deepEqual(daemon.posts.map((post) => post.url), ['/api/hook/context?session=sess-aws1&agent=claude', '/api/hook'], 'no KEEP_PANE here: the ask names no pane');
   const post = daemon.posts[1].body;
   assert.equal(post.event, 'pre-bash');
   assert.equal(post.transcript, null, 'no transcript bytes');
@@ -666,9 +666,11 @@ test('a Codex pre-tool posts the shell command with this node\'s repository fact
   });
   const shell = (url, command, extra = {}, tool = 'shell') => codexRun(f, 'pre-tool', url, codexInput(f, { hook_event_name: 'PreToolUse', tool_name: tool,
     call_id: 'call-1', tool_input: { command: ['bash', '-lc', command], workdir: f.home, timeout_ms: 1000 } }), extra);
-  const refused = await shell(daemon.url, 'terraform apply');
+  const refused = await shell(daemon.url, 'terraform apply', { KEEP_PANE: 'p2' });
   assert.equal(refused.status, 2);
   assert.deepEqual(onlyJson(refused), JSON.parse(block('step apply')));
+  // The context is asked as the session and pane its posts name, so the daemon can adopt it first.
+  assert.equal(daemon.posts[0].url, '/api/hook/context?session=codex-aws1&agent=codex&pane=p2%40aws1');
   const post = daemon.posts.find((entry) => entry.url === '/api/hook').body;
   assert.equal(post.event, 'codex-pre-tool');
   assert.equal(post.transcript, null, 'no rollout bytes in front of a command');
@@ -904,7 +906,7 @@ test('a Pi hook posts as the Pi session, with only what the daemon\'s keep hook 
   assert.equal(posts[1].payload.event, 'pi-end');
   const pre = await client.runPiHook('pre-tool', { ...input, tool_name: 'Bash', tool_input: { command: 'ls' } }, where, deps);
   assert.equal(pre.delivered, true);
-  assert.deepEqual(posts.slice(2).map((post) => post.pathname), ['/api/hook/context?session=pi-aws1', '/api/hook']);
+  assert.deepEqual(posts.slice(2).map((post) => post.pathname), ['/api/hook/context?session=pi-aws1&agent=pi&pane=p3%40aws1', '/api/hook']);
   const tool = posts[3].payload;
   assert.equal(tool.event, 'pi-pre-tool');
   assert.deepEqual(tool.input, { session_id: 'pi-aws1', cwd: home, tool_name: 'Bash', tool_input: { command: 'ls' },

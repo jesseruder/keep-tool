@@ -132,6 +132,13 @@ more than one, nothing is adopted: the open answers `pendingRegistration` with a
 first turn, but the daemon, with no record placing that session on the node, refuses
 its hooks.
 
+Unless a hook from the session's own pane adopts it (`bin/late-adoption.js`): a
+`POST /api/hook` naming the pane, or a pre-tool's `GET /api/hook/context?session=
+&agent=codex&pane=`, which the node sends with its session's agent and `KEEP_PANE`. So
+a first pre-tool that fires before any post was admitted is judged by the daemon's
+published fingerprints, not the node's fallback. The context ask still waits no longer
+than its own budget; an adoption slower than that answers as a daemon that did not.
+
 A node identifies its Codex processes' open rollouts with lsof, and on a Linux node
 without lsof from `/proc/<pid>/fd`; a read that fails leaves the session unverified,
 never absent. `keep doctor` on a node checks each `~/.codex*` profile: a hooks.json whose
