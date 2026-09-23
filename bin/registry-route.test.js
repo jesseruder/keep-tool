@@ -699,7 +699,7 @@ test('a refused late adoption is remembered for five seconds per node and sessio
   }
   assert.equal(host.asked, 1);
   // Another session on the same node is asked for on its own.
-  await svc.handle(AWS1, lateBody(root, { session: 'codex-other', pane: null }));
+  await svc.handle(AWS1, lateBody(root, { session: 'codex-other' }));
   assert.equal(host.asked, 2);
   // Once the refusal has lapsed and the pane is the session's, it is adopted.
   host.panes = [lateCodexPane()];
@@ -732,6 +732,34 @@ test('no pane naming the session yet is never remembered: the node\'s own bind l
   const adopted = await svc.handle(AWS1, lateBody(root));
   assert.equal(adopted.status, 200, JSON.stringify(adopted.body));
   assert.equal(host.asked, 3);
+});
+
+test('a Codex on a node that Keep did not open (no pane in its request) never costs a host lookup, and the helper remembers its empty answer for 500 ms', async (t) => {
+  // Through the route: a request naming no pane is not from one of Keep's panes.
+  const { svc, root, host } = adoptingService(t, []);
+  for (let i = 0; i < 4; i += 1) {
+    const answer = await svc.handle(AWS1, lateBody(root, { pane: null, idempotencyKey: `k-unmanaged-${i}-0123456789` }));
+    assert.equal(answer.status, 403);
+    assert.equal(answer.body.error, 'session codex-late is not on node aws1');
+  }
+  assert.equal(host.asked, 0);
+  // The helper asked directly for such a session: no pane names it, remembered briefly.
+  const direct = directAdoption(t, []);
+  const ask = () => direct.adoption.adopt('aws1', 'codex-late', 'codex', {});
+  assert.match((await ask()).why, /0 live panes on aws1 name session codex-late/);
+  for (let i = 0; i < 3; i += 1) assert.equal((await ask()).cached, true);
+  assert.equal(direct.host.asked, 1, 'once per 500 ms window');
+  direct.tick(499);
+  assert.equal((await ask()).cached, true);
+  direct.tick(2);
+  assert.equal((await ask()).cached, undefined);
+  assert.equal(direct.host.asked, 2);
+  // A request naming its pane is still asked each time: its own bind is about to land.
+  assert.equal((await direct.adopt()).adopted, false);
+  assert.equal((await direct.adopt()).adopted, false);
+  assert.equal(direct.host.asked, 4);
+  direct.host.panes = [lateCodexPane()];
+  assert.equal((await direct.adopt()).adopted, true);
 });
 
 test('late adoption refuses a session this machine knows, one with any daemon pane record, and a pane whose open the daemon never recorded', async (t) => {
@@ -985,9 +1013,10 @@ test('a request naming the wrong pane neither blocks nor delays the right one', 
   // A refusal that is remembered is remembered for that request's pane only.
   const other = adoptingService(t, [lateCodexPane({ agent: 'claude' })]);
   assert.equal((await other.svc.handle(AWS1, lateBody(other.root))).status, 403);
-  assert.equal((await other.svc.handle(AWS1, lateBody(other.root, { pane: null, idempotencyKey: 'k-no-pane-0123456789' }))).status, 403);
-  assert.equal(other.host.asked, 2, 'a request naming no pane is asked for on its own');
-  assert.equal((await other.svc.handle(AWS1, lateBody(other.root, { pane: null, idempotencyKey: 'k-no-pane-1123456789' }))).status, 403);
+  assert.equal((await other.svc.shared.adopt('aws1', 'codex-late', 'codex', {})).why, 'the pane runs claude, not codex',
+    'a request naming no pane is asked for on its own');
+  assert.equal(other.host.asked, 2);
+  assert.equal((await other.svc.shared.adopt('aws1', 'codex-late', 'codex', {})).cached, true);
   assert.equal(other.host.asked, 2);
 });
 

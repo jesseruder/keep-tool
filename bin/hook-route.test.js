@@ -1401,6 +1401,23 @@ test('a Codex start posted before its pane is bound is refused uncached: the pro
   assert.equal(require('./accounts.js').sessionLocation('codex-aws1', { root, env }).node, 'aws1');
 });
 
+test('a Codex hook on a node that names no pane (a Codex Keep did not open) never asks the node\'s host', async (t) => {
+  const { root, hooks, host, calls } = adoptingServices(t, [latePane()]);
+  for (let i = 0; i < 4; i += 1) {
+    const answer = await hooks.handle(AWS1, codexBody('codex-stop', { hook_event_name: 'Stop', stop_hook_active: false }, {
+      identity: { agent: 'codex', sessionId: 'codex-aws1', accountId: 'codex-node' }, idempotencyKey: `${KEY}-unmanaged-${i}` }));
+    assert.equal(answer.status, 403);
+    assert.equal(answer.body.code, 'SESSION_NOT_ON_NODE');
+  }
+  assert.equal(host.asked, 0);
+  assert.equal(calls.length, 0);
+  assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts')), false);
+  // The same session posting from its pane is adopted as before.
+  const named = await hooks.handle(AWS1, codexBody('codex-stop', { hook_event_name: 'Stop', stop_hook_active: false }));
+  assert.equal(named.status, 200, JSON.stringify(named.body));
+  assert.equal(host.asked, 1);
+});
+
 test('a Codex post the route would refuse on its own adopts nothing', async (t) => {
   const cases = [
     ['a malformed input', codexBody('codex-stop', { stop_hook_active: 'no' }), 400],

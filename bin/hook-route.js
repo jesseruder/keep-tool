@@ -606,13 +606,15 @@ function createHookService(options = {}) {
       // A session the caller's host shows but the daemon never heard register
       // (bin/late-adoption.js), asked only for a well-formed event of its agent, and
       // only for a post that is otherwise sound: checked first as if the session were
-      // on the caller, so a post the route would refuse on its own pins nothing.
+      // on the caller, so a post the route would refuse on its own pins nothing. A post
+      // that names no pane is not from one of Keep's panes (every host pane carries
+      // KEEP_PANE, and the node's own bind needs it), so it never asks the node's host.
       const identity = isObject(body) && isObject(body.identity) ? body.identity : null;
-      const ofItsAgent = identity && (body.event === TRANSCRIPT_ONLY
+      const ofItsAgent = identity && typeof identity.pane === 'string' && identity.pane !== '' && (body.event === TRANSCRIPT_ONLY
         || ((EVENTS.includes(body.event) || CODEX_EVENTS.includes(body.event)) && agentOf(body.event) === identity.agent));
       if (ofItsAgent && typeof shared.adopt === 'function' && shared.unlocated(identity.sessionId)) {
         validateRequest(body, caller, { ...deps, location: () => ({ node: caller, agent: identity.agent }) });
-        await shared.adopt(caller, identity.sessionId, identity.agent, { pane: typeof identity.pane === 'string' ? identity.pane : null });
+        await shared.adopt(caller, identity.sessionId, identity.agent, { pane: identity.pane });
       }
       const request = validateRequest(body, caller, deps);
       if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };

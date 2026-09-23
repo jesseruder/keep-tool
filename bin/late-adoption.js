@@ -24,8 +24,9 @@
 // NEGATIVE_TTL_MS per (node, session), so a flood of refused posts asks the host once;
 // one that can is not: no pane names the session yet (the node's own bind lands
 // milliseconds after its start posts) or two do, nor one the request itself caused (a
-// pane other than the one it names). A host that could not be asked is remembered for
-// SHORT_TTL_MS. What is remembered is keyed by the request's agent and pane as well,
+// pane other than the one it names). A host that could not be asked, and no pane for
+// a request that names none (never one of Keep's panes), is remembered for
+// SHORT_TTL_MS. The routes do not ask at all for a request that names no pane. What is remembered is keyed by the request's agent and pane as well,
 // so one request's refusal never turns away another's.
 // The routes exist only on the node listener: a single-node install
 // never gets here.
@@ -257,7 +258,15 @@ function createLateAdoption(options = {}) {
   // Resolves { adopted: true, pane, accountId } or { adopted: false, why, ttl }.
   async function attempt(caller, sessionId, agent, requestPane) {
     const matches = await livePanesNaming(caller, sessionId);
-    if (matches.length !== 1) return refusal(`${matches.length} live panes on ${caller} name session ${sessionId}`, 0);
+    // No pane naming the session is not remembered for a request that names its pane:
+    // the node's own bind lands milliseconds after its start posts, and that post is
+    // retried. One that names no pane is from a session Keep did not open (the node's
+    // bind needs KEEP_PANE), so it is remembered briefly: a Codex hooked on a node
+    // outside Keep's panes then costs one host lookup per SHORT_TTL_MS, not one per post.
+    if (matches.length !== 1) {
+      return refusal(`${matches.length} live panes on ${caller} name session ${sessionId}`,
+        matches.length === 0 && !requestPane ? SHORT_TTL_MS : 0);
+    }
     const [pane] = matches;
     const meta = pane.meta;
     if (typeof pane.id !== 'string' || !PANE_ID_RE.test(pane.id)) return refusal('the pane has no usable id');

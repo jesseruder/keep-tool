@@ -313,10 +313,12 @@ function createRegistryService(options = {}) {
       // A session the daemon never heard register (bin/late-adoption.js) is adopted
       // only for a request that is otherwise sound: checked first as if the session
       // were on the caller, so a request the route would refuse on its own pins nothing.
+      // One that names no pane is not from one of Keep's panes, so it never asks the host.
       if (caller !== daemon && body && typeof body === 'object' && typeof body.session === 'string'
-        && typeof body.agent === 'string' && lateAdoption.unlocated(body.session)) {
+        && typeof body.agent === 'string' && typeof body.pane === 'string' && body.pane !== ''
+        && lateAdoption.unlocated(body.session)) {
         validateRequest(body, caller, { ...deps, location: () => ({ node: caller, agent: body.agent }) });
-        await lateAdoption.adopt(caller, body.session, body.agent, { pane: typeof body.pane === 'string' ? body.pane : null });
+        await lateAdoption.adopt(caller, body.session, body.agent, { pane: body.pane });
       }
       const request = validateRequest(body, caller, deps);
       return await journaled({
