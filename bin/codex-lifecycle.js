@@ -25,6 +25,11 @@ function record(root, input, now = Date.now()) {
   return lifecycle.record(root, { ...input, agentKind: 'codex', prompt_id: input.turn_id || input.prompt_id }, now);
 }
 
+// A child's own rollout, found on this machine. For a session on another node (a hook
+// the daemon runs with KEEP_HOOK_NODE) there is none here: only the parent's rollout
+// is mirrored, because a child's hooks carry the parent's session id. The lookup then
+// finds nothing, and state() falls back on the lifecycle events alone, which expire
+// a SubagentStart the transcript never confirmed after 120 s.
 function childState(id, parent, now) {
   const codex = require('./codex');
   let resolved = childPaths.get(id);

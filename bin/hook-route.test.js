@@ -1094,3 +1094,165 @@ test('a Codex client-end names no session: only its token reaches the hook, and 
   const other = await hooks.handle(AWS1, { ...codexBody('codex-client-end', { client_token: 'tok' }), identity: { agent: 'codex', sessionId: 'sess-main' } });
   assert.equal(other.status, 403);
 });
+
+// ---------- a Codex session's hooks, run on the daemon against its rollout mirror ----------
+
+function authority(root, sessionId, agent, node) {
+  const dir = path.join(root, '.keep', 'session-accounts');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ version: 1, sessionId, agent, accountId: `${agent}-node`, node }));
+}
+
+function codexRolloutText(sid, message = 'Done with the edits.') {
+  const row = (type, payload) => `${JSON.stringify({ type, payload, timestamp: '2026-09-22T10:00:00.000Z' })}\n`;
+  return row('session_meta', { id: sid, source: 'cli', originator: 'codex-tui', cwd: '/home/node/project' })
+    + row('event_msg', { type: 'user_message', message: 'Continue the work.' })
+    + row('event_msg', { type: 'agent_message', message });
+}
+
+const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
+const withoutTimes = ({ at, startedAt, ...rest }) => rest;
+
+test('a Codex start, stop, question and client-end through the route write what a local run writes, the pane record naming the node', async (t) => {
+  const sid = 'codex-aws1';
+  const text = codexRolloutText(sid);
+
+  // The local run: a Codex session on the daemon node, its rollout on disk.
+  const localRoot = registry(t);
+  const rollout = path.join(localRoot, `rollout-2026-09-22T10-00-00-${sid}.jsonl`);
+  fs.writeFileSync(rollout, text);
+  const localEnv = { PATH: process.env.PATH, HOME: localRoot, LANG: 'C', KEEP_DIR: localRoot, KEEP_NO_PUSH: '1', KEEP_SYNC: '0',
+    KEEP_CONFIG: path.join(localRoot, 'config.json'), KEEP_PANE: 'p2', KEEP_HOST_SOCK: path.join(localRoot, 'no-host.sock'),
+    KEEP_CODEX_CLIENT_TOKEN: 'launch-tok' };
+  const local = (action, extra = {}) => runLocal(['hook', 'codex', action], { env: localEnv,
+    input: JSON.stringify({ session_id: sid, transcript_path: rollout, cwd: '/home/node/project', ...extra }) });
+
+  // The node's run: the same rollout arrives as bytes; the daemon's own hook runs on the mirror.
+  const root = registry(t);
+  authority(root, sid, 'codex', 'aws1');
+  authority(root, 'claude-parent', 'claude', 'aws1');
+  authority(root, 'claude-elsewhere', 'claude', 'main');
+  authority(root, 'codex-main', 'codex', 'main');
+  const { hooks } = services(t, { root, realSpawn: true });
+  const mtimeMs = 1_700_000_000_000;
+  let sent = 0;
+  const node = async (event, input = {}, identityEnv = {}, firedAt) => {
+    const bytes = sent === 0 ? text : '';
+    const answer = await hooks.handle(AWS1, codexBody(event, input, {
+      identity: { agent: 'codex', sessionId: sid, pane: 'p2@aws1', env: { KEEP_CODEX_CLIENT_TOKEN: 'launch-tok', ...identityEnv }, ...(firedAt ? { firedAt } : {}) },
+      transcript: { ...transcript(bytes, { fromOffset: sent, size: Buffer.byteLength(text), mtimeMs }), path: CODEX_ROLLOUT },
+      idempotencyKey: `${KEY}-${event}-${Math.random().toString(36).slice(2)}`,
+    }));
+    sent = Buffer.byteLength(text);
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    assert.equal(answer.body.status, 0, answer.body.stderr);
+    return answer.body;
+  };
+
+  // start
+  const localStart = await local('start', { hook_event_name: 'SessionStart', source: 'startup' });
+  assert.equal(localStart.status, 0, localStart.stderr);
+  const nodeStart = await node('codex-start', { hook_event_name: 'SessionStart', source: 'startup' }, { KEEP_CODEX_PARENT_SESSION: 'claude-parent' });
+  assert.equal(nodeStart.stdout, localStart.stdout, 'the same answer to Codex');
+  const localPane = readJson(path.join(localRoot, '.keep', 'panes', `${sid}.json`));
+  const nodePane = readJson(path.join(root, '.keep', 'panes', `${sid}.json`));
+  assert.deepEqual(withoutTimes(nodePane), { ...withoutTimes(localPane), pane: 'p2@aws1', node: 'aws1', accountId: 'codex-node' });
+  assert.deepEqual(withoutTimes(readJson(path.join(root, '.keep', 'stopcheck', `${sid}.json`))),
+    withoutTimes(readJson(path.join(localRoot, '.keep', 'stopcheck', `${sid}.json`))), 'the stop evidence anchored at the mirror\'s end');
+  assert.equal(readJson(path.join(root, '.keep', 'codex-parents', `${sid}.json`)).parent, 'claude-parent', 'a parent on the same node');
+  assert.equal(fs.existsSync(path.join(localRoot, '.keep', 'codex-parents', `${sid}.json`)), false);
+
+  // stop: nothing to push back, so the turn's completion marker, with the mirror's mtime and when it fired.
+  const localStop = await local('stop', { hook_event_name: 'Stop', stop_hook_active: false });
+  const firedAt = Date.now() - 60e3;
+  const nodeStop = await node('codex-stop', { hook_event_name: 'Stop', stop_hook_active: false }, {}, firedAt);
+  assert.equal(nodeStop.stdout, localStop.stdout);
+  assert.deepEqual(JSON.parse(nodeStop.stdout), {});
+  const localMarker = readJson(path.join(localRoot, '.keep', 'attention', `${sid}.json`));
+  const nodeMarker = readJson(path.join(root, '.keep', 'attention', `${sid}.json`));
+  assert.equal(localMarker.type, 'complete');
+  // Locally mt comes from the rollouts under ~/.codex/sessions (none in this fixture); on
+  // the daemon for a node's session, from the mirror.
+  assert.deepEqual({ ...nodeMarker, mt: undefined, at: undefined }, { ...localMarker, mt: undefined, at: undefined });
+  assert.equal(nodeMarker.mt, mtimeMs, 'the mirror\'s mtime, the node\'s rollout time');
+  assert.equal(nodeMarker.at, firedAt, 'when it fired on the node');
+  assert.equal(nodeMarker.clientToken, 'launch-tok');
+
+  // client-end: the session's own completion goes; another node's session with the same token stays.
+  const otherMarker = path.join(root, '.keep', 'attention', 'codex-main.json');
+  fs.writeFileSync(otherMarker, JSON.stringify({ ...nodeMarker, at: Date.now() }));
+  const ended = await hooks.handle(AWS1, { event: 'codex-client-end', input: { client_token: 'launch-tok' },
+    identity: { agent: 'codex', pane: 'p2@aws1' }, transcript: null, idempotencyKey: `${KEY}-client-end` });
+  assert.equal(ended.status, 200, JSON.stringify(ended.body));
+  assert.equal(ended.body.stdout, '{}\n');
+  assert.equal(fs.existsSync(path.join(root, '.keep', 'attention', `${sid}.json`)), false, 'this node\'s session\'s completion cleared');
+  assert.equal(fs.existsSync(otherMarker), true, 'a session on another node is not this node\'s to clear');
+
+  // question: nobody marks the pane unattended (its host is not reachable), so the question is asked and marked.
+  const question = { hook_event_name: 'PreToolUse', tool_name: 'request_user_input', tool_input: { questions: [{ question: 'Which branch?', options: [{ label: 'main' }] }] } };
+  const localQuestion = await local('question', question);
+  const nodeQuestion = await node('codex-question', question);
+  assert.equal(nodeQuestion.stdout, localQuestion.stdout);
+  const localAsked = readJson(path.join(localRoot, '.keep', 'attention', `${sid}.json`));
+  const nodeAsked = readJson(path.join(root, '.keep', 'attention', `${sid}.json`));
+  assert.deepEqual({ ...nodeAsked, mt: undefined, at: undefined }, { ...localAsked, mt: undefined, at: undefined });
+  assert.equal(nodeAsked.type, 'question');
+  assert.equal(nodeAsked.mt, mtimeMs);
+});
+
+test('a Codex parent on another node, or not a Claude session, is not recorded', async (t) => {
+  const sid = 'codex-aws1';
+  const root = registry(t);
+  authority(root, sid, 'codex', 'aws1');
+  authority(root, 'claude-elsewhere', 'claude', 'main');
+  authority(root, 'codex-sibling', 'codex', 'aws1');
+  const { hooks } = services(t, { root, realSpawn: true });
+  const text = codexRolloutText(sid);
+  let n = 0;
+  for (const parent of ['claude-elsewhere', 'codex-sibling', 'nobody']) {
+    const answer = await hooks.handle(AWS1, codexBody('codex-start', { hook_event_name: 'SessionStart' }, {
+      identity: { agent: 'codex', sessionId: sid, env: { KEEP_CODEX_PARENT_SESSION: parent } },
+      transcript: n === 0 ? { ...transcript(text), path: CODEX_ROLLOUT } : null, idempotencyKey: `${KEY}-parent-${n++}`,
+    }));
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'codex-parents', `${sid}.json`)), false, parent);
+  }
+});
+
+test('on the daemon node the Codex hooks read no node state: KEEP_CODEX_PARENT_SESSION alone changes nothing', async (t) => {
+  const sid = 'codex-local';
+  const root = registry(t);
+  authority(root, 'claude-parent', 'claude', 'main');
+  const rollout = path.join(root, 'rollout.jsonl');
+  fs.writeFileSync(rollout, codexRolloutText(sid));
+  const env = { PATH: process.env.PATH, HOME: root, LANG: 'C', KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_SYNC: '0',
+    KEEP_CONFIG: path.join(root, 'config.json'), KEEP_CODEX_PARENT_SESSION: 'claude-parent', CLAUDE_CODE_SESSION_ID: 'claude-real' };
+  const result = await runLocal(['hook', 'codex', 'start'], { env, input: JSON.stringify({ session_id: sid, transcript_path: rollout, cwd: root }) });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readJson(path.join(root, '.keep', 'codex-parents', `${sid}.json`)).parent, 'claude-real', 'the local parent, as always');
+});
+
+test('a Codex pre-tool on the daemon judges a node\'s shell command by the node\'s facts, as a Claude pre-bash is judged', async (t) => {
+  const root = registry(t);
+  stepsRegistry(root);
+  const { hooks } = services(t, { root, realSpawn: true });
+  const cwd = path.join(root, 'wt', 'infra', 'feature');
+  const run = async (command, paths = { [cwd]: { top: cwd, main: path.join(root, 'infra') } }) => {
+    const answer = await hooks.handle(AWS1, codexBody('codex-pre-tool', { cwd, hook_event_name: 'PreToolUse', tool_name: 'shell', call_id: 'call-1',
+      tool_input: { command, workdir: cwd }, repo_facts: { paths, deploy: null, head: {} } }, { idempotencyKey: `${KEY}-${Math.random().toString(36).slice(2)}` }));
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    return answer.body;
+  };
+  const refused = await run('terraform apply -auto-approve');
+  assert.equal(refused.status, 2, refused.stderr);
+  const block = JSON.parse(refused.stdout);
+  assert.equal(block.decision, 'block');
+  assert.equal(block.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(block.reason, /^keep guard: `terraform apply` is step apply on ~\/infra/);
+  // A directory the node did not report is refused, never let through.
+  const unreported = await run('terraform apply', {});
+  assert.equal(unreported.status, 2);
+  assert.match(JSON.parse(unreported.stdout).reason, /node aws1 did not report the repository/);
+  const plain = await run('ls -la');
+  assert.deepEqual([plain.status, JSON.parse(plain.stdout)], [0, {}]);
+});

@@ -107,6 +107,9 @@ function codexToolInput(input) {
     tool_input: { command },
     tool_response: response,
     tool_use_id: toolUseId,
+    // A node's session (KEEP_HOOK_NODE): the repository facts the node posted with the
+    // call, which the step guard and the recorders read in place of git here.
+    ...(process.env.KEEP_HOOK_NODE && input.repo_facts ? { repo_facts: input.repo_facts } : {}),
   };
 }
 
@@ -186,7 +189,7 @@ function codexHook(kind, input) {
   if (kind === 'start') {
     // Codex's SessionStart payload carries session_id and cwd like Claude's; the
     // hook binds the inherited host pane to the ID it just assigned.
-    const pending = recordSessionPane(input, 'codex');
+    const pending = recordSessionPane(input, 'codex', process.env.KEEP_HOOK_NODE ? codexNodeDeps(input) : undefined);
     let delegationStatus = { kind: 'none' };
     try {
       delegationStatus = withLock(() => delegation.registerStart(
@@ -229,6 +232,56 @@ function codexHook(kind, input) {
   return codexAttentionMarker(kind, input);
 }
 
+// ---------- a Codex session on another node (KEEP_HOOK_NODE) ----------
+//
+// bin/hook-route.js runs `keep hook codex <action>` here for a session on another
+// node, with transcript_path pointing at the session's rollout mirror. What the code
+// above reads from this machine for a local session it reads there instead: the
+// mirror for the rollout, that node's host and process table for the pane. None of
+// these is called without KEEP_HOOK_NODE.
+
+// The rollout mirror, as recentCodexRollouts would have listed it.
+function codexMirrorRollout(input) {
+  const file = input && input.transcript_path;
+  if (typeof file !== 'string' || !path.isAbsolute(file)) return null;
+  try {
+    const stat = fs.statSync(file);
+    return stat.isFile() ? { file, name: path.basename(file), mtimeMs: stat.mtimeMs } : null;
+  } catch { return null; }
+}
+
+// Whether the location record places this session on the node the hook runs for,
+// as a Codex session. Any failure to read it is no.
+function codexSessionOnHookNode(sid) {
+  try {
+    const where = require('../accounts').sessionLocation(sid, { root: ROOT });
+    return Boolean(where && where.node === process.env.KEEP_HOOK_NODE && where.agent === 'codex');
+  } catch { return false; }
+}
+
+// The Claude session a node's Codex session was started from (the node forwards its
+// CLAUDE_CODE_SESSION_ID as KEEP_CODEX_PARENT_SESSION), when the location record
+// places that Claude session on the same node. Anything else names no parent.
+function nodeCodexParent() {
+  const id = process.env.KEEP_CODEX_PARENT_SESSION;
+  if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) return undefined;
+  try {
+    const where = require('../accounts').sessionLocation(id, { root: ROOT });
+    return where && where.node === process.env.KEEP_HOOK_NODE && where.agent === 'claude' ? id : undefined;
+  } catch { return undefined; }
+}
+
+// What recordSessionPane's Codex ownership check reads for a node's session: that
+// node's process table and open rollouts (codex-pane.ownsPane with `node`, through
+// serve.js nodeEvidence), and the session's meta from the mirror.
+function codexNodeDeps(input) {
+  const file = input && input.transcript_path;
+  return {
+    node: process.env.KEEP_HOOK_NODE,
+    sessionMetaFor: (sessionId) => require('../codex').sessionMetaFor(sessionId, { file }),
+  };
+}
+
 // The attention marker behind the console's "Needs you" row: a finished turn, a
 // question waiting for an answer, or a permission prompt.
 function codexAttentionMarker(kind, input) {
@@ -252,6 +305,9 @@ function codexAttentionMarker(kind, input) {
       }) || null;
   }
   if (!sid) return;
+  // A node's session: its rollout is the mirror the route pointed transcript_path at,
+  // never a file under this machine's ~/.codex.
+  if (process.env.KEEP_HOOK_NODE) rollout = codexMirrorRollout(input);
   const markerFile = path.join(META, 'attention', `${sid}.json`);
 
   const toolInput = input && input.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
@@ -291,6 +347,7 @@ function codexAttentionMarker(kind, input) {
     source: 'codex',
     clientToken: process.env.KEEP_CODEX_CLIENT_TOKEN || undefined,
   }));
+  stampNodeFiredAt(markerFile);
   for (const name of fs.readdirSync(dir)) {
     if (!name.endsWith('.json')) continue;
     try {
@@ -316,6 +373,7 @@ function clearClientCompletion(input) {
       if (marker.type === 'complete' && marker.source === 'codex' && marker.clientToken === token) {
         const sid = name.slice(0, -'.json'.length);
         if (require('../session-retirement').lookup(ROOT, sid)?.automatic === true) continue;
+        if (process.env.KEEP_HOOK_NODE && !codexSessionOnHookNode(sid)) continue;
         fs.unlinkSync(markerFile);
       }
     } catch {}
@@ -2520,7 +2578,7 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
           (deps.pinSession || accountStore.pinSession)(sid, 'codex', accountId,
             // A hook runs on the machine whose pane it is talking about, which is
             // not necessarily the one running the daemon.
-            { root: deps.root || ROOT, env, node: require('../nodes.js').localNode(env) });
+            { root: deps.root || ROOT, env, node: env.KEEP_HOOK_NODE || require('../nodes.js').localNode(env) });
         }
       }
       const owner = current && current.pane && current.pane.meta && current.pane.meta.sessionId;
@@ -2634,6 +2692,7 @@ async function releaseSessionPane(input, agent = 'claude', deps = {}) {
 function recordCodexParent(input) {
   const sid = input && input.session_id;
   let parent = process.env.CLAUDE_CODE_SESSION_ID;
+  if (process.env.KEEP_HOOK_NODE) parent = nodeCodexParent();
   let parentAgent = 'claude';
   const valid = (value) => typeof value === 'string' && /^[A-Za-z0-9_-]+$/.test(value);
   try {
