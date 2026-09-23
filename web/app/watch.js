@@ -132,8 +132,12 @@ function renderGrid(ctx, layout) {
     const portable = providerControls && (closable || pendingHandoff) && !entity.session?.reviewer ? portableTransferControls(ctx, pane.meta.sessionId) : '';
     const handoff = providerControls && (closable || pendingHandoff) && !entity.session?.reviewer ? handoffControls(ctx, pane.meta.sessionId, pane.id) : '';
     const restart = providerControls && closable && !pendingHandoff && !entity.session?.reviewer ? restartControls(ctx, pane.meta.sessionId) : '';
-    const move = providerControls && !entity.session?.reviewer
-      ? moveControlsHTML(ctx, entity.session, { live: Boolean(closable), pendingHandoff }) : '';
+    // The session a move acts on is the pane's own when it names one, so the current
+    // node the controls show and the session they post are the same identity; the
+    // entity's may be another row bound to this pane.
+    const moveSession = pane.meta?.sessionId ? ctx.sessionFor({ sessionId: pane.meta.sessionId }) : entity.session;
+    const move = providerControls && moveSession && !moveSession.reviewer
+      ? moveControlsHTML(ctx, moveSession, { live: Boolean(closable), pendingHandoff }) : '';
     const keepRunning = providerControls && closable && entity.session && !entity.session.reviewer && !entity.session.agentName
       ? keepRunningControlHTML(entity.session) : '';
     const menu = element.querySelector('.session-actions');
@@ -145,7 +149,7 @@ function renderGrid(ctx, layout) {
     installHeadingRename(heading, ctx, entity.session?.id, entity.title, api.renameSession);
     if (portable) installPortableTransferControls(menu.querySelector('.portable-transfer-controls'), ctx);
     if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, pane.meta.sessionId, pane.id);
-    if (move) installMoveControls(menu.querySelector('.move-controls'), ctx, pane.meta.sessionId);
+    if (move) installMoveControls(menu.querySelector('.move-controls'), ctx, moveSession.id);
     if (restart) installRestartControls(menu.querySelector('.restart-controls'), ctx, pane.meta.sessionId, pane.id);
     retained.add(element);
     const closeButton = element.querySelector('[data-close-session]');
