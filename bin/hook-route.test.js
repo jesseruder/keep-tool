@@ -808,8 +808,17 @@ test('a registered step on the daemon refuses its command on the node, by the no
     [path.join(root, 'wt', 'infra', 'feature')]: { top: path.join(root, 'wt', 'infra', 'feature'), main: path.join(root, 'infra') },
   } } });
   assert.equal(walked.status, 2, walked.stderr);
-  // Without the facts the daemon knows nothing of the node's worktree: the facts are what decided.
-  assert.equal((await run('terraform apply', { facts: { paths: {} } })).status, 0);
+  // A base the node posted nothing for is taken as the step's: refused, never skipped.
+  const unreported = await run('terraform apply', { facts: { paths: {} } });
+  assert.equal(unreported.status, 2);
+  assert.match(unreported.stderr, /looks like step apply on ~\/infra, and node aws1 did not report the repository at .*wt\/infra\/feature, so the guard cannot tell/);
+  const ninth = await run(`cd ${path.join(root, 'elsewhere')} && terraform apply`);
+  assert.equal(ninth.status, 2, 'a cd target without facts');
+  assert.match(ninth.stderr, /did not report the repository at .*elsewhere/);
+  // A base the node reported as no repository is no step, and one outside the home cannot be reported.
+  const cwd = path.join(root, 'wt', 'infra', 'feature');
+  assert.equal((await run('terraform apply', { facts: { paths: { [cwd]: { top: null, main: null } } } })).status, 0);
+  assert.equal((await run('cd /opt/elsewhere && terraform apply', { facts: { paths: { [cwd]: { top: null, main: null } } } })).status, 0);
   assert.equal((await run('terraform apply', { identity: { env: { KEEP_STEP_OK: '1' } } })).status, 0, 'the session\'s own bypass');
   const plain = await run('ls -la && git status');
   assert.deepEqual([plain.status, plain.stdout, plain.stderr], [0, '', '']);

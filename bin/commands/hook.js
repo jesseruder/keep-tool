@@ -1570,6 +1570,14 @@ function stepMatchForInput(input, now = Date.now()) {
     if (nodeFacts) {
       // A session on another node: the toplevel and main checkout that node read.
       const known = Object.prototype.hasOwnProperty.call(nodeFacts.paths, base) ? nodeFacts.paths[base] : null;
+      // A base under the home the node said nothing of (a step registered since its
+      // fingerprints were cached, a ninth cd target) may be the step's project: the
+      // command is taken as the step's, never waved through. Nothing outside the home
+      // can be posted, and no registered project is there.
+      if (!known && (base === home || base.startsWith(home + path.sep))) {
+        const sid = typeof input.session_id === 'string' ? input.session_id : '';
+        return { registry: hit.registry, match: hit.match, claim: null, holder: false, sid, command: String(command), cwd, top, missingFacts: base };
+      }
       if (!known || typeof known.top !== 'string' || !known.top) continue;
       paths.push(known.top);
       if (base === cwd) top = known.top;
@@ -1604,6 +1612,12 @@ function guardStepCommand(input, now = Date.now()) {
   const ctx = stepMatchForInput(input, now);
   if (!ctx) return { deny: false, reason: '' };
   const { registry, match, claim } = ctx;
+  if (ctx.missingFacts) {
+    return {
+      deny: true,
+      reason: `keep guard: \`${match.fingerprint}\` looks like step ${match.name} on ${registry.project}, and node ${process.env.KEEP_HOOK_NODE} did not report the repository at ${ctx.missingFacts}, so the guard cannot tell whether it is; run it from the project's directory, or run it again in a minute. KEEP_STEP_OK=1 bypasses the guard.`,
+    };
+  }
   if (!claim) {
     return {
       deny: true,
@@ -2050,6 +2064,10 @@ async function recordStepRun(input) {
   const ctx = stepMatchForInput(input);
   if (!ctx) return null;
   const { registry, match, claim } = ctx;
+  if (ctx.missingFacts) {
+    process.stderr.write(`keep: step ${match.name} on ${registry.project} may have run by hand, but the node did not report the repository at ${ctx.missingFacts}; not recorded — record it with keep step done if it did\n`);
+    return { recorded: false, missingFacts: ctx.missingFacts };
+  }
   if (!ctx.holder) {
     process.stderr.write(`keep: step ${match.name} on ${registry.project} ran by hand ${claim ? `under another session's claim` : 'with no claim'}; the ledger is unchanged — record it with keep step done if it succeeded\n`);
     return { recorded: false, unauthorized: true };
