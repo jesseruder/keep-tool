@@ -10075,9 +10075,13 @@ async function openSession(body, deps = {}) {
       && !fs.existsSync(path.join(os.homedir(), '.pi', 'agent', 'extensions', 'keep.ts'))) {
     throw new InjectionError(409, 'Pi Keep extension is not installed at ~/.pi/agent/extensions/keep.ts');
   }
-  // A fresh card open on another node, named by a request id: it has no session yet,
-  // so it may register late (below), and a retry with the same id finds its pane.
+  // A fresh Codex card open on another node with no opening message, named by a
+  // request id: it has no session yet, so it may register late (below), and a retry
+  // with the same id finds its pane. Only that case: a remote card open with a message,
+  // or of Claude, waits for its session as it always has, with no request id on its
+  // pane and no pane listing up front.
   const nodeCardRequest = Boolean(body.taskId) && !session && Boolean(body.requestId)
+    && agent === 'codex' && !message
     && launchNode !== nodes.daemonNode(deps.env || process.env);
   // A fresh Codex with no opening message names its session only at its first turn,
   // which may come long after the open returns: the open returns pending instead of
@@ -10420,12 +10424,11 @@ async function openSession(body, deps = {}) {
   }
   const handoff = Boolean(body.taskId) && !session;
   let releasePending = handoff && Boolean(body.requester);
-  // A card open left pending keeps the requester on the card until its session is:
-  // late adoption releases it once it links the new one (the launch record names it).
-  let releaseWithSession = false;
+  // The session that handed the card over leaves it only once the launched one is
+  // linked to it, as late adoption does for a card open left pending: an open that
+  // fails, or a link that fails, leaves the card with its requester, never ownerless.
   const release = () => {
-    if (!releasePending) return;
-    if (releaseWithSession && !launch.sessionId) return;
+    if (!releasePending || !launch.sessionId) return;
     try {
       if ((deps.releaseCardSession || keep.releaseCardSession)(body.taskId, body.requester)) {
         launch.unlinked = body.requester;
@@ -10437,9 +10440,10 @@ async function openSession(body, deps = {}) {
   };
 
   const target = { pane: launch.pane };
-  let launchPrepared = false;
   // Set while the daemon holds a record of this launch that late adoption could still use.
   let nodeLaunchRecorded = false;
+  // The error that kept that record from being written, if one did.
+  let nodeLaunchRecordFailed = null;
   // Once this open knows the session, its launch record is consumed, so late adoption
   // can never take it again. A record that cannot be deleted is reported, not fatal:
   // late adoption refuses a session that has a location record anyway.
@@ -10466,8 +10470,8 @@ async function openSession(body, deps = {}) {
           ...(body.taskId ? { card: body.taskId } : {}), ...(body.taskId && body.requester ? { requester: body.requester } : {}),
         });
         nodeLaunchRecorded = true;
-        if (body.taskId) releaseWithSession = true;
       } catch (error) {
+        nodeLaunchRecordFailed = error;
         process.stderr.write(`keep serve: could not record the Codex launch in ${launch.pane}: ${error.message}\n`);
       }
     }
@@ -10476,8 +10480,6 @@ async function openSession(body, deps = {}) {
         { root: deps.root || keep.ROOT, env: deps.env || process.env, node: launchNode });
     }
     if (deps.onLaunched) await deps.onLaunched(launch);
-    launchPrepared = true;
-    release();
     if (agent === 'pi') {
       // Pi receives the opening message as a positional prompt. Its extension
       // reports turn state; no Claude/Codex composer probing is involved.
@@ -10511,6 +10513,12 @@ async function openSession(body, deps = {}) {
           nodeLaunchRecorded = false;
           throw new InjectionError(504, `${agent} started in host pane ${launch.pane} but its session could not be registered: ${adopted.why}`);
         }
+      }
+      // A card open whose launch could not be recorded cannot be adopted later, so it
+      // is not left pending: it fails as a card open without its session always has.
+      if (!launch.sessionId && body.taskId && nodeLaunchRecordFailed) {
+        throw new InjectionError(504, `${agent} started in host pane ${launch.pane} but never registered its session id, `
+          + `and its launch could not be recorded for later: ${nodeLaunchRecordFailed.message}`);
       }
       if (!launch.sessionId) {
         launch.pendingRegistration = true;
@@ -10616,20 +10624,23 @@ async function openSession(body, deps = {}) {
       else if (error && typeof error === 'object') error.launch ||= started;
     }
     throw error;
-  } finally {
-    if (launchPrepared) release();
   }
 
+  // The launched session goes on the card first; only then does the one that handed
+  // it over leave, so a failed link leaves the card with its requester.
   if (handoff && launch.sessionId) {
     try {
       if ((deps.linkLaunchedSession || keep.linkLaunchedSession)(body.taskId,
           { id: launch.sessionId, agent, node: launchNode })) {
         launch.linked = true;
+      } else {
+        process.stderr.write(`keep serve: could not link ${sessionRef(launch.sessionId)} to ${body.taskId}: no such card\n`);
       }
     } catch (error) {
       process.stderr.write(`keep serve: could not link ${sessionRef(launch.sessionId)} to ${body.taskId}: ${error.message}\n`);
       launch.linked = false;
     }
+    if (launch.linked === true) release();
   }
   if (session && launch.sessionId) {
     try { require('./session-retirement').clear(deps.root || keep.ROOT, session.id); } catch {}

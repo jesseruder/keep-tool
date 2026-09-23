@@ -16284,14 +16284,15 @@ test('an open\'s own adoption whose pane bind fails or settles on another sessio
 
 // A card open on aws1 against a fake aws1 host that records every request. `options`
 // overrides deps; `options.host(type, params, state)` answers a request first when it
-// returns something. Resolves { opened, error, calls, linked, released, order, listed, root }.
+// returns something; `options.run(open)` drives the opens itself (its result is `ran`).
+// Resolves { opened, ran, error, calls, linked, released, order, listed, root }.
 async function remoteCardOpen(t, body, options = {}) {
   const { closeHostClient } = require('./serve');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-remote-card-open-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const project = path.join(root, 'project');
   fs.mkdirSync(project);
-  const { host, ...extra } = options;
+  const { host, run, panes, ...extra } = options;
   const state = { calls: [], meta: null, order: [], linked: [], released: [], listed: 0 };
   const client = {
     request: async (type, params = {}) => {
@@ -16310,23 +16311,26 @@ async function remoteCardOpen(t, body, options = {}) {
   };
   await closeHostClient();
   let opened = null;
+  let ran;
   let error = null;
+  const open = (given = body) => openSession({ taskId: 'card', fresh: true, node: 'aws1', requester: 'handing-session', ...given }, {
+    root, env: { PATH: process.env.PATH, HOME: root, KEEP_DIR: root, KEEP_DAEMON_NODE: 'main' },
+    placementNodes: [{ name: 'main', capabilities: [] }, { name: 'aws1', capabilities: [] }],
+    connectHost: async () => client,
+    listHostPanes: async () => { state.listed += 1; return panes ? panes(project) : []; },
+    loadTask: () => ({ id: 'card', fm: { project, sessions: [] } }),
+    waitForHostAgent: async () => true, trustProject: () => true, codexFlags: '', claudeFlags: '',
+    prepareLaunch: async (launch) => ({ argv: [launch.agent], command: launch.agent }),
+    typeOpeningMessage: async () => {},
+    linkLaunchedSession: (cardId, entry) => { state.order.push('link'); state.linked.push({ cardId, entry }); return { linked: entry.id }; },
+    releaseCardSession: (cardId, requester) => { state.order.push('release'); state.released.push({ cardId, requester }); return true; },
+    ...extra,
+  });
   try {
-    opened = await openSession({ taskId: 'card', fresh: true, node: 'aws1', requester: 'handing-session', ...body }, {
-      root, env: { PATH: process.env.PATH, HOME: root, KEEP_DIR: root, KEEP_DAEMON_NODE: 'main' },
-      placementNodes: [{ name: 'main', capabilities: [] }, { name: 'aws1', capabilities: [] }],
-      connectHost: async () => client,
-      listHostPanes: async () => { state.listed += 1; return []; },
-      loadTask: () => ({ id: 'card', fm: { project, sessions: [] } }),
-      waitForHostAgent: async () => true, trustProject: () => true, codexFlags: '', claudeFlags: '',
-      prepareLaunch: async (launch) => ({ argv: [launch.agent], command: launch.agent }),
-      typeOpeningMessage: async () => {},
-      linkLaunchedSession: (cardId, entry) => { state.order.push('link'); state.linked.push({ cardId, entry }); return { linked: entry.id }; },
-      releaseCardSession: (cardId, requester) => { state.order.push('release'); state.released.push({ cardId, requester }); return true; },
-      ...extra,
-    });
+    if (run) ran = await run(open);
+    else opened = await open();
   } catch (caught) { error = caught; } finally { await closeHostClient(); }
-  return { opened, error, root, project, ...state };
+  return { opened, ran, error, root, project, ...state };
 }
 
 test('a pending card open on aws1 whose own adoption dropped the launch record fails, and the requester keeps the card', async (t) => {
@@ -16338,6 +16342,156 @@ test('a pending card open on aws1 whose own adoption dropped the launch record f
   assert.match(run.error.message, /could not be registered: host pane p1@aws1 was bound to someone-else instead/);
   assert.deepEqual(run.released, [], 'the requester keeps the card');
   assert.deepEqual(run.linked, []);
+});
+
+test('a remote card open with an opening message, or of Claude, carries no open request id and lists no panes up front', async (t) => {
+  const codex = await remoteCardOpen(t, { agent: 'codex', requestId: 'open-m-1', message: 'Begin.' }, {
+    waitForHostSessionId: async () => 'codex-m-session',
+  });
+  assert.equal(codex.error, null, codex.error && codex.error.stack);
+  assert.equal(codex.listed, 0, 'no pane listing up front');
+  assert.equal('openRequestId' in codex.meta, false);
+  assert.equal(codex.opened.sessionId, 'codex-m-session');
+  assert.equal(codex.opened.pendingRegistration, undefined);
+  assert.deepEqual(codex.linked, [{ cardId: 'card', entry: { id: 'codex-m-session', agent: 'codex', node: 'aws1' } }]);
+  assert.equal(fs.existsSync(path.join(codex.root, '.keep', 'node-codex-launches')), false, 'no launch record');
+
+  const claude = await remoteCardOpen(t, { agent: 'claude', requestId: 'open-claude-1' }, {
+    randomUUID: () => '88888888-8888-4888-8888-888888888888',
+  });
+  assert.equal(claude.error, null, claude.error && claude.error.stack);
+  assert.equal(claude.listed, 0, 'no pane listing up front');
+  assert.equal('openRequestId' in claude.meta, false);
+  assert.equal(claude.opened.sessionId, '88888888-8888-4888-8888-888888888888');
+  assert.deepEqual(claude.order, ['link', 'release']);
+
+  // A host list that fails cannot refuse either of them.
+  const unlisted = await remoteCardOpen(t, { agent: 'claude', requestId: 'open-claude-2' }, {
+    randomUUID: () => '99999999-9999-4999-8999-999999999999', listHostPanes: async () => null,
+  });
+  assert.equal(unlisted.error, null, unlisted.error && unlisted.error.stack);
+});
+
+test('a pending card open on aws1 whose launch cannot be recorded fails instead of returning pending, and the requester keeps the card', async (t) => {
+  const stderr = process.stderr.write;
+  process.stderr.write = () => true;
+  let run;
+  try {
+    run = await remoteCardOpen(t, { agent: 'codex', requestId: 'open-unrecorded-1' }, {
+      recordNodeCodexLaunch: () => { throw new Error('disk full'); },
+      adoptNodeCodexLaunch: async () => ({ sessionId: null, why: 'no Codex rollout begun' }),
+    });
+  } finally { process.stderr.write = stderr; }
+  assert.ok(run.error, 'the open fails');
+  assert.equal(run.error.status, 504);
+  assert.match(run.error.message, /never registered its session id, and its launch could not be recorded for later: disk full/);
+  assert.equal(run.error.extra.launch.pane, 'p1@aws1', 'and says which pane is running');
+  assert.deepEqual(run.released, [], 'the requester keeps the card');
+  assert.deepEqual(run.linked, []);
+  // The same open with its record written returns pending, the requester still on the card.
+  const pending = await remoteCardOpen(t, { agent: 'codex', requestId: 'open-recorded-1' }, {
+    adoptNodeCodexLaunch: async () => ({ sessionId: null, why: 'no Codex rollout begun' }),
+  });
+  assert.equal(pending.error, null, pending.error && pending.error.stack);
+  assert.equal(pending.opened.pendingRegistration, true);
+  assert.equal(pending.meta.openRequestId, 'open-recorded-1');
+  assert.equal(pending.listed, 1);
+  assert.deepEqual(pending.released, []);
+  assert.deepEqual(pending.linked, []);
+});
+
+test('a card open links the launched session before the requester leaves, and a failed link or open keeps the requester on the card', async (t) => {
+  const ok = await remoteCardOpen(t, { agent: 'claude' }, { randomUUID: () => '11111111-2222-4333-8444-555555555555' });
+  assert.equal(ok.error, null, ok.error && ok.error.stack);
+  assert.deepEqual(ok.order, ['link', 'release']);
+  assert.equal(ok.opened.linked, true);
+  assert.equal(ok.opened.unlinked, 'handing-session');
+
+  const logged = [];
+  const stderr = process.stderr.write;
+  process.stderr.write = (line) => { logged.push(String(line)); return true; };
+  let thrown, missing, failedOpen;
+  try {
+    thrown = await remoteCardOpen(t, { agent: 'claude' }, {
+      randomUUID: () => '11111111-2222-4333-8444-666666666666',
+      linkLaunchedSession: () => { throw new Error('registry locked'); },
+    });
+    missing = await remoteCardOpen(t, { agent: 'claude' }, {
+      randomUUID: () => '11111111-2222-4333-8444-777777777777',
+      linkLaunchedSession: () => null,
+    });
+    // An open that fails once its session is known links nothing, so releases nothing.
+    failedOpen = await remoteCardOpen(t, { agent: 'claude', message: 'Begin.' }, {
+      randomUUID: () => '11111111-2222-4333-8444-888888888888',
+      typeOpeningMessage: async () => { throw new Error('the pane stopped echoing'); },
+    });
+  } finally { process.stderr.write = stderr; }
+  assert.equal(thrown.error, null);
+  assert.equal(thrown.opened.linked, false);
+  assert.deepEqual(thrown.released, [], 'the requester keeps the card');
+  assert.equal(thrown.opened.unlinked, undefined);
+  assert.ok(logged.some((line) => /could not link .* to card: registry locked/.test(line)), logged.join(''));
+  assert.equal(missing.error, null);
+  assert.deepEqual(missing.released, []);
+  assert.ok(logged.some((line) => /could not link .* to card: no such card/.test(line)), logged.join(''));
+  assert.ok(failedOpen.error, 'the open fails');
+  assert.deepEqual(failedOpen.order, [], 'neither linked nor released');
+});
+
+test('a pending card open on aws1 that learns its session itself links it once, releases the requester once, and consumes its launch record', async (t) => {
+  const run = await remoteCardOpen(t, { agent: 'codex', requestId: 'open-learned-1' }, {
+    host: (type, params, state) => (type === 'get'
+      ? { pane: { id: 'p1', alive: true, pid: 5, createdAt: 6, meta: { ...state.meta, sessionId: 'codex-learned' } } } : undefined),
+  });
+  assert.equal(run.error, null, run.error && run.error.stack);
+  assert.equal(run.opened.sessionId, 'codex-learned');
+  assert.equal(run.opened.pendingRegistration, undefined);
+  assert.deepEqual(run.linked, [{ cardId: 'card', entry: { id: 'codex-learned', agent: 'codex', node: 'aws1' } }]);
+  assert.deepEqual(run.released, [{ cardId: 'card', requester: 'handing-session' }]);
+  assert.deepEqual(run.order, ['link', 'release']);
+  assert.equal(require('./late-adoption.js').readNodeCodexLaunch(run.root, 'aws1', 'open-learned-1'), null, 'consumed');
+});
+
+test('a card open request id is its card\'s: on another card it is refused, and concurrent opens of it start one pane', async (t) => {
+  // The pane an open launched under a request id: a retry for its card finds it, and
+  // the same id on another card is refused.
+  let spawned = null;
+  const seq = await remoteCardOpen(t, { agent: 'codex', requestId: 'open-shared-1' }, {
+    adoptNodeCodexLaunch: async () => ({ sessionId: null, why: 'no Codex rollout begun' }),
+    host: (type, params) => { if (type === 'spawn') spawned = params.meta; return undefined; },
+    panes: () => (spawned ? [{ id: 'p1@aws1', node: 'aws1', alive: true, agentAlive: true, meta: spawned }] : []),
+    run: async (open) => {
+      const first = await open();
+      const retry = await open();
+      const elsewhere = await open({ agent: 'codex', requestId: 'open-shared-1', taskId: 'another-card' }).then(() => null, (error) => error);
+      return { first, retry, elsewhere };
+    },
+  });
+  assert.equal(seq.error, null, seq.error && seq.error.stack);
+  assert.equal(seq.ran.first.pendingRegistration, true);
+  assert.equal(seq.ran.retry.existing, true);
+  assert.equal(seq.ran.retry.pendingRegistration, true);
+  assert.equal(seq.ran.retry.card, 'card');
+  assert.equal(seq.ran.elsewhere.status, 409);
+  assert.match(seq.ran.elsewhere.message, /open request was already used for a different launch/);
+  assert.equal(seq.calls.filter((call) => call.type === 'spawn').length, 1);
+  // Two opens of one request at once: one spawn, both answered by it; another
+  // selection under the same id is refused while it runs.
+  const both = await remoteCardOpen(t, { agent: 'codex', requestId: 'open-concurrent-1' }, {
+    adoptNodeCodexLaunch: async () => ({ sessionId: null, why: 'no Codex rollout begun' }),
+    run: async (open) => {
+      const first = open();
+      const second = open();
+      const different = open({ agent: 'codex', requestId: 'open-concurrent-1', model: 'gpt-5.6-sol' }).then(() => null, (error) => error);
+      return { results: await Promise.all([first, second]), different: await different };
+    },
+  });
+  assert.equal(both.error, null, both.error && both.error.stack);
+  assert.equal(both.calls.filter((call) => call.type === 'spawn').length, 1);
+  assert.equal(both.ran.results[0], both.ran.results[1], 'the second joined the first');
+  assert.equal(both.ran.results[0].pendingRegistration, true);
+  assert.equal(both.ran.different.status, 409);
+  assert.match(both.ran.different.message, /already launching a different selection/);
 });
 
 test('a fresh Codex on aws1 whose launch began no rollout, or two, is not adopted and stays pending', async (t) => {

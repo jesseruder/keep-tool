@@ -428,11 +428,12 @@ function claimSession(task, session, otherTasks) {
   return changed;
 }
 
-// `keep open --fresh` hands a card to the session it launches. Two halves, because
-// they succeed at different times: the requesting session (usually the one that
-// just created the card) gives up its link as soon as the launch succeeds, so its
-// Stop hook stops steering it toward steps another session now owns; the launched
-// session takes the card's resume slot once its pane record identifies it.
+// `keep open --fresh` hands a card to the session it launches. Two halves, in this
+// order: the launched session takes the card's resume slot once the open (or late
+// adoption) knows it, and only after that link the requesting session (usually the
+// one that just created the card) gives up its own, so its Stop hook stops steering
+// it toward steps another session now owns. A link that fails leaves the requester
+// on the card rather than leaving it ownerless.
 function releaseCardSession(taskId, sessionId, scope) {
   if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sessionId)) return false;
   const { root } = scopeFor(scope);
