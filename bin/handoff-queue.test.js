@@ -39,6 +39,11 @@ function session(overrides = {}) {
     rateLimit: { type: 'fable_weekly', at: T }, title: 'a card', ...overrides };
 }
 
+// A current usage reading, in the on-disk cache's shape.
+function reading(limits) {
+  return { identity: { agent: 'claude' }, snapshot: { limits, fetchedAt: T - 60e3 } };
+}
+
 // A tick with nothing else attached: no policy, a fixed clock, and a recorded
 // handoffSession so a test can say exactly what the transfer answered.
 function tickDeps(f, handoffSession, overrides = {}) {
@@ -205,11 +210,12 @@ test('the policy enqueues only configured sources, holds an exhausted target, an
     sessions: async () => sessions, readUsageCache: () => usage,
     handoffSession: async () => { throw Object.assign(new Error('Waiting for the turn and background work to finish'), { status: 409 }); } });
 
-  // A target whose weekly window is spent is not somewhere to move work to.
-  await queue.tick(deps({ accounts: { two: { agent: 'claude', limits: [{ label: 'Fable wk', percent: 100 }] } } }));
+  // A target whose weekly window is spent is not somewhere to move work to, and with
+  // `two` also the only account in the pool, there is nowhere else either.
+  await queue.tick(deps({ accounts: { two: reading([{ label: 'week', percent: 40 }, { label: 'Fable wk', percent: 100 }]) } }));
   assert.deepEqual(queue.list(f.root), []);
 
-  await queue.tick(deps({ accounts: { two: { agent: 'claude', limits: [{ label: 'Fable wk', percent: 31 }] } } }));
+  await queue.tick(deps({ accounts: { two: reading([{ label: 'week', percent: 40 }, { label: 'Fable wk', percent: 31 }]) } }));
   assert.deepEqual(queue.list(f.root).map((entry) => entry.sessionId), ['session-a']);
   const queued = entryFor(f.root, 'session-a');
   assert.deepEqual([queued.targetAccountId, queued.force], ['two', false], 'the policy never forces');
@@ -222,11 +228,67 @@ test('the policy enqueues only configured sources, holds an exhausted target, an
   await queue.tick(deps({ accounts: { two: { agent: 'claude', limits: [{ label: 'Fable wk', percent: 31 }] } } }));
   assert.equal(entryFor(f.root, 'session-a').status, 'parked');
 
-  // No key in config.json means nothing automatic at all.
-  f.write();
+  // No key and the automation pool switched off means nothing automatic at all.
+  f.write({ automationPool: [] });
   fs.rmSync(path.join(queue.dir(f.root), 'session-a.json'));
   await queue.tick(deps(null));
   assert.deepEqual(queue.list(f.root), []);
+
+  // No key with a pool: the policy runs, and the pool names the target.
+  f.write();
+  await queue.tick(deps(null));
+  assert.deepEqual(queue.list(f.root).map((entry) => [entry.sessionId, entry.targetAccountId]), [['session-a', 'two']]);
+});
+
+test('the pool names the target when the configured one is spent, holds when every candidate is, and the override wins while usable', async () => {
+  const f = fixture();
+  const three = path.join(f.base, 'three');
+  fs.mkdirSync(three, { recursive: true });
+  const config = JSON.parse(fs.readFileSync(f.config, 'utf8'));
+  config.accounts.push({ id: 'three', label: 'Three', agent: 'claude', configDir: three });
+  config.rateLimitHandoff = { one: 'two' };
+  fs.writeFileSync(f.config, JSON.stringify(config));
+  const sessions = [session({ id: 'session-a', model: 'claude-fable-5-1' })];
+  const logs = [];
+  const run = (usage) => queue.tick({ root: f.root, env: f.env, now: () => T, log: (line) => logs.push(line),
+    sessions: async () => sessions, readUsageCache: () => usage,
+    handoffSession: async () => { throw Object.assign(new Error('Waiting for the turn and background work to finish'), { status: 409 }); } });
+  const clear = () => { for (const entry of queue.list(f.root)) fs.rmSync(path.join(queue.dir(f.root), `${entry.sessionId}.json`)); };
+
+  // The override's target is spent for Fable: the pool's other account takes it.
+  await run({ accounts: {
+    two: reading([{ label: 'week', percent: 30 }, { label: 'Fable wk', percent: 100 }]),
+    three: reading([{ label: 'week', percent: 60 }, { label: 'Fable wk', percent: 10 }]),
+  } });
+  assert.deepEqual(queue.list(f.root).map((entry) => entry.targetAccountId), ['three']);
+  clear();
+
+  // Every candidate spent: held, and said so.
+  await run({ accounts: {
+    two: reading([{ label: 'week', percent: 100 }]),
+    three: reading([{ label: 'week', percent: 40 }, { label: 'Fable wk', percent: 100 }]),
+  } });
+  assert.deepEqual(queue.list(f.root), []);
+  assert.ok(logs.some((line) => /^policy held 1 session\(s\)/.test(line)));
+
+  // The override is usable: it wins, even though the pool has an emptier account.
+  await run({ accounts: {
+    two: reading([{ label: 'week', percent: 80 }, { label: 'Fable wk', percent: 50 }]),
+    three: reading([{ label: 'week', percent: 5 }, { label: 'Fable wk', percent: 5 }]),
+  } });
+  assert.deepEqual(queue.list(f.root).map((entry) => entry.targetAccountId), ['two']);
+  clear();
+
+  // With no override, the pool's best account (never the source, never the default).
+  config.rateLimitHandoff = undefined;
+  fs.writeFileSync(f.config, JSON.stringify(config));
+  sessions[0] = session({ id: 'session-a', accountId: 'two', model: 'claude-fable-5-1' });
+  await run({ accounts: {
+    one: reading([{ label: 'week', percent: 0 }]),
+    two: reading([{ label: 'week', percent: 100 }]),
+    three: reading([{ label: 'week', percent: 50 }]),
+  } });
+  assert.deepEqual(queue.list(f.root).map((entry) => [entry.sourceAccountId, entry.targetAccountId]), [['two', 'three']]);
 });
 
 test('a rate-limited session on another node is never queued for a transfer', async () => {
@@ -269,14 +331,19 @@ test('an unusable rateLimitHandoff key is reported and ignored, never guessed at
   assert.deepEqual(queue.policyTargets(f.env), { one: 'two' });
 });
 
-test('the weekly-window check reads only a weekly bucket, and unknown usage is never exhausted', () => {
-  assert.equal(queue.weeklyExhausted(null, 'two'), false);
-  assert.equal(queue.weeklyExhausted({ accounts: {} }, 'two'), false);
-  assert.equal(queue.weeklyExhausted({ accounts: { two: { limits: [] } } }, 'two'), false);
-  assert.equal(queue.weeklyExhausted({ accounts: { two: { limits: [{ label: '5h', percent: 100 }] } } }, 'two'), false);
-  assert.equal(queue.weeklyExhausted({ accounts: { two: { limits: [{ label: 'Fable wk', percent: 99.4 }] } } }, 'two'), false);
-  assert.equal(queue.weeklyExhausted({ accounts: { two: { limits: [{ label: 'Fable wk', percent: 100 }] } } }, 'two'), true);
-  assert.equal(queue.weeklyExhausted({ accounts: { two: { snapshot: { limits: [{ label: 'Opus wk', percent: 100 }] } } } }, 'two'), true);
+test('the target check reads only weekly windows, and unknown or stale usage is never exhausted', () => {
+  const spent = (limits, fetchedAt = T - 60e3) => ({ accounts: { two: { identity: { agent: 'claude' }, snapshot: { limits, fetchedAt } } } });
+  assert.equal(queue.targetExhausted(null, 'two', undefined, T), false);
+  assert.equal(queue.targetExhausted({ accounts: {} }, 'two', undefined, T), false);
+  assert.equal(queue.targetExhausted(spent([]), 'two', undefined, T), false);
+  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 10 }, { label: '5h', percent: 100 }]), 'two', undefined, T), false);
+  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 10 }, { label: 'Fable wk', percent: 99.4 }]), 'two', undefined, T), false);
+  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 10 }, { label: 'Fable wk', percent: 100 }]), 'two', undefined, T), true);
+  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 100 }]), 'two', 'claude-opus-5', T), true);
+  // A Fable bucket does not cap an Opus session.
+  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 10 }, { label: 'Fable wk', percent: 100 }]), 'two', 'claude-opus-5', T), false);
+  // Stale is unknown.
+  assert.equal(queue.targetExhausted(spent([{ label: 'week', percent: 100 }], T - 31 * 60e3), 'two', undefined, T), false);
 });
 
 test('the batch selects rate-limited sessions on the named source and reports every skip', () => {
@@ -676,6 +743,8 @@ test('the batch and cancel routes match through the real ladder and pass their r
 
 test('a tick with no policy and nothing due builds no session state at all', async () => {
   const f = fixture();
+  // No override and the automation pool switched off.
+  f.write({ automationPool: [] });
   let loads = 0;
   let policyLoads = 0;
   const result = await queue.tick({ root: f.root, env: f.env, now: () => T, log: () => {},

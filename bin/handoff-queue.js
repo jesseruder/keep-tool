@@ -22,6 +22,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const accounts = require('./accounts');
+const accountBudget = require('./account-budget');
 const nodes = require('./nodes.js');
 const { classifyRefusal } = require('./account-handoff');
 
@@ -192,18 +193,19 @@ function accountOf(session) {
   return session?.accountId || session?.account || null;
 }
 
-// The weekly window the target would be moved into. An unknown or missing
-// snapshot is never "exhausted": guessing wrong would silently stop the policy.
-function weeklyExhausted(usage, accountId) {
-  const entry = usage && usage.accounts && usage.accounts[accountId];
-  const limits = Array.isArray(entry?.limits) ? entry.limits
-    : Array.isArray(entry?.snapshot?.limits) ? entry.snapshot.limits : null;
-  if (!limits || !limits.length) return false;
-  return limits.some((limit) => / wk$/i.test(String(limit?.label || '').trim()) && Number(limit?.percent) >= 100);
+// Whether the account a session would be moved onto has no room for its model: the
+// shared week or the model's own weekly bucket spent (with no model known, any
+// model bucket). bin/account-budget.js reads it: an unknown or stale snapshot is
+// never "exhausted", because guessing wrong would silently stop the policy.
+function targetExhausted(usage, accountId, model, now) {
+  const [row] = accountBudget.rank([accountId], usage, { model, now });
+  return Boolean(row && row.exhausted);
 }
 
 // config.json's `rateLimitHandoff`: { "<sourceAccountId>": "<targetAccountId>" }.
-// No key means nothing automatic ever happens, which is how this ships.
+// An optional override: a source listed here moves to its named target while that
+// target has room. Every other rate-limited session — and a listed one whose target
+// is spent — moves to the automation pool's best account (bin/account-budget.js).
 function policyTargets(env = process.env) {
   const raw = accounts.rawConfig(env).rateLimitHandoff;
   if (raw == null) return {};
@@ -223,20 +225,26 @@ function policyTargets(env = process.env) {
   return map;
 }
 
-// The policy map is read before any session is: with no key configured, which is
-// how this ships, the scan costs the daemon nothing.
+// The override map and the pool are read before any session is: with neither — no
+// rateLimitHandoff key and an empty pool (one Claude account, or automationPool: [])
+// — the scan costs the daemon nothing and nothing is ever queued automatically.
 async function policyEnqueue(root, loadSessions, now, deps, log) {
+  const env = deps.env || process.env;
   let map;
-  try { map = deps.policy ? deps.policy(deps.env || process.env) : policyTargets(deps.env || process.env); }
+  try { map = deps.policy ? deps.policy(env) : policyTargets(env); }
   catch (error) { log(`policy ignored: ${error.message}`); return { enqueued: 0, exhausted: 0 }; }
-  if (!Object.keys(map).length) return { enqueued: 0, exhausted: 0 };
+  let poolIds = [];
+  try { poolIds = (deps.pool || accountBudget.pool)(env).map((account) => account.id); }
+  catch (error) { log(`automation pool ignored: ${error.message}`); poolIds = []; }
+  if (!Object.keys(map).length && !poolIds.length) return { enqueued: 0, exhausted: 0 };
   const sessions = await loadSessions();
   let usage;
   const summary = { enqueued: 0, exhausted: 0 };
   for (const session of sessions) {
     const sourceAccountId = accountOf(session);
-    const targetAccountId = sourceAccountId && map[sourceAccountId];
-    if (!targetAccountId || session.kind !== 'claude' || !session.rateLimit || !session.pane) continue;
+    if (!sourceAccountId || session.kind !== 'claude' || !session.rateLimit || !session.pane) continue;
+    // Neither an override for this source nor a pool to choose from.
+    if (!map[sourceAccountId] && !poolIds.length) continue;
     // A transfer stops an agent and proves it from a process table; a session on
     // another machine answers none of that here, and the retry this entry promises
     // could only ever be refused. Never enqueued at all.
@@ -246,7 +254,19 @@ async function policyEnqueue(root, loadSessions, now, deps, log) {
     const current = readOne(root, session.id);
     if (current && ['queued', 'parked', 'cancelled'].includes(current.status)) continue;
     if (usage === undefined) usage = deps.readUsageCache ? deps.readUsageCache() : null;
-    if (weeklyExhausted(usage, targetAccountId)) {
+    const model = session.model || undefined;
+    let targetAccountId = map[sourceAccountId] || null;
+    if (targetAccountId && targetExhausted(usage, targetAccountId, model, now)) targetAccountId = null;
+    if (!targetAccountId && poolIds.length) {
+      let choice = null;
+      try {
+        choice = (deps.selectAccount || accountBudget.select)({ purpose: 'handoff', model, env, usage, now,
+          exclude: [sourceAccountId], fallback: false });
+      } catch (error) { log(`automation pool ignored: ${error.message}`); }
+      if (choice && !choice.deferred && choice.account && choice.account !== sourceAccountId) targetAccountId = choice.account;
+    }
+    // Nowhere with room to move it: held, and asked again next tick.
+    if (!targetAccountId) {
       summary.exhausted += 1;
       continue;
     }
@@ -254,7 +274,7 @@ async function policyEnqueue(root, loadSessions, now, deps, log) {
       rateLimitAt: session.rateLimit?.at ?? null }, { now, log });
     summary.enqueued += 1;
   }
-  if (summary.exhausted) log(`policy held ${summary.exhausted} session(s): the target's weekly window is spent`);
+  if (summary.exhausted) log(`policy held ${summary.exhausted} session(s): the target's weekly window is spent, and no pool account has room`);
   return summary;
 }
 
@@ -507,6 +527,6 @@ function batch(deps = {}) {
 
 module.exports = {
   BACKOFF_BASE_MS, BACKOFF_MAX_MS, DEFAULT_MAX_MIN, MOVED_VISIBLE_MS, STATUSES,
-  dir, readOne, list, visible, enqueue, cancel, tick, batch, backoffMs, maxMinutes, policyTargets, weeklyExhausted,
+  dir, readOne, list, visible, enqueue, cancel, tick, batch, backoffMs, maxMinutes, policyTargets, targetExhausted,
   transferPastStop,
 };
