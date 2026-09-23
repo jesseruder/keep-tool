@@ -809,17 +809,34 @@ async function carriedCodexHook(action, input, where, deps = {}) {
     return;
   }
   let out = null;
+  // What Codex hears: the daemon's JSON when it delivered, else a start's pane-only
+  // notice, else nothing (`{}`).
+  const answerOf = (outcome) => {
+    if (outcome && outcome.delivered) {
+      const value = outcome.value || {};
+      if (value.stderr) process.stderr.write(String(value.stderr));
+      const answer = codexJsonAnswer(value);
+      // The daemon refused the question (nobody reads this session): its deny is the answer.
+      if (answer && action === 'question' && value.status === 2) process.exitCode = 2;
+      return answer;
+    }
+    if (action === 'start') {
+      return JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart',
+        additionalContext: paneOnlyNotice(where, { url: where.url, agent: 'codex' }) } });
+    }
+    return null;
+  };
   try {
-    const run = () => (valid ? client.runHook(event, input, where, deps) : Promise.resolve(null))
+    const run = (extra = {}) => (valid ? client.runHook(event, input, where, { ...deps, ...extra }) : Promise.resolve(null))
       .catch((error) => ({ delivered: false, why: error.message }));
-    let outcome;
     if (action === 'start') {
       // The daemon first, as for Claude, so its record knows this session claimed the
       // pane; the bind here then finds it bound, or does it when the daemon could not.
+      // The deadline runs from when Codex started this process, not from here.
       const now = deps.now || Date.now;
-      const startedAt = now();
+      const startedAt = Number.isFinite(deps.hookStartedAt) ? deps.hookStartedAt : Date.now() - process.uptime() * 1000;
       const total = deps.codexStartDeadlineMs == null ? CODEX_START_DEADLINE_MS : deps.codexStartDeadlineMs;
-      outcome = await run();
+      out = answerOf(await run({ startedAt }));
       if (valid) {
         const bindMs = Math.max(CODEX_START_BIND_MIN_MS, startedAt + total - now());
         let timer;
@@ -830,28 +847,19 @@ async function carriedCodexHook(action, input, where, deps = {}) {
         ]);
         clearTimeout(timer);
         if (late) {
-          try { require('../hook-client.js').logLine(deps.env || process.env, `codex start for session ${input.session_id}: the pane bind was still running at the ${total} ms deadline; answered {}`); } catch {}
+          try { require('../hook-client.js').logLine(deps.env || process.env, `codex start for session ${input.session_id}: the pane bind was still running at the ${total} ms deadline; answered without it`); } catch {}
           // Whatever the bind is still waiting on (a host, ps, lsof) must not keep
           // Codex waiting past its timeout: answer, and exit once the answer is out.
           const exit = deps.exit || process.exit;
-          process.stdout.write('{}\n', () => exit(0));
+          process.stdout.write(`${out || '{}'}\n`, () => exit(0));
           return;
         }
       }
     } else if (action === 'end') {
-      [outcome] = await Promise.all([run(), valid ? releaseRemotePane(input, deps).catch(() => null) : null]);
+      const [outcome] = await Promise.all([run(), valid ? releaseRemotePane(input, deps).catch(() => null) : null]);
+      out = answerOf(outcome);
     } else {
-      outcome = await run();
-    }
-    if (outcome && outcome.delivered) {
-      const value = outcome.value || {};
-      if (value.stderr) process.stderr.write(String(value.stderr));
-      out = codexJsonAnswer(value);
-      // The daemon refused the question (nobody reads this session): its deny is the answer.
-      if (out && action === 'question' && value.status === 2) process.exitCode = 2;
-    } else if (action === 'start') {
-      out = JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart',
-        additionalContext: paneOnlyNotice(where, { url: where.url, agent: 'codex' }) } });
+      out = answerOf(await run());
     }
   } catch { out = null; }
   console.log(out || '{}');

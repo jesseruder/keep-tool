@@ -750,18 +750,29 @@ test('a Codex start on a node answers inside its 3 s timeout however slow the da
     };
     const began = Date.now();
     try {
-      await hook.carriedCodexHook('start', input, where, { env, exit: (code) => { exited = code; }, ...deps });
+      await hook.carriedCodexHook('start', input, where, { env, hookStartedAt: began, exit: (code) => { exited = code; }, ...deps });
     } finally { process.stdout.write = write; }
     return { written: written.join(''), exited, elapsed: Date.now() - began };
   };
 
-  // A stalled host: the bind is cut at the deadline, `{}` is the answer, and the hook exits.
+  // A stalled host: the bind is cut at the deadline, the answer it had (here the
+  // notice for a daemon that did not answer) is printed, and the hook exits.
   const stalled = [];
   const cut = await run({ hookClient: slowDaemon(2000), connectHost: host(Infinity, stalled) });
-  assert.equal(cut.written, '{}\n');
+  assert.match(JSON.parse(cut.written).hookSpecificOutput.additionalContext, /the daemon did not answer this start/);
+  assert.equal(cut.written.split('\n').filter(Boolean).length, 1, 'one JSON value');
   assert.equal(cut.exited, 0);
   assert.ok(cut.elapsed >= 2500 && cut.elapsed < 2900, `answered at the deadline (${cut.elapsed} ms)`);
-  assert.match(fs.readFileSync(path.join(home, '.keep-node', 'hook.log'), 'utf8'), /codex start for session codex-aws1: the pane bind was still running at the 2600 ms deadline/);
+  assert.match(fs.readFileSync(path.join(home, '.keep-node', 'hook.log'), 'utf8'), /codex start for session codex-aws1: the pane bind was still running at the 2600 ms deadline; answered without it/);
+
+  // The daemon delivered its SessionStart context, then the bind stalled: that context
+  // is what Codex hears, not `{}`.
+  const context = '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"[keep] You are session #7."}}';
+  const delivered = { runHook: async () => { await delay(200); return { delivered: true, value: { status: 0, stdout: `${context}\n`, stderr: '' } }; } };
+  const kept = await run({ hookClient: delivered, connectHost: host(Infinity, []) });
+  assert.equal(kept.written, `${context}\n`);
+  assert.equal(kept.exited, 0);
+  assert.ok(kept.elapsed >= 2500 && kept.elapsed < 2900, `answered at the deadline (${kept.elapsed} ms)`);
 
   // A daemon that used more than its share: the bind still gets 600 ms, one attempt, and binds.
   const late = [];
