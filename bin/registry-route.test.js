@@ -787,3 +787,27 @@ test('a launch record adopts one session, once', async (t) => {
   assert.equal((await svc.handle(AWS1, lateBody(root))).status, 200);
   assert.equal(require('./late-adoption.js').readNodeCodexLaunch(root, 'aws1', 'req-1', { now: () => 1_800_000_000_000 }), null, 'consumed');
 });
+
+test('late adoption gives up on a node host that never answers its hello within about two seconds, well inside a start\'s deadline', async (t) => {
+  const net = require('node:net');
+  const sockets = [];
+  const silent = net.createServer((socket) => { sockets.push(socket); });
+  await new Promise((resolve) => silent.listen(0, '127.0.0.1', resolve));
+  t.after(() => { for (const socket of sockets) socket.destroy(); return new Promise((resolve) => silent.close(resolve)); });
+  const root = tempDir(t);
+  const tokenFile = path.join(root, 'aws1.token');
+  fs.writeFileSync(tokenFile, 'a'.repeat(64) + '\n', { mode: 0o600 });
+  const configFile = path.join(root, 'config.json');
+  fs.writeFileSync(configFile, `${JSON.stringify({ version: 1, daemonNode: 'main',
+    nodes: { main: {}, aws1: { transport: 'tcp', address: `127.0.0.1:${silent.address().port}`, tokenFile } } })}\n`);
+  const adoption = require('./late-adoption.js').createLateAdoption({
+    root, env: { PATH: '/usr/bin:/bin', HOME: root, KEEP_CONFIG: configFile }, daemonNode: () => 'main',
+  });
+  const began = Date.now();
+  const result = await adoption.adopt('aws1', 'codex-late', 'codex', {});
+  const elapsed = Date.now() - began;
+  assert.equal(sockets.length, 1, 'it did connect');
+  assert.equal(result.adopted, false);
+  assert.match(result.why, /could not be asked/);
+  assert.ok(elapsed < 2000, `bounded by the hello timeout (${elapsed} ms)`);
+});

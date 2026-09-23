@@ -34,6 +34,9 @@ const path = require('node:path');
 const NEGATIVE_TTL_MS = 5e3;
 const SHORT_TTL_MS = 500;
 const CONNECT_TIMEOUT_MS = 1000;
+// Over TCP the host's hello frame has its own wait (8 s by default): bounded here too,
+// so a lookup ends well inside a node's 2.6 s Codex start deadline.
+const HELLO_TIMEOUT_MS = 1000;
 const REQUEST_TIMEOUT_MS = 1500;
 const CACHE_MAX = 1024;
 const SESSION_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -94,7 +97,7 @@ function createLateAdoption(options = {}) {
   const accounts = options.accounts || require('./accounts.js');
   const location = options.location || ((sessionId) => accounts.sessionLocation(sessionId, { root, env }));
   const connect = options.hostConnect
-    || ((node, timeoutMs) => require('./hostclient.js').connect({ node, env, timeoutMs }));
+    || ((node, timeoutMs) => require('./hostclient.js').connect({ node, env, timeoutMs, helloTimeoutMs: HELLO_TIMEOUT_MS }));
   const log = options.log || (() => {});
   // Whether this machine knows the session itself: a Claude transcript found by
   // discovery, or a rollout under one of its Codex accounts. A failed look says yes.
