@@ -30,6 +30,11 @@ const HOST_LOG_MAX_BYTES = 5 * 1024 * 1024;
 // frames, so this is not a second protocol: it is the number a caller checks before
 // it trusts a descriptor it reached over the network.
 const PROTOCOL_VERSION = 1;
+// The shapes of the verbs a caller checks for in the hello before it asks. Named once,
+// because the `stats` verb reports them too.
+const TRANSCRIPT_VERSION = 4;
+const ARTIFACTS_VERSION = 2;
+const STATS_VERSION = 1;
 const HELLO_FAILURE_LIMIT = 10;
 const HELLO_FAILURE_WINDOW_MS = 60e3;
 const HELLO_FAILURE_ADDRESSES = 256;
@@ -1138,12 +1143,15 @@ function createHost(options = {}) {
           // 2 adds `find`, the Codex rollouts written since a launch; 3 adds
           // `pi-event`, the Keep Pi extension's phase file for a session here; 4
           // adds `meta`, a Codex rollout's session_meta and last turn's model.
-          transcript: 4,
+          transcript: TRANSCRIPT_VERSION,
           // artifacts: this host answers the `artifacts` verb (bin/session-artifacts.js),
           // which lists, reads, stages and publishes a session's files under one of
           // this node's own accounts, so a session can be moved onto or off it. 2 adds
           // `kind: 'codex'`: a Codex session's root and child-thread rollouts.
-          artifacts: 2,
+          artifacts: ARTIFACTS_VERSION,
+          // stats: this host answers the `stats` verb (bin/node-stats.js): memory, swap,
+          // CPU, disk, uptime, pane and agent counts, its versions and its clock offset.
+          stats: STATS_VERSION,
           // spawnReceipts: a spawn naming an operationId is journalled, so a caller
           // whose reply was lost may ask again instead of starting a second process.
           spawnReceipts: true,
@@ -1603,6 +1611,37 @@ function createHost(options = {}) {
     }
   };
 
+  // A machine's stats (bin/node-stats.js). The CPU sample waits a quarter of a second
+  // on a timer, so like a transcript read it runs beside the connection's queue and
+  // never holds a keystroke behind it. Bounded, since each one runs a sample.
+  let statsInFlight = 0;
+  const STATS_IN_FLIGHT_MAX = 4;
+  const runStats = (connection, socket, request) => {
+    const respond = (response) => {
+      if (socket.destroyed) return;
+      connection.send(encodeFrame(response));
+    };
+    if (statsInFlight >= STATS_IN_FLIGHT_MAX) {
+      respond({ ok: false, id: request.id, error: 'too many stats requests in flight', code: 'stats-busy' });
+      return;
+    }
+    statsInFlight += 1;
+    Promise.resolve()
+      .then(() => require('./node-stats.js').readStats({
+        now: request.now,
+        panes: [...panes.values()].filter((pane) => pane.alive).length,
+        hostVersion: {
+          protocol: PROTOCOL_VERSION, transcript: TRANSCRIPT_VERSION, artifacts: ARTIFACTS_VERSION,
+          stats: STATS_VERSION, boot: (options.boot && options.boot.version) || null,
+        },
+      }))
+      .then((stats) => respond({ ok: true, id: request.id, stats }), (error) => {
+        respond({ ok: false, id: request.id, error: error.message });
+      })
+      .catch(() => {})
+      .finally(() => { statsInFlight -= 1; });
+  };
+
   let transcriptsInFlight = 0;
   const TRANSCRIPTS_IN_FLIGHT_MAX = 32;
   const runTranscript = (connection, socket, request) => {
@@ -1694,6 +1733,10 @@ function createHost(options = {}) {
       // per host, since each one holds a descriptor and a timer.
       if (request && typeof request === 'object' && request.type === 'transcript') {
         runTranscript(connection, socket, request);
+        return;
+      }
+      if (request && typeof request === 'object' && request.type === 'stats') {
+        runStats(connection, socket, request);
         return;
       }
       connection.queue = connection.queue.then(async () => {
@@ -2124,6 +2167,7 @@ module.exports = {
   DEFAULT_SNAPSHOT_SCROLLBACK,
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
+  STATS_VERSION,
   canonicalIp,
   linkLocalIp,
   unmapIpv4,

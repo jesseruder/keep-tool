@@ -3100,3 +3100,32 @@ test('a node finds the Codex rollouts its account began since a launch, in a dir
     fs.rmSync(elsewhere, { recursive: true, force: true });
   }
 });
+
+test('a node answers its stats beside the queue, with the caller\'s clock offset and its live panes', async () => {
+  await withHost({}, async ({ client }) => {
+    const hello = await client.request('hello');
+    assert.equal(hello.stats, 1, 'the hello says the verb is here');
+    const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 30'] });
+    const exited = (await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'exit 0'] })).pane;
+    await waitFor(async () => !(await client.request('get', { pane: exited.id })).pane.alive, 'the second pane to exit');
+    const now = Date.now() - 60_000;
+    // A stats read samples the CPU for a quarter of a second; a screen read asked at
+    // the same time on the same connection is not held behind it.
+    const pending = client.request('stats', { now });
+    const screenAt = Date.now();
+    await client.request('screen', { pane: pane.id });
+    const screenMs = Date.now() - screenAt;
+    const { stats } = await pending;
+    assert.ok(screenMs < 200, `a screen read waited ${screenMs}ms behind stats`);
+    assert.equal(stats.panes, 1, 'only live panes are counted');
+    assert.ok(stats.clockOffsetMs >= 60_000 && stats.clockOffsetMs < 65_000, `offset ${stats.clockOffsetMs}`);
+    assert.equal(stats.hostVersion.protocol, hello.protocol);
+    assert.equal(stats.hostVersion.transcript, hello.transcript);
+    assert.equal(stats.hostVersion.artifacts, hello.artifacts);
+    assert.equal(stats.hostVersion.stats, 1);
+    assert.ok(stats.memTotal > 0 && stats.cpuCount >= 1);
+    assert.ok(stats.cpuBusyPct >= 0 && stats.cpuBusyPct <= 100);
+    const noClock = (await client.request('stats', {})).stats;
+    assert.equal(noClock.clockOffsetMs, undefined, 'no caller clock, no offset');
+  });
+});
