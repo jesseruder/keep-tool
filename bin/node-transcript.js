@@ -27,8 +27,9 @@
 //   meta  -> { ...stat, meta, model }: Codex only, naming a session: its rollout's
 //            session_meta line (id, cwd, model, originator, parent thread, child,
 //            headless) from at most its first 256 KiB, and the model of the last
-//            turn_context in its last 256 KiB (what it last ran on), or null. How a
-//            move learns what a Codex session on a node runs on.
+//            turn_context (what it last ran on), found reading back from the end
+//            256 KiB at a time, at most 32 MiB, or null. How a move learns what a
+//            Codex session on a node runs on.
 //   pi-event -> { event }: Pi only, naming a session and no account: the phase file the
 //            Keep Pi extension (integrations/pi/keep.ts) writes on this node,
 //            <KEEP_DIR || ~/keep>/.keep/pi-events/<id>.json, parsed, or null when there
@@ -203,26 +204,45 @@ const shortText = (value, max = 256) => (typeof value === 'string' && value.leng
 
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:[\]/-]{0,127}$/;
 
-// The model of the last turn_context in the rollout's last 256 KiB, or null: what a
-// resumed Codex conversation last ran on. A partial first line is skipped.
-function lastTurnModel(fd, size) {
-  const from = Math.max(0, size - TAIL_MAX_BYTES);
-  const buffer = Buffer.alloc(size - from);
-  let got = 0;
-  while (got < buffer.length) {
-    const n = fs.readSync(fd, buffer, got, buffer.length - got, from + got);
-    if (!n) break;
-    got += n;
-  }
-  const lines = buffer.subarray(0, got).toString('utf8').split('\n');
-  if (from > 0) lines.shift();
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (!lines[index].includes('"turn_context"')) continue;
-    let record;
-    try { record = JSON.parse(lines[index]); } catch { continue; }
-    if (record && record.type === 'turn_context' && record.payload && typeof record.payload.model === 'string') {
-      return MODEL_RE.test(record.payload.model) ? record.payload.model : null;
+// The model of the last turn_context in the rollout, or null: what a resumed Codex
+// conversation last ran on. Read back from the end 256 KiB at a time, whole lines
+// only (a line cut by a chunk's start is finished by the next chunk back), stopping
+// at the first turn_context found, and never more than `maxBytes` in all: a long
+// turn of tool output can put the last turn_context megabytes before the end.
+const TURN_SCAN_MAX_BYTES = REQUEST_MAX_READ_BYTES;
+
+function lastTurnModel(fd, size, maxBytes = TURN_SCAN_MAX_BYTES) {
+  let position = size;
+  let carry = Buffer.alloc(0);
+  let spent = 0;
+  while (position > 0 && spent < maxBytes) {
+    const from = Math.max(0, position - TAIL_MAX_BYTES, size - maxBytes);
+    const chunk = Buffer.alloc(position - from);
+    let got = 0;
+    while (got < chunk.length) {
+      const n = fs.readSync(fd, chunk, got, chunk.length - got, from + got);
+      if (!n) break;
+      got += n;
     }
+    if (got < chunk.length) return null;
+    spent += chunk.length;
+    let body = Buffer.concat([chunk, carry]);
+    if (from > 0) {
+      const newline = body.indexOf(10);
+      if (newline === -1) { carry = body; position = from; continue; }
+      carry = body.subarray(0, newline);
+      body = body.subarray(newline + 1);
+    }
+    const lines = body.toString('utf8').split('\n');
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      if (!lines[index].includes('"turn_context"')) continue;
+      let record;
+      try { record = JSON.parse(lines[index]); } catch { continue; }
+      if (record && record.type === 'turn_context' && record.payload && typeof record.payload.model === 'string') {
+        return MODEL_RE.test(record.payload.model) ? record.payload.model : null;
+      }
+    }
+    position = from;
   }
   return null;
 }
@@ -410,6 +430,6 @@ async function handle(params, options = {}) {
 }
 
 module.exports = {
-  handle, open, find, piEvent, rolloutMeta, validate, generationOf, nodeAccount, FIND_MAX,
+  handle, open, find, piEvent, rolloutMeta, lastTurnModel, validate, generationOf, nodeAccount, FIND_MAX,
   TAIL_MAX_BYTES, MATCH_MAX_WAIT_MS, MATCH_POLL_MS, REQUEST_MAX_READ_BYTES,
 };

@@ -113,6 +113,30 @@ test('meta answers a Codex rollout\'s session_meta and its last turn\'s model', 
   assert.equal((await handle({ op: 'meta', kind: 'codex', sessionId: ID, account: { id: 'codex-a', configDir: f.configDir } }, f.options)).model, null);
 });
 
+test('meta finds the last turn_context however far back a long turn put it, within its bound', async (t) => {
+  const f = codexFixture(t);
+  const file = path.join(f.day, `rollout-2026-09-23T10-00-00-${ID}.jsonl`);
+  // The only turn_context sits 600 KiB before the end, behind lines of tool output, one
+  // of them longer than a chunk, so chunk edges cut lines.
+  const output = (bytes) => line({ type: 'response_item', payload: { type: 'function_call_output', output: 'x'.repeat(bytes) } });
+  fs.writeFileSync(file, line({ type: 'session_meta', payload: { id: ID, cwd: '/work/project' } })
+    + line({ type: 'turn_context', payload: { model: 'gpt-old' } }) + output(4000)
+    + line({ type: 'turn_context', payload: { model: 'gpt-far-back' } })
+    + output(300 * 1024) + output(100 * 1024) + output(200 * 1024 - 7));
+  const size = fs.statSync(file).size;
+  assert.ok(size - fs.readFileSync(file, 'utf8').lastIndexOf('"turn_context"') > 600 * 1024);
+  const answer = await handle({ op: 'meta', kind: 'codex', sessionId: ID, account: { id: 'codex-a', configDir: f.configDir } }, f.options);
+  assert.equal(answer.model, 'gpt-far-back');
+  assert.equal(require('./node-transcript.js').rolloutMeta(f.configDir, ID).model, 'gpt-far-back');
+  // Bounded: a read that may not go back that far says it did not find one.
+  const fd = fs.openSync(file, 'r');
+  try {
+    const { lastTurnModel } = require('./node-transcript.js');
+    assert.equal(lastTurnModel(fd, size, 512 * 1024), null);
+    assert.equal(lastTurnModel(fd, size, 1024 * 1024), 'gpt-far-back');
+  } finally { fs.closeSync(fd); }
+});
+
 test('meta says transcript-missing for a session with no rollout, and refuses a malformed request', async (t) => {
   const f = codexFixture(t);
   const ask = (extra) => handle({ op: 'meta', kind: 'codex', sessionId: ID, account: { id: 'codex-a', configDir: f.configDir }, ...extra }, f.options);
