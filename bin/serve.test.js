@@ -16793,6 +16793,7 @@ test('a fresh Pi open on aws1 asks aws1 whether it can run Pi, launches there an
   assert.equal(check.params.check, true);
   assert.equal(check.params.agent, 'pi');
   assert.equal(check.params.remote, true, 'aws1 is told it answers for itself');
+  assert.equal(check.params.piKeepCli, path.join(__dirname, 'keep.js'), 'aws1 is asked for the CLI the extension will run');
   const spawn = run.calls.find((call) => call.type === 'spawn');
   assert.ok(run.calls.indexOf(check) < run.calls.indexOf(spawn), 'asked before the pane exists');
   assert.equal(spawn.params.meta.agent, 'pi');
@@ -16812,6 +16813,11 @@ test('a Pi open on aws1 is refused before any pane when aws1 has no Pi extension
   assert.equal(missing.error && missing.error.status, 409);
   assert.equal(missing.error.message, 'Pi Keep extension is not installed on aws1');
   assert.equal(missing.calls.some((call) => call.type === 'spawn'), false);
+
+  const noCli = await remotePiOpen(t, { check: { checked: true, account: 'pi/default', sharedSetup: false, piExtension: true, piKeepCli: false } });
+  assert.equal(noCli.error && noCli.error.status, 409);
+  assert.equal(noCli.error.message, `the Keep CLI the Pi extension runs (${path.join(__dirname, 'keep.js')}) is not on aws1; install keep-tool at that path there`);
+  assert.equal(noCli.calls.some((call) => call.type === 'spawn'), false);
 
   const old = await remotePiOpen(t, { hello: { bootId: 'aws1-boot', spawnReceipts: true, transcript: 2 } });
   assert.equal(old.error && old.error.status, 409);

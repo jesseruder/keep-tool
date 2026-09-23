@@ -9485,6 +9485,10 @@ async function waitForHostSessionId(pane, deps = {}) {
 // registry's own .keep/pi-events on the daemon node, exactly as always, and the
 // node's through its `transcript` verb (op pi-event) anywhere else. The node read
 // throws when the node cannot answer; piEventFor takes that as no signal.
+// The Keep CLI a Pi pane's extension runs its hooks with: this checkout's, which the
+// shared home puts at the same path on every node.
+const PI_KEEP_CLI = path.join(__dirname, 'keep.js');
+
 async function readNodePiEvent(sessionId, node, deps = {}) {
   const answer = await (deps.hostRequest || hostRequest)('transcript',
     { op: 'pi-event', kind: 'pi', sessionId }, { ...deps, node });
@@ -9502,8 +9506,10 @@ async function piEventFor(sessionId, node, deps = {}) {
 }
 
 // Whether a Pi session can be started on another node: its host reads Pi phase files
-// (transcript verb 3), Pi's account is set up there, and the Keep Pi extension is
-// installed where that Pi will look for it. Asked of the node itself, before the pane.
+// (transcript verb 3), Pi's account is set up there, the Keep Pi extension is
+// installed where that Pi will look for it, and the Keep CLI the pane's
+// KEEP_PI_KEEP_CLI names (this checkout's bin/keep.js) is there too. Asked of the node
+// itself, before the pane. A node too old to answer the last is not refused for it.
 async function assertNodePiReady(node, account, project, deps = {}) {
   const hello = await (deps.hostRequest || hostRequest)('hello', {}, { ...deps, node });
   if (!hello || !(Number(hello.transcript) >= 3)) {
@@ -9512,7 +9518,7 @@ async function assertNodePiReady(node, account, project, deps = {}) {
   let checked;
   try {
     checked = await prepareLaunchOn(node, {
-      agent: 'pi', check: true, cwd: project, argv: ['pi'],
+      agent: 'pi', check: true, cwd: project, argv: ['pi'], piKeepCli: PI_KEEP_CLI,
       account: { id: account.id, agent: account.agent, configDir: account.configDir,
         builtIn: account.builtIn === true, managed: account.managed === true },
     }, deps);
@@ -9522,6 +9528,9 @@ async function assertNodePiReady(node, account, project, deps = {}) {
   }
   if (!checked || checked.piExtension !== true) {
     throw new InjectionError(409, `Pi Keep extension is not installed on ${node}`);
+  }
+  if (checked.piKeepCli === false) {
+    throw new InjectionError(409, `the Keep CLI the Pi extension runs (${PI_KEEP_CLI}) is not on ${node}; install keep-tool at that path there`);
   }
 }
 
@@ -10402,7 +10411,7 @@ async function openSession(body, deps = {}) {
       // launch that named the browser itself keeps its own name.
       env: require('./agent-launcher').launcherEnv({
         ...repairEnvFor({ sessionId }, deps),
-        ...(agent === 'pi' ? { KEEP_PI_SESSION_ID: sessionId, KEEP_PI_KEEP_CLI: path.join(__dirname, 'keep.js'),
+        ...(agent === 'pi' ? { KEEP_PI_SESSION_ID: sessionId, KEEP_PI_KEEP_CLI: PI_KEEP_CLI,
           ...(piOpeningFile ? { KEEP_PI_OPENING_FILE: piOpeningFile } : {}) } : {}),
         ...(browserName ? { BROWSER_BRIDGE_SESSION_NAME: browserName } : {}),
         ...deps.launchEnv,

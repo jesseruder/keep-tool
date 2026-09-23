@@ -129,6 +129,15 @@ function piExtensionInstalled(deps = {}) {
   catch { return false; }
 }
 
+// Whether the Keep CLI the daemon names for a Pi launch's extension (KEEP_PI_KEEP_CLI,
+// the daemon's own bin/keep.js) is a file on this machine. The extension runs it for
+// every hook, so without it no Pi session there ever registers.
+function piKeepCliPresent(file, deps = {}) {
+  const io = deps.fs || fs;
+  if (typeof file !== 'string' || !path.isAbsolute(file) || /[\0\r\n]/.test(file)) return false;
+  try { return io.statSync(file).isFile(); } catch { return false; }
+}
+
 // Returns what the launch needs and what it changed:
 //   mcpConfig      the --mcp-config path a shared Claude setup wrote, or ''
 //   trusted        true when this call accepted the trust dialog, false when it was
@@ -140,6 +149,7 @@ function piExtensionInstalled(deps = {}) {
 //   command        the shell word the pane execs, carrying this machine's execPath
 //                  and launcher path
 //   piExtension    for a Pi launch only: whether the Keep Pi extension is installed here
+//   piKeepCli      for a Pi check naming `piKeepCli` only: whether that file is here
 function prepare(options = {}, deps = {}) {
   const agent = String(options.agent || '');
   if (!['claude', 'codex', 'pi'].includes(agent)) {
@@ -183,7 +193,8 @@ function prepare(options = {}, deps = {}) {
       }
     }
     return { checked: true, account: account.id, sharedSetup,
-      ...(agent === 'pi' ? { piExtension: piExtensionInstalled(deps) } : {}) };
+      ...(agent === 'pi' ? { piExtension: piExtensionInstalled(deps) } : {}),
+      ...(agent === 'pi' && options.piKeepCli !== undefined ? { piKeepCli: piKeepCliPresent(options.piKeepCli, deps) } : {}) };
   }
 
   // A Claude account carrying a shared-setup manifest has its project memory and
@@ -241,4 +252,4 @@ function prepare(options = {}, deps = {}) {
   };
 }
 
-module.exports = { prepare, expandArgv, assertSharedHome, piExtensionInstalled };
+module.exports = { prepare, expandArgv, assertSharedHome, piExtensionInstalled, piKeepCliPresent };

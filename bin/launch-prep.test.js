@@ -310,6 +310,22 @@ test('a Pi launch, and a check for one, say whether the Keep Pi extension is ins
   assert.equal('piExtension' in launchPrep.prepare({ agent: 'codex', account: codex, cwd: f.project, check: true, argv: ['codex'] }), false);
 });
 
+test('a Pi check naming the Keep CLI the extension will run says whether that file is on this machine', (t) => {
+  const f = fixture(t);
+  const pi = { id: 'pi/default', agent: 'pi', configDir: path.join(f.home, '.pi'), builtIn: true, managed: false };
+  fs.mkdirSync(pi.configDir, { recursive: true });
+  const ask = (piKeepCli) => launchPrep.prepare({ agent: 'pi', account: pi, cwd: f.project, argv: ['pi'], check: true,
+    remote: true, daemonHome: f.home, ...(piKeepCli === undefined ? {} : { piKeepCli }) }, { homedir: f.home });
+  const cli = path.join(f.root, 'keep-tool', 'bin', 'keep.js');
+  assert.equal('piKeepCli' in ask(undefined), false, 'not asked, not answered: an older daemon sees what it always did');
+  assert.equal(ask(cli).piKeepCli, false);
+  fs.mkdirSync(path.dirname(cli), { recursive: true });
+  fs.writeFileSync(cli, '// keep\n');
+  assert.equal(ask(cli).piKeepCli, true);
+  assert.equal(ask(path.dirname(cli)).piKeepCli, false, 'a directory is not the CLI');
+  assert.equal(ask('bin/keep.js').piKeepCli, false, 'a relative path is never looked up');
+});
+
 test('a codex launch takes neither path and still gets this machine command', (t) => {
   const f = fixture(t);
   const account = { id: 'codex/default', agent: 'codex', configDir: path.join(f.home, '.codex'), builtIn: true, managed: false };
