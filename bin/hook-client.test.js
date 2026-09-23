@@ -914,6 +914,39 @@ test('a Pi hook posts as the Pi session, with only what the daemon\'s keep hook 
   assert.equal(await client.runPiHook('post-tool', input, where, deps), null, 'not a carried Pi hook');
 });
 
+test('a node Pi start\'s post runs its budget from when the hook process started, not from the post', async (t) => {
+  const client = require('./hook-client.js');
+  const hook = require('./commands/hook.js');
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pi-start-budget-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { HOME: home, KEEP_PANE: 'p3', KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main', KEEP_DAEMON_URL: 'http://127.0.0.1:1' };
+  const where = { url: env.KEEP_DAEMON_URL, local: 'aws1', daemon: 'main' };
+  const input = { session_id: 'pi-aws1', cwd: home, instance: PI_INSTANCE, pid: 4242 };
+  // The post itself: its request gets what is left of 3 s since the process started.
+  const timeouts = [];
+  const request = async (url, pathname, { timeoutMs }) => {
+    timeouts.push(timeoutMs);
+    return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: '', stderr: '', replayed: false }) };
+  };
+  const began = Date.now() - 1800;
+  await client.runPiHook('start', input, where, { env, token: 'aws1-secret', request, startedAt: began });
+  assert.equal(timeouts.length, 1);
+  assert.ok(timeouts[0] <= 1200 && timeouts[0] > 0, `the post has what is left (${timeouts[0]} ms)`);
+  // carriedPiHook hands its process start to the start's post, and to nothing else.
+  const seen = [];
+  const hookClient = { logLine: () => {}, runPiHook: async (action, given, at, deps) => {
+    seen.push([action, deps.startedAt]);
+    return { delivered: true, value: { status: 0, stdout: '', stderr: '' } };
+  } };
+  const connectHost = async () => ({ request: async (type) => (type === 'get' ? { pane: { alive: true, pid: 1, meta: { sessionId: 'pi-aws1' } } } : {}), close() {} });
+  const exitCode = process.exitCode;
+  try {
+    await hook.carriedPiHook('start', input, where, { env, hookStartedAt: began, hookClient, connectHost });
+    await hook.carriedPiHook('end', input, where, { env, hookStartedAt: began, hookClient, connectHost });
+  } finally { process.exitCode = exitCode; }
+  assert.deepEqual(seen, [['start', began], ['end', undefined]]);
+});
+
 // `keep hook pi <action>` on aws1, as the Keep Pi extension runs it.
 function piHook(f, action, url, input = {}, extra = {}) {
   return new Promise((resolve, reject) => {

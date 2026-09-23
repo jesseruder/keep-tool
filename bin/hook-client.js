@@ -641,6 +641,7 @@ async function runCodexToolHook(event, input, normalized, where, deps = {}) {
 // for a pre-tool the command with this node's repository facts, as runBashHook
 // carries a Claude pre-bash. A background worker's job id and token are never sent:
 // Pi workers do not run on nodes. Resolves as runHook does (runBashHook for pre-tool).
+// `deps.startedAt` (a start's: when its process started) is where the budget runs from.
 async function runPiHook(action, input, where, deps = {}) {
   const event = `pi-${action}`;
   if (!PI_EVENTS.includes(event) || !input || typeof input !== 'object') return null;

@@ -926,8 +926,8 @@ async function carriedPiHook(action, input, where, deps = {}) {
   const client = deps.hookClient || require('../hook-client.js');
   const sid = input && typeof input.session_id === 'string' ? input.session_id : '';
   const log = (text) => { try { client.logLine(env, text); } catch {} };
-  const post = () => Promise.resolve()
-    .then(() => client.runPiHook(action, input, where, deps))
+  const post = (extra = {}) => Promise.resolve()
+    .then(() => client.runPiHook(action, input, where, { ...deps, ...extra }))
     .then((outcome) => outcome || { delivered: false, why: 'this hook is not carried' },
       (error) => ({ delivered: false, why: error && error.message || String(error) }));
   const refuse = (reason) => {
@@ -966,7 +966,9 @@ async function carriedPiHook(action, input, where, deps = {}) {
   if (action === 'start') {
     const now = deps.now || Date.now;
     const startedAt = Number.isFinite(deps.hookStartedAt) ? deps.hookStartedAt : Date.now() - process.uptime() * 1000;
-    const outcome = await post();
+    // The post's budget runs from when this process started, as the extension's own
+    // 5 s timer does: a slow CLI startup comes out of the post, not past the kill.
+    const outcome = await post({ startedAt });
     if (!outcome.delivered) {
       log(`pi start for session ${sid}: the daemon did not take it (${outcome.why || 'no answer'})${outcome.queued ? '; queued' : ''}`);
     }
@@ -3280,6 +3282,6 @@ function stopHookChecks(input, agent, options, sid, transcript, hint) {
   return true;
 }
 
-module.exports = { commands, carriedCodexHook, bindRemotePane, releaseRemotePane, remoteCommandGuard, carriedPreBash, carriedPostBash, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
+module.exports = { commands, carriedCodexHook, carriedPiHook, bindRemotePane, releaseRemotePane, remoteCommandGuard, carriedPreBash, carriedPostBash, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
   openerDescription, unattendedContext, unattendedState, enforcedUnattendedState, recordedUnattended, hookHostConnect,
   UNATTENDED_DENY_REASON, UNATTENDED_STOP_REASON };
