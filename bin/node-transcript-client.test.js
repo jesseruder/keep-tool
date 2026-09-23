@@ -215,6 +215,58 @@ test('a send a node cannot confirm is refused before anything is typed', async (
   assert.match(serve.remoteDeliveryRefusal({ id: 'x', node: 'aws1' }, deps).message, /a session whose agent is not known on aws1/);
 });
 
+function authorityRoot(sid, node) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-send-authority-'));
+  fs.mkdirSync(path.join(root, '.keep', 'session-accounts'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.keep', 'session-accounts', `${sid}.json`), JSON.stringify({
+    version: 1, sessionId: sid, agent: 'claude', accountId: 'claude/default', node,
+  }));
+  return root;
+}
+
+test('a pane on aws1 whose meta names a session the authority record places here is never typed into', async () => {
+  const sid = 'sess-recorded-here';
+  const root = authorityRoot(sid, 'main');
+  try {
+    const typed = [];
+    const deps = {
+      root,
+      hostNodes: ['main', 'aws1'],
+      hostRequest: async (type) => { typed.push(type); throw new Error(`unexpected ${type}`); },
+    };
+    // A local session row carries no node; the pane's node is not taken as its answer.
+    await assert.rejects(serve.sendToResolvedTarget({ id: sid, kind: 'claude' }, { pane: 'p1@aws1' }, 'hi', {}, deps),
+      (error) => error.status === 409 && new RegExp(`pane p1@aws1 is on aws1 but session ${sid} is on main`).test(error.message));
+    assert.deepEqual(typed, [], 'nothing was typed or asked of either node');
+
+    const stray = { id: 'p1@aws1', node: 'aws1', alive: true, agentAlive: true, meta: { sessionId: sid, agent: 'claude' } };
+    const here = { id: 'p2', alive: true, agentAlive: true, meta: { sessionId: sid, agent: 'claude' } };
+    const withPanes = (panes) => ({ ...deps, listHostPaneResult: async () => ({ panes, failure: null, missingNodes: [] }) });
+    // The only live pane for the id is on aws1: refused by name, not picked.
+    await assert.rejects(serve.resolveSessionTarget({ id: sid, kind: 'claude' }, null, withPanes([stray])),
+      (error) => error.status === 409 && /is recorded on main but its live pane p1@aws1 is not/.test(error.message));
+    // A pane on the recorded node wins over the stray one, whichever is listed first.
+    assert.deepEqual(await serve.resolveSessionTarget({ id: sid, kind: 'claude' }, null, withPanes([stray, here])), { pane: 'p2' });
+    assert.deepEqual(typed, []);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a session the authority record places on aws1 still resolves to its aws1 pane, and a single node is unchanged', async () => {
+  const sid = 'sess-recorded-there';
+  const root = authorityRoot(sid, 'aws1');
+  try {
+    const there = { id: 'p1@aws1', node: 'aws1', alive: true, agentAlive: true, meta: { sessionId: sid, agent: 'claude' } };
+    const here = { id: 'p2', alive: true, agentAlive: true, meta: { sessionId: sid, agent: 'claude' } };
+    const deps = (hostNodes, panes) => ({ root, hostNodes,
+      listHostPaneResult: async () => ({ panes, failure: null, missingNodes: [] }),
+      hostRequest: async (type) => { throw new Error(`unexpected ${type}`); } });
+    assert.deepEqual(await serve.resolveSessionTarget({ id: sid, kind: 'claude' }, null, deps(['main', 'aws1'], [here, there])), { pane: 'p1@aws1' });
+    // Single node: the record is not read (it would say aws1), and the one pane is the answer.
+    assert.deepEqual(await serve.resolveSessionTarget({ id: sid, kind: 'claude' }, null, deps(['main'], [here])), { pane: 'p2' });
+    assert.equal(serve.sessionNodeOf({ id: sid }, { root, hostNodes: ['main'] }), 'main');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 // ---------- a node session's freshness in the publication ----------
 
 function freshnessFixture(node, sid) {

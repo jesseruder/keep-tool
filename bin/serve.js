@@ -6208,8 +6208,27 @@ async function resolveSessionTarget(session, targetHint, deps = {}) {
     }
     return { pane: selected.id };
   }
-  const hosted = sessionHostPane(panes, session.id);
-  if (hosted && hosted.alive && hosted.agentAlive !== false) {
+  // With more than one node, the pane that answers for a session is the one on the
+  // node its authority record names: another node's pane whose meta carries the same
+  // id is not this session's, and typing into it would journal a receipt that node
+  // could settle. A single-node install skips this and reads nothing.
+  let sessionNode = null;
+  let candidates = panes;
+  if (hostNodeNames(deps).length > 1) {
+    const env = paneRefEnv(deps);
+    sessionNode = session.node ? String(session.node) : sessionNodeOf({ id: session.id }, deps);
+    candidates = panes.filter((pane) => pane
+      && (pane.node || nodes.parsePaneRef(String(pane.id || ''), { env }).node) === sessionNode);
+  }
+  const hosted = sessionHostPane(candidates, session.id);
+  const liveHosted = Boolean(hosted && hosted.alive && hosted.agentAlive !== false);
+  if (sessionNode && !liveHosted && !(listed.missingNodes || []).includes(sessionNode)) {
+    const elsewhere = sessionHostPane(panes, session.id);
+    if (elsewhere && elsewhere.alive && elsewhere.agentAlive !== false) {
+      throw new InjectionError(409, `session ${session.id} is recorded on ${sessionNode} but its live pane ${elsewhere.id} is not; nothing was sent`);
+    }
+  }
+  if (liveHosted) {
     // A pane carried over from a node that has gone quiet is the last thing it said,
     // not a pane this daemon can act on now.
     if (hosted.node && (listed.missingNodes || []).includes(hosted.node)) {
@@ -8430,7 +8449,10 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   // single-node install both answers are this machine and `remote` stays null.
   const daemonNode = daemonNodeName(deps);
   const paneNode = nodes.parsePaneRef(String(target && target.pane || ''), { env: paneRefEnv(deps) }).node;
-  const sessionNode = session.node ? String(session.node) : paneNode;
+  // A session that carries no node is asked of its authority record, never taken
+  // from the pane: a pane on another node whose meta names this id is not proof the
+  // session lives there. sessionNodeOf reads nothing on a single-node install.
+  const sessionNode = session.node ? String(session.node) : sessionNodeOf({ id: session.id }, deps);
   if (paneNode !== sessionNode) {
     throw new InjectionError(409, `pane ${target.pane} is on ${paneNode} but session ${session.id} is on ${sessionNode}; nothing was sent`);
   }
