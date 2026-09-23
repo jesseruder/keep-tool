@@ -12648,10 +12648,19 @@ function sessionMoveDeps(deps = {}) {
     cleanup: async (record) => {
       const warnings = [];
       const account = accountOf(record);
-      // The stopped pane on the source, which nothing will run again.
+      // The stopped pane on the source, which nothing will run again: removed only on
+      // the same proof the move stopped it on (no agent for the session in the
+      // source's own table) and only while the pane itself is still exited. A pane
+      // somebody started again is left running, and said so.
       if (record.pane) {
-        try { await hostRequest('remove', { pane: record.pane.id }, deps); }
-        catch (error) { warnings.push(`the stopped pane ${record.pane.id} was not removed: ${error.message}`); }
+        try {
+          await requireNoAgentOn(record.from, record.sessionId, deps);
+          const panes = await listPanes();
+          if (!Array.isArray(panes)) throw new Error('the terminal hosts did not list their panes');
+          const pane = panes.find((entry) => entry && entry.id === record.pane.id);
+          if (pane && pane.alive !== false) warnings.push(`the pane ${record.pane.id} on ${record.from} is running again; it was left as it is`);
+          else if (pane) await (deps.hostRequest || hostRequest)('remove', { pane: record.pane.id }, deps);
+        } catch (error) { warnings.push(`the stopped pane ${record.pane.id} was not removed: ${error.message}`); }
       }
       // What the session left on the source is a copy a later move back may replace.
       try { await moveEndpoint(record.from, account, deps).release(record.sessionId); }

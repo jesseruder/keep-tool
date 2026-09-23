@@ -310,3 +310,36 @@ test('the move relinks the card\'s entry for the session in place, through relin
     assert.deepEqual(calls, [['moving-card', SID, 'aws1', { root }]]);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('the cleanup removes the source pane only while it is exited and no agent runs the session there', async () => {
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-move-cleanup-'));
+  try {
+    const config = path.join(root, 'config.json');
+    fs.mkdirSync(path.join(root, 'claude'));
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [{ id: 'claude-a', label: 'Claude A', agent: 'claude', configDir: path.join(root, 'claude') }],
+      defaultAccounts: { claude: 'claude-a' } }));
+    const env = { ...process.env, KEEP_CONFIG: config };
+    delete env.CLAUDE_CODE_SESSION_ID;
+    const idle = '11 10 ttys001 Tue Sep  8 10:00:00 2026 /bin/zsh';
+    const record = { id: `mv-${'e'.repeat(24)}`, sessionId: SID, from: 'main', to: 'aws1', accountId: 'claude-a', pane: { id: 'p1', pid: 42 } };
+    const cleanup = async (pane, psTable) => {
+      const removed = [];
+      const warnings = await serve.sessionMoveDeps({
+        root, env, daemonNode: 'main', psTable, listHostPanes: async () => (pane ? [pane] : []),
+        hostRequest: async (type, params) => { if (type === 'remove') removed.push(params.pane); return {}; },
+      }).cleanup(record);
+      return { removed, warnings: warnings.join('\n') };
+    };
+    const exited = { id: 'p1', alive: false, meta: { sessionId: SID } };
+    assert.deepEqual((await cleanup(exited, idle)).removed, ['p1']);
+    const revived = await cleanup({ ...exited, alive: true }, idle);
+    assert.deepEqual(revived.removed, [], 'a pane running again is never removed');
+    assert.match(revived.warnings, /the pane p1 on main is running again; it was left as it is/);
+    const agent = await cleanup(exited, `${idle}\n12 10 ttys002 Tue Sep  8 10:00:00 2026 /test/claude --resume ${SID}`);
+    assert.deepEqual(agent.removed, [], 'nor while an agent runs the session there');
+    assert.match(agent.warnings, /was not removed: an agent process still owns/);
+    const unread = await cleanup(exited, '');
+    assert.deepEqual(unread.removed, []);
+    assert.match(unread.warnings, /was not removed: the process table on main could not be read/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
