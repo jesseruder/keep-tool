@@ -53,6 +53,9 @@ const OPS = new Set(['list', 'read', 'stage', 'publish', 'release', 'abort', 'cw
 const KINDS = new Set(['claude', 'codex']);
 const ROLLOUT_NAME_RE = /^rollout-[A-Za-z0-9._:+=@-]+\.jsonl$/;
 const META_MAX_BYTES = 256 * 1024;
+const ROLLOUT_ID_RE = /^[A-Za-z0-9_-]{1,160}$/;
+const CODEX_GRAPH_DEPTH = 8;
+const CODEX_GRAPH_MAX = 128;
 
 function coded(message, code) {
   const error = new Error(message);
@@ -239,49 +242,161 @@ function walkTree(root, parts, out) {
   }
 }
 
-// A Codex session's rollouts: the root, found by its session_meta id, and every child
-// rollout reachable through parent_thread_id, walked by the same scan and graph the
-// account handoff's forced copy uses (bin/codex-account-artifacts.js): a link, an
-// unsupported entry, an ambiguous id or a cyclic graph anywhere refuses the list.
+// The session_meta of an open rollout, from its first line only: read 4 KiB at a
+// time up to the first newline, never past 256 KiB. { id, parent } or null.
+function firstLineMeta(fd) {
+  const chunks = [];
+  let position = 0;
+  for (;;) {
+    const buffer = Buffer.alloc(Math.min(4096, META_MAX_BYTES - position));
+    if (!buffer.length) return null;
+    const n = fs.readSync(fd, buffer, 0, buffer.length, position);
+    if (!n) break;
+    const newline = buffer.subarray(0, n).indexOf(10);
+    chunks.push(buffer.subarray(0, newline === -1 ? n : newline));
+    position += n;
+    if (newline !== -1) break;
+  }
+  scanStats.firstLineReads += 1;
+  let row = null;
+  try { row = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return null; }
+  const meta = row && row.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
+  if (!meta) return null;
+  const id = meta.id || meta.session_id;
+  const parent = meta.parent_thread_id || (meta.source && meta.source.subagent && meta.source.subagent.thread_spawn
+    && meta.source.subagent.thread_spawn.parent_thread_id) || null;
+  return {
+    id: typeof id === 'string' && ROLLOUT_ID_RE.test(id) ? id : null,
+    parent: typeof parent === 'string' && ROLLOUT_ID_RE.test(parent) ? parent : null,
+    child: Boolean(parent || (meta.source && meta.source.subagent)),
+  };
+}
+
+// First lines already read, by path, with the (inode, size, mtime) they were read
+// at: a move lists a session several times, and only a rollout that changed (a
+// resumed one grows) is opened again. A rollout's first line never changes once it
+// is written, so this is only ever a cost saving, never a stale answer.
+const firstLines = new Map();
+const FIRST_LINES_MAX = 20000;
+// Counted for the tests: how many first lines were actually read from disk.
+const scanStats = { firstLineReads: 0 };
+
+function cachedFirstLine(file, stat) {
+  const known = firstLines.get(file);
+  if (known && known.ino === stat.ino && known.size === stat.size && known.mtimeMs === stat.mtimeMs) return known.meta;
+  const fd = openNoFollow(file, fs.constants.O_RDONLY);
+  let meta;
+  try {
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.ino !== stat.ino) throw refused(`${path.basename(file)} changed while it was read`);
+    meta = firstLineMeta(fd);
+  } finally { fs.closeSync(fd); }
+  firstLines.delete(file);
+  firstLines.set(file, { ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, meta });
+  while (firstLines.size > FIRST_LINES_MAX) firstLines.delete(firstLines.keys().next().value);
+  return meta;
+}
+
+// Every rollout file of the account by name alone (directory reads, no file opened):
+// `sessions/YYYY/MM/DD/rollout-*.jsonl` and `archived_sessions/rollout-*.jsonl`. A link
+// or anything but a plain directory or file on the way refuses, as a move that could
+// not see a thread must not leave it behind.
+function rolloutNames(root) {
+  const out = [];
+  const plainDir = (parts) => {
+    const stat = lstatOrNull(path.join(root, ...parts));
+    if (!stat) return false;
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw refused(`${parts.join('/')} is not a plain directory`);
+    return true;
+  };
+  const files = (parts) => {
+    for (const name of names(path.join(root, ...parts))) {
+      if (!ROLLOUT_NAME_RE.test(name)) continue;
+      const stat = fs.lstatSync(path.join(root, ...parts, name));
+      if (stat.isSymbolicLink() || !stat.isFile()) throw refused(`${[...parts, name].join('/')} is not a regular file`);
+      out.push({ parts: [...parts, name], stat });
+      if (out.length > MAX_FILES) throw refused(`the account has more than ${MAX_FILES} rollouts`);
+    }
+  };
+  if (plainDir(['sessions'])) {
+    for (const year of names(path.join(root, 'sessions')).filter((name) => /^\d{4}$/.test(name))) {
+      if (!plainDir(['sessions', year])) continue;
+      for (const month of names(path.join(root, 'sessions', year)).filter((name) => /^\d{2}$/.test(name))) {
+        if (!plainDir(['sessions', year, month])) continue;
+        for (const day of names(path.join(root, 'sessions', year, month)).filter((name) => /^\d{2}$/.test(name))) {
+          if (plainDir(['sessions', year, month, day])) files(['sessions', year, month, day]);
+        }
+      }
+    }
+  }
+  if (plainDir(['archived_sessions'])) files(['archived_sessions']);
+  return out;
+}
+
+// The dated folder a day before `day` (YYYY/MM/DD): the slack a child is given, since
+// a machine that changed time zone between a root and its child can file the child
+// under an earlier date.
+function dayBefore(day) {
+  const [year, month, date] = day.split('/').map(Number);
+  const earlier = new Date(Date.UTC(year, month - 1, date - 1));
+  return [String(earlier.getUTCFullYear()), String(earlier.getUTCMonth() + 1).padStart(2, '0'),
+    String(earlier.getUTCDate()).padStart(2, '0')].join('/');
+}
+
+// A Codex session's rollouts: the root, found by its file name and confirmed by its
+// session_meta, and every child rollout whose parent chain leads back to it. Children
+// begin after their root, so only rollouts filed no earlier than the day before the
+// root's folder, and the archive, are candidates, and of those only the first line is
+// read, once per file per change (cachedFirstLine). A duplicate id, a cycle, or a
+// graph deeper or larger than a conversation has refuses the list.
 function codexArtifactParts(root, sessionId) {
-  const artifacts = require('./codex-account-artifacts.js');
-  let index;
-  try { index = artifacts.scanProfile({ root }); } catch (error) { throw refused(error.message); }
-  const roots = index.byId.get(sessionId) || [];
-  if (!roots.length) throw coded(`no Codex rollout for ${sessionId} on this node`, 'artifacts-missing');
-  if (roots.some((entry) => entry.relative.split(path.sep)[0] === 'archived_sessions')) {
+  const all = rolloutNames(root);
+  const suffix = `-${sessionId}.jsonl`;
+  const named = all.filter((entry) => entry.parts[entry.parts.length - 1].endsWith(suffix));
+  if (named.some((entry) => entry.parts[0] === 'archived_sessions')) {
     throw coded(`Codex session ${sessionId} is archived on this node; unarchive it before moving it`, 'artifacts-archived');
   }
-  if (roots.length === 1 && roots[0].parent) throw refused(`${sessionId} is a child thread of ${roots[0].parent}; move the conversation it belongs to`);
-  let graph;
-  try { graph = artifacts.graphFromRollouts(sessionId, index); } catch (error) { throw refused(error.message); }
-  const files = graph.map((node) => node.relative.split(path.sep));
-  for (const parts of files) codexScopedParts(parts, parts.join('/'), parts === files[0] ? sessionId : '');
-  if (!files[0][files[0].length - 1].endsWith(`-${sessionId}.jsonl`)) {
-    throw refused(`the rollout of ${sessionId} is not named for it (${files[0].join('/')})`);
+  if (!named.length) throw coded(`no Codex rollout for ${sessionId} on this node`, 'artifacts-missing');
+  if (named.length > 1) throw refused(`session ${sessionId} has more than one rollout on this node`);
+  const [rootEntry] = named;
+  const rootFile = path.join(root, ...rootEntry.parts);
+  const rootMeta = cachedFirstLine(rootFile, rootEntry.stat);
+  if (!rootMeta || rootMeta.id !== sessionId) throw refused(`${rootEntry.parts.join('/')} does not begin with the session_meta of ${sessionId}`);
+  if (rootMeta.child) throw refused(`${sessionId} is a child thread${rootMeta.parent ? ` of ${rootMeta.parent}` : ''}; move the conversation it belongs to`);
+  const earliest = dayBefore(rootEntry.parts.slice(1, 4).join('/'));
+  const byParent = new Map();
+  const seenIds = new Map([[sessionId, rootEntry]]);
+  for (const entry of all) {
+    if (entry === rootEntry) continue;
+    if (entry.parts[0] === 'sessions' && entry.parts.slice(1, 4).join('/') < earliest) continue;
+    const meta = cachedFirstLine(path.join(root, ...entry.parts), entry.stat);
+    if (!meta || !meta.parent || !meta.id) continue;
+    if (!byParent.has(meta.parent)) byParent.set(meta.parent, []);
+    byParent.get(meta.parent).push({ ...entry, id: meta.id });
   }
+  const files = [rootEntry.parts];
+  const visit = (id, depth) => {
+    if (depth > CODEX_GRAPH_DEPTH) throw refused(`the thread graph of ${sessionId} is deeper than ${CODEX_GRAPH_DEPTH}`);
+    const children = (byParent.get(id) || []).sort((a, b) => a.parts.join('/').localeCompare(b.parts.join('/')));
+    for (const child of children) {
+      if (seenIds.has(child.id)) throw refused(`thread ${child.id} of ${sessionId} appears more than once, or in a cycle`);
+      seenIds.set(child.id, child);
+      files.push(child.parts);
+      if (files.length > CODEX_GRAPH_MAX) throw refused(`session ${sessionId} has more than ${CODEX_GRAPH_MAX} threads`);
+      visit(child.id, depth + 1);
+    }
+  };
+  visit(sessionId, 1);
+  for (const parts of files) codexScopedParts(parts, parts.join('/'), parts === files[0] ? sessionId : '');
   return { projectName: null, files };
 }
 
 // Whether an open rollout may be read for this session: it is the session's own (its
 // session_meta names it) or a child thread's (it names a parent). Never another
 // top-level conversation of the account, whose file name merely has the shape.
-function codexRolloutReadable(fd, size, sessionId) {
-  const buffer = Buffer.alloc(Math.min(size, META_MAX_BYTES));
-  let got = 0;
-  while (got < buffer.length) {
-    const n = fs.readSync(fd, buffer, got, buffer.length - got, got);
-    if (!n) break;
-    got += n;
-  }
-  const text = buffer.subarray(0, got).toString('utf8');
-  const newline = text.indexOf('\n');
-  let row = null;
-  try { row = JSON.parse(newline === -1 ? text : text.slice(0, newline)); } catch {}
-  const meta = row && row.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
-  if (!meta) return false;
-  if ((meta.id || meta.session_id) === sessionId) return true;
-  return Boolean(meta.parent_thread_id || (meta.source && meta.source.subagent));
+function codexRolloutReadable(fd, sessionId) {
+  const meta = firstLineMeta(fd);
+  return Boolean(meta && (meta.id === sessionId || meta.child));
 }
 
 function artifactParts(root, sessionId, kind = 'claude') {
@@ -358,7 +473,7 @@ function read(root, params, kind = 'claude') {
   try {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile()) throw refused(`${params.relPath} is not a regular file`);
-    if (kind === 'codex' && !codexRolloutReadable(fd, stat.size, params.sessionId)) {
+    if (kind === 'codex' && !codexRolloutReadable(fd, params.sessionId)) {
       throw refused(`${params.relPath} is not a rollout of session ${params.sessionId} or of one of its threads`);
     }
     const want = Math.max(0, Math.min(length, stat.size - from));
@@ -598,5 +713,5 @@ async function handle(params, options = {}) {
 }
 
 module.exports = {
-  handle, scopedParts, REQUEST_MAX_BYTES, TX_MAX_BYTES, TX_RE, MOVE_DIR,
+  handle, scopedParts, REQUEST_MAX_BYTES, TX_MAX_BYTES, TX_RE, MOVE_DIR, scanStats,
 };

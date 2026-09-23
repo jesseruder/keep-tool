@@ -132,3 +132,50 @@ test('a Codex session is carried whole between two accounts, publish needs the r
   await assert.rejects(transport.transfer({ sessionId: ROOT_ID, tx, from: { ...from, list: async () => ({ files: [child] }) }, to }),
     /listed no transcript/);
 });
+
+test('a profile of 2,000 unrelated rollouts lists the root and its threads reading only first lines, once', async (t) => {
+  const node = codexNode(t, 'many');
+  // Older conversations, filed before the root's day: never opened. Newer ones, some
+  // large: their first line only, once, and not again while they are unchanged.
+  const body = 'y'.repeat(64 * 1024);
+  for (let index = 0; index < 1000; index += 1) {
+    const id = crypto.randomUUID();
+    node.put(`sessions/2026/08/${String(1 + (index % 28)).padStart(2, '0')}/rollout-2026-08-01T00-00-00-${id}.jsonl`,
+      line({ type: 'session_meta', payload: { id, cwd: '/work/other' } }));
+  }
+  for (let index = 0; index < 1000; index += 1) {
+    const id = crypto.randomUUID();
+    node.put(`sessions/2026/09/${String(20 + (index % 5)).padStart(2, '0')}/rollout-2026-09-22T00-00-00-${id}.jsonl`,
+      line({ type: 'session_meta', payload: { id, cwd: '/work/other' } }) + (index % 10 === 0 ? `${JSON.stringify({ pad: body })}\n` : ''));
+  }
+  const before = artifacts.scanStats.firstLineReads;
+  const started = Date.now();
+  const listed = await node.ask({ op: 'list', sessionId: ROOT_ID });
+  assert.deepEqual(listed.files.map((file) => file.relPath), [node.rel.root, node.rel.childA, node.rel.childB]);
+  const firstReads = artifacts.scanStats.firstLineReads - before;
+  // The root, its two threads and the unrelated one on its day, plus the 1,000 newer
+  // conversations: the 1,000 older ones are never opened.
+  assert.ok(firstReads <= 1004, `read ${firstReads} first lines`);
+  assert.ok(firstReads >= 1003);
+  assert.ok(Date.now() - started < 20000, 'a generous bound on a slow machine');
+  // A second listing of the same move reads no first line again.
+  const again = artifacts.scanStats.firstLineReads;
+  assert.equal((await node.ask({ op: 'list', sessionId: ROOT_ID })).files.length, 3);
+  assert.equal(artifacts.scanStats.firstLineReads, again);
+  // A thread whose rollout grew is read again, and only it.
+  fs.appendFileSync(path.join(node.configDir, ...node.rel.childA.split('/')), line({ type: 'event_msg' }));
+  await node.ask({ op: 'list', sessionId: ROOT_ID });
+  assert.equal(artifacts.scanStats.firstLineReads, again + 1);
+});
+
+test('a thread filed a day before its root still travels; a duplicate thread id refuses the list', async (t) => {
+  const node = codexNode(t, 'edges');
+  const late = crypto.randomUUID();
+  node.put(`sessions/2026/09/19/rollout-2026-09-19T23-59-00-${late}.jsonl`,
+    line({ type: 'session_meta', payload: { id: late, parent_thread_id: ROOT_ID } }));
+  const listed = await node.ask({ op: 'list', sessionId: ROOT_ID });
+  assert.ok(listed.files.some((file) => file.relPath.endsWith(`-${late}.jsonl`)));
+  node.put(`sessions/2026/09/22/rollout-2026-09-22T09-00-00-${late}.jsonl`,
+    line({ type: 'session_meta', payload: { id: late, parent_thread_id: ROOT_ID } }));
+  await assert.rejects(node.ask({ op: 'list', sessionId: ROOT_ID }), (error) => error.code === 'artifacts-refused' && /more than once/.test(error.message));
+});
