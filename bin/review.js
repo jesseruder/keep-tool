@@ -4092,7 +4092,23 @@ function classifyBudget(snapshot, model, minHeadroom) {
 // `reviewer` purpose (bin/reviewer-launch.js), so its budget has to be read against
 // that same account: in a multi-account fleet an unpinned read is code 8 and the
 // tick never fires. Falls back to undefined, which is the single-account path.
-function reviewerAccountId(env = process.env) {
+//
+// The reviewer is no longer pinned to that purpose: bin/account-budget.js launches it on
+// whichever pool account has room. So the live reviewer pane's own `meta.accountId` —
+// the account it is actually running on — wins over the config map whenever one is
+// given. With `sessionId`, only the pane carrying that session counts.
+function reviewerPaneAccountId(panes, sessionId) {
+  if (!Array.isArray(panes)) return undefined;
+  const live = panes.filter((pane) => pane && pane.alive !== false && pane.meta && pane.meta.reviewer === true
+    && typeof pane.meta.accountId === 'string' && pane.meta.accountId
+    && (!sessionId || !pane.meta.sessionId || pane.meta.sessionId === sessionId));
+  const exact = sessionId ? live.find((pane) => pane.meta.sessionId === sessionId) : null;
+  return (exact || live[0] || {}).meta?.accountId || undefined;
+}
+
+function reviewerAccountId(env = process.env, panes, sessionId) {
+  const live = reviewerPaneAccountId(panes, sessionId);
+  if (live) return live;
   try { return require('./accounts.js').automationFor('claude', 'reviewer', env).id; }
   catch { return undefined; }
 }
@@ -4497,16 +4513,21 @@ async function reviewTick(deps, opts) {
   const sessions = deps.sessions ? (options.force ? deps.sessions({ fresh: true }) : deps.sessions()) : [];
   const reviewer = (deps.findReviewer || findReviewerSession)(sessions, meta.bootstrapAttempts);
   const model = reviewer ? (readReviewerMarker(reviewer.id).model || reviewerModel()) : reviewerModel();
-  // Account precedence, deliberately: the session's own account if the daemon knows
-  // it, then the `reviewer` automation purpose, and only then (inside reviewBudget)
-  // KEEP_AGENT_ACCOUNT_ID. The env var describes whichever session happens to have
-  // spawned this process, which for the daemon is not the reviewer's account at all;
-  // the configured purpose is the operator's actual statement about what the reviewer
-  // spends. `keep review-tick` from a pane inherits that pane's env, so without this
-  // the same tick would be budgeted against two different windows.
+  // Account precedence, deliberately: the live reviewer pane's `meta.accountId` (the
+  // account the automation policy actually launched it on), then the session's own
+  // account if the daemon knows it, then the `reviewer` automation purpose, and only
+  // then (inside reviewBudget) KEEP_AGENT_ACCOUNT_ID. The env var describes whichever
+  // session happens to have spawned this process, which for the daemon is not the
+  // reviewer's account at all. `keep review-tick` from a pane inherits that pane's env,
+  // so without this the same tick would be budgeted against two different windows.
+  let reviewerPanes;
+  if (!options.force && deps.hostPanes) {
+    try { reviewerPanes = await deps.hostPanes(); } catch { reviewerPanes = undefined; }
+  }
   const budget = options.force
     ? { code: 0, reason: 'forced' }
-    : (deps.reviewBudget || reviewBudget)(model, undefined, (reviewer && reviewer.accountId) || reviewerAccountId());
+    : (deps.reviewBudget || reviewBudget)(model, undefined,
+      reviewerPaneAccountId(reviewerPanes, reviewer && reviewer.id) || (reviewer && reviewer.accountId) || reviewerAccountId());
   const queue = reviewQueue({ limit: Number.isFinite(TICK_LIMIT) && TICK_LIMIT > 0 ? TICK_LIMIT : 5 });
   const decision = options.force
     ? (reviewer ? { send: Boolean(queue.ranked.length), why: queue.ranked.length ? '' : 'nothing ranked' } : { send: false, why: 'no live reviewer session registered' })
@@ -5006,6 +5027,7 @@ module.exports = {
   accountLimits,
   reviewBudget,
   reviewerAccountId,
+  reviewerPaneAccountId,
   reviewerModel,
   tickMessage,
   driftTickMessage,

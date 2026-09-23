@@ -14399,6 +14399,9 @@ const reviewDeps = {
   // Bounded for finding the reviewer and deciding whether a tick is due; review.js
   // asks for { fresh: true } on the look it takes immediately before typing.
   sessions: (options = {}) => scanSessions({ fresh: false, ...options }),
+  // The reviewer pane's meta names the account the automation policy launched it on;
+  // the budget governor reads the reviewer's windows from that account.
+  hostPanes: () => listHostPanes({}, false),
   sessionContextTokens,
   compact: (sessionId, instruction) => withInjectionLock(() => compactSessionById({ sessionId, instruction }), { session: sessionId, model: true }),
   who: (project) => buildWhoSnapshot(project),

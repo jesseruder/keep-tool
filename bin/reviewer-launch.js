@@ -32,12 +32,30 @@ function reviewerEnv(root, family, bashOutput) {
   };
 }
 
+// The account the automation policy names for the reviewer: `automationAccounts.reviewer`
+// while it has room for this model, else the pool account with the most. A spent pool
+// is a refusal to start, with the reason `keep reviewer` prints — when it can run again
+// and where every pool account's windows stand.
+function reviewerAccount(model, accountApi, deps = {}) {
+  const select = deps.selectAccount || require('./account-budget').select;
+  const choice = select({ purpose: 'reviewer', model, ...(deps.accounts ? { accountApi } : {}) });
+  if (choice.deferred) {
+    const error = new Error(`not starting the fleet reviewer: ${choice.reason}`);
+    error.code = 'ACCOUNT_DEFERRED';
+    error.retryAt = choice.retryAt;
+    throw error;
+  }
+  const account = choice.record || accountApi.get(choice.account);
+  if (!account || account.agent !== 'claude') throw new Error(`reviewer account ${choice.account} is not a Claude account`);
+  return account;
+}
+
 async function launch(args, root, deps = {}) {
   const model = args[0] || process.env.KEEP_REVIEWER_MODEL || 'fable';
   const family = ['fable', 'opus', 'sonnet', 'haiku'].find((name) => model.includes(name)) || model;
   const sessionId = (deps.randomUUID || crypto.randomUUID)();
   const accountApi = deps.accounts || require('./accounts.js');
-  const account = deps.account || accountApi.automationFor('claude', 'reviewer');
+  const account = deps.account || reviewerAccount(model, accountApi, deps);
   const shared = (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(account, root);
   const argv = ['claude', ...reviewerFlags(model), ...(shared.mcpConfig ? ['--mcp-config', shared.mcpConfig] : []),
     '--session-id', sessionId, ...args.slice(1)];
@@ -70,4 +88,4 @@ async function launch(args, root, deps = {}) {
   } finally { client.close(); }
 }
 
-module.exports = { launch, reviewerFlags, reviewerEnv, reviewerBashOutput, REVIEWER_SETTINGS, REVIEWER_BASH_OUTPUT_CHARS };
+module.exports = { launch, reviewerAccount,reviewerFlags, reviewerEnv, reviewerBashOutput, REVIEWER_SETTINGS, REVIEWER_BASH_OUTPUT_CHARS };

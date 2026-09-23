@@ -3669,3 +3669,44 @@ test('the reviewer is found from bounded rows and re-looked at fresh before anyt
   assert.equal(result.compacted, true);
   assert.deepEqual(asked, ['default', { fresh: true }]);
 });
+
+test('the budget governor judges the reviewer against the account its live pane runs on', async () => {
+  const cadence = require('./review.js');
+  const health = require('./health.js');
+  cadence.mutateMeta((meta) => { meta.drift = {}; meta.fallback = {}; meta.sweepTick = {}; delete meta.lastTickAt; });
+  const original = health.record;
+  health.record = () => {};
+  const judged = [];
+  // The transcript row says tertiary (the config map's pick); the pane the policy
+  // launched says secondary, and that is the account the reviewer is spending.
+  const reviewer = { id: 'reviewer-1', kind: 'claude', state: 'idle', endedTurn: true, accountId: 'claude-tertiary' };
+  const panes = [
+    { id: 'p-old', alive: false, meta: { reviewer: true, sessionId: 'reviewer-0', accountId: 'claude-tertiary' } },
+    { id: 'p-1', alive: true, meta: { reviewer: true, sessionId: 'reviewer-1', accountId: 'claude-secondary' } },
+  ];
+  const deps = {
+    sessions: () => [reviewer],
+    findReviewer: (sessions) => sessions[0] || null,
+    hostPanes: async () => panes,
+    reviewBudget: (_model, _snapshot, accountId) => { judged.push(accountId); return { code: 6, reason: 'spent' }; },
+    lastVerdictAt: () => 0,
+    lintSnapshotAgeMs: () => 0,
+    refreshLint: async () => ({ ok: true }),
+    send: async () => {},
+  };
+  try {
+    await cadence.reviewTick(deps, { trigger: 'sweep', sweepDue: true });
+    assert.deepEqual(judged, ['claude-secondary']);
+    // No live reviewer pane: the session's own account, as before.
+    judged.length = 0;
+    await cadence.reviewTick({ ...deps, hostPanes: async () => [panes[0]] }, { trigger: 'sweep', sweepDue: true });
+    assert.deepEqual(judged, ['claude-tertiary']);
+    // The host could not be asked: never fatal, same fallback.
+    judged.length = 0;
+    await cadence.reviewTick({ ...deps, hostPanes: async () => { throw new Error('host down'); } }, { trigger: 'sweep', sweepDue: true });
+    assert.deepEqual(judged, ['claude-tertiary']);
+  } finally { health.record = original; }
+  assert.equal(cadence.reviewerPaneAccountId(panes, 'reviewer-1'), 'claude-secondary');
+  assert.equal(cadence.reviewerPaneAccountId(panes, 'someone-else'), undefined);
+  assert.equal(cadence.reviewerAccountId({}, panes), 'claude-secondary');
+});
