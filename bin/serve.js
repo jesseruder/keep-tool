@@ -12636,10 +12636,13 @@ function sessionMoveDeps(deps = {}) {
         await sleep(250);
       }
     },
+    // The card keeps its link where it stands: only the entry's node changes, never
+    // its order, its time or who owns the card, and nothing is pushed.
     relink: (record) => {
-      const card = keep.loadAll(false).find((task) => (task.fm.sessions || []).some((entry) => entry.id === record.sessionId));
+      const scope = { root };
+      const card = keep.loadAll(true, scope).find((task) => (task.fm.sessions || []).some((entry) => entry.id === record.sessionId));
       if (!card) return null;
-      (deps.linkLaunchedSession || keep.linkLaunchedSession)(card.id, { id: record.sessionId, agent: 'claude', node: record.to });
+      (deps.relinkSessionNode || keep.relinkSessionNode)(card.id, record.sessionId, record.to, scope);
       return card.id;
     },
     cleanup: async (record) => {

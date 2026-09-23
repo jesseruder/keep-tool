@@ -468,6 +468,30 @@ function linkLaunchedSession(taskId, session, scope) {
   }, { scope });
 }
 
+// A session that moved to another node keeps its place on its card: the entry's
+// `node` is set (or dropped, back on the daemon node) where it stands, with its order,
+// its `at` and the card's ownership untouched, and the change is committed locally.
+function relinkSessionNode(taskId, sessionId, node, scope) {
+  if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sessionId)) return null;
+  const name = node === undefined || node === null ? null : String(node);
+  if (name !== null && !nodes.NODE_NAME_RE.test(name)) throw new Error(`invalid node name: ${node}`);
+  const { root } = scopeFor(scope);
+  return withLock(() => {
+    const task = loadAll(true, scope).find((entry) => entry.id === taskId);
+    if (!task || !Array.isArray(task.fm.sessions)) return null;
+    const entry = task.fm.sessions.find((session) => session.id === sessionId);
+    if (!entry) return null;
+    const remote = name !== null && name !== nodes.daemonNode();
+    if (remote ? entry.node === name : entry.node === undefined) return { relinked: sessionId, node: remote ? name : null, changed: false };
+    if (remote) entry.node = name;
+    else delete entry.node;
+    const file = fs.existsSync(taskPath(task.id, root)) ? taskPath(task.id, root) : path.join(paths(root).archive, `${task.id}.md`);
+    fs.writeFileSync(file, serializeTask(task));
+    commitAndPush(`keep: move ${task.id}`, ['tasks', 'archive'], { push: false, scope });
+    return { relinked: sessionId, node: remote ? name : null, changed: true };
+  }, { scope });
+}
+
 function linkSession(taskId, session, options = {}) {
   const scope = options.scope;
   const { root } = scopeFor(scope);
@@ -1869,7 +1893,7 @@ module.exports = {
   STATUS_COLOR, nowStamp, relativeDurationMs, parseWhen, stampOf, parseTask, parseFrontmatterScalar,
   serializeTask, taskPath, loadTask, loadTaskAnywhere, warnedFiles, loadAll, saveTask, recordDoneTransition,
   slugify, currentSession, delegationDependencies, currentDelegation, commandSession, resumeCommand,
-  claimSession, releaseCardSession, linkLaunchedSession, linkSession, isReviewerSession, reviewerLabel,
+  claimSession, releaseCardSession, linkLaunchedSession, relinkSessionNode, linkSession, isReviewerSession, reviewerLabel,
   attributeHeading, countReviewerStatusChange, sessionInTaskProject, recordScheduler, clearScheduler,
   invalidateSchedulerHandoff, recordProgressMarker, recordContribution, recordSession,
   warnSkippedSessionLink, parsePlan, renderPlan, setPlan, nextStep, demoteHeadings, appendLog,

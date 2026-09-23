@@ -285,3 +285,21 @@ test('the abandon\'s flip back names the source in the location record again', (
     assert.equal(accounts.sessionNode(SID, { root, env }), 'main');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('the move relinks the card\'s entry for the session in place, through relinkSessionNode', () => {
+  const keep = require('./keep-core.js');
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-move-relink-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    const task = keep.parseTask(keep.serializeTask({ id: 'moving-card', fm: { title: 'x', status: 'active', kind: 'task', tags: ['personal'],
+      project: '', created: '2026-09-21', updated: '2026-09-21T08:00' }, body: 'x\n' }), 'moving-card');
+    task.fm.sessions = [{ id: SID, agent: 'claude', at: '2026-09-21T08:00' }, { id: 'sid-other', agent: 'claude', at: '2026-09-21T09:00' }];
+    fs.writeFileSync(path.join(root, 'tasks', 'moving-card.md'), keep.serializeTask(task));
+    const calls = [];
+    const linked = serve.sessionMoveDeps({ root, daemonNode: 'main', relinkSessionNode: (...args) => calls.push(args),
+      linkLaunchedSession: () => assert.fail('a move never re-claims the card') })
+      .relink({ sessionId: SID, to: 'aws1' });
+    assert.equal(linked, 'moving-card');
+    assert.deepEqual(calls, [['moving-card', SID, 'aws1', { root }]]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

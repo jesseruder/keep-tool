@@ -94,3 +94,34 @@ test('a scoped recordSession records the identity the scope names, in the regist
     assert.equal((bare.fm.sessions || []).length, 0);
   } finally { fs.rmSync(other, { recursive: true, force: true }); }
 });
+
+test('a moved session keeps its place on its card: only the entry\'s node changes', () => {
+  const other = registry();
+  try {
+    const sessions = [
+      { id: 'sid-first', agent: 'claude', at: '2026-09-20T08:00' },
+      { id: 'sid-moving', agent: 'claude', at: '2026-09-21T09:00' },
+      { id: 'sid-last', agent: 'codex', at: '2026-09-21T10:00' },
+    ];
+    const task = keep.parseTask(card('moving-card'), 'moving-card');
+    task.fm.sessions = sessions.map((entry) => ({ ...entry }));
+    fs.writeFileSync(path.join(other, 'tasks', 'moving-card.md'), keep.serializeTask(task));
+    const scope = { root: other };
+    const read = () => keep.loadTask('moving-card', other).fm.sessions;
+
+    assert.deepEqual(keep.relinkSessionNode('moving-card', 'sid-moving', 'aws1', scope), { relinked: 'sid-moving', node: 'aws1', changed: true });
+    assert.deepEqual(read(), [sessions[0], { ...sessions[1], node: 'aws1' }, sessions[2]], 'order and at unchanged, node set');
+    const log = () => spawnSync('git', ['-C', other, 'log', '--format=%s'], { encoding: 'utf8' }).stdout.trim().split('\n');
+    assert.deepEqual(log(), ['keep: move moving-card']);
+    assert.equal(fs.existsSync(path.join(other, '.keep', 'card-usage')), false, 'no ownership was recorded');
+
+    // Asked again, nothing changes; back on the daemon node the entry carries no node.
+    assert.equal(keep.relinkSessionNode('moving-card', 'sid-moving', 'aws1', scope).changed, false);
+    assert.deepEqual(keep.relinkSessionNode('moving-card', 'sid-moving', 'main', scope), { relinked: 'sid-moving', node: null, changed: true });
+    assert.deepEqual(read(), sessions);
+    assert.equal(log().length, 2);
+    assert.equal(keep.relinkSessionNode('moving-card', 'sid-unknown', 'aws1', scope), null);
+    assert.equal(keep.relinkSessionNode('missing-card', 'sid-moving', 'aws1', scope), null);
+    assert.throws(() => keep.relinkSessionNode('moving-card', 'sid-moving', 'AWS 1', scope), /invalid node name/);
+  } finally { fs.rmSync(other, { recursive: true, force: true }); }
+});
