@@ -179,6 +179,12 @@ test('real dashboard routes use the worker snapshot across full, console, mobile
   assert.equal(moveRefused.body.status, 'recovery-needed');
   const [fenceEpoch, fenceSequence] = fence.split(':');
   assert.equal(moveRefused.headers['x-keep-mutation-fence'], `${fenceEpoch}:${Number(fenceSequence) + 1}`);
+  // A dry run against the same journal changed nothing, and advances no fence.
+  const dryRefused = await request(port, '/api/move-session', { method: 'POST', headers: { 'x-keep': '1' },
+    body: { sessionId: 'stuck-session', node: 'aws1', dry: true } });
+  assert.equal(dryRefused.status, 409, JSON.stringify(dryRefused.body));
+  assert.equal(dryRefused.body.status, 'recovery-needed');
+  assert.equal(dryRefused.headers['x-keep-mutation-fence'], undefined);
   const moveBad = await request(port, '/api/move-session', { method: 'POST', headers: { 'x-keep': '1' }, body: { sessionId: '../x', node: 'aws1' } });
   assert.equal(moveBad.status, 400);
   assert.equal(moveBad.headers['x-keep-mutation-fence'], undefined);

@@ -805,7 +805,8 @@ function routes(ctx) {
         } catch (error) {
           // A move that stopped part way was journalled as recovery-needed: the
           // console's reload after this 409 must see Retry and Abandon, so it is fenced.
-          if (error.extra && error.extra.status === 'recovery-needed') {
+          // A dry run changed nothing (the journal it names was already published).
+          if (error.extra && error.extra.status === 'recovery-needed' && !(body && body.dry === true)) {
             res.keepStateChanged = true;
             broadcast();
           }
