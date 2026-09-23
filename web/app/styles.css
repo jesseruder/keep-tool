@@ -284,14 +284,19 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .mark-dot.mark-blue, .mark-swatch.mark-blue { background: var(--mark-blue); }
 .mark-dot.mark-purple, .mark-swatch.mark-purple { background: var(--mark-purple); }
 .mark-dot.mark-pink, .mark-swatch.mark-pink { background: var(--mark-pink); }
-/* A colored session's queue row is tinted with its mark instead of showing a dot. */
+/* A colored session's queue row is filled with its mark instead of showing a dot,
+   and every line of it switches to one dark ink so it reads on any of the eight
+   colors in either theme. The state and kind labels drop their own colors too:
+   green or amber text on a colored row is unreadable. */
 .qitem.mark-red { --row-mark: var(--mark-red); } .qitem.mark-orange { --row-mark: var(--mark-orange); }
 .qitem.mark-yellow { --row-mark: var(--mark-yellow); } .qitem.mark-green { --row-mark: var(--mark-green); }
 .qitem.mark-teal { --row-mark: var(--mark-teal); } .qitem.mark-blue { --row-mark: var(--mark-blue); }
 .qitem.mark-purple { --row-mark: var(--mark-purple); } .qitem.mark-pink { --row-mark: var(--mark-pink); }
-.qitem.marked { background: color-mix(in srgb, var(--row-mark) 22%, transparent); }
-.qitem.marked:hover { background: color-mix(in srgb, var(--row-mark) 30%, var(--panel-2)); }
-.qitem.marked.sel { background: color-mix(in srgb, var(--row-mark) 34%, var(--sel)); }
+.qitem.marked { --mark-ink: #1b1a17; background: color-mix(in srgb, var(--row-mark) 80%, white); }
+.qitem.marked:hover { background: color-mix(in srgb, var(--row-mark) 88%, white); }
+.qitem.marked.sel { background: color-mix(in srgb, var(--row-mark) 94%, white); }
+.qitem.marked :is(.t, .t.untitled, .kind) { color: var(--mark-ink); }
+.qitem.marked :is(.num-id, .w, .w.long, .p, .pj, .card, .s) { color: color-mix(in srgb, var(--mark-ink) 72%, transparent); }
 /* The Actions-menu block that sets one: one column, except that the emoji field
    and the picker's toggle share a row. */
 .mark-controls { display: grid; grid-template-columns: auto 1fr; gap: 4px 0; align-items: center; }
