@@ -1386,28 +1386,8 @@ function deployCommand(command) {
   return null;
 }
 
-function deployProvenance(cwd, ref) {
-  const git = (args) => execFileSync('git', ['-C', cwd, '--no-optional-locks', ...args], {
-    encoding: 'utf8', timeout: 10e3, stdio: ['ignore', 'pipe', 'ignore'],
-  }).trim();
-  let repo;
-  try { repo = git(['rev-parse', '--show-toplevel']); } catch { return null; }
-  let sha = '';
-  try { sha = git(['rev-parse', '--verify', `${ref || 'HEAD'}^{commit}`]); } catch {
-    try { sha = git(['rev-parse', '--verify', 'HEAD^{commit}']); } catch { return null; }
-  }
-  let dirty = [];
-  try {
-    // -z keeps the two status columns intact; a trimmed first line loses its leading space
-    dirty = execFileSync('git', ['-C', cwd, '--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=normal'], {
-      encoding: 'utf8', timeout: 10e3, stdio: ['ignore', 'pipe', 'ignore'],
-    }).split('\0').filter(Boolean).map((line) => line.slice(3)).filter(Boolean);
-  } catch {}
-  const landed = require('../landed.js');
-  const branch = landed.defaultBranch(repo);
-  const onOrigin = branch ? landed.isOnDefault(repo, sha, branch) : null;
-  return { repo, sha, dirty, branch, onOrigin };
-}
+// Shared with a node's hook, which computes it where the checkout is (bin/repo-facts.js).
+const { deployProvenance } = require('../repo-facts.js');
 
 const DEPLOY_FAILURE_RE = /error: failed to push|! \[rejected\]|\[remote rejected\]|adb: failed to install|Failure \[|INSTALL_FAILED|fatal: |Permission denied \(publickey\)/;
 

@@ -63,13 +63,16 @@ function gitTopLevel(input) {
   } catch { return null; }
 }
 
-function mainCheckout(input) {
+// `options.timeout` bounds each git call (a node's hook computing repo facts);
+// without it the calls are unbounded, as they always were.
+function mainCheckout(input, options = {}) {
+  const bound = options.timeout ? { timeout: options.timeout } : {};
   try {
     const context = existingContext(input);
-    const top = fs.realpathSync(git(context, ['rev-parse', '--show-toplevel']).trim());
+    const top = fs.realpathSync(git(context, ['rev-parse', '--show-toplevel'], bound).trim());
     const common = fs.realpathSync(git(context, [
       'rev-parse', '--path-format=absolute', '--git-common-dir',
-    ]).trim());
+    ], bound).trim());
     if (path.basename(common) === '.git') {
       const owner = fs.realpathSync(path.dirname(common));
       if (owner !== top) return owner;
