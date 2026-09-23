@@ -9904,6 +9904,20 @@ test('a Codex update notice with no prompt is waited out and named; with its pro
   await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),
     (error) => error.status === 504 && error.extra.awaitingUpdate === true
       && /waiting at its update prompt \(0\.155\.1 -> 0\.156\.1\), and a prompt under it waits for an answer; answer it in the pane/.test(error.message));
+  // The composer's placeholder on screen is a live prompt, even with the update
+  // prompt's option markers still above it: the wait ends there.
+  now = 0;
+  screen = '✨ Update available! 0.155.1 -> 0.156.1\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n\n› Ask Codex to do anything\n';
+  assert.equal(await waitForHostAgent({ pane: 'pane-update' }, 'codex', clock), true);
+  assert.equal(now, 0);
+  // The update prompt in a single frame, gone by the next read, is never refused.
+  now = 0;
+  const frames = ['✨ Update available! 0.155.1 -> 0.156.1\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n',
+    '› Ask Codex to do anything\n'];
+  let read = 0;
+  const once = { ...clock, host: { request: async () => ({ text: frames[Math.min(read++, frames.length - 1)] }) } };
+  assert.equal(await waitForHostAgent({ pane: 'pane-update' }, 'codex', once), true);
+  assert.equal(read, 2);
   // The sparkle with its emoji presentation selector is the same notice, prompt and all.
   now = 0;
   screen = '  ✨\uFE0F Update available! 0.155.1 -> 0.156.1\n\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n';

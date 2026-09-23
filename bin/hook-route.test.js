@@ -1794,3 +1794,45 @@ test('a Pi start is adopted only on A\'s shutdown in the same process and instan
   assert.equal((await hooks.context(AWS1, 'pi-b', { agent: 'pi', pane: 'p3@aws1' })).status, 403);
   assert.deepEqual(host.asked, []);
 });
+
+test('a node\'s context ask whose adoption outlasts the client timeout answers from the node\'s cache, on time', async (t) => {
+  const http = require('node:http');
+  const client = require('./hook-client.js');
+  const root = tempDir(t);
+  const configFile = path.join(root, 'config.json');
+  fs.writeFileSync(configFile, `${JSON.stringify({ version: 1, daemonNode: 'main', nodes: { main: {}, aws1: {} } })}\n`);
+  const env = { PATH: process.env.PATH, HOME: root, LANG: 'C', KEEP_CONFIG: configFile };
+  let asked = 0;
+  // aws1's host never answers: the adoption runs to its own deadline (about 2 s).
+  const registry = createRegistryService({ root, spawn: fakeSpawn().spawn, daemonNode: () => 'main', env, configFile,
+    location: (id) => require('./accounts.js').sessionLocation(id, { root, env }),
+    hostConnect: () => { asked += 1; return new Promise(() => {}); } });
+  const hooks = createHookService({ root, registry });
+  const answered = [];
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const began = Date.now();
+    const answer = await hooks.context(AWS1, url.searchParams.get('session'),
+      { agent: url.searchParams.get('agent'), pane: url.searchParams.get('pane') });
+    answered.push({ status: answer.status, ms: Date.now() - began });
+    if (!res.destroyed) { res.writeHead(answer.status, { 'content-type': 'application/json' }); res.end(JSON.stringify(answer.body)); }
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const home = tempDir(t);
+  const nodeEnv = { HOME: home };
+  fs.mkdirSync(path.dirname(client.contextFile(nodeEnv)), { recursive: true });
+  fs.writeFileSync(client.contextFile(nodeEnv), JSON.stringify({ at: 1, steps: ['terraform apply'], sessions: {} }));
+  const began = Date.now();
+  const context = await client.hookContext({ env: nodeEnv, where: { url: `http://127.0.0.1:${server.address().port}` }, token: 'aws1-secret',
+    sessionId: 'codex-late', agent: 'codex', pane: 'p2@aws1', timeoutMs: 400 });
+  const took = Date.now() - began;
+  assert.deepEqual(context, { steps: ['terraform apply'], repairSession: null, fresh: false }, 'the last published steps, not fresh');
+  assert.ok(took < 1500, `the ask gave up at its own timeout (${took} ms), not the adoption's`);
+  // The daemon's adoption finishes on its own deadline and refuses; nothing waits on it.
+  await new Promise((resolve) => { const poll = () => (answered.length ? resolve() : setTimeout(poll, 50)); poll(); });
+  assert.equal(asked, 1);
+  assert.equal(answered[0].status, 403);
+  assert.ok(answered[0].ms >= 1900 && answered[0].ms < 3000, `the adoption ran to its deadline (${answered[0].ms} ms)`);
+  assert.equal(JSON.parse(fs.readFileSync(client.contextFile(nodeEnv), 'utf8')).at, 1, 'the late answer never reached the cache');
+});
