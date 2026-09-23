@@ -3,6 +3,8 @@
 
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -16,6 +18,7 @@ import {
   encodeMessage,
   loadUnpackedMessage,
   parseArgs,
+  prepareProfileDir,
 } from "../bin/headless-edge.js";
 import { EXTENSION_ID } from "../host/protocol.js";
 
@@ -112,6 +115,21 @@ test("the Edge path and the profile come from flags, then the environment, then 
   assert.throws(() => parseArgs(["--wat"], env), /Unknown argument/);
 });
 
+test("the profile is private on every start, even one that already existed open", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bb-profile-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const fresh = path.join(root, "fresh", "edge-profile");
+  prepareProfileDir(fresh);
+  assert.equal(fs.statSync(fresh).mode & 0o777, 0o700);
+
+  // The installer's recursive mkdir for the manifest copy can get there first, at 0755.
+  const existing = path.join(root, "existing");
+  fs.mkdirSync(path.join(existing, "NativeMessagingHosts"), { recursive: true });
+  fs.chmodSync(existing, 0o755);
+  prepareProfileDir(existing);
+  assert.equal(fs.statSync(existing).mode & 0o777, 0o700);
+});
+
 // --- the supervisor -------------------------------------------------------
 
 /** A child process as much as the supervisor sees of one: fds 3 and 4, kill, exit. */
@@ -193,6 +211,7 @@ function harness(overrides = {}) {
     maxDelayMs: 8_000,
     stableMs: 30_000,
     killGraceMs: 5_000,
+    loadTimeoutMs: 40_000,
     ...overrides,
   });
   return { supervisor, clock, children, spawned, lines };
@@ -217,20 +236,59 @@ test("each start spawns Edge with the pipe on fds 3 and 4 and asks it to load th
   assert.equal(lines.some((line) => line.startsWith("expected extension id")), false);
 });
 
-test("a load error, a wrong id and an unreadable message are logged, and nothing restarts", async () => {
-  const { supervisor, children, spawned, lines } = harness();
+test("a wrong id and an unreadable message are logged, and nothing restarts", async () => {
+  const { supervisor, clock, children, spawned, lines } = harness();
   supervisor.start();
   const child = children[0];
-  child.reply({ id: 1, error: { code: -32000, message: "Manifest file is missing or unreadable" } });
   // Two frames in one write, the second not JSON: the first must still be read.
   child.output.write(Buffer.concat([encodeMessage({ id: 1, result: { id: "abcdefghijklmnopabcdefghijklmnop" } }), Buffer.from("{nope\0")]));
   child.reply({ method: "Target.targetCreated", params: {} }); // not ours: ignored
   await flush();
-  assert.ok(lines.includes("Extensions.loadUnpacked failed: Manifest file is missing or unreadable"));
   assert.ok(lines.some((line) => line.startsWith(`expected extension id ${EXTENSION_ID}`)));
   assert.ok(lines.includes("unreadable CDP message (5 chars)"));
+  assert.deepEqual(clock.pending(), [], "an answer clears the load timeout");
+  clock.advance(120_000);
   assert.equal(spawned.length, 1);
   assert.deepEqual(child.signals, []);
+});
+
+test("a load error stops that Edge, killing it if it lingers, and the backoff starts another", async () => {
+  const { supervisor, clock, children, spawned, lines } = harness();
+  supervisor.start();
+  const child = children[0];
+  child.reply({ id: 1, error: { code: -32000, message: "Manifest file is missing or unreadable" } });
+  await flush();
+  assert.ok(lines.includes("Extensions.loadUnpacked failed: Manifest file is missing or unreadable; restarting Edge"));
+  assert.deepEqual(child.signals, ["SIGTERM"]);
+  assert.deepEqual(clock.pending(), [5_000], "only the kill timer: the load timeout is gone");
+  clock.advance(5_000);
+  assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+  child.exit(null, "SIGKILL");
+  assert.deepEqual(clock.pending(), [1_000]);
+  clock.advance(1_000);
+  assert.equal(spawned.length, 2);
+  // The new Edge is asked again.
+  await flush();
+  assert.deepEqual(Buffer.concat(children[1].written), encodeMessage(loadUnpackedMessage("/srv/bb/extension")));
+});
+
+test("an Edge that never answers the load is stopped after the timeout and started again", async () => {
+  const { supervisor, clock, children, spawned, lines } = harness();
+  supervisor.start();
+  const child = children[0];
+  clock.advance(39_999);
+  assert.deepEqual(child.signals, []);
+  clock.advance(1);
+  assert.deepEqual(child.signals, ["SIGTERM"]);
+  assert.ok(lines.includes("Extensions.loadUnpacked did not answer in 40 s; restarting Edge"));
+  // A late answer changes nothing now: it is already on its way out.
+  child.reply({ id: 1, result: { id: EXTENSION_ID } });
+  await flush();
+  assert.equal(lines.some((line) => line.startsWith("extension loaded")), false);
+  child.exit(0);
+  assert.deepEqual(clock.pending(), [1_000], "the kill timer is cleared and a restart is scheduled");
+  clock.advance(1_000);
+  assert.equal(spawned.length, 2);
 });
 
 test("Edge that keeps dying is restarted with a doubling delay, capped", () => {
@@ -280,7 +338,7 @@ test("an error from a running Edge is logged and does not start a second one", (
   const { supervisor, clock, children, spawned, lines } = harness();
   supervisor.start();
   children[0].emit("error", new Error("kill EPERM"));
-  assert.deepEqual(clock.pending(), []);
+  assert.deepEqual(clock.pending(), [40_000], "only its load timeout: no restart");
   assert.equal(spawned.length, 1);
   assert.ok(lines.includes("Edge process: kill EPERM"));
 });
@@ -334,10 +392,15 @@ test("stop during the backoff cancels the pending restart", async () => {
 });
 
 test("an overlong message from Edge restarts it rather than growing without bound", async () => {
-  const { supervisor, children, lines } = harness();
+  const { supervisor, clock, children, lines } = harness();
   supervisor.start();
   children[0].output.write(Buffer.alloc(MAX_FRAME_BYTES + 1, 0x61));
   await flush();
   assert.deepEqual(children[0].signals, ["SIGTERM"]);
   assert.ok(lines.some((line) => line.includes("without a terminator; restarting Edge")));
+  // One that ignores the SIGTERM gets the same grace as stop() gives, then SIGKILL.
+  clock.advance(5_000);
+  assert.deepEqual(children[0].signals, ["SIGTERM", "SIGKILL"]);
+  children[0].exit(null, "SIGKILL");
+  assert.deepEqual(clock.pending(), [1_000]);
 });

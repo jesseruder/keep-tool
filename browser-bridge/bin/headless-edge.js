@@ -124,9 +124,17 @@ export function createSupervisor({
   stableMs = 60_000,
   /** How long Edge gets to close after SIGTERM before it is killed outright. */
   killGraceMs = 10_000,
+  /**
+   * How long Edge gets to answer Extensions.loadUnpacked. An Edge that has not loaded the
+   * extension is no use to anyone, so one that fails the call or never answers it is stopped,
+   * and the backoff starts it again.
+   */
+  loadTimeoutMs = 30_000,
 }) {
   const args = edgeArgs(profileDir);
   let child = null;
+  /** The current Edge: its process, and the load and kill timers that belong to it. */
+  let run = null;
   let restartTimer = null;
   let delay = initialDelayMs;
   let stopping = false;
@@ -149,11 +157,15 @@ export function createSupervisor({
       return;
     }
     child = proc;
+    const current = { proc, loadTimer: null, killTimer: null };
+    run = current;
     let done = false;
     const finish = (reason) => {
       if (done) return;
       done = true;
+      clearRunTimers(current);
       if (child === proc) child = null;
+      if (run === current) run = null;
       exited(proc, reason, startedAt);
     };
 
@@ -169,11 +181,10 @@ export function createSupervisor({
       try {
         frames = decoder.push(chunk);
       } catch (error) {
-        log(`${error.message}; restarting Edge`);
-        proc.kill("SIGTERM");
+        terminate(current, error.message);
         return;
       }
-      for (const frame of frames) handleFrame(frame);
+      for (const frame of frames) handleFrame(frame, current);
     });
 
     proc.on("exit", (code, signal) => finish(signal ? `signal ${signal}` : `code ${code}`));
@@ -185,9 +196,42 @@ export function createSupervisor({
     });
 
     input.write(encodeMessage(loadUnpackedMessage(extensionPath)));
+    if (!done) {
+      current.loadTimer = setTimer(() => {
+        current.loadTimer = null;
+        terminate(current, `Extensions.loadUnpacked did not answer in ${loadTimeoutMs / 1000} s`);
+      }, loadTimeoutMs);
+    }
   }
 
-  function handleFrame(frame) {
+  function clearRunTimers(current) {
+    for (const key of ["loadTimer", "killTimer"]) {
+      if (current[key] !== null) {
+        clearTimer(current[key]);
+        current[key] = null;
+      }
+    }
+  }
+
+  /**
+   * Asks this Edge to close, and kills it if it has not gone after the grace period. Its exit
+   * is what schedules the restart (or, once stopping, resolves stop()), and clears the timer.
+   */
+  function terminate(current, reason) {
+    if (current.killTimer !== null) return; // already on its way out
+    if (reason) log(`${reason}; ${stopping ? "stopping" : "restarting"} Edge`);
+    if (current.loadTimer !== null) {
+      clearTimer(current.loadTimer);
+      current.loadTimer = null;
+    }
+    current.killTimer = setTimer(() => {
+      log(`Edge still running ${killGraceMs / 1000} s after SIGTERM; killing it`);
+      current.proc.kill("SIGKILL");
+    }, killGraceMs);
+    current.proc.kill("SIGTERM");
+  }
+
+  function handleFrame(frame, current) {
     let message;
     try {
       message = JSON.parse(frame);
@@ -196,9 +240,14 @@ export function createSupervisor({
       return;
     }
     if (message?.id !== LOAD_ID) return;
+    if (current.killTimer !== null) return; // this Edge is already being stopped
     if (message.error) {
-      log(`Extensions.loadUnpacked failed: ${message.error.message ?? JSON.stringify(message.error)}`);
+      terminate(current, `Extensions.loadUnpacked failed: ${message.error.message ?? JSON.stringify(message.error)}`);
       return;
+    }
+    if (current.loadTimer !== null) {
+      clearTimer(current.loadTimer);
+      current.loadTimer = null;
     }
     const id = message.result?.id;
     log(`extension loaded: ${id} from ${extensionPath}`);
@@ -233,18 +282,11 @@ export function createSupervisor({
         clearTimer(restartTimer);
         restartTimer = null;
       }
-      const proc = child;
-      if (!proc) return Promise.resolve();
+      const current = run;
+      if (!current) return Promise.resolve();
       return new Promise((resolve) => {
-        const grace = setTimer(() => {
-          log(`Edge still running ${killGraceMs / 1000} s after SIGTERM; killing it`);
-          proc.kill("SIGKILL");
-        }, killGraceMs);
-        onStopped = () => {
-          clearTimer(grace);
-          resolve();
-        };
-        proc.kill("SIGTERM");
+        onStopped = resolve;
+        terminate(current, null);
       });
     },
     /** For the tests: what is running and what is scheduled. */
@@ -280,6 +322,16 @@ export function parseArgs(argv, env = process.env) {
   return options;
 }
 
+/**
+ * Private: the profile will hold cookies for whatever the sessions browse. mkdir's mode does
+ * nothing to a directory that is already there - and the installer's recursive mkdir for the
+ * manifest copy may have made it first, 0755 - so the mode is set on every start.
+ */
+export function prepareProfileDir(profileDir) {
+  fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(profileDir, 0o700);
+}
+
 async function main(argv) {
   let options;
   try {
@@ -289,8 +341,7 @@ async function main(argv) {
     process.exitCode = 2;
     return;
   }
-  // Private: the profile will hold cookies for whatever the sessions browse.
-  fs.mkdirSync(options.profileDir, { recursive: true, mode: 0o700 });
+  prepareProfileDir(options.profileDir);
   const supervisor = createSupervisor(options);
   let signalled = false;
   const shutdown = async (signal) => {

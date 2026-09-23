@@ -121,7 +121,9 @@ Edge itself, since there is nobody at a screen to click **Load unpacked**:
   and 4, NUL-terminated JSON), sends `Extensions.loadUnpacked` for this checkout's
   `extension/` on every start and logs the id it got back to `edge.log`: it must be
   `goijgcbiphelgdlpjmpepfkihboonjbg`. If Edge exits, the wrapper starts it again with a
-  growing backoff; SIGTERM takes Edge down with it and stops.
+  growing backoff; so it does if the load fails or goes 30 s unanswered, since an Edge
+  without the extension is no use. SIGTERM takes Edge down with it and stops. The profile
+  directory is set to mode 0700 on every start.
 - Registration is the same `claude mcp add-json` into every `~/.claude*` config, with this
   machine's node, so any Claude session started afterwards has the `browser` tools.
 
@@ -150,6 +152,12 @@ systemctl --user start browser-bridge-edge
 
 Cookies live in the profile, so they survive restarts of the unit. Anything a session can
 reach through that profile, every session on the machine can reach.
+
+`--uninstall` disables and removes the units, the launcher and the manifests, but leaves
+`edge-profile/` (with its cookies) and the logs (`daemon.log`, `edge.log`, `host.log`) in
+the runtime directory; delete them by hand to be rid of them. Nothing rotates `edge.log`:
+the wrapper and Edge append to it for as long as the unit runs, so truncate it now and then
+on a long-lived node.
 
 ## Using it
 

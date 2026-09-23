@@ -24,6 +24,7 @@ import {
   renderPlan,
   startUnits,
   stopUnits,
+  systemdExecArg,
   systemdQuote,
 } from "../bin/install.js";
 import { DEFAULT_DAEMON_PORT, EXTENSION_ID, HOST_NAME } from "../host/protocol.js";
@@ -159,6 +160,25 @@ test("XDG_CONFIG_HOME and XDG_STATE_HOME move the Linux paths", (t) => {
   assert.match(plan.files.find((file) => file.path === daemonUnitPath(env)).content, new RegExp(
     `Environment=BROWSER_BRIDGE_RUNTIME_DIR="${env.HOME}/state/browser-bridge"`,
   ));
+});
+
+test("a dollar sign in the checkout is doubled on ExecStart= and nowhere else", (t) => {
+  const env = fakeHome(t);
+  assert.equal(systemdExecArg("/srv/$HOME/${USER}"), '"/srv/$$HOME/$${USER}"');
+  const checkout = "/srv/$HOME bb";
+  const plan = buildPlan(LINUX, env, checkout);
+  const daemon = plan.files.find((file) => file.path === daemonUnitPath(env)).content;
+  const edge = plan.files.find((file) => file.path === edgeUnitPath(env)).content;
+  assert.match(daemon, /^ExecStart="[^"]+" "\/srv\/\$\$HOME bb\/mcp\/daemon\.js"$/m);
+  assert.match(edge, /^ExecStart="[^"]+" "\/srv\/\$\$HOME bb\/bin\/headless-edge\.js" "--user-data-dir" "[^"]+"$/m);
+  // WorkingDirectory= expands nothing, so its dollar sign stays single.
+  for (const unit of [daemon, edge]) assert.match(unit, /^WorkingDirectory=\/srv\/\$HOME bb$/m);
+  // A profile under the same odd directory: doubled as an argument, single in the manifest path.
+  const profile = path.join(env.HOME, "$p");
+  const withProfile = buildPlan({ ...LINUX, userDataDir: profile }, env, checkout);
+  const edgeWithProfile = withProfile.files.find((file) => file.path === edgeUnitPath(env)).content;
+  assert.ok(edgeWithProfile.includes(`"--user-data-dir" "${env.HOME}/$$p"`));
+  assert.ok(withProfile.files.some((file) => file.path === profileManifestPath(profile)));
 });
 
 test("--user-data-dir puts the profile's manifest where it is told, on either platform", (t) => {
@@ -308,7 +328,12 @@ test("a Linux dry run shows the systemd sequence and how the extension gets load
 
 test("a real Linux run stops before removing and starts after writing", async (t) => {
   const env = fakeHome(t);
+  // A profile an earlier install made world-readable is made private again.
+  const profile = path.join(env.HOME, RUNTIME, "edge-profile");
+  fs.mkdirSync(profile, { recursive: true });
+  fs.chmodSync(profile, 0o755);
   const { calls, output } = await runInstaller([], env);
+  assert.equal(fs.statSync(profile).mode & 0o777, 0o700);
   assert.ok(fs.existsSync(daemonUnitPath(env)));
   assert.ok(fs.existsSync(edgeUnitPath(env)));
   assert.ok(fs.existsSync(path.join(env.HOME, RUNTIME, "edge-profile/NativeMessagingHosts", `${HOST_NAME}.json`)));

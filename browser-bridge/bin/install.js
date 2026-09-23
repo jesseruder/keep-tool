@@ -257,6 +257,16 @@ export function systemdQuote(value) {
 }
 
 /**
+ * An argument on an ExecStart= line. systemd expands `$VAR` and `${VAR}` there even inside
+ * double quotes, so on top of systemdQuote a literal `$` is doubled. Only there: the other
+ * settings here (Environment=, WorkingDirectory=, append:) do no variable expansion, and a
+ * doubled `$` in them would be two dollar signs.
+ */
+export function systemdExecArg(value) {
+  return systemdQuote(value).replace(/\$/g, "$$$$");
+}
+
+/**
  * For the settings that take the rest of the line as one path and do no unquoting
  * (WorkingDirectory=, StandardOutput=append:): only the specifiers need escaping.
  */
@@ -295,7 +305,7 @@ export function daemonUnit(nodePath, env = process.env, projectDir = PROJECT_DIR
     "Description=Browser Bridge MCP daemon",
     "",
     "[Service]",
-    `ExecStart=${systemdQuote(nodePath)} ${systemdQuote(path.join(projectDir, "mcp", "daemon.js"))}`,
+    `ExecStart=${systemdExecArg(nodePath)} ${systemdExecArg(path.join(projectDir, "mcp", "daemon.js"))}`,
     `WorkingDirectory=${systemdPath(projectDir)}`,
     `Environment=BROWSER_BRIDGE_RUNTIME_DIR=${systemdQuote(runtimeDir(env, "linux"))}`,
     `StandardOutput=append:${systemdPath(log)}`,
@@ -328,7 +338,7 @@ export function edgeUnit(nodePath, env = process.env, projectDir = PROJECT_DIR, 
     "[Service]",
     // The profile is named even when it is the default, so the unit and the manifest copy the
     // installer wrote cannot disagree about where it is.
-    `ExecStart=${[nodePath, script, "--user-data-dir", userDataDir].map(systemdQuote).join(" ")}`,
+    `ExecStart=${[nodePath, script, "--user-data-dir", userDataDir].map(systemdExecArg).join(" ")}`,
     `WorkingDirectory=${systemdPath(projectDir)}`,
     `Environment=BROWSER_BRIDGE_RUNTIME_DIR=${systemdQuote(runtimeDir(env, "linux"))}`,
     `StandardOutput=append:${systemdPath(log)}`,
@@ -1287,6 +1297,12 @@ export async function main(argv, env = process.env, hooks = {}) {
     );
   }
   if (plan.systemd) stopUnits(plan.systemd, { run });
+  if (plan.systemd && plan.userDataDir && !options.uninstall) {
+    // The manifest copy below would make the profile with a recursive mkdir, 0755; it will
+    // hold the headless Edge's cookies, so it is made private first (and on every install).
+    fs.mkdirSync(plan.userDataDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(plan.userDataDir, 0o700);
+  }
   for (const file of plan.files) writeFile(file);
   for (const target of plan.removals) removeFile(target);
   for (const edit of plan.edits ?? []) applyEdit(edit);
