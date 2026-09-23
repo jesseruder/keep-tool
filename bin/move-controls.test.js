@@ -89,10 +89,20 @@ test('a Watch pane moves the session it names, from where that session is, not a
 test('move controls stay hidden on one node, for other agents, during a handoff, and on a session with no live pane', () => {
   assert.equal(context.moveControlsHTML(fixture({ nodes: [fleet[0]] }), session(), { live: true }), '');
   assert.equal(context.moveControlsHTML(fixture({ nodes: undefined }), session(), { live: true }), '', 'an older daemon publishes no nodes');
-  assert.equal(context.moveControlsHTML(fixture(), session({ kind: 'codex' }), { live: true }), '');
+  assert.equal(context.moveControlsHTML(fixture(), session({ kind: 'pi' }), { live: true }), '');
+  assert.equal(context.moveControlsHTML(fixture(), session({ kind: undefined, agent: 'pi' }), { live: true }), '');
   assert.equal(context.moveControlsHTML(fixture(), session(), { live: true, pendingHandoff: true }), '');
   assert.equal(context.moveControlsHTML(fixture(), session(), { live: false }), '');
   assert.equal(context.moveControlsHTML(fixture(), null, { live: true }), '');
+});
+
+test('a Codex session is offered the move as a Claude one is, live or stopped', () => {
+  assert.match(context.moveControlsHTML(fixture(), session({ kind: 'codex' }), { live: true }), /Move to another machine/);
+  assert.match(context.moveControlsHTML(fixture(), session({ kind: undefined, agent: 'codex', node: 'aws1' }), { live: true }),
+    /title="Stops this session on aws1[^"]*">Move to another machine/);
+  assert.match(context.moveControlsHTML(fixture(), session({ kind: 'codex', exited: true, node: 'aws1', nodeRecorded: true }), { live: false }),
+    /Move to another machine/);
+  assert.doesNotMatch(context.moveControlsHTML(fixture(), session({ kind: 'codex' }), { live: true }), /Claude/);
 });
 
 test('a stopped session whose location is recorded is offered a move from the machine it is on', () => {

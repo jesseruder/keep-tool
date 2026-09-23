@@ -1249,15 +1249,21 @@ bare `claude --resume` / `codex resume` form for a human who knows what it gives
 
 ## Moving a session to another node
 
-`keep move <#n|session-id> --node <name>` stops a Claude session where it runs, carries
-its files to the other node, and resumes it there: the same conversation, on the same
-account, with the same model and permission class. It is the fleet's way to drain a
+`keep move <#n|session-id> --node <name>` stops a Claude or Codex session where it runs,
+carries its files to the other node, and resumes it there: the same conversation, on the
+same account, with the same model and permission class. It is the fleet's way to drain a
 machine (the laptop to `aws1` and back); `keep handoff` still moves a session between
 accounts on one machine, and `keep transfer` is still the fresh portable continuation.
 
-What moves is the session's own files under its account's config directory: the
-transcript `projects/<slug>/<sid>.jsonl`, its session tree `projects/<slug>/<sid>/`, any
-`<sid>.superseded-*` tree under another project, and `file-history/<sid>/`. Every node
+What moves is the session's own files under its account's config directory. For Claude:
+the transcript `projects/<slug>/<sid>.jsonl`, its session tree `projects/<slug>/<sid>/`,
+any `<sid>.superseded-*` tree under another project, and `file-history/<sid>/`. For
+Codex: the root rollout `sessions/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl` and the rollout of
+every child thread whose parent chain leads back to it (from `sessions/` or
+`archived_sessions/`), found by each rollout's own session_meta. What does not move for
+Codex: the account's `session_index.jsonl` (thread titles), `history.jsonl`, its sqlite
+state and anything else in the profile; the target keeps its own, and resuming by id
+does not need them. An archived root is refused (unarchive it first). Every node
 shares one home path, so they land at the same paths on the other machine. A node's host
 answers the `artifacts` verb for this (`bin/session-artifacts.js`): it lists and reads a
 session's files, stages what it is sent under `<configDir>/.keep-move/<tx>/` (4 MiB a
@@ -1270,9 +1276,12 @@ Before anything stops, the move refuses when:
 
 - only one node is configured (`keep move needs another node`), or the session is
   already on the node named;
-- the session is not a Claude session (Codex and Pi are refused by name for now);
-- a node end's host predates the `artifacts` verb (update keep-tool there and reload its
-  host);
+- the session is not a Claude or Codex session (a Pi session is refused by name);
+- a node end's host predates the `artifacts` verb, or, for a Codex session, answers a
+  version before 2 (update keep-tool there and reload its host);
+- the model a Codex session runs on cannot be established: its pane's launch model, the
+  `-m` its process was given, or the last `turn_context` of its rollout (read on its
+  own node);
 - the session's working directory does not exist on the target;
 - the target does not have the session's account (its own configuration must name it
   and its directory must be there), or could not launch it: the target runs
@@ -1280,11 +1289,23 @@ Before anything stops, the move refuses when:
   a shared setup's MCP configuration and writes nothing;
 - a message to the session is still unconfirmed, an account handoff is in flight, a
   compaction has not restored its model, or a restart for it is queued, running or
-  waiting for recovery;
+  waiting for recovery; for Codex also while a compaction swap record exists for it
+  (even one deferred for a rate limit) or its restart ledger tracks open background
+  jobs, since both name the daemon's own files and do not follow a move;
 - the session is working (its turn has not ended) and `--force` was not given;
 - the session is live on a node other than the daemon's and `--force` was not given: the
   graceful stop proves background work from the transcript, which the daemon cannot
-  read on another node, so a move off a node is Owner's forced stop for now.
+  read on another node, so a move off a node is Owner's forced stop for now. A Codex
+  session on a node counts as live when its node's process table shows it (an agent
+  holding its rollout open), pane or not.
+
+A Codex session resumes on the target as `codex [flags] [-m <model>] resume <sid>`: the
+permission flag its source process ran with (`--dangerously-bypass-approvals-and-sandbox`
+or none; Keep's default when no process was read) and the model established above. Codex
+reports its session-start only at its first turn, so the move also accepts the target's
+own process evidence (the launch pane's process arguing `resume <sid>` or holding the
+rollout open) and writes the pane record itself. `keep tell` to a Codex session on a
+node other than the daemon's is still unsupported: open its pane, or move it back.
 
 `--dry` prints what the move would do and changes nothing. `--force` is Owner's own move,
 as with `keep handoff --force`: the source is signalled instead of being asked to exit.

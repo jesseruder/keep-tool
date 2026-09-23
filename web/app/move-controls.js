@@ -1,10 +1,12 @@
 import { dismissWriteFailure, write } from './api.js';
 import { runAction } from './action.js';
 
-// Moving a Claude session to another machine (POST /api/move-session, bin/session-move.js):
+// Moving a Claude or Codex session to another machine (POST /api/move-session, bin/session-move.js):
 // stopped where it runs, its files carried and verified, resumed on the other node.
 // A real move takes minutes; the CLI gives it half an hour, and so does this.
 const MOVE_TIMEOUT_MS = 30 * 60e3;
+// The agents a move carries; a Pi session is not offered one.
+const MOVABLE_AGENTS = ['claude', 'codex'];
 
 // Moves this console started and has not heard back from, by session id: shown as
 // "Moving to …" until the published state's own `session.move` takes over.
@@ -44,7 +46,7 @@ function refusedAtMove(error) {
 // stopped session as well. A move the state still carries is shown whether or not its
 // pane survived the stop.
 export function moveControlsHTML(ctx, session, { live = false, pendingHandoff = false } = {}) {
-  if (!session?.id || (session.kind || session.agent) !== 'claude' || pendingHandoff) return '';
+  if (!session?.id || !MOVABLE_AGENTS.includes(session.kind || session.agent) || pendingHandoff) return '';
   // A move the state carries is shown whatever the node list now says: one that needs
   // recovery keeps Retry and Abandon after the configuration drops to one node.
   const move = session.move;

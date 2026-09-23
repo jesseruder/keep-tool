@@ -222,14 +222,19 @@ session controls outside Keep if the user directs that work.
 
 ## Moving a session to another node
 
-- `keep move <#n|session-id> --node <name> [--force] [--dry]` stops a Claude session,
-  carries its transcript, session trees and file history to the other node, verifies
-  them there by digest, flips the session's location record once, and resumes it there
-  on the same account, model and permission class. `--dry` prints the plan and changes
-  nothing.
-- Preconditions: more than one node configured; a Claude session (Codex and Pi are
-  refused for now); the target's host advertises the `artifacts` verb; the session's cwd
-  exists on the target; the target has the account and could launch it; no unconfirmed
+- `keep move <#n|session-id> --node <name> [--force] [--dry]` stops a Claude or Codex
+  session, carries its files to the other node (Claude: transcript, session trees and
+  file history; Codex: the root rollout and its child-thread rollouts, never the
+  profile's session index, history or sqlite), verifies them there by digest, flips the
+  session's location record once, and resumes it there on the same account, model and
+  permission class. `--dry` prints the plan and changes nothing. `keep tell` to a
+  Codex session on a node other than the daemon's is still unsupported: message it
+  through its pane, or move it back first.
+- Preconditions: more than one node configured; a Claude or Codex session (Pi is
+  refused); the target's host advertises the `artifacts` verb (version 2 for Codex); a
+  Codex session's model can be read (launch model, `-m`, or its rollout's last turn),
+  and it has no compaction swap record and no open background jobs in its restart
+  ledger; the session's cwd exists on the target; the target has the account and could launch it; no unconfirmed
   message, account handoff, pending compaction restore or queued restart; the turn has
   ended. A session live on a node other than the daemon's leaves it
   only with `--force` for now, and `--force` is Owner's forced stop: pass it only when

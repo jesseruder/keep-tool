@@ -3459,7 +3459,7 @@ commands.handoff = async (argv, deps = {}) => {
   console.log(`moved session ${sessionNamed(result.sessionId)} from ${result.sourceAccountId} to ${result.targetAccountId} in pane ${result.pane}`);
 };
 
-// Moves a Claude session to another node (bin/session-move.js, through the daemon's
+// Moves a Claude or Codex session to another node (bin/session-move.js, through the daemon's
 // POST /api/move-session): stopped where it runs, its files carried and verified,
 // then resumed on the other machine. A move that stops part way prints the command
 // that continues it.
@@ -3900,7 +3900,7 @@ ${stepUsage()}
   keep accounts setup <id> --share-from <source-id>
   keep handoff <session-id> --pane <pane-id> --account <target-id> [--force]
   keep move <#n|session-id> --node <name> [--force] [--dry] [--json]
-                         # stops a Claude session, carries its files to <name> and resumes it there
+                         # stops a Claude or Codex session, carries its files to <name> and resumes it there
                          # the cwd must exist on <name> first; --force is Owner's forced stop (needed off a node)
   keep move --recover <tx> | --abandon <tx>    # continue a move that stopped part way, or leave it where it was
   keep transfer <source-session-id> --account <target-id> --context <handoff.md> [--cwd <worktree>] [--prepare-only]
