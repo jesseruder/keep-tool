@@ -192,6 +192,22 @@ test('a daemon that is not there gets each event\'s safe default, and the delive
   assert.ok(Date.now() - began < 6000, 'bounded');
 });
 
+test('a queued Codex stop is replayed as a stop that cannot hold a turn, as a Claude one is', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.transcript, '{"n":1}\n');
+  const url = await closedUrl();
+  const result = await codexRun(f, 'stop', url, codexInput(f, { hook_event_name: 'Stop', stop_hook_active: false }));
+  assert.deepEqual(onlyJson(result), {});
+  const [queued] = f.queue();
+  assert.equal(queued.event, 'codex-stop');
+  assert.equal(queued.body.input.stop_hook_active, true, 'a late stop cannot hold a turn');
+  // The replay delivers it that way.
+  const daemon = await stubDaemon(t, () => ran('{}\n'));
+  await codexRun(f, 'lifecycle', daemon.url, codexInput(f, { hook_event_name: 'UserPromptSubmit' }));
+  assert.deepEqual(daemon.posts.map((post) => post.body.event), ['codex-stop', 'codex-lifecycle']);
+  assert.equal(daemon.posts[0].body.input.stop_hook_active, true);
+});
+
 test('the queue replays in order, with its own keys, once, before the next event', async (t) => {
   const f = fixture(t);
   fs.writeFileSync(f.transcript, '{"n":1}\n');

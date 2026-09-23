@@ -419,7 +419,8 @@ function queue(event, input, identity, key, fired, env) {
   // stop_hook_active it never blocks, because the evaluator returns before it scans,
   // so the turn's evidence is left for the next live stop to judge. What the replay
   // does write is the completion marker, stamped with `firedAt`, and the turn index.
-  const replayInput = event === 'stop' ? { ...input, stop_hook_active: true } : input;
+  // A Codex stop the same way: the daemon's Codex Stop guard returns before it scans too.
+  const replayInput = event === 'stop' || event === 'codex-stop' ? { ...input, stop_hook_active: true } : input;
   try {
     enqueue(env, { event, body: {
       input: replayInput, identity: { ...identity, firedAt: fired.firedAt }, idempotencyKey: key,
