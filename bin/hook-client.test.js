@@ -888,7 +888,7 @@ test('a Pi hook posts as the Pi session, with only what the daemon\'s keep hook 
     return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: '', stderr: '', replayed: false }) };
   };
   const env = { HOME: home, KEEP_PANE: 'p3', KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main', KEEP_AGENT_ACCOUNT_ID: 'pi/default',
-    KEEP_STEP_OK: '1', KEEP_REVIEWER: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', KEEP_CODEX_CLIENT_TOKEN: 'tok' };
+    KEEP_STEP_OK: '1', KEEP_REVIEWER: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', KEEP_CODEX_CLIENT_TOKEN: 'tok', KEEP_DELEGATION_ID: 'del-1' };
   const where = { url: 'http://127.0.0.1:1', local: 'aws1', daemon: 'main' };
   const input = { session_id: 'pi-aws1', cwd: home, instance: PI_INSTANCE, pid: 4242, job_id: 'job', worker_token: 'secret' };
   const deps = { env, token: 'aws1-secret', request };
@@ -898,7 +898,8 @@ test('a Pi hook posts as the Pi session, with only what the daemon\'s keep hook 
   assert.equal(start.event, 'pi-start');
   assert.equal(start.transcript, null);
   assert.deepEqual(start.input, { session_id: 'pi-aws1', cwd: home, instance: PI_INSTANCE, pid: 4242 }, 'no worker job id or token');
-  assert.deepEqual(start.identity, { agent: 'pi', sessionId: 'pi-aws1', pane: 'p3@aws1', accountId: 'pi/default', env: { KEEP_STEP_OK: '1' } });
+  assert.deepEqual(start.identity, { agent: 'pi', sessionId: 'pi-aws1', pane: 'p3@aws1', accountId: 'pi/default',
+    env: { KEEP_DELEGATION_ID: 'del-1', KEEP_STEP_OK: '1' } });
   await client.runPiHook('end', input, where, deps);
   assert.equal(posts[1].payload.event, 'pi-end');
   const pre = await client.runPiHook('pre-tool', { ...input, tool_name: 'Bash', tool_input: { command: 'ls' } }, where, deps);

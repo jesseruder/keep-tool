@@ -176,8 +176,9 @@ function identityOf(input, env, where, event) {
   const forwarded = {};
   for (const [key, re] of Object.entries(FORWARDED_ENV)) {
     if (!codex && key.startsWith('KEEP_CODEX_')) continue;
-    // A Pi hook reads only the step guard's bypass of its session's environment.
-    if (piEvent && key !== 'KEEP_STEP_OK') continue;
+    // A Pi hook reads only the step guard's bypass and a delegation's id (its start
+    // binds a delegated session, as on the daemon node) of its session's environment.
+    if (piEvent && key !== 'KEEP_STEP_OK' && key !== 'KEEP_DELEGATION_ID') continue;
     if (typeof source[key] === 'string' && re.test(source[key])) forwarded[key] = source[key];
   }
   if (Object.keys(forwarded).length) identity.env = forwarded;
