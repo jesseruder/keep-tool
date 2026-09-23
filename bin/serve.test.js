@@ -9848,6 +9848,45 @@ test('a Claude workspace-trust screen refuses any wait; the portable code stays 
   }
 });
 
+test('a Codex update notice with no prompt is waited out and named; with its prompt it is refused, never answered', async () => {
+  let now = 0;
+  let screen = '';
+  const requests = [];
+  const host = { request: async (type) => {
+    requests.push(type);
+    assert.equal(type, 'screen', 'nothing is typed into the pane'); return { text: screen };
+  } };
+  const clock = { host, now: () => now, sleep: async (ms) => { now += ms; } };
+  const banner = '\x1b[1m✨ Update available! 0.155.1 -> 0.156.1\x1b[0m\nRun npm install -g @openai/codex to update.';
+  // The notice with no prompt: the whole wait, then the cause by name.
+  screen = `>_ OpenAI Codex (v0.155.1)\n\n${banner}\n`;
+  await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),
+    (error) => error.status === 504 && error.extra.awaitingUpdate === true
+      && /^codex in pane-update is waiting at its update prompt \(0\.155\.1 -> 0\.156\.1\); answer it in the pane or update Codex on \S+; message not sent$/.test(error.message));
+  assert.ok(now >= 45e3, 'the notice alone does not cut the wait short');
+  // The notice above a live prompt is information: the wait ends at the prompt.
+  now = 0;
+  screen = `${banner}\n\n› Ask Codex to do anything\n`;
+  assert.equal(await waitForHostAgent({ pane: 'pane-update' }, 'codex', clock), true);
+  assert.equal(now, 0);
+  // The startup update prompt: refused on its second read, with nothing typed.
+  now = 0; requests.length = 0;
+  screen = '  ✨ Update available! 0.155.1 -> 0.156.1\n\n  Release notes: https://github.com/openai/codex/releases/latest\n\n'
+    + '› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n  3. Skip until next version\n\n  Press enter to continue\n';
+  await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),
+    (error) => error.status === 409 && error.extra.awaitingUpdate === true
+      && /waiting at its update prompt \(0\.155\.1 -> 0\.156\.1\)/.test(error.message));
+  assert.ok(now < 2000, 'refused at once, not after the whole wait');
+  assert.deepEqual([...new Set(requests)], ['screen']);
+  // A generic timeout is still generic, and a Claude pane never reads the notice.
+  now = 0; screen = 'loading...';
+  await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'codex', clock),
+    (error) => error.status === 504 && /never showed an empty prompt/.test(error.message));
+  now = 0; screen = banner;
+  await assert.rejects(waitForHostAgent({ pane: 'pane-update' }, 'claude', clock),
+    (error) => error.status === 504 && /claude session in pane-update never showed an empty prompt/.test(error.message));
+});
+
 test('setup recovery rechecks the destination incarnation under the injection lock before typing', async () => {
   const transferId = 'e'.repeat(64), message = 'Read the package, then WAIT.';
   const original = { id: 'pane-recovery', pid: 20, createdAt: 100, alive: true,

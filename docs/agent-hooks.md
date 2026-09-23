@@ -150,6 +150,14 @@ run it there, on the node; nothing copies them from another node. Otherwise copy
 `[hooks.state]` tables from a profile that accepted the same hooks.json bytes at the same
 path, or answer the review once per hook in a fresh Codex on the node.
 
+A fresh Codex can also open on its update prompt ("✨ Update available! 0.155.1 ->
+0.156.1", "Update now", "Skip", "Skip until next version"). Keep never answers it: the
+open's wait refuses at once, naming the pane, both versions and the node to update
+Codex on. The notice alone, above a live prompt, is information and the open proceeds;
+the notice with no prompt is waited out and the timeout names it. `keep doctor` prints
+the `codex --version` it finds; on a node it says to compare that with the daemon
+node's by hand, since the node API does not carry the daemon's version.
+
 Restart/resume existing agent sessions in a controlled manner to load new hooks. The reviewer launcher sets
 `KEEP_REVIEWER=1`, allowing the SessionStart hook to register it for daemon ticks.
 

@@ -1165,3 +1165,22 @@ test('keep doctor fails an install whose nodes do not share its home directory',
   assert.equal(down[0].status, 'optional');
   assert.match(down[0].text, /node aws1 could not be asked: connect ECONNREFUSED/);
 });
+
+test('keep doctor reports which Codex runs here, and on a node says to compare it with the daemon node\'s', () => {
+  const daemonEnv = { KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' };
+  const nodeEnv = { KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main' };
+  const ran = (stdout, status = 0) => () => ({ status, stdout });
+  assert.deepEqual(setup.codexVersionReport({ env: daemonEnv, run: ran('codex-cli 0.155.1\n') }),
+    [{ status: 'ok', text: 'Codex CLI: codex-cli 0.155.1' }]);
+  assert.deepEqual(setup.codexVersionReport({ env: nodeEnv, run: ran('\ncodex-cli 0.156.1\nmore\n') }),
+    [{ status: 'ok', text: 'Codex CLI: codex-cli 0.156.1; main\'s version is not reported to this node, so compare it with codex --version there by hand' }]);
+  // Bounded, one line, no terminal controls.
+  const long = setup.codexVersionReport({ env: daemonEnv, run: ran(`\x1b[31m${'9'.repeat(500)}\n`) })[0];
+  assert.equal(long.text.length, 'Codex CLI: '.length + 80);
+  assert.doesNotMatch(long.text, /\x1b/);
+  assert.deepEqual(setup.codexVersionReport({ env: daemonEnv, run: ran('', 0) }), [{ status: 'ok', text: 'Codex CLI: no version printed' }]);
+  // No Codex is optional, as it was.
+  for (const run of [ran('', 1), () => ({ status: null, error: new Error('ENOENT') }), () => { throw new Error('spawn'); }]) {
+    assert.deepEqual(setup.codexVersionReport({ env: nodeEnv, run }), [{ status: 'optional', text: 'Codex CLI: codex --version did not answer' }]);
+  }
+});

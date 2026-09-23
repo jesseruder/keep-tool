@@ -9203,6 +9203,34 @@ function agentPromptVisible(agent, screen) {
   return false;
 }
 
+// Codex's update notice: "✨ Update available! 0.155.1 -> 0.156.1". In the chat history
+// it is information, and the prompt below it still takes a message; as the startup
+// update prompt ("Update now (runs `npm install -g @openai/codex`)", "Skip", "Skip
+// until next version", "Press enter to continue") it holds the pane before any prompt,
+// and Keep never answers it: it would install software on Owner's machine. Returns
+// { from, to, prompt } for a screen showing the notice, null otherwise.
+const CODEX_UPDATE_VERSION = String.raw`v?(\d{1,4}\.\d{1,4}\.\d{1,4}(?:[-+][0-9A-Za-z.]{1,24})?)`;
+const CODEX_UPDATE_RE = new RegExp(String.raw`Update available!\s{0,8}${CODEX_UPDATE_VERSION}\s{0,8}(?:->|→)\s{0,8}${CODEX_UPDATE_VERSION}`);
+const CODEX_UPDATE_PROMPT_RE = /Skip until next version|Update now \(runs|Press enter to continue|\[y\/N\]/i;
+
+function codexUpdateNotice(screen) {
+  const lines = stripTerminalAnsi(String(screen || '')).split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const match = CODEX_UPDATE_RE.exec(lines[index].slice(0, 400));
+    if (!match) continue;
+    // The prompt's options sit under its title; a "Press enter" further off is another screen's.
+    const prompt = lines.slice(index + 1, index + 13).some((line) => CODEX_UPDATE_PROMPT_RE.test(line));
+    return { from: match[1], to: match[2], prompt };
+  }
+  return null;
+}
+
+function codexUpdateMessage(target, notice, deps = {}) {
+  let node = '';
+  try { node = sessionNodeOf(String(target.pane || ''), deps); } catch { node = ''; }
+  return `codex in ${target.pane} is waiting at its update prompt (${notice.from} -> ${notice.to}); answer it in the pane or update Codex on ${node || 'its node'}`;
+}
+
 // Under the injection lock: the prompt seen a moment ago must still be there
 // (the agent may have exited back to a shell), then type like a live delivery.
 async function typeOpeningMessage(target, agent, text, deps = {}) {
@@ -9275,7 +9303,34 @@ async function waitForHostAgent(target, agent, deps = {}) {
         }
       }
     }
+    // Codex's startup update prompt, confirmed across two reads as a Claude dialog is,
+    // is refused by name and never answered. The notice alone, with no prompt under
+    // it, may still be followed by the prompt: that is waited for, and named if the
+    // wait runs out with the notice still on screen.
+    if (agent === 'codex') {
+      const notice = codexUpdateNotice(screen);
+      if (notice && notice.prompt && refusedDialog && refusedDialog.kind === 'codex-update'
+          && now() - refusedDialog.at >= DIALOG_CONFIRM_MS) {
+        throw new InjectionError(409, `${codexUpdateMessage(target, notice, deps)}; message not sent`, {
+          awaitingUpdate: true, screenTail: screenTail(screen),
+        });
+      }
+      if (!notice || !notice.prompt) refusedDialog = null;
+      else if (!refusedDialog) {
+        refusedDialog = { kind: 'codex-update', at: now() };
+        if (!refusalGrace && deadline - now() < DIALOG_CONFIRM_GRACE_MS) {
+          refusalGrace = true;
+          deadline = now() + DIALOG_CONFIRM_GRACE_MS;
+        }
+      }
+    }
     await sleep(Math.min(500, Math.max(0, deadline - now())));
+  }
+  const notice = agent === 'codex' ? codexUpdateNotice(screen) : null;
+  if (notice) {
+    throw new InjectionError(504, `${codexUpdateMessage(target, notice, deps)}; message not sent`, {
+      awaitingUpdate: true, screenTail: screenTail(screen),
+    });
   }
   throw new InjectionError(504, `${agent} session in ${target.pane} never showed an empty prompt; message not sent`, {
     screenTail: screenTail(screen),

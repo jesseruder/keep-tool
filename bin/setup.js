@@ -1057,6 +1057,22 @@ function piExtensionReport(deps = {}) {
     : `Pi Keep extension installed at ~/.pi/agent/extensions/keep.ts (${real})` }];
 }
 
+// Which Codex this machine runs, as information: optional when there is none. On a
+// pane-only node the daemon node's version is not known here (the node API does not
+// carry it), so the row says to compare the two by hand: a Codex behind the release
+// the other runs is one that can stop a fresh open at its update prompt.
+function codexVersionReport(deps = {}) {
+  const env = deps.env || process.env;
+  let result = null;
+  try { result = (deps.run || (() => spawnSync('codex', ['--version'], { timeout: 10000, encoding: 'utf8' })))(); } catch { result = null; }
+  if (!result || result.status !== 0) return [{ status: 'optional', text: 'Codex CLI: codex --version did not answer' }];
+  const line = String(result.stdout || '').split(/\r?\n/).map((text) => text.trim()).find(Boolean) || '';
+  const version = line.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 80) || 'no version printed';
+  const where = require('./nodes.js').paneOnlyNode(env);
+  return [{ status: 'ok', text: `Codex CLI: ${version}${where
+    ? `; ${where.daemon}'s version is not reported to this node, so compare it with codex --version there by hand` : ''}` }];
+}
+
 async function doctor(root) {
   let failed = false;
   const check = (name, fn, required = true) => {
@@ -1070,7 +1086,7 @@ async function doctor(root) {
   check('registry directories', () => ['tasks', 'archive', 'digests'].every((dir) => fs.statSync(path.join(root, dir)).isDirectory()));
   check('Git commit identity', () => git(root, ['config', 'user.name']) && git(root, ['config', 'user.email']));
   check('Claude CLI (reviewer and scheduled checks)', () => spawnSync('claude', ['--version'], { timeout: 10000 }).status === 0);
-  check('Codex CLI', () => spawnSync('codex', ['--version'], { timeout: 10000 }).status === 0, false);
+  for (const entry of codexVersionReport()) console.log(`${entry.status}: ${entry.text}`);
   check('terminal dependencies', () => { require('node-pty'); require('ws'); return true; });
   // Per account: the restart guard, the raw-resume guard and the unattended question
   // refusal all live in the hooks, so an account without them runs unguarded.
@@ -1118,7 +1134,7 @@ async function doctor(root) {
 }
 
 module.exports = {
-  init, installHooks, installSkills, service, node, doctor, nodeHomeReport, nodeApiReport, hookDeliveryReport, codexHooksReport, piExtensionReport, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
+  init, installHooks, installSkills, service, node, doctor, nodeHomeReport, nodeApiReport, hookDeliveryReport, codexHooksReport, codexVersionReport, piExtensionReport, accountSetupReport, mergeHooks, servicePlist, hostUnit, systemdQuote, quote, canonicalPath, insideSource,
   HOOK_ACTIONS, missingHooks, hookTargets, hookTarget,
   loadPacks, configuredPacks, installPackNames, skillPlans, applySkillPlans, reportSkillPlans, listPacks,
   recordPacks, recordPreflight,
