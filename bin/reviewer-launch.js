@@ -88,4 +88,4 @@ async function launch(args, root, deps = {}) {
   } finally { client.close(); }
 }
 
-module.exports = { launch, reviewerAccount,reviewerFlags, reviewerEnv, reviewerBashOutput, REVIEWER_SETTINGS, REVIEWER_BASH_OUTPUT_CHARS };
+module.exports = { launch, reviewerAccount, reviewerFlags, reviewerEnv, reviewerBashOutput, REVIEWER_SETTINGS, REVIEWER_BASH_OUTPUT_CHARS };

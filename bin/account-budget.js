@@ -15,8 +15,8 @@
 // never in the pool unless `automationPool` names it explicitly.
 //
 // Readings come from the daemon's usage cache (.keep/usage-cache.json). A missing or
-// stale reading is unknown, never exhausted — guessing wrong would stop automation
-// for no reason — but an account with a reading that shows room ranks ahead of it.
+// stale reading is unknown for ranking — never counted as room it may not have — but
+// a window any reading shows spent (reset still ahead) is spent, however old the reading.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -83,14 +83,12 @@ function pool(env = process.env, accountApi = require('./accounts.js')) {
 }
 
 // The bucket that caps this model on top of the shared week, by the same rule the
-// reviewer's budget governor uses. With no model named, every model-scoped bucket
-// counts: the work could be running on any of them.
+// reviewer's budget governor uses. With no model named there is none: the work is
+// capped by the shared week and the 5h window only.
 function scopedLimit(limits, model) {
   const name = String(model || '').toLowerCase();
+  if (!name) return null;
   const scopedAll = limits.filter((limit) => / wk$/i.test(String(limit && limit.label || '').trim()));
-  if (!name) {
-    return scopedAll.reduce((worst, limit) => (!worst || Number(limit.percent) > Number(worst.percent) ? limit : worst), null);
-  }
   const family = review().modelFamily(model);
   const budget = require('./preferences').modelBudgets()[family] || {};
   return scopedAll.find((limit) => {
@@ -100,48 +98,80 @@ function scopedLimit(limits, model) {
   }) || null;
 }
 
-function assess(id, usage, model, now) {
-  const row = { id, exhausted: false, unknown: false, weekPercent: null, scopedPercent: null, shortPercent: null,
-    resetsAt: null, scopedLabel: null };
+// The headroom the reviewer and ideas budget governors insist on before spending
+// (review.js MIN_HEADROOM, or the model family's minHeadroom).
+function minHeadroomFor(model) {
+  const base = Number.isFinite(review().MIN_HEADROOM) ? review().MIN_HEADROOM : 10;
+  if (!model) return base;
+  const budget = require('./preferences').modelBudgets()[review().modelFamily(model)] || {};
+  return Number.isFinite(budget.minHeadroom) ? budget.minHeadroom : base;
+}
+
+// The account's limits. The governor's own reader first; when it declines (an entry
+// with no agent field, say), the limits are still read leniently, because a reading
+// that shows a window spent is evidence whatever its shape. Only a strict reading
+// can make an account `known` for ranking.
+function readingOf(usage, id) {
   let snapshot = null;
   try { snapshot = usage ? review().accountLimits(usage, id) : null; } catch {}
-  const limits = snapshot && Array.isArray(snapshot.limits) ? snapshot.limits : [];
-  const fetchedAt = snapshot ? toMs(snapshot.fetchedAt) : null;
-  const percent = (limit) => (limit && Number.isFinite(Number(limit.percent)) ? Number(limit.percent) : null);
-  const week = limits.find((limit) => limit && limit.label === 'week');
-  if (!limits.length || !fetchedAt || now - fetchedAt > staleMs() || percent(week) == null) {
-    return { ...row, unknown: true };
+  if (snapshot && Array.isArray(snapshot.limits) && snapshot.limits.length) {
+    return { limits: snapshot.limits, fetchedAt: toMs(snapshot.fetchedAt), strict: true };
   }
+  const entry = usage && usage.accounts && usage.accounts[id];
+  const lenient = Array.isArray(entry?.limits) ? entry
+    : Array.isArray(entry?.snapshot?.limits) ? entry.snapshot : null;
+  if (lenient && lenient.limits.length) return { limits: lenient.limits, fetchedAt: toMs(lenient.fetchedAt), strict: false };
+  return null;
+}
+
+// Exhaustion is judged from any reading, stale or not: a window at 100% whose reset
+// is unknown or still ahead is spent. Staleness only decides whether an account that
+// is not spent counts as `unknown` for ranking. `roomy` is the governor's bar: a
+// fresh reading with at least the minimum headroom on the week, the model's bucket
+// and the 5h window.
+function assess(id, usage, model, now) {
+  const row = { id, exhausted: false, unknown: false, roomy: false, weekPercent: null, scopedPercent: null,
+    shortPercent: null, resetsAt: null, scopedLabel: null };
+  const reading = readingOf(usage, id);
+  const limits = reading ? reading.limits.filter(Boolean) : [];
+  const percent = (limit) => (limit && Number.isFinite(Number(limit.percent)) ? Number(limit.percent) : null);
+  const week = limits.find((limit) => limit.label === 'week');
   const scoped = scopedLimit(limits, model);
-  const short = limits.find((limit) => limit && limit.label === '5h');
+  const short = limits.find((limit) => limit.label === '5h');
   row.weekPercent = percent(week);
   row.scopedPercent = percent(scoped);
   row.scopedLabel = scoped ? String(scoped.label) : null;
   row.shortPercent = percent(short);
-  const spent = [week, scoped].filter((limit) => limit && percent(limit) >= 100);
+  const pending = (limit) => { const at = toMs(limit.resetsAt); return at == null || at > now; };
+  const spent = [week, scoped, short].filter((limit) => limit && percent(limit) >= 100 && pending(limit));
   if (spent.length) {
     row.exhausted = true;
-    // Both have to clear before the account is usable again.
+    // Every spent window has to clear before the account is usable again.
     const resets = spent.map((limit) => toMs(limit.resetsAt));
     row.resetsAt = resets.every(Number.isFinite) ? Math.max(...resets) : null;
-  } else {
-    row.resetsAt = toMs(week.resetsAt);
+    return row;
   }
+  const fresh = Boolean(reading && reading.strict && reading.fetchedAt && now - reading.fetchedAt <= staleMs()
+    && row.weekPercent != null);
+  if (!fresh) return { ...row, unknown: true };
+  row.resetsAt = toMs(week.resetsAt);
+  const min = minHeadroomFor(model);
+  row.roomy = [week, scoped, short].every((limit) => !limit || (percent(limit) != null && 100 - percent(limit) >= min));
   return row;
 }
 
-// Best first: the preferred account while it has room, then the most weekly headroom
-// (ties: the model's own bucket, then the 5h window), then accounts with no usable
-// reading, then the spent ones by when they come back.
+// Best first: the preferred account when it clears the governor's headroom bar, then
+// the most weekly headroom (ties: the model's own bucket, then the 5h window), then
+// accounts with no usable reading, then the spent ones by when they come back.
 function rank(candidates, usage, options = {}) {
   const now = Number.isFinite(options.now) ? options.now : Date.now();
   const rows = (candidates || []).map((candidate) => assess(typeof candidate === 'string' ? candidate : candidate.id,
     usage, options.model, now));
-  const tier = (row) => (row.exhausted ? 3 : row.unknown ? 2 : 1);
+  const tier = (row) => (row.id === options.preferredId && row.roomy ? 0 : row.exhausted ? 3 : row.unknown ? 2 : 1);
   const num = (value) => (value == null ? 0 : value);
   return rows.sort((a, b) => {
-    const pa = a.id === options.preferredId && !a.exhausted ? 0 : tier(a);
-    const pb = b.id === options.preferredId && !b.exhausted ? 0 : tier(b);
+    const pa = tier(a);
+    const pb = tier(b);
     if (pa !== pb) return pa - pb;
     if (pa === 1) {
       return num(a.weekPercent) - num(b.weekPercent) || num(a.scopedPercent) - num(b.scopedPercent)
@@ -159,7 +189,8 @@ function rank(candidates, usage, options = {}) {
 function describe(rows) {
   return rows.map((row) => {
     if (row.unknown) return `${row.id} usage unknown`;
-    const parts = [`week ${row.weekPercent}%`];
+    const parts = [];
+    if (row.weekPercent != null) parts.push(`week ${row.weekPercent}%`);
     if (row.scopedLabel) parts.push(`${row.scopedLabel} ${row.scopedPercent}%`);
     if (row.shortPercent != null) parts.push(`5h ${row.shortPercent}%`);
     if (row.exhausted) parts.push(`resets ${when(row.resetsAt)}`);
@@ -169,35 +200,38 @@ function describe(rows) {
 
 // ---------- health ----------
 
-// One row for the whole pool. A deferral per purpose is remembered in-process, and
-// the row is written only when that set changes, so a summary request on every state
-// build does not rewrite health.json.
+// One row for the whole pool. Deferrals are remembered per purpose in-process. A red
+// row is rewritten only when its content changes; an ok row is written by the first
+// success in this process and by any success after a red write, so a red row left by
+// the CLI or by a previous daemon is cleared by the next success here.
 const deferredByPurpose = new Map();
-let lastWritten = '';
+let lastWritten = null;
 
-function noteHealth(purpose, retryAt, healthApi) {
-  const key = purpose || 'automation';
-  if (retryAt == null) deferredByPurpose.delete(key);
-  else deferredByPurpose.set(key, retryAt);
-  const entries = [...deferredByPurpose.entries()].sort((a, b) => a[1] - b[1]);
-  const signature = JSON.stringify(entries);
-  if (signature === lastWritten) return;
-  const wasDeferred = lastWritten !== '' && lastWritten !== '[]';
-  lastWritten = signature;
-  if (!entries.length && !wasDeferred) return;
-  const api = healthApi || require('./health.js');
-  try {
-    if (entries.length) {
-      const earliest = entries[0][1];
-      const message = `automation pool exhausted until ${when(earliest)} (${entries.map(([name, at]) => `${name} ${when(at)}`).join(', ')})`;
-      api.record(HEALTH_NAME, { ok: false, error: message, detail: message });
-    } else {
-      api.record(HEALTH_NAME, { ok: true, detail: 'automation pool has room' });
-    }
-  } catch {}
+function writeHealth(options, healthApi) {
+  try { (healthApi || require('./health.js')).record(HEALTH_NAME, options); } catch {}
 }
 
-function resetHealthMemory() { deferredByPurpose.clear(); lastWritten = ''; }
+function noteSuccess(healthApi) {
+  // Room for one purpose means the pool is not exhausted: every remembered deferral goes.
+  deferredByPurpose.clear();
+  if (lastWritten === 'ok') return;
+  lastWritten = 'ok';
+  writeHealth({ ok: true, detail: 'automation pool has room' }, healthApi);
+}
+
+function noteDeferral(purpose, retryAt, now, healthApi) {
+  deferredByPurpose.set(purpose || 'automation', retryAt);
+  for (const [name, at] of [...deferredByPurpose]) if (!(at > now)) deferredByPurpose.delete(name);
+  const entries = [...deferredByPurpose.entries()].sort((a, b) => a[1] - b[1]);
+  if (!entries.length) return;
+  const signature = `red:${JSON.stringify(entries)}`;
+  if (signature === lastWritten) return;
+  lastWritten = signature;
+  const message = `automation pool exhausted until ${when(entries[0][1])} (${entries.map(([name, at]) => `${name} ${when(at)}`).join(', ')})`;
+  writeHealth({ ok: false, error: message, detail: message }, healthApi);
+}
+
+function resetHealthMemory() { deferredByPurpose.clear(); lastWritten = null; warnedPool = false; }
 
 // ---------- selection ----------
 
@@ -210,13 +244,15 @@ class AccountDeferredError extends Error {
   }
 }
 
+let warnedPool = false;
+
 // { account, record, reason, ranked } or { account: null, deferred: true, retryAt, reason, ranked }.
 // `account` is an id; `record` is the account entry when one is known.
 //
-// With no pool (a single-account fleet, or `automationPool: []`) the answer is the
-// fixed assignment it always was: `preferredId` when given, else automationFor. A
-// caller that has no fixed fallback (the rate-limit handoff) passes fallback: false
-// and gets { account: null } instead.
+// With no pool (a single-account fleet, `automationPool: []`, or an automationPool
+// that cannot be used) the answer is the fixed assignment it always was: `preferredId`
+// when given, else automationFor. A caller that has no fixed fallback (the rate-limit
+// handoff) passes fallback: false and gets { account: null } instead.
 function select(options = {}) {
   const env = options.env || process.env;
   const accountApi = options.accountApi || require('./accounts.js');
@@ -231,7 +267,16 @@ function select(options = {}) {
       preferredId = map && typeof map[purpose] === 'string' ? map[purpose] : undefined;
     } catch { preferredId = undefined; }
   }
-  const all = pool(env, accountApi);
+  let all;
+  try { all = pool(env, accountApi); }
+  catch (error) {
+    // A broken list must not stop every job: said once, then the fixed assignment.
+    if (!warnedPool) {
+      warnedPool = true;
+      try { (options.stderr || process.stderr).write(`keep accounts: automationPool ignored: ${error && error.message || error}\n`); } catch {}
+    }
+    all = [];
+  }
   if (!all.length) {
     if (options.fallback === false) return { account: null, record: null, reason: 'no automation pool', ranked: [] };
     if (preferredId) {
@@ -243,24 +288,28 @@ function select(options = {}) {
     return { account: record.id, record, reason: 'no automation pool; using the configured account', ranked: [] };
   }
   const members = all.filter((entry) => !exclude.has(entry.id));
+  if (!members.length) {
+    // Nowhere to move to is not an exhausted pool: no health row.
+    const retryAt = now + DEFER_FALLBACK_MS;
+    return { account: null, record: null, deferred: true, retryAt, ranked: [],
+      reason: `no account in the automation pool other than ${[...exclude].join(', ')}; retrying at ${when(retryAt)}` };
+  }
   const usage = options.usage !== undefined ? options.usage
     : (options.readUsage || (() => readUsageCache(options.root || defaultRoot(env))))();
   const ranked = rank(members, usage, { model: options.model, now, preferredId });
   const best = ranked[0];
   if (best && !best.exhausted) {
-    if (recordHealth) noteHealth(purpose, null, options.health);
+    if (recordHealth) noteSuccess(options.health);
     const record = members.find((entry) => entry.id === best.id) || null;
-    const reason = best.id === preferredId ? 'preferred account has room'
+    const reason = best.id === preferredId && best.roomy ? 'preferred account has room'
       : best.unknown ? 'no account in the pool has a current reading; using one with no reading'
         : `most headroom in the automation pool (week ${best.weekPercent}%)`;
     return { account: best.id, record, reason, ranked };
   }
   const resets = ranked.map((row) => row.resetsAt).filter((at) => Number.isFinite(at) && at > now);
   const retryAt = resets.length ? Math.min(...resets) : now + DEFER_FALLBACK_MS;
-  const reason = members.length
-    ? `automation pool exhausted${options.model ? ` for ${options.model}` : ''}; retrying at ${when(retryAt)}: ${describe(ranked)}`
-    : `no account in the automation pool other than ${[...exclude].join(', ')}; retrying at ${when(retryAt)}`;
-  if (recordHealth) noteHealth(purpose, retryAt, options.health);
+  const reason = `automation pool exhausted${options.model ? ` for ${options.model}` : ''}; retrying at ${when(retryAt)}: ${describe(ranked)}`;
+  if (recordHealth) noteDeferral(purpose, retryAt, now, options.health);
   return { account: null, record: null, deferred: true, retryAt, reason, ranked };
 }
 
@@ -273,5 +322,5 @@ function selectOrThrow(options = {}) {
 
 module.exports = {
   DEFER_FALLBACK_MS, HEALTH_NAME, AccountDeferredError,
-  pool, rank, select, selectOrThrow, describe, readUsageCache, when, resetHealthMemory,
+  pool, rank, select, selectOrThrow, describe, readUsageCache, when, resetHealthMemory, minHeadroomFor,
 };

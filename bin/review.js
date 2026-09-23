@@ -5024,6 +5024,7 @@ module.exports = {
   sessionLiveness,
   classifyBudget,
   USAGE_STALE_MS,
+  MIN_HEADROOM,
   accountLimits,
   reviewBudget,
   reviewerAccountId,
