@@ -3450,6 +3450,43 @@ commands.handoff = async (argv, deps = {}) => {
   console.log(`moved session ${sessionNamed(result.sessionId)} from ${result.sourceAccountId} to ${result.targetAccountId} in pane ${result.pane}`);
 };
 
+// Moves a Claude session to another node (bin/session-move.js, through the daemon's
+// POST /api/move-session): stopped where it runs, its files carried and verified,
+// then resumed on the other machine. A move that stops part way prints the command
+// that continues it.
+const MOVE_USAGE = 'usage: keep move <#n|session-id> --node <name> [--force] [--dry] [--json] | keep move --recover <tx> | keep move --abandon <tx>';
+commands.move = async (argv, deps = {}) => {
+  const o = parseArgs(argv, { node: 'str', force: 'bool', dry: 'bool', json: 'bool', recover: 'str', abandon: 'str' });
+  const stdout = deps.stdout || console.log;
+  let body;
+  if (o.recover != null || o.abandon != null) {
+    if (o._.length || o.node || o.force || o.dry || (o.recover != null && o.abandon != null)) die(MOVE_USAGE);
+    body = o.recover != null ? { recover: o.recover } : { abandon: o.abandon };
+  } else {
+    if (o._.length !== 1 || !o.node) die(MOVE_USAGE);
+    const { sessionId } = resolveSessionByNumberOrId(o._[0], { root: deps.root || ROOT });
+    body = { sessionId, node: o.node, ...(o.force ? { ownerForce: true } : {}), ...(o.dry ? { dry: true } : {}) };
+  }
+  let response;
+  // A move carries a session's whole transcript between machines: give it room.
+  try { response = await (deps.postKeepApi || postKeepApi)('/api/move-session', body, 30 * 60e3); }
+  catch { die("keep serve isn't running (start it or use the dashboard)"); }
+  let result = {};
+  try { result = JSON.parse(response.data); } catch {}
+  if (response.status !== 200 || !result.ok) die(result.error || `keep serve returned an unexpected response (${response.status})`);
+  if (o.json) { stdout(JSON.stringify(result, null, 2)); return; }
+  if (result.dry) {
+    stdout(`would move ${result.sessionId} from ${result.from} to ${result.to}: cwd ${result.cwd}, account ${result.accountId}, `
+      + `${result.model ? `model ${result.model}` : 'the account\'s default model'}, ${result.bypass ? 'permissions skipped' : 'restricted permissions'}`
+      + `${result.pane ? `, stopping pane ${result.pane.id}` : ', no live pane'}`);
+    return;
+  }
+  if (result.status === 'abandoned') { stdout(result.message); return; }
+  stdout(`moved ${result.sessionId} from ${result.from} to ${result.to}${result.launch ? ` in pane ${result.launch.pane}` : ''}`
+    + ` (${result.files} file${result.files === 1 ? '' : 's'}, ${result.bytes} bytes; move ${result.id})`);
+  for (const warning of result.warnings || []) stdout(`  note: ${warning}`);
+};
+
 commands.transfer = async (argv, deps = {}) => {
   const o = parseArgs(argv, { account: 'str', context: 'str', cwd: 'str', 'prepare-only': 'bool', 'resolve-session': 'str' });
   const sourceSessionId = o._[0];
@@ -3839,6 +3876,10 @@ ${stepUsage()}
   keep accounts default claude|codex <id>
   keep accounts setup <id> --share-from <source-id>
   keep handoff <session-id> --pane <pane-id> --account <target-id> [--force]
+  keep move <#n|session-id> --node <name> [--force] [--dry] [--json]
+                         # stops a Claude session, carries its files to <name> and resumes it there
+                         # the cwd must exist on <name> first; --force is Owner's forced stop (needed off a node)
+  keep move --recover <tx> | --abandon <tx>    # continue a move that stopped part way, or leave it where it was
   keep transfer <source-session-id> --account <target-id> --context <handoff.md> [--cwd <worktree>] [--prepare-only]
                          # starts a fresh conversation from a prose-only portable package; source session remains intact
                          # ambiguous launches require --resolve-session <destination-id>, never a blind second launch
@@ -3966,6 +4007,7 @@ module.exports = {
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
   renameCommandCli: commands.rename, markCommandCli: commands.mark, keepRunningCommandCli: commands['keep-running'],
   accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff, transferCommandCli: commands.transfer,
+  moveCommandCli: commands.move,
   delegateCommandCli: commands.delegate,
   artifactCommandCli: commands.artifact,
   resolveReviewBudgetTarget, reviewBudgetCommandCli: commands['review-budget'],

@@ -777,6 +777,23 @@ function routes(ctx) {
       },
     },
     {
+      // keep move: a Claude session from one node to another (bin/session-move.js).
+      // Local and admin only in this landing: the console has no button for it, and
+      // no node may ask for one.
+      method: 'POST',
+      path: '/api/move-session',
+      allow: ['local', 'admin'],
+      handle: async ({ res, body }) => {
+        try {
+          const result = await ctx.moveSession(body);
+          broadcast();
+          return json(res, 200, result);
+        } catch (error) {
+          return json(res, error.status || 500, { error: error.message, ...(error.extra || {}) });
+        }
+      },
+    },
+    {
       // The batch behind "Move N rate-limited sessions": it only enqueues, and the
       // daemon's queue tick performs each transfer through the same handoffSession
       // this ladder's /api/handoff-session calls.

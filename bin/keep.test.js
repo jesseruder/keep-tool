@@ -1872,7 +1872,7 @@ test('on a pane-only node the registry commands name the daemon node and exit 2'
     const before = registrySnapshot(f.root);
     for (const argv of [['list'], [], ['checkin', 'unread-card', '-m', 'state'], ['add', 'A card'], ['show', 'unread-card'],
       ['tell', 'unread-card', 'hello'], ['open', 'unread-card'], ['land', 'unread-card'], ['sync'], ['serve'],
-      ['nodes', 'add', 'x'], ['node', 'ls'], ['codex', 'task', 'go'], ['init'], ['usage']]) {
+      ['nodes', 'add', 'x'], ['node', 'ls'], ['codex', 'task', 'go'], ['init'], ['usage'], ['move', 'sess-a', '--node', 'main']]) {
       const result = await keep(argv);
       const cmd = argv[0] || 'list';
       assert.equal(result.status, 2, `${argv.join(' ')}: ${result.stderr}`);
@@ -3261,4 +3261,89 @@ test('keep pane resolves a pane qualified with the daemon node own name', async 
     await paneCommandCli(['screen', 'p@main'], { connectHost });
     assert.deepEqual(requests.filter((call) => call[0] === 'screen').map((call) => call[1].pane), ['p']);
   } finally { console.log = originalLog; }
+});
+
+// ---------- keep move (a Claude session to another node) ----------
+
+function moveStub(answer) {
+  const calls = [];
+  return {
+    calls,
+    postKeepApi: async (pathname, body, timeoutMs) => {
+      calls.push({ pathname, body, timeoutMs });
+      const reply = answer(body);
+      return { status: reply.status, data: JSON.stringify(reply.body) };
+    },
+  };
+}
+
+test('keep move posts the session, the node and Owner\'s force to the daemon and says where it went', async () => {
+  const { moveCommandCli } = require('./keep.js');
+  const root = renameRoot({ 'sess-moving': 12 });
+  try {
+    const stub = moveStub((body) => ({ status: 200, body: { ok: true, status: 'done', id: `mv-${'a'.repeat(24)}`, sessionId: body.sessionId,
+      from: 'main', to: body.node, launch: { pane: 'p9@aws1' }, files: 3, bytes: 4096, warnings: ['the card link was not updated: x'] } }));
+    const stdout = [];
+    await moveCommandCli(['#12', '--node', 'aws1', '--force'], { root, postKeepApi: stub.postKeepApi, stdout: (line) => stdout.push(line) });
+    assert.equal(stub.calls.length, 1);
+    assert.equal(stub.calls[0].pathname, '/api/move-session');
+    assert.deepEqual(stub.calls[0].body, { sessionId: 'sess-moving', node: 'aws1', ownerForce: true });
+    assert.ok(stub.calls[0].timeoutMs >= 10 * 60e3, 'a move has room to carry a transcript');
+    assert.deepEqual(stdout, [
+      `moved sess-moving from main to aws1 in pane p9@aws1 (3 files, 4096 bytes; move mv-${'a'.repeat(24)})`,
+      '  note: the card link was not updated: x',
+    ]);
+
+    // --dry prints the preflight's plan.
+    const dry = moveStub((body) => ({ status: 200, body: { ok: true, dry: true, sessionId: body.sessionId, from: 'main', to: 'aws1',
+      cwd: '/work/project', accountId: 'claude-a', model: '', bypass: true, pane: { id: 'p1' } } }));
+    const dryOut = [];
+    await moveCommandCli(['sess-moving', '--node', 'aws1', '--dry'], { root, postKeepApi: dry.postKeepApi, stdout: (line) => dryOut.push(line) });
+    assert.deepEqual(dry.calls[0].body, { sessionId: 'sess-moving', node: 'aws1', dry: true });
+    assert.deepEqual(dryOut, ['would move sess-moving from main to aws1: cwd /work/project, account claude-a, the account\'s default model, permissions skipped, stopping pane p1']);
+
+    // --recover and --abandon name only the transaction.
+    const tx = `mv-${'b'.repeat(24)}`;
+    const recover = moveStub(() => ({ status: 200, body: { ok: true, status: 'abandoned', message: `move ${tx} abandoned; sess-moving stays on main` } }));
+    const recoverOut = [];
+    await moveCommandCli(['--abandon', tx], { root, postKeepApi: recover.postKeepApi, stdout: (line) => recoverOut.push(line) });
+    assert.deepEqual(recover.calls[0].body, { abandon: tx });
+    assert.deepEqual(recoverOut, [`move ${tx} abandoned; sess-moving stays on main`]);
+    await moveCommandCli(['--recover', tx], { root, postKeepApi: recover.postKeepApi, stdout: () => {} });
+    assert.deepEqual(recover.calls[1].body, { recover: tx });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep move says what the daemon refused, and refuses a malformed request before asking', async () => {
+  const { moveCommandCli } = require('./keep.js');
+  const root = renameRoot();
+  try {
+    const refused = moveStub(() => ({ status: 409, body: { error: 'keep move needs another node, and no other node is configured' } }));
+    await assert.rejects(moveCommandCli(['sess-x', '--node', 'aws1'], { root, postKeepApi: refused.postKeepApi, stdout: () => {} }),
+      /no other node is configured/);
+    const never = { postKeepApi: async () => assert.fail('a malformed move must not reach the daemon') };
+    for (const argv of [[], ['sess-x'], ['--node', 'aws1'], ['sess-x', 'sess-y', '--node', 'aws1'], ['--recover', 'mv-x', '--abandon', 'mv-y'],
+      ['sess-x', '--recover', `mv-${'c'.repeat(24)}`], ['#99', '--node', 'aws1']]) {
+      await assert.rejects(moveCommandCli(argv, { root, ...never, stdout: () => {} }), /usage: keep move|no session #99/, argv.join(' '));
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the move route answers local and admin callers only, never a node or the proxy', async () => {
+  const { routes, matchRoute, routeAllows } = require('./serve/routes.js');
+  const moved = [];
+  const list = routes({
+    json: (res, status, value) => ({ status, value }), broadcast: () => {},
+    moveSession: async (body) => { moved.push(body); if (body.node === 'nowhere') throw Object.assign(new Error('node nowhere is not configured'), { status: 400, extra: { reason: 'x' } }); return { ok: true, status: 'done' }; },
+  });
+  const req = { method: 'POST' };
+  const route = matchRoute(list, { req, url: new URL('http://x/api/move-session'), body: {} });
+  assert.equal(route.path, '/api/move-session');
+  for (const cls of ['local', 'admin']) assert.equal(routeAllows(route, { class: cls }), true, cls);
+  for (const cls of ['node', 'proxy']) assert.equal(routeAllows(route, { class: cls, node: 'aws1' }), false, cls);
+  assert.deepEqual(await route.handle({ res: null, body: { sessionId: 's', node: 'aws1' } }), { status: 200, value: { ok: true, status: 'done' } });
+  assert.deepEqual(await route.handle({ res: null, body: { sessionId: 's', node: 'nowhere' } }),
+    { status: 400, value: { error: 'node nowhere is not configured', reason: 'x' } });
+  // No node-API route by this name: a node's listener never reaches it.
+  assert.equal(route.when, undefined);
 });

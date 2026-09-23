@@ -14519,7 +14519,7 @@ function start(deps = {}) {
     setAsideCandidates, slack, stallAliveIds, stalled, stalledSessionSnapshot, standup, tellSession,
     startAutoCompact, startBriefScheduler, startHandoffQueue, startWtGcScheduler, summarize,
     transcriptFileForSession, pendingCompactSwaps, deliveryReceiptFor,
-    transferSession,
+    transferSession, moveSession,
     unblock, updateSetAside, usage, wantsConsoleState, watcherSend,
     withInjectionLock, writeTarget, writeToShellPane,
     broadcast, dashboardBuild, dashboardBuilder, deps, shutdown, terminalProfile,
