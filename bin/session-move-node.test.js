@@ -463,3 +463,133 @@ test('an abandon back drops what the target kept for the session: its hook state
       .dropTarget({ ...record, from: 'aws1', to: 'main' }), []);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+// ---------- a Codex session's move, through serve.js's own wiring ----------
+
+// Not a real id: the shape a Codex thread id has, which the rollout evidence needs.
+const CODEX_SID = 'c0dec0de-0000-4000-8000-00000000c0de';
+
+// A registry whose config has one Codex account, the session pinned to it on `node`.
+function codexRegistry(node = 'aws1') {
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-move-codex-'));
+  const config = path.join(root, 'config.json');
+  const configDir = path.join(root, 'codex');
+  fs.mkdirSync(configDir);
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [{ id: 'codex-a', label: 'Codex A', agent: 'codex', configDir }],
+    defaultAccounts: { codex: 'codex-a' } }));
+  const env = { ...process.env, KEEP_CONFIG: config };
+  delete env.CLAUDE_CODE_SESSION_ID;
+  accounts.pinSession(CODEX_SID, 'codex', 'codex-a', { root, env, node });
+  return { root, env, configDir, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+}
+
+const codexRow = (pid, ppid, args) => ({ pid, ppid, args, agent: 'codex', interactive: true, tty: 'ttys001', pidStart: 'Tue Sep  8 10:00:00 2026' });
+const rolloutPath = `/nowhere/sessions/2026/09/23/rollout-2026-09-23T10-00-00-${CODEX_SID}.jsonl`;
+
+test('a Codex session on a node is inspected from its pane, its node\'s processes and its rollout, never a session row', async () => {
+  const r = codexRegistry('aws1');
+  try {
+    const pane = { id: 'p3@aws1', node: 'aws1', alive: true, pid: 50, meta: { sessionId: CODEX_SID, agent: 'codex', project: '/work/project' } };
+    const asked = [];
+    const deps = (args, extra = {}) => ({
+      root: r.root, env: r.env, daemonNode: 'main', placementNodes: ['main', 'aws1'],
+      listHostPanes: async () => [pane],
+      agentProcessRows: async () => [{ pid: 50, ppid: 1, args: '/bin/zsh', tty: 'ttys001', pidStart: 'x' }, codexRow(51, 50, args)],
+      lsof: async () => `p51\nn${rolloutPath}`,
+      statMtime: async () => 1,
+      nodeTranscript: (node, session) => ({ meta: async () => { asked.push([node, session.id, session.kind]); return { model: 'gpt-rollout', meta: { model: 'gpt-meta', cwd: '/work/rollout' } }; } }),
+      ...extra,
+    });
+    // A session on another node that is Codex: remoteSessionRead would refuse it, so a
+    // move that asked it for a row could not start at all.
+    const inspected = await serve.inspectSessionMove(CODEX_SID, deps(`codex --dangerously-bypass-approvals-and-sandbox -m gpt-argv resume ${CODEX_SID}`));
+    assert.equal(inspected.agent, 'codex');
+    assert.equal(inspected.from, 'aws1');
+    assert.equal(inspected.session, null);
+    assert.equal(inspected.account.id, 'codex-a');
+    assert.deepEqual(inspected.pane, { id: 'p3@aws1', pid: 50, createdAt: undefined, node: 'aws1' });
+    assert.equal(inspected.model, 'gpt-argv', 'the -m its process was given');
+    assert.equal(inspected.flags, '--dangerously-bypass-approvals-and-sandbox');
+    assert.equal(inspected.cwd, '/work/project');
+    assert.deepEqual(asked, [], 'the rollout is not asked when the argv names the model');
+
+    // No -m and no launch model: what the rollout on aws1 says it last ran on.
+    const plain = await serve.inspectSessionMove(CODEX_SID, deps(`codex resume ${CODEX_SID}`));
+    assert.equal(plain.model, 'gpt-rollout');
+    assert.equal(plain.flags, '', 'no bypass on the source, none on the target');
+    assert.deepEqual(asked, [['aws1', CODEX_SID, 'codex']]);
+    // A rollout that cannot be read establishes no model, which the preflight refuses.
+    const unread = await serve.inspectSessionMove(CODEX_SID, deps(`codex resume ${CODEX_SID}`,
+      { nodeTranscript: () => ({ meta: async () => { throw new Error('aws1 did not answer'); } }) }));
+    assert.equal(unread.model, '<unknown>');
+
+    // No pane: the node's own table says whether it runs, and an unreadable one refuses.
+    pane.alive = false;
+    const idle = await serve.inspectSessionMove(CODEX_SID, deps('', { agentProcessRows: async () => [{ pid: 50, ppid: 1, args: '/bin/zsh', tty: 'x', pidStart: 'x' }] }));
+    assert.equal(idle.pane, null);
+    assert.equal(idle.running, undefined);
+    assert.equal(idle.flags, null);
+    assert.equal(idle.cwd, '/work/rollout', 'the rollout\'s cwd when nothing else names one');
+    const live = await serve.inspectSessionMove(CODEX_SID, deps(`codex resume ${CODEX_SID}`));
+    assert.equal(live.running, true);
+    await assert.rejects(serve.inspectSessionMove(CODEX_SID, deps(`codex resume ${CODEX_SID}`, { lsof: async () => { throw new Error('lsof failed'); } })),
+      (error) => error.status === 409 && error.extra.reason === 'processes-unverified');
+  } finally { r.cleanup(); }
+});
+
+test('a node whose host answers artifacts 1 is refused for a Codex move, by name, and still serves a Claude one', async () => {
+  const hostRequest = async (type) => {
+    if (type === 'hello') return { artifacts: 1, transcript: 3 };
+    throw new Error(`nothing else is asked: ${type}`);
+  };
+  const deps = serve.sessionMoveDeps({ daemonNode: 'main', hostRequest });
+  await deps.requireNode('aws2', 'claude');
+  await assert.rejects(deps.requireNode('aws2', 'codex'),
+    (error) => error.status === 409 && /terminal host on aws2 predates Codex moves \(its artifacts verb is version 1\)/.test(error.message));
+  const current = serve.sessionMoveDeps({ daemonNode: 'main', hostRequest: async () => ({ artifacts: 2, transcript: 4 }) });
+  await current.requireNode('aws3', 'codex');
+});
+
+test('a Codex target without the account is refused as account-missing; the launch check asks for Codex', async () => {
+  const r = codexRegistry('main');
+  try {
+    const prepared = [];
+    const deps = (artifacts) => serve.sessionMoveDeps({ root: r.root, env: r.env, daemonNode: 'main',
+      hostRequest: async (type, params) => {
+        if (type === 'hello') return { artifacts: 2, transcript: 4 };
+        assert.equal(params.kind, 'codex', 'a Codex account\'s request says so');
+        return artifacts(params);
+      },
+      prepareLaunchOn: async (node, options) => { prepared.push([node, options.agent, options.account.agent, options.check]); } });
+    await assert.rejects(deps(() => { throw new Error('codex-a is not a codex account on this node'); })
+      .targetReady('aws4', { agent: 'codex', accountId: 'codex-a', cwd: '/work/project' }),
+    (error) => error.extra.reason === 'account-missing' && /^aws4 does not have the Codex account codex-a/.test(error.message));
+    await deps(() => ({ account: 'codex-a', directory: true })).targetReady('aws4', { agent: 'codex', accountId: 'codex-a', cwd: '/work/project' });
+    assert.deepEqual(prepared, [['aws4', 'codex', 'codex', true]]);
+  } finally { r.cleanup(); }
+});
+
+test('a Codex session whose compaction swap record or restart ledger names this machine is busy', async () => {
+  const w = wiredMove({ moveDeps: { inspect: async () => ({ agent: 'codex', from: 'main', account: { id: 'codex-a', agent: 'codex', configDir: '/nowhere' },
+    session: { id: SID, kind: 'codex', endedTurn: true, project: '/work/project' }, pane: null, cwd: '/work/project', model: 'gpt-test', flags: null }) } });
+  try {
+    assert.equal((await serve.moveSession({ sessionId: SID, node: 'aws1', dry: true }, w.deps)).agent, 'codex');
+    const swap = path.join(w.root, '.keep', 'compact', `${SID}.swap.json`);
+    fs.mkdirSync(path.dirname(swap), { recursive: true });
+    // Even a restore deferred for a rate limit: the record restores a file here.
+    fs.writeFileSync(swap, JSON.stringify({ sessionId: SID, restoreDeferredReason: 'rate-limit', restoreDeferredUntil: Date.now() + 60e3 }));
+    await assert.rejects(serve.moveSession({ sessionId: SID, node: 'aws1', dry: true }, w.deps),
+      (error) => error.extra.reason === 'busy' && /Codex compaction swap record/.test(error.message));
+    fs.rmSync(swap);
+    const ledger = path.join(w.root, '.keep', 'background-jobs', 'codex', SID, 'state.json');
+    fs.mkdirSync(path.dirname(ledger), { recursive: true });
+    const state = (status) => ({ version: 1, jobs: { j1: { id: 'j1', kind: 'shell', status, eventAt: Date.now(), lastCorroboratedAt: Date.now() } },
+      calls: {}, notices: {}, checkpoint: null, gap: false, source: { agent: 'codex', sid: SID, file: '/nowhere/rollout.jsonl' } });
+    fs.writeFileSync(ledger, JSON.stringify(state('running')));
+    await assert.rejects(serve.moveSession({ sessionId: SID, node: 'aws1', dry: true }, w.deps),
+      (error) => error.extra.reason === 'busy' && /restart ledger tracks 1 open background job against the rollout on this machine/.test(error.message));
+    // A ledger with nothing open is inert, and does not hold the move.
+    fs.writeFileSync(ledger, JSON.stringify(state('completed')));
+    assert.equal((await serve.moveSession({ sessionId: SID, node: 'aws1', dry: true }, w.deps)).dry, true);
+  } finally { w.cleanup(); }
+});

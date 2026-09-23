@@ -143,7 +143,8 @@ test('the preflight refuses before anything is stopped', async () => {
   const cases = [
     [{ nodes: ['main'] }, /no other node is configured/],
     [{ from: 'aws1' }, /already on aws1/],
-    [{ agent: 'codex' }, /Claude sessions only/],
+    [{ agent: 'pi' }, /carries Claude and Codex sessions; sess-moving is a pi session/],
+    [{ agent: 'codex', inspect: { account: { id: 'claude-a', agent: 'claude', configDir: '/home/claude-a' } } }, /has no Codex account record/],
     [{ cwdMissing: true, session: { project: '/home/u/wt/keep-tool/x' } }, /does not exist on aws1.*worktree: run wt there/],
     [{ pendingDelivery: true }, /still unconfirmed/],
     [{ busy: 'an account handoff is copying (copying-artifacts)' }, /busy: an account handoff/],
@@ -176,6 +177,48 @@ test('the preflight refuses before anything is stopped', async () => {
   const busy = world({ session: { endedTurn: false } });
   try { assert.equal((await move.moveSession({ sessionId: SID, node: 'aws1', ownerForce: true }, busy.deps)).status, 'done'); }
   finally { busy.cleanup(); }
+});
+
+test('a Codex session passes the same preflight, and its record carries its Codex flags', async () => {
+  const seen = {};
+  const flags = '--dangerously-bypass-approvals-and-sandbox';
+  const w = world({ agent: 'codex', model: 'gpt-test', inspect: { flags, account: { id: 'codex-a', agent: 'codex', configDir: '/home/codex-a' } } });
+  try {
+    const requireNode = w.deps.requireNode;
+    w.deps.requireNode = async (node, agent) => { seen.requireNode = agent; return requireNode(node, agent); };
+    const targetReady = w.deps.targetReady;
+    w.deps.targetReady = async (node, plan) => { seen.plan = plan; return targetReady(node, plan); };
+    w.deps.busy = async (sessionId, plan) => { seen.busy = plan; return null; };
+    const plan = await move.moveSession({ sessionId: SID, node: 'aws1', dry: true }, w.deps);
+    assert.equal(plan.agent, 'codex');
+    assert.equal(plan.flags, flags);
+    assert.equal(plan.model, 'gpt-test');
+    assert.equal(seen.requireNode, 'codex', 'the node end is asked for the verb version a Codex move needs');
+    assert.deepEqual(seen.plan, { agent: 'codex', accountId: 'codex-a', cwd: '/work/project' });
+    assert.deepEqual(seen.busy, { agent: 'codex', from: 'main' });
+    const done = await move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps);
+    assert.equal(done.status, 'done');
+    const record = move.readMove(w.root, done.id);
+    assert.equal(record.agent, 'codex');
+    assert.equal(record.flags, flags);
+  } finally { w.cleanup(); }
+  // No process to read the flags from: null, and the target gets Keep's default.
+  const stopped = world({ agent: 'codex', noPane: true, inspect: { flags: null, account: { id: 'codex-a', agent: 'codex', configDir: '/home/codex-a' } } });
+  try { assert.equal((await move.moveSession({ sessionId: SID, node: 'aws1', dry: true }, stopped.deps)).flags, null); }
+  finally { stopped.cleanup(); }
+  // A Claude plan carries no flags field at all.
+  const claude = world();
+  try { assert.equal('flags' in (await move.moveSession({ sessionId: SID, node: 'aws1', dry: true }, claude.deps)), false); }
+  finally { claude.cleanup(); }
+  // A Codex session with no row here that its node's table says is live leaves only
+  // with Owner's force, pane or not.
+  const hostOnly = world({ agent: 'codex', from: 'aws1', noPane: true, session: null,
+    inspect: { session: null, running: true, account: { id: 'codex-a', agent: 'codex', configDir: '/home/codex-a' } } });
+  try {
+    await assert.rejects(move.moveSession({ sessionId: SID, node: 'main' }, hostOnly.deps),
+      (error) => error.extra && error.extra.reason === 'remote-graceful');
+    assert.equal((await move.moveSession({ sessionId: SID, node: 'main', ownerForce: true, dry: true }, hostOnly.deps)).agent, 'codex');
+  } finally { hostOnly.cleanup(); }
 });
 
 test('a dry run answers the plan and changes nothing', async () => {

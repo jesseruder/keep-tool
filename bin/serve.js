@@ -3943,6 +3943,8 @@ function nodeTranscript(node, session, deps = {}) {
     node,
     stat: () => ask('stat'),
     tail: (length) => ask('tail', length ? { length } : {}),
+    // A Codex rollout's session_meta and last turn's model (transcript verb 4).
+    meta: () => ask('meta'),
     match: (offset, hash, options = {}) => {
       const timeoutMs = Math.max(0, Math.min(9000, Math.floor(Number(options.timeoutMs) || 0)));
       return ask('match', { fromOffset: offset, hash, timeoutMs }, timeoutMs + 2000);
@@ -13137,7 +13139,7 @@ async function handoffSession(body, deps = {}) {
   });
 }
 
-// ---------- keep move: a Claude session from one node to another ----------
+// ---------- keep move: a Claude or Codex session from one node to another ----------
 //
 // bin/session-move.js is the state machine; these are the machines it acts on. Every
 // check that asks a node something fails closed: a node that does not answer is a
@@ -13157,10 +13159,11 @@ function moveEndpoint(node, account, deps = {}) {
 
 // Whether an agent process for this conversation runs on `node`, from that node's own
 // table read now (not the listing's short cache, which may predate the stop being
-// proven). A table that cannot be read, or a Claude row whose session could not be
-// named, proves nothing either way and refuses, on the daemon node as on any other:
+// proven). A table that cannot be read, or the evidence the agent kind is named by
+// (a Claude row's child environment, a Codex row's open rollouts) that could not be
+// read, proves nothing either way and refuses, on the daemon node as on any other:
 // this is the only stop proof when the stop had no live Keep pane to close.
-async function agentLiveOn(node, sessionId, deps = {}) {
+async function agentLiveOn(node, sessionId, deps = {}, agent = 'claude') {
   let live;
   if (node === daemonNodeName(deps)) {
     live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, processRowsCache: { value: null, at: 0, pending: null } });
@@ -13170,7 +13173,7 @@ async function agentLiveOn(node, sessionId, deps = {}) {
     try { rows = await (deps.agentProcessRows || agentProcessRows)(deps, { node }); } catch {}
     live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => rows }, { node });
   }
-  if (unverifiedProcesses(live, 'claude')) {
+  if (unverifiedProcesses(live, agent === 'codex' ? 'codex' : 'claude')) {
     throw new InjectionError(409, `the process table on ${node} could not be read, so whether ${sessionRef(sessionId)} still runs there is unproven`,
       { reason: 'processes-unverified' });
   }
@@ -13178,11 +13181,16 @@ async function agentLiveOn(node, sessionId, deps = {}) {
 }
 
 // No agent process for this conversation on `node`; anything short of that proof refuses.
-async function requireNoAgentOn(node, sessionId, deps = {}) {
-  if (await agentLiveOn(node, sessionId, deps)) {
+async function requireNoAgentOn(node, sessionId, deps = {}, agent = 'claude') {
+  if (await agentLiveOn(node, sessionId, deps, agent)) {
     throw new InjectionError(409, `an agent process still owns ${sessionRef(sessionId)} on ${node}`, { reason: 'source-running' });
   }
 }
+
+// How a Codex launch's argv names its model (`-m`, or `--model`), and the one Codex
+// flag a move carries: the permission class Keep launches Codex in.
+const CODEX_ARGV_MODEL_RE = /(?:^|\s)(?:-m|--model)(?:=|\s+)["']?([A-Za-z0-9][A-Za-z0-9._:[\]/-]*)["']?(?=\s|$)/;
+const CODEX_BYPASS_FLAG = '--dangerously-bypass-approvals-and-sandbox';
 
 async function inspectSessionMove(sessionId, deps = {}) {
   const root = deps.root || keep.ROOT;
@@ -13192,10 +13200,17 @@ async function inspectSessionMove(sessionId, deps = {}) {
   try { location = accounts.sessionLocation(sessionId, { root, env }); }
   catch (error) { throw new InjectionError(409, error.message); }
   const from = location ? location.node : daemon;
+  // A Codex session on another node has no session row here (its state would need the
+  // rollout's first line as well as its tail, and remoteSessionRead refuses one): what
+  // the move needs comes from its pane, its node's process table and its rollout's
+  // session_meta and last turn, read on that node.
+  const hostOnly = Boolean(location && location.agent === 'codex' && from !== daemon);
   let session = null;
-  try { session = await loadSessionForAction(sessionId, deps); }
-  catch (error) { if (!(error instanceof InjectionError) || error.status !== 404) throw error; }
-  const panes = await listHostPanes(deps, true);
+  if (!hostOnly) {
+    try { session = await loadSessionForAction(sessionId, deps); }
+    catch (error) { if (!(error instanceof InjectionError) || error.status !== 404) throw error; }
+  }
+  const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
   if (!Array.isArray(panes)) throw new InjectionError(409, 'the terminal hosts did not list their panes; nothing was moved');
   const pane = panes.find((entry) => entry && entry.alive !== false && entry.meta && entry.meta.sessionId === sessionId) || null;
   const agent = (location && location.agent) || (session && session.kind) || (pane && pane.meta.agent) || null;
@@ -13214,6 +13229,7 @@ async function inspectSessionMove(sessionId, deps = {}) {
     if (!identity) throw new InjectionError(409, `the agent process of ${sessionRef(sessionId)} could not be verified on ${node}`);
     args = ((rows || []).find((row) => row.pid === identity.pid) || {}).args || '';
   }
+  if (agent === 'codex') return inspectCodexMove({ sessionId, from, hostOnly, session, pane, account, args }, deps);
   let model = launchModelId(pane && pane.meta && pane.meta.model) || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(args)?.[1]) || '';
   if (!model && session && from === daemon && agent === 'claude') {
     try { model = handoffCurrentModel(session, pane, args, deps) || ''; } catch { model = '<unknown>'; }
@@ -13225,6 +13241,71 @@ async function inspectSessionMove(sessionId, deps = {}) {
     cwd: (session && session.project) || (pane && (pane.meta.project || pane.cwd)) || (record && record.cwd) || null,
     model, bypass: args.split(/\s+/).includes('--dangerously-skip-permissions'),
   };
+}
+
+// The rest of inspectSessionMove for a Codex session. The model is the pane's launch
+// model, else the `-m` its process was given, else what its rollout says it last ran
+// on (a turn_context's model, then session_meta's), and `<unknown>` when none of
+// those can be read, which the preflight refuses. `flags` is the Codex permission
+// class its process runs in, to launch the target in the same one (null when there is
+// no process to read it from: the target then gets Keep's default). `running`, for a
+// session with no row here, is its node's process table: a live one there needs
+// Owner's force to leave, and a table that cannot be read refuses.
+async function inspectCodexMove({ sessionId, from, hostOnly, session, pane, account, args }, deps = {}) {
+  const env = deps.env || process.env;
+  const daemon = daemonNodeName(deps);
+  let rollout;
+  const readRollout = async () => {
+    if (rollout !== undefined) return rollout;
+    rollout = null;
+    try {
+      if (from === daemon) {
+        const where = account && require('./codex').configuredRoots(env).find((entry) => entry.accountId === account.id);
+        if (where) rollout = require('./node-transcript').rolloutMeta(where.configDir, sessionId);
+      } else {
+        rollout = await (deps.nodeTranscript || nodeTranscript)(from, { id: sessionId, kind: 'codex' }, deps).meta();
+      }
+    } catch { rollout = null; }
+    return rollout;
+  };
+  let model = launchModelId(pane && pane.meta && pane.meta.model) || launchModelId(CODEX_ARGV_MODEL_RE.exec(args)?.[1]) || '';
+  if (!model) {
+    const read = await readRollout();
+    model = launchModelId(read && read.model) || launchModelId(read && read.meta && read.meta.model) || '<unknown>';
+  }
+  const record = readPaneRecord(sessionId, deps);
+  let cwd = (session && session.project) || (pane && (pane.meta.project || pane.cwd)) || (record && record.cwd) || null;
+  if (!cwd) {
+    const read = await readRollout();
+    cwd = (read && read.meta && read.meta.cwd) || null;
+  }
+  const running = hostOnly && !pane ? await agentLiveOn(from, sessionId, deps, 'codex') : false;
+  return {
+    agent: 'codex', from, account, session,
+    pane: pane ? { id: pane.id, pid: pane.pid, createdAt: pane.createdAt, node: sessionNodeOf(pane, deps) } : null,
+    cwd, model, bypass: false,
+    flags: pane ? (args.split(/\s+/).includes(CODEX_BYPASS_FLAG) ? CODEX_BYPASS_FLAG : '') : null,
+    ...(running ? { running: true } : {}),
+  };
+}
+
+// Why a Codex session cannot be moved yet, from what this daemon keeps for it that
+// names this machine's files, or null. Neither record follows a move: a compaction
+// swap record restores a config file here (even one deferred for a rate limit), and a
+// restart ledger with open background jobs is synced against the rollout here.
+function codexMoveObstacle(sessionId, deps = {}) {
+  const root = deps.root || keep.ROOT;
+  if (pendingCompactRestoreFile(sessionId, deps)) {
+    return 'a Codex compaction swap record names this machine\'s config and rollout; it does not follow a move, so let its restore finish first';
+  }
+  let ledger = null;
+  try { ledger = require('./background-jobs').read(root, 'codex', sessionId); } catch {}
+  const open = ((ledger && ledger.jobs) || []).filter((job) => job && !['completed', 'failed', 'cancelled'].includes(job.status)
+    && !['service', 'scheduled'].includes(job.kind));
+  if (open.length) {
+    return `its Codex restart ledger tracks ${open.length} open background job${open.length === 1 ? '' : 's'} against the rollout on this machine; they do not follow a move, so let them finish first`;
+  }
+  return null;
 }
 
 function sessionMoveDeps(deps = {}) {
@@ -13252,15 +13333,19 @@ function sessionMoveDeps(deps = {}) {
     return Object.fromEntries(listed.files.map((file) => [file.relPath, file.sha256]));
   };
   const accountOf = (record) => {
+    const agent = record.agent || 'claude';
     const account = accounts.get(record.accountId, env);
-    if (!account || account.agent !== 'claude') throw new InjectionError(409, `account ${record.accountId} is not a Claude account here`);
+    if (!account || account.agent !== agent) {
+      throw new InjectionError(409, `account ${record.accountId} is not a ${agent === 'codex' ? 'Codex' : 'Claude'} account here`);
+    }
     return account;
   };
+  const agentOf = (record) => record.agent || 'claude';
   return {
     root, env, daemonNode: daemon,
     nodeNames: () => placementNodes(deps).map((node) => node.name),
     inspect: (sessionId) => inspectSessionMove(sessionId, deps),
-    requireNode: (node) => requireNodeArtifacts(node, deps),
+    requireNode: (node, agent) => requireNodeArtifacts(node, deps, agent === 'codex' ? CODEX_ARTIFACTS_VERSION : 1),
     cwdExists: async (node, cwd) => {
       if (node === daemon) { try { return fs.statSync(cwd).isDirectory(); } catch { return false; } }
       const answer = await nodeArtifacts(node, null, deps).cwd(cwd);
@@ -13270,16 +13355,21 @@ function sessionMoveDeps(deps = {}) {
     // names it and its directory is there), and it could prepare the launch (shared
     // home, account installed, shared setup and MCP config derivable), writing nothing.
     targetReady: async (node, plan) => {
+      const agent = agentOf(plan);
       const account = accountOf(plan);
       try { await moveEndpoint(node, account, deps).account(); }
       catch (error) {
+        // A Codex move to a node that lacks the Codex account is refused as that.
+        if (agent === 'codex' && !(error instanceof InjectionError && error.extra && error.extra.reason === 'remote-node')) {
+          throw new InjectionError(409, `${node} does not have the Codex account ${plan.accountId}: ${error.message}`, { reason: 'account-missing' });
+        }
         throw new InjectionError(409, `${node} cannot take ${plan.accountId}: ${error.message}`, { reason: 'target-account' });
       }
       const onNode = moveNodeAccount(node, account, deps);
       try {
         await (deps.prepareLaunchOn || prepareLaunchOn)(node, {
-          agent: 'claude', cwd: plan.cwd, check: true,
-          account: { id: onNode.id, agent: 'claude', configDir: onNode.configDir, builtIn: onNode.builtIn === true, managed: onNode.managed === true },
+          agent, cwd: plan.cwd, check: true,
+          account: { id: onNode.id, agent, configDir: onNode.configDir, builtIn: onNode.builtIn === true, managed: onNode.managed === true },
         }, deps);
       } catch (error) {
         throw new InjectionError(409, `${node} could not launch ${plan.accountId}: ${error.message}`, { reason: 'target-launch' });
@@ -13287,7 +13377,11 @@ function sessionMoveDeps(deps = {}) {
     },
     pendingDelivery: (sessionId) => require('./delivery').pendingForSessionAsync(path.join(root, '.keep', 'delivery'), sessionId,
       { receiptFor: (entry) => deliveryReceiptFor(entry, deps) }),
-    busy: async (sessionId) => {
+    busy: async (sessionId, plan = {}) => {
+      if (plan.agent === 'codex') {
+        const obstacle = codexMoveObstacle(sessionId, deps);
+        if (obstacle) return obstacle;
+      }
       const handoff = require('./account-handoff').transferInFlight(root, sessionId);
       if (handoff) return `an account handoff is ${handoff.status} (${handoff.phase})`;
       if (compactRestoreBlocking(sessionId, deps)) return 'a compaction has not restored its model yet';

@@ -1,9 +1,11 @@
 'use strict';
-// Moving a Claude session from one node to another: stop it where it runs, carry its
-// files, flip the one record that says where it runs, and resume it on the other
-// machine. The steps are journalled under .keep/session-moves/<tx>.json, so a move
-// that fails part way is left with a record that says which machine holds the
-// session's verified bytes, and `keep move --recover <tx>` continues from there.
+// Moving a Claude or Codex session from one node to another: stop it where it runs,
+// carry its files (a Claude session's transcript, trees and file history; a Codex
+// session's root and child-thread rollouts), flip the one record that says where it
+// runs, and resume it on the other machine. The steps are journalled under
+// .keep/session-moves/<tx>.json, so a move that fails part way is left with a record
+// that says which machine holds the session's verified bytes, and
+// `keep move --recover <tx>` continues from there.
 //
 //   stopping  -> the source is stopped, and proven stopped on its own node
 //   copying   -> its files are carried to the target and verified by digest there
@@ -35,6 +37,8 @@ const path = require('node:path');
 const SESSION_RE = /^[A-Za-z0-9_-]+$/;
 const NODE_RE = /^[a-z0-9]+$/;
 const TX_RE = /^mv-[a-f0-9]{24}$/;
+// The agents whose sessions a move can carry. A Pi session is refused by name.
+const MOVABLE = ['claude', 'codex'];
 const IN_FLIGHT = ['stopping', 'copying', 'staged', 'pinned', 'starting', 'verifying', 'recovery-needed'];
 const ORDER = ['stopping', 'copying', 'staged', 'pinned', 'starting', 'verifying', 'done'];
 const BEFORE_FLIP = ['stopping', 'copying', 'staged'];
@@ -226,22 +230,25 @@ async function preflight(body, deps) {
   const inspected = await deps.inspect(body.sessionId);
   if (!inspected) throw refusal(404, `no session ${body.sessionId}`);
   const { agent, from, account, pane, session } = inspected;
-  if (agent !== 'claude') {
-    throw refusal(409, `keep move carries Claude sessions only for now; ${body.sessionId} is a ${agent || 'unknown'} session`, { reason: 'agent' });
+  if (!MOVABLE.includes(agent)) {
+    throw refusal(409, `keep move carries Claude and Codex sessions; ${body.sessionId} is a ${agent || 'unknown'} session`, { reason: 'agent' });
   }
   if (!from || !NODE_RE.test(from)) throw refusal(409, `the node ${body.sessionId} runs on could not be established`);
   if (from === to) throw refusal(409, `session ${body.sessionId} is already on ${to}`, { reason: 'same-node' });
-  if (!account || account.agent !== 'claude') throw refusal(409, `session ${body.sessionId} has no Claude account record`);
+  if (!account || account.agent !== agent) {
+    throw refusal(409, `session ${body.sessionId} has no ${agent === 'codex' ? 'Codex' : 'Claude'} account record`);
+  }
   if (pane && pane.node && pane.node !== from) {
     throw refusal(409, `session ${body.sessionId}'s pane is on ${pane.node}, but its location record names ${from}`);
   }
   // The graceful stop proves the session's background work from its transcript, and
   // this daemon cannot read a node's transcript for that proof; Owner's forced stop
-  // proves the stop from the node's process table instead.
-  if (from !== daemon && pane && body.ownerForce !== true) {
+  // proves the stop from the node's process table instead. A Codex session with no row
+  // here is live when its node's table says so (`running`), pane or not.
+  if (from !== daemon && (pane || inspected.running === true) && body.ownerForce !== true) {
     throw refusal(409, `a live session on ${from} can only be moved off its node with --force for now: the graceful stop reads the transcript, which is on ${from}`, { reason: 'remote-graceful' });
   }
-  for (const end of [from, to]) if (end !== daemon) await deps.requireNode(end);
+  for (const end of [from, to]) if (end !== daemon) await deps.requireNode(end, agent);
   const cwd = inspected.cwd;
   if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) throw refusal(409, `the working directory of ${body.sessionId} is unknown`);
   if (!(await deps.cwdExists(to, cwd))) {
@@ -249,11 +256,11 @@ async function preflight(body, deps) {
   }
   // The account and the launch, asked of the target now: found missing after the
   // stop, they would leave a stopped session nothing can start.
-  await deps.targetReady(to, { accountId: account.id, cwd });
+  await deps.targetReady(to, { agent, accountId: account.id, cwd });
   if (await deps.pendingDelivery(body.sessionId)) {
     throw refusal(409, `a message to ${body.sessionId} is still unconfirmed; the move waits until it is settled`, { reason: 'pending-delivery' });
   }
-  const busy = await deps.busy(body.sessionId);
+  const busy = await deps.busy(body.sessionId, { agent, from });
   if (busy) throw refusal(409, `${body.sessionId} is busy: ${busy}`, { reason: 'busy' });
   if (body.ownerForce !== true && session && !(session.endedTurn === true && !session.toolRunning
       && !session.pendingQuestion && !session.pendingPlan && !session.pendingBackground)) {
@@ -263,6 +270,9 @@ async function preflight(body, deps) {
   return {
     sessionId: body.sessionId, agent, accountId: account.id, from, to, cwd,
     model: inspected.model || '', bypass: inspected.bypass === true,
+    // A Codex session's permission class, launched again on the target as it ran:
+    // its Codex flags as a string, or null for Keep's default.
+    ...(agent === 'codex' ? { flags: typeof inspected.flags === 'string' ? inspected.flags : null } : {}),
     pane: pane ? { id: pane.id, pid: pane.pid, createdAt: pane.createdAt, node: pane.node || from } : null,
   };
 }
