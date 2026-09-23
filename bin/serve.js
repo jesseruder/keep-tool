@@ -1814,7 +1814,7 @@ function isHostTarget(target) {
 // node can never sit in front of a keystroke bound for another. `transcript` goes
 // further and has a connection of its own (HOST_CHANNEL_BY_TYPE): a receipt's long
 // poll waits up to nine seconds, and a launch's prepare must not queue behind it.
-const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state', 'artifacts']);
+const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state', 'artifacts', 'stats']);
 // `artifacts` carries a moving session's files in 4 MiB frames: a connection of its
 // own, so a move never sits in front of a receipt, a launch or a keystroke.
 const HOST_CHANNEL_BY_TYPE = new Map([['transcript', 'transcript'], ['artifacts', 'artifacts']]);
@@ -2085,7 +2085,7 @@ async function hostRequest(type, params, deps = {}) {
   // agent pane — a `process` call every 2.5s — clear the memo that outage listing is
   // built from, so a slow node holding an agent pane dropped off the list entirely
   // instead of staying on it marked stale.
-  const idempotent = ['hello', 'list', 'get', 'screen', 'meta', 'process', 'usage', 'transcript'].includes(type)
+  const idempotent = ['hello', 'list', 'get', 'screen', 'meta', 'process', 'usage', 'transcript', 'stats'].includes(type)
     // An artifacts read or list changes nothing, a stage is continuity-checked on the
     // node (the same piece again is a no-op), and an abort only removes a stage. A
     // publish, a release and a queue drop are asked once: their caller looks before
@@ -9684,13 +9684,109 @@ function consoleNodes(hostStatus, deps = {}) {
   const own = configured.find((node) => node.name === daemon) || { name: daemon, capabilities: [] };
   return [own, ...configured.filter((node) => node.name !== daemon)].map((node) => {
     const capabilities = Array.isArray(node.capabilities) ? [...node.capabilities] : [];
-    if (node.name === daemon) return { name: node.name, daemon: true, capabilities, ok: true };
+    // The machine's last stats sample, when there is one. Added at the end, so a row
+    // without one is exactly the row it always was.
+    const stats = nodeStatsForPublish(node.name, deps);
+    const withStats = (row) => (stats ? { ...row, stats } : row);
+    if (node.name === daemon) return withStats({ name: node.name, daemon: true, capabilities, ok: true });
     const status = Object.prototype.hasOwnProperty.call(reach, node.name) ? reach[node.name] : null;
     if (status && status.ok === false) {
-      return { name: node.name, daemon: false, capabilities, ok: false, reason: status.reason || 'unreachable' };
+      return withStats({ name: node.name, daemon: false, capabilities, ok: false, reason: status.reason || 'unreachable' });
     }
-    return { name: node.name, daemon: false, capabilities, ok: true };
+    return withStats({ name: node.name, daemon: false, capabilities, ok: true });
   });
+}
+
+// ---- node stats ----------------------------------------------------------
+//
+// Memory, CPU, disk and the rest of what each machine in the fleet looks like
+// (bin/node-stats.js), for the console's node strip and the Fleet tab. Polled on a
+// timer of its own, never inside a state build: a build only reads the last sample.
+// The daemon node is read in this process (its process table from the daemon's own
+// cached read, its pane count from the last list its host answered); every other
+// node is asked through its host's `stats` verb on the ops connection, one request
+// in flight per node. A node that stops answering keeps its last good sample, which
+// is published marked stale once it is older than NODE_STATS_STALE_MS; the node's
+// reachability is still the pane list's to report.
+const NODE_STATS_POLL_MS = 20e3;
+const NODE_STATS_STALE_MS = 60e3;
+const NODE_STATS_REQUEST_TIMEOUT_MS = 3000;
+const nodeStatsMemo = new Map();
+
+function nodeStatsClock(deps = {}) {
+  if (typeof deps.now === 'function') return Number(deps.now());
+  return Date.now();
+}
+
+async function readNodeStats(node, deps = {}) {
+  if (node === daemonNodeName(deps)) {
+    const known = nodePaneMemo.get(node);
+    const now = Date.now();
+    const panes = known && Array.isArray(known.panes) && now - known.at < NODE_STATS_STALE_MS
+      ? known.panes.filter((pane) => pane && pane.alive).length : undefined;
+    return require('./node-stats.js').readStats({
+      now, panes, processRows: () => agentProcessRows(deps),
+    });
+  }
+  const result = await hostRequest('stats', { now: Date.now() }, {
+    ...deps, node, hostRequestTimeoutMs: NODE_STATS_REQUEST_TIMEOUT_MS,
+  });
+  return result && result.stats && typeof result.stats === 'object' ? result.stats : null;
+}
+
+// One round: every configured node at once, each one skipped while its previous
+// request is still out. Entries for nodes no longer configured are dropped.
+async function pollNodeStats(deps = {}) {
+  const memo = deps.nodeStatsMemo || nodeStatsMemo;
+  const names = hostNodeNames(deps);
+  for (const name of [...memo.keys()]) if (!names.includes(name)) memo.delete(name);
+  const read = deps.readNodeStats || readNodeStats;
+  await Promise.all(names.map((name) => {
+    let entry = memo.get(name);
+    if (!entry) {
+      entry = { sample: null, sampledAt: 0, pending: null, error: null };
+      memo.set(name, entry);
+    }
+    if (entry.pending) return entry.pending;
+    entry.pending = Promise.resolve()
+      .then(() => read(name, deps))
+      .then((sample) => {
+        if (!sample || typeof sample !== 'object' || Array.isArray(sample)) return;
+        entry.sample = sample;
+        entry.sampledAt = nodeStatsClock(deps);
+        entry.error = null;
+      }, (error) => { entry.error = String(error && error.message || error); })
+      .finally(() => { entry.pending = null; });
+    return entry.pending;
+  }));
+}
+
+// What a state build publishes for one node: the last good sample, when it was
+// taken, and whether that is too long ago to be read as now. Nothing at all for a
+// node that has never answered.
+function nodeStatsForPublish(name, deps = {}) {
+  const memo = deps.nodeStatsMemo || nodeStatsMemo;
+  const entry = memo.get(name);
+  if (!entry || !entry.sample) return null;
+  const now = nodeStatsClock(deps);
+  return { ...entry.sample, sampledAt: entry.sampledAt, stale: now - entry.sampledAt > NODE_STATS_STALE_MS };
+}
+
+function startNodeStatsPoller(deps = {}, onUpdate = () => {}) {
+  let running = false;
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try {
+      await pollNodeStats(deps);
+      onUpdate();
+    } catch (error) {
+      process.stderr.write(`keep serve: node stats poll failed: ${error.message}\n`);
+    } finally { running = false; }
+  };
+  const held = loopHold.wrap('node-stats', tick);
+  setTimeout(() => { void held(); }, 3e3).unref();
+  setInterval(() => { void held(); }, NODE_STATS_POLL_MS).unref();
 }
 
 // A session's unfinished move, as the console renders it: moving (no buttons), or
@@ -15329,6 +15425,9 @@ function start(deps = {}) {
     minIntervalMs: envNumber('KEEP_DASHBOARD_MIN_INTERVAL_MS', 5000),
     onError: (error) => process.stderr.write(`keep serve: dashboard refresh failed; retaining published state: ${error.message}\n`),
   });
+  // Each machine's stats, sampled on their own timer; a new sample reaches the
+  // console with the next (throttled) build.
+  startNodeStatsPoller(deps, () => dashboardPublisher.invalidate());
   const broadcast = () => dashboardPublisher.invalidate();
   onChange = broadcast;
   // A focus request (mobile 'Open on Mac') is a named SSE event the console acts on.
@@ -15852,6 +15951,7 @@ module.exports = {
   moveSession,
   addNodeState,
   consoleNodes,
+  readNodeStats, pollNodeStats, nodeStatsForPublish, NODE_STATS_STALE_MS,
   sessionMoveDeps,
   inspectSessionMove,
   remoteSessionFreshness, unansweredNodes, piEventFor, waitForPiStart, cachedRemotePiEvent,

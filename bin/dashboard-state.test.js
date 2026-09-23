@@ -538,3 +538,27 @@ test('a watcher that has never run leaves the state untouched rather than failin
   assert.equal(rows[0].stateLine, 'still here');
   assert.equal(rows[0].pendingDecision, undefined);
 });
+
+test('node stats ride through the console projection and reach a tab as a nodes change', () => {
+  const { diffConsoleState, applyConsoleDelta } = require('../web/app/shared/state-delta.js');
+  const stats = (memAvailable, sampledAt) => ({
+    at: sampledAt, platform: 'linux', memTotal: 100, memAvailable, cpuCount: 4, cpuBusyPct: 12.5,
+    load1: 0.5, diskRoot: { total: 10, free: 4 }, panes: 2, sampledAt, stale: false,
+  });
+  const before = consoleFixture();
+  before.nodes = [
+    { name: 'main', daemon: true, capabilities: [], ok: true, stats: stats(40, 1) },
+    { name: 'aws1', daemon: false, capabilities: [], ok: true },
+  ];
+  const after = consoleFixture();
+  after.nodes = [
+    { name: 'main', daemon: true, capabilities: [], ok: true, stats: stats(30, 2) },
+    { name: 'aws1', daemon: false, capabilities: [], ok: false, reason: 'timeout', stats: stats(70, 1) },
+  ];
+  const from = consoleState(before);
+  const to = consoleState(after);
+  assert.deepEqual(from.nodes, before.nodes, 'the field is published as built');
+  const delta = diffConsoleState(from, to);
+  assert.ok(delta, 'a new sample is a change a tab hears about');
+  assert.deepEqual(applyConsoleDelta(from, delta).nodes, to.nodes);
+});

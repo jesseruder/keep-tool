@@ -16998,3 +16998,96 @@ test('a Pi resume on aws1 reads aws1\'s processes and panes for an external Pi',
     else assert.equal(error && error.message, 'reached the launch', label);
   }
 });
+
+test('node stats: each node publishes its last sample, stale after a minute, kept while its node is silent', async (t) => {
+  const { withTwoNodes } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient, pollNodeStats, consoleNodes } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodes(t, async ({ aws1 }) => {
+    await closeHostClient();
+    let clock = Date.now();
+    const deps = {
+      connectHost: connect, nodeStatsMemo: new Map(), now: () => clock,
+      daemonNode: 'main', placementNodes: ['main', 'aws1'],
+    };
+    try {
+      await pollNodeStats(deps);
+      const nodes = consoleNodes({ ok: true, nodes: { aws1: { ok: true } } }, deps);
+      assert.deepEqual(nodes.map((node) => node.name), ['main', 'aws1']);
+      for (const node of nodes) {
+        assert.ok(node.stats, `${node.name} has stats`);
+        assert.ok(node.stats.memTotal > 0 && node.stats.cpuCount >= 1, node.name);
+        assert.ok(node.stats.cpuBusyPct >= 0 && node.stats.cpuBusyPct <= 100, node.name);
+        assert.equal(node.stats.sampledAt, clock);
+        assert.equal(node.stats.stale, false);
+      }
+      const [main, remote] = nodes;
+      assert.equal(remote.stats.hostVersion.stats, 1, 'the remote host reports its own versions');
+      assert.equal(remote.stats.panes, 0);
+      assert.equal(typeof remote.stats.clockOffsetMs, 'number');
+      assert.equal(main.stats.hostVersion, undefined, 'the daemon node is read here, not asked of its host');
+
+      // A minute on with no new sample: the same numbers, marked stale.
+      clock += 61e3;
+      const later = consoleNodes({ ok: true, nodes: { aws1: { ok: true } } }, deps);
+      assert.equal(later[1].stats.stale, true);
+      assert.equal(later[1].stats.sampledAt, remote.stats.sampledAt);
+
+      // The node goes away: its last sample stays, beside the reachability the pane
+      // list reports; the daemon node samples again.
+      await aws1.close();
+      await pollNodeStats({ ...deps, forceHostReconnect: true, hostReloadRetryMs: 100, hostConnectTimeoutMs: 300 });
+      assert.match(deps.nodeStatsMemo.get('aws1').error, /./, 'the failure is remembered');
+      const down = consoleNodes({ ok: true, nodes: { aws1: { ok: false, reason: 'unreachable', since: 1 } } }, deps);
+      assert.equal(down[0].stats.sampledAt, clock);
+      assert.equal(down[0].stats.stale, false);
+      assert.equal(down[1].ok, false);
+      assert.equal(down[1].reason, 'unreachable');
+      assert.equal(down[1].stats.sampledAt, remote.stats.sampledAt, 'the last good sample is kept');
+      assert.equal(down[1].stats.stale, true);
+    } finally { await closeHostClient(); }
+  });
+});
+
+test('node stats: a node that has never answered carries no stats, and one node is the row it was plus stats', async () => {
+  const { pollNodeStats, consoleNodes } = require('./serve');
+  const memo = new Map();
+  let clock = 1_000_000;
+  const sample = { at: 5, platform: 'linux', memTotal: 100, memAvailable: 40, cpuCount: 2 };
+  const deps = {
+    nodeStatsMemo: memo, now: () => clock, daemonNode: 'main', placementNodes: ['main', 'aws1', 'mini'],
+    hostNodes: ['main', 'aws1', 'mini'],
+    readNodeStats: async (name) => {
+      if (name === 'aws1') throw new Error('unknown request');
+      if (name === 'mini') return null;
+      return sample;
+    },
+  };
+  await pollNodeStats(deps);
+  const nodes = consoleNodes({ ok: true, nodes: { aws1: { ok: true }, mini: { ok: true } } }, deps);
+  assert.deepEqual(nodes, [
+    { name: 'main', daemon: true, capabilities: [], ok: true, stats: { ...sample, sampledAt: clock, stale: false } },
+    { name: 'aws1', daemon: false, capabilities: [], ok: true },
+    { name: 'mini', daemon: false, capabilities: [], ok: true },
+  ]);
+  assert.equal(memo.get('aws1').error, 'unknown request');
+
+  // One request per node at a time: a poll while the last one is out asks nothing.
+  let asked = 0;
+  let release;
+  const slow = { ...deps, readNodeStats: () => { asked += 1; return new Promise((resolve) => { release = resolve; }); } };
+  const first = pollNodeStats({ ...slow, hostNodes: ['main'] });
+  const second = pollNodeStats({ ...slow, hostNodes: ['main'] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(asked, 1);
+  release({ ...sample, memAvailable: 10 });
+  await Promise.all([first, second]);
+  assert.equal(memo.get('main').sample.memAvailable, 10);
+  assert.equal(memo.has('aws1'), false, 'a node no longer configured is forgotten');
+
+  // A single-node install with no sample yet publishes exactly the row it always did.
+  assert.deepEqual(consoleNodes({ ok: true }, { daemonNode: 'main', placementNodes: ['main'], nodeStatsMemo: new Map() }),
+    [{ name: 'main', daemon: true, capabilities: [], ok: true }]);
+  clock += 60_001;
+  assert.equal(consoleNodes({ ok: true }, { ...deps, placementNodes: ['main'] })[0].stats.stale, true);
+});
