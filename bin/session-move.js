@@ -138,6 +138,7 @@ async function listMovesAsync(root, options = {}) {
 // says a move is in flight while nothing here runs it was left by a daemon that went
 // away: it waits for a recover or an abandon like a move that failed.
 function isRunning(sessionId) { return active.has(sessionId); }
+function running() { return [...active.keys()]; }
 
 // The move of this session that has not finished, if any. Anything but done and
 // abandoned counts: a move that failed part way still owns the session until it is
@@ -547,4 +548,4 @@ async function moveSession(body, deps = {}) {
   });
 }
 
-module.exports = { moveSession, inFlight, readMove, listMoves, listMovesAsync, PRUNE_AFTER_MS, PRUNE_EVERY_MS, isRunning, safe, digestDifference, TX_RE, IN_FLIGHT };
+module.exports = { moveSession, inFlight, readMove, listMoves, listMovesAsync, PRUNE_AFTER_MS, PRUNE_EVERY_MS, isRunning, running, safe, digestDifference, TX_RE, IN_FLIGHT };

@@ -16568,3 +16568,29 @@ test('console node state publishes in-flight and recovery-needed moves on their 
     assert.match(byId.orphan.move.message, /interrupted while staged.*leaves it on main/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('console node state does not call a move interrupted when it finishes, or starts, while the journals are read', async () => {
+  const { addNodeState } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-move-state-'));
+  try {
+    const dir = path.join(root, '.keep', 'session-moves');
+    fs.mkdirSync(dir, { recursive: true });
+    const tx = (n) => `mv-${String(n).padStart(24, '0')}`;
+    fs.writeFileSync(path.join(dir, `${tx(1)}.json`), JSON.stringify({ id: tx(1), sessionId: 'finishing', from: 'main', to: 'aws1', status: 'verifying', createdAt: 1 }));
+    fs.writeFileSync(path.join(dir, `${tx(2)}.json`), JSON.stringify({ id: tx(2), sessionId: 'starting', from: 'main', to: 'aws1', status: 'stopping', createdAt: 2 }));
+    fs.writeFileSync(path.join(dir, `${tx(3)}.json`), JSON.stringify({ id: tx(3), sessionId: 'orphan', from: 'main', to: 'aws1', status: 'copying', createdAt: 3 }));
+    // The runner set flips between the sample before the read and the one after it;
+    // isRunning, asked last, says nothing runs.
+    const samples = [['finishing'], ['starting']];
+    const sessionMove = { ...require('./session-move'), running: () => samples.shift() || [], isRunning: () => false };
+    const state = { sessions: [{ id: 'finishing' }, { id: 'starting' }, { id: 'orphan' }] };
+    await addNodeState(state, { ok: true }, { root, sessionMove, daemonNode: 'main', placementNodes: ['main', 'aws1'] });
+    const byId = Object.fromEntries(state.sessions.map((session) => [session.id, session]));
+    assert.equal(samples.length, 0, 'sampled before and after the read');
+    for (const id of ['finishing', 'starting']) {
+      assert.equal(byId[id].move.status, 'in-flight', id);
+      assert.equal(byId[id].move.interrupted, undefined, id);
+    }
+    assert.equal(byId.orphan.move.interrupted, true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

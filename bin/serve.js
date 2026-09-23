@@ -9486,8 +9486,18 @@ function consoleMove(record, running) {
 async function addNodeState(state, hostStatus, deps = {}) {
   const sessionMove = deps.sessionMove || require('./session-move');
   state.nodes = consoleNodes(hostStatus, deps);
+  // Which moves this process runs, asked before the journal read and again after it:
+  // a move that finishes while the journals are read has a journal still in flight and
+  // no longer a runner, and is not shown as interrupted for it.
+  const runningNow = () => {
+    try { return new Set(typeof sessionMove.running === 'function' ? sessionMove.running() : []); }
+    catch { return new Set(); }
+  };
+  const before = runningNow();
   let records = [];
   try { records = await sessionMove.listMovesAsync(deps.root || keep.ROOT); } catch {}
+  const after = runningNow();
+  const running = (sessionId) => before.has(sessionId) || after.has(sessionId) || sessionMove.isRunning(sessionId);
   const moves = new Map();
   for (const record of records) {
     if (!record || typeof record.sessionId !== 'string' || !sessionMove.IN_FLIGHT.includes(record.status)) continue;
@@ -9498,7 +9508,7 @@ async function addNodeState(state, hostStatus, deps = {}) {
   if (!Array.isArray(state.sessions)) return state;
   state.sessions = state.sessions.map((session) => {
     const record = session && moves.get(session.id);
-    if (record) return { ...session, move: consoleMove(record, sessionMove.isRunning(record.sessionId)) };
+    if (record) return { ...session, move: consoleMove(record, running(record.sessionId)) };
     if (session && Object.prototype.hasOwnProperty.call(session, 'move')) {
       const { move: _stale, ...rest } = session;
       return rest;
