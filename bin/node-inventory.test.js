@@ -366,6 +366,50 @@ test('a subprocess timeout holds its slot until the child has closed, and report
   assert.equal(collection.stats().active, 0);
 });
 
+// The environment the login shell probe was started with, under a given PATH.
+async function probeEnvWith(t, pathValue) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-inventory-probe-env-')));
+  const saved = { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR };
+  t.after(() => {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const shell = '/bin/fake-probe-shell';
+  const spawner = fakeSpawn((file) => (file === shell ? '__KEEP_INVENTORY__PATH=/from-the-shell\n' : ''));
+  process.env.PATH = pathValue;
+  process.env.CLAUDE_CONFIG_DIR = '/probe-caller/.claude-session';
+  try {
+    await inventory.collectInventory({
+      home: dir, shell, spawn: spawner.spawn, tools: [], logins: false,
+      claudeDirs: [path.join(dir, '.claude')], codexDirs: [path.join(dir, '.codex')], repoRoots: [path.join(dir, 'none')],
+    });
+  } finally {
+    process.env.PATH = saved.PATH;
+    if (saved.CLAUDE_CONFIG_DIR === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = saved.CLAUDE_CONFIG_DIR;
+  }
+  const call = spawner.calls.find((entry) => entry.file === shell);
+  assert.ok(call, 'the login shell was probed');
+  return call.options.env;
+}
+
+test('the login shell probe starts from the PATH a pane of this host inherits', async (t) => {
+  const env = await probeEnvWith(t, '/probe-distinct/bin:/usr/local/bin:/usr/bin:/bin');
+  assert.equal(env.PATH, '/probe-distinct/bin:/usr/local/bin:/usr/bin:/bin');
+  assert.ok(!('CLAUDE_CONFIG_DIR' in env), "the caller's session variables stay out");
+  assert.equal(env.TERM, 'dumb');
+  assert.equal(env.LC_ALL, 'C');
+});
+
+test('the login shell probe falls back to the minimal PATH when this process has none', async (t) => {
+  const env = await probeEnvWith(t, '');
+  assert.equal(env.PATH, '/usr/bin:/bin:/usr/sbin:/sbin');
+  assert.ok(!('CLAUDE_CONFIG_DIR' in env), "the caller's session variables stay out");
+});
+
 test('a timed-out subprocess is killed with everything in its process group', async (t) => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-inventory-group-')));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

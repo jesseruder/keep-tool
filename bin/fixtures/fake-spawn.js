@@ -3,7 +3,7 @@
 // A stand-in for child_process.spawn in tests of bin/node-inventory.js: no process
 // is started. `answer(file, args)` returns what the "process" does: a string (its
 // stdout, exit 0), { stdout, stderr, code }, or 'hang' (it runs until it is killed
-// or released). Every call is recorded in `calls`; `kills` counts kills asked for.
+// or released). Every call (with its spawn options) is recorded in `calls`; `kills` counts kills asked for.
 // With `{ holdKills: true }` a kill does not land until `landKills()`, so a test can
 // see a process outlive the answer; `release()` lets every hung process exit 0.
 const { EventEmitter } = require('node:events');
@@ -18,8 +18,8 @@ function fakeSpawn(answer = () => '', options = {}) {
     release() { for (const end of [...hung]) end(0, null); },
     landKills() { for (const land of heldKills.splice(0)) land(); },
   };
-  state.spawn = (file, args) => {
-    state.calls.push({ file, args });
+  state.spawn = (file, args, spawnOptions) => {
+    state.calls.push({ file, args, options: spawnOptions });
     const child = new EventEmitter();
     child.stdout = new PassThrough();
     child.stderr = new PassThrough();

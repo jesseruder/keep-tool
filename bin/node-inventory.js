@@ -87,8 +87,11 @@ const VERSION_ARGS = {
   claude: ['--version'], codex: ['--version'], pi: ['--version'], git: ['--version'], python3: ['--version'],
   tailscale: ['--version'], jq: ['--version'], rg: ['--version'],
 };
-// Read from the login shell, not from whichever process asked: a host started by a
-// service manager has a thinner environment than the sessions it runs.
+// The login shell probe's PATH when this process has none.
+const MINIMAL_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+// Read from a login shell started over this process's PATH, as a pane is: a host
+// started by a service manager has a thinner environment than the sessions it runs,
+// which add what their rc files set.
 const ENV_VARS = ['PATH', 'ANDROID_HOME', 'ANDROID_SDK_ROOT', 'JAVA_HOME', 'CLAUDE_CONFIG_DIR', 'KEEP_PORT', 'EDITOR', 'GOPATH', 'LANG'];
 const DOTFILES = [
   '.zshrc', '.zprofile', '.zshenv', '.zlogin', '.bashrc', '.bash_profile', '.profile', '.gitconfig',
@@ -661,9 +664,14 @@ async function readShellEnv(ctx) {
   if (ctx.options.shellEnv && typeof ctx.options.shellEnv === 'object') return { source: 'given', env: { ...ctx.options.shellEnv } };
   const marker = '__KEEP_INVENTORY__';
   const script = ENV_VARS.map((name) => `printf '${marker}${name}=%s\\n' "\${${name}-}"`).join('; ');
-  // A fresh login's environment, not the asker's: a CLI run inside a session, or a
-  // host started by a service manager, would otherwise report its own variables.
-  const baseEnv = { HOME: ctx.home, TERM: 'dumb', PATH: '/usr/bin:/bin:/usr/sbin:/sbin' };
+  // What a pane this host starts would see: a pane inherits the host's PATH (on a
+  // Linux node, a systemd user service's, which carries /etc/environment's) and
+  // then runs the login shell's rc files over it. So the probe's shell starts from
+  // this process's PATH, the minimal system one only when that is empty. Only PATH
+  // passes: this collection often runs in a keep CLI inside an agent session, whose
+  // CLAUDE_CONFIG_DIR, EDITOR or LANG a pane of the host never inherits, and they
+  // would leak the caller's session into the report.
+  const baseEnv = { HOME: ctx.home, TERM: 'dumb', PATH: process.env.PATH || MINIMAL_PATH };
   for (const name of ['USER', 'LOGNAME', 'SHELL', 'TMPDIR']) if (process.env[name]) baseEnv[name] = process.env[name];
   const shell = loginShell(ctx);
   const flag = /\/(zsh|bash)$/.test(shell) ? '-ilc' : '-lc';
