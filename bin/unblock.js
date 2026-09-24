@@ -436,7 +436,10 @@ function startScheduler(options = {}) {
     try {
       const result = await sweep(options);
       if (result.changed && options.onChange) options.onChange();
-      health.record('unblock', { ok: true, skipped: !result.changed, detail: result.changed ? `${result.changed} changed` : 'nothing due' });
+      // Every sweep takes the lock and reads every waiting card, so one that changes
+      // nothing is still a whole pass that worked. Recorded as a skip, a single lock
+      // timeout stayed red until some dependency happened to resolve (days, in 2026-09).
+      health.record('unblock', { ok: true, detail: result.changed ? `${result.changed} changed` : 'nothing to unblock' });
     } catch (error) {
       health.record('unblock', { ok: false, error });
       process.stderr.write(`keep unblock: sweep failed: ${error.message}\n`);

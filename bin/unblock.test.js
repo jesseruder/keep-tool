@@ -811,3 +811,26 @@ test('deps describes open and completed step-qualified dependencies', () => {
     assert.match(result.stdout, /resolved\s+done-rollout#2 \(step 2 done\)/);
   } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
 });
+
+test('a sweep with nothing to unblock clears an earlier failure', () => {
+  const fixture = registry();
+  try {
+    const script = [
+      "const health = require('./health.js');",
+      "for (let i = 0; i < 4; i += 1) health.record('unblock', { ok: false, error: 'could not acquire lock (.keep/lock)' });",
+      "const scheduler = require('./unblock.js').startScheduler({ root: process.env.KEEP_DIR });",
+      'clearInterval(scheduler.timer);',
+      'scheduler.tick().then(() => {',
+      "  const row = health.snapshot().schedulers.find((entry) => entry.name === 'unblock');",
+      '  process.stdout.write(JSON.stringify(row));',
+      '  process.exit(0);',
+      '});',
+    ].join('\n');
+    const result = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', env: fixture.env });
+    assert.equal(result.status, 0, result.stderr);
+    const row = JSON.parse(result.stdout);
+    assert.equal(row.consecutiveFailures, 0);
+    assert.equal(row.detail, 'nothing to unblock');
+    assert.equal(row.state, 'ok');
+  } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
+});

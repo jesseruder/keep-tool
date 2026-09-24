@@ -4669,7 +4669,10 @@ async function reviewerCompactTick(deps) {
   // Compaction types into the pane, and the daemon refuses that on another node
   // (refuseRemoteCompaction), so a reviewer there is skipped rather than failed.
   // The node comes from the session's location record: the scanned rows carry no
-  // `node`, and may be a stale local copy from before the session moved.
+  // `node`, and may be a stale local copy from before the session moved. The skip is
+  // `expected`: a reviewer on a node is a placement, not a fault, so it clears the
+  // row's streak instead of leaving an old failure red until a compaction that
+  // cannot happen there.
   const daemonNode = (options.daemonNode || (() => require('./nodes.js').daemonNode()))();
   let reviewerNode = null;
   try {
@@ -4677,7 +4680,7 @@ async function reviewerCompactTick(deps) {
   } catch {}
   reviewerNode ||= reviewer.node || null;
   if (reviewerNode && reviewerNode !== daemonNode) {
-    return { compacted: false, skipped: true, why: `reviewer runs on node ${reviewerNode}; compaction there is not supported yet` };
+    return { compacted: false, skipped: true, expected: true, why: `reviewer runs on node ${reviewerNode}; compaction there is not supported yet` };
   }
   let transcriptMtime;
   if (options.transcriptMtime) transcriptMtime = options.transcriptMtime(reviewer);
@@ -4899,7 +4902,7 @@ function startScheduler(deps) {
     compactInFlight = true;
     reviewerCompactTick(deps)
       .then((result) => {
-        if (result.skipped) health.record('review-compact', { ok: true, skipped: true, detail: result.why || 'nothing due' });
+        if (result.skipped) health.record('review-compact', { ok: true, skipped: true, expected: result.expected === true, detail: result.why || 'nothing due' });
         else if (result.compacted) health.record('review-compact', { ok: true, detail: `compacted ${result.sessionId}` });
         else health.record('review-compact', { ok: false, error: result.why || 'compaction failed' });
       })

@@ -1675,6 +1675,7 @@ test('reviewerCompactTick waits for an idle, clear, over-threshold reviewer and 
   });
   assert.equal(remote.skipped, true);
   assert.match(remote.why, /runs on node aws1/);
+  assert.equal(remote.expected, true);
   assert.equal(compactCalls, 2);
 });
 
