@@ -383,7 +383,7 @@ function record(name, options = {}) {
     store[name] = entry;
     // A disabled row cannot fail again, so it cannot stay charged to a deploy.
     safeNoteDeploy(store, name, { consecutiveFailures: 0 }, at, false);
-        return persist(store) ? entry : null;
+    return persist(store) ? entry : null;
   }
   const ok = options.ok !== false;
   const skipped = options.skipped === true || (ok && options.detail === 'nothing due');
@@ -430,7 +430,7 @@ function record(name, options = {}) {
     else entry.detail = clipError(options.detail);
     store[name] = entry;
     safeNoteDeploy(store, name, entry, at, false);
-        return persist(store) ? entry : null;
+    return persist(store) ? entry : null;
   }
   const entry = {
     ...prior,
@@ -455,7 +455,7 @@ function record(name, options = {}) {
   else entry.detail = clipError(options.detail);
   store[name] = entry;
   safeNoteDeploy(store, name, entry, at, !ok);
-    return persist(store) ? entry : null;
+  return persist(store) ? entry : null;
 }
 
 function nextExpectedAfter(value, config) {
