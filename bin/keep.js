@@ -1774,7 +1774,7 @@ commands.reviews = (argv) => {
   }
 };
 
-const KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE = 'For keep-tool, wt land deploys a ready live checkout by fast-forwarding it and restarting the daemon; it reports any skipped or failed deployment.';
+const KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE = 'For keep-tool, wt land deploys a ready live checkout by fast-forwarding it and restarting the daemon; it reports any skipped or failed deployment, then watches daemon health for about two minutes and names any scheduler that started failing, with the revert to run.';
 
 commands.land = (argv) => {
   const o = parseArgs(argv, { json: 'bool', 'dry-run': 'bool' });
@@ -1808,7 +1808,12 @@ commands.land = (argv) => {
   }
   const wt = require('./wt.js');
   let sha;
-  try { sha = wt.landWorktree(context.worktree); }
+  // The deploy is handed back and run after the check-in, as the node path below
+  // does: a keep-tool deploy restarts the daemon and then watches its health for a
+  // couple of minutes, and the citation should not wait on that, or be lost with a
+  // land whose caller gave up waiting.
+  let deploy = null;
+  try { sha = wt.landWorktree(context.worktree, { deferDeploy: (run) => { deploy = run; } }); }
   catch (error) { die(`wt land refused: ${error.message}`); }
   if (!sha) die('wt land had nothing to push');
   const cited = record ? ` (review record ${record.id})` : '';
@@ -1823,6 +1828,7 @@ commands.land = (argv) => {
     process.stderr.write(`keep: landed ${sha} but the check-in failed: ${error.message}\n`
       + `keep: record it by hand — keep checkin ${id} --commit ${sha} -m "Landed ${context.branch} onto ${context.defaultBranch}${cited}."\n`);
   }
+  if (deploy) deploy();
   if (o.json) return console.log(JSON.stringify({ id, landed: sha, record, why: verdict.why }, null, 2));
   console.log(`${id}: landed ${sha.slice(0, 12)} onto origin/${context.defaultBranch}${cited}`);
   console.log(`  ${KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE}`);
@@ -3749,7 +3755,8 @@ function helpText() {
   keep land <card> [--dry-run] [--json]        # keep allow <card> land, then wt land, then cite the sha
                        # exit 3 when the reviewed patches are not exactly what would land
                        # for keep-tool, wt land fast-forwards a ready live checkout, restarts the daemon,
-                       # and reports any skipped or failed deployment
+                       # and reports any skipped or failed deployment; it then watches daemon health
+                       # for ~2m and names a scheduler that regressed (WT_HEALTH_WAIT=0 skips the wait)
   keep retitle <id> "new title"
   keep rename [<#n|session-id>] "new title"    # name a session by hand; its automatic title stops updating
   keep rename [<#n|session-id>] --clear        # hand the session back to automatic titles

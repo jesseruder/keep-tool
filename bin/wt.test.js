@@ -1074,3 +1074,96 @@ test('recycledWorktree names only a missing <root>/<repo>/<name> path; recreatio
     fs.rmSync(f.root, { recursive: true, force: true });
   }
 });
+
+// A health picture as `keep health --json` gives it: just the fields the deploy
+// watch reads.
+function healthPicture(startedAt, commit, rows) {
+  return {
+    daemon: { startedAt, commit, running: true },
+    schedulers: Object.entries(rows).map(([name, row]) => ({
+      name, disabled: false, consecutiveFailures: 0, lastErrorAt: null, lastError: '', state: 'ok', ...row,
+    })),
+  };
+}
+
+test('land watches daemon health after the restart and names a regression with the revert, never running it', () => {
+  const f = fixture('keep-tool');
+  let said = '';
+  const write2 = process.stderr.write.bind(process.stderr);
+  try {
+    const worktree = runCli(f, ['new', f.name, 'watched', '--no-install']).stdout.trim();
+    const base = git(f.main, 'rev-parse', 'HEAD');
+    write(path.join(worktree, 'one.txt'), 'one\n');
+    commitIn(worktree, 'first');
+    let clock = 1_000_000;
+    const events = [];
+    let restarted = false;
+    const newStart = clock + 5e3;
+    const pictures = {
+      before: healthPicture(1000, base, { 'review-compact': {}, 'loop-stalls': {}, delivery: { consecutiveFailures: 2, state: 'ok', lastErrorAt: 900 } }),
+      starting: healthPicture(1000, base, { 'review-compact': {}, delivery: { consecutiveFailures: 2, lastErrorAt: 900 } }),
+      broken: healthPicture(newStart, 'x', {
+        'review-compact': { consecutiveFailures: 1, lastErrorAt: newStart + 60e3, lastError: 'compact tick threw' },
+        'loop-stalls': { consecutiveFailures: 1, lastErrorAt: newStart + 10e3, lastError: 'startup stall' },
+        delivery: { consecutiveFailures: 3, lastErrorAt: newStart + 60e3 },
+        deploy: { consecutiveFailures: 1, lastErrorAt: newStart + 60e3 },
+      }),
+    };
+    let polls = 0;
+    const healthSnapshot = () => {
+      if (!restarted) { events.push('snapshot-before'); return pictures.before; }
+      polls += 1;
+      return polls === 1 ? pictures.starting : pictures.broken;
+    };
+    const runDeploy = (command, args) => { events.push([command, ...args].join(' ')); restarted = true; return { status: 0 }; };
+    process.stderr.write = (chunk, ...rest) => { said += chunk; return true; };
+    let sha;
+    try {
+      sha = wt.landWorktree(worktree, {
+        runDeploy, healthSnapshot, healthWaitMs: 120e3, healthPollMs: 10e3,
+        sleep: (ms) => { clock += ms; }, now: () => clock,
+        onDeploy: (result) => events.push(result),
+      });
+    } finally { process.stderr.write = write2; }
+    assert.deepEqual(events.slice(0, 2), ['snapshot-before', 'keep restart-daemon'], 'the before picture is taken ahead of the restart');
+    const result = events[2];
+    assert.equal(result.deployed, true);
+    assert.deepEqual(result.health.regressions, ['review-compact'], 'a row failing before the restart, a startup stall, and the deploy row are not listed');
+    assert.equal(polls, 2, 'it stops polling at the first regression');
+    assert.match(said, /DEPLOY REGRESSION: 1 scheduler started failing after deploy .{7} \(was .{7}\)/);
+    assert.match(said, /review-compact: 1 failure since the restart — compact tick threw/);
+    assert.ok(said.includes(`git revert --no-edit ${base}..${sha}`), said);
+    assert.equal(git(f.origin, 'rev-parse', 'main'), sha, 'nothing was reverted or pushed on top');
+  } finally {
+    process.stderr.write = write2;
+    fs.rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test('the deploy watch says so in one line when nothing regressed, and reports a daemon that never came back', () => {
+  let said = '';
+  const write2 = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk) => { said += chunk; return true; };
+  try {
+    const before = healthPicture(1000, 'a'.repeat(40), { 'review-compact': {} });
+    let clock = 0;
+    const deps = { healthWaitMs: 60e3, healthPollMs: 10e3, sleep: (ms) => { clock += ms; }, now: () => clock };
+    let reads = 0;
+    const fine = wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), before, {
+      ...deps, healthSnapshot: () => { reads += 1; return healthPicture(2000, 'b'.repeat(40), { 'review-compact': { lastOkAt: 3000 } }); },
+    });
+    assert.deepEqual(fine, { started: true, regressions: [] });
+    assert.equal(reads, 7, 'it watches for the whole window when nothing fails');
+    assert.match(said, /no scheduler regressed in 60s/);
+
+    said = '';
+    clock = 0;
+    const down = wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), before, { ...deps, healthSnapshot: () => before });
+    assert.deepEqual(down, { started: false, regressions: [] });
+    assert.match(said, /has not recorded a new start 60s after the restart/);
+
+    said = '';
+    assert.equal(wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), before, { ...deps, noHealthWait: true }), null);
+    assert.equal(said, '', '--no-health-wait is silent');
+  } finally { process.stderr.write = write2; }
+});

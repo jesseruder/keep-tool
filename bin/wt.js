@@ -566,8 +566,110 @@ function recycleWorktree(input, opts = {}) {
 const DEPLOY_AFTER_LAND = {
   // ~/keep-tool is what the launchd-supervised `keep serve` daemon executes, and
   // its own git-pull only syncs the ~/keep registry, never the code.
-  'keep-tool': { restart: ['keep', 'restart-daemon'] },
+  // `watchHealth`: after the restart, watch the daemon's health rows for a
+  // regression this land caused (watchDeployHealth).
+  'keep-tool': { restart: ['keep', 'restart-daemon'], watchHealth: true },
 };
+
+// How long `wt land` watches the restarted daemon before it reports and exits. Most
+// schedulers tick every minute, so two minutes sees their first runs on the new
+// code; the daemon's own `deploy` health row watches the slower ones for half an
+// hour after this process is gone (bin/health.js noteDeploy). WT_HEALTH_WAIT
+// (seconds, 0 to skip) and --no-health-wait override it.
+const HEALTH_WAIT_MS = 120e3;
+const HEALTH_POLL_MS = 10e3;
+
+function healthWaitMs(opts = {}) {
+  if (opts.noHealthWait) return 0;
+  if (Number.isFinite(opts.healthWaitMs)) return Math.max(0, opts.healthWaitMs);
+  const env = process.env.WT_HEALTH_WAIT;
+  if (env != null && env !== '' && Number.isFinite(Number(env))) return Math.max(0, Number(env) * 1000);
+  // An injected restart is a test or a scripted caller, not the machine's daemon:
+  // there is nothing of its own to watch, and a real health.json is not its to wait on.
+  if (opts.runDeploy) return 0;
+  return HEALTH_WAIT_MS;
+}
+
+// Rows that were healthy in `before` (enabled, a zero streak, ok or skipped) and
+// have recorded a failure since the daemon started at `startedAt`. The daemon's own
+// `deploy` row is left out: it restates these same failures. So are the rows a
+// restart itself can fail (health.DEPLOY_UNWATCHED), which would otherwise name
+// every deploy a regression.
+function healthRegressions(before, after, startedAt) {
+  const prior = new Map(((before && before.schedulers) || []).map((row) => [row.name, row]));
+  const unwatched = require('./health.js').DEPLOY_UNWATCHED;
+  return ((after && after.schedulers) || []).filter((row) => {
+    if (!row || row.name === 'deploy' || unwatched.has(row.name)) return false;
+    const was = prior.get(row.name);
+    if (!was || was.disabled || Number(was.consecutiveFailures || 0) || !['ok', 'skipped'].includes(was.state)) return false;
+    const failedAt = Number(row.lastErrorAt) || Date.parse(row.lastErrorAt) || 0;
+    return Number(row.consecutiveFailures || 0) > 0 && failedAt >= startedAt;
+  });
+}
+
+// The landing half of the post-deploy check. Synchronous like the rest of `wt land`:
+// it polls the health file the restarted daemon writes, returns as soon as a row
+// that was healthy before the restart has failed on the new code, and otherwise
+// gives up at the deadline and says nothing regressed. It only reports — the revert
+// it prints is for the person who landed to run in a worktree, reviewed like any
+// other change. Never throws; `before` is the snapshot taken ahead of the restart.
+function watchDeployHealth(main, sha, before, opts = {}) {
+  const note = (text) => { try { process.stderr.write(`wt: ${text}\n`); } catch {} };
+  try {
+    const waitMs = healthWaitMs(opts);
+    if (!waitMs || !before) return null;
+    const read = opts.healthSnapshot || (() => require('./health.js').snapshot());
+    const pause = opts.sleep || sleep;
+    const now = opts.now || Date.now;
+    const pollMs = Number.isFinite(opts.healthPollMs) ? opts.healthPollMs : HEALTH_POLL_MS;
+    const previousStart = Number((before.daemon || {}).startedAt) || 0;
+    // The commit the old daemon was running is the base of what this restart put live,
+    // which can be more than this land's own commits when an earlier land never
+    // restarted. Without it, the checkout's HEAD before the fast-forward stands in.
+    const from = String((before.daemon || {}).commit || opts.from || '');
+    const deadline = now() + waitMs;
+    note(`watching daemon health for up to ${Math.round(waitMs / 1000)}s after the restart (WT_HEALTH_WAIT=0 or --no-health-wait skips this)`);
+    let started = 0;
+    let after = null;
+    let regressions = [];
+    for (;;) {
+      try { after = read(); } catch { after = null; }
+      const startedAt = Number(after && after.daemon && after.daemon.startedAt) || 0;
+      if (startedAt > previousStart) started = startedAt;
+      if (started) regressions = healthRegressions(before, after, started);
+      if (regressions.length || now() >= deadline) break;
+      pause(Math.max(0, Math.min(pollMs, deadline - now())));
+    }
+    const waited = `${Math.round((waitMs - Math.max(0, deadline - now())) / 1000)}s`;
+    const short = (value) => String(value || '').slice(0, 7);
+    if (!started) {
+      note(`the daemon has not recorded a new start ${waited} after the restart; check keep health and keep doctor`);
+      return { started: false, regressions: [] };
+    }
+    if (after && after.daemon && after.daemon.running === false) {
+      note(`the daemon started on the new code and is down again ${waited} later; check keep health and keep doctor`);
+    }
+    if (!regressions.length) {
+      note(`daemon health after deploy ${short(sha)}: no scheduler regressed in ${waited} (the deploy health row keeps watching for 30m)`);
+      return { started: true, regressions: [] };
+    }
+    const range = from && from !== sha ? `${short(from)}..${short(sha)}` : short(sha);
+    let revertable = false;
+    try { revertable = Boolean(from && from !== sha && isAncestor(main, from, sha)); } catch {}
+    note(`DEPLOY REGRESSION: ${regressions.length} scheduler${regressions.length === 1 ? '' : 's'} started failing after deploy ${short(sha)}${from ? ` (was ${short(from)})` : ''}:`);
+    for (const row of regressions) {
+      const error = String(row.lastError || 'tick failed').replace(/\s+/g, ' ').trim();
+      note(`  ${row.name}: ${row.consecutiveFailures} failure${row.consecutiveFailures === 1 ? '' : 's'} since the restart — ${error.length > 200 ? `${error.slice(0, 199)}…` : error}`);
+    }
+    note(`landed range ${range}; nothing was reverted. To back it out, in a fresh worktree (wt new ${path.basename(main)} revert-${short(sha)}):`);
+    note(revertable ? `  git revert --no-edit ${from}..${sha}` : `  git revert --no-edit ${sha}   (the base is unknown; revert each commit of the land)`);
+    note('  then review and land it as usual');
+    return { started: true, regressions: regressions.map((row) => row.name), range };
+  } catch (error) {
+    note(`post-deploy health check failed: ${String(error && error.message || error)}`);
+    return null;
+  }
+}
 
 // Everything here runs after the push, so nothing may throw out of it: the land
 // already happened, and a checkout that cannot be advanced is a thing to report,
@@ -626,6 +728,12 @@ function deployAfterLand(main, defaultName, sha, opts = {}) {
       }
       note(`fast-forwarded ${main} to ${sha.slice(0, 12)}`);
     }
+    // The picture of the old daemon, taken before it is asked to go: what was healthy
+    // then is what a failure afterwards is measured against.
+    let before = null;
+    if (plan.watchHealth && healthWaitMs(opts)) {
+      try { before = (opts.healthSnapshot || (() => require('./health.js').snapshot()))(); } catch {}
+    }
     const [command, ...args] = plan.restart;
     const result = run(command, args) || {};
     const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
@@ -635,7 +743,8 @@ function deployAfterLand(main, defaultName, sha, opts = {}) {
       return { deployed: false, why: 'restart', output };
     }
     if (output) note(output);
-    return { deployed: true, output };
+    const health = before ? watchDeployHealth(main, sha, before, { ...opts, from: head }) : null;
+    return { deployed: true, output, ...(health ? { health } : {}) };
   } catch (error) {
     note(`post-land deploy failed: ${describe(error)}`);
     return { deployed: false, why: 'error' };
@@ -1213,10 +1322,11 @@ function main(argv = process.argv.slice(2)) {
     const result = gcWorktrees({ cfg, repo: opts._[0], dryRun: opts['dry-run'], days: opts.days, keepFree: opts['keep-free'] });
     console.log(gcTable(result.rows));
   } else if (command === 'land') {
-    const opts = parseArgs(rest, { 'dry-run': 'bool', 'no-push': 'bool', 'ignore-main': 'bool', 'no-deploy': 'bool' });
-    if (opts._.length > 1) die('usage: wt land [<path>] [--dry-run] [--no-push] [--ignore-main] [--no-deploy]');
+    const opts = parseArgs(rest, { 'dry-run': 'bool', 'no-push': 'bool', 'ignore-main': 'bool', 'no-deploy': 'bool', 'no-health-wait': 'bool' });
+    if (opts._.length > 1) die('usage: wt land [<path>] [--dry-run] [--no-push] [--ignore-main] [--no-deploy] [--no-health-wait]');
     const sha = landWorktree(opts._[0] || process.cwd(), {
       dryRun: opts['dry-run'], noPush: opts['no-push'], ignoreMain: opts['ignore-main'], noDeploy: opts['no-deploy'],
+      noHealthWait: opts['no-health-wait'],
     });
     if (sha) console.log(sha);
   } else if (command === 'main') {
@@ -1312,6 +1422,8 @@ module.exports = {
   barePushOfSharedRef,
   unpushedMainCommits,
   deployAfterLand,
+  healthRegressions,
+  watchDeployHealth,
   deployOnDaemon,
   createWorktree,
   recycledWorktree,

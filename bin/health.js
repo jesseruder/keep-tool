@@ -18,6 +18,23 @@ const VERSION = 1;
 // it asked for. The marker is written just before exit and launchd's KeepAlive
 // relaunches within seconds, so a short window keeps it from covering a crash.
 const RESTART_REQUEST_MS = 2 * 60e3;
+// A deploy — a daemon start on a different commit from the one before it — is
+// watched for this long: a scheduler row that was healthy when the new code
+// started and records a failure inside the window is charged to that deploy on the
+// `deploy` row. Rows as slow as the window or slower are watched until their first
+// run has had time to happen (cadence plus half the window), never past the cap, so
+// an hourly row still gets its first tick counted and a daily one only when it
+// happens to run soon after the start.
+const DEPLOY_ROW = 'deploy';
+const DEPLOY_WATCH_MS = 30 * 60e3;
+const DEPLOY_WATCH_MAX_MS = 2 * HOUR_MS;
+// Rows a deploy is never charged with, because what fails them is the machine or
+// the registry rather than the code, and a restart provokes exactly that: the new
+// daemon's own startup can stall the loop past five seconds (`loop-stalls`), and
+// `runs` fails on delivery into sessions whose host is still reattaching. `lint`
+// and `git-pull` fail on registry and checkout state, `account-budget` on a spent
+// account pool. The same reasoning as bin/self-repair.js EXCLUDED, plus the budget.
+const DEPLOY_UNWATCHED = new Set(['runs', 'lint', 'git-pull', 'loop-stalls', 'account-budget']);
 let warnedWrite = false;
 
 // Schedulers that no longer exist. Their rows stay in health.json from older
@@ -61,6 +78,11 @@ const CADENCES = Object.freeze({
   // Recorded once at daemon start and once if a Claude transcript watcher dies: no
   // cadence, so the row reads as a warning until the next start records it ok.
   'transcript-watcher': { onDemand: true },
+  // Written from inside record() when a row that was healthy before a deploy starts
+  // failing after it (see noteDeploy). On demand: it has no tick of its own, and
+  // bin/self-repair.js skips on-demand rows, so the failing scheduler gets the repair
+  // card and this row only names the deploy it started with.
+  [DEPLOY_ROW]: { onDemand: true },
   brief: { cadenceMs: DAY_MS, daily: true, hour: 8, minute: 0, windowMs: 2 * HOUR_MS },
   ideas: { cadenceMs: DAY_MS, daily: true, hour: 7, minute: 30, windowMs: 2 * HOUR_MS },
   standup: { cadenceMs: DAY_MS, daily: true, weekdays: true, hour: 11, minute: 30, windowMs: 2 * HOUR_MS },
@@ -131,6 +153,80 @@ function row(name) {
   return value && typeof value === 'object' ? value : null;
 }
 
+function shortSha(value) {
+  return String(value || '').slice(0, 7) || 'unknown';
+}
+
+// How long after the deploy's start a failure on `name` still counts against it.
+function deployWatchUntil(watch, name) {
+  const cadenceMs = Number((CADENCES[name] || {}).cadenceMs || 0);
+  const span = cadenceMs >= DEPLOY_WATCH_MS ? Math.min(cadenceMs + DEPLOY_WATCH_MS / 2, DEPLOY_WATCH_MAX_MS) : DEPLOY_WATCH_MS;
+  return Number(watch.startedAt) + span;
+}
+
+// The watch a daemon start arms: which rows were healthy (recorded, enabled, a zero
+// streak) the moment the new commit started, and which commit it replaced. Only a
+// start on a new commit arms one; a start on the same commit (a crash, a restart
+// with nothing landed) keeps the watch the deploy armed, so a crash inside the
+// window does not forget it, and drops it once no row could still be watched.
+function deployWatchFor(store, prior, at, commit) {
+  const previousCommit = prior.commit ? String(prior.commit) : '';
+  if (commit && previousCommit && commit !== previousCommit) {
+    const healthy = Object.keys(store).filter((name) => {
+      if (name === 'daemon' || name === DEPLOY_ROW || RETIRED.has(name) || DEPLOY_UNWATCHED.has(name)) return false;
+      const entry = store[name];
+      return entry && typeof entry === 'object' && entry.disabled !== true && !Number(entry.consecutiveFailures || 0);
+    });
+    return { commit, previousCommit, startedAt: at, healthy };
+  }
+  const watch = prior.deployWatch;
+  if (!watch || typeof watch !== 'object' || !Number.isFinite(Number(watch.startedAt))) return null;
+  return at - Number(watch.startedAt) <= DEPLOY_WATCH_MAX_MS ? watch : null;
+}
+
+// Runs inside record(), on the store it already read and is about to write, so a
+// deploy regression costs no extra file access. Two things land here: a row the
+// watch saw healthy failing inside its window (a regression, charged to the deploy
+// it started with), and a row already charged recording again (its streak is kept
+// current, and a zero streak resolves it). The `deploy` row is rebuilt from what is
+// left: failing on the worst open streak, so it turns red on the same three-in-a-row
+// that turns the scheduler's own row red, and ok again once every regression cleared.
+function noteDeploy(store, name, entry, at, failed) {
+  if (name === DEPLOY_ROW || name === 'daemon') return;
+  const prior = store[DEPLOY_ROW] && typeof store[DEPLOY_ROW] === 'object' ? store[DEPLOY_ROW] : null;
+  const regressions = prior && prior.regressions && typeof prior.regressions === 'object' ? { ...prior.regressions } : {};
+  const failures = Number(entry.consecutiveFailures || 0);
+  if (regressions[name]) {
+    regressions[name] = { ...regressions[name], consecutiveFailures: failures, ...(failed ? { error: entry.lastError || '' } : {}) };
+  } else {
+    const watch = store.daemon && store.daemon.deployWatch;
+    if (!failed || !failures || !watch || !Array.isArray(watch.healthy) || !watch.healthy.includes(name)) return;
+    if (at < Number(watch.startedAt) || at > deployWatchUntil(watch, name)) return;
+    regressions[name] = {
+      commit: watch.commit, previousCommit: watch.previousCommit, deployedAt: Number(watch.startedAt),
+      firstFailedAt: at, consecutiveFailures: failures, error: entry.lastError || '',
+    };
+  }
+  const open = Object.entries(regressions).filter(([, value]) => Number(value.consecutiveFailures || 0) > 0);
+  const says = ([row, value]) => `${row} started failing after deploy ${shortSha(value.commit)} (was ${shortSha(value.previousCommit)})`;
+  const next = { ...(prior || {}), disabled: false, lastRunAt: at, cadenceMs: 0 };
+  if (open.length) {
+    next.consecutiveFailures = Math.max(...open.map(([, value]) => Number(value.consecutiveFailures)));
+    next.lastErrorAt = at;
+    next.lastError = clipError(open.map((item) => `${says(item)}: ${item[1].error || 'tick failed'}`).join('; '));
+    next.detail = clipError(open.map(says).join('; '));
+    // A regression that cleared while another is still open is dropped, so a later
+    // failure of it, outside any watch, is not charged to this deploy again.
+    next.regressions = Object.fromEntries(open);
+  } else {
+    next.consecutiveFailures = 0;
+    next.lastOkAt = at;
+    next.detail = clipError(`${Object.entries(regressions).map(says).join('; ')}; recovered`);
+    delete next.regressions;
+  }
+  store[DEPLOY_ROW] = next;
+}
+
 function persist(value) {
   try {
     writeStore(value);
@@ -162,6 +258,7 @@ function record(name, options = {}) {
     const sorted = startedAts.sort((a, b) => a - b);
     const requestedKept = sorted.filter((value) => requestedSet.has(value)).slice(-10);
     const unrequestedKept = sorted.filter((value) => !requestedSet.has(value)).slice(-10);
+    const deployWatch = deployWatchFor(store, prior, at, options.commit ? String(options.commit) : '');
     store.daemon = {
       startedAt: at,
       pid: Number(options.pid || process.pid),
@@ -171,6 +268,7 @@ function record(name, options = {}) {
       ...(options.commit ? { commit: String(options.commit), checkout: String(options.checkout || '') } : {}),
       startedAts: [...requestedKept, ...unrequestedKept].sort((a, b) => a - b),
       requestedStartAts: requestedKept,
+      ...(deployWatch ? { deployWatch } : {}),
     };
     persist(store);
     return store.daemon;
@@ -234,6 +332,7 @@ function record(name, options = {}) {
     if (options.detail == null || options.detail === '') delete entry.detail;
     else entry.detail = clipError(options.detail);
     store[name] = entry;
+    noteDeploy(store, name, entry, at, false);
     persist(store);
     return entry;
   }
@@ -259,6 +358,7 @@ function record(name, options = {}) {
   if (options.detail == null || options.detail === '') delete entry.detail;
   else entry.detail = clipError(options.detail);
   store[name] = entry;
+  noteDeploy(store, name, entry, at, !ok);
   persist(store);
   return entry;
 }
@@ -571,6 +671,9 @@ module.exports = {
   FILE,
   VERSION,
   CADENCES,
+  DEPLOY_ROW,
+  DEPLOY_WATCH_MS,
+  DEPLOY_UNWATCHED,
   RETIRED,
   record,
   row,

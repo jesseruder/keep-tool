@@ -2788,7 +2788,7 @@ wt path <repo> <name>
 wt main [<path>]
 wt rm <path | repo/name> [--force] [--delete]
 wt gc [--dry-run] [--days N] [--keep-free N] [<repo>]
-wt land [<path>] [--dry-run] [--no-push] [--ignore-main] [--no-deploy]
+wt land [<path>] [--dry-run] [--no-push] [--ignore-main] [--no-deploy] [--no-health-wait]
 wt guard [on|off|status]
 ```
 
@@ -2817,6 +2817,39 @@ checks are policy, not a lock; a checkout being mutated concurrently is only
 protected by `--ff-only` itself. `--no-deploy` lands without touching the checkout,
 `WT_NO_DEPLOY=1` disables the step for a whole process (the test harness sets it),
 and `keep land <card>` inherits all of this.
+
+A restart that happened is then checked, because a reviewed, tested commit can still
+leave a scheduler failing every minute on the live daemon. Before restarting,
+`wt land` takes a `keep health` snapshot; afterwards it polls health for up to two
+minutes (`WT_HEALTH_WAIT=<seconds>`, `0` or `--no-health-wait` skips it) and stops at
+the first scheduler that was healthy before the restart (enabled, ok or skipped, a
+zero streak) and has recorded a failure since the new start. It prints those rows,
+the landed range (from the commit the old daemon was running to the pushed sha) and
+the revert to run in a fresh worktree — `git revert --no-edit <from>..<sha>`, then
+review and land it as usual. It never reverts or pushes anything itself. When nothing
+regressed it says so in one line; a daemon that has not recorded a new start by the
+deadline is reported too. Give a `wt land` or `keep land` of keep-tool a command
+timeout of at least five minutes, so the report is not cut off. `keep land` records
+its check-in before the deploy, so the wait never holds the citation. A land from a
+pane-only node, which asks the daemon to deploy itself (`/api/deploy-self`), does not
+wait; the daemon's own watch below still covers it.
+
+The daemon keeps watching after that process is gone. A daemon start on a commit
+different from the previous start's arms a deploy watch in `health.json`
+(`daemon.deployWatch`: the commit, the one it replaced, and the rows healthy at
+start). For 30 minutes — longer for slower rows, cadence plus 15 minutes, capped at
+two hours, so an hourly row's first run counts — a failure on one of those rows is
+charged to the deploy on the `deploy` health row, for example `review-compact started
+failing after deploy 7f8affa (was 738b569)`. The row's streak is the worst open
+regression's, so it turns failing on the same three-in-a-row as the scheduler's own
+row, and goes back to ok (naming what recovered) once every charged row succeeds. It
+is written inside `health.record`, on the store that call already reads and writes,
+and is on demand, so self-repair opens its card on the failing scheduler, not on
+`deploy`. A same-commit restart (a crash, or a restart with nothing landed) keeps the
+watch the deploy armed. Neither half charges a deploy with `runs`, `lint`, `git-pull`,
+`loop-stalls` or `account-budget` (`health.DEPLOY_UNWATCHED`): what fails those is the
+machine, the registry or the restart itself — the new daemon's startup can stall the
+loop — so they would call every deploy a regression.
 
 `wt gc` fetches each repository, then recycles only clean, fully landed worktrees
 whose directory contains no live agent cwd. It keeps two safe recycled trees per

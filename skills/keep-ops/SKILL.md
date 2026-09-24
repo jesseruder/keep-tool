@@ -97,6 +97,12 @@ call or a write.
 The daemon runs from the main keep-tool checkout, which must stay clean: work in a
 worktree, then land. `wt land` fast-forwards a ready main checkout and restarts the
 daemon; it reports a skipped or failed deployment for the landing session to inspect.
+It then watches `keep health` for about two minutes and names any scheduler that was
+healthy before the restart and failed after it, with the landed range and the
+`git revert` to run in a fresh worktree (it never reverts itself); give it a command
+timeout of at least five minutes. For 30 minutes after a start on a new commit the daemon
+charges such failures to the `deploy` health row ("X started failing after deploy <sha>
+(was <sha>)") — a failing `deploy` row means fix forward or revert that deploy.
 For manual recovery, skills, docs and CLI-only changes may need only the fast-forward;
 daemon-code changes need the restart too.
 The daemon's own git pull syncs the registry, never the code.

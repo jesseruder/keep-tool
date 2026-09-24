@@ -486,3 +486,71 @@ test('a daemon start records the commit it loaded, and the status line shows it'
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8')).daemon.commit, undefined);
   assert.deepEqual(health.codeCommit(root), { commit: '', checkout: '' });
 });
+
+test('a row healthy before a deploy that fails after it turns the deploy row failing, naming both commits', () => {
+  const { root, health } = fixture();
+  const old = '738b569' + '0'.repeat(33);
+  const next = '7f8affa' + '1'.repeat(33);
+  const read = () => JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8'));
+  const start = 10 * 3600e3;
+  health.record('daemon', { at: start - 3600e3, pid: process.pid, commit: old });
+  health.record('review-compact', { ok: true, at: start - 60e3 });
+  health.record('delivery', { ok: false, error: 'already broken', at: start - 60e3 });
+  health.record('delivery', { ok: false, error: 'already broken', at: start - 30e3 });
+  health.record('landed', { ok: true, at: start - 60e3 });
+  health.record('daemon', { at: start, pid: process.pid, commit: next });
+  const watch = read().daemon.deployWatch;
+  assert.equal(watch.commit, next);
+  assert.equal(watch.previousCommit, old);
+  assert.ok(watch.healthy.includes('review-compact'));
+  assert.equal(watch.healthy.includes('delivery'), false, 'a row failing before the deploy is not the deploy\'s fault');
+
+  health.record('delivery', { ok: false, error: 'still broken', at: start + 60e3 });
+  assert.equal(read().deploy, undefined, 'an already-failing row charges nothing to the deploy');
+
+  for (let i = 1; i <= 3; i++) health.record('review-compact', { ok: false, error: 'boom', at: start + i * 60e3 });
+  const row = health.snapshot(start + 4 * 60e3).schedulers.find((entry) => entry.name === 'deploy');
+  assert.equal(row.state, 'failing');
+  assert.equal(row.consecutiveFailures, 3);
+  assert.match(row.lastError, /^review-compact started failing after deploy 7f8affa \(was 738b569\): boom/);
+  assert.match(row.detail, /review-compact started failing after deploy 7f8affa \(was 738b569\)/);
+  assert.ok(health.attentionItems(health.snapshot(start + 4 * 60e3), start + 4 * 60e3).some((item) => item.id === 'health:deploy'));
+
+  // A crash-restart on the same commit keeps the watch the deploy armed.
+  health.record('daemon', { at: start + 5 * 60e3, pid: process.pid, commit: next });
+  assert.equal(read().daemon.deployWatch.startedAt, start);
+
+  // A slow row still gets its first run counted past the half hour.
+  health.record('landed', { ok: false, error: 'late', at: start + 40 * 60e3 });
+  assert.match(read().deploy.lastError, /landed started failing/);
+
+  // Recovery of every regression clears the row, and says what it was.
+  health.record('review-compact', { ok: true, at: start + 41 * 60e3 });
+  assert.equal(read().deploy.consecutiveFailures, 1, 'landed is still open');
+  health.record('landed', { ok: true, at: start + 42 * 60e3 });
+  const cleared = read().deploy;
+  assert.equal(cleared.consecutiveFailures, 0);
+  assert.equal(cleared.regressions, undefined);
+  assert.match(cleared.detail, /landed started failing after deploy 7f8affa \(was 738b569\); recovered/);
+  assert.equal(health.snapshot(start + 43 * 60e3).schedulers.find((entry) => entry.name === 'deploy').state, 'ok');
+});
+
+test('a failure outside the deploy watch, or after a start on the same commit, is not a deploy regression', () => {
+  const { root, health } = fixture();
+  const read = () => JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8'));
+  const start = 10 * 3600e3;
+  health.record('daemon', { at: start - 3600e3, pid: process.pid, commit: 'a'.repeat(40) });
+  health.record('review-compact', { ok: true, at: start - 60e3 });
+  health.record('daemon', { at: start, pid: process.pid, commit: 'a'.repeat(40) });
+  assert.equal(read().daemon.deployWatch, undefined, 'a restart with nothing new is not a deploy');
+  health.record('review-compact', { ok: false, error: 'boom', at: start + 60e3 });
+  assert.equal(read().deploy, undefined);
+
+  health.record('review-compact', { ok: true, at: start + 2 * 60e3 });
+  health.record('loop-stalls', { ok: true, at: start + 2 * 60e3 });
+  health.record('daemon', { at: start + 3600e3, pid: process.pid, commit: 'b'.repeat(40) });
+  health.record('loop-stalls', { ok: false, error: 'event loop stalled 6s', at: start + 3600e3 + 10e3 });
+  assert.equal(read().deploy, undefined, 'a startup stall is the restart, not the code');
+  health.record('review-compact', { ok: false, error: 'boom', at: start + 3600e3 + 31 * 60e3 });
+  assert.equal(read().deploy, undefined, 'a minute row failing after its 30m window is ordinary health');
+});
