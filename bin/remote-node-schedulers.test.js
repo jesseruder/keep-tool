@@ -603,3 +603,23 @@ test('steps: a claim held by a busy session on the node is not called stale', (t
   assert.equal(claimStaleness(claim(fleet.unmirrored), now), null);
   assert.equal(claimStaleness(claim(fleet.remoteCodex), now), null);
 });
+
+// ---------- health: a node-side "busy" or "unreachable" holds the review row ----------
+
+test('health: a reviewer refused as busy or unreachable on its node holds the review row, like the local skips', () => {
+  const { recordTickError } = require('./review.js');
+  const rows = [];
+  const record = (name, value) => rows.push({ name, ...value });
+  const write = process.stderr.write;
+  process.stderr.write = () => true;
+  try {
+    recordTickError(new Error('reviewer 0a1b is not idle on aws1; nothing was typed'), record);
+    recordTickError(new Error("node aws1 did not answer, so the reviewer's pane there cannot be verified; nothing was sent"), record);
+    recordTickError(new Error('pane fxstray is on main but reviewer 0a1b is on aws1; nothing was sent'), record);
+  } finally { process.stderr.write = write; }
+  assert.deepEqual(rows.map((row) => [row.ok, row.holdResult === true, row.detail || null]), [
+    [true, true, 'reviewer is mid-turn on its node'],
+    [true, true, 'reviewer node did not answer'],
+    [false, false, null],
+  ]);
+});

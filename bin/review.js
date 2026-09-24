@@ -4856,8 +4856,17 @@ function recordTickOutcome(result, record = health.record) {
 function recordTickError(e, record = health.record) {
   // Another sender holding the injection lock is a skip, not a failure; a modal or
   // an unresolvable pane is the real thing and must count.
-  // It did not try, so the skip holds the row's result.
-  if (/injection is busy/i.test(String(e && e.message || e))) record('review', { ok: true, skipped: true, holdResult: true, cadenceMs: reviewCadenceMs(), detail: 'injection busy' });
+  // It did not try, so the skip holds the row's result. The same for a reviewer on
+  // another node that its node says is mid-turn (serve.js sendReviewerMessage) or
+  // whose node did not answer for its pane: the node-side reading of "reviewer is
+  // mid-turn" and "unreachable", refused before a key was typed.
+  const message = String(e && e.message || e);
+  const held = /injection is busy/i.test(message) ? 'injection busy'
+    : e && e.typingStarted ? null
+      : /^reviewer \S+ is not idle on \S+; nothing was typed/.test(message) ? 'reviewer is mid-turn on its node'
+        : /^node \S+ did not answer, so the reviewer's pane there cannot be verified/.test(message) ? 'reviewer node did not answer'
+          : null;
+  if (held) record('review', { ok: true, skipped: true, holdResult: true, cadenceMs: reviewCadenceMs(), detail: held });
   else record('review', { ok: false, cadenceMs: reviewCadenceMs(), error: e });
   process.stderr.write('keep review: tick failed: ' + (e && e.message || e) + '\n');
 }
