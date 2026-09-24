@@ -1159,7 +1159,7 @@ function createHost(options = {}) {
           // daemon node's.
           inventory: INVENTORY_VERSION,
           // Set while an earlier inventory is stuck past its grace (see runInventory).
-          inventoryStuck,
+          inventoryStuck: inventoryStuck ? inventoryStuck.text : null,
           // spawnReceipts: a spawn naming an operationId is journalled, so a caller
           // whose reply was lost may ask again instead of starting a second process.
           spawnReceipts: true,
@@ -1661,7 +1661,9 @@ function createHost(options = {}) {
   // The wait for idle is bounded too: a filesystem call on a hung mount never
   // returns and cannot be cancelled. Past INVENTORY_IDLE_GRACE_MS after the answer
   // the slot is released anyway, and what was still running is recorded as
-  // `inventoryStuck` (in the hello and in every answer) until it does return.
+  // `inventoryStuck` (in the hello and in every answer) until it does return. While
+  // it names the filesystem a new collection is refused: it would pile onto the same
+  // hung mount and could take every libuv thread the host needs for its own work.
   let inventoryInFlight = 0;
   let inventoryStuck = null;
   const INVENTORY_IN_FLIGHT_MAX = 1;
@@ -1675,9 +1677,21 @@ function createHost(options = {}) {
       respond({ ok: false, id: request.id, error: 'an inventory is already being collected', code: 'inventory-busy' });
       return;
     }
+    if (inventoryStuck && inventoryStuck.reason === 'filesystem') {
+      respond({ ok: false, id: request.id, error: 'inventory-stuck: filesystem; reload the host to clear', code: 'inventory-stuck' });
+      return;
+    }
     inventoryInFlight += 1;
     let idle = null;
     let collection = null;
+    // Recorded as an object, and cleared only by the same one, so an earlier stuck
+    // collection returning never clears a later one that is still stuck.
+    const markStuck = (reason, pending) => {
+      const record = { reason, text: `inventory stuck: ${reason}` };
+      inventoryStuck = record;
+      eventLog(`host: ${record.text}; its slot is released`);
+      if (pending) Promise.resolve(pending).then(() => { if (inventoryStuck === record) inventoryStuck = null; }, () => {});
+    };
     const waitIdle = () => {
       if (!idle) return undefined;
       let timer;
@@ -1686,10 +1700,7 @@ function createHost(options = {}) {
         clearTimeout(timer);
         if (settled) return;
         const counts = typeof collection.stats === 'function' ? collection.stats() : {};
-        const stuck = `inventory stuck: ${counts.fsActive ? 'filesystem' : counts.active ? 'subprocess' : 'unknown'}`;
-        inventoryStuck = stuck;
-        eventLog(`host: ${stuck}; its slot is released`);
-        Promise.resolve(idle).then(() => { if (inventoryStuck === stuck) inventoryStuck = null; }, () => {});
+        markStuck(counts.fsActive ? 'filesystem' : counts.active ? 'subprocess' : 'unknown', idle);
       });
     };
     Promise.resolve()
@@ -1699,7 +1710,15 @@ function createHost(options = {}) {
         // replacement for the collection.
         const seam = options.inventoryOptions || {};
         const start = options.inventoryStart || inventory.startInventory;
-        const scope = await inventory.requestOptions(request, seam.home || os.homedir());
+        let scope;
+        try {
+          scope = await inventory.requestOptions(request, seam.home || os.homedir(), options.inventoryScopeBounds || {});
+        } catch (error) {
+          // A realpath on a hung mount that never returned: nothing will clear it but a
+          // reload, and the next ask would only pile onto it.
+          if (error && error.code === 'scope-timeout') markStuck('filesystem', null);
+          throw error;
+        }
         // Never the account list here: it is read synchronously, and the host's loop
         // carries keystrokes. A node without a requested directory looks at the
         // agents' default ones.
@@ -1709,9 +1728,9 @@ function createHost(options = {}) {
         return { lines: inventory.toLines(entries), partial: inventory.partialOf(entries) || false };
       })
       .then(({ lines, partial }) => respond({
-        ok: true, id: request.id, inventory: lines, partial, stuck: inventoryStuck, version: INVENTORY_VERSION,
+        ok: true, id: request.id, inventory: lines, partial, stuck: inventoryStuck ? inventoryStuck.text : null, version: INVENTORY_VERSION,
       }), (error) => {
-        respond({ ok: false, id: request.id, error: error.message });
+        respond({ ok: false, id: request.id, error: error.message, ...(error && error.code ? { code: error.code } : {}) });
       })
       .catch(() => {})
       .then(waitIdle)

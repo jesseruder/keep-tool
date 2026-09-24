@@ -75,12 +75,26 @@ credential:
   and a hash, never their values.
 - Logins are reported by the identity each CLI prints, such as an account name or an
   ARN.
+- Every hash is keyed with a random salt that the audit makes and hands to both
+  sides. Hashes therefore compare within one audit and mean nothing across audits,
+  so a short masked word cannot be recovered by hashing a password list.
+
+One known limit: a word in a free position that looks like an ordinary word is shown,
+because only its shape can be judged. In `deploy supersecretpassword now` all three
+words are shown. Command-line rows exist to compare two machines, not to reproduce
+the command.
 
 When either side hit its deadline (about fifty seconds), the report starts with a
-warning naming the sections it cut short. Their rows are summarised rather than
-listed, because what is missing from them is not a real difference; run the audit
-again. Rows of a file one side could not read (too large, unparseable or unreadable)
-are summarised the same way.
+warning naming the sections it cut short. Rows that only one side reported in those
+sections are summarised rather than listed, because what is missing from them is not
+a real difference; run the audit again. Rows both sides reported with different
+values are still listed. Rows of a file one side could not read (too large,
+unparseable or unreadable) are summarised the same way.
+
+If a node's filesystem hangs, for example a stuck network mount, its host releases
+the audit after a grace period and reports `inventory stuck: filesystem` in its hello
+and answers. It then refuses new audits until `keep host reload` is run on that node,
+so that audits do not pile up on the same mount.
 
 A node whose host predates the `inventory` verb is refused with a message saying so:
 on that node, `git pull` in Keep's checkout and run `keep host reload`. The reload keeps

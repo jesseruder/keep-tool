@@ -267,6 +267,9 @@ async function nodeAudit(argv, deps = {}) {
   const home = deps.homedir || require('node:os').homedir();
   const daemon = deps.daemonNode || nodes.daemonNode();
   const scope = auditScope(home, deps);
+  // One salt for both sides of this audit: their hashes compare with each other and
+  // with no other audit's.
+  const salt = deps.salt || inventory.randomSalt();
   const connect = deps.connect || require('../hostclient.js').connect;
   let client;
   try { client = await connect({ node: name, timeoutMs: deps.timeoutMs == null ? 3000 : deps.timeoutMs }); }
@@ -282,8 +285,8 @@ async function nodeAudit(argv, deps = {}) {
     const collect = deps.collectInventory || inventory.collectInventory;
     let answer;
     const [ours] = await Promise.all([
-      collect({ ...scope.local, ...(deps.inventoryOptions || {}) }),
-      client.request('inventory', scope.remote, { timeoutMs: deps.auditTimeoutMs == null ? AUDIT_TIMEOUT_MS : deps.auditTimeoutMs })
+      collect({ ...scope.local, salt, ...(deps.inventoryOptions || {}) }),
+      client.request('inventory', { ...scope.remote, salt }, { timeoutMs: deps.auditTimeoutMs == null ? AUDIT_TIMEOUT_MS : deps.auditTimeoutMs })
         .then((result) => { answer = result; }, (error) => { answer = { error }; }),
     ]);
     if (answer.error) return die(`node ${name} could not collect its inventory: ${answer.error.message}`);
@@ -295,15 +298,24 @@ async function nodeAudit(argv, deps = {}) {
     const stuck = typeof answer.stuck === 'string' && answer.stuck ? answer.stuck : null;
     if (o.json) {
       console.log(JSON.stringify({ daemonNode: daemon, node: name, partial, stuck, sections }));
-      return;
+      return finishAudit(deps);
     }
     if (stuck) console.log(`warning: node ${name} reports an earlier ${stuck}; its host may be short of filesystem threads until it returns`);
     console.log(inventory.renderComparison(sections, {
       nameA: daemon, nameB: name, all: o.all === true, partial: { a: partial.daemon, b: partial.node },
     }));
+    return finishAudit(deps);
   } finally {
     try { client.close(); } catch {}
   }
+}
+
+// The report is out: exit rather than wait, since a local collection stuck on a hung
+// mount leaves filesystem calls that would otherwise keep the process alive. Output
+// is flushed first. Exit 0, since the audit is a report, not a gate.
+async function finishAudit(deps) {
+  await new Promise((resolve) => process.stdout.write('', resolve));
+  (deps.exit || ((code) => process.exit(code)))(0);
 }
 
 commands.nodes = async (argv, deps = {}) => {

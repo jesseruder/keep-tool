@@ -27,6 +27,12 @@
 //   and opaque runs; a value whose name says secret is reported as `set`; a table
 //   or object is reported by its key names and hash, never its values.
 // Logins are reported by the identity each CLI prints (an account name, an ARN).
+// Every hash is an HMAC under a salt that `keep node audit` makes per audit and hands
+// to both sides, so hashes compare only within one audit.
+//
+// A known limit: a word in a free position that reads as a plain name
+// (`deploy supersecretpassword now`) is shown; only its shape can be judged. Command
+// rows are made to compare two machines, not to reproduce the command.
 //
 // Every read is bounded and nothing throws: a subprocess runs in its own process
 // group with its output buffered and capped, and is killed with that group on
@@ -106,7 +112,15 @@ const GROUP_SECTIONS = {
 
 // ---- text safety ------------------------------------------------------------
 
-const sha = (value) => crypto.createHash('sha256').update(value).digest('hex').slice(0, 12);
+// Every hash in an inventory is an HMAC under a salt: `keep node audit` makes one per
+// audit and gives it to both sides, so their hashes compare with each other and with
+// nothing else. An unsalted short hash of a line whose other words are visible would
+// let a password list recover the one word that was masked. A collection asked for
+// without a salt makes its own, so no row ever carries an unsalted hash.
+const SALT_RE = /^[0-9a-f]{16,64}$/i;
+const randomSalt = () => crypto.randomBytes(16).toString('hex');
+const makeHash = (salt) => (value) => crypto.createHmac('sha256', String(salt)).update(value).digest('hex').slice(0, 12);
+const defaultHash = makeHash(randomSalt());
 
 // A piece of a token that looks random rather than written: long with letters and
 // digits mixed, or very long in mixed case.
@@ -131,27 +145,43 @@ function caseFlips(text) {
 // Letters and digits run together with no separator: a password shape, never a word.
 const mixedAlnum = (word) => /^[A-Za-z0-9]+$/.test(word) && /\d/.test(word) && /[A-Za-z]/.test(word) && !/^v?\d+$/.test(word);
 
+const PLAIN_WORD = /^[A-Za-z0-9_./~-]+$/;
+// Text that reads as a written name or path: the plain alphabet (plus `extra`
+// characters), and every piece between separators short, not random-looking and,
+// unless it is an executable, without letters and digits run together.
+function readsAsName(text, { executable = false, extra = '' } = {}) {
+  const value = String(text == null ? '' : text);
+  const alphabet = extra ? new RegExp(`^[A-Za-z0-9_./~${extra}-]+$`) : PLAIN_WORD;
+  if (!value || !alphabet.test(value) || value.length > 160) return false;
+  return value.split(/[/@:]+/).filter(Boolean).every((segment) => segment.length <= 40 && !opaque(segment)
+    && segment.split(/[-_.~]+/).every((piece) => piece.length <= 24
+      && caseFlips(piece) < Math.max(3, piece.length / 3)
+      && (executable || !mixedAlnum(piece))));
+}
+
 // A flag whose value is a credential. Single letters are case-sensitive, so -h, -P
 // and -U (psql's host, port and user name) are ordinary flags; -u, -p and -H are not.
+// Long names are matched in their kebab form, so --api_key is --api-key.
 function credentialFlag(flag) {
   const text = String(flag || '');
   if (/^-[A-Za-z]$/.test(text)) return /^-[upH]$/.test(text);
   if (!/^--?[A-Za-z][A-Za-z0-9_-]+$/.test(text)) return false;
-  return /^--?(?:user|pw|pass|header)$/i.test(text) || SECRET_NAME.test(text.replace(/^-+/, ''));
+  const name = text.replace(/^-+/, '').replace(/_/g, '-');
+  return /^(?:user|pw|pass|header)$/i.test(name) || SECRET_NAME.test(name);
 }
 
-function embeddedUrl(url) {
+function embeddedUrl(url, hash = defaultHash) {
   try { new URL(url); } catch { return '***'; }
-  return safeUrl(url);
+  return safeUrl(url, hash);
 }
 
 // Credential-shaped substrings out of free text: embedded URLs (through safeUrl),
 // header-shaped `Name: value` pairs, any `name=value` or `"name": value` pair whose
 // name says secret, the values of credential flags and of attached -p, well-known
 // token prefixes, bearer values and opaque runs.
-function scrub(text) {
+function scrub(text, hash = defaultHash) {
   return String(text == null ? '' : text)
-    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`]+/gi, embeddedUrl)
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`]+/gi, (url) => embeddedUrl(url, hash))
     .replace(/(\/\/)[^/\s@]+@/g, '$1***@')
     .replace(/\b(Authorization|Proxy-Authorization|Cookie|Set-Cookie|[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+)(:[ \t]*)[^"'\n]+/g, '$1$2***')
     .replace(/\b(bearer|basic)\s+[^\s"']+/gi, '$1 ***')
@@ -168,7 +198,7 @@ function scrub(text) {
 // A URL path segment that may be a credential (a webhook's secret, a token-bearing
 // MCP endpoint) becomes a short hash marker, so the same URL on two machines still
 // compares equal and neither prints it. Matrix parameters (`;name=value`) are dropped.
-function maskSegment(segment) {
+function maskSegment(segment, hash = defaultHash) {
   if (!segment) return segment;
   const [head, ...params] = segment.split(';');
   let decoded = head;
@@ -179,29 +209,39 @@ function maskSegment(segment) {
     || pieces.some((piece) => piece.length >= 16)
     || /^(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{8,}$/.test(decoded)
     || pieces.some((piece) => piece.length >= 8 && caseFlips(piece) >= Math.max(4, piece.length / 3));
-  return `${risky ? `*${sha(head).slice(0, 8)}` : head}${params.length ? ';***' : ''}`;
+  return `${risky ? `*${hash(head).slice(0, 8)}` : head}${params.length ? ';***' : ''}`;
 }
 
-function safeUrl(value) {
+function safeUrl(value, hash = defaultHash) {
   const text = String(value == null ? '' : value).trim();
+  const mask = (segment) => maskSegment(segment, hash);
   try {
     const url = new URL(text);
     if (!url.host) throw new Error('no host');
-    const pathname = url.pathname.split('/').map(maskSegment).join('/');
-    const query = url.search ? `?${[...url.searchParams.keys()].sort().map((key) => `${maskSegment(key)}=***`).join('&')}` : '';
+    const pathname = url.pathname.split('/').map(mask).join('/');
+    const query = url.search ? `?${[...url.searchParams.keys()].sort().map((key) => `${mask(key)}=***`).join('&')}` : '';
     return `${url.protocol}//${url.host}${pathname}${query}`;
   } catch {}
   // scp-style git remotes: [user@]host:path.
   const scp = /^(?:([^\s@/:]+)@)?([A-Za-z0-9.-]+):([^\s]+)$/.exec(text);
-  if (scp) return `${scp[1] ? `${scp[1] === 'git' ? 'git' : '***'}@` : ''}${scp[2]}:${scp[3].split('/').map(maskSegment).join('/')}`;
+  if (scp) return `${scp[1] ? `${scp[1] === 'git' ? 'git' : '***'}@` : ''}${scp[2]}:${scp[3].split('/').map(mask).join('/')}`;
   // A local path (a remote that is another checkout on this disk).
-  if (/^[/~]/.test(text) && PLAIN_WORD.test(text)) return text.split('/').map(maskSegment).join('/');
+  if (/^[/~]/.test(text) && PLAIN_WORD.test(text)) return text.split('/').map(mask).join('/');
   return '***';
 }
 
 const SHELL_OPERATOR = /^(?:&&|\|\||\||;|&|>|>>|<|2>&1|2>\/dev\/null)$/;
-const PLAIN_WORD = /^[A-Za-z0-9_./~-]+$/;
-const BARE_FLAG = /^--?[A-Za-z][A-Za-z0-9-]*$/;
+const FLAG = /^(--?)([A-Za-z][A-Za-z0-9_-]*)$/;
+
+// A flag word shown as it is, or with its glued value masked. A long flag's name
+// must read as a name. A single dash with more than one letter is either grouped
+// short flags or a letter with a value glued on; only up to four letters are taken
+// as the former, anything else keeps its first letter and masks the rest.
+function showFlag(dashes, body) {
+  if (dashes === '--') return readsAsName(body) ? `--${body}` : '***';
+  if (body.length === 1 || /^[A-Za-z]{2,4}$/.test(body)) return `-${body}`;
+  return `-${body[0]}***`;
+}
 
 // Shell-style words: a quoted span is one word, quotes removed.
 function tokenize(text) {
@@ -231,23 +271,10 @@ function tokenize(text) {
 
 // A command line for display, through an allowlist: see the top of this file. Only
 // words that are provably harmless are shown; everything else is `***`.
-function safeCommand(input, rel = (value) => value) {
+function safeCommand(input, rel = (value) => value, hash = defaultHash) {
   const words = Array.isArray(input) ? input.map((value) => String(value)) : tokenize(input);
   if (!words.length) return '';
   const full = Array.isArray(input) ? JSON.stringify(input) : String(input);
-  // A word from the allowed alphabet whose every piece (between / - _ .) reads as a
-  // written word: short, not random-looking, and, past the executable, no letters and
-  // digits run together (a password's shape, and base64's).
-  const plain = (word, executable) => {
-    const shown = rel(word);
-    if (!PLAIN_WORD.test(shown) || shown.length > 160) return null;
-    const segments = shown.split('/').filter(Boolean);
-    const ok = segments.every((segment) => segment.length <= 40 && !opaque(segment)
-      && segment.split(/[-_.]+/).every((piece) => piece.length <= 24
-        && caseFlips(piece) < Math.max(3, piece.length / 3)
-        && (executable || !mixedAlnum(piece))));
-    return ok ? shown : null;
-  };
   const out = [];
   let hideNext = false;
   words.forEach((word, index) => {
@@ -255,21 +282,26 @@ function safeCommand(input, rel = (value) => value) {
     if (SHELL_OPERATOR.test(word)) { out.push(word); return; }
     if (word.includes('=')) {
       const name = word.slice(0, word.indexOf('='));
-      const bare = name.replace(/^-+/, '');
-      const nameOk = /^-{0,2}[A-Za-z_][A-Za-z0-9_.-]*$/.test(name) && !SECRET_NAME.test(bare) && !credentialFlag(name);
+      const flag = FLAG.exec(name);
+      const nameOk = flag
+        ? readsAsName(flag[2]) && !credentialFlag(name) && !SECRET_NAME.test(flag[2])
+        : /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(name) && readsAsName(name, { executable: true }) && !SECRET_NAME.test(name);
       out.push(nameOk ? `${name}=***` : '***');
       return;
     }
     if (/^-[pu]./.test(word)) { out.push(`${word.slice(0, 2)}***`); return; }
-    if (BARE_FLAG.test(word)) {
-      out.push(word);
+    const flag = FLAG.exec(word);
+    if (flag) {
+      out.push(showFlag(flag[1], flag[2]));
       if (credentialFlag(word)) hideNext = true;
       return;
     }
-    if (/^https?:\/\//i.test(word)) { out.push(embeddedUrl(word)); return; }
-    out.push(plain(word, index === 0) || '***');
+    if (/^https?:\/\//i.test(word)) { out.push(embeddedUrl(word, hash)); return; }
+    // A word, a path or the executable, shown only when it reads as a name.
+    const shown = rel(word);
+    out.push(readsAsName(shown, { executable: index === 0 }) ? shown : '***');
   });
-  return `${out.join(' ')} sha=${sha(full)}`;
+  return `${out.join(' ')} sha=${hash(full)}`;
 }
 
 // ---- bounded work ----------------------------------------------------------
@@ -278,9 +310,13 @@ function createContext(options) {
   const home = path.resolve(options.home || os.homedir());
   const entries = new Map();
   let idleResolve;
+  const hash = makeHash(typeof options.salt === 'string' && SALT_RE.test(options.salt) ? options.salt : randomSalt());
   const ctx = {
     home,
     options,
+    hash,
+    scrub: (text) => scrub(text, hash),
+    safeUrl: (value) => safeUrl(value, hash),
     fsp: options.fsp || fsp,
     done: false,
     entries,
@@ -365,9 +401,10 @@ function run(ctx, file, args, opts = {}) {
         ctx.checkIdle();
       };
       const text = (list) => Buffer.concat(list).toString('utf8');
+      let timedOut = false;
       const done = (code, signal) => finish({
-        ok: code === 0, stdout: text(out), stderr: text(err),
-        error: code === 0 ? null : signal ? 'killed' : `exit ${code}`,
+        ok: code === 0 && !timedOut, stdout: text(out), stderr: text(err),
+        error: timedOut ? 'timeout' : code === 0 ? null : signal ? 'killed' : `exit ${code}`,
       });
       try {
         child = spawnFn(file, args, {
@@ -409,9 +446,13 @@ function run(ctx, file, args, opts = {}) {
         graceTimer = setTimeout(() => done(code, signal), EXIT_GRACE_MS);
       });
       ctx.children.add(kill);
+      // A timeout kills the group but releases the slot only once the child has closed,
+      // as the deadline does. One that fires after the child exited changes nothing:
+      // its exit code is reported when its pipes close or the exit grace ends.
       timer = setTimeout(() => {
+        if (!unreaped()) return;
+        timedOut = true;
         kill();
-        finish({ ok: false, stdout: text(out), stderr: text(err), error: 'timeout' });
       }, opts.timeout || ctx.options.subprocessTimeoutMs || SUBPROCESS_TIMEOUT_MS);
     };
     if (ctx.active < ctx.limit) start();
@@ -490,7 +531,7 @@ const fileSig = (ctx, p) => fsCall(ctx, async () => {
     if (!stat.isFile()) return stat.isDirectory() ? 'dir' : 'other';
     if (stat.size > HASH_MAX_BYTES) return `bytes=${stat.size}`;
     const data = await ctx.fsp.readFile(p);
-    return `sha=${sha(data)} bytes=${data.length}`;
+    return `sha=${ctx.hash(data)} bytes=${data.length}`;
   } catch (error) {
     return isMissing(error) ? 'absent' : unread(error);
   }
@@ -574,7 +615,7 @@ async function systemSection(ctx) {
   emit('system', 'timezone', zone || '(unknown)');
   emit('system', 'nvm-versions', names(await listDir(ctx, path.join(ctx.home, '.nvm/versions/node'))));
   const nvmDefault = await readText(ctx, path.join(ctx.home, '.nvm/alias/default'), 4096);
-  emit('system', 'nvm-default', nvmDefault === null ? 'absent' : scrub(nvmDefault.trim()));
+  emit('system', 'nvm-default', nvmDefault === null ? 'absent' : ctx.scrub(nvmDefault.trim()));
 }
 
 async function envSection(ctx) {
@@ -586,10 +627,10 @@ async function envSection(ctx) {
   for (const name of ENV_VARS) {
     if (name === 'PATH') continue;
     const value = shell.env[name];
-    emit('env', name, value ? (SECRET_NAME.test(name) ? 'set' : ctx.rel(scrub(value))) : '(unset)');
+    emit('env', name, value ? (SECRET_NAME.test(name) ? 'set' : ctx.rel(ctx.scrub(value))) : '(unset)');
   }
   const dirs = String(shell.env.PATH || '').split(':').filter(Boolean);
-  emit('env', 'PATH-entries', dirs.map((dir) => ctx.rel(scrub(dir))).join(' '));
+  emit('env', 'PATH-entries', dirs.map((dir) => ctx.rel(ctx.scrub(dir))).join(' '));
 }
 
 async function toolSection(ctx) {
@@ -605,7 +646,7 @@ async function toolSection(ctx) {
     if (where && VERSION_ARGS[name]) {
       versions.push(run(ctx, where, VERSION_ARGS[name]).then((result) => {
         const line = firstLine(result.stdout) || firstLine(result.stderr);
-        emit('tool-version', name, line ? scrub(line).slice(0, 100) : `ERR ${result.error || 'no output'}`);
+        emit('tool-version', name, line ? ctx.scrub(line).slice(0, 100) : `ERR ${result.error || 'no output'}`);
       }));
     }
   });
@@ -626,27 +667,27 @@ async function walkSkills(ctx, dir, section, prefix) {
 
 const shortWord = (value) => (typeof value === 'string' && /^[A-Za-z0-9_-]{1,24}$/.test(value) ? value : '***');
 
-function describeMcp(server, rel) {
+function describeMcp(server, rel, hash = defaultHash) {
   if (!server || typeof server !== 'object') return 'invalid';
   const type = shortWord(server.type || (server.url ? 'http' : 'stdio'));
   if (server.url) {
     const headers = server.headers && typeof server.headers === 'object' ? Object.keys(server.headers).sort().map(shortWord) : [];
-    return `${type} ${safeUrl(server.url)}${headers.length ? ` headers=[${headers.join(',')}]` : ''}`.slice(0, 300);
+    return `${type} ${safeUrl(server.url, hash)}${headers.length ? ` headers=[${headers.join(',')}]` : ''}`.slice(0, 300);
   }
   const env = server.env && typeof server.env === 'object' ? Object.keys(server.env).sort().map(shortWord) : [];
-  const line = safeCommand([server.command || '?', ...(Array.isArray(server.args) ? server.args : [])], rel);
+  const line = safeCommand([server.command || '?', ...(Array.isArray(server.args) ? server.args : [])], rel, hash);
   return `${type} ${line}${env.length ? ` env=[${env.join(',')}]` : ''}`.slice(0, 300);
 }
 
 // An object or array by its key names and hash, a scalar by its scrubbed value; a
 // secret-named key is `set`.
-function describeValue(key, value) {
+function describeValue(key, value, hash = defaultHash) {
   if (SECRET_NAME.test(key)) return 'set';
   if (value && typeof value === 'object') {
     const keys = Array.isArray(value) ? `${value.length} items` : `keys=[${Object.keys(value).sort().map(shortWord).join(',')}]`;
-    return `${keys} sha=${sha(JSON.stringify(value))}`;
+    return `${keys} sha=${hash(JSON.stringify(value))}`;
   }
-  return scrub(JSON.stringify(value)).slice(0, 120);
+  return scrub(JSON.stringify(value), hash).slice(0, 120);
 }
 
 // The settings keys whose values are shown (scrubbed) as they are; every other key
@@ -664,26 +705,26 @@ function emitSettings(ctx, section, file, settings) {
     if (key === 'hooks' && value && typeof value === 'object') {
       for (const [event, list] of Object.entries(value)) {
         const commands = [].concat(list || []).flatMap((matcher) => [].concat((matcher && matcher.hooks) || []).map((hook) => {
-          const body = hook && hook.url ? safeUrl(hook.url) : safeCommand(hook && (hook.command || hook.prompt || ''), relWord);
-          return `${(matcher && matcher.matcher) ? `[${scrub(matcher.matcher)}] ` : ''}${shortWord(hook && hook.type)}:${body}`;
+          const body = hook && hook.url ? ctx.safeUrl(hook.url) : safeCommand(hook && (hook.command || hook.prompt || ''), relWord, ctx.hash);
+          return `${(matcher && matcher.matcher) ? `[${ctx.scrub(matcher.matcher)}] ` : ''}${shortWord(hook && hook.type)}:${body}`;
         }));
         emit(section, `${file}:hooks:${event}`, commands.join(' || '));
       }
     } else if (key === 'permissions' && value && typeof value === 'object') {
       for (const [name, entry] of Object.entries(value)) {
         emit(section, `${file}:permissions:${name}`, Array.isArray(entry)
-          ? `${entry.length} entries sha=${sha(JSON.stringify(entry))}` : describeValue(name, entry));
+          ? `${entry.length} entries sha=${ctx.hash(JSON.stringify(entry))}` : describeValue(name, entry, ctx.hash));
       }
     } else if (key === 'env' && value && typeof value === 'object') {
       for (const [name, entry] of Object.entries(value)) {
-        emit(section, `${file}:env:${name}`, SECRET_NAME.test(name) ? 'set' : ctx.rel(scrub(entry)).slice(0, 120));
+        emit(section, `${file}:env:${name}`, SECRET_NAME.test(name) ? 'set' : ctx.rel(ctx.scrub(entry)).slice(0, 120));
       }
     } else if (key === 'statusLine' && value && typeof value === 'object') {
-      emit(section, `${file}:${key}`, `${shortWord(value.type || '?')}:${safeCommand(value.command || '', relWord)}`);
+      emit(section, `${file}:${key}`, `${shortWord(value.type || '?')}:${safeCommand(value.command || '', relWord, ctx.hash)}`);
     } else if (SHOWN_SETTINGS.has(key)) {
-      emit(section, `${file}:${key}`, ctx.rel(scrub(JSON.stringify(value))).slice(0, 240));
+      emit(section, `${file}:${key}`, ctx.rel(ctx.scrub(JSON.stringify(value))).slice(0, 240));
     } else {
-      emit(section, `${file}:${key}`, describeValue(key, value));
+      emit(section, `${file}:${key}`, describeValue(key, value, ctx.hash));
     }
   }
 }
@@ -701,10 +742,10 @@ async function claudeSection(ctx, dir) {
   const problem = jsonProblem(state);
   if (problem) emit(S, 'claude.json', problem);
   else {
-    for (const [name, server] of Object.entries(state.mcpServers || {})) emit(S, `mcp:user:${name}`, describeMcp(server, relWord));
+    for (const [name, server] of Object.entries(state.mcpServers || {})) emit(S, `mcp:user:${name}`, describeMcp(server, relWord, ctx.hash));
     for (const [project, entry] of Object.entries(state.projects || {})) {
       if (!entry || typeof entry !== 'object') continue;
-      for (const [name, server] of Object.entries(entry.mcpServers || {})) emit(S, `mcp:project:${ctx.rel(project)}:${name}`, describeMcp(server, relWord));
+      for (const [name, server] of Object.entries(entry.mcpServers || {})) emit(S, `mcp:project:${ctx.rel(project)}:${name}`, describeMcp(server, relWord, ctx.hash));
       if (Array.isArray(entry.enabledMcpjsonServers) && entry.enabledMcpjsonServers.length) {
         emit(S, `mcpjson-enabled:${ctx.rel(project)}`, entry.enabledMcpjsonServers.map(shortWord).sort().join(','));
       }
@@ -713,9 +754,9 @@ async function claudeSection(ctx, dir) {
       }
     }
     const account = state.oauthAccount;
-    emit(S, 'login', account ? `${scrub(account.emailAddress || '?')} org=${scrub(account.organizationName || '?')}` : 'none');
+    emit(S, 'login', account ? `${ctx.scrub(account.emailAddress || '?')} org=${ctx.scrub(account.organizationName || '?')}` : 'none');
     for (const key of ['theme', 'preferredNotifChannel', 'editorMode', 'autoUpdates']) {
-      emit(S, `claude.json:${key}`, state[key] === undefined ? '(unset)' : describeValue(key, state[key]));
+      emit(S, `claude.json:${key}`, state[key] === undefined ? '(unset)' : describeValue(key, state[key], ctx.hash));
     }
     emit(S, 'claude.json:projects-known', Object.keys(state.projects || {}).length);
   }
@@ -764,42 +805,52 @@ function tomlPath(name) {
 // config.toml itemised: every top-level scalar key with its value (scrubbed; `set`
 // when the name says secret), and every top-level table (its dotted subtables
 // included) by its key names and a hash of its lines, never its values. A table
-// present on one side only is then its own row. A light line reader, not a full
-// TOML parser: a multi-line value is hashed with its table but shown only by name.
-function codexConfigRows(toml) {
+// present on one side only is then its own row. Table and key names are shown only
+// when they read as names (see readsAsName); any other name is a hash marker. A light
+// line reader, not a full TOML parser: lines inside a multi-line string ("""/''')
+// are hashed with their table and never read as headers or keys.
+function codexConfigRows(toml, hash = defaultHash) {
+  const name = (text, extra) => (readsAsName(text, { extra }) ? text : `*${hash(text).slice(0, 8)}`);
   const topKeys = {};
   const tables = new Map();
   let current = null;
+  let inString = null;
+  const count = (text, delimiter) => text.split(delimiter).length - 1;
   for (const raw of String(toml || '').split('\n')) {
+    if (inString) {
+      if (current) current.table.lines.push(raw);
+      if (count(raw, inString) % 2 === 1) inString = null;
+      continue;
+    }
     const line = raw.replace(/\s+#.*$/, '').trim();
     if (!line || line.startsWith('#')) continue;
     const header = /^\[\[?([^\]]+)\]\]?$/.exec(line);
     if (header) {
       const parts = tomlPath(header[1]);
-      const top = parts[0] || header[1];
+      const top = name(parts[0] || header[1]);
       if (!tables.has(top)) tables.set(top, { keys: new Set(), lines: [] });
       current = { table: tables.get(top), depth: parts.length, sub: parts[1] };
       current.table.lines.push(line);
-      if (current.depth > 1 && current.sub) current.table.keys.add(current.sub);
+      if (current.depth > 1 && current.sub) current.table.keys.add(name(current.sub, '@:'));
       continue;
     }
     const pair = /^("[^"]+"|'[^']+'|[A-Za-z0-9_.-]+)\s*=\s*(.*)$/.exec(line);
+    for (const delimiter of ['"""', "'''"]) {
+      if (count(raw, delimiter) % 2 === 1) { inString = delimiter; break; }
+    }
     if (!current) {
-      if (pair) topKeys[pair[1].replace(/^["']|["']$/g, '')] = pair[2];
+      if (pair) topKeys[pair[1].replace(/^["']|["']$/g, '')] = inString ? '(multi-line)' : pair[2];
       continue;
     }
-    current.table.lines.push(line);
-    if (pair && current.depth === 1) current.table.keys.add(tomlPath(pair[1])[0] || pair[1]);
+    current.table.lines.push(raw.trim());
+    if (pair && current.depth === 1) current.table.keys.add(name(tomlPath(pair[1])[0] || pair[1], '@:'));
   }
   const rows = [];
   for (const [key, value] of Object.entries(topKeys)) {
-    rows.push([`config:${key}`, SECRET_NAME.test(key) ? 'set' : scrub(value).slice(0, 120)]);
+    rows.push([`config:${name(key)}`, SECRET_NAME.test(key) ? 'set' : scrub(value, hash).slice(0, 120)]);
   }
-  for (const [name, table] of tables) {
-    // Key names (plugin ids, project paths, server names) are shown when they read as
-    // names; the values under them never are.
-    const keyName = (key) => (/^[A-Za-z0-9_@.\/~:-]{1,120}$/.test(key) && !opaque(key) ? key : '***');
-    rows.push([`table:${name}`, `keys=[${[...table.keys].sort().map(keyName).join(',')}] sha=${sha(table.lines.join('\n'))}`]);
+  for (const [tableName, table] of tables) {
+    rows.push([`table:${tableName}`, `keys=[${[...table.keys].sort().join(',')}] sha=${hash(table.lines.join('\n'))}`]);
   }
   return rows;
 }
@@ -808,9 +859,16 @@ async function codexSection(ctx, dir) {
   const S = `codex:${ctx.rel(dir)}`;
   const { emit } = ctx;
   emit(S, 'dir', await kindOf(ctx, dir));
-  emit(S, 'config.toml', await fileSig(ctx, path.join(dir, 'config.toml')));
-  const toml = (await readText(ctx, path.join(dir, 'config.toml'), JSON_MAX_BYTES)) || '';
-  for (const [key, value] of codexConfigRows(toml)) emit(S, key, value);
+  const file = path.join(dir, 'config.toml');
+  emit(S, 'config.toml', await fileSig(ctx, file));
+  const toml = await readText(ctx, file, JSON_MAX_BYTES);
+  if (toml === null) {
+    // Hashed above but too large to itemise: said so, so its rows on the other side
+    // are summarised rather than read as missing here.
+    const stat = await fsCall(ctx, () => ctx.fsp.stat(file), null);
+    if (stat && stat.isFile() && stat.size > JSON_MAX_BYTES) emit(S, 'config.toml', `too large (bytes=${stat.size})`);
+  }
+  for (const [key, value] of codexConfigRows(toml || '', ctx.hash)) emit(S, key, value);
   emit(S, 'AGENTS.md', await fileSig(ctx, path.join(dir, 'AGENTS.md')));
   for (const name of ['AGENTS.md', 'hooks.json', 'skills', 'agents']) emit(S, `entry:${name}`, await kindOf(ctx, path.join(dir, name)));
   emit(S, 'auth.json', await presence(ctx, path.join(dir, 'auth.json')));
@@ -837,9 +895,9 @@ async function homeFilesSection(ctx) {
   const gitconfig = (await readText(ctx, path.join(home, '.gitconfig'), JSON_MAX_BYTES)) || '';
   for (const key of ['name', 'email', 'helper', 'defaultBranch', 'editor', 'signingkey', 'gpgsign', 'rebase', 'autoSetupRemote']) {
     const match = new RegExp(`^\\s*${key}\\s*=\\s*(.+)$`, 'mi').exec(gitconfig);
-    emit('gitconfig', key, !match ? '(unset)' : SECRET_NAME.test(key) ? 'set' : ctx.rel(scrub(match[1].trim())));
+    emit('gitconfig', key, !match ? '(unset)' : SECRET_NAME.test(key) ? 'set' : ctx.rel(ctx.scrub(match[1].trim())));
   }
-  const includes = [...gitconfig.matchAll(/^\s*path\s*=\s*(.+)$/gm)].map((match) => ctx.rel(scrub(match[1].trim())));
+  const includes = [...gitconfig.matchAll(/^\s*path\s*=\s*(.+)$/gm)].map((match) => ctx.rel(ctx.scrub(match[1].trim())));
   emit('gitconfig', 'includes', includes.join(',') || '(none)');
   const ssh = await listDir(ctx, path.join(home, '.ssh'));
   emit('ssh', 'files', ssh && !ssh.unread ? ssh.map((entry) => entry.name).filter((name) => !/known_hosts/.test(name)).join(',') || '(empty)' : names(ssh));
@@ -873,8 +931,8 @@ async function describeRepo(ctx, p) {
   const envFiles = (top || []).filter((entry) => /^\.env/.test(entry.name)).map((entry) => entry.name).join(',');
   const has = (name) => (top || []).some((entry) => entry.name === name);
   ctx.emit('repo', ctx.rel(p), [
-    `${scrub(branch)}@${head}`,
-    `origin=${origin.ok ? safeUrl(origin.stdout.trim()) : 'none'}`,
+    `${ctx.scrub(branch)}@${head}`,
+    `origin=${origin.ok ? ctx.safeUrl(origin.stdout.trim()) : 'none'}`,
     `dirty=${status.ok ? dirty : `ERR ${status.error}`}`,
     `env=[${envFiles}]`,
     `node_modules=${has('node_modules') ? 'y' : 'n'}`,
@@ -949,14 +1007,14 @@ async function keepSection(ctx) {
 async function loginSection(ctx) {
   if (ctx.options.logins === false) return;
   const { emit } = ctx;
-  const line = (result, max = 100) => (result.ok ? scrub(firstLine(result.stdout) || firstLine(result.stderr)).slice(0, max)
-    : `ERR ${scrub(firstLine(result.stderr) || firstLine(result.stdout) || result.error).slice(0, max)}`);
+  const line = (result, max = 100) => (result.ok ? ctx.scrub(firstLine(result.stdout) || firstLine(result.stderr)).slice(0, max)
+    : `ERR ${ctx.scrub(firstLine(result.stderr) || firstLine(result.stdout) || result.error).slice(0, max)}`);
   const tool = (name) => (ctx.env ? resolveTool(ctx, String(ctx.env.PATH || '').split(':'), name) : Promise.resolve(null));
   const checks = {
     gh: async (bin) => {
       const result = await run(ctx, bin, ['auth', 'status', '-h', 'github.com'], { timeout: 15e3 });
       const text = `${result.stdout}\n${result.stderr}`;
-      return scrub(text.split('\n').filter((row) => /logged in|not logged/i.test(row)).map((row) => row.trim()).join(' ')).slice(0, 140) || line(result);
+      return ctx.scrub(text.split('\n').filter((row) => /logged in|not logged/i.test(row)).map((row) => row.trim()).join(' ')).slice(0, 140) || line(result);
     },
     aws: async (bin) => line(await run(ctx, bin, ['sts', 'get-caller-identity', '--query', 'Arn', '--output', 'text'], { timeout: 20e3 }), 140),
     heroku: async (bin) => line(await run(ctx, bin, ['whoami'], { timeout: 20e3 })),
@@ -979,7 +1037,7 @@ async function androidSection(ctx) {
   const env = ctx.env || {};
   const sdk = env.ANDROID_HOME || env.ANDROID_SDK_ROOT
     || (os.platform() === 'darwin' ? path.join(home, 'Library/Android/sdk') : path.join(home, 'Android/Sdk'));
-  emit('android', 'sdk-root', `${ctx.rel(scrub(sdk))} ${await presence(ctx, sdk)}`);
+  emit('android', 'sdk-root', `${ctx.rel(ctx.scrub(sdk))} ${await presence(ctx, sdk)}`);
   await Promise.all(['platform-tools', 'build-tools', 'platforms', 'cmdline-tools', 'emulator', 'ndk', 'system-images'].map(async (sub) => {
     const entries = await listDir(ctx, path.join(sdk, sub));
     emit('android', sub, entries && !entries.unread && (sub === 'platform-tools' || sub === 'emulator') ? 'present' : names(entries));
@@ -1005,33 +1063,59 @@ function uniqueDirs(list, home) {
 // through its symlinks before the check, so `~/link -> /` is refused; one that does
 // not resolve is dropped. The path used is the one asked for, so the report names
 // it the way the daemon node does. Anything refused falls back to the defaults.
-async function requestOptions(params = {}, home = os.homedir()) {
-  const root = path.resolve(home);
-  let realRoot = root;
-  try { realRoot = await fsp.realpath(root); } catch {}
-  const inside = (value, base) => value === base || value.startsWith(`${base}${path.sep}`);
-  const within = async (list) => {
-    if (!Array.isArray(list)) return undefined;
-    const out = [];
-    for (const raw of list.slice(0, MAX_DIRS * 4)) {
-      if (typeof raw !== 'string' || !raw || raw.length > 4096 || raw.includes('\0')) continue;
-      if (!raw.startsWith('/') && !/^~(?:\/|$)/.test(raw)) continue;
-      const resolved = path.resolve(raw.replace(/^~(?=\/|$)/, root));
-      if (!inside(resolved, root)) continue;
-      let real;
-      try { real = await fsp.realpath(resolved); } catch { continue; }
-      if (!inside(real, realRoot)) continue;
-      if (!out.includes(resolved)) out.push(resolved);
-      if (out.length >= MAX_DIRS) break;
+//
+// Each realpath is bounded by `timeoutMs` (a hung mount drops that directory), and the
+// whole answer by `totalMs`, past which it is refused with code 'scope-timeout'. The
+// audit's salt (16-64 hex characters) is passed through when it is well formed.
+async function requestOptions(params = {}, home = os.homedir(), bounds = {}) {
+  const realpath = bounds.realpath || fsp.realpath;
+  const timeoutMs = bounds.timeoutMs == null ? 5e3 : bounds.timeoutMs;
+  const totalMs = bounds.totalMs == null ? 10e3 : bounds.totalMs;
+  const timers = new Set();
+  const bounded = (promise, ms, onTimeout) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { timers.delete(timer); onTimeout(resolve, reject); }, ms);
+    timers.add(timer);
+    promise.then((value) => { clearTimeout(timer); timers.delete(timer); resolve(value); },
+      (error) => { clearTimeout(timer); timers.delete(timer); reject(error); });
+  });
+  const resolveReal = (value) => bounded(Promise.resolve().then(() => realpath(value)), timeoutMs, (resolve) => resolve(null));
+  const collect = async () => {
+    const root = path.resolve(home);
+    let realRoot = root;
+    try { realRoot = (await resolveReal(root)) || root; } catch {}
+    const inside = (value, base) => value === base || value.startsWith(`${base}${path.sep}`);
+    const within = async (list) => {
+      if (!Array.isArray(list)) return undefined;
+      const out = [];
+      for (const raw of list.slice(0, MAX_DIRS * 4)) {
+        if (typeof raw !== 'string' || !raw || raw.length > 4096 || raw.includes('\0')) continue;
+        if (!raw.startsWith('/') && !/^~(?:\/|$)/.test(raw)) continue;
+        const resolved = path.resolve(raw.replace(/^~(?=\/|$)/, root));
+        if (!inside(resolved, root)) continue;
+        let real;
+        try { real = await resolveReal(resolved); } catch { continue; }
+        if (!real || !inside(real, realRoot)) continue;
+        if (!out.includes(resolved)) out.push(resolved);
+        if (out.length >= MAX_DIRS) break;
+      }
+      return out.length ? out : undefined;
+    };
+    const out = {};
+    for (const key of ['claudeDirs', 'codexDirs', 'repoRoots']) {
+      const value = await within(params && params[key]);
+      if (value) out[key] = value;
     }
-    return out.length ? out : undefined;
+    if (params && typeof params.salt === 'string' && SALT_RE.test(params.salt)) out.salt = params.salt;
+    return out;
   };
-  const out = {};
-  for (const key of ['claudeDirs', 'codexDirs', 'repoRoots']) {
-    const value = await within(params && params[key]);
-    if (value) out[key] = value;
+  try {
+    return await bounded(collect(), totalMs, (resolve, reject) => reject(Object.assign(
+      new Error('inventory-stuck: filesystem (resolving the requested directories); reload the host to clear'),
+      { code: 'scope-timeout' },
+    )));
+  } finally {
+    for (const timer of timers) clearTimeout(timer);
   }
-  return out;
 }
 
 // The config directories of this install's accounts when a registry configuration is
@@ -1068,7 +1152,7 @@ function startInventory(options = {}) {
   const section = (name, fn) => {
     pending.add(name);
     return Promise.resolve().then(fn).catch((error) => {
-      ctx.emit('inventory', `error:${name}`, scrub(error && error.message || error).slice(0, 160));
+      ctx.emit('inventory', `error:${name}`, ctx.scrub(error && error.message || error).slice(0, 160));
     }).finally(() => { pending.delete(name); });
   };
   const result = (async () => {
@@ -1155,6 +1239,7 @@ const UNREADABLE = /^(?:too large|unparseable|unread)/;
 // The rows a file's own row stands for: claude.json's MCP, login and state rows, and
 // `<file>:…` for any other (settings.json, settings.local.json).
 function rowsOfFile(file, key) {
+  if (file === 'config.toml') return /^(?:config:|table:)/.test(key);
   if (file === 'claude.json') return /^(?:mcp:|mcpjson-enabled:|mcp-disabled:|login$|claude\.json:)/.test(key);
   return key.startsWith(`${file}:`);
 }
@@ -1187,8 +1272,10 @@ function compareInventories(a, b) {
   };
   const unreadA = unreadFiles(A);
   const unreadB = unreadFiles(B);
-  const classify = (section, key) => {
-    if (section !== 'inventory' && (cutA.has(section) || cutB.has(section))) return 'rows in a section cut short at the deadline';
+  // A cut-short section hides only rows one side lacks: a row both sides reported
+  // with different values is a real difference either way.
+  const classify = (section, key, onlyOneSide) => {
+    if (onlyOneSide && section !== 'inventory' && (cutA.has(section) || cutB.has(section))) return 'rows in a section cut short at the deadline';
     for (const files of [unreadA.get(section), unreadB.get(section)]) {
       if (files && files.some((file) => file !== key && rowsOfFile(file, key))) return 'rows of a file one side could not read';
     }
@@ -1202,14 +1289,14 @@ function compareInventories(a, b) {
   for (const [id, value] of A) {
     const [section, key] = id.split('\t');
     const row = at(section);
-    if (!B.has(id)) row.onlyA.push({ key, value, noise: classify(section, key) });
-    else if (B.get(id) !== value) row.differ.push({ key, a: value, b: B.get(id), noise: classify(section, key) });
+    if (!B.has(id)) row.onlyA.push({ key, value, noise: classify(section, key, true) });
+    else if (B.get(id) !== value) row.differ.push({ key, a: value, b: B.get(id), noise: classify(section, key, false) });
     else row.same += 1;
   }
   for (const [id, value] of B) {
     if (A.has(id)) continue;
     const [section, key] = id.split('\t');
-    at(section).onlyB.push({ key, value, noise: classify(section, key) });
+    at(section).onlyB.push({ key, value, noise: classify(section, key, true) });
   }
   const byKey = (x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0);
   return [...sections.values()]
@@ -1280,4 +1367,7 @@ module.exports = {
   fromLines,
   defaultAccountDirs,
   requestOptions,
+  readsAsName,
+  randomSalt,
+  SALT_RE,
 };

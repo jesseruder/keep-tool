@@ -3216,7 +3216,7 @@ test('an inventory past its deadline keeps its slot until what it started is gon
   }
 });
 
-test('an inventory stuck on a filesystem call is let go after its grace, and says so', async () => {
+test('an inventory stuck on a filesystem call is let go after its grace, says so, and refuses the next one', async () => {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-inventory-stuck-')));
   fs.mkdirSync(path.join(home, 'src', 'hang'), { recursive: true });
   const fsp = require('node:fs/promises');
@@ -3232,8 +3232,27 @@ test('an inventory stuck on a filesystem call is let go after its grace, and say
       assert.equal(first.partial, 'repo');
       assert.equal(first.stuck, null);
       await waitFor(async () => (await client.request('hello')).inventoryStuck === 'inventory stuck: filesystem', 'the stuck record');
-      const second = await client.request('inventory', {}, { timeoutMs: 10e3 });
-      assert.equal(second.stuck, 'inventory stuck: filesystem', 'the next answer carries it');
+      // A second collection would pile onto the same hung mount: refused until a reload.
+      await assert.rejects(client.request('inventory', {}, { timeoutMs: 10e3 }), /inventory-stuck: filesystem; reload the host to clear/);
+      const { stats } = await client.request('stats', {});
+      assert.ok(stats, 'the host still answers everything else');
+    });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('an inventory whose requested directories never resolve is answered, and marks the host stuck', async () => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-inventory-scope-')));
+  const inventoryOptions = { home, tools: [], logins: false, shellEnv: { PATH: '/nonexistent-bin' }, keepDir: path.join(home, 'keep') };
+  // Every realpath hangs, as on a mount that stopped answering.
+  const inventoryScopeBounds = { realpath: () => new Promise(() => {}), timeoutMs: 10e3, totalMs: 100 };
+  try {
+    await withHost({ inventoryOptions, inventoryScopeBounds }, async ({ client }) => {
+      await assert.rejects(client.request('inventory', { claudeDirs: ['~/.claude'] }, { timeoutMs: 10e3 }),
+        /inventory-stuck: filesystem \(resolving the requested directories\)/);
+      assert.equal((await client.request('hello')).inventoryStuck, 'inventory stuck: filesystem');
+      await assert.rejects(client.request('inventory', {}, { timeoutMs: 10e3 }), /inventory-stuck: filesystem; reload the host to clear/);
     });
   } finally {
     fs.rmSync(home, { recursive: true, force: true });

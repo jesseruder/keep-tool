@@ -56,6 +56,17 @@ const SECRETS = {
   jsonPat: 'osprey',
   urlPathWord: 'QwErTyUiOp',
   matrixParam: 'gannet',
+  // Round three: snake_case credential flags, values glued to any short flag, and
+  // names hidden in TOML.
+  snakeKey: 'grebe',
+  snakeToken: 'plover',
+  snakeSecret: 'curlew',
+  gluedK: 'godwit',
+  gluedP: 'dunlin7',
+  gluedX: 'hunterx',
+  dashB64: 'QUJDREVGR0hJSktMTU5PUA',
+  tomlInString: 'PLANTEDinSTRINGtable',
+  tomlTable: 'QwErTyUiOpAsDfGh',
 };
 
 function write(file, content) {
@@ -110,6 +121,8 @@ function fakeHome(t) {
         { type: 'command', command: `tool pass=${SECRETS.passPair}` },
         { type: 'command', command: `docker run -e DB_PASSWORD=${SECRETS.dockerEnv} image` },
         { type: 'command', command: `tool --pw ${SECRETS.pwFlag} --pass ${SECRETS.passFlag}` },
+        { type: 'command', command: `tool --api_key ${SECRETS.snakeKey} --access_token ${SECRETS.snakeToken} --client_secret ${SECRETS.snakeSecret}` },
+        { type: 'command', command: `tool -k${SECRETS.gluedK} -P${SECRETS.gluedP} -x${SECRETS.gluedX} -${SECRETS.dashB64} -la` },
       ] }],
     },
     permissions: { allow: ['Bash(ls:*)'] },
@@ -127,6 +140,11 @@ function fakeHome(t) {
     'model = "gpt-test"',
     'model_reasoning_effort = "high"',
     `openai_api_key = "${SECRETS.codexTopKey}"`,
+    'notes = """',
+    `["${SECRETS.tomlInString}"]`,
+    '"""',
+    `["${SECRETS.tomlTable}"]`,
+    'x = 1',
     '[tui]',
     'status_line = ["model", "context"]',
     'notifications = true',
@@ -169,6 +187,7 @@ function options(fixture, extra = {}) {
       tools: [],
       logins: false,
       spawn: spawner.spawn,
+      salt: '0123456789abcdef0123456789abcdef',
       ...extra,
     },
   };
@@ -216,6 +235,10 @@ test('no planted credential ever appears in the inventory', async (t) => {
   assert.match(session[2], new RegExp(`^command:tool \\*\\*\\* sha=${sha}$`));
   assert.match(session[3], new RegExp(`^command:docker run -e \\*\\*\\* image sha=${sha}$`));
   assert.match(session[4], new RegExp(`^command:tool --pw \\*\\*\\* --pass \\*\\*\\* sha=${sha}$`));
+  assert.match(session[5], new RegExp(`^command:tool --api_key \\*\\*\\* --access_token \\*\\*\\* --client_secret \\*\\*\\* sha=${sha}$`));
+  assert.match(session[6], new RegExp(`^command:tool -k\\*\\*\\* -P\\*\\*\\* -x\\*\\*\\* -Q\\*\\*\\* -la sha=${sha}$`));
+  assert.equal(lines.get('codex:~/.codex config:notes'), '(multi-line)');
+  assert.ok([...lines.keys()].some((key) => /^codex:~\/\.codex table:\*[0-9a-f]{8}$/.test(key)), 'a random-looking table name is a hash marker');
   assert.match(lines.get('repo ~/src/app'), /^main@0123456 origin=https:\/\/github.com\/example\/app.git dirty=1 env=\[\.env\]/);
   assert.equal(lines.get('codex:~/.codex config:model'), '"gpt-test"', 'a profile\'s model is not the top-level one');
   assert.equal(lines.get('codex:~/.codex config:openai_api_key'), 'set');
@@ -272,6 +295,21 @@ test('a collection past its deadline answers with what it has, starts nothing af
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(hung.calls.length, atDeadline, 'nothing queued started after the deadline');
   assert.deepEqual(collection.stats(), { spawned: 1, active: 0, fsActive: 0 });
+});
+
+test('a subprocess timeout holds its slot until the child has closed, and reports timeout', async (t) => {
+  const fixture = fakeHome(t);
+  // The status answers; the remote lookup hangs past its timeout, and its kill does
+  // not land until the test lets it.
+  const held = fakeSpawn((file, args) => (args[2] === 'status' ? '# branch.head main\n' : 'hang'), { holdKills: true });
+  const collection = inventory.startInventory({ ...options(fixture).value, spawn: held.spawn, subprocessTimeoutMs: 50, deadlineMs: 10e3 });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(held.kills, 1, 'the timeout asked for the kill');
+  assert.equal(collection.stats().active, 1, 'the slot is still held while the child has not closed');
+  held.landKills();
+  const lines = byKey(await collection.result);
+  assert.match(lines.get('repo ~/src/app'), /^main@\? origin=none /);
+  assert.equal(collection.stats().active, 0);
 });
 
 test('a timed-out subprocess is killed with everything in its process group', async (t) => {
@@ -354,6 +392,53 @@ test('the report warns first when either side was cut short, and those sections 
   assert.match(lines[1], /^main vs mini: /);
   assert.doesNotMatch(report, /gh = ok/);
   assert.match(report, /pi[\s\S]*main {2}sha=1/);
+  // A row both sides reported is a real difference even in a cut-short section.
+  const both = inventory.compareInventories(
+    [{ section: 'login', key: 'gh', value: 'one' }],
+    [{ section: 'inventory', key: 'partial', value: 'login' }, { section: 'login', key: 'gh', value: 'two' }],
+  );
+  assert.equal(both.find((row) => row.section === 'login').differ[0].noise, null);
+});
+
+test('hashes are salted: one salt compares, another does not, and none is unsalted', async (t) => {
+  const fixture = fakeHome(t);
+  const salt = 'fedcba9876543210fedcba9876543210';
+  const get = (entries) => byKey(entries).get('claude:~/.claude CLAUDE.md');
+  const one = get(await inventory.collectInventory(options(fixture, { salt }).value));
+  const again = get(await inventory.collectInventory(options(fixture, { salt }).value));
+  const other = get(await inventory.collectInventory(options(fixture, { salt: 'aa'.repeat(16) }).value));
+  const none = get(await inventory.collectInventory(options(fixture, { salt: 'not-hex' }).value));
+  assert.equal(one, again);
+  assert.notEqual(one, other);
+  const plain = require('node:crypto').createHash('sha256').update('# global\n').digest('hex').slice(0, 12);
+  for (const value of [one, other, none]) assert.ok(!value.includes(plain), 'never the unsalted hash');
+});
+
+test('a Codex config too large to itemise says so, and its rows on the other side are summarised', async (t) => {
+  const fixture = fakeHome(t);
+  const big = path.join(fixture.home, '.codex-big');
+  write(path.join(big, 'config.toml'), `model = "x"\n# ${'x'.repeat((1 << 20) + 10)}\n`);
+  const lines = byKey(await inventory.collectInventory(options(fixture, { codexDirs: [big] }).value));
+  assert.match(lines.get('codex:~/.codex-big config.toml'), /^too large \(bytes=\d+\)$/);
+  const [section] = inventory.compareInventories(
+    [{ section: 'codex:~/.codex', key: 'table:tui', value: 'keys=[a] sha=1' }],
+    [{ section: 'codex:~/.codex', key: 'config.toml', value: 'too large (bytes=2000000)' }],
+  );
+  assert.equal(section.onlyA[0].noise, 'rows of a file one side could not read');
+});
+
+test('resolving the requested directories is bounded per directory and in total', async (t) => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-inventory-bounds-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(home, '.claude'));
+  fs.mkdirSync(path.join(home, 'hung'));
+  const fsp = require('node:fs/promises');
+  const realpath = (value) => (value.endsWith(`${path.sep}hung`) ? new Promise(() => {}) : fsp.realpath(value));
+  assert.deepEqual(await inventory.requestOptions({ claudeDirs: ['~/hung', '~/.claude'], salt: 'ab'.repeat(8) }, home, { realpath, timeoutMs: 50 }),
+    { claudeDirs: [path.join(home, '.claude')], salt: 'ab'.repeat(8) }, 'the hung directory is dropped, the rest kept');
+  assert.deepEqual(await inventory.requestOptions({ salt: 'xyz' }, home), {}, 'a malformed salt is dropped');
+  await assert.rejects(inventory.requestOptions({ claudeDirs: ['~/hung'] }, home, { realpath: () => new Promise(() => {}), timeoutMs: 10e3, totalMs: 50 }),
+    (error) => error.code === 'scope-timeout' && /inventory-stuck: filesystem/.test(error.message));
 });
 
 test('a remote caller may only point the collection at directories under the home, symlinks resolved', async (t) => {
@@ -496,7 +581,10 @@ test('keep node audit prints the daemon node beside the node, and says when a ho
     ] },
     collectInventory: async (scope) => { asked.push({ type: 'local', params: scope }); return A; },
     connect: async () => client({ protocol: 1, inventory: 1 }),
+    // The command exits once its report is out; here it only counts.
+    exit: (code) => { exits.push(code); },
   };
+  const exits = [];
   const lines = [];
   const original = console.log;
   console.log = (...args) => lines.push(args.join(' '));
@@ -514,13 +602,19 @@ test('keep node audit prints the daemon node beside the node, and says when a ho
   assert.equal(json.stuck, null);
   assert.equal(json.sections.length, 5);
   assert.match(lines[2], /^warning: node mini reports an earlier inventory stuck: filesystem/);
+  assert.deepEqual(exits, [0, 0, 0], 'each run exits 0 once its report is out');
   const remote = asked.find((call) => call.type === 'inventory');
-  assert.deepEqual(remote.params, {
+  const { salt, ...where } = remote.params;
+  assert.deepEqual(where, {
     claudeDirs: ['~/.claude', '~/.claude-second'], codexDirs: ['~/.codex'], repoRoots: ['~', '~/wt'],
   }, 'the node is told where to look, relative to its own home');
+  assert.match(salt, inventory.SALT_RE);
   assert.equal(remote.requestOptions.timeoutMs, 60e3);
   const local = asked.find((call) => call.type === 'local');
   assert.deepEqual(local.params.claudeDirs, [`${home}/.claude`, `${home}/.claude-second`]);
+  assert.equal(local.params.salt, salt, 'both sides of one audit hash with the same salt');
+  const second = asked.filter((call) => call.type === 'inventory')[1];
+  assert.notEqual(second.params.salt, salt, 'and each audit has its own');
 
   await assert.rejects(nodeAudit(['mini'], { ...deps, connect: async () => client({ protocol: 1, stats: 1 }) }),
     /predates the inventory verb[\s\S]*git pull[\s\S]*keep host reload/);
