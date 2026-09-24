@@ -2823,13 +2823,16 @@ leave a scheduler failing every minute on the live daemon. Before restarting,
 `wt land` takes a `keep health` snapshot; afterwards it polls health for up to 90
 seconds (`WT_HEALTH_WAIT=<seconds>`, `0` or `--no-health-wait` skips it). A row
 counts when it was healthy before the restart (enabled, ok or skipped, a zero streak)
-or did not exist then (a scheduler the deploy added, shown as `(new row)`), and has
+or had never run then (a scheduler the deploy added, shown as `(new row)`; the snapshot
+is read after the fast-forward, so the new code already lists it, unrun), and has
 recorded failures since the new start. Two in a row is a `DEPLOY REGRESSION` and ends
 the watch; a single failure is reported as "failed once since the restart" with no
 revert, because one failure right after a restart is as often the restart itself
 (delivery, handoff-queue and auto-compact while the terminal host reattaches). A
-daemon that never records a start on the new code, or starts more than once in the
-window (a crash loop), is a `DEPLOY FAILURE`. Regressions and failures print the range
+daemon that never records a start on the new code, or starts again in the window
+without anyone asking (a crash loop, which ends the watch at once; a start another
+session's land or `keep restart-daemon` requested does not count), is a
+`DEPLOY FAILURE`. Regressions and failures print the range
 that went live and the revert to run in a fresh worktree — `git revert --no-edit
 <from>..<sha>`, then review and land it as usual. The range starts at the commit the
 old daemon was running (or, when that is unknown or not an ancestor, the checkout's
@@ -2854,7 +2857,9 @@ reads `(new)`). A deploy that starts inside an earlier deploy's 30-minute window
 that one's base, so the label names the whole range. The row's streak is the worst
 open regression's, so it turns failing on the same three-in-a-row as the scheduler's
 own row, and goes back to ok (naming what recovered) once every charged row succeeds;
-a charged row that is disabled, retired or removed stops counting. It is written
+a charged row that is disabled, retired or removed stops counting, and so does a row
+the deploy added once a daemon starts on code that no longer schedules it (the revert
+went out). It is written
 inside `health.record`, on the store that call already reads and writes, behind a
 try/catch so the scheduler's own record always lands, and is on demand, so
 self-repair opens its card on the failing scheduler, not on `deploy`. A same-commit

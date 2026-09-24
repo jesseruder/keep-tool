@@ -609,21 +609,25 @@ function healthRegressions(before, after, startedAt) {
   for (const row of (after && after.schedulers) || []) {
     if (!row || row.name === 'deploy' || unwatched.has(row.name)) continue;
     const was = prior.get(row.name);
-    if (was && (was.disabled || Number(was.consecutiveFailures || 0) || !['ok', 'skipped'].includes(was.state))) continue;
+    // The before snapshot is read after the fast-forward, by the new code's health.js,
+    // so a scheduler this land adds is already listed there — from CADENCES, never
+    // run, reading 'never' — and is as new as one missing from the snapshot.
+    const added = !was || (!was.lastRunAt && !was.lastOkAt && !was.lastErrorAt);
+    if (!added && (was.disabled || Number(was.consecutiveFailures || 0) || !['ok', 'skipped'].includes(was.state))) continue;
+    if (added && was && was.disabled) continue;
     const failedAt = Number(row.lastErrorAt) || Date.parse(row.lastErrorAt) || 0;
     if (Number(row.consecutiveFailures || 0) > 0 && failedAt >= startedAt) {
-      out.push({ name: row.name, consecutiveFailures: Number(row.consecutiveFailures), lastError: row.lastError || '', added: !was });
+      out.push({ name: row.name, consecutiveFailures: Number(row.consecutiveFailures), lastError: row.lastError || '', added });
     }
   }
   return out;
 }
 
-// Daemon starts recorded after `since`: more than one inside the watch is a daemon
-// that keeps dying on the new code.
-function startsSince(daemon, since) {
-  const starts = new Set([...(Array.isArray(daemon && daemon.startedAts) ? daemon.startedAts : []), daemon && daemon.startedAt]
-    .map(Number).filter((value) => Number.isFinite(value) && value > since));
-  return starts.size;
+// Starts after the first one on the new code that nobody asked for: a daemon that
+// keeps dying on the new code. A requested start (another session's land, or a
+// `keep restart-daemon`, during the wait) is not a crash, so it does not count.
+function crashStartsAfter(daemon, started) {
+  return require('./health.js').unrequestedStarts(daemon, started + 1).length;
 }
 
 // The landing half of the post-deploy check. Synchronous like the rest of `wt land`:
@@ -666,14 +670,19 @@ function watchDeployHealth(main, sha, before, opts = {}) {
     let regressions = [];
     for (;;) {
       try { after = read(); } catch { after = null; }
-      const startedAt = Number(after && after.daemon && after.daemon.startedAt) || 0;
-      if (startedAt > previousStart) {
-        // The first start after the restart: a crash loop's later starts would
-        // otherwise move the baseline past the failures that caused them.
-        if (!started) started = startedAt;
+      // The first start after the restart, from the start history rather than the
+      // latest start: a crash loop's later starts would otherwise move the baseline
+      // past the failures that caused them, even on the first poll.
+      if (!started) {
+        const daemon = (after && after.daemon) || {};
+        const since = [...(Array.isArray(daemon.startedAts) ? daemon.startedAts : []), daemon.startedAt]
+          .map(Number).filter((value) => Number.isFinite(value) && value > previousStart);
+        if (since.length) started = Math.min(...since);
       }
       if (started) regressions = healthRegressions(before, after, started);
       if (regressions.some((row) => row.consecutiveFailures >= REGRESSION_STREAK) || now() >= deadline) break;
+      // A crash loop is already an answer; there is nothing more to wait for.
+      if (started && crashStartsAfter(after && after.daemon, started) > 0) break;
       pause(Math.max(0, Math.min(pollMs, deadline - now())));
     }
     const waited = `${Math.round((waitMs - Math.max(0, deadline - now())) / 1000)}s`;
@@ -682,7 +691,7 @@ function watchDeployHealth(main, sha, before, opts = {}) {
       revert();
       return { started: false, regressions: [], range };
     }
-    const starts = startsSince(after && after.daemon, previousStart);
+    const starts = 1 + crashStartsAfter(after && after.daemon, started);
     const looping = starts > 1;
     if (looping) note(`DEPLOY FAILURE: the daemon started ${starts} times in ${waited} after the restart — it keeps dying on the new code; check keep health and serve.log`);
     else if (after && after.daemon && after.daemon.running === false) {

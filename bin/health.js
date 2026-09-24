@@ -222,18 +222,23 @@ function deployCharges(watch, name, at) {
 //
 // A charged row that is disabled comes through here with a zero streak, and one that
 // is retired or gone from the store is dropped on any record, so neither can hold the
-// row failing with nothing left that could ever clear it.
+// row failing with nothing left that could ever clear it. A daemon start (`name` is
+// 'daemon') only prunes, and also drops a charge on a row the deploy added that the
+// code now starting no longer schedules: the revert that removed it would otherwise
+// leave a charge nothing will ever record against again.
 function noteDeploy(store, name, entry, at, failed) {
-  if (name === DEPLOY_ROW || name === 'daemon') return;
+  if (name === DEPLOY_ROW) return;
+  const starting = name === 'daemon';
   const prior = store[DEPLOY_ROW] && typeof store[DEPLOY_ROW] === 'object' ? store[DEPLOY_ROW] : null;
   const regressions = {};
   let changed = false;
   for (const [row, value] of Object.entries(prior && prior.regressions && typeof prior.regressions === 'object' ? prior.regressions : {})) {
-    if (value && typeof value === 'object' && !RETIRED.has(row) && store[row] && typeof store[row] === 'object') regressions[row] = value;
+    const gone = starting && value && value.added && !Object.prototype.hasOwnProperty.call(CADENCES, row);
+    if (value && typeof value === 'object' && !gone && !RETIRED.has(row) && store[row] && typeof store[row] === 'object') regressions[row] = value;
     else changed = true;
   }
-  const failures = Number(entry.consecutiveFailures || 0);
-  if (regressions[name]) {
+  const failures = starting ? 0 : Number(entry.consecutiveFailures || 0);
+  if (starting) { /* nothing to charge on a start */ } else if (regressions[name]) {
     regressions[name] = { ...regressions[name], consecutiveFailures: failures, ...(failed ? { error: entry.lastError || '' } : {}) };
     changed = true;
   } else if (failed && failures) {
@@ -265,7 +270,7 @@ function noteDeploy(store, name, entry, at, failed) {
     next.lastOkAt = at;
     next.detail = Object.keys(regressions).length
       ? clipError(`${Object.entries(regressions).map(says).join('; ')}; recovered`)
-      : 'the rows charged to the deploy were disabled or removed';
+      : 'the rows charged to the deploy were disabled or removed, or are no longer scheduled';
     delete next.regressions;
   }
   store[DEPLOY_ROW] = next;
@@ -324,6 +329,7 @@ function record(name, options = {}) {
       ...(lastKnownCommit ? { lastKnownCommit } : {}),
       ...(deployWatch ? { deployWatch } : {}),
     };
+    safeNoteDeploy(store, 'daemon', {}, at, false);
     persist(store);
     return store.daemon;
   }

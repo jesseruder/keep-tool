@@ -613,6 +613,26 @@ test('a deploy inside an earlier deploy\'s window keeps its base, and a row the 
   assert.match(read().deploy.lastError, /^brand-new \(new\) started failing after deploy ccccccc \(was aaaaaaa\): new tick threw/);
 });
 
+test('a charge on a row the deploy added is dropped when a start no longer schedules it', () => {
+  const { root, health } = fixture();
+  const read = () => JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8'));
+  const start = 10 * 3600e3;
+  health.record('daemon', { at: start - 3600e3, pid: process.pid, commit: 'a'.repeat(40) });
+  health.record('review-compact', { ok: true, at: start - 60e3 });
+  health.record('daemon', { at: start, pid: process.pid, commit: 'b'.repeat(40) });
+  // A scheduler the deploy added (not in this code's CADENCES), and a known one.
+  for (let i = 1; i <= 3; i++) health.record('brand-new', { ok: false, error: 'boom', at: start + i * 60e3 });
+  health.record('review-compact', { ok: false, error: 'boom', at: start + 4 * 60e3 });
+  assert.equal(read().deploy.consecutiveFailures, 3);
+  // The printed revert went out: a start on the reverting commit.
+  health.record('daemon', { at: start + 10 * 60e3, pid: process.pid, commit: 'c'.repeat(40) });
+  const row = read().deploy;
+  assert.deepEqual(Object.keys(row.regressions), ['review-compact'], 'the removed scheduler\'s charge is dropped');
+  assert.equal(row.consecutiveFailures, 1);
+  health.record('review-compact', { ok: true, at: start + 11 * 60e3 });
+  assert.equal(read().deploy.consecutiveFailures, 0);
+});
+
 test('a malformed deploy row never costs the scheduler its own record', () => {
   const { root, health } = fixture();
   const file = path.join(root, '.keep', 'health.json');

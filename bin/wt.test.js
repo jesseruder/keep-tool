@@ -1081,7 +1081,7 @@ function healthPicture(startedAt, commit, rows) {
   return {
     daemon: { startedAt, commit, running: true },
     schedulers: Object.entries(rows).map(([name, row]) => ({
-      name, disabled: false, consecutiveFailures: 0, lastErrorAt: null, lastError: '', state: 'ok', ...row,
+      name, disabled: false, consecutiveFailures: 0, lastRunAt: 500, lastOkAt: 500, lastErrorAt: null, lastError: '', state: 'ok', ...row,
     })),
   };
 }
@@ -1188,10 +1188,40 @@ test('the deploy watch says so in one line when nothing regressed, and reports a
     clock = 0;
     const loop = healthPicture(4000, 'b'.repeat(40), { 'review-compact': {} });
     loop.daemon.startedAts = [1000, 2000, 3000, 4000];
-    const looping = wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), before, { ...deps, healthSnapshot: () => loop });
+    reads = 0;
+    const looping = wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), before, {
+      ...deps, healthSnapshot: () => { reads += 1; return loop; },
+    });
     assert.equal(looping.starts, 3);
+    assert.equal(reads, 1, 'a crash loop ends the watch without waiting out the window');
     assert.match(said, /DEPLOY FAILURE: the daemon started 3 times/);
     assert.match(said, /git revert --no-edit b{40}/);
+
+    // Another session's land (or a keep restart-daemon) during the wait is a
+    // requested start, not a crash.
+    said = '';
+    clock = 0;
+    const relanded = healthPicture(3000, 'c'.repeat(40), { 'review-compact': {} });
+    relanded.daemon.startedAts = [1000, 2000, 3000];
+    relanded.daemon.requestedStartAts = [2000, 3000];
+    const other = wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), before, { ...deps, healthSnapshot: () => relanded });
+    assert.deepEqual(other, { started: true, regressions: [] });
+    assert.doesNotMatch(said, /DEPLOY FAILURE/);
+
+    // The before snapshot comes from the new code's health.js, so a scheduler this
+    // land added is listed there with no runs; failing twice after, it is a new row.
+    said = '';
+    clock = 0;
+    const withNew = healthPicture(1000, 'a'.repeat(40), {
+      'review-compact': {}, fresh: { lastRunAt: null, lastOkAt: null, state: 'never' },
+    });
+    const addedRow = wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), withNew, {
+      ...deps, healthSnapshot: () => healthPicture(2000, 'b'.repeat(40), {
+        'review-compact': {}, fresh: { consecutiveFailures: 2, lastErrorAt: 2500, lastError: 'new tick threw' },
+      }),
+    });
+    assert.deepEqual(addedRow.regressions, ['fresh']);
+    assert.match(said, /fresh \(new row\): 2 failures in a row/);
 
     said = '';
     assert.equal(wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), before, { ...deps, noHealthWait: true }), null);
