@@ -34,7 +34,8 @@ daemon polls due recipes every minute.
   deferral before Keep opens a session instead.
 - Otherwise Keep opens a fresh interactive Claude session on the card and types the same
   instruction into it — nothing runs headless. At most one such session per card per day,
-  and none while the checks account's usage window is exhausted (the card records a
+  and none while the checks account (the automation pool's pick for `checks`) has its
+  usage window exhausted (the card records a
   `check deferred` note and stays overdue). A deferral has a ceiling: on the second
   deferred day, or after 24 hours, Keep either opens the check on a configured
   `checks-fallback` account or records one `check stalled` check-in, and `keep overdue`

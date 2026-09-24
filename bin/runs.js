@@ -407,9 +407,26 @@ function grantReopen(taskId, today) {
   return true;
 }
 
-// The account a scheduled check spends against. Undefined lets openSession pick the
-// default, which is what a single-account install wants anyway.
-function checksAccountId(env = process.env) {
+// The account a scheduled check spends against: the automation pool's pick for the
+// `checks` purpose (`automationAccounts.checks` is a preference, like every other
+// purpose since the pool). A spent pool names its best member all the same, so the
+// scheduler's own deferral bookkeeping below — `check deferred`, the configured
+// `checks-fallback`, `check stalled` — runs against a pool account and never against
+// the owner's interactive default, which the pool exists to keep automation off.
+// Undefined lets openSession pick the default, which is what a single-account
+// install wants anyway.
+function checksAccountId(env = process.env, deps = {}) {
+  let choice = null;
+  try {
+    choice = (deps.selectAccount || require('./account-budget.js').select)({
+      purpose: 'checks', model: CHECK_MODEL || undefined, env,
+    });
+  } catch {}
+  if (choice) {
+    if (choice.account) return choice.account;
+    const first = Array.isArray(choice.ranked) ? choice.ranked[0] : null;
+    if (first && first.id) return first.id;
+  }
   try { return require('./accounts.js').automationFor('claude', 'checks', env).id; }
   catch { return undefined; }
 }

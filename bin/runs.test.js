@@ -1006,8 +1006,28 @@ test('a check session that dies without a result is reopened on a later tick', (
 // ---------- bounding a deferral streak ----------
 
 const {
-  handleBudgetDeferral, checksFallbackAccountId, setOpener, MAX_FALLBACK_ATTEMPTS,
+  handleBudgetDeferral, checksFallbackAccountId, checksAccountId, setOpener, MAX_FALLBACK_ATTEMPTS,
 } = require('./runs.js');
+
+test('the checks account is the automation pool pick, or its best member when the pool is spent', () => {
+  const asked = [];
+  const select = (answer) => (options) => { asked.push(options); return answer; };
+  // The pool has room: its pick, whatever the fixed map says.
+  assert.equal(checksAccountId({}, {
+    selectAccount: select({ account: 'claude-secondary', ranked: [{ id: 'claude-secondary' }] }),
+  }), 'claude-secondary');
+  assert.equal(asked[0].purpose, 'checks');
+  assert.equal(asked[0].model, undefined, 'no KEEP_CHECK_MODEL: capped by week and 5h only');
+  // Spent: the best pool member, so the scheduler's own deferral runs against it and
+  // the owner's default account is never the one that "refused".
+  assert.equal(checksAccountId({}, {
+    selectAccount: select({ account: null, deferred: true, retryAt: 1, ranked: [{ id: 'claude-tertiary' }, { id: 'claude-secondary' }] }),
+  }), 'claude-tertiary');
+  // A selector that cannot answer at all leaves the fixed assignment in charge: in an
+  // isolated registry with nothing configured, that is the one default account.
+  const throwing = { selectAccount: () => { throw new Error('config unreadable'); } };
+  assert.equal(checksAccountId({ KEEP_DIR: '/nonexistent/keep' }, throwing), 'claude/default');
+});
 
 test('a check deferred a second day escalates once instead of deferring forever', async () => {
   _resetSchedulerState();
