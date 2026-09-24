@@ -330,7 +330,9 @@ function allowlist(tokens, { rel = (value) => value, hash = defaultHash, executa
     const plain = readsAsName(shown, { executable: executableFirst && index === 0, extra: '+' });
     // A plain secret word waits for a separator (`password = x`); a compound one
     // (`db.password`, `api_key`, `echo-db.password`) is a key and hides its value.
-    if (plain && SECRET_NAME.test(shown) && !(executableFirst && index === 0)) {
+    // The executable is judged here like any word: only its display is exempt from
+    // the letters-and-digits rule, not what it hides next.
+    if (plain && SECRET_NAME.test(shown)) {
       if (/[-_.]/.test(shown)) hideNext = true;
       else afterSecretWord = true;
     }

@@ -603,6 +603,12 @@ test('property: a secret that is not a plain word never survives any mix of quot
     assert.ok(!out.includes(secret), `round ${round}: ${JSON.stringify(text)} -> ${JSON.stringify(out)}`);
     const line = inventory.safeCommand(`run ${text}`);
     assert.ok(!line.includes(secret), `round ${round} (command): ${JSON.stringify(text)} -> ${JSON.stringify(line)}`);
+    // The same secret name as the command's first word, the executable's place.
+    if (plain) {
+      const first = `${pick(secretNames)}${pick(separators.filter((sep) => sep !== ' ').concat([' => ', ' -> ']))}${secret}`;
+      const asCommand = inventory.safeCommand(`${first} ${text}`);
+      assert.ok(!asCommand.includes(secret), `round ${round} (executable): ${JSON.stringify(first)} -> ${JSON.stringify(asCommand)}`);
+    }
   }
 });
 
@@ -663,6 +669,10 @@ test('scrub, safeUrl and safeCommand', () => {
   assert.equal(anyHash(inventory.safeCommand('curl -H "X-Api-Key: letmein" https://x.example.com')), 'curl -H *** *** *** sha=H');
   assert.equal(anyHash(inventory.safeCommand('psql -h db -U reader -P pager')), 'psql -h db -U reader -P pager sha=H', 'psql\'s -h, -U and -P are not credentials');
   assert.notEqual(inventory.safeCommand('run --pw one'), inventory.safeCommand('run --pw two'), 'the hash still tells two lines apart');
+  // A secret name in the executable's place hides what follows it as anywhere else.
+  for (const text of ['password = hunter', 'password => hunter', 'password -> hunter']) {
+    assert.equal(anyHash(inventory.safeCommand(text)), 'password *** *** sha=H', text);
+  }
   // JSON values are never scrubbed as text: key names and a hash, no scalar inside.
   assert.match(inventory.describeValue('config', { user: 'admin', list: ['hunter', 'x'] }), /^keys=\[list,user\] sha=[0-9a-f]{12}$/);
   assert.match(inventory.describeValue('items', ['hunter', 'x']), /^2 items sha=[0-9a-f]{12}$/);
