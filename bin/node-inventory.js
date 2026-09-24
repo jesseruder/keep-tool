@@ -102,7 +102,7 @@ const MISC_PRESENCE = [
 // Home's own children that are never project roots and are large to walk.
 const SKIP_HOME_CHILDREN = new Set(['Library', 'Applications', 'Pictures', 'Music', 'Movies', 'Downloads', 'node_modules', 'snap']);
 // A name (an env variable, a JSON or TOML key, a flag) that says its value is secret.
-const SECRET_NAME = /token|secret|pass|pwd|(?:^|[_-])pw(?:$|[_-])|key|credential|auth|cookie|private|session|header|dsn|webhook|(?:^|[_-])pat(?:$|[_-])/i;
+const SECRET_NAME = /token|secret|pass|pwd|key|credential|auth|cookie|private|session|header|dsn|webhook|(?:^|[_-])(?:pw|pat|cred|login|bearer)(?:$|[_-])/i;
 // Report sections each collection group writes, for naming what a deadline cut short.
 const GROUP_SECTIONS = {
   env: ['env'], system: ['system'], pi: ['pi'], keep: ['keep'], repos: ['repo'], logins: ['login'], android: ['android'],
@@ -178,17 +178,29 @@ function embeddedUrl(url, hash = defaultHash) {
 // Credential-shaped substrings out of free text: embedded URLs (through safeUrl),
 // header-shaped `Name: value` pairs, any `name=value` or `"name": value` pair whose
 // name says secret, the values of credential flags and of attached -p, well-known
-// token prefixes, bearer values and opaque runs.
+// token prefixes, bearer values and opaque runs. A quoted value is masked through its
+// closing quote (escaped quotes included), so a multi-word secret goes whole. Text
+// is cut to SCRUB_MAX_CHARS first, which bounds every pattern here.
+const SCRUB_MAX_CHARS = 4096;
+// A value: a double- or single-quoted string (to its closing quote, or to the end
+// when it has none), or a bare run.
+const VALUE = String.raw`"(?:[^"\\]|\\.)*"?|'(?:[^'\\]|\\.)*'?|[^"'\s,;&}\]]+`;
+const PAIR_RE = new RegExp(String.raw`(["']?)([A-Za-z_][A-Za-z0-9_.-]*)(["']?)(\s*[=:]\s*)(${VALUE})`, 'g');
+const FLAG_VALUE_RE = new RegExp(String.raw`((?:^|\s)(--?[A-Za-z][A-Za-z0-9_-]*)(?:\s+|=))(${VALUE.replace(String.raw`[^"'\s,;&}\]]+`, String.raw`[^\s"']+`)})`, 'g');
+function maskValue(value) {
+  const quote = value[0] === '"' || value[0] === '\'' ? value[0] : '';
+  if (!quote) return '***';
+  const closed = value.length > 1 && value.endsWith(quote) && !/(^|[^\\])(\\\\)*\\.$/.test(value);
+  return `${quote}***${closed ? quote : ''}`;
+}
 function scrub(text, hash = defaultHash) {
-  return String(text == null ? '' : text)
+  return String(text == null ? '' : text).slice(0, SCRUB_MAX_CHARS)
     .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`]+/gi, (url) => embeddedUrl(url, hash))
     .replace(/(\/\/)[^/\s@]+@/g, '$1***@')
     .replace(/\b(Authorization|Proxy-Authorization|Cookie|Set-Cookie|[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+)(:[ \t]*)[^"'\n]+/g, '$1$2***')
     .replace(/\b(bearer|basic)\s+[^\s"']+/gi, '$1 ***')
-    .replace(/(["']?)([A-Za-z_][A-Za-z0-9_.-]*)(["']?)(\s*[=:]\s*)(["']?)([^"'\s,;&}\]]+)/g,
-      (match, q1, name, q2, sep, q3) => (SECRET_NAME.test(name) ? `${q1}${name}${q2}${sep}${q3}***` : match))
-    .replace(/((?:^|\s)(--?[A-Za-z][A-Za-z0-9_-]*)(?:\s+|=)["']?)([^\s"']+)/g,
-      (match, lead, flag) => (credentialFlag(flag) ? `${lead}***` : match))
+    .replace(PAIR_RE, (match, q1, name, q2, sep, value) => (SECRET_NAME.test(name) ? `${q1}${name}${q2}${sep}${maskValue(value)}` : match))
+    .replace(FLAG_VALUE_RE, (match, lead, flag, value) => (credentialFlag(flag) ? `${lead}${maskValue(value)}` : match))
     .replace(/((?:^|\s)-[pu])([^\s"']+)/g, '$1***')
     .replace(/\b(?:sk|pk|rk|ghp|gho|ghs|ghu|ghr|github_pat|xox[abprs]|glpat|npm|ASIA|hf|sntrys|sntryu)[-_][A-Za-z0-9_-]{8,}/g, '***')
     .replace(/\bAKIA[A-Z0-9]{12,}\b/g, '***')
@@ -815,14 +827,32 @@ function codexConfigRows(toml, hash = defaultHash) {
   const tables = new Map();
   let current = null;
   let inString = null;
-  const count = (text, delimiter) => text.split(delimiter).length - 1;
+  // Delimiters on a line; in a basic string (""") one preceded by an odd number of
+  // backslashes is escaped and does not count. Literal strings (''') have no escapes.
+  const count = (text, delimiter) => {
+    let found = 0;
+    for (let at = text.indexOf(delimiter); at !== -1; at = text.indexOf(delimiter, at + 1)) {
+      if (delimiter === '"""') {
+        let slashes = 0;
+        for (let before = at - 1; before >= 0 && text[before] === '\\'; before -= 1) slashes += 1;
+        if (slashes % 2 === 1) continue;
+      }
+      found += 1;
+      at += delimiter.length - 1;
+    }
+    return found;
+  };
   for (const raw of String(toml || '').split('\n')) {
     if (inString) {
       if (current) current.table.lines.push(raw);
       if (count(raw, inString) % 2 === 1) inString = null;
       continue;
     }
-    const line = raw.replace(/\s+#.*$/, '').trim();
+    // Parsed from a bounded slice, and the comment found by a plain search: neither
+    // can take time out of proportion to the line.
+    const head = raw.slice(0, SCRUB_MAX_CHARS);
+    const comment = head.search(/\s#/);
+    const line = (comment === -1 ? head : head.slice(0, comment)).trim();
     if (!line || line.startsWith('#')) continue;
     const header = /^\[\[?([^\]]+)\]\]?$/.exec(line);
     if (header) {
@@ -1064,25 +1094,61 @@ function uniqueDirs(list, home) {
 // not resolve is dropped. The path used is the one asked for, so the report names
 // it the way the daemon node does. Anything refused falls back to the defaults.
 //
-// Each realpath is bounded by `timeoutMs` (a hung mount drops that directory), and the
-// whole answer by `totalMs`, past which it is refused with code 'scope-timeout'. The
-// audit's salt (16-64 hex characters) is passed through when it is well formed.
+// Each realpath is bounded by `timeoutMs` and the whole answer by `totalMs`. A realpath
+// that outlives its bound is a hung mount: it still holds a libuv thread, and nothing
+// can cancel it. Any such timeout, the home's own included, refuses the whole answer
+// with code 'scope-timeout' (the host then marks itself stuck and refuses further
+// audits), and nothing after it starts. `realpathsInFlight(realpath)` counts the calls
+// through that function still running, for the host's own stuck check. The audit's
+// salt (16-64 hex characters) is passed through when it is well formed.
+const realpathCalls = new Map();
+function realpathsInFlight(realpath = fsp.realpath) {
+  return realpathCalls.get(realpath) || 0;
+}
+function scopeTimeout() {
+  return Object.assign(
+    new Error('inventory-stuck: filesystem (resolving the requested directories); reload the host to clear'),
+    { code: 'scope-timeout' },
+  );
+}
 async function requestOptions(params = {}, home = os.homedir(), bounds = {}) {
   const realpath = bounds.realpath || fsp.realpath;
   const timeoutMs = bounds.timeoutMs == null ? 5e3 : bounds.timeoutMs;
   const totalMs = bounds.totalMs == null ? 10e3 : bounds.totalMs;
   const timers = new Set();
-  const bounded = (promise, ms, onTimeout) => new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { timers.delete(timer); onTimeout(resolve, reject); }, ms);
+  let cancelled = false;
+  const cancel = () => {
+    cancelled = true;
+    for (const timer of timers) clearTimeout(timer);
+    timers.clear();
+  };
+  const bounded = (promise, ms) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { timers.delete(timer); cancel(); reject(scopeTimeout()); }, ms);
     timers.add(timer);
     promise.then((value) => { clearTimeout(timer); timers.delete(timer); resolve(value); },
       (error) => { clearTimeout(timer); timers.delete(timer); reject(error); });
   });
-  const resolveReal = (value) => bounded(Promise.resolve().then(() => realpath(value)), timeoutMs, (resolve) => resolve(null));
+  const resolveReal = (value) => {
+    if (cancelled) return Promise.reject(scopeTimeout());
+    realpathCalls.set(realpath, realpathsInFlight(realpath) + 1);
+    const call = Promise.resolve().then(() => realpath(value));
+    call.catch(() => {}).finally(() => {
+      const left = realpathsInFlight(realpath) - 1;
+      if (left > 0) realpathCalls.set(realpath, left);
+      else realpathCalls.delete(realpath);
+    });
+    return bounded(call, timeoutMs);
+  };
+  // A missing or unreadable directory is dropped; a timeout ends everything.
+  const tryReal = async (value) => {
+    try { return await resolveReal(value); } catch (error) {
+      if (cancelled || (error && error.code === 'scope-timeout')) throw scopeTimeout();
+      return null;
+    }
+  };
   const collect = async () => {
     const root = path.resolve(home);
-    let realRoot = root;
-    try { realRoot = (await resolveReal(root)) || root; } catch {}
+    const realRoot = (await tryReal(root)) || root;
     const inside = (value, base) => value === base || value.startsWith(`${base}${path.sep}`);
     const within = async (list) => {
       if (!Array.isArray(list)) return undefined;
@@ -1092,8 +1158,7 @@ async function requestOptions(params = {}, home = os.homedir(), bounds = {}) {
         if (!raw.startsWith('/') && !/^~(?:\/|$)/.test(raw)) continue;
         const resolved = path.resolve(raw.replace(/^~(?=\/|$)/, root));
         if (!inside(resolved, root)) continue;
-        let real;
-        try { real = await resolveReal(resolved); } catch { continue; }
+        const real = await tryReal(resolved);
         if (!real || !inside(real, realRoot)) continue;
         if (!out.includes(resolved)) out.push(resolved);
         if (out.length >= MAX_DIRS) break;
@@ -1109,12 +1174,10 @@ async function requestOptions(params = {}, home = os.homedir(), bounds = {}) {
     return out;
   };
   try {
-    return await bounded(collect(), totalMs, (resolve, reject) => reject(Object.assign(
-      new Error('inventory-stuck: filesystem (resolving the requested directories); reload the host to clear'),
-      { code: 'scope-timeout' },
-    )));
+    return await bounded(collect(), totalMs);
   } finally {
-    for (const timer of timers) clearTimeout(timer);
+    // Whatever is still pending stops at its next step and leaves no timer behind.
+    cancel();
   }
 }
 
@@ -1367,6 +1430,7 @@ module.exports = {
   fromLines,
   defaultAccountDirs,
   requestOptions,
+  realpathsInFlight,
   readsAsName,
   randomSalt,
   SALT_RE,

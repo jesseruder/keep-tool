@@ -92,8 +92,8 @@ values are still listed. Rows of a file one side could not read (too large,
 unparseable or unreadable) are summarised the same way.
 
 If a node's filesystem hangs, for example a stuck network mount, its host releases
-the audit after a grace period and reports `inventory stuck: filesystem` in its hello
-and answers. It then refuses new audits until `keep host reload` is run on that node,
+the audit after a grace period, or fails it at once if resolving a requested
+directory hangs, and reports `inventory stuck: filesystem` in its hello and answers. It then refuses new audits until `keep host reload` is run on that node,
 so that audits do not pile up on the same mount.
 
 A node whose host predates the `inventory` verb is refused with a message saying so:

@@ -1677,7 +1677,11 @@ function createHost(options = {}) {
       respond({ ok: false, id: request.id, error: 'an inventory is already being collected', code: 'inventory-busy' });
       return;
     }
-    if (inventoryStuck && inventoryStuck.reason === 'filesystem') {
+    // A realpath from an earlier audit that never returned holds a libuv thread just
+    // as a stuck collection does, whether or not its audit was marked stuck.
+    const scopeBounds = options.inventoryScopeBounds || {};
+    const hungRealpaths = require('./node-inventory.js').realpathsInFlight(scopeBounds.realpath);
+    if ((inventoryStuck && inventoryStuck.reason === 'filesystem') || hungRealpaths > 0) {
       respond({ ok: false, id: request.id, error: 'inventory-stuck: filesystem; reload the host to clear', code: 'inventory-stuck' });
       return;
     }

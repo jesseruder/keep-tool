@@ -67,6 +67,14 @@ const SECRETS = {
   dashB64: 'QUJDREVGR0hJSktMTU5PUA',
   tomlInString: 'PLANTEDinSTRINGtable',
   tomlTable: 'QwErTyUiOpAsDfGh',
+  // Round four: multi-word quoted secrets, an escaped delimiter in a TOML string, and
+  // names that say login or bearer.
+  quotedPhrase: 'turnstone sanderling whimbrel',
+  quotedJson: 'knot stilt',
+  quotedFlag: 'avocet ruff',
+  tomlEscaped: 'PLANTEDescapedTABLE',
+  loginValue: 'bittern',
+  bearerValue: 'shoveler',
 };
 
 function write(file, content) {
@@ -104,6 +112,11 @@ function fakeHome(t) {
       EXTRA_OPTIONS: `X-Api-Key: ${SECRETS.envHeaderValue}`,
       TOOL_CONFIG: JSON.stringify({ private_key: SECRETS.jsonPrivateKey, clientKey: SECRETS.jsonClientKey, GH_PAT: SECRETS.jsonPat }),
       OTEL_EXPORTER_OTLP_ENDPOINT: `https://otel.example.com/v1/${SECRETS.urlPathWord}`,
+      DB_OPTIONS: `password = "${SECRETS.quotedPhrase}" timeout = 5`,
+      JSON_OPTIONS: `{"secret" : "${SECRETS.quotedJson}", "theme": "dark"}`,
+      TOOL_ARGS: `--password '${SECRETS.quotedFlag}' --port 8080`,
+      SERVICE_LOGIN: SECRETS.loginValue,
+      API_BEARER: SECRETS.bearerValue,
     },
     apiKeyHelper: `echo ${SECRETS.helper}`,
     someTool: { private_key: SECRETS.jsonPrivateKey, clientKey: SECRETS.jsonClientKey, GH_PAT: SECRETS.jsonPat },
@@ -142,6 +155,9 @@ function fakeHome(t) {
     `openai_api_key = "${SECRETS.codexTopKey}"`,
     'notes = """',
     `["${SECRETS.tomlInString}"]`,
+    '"""',
+    'doc = """ first \\""" is escaped, the string goes on',
+    `["${SECRETS.tomlEscaped}"]`,
     '"""',
     `["${SECRETS.tomlTable}"]`,
     'x = 1',
@@ -238,6 +254,12 @@ test('no planted credential ever appears in the inventory', async (t) => {
   assert.match(session[5], new RegExp(`^command:tool --api_key \\*\\*\\* --access_token \\*\\*\\* --client_secret \\*\\*\\* sha=${sha}$`));
   assert.match(session[6], new RegExp(`^command:tool -k\\*\\*\\* -P\\*\\*\\* -x\\*\\*\\* -Q\\*\\*\\* -la sha=${sha}$`));
   assert.equal(lines.get('codex:~/.codex config:notes'), '(multi-line)');
+  assert.equal(lines.get('codex:~/.codex config:doc'), '(multi-line)');
+  assert.equal(lines.get('claude:~/.claude settings.json:env:DB_OPTIONS'), 'password = "***" timeout = 5');
+  assert.equal(lines.get('claude:~/.claude settings.json:env:JSON_OPTIONS'), '{"secret" : "***", "theme": "dark"}');
+  assert.equal(lines.get('claude:~/.claude settings.json:env:TOOL_ARGS'), '--password \'***\' --port 8080');
+  assert.equal(lines.get('claude:~/.claude settings.json:env:SERVICE_LOGIN'), 'set');
+  assert.equal(lines.get('claude:~/.claude settings.json:env:API_BEARER'), 'set');
   assert.ok([...lines.keys()].some((key) => /^codex:~\/\.codex table:\*[0-9a-f]{8}$/.test(key)), 'a random-looking table name is a hash marker');
   assert.match(lines.get('repo ~/src/app'), /^main@0123456 origin=https:\/\/github.com\/example\/app.git dirty=1 env=\[\.env\]/);
   assert.equal(lines.get('codex:~/.codex config:model'), '"gpt-test"', 'a profile\'s model is not the top-level one');
@@ -433,12 +455,27 @@ test('resolving the requested directories is bounded per directory and in total'
   fs.mkdirSync(path.join(home, '.claude'));
   fs.mkdirSync(path.join(home, 'hung'));
   const fsp = require('node:fs/promises');
-  const realpath = (value) => (value.endsWith(`${path.sep}hung`) ? new Promise(() => {}) : fsp.realpath(value));
-  assert.deepEqual(await inventory.requestOptions({ claudeDirs: ['~/hung', '~/.claude'], salt: 'ab'.repeat(8) }, home, { realpath, timeoutMs: 50 }),
-    { claudeDirs: [path.join(home, '.claude')], salt: 'ab'.repeat(8) }, 'the hung directory is dropped, the rest kept');
+  const asked = [];
+  // One directory on a mount that never answers.
+  const realpath = (value) => {
+    asked.push(value);
+    return value.endsWith(`${path.sep}hung`) ? new Promise(() => {}) : fsp.realpath(value);
+  };
+  const stuck = (error) => error.code === 'scope-timeout' && /inventory-stuck: filesystem/.test(error.message);
+  assert.deepEqual(await inventory.requestOptions({ claudeDirs: ['~/.claude'], salt: 'ab'.repeat(8) }, home, { realpath, timeoutMs: 50 }),
+    { claudeDirs: [path.join(home, '.claude')], salt: 'ab'.repeat(8) });
   assert.deepEqual(await inventory.requestOptions({ salt: 'xyz' }, home), {}, 'a malformed salt is dropped');
-  await assert.rejects(inventory.requestOptions({ claudeDirs: ['~/hung'] }, home, { realpath: () => new Promise(() => {}), timeoutMs: 10e3, totalMs: 50 }),
-    (error) => error.code === 'scope-timeout' && /inventory-stuck: filesystem/.test(error.message));
+  // A single hung realpath fails the whole answer, and nothing after it starts.
+  asked.length = 0;
+  await assert.rejects(inventory.requestOptions({ claudeDirs: ['~/hung', '~/.claude'], codexDirs: ['~/.claude'] }, home, { realpath, timeoutMs: 50 }), stuck);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.deepEqual(asked, [home, path.join(home, 'hung')], 'no realpath after the one that hung');
+  assert.equal(inventory.realpathsInFlight(realpath), 1, 'the hung call is still counted');
+  // The home's own realpath hanging fails it too, and so does the total bound.
+  const allHung = () => new Promise(() => {});
+  await assert.rejects(inventory.requestOptions({}, home, { realpath: allHung, timeoutMs: 50 }), stuck);
+  await assert.rejects(inventory.requestOptions({ claudeDirs: ['~/hung'] }, home, { realpath: allHung, timeoutMs: 10e3, totalMs: 50 }), stuck);
+  assert.equal(inventory.realpathsInFlight(), 0, 'the real realpath is not counted with the fakes');
 });
 
 test('a remote caller may only point the collection at directories under the home, symlinks resolved', async (t) => {
@@ -459,7 +496,13 @@ test('a remote caller may only point the collection at directories under the hom
 
 test('scrub, safeUrl and safeCommand', () => {
   assert.equal(inventory.scrub('node ~/bin/keep.js hook stop'), 'node ~/bin/keep.js hook stop');
-  assert.equal(inventory.scrub('curl -H "Authorization: Bearer abc.def"'), 'curl -H "*** ***"');
+  assert.equal(inventory.scrub('curl -H "Authorization: Bearer abc.def"'), 'curl -H "***"');
+  assert.equal(inventory.scrub('x=1 secret="a \\" b c" y=2'), 'x=1 secret="***" y=2', 'an escaped quote does not end the value');
+  const long = `${'a'.repeat(30000)} ${' '.repeat(30000)}#`;
+  const started = Date.now();
+  inventory.scrub(long);
+  inventory.codexConfigRows(`k = 1${' '.repeat(30000)}x`);
+  assert.ok(Date.now() - started < 500, 'long input costs little');
   assert.equal(inventory.scrub('Authorization: Bearer abc.def'), 'Authorization: ***');
   assert.equal(inventory.scrub('curl -u admin:pass https://x.example.com'), 'curl -u *** https://x.example.com/');
   assert.equal(inventory.scrub('mysql -phunter2 db'), 'mysql -p*** db');

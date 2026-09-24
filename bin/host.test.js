@@ -3259,6 +3259,26 @@ test('an inventory whose requested directories never resolve is answered, and ma
   }
 });
 
+test('one requested directory whose realpath hangs fails the audit and stops the next one', async () => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-inventory-hung-')));
+  fs.mkdirSync(path.join(home, 'hung'));
+  const fsp = require('node:fs/promises');
+  const inventoryOptions = { home, tools: [], logins: false, shellEnv: { PATH: '/nonexistent-bin' }, keepDir: path.join(home, 'keep') };
+  // Only one directory hangs, and only past its own bound: the rest resolve at once.
+  const realpath = (value) => (value.endsWith(`${path.sep}hung`) ? new Promise(() => {}) : fsp.realpath(value));
+  const inventoryScopeBounds = { realpath, timeoutMs: 50, totalMs: 10e3 };
+  try {
+    await withHost({ inventoryOptions, inventoryScopeBounds }, async ({ client }) => {
+      await assert.rejects(client.request('inventory', { claudeDirs: ['~/hung'] }, { timeoutMs: 10e3 }), /inventory-stuck: filesystem/);
+      assert.equal(require('./node-inventory.js').realpathsInFlight(realpath), 1);
+      assert.equal((await client.request('hello')).inventoryStuck, 'inventory stuck: filesystem');
+      await assert.rejects(client.request('inventory', {}, { timeoutMs: 10e3 }), /reload the host to clear/);
+    });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('a stats read that hangs on a disk answers partial and never leaves the host busy', async () => {
   const statsOptions = { statfs: () => new Promise(() => {}), deadlineMs: 300, cpuSampleMs: 5, agents: false };
   await withHost({ statsOptions }, async ({ client }) => {
