@@ -177,34 +177,115 @@ function embeddedUrl(url, hash = defaultHash) {
 
 // Credential-shaped substrings out of free text: embedded URLs (through safeUrl),
 // header-shaped `Name: value` pairs, any `name=value` or `"name": value` pair whose
-// name says secret, the values of credential flags and of attached -p, well-known
-// token prefixes, bearer values and opaque runs. A quoted value is masked through its
-// closing quote (escaped quotes included), so a multi-word secret goes whole. Text
-// is cut to SCRUB_MAX_CHARS first, which bounds every pattern here.
+// name says secret, the values of credential flags (long, or a single letter with
+// its value attached), well-known token prefixes, bearer values and opaque runs.
+//
+// Every quoted span ("…", '…', `…`) and command substitution ($(…)) is a text of its
+// own. When what precedes it says secret (a secret name and `=`/`:`, a credential
+// flag, `-p` glued to it, a quoted secret key in JSON, `bearer`), the whole span is
+// masked. Otherwise its quotes are kept and its inside is scrubbed the same way, to
+// MAX_SCRUB_DEPTH, so `sh -c "mysql --password x"` or `JAVA_OPTS="-Ddb.password=x"`
+// are masked inside. Text is cut to SCRUB_MAX_CHARS first, which bounds every pass.
 const SCRUB_MAX_CHARS = 4096;
-// A value: a double- or single-quoted string (to its closing quote, or to the end
-// when it has none), or a bare run.
-const VALUE = String.raw`"(?:[^"\\]|\\.)*"?|'(?:[^'\\]|\\.)*'?|[^"'\s,;&}\]]+`;
-const PAIR_RE = new RegExp(String.raw`(["']?)([A-Za-z_][A-Za-z0-9_.-]*)(["']?)(\s*[=:]\s*)(${VALUE})`, 'g');
-const FLAG_VALUE_RE = new RegExp(String.raw`((?:^|\s)(--?[A-Za-z][A-Za-z0-9_-]*)(?:\s+|=))(${VALUE.replace(String.raw`[^"'\s,;&}\]]+`, String.raw`[^\s"']+`)})`, 'g');
-function maskValue(value) {
-  const quote = value[0] === '"' || value[0] === '\'' ? value[0] : '';
-  if (!quote) return '***';
-  const closed = value.length > 1 && value.endsWith(quote) && !/(^|[^\\])(\\\\)*\\.$/.test(value);
-  return `${quote}***${closed ? quote : ''}`;
+const MAX_SCRUB_DEPTH = 4;
+const HOLE = '\u0000';
+const HEADER_NAME = /^(?:Authorization|Proxy-Authorization|Cookie|Set-Cookie|[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+)$/;
+
+// The end of a span that opened just before `from`: the matching quote (backslash
+// escapes skipped), or for `$(` the matching parenthesis. -1 when it never closes.
+function spanEnd(text, from, open) {
+  if (open === '$(') {
+    let depth = 1;
+    for (let index = from; index < text.length; index += 1) {
+      if (text[index] === '\\') { index += 1; continue; }
+      if (text[index] === '(') depth += 1;
+      else if (text[index] === ')' && --depth === 0) return index;
+    }
+    return -1;
+  }
+  for (let index = from; index < text.length; index += 1) {
+    if (text[index] === '\\') { index += 1; continue; }
+    if (text[index] === open) return index;
+  }
+  return -1;
 }
-function scrub(text, hash = defaultHash) {
-  return String(text == null ? '' : text).slice(0, SCRUB_MAX_CHARS)
-    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`]+/gi, (url) => embeddedUrl(url, hash))
-    .replace(/(\/\/)[^/\s@]+@/g, '$1***@')
-    .replace(/\b(Authorization|Proxy-Authorization|Cookie|Set-Cookie|[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+)(:[ \t]*)[^"'\n]+/g, '$1$2***')
-    .replace(/\b(bearer|basic)\s+[^\s"']+/gi, '$1 ***')
-    .replace(PAIR_RE, (match, q1, name, q2, sep, value) => (SECRET_NAME.test(name) ? `${q1}${name}${q2}${sep}${maskValue(value)}` : match))
-    .replace(FLAG_VALUE_RE, (match, lead, flag, value) => (credentialFlag(flag) ? `${lead}${maskValue(value)}` : match))
-    .replace(/((?:^|\s)-[pu])([^\s"']+)/g, '$1***')
+
+// Whether the text just before a span makes the span a secret value. Only its tail
+// is looked at, so the cost does not grow with the text.
+function secretBefore(before, spans) {
+  const tail = before.slice(-256);
+  let match = /([A-Za-z_][A-Za-z0-9_.-]*)\s*[=:]\s*[^\s"'`,;&}\]\u0000]*$/.exec(tail);
+  if (match && SECRET_NAME.test(match[1])) return true;
+  match = /(?:^|\s)(--?[A-Za-z][A-Za-z0-9_-]*)(?:\s+|=)[^\s"'`\u0000]*$/.exec(tail);
+  if (match && credentialFlag(match[1])) return true;
+  match = /(?:^|\s)(-[A-Za-z])[^\s"'`\u0000]*$/.exec(tail);
+  if (match && credentialFlag(match[1])) return true;
+  match = /\u0000(\d+)\u0000\s*[=:]\s*$/.exec(tail);
+  if (match && spans[Number(match[1])] && SECRET_NAME.test(spans[Number(match[1])].inner)) return true;
+  return /(?:^|\s)(?:bearer|basic)\s+$/i.test(tail);
+}
+
+// Credential-flag values, word by word: the word after a bare credential flag, the
+// value after `--flag=`, and a value glued to a single-letter credential flag (-p…).
+// Holes (spans already decided) are kept in place; everything else in such a word is
+// masked, so `--password=ab"cd ef"` loses `ab` here and its span before. Linear in
+// the text, with no pattern that looks back over whitespace.
+function maskFlags(flat) {
+  const maskWord = (word) => word.split(/(\u0000\d+\u0000)/).map((part) => (!part || /^\u0000\d+\u0000$/.test(part) ? part : '***')).join('');
+  const parts = flat.split(/(\s+)/);
+  let hideNext = false;
+  for (let index = 0; index < parts.length; index += 2) {
+    const word = parts[index];
+    if (!word) continue;
+    if (hideNext) { hideNext = false; parts[index] = maskWord(word); continue; }
+    let match = /^(--?[A-Za-z][A-Za-z0-9_-]*)=([\s\S]*)$/.exec(word);
+    if (match) {
+      if (credentialFlag(match[1])) parts[index] = `${match[1]}=${maskWord(match[2])}`;
+      continue;
+    }
+    match = /^(-[A-Za-z])([^-][\s\S]*)$/.exec(word);
+    if (match && credentialFlag(match[1])) { parts[index] = `${match[1]}${maskWord(match[2])}`; continue; }
+    if (/^--?[A-Za-z][A-Za-z0-9_-]*$/.test(word)) hideNext = credentialFlag(word);
+  }
+  return parts.join('');
+}
+
+function scrub(text, hash = defaultHash, depth = 0) {
+  let source = String(text == null ? '' : text).replace(/\u0000/g, '');
+  if (depth === 0) source = source.slice(0, SCRUB_MAX_CHARS);
+  if (depth > MAX_SCRUB_DEPTH) return '***';
+  // Lift every span out, leaving a hole the flat rules below never match into.
+  const spans = [];
+  let flat = '';
+  for (let index = 0; index < source.length;) {
+    const ch = source[index];
+    const open = ch === '"' || ch === '\'' || ch === '`' ? ch : ch === '$' && source[index + 1] === '(' ? '$(' : null;
+    if (!open) { flat += ch; index += 1; continue; }
+    const start = index + open.length;
+    const end = spanEnd(source, start, open);
+    const close = open === '$(' ? ')' : open;
+    const inner = source.slice(start, end === -1 ? source.length : end);
+    const secret = secretBefore(flat, spans);
+    spans.push({ inner, text: `${open}${secret ? '***' : scrub(inner, hash, depth + 1)}${end === -1 ? '' : close}` });
+    flat += `${HOLE}${spans.length - 1}${HOLE}`;
+    index = end === -1 ? source.length : end + close.length;
+  }
+  const scrubbedPairs = flat
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`\u0000]+/gi, (url) => embeddedUrl(url, hash))
+    .replace(/(\/\/)[^/\s@\u0000]+@/g, '$1***@')
+    // A header: a bounded name run, checked by shape afterwards, so no nested
+    // quantifier backtracks over a long run of name-like characters.
+    // Name runs are matched only from their start (the lookbehind), so a long run
+    // that never reaches a `:` or `=` is scanned once, not once per character.
+    .replace(/(?<![A-Za-z0-9-])([A-Za-z][A-Za-z0-9-]{0,63})(:[ \t]*)([^"'\n]+)/g, (match, name, sep) => (HEADER_NAME.test(name) ? `${name}${sep}***` : match))
+    .replace(/\b(bearer|basic)\s+[^\s"'\u0000]+/gi, '$1 ***')
+    .replace(/(?<![A-Za-z0-9_.-])(-*)([A-Za-z_][A-Za-z0-9_.-]*)(\s*[=:]\s*)([^"'\s,;&}\]\u0000]+)/g, (match, dashes, name, sep) => (SECRET_NAME.test(name) ? `${dashes}${name}${sep}***` : match));
+  const masked = maskFlags(scrubbedPairs)
     .replace(/\b(?:sk|pk|rk|ghp|gho|ghs|ghu|ghr|github_pat|xox[abprs]|glpat|npm|ASIA|hf|sntrys|sntryu)[-_][A-Za-z0-9_-]{8,}/g, '***')
     .replace(/\bAKIA[A-Z0-9]{12,}\b/g, '***')
     .replace(/[A-Za-z0-9_+=/.-]{16,}/g, (run) => (opaque(run) ? '***' : run));
+  // A hole the flat rules masked away is gone with it; the rest get their span back.
+  return masked.replace(/\u0000(\d+)\u0000/g, (match, number) => (spans[Number(number)] ? spans[Number(number)].text : ''));
 }
 
 // A URL path segment that may be a credential (a webhook's secret, a token-bearing

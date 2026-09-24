@@ -77,6 +77,25 @@ const SECRETS = {
   bearerValue: 'shoveler',
 };
 
+// Round five: a secret inside a quoted span or a command substitution whose own
+// prefix is not secret, a quoted value glued to -p, and a quoted tail after a bare
+// value. Each case, its planted secret, and what scrub() must print for it.
+const NESTED = [
+  ['sh -c "mysql --password redknot"', 'redknot', 'sh -c "mysql --password ***"'],
+  ['docker run --opts "-a --password dotterel"', 'dotterel', 'docker run --opts "-a --password ***"'],
+  ['ssh -o "ProxyCommand x --token lapwing"', 'lapwing', 'ssh -o "ProxyCommand x --token ***"'],
+  ['opts="--env API_KEY=killdeer"', 'killdeer', 'opts="--env API_KEY=***"'],
+  ['JAVA_OPTS="-Xmx1g -Ddb.password=phalarope"', 'phalarope', 'JAVA_OPTS="-Xmx1g -Ddb.password=***"'],
+  ['desc: "export TOKEN=yellowlegs"', 'yellowlegs', 'desc: "export TOKEN=***"'],
+  ["args='--db password=willet'", 'willet', "args='--db password=***'"],
+  ['mysql -p"oystercatcher"', 'oystercatcher', 'mysql -p"***"'],
+  ["mysql -p'stiltbird'", 'stiltbird', "mysql -p'***'"],
+  ['--password=ab"cd sanderlingx"', 'sanderlingx', '--password=***"***"'],
+  ['echo $(curl -u admin:turnstonex https://x.example.com)', 'turnstonex', 'echo $(curl -u *** https://x.example.com/)'],
+  ['run `tool --token whimbrelx`', 'whimbrelx', 'run `tool --token ***`'],
+];
+for (const [, secret] of NESTED) SECRETS[`nested-${secret}`] = secret;
+
 function write(file, content) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, typeof content === 'string' ? content : JSON.stringify(content, null, 2));
@@ -117,6 +136,7 @@ function fakeHome(t) {
       TOOL_ARGS: `--password '${SECRETS.quotedFlag}' --port 8080`,
       SERVICE_LOGIN: SECRETS.loginValue,
       API_BEARER: SECRETS.bearerValue,
+      ...Object.fromEntries(NESTED.map(([text], index) => [`NESTED_${index}`, text])),
     },
     apiKeyHelper: `echo ${SECRETS.helper}`,
     someTool: { private_key: SECRETS.jsonPrivateKey, clientKey: SECRETS.jsonClientKey, GH_PAT: SECRETS.jsonPat },
@@ -153,6 +173,9 @@ function fakeHome(t) {
     'model = "gpt-test"',
     'model_reasoning_effort = "high"',
     `openai_api_key = "${SECRETS.codexTopKey}"`,
+    // The nested cases as top-level Codex config values: a TOML literal string when
+    // the case has no single quote, a basic string with its quotes escaped otherwise.
+    ...NESTED.map(([text], index) => `nested_${index} = ${text.includes('\'') ? `"${text.replace(/"/g, '\\"')}"` : `'${text}'`}`),
     'notes = """',
     `["${SECRETS.tomlInString}"]`,
     '"""',
@@ -492,6 +515,28 @@ test('a remote caller may only point the collection at directories under the hom
     home: '/elsewhere',
   }, home), { claudeDirs: [path.join(home, '.claude'), path.join(home, '.claude-b'), path.join(home, 'inside')], repoRoots: [home] });
   assert.deepEqual(await inventory.requestOptions({}, home), {});
+});
+
+test('a secret inside a quoted span or command substitution is masked, whatever came before it', async (t) => {
+  // Directly: the exact round-four output for each case, and the secret nowhere.
+  for (const [text, secret, expected] of NESTED) {
+    const out = inventory.scrub(text);
+    assert.equal(out, expected, text);
+    assert.ok(!out.includes(secret));
+  }
+  // Through a settings env value and a Codex config value.
+  const fixture = fakeHome(t);
+  const lines = byKey(await inventory.collectInventory(options(fixture).value));
+  NESTED.forEach(([, secret, expected], index) => {
+    assert.equal(lines.get(`claude:~/.claude settings.json:env:NESTED_${index}`), expected);
+    const config = lines.get(`codex:~/.codex config:nested_${index}`);
+    assert.ok(config && !config.includes(secret), `config value ${index}: ${config}`);
+  });
+  // Nested spans are followed to a bounded depth, and a long adversarial text stays cheap.
+  assert.equal(inventory.scrub('a "b \'c `d $(e --token f)`\'"'), 'a "b \'c `d $(e --token ***)`\'"');
+  const started = Date.now();
+  for (const text of ['A-'.repeat(2048), '"'.repeat(4096), '$('.repeat(2000), ' '.repeat(4000) + 'x']) inventory.scrub(text);
+  assert.ok(Date.now() - started < 500, 'adversarial inputs stay cheap');
 });
 
 test('scrub, safeUrl and safeCommand', () => {
