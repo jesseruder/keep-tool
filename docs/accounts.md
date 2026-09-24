@@ -118,8 +118,9 @@ rather than letting them share the interactive default's weekly window.
 Since 2026-09-22 an `automationAccounts` entry is a **preference**, not a hard
 assignment. Every automation launch — the reviewer, incident responders
 (`incident-responder`), summaries (`summarize`), the Slack classifier (`slack`),
-`landed`, `standup`, the ideas sweep, scheduled checks (`checks`, since 2026-09-24),
-and the rate-limit handoff below — asks
+`landed`, `standup`, the ideas sweep, scheduled checks (`checks`, since 2026-09-24;
+a `checks-fallback` is only a reserve when it sits outside the pool, since a pool
+member is spent whenever the pool is), and the rate-limit handoff below — asks
 `bin/account-budget.js` for an account, and it answers from the **automation pool**:
 
 ```json

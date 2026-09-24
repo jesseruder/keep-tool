@@ -1012,17 +1012,32 @@ const {
 test('the checks account is the automation pool pick, or its best member when the pool is spent', () => {
   const asked = [];
   const select = (answer) => (options) => { asked.push(options); return answer; };
+  const room = () => ({ code: 0 });
   // The pool has room: its pick, whatever the fixed map says.
   assert.equal(checksAccountId({}, {
     selectAccount: select({ account: 'claude-secondary', ranked: [{ id: 'claude-secondary' }] }),
+    checkBudget: room, proxyModel: () => 'opus',
   }), 'claude-secondary');
   assert.equal(asked[0].purpose, 'checks');
-  assert.equal(asked[0].model, undefined, 'no KEEP_CHECK_MODEL: capped by week and 5h only');
+  assert.equal(asked[0].model, 'opus', 'asked about the model the budget is classified against');
+  assert.equal(asked[0].recordHealth, false, 'a per-tick read never rewrites the health row');
+  // The pool's first pick has a spent 5h window the weekly ranking did not see: the
+  // next member with room runs the check instead of the card deferring.
+  const budget = (id) => (id === 'claude-tertiary' ? { code: 7, reason: '5h at 100%' } : { code: 0 });
+  assert.equal(checksAccountId({}, {
+    selectAccount: select({ account: 'claude-tertiary', ranked: [{ id: 'claude-tertiary' }, { id: 'claude-secondary' }] }),
+    checkBudget: budget, proxyModel: () => 'opus',
+  }), 'claude-secondary');
   // Spent: the best pool member, so the scheduler's own deferral runs against it and
   // the owner's default account is never the one that "refused".
   assert.equal(checksAccountId({}, {
-    selectAccount: select({ account: null, deferred: true, retryAt: 1, ranked: [{ id: 'claude-tertiary' }, { id: 'claude-secondary' }] }),
+    selectAccount: select({ account: null, deferred: true, retryAt: 1, ranked: [{ id: 'claude-tertiary', exhausted: true }, { id: 'claude-secondary', exhausted: true }] }),
+    checkBudget: () => ({ code: 6, reason: 'week at 100%' }), proxyModel: () => 'opus',
   }), 'claude-tertiary');
+  // No pool at all: the fixed assignment select already answered with.
+  assert.equal(checksAccountId({}, {
+    selectAccount: select({ account: 'claude/default', ranked: [] }), checkBudget: room, proxyModel: () => 'opus',
+  }), 'claude/default');
   // A selector that cannot answer at all leaves the fixed assignment in charge: in an
   // isolated registry with nothing configured, that is the one default account.
   const throwing = { selectAccount: () => { throw new Error('config unreadable'); } };

@@ -415,17 +415,35 @@ function grantReopen(taskId, today) {
 // the owner's interactive default, which the pool exists to keep automation off.
 // Undefined lets openSession pick the default, which is what a single-account
 // install wants anyway.
+//
+// The pool is asked about the same model `checkBudget` below classifies against
+// (`KEEP_CHECK_MODEL`, else the reviewer's model as the proxy the docs describe), and
+// its ranking is walked with that same budget check: `rank` orders by weekly percent,
+// which can put an account with a spent 5h window or a spent model bucket ahead of one
+// that has room, and a check deferred while a pool member could have run it is the
+// one outcome this exists to prevent. Health is not recorded here: this runs every
+// scheduler tick whether or not a card is due, and a row rewritten once a minute
+// would erase a model-scoped deferral the reviewer had just recorded.
 function checksAccountId(env = process.env, deps = {}) {
   let choice = null;
   try {
+    const model = CHECK_MODEL || (deps.proxyModel || (() => require('./review.js').reviewerModel()))();
     choice = (deps.selectAccount || require('./account-budget.js').select)({
-      purpose: 'checks', model: CHECK_MODEL || undefined, env,
+      purpose: 'checks', model: model || undefined, env, recordHealth: false,
     });
   } catch {}
   if (choice) {
+    const ranked = Array.isArray(choice.ranked) ? choice.ranked : [];
+    if (!ranked.length && choice.account) return choice.account;
+    const budget = deps.checkBudget || checkBudget;
+    for (const row of ranked) {
+      if (!row || !row.id || row.exhausted) continue;
+      let verdict;
+      try { verdict = budget(row.id); } catch { verdict = null; }
+      if (!budgetDeferralReason(verdict)) return row.id;
+    }
     if (choice.account) return choice.account;
-    const first = Array.isArray(choice.ranked) ? choice.ranked[0] : null;
-    if (first && first.id) return first.id;
+    if (ranked[0] && ranked[0].id) return ranked[0].id;
   }
   try { return require('./accounts.js').automationFor('claude', 'checks', env).id; }
   catch { return undefined; }
