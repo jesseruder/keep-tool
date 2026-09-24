@@ -389,48 +389,134 @@ test('a state file that will not write cannot make the next tick repeat a card w
   assert.equal(calls.checkins.length, 0);
 });
 
-test('an unreadable kind is carried, not reported finished; a vanished or half-written record is just gone', async (t) => {
+test('an unreadable record file is carried for an hour, then unknown; the rest of its kind is unaffected', async (t) => {
   const root = registry(t);
-  const [a, b] = [sid(), sid()];
+  const [a, b, c] = [sid(), sid(), sid()];
   const handoff = (id) => ({ sessionId: id, pane: pane(), status: 'recovery-needed', phase: 'delivering-continuation',
     sourceStopVerifiedAt: NOW - 3 * HOUR, targetAccountId: 'claude/two', updatedAt: NOW - 3 * HOUR });
   put(root, `account-handoffs/${a}.json`, handoff(a));
   put(root, `account-handoffs/${b}.json`, handoff(b));
+  const cFile = put(root, `account-handoffs/${c}.json`, handoff(c));
   put(root, `account-handoffs/${sid()}.json`, '{"half":');
   const clean = await inflight.scan({ root, now: NOW });
   assert.deepEqual(clean.errors, []);
-  assert.equal(clean.items.length, 2);
+  assert.equal(clean.items.length, 3);
 
-  // EMFILE on one record's read: the kind is reported unread, not emptied.
+  // EMFILE on b's read: only b's file is unread; the kind's other records are read.
   const fsp = require('node:fs/promises');
   const flaky = { ...fsp, readFile: async (file, ...rest) => {
     if (String(file).endsWith(`${b}.json`)) { const error = new Error('too many open files'); error.code = 'EMFILE'; throw error; }
     return fsp.readFile(file, ...rest);
   } };
+  // c finishes while b is unreadable: it must be reported finished, not pinned by b.
+  fs.writeFileSync(cFile, JSON.stringify({ sessionId: c, status: 'done', phase: 'done', updatedAt: NOW }));
   const glitch = await inflight.scan({ root, now: NOW + MINUTE, fs: flaky });
-  assert.deepEqual(glitch.failedKinds, ['account-handoff']);
-  assert.match(glitch.errors[0], /account-handoff: EMFILE/);
+  assert.deepEqual(glitch.failedFiles, [`.keep/account-handoffs/${b}.json`]);
+  assert.match(glitch.errors[0], /account-handoff \.keep\/account-handoffs\/.*: EMFILE/);
   assert.deepEqual(glitch.items.map((entry) => entry.recordId), [a]);
 
-  // Escalation carries b through the glitch, however long it lasts: no "finished".
   const { calls, deps } = fakeCards();
   await inflight.escalate(clean.items, { root, now: NOW, deps });
-  for (let i = 1; i <= 30; i += 1) {
-    const result = await inflight.escalate(glitch.items, { root, now: NOW + i * MINUTE, deps, failedKinds: glitch.failedKinds });
-    assert.equal(result.action, 'unchanged');
+  let finishedAt = 0;
+  for (let i = 1; i <= 59; i += 1) {
+    const result = await inflight.escalate(glitch.items, { root, now: NOW + i * MINUTE, deps, failedFiles: glitch.failedFiles });
+    if (result.action === 'updated') finishedAt = i;
   }
-  assert.equal(calls.checkins.length, 0);
+  // c left after the blink window, as finished; b is still carried.
+  assert.equal(calls.checkins.length, 1);
+  assert.equal(finishedAt, inflight.GONE_AFTER_MS / MINUTE);
+  assert.match(calls.checkins[0].message, new RegExp(`Finished or gone: account-handoff:${c}`));
+  assert.ok(!calls.checkins[0].message.includes(b));
+  // Past the cap, b is reported unknown, not stuck and not finished.
+  const result = await inflight.escalate(glitch.items, { root, now: NOW + inflight.CARRY_UNREAD_MS + MINUTE, deps, failedFiles: glitch.failedFiles });
+  assert.equal(result.action, 'updated');
+  assert.match(calls.checkins[1].message, new RegExp(`Unknown, their record unreadable for over 60m .*: account-handoff:${b}`));
+  assert.ok(!/Finished or gone/.test(calls.checkins[1].message));
+  // Later ticks stay quiet about it.
+  assert.equal((await inflight.escalate(glitch.items, { root, now: NOW + 2 * HOUR, deps, failedFiles: glitch.failedFiles })).action, 'unchanged');
 
-  // The row fails and says so, while still naming what it read.
+  // The row fails and says which file, while still naming what it read.
   const rows = [];
-  await inflight.tick({ root, now: NOW + 31 * MINUTE, deps, record: (name, entry) => rows.push(entry), scanned: glitch });
-  assert.match(rows[0].error, /unreadable: account-handoff: EMFILE/);
+  await inflight.tick({ root, now: NOW + 2 * HOUR, deps, record: (name, entry) => rows.push(entry), scanned: glitch });
+  assert.match(rows[0].error, /unreadable: account-handoff .*: EMFILE/);
 
-  // And the stalled sweep keeps listing b from what it last saw.
+  // The stalled sweep keeps listing b from what it last saw, for an hour, then drops it.
   const options = { root, sessions: [], jobs: [], brokers: [], psOutput: '', includeInflight: true, autoReap: false };
-  await stalled.sweep({ ...options, now: NOW });
+  await stalled.sweep({ ...options, now: NOW, deps: { scanInflight: async () => clean } });
   const swept = await stalled.sweep({ ...options, now: NOW + MINUTE, deps: { scanInflight: async () => glitch } });
   assert.deepEqual(swept.items.map((entry) => entry.recordId).sort(), [a, b].sort());
+  const later = await stalled.sweep({ ...options, now: NOW + 30 * MINUTE, deps: { scanInflight: async () => glitch } });
+  assert.deepEqual(later.items.map((entry) => entry.recordId).sort(), [a, b].sort());
+  const capped = await stalled.sweep({ ...options, now: NOW + MINUTE + inflight.CARRY_UNREAD_MS, deps: { scanInflight: async () => glitch } });
+  assert.deepEqual(capped.items.map((entry) => entry.recordId), [a]);
+});
+
+test('a stray file where a Pi job directory belongs is not a record and pins nothing', async (t) => {
+  const root = registry(t);
+  const job = crypto.randomBytes(12).toString('hex');
+  const jobFile = put(root, `pi-jobs/${job}/job.json`, { id: job, status: 'running', createdAt: NOW - 13 * HOUR, updatedAt: NOW - 13 * HOUR });
+  // A 24-hex *file*: reading <file>/job.json gives ENOTDIR.
+  put(root, `pi-jobs/${crypto.randomBytes(12).toString('hex')}`, 'stray');
+  const first = await inflight.scan({ root, now: NOW });
+  assert.deepEqual(first.errors, []);
+  assert.deepEqual(first.failedFiles, []);
+  assert.deepEqual(first.items.map((entry) => entry.recordId), [job]);
+
+  const { calls, deps } = fakeCards();
+  await inflight.escalate(first.items, { root, now: NOW, deps });
+  fs.writeFileSync(jobFile, JSON.stringify({ id: job, status: 'succeeded', updatedAt: NOW }));
+  for (const at of [HOUR, 24 * HOUR, 168 * HOUR]) {
+    const scanned = await inflight.scan({ root, now: NOW + at });
+    assert.deepEqual(scanned.items, []);
+    await inflight.escalate(scanned.items, { root, now: NOW + at, deps, failedFiles: scanned.failedFiles });
+  }
+  assert.equal(calls.checkins.length, 1);
+  assert.match(calls.checkins[0].heading, /cleared/);
+});
+
+test('a check-in tag belongs to one attempt: a returning set that failed before saving is retried, not called landed', async (t) => {
+  const root = registry(t);
+  const { calls, cards, deps, fail } = fakeCards();
+  const [a, b] = [sid(), sid()];
+  const A = [item('account-handoff', a)];
+  const AB = [item('account-handoff', a), item('delivery', b)];
+  let at = NOW;
+  const step = (set) => inflight.escalate(set, { root, now: at, deps });
+
+  assert.equal((await step(A)).action, 'opened');
+  at += MINUTE;
+  assert.equal((await step(AB)).action, 'updated');           // New: b
+  at += inflight.GONE_AFTER_MS + MINUTE;
+  assert.equal((await step(A)).action, 'updated');            // b finished
+  assert.equal(calls.checkins.length, 2);
+  // b is stuck again, and the check-in saying so throws before it is saved.
+  at += MINUTE;
+  fail.checkin = 'before';
+  await assert.rejects(step(AB), /registry lock busy/);
+  assert.equal(calls.checkins.length, 2);
+  // After the backoff the retry actually writes it: the old A+B tag is not this attempt's.
+  at += inflight.RETRY_BACKOFF_MS;
+  assert.equal((await step(AB)).action, 'updated');
+  assert.equal(calls.checkins.length, 3);
+  assert.match(calls.checkins[2].message, /New:\n- delivery /);
+  const body = cards.get('inflight-card-1').body;
+  const last = body.lastIndexOf(`delivery ${b}`);
+  assert.ok(last > body.lastIndexOf(`Finished or gone: delivery:${b}`), 'the card\'s last word on b is that it is stuck');
+
+  // Every 'cleared' check-in is its own, too.
+  at += MINUTE;
+  await step([]);
+  at += inflight.GONE_AFTER_MS + MINUTE;
+  assert.equal((await step([])).action, 'cleared');
+  at += MINUTE;
+  await step(A);
+  at += inflight.GONE_AFTER_MS + MINUTE;
+  fail.checkin = 'before';
+  await assert.rejects(step([]), /registry lock busy/);
+  at += inflight.RETRY_BACKOFF_MS;
+  const before = calls.checkins.length;
+  assert.equal((await step([])).action, 'cleared');
+  assert.equal(calls.checkins.length, before + 1);
 });
 
 test('closing the card dismisses its records for good: a blink or a restamp does not reopen it', async (t) => {

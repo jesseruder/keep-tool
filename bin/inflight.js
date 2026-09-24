@@ -524,18 +524,21 @@ const KINDS = [
 
 // ---------- scanning ----------
 
+const NOT_A_RECORD = new Set(['ENOENT', 'ENOTDIR', 'EISDIR']);
+
 async function readRecords(dir, kind, io = fsp) {
   let names;
   try { names = await io.readdir(dir); }
   catch (error) {
-    if (error && error.code === 'ENOENT') return { records: [], error: null };
-    return { records: [], error };
+    if (error && NOT_A_RECORD.has(error.code)) return { records: [], failed: [] };
+    // The directory itself: every record under it is unread this tick.
+    return { records: [], failed: [{ file: dir, error }] };
   }
   const records = [];
   // `nested` kinds keep one directory per record with a fixed file inside
   // (.keep/pi-jobs/<id>/job.json): one level, never a walk.
   const wanted = names.filter(kind.match).sort().map((name) => (kind.nested ? path.join(name, kind.nested) : name));
-  let failure = null;
+  const failed = [];
   for (const name of wanted) {
     const file = path.join(dir, name);
     try {
@@ -547,16 +550,18 @@ async function readRecords(dir, kind, io = fsp) {
       if (!entry || typeof entry !== 'object') continue;
       records.push({ name, file, entry, mtimeMs: stat.mtimeMs });
     } catch (error) {
-      // Only two failures say the record is not in flight: it was removed mid-scan
-      // (its owner finished it), or it is half-written and its owner is mid-write. Any
-      // other (EMFILE, EIO, EACCES) says nothing about the record, so the whole kind is
-      // reported as unread for this tick: escalation then keeps what it last knew of
-      // it rather than calling every one of its records finished.
-      if (error && (error.code === 'ENOENT' || error instanceof SyntaxError)) continue;
-      failure = failure || error;
+      // What says the file is not an in-flight record: it was removed mid-scan (its
+      // owner finished it), it is half-written (its owner is mid-write), or it is not a
+      // record at all (a stray file where a job directory belongs gives ENOTDIR). Any
+      // other failure (EMFILE, EIO, EACCES) says nothing about the record, so this one
+      // file is reported unread: escalation keeps what it last knew of the records it
+      // held, for a while, rather than calling them finished. Only that file: the
+      // rest of the kind was read, and a bad neighbour must not pin them.
+      if (error && (NOT_A_RECORD.has(error.code) || error instanceof SyntaxError)) continue;
+      failed.push({ file, error });
     }
   }
-  return { records, error: failure };
+  return { records, failed };
 }
 
 // Pure over what readRecords returned, so a test can feed it shapes directly.
@@ -606,23 +611,35 @@ async function scan(options = {}) {
   const io = options.fs || fsp;
   const items = [];
   const errors = [];
-  const failedKinds = [];
+  const failedFiles = [];
+  const root = rootOf(options);
   for (const kind of options.kinds || KINDS) {
     const dir = path.join(base, kind.dir);
-    const { records, error } = await readRecords(dir, kind, io);
-    if (error) {
-      errors.push(`${kind.kind}: ${error.code || error.message}`);
-      failedKinds.push(kind.kind);
+    const { records, failed } = await readRecords(dir, kind, io);
+    for (const { file, error } of failed) {
+      errors.push(`${kind.kind} ${path.relative(root, file)}: ${error.code || error.message}`);
+      failedFiles.push(path.relative(root, file));
     }
-    // What was read is still named; a failed kind's missing records are carried by
-    // escalate() and the stalled sweep from what they last saw.
+    // What was read is named; a record in a file that could not be read is carried by
+    // escalate() and the stalled sweep from what they last saw (unreadCovers).
     items.push(...judge(kind, records, now));
   }
   items.sort((a, b) => a.since - b.since || a.id.localeCompare(b.id));
   // Relative to the registry, so the card and the console never print a home path.
-  const root = rootOf(options);
   for (const item of items) item.file = path.relative(root, item.file);
-  return { items, errors, failedKinds };
+  return { items, errors, failedFiles };
+}
+
+// How long a record whose file cannot be read is carried as still stuck. After that
+// it is reported unknown, not stuck: a file that stays unreadable is a problem of its
+// own (named on the row), and must not pin a record that has long since finished.
+const CARRY_UNREAD_MS = HOUR_MS;
+
+// Whether a record last seen in `file` sits under one of this tick's unreadable paths
+// (the file itself, or a directory that could not be listed).
+function unreadCovers(failedFiles, file) {
+  const target = String(file || '');
+  return Boolean(target) && (failedFiles || []).some((failed) => target === failed || target.startsWith(`${failed}${path.sep}`));
 }
 
 // ---------- rendering ----------
@@ -669,6 +686,7 @@ function cardText(items) {
 //               read) is carried rather than reported finished and then new again
 //   dismissed   id -> lastSeenAt for records a card named and Owner then closed
 //   failedAt    the last card write that threw, for the retry backoff
+//   pending     { sig, tag } of the check-in being attempted, so its retry reuses the tag
 //
 // The daemon also keeps the latest state in memory and reads that first, so a state
 // file that will not write (a full disk) cannot make the next tick repeat a card
@@ -688,7 +706,7 @@ const CHANGE_LIST_MAX = 12;
 const memory = new Map(); // root -> state
 
 function emptyState() {
-  return { cardId: '', keys: [], seen: {}, dismissed: {}, failedAt: 0, failedError: '', changedAt: 0 };
+  return { cardId: '', keys: [], seen: {}, dismissed: {}, failedAt: 0, failedError: '', changedAt: 0, pending: null };
 }
 
 function normalizeState(value) {
@@ -701,6 +719,8 @@ function normalizeState(value) {
     failedAt: number(value.failedAt),
     failedError: String(value.failedError || ''),
     changedAt: number(value.changedAt),
+    pending: value.pending && typeof value.pending.sig === 'string' && typeof value.pending.tag === 'string'
+      ? { sig: value.pending.sig, tag: value.pending.tag } : null,
   };
 }
 
@@ -756,10 +776,14 @@ function defaultDeps(deps = {}, options = {}) {
     findOpenCard: deps.findOpenCard || (async () => {
       const root = rootOf(options);
       const base = cardSlug();
-      for (let n = 1; n < 200; n += 1) {
+      // The sequence normally has no gaps, but a card deleted outright leaves one; a
+      // few misses in a row, not the first, end it.
+      let misses = 0;
+      for (let n = 1; n < 200 && misses < 5; n += 1) {
         const id = n === 1 ? base : `${base}-${n}`;
         const live = await exists(path.join(root, 'tasks', `${id}.md`));
-        if (!live && !await exists(path.join(root, 'archive', `${id}.md`))) return '';
+        if (!live && !await exists(path.join(root, 'archive', `${id}.md`))) { misses += 1; continue; }
+        misses = 0;
         if (live && isOurCard(loadTask(id))) return id;
       }
       return '';
@@ -775,10 +799,6 @@ function cardOpen(task) {
   return Boolean(task && task.fm && task.fm.status && task.fm.status !== 'done');
 }
 
-function marker(cardId, keys, label) {
-  const digest = require('crypto').createHash('sha256').update(JSON.stringify([cardId, label, keys])).digest('hex').slice(0, 12);
-  return `[inflight ${digest}]`;
-}
 
 function listIds(ids) {
   if (ids.length <= CHANGE_LIST_MAX) return ids.join(', ');
@@ -786,8 +806,13 @@ function listIds(ids) {
 }
 
 // A check-in that is safe to retry. checkinTask saves the card before it commits, so
-// a throw can come after the entry is already on the card; the marker says whether it
-// is, and a retry then counts as done rather than appending a second copy.
+// a throw can come after the entry is already on the card; the tag says whether it
+// is, and a retry then counts as done rather than appending a second copy. The tag
+// must be this attempt's alone: one derived from the key set would match an earlier,
+// landed check-in whenever a set returns (A, then A+B, then A, then A+B again) and
+// call a check-in landed that never was. So escalate() draws a random tag per
+// attempt and writes it to its state before trying; only a retry of that same
+// attempt (same card, label and set) reuses it.
 function checkinOnce(deps, cardId, payload, tag) {
   try {
     deps.checkin(cardId, { ...payload, message: `${payload.message}\n${tag}` });
@@ -811,7 +836,7 @@ function checkinOnce(deps, cardId, payload, tag) {
 async function escalate(items, options = {}) {
   const now = number(options.now, Date.now());
   const deps = defaultDeps(options.deps, options);
-  const failedKinds = new Set(options.failedKinds || []);
+  const failedFiles = options.failedFiles || [];
   const state = await readState(options);
 
   // Every id this tick knows is past its age: the ones read now, plus the ones read
@@ -819,14 +844,18 @@ async function escalate(items, options = {}) {
   const byKey = new Map((items || []).map((item) => [item.id, item]));
   const seen = {};
   for (const [key, item] of byKey) {
-    seen[key] = { lastSeenAt: now, since: item.since, recordKind: item.recordKind,
+    seen[key] = { lastSeenAt: now, since: item.since, recordKind: item.recordKind, file: item.file,
       ...(item.expiresAfterMs ? { expiresAfterMs: item.expiresAfterMs } : {}) };
   }
-  const gone = [];
+  // Absent this tick: carried while it is a blink, or while its own file is unreadable
+  // (for at most CARRY_UNREAD_MS); otherwise it has left, as finished or as unknown.
+  const unknown = new Set();
   for (const [key, entry] of Object.entries(state.seen)) {
     if (seen[key]) continue;
-    if (failedKinds.has(entry.recordKind) || now - number(entry.lastSeenAt) < GONE_AFTER_MS) seen[key] = entry;
-    else gone.push(key);
+    const absentMs = now - number(entry.lastSeenAt);
+    const unread = unreadCovers(failedFiles, entry.file);
+    if (absentMs < GONE_AFTER_MS || unread && absentMs < CARRY_UNREAD_MS) seen[key] = entry;
+    else if (unread) unknown.add(key);
   }
   const keys = Object.keys(seen).sort();
 
@@ -838,6 +867,17 @@ async function escalate(items, options = {}) {
 
   const next = { ...state, seen, dismissed };
   const save = async (patch = {}) => { await writeState({ ...next, ...patch }, options); };
+  // The tag for this check-in, reused only by a retry of the very same attempt.
+  const tagFor = async (id, label, set) => {
+    const sig = JSON.stringify([id, label, set]);
+    const tag = state.pending && state.pending.sig === sig ? state.pending.tag
+      : `[inflight ${require('crypto').randomBytes(6).toString('hex')}]`;
+    next.pending = { sig, tag };
+    // Memory holds it even if the file will not write, which is all a retry in this
+    // process needs; a write error here must not stop the check-in itself.
+    await save().catch(() => {});
+    return tag;
+  };
 
   const cardFailed = async (error) => {
     await save({ failedAt: now, failedError: String(error && error.message || error) }).catch(() => {});
@@ -862,13 +902,17 @@ async function escalate(items, options = {}) {
   if (!keys.length) {
     if (!named.length) { await save({ keys: [] }); return { cardId, action: 'none' }; }
     try {
+      const tag = await tagFor(cardId, 'cleared', named);
       checkinOnce(deps, cardId, {
         heading: 'in-flight records cleared',
-        message: `Every record this card named has finished or gone (${listIds(named)}). Keep leaves the card for you to close.`,
+        message: unknown.size
+          ? `No record is past its max age now. Finished or gone: ${listIds(named.filter((key) => !unknown.has(key))) || 'none'}; `
+            + `unknown, their record unreadable for over ${duration(CARRY_UNREAD_MS)}: ${listIds(named.filter((key) => unknown.has(key)))}.`
+          : `Every record this card named has finished or gone (${listIds(named)}). Keep leaves the card for you to close.`,
         linkSession: false, commitLabel: HEALTH_NAME,
-      }, marker(cardId, [], 'cleared'));
+      }, tag);
     } catch (error) { return cardFailed(error); }
-    await save({ keys: [], changedAt: now });
+    await save({ keys: [], changedAt: now, pending: null });
     return { cardId, action: 'cleared' };
   }
 
@@ -884,20 +928,22 @@ async function escalate(items, options = {}) {
       const entry = state.seen[key];
       return entry && entry.expiresAfterMs && now >= number(entry.since) + number(entry.expiresAfterMs);
     });
-    const finished = left.filter((key) => !expired.includes(key));
+    const finished = left.filter((key) => !expired.includes(key) && !unknown.has(key));
+    const unknownLeft = left.filter((key) => unknown.has(key));
     const addedItems = added.map((key) => byKey.get(key)).filter(Boolean);
     const message = [
       `${keys.length} record${keys.length === 1 ? '' : 's'} past max age now (was ${named.length}).`,
       finished.length ? `Finished or gone: ${listIds(finished)}.` : '',
       expired.length ? `Expired unresolved (dropped by their owner's own timeout): ${listIds(expired)}.` : '',
+      unknownLeft.length ? `Unknown, their record unreadable for over ${duration(CARRY_UNREAD_MS)} (see the inflight health row): ${listIds(unknownLeft)}.` : '',
       addedItems.length ? `New:\n${addedItems.slice(0, CHANGE_LIST_MAX).map((item) => `- ${line(item)} [${item.file}]`).join('\n')}` : '',
       addedItems.length > CHANGE_LIST_MAX ? `and ${addedItems.length - CHANGE_LIST_MAX} more; keep stalled lists them all.` : '',
     ].filter(Boolean).join('\n');
     try {
-      checkinOnce(deps, cardId, { heading: 'in-flight records changed', message, linkSession: false, commitLabel: HEALTH_NAME },
-        marker(cardId, keys, 'changed'));
+      const tag = await tagFor(cardId, 'changed', keys);
+      checkinOnce(deps, cardId, { heading: 'in-flight records changed', message, linkSession: false, commitLabel: HEALTH_NAME }, tag);
     } catch (error) { return cardFailed(error); }
-    await save({ keys, changedAt: now });
+    await save({ keys, changedAt: now, pending: null });
     return { cardId, action: 'updated' };
   }
 
@@ -914,11 +960,12 @@ async function escalate(items, options = {}) {
       // A card of ours this state does not know (a lost state file): what it names is
       // unknown, so it is told the whole current list once.
       action = 'adopted';
+      const tag = await tagFor(cardId, 'adopted', keys);
       checkinOnce(deps, cardId, {
         heading: 'in-flight records',
         message: `Keep lost track of this card and picked it up again. Current list:\n\n${cardText(current)}`,
         linkSession: false, commitLabel: HEALTH_NAME,
-      }, marker(cardId, keys, 'adopted'));
+      }, tag);
     } else {
       try {
         const created = deps.addTask({
@@ -944,7 +991,7 @@ async function escalate(items, options = {}) {
   } catch (error) { return cardFailed(error); }
   // A new card names everything current, dismissed or not, so dismissal starts over
   // with it.
-  await save({ cardId, keys, dismissed: {}, changedAt: now });
+  await save({ cardId, keys, dismissed: {}, changedAt: now, pending: null });
   return { cardId, action };
 }
 
@@ -965,10 +1012,10 @@ async function tick(options = {}) {
     record(HEALTH_NAME, { at: now, ok: false, cadenceMs: MINUTE_MS, error: `in-flight scan failed: ${error.message || error}` });
     return { items: [], error };
   }
-  const { items, errors = [], failedKinds = [] } = result;
+  const { items, errors = [], failedFiles = [] } = result;
   let escalation = null;
   let escalationError = null;
-  try { escalation = await escalate(items, { ...options, now, failedKinds }); }
+  try { escalation = await escalate(items, { ...options, now, failedFiles }); }
   catch (error) { escalationError = error; }
   const cardId = escalation && escalation.cardId || '';
   const unread = errors.length ? `; unreadable: ${errors.join('; ')}` : '';
@@ -990,7 +1037,8 @@ async function tick(options = {}) {
 }
 
 module.exports = {
-  HEALTH_NAME, CARD_TITLE, KINDS, GONE_AFTER_MS, DISMISS_FORGET_MS, RETRY_BACKOFF_MS,
+  HEALTH_NAME, CARD_TITLE, KINDS, GONE_AFTER_MS, DISMISS_FORGET_MS, RETRY_BACKOFF_MS, CARRY_UNREAD_MS,
+  unreadCovers,
   scan, judge, escalate, tick, readState, cardSlug,
   // Tests only: forget the in-memory state, as a daemon restart does.
   _resetMemory: () => memory.clear(),

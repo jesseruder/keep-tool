@@ -1027,9 +1027,11 @@ ledgers, holds, step claims) are not tracked. Neither are unblock records: one i
 resolved while its card may still legitimately wait on another upstream, a
 `check_after` or a need, and the unblock sweep already gives up a deliverable one after
 a day. An idle-mode restart queued behind a busy session is legitimately waiting too.
-A kind whose directory or a record in it cannot be read (EMFILE, EIO, EACCES, but not
-a record that vanished or is half-written) is reported on the row as unreadable, and its
-records are carried from the last reading rather than reported finished.
+A record file (or a whole directory) that cannot be read (EMFILE, EIO, EACCES) is
+named on the row as unreadable, and only the records last seen in it are carried from
+the last reading, for at most an hour; after that the card calls them unknown, not
+stuck and not finished. A file that vanished, is half-written, or is not a record at
+all (a stray file where a job directory belongs: ENOTDIR, EISDIR) is simply not one.
 
 A record past its max age shows up three ways:
 
