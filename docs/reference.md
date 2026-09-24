@@ -2869,10 +2869,11 @@ inside `health.record`, on the store that call already reads and writes, behind 
 try/catch so the scheduler's own record always lands, and is on demand, so
 self-repair opens its card on the failing scheduler, not on `deploy`. A same-commit
 restart (a crash, or a restart with nothing landed) keeps the watch the deploy armed.
-Neither half charges a deploy with `runs`, `lint`, `git-pull`, `loop-stalls` or
-`account-budget` (`health.DEPLOY_UNWATCHED`): what fails those is the machine, the
-registry or the restart itself — the new daemon's startup can stall the loop — so they
-would call every deploy a regression.
+Neither half charges a deploy with `runs`, `lint`, `git-pull`, `loop-stalls`,
+`account-budget` or `inflight` (`health.DEPLOY_UNWATCHED`): what fails those is the
+machine, the registry, a durable record outliving its max age or the restart itself —
+the new daemon's startup can stall the loop — so they would call every deploy a
+regression.
 
 `wt gc` fetches each repository, then recycles only clean, fully landed worktrees
 whose directory contains no live agent cwd. It keeps two safe recycled trees per

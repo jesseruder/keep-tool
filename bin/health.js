@@ -33,8 +33,10 @@ const DEPLOY_WATCH_MAX_MS = 2 * HOUR_MS;
 // daemon's own startup can stall the loop past five seconds (`loop-stalls`), and
 // `runs` fails on delivery into sessions whose host is still reattaching. `lint`
 // and `git-pull` fail on registry and checkout state, `account-budget` on a spent
-// account pool. The same reasoning as bin/self-repair.js EXCLUDED, plus the budget.
-const DEPLOY_UNWATCHED = new Set(['runs', 'lint', 'git-pull', 'loop-stalls', 'account-budget']);
+// account pool, and `inflight` on a durable record outliving its max age, which a
+// restart can strand and which then ages past its limit an hour later. The same
+// reasoning as bin/self-repair.js EXCLUDED, plus the budget.
+const DEPLOY_UNWATCHED = new Set(['runs', 'lint', 'git-pull', 'loop-stalls', 'account-budget', 'inflight']);
 let warnedWrite = false;
 
 // Schedulers that no longer exist. Their rows stay in health.json from older
