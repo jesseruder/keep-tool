@@ -77,22 +77,29 @@ const SECRETS = {
   bearerValue: 'shoveler',
 };
 
-// Round five: a secret inside a quoted span or a command substitution whose own
-// prefix is not secret, a quoted value glued to -p, and a quoted tail after a bare
-// value. Each case, its planted secret, and what scrub() must print for it.
+// Every quoting and substitution case of rounds four to six, its planted secret, and
+// what the allowlist prints for it (the salted hash shown as sha=H). Everything
+// from the first quote, backtick, backslash or parenthesis on is masked.
 const NESTED = [
-  ['sh -c "mysql --password redknot"', 'redknot', 'sh -c "mysql --password ***"'],
-  ['docker run --opts "-a --password dotterel"', 'dotterel', 'docker run --opts "-a --password ***"'],
-  ['ssh -o "ProxyCommand x --token lapwing"', 'lapwing', 'ssh -o "ProxyCommand x --token ***"'],
-  ['opts="--env API_KEY=killdeer"', 'killdeer', 'opts="--env API_KEY=***"'],
-  ['JAVA_OPTS="-Xmx1g -Ddb.password=phalarope"', 'phalarope', 'JAVA_OPTS="-Xmx1g -Ddb.password=***"'],
-  ['desc: "export TOKEN=yellowlegs"', 'yellowlegs', 'desc: "export TOKEN=***"'],
-  ["args='--db password=willet'", 'willet', "args='--db password=***'"],
-  ['mysql -p"oystercatcher"', 'oystercatcher', 'mysql -p"***"'],
-  ["mysql -p'stiltbird'", 'stiltbird', "mysql -p'***'"],
-  ['--password=ab"cd sanderlingx"', 'sanderlingx', '--password=***"***"'],
-  ['echo $(curl -u admin:turnstonex https://x.example.com)', 'turnstonex', 'echo $(curl -u *** https://x.example.com/)'],
-  ['run `tool --token whimbrelx`', 'whimbrelx', 'run `tool --token ***`'],
+  ['sh -c "mysql --password redknot"', 'redknot', 'sh -c *** *** *** sha=H'],
+  ['docker run --opts "-a --password dotterel"', 'dotterel', 'docker run --opts *** *** *** sha=H'],
+  ['ssh -o "ProxyCommand x --token lapwing"', 'lapwing', 'ssh -o *** *** *** *** sha=H'],
+  ['opts="--env API_KEY=killdeer"', 'killdeer', '*** *** sha=H'],
+  ['JAVA_OPTS="-Xmx1g -Ddb.password=phalarope"', 'phalarope', '*** *** sha=H'],
+  ['desc: "export TOKEN=yellowlegs"', 'yellowlegs', '*** *** *** sha=H'],
+  ["args='--db password=willet'", 'willet', '*** *** sha=H'],
+  ['mysql -p"oystercatcher"', 'oystercatcher', 'mysql *** sha=H'],
+  ["mysql -p'stiltbird'", 'stiltbird', 'mysql *** sha=H'],
+  ['--password=ab"cd sanderlingx"', 'sanderlingx', '*** *** sha=H'],
+  ['echo $(curl -u admin:turnstonex https://x.example.com)', 'turnstonex', 'echo *** *** *** *** sha=H'],
+  ['run `tool --token whimbrelx`', 'whimbrelx', 'run *** *** *** sha=H'],
+  // Round six.
+  ['x="$(mysql --password "curlewbird")"', 'curlewbird', '*** *** *** sha=H'],
+  ['$(x)--token godwitbird', 'godwitbird', '*** *** sha=H'],
+  ["--password='p'\"'\"'knotbird'", 'knotbird', '*** sha=H'],
+  ['--password "a""stintbird"', 'stintbird', '--password *** sha=H'],
+  ['PASSWORD=$(cat f)"dunlinbird"', 'dunlinbird', '*** *** sha=H'],
+  ['key: ["a", "ruffbird"]', 'ruffbird', '*** *** *** sha=H'],
 ];
 for (const [, secret] of NESTED) SECRETS[`nested-${secret}`] = secret;
 
@@ -253,9 +260,9 @@ test('no planted credential ever appears in the inventory', async (t) => {
   assert.equal(lines.get('claude:~/.claude settings.json:env:EXAMPLE_API_KEY'), 'set');
   assert.equal(lines.get('claude:~/.claude settings.json:env:PLAIN_FLAG'), '1');
   assert.equal(lines.get('claude:~/.claude settings.json:env:OTEL_EXPORTER_OTLP_HEADERS'), 'set');
-  assert.equal(lines.get('claude:~/.claude settings.json:env:EXTRA_OPTIONS'), 'X-Api-Key: ***');
-  assert.equal(lines.get('claude:~/.claude settings.json:env:TOOL_CONFIG'), '{"private_key":"***","clientKey":"***","GH_PAT":"***"}');
-  assert.match(lines.get('claude:~/.claude settings.json:env:OTEL_EXPORTER_OTLP_ENDPOINT'), /^https:\/\/otel\.example\.com\/v1\/\*[0-9a-f]{8}$/);
+  assert.match(lines.get('claude:~/.claude settings.json:env:EXTRA_OPTIONS'), new RegExp(`^\\*\\*\\* \\*\\*\\* sha=${sha}$`));
+  assert.match(lines.get('claude:~/.claude settings.json:env:TOOL_CONFIG'), new RegExp(`^\\*\\*\\* sha=${sha}$`));
+  assert.match(lines.get('claude:~/.claude settings.json:env:OTEL_EXPORTER_OTLP_ENDPOINT'), new RegExp(`^https://otel\\.example\\.com/v1/\\*[0-9a-f]{8} sha=${sha}$`));
   assert.equal(lines.get('claude:~/.claude settings.json:apiKeyHelper'), 'set');
   assert.match(lines.get('claude:~/.claude settings.json:someTool'), /^keys=\[GH_PAT,clientKey,private_key\] sha=/);
   assert.match(lines.get('claude:~/.claude settings.json:statusLine'), new RegExp(`^command:~/\\.claude/statusline\\.sh --pass \\*\\*\\* sha=${sha}$`));
@@ -267,7 +274,7 @@ test('no planted credential ever appears in the inventory', async (t) => {
   assert.match(lines.get('claude:~/.claude mcp:user:envflag'), new RegExp(`^stdio runner --env=\\*\\*\\* --verbose sha=${sha}$`));
   assert.match(lines.get('claude:~/.claude settings.json:hooks:Stop'), new RegExp(`^command:~/bin/stop-hook --token \\*\\*\\* sha=${sha}$`));
   assert.match(lines.get('claude:~/.claude settings.json:hooks:Notification'),
-    /^command:curl -u \*\*\* -H \*\*\* https:\/\/hooks\.example\.com\/services\/\*[0-9a-f]{8}\/\*[0-9a-f]{8}\/\*[0-9a-f]{8} sha=/);
+    /^command:curl -u \*\*\* -H \*\*\* \*\*\* \*\*\* \*\*\* sha=[0-9a-f]{12} \|\| command:mysql -p\*\*\* -e status \*\*\* sha=[0-9a-f]{12} \|\| http:https:\/\/hooks\.example\.com\/services\/\*[0-9a-f]{8}\/\*[0-9a-f]{8}\/\*[0-9a-f]{8}$/);
   const session = lines.get('claude:~/.claude settings.json:hooks:SessionStart').split(' || ');
   assert.match(session[0], new RegExp(`^command:\\*\\*\\* node x\\.js sha=${sha}$`));
   assert.match(session[1], new RegExp(`^command:env \\*\\*\\* node x sha=${sha}$`));
@@ -278,14 +285,15 @@ test('no planted credential ever appears in the inventory', async (t) => {
   assert.match(session[6], new RegExp(`^command:tool -k\\*\\*\\* -P\\*\\*\\* -x\\*\\*\\* -Q\\*\\*\\* -la sha=${sha}$`));
   assert.equal(lines.get('codex:~/.codex config:notes'), '(multi-line)');
   assert.equal(lines.get('codex:~/.codex config:doc'), '(multi-line)');
-  assert.equal(lines.get('claude:~/.claude settings.json:env:DB_OPTIONS'), 'password = "***" timeout = 5');
-  assert.equal(lines.get('claude:~/.claude settings.json:env:JSON_OPTIONS'), '{"secret" : "***", "theme": "dark"}');
-  assert.equal(lines.get('claude:~/.claude settings.json:env:TOOL_ARGS'), '--password \'***\' --port 8080');
+  // Everything from the first quote on is masked; the line hash still compares.
+  assert.match(lines.get('claude:~/.claude settings.json:env:DB_OPTIONS'), new RegExp(`^password \\*\\*\\* \\*\\*\\* \\*\\*\\* \\*\\*\\* \\*\\*\\* \\*\\*\\* \\*\\*\\* sha=${sha}$`));
+  assert.match(lines.get('claude:~/.claude settings.json:env:JSON_OPTIONS'), new RegExp(`^(\\*\\*\\* ){6}sha=${sha}$`));
+  assert.match(lines.get('claude:~/.claude settings.json:env:TOOL_ARGS'), new RegExp(`^--password \\*\\*\\* \\*\\*\\* \\*\\*\\* \\*\\*\\* sha=${sha}$`));
   assert.equal(lines.get('claude:~/.claude settings.json:env:SERVICE_LOGIN'), 'set');
   assert.equal(lines.get('claude:~/.claude settings.json:env:API_BEARER'), 'set');
   assert.ok([...lines.keys()].some((key) => /^codex:~\/\.codex table:\*[0-9a-f]{8}$/.test(key)), 'a random-looking table name is a hash marker');
   assert.match(lines.get('repo ~/src/app'), /^main@0123456 origin=https:\/\/github.com\/example\/app.git dirty=1 env=\[\.env\]/);
-  assert.equal(lines.get('codex:~/.codex config:model'), '"gpt-test"', 'a profile\'s model is not the top-level one');
+  assert.equal(lines.get('codex:~/.codex config:model'), 'gpt-test', 'a profile\'s model is not the top-level one');
   assert.equal(lines.get('codex:~/.codex config:openai_api_key'), 'set');
   assert.match(lines.get('codex:~/.codex table:tui'), /^keys=\[notifications,status_line\] sha=/);
   assert.match(lines.get('codex:~/.codex table:mcp_servers'), /^keys=\[docs\] sha=/);
@@ -301,7 +309,8 @@ test('the inventory reads each config dir, a project-scope MCP server, and is th
     'sorted by section then key');
   const get = (section, key) => (first.find((entry) => entry.section === section && entry.key === key) || {}).value;
   assert.equal(get('claude:~/.claude', 'mcp:project:~/src/app:tracker'), 'http https://tracker.example.com/mcp');
-  assert.equal(get('claude:~/.claude', 'login'), 'owner@example.com org=Example');
+  // An address has an @, which no shown token may: compared by its hash.
+  assert.match(get('claude:~/.claude', 'login'), /^\*\*\* sha=[0-9a-f]{12} org=Example$/);
   assert.match(get('claude:~/.claude', 'skills/alpha'), /^dir sha=[0-9a-f]{12} bytes=\d+$/);
   assert.match(get('claude:~/.claude', 'memory:-src-app'), /^1 files MEMORY.md=sha=/);
   assert.notEqual(get('claude:~/.claude', 'CLAUDE.md'), get('claude:~/.claude-second', 'CLAUDE.md'));
@@ -517,55 +526,88 @@ test('a remote caller may only point the collection at directories under the hom
   assert.deepEqual(await inventory.requestOptions({}, home), {});
 });
 
-test('a secret inside a quoted span or command substitution is masked, whatever came before it', async (t) => {
-  // Directly: the exact round-four output for each case, and the secret nowhere.
+const anyHash = (text) => String(text).replace(/sha=[0-9a-f]{12}/g, 'sha=H');
+
+test('no quoting or substitution case shows its secret, directly or through a config value', async (t) => {
+  // Directly: the pinned allowlist output for each case, and the secret nowhere.
   for (const [text, secret, expected] of NESTED) {
     const out = inventory.scrub(text);
-    assert.equal(out, expected, text);
+    assert.equal(anyHash(out), expected, text);
     assert.ok(!out.includes(secret));
   }
   // Through a settings env value and a Codex config value.
   const fixture = fakeHome(t);
   const lines = byKey(await inventory.collectInventory(options(fixture).value));
   NESTED.forEach(([, secret, expected], index) => {
-    assert.equal(lines.get(`claude:~/.claude settings.json:env:NESTED_${index}`), expected);
+    assert.equal(anyHash(lines.get(`claude:~/.claude settings.json:env:NESTED_${index}`)), expected);
     const config = lines.get(`codex:~/.codex config:nested_${index}`);
     assert.ok(config && !config.includes(secret), `config value ${index}: ${config}`);
   });
-  // Nested spans are followed to a bounded depth, and a long adversarial text stays cheap.
-  assert.equal(inventory.scrub('a "b \'c `d $(e --token f)`\'"'), 'a "b \'c `d $(e --token ***)`\'"');
+  assert.equal(anyHash(inventory.scrub('a "b \'c `d $(e --token f)`\'"')), 'a *** *** *** *** *** *** sha=H');
+  // A long adversarial text stays cheap.
   const started = Date.now();
-  for (const text of ['A-'.repeat(2048), '"'.repeat(4096), '$('.repeat(2000), ' '.repeat(4000) + 'x']) inventory.scrub(text);
+  for (const text of ['A-'.repeat(2048), '"'.repeat(4096), '$('.repeat(2000), ' '.repeat(4000) + 'x', 'a '.repeat(2048)]) inventory.scrub(text);
   assert.ok(Date.now() - started < 500, 'adversarial inputs stay cheap');
 });
 
+test('property: a secret that is not a plain word never survives any mix of quoting', () => {
+  // A small seeded generator, so a failure names the case that produced it.
+  let seed = 20260924;
+  const random = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const pick = (list) => list[Math.floor(random() * list.length)];
+  const secrets = ['hunter2', 'pa55word', 's3cr3t-Tok3n', 'x9Y8z7W6', 'Zm9vYmFy0', 'Qw3rty9'];
+  const parts = ['echo', 'run', 'mysql', '--password', '--token', '--api_key', '-p', '-u', '-H', '--opts', '-c', 'x',
+    'KEY=', 'PASSWORD=', 'opts=', 'desc:', 'Authorization:', 'Bearer', '"', '\'', '`', '$(', ')', '=', ':', '"a"', '|', '&&', ' '];
+  for (let round = 0; round < 500; round += 1) {
+    const secret = pick(secrets);
+    const words = [];
+    const length = 1 + Math.floor(random() * 8);
+    for (let index = 0; index < length; index += 1) words.push(pick(parts));
+    words.splice(Math.floor(random() * (words.length + 1)), 0, secret);
+    // Glue some neighbours together, as a shell word would be.
+    const text = words.map((word) => (random() < 0.4 ? word : `${word} `)).join('');
+    const out = inventory.scrub(text);
+    assert.ok(!out.includes(secret), `round ${round}: ${JSON.stringify(text)} -> ${JSON.stringify(out)}`);
+    const line = inventory.safeCommand(`run ${text}`);
+    assert.ok(!line.includes(secret), `round ${round} (command): ${JSON.stringify(text)} -> ${JSON.stringify(line)}`);
+  }
+});
+
 test('scrub, safeUrl and safeCommand', () => {
-  assert.equal(inventory.scrub('node ~/bin/keep.js hook stop'), 'node ~/bin/keep.js hook stop');
-  assert.equal(inventory.scrub('curl -H "Authorization: Bearer abc.def"'), 'curl -H "***"');
-  assert.equal(inventory.scrub('x=1 secret="a \\" b c" y=2'), 'x=1 secret="***" y=2', 'an escaped quote does not end the value');
+  const cases = [
+    // Only allowlisted tokens show; a masked line carries its salted hash.
+    ['node ~/bin/keep.js hook stop', 'node ~/bin/keep.js hook stop'],
+    ['/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home', '/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home'],
+    ['curl -H "Authorization: Bearer abc.def"', 'curl -H *** *** *** sha=H'],
+    ['x=1 secret="a \\" b c" y=2', 'x=*** *** *** *** *** *** sha=H'],
+    ['Authorization: Bearer abc.def', '*** *** *** sha=H'],
+    ['curl -u admin:pass https://x.example.com', 'curl -u *** https://x.example.com/ sha=H'],
+    ['mysql -phunter2 db', 'mysql -p*** db sha=H'],
+    ['psql -h db.local -U reader -P pager=off', 'psql -h db.local -U reader -P pager=*** sha=H'],
+    ['pass=letmein clientKey: heron', '*** *** *** sha=H'],
+    ['token is eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlMTIz ok', 'token is *** ok sha=H'],
+    ['see https://user:pw@host.example.com/x?key=1&v=2 now', 'see https://host.example.com/x?key=***&v=*** now sha=H'],
+    ['uses ghp_abcdefghij0123456789', 'uses *** sha=H'],
+    // A colon is never shown, so a non-header `name:` hides only itself.
+    ['name: value', '*** value sha=H'],
+  ];
+  for (const [text, expected] of cases) assert.equal(anyHash(inventory.scrub(text)), expected, text);
   const long = `${'a'.repeat(30000)} ${' '.repeat(30000)}#`;
   const started = Date.now();
   inventory.scrub(long);
   inventory.codexConfigRows(`k = 1${' '.repeat(30000)}x`);
   assert.ok(Date.now() - started < 500, 'long input costs little');
-  assert.equal(inventory.scrub('Authorization: Bearer abc.def'), 'Authorization: ***');
-  assert.equal(inventory.scrub('curl -u admin:pass https://x.example.com'), 'curl -u *** https://x.example.com/');
-  assert.equal(inventory.scrub('mysql -phunter2 db'), 'mysql -p*** db');
-  assert.equal(inventory.scrub('psql -h db.local -U reader -P pager=off'), 'psql -h db.local -U reader -P pager=off');
-  assert.equal(inventory.scrub('pass=letmein clientKey: heron'), 'pass=*** clientKey: ***');
-  assert.equal(inventory.scrub('token is eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlMTIz ok'), 'token is *** ok');
-  assert.equal(inventory.scrub('/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home'), '/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home');
-  assert.equal(inventory.scrub('see https://user:pw@host.example.com/x?key=1&v=2 now'), 'see https://host.example.com/x?key=***&v=*** now');
-  assert.equal(inventory.scrub('uses ghp_abcdefghij0123456789'), 'uses ***');
   assert.equal(inventory.safeUrl('https://github.com/example/app.git'), 'https://github.com/example/app.git');
   assert.equal(inventory.safeUrl('git@github.com:example/app.git'), 'git@github.com:example/app.git');
   assert.match(inventory.safeUrl('https://hooks.example.com/services/T0ABCDEF1/B0ABCDEF2/abcdefghijklmnopqrstuvwx'),
     /^https:\/\/hooks\.example\.com\/services\/\*[0-9a-f]{8}\/\*[0-9a-f]{8}\/\*[0-9a-f]{8}$/);
-  assert.deepEqual(inventory.tokenize(`a -H "X-Api-Key: letmein" 'b c'`), ['a', '-H', 'X-Api-Key: letmein', 'b c']);
-  assert.match(inventory.safeCommand(['node', '--token=abc', '--port', '8080', '-y', 'pkg']), /^node \*\*\* --port 8080 -y pkg sha=[0-9a-f]{12}$/);
-  assert.match(inventory.safeCommand('curl -H "X-Api-Key: letmein" https://x.example.com'), /^curl -H \*\*\* https:\/\/x\.example\.com\/ sha=/);
-  assert.match(inventory.safeCommand('psql -h db -U reader -P pager'), /^psql -h db -U reader -P pager sha=/, 'psql\'s -h, -U and -P are not credentials');
+  assert.equal(anyHash(inventory.safeCommand(['node', '--token=abc', '--port', '8080', '-y', 'pkg'])), 'node *** --port 8080 -y pkg sha=H');
+  assert.equal(anyHash(inventory.safeCommand('curl -H "X-Api-Key: letmein" https://x.example.com')), 'curl -H *** *** *** sha=H');
+  assert.equal(anyHash(inventory.safeCommand('psql -h db -U reader -P pager')), 'psql -h db -U reader -P pager sha=H', 'psql\'s -h, -U and -P are not credentials');
   assert.notEqual(inventory.safeCommand('run --pw one'), inventory.safeCommand('run --pw two'), 'the hash still tells two lines apart');
+  // JSON values are never scrubbed as text: key names and a hash, no scalar inside.
+  assert.match(inventory.describeValue('config', { user: 'admin', list: ['hunter', 'x'] }), /^keys=\[list,user\] sha=[0-9a-f]{12}$/);
+  assert.match(inventory.describeValue('items', ['hunter', 'x']), /^2 items sha=[0-9a-f]{12}$/);
 });
 
 const A = [

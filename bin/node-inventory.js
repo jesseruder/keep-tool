@@ -12,27 +12,26 @@
 // What leaves the machine, and nothing else:
 // - Files are reported by presence, kind and a short content hash. Credential files
 //   (.credentials.json, auth.json, .netrc, ~/.aws/credentials) by presence only.
-// - A command line (a hook, an MCP server, the status line) is shown through an
-//   allowlist: the executable, paths and words made only of [A-Za-z0-9_./~-] with
-//   no `=`, bare flags, shell operators and URLs through safeUrl. A `NAME=value`
-//   word shows as `NAME=***` (or `***` when the name says secret), the word after a
-//   credential flag is `***`, and every other word is `***`. The line's hash is
-//   appended, so two machines still compare exactly.
+// - Free text (settings env values, config values, git settings, tool and login
+//   lines, error messages, hook commands, MCP arguments, status lines) goes through
+//   one rule, allowlist(): split on whitespace, show a token only when it is a plain
+//   word, path or version, a bare flag, a shell operator or an http(s) URL (through
+//   safeUrl), show `NAME=value` as `NAME=***`, and mask everything else, including
+//   everything from the first quote, backtick, backslash or parenthesis on and the
+//   word after a credential flag. Nothing is parsed, so no quoting can get past it.
+//   A salted hash of the whole text compares what is masked.
 // - A URL keeps its scheme, host and plain path segments; user info, query values
 //   and matrix parameters are dropped, and long or random-looking segments become
 //   `*<hash>` markers.
-// - Names (skills, MCP servers, settings keys, env keys, tables) are shown. Values
-//   of settings, environment variables and config keys pass through scrub(), which
-//   masks secret-named pairs, header values, credential flags, known token shapes
-//   and opaque runs; a value whose name says secret is reported as `set`; a table
-//   or object is reported by its key names and hash, never its values.
-// Logins are reported by the identity each CLI prints (an account name, an ARN).
+// - Names (skills, MCP servers, settings keys, env keys, tables) are shown when they
+//   read as names. A value whose name says secret is `set`. JSON objects and arrays
+//   are never read as text: their key names and a salted hash, no scalar inside.
 // Every hash is an HMAC under a salt that `keep node audit` makes per audit and hands
 // to both sides, so hashes compare only within one audit.
 //
 // A known limit: a word in a free position that reads as a plain name
-// (`deploy supersecretpassword now`) is shown; only its shape can be judged. Command
-// rows are made to compare two machines, not to reproduce the command.
+// (`deploy supersecretpassword now`) is shown; only its shape can be judged. Rows are
+// made to compare two machines, not to reproduce what they describe.
 //
 // Every read is bounded and nothing throws: a subprocess runs in its own process
 // group with its output buffered and capped, and is killed with that group on
@@ -175,119 +174,6 @@ function embeddedUrl(url, hash = defaultHash) {
   return safeUrl(url, hash);
 }
 
-// Credential-shaped substrings out of free text: embedded URLs (through safeUrl),
-// header-shaped `Name: value` pairs, any `name=value` or `"name": value` pair whose
-// name says secret, the values of credential flags (long, or a single letter with
-// its value attached), well-known token prefixes, bearer values and opaque runs.
-//
-// Every quoted span ("…", '…', `…`) and command substitution ($(…)) is a text of its
-// own. When what precedes it says secret (a secret name and `=`/`:`, a credential
-// flag, `-p` glued to it, a quoted secret key in JSON, `bearer`), the whole span is
-// masked. Otherwise its quotes are kept and its inside is scrubbed the same way, to
-// MAX_SCRUB_DEPTH, so `sh -c "mysql --password x"` or `JAVA_OPTS="-Ddb.password=x"`
-// are masked inside. Text is cut to SCRUB_MAX_CHARS first, which bounds every pass.
-const SCRUB_MAX_CHARS = 4096;
-const MAX_SCRUB_DEPTH = 4;
-const HOLE = '\u0000';
-const HEADER_NAME = /^(?:Authorization|Proxy-Authorization|Cookie|Set-Cookie|[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+)$/;
-
-// The end of a span that opened just before `from`: the matching quote (backslash
-// escapes skipped), or for `$(` the matching parenthesis. -1 when it never closes.
-function spanEnd(text, from, open) {
-  if (open === '$(') {
-    let depth = 1;
-    for (let index = from; index < text.length; index += 1) {
-      if (text[index] === '\\') { index += 1; continue; }
-      if (text[index] === '(') depth += 1;
-      else if (text[index] === ')' && --depth === 0) return index;
-    }
-    return -1;
-  }
-  for (let index = from; index < text.length; index += 1) {
-    if (text[index] === '\\') { index += 1; continue; }
-    if (text[index] === open) return index;
-  }
-  return -1;
-}
-
-// Whether the text just before a span makes the span a secret value. Only its tail
-// is looked at, so the cost does not grow with the text.
-function secretBefore(before, spans) {
-  const tail = before.slice(-256);
-  let match = /([A-Za-z_][A-Za-z0-9_.-]*)\s*[=:]\s*[^\s"'`,;&}\]\u0000]*$/.exec(tail);
-  if (match && SECRET_NAME.test(match[1])) return true;
-  match = /(?:^|\s)(--?[A-Za-z][A-Za-z0-9_-]*)(?:\s+|=)[^\s"'`\u0000]*$/.exec(tail);
-  if (match && credentialFlag(match[1])) return true;
-  match = /(?:^|\s)(-[A-Za-z])[^\s"'`\u0000]*$/.exec(tail);
-  if (match && credentialFlag(match[1])) return true;
-  match = /\u0000(\d+)\u0000\s*[=:]\s*$/.exec(tail);
-  if (match && spans[Number(match[1])] && SECRET_NAME.test(spans[Number(match[1])].inner)) return true;
-  return /(?:^|\s)(?:bearer|basic)\s+$/i.test(tail);
-}
-
-// Credential-flag values, word by word: the word after a bare credential flag, the
-// value after `--flag=`, and a value glued to a single-letter credential flag (-p…).
-// Holes (spans already decided) are kept in place; everything else in such a word is
-// masked, so `--password=ab"cd ef"` loses `ab` here and its span before. Linear in
-// the text, with no pattern that looks back over whitespace.
-function maskFlags(flat) {
-  const maskWord = (word) => word.split(/(\u0000\d+\u0000)/).map((part) => (!part || /^\u0000\d+\u0000$/.test(part) ? part : '***')).join('');
-  const parts = flat.split(/(\s+)/);
-  let hideNext = false;
-  for (let index = 0; index < parts.length; index += 2) {
-    const word = parts[index];
-    if (!word) continue;
-    if (hideNext) { hideNext = false; parts[index] = maskWord(word); continue; }
-    let match = /^(--?[A-Za-z][A-Za-z0-9_-]*)=([\s\S]*)$/.exec(word);
-    if (match) {
-      if (credentialFlag(match[1])) parts[index] = `${match[1]}=${maskWord(match[2])}`;
-      continue;
-    }
-    match = /^(-[A-Za-z])([^-][\s\S]*)$/.exec(word);
-    if (match && credentialFlag(match[1])) { parts[index] = `${match[1]}${maskWord(match[2])}`; continue; }
-    if (/^--?[A-Za-z][A-Za-z0-9_-]*$/.test(word)) hideNext = credentialFlag(word);
-  }
-  return parts.join('');
-}
-
-function scrub(text, hash = defaultHash, depth = 0) {
-  let source = String(text == null ? '' : text).replace(/\u0000/g, '');
-  if (depth === 0) source = source.slice(0, SCRUB_MAX_CHARS);
-  if (depth > MAX_SCRUB_DEPTH) return '***';
-  // Lift every span out, leaving a hole the flat rules below never match into.
-  const spans = [];
-  let flat = '';
-  for (let index = 0; index < source.length;) {
-    const ch = source[index];
-    const open = ch === '"' || ch === '\'' || ch === '`' ? ch : ch === '$' && source[index + 1] === '(' ? '$(' : null;
-    if (!open) { flat += ch; index += 1; continue; }
-    const start = index + open.length;
-    const end = spanEnd(source, start, open);
-    const close = open === '$(' ? ')' : open;
-    const inner = source.slice(start, end === -1 ? source.length : end);
-    const secret = secretBefore(flat, spans);
-    spans.push({ inner, text: `${open}${secret ? '***' : scrub(inner, hash, depth + 1)}${end === -1 ? '' : close}` });
-    flat += `${HOLE}${spans.length - 1}${HOLE}`;
-    index = end === -1 ? source.length : end + close.length;
-  }
-  const scrubbedPairs = flat
-    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`\u0000]+/gi, (url) => embeddedUrl(url, hash))
-    .replace(/(\/\/)[^/\s@\u0000]+@/g, '$1***@')
-    // A header: a bounded name run, checked by shape afterwards, so no nested
-    // quantifier backtracks over a long run of name-like characters.
-    // Name runs are matched only from their start (the lookbehind), so a long run
-    // that never reaches a `:` or `=` is scanned once, not once per character.
-    .replace(/(?<![A-Za-z0-9-])([A-Za-z][A-Za-z0-9-]{0,63})(:[ \t]*)([^"'\n]+)/g, (match, name, sep) => (HEADER_NAME.test(name) ? `${name}${sep}***` : match))
-    .replace(/\b(bearer|basic)\s+[^\s"'\u0000]+/gi, '$1 ***')
-    .replace(/(?<![A-Za-z0-9_.-])(-*)([A-Za-z_][A-Za-z0-9_.-]*)(\s*[=:]\s*)([^"'\s,;&}\]\u0000]+)/g, (match, dashes, name, sep) => (SECRET_NAME.test(name) ? `${dashes}${name}${sep}***` : match));
-  const masked = maskFlags(scrubbedPairs)
-    .replace(/\b(?:sk|pk|rk|ghp|gho|ghs|ghu|ghr|github_pat|xox[abprs]|glpat|npm|ASIA|hf|sntrys|sntryu)[-_][A-Za-z0-9_-]{8,}/g, '***')
-    .replace(/\bAKIA[A-Z0-9]{12,}\b/g, '***')
-    .replace(/[A-Za-z0-9_+=/.-]{16,}/g, (run) => (opaque(run) ? '***' : run));
-  // A hole the flat rules masked away is gone with it; the rest get their span back.
-  return masked.replace(/\u0000(\d+)\u0000/g, (match, number) => (spans[Number(number)] ? spans[Number(number)].text : ''));
-}
-
 // A URL path segment that may be a credential (a webhook's secret, a token-bearing
 // MCP endpoint) becomes a short hash marker, so the same URL on two machines still
 // compares equal and neither prints it. Matrix parameters (`;name=value`) are dropped.
@@ -325,6 +211,10 @@ function safeUrl(value, hash = defaultHash) {
 
 const SHELL_OPERATOR = /^(?:&&|\|\||\||;|&|>|>>|<|2>&1|2>\/dev\/null)$/;
 const FLAG = /^(--?)([A-Za-z][A-Za-z0-9_-]*)$/;
+// The only characters a shown token may contain (a URL is judged by safeUrl instead).
+const TOKEN_CHARS = /^[A-Za-z0-9_./~+-]+$/;
+const SCRUB_MAX_CHARS = 4096;
+const SHOWN_MAX_CHARS = 200;
 
 // A flag word shown as it is, or with its glued value masked. A long flag's name
 // must read as a name. A single dash with more than one letter is either grouped
@@ -336,65 +226,97 @@ function showFlag(dashes, body) {
   return `-${body[0]}***`;
 }
 
-// Shell-style words: a quoted span is one word, quotes removed.
-function tokenize(text) {
+// The one rule for every free-text value and command line: whitespace-separated
+// tokens, each shown only when it is entirely one of
+//   - a plain word, path or version ([A-Za-z0-9_./~+-], every piece reading as a
+//     word; letters and digits run together are masked past an executable),
+//   - a bare flag (-x, --long-name, --long_name) with no value part,
+//   - a shell operator,
+//   - an http(s) URL, through safeUrl,
+//   - NAME=value, shown as NAME=*** when NAME is a plain name that does not say
+//     secret;
+// and `***` otherwise: anything with a quote, $, a backtick, a bracket, a brace, a
+// backslash, a colon, @, %, a comma, a non-ASCII character, or that does not read as
+// a name. The word after a credential flag (-u, -p, -H, --password, --api_key, …) is
+// `***` whatever it is, and a value glued to -p/-u/-H is masked. No span, quote or
+// pair is parsed, so there is nothing for a quoting trick to get past.
+function allowlist(tokens, { rel = (value) => value, hash = defaultHash, executableFirst = false } = {}) {
   const out = [];
-  let current = '';
-  let quote = null;
-  let started = false;
-  for (const ch of String(text == null ? '' : text)) {
-    if (quote) {
-      if (ch === quote) quote = null;
-      else current += ch;
-      continue;
-    }
-    if (ch === '"' || ch === '\'') { quote = ch; started = true; continue; }
-    if (/\s/.test(ch)) {
-      if (started) out.push(current);
-      current = '';
-      started = false;
-      continue;
-    }
-    current += ch;
-    started = true;
-  }
-  if (started) out.push(current);
-  return out;
-}
-
-// A command line for display, through an allowlist: see the top of this file. Only
-// words that are provably harmless are shown; everything else is `***`.
-function safeCommand(input, rel = (value) => value, hash = defaultHash) {
-  const words = Array.isArray(input) ? input.map((value) => String(value)) : tokenize(input);
-  if (!words.length) return '';
-  const full = Array.isArray(input) ? JSON.stringify(input) : String(input);
-  const out = [];
+  let masked = false;
   let hideNext = false;
-  words.forEach((word, index) => {
-    if (hideNext) { out.push('***'); hideNext = false; return; }
-    if (SHELL_OPERATOR.test(word)) { out.push(word); return; }
-    if (word.includes('=')) {
-      const name = word.slice(0, word.indexOf('='));
-      const flag = FLAG.exec(name);
-      const nameOk = flag
-        ? readsAsName(flag[2]) && !credentialFlag(name) && !SECRET_NAME.test(flag[2])
-        : /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(name) && readsAsName(name, { executable: true }) && !SECRET_NAME.test(name);
+  let hideRest = false;
+  const mask = () => { masked = true; return '***'; };
+  tokens.forEach((token, index) => {
+    if (hideRest) { out.push(mask()); return; }
+    // A quote, a backtick, a backslash or a parenthesis starts something whose end
+    // is not looked for: every token from it on is masked, so a plain word inside a
+    // quoted or substituted span is never shown by being plain. Checked before the
+    // word-after-a-flag rule, which would otherwise mask only this one token.
+    if (/["'`\\()]/.test(token)) { hideRest = true; out.push(mask()); return; }
+    if (hideNext) { hideNext = false; out.push(mask()); return; }
+    // A secret name used as a header or a key (`Authorization:`, `password:`) hides
+    // the rest of the text; a bearer or basic scheme word hides the word after it.
+    if (/^[A-Za-z_][A-Za-z0-9_.-]*:$/.test(token) && SECRET_NAME.test(token.slice(0, -1))) { hideRest = true; out.push(mask()); return; }
+    if (/^(?:bearer|basic)$/i.test(token)) { hideNext = true; out.push(token); return; }
+    if (SHELL_OPERATOR.test(token)) { out.push(token); return; }
+    if (/^https?:\/\/[^\s]+$/i.test(token)) {
+      const url = embeddedUrl(token, hash);
+      if (url !== token) masked = true;
+      out.push(url);
+      return;
+    }
+    const eq = token.indexOf('=');
+    if (eq !== -1) {
+      const name = token.slice(0, eq);
+      const bare = name.replace(/^-+/, '');
+      const nameOk = /^-{0,2}[A-Za-z_][A-Za-z0-9_.-]*$/.test(name) && readsAsName(bare)
+        && !SECRET_NAME.test(bare) && !SECRET_NAME.test(bare.replace(/_/g, '-')) && !credentialFlag(name);
+      masked = true;
       out.push(nameOk ? `${name}=***` : '***');
       return;
     }
-    if (/^-[pu]./.test(word)) { out.push(`${word.slice(0, 2)}***`); return; }
-    const flag = FLAG.exec(word);
-    if (flag) {
-      out.push(showFlag(flag[1], flag[2]));
-      if (credentialFlag(word)) hideNext = true;
+    if (!TOKEN_CHARS.test(token)) { out.push(mask()); return; }
+    if (/^-[A-Za-z]./.test(token) && !token.startsWith('--') && credentialFlag(token.slice(0, 2))) {
+      masked = true;
+      out.push(`${token.slice(0, 2)}***`);
       return;
     }
-    if (/^https?:\/\//i.test(word)) { out.push(embeddedUrl(word, hash)); return; }
-    // A word, a path or the executable, shown only when it reads as a name.
-    const shown = rel(word);
-    out.push(readsAsName(shown, { executable: index === 0 }) ? shown : '***');
+    const flag = FLAG.exec(token);
+    if (flag) {
+      const shown = showFlag(flag[1], flag[2]);
+      if (shown !== token) masked = true;
+      out.push(shown);
+      if (credentialFlag(token)) hideNext = true;
+      return;
+    }
+    const shown = rel(token);
+    out.push(readsAsName(shown, { executable: executableFirst && index === 0, extra: '+' }) ? shown : mask());
   });
-  return `${out.join(' ')} sha=${hash(full)}`;
+  return { shown: out.join(' '), masked };
+}
+
+// A free-text value through the allowlist, cut to SCRUB_MAX_CHARS before it is read.
+// When anything was masked or cut, a salted hash of the whole original text is
+// appended, so two machines still compare exactly on what is not shown.
+function scrub(text, hash = defaultHash, rel) {
+  const full = String(text == null ? '' : text);
+  const tokens = full.slice(0, SCRUB_MAX_CHARS).split(/\s+/).filter(Boolean);
+  const { shown, masked } = allowlist(tokens, { rel, hash });
+  const cut = shown.length > SHOWN_MAX_CHARS || full.length > SCRUB_MAX_CHARS;
+  const visible = shown.length > SHOWN_MAX_CHARS ? `${shown.slice(0, SHOWN_MAX_CHARS)}…` : shown;
+  return masked || cut ? `${visible} sha=${hash(full)}`.trim() : visible;
+}
+
+// A command line through the same allowlist, the executable first; its salted hash
+// is always appended. An array is taken as the words already split (an element with
+// whitespace in it is not a plain word and is masked).
+function safeCommand(input, rel = (value) => value, hash = defaultHash) {
+  const full = Array.isArray(input) ? JSON.stringify(input) : String(input == null ? '' : input);
+  const tokens = Array.isArray(input) ? input.map((value) => String(value)) : full.slice(0, SCRUB_MAX_CHARS).split(/\s+/).filter(Boolean);
+  if (!tokens.length) return '';
+  const { shown } = allowlist(tokens, { rel, hash, executableFirst: true });
+  const visible = shown.length > SHOWN_MAX_CHARS ? `${shown.slice(0, SHOWN_MAX_CHARS)}…` : shown;
+  return `${visible} sha=${hash(full)}`;
 }
 
 // ---- bounded work ----------------------------------------------------------
@@ -408,7 +330,7 @@ function createContext(options) {
     home,
     options,
     hash,
-    scrub: (text) => scrub(text, hash),
+    scrub: (text) => scrub(text, hash, (word) => ctx.rel(word)),
     safeUrl: (value) => safeUrl(value, hash),
     fsp: options.fsp || fsp,
     done: false,
@@ -720,10 +642,10 @@ async function envSection(ctx) {
   for (const name of ENV_VARS) {
     if (name === 'PATH') continue;
     const value = shell.env[name];
-    emit('env', name, value ? (SECRET_NAME.test(name) ? 'set' : ctx.rel(ctx.scrub(value))) : '(unset)');
+    emit('env', name, value ? (SECRET_NAME.test(name) ? 'set' : ctx.scrub(value)) : '(unset)');
   }
   const dirs = String(shell.env.PATH || '').split(':').filter(Boolean);
-  emit('env', 'PATH-entries', dirs.map((dir) => ctx.rel(ctx.scrub(dir))).join(' '));
+  emit('env', 'PATH-entries', ctx.scrub(dirs.map((dir) => ctx.rel(dir)).join(' ')));
 }
 
 async function toolSection(ctx) {
@@ -739,7 +661,7 @@ async function toolSection(ctx) {
     if (where && VERSION_ARGS[name]) {
       versions.push(run(ctx, where, VERSION_ARGS[name]).then((result) => {
         const line = firstLine(result.stdout) || firstLine(result.stderr);
-        emit('tool-version', name, line ? ctx.scrub(line).slice(0, 100) : `ERR ${result.error || 'no output'}`);
+        emit('tool-version', name, line ? ctx.scrub(line) : `ERR ${result.error || 'no output'}`);
       }));
     }
   });
@@ -772,15 +694,19 @@ function describeMcp(server, rel, hash = defaultHash) {
   return `${type} ${line}${env.length ? ` env=[${env.join(',')}]` : ''}`.slice(0, 300);
 }
 
-// An object or array by its key names and hash, a scalar by its scrubbed value; a
-// secret-named key is `set`.
+// An object or array: its key names (or its length) and a salted hash of the whole.
+// Its JSON is never scrubbed or shown, so no scalar inside it ever is.
+function describeObject(value, hash = defaultHash) {
+  const keys = Array.isArray(value) ? `${value.length} items` : `keys=[${Object.keys(value).sort().map(shortWord).join(',')}]`;
+  return `${keys} sha=${hash(JSON.stringify(value))}`;
+}
+
+// A secret-named key is `set`; an object or array goes through describeObject; a
+// scalar is free text through the allowlist.
 function describeValue(key, value, hash = defaultHash) {
   if (SECRET_NAME.test(key)) return 'set';
-  if (value && typeof value === 'object') {
-    const keys = Array.isArray(value) ? `${value.length} items` : `keys=[${Object.keys(value).sort().map(shortWord).join(',')}]`;
-    return `${keys} sha=${hash(JSON.stringify(value))}`;
-  }
-  return scrub(JSON.stringify(value), hash).slice(0, 120);
+  if (value && typeof value === 'object') return describeObject(value, hash);
+  return scrub(String(value), hash);
 }
 
 // The settings keys whose values are shown (scrubbed) as they are; every other key
@@ -810,12 +736,12 @@ function emitSettings(ctx, section, file, settings) {
       }
     } else if (key === 'env' && value && typeof value === 'object') {
       for (const [name, entry] of Object.entries(value)) {
-        emit(section, `${file}:env:${name}`, SECRET_NAME.test(name) ? 'set' : ctx.rel(ctx.scrub(entry)).slice(0, 120));
+        emit(section, `${file}:env:${name}`, SECRET_NAME.test(name) ? 'set' : ctx.scrub(entry));
       }
     } else if (key === 'statusLine' && value && typeof value === 'object') {
       emit(section, `${file}:${key}`, `${shortWord(value.type || '?')}:${safeCommand(value.command || '', relWord, ctx.hash)}`);
     } else if (SHOWN_SETTINGS.has(key)) {
-      emit(section, `${file}:${key}`, ctx.rel(ctx.scrub(JSON.stringify(value))).slice(0, 240));
+      emit(section, `${file}:${key}`, value && typeof value === 'object' ? describeObject(value, ctx.hash) : ctx.scrub(String(value)));
     } else {
       emit(section, `${file}:${key}`, describeValue(key, value, ctx.hash));
     }
@@ -902,6 +828,7 @@ function tomlPath(name) {
 // when they read as names (see readsAsName); any other name is a hash marker. A light
 // line reader, not a full TOML parser: lines inside a multi-line string ("""/''')
 // are hashed with their table and never read as headers or keys.
+const MULTI_LINE = '(multi-line)';
 function codexConfigRows(toml, hash = defaultHash) {
   const name = (text, extra) => (readsAsName(text, { extra }) ? text : `*${hash(text).slice(0, 8)}`);
   const topKeys = {};
@@ -950,7 +877,7 @@ function codexConfigRows(toml, hash = defaultHash) {
       if (count(raw, delimiter) % 2 === 1) { inString = delimiter; break; }
     }
     if (!current) {
-      if (pair) topKeys[pair[1].replace(/^["']|["']$/g, '')] = inString ? '(multi-line)' : pair[2];
+      if (pair) topKeys[pair[1].replace(/^["']|["']$/g, '')] = inString ? MULTI_LINE : pair[2];
       continue;
     }
     current.table.lines.push(raw.trim());
@@ -958,7 +885,10 @@ function codexConfigRows(toml, hash = defaultHash) {
   }
   const rows = [];
   for (const [key, value] of Object.entries(topKeys)) {
-    rows.push([`config:${name(key)}`, SECRET_NAME.test(key) ? 'set' : scrub(value, hash).slice(0, 120)]);
+    // A plain one-line string is read as its contents; anything else (an array, an
+    // inline table, a string with escapes) is free text as written.
+    const quoted = /^"([^"\\]*)"$/.exec(value) || /^'([^']*)'$/.exec(value);
+    rows.push([`config:${name(key)}`, SECRET_NAME.test(key) ? 'set' : value === MULTI_LINE ? value : scrub(quoted ? quoted[1] : value, hash)]);
   }
   for (const [tableName, table] of tables) {
     rows.push([`table:${tableName}`, `keys=[${[...table.keys].sort().join(',')}] sha=${hash(table.lines.join('\n'))}`]);
@@ -1006,9 +936,9 @@ async function homeFilesSection(ctx) {
   const gitconfig = (await readText(ctx, path.join(home, '.gitconfig'), JSON_MAX_BYTES)) || '';
   for (const key of ['name', 'email', 'helper', 'defaultBranch', 'editor', 'signingkey', 'gpgsign', 'rebase', 'autoSetupRemote']) {
     const match = new RegExp(`^\\s*${key}\\s*=\\s*(.+)$`, 'mi').exec(gitconfig);
-    emit('gitconfig', key, !match ? '(unset)' : SECRET_NAME.test(key) ? 'set' : ctx.rel(ctx.scrub(match[1].trim())));
+    emit('gitconfig', key, !match ? '(unset)' : SECRET_NAME.test(key) ? 'set' : ctx.scrub(match[1].trim()));
   }
-  const includes = [...gitconfig.matchAll(/^\s*path\s*=\s*(.+)$/gm)].map((match) => ctx.rel(ctx.scrub(match[1].trim())));
+  const includes = [...gitconfig.matchAll(/^\s*path\s*=\s*(.+)$/gm)].map((match) => ctx.scrub(match[1].trim()));
   emit('gitconfig', 'includes', includes.join(',') || '(none)');
   const ssh = await listDir(ctx, path.join(home, '.ssh'));
   emit('ssh', 'files', ssh && !ssh.unread ? ssh.map((entry) => entry.name).filter((name) => !/known_hosts/.test(name)).join(',') || '(empty)' : names(ssh));
@@ -1118,14 +1048,14 @@ async function keepSection(ctx) {
 async function loginSection(ctx) {
   if (ctx.options.logins === false) return;
   const { emit } = ctx;
-  const line = (result, max = 100) => (result.ok ? ctx.scrub(firstLine(result.stdout) || firstLine(result.stderr)).slice(0, max)
-    : `ERR ${ctx.scrub(firstLine(result.stderr) || firstLine(result.stdout) || result.error).slice(0, max)}`);
+  const line = (result) => (result.ok ? ctx.scrub(firstLine(result.stdout) || firstLine(result.stderr))
+    : `ERR ${ctx.scrub(firstLine(result.stderr) || firstLine(result.stdout) || result.error)}`);
   const tool = (name) => (ctx.env ? resolveTool(ctx, String(ctx.env.PATH || '').split(':'), name) : Promise.resolve(null));
   const checks = {
     gh: async (bin) => {
       const result = await run(ctx, bin, ['auth', 'status', '-h', 'github.com'], { timeout: 15e3 });
       const text = `${result.stdout}\n${result.stderr}`;
-      return ctx.scrub(text.split('\n').filter((row) => /logged in|not logged/i.test(row)).map((row) => row.trim()).join(' ')).slice(0, 140) || line(result);
+      return ctx.scrub(text.split('\n').filter((row) => /logged in|not logged/i.test(row)).map((row) => row.trim()).join(' ')) || line(result);
     },
     aws: async (bin) => line(await run(ctx, bin, ['sts', 'get-caller-identity', '--query', 'Arn', '--output', 'text'], { timeout: 20e3 }), 140),
     heroku: async (bin) => line(await run(ctx, bin, ['whoami'], { timeout: 20e3 })),
@@ -1148,7 +1078,7 @@ async function androidSection(ctx) {
   const env = ctx.env || {};
   const sdk = env.ANDROID_HOME || env.ANDROID_SDK_ROOT
     || (os.platform() === 'darwin' ? path.join(home, 'Library/Android/sdk') : path.join(home, 'Android/Sdk'));
-  emit('android', 'sdk-root', `${ctx.rel(ctx.scrub(sdk))} ${await presence(ctx, sdk)}`);
+  emit('android', 'sdk-root', `${ctx.scrub(sdk)} ${await presence(ctx, sdk)}`);
   await Promise.all(['platform-tools', 'build-tools', 'platforms', 'cmdline-tools', 'emulator', 'ndk', 'system-images'].map(async (sub) => {
     const entries = await listDir(ctx, path.join(sdk, sub));
     emit('android', sub, entries && !entries.unread && (sub === 'platform-tools' || sub === 'emulator') ? 'present' : names(entries));
@@ -1296,7 +1226,7 @@ function startInventory(options = {}) {
   const section = (name, fn) => {
     pending.add(name);
     return Promise.resolve().then(fn).catch((error) => {
-      ctx.emit('inventory', `error:${name}`, ctx.scrub(error && error.message || error).slice(0, 160));
+      ctx.emit('inventory', `error:${name}`, ctx.scrub(error && error.message || error));
     }).finally(() => { pending.delete(name); });
   };
   const result = (async () => {
@@ -1504,8 +1434,8 @@ module.exports = {
   scrub,
   safeUrl,
   safeCommand,
-  tokenize,
   describeMcp,
+  describeValue,
   codexConfigRows,
   toLines,
   fromLines,

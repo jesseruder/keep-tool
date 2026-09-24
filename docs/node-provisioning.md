@@ -59,22 +59,29 @@ credential:
 - Credential files (`.credentials.json`, `auth.json`, `.netrc`, `~/.aws/credentials`)
   are reported as present or absent. Other files (dotfiles, `~/bin` scripts, skills,
   `CLAUDE.md`, `config.toml`) are reported by a short content hash, never their content.
-- Command lines (hooks, MCP servers, the status line) go through an allowlist. Only
-  the executable, bare flags, shell operators and words or paths made of plain name
-  characters are shown. A `NAME=value` word shows as `NAME=***`, or `***` when the name
-  says secret. The word after a credential flag (`-u`, `-p`, `-H`, `--pass`, `--token`
-  and the like) is `***`, and every other word is `***` too. The line ends with a hash
-  of the whole line, so two machines still compare exactly.
+- Free text follows one rule: it shows only allowlisted tokens, and everything else
+  is masked; a salted hash compares the rest. Free text here means settings and
+  environment values, config values, git settings, tool, version and login lines,
+  error messages, hook commands, MCP arguments and status lines. The text is split on
+  whitespace, and a token is shown only when it is:
+  - a plain word, path or version,
+  - a bare flag,
+  - a shell operator,
+  - an http(s) URL, with the URL rules below applied,
+  - or `NAME=value`, which is shown as `NAME=***`.
+
+  Any other token is `***`. That includes tokens with a colon or an `@`, the word
+  after a credential flag (`-u`, `-p`, `-H`, `--pass`, `--token` and the like), and
+  every token from the first quote, backtick, backslash or parenthesis onwards.
+  Nothing is parsed, so quoting cannot hide a secret from the rule. As a result, login
+  identities such as email addresses and ARNs are compared by hash, not shown.
 - URLs keep their scheme, host and plain path segments. User info, query values and
   `;` parameters are dropped, and long or random-looking segments become `*<hash>`
   markers.
-- Names (skills, servers, settings keys, config tables and their keys) are shown.
-  Values of settings, environment variables and top-level config keys are scrubbed:
-  a secret-named value is `set`, and header values, credential flags, token shapes and
-  embedded URLs are masked. Objects and config tables are reported by their key names
-  and a hash, never their values.
-- Logins are reported by the identity each CLI prints, such as an account name or an
-  ARN.
+- Names (skills, servers, settings keys, config tables and their keys) are shown when
+  they read as names. A value whose name says secret is reported as `set`. JSON
+  objects and arrays are reported by their key names (or length) and a hash; no value
+  inside them is ever shown.
 - Every hash is keyed with a random salt that the audit makes and hands to both
   sides. Hashes therefore compare within one audit and mean nothing across audits,
   so a short masked word cannot be recovered by hashing a password list.
