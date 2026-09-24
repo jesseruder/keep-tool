@@ -291,10 +291,13 @@ async function nodeAudit(argv, deps = {}) {
     const sections = inventory.compareInventories(ours, theirs);
     // The cut-short sections of each side, or null.
     const partial = { daemon: inventory.partialOf(ours), node: inventory.partialOf(theirs) };
+    // An earlier collection on the node that never finished (a hung mount, most likely).
+    const stuck = typeof answer.stuck === 'string' && answer.stuck ? answer.stuck : null;
     if (o.json) {
-      console.log(JSON.stringify({ daemonNode: daemon, node: name, partial, sections }));
+      console.log(JSON.stringify({ daemonNode: daemon, node: name, partial, stuck, sections }));
       return;
     }
+    if (stuck) console.log(`warning: node ${name} reports an earlier ${stuck}; its host may be short of filesystem threads until it returns`);
     console.log(inventory.renderComparison(sections, {
       nameA: daemon, nameB: name, all: o.all === true, partial: { a: partial.daemon, b: partial.node },
     }));

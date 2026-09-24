@@ -9,25 +9,35 @@
 // function, then diffs the two, so a machine joining the fleet is compared against
 // the one it has to match in one command instead of one session at a time.
 //
-// Secrets are never read into the answer. A file that holds credentials is reported
-// by presence only; a file that may hold one among other content (a dotfile, a
-// script in ~/bin) by a short content hash. A command line (a hook, an MCP server)
-// shows its executable, paths and short plain words, masks every other token and
-// carries a hash of the whole line, so two machines still compare exactly. URLs
-// lose their user info and query values, and long or opaque path segments become
-// hash markers. Environment values whose name says secret are reported as `set`,
-// and any other text that travels passes through scrub() first.
+// What leaves the machine, and nothing else:
+// - Files are reported by presence, kind and a short content hash. Credential files
+//   (.credentials.json, auth.json, .netrc, ~/.aws/credentials) by presence only.
+// - A command line (a hook, an MCP server, the status line) is shown through an
+//   allowlist: the executable, paths and words made only of [A-Za-z0-9_./~-] with
+//   no `=`, bare flags, shell operators and URLs through safeUrl. A `NAME=value`
+//   word shows as `NAME=***` (or `***` when the name says secret), the word after a
+//   credential flag is `***`, and every other word is `***`. The line's hash is
+//   appended, so two machines still compare exactly.
+// - A URL keeps its scheme, host and plain path segments; user info, query values
+//   and matrix parameters are dropped, and long or random-looking segments become
+//   `*<hash>` markers.
+// - Names (skills, MCP servers, settings keys, env keys, tables) are shown. Values
+//   of settings, environment variables and config keys pass through scrub(), which
+//   masks secret-named pairs, header values, credential flags, known token shapes
+//   and opaque runs; a value whose name says secret is reported as `set`; a table
+//   or object is reported by its key names and hash, never its values.
+// Logins are reported by the identity each CLI prints (an account name, an ARN).
 //
-// Every read is bounded and nothing throws: a subprocess has a timeout and is killed
-// with its process group, filesystem calls go through a small limiter so a hung
-// mount cannot take every libuv thread, and the whole collection has a deadline past
-// which it answers with what it has, names the sections it cut short, starts nothing
-// new and kills what is still running. `startInventory().idle` settles once nothing
-// it started is still running, which is when a host may start another. Nothing
-// beyond node builtins is loaded at require time: a node agent may hold no Keep
-// registry.
+// Every read is bounded and nothing throws: a subprocess runs in its own process
+// group with its output buffered and capped, and is killed with that group on
+// timeout or at the deadline while it is still unreaped; filesystem calls go
+// through a small limiter so a hung mount cannot take every libuv thread; and the
+// whole collection has a deadline past which it answers with what it has, names the
+// report sections it cut short and starts nothing new. `startInventory().idle`
+// settles once nothing it started is still running. Nothing beyond node builtins
+// is loaded at require time: a node agent may hold no Keep registry.
 
-const { execFile } = require('node:child_process');
+const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -38,6 +48,10 @@ const INVENTORY_VERSION = 1;
 const DEADLINE_MS = 50e3;
 const SUBPROCESS_TIMEOUT_MS = 10e3;
 const SUBPROCESS_CONCURRENCY = 6;
+const MAX_OUTPUT_BYTES = 4 << 20;
+// After a process exits, how long its pipes may stay open (held by something it
+// left behind) before its output is taken as complete.
+const EXIT_GRACE_MS = 250;
 // libuv runs filesystem calls on four threads by default; the collection keeps to
 // fewer, so a hung mount can hold these and still leave the host a thread.
 const FS_CONCURRENCY = 3;
@@ -81,9 +95,14 @@ const MISC_PRESENCE = [
 ];
 // Home's own children that are never project roots and are large to walk.
 const SKIP_HOME_CHILDREN = new Set(['Library', 'Applications', 'Pictures', 'Music', 'Movies', 'Downloads', 'node_modules', 'snap']);
-const SECRET_NAME = /token|secret|passw|pwd|api[_-]?key|apikey|credential|auth|cookie|private|session[_-]?key|header|dsn|webhook|(?:^|[_-])pat(?:$|[_-])|^key$|[_-]key$/i;
-// Flags whose next argument is a value to hide.
-const SECRET_FLAG = /^-(?:u|p|H)$|^--(?:user|header|[A-Za-z0-9_-]*(?:token|secret|passw|pwd|api[_-]?key|apikey|credential|auth|cookie|private|dsn|webhook)[A-Za-z0-9_-]*|key|pat)$/i;
+// A name (an env variable, a JSON or TOML key, a flag) that says its value is secret.
+const SECRET_NAME = /token|secret|pass|pwd|(?:^|[_-])pw(?:$|[_-])|key|credential|auth|cookie|private|session|header|dsn|webhook|(?:^|[_-])pat(?:$|[_-])/i;
+// Report sections each collection group writes, for naming what a deadline cut short.
+const GROUP_SECTIONS = {
+  env: ['env'], system: ['system'], pi: ['pi'], keep: ['keep'], repos: ['repo'], logins: ['login'], android: ['android'],
+  tools: ['tool', 'tool-path', 'tool-version'],
+  'home-files': ['agents-shared', 'bin', 'dotfile', 'gitconfig', 'misc', 'ssh'],
+};
 
 // ---- text safety ------------------------------------------------------------
 
@@ -100,21 +119,47 @@ function opaquePiece(piece) {
 function opaque(token) {
   return String(token).split(/[/.-]+/).some(opaquePiece);
 }
+function caseFlips(text) {
+  let flips = 0;
+  for (let index = 1; index < text.length; index += 1) {
+    const a = text[index - 1];
+    const b = text[index];
+    if ((/[a-z]/.test(a) && /[A-Z]/.test(b)) || (/[A-Z]/.test(a) && /[a-z]/.test(b))) flips += 1;
+  }
+  return flips;
+}
+// Letters and digits run together with no separator: a password shape, never a word.
+const mixedAlnum = (word) => /^[A-Za-z0-9]+$/.test(word) && /\d/.test(word) && /[A-Za-z]/.test(word) && !/^v?\d+$/.test(word);
 
-// Credential-shaped substrings out of free text: URL user info and query values,
-// header-shaped `Name: value` pairs, `name=value` pairs whose name says secret, the
-// values of -u/-p/--user/--password style flags, well-known token prefixes, bearer
-// values and opaque runs.
+// A flag whose value is a credential. Single letters are case-sensitive, so -h, -P
+// and -U (psql's host, port and user name) are ordinary flags; -u, -p and -H are not.
+function credentialFlag(flag) {
+  const text = String(flag || '');
+  if (/^-[A-Za-z]$/.test(text)) return /^-[upH]$/.test(text);
+  if (!/^--?[A-Za-z][A-Za-z0-9_-]+$/.test(text)) return false;
+  return /^--?(?:user|pw|pass|header)$/i.test(text) || SECRET_NAME.test(text.replace(/^-+/, ''));
+}
+
+function embeddedUrl(url) {
+  try { new URL(url); } catch { return '***'; }
+  return safeUrl(url);
+}
+
+// Credential-shaped substrings out of free text: embedded URLs (through safeUrl),
+// header-shaped `Name: value` pairs, any `name=value` or `"name": value` pair whose
+// name says secret, the values of credential flags and of attached -p, well-known
+// token prefixes, bearer values and opaque runs.
 function scrub(text) {
   return String(text == null ? '' : text)
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`]+/gi, embeddedUrl)
     .replace(/(\/\/)[^/\s@]+@/g, '$1***@')
-    .replace(/([?&][^=&\s#]+=)[^&\s#"']+/g, '$1***')
     .replace(/\b(Authorization|Proxy-Authorization|Cookie|Set-Cookie|[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+)(:[ \t]*)[^"'\n]+/g, '$1$2***')
     .replace(/\b(bearer|basic)\s+[^\s"']+/gi, '$1 ***')
-    .replace(/((?:token|secret|passw(?:or)?d?|pwd|api[_-]?key|apikey|auth|credential|dsn|webhook)[A-Za-z0-9_-]*["']?\s*[=:]\s*["']?)[^\s"',;&]+/gi, '$1***')
-    .replace(/((?:^|\s)--?(?:token|secret|password|passwd|api[_-]?key|apikey|auth[A-Za-z-]*|key|user|header|pat)(?:\s+|=)["']?)[^\s"']+/gi, '$1***')
-    .replace(/((?:^|\s)-u\s*["']?)[^\s"']+/g, '$1***')
-    .replace(/((?:^|\s)-p)[^\s"']+/g, '$1***')
+    .replace(/(["']?)([A-Za-z_][A-Za-z0-9_.-]*)(["']?)(\s*[=:]\s*)(["']?)([^"'\s,;&}\]]+)/g,
+      (match, q1, name, q2, sep, q3) => (SECRET_NAME.test(name) ? `${q1}${name}${q2}${sep}${q3}***` : match))
+    .replace(/((?:^|\s)(--?[A-Za-z][A-Za-z0-9_-]*)(?:\s+|=)["']?)([^\s"']+)/g,
+      (match, lead, flag) => (credentialFlag(flag) ? `${lead}***` : match))
+    .replace(/((?:^|\s)-[pu])([^\s"']+)/g, '$1***')
     .replace(/\b(?:sk|pk|rk|ghp|gho|ghs|ghu|ghr|github_pat|xox[abprs]|glpat|npm|ASIA|hf|sntrys|sntryu)[-_][A-Za-z0-9_-]{8,}/g, '***')
     .replace(/\bAKIA[A-Z0-9]{12,}\b/g, '***')
     .replace(/[A-Za-z0-9_+=/.-]{16,}/g, (run) => (opaque(run) ? '***' : run));
@@ -122,15 +167,19 @@ function scrub(text) {
 
 // A URL path segment that may be a credential (a webhook's secret, a token-bearing
 // MCP endpoint) becomes a short hash marker, so the same URL on two machines still
-// compares equal and neither prints it.
+// compares equal and neither prints it. Matrix parameters (`;name=value`) are dropped.
 function maskSegment(segment) {
   if (!segment) return segment;
-  let decoded = segment;
-  try { decoded = decodeURIComponent(segment); } catch {}
+  const [head, ...params] = segment.split(';');
+  let decoded = head;
+  try { decoded = decodeURIComponent(head); } catch {}
+  const pieces = decoded.split(/[-_.]+/);
   const risky = opaque(decoded)
-    || (decoded.length >= 16 && decoded.split(/[-_.]+/).some((piece) => piece.length >= 16))
-    || /^(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{8,}$/.test(decoded);
-  return risky ? `*${sha(segment).slice(0, 8)}` : segment;
+    || !/^[A-Za-z0-9_.~-]+$/.test(decoded)
+    || pieces.some((piece) => piece.length >= 16)
+    || /^(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{8,}$/.test(decoded)
+    || pieces.some((piece) => piece.length >= 8 && caseFlips(piece) >= Math.max(4, piece.length / 3));
+  return `${risky ? `*${sha(head).slice(0, 8)}` : head}${params.length ? ';***' : ''}`;
 }
 
 function safeUrl(value) {
@@ -139,55 +188,86 @@ function safeUrl(value) {
     const url = new URL(text);
     if (!url.host) throw new Error('no host');
     const pathname = url.pathname.split('/').map(maskSegment).join('/');
-    const query = url.search ? `?${[...url.searchParams.keys()].sort().map((key) => `${key}=***`).join('&')}` : '';
+    const query = url.search ? `?${[...url.searchParams.keys()].sort().map((key) => `${maskSegment(key)}=***`).join('&')}` : '';
     return `${url.protocol}//${url.host}${pathname}${query}`;
   } catch {}
   // scp-style git remotes: [user@]host:path.
-  const scp = /^(?:([^\s@/:]+)@)?([^\s:/]+):([^\s]+)$/.exec(text);
+  const scp = /^(?:([^\s@/:]+)@)?([A-Za-z0-9.-]+):([^\s]+)$/.exec(text);
   if (scp) return `${scp[1] ? `${scp[1] === 'git' ? 'git' : '***'}@` : ''}${scp[2]}:${scp[3].split('/').map(maskSegment).join('/')}`;
-  return scrub(text);
+  // A local path (a remote that is another checkout on this disk).
+  if (/^[/~]/.test(text) && PLAIN_WORD.test(text)) return text.split('/').map(maskSegment).join('/');
+  return '***';
 }
 
-const PLAIN_TOKEN = /^[A-Za-z0-9_./~=-]{1,24}$/;
 const SHELL_OPERATOR = /^(?:&&|\|\||\||;|&|>|>>|<|2>&1|2>\/dev\/null)$/;
+const PLAIN_WORD = /^[A-Za-z0-9_./~-]+$/;
+const BARE_FLAG = /^--?[A-Za-z][A-Za-z0-9-]*$/;
 
-// A command line for display: the executable, paths whose every segment is a plain
-// word, short plain words, and shell operators are shown; every other token, and the
-// value after a flag that names a credential, is `***`; the whole line's hash is
-// appended so two machines compare exactly.
+// Shell-style words: a quoted span is one word, quotes removed.
+function tokenize(text) {
+  const out = [];
+  let current = '';
+  let quote = null;
+  let started = false;
+  for (const ch of String(text == null ? '' : text)) {
+    if (quote) {
+      if (ch === quote) quote = null;
+      else current += ch;
+      continue;
+    }
+    if (ch === '"' || ch === '\'') { quote = ch; started = true; continue; }
+    if (/\s/.test(ch)) {
+      if (started) out.push(current);
+      current = '';
+      started = false;
+      continue;
+    }
+    current += ch;
+    started = true;
+  }
+  if (started) out.push(current);
+  return out;
+}
+
+// A command line for display, through an allowlist: see the top of this file. Only
+// words that are provably harmless are shown; everything else is `***`.
 function safeCommand(input, rel = (value) => value) {
-  const tokens = (Array.isArray(input) ? input.map((value) => String(value)) : String(input == null ? '' : input).split(/\s+/))
-    .filter((token) => token !== '');
-  if (!tokens.length) return '';
+  const words = Array.isArray(input) ? input.map((value) => String(value)) : tokenize(input);
+  if (!words.length) return '';
   const full = Array.isArray(input) ? JSON.stringify(input) : String(input);
-  const unquote = (token) => token.replace(/^["']+|["';]+$/g, '');
-  const plainWord = (word) => PLAIN_TOKEN.test(word) && !opaque(word)
-    && !(/^[A-Za-z0-9]+$/.test(word) && /\d/.test(word) && /[A-Za-z]/.test(word) && !/^v?\d+$/.test(word));
-  const plainPath = (word) => /^(?:~|\.{1,2})?\//.test(word) && word.length <= 160
-    && word.split('/').filter(Boolean).every((segment) => plainWord(segment));
-  const show = (raw) => {
-    const word = rel(unquote(raw));
-    if (SHELL_OPERATOR.test(word)) return word;
-    if (/^-[pu].+/.test(word) && !/^--/.test(word)) return `${word.slice(0, 2)}***`;
-    return plainWord(word) || plainPath(word) ? word : '***';
+  // A word from the allowed alphabet whose every piece (between / - _ .) reads as a
+  // written word: short, not random-looking, and, past the executable, no letters and
+  // digits run together (a password's shape, and base64's).
+  const plain = (word, executable) => {
+    const shown = rel(word);
+    if (!PLAIN_WORD.test(shown) || shown.length > 160) return null;
+    const segments = shown.split('/').filter(Boolean);
+    const ok = segments.every((segment) => segment.length <= 40 && !opaque(segment)
+      && segment.split(/[-_.]+/).every((piece) => piece.length <= 24
+        && caseFlips(piece) < Math.max(3, piece.length / 3)
+        && (executable || !mixedAlnum(piece))));
+    return ok ? shown : null;
   };
   const out = [];
   let hideNext = false;
-  tokens.forEach((raw, index) => {
+  words.forEach((word, index) => {
     if (hideNext) { out.push('***'); hideNext = false; return; }
-    const word = unquote(raw);
-    if (index === 0) { out.push(plainPath(rel(word)) || plainWord(word) ? rel(word) : '***'); return; }
-    const flag = /^(--?[A-Za-z0-9_-]+)(=(.*))?$/.exec(word);
-    if (flag && flag[2] !== undefined) {
-      out.push(`${flag[1]}=${SECRET_FLAG.test(flag[1]) || SECRET_NAME.test(flag[1]) ? '***' : show(flag[3])}`);
+    if (SHELL_OPERATOR.test(word)) { out.push(word); return; }
+    if (word.includes('=')) {
+      const name = word.slice(0, word.indexOf('='));
+      const bare = name.replace(/^-+/, '');
+      const nameOk = /^-{0,2}[A-Za-z_][A-Za-z0-9_.-]*$/.test(name) && !SECRET_NAME.test(bare) && !credentialFlag(name);
+      out.push(nameOk ? `${name}=***` : '***');
       return;
     }
-    if (flag && (SECRET_FLAG.test(flag[1]) || (flag[1].startsWith('--') && SECRET_NAME.test(flag[1])))) {
-      out.push(flag[1]);
-      hideNext = true;
+    if (/^-[pu]./.test(word)) { out.push(`${word.slice(0, 2)}***`); return; }
+    if (BARE_FLAG.test(word)) {
+      out.push(word);
+      if (credentialFlag(word)) hideNext = true;
       return;
     }
-    out.push(show(raw));
+    if (/^https?:\/\//i.test(word)) { out.push(embeddedUrl(word)); return; }
+    out.push(plain(word, index === 0) || '***');
   });
   return `${out.join(' ')} sha=${sha(full)}`;
 }
@@ -201,6 +281,7 @@ function createContext(options) {
   const ctx = {
     home,
     options,
+    fsp: options.fsp || fsp,
     done: false,
     entries,
     env: null,
@@ -241,12 +322,16 @@ function createContext(options) {
 
 const SKIPPED = Object.freeze({ ok: false, stdout: '', stderr: '', error: 'deadline' });
 
-// execFile with stdin closed, its own process group killed on timeout or at the
-// deadline, a concurrency cap and no throw. Resolves { ok, stdout, stderr, error };
-// once the deadline has passed it resolves at once without starting anything.
+// A subprocess in its own process group, stdin closed, output buffered up to
+// MAX_OUTPUT_BYTES. On timeout, at the deadline or past the output cap, the group
+// is killed, but only while the child is unreaped: after it exits its pid may be
+// reused, and a group kill then could reach an unrelated process. A child that
+// exits while something it left behind still holds its pipes is taken as done
+// EXIT_GRACE_MS later, and its pipes are closed on this side. Resolves
+// { ok, stdout, stderr, error }; after the deadline it starts nothing.
 function run(ctx, file, args, opts = {}) {
   if (ctx.done) return Promise.resolve(SKIPPED);
-  const exec = ctx.options.execFile || execFile;
+  const spawnFn = ctx.options.spawn || spawn;
   return new Promise((resolve) => {
     const start = () => {
       if (ctx.done) { resolve(SKIPPED); return; }
@@ -254,28 +339,41 @@ function run(ctx, file, args, opts = {}) {
       ctx.spawned += 1;
       let child = null;
       let timer = null;
+      let graceTimer = null;
       let settled = false;
+      let size = 0;
+      const out = [];
+      const err = [];
+      const unreaped = () => Boolean(child) && child.exitCode === null && child.signalCode === null;
       const kill = () => {
-        try { if (child && child.pid) process.kill(-child.pid, 'SIGKILL'); } catch {}
-        try { if (child && typeof child.kill === 'function') child.kill('SIGKILL'); } catch {}
+        if (!unreaped()) return;
+        if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }
+        try { child.kill('SIGKILL'); } catch {}
       };
       const finish = (value) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearTimeout(graceTimer);
         ctx.children.delete(kill);
+        for (const stream of [child && child.stdout, child && child.stderr]) {
+          try { if (stream) stream.destroy(); } catch {}
+        }
         ctx.active -= 1;
         resolve(value);
         while (!ctx.done && ctx.waiting.length && ctx.active < ctx.limit) ctx.waiting.shift().start();
         ctx.checkIdle();
       };
+      const text = (list) => Buffer.concat(list).toString('utf8');
+      const done = (code, signal) => finish({
+        ok: code === 0, stdout: text(out), stderr: text(err),
+        error: code === 0 ? null : signal ? 'killed' : `exit ${code}`,
+      });
       try {
-        child = exec(file, args, {
-          encoding: 'utf8',
-          maxBuffer: 4 << 20,
+        child = spawnFn(file, args, {
           cwd: opts.cwd || ctx.home,
-          // Its own process group, so a timeout takes whatever it started with it.
           detached: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
           env: {
             ...(opts.baseEnv || process.env),
             ...(!opts.baseEnv && ctx.env && ctx.env.PATH ? { PATH: ctx.env.PATH } : {}),
@@ -286,20 +384,34 @@ function run(ctx, file, args, opts = {}) {
             GIT_OPTIONAL_LOCKS: '0',
             ...(opts.env || {}),
           },
-        }, (error, stdout, stderr) => finish({
-          ok: !error, stdout: String(stdout || ''), stderr: String(stderr || ''),
-          error: error ? (error.killed || error.signal ? 'killed' : String(error.code || error.message || 'failed')) : null,
-        }));
-        try { if (child && child.stdin) child.stdin.end(); } catch {}
+        });
       } catch (error) {
-        finish({ ok: false, stdout: '', stderr: '', error: String(error && error.message || error) });
+        finish({ ok: false, stdout: '', stderr: '', error: String(error && (error.code || error.message) || error) });
         return;
       }
-      if (settled) return;
+      const take = (list) => (chunk) => {
+        if (settled) return;
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+        size += buffer.length;
+        if (size > MAX_OUTPUT_BYTES) {
+          kill();
+          finish({ ok: false, stdout: '', stderr: '', error: 'output too large' });
+          return;
+        }
+        list.push(buffer);
+      };
+      if (child.stdout) child.stdout.on('data', take(out));
+      if (child.stderr) child.stderr.on('data', take(err));
+      for (const stream of [child.stdout, child.stderr]) if (stream) stream.on('error', () => {});
+      child.on('error', (error) => finish({ ok: false, stdout: '', stderr: '', error: String(error && (error.code || error.message) || error) }));
+      child.on('close', (code, signal) => done(code, signal));
+      child.on('exit', (code, signal) => {
+        graceTimer = setTimeout(() => done(code, signal), EXIT_GRACE_MS);
+      });
       ctx.children.add(kill);
       timer = setTimeout(() => {
         kill();
-        finish({ ok: false, stdout: '', stderr: '', error: 'timeout' });
+        finish({ ok: false, stdout: text(out), stderr: text(err), error: 'timeout' });
       }, opts.timeout || ctx.options.subprocessTimeoutMs || SUBPROCESS_TIMEOUT_MS);
     };
     if (ctx.active < ctx.limit) start();
@@ -328,46 +440,73 @@ function fsCall(ctx, fn, fallback) {
 
 const firstLine = (text) => String(text || '').split('\n').map((line) => line.trim()).find(Boolean) || '';
 const byName = (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+// Missing is `absent`; anything else that stops a read (a permission, an I/O error)
+// is `unread`, never absent, so it cannot pass for a real difference.
+const isMissing = (error) => Boolean(error) && (error.code === 'ENOENT' || error.code === 'ENOTDIR');
+const unread = (error) => `unread (${(error && error.code) || 'error'})`;
+const UNREAD_DEADLINE = 'unread (deadline)';
 
-const lstat = (ctx, p) => fsCall(ctx, () => fsp.lstat(p), null);
+const lstat = (ctx, p) => fsCall(ctx, () => ctx.fsp.lstat(p), null);
 const exists = async (ctx, p) => (await lstat(ctx, p)) !== null;
-const listDir = (ctx, p) => fsCall(ctx, async () => (await fsp.readdir(p, { withFileTypes: true })).sort(byName), null);
+// An array of entries; null when missing; an empty array carrying `unread` otherwise.
+const listDir = (ctx, p) => fsCall(ctx, async () => {
+  try { return (await ctx.fsp.readdir(p, { withFileTypes: true })).sort(byName); } catch (error) {
+    return isMissing(error) ? null : Object.assign([], { unread: unread(error) });
+  }
+}, Object.assign([], { unread: UNREAD_DEADLINE }));
 const readText = (ctx, p, max = HASH_MAX_BYTES) => fsCall(ctx, async () => {
-  const stat = await fsp.stat(p);
+  const stat = await ctx.fsp.stat(p);
   if (!stat.isFile() || stat.size > max) return null;
-  return fsp.readFile(p, 'utf8');
+  return ctx.fsp.readFile(p, 'utf8');
 }, null);
-// null when absent; { __tooLarge: bytes } past JSON_MAX_BYTES; { __parseError } when
-// unparseable. A file too large to parse is never reported as missing.
+// null when absent; { __tooLarge: bytes } past JSON_MAX_BYTES; { __unread } when it
+// could not be read; { __parseError } when unparseable.
 async function readJson(ctx, p) {
   const text = await fsCall(ctx, async () => {
-    const stat = await fsp.stat(p);
-    if (!stat.isFile()) return null;
-    if (stat.size > JSON_MAX_BYTES) return { tooLarge: stat.size };
-    return fsp.readFile(p, 'utf8');
-  }, null);
+    try {
+      const stat = await ctx.fsp.stat(p);
+      if (!stat.isFile()) return null;
+      if (stat.size > JSON_MAX_BYTES) return { tooLarge: stat.size };
+      return await ctx.fsp.readFile(p, 'utf8');
+    } catch (error) {
+      return isMissing(error) ? null : { unread: unread(error) };
+    }
+  }, { unread: UNREAD_DEADLINE });
   if (text === null) return null;
-  if (typeof text === 'object') return { __tooLarge: text.tooLarge };
+  if (typeof text === 'object') return text.unread ? { __unread: text.unread } : { __tooLarge: text.tooLarge };
   try { return JSON.parse(text); } catch { return { __parseError: true }; }
 }
-const jsonProblem = (value) => (!value ? 'absent' : value.__tooLarge ? `too large (bytes=${value.__tooLarge})` : value.__parseError ? 'unparseable' : null);
+const jsonProblem = (value) => {
+  if (!value) return 'absent';
+  if (value.__tooLarge) return `too large (bytes=${value.__tooLarge})`;
+  if (value.__unread) return value.__unread;
+  if (value.__parseError) return 'unparseable';
+  return null;
+};
 // A file by content hash and size, never by content.
 const fileSig = (ctx, p) => fsCall(ctx, async () => {
-  const stat = await fsp.stat(p);
-  if (!stat.isFile()) return stat.isDirectory() ? 'dir' : 'other';
-  if (stat.size > HASH_MAX_BYTES) return `bytes=${stat.size}`;
-  const data = await fsp.readFile(p);
-  return `sha=${sha(data)} bytes=${data.length}`;
-}, 'absent');
+  try {
+    const stat = await ctx.fsp.stat(p);
+    if (!stat.isFile()) return stat.isDirectory() ? 'dir' : 'other';
+    if (stat.size > HASH_MAX_BYTES) return `bytes=${stat.size}`;
+    const data = await ctx.fsp.readFile(p);
+    return `sha=${sha(data)} bytes=${data.length}`;
+  } catch (error) {
+    return isMissing(error) ? 'absent' : unread(error);
+  }
+}, UNREAD_DEADLINE);
 const kindOf = (ctx, p) => fsCall(ctx, async () => {
-  const stat = await fsp.lstat(p);
+  let stat;
+  try { stat = await ctx.fsp.lstat(p); } catch (error) { return isMissing(error) ? 'absent' : unread(error); }
   if (stat.isSymbolicLink()) {
-    try { return `link->${ctx.rel(await fsp.readlink(p))}`; } catch { return 'link'; }
+    try { return `link->${ctx.rel(await ctx.fsp.readlink(p))}`; } catch { return 'link'; }
   }
   return stat.isDirectory() ? 'dir' : 'file';
-}, 'absent');
-const presence = async (ctx, p) => ((await exists(ctx, p)) ? 'present' : 'absent');
-const names = (entries) => (entries ? entries.map((entry) => entry.name).join(',') || '(empty)' : 'absent');
+}, UNREAD_DEADLINE);
+const presence = (ctx, p) => fsCall(ctx, async () => {
+  try { await ctx.fsp.lstat(p); return 'present'; } catch (error) { return isMissing(error) ? 'absent' : unread(error); }
+}, UNREAD_DEADLINE);
+const names = (entries) => (!entries ? 'absent' : entries.unread ? entries.unread : entries.map((entry) => entry.name).join(',') || '(empty)');
 
 // ---- the login shell's environment -------------------------------------------
 
@@ -412,9 +551,9 @@ function resolveTool(ctx, dirs, name) {
       if (!dir || !path.isAbsolute(dir)) continue;
       const candidate = path.join(dir, name);
       try {
-        const stat = await fsp.stat(candidate);
+        const stat = await ctx.fsp.stat(candidate);
         if (!stat.isFile()) continue;
-        await fsp.access(candidate, fs.constants.X_OK);
+        await ctx.fsp.access(candidate, fs.constants.X_OK);
         return candidate;
       } catch {}
     }
@@ -433,10 +572,9 @@ async function systemSection(ctx) {
   let zone = '';
   try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch {}
   emit('system', 'timezone', zone || '(unknown)');
-  const nvm = await listDir(ctx, path.join(ctx.home, '.nvm/versions/node'));
-  emit('system', 'nvm-versions', nvm ? nvm.map((entry) => entry.name).join(',') : 'absent');
+  emit('system', 'nvm-versions', names(await listDir(ctx, path.join(ctx.home, '.nvm/versions/node'))));
   const nvmDefault = await readText(ctx, path.join(ctx.home, '.nvm/alias/default'), 4096);
-  emit('system', 'nvm-default', nvmDefault === null ? 'absent' : nvmDefault.trim());
+  emit('system', 'nvm-default', nvmDefault === null ? 'absent' : scrub(nvmDefault.trim()));
 }
 
 async function envSection(ctx) {
@@ -451,7 +589,7 @@ async function envSection(ctx) {
     emit('env', name, value ? (SECRET_NAME.test(name) ? 'set' : ctx.rel(scrub(value))) : '(unset)');
   }
   const dirs = String(shell.env.PATH || '').split(':').filter(Boolean);
-  emit('env', 'PATH-entries', dirs.map((dir) => ctx.rel(dir)).join(' '));
+  emit('env', 'PATH-entries', dirs.map((dir) => ctx.rel(scrub(dir))).join(' '));
 }
 
 async function toolSection(ctx) {
@@ -476,7 +614,7 @@ async function toolSection(ctx) {
 
 async function walkSkills(ctx, dir, section, prefix) {
   const entries = await listDir(ctx, dir);
-  if (!entries) { ctx.emit(section, prefix, 'absent'); return; }
+  if (!entries || entries.unread) { ctx.emit(section, prefix, names(entries)); return; }
   await Promise.all(entries.filter((entry) => !entry.name.startsWith('.')).map(async (entry) => {
     const p = path.join(dir, entry.name);
     const kind = await kindOf(ctx, p);
@@ -486,54 +624,66 @@ async function walkSkills(ctx, dir, section, prefix) {
   }));
 }
 
+const shortWord = (value) => (typeof value === 'string' && /^[A-Za-z0-9_-]{1,24}$/.test(value) ? value : '***');
+
 function describeMcp(server, rel) {
   if (!server || typeof server !== 'object') return 'invalid';
-  const type = server.type || (server.url ? 'http' : 'stdio');
+  const type = shortWord(server.type || (server.url ? 'http' : 'stdio'));
   if (server.url) {
-    const headers = server.headers && typeof server.headers === 'object' ? Object.keys(server.headers).sort() : [];
+    const headers = server.headers && typeof server.headers === 'object' ? Object.keys(server.headers).sort().map(shortWord) : [];
     return `${type} ${safeUrl(server.url)}${headers.length ? ` headers=[${headers.join(',')}]` : ''}`.slice(0, 300);
   }
-  const env = server.env && typeof server.env === 'object' ? Object.keys(server.env).sort() : [];
+  const env = server.env && typeof server.env === 'object' ? Object.keys(server.env).sort().map(shortWord) : [];
   const line = safeCommand([server.command || '?', ...(Array.isArray(server.args) ? server.args : [])], rel);
   return `${type} ${line}${env.length ? ` env=[${env.join(',')}]` : ''}`.slice(0, 300);
 }
 
-// The settings keys whose values are shown as they are; any other key is shown by
-// hash and a scrubbed preview, and `env` by name with secret-named values hidden.
-const SHOWN_SETTINGS = new Set(['enabledPlugins', 'statusLine', 'model', 'theme', 'includeCoAuthoredBy', 'alwaysThinkingEnabled',
-  'effortLevel', 'spinnerTipsEnabled', 'language', 'outputStyle', 'extraKnownMarketplaces', 'cleanupPeriodDays']);
+// An object or array by its key names and hash, a scalar by its scrubbed value; a
+// secret-named key is `set`.
+function describeValue(key, value) {
+  if (SECRET_NAME.test(key)) return 'set';
+  if (value && typeof value === 'object') {
+    const keys = Array.isArray(value) ? `${value.length} items` : `keys=[${Object.keys(value).sort().map(shortWord).join(',')}]`;
+    return `${keys} sha=${sha(JSON.stringify(value))}`;
+  }
+  return scrub(JSON.stringify(value)).slice(0, 120);
+}
+
+// The settings keys whose values are shown (scrubbed) as they are; every other key
+// is described by describeValue, `env` by name with secret-named values hidden, and
+// hooks and the status line through safeCommand.
+const SHOWN_SETTINGS = new Set(['enabledPlugins', 'model', 'theme', 'includeCoAuthoredBy', 'alwaysThinkingEnabled',
+  'effortLevel', 'spinnerTipsEnabled', 'language', 'outputStyle', 'cleanupPeriodDays']);
 
 function emitSettings(ctx, section, file, settings) {
   const { emit } = ctx;
   const problem = jsonProblem(settings);
   if (problem) { emit(section, file, problem); return; }
+  const relWord = (word) => ctx.rel(word);
   for (const [key, value] of Object.entries(settings)) {
-    if (key === 'hooks') {
-      for (const [event, list] of Object.entries(value || {})) {
+    if (key === 'hooks' && value && typeof value === 'object') {
+      for (const [event, list] of Object.entries(value)) {
         const commands = [].concat(list || []).flatMap((matcher) => [].concat((matcher && matcher.hooks) || []).map((hook) => {
-          const body = hook && hook.url ? safeUrl(hook.url) : safeCommand(hook && (hook.command || hook.prompt || ''), (word) => ctx.rel(word));
-          return `${(matcher && matcher.matcher) ? `[${scrub(matcher.matcher)}] ` : ''}${hook && hook.type}:${body}`;
+          const body = hook && hook.url ? safeUrl(hook.url) : safeCommand(hook && (hook.command || hook.prompt || ''), relWord);
+          return `${(matcher && matcher.matcher) ? `[${scrub(matcher.matcher)}] ` : ''}${shortWord(hook && hook.type)}:${body}`;
         }));
         emit(section, `${file}:hooks:${event}`, commands.join(' || '));
       }
-    } else if (key === 'permissions') {
-      for (const [name, entry] of Object.entries(value || {})) {
+    } else if (key === 'permissions' && value && typeof value === 'object') {
+      for (const [name, entry] of Object.entries(value)) {
         emit(section, `${file}:permissions:${name}`, Array.isArray(entry)
-          ? `${entry.length} entries sha=${sha(JSON.stringify(entry))}` : scrub(JSON.stringify(entry)).slice(0, 120));
+          ? `${entry.length} entries sha=${sha(JSON.stringify(entry))}` : describeValue(name, entry));
       }
-    } else if (key === 'env') {
-      for (const [name, entry] of Object.entries(value || {})) {
+    } else if (key === 'env' && value && typeof value === 'object') {
+      for (const [name, entry] of Object.entries(value)) {
         emit(section, `${file}:env:${name}`, SECRET_NAME.test(name) ? 'set' : ctx.rel(scrub(entry)).slice(0, 120));
       }
     } else if (key === 'statusLine' && value && typeof value === 'object') {
-      emit(section, `${file}:${key}`, `${value.type || '?'}:${safeCommand(value.command || '', (word) => ctx.rel(word))}`);
-    } else if (SECRET_NAME.test(key)) {
-      emit(section, `${file}:${key}`, 'set');
+      emit(section, `${file}:${key}`, `${shortWord(value.type || '?')}:${safeCommand(value.command || '', relWord)}`);
     } else if (SHOWN_SETTINGS.has(key)) {
       emit(section, `${file}:${key}`, ctx.rel(scrub(JSON.stringify(value))).slice(0, 240));
     } else {
-      const text = JSON.stringify(value) || '';
-      emit(section, `${file}:${key}`, `sha=${sha(text)} ${ctx.rel(scrub(text)).slice(0, 80)}`);
+      emit(section, `${file}:${key}`, describeValue(key, value));
     }
   }
 }
@@ -556,16 +706,16 @@ async function claudeSection(ctx, dir) {
       if (!entry || typeof entry !== 'object') continue;
       for (const [name, server] of Object.entries(entry.mcpServers || {})) emit(S, `mcp:project:${ctx.rel(project)}:${name}`, describeMcp(server, relWord));
       if (Array.isArray(entry.enabledMcpjsonServers) && entry.enabledMcpjsonServers.length) {
-        emit(S, `mcpjson-enabled:${ctx.rel(project)}`, entry.enabledMcpjsonServers.slice().sort().join(','));
+        emit(S, `mcpjson-enabled:${ctx.rel(project)}`, entry.enabledMcpjsonServers.map(shortWord).sort().join(','));
       }
       if (Array.isArray(entry.disabledMcpServers) && entry.disabledMcpServers.length) {
-        emit(S, `mcp-disabled:${ctx.rel(project)}`, entry.disabledMcpServers.slice().sort().join(','));
+        emit(S, `mcp-disabled:${ctx.rel(project)}`, entry.disabledMcpServers.map(shortWord).sort().join(','));
       }
     }
     const account = state.oauthAccount;
-    emit(S, 'login', account ? `${account.emailAddress || '?'} org=${account.organizationName || '?'}` : 'none');
+    emit(S, 'login', account ? `${scrub(account.emailAddress || '?')} org=${scrub(account.organizationName || '?')}` : 'none');
     for (const key of ['theme', 'preferredNotifChannel', 'editorMode', 'autoUpdates']) {
-      emit(S, `claude.json:${key}`, state[key] === undefined ? '(unset)' : scrub(String(state[key])));
+      emit(S, `claude.json:${key}`, state[key] === undefined ? '(unset)' : describeValue(key, state[key]));
     }
     emit(S, 'claude.json:projects-known', Object.keys(state.projects || {}).length);
   }
@@ -586,32 +736,72 @@ async function claudeSection(ctx, dir) {
   emit(S, 'plugins:marketplaces', jsonProblem(markets) || Object.keys(markets).sort().join(',') || '(none)');
   emit(S, 'credentials-file', await presence(ctx, path.join(dir, '.credentials.json')));
   const projects = await listDir(ctx, path.join(dir, 'projects'));
-  if (!projects) { emit(S, 'projects-dir', 'absent'); return; }
+  if (!projects || projects.unread) { emit(S, 'projects-dir', names(projects)); return; }
   await Promise.all(projects.filter((entry) => entry.isDirectory()).map(async (entry) => {
     const memory = path.join(dir, 'projects', entry.name, 'memory');
     const files = await listDir(ctx, memory);
-    if (files) {
+    if (files && files.unread) emit(S, `memory:${entry.name}`, files.unread);
+    else if (files) {
       emit(S, `memory:${entry.name}`, `${files.filter((file) => file.name.endsWith('.md')).length} files MEMORY.md=${await fileSig(ctx, path.join(memory, 'MEMORY.md'))}`);
     }
   }));
 }
 
-// Top-level keys only: the same names inside a [profiles.x] table are that profile's.
-function codexTopLevel(toml) {
-  const out = {};
-  for (const line of String(toml || '').split('\n')) {
-    if (/^\s*\[/.test(line)) break;
-    const match = /^\s*(model|model_reasoning_effort|approval_policy|sandbox_mode|model_provider|profile|web_search)\s*=\s*(.+?)\s*$/.exec(line);
-    if (match) out[match[1]] = match[2];
-  }
-  return out;
-}
-function tomlTables(toml, prefix) {
-  const found = new Set();
-  const re = new RegExp(`^\\s*\\[${prefix}\\.("[^"]+"|[^\\].]+)\\]`, 'gm');
+// ---- Codex config.toml ------------------------------------------------------------
+
+// A dotted TOML table name split into its keys, quotes removed.
+function tomlPath(name) {
+  const parts = [];
+  const re = /\s*("([^"]*)"|'([^']*)'|[^.\s"']+)\s*(?:\.|$)/g;
   let match;
-  while ((match = re.exec(String(toml || '')))) found.add(match[1].replace(/^"|"$/g, ''));
-  return [...found].sort();
+  while ((match = re.exec(name)) && match[0] !== '') {
+    parts.push(match[2] !== undefined ? match[2] : match[3] !== undefined ? match[3] : match[1]);
+    if (re.lastIndex >= name.length) break;
+  }
+  return parts;
+}
+
+// config.toml itemised: every top-level scalar key with its value (scrubbed; `set`
+// when the name says secret), and every top-level table (its dotted subtables
+// included) by its key names and a hash of its lines, never its values. A table
+// present on one side only is then its own row. A light line reader, not a full
+// TOML parser: a multi-line value is hashed with its table but shown only by name.
+function codexConfigRows(toml) {
+  const topKeys = {};
+  const tables = new Map();
+  let current = null;
+  for (const raw of String(toml || '').split('\n')) {
+    const line = raw.replace(/\s+#.*$/, '').trim();
+    if (!line || line.startsWith('#')) continue;
+    const header = /^\[\[?([^\]]+)\]\]?$/.exec(line);
+    if (header) {
+      const parts = tomlPath(header[1]);
+      const top = parts[0] || header[1];
+      if (!tables.has(top)) tables.set(top, { keys: new Set(), lines: [] });
+      current = { table: tables.get(top), depth: parts.length, sub: parts[1] };
+      current.table.lines.push(line);
+      if (current.depth > 1 && current.sub) current.table.keys.add(current.sub);
+      continue;
+    }
+    const pair = /^("[^"]+"|'[^']+'|[A-Za-z0-9_.-]+)\s*=\s*(.*)$/.exec(line);
+    if (!current) {
+      if (pair) topKeys[pair[1].replace(/^["']|["']$/g, '')] = pair[2];
+      continue;
+    }
+    current.table.lines.push(line);
+    if (pair && current.depth === 1) current.table.keys.add(tomlPath(pair[1])[0] || pair[1]);
+  }
+  const rows = [];
+  for (const [key, value] of Object.entries(topKeys)) {
+    rows.push([`config:${key}`, SECRET_NAME.test(key) ? 'set' : scrub(value).slice(0, 120)]);
+  }
+  for (const [name, table] of tables) {
+    // Key names (plugin ids, project paths, server names) are shown when they read as
+    // names; the values under them never are.
+    const keyName = (key) => (/^[A-Za-z0-9_@.\/~:-]{1,120}$/.test(key) && !opaque(key) ? key : '***');
+    rows.push([`table:${name}`, `keys=[${[...table.keys].sort().map(keyName).join(',')}] sha=${sha(table.lines.join('\n'))}`]);
+  }
+  return rows;
 }
 
 async function codexSection(ctx, dir) {
@@ -620,9 +810,7 @@ async function codexSection(ctx, dir) {
   emit(S, 'dir', await kindOf(ctx, dir));
   emit(S, 'config.toml', await fileSig(ctx, path.join(dir, 'config.toml')));
   const toml = (await readText(ctx, path.join(dir, 'config.toml'), JSON_MAX_BYTES)) || '';
-  for (const [key, value] of Object.entries(codexTopLevel(toml))) emit(S, `config:${key}`, scrub(value));
-  emit(S, 'config:mcp_servers', tomlTables(toml, 'mcp_servers').join(',') || '(none)');
-  emit(S, 'config:profiles', tomlTables(toml, 'profiles').join(',') || '(none)');
+  for (const [key, value] of codexConfigRows(toml)) emit(S, key, value);
   emit(S, 'AGENTS.md', await fileSig(ctx, path.join(dir, 'AGENTS.md')));
   for (const name of ['AGENTS.md', 'hooks.json', 'skills', 'agents']) emit(S, `entry:${name}`, await kindOf(ctx, path.join(dir, name)));
   emit(S, 'auth.json', await presence(ctx, path.join(dir, 'auth.json')));
@@ -649,15 +837,15 @@ async function homeFilesSection(ctx) {
   const gitconfig = (await readText(ctx, path.join(home, '.gitconfig'), JSON_MAX_BYTES)) || '';
   for (const key of ['name', 'email', 'helper', 'defaultBranch', 'editor', 'signingkey', 'gpgsign', 'rebase', 'autoSetupRemote']) {
     const match = new RegExp(`^\\s*${key}\\s*=\\s*(.+)$`, 'mi').exec(gitconfig);
-    emit('gitconfig', key, match ? ctx.rel(scrub(match[1].trim())) : '(unset)');
+    emit('gitconfig', key, !match ? '(unset)' : SECRET_NAME.test(key) ? 'set' : ctx.rel(scrub(match[1].trim())));
   }
   const includes = [...gitconfig.matchAll(/^\s*path\s*=\s*(.+)$/gm)].map((match) => ctx.rel(scrub(match[1].trim())));
   emit('gitconfig', 'includes', includes.join(',') || '(none)');
   const ssh = await listDir(ctx, path.join(home, '.ssh'));
-  emit('ssh', 'files', ssh ? ssh.map((entry) => entry.name).filter((name) => !/known_hosts/.test(name)).join(',') || '(empty)' : 'absent');
+  emit('ssh', 'files', ssh && !ssh.unread ? ssh.map((entry) => entry.name).filter((name) => !/known_hosts/.test(name)).join(',') || '(empty)' : names(ssh));
   emit('ssh', 'config', await fileSig(ctx, path.join(home, '.ssh/config')));
   const bin = await listDir(ctx, path.join(home, 'bin'));
-  emit('bin', 'entries', bin ? bin.map((entry) => `${entry.name}${entry.isSymbolicLink() ? '@' : ''}`).join(',') || '(empty)' : 'absent');
+  emit('bin', 'entries', bin && !bin.unread ? bin.map((entry) => `${entry.name}${entry.isSymbolicLink() ? '@' : ''}`).join(',') || '(empty)' : names(bin));
   await Promise.all((bin || []).map(async (entry) => {
     const p = path.join(home, 'bin', entry.name);
     emit('bin', entry.name, `${await kindOf(ctx, p)}${entry.isDirectory() ? '' : ` ${await fileSig(ctx, p)}`}`);
@@ -715,7 +903,7 @@ async function repoSection(ctx) {
   };
   const note = async (p) => {
     if (repos.length >= max) { capped = true; return true; }
-    const real = await fsCall(ctx, () => fsp.realpath(p), p);
+    const real = await fsCall(ctx, () => ctx.fsp.realpath(p), p);
     if (seen.has(real)) return true;
     if (!(await exists(ctx, path.join(p, '.git')))) return false;
     seen.add(real);
@@ -791,10 +979,10 @@ async function androidSection(ctx) {
   const env = ctx.env || {};
   const sdk = env.ANDROID_HOME || env.ANDROID_SDK_ROOT
     || (os.platform() === 'darwin' ? path.join(home, 'Library/Android/sdk') : path.join(home, 'Android/Sdk'));
-  emit('android', 'sdk-root', `${ctx.rel(sdk)} ${await presence(ctx, sdk)}`);
+  emit('android', 'sdk-root', `${ctx.rel(scrub(sdk))} ${await presence(ctx, sdk)}`);
   await Promise.all(['platform-tools', 'build-tools', 'platforms', 'cmdline-tools', 'emulator', 'ndk', 'system-images'].map(async (sub) => {
     const entries = await listDir(ctx, path.join(sdk, sub));
-    emit('android', sub, entries ? (sub === 'platform-tools' || sub === 'emulator' ? 'present' : names(entries)) : 'absent');
+    emit('android', sub, entries && !entries.unread && (sub === 'platform-tools' || sub === 'emulator') ? 'present' : names(entries));
   }));
   emit('android', 'gradle.properties', await fileSig(ctx, path.join(home, '.gradle/gradle.properties')));
 }
@@ -859,13 +1047,14 @@ function defaultAccountDirs(agent, home, env = process.env) {
 
 // Starts a collection. `result` is the sorted { section, key, value } entries,
 // answered by the deadline at the latest; `idle` settles once nothing the collection
-// started is still running. `options`:
+// started is still running; `stats()` counts what it started and what still runs.
+// `options`:
 //   home, claudeDirs, codexDirs, repoRoots, keepDir, codeRoot — where to look;
 //   useAccounts (false: never read the account list; the host's setting);
 //   tools (a list; [] skips the PATH and version reads), logins (false skips them),
 //   shellEnv (an environment to use instead of the login shell's), shell;
 //   deadlineMs, subprocessTimeoutMs, shellTimeoutMs, concurrency, fsConcurrency,
-//   maxRepos, execFile — bounds and test seams.
+//   maxRepos, spawn, fsp — bounds and test seams.
 function startInventory(options = {}) {
   const ctx = createContext(options || {});
   const home = ctx.home;
@@ -909,7 +1098,12 @@ function startInventory(options = {}) {
     });
     try {
       const late = await Promise.race([all.then(() => false), expired]);
-      if (late) ctx.emit('inventory', 'partial', [...pending].sort().join(',') || 'yes');
+      if (late) {
+        // Named as the report's sections, which is what a reader compares.
+        const cut = new Set();
+        for (const name of pending) for (const sectionName of GROUP_SECTIONS[name] || [name]) cut.add(sectionName);
+        ctx.emit('inventory', 'partial', [...cut].sort().join(',') || 'yes');
+      }
     } finally {
       clearTimeout(timer);
       ctx.stop();
@@ -953,13 +1147,23 @@ function noisy(section, key) {
   if (section === 'repo' && key === '(count)') return 'repo count';
   if (section === 'tool-path') return 'tool locations';
   if (/^tool/.test(section) && PLATFORM_TOOLS.has(key)) return 'platform-specific tools';
+  if (section === 'inventory' && key === 'partial') return 'deadline records (see the warning above)';
   return null;
 }
 
+const UNREADABLE = /^(?:too large|unparseable|unread)/;
+// The rows a file's own row stands for: claude.json's MCP, login and state rows, and
+// `<file>:…` for any other (settings.json, settings.local.json).
+function rowsOfFile(file, key) {
+  if (file === 'claude.json') return /^(?:mcp:|mcpjson-enabled:|mcp-disabled:|login$|claude\.json:)/.test(key);
+  return key.startsWith(`${file}:`);
+}
+
 // Per section: keys only on A, keys only on B, keys whose values differ, and how many
-// agree. Each row carries its noise class (null when it is always shown). The MCP
-// rows of a config dir whose state file the other side could not parse are not
-// differences, only unread, and are classed so.
+// agree. Each row carries its noise class (null when it is always shown). Rows that
+// are only unread on one side are classed so, not listed as differences: those of a
+// file the other side could not read or parse, and every row of a section the other
+// side's deadline cut short.
 function compareInventories(a, b) {
   const index = (entries) => {
     const map = new Map();
@@ -968,8 +1172,28 @@ function compareInventories(a, b) {
   };
   const A = index(a);
   const B = index(b);
-  const unread = (map, section, key) => /^mcp/.test(key) && /^(?:too large|unparseable)/.test(map.get(`${section}\tclaude.json`) || '');
-  const classify = (other, section, key) => (unread(other, section, key) ? 'MCP rows the other side could not read' : noisy(section, key));
+  const cutShort = (map) => new Set(String(map.get('inventory\tpartial') || '').split(',').filter(Boolean));
+  const cutA = cutShort(A);
+  const cutB = cutShort(B);
+  const unreadFiles = (map) => {
+    const out = new Map();
+    for (const [id, value] of map) {
+      if (!UNREADABLE.test(value)) continue;
+      const [section, key] = id.split('\t');
+      if (!out.has(section)) out.set(section, []);
+      out.get(section).push(key);
+    }
+    return out;
+  };
+  const unreadA = unreadFiles(A);
+  const unreadB = unreadFiles(B);
+  const classify = (section, key) => {
+    if (section !== 'inventory' && (cutA.has(section) || cutB.has(section))) return 'rows in a section cut short at the deadline';
+    for (const files of [unreadA.get(section), unreadB.get(section)]) {
+      if (files && files.some((file) => file !== key && rowsOfFile(file, key))) return 'rows of a file one side could not read';
+    }
+    return noisy(section, key);
+  };
   const sections = new Map();
   const at = (name) => {
     if (!sections.has(name)) sections.set(name, { section: name, same: 0, onlyA: [], onlyB: [], differ: [] });
@@ -978,14 +1202,14 @@ function compareInventories(a, b) {
   for (const [id, value] of A) {
     const [section, key] = id.split('\t');
     const row = at(section);
-    if (!B.has(id)) row.onlyA.push({ key, value, noise: classify(B, section, key) });
-    else if (B.get(id) !== value) row.differ.push({ key, a: value, b: B.get(id), noise: noisy(section, key) });
+    if (!B.has(id)) row.onlyA.push({ key, value, noise: classify(section, key) });
+    else if (B.get(id) !== value) row.differ.push({ key, a: value, b: B.get(id), noise: classify(section, key) });
     else row.same += 1;
   }
   for (const [id, value] of B) {
     if (A.has(id)) continue;
     const [section, key] = id.split('\t');
-    at(section).onlyB.push({ key, value, noise: classify(A, section, key) });
+    at(section).onlyB.push({ key, value, noise: classify(section, key) });
   }
   const byKey = (x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0);
   return [...sections.values()]
@@ -994,9 +1218,8 @@ function compareInventories(a, b) {
 }
 
 // The report `keep node audit` prints. `all` shows the noisy classes too; otherwise
-// each is one count line per section. `partial` ({ a, b }: the cut-short section
-// names of each side, or null) puts a warning first, so rows missing from a section
-// that ran out of time are not read as real differences.
+// each is one count line per section. `partial` ({ a, b }: the cut-short report
+// sections of each side, or null) puts a warning first.
 function renderComparison(sections, options = {}) {
   const nameA = options.nameA || 'A';
   const nameB = options.nameB || 'B';
@@ -1050,7 +1273,9 @@ module.exports = {
   scrub,
   safeUrl,
   safeCommand,
+  tokenize,
   describeMcp,
+  codexConfigRows,
   toLines,
   fromLines,
   defaultAccountDirs,

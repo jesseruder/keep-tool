@@ -3132,18 +3132,13 @@ test('a node answers its stats beside the queue, with the caller\'s clock offset
 
 test('a node answers its inventory beside the queue, one at a time, looking only under its home', async () => {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-inventory-')));
-  let release;
-  const gate = new Promise((resolve) => { release = resolve; });
-  let calls = 0;
+  const { fakeSpawn } = require('./fixtures/fake-spawn.js');
+  // Every subprocess (git, here) hangs until released, so the first request is still
+  // collecting when the second arrives.
+  let gated = true;
+  const spawner = fakeSpawn(() => (gated ? 'hang' : ''));
   const inventoryOptions = {
-    home, tools: [], logins: false, shellEnv: { PATH: '/nonexistent-bin' }, keepDir: path.join(home, 'keep'),
-    // Every subprocess (git, here) waits for the gate, so the first request is still
-    // collecting when the second arrives.
-    execFile: (file, args, options, callback) => {
-      calls += 1;
-      gate.then(() => callback(null, '', ''));
-      return { stdin: { end() {} } };
-    },
+    home, tools: [], logins: false, shellEnv: { PATH: '/nonexistent-bin' }, keepDir: path.join(home, 'keep'), spawn: spawner.spawn,
   };
   fs.mkdirSync(path.join(home, '.claude', 'skills', 'alpha'), { recursive: true });
   fs.writeFileSync(path.join(home, '.claude', 'skills', 'alpha', 'SKILL.md'), '---\nname: alpha\n---\n');
@@ -3153,19 +3148,22 @@ test('a node answers its inventory beside the queue, one at a time, looking only
       const hello = await client.request('hello');
       assert.equal(hello.inventory, 1, 'the hello says the verb is here');
       assert.equal(hello.inventory, require('./node-inventory.js').INVENTORY_VERSION);
+      assert.equal(hello.inventoryStuck, null);
       const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 30'] });
       const pending = client.request('inventory', { claudeDirs: ['~/.claude', '/etc'], repoRoots: ['~/src'] }, { timeoutMs: 10e3 });
-      await waitFor(async () => calls > 0, 'the collection to reach its subprocesses');
+      await waitFor(async () => spawner.calls.length > 0, 'the collection to reach its subprocesses');
       // Collecting runs beside the queue: a screen read is answered meanwhile, and a
       // second inventory is refused rather than started.
       const screenAt = Date.now();
       await client.request('screen', { pane: pane.id });
       assert.ok(Date.now() - screenAt < 200, 'a screen read waited behind the inventory');
       await assert.rejects(client.request('inventory', {}), /already being collected/);
-      release();
+      gated = false;
+      spawner.release();
       const answer = await pending;
       assert.equal(answer.version, 1);
       assert.equal(answer.partial, false);
+      assert.equal(answer.stuck, null);
       assert.ok(Array.isArray(answer.inventory) && answer.inventory.every((line) => typeof line === 'string'));
       assert.ok(answer.inventory.some((line) => /^claude:~\/\.claude\tskills\/alpha\tdir sha=/.test(line)), 'the asked-for config dir was read');
       assert.ok(!answer.inventory.some((line) => line.startsWith('claude:/etc')), 'a directory outside the home is never read');
@@ -3184,17 +3182,14 @@ test('an inventory past its deadline keeps its slot until what it started is gon
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-inventory-late-')));
   fs.mkdirSync(path.join(home, 'src', 'app', '.git'), { recursive: true });
   const inventory = require('./node-inventory.js');
-  let pendingKill = null;
+  const { fakeSpawn } = require('./fixtures/fake-spawn.js');
+  // Subprocesses that outlive the deadline and only end when the test lets their
+  // kills land, so the host has answered while they are still running.
+  const spawner = fakeSpawn(() => 'hang', { holdKills: true });
   let starts = 0;
   const inventoryOptions = {
     home, tools: [], logins: false, shellEnv: { PATH: '/nonexistent-bin' }, keepDir: path.join(home, 'keep'),
-    repoRoots: [path.join(home, 'src')], deadlineMs: 100, subprocessTimeoutMs: 60e3,
-    // A subprocess that outlives the deadline and only ends when the test lets its
-    // kill land, so the host has answered while it is still running.
-    execFile: (file, args, options, callback) => ({
-      stdin: { end() {} },
-      kill() { const previous = pendingKill; pendingKill = () => { if (previous) previous(); callback(Object.assign(new Error('killed'), { killed: true }), '', ''); }; },
-    }),
+    repoRoots: [path.join(home, 'src')], deadlineMs: 100, subprocessTimeoutMs: 60e3, spawn: spawner.spawn,
   };
   const inventoryStart = (options) => {
     starts += 1;
@@ -3204,19 +3199,41 @@ test('an inventory past its deadline keeps its slot until what it started is gon
   try {
     await withHost({ inventoryOptions, inventoryStart }, async ({ client }) => {
       const late = await client.request('inventory', {}, { timeoutMs: 10e3 });
-      assert.match(late.partial, /repos/, 'the answer names what was cut short');
-      await waitFor(async () => pendingKill !== null, 'the running subprocess to be killed');
+      assert.equal(late.partial, 'repo', 'the answer names the report section cut short');
+      await waitFor(async () => spawner.kills > 0, 'the running subprocesses to be killed');
       await assert.rejects(client.request('inventory', {}), /already being collected/, 'still running: the slot is held');
-      pendingKill();
+      spawner.landKills();
       await waitFor(async () => {
         try { await client.request('inventory', {}); return false; } catch (error) { return /failed to start/.test(error.message); }
-      }, 'the slot to be released once the subprocess returned');
+      }, 'the slot to be released once the subprocesses returned');
       // The failed start released the slot too: the next one is answered.
-      pendingKill = null;
-      const next = client.request('inventory', {}, { timeoutMs: 10e3 });
-      assert.match((await next).partial, /repos/);
-      await waitFor(async () => pendingKill !== null, 'the third collection to reach its kill');
-      pendingKill();
+      const next = await client.request('inventory', {}, { timeoutMs: 10e3 });
+      assert.equal(next.partial, 'repo');
+      spawner.landKills();
+    });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('an inventory stuck on a filesystem call is let go after its grace, and says so', async () => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-inventory-stuck-')));
+  fs.mkdirSync(path.join(home, 'src', 'hang'), { recursive: true });
+  const fsp = require('node:fs/promises');
+  // A directory on a mount that never answers: its readdir never settles.
+  const stuckFs = { ...fsp, readdir: (p, ...rest) => (String(p).endsWith(`${path.sep}hang`) ? new Promise(() => {}) : fsp.readdir(p, ...rest)) };
+  const inventoryOptions = {
+    home, tools: [], logins: false, shellEnv: { PATH: '/nonexistent-bin' }, keepDir: path.join(home, 'keep'),
+    repoRoots: [path.join(home, 'src')], deadlineMs: 100, fsp: stuckFs,
+  };
+  try {
+    await withHost({ inventoryOptions, inventoryIdleGraceMs: 100 }, async ({ client }) => {
+      const first = await client.request('inventory', {}, { timeoutMs: 10e3 });
+      assert.equal(first.partial, 'repo');
+      assert.equal(first.stuck, null);
+      await waitFor(async () => (await client.request('hello')).inventoryStuck === 'inventory stuck: filesystem', 'the stuck record');
+      const second = await client.request('inventory', {}, { timeoutMs: 10e3 });
+      assert.equal(second.stuck, 'inventory stuck: filesystem', 'the next answer carries it');
     });
   } finally {
     fs.rmSync(home, { recursive: true, force: true });

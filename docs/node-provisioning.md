@@ -53,16 +53,34 @@ The sections:
 - `keep`, `android`: the Keep checkout and its commit, the registry directory, the node
   token, and the Android SDK pieces.
 
-Nothing secret leaves either machine. Credential files are reported as present or
-absent; files that may contain a secret among other content are reported by a short
-content hash; environment values whose name looks like a credential are reported as
-`set`. A command line (a hook, an MCP server, the status line) shows its executable,
-plain paths and short plain words, masks every other token as `***`, and ends with
-`sha=<hash>` of the whole line, so two machines still compare exactly. URLs lose their
-user info and query values, and long or random-looking path segments become `*<hash>`
-markers. When either side hit its deadline (about fifty seconds), the report starts
-with a warning naming the sections it cut short; what is missing from them is not a
-real difference, so run the audit again.
+What leaves each machine follows fixed rules, so it can be read without exposing a
+credential:
+
+- Credential files (`.credentials.json`, `auth.json`, `.netrc`, `~/.aws/credentials`)
+  are reported as present or absent. Other files (dotfiles, `~/bin` scripts, skills,
+  `CLAUDE.md`, `config.toml`) are reported by a short content hash, never their content.
+- Command lines (hooks, MCP servers, the status line) go through an allowlist. Only
+  the executable, bare flags, shell operators and words or paths made of plain name
+  characters are shown. A `NAME=value` word shows as `NAME=***`, or `***` when the name
+  says secret. The word after a credential flag (`-u`, `-p`, `-H`, `--pass`, `--token`
+  and the like) is `***`, and every other word is `***` too. The line ends with a hash
+  of the whole line, so two machines still compare exactly.
+- URLs keep their scheme, host and plain path segments. User info, query values and
+  `;` parameters are dropped, and long or random-looking segments become `*<hash>`
+  markers.
+- Names (skills, servers, settings keys, config tables and their keys) are shown.
+  Values of settings, environment variables and top-level config keys are scrubbed:
+  a secret-named value is `set`, and header values, credential flags, token shapes and
+  embedded URLs are masked. Objects and config tables are reported by their key names
+  and a hash, never their values.
+- Logins are reported by the identity each CLI prints, such as an account name or an
+  ARN.
+
+When either side hit its deadline (about fifty seconds), the report starts with a
+warning naming the sections it cut short. Their rows are summarised rather than
+listed, because what is missing from them is not a real difference; run the audit
+again. Rows of a file one side could not read (too large, unparseable or unreadable)
+are summarised the same way.
 
 A node whose host predates the `inventory` verb is refused with a message saying so:
 on that node, `git pull` in Keep's checkout and run `keep host reload`. The reload keeps

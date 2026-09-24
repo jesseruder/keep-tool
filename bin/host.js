@@ -1158,6 +1158,8 @@ function createHost(options = {}) {
           // this machine is set up with, which `keep node audit` diffs against the
           // daemon node's.
           inventory: INVENTORY_VERSION,
+          // Set while an earlier inventory is stuck past its grace (see runInventory).
+          inventoryStuck,
           // spawnReceipts: a spawn naming an operationId is journalled, so a caller
           // whose reply was lost may ask again instead of starting a second process.
           spawnReceipts: true,
@@ -1656,8 +1658,14 @@ function createHost(options = {}) {
   // The slot is held until the collection is idle, not only until it has answered:
   // past its deadline it answers at once, and whatever it started must be gone
   // before another may start beside it.
+  // The wait for idle is bounded too: a filesystem call on a hung mount never
+  // returns and cannot be cancelled. Past INVENTORY_IDLE_GRACE_MS after the answer
+  // the slot is released anyway, and what was still running is recorded as
+  // `inventoryStuck` (in the hello and in every answer) until it does return.
   let inventoryInFlight = 0;
+  let inventoryStuck = null;
   const INVENTORY_IN_FLIGHT_MAX = 1;
+  const INVENTORY_IDLE_GRACE_MS = options.inventoryIdleGraceMs == null ? 30e3 : options.inventoryIdleGraceMs;
   const runInventory = (connection, socket, request) => {
     const respond = (response) => {
       if (socket.destroyed) return;
@@ -1669,6 +1677,21 @@ function createHost(options = {}) {
     }
     inventoryInFlight += 1;
     let idle = null;
+    let collection = null;
+    const waitIdle = () => {
+      if (!idle) return undefined;
+      let timer;
+      const grace = new Promise((resolve) => { timer = setTimeout(() => resolve(false), INVENTORY_IDLE_GRACE_MS); });
+      return Promise.race([Promise.resolve(idle).then(() => true, () => true), grace]).then((settled) => {
+        clearTimeout(timer);
+        if (settled) return;
+        const counts = typeof collection.stats === 'function' ? collection.stats() : {};
+        const stuck = `inventory stuck: ${counts.fsActive ? 'filesystem' : counts.active ? 'subprocess' : 'unknown'}`;
+        inventoryStuck = stuck;
+        eventLog(`host: ${stuck}; its slot is released`);
+        Promise.resolve(idle).then(() => { if (inventoryStuck === stuck) inventoryStuck = null; }, () => {});
+      });
+    };
     Promise.resolve()
       .then(async () => {
         const inventory = require('./node-inventory.js');
@@ -1680,16 +1703,19 @@ function createHost(options = {}) {
         // Never the account list here: it is read synchronously, and the host's loop
         // carries keystrokes. A node without a requested directory looks at the
         // agents' default ones.
-        const collection = start({ useAccounts: false, ...seam, ...scope });
+        collection = start({ useAccounts: false, ...seam, ...scope });
         idle = collection.idle;
         const entries = await collection.result;
         return { lines: inventory.toLines(entries), partial: inventory.partialOf(entries) || false };
       })
-      .then(({ lines, partial }) => respond({ ok: true, id: request.id, inventory: lines, partial, version: INVENTORY_VERSION }), (error) => {
+      .then(({ lines, partial }) => respond({
+        ok: true, id: request.id, inventory: lines, partial, stuck: inventoryStuck, version: INVENTORY_VERSION,
+      }), (error) => {
         respond({ ok: false, id: request.id, error: error.message });
       })
       .catch(() => {})
-      .then(() => (idle ? Promise.resolve(idle).catch(() => {}) : undefined))
+      .then(waitIdle)
+      .catch(() => {})
       .finally(() => { inventoryInFlight -= 1; });
   };
 
