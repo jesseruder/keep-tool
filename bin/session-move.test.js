@@ -636,3 +636,81 @@ test('a dry run of a stopped session passes the preflight and plans its move wit
     assert.deepEqual(move.listMoves(w.root), [], 'a dry run journals nothing');
   } finally { w.cleanup(); }
 });
+
+// The daemon's mirror of the target's transcript is seeded once the copy is verified,
+// before the record is staged, and never fails the move.
+function seeding(w, answer) {
+  const calls = [];
+  w.deps.seedMirror = async (record) => {
+    w.steps.push(['seed', record.to]);
+    calls.push({ status: record.status, manifest: record.manifest, id: record.id });
+    return answer();
+  };
+  return calls;
+}
+
+test('a move seeds the target mirror once, right after the copy, and journals it', async () => {
+  const w = world();
+  try {
+    const calls = seeding(w, () => ({ ok: true, size: 10 }));
+    const result = await move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps);
+    assert.equal(result.status, 'done');
+    assert.deepEqual(names(w.steps), ['requireNode', 'cwdExists', 'targetReady', 'stop', 'transfer', 'seed', 'reprove', 'pin', 'reprove', 'open', 'wait', 'relink', 'cleanup']);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].status, 'copying', 'seeded before the record says staged');
+    assert.equal(calls[0].manifest.files, 1, 'with the verified manifest already recorded');
+    assert.equal(calls[0].id, result.id);
+    const record = move.readMove(w.root, result.id);
+    assert.equal(record.mirrorSeeded.size, 10);
+    assert.ok(Number.isFinite(record.mirrorSeeded.at));
+    assert.equal(record.warnings, undefined);
+    assert.deepEqual(result.mirrorSeeded, record.mirrorSeeded, 'the answer carries it');
+  } finally { w.cleanup(); }
+});
+
+test('a seed that throws or declines is a warning, and the move completes', async () => {
+  for (const [label, answer, reason] of [
+    ['throws', () => { throw new Error('mirror disk full'); }, 'mirror disk full'],
+    ['declines', () => ({ ok: false, reason: 'the target listed no file generation' }), 'the target listed no file generation'],
+  ]) {
+    const w = world();
+    try {
+      seeding(w, answer);
+      w.deps.cleanup = async () => ['a cleanup warning'];
+      const result = await move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps);
+      assert.equal(result.status, 'done', label);
+      const record = move.readMove(w.root, result.id);
+      assert.equal(record.mirrorSeeded, undefined, label);
+      assert.deepEqual(record.warnings, [`the daemon's mirror of aws1 was not seeded: ${reason}`, 'a cleanup warning'], label);
+    } finally { w.cleanup(); }
+  }
+});
+
+test('a seed with nothing to seed (a move onto the daemon node) is neither journalled nor a warning', async () => {
+  const w = world();
+  try {
+    const calls = seeding(w, () => ({ ok: false, skipped: true, reason: 'the daemon keeps no mirror of its own sessions' }));
+    const result = await move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps);
+    assert.equal(result.status, 'done');
+    assert.equal(calls.length, 1);
+    const record = move.readMove(w.root, result.id);
+    assert.equal(record.mirrorSeeded, undefined);
+    assert.equal(record.warnings, undefined);
+  } finally { w.cleanup(); }
+});
+
+test('a recovery from the staged copy does not seed again', async () => {
+  const w = world({ reviveAfter: 'transfer' });
+  try {
+    const calls = seeding(w, () => ({ ok: false, reason: 'short' }));
+    let id;
+    await assert.rejects(move.moveSession({ sessionId: SID, node: 'aws1' }, w.deps), (error) => { id = error.extra.id; return error.extra.phase === 'staged'; });
+    assert.equal(calls.length, 1);
+    w.state.revived = false;
+    w.steps.length = 0;
+    assert.equal((await move.moveSession({ recover: id }, w.deps)).status, 'done');
+    assert.equal(calls.length, 1, 'the seed belongs to the copy, which a recovery from staged does not repeat');
+    assert.deepEqual(move.readMove(w.root, id).warnings, ["the daemon's mirror of aws1 was not seeded: short"],
+      'the warning journalled by the first run survives the recovery');
+  } finally { w.cleanup(); }
+});

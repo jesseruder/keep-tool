@@ -17091,3 +17091,48 @@ test('node stats: a node that has never answered carries no stats, and one node 
   clock += 60_001;
   assert.equal(consoleNodes({ ok: true }, { ...deps, placementNodes: ['main'] })[0].stats.stale, true);
 });
+
+test('node stats: each round records the node-hook-queue row from the nodes\' current samples', async () => {
+  const { pollNodeStats } = require('./serve');
+  const MIN = 60e3;
+  let clock = 50_000_000;
+  const recorded = [];
+  const samples = {};
+  const deps = {
+    nodeStatsMemo: new Map(), now: () => clock, daemonNode: 'main', hostNodes: ['main', 'aws1', 'mini'],
+    recordHealth: (name, result) => recorded.push([name, result]),
+    readNodeStats: async (name) => {
+      const sample = samples[name];
+      if (sample instanceof Error) throw sample;
+      return sample === undefined ? null : sample;
+    },
+  };
+
+  // Nobody reports a queue (no nodes, or nodes on older code): nothing is written.
+  samples.main = { at: 1 };
+  samples.aws1 = { at: 1 };
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded, []);
+
+  // aws1's clock runs five seconds ahead: its oldest entry, two hours and three
+  // minutes old on this clock, is read on this clock. The daemon's own queue is not a
+  // node's and never counts.
+  samples.main = { at: 1, hookQueue: { depth: 200, cap: 200, oldestAt: clock - 9 * 60 * MIN } };
+  samples.aws1 = { at: 1, clockOffsetMs: 5000, hookQueue: { depth: 200, cap: 200, oldestAt: clock + 5000 - (2 * 60 + 3) * MIN } };
+  samples.mini = { at: 1, hookQueue: { depth: 0, cap: 200 } };
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: false, error: 'aws1: 200 hook events queued (at cap), oldest 2h 3m' }]]);
+
+  // Drained: the row reads ok again.
+  samples.aws1 = { at: 1, clockOffsetMs: 5000, hookQueue: { depth: 0, cap: 200 } };
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: true, detail: 'hook events queued: aws1 0, mini 0' }]]);
+
+  // A node that stops answering keeps its last sample, but a stale one says nothing
+  // about its queue now.
+  samples.mini = new Error('unreachable');
+  clock += 61e3;
+  samples.aws1 = { at: 2, clockOffsetMs: 5000, hookQueue: { depth: 1, cap: 200, oldestAt: clock + 5000 - MIN } };
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: true, detail: 'hook events queued: aws1 1' }]]);
+});

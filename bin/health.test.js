@@ -323,6 +323,8 @@ test('on-demand schedulers never become silent or never from elapsed time', () =
   const now = 10 * 86400e3;
   assert.equal(health.CADENCES.usage.onDemand, true);
   assert.equal(health.CADENCES.digest.onDemand, true);
+  assert.equal(health.CADENCES['node-hook-queue'].onDemand, true);
+  assert.equal(health.stateOf({ name: 'node-hook-queue', daemonStartedAt: 1 }, now), 'ok', 'an install with no nodes never writes it');
   assert.equal(health.stateOf({ name: 'usage', daemonStartedAt: 1 }, now), 'ok');
   assert.equal(health.stateOf({ name: 'digest', daemonStartedAt: 1, lastRunAt: 2, lastOkAt: 2 }, now), 'ok');
   assert.equal(health.stateOf({ name: 'usage', daemonStartedAt: 1, lastRunAt: 2, consecutiveFailures: 3 }, now), 'failing');

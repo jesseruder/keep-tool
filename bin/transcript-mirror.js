@@ -8,7 +8,7 @@
 // against this file exactly as it runs against a local one.
 //
 // Layout: <root>/.keep/transcript-mirrors/<node>/<sessionId>.jsonl, with a sidecar
-// <sessionId>.json { generation, size, mtimeMs, sourcePath, updatedAt }. The path is
+// <sessionId>.json { generation, size, mtimeMs, sourcePath, updatedAt, seededAt? }. The path is
 // built from a validated node name and session id only, every directory on the way
 // must be a real directory (never a symlink), and the files are opened with
 // O_NOFOLLOW, so nothing a request says can place a write anywhere else. The
@@ -19,6 +19,14 @@
 // mirror's current size, or nothing is written and the answer says where to start
 // (`needFrom`). A new generation (the node's file was replaced) or a source smaller
 // than the mirror (it was truncated) starts the mirror again from 0.
+//
+// Seeding: when `keep move` carries a session onto a node, the daemon already holds
+// the transcript's bytes (its own file, or its mirror of the source node). `seed`
+// writes them into the target's mirror, checked against the digest the target listed
+// for its copy and stamped with that copy's generation, so the target's hook client
+// finds the mirror current and sends only what the session appends after the move,
+// not the whole transcript again over the link.
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { NODE_NAME_RE } = require('./config.js');
@@ -30,6 +38,8 @@ const POST_CAP_BYTES = 4 * 1024 * 1024;
 const MIRROR_CAP_BYTES = 512 * 1024 * 1024;
 const PRUNE_AFTER_MS = 30 * 24 * 60 * 60e3;
 const SOURCE_PATH_MAX = 4096;
+const HASH_RE = /^[a-f0-9]{64}$/;
+const SEED_CHUNK_BYTES = 1024 * 1024;
 
 class MirrorError extends Error {
   constructor(status, message) {
@@ -100,6 +110,12 @@ function writeSidecar(file, value) {
   fs.renameSync(temp, file);
 }
 
+function checkedSourcePath(sourcePath) {
+  if (typeof sourcePath !== 'string' || !path.isAbsolute(sourcePath) || sourcePath.includes('\0')
+    || /[\r\n]/.test(sourcePath) || Buffer.byteLength(sourcePath) > SOURCE_PATH_MAX) refuse(400, 'invalid transcript source path');
+  return sourcePath;
+}
+
 function nonNegativeInteger(value, name) {
   if (!Number.isSafeInteger(value) || value < 0) refuse(400, `${name} must be a non-negative integer`);
   return value;
@@ -130,8 +146,7 @@ function append(options = {}) {
   nonNegativeInteger(fromOffset, 'fromOffset');
   nonNegativeInteger(size, 'size');
   if (!Number.isFinite(mtimeMs) || mtimeMs <= 0) refuse(400, 'mtimeMs must be a positive number');
-  if (typeof sourcePath !== 'string' || !path.isAbsolute(sourcePath) || sourcePath.includes('\0')
-    || /[\r\n]/.test(sourcePath) || Buffer.byteLength(sourcePath) > SOURCE_PATH_MAX) refuse(400, 'invalid transcript source path');
+  checkedSourcePath(sourcePath);
   const bytes = options.bytes || Buffer.alloc(0);
   if (!Buffer.isBuffer(bytes)) refuse(400, 'bytes must be a buffer');
   if (bytes.length > POST_CAP_BYTES) return { ok: false, status: 413, reason: `a post carries at most ${POST_CAP_BYTES} bytes` };
@@ -161,6 +176,69 @@ function append(options = {}) {
   const total = from + bytes.length;
   writeSidecar(where.sidecar, { generation, size: total, mtimeMs, sourcePath, updatedAt: now() });
   return { ok: true, size: total, reset };
+}
+
+// Replaces a node's mirror of a session with the first `size` bytes of `fromFile`, a
+// file the daemon already holds. The bytes are streamed into a temporary file in the
+// mirror directory while they are hashed, and only bytes that hash to `sha256` (the
+// digest the node listed for its own copy) replace the mirror: a short file, other
+// bytes, or a transcript past the mirror cap answer { ok: false, reason } and leave
+// the mirror as it was. The mirror is renamed into place before its sidecar is
+// written, and it carries the source's mtime as an append does. Answers
+// { ok: true, size } after a seed; throws MirrorError for a request that does not
+// make sense, as append does. Asynchronous: a transcript can be hundreds of
+// megabytes, and the daemon's loop is not held while it is hashed.
+async function seed(options = {}) {
+  const { root, node, sessionId, fromFile, size, sha256, generation, mtimeMs, sourcePath } = options;
+  const now = options.now || Date.now;
+  if (!root) throw new Error('transcript-mirror.seed needs the registry root');
+  const where = paths(root, node, sessionId);
+  if (typeof generation !== 'string' || !GENERATION_RE.test(generation)) refuse(400, 'invalid transcript generation');
+  nonNegativeInteger(size, 'size');
+  if (typeof sha256 !== 'string' || !HASH_RE.test(sha256)) refuse(400, 'invalid transcript digest');
+  if (!Number.isFinite(mtimeMs) || mtimeMs <= 0) refuse(400, 'mtimeMs must be a positive number');
+  checkedSourcePath(sourcePath);
+  if (typeof fromFile !== 'string' || !path.isAbsolute(fromFile)) refuse(400, 'the seed needs an absolute file to read');
+  if (size > MIRROR_CAP_BYTES) return { ok: false, reason: `a mirror holds at most ${MIRROR_CAP_BYTES} bytes; this transcript is past it` };
+
+  checkedDirectory(root, node, true);
+  // Named so neither prune nor a session id can ever match it.
+  const temp = path.join(where.dir, `.seed.${sessionId}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+  let source = null;
+  let target = null;
+  let placed = false;
+  try {
+    source = await fs.promises.open(fromFile, fs.constants.O_RDONLY);
+    target = await fs.promises.open(temp,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    const hash = crypto.createHash('sha256');
+    const buffer = Buffer.allocUnsafe(Math.max(1, Math.min(SEED_CHUNK_BYTES, size)));
+    let copied = 0;
+    while (copied < size) {
+      const { bytesRead } = await source.read(buffer, 0, Math.min(buffer.length, size - copied), copied);
+      if (!bytesRead) break;
+      const chunk = buffer.subarray(0, bytesRead);
+      hash.update(chunk);
+      let written = 0;
+      while (written < bytesRead) written += (await target.write(chunk, written, bytesRead - written)).bytesWritten;
+      copied += bytesRead;
+    }
+    if (copied < size) return { ok: false, reason: `the daemon's copy holds ${copied} of the ${size} bytes the target listed` };
+    if (hash.digest('hex') !== sha256) return { ok: false, reason: 'the daemon\'s copy does not match the digest the target listed' };
+    // What readers take as activity evidence is the source's time, as after an append.
+    await target.utimes(now() / 1000, mtimeMs / 1000);
+    await target.close();
+    target = null;
+    fs.renameSync(temp, where.file);
+    placed = true;
+  } finally {
+    if (source) await source.close().catch(() => {});
+    if (target) await target.close().catch(() => {});
+    if (!placed) { try { fs.unlinkSync(temp); } catch {} }
+  }
+  const at = now();
+  writeSidecar(where.sidecar, { generation, size, mtimeMs, sourcePath, updatedAt: at, seededAt: at });
+  return { ok: true, size };
 }
 
 // The sidecar and the mirror's real size, or null when there is no mirror.
@@ -250,6 +328,6 @@ function prune(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now } = {}) {
 }
 
 module.exports = {
-  append, stat, read, prune, usage, paths, mirrorRoot, MirrorError,
+  append, seed, stat, read, prune, usage, paths, mirrorRoot, MirrorError,
   POST_CAP_BYTES, MIRROR_CAP_BYTES, PRUNE_AFTER_MS, GENERATION_RE, SESSION_RE,
 };

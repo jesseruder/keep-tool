@@ -46,7 +46,10 @@ const SELF_NAME = 'self-repair';
 // swap) is past its maximum age. That is a record waiting on an event that will not
 // come, resolved by a command per record rather than a daemon fix, and bin/inflight.js
 // already files one card naming each record and its command.
-const EXCLUDED = new Set(['runs', 'lint', 'git-pull', 'loop-stalls', 'inflight']);
+// `node-hook-queue` fails while a node's hook queue is full or not draining. The queue
+// is on the node and drains once the node reaches the daemon again; a repair session
+// on the daemon cannot drain it, so the row is for Owner.
+const EXCLUDED = new Set(['runs', 'lint', 'git-pull', 'loop-stalls', 'inflight', 'node-hook-queue']);
 const CADENCE_MS = 5 * MINUTE_MS;
 const FIRST_RUN_MS = 90e3;
 // A resolved signature is kept so a recurrence can link the previous card.

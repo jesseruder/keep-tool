@@ -322,6 +322,26 @@ async function run(record, deps, options = {}) {
       record.manifest = { files: carried.files.length, bytes: carried.bytes,
         digests: Object.fromEntries(carried.files.map((file) => [file.relPath, file.sha256])),
         ...(Array.isArray(carried.landed) ? { targetDigests: Object.fromEntries(carried.landed.map((file) => [file.relPath, file.sha256])) } : {}) };
+      // The daemon's mirror of the target's transcript, seeded from bytes the daemon
+      // already holds, so the target's hook does not send the whole transcript again
+      // once the session runs there. Best effort: without it the hook still sends
+      // everything, as before, so a failure is a warning and never fails the move.
+      if (typeof deps.seedMirror === 'function') {
+        let seeded;
+        try { seeded = await deps.seedMirror(record); }
+        catch (error) { seeded = { ok: false, reason: String(error && error.message || error) }; }
+        // A copy carried again on a recovery is seeded again: only this seed's outcome stands.
+        const notSeeded = `the daemon's mirror of ${record.to} was not seeded: `;
+        const kept = (record.warnings || []).filter((warning) => !String(warning).startsWith(notSeeded));
+        delete record.mirrorSeeded;
+        // `skipped`: there is no mirror to seed (a move onto the daemon node), which is
+        // nothing to warn about.
+        if (seeded && seeded.skipped) { /* nothing to seed */ }
+        else if (seeded && seeded.ok) record.mirrorSeeded = { at: now(), size: seeded.size };
+        else kept.push(`${notSeeded}${seeded && seeded.reason || 'no answer'}`);
+        if (kept.length) record.warnings = kept;
+        else delete record.warnings;
+      }
       record.status = 'staged'; save();
     }
     phase = record.status;
@@ -394,7 +414,8 @@ async function run(record, deps, options = {}) {
       try { warnings.push(...((await deps.cleanup(record)) || [])); }
       catch (error) { warnings.push(`cleanup on ${record.from} did not finish: ${error.message}`); }
       record.status = 'done'; record.doneAt = now();
-      if (warnings.length) record.warnings = warnings;
+      // Warnings journalled by an earlier step (the mirror seed) are kept beside this run's.
+      if (warnings.length) record.warnings = [...(record.warnings || []), ...warnings];
       delete record.reason; delete record.phase; delete record.holder;
       save();
     }

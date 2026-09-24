@@ -85,6 +85,12 @@ const CADENCES = Object.freeze({
   // bin/self-repair.js skips on-demand rows, so the failing scheduler gets the repair
   // card and this row only names the deploy it started with.
   [DEPLOY_ROW]: { onDemand: true },
+  // Written by the node-stats poller in serve.js after each round in which a node
+  // reported its hook queue: failing while a node's queue is at its cap or holds an
+  // event over ten minutes old (bin/node-stats.js hookQueueHealth). On demand: it has
+  // no tick of its own, and an install with no nodes never writes it. Excluded from
+  // self-repair (bin/self-repair.js EXCLUDED).
+  'node-hook-queue': { onDemand: true },
   brief: { cadenceMs: DAY_MS, daily: true, hour: 8, minute: 0, windowMs: 2 * HOUR_MS },
   ideas: { cadenceMs: DAY_MS, daily: true, hour: 7, minute: 30, windowMs: 2 * HOUR_MS },
   standup: { cadenceMs: DAY_MS, daily: true, weekdays: true, hour: 11, minute: 30, windowMs: 2 * HOUR_MS },

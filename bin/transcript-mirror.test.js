@@ -142,3 +142,54 @@ test('the mirror carries the source mtime, and prune removes month-old mirrors o
   assert.deepEqual(mirror.usage(root), { aws1: { bytes: fs.statSync(mirror.paths(root, 'aws1', 'sess-new').file).size
     + fs.statSync(mirror.paths(root, 'aws1', 'sess-new').sidecar).size, mirrors: 1 } });
 });
+
+test('a seed replaces the mirror only with bytes that match the digest, and appends continue from it', async (t) => {
+  const root = tempRoot(t);
+  const crypto = require('node:crypto');
+  const digest = (buffer) => crypto.createHash('sha256').update(buffer).digest('hex');
+  const held = Buffer.from('{"n":1}\n{"n":2}\n{"n":3}\n');
+  const fromFile = path.join(root, 'held.jsonl');
+  // The daemon's copy may run past what the target listed; only the listed prefix is seeded.
+  fs.writeFileSync(fromFile, Buffer.concat([held, Buffer.from('{"later":true}\n')]));
+  const seedOf = (extra = {}) => mirror.seed({
+    root, node: 'aws1', sessionId: 'sess-1', fromFile, size: held.length, sha256: digest(held),
+    generation: '7:8:9', mtimeMs: 1_700_000_000_000, sourcePath: SOURCE, now: () => 1_750_000_000_000, ...extra,
+  });
+  const dir = path.join(root, '.keep', 'transcript-mirrors', 'aws1');
+
+  // An existing mirror of another generation, which a failed seed must leave alone.
+  post(root, { bytes: Buffer.from('old\n') });
+  const before = { file: mirror.read(root, 'aws1', 'sess-1').toString(), side: mirror.stat(root, 'aws1', 'sess-1') };
+
+  const mismatch = await seedOf({ sha256: digest(Buffer.from('other')) });
+  assert.equal(mismatch.ok, false);
+  assert.match(mismatch.reason, /does not match the digest/);
+  const short = await seedOf({ size: held.length + 100 });
+  assert.equal(short.ok, false);
+  assert.match(short.reason, /holds \d+ of the \d+ bytes/);
+  const capped = await seedOf({ size: mirror.MIRROR_CAP_BYTES + 1 });
+  assert.equal(capped.ok, false);
+  assert.match(capped.reason, /at most/);
+  assert.equal(mirror.read(root, 'aws1', 'sess-1').toString(), before.file);
+  assert.deepEqual(mirror.stat(root, 'aws1', 'sess-1'), before.side);
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['sess-1.json', 'sess-1.jsonl'], 'no temporary file is left behind');
+  await assert.rejects(seedOf({ generation: '../x' }), /invalid transcript generation/);
+  await assert.rejects(seedOf({ sessionId: '../x' }), (error) => error.status === 400);
+
+  assert.deepEqual(await seedOf(), { ok: true, size: held.length });
+  assert.equal(mirror.read(root, 'aws1', 'sess-1').toString(), held.toString());
+  const side = JSON.parse(fs.readFileSync(path.join(dir, 'sess-1.json'), 'utf8'));
+  assert.deepEqual(side, { generation: '7:8:9', size: held.length, mtimeMs: 1_700_000_000_000, sourcePath: SOURCE,
+    updatedAt: 1_750_000_000_000, seededAt: 1_750_000_000_000 });
+  assert.equal(fs.statSync(path.join(dir, 'sess-1.jsonl')).mode & 0o777, 0o600);
+  assert.equal(Math.round(fs.statSync(path.join(dir, 'sess-1.jsonl')).mtimeMs), 1_700_000_000_000);
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['sess-1.json', 'sess-1.jsonl']);
+
+  // The node's first post after the move: from zero it is told where the seed ends,
+  // and a post from there appends.
+  const next = Buffer.from('{"n":4}\n');
+  assert.deepEqual(post(root, { generation: '7:8:9', bytes: next, size: held.length + next.length }), { ok: false, needFrom: held.length });
+  assert.deepEqual(post(root, { generation: '7:8:9', bytes: next, fromOffset: held.length, size: held.length + next.length }),
+    { ok: true, size: held.length + next.length, reset: false });
+  assert.equal(mirror.read(root, 'aws1', 'sess-1').toString(), `${held}${next}`);
+});

@@ -15,8 +15,11 @@
 // Every request may name `kind` ('claude' when it names none, which is all an older
 // daemon sends); the account must be one of this node's accounts of that agent.
 //
-//   list    { sessionId, account }                    -> { projectName, files: [{ relPath, size, mtimeMs, mode, sha256 }], bytes }
-//   read    { sessionId, account, relPath, from, length ≤ 4 MiB } -> { relPath, size, mtimeMs, from, bytes, eof }
+//   list    { sessionId, account }                    -> { projectName, files: [{ relPath, size, mtimeMs, mode, sha256, generation }], bytes }
+//             `generation` names the file as the hook client does (hook-client.js
+//             generationOf), so a daemon seeding its mirror of this node's copy
+//             stamps it with the identity the node's hook posts will carry.
+//   read   { sessionId, account, relPath, from, length ≤ 4 MiB } -> { relPath, size, mtimeMs, from, bytes, eof }
 //   stage   { sessionId, account, tx, relPath, from, bytes, size, sha256 }
 //                                                      -> { relPath, staged, complete } | { relPath, staged, needFrom }
 //   publish { sessionId, account, tx, entries: [{ relPath, sha256, size }] } -> { published: [{ relPath, sha256, size, action }] }
@@ -204,7 +207,8 @@ async function fileDigest(file) {
   try {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile()) throw refused(`${path.basename(file)} is not a regular file`);
-    return { sha256: await hashFd(fd), size: stat.size, mtimeMs: stat.mtimeMs, mode: stat.mode & 0o777 };
+    return { sha256: await hashFd(fd), size: stat.size, mtimeMs: stat.mtimeMs, mode: stat.mode & 0o777,
+      generation: require('./hook-client.js').generationOf(stat) };
   } finally { fs.closeSync(fd); }
 }
 
@@ -447,7 +451,8 @@ async function list(root, sessionId, kind = 'claude') {
     if (!digest) throw coded(`${parts.join('/')} disappeared while it was listed`, 'artifacts-missing');
     bytes += digest.size;
     if (bytes > TX_MAX_BYTES) throw refused('the session\'s artifacts are larger than a move carries');
-    out.push({ relPath: parts.join('/'), size: digest.size, mtimeMs: digest.mtimeMs, mode: digest.mode, sha256: digest.sha256 });
+    out.push({ relPath: parts.join('/'), size: digest.size, mtimeMs: digest.mtimeMs, mode: digest.mode, sha256: digest.sha256,
+      generation: digest.generation });
   }
   return { sessionId, projectName, files: out, bytes };
 }

@@ -173,3 +173,55 @@ test('the code is the commit this process loaded, not a checkout changed since',
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('the hook queue is read from the home: depth, cap and the oldest entry, absent with no queue directory', async (t) => {
+  const { readHookQueue, HOOK_QUEUE_CAP } = require('./node-stats.js');
+  assert.equal(HOOK_QUEUE_CAP, require('./hook-client.js').QUEUE_MAX, 'the cap is the hook client\'s');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-node-stats-queue-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  assert.equal(await readHookQueue(home), undefined, 'no queue directory, no field');
+  const quick = { cpuSampleMs: 1, agents: false, home };
+  assert.equal((await readStats(quick)).hookQueue, undefined);
+
+  const dir = path.join(home, '.keep-node', 'hook-queue');
+  fs.mkdirSync(dir, { recursive: true });
+  assert.deepEqual(await readHookQueue(home), { depth: 0, cap: HOOK_QUEUE_CAP });
+  const queuedAt = '2026-01-02T03:04:05.000Z';
+  fs.writeFileSync(path.join(dir, '0000000000000007.json'), JSON.stringify({ seq: 7, queuedAt }));
+  fs.writeFileSync(path.join(dir, '0000000000000009.json'), JSON.stringify({ seq: 9, queuedAt: '2026-01-02T04:00:00.000Z' }));
+  // Not queue entries: a temp file and a counter-shaped name.
+  fs.writeFileSync(path.join(dir, 'hook-queue.1.tmp'), '{}');
+  fs.writeFileSync(path.join(dir, '12.json'), '{}');
+  assert.deepEqual(await readHookQueue(home), { depth: 2, cap: HOOK_QUEUE_CAP, oldestAt: Date.parse(queuedAt) });
+  assert.deepEqual((await readStats(quick)).hookQueue, { depth: 2, cap: HOOK_QUEUE_CAP, oldestAt: Date.parse(queuedAt) });
+
+  // An unreadable oldest entry falls back to its mtime.
+  const lowest = path.join(dir, '0000000000000001.json');
+  fs.writeFileSync(lowest, 'not json');
+  fs.utimesSync(lowest, 1_700_000_000, 1_700_000_000);
+  assert.deepEqual(await readHookQueue(home), { depth: 3, cap: HOOK_QUEUE_CAP, oldestAt: 1_700_000_000_000 });
+});
+
+test('the hook queue row fails for a queue at its cap or not draining, naming every such node', () => {
+  const { hookQueueHealth, HOOK_QUEUE_STUCK_MS } = require('./node-stats.js');
+  const now = 10_000_000_000;
+  const MIN = 60e3;
+  assert.deepEqual(hookQueueHealth([], now), { ok: true, detail: 'no node reported a hook queue' });
+  assert.deepEqual(hookQueueHealth([
+    { node: 'aws1', hookQueue: { depth: 0, cap: 200 } },
+    { node: 'mini', hookQueue: { depth: 3, cap: 200, oldestAt: now - 2 * MIN } },
+  ], now), { ok: true, detail: 'hook events queued: aws1 0, mini 3' });
+
+  // Exactly ten minutes is still draining; past it is not.
+  assert.equal(hookQueueHealth([{ node: 'aws1', hookQueue: { depth: 1, cap: 200, oldestAt: now - HOOK_QUEUE_STUCK_MS } }], now).ok, true);
+  assert.deepEqual(hookQueueHealth([{ node: 'aws1', hookQueue: { depth: 1, cap: 200, oldestAt: now - HOOK_QUEUE_STUCK_MS - 1000 } }], now),
+    { ok: false, error: 'aws1: 1 hook event queued, oldest 10m' });
+
+  assert.deepEqual(hookQueueHealth([
+    { node: 'aws1', hookQueue: { depth: 200, cap: 200, oldestAt: now - (2 * 60 + 3) * MIN } },
+    { node: 'fresh', hookQueue: { depth: 4, cap: 200, oldestAt: now - MIN } },
+    { node: 'mini', hookQueue: { depth: 200, cap: 200 } },
+    { node: 'old', hookQueue: { depth: 12, cap: 200, oldestAt: now - (3 * 24 + 4) * 60 * MIN } },
+    { node: 'none' },
+  ], now), { ok: false, error: 'aws1: 200 hook events queued (at cap), oldest 2h 3m; mini: 200 hook events queued (at cap); old: 12 hook events queued, oldest 3d 4h' });
+});

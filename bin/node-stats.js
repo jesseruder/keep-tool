@@ -238,6 +238,80 @@ function processCode(deps = {}) {
 // by the time somebody asks.
 processCode();
 
+// The hook client's queue on this machine (bin/hook-client.js): events it could not
+// deliver to the daemon, kept as ~/.keep-node/hook-queue/<16-digit seq>.json and
+// replayed in order. A queue at its cap is dropping its oldest events, and one whose
+// oldest entry is old is not draining; the daemon's node-hook-queue row reads both.
+// The cap is hook-client.js QUEUE_MAX, which is the source of truth; it is repeated
+// here because nothing beyond builtins is required at load time (a test holds the
+// two equal).
+const HOOK_QUEUE_CAP = 200;
+const HOOK_QUEUE_NAME_RE = /^\d{16}\.json$/;
+// A queued event older than this means the queue is not draining: the client replays
+// on every hook, and a healthy link empties it within seconds.
+const HOOK_QUEUE_STUCK_MS = 10 * 60e3;
+
+// { depth, cap, oldestAt } from the queue directory under `home`, or undefined when
+// there is no queue directory (no hook client ever queued here). `oldestAt` is the
+// lowest-numbered entry's queuedAt, or its mtime when that cannot be read.
+async function readHookQueue(home, deps = {}) {
+  if (typeof home !== 'string' || !home) return undefined;
+  const io = (deps.fs && deps.fs.promises) || fs.promises;
+  const dir = path.join(home, '.keep-node', 'hook-queue');
+  let names;
+  try { names = await io.readdir(dir); } catch { return undefined; }
+  const queued = names.filter((name) => HOOK_QUEUE_NAME_RE.test(name)).sort();
+  const out = { depth: queued.length, cap: HOOK_QUEUE_CAP };
+  if (!queued.length) return out;
+  const file = path.join(dir, queued[0]);
+  let oldestAt;
+  try {
+    const stat = await io.stat(file);
+    oldestAt = stat.mtimeMs;
+    if (stat.isFile() && stat.size <= SMALL_FILE_MAX_BYTES) {
+      try {
+        const queuedAt = Date.parse(JSON.parse(await io.readFile(file, 'utf8')).queuedAt);
+        if (Number.isFinite(queuedAt)) oldestAt = queuedAt;
+      } catch {}
+    }
+  } catch {}
+  if (Number.isFinite(oldestAt)) out.oldestAt = Math.round(oldestAt);
+  return out;
+}
+
+// "45s", "12m", "2h 3m", "3d 4h".
+function shortAge(ms) {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+
+// The node-hook-queue health row from each node's last sample: [{ node, hookQueue }],
+// with oldestAt already on the caller's clock. Failing while any node's queue is at
+// its cap or holds an event older than ten minutes, naming every such node.
+function hookQueueHealth(samples, now = Date.now()) {
+  const failing = [];
+  const seen = [];
+  for (const sample of Array.isArray(samples) ? samples : []) {
+    const queue = sample && sample.hookQueue;
+    if (!queue || typeof queue !== 'object') continue;
+    const depth = Number.isFinite(queue.depth) ? queue.depth : 0;
+    const cap = Number.isFinite(queue.cap) && queue.cap > 0 ? queue.cap : HOOK_QUEUE_CAP;
+    seen.push(`${sample.node} ${depth}`);
+    const age = depth > 0 && Number.isFinite(queue.oldestAt) ? now - queue.oldestAt : null;
+    const atCap = depth >= cap;
+    if (!atCap && !(age != null && age > HOOK_QUEUE_STUCK_MS)) continue;
+    failing.push(`${sample.node}: ${depth} hook event${depth === 1 ? '' : 's'} queued${atCap ? ' (at cap)' : ''}`
+      + `${age != null ? `, oldest ${shortAge(age)}` : ''}`);
+  }
+  if (failing.length) return { ok: false, error: failing.join('; ') };
+  return { ok: true, detail: seen.length ? `hook events queued: ${seen.join(', ')}` : 'no node reported a hook queue' };
+}
+
 // One machine's stats. `options.now` is the caller's clock when it asked: the
 // answer's clockOffsetMs is this machine's clock minus that, one-way latency
 // included. `panes` and `hostVersion` are the host's to supply; `processRows`
@@ -278,6 +352,7 @@ async function readStats(options = {}) {
     readDisk(deps, home).then(land((disk) => { if (disk) out.diskHome = disk; })),
     (deps.agents === false ? Promise.resolve(null) : readAgentRows(deps).catch(() => null))
       .then(land((rows) => { if (Array.isArray(rows)) out.agentProcesses = countAgents(rows); })),
+    readHookQueue(home, deps).catch(() => undefined).then(land((queue) => { if (queue) out.hookQueue = queue; })),
   ]).then(() => false);
   const deadlineMs = deps.deadlineMs == null ? STATS_DEADLINE_MS : Math.max(0, Number(deps.deadlineMs) || 0);
   let timer;
@@ -297,4 +372,5 @@ async function readStats(options = {}) {
 
 module.exports = {
   CPU_SAMPLE_MS, STATS_DEADLINE_MS, readStats, processCode, parseMeminfo, parseVmStat, parseSwapUsage, countAgents, readCode,
+  readHookQueue, hookQueueHealth, HOOK_QUEUE_CAP, HOOK_QUEUE_STUCK_MS,
 };

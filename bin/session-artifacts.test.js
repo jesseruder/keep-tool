@@ -60,6 +60,9 @@ test('a Codex session lists its root rollout and every child thread, with digest
   assert.deepEqual(listed.files.map((file) => file.relPath), [node.rel.root, node.rel.childA, node.rel.childB]);
   for (const file of listed.files) {
     assert.equal(file.sha256, sha256(fs.readFileSync(path.join(node.configDir, ...file.relPath.split('/')))), file.relPath);
+    // The file's identity as the node's hook client names it, for a daemon seeding its mirror.
+    assert.equal(file.generation, require('./hook-client.js').generationOf(fs.statSync(path.join(node.configDir, ...file.relPath.split('/')))),
+      file.relPath);
   }
   // The account's own indexes are never a conversation's state.
   node.put('session_index.jsonl', '{}\n');
