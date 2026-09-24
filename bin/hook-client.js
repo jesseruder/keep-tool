@@ -12,9 +12,9 @@
 //                                    in order, with their own keys, before the next post.
 //   ~/.keep-node/hook-queue.state.json  { stalledSession, at }: the session whose
 //                                    entry the last replay could not deliver; it
-//                                    goes last in the next replay.
-//   ~/.keep-node/link.json           { bytesPerSec, at }: how fast transcript bytes
-//                                    have reached the daemon, which sizes the chunks.
+//                                    goes last in the next replay, for an hour at most.
+//   ~/.keep-node/link.json           { bytesPerSec, at }: how fast transcript chunks
+//                                    have reached the daemon, which sizes the next ones.
 //   ~/.keep-node/hook.log            what the queue dropped, and why.
 //   ~/.keep-node/hook-context.json   { at, steps, sessions: { <sid>: { repairSession, at } } }:
 //                                    what GET /api/hook/context last said, asked
@@ -89,9 +89,14 @@ const CHUNK_WINDOW_MS = 2000;
 // A chunk is not started with less than this left: it could not land, and a post cut
 // off by the deadline costs the link its bytes for nothing.
 const CHUNK_FLOOR_MS = 300;
-// A post measures the link only when it carried this much: a small one is all latency.
+// A chunk measures the link only when it carried this much: a small one is all
+// latency. The event's own post never does: its time includes the daemon running
+// the hook, and a slow stop would shrink every later chunk.
 const RATE_SAMPLE_BYTES = 64 * 1024;
 const RATE_ALPHA = 0.5;
+// A stall record older than this orders nothing: its session is long gone, or has
+// long since had its chance to go first again.
+const STALL_TTL_MS = 60 * 60 * 1000;
 // The bound on asking the daemon how much of a transcript its mirror holds.
 const MIRROR_ASK_MS = 1500;
 const NEED_FROM_RETRIES = 3;
@@ -289,7 +294,7 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
     if (left <= 0) throw new Error('out of time');
     return request(where.url, '/api/hook', { payload, token, timeoutMs: left });
   };
-  // A post that carried `raw` transcript bytes and landed measures the link.
+  // A chunk that carried `raw` transcript bytes and landed measures the link.
   const timed = async (payload, raw) => {
     const began = now();
     const response = await send(payload);
@@ -355,8 +360,7 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
         }
         return { ok: false, retry: chunk.status >= 500, why: value.error || `HTTP ${chunk.status}` };
       }
-      response = await timed({ event, input, identity, transcript: plan ? piece(from, plan.end) : null, idempotencyKey: key },
-        plan ? plan.end - from : 0);
+      response = await send({ event, input, identity, transcript: plan ? piece(from, plan.end) : null, idempotencyKey: key });
     } catch (error) {
       // The request itself failed: the daemon did not answer at all (refused, reset,
       // timed out), which `link` tells apart from a daemon that answered a failure.
@@ -442,7 +446,9 @@ function enqueue(env, entry) {
 async function replayQueue({ env, where, token, deadline, deps }) {
   const now = deps.now || Date.now;
   const state = readJson(replayStateFile(env));
-  let stalled = state && typeof state.stalledSession === 'string' ? state.stalledSession : null;
+  // A record past its hour is ignored, and the next stall overwrites it.
+  const fresh = state && typeof state.stalledSession === 'string' && Number.isFinite(state.at) && now() - state.at < STALL_TTL_MS;
+  let stalled = fresh ? state.stalledSession : null;
   const entries = [];
   for (const name of queueFiles(env)) {
     const file = path.join(queueDir(env), name);
@@ -795,5 +801,5 @@ module.exports = {
   runHook, runBashHook, runCodexToolHook, runPiHook, deliver, logLine, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
   hookContext, contextFile, CONTEXT_TTL_MS, linkFile, replayStateFile, chunkSize,
   EVENTS, CLAUDE_EVENTS, CODEX_EVENTS, PI_EVENTS, TRANSCRIPTLESS, QUEUED, ENDS, BUDGET_MS, QUEUE_MAX,
-  CHUNK_BYTES, CHUNK_MIN, CHUNK_MAX, CHUNK_FIRST, CHUNK_FLOOR_MS, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
+  CHUNK_BYTES, CHUNK_MIN, CHUNK_MAX, CHUNK_FIRST, CHUNK_FLOOR_MS, STALL_TTL_MS, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
 };

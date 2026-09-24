@@ -309,21 +309,24 @@ test('with a measured link rate, each chunk is what the link carries in the time
   const f = fixture(t);
   const client = require('./hook-client.js');
   const env = { HOME: f.home };
-  const total = 1152 * 1024;
+  // What the second call leaves for the event's own post is over 64 KiB, so it would
+  // be a sample if the event's post measured the link.
+  const total = 987136 + 83968 + 70000;
   fs.writeFileSync(f.transcript, 'x'.repeat(total));
   fs.mkdirSync(path.join(f.home, '.keep-node'), { recursive: true });
   fs.writeFileSync(path.join(f.home, '.keep-node', 'link.json'), JSON.stringify({ bytesPerSec: 100 * 1024, at: 1 }));
   const cursor = () => {
     try { return JSON.parse(fs.readFileSync(client.cursorFile(env, 'sess-aws1'), 'utf8')).sent; } catch { return null; }
   };
-  // Every post takes one second on this link.
+  // Every chunk takes one second on this link; the event's own post five, the
+  // daemon's hook running behind it.
   let clock = 0;
   const posts = [];
   const request = async (url, pathname, { method, payload }) => {
     if (method === 'GET') { posts.push({ ask: pathname }); return { status: 404, data: '{"error":"not found"}' }; }
     const raw = payload.transcript ? Buffer.from(payload.transcript.bytes, 'base64').length : 0;
     posts.push({ event: payload.event, from: payload.transcript.fromOffset, raw, cursor: cursor() });
-    clock += 1000;
+    clock += payload.event === 'transcript' ? 1000 : 5000;
     return payload.event === 'transcript' ? { status: 200, data: '{"ok":true}' } : { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: '', stderr: '' }) };
   };
   const common = { event: 'stop', input: { session_id: 'sess-aws1' }, identity: { agent: 'claude', sessionId: 'sess-aws1' }, key: 'k'.repeat(32),
@@ -353,8 +356,9 @@ test('with a measured link rate, each chunk is what the link carries in the time
   const next = await client.deliver({ ...common, deadline: 30_000 });
   assert.equal(next.ok, true);
   const rate = (100 * 1024 + client.CHUNK_MIN) / 2;
-  assert.deepEqual(posts.map((post) => [post.event, post.from, post.raw]),
-    [['transcript', at, rate], ['transcript', at + rate, rate], ['stop', at + 2 * rate, total - at - 2 * rate]]);
+  assert.deepEqual(posts.map((post) => [post.event, post.from, post.raw]), [['transcript', at, rate], ['stop', at + rate, 70000]]);
+  assert.equal(JSON.parse(fs.readFileSync(client.linkFile(env), 'utf8')).bytesPerSec, rate,
+    'the slow event post, 70000 bytes in 5 s, is not a sample');
   assert.equal(cursor(), total);
   assert.equal(client.chunkSize({ HOME: f.home }, 50), client.CHUNK_MIN);
   assert.equal(client.chunkSize({ HOME: path.join(f.home, 'nowhere') }, 5000), client.CHUNK_FIRST, 'no rate known yet');
@@ -582,15 +586,20 @@ test('a daemon that drops the connection stops the replay: the next entry would 
   const url = await closedUrl();
   await f.hook('notification', url, { session_id: 'sess-stuck', notification_type: 'idle_prompt' });
   await f.hook('notification', url, { session_id: 'sess-other', notification_type: 'idle_prompt' });
-  // The closed daemon's replays recorded sess-stuck as stalled; start with none, so it goes first.
-  fs.rmSync(path.join(f.home, '.keep-node', 'hook-queue.state.json'), { force: true });
+  // A record past its hour orders nothing: were this one honoured, sess-stuck would
+  // go last; ignored, it goes first.
+  const stateFile = path.join(f.home, '.keep-node', 'hook-queue.state.json');
+  const client = require('./hook-client.js');
+  fs.writeFileSync(stateFile, JSON.stringify({ stalledSession: 'sess-stuck', at: Date.now() - client.STALL_TTL_MS - 1000 }));
   const daemon = await stubDaemon(t, (body) => (body.identity.sessionId === 'sess-stuck' ? 'reset' : ran('')));
   const result = await f.hook('lifecycle', daemon.url, { hook_event_name: 'PostToolUse' });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(daemon.posts.map((post) => `${post.body.event}:${post.body.identity.sessionId}`),
     ['notification:sess-stuck', 'lifecycle:sess-aws1'], 'sess-other was not tried');
   assert.deepEqual(f.queue().map((entry) => entry.body.identity.sessionId), ['sess-stuck', 'sess-other']);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, '.keep-node', 'hook-queue.state.json'), 'utf8')).stalledSession, 'sess-stuck');
+  const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  assert.equal(state.stalledSession, 'sess-stuck', 'the expired record overwritten');
+  assert.ok(Date.now() - state.at < 60_000);
 });
 
 // ---------- pre-bash ----------
