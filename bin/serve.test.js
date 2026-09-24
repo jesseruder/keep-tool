@@ -17099,7 +17099,7 @@ test('node stats: each round records the node-hook-queue row from the nodes\' cu
   const recorded = [];
   const samples = {};
   const deps = {
-    nodeStatsMemo: new Map(), now: () => clock, daemonNode: 'main', hostNodes: ['main', 'aws1', 'mini'],
+    nodeStatsMemo: new Map(), nodeHookQueueRow: { last: null }, now: () => clock, daemonNode: 'main', hostNodes: ['main'],
     recordHealth: (name, result) => recorded.push([name, result]),
     readNodeStats: async (name) => {
       const sample = samples[name];
@@ -17108,11 +17108,19 @@ test('node stats: each round records the node-hook-queue row from the nodes\' cu
     },
   };
 
-  // Nobody reports a queue (no nodes, or nodes on older code): nothing is written.
+  // An install with no remote node writes nothing, even when the daemon's own
+  // sample carries a queue.
+  samples.main = { at: 1, hookQueue: { depth: 200, cap: 200 } };
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded, []);
+
+  // Nodes on older code report no queue: the row says so, once, not every round.
+  deps.hostNodes = ['main', 'aws1', 'mini'];
   samples.main = { at: 1 };
   samples.aws1 = { at: 1 };
   await pollNodeStats(deps);
-  assert.deepEqual(recorded, []);
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: true, detail: 'no fresh node sample reports a hook queue' }]]);
 
   // aws1's clock runs five seconds ahead: its oldest entry, two hours and three
   // minutes old on this clock, is read on this clock. The daemon's own queue is not a
@@ -17122,6 +17130,9 @@ test('node stats: each round records the node-hook-queue row from the nodes\' cu
   samples.mini = { at: 1, hookQueue: { depth: 0, cap: 200 } };
   await pollNodeStats(deps);
   assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: false, error: 'aws1: 200 hook events queued (at cap), oldest 2h 3m' }]]);
+  // The same failure a round later is not written again.
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded, []);
 
   // Drained: the row reads ok again.
   samples.aws1 = { at: 1, clockOffsetMs: 5000, hookQueue: { depth: 0, cap: 200 } };
@@ -17135,4 +17146,35 @@ test('node stats: each round records the node-hook-queue row from the nodes\' cu
   samples.aws1 = { at: 2, clockOffsetMs: 5000, hookQueue: { depth: 1, cap: 200, oldestAt: clock + 5000 - MIN } };
   await pollNodeStats(deps);
   assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: true, detail: 'hook events queued: aws1 1' }]]);
+
+  // A failure, then every node silent for over a minute: the failure does not outlive
+  // the samples that showed it.
+  samples.aws1 = { at: 3, clockOffsetMs: 5000, hookQueue: { depth: 200, cap: 200 } };
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: false, error: 'aws1: 200 hook events queued (at cap)' }]]);
+  samples.aws1 = new Error('unreachable');
+  clock += 61e3;
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: true, detail: 'no fresh node sample reports a hook queue' }]]);
+
+  // The nodes removed from the configuration: the row this process wrote is cleared once.
+  samples.aws1 = { at: 4, hookQueue: { depth: 200, cap: 200 } };
+  await pollNodeStats(deps);
+  assert.equal(recorded.splice(0)[0][1].ok, false);
+  deps.hostNodes = ['main'];
+  await pollNodeStats(deps);
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: true, detail: 'no remote nodes' }]]);
+
+  // A write that fails is tried again the next round.
+  deps.hostNodes = ['main', 'aws1'];
+  let failures = 1;
+  deps.recordHealth = (name, result) => {
+    if (failures-- > 0) throw new Error('disk full');
+    recorded.push([name, result]);
+  };
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded, []);
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: false, error: 'aws1: 200 hook events queued (at cap)' }]]);
 });

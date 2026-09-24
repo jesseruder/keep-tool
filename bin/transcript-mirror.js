@@ -40,6 +40,9 @@ const PRUNE_AFTER_MS = 30 * 24 * 60 * 60e3;
 const SOURCE_PATH_MAX = 4096;
 const HASH_RE = /^[a-f0-9]{64}$/;
 const SEED_CHUNK_BYTES = 1024 * 1024;
+// A seed's temporary file: `.seed.<sid>.<pid>.<hex>.tmp`, in the node's mirror directory.
+const SEED_TEMP_RE = /^\.seed\.[A-Za-z0-9_-]{1,128}\.\d+\.[a-f0-9]+\.tmp$/;
+const SEED_TEMP_MAX_AGE_MS = 60 * 60e3;
 
 class MirrorError extends Error {
   constructor(status, message) {
@@ -300,9 +303,15 @@ function usage(root) {
 
 // Mirrors nobody has appended to in a month: the sidecar's updatedAt (its mtime
 // when unreadable) decides, and a mirror with no sidecar goes by its own mtime.
+// A seed's temporary file left by a daemon that died mid-seed (it can be as large as
+// a mirror) goes once it is an hour old. Its age is the later of its mtime and ctime:
+// a seed stamps the source's mtime on the file just before renaming it, which moves
+// the ctime to now, so a seed still running is never taken for a dead one. Those
+// files are not sessions and are not in the answer.
 function prune(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now } = {}) {
   const removed = [];
   const cutoff = now() - olderThanMs;
+  const seedCutoff = now() - SEED_TEMP_MAX_AGE_MS;
   let nodes;
   try { nodes = fs.readdirSync(mirrorRoot(root), { withFileTypes: true }); } catch { return removed; }
   for (const entry of nodes) {
@@ -310,6 +319,13 @@ function prune(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now } = {}) {
     const dir = path.join(mirrorRoot(root), entry.name);
     let names = [];
     try { names = fs.readdirSync(dir); } catch {}
+    for (const name of names.filter((value) => SEED_TEMP_RE.test(value))) {
+      const temp = path.join(dir, name);
+      try {
+        const info = fs.lstatSync(temp);
+        if (info.isFile() && Math.max(info.mtimeMs, info.ctimeMs) < seedCutoff) fs.unlinkSync(temp);
+      } catch {}
+    }
     const sessions = new Set(names.map((name) => name.replace(/\.(jsonl|json)$/, '')).filter((name) => SESSION_RE.test(name)));
     for (const sid of sessions) {
       const sidecar = path.join(dir, `${sid}.json`);

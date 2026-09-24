@@ -865,3 +865,95 @@ test('the stop resolves only once a fresh listing shows the source pane gone, so
   await assert.rejects(stop([[live]]).run, (error) => error.status === 409
     && /the pane p1 on main is still listed as running .* after its agent stopped/.test(error.message));
 });
+
+// ---------- the daemon's mirror of the target, seeded at the move ----------
+
+// A node that answers `artifacts list` with the files given for it, as the target
+// would list its published copy.
+function listingHost(listings) {
+  return async (type, params, options) => {
+    if (type === 'hello') return { artifacts: 2, transcript: 4 };
+    assert.equal(type, 'artifacts');
+    assert.equal(params.op, 'list');
+    const files = listings[options.node];
+    if (!files) throw new Error(`${options.node} was not asked for a listing`);
+    return { sessionId: params.sessionId, files, bytes: files.reduce((sum, file) => sum + file.size, 0) };
+  };
+}
+
+const listed = (relPath, bytes, generation = '11:22:33') => ({ relPath, size: bytes.length, mtimeMs: 1_700_000_000_000, mode: 0o600,
+  sha256: sha256(bytes), ...(generation ? { generation } : {}) });
+
+test('a Claude move seeds the target mirror from the daemon\'s own transcript or from its mirror of the source node', async () => {
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-move-seed-'));
+  try {
+    const claudeDir = path.join(root, 'claude');
+    const config = path.join(root, 'config.json');
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [{ id: 'claude-a', label: 'Claude A', agent: 'claude', configDir: claudeDir }],
+      defaultAccounts: { claude: 'claude-a' } }));
+    const env = { ...process.env, KEEP_CONFIG: config };
+    delete env.CLAUDE_CODE_SESSION_ID;
+    const mirror = require('./transcript-mirror.js');
+    const rel = `projects/-work-project/${SID}.jsonl`;
+    const bytes = Buffer.from('{"turn":1}\n{"turn":2}\n');
+    fs.mkdirSync(path.join(claudeDir, 'projects', '-work-project'), { recursive: true });
+    // The daemon's own file runs on past what the target listed; only the listed prefix is seeded.
+    fs.writeFileSync(path.join(claudeDir, rel), Buffer.concat([bytes, Buffer.from('{"turn":3}\n')]));
+    // Listed first: a file in the session's tree whose name also ends in <sid>.jsonl.
+    // Its digest matches nothing the daemon holds, so picking it would fail the seed.
+    const decoy = listed(`projects/-work-project/${SID}/subagents/${SID}.jsonl`, Buffer.from('other'));
+    const record = { id: `mv-${'a'.repeat(24)}`, sessionId: SID, agent: 'claude', accountId: 'claude-a', from: 'main', to: 'aws1' };
+    const seedWith = (listings, extra = {}) => serve.sessionMoveDeps({ root, env, daemonNode: 'main', hostRequest: listingHost(listings) })
+      .seedMirror({ ...record, ...extra });
+
+    // From the daemon node: its own transcript.
+    assert.deepEqual(await seedWith({ aws1: [decoy, listed(rel, bytes)] }), { ok: true, size: bytes.length });
+    assert.equal(mirror.read(root, 'aws1', SID).toString(), bytes.toString());
+    const side = mirror.stat(root, 'aws1', SID);
+    assert.equal(side.generation, '11:22:33', 'the target\'s generation, which its hook posts will carry');
+    assert.equal(side.sourcePath, path.join(claudeDir, ...rel.split('/')));
+
+    // From another node: the daemon's mirror of that node, not its own file (which
+    // here holds other bytes).
+    fs.writeFileSync(path.join(claudeDir, rel), 'the daemon\'s own file is not the source\n');
+    const remote = Buffer.from('{"turn":"on aws1"}\n');
+    mirror.append({ root, node: 'aws1', sessionId: SID, generation: '1:1:1', fromOffset: 0, size: remote.length,
+      mtimeMs: 1_700_000_000_000, sourcePath: path.join(claudeDir, rel), bytes: remote });
+    assert.deepEqual(await seedWith({ mini: [listed(rel, remote, '44:55:66')] }, { from: 'aws1', to: 'mini' }), { ok: true, size: remote.length });
+    assert.equal(mirror.read(root, 'mini', SID).toString(), remote.toString());
+    assert.equal(mirror.stat(root, 'mini', SID).generation, '44:55:66');
+
+    // A target on older code lists no generation: nothing is seeded.
+    assert.deepEqual(await seedWith({ mini: [listed(rel, remote, null)] }, { from: 'aws1', to: 'mini', sessionId: SID }),
+      { ok: false, reason: 'the target listed no file generation' });
+    // A target that lists no transcript for the session.
+    assert.equal((await seedWith({ aws1: [decoy] })).ok, false);
+    // A move onto the daemon node has no mirror to seed, and asks nothing.
+    assert.deepEqual(await serve.sessionMoveDeps({ root, env, daemonNode: 'main', hostRequest: async () => assert.fail('nothing to ask') })
+      .seedMirror({ ...record, from: 'aws1', to: 'main' }),
+    { ok: false, skipped: true, reason: 'the daemon keeps no mirror of its own sessions' });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a Codex move seeds the target mirror with the root rollout, never a child thread\'s', async () => {
+  const r = codexRegistry('main');
+  try {
+    const mirror = require('./transcript-mirror.js');
+    const rootRel = `sessions/2026/09/23/rollout-2026-09-23T10-00-00-${CODEX_SID}.jsonl`;
+    const childRel = 'sessions/2026/09/23/rollout-2026-09-23T11-00-00-c0dec0de-1111-4000-8000-00000000c0de.jsonl';
+    const rootBytes = Buffer.from(`${JSON.stringify({ type: 'session_meta', payload: { id: CODEX_SID } })}\n`);
+    const childBytes = Buffer.from(`${JSON.stringify({ type: 'session_meta', payload: { id: 'child', parent_thread_id: CODEX_SID } })}\n`);
+    for (const [rel, bytes] of [[rootRel, rootBytes], [childRel, childBytes]]) {
+      fs.mkdirSync(path.dirname(path.join(r.configDir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(r.configDir, rel), bytes);
+    }
+    const record = { id: `mv-${'b'.repeat(24)}`, sessionId: CODEX_SID, agent: 'codex', accountId: 'codex-a', from: 'main', to: 'aws1' };
+    const result = await serve.sessionMoveDeps({ root: r.root, env: r.env, daemonNode: 'main',
+      hostRequest: listingHost({ aws1: [listed(childRel, childBytes, '9:9:9'), listed(rootRel, rootBytes, '7:7:7')] }) }).seedMirror(record);
+    assert.deepEqual(result, { ok: true, size: rootBytes.length });
+    assert.equal(mirror.read(r.root, 'aws1', CODEX_SID).toString(), rootBytes.toString());
+    const side = mirror.stat(r.root, 'aws1', CODEX_SID);
+    assert.equal(side.generation, '7:7:7');
+    assert.equal(side.sourcePath, path.join(r.configDir, ...rootRel.split('/')));
+  } finally { r.cleanup(); }
+});

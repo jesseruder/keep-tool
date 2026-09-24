@@ -9849,25 +9849,41 @@ async function pollNodeStats(deps = {}) {
 // The node-hook-queue row, from each node's current sample after a round: a node's
 // hook queue at its cap or not draining is invisible anywhere else on the daemon. The
 // daemon node runs no hook client, and a stale sample says nothing about now, so both
-// are left out; with no node reporting a queue (an install with no nodes, or nodes on
-// older code) nothing is written. A node's oldestAt is on its own clock, brought onto
-// this one by the offset its sample measured.
+// are left out. With remote nodes configured but no fresh sample reporting a queue
+// (the node is offline, or on older code), the row reads ok and says so, so a failure
+// never outlives what showed it; with no remote node at all nothing is written, unless
+// this process wrote the row before (the nodes were removed since). A node's oldestAt
+// is on its own clock, brought onto this one by the offset its sample measured.
+//
+// The health store is read and written synchronously, so the row is written only when
+// its outcome or text changes, not every round.
+const nodeHookQueueRow = { last: null };
+
 function recordNodeHookQueues(memo, names, deps = {}) {
   const daemon = daemonNodeName(deps);
   const now = nodeStatsClock(deps);
+  const remote = names.filter((name) => name !== daemon);
+  const state = deps.nodeHookQueueRow || nodeHookQueueRow;
   const samples = [];
-  for (const name of names) {
+  for (const name of remote) {
     const entry = memo.get(name);
-    if (name === daemon || !entry || !entry.sample || now - entry.sampledAt > NODE_STATS_STALE_MS) continue;
+    if (!entry || !entry.sample || now - entry.sampledAt > NODE_STATS_STALE_MS) continue;
     const queue = entry.sample.hookQueue;
     if (!queue || typeof queue !== 'object' || Array.isArray(queue)) continue;
     const offset = Number.isFinite(entry.sample.clockOffsetMs) ? entry.sample.clockOffsetMs : 0;
     samples.push({ node: name, hookQueue: Number.isFinite(queue.oldestAt) ? { ...queue, oldestAt: queue.oldestAt - offset } : queue });
   }
-  if (!samples.length) return;
-  const result = require('./node-stats.js').hookQueueHealth(samples, now);
-  try { (deps.recordHealth || health.record)('node-hook-queue', result); }
-  catch (error) { process.stderr.write(`keep serve: node-hook-queue health not recorded: ${error.message}\n`); }
+  let result;
+  if (samples.length) result = require('./node-stats.js').hookQueueHealth(samples, now);
+  else if (remote.length) result = { ok: true, detail: 'no fresh node sample reports a hook queue' };
+  else if (state.last !== null) result = { ok: true, detail: 'no remote nodes' };
+  else return;
+  const key = JSON.stringify([result.ok, result.ok ? result.detail : result.error]);
+  if (key === state.last) return;
+  try {
+    (deps.recordHealth || health.record)('node-hook-queue', result);
+    state.last = key;
+  } catch (error) { process.stderr.write(`keep serve: node-hook-queue health not recorded: ${error.message}\n`); }
 }
 
 // What a state build publishes for one node: the last good sample, when it was

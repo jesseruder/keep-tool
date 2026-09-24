@@ -143,6 +143,25 @@ test('the mirror carries the source mtime, and prune removes month-old mirrors o
     + fs.statSync(mirror.paths(root, 'aws1', 'sess-new').sidecar).size, mirrors: 1 } });
 });
 
+test('prune removes a seed\'s temporary file an hour after a daemon died mid-seed, and nothing else early', (t) => {
+  const root = tempRoot(t);
+  post(root);
+  const dir = path.join(root, '.keep', 'transcript-mirrors', 'aws1');
+  const dead = path.join(dir, '.seed.sess-1.4242.0badf00d.tmp');
+  const other = path.join(dir, 'notes.tmp');
+  fs.writeFileSync(dead, 'half a transcript');
+  fs.writeFileSync(other, 'not a seed');
+  const now = Date.now();
+  // Half an hour on: the seed may still be running.
+  assert.deepEqual(mirror.prune(root, { now: () => now + 30 * 60e3 }), []);
+  assert.ok(fs.existsSync(dead));
+  // Past the hour it is gone; the session's mirror (a day old) and other files stay.
+  assert.deepEqual(mirror.prune(root, { now: () => now + 61 * 60e3 }), [], 'a temporary file is not a pruned session');
+  assert.equal(fs.existsSync(dead), false);
+  assert.ok(fs.existsSync(other));
+  assert.ok(mirror.stat(root, 'aws1', 'sess-1'));
+});
+
 test('a seed replaces the mirror only with bytes that match the digest, and appends continue from it', async (t) => {
   const root = tempRoot(t);
   const crypto = require('node:crypto');
