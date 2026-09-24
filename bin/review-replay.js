@@ -52,7 +52,8 @@ function replayCard(card, since, sessionId) {
   const session = sessionId ? sessions.find(s => s.id === sessionId) : sessions.at(-1);
   if (!session || session.agent === 'codex') throw new keep.KeepError('replay needs a linked Claude session; pass --session if the latest session is not Claude');
   const transcripts = require('./transcripts');
-  const file = transcripts.findSessionFile(session.id);
+  // A replay only reads, so a session on another node is replayed from its mirror.
+  const file = transcripts.readableSessionFile(session.id);
   if (!file || fs.statSync(file).size > 32 * 1024 * 1024) throw new keep.KeepError('replay needs a readable transcript under 32 MB');
   const records = replayRecords(transcripts.readTranscript(file), start);
   const ticks = new Map();

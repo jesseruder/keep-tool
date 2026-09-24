@@ -394,7 +394,9 @@ function sessionSummaryFile(session, deps = {}) {
   if (deps.publishedOnly) return null;
   const reader = deps.codex || codex;
   return session && (session.kind === 'codex'
-    ? reader.rolloutFileFor(session.id) || reader.findRolloutFile(session.id)
+    // Nothing mirrors a Codex rollout, and the one a moved session left here is
+    // where it was, not what it is doing: no summary rather than a wrong one.
+    ? transcripts.readableRolloutFile(session.id, { codex: reader })
     // A summary only reads, so a session on another node is summarized from its mirror.
     : (deps.findSessionFile || transcripts.readableSessionFile)(session.id));
 }
@@ -3876,7 +3878,11 @@ function transcriptFileForSession(session) {
   // is some other machine's history. Its transcript is read through its node
   // (nodeTranscriptFileForSession); to every synchronous caller of this one it is
   // simply unavailable, the answer each of them already handles, and never a local path.
-  if (session && session.node && session.node !== daemonNodeName()) return null;
+  // A row that carries no `node` (a local scan's stale copy of a moved session) is
+  // asked of its location record, as sessionNodeOf asks everywhere else: without that
+  // a Claude row threw from findSessionFile and a Codex row was answered with the
+  // rollout it left behind here.
+  if (session && (session.node ? session.node !== daemonNodeName() : remoteSession({ id: session.id }))) return null;
   return session.kind === 'codex'
     ? codex.rolloutFileFor(session.id) || codex.findRolloutFile(session.id)
     : session.kind === 'pi' ? session.sessionFile || pi.fileFor(session.id)
@@ -5998,7 +6004,9 @@ function sessionProjectFromTranscript(sessionId, deps = {}, agent = null) {
   }
   if (agent !== 'codex') {
     try {
-      const file = (deps.findSessionFile || findSessionFile)(sessionId);
+      // Only the cwd is read, so a session on another node answers from its mirror;
+      // the strict lookup refused it, and the live-session ledger lost its project.
+      const file = (deps.findSessionFile || transcripts.readableSessionFile)(sessionId);
       if (file) {
         const stat = fs.statSync(file);
         const length = Math.min(stat.size, 64 * 1024);
@@ -7038,8 +7046,22 @@ async function restartSession(body, deps = {}) {
     // another machine: `afterStop` is handed the stopped pane in place of the resume.
     if (ownerForce) return forceStopThenResume({ session, pane, identity: originalIdentity, resume: deps.afterStop || resume }, deps);
     const ledger = require('./restart-ledger');
-    const file = session.kind === 'codex' ? (deps.codexRolloutFile || codex.rolloutFileFor)(session.id)
-      : (deps.claudeRolloutFile || findSessionFile)(session.id);
+    // The job ledger is verified against the session's own transcript. A session on
+    // another node has at most a mirror here, which trails it by a hook post, and a
+    // proof read off that is not a proof; a Codex rollout is not mirrored at all, and
+    // the one a moved session left here is its history before the move. Refused
+    // before anything is stopped, in words that say what does work: findSessionFile's
+    // own refusal talked about mirrors, and a Codex restart went on to verify against
+    // the copy left behind.
+    const localOnly = (lookup) => (id) => {
+      if (remotePane) {
+        throw new InjectionError(409, `an in-place restart of a session on ${paneNode} is not available yet: `
+          + 'its background work cannot be verified from here; use a forced restart or move it');
+      }
+      return lookup(id);
+    };
+    const file = session.kind === 'codex' ? (deps.codexRolloutFile || localOnly(codex.rolloutFileFor))(session.id)
+      : (deps.claudeRolloutFile || localOnly(findSessionFile))(session.id);
     // Claude child transcripts are looked for across the whole profile that holds the
     // transcript being walked, not just beside it: a session that changed cwd writes
     // later subagent files under the worktree's own project dir. That profile is the
@@ -8932,8 +8954,12 @@ async function sendToSession(body, targetHint, opts, deps = {}) {
   if (body.pane && text.length > 2000) throw new InjectionError(400, 'agent messages are limited to 2000 characters');
 
   // Bootstrap: a reviewer that has never taken a turn has no transcript, but its
-  // chosen session id is already bound to the host pane at launch.
-  if (targetHint && targetHint.bootstrap && !findSessionFile(body.sessionId)) {
+  // chosen session id is already bound to the host pane at launch. Only whether a
+  // transcript exists is asked, so a reviewer on another node is asked of its mirror:
+  // the strict lookup threw for it and failed the whole review tick. With no mirror
+  // yet it is typed to through its pane like a local one (the host routes the ref);
+  // with one, it takes the ordinary path below, which reads it from its node.
+  if (targetHint && targetHint.bootstrap && !transcripts.readableSessionFile(body.sessionId)) {
     const hosted = sessionHostPane(await listHostPanes(deps), body.sessionId);
     if (!hosted || !hosted.alive) throw new InjectionError(409, 'reviewer has no transcript yet and no live host pane');
     const bootTarget = claimInjectionTarget({ pane: hosted.id });
@@ -12134,8 +12160,20 @@ async function restorePlan(query, deps = {}) {
       }
     }
 
-    const hasTranscript = agent === 'codex' ? true : agent === 'pi'
-      ? Boolean((deps.piFileFor || pi.fileFor)(id)) : Boolean((deps.transcriptExists || findSessionFile)(id));
+    // Only whether there is history to resume is asked, so a session on another
+    // node is asked of its mirror. The strict lookup threw for it here, and one such
+    // session failed the whole plan for every other session in it.
+    let hasTranscript;
+    try {
+      hasTranscript = agent === 'codex' ? true : agent === 'pi'
+        ? Boolean((deps.piFileFor || pi.fileFor)(id))
+        : Boolean((deps.transcriptExists || transcripts.readableSessionFile)(id));
+    } catch (error) {
+      rows.push({ id, sessionId: id, agent, project: entry.project || session && session.project || '',
+        pane: pane && pane.id || null, state, mtime: entry.lastSeenAlive, lastSeenAlive: entry.lastSeenAlive,
+        source: entry.source, action: 'skip', reason: `transcript lookup failed: ${error.message}` });
+      continue;
+    }
     let action = 'skip';
     let reason;
     if (codexChild) reason = 'codex child session';
@@ -15601,7 +15639,7 @@ function start(deps = {}) {
     ideas,
     inspectReviewQueueLaunch, keep, keepConsole, landed, launchReviewQueueSession,
     limitresume, listHostPaneResult, listHostPanes, listPortableTransfers, liveSessionTick, liveTurnIndexSessions,
-    loadCurrentSession, notifications, openCheckSession, openSession, path, portableTransferDraft,
+    loadCurrentSession, loadSessionForAction, notifications, openCheckSession, openSession, path, portableTransferDraft,
     portableTransferPreview, preparePortableTransfer, prepareSessionSummary, projectMobileState,
     readBody, readLiveSessionLedger, readScreenResult, recentTranscriptText, recoverReviewQueueLaunch, reminders,
     remoteSession, reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, resolveSessionTarget,

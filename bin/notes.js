@@ -435,7 +435,23 @@ async function sweep(options = {}) {
   let deferred = 0;
   for (const note of due) {
     const sessionId = (note.by && note.by.sessionId) || '';
-    const session = sessionId ? sessions.find((candidate) => candidate && candidate.id === sessionId) : null;
+    let session = sessionId ? sessions.find((candidate) => candidate && candidate.id === sessionId) : null;
+    // The scan is this machine's transcripts, so an author on another node is never
+    // in it, and "no live session" would hand its note to Owner for good. Such an
+    // author is read from its node instead (options.remoteSession answers null for a
+    // session that is not on another node). A node that cannot be read now is a
+    // reason to come back, the same as a busy session, not proof the author is gone.
+    if (!session && sessionId && typeof options.remoteSession === 'function') {
+      try { session = await options.remoteSession(sessionId); } catch (error) {
+        if (error && error.status === 404) session = null;
+        else {
+          const updated = deferNag(note.id, root, now, `its node could not be read: ${error && error.message || error}`);
+          if (updated && updated.nagged) owner += 1;
+          else deferred += 1;
+          continue;
+        }
+      }
+    }
     const gone = !session || session.exited === true || session.state === 'exited';
     if (gone || typeof options.send !== 'function') {
       markNagged(note.id, { at: now, owner: true, reason: session ? 'the session has exited' : 'no live session' }, root);

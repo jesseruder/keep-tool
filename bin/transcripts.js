@@ -232,16 +232,34 @@ function findSessionFile(id, options = {}) {
 // such a session: its callers deliver, move or verify against the file, and a
 // mirror is not the session's own transcript.
 function readableSessionFile(id, options = {}) {
-  const accounts = require('./accounts');
   const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
-  const env = options.env || process.env;
-  let recordedNode = null;
-  try { recordedNode = accounts.sessionNode(id, { root, env }); } catch {}
-  if (recordedNode && recordedNode !== nodes.daemonNode(env)) {
+  const recordedNode = remoteSessionNode(id, options);
+  if (recordedNode) {
     try { return require('./transcript-mirror.js').stat(root, recordedNode, id)?.path || null; } catch { return null; }
   }
   return findSessionFile(id, options);
 }
 
+// The node a session's location record puts it on when that is not this one, or
+// null (this node, no record, or a record that cannot be read — the lookups below
+// then answer exactly as they did on a single node).
+function remoteSessionNode(id, options = {}) {
+  const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+  const env = options.env || process.env;
+  let recordedNode = null;
+  try { recordedNode = require('./accounts').sessionNode(id, { root, env }); } catch {}
+  return recordedNode && recordedNode !== nodes.daemonNode(env) ? recordedNode : null;
+}
+
+// readableSessionFile for a Codex session. Nothing mirrors a Codex rollout from a
+// node, and a Codex session moved there leaves its old rollout behind here (released
+// for a later move back), so a reader of a session on another node gets null rather
+// than that copy: a summary or a review of it would describe where the session was.
+function readableRolloutFile(id, options = {}) {
+  if (remoteSessionNode(id, options)) return null;
+  const codex = options.codex || require('./codex.js');
+  return codex.rolloutFileFor(id) || codex.findRolloutFile(id);
+}
+
 module.exports = { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscript, readTranscriptTail, lastTurnUsage, findSessionFile,
-  readableSessionFile, claudeFilesIn, claudeFilesInProjects };
+  readableSessionFile, readableRolloutFile, remoteSessionNode, claudeFilesIn, claudeFilesInProjects };

@@ -27,7 +27,7 @@ const health = require('./health.js');
 const probes = require('./review-probes.js');
 const quality = require('./review-quality.js');
 const related = require('./review-related.js');
-const { PROJECTS_DIR, readableSessionFile, readTranscript, textOf: transcriptTextOf } = require('./transcripts.js');
+const { PROJECTS_DIR, readableSessionFile, remoteSessionNode, readTranscript, textOf: transcriptTextOf } = require('./transcripts.js');
 
 const META = path.join(keep.ROOT, '.keep');
 const REVIEW_DIR = path.join(META, 'review');
@@ -583,7 +583,10 @@ function locateSession(session) {
   // Frontmatter is only as trustworthy as whatever wrote it; codex.findRolloutFile
   // validates, readableSessionFile does not.
   if (!SESSION_ID_RE.test(String(session.id || ''))) return null;
-  return session.agent === 'codex' ? codex.findRolloutFile(session.id) : readableSessionFile(session.id);
+  // A Codex session on another node has no mirror here, and the rollout it left
+  // behind when it moved is not what it is doing now (readableRolloutFile).
+  if (session.agent === 'codex') return remoteSessionNode(session.id) ? null : codex.findRolloutFile(session.id);
+  return readableSessionFile(session.id);
 }
 
 // ---------- reviewer state ----------

@@ -358,7 +358,7 @@ function startSchedulers(ctx) {
     closeIdleSession, companionSnapshot, dashboardBuild, dashboardBuilder, deliverCheckToThread, deliverUnblockToThread,
     deps, discord, driftWakeFromVerdict, envNumber, features, forceRestartSession, fs, health, hostRequest,
     ideas, keep, keepConsole, landed, limitresume, listHostPaneResult, listHostPanes, liveSessionTick,
-    liveTurnIndexSessions, loadCurrentSession, openCheckSession, openSession, path, pendingCompactSwaps,
+    liveTurnIndexSessions, loadCurrentSession, loadSessionForAction, openCheckSession, openSession, path, pendingCompactSwaps,
     prepareSessionSummary, readLiveSessionLedger, readScreenResult, remoteSession, resolveSessionTarget, restartSession,
     resumeAfterLimit, retireLeftDeliveryDrafts,
     review, reviewDeps, runs, scanSessions, sendToResolvedTarget, sendToSession, sessionSummarySnapshot, slack,
@@ -419,6 +419,9 @@ function startSchedulers(ctx) {
     // handed to Owner for good, a terminal decision a bounded index could make on a
     // session it has not caught up with. It scans only when a note is due.
     sessions: () => scanSessions({ fresh: true }),
+    // An author on another node is not in that scan: its node's read of it, or null
+    // for one that is not on another node (then it really is absent).
+    remoteSession: async (sessionId) => (remoteSession({ id: sessionId }, deps) ? loadSessionForAction(sessionId, deps) : null),
     send: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }),
   });
   startAutoCompact();
