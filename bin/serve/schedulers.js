@@ -738,8 +738,10 @@ function startSchedulers(ctx) {
       health.record('stalled', { ok: false, cadenceMs: 60e3, error });
       process.stderr.write(`keep serve: stalled sweep failed: ${error.message}\n`);
       // A sweep that failed elsewhere (companion state, ps) must not silence the
-      // in-flight row: it scans for itself.
-      await require('../inflight.js').tick({ root: keep.ROOT, record: health.record });
+      // in-flight row or leave `keep stalled` listing yesterday's records: refresh
+      // just those rows of current.json from a fresh scan, then escalate that scan.
+      const scanned = await stalled.refreshInflight({ root: keep.ROOT });
+      await require('../inflight.js').tick({ root: keep.ROOT, scanned, record: health.record });
     } finally {
       stalledRunning = false;
     }

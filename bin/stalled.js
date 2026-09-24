@@ -535,15 +535,18 @@ async function sweep(options = {}) {
   // `inflight` health row from the same scan. A failed scan is reported to the caller
   // rather than failing the rest of the sweep.
   let inflightScan = null;
+  const prior = readCurrent(options);
   if (options.includeInflight) {
     try {
       inflightScan = await (deps.scanInflight || require('./inflight.js').scan)({ root, now });
-      detected.push(...inflightScan.items);
+      detected.push(...inflightScan.items, ...carriedInflight(inflightScan, prior));
     } catch (error) {
       inflightScan = { items: [], errors: [], error };
+      // A scan that did not happen is not an empty one: keep what was listed.
+      detected.push(...prior.filter((item) => item.kind === 'inflight'));
     }
   }
-  const current = reconcileFirstSeen(detected, readCurrent(options), now);
+  const current = reconcileFirstSeen(detected, prior, now);
   saveCurrent(current, options);
   let detail = discovery.known ? `${current.length} current` : 'companion state unknown';
   if (inflightScan && inflightScan.items.length) detail += `; ${inflightScan.items.length} in flight past max age`;
@@ -561,6 +564,35 @@ async function sweep(options = {}) {
     detail += `; reap failed: ${reapError.message || reapError}`;
   }
   return { items: current, detail, ...(inflightScan ? { inflight: inflightScan } : {}) };
+}
+
+// The in-flight rows a kind that could not be read this tick last listed: an EMFILE
+// is not every one of its records finishing at once.
+function carriedInflight(scanned, prior) {
+  const failed = new Set(scanned.failedKinds || []);
+  if (!failed.size) return [];
+  const listed = new Set(scanned.items.map((item) => item.id));
+  return (prior || []).filter((item) => item.kind === 'inflight' && failed.has(item.recordKind) && !listed.has(item.id));
+}
+
+// Only the in-flight rows of current.json, from a fresh scan, for when the rest of the
+// sweep threw: `keep stalled` must not keep showing records that have since finished,
+// or miss ones that have since stuck. Everything else is left as the last sweep wrote it.
+async function refreshInflight(options = {}) {
+  const now = number(options.now, Date.now());
+  const prior = readCurrent(options);
+  let scanned;
+  try {
+    scanned = await ((options.deps || {}).scanInflight || require('./inflight.js').scan)({ root: rootOf(options), now });
+  } catch (error) {
+    return { items: [], errors: [], error };
+  }
+  const others = prior.filter((item) => item.kind !== 'inflight');
+  // A current.json that will not write leaves the list stale; the scan still feeds the
+  // health row and the card, so it is returned either way.
+  try { saveCurrent(reconcileFirstSeen([...others, ...scanned.items, ...carriedInflight(scanned, prior)], prior, now), options); }
+  catch {}
+  return scanned;
 }
 
 function duration(ms) {
@@ -631,6 +663,7 @@ module.exports = {
   companionScript,
   execFileOutput,
   sweep,
+  refreshInflight,
   attentionItems,
   render,
 };

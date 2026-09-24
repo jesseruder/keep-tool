@@ -127,7 +127,8 @@ test('every in-flight kind is named past its max age and not before; terminal re
     { id: 'obl-young-0003', at: new Date(NOW - HOUR).toISOString(), state: 'open' },
   ]);
 
-  // Unblock: resolved two days ago, never delivered; one still waiting on its upstream.
+  // Unblock records are not a kind (inflight.js says why): even a resolved record two
+  // days old, which may be waiting on a sibling upstream or a check_after, is not named.
   put(root, 'unblocked/dependent-card--upstream-card--2026-09-20T10-00.json', {
     dependent: 'dependent-card', upstream: 'upstream-card', createdAt: new Date(NOW - 50 * HOUR).toISOString(),
     resolvedAt: new Date(NOW - 48 * HOUR).toISOString(), deliveredAt: null, gaveUp: null, attempts: 2,
@@ -141,6 +142,8 @@ test('every in-flight kind is named past its max age and not before; terminal re
   put(root, 'session-restarts.json', [
     { sessionId: restarting, pane: pane(), status: 'recovery-needed', mode: 'force', at: NOW - 3 * HOUR },
     { sessionId: sid(), status: 'done', at: NOW - 99 * HOUR },
+    // An idle-mode restart waits for a busy session and keeps its first `at`: legitimate.
+    { sessionId: sid(), status: 'queued', mode: 'idle', at: NOW - 30 * HOUR },
   ]);
 
   // Pi job running thirteen hours; a finished one.
@@ -167,9 +170,12 @@ test('every in-flight kind is named past its max age and not before; terminal re
   assert.deepEqual(byKind('registry-lock'), ['pid-4242']);
   assert.deepEqual(byKind('worktree-recreation'), ['slug']);
   assert.equal(byKind('pi-opening').length, 1);
+  assert.match(items.find((item) => item.recordKind === 'pi-opening').resolve, /remove the file by hand/);
+  // The handoff queue's max follows the queue's own cap (45 minutes by default): twice it.
+  assert.equal(items.find((item) => item.recordKind === 'handoff-queue').maxAgeMs, 90 * MINUTE);
   assert.equal(byKind('node-codex-launch').length, 1);
   assert.deepEqual(byKind('review-obligation'), [oblOld]);
-  assert.deepEqual(byKind('unblock'), ['dependent-card--upstream-card--2026-09-20T10-00']);
+  assert.deepEqual(byKind('unblock'), []);
   assert.deepEqual(byKind('session-restart'), [restarting]);
   assert.deepEqual(byKind('pi-job'), [piJob]);
   assert.deepEqual(byKind('pending-checkin'), ['fixture-card-probe-1']);
@@ -217,20 +223,34 @@ test('max ages follow their environment overrides', async (t) => {
   assert.equal((await inflight.scan({ root, now: NOW })).items.length, 1);
 });
 
+// An in-memory registry of cards shaped the way keep.addTask/checkinTask/loadTask
+// behave: a check-in appends to the body. `failAdd` and `failCheckin` make the next
+// write throw, before the save ('before') or after it ('after', as a git commit that
+// hits a held index.lock does).
 function fakeCards() {
   const calls = { added: [], checkins: [] };
   const cards = new Map();
+  const fail = { add: '', checkin: '' };
   const deps = {
     addTask: (options) => {
-      const id = `inflight-card-${calls.added.length + 1}`;
+      if (fail.add === 'before') { fail.add = ''; throw new Error('registry lock busy'); }
+      const id = `inflight-card-${cards.size + 1}`;
       calls.added.push(options);
-      cards.set(id, { id, fm: { status: options.status } });
+      cards.set(id, { id, fm: { status: options.status, title: options.title, tags: options.tags }, body: options.note || '' });
+      if (fail.add === 'after') { fail.add = ''; throw new Error('index.lock exists'); }
       return cards.get(id);
     },
-    checkin: (id, payload) => { calls.checkins.push({ id, ...payload }); },
+    checkin: (id, payload) => {
+      if (fail.checkin === 'before') { fail.checkin = ''; throw new Error('registry lock busy'); }
+      calls.checkins.push({ id, ...payload });
+      cards.get(id).body += `\n${payload.message}`;
+      if (fail.checkin === 'after') { fail.checkin = ''; throw new Error('index.lock exists'); }
+    },
     loadTask: (id) => cards.get(id) || null,
+    findOpenCard: async () => [...cards.values()].find((card) => card.fm.status !== 'done'
+      && card.fm.title === inflight.CARD_TITLE && card.fm.tags.includes('inflight'))?.id || '',
   };
-  return { calls, cards, deps };
+  return { calls, cards, deps, fail };
 }
 
 function item(kind, id, ageMs = 2 * HOUR) {
@@ -240,7 +260,7 @@ function item(kind, id, ageMs = 2 * HOUR) {
   };
 }
 
-test('escalation opens one card, stays quiet while the set holds, and checks in only when it changes', async (t) => {
+test('escalation opens one card, stays quiet while the set holds, and checks in the delta when it changes', async (t) => {
   const root = registry(t);
   const { calls, cards, deps } = fakeCards();
   const [a, b] = [sid(), sid()];
@@ -260,35 +280,200 @@ test('escalation opens one card, stays quiet while the set holds, and checks in 
   assert.equal(calls.added.length, 1);
   assert.equal(calls.checkins.length, 0);
 
-  // A second record joins: one check-in on the same card naming it.
-  result = await inflight.escalate([item('account-handoff', a), item('delivery', b)], { root, now: NOW, deps });
+  // A second record joins: one check-in on the same card naming only it, with a count.
+  let at = NOW + 10 * MINUTE;
+  result = await inflight.escalate([item('account-handoff', a), item('delivery', b)], { root, now: at, deps });
   assert.equal(result.action, 'updated');
   assert.equal(result.cardId, 'inflight-card-1');
   assert.equal(calls.checkins.length, 1);
-  assert.match(calls.checkins[0].message, new RegExp(`New: delivery:${b}\\.`));
+  assert.match(calls.checkins[0].message, /^2 records past max age now \(was 1\)\.\nNew:\n- delivery /);
+  assert.ok(!calls.checkins[0].message.includes(`account-handoff ${a} (`), 'the unchanged record is not repeated');
+
+  // One tick without the delivery is a blink, not a finish.
+  at += MINUTE;
+  assert.equal((await inflight.escalate([item('account-handoff', a)], { root, now: at, deps })).action, 'unchanged');
+  // Gone for longer than GONE_AFTER_MS: reported finished, once.
+  at += inflight.GONE_AFTER_MS;
+  result = await inflight.escalate([item('account-handoff', a)], { root, now: at, deps });
+  assert.equal(result.action, 'updated');
+  assert.match(calls.checkins.at(-1).message, new RegExp(`Finished or gone: delivery:${b}`));
+  assert.equal(calls.checkins.length, 2);
 
   // Everything finished: one closing check-in, and the card is left open for Owner.
-  result = await inflight.escalate([], { root, now: NOW, deps });
+  at += inflight.GONE_AFTER_MS;
+  result = await inflight.escalate([], { root, now: at, deps });
   assert.equal(result.action, 'cleared');
-  assert.equal(calls.checkins.length, 2);
-  assert.match(calls.checkins[1].heading, /cleared/);
-  assert.equal((await inflight.escalate([], { root, now: NOW, deps })).action, 'none');
-  assert.equal(calls.checkins.length, 2);
+  assert.equal(calls.checkins.length, 3);
+  assert.match(calls.checkins[2].heading, /cleared/);
+  assert.equal((await inflight.escalate([], { root, now: at, deps })).action, 'none');
 
-  // A new record while that card is still open re-uses it.
-  result = await inflight.escalate([item('delivery', b)], { root, now: NOW, deps });
+  // A new record while that card is still open re-uses it. A parked (waiting) card is
+  // still open.
+  cards.get('inflight-card-1').fm.status = 'waiting';
+  result = await inflight.escalate([item('delivery', b)], { root, now: at, deps });
   assert.equal(result.action, 'updated');
   assert.equal(calls.added.length, 1);
+});
 
-  // Owner closes the card: the same records do not reopen it, a new one opens a fresh card.
-  cards.get('inflight-card-1').fm.status = 'done';
-  result = await inflight.escalate([item('delivery', b)], { root, now: NOW, deps });
-  assert.equal(result.action, 'dismissed');
-  assert.equal(calls.added.length, 1);
+test('a record whose owner drops it on a timer is reported expired, not finished', async (t) => {
+  const root = registry(t);
+  const { calls, deps } = fakeCards();
+  const launch = { ...item('node-codex-launch', 'launch1', 3 * HOUR), expiresAfterMs: 24 * HOUR };
+  const other = item('account-handoff', sid());
+  await inflight.escalate([launch, other], { root, now: NOW, deps });
+  await inflight.escalate([other], { root, now: NOW + 22 * HOUR, deps });
+  assert.match(calls.checkins.at(-1).message, /Expired unresolved .*: node-codex-launch:launch1/);
+  assert.ok(!/Finished or gone/.test(calls.checkins.at(-1).message));
+});
+
+test('a card write that throws after its save is adopted, never duplicated, and a failing write backs off', async (t) => {
+  const root = registry(t);
+  const { calls, cards, deps, fail } = fakeCards();
+  const a = sid();
+
+  // addTask saved the card, then its commit threw: the card is adopted.
+  fail.add = 'after';
+  let result = await inflight.escalate([item('account-handoff', a)], { root, now: NOW, deps });
+  assert.equal(result.action, 'adopted');
+  assert.equal(cards.size, 1);
+  for (let i = 1; i <= 3; i += 1) {
+    assert.equal((await inflight.escalate([item('account-handoff', a)], { root, now: NOW + i * MINUTE, deps })).action, 'unchanged');
+  }
+  assert.equal(cards.size, 1);
+
+  // A check-in whose commit threw after it was appended counts as done: no second copy.
+  const b = sid();
+  fail.checkin = 'after';
+  result = await inflight.escalate([item('account-handoff', a), item('delivery', b)], { root, now: NOW + 5 * MINUTE, deps });
+  assert.equal(result.action, 'updated');
+  assert.equal((await inflight.escalate([item('account-handoff', a), item('delivery', b)], { root, now: NOW + 6 * MINUTE, deps })).action, 'unchanged');
+  assert.equal(calls.checkins.length, 1);
+
+  // A write that fails before saving anything is rethrown, then not retried every minute.
   const c = sid();
-  result = await inflight.escalate([item('delivery', b), item('compact-swap', c)], { root, now: NOW, deps });
-  assert.equal(result.action, 'opened');
-  assert.equal(result.cardId, 'inflight-card-2');
+  const three = [item('account-handoff', a), item('delivery', b), item('compact-swap', c)];
+  fail.checkin = 'before';
+  await assert.rejects(inflight.escalate(three, { root, now: NOW + 7 * MINUTE, deps }), /registry lock busy/);
+  assert.equal((await inflight.escalate(three, { root, now: NOW + 8 * MINUTE, deps })).action, 'backoff');
+  assert.equal(calls.checkins.length, 1);
+  result = await inflight.escalate(three, { root, now: NOW + 7 * MINUTE + inflight.RETRY_BACKOFF_MS, deps });
+  assert.equal(result.action, 'updated');
+  assert.equal(calls.checkins.length, 2);
+
+  // The first creation failing outright backs off too, and never files a card per tick.
+  const other = registry(t);
+  const fresh = fakeCards();
+  fresh.fail.add = 'before';
+  await assert.rejects(inflight.escalate([item('delivery', b)], { root: other, now: NOW, deps: fresh.deps }), /registry lock busy/);
+  for (let i = 1; i < 20; i += 1) {
+    assert.equal((await inflight.escalate([item('delivery', b)], { root: other, now: NOW + i * MINUTE, deps: fresh.deps })).action, 'backoff');
+  }
+  assert.equal(fresh.cards.size, 0);
+  assert.equal((await inflight.escalate([item('delivery', b)], { root: other, now: NOW + 21 * MINUTE, deps: fresh.deps })).action, 'opened');
+  assert.equal(fresh.cards.size, 1);
+});
+
+test('a state file that will not write cannot make the next tick repeat a card write', async (t) => {
+  const root = registry(t);
+  const { cards, calls, deps } = fakeCards();
+  // .keep/stalled is a file, so the state's directory cannot be created.
+  fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.keep', 'stalled'), '');
+  const a = sid();
+  await assert.rejects(inflight.escalate([item('account-handoff', a)], { root, now: NOW, deps }));
+  assert.equal(cards.size, 1);
+  for (let i = 1; i <= 3; i += 1) {
+    await assert.rejects(inflight.escalate([item('account-handoff', a)], { root, now: NOW + i * MINUTE, deps }));
+  }
+  assert.equal(cards.size, 1);
+  assert.equal(calls.checkins.length, 0);
+});
+
+test('an unreadable kind is carried, not reported finished; a vanished or half-written record is just gone', async (t) => {
+  const root = registry(t);
+  const [a, b] = [sid(), sid()];
+  const handoff = (id) => ({ sessionId: id, pane: pane(), status: 'recovery-needed', phase: 'delivering-continuation',
+    sourceStopVerifiedAt: NOW - 3 * HOUR, targetAccountId: 'claude/two', updatedAt: NOW - 3 * HOUR });
+  put(root, `account-handoffs/${a}.json`, handoff(a));
+  put(root, `account-handoffs/${b}.json`, handoff(b));
+  put(root, `account-handoffs/${sid()}.json`, '{"half":');
+  const clean = await inflight.scan({ root, now: NOW });
+  assert.deepEqual(clean.errors, []);
+  assert.equal(clean.items.length, 2);
+
+  // EMFILE on one record's read: the kind is reported unread, not emptied.
+  const fsp = require('node:fs/promises');
+  const flaky = { ...fsp, readFile: async (file, ...rest) => {
+    if (String(file).endsWith(`${b}.json`)) { const error = new Error('too many open files'); error.code = 'EMFILE'; throw error; }
+    return fsp.readFile(file, ...rest);
+  } };
+  const glitch = await inflight.scan({ root, now: NOW + MINUTE, fs: flaky });
+  assert.deepEqual(glitch.failedKinds, ['account-handoff']);
+  assert.match(glitch.errors[0], /account-handoff: EMFILE/);
+  assert.deepEqual(glitch.items.map((entry) => entry.recordId), [a]);
+
+  // Escalation carries b through the glitch, however long it lasts: no "finished".
+  const { calls, deps } = fakeCards();
+  await inflight.escalate(clean.items, { root, now: NOW, deps });
+  for (let i = 1; i <= 30; i += 1) {
+    const result = await inflight.escalate(glitch.items, { root, now: NOW + i * MINUTE, deps, failedKinds: glitch.failedKinds });
+    assert.equal(result.action, 'unchanged');
+  }
+  assert.equal(calls.checkins.length, 0);
+
+  // The row fails and says so, while still naming what it read.
+  const rows = [];
+  await inflight.tick({ root, now: NOW + 31 * MINUTE, deps, record: (name, entry) => rows.push(entry), scanned: glitch });
+  assert.match(rows[0].error, /unreadable: account-handoff: EMFILE/);
+
+  // And the stalled sweep keeps listing b from what it last saw.
+  const options = { root, sessions: [], jobs: [], brokers: [], psOutput: '', includeInflight: true, autoReap: false };
+  await stalled.sweep({ ...options, now: NOW });
+  const swept = await stalled.sweep({ ...options, now: NOW + MINUTE, deps: { scanInflight: async () => glitch } });
+  assert.deepEqual(swept.items.map((entry) => entry.recordId).sort(), [a, b].sort());
+});
+
+test('closing the card dismisses its records for good: a blink or a restamp does not reopen it', async (t) => {
+  const root = registry(t);
+  const { calls, cards, deps } = fakeCards();
+  const [a, b] = [sid(), sid()];
+  let at = NOW;
+  await inflight.escalate([item('account-handoff', a), item('delivery', b)], { root, now: at, deps });
+  cards.get('inflight-card-1').fm.status = 'done';
+
+  // Still there: dismissed.
+  at += MINUTE;
+  assert.equal((await inflight.escalate([item('account-handoff', a), item('delivery', b)], { root, now: at, deps })).action, 'dismissed');
+  // `a` goes away long enough to count as gone, then comes back restamped (a console
+  // Retry that stuck again): still dismissed, no new card.
+  at += inflight.GONE_AFTER_MS + MINUTE;
+  assert.equal((await inflight.escalate([item('delivery', b)], { root, now: at, deps })).action, 'dismissed');
+  at += HOUR;
+  assert.equal((await inflight.escalate([item('account-handoff', a, 5 * MINUTE), item('delivery', b)], { root, now: at, deps })).action, 'dismissed');
+  assert.equal(calls.added.length, 1);
+
+  // A record the closed card never named opens a new card.
+  const c = sid();
+  at += MINUTE;
+  const reopened = await inflight.escalate([item('account-handoff', a), item('delivery', b), item('compact-swap', c)], { root, now: at, deps });
+  assert.equal(reopened.action, 'opened');
+  assert.equal(reopened.cardId, 'inflight-card-2');
+  cards.get('inflight-card-2').fm.status = 'done';
+
+  // A dismissed record absent for longer than DISMISS_FORGET_MS is forgotten: its
+  // return is a new occurrence. Absent for less, it is still dismissed.
+  // (A one-tick absence is a blink: `c` is still carried, and still dismissed.)
+  at += MINUTE;
+  assert.equal((await inflight.escalate([], { root, now: at, deps })).action, 'dismissed');
+  assert.equal((await inflight.escalate([], { root, now: at + inflight.GONE_AFTER_MS, deps })).action, 'none');
+  assert.equal((await inflight.escalate([item('compact-swap', c)], { root, now: at + HOUR, deps })).action, 'dismissed');
+  at += HOUR + inflight.GONE_AFTER_MS + MINUTE;
+  assert.equal((await inflight.escalate([], { root, now: at, deps })).action, 'none');
+  at += inflight.DISMISS_FORGET_MS;
+  assert.equal((await inflight.escalate([], { root, now: at, deps })).action, 'none');
+  const back = await inflight.escalate([item('compact-swap', c)], { root, now: at + MINUTE, deps });
+  assert.equal(back.action, 'opened');
+  assert.equal(back.cardId, 'inflight-card-3');
 });
 
 test('the tick fails the health row with text that does not change as records age, and passes when clear', async (t) => {
@@ -367,5 +552,16 @@ test('the escalation card is a real Keep card that addTask and checkinTask accep
   assert.match(card.body, new RegExp(`keep handoff ${a}`));
   const updated = await inflight.escalate([item('account-handoff', a), item('delivery', b)], { root, now: NOW });
   assert.equal(updated.action, 'updated');
-  assert.match(keep.loadTask(opened.cardId).body, new RegExp(`New: delivery:${b}`));
+  assert.match(keep.loadTask(opened.cardId).body, new RegExp(`New:\\n- delivery ${b}`));
+
+  // A restarted daemon that lost its state file adopts the open card instead of filing
+  // a second one, and tells it the current list.
+  inflight._resetMemory();
+  fs.rmSync(path.join(root, '.keep', 'stalled', 'inflight.json'));
+  const c = sid();
+  const adopted = await inflight.escalate([item('account-handoff', a), item('delivery', b), item('compact-swap', c)], { root, now: NOW });
+  assert.equal(adopted.action, 'adopted');
+  assert.equal(adopted.cardId, opened.cardId);
+  assert.match(keep.loadTask(opened.cardId).body, new RegExp(`compact-swap ${c}`));
+  assert.ok(!fs.existsSync(path.join(root, 'tasks', `${inflight.cardSlug()}-2.md`)));
 });

@@ -1000,17 +1000,16 @@ account transfer in `recovery-needed` for fourteen hours, a delivery journal ret
 |---|---|---|---|---|
 | `delivery` | `delivery/<hash>.json` | in the top directory (not `settled/`) | 2 h from `createdAt` | `keep pane screen <pane>`; submit or clear the draft; re-run the byte-identical `keep tell` |
 | `account-handoff` | `account-handoffs/<session>.json` | `stopping` … `delivering`, `staged`, `recovery-needed` | 30 min from `updatedAt`; 24 h if the source never stopped | `keep handoff <session> --pane <pane> --account <target>`; Abandon in the console if the source never stopped |
-| `handoff-queue` | `handoff-queue/<session>.json` | `queued` | 90 min from `enqueuedAt` | the `handoff-queue` health row; cancel or retry from the console |
+| `handoff-queue` | `handoff-queue/<session>.json` | `queued` | twice `KEEP_HANDOFF_QUEUE_MAX_MIN` (90 min by default) from `enqueuedAt` | the `handoff-queue` health row; cancel or retry from the console |
 | `session-move` | `session-moves/mv-*.json` | `stopping` … `verifying`, `recovery-needed` | 1 h from `updatedAt` | `keep move --recover <tx>` or `--abandon <tx>` |
 | `portable-transfer` | `portable-transfers/<key>.json` | `prepared`, `launching`, `ambiguous`, `awaiting-setup` | 1 h; 6 h for `awaiting-setup` | `keep transfer … --resolve-session <session>` |
 | `compact-swap` | `compact/<session>.swap.json` | present | 2 h from the swap or the end of its deferral | restore the model in the session; never delete the record |
 | `registry-lock` | `lock/owner.json` | present | 10 min | find the holder with `ps -p <pid>` |
 | `worktree-recreation` | `worktree-recreations/<hash>.json` | present | 30 min from `startedAt` | inspect the worktree; `wt rm --force --delete <path>` if the recreation died |
-| `pi-opening` | `pi-opening/<session>-<uuid>.txt` | present | 30 min (file mtime) | reopen the Pi session |
-| `node-codex-launch` | `node-codex-launches/<hash>.json` | present | 2 h from `launchedAt` | `keep pane screen <pane>` on the node |
+| `pi-opening` | `pi-opening/<session>-<uuid>.txt` | present | 30 min (file mtime) | read it (the opening Pi never received), relaunch if the work matters, remove the file by hand |
+| `node-codex-launch` | `node-codex-launches/<hash>.json` | present | 2 h from `launchedAt`; its owner drops it at 24 h, reported as expired | `keep pane screen <pane>` on the node |
 | `review-obligation` | `review-obligations/<card>.json` entries | `open`, `awaiting-verdict` | 8 h from `at` / `stateAt` | `keep reviewed <card> --job <job> …` or `keep reviewing <card> --drop <id> -m why` |
-| `unblock` | `unblocked/*.json` | resolved, not delivered, not given up | 24 h from `resolvedAt` | pick the card up, or `keep wait-on <card> <upstream> --remove` |
-| `session-restart` | `session-restarts.json` entries | `queued`, `restarting`, `recovery-needed` | 2 h from `at` | `keep force-restart <session> --pane <pane> --recover` (Owner's approval) |
+| `session-restart` | `session-restarts.json` entries | `restarting`, `recovery-needed`, `queued` unless idle-mode | 2 h from `at` | `keep force-restart <session> --pane <pane> --recover` (Owner's approval) |
 | `pi-job` | `pi-jobs/<id>/job.json` | `queued`, `running`, `cancelling` | 12 h from the last write | `keep pi cancel <id>` |
 | `pending-checkin` | `runs/*.pending.json` | present | 1 h (file mtime) | the `pending check-in` lines in `serve.log`; `keep show <card>` |
 
@@ -1024,23 +1023,40 @@ none, and never from asking a pane, a transcript or another node. A record for a
 session on a node that is not answering is therefore not "stuck" for being unknowable;
 it is named only once it is old by its own account. Records that expire on their own
 (open-handoff routing hints, parked queue entries, review-queue items, background-job
-ledgers, holds, step claims) are not tracked.
+ledgers, holds, step claims) are not tracked. Neither are unblock records: one is stamped
+resolved while its card may still legitimately wait on another upstream, a
+`check_after` or a need, and the unblock sweep already gives up a deliverable one after
+a day. An idle-mode restart queued behind a busy session is legitimately waiting too.
+A kind whose directory or a record in it cannot be read (EMFILE, EIO, EACCES, but not
+a record that vanished or is half-written) is reported on the row as unreadable, and its
+records are carried from the last reading rather than reported finished.
 
 A record past its max age shows up three ways:
 
 - **`keep stalled`** and the console's stalled attention, one line per record with its
-  age, what it is waiting for, and the resolving command.
+  age, what it is waiting for, and the resolving command. These rows are refreshed even
+  when the rest of the stalled sweep fails.
 - **The `inflight` health row** fails while any record is past its max age. Its error
   names record identities only, never ages, so an acknowledged row stays acknowledged
   while the same records age. Self-repair excludes the row.
 - **One Keep card**, `Keep: in-flight records past their max age` (project
   `~/keep-tool`, tags `personal`, `inflight`), naming every record. The daemon keeps
   its id in `.keep/stalled/inflight.json` and never opens a second one while it is
-  open: when the set of records changes it adds one check-in naming what is new and
-  what finished, and when the set empties it checks in once and leaves the card for
-  Owner to close. Closing the card while records remain dismisses those records; only
-  a record it never named opens a new card. The card does not depend on self-repair
-  being enabled.
+  open (anything but `done`: a card Owner parked as waiting, blocked or deferred still
+  takes the check-ins). When the set of records changes it adds one check-in with the
+  new count, the new records in full, and the ids that finished, or expired where their
+  owner drops them on a timer; a record has to be absent for ten minutes before it
+  counts as finished, so a blink never reads as finished-then-new. When the set empties
+  it checks in once and leaves the card for Owner to close.
+- Closing the card dismisses the records it named, keyed by record identity (not age,
+  so a console Retry that restamps a record which then sticks again stays dismissed).
+  A dismissed record is forgotten only after six hours absent. Only a record none of
+  those covers opens a new card.
+- A card write that throws does not repeat every tick. A card or check-in already saved
+  when its commit threw (a held `index.lock`) is recognised and adopted; a daemon that
+  lost its state finds its open card by title and tag instead of filing a second; any
+  other failure is retried after twenty minutes. The card does not depend on
+  self-repair being enabled.
 
 This is escalation only. Keep never mutates, settles, retires or deletes a record
 because it is old: each owner's retirement rules (a typed delivery journal on a live

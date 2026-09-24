@@ -200,15 +200,20 @@ const KINDS = [
     },
   },
   // The handoff queue, .keep/handoff-queue/<session>.json (bin/handoff-queue.js).
-  // `queued` is the only in-flight status: the queue's own tick parks an entry 45
-  // minutes after it was enqueued (KEEP_HANDOFF_QUEUE_MAX_MIN), and parked, moved and
-  // cancelled are decisions it has made. A `queued` entry older than that is one the
-  // tick has stopped reaching, and the queue never collects a queued entry itself.
+  // `queued` is the only in-flight status: the queue's own tick parks an entry once it
+  // has been enqueued for KEEP_HANDOFF_QUEUE_MAX_MIN (45 by default), and parked, moved
+  // and cancelled are decisions it has made. The max age is twice that cap, read from
+  // the queue itself so the two cannot drift: a `queued` entry older than that is one
+  // the tick has stopped reaching, and the queue never collects a queued entry itself.
   {
     kind: 'handoff-queue',
     dir: 'handoff-queue',
     match: json,
-    maxAgeMs: () => envMinutes('KEEP_INFLIGHT_HANDOFF_QUEUE_MIN', 90 * MINUTE_MS),
+    maxAgeMs: () => {
+      let capMs = 45 * MINUTE_MS;
+      try { capMs = require('./handoff-queue.js').maxMinutes() * MINUTE_MS; } catch {}
+      return envMinutes('KEEP_INFLIGHT_HANDOFF_QUEUE_MIN', Math.max(2 * capMs, 30 * MINUTE_MS));
+    },
     describe(entry) {
       if (entry.status !== 'queued' || !entry.sessionId) return null;
       return {
@@ -309,6 +314,8 @@ const KINDS = [
         id: entry.sessionId,
         state: entry.restoreDeferredReason ? `deferred (${entry.restoreDeferredReason})` : 'restore pending',
         since: latest(entry.at, entry.restoreExpiryFrom, entry.restoreDeferredUntil),
+        // The restore pass drops it unrestored a day after this (KEEP_COMPACT_SWAP_MAX_AGE_MIN).
+        expiresAfterMs: 24 * HOUR_MS,
         sessionId: entry.sessionId,
         waitingFor: `the model restore ${entry.restoreCommand || 'to the original model'}`,
         resolve: `type ${entry.restoreCommand || '/model <original>'} in the session's pane if it is alive; `
@@ -359,7 +366,11 @@ const KINDS = [
   },
   // Pi opening messages, .keep/pi-opening/<session>-<uuid>.txt (bin/launch-prep.js).
   // The Pi extension deletes its file when the session starts, seconds after the
-  // launch; nothing else ever does. Plain text, so its age is the file's mtime.
+  // launch; nothing else ever does. Plain text, so its age is the file's mtime. A file
+  // still here means that launch never started Pi, and nothing will ever read it: a
+  // new launch writes a new file. So the answer is not "open it again" (that leaves
+  // this one where it is) but to read it, relaunch if the work still matters, and then
+  // remove the file by hand; Keep never removes it.
   {
     kind: 'pi-opening',
     dir: 'pi-opening',
@@ -374,8 +385,9 @@ const KINDS = [
         state: 'opening not read',
         since: 0,
         sessionId,
-        waitingFor: 'the Pi session to start and read its opening message',
-        resolve: `keep pane screen for Pi session ${sessionId}; if it never started, open it again (the file is its opening message)`,
+        waitingFor: 'a Pi session that never started to read its opening message',
+        resolve: `read ${record.file ? path.basename(record.file) : 'the file'} (the opening Pi never received); `
+          + 'relaunch the work if it still matters, then remove the file by hand: nothing else will',
       };
     },
   },
@@ -406,34 +418,20 @@ const KINDS = [
       }));
     },
   },
-  // Unblock records, .keep/unblocked/*.json (bin/unblock.js). A record waiting on its
-  // upstream is legitimately open for as long as the upstream is, so only a resolved
-  // one counts: resolvedAt set, nothing delivered, not given up. The sweep gives up a
-  // day after creation or twelve tries, but only while the card has no check_after and
-  // no open needs; a card with either keeps the record pending forever. A day from
-  // the resolution covers every automatic path.
-  {
-    kind: 'unblock',
-    dir: 'unblocked',
-    match: json,
-    maxAgeMs: () => envMinutes('KEEP_INFLIGHT_UNBLOCK_MIN', 24 * HOUR_MS),
-    describe(entry, record) {
-      if (Array.isArray(entry) || !entry.resolvedAt || entry.deliveredAt || entry.gaveUp || !entry.dependent) return null;
-      return {
-        id: record.name.replace(/\.json$/, ''),
-        state: `resolved, undelivered (${number(entry.attempts)} attempts)`,
-        since: latest(entry.resolvedAt),
-        sessionId: entry.sessionId,
-        waitingFor: `delivery of "${entry.upstream || entry.upstreamId || 'its upstream'} is resolved" to ${entry.dependent}`,
-        resolve: `keep show ${entry.dependent}: pick it up (keep open ${entry.dependent}), `
-          + `or keep wait-on ${entry.dependent} ${entry.upstream || entry.upstreamId || '<upstream>'} --remove`,
-      };
-    },
-  },
+  // Unblock records (.keep/unblocked, bin/unblock.js) are deliberately not a kind.
+  // resolvedAt is stamped when the record's own upstream resolves, even while the
+  // dependent still waits on other upstreams, a check_after or an open need, and
+  // telling those apart means loading every upstream card and asking
+  // keep.dependencyResolved of each: the unblock sweep's own work, not a watchdog's.
+  // And the one wait that is not legitimate, a deliverable record nobody delivered, is
+  // already bounded there (given up a day after creation or after twelve tries, then
+  // surfaced as an `unblocked` attention row). A stuck unblock sweep is its health row.
   // The session restart queue, .keep/session-restarts.json (bin/session-restart.js),
-  // one array. `queued` waits for the session to go idle, `restarting` for the
-  // restart to finish, `recovery-needed` for someone to recover an interrupted forced
-  // restart. A restart takes a minute; two hours covers a long idle wait.
+  // one array. `restarting` waits for the restart to finish, `recovery-needed` for
+  // someone to recover an interrupted forced restart, and a `queued` now/force entry
+  // runs at once. A restart takes a minute. A `queued` idle-mode entry is left out: it
+  // waits for the session to stop working, keeps its original `at` while refused as
+  // busy, and a session busy for an afternoon is not a stuck restart.
   {
     kind: 'session-restart',
     dir: '.',
@@ -441,14 +439,15 @@ const KINDS = [
     maxAgeMs: () => envMinutes('KEEP_INFLIGHT_RESTART_MIN', 2 * HOUR_MS),
     describe(entry) {
       if (!Array.isArray(entry)) return null;
-      return entry.filter((item) => item && ['queued', 'restarting', 'recovery-needed'].includes(item.status) && item.sessionId)
+      return entry.filter((item) => item && item.sessionId
+        && (['restarting', 'recovery-needed'].includes(item.status) || item.status === 'queued' && item.mode !== 'idle'))
         .map((item) => ({
           id: item.sessionId,
           state: `${item.status} (${item.mode || 'now'})`,
           since: latest(item.at),
           sessionId: item.sessionId,
           pane: item.pane,
-          waitingFor: item.status === 'queued' ? 'the session to go idle so it can restart'
+          waitingFor: item.status === 'queued' ? 'the restart queue to run it'
             : item.status === 'restarting' ? 'the restart to finish' : 'recovery of an interrupted forced restart',
           resolve: item.status === 'recovery-needed'
             ? `keep force-restart ${item.sessionId} --pane ${item.pane || '<pane>'} --recover (needs Owner's approval)`
@@ -512,6 +511,8 @@ const KINDS = [
         id: record.name.replace(/\.json$/, '').slice(0, 16),
         state: 'awaiting adoption',
         since: latest(entry.launchedAt, entry.at),
+        // late-adoption.js unlinks it by mtime a day on; gone after that is not adopted.
+        expiresAfterMs: 24 * HOUR_MS,
         node: entry.node,
         pane: entry.pane,
         waitingFor: `the Codex session launched on ${entry.node || 'its node'} to be adopted${entry.card ? ` for ${entry.card}` : ''}`,
@@ -534,6 +535,7 @@ async function readRecords(dir, kind, io = fsp) {
   // `nested` kinds keep one directory per record with a fixed file inside
   // (.keep/pi-jobs/<id>/job.json): one level, never a walk.
   const wanted = names.filter(kind.match).sort().map((name) => (kind.nested ? path.join(name, kind.nested) : name));
+  let failure = null;
   for (const name of wanted) {
     const file = path.join(dir, name);
     try {
@@ -544,12 +546,17 @@ async function readRecords(dir, kind, io = fsp) {
       // Objects, or arrays for the kinds that keep several records in one file.
       if (!entry || typeof entry !== 'object') continue;
       records.push({ name, file, entry, mtimeMs: stat.mtimeMs });
-    } catch {
-      // Removed mid-scan (its owner finished it), or half-written. Neither is stuck;
-      // an unreadable record that stays unreadable is its owner's watchdog's to name.
+    } catch (error) {
+      // Only two failures say the record is not in flight: it was removed mid-scan
+      // (its owner finished it), or it is half-written and its owner is mid-write. Any
+      // other (EMFILE, EIO, EACCES) says nothing about the record, so the whole kind is
+      // reported as unread for this tick: escalation then keeps what it last knew of
+      // it rather than calling every one of its records finished.
+      if (error && (error.code === 'ENOENT' || error instanceof SyntaxError)) continue;
+      failure = failure || error;
     }
   }
-  return { records, error: null };
+  return { records, error: failure };
 }
 
 // Pure over what readRecords returned, so a test can feed it shapes directly.
@@ -589,6 +596,7 @@ function judgeOne(kind, record, described, now) {
     ...(described.sessionId ? { sessionId: String(described.sessionId) } : {}),
     ...(described.node ? { node: String(described.node) } : {}),
     ...(described.pane ? { pane: String(described.pane) } : {}),
+    ...(Number(described.expiresAfterMs) > 0 ? { expiresAfterMs: Number(described.expiresAfterMs) } : {}),
   };
 }
 
@@ -598,17 +606,23 @@ async function scan(options = {}) {
   const io = options.fs || fsp;
   const items = [];
   const errors = [];
+  const failedKinds = [];
   for (const kind of options.kinds || KINDS) {
     const dir = path.join(base, kind.dir);
     const { records, error } = await readRecords(dir, kind, io);
-    if (error) { errors.push(`${kind.kind}: ${error.code || error.message}`); continue; }
+    if (error) {
+      errors.push(`${kind.kind}: ${error.code || error.message}`);
+      failedKinds.push(kind.kind);
+    }
+    // What was read is still named; a failed kind's missing records are carried by
+    // escalate() and the stalled sweep from what they last saw.
     items.push(...judge(kind, records, now));
   }
   items.sort((a, b) => a.since - b.since || a.id.localeCompare(b.id));
   // Relative to the registry, so the card and the console never print a home path.
   const root = rootOf(options);
   for (const item of items) item.file = path.relative(root, item.file);
-  return { items, errors };
+  return { items, errors, failedKinds };
 }
 
 // ---------- rendering ----------
@@ -646,19 +660,59 @@ function cardText(items) {
 }
 
 // ---------- escalation ----------
+//
+// The state in .keep/stalled/inflight.json:
+//   cardId      the card this names records on (kept after it closes, to know it)
+//   keys        the record ids the card last named
+//   seen        id -> { lastSeenAt, since, recordKind, expiresAfterMs? } for every record
+//               past its age, so one that blinks out for a tick (a glitch, a mid-write
+//               read) is carried rather than reported finished and then new again
+//   dismissed   id -> lastSeenAt for records a card named and Owner then closed
+//   failedAt    the last card write that threw, for the retry backoff
+//
+// The daemon also keeps the latest state in memory and reads that first, so a state
+// file that will not write (a full disk) cannot make the next tick repeat a card
+// write it already made.
+
+// A record absent this long is finished or gone; shorter is a blink.
+const GONE_AFTER_MS = 10 * MINUTE_MS;
+// A dismissed record forgotten after this long absent: if it comes back after that, it
+// is a new occurrence and may open a card again.
+const DISMISS_FORGET_MS = 6 * HOUR_MS;
+// After a card write throws, the next attempt waits this long. A card write takes the
+// registry lock and commits; one that fails every minute would fail loudly for nothing.
+const RETRY_BACKOFF_MS = 20 * MINUTE_MS;
+// How many ids of a set change a check-in lists before summarising.
+const CHANGE_LIST_MAX = 12;
+
+const memory = new Map(); // root -> state
+
+function emptyState() {
+  return { cardId: '', keys: [], seen: {}, dismissed: {}, failedAt: 0, failedError: '', changedAt: 0 };
+}
+
+function normalizeState(value) {
+  const object = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
+  return {
+    cardId: typeof value.cardId === 'string' ? value.cardId : '',
+    keys: Array.isArray(value.keys) ? value.keys.map(String) : [],
+    seen: object(value.seen),
+    dismissed: object(value.dismissed),
+    failedAt: number(value.failedAt),
+    failedError: String(value.failedError || ''),
+    changedAt: number(value.changedAt),
+  };
+}
 
 async function readState(options = {}) {
-  try {
-    const value = JSON.parse(await fsp.readFile(stateFile(options), 'utf8'));
-    return {
-      cardId: typeof value.cardId === 'string' ? value.cardId : '',
-      keys: Array.isArray(value.keys) ? value.keys.map(String) : [],
-      changedAt: number(value.changedAt),
-    };
-  } catch { return { cardId: '', keys: [], changedAt: 0 }; }
+  const root = rootOf(options);
+  if (memory.has(root)) return normalizeState(JSON.parse(JSON.stringify(memory.get(root))));
+  try { return normalizeState(JSON.parse(await fsp.readFile(stateFile(options), 'utf8'))); }
+  catch { return emptyState(); }
 }
 
 async function writeState(value, options = {}) {
+  memory.set(rootOf(options), JSON.parse(JSON.stringify(value)));
   const file = stateFile(options);
   await fsp.mkdir(path.dirname(file), { recursive: true });
   const temp = `${file}.${process.pid}.tmp`;
@@ -671,92 +725,227 @@ async function writeState(value, options = {}) {
   }
 }
 
-function defaultDeps(deps = {}) {
+// The card's id is its title's slug, suffixed -2, -3, ... past every id that already
+// exists in tasks/ or archive/ (keep-core slugify). So every card this has ever opened
+// is on that one sequence, which ends at the first id in neither directory.
+function cardSlug() {
+  return CARD_TITLE.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48).replace(/-+$/, '');
+}
+
+async function exists(file) {
+  try { await fsp.access(file); return true; } catch { return false; }
+}
+
+function isOurCard(task) {
+  return cardOpen(task) && task.fm.title === CARD_TITLE
+    && Array.isArray(task.fm.tags) && task.fm.tags.includes(HEALTH_NAME);
+}
+
+function defaultDeps(deps = {}, options = {}) {
   const lazyKeep = () => require('./keep.js');
+  const loadTask = deps.loadTask || ((id) => { try { return lazyKeep().loadTask(id); } catch { return null; } });
   return {
-    addTask: deps.addTask || ((options) => lazyKeep().addTask(options)),
+    addTask: deps.addTask || ((payload) => lazyKeep().addTask(payload)),
     checkin: deps.checkin || ((id, payload) => lazyKeep().checkinTask(id, payload)),
     // A card that will not load reads as closed, which is what an archived or deleted
     // one is: the next set of stuck records opens a fresh card.
-    loadTask: deps.loadTask || ((id) => { try { return lazyKeep().loadTask(id); } catch { return null; } }),
+    loadTask,
+    // An open card of ours already in the registry: one a crashed tick created and
+    // never recorded, or one whose creation threw after the file was saved (a held
+    // git index.lock throws from commitAndPush, after saveTask).
+    findOpenCard: deps.findOpenCard || (async () => {
+      const root = rootOf(options);
+      const base = cardSlug();
+      for (let n = 1; n < 200; n += 1) {
+        const id = n === 1 ? base : `${base}-${n}`;
+        const live = await exists(path.join(root, 'tasks', `${id}.md`));
+        if (!live && !await exists(path.join(root, 'archive', `${id}.md`))) return '';
+        if (live && isOurCard(loadTask(id))) return id;
+      }
+      return '';
+    }),
   };
 }
 
+// Open means anything but done: a card Owner moved to waiting, blocked or deferred
+// has been parked, not dismissed, so changes still land on it as check-ins rather
+// than opening a second card beside it. Only `done` (or archived, which will not
+// load) dismisses the records it named.
 function cardOpen(task) {
   return Boolean(task && task.fm && task.fm.status && task.fm.status !== 'done');
 }
 
-// One card for every stuck record, keyed by the set of record identities. Returns
-// { cardId, action } where action is 'opened', 'updated', 'cleared', 'unchanged',
-// 'dismissed' or 'none'. Throws only when the card write itself fails; the caller
-// records that on the health row, and the state is left as it was so the next tick
-// retries.
+function marker(cardId, keys, label) {
+  const digest = require('crypto').createHash('sha256').update(JSON.stringify([cardId, label, keys])).digest('hex').slice(0, 12);
+  return `[inflight ${digest}]`;
+}
+
+function listIds(ids) {
+  if (ids.length <= CHANGE_LIST_MAX) return ids.join(', ');
+  return `${ids.slice(0, CHANGE_LIST_MAX).join(', ')} and ${ids.length - CHANGE_LIST_MAX} more`;
+}
+
+// A check-in that is safe to retry. checkinTask saves the card before it commits, so
+// a throw can come after the entry is already on the card; the marker says whether it
+// is, and a retry then counts as done rather than appending a second copy.
+function checkinOnce(deps, cardId, payload, tag) {
+  try {
+    deps.checkin(cardId, { ...payload, message: `${payload.message}\n${tag}` });
+  } catch (error) {
+    const task = deps.loadTask(cardId);
+    if (task && String(task.body || '').includes(tag)) return;
+    throw error;
+  }
+}
+
+// One card for every stuck record, keyed by record identity. Returns { cardId, action }
+// where action is 'opened', 'adopted', 'updated', 'cleared', 'unchanged', 'dismissed',
+// 'backoff' or 'none'. A card write that throws is rethrown after arming the backoff;
+// the caller records it on the health row.
 //
-// Closing the card is how Owner says "I have seen these": a closed card whose records
-// are all ones it already named stays closed (the health row and `keep stalled` still
-// show them). Only a record it never named opens a fresh card.
+// Closing the card is how Owner says "I have seen these". The ids it named are then
+// dismissed, and stay dismissed while they keep turning up and for six hours after
+// they last did; only a record none of those covers opens a new card. Identity is the
+// record (the session, the move, the journal), not its timestamp, so a console Retry
+// that restamps a record which then sticks again is still the one Owner dismissed.
 async function escalate(items, options = {}) {
   const now = number(options.now, Date.now());
-  const deps = defaultDeps(options.deps);
+  const deps = defaultDeps(options.deps, options);
+  const failedKinds = new Set(options.failedKinds || []);
   const state = await readState(options);
-  const keys = [...new Set((items || []).map((item) => item.id))].sort();
-  const task = state.cardId ? deps.loadTask(state.cardId) : null;
-  const open = cardOpen(task);
-  const same = keys.length === state.keys.length && keys.every((key, i) => key === state.keys[i]);
-  const known = new Set(state.keys);
 
-  if (!open && state.cardId && keys.length && keys.every((key) => known.has(key))) {
-    if (!same) await writeState({ cardId: state.cardId, keys, changedAt: now }, options);
-    return { cardId: state.cardId, action: 'dismissed' };
+  // Every id this tick knows is past its age: the ones read now, plus the ones read
+  // recently (a blink) or in a kind that could not be read this tick.
+  const byKey = new Map((items || []).map((item) => [item.id, item]));
+  const seen = {};
+  for (const [key, item] of byKey) {
+    seen[key] = { lastSeenAt: now, since: item.since, recordKind: item.recordKind,
+      ...(item.expiresAfterMs ? { expiresAfterMs: item.expiresAfterMs } : {}) };
   }
+  const gone = [];
+  for (const [key, entry] of Object.entries(state.seen)) {
+    if (seen[key]) continue;
+    if (failedKinds.has(entry.recordKind) || now - number(entry.lastSeenAt) < GONE_AFTER_MS) seen[key] = entry;
+    else gone.push(key);
+  }
+  const keys = Object.keys(seen).sort();
+
+  const dismissed = {};
+  for (const [key, at] of Object.entries(state.dismissed)) {
+    if (seen[key]) dismissed[key] = now;
+    else if (now - number(at) < DISMISS_FORGET_MS) dismissed[key] = number(at);
+  }
+
+  const next = { ...state, seen, dismissed };
+  const save = async (patch = {}) => { await writeState({ ...next, ...patch }, options); };
+
+  const cardFailed = async (error) => {
+    await save({ failedAt: now, failedError: String(error && error.message || error) }).catch(() => {});
+    throw error;
+  };
+  if (state.failedAt && now - state.failedAt < RETRY_BACKOFF_MS) {
+    await save();
+    return { cardId: state.cardId, action: 'backoff' };
+  }
+  next.failedAt = 0;
+  next.failedError = '';
+
+  let cardId = state.cardId;
+  const open = cardId ? cardOpen(deps.loadTask(cardId)) : false;
+  if (cardId && !open && state.keys.length) {
+    // The card was closed with records on it: those are dismissed now.
+    for (const key of state.keys) dismissed[key] = now;
+    next.keys = [];
+  }
+  const named = open ? state.keys : [];
 
   if (!keys.length) {
-    if (!state.keys.length) return { cardId: state.cardId, action: 'none' };
-    if (open) {
-      deps.checkin(state.cardId, {
+    if (!named.length) { await save({ keys: [] }); return { cardId, action: 'none' }; }
+    try {
+      checkinOnce(deps, cardId, {
         heading: 'in-flight records cleared',
-        message: `Every record this card named has finished or gone (${state.keys.join(', ')}). Keep leaves the card for you to close.`,
+        message: `Every record this card named has finished or gone (${listIds(named)}). Keep leaves the card for you to close.`,
         linkSession: false, commitLabel: HEALTH_NAME,
-      });
-    }
-    await writeState({ cardId: state.cardId, keys: [], changedAt: now }, options);
-    return { cardId: state.cardId, action: 'cleared' };
+      }, marker(cardId, [], 'cleared'));
+    } catch (error) { return cardFailed(error); }
+    await save({ keys: [], changedAt: now });
+    return { cardId, action: 'cleared' };
   }
-
-  if (open && same) return { cardId: state.cardId, action: 'unchanged' };
 
   if (open) {
-    const before = new Set(state.keys);
-    const after = new Set(keys);
+    const same = keys.length === named.length && keys.every((key, i) => key === named[i]);
+    if (same) { await save(); return { cardId, action: 'unchanged' }; }
+    const before = new Set(named);
     const added = keys.filter((key) => !before.has(key));
-    const gone = state.keys.filter((key) => !after.has(key));
-    const change = [
-      added.length ? `New: ${added.join(', ')}.` : '',
-      gone.length ? `Finished or gone: ${gone.join(', ')}.` : '',
-    ].filter(Boolean).join(' ');
-    deps.checkin(state.cardId, {
-      heading: 'in-flight records changed',
-      message: `${change}\n\n${cardText(items)}`,
-      linkSession: false, commitLabel: HEALTH_NAME,
+    const left = named.filter((key) => !seen[key]);
+    // A record whose owner drops it on a timer (a node launch nobody adopted, a model
+    // swap the restore pass gave up on) did not finish: it expired unresolved.
+    const expired = left.filter((key) => {
+      const entry = state.seen[key];
+      return entry && entry.expiresAfterMs && now >= number(entry.since) + number(entry.expiresAfterMs);
     });
-    await writeState({ cardId: state.cardId, keys, changedAt: now }, options);
-    return { cardId: state.cardId, action: 'updated' };
+    const finished = left.filter((key) => !expired.includes(key));
+    const addedItems = added.map((key) => byKey.get(key)).filter(Boolean);
+    const message = [
+      `${keys.length} record${keys.length === 1 ? '' : 's'} past max age now (was ${named.length}).`,
+      finished.length ? `Finished or gone: ${listIds(finished)}.` : '',
+      expired.length ? `Expired unresolved (dropped by their owner's own timeout): ${listIds(expired)}.` : '',
+      addedItems.length ? `New:\n${addedItems.slice(0, CHANGE_LIST_MAX).map((item) => `- ${line(item)} [${item.file}]`).join('\n')}` : '',
+      addedItems.length > CHANGE_LIST_MAX ? `and ${addedItems.length - CHANGE_LIST_MAX} more; keep stalled lists them all.` : '',
+    ].filter(Boolean).join('\n');
+    try {
+      checkinOnce(deps, cardId, { heading: 'in-flight records changed', message, linkSession: false, commitLabel: HEALTH_NAME },
+        marker(cardId, keys, 'changed'));
+    } catch (error) { return cardFailed(error); }
+    await save({ keys, changedAt: now });
+    return { cardId, action: 'updated' };
   }
 
-  const created = deps.addTask({
-    title: CARD_TITLE,
-    kind: 'bug',
-    status: 'active',
-    project: CARD_PROJECT,
-    tags: ['personal', HEALTH_NAME],
-    note: cardText(items),
-    linkSession: false,
-    commit: true,
-  });
-  const cardId = created && created.id;
-  if (!cardId) throw new Error('addTask returned no card');
-  await writeState({ cardId, keys, changedAt: now }, options);
-  return { cardId, action: 'opened' };
+  // No open card. Records Owner dismissed do not open one; anything else does.
+  if (keys.every((key) => dismissed[key])) {
+    await save({ keys: [] });
+    return { cardId, action: cardId ? 'dismissed' : 'none' };
+  }
+  const current = keys.map((key) => byKey.get(key)).filter(Boolean);
+  let action = 'opened';
+  try {
+    cardId = await deps.findOpenCard();
+    if (cardId) {
+      // A card of ours this state does not know (a lost state file): what it names is
+      // unknown, so it is told the whole current list once.
+      action = 'adopted';
+      checkinOnce(deps, cardId, {
+        heading: 'in-flight records',
+        message: `Keep lost track of this card and picked it up again. Current list:\n\n${cardText(current)}`,
+        linkSession: false, commitLabel: HEALTH_NAME,
+      }, marker(cardId, keys, 'adopted'));
+    } else {
+      try {
+        const created = deps.addTask({
+          title: CARD_TITLE,
+          kind: 'bug',
+          status: 'active',
+          project: CARD_PROJECT,
+          tags: ['personal', HEALTH_NAME],
+          note: cardText(current),
+          linkSession: false,
+          commit: true,
+        });
+        cardId = created && created.id;
+        if (!cardId) throw new Error('addTask returned no card');
+      } catch (error) {
+        // addTask saves the card before it commits: a throw from the commit leaves a
+        // perfectly good card, which must be adopted, not duplicated next tick.
+        cardId = await deps.findOpenCard();
+        if (!cardId) throw error;
+        action = 'adopted';
+      }
+    }
+  } catch (error) { return cardFailed(error); }
+  // A new card names everything current, dismissed or not, so dismissal starts over
+  // with it.
+  await save({ cardId, keys, dismissed: {}, changedAt: now });
+  return { cardId, action };
 }
 
 // The whole tick: scan, escalate, and the health row. Never throws; a failure lands
@@ -776,22 +965,23 @@ async function tick(options = {}) {
     record(HEALTH_NAME, { at: now, ok: false, cadenceMs: MINUTE_MS, error: `in-flight scan failed: ${error.message || error}` });
     return { items: [], error };
   }
-  const { items, errors } = result;
+  const { items, errors = [], failedKinds = [] } = result;
   let escalation = null;
   let escalationError = null;
-  try { escalation = await escalate(items, { ...options, now }); }
+  try { escalation = await escalate(items, { ...options, now, failedKinds }); }
   catch (error) { escalationError = error; }
   const cardId = escalation && escalation.cardId || '';
+  const unread = errors.length ? `; unreadable: ${errors.join('; ')}` : '';
   if (items.length) {
     record(HEALTH_NAME, {
       at: now, ok: false, cadenceMs: MINUTE_MS,
-      error: healthError(items, cardId)
+      error: healthError(items, cardId) + unread
         + (escalationError ? `; card write failed: ${escalationError.message || escalationError}` : ''),
     });
   } else if (escalationError || errors.length) {
     record(HEALTH_NAME, {
       at: now, ok: false, cadenceMs: MINUTE_MS,
-      error: escalationError ? `card write failed: ${escalationError.message || escalationError}` : `unreadable: ${errors.join('; ')}`,
+      error: escalationError ? `card write failed: ${escalationError.message || escalationError}${unread}` : unread.slice(2),
     });
   } else {
     record(HEALTH_NAME, { at: now, ok: true, cadenceMs: MINUTE_MS, detail: 'no in-flight record past its max age' });
@@ -800,7 +990,9 @@ async function tick(options = {}) {
 }
 
 module.exports = {
-  HEALTH_NAME, CARD_TITLE, KINDS,
-  scan, judge, escalate, tick, readState,
+  HEALTH_NAME, CARD_TITLE, KINDS, GONE_AFTER_MS, DISMISS_FORGET_MS, RETRY_BACKOFF_MS,
+  scan, judge, escalate, tick, readState, cardSlug,
+  // Tests only: forget the in-memory state, as a daemon restart does.
+  _resetMemory: () => memory.clear(),
   attentionText, healthError, cardText, line, duration, safeId,
 };
