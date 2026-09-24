@@ -2,17 +2,20 @@
 'use strict';
 const path = require('node:path');
 const BOOT_VERSION = 1;
-const CORE_RELOAD_ALLOWLIST = [];
-function clearLocalCoreModules(corePath) {
-  // A reload swaps host.js only. Shared modules such as keep.js stay cached so a
-  // core upgrade cannot replace process-wide singletons behind the daemon's back.
-  const targets = [corePath, ...CORE_RELOAD_ALLOWLIST].map((file) => path.resolve(file));
+const { HOST_ONLY_MODULES, hostOnlyModulePaths } = require('./host-modules.js');
+const CORE_RELOAD_ALLOWLIST = HOST_ONLY_MODULES;
+function clearLocalCoreModules(corePath, allowlist = CORE_RELOAD_ALLOWLIST) {
+  // A reload swaps host.js and the host-only helpers it requires lazily
+  // (host-modules.js). Shared modules such as keep.js, usage.js and nodes.js stay
+  // cached so a core upgrade cannot replace process-wide singletons behind the
+  // daemon's back.
+  const targets = [path.resolve(corePath), ...hostOnlyModulePaths(allowlist)];
   for (const target of targets) delete require.cache[target];
 }
 function createBootstrap(options = {}) {
   const corePath = options.corePath || path.join(__dirname, 'host.js');
   const loadCore = options.loadCore || ((fresh) => {
-    if (fresh) clearLocalCoreModules(corePath);
+    if (fresh) clearLocalCoreModules(corePath, options.hostOnlyModules || CORE_RELOAD_ALLOWLIST);
     return require(corePath);
   });
   const hostOptions = { ...options };

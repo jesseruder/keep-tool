@@ -12,6 +12,7 @@ const { Terminal } = require('@xterm/headless');
 const { SerializeAddon } = require('@xterm/addon-serialize');
 
 const { localNode } = require('./nodes.js');
+const { HOST_ONLY_MODULES, dropHostOnlyModules } = require('./host-modules.js');
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const DEFAULT_BUFFER_BYTES = 4 * 1024 * 1024;
@@ -550,6 +551,14 @@ function readNodeToken(file, io = fs) {
 
 function createHost(options = {}) {
   const adopt = options.adopt || null;
+  // A core taking over from a reload drops the host-only helpers (host-modules.js)
+  // so its lazy requires load their current code. This lives in the core, not only
+  // in host-boot.js, because the bootstrap is not reloadable without a restart: a
+  // host running an older bootstrap picks the fix up through a plain reload. It runs
+  // here rather than at module load because the daemon loads host.js too (hostclient,
+  // node-registry) and holds process-table.js itself; only the bootstrap passes
+  // `boot`, and nothing below can reach a lazy require before this returns.
+  if (options.boot && adopt) dropHostOnlyModules(options.hostOnlyModules || HOST_ONLY_MODULES);
   if (adopt && (adopt.version !== 1 || !Array.isArray(adopt.panes))) {
     throw new Error('unsupported host handoff record');
   }
@@ -2269,6 +2278,7 @@ async function runHost(options = {}) {
 
 module.exports = {
   DEFAULT_SNAPSHOT_SCROLLBACK,
+  HOST_ONLY_MODULES,
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
   STATS_VERSION,

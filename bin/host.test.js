@@ -1867,6 +1867,74 @@ test('core cache eviction leaves shared sibling modules cached', () => {
   require(hostPath);
 });
 
+test('core cache eviction drops the host-only helpers and keeps shared config readers', () => {
+  const { HOST_ONLY_MODULES } = require('./host-modules.js');
+  assert.deepEqual(require('./host.js').HOST_ONLY_MODULES, HOST_ONLY_MODULES);
+  const helpers = HOST_ONLY_MODULES.map((file) => require.resolve(file));
+  const shared = ['./usage.js', './nodes.js', './keep.js'].map((file) => require.resolve(file));
+  for (const file of [...helpers, ...shared]) require(file);
+  const hostPath = require.resolve('./host.js');
+  clearLocalCoreModules(hostPath);
+  for (const file of helpers) assert.equal(require.cache[file], undefined, `${path.basename(file)} is dropped`);
+  for (const file of shared) assert.ok(require.cache[file], `${path.basename(file)} stays cached`);
+  require(hostPath);
+});
+
+function markerModule(root) {
+  const file = path.join(root, 'marker.js');
+  fs.writeFileSync(file, 'globalThis.__keepHostMarkerLoads = (globalThis.__keepHostMarkerLoads || 0) + 1;\nmodule.exports = {};\n');
+  return file;
+}
+
+test('a reload re-requires the host-only helper modules', async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-helper-reload-')));
+  const marker = markerModule(root);
+  const boot = createBootstrap({ sock: path.join(root, 'host.sock'), log: null, hostOnlyModules: [marker] });
+  globalThis.__keepHostMarkerLoads = 0;
+  try {
+    await boot.start();
+    require(marker);
+    require(marker);
+    assert.equal(globalThis.__keepHostMarkerLoads, 1);
+    assert.deepEqual(await boot.reload(), { panesAdopted: 0, fallback: false });
+    assert.equal(require.cache[marker], undefined, 'the reload dropped the helper');
+    require(marker);
+    assert.equal(globalThis.__keepHostMarkerLoads, 2, 'the helper ran its top level again');
+  } finally {
+    await boot.close();
+    delete require.cache[marker];
+    delete globalThis.__keepHostMarkerLoads;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a new core drops the host-only helpers itself when an older bootstrap reloads it', async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-helper-oldboot-')));
+  const marker = markerModule(root);
+  const hostPath = require.resolve('./host.js');
+  // An older bootstrap: it evicts host.js and nothing else.
+  const loadCore = (fresh) => {
+    if (fresh) delete require.cache[hostPath];
+    return require(hostPath);
+  };
+  const boot = createBootstrap({ sock: path.join(root, 'host.sock'), log: null, hostOnlyModules: [marker], loadCore });
+  globalThis.__keepHostMarkerLoads = 0;
+  try {
+    await boot.start();
+    require(marker);
+    assert.ok(require.cache[marker], 'a first start leaves the helpers alone');
+    assert.deepEqual(await boot.reload(), { panesAdopted: 0, fallback: false });
+    assert.equal(require.cache[marker], undefined, 'the adopting core dropped the helper');
+    require(marker);
+    assert.equal(globalThis.__keepHostMarkerLoads, 2);
+  } finally {
+    await boot.close();
+    delete require.cache[marker];
+    delete globalThis.__keepHostMarkerLoads;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('compact screen bounds escaped multibyte history before framing and preserves viewport', () => {
   const history = '\"\\漢'.repeat(400);
   const term = { cols: 1200, rows: 200, buffer: { active: {
