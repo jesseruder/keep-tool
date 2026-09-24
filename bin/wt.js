@@ -572,12 +572,18 @@ const DEPLOY_AFTER_LAND = {
 };
 
 // How long `wt land` watches the restarted daemon before it reports and exits. Most
-// schedulers tick every minute, so two minutes sees their first runs on the new
-// code; the daemon's own `deploy` health row watches the slower ones for half an
-// hour after this process is gone (bin/health.js noteDeploy). WT_HEALTH_WAIT
+// schedulers tick every minute, so ninety seconds sees their first runs on the new
+// code, and the whole land (restart included) still fits a caller's few-minute
+// command timeout; the daemon's own `deploy` health row watches the slower ones for
+// half an hour after this process is gone (bin/health.js noteDeploy). WT_HEALTH_WAIT
 // (seconds, 0 to skip) and --no-health-wait override it.
-const HEALTH_WAIT_MS = 120e3;
+const HEALTH_WAIT_MS = 90e3;
 const HEALTH_POLL_MS = 10e3;
+// Failures in a row that make a regression worth a revert. One failure right after a
+// restart is as often the restart as the code — delivery, handoff-queue and
+// auto-compact all fail once while the terminal host reattaches — so a single one is
+// reported as that and the watch keeps polling for a second.
+const REGRESSION_STREAK = 2;
 
 function healthWaitMs(opts = {}) {
   if (opts.noHealthWait) return 0;
@@ -590,29 +596,43 @@ function healthWaitMs(opts = {}) {
   return HEALTH_WAIT_MS;
 }
 
-// Rows that were healthy in `before` (enabled, a zero streak, ok or skipped) and
-// have recorded a failure since the daemon started at `startedAt`. The daemon's own
+// Rows that were healthy in `before` (enabled, a zero streak, ok or skipped), or did
+// not exist in it at all (a scheduler the deploy added, marked `added`), and have
+// recorded a failure since the daemon started at `startedAt`. The daemon's own
 // `deploy` row is left out: it restates these same failures. So are the rows a
 // restart itself can fail (health.DEPLOY_UNWATCHED), which would otherwise name
 // every deploy a regression.
 function healthRegressions(before, after, startedAt) {
   const prior = new Map(((before && before.schedulers) || []).map((row) => [row.name, row]));
   const unwatched = require('./health.js').DEPLOY_UNWATCHED;
-  return ((after && after.schedulers) || []).filter((row) => {
-    if (!row || row.name === 'deploy' || unwatched.has(row.name)) return false;
+  const out = [];
+  for (const row of (after && after.schedulers) || []) {
+    if (!row || row.name === 'deploy' || unwatched.has(row.name)) continue;
     const was = prior.get(row.name);
-    if (!was || was.disabled || Number(was.consecutiveFailures || 0) || !['ok', 'skipped'].includes(was.state)) return false;
+    if (was && (was.disabled || Number(was.consecutiveFailures || 0) || !['ok', 'skipped'].includes(was.state))) continue;
     const failedAt = Number(row.lastErrorAt) || Date.parse(row.lastErrorAt) || 0;
-    return Number(row.consecutiveFailures || 0) > 0 && failedAt >= startedAt;
-  });
+    if (Number(row.consecutiveFailures || 0) > 0 && failedAt >= startedAt) {
+      out.push({ name: row.name, consecutiveFailures: Number(row.consecutiveFailures), lastError: row.lastError || '', added: !was });
+    }
+  }
+  return out;
+}
+
+// Daemon starts recorded after `since`: more than one inside the watch is a daemon
+// that keeps dying on the new code.
+function startsSince(daemon, since) {
+  const starts = new Set([...(Array.isArray(daemon && daemon.startedAts) ? daemon.startedAts : []), daemon && daemon.startedAt]
+    .map(Number).filter((value) => Number.isFinite(value) && value > since));
+  return starts.size;
 }
 
 // The landing half of the post-deploy check. Synchronous like the rest of `wt land`:
 // it polls the health file the restarted daemon writes, returns as soon as a row
-// that was healthy before the restart has failed on the new code, and otherwise
-// gives up at the deadline and says nothing regressed. It only reports — the revert
-// it prints is for the person who landed to run in a worktree, reviewed like any
-// other change. Never throws; `before` is the snapshot taken ahead of the restart.
+// that was healthy before the restart has failed REGRESSION_STREAK times in a row on
+// the new code, and otherwise gives up at the deadline and reports what it saw. It
+// only reports — the revert it prints is for the person who landed to run in a
+// worktree, reviewed like any other change. Never throws; `before` is the snapshot
+// taken ahead of the restart.
 function watchDeployHealth(main, sha, before, opts = {}) {
   const note = (text) => { try { process.stderr.write(`wt: ${text}\n`); } catch {} };
   try {
@@ -623,10 +643,22 @@ function watchDeployHealth(main, sha, before, opts = {}) {
     const now = opts.now || Date.now;
     const pollMs = Number.isFinite(opts.healthPollMs) ? opts.healthPollMs : HEALTH_POLL_MS;
     const previousStart = Number((before.daemon || {}).startedAt) || 0;
+    const short = (value) => String(value || '').slice(0, 7);
+    const ancestor = (base) => {
+      try { return Boolean(base && base !== sha && isAncestor(main, base, sha)); } catch { return false; }
+    };
     // The commit the old daemon was running is the base of what this restart put live,
     // which can be more than this land's own commits when an earlier land never
-    // restarted. Without it, the checkout's HEAD before the fast-forward stands in.
-    const from = String((before.daemon || {}).commit || opts.from || '');
+    // restarted. When that is unknown or not an ancestor, the checkout's HEAD before
+    // the fast-forward stands in; failing both, only the tip can be named.
+    const running = String((before.daemon || {}).commit || '');
+    const from = ancestor(running) ? running : ancestor(opts.from) ? String(opts.from) : '';
+    const range = from ? `${short(from)}..${short(sha)}` : short(sha);
+    const revert = () => {
+      note(`${range} went live with this restart — the range runs from the commit the old daemon was running, so it can include other sessions' landed commits that had not been deployed yet. Nothing was reverted. To back it out, in a fresh worktree (wt new ${path.basename(main)} revert-${short(sha)}):`);
+      note(from ? `  git revert --no-edit ${from}..${sha}` : `  git revert --no-edit ${sha}   (the base is unknown; revert the rest of the land by hand)`);
+      note('  then review and land it as usual');
+    };
     const deadline = now() + waitMs;
     note(`watching daemon health for up to ${Math.round(waitMs / 1000)}s after the restart (WT_HEALTH_WAIT=0 or --no-health-wait skips this)`);
     let started = 0;
@@ -635,36 +667,45 @@ function watchDeployHealth(main, sha, before, opts = {}) {
     for (;;) {
       try { after = read(); } catch { after = null; }
       const startedAt = Number(after && after.daemon && after.daemon.startedAt) || 0;
-      if (startedAt > previousStart) started = startedAt;
+      if (startedAt > previousStart) {
+        // The first start after the restart: a crash loop's later starts would
+        // otherwise move the baseline past the failures that caused them.
+        if (!started) started = startedAt;
+      }
       if (started) regressions = healthRegressions(before, after, started);
-      if (regressions.length || now() >= deadline) break;
+      if (regressions.some((row) => row.consecutiveFailures >= REGRESSION_STREAK) || now() >= deadline) break;
       pause(Math.max(0, Math.min(pollMs, deadline - now())));
     }
     const waited = `${Math.round((waitMs - Math.max(0, deadline - now())) / 1000)}s`;
-    const short = (value) => String(value || '').slice(0, 7);
     if (!started) {
-      note(`the daemon has not recorded a new start ${waited} after the restart; check keep health and keep doctor`);
-      return { started: false, regressions: [] };
+      note(`DEPLOY FAILURE: the daemon has not recorded a start on the new code ${waited} after the restart (a load error, or launchd still relaunching it); check keep health and keep doctor`);
+      revert();
+      return { started: false, regressions: [], range };
     }
-    if (after && after.daemon && after.daemon.running === false) {
+    const starts = startsSince(after && after.daemon, previousStart);
+    const looping = starts > 1;
+    if (looping) note(`DEPLOY FAILURE: the daemon started ${starts} times in ${waited} after the restart — it keeps dying on the new code; check keep health and serve.log`);
+    else if (after && after.daemon && after.daemon.running === false) {
       note(`the daemon started on the new code and is down again ${waited} later; check keep health and keep doctor`);
     }
-    if (!regressions.length) {
-      note(`daemon health after deploy ${short(sha)}: no scheduler regressed in ${waited} (the deploy health row keeps watching for 30m)`);
-      return { started: true, regressions: [] };
-    }
-    const range = from && from !== sha ? `${short(from)}..${short(sha)}` : short(sha);
-    let revertable = false;
-    try { revertable = Boolean(from && from !== sha && isAncestor(main, from, sha)); } catch {}
-    note(`DEPLOY REGRESSION: ${regressions.length} scheduler${regressions.length === 1 ? '' : 's'} started failing after deploy ${short(sha)}${from ? ` (was ${short(from)})` : ''}:`);
-    for (const row of regressions) {
+    const failing = regressions.filter((row) => row.consecutiveFailures >= REGRESSION_STREAK);
+    const once = regressions.filter((row) => row.consecutiveFailures < REGRESSION_STREAK);
+    const label = (row) => `${row.name}${row.added ? ' (new row)' : ''}`;
+    const clip = (row) => {
       const error = String(row.lastError || 'tick failed').replace(/\s+/g, ' ').trim();
-      note(`  ${row.name}: ${row.consecutiveFailures} failure${row.consecutiveFailures === 1 ? '' : 's'} since the restart — ${error.length > 200 ? `${error.slice(0, 199)}…` : error}`);
+      return error.length > 200 ? `${error.slice(0, 199)}…` : error;
+    };
+    if (failing.length) {
+      note(`DEPLOY REGRESSION: ${failing.length} scheduler${failing.length === 1 ? '' : 's'} started failing after deploy ${short(sha)}${from ? ` (was ${short(from)})` : ''}:`);
+      for (const row of failing) note(`  ${label(row)}: ${row.consecutiveFailures} failures in a row since the restart — ${clip(row)}`);
     }
-    note(`landed range ${range}; nothing was reverted. To back it out, in a fresh worktree (wt new ${path.basename(main)} revert-${short(sha)}):`);
-    note(revertable ? `  git revert --no-edit ${from}..${sha}` : `  git revert --no-edit ${sha}   (the base is unknown; revert each commit of the land)`);
-    note('  then review and land it as usual');
-    return { started: true, regressions: regressions.map((row) => row.name), range };
+    for (const row of once) note(`  ${label(row)} failed once since the restart (often the restart itself; the deploy health row keeps watching) — ${clip(row)}`);
+    if (failing.length || looping) {
+      revert();
+      return { started: true, regressions: failing.map((row) => row.name), once: once.map((row) => row.name), range, ...(looping ? { starts } : {}) };
+    }
+    if (!once.length) note(`daemon health after deploy ${short(sha)}: no scheduler regressed in ${waited} (the deploy health row keeps watching for 30m)`);
+    return { started: true, regressions: [], ...(once.length ? { once: once.map((row) => row.name) } : {}) };
   } catch (error) {
     note(`post-deploy health check failed: ${String(error && error.message || error)}`);
     return null;

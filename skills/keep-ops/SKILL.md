@@ -97,7 +97,7 @@ call or a write.
 The daemon runs from the main keep-tool checkout, which must stay clean: work in a
 worktree, then land. `wt land` fast-forwards a ready main checkout and restarts the
 daemon; it reports a skipped or failed deployment for the landing session to inspect.
-It then watches `keep health` for about two minutes and names any scheduler that was
+It then watches `keep health` for up to 90 seconds and names any scheduler that was
 healthy before the restart and failed after it, with the landed range and the
 `git revert` to run in a fresh worktree (it never reverts itself); give it a command
 timeout of at least five minutes. For 30 minutes after a start on a new commit the daemon

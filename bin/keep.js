@@ -1774,7 +1774,7 @@ commands.reviews = (argv) => {
   }
 };
 
-const KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE = 'For keep-tool, wt land deploys a ready live checkout by fast-forwarding it and restarting the daemon; it reports any skipped or failed deployment, then watches daemon health for about two minutes and names any scheduler that started failing, with the revert to run.';
+const KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE = 'For keep-tool, wt land deploys a ready live checkout by fast-forwarding it and restarting the daemon; it reports any skipped or failed deployment, then watches daemon health for up to 90 seconds and names any scheduler that started failing, with the revert to run.';
 
 commands.land = (argv) => {
   const o = parseArgs(argv, { json: 'bool', 'dry-run': 'bool' });
@@ -3756,7 +3756,7 @@ function helpText() {
                        # exit 3 when the reviewed patches are not exactly what would land
                        # for keep-tool, wt land fast-forwards a ready live checkout, restarts the daemon,
                        # and reports any skipped or failed deployment; it then watches daemon health
-                       # for ~2m and names a scheduler that regressed (WT_HEALTH_WAIT=0 skips the wait)
+                       # for up to 90s and names a scheduler that regressed (WT_HEALTH_WAIT=0 skips the wait)
   keep retitle <id> "new title"
   keep rename [<#n|session-id>] "new title"    # name a session by hand; its automatic title stops updating
   keep rename [<#n|session-id>] --clear        # hand the session back to automatic titles

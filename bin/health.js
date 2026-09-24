@@ -164,24 +164,52 @@ function deployWatchUntil(watch, name) {
   return Number(watch.startedAt) + span;
 }
 
+// The commit the daemon last reported loading. A start whose `git rev-parse` failed
+// or timed out (likely under exactly the load a restart brings) records no commit,
+// and comparing the next start against that blank would miss the next deploy; the
+// last one known is carried forward instead.
+function knownCommit(prior) {
+  return String(prior.commit || prior.lastKnownCommit || '');
+}
+
 // The watch a daemon start arms: which rows were healthy (recorded, enabled, a zero
-// streak) the moment the new commit started, and which commit it replaced. Only a
-// start on a new commit arms one; a start on the same commit (a crash, a restart
-// with nothing landed) keeps the watch the deploy armed, so a crash inside the
-// window does not forget it, and drops it once no row could still be watched.
+// streak) the moment the new commit started, every row the store held then (so a
+// scheduler the deploy added is watched too), and which commit it replaced. Only a
+// start on a new commit arms one; a start on the same commit, or with no commit
+// (a crash, a restart with nothing landed, a git that did not answer), keeps the
+// watch the deploy armed, so a crash inside the window does not forget it, and drops
+// it once no row could still be watched. A deploy that lands inside an earlier
+// deploy's window keeps that one's base: its failures could come from either, so the
+// label names the whole range that went live since the last quiet start.
 function deployWatchFor(store, prior, at, commit) {
-  const previousCommit = prior.commit ? String(prior.commit) : '';
+  const previousCommit = knownCommit(prior);
+  const watch = prior.deployWatch && typeof prior.deployWatch === 'object'
+    && Number.isFinite(Number(prior.deployWatch.startedAt))
+    && at - Number(prior.deployWatch.startedAt) <= DEPLOY_WATCH_MAX_MS ? prior.deployWatch : null;
   if (commit && previousCommit && commit !== previousCommit) {
-    const healthy = Object.keys(store).filter((name) => {
-      if (name === 'daemon' || name === DEPLOY_ROW || RETIRED.has(name) || DEPLOY_UNWATCHED.has(name)) return false;
+    const rows = Object.keys(store).filter((name) => name !== 'daemon' && name !== DEPLOY_ROW);
+    const healthy = rows.filter((name) => {
+      if (RETIRED.has(name) || DEPLOY_UNWATCHED.has(name)) return false;
       const entry = store[name];
       return entry && typeof entry === 'object' && entry.disabled !== true && !Number(entry.consecutiveFailures || 0);
     });
-    return { commit, previousCommit, startedAt: at, healthy };
+    const open = watch && String(watch.commit || '') === previousCommit && at <= Number(watch.startedAt) + DEPLOY_WATCH_MS;
+    const base = open && watch.previousCommit ? String(watch.previousCommit) : previousCommit;
+    return { commit, previousCommit: base, startedAt: at, healthy, rows };
   }
-  const watch = prior.deployWatch;
-  if (!watch || typeof watch !== 'object' || !Number.isFinite(Number(watch.startedAt))) return null;
-  return at - Number(watch.startedAt) <= DEPLOY_WATCH_MAX_MS ? watch : null;
+  return watch;
+}
+
+// Whether a failure of `name` at `at` is one the deploy watch charges: a row healthy
+// at the start, or a row that did not exist at the start (a scheduler the deploy
+// added), failing inside its window. Watches armed before `rows` was recorded only
+// know the healthy list.
+function deployCharges(watch, name, at) {
+  if (!watch || !Array.isArray(watch.healthy)) return null;
+  if (at < Number(watch.startedAt) || at > deployWatchUntil(watch, name)) return null;
+  if (watch.healthy.includes(name)) return { added: false };
+  if (Array.isArray(watch.rows) && !watch.rows.includes(name) && !RETIRED.has(name) && !DEPLOY_UNWATCHED.has(name)) return { added: true };
+  return null;
 }
 
 // Runs inside record(), on the store it already read and is about to write, so a
@@ -191,24 +219,38 @@ function deployWatchFor(store, prior, at, commit) {
 // current, and a zero streak resolves it). The `deploy` row is rebuilt from what is
 // left: failing on the worst open streak, so it turns red on the same three-in-a-row
 // that turns the scheduler's own row red, and ok again once every regression cleared.
+//
+// A charged row that is disabled comes through here with a zero streak, and one that
+// is retired or gone from the store is dropped on any record, so neither can hold the
+// row failing with nothing left that could ever clear it.
 function noteDeploy(store, name, entry, at, failed) {
   if (name === DEPLOY_ROW || name === 'daemon') return;
   const prior = store[DEPLOY_ROW] && typeof store[DEPLOY_ROW] === 'object' ? store[DEPLOY_ROW] : null;
-  const regressions = prior && prior.regressions && typeof prior.regressions === 'object' ? { ...prior.regressions } : {};
+  const regressions = {};
+  let changed = false;
+  for (const [row, value] of Object.entries(prior && prior.regressions && typeof prior.regressions === 'object' ? prior.regressions : {})) {
+    if (value && typeof value === 'object' && !RETIRED.has(row) && store[row] && typeof store[row] === 'object') regressions[row] = value;
+    else changed = true;
+  }
   const failures = Number(entry.consecutiveFailures || 0);
   if (regressions[name]) {
     regressions[name] = { ...regressions[name], consecutiveFailures: failures, ...(failed ? { error: entry.lastError || '' } : {}) };
-  } else {
-    const watch = store.daemon && store.daemon.deployWatch;
-    if (!failed || !failures || !watch || !Array.isArray(watch.healthy) || !watch.healthy.includes(name)) return;
-    if (at < Number(watch.startedAt) || at > deployWatchUntil(watch, name)) return;
-    regressions[name] = {
-      commit: watch.commit, previousCommit: watch.previousCommit, deployedAt: Number(watch.startedAt),
-      firstFailedAt: at, consecutiveFailures: failures, error: entry.lastError || '',
-    };
+    changed = true;
+  } else if (failed && failures) {
+    const charge = deployCharges(store.daemon && store.daemon.deployWatch, name, at);
+    if (charge) {
+      const watch = store.daemon.deployWatch;
+      regressions[name] = {
+        commit: watch.commit, previousCommit: watch.previousCommit, deployedAt: Number(watch.startedAt),
+        firstFailedAt: at, consecutiveFailures: failures, error: entry.lastError || '',
+        ...(charge.added ? { added: true } : {}),
+      };
+      changed = true;
+    }
   }
+  if (!changed) return;
   const open = Object.entries(regressions).filter(([, value]) => Number(value.consecutiveFailures || 0) > 0);
-  const says = ([row, value]) => `${row} started failing after deploy ${shortSha(value.commit)} (was ${shortSha(value.previousCommit)})`;
+  const says = ([row, value]) => `${row}${value.added ? ' (new)' : ''} started failing after deploy ${shortSha(value.commit)} (was ${shortSha(value.previousCommit)})`;
   const next = { ...(prior || {}), disabled: false, lastRunAt: at, cadenceMs: 0 };
   if (open.length) {
     next.consecutiveFailures = Math.max(...open.map(([, value]) => Number(value.consecutiveFailures)));
@@ -221,10 +263,18 @@ function noteDeploy(store, name, entry, at, failed) {
   } else {
     next.consecutiveFailures = 0;
     next.lastOkAt = at;
-    next.detail = clipError(`${Object.entries(regressions).map(says).join('; ')}; recovered`);
+    next.detail = Object.keys(regressions).length
+      ? clipError(`${Object.entries(regressions).map(says).join('; ')}; recovered`)
+      : 'the rows charged to the deploy were disabled or removed';
     delete next.regressions;
   }
   store[DEPLOY_ROW] = next;
+}
+
+// record() calls this, never noteDeploy directly: a malformed deploy row or watch in
+// health.json must cost the attribution, never the scheduler's own record.
+function safeNoteDeploy(store, name, entry, at, failed) {
+  try { noteDeploy(store, name, entry, at, failed); } catch {}
 }
 
 function persist(value) {
@@ -258,7 +308,10 @@ function record(name, options = {}) {
     const sorted = startedAts.sort((a, b) => a - b);
     const requestedKept = sorted.filter((value) => requestedSet.has(value)).slice(-10);
     const unrequestedKept = sorted.filter((value) => !requestedSet.has(value)).slice(-10);
-    const deployWatch = deployWatchFor(store, prior, at, options.commit ? String(options.commit) : '');
+    // The deploy watch is a side channel: nothing in it may cost the start record.
+    let deployWatch = null;
+    try { deployWatch = deployWatchFor(store, prior, at, options.commit ? String(options.commit) : ''); } catch {}
+    const lastKnownCommit = options.commit ? String(options.commit) : knownCommit(prior);
     store.daemon = {
       startedAt: at,
       pid: Number(options.pid || process.pid),
@@ -268,6 +321,7 @@ function record(name, options = {}) {
       ...(options.commit ? { commit: String(options.commit), checkout: String(options.checkout || '') } : {}),
       startedAts: [...requestedKept, ...unrequestedKept].sort((a, b) => a - b),
       requestedStartAts: requestedKept,
+      ...(lastKnownCommit ? { lastKnownCommit } : {}),
       ...(deployWatch ? { deployWatch } : {}),
     };
     persist(store);
@@ -285,6 +339,8 @@ function record(name, options = {}) {
     };
     delete entry.expected;
     store[name] = entry;
+    // A disabled row cannot fail again, so it cannot stay charged to a deploy.
+    safeNoteDeploy(store, name, { consecutiveFailures: 0 }, at, false);
     persist(store);
     return entry;
   }
@@ -332,7 +388,7 @@ function record(name, options = {}) {
     if (options.detail == null || options.detail === '') delete entry.detail;
     else entry.detail = clipError(options.detail);
     store[name] = entry;
-    noteDeploy(store, name, entry, at, false);
+    safeNoteDeploy(store, name, entry, at, false);
     persist(store);
     return entry;
   }
@@ -358,7 +414,7 @@ function record(name, options = {}) {
   if (options.detail == null || options.detail === '') delete entry.detail;
   else entry.detail = clipError(options.detail);
   store[name] = entry;
-  noteDeploy(store, name, entry, at, !ok);
+  safeNoteDeploy(store, name, entry, at, !ok);
   persist(store);
   return entry;
 }

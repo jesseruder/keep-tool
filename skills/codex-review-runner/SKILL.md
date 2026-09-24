@@ -101,7 +101,7 @@ keep reviewed <card> --commit origin/<default>..HEAD --verdict clean|findings --
 - `keep land <card>` does the land: it re-checks that, runs `wt land`, and cites the
   landed sha (exit 3 when the reviewed patches are not exactly what would land;
   `--dry-run` shows the decision). For keep-tool, `wt land` fast-forwards a ready
-  live checkout, restarts the daemon, and watches its health for about two minutes (run it
+  live checkout, restarts the daemon, and watches its health for up to 90 seconds (run it
   with a command timeout of at least five minutes); a reported regression names the revert
   to run in a fresh worktree. Inspect a skipped or failed deployment: a checkout
   already past this land belongs to its newer landing session; recover only a safe failure

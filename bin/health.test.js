@@ -554,3 +554,74 @@ test('a failure outside the deploy watch, or after a start on the same commit, i
   health.record('review-compact', { ok: false, error: 'boom', at: start + 3600e3 + 31 * 60e3 });
   assert.equal(read().deploy, undefined, 'a minute row failing after its 30m window is ordinary health');
 });
+
+test('a charged row that is disabled or removed does not hold the deploy row failing', () => {
+  const { root, health } = fixture();
+  const file = path.join(root, '.keep', 'health.json');
+  const read = () => JSON.parse(fs.readFileSync(file, 'utf8'));
+  const start = 10 * 3600e3;
+  health.record('daemon', { at: start - 3600e3, pid: process.pid, commit: 'a'.repeat(40) });
+  health.record('slack', { ok: true, at: start - 60e3 });
+  health.record('notes', { ok: true, at: start - 60e3 });
+  health.record('daemon', { at: start, pid: process.pid, commit: 'b'.repeat(40) });
+  for (let i = 1; i <= 3; i++) health.record('slack', { ok: false, error: 'boom', at: start + i * 60e3 });
+  assert.equal(read().deploy.consecutiveFailures, 3);
+  health.record('slack', { disabled: true, detail: 'not configured', at: start + 5 * 60e3 });
+  assert.equal(read().deploy.consecutiveFailures, 0, 'disabling the row clears its charge');
+
+  for (let i = 6; i <= 8; i++) health.record('notes', { ok: false, error: 'boom', at: start + i * 60e3 });
+  assert.equal(read().deploy.consecutiveFailures, 3);
+  const raw = read();
+  delete raw.notes;
+  fs.writeFileSync(file, JSON.stringify(raw));
+  health.record('review', { ok: true, at: start + 9 * 60e3 });
+  const cleared = read().deploy;
+  assert.equal(cleared.consecutiveFailures, 0, 'a row gone from the store is dropped on any record');
+  assert.equal(cleared.regressions, undefined);
+});
+
+test('a start that could not read its commit does not hide the next deploy', () => {
+  const { root, health } = fixture();
+  const read = () => JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8'));
+  const start = 10 * 3600e3;
+  health.record('daemon', { at: start - 3 * 3600e3, pid: process.pid, commit: 'a'.repeat(40) });
+  health.record('daemon', { at: start - 2 * 3600e3, pid: process.pid, commit: 'b'.repeat(40) });
+  assert.equal(read().daemon.deployWatch.commit, 'b'.repeat(40));
+  // git timed out under restart load: no commit on this start.
+  health.record('daemon', { at: start - 60e3, pid: process.pid });
+  assert.equal(read().daemon.lastKnownCommit, 'b'.repeat(40));
+  health.record('review-compact', { ok: true, at: start - 30e3 });
+  health.record('daemon', { at: start, pid: process.pid, commit: 'c'.repeat(40) });
+  const watch = read().daemon.deployWatch;
+  assert.equal(watch.commit, 'c'.repeat(40));
+  assert.equal(watch.previousCommit, 'b'.repeat(40));
+});
+
+test('a deploy inside an earlier deploy\'s window keeps its base, and a row the deploy added is charged', () => {
+  const { root, health } = fixture();
+  const read = () => JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8'));
+  const start = 10 * 3600e3;
+  health.record('daemon', { at: start - 3600e3, pid: process.pid, commit: 'a'.repeat(40) });
+  health.record('review-compact', { ok: true, at: start - 60e3 });
+  health.record('daemon', { at: start, pid: process.pid, commit: 'b'.repeat(40) });
+  health.record('daemon', { at: start + 10 * 60e3, pid: process.pid, commit: 'c'.repeat(40) });
+  assert.equal(read().daemon.deployWatch.previousCommit, 'a'.repeat(40), 'the label covers a..c');
+  assert.ok(read().daemon.deployWatch.rows.includes('review-compact'));
+
+  // A scheduler that did not exist when the deploy started.
+  health.record('brand-new', { ok: false, error: 'new tick threw', at: start + 11 * 60e3 });
+  assert.match(read().deploy.lastError, /^brand-new \(new\) started failing after deploy ccccccc \(was aaaaaaa\): new tick threw/);
+});
+
+test('a malformed deploy row never costs the scheduler its own record', () => {
+  const { root, health } = fixture();
+  const file = path.join(root, '.keep', 'health.json');
+  const start = 10 * 3600e3;
+  health.record('daemon', { at: start, pid: process.pid, commit: 'a'.repeat(40) });
+  const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+  raw.daemon.deployWatch = { startedAt: start, healthy: ['review'], rows: null, commit: 'a', previousCommit: 'b' };
+  raw.deploy = { regressions: { review: null } };
+  fs.writeFileSync(file, JSON.stringify(raw));
+  health.record('review', { ok: false, error: 'boom', at: start + 60e3 });
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).review.consecutiveFailures, 1);
+});

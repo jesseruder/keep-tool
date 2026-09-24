@@ -1100,10 +1100,14 @@ test('land watches daemon health after the restart and names a regression with t
     let restarted = false;
     const newStart = clock + 5e3;
     const pictures = {
-      before: healthPicture(1000, base, { 'review-compact': {}, 'loop-stalls': {}, delivery: { consecutiveFailures: 2, state: 'ok', lastErrorAt: 900 } }),
-      starting: healthPicture(1000, base, { 'review-compact': {}, delivery: { consecutiveFailures: 2, lastErrorAt: 900 } }),
+      // The old daemon's commit is not an ancestor (unknown to this repo), so the
+      // revert falls back to the checkout's HEAD before the fast-forward.
+      before: healthPicture(1000, 'f'.repeat(40), { 'review-compact': {}, 'handoff-queue': {}, 'loop-stalls': {}, delivery: { consecutiveFailures: 2, state: 'ok', lastErrorAt: 900 } }),
+      starting: healthPicture(1000, 'f'.repeat(40), { 'review-compact': {}, delivery: { consecutiveFailures: 2, lastErrorAt: 900 } }),
       broken: healthPicture(newStart, 'x', {
-        'review-compact': { consecutiveFailures: 1, lastErrorAt: newStart + 60e3, lastError: 'compact tick threw' },
+        'review-compact': { consecutiveFailures: 2, lastErrorAt: newStart + 60e3, lastError: 'compact tick threw' },
+        'brand-new': { consecutiveFailures: 2, lastErrorAt: newStart + 60e3, lastError: 'new tick threw' },
+        'handoff-queue': { consecutiveFailures: 1, lastErrorAt: newStart + 30e3, lastError: 'host reattaching' },
         'loop-stalls': { consecutiveFailures: 1, lastErrorAt: newStart + 10e3, lastError: 'startup stall' },
         delivery: { consecutiveFailures: 3, lastErrorAt: newStart + 60e3 },
         deploy: { consecutiveFailures: 1, lastErrorAt: newStart + 60e3 },
@@ -1128,11 +1132,15 @@ test('land watches daemon health after the restart and names a regression with t
     assert.deepEqual(events.slice(0, 2), ['snapshot-before', 'keep restart-daemon'], 'the before picture is taken ahead of the restart');
     const result = events[2];
     assert.equal(result.deployed, true);
-    assert.deepEqual(result.health.regressions, ['review-compact'], 'a row failing before the restart, a startup stall, and the deploy row are not listed');
-    assert.equal(polls, 2, 'it stops polling at the first regression');
-    assert.match(said, /DEPLOY REGRESSION: 1 scheduler started failing after deploy .{7} \(was .{7}\)/);
-    assert.match(said, /review-compact: 1 failure since the restart — compact tick threw/);
-    assert.ok(said.includes(`git revert --no-edit ${base}..${sha}`), said);
+    assert.deepEqual(result.health.regressions, ['review-compact', 'brand-new'], 'a row failing before the restart, a startup stall, and the deploy row are not listed');
+    assert.deepEqual(result.health.once, ['handoff-queue']);
+    assert.equal(polls, 2, 'it stops polling at the first two-in-a-row regression');
+    assert.match(said, /DEPLOY REGRESSION: 2 schedulers started failing after deploy .{7} \(was .{7}\)/);
+    assert.match(said, /review-compact: 2 failures in a row since the restart — compact tick threw/);
+    assert.match(said, /brand-new \(new row\): 2 failures in a row/, 'a scheduler the deploy added is charged too');
+    assert.match(said, /handoff-queue failed once since the restart/);
+    assert.match(said, /can include other sessions' landed commits/);
+    assert.ok(said.includes(`git revert --no-edit ${base}..${sha}`), 'the base falls back to the checkout before the fast-forward');
     assert.equal(git(f.origin, 'rev-parse', 'main'), sha, 'nothing was reverted or pushed on top');
   } finally {
     process.stderr.write = write2;
@@ -1159,8 +1167,31 @@ test('the deploy watch says so in one line when nothing regressed, and reports a
     said = '';
     clock = 0;
     const down = wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), before, { ...deps, healthSnapshot: () => before });
-    assert.deepEqual(down, { started: false, regressions: [] });
-    assert.match(said, /has not recorded a new start 60s after the restart/);
+    assert.deepEqual(down, { started: false, regressions: [], range: 'bbbbbbb' });
+    assert.match(said, /DEPLOY FAILURE: the daemon has not recorded a start on the new code 60s after the restart/);
+    assert.match(said, /git revert --no-edit b{40} {3}\(the base is unknown/, 'a daemon that never came back gets the revert too');
+
+    // A single failure keeps the watch polling to the deadline and suggests no revert.
+    said = '';
+    clock = 0;
+    reads = 0;
+    const blip = wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), before, {
+      ...deps, healthSnapshot: () => { reads += 1; return healthPicture(2000, 'b'.repeat(40), { 'review-compact': { consecutiveFailures: 1, lastErrorAt: 2500, lastError: 'blip' } }); },
+    });
+    assert.deepEqual(blip, { started: true, regressions: [], once: ['review-compact'] });
+    assert.equal(reads, 7, 'one failure does not end the watch');
+    assert.match(said, /review-compact failed once since the restart/);
+    assert.doesNotMatch(said, /DEPLOY REGRESSION|git revert/);
+
+    // A daemon that keeps restarting on the new code is a failure with a revert.
+    said = '';
+    clock = 0;
+    const loop = healthPicture(4000, 'b'.repeat(40), { 'review-compact': {} });
+    loop.daemon.startedAts = [1000, 2000, 3000, 4000];
+    const looping = wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), before, { ...deps, healthSnapshot: () => loop });
+    assert.equal(looping.starts, 3);
+    assert.match(said, /DEPLOY FAILURE: the daemon started 3 times/);
+    assert.match(said, /git revert --no-edit b{40}/);
 
     said = '';
     assert.equal(wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), before, { ...deps, noHealthWait: true }), null);

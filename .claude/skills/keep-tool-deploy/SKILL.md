@@ -39,10 +39,30 @@ default branch: never edit or commit there. All work happens in a `wt` worktree.
      `keep step run keep-tool deploy` (the pull `--ff-only` and `keep restart-daemon`).
    A failed run keeps your claim and prints its log: a dirty or diverged main checkout
    fails the pull. Coordinate with its owner and record the blocker before retrying.
-5. **Skills changed?** New or renamed skills need `keep setup skills` (and
+5. **Read the health report.** After a restart that happened, `wt land` watches
+   `keep health` for up to 90 seconds, so run `wt land` / `keep land` with a command
+   timeout of at least five minutes or the report is cut off (`keep land` records its
+   check-in before the deploy, so the citation is safe either way; `--no-health-wait` or
+   `WT_HEALTH_WAIT=0` skips the wait). What it prints:
+   - one line saying no scheduler regressed: done.
+   - `<row> failed once since the restart`: often the restart itself (delivery,
+     handoff-queue, auto-compact while the host reattaches). No revert; glance at
+     `keep health` a few minutes later.
+   - `DEPLOY REGRESSION`: a row that was healthy before the restart (or a row the deploy
+     added, marked `(new row)`) failed twice in a row on the new code. `DEPLOY FAILURE`:
+     the daemon never recorded a start on the new code, or started more than once (a
+     crash loop). Both print the range that went live and a `git revert --no-edit
+     <from>..<sha>` to run in a fresh worktree. The range starts at the commit the old
+     daemon was running, so it can include other sessions' commits that had not been
+     deployed yet — check with them before reverting theirs. Nothing is reverted for you:
+     fix forward or revert, review, and land as usual.
+   The daemon keeps watching for 30 minutes (longer for slow rows): a `deploy` row in
+   `keep health` that reads "X started failing after deploy <sha> (was <sha>)" is the same
+   finding arriving after `wt land` exited. It clears itself once the row succeeds again.
+6. **Skills changed?** New or renamed skills need `keep setup skills` (and
    `keep setup hooks` when the hook text changed) so every managed account links them;
    sessions load new skills on their next start.
-6. **Check in** with the landed shas (post-rebase, not the worktree shas) and whether the
+7. **Check in** with the landed shas (post-rebase, not the worktree shas) and whether the
    daemon restarted.
 
 ## Does it need a restart?
