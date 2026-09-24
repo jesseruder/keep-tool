@@ -3017,8 +3017,11 @@ from every node's `hookQueue` sample (`{ depth, cap, oldestAt }`, the node's
 never queued a hook, and from the daemon node, which runs no hook client). It fails while
 any node's queue is at its cap (200 entries, where the oldest events are being dropped) or
 holds an event older than ten minutes (a queue that is not draining), naming each such
-node: `aws1: 200 hook events queued (at cap), oldest 2h 3m`. Stale samples are left out,
-and with no node reporting a queue nothing is written. Self-repair excludes the row: a
+node: `aws1: 200 hook events queued (at cap), oldest 2h 3m`. Stale samples are left out:
+with remote nodes configured but no fresh sample reporting a queue the row reads ok
+(`no fresh node sample reports a hook queue`), with no remote nodes at all nothing is
+written except once to clear a failure an earlier daemon left behind (`no remote
+nodes`), and the row is rewritten only when its result changes. Self-repair excludes the row: a
 repair session on the daemon cannot drain a node's queue, which empties on its own once
 the node reaches the daemon again.
 A stall in the probe's first minute is logged as `keep serve: event loop stalled
