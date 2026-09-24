@@ -12,7 +12,7 @@ const { Terminal } = require('@xterm/headless');
 const { SerializeAddon } = require('@xterm/addon-serialize');
 
 const { localNode } = require('./nodes.js');
-const { HOST_ONLY_MODULES, dropHostOnlyModules } = require('./host-modules.js');
+const { HOST_ONLY_MODULES, dropHostOnlyModules, readHostOnlyModules } = require('./host-modules.js');
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const DEFAULT_BUFFER_BYTES = 4 * 1024 * 1024;
@@ -557,8 +557,13 @@ function createHost(options = {}) {
   // host running an older bootstrap picks the fix up through a plain reload. It runs
   // here rather than at module load because the daemon loads host.js too (hostclient,
   // node-registry) and holds process-table.js itself; only the bootstrap passes
-  // `boot`, and nothing below can reach a lazy require before this returns.
-  if (options.boot && adopt) dropHostOnlyModules(options.hostOnlyModules || HOST_ONLY_MODULES);
+  // `boot`, and nothing below can reach a lazy require before this returns. The list
+  // is read fresh from disk, and nothing here throws on a helper that is missing.
+  // `restoredModules` is a bootstrap falling back to this core after putting its
+  // own helpers back in the cache: those stay.
+  if (options.boot && adopt && !options.restoredModules) {
+    dropHostOnlyModules(options.hostOnlyModules || readHostOnlyModules());
+  }
   if (adopt && (adopt.version !== 1 || !Array.isArray(adopt.panes))) {
     throw new Error('unsupported host handoff record');
   }

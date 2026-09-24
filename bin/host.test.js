@@ -1935,6 +1935,66 @@ test('a new core drops the host-only helpers itself when an older bootstrap relo
   }
 });
 
+test('a listed helper missing on disk does not break a reload', async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-helper-missing-')));
+  const marker = markerModule(root);
+  const missing = path.join(root, 'renamed-by-a-pull.js');
+  const boot = createBootstrap({ sock: path.join(root, 'host.sock'), log: null, hostOnlyModules: [missing, marker] });
+  globalThis.__keepHostMarkerLoads = 0;
+  try {
+    await boot.start();
+    require(marker);
+    assert.deepEqual(await boot.reload(), { panesAdopted: 0, fallback: false });
+    assert.equal(require.cache[marker], undefined, 'the helpers after the missing one are still dropped');
+    assert.deepEqual(await boot.reload(), { panesAdopted: 0, fallback: false });
+  } finally {
+    await boot.close();
+    delete require.cache[marker];
+    delete globalThis.__keepHostMarkerLoads;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a reload that falls back restores the previous core with its own helper modules', async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-helper-fallback-')));
+  const marker = markerModule(root);
+  const hostPath = require.resolve('./host.js');
+  // A new core that fails at load, after the bootstrap evicted the core and helpers.
+  const loadCore = (fresh, list) => {
+    if (!fresh) return require(hostPath);
+    clearLocalCoreModules(hostPath, list);
+    throw new Error('synthetic upgrade failure');
+  };
+  const boot = createBootstrap({ sock: path.join(root, 'host.sock'), log: null, hostOnlyModules: [marker], loadCore });
+  globalThis.__keepHostMarkerLoads = 0;
+  try {
+    await boot.start();
+    require(marker);
+    const helper = require.cache[marker];
+    const core = require.cache[hostPath];
+    const result = await boot.reload();
+    assert.equal(result.fallback, true);
+    assert.match(result.error, /synthetic upgrade failure/);
+    assert.equal(require.cache[marker], helper, 'the previous helper module is back in the cache');
+    assert.equal(require.cache[hostPath], core, 'and so is the previous core');
+    require(marker);
+    assert.equal(globalThis.__keepHostMarkerLoads, 1, 'the restored core never loaded the new helper');
+  } finally {
+    await boot.close();
+    delete require.cache[marker];
+    delete globalThis.__keepHostMarkerLoads;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the host-only list is read fresh from disk on each reload', () => {
+  const modules = require('./host-modules.js');
+  const before = require.cache[modules.HOST_MODULES_FILE];
+  assert.deepEqual(modules.readHostOnlyModules(), modules.HOST_ONLY_MODULES);
+  assert.notEqual(require.cache[modules.HOST_MODULES_FILE], before, 'host-modules.js itself was re-required');
+  assert.deepEqual(modules.hostOnlyModulePaths(['./gone.js']), [path.join(__dirname, 'gone.js')], 'no resolve, so no throw');
+});
+
 test('compact screen bounds escaped multibyte history before framing and preserves viewport', () => {
   const history = '\"\\漢'.repeat(400);
   const term = { cols: 1200, rows: 200, buffer: { active: {

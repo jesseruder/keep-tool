@@ -2,7 +2,9 @@
 'use strict';
 const path = require('node:path');
 const BOOT_VERSION = 1;
-const { HOST_ONLY_MODULES, hostOnlyModulePaths } = require('./host-modules.js');
+const {
+  HOST_ONLY_MODULES, HOST_MODULES_FILE, hostOnlyModulePaths, readHostOnlyModules, snapshotModules, restoreModules,
+} = require('./host-modules.js');
 const CORE_RELOAD_ALLOWLIST = HOST_ONLY_MODULES;
 function clearLocalCoreModules(corePath, allowlist = CORE_RELOAD_ALLOWLIST) {
   // A reload swaps host.js and the host-only helpers it requires lazily
@@ -14,10 +16,28 @@ function clearLocalCoreModules(corePath, allowlist = CORE_RELOAD_ALLOWLIST) {
 }
 function createBootstrap(options = {}) {
   const corePath = options.corePath || path.join(__dirname, 'host.js');
-  const loadCore = options.loadCore || ((fresh) => {
-    if (fresh) clearLocalCoreModules(corePath, options.hostOnlyModules || CORE_RELOAD_ALLOWLIST);
+  const loadCore = options.loadCore || ((fresh, list) => {
+    if (fresh) clearLocalCoreModules(corePath, list);
     return require(corePath);
   });
+  // The helper list the running core was loaded with. A reload reads the list fresh
+  // from host-modules.js (so an addition needs no restart) and snapshots every cache
+  // entry it is about to replace, so a fallback restores the previous core with its
+  // own helpers rather than the newly pulled ones.
+  let loadedList = options.hostOnlyModules || CORE_RELOAD_ALLOWLIST;
+  // It runs after the handoff, where a throw would lose every pane, so it never throws.
+  const prepareReload = () => {
+    const snapshot = new Map();
+    let list = loadedList;
+    try {
+      for (const [file, entry] of snapshotModules([path.resolve(corePath), HOST_MODULES_FILE, ...hostOnlyModulePaths(loadedList)])) {
+        snapshot.set(file, entry);
+      }
+      list = options.hostOnlyModules || readHostOnlyModules();
+      for (const file of hostOnlyModulePaths(list)) if (!snapshot.has(file)) snapshot.set(file, require.cache[file]);
+    } catch {}
+    return { snapshot, list };
+  };
   const hostOptions = { ...options };
   delete hostOptions.corePath;
   delete hostOptions.loadCore;
@@ -74,14 +94,16 @@ function createBootstrap(options = {}) {
           report(`host: reload failed during handoff (${error.message}) and the previous core is unusable; exiting so launchd restarts (panes lost)`, true);
           process.exit(1);
         }
+        const prepared = prepareReload();
         let candidate;
         try {
-          const nextModule = loadCore(true);
+          const nextModule = loadCore(true, prepared.list);
           candidate = nextModule.createHost({ ...hostOptions, boot, adopt: record });
           await candidate.listen();
           previous.finalizeHandoff();
           current = candidate;
           currentModule = nextModule;
+          loadedList = prepared.list;
           reloads += 1;
           lastReload = {
             at: new Date().toISOString(), panesAdopted: record.panes.length, fallback: false, error: null,
@@ -98,7 +120,8 @@ function createBootstrap(options = {}) {
           }
           let fallback;
           try {
-            fallback = previousModule.createHost({ ...hostOptions, boot, adopt: record });
+            restoreModules(prepared.snapshot);
+            fallback = previousModule.createHost({ ...hostOptions, boot, adopt: record, restoredModules: true });
             await fallback.listen();
           } catch (fallbackError) {
             reloads += 1;

@@ -17,13 +17,56 @@ const HOST_ONLY_MODULES = Object.freeze([
   './process-table.js',
 ]);
 
-// Absolute paths, resolved relative to this directory (host.js lives beside it).
+const HOST_MODULES_FILE = __filename;
+
+const validList = (list) => Array.isArray(list) && list.every((file) => typeof file === 'string' && file);
+
+// require.cache keys, built by hand. Never require.resolve: a helper a pull renamed
+// or deleted must not throw in the middle of a reload.
 function hostOnlyModulePaths(list = HOST_ONLY_MODULES) {
-  return list.map((file) => require.resolve(path.resolve(__dirname, file)));
+  return (validList(list) ? list : HOST_ONLY_MODULES).map((file) => path.resolve(__dirname, file));
 }
 
+// Drops whichever of the helpers are cached; a missing one is simply skipped.
 function dropHostOnlyModules(list = HOST_ONLY_MODULES) {
   for (const file of hostOnlyModulePaths(list)) delete require.cache[file];
 }
 
-module.exports = { HOST_ONLY_MODULES, hostOnlyModulePaths, dropHostOnlyModules };
+// The list as this file reads on disk now, so an addition takes effect through a
+// reload. A file that is missing or does not load keeps the copy already loaded.
+function readHostOnlyModules() {
+  const cached = require.cache[HOST_MODULES_FILE];
+  delete require.cache[HOST_MODULES_FILE];
+  try {
+    const fresh = require(HOST_MODULES_FILE).HOST_ONLY_MODULES;
+    if (validList(fresh)) return fresh;
+  } catch {}
+  if (cached) require.cache[HOST_MODULES_FILE] = cached;
+  else delete require.cache[HOST_MODULES_FILE];
+  return HOST_ONLY_MODULES;
+}
+
+// The cache entries a reload replaces (the core, this file and the helpers), so a
+// reload that falls back can put the previous core's own modules back.
+function snapshotModules(files) {
+  const snapshot = new Map();
+  for (const file of files) snapshot.set(file, require.cache[file]);
+  return snapshot;
+}
+
+function restoreModules(snapshot) {
+  for (const [file, entry] of snapshot) {
+    if (entry) require.cache[file] = entry;
+    else delete require.cache[file];
+  }
+}
+
+module.exports = {
+  HOST_ONLY_MODULES,
+  HOST_MODULES_FILE,
+  hostOnlyModulePaths,
+  dropHostOnlyModules,
+  readHostOnlyModules,
+  snapshotModules,
+  restoreModules,
+};
