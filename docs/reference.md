@@ -2854,9 +2854,12 @@ hourly row's first run counts — a failure on a row healthy at start, or on a r
 did not exist then, is charged to the deploy on the `deploy` health row, for example
 `review-compact started failing after deploy 7f8affa (was 738b569)` (an added row
 reads `(new)`). A deploy that starts inside an earlier deploy's 30-minute window keeps
-that one's base, so the label names the whole range. The row's streak is the worst
-open regression's, so it turns failing on the same three-in-a-row as the scheduler's
-own row, and goes back to ok (naming what recovered) once every charged row succeeds;
+that one's base, so the label names the whole range. The row reads what the rows it
+blames read: its streak is the worst among charged rows whose fault still stands
+(`faultStands`), so it turns failing on the same three-in-a-row as the scheduler's own
+row; when a charged row has only skipped past its fault window it reads recovered with
+it; its failure time is the charged rows' last real failure, never a skip's; and it
+goes back to ok (naming what recovered) once every charged row succeeds;
 a charged row that is disabled, retired or removed stops counting, and so does a row
 the deploy added that the running code stopped writing (the revert went out): one with
 no `CADENCES` entry that has not recorded since the current daemon started, once that

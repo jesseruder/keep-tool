@@ -256,14 +256,25 @@ function noteDeploy(store, name, entry, at, failed) {
   const says = ([row, value]) => `${row}${value.added ? ' (new)' : ''} started failing after deploy ${shortSha(value.commit)} (was ${shortSha(value.previousCommit)})`;
   const next = { ...(prior || {}), disabled: false, lastRunAt: at, cadenceMs: 0 };
   if (open.length) {
-    next.consecutiveFailures = Math.max(...open.map(([, value]) => Number(value.consecutiveFailures)));
-    next.lastErrorAt = at;
+    // The row reads what the rows it blames read. A charge counts toward the streak
+    // only while its row's fault stands (faultStands, the test `failing` uses); when
+    // none does, the streak is the charged rows' own and the latest result a skip, so
+    // the row reads recovered exactly when they do. The failure time is the blamed
+    // rows' last real failure, never the time of this record: a skip on a charged row
+    // rebuilds the row, and stamping it would keep the fault standing forever.
+    const standing = open.filter(([row]) => faultStands({ ...store[row], name: row }, at));
+    const counted = standing.length ? standing : open;
+    next.consecutiveFailures = Math.max(...counted.map(([, value]) => Number(value.consecutiveFailures)));
+    const lastErrorAt = Math.max(0, ...counted.map(([row]) => atMs(store[row].lastErrorAt)));
+    if (lastErrorAt) next.lastErrorAt = lastErrorAt;
+    next.lastResult = standing.length ? 'failed' : 'skipped';
     next.lastError = clipError(open.map((item) => `${says(item)}: ${item[1].error || 'tick failed'}`).join('; '));
     next.detail = clipError(open.map(says).join('; '));
     // A regression that cleared while another is still open is dropped, so a later
     // failure of it, outside any watch, is not charged to this deploy again.
     next.regressions = Object.fromEntries(open);
   } else {
+    next.lastResult = 'ok';
     next.consecutiveFailures = 0;
     next.lastOkAt = at;
     next.detail = Object.keys(regressions).length

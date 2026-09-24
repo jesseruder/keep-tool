@@ -643,6 +643,37 @@ test('an added row keeps its charge across a crash restart and loses it once a r
   assert.equal(read().deploy.consecutiveFailures, 0);
 });
 
+test('the deploy row reads what the row it blames reads: failing while its fault stands, recovered after', () => {
+  const { health } = fixture();
+  const start = 10 * 3600e3;
+  health.record('daemon', { at: start - 3600e3, pid: process.pid, commit: 'a'.repeat(40) });
+  health.record('review-compact', { ok: true, at: start - 60e3 });
+  health.record('daemon', { at: start, pid: process.pid, commit: 'b'.repeat(40) });
+  for (let i = 1; i <= 3; i++) health.record('review-compact', { ok: false, error: 'boom', at: start + i * 60e3 });
+  const states = (at) => Object.fromEntries(health.snapshot(at).schedulers
+    .filter((row) => ['review-compact', 'deploy'].includes(row.name)).map((row) => [row.name, row.state]));
+
+  // Skips inside the fault's window: both still failing, and the skips do not move
+  // the deploy row's failure time.
+  health.record('review-compact', { skipped: true, detail: 'nothing due', at: start + 10 * 60e3 });
+  assert.deepEqual(states(start + 10 * 60e3), { 'review-compact': 'failing', deploy: 'failing' });
+  const raw = JSON.parse(fs.readFileSync(health.FILE, 'utf8'));
+  assert.equal(raw.deploy.lastErrorAt, start + 3 * 60e3, 'a skip is not a failure');
+
+  // Three hours of skips: the scheduler reads recovered on master, and so does the deploy.
+  for (let i = 1; i <= 3; i++) health.record('review-compact', { skipped: true, detail: 'nothing due', at: start + i * 3600e3 });
+  assert.deepEqual(states(start + 3 * 3600e3 + 60e3), { 'review-compact': 'recovered', deploy: 'recovered' });
+  assert.equal(health.attentionItems(health.snapshot(start + 3 * 3600e3 + 60e3), start + 3 * 3600e3 + 60e3)
+    .some((item) => item.id === 'health:deploy'), false);
+
+  // A real failure again stands for both.
+  health.record('review-compact', { ok: false, error: 'boom again', at: start + 4 * 3600e3 });
+  assert.deepEqual(states(start + 4 * 3600e3), { 'review-compact': 'failing', deploy: 'failing' });
+  // And a real success clears both.
+  health.record('review-compact', { ok: true, at: start + 4 * 3600e3 + 60e3 });
+  assert.equal(states(start + 4 * 3600e3 + 120e3).deploy, 'ok');
+});
+
 test('a malformed deploy row never costs the scheduler its own record', () => {
   const { root, health } = fixture();
   const file = path.join(root, '.keep', 'health.json');
