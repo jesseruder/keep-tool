@@ -3130,6 +3130,56 @@ test('a node answers its stats beside the queue, with the caller\'s clock offset
   });
 });
 
+test('a node answers its inventory beside the queue, one at a time, looking only under its home', async () => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-inventory-')));
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let calls = 0;
+  const inventoryOptions = {
+    home, tools: [], logins: false, shellEnv: { PATH: '/nonexistent-bin' }, keepDir: path.join(home, 'keep'),
+    // Every subprocess (git, here) waits for the gate, so the first request is still
+    // collecting when the second arrives.
+    execFile: (file, args, options, callback) => {
+      calls += 1;
+      gate.then(() => callback(null, '', ''));
+      return { stdin: { end() {} } };
+    },
+  };
+  fs.mkdirSync(path.join(home, '.claude', 'skills', 'alpha'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude', 'skills', 'alpha', 'SKILL.md'), '---\nname: alpha\n---\n');
+  fs.mkdirSync(path.join(home, 'src', 'app', '.git'), { recursive: true });
+  try {
+    await withHost({ inventoryOptions }, async ({ client }) => {
+      const hello = await client.request('hello');
+      assert.equal(hello.inventory, 1, 'the hello says the verb is here');
+      assert.equal(hello.inventory, require('./node-inventory.js').INVENTORY_VERSION);
+      const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 30'] });
+      const pending = client.request('inventory', { claudeDirs: ['~/.claude', '/etc'], repoRoots: ['~/src'] }, { timeoutMs: 10e3 });
+      await waitFor(async () => calls > 0, 'the collection to reach its subprocesses');
+      // Collecting runs beside the queue: a screen read is answered meanwhile, and a
+      // second inventory is refused rather than started.
+      const screenAt = Date.now();
+      await client.request('screen', { pane: pane.id });
+      assert.ok(Date.now() - screenAt < 200, 'a screen read waited behind the inventory');
+      await assert.rejects(client.request('inventory', {}), /already being collected/);
+      release();
+      const answer = await pending;
+      assert.equal(answer.version, 1);
+      assert.equal(answer.partial, false);
+      assert.ok(Array.isArray(answer.inventory) && answer.inventory.every((line) => typeof line === 'string'));
+      assert.ok(answer.inventory.some((line) => /^claude:~\/\.claude\tskills\/alpha\tdir sha=/.test(line)), 'the asked-for config dir was read');
+      assert.ok(!answer.inventory.some((line) => line.startsWith('claude:/etc')), 'a directory outside the home is never read');
+      assert.ok(answer.inventory.some((line) => line.startsWith('repo\t~/src/app\t')), 'the asked-for repo root was walked');
+      // The slot was released: the next ask is answered.
+      assert.ok((await client.request('inventory', {}, { timeoutMs: 10e3 })).inventory.length > 0);
+      const { stats } = await client.request('stats', {});
+      assert.equal(stats.hostVersion.inventory, 1);
+    });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('a stats read that hangs on a disk answers partial and never leaves the host busy', async () => {
   const statsOptions = { statfs: () => new Promise(() => {}), deadlineMs: 300, cpuSampleMs: 5, agents: false };
   await withHost({ statsOptions }, async ({ client }) => {

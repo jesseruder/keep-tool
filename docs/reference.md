@@ -1247,6 +1247,19 @@ inherit a bypass.
 `keep resume` prints `keep open <id>` for every session; `keep resume --raw` prints the
 bare `claude --resume` / `codex resume` form for a human who knows what it gives up.
 
+## Bringing a node to parity
+
+`keep node audit <name> [--json] [--all]`, run on the daemon node, compares the named
+node with the daemon node: tools on the login `PATH`, each managed Claude and Codex
+config directory (MCP servers, settings and hooks, `CLAUDE.md` and `AGENTS.md`, skills,
+plugins), Pi, dotfiles, `~/bin`, repos and logins. It prints only what one side has and
+the other lacks, and what differs; per-project memory directories, worktrees under
+`~/wt` and tool locations are counted unless `--all` is given. Secrets are reported by
+presence or hash only. The node's host answers the `inventory` verb
+(`bin/node-inventory.js`); a host that predates it needs `git pull` and
+`keep host reload` on that node. [Node provisioning](node-provisioning.md) is the
+checklist for applying what the audit finds.
+
 ## Moving a session to another node
 
 `keep move <#n|session-id> --node <name>` stops a Claude or Codex session where it runs,

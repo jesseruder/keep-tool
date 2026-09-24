@@ -413,7 +413,8 @@ here rather than by copying whole private checkouts back into this repository.
 See the [full command reference](docs/reference.md), [shared state](docs/shared-state.md),
 [daemon self-repair](docs/self-repair.md), [Keep skill](skills/keep/SKILL.md),
 [fleet reviewer procedure](skills/fleet-review/SKILL.md),
-[agent guidance](docs/agent-guidance.md), and [desktop README](desktop/README.md).
+[agent guidance](docs/agent-guidance.md), [node provisioning](docs/node-provisioning.md),
+and [desktop README](desktop/README.md).
 
 ## Session handoffs
 

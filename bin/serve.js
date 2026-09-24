@@ -1815,7 +1815,7 @@ function isHostTarget(target) {
 // node can never sit in front of a keystroke bound for another. `transcript` goes
 // further and has a connection of its own (HOST_CHANNEL_BY_TYPE): a receipt's long
 // poll waits up to nine seconds, and a launch's prepare must not queue behind it.
-const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state', 'artifacts', 'stats']);
+const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state', 'artifacts', 'stats', 'inventory']);
 // `artifacts` carries a moving session's files in 4 MiB frames: a connection of its
 // own, so a move never sits in front of a receipt, a launch or a keystroke.
 const HOST_CHANNEL_BY_TYPE = new Map([['transcript', 'transcript'], ['artifacts', 'artifacts']]);
@@ -2086,7 +2086,7 @@ async function hostRequest(type, params, deps = {}) {
   // agent pane — a `process` call every 2.5s — clear the memo that outage listing is
   // built from, so a slow node holding an agent pane dropped off the list entirely
   // instead of staying on it marked stale.
-  const idempotent = ['hello', 'list', 'get', 'screen', 'meta', 'process', 'usage', 'transcript', 'stats'].includes(type)
+  const idempotent = ['hello', 'list', 'get', 'screen', 'meta', 'process', 'usage', 'transcript', 'stats', 'inventory'].includes(type)
     // An artifacts read or list changes nothing, a stage is continuity-checked on the
     // node (the same piece again is a no-op), and an abort only removes a stage. A
     // publish, a release and a queue drop are asked once: their caller looks before

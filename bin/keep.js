@@ -3701,6 +3701,10 @@ function helpText() {
                            # that account's usage as the node itself reads it
   keep node init <name> --daemon-node <name> --listen <ip:port> --token-file <path> [--sock <path>]
                            # on the node itself: install the host-only service
+  keep node audit <name> [--json] [--all]
+                           # compare the node's tools, agent config dirs, skills, MCP servers,
+                           # plugins, repos and logins with this daemon node's; --all shows
+                           # the per-project memory and worktree rows it otherwise counts
   keep add "title" [--kind task|experiment|idea|chore|bug] [--file|--claim] [--tag t]… [--project p]
                    [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when]
                    [--autonomous] [--experiment-id id] [--check-after when]
@@ -4049,7 +4053,9 @@ commands.setup = (args) => {
   return require('./setup').installHooks(args.slice(1));
 };
 commands.service = (args) => require('./setup').service(args, ROOT);
-commands.node = (args) => require('./setup').node(args, ROOT);
+commands.node = (args) => (args[0] === 'audit'
+  ? nodesGroup.nodeAudit(args.slice(1))
+  : require('./setup').node(args, ROOT));
 
 // A machine that holds terminals for another one's registry answers only for
 // itself. This table is the whole of what runs there, and it is an allow-list on

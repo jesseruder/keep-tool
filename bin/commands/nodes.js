@@ -229,6 +229,84 @@ async function nodeUsage(argv, deps) {
   }
 }
 
+const AUDIT_USAGE = 'usage: keep node audit <name> [--json] [--all]';
+const AUDIT_TIMEOUT_MS = 60e3;
+
+// Where both machines are looked at: this install's Claude and Codex account
+// directories and the repo roots, sent as `~/...` so a node reads its own home.
+function auditScope(home, deps = {}) {
+  const inventory = require('../node-inventory.js');
+  const accountDirs = (agent) => {
+    try {
+      const list = (deps.accounts || require('../accounts.js')).list().filter((entry) => entry.agent === agent).map((entry) => entry.configDir);
+      if (list.length) return list;
+    } catch {}
+    return inventory.defaultAccountDirs(agent, home);
+  };
+  const tilde = (dir) => (dir === home ? '~' : dir.startsWith(`${home}/`) ? `~${dir.slice(home.length)}` : dir);
+  const scope = {
+    claudeDirs: accountDirs('claude'),
+    codexDirs: accountDirs('codex'),
+    repoRoots: [home, path.join(home, 'wt')],
+  };
+  return {
+    local: scope,
+    remote: Object.fromEntries(Object.entries(scope).map(([key, list]) => [key, list.map(tilde)])),
+  };
+}
+
+// keep node audit: this (daemon) machine's inventory beside the named node's, as a
+// report of what one has that the other lacks. It exits 0 whatever it finds: it is
+// a checklist for the owner, not a gate.
+async function nodeAudit(argv, deps = {}) {
+  const o = parseArgs(argv, { json: 'bool', all: 'bool' });
+  if (o._.length !== 1) die(AUDIT_USAGE);
+  const name = o._[0];
+  if (!nodes.NODE_NAME_RE.test(name)) die(`a node name is lowercase letters and digits: ${name}`);
+  const inventory = require('../node-inventory.js');
+  const home = deps.homedir || require('node:os').homedir();
+  const daemon = deps.daemonNode || nodes.daemonNode();
+  const scope = auditScope(home, deps);
+  const connect = deps.connect || require('../hostclient.js').connect;
+  let client;
+  try { client = await connect({ node: name, timeoutMs: deps.timeoutMs == null ? 3000 : deps.timeoutMs }); }
+  catch (error) { return die(`cannot reach node ${name}: ${error.message}`); }
+  try {
+    let hello;
+    try { hello = client.descriptor || await client.request('hello'); }
+    catch (error) { return die(`node ${name} did not answer its hello: ${error.message}`); }
+    if (!hello || !hello.inventory) {
+      return die(`node ${name}'s host predates the inventory verb. On ${name}, pull Keep's checkout (git pull) `
+        + 'and run keep host reload, then run this again. Running sessions there are kept across the reload.');
+    }
+    const collect = deps.collectInventory || inventory.collectInventory;
+    let answer;
+    const [ours] = await Promise.all([
+      collect({ ...scope.local, ...(deps.inventoryOptions || {}) }),
+      client.request('inventory', scope.remote, { timeoutMs: deps.auditTimeoutMs == null ? AUDIT_TIMEOUT_MS : deps.auditTimeoutMs })
+        .then((result) => { answer = result; }, (error) => { answer = { error }; }),
+    ]);
+    if (answer.error) return die(`node ${name} could not collect its inventory: ${answer.error.message}`);
+    const theirs = inventory.fromLines(answer.inventory);
+    const sections = inventory.compareInventories(ours, theirs);
+    if (o.json) {
+      console.log(JSON.stringify({
+        daemonNode: daemon,
+        node: name,
+        partial: {
+          daemon: ours.some((entry) => entry.section === 'inventory' && entry.key === 'partial'),
+          node: answer.partial === true,
+        },
+        sections,
+      }));
+      return;
+    }
+    console.log(inventory.renderComparison(sections, { nameA: daemon, nameB: name, all: o.all === true }));
+  } finally {
+    try { client.close(); } catch {}
+  }
+}
+
 commands.nodes = async (argv, deps = {}) => {
   const [subcommand, ...rest] = argv.length ? argv : ['ls'];
   if (subcommand === 'ls') return listNodes(rest, deps);
@@ -239,4 +317,4 @@ commands.nodes = async (argv, deps = {}) => {
   return die(USAGE);
 };
 
-module.exports = { commands, renderNodes, renderUsage, USAGE };
+module.exports = { commands, renderNodes, renderUsage, nodeAudit, auditScope, USAGE, AUDIT_USAGE };

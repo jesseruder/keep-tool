@@ -35,6 +35,7 @@ const PROTOCOL_VERSION = 1;
 const TRANSCRIPT_VERSION = 4;
 const ARTIFACTS_VERSION = 2;
 const STATS_VERSION = 1;
+const INVENTORY_VERSION = 1;
 const HELLO_FAILURE_LIMIT = 10;
 const HELLO_FAILURE_WINDOW_MS = 60e3;
 const HELLO_FAILURE_ADDRESSES = 256;
@@ -1152,6 +1153,11 @@ function createHost(options = {}) {
           // stats: this host answers the `stats` verb (bin/node-stats.js): memory, swap,
           // CPU, disk, uptime, pane and agent counts, its versions and its clock offset.
           stats: STATS_VERSION,
+          // inventory: this host answers the `inventory` verb (bin/node-inventory.js):
+          // the tools, agent config directories, skills, MCP servers, repos and logins
+          // this machine is set up with, which `keep node audit` diffs against the
+          // daemon node's.
+          inventory: INVENTORY_VERSION,
           // spawnReceipts: a spawn naming an operationId is journalled, so a caller
           // whose reply was lost may ask again instead of starting a second process.
           spawnReceipts: true,
@@ -1634,7 +1640,7 @@ function createHost(options = {}) {
         panes: [...panes.values()].filter((pane) => pane.alive).length,
         hostVersion: {
           protocol: PROTOCOL_VERSION, transcript: TRANSCRIPT_VERSION, artifacts: ARTIFACTS_VERSION,
-          stats: STATS_VERSION, boot: (options.boot && options.boot.version) || null,
+          stats: STATS_VERSION, inventory: INVENTORY_VERSION, boot: (options.boot && options.boot.version) || null,
         },
       }))
       .then((stats) => respond({ ok: true, id: request.id, stats }), (error) => {
@@ -1642,6 +1648,41 @@ function createHost(options = {}) {
       })
       .catch(() => {})
       .finally(() => { statsInFlight -= 1; });
+  };
+
+  // What this machine is set up with (bin/node-inventory.js), for `keep node audit`.
+  // It runs subprocesses for tens of seconds, so it runs beside the connection's
+  // queue like stats, and one at a time: a second ask while one runs is refused.
+  let inventoryInFlight = 0;
+  const INVENTORY_IN_FLIGHT_MAX = 1;
+  const runInventory = (connection, socket, request) => {
+    const respond = (response) => {
+      if (socket.destroyed) return;
+      connection.send(encodeFrame(response));
+    };
+    if (inventoryInFlight >= INVENTORY_IN_FLIGHT_MAX) {
+      respond({ ok: false, id: request.id, error: 'an inventory is already being collected', code: 'inventory-busy' });
+      return;
+    }
+    inventoryInFlight += 1;
+    Promise.resolve()
+      .then(() => {
+        const inventory = require('./node-inventory.js');
+        // A test seam only: a fake home, no tool or login reads.
+        const seam = options.inventoryOptions || {};
+        return inventory.collectInventory({
+          ...seam,
+          ...inventory.requestOptions(request, seam.home || os.homedir()),
+        }).then((entries) => ({
+          lines: inventory.toLines(entries),
+          partial: entries.some((entry) => entry.section === 'inventory' && entry.key === 'partial'),
+        }));
+      })
+      .then(({ lines, partial }) => respond({ ok: true, id: request.id, inventory: lines, partial, version: INVENTORY_VERSION }), (error) => {
+        respond({ ok: false, id: request.id, error: error.message });
+      })
+      .catch(() => {})
+      .finally(() => { inventoryInFlight -= 1; });
   };
 
   let transcriptsInFlight = 0;
@@ -1739,6 +1780,10 @@ function createHost(options = {}) {
       }
       if (request && typeof request === 'object' && request.type === 'stats') {
         runStats(connection, socket, request);
+        return;
+      }
+      if (request && typeof request === 'object' && request.type === 'inventory') {
+        runInventory(connection, socket, request);
         return;
       }
       connection.queue = connection.queue.then(async () => {
@@ -2170,6 +2215,7 @@ module.exports = {
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
   STATS_VERSION,
+  INVENTORY_VERSION,
   canonicalIp,
   linkLocalIp,
   unmapIpv4,
