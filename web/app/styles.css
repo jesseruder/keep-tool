@@ -349,6 +349,9 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .session-launch-fields label, .session-launch-value { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; min-width: 0; }
 .session-launch-fields label > span, .session-launch-value > span { color: var(--faint); font-size: 10px; }
 .session-launch-fields select, .session-launch-fields input { width: 100%; padding: 8px 9px; border: 1px solid var(--line-2); border-radius: 5px; background: var(--panel-2); color: var(--text); }
+.session-launch-fields .linkish { padding: 0; border: 0; background: none; color: var(--info); font: inherit; cursor: pointer; }
+.session-launch-fields .linkish:hover { text-decoration: underline; }
+.session-launch-fields .linkish:disabled { color: var(--faint); cursor: default; text-decoration: none; }
 .session-launch-value strong { color: var(--text); overflow-wrap: anywhere; }
 .session-launch-fields .wide { grid-column: 1 / -1; }
 .session-launch-error { margin: 0 22px 14px; color: var(--bad); }

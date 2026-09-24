@@ -23,7 +23,7 @@ import { renderFleet } from './fleet.js';
 import { nodeStripHTML, nodeStatsHealthRowsHTML } from './node-stats.js';
 import { numLabel } from './session-number.js';
 import { openReviewQueueNotification, renderReviewQueue, reviewQueueIdForNotification } from './review-queue.js';
-import { openSessionChooser } from './session-launcher.js';
+import { openSessionChooser, defaultModels } from './session-launcher.js';
 import { providerIconHTML } from './provider-icon.js';
 import { openPortableTransfer } from './portable-transfer.js';
 import { closeReviewerPopover, markReviewerSeen, renderDock, renderReviewer, renderReviewerTop } from './reviewer.js';
@@ -639,7 +639,7 @@ async function newSession(cwd, name, onOpened) {
     title: 'New session', description: 'Choose what to open and where.', project: cwd,
     directory: cwd, editableDirectory: true,
     kinds: ['shell', 'claude', 'codex', 'pi'], initialKind: 'shell', confirmLabel: 'Open session', chooseNode: true,
-    models: { claude: 'claude-fable-5-1', codex: '' },
+    models: defaultModels(), defaultModels: true,
     async onSubmit(selection) {
       state.pendingFocus = true;
       try {

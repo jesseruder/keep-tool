@@ -51,7 +51,13 @@ globalThis.document = {
   body: { append() {} },
 };
 
-const { openSessionChooser } = await import('./session-launcher.js');
+const store = new Map();
+globalThis.localStorage = {
+  getItem: (key) => (store.has(key) ? store.get(key) : null),
+  setItem: (key, value) => { store.set(key, String(value)); },
+};
+
+const { openSessionChooser, defaultModels } = await import('./session-launcher.js');
 
 const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[c]);
 const accounts = [
@@ -146,4 +152,51 @@ test('switching from pi back to another agent restores the Machine choice', asyn
   await submit(modal);
   await done;
   assert.equal(submitted[0].node, 'aws1');
+});
+
+test('a new session starts on the provider default, Opus 5.5 [1m] for Claude until another is chosen', async () => {
+  store.clear();
+  assert.deepEqual(defaultModels(), { claude: 'claude-opus-5-5[1m]', codex: '', pi: '' });
+  const { modal, submitted, done } = open(undefined, { models: defaultModels(), defaultModels: true });
+  assert.match(modal.innerHTML, /<option value="claude-opus-5-5\[1m\]" selected>claude-opus-5-5\[1m\] · default<\/option>/);
+  assert.match(modal.innerHTML, /Your default for new sessions/);
+  assert.doesNotMatch(modal.innerHTML, /data-launch-model-default/);
+  await submit(modal);
+  await done;
+  assert.equal(submitted[0].model, 'claude-opus-5-5[1m]');
+});
+
+test('Make this the default saves the chosen model for that provider only', async () => {
+  store.clear();
+  const { modal, done } = open(undefined, { models: defaultModels(), defaultModels: true });
+  modal.querySelector('[data-launch-model]').fire('change', { target: { value: 'claude-sonnet-5' } });
+  assert.match(modal.innerHTML, /data-launch-model-default/);
+  modal.querySelector('[data-launch-model-default]').fire('click');
+  assert.deepEqual(defaultModels(), { claude: 'claude-sonnet-5', codex: '', pi: '' });
+  assert.match(modal.innerHTML, /<option value="claude-sonnet-5" selected>claude-sonnet-5 · default<\/option>/);
+
+  modal.querySelector('[data-launch-kind]').fire('change', { target: { value: 'codex' } });
+  assert.match(modal.innerHTML, /<option value="" selected>Account default · default<\/option>/);
+  modal.querySelector('[data-launch-model]').fire('change', { target: { value: 'gpt-5.6-sol' } });
+  modal.querySelector('[data-launch-model-default]').fire('click');
+  assert.deepEqual(defaultModels(), { claude: 'claude-sonnet-5', codex: 'gpt-5.6-sol', pi: '' });
+  modal.close(); await done;
+});
+
+test('without defaultModels the chooser shows no default note, as a reopen does', async () => {
+  store.clear();
+  const { modal, done } = open(undefined, { models: { claude: 'claude-fable-5-1' } });
+  const select = /<select data-launch-model[^>]*>[\s\S]*?<\/select>/.exec(modal.innerHTML)?.[0] || '';
+  assert.ok(select, 'Model select rendered');
+  assert.doesNotMatch(select, /· default/);
+  assert.doesNotMatch(modal.innerHTML, /Your default|data-launch-model-default/);
+  modal.close(); await done;
+});
+
+test('a malformed saved default falls back to the built-in one', () => {
+  store.set('keep.launch.defaultModels', '["nope"]');
+  assert.equal(defaultModels().claude, 'claude-opus-5-5[1m]');
+  store.set('keep.launch.defaultModels', '{bad json');
+  assert.equal(defaultModels().claude, 'claude-opus-5-5[1m]');
+  store.clear();
 });

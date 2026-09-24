@@ -8,6 +8,29 @@ const modelPresets = {
   codex: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
 };
 const OTHER_MODEL = '__other__';
+// A fresh session's model per provider until the person picks another as default in the
+// chooser; '' is the account default. Kept per browser, like the console's other choices.
+const DEFAULT_MODELS_KEY = 'keep.launch.defaultModels';
+const builtInDefaults = { claude: 'claude-opus-5-5[1m]', codex: '', pi: '' };
+
+function readDefaults() {
+  try {
+    const saved = JSON.parse(globalThis.localStorage?.getItem(DEFAULT_MODELS_KEY) || 'null');
+    return saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+  } catch { return {}; }
+}
+
+export function defaultModels() {
+  const saved = readDefaults();
+  const models = { ...builtInDefaults };
+  for (const kind of Object.keys(models)) if (typeof saved[kind] === 'string') models[kind] = saved[kind].trim();
+  return models;
+}
+
+export function setDefaultModel(kind, model) {
+  if (!Object.hasOwn(builtInDefaults, kind)) return;
+  try { globalThis.localStorage?.setItem(DEFAULT_MODELS_KEY, JSON.stringify({ ...readDefaults(), [kind]: String(model || '').trim() })); } catch {}
+}
 const isCustomModel = (kind, model) => !!model && !(modelPresets[kind] || []).includes(model);
 
 function ensureDialog() {
@@ -91,9 +114,14 @@ export function openSessionChooser(ctx, options) {
     const model = state.models[state.kind] || '';
     const customModel = !!state.customModel[state.kind];
     const selectedModel = customModel ? OTHER_MODEL : model;
-    const modelOptions = [['', 'Account default'], ...(modelPresets[state.kind] || []).map((id) => [id, id]), [OTHER_MODEL, 'Other…']];
+    const defaults = options.defaultModels === true ? defaultModels() : null;
+    const defaultTag = (value) => (defaults && defaults[state.kind] === value ? ' · default' : '');
+    const modelOptions = [['', 'Account default' + defaultTag('')], ...(modelPresets[state.kind] || []).map((id) => [id, id + defaultTag(id)]), [OTHER_MODEL, 'Other…']];
+    const modelNote = !defaults ? ''
+      : defaults[state.kind] === model.trim() ? '<span>Your default for new sessions</span>'
+        : `<span><button class="linkish" type="button" data-launch-model-default ${locked}>Make this the default</button></span>`;
     const modelField = state.kind === 'shell' || options.showModel === false ? ''
-      : `<label>Model<select data-launch-model ${locked}>${modelOptions.map(([value, text]) => `<option value="${ctx.esc(value)}" ${value === selectedModel ? 'selected' : ''}>${ctx.esc(text)}</option>`).join('')}</select>${customModel
+      : `<label>Model${modelNote}<select data-launch-model ${locked}>${modelOptions.map(([value, text]) => `<option value="${ctx.esc(value)}" ${value === selectedModel ? 'selected' : ''}>${ctx.esc(text)}</option>`).join('')}</select>${customModel
         ? `<input data-launch-model-custom aria-label="Model id" autocomplete="off" spellcheck="false" ${locked} value="${ctx.esc(model)}" placeholder="Model id">` : ''}</label>`;
     const nodeField = !nodeChoice() ? ''
       : state.kind === 'pi'
@@ -134,6 +162,12 @@ export function openSessionChooser(ctx, options) {
       state.node = event.target.value;
     });
     modal.querySelector('[data-launch-model-custom]')?.addEventListener('input', (event) => { state.models[state.kind] = event.target.value; });
+    modal.querySelector('[data-launch-model-default]')?.addEventListener('click', () => {
+      if (state.busy) return;
+      setDefaultModel(state.kind, state.models[state.kind]);
+      render();
+      queueMicrotask(() => modal.querySelector(state.customModel[state.kind] ? '[data-launch-model-custom]' : '[data-launch-model]')?.focus());
+    });
     modal.querySelector('[data-launch-directory]')?.addEventListener('input', (event) => { state.directory = event.target.value; });
     modal.querySelectorAll('[data-launch-cancel]').forEach((button) => button.addEventListener('click', () => { if (!state.busy) modal.close(); }));
     modal.querySelector('[data-launch-transfer]')?.addEventListener('click', () => { if (!state.busy) { modal.close(); options.onTransfer(); } });

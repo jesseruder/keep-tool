@@ -1,5 +1,5 @@
 import { searchDashboardReviews, write } from './api.js';
-import { openSessionChooser } from './session-launcher.js';
+import { openSessionChooser, defaultModels } from './session-launcher.js';
 
 const STATUSES = ['needs-decision', 'in-progress', 'resolved'];
 const LABELS = { 'needs-decision': 'Needs decision', 'in-progress': 'In progress', resolved: 'Resolved' };
@@ -221,7 +221,7 @@ async function chooseLaunch(ctx, item, action) {
     eyebrow: item.type === 'finding' ? 'Finding' : 'Idea', title: label,
     description: 'Choose the account for this new conversation.', project: item.project || item.card || '',
     kinds: ['claude', 'codex'], initialKind: 'claude', confirmLabel: label,
-    models: { claude: 'claude-fable-5-1', codex: '' },
+    models: defaultModels(), defaultModels: true,
     // The Machine select, as a new session from the rail has it; Automatic sends none.
     chooseNode: true,
     async onSubmit(selection) {
