@@ -86,6 +86,10 @@ export function mountTerminal(container, pane, options = {}) {
     fontFamily: '"SF Mono", Menlo, monospace',
     fontSize: 12.5,
     macOptionIsMeta: true,
+    // An app that captures the mouse (Claude Code's fullscreen renderer) takes every
+    // drag; Option-drag still makes a native selection, which is what Cmd+C copies.
+    // xterm only honours Shift for that outside macOS.
+    macOptionClickForcesSelection: true,
     cursorBlink: true,
     theme: xtermTheme(resolvedTheme(), getPalette()),
   });
@@ -574,6 +578,9 @@ export function mountTerminal(container, pane, options = {}) {
     }
     if (event.metaKey && event.key.toLowerCase() === 'c') {
       if (terminal.hasSelection()) navigator.clipboard?.writeText(terminal.getSelection()).catch(() => {});
+      // Cancel the key event too, or the desktop app's Edit menu takes Cmd+C next,
+      // finds no DOM selection to copy, and macOS beeps at the disabled item.
+      event.preventDefault();
       return false;
     }
     if (event.metaKey && event.key.toLowerCase() === 'k') {
