@@ -141,7 +141,10 @@ so it is for something he would want to be woken for, not for a trend. A quiet d
 recorded too: "quiet" is a result, and the next morning depends on seeing it.
 
 If the MCP is not attached or a query fails, say exactly which and check in with what you
-did get, then re-arm as usual; the card must never be left without its check-in.
+did get, then re-arm as usual: the delivered message says to record a failure "with the
+status it deserves", and for this card that status is `waiting` with tomorrow's check,
+because a missed morning is not a failed card. The card must never be left without its
+check-in.
 
 ## Budget
 

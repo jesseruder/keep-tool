@@ -2363,7 +2363,8 @@ restart does not hand every card a second pane. The account it spends is the aut
 pool's pick for the `checks` purpose (`docs/accounts.md`, **Automation pool**;
 `automationAccounts.checks` is a preference), and a spent pool names its best member
 so the deferral below runs against a pool account rather than the owner's default. It
-opens none at all while that account's weekly or 5h window is exhausted: that records one `check deferred`
+opens none at all while that account is out of budget for the check model — its week,
+its 5h window or the model's own weekly bucket under the headroom minimum: that records one `check deferred`
 check-in per card per day (at most three *written* notices a tick; a card already
 noticed today costs nothing, and the rest are logged only),
 changes neither the status nor the schedule, and leaves the card overdue for the tick
