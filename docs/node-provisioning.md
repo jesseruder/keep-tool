@@ -55,10 +55,14 @@ The sections:
 
 Nothing secret leaves either machine. Credential files are reported as present or
 absent; files that may contain a secret among other content are reported by a short
-content hash; environment values and MCP arguments whose name or shape looks like a
-credential are reported as `set` or `***`; and URLs lose their user info and query
-values. A line reading `inventory partial <sections>` means that side hit its deadline
-(about fifty seconds) and those sections are incomplete; run the audit again.
+content hash; environment values whose name looks like a credential are reported as
+`set`. A command line (a hook, an MCP server, the status line) shows its executable,
+plain paths and short plain words, masks every other token as `***`, and ends with
+`sha=<hash>` of the whole line, so two machines still compare exactly. URLs lose their
+user info and query values, and long or random-looking path segments become `*<hash>`
+markers. When either side hit its deadline (about fifty seconds), the report starts
+with a warning naming the sections it cut short; what is missing from them is not a
+real difference, so run the audit again.
 
 A node whose host predates the `inventory` verb is refused with a message saying so:
 on that node, `git pull` in Keep's checkout and run `keep host reload`. The reload keeps

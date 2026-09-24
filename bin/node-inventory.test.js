@@ -25,6 +25,20 @@ const SECRETS = {
   origin: 'PLANTEDoriginPAT19',
   helper: 'PLANTEDapiKeyHelper',
   hook: 'ghp_PLANTEDhookTOKEN0123456789',
+  // The review's leak classes, one each.
+  pathToken: 'PLANTEDpathTOKENsegment42',
+  webhook: 'PLANTEDwebhookSECRETvalue',
+  webhookTeam: 'T0PLANT77',
+  headerEnv: 'PLANTEDotelHEADERvalue',
+  envHeaderValue: 'PLANTEDenvHEADERshape',
+  jwt: 'eyJhbGciOiJIUzI1NiJ9.eyJQTEFOVEVEand0In0.PLANTEDjwtSIGNATURE9',
+  base64url: 'PLANTED-b64url_Zm9vYmFy-QUJDREVGR0g',
+  base64slash: 'PLANTED/b64slash+Zm9vYmFyYmF6/QUJDREVG',
+  curlUser: 'PLANTEDcurlPASS8',
+  mysqlPass: 'PLANTEDmysqlPW3',
+  customHeader: 'PLANTEDcustomHDR5',
+  hookHeader: 'PLANTEDhookHDR6',
+  shortPositional: 'hunter2x',
 };
 
 function write(file, content) {
@@ -44,6 +58,8 @@ function fakeHome(t) {
     mcpServers: {
       gateway: { type: 'http', url: `https://mcp.example.com/mcp?token=${SECRETS.mcpUrl}`, headers: { Authorization: `Bearer ${SECRETS.mcpHeader}` } },
       local: { type: 'stdio', command: 'npx', args: ['-y', 'example-mcp', '--api-key', SECRETS.mcpArg], env: { EXAMPLE_TOKEN: SECRETS.mcpEnv } },
+      pathy: { type: 'http', url: `https://mcp.example.com/api/mcp/s/${SECRETS.pathToken}/mcp` },
+      custom: { type: 'stdio', command: 'example-server', args: ['--header', `X-Custom: ${SECRETS.customHeader}`, SECRETS.jwt, SECRETS.base64url, SECRETS.base64slash, SECRETS.shortPositional] },
     },
     projects: {
       [path.join(home, 'src', 'app')]: { mcpServers: { tracker: { type: 'http', url: 'https://tracker.example.com/mcp' } } },
@@ -51,9 +67,21 @@ function fakeHome(t) {
   });
   write(path.join(primary, 'settings.json'), {
     model: 'opus',
-    env: { EXAMPLE_API_KEY: SECRETS.settingsEnv, PLAIN_FLAG: '1' },
+    env: {
+      EXAMPLE_API_KEY: SECRETS.settingsEnv,
+      PLAIN_FLAG: '1',
+      OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Basic ${SECRETS.headerEnv}`,
+      EXTRA_OPTIONS: `X-Api-Key: ${SECRETS.envHeaderValue}`,
+    },
     apiKeyHelper: `echo ${SECRETS.helper}`,
-    hooks: { Stop: [{ hooks: [{ type: 'command', command: `${home}/bin/stop-hook --token ${SECRETS.hook}` }] }] },
+    hooks: {
+      Stop: [{ hooks: [{ type: 'command', command: `${home}/bin/stop-hook --token ${SECRETS.hook}` }] }],
+      Notification: [{ hooks: [
+        { type: 'command', command: `curl -u admin:${SECRETS.curlUser} -H "X-Custom: ${SECRETS.hookHeader}" https://hooks.example.com/services/${SECRETS.webhookTeam}/B0PLANT88/${SECRETS.webhook}` },
+        { type: 'command', command: `mysql -p${SECRETS.mysqlPass} -e status ${SECRETS.jwt}` },
+        { type: 'http', url: `https://hooks.example.com/services/${SECRETS.webhookTeam}/B0PLANT88/${SECRETS.webhook}` },
+      ] }],
+    },
     permissions: { allow: ['Bash(ls:*)'] },
   });
   write(path.join(primary, 'CLAUDE.md'), '# global\n');
@@ -138,8 +166,13 @@ test('no planted credential ever appears in the inventory', async (t) => {
   assert.equal(lines.get('claude:~/.claude settings.json:env:PLAIN_FLAG'), '1');
   assert.equal(lines.get('claude:~/.claude settings.json:apiKeyHelper'), 'set');
   assert.equal(lines.get('claude:~/.claude mcp:user:gateway'), 'http https://mcp.example.com/mcp?token=*** headers=[Authorization]');
-  assert.equal(lines.get('claude:~/.claude mcp:user:local'), 'stdio npx -y example-mcp --api-key *** env=[EXAMPLE_TOKEN]');
-  assert.match(lines.get('claude:~/.claude settings.json:hooks:Stop'), /^command:~\/bin\/stop-hook --token \*\*\*$/);
+  assert.match(lines.get('claude:~/.claude mcp:user:local'), /^stdio npx -y example-mcp --api-key \*\*\* sha=[0-9a-f]{12} env=\[EXAMPLE_TOKEN\]$/);
+  assert.match(lines.get('claude:~/.claude mcp:user:pathy'), /^http https:\/\/mcp\.example\.com\/api\/mcp\/s\/\*[0-9a-f]{8}\/mcp$/);
+  assert.match(lines.get('claude:~/.claude mcp:user:custom'), /^stdio example-server --header \*\*\* \*\*\* \*\*\* \*\*\* \*\*\* sha=[0-9a-f]{12}$/);
+  assert.match(lines.get('claude:~/.claude settings.json:hooks:Stop'), /^command:~\/bin\/stop-hook --token \*\*\* sha=[0-9a-f]{12}$/);
+  assert.equal(lines.get('claude:~/.claude settings.json:env:OTEL_EXPORTER_OTLP_HEADERS'), 'set');
+  assert.equal(lines.get('claude:~/.claude settings.json:env:EXTRA_OPTIONS'), 'X-Api-Key: ***');
+  assert.match(lines.get('claude:~/.claude settings.json:hooks:Notification'), /^command:curl -u \*\*\* -H \*\*\* \*\*\* \*\*\* sha=/);
   assert.match(lines.get('repo ~/src/app'), /^main@0123456 origin=https:\/\/github.com\/example\/app.git dirty=1 env=\[\.env\]/);
   assert.equal(lines.get('codex:~/.codex config:mcp_servers'), 'docs');
   assert.equal(lines.get('codex:~/.codex config:profiles'), 'fast');
@@ -165,33 +198,93 @@ test('the inventory reads each config dir, a project-scope MCP server, and is th
   assert.equal(get('inventory', 'partial'), undefined);
 });
 
-test('a collection past its deadline answers with what it has and names what was cut', async (t) => {
+test('a collection past its deadline answers with what it has, starts nothing after it, and kills what runs', async (t) => {
   const fixture = fakeHome(t);
-  const hung = (file, args, opts, callback) => ({ stdin: { end() {} } });
-  const entries = await inventory.collectInventory({ ...options(fixture).value, execFile: hung, deadlineMs: 200 });
+  for (const name of ['one', 'two', 'three', 'four', 'five']) fs.mkdirSync(path.join(fixture.home, 'src', name, '.git'), { recursive: true });
+  let spawns = 0;
+  let killed = 0;
+  // A subprocess that never finishes on its own, only when it is killed.
+  const hung = (file, args, opts, callback) => {
+    spawns += 1;
+    return {
+      stdin: { end() {} },
+      kill() { killed += 1; setImmediate(() => callback(Object.assign(new Error('killed'), { killed: true, signal: 'SIGKILL' }), '', '')); },
+    };
+  };
+  const collection = inventory.startInventory({ ...options(fixture).value, execFile: hung, deadlineMs: 150, concurrency: 1, subprocessTimeoutMs: 60e3 });
+  const entries = await collection.result;
   const partial = entries.find((entry) => entry.section === 'inventory' && entry.key === 'partial');
   assert.ok(partial && /repos/.test(partial.value), `partial names the repos: ${partial && partial.value}`);
+  assert.equal(inventory.partialOf(entries), partial.value);
   assert.ok(entries.some((entry) => entry.section === 'claude:~/.claude'), 'what finished is kept');
+  const atDeadline = spawns;
+  assert.equal(atDeadline, 1, 'one at a time, and the rest were still queued');
+  await collection.idle;
+  assert.equal(killed, 1, 'the running one was killed at the deadline');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(spawns, atDeadline, 'nothing queued started after the deadline');
+  assert.deepEqual(collection.stats(), { spawned: 1, active: 0, fsActive: 0 });
 });
 
-test('a remote caller may only point the collection at directories under the home', () => {
-  const home = '/home/someone';
-  assert.deepEqual(inventory.requestOptions({
-    claudeDirs: ['~/.claude', '/home/someone/.claude-b', '/etc', '~/../other', 'relative', 7, '~/.claude'],
+test('the repo walk stops at its cap and says so', async (t) => {
+  const fixture = fakeHome(t);
+  for (const name of ['one', 'two', 'three']) fs.mkdirSync(path.join(fixture.home, 'src', name, '.git'), { recursive: true });
+  const entries = await inventory.collectInventory({ ...options(fixture).value, maxRepos: 2 });
+  const repos = entries.filter((entry) => entry.section === 'repo' && entry.key.startsWith('~/'));
+  assert.equal(repos.length, 2);
+  assert.equal(entries.find((entry) => entry.key === '(capped)').value, 'repos capped at 2');
+});
+
+test('a state file too large to parse is reported as such, and its MCP rows are not called missing', async (t) => {
+  const fixture = fakeHome(t);
+  fs.writeFileSync(path.join(fixture.second, '.claude.json'), JSON.stringify({ pad: 'x'.repeat((1 << 20) + 10) }));
+  const entries = await inventory.collectInventory(options(fixture).value);
+  const row = entries.find((entry) => entry.section === 'claude:~/.claude-second' && entry.key === 'claude.json');
+  assert.match(row.value, /^too large \(bytes=\d+\)$/);
+  const a = [{ section: 'claude:~/.claude-second', key: 'mcp:user:x', value: 'http https://x' }];
+  const b = [{ section: 'claude:~/.claude-second', key: 'claude.json', value: row.value }];
+  const [section] = inventory.compareInventories(a, b);
+  assert.equal(section.onlyA[0].noise, 'MCP rows the other side could not read');
+});
+
+test('the report warns first when either side was cut short', () => {
+  const report = inventory.renderComparison(inventory.compareInventories(A, B), { nameA: 'main', nameB: 'mini', partial: { a: null, b: 'logins,repos' } });
+  assert.match(report.split('\n')[0], /^warning: mini's inventory hit its deadline; .*: logins,repos$/);
+  assert.match(report.split('\n')[1], /^main vs mini: /);
+});
+
+test('a remote caller may only point the collection at directories under the home, symlinks resolved', async (t) => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-inventory-scope-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(home, '.claude'));
+  fs.mkdirSync(path.join(home, '.claude-b'));
+  fs.symlinkSync('/', path.join(home, 'escape'));
+  fs.symlinkSync(path.join(home, '.claude-b'), path.join(home, 'inside'));
+  assert.deepEqual(await inventory.requestOptions({
+    claudeDirs: ['~/.claude', `${home}/.claude-b`, '/etc', '~/../other', 'relative', 7, '~/.claude', '~/escape', '~/escape/etc', '~/inside', '~/missing'],
     codexDirs: 'not-a-list',
     repoRoots: ['~'],
     home: '/elsewhere',
-  }, home), { claudeDirs: ['/home/someone/.claude', '/home/someone/.claude-b'], repoRoots: ['/home/someone'] });
-  assert.deepEqual(inventory.requestOptions({}, home), {});
+  }, home), { claudeDirs: [path.join(home, '.claude'), path.join(home, '.claude-b'), path.join(home, 'inside')], repoRoots: [home] });
+  assert.deepEqual(await inventory.requestOptions({}, home), {});
 });
 
 test('scrub leaves ordinary text and hides credential shapes', () => {
   assert.equal(inventory.scrub('node ~/bin/keep.js hook stop'), 'node ~/bin/keep.js hook stop');
-  assert.equal(inventory.scrub('curl -H "Authorization: Bearer abc.def"'), 'curl -H "Authorization: *** ***');
+  assert.equal(inventory.scrub('curl -H "Authorization: Bearer abc.def"'), 'curl -H "Authorization: ***"');
+  assert.equal(inventory.scrub('curl -u admin:pass https://x'), 'curl -u *** https://x');
+  assert.equal(inventory.scrub('mysql -phunter2 db'), 'mysql -p*** db');
+  assert.equal(inventory.scrub('token is eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlMTIz ok'), 'token is *** ok');
+  assert.equal(inventory.scrub('/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home'), '/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home');
+  assert.equal(inventory.safeUrl('https://github.com/example/app.git'), 'https://github.com/example/app.git');
+  assert.equal(inventory.safeUrl('git@github.com:example/app.git'), 'git@github.com:example/app.git');
+  assert.match(inventory.safeUrl('https://hooks.example.com/services/T0ABCDEF1/B0ABCDEF2/abcdefghijklmnopqrstuvwx'),
+    /^https:\/\/hooks\.example\.com\/services\/\*[0-9a-f]{8}\/\*[0-9a-f]{8}\/\*[0-9a-f]{8}$/);
   assert.equal(inventory.scrub('https://user:pw@host/x?key=1&v=2'), 'https://***@host/x?key=***&v=***');
   assert.equal(inventory.scrub('PASSWORD=hunter2 other'), 'PASSWORD=*** other');
   assert.equal(inventory.scrub('uses ghp_abcdefghij0123456789'), 'uses ***');
-  assert.equal(inventory.safeArgs(['--token=abc', '--port', '8080', '-y', 'pkg']), '--token=*** --port 8080 -y pkg');
+  assert.match(inventory.safeCommand(['node', '--token=abc', '--port', '8080', '-y', 'pkg']), /^node --token=\*\*\* --port 8080 -y pkg sha=[0-9a-f]{12}$/);
+  assert.notEqual(inventory.safeCommand('run --pw one'), inventory.safeCommand('run --pw two'), 'the hash still tells two lines apart');
 });
 
 const A = [
@@ -306,7 +399,7 @@ test('keep node audit prints the daemon node beside the node, and says when a ho
   const json = JSON.parse(lines[1]);
   assert.equal(json.node, 'mini');
   assert.equal(json.daemonNode, 'main');
-  assert.deepEqual(json.partial, { daemon: false, node: false });
+  assert.deepEqual(json.partial, { daemon: null, node: null });
   assert.equal(json.sections.length, 5);
   const remote = asked.find((call) => call.type === 'inventory');
   assert.deepEqual(remote.params, {

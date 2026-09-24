@@ -1653,6 +1653,9 @@ function createHost(options = {}) {
   // What this machine is set up with (bin/node-inventory.js), for `keep node audit`.
   // It runs subprocesses for tens of seconds, so it runs beside the connection's
   // queue like stats, and one at a time: a second ask while one runs is refused.
+  // The slot is held until the collection is idle, not only until it has answered:
+  // past its deadline it answers at once, and whatever it started must be gone
+  // before another may start beside it.
   let inventoryInFlight = 0;
   const INVENTORY_IN_FLIGHT_MAX = 1;
   const runInventory = (connection, socket, request) => {
@@ -1665,23 +1668,28 @@ function createHost(options = {}) {
       return;
     }
     inventoryInFlight += 1;
+    let idle = null;
     Promise.resolve()
-      .then(() => {
+      .then(async () => {
         const inventory = require('./node-inventory.js');
-        // A test seam only: a fake home, no tool or login reads.
+        // Test seams only: a fake home and no tool or login reads, or a whole
+        // replacement for the collection.
         const seam = options.inventoryOptions || {};
-        return inventory.collectInventory({
-          ...seam,
-          ...inventory.requestOptions(request, seam.home || os.homedir()),
-        }).then((entries) => ({
-          lines: inventory.toLines(entries),
-          partial: entries.some((entry) => entry.section === 'inventory' && entry.key === 'partial'),
-        }));
+        const start = options.inventoryStart || inventory.startInventory;
+        const scope = await inventory.requestOptions(request, seam.home || os.homedir());
+        // Never the account list here: it is read synchronously, and the host's loop
+        // carries keystrokes. A node without a requested directory looks at the
+        // agents' default ones.
+        const collection = start({ useAccounts: false, ...seam, ...scope });
+        idle = collection.idle;
+        const entries = await collection.result;
+        return { lines: inventory.toLines(entries), partial: inventory.partialOf(entries) || false };
       })
       .then(({ lines, partial }) => respond({ ok: true, id: request.id, inventory: lines, partial, version: INVENTORY_VERSION }), (error) => {
         respond({ ok: false, id: request.id, error: error.message });
       })
       .catch(() => {})
+      .then(() => (idle ? Promise.resolve(idle).catch(() => {}) : undefined))
       .finally(() => { inventoryInFlight -= 1; });
   };
 

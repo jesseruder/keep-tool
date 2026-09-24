@@ -3180,6 +3180,49 @@ test('a node answers its inventory beside the queue, one at a time, looking only
   }
 });
 
+test('an inventory past its deadline keeps its slot until what it started is gone, and an error releases it', async () => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-inventory-late-')));
+  fs.mkdirSync(path.join(home, 'src', 'app', '.git'), { recursive: true });
+  const inventory = require('./node-inventory.js');
+  let pendingKill = null;
+  let starts = 0;
+  const inventoryOptions = {
+    home, tools: [], logins: false, shellEnv: { PATH: '/nonexistent-bin' }, keepDir: path.join(home, 'keep'),
+    repoRoots: [path.join(home, 'src')], deadlineMs: 100, subprocessTimeoutMs: 60e3,
+    // A subprocess that outlives the deadline and only ends when the test lets its
+    // kill land, so the host has answered while it is still running.
+    execFile: (file, args, options, callback) => ({
+      stdin: { end() {} },
+      kill() { const previous = pendingKill; pendingKill = () => { if (previous) previous(); callback(Object.assign(new Error('killed'), { killed: true }), '', ''); }; },
+    }),
+  };
+  const inventoryStart = (options) => {
+    starts += 1;
+    if (starts === 2) throw new Error('collection failed to start');
+    return inventory.startInventory(options);
+  };
+  try {
+    await withHost({ inventoryOptions, inventoryStart }, async ({ client }) => {
+      const late = await client.request('inventory', {}, { timeoutMs: 10e3 });
+      assert.match(late.partial, /repos/, 'the answer names what was cut short');
+      await waitFor(async () => pendingKill !== null, 'the running subprocess to be killed');
+      await assert.rejects(client.request('inventory', {}), /already being collected/, 'still running: the slot is held');
+      pendingKill();
+      await waitFor(async () => {
+        try { await client.request('inventory', {}); return false; } catch (error) { return /failed to start/.test(error.message); }
+      }, 'the slot to be released once the subprocess returned');
+      // The failed start released the slot too: the next one is answered.
+      pendingKill = null;
+      const next = client.request('inventory', {}, { timeoutMs: 10e3 });
+      assert.match((await next).partial, /repos/);
+      await waitFor(async () => pendingKill !== null, 'the third collection to reach its kill');
+      pendingKill();
+    });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('a stats read that hangs on a disk answers partial and never leaves the host busy', async () => {
   const statsOptions = { statfs: () => new Promise(() => {}), deadlineMs: 300, cpuSampleMs: 5, agents: false };
   await withHost({ statsOptions }, async ({ client }) => {

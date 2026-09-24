@@ -289,19 +289,15 @@ async function nodeAudit(argv, deps = {}) {
     if (answer.error) return die(`node ${name} could not collect its inventory: ${answer.error.message}`);
     const theirs = inventory.fromLines(answer.inventory);
     const sections = inventory.compareInventories(ours, theirs);
+    // The cut-short sections of each side, or null.
+    const partial = { daemon: inventory.partialOf(ours), node: inventory.partialOf(theirs) };
     if (o.json) {
-      console.log(JSON.stringify({
-        daemonNode: daemon,
-        node: name,
-        partial: {
-          daemon: ours.some((entry) => entry.section === 'inventory' && entry.key === 'partial'),
-          node: answer.partial === true,
-        },
-        sections,
-      }));
+      console.log(JSON.stringify({ daemonNode: daemon, node: name, partial, sections }));
       return;
     }
-    console.log(inventory.renderComparison(sections, { nameA: daemon, nameB: name, all: o.all === true }));
+    console.log(inventory.renderComparison(sections, {
+      nameA: daemon, nameB: name, all: o.all === true, partial: { a: partial.daemon, b: partial.node },
+    }));
   } finally {
     try { client.close(); } catch {}
   }
