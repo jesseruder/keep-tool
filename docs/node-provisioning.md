@@ -177,3 +177,52 @@ anyway.
 Sessions already running on the node keep the MCP servers, skills and settings they
 started with. Restart them (or open fresh ones) to pick up what changed. Run
 `keep node audit <name>` again; what remains should be only what is meant to differ.
+
+## Schedulers and sessions on another node
+
+A machine at parity is not enough on its own: the daemon's own periodic work has to
+survive the sessions that moved there. When the first sessions went to `aws1`, the
+reviewer tick, reviewer compaction, the session summaries and the account transfer each
+assumed a local transcript, and each surfaced hours later as its own red health row.
+
+The rule: **a scheduler must pass the remote-node suite
+(`bin/remote-node-schedulers.test.js`) before sessions of the kind it touches may move to
+a node.** Run against a fleet where some sessions live on another node, a tick must:
+
+- finish, and still serve every local session: a failure for one remote session never
+  fails the tick or its health row for the others;
+- read a remote session's history only where reading is enough (summaries, review
+  bundles, lint, a project or idle-time lookup), and then from the daemon's mirror
+  (`readableSessionFile`), or not at all when nothing is mirrored. A Codex rollout is not
+  mirrored, so a Codex session on a node has no readable history here
+  (`readableRolloutFile` answers null);
+- never read the copy a move left behind under the same id, and never act on a remote
+  session through anything local: where the work would type into the pane, compact it,
+  close it, verify it against its transcript or move it, the session is skipped with a
+  reason that names its node, or the action goes through that node's host the way
+  delivery and `keep move` do.
+
+`findSessionFile` keeps throwing for a session on another node on purpose. Its callers
+deliver, move or verify against the file, and a mirror trails the node by a hook post, so
+"use the mirror" is never the fix there; handle the refusal per session instead.
+
+### Adding a scheduler to the suite
+
+The fixture is `bin/fixtures/remote-node-fleet.js`. `createRemoteNodeFleet(t)` writes, into
+the test's registry, a daemon node `main` and a node `aws1` in one config, a local Claude
+session, a Claude session on `aws1` whose transcript is mirrored (with a stale local copy
+beside it), one on `aws1` with nothing mirrored, and a Codex session on `aws1` (with the
+rollout a move left behind). It gives you:
+
+- `fleet.local`, `fleet.mirrored`, `fleet.unmirrored`, `fleet.remoteCodex` (`id`, `pane`,
+  `file` / `mirror` / `staleLocal`), `fleet.remote` and `fleet.all`;
+- `fleet.sessions()` and `fleet.row(session, extra, { bare })`: scanned rows, with `node` on
+  the remote ones, or without it (`bare`) the way a local scan's stale row looks;
+- `fleet.panes()`: a fleet pane listing (`<id>@aws1` for the node's panes);
+- `fleet.fakeHosts(answer)`: a `connectHost` for serve.js that answers each node from its
+  own panes and records every request, so `typedOn('aws1')` can prove nothing was typed.
+
+Write one test per tick or lookup: drive it with the fleet's rows and panes (or its hosts),
+then assert the local session was served, each remote one was read from its mirror or
+skipped with a reason naming `aws1`, and no stale copy was read. Check that the test fails
+against the code before your fix, so it proves the fix rather than the fixture.

@@ -1381,6 +1381,12 @@ presence or hash only. The node's host answers the `inventory` verb
 `keep host reload` on that node. [Node provisioning](node-provisioning.md) is the
 checklist for applying what the audit finds.
 
+Parity is the node's half. The daemon's half is that every scheduler tick survives
+sessions on another node: a scheduler must pass `bin/remote-node-schedulers.test.js`
+before sessions of the kind it touches may move to a node. The rule and how to add a
+scheduler to that suite are in
+[node provisioning](node-provisioning.md#schedulers-and-sessions-on-another-node).
+
 ## Moving a session to another node
 
 `keep move <#n|session-id> --node <name>` stops a Claude or Codex session where it runs,
