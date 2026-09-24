@@ -101,7 +101,7 @@ const MISC_PRESENCE = [
 // Home's own children that are never project roots and are large to walk.
 const SKIP_HOME_CHILDREN = new Set(['Library', 'Applications', 'Pictures', 'Music', 'Movies', 'Downloads', 'node_modules', 'snap']);
 // A name (an env variable, a JSON or TOML key, a flag) that says its value is secret.
-const SECRET_NAME = /token|secret|pass|pwd|key|credential|auth|cookie|private|session|header|dsn|webhook|(?:^|[_-])(?:pw|pat|cred|login|bearer|pin)(?:$|[_-])/i;
+const SECRET_NAME = /token|secret|pass|pwd|key|credential|auth|cookie|private|session|header|dsn|webhook|(?:^|[_-])(?:pw|pat|cred|login|bearer|basic|pin)(?:$|[_-])/i;
 // Report sections each collection group writes, for naming what a deadline cut short.
 const GROUP_SECTIONS = {
   env: ['env'], system: ['system'], pi: ['pi'], keep: ['keep'], repos: ['repo'], logins: ['login'], android: ['android'],
@@ -246,6 +246,22 @@ function showFlag(dashes, body) {
 // on its right, and after a token masked whole that names a secret inside it. A
 // value glued to -p/-u/-H is masked. No span, quote or pair is parsed, so there is
 // nothing for a quoting trick to get past.
+// A NAME in NAME=value that may be shown: plain, not secret, not a credential flag,
+// and not a value glued to -p (-pNAME=).
+function plainName(name) {
+  const bare = name.replace(/^-+/, '');
+  return /^-{0,2}[A-Za-z_][A-Za-z0-9_.-]*$/.test(name) && readsAsName(bare)
+    && !SECRET_NAME.test(bare) && !SECRET_NAME.test(bare.replace(/_/g, '-')) && !credentialFlag(name)
+    && !(/^-[A-Za-z]/.test(name) && !name.startsWith('--') && credentialFlag(name.slice(0, 2)));
+}
+
+// Dashes that look like `-` are read as `-`, and zero-width characters dropped, before
+// a token is judged: `–p x` and `-p​ x` are the credential flag they look like.
+const normalizeToken = (token) => token.replace(/[‐-―−﹘﹣－]/g, '-').replace(/[​-‍⁠﻿]/g, '');
+// A separator standing on its own between a name and its value: `=`, `:`, `=>`,
+// `->`, `:=` and the like, but not a lone dash or a redirection.
+const isSeparator = (token) => /^[:=>-]{1,3}$/.test(token) && !/^(?:-|--|>|>>)$/.test(token);
+
 function allowlist(tokens, { rel = (value) => value, hash = defaultHash, executableFirst = false } = {}) {
   const out = [];
   let masked = false;
@@ -273,17 +289,20 @@ function allowlist(tokens, { rel = (value) => value, hash = defaultHash, executa
     const eq = token.indexOf('=');
     if (eq !== -1) {
       const name = token.slice(0, eq);
-      const bare = name.replace(/^-+/, '');
-      const nameOk = /^-{0,2}[A-Za-z_][A-Za-z0-9_.-]*$/.test(name) && readsAsName(bare)
-        && !SECRET_NAME.test(bare) && !SECRET_NAME.test(bare.replace(/_/g, '-')) && !credentialFlag(name)
-        // -pNAME= is a value glued to -p, not a name.
-        && !(/^-[A-Za-z]/.test(name) && !name.startsWith('--') && credentialFlag(name.slice(0, 2)));
-      // `password=` with its value in the next word.
-      const value = token.slice(eq + 1);
-      if (/^[:=]*$/.test(value) && !nameOk) hideNext = true;
-      // A value that is itself a flag or a key (`PASSWORD=--client_secret x`) hides
-      // what follows it just as it would on its own.
-      else if (value) classify(value, 1);
+      const nameOk = plainName(name);
+      // Each `name=` in turn (a loop, not recursion): one whose right side is empty
+      // and whose name is not plain has its value in the next word (`password=`),
+      // and the last value, when it is itself a flag or a key
+      // (`PASSWORD=--client_secret x`), hides what follows it as it would alone.
+      let left = name;
+      let value = token.slice(eq + 1);
+      for (;;) {
+        if (/^[:=]*$/.test(value)) { if (!plainName(left)) hideNext = true; break; }
+        const next = value.indexOf('=');
+        if (next === -1) { classify(value, 1); break; }
+        left = value.slice(0, next);
+        value = value.slice(next + 1);
+      }
       masked = true;
       return nameOk ? `${name}=***` : '***';
     }
@@ -317,16 +336,19 @@ function allowlist(tokens, { rel = (value) => value, hash = defaultHash, executa
     }
     return plain ? shown : mask();
   };
-  tokens.forEach((token, index) => {
+  tokens.forEach((raw, index) => {
+    const token = normalizeToken(raw);
+    // What is shown then differs from the text, so the hash has to carry the rest.
+    if (token !== raw) masked = true;
     const secretWordBefore = afterSecretWord;
     afterSecretWord = false;
-    if (hideRest) { out.push(mask()); return; }
+    if (hideRest || !token) { out.push(mask()); return; }
     // A quote, a backtick, a backslash or a parenthesis starts something whose end
     // is not looked for: every token from it on is masked, so a plain word inside a
     // quoted or substituted span is never shown by being plain. Checked before the
     // word-after-a-flag rule, which would otherwise mask only this one token.
     if (/["'`\\()]/.test(token)) { hideRest = true; out.push(mask()); return; }
-    const separator = /^[:=]+$/.test(token);
+    const separator = isSeparator(token);
     // A separator on its own (`--password = x`) keeps the value after it hidden.
     if (hideNext && separator) { out.push(mask()); return; }
     const hidden = hideNext;
@@ -367,7 +389,8 @@ function scrub(text, hash = defaultHash, rel) {
 // whitespace in it is not a plain word and is masked).
 function safeCommand(input, rel = (value) => value, hash = defaultHash) {
   const full = Array.isArray(input) ? JSON.stringify(input) : String(input == null ? '' : input);
-  const tokens = Array.isArray(input) ? input.map((value) => String(value)) : full.slice(0, SCRUB_MAX_CHARS).split(/\s+/).filter(Boolean);
+  // Each array element is capped like any text, so one huge argument cannot hold the loop.
+  const tokens = Array.isArray(input) ? input.map((value) => String(value).slice(0, SCRUB_MAX_CHARS)) : full.slice(0, SCRUB_MAX_CHARS).split(/\s+/).filter(Boolean);
   if (!tokens.length) return '';
   const { shown } = allowlist(tokens, { rel, hash, executableFirst: true });
   const visible = shown.length > SHOWN_MAX_CHARS ? `${shown.slice(0, SHOWN_MAX_CHARS)}…` : shown;

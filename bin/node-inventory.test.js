@@ -430,7 +430,8 @@ test('TOML names are read by hand, so hostile headers cost little', () => {
   const hostile = Array.from({ length: 250 }, () => `[${'a'.repeat(4000)}"]`).join('\n');
   const started = Date.now();
   const rows = inventory.codexConfigRows(hostile);
-  assert.ok(Date.now() - started < 100, `took ${Date.now() - started} ms`);
+  // Linear now (under a millisecond); the old pattern took ~70 ms a line, so 1 s still catches it.
+  assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
   assert.equal(rows.length, 1, 'all of them one hashed table');
   assert.match(rows[0][0], /^table:\*[0-9a-f]{8}$/);
   // Ordinary names still read: dotted, quoted with a dot or a space, and literal.
@@ -636,6 +637,14 @@ test('scrub, safeUrl and safeCommand', () => {
     ['password= correcthorse', '*** *** sha=H'],
     ['--password = correcthorse', '--password *** *** sha=H'],
     ['user pin = 1234', 'user pin *** *** sha=H'],
+    // Round eight: dashes that only look like `-`, a zero-width character after a
+    // flag, arrow separators, and `basic` as a secret name.
+    ['–p hunter', '-p *** sha=H'],
+    ['—pw hunter', '-p*** *** sha=H'],
+    ['-p​ hunter', '-p *** sha=H'],
+    ['password => hunter', 'password *** *** sha=H'],
+    ['password -> hunter', 'password *** *** sha=H'],
+    ['basic: hunter', '*** *** sha=H'],
     // A secret-sounding word alone hides nothing.
     ['the password is set', 'the password is set'],
     ['-la file', '-la file'],
