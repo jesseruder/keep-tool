@@ -441,6 +441,59 @@ test('a chunk answered with a mirror past what the event saw sends the event wit
   const result = await d.run({ snapshot, deadline: 10_000 });
   assert.equal(result.ok, true, JSON.stringify(result));
   assert.deepEqual(d.state.posts.map((post) => [post.event, post.from]), [['transcript', 0], ['stop', null]]);
+  // The cursor is where the mirror said it is, so the next event sends only what follows.
+  assert.equal(JSON.parse(fs.readFileSync(client.cursorFile(d.env, 'sess-aws1'), 'utf8')).sent, 650 * 1024);
+  d.state.posts.length = 0;
+  const next = await d.run({ snapshot: client.snapshotOf(f.transcript), deadline: 20_000 });
+  assert.equal(next.ok, true);
+  assert.deepEqual(d.state.posts.map((post) => [post.event, post.from, post.raw]), [['stop', 650 * 1024, 50 * 1024]]);
+});
+
+test('only a chunk its own timeout cut off, after most of that timeout, lowers the link rate', async (t) => {
+  const client = require('./hook-client.js');
+  const MiB = 1024 * 1024;
+  const refused = () => Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:1'), { code: 'ECONNREFUSED' });
+  const cases = [
+    // [what is stored, what the chunk meets, what the stored rate is after, whether the replay reads it as the link]
+    ['no rate, refused', null, () => { throw refused(); }, null, true],
+    ['no rate, cut off by its timeout', null, (timeoutMs, state) => { state.clock += timeoutMs; throw new Error('timed out after 4s'); }, null, false],
+    ['a rate, refused', 4 * MiB, () => { throw refused(); }, 4 * MiB, true],
+    ['a rate, reset', 4 * MiB, () => { throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }); }, 4 * MiB, true],
+    ['a rate, a timeout error at once', 4 * MiB, (timeoutMs, state) => { state.clock += 10; throw new Error('timed out after 4s'); }, 4 * MiB, false],
+    ['a rate, cut off by its timeout', 4 * MiB, (timeoutMs, state) => { state.clock += timeoutMs; throw new Error('timed out after 4s'); }, MiB, false],
+  ];
+  for (const [name, stored, meet, after, link] of cases) {
+    const f = fixture(t);
+    fs.writeFileSync(f.transcript, 'x'.repeat(5 * MiB));
+    fs.mkdirSync(path.join(f.home, '.keep-node'), { recursive: true });
+    const linkFile = path.join(f.home, '.keep-node', 'link.json');
+    if (stored) fs.writeFileSync(linkFile, JSON.stringify({ bytesPerSec: stored, at: 0 }));
+    const d = driven(f, (payload, timeoutMs, state) => (payload.event === 'transcript' ? meet(timeoutMs, state) : landed(payload)));
+    const result = await d.run({ snapshot: client.snapshotOf(f.transcript), deadline: 10_000 });
+    assert.equal(result.ok, false, name);
+    assert.equal(result.retry, true, name);
+    assert.equal(Boolean(result.link), link, `${name}: ${result.why}`);
+    assert.equal(d.state.posts.length, 1, name);
+    if (after === null) assert.equal(fs.existsSync(linkFile), false, `${name}: an unknown link stays unknown`);
+    else assert.equal(JSON.parse(fs.readFileSync(linkFile, 'utf8')).bytesPerSec, after, name);
+  }
+
+  // A chunk that cannot be read never reaches the link, and measures nothing.
+  if (process.getuid && process.getuid() !== 0) {
+    const f = fixture(t);
+    fs.writeFileSync(f.transcript, 'x'.repeat(5 * MiB));
+    fs.mkdirSync(path.join(f.home, '.keep-node'), { recursive: true });
+    const linkFile = path.join(f.home, '.keep-node', 'link.json');
+    fs.writeFileSync(linkFile, JSON.stringify({ bytesPerSec: 4 * MiB, at: 0 }));
+    const snapshot = client.snapshotOf(f.transcript);
+    fs.chmodSync(f.transcript, 0o000);
+    t.after(() => { try { fs.chmodSync(f.transcript, 0o600); } catch {} });
+    const d = driven(f, landed);
+    const result = await d.run({ snapshot, deadline: 10_000 });
+    assert.equal(result.ok, false);
+    assert.deepEqual(d.state.posts, [], 'nothing sent');
+    assert.equal(JSON.parse(fs.readFileSync(linkFile, 'utf8')).bytesPerSec, 4 * MiB);
+  }
 });
 
 test('a hook that runs out of time leaves the cursor at the last chunk that landed, and queues its event', async (t) => {
@@ -680,6 +733,33 @@ test('a daemon that drops the connection stops the replay: the next entry would 
   const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
   assert.deepEqual(Object.keys(state.stalled), ['sess-stuck'], 'the expired record overwritten');
   assert.ok(Date.now() - state.stalled['sess-stuck'] < 60_000);
+});
+
+test('a replay changes only its own sessions in the stall record, whatever another replay wrote meanwhile', async (t) => {
+  const f = fixture(t);
+  const client = require('./hook-client.js');
+  const env = { HOME: f.home };
+  for (const [i, session] of ['sess-stuck', 'sess-b'].entries()) {
+    client.enqueue(env, { event: 'notification', body: { input: { session_id: session, cwd: '/x', notification_type: 'idle_prompt' },
+      identity: { agent: 'claude', sessionId: session }, idempotencyKey: `k-${String(i).padStart(16, '0')}` } });
+  }
+  const stateFile = path.join(f.home, '.keep-node', 'hook-queue.state.json');
+  fs.writeFileSync(stateFile, JSON.stringify({ stalled: { 'sess-stuck': Date.now() } }));
+  const daemon = await stubDaemon(t, (body) => {
+    const session = body.identity.sessionId;
+    if (session === 'sess-b') return { status: 503, body: { error: 'busy' } };
+    if (session === 'sess-stuck') {
+      // Another hook's replay, at the same moment, records sess-x as stalled.
+      const current = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+      fs.writeFileSync(stateFile, JSON.stringify({ stalled: { ...current.stalled, 'sess-x': Date.now() } }));
+    }
+    return ran('');
+  });
+  const result = await f.hook('lifecycle', daemon.url, { hook_event_name: 'PostToolUse' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(daemon.posts.map((post) => post.body.identity.sessionId), ['sess-b', 'sess-stuck', 'sess-aws1']);
+  // sess-stuck drained and is gone; sess-b stalled here; sess-x is the other replay's.
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(stateFile, 'utf8')).stalled).sort(), ['sess-b', 'sess-x']);
 });
 
 test('every stalled session goes last, so two stuck sessions cannot starve a healthy one queued after them', async (t) => {

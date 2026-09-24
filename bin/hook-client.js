@@ -280,14 +280,17 @@ function recordLinkRate(env, bytes, elapsedMs, at) {
   writeLinkRate(env, stored ? RATE_ALPHA * sample + (1 - RATE_ALPHA) * stored : sample, at);
 }
 
-// A chunk that did not land. Its bytes over the time spent on it is more than the
-// link carried, and a stored rate it failed under is at least twice too high: the
-// lower of the two replaces the rate, so a link that slowed after a fast measurement
-// brings the chunks down with it instead of timing every one of them out.
+// A chunk its own timeout cut off, after at least half that timeout. Its bytes over
+// the time spent on it is more than the link carried, and a stored rate it failed
+// under is at least twice too high: the lower of the two replaces the rate, so a link
+// that slowed after a fast measurement brings the chunks down with it instead of
+// timing every one of them out. Only a measured rate is lowered: a link that is not
+// known stays unknown (CHUNK_FIRST applies), since a failure alone measures nothing.
 function recordLinkFailure(env, bytes, elapsedMs, at) {
-  const seen = bytes / (Math.max(1, elapsedMs) / 1000);
   const stored = readLinkRate(env, at);
-  writeLinkRate(env, stored ? Math.min(seen, stored / 2) : seen, at);
+  if (!stored) return;
+  const seen = bytes / (Math.max(1, elapsedMs) / 1000);
+  writeLinkRate(env, Math.min(seen, stored / 2), at);
 }
 
 // How many transcript bytes one post may carry with `leftMs` left of the event's budget.
@@ -355,9 +358,16 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
       // for a truncated source; the bytes stop where the event saw the file end.
       const end = Math.min(stat.size, snapshot.size);
       plan = { generation, size: stat.size, end, mtimeMs: end === snapshot.size ? snapshot.mtimeMs : stat.mtimeMs, path: transcriptPath };
-      // The mirror already holds more than this event saw (another hook sent it):
-      // the event goes without bytes, and the mirror is left as it is.
-      if (from > end) plan = null;
+      // The mirror already holds more than this event saw (another hook sent it, or a
+      // 409 said so): the event goes without bytes, and the mirror is left as it is.
+      // The cursor goes where the mirror is, so the next hook does not resend from
+      // the old one.
+      if (from > end) {
+        if (!cursor || cursor.generation !== generation || cursor.sent !== from) {
+          try { writeAtomic(cursorFile(env, sid), { generation, sent: from }); } catch {}
+        }
+        plan = null;
+      }
     }
     const piece = (start, end) => ({
       path: plan.path, generation: plan.generation, fromOffset: start, size: plan.size, mtimeMs: plan.mtimeMs,
@@ -375,16 +385,23 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
         const left = deadline - now();
         if (left < CHUNK_FLOOR_MS) return { ok: false, retry: true, why: 'out of time' };
         const timeoutMs = chunkTimeout(env, size, left, now());
+        // Read before the clock starts: a failure here is not the link's.
+        const payload = { event: 'transcript', identity, transcript: piece(from, from + size) };
         const began = now();
         let chunk;
         try {
-          chunk = await request(where.url, '/api/hook', { payload: { event: 'transcript', identity, transcript: piece(from, from + size) }, token, timeoutMs });
+          chunk = await request(where.url, '/api/hook', { payload, token, timeoutMs });
         } catch (error) {
-          recordLinkFailure(env, size, now() - began, now());
+          // Only a chunk its own timeout cut off says how fast the link is, and only
+          // when it ran most of that timeout. A refused or reset connection (a daemon
+          // restarting) fails in milliseconds and says nothing of the link's speed.
+          const elapsed = now() - began;
+          const cutOff = /timed out/.test(error.message);
+          if (cutOff && elapsed >= timeoutMs / 2) recordLinkFailure(env, size, elapsed, now());
           // Cut off by its own bound with time still left: the chunk was too large for
           // the link as it is now. The next one is smaller; meanwhile a replay goes on
           // to other sessions, whose entries may be small enough to land.
-          if (timeoutMs < left && /timed out/.test(error.message)) {
+          if (cutOff && timeoutMs < left) {
             return { ok: false, retry: true, why: `a chunk of ${size} bytes did not land in ${timeoutMs} ms` };
           }
           throw error;
@@ -516,8 +533,7 @@ async function replayQueue({ env, where, token, deadline, deps }) {
     });
     if (!result.ok && result.retry) {
       failed.add(session);
-      stalled[session] = now();
-      writeStalled(env, stalled);
+      updateStalled(env, { stalls: { [session]: now() }, at: now() });
       if (result.link || result.why === 'out of time') break;
       continue;
     }
@@ -527,12 +543,22 @@ async function replayQueue({ env, where, token, deadline, deps }) {
     try { fs.unlinkSync(file); } catch {}
     sent += 1;
   }
-  // A stalled session whose entries have all gone no longer goes last.
-  for (const session of Object.keys(stalled)) {
-    if (!failed.has(session) && !pendingFor(env, session)) delete stalled[session];
-  }
-  writeStalled(env, stalled);
+  // A stalled session whose entries have all gone no longer goes last. The queue is
+  // read once for every session it still holds.
+  const queued = queuedSessions(env);
+  const drained = Object.keys(stalled).filter((session) => !failed.has(session) && !queued.has(session));
+  if (drained.length) updateStalled(env, { drained, at: now() });
   return sent;
+}
+
+// The sessions with an entry in the queue.
+function queuedSessions(env) {
+  const out = new Set();
+  for (const name of queueFiles(env)) {
+    const entry = readJson(path.join(queueDir(env), name));
+    if (entry && entry.body && entry.body.identity) out.add(entry.body.identity.sessionId);
+  }
+  return out;
 }
 
 // The stalled sessions and when each last stalled, those older than an hour left out:
@@ -548,16 +574,22 @@ function readStalled(env, at) {
   return out;
 }
 
-function writeStalled(env, stalled) {
+// This replay's changes to the stall record, merged into the record as it is now:
+// another hook may be replaying at the same time, and its stalls are not this one's
+// to erase. `stalls` are added, the `drained` sessions (confirmed to have nothing
+// left queued) removed, everything else kept but what is past its hour; the file
+// goes only when nothing is left in it.
+function updateStalled(env, { stalls = {}, drained = [], at }) {
   const file = replayStateFile(env);
-  if (!Object.keys(stalled).length) {
+  const merged = { ...readStalled(env, at), ...stalls };
+  for (const session of drained) delete merged[session];
+  if (!Object.keys(merged).length) {
     try { fs.unlinkSync(file); } catch {}
     return;
   }
-  // Nothing written when nothing changed: most replays find the record as it was.
   const current = readJson(file);
-  if (current && JSON.stringify(current.stalled) === JSON.stringify(stalled)) return;
-  try { writeAtomic(file, { stalled }); } catch {}
+  if (current && JSON.stringify(current.stalled) === JSON.stringify(merged)) return;
+  try { writeAtomic(file, { stalled: merged }); } catch {}
 }
 
 // Removes a session's queued events. A session's end is the last thing it sends:
