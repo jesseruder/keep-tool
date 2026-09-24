@@ -4483,13 +4483,21 @@ function findReviewerSession(sessions, attempts, options = {}) {
 // transcripts, so such a reviewer was only ever reached by the bootstrap branch: for
 // its first thirty minutes and three sends, and never again, which left the tick
 // skipping "no live reviewer session registered" for good. Its mirror is the evidence
-// here that it has spoken and when (the mirror's mtime is the node's); the send itself
-// still reads the session from its node before it types. A reviewer the scan already
-// has, an ended marker, or one with nothing mirrored yet adds nothing.
+// here that it has spoken and when (the mirror's mtime is the node's), read with the
+// daemon's own transcript scanner so an interrupted or limited turn ends as it does
+// everywhere else. The mirror trails the node, so this only picks the reviewer: the
+// send reads the session from its node again right before it types (serve.js
+// sendReviewerMessage). A reviewer the scan already has, an ended marker, one with
+// nothing mirrored yet, and one with no live pane in `options.panes` (the tick's own
+// host list) add nothing: an old reviewer's mirror can be newer than the live one's.
+// Without a pane list there is no proof any pane is live, so nothing is added.
 function remoteReviewerRows(sessions, markers, options = {}) {
   const scanned = new Set((sessions || []).map((session) => session && session.id));
   const nodeOf = options.sessionNode || ((id) => remoteSessionNode(id));
   const fileOf = options.readableFile || ((id) => readableSessionFile(id));
+  const panes = Array.isArray(options.panes) ? options.panes : [];
+  const livePane = (id) => panes.some((pane) => pane && pane.alive && pane.agentAlive !== false
+    && pane.meta && pane.meta.sessionId === id);
   const rows = [];
   for (const [id, marker] of Object.entries(markers || {})) {
     if (scanned.has(id) || !marker || marker.ended || !SESSION_ID_RE.test(id)) continue;
@@ -4498,29 +4506,27 @@ function remoteReviewerRows(sessions, markers, options = {}) {
     let mtime = NaN;
     try {
       node = nodeOf(id);
-      if (!node) continue;
+      if (!node || !livePane(id)) continue;
       file = fileOf(id);
       if (file) mtime = fs.statSync(file).mtimeMs;
     } catch { continue; }
     if (!file || !Number.isFinite(mtime)) continue;
-    rows.push({ id, node, reviewer: true, state: 'idle', endedTurn: mirroredTurnEnded(file), mtime });
+    const turn = mirroredTurnState(file, options);
+    rows.push({ id, node, reviewer: true, state: turn.waiting ? 'waiting' : 'idle', endedTurn: turn.endedTurn, mtime });
   }
   return rows;
 }
 
-// Whether the last turn in a mirrored transcript ended: its last prompt or answer is
-// an answer that stopped on end_turn. Anything else, including a tail that cannot be
-// read, is a turn still in progress, so the tick waits rather than types into it.
-function mirroredTurnEnded(file) {
-  let lines;
-  try { lines = readTranscriptTail(file).split('\n'); } catch { return false; }
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    let record;
-    try { record = JSON.parse(lines[i]); } catch { continue; }
-    if (!record || (record.type !== 'assistant' && record.type !== 'user') || record.isMeta) continue;
-    return record.type === 'assistant' && record.message?.stop_reason === 'end_turn';
-  }
-  return false;
+// The last turn in a mirrored transcript, by the scanner every other session row is
+// built with (serve.js scanTranscriptText): whether it ended, and whether a question
+// or plan is waiting for an answer. A tail that cannot be read or parsed is a turn
+// still in progress, so the tick waits rather than types into it.
+function mirroredTurnState(file, options = {}) {
+  try {
+    const scan = options.scanTranscriptText || require('./serve.js').scanTranscriptText;
+    const info = scan(readTranscriptTail(file), file);
+    return { endedTurn: info.endedTurn === true, waiting: Boolean(info.pendingQuestion || info.pendingPlan) };
+  } catch { return { endedTurn: false, waiting: false }; }
 }
 
 function readReviewerMarker(sessionId) {
@@ -4565,7 +4571,14 @@ async function reviewTick(deps, opts) {
   // The daemon's session source is bounded unless asked otherwise. A forced tick
   // skips the re-look below and types on this read alone, so it asks for fresh here.
   const sessions = deps.sessions ? (options.force ? deps.sessions({ fresh: true }) : deps.sessions()) : [];
-  const reviewer = (deps.findReviewer || findReviewerSession)(sessions, meta.bootstrapAttempts);
+  // The host's panes, read first: a reviewer on another node is only a candidate
+  // with a live pane in this list (remoteReviewerRows), forced tick or not.
+  let reviewerPanes;
+  if (deps.hostPanes) {
+    try { reviewerPanes = await deps.hostPanes(); } catch { reviewerPanes = undefined; }
+  }
+  const findOptions = { panes: reviewerPanes };
+  const reviewer = (deps.findReviewer || findReviewerSession)(sessions, meta.bootstrapAttempts, findOptions);
   const model = reviewer ? (readReviewerMarker(reviewer.id).model || reviewerModel()) : reviewerModel();
   // Account precedence, deliberately: the live reviewer pane's `meta.accountId` (the
   // account the automation policy actually launched it on), then the session's own
@@ -4574,10 +4587,6 @@ async function reviewTick(deps, opts) {
   // session happens to have spawned this process, which for the daemon is not the
   // reviewer's account at all. `keep review-tick` from a pane inherits that pane's env,
   // so without this the same tick would be budgeted against two different windows.
-  let reviewerPanes;
-  if (!options.force && deps.hostPanes) {
-    try { reviewerPanes = await deps.hostPanes(); } catch { reviewerPanes = undefined; }
-  }
   const budget = options.force
     ? { code: 0, reason: 'forced' }
     : (deps.reviewBudget || reviewBudget)(model, undefined,
@@ -4620,7 +4629,7 @@ async function reviewTick(deps, opts) {
   if (!options.force) {
     // The daemon's session source is bounded for the first look; this one decides
     // whether to type, so it asks for a fresh transcript scan.
-    const again = (deps.findReviewer || findReviewerSession)(deps.sessions ? deps.sessions({ fresh: true }) : [], meta.bootstrapAttempts);
+    const again = (deps.findReviewer || findReviewerSession)(deps.sessions ? deps.sessions({ fresh: true }) : [], meta.bootstrapAttempts, findOptions);
     const recheck = shouldSendTick({
       budget, reviewer: again && again.id === reviewer.id ? again : null, queue, lastTickAt: meta.lastTickAt, now, trigger,
       drift: detail ? driftGate(meta, detail, now) : null,
@@ -4632,55 +4641,55 @@ async function reviewTick(deps, opts) {
   const text = detail
     ? driftTickMessage(detail, queue.ranked)
     : tickMessage(queue.ranked, queue.sweepDue, reviewer.bootstrap ? null : (deps.lastTickCost || lastTickCost)(reviewer.id));
+  // Everything a sent tick records: the tick clock, the bootstrap count, the day's
+  // counters, the drift it answered (recorded, and taken off the retry list) and the
+  // sweep it carried. Run for a send that returned, and for one that failed after its
+  // first key (a screen read that timed out after Enter, say): that tick may have
+  // landed, and a drift left parked or a sweep left due would be typed again.
+  const recordSent = (viaBootstrap) => {
+    mutateMeta((fresh) => {
+      fresh.lastTickAt = now;
+      fresh.lastTickTasks = queue.ranked.map((r) => r.task);
+      if (viaBootstrap) {
+        // Count the attempt. A real reviewer answers by producing a transcript, which
+        // ends bootstrap for good; a marker that keeps needing it is aimed at the wrong
+        // pane, so give up rather than keep typing into a stranger's session.
+        countBootstrapAttempt(fresh, reviewer.id);
+      } else if (fresh.bootstrapAttempts) {
+        delete fresh.bootstrapAttempts[reviewer.id];
+      }
+      bumpDay(fresh, 'ticks');
+      if (detail) {
+        bumpDay(fresh, 'driftWakes');
+        recordDriftWake(fresh, detail, now);
+        clearPendingDrift(fresh, detail.sessionId);
+      }
+      if (trigger === 'sweep') fresh.sweepTick = { ...(fresh.sweepTick || {}), day: localDay(now), lastSentAt: now };
+    });
+    // Only a message that actually carried the sweep clause consumes the day's sweep.
+    // A drift wake never carries it, and an early fallback tick must not burn it either.
+    const carried = queue.sweepDue && !detail && text.includes('cross-workstream fleet sweep');
+    if (carried) markFleetSweep();
+    return carried;
+  };
   let sent;
   try {
     sent = await deps.send(reviewer.id, text, { bootstrap: Boolean(reviewer.bootstrap) });
   } catch (error) {
-    // Keys were already typed (a screen read that timed out after Enter, say): the
-    // tick may have landed, so it is recorded as the last tick. Without that the next
-    // tick sends it again, and through the ordinary path once the transcript exists.
-    if (error && error.typingStarted) {
-      mutateMeta((fresh) => {
-        fresh.lastTickAt = now;
-        if (reviewer.bootstrap) countBootstrapAttempt(fresh, reviewer.id);
-      });
-    }
+    if (error && error.typingStarted) recordSent(Boolean(reviewer.bootstrap));
     throw error;
   }
   // The daemon's send says which path it took: a bootstrap message is answered
   // { bootstrap: true }, and a reviewer that already had a transcript (on its node,
   // say) took the ordinary path, which is no bootstrap attempt at all. An injected
   // send that answers nothing counts as the path it was asked for.
-  const viaBootstrap = Boolean(reviewer.bootstrap) && (sent == null || sent.bootstrap === true);
   appendReviewEvent({
     kind: 'tick', sessionId: reviewer.id,
     cards: detail && detail.cardId ? [detail.cardId, ...queue.ranked.map((r) => r.task)] : queue.ranked.map((r) => r.task),
     title: detail ? 'drift wake' : 'tick',
     detail: detail ? `drift on ${detail.cardId || 'an unlinked session'}` : `read ${queue.ranked.length} card(s)`,
   });
-  mutateMeta((fresh) => {
-    fresh.lastTickAt = now;
-    fresh.lastTickTasks = queue.ranked.map((r) => r.task);
-    if (viaBootstrap) {
-      // Count the attempt. A real reviewer answers by producing a transcript, which
-      // ends bootstrap for good; a marker that keeps needing it is aimed at the wrong
-      // pane, so give up rather than keep typing into a stranger's session.
-      countBootstrapAttempt(fresh, reviewer.id);
-    } else if (fresh.bootstrapAttempts) {
-      delete fresh.bootstrapAttempts[reviewer.id];
-    }
-    bumpDay(fresh, 'ticks');
-    if (detail) {
-      bumpDay(fresh, 'driftWakes');
-      recordDriftWake(fresh, detail, now);
-      clearPendingDrift(fresh, detail.sessionId);
-    }
-    if (trigger === 'sweep') fresh.sweepTick = { ...(fresh.sweepTick || {}), day: localDay(now), lastSentAt: now };
-  });
-  // Only a message that actually carried the sweep clause consumes the day's sweep.
-  // A drift wake never carries it, and an early fallback tick must not burn it either.
-  const carriedSweep = queue.sweepDue && !detail && text.includes('cross-workstream fleet sweep');
-  if (carriedSweep) markFleetSweep();
+  const carriedSweep = recordSent(Boolean(reviewer.bootstrap) && (sent == null || sent.bootstrap === true));
   return { sent: true, sessionId: reviewer.id, model, text, ranked: queue.ranked.length, trigger, carriedSweep };
 }
 
@@ -5172,6 +5181,7 @@ module.exports = {
   MAX_DRIFT_TURN_KEYS,
   findReviewerSession,
   pickReviewer,
+  remoteReviewerRows,
   BOOTSTRAP_MAX_AGE_MS,
   BOOTSTRAP_MAX_ATTEMPTS,
   TICK_LIMIT,

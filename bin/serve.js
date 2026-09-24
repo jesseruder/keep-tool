@@ -12194,6 +12194,11 @@ async function restorePlan(query, deps = {}) {
   ]);
   const nodesUnreadable = listed.configurationUnreadable === true;
   const daemonNode = daemonNodeName(deps);
+  // Heard from: a node the list names, that answered, freshly. One the list does not
+  // name at all (removed from the configuration, or a list that is one node's because
+  // the configuration could not be read) has said nothing either.
+  const heard = (node) => Boolean(listed.nodes && listed.nodes[node] && listed.nodes[node].ok && !listed.nodes[node].stale)
+    && !unheardNodes.has(node);
   const candidates = new Map(Object.entries(ledger.sessions || {}));
 
   const paneBySession = new Map();
@@ -12228,15 +12233,18 @@ async function restorePlan(query, deps = {}) {
     const pane = paneBySession.get(id);
     const state = live.has(id) || pane && pane.alive && pane.agentAlive !== false ? 'alive' : 'gone';
     const agent = entry.agent || session && (session.kind || session.agent) || 'claude';
-    // Where the session runs is its location record's answer (sessionNodeOf), never
-    // the pane's: a pane the list lost says nothing. A session on a node this list did
-    // not hear from cannot be called gone.
-    const node = sessionNodeOf({ id }, deps);
-    if (node !== daemonNode && (unheardNodes.has(node) || nodesUnreadable)) {
+    // Where the session runs is its location record's answer, read directly, never
+    // the pane's (a pane the list lost says nothing) and never sessionNodeOf's (which
+    // answers the daemon node for everything when the node list cannot be read). A
+    // session on a node this list did not hear from cannot be called gone.
+    const node = transcripts.remoteSessionNode(id, { root: deps.root || keep.ROOT, env: deps.env || process.env, daemonNode });
+    if (node && (nodesUnreadable || !heard(node))) {
+      const configured = listed.nodes && Object.prototype.hasOwnProperty.call(listed.nodes, node);
       rows.push({ id, sessionId: id, agent, project: entry.project || session && session.project || '',
         pane: pane && pane.id || null, state: 'unknown', mtime: entry.lastSeenAlive, lastSeenAlive: entry.lastSeenAlive,
         source: entry.source, action: 'skip',
-        reason: nodesUnreadable ? 'the node list could not be read' : `node ${node} did not answer` });
+        reason: nodesUnreadable ? 'the node list could not be read'
+          : configured ? `node ${node} did not answer` : `node ${node} is not in this daemon's node list` });
       continue;
     }
     let codexChild = false;
@@ -15250,11 +15258,30 @@ async function announceStateNote(id, deps = {}) {
   return { id: note.id, event, text, sent, failed, busy, available: ledger.available !== false };
 }
 
-function sendReviewerMessage(sessionId, text, opts) {
-  return sendToSession(
-    { sessionId, text },
-    { ...review.readReviewerMarker(sessionId), bootstrap: Boolean(opts && opts.bootstrap) },
-  );
+// A reviewer on another node is picked from its mirror, which trails the node (and
+// stops moving while its hook posts fail), and a send's own checks read the session
+// only when finishing a half-typed message. So a message to one is gated here on the
+// node's own read of it: before anything is resolved, and again as the send's
+// beforeType, the last moment before the first key. Anything but an ended turn with no
+// question or plan waiting is a 409 and nothing is typed. A reviewer the node has no
+// transcript for has never taken a turn; that one is the bootstrap path's to decide.
+// A reviewer on this machine is sent exactly as before.
+async function sendReviewerMessage(sessionId, text, opts, deps = {}) {
+  const hint = { ...review.readReviewerMarker(sessionId), bootstrap: Boolean(opts && opts.bootstrap) };
+  if (!remoteSession({ id: sessionId }, deps)) return sendToSession({ sessionId, text }, hint, undefined, deps);
+  const idleOnNode = async ({ allowMissing }) => {
+    let current;
+    try { current = await (deps.loadSessionForAction || loadSessionForAction)(sessionId, deps); } catch (error) {
+      if (allowMissing && error && error.code === 'transcript-missing') return;
+      throw error;
+    }
+    if (!current || current.endedTurn !== true || current.pendingQuestion || current.pendingPlan) {
+      throw new InjectionError(409, `reviewer ${sessionId} is not idle on ${current && current.node || 'its node'}; nothing was typed`,
+        { reason: 'busy' });
+    }
+  };
+  await idleOnNode({ allowMissing: true });
+  return sendToSession({ sessionId, text }, hint, { beforeType: () => idleOnNode({ allowMissing: false }) }, deps);
 }
 
 // The bridge from a drift verdict to a reviewer wake. Exported because the field
@@ -15966,6 +15993,7 @@ function start(deps = {}) {
 module.exports = {
   runWorktreeRecreation,
   repairEnvFor,
+  sendReviewerMessage,
   messageWatcherDashboardState,
   prepareSessionSummary, sessionSummarySnapshot, associateDashboardSessionFiles,
   start,

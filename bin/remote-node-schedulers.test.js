@@ -152,16 +152,27 @@ test('review: a reviewer on the node with a mirror is live, and is not mistaken 
     fs.writeFileSync(path.join(dir, session.id), JSON.stringify({ at: Date.now() - 6 * 3600e3 }));
     t.after(() => fs.rmSync(path.join(dir, session.id), { force: true }));
   }
+  const panes = fleet.panes();
   // The local scan has neither; the mirrored one is live from its mirror, and idle.
-  const reviewer = review.findReviewerSession([fleet.row(fleet.local)], {});
+  const reviewer = review.findReviewerSession([fleet.row(fleet.local)], {}, { panes });
   assert.equal(reviewer.id, fleet.mirrored.id);
   assert.equal(reviewer.node, 'aws1');
   assert.equal(reviewer.bootstrap, undefined);
   assert.equal(reviewer.endedTurn, true);
   assert.ok(Math.abs(reviewer.mtime - fs.statSync(fleet.mirrored.mirror).mtimeMs) < 1);
+  // No live pane for it (an old reviewer whose mirror is still the newest), or no
+  // pane list at all: not a candidate.
+  const dead = panes.map((pane) => (pane.meta.sessionId === fleet.mirrored.id ? { ...pane, alive: false } : pane));
+  assert.equal(review.findReviewerSession([], {}, { panes: dead }), null);
+  assert.equal(review.findReviewerSession([], {}, {}), null);
   // A mirror whose last turn has not ended is a reviewer mid-turn: the tick waits.
-  fs.appendFileSync(fleet.mirrored.mirror, `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'next' } })}\n`);
-  assert.equal(review.findReviewerSession([], {}).endedTurn, false);
+  const at = new Date().toISOString();
+  fs.appendFileSync(fleet.mirrored.mirror, `${JSON.stringify({ type: 'user', timestamp: at, message: { role: 'user', content: 'next' } })}\n`);
+  assert.equal(review.findReviewerSession([], {}, { panes }).endedTurn, false);
+  // Interrupted, as the daemon's scanner reads it everywhere else: the turn is over.
+  fs.appendFileSync(fleet.mirrored.mirror, `${JSON.stringify({ type: 'user', timestamp: at, interruptedMessageId: 'msg_fixture',
+    message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }] } })}\n`);
+  assert.equal(review.findReviewerSession([], {}, { panes }).endedTurn, true);
 });
 
 test('review: bootstrap attempts count only sends that went the bootstrap way, and a half-typed send is a tick', async (t) => {
@@ -200,6 +211,87 @@ test('review: bootstrap attempts count only sends that went the bootstrap way, a
   reset();
   await assert.rejects(tick(async () => { throw new Error('refused before typing'); }));
   assert.equal(review.loadMeta().lastTickAt, undefined);
+  // The same half-typed send as the daily sweep: the sweep is recorded as sent.
+  reset();
+  await assert.rejects(tick(async () => { throw Object.assign(new Error('screen read timed out'), { typingStarted: true }); }));
+  assert.ok(review.loadMeta().sweepTick.lastSentAt);
+});
+
+test('review: a parked drift whose retry fails after its first key is not typed again', async (t) => {
+  createRemoteNodeFleet(t);
+  const review = require('./review.js');
+  const health = require('./health.js');
+  const original = health.record;
+  health.record = () => {};
+  t.after(() => { health.record = original; });
+  review.mutateMeta((meta) => { meta.drift = {}; meta.fallback = {}; meta.sweepTick = {}; delete meta.lastTickAt; });
+  let reviewer = { id: 'reviewer-fixture', state: 'idle', endedTurn: false };
+  const sends = [];
+  let fail = null;
+  const deps = {
+    sessions: () => [], findReviewer: () => reviewer,
+    reviewBudget: () => ({ code: 0, reason: 'within budget' }),
+    lintSnapshotAgeMs: () => 0, refreshLint: async () => ({ ok: true }),
+    send: async (_id, text) => { sends.push(text); if (fail) throw fail; },
+  };
+  // Parked while the reviewer is busy.
+  await review.driftWake(deps, { sessionId: 'drifting-fixture', turn: 3, cardId: 'card-fixture', stateLine: 's', reason: 'r' });
+  assert.equal(review.duePendingDrifts(review.loadMeta()).length, 1);
+  // Retried once it is free; the keys go in and the screen read after Enter fails.
+  reviewer = { id: 'reviewer-fixture', state: 'idle', endedTurn: true };
+  fail = Object.assign(new Error('screen read timed out'), { typingStarted: true });
+  await assert.rejects(review.retryPendingDrifts(deps), /screen read timed out/);
+  assert.equal(sends.length, 1);
+  assert.deepEqual(review.duePendingDrifts(review.loadMeta()), [], 'the drift is off the retry list');
+  // The next minute's retry, and a second wake for the same turn, type nothing.
+  fail = null;
+  await review.retryPendingDrifts(deps);
+  const again = await review.driftWake(deps, { sessionId: 'drifting-fixture', turn: 3, cardId: 'card-fixture', stateLine: 's', reason: 'r' });
+  assert.equal(again.sent, false);
+  assert.equal(sends.length, 1);
+});
+
+test('review: a message to a reviewer on the node is gated on the node\'s own read of it', async (t) => {
+  const fleet = createRemoteNodeFleet(t);
+  const serve = require('./serve.js');
+  await serve.closeHostClient();
+  t.after(() => serve.closeHostClient());
+  const midTurn = Buffer.from(`${fs.readFileSync(fleet.mirrored.mirror, 'utf8')}${JSON.stringify({ type: 'user',
+    timestamp: new Date().toISOString(), message: { role: 'user', content: 'a prompt the mirror has not seen' } })}\n`);
+  const send = async (session, { tail, stat, bootstrap = false } = {}) => {
+    await serve.closeHostClient();
+    const hosts = fleet.fakeHosts((node, type, params) => {
+      if (node !== 'aws1') return undefined;
+      if (type === 'transcript' && params.op === 'tail' && tail) return tail;
+      if (type === 'transcript' && params.op === 'stat' && stat) return stat;
+      if (['screen', 'input'].includes(type)) throw new Error(`reached aws1 with ${type}`);
+      return undefined;
+    });
+    const result = serve.sendReviewerMessage(session.id, 'review tick', { bootstrap },
+      { connectHost: hosts.connectHost, forceHostReconnect: true });
+    return { hosts, result };
+  };
+  const tailOf = (bytes) => ({ path: '/node/reviewer.jsonl', size: bytes.length, mtimeMs: Date.now(), generation: 'g', from: 0,
+    bytes: bytes.toString('base64') });
+
+  // The mirror says idle, the node says a turn is running: refused, nothing read or typed.
+  const busy = await send(fleet.mirrored, { tail: tailOf(midTurn) });
+  await assert.rejects(busy.result, (error) => error.status === 409 && /is not idle on aws1; nothing was typed/.test(error.message));
+  assert.equal(busy.hosts.requests.some((entry) => ['screen', 'input'].includes(entry.type)), false);
+
+  // Picked as a bootstrap row, but the node has a transcript and a turn running: refused.
+  const spoken = await send(fleet.unmirrored, { bootstrap: true, tail: tailOf(midTurn),
+    stat: { path: '/node/reviewer.jsonl', size: midTurn.length, mtimeMs: Date.now(), generation: 'g' } });
+  await assert.rejects(spoken.result, /is not idle on aws1/);
+
+  // Idle on the node: past the gate, to the pane.
+  const idle = await send(fleet.mirrored);
+  await assert.rejects(idle.result, /reached aws1 with screen/);
+
+  // Never spoken (no transcript on the node): the bootstrap path decides, ungated.
+  const fresh = await send(fleet.unmirrored, { bootstrap: true });
+  await assert.rejects(fresh.result, /reached aws1 with screen/);
+  assert.deepEqual(idle.hosts.typedOn('aws1'), []);
 });
 
 // ---------- session summaries ----------
@@ -312,6 +404,43 @@ test('restore: a node that did not answer has its sessions skipped by name, neve
   for (const session of fleet.remote) {
     assert.equal(byId[session.id].action, 'skip', session.name);
     assert.equal(byId[session.id].reason, 'node aws1 did not answer', session.name);
+  }
+});
+
+test('restore: a session on a node this daemon cannot list is skipped, when the node is gone from the config or the config is unreadable', async (t) => {
+  const fleet = createRemoteNodeFleet(t);
+  const serve = require('./serve.js');
+  await serve.closeHostClient();
+  t.after(() => serve.closeHostClient());
+  const now = Date.now();
+  const ledger = { updatedAt: now, sessions: Object.fromEntries(fleet.all.map((session, index) => [session.id,
+    { pid: 50000 + index, agent: session.agent, project: fleet.project, source: 'host', primary: true, lastSeenAlive: now - 60e3 }])) };
+  const plan = async () => {
+    await serve.closeHostClient();
+    const hosts = fleet.fakeHosts((_node, type) => (type === 'list' ? { panes: [] } : undefined));
+    const result = await serve.restorePlan({}, {
+      connectHost: hosts.connectHost, forceHostReconnect: true, ledger, now: () => now,
+      liveSessionPids: async () => new Map(), scanSessions: async () => [fleet.row(fleet.local)],
+      agentProcessRows: async () => [],
+    });
+    return Object.fromEntries(result.sessions.map((row) => [row.id, row]));
+  };
+  // aws1 taken out of the node list: its sessions' records still name it. (A new
+  // file each time: the node list is memoized per configuration path.)
+  const removed = path.join(fleet.base, 'config-without-aws1.json');
+  fs.writeFileSync(removed, JSON.stringify({ ...fleet.config, nodes: { main: {} } }));
+  process.env.KEEP_CONFIG = removed;
+  let byId = await plan();
+  for (const session of fleet.remote) {
+    assert.deepEqual([byId[session.id].action, byId[session.id].reason], ['skip', 'node aws1 is not in this daemon\'s node list'], session.name);
+  }
+  // A configuration nobody can read: every node session is skipped by name.
+  const broken = path.join(fleet.base, 'config-unreadable.json');
+  fs.writeFileSync(broken, '{ not json');
+  process.env.KEEP_CONFIG = broken;
+  byId = await plan();
+  for (const session of fleet.remote) {
+    assert.deepEqual([byId[session.id].action, byId[session.id].reason], ['skip', 'the node list could not be read'], session.name);
   }
 });
 
