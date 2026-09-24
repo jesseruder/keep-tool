@@ -27,7 +27,7 @@ const health = require('./health.js');
 const probes = require('./review-probes.js');
 const quality = require('./review-quality.js');
 const related = require('./review-related.js');
-const { PROJECTS_DIR, readableSessionFile, remoteSessionNode, readTranscript, textOf: transcriptTextOf } = require('./transcripts.js');
+const { PROJECTS_DIR, readableSessionFile, readableFileForRow, remoteSessionNode, readTranscript, readTranscriptTail, textOf: transcriptTextOf } = require('./transcripts.js');
 
 const META = path.join(keep.ROOT, '.keep');
 const REVIEW_DIR = path.join(META, 'review');
@@ -585,6 +585,8 @@ function locateSession(session) {
   if (!SESSION_ID_RE.test(String(session.id || ''))) return null;
   // A Codex session on another node has no mirror here, and the rollout it left
   // behind when it moved is not what it is doing now (readableRolloutFile).
+  // A `node` the card's link carries is honoured first (readableFileForRow).
+  if (session.node) return readableFileForRow({ id: session.id, kind: session.agent || 'claude', node: session.node }, { codex });
   if (session.agent === 'codex') return remoteSessionNode(session.id) ? null : codex.findRolloutFile(session.id);
   return readableSessionFile(session.id);
 }
@@ -4471,10 +4473,54 @@ function pickReviewer(sessions, markers, now, attempts) {
   return { id: best.id, state: 'idle', endedTurn: true, mtime: best.at, bootstrap: true };
 }
 
-function findReviewerSession(sessions, attempts) {
+function findReviewerSession(sessions, attempts, options = {}) {
   const markers = {};
   for (const id of markerIds(REVIEWER_DIR)) markers[id] = readReviewerMarker(id);
-  return pickReviewer(sessions, markers, Date.now(), attempts);
+  return pickReviewer([...(sessions || []), ...remoteReviewerRows(sessions, markers, options)], markers, Date.now(), attempts);
+}
+
+// A reviewer on another node, as a live row. The daemon's scan is this machine's
+// transcripts, so such a reviewer was only ever reached by the bootstrap branch: for
+// its first thirty minutes and three sends, and never again, which left the tick
+// skipping "no live reviewer session registered" for good. Its mirror is the evidence
+// here that it has spoken and when (the mirror's mtime is the node's); the send itself
+// still reads the session from its node before it types. A reviewer the scan already
+// has, an ended marker, or one with nothing mirrored yet adds nothing.
+function remoteReviewerRows(sessions, markers, options = {}) {
+  const scanned = new Set((sessions || []).map((session) => session && session.id));
+  const nodeOf = options.sessionNode || ((id) => remoteSessionNode(id));
+  const fileOf = options.readableFile || ((id) => readableSessionFile(id));
+  const rows = [];
+  for (const [id, marker] of Object.entries(markers || {})) {
+    if (scanned.has(id) || !marker || marker.ended || !SESSION_ID_RE.test(id)) continue;
+    let node = null;
+    let file = null;
+    let mtime = NaN;
+    try {
+      node = nodeOf(id);
+      if (!node) continue;
+      file = fileOf(id);
+      if (file) mtime = fs.statSync(file).mtimeMs;
+    } catch { continue; }
+    if (!file || !Number.isFinite(mtime)) continue;
+    rows.push({ id, node, reviewer: true, state: 'idle', endedTurn: mirroredTurnEnded(file), mtime });
+  }
+  return rows;
+}
+
+// Whether the last turn in a mirrored transcript ended: its last prompt or answer is
+// an answer that stopped on end_turn. Anything else, including a tail that cannot be
+// read, is a turn still in progress, so the tick waits rather than types into it.
+function mirroredTurnEnded(file) {
+  let lines;
+  try { lines = readTranscriptTail(file).split('\n'); } catch { return false; }
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    let record;
+    try { record = JSON.parse(lines[i]); } catch { continue; }
+    if (!record || (record.type !== 'assistant' && record.type !== 'user') || record.isMeta) continue;
+    return record.type === 'assistant' && record.message?.stop_reason === 'end_turn';
+  }
+  return false;
 }
 
 function readReviewerMarker(sessionId) {
@@ -4503,6 +4549,11 @@ async function refreshLintSnapshot(deps = {}, now = Date.now()) {
   if (age <= lint.LINT_EVERY_MS) return { ok: true, skipped: true, ageMs: age };
   try { return { ...await (deps.refreshLint || lint.runLintChild)(), ageMs: age }; }
   catch (error) { return { ok: false, ageMs: age, error }; }
+}
+
+function countBootstrapAttempt(meta, id) {
+  meta.bootstrapAttempts = meta.bootstrapAttempts || {};
+  meta.bootstrapAttempts[id] = (meta.bootstrapAttempts[id] || 0) + 1;
 }
 
 async function reviewTick(deps, opts) {
@@ -4581,7 +4632,26 @@ async function reviewTick(deps, opts) {
   const text = detail
     ? driftTickMessage(detail, queue.ranked)
     : tickMessage(queue.ranked, queue.sweepDue, reviewer.bootstrap ? null : (deps.lastTickCost || lastTickCost)(reviewer.id));
-  await deps.send(reviewer.id, text, { bootstrap: Boolean(reviewer.bootstrap) });
+  let sent;
+  try {
+    sent = await deps.send(reviewer.id, text, { bootstrap: Boolean(reviewer.bootstrap) });
+  } catch (error) {
+    // Keys were already typed (a screen read that timed out after Enter, say): the
+    // tick may have landed, so it is recorded as the last tick. Without that the next
+    // tick sends it again, and through the ordinary path once the transcript exists.
+    if (error && error.typingStarted) {
+      mutateMeta((fresh) => {
+        fresh.lastTickAt = now;
+        if (reviewer.bootstrap) countBootstrapAttempt(fresh, reviewer.id);
+      });
+    }
+    throw error;
+  }
+  // The daemon's send says which path it took: a bootstrap message is answered
+  // { bootstrap: true }, and a reviewer that already had a transcript (on its node,
+  // say) took the ordinary path, which is no bootstrap attempt at all. An injected
+  // send that answers nothing counts as the path it was asked for.
+  const viaBootstrap = Boolean(reviewer.bootstrap) && (sent == null || sent.bootstrap === true);
   appendReviewEvent({
     kind: 'tick', sessionId: reviewer.id,
     cards: detail && detail.cardId ? [detail.cardId, ...queue.ranked.map((r) => r.task)] : queue.ranked.map((r) => r.task),
@@ -4591,12 +4661,11 @@ async function reviewTick(deps, opts) {
   mutateMeta((fresh) => {
     fresh.lastTickAt = now;
     fresh.lastTickTasks = queue.ranked.map((r) => r.task);
-    if (reviewer.bootstrap) {
+    if (viaBootstrap) {
       // Count the attempt. A real reviewer answers by producing a transcript, which
       // ends bootstrap for good; a marker that keeps needing it is aimed at the wrong
       // pane, so give up rather than keep typing into a stranger's session.
-      fresh.bootstrapAttempts = fresh.bootstrapAttempts || {};
-      fresh.bootstrapAttempts[reviewer.id] = (fresh.bootstrapAttempts[reviewer.id] || 0) + 1;
+      countBootstrapAttempt(fresh, reviewer.id);
     } else if (fresh.bootstrapAttempts) {
       delete fresh.bootstrapAttempts[reviewer.id];
     }

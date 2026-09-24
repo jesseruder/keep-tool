@@ -419,9 +419,9 @@ function startSchedulers(ctx) {
     // handed to Owner for good, a terminal decision a bounded index could make on a
     // session it has not caught up with. It scans only when a note is due.
     sessions: () => scanSessions({ fresh: true }),
-    // An author on another node is not in that scan: its node's read of it, or null
-    // for one that is not on another node (then it really is absent).
-    remoteSession: async (sessionId) => (remoteSession({ id: sessionId }, deps) ? loadSessionForAction(sessionId, deps) : null),
+    // An author on another node is not in that scan, or is there only as a stale
+    // copy: its node answers for it (createNoteAuthorLookup).
+    remoteSession: createNoteAuthorLookup({ remoteSession, loadSessionForAction, deps, root: keep.ROOT }),
     send: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }),
   });
   startAutoCompact();
@@ -953,6 +953,31 @@ function startSchedulers(ctx) {
   return { restarts };
 }
 
+// Who wrote a note, asked of the node its location record names (bin/notes.js sweep's
+// `remoteSession`). null for a session that is not on another node: the sweep then
+// reads its own scan. Otherwise the node's read of the session (loadSessionForAction),
+// or { absent: reason } when the answer is final for this note: the node says the
+// session is not there (404: outside the window, or one Keep spawned), or it is not a
+// Claude session, which a note cannot be delivered to on a node yet. Anything else a
+// node read throws (unreachable, a host that predates the transcript verb, an account
+// that cannot be resolved) is thrown on, and the sweep waits for the node.
+function createNoteAuthorLookup({ remoteSession, loadSessionForAction, deps = {}, root, sessionLocation } = {}) {
+  const locate = sessionLocation || ((id) => require('../accounts.js').sessionLocation(id, { root }));
+  return async (sessionId) => {
+    if (!remoteSession({ id: sessionId }, deps)) return null;
+    let location = null;
+    try { location = locate(sessionId); } catch {}
+    if (location && location.agent !== 'claude') {
+      return { absent: `its author is a ${location.agent} session on ${location.node}, and a note cannot be delivered there yet` };
+    }
+    const absent = { absent: `no live session on ${location ? location.node : 'its node'}` };
+    try { return (await loadSessionForAction(sessionId, deps)) || absent; } catch (error) {
+      if (error && error.status === 404) return absent;
+      throw error;
+    }
+  };
+}
+
 // The delivery watchdog's reconcile, one attempt. Global on purpose: reconcile reads
 // every session's pending delivery record, so no delivery may be mid-flight anywhere,
 // and the hold must stay brief: it is synchronous file work under the lock, and
@@ -1001,7 +1026,7 @@ function createDeliveryReconcile({ directory, deps = {}, listHostPaneResult, wit
 }
 
 module.exports = {
-  createDeliveryReconcile,
+  createDeliveryReconcile, createNoteAuthorLookup,
   startFeatureSchedulers, startSchedulers, createRegistryPull, createCleanupSnapshot,
   startLoopLagProbe, createLoopStallHealth, SEVERE_STALL_MS, SUSPEND_MS, STARTUP_MS, startReceiptsPoller, periodicSessionScan,
 };

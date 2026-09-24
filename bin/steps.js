@@ -472,15 +472,18 @@ const IDLE_SESSION_MS = 60 * 60e3;
 function defaultSessionIdle(sessionId, agent, now = Date.now()) {
   if (!sessionId || !/^[A-Za-z0-9_-]+$/.test(String(sessionId))) return true;
   let file = null;
+  let remote = null;
   // Only the file's age is read, so a session on another node is judged by its mirror
   // (whose mtime is the node's). The strict lookup threw for it, and the claim of a
-  // session busy on aws1 was called stale. A Codex session there has nothing here to
-  // read, which leaves it idle, as a session with no transcript always was.
+  // session busy on aws1 was called stale. One with nothing readable here (any Codex
+  // session there, a Claude one whose hook posts have not arrived) is unknown, not
+  // idle: no STALE flag on the word of a machine that cannot see the session.
   try {
     const transcripts = require('./transcripts.js');
+    remote = transcripts.remoteSessionNode(sessionId);
     file = agent === 'codex' ? transcripts.readableRolloutFile(sessionId) : transcripts.readableSessionFile(sessionId);
   } catch { file = null; }
-  if (!file) return true;
+  if (!file) return !remote;
   try { return now - fs.statSync(file).mtimeMs > IDLE_SESSION_MS; } catch { return true; }
 }
 

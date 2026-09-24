@@ -200,6 +200,23 @@ function createRemoteNodeFleet(t, options = {}) {
   // in `requests` as { node, type, params } so a test can prove nothing was typed
   // into a pane on aws1. `answer(node, type, params)` may answer first; returning
   // undefined falls through to the defaults. Unknown verbs answer {}.
+  // The `transcript` verb as a node answers it (bin/node-transcript.js): the node's
+  // own transcript, which for the mirrored session is the mirror's bytes (the mirror
+  // is a copy of it) and for the unmirrored one does not exist yet, so the node says
+  // `transcript-missing`. Only stat and tail, the two the daemon's reads use.
+  const nodeTranscriptAnswer = (node, params = {}) => {
+    const session = all.find((candidate) => candidate.id === params.sessionId && candidate.node === node);
+    const file = session && (node === DAEMON_NODE ? session.file : session.mirror);
+    if (!file) {
+      throw Object.assign(new Error(`no ${params.kind} transcript for ${params.sessionId} on this node`), { code: 'transcript-missing' });
+    }
+    const bytes = fs.readFileSync(file);
+    const described = { path: path.join(project, `${session.id}.jsonl`), size: bytes.length,
+      mtimeMs: fs.statSync(file).mtimeMs, generation: `fixture-${session.id}` };
+    if (params.op === 'stat') return described;
+    if (params.op === 'tail') return { ...described, from: 0, bytes: bytes.toString('base64') };
+    throw Object.assign(new Error(`the fixture node does not answer ${params.op}`), { code: 'transcript-invalid' });
+  };
   const fakeHosts = (answer = () => undefined) => {
     const requests = [];
     const panesOn = (node) => all.filter((session) => session.node === node).map((session) => {
@@ -216,7 +233,8 @@ function createRemoteNodeFleet(t, options = {}) {
           requests.push({ node, type, params });
           const custom = await answer(node, type, params);
           if (custom !== undefined) return custom;
-          if (type === 'hello') return { replaceExited: true, guardedKill: true };
+          if (type === 'hello') return { replaceExited: true, guardedKill: true, transcript: 4 };
+          if (type === 'transcript') return nodeTranscriptAnswer(node, params);
           if (type === 'list') return { panes: panesOn(node) };
           if (type === 'get') return { pane: panesOn(node).find((pane) => pane.id === params.pane) || null };
           if (type === 'screen') return { text: '\u276f \n', cursor: { x: 2, y: 0 } };

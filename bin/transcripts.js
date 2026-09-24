@@ -248,7 +248,24 @@ function remoteSessionNode(id, options = {}) {
   const env = options.env || process.env;
   let recordedNode = null;
   try { recordedNode = require('./accounts').sessionNode(id, { root, env }); } catch {}
-  return recordedNode && recordedNode !== nodes.daemonNode(env) ? recordedNode : null;
+  return recordedNode && recordedNode !== (options.daemonNode || nodes.daemonNode(env)) ? recordedNode : null;
+}
+
+// The readable history of a scanned row, honouring a `node` the row itself carries
+// (a fleet listing stamps it) before the location record: a row placed on another
+// node is read from that node's mirror, or not at all for Codex; any other row is
+// read as readableSessionFile / readableRolloutFile read it.
+function readableFileForRow(session, options = {}) {
+  if (!session || !session.id) return null;
+  const env = options.env || process.env;
+  const daemon = options.daemonNode || nodes.daemonNode(env);
+  const kind = session.kind || session.agent;
+  if (session.node && session.node !== daemon) {
+    if (kind === 'codex') return null;
+    const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+    try { return require('./transcript-mirror.js').stat(root, session.node, session.id)?.path || null; } catch { return null; }
+  }
+  return kind === 'codex' ? readableRolloutFile(session.id, options) : readableSessionFile(session.id, options);
 }
 
 // readableSessionFile for a Codex session. Nothing mirrors a Codex rollout from a
@@ -262,4 +279,4 @@ function readableRolloutFile(id, options = {}) {
 }
 
 module.exports = { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscript, readTranscriptTail, lastTurnUsage, findSessionFile,
-  readableSessionFile, readableRolloutFile, remoteSessionNode, claudeFilesIn, claudeFilesInProjects };
+  readableSessionFile, readableRolloutFile, readableFileForRow, remoteSessionNode, claudeFilesIn, claudeFilesInProjects };

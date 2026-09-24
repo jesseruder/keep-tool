@@ -30,6 +30,7 @@ const SWEEP_EVERY_MS = 60e3;
 // forever: after this many sweeps the note is Owner's, and the brief and lint
 // carry it from there.
 const NAG_ATTEMPT_LIMIT = 6;
+const NODE_UNREADABLE_LIMIT_MS = 2 * 3600e3;
 
 function defaultRoot() {
   return process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
@@ -413,9 +414,27 @@ function deferNag(id, root, now, reason) {
     if (note.nagged) return false;
     const attempts = Number(note.nagAttempts || 0) + 1;
     note.nagAttempts = attempts;
+    // The author was read, so any node outage it waited through is over.
+    delete note.nodeUnreadableSince;
     note.lastNagAttempt = { at: now, reason };
     if (attempts >= NAG_ATTEMPT_LIMIT) {
       note.nagged = { at: now, owner: true, reason: `${reason}, after ${attempts} attempts` };
+    }
+  });
+}
+
+// An author whose node cannot be read. That says nothing about the author, so it
+// never counts toward NAG_ATTEMPT_LIMIT (six sweeps is a six-minute outage); the note
+// waits for the node, and goes to Owner only once the node has been unreadable for
+// NODE_UNREADABLE_LIMIT_MS since the first such sweep.
+function deferForNode(id, root, now, reason) {
+  return updateNote(id, root, (note) => {
+    if (note.nagged) return false;
+    const since = Number.isFinite(Number(note.nodeUnreadableSince)) ? Number(note.nodeUnreadableSince) : now;
+    note.nodeUnreadableSince = since;
+    note.lastNagAttempt = { at: now, reason };
+    if (now - since >= NODE_UNREADABLE_LIMIT_MS) {
+      note.nagged = { at: now, owner: true, reason: `${reason}, for ${Math.round((now - since) / 60e3)} minutes` };
     }
   });
 }
@@ -435,23 +454,32 @@ async function sweep(options = {}) {
   let deferred = 0;
   for (const note of due) {
     const sessionId = (note.by && note.by.sessionId) || '';
-    let session = sessionId ? sessions.find((candidate) => candidate && candidate.id === sessionId) : null;
+    let session = null;
     // The scan is this machine's transcripts, so an author on another node is never
-    // in it, and "no live session" would hand its note to Owner for good. Such an
-    // author is read from its node instead (options.remoteSession answers null for a
-    // session that is not on another node). A node that cannot be read now is a
-    // reason to come back, the same as a busy session, not proof the author is gone.
-    if (!session && sessionId && typeof options.remoteSession === 'function') {
-      try { session = await options.remoteSession(sessionId); } catch (error) {
-        if (error && error.status === 404) session = null;
-        else {
-          const updated = deferNag(note.id, root, now, `its node could not be read: ${error && error.message || error}`);
-          if (updated && updated.nagged) owner += 1;
-          else deferred += 1;
-          continue;
-        }
+    // in it (or is there only as the stale copy a move left behind), and "no live
+    // session" would hand its note to Owner for good. Such an author is asked of its
+    // node first (options.remoteSession, see createNoteAuthorLookup in
+    // serve/schedulers.js): it answers null for a session that is not on another
+    // node, the session row, or { absent: reason } for one its node says is not
+    // there or cannot take a note. A node that cannot be read now is a reason to
+    // come back, not proof the author is gone: it has its own time budget
+    // (NODE_UNREADABLE_LIMIT_MS) and never spends the busy-session attempts.
+    let remote = null;
+    if (sessionId && typeof options.remoteSession === 'function') {
+      try { remote = await options.remoteSession(sessionId); } catch (error) {
+        const updated = deferForNode(note.id, root, now, `its node could not be read: ${error && error.message || error}`);
+        if (updated && updated.nagged) owner += 1;
+        else deferred += 1;
+        continue;
       }
     }
+    if (remote && remote.absent) {
+      markNagged(note.id, { at: now, owner: true, reason: String(remote.absent) }, root);
+      owner += 1;
+      continue;
+    }
+    if (remote) session = remote;
+    else if (sessionId) session = sessions.find((candidate) => candidate && candidate.id === sessionId) || null;
     const gone = !session || session.exited === true || session.state === 'exited';
     if (gone || typeof options.send !== 'function') {
       markNagged(note.id, { at: now, owner: true, reason: session ? 'the session has exited' : 'no live session' }, root);
@@ -514,5 +542,5 @@ module.exports = {
   loadNotes, allNotes, findNote, addNote, extendNote, clearNote, writeFileNotes,
   activeNotes, describeNote, announcementFor, nagFor,
   announceEventFor, announcedAlready, markAnnounced,
-  dueForNag, markNagged, deferNag, sweep, startScheduler, NAG_ATTEMPT_LIMIT,
+  dueForNag, markNagged, deferNag, sweep, startScheduler, NAG_ATTEMPT_LIMIT, NODE_UNREADABLE_LIMIT_MS,
 };

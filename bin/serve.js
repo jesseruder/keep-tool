@@ -393,6 +393,11 @@ function sessionSummaryFile(session, deps = {}) {
   if (published) return published;
   if (deps.publishedOnly) return null;
   const reader = deps.codex || codex;
+  // A row that says it is on another node is read from that node's mirror, or not at
+  // all for Codex, before anything asks the location record.
+  if (session && session.node && session.node !== daemonNodeName(deps) && !deps.findSessionFile) {
+    return transcripts.readableFileForRow(session, { codex: reader, daemonNode: daemonNodeName(deps) });
+  }
   return session && (session.kind === 'codex'
     // Nothing mirrors a Codex rollout, and the one a moved session left here is
     // where it was, not what it is doing: no summary rather than a wrong one.
@@ -8954,18 +8959,31 @@ async function sendToSession(body, targetHint, opts, deps = {}) {
   if (body.pane && text.length > 2000) throw new InjectionError(400, 'agent messages are limited to 2000 characters');
 
   // Bootstrap: a reviewer that has never taken a turn has no transcript, but its
-  // chosen session id is already bound to the host pane at launch. Only whether a
-  // transcript exists is asked, so a reviewer on another node is asked of its mirror:
-  // the strict lookup threw for it and failed the whole review tick. With no mirror
-  // yet it is typed to through its pane like a local one (the host routes the ref);
-  // with one, it takes the ordinary path below, which reads it from its node.
-  if (targetHint && targetHint.bootstrap && !transcripts.readableSessionFile(body.sessionId)) {
-    const hosted = sessionHostPane(await listHostPanes(deps), body.sessionId);
-    if (!hosted || !hosted.alive) throw new InjectionError(409, 'reviewer has no transcript yet and no live host pane');
-    const bootTarget = claimInjectionTarget({ pane: hosted.id });
-    const bootBefore = await readScreen(bootTarget, 30, false, deps);
-    await probeSuggestion(bootTarget, bootBefore, deps);
-    return typeAndSubmit(bootTarget, text, claudeTypedTextVisible, deps);
+  // chosen session id is already bound to the host pane at launch. The answer says it
+  // went this way ({ bootstrap: true }), so the review tick counts only real bootstrap
+  // sends; a failure after the first key is marked typingStarted, so the tick records
+  // a send that may have landed instead of sending it again.
+  if (targetHint && targetHint.bootstrap) {
+    const bootPane = await reviewerBootstrapPane(body.sessionId, deps);
+    if (bootPane) {
+      const bootTarget = claimInjectionTarget({ pane: bootPane });
+      const bootBefore = await readScreen(bootTarget, 30, false, deps);
+      await probeSuggestion(bootTarget, bootBefore, deps);
+      let typing = false;
+      try {
+        const result = await typeAndSubmit(bootTarget, text, claudeTypedTextVisible, {
+          ...deps,
+          deliveryTrace: (stage, fields) => {
+            if (stage === 'write-start' || stage === 'enter-start') typing = true;
+            return deps.deliveryTrace?.(stage, fields);
+          },
+        });
+        return { ...(result && typeof result === 'object' ? result : {}), bootstrap: true };
+      } catch (error) {
+        if (typing && error && typeof error === 'object') error.typingStarted = true;
+        throw error;
+      }
+    }
   }
 
   // A session on another node is read from its node (loadSessionForAction); every
@@ -8975,6 +8993,42 @@ async function sendToSession(body, targetHint, opts, deps = {}) {
     session, body.pane ? { expectedPane: body.pane } : targetHint, deps,
   ));
   return (deps.sendToResolvedTarget || sendToResolvedTarget)(session, target, text, opts, deps);
+}
+
+// The pane a reviewer bootstrap message is typed into, or null when the reviewer has
+// a transcript and takes the ordinary path. Where it has one is asked of the machine
+// it runs on: here, the local file; on another node, that node's own stat of it (the
+// mirror trails the node, and is missing whenever its hook posts fail, so its absence
+// proves nothing). The pane must be on that same node, from a list that node answered
+// just now: a last-known pane of a node that did not answer is not a pane to type into.
+async function reviewerBootstrapPane(sessionId, deps = {}) {
+  const daemon = daemonNodeName(deps);
+  const node = sessionNodeOf({ id: sessionId }, deps);
+  if (node === daemon) {
+    if (findSessionFile(sessionId)) return null;
+  } else {
+    try {
+      await (deps.nodeTranscript || nodeTranscript)(node, { id: sessionId, kind: 'claude', node }, deps).stat();
+      return null;
+    } catch (error) {
+      if (!error || error.code !== 'transcript-missing') throw error;
+    }
+  }
+  const listed = await listHostPaneResult(deps);
+  if (node !== daemon) {
+    const status = listed.nodes && listed.nodes[node];
+    if (!status || !status.ok || status.stale) {
+      throw new InjectionError(409, `node ${node} did not answer, so the reviewer's pane there cannot be verified; nothing was sent`,
+        { reason: 'remote-node' });
+    }
+  }
+  const hosted = sessionHostPane(listed.panes, sessionId);
+  if (!hosted || !hosted.alive) throw new InjectionError(409, 'reviewer has no transcript yet and no live host pane');
+  const paneNode = nodes.parsePaneRef(hosted.id, { env: paneRefEnv(deps) }).node;
+  if (paneNode !== node) {
+    throw new InjectionError(409, `pane ${hosted.id} is on ${paneNode} but reviewer ${sessionId} is on ${node}; nothing was sent`);
+  }
+  return hosted.id;
 }
 
 // The watcher's transport: the only way a verdict becomes keystrokes. The same
@@ -10297,11 +10351,25 @@ async function openSession(body, deps = {}) {
 
   if (typeof project !== 'string' || !project) throw new InjectionError(400, `no project for ${body.taskId ? `task ${body.taskId}` : `session ${body.sessionId || '?'}`}`);
   project = path.resolve(project.replace(/^~(?=\/|$)/, os.homedir()));
-  if (session && !body.fresh) await awaitWorktreeRecreation(project, deps);
-  try { if (!fs.statSync(project).isDirectory()) throw new Error(); }
-  catch {
-    if (!session || body.fresh || !await recreateRecycledWorktree(project, deps)) {
-      throw new InjectionError(400, 'project directory does not exist');
+  // A session whose location record names another node resumes there, in that
+  // machine's directory: this one cannot see it, and must not recreate a recycled
+  // worktree of the same path here for it (the project may have come from its
+  // mirror). The spawn on the node fails for itself if the directory is gone, as
+  // restartSession's does.
+  let resumesOnNode = null;
+  if (session && !body.fresh && typeof session.id === 'string' && /^[A-Za-z0-9_-]+$/.test(session.id)) {
+    try {
+      const recorded = accounts.sessionNode(session.id, { root: deps.root || keep.ROOT, env: deps.env || process.env });
+      if (recorded && recorded !== launchDaemonNode(deps)) resumesOnNode = recorded;
+    } catch {} // An unreadable record is refused, by name, where the node is settled below.
+  }
+  if (!resumesOnNode) {
+    if (session && !body.fresh) await awaitWorktreeRecreation(project, deps);
+    try { if (!fs.statSync(project).isDirectory()) throw new Error(); }
+    catch {
+      if (!session || body.fresh || !await recreateRecycledWorktree(project, deps)) {
+        throw new InjectionError(400, 'project directory does not exist');
+      }
     }
   }
   if (body.cwd != null) {
@@ -12113,7 +12181,19 @@ async function restorePlan(query, deps = {}) {
   try { scanned = await (deps.scanSessions || scanSessions)(); } catch {}
   const scannedById = new Map(scanned.map((session) => [session.id, session]));
   const live = await (deps.liveSessionPids || liveSessionPids)(deps);
-  const hostPanes = await listHostPanes(deps, true) || [];
+  // The whole result, not just its panes: a node that did not answer is missing from
+  // the list, and after a daemon restart there is no last-known list to stand in for
+  // it, so its sessions would read as gone and be resumed a second time beside the
+  // agents still running there. Such a node's sessions are skipped by name below, as
+  // they are when the node list itself could not be read.
+  const listed = await listHostPaneResult(deps, true);
+  const hostPanes = Array.isArray(listed.panes) ? listed.panes : [];
+  const unheardNodes = new Set([
+    ...(listed.missingNodes || []),
+    ...Object.entries(listed.nodes || {}).filter(([, status]) => status && (status.stale || !status.ok)).map(([name]) => name),
+  ]);
+  const nodesUnreadable = listed.configurationUnreadable === true;
+  const daemonNode = daemonNodeName(deps);
   const candidates = new Map(Object.entries(ledger.sessions || {}));
 
   const paneBySession = new Map();
@@ -12148,6 +12228,17 @@ async function restorePlan(query, deps = {}) {
     const pane = paneBySession.get(id);
     const state = live.has(id) || pane && pane.alive && pane.agentAlive !== false ? 'alive' : 'gone';
     const agent = entry.agent || session && (session.kind || session.agent) || 'claude';
+    // Where the session runs is its location record's answer (sessionNodeOf), never
+    // the pane's: a pane the list lost says nothing. A session on a node this list did
+    // not hear from cannot be called gone.
+    const node = sessionNodeOf({ id }, deps);
+    if (node !== daemonNode && (unheardNodes.has(node) || nodesUnreadable)) {
+      rows.push({ id, sessionId: id, agent, project: entry.project || session && session.project || '',
+        pane: pane && pane.id || null, state: 'unknown', mtime: entry.lastSeenAlive, lastSeenAlive: entry.lastSeenAlive,
+        source: entry.source, action: 'skip',
+        reason: nodesUnreadable ? 'the node list could not be read' : `node ${node} did not answer` });
+      continue;
+    }
     let codexChild = false;
     if (agent === 'codex') {
       if (fs.existsSync(path.join(deps.root || keep.ROOT, '.keep', 'codex-parents', `${id}.json`))) {

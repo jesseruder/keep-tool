@@ -13,7 +13,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const { createRemoteNodeFleet } = require('./fixtures/remote-node-fleet.js');
+const path = require('node:path');
+const { createRemoteNodeFleet, claudeTranscript } = require('./fixtures/remote-node-fleet.js');
 
 const STRICT_REFUSAL = /its transcript is not mirrored here/;
 
@@ -79,28 +80,126 @@ test('review: the compact tick skips a reviewer on the node by its location reco
   assert.equal(compacted, 0);
 });
 
-test('review: a bootstrap message to a reviewer on the node goes to its pane there, not to a refusal', async (t) => {
+test('review: a bootstrap message to a reviewer on the node is decided by the node, and typed only into its pane there', async (t) => {
   const fleet = createRemoteNodeFleet(t);
   const serve = require('./serve.js');
   await serve.closeHostClient();
   t.after(() => serve.closeHostClient());
-  // Anything read from a pane on aws1 stops the send right there: what this test is
-  // about is where it got to, and no keystroke is ever typed.
-  const hosts = fleet.fakeHosts((node, type) => {
-    if (node === 'aws1' && !['hello', 'list'].includes(type)) throw new Error(`reached aws1 with ${type}`);
-  });
-  const deps = { connectHost: hosts.connectHost, forceHostReconnect: true };
-  // No transcript yet, mirrored or local: the bootstrap path, through the node's pane.
-  await assert.rejects(
-    serve.sendToSession({ sessionId: fleet.unmirrored.id, text: 'bootstrap' }, { bootstrap: true }, {}, deps),
-    (error) => !STRICT_REFUSAL.test(error.message) && /reached aws1 with screen/.test(error.message));
-  assert.ok(hosts.requests.some((entry) => entry.node === 'aws1' && entry.type === 'screen'
+  // Anything past the node's own answers stops the send right there: what these cases
+  // are about is where it got to, and no keystroke is ever typed.
+  const stopAt = (extra = () => undefined) => (node, type, params) => {
+    const answered = extra(node, type, params);
+    if (answered !== undefined) return answered;
+    if (node === 'aws1' && !['hello', 'list'].includes(type) && !(type === 'transcript' && params.op === 'stat')) {
+      throw new Error(`reached aws1 with ${type}${params.op ? ` ${params.op}` : ''}`);
+    }
+    return undefined;
+  };
+  const send = async (session, answer) => {
+    await serve.closeHostClient();
+    const hosts = fleet.fakeHosts(answer);
+    const result = serve.sendToSession({ sessionId: session.id, text: 'bootstrap' }, { bootstrap: true }, {},
+      { connectHost: hosts.connectHost, forceHostReconnect: true });
+    return { hosts, result };
+  };
+
+  // The node has no transcript for it: the bootstrap path, through its pane on aws1.
+  const bare = await send(fleet.unmirrored, stopAt());
+  await assert.rejects(bare.result, (error) => !STRICT_REFUSAL.test(error.message) && /reached aws1 with screen/.test(error.message));
+  assert.ok(bare.hosts.requests.some((entry) => entry.node === 'aws1' && entry.type === 'screen'
     && entry.params.pane === fleet.unmirrored.hostPaneId));
-  // A mirrored reviewer has had a turn: the ordinary path, which reads it from its node.
-  await assert.rejects(
-    serve.sendToSession({ sessionId: fleet.mirrored.id, text: 'bootstrap' }, { bootstrap: true }, {}, deps),
-    (error) => !STRICT_REFUSAL.test(error.message));
-  assert.deepEqual(hosts.typedOn('aws1'), []);
+  assert.deepEqual(bare.hosts.typedOn('aws1'), []);
+
+  // Nothing mirrored, but the node has a transcript (its hook posts are failing): the
+  // node's stat decides, so it takes the ordinary path and reads the session there.
+  const behind = await send(fleet.unmirrored, stopAt((node, type, params) => (node === 'aws1' && type === 'transcript'
+    && params.op === 'stat' ? { path: '/node/path.jsonl', size: 10, mtimeMs: Date.now(), generation: 'g' } : undefined)));
+  await assert.rejects(behind.result, /reached aws1 with transcript tail/);
+  assert.equal(behind.hosts.requests.some((entry) => entry.type === 'screen'), false);
+
+  // A mirrored reviewer has had a turn: the ordinary path.
+  const spoken = await send(fleet.mirrored, stopAt());
+  await assert.rejects(spoken.result, /reached aws1 with transcript tail/);
+
+  // The only pane naming it is on this machine: a pane on the wrong node is refused.
+  const elsewhere = await send(fleet.unmirrored, stopAt((node, type) => {
+    if (node === 'main' && type === 'list') {
+      return { panes: [{ ...fleet.local.paneRow, id: 'fxstray', node: undefined,
+        meta: { agent: 'claude', sessionId: fleet.unmirrored.id } }] };
+    }
+    if (node === 'aws1' && type === 'list') return { panes: [] };
+    return undefined;
+  }));
+  await assert.rejects(elsewhere.result, (error) => error.status === 409
+    && /pane fxstray is on main but reviewer .* is on aws1; nothing was sent/.test(error.message));
+
+  // aws1 does not answer the list: its pane cannot be verified, whatever it last said.
+  const silent = await send(fleet.unmirrored, stopAt((node, type) => {
+    if (node === 'aws1' && type === 'list') throw new Error('aws1 is unreachable');
+    return undefined;
+  }));
+  await assert.rejects(silent.result, (error) => error.status === 409 && /node aws1 did not answer/.test(error.message));
+  assert.equal(silent.hosts.requests.some((entry) => entry.type === 'screen'), false);
+});
+
+test('review: a reviewer on the node with a mirror is live, and is not mistaken for a bootstrap', (t) => {
+  const fleet = createRemoteNodeFleet(t);
+  const review = require('./review.js');
+  const dir = path.join(fleet.root, '.keep', 'reviewer');
+  fs.mkdirSync(dir, { recursive: true });
+  // Registered hours ago, so the bootstrap window is long over for both.
+  for (const session of [fleet.mirrored, fleet.unmirrored]) {
+    fs.writeFileSync(path.join(dir, session.id), JSON.stringify({ at: Date.now() - 6 * 3600e3 }));
+    t.after(() => fs.rmSync(path.join(dir, session.id), { force: true }));
+  }
+  // The local scan has neither; the mirrored one is live from its mirror, and idle.
+  const reviewer = review.findReviewerSession([fleet.row(fleet.local)], {});
+  assert.equal(reviewer.id, fleet.mirrored.id);
+  assert.equal(reviewer.node, 'aws1');
+  assert.equal(reviewer.bootstrap, undefined);
+  assert.equal(reviewer.endedTurn, true);
+  assert.ok(Math.abs(reviewer.mtime - fs.statSync(fleet.mirrored.mirror).mtimeMs) < 1);
+  // A mirror whose last turn has not ended is a reviewer mid-turn: the tick waits.
+  fs.appendFileSync(fleet.mirrored.mirror, `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'next' } })}\n`);
+  assert.equal(review.findReviewerSession([], {}).endedTurn, false);
+});
+
+test('review: bootstrap attempts count only sends that went the bootstrap way, and a half-typed send is a tick', async (t) => {
+  createRemoteNodeFleet(t);
+  const review = require('./review.js');
+  const health = require('./health.js');
+  const original = health.record;
+  health.record = () => {};
+  t.after(() => { health.record = original; });
+  const reset = () => review.mutateMeta((meta) => {
+    meta.drift = {}; meta.fallback = {}; meta.sweepTick = {}; delete meta.lastTickAt; delete meta.bootstrapAttempts;
+  });
+  const reviewer = { id: 'reviewer-fixture', state: 'idle', endedTurn: true, mtime: Date.now(), bootstrap: true };
+  const tick = (send) => review.reviewTick({
+    sessions: () => [], findReviewer: () => reviewer,
+    reviewBudget: () => ({ code: 0, reason: 'within budget' }), lastVerdictAt: () => 0,
+    lintSnapshotAgeMs: () => 0, refreshLint: async () => ({ ok: true }), send,
+  }, { trigger: 'sweep', sweepDue: true });
+  const attempts = () => (review.loadMeta().bootstrapAttempts || {})[reviewer.id] || 0;
+
+  // The daemon took the ordinary path (the reviewer had a transcript on its node).
+  reset();
+  await tick(async () => ({ ok: true, delivery: 'confirmed' }));
+  assert.equal(attempts(), 0);
+  // It really went the bootstrap way.
+  reset();
+  await tick(async () => ({ bootstrap: true }));
+  assert.equal(attempts(), 1);
+  // Keys were typed and then the send failed: recorded as a tick, so the next one
+  // waits its gap instead of sending the same message again.
+  reset();
+  await assert.rejects(tick(async () => { throw Object.assign(new Error('screen read timed out'), { typingStarted: true }); }));
+  assert.ok(review.loadMeta().lastTickAt);
+  assert.equal(attempts(), 1);
+  // Nothing typed: no tick recorded.
+  reset();
+  await assert.rejects(tick(async () => { throw new Error('refused before typing'); }));
+  assert.equal(review.loadMeta().lastTickAt, undefined);
 });
 
 // ---------- session summaries ----------
@@ -187,6 +286,35 @@ test('restore: a plan over a fleet with node sessions answers for every session,
   assert.ok(byId[fleet.remoteCodex.id]);
 });
 
+test('restore: a node that did not answer has its sessions skipped by name, never resumed a second time', async (t) => {
+  const fleet = createRemoteNodeFleet(t);
+  const serve = require('./serve.js');
+  await serve.closeHostClient();
+  t.after(() => serve.closeHostClient());
+  // A daemon just restarted: aws1 does not answer, and there is no last-known list for
+  // it. Its agents may well be running; this machine cannot tell.
+  const hosts = fleet.fakeHosts((node, type) => {
+    if (node === 'aws1' && type === 'list') throw new Error('aws1 is unreachable');
+    if (type === 'list') return { panes: [] };
+    return undefined;
+  });
+  const now = Date.now();
+  const ledger = { updatedAt: now, sessions: Object.fromEntries(fleet.all.map((session, index) => [session.id,
+    { pid: 50000 + index, agent: session.agent, project: fleet.project, source: 'host', primary: true, lastSeenAlive: now - 60e3 }])) };
+  const plan = await serve.restorePlan({}, {
+    connectHost: hosts.connectHost, forceHostReconnect: true, ledger, now: () => now,
+    liveSessionPids: async () => new Map(), scanSessions: async () => [fleet.row(fleet.local)],
+    agentProcessRows: async () => [],
+  });
+  assert.equal(plan.ok, true);
+  const byId = Object.fromEntries(plan.sessions.map((row) => [row.id, row]));
+  assert.equal(byId[fleet.local.id].action, 'restore', 'the daemon node answered for its own session');
+  for (const session of fleet.remote) {
+    assert.equal(byId[session.id].action, 'skip', session.name);
+    assert.equal(byId[session.id].reason, 'node aws1 did not answer', session.name);
+  }
+});
+
 // ---------- acting paths: skipped with a reason that names the node ----------
 
 test('restart: an in-place restart of a node session is refused by name before anything is stopped', async (t) => {
@@ -246,33 +374,89 @@ test('limit resume and auto-close: the node\'s sessions and panes are filtered o
 
 // ---------- notes: an author on the node is asked of its node ----------
 
-test('notes: an expired note by a session on the node is sent to it, not handed to Owner', async (t) => {
+test('notes: an author on the node is asked of its node first, and an outage there has its own budget', async (t) => {
   const fleet = createRemoteNodeFleet(t);
   const notes = require('./notes.js');
-  const now = Date.now();
-  const add = (session) => notes.addNote({ project: fleet.project, scopes: ['deploy'], by: { sessionId: session.id, agent: 'claude' },
-    message: `held by ${session.name}`, until: new Date(now - 60e3).toISOString(), root: fleet.root, now: now - 3600e3 });
+  const start = Date.now();
+  const add = (session) => notes.addNote({ project: fleet.project, scopes: ['deploy'], by: { sessionId: session.id, agent: session.agent },
+    message: `held by ${session.name}`, until: new Date(start - 60e3).toISOString(), root: fleet.root, now: start - 3600e3 });
   const local = add(fleet.local);
   const mirrored = add(fleet.mirrored);
   const unreachable = add(fleet.unmirrored);
+  const codexNote = add(fleet.remoteCodex);
   const sent = [];
-  const result = await notes.sweep({
+  const sweep = (now) => notes.sweep({
     root: fleet.root, now,
-    sessions: () => [fleet.row(fleet.local)],
+    // The local scan still has the stale copy a move left behind, and it says exited:
+    // the node's answer wins.
+    sessions: () => [fleet.row(fleet.local), fleet.row(fleet.mirrored, { exited: true, state: 'exited' }, { bare: true })],
     remoteSession: async (id) => {
       if (id === fleet.unmirrored.id) throw new Error('aws1 did not answer');
+      if (id === fleet.remoteCodex.id) return { absent: 'its author is a codex session on aws1' };
       return id === fleet.mirrored.id ? fleet.row(fleet.mirrored) : null;
     },
     send: async (sessionId) => { sent.push(sessionId); },
   });
+  const result = await sweep(start);
   assert.deepEqual(sent.sort(), [fleet.local.id, fleet.mirrored.id].sort());
-  assert.deepEqual({ nagged: result.nagged, owner: result.owner, deferred: result.deferred }, { nagged: 2, owner: 0, deferred: 1 });
-  const byId = Object.fromEntries(notes.allNotes(fleet.root).map((note) => [note.id, note]));
-  assert.equal(byId[local.id].nagged.sessionId, fleet.local.id);
-  assert.equal(byId[mirrored.id].nagged.sessionId, fleet.mirrored.id);
-  // A node that could not be read is a reason to come back, not proof the author left.
-  assert.equal(byId[unreachable.id].nagged, null);
-  assert.match(byId[unreachable.id].lastNagAttempt.reason, /its node could not be read: aws1 did not answer/);
+  assert.deepEqual({ nagged: result.nagged, owner: result.owner, deferred: result.deferred }, { nagged: 2, owner: 1, deferred: 1 });
+  const byId = () => Object.fromEntries(notes.allNotes(fleet.root).map((note) => [note.id, note]));
+  assert.equal(byId()[local.id].nagged.sessionId, fleet.local.id);
+  assert.equal(byId()[mirrored.id].nagged.sessionId, fleet.mirrored.id);
+  assert.deepEqual({ owner: byId()[codexNote.id].nagged.owner, reason: byId()[codexNote.id].nagged.reason },
+    { owner: true, reason: 'its author is a codex session on aws1' });
+  // A node that could not be read is a reason to come back, not proof the author
+  // left, and it never spends the busy-session attempts: ten more sweeps later the
+  // note is still waiting for the node.
+  for (let i = 1; i <= notes.NAG_ATTEMPT_LIMIT + 4; i += 1) await sweep(start + i * 60e3);
+  assert.equal(byId()[unreachable.id].nagged, null);
+  assert.equal(byId()[unreachable.id].nagAttempts || 0, 0);
+  assert.match(byId()[unreachable.id].lastNagAttempt.reason, /its node could not be read: aws1 did not answer/);
+  // Past the node budget, it goes to Owner, saying why.
+  await sweep(start + notes.NODE_UNREADABLE_LIMIT_MS + 60e3);
+  assert.equal(byId()[unreachable.id].nagged.owner, true);
+  assert.match(byId()[unreachable.id].nagged.reason, /its node could not be read: aws1 did not answer, for \d+ minutes/);
+});
+
+test('notes: the daemon\'s author lookup reads a node author from its node and answers 404s and Codex authors as final', async (t) => {
+  const fleet = createRemoteNodeFleet(t);
+  const serve = require('./serve.js');
+  const { createNoteAuthorLookup } = require('./serve/schedulers.js');
+  await serve.closeHostClient();
+  t.after(() => serve.closeHostClient());
+  let tail = null;
+  let unreachable = false;
+  const hosts = fleet.fakeHosts((node, type, params) => {
+    if (node !== 'aws1') return undefined;
+    if (unreachable && type === 'transcript') throw new Error('aws1 is unreachable');
+    if (tail && type === 'transcript' && params.op === 'tail') return tail;
+    return undefined;
+  });
+  const deps = { connectHost: hosts.connectHost, forceHostReconnect: true };
+  // The same wiring startSchedulers hands the notes sweep.
+  const lookup = createNoteAuthorLookup({ remoteSession: serve.remoteSession, loadSessionForAction: serve.loadSessionForAction,
+    deps, root: fleet.root });
+
+  // Not on another node: the sweep reads its own scan.
+  assert.equal(await lookup(fleet.local.id), null);
+  // On aws1: the node's own read of it.
+  const author = await lookup(fleet.mirrored.id);
+  assert.equal(author.id, fleet.mirrored.id);
+  assert.equal(author.node, 'aws1');
+  assert.equal(author.endedTurn, true);
+  // A Codex author there: final, and said accurately (delivery refuses it by kind).
+  assert.match((await lookup(fleet.remoteCodex.id)).absent, /codex session on aws1, and a note cannot be delivered there yet/);
+  // The node says the session is outside the window (the daemon's 404): final.
+  const old = Buffer.from(claudeTranscript({ sessionId: fleet.mirrored.id, cwd: fleet.project, text: 'long ago',
+    at: Date.now() - 30 * 86400e3 }));
+  tail = { path: '/node/old.jsonl', size: old.length, mtimeMs: Date.now() - 30 * 86400e3, generation: 'old', from: 0,
+    bytes: old.toString('base64') };
+  assert.deepEqual(await lookup(fleet.mirrored.id), { absent: 'no live session on aws1' });
+  // The node cannot be read: thrown on, so the sweep waits for it.
+  tail = null;
+  unreachable = true;
+  await assert.rejects(lookup(fleet.mirrored.id), /aws1 is unreachable/);
+  assert.deepEqual(hosts.typedOn('aws1'), []);
 });
 
 // ---------- steps: a claim held by a session on the node ----------
@@ -285,6 +469,8 @@ test('steps: a claim held by a busy session on the node is not called stale', (t
   // The mirror moved five minutes ago (the node's own mtime), so the holder is busy.
   assert.equal(claimStaleness(claim(fleet.mirrored), now), null);
   assert.equal(claimStaleness(claim(fleet.local), now), null);
-  // Nothing readable here: idle, as a session with no transcript always was.
-  assert.equal(claimStaleness(claim(fleet.unmirrored), now).idle, true);
+  // Nothing readable here for a session on the node (nothing mirrored yet, or a Codex
+  // session, which is never mirrored): unknown, so no STALE flag.
+  assert.equal(claimStaleness(claim(fleet.unmirrored), now), null);
+  assert.equal(claimStaleness(claim(fleet.remoteCodex), now), null);
 });
