@@ -10,6 +10,11 @@
 //                                    session's transcript the daemon has.
 //   ~/.keep-node/hook-queue/<seq>.json  events that could not be delivered, replayed
 //                                    in order, with their own keys, before the next post.
+//   ~/.keep-node/hook-queue.state.json  { stalledSession, at }: the session whose
+//                                    entry the last replay could not deliver; it
+//                                    goes last in the next replay.
+//   ~/.keep-node/link.json           { bytesPerSec, at }: how fast transcript bytes
+//                                    have reached the daemon, which sizes the chunks.
 //   ~/.keep-node/hook.log            what the queue dropped, and why.
 //   ~/.keep-node/hook-context.json   { at, steps, sessions: { <sid>: { repairSession, at } } }:
 //                                    what GET /api/hook/context last said, asked
@@ -69,7 +74,26 @@ const QUEUED = new Set(['session-start', 'stop', 'notification', 'lifecycle', 'p
 const ENDS = new Set(['session-end', 'codex-end', 'pi-end']);
 const QUEUE_MAX = 200;
 const REPLAY_MS = 5000;
-const CHUNK_BYTES = 4 * 1024 * 1024;
+// A long delta goes in chunks sized to the link, so that each one lands inside the
+// time this event has left and every hook moves the cursor, however slow the link:
+// a fixed 4 MiB chunk over a slow link never finished inside a 3 s hook, so the
+// cursor never moved and the same bytes went up again with every hook. A chunk is
+// half of what the measured rate carries in the time left (at most 2 s of it), never
+// under CHUNK_MIN nor over CHUNK_MAX, the daemon's cap on one post's transcript bytes
+// (bin/transcript-mirror.js POST_CAP_BYTES). Before any rate is known: CHUNK_FIRST.
+const CHUNK_MIN = 64 * 1024;
+const CHUNK_MAX = 4 * 1024 * 1024;
+const CHUNK_FIRST = 256 * 1024;
+const CHUNK_BYTES = CHUNK_MAX;
+const CHUNK_WINDOW_MS = 2000;
+// A chunk is not started with less than this left: it could not land, and a post cut
+// off by the deadline costs the link its bytes for nothing.
+const CHUNK_FLOOR_MS = 300;
+// A post measures the link only when it carried this much: a small one is all latency.
+const RATE_SAMPLE_BYTES = 64 * 1024;
+const RATE_ALPHA = 0.5;
+// The bound on asking the daemon how much of a transcript its mirror holds.
+const MIRROR_ASK_MS = 1500;
 const NEED_FROM_RETRIES = 3;
 const SESSION_RE = /^[A-Za-z0-9_-]{1,128}$/;
 // The daemon's caps (bin/hook-route.js): the whole stdin object, and the fields it
@@ -99,6 +123,8 @@ function contextFile(env) { return path.join(stateDir(env), 'hook-context.json')
 function cursorFile(env, sid) { return path.join(stateDir(env), 'mirror', `${sid}.json`); }
 function queueDir(env) { return path.join(stateDir(env), 'hook-queue'); }
 function logFile(env) { return path.join(stateDir(env), 'hook.log'); }
+function linkFile(env) { return path.join(stateDir(env), 'link.json'); }
+function replayStateFile(env) { return path.join(stateDir(env), 'hook-queue.state.json'); }
 const LOG_MAX_BYTES = 1024 * 1024;
 
 // One line to ~/.keep-node/hook.log, the file cut short when it grows past 1 MiB.
@@ -218,6 +244,30 @@ function fitInput(input) {
   return out;
 }
 
+// The link rate this node last measured, in bytes a second, or null when none is known.
+function readLinkRate(env) {
+  const value = readJson(linkFile(env));
+  return value && Number.isFinite(value.bytesPerSec) && value.bytesPerSec > 0 ? value.bytesPerSec : null;
+}
+
+// One post's transcript bytes and how long its request took, folded into the stored
+// rate as a moving average: one slow or fast post moves it, and does not replace it.
+function recordLinkRate(env, bytes, elapsedMs, at) {
+  if (!(bytes >= RATE_SAMPLE_BYTES)) return;
+  const sample = bytes / (Math.max(1, elapsedMs) / 1000);
+  const stored = readLinkRate(env);
+  const bytesPerSec = stored ? RATE_ALPHA * sample + (1 - RATE_ALPHA) * stored : sample;
+  try { writeAtomic(linkFile(env), { bytesPerSec: Math.round(bytesPerSec), at }); } catch {}
+}
+
+// How many transcript bytes one post may carry with `leftMs` left of the event's budget.
+function chunkSize(env, leftMs) {
+  const rate = readLinkRate(env);
+  if (!rate) return CHUNK_FIRST;
+  const size = Math.round(rate * (Math.min(Math.max(0, leftMs), CHUNK_WINDOW_MS) / 1000) * 0.5);
+  return Math.min(CHUNK_MAX, Math.max(CHUNK_MIN, size));
+}
+
 function newKey() { return crypto.randomBytes(16).toString('hex'); }
 
 function parsed(response) {
@@ -228,7 +278,8 @@ function parsed(response) {
 // the transcript's { generation, size, mtimeMs } when the event fired (null: it had
 // none, and none is sent). Resolves { ok: true, value } with the daemon's answer, or
 // { ok: false, retry, why } where `retry` says whether a later resend could succeed;
-// `stale` says the transcript was replaced since the event fired.
+// `stale` says the transcript was replaced since the event fired, and `link` that the
+// daemon did not answer at all (the request failed, or timed out).
 async function deliver({ event, input, identity, key, transcriptPath, snapshot, deadline, where, token, env, deps }) {
   const request = deps.request || require('./remote-cli.js').nodeApiRequest;
   const now = deps.now || Date.now;
@@ -237,6 +288,13 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
     const left = deadline - now();
     if (left <= 0) throw new Error('out of time');
     return request(where.url, '/api/hook', { payload, token, timeoutMs: left });
+  };
+  // A post that carried `raw` transcript bytes and landed measures the link.
+  const timed = async (payload, raw) => {
+    const began = now();
+    const response = await send(payload);
+    if (response.status === 200) recordLinkRate(env, raw, now() - began, now());
+    return response;
   };
   let resends = 0;
   let from = null;
@@ -249,7 +307,21 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
         return { ok: false, retry: false, stale: true, why: 'the transcript was replaced after the event fired' };
       }
       const cursor = readCursor(env, sid);
-      if (from === null) from = cursor && cursor.generation === generation && cursor.sent <= stat.size ? cursor.sent : 0;
+      if (from === null) {
+        const usable = cursor && cursor.generation === generation && cursor.sent <= stat.size;
+        from = usable ? cursor.sent : 0;
+        // No cursor to go by (a fresh node home, a lost state directory) and more to
+        // send than a first chunk: the daemon's mirror may already hold most of it,
+        // so it is asked before the whole transcript goes up again.
+        if (!usable && Math.min(stat.size, snapshot.size) > CHUNK_FIRST) {
+          const held = await mirrorOffset({ request, where, token, sid, generation, size: stat.size,
+            timeoutMs: Math.min(MIRROR_ASK_MS, deadline - now()) });
+          if (held !== null) {
+            from = held;
+            try { writeAtomic(cursorFile(env, sid), { generation, sent: held }); } catch {}
+          }
+        }
+      }
       if (from > stat.size) from = 0;
       // `size` is the source's size now, so a mirror that is ahead is never taken
       // for a truncated source; the bytes stop where the event saw the file end.
@@ -266,11 +338,16 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
     const advance = (sent) => { try { writeAtomic(cursorFile(env, sid), { generation: plan.generation, sent }); } catch {} };
     let response;
     try {
-      // Every chunk of a long delta but the last goes on its own.
-      while (plan && plan.end - from > CHUNK_BYTES) {
-        const chunk = await send({ event: 'transcript', identity, transcript: piece(from, from + CHUNK_BYTES) });
+      // Every chunk of a long delta but the last goes on its own, each sized to what
+      // the link carries in the time left. Each one that lands moves the cursor, so a
+      // hook that runs out of time leaves the next hook to go on from there.
+      while (plan) {
+        const size = chunkSize(env, deadline - now());
+        if (plan.end - from <= size) break;
+        if (deadline - now() < CHUNK_FLOOR_MS) return { ok: false, retry: true, why: 'out of time' };
+        const chunk = await timed({ event: 'transcript', identity, transcript: piece(from, from + size) }, size);
         const value = parsed(chunk) || {};
-        if (chunk.status === 200) { from += CHUNK_BYTES; advance(from); continue; }
+        if (chunk.status === 200) { from += size; advance(from); continue; }
         if (chunk.status === 409 && Number.isSafeInteger(value.needFrom) && resends < NEED_FROM_RETRIES) {
           resends += 1;
           from = value.needFrom;
@@ -278,9 +355,12 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
         }
         return { ok: false, retry: chunk.status >= 500, why: value.error || `HTTP ${chunk.status}` };
       }
-      response = await send({ event, input, identity, transcript: plan ? piece(from, plan.end) : null, idempotencyKey: key });
+      response = await timed({ event, input, identity, transcript: plan ? piece(from, plan.end) : null, idempotencyKey: key },
+        plan ? plan.end - from : 0);
     } catch (error) {
-      return { ok: false, retry: true, why: error.message };
+      // The request itself failed: the daemon did not answer at all (refused, reset,
+      // timed out), which `link` tells apart from a daemon that answered a failure.
+      return { ok: false, retry: true, link: true, why: error.message };
     }
     const value = parsed(response) || {};
     if (response.status === 409 && Number.isSafeInteger(value.needFrom) && resends < NEED_FROM_RETRIES) {
@@ -295,6 +375,20 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
     return { ok: false, retry: response.status >= 500, why: value.error || `HTTP ${response.status}`,
       ...(typeof value.code === 'string' ? { code: value.code } : {}) };
   }
+}
+
+// How much of this transcript generation the daemon's mirror holds, when it holds a
+// prefix of it: its size, or null for anything else (another generation, no mirror,
+// a daemon without the route, no answer in time).
+async function mirrorOffset({ request, where, token, sid, generation, size, timeoutMs }) {
+  if (!(timeoutMs > 0)) return null;
+  try {
+    const query = new URLSearchParams({ session: sid });
+    const response = await request(where.url, `/api/hook/mirror?${query}`, { method: 'GET', token, timeoutMs });
+    const value = response.status === 200 ? parsed(response) : null;
+    if (value && value.generation === generation && Number.isSafeInteger(value.size) && value.size >= 0 && value.size <= size) return value.size;
+  } catch {}
+  return null;
 }
 
 function queueFiles(env) {
@@ -335,26 +429,55 @@ function enqueue(env, entry) {
   for (const name of all.slice(0, Math.max(0, all.length - QUEUE_MAX))) { try { fs.unlinkSync(path.join(dir, name)); } catch {} }
 }
 
-// Replays the queue in order until it is empty, the daemon stops answering, or the
-// time is up. An entry the daemon answered, or refused for good, is removed.
+// Replays the queue until it is empty, the daemon stops answering, or the time is
+// up. An entry the daemon answered, or refused for good, is removed.
+//
+// Each session's entries go in their order: an event never overtakes its own
+// session's earlier ones. Sessions do not wait on each other. One whose entry could
+// not be delivered (a transcript too large for the link, a daemon that refuses it for
+// now) is recorded as stalled and goes last in the next replay, so it cannot spend
+// every other session's replay time. A failure the daemon answered skips only that
+// session's remaining entries; one it did not answer, or the time running out, stops
+// the replay, since the next entry would meet the same link.
 async function replayQueue({ env, where, token, deadline, deps }) {
   const now = deps.now || Date.now;
-  let sent = 0;
+  const state = readJson(replayStateFile(env));
+  let stalled = state && typeof state.stalledSession === 'string' ? state.stalledSession : null;
+  const entries = [];
   for (const name of queueFiles(env)) {
-    if (now() >= deadline) break;
     const file = path.join(queueDir(env), name);
     const entry = readJson(file);
     if (!entry || !EVENTS.includes(entry.event) || !entry.body || !entry.body.identity) { try { fs.unlinkSync(file); } catch {} continue; }
+    entries.push({ file, entry, session: entry.body.identity.sessionId });
+  }
+  const ordered = [...entries.filter((item) => item.session !== stalled), ...entries.filter((item) => item.session === stalled)];
+  const failed = new Set();
+  let sent = 0;
+  for (const { file, entry, session } of ordered) {
+    if (now() >= deadline) break;
+    if (failed.has(session)) continue;
+    // Another hook's replay may have delivered it since the queue was read.
+    if (!fs.existsSync(file)) continue;
     const result = await deliver({
       event: entry.event, input: entry.body.input, identity: entry.body.identity, key: entry.body.idempotencyKey,
       transcriptPath: entry.body.transcriptPath, snapshot: entry.body.transcript || null, deadline, where, token, env, deps,
     });
-    if (!result.ok && result.retry) break;
+    if (!result.ok && result.retry) {
+      failed.add(session);
+      stalled = session;
+      try { writeAtomic(replayStateFile(env), { stalledSession: session, at: now() }); } catch {}
+      if (result.link || result.why === 'out of time') break;
+      continue;
+    }
     if (result.stale) {
       logLine(env, `dropped queued ${entry.event} for session ${entry.body.identity.sessionId} (seq ${entry.seq}): ${result.why}`);
     }
     try { fs.unlinkSync(file); } catch {}
     sent += 1;
+  }
+  // The stalled session's entries have all gone: it no longer goes last.
+  if (stalled && !failed.has(stalled) && !pendingFor(env, stalled)) {
+    try { fs.unlinkSync(replayStateFile(env)); } catch {}
   }
   return sent;
 }
@@ -670,6 +793,7 @@ function report(env = process.env) {
 
 module.exports = {
   runHook, runBashHook, runCodexToolHook, runPiHook, deliver, logLine, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
-  hookContext, contextFile, CONTEXT_TTL_MS,
-  EVENTS, CLAUDE_EVENTS, CODEX_EVENTS, PI_EVENTS, TRANSCRIPTLESS, QUEUED, ENDS, BUDGET_MS, QUEUE_MAX, CHUNK_BYTES, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
+  hookContext, contextFile, CONTEXT_TTL_MS, linkFile, replayStateFile, chunkSize,
+  EVENTS, CLAUDE_EVENTS, CODEX_EVENTS, PI_EVENTS, TRANSCRIPTLESS, QUEUED, ENDS, BUDGET_MS, QUEUE_MAX,
+  CHUNK_BYTES, CHUNK_MIN, CHUNK_MAX, CHUNK_FIRST, CHUNK_FLOOR_MS, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
 };

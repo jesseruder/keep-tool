@@ -657,6 +657,48 @@ test('the hook context is on the node API only, for nodes', async () => {
   assert.deepEqual(await route.handle({ req, res: {}, url, principal: AWS1 }), { status: 200, value: { steps: [], repairSession: false } });
 });
 
+test('the hook mirror query is on the node API only, for nodes', async () => {
+  const asked = [];
+  const fake = { mirror: async (...args) => { asked.push(args); return { status: 200, body: { generation: null, size: 0 } }; } };
+  const json = (res, status, value) => ({ status, value });
+  const req = { method: 'GET' };
+  const url = new URL('http://x/api/hook/mirror?session=sess-aws1');
+  assert.equal(matchRoute(routes({ json, hookService: fake }), { req, url }), null);
+  const route = matchRoute(routes({ json, nodeApiEnabled: () => true, hookService: fake }), { req, url });
+  assert.equal(route.path, '/api/hook/mirror');
+  assert.equal(routeDenial(route, AWS1), null);
+  assert.deepEqual(routeDenial(route, { class: 'admin' }), { status: 403, error: 'forbidden for admin' });
+  assert.deepEqual(await route.handle({ req, res: {}, url, principal: AWS1 }), { status: 200, value: { generation: null, size: 0 } });
+  assert.deepEqual(asked, [[AWS1, 'sess-aws1']]);
+});
+
+test('the hook mirror query answers how much of the session\'s transcript the daemon holds, only to the session\'s node', async (t) => {
+  const { hooks, calls, root } = services(t);
+  assert.deepEqual(await hooks.mirror(AWS1, 'sess-aws1'), { status: 200, body: { generation: null, size: 0 } }, 'no mirror yet');
+  const text = '{"n":1}\n{"n":2}\n';
+  const appended = mirror.append({ root, node: 'aws1', sessionId: 'sess-aws1', generation: '10:20:30', fromOffset: 0, bytes: Buffer.from(text),
+    size: Buffer.byteLength(text) + 100, mtimeMs: 1_700_000_000_000, sourcePath: '/home/node/.claude/projects/p/sess-aws1.jsonl' });
+  assert.equal(appended.ok, true, JSON.stringify(appended));
+  assert.deepEqual(await hooks.mirror(AWS1, 'sess-aws1'),
+    { status: 200, body: { generation: '10:20:30', size: Buffer.byteLength(text), mtimeMs: 1_700_000_000_000 } });
+  for (const [who, session, status, message, code] of [
+    [AWS1, 'sess-main', 403, /session sess-main is not on node aws1/, 'SESSION_NOT_ON_NODE'],
+    [AWS1, 'nobody', 403, /is not on node aws1/, 'SESSION_NOT_ON_NODE'],
+    [AWS1, '../x', 400, /invalid session id/],
+    [AWS1, null, 400, /invalid session id/],
+    [{ class: 'admin' }, 'sess-aws1', 403, /for sessions on other nodes/],
+    [{ class: 'node', node: 'main' }, 'sess-aws1', 403, /unauthorized/],
+    [{ class: 'node', node: 'other' }, 'sess-aws1', 403, /session sess-aws1 is not on node other/, 'SESSION_NOT_ON_NODE'],
+  ]) {
+    const answer = await hooks.mirror(who, session);
+    assert.equal(answer.status, status, JSON.stringify(answer));
+    assert.match(answer.body.error, message);
+    assert.equal(answer.body.code, code);
+    assert.equal(answer.body.size, undefined, 'nothing of the mirror is said');
+  }
+  assert.equal(calls.length, 0, 'nothing ran');
+});
+
 test('the hook context publishes the step fingerprints and whether the daemon launched the session to repair it', async (t) => {
   const root = tempDir(t);
   stepsRegistry(root);

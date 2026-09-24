@@ -759,7 +759,32 @@ function createHookService(options = {}) {
     }
   }
 
-  return { handle, context };
+  // GET /api/hook/mirror?session=<id>: how much of the session's transcript the
+  // daemon's mirror holds, for a node that has no cursor for it (a fresh home, a
+  // cursor lost with the node's state). Asked before a large first upload, so the
+  // node resends only what is missing instead of the whole transcript. The same
+  // caller checks as the context: a session the location record places on the
+  // calling node, never the daemon's own, with no adoption and no pane read.
+  async function mirrorStat(principal, sessionId) {
+    try {
+      const caller = shared.callerNode(principal);
+      if (caller === shared.daemonNode()) refuse(403, 'the hook route is for sessions on other nodes');
+      const session = matching(sessionId, SESSION_RE, 'session id');
+      let where = null;
+      try { where = shared.location(session); } catch { where = null; }
+      if (!where || where.node !== caller) refuse(403, `session ${session} is not on node ${caller}`, SESSION_NOT_ON_NODE);
+      let stat = null;
+      try { stat = mirror.stat(root, caller, session); } catch { stat = null; }
+      // A mirror file without a sidecar names no generation: nothing a node can resume from.
+      if (!stat || typeof stat.generation !== 'string') return { status: 200, body: { generation: null, size: 0 } };
+      return { status: 200, body: { generation: stat.generation, size: stat.size, mtimeMs: stat.mtimeMs } };
+    } catch (error) {
+      if (error instanceof RegistryError) return { status: error.status, body: { error: error.message, ...(error.code ? { code: error.code } : {}) } };
+      return { status: 500, body: { error: error.message } };
+    }
+  }
+
+  return { handle, context, mirror: mirrorStat };
 }
 
 module.exports = {

@@ -36,6 +36,7 @@ async function stubDaemon(t, answer) {
       posts.push({ url: req.url, token: req.headers['x-keep-node-token'], body });
       const result = answer(body, posts.length, req.url);
       if (result === 'hang') { hung.push(res); return; }
+      if (result === 'reset') { req.socket.destroy(); return; }
       res.writeHead(result.status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(result.body));
     });
@@ -260,11 +261,13 @@ test('a refusal is not queued, and a queue past its cap drops the oldest', async
 test('a mirror that is elsewhere is resent from where the daemon says, and a long delta goes in chunks', async (t) => {
   const f = fixture(t);
   const client = require('./hook-client.js');
-  const big = `${'x'.repeat(client.CHUNK_BYTES + 100)}\n`;
+  const big = `${'x'.repeat(client.CHUNK_FIRST * 2 + 100)}\n`;
   fs.writeFileSync(f.transcript, big);
   let told = false;
   let mirrored = 0;
-  const daemon = await stubDaemon(t, (body) => {
+  const daemon = await stubDaemon(t, (body, n, url) => {
+    // The mirror query finds nothing to start from.
+    if (url.startsWith('/api/hook/mirror')) return { status: 200, body: { generation: null, size: 0 } };
     const tr = body.transcript;
     // The daemon's mirror is at 10 bytes the first time it is asked.
     if (!told && tr) { told = true; mirrored = 10; return { status: 409, body: { error: 'resend', needFrom: 10 } }; }
@@ -277,8 +280,21 @@ test('a mirror that is elsewhere is resent from where the daemon says, and a lon
   const result = await f.hook('stop', daemon.url, { hook_event_name: 'Stop' });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(mirrored, Buffer.byteLength(big));
-  const events = daemon.posts.map((post) => `${post.body.event}@${post.body.transcript.fromOffset}`);
-  assert.deepEqual(events, ['transcript@0', `transcript@10`, `stop@${10 + client.CHUNK_BYTES}`]);
+  assert.equal(daemon.posts[0].url, '/api/hook/mirror?session=sess-aws1', 'a node with no cursor asks before a large upload');
+  const posts = daemon.posts.filter((post) => post.url === '/api/hook').map((post) => post.body);
+  const events = posts.map((post) => `${post.event}@${post.transcript.fromOffset}`);
+  assert.deepEqual(events.slice(0, 2), ['transcript@0', 'transcript@10']);
+  assert.equal(posts.at(-1).event, 'stop');
+  // Before a rate is measured a chunk is CHUNK_FIRST; after, what the link carries,
+  // never past CHUNK_MAX, each starting where the one before ended.
+  const sizes = posts.map((post) => Buffer.from(post.transcript.bytes, 'base64').length);
+  assert.deepEqual(sizes.slice(0, 2), [client.CHUNK_FIRST, client.CHUNK_FIRST]);
+  for (let i = 1; i < posts.length; i += 1) {
+    assert.ok(sizes[i] <= client.CHUNK_MAX);
+    if (i > 1) assert.equal(posts[i].transcript.fromOffset, posts[i - 1].transcript.fromOffset + sizes[i - 1]);
+  }
+  const link = JSON.parse(fs.readFileSync(path.join(f.home, '.keep-node', 'link.json'), 'utf8'));
+  assert.ok(link.bytesPerSec > 0 && Number.isFinite(link.at), 'the chunks measured the link');
   const cursor = JSON.parse(fs.readFileSync(path.join(f.home, '.keep-node', 'mirror', 'sess-aws1.json'), 'utf8'));
   assert.equal(cursor.sent, Buffer.byteLength(big));
   // A replaced file (another inode) starts again from 0.
@@ -287,6 +303,124 @@ test('a mirror that is elsewhere is resent from where the daemon says, and a lon
   mirrored = 0;
   await f.hook('notification', daemon.url);
   assert.equal(daemon.posts.at(-1).body.transcript.fromOffset, 0);
+});
+
+test('with a measured link rate, each chunk is what the link carries in the time left, and the cursor moves with each one', async (t) => {
+  const f = fixture(t);
+  const client = require('./hook-client.js');
+  const env = { HOME: f.home };
+  const total = 1152 * 1024;
+  fs.writeFileSync(f.transcript, 'x'.repeat(total));
+  fs.mkdirSync(path.join(f.home, '.keep-node'), { recursive: true });
+  fs.writeFileSync(path.join(f.home, '.keep-node', 'link.json'), JSON.stringify({ bytesPerSec: 100 * 1024, at: 1 }));
+  const cursor = () => {
+    try { return JSON.parse(fs.readFileSync(client.cursorFile(env, 'sess-aws1'), 'utf8')).sent; } catch { return null; }
+  };
+  // Every post takes one second on this link.
+  let clock = 0;
+  const posts = [];
+  const request = async (url, pathname, { method, payload }) => {
+    if (method === 'GET') { posts.push({ ask: pathname }); return { status: 404, data: '{"error":"not found"}' }; }
+    const raw = payload.transcript ? Buffer.from(payload.transcript.bytes, 'base64').length : 0;
+    posts.push({ event: payload.event, from: payload.transcript.fromOffset, raw, cursor: cursor() });
+    clock += 1000;
+    return payload.event === 'transcript' ? { status: 200, data: '{"ok":true}' } : { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: '', stderr: '' }) };
+  };
+  const common = { event: 'stop', input: { session_id: 'sess-aws1' }, identity: { agent: 'claude', sessionId: 'sess-aws1' }, key: 'k'.repeat(32),
+    transcriptPath: f.transcript, snapshot: client.snapshotOf(f.transcript), where: { url: 'http://127.0.0.1:1' }, token: 't', env,
+    deps: { request, now: () => clock } };
+  const first = await client.deliver({ ...common, deadline: 10_200 });
+  assert.deepEqual(first, { ok: false, retry: true, why: 'out of time' }, 'no chunk started with 200 ms left');
+  assert.deepEqual(posts[0], { ask: '/api/hook/mirror?session=sess-aws1' }, 'no cursor: the daemon is asked first');
+  const chunks = posts.slice(1);
+  // 100 KiB/s over the 2 s window, halved; with 1.2 s left, 61440 bytes, raised to CHUNK_MIN.
+  assert.deepEqual(chunks.map((post) => post.raw), [...Array(9).fill(100 * 1024), client.CHUNK_MIN]);
+  let at = 0;
+  for (const [i, post] of chunks.entries()) {
+    assert.equal(post.event, 'transcript');
+    assert.equal(post.from, at);
+    if (i > 0) assert.equal(post.cursor, at, 'the cursor stood at the chunk before');
+    at += post.raw;
+  }
+  assert.equal(cursor(), at, 'the cursor is at the last chunk that landed');
+  // The last chunk measured 64 KiB/s: the average moves halfway to it.
+  assert.equal(JSON.parse(fs.readFileSync(client.linkFile(env), 'utf8')).bytesPerSec, (100 * 1024 + client.CHUNK_MIN) / 2);
+
+  // The next event goes on from the cursor at the new rate, and the event itself
+  // carries the rest once it fits one chunk.
+  posts.length = 0;
+  clock = 20_000;
+  const next = await client.deliver({ ...common, deadline: 30_000 });
+  assert.equal(next.ok, true);
+  const rate = (100 * 1024 + client.CHUNK_MIN) / 2;
+  assert.deepEqual(posts.map((post) => [post.event, post.from, post.raw]),
+    [['transcript', at, rate], ['transcript', at + rate, rate], ['stop', at + 2 * rate, total - at - 2 * rate]]);
+  assert.equal(cursor(), total);
+  assert.equal(client.chunkSize({ HOME: f.home }, 50), client.CHUNK_MIN);
+  assert.equal(client.chunkSize({ HOME: path.join(f.home, 'nowhere') }, 5000), client.CHUNK_FIRST, 'no rate known yet');
+});
+
+test('a hook that runs out of time leaves the cursor at the last chunk that landed, and queues its event', async (t) => {
+  const f = fixture(t);
+  const client = require('./hook-client.js');
+  fs.writeFileSync(f.transcript, 'x'.repeat(512 * 1024));
+  fs.mkdirSync(path.join(f.home, '.keep-node'), { recursive: true });
+  fs.writeFileSync(path.join(f.home, '.keep-node', 'link.json'), JSON.stringify({ bytesPerSec: 128 * 1024, at: 1 }));
+  // The first chunk lands; nothing after it is answered.
+  let landed = 0;
+  const daemon = await stubDaemon(t, (body, n, url) => {
+    if (url.startsWith('/api/hook/mirror')) return { status: 404, body: { error: 'not found' } };
+    if (body.event === 'transcript' && !landed) { landed += 1; return { status: 200, body: { ok: true } }; }
+    return 'hang';
+  });
+  const result = await f.hook('notification', daemon.url, { notification_type: 'idle_prompt' });
+  assert.deepEqual(result, { status: 0, stdout: '', stderr: '' });
+  const posts = daemon.posts.filter((post) => post.url === '/api/hook').map((post) => post.body);
+  assert.equal(posts[0].event, 'transcript');
+  assert.equal(Buffer.from(posts[0].transcript.bytes, 'base64').length, 128 * 1024, 'the chunk the stored rate gives');
+  assert.equal(posts[1].transcript.fromOffset, 128 * 1024, 'the next post goes on from there');
+  const cursor = JSON.parse(fs.readFileSync(client.cursorFile({ HOME: f.home }, 'sess-aws1'), 'utf8'));
+  assert.equal(cursor.sent, 128 * 1024);
+  assert.deepEqual(f.queue().map((entry) => entry.event), ['notification']);
+});
+
+test('a node with no cursor starts from what the daemon\'s mirror already holds of the same transcript', async (t) => {
+  const f = fixture(t);
+  const client = require('./hook-client.js');
+  const total = 400 * 1024;
+  const held = 300 * 1024;
+  fs.writeFileSync(f.transcript, 'y'.repeat(total));
+  const stat = fs.statSync(f.transcript);
+  let generation = `${stat.dev}:${stat.ino}:${Math.round(stat.birthtimeMs)}`;
+  const daemon = await stubDaemon(t, (body, n, url) => {
+    if (url.startsWith('/api/hook/mirror')) return { status: 200, body: { generation, size: held, mtimeMs: 1 } };
+    return body.event === 'transcript' ? { status: 200, body: { ok: true } } : ran('');
+  });
+  const result = await f.hook('notification', daemon.url, { notification_type: 'idle_prompt' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(daemon.posts.map((post) => post.url), ['/api/hook/mirror?session=sess-aws1', '/api/hook']);
+  const post = daemon.posts[1].body;
+  assert.equal(post.event, 'notification');
+  assert.equal(post.transcript.fromOffset, held, 'the prefix the daemon holds is never sent again');
+  assert.equal(Buffer.from(post.transcript.bytes, 'base64').length, total - held);
+  const cursorFile = client.cursorFile({ HOME: f.home }, 'sess-aws1');
+  assert.equal(JSON.parse(fs.readFileSync(cursorFile, 'utf8')).sent, total);
+
+  // A mirror of another generation (a transcript since replaced) is not a prefix of this one.
+  fs.rmSync(cursorFile);
+  generation = '1:2:3';
+  const before = daemon.posts.length;
+  await f.hook('notification', daemon.url, { notification_type: 'idle_prompt' });
+  const later = daemon.posts.slice(before);
+  assert.equal(later[0].url, '/api/hook/mirror?session=sess-aws1');
+  assert.equal(later.find((item) => item.url === '/api/hook').body.transcript.fromOffset, 0);
+  assert.equal(JSON.parse(fs.readFileSync(cursorFile, 'utf8')).sent, total);
+
+  // A cursor for this transcript: nothing is asked.
+  const asked = daemon.posts.filter((item) => item.url.startsWith('/api/hook/mirror')).length;
+  fs.appendFileSync(f.transcript, 'z'.repeat(300 * 1024));
+  await f.hook('notification', daemon.url, { notification_type: 'idle_prompt' });
+  assert.equal(daemon.posts.filter((item) => item.url.startsWith('/api/hook/mirror')).length, asked);
 });
 
 test('without KEEP_DAEMON_URL the hooks are the pane-only hooks they were', async (t) => {
@@ -371,23 +505,30 @@ test('an event never overtakes its session\'s events the replay could not finish
   await f.hook('stop', url, { hook_event_name: 'Stop' });
   await f.hook('notification', url, { session_id: 'sess-other', notification_type: 'idle_prompt' });
   assert.deepEqual(f.queue().map((entry) => entry.event), ['stop', 'notification']);
+  // The notification's own replay met the closed daemon on the stop.
+  const stateFile = path.join(f.home, '.keep-node', 'hook-queue.state.json');
+  assert.equal(JSON.parse(fs.readFileSync(stateFile, 'utf8')).stalledSession, 'sess-aws1');
 
-  // The daemon takes the replayed stop and never answers it: the replay's time runs
-  // out with the stop still queued, so the new event waits behind it.
+  // The daemon takes the replayed notification (sess-aws1 goes last) and never
+  // answers it: the replay's time runs out with the stop still queued, so the new
+  // event waits behind it.
   const slow = await stubDaemon(t, () => 'hang');
   const result = await f.hook('lifecycle', slow.url, { hook_event_name: 'PostToolUse' });
   assert.deepEqual(result, { status: 0, stdout: '', stderr: '' }, 'the safe default');
-  assert.deepEqual(slow.posts.map((post) => post.body.event), ['stop'], 'nothing posted ahead of it');
+  assert.deepEqual(slow.posts.map((post) => post.body.event), ['notification'], 'nothing of sess-aws1 posted');
   assert.deepEqual(f.queue().map((entry) => `${entry.event}:${entry.body.identity.sessionId}`),
     ['stop:sess-aws1', 'notification:sess-other', 'lifecycle:sess-aws1'], 'queued behind it, in order');
+  assert.equal(JSON.parse(fs.readFileSync(stateFile, 'utf8')).stalledSession, 'sess-other');
 
-  // A daemon that answers: the queue drains in order, then the new event goes.
+  // A daemon that answers: the queue drains, each session in its own order and the
+  // stalled one last, then the new event goes.
   const daemon = await stubDaemon(t, () => ran(''));
   const next = await f.hook('lifecycle', daemon.url, { hook_event_name: 'PostToolUse' });
   assert.equal(next.status, 0, next.stderr);
   assert.deepEqual(daemon.posts.map((post) => `${post.body.event}:${post.body.identity.sessionId}`),
-    ['stop:sess-aws1', 'notification:sess-other', 'lifecycle:sess-aws1', 'lifecycle:sess-aws1'], 'drained in order, then the new one');
+    ['stop:sess-aws1', 'lifecycle:sess-aws1', 'notification:sess-other', 'lifecycle:sess-aws1'], 'drained, then the new one');
   assert.deepEqual(f.queue(), []);
+  assert.equal(fs.existsSync(stateFile), false, 'nothing is stalled any more');
 });
 
 test('another session\'s queued events do not hold this session\'s event back', async (t) => {
@@ -401,6 +542,55 @@ test('another session\'s queued events do not hold this session\'s event back', 
   assert.equal(result.stdout, 'context\n');
   assert.deepEqual(daemon.posts.map((post) => post.body.event), ['notification', 'session-start']);
   assert.deepEqual(f.queue().map((entry) => entry.body.identity.sessionId), ['sess-other']);
+});
+
+test('a session the daemon keeps refusing goes last, and the other sessions\' entries deliver in the same replay', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.transcript, '{"n":1}\n');
+  const url = await closedUrl();
+  await f.hook('notification', url, { session_id: 'sess-stuck', notification_type: 'idle_prompt' });
+  await f.hook('notification', url, { session_id: 'sess-other', notification_type: 'idle_prompt' });
+  await f.hook('stop', url, { session_id: 'sess-stuck', hook_event_name: 'Stop' });
+  const label = (post) => `${post.body.event}:${post.body.identity.sessionId}`;
+  // The closed daemon's replays recorded a stalled session; start with none.
+  const stateFile = path.join(f.home, '.keep-node', 'hook-queue.state.json');
+  fs.rmSync(stateFile, { force: true });
+
+  // The daemon answers, and refuses sess-stuck for now: the rest of sess-stuck waits,
+  // and the replay goes on to sess-other and the new event.
+  const busy = await stubDaemon(t, (body) => (body.identity.sessionId === 'sess-stuck' ? { status: 503, body: { error: 'busy' } } : ran('')));
+  const first = await f.hook('lifecycle', busy.url, { hook_event_name: 'PostToolUse' });
+  assert.equal(first.status, 0, first.stderr);
+  assert.deepEqual(busy.posts.map(label), ['notification:sess-stuck', 'notification:sess-other', 'lifecycle:sess-aws1']);
+  assert.deepEqual(f.queue().map((entry) => `${entry.event}:${entry.body.identity.sessionId}`), ['notification:sess-stuck', 'stop:sess-stuck']);
+  assert.equal(JSON.parse(fs.readFileSync(stateFile, 'utf8')).stalledSession, 'sess-stuck');
+
+  // In the next replay sess-stuck goes last, behind an entry queued after it.
+  await f.hook('notification', url, { session_id: 'sess-other', notification_type: 'idle_prompt' });
+  const daemon = await stubDaemon(t, () => ran(''));
+  const second = await f.hook('lifecycle', daemon.url, { hook_event_name: 'PostToolUse' });
+  assert.equal(second.status, 0, second.stderr);
+  assert.deepEqual(daemon.posts.map(label),
+    ['notification:sess-other', 'notification:sess-stuck', 'stop:sess-stuck', 'lifecycle:sess-aws1']);
+  assert.deepEqual(f.queue(), []);
+  assert.equal(fs.existsSync(stateFile), false);
+});
+
+test('a daemon that drops the connection stops the replay: the next entry would meet the same link', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.transcript, '{"n":1}\n');
+  const url = await closedUrl();
+  await f.hook('notification', url, { session_id: 'sess-stuck', notification_type: 'idle_prompt' });
+  await f.hook('notification', url, { session_id: 'sess-other', notification_type: 'idle_prompt' });
+  // The closed daemon's replays recorded sess-stuck as stalled; start with none, so it goes first.
+  fs.rmSync(path.join(f.home, '.keep-node', 'hook-queue.state.json'), { force: true });
+  const daemon = await stubDaemon(t, (body) => (body.identity.sessionId === 'sess-stuck' ? 'reset' : ran('')));
+  const result = await f.hook('lifecycle', daemon.url, { hook_event_name: 'PostToolUse' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(daemon.posts.map((post) => `${post.body.event}:${post.body.identity.sessionId}`),
+    ['notification:sess-stuck', 'lifecycle:sess-aws1'], 'sess-other was not tried');
+  assert.deepEqual(f.queue().map((entry) => entry.body.identity.sessionId), ['sess-stuck', 'sess-other']);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, '.keep-node', 'hook-queue.state.json'), 'utf8')).stalledSession, 'sess-stuck');
 });
 
 // ---------- pre-bash ----------

@@ -79,6 +79,18 @@ function routes(ctx) {
       },
     },
     {
+      // How much of a session's transcript the daemon's mirror holds, asked by a node
+      // with no cursor for it before a large first upload (bin/hook-route.js).
+      method: 'GET',
+      path: '/api/hook/mirror',
+      allow: ['node'],
+      when: nodeApiEnabled,
+      handle: async ({ res, url, principal }) => {
+        const result = await ctx.hookService.mirror(principal, url.searchParams.get('session'));
+        return json(res, result.status, result.body);
+      },
+    },
+    {
       method: 'GET',
       path: '/api/registry/ping',
       allow: NODE_API_ALLOW,
