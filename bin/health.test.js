@@ -318,6 +318,29 @@ test('daily schedulers use their expected window and retain fresh-restart grace'
   assert.equal(health.stateOf({ name: 'standup', cadenceMs: 86400e3, daemonStartedAt: fridayNoon }, day(7, 13, 31)), 'never');
 });
 
+test('record answers the stored row, and null when the store could not be written', (t) => {
+  const { root, health } = fixture();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const written = health.record('node-hook-queue', { ok: false, error: 'aws1: 200 hook events queued (at cap)', at: 1000 });
+  assert.equal(written.lastResult, 'failed');
+  assert.deepEqual(health.row('node-hook-queue'), written);
+  // The store's path taken by a directory: the rename fails, which record warns about
+  // (never throws) and now says to its caller.
+  const file = path.join(root, '.keep', 'health.json');
+  fs.rmSync(file);
+  fs.mkdirSync(path.join(file, 'blocked'), { recursive: true });
+  const warn = process.stderr.write;
+  process.stderr.write = () => true;
+  try {
+    assert.equal(health.record('node-hook-queue', { ok: true, detail: 'no remote nodes', at: 2000 }), null);
+    assert.equal(health.record('node-hook-queue', { ok: true, skipped: true, detail: 'nothing due', at: 3000 }), null);
+    assert.equal(health.record('node-hook-queue', { disabled: true, at: 4000 }), null);
+    assert.ok(health.record('daemon', { at: 5000, pid: process.pid }), 'the daemon row answers its entry whatever the write did');
+  } finally { process.stderr.write = warn; }
+  fs.rmSync(file, { recursive: true, force: true });
+  assert.equal(health.record('node-hook-queue', { ok: true, detail: 'no remote nodes', at: 6000 }).lastResult, 'ok');
+});
+
 test('on-demand schedulers never become silent or never from elapsed time', () => {
   const { health } = fixture();
   const now = 10 * 86400e3;

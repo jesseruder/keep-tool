@@ -327,6 +327,10 @@ function persist(value) {
   }
 }
 
+// Records one row. Answers the stored row, or null when the store could not be
+// written (the failure is warned about once and never thrown), so a caller that
+// writes only on change can tell a row that reached the disk from one that did not.
+// The `daemon` row answers the daemon entry whatever the write did.
 function record(name, options = {}) {
   const at = atMs(options.at, Date.now());
   const store = readStore();
@@ -379,8 +383,7 @@ function record(name, options = {}) {
     store[name] = entry;
     // A disabled row cannot fail again, so it cannot stay charged to a deploy.
     safeNoteDeploy(store, name, { consecutiveFailures: 0 }, at, false);
-    persist(store);
-    return entry;
+        return persist(store) ? entry : null;
   }
   const ok = options.ok !== false;
   const skipped = options.skipped === true || (ok && options.detail === 'nothing due');
@@ -427,8 +430,7 @@ function record(name, options = {}) {
     else entry.detail = clipError(options.detail);
     store[name] = entry;
     safeNoteDeploy(store, name, entry, at, false);
-    persist(store);
-    return entry;
+        return persist(store) ? entry : null;
   }
   const entry = {
     ...prior,
@@ -453,8 +455,7 @@ function record(name, options = {}) {
   else entry.detail = clipError(options.detail);
   store[name] = entry;
   safeNoteDeploy(store, name, entry, at, !ok);
-  persist(store);
-  return entry;
+    return persist(store) ? entry : null;
 }
 
 function nextExpectedAfter(value, config) {

@@ -17099,8 +17099,9 @@ test('node stats: each round records the node-hook-queue row from the nodes\' cu
   const recorded = [];
   const samples = {};
   const deps = {
-    nodeStatsMemo: new Map(), nodeHookQueueRow: { last: null }, now: () => clock, daemonNode: 'main', hostNodes: ['main'],
-    recordHealth: (name, result) => recorded.push([name, result]),
+    nodeStatsMemo: new Map(), nodeHookQueueRow: { last: null, seeded: false }, healthRow: () => null,
+    now: () => clock, daemonNode: 'main', hostNodes: ['main'],
+    recordHealth: (name, result) => { recorded.push([name, result]); return { lastResult: result.ok ? 'ok' : 'failed' }; },
     readNodeStats: async (name) => {
       const sample = samples[name];
       if (sample instanceof Error) throw sample;
@@ -17166,15 +17167,52 @@ test('node stats: each round records the node-hook-queue row from the nodes\' cu
   await pollNodeStats(deps);
   assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: true, detail: 'no remote nodes' }]]);
 
-  // A write that fails is tried again the next round.
+  // A write that did not reach the disk (health.record answers null; it never
+  // throws for that) leaves the last written row unmoved, so the next round writes
+  // again; so does one that throws.
   deps.hostNodes = ['main', 'aws1'];
-  let failures = 1;
+  const attempts = [];
+  let failures = 2;
   deps.recordHealth = (name, result) => {
-    if (failures-- > 0) throw new Error('disk full');
-    recorded.push([name, result]);
+    attempts.push([name, result]);
+    if (failures === 2) { failures -= 1; return null; }
+    if (failures === 1) { failures -= 1; throw new Error('disk full'); }
+    return { lastResult: result.ok ? 'ok' : 'failed' };
   };
   await pollNodeStats(deps);
-  assert.deepEqual(recorded, []);
+  assert.equal(deps.nodeHookQueueRow.last, JSON.stringify([true, 'no remote nodes']), 'still what last reached the disk');
   await pollNodeStats(deps);
-  assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: false, error: 'aws1: 200 hook events queued (at cap)' }]]);
+  await pollNodeStats(deps);
+  await pollNodeStats(deps);
+  const failing = ['node-hook-queue', { ok: false, error: 'aws1: 200 hook events queued (at cap)' }];
+  assert.deepEqual(attempts, [failing, failing, failing], 'written until a write lands, then not again');
+});
+
+test('node stats: the hook-queue row starts from the stored row, so one left failing is cleared with no nodes left', async () => {
+  const { pollNodeStats } = require('./serve');
+  const recorded = [];
+  const base = {
+    nodeStatsMemo: new Map(), now: () => 50_000_000, daemonNode: 'main', hostNodes: ['main'],
+    readNodeStats: async () => ({ at: 1 }),
+    recordHealth: (name, result) => { recorded.push([name, result]); return { lastResult: result.ok ? 'ok' : 'failed' }; },
+  };
+  // The previous daemon wrote a failure, and the node was removed while it was down.
+  let reads = 0;
+  const failingRow = { lastResult: 'failed', lastError: 'aws1: 200 hook events queued (at cap)', consecutiveFailures: 3 };
+  const deps = { ...base, nodeHookQueueRow: { last: null, seeded: false }, healthRow: (name) => { reads += 1; assert.equal(name, 'node-hook-queue'); return failingRow; } };
+  await pollNodeStats(deps);
+  await pollNodeStats(deps);
+  assert.deepEqual(recorded.splice(0), [['node-hook-queue', { ok: true, detail: 'no remote nodes' }]]);
+  assert.equal(reads, 1, 'the stored row is read once per process');
+
+  // A stored row that already says so, and an install that never had the row: nothing.
+  await pollNodeStats({ ...base, nodeHookQueueRow: { last: null, seeded: false },
+    healthRow: () => ({ lastResult: 'ok', detail: 'no remote nodes' }) });
+  await pollNodeStats({ ...base, nodeHookQueueRow: { last: null, seeded: false }, healthRow: () => null });
+  assert.deepEqual(recorded, []);
+
+  // With a node still configured, a stored row equal to this round's is not written again.
+  await pollNodeStats({ ...base, hostNodes: ['main', 'aws1'], nodeHookQueueRow: { last: null, seeded: false },
+    healthRow: () => ({ lastResult: 'ok', detail: 'no fresh node sample reports a hook queue' }) });
+  assert.deepEqual(recorded, []);
 });

@@ -9856,14 +9856,28 @@ async function pollNodeStats(deps = {}) {
 // is on its own clock, brought onto this one by the offset its sample measured.
 //
 // The health store is read and written synchronously, so the row is written only when
-// its outcome or text changes, not every round.
-const nodeHookQueueRow = { last: null };
+// its outcome or text changes, not every round. What was last written starts as the
+// stored row, read on a process's first round: a daemon that starts after the nodes
+// were removed still clears a failure the previous one wrote. It moves only when a
+// write reached the disk (health.record answers null when it did not), so a write
+// that failed is made again the next round.
+const nodeHookQueueRow = { last: null, seeded: false };
+
+function storedRowKey(row) {
+  if (!row || typeof row !== 'object' || !row.lastResult) return null;
+  const ok = row.lastResult !== 'failed';
+  return JSON.stringify([ok, ok ? row.detail : row.lastError]);
+}
 
 function recordNodeHookQueues(memo, names, deps = {}) {
   const daemon = daemonNodeName(deps);
   const now = nodeStatsClock(deps);
   const remote = names.filter((name) => name !== daemon);
   const state = deps.nodeHookQueueRow || nodeHookQueueRow;
+  if (!state.seeded) {
+    state.seeded = true;
+    try { state.last = storedRowKey((deps.healthRow || health.row)('node-hook-queue')); } catch { state.last = null; }
+  }
   const samples = [];
   for (const name of remote) {
     const entry = memo.get(name);
@@ -9881,8 +9895,7 @@ function recordNodeHookQueues(memo, names, deps = {}) {
   const key = JSON.stringify([result.ok, result.ok ? result.detail : result.error]);
   if (key === state.last) return;
   try {
-    (deps.recordHealth || health.record)('node-hook-queue', result);
-    state.last = key;
+    if ((deps.recordHealth || health.record)('node-hook-queue', result)) state.last = key;
   } catch (error) { process.stderr.write(`keep serve: node-hook-queue health not recorded: ${error.message}\n`); }
 }
 
