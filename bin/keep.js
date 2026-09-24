@@ -3814,6 +3814,9 @@ ${stepUsage()}
                          # --dry prints what the next tick would open and why, writing nothing
                          # --reset <signature> clears one signature's cooldown and resolution
   keep stalled [--json]
+                         # sessions, Codex jobs and brokers that stopped moving, and durable
+                         #   in-flight records (transfers, delivery journals, model swaps, ...)
+                         #   past their max age, each with the command that resolves it
   keep codex-jobs [--json] [--reap] [--dry]
   keep leftovers [--json] [--reap] [--dry]
     List companion jobs and brokers; --reap cleans stale jobs, pollers, and brokers.

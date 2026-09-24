@@ -35,7 +35,10 @@ the `self-repair` row itself never produce a signature. Nor do `runs`, `lint` an
 a busy thread, a terminal host that is not up, a card that will not load — which is
 congestion rather than a bug in this process, and `lint`
 and `git-pull` fail on registry and checkout state (a malformed card, a dirty or
-diverged checkout), which is Owner's to fix rather than a daemon bug. A `delivery`
+diverged checkout), which is Owner's to fix rather than a daemon bug. Nor does
+`inflight` (see "In-flight records past their max age" in the reference): it fails on a
+durable record waiting for an event that will not come, which a command per record
+resolves, and it files its own card naming each one. A `delivery`
 row carrying a live incident gets the `delivery:` signature rather than a second
 `sched:` one.
 

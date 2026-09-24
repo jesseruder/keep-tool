@@ -17,7 +17,9 @@ This is for when Keep is the thing that is broken. Read state before changing an
    the stack. An amber `recovered` row last failed long enough ago (an hour, up to a
    day for dailies) and has only run cleanly since: its streak waits for a real
    success, but it is not broken now.
-3. `keep stalled [--json]` — sessions, Codex jobs and deliveries that stopped moving.
+3. `keep stalled [--json]` — sessions, Codex jobs and deliveries that stopped moving, and
+   durable in-flight records (account transfers, delivery journals, model swaps, moves,
+   review obligations, …) past their max age, each with the command that resolves it.
 4. `keep self-repair --dry` — what the daemon would open a repair card for, and why;
    bare `keep self-repair` lists the open signatures, their cards, cooldowns and today's
    count against the daily cap. See `docs/self-repair.md` in the keep-tool checkout.
@@ -46,6 +48,13 @@ This is for when Keep is the thing that is broken. Read state before changing an
 - **`keep restart-daemon` refuses for another reason** (a compaction or delivery in
   flight): it is telling you a restart now would lose work. Retry in a few minutes. Never
   work around it with `launchctl` or `kill`.
+- **The `inflight` health row is failing, or a "Keep: in-flight records past their max
+  age" card is open**: a durable record has waited longer than its operation ever
+  legitimately takes. `keep stalled` lists each one with its age, what it waits for and
+  the resolving command (for a half-moved account transfer, `keep handoff <session>
+  --pane <pane> --account <target>`). Run that command, or leave the record and say why
+  on the card. Never delete or hand-edit the record itself; the daemon only escalates,
+  and each record's owner decides when it may be retired.
 - **A headless model call exits 1 almost immediately, with the error on stdout**: the
   account is out of usage ("You've hit your weekly limit"), not a bad invocation. Headless
   purposes (summarize, landed, slack, reviewer, watcher, …) map to accounts only in

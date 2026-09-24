@@ -422,7 +422,9 @@ function reconcileFirstSeen(items, prior, now) {
   });
   for (const item of prior || []) {
     if (detected.has(itemKey(item))) continue;
-    if (['codex-job', 'orphan-shell', 'codex-broker', 'orphan-agent'].includes(item.kind)) continue;
+    // An in-flight record that is no longer past its age has finished or gone: its file
+    // is the evidence, and the grace below is for sessions, whose size can blink.
+    if (['codex-job', 'orphan-shell', 'codex-broker', 'orphan-agent', 'inflight'].includes(item.kind)) continue;
     const missingSweeps = Math.max(0, number(item.missingSweeps)) + 1;
     if (missingSweeps > 3) continue;
     current.push({
@@ -528,9 +530,23 @@ async function sweep(options = {}) {
     }
     detected.push(...agents);
   }
+  // Durable records past their maximum age (bin/inflight.js). Read-only: the sweep
+  // lists them beside stalled work, and the caller escalates them and writes the
+  // `inflight` health row from the same scan. A failed scan is reported to the caller
+  // rather than failing the rest of the sweep.
+  let inflightScan = null;
+  if (options.includeInflight) {
+    try {
+      inflightScan = await (deps.scanInflight || require('./inflight.js').scan)({ root, now });
+      detected.push(...inflightScan.items);
+    } catch (error) {
+      inflightScan = { items: [], errors: [], error };
+    }
+  }
   const current = reconcileFirstSeen(detected, readCurrent(options), now);
   saveCurrent(current, options);
   let detail = discovery.known ? `${current.length} current` : 'companion state unknown';
+  if (inflightScan && inflightScan.items.length) detail += `; ${inflightScan.items.length} in flight past max age`;
   if (reapResult || brokerReapResult) {
     const jobs = (reapResult?.cancelled || []).length;
     const shells = (reapResult?.killed || []).length;
@@ -544,7 +560,7 @@ async function sweep(options = {}) {
   if (reapError) {
     detail += `; reap failed: ${reapError.message || reapError}`;
   }
-  return { items: current, detail };
+  return { items: current, detail, ...(inflightScan ? { inflight: inflightScan } : {}) };
 }
 
 function duration(ms) {
@@ -572,6 +588,7 @@ function attentionItems(items) {
     else if (item.kind === 'codex-job' && item.status === 'dead' && item.reason === 'worker gone') text = `Dead Codex job ${item.id}${item.accountId ? ` for ${item.accountId}` : ''}: worker process gone (record still running); keep codex-jobs --reap`;
     else if (item.kind === 'codex-job' && item.status === 'dead') text = `Dead Codex job ${item.id}${item.accountId ? ` for ${item.accountId}` : ''} (log ${bytes(item.logBytes)}, ${duration(item.idleMs)})`;
     else if (item.kind === 'codex-job') text = `Stalled Codex job ${item.id}${item.accountId ? ` for ${item.accountId}` : ''} (${duration(item.idleMs)} idle)`;
+    else if (item.kind === 'inflight') text = require('./inflight.js').attentionText(item);
     else text = `Orphan Codex poller pid ${item.pid} (${duration(item.idleMs)})`;
     return {
       id: `stalled:${item.kind}:${stableId}`,

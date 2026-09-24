@@ -42,7 +42,11 @@ const SELF_NAME = 'self-repair';
 // sleep, swap or a loaded machine produce as readily as daemon code, and whose
 // culprit is named by a heuristic at best; a daemon-code repair card cannot address
 // that. The row is for the console and serve.log (bin/serve/schedulers.js).
-const EXCLUDED = new Set(['runs', 'lint', 'git-pull', 'loop-stalls']);
+// `inflight` fails while a durable record (a transfer, a delivery journal, a model
+// swap) is past its maximum age. That is a record waiting on an event that will not
+// come, resolved by a command per record rather than a daemon fix, and bin/inflight.js
+// already files one card naming each record and its command.
+const EXCLUDED = new Set(['runs', 'lint', 'git-pull', 'loop-stalls', 'inflight']);
 const CADENCE_MS = 5 * MINUTE_MS;
 const FIRST_RUN_MS = 90e3;
 // A resolved signature is kept so a recurrence can link the previous card.

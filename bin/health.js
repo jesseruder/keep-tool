@@ -54,6 +54,9 @@ const CADENCES = Object.freeze({
   // its own: a heartbeat every five minutes, plus a failure per >5 s stall, at most
   // one per ten minutes. Excluded from self-repair (bin/self-repair.js EXCLUDED).
   'loop-stalls': { cadenceMs: 5 * 60e3 },
+  // Written by the stalled sweep (bin/inflight.js): failing while any in-flight record
+  // is past its maximum age. It files its own card, so self-repair excludes it.
+  inflight: { cadenceMs: 60e3 },
   digest: { onDemand: true },
   // Recorded once at daemon start and once if a Claude transcript watcher dies: no
   // cadence, so the row reads as a warning until the next start records it ok.

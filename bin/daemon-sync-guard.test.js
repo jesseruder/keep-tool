@@ -18,6 +18,8 @@ const FILES = [
   'bin/serve.js', 'bin/serve/schedulers.js', 'bin/serve/routes.js', 'bin/handoff-queue.js',
   // Modules whose startScheduler the daemon calls, so their ticks run on its loop.
   'bin/landed.js', 'bin/lint.js', 'bin/review.js', 'bin/self-repair.js',
+  // Run from the stalled tick (bin/serve/schedulers.js) every minute.
+  'bin/inflight.js',
 ];
 const SYNC_SPAWN = /\b(execFileSync|spawnSync|execSync)\b/g;
 

@@ -725,14 +725,21 @@ function startSchedulers(ctx) {
       const ledger = readLiveSessionLedger();
       const aliveIds = stallAliveIds(ledger, now);
       const result = await stalled.sweep({
-        root: keep.ROOT, sessions: stalledSessionSnapshot(), includeAgents: true,
+        root: keep.ROOT, sessions: stalledSessionSnapshot(), includeAgents: true, includeInflight: true,
         ...(aliveIds ? { aliveIds } : {}),
       });
       health.record('stalled', { ok: true, cadenceMs: 60e3, detail: result.detail });
+      // Durable records past their maximum age, from the scan the sweep just made: the
+      // `inflight` row and the one card that names them (bin/inflight.js). Escalation
+      // only; nothing here touches the records. tick() never throws.
+      await require('../inflight.js').tick({ root: keep.ROOT, scanned: result.inflight, record: health.record });
       broadcast();
     } catch (error) {
       health.record('stalled', { ok: false, cadenceMs: 60e3, error });
       process.stderr.write(`keep serve: stalled sweep failed: ${error.message}\n`);
+      // A sweep that failed elsewhere (companion state, ps) must not silence the
+      // in-flight row: it scans for itself.
+      await require('../inflight.js').tick({ root: keep.ROOT, record: health.record });
     } finally {
       stalledRunning = false;
     }

@@ -987,6 +987,65 @@ still works. `keep self-repair`
 shows what is open; `keep self-repair --dry` shows what the next tick would open.
 See [daemon self-repair](self-repair.md).
 
+## In-flight records past their max age
+
+Operations that must survive a daemon restart leave a durable record under
+`~/keep/.keep` while they wait for something, and each has a sweep that finishes the
+record when that thing happens. When it never happens, the record just sits there: an
+account transfer in `recovery-needed` for fourteen hours, a delivery journal retried
+2,894 times over two days. So every kind has a maximum age, and the stalled sweep
+(`bin/inflight.js`, once a minute) names any record past it:
+
+| kind | record | in flight while | max age | resolved by |
+|---|---|---|---|---|
+| `delivery` | `delivery/<hash>.json` | in the top directory (not `settled/`) | 2 h from `createdAt` | `keep pane screen <pane>`; submit or clear the draft; re-run the byte-identical `keep tell` |
+| `account-handoff` | `account-handoffs/<session>.json` | `stopping` … `delivering`, `staged`, `recovery-needed` | 30 min from `updatedAt`; 24 h if the source never stopped | `keep handoff <session> --pane <pane> --account <target>`; Abandon in the console if the source never stopped |
+| `handoff-queue` | `handoff-queue/<session>.json` | `queued` | 90 min from `enqueuedAt` | the `handoff-queue` health row; cancel or retry from the console |
+| `session-move` | `session-moves/mv-*.json` | `stopping` … `verifying`, `recovery-needed` | 1 h from `updatedAt` | `keep move --recover <tx>` or `--abandon <tx>` |
+| `portable-transfer` | `portable-transfers/<key>.json` | `prepared`, `launching`, `ambiguous`, `awaiting-setup` | 1 h; 6 h for `awaiting-setup` | `keep transfer … --resolve-session <session>` |
+| `compact-swap` | `compact/<session>.swap.json` | present | 2 h from the swap or the end of its deferral | restore the model in the session; never delete the record |
+| `registry-lock` | `lock/owner.json` | present | 10 min | find the holder with `ps -p <pid>` |
+| `worktree-recreation` | `worktree-recreations/<hash>.json` | present | 30 min from `startedAt` | inspect the worktree; `wt rm --force --delete <path>` if the recreation died |
+| `pi-opening` | `pi-opening/<session>-<uuid>.txt` | present | 30 min (file mtime) | reopen the Pi session |
+| `node-codex-launch` | `node-codex-launches/<hash>.json` | present | 2 h from `launchedAt` | `keep pane screen <pane>` on the node |
+| `review-obligation` | `review-obligations/<card>.json` entries | `open`, `awaiting-verdict` | 8 h from `at` / `stateAt` | `keep reviewed <card> --job <job> …` or `keep reviewing <card> --drop <id> -m why` |
+| `unblock` | `unblocked/*.json` | resolved, not delivered, not given up | 24 h from `resolvedAt` | pick the card up, or `keep wait-on <card> <upstream> --remove` |
+| `session-restart` | `session-restarts.json` entries | `queued`, `restarting`, `recovery-needed` | 2 h from `at` | `keep force-restart <session> --pane <pane> --recover` (Owner's approval) |
+| `pi-job` | `pi-jobs/<id>/job.json` | `queued`, `running`, `cancelling` | 12 h from the last write | `keep pi cancel <id>` |
+| `pending-checkin` | `runs/*.pending.json` | present | 1 h (file mtime) | the `pending check-in` lines in `serve.log`; `keep show <card>` |
+
+Each maximum is well past the longest the operation legitimately takes, and past the
+record's own automatic expiry where it has one, so what is left is a person's call.
+Each has its own `KEEP_INFLIGHT_*_MIN` environment override, named beside it in
+`bin/inflight.js`.
+
+Age comes from the record's own timestamps, the file's mtime only when it carries
+none, and never from asking a pane, a transcript or another node. A record for a
+session on a node that is not answering is therefore not "stuck" for being unknowable;
+it is named only once it is old by its own account. Records that expire on their own
+(open-handoff routing hints, parked queue entries, review-queue items, background-job
+ledgers, holds, step claims) are not tracked.
+
+A record past its max age shows up three ways:
+
+- **`keep stalled`** and the console's stalled attention, one line per record with its
+  age, what it is waiting for, and the resolving command.
+- **The `inflight` health row** fails while any record is past its max age. Its error
+  names record identities only, never ages, so an acknowledged row stays acknowledged
+  while the same records age. Self-repair excludes the row.
+- **One Keep card**, `Keep: in-flight records past their max age` (project
+  `~/keep-tool`, tags `personal`, `inflight`), naming every record. The daemon keeps
+  its id in `.keep/stalled/inflight.json` and never opens a second one while it is
+  open: when the set of records changes it adds one check-in naming what is new and
+  what finished, and when the set empties it checks in once and leaves the card for
+  Owner to close. Closing the card while records remain dismisses those records; only
+  a record it never named opens a new card. The card does not depend on self-repair
+  being enabled.
+
+This is escalation only. Keep never mutates, settles, retires or deletes a record
+because it is old: each owner's retirement rules (a typed delivery journal on a live
+pane is never retired automatically) stay exactly as they were.
+
 ## Landed commits
 
 `keep landed` checks recent open cards for cited commit shas that have reached each

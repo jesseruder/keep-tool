@@ -1113,4 +1113,4 @@ function abandonedForPortable(root, sessionId) {
 }
 
 module.exports = { run, abandon, abandonForPortable, abandonedForPortable, list, readOne, safe, authPreflight, permissionClass,
-  loginShellOutput, classifyRefusal, transferInFlight, CONTINUATION_TEXT };
+  loginShellOutput, classifyRefusal, transferInFlight, abandonCandidate, CONTINUATION_TEXT };

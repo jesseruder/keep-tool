@@ -141,7 +141,7 @@ test('retired, disabled, on-demand and self-repair rows never produce a signatur
     { name: 'unblock', consecutiveFailures: 5, lastError: 'real', lastErrorAt: NOW },
   ]);
   assert.deepEqual(selfRepair.signatures(snapshot, null, NOW, config, null).map((row) => row.name), ['unblock']);
-  assert.deepEqual([...selfRepair.EXCLUDED].sort(), ['git-pull', 'lint', 'loop-stalls', 'runs']);
+  assert.deepEqual([...selfRepair.EXCLUDED].sort(), ['git-pull', 'inflight', 'lint', 'loop-stalls', 'runs']);
 });
 
 test('the restart loop needs two consecutive ticks, and a delivery incident needs age', () => {
