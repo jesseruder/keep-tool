@@ -2182,6 +2182,9 @@ config error and neither runs (see **Restart from the log**).
 to edit. This repo ships the version the code was written against at
 `docs/agents/<name>.md`, and the tick installs it into the registry when there is none.
 An existing file is never overwritten, so Owner's edits survive every later tick.
+Not every recipe under `docs/agents/` is an area agent's: `redash-daily.md` is read by
+the scheduled-check session a card opens every morning (its `--check` text points at the
+file), keeps its memory in that card's check-ins, and has no record or feed.
 `.keep/agents/<name>/notes.md` beside it is the agent's own standing notes, owned by
 that recipe.
 
@@ -2356,8 +2359,11 @@ passes with no result, the stamp is discarded and the card is simply due again.
 
 Keep opens at most one scheduler session per card per local day and three per scheduler
 tick. That bookkeeping is persisted to `.keep/runs/scheduler-state.json`, so a daemon
-restart does not hand every card a second pane. It opens none at all while the `checks`
-automation account's weekly or 5h window is exhausted: that records one `check deferred`
+restart does not hand every card a second pane. The account it spends is the automation
+pool's pick for the `checks` purpose (`docs/accounts.md`, **Automation pool**;
+`automationAccounts.checks` is a preference), and a spent pool names its best member
+so the deferral below runs against a pool account rather than the owner's default. It
+opens none at all while that account's weekly or 5h window is exhausted: that records one `check deferred`
 check-in per card per day (at most three *written* notices a tick; a card already
 noticed today costs nothing, and the rest are logged only),
 changes neither the status nor the schedule, and leaves the card overdue for the tick
