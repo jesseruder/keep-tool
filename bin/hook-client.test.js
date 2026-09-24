@@ -406,7 +406,7 @@ test('a link that slows after a fast measurement brings the chunks down with it'
   const d = driven(f, (payload, timeoutMs, state) => {
     if (payload.event === 'transcript' && slow) {
       state.clock += timeoutMs;
-      throw new Error(`timed out after ${Math.round(timeoutMs / 1000)}s`);
+      throw Object.assign(new Error(`timed out after ${Math.round(timeoutMs / 1000)}s`), { timedOut: true });
     }
     state.clock += 100;
     return landed(payload);
@@ -453,14 +453,19 @@ test('only a chunk its own timeout cut off, after most of that timeout, lowers t
   const client = require('./hook-client.js');
   const MiB = 1024 * 1024;
   const refused = () => Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:1'), { code: 'ECONNREFUSED' });
+  const timedOut = () => Object.assign(new Error('timed out after 4s'), { timedOut: true });
   const cases = [
     // [what is stored, what the chunk meets, what the stored rate is after, whether the replay reads it as the link]
     ['no rate, refused', null, () => { throw refused(); }, null, true],
-    ['no rate, cut off by its timeout', null, (timeoutMs, state) => { state.clock += timeoutMs; throw new Error('timed out after 4s'); }, null, false],
+    // 256 KiB in 4 s: 64 KiB/s, under half of what CHUNK_FIRST assumes.
+    ['no rate, cut off by its timeout', null, (timeoutMs, state) => { state.clock += timeoutMs; throw timedOut(); }, 64 * 1024, false],
+    ['no rate, cut off at once', null, (timeoutMs, state) => { state.clock += 10; throw timedOut(); }, null, false],
     ['a rate, refused', 4 * MiB, () => { throw refused(); }, 4 * MiB, true],
     ['a rate, reset', 4 * MiB, () => { throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }); }, 4 * MiB, true],
-    ['a rate, a timeout error at once', 4 * MiB, (timeoutMs, state) => { state.clock += 10; throw new Error('timed out after 4s'); }, 4 * MiB, false],
-    ['a rate, cut off by its timeout', 4 * MiB, (timeoutMs, state) => { state.clock += timeoutMs; throw new Error('timed out after 4s'); }, MiB, false],
+    ['a rate, a timeout error at once', 4 * MiB, (timeoutMs, state) => { state.clock += 10; throw timedOut(); }, 4 * MiB, false],
+    ['a rate, cut off by its timeout', 4 * MiB, (timeoutMs, state) => { state.clock += timeoutMs; throw timedOut(); }, MiB, false],
+    // What says a chunk was cut off is the tag, not the words.
+    ['a rate, an untagged error that says it timed out', 4 * MiB, (timeoutMs, state) => { state.clock += timeoutMs; throw new Error('timed out after 4s'); }, 4 * MiB, true],
   ];
   for (const [name, stored, meet, after, link] of cases) {
     const f = fixture(t);
@@ -474,7 +479,7 @@ test('only a chunk its own timeout cut off, after most of that timeout, lowers t
     assert.equal(result.retry, true, name);
     assert.equal(Boolean(result.link), link, `${name}: ${result.why}`);
     assert.equal(d.state.posts.length, 1, name);
-    if (after === null) assert.equal(fs.existsSync(linkFile), false, `${name}: an unknown link stays unknown`);
+    if (after === null) assert.equal(fs.existsSync(linkFile), false, `${name}: nothing measured`);
     else assert.equal(JSON.parse(fs.readFileSync(linkFile, 'utf8')).bytesPerSec, after, name);
   }
 

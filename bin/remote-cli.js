@@ -42,10 +42,22 @@ function nodeToken(env = process.env, read) {
 
 // One request to the daemon's node API. Resolves { status, data } for any HTTP
 // answer and rejects only when there was none: a network error or a timeout.
+//
+// `timeoutMs` bounds the whole request by the wall clock. A socket's idle timeout
+// alone does not: an upload the daemon keeps reading slowly is never idle, and ran
+// many times past its bound. A timeout rejects with `error.timedOut` set, which a
+// caller reads rather than the message.
 function nodeApiRequest(base, pathname, { method = 'POST', payload, token, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
   const url = daemonBase(base);
   const body = payload === undefined ? '' : JSON.stringify(payload);
   return new Promise((resolve, reject) => {
+    let timer = null;
+    const settle = (fn) => (value) => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      fn(value);
+    };
+    const ok = settle(resolve);
+    const fail = settle(reject);
     const req = http.request({
       hostname: url.hostname.replace(/^\[|\]$/g, ''),
       port: url.port,
@@ -65,11 +77,19 @@ function nodeApiRequest(base, pathname, { method = 'POST', payload, token, timeo
       let data = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { data += chunk; });
-      res.on('error', reject);
-      res.on('end', () => resolve({ status: res.statusCode, data }));
+      res.on('error', fail);
+      res.on('end', () => ok({ status: res.statusCode, data }));
     });
-    req.on('error', reject);
-    req.setTimeout(timeoutMs, () => req.destroy(new Error(`timed out after ${Math.round(timeoutMs / 1000)}s`)));
+    const timeOut = () => {
+      const error = new Error(`timed out after ${Math.round(timeoutMs / 1000)}s`);
+      error.timedOut = true;
+      fail(error);
+      req.destroy(error);
+    };
+    req.on('error', fail);
+    req.setTimeout(timeoutMs, timeOut);
+    timer = setTimeout(timeOut, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
     req.end(body);
   });
 }

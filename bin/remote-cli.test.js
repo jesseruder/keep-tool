@@ -117,6 +117,28 @@ test('each request to the daemon opens its own connection', async (t) => {
   assert.equal(connections, 3, 'no kept-alive socket the daemon may since have closed is reused');
 });
 
+test('a request is bounded by the wall clock, however slowly the daemon keeps reading it', async (t) => {
+  const { nodeApiRequest } = require('./remote-cli.js');
+  // The daemon reads the upload a little at a time: the socket is never idle.
+  const slow = http.createServer((req, res) => {
+    req.on('data', () => { req.pause(); setTimeout(() => req.resume(), 100); });
+    req.on('end', () => res.end('{}'));
+  });
+  const sockets = new Set();
+  slow.on('connection', (socket) => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+  await new Promise((resolve) => slow.listen(0, '127.0.0.1', resolve));
+  t.after(() => { for (const socket of sockets) socket.destroy(); slow.close(); });
+  const url = `http://127.0.0.1:${slow.address().port}`;
+  const began = Date.now();
+  const error = await nodeApiRequest(url, '/api/hook', { payload: { pad: 'x'.repeat(8 * 1024 * 1024) }, token: 't', timeoutMs: 1000 })
+    .then(() => null, (reason) => reason);
+  const elapsed = Date.now() - began;
+  assert.ok(error, 'the request failed');
+  assert.equal(error.timedOut, true);
+  assert.match(error.message, /^timed out after 1s$/);
+  assert.ok(elapsed >= 900 && elapsed < 2500, `failed after ${elapsed} ms`);
+});
+
 // A daemon restarting under a check-in: the post finds nothing listening, and the
 // ping answers only after a while. The check-in is resent once, with its key, once
 // the daemon is back — never once per wait.

@@ -284,13 +284,13 @@ function recordLinkRate(env, bytes, elapsedMs, at) {
 // the time spent on it is more than the link carried, and a stored rate it failed
 // under is at least twice too high: the lower of the two replaces the rate, so a link
 // that slowed after a fast measurement brings the chunks down with it instead of
-// timing every one of them out. Only a measured rate is lowered: a link that is not
-// known stays unknown (CHUNK_FIRST applies), since a failure alone measures nothing.
+// timing every one of them out. With no rate stored, the cut-off chunk is the first
+// measurement, at most half of what CHUNK_FIRST assumes: a fresh node on a link too
+// slow for its first chunk would otherwise time that chunk out on every hook.
 function recordLinkFailure(env, bytes, elapsedMs, at) {
   const stored = readLinkRate(env, at);
-  if (!stored) return;
   const seen = bytes / (Math.max(1, elapsedMs) / 1000);
-  writeLinkRate(env, Math.min(seen, stored / 2), at);
+  writeLinkRate(env, Math.min(seen, (stored || CHUNK_FIRST) / 2), at);
 }
 
 // How many transcript bytes one post may carry with `leftMs` left of the event's budget.
@@ -363,7 +363,8 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
       // The cursor goes where the mirror is, so the next hook does not resend from
       // the old one.
       if (from > end) {
-        if (!cursor || cursor.generation !== generation || cursor.sent !== from) {
+        // Never backwards: another hook may have moved it past this one meanwhile.
+        if (!cursor || cursor.generation !== generation || cursor.sent < from) {
           try { writeAtomic(cursorFile(env, sid), { generation, sent: from }); } catch {}
         }
         plan = null;
@@ -396,7 +397,7 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
           // when it ran most of that timeout. A refused or reset connection (a daemon
           // restarting) fails in milliseconds and says nothing of the link's speed.
           const elapsed = now() - began;
-          const cutOff = /timed out/.test(error.message);
+          const cutOff = Boolean(error && error.timedOut === true);
           if (cutOff && elapsed >= timeoutMs / 2) recordLinkFailure(env, size, elapsed, now());
           // Cut off by its own bound with time still left: the chunk was too large for
           // the link as it is now. The next one is smaller; meanwhile a replay goes on
