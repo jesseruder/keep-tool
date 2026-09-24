@@ -49,6 +49,14 @@ const FIRST_RUN_MS = 90e3;
 const RESOLVED_TTL_MS = 14 * DAY_MS;
 // How long a signature must stay clear before the card is told it cleared.
 const CLEARED_FOR_MS = 60 * MINUTE_MS;
+// How long after its last failure a streak whose scheduler has run cleanly since
+// (health's `recovered`) stays a candidate. A skip keeps the streak, so five failures
+// with only "nothing due" between them are five real attempts that all failed, and a
+// scheduler whose real work comes hourly and fails every time must still open a card.
+// But the skips land every minute and this tick every five, so it would almost never
+// catch such a row with its latest record a failure. An hour covers that; a row whose
+// last failure is older than that is recovered, not broken, and opens nothing.
+const RECENT_FAILURE_MS = 60 * MINUTE_MS;
 const EXCERPT_MAX = 64 * 1024;
 const LOG_TAIL_BYTES = 1024 * 1024;
 const LOG_MATCH_LINES = 80;
@@ -327,6 +335,11 @@ function signatures(snapshot, deliveryRow, now = Date.now(), config = DEFAULT_CO
     if (row.name === 'delivery' && row.incidentId) continue;
     const failures = Number(row.consecutiveFailures || 0);
     if (failures < Number(cfg.minFailures)) continue;
+    // A streak is a fault still happening only while its latest attempt failed or its
+    // last failure is recent (RECENT_FAILURE_MS). Leaving the list does not start the
+    // clear clock: signatureClear still waits for a real ok to zero the streak, so a
+    // card that is already open stays open until the scheduler has actually worked.
+    if (!health.latestFailed(row) && !(at - atMs(row.lastErrorAt) <= RECENT_FAILURE_MS)) continue;
     const normalized = normalizeError(row.lastError);
     const sig = `sched:${row.name}:${signatureHash(row.name, normalized)}`;
     const seen = prior(sig);

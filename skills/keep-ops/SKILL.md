@@ -14,7 +14,8 @@ This is for when Keep is the thing that is broken. Read state before changing an
    accounts. Its `fix:` lines are safe to run.
 2. `keep health [--json]` — one row per scheduler with last success, consecutive failures
    and the normalized error. A red row names the failing scheduler; the daemon log has
-   the stack.
+   the stack. An amber `recovered` row failed earlier and has run cleanly since: its
+   streak waits for a real success, but it is not broken now.
 3. `keep stalled [--json]` — sessions, Codex jobs and deliveries that stopped moving.
 4. `keep self-repair --dry` — what the daemon would open a repair card for, and why;
    bare `keep self-repair` lists the open signatures, their cards, cooldowns and today's

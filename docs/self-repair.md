@@ -25,7 +25,7 @@ returns candidates.
 
 | Signature | Opened when |
 | --- | --- |
-| `sched:<name>:<hash8>` | a scheduler has `consecutiveFailures >= minFailures` (5) on one normalized error, and that signature was first seen at least `minAgeMin` (30) minutes before its latest failure |
+| `sched:<name>:<hash8>` | a scheduler has `consecutiveFailures >= minFailures` (5) on one normalized error, its latest attempt failed or its last failure is under an hour old, and that signature was first seen at least `minAgeMin` (30) minutes before its latest failure |
 | `daemon:restart-loop` | more than `restartsPerHour` (3) daemon starts in the last hour, on two consecutive ticks; a start that `keep restart-daemon` asked for (a deploy) does not count |
 | `delivery:<incidentId8>` | the `delivery` row's `incidentId` has been unchanged for `minAgeMin` |
 
@@ -38,6 +38,16 @@ and `git-pull` fail on registry and checkout state (a malformed card, a dirty or
 diverged checkout), which is Owner's to fix rather than a daemon bug. A `delivery`
 row carrying a live incident gets the `delivery:` signature rather than a second
 `sched:` one.
+
+A skip keeps the streak, so five failures with only "nothing due" between them are
+five real attempts that all failed. The row reads as `recovered` in `keep health`
+as soon as a skip follows a failure (see Health states in the reference), but a
+`sched:` signature stays a candidate for an hour after its last failure: this tick
+runs every five minutes and the skips land every minute, so it would almost never see
+such a row with a failure as its latest record, and a scheduler whose real work
+comes hourly and fails every time must still get a card. Past that hour a recovered
+row opens nothing. Dropping out of the candidates does not clear an open card: that
+still waits for a real success (Resolution, below).
 
 A tick may also decide the state it is reporting is one its own scheduler tolerates
 rather than a fault, and record

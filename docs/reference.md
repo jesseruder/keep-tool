@@ -446,7 +446,7 @@ duplicate titles, `tmp-artifact` citations, `missing-project` (an open card whos
 is empty or does not resolve to a directory), `landing-uncited` (status `landing` with no
 cited sha), `blocked-no-need` (status `blocked` with neither an open need nor a
 dependency), `daemon-health` (one finding for every scheduler in `.keep/health.json` with
-3+ consecutive failures or no successful run in 24h, skipping on-demand rows and any row
+3+ consecutive failures whose latest attempt failed, or no successful run in 24h, skipping on-demand rows and any row
 whose latest record is a state its scheduler tolerates — see [self-repair](self-repair.md)),
 `checkout-drift` (per project of an
 open card: a dirty tree or a branch ahead of/behind its upstream, from local refs with no
@@ -919,6 +919,33 @@ Headless run logs written by Keep before scheduled checks became sessions
 can be deleted by hand. A headless run that was still in flight when the daemon was
 upgraded is dropped — its result was never landed, and its card comes due again on the
 next tick.
+
+### Health states
+
+`keep health` reads each scheduler row as one of:
+
+- **failing** (red): three or more consecutive failures, and the latest attempt is
+  one of them.
+- **recovered** (amber): a nonzero streak, but the scheduler has run cleanly since
+  its last failure — a skip with nothing due, or a state it tolerates. The streak is
+  kept until a real success clears it, and the detail reads
+  `last failed 21h ago (<error>) · 3 failed attempts · latest check skipped 1m ago ·
+  awaiting a real run`. It is out of console attention, the review bundle's daemon
+  health and the brief's daemon line.
+- **warning** (amber): one or two failures with the latest attempt failed.
+- **silent** / **never** (red): no tick in twice the cadence, or none since the
+  daemon started.
+- **skipped**, **ok**, **disabled**.
+
+Which one applies is decided by the row's `lastResult` (`ok`, `failed` or `skipped`,
+the kind of its latest record). A row written before that field existed is read from
+its timestamps: a failure sets `lastErrorAt` to `lastRunAt`, and a skip moves
+`lastRunAt` alone. A tick with nothing new to try whose last fault still stands records
+`{ skipped: true, holdResult: true }`: it moves `lastRunAt`, so the row cannot go
+silent, and carries the stored result forward, so a failing row stays failing. The
+`loop-stalls` heartbeat uses it while a severe stall is inside its hour, and `usage`
+while an account's failure waits for its retry. A console tab still running JS from
+before `recovered` existed shows such a row uncolored, never red.
 
 The ideas sweep, standup and Slack classification are the only model calls Keep still
 makes headless (they are one-shot generators, not agents). They disable
@@ -2812,7 +2839,8 @@ stall under 5 s appears only in the detail.
 A severe stall records a failure, at most one every ten minutes: a continuous storm
 is rate limited, not merged into one. A heartbeat every five minutes records a skip
 while a severe stall is still inside the hour, so the streak stays but does not
-grow. The first heartbeat after a clean hour records ok. The row warns at one
+grow; the skip holds the result (`holdResult`), so the row does not read as
+recovered while the stall is still in the hour. The first heartbeat after a clean hour records ok. The row warns at one
 failure and reads failing at three, which puts it in console attention. It never
 opens a self-repair card: `bin/self-repair.js` excludes it, because a stall from
 sleep, swap or a loaded machine, blamed by a heuristic, is not something a

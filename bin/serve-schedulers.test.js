@@ -427,9 +427,9 @@ test('the loop-stalls row rate-limits failures, heartbeats with skips, and clear
 
   stalls.tick(7 * MIN);
   assert.deepEqual(rows.shift(), ['loop-stalls', {
-    cadenceMs: 5 * MIN, at: 7 * MIN, skipped: true,
+    cadenceMs: 5 * MIN, at: 7 * MIN, skipped: true, holdResult: true,
     detail: '3 stalls in the last hour, worst 9000ms',
-  }], 'the heartbeat keeps the streak without adding to it');
+  }], 'the heartbeat keeps the streak without adding to it, and holds the row failing');
 
   stalls.stall(13 * MIN, 6000, null);
   assert.equal(rows.shift()[1].error, 'event loop stalled over 5s', 'ten minutes on, a storm records its next failure');

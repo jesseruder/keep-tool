@@ -745,11 +745,15 @@ function daemonHealth(_task, ctx) {
   const health = (() => { try { return require('./health.js'); } catch { return { RETIRED: new Set(), CADENCES: {} }; } })();
   const retired = health.RETIRED || new Set();
   const cadences = health.CADENCES || {};
+  // Failing is a streak whose latest attempt failed. A streak the scheduler has run
+  // cleanly past since (health's `recovered`) is not named for its failures; it falls
+  // through to the no-successful-run check below like any row still awaiting a real ok.
+  const latestFailed = typeof health.latestFailed === 'function' ? health.latestFailed : () => true;
   for (const [name, entry] of Object.entries(store)) {
     if (name === 'daemon' || retired.has(name) || !entry || typeof entry !== 'object' || entry.disabled === true) continue;
     const failures = Number(entry.consecutiveFailures || 0);
     const lastOkAt = Number(entry.lastOkAt || 0);
-    if (failures >= 3) {
+    if (failures >= 3 && latestFailed(entry)) {
       problems.push({ name, why: `${failures} consecutive failures: ${String(entry.lastError || 'no error recorded').slice(0, 120)}` });
       continue;
     }

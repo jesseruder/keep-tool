@@ -246,7 +246,8 @@ function startLoopLagProbe({ thresholdMs = 500, intervalMs = 1000, write = (line
 //     into one;
 //   - every CADENCE_MS the row records a skip while a severe stall is still inside
 //     the hour: the skip keeps the streak and keeps the row from reading `silent`,
-//     but does not add to it;
+//     but does not add to it, and it holds the result (`holdResult`), so the row
+//     keeps reading as failing rather than recovered while the stall is in the hour;
 //   - the first cadence tick with no severe stall in the hour records ok, which
 //     zeroes the streak.
 // So the row warns at one failure and reads failing at three (which puts it in
@@ -301,7 +302,7 @@ function createLoopStallHealth({ health, thresholdMs = 500, severeMs = SEVERE_ST
       if (at - lastRecordAt < cadenceMs) return;
       prune(at);
       const severe = stalls.some((stall) => !stall.startup && stall.ms > severeMs);
-      record(at, severe ? { skipped: true, detail: detailOf() } : { ok: true, detail: detailOf() });
+      record(at, severe ? { skipped: true, holdResult: true, detail: detailOf() } : { ok: true, detail: detailOf() });
     },
   };
 }

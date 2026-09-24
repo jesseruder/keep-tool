@@ -104,6 +104,24 @@ test('a scheduler signature needs enough failures and enough age', () => {
   assert.deepEqual(few, []);
 });
 
+test('a streak the scheduler has run cleanly past opens nothing once its last failure is old', () => {
+  const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+  const row = { name: 'unblock', consecutiveFailures: 6, lastError: 'scan timed out', lastOkAt: NOW - 30 * 3600e3 };
+  const names = (rows) => selfRepair.signatures(snapshotOf(rows), null, NOW, config, null).map((entry) => entry.name);
+  // The latest attempt failed: a candidate, however old the failure.
+  assert.deepEqual(names([{ ...row, lastErrorAt: NOW - 3 * 3600e3, lastRunAt: NOW - 3 * 3600e3, lastResult: 'failed' }]), ['unblock']);
+  // Clean since, but the failure is recent: work that fails whenever it comes, with
+  // skips between, is still a fault.
+  assert.deepEqual(names([{ ...row, lastErrorAt: NOW - 20 * 60e3, lastRunAt: NOW - 60e3, lastResult: 'skipped' }]), ['unblock']);
+  // Clean since and the failure is 21 hours old: recovered, not broken.
+  assert.deepEqual(names([{ ...row, lastErrorAt: NOW - 21 * 3600e3, lastRunAt: NOW - 60e3, lastResult: 'skipped' }]), []);
+  // The same row written before lastResult existed reads the same from its timestamps.
+  assert.deepEqual(names([{ ...row, lastErrorAt: NOW - 21 * 3600e3, lastRunAt: NOW - 60e3 }]), []);
+  // And it does not count as clear: an open card waits for a real ok.
+  const recovered = snapshotOf([{ ...row, lastErrorAt: NOW - 21 * 3600e3, lastRunAt: NOW - 60e3, lastResult: 'skipped' }]);
+  assert.equal(selfRepair.signatureClear('sched:unblock:abcd1234', recovered, [], { openedAt: NOW - 22 * 3600e3 }), false);
+});
+
 test('retired, disabled, on-demand and self-repair rows never produce a signature', () => {
   const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
   const snapshot = snapshotOf([

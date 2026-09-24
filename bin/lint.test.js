@@ -950,6 +950,33 @@ test('daemon-health leaves a row whose latest record is a tolerated state alone'
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('daemon-health names a streak only while its latest attempt failed', () => {
+  const root = makeRoot();
+  const now = Date.parse('2026-09-14T12:00:00');
+  try {
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+    const write = (unblock) => fs.writeFileSync(path.join(root, '.keep', 'health.json'), JSON.stringify({
+      daemon: { startedAt: now - 3600e3 }, unblock: { cadenceMs: 60e3, lastError: 'scan timed out', ...unblock },
+    }));
+    // Failed 21 hours ago, clean skips every minute since, and an ok an hour before
+    // the failure: recovered, so not named for its streak nor yet late.
+    write({ consecutiveFailures: 3, lastOkAt: now - 22 * 3600e3 + 1, lastErrorAt: now - 21 * 3600e3, lastRunAt: now - 60e3, lastResult: 'skipped' });
+    assert.deepEqual(lint({ root, rule: 'daemon-health', now }).findings, []);
+    // Once 24 hours pass without a real ok, the ordinary lateness check names it.
+    write({ consecutiveFailures: 3, lastOkAt: now - 30 * 3600e3, lastErrorAt: now - 21 * 3600e3, lastRunAt: now - 60e3, lastResult: 'skipped' });
+    assert.match(lint({ root, rule: 'daemon-health', now }).findings[0].text, /^unblock: no successful run in 30h/);
+    // The latest attempt failing is named for its streak, from a stored result or,
+    // for a row written before that field, from its timestamps.
+    for (const unblock of [
+      { consecutiveFailures: 3, lastOkAt: now - 3600e3, lastErrorAt: now - 60e3, lastRunAt: now - 60e3, lastResult: 'failed' },
+      { consecutiveFailures: 3, lastOkAt: now - 3600e3, lastErrorAt: now - 60e3, lastRunAt: now - 60e3 },
+    ]) {
+      write(unblock);
+      assert.match(lint({ root, rule: 'daemon-health', now }).findings[0].text, /^unblock: 3 consecutive failures: scan timed out/);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('daemon-health names the open self-repair card covering a failing row', () => {
   const root = makeRoot();
   const now = Date.parse('2026-09-15T12:00:00');

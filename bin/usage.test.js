@@ -195,7 +195,7 @@ test('an idle Codex account keeps the usage row green with a note until it is us
     assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: false, error: 'Codex (default): sessions unreadable (EACCES)' } });
     assert.equal(manager._view().codex.idle, undefined);
     manager.requestRefresh(currentTime + 1000, refresh);
-    assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true, skipped: true, detail: 'nothing due' } });
+    assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true, skipped: true, holdResult: true, detail: 'nothing due' } });
 
     // A Claude socket error carries the same shape of code and keeps its own label.
     manager._states.get('claude/default').nextAttemptAt = currentTime;
@@ -371,8 +371,8 @@ test('cached account errors do not inflate usage health between real retries', a
   await settleRefresh();
   assert.equal(records.filter((entry) => entry.options.ok === false).length, 1, 'healthy account refreshes do not recount a cached failure');
   assert.deepEqual(records.slice(-2).map((entry) => ({ options: entry.options, streak: entry.streak })), [
-    { options: { ok: true, skipped: true, detail: 'waiting for failed account retry' }, streak: 1 },
-    { options: { ok: true, skipped: true, detail: 'waiting for failed account retry' }, streak: 1 },
+    { options: { ok: true, skipped: true, holdResult: true, detail: 'waiting for failed account retry' }, streak: 1 },
+    { options: { ok: true, skipped: true, holdResult: true, detail: 'waiting for failed account retry' }, streak: 1 },
   ]);
 
   currentTime = firstAt + 30 * 60e3 + 1;
@@ -645,6 +645,7 @@ test('a rate limit nobody can judge stays a real failure that another account\'s
           assert.deepEqual(step.asked, ['claude-b'], where);
           assert.equal(step.options.ok, true, where);
           assert.equal(step.options.skipped, true, where);
+          assert.equal(step.options.holdResult, true, `${where}: Alpha's failure stays the latest result`);
           assert.equal(step.options.expected, undefined, `${where}: Alpha's failure is not cleared`);
           assert.match(step.options.detail,
             /^rate limited \(Bravo\); retrying \d\d:\d\d, reading 5m old; unresolved: Alpha: HTTP 429$/, where);
@@ -657,7 +658,7 @@ test('a rate limit nobody can judge stays a real failure that another account\'s
         // left the streak alone.
         const between = await poll(at + 15 * 60e3, { 'claude-b': reading });
         assert.deepEqual(between.asked, ['claude-b'], where);
-        assert.deepEqual(between.options, { ok: true, skipped: true, detail: 'waiting for failed account retry' }, where);
+        assert.deepEqual(between.options, { ok: true, skipped: true, holdResult: true, detail: 'waiting for failed account retry' }, where);
         assert.equal(streak, before + 1, where);
 
         await weather(20 * 60e3);

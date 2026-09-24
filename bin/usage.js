@@ -637,13 +637,15 @@ function createUsageManager(deps = {}) {
             // failure instead would let weather inflate the streak on every poll, which
             // is the thing this branch exists to stop; recording an expected state would
             // clear the other account's evidence, which the reviewer's 12-hour
-            // simulation did 46 times without the row ever reaching two failures. An
-            // ordinary skip does neither: the streak, lastError and lastErrorAt stay,
-            // `keep health` keeps showing "N failed attempts · latest check skipped",
-            // and the row is still lintable and still a self-repair candidate.
+            // simulation did 46 times without the row ever reaching two failures. A
+            // skip that holds the result does neither: the streak, lastError and
+            // lastErrorAt stay, and so does the failure as the row's latest result, so
+            // `keep health` keeps reading it as failing rather than recovered and the
+            // row is still lintable. (An ordinary skip would keep the streak but read as
+            // recovered: weather is not a clean run for the account that failed.)
             const unresolved = unresolvedRealFailures(Number(clock()));
             healthApi.record('usage', unresolved.length ? {
-              ok: true, skipped: true,
+              ok: true, skipped: true, holdResult: true,
               detail: `${weather}; unresolved: ${unresolved.map((state) => `${state.account.label || state.account.id}: ${state.snapshot.error}`).join('; ')}`,
             } : { ok: true, skipped: true, expected: true, detail: weather });
             return;
@@ -659,8 +661,10 @@ function createUsageManager(deps = {}) {
           rateLimitWeather = false;
         }
         const idle = idleDetail();
+        // An account's failure still waiting for its retry is not a clean run: the
+        // skip holds the failure as the row's latest result (bin/health.js record).
         healthApi.record('usage', cachedErrors.length
-          ? { ok: true, skipped: true, detail: 'waiting for failed account retry' }
+          ? { ok: true, skipped: true, holdResult: true, detail: 'waiting for failed account retry' }
           : idle ? { ok: true, detail: idle } : { ok: true });
       });
       return true;
@@ -675,7 +679,10 @@ function createUsageManager(deps = {}) {
         // Every dashboard poll lands here between refreshes, and a skip's detail
         // replaces the last one, so the idle note rides along or `keep health` would
         // only ever show "nothing due".
-        healthApi.record('usage', { ok: true, skipped: true, detail: idle && !cachedErrors ? `nothing due; ${idle}` : 'nothing due' });
+        // Likewise a poll between retries of a failed account holds its failure.
+        healthApi.record('usage', cachedErrors
+          ? { ok: true, skipped: true, holdResult: true, detail: 'nothing due' }
+          : { ok: true, skipped: true, detail: idle ? `nothing due; ${idle}` : 'nothing due' });
       }
     }
     return false;

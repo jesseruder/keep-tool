@@ -914,7 +914,11 @@ function renderHealth() {
   };
   const rows = (health.schedulers || []).map((row) => ({ ...row, ...presentation(row) }));
   const unhealthy = rows.filter((row) => ['failing', 'silent', 'never'].includes(row.displayState));
-  const warnings = rows.filter((row) => row.displayState === 'warning');
+  // Amber: a streak whose latest attempt failed but has not reached failing, and a
+  // streak the scheduler has run cleanly past since (recovered, bin/health.js stateOf).
+  // A console still on older JS shows recovered as a plain row, never as red.
+  const amber = (row) => row.displayState === 'warning' || row.displayState === 'recovered';
+  const warnings = rows.filter(amber);
   const button = document.querySelector('#health');
   // A silent terminal host is not a scheduler failure, but it is the reason every
   // pane looks gone, so it belongs in the one always-visible health indicator.
@@ -933,7 +937,7 @@ function renderHealth() {
   // Each machine's numbers, a single-node install's one included: this is where a
   // lone machine shows them, since the header strip is a fleet's.
   const nodeRows = nodeStatsHealthRowsHTML(esc, data);
-  button.querySelector('.pop').innerHTML = `<b>keep serve</b> · pid ${esc(health.daemon?.pid || '—')}${enable}<dl>${hostRow}${nodeRows}${rows.map((row) => `<dt>${esc(row.name)}</dt><dd class="${['failing', 'silent', 'never'].includes(row.displayState) ? 'bad' : row.displayState === 'warning' ? 'warning' : ''}">${esc(row.displayState)}${row.displayDetail ? ` · ${esc(row.displayDetail)}` : ''}</dd>`).join('')}</dl>`;
+  button.querySelector('.pop').innerHTML = `<b>keep serve</b> · pid ${esc(health.daemon?.pid || '—')}${enable}<dl>${hostRow}${nodeRows}${rows.map((row) => `<dt>${esc(row.name)}</dt><dd class="${['failing', 'silent', 'never'].includes(row.displayState) ? 'bad' : amber(row) ? 'warning' : ''}">${esc(row.displayState)}${row.displayDetail ? ` · ${esc(row.displayDetail)}` : ''}</dd>`).join('')}</dl>`;
   button.querySelector('.notify-enable')?.addEventListener('click', async (event) => {
     event.stopPropagation();
     const permission = await requestPermission();
