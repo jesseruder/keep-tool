@@ -208,6 +208,8 @@ function safe(entry) {
     ...Object.fromEntries(keys.filter((key) => entry[key] != null).map((key) => [key, entry[key]])),
     ...(portableFallbackCandidate(entry) ? { portableFallbackAvailable: true } : {}),
     ...(abandonCandidate(entry) && !active.has(entry.sessionId) ? { abandonAvailable: true } : {}),
+    // Offered too, but only proven when clicked: the daemon reads the panes and `ps`.
+    ...(exitedAbandonCandidate(entry) && !active.has(entry.sessionId) ? { abandonAvailable: true, abandonNeedsExitProof: true } : {}),
     ...(entry.phase === 'portable-fallback' && entry.portableFallbackAt ? { portableFallbackAt: entry.portableFallbackAt } : {}),
   };
 }
@@ -1072,8 +1074,7 @@ async function abandonForPortable(body, deps = {}) {
 // the record goes terminal, and a queued retry of the same move is cancelled with it
 // so the queue does not re-drive what Owner just dropped. The source need not be live;
 // if it died on its own the console offers Reopen on the source account as usual.
-function abandon(body, deps = {}) {
-  const root = deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+function abandonTarget(body, root) {
   if (!/^[A-Za-z0-9_-]+$/.test(String(body?.sessionId || ''))
       || !/^[A-Za-z0-9_-]+$/.test(String(body?.transactionId || ''))) {
     const error = new Error('Expected exact session and handoff transaction'); error.status = 400; throw error;
@@ -1086,23 +1087,119 @@ function abandon(body, deps = {}) {
       || current.sessionId !== body.sessionId) {
     const error = new Error('This is no longer the session\'s latest transfer'); error.status = 409; throw error;
   }
+  return current;
+}
+function refuseStagedTarget(root, sessionId) {
+  // Abandon writes no authority, so only a staged target (a transfer past its stop)
+  // matters here; a source pin from this transaction or elsewhere stays as it is.
+  if (accounts.authority(root)[sessionId]?.stagedAccountId) {
+    const error = new Error('A target account is already staged for this session; retry the transfer instead'); error.status = 409; throw error;
+  }
+}
+function writeAbandoned(root, current, deps, reason) {
+  const queue = deps.queue || require('./handoff-queue');
+  const queued = queue.readOne(root, current.sessionId);
+  if (queued && ['queued', 'parked'].includes(queued.status)) queue.cancel(root, current.sessionId, { log: deps.log });
+  Object.assign(current, { status: 'failed', phase: 'abandoned', abandonedAt: Date.now(), reason });
+  writeOne(root, current);
+  return { ok: true, ...safe(current) };
+}
+function abandon(body, deps = {}) {
+  const root = deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+  const current = abandonTarget(body, root);
   // A click retried after its first write landed finds its own result.
   if (current.status === 'failed' && current.phase === 'abandoned') return { ok: true, ...safe(current) };
   if (!abandonCandidate(current)) {
+    const error = new Error('This transfer got past stopping the session; retry it instead'); error.status = 409;
+    if (exitedAbandonCandidate(current)) error.code = 'ABANDON_NEEDS_EXIT_PROOF';
+    throw error;
+  }
+  refuseStagedTarget(root, body.sessionId);
+  return writeAbandoned(root, current, deps,
+    `Transfer abandoned by Owner; the session stays on ${current.sourceAccountId || 'its account'}`);
+}
+
+// A transfer that committed its /exit Enter (or force-stopped its source, or proved the
+// stop) is past abandonCandidate: from there the session may be half-moved, and Retry
+// is how it finishes. Half-moved, though, means something was started on the target:
+// a staged target, a launch, a delivered continuation. A transfer that stopped its
+// source and then stalled before any of that has moved nothing; its session simply
+// ended on its own account, as if it had exited by itself. On 2026-09-24 one sat for
+// two days after its pane was cleaned up — /exit had answered "See ya!" — and the only
+// way out Keep offered was a Retry that would have reopened a finished conversation on
+// another account. So when the session is proven gone, Abandon takes it too.
+//
+// "Proven gone" is read fresh, from the machine the source ran on: every node answered
+// a fresh pane list and none of them has a live pane carrying the session, and a `ps`
+// snapshot has no process with the recorded pid and start time, no survivor of a
+// forced stop, and no agent resuming this conversation by its id. The recorded pane
+// must be on the daemon node, the only one whose process table this can read. Any
+// doubt refuses, and Retry stays available.
+function exitedAbandonCandidate(entry, now = Date.now()) {
+  if (!entry || entry.phase !== 'stopping-source') return false;
+  const interrupted = entry.status === 'recovery-needed'
+    || entry.status === 'stopping' && !fresh(entry, now, WORKING_GRACE_MS);
+  const stopTouched = entry.sourceExitEnterAt != null || Boolean(entry.sourceStopVerifiedAt)
+    || Array.isArray(entry.forcedProcesses) && entry.forcedProcesses.length > 0;
+  return Boolean(interrupted && stopTouched
+    && entry.forcedCaptureIncomplete !== true
+    && !entry.targetLaunchStartedAt && !entry.deliveryStartedAt && !entry.deliveredAt
+    && Number.isInteger(entry.sourceAgentPid) && entry.sourceAgentPid > 0
+    && typeof entry.sourceAgentPidStart === 'string' && entry.sourceAgentPidStart);
+}
+async function abandonExited(body, deps = {}) {
+  const root = deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+  const current = abandonTarget(body, root);
+  if (current.status === 'failed' && current.phase === 'abandoned') return { ok: true, ...safe(current) };
+  if (!exitedAbandonCandidate(current)) {
     const error = new Error('This transfer got past stopping the session; retry it instead'); error.status = 409; throw error;
   }
-  // Abandon writes no authority, so only a staged target (a transfer past its stop)
-  // matters here; a source pin from this transaction or elsewhere stays as it is.
-  if (accounts.authority(root)[body.sessionId]?.stagedAccountId) {
-    const error = new Error('A target account is already staged for this session; retry the transfer instead'); error.status = 409; throw error;
+  refuseStagedTarget(root, body.sessionId);
+  const refuse = (message) => { const error = new Error(`${message}; retry the transfer instead`); error.status = 409; return error; };
+  const nodes = require('./nodes.js');
+  const daemon = nodes.daemonNode();
+  if (current.pane && nodes.parsePaneRef(String(current.pane)).node !== daemon) {
+    throw refuse(`The session ran on node ${nodes.parsePaneRef(String(current.pane)).node}, whose processes this daemon cannot read`);
   }
-  const queue = deps.queue || require('./handoff-queue');
-  const queued = queue.readOne(root, body.sessionId);
-  if (queued && ['queued', 'parked'].includes(queued.status)) queue.cancel(root, body.sessionId, { log: deps.log });
-  Object.assign(current, { status: 'failed', phase: 'abandoned', abandonedAt: Date.now(),
-    reason: `Transfer abandoned by Owner; the session stays on ${current.sourceAccountId || 'its account'}` });
-  writeOne(root, current);
-  return { ok: true, ...safe(current) };
+  if (typeof deps.listPanes !== 'function' || typeof deps.agentProcessRows !== 'function') {
+    throw refuse('The session\'s exit could not be proven: no pane list or process snapshot is available');
+  }
+  // Held for the proof, so a Retry cannot start the transfer while this reads.
+  active.set(body.sessionId, { abandoning: true });
+  try {
+    let listed;
+    try { listed = await deps.listPanes(); } catch (error) {
+      throw refuse(`The session's exit could not be proven: the pane list failed (${String(error?.message || error).slice(0, 160)})`);
+    }
+    if (!Array.isArray(listed?.panes) || listed.configurationUnreadable || (listed.missingNodes || []).length) {
+      throw refuse('The session\'s exit could not be proven: not every node answered the pane list');
+    }
+    const open = listed.panes.find((pane) => pane?.meta?.sessionId === current.sessionId && pane.alive !== false);
+    if (open) throw refuse(`The session is still open in pane ${open.id}`);
+    let rows;
+    try { rows = await deps.agentProcessRows(); } catch (error) {
+      throw refuse(`The session's exit could not be proven: ps failed (${String(error?.message || error).slice(0, 160)})`);
+    }
+    if (!Array.isArray(rows) || !rows.length) throw refuse('The session\'s exit could not be proven: ps returned no processes');
+    if (rows.some((row) => row && row.pid === current.sourceAgentPid && row.pidStart === current.sourceAgentPidStart)) {
+      throw refuse('The source agent is still running');
+    }
+    if (Array.isArray(current.forcedProcesses) && rows.some((row) => row && !row.zombie
+      && current.forcedProcesses.some((old) => old && row.pid === old.pid && row.pidStart === old.pidStart))) {
+      throw refuse('A process from the forced stop is still running');
+    }
+    if (rows.some((row) => row?.agent && typeof row.args === 'string' && row.args.includes(current.sessionId))) {
+      throw refuse('A process is still running this conversation');
+    }
+  } finally { active.delete(body.sessionId); }
+  // The proof took time; act only on the record it was taken for.
+  const still = readOne(root, body.sessionId);
+  if (!still || still.id !== current.id || still.updatedAt !== current.updatedAt || still.status !== current.status) {
+    const error = new Error('The transfer changed while its exit was being checked; look again'); error.status = 409; throw error;
+  }
+  refuseStagedTarget(root, body.sessionId);
+  return writeAbandoned(root, still, deps,
+    `Transfer abandoned by Owner after the session exited; it stays on ${still.sourceAccountId || 'its account'}`);
 }
 
 function abandonedForPortable(root, sessionId) {
@@ -1112,5 +1209,5 @@ function abandonedForPortable(root, sessionId) {
       sourceOwnsPane: entry.sourceOwnsPane === true } : null;
 }
 
-module.exports = { run, abandon, abandonForPortable, abandonedForPortable, list, readOne, safe, authPreflight, permissionClass,
-  loginShellOutput, classifyRefusal, transferInFlight, abandonCandidate, CONTINUATION_TEXT };
+module.exports = { run, abandon, abandonExited, abandonForPortable, abandonedForPortable, list, readOne, safe, authPreflight, permissionClass,
+  loginShellOutput, classifyRefusal, transferInFlight, abandonCandidate, exitedAbandonCandidate, CONTINUATION_TEXT };

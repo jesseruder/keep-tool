@@ -851,7 +851,7 @@ function routes(ctx) {
       handle: async ({ req, res, url, body }) => {
         if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
         try {
-          const result = abandonTransfer(body);
+          const result = await abandonTransfer(body);
           broadcast();
           return json(res, 200, result);
         } catch (error) {

@@ -180,7 +180,12 @@ const KINDS = [
       // Asked as of a moment past the working grace, so a `stopping` record reads the
       // way it will once it is old enough to matter here.
       let neverLeft = false;
-      try { neverLeft = require('./account-handoff.js').abandonCandidate(entry, since + 16 * MINUTE_MS); } catch {}
+      let exitedOk = false;
+      try {
+        const handoff = require('./account-handoff.js');
+        neverLeft = handoff.abandonCandidate(entry, since + 16 * MINUTE_MS);
+        exitedOk = !neverLeft && handoff.exitedAbandonCandidate(entry, since + 16 * MINUTE_MS);
+      } catch {}
       const retry = `keep handoff ${entry.sessionId} --pane ${entry.pane || '<pane>'} --account ${target}`;
       return {
         id: entry.sessionId,
@@ -195,7 +200,9 @@ const KINDS = [
         resolve: neverLeft
           ? `the source never stopped, so the session is still on ${entry.sourceAccountId || 'its account'}: `
             + `Abandon it in the console (or retry: ${retry})`
-          : `${retry} (it is past the point where Abandon is safe; only a retry finishes it)`,
+          : exitedOk
+            ? `if the session has exited, Abandon it in the console (Keep checks the exit first); otherwise ${retry}`
+            : `${retry} (it is past the point where Abandon is safe; only a retry finishes it)`,
       };
     },
   },

@@ -13975,8 +13975,22 @@ async function handoffSessionRequest(body, deps = {}) {
   return await queueRefusedHandoff(request, result, requestedAt, deps) || result;
 }
 
-function abandonTransfer(body, deps = {}) {
-  return require('./account-handoff').abandon(body, { ...deps, root: deps.root || keep.ROOT });
+// Abandon first as it always was; a transfer past its stop whose session may have
+// exited is abandoned only on a fresh proof of that exit (account-handoff.js
+// abandonExited), read from the pane list and the process table here.
+async function abandonTransfer(body, deps = {}) {
+  const handoff = deps.handoff || require('./account-handoff');
+  const root = deps.root || keep.ROOT;
+  try {
+    return handoff.abandon(body, { ...deps, root });
+  } catch (error) {
+    if (error?.code !== 'ABANDON_NEEDS_EXIT_PROOF') throw error;
+  }
+  return handoff.abandonExited(body, {
+    ...deps, root,
+    listPanes: deps.listPanes || (() => listHostPaneResult(deps, true)),
+    agentProcessRows: deps.agentProcessRows || (() => agentProcessRows({ ...deps, processRowsCache: {} })),
+  });
 }
 
 async function abandonAccountHandoff(body, deps = {}) {
