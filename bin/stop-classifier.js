@@ -123,9 +123,10 @@ function request(sessions, deps = {}) {
     const snapshot = { id: session.id, kind: session.kind };
     latestInput.set(key, inputText);
     summarize.getSummary(key, inputText, INSTRUCTION, () => {
-      const answered = latestInput.get(key) || inputText;
+      const newest = latestInput.get(key);
       latestInput.delete(key);
-      const exact = summarize.cachedSummary(key, answered, INSTRUCTION, { model });
+      const answered = [inputText, newest].find((candidate) => candidate && summarize.cachedSummary(key, candidate, INSTRUCTION, { model })) || '';
+      const exact = answered && summarize.cachedSummary(key, answered, INSTRUCTION, { model });
       logVerdict(root, snapshot, model, (exact || summarize.peekSummary(key))?.text, exact ? answered : '');
       onChange();
     }, { priority: 0, model });

@@ -75,14 +75,13 @@ function activity(session, context = {}) {
   const verdict = ended && model.identity.interactive && !model.identity.reviewer
     && !['hook', 'registry'].includes(model.conversation.source) ? session.stopVerdict : null;
   const cardAsks = taskStatus === 'review' || (taskStatus !== 'done' && model.task.needs);
-  const durableWait = model.conversation.waiting
-    && Boolean(model.conversation.scheduled.length || model.task.dependencies.length || model.task.checkAfter);
+  const durableWait = model.conversation.waiting && ['scheduled check', 'dependency'].includes(model.conversation.reason);
   const heldReason = verdict?.verdict === 'pending' ? 'classifying' : verdict?.reason || 'background work';
   add(['running', 'pending'].includes(verdict?.verdict) && !cardAsks, 'model-running', 'model', 'waiting', `Waiting: ${heldReason}`, heldReason, null,
     verdict?.verdict === 'pending' ? 'uncertain' : 'inferred');
   const asks = model.conversation.hint === 'needs-input';
   // The agent's own words stay the row's (and a push's) detail when it asked something.
-  add(verdict?.verdict === 'needs-input' && !durableWait, 'model-needs-input', 'model', 'needs-input', asks ? 'Needs an answer' : 'Ready for next instruction',
+  add(verdict?.verdict === 'needs-input' && !durableWait && !cardAsks, 'model-needs-input', 'model', 'needs-input', asks ? 'Needs an answer' : 'Ready for next instruction',
     asks ? 'question' : 'next instruction', { kind: 'input', detail: asks ? text : verdict?.reason || 'Ready for your next instruction.' }, 'inferred');
   add(ended && model.conversation.hint === 'needs-input', 'prose-request', 'prose', 'needs-input', 'Needs an answer', 'question', { kind: 'input', detail: text }, 'inferred');
   add(model.conversation.waiting, 'conversation-wait', model.conversation.source, 'waiting', `Waiting: ${model.conversation.reason}`, model.conversation.reason, null, model.conversation.confidence, model.conversation.handoff?.at ?? model.foreground.at);

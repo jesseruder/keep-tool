@@ -122,6 +122,19 @@ test('a WAITING_ON_YOU verdict does not pull a session out of a scheduled check 
   assert.equal(activity(session, { dependencies: ['upstream'] }).state, 'waiting');
 });
 
+test('a far-off card check does not stop the verdict overriding a stale job wait', () => {
+  const session = { ...base, pendingBackground: true, lastAssistantFull: 'Deployed and verified; everything is green.',
+    stopVerdict: { verdict: 'needs-input', reason: 'deploy finished and verified' } };
+  assert.equal(activity(session, { task: { check_after: '2026-10-01T00:00' } }).state, 'needs-input');
+});
+
+test('a card\'s open needs keep their own text over a WAITING_ON_YOU verdict', () => {
+  const session = { ...base, lastAssistantFull: 'Migration done.', stopVerdict: { verdict: 'needs-input', reason: 'migration finished' } };
+  const status = activity(session, { task: { status: 'active', needs: [{ text: 'Approve prod cutover window' }] } });
+  assert.equal(status.decision.rule, 'task-needs');
+  assert.equal(status.request.detail, 'Approve prod cutover window');
+});
+
 test('a RUNNING verdict does not hide the card\'s own review or needs', () => {
   const running = { verdict: 'running', reason: 'handed to reviewer' };
   assert.equal(activity({ ...base, stopVerdict: running }, { task: { status: 'review' } }).state, 'needs-input');
