@@ -9019,7 +9019,7 @@ async function reviewerBootstrapPane(sessionId, deps = {}) {
     const status = listed.nodes && listed.nodes[node];
     if (!status || !status.ok || status.stale) {
       throw new InjectionError(409, `node ${node} did not answer, so the reviewer's pane there cannot be verified; nothing was sent`,
-        { reason: 'remote-node' });
+        { reason: 'node-unanswered' });
     }
   }
   const hosted = sessionHostPane(listed.panes, sessionId);

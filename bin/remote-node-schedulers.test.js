@@ -169,6 +169,13 @@ test('review: a reviewer on the node with a mirror is live, and is not mistaken 
   const at = new Date().toISOString();
   fs.appendFileSync(fleet.mirrored.mirror, `${JSON.stringify({ type: 'user', timestamp: at, message: { role: 'user', content: 'next' } })}\n`);
   assert.equal(review.findReviewerSession([], {}, { panes }).endedTurn, false);
+  // Quiet for longer than the session window (the node's own read would answer 404
+  // "no session"): not a candidate, exactly as the local scan leaves a stale reviewer out.
+  const stale = (Date.now() - 49 * 3600e3) / 1000;
+  const fresh = fs.statSync(fleet.mirrored.mirror).mtime;
+  fs.utimesSync(fleet.mirrored.mirror, stale, stale);
+  assert.equal(review.findReviewerSession([], {}, { panes }), null);
+  fs.utimesSync(fleet.mirrored.mirror, fresh, fresh);
   // Interrupted, as the daemon's scanner reads it everywhere else: the turn is over.
   fs.appendFileSync(fleet.mirrored.mirror, `${JSON.stringify({ type: 'user', timestamp: at, interruptedMessageId: 'msg_fixture',
     message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }] } })}\n`);
@@ -276,7 +283,12 @@ test('review: a message to a reviewer on the node is gated on the node\'s own re
 
   // The mirror says idle, the node says a turn is running: refused, nothing read or typed.
   const busy = await send(fleet.mirrored, { tail: tailOf(midTurn) });
-  await assert.rejects(busy.result, (error) => error.status === 409 && /is not idle on aws1; nothing was typed/.test(error.message));
+  let refusal = null;
+  await assert.rejects(busy.result, (error) => { refusal = error; return error.status === 409 && /is not idle on aws1; nothing was typed/.test(error.message); });
+  // And the review row holds for it, as it does for a local reviewer mid-turn.
+  const held = [];
+  require('./review.js').recordTickError(refusal, (name, value) => held.push(value));
+  assert.equal(held[0].holdResult, true);
   assert.equal(busy.hosts.requests.some((entry) => ['screen', 'input'].includes(entry.type)), false);
 
   // Picked as a bootstrap row, but the node has a transcript and a turn running: refused.
@@ -613,8 +625,9 @@ test('health: a reviewer refused as busy or unreachable on its node holds the re
   const write = process.stderr.write;
   process.stderr.write = () => true;
   try {
-    recordTickError(new Error('reviewer 0a1b is not idle on aws1; nothing was typed'), record);
-    recordTickError(new Error("node aws1 did not answer, so the reviewer's pane there cannot be verified; nothing was sent"), record);
+    // Reworded messages, the same reasons: the reason decides.
+    recordTickError(Object.assign(new Error('reviewer busy elsewhere'), { extra: { reason: 'busy' } }), record);
+    recordTickError(Object.assign(new Error('its node was silent'), { extra: { reason: 'node-unanswered' } }), record);
     recordTickError(new Error('pane fxstray is on main but reviewer 0a1b is on aws1; nothing was sent'), record);
   } finally { process.stderr.write = write; }
   assert.deepEqual(rows.map((row) => [row.ok, row.holdResult === true, row.detail || null]), [

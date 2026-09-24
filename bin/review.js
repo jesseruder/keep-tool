@@ -4490,7 +4490,13 @@ function findReviewerSession(sessions, attempts, options = {}) {
 // sendReviewerMessage). A reviewer the scan already has, an ended marker, one with
 // nothing mirrored yet, and one with no live pane in `options.panes` (the tick's own
 // host list) add nothing: an old reviewer's mirror can be newer than the live one's.
-// Without a pane list there is no proof any pane is live, so nothing is added.
+// Without a pane list there is no proof any pane is live, so nothing is added. Nor
+// does one whose mirror has not moved in REMOTE_REVIEWER_WINDOW_MS: the local scan
+// leaves a reviewer that quiet out, and the node's own read of it answers 404 "no
+// session" (loadRemoteSession), which would fail every tick instead of holding the
+// row as "no live reviewer session registered".
+const REMOTE_REVIEWER_WINDOW_MS = 48 * 3600e3; // serve.js SESSION_WINDOW_MS
+
 function remoteReviewerRows(sessions, markers, options = {}) {
   const scanned = new Set((sessions || []).map((session) => session && session.id));
   const nodeOf = options.sessionNode || ((id) => remoteSessionNode(id));
@@ -4498,6 +4504,7 @@ function remoteReviewerRows(sessions, markers, options = {}) {
   const panes = Array.isArray(options.panes) ? options.panes : [];
   const livePane = (id) => panes.some((pane) => pane && pane.alive && pane.agentAlive !== false
     && pane.meta && pane.meta.sessionId === id);
+  const now = options.now || Date.now();
   const rows = [];
   for (const [id, marker] of Object.entries(markers || {})) {
     if (scanned.has(id) || !marker || marker.ended || !SESSION_ID_RE.test(id)) continue;
@@ -4510,7 +4517,8 @@ function remoteReviewerRows(sessions, markers, options = {}) {
       file = fileOf(id);
       if (file) mtime = fs.statSync(file).mtimeMs;
     } catch { continue; }
-    if (!file || !Number.isFinite(mtime)) continue;
+    // The mirror's mtime is the node's (transcript-mirror sets it from the source).
+    if (!file || !Number.isFinite(mtime) || now - mtime > REMOTE_REVIEWER_WINDOW_MS) continue;
     const turn = mirroredTurnState(file, options);
     rows.push({ id, node, reviewer: true, state: turn.waiting ? 'waiting' : 'idle', endedTurn: turn.endedTurn, mtime });
   }
@@ -4860,11 +4868,15 @@ function recordTickError(e, record = health.record) {
   // another node that its node says is mid-turn (serve.js sendReviewerMessage) or
   // whose node did not answer for its pane: the node-side reading of "reviewer is
   // mid-turn" and "unreachable", refused before a key was typed.
+  // Keyed on the reason each refusal carries (reason 'busy' and 'node-unanswered'),
+  // not on its wording.
   const message = String(e && e.message || e);
+  // serve.js's InjectionError carries it in `extra`.
+  const reason = e && typeof e === 'object' ? (e.extra && e.extra.reason) || e.reason || null : null;
   const held = /injection is busy/i.test(message) ? 'injection busy'
     : e && e.typingStarted ? null
-      : /^reviewer \S+ is not idle on \S+; nothing was typed/.test(message) ? 'reviewer is mid-turn on its node'
-        : /^node \S+ did not answer, so the reviewer's pane there cannot be verified/.test(message) ? 'reviewer node did not answer'
+      : reason === 'busy' ? 'reviewer is mid-turn on its node'
+        : reason === 'node-unanswered' ? 'reviewer node did not answer'
           : null;
   if (held) record('review', { ok: true, skipped: true, holdResult: true, cadenceMs: reviewCadenceMs(), detail: held });
   else record('review', { ok: false, cadenceMs: reviewCadenceMs(), error: e });
