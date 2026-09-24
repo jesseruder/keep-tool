@@ -33,16 +33,18 @@ test('only a finished turn in a live agent conversation with nothing pending is 
   assert.equal(classifier.eligible(base), true);
   for (const change of [{ endedTurn: false }, { endedTurn: undefined }, { toolRunning: true }, { pendingQuestion: { question: 'x' } },
     { pendingPlan: true }, { reviewer: true }, { agentName: 'sandboxes' }, { exited: true }, { kind: 'pi' },
-    { lastAssistantFull: '  ' }, { runtime: { state: 'exited' } }]) {
+    { lastAssistantFull: '  ' }, { runtime: { state: 'exited' } }, { runtime: { state: 'external' } }]) {
     assert.equal(classifier.eligible({ ...base, ...change }), false, JSON.stringify(change));
   }
-  assert.equal(classifier.eligible({ ...base, runtime: { state: 'external' } }), true);
+  assert.equal(classifier.eligible({ ...base, runtime: { state: 'live' } }), true);
 });
 
 test('the input is the last message plus whether tracked background work is still running', () => {
   assert.match(classifier.input(base), /^Background work Keep tracks for this session: none running\nLast assistant message:\nThe Codex review/);
   assert.match(classifier.input({ ...base, pendingBackground: true }), /still running/);
   assert.match(classifier.input({ ...base, lifecycleAgents: [{ id: 'a' }] }), /still running/);
+  assert.match(classifier.input({ ...base, backgroundJobs: { jobs: [{ status: 'pending', kind: 'scheduled' }] } }), /still running/);
+  assert.match(classifier.input({ ...base, backgroundJobs: { jobs: [{ status: 'completed', kind: 'scheduled' }] } }), /none running/);
 });
 
 test('a missing verdict queues one on the configured model, logs it, and a changed input queues again', () => {
@@ -103,6 +105,27 @@ test('a WAITING_ON_YOU verdict beats a tracked job wait and carries its reason t
   assert.equal(activity(asks).state, 'needs-input');
   assert.equal(attention(asks).detail, 'asks whether Transfer follows default');
   assert.equal(attention(asks).attentionLabel, 'Ready for next instruction');
+});
+
+test('a question keeps the agent\'s own words as the detail a push shows', () => {
+  const text = 'Tests pass. Should I deploy to prod now, or wait for the migration?';
+  const session = { ...base, lastAssistantFull: text, stopVerdict: { verdict: 'needs-input', reason: 'asks whether to deploy now' } };
+  assert.equal(attention(session).detail, text);
+  assert.equal(attention(session).attentionLabel, 'Needs an answer');
+});
+
+test('a WAITING_ON_YOU verdict does not pull a session out of a scheduled check or dependency wait', () => {
+  const needs = { verdict: 'needs-input', reason: 'finished, nothing running' };
+  const session = { ...base, lastAssistantFull: 'Waiting for the scheduled check at 3pm.', stopVerdict: needs };
+  const checked = activity(session, { task: { check_after: '2026-09-25T15:00' } });
+  assert.equal(checked.state, 'waiting');
+  assert.equal(activity(session, { dependencies: ['upstream'] }).state, 'waiting');
+});
+
+test('a RUNNING verdict does not hide the card\'s own review or needs', () => {
+  const running = { verdict: 'running', reason: 'handed to reviewer' };
+  assert.equal(activity({ ...base, stopVerdict: running }, { task: { status: 'review' } }).state, 'needs-input');
+  assert.equal(activity({ ...base, stopVerdict: running }, { task: { status: 'active', needs: [{ text: 'API key' }] } }).state, 'needs-input');
 });
 
 test('explicit signals still outrank the verdict', () => {

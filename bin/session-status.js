@@ -66,21 +66,27 @@ function activity(session, context = {}) {
   const waiting = text.match(/\b(?:waiting (?:on|for)|awaiting|blocked (?:on|by))\b[^.!?\n]*/i)?.[0];
   const reason = model.background.agents.length ? 'subagent' : waitReason(waiting);
   add(ended && model.conversation.handoff?.intent === 'needs-input', 'handoff-input', 'registry', 'needs-input', 'Needs input', 'question', { kind: 'input', detail: 'Ready for your decision.' }, 'observed', model.conversation.handoff?.at);
+  const task = context.task?.fm || context.task || {};
+  const taskStatus = model.task.status;
   // The turn-end model verdict (bin/stop-classifier.js) outranks the prose rules and
   // tracked-job waits below, but not a stop intent a hook or card handoff declared.
+  // It sees only the message, so it cannot hide the card's own review or needs, and
+  // cannot pull a session out of a scheduled or dependency wait it does not see.
   const verdict = ended && model.identity.interactive && !model.identity.reviewer
     && !['hook', 'registry'].includes(model.conversation.source) ? session.stopVerdict : null;
+  const cardAsks = taskStatus === 'review' || (taskStatus !== 'done' && model.task.needs);
+  const durableWait = model.conversation.waiting
+    && Boolean(model.conversation.scheduled.length || model.task.dependencies.length || model.task.checkAfter);
   const heldReason = verdict?.verdict === 'pending' ? 'classifying' : verdict?.reason || 'background work';
-  add(['running', 'pending'].includes(verdict?.verdict), 'model-running', 'model', 'waiting', `Waiting: ${heldReason}`, heldReason, null,
+  add(['running', 'pending'].includes(verdict?.verdict) && !cardAsks, 'model-running', 'model', 'waiting', `Waiting: ${heldReason}`, heldReason, null,
     verdict?.verdict === 'pending' ? 'uncertain' : 'inferred');
   const asks = model.conversation.hint === 'needs-input';
-  add(verdict?.verdict === 'needs-input', 'model-needs-input', 'model', 'needs-input', asks ? 'Needs an answer' : 'Ready for next instruction',
-    asks ? 'question' : 'next instruction', { kind: 'input', detail: verdict?.reason || (asks ? text : 'Ready for your next instruction.') }, 'inferred');
+  // The agent's own words stay the row's (and a push's) detail when it asked something.
+  add(verdict?.verdict === 'needs-input' && !durableWait, 'model-needs-input', 'model', 'needs-input', asks ? 'Needs an answer' : 'Ready for next instruction',
+    asks ? 'question' : 'next instruction', { kind: 'input', detail: asks ? text : verdict?.reason || 'Ready for your next instruction.' }, 'inferred');
   add(ended && model.conversation.hint === 'needs-input', 'prose-request', 'prose', 'needs-input', 'Needs an answer', 'question', { kind: 'input', detail: text }, 'inferred');
   add(model.conversation.waiting, 'conversation-wait', model.conversation.source, 'waiting', `Waiting: ${model.conversation.reason}`, model.conversation.reason, null, model.conversation.confidence, model.conversation.handoff?.at ?? model.foreground.at);
   add(!model.identity.interactive && model.background.pending, 'background-pending', 'background', 'waiting', `Waiting: ${reason}`, reason);
-  const task = context.task?.fm || context.task || {};
-  const taskStatus = model.task.status;
   add(taskStatus !== 'done' && model.task.needs, 'task-needs', 'registry', 'needs-input', 'Needs input', 'requested input', { kind: 'input', detail: (task.needs || []).map((need) => need.text).filter(Boolean).join('\n') });
   const ready = ended && model.identity.interactive && !model.identity.reviewer;
   const readyRequest = { kind: 'input', detail: 'Ready for your next instruction.' };

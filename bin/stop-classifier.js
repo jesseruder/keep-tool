@@ -16,6 +16,7 @@ const DEFAULT_MODEL = 'claude-sonnet-5';
 // rules' first guess does not flash into Waiting on you (and alert) only to move.
 const HOLD_MS = 90e3;
 const MAX_TEXT = 8000;
+const LOG_MAX_BYTES = 20 * 1024 * 1024;
 
 const INSTRUCTION = [
   'You sort coding-agent sessions for the person supervising them.',
@@ -40,13 +41,15 @@ function eligible(session) {
   if (!session || !['claude', 'codex'].includes(session.kind) || session.reviewer || session.agentName) return false;
   if (session.exited || session.state === 'exited' || session.deadMidTurn) return false;
   if (session.endedTurn !== true || session.toolRunning || session.pendingQuestion || session.pendingPlan) return false;
-  if (session.runtime && !['live', 'external'].includes(session.runtime.state)) return false;
+  // Only a hosted pane counts: session-status ignores the verdict for any other.
+  if (session.runtime && session.runtime.state !== 'live') return false;
   return Boolean(lastText(session));
 }
 
 function input(session) {
   const text = lastText(session);
-  const background = session.pendingBackground || (session.unknownBackgroundJobs || []).length || (session.lifecycleAgents || []).length;
+  const scheduled = (session.backgroundJobs?.jobs || []).some((job) => job.status === 'pending' && job.kind === 'scheduled');
+  const background = session.pendingBackground || (session.unknownBackgroundJobs || []).length || (session.lifecycleAgents || []).length || scheduled;
   return `Background work Keep tracks for this session: ${background ? 'still running' : 'none running'}\n`
     + `Last assistant message:\n${text.length > MAX_TEXT ? text.slice(-MAX_TEXT) : text}`;
 }
@@ -59,6 +62,9 @@ function parse(text) {
 }
 
 const keyFor = (session) => `stop-${session.id}`;
+// The newest input requested per key: a queued job refreshed with a newer message
+// still completes through the first request's callback.
+const latestInput = new Map();
 
 // Cache reads only: the verdict for the session's current message, or a pending
 // hold while a fresh turn end waits for one. Safe in the dashboard worker.
@@ -93,6 +99,7 @@ function logVerdict(root, session, model, text, inputText) {
     const parsed = parse(text);
     const file = path.join(root, '.keep', 'stop-verdicts.jsonl');
     fs.mkdirSync(path.dirname(file), { recursive: true });
+    try { if (fs.statSync(file).size > LOG_MAX_BYTES) fs.renameSync(file, `${file}.1`); } catch {}
     fs.appendFileSync(file, JSON.stringify({ at: new Date().toISOString(), sessionId: session.id, kind: session.kind, model,
       verdict: parsed?.verdict || null, reason: parsed?.reason || null, raw: parsed ? undefined : String(text || '').slice(0, 200),
       inputSha: crypto.createHash('sha1').update(inputText).digest('hex').slice(0, 12), input: inputText }) + '\n', { mode: 0o600 });
@@ -114,11 +121,12 @@ function request(sessions, deps = {}) {
     const inputText = input(session);
     if (summarize.cachedSummary(key, inputText, INSTRUCTION, { model })) continue;
     const snapshot = { id: session.id, kind: session.kind };
+    latestInput.set(key, inputText);
     summarize.getSummary(key, inputText, INSTRUCTION, () => {
-      // A queued job can be refreshed with a newer message before it runs; log the
-      // input only when it is the one the verdict came from.
-      const exact = summarize.cachedSummary(key, inputText, INSTRUCTION, { model });
-      logVerdict(root, snapshot, model, (exact || summarize.peekSummary(key))?.text, exact ? inputText : '');
+      const answered = latestInput.get(key) || inputText;
+      latestInput.delete(key);
+      const exact = summarize.cachedSummary(key, answered, INSTRUCTION, { model });
+      logVerdict(root, snapshot, model, (exact || summarize.peekSummary(key))?.text, exact ? answered : '');
       onChange();
     }, { priority: 0, model });
   }

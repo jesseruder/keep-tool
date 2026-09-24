@@ -12564,9 +12564,9 @@ function buildState(options = {}) {
     }
   }
   applyCompanionJobs(sessions, options.companion);
-  // Cache reads only; the daemon queues missing verdicts below or in the worker's finalize.
+  // Cache reads only; the daemon queues missing verdicts once agent sessions are
+  // marked (below), or in the worker's finalize.
   require('./stop-classifier').attach(sessions);
-  if (!workerMode) require('./stop-classifier').request(sessions, { onChange });
   for (const session of sessions) {
     const task = taskById.get(session.taskId);
     if (task && !dependencyCache.has(task.id)) dependencyCache.set(task.id, keep.unresolvedDependencyIds(task));
@@ -12626,6 +12626,7 @@ function buildState(options = {}) {
     agentRecords = agents.records(keep.ROOT);
     agents.applySessions(sessions, agentRecords, options.hostPanes || []);
   } catch {}
+  if (!workerMode) require('./stop-classifier').request(sessions, { onChange });
   const attention = [];
   for (const s of sessions) {
     const item = sessionAttentionItem(s, now);
