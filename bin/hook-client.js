@@ -10,11 +10,12 @@
 //                                    session's transcript the daemon has.
 //   ~/.keep-node/hook-queue/<seq>.json  events that could not be delivered, replayed
 //                                    in order, with their own keys, before the next post.
-//   ~/.keep-node/hook-queue.state.json  { stalledSession, at }: the session whose
-//                                    entry the last replay could not deliver; it
-//                                    goes last in the next replay, for an hour at most.
+//   ~/.keep-node/hook-queue.state.json  { stalled: { <sid>: at } }: the sessions whose
+//                                    entries a replay could not deliver; they go last
+//                                    in the next replays, for an hour at most.
 //   ~/.keep-node/link.json           { bytesPerSec, at }: how fast transcript chunks
-//                                    have reached the daemon, which sizes the next ones.
+//                                    have reached the daemon, which sizes the next
+//                                    ones; an hour old, it is no longer believed.
 //   ~/.keep-node/hook.log            what the queue dropped, and why.
 //   ~/.keep-node/hook-context.json   { at, steps, sessions: { <sid>: { repairSession, at } } }:
 //                                    what GET /api/hook/context last said, asked
@@ -80,7 +81,8 @@ const REPLAY_MS = 5000;
 // cursor never moved and the same bytes went up again with every hook. A chunk is
 // half of what the measured rate carries in the time left (at most 2 s of it), never
 // under CHUNK_MIN nor over CHUNK_MAX, the daemon's cap on one post's transcript bytes
-// (bin/transcript-mirror.js POST_CAP_BYTES). Before any rate is known: CHUNK_FIRST.
+// (bin/transcript-mirror.js POST_CAP_BYTES). Before any rate is known the link is
+// taken to carry CHUNK_FIRST a second, which makes CHUNK_FIRST the largest chunk.
 const CHUNK_MIN = 64 * 1024;
 const CHUNK_MAX = 4 * 1024 * 1024;
 const CHUNK_FIRST = 256 * 1024;
@@ -94,6 +96,13 @@ const CHUNK_FLOOR_MS = 300;
 // the hook, and a slow stop would shrink every later chunk.
 const RATE_SAMPLE_BYTES = 64 * 1024;
 const RATE_ALPHA = 0.5;
+// A measurement this old says nothing about the link now.
+const LINK_TTL_MS = 60 * 60 * 1000;
+// A chunk's request waits a few times what the rate says its transfer takes (at least
+// a second, never past the deadline), not the whole budget: a chunk too large for the
+// link as it is now fails soon enough to leave the other sessions their time.
+const CHUNK_TIMEOUT_FACTOR = 4;
+const CHUNK_TIMEOUT_MIN_MS = 1000;
 // A stall record older than this orders nothing: its session is long gone, or has
 // long since had its chance to go first again.
 const STALL_TTL_MS = 60 * 60 * 1000;
@@ -249,28 +258,49 @@ function fitInput(input) {
   return out;
 }
 
-// The link rate this node last measured, in bytes a second, or null when none is known.
-function readLinkRate(env) {
+// The link rate this node measured within the hour before `at`, in bytes a second,
+// or null when none is known.
+function readLinkRate(env, at) {
   const value = readJson(linkFile(env));
-  return value && Number.isFinite(value.bytesPerSec) && value.bytesPerSec > 0 ? value.bytesPerSec : null;
+  if (!value || !Number.isFinite(value.bytesPerSec) || !(value.bytesPerSec > 0) || !Number.isFinite(value.at)) return null;
+  return at - value.at < LINK_TTL_MS ? value.bytesPerSec : null;
 }
 
-// One post's transcript bytes and how long its request took, folded into the stored
-// rate as a moving average: one slow or fast post moves it, and does not replace it.
+function writeLinkRate(env, bytesPerSec, at) {
+  try { writeAtomic(linkFile(env), { bytesPerSec: Math.max(1, Math.round(bytesPerSec)), at }); } catch {}
+}
+
+// A chunk that landed, its bytes and how long its request took, folded into the
+// stored rate as a moving average: one slow or fast chunk moves it, and does not
+// replace it.
 function recordLinkRate(env, bytes, elapsedMs, at) {
   if (!(bytes >= RATE_SAMPLE_BYTES)) return;
   const sample = bytes / (Math.max(1, elapsedMs) / 1000);
-  const stored = readLinkRate(env);
-  const bytesPerSec = stored ? RATE_ALPHA * sample + (1 - RATE_ALPHA) * stored : sample;
-  try { writeAtomic(linkFile(env), { bytesPerSec: Math.round(bytesPerSec), at }); } catch {}
+  const stored = readLinkRate(env, at);
+  writeLinkRate(env, stored ? RATE_ALPHA * sample + (1 - RATE_ALPHA) * stored : sample, at);
+}
+
+// A chunk that did not land. Its bytes over the time spent on it is more than the
+// link carried, and a stored rate it failed under is at least twice too high: the
+// lower of the two replaces the rate, so a link that slowed after a fast measurement
+// brings the chunks down with it instead of timing every one of them out.
+function recordLinkFailure(env, bytes, elapsedMs, at) {
+  const seen = bytes / (Math.max(1, elapsedMs) / 1000);
+  const stored = readLinkRate(env, at);
+  writeLinkRate(env, stored ? Math.min(seen, stored / 2) : seen, at);
 }
 
 // How many transcript bytes one post may carry with `leftMs` left of the event's budget.
-function chunkSize(env, leftMs) {
-  const rate = readLinkRate(env);
-  if (!rate) return CHUNK_FIRST;
-  const size = Math.round(rate * (Math.min(Math.max(0, leftMs), CHUNK_WINDOW_MS) / 1000) * 0.5);
-  return Math.min(CHUNK_MAX, Math.max(CHUNK_MIN, size));
+function chunkSize(env, leftMs, at = Date.now()) {
+  const rate = readLinkRate(env, at);
+  const size = Math.round((rate || CHUNK_FIRST) * (Math.min(Math.max(0, leftMs), CHUNK_WINDOW_MS) / 1000) * 0.5);
+  return Math.min(rate ? CHUNK_MAX : CHUNK_FIRST, Math.max(CHUNK_MIN, size));
+}
+
+// How long one chunk of `bytes` may take, with `leftMs` left.
+function chunkTimeout(env, bytes, leftMs, at = Date.now()) {
+  const rate = readLinkRate(env, at) || CHUNK_FIRST;
+  return Math.min(leftMs, Math.max(CHUNK_TIMEOUT_MIN_MS, Math.round(CHUNK_TIMEOUT_FACTOR * bytes / rate * 1000)));
 }
 
 function newKey() { return crypto.randomBytes(16).toString('hex'); }
@@ -294,16 +324,9 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
     if (left <= 0) throw new Error('out of time');
     return request(where.url, '/api/hook', { payload, token, timeoutMs: left });
   };
-  // A chunk that carried `raw` transcript bytes and landed measures the link.
-  const timed = async (payload, raw) => {
-    const began = now();
-    const response = await send(payload);
-    if (response.status === 200) recordLinkRate(env, raw, now() - began, now());
-    return response;
-  };
   let resends = 0;
   let from = null;
-  for (;;) {
+  attempt: for (;;) {
     const stat = snapshot ? transcriptStat(transcriptPath) : null;
     let plan = null;
     if (snapshot) {
@@ -347,19 +370,43 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
       // the link carries in the time left. Each one that lands moves the cursor, so a
       // hook that runs out of time leaves the next hook to go on from there.
       while (plan) {
-        const size = chunkSize(env, deadline - now());
+        const size = chunkSize(env, deadline - now(), now());
         if (plan.end - from <= size) break;
-        if (deadline - now() < CHUNK_FLOOR_MS) return { ok: false, retry: true, why: 'out of time' };
-        const chunk = await timed({ event: 'transcript', identity, transcript: piece(from, from + size) }, size);
+        const left = deadline - now();
+        if (left < CHUNK_FLOOR_MS) return { ok: false, retry: true, why: 'out of time' };
+        const timeoutMs = chunkTimeout(env, size, left, now());
+        const began = now();
+        let chunk;
+        try {
+          chunk = await request(where.url, '/api/hook', { payload: { event: 'transcript', identity, transcript: piece(from, from + size) }, token, timeoutMs });
+        } catch (error) {
+          recordLinkFailure(env, size, now() - began, now());
+          // Cut off by its own bound with time still left: the chunk was too large for
+          // the link as it is now. The next one is smaller; meanwhile a replay goes on
+          // to other sessions, whose entries may be small enough to land.
+          if (timeoutMs < left && /timed out/.test(error.message)) {
+            return { ok: false, retry: true, why: `a chunk of ${size} bytes did not land in ${timeoutMs} ms` };
+          }
+          throw error;
+        }
         const value = parsed(chunk) || {};
-        if (chunk.status === 200) { from += size; advance(from); continue; }
+        if (chunk.status === 200) {
+          recordLinkRate(env, size, now() - began, now());
+          from += size;
+          advance(from);
+          continue;
+        }
         if (chunk.status === 409 && Number.isSafeInteger(value.needFrom) && resends < NEED_FROM_RETRIES) {
           resends += 1;
           from = value.needFrom;
-          continue;
+          // Planned again: the mirror may now hold more than this event saw.
+          continue attempt;
         }
         return { ok: false, retry: chunk.status >= 500, why: value.error || `HTTP ${chunk.status}` };
       }
+      // The event's own post, when it carries bytes, keeps the chunks' floor: cut off
+      // at the deadline it would read as a daemon that does not answer.
+      if (plan && plan.end > from && deadline - now() < CHUNK_FLOOR_MS) return { ok: false, retry: true, why: 'out of time' };
       response = await send({ event, input, identity, transcript: plan ? piece(from, plan.end) : null, idempotencyKey: key });
     } catch (error) {
       // The request itself failed: the daemon did not answer at all (refused, reset,
@@ -439,16 +486,14 @@ function enqueue(env, entry) {
 // Each session's entries go in their order: an event never overtakes its own
 // session's earlier ones. Sessions do not wait on each other. One whose entry could
 // not be delivered (a transcript too large for the link, a daemon that refuses it for
-// now) is recorded as stalled and goes last in the next replay, so it cannot spend
-// every other session's replay time. A failure the daemon answered skips only that
+// now) is recorded as stalled, and every stalled session goes last in the next
+// replays (among themselves in queue order), so none of them can spend the others'
+// replay time. A failure the daemon answered skips only that
 // session's remaining entries; one it did not answer, or the time running out, stops
 // the replay, since the next entry would meet the same link.
 async function replayQueue({ env, where, token, deadline, deps }) {
   const now = deps.now || Date.now;
-  const state = readJson(replayStateFile(env));
-  // A record past its hour is ignored, and the next stall overwrites it.
-  const fresh = state && typeof state.stalledSession === 'string' && Number.isFinite(state.at) && now() - state.at < STALL_TTL_MS;
-  let stalled = fresh ? state.stalledSession : null;
+  const stalled = readStalled(env, now());
   const entries = [];
   for (const name of queueFiles(env)) {
     const file = path.join(queueDir(env), name);
@@ -456,7 +501,8 @@ async function replayQueue({ env, where, token, deadline, deps }) {
     if (!entry || !EVENTS.includes(entry.event) || !entry.body || !entry.body.identity) { try { fs.unlinkSync(file); } catch {} continue; }
     entries.push({ file, entry, session: entry.body.identity.sessionId });
   }
-  const ordered = [...entries.filter((item) => item.session !== stalled), ...entries.filter((item) => item.session === stalled)];
+  const isStalled = (item) => Object.hasOwn(stalled, item.session);
+  const ordered = [...entries.filter((item) => !isStalled(item)), ...entries.filter(isStalled)];
   const failed = new Set();
   let sent = 0;
   for (const { file, entry, session } of ordered) {
@@ -470,8 +516,8 @@ async function replayQueue({ env, where, token, deadline, deps }) {
     });
     if (!result.ok && result.retry) {
       failed.add(session);
-      stalled = session;
-      try { writeAtomic(replayStateFile(env), { stalledSession: session, at: now() }); } catch {}
+      stalled[session] = now();
+      writeStalled(env, stalled);
       if (result.link || result.why === 'out of time') break;
       continue;
     }
@@ -481,11 +527,37 @@ async function replayQueue({ env, where, token, deadline, deps }) {
     try { fs.unlinkSync(file); } catch {}
     sent += 1;
   }
-  // The stalled session's entries have all gone: it no longer goes last.
-  if (stalled && !failed.has(stalled) && !pendingFor(env, stalled)) {
-    try { fs.unlinkSync(replayStateFile(env)); } catch {}
+  // A stalled session whose entries have all gone no longer goes last.
+  for (const session of Object.keys(stalled)) {
+    if (!failed.has(session) && !pendingFor(env, session)) delete stalled[session];
   }
+  writeStalled(env, stalled);
   return sent;
+}
+
+// The stalled sessions and when each last stalled, those older than an hour left out:
+// a session long gone, or one that has long since had its chance to go first again.
+function readStalled(env, at) {
+  const state = readJson(replayStateFile(env));
+  const out = {};
+  if (state && state.stalled && typeof state.stalled === 'object' && !Array.isArray(state.stalled)) {
+    for (const [session, when] of Object.entries(state.stalled)) {
+      if (Number.isFinite(when) && at - when < STALL_TTL_MS) out[session] = when;
+    }
+  }
+  return out;
+}
+
+function writeStalled(env, stalled) {
+  const file = replayStateFile(env);
+  if (!Object.keys(stalled).length) {
+    try { fs.unlinkSync(file); } catch {}
+    return;
+  }
+  // Nothing written when nothing changed: most replays find the record as it was.
+  const current = readJson(file);
+  if (current && JSON.stringify(current.stalled) === JSON.stringify(stalled)) return;
+  try { writeAtomic(file, { stalled }); } catch {}
 }
 
 // Removes a session's queued events. A session's end is the last thing it sends:
@@ -799,7 +871,7 @@ function report(env = process.env) {
 
 module.exports = {
   runHook, runBashHook, runCodexToolHook, runPiHook, deliver, logLine, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
-  hookContext, contextFile, CONTEXT_TTL_MS, linkFile, replayStateFile, chunkSize,
+  hookContext, contextFile, CONTEXT_TTL_MS, linkFile, replayStateFile, chunkSize, chunkTimeout,
   EVENTS, CLAUDE_EVENTS, CODEX_EVENTS, PI_EVENTS, TRANSCRIPTLESS, QUEUED, ENDS, BUDGET_MS, QUEUE_MAX,
-  CHUNK_BYTES, CHUNK_MIN, CHUNK_MAX, CHUNK_FIRST, CHUNK_FLOOR_MS, STALL_TTL_MS, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
+  CHUNK_BYTES, CHUNK_MIN, CHUNK_MAX, CHUNK_FIRST, CHUNK_FLOOR_MS, STALL_TTL_MS, LINK_TTL_MS, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
 };
