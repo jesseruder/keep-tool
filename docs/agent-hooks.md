@@ -37,6 +37,26 @@ notification, pre-question, lifecycle, and the Bash pair. So is every Codex adap
 below (see "Codex sessions on another node"), and the three Pi hooks (see "Pi sessions
 on another node").
 
+Each post that carries a transcript brings the bytes the daemon's mirror
+(`.keep/transcript-mirrors/<node>/<session>.jsonl`) does not have yet, from a per-session
+cursor the node keeps in `~/.keep-node/mirror/<session>.json`. A long delta goes in
+chunks sized to the measured link rate and the time left in the hook's budget: 64 KiB
+to 4 MiB (the daemon's per-post cap), 256 KiB before any measurement, with the rate
+kept in `~/.keep-node/link.json` from the chunk posts alone. Each chunk that lands
+advances the cursor, so a hook that runs out of time leaves progress behind and the
+next hook continues from it. A node with no usable cursor (none, or one for a replaced
+file) asks `GET /api/hook/mirror?session=<id>` before a delta over 256 KiB and resumes
+from a mirror of the same file generation, which is how a session moved onto the node
+starts from the mirror `keep move` seeded rather than sending its transcript again.
+Events the daemon did not take are queued under `~/.keep-node/hook-queue` (200 at most,
+oldest dropped) and replayed at the start of the next hook, each session's events in
+order; a session the last replay could not deliver goes last the next time, recorded in
+`~/.keep-node/hook-queue.state.json`, so one stuck session never holds the others. A
+daemon that answered a retryable error for one session skips the rest of that session's
+entries and moves on; a daemon that did not answer at all, or a replay out of time, stops
+the replay. The daemon's `node-hook-queue` health row names a node whose queue is at its
+cap or holds an event older than ten minutes.
+
 - **pre-bash.** The raw `claude --resume` guard runs on the node first, as everywhere.
   The node then reads the daemon's step fingerprints (`GET /api/hook/context`, kept in
   `~/.keep-node/hook-context.json` and asked again after a minute), computes the

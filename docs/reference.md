@@ -1467,7 +1467,15 @@ holds the verified bytes and before the target starts; the target is launched th
 `keep open` pinned to the new record, and the move waits for its session-start. Then the
 card's session link is rewritten with the new node, the stopped pane is removed, the copy
 left behind is released for a later move back, and a move off a node also drops the
-daemon's transcript mirror for it and the node's hook queue and cursor. A finished move
+daemon's transcript mirror for it and the node's hook queue and cursor. A move onto a
+node seeds the daemon's mirror of the target's transcript once the copy has landed, from
+bytes the daemon already holds (its own file when the session leaves the daemon node,
+its mirror of the source node otherwise), checked against the digest the target lists
+for its copy and stamped with that copy's file generation, so the target's hooks send
+only what the session appends after the move rather than the whole transcript over the
+link. A seed that cannot be made is a move warning (`the daemon's mirror of <node> was
+not seeded: …`), never a failed move; the target's hook client then asks the daemon
+where its mirror ends before its first upload and starts there. A finished move
 deletes its transaction directory on the target, `<configDir>/.keep-move/<tx>/`, and the
 backups of any files its publish replaced go with it; only the provenance record
 (`<configDir>/.keep-move/provenance/<sid>.json`) stays. A move that fails
@@ -3002,6 +3010,17 @@ failure and reads failing at three, which puts it in console attention. It never
 opens a self-repair card: `bin/self-repair.js` excludes it, because a stall from
 sleep, swap or a loaded machine, blamed by a heuristic, is not something a
 daemon-code fix addresses. A restarted daemon starts with an empty window.
+
+The `node-hook-queue` health row is written by the node-stats poller after each round,
+from every node's `hookQueue` sample (`{ depth, cap, oldestAt }`, the node's
+`~/.keep-node/hook-queue` as its host's `stats` verb reads it; absent from a node that
+never queued a hook, and from the daemon node, which runs no hook client). It fails while
+any node's queue is at its cap (200 entries, where the oldest events are being dropped) or
+holds an event older than ten minutes (a queue that is not draining), naming each such
+node: `aws1: 200 hook events queued (at cap), oldest 2h 3m`. Stale samples are left out,
+and with no node reporting a queue nothing is written. Self-repair excludes the row: a
+repair session on the daemon cannot drain a node's queue, which empties on its own once
+the node reaches the daemon again.
 A stall in the probe's first minute is logged as `keep serve: event loop stalled
 7200ms during startup` (with ` (<name>)` when a holder was measured, and
 ` (likely <name>)` when it is a guess) and only counted in
