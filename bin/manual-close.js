@@ -27,8 +27,7 @@ async function manualClose(body, deps) {
   // A pane may be named by the node it lives on (`<id>@<node>`); the host's own
   // alphabet has no '@', so the two shapes stay distinguishable here.
   if (!/^[a-z0-9_-]+$/i.test(body?.sessionId || '') || !/^[A-Za-z0-9_-]{1,64}(?:@[a-z0-9]+)?$/.test(body?.pane || '')) throw new Error('Expected exact session and pane');
-  const readBudgetMs = deps.readBudgetMs != null ? deps.readBudgetMs
-    : require('./nodes.js').isRemotePane(body.pane) ? REMOTE_READ_BUDGET_MS : READ_BUDGET_MS;
+  const readBudgetMs = require('./nodes.js').isRemotePane(body.pane) ? REMOTE_READ_BUDGET_MS : READ_BUDGET_MS;
   const initial = await withinBudget(deps.getPane(body.pane), readBudgetMs);
   if (deps.requireSignalGuard && deps.signalGuarded !== true) {
     throw new Error('Terminal host must be refreshed before automatic force close');
@@ -100,13 +99,18 @@ async function manualClose(body, deps) {
   // Try the normal /exit workflow first. If prompt/activity guards refuse it,
   // SIGTERM still gives the process a chance to clean up without typing into a draft.
   let gracefulResult;
+  let gracefulRefused = false;
   try { gracefulResult = await deps.graceful(body); } catch (error) {
     deps.onGracefulError?.(error);
     if (deps.requireGraceful) throw error;
+    gracefulRefused = true;
   }
   if (deps.protectInput) expectedInputCount = gracefulResult?.expectedInputCount;
   if (deps.protectOutput) expectedOutputCount = gracefulResult?.expectedOutputCount;
-  if ((await wait(200)).closed) return result();
+  // A refused /exit leaves nothing to wait for: polling would only spend the phase
+  // (a whole remote read budget, since a remote pane's graceful close always refuses)
+  // before the SIGTERM that comes next anyway.
+  if (!gracefulRefused && (await wait(200)).closed) return result();
   await gracefulResult?.beforeSignal?.();
   // The identity reads around each signal get one phase's budget too; nothing has
   // been signalled yet here, so a timeout simply fails the close.

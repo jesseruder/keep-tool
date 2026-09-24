@@ -85,8 +85,16 @@ for (const mode of ['timeout', 'missing']) test(`manual close reports an unconfi
 
 // A pane on another node is read across the node transport, where one reply can
 // wait behind another crossing a relayed link: its reads get the remote budget.
+// These run as the daemon node `main`, so `@aws1` names another machine wherever
+// the suite runs.
+function asDaemonNode(t) {
+  const saved = process.env.KEEP_DAEMON_NODE;
+  process.env.KEEP_DAEMON_NODE = 'main';
+  t.after(() => { if (saved === undefined) delete process.env.KEEP_DAEMON_NODE; else process.env.KEEP_DAEMON_NODE = saved; });
+}
 for (const [pane, closes] of [['pane@aws1', true], ['pane', false]]) {
-  test(`manual close gives a ${closes ? 'remote' : 'local'} pane's first read ${closes ? 'more than' : 'only'} one second`, async () => {
+  test(`manual close gives a ${closes ? 'remote' : 'local'} pane's first read ${closes ? 'more than' : 'only'} one second`, async (t) => {
+    asDaemonNode(t);
     const f = fixture('exit');
     let first = true;
     f.deps.getPane = async () => {
@@ -99,7 +107,8 @@ for (const [pane, closes] of [['pane@aws1', true], ['pane', false]]) {
   });
 }
 
-test('a remote pane\'s SIGTERM phase lasts at least one remote read budget', async () => {
+test('a remote pane\'s SIGTERM phase lasts at least one remote read budget', async (t) => {
+  asDaemonNode(t);
   const { READ_BUDGET_MS, REMOTE_READ_BUDGET_MS } = require('./manual-close');
   assert.equal(READ_BUDGET_MS, 1000);
   assert.ok(REMOTE_READ_BUDGET_MS > READ_BUDGET_MS);
@@ -115,6 +124,22 @@ test('a remote pane\'s SIGTERM phase lasts at least one remote read budget', asy
   f.deps.sleep = async (ms) => { clock += ms; };
   await assert.rejects(manualClose({ ...body, pane: 'pane@aws1' }, f.deps),
     new RegExp(`host did not confirm within ${REMOTE_READ_BUDGET_MS / 1000}s`));
+});
+
+test('a refused graceful close goes straight to SIGTERM without polling first', async (t) => {
+  asDaemonNode(t);
+  const f = fixture('refusal');
+  let reads = 0;
+  const get = f.deps.getPane;
+  f.deps.getPane = async () => { reads += 1; return { ...await get(), id: 'pane@aws1' }; };
+  let clock = 0;
+  f.deps.now = () => clock;
+  f.deps.sleep = async (ms) => { clock += ms; };
+  assert.equal((await manualClose({ ...body, pane: 'pane@aws1' }, f.deps)).closed, true);
+  assert.deepEqual(f.calls, ['exit', 'SIGTERM']);
+  // The initial read, the read before SIGTERM, and the one that sees it exit.
+  assert.equal(reads, 3);
+  assert.equal(clock, 0);
 });
 
 test('automatic close never turns a graceful refusal into force permission', async () => {
