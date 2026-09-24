@@ -1,11 +1,16 @@
 import { reportWriteFailure, write } from './api.js';
 import { runAction } from './action.js';
 
+// A close of a pane on another node reads it over the node transport with a
+// four-second budget per phase, so its worst case outlives the ordinary write
+// deadline; the console must not report a close the daemon is still carrying out.
+const CLOSE_TIMEOUT_MS = 45000;
+
 export async function closeSession(ctx, sessionId, pane, button) {
   if (button?.disabled || !ctx.beginClose(sessionId, pane)) return;
   try {
     await runAction(button, async () => {
-      const result = await write('/api/close-session', { sessionId, pane }, 'POST', { label: 'Closing session' });
+      const result = await write('/api/close-session', { sessionId, pane }, 'POST', { label: 'Closing session', timeoutMs: CLOSE_TIMEOUT_MS });
       if (!result.closed) {
         ctx.closingSessions.cancel(sessionId);
         ctx.toast('Graceful exit requested; history and task preserved');

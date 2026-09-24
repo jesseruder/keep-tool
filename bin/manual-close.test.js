@@ -83,6 +83,40 @@ for (const mode of ['timeout', 'missing']) test(`manual close reports an unconfi
   assert.deepEqual(f.calls, ['exit', 'SIGTERM']);
 });
 
+// A pane on another node is read across the node transport, where one reply can
+// wait behind another crossing a relayed link: its reads get the remote budget.
+for (const [pane, closes] of [['pane@aws1', true], ['pane', false]]) {
+  test(`manual close gives a ${closes ? 'remote' : 'local'} pane's first read ${closes ? 'more than' : 'only'} one second`, async () => {
+    const f = fixture('exit');
+    let first = true;
+    f.deps.getPane = async () => {
+      if (first) { first = false; await new Promise((resolve) => setTimeout(resolve, 1300)); }
+      return { id: pane, pid: 123, alive: !f.calls.includes('exit'), meta: { agent: 'claude', sessionId: 'session' } };
+    };
+    const closing = manualClose({ ...body, pane }, f.deps);
+    if (closes) assert.equal((await closing).closed, true);
+    else await assert.rejects(closing, /timed out \(get\) after 1000ms/);
+  });
+}
+
+test('a remote pane\'s SIGTERM phase lasts at least one remote read budget', async () => {
+  const { READ_BUDGET_MS, REMOTE_READ_BUDGET_MS } = require('./manual-close');
+  assert.equal(READ_BUDGET_MS, 1000);
+  assert.ok(REMOTE_READ_BUDGET_MS > READ_BUDGET_MS);
+  const f = fixture('never');
+  let signaled = false;
+  f.deps.signal = async (_pane, signal) => { f.calls.push(signal); if (signal === 'SIGTERM') signaled = true; };
+  f.deps.getPane = async () => {
+    if (signaled) throw new Error('host request timed out (get)');
+    return { id: 'pane@aws1', pid: 123, alive: true, meta: { agent: 'claude', sessionId: 'session' } };
+  };
+  let clock = 0;
+  f.deps.now = () => clock;
+  f.deps.sleep = async (ms) => { clock += ms; };
+  await assert.rejects(manualClose({ ...body, pane: 'pane@aws1' }, f.deps),
+    new RegExp(`host did not confirm within ${REMOTE_READ_BUDGET_MS / 1000}s`));
+});
+
 test('automatic close never turns a graceful refusal into force permission', async () => {
   const f = fixture('refusal');
   await assert.rejects(manualClose(body, { ...f.deps, requireGraceful: true }), /draft/);

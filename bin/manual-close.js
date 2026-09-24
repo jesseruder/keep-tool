@@ -3,6 +3,11 @@
 // One phase of polling: ten reads a tenth of a second apart. Every identity read
 // on this path is bounded by it, because the caller holds the injection lock.
 const READ_BUDGET_MS = 1000;
+// A pane on another node is read over the node transport: a relayed link costs a
+// round trip of ~100 ms, and that node's host answers one request per connection at
+// a time, so a get can sit behind a screen or list reply still crossing the link.
+// One second failed real closes of aws1 panes; this is the budget for those reads.
+const REMOTE_READ_BUDGET_MS = 4000;
 
 // A host read may not outlive its budget: a host that never answers is abandoned
 // as a timeout (the read is idempotent and may finish on its own; a late reply
@@ -22,7 +27,9 @@ async function manualClose(body, deps) {
   // A pane may be named by the node it lives on (`<id>@<node>`); the host's own
   // alphabet has no '@', so the two shapes stay distinguishable here.
   if (!/^[a-z0-9_-]+$/i.test(body?.sessionId || '') || !/^[A-Za-z0-9_-]{1,64}(?:@[a-z0-9]+)?$/.test(body?.pane || '')) throw new Error('Expected exact session and pane');
-  const initial = await withinBudget(deps.getPane(body.pane), READ_BUDGET_MS);
+  const readBudgetMs = deps.readBudgetMs != null ? deps.readBudgetMs
+    : require('./nodes.js').isRemotePane(body.pane) ? REMOTE_READ_BUDGET_MS : READ_BUDGET_MS;
+  const initial = await withinBudget(deps.getPane(body.pane), readBudgetMs);
   if (deps.requireSignalGuard && deps.signalGuarded !== true) {
     throw new Error('Terminal host must be refreshed before automatic force close');
   }
@@ -54,15 +61,18 @@ async function manualClose(body, deps) {
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const timedOut = (error) => /timed out/i.test(String(error && error.message || error));
   const now = deps.now || Date.now;
-  // A phase is ten polls or the wall time they were meant to take, whichever ends
-  // first: a host that times out every read must not hold the injection lock for
-  // ten full request timeouts, and the error reports the time actually spent.
+  // A phase is a poll every `delay` for its budget (ten polls on this node), ending
+  // on whichever runs out first: a host that times out every read must not hold the
+  // injection lock for ten full request timeouts, and the error reports the time
+  // actually spent.
   const wait = async (delay) => {
     const started = now();
-    const budgetMs = 10 * delay;
+    // Never shorter than one read's budget, or a single slow remote read would end
+    // the phase before the host had a chance to confirm anything.
+    const budgetMs = Math.max(10 * delay, readBudgetMs);
     let confirmed = false;
     let lastError = null;
-    for (let i = 0; i < 10 && now() - started < budgetMs; i++) {
+    for (let i = 0; i < Math.ceil(budgetMs / delay) && now() - started < budgetMs; i++) {
       let pane;
       try { pane = await withinBudget(deps.getPane(body.pane), budgetMs - (now() - started)); }
       catch (error) {
@@ -100,7 +110,7 @@ async function manualClose(body, deps) {
   await gracefulResult?.beforeSignal?.();
   // The identity reads around each signal get one phase's budget too; nothing has
   // been signalled yet here, so a timeout simply fails the close.
-  verify(await withinBudget(deps.getPane(body.pane), READ_BUDGET_MS));
+  verify(await withinBudget(deps.getPane(body.pane), readBudgetMs));
   const guard = () => ({
     expectedPid: initial.pid,
     expectedSessionId: body.sessionId,
@@ -113,7 +123,7 @@ async function manualClose(body, deps) {
   if (!term.confirmed) throw unconfirmed('SIGTERM', term.waitedMs, term.lastError);
   await gracefulResult?.beforeSignal?.();
   let beforeKill;
-  try { beforeKill = await withinBudget(deps.getPane(body.pane), READ_BUDGET_MS); }
+  try { beforeKill = await withinBudget(deps.getPane(body.pane), readBudgetMs); }
   catch (error) { if (timedOut(error)) throw unconfirmed('SIGTERM', term.waitedMs, error); throw error; }
   if (!beforeKill) throw unconfirmed('SIGTERM', term.waitedMs);
   verify(beforeKill);
@@ -124,4 +134,4 @@ async function manualClose(body, deps) {
   throw new Error('Termination requested but the pane is still alive');
 }
 
-module.exports = { manualClose };
+module.exports = { manualClose, READ_BUDGET_MS, REMOTE_READ_BUDGET_MS };
