@@ -220,11 +220,13 @@ function record(name, options = {}) {
     // is a clean run unless the tick says otherwise with `holdResult`: nothing new
     // ran, and the fault it last recorded still stands — the loop-stall heartbeat
     // while a severe stall is inside its hour, the usage poll while an account's
-    // failure waits for its retry. That skip moves lastRunAt (the row is alive, not
-    // silent) and carries the stored result forward unchanged. An expected state has
-    // no fault to hold, so it is always a clean skip.
-    entry.lastResult = options.holdResult === true && options.expected !== true
-      ? (resultOf(prior) || 'skipped')
+    // failure waits for its retry, a tick that gave up for the day or could not reach
+    // what it drives. That skip moves lastRunAt (the row is alive, not silent) and
+    // carries a stored failure forward; after anything else it is still a skip, so
+    // the field never names a success for a record that was not one. An expected
+    // state has no fault to hold, so it is always a clean skip.
+    entry.lastResult = options.holdResult === true && options.expected !== true && resultOf(prior) === 'failed'
+      ? 'failed'
       : 'skipped';
     if (options.detail == null || options.detail === '') delete entry.detail;
     else entry.detail = clipError(options.detail);
@@ -288,11 +290,40 @@ function resultOf(entry) {
   return runAt > 0 ? 'skipped' : null;
 }
 
-// Whether the most recent attempt failed: what `failing` means, and what
-// bin/self-repair.js and bin/lint.js daemonHealth ask before treating a streak as a
-// fault that is still happening.
+// Whether the most recent attempt failed.
 function latestFailed(entry) {
   return resultOf(entry) === 'failed';
+}
+
+// How long after its last failure a streak still counts as a fault that stands,
+// whatever skips followed it. A skip is the scheduler finding nothing to do, not
+// proof its work succeeds: a scheduler whose real attempts come hourly and all fail,
+// with a clean "nothing due" every minute between them, is broken, and would read as
+// recovered almost all the time if only the latest record counted. So the window is
+// the longer of an hour and two of the row's own cadences (about the time in which
+// it should have had a real attempt), capped at a day. An hour is the floor because
+// self-repair ticks every five minutes and must see a candidate across ticks; a day
+// is the cap, and what a daily scheduler gets, so yesterday's failed brief stays red
+// until today's attempt. Past the window, a streak the scheduler has only skipped
+// since reads as recovered.
+const RECENT_FAILURE_MIN_MS = HOUR_MS;
+const RECENT_FAILURE_MAX_MS = DAY_MS;
+
+function recentFailureMs(entry) {
+  const config = CADENCES[entry && entry.name] || {};
+  const cadenceMs = Number(entry && entry.cadenceMs || config.cadenceMs || 0);
+  return Math.min(RECENT_FAILURE_MAX_MS, Math.max(RECENT_FAILURE_MIN_MS, 2 * cadenceMs));
+}
+
+// Whether a row's streak is a fault that stands now: its latest attempt failed, or
+// its last failure is inside recentFailureMs. What `failing` means at three, and what
+// bin/self-repair.js and bin/lint.js daemonHealth ask before treating a streak as
+// current rather than history. A row with no streak has no fault to stand.
+function faultStands(entry, now = Date.now()) {
+  if (!(Number(entry && entry.consecutiveFailures || 0) > 0)) return false;
+  if (latestFailed(entry)) return true;
+  const lastErrorAt = atMs(entry && entry.lastErrorAt);
+  return lastErrorAt > 0 && atMs(now, Date.now()) - lastErrorAt <= recentFailureMs(entry);
 }
 
 function stateOf(entry, now = Date.now()) {
@@ -308,20 +339,19 @@ function stateOf(entry, now = Date.now()) {
   const daemonStartedAt = atMs(startedAt);
   const lastRunAt = atMs(entry && entry.lastRunAt);
 
-  // Red means broken now. A streak of three reads as failing only while the latest
-  // attempt is one of its failures. Once the scheduler has run cleanly since — a skip
-  // with nothing to do, or a tolerated state — the streak stays (it still awaits a
-  // real ok to clear it) but the row reads as recovered: amber, and out of console
-  // attention, the review bundle and the brief's daemon line. It answers where a
-  // skip answers, ahead of the silence checks, exactly as the skip it replaces (and
-  // the failing it replaces) did: some schedulers record their skips more sparsely
-  // than twice their cadence, and a row that failed once must not turn red for that.
+  // Red means broken now. A streak of three reads as failing while its fault stands:
+  // the latest attempt failed, or the last failure is recent (faultStands). Once the
+  // scheduler has gone past that with only clean skips, the streak stays (it still
+  // awaits a real ok to clear it) but the row reads as recovered: amber, and out of
+  // console attention, the review bundle and the brief's daemon line. Unlike a plain
+  // skip, a recovered row still goes through the silence checks below, so a scheduler
+  // that failed and then stopped ticking reads as silent or never, as red as it was.
   const failures = Number(entry && entry.consecutiveFailures || 0);
-  const failedLast = latestFailed(entry);
-  if (failures >= 3 && failedLast) return 'failing';
-  if (failures > 0 && !failedLast) return 'recovered';
+  const stands = faultStands(entry, at);
+  if (failures >= 3 && stands) return 'failing';
+  const recovered = failures > 0 && !stands;
   const lastResultAt = Math.max(atMs(entry && entry.lastOkAt), atMs(entry && entry.lastErrorAt));
-  if (lastRunAt > lastResultAt) return 'skipped';
+  if (!recovered && lastRunAt > lastResultAt) return 'skipped';
   if (!config.onDemand && cadenceMs > 0 && daemonStartedAt > 0) {
     const ranThisBoot = lastRunAt >= daemonStartedAt;
     if (!ranThisBoot) {
@@ -335,6 +365,7 @@ function stateOf(entry, now = Date.now()) {
       return 'silent';
     }
   }
+  if (recovered) return 'recovered';
   if (entry && entry.detail === 'nothing due') return 'skipped';
   return 'ok';
 }
@@ -441,13 +472,17 @@ function presentationOf(entry, now = Date.now()) {
   const displayState = unresolved && failures < 3 && ['ok', 'skipped'].includes(entry.state) ? 'warning' : entry.state;
 
   // Failed before, clean since: say when it last failed and what it said, and that
-  // the streak is waiting on a real run rather than on a fix.
+  // the streak is waiting on a real run rather than on a fix. The display state is
+  // 'warning', not 'recovered': an open console tab keeps its JS across daemon
+  // restarts, and older JS colors 'warning' amber but leaves a state it does not know
+  // uncolored and out of its header. `state` says recovered; labelOf names it for the
+  // table and the current console.
   if (entry && entry.state === 'recovered') {
     const parts = [`last failed ${relativeTime(lastErrorAt, now)}${entry.lastError ? ` (${entry.lastError})` : ''}`,
       `${failures} failed attempt${failures === 1 ? '' : 's'}`];
     if (atMs(entry.lastRunAt) > lastErrorAt) parts.push(`latest check skipped ${relativeTime(entry.lastRunAt, now)}`);
     parts.push('awaiting a real run');
-    return { displayState: 'recovered', displayDetail: parts.join(' · ') };
+    return { displayState: 'warning', displayDetail: parts.join(' · ') };
   }
 
   if (unresolved) {
@@ -459,6 +494,13 @@ function presentationOf(entry, now = Date.now()) {
   }
 
   return { displayState, displayDetail: entry.detail || '' };
+}
+
+// The word a row is shown under: its display state, except that a recovered row,
+// displayed as 'warning' for older consoles, is named for what it is.
+function labelOf(row, now = Date.now()) {
+  if (row && row.state === 'recovered') return 'recovered';
+  return (row && row.displayState) || presentationOf(row, now).displayState;
 }
 
 function reviewSection(value, now = Date.now()) {
@@ -503,16 +545,14 @@ function render(value, now = Date.now()) {
     : daemon.startedAt ? `down (last start ${relativeTime(daemon.startedAt, now)})` : 'down (no start recorded)';
   const rows = [...(value.schedulers || [])].sort((a, b) => {
     const rank = { failing: 0, silent: 1, never: 2, warning: 3, recovered: 4, skipped: 5, ok: 6, disabled: 7 };
-    const aState = a.displayState || presentationOf(a, now).displayState;
-    const bState = b.displayState || presentationOf(b, now).displayState;
-    return (rank[aState] ?? 9) - (rank[bState] ?? 9) || a.name.localeCompare(b.name);
+    return (rank[labelOf(a, now)] ?? 9) - (rank[labelOf(b, now)] ?? 9) || a.name.localeCompare(b.name);
   });
   const values = [['scheduler', 'state', 'last run', 'last ok', 'failures', 'detail']];
   for (const row of rows) {
     const presentation = row.displayState ? row : presentationOf(row, now);
     values.push([
       row.name,
-      presentation.displayState,
+      labelOf(row, now),
       relativeTime(row.lastRunAt, now),
       relativeTime(row.lastOkAt, now),
       String(row.consecutiveFailures),
@@ -538,7 +578,10 @@ module.exports = {
   stateOf,
   resultOf,
   latestFailed,
+  recentFailureMs,
+  faultStands,
   presentationOf,
+  labelOf,
   snapshot,
   attentionItems,
   reviewSection,

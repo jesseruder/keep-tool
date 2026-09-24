@@ -895,6 +895,40 @@ test('due checks open one fresh session per card per day, three per tick', () =>
   }
 });
 
+test('a check open that failed for the day holds the runs row failing through the idle ticks', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-runs-giveup-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'tasks', 'due-1.md'), [
+      '---', 'title: Due card', 'status: waiting', 'kind: task', 'tags: [personal]',
+      'check_after: 2020-01-01T00:00', 'check: |', '  Confirm the recorder is still green.',
+      'created: 2020-01-01T00:00', 'updated: 2020-01-01T00:00', '---', '', 'Context.', '',
+    ].join('\n'));
+    const script = `
+      const runs = require(${JSON.stringify(require.resolve('./runs.js'))});
+      runs.setOpener(async () => { throw new Error('the card project does not exist'); });
+      (async () => {
+        const fs = require('fs');
+        const read = () => JSON.parse(fs.readFileSync(${JSON.stringify(path.join(root, '.keep', 'health.json'))}, 'utf8')).runs;
+        await runs.schedulerTick();
+        const first = read();
+        await runs.schedulerTick();
+        process.stdout.write(JSON.stringify({ first, second: read() }));
+      })();
+    `;
+    const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_NO_COMMIT: '1' };
+    delete env.CLAUDE_CODE_SESSION_ID;
+    const { first, second } = JSON.parse(execFileSync(process.execPath, ['-e', script], { encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'ignore'] }));
+    assert.deepEqual([first.lastResult, first.consecutiveFailures], ['failed', 1]);
+    // The card is marked opened for the day, so the next tick has nothing due; the fault
+    // has not gone anywhere, so that skip holds the failure rather than a clean result.
+    assert.equal(second.detail, 'nothing due', JSON.stringify({ first, second }));
+    assert.deepEqual([second.lastResult, second.consecutiveFailures], ['failed', 1]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // The bookkeeping that stops a card being opened or noticed twice is only worth
 // anything if it survives the restart that used to reset it.
 test('the per-day allowances are read back from disk by a fresh process', () => {

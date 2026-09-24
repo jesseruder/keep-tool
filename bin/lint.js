@@ -745,15 +745,17 @@ function daemonHealth(_task, ctx) {
   const health = (() => { try { return require('./health.js'); } catch { return { RETIRED: new Set(), CADENCES: {} }; } })();
   const retired = health.RETIRED || new Set();
   const cadences = health.CADENCES || {};
-  // Failing is a streak whose latest attempt failed. A streak the scheduler has run
-  // cleanly past since (health's `recovered`) is not named for its failures; it falls
-  // through to the no-successful-run check below like any row still awaiting a real ok.
-  const latestFailed = typeof health.latestFailed === 'function' ? health.latestFailed : () => true;
+  // Failing is a streak whose fault stands (health.faultStands: the latest attempt
+  // failed, or the last failure is recent for the row's cadence). A streak the
+  // scheduler has run cleanly past since (health's `recovered`) is not named for its
+  // failures; it falls through to the no-successful-run check below like any row
+  // still awaiting a real ok.
+  const faultStands = typeof health.faultStands === 'function' ? health.faultStands : () => true;
   for (const [name, entry] of Object.entries(store)) {
     if (name === 'daemon' || retired.has(name) || !entry || typeof entry !== 'object' || entry.disabled === true) continue;
     const failures = Number(entry.consecutiveFailures || 0);
     const lastOkAt = Number(entry.lastOkAt || 0);
-    if (failures >= 3 && latestFailed(entry)) {
+    if (failures >= 3 && faultStands({ ...entry, name }, ctx.now)) {
       problems.push({ name, why: `${failures} consecutive failures: ${String(entry.lastError || 'no error recorded').slice(0, 120)}` });
       continue;
     }
@@ -772,6 +774,14 @@ function daemonHealth(_task, ctx) {
     const silentMs = Math.max(HEALTH_SILENT_MS, 2 * Number(cadence.cadenceMs || entry.cadenceMs || 0));
     if (lastOkAt && ctx.now - lastOkAt > silentMs) {
       problems.push({ name, why: `no successful run in ${Math.floor((ctx.now - lastOkAt) / 3600e3)}h` });
+      continue;
+    }
+    // A row that has never succeeded has no last ok to be late against, but a streak on
+    // it is a fault that has gone unanswered since its last failure: a recovered row
+    // that never worked is late from then, not never.
+    const lastErrorAt = Number(entry.lastErrorAt || 0);
+    if (!lastOkAt && failures > 0 && lastErrorAt && ctx.now - lastErrorAt > silentMs) {
+      problems.push({ name, why: `never succeeded; last failed ${Math.floor((ctx.now - lastErrorAt) / 3600e3)}h ago: ${String(entry.lastError || 'no error recorded').slice(0, 120)}` });
     }
   }
   if (!problems.length) return [];

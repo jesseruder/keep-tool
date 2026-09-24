@@ -446,7 +446,9 @@ duplicate titles, `tmp-artifact` citations, `missing-project` (an open card whos
 is empty or does not resolve to a directory), `landing-uncited` (status `landing` with no
 cited sha), `blocked-no-need` (status `blocked` with neither an open need nor a
 dependency), `daemon-health` (one finding for every scheduler in `.keep/health.json` with
-3+ consecutive failures whose latest attempt failed, or no successful run in 24h, skipping on-demand rows and any row
+3+ consecutive failures whose fault still stands (the latest attempt failed or the
+last failure is recent; see Health states), no successful run in 24h, or a streak on a
+row that has never succeeded whose last failure is over 24h old, skipping on-demand rows and any row
 whose latest record is a state its scheduler tolerates — see [self-repair](self-repair.md)),
 `checkout-drift` (per project of an
 open card: a dirty tree or a branch ahead of/behind its upstream, from local refs with no
@@ -924,28 +926,43 @@ next tick.
 
 `keep health` reads each scheduler row as one of:
 
-- **failing** (red): three or more consecutive failures, and the latest attempt is
-  one of them.
-- **recovered** (amber): a nonzero streak, but the scheduler has run cleanly since
-  its last failure — a skip with nothing due, or a state it tolerates. The streak is
-  kept until a real success clears it, and the detail reads
+- **failing** (red): three or more consecutive failures whose fault still stands:
+  the latest attempt failed, or the last failure is recent.
+- **recovered** (amber): a nonzero streak whose last failure is no longer recent,
+  with only clean records since — skips with nothing due, or a state the scheduler
+  tolerates. The streak is kept until a real success clears it, and the detail reads
   `last failed 21h ago (<error>) · 3 failed attempts · latest check skipped 1m ago ·
   awaiting a real run`. It is out of console attention, the review bundle's daemon
-  health and the brief's daemon line.
-- **warning** (amber): one or two failures with the latest attempt failed.
+  health and the brief's daemon line. A recovered row whose scheduler then stops
+  ticking still reads silent or never.
+- **warning** (amber): one or two failures whose fault still stands.
 - **silent** / **never** (red): no tick in twice the cadence, or none since the
   daemon started.
 - **skipped**, **ok**, **disabled**.
 
-Which one applies is decided by the row's `lastResult` (`ok`, `failed` or `skipped`,
+"Recent" is the longer of an hour and two of the row's cadences, capped at a day
+(`recentFailureMs` in `bin/health.js`). A skip is the scheduler finding nothing to do,
+not proof its work succeeds: a scheduler whose real work comes hourly and fails every
+time, with "nothing due" every minute between, is failing, not recovered. The same
+rule gates `daemon-health` in `keep lint` and `sched:` signatures in self-repair.
+A daily scheduler gets the full day, so a brief that gave up at noon is still red the
+next morning until it tries again.
+
+The latest attempt comes from the row's `lastResult` (`ok`, `failed` or `skipped`,
 the kind of its latest record). A row written before that field existed is read from
 its timestamps: a failure sets `lastErrorAt` to `lastRunAt`, and a skip moves
-`lastRunAt` alone. A tick with nothing new to try whose last fault still stands records
-`{ skipped: true, holdResult: true }`: it moves `lastRunAt`, so the row cannot go
-silent, and carries the stored result forward, so a failing row stays failing. The
-`loop-stalls` heartbeat uses it while a severe stall is inside its hour, and `usage`
-while an account's failure waits for its retry. A console tab still running JS from
-before `recovered` existed shows such a row uncolored, never red.
+`lastRunAt` alone. A tick that did not try — it gave up for the day, was deferred by a
+spent automation pool, found the reviewer busy or its pane locked, or is a start-up
+placeholder — records `{ skipped: true, holdResult: true }`: it moves `lastRunAt`, so
+the row cannot go silent, and carries a stored failure forward, so a failing row stays
+failing (after anything else it is an ordinary skip). The `loop-stalls` heartbeat uses
+it while a severe stall is inside its hour, `usage` while an account's failure waits
+for its retry, `runs` for the rest of a day on which a check open failed for good,
+`brief` after the noon give-up, `leftovers` when the host could not be asked, and
+`review`, `review-compact`, `auto-compact`, `slack`, `landed`, `standup`,
+`discord` and `git-pull` on their did-not-try paths. A recovered row is sent with
+`displayState: 'warning'` and `state: 'recovered'`, so a console tab still running JS
+from before `recovered` existed colors it amber too.
 
 The ideas sweep, standup and Slack classification are the only model calls Keep still
 makes headless (they are one-shot generators, not agents). They disable

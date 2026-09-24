@@ -2526,6 +2526,30 @@ test('recordTickOutcome and recordTickError share the scheduler health bookkeepi
     ['review', true, true, 'injection busy'],
     ['review', false, false, 'session is showing a modal'],
   ]);
+  // Only a tick that could not reach the reviewer holds the row's result.
+  assert.deepEqual(calls.map((c) => c.holdResult === true), [false, false, true, false]);
+});
+
+test('review and review-compact skips hold the result only when they did not try', () => {
+  const { recordTickOutcome, compactSkipHealth } = require('./review.js');
+  const held = (why) => {
+    let options;
+    const stderr = process.stderr.write;
+    process.stderr.write = () => true;
+    try { recordTickOutcome({ sent: false, why }, (_name, value) => { options = value; }); }
+    finally { process.stderr.write = stderr; }
+    return options.holdResult === true;
+  };
+  for (const why of ['reviewer is mid-turn', 'reviewer session is unavailable (busy)', 'budget: window exhausted',
+    'no live reviewer session registered', 'reviewer session has exited']) assert.equal(held(why), true, why);
+  for (const why of ['nothing ranked', 'last tick 3 min ago', 'drift gap: last drift wake for this session 2 min ago', 'sweep not due'])
+    assert.equal(held(why), false, why);
+
+  assert.equal(compactSkipHealth({ skipped: true, why: 'injection busy' }).holdResult, true);
+  assert.equal(compactSkipHealth({ skipped: true, why: 'reviewer session disappeared' }).holdResult, true);
+  assert.equal(compactSkipHealth({ skipped: true, why: 'no newer review tick' }).holdResult, undefined);
+  const remote = compactSkipHealth({ skipped: true, expected: true, why: 'reviewer runs on node n2; compaction there is not supported yet' });
+  assert.deepEqual([remote.expected, remote.holdResult], [true, undefined]);
 });
 
 test('gitState on a project that is not a repository reports the reason without leaking to stderr', () => {

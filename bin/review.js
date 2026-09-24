@@ -4738,10 +4738,33 @@ function reviewCadenceMs() {
   return cadenceMode() === 'clock' ? TICK_MS : FALLBACK_TICK_MS;
 }
 
+// Not-sent reasons that mean the tick could not reach the reviewer, rather than that
+// it had nothing to send: no reviewer, one that exited, is mid-turn or unavailable, or
+// a budget that will not pay for it. Those skips hold the row's result (bin/health.js
+// record, holdResult), so a standing failure is not read as recovered because the
+// reviewer was busy. Nothing ranked, the tick gap and the drift gates stay clean.
+const REVIEW_UNREACHABLE_RE = /^(no live reviewer session|reviewer session has exited|reviewer session is unavailable|reviewer is mid-turn|budget: )/;
+
+// The health record for a compaction tick that did not compact. A skip because the
+// reviewer could not be reached — none registered, gone between the scans, mid-turn,
+// or another sender on the pane — did not try, so it holds the row's result. A skip
+// because nothing is due is clean, and the remote-node skip stays `expected`.
+const COMPACT_UNREACHABLE_RE = /^(no live reviewer session|reviewer session disappeared|reviewer is mid-turn|injection busy)/;
+
+function compactSkipHealth(result) {
+  const held = result.expected !== true && COMPACT_UNREACHABLE_RE.test(String(result.why || ''));
+  return {
+    ok: true, skipped: true, expected: result.expected === true, detail: result.why || 'nothing due',
+    ...(held ? { holdResult: true } : {}),
+  };
+}
+
 function recordTickOutcome(result, record = health.record) {
+  const held = !result.sent && REVIEW_UNREACHABLE_RE.test(String(result.why || ''));
   record('review', {
     ok: true, skipped: !result.sent, cadenceMs: reviewCadenceMs(),
     detail: result.sent ? `sent ${result.ranked} cards` : 'nothing due',
+    ...(held ? { holdResult: true } : {}),
   });
   if (result.sent) process.stderr.write('keep review: woke reviewer ' + result.sessionId + ' for ' + result.ranked + ' card(s)\n');
   else if (result.why && !/nothing ranked|last tick|no live reviewer/.test(result.why)) {
@@ -4752,7 +4775,8 @@ function recordTickOutcome(result, record = health.record) {
 function recordTickError(e, record = health.record) {
   // Another sender holding the injection lock is a skip, not a failure; a modal or
   // an unresolvable pane is the real thing and must count.
-  if (/injection is busy/i.test(String(e && e.message || e))) record('review', { ok: true, skipped: true, cadenceMs: reviewCadenceMs(), detail: 'injection busy' });
+  // It did not try, so the skip holds the row's result.
+  if (/injection is busy/i.test(String(e && e.message || e))) record('review', { ok: true, skipped: true, holdResult: true, cadenceMs: reviewCadenceMs(), detail: 'injection busy' });
   else record('review', { ok: false, cadenceMs: reviewCadenceMs(), error: e });
   process.stderr.write('keep review: tick failed: ' + (e && e.message || e) + '\n');
 }
@@ -4902,7 +4926,7 @@ function startScheduler(deps) {
     compactInFlight = true;
     reviewerCompactTick(deps)
       .then((result) => {
-        if (result.skipped) health.record('review-compact', { ok: true, skipped: true, expected: result.expected === true, detail: result.why || 'nothing due' });
+        if (result.skipped) health.record('review-compact', compactSkipHealth(result));
         else if (result.compacted) health.record('review-compact', { ok: true, detail: `compacted ${result.sessionId}` });
         else health.record('review-compact', { ok: false, error: result.why || 'compaction failed' });
       })
@@ -4923,6 +4947,7 @@ module.exports = {
   bundleTimeContext,
   recordTickOutcome,
   recordTickError,
+  compactSkipHealth,
   REVIEW_DIR,
   REVIEW_EVENTS_FILE,
   REVIEW_EVENTS_ARCHIVE_FILE,

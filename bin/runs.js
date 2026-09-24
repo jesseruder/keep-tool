@@ -1089,6 +1089,18 @@ function startDueProbe(task, onSettled = () => {}) {
 }
 
 const deferrals = new Map(); // taskId -> { day, count }
+// Cards whose check open failed for good, and the day: the card is marked opened for
+// the day (markDay) and is not retried, so a later tick that reaches it does nothing
+// for it and must not count it as work, or that tick records ok and wipes the streak
+// the failure started. With nothing else to do those ticks record a skip that holds
+// the failure (bin/health.js record, holdResult) for the rest of that day rather than
+// reading the row as recovered.
+const givenUp = new Map(); // taskId -> day
+function givenUpToday() {
+  const today = keep.nowStamp().slice(0, 10);
+  for (const [id, day] of givenUp) if (day !== today) givenUp.delete(id);
+  return givenUp.size > 0;
+}
 let tickInFlight = false;
 async function schedulerTick() {
   if (tickInFlight) return;
@@ -1134,6 +1146,7 @@ async function schedulerTick() {
         require('./delivery').acknowledge(path.join(keep.ROOT, '.keep', 'delivery'), checkDeliveryMessage(t), checkDeliveryKey(t));
         continue;
       }
+      const workBefore = didWork;
       didWork = true;
 
       // An unconfirmed typed attempt may already be executing. Reconcile its
@@ -1209,6 +1222,9 @@ async function schedulerTick() {
           else if (handled.noticed) deferralNotices += 1;
           continue;
         }
+        // A card whose open already failed for good today reaches here with nothing
+        // tried for it (no thread took the check either), so it is not this tick's work.
+        if (outcome.skipped === 'opened-today' && givenUp.get(t.id) === today) didWork = workBefore;
         if (outcome.skipped) continue;
         clearBudgetDeferral(t.id, today);
         const { delivery, errors } = outcome;
@@ -1217,7 +1233,7 @@ async function schedulerTick() {
         onChange();
       } catch (e) {
         if (!isTransientStartError(e)) markDay('opened', t.id, today);
-        if (!isTransientStartError(e)) tickErrors.push(e);
+        if (!isTransientStartError(e)) { tickErrors.push(e); givenUp.set(t.id, today); }
         process.stderr.write(`keep runs: could not open a check session for ${t.id}: ${e.message}\n`);
       }
     }
@@ -1228,7 +1244,8 @@ async function schedulerTick() {
   } finally {
     health.record('runs', tickErrors.length
       ? { ok: false, error: tickErrors.map((error) => String(error && error.message || error)).join('; ') }
-      : { ok: true, skipped: !didWork, detail: didWork ? undefined : 'nothing due' });
+      : didWork ? { ok: true, skipped: false, detail: undefined }
+        : { ok: true, skipped: true, detail: 'nothing due', ...(givenUpToday() ? { holdResult: true } : {}) });
     tickInFlight = false;
   }
 }

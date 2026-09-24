@@ -459,9 +459,10 @@ function startSchedulers(ctx) {
         const failed = result.skipped.find((item) => item.pid == null);
         const mb = Math.round(result.stopped.reduce((sum, item) => sum + item.rssKb, 0) / 1024);
         // Missing host or process evidence is a sweep that did not run, not a fault:
-        // host list timeouts under load are routine and must not open self-repair.
+        // host list timeouts under load are routine and must not open self-repair. Nor
+        // is it a sweep, so the skip holds the row's result (bin/health.js record).
         health.record('leftovers', failed
-          ? (failed.evidence ? { ok: true, skipped: true, detail: failed.why } : { ok: false, error: failed.why })
+          ? (failed.evidence ? { ok: true, skipped: true, holdResult: true, detail: failed.why } : { ok: false, error: failed.why })
           : { ok: true, detail: `${result.stopped.length} stopped${mb ? ` (${mb} MB)` : ''}, ${result.waiting.length} in grace` });
       } catch (error) {
         health.record('leftovers', { ok: false, error });
@@ -928,7 +929,8 @@ function startSchedulers(ctx) {
   startLoopLagProbe({ health });
   const pull = hold('git-pull', createRegistryPull({ keep, health }));
   if (process.env.KEEP_SYNC === '1') {
-    health.record('git-pull', { skipped: true });
+    // A start is not a pull: the placeholder holds the row's result (bin/health.js record).
+    health.record('git-pull', { skipped: true, holdResult: true });
     setInterval(pull, 30 * 60e3).unref();
     setTimeout(pull, 60e3).unref();
   } else {

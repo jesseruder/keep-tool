@@ -294,7 +294,8 @@ function startScheduler(options = {}) {
     health.record('discord', { disabled: true, detail: 'not enabled', cadenceMs });
     return null;
   }
-  health.record('discord', { skipped: true, detail: 'waiting for first poll', cadenceMs });
+  // A start is not a run: the placeholder holds the row's result (bin/health.js record).
+  health.record('discord', { skipped: true, holdResult: true, detail: 'waiting for first poll', cadenceMs });
   let running = false;
   // Whether the last tick already found the reader unavailable. The log line belongs to
   // the transition into that state, not to every tick that finds the tab still closed.

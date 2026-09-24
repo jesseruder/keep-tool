@@ -3167,11 +3167,11 @@ test('auto-compact tick honours a request with the sweep off, clears it once att
 
   // A lock the tick cannot take is a retryable skip: the request stays for the next tick.
   const busy = await autoCompactTick({ ...deps, withInjectionLock: async () => { throw new InjectionError(429, 'busy'); } });
-  assert.deepEqual(busy, { ok: true, detail: 'nothing due' });
+  assert.deepEqual(busy, { ok: true, detail: 'nothing due', holdResult: true });
   assert.deepEqual(cleared, []);
   // So is a session that moved on between the scan and the lock.
   const moved = await autoCompactTick({ ...deps, loadCurrentSession: (id) => ({ ...sessions.find((s) => s.id === id), mtime: now }) });
-  assert.deepEqual(moved, { ok: true, detail: 'nothing due' });
+  assert.deepEqual(moved, { ok: true, detail: 'nothing due', holdResult: true });
   assert.deepEqual(cleared, []);
 
   const outcome = await autoCompactTick(deps);

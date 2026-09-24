@@ -8498,7 +8498,10 @@ async function autoCompactTick(deps = {}) {
       attempted = true;
       break;
     }
-    if (!attempted) return { ok: true, detail: 'nothing due' };
+    // Every candidate was held back (a busy pane, a precheck, a session that left the
+    // window): the tick did not try, so the skip holds the row's result rather than
+    // reading a standing failure as recovered (bin/health.js record, holdResult).
+    if (!attempted) return { ok: true, detail: 'nothing due', holdResult: true };
     // The request is spent once an attempt was made, whatever its outcome: the stamp
     // says what happened, and a retryable skip above never reaches here, so that
     // request waits for the next tick. An agent that still wants it can ask again. A
@@ -8563,7 +8566,7 @@ function startAutoCompact() {
     try {
       const result = await autoCompactTick();
       health.record('auto-compact', result.ok
-        ? { ok: true, detail: result.detail }
+        ? { ok: true, detail: result.detail, ...(result.holdResult ? { holdResult: true } : {}) }
         : { ok: false, error: result.error, detail: result.detail });
     }
     catch (e) {
@@ -15241,7 +15244,11 @@ function startBriefScheduler(options = {}) {
       if (recorded) {
         health.record('brief', { ok: false, error: 'no successful delivery by 12:00 local' });
         process.stderr.write(`keep serve: morning brief failed; giving up after 12:00 local\n`);
-      } else health.record('brief', { ok: true, skipped: true, detail: 'nothing due' });
+        // After the cutoff nothing is retried until tomorrow, so these skips hold the
+        // result (bin/health.js record): a brief that gave up is not recovered because
+        // the afternoon has nothing due. After a delivered brief there is no failure to
+        // hold and the skip stays a clean one.
+      } else health.record('brief', { ok: true, skipped: true, holdResult: true, detail: 'nothing due' });
       return;
     }
     if (!briefDue(meta, now, clock)) {

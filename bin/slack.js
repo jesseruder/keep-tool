@@ -1320,7 +1320,9 @@ function startScheduler(options = {}) {
     health.record('slack', { disabled: true, detail: 'no channels configured' });
     return null;
   }
-  health.record('slack', { skipped: true });
+  // A start is not a run: the placeholder holds whatever the last daemon left (bin/health.js
+  // record, holdResult), so a standing failure is not read as recovered by a restart.
+  health.record('slack', { skipped: true, holdResult: true });
   let running = false;
   // The reset a deferral was last logged for: said once per retryAt, not per poll.
   let deferredLoggedFor = null;
@@ -1353,8 +1355,9 @@ function startScheduler(options = {}) {
     } catch (error) {
       if (error && error.code === 'ACCOUNT_DEFERRED') {
         // The automation pool is spent: the classifier was never started, and the
-        // messages stay behind the cursor for the poll after the reset. Not a fault.
-        health.record('slack', { ok: true, skipped: true, detail: error.message });
+        // messages stay behind the cursor for the poll after the reset. Not a fault,
+        // but not a run either: the skip holds the row's result.
+        health.record('slack', { ok: true, skipped: true, holdResult: true, detail: error.message });
         if (deferredLoggedFor !== error.retryAt) {
           deferredLoggedFor = error.retryAt;
           log(`keep slack: ${error.message}\n`);

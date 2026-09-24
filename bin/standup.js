@@ -519,7 +519,8 @@ function recordFailure(error, state = {}, deps = {}) {
   const healthApi = deps.health || health;
   const log = deps.log || ((line) => process.stderr.write(line));
   if (error && error.code === 'ACCOUNT_DEFERRED') {
-    healthApi.record('standup', { ok: true, skipped: true, detail: error.message });
+    // Not a run either: the skip holds the row's result (bin/health.js record).
+    healthApi.record('standup', { ok: true, skipped: true, holdResult: true, detail: error.message });
     if (state.deferredLoggedFor !== error.retryAt) {
       state.deferredLoggedFor = error.retryAt;
       log(`keep standup: ${error.message}\n`);

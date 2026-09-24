@@ -276,8 +276,8 @@ test('a standup the account policy deferred is a healthy skip, logged once per r
   const deferred = (retryAt) => Object.assign(new Error('automation pool exhausted for claude-sonnet-5'), { code: 'ACCOUNT_DEFERRED', retryAt });
   recordFailure(deferred(1000), state, deps);
   recordFailure(deferred(1000), state, deps);
-  assert.deepEqual(records.map((row) => [row.name, row.options.ok, row.options.skipped]),
-    [['standup', true, true], ['standup', true, true]]);
+  assert.deepEqual(records.map((row) => [row.name, row.options.ok, row.options.skipped, row.options.holdResult]),
+    [['standup', true, true, true], ['standup', true, true, true]], 'a deferral did not run, so it holds the result');
   assert.equal(lines.length, 1);
   recordFailure(deferred(2000), state, deps);
   assert.equal(lines.length, 2, 'a new reset is said again');

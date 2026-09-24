@@ -1411,7 +1411,8 @@ function startScheduler({ onChange } = {}) {
       });
     } catch (error) {
       // A spent automation pool is waited out, not a failure: the next tick asks again.
-      if (error && error.code === 'ACCOUNT_DEFERRED') health.record('landed', { ok: true, skipped: true, detail: error.message });
+      // Nor is it a run, so the skip holds the row's result.
+      if (error && error.code === 'ACCOUNT_DEFERRED') health.record('landed', { ok: true, skipped: true, holdResult: true, detail: error.message });
       else health.record('landed', { ok: false, error, detail: 'spawn failed' });
       process.stderr.write(`keep landed: ${error.message}\n`);
       running = false;

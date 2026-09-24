@@ -29,7 +29,7 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     schedulers: [
       { name: 'runs', state: 'ok', displayState: 'ok', detail: 'processed 4 runs', displayDetail: 'processed 4 runs', lastError: 'recovered old error' },
       { name: 'review', state: 'ok', displayState: 'warning', displayDetail: '1 failed attempt · last failed attempt 13h ago · timeout <img id="health-injection">' },
-      { name: 'unblock', state: 'recovered', displayState: 'recovered', consecutiveFailures: 3, displayDetail: 'last failed 21h ago (scan timed out) · 3 failed attempts · latest check skipped 1m ago · awaiting a real run' },
+      { name: 'unblock', state: 'recovered', displayState: 'warning', consecutiveFailures: 3, displayDetail: 'last failed 21h ago (scan timed out) · 3 failed attempts · latest check skipped 1m ago · awaiting a real run' },
     ],
   }, usage: {}, review: { events: [], stats: {} }, limitResume: {} };
   sessions.push({ id: 'recent-only', kind: 'claude', title: 'Recent only', project: '/tmp/recent-fixture', state: 'exited', exited: true, endedTurn: true, lastUserAt: Date.now() - 60000, mtime: Date.now() - 60000 });
@@ -163,7 +163,8 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     assert.equal(await evaluate("document.querySelector('#health').classList.contains('warning') && !document.querySelector('#health').classList.contains('bad')"), true);
     assert.equal(await evaluate("document.querySelector('#health .pop').textContent.includes('processed 4 runs') && !document.querySelector('#health .pop').textContent.includes('recovered old error')"), true);
     assert.equal(await evaluate("document.querySelector('#health .pop').textContent.includes('last failed attempt 13h ago') && !document.querySelector('#health-injection')"), true);
-    // A recovered streak is amber like a warning, never red.
+    // A recovered streak is amber like a warning, never red, and is named for its state
+    // (the daemon sends displayState 'warning' so older console JS colors it too).
     assert.equal(await evaluate("[...document.querySelectorAll('#health .pop dd')].find((dd) => dd.textContent.startsWith('recovered · last failed 21h ago'))?.className"), 'warning');
     state.health = { daemon: { running: true, pid: 321 }, schedulers: [] };
     for (const client of eventClients) client.write('data: changed\n\n');

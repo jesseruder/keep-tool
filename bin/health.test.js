@@ -102,14 +102,24 @@ test('an expected state clears the streak, marks the row, and any later record u
   assert.equal(inherited.lastResult, 'failed');
   assert.equal(inherited.displayState, 'warning');
   assert.equal(inherited.expected, false);
+  // A plain skip is clean, but inside the recent-failure window the fault still stands.
   health.record('usage', { ok: true, skipped: true, detail: 'nothing due', at: 11000 });
-  const clean = health.snapshot(11000).schedulers.find((entry) => entry.name === 'usage');
+  let clean = health.snapshot(11000).schedulers.find((entry) => entry.name === 'usage');
   assert.equal(clean.consecutiveFailures, 1);
   assert.equal(clean.lastResult, 'skipped');
-  assert.equal(clean.displayState, 'recovered');
+  assert.equal(clean.displayState, 'warning');
+  assert.equal(clean.state, 'skipped');
+  // Past it, the same row reads as recovered.
+  clean = health.snapshot(9000 + 2 * 3600e3).schedulers.find((entry) => entry.name === 'usage');
+  assert.equal(clean.state, 'recovered');
+
+  // A holding skip after a success never names a success for itself.
+  health.record('slack', { ok: true, at: 12000 });
+  health.record('slack', { skipped: true, holdResult: true, at: 13000 });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8')).slack.lastResult, 'skipped');
 });
 
-test('a streak reads as failing only while its latest attempt failed', () => {
+test('a streak reads as failing while its fault stands: latest attempt failed or failure recent', () => {
   const { root, health } = fixture();
   const now = 30 * 3600e3;
   health.record('daemon', { at: now - 29 * 3600e3, pid: process.pid });
@@ -126,7 +136,8 @@ test('a streak reads as failing only while its latest attempt failed', () => {
   let value = row(now);
   assert.equal(value.consecutiveFailures, 3);
   assert.equal(value.state, 'recovered');
-  assert.equal(value.displayState, 'recovered');
+  assert.equal(value.displayState, 'warning', 'older console JS colors warning amber');
+  assert.equal(health.labelOf(value, now), 'recovered');
   assert.equal(value.displayDetail, 'last failed 21h ago (unblock scan timed out) · 3 failed attempts · latest check skipped 60s ago · awaiting a real run');
   assert.equal(health.attentionItems(health.snapshot(now), now).some((item) => item.id === 'health:unblock'), false);
   assert.doesNotMatch(health.reviewSection(health.snapshot(now), now), /unblock/);
@@ -147,6 +158,53 @@ test('a streak reads as failing only while its latest attempt failed', () => {
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8')).unblock.lastRunAt, now + 4);
 });
 
+test('a scheduler that fails every real attempt with clean skips between stays failing', () => {
+  const { health } = fixture();
+  const now = 30 * 3600e3;
+  health.record('daemon', { at: now - 29 * 3600e3, pid: process.pid });
+  const row = (at) => health.snapshot(at).schedulers.find((entry) => entry.name === 'unblock');
+  // Real work every 20 minutes, failing each time, "nothing due" every minute between.
+  let at = now - 3 * 3600e3;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    health.record('unblock', { ok: false, error: 'scan timed out', at });
+    for (let minute = 1; minute < 20; minute += 1) {
+      health.record('unblock', { ok: true, detail: 'nothing due', at: at + minute * 60e3 });
+      const value = row(at + minute * 60e3);
+      // Under three it is the amber warning it always was; from three on, red.
+      assert.deepEqual([value.state, value.displayState], attempt >= 2 ? ['failing', 'failing'] : ['skipped', 'warning'], `attempt ${attempt} minute ${minute}`);
+    }
+    at += 20 * 60e3;
+  }
+  // An hour (the floor, two cadences of a one-minute scheduler being less) after the
+  // last failure with nothing but clean skips, it reads as recovered.
+  const lastFailure = at - 20 * 60e3;
+  health.record('unblock', { ok: true, detail: 'nothing due', at: lastFailure + 61 * 60e3 });
+  assert.equal(row(lastFailure + 61 * 60e3).state, 'recovered');
+
+  // The window is the longer of an hour and two cadences, capped at a day.
+  assert.equal(health.recentFailureMs({ name: 'unblock' }), 3600e3);
+  assert.equal(health.recentFailureMs({ name: 'landed' }), 3600e3);
+  assert.equal(health.recentFailureMs({ name: 'review', cadenceMs: 120 * 60e3 }), 4 * 3600e3);
+  assert.equal(health.recentFailureMs({ name: 'brief' }), 86400e3);
+  // So a brief that gave up at noon is still failing the next morning before its run.
+  const brief = { name: 'brief', consecutiveFailures: 9, lastErrorAt: now - 20 * 3600e3, lastRunAt: now - 60e3, lastResult: 'skipped', cadenceMs: 86400e3, daemonStartedAt: now - 3600e3 };
+  assert.equal(health.stateOf(brief, now), 'failing');
+  assert.equal(health.stateOf({ ...brief, lastErrorAt: now - 25 * 3600e3 }, now), 'recovered');
+});
+
+test('a recovered row still goes silent or never when its scheduler stops', () => {
+  const { health } = fixture();
+  const now = 100 * 3600e3;
+  // A five-minute scheduler, streak 3, clean skip since, then 72 hours of nothing.
+  const leftovers = { name: 'leftovers', cadenceMs: 5 * 60e3, consecutiveFailures: 3, lastError: 'x',
+    lastErrorAt: now - 73 * 3600e3, lastRunAt: now - 72 * 3600e3, lastResult: 'skipped', daemonStartedAt: now - 80 * 3600e3 };
+  assert.equal(health.stateOf(leftovers, now), 'silent');
+  // Not run since this boot, past the grace.
+  assert.equal(health.stateOf({ ...leftovers, daemonStartedAt: now - 3600e3 }, now), 'never');
+  // Still ticking: recovered.
+  assert.equal(health.stateOf({ ...leftovers, lastRunAt: now - 60e3 }, now), 'recovered');
+});
+
 test('rows written before lastResult existed are read from their timestamps', () => {
   const { health } = fixture();
   const now = 10 * 60e3;
@@ -155,11 +213,13 @@ test('rows written before lastResult existed are read from their timestamps', ()
   const failed = { ...base, lastRunAt: now, lastErrorAt: now, lastOkAt: now - 5e3 };
   assert.equal(health.resultOf(failed), 'failed');
   assert.equal(health.stateOf(failed, now), 'failing');
-  // A skip moved lastRunAt past it.
+  // A skip moved lastRunAt past it: failing while the failure is recent, then recovered.
   const skipped = { ...base, lastRunAt: now, lastErrorAt: now - 30e3, lastOkAt: now - 60e3 };
   assert.equal(health.resultOf(skipped), 'skipped');
-  assert.equal(health.stateOf(skipped, now), 'recovered');
-  assert.equal(health.presentationOf({ ...skipped, state: 'recovered' }, now).displayState, 'recovered');
+  assert.equal(health.stateOf(skipped, now), 'failing');
+  const later = now + 2 * 3600e3;
+  assert.equal(health.stateOf({ ...skipped, lastRunAt: later }, later), 'recovered');
+  assert.equal(health.presentationOf({ ...skipped, state: 'recovered' }, later).displayState, 'warning');
   // A success is the latest record.
   assert.equal(health.resultOf({ lastRunAt: now, lastOkAt: now, lastErrorAt: now - 1 }), 'ok');
   // Nothing recorded at all.
@@ -183,13 +243,13 @@ test('snapshot and CLI presentation separate recovered errors from unresolved fa
   assert.doesNotMatch(health.render({ daemon: { running: true, pid: 1, startedAt: now - 19 * 3600e3 }, schedulers: [row] }, now), /recovered <old> error/);
 
   health.record('review', { ok: false, error: 'timeout <unsafe>', at: now - 13 * 3600e3 });
-  health.record('review', { skipped: true, at: now - 3600e3 });
+  health.record('review', { skipped: true, at: now - 6 * 60e3 });
   row = health.snapshot(now).schedulers.find((entry) => entry.name === 'review');
-  assert.equal(row.state, 'recovered', 'a clean skip since the failure reads as recovered');
-  assert.equal(row.displayState, 'recovered');
-  assert.match(row.displayDetail, /^last failed 13h ago \(timeout <unsafe>\) · 1 failed attempt · latest check skipped 60m ago · awaiting a real run$/);
+  assert.equal(row.state, 'recovered', 'a clean skip long after the failure reads as recovered');
+  assert.equal(row.displayState, 'warning');
+  assert.match(row.displayDetail, /^last failed 13h ago \(timeout <unsafe>\) · 1 failed attempt · latest check skipped 6m ago · awaiting a real run$/);
   assert.equal(health.attentionItems(health.snapshot(now), now).some((item) => item.id === 'health:review'), false);
-  assert.match(health.render({ daemon: { running: true, pid: 1, startedAt: now - 19 * 3600e3 }, schedulers: [row] }, now), /review\s+recovered\s+60m ago\s+never\s+1\s+last failed 13h ago/);
+  assert.match(health.render({ daemon: { running: true, pid: 1, startedAt: now - 19 * 3600e3 }, schedulers: [row] }, now), /review\s+recovered\s+6m ago\s+never\s+1\s+last failed 13h ago/);
 
   health.record('review', { ok: false, error: 'timeout again', at: now - 5 * 60e3 });
   row = health.snapshot(now).schedulers.find((entry) => entry.name === 'review');

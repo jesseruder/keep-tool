@@ -974,6 +974,14 @@ test('daemon-health names a streak only while its latest attempt failed', () => 
       write(unblock);
       assert.match(lint({ root, rule: 'daemon-health', now }).findings[0].text, /^unblock: 3 consecutive failures: scan timed out/);
     }
+    // Clean skips since, but the failure is recent for the row's cadence: still named.
+    write({ consecutiveFailures: 3, lastOkAt: now - 3600e3, lastErrorAt: now - 20 * 60e3, lastRunAt: now - 60e3, lastResult: 'skipped' });
+    assert.match(lint({ root, rule: 'daemon-health', now }).findings[0].text, /^unblock: 3 consecutive failures/);
+    // A recovered row that never succeeded is late from its last failure.
+    write({ consecutiveFailures: 2, lastErrorAt: now - 30 * 3600e3, lastRunAt: now - 60e3, lastResult: 'skipped' });
+    assert.match(lint({ root, rule: 'daemon-health', now }).findings[0].text, /^unblock: never succeeded; last failed 30h ago: scan timed out/);
+    write({ consecutiveFailures: 2, lastErrorAt: now - 2 * 3600e3, lastRunAt: now - 60e3, lastResult: 'skipped' });
+    assert.deepEqual(lint({ root, rule: 'daemon-health', now }).findings, []);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

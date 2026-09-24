@@ -113,6 +113,9 @@ test('a streak the scheduler has run cleanly past opens nothing once its last fa
   // Clean since, but the failure is recent: work that fails whenever it comes, with
   // skips between, is still a fault.
   assert.deepEqual(names([{ ...row, lastErrorAt: NOW - 20 * 60e3, lastRunAt: NOW - 60e3, lastResult: 'skipped' }]), ['unblock']);
+  // The window is health's: two cadences when that is longer than an hour.
+  assert.deepEqual(names([{ ...row, cadenceMs: 3 * 3600e3, lastErrorAt: NOW - 5 * 3600e3, lastRunAt: NOW - 60e3, lastResult: 'skipped' }]), ['unblock']);
+  assert.deepEqual(names([{ ...row, lastErrorAt: NOW - 61 * 60e3, lastRunAt: NOW - 60e3, lastResult: 'skipped' }]), []);
   // Clean since and the failure is 21 hours old: recovered, not broken.
   assert.deepEqual(names([{ ...row, lastErrorAt: NOW - 21 * 3600e3, lastRunAt: NOW - 60e3, lastResult: 'skipped' }]), []);
   // The same row written before lastResult existed reads the same from its timestamps.

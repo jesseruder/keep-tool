@@ -890,7 +890,8 @@ test('a poll the account policy deferred is a healthy skip, logged once per rese
     await scheduler.tick();
     await scheduler.tick();
     const polls = records.filter((row) => row.name === 'slack').slice(1);
-    assert.deepEqual(polls.map((row) => [row.options.ok, row.options.skipped]), [[true, true], [true, true]]);
+    assert.deepEqual(polls.map((row) => [row.options.ok, row.options.skipped, row.options.holdResult]), [[true, true, true], [true, true, true]]);
+    assert.deepEqual(records.filter((row) => row.name === 'slack')[0].options, { skipped: true, holdResult: true }, 'the start placeholder holds');
     assert.match(polls[0].options.detail, /automation pool exhausted/);
     assert.equal(lines.length, 1, 'said once for this reset');
     retryAt += 3600e3;
