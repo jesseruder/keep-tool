@@ -683,7 +683,7 @@ async function reopenSession({ sessionId, taskId, agent, title, stalePane, proje
     accountId: currentAccountId, requireRecordedAccount: !freshCard, showModel: freshCard, confirmLabel: freshCard ? 'Start conversation' : 'Reopen',
     // Only a card's first conversation picks a machine: an existing one resumes where it runs.
     chooseNode: freshCard,
-    models: freshCard ? { claude: 'claude-fable-5-1', codex: '' } : undefined,
+    models: freshCard ? defaultModels() : undefined, defaultModels: freshCard,
     onTransfer: sessionId ? () => openPortableTransfer(ctx, sessionId) : null,
     async onSubmit(selection) {
       const key = taskId ? `task:${taskId}` : `session:${sessionId}`;

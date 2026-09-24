@@ -183,10 +183,36 @@ test('Make this the default saves the chosen model for that provider only', asyn
   modal.close(); await done;
 });
 
+test('the default note sits outside the Model label, so clicking "Model" cannot press it', async () => {
+  store.clear();
+  const { modal, done } = open(undefined, { models: { claude: 'claude-sonnet-5' }, defaultModels: true });
+  const field = /<div class="session-launch-model">([\s\S]*?)<\/div>/.exec(modal.innerHTML)?.[1] || '';
+  assert.match(field, /^<label for="session-launch-model-\d+">Model<\/label><span><button[^>]*data-launch-model-default/);
+  assert.match(field, /<select id="session-launch-model-\d+" data-launch-model/);
+  modal.close(); await done;
+});
+
+test('an Other… model always offers the save, even when it starts equal to the default', async () => {
+  store.clear();
+  const { modal, done } = open(undefined, { models: defaultModels(), defaultModels: true });
+  modal.querySelector('[data-launch-model]').fire('change', { target: { value: '__other__' } });
+  assert.match(modal.innerHTML, /data-launch-model-default/);
+  modal.querySelector('[data-launch-model-custom]').fire('input', { target: { value: ' claude-foo ' } });
+  modal.querySelector('[data-launch-model-default]').fire('click');
+  assert.equal(defaultModels().claude, 'claude-foo');
+  modal.close(); await done;
+
+  const reopened = open(undefined, { models: defaultModels(), defaultModels: true });
+  assert.match(reopened.modal.innerHTML, /<option value="__other__" selected>/);
+  assert.match(reopened.modal.innerHTML, /data-launch-model-custom[^>]*value="claude-foo"/);
+  reopened.modal.close(); await reopened.done;
+  store.clear();
+});
+
 test('without defaultModels the chooser shows no default note, as a reopen does', async () => {
   store.clear();
   const { modal, done } = open(undefined, { models: { claude: 'claude-fable-5-1' } });
-  const select = /<select data-launch-model[^>]*>[\s\S]*?<\/select>/.exec(modal.innerHTML)?.[0] || '';
+  const select = /<select [^>]*data-launch-model[^>]*>[\s\S]*?<\/select>/.exec(modal.innerHTML)?.[0] || '';
   assert.ok(select, 'Model select rendered');
   assert.doesNotMatch(select, /· default/);
   assert.doesNotMatch(modal.innerHTML, /Your default|data-launch-model-default/);

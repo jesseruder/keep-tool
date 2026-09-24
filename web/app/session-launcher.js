@@ -117,12 +117,15 @@ export function openSessionChooser(ctx, options) {
     const defaults = options.defaultModels === true ? defaultModels() : null;
     const defaultTag = (value) => (defaults && defaults[state.kind] === value ? ' · default' : '');
     const modelOptions = [['', 'Account default' + defaultTag('')], ...(modelPresets[state.kind] || []).map((id) => [id, id + defaultTag(id)]), [OTHER_MODEL, 'Other…']];
+    // A typed "Other…" id is not re-rendered per keystroke, so it always offers the save.
     const modelNote = !defaults ? ''
-      : defaults[state.kind] === model.trim() ? '<span>Your default for new sessions</span>'
+      : !customModel && defaults[state.kind] === model.trim() ? '<span>Your default for new sessions</span>'
         : `<span><button class="linkish" type="button" data-launch-model-default ${locked}>Make this the default</button></span>`;
+    // With a note the field is a div, not a label: a label would adopt the note's button
+    // as its control, so clicking "Model" would save the default.
     const modelField = state.kind === 'shell' || options.showModel === false ? ''
-      : `<label>Model${modelNote}<select data-launch-model ${locked}>${modelOptions.map(([value, text]) => `<option value="${ctx.esc(value)}" ${value === selectedModel ? 'selected' : ''}>${ctx.esc(text)}</option>`).join('')}</select>${customModel
-        ? `<input data-launch-model-custom aria-label="Model id" autocomplete="off" spellcheck="false" ${locked} value="${ctx.esc(model)}" placeholder="Model id">` : ''}</label>`;
+      : `${defaults ? `<div class="session-launch-model"><label for="session-launch-model-${runId}">Model</label>${modelNote}` : '<label>Model'}<select id="session-launch-model-${runId}" data-launch-model ${locked}>${modelOptions.map(([value, text]) => `<option value="${ctx.esc(value)}" ${value === selectedModel ? 'selected' : ''}>${ctx.esc(text)}</option>`).join('')}</select>${customModel
+        ? `<input data-launch-model-custom aria-label="Model id" autocomplete="off" spellcheck="false" ${locked} value="${ctx.esc(model)}" placeholder="Model id">` : ''}${defaults ? '</div>' : '</label>'}`;
     const nodeField = !nodeChoice() ? ''
       : state.kind === 'pi'
         ? `<label>Machine <span>Pi sessions run on this machine only</span><select data-launch-node disabled><option value="${ctx.esc(daemonNode)}" selected>${ctx.esc(nodeLabel(nodes.find((node) => node.daemon) || { name: daemonNode, daemon: true }))}</option></select></label>`
