@@ -101,7 +101,7 @@ const MISC_PRESENCE = [
 // Home's own children that are never project roots and are large to walk.
 const SKIP_HOME_CHILDREN = new Set(['Library', 'Applications', 'Pictures', 'Music', 'Movies', 'Downloads', 'node_modules', 'snap']);
 // A name (an env variable, a JSON or TOML key, a flag) that says its value is secret.
-const SECRET_NAME = /token|secret|pass|pwd|key|credential|auth|cookie|private|session|header|dsn|webhook|(?:^|[_-])(?:pw|pat|cred|login|bearer)(?:$|[_-])/i;
+const SECRET_NAME = /token|secret|pass|pwd|key|credential|auth|cookie|private|session|header|dsn|webhook|(?:^|[_-])(?:pw|pat|cred|login|bearer|pin)(?:$|[_-])/i;
 // Report sections each collection group writes, for naming what a deadline cut short.
 const GROUP_SECTIONS = {
   env: ['env'], system: ['system'], pi: ['pi'], keep: ['keep'], repos: ['repo'], logins: ['login'], android: ['android'],
@@ -164,9 +164,10 @@ function readsAsName(text, { executable = false, extra = '' } = {}) {
 function credentialFlag(flag) {
   const text = String(flag || '');
   if (/^-[A-Za-z]$/.test(text)) return /^-[upH]$/.test(text);
-  if (!/^--?[A-Za-z][A-Za-z0-9_-]+$/.test(text)) return false;
+  if (!/^--?[A-Za-z][A-Za-z0-9_.-]+$/.test(text)) return false;
+  // The whole name and its last dotted segment (--db.password), in kebab form.
   const name = text.replace(/^-+/, '').replace(/_/g, '-');
-  return /^(?:user|pw|pass|header)$/i.test(name) || SECRET_NAME.test(name);
+  return [name, name.split('.').pop()].some((part) => /^(?:user|pw|pass|header)$/i.test(part) || SECRET_NAME.test(part));
 }
 
 function embeddedUrl(url, hash = defaultHash) {
@@ -210,7 +211,7 @@ function safeUrl(value, hash = defaultHash) {
 }
 
 const SHELL_OPERATOR = /^(?:&&|\|\||\||;|&|>|>>|<|2>&1|2>\/dev\/null)$/;
-const FLAG = /^(--?)([A-Za-z][A-Za-z0-9_-]*)$/;
+const FLAG = /^(--?)([A-Za-z][A-Za-z0-9_.-]*)$/;
 // The only characters a shown token may contain (a URL is judged by safeUrl instead).
 const TOKEN_CHARS = /^[A-Za-z0-9_./~+-]+$/;
 const SCRUB_MAX_CHARS = 4096;
@@ -237,60 +238,114 @@ function showFlag(dashes, body) {
 //     secret;
 // and `***` otherwise: anything with a quote, $, a backtick, a bracket, a brace, a
 // backslash, a colon, @, %, a comma, a non-ASCII character, or that does not read as
-// a name. The word after a credential flag (-u, -p, -H, --password, --api_key, …) is
-// `***` whatever it is, and a value glued to -p/-u/-H is masked. No span, quote or
-// pair is parsed, so there is nothing for a quoting trick to get past.
+// a name. The word after a credential flag (-u, -p, -H, --password, --api_key,
+// --db.password, and the same names with one dash: -pw, -password) is `***`
+// whatever it is, as is the word after a group of letters holding a credential one
+// (-vp), after a compound secret key (db.password, api_key), after a secret word and
+// a separator standing on its own (`password = x`), after `password=` with nothing
+// on its right, and after a token masked whole that names a secret inside it. A
+// value glued to -p/-u/-H is masked. No span, quote or pair is parsed, so there is
+// nothing for a quoting trick to get past.
 function allowlist(tokens, { rel = (value) => value, hash = defaultHash, executableFirst = false } = {}) {
   const out = [];
   let masked = false;
   let hideNext = false;
   let hideRest = false;
+  // Whether the token before was a bare word that says secret: `password = x` and
+  // `password : x` hide x, but a secret-sounding word alone hides nothing.
+  let afterSecretWord = false;
   const mask = () => { masked = true; return '***'; };
-  tokens.forEach((token, index) => {
-    if (hideRest) { out.push(mask()); return; }
-    // A quote, a backtick, a backslash or a parenthesis starts something whose end
-    // is not looked for: every token from it on is masked, so a plain word inside a
-    // quoted or substituted span is never shown by being plain. Checked before the
-    // word-after-a-flag rule, which would otherwise mask only this one token.
-    if (/["'`\\()]/.test(token)) { hideRest = true; out.push(mask()); return; }
-    if (hideNext) { hideNext = false; out.push(mask()); return; }
+  // One token's shown form. It may also set what the following tokens get:
+  // hideNext (a credential flag, `password=`, bearer), hideRest (a secret header
+  // name) or afterSecretWord (a bare secret word).
+  const classify = (token, index) => {
     // A secret name used as a header or a key (`Authorization:`, `password:`) hides
     // the rest of the text; a bearer or basic scheme word hides the word after it.
-    if (/^[A-Za-z_][A-Za-z0-9_.-]*:$/.test(token) && SECRET_NAME.test(token.slice(0, -1))) { hideRest = true; out.push(mask()); return; }
-    if (/^(?:bearer|basic)$/i.test(token)) { hideNext = true; out.push(token); return; }
-    if (SHELL_OPERATOR.test(token)) { out.push(token); return; }
+    const header = /^(-{0,2})([A-Za-z_][A-Za-z0-9_.-]*):+$/.exec(token);
+    if (header && (SECRET_NAME.test(header[2]) || credentialFlag(header[1] + header[2]))) { hideRest = true; return mask(); }
+    if (/^(?:bearer|basic)$/i.test(token)) { hideNext = true; return token; }
+    if (SHELL_OPERATOR.test(token)) return token;
     if (/^https?:\/\/[^\s]+$/i.test(token)) {
       const url = embeddedUrl(token, hash);
       if (url !== token) masked = true;
-      out.push(url);
-      return;
+      return url;
     }
     const eq = token.indexOf('=');
     if (eq !== -1) {
       const name = token.slice(0, eq);
       const bare = name.replace(/^-+/, '');
       const nameOk = /^-{0,2}[A-Za-z_][A-Za-z0-9_.-]*$/.test(name) && readsAsName(bare)
-        && !SECRET_NAME.test(bare) && !SECRET_NAME.test(bare.replace(/_/g, '-')) && !credentialFlag(name);
+        && !SECRET_NAME.test(bare) && !SECRET_NAME.test(bare.replace(/_/g, '-')) && !credentialFlag(name)
+        // -pNAME= is a value glued to -p, not a name.
+        && !(/^-[A-Za-z]/.test(name) && !name.startsWith('--') && credentialFlag(name.slice(0, 2)));
+      // `password=` with its value in the next word.
+      const value = token.slice(eq + 1);
+      if (/^[:=]*$/.test(value) && !nameOk) hideNext = true;
+      // A value that is itself a flag or a key (`PASSWORD=--client_secret x`) hides
+      // what follows it just as it would on its own.
+      else if (value) classify(value, 1);
       masked = true;
-      out.push(nameOk ? `${name}=***` : '***');
-      return;
+      return nameOk ? `${name}=***` : '***';
     }
-    if (!TOKEN_CHARS.test(token)) { out.push(mask()); return; }
-    if (/^-[A-Za-z]./.test(token) && !token.startsWith('--') && credentialFlag(token.slice(0, 2))) {
-      masked = true;
-      out.push(`${token.slice(0, 2)}***`);
-      return;
-    }
+    if (!TOKEN_CHARS.test(token)) return mask();
     const flag = FLAG.exec(token);
     if (flag) {
-      const shown = showFlag(flag[1], flag[2]);
+      const [, dashes, body] = flag;
+      let shown;
+      if (dashes === '-' && body.length > 1) {
+        // One dash and more: a value glued to a credential letter (-pSECRET) is
+        // masked; a credential name spelled with one dash (-pw, -password, -Header)
+        // or a group of letters holding a credential one (-vp) hides the next word.
+        const credentialLetter = credentialFlag(`-${body[0]}`);
+        shown = credentialLetter ? `-${body[0]}***` : showFlag(dashes, body);
+        if (credentialFlag(`--${body}`)
+          || (/^[A-Za-z]{2,4}$/.test(body) && [...body].some((letter) => credentialFlag(`-${letter}`)))) hideNext = true;
+      } else {
+        shown = showFlag(dashes, body);
+        if (credentialFlag(token)) hideNext = true;
+      }
       if (shown !== token) masked = true;
-      out.push(shown);
-      if (credentialFlag(token)) hideNext = true;
-      return;
+      return shown;
     }
     const shown = rel(token);
-    out.push(readsAsName(shown, { executable: executableFirst && index === 0, extra: '+' }) ? shown : mask());
+    const plain = readsAsName(shown, { executable: executableFirst && index === 0, extra: '+' });
+    // A plain secret word waits for a separator (`password = x`); a compound one
+    // (`db.password`, `api_key`, `echo-db.password`) is a key and hides its value.
+    if (plain && SECRET_NAME.test(shown) && !(executableFirst && index === 0)) {
+      if (/[-_.]/.test(shown)) hideNext = true;
+      else afterSecretWord = true;
+    }
+    return plain ? shown : mask();
+  };
+  tokens.forEach((token, index) => {
+    const secretWordBefore = afterSecretWord;
+    afterSecretWord = false;
+    if (hideRest) { out.push(mask()); return; }
+    // A quote, a backtick, a backslash or a parenthesis starts something whose end
+    // is not looked for: every token from it on is masked, so a plain word inside a
+    // quoted or substituted span is never shown by being plain. Checked before the
+    // word-after-a-flag rule, which would otherwise mask only this one token.
+    if (/["'`\\()]/.test(token)) { hideRest = true; out.push(mask()); return; }
+    const separator = /^[:=]+$/.test(token);
+    // A separator on its own (`--password = x`) keeps the value after it hidden.
+    if (hideNext && separator) { out.push(mask()); return; }
+    const hidden = hideNext;
+    hideNext = false;
+    if (separator) { if (secretWordBefore) hideNext = true; out.push(mask()); return; }
+    // A separator glued in front (`=-pass`, `:password`): what follows it is judged
+    // for what it hides next, and the token itself is masked.
+    const lead = /^[:=]+/.exec(token);
+    if (lead) { classify(token.slice(lead[0].length), index); out.push(mask()); return; }
+    // A hidden token is still classified: it may itself be a credential flag or a
+    // secret name whose value comes next (`Bearer --token x`, `-p PASSWORD = x`).
+    const shown = classify(token, index);
+    // A token masked whole that names a secret anywhere inside it (words glued by
+    // shell syntax, `--optsPASSWORD=&&-password`) hides the word after it too. A
+    // plain secret-sounding word alone does not (`the password is set`).
+    // A plain assignment (`API_TOKEN=x`) carries its own value and hides nothing more.
+    if (shown === '***' && SECRET_NAME.test(token)
+      && !/^-{0,2}[A-Za-z_][A-Za-z0-9_.-]*=[A-Za-z0-9_./~+-]+$/.test(token)) hideNext = true;
+    out.push(hidden ? mask() : shown);
   });
   return { shown: out.join(' '), masked };
 }
@@ -809,16 +864,44 @@ async function claudeSection(ctx, dir) {
 
 // ---- Codex config.toml ------------------------------------------------------------
 
-// A dotted TOML table name split into its keys, quotes removed.
+// A dotted TOML key or table name split into its keys, quotes removed, read by hand
+// in one pass: bare segments of [A-Za-z0-9_-], or quoted ones ("…" with backslash
+// escapes, '…' without), separated by dots. Anything else, or a name over
+// TOML_NAME_MAX_CHARS, gives [] and the caller hashes the name instead.
+const TOML_NAME_MAX_CHARS = 1024;
 function tomlPath(name) {
+  const text = String(name == null ? '' : name);
+  if (text.length > TOML_NAME_MAX_CHARS) return [];
   const parts = [];
-  const re = /\s*("([^"]*)"|'([^']*)'|[^.\s"']+)\s*(?:\.|$)/g;
-  let match;
-  while ((match = re.exec(name)) && match[0] !== '') {
-    parts.push(match[2] !== undefined ? match[2] : match[3] !== undefined ? match[3] : match[1]);
-    if (re.lastIndex >= name.length) break;
+  const blank = (ch) => ch === ' ' || ch === '\t';
+  let index = 0;
+  for (;;) {
+    while (blank(text[index])) index += 1;
+    let part = '';
+    const quote = text[index] === '"' || text[index] === '\'' ? text[index] : null;
+    if (quote) {
+      index += 1;
+      let closed = false;
+      while (index < text.length) {
+        const ch = text[index];
+        if (quote === '"' && ch === '\\') { part += text[index + 1] || ''; index += 2; continue; }
+        index += 1;
+        if (ch === quote) { closed = true; break; }
+        part += ch;
+      }
+      if (!closed) return [];
+    } else {
+      const start = index;
+      while (index < text.length && /[A-Za-z0-9_-]/.test(text[index])) index += 1;
+      if (index === start) return [];
+      part = text.slice(start, index);
+    }
+    parts.push(part);
+    while (blank(text[index])) index += 1;
+    if (index >= text.length) return parts;
+    if (text[index] !== '.') return [];
+    index += 1;
   }
-  return parts;
 }
 
 // config.toml itemised: every top-level scalar key with its value (scrubbed; `set`
@@ -862,7 +945,9 @@ function codexConfigRows(toml, hash = defaultHash) {
     const comment = head.search(/\s#/);
     const line = (comment === -1 ? head : head.slice(0, comment)).trim();
     if (!line || line.startsWith('#')) continue;
-    const header = /^\[\[?([^\]]+)\]\]?$/.exec(line);
+    // A header over TOML_NAME_MAX_CHARS is still a header, named by its hash.
+    const header = line.length <= TOML_NAME_MAX_CHARS + 4 ? /^\[\[?([^\]]+)\]\]?$/.exec(line)
+      : line.startsWith('[') && line.endsWith(']') ? [line, line] : null;
     if (header) {
       const parts = tomlPath(header[1]);
       const top = name(parts[0] || header[1]);

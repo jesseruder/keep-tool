@@ -274,7 +274,7 @@ test('no planted credential ever appears in the inventory', async (t) => {
   assert.match(lines.get('claude:~/.claude mcp:user:envflag'), new RegExp(`^stdio runner --env=\\*\\*\\* --verbose sha=${sha}$`));
   assert.match(lines.get('claude:~/.claude settings.json:hooks:Stop'), new RegExp(`^command:~/bin/stop-hook --token \\*\\*\\* sha=${sha}$`));
   assert.match(lines.get('claude:~/.claude settings.json:hooks:Notification'),
-    /^command:curl -u \*\*\* -H \*\*\* \*\*\* \*\*\* \*\*\* sha=[0-9a-f]{12} \|\| command:mysql -p\*\*\* -e status \*\*\* sha=[0-9a-f]{12} \|\| http:https:\/\/hooks\.example\.com\/services\/\*[0-9a-f]{8}\/\*[0-9a-f]{8}\/\*[0-9a-f]{8}$/);
+    /^command:curl -u \*\*\* \*\*\* \*\*\* \*\*\* \*\*\* \*\*\* sha=[0-9a-f]{12} \|\| command:mysql -p\*\*\* -e status \*\*\* sha=[0-9a-f]{12} \|\| http:https:\/\/hooks\.example\.com\/services\/\*[0-9a-f]{8}\/\*[0-9a-f]{8}\/\*[0-9a-f]{8}$/);
   const session = lines.get('claude:~/.claude settings.json:hooks:SessionStart').split(' || ');
   assert.match(session[0], new RegExp(`^command:\\*\\*\\* node x\\.js sha=${sha}$`));
   assert.match(session[1], new RegExp(`^command:env \\*\\*\\* node x sha=${sha}$`));
@@ -425,6 +425,20 @@ test('a file one side could not read makes its rows on the other side unread, no
   assert.equal(section.differ[0].noise, null, 'an ordinary difference is still one');
 });
 
+test('TOML names are read by hand, so hostile headers cost little', () => {
+  // 250 headers of 4 KB each with an unclosed quote: the old pattern took ~70 ms apiece.
+  const hostile = Array.from({ length: 250 }, () => `[${'a'.repeat(4000)}"]`).join('\n');
+  const started = Date.now();
+  const rows = inventory.codexConfigRows(hostile);
+  assert.ok(Date.now() - started < 100, `took ${Date.now() - started} ms`);
+  assert.equal(rows.length, 1, 'all of them one hashed table');
+  assert.match(rows[0][0], /^table:\*[0-9a-f]{8}$/);
+  // Ordinary names still read: dotted, quoted with a dot or a space, and literal.
+  const names = inventory.codexConfigRows('[mcp_servers."my.server".env]\nX = 1\n[a . b]\n[\'lit\'.x]\n[bad name]\n').map(([key]) => key);
+  assert.deepEqual(names.slice(0, 3), ['table:mcp_servers', 'table:a', 'table:lit']);
+  assert.match(names[3], /^table:\*[0-9a-f]{8}$/, 'a name that is not TOML is hashed');
+});
+
 test('a Codex config table on one side only is its own row', () => {
   const base = ['model = "gpt-test"', '[mcp_servers.docs]', 'url = "https://docs.example.com/mcp"'];
   const withTui = [...base, '[tui]', 'status_line = ["model"]', 'terminal_title = true', 'notifications = true'];
@@ -558,14 +572,32 @@ test('property: a secret that is not a plain word never survives any mix of quot
   const secrets = ['hunter2', 'pa55word', 's3cr3t-Tok3n', 'x9Y8z7W6', 'Zm9vYmFy0', 'Qw3rty9'];
   const parts = ['echo', 'run', 'mysql', '--password', '--token', '--api_key', '-p', '-u', '-H', '--opts', '-c', 'x',
     'KEY=', 'PASSWORD=', 'opts=', 'desc:', 'Authorization:', 'Bearer', '"', '\'', '`', '$(', ')', '=', ':', '"a"', '|', '&&', ' '];
+  // Plain lowercase words: only the flag and name rules can keep these out, so each
+  // is always placed right after a credential flag or a secret name.
+  const plainSecrets = ['correcthorse', 'batterystaple', 'opensesame', 'letmeinnow'];
+  const flagNames = ['password', 'pass', 'pw', 'token', 'api_key', 'api-key', 'Header', 'db.password', 'client_secret'];
+  const secretNames = ['password', 'PASSWORD', 'api_key', 'TOKEN', 'db.password', 'pin'];
+  const separators = ['=', ' = ', ' =', '= ', ' : ', ' :', '=  ', ' ', ' :: '];
   for (let round = 0; round < 500; round += 1) {
-    const secret = pick(secrets);
+    const plain = round % 3 === 0;
+    const secret = plain ? pick(plainSecrets) : pick(secrets);
     const words = [];
     const length = 1 + Math.floor(random() * 8);
     for (let index = 0; index < length; index += 1) words.push(pick(parts));
-    words.splice(Math.floor(random() * (words.length + 1)), 0, secret);
-    // Glue some neighbours together, as a shell word would be.
-    const text = words.map((word) => (random() < 0.4 ? word : `${word} `)).join('');
+    let placed = secret;
+    if (plain) {
+      // After a flag (one or two dashes, then space or =), or after a secret name
+      // and a separator, with spacing that varies.
+      placed = random() < 0.5
+        ? `${pick(['-', '--'])}${pick(flagNames)}${pick([' ', '  ', '=', ' = '])}${secret}`
+        : `${pick(secretNames)}${pick(separators.filter((sep) => sep !== ' '))}${secret}`;
+    }
+    words.splice(Math.floor(random() * (words.length + 1)), 0, placed);
+    // Glue some neighbours together, as a shell word would be. A plain-word secret's
+    // flag or name is never glued to the word before it: `runpin` is not the name
+    // `pin`, and only the name makes that value a secret at all.
+    const text = words.map((word, index) => (word !== placed && !(plain && words[index + 1] === placed) && random() < 0.4
+      ? word : `${word} `)).join('');
     const out = inventory.scrub(text);
     assert.ok(!out.includes(secret), `round ${round}: ${JSON.stringify(text)} -> ${JSON.stringify(out)}`);
     const line = inventory.safeCommand(`run ${text}`);
@@ -581,7 +613,8 @@ test('scrub, safeUrl and safeCommand', () => {
     ['curl -H "Authorization: Bearer abc.def"', 'curl -H *** *** *** sha=H'],
     ['x=1 secret="a \\" b c" y=2', 'x=*** *** *** *** *** *** sha=H'],
     ['Authorization: Bearer abc.def', '*** *** *** sha=H'],
-    ['curl -u admin:pass https://x.example.com', 'curl -u *** https://x.example.com/ sha=H'],
+    // A masked token naming a secret (admin:pass) hides the word after it as well.
+    ['curl -u admin:pass https://x.example.com', 'curl -u *** *** sha=H'],
     ['mysql -phunter2 db', 'mysql -p*** db sha=H'],
     ['psql -h db.local -U reader -P pager=off', 'psql -h db.local -U reader -P pager=*** sha=H'],
     ['pass=letmein clientKey: heron', '*** *** *** sha=H'],
@@ -590,6 +623,22 @@ test('scrub, safeUrl and safeCommand', () => {
     ['uses ghp_abcdefghij0123456789', 'uses *** sha=H'],
     // A colon is never shown, so a non-header `name:` hides only itself.
     ['name: value', '*** value sha=H'],
+    // Round seven: credential names spelled with one dash, dotted flag names, grouped
+    // letters holding a credential one, and separators standing on their own.
+    ['plink -pw correcthorse host', 'plink -p*** *** host sha=H'],
+    ['influx -password correcthorse', 'influx -p*** *** sha=H'],
+    ['tool -pass correcthorse', 'tool -p*** *** sha=H'],
+    ['curl -Header correcthorse', 'curl -H*** *** sha=H'],
+    ['tool --db.password correcthorse', 'tool --db.password *** sha=H'],
+    ['tar -vp correcthorse', 'tar -vp *** sha=H'],
+    ['password = correcthorse', 'password *** *** sha=H'],
+    ['password : correcthorse', 'password *** *** sha=H'],
+    ['password= correcthorse', '*** *** sha=H'],
+    ['--password = correcthorse', '--password *** *** sha=H'],
+    ['user pin = 1234', 'user pin *** *** sha=H'],
+    // A secret-sounding word alone hides nothing.
+    ['the password is set', 'the password is set'],
+    ['-la file', '-la file'],
   ];
   for (const [text, expected] of cases) assert.equal(anyHash(inventory.scrub(text)), expected, text);
   const long = `${'a'.repeat(30000)} ${' '.repeat(30000)}#`;
