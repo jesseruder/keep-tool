@@ -693,7 +693,8 @@ function watchDeployHealth(main, sha, before, opts = {}) {
     }
     const starts = 1 + crashStartsAfter(after && after.daemon, started);
     const looping = starts > 1;
-    if (looping) note(`DEPLOY FAILURE: the daemon started ${starts} times in ${waited} after the restart — it keeps dying on the new code; check keep health and serve.log`);
+    if (looping && starts === 2) note(`DEPLOY FAILURE: the daemon crashed and restarted on the new code within ${waited} of the restart; check keep health and serve.log`);
+    else if (looping) note(`DEPLOY FAILURE: the daemon started ${starts} times in ${waited} after the restart — it keeps dying on the new code; check keep health and serve.log`);
     else if (after && after.daemon && after.daemon.running === false) {
       note(`the daemon started on the new code and is down again ${waited} later; check keep health and keep doctor`);
     }

@@ -2858,8 +2858,10 @@ that one's base, so the label names the whole range. The row's streak is the wor
 open regression's, so it turns failing on the same three-in-a-row as the scheduler's
 own row, and goes back to ok (naming what recovered) once every charged row succeeds;
 a charged row that is disabled, retired or removed stops counting, and so does a row
-the deploy added once a daemon starts on code that no longer schedules it (the revert
-went out). It is written
+the deploy added that the running code stopped writing (the revert went out): one with
+no `CADENCES` entry that has not recorded since the current daemon started, once that
+start is older than 30 minutes and two of the row's cadences. A crash restart on the
+same code keeps the charge of a row that is still there. It is written
 inside `health.record`, on the store that call already reads and writes, behind a
 try/catch so the scheduler's own record always lands, and is on demand, so
 self-repair opens its card on the failing scheduler, not on `deploy`. A same-commit

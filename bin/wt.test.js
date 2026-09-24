@@ -1197,6 +1197,16 @@ test('the deploy watch says so in one line when nothing regressed, and reports a
     assert.match(said, /DEPLOY FAILURE: the daemon started 3 times/);
     assert.match(said, /git revert --no-edit b{40}/);
 
+    // One unrequested restart is a crash, said as that rather than a loop.
+    said = '';
+    clock = 0;
+    const once = healthPicture(3000, 'b'.repeat(40), { 'review-compact': {} });
+    once.daemon.startedAts = [1000, 2000, 3000];
+    once.daemon.requestedStartAts = [2000];
+    assert.equal(wt.watchDeployHealth('/nowhere/keep-tool', 'b'.repeat(40), before, { ...deps, healthSnapshot: () => once }).starts, 2);
+    assert.match(said, /DEPLOY FAILURE: the daemon crashed and restarted on the new code/);
+    assert.doesNotMatch(said, /keeps dying/);
+
     // Another session's land (or a keep restart-daemon) during the wait is a
     // requested start, not a crash.
     said = '';

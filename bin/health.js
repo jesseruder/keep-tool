@@ -222,23 +222,21 @@ function deployCharges(watch, name, at) {
 //
 // A charged row that is disabled comes through here with a zero streak, and one that
 // is retired or gone from the store is dropped on any record, so neither can hold the
-// row failing with nothing left that could ever clear it. A daemon start (`name` is
-// 'daemon') only prunes, and also drops a charge on a row the deploy added that the
-// code now starting no longer schedules: the revert that removed it would otherwise
-// leave a charge nothing will ever record against again.
+// row failing with nothing left that could ever clear it. Nor can a row the deploy
+// added that the running code has stopped writing (a revert took it out): see
+// abandonedAdded.
 function noteDeploy(store, name, entry, at, failed) {
-  if (name === DEPLOY_ROW) return;
-  const starting = name === 'daemon';
+  if (name === DEPLOY_ROW || name === 'daemon') return;
   const prior = store[DEPLOY_ROW] && typeof store[DEPLOY_ROW] === 'object' ? store[DEPLOY_ROW] : null;
   const regressions = {};
   let changed = false;
   for (const [row, value] of Object.entries(prior && prior.regressions && typeof prior.regressions === 'object' ? prior.regressions : {})) {
-    const gone = starting && value && value.added && !Object.prototype.hasOwnProperty.call(CADENCES, row);
-    if (value && typeof value === 'object' && !gone && !RETIRED.has(row) && store[row] && typeof store[row] === 'object') regressions[row] = value;
+    if (value && typeof value === 'object' && !RETIRED.has(row) && store[row] && typeof store[row] === 'object'
+      && !(value.added && abandonedAdded(store, row, at))) regressions[row] = value;
     else changed = true;
   }
-  const failures = starting ? 0 : Number(entry.consecutiveFailures || 0);
-  if (starting) { /* nothing to charge on a start */ } else if (regressions[name]) {
+  const failures = Number(entry.consecutiveFailures || 0);
+  if (regressions[name]) {
     regressions[name] = { ...regressions[name], consecutiveFailures: failures, ...(failed ? { error: entry.lastError || '' } : {}) };
     changed = true;
   } else if (failed && failures) {
@@ -274,6 +272,22 @@ function noteDeploy(store, name, entry, at, failed) {
     delete next.regressions;
   }
   store[DEPLOY_ROW] = next;
+}
+
+// Whether a charged row the deploy added has been taken out of the running code. A
+// scheduler with no CADENCES entry cannot be told apart from a removed one by name
+// (self-repair and the compact-restore rows write their own rows), so it is judged by
+// behaviour instead: it has not recorded since the current daemon started, and that
+// start is older than the watch window and two of its own cadences. A live one records
+// again inside that and keeps its charge; a reverted one never does and is let go.
+// Only reached for an open `added` charge, so the hot path pays nothing for it.
+function abandonedAdded(store, row, at) {
+  if (Object.prototype.hasOwnProperty.call(CADENCES, row)) return false;
+  const startedAt = Number(store.daemon && store.daemon.startedAt);
+  if (!Number.isFinite(startedAt)) return false;
+  const entry = store[row];
+  if (atMs(entry.lastRunAt) >= startedAt) return false;
+  return at - startedAt > Math.max(DEPLOY_WATCH_MS, 2 * Number(entry.cadenceMs || 0));
 }
 
 // record() calls this, never noteDeploy directly: a malformed deploy row or watch in
@@ -329,7 +343,6 @@ function record(name, options = {}) {
       ...(lastKnownCommit ? { lastKnownCommit } : {}),
       ...(deployWatch ? { deployWatch } : {}),
     };
-    safeNoteDeploy(store, 'daemon', {}, at, false);
     persist(store);
     return store.daemon;
   }
