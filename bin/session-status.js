@@ -66,6 +66,16 @@ function activity(session, context = {}) {
   const waiting = text.match(/\b(?:waiting (?:on|for)|awaiting|blocked (?:on|by))\b[^.!?\n]*/i)?.[0];
   const reason = model.background.agents.length ? 'subagent' : waitReason(waiting);
   add(ended && model.conversation.handoff?.intent === 'needs-input', 'handoff-input', 'registry', 'needs-input', 'Needs input', 'question', { kind: 'input', detail: 'Ready for your decision.' }, 'observed', model.conversation.handoff?.at);
+  // The turn-end model verdict (bin/stop-classifier.js) outranks the prose rules and
+  // tracked-job waits below, but not a stop intent a hook or card handoff declared.
+  const verdict = ended && model.identity.interactive && !model.identity.reviewer
+    && !['hook', 'registry'].includes(model.conversation.source) ? session.stopVerdict : null;
+  const heldReason = verdict?.verdict === 'pending' ? 'classifying' : verdict?.reason || 'background work';
+  add(['running', 'pending'].includes(verdict?.verdict), 'model-running', 'model', 'waiting', `Waiting: ${heldReason}`, heldReason, null,
+    verdict?.verdict === 'pending' ? 'uncertain' : 'inferred');
+  const asks = model.conversation.hint === 'needs-input';
+  add(verdict?.verdict === 'needs-input', 'model-needs-input', 'model', 'needs-input', asks ? 'Needs an answer' : 'Ready for next instruction',
+    asks ? 'question' : 'next instruction', { kind: 'input', detail: verdict?.reason || (asks ? text : 'Ready for your next instruction.') }, 'inferred');
   add(ended && model.conversation.hint === 'needs-input', 'prose-request', 'prose', 'needs-input', 'Needs an answer', 'question', { kind: 'input', detail: text }, 'inferred');
   add(model.conversation.waiting, 'conversation-wait', model.conversation.source, 'waiting', `Waiting: ${model.conversation.reason}`, model.conversation.reason, null, model.conversation.confidence, model.conversation.handoff?.at ?? model.foreground.at);
   add(!model.identity.interactive && model.background.pending, 'background-pending', 'background', 'waiting', `Waiting: ${reason}`, reason);

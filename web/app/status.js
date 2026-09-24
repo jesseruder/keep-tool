@@ -63,5 +63,7 @@ export function sessionExplanation(session) {
   const d = session?.activity?.decision;
   if (!d) return sessionLabel(session);
   const at = d.at ? ` · evidence ${new Date(d.at).toLocaleString()}` : '';
-  return `${sessionLabel(session)} · ${d.source}: ${d.rule} (${d.confidence})${at}${backgroundLabel(session) ? ` · ${backgroundLabel(session)}` : ''}`;
+  const verdict = d.source === 'model' && session.stopVerdict
+    ? ` · ${session.stopVerdict.model || 'model'}: ${session.stopVerdict.verdict === 'pending' ? 'classifying' : session.stopVerdict.reason || session.stopVerdict.verdict}` : '';
+  return `${sessionLabel(session)} · ${d.source}: ${d.rule} (${d.confidence})${verdict}${at}${backgroundLabel(session) ? ` · ${backgroundLabel(session)}` : ''}`;
 }

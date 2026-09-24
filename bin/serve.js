@@ -12564,6 +12564,9 @@ function buildState(options = {}) {
     }
   }
   applyCompanionJobs(sessions, options.companion);
+  // Cache reads only; the daemon queues missing verdicts below or in the worker's finalize.
+  require('./stop-classifier').attach(sessions);
+  if (!workerMode) require('./stop-classifier').request(sessions, { onChange });
   for (const session of sessions) {
     const task = taskById.get(session.taskId);
     if (task && !dependencyCache.has(task.id)) dependencyCache.set(task.id, keep.unresolvedDependencyIds(task));
@@ -12576,7 +12579,7 @@ function buildState(options = {}) {
   if (workerMode) {
     const terminal = new Set(['completed', 'failed', 'cancelled']);
     const derived = new Set(['taskId', 'taskStatus', 'runtime', 'pane', 'launchModel', 'accountLabel',
-      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark',
+      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark', 'stopVerdict',
       // Attached further down, after this block, and re-read from the usage snapshot
       // on every build. Listed so a reordering cannot freeze a settled session's
       // totals at whatever the collector had seen the moment it was cached.
@@ -12845,6 +12848,7 @@ function finalizeDashboardWorkerResult(result) {
   sessionNames.apply(state.sessions, { root: keep.ROOT });
   sessionMarks.apply(state.sessions, { root: keep.ROOT });
   titles.applyLiveTitles(state.sessions, { onChange, taskFor: (session) => taskById.get(session.taskId) });
+  require('./stop-classifier').request(state.sessions, { onChange });
   for (const session of state.sessions || []) require('./session-debug').record(session, Date.now());
   const sessionById = new Map((state.sessions || []).map((session) => [session.id, session]));
   for (const item of state.attention || []) {
