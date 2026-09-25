@@ -1336,7 +1336,9 @@ function createHost(options = {}) {
       case 'ensure-worktree': {
         // A standing agent placed on this machine runs in a worktree here: built and
         // checked against this node's own worktree root, the answer naming its path.
-        return { result: await require('./area-worktree.js').ensure(params) };
+        // Wrapped: a host answer may not carry `ok` at its top level, and the tree's
+        // own answer does.
+        return { result: { worktree: await require('./area-worktree.js').ensure(params) } };
       }
       case 'artifacts': {
         // A session's files, for a move between nodes. Every path is built here from

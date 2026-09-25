@@ -2805,6 +2805,18 @@ function transcriptNode(name) {
   };
 }
 
+test('a node answers ensure-worktree through its real frames, its refusal named inside the answer', async () => {
+  await withHost({}, async ({ client }) => {
+    assert.equal((await client.request('hello')).worktree, 1, 'the verb is advertised');
+    // A refusal is an answer, not a transport failure: nothing reaches wt.
+    for (const params of [{ repo: '/Users/me/keep-tool', name: 'responder' }, { repo: 'castle-sandboxes', name: '../x' }]) {
+      const answer = await client.request('ensure-worktree', params);
+      assert.equal(answer.worktree.ok, false);
+      assert.equal(answer.worktree.code, 'invalid');
+    }
+  });
+});
+
 test('a node answers stat, tail and match for a transcript of its own account', async () => {
   const node = transcriptNode('ops');
   try {

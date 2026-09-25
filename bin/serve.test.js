@@ -11103,7 +11103,7 @@ test('a responder\'s worktree on a node is built by that node\'s host, and an ol
   const host = (hello) => async (type, params, requestDeps) => {
     asked.push([type, requestDeps.node, params, requestDeps.hostRequestTimeoutMs]);
     if (type === 'hello') return hello;
-    return { ok: true, path: '/home/node/wt/castle-sandboxes/responder' };
+    return { worktree: { ok: true, path: '/home/node/wt/castle-sandboxes/responder' } };
   };
   assert.deepEqual(await ensureWorktreeOn('aws1', 'castle-sandboxes', 'responder', { hostRequest: host({ worktree: 1 }) }),
     { ok: true, path: '/home/node/wt/castle-sandboxes/responder' });
@@ -11112,6 +11112,7 @@ test('a responder\'s worktree on a node is built by that node\'s host, and an ol
   asked.length = 0;
   const old = await ensureWorktreeOn('aws1', 'castle-sandboxes', 'responder', { hostRequest: host({ transcript: 5 }) });
   assert.equal(old.ok, false);
+  assert.equal(old.waitForNode, true, 'an older host is waited for, not a failed launch');
   assert.match(old.error, /predates ensure-worktree/);
   assert.deepEqual(asked.map(([type]) => type), ['hello']);
 });

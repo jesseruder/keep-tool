@@ -1805,6 +1805,22 @@ test('a responder placed on a node launches there, in a worktree built there, an
     assert.equal(deps.calls.opens[0].body.cwd, '/home/node/wt/castle-sandboxes/responder');
     assert.equal(record(fixture).nodeWait, null);
 
+    // A node whose host predates the verb is waited for: no attempt spent.
+    const older = makeRoot();
+    try {
+      const olderState = { panes: [], sessions: [], nodeTree: { ok: false, waitForNode: true, error: 'the terminal host on aws1 predates ensure-worktree' } };
+      const olderDeps = placedDeps(older, olderState);
+      for (let i = 0; i < 4; i += 1) {
+        const report = sandboxes(await tick(older, olderDeps));
+        assert.equal(report.launch.state, 'skipped');
+        assert.match(report.launch.reason, /predates ensure-worktree/);
+      }
+      assert.equal(Number(record(older).launch.attempts || 0), 0);
+      assert.equal(olderDeps.calls.opens.length, 0);
+      assert.equal(agents.readEvents('sandboxes', { root: older.root }).filter((event) => event.kind === 'waiting').length, 1,
+        'said once, not every tick');
+    } finally { cleanup(older.root); }
+
     // A node that could not build the tree fails the launch, as a local one would.
     const failing = makeRoot();
     try {

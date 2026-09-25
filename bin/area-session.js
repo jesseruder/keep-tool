@@ -906,13 +906,20 @@ async function launchSession(context, deps, say) {
       (deps.noteNodeWait || require('./runs.js').noteNodeWait)(agents, agentName, placement.node, root);
       return { state: 'skipped', waitingForNode: placement.node, reason: oneLine(error && error.message || error, 200) };
     }
-    (deps.clearNodeWait || require('./runs.js').clearNodeWait)(agents, agentName, root);
   }
   // On a node, the tree is built there and checked against that machine's own
   // worktree root; here, as it always was.
   const tree = placement.remote
     ? await deps.ensureWorktreeOn(placement.node, repo, WORKTREE_NAME)
     : await ensureWorktree(repo, WORKTREE_NAME, deps);
+  if (!tree.ok && tree.waitForNode) {
+    // A node whose host cannot do this yet: waited for like a silent one, with no
+    // launch attempt spent.
+    (deps.noteNodeWait || require('./runs.js').noteNodeWait)(agents, agentName, placement.node, root);
+    return { state: 'skipped', waitingForNode: placement.node, reason: oneLine(tree.error, 200), worktree: tree };
+  }
+  // The node answered and could build: whatever wait the feed was told about is over.
+  if (placement.remote) (deps.clearNodeWait || require('./runs.js').clearNodeWait)(agents, agentName, root);
   if (!tree.ok) {
     say(`could not prepare ${repo}/${WORKTREE_NAME} for ${agentName}: ${tree.error}`);
     return { state: 'failed', reason: `worktree: ${tree.error}`, worktree: tree };

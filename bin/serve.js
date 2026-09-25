@@ -16042,9 +16042,14 @@ async function ensureWorktreeOn(node, repo, name, deps = {}) {
   const ask = deps.hostRequest || hostRequest;
   const hello = await ask('hello', {}, { ...deps, node });
   if (!(Number(hello && hello.worktree) >= 1)) {
-    return { ok: false, error: `the terminal host on ${node} predates ensure-worktree; update keep-tool on ${node} and reload its host` };
+    // A wait, not a failed launch: a node host one update behind catches up with the
+    // next `keep nodes update`, and its responder should not have spent its launches.
+    return { ok: false, waitForNode: true, error: `the terminal host on ${node} predates ensure-worktree; update keep-tool on ${node} and reload its host` };
   }
-  return ask('ensure-worktree', { repo, name }, { ...deps, node, hostRequestTimeoutMs: 6 * 60e3 });
+  const answer = await ask('ensure-worktree', { repo, name }, { ...deps, node, hostRequestTimeoutMs: 6 * 60e3 });
+  const tree = answer && answer.worktree;
+  if (!tree || typeof tree !== 'object') return { ok: false, error: `the terminal host on ${node} gave no worktree answer` };
+  return tree;
 }
 
 // "Wait for the node": an agent placed on a machine that is not answering is not

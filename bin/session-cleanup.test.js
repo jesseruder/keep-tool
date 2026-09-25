@@ -140,7 +140,8 @@ test('an area\'s quiet close may close its own responder, and only its own', () 
 
 test('ensure-worktree refuses a request it cannot pass to wt safely, and a tree outside the root', async () => {
   const { ensure } = require('./area-worktree');
-  for (const params of [{}, { repo: '--force', name: 'responder' }, { repo: 'r\nx', name: 'responder' }, { repo: 'r', name: '../x' }, { repo: 'r', name: '-x' }]) {
+  for (const params of [{}, { repo: '--force', name: 'responder' }, { repo: 'r\nx', name: 'responder' }, { repo: 'r', name: '../x' }, { repo: 'r', name: '-x' },
+    { repo: '/Users/me/keep-tool', name: 'responder' }, { repo: '../keep-tool', name: 'responder' }]) {
     assert.equal((await ensure(params, { runWt: async () => assert.fail('wt ran') })).code, 'invalid', JSON.stringify(params));
   }
   const deps = {
@@ -148,6 +149,17 @@ test('ensure-worktree refuses a request it cannot pass to wt safely, and a tree 
     runWt: async () => ({ ok: true, stdout: '/elsewhere/r/responder\n', error: '' }),
   };
   assert.equal((await ensure({ repo: 'r', name: 'responder' }, { ...deps, insideWorktreeRoot: () => false })).code, 'outside');
+  // A tree already there but outside the root is refused before wt could remove it.
+  const there = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-ensure-outside-'));
+  try {
+    const removed = [];
+    const outside = await ensure({ repo: 'r', name: 'responder' }, {
+      worktreePath: () => there, insideWorktreeRoot: () => false, worktreeReady: () => false,
+      runWt: async (args) => { removed.push(args); return { ok: true, stdout: '', error: '' }; },
+    });
+    assert.equal(outside.code, 'outside');
+    assert.deepEqual(removed, [], 'wt was never asked to remove it');
+  } finally { fs.rmSync(there, { recursive: true, force: true }); }
   assert.deepEqual(await ensure({ repo: 'r', name: 'responder' }, { ...deps, insideWorktreeRoot: () => true }),
     { ok: true, path: '/elsewhere/r/responder' });
 });

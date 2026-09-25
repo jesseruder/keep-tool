@@ -101,18 +101,24 @@ async function ensureWorktree(repo, name, deps = {}) {
 }
 
 // The host verb: a worktree for `repo` named `name`, prepared here and checked to be
-// inside this machine's worktree root. `repo` is a repo name or a path, as wt takes it;
-// neither may carry anything a command line would read as a flag.
+// inside this machine's worktree root. Both are plain names, as an area launch sends
+// them (the repo's basename): never a path, never anything a command line would read
+// as a flag. And the tree it may replace must already be inside the root, checked
+// before `wt rm` could touch it.
 async function ensure(params = {}, deps = {}) {
   const repo = String(params.repo || '');
   const name = String(params.name || '');
-  if (!repo || repo.startsWith('-') || /[\0\r\n]/.test(repo) || repo.length > 4096) {
-    return { ok: false, code: 'invalid', error: 'ensure-worktree needs a repo' };
-  }
+  if (!NAME_RE.test(repo)) return { ok: false, code: 'invalid', error: 'ensure-worktree needs a repo name' };
   if (!NAME_RE.test(name)) return { ok: false, code: 'invalid', error: 'ensure-worktree needs a worktree name' };
+  const inside = deps.insideWorktreeRoot || insideWorktreeRoot;
+  let existing = null;
+  try { existing = (deps.worktreePath || worktreePath)(repo, name); } catch {}
+  if (existing && fs.existsSync(existing) && !inside(existing)) {
+    return { ok: false, code: 'outside', error: `${existing} is not inside this node's worktree root` };
+  }
   const tree = await ensureWorktree(repo, name, deps);
   if (!tree.ok) return { ...tree, code: 'failed' };
-  if (!(deps.insideWorktreeRoot || insideWorktreeRoot)(tree.path)) {
+  if (!inside(tree.path)) {
     return { ok: false, code: 'outside', error: `${tree.path} is not inside this node's worktree root` };
   }
   return tree;
