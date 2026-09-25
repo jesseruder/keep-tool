@@ -70,23 +70,25 @@ test('rapid switching routes typing to the last clicked session during updates',
   }
 });
 
-test('watcher state-line refreshes do not resize the desktop terminal', async ({ page }) => {
+test('a new card check-in does not resize the desktop terminal', async ({ page }) => {
   await page.locator('#qlist [data-key="running:b"]').click();
   await selected(page, 'b');
-  fixture.update('b', { stateLine: 'Short watcher state.' });
-  await expect(page.locator('#stage .state-line-text')).toHaveText('Short watcher state.');
+  const card = fixture.state.tasks.find((task) => task.id === 'card-b');
+  card.lastLog = 'Short check-in.';
+  fixture.publish();
+  await expect(page.locator('#stage .card-log')).toHaveText('Short check-in.');
   await page.waitForTimeout(100);
   const before = await page.locator('#stage').evaluate((stage) => ({
-    brief: stage.querySelector('.summary.state-line').getBoundingClientRect().height,
+    brief: stage.querySelector('.summary.card-log').getBoundingClientRect().height,
     terminal: stage.querySelector('.xterm-host').getBoundingClientRect().height,
   }));
 
-  const long = Array.from({ length: 80 }, (_, index) => `watcher update ${index}`).join(' ');
-  fixture.update('b', { stateLine: long });
-  await expect(page.locator('#stage .state-line-text')).toHaveText(long);
+  card.lastLog = Array.from({ length: 80 }, (_, index) => `check-in ${index}`).join(' ');
+  fixture.publish();
+  await expect(page.locator('#stage .card-log')).toContainText('check-in 20');
   await page.waitForTimeout(100);
   const after = await page.locator('#stage').evaluate((stage) => ({
-    brief: stage.querySelector('.summary.state-line').getBoundingClientRect().height,
+    brief: stage.querySelector('.summary.card-log').getBoundingClientRect().height,
     terminal: stage.querySelector('.xterm-host').getBoundingClientRect().height,
   }));
   expect(after).toEqual(before);

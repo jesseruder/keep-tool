@@ -263,7 +263,7 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     await evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
     assert.ok(await evaluate("document.activeElement?.matches('[data-history-toggle]')"), 'deferred Triage focus cannot override newer Watch/header focus');
     await evaluate("document.querySelector('[data-mode=triage]').click(); document.querySelector('#qlist [data-key=\"running:a\"]').click()");
-    await wait("document.querySelector('.summary-updating')");
+    await wait("document.querySelector('#stage .card-log')");
     assert.ok(await evaluate("document.querySelector('.shead .meta').getBoundingClientRect().top >= document.querySelector('.shead h2').getBoundingClientRect().bottom"));
     assert.ok(await evaluate("document.querySelector('.shead .meta').textContent.includes('card-a') && document.querySelector('.shead .meta').textContent.includes('personal')"));
     // A stale positional index must not redirect a row click to another session.
@@ -311,7 +311,7 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     await wait("document.querySelector('.mode.on')?.id === 'watch' && document.querySelectorAll('.wpane').length === 2");
     await evaluate("document.querySelector('[data-history-back]').click(); document.querySelector('[data-close-session]').click()");
     await wait("document.querySelector('#toast').textContent.includes('Session closed')");
-    await wait("document.querySelector('.summary')?.textContent === 'Fixture summary' && !document.querySelector('.summary-updating')");
+    await wait("document.querySelector('#stage .card-log')");
     await evaluate("document.querySelector('[data-history-toggle]').click(); document.querySelector('[data-history-toggle]').focus()");
     assert.equal(await evaluate("document.querySelectorAll('[data-history-entry]').length"), 2);
     assert.ok(await evaluate("document.querySelector('.history-pop').getBoundingClientRect().right <= innerWidth"));

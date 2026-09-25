@@ -1,8 +1,8 @@
 // The keyboard path out of a focused terminal. Plain keys and Escape belong to
 // the terminal (Claude Code reads Escape as interrupt), and ⌘↵ inserts a
 // newline there, so the way back to the queue is ⌘⎋: a chord neither xterm
-// nor the browser claims. Duck-typed on the document, like handleGradeKey, so
-// it can be exercised outside a browser.
+// nor the browser claims. Duck-typed on the document so it can be exercised
+// outside a browser.
 export function isLeaveTerminalChord(event) {
   return event.key === 'Escape' && Boolean(event.metaKey)
     && !event.ctrlKey && !event.altKey && !event.shiftKey;

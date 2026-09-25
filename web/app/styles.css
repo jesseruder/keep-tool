@@ -274,7 +274,6 @@ html.mobile .stage-artifacts .artifact-body { position: static; max-height: 30dv
 /* The inline rename editor stands in for the heading's title text. */
 .rename-session { display: block; }
 .rename-session input { width: 100%; box-sizing: border-box; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--accent); border-radius: 4px; padding: 1px 6px; }
-.summary-updating { color: var(--faint); font-size: 11px; position: absolute; bottom: 5px; right: 16px; }
 .shead h2 { margin: 0; flex: 1 1 240px; min-width: 0; font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .shead .meta { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; } .shead .meta a { color: var(--info); text-decoration: none; }
 .shead .acts { margin-left: auto; display: flex; flex-wrap: wrap; justify-content: flex-end; max-width: 100%; gap: 6px; position: relative; }
@@ -485,27 +484,22 @@ html.mobile .stage-artifacts .artifact-body { position: static; max-height: 30dv
 .brief { position: relative; padding: 10px 16px 24px; border-bottom: 1px solid var(--line); background: var(--answer-bg); display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
 /* Summary refreshes are background metadata, not a reason to resize the PTY. */
 .brief .summary { color: var(--muted); white-space: pre-line; line-height: 1.4; height: 7em; flex-shrink: 0; overflow: auto; }
-/* The watcher's state line replaces the generated summary; it keeps the .summary
-   class so existing focus and keyboard code sees the same element. */
-.brief .summary.state-line { display: flex; flex-direction: column; gap: 6px; }
-.brief .state-line-text { color: var(--text); }
-.brief .state-line-meta { display: flex; align-items: center; gap: 8px; font-size: 11px; }
-.verdict-chip { font: 500 10px/1 var(--mono); text-transform: uppercase; letter-spacing: .05em; border: 1px solid var(--line-2); border-radius: 3px; padding: 3px 5px; display: inline-flex; gap: 5px; align-items: center; color: var(--muted); }
-.verdict-chip .n { color: var(--faint); text-transform: none; letter-spacing: 0; }
-.verdict-chip.ok { color: var(--ok); border-color: var(--ok); }
-.verdict-chip.warn { color: var(--warn); border-color: var(--warn); }
-/* drift is the only emphasised verdict: the watcher says the session went wrong. */
-.verdict-chip.bad { color: var(--bad); border-color: var(--bad); background: var(--bad-soft); }
-.verdict-chip.faint { color: var(--faint); border-color: var(--line); }
-.verdict-grade { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 11px; }
-.verdict-grade .btn.tiny { padding: 3px 7px; font-size: 11px; }
-.verdict-grade-msg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40ch; }
-.verdict-grade-form { display: flex; gap: 6px; align-items: center; flex: 1 1 220px; }
-.verdict-grade-form[hidden] { display: none; }
-.verdict-grade-form input { flex: 1; min-width: 140px; }
-.verdict-chip .sent-mark { color: var(--ok); text-transform: none; letter-spacing: 0; }
-.fleet-shadow { color: var(--muted); font: 11px var(--mono); }
-.shadow-live { color: var(--ok); }
+/* The card's last few check-ins, newest first. The fixed .summary height above
+   still holds: a new check-in scrolls inside the box instead of resizing the PTY. */
+.brief .summary.card-log { white-space: normal; }
+.brief .card-log ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.brief .card-log li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+.brief .card-log li:first-child .card-log-text { color: var(--text); }
+.brief .card-log-when { font-size: 11px; flex: 0 0 auto; }
+.brief .card-log-kind { font: 10px var(--mono); flex: 0 0 auto; }
+.brief .card-log-text { flex: 1 1 24ch; min-width: 0; }
+.brief .card-log-next { flex: 1 0 100%; font-size: 11px; }
+.brief .card-log-empty { margin: 0; }
+.brief-body { display: flex; gap: 12px; align-items: stretch; min-width: 0; }
+.brief-body > .summary { flex: 1 1 auto; min-width: 0; }
+.card-picture { margin: 0; flex: 0 0 11.2em; height: 7em; border: 1px solid var(--line); border-radius: 5px; overflow: hidden; background: var(--panel); display: flex; align-items: center; justify-content: center; }
+.card-picture img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.card-picture.pending { font-size: 11px; }
 .opts { display: flex; flex-wrap: wrap; gap: 6px; }
 .opt { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 5px; border: 1px solid var(--line-2); background: var(--panel-2); text-align: left; }
 .opt:hover, .opt.rec { border-color: var(--accent); } .opt .n { font: 500 11px/1 var(--mono); color: var(--accent); } .opt .d { color: var(--muted); font-size: 12px; }
@@ -923,8 +917,7 @@ html.mobile .shead .acts { flex: 1 0 100%; margin-left: 0; flex-wrap: wrap; just
 html.mobile .session-actions-pop { width: min(300px, calc(100vw - 24px)); right: auto; left: 0; }
 html.mobile .brief { padding: 10px 12px 16px; }
 html.mobile .brief .summary { height: auto; max-height: 28dvh; }
-html.mobile .brief .summary.state-line { max-height: 28dvh; }
-html.mobile .verdict-grade-msg { max-width: 100%; }
+html.mobile .card-picture { display: none; }
 /* The terminal is a handoff panel on the phone: its button has to be on the
    screen with the answer buttons, not below a full page of stage. */
 html.mobile .stage-body { flex-direction: column; }

@@ -1,6 +1,5 @@
 import { sessionLabel } from './status.js';
 import { closeSession } from './close-session.js';
-import { shadowSummaryHTML } from './state-line.js';
 import { numBadgeHTML, numHaystack } from './session-number.js';
 import { RENAMED_HINT } from './session-rename.js';
 import { markHTML } from './session-mark.js';
@@ -119,7 +118,7 @@ export function renderFleet(ctx) {
 
   const root = document.querySelector('#fleet');
   if (!root.querySelector('.fleetbar')) {
-    root.innerHTML = `<div class="fleetbar"><input type="search" aria-label="Filter fleet" placeholder="Filter title, session, card, project, or branch" value="${ctx.esc(filter)}"><select aria-label="Filter fleet by provider"><option value="all">All</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="pi">Pi</option></select><span class="fleet-count"></span><span class="fleet-shadow"></span></div><div class="fleet-nodes"></div><div class="fleet-results"></div>`;
+    root.innerHTML = `<div class="fleetbar"><input type="search" aria-label="Filter fleet" placeholder="Filter title, session, card, project, or branch" value="${ctx.esc(filter)}"><select aria-label="Filter fleet by provider"><option value="all">All</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="pi">Pi</option></select><span class="fleet-count"></span></div><div class="fleet-nodes"></div><div class="fleet-results"></div>`;
     const input = root.querySelector('.fleetbar input');
     const select = root.querySelector('.fleetbar select');
     select.value = providerFilter;
@@ -136,7 +135,6 @@ export function renderFleet(ctx) {
   }
   root.querySelector('.fleet-count').textContent = `${visible.length} of ${rows.length}`;
   // Graduation progress, so Owner can see it without `keep decisions stats`.
-  ctx.patchHTML(root.querySelector('.fleet-shadow'), shadowSummaryHTML(ctx.data.shadowDecisions, ctx.esc));
   // Each machine's full stats card, on a fleet of two or more nodes.
   const nodeCards = root.querySelector('.fleet-nodes');
   if (nodeCards) {

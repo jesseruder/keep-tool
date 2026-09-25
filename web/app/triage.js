@@ -11,7 +11,7 @@ import { sessionLabel, sessionExplanation, backgroundLabel, hostOutage, hostOuta
 import { retainSelection, selectionIndex } from './selection.js';
 import { actionsMenuHTML, installActionsMenu, installKeepRunningControl, keepRunningControlHTML,
   patchActionsMenu, predictTypingControlsHTML, rendererControlsHTML } from './session-actions.js';
-import { stateLineHTML, installGrading } from './state-line.js';
+import { checkinsHTML, pictureHTML, pictureToggleHTML, installPictureToggle } from './card-log.js';
 import { numBadgeHTML } from './session-number.js';
 import { installHeadingRename, installRenameControls, isEditing, renameButtonsHTML, titleAttrsHTML } from './session-rename.js';
 import { installMarkControls, markControlsHTML, markHTML, markRowClass } from './session-mark.js';
@@ -21,8 +21,6 @@ import { placeInbox } from './queue-inbox.js';
 import { runAction } from './action.js';
 import { syncSecretDrop } from './secret-drop.js';
 
-const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
-const summaryInflight = new Map();
 // Agent name -> `{ events, seq, at, read, readAt, misses }`: the last page read for an
 // agent and what that read did. Only an agent that has been opened has one;
 // /api/state carries the badge and the last event for every row, so a listed
@@ -457,47 +455,6 @@ function togglePinned(ctx) {
   ctx.refresh();
 }
 
-function fetchSessionSummary(ctx, item, session) {
-  const id = item.sessionId;
-  if (!id || summaryInflight.has(id)) return;
-  const cached = summaryCache.get(id);
-  const now = Date.now();
-  const mtime = session?.mtime;
-  const elapsed = cached ? now - cached.fetchedAt : Infinity;
-  const changed = cached && mtime !== cached.mtime;
-  if (cached?.retryAt && now < cached.retryAt && !changed) return;
-  if (cached && !(changed && elapsed >= 15e3) && !(cached.fresh === false && elapsed >= 10e3)) return;
-
-  const pending = api.getSessionSummary(id)
-    .then((result) => {
-      summaryCache.set(id, {
-        text: typeof result?.text === 'string' ? result.text.trim() : '',
-        fetchedAt: Date.now(),
-        mtime,
-        fresh: result?.fresh !== false,
-      });
-    })
-    .catch((error) => {
-      // api.request throws a plain Error carrying the daemon's message; a missing
-      // transcript is "no session". Either way, wait for new activity before retrying.
-      const missing = /no session/i.test(error?.message || '');
-      // A missing transcript waits for new activity; a transient failure retries
-      // after a minute (fresh:false plus retryAt) instead of every 10 s or never.
-      summaryCache.set(id, {
-        text: missing ? 'No transcript for this session' : cached?.text || '',
-        fetchedAt: Date.now(),
-        mtime,
-        fresh: missing,
-        retryAt: missing ? null : Date.now() + 60e3,
-      });
-    })
-    .finally(() => {
-      summaryInflight.delete(id);
-      ctx.refresh();
-    });
-  summaryInflight.set(id, pending);
-}
-
 function shellProject(ctx) {
   const projects = ctx.knownProjects();
   const fallback = projects.find((project) => project.key === 'keep') || ctx.projectOf('~/keep');
@@ -795,17 +752,10 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
   return { active, stageItem: selection.stageItem };
 }
 
-function briefHTML(ctx, item, session) {
-  // The watcher's state line is the summary when there is one. Only fall back to
-  // the Haiku summarizer for sessions it has not judged yet, and never spend a
-  // model call on a session that already has a state line.
-  const hasStateLine = typeof session?.stateLine === 'string' && session.stateLine.trim();
-  if (item.sessionId && !hasStateLine) fetchSessionSummary(ctx, item, session);
-  const cached = summaryCache.get(item.sessionId);
-  const fallback = item.sessionId
-    ? cached?.text || 'No state line yet'
-    : item.detail || 'No session transcript available.';
-  const updating = !hasStateLine && cached?.text && (cached.fresh === false || cached.mtime !== session?.mtime);
+function briefHTML(ctx, item, session, task) {
+  const fallback = item.taskId
+    ? 'No check-ins on this card yet'
+    : item.sessionId ? 'No Keep card for this session' : item.detail || 'No session transcript available.';
   let actions = '';
   if (item.kind === 'question') {
     const options = Array.isArray(item.options) ? item.options : [];
@@ -814,7 +764,9 @@ function briefHTML(ctx, item, session) {
   if (item.kind === 'rateLimit') {
     actions = '<div class="opts"><button class="opt" data-continue><span class="n">1</span><span>Continue</span></button><button class="opt" data-leave><span class="n">2</span><span>Leave parked</span></button></div>';
   }
-  return `${stateLineHTML(ctx, session, fallback)}${updating ? '<div class="summary-updating" role="status">Updating summary…</div>' : ''}${actions}`;
+  const cardTask = item.taskId && task?.id ? task : null;
+  const picture = cardTask ? pictureHTML(ctx, cardTask) : '';
+  return `<div class="brief-body${picture ? ' with-picture' : ''}">${checkinsHTML(ctx, cardTask, fallback)}${picture}</div>${actions}`;
 }
 
 async function sendReply(ctx, item, text) {
@@ -1071,8 +1023,9 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     : waitingItem ? '<button class="btn" data-mark-running title="This session still has background work: list it under Running &amp; waiting until its next message or turn">Mark running</button>' : '';
   ctx.patchHTML(stage.querySelector('.quick-actions'), `${markRunning}${item.sessionId || waitingItem ? '<button class="btn" data-snooze="60">Snooze 1h</button><button class="btn" data-snooze="1440">Snooze 24h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}`);
   const menu = stage.querySelector('.session-actions');
-  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${paneId ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${keepRunning}${renameButtonsHTML(item.sessionId, session?.renamed)}${markControlsHTML(ctx.esc, item.sessionId, session?.mark)}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><div class="move-controls">${move}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, paneId, pane) + predictTypingControlsHTML() : ''}`);
+  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${paneId ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${keepRunning}${renameButtonsHTML(item.sessionId, session?.renamed)}${markControlsHTML(ctx.esc, item.sessionId, session?.mark)}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><div class="move-controls">${move}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, paneId, pane) + predictTypingControlsHTML() : ''}${item.taskId ? pictureToggleHTML() : ''}`);
   installActionsMenu(menu, ctx, paneId);
+  installPictureToggle(menu, ctx);
   if (keepRunning) installKeepRunningControl(menu, ctx, session, api.setSessionKeepRunning);
   installRenameControls(menu, ctx, heading, item.sessionId, title, api.renameSession);
   installMarkControls(menu, ctx, item.sessionId, session?.mark, api.markSession);
@@ -1082,12 +1035,11 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, item.sessionId, paneId);
   if (move) installMoveControls(menu.querySelector('.move-controls'), ctx, item.sessionId);
   if (restart) installRestartControls(menu.querySelector('.restart-controls'), ctx, item.sessionId, paneId);
-  const briefChanged = ctx.patchHTML(brief, briefHTML(ctx, item, session));
+  const briefChanged = ctx.patchHTML(brief, briefHTML(ctx, item, session, task));
   // The card's stored files, one line until opened (card-artifacts.js). A stage from
   // before this section existed has no box for it and simply goes without.
   const artifactsBox = stage.querySelector('.stage-artifacts');
   if (artifactsBox) ctx.patchHTML(artifactsBox, item.taskId && task?.id ? cardArtifactsHTML(ctx, task, { collapsible: true }) : '');
-  installGrading(brief, ctx, session);
   // An agent's pane on the stage brings its log with it, in a column beside the
   // terminal. The aside is patched like the brief; the terminal host beside it is
   // never rebuilt, and xterm's own ResizeObserver refits it when the column

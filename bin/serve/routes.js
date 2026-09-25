@@ -311,6 +311,21 @@ function routes(ctx) {
         return json(res, 200, { text: result.text, fresh: result.fresh });
       },
     },
+    // The console's card picture (card-picture.js). The x-keep header is required
+    // because a request can start a model call: a cross-site page cannot set it.
+    {
+      method: 'GET',
+      path: '/api/card-picture',
+      handle: async ({ req, res, url }) => {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        const id = url.searchParams.get('id') || '';
+        if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) return json(res, 400, { error: 'bad card id' });
+        let task = null;
+        try { task = keep.loadTask(id); } catch {}
+        if (!task) return json(res, 404, { error: 'no card' });
+        return json(res, 200, require('../card-picture.js').cardPicture(task));
+      },
+    },
     // Shadow decisions the watcher recorded and Owner has not graded yet. The
     // state payload already carries the newest one per session; this is for the
     // edit flow and for refreshing after a grade.

@@ -229,14 +229,13 @@ export function getState() {
   return stateRequest;
 }
 export const getLayouts = () => request('/api/layouts');
-export const getSessionSummary = (id) => request(`/api/sessionsummary?id=${encodeURIComponent(id)}`);
+export const getCardPicture = (id) => request(`/api/card-picture?id=${encodeURIComponent(id)}`);
 export const getDashboardDetail = (kind, id) => request(`/api/dashboard-detail?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`);
 // Resolves null when a newer search (from any console) replaced this one.
 export const searchSessionText = (query) => request(`/api/session-text-search?q=${encodeURIComponent(query)}`)
   .then((body) => (body?.superseded ? null : body?.results || []));
 export const searchDashboardReviews = (query) => request(`/api/dashboard-review-search?q=${encodeURIComponent(query)}`);
 export const getPendingDecisions = (sessionId) => request(`/api/decisions?session=${encodeURIComponent(sessionId)}&pending=1`);
-export const judgeDecision = (id, verdict, message) => write('/api/decisions/judge', { id, verdict, message }, 'POST', { label: 'Judging decision' });
 export const getPortableTransfers = () => freshRequest('/api/portable-transfers');
 export const getPortableTransferDraft = (sessionId) => request(`/api/portable-transfer-draft?session=${encodeURIComponent(sessionId)}`);
 export const getPortableTransferPreview = (transferId) => request(`/api/portable-transfer-preview?id=${encodeURIComponent(transferId)}`);

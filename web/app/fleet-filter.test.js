@@ -22,7 +22,6 @@ class FakeFleet extends FakeElement {
     this.input = null;
     this.select = null;
     this.count = null;
-    this.shadow = null;
     this.nodes = null;
     this.results = null;
   }
@@ -33,13 +32,12 @@ class FakeFleet extends FakeElement {
     this.input = new FakeElement();
     this.select = new FakeElement();
     this.count = new FakeElement();
-    this.shadow = new FakeElement();
     this.nodes = html.includes('fleet-nodes') ? new FakeElement() : null;
     this.results = new FakeElement();
   }
   querySelector(selector) {
     return ({ '.fleetbar': this.bar, '.fleetbar input': this.input, '.fleetbar select': this.select,
-      '.fleet-count': this.count, '.fleet-shadow': this.shadow, '.fleet-nodes': this.nodes, '.fleet-results': this.results })[selector] || null;
+      '.fleet-count': this.count, '.fleet-nodes': this.nodes, '.fleet-results': this.results })[selector] || null;
   }
 }
 

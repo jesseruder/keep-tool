@@ -570,32 +570,15 @@ guess, and a model that can talk Keep out of showing Owner a permission prompt i
 a model that can lose him a session. Today it overrides nothing: this records and
 reports, and that is all.
 
-## Grading from the console
+## Grading from the console (removed)
 
-The console's brief panel shows the watcher's **state line** where it used to
-show a generated summary of recent work. Beneath it sits the verdict chip and, if
-the verdict produced a shadow decision Owner has not marked yet, three buttons:
-
-- **Agree** records straight away — agreement needs no explanation.
-- **Disagree** and **Edit** open a single-line input, because `decisions.judge`
-  refuses a bare rejection ("the reviewer reads these back"). Edit prefills with
-  the message that was proposed, so Owner can send what he would have typed
-  instead; the graded message itself is preserved on the entry, and his text
-  lands in the note.
-- `a` and `d` are shortcuts for the first two, guarded the same way as every
-  other plain key: not while typing, not while a terminal has the keyboard.
-
-Both go through `POST /api/decisions/judge`, which calls `decisions.judge` under
-the registry lock exactly as `keep decisions` does, so the console and the CLI
-cannot both write the ledger at once. The response carries the type's new
-numbers, so the toast can say "continue 12/14 agree" without another round trip.
-`GET /api/decisions?session=<id>&pending=1` lists a session's unjudged decisions;
-the newest one already rides along in the state payload as
-`session.pendingDecision`, so the common case needs no fetch at all.
-
-The fleet strip carries one line of graduation progress — how many verdicts are
-waiting on Owner, and the agreement rate per type — so the numbers that decide
-whether a type goes live are visible without the CLI.
+The console used to show the watcher's state line in each session's brief panel,
+with a verdict chip and Agree / Disagree / Edit buttons (`a` / `d`) for the
+shadow decision. Four decisions were graded that way in two weeks, while
+`keep watcher score` grades every answered turn from what Owner actually typed,
+so the chip and the buttons were removed. The panel shows the card's last few
+check-ins instead. `keep decisions` still grades a shadow decision by hand, and
+the daemon still records verdicts and decisions exactly as before.
 
 ## A signal that was measured and not shipped: handbacks
 

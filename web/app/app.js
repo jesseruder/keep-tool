@@ -30,7 +30,6 @@ import { providerIconHTML } from './provider-icon.js';
 import { openPortableTransfer } from './portable-transfer.js';
 import { closeReviewerPopover, markReviewerSeen, renderDock, renderReviewer, renderReviewerTop } from './reviewer.js';
 import { createDetailStore } from './details.js';
-import { handleGradeKey } from './state-line.js';
 import { focusQueueItem, handleLeaveTerminalKey } from './leave-terminal.js';
 import { acknowledgeNotificationClick, installNotificationClicks, notificationPermission, notify, requestPermission, setBadge, shellReady } from './shell.js';
 import { installMobile, mobileActive, openMobileStage, searchClosed, searchOpened, syncMobile } from './mobile.js';
@@ -1631,10 +1630,6 @@ document.addEventListener('keydown', (event) => {
   else if (key === 'k' || key === 'ArrowUp') { moveQueue(-1); event.preventDefault(); }
   else if (key === 'p') state.currentActions.pin?.();
   else if (key === 'x') state.currentActions.dismiss?.();
-  // Grading the selected session's shadow verdict. The guard above already
-  // excluded inputs and a focused terminal; handleGradeKey re-checks both so it
-  // can be reasoned about (and tested) on its own.
-  else if ((key === 'a' || key === 'd') && handleGradeKey(ctx, key)) event.preventDefault();
   else if (/^[1-9]$/.test(key)) state.currentActions.number?.(Number(key));
 }, true);
 
