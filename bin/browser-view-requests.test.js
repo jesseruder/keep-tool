@@ -85,6 +85,14 @@ test('a node closes a view only by naming its session\'s pane', async (t) => {
   assert.equal((await service.close(node, { sessionId: SESSION, pane: 'p1@aws1' })).body.closed, true);
 });
 
+test('a node reads only the views of sessions it runs', async (t) => {
+  const { service } = setup(t);
+  await service.open(node, ask());
+  assert.equal((await service.status(SESSION, { class: 'node', node: 'other' })).body.request, null);
+  assert.equal((await service.status(SESSION, node)).body.request.num, 42);
+  assert.equal((await service.status(SESSION, { class: 'proxy' })).body.request.num, 42);
+});
+
 test('routes: nodes, the daemon machine and the console may open and close views', () => {
   const list = routes({ browserViewService: {} });
   const find = (method, pathname) => matchRoute(list, { req: { method }, url: new URL(`http://x${pathname}`) });

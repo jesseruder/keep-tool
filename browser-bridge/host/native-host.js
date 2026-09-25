@@ -290,7 +290,12 @@ function forwardViewer(client, message) {
  */
 function routeViewerEvent(message) {
   const route = viewerRoutes.get(message.viewer);
-  if (!route || route.client.socket.destroyed) return;
+  if (!route || route.client.socket.destroyed) {
+    // Nobody will ack a frame for a view that is gone; release it so the tab's
+    // screencast is not left waiting on it.
+    if (message.event === "viewer_frame") sendToExtension({ method: "viewer_ack", params: { viewer: message.viewer } });
+    return;
+  }
   const { client } = route;
   if (message.event === "viewer_frame" && client.socket.writableLength > MAX_VIEWER_BACKLOG_BYTES) {
     sendToExtension({ method: "viewer_ack", params: { viewer: message.viewer } });

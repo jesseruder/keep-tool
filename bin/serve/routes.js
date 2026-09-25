@@ -166,8 +166,8 @@ function routes(ctx) {
       method: 'GET',
       path: '/api/browser-view',
       allow: ['node', 'local', 'proxy', 'admin'],
-      handle: async ({ res, url }) => {
-        const result = await ctx.browserViewService.status(url.searchParams.get('session') || '');
+      handle: async ({ res, url, principal }) => {
+        const result = await ctx.browserViewService.status(url.searchParams.get('session') || '', principal);
         return json(res, result.status, result.body);
       },
     },

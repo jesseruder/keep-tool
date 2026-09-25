@@ -153,8 +153,10 @@ function createBrowserViewService(options = {}) {
     return { status: 200, body: { closed: true, request: publicRecord(target) } };
   }
 
-  async function status(sessionId) {
-    const found = (await load()).find((r) => r.sessionId === sessionId);
+  // A node reads only the views of sessions it runs.
+  async function status(sessionId, principal = null) {
+    const node = principal && principal.class === 'node' ? principal.node : null;
+    const found = (await load()).find((r) => r.sessionId === sessionId && (!node || r.node === node));
     return { status: 200, body: { request: found ? publicRecord(found) : null } };
   }
 

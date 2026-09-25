@@ -121,17 +121,41 @@ export function createViewerHandlers() {
     return false;
   }
 
+  // A viewer's start and stop run one at a time: a resize restart racing a tab switch
+  // must not leave a screencast or an override on a tab no viewer owns any more.
+  const chains = new Map(); // viewerId -> promise
+  function serial(id, fn) {
+    const run = (chains.get(id) ?? Promise.resolve()).then(fn);
+    const settled = run.then(() => {}, () => {});
+    chains.set(id, settled);
+    settled.then(() => {
+      if (chains.get(id) === settled) chains.delete(id);
+    });
+    return run;
+  }
+
   async function startScreencast(viewer) {
     const tabId = viewer.tabId;
+    const current = () => !viewer.stopped && viewer.tabId === tabId;
     await attach(tabId);
+    if (!current()) return;
     if (viewer.fit) {
+      // Laid out at the view's size, but never switched to a mobile layout: the agent
+      // is working in this page too, and a phone glance should not reflow it.
       await send(tabId, "Emulation.setDeviceMetricsOverride", {
         width: viewer.width,
         height: viewer.height,
         deviceScaleFactor: 0,
-        mobile: viewer.width < 600,
+        mobile: false,
       });
     }
+    if (!current()) {
+      await send(tabId, "Emulation.clearDeviceMetricsOverride").catch(() => {});
+      return;
+    }
+    // A tab streams once: a restart at a new size, or another view taking the tab over,
+    // replaces the screencast that is running ("Screencast is already active" otherwise).
+    await send(tabId, "Page.stopScreencast").catch(() => {});
     const scale = viewer.pixelRatio;
     await send(tabId, "Page.startScreencast", {
       format: "jpeg",
@@ -215,11 +239,74 @@ export function createViewerHandlers() {
      * has on Owner's screen; with `fit` the page is laid out at that size while it is
      * watched, which is what makes an 800x600 headless window usable on a phone.
      */
-    async viewer_start(params, emit) {
-      if (!validViewerId(params.viewer)) throw new Error("viewer id is required");
+    viewer_start(params, emit) {
+      if (!validViewerId(params.viewer)) return Promise.reject(new Error("viewer id is required"));
+      return serial(params.viewer, () => startNow(params, emit));
+    },
+
+    /** The viewer drew a frame: release the ack CDP is waiting for, if one is held. */
+    async viewer_ack(params) {
+      const viewer = viewers.get(params.viewer);
+      if (!viewer) return { stopped: true };
+      viewer.unacked = Math.max(0, viewer.unacked - 1);
+      if (viewer.heldAck != null && viewer.unacked < MAX_UNACKED) {
+        const sessionId = viewer.heldAck;
+        viewer.heldAck = null;
+        await ackCdp(viewer, sessionId);
+      }
+      return { ok: true };
+    },
+
+    /** One input event, in the view's CSS pixels, which are the page's with `fit` on. */
+    async viewer_input(params) {
+      const viewer = viewers.get(params.viewer);
+      if (!viewer || viewer.tabId == null) throw new Error("that view is not showing a tab");
+      await dispatchInput(viewer.tabId, params.input ?? {});
+      return { ok: true };
+    },
+
+    async viewer_navigate(params) {
+      const viewer = viewers.get(params.viewer);
+      if (!viewer || viewer.tabId == null) throw new Error("that view is not showing a tab");
+      const action = String(params.action ?? "");
+      if (action === "back") await chrome.tabs.goBack(viewer.tabId);
+      else if (action === "forward") await chrome.tabs.goForward(viewer.tabId);
+      else if (action === "reload") await chrome.tabs.reload(viewer.tabId);
+      else throw new Error(`unknown navigation: ${action}`);
+      return { ok: true };
+    },
+
+    viewer_stop(params) {
+      return serial(String(params.viewer ?? ""), async () => {
+        const viewer = viewers.get(params.viewer);
+        if (viewer) await stopViewer(viewer, params.reason ?? "closed");
+        return { ok: true };
+      });
+    },
+
+    /** The host lost its port or its client: every viewer it carried is over. */
+    stopAll(reason) {
+      return Promise.all([...viewers.values()].map((viewer) => stopViewer(viewer, reason)));
+    },
+  };
+
+  /**
+   * Start (or move) a viewer onto one tab. Width and height are the CSS size the view
+   * has on Owner's screen; with `fit` the page is laid out at that size while it is
+   * watched, which is what makes an 800x600 headless window usable on a phone. A tab has
+   * one view at a time: CDP gives a tab one screencast, so a second console opening the
+   * same tab takes it over, and the first is told.
+   */
+  async function startNow(params, emit) {
+    {
       const session = String(params.session ?? "");
       if (!/^#\d+$/.test(session)) throw new Error("session must look like #12");
       const tab = await requireViewableTab(session, params.tabId);
+      for (const other of viewers.values()) {
+        if (other.id === params.viewer || other.tabId !== tab.id) continue;
+        other.tabId = null;
+        other.emit({ event: "viewer_state", viewer: other.id, state: "taken-over", reason: "another view opened this tab" });
+      }
       let viewer = viewers.get(params.viewer);
       if (viewer && viewer.tabId != null && viewer.tabId !== tab.id) {
         const previous = viewer.tabId;
@@ -256,51 +343,8 @@ export function createViewerHandlers() {
         throw error;
       }
       return { tab };
-    },
-
-    /** The viewer drew a frame: release the ack CDP is waiting for, if one is held. */
-    async viewer_ack(params) {
-      const viewer = viewers.get(params.viewer);
-      if (!viewer) return { stopped: true };
-      viewer.unacked = Math.max(0, viewer.unacked - 1);
-      if (viewer.heldAck != null && viewer.unacked < MAX_UNACKED) {
-        const sessionId = viewer.heldAck;
-        viewer.heldAck = null;
-        await ackCdp(viewer, sessionId);
-      }
-      return { ok: true };
-    },
-
-    /** One input event, in the view's CSS pixels, which are the page's with `fit` on. */
-    async viewer_input(params) {
-      const viewer = viewers.get(params.viewer);
-      if (!viewer || viewer.tabId == null) throw new Error("that view is not showing a tab");
-      await dispatchInput(viewer.tabId, params.input ?? {});
-      return { ok: true };
-    },
-
-    async viewer_navigate(params) {
-      const viewer = viewers.get(params.viewer);
-      if (!viewer || viewer.tabId == null) throw new Error("that view is not showing a tab");
-      const action = String(params.action ?? "");
-      if (action === "back") await chrome.tabs.goBack(viewer.tabId);
-      else if (action === "forward") await chrome.tabs.goForward(viewer.tabId);
-      else if (action === "reload") await chrome.tabs.reload(viewer.tabId);
-      else throw new Error(`unknown navigation: ${action}`);
-      return { ok: true };
-    },
-
-    async viewer_stop(params) {
-      const viewer = viewers.get(params.viewer);
-      if (viewer) await stopViewer(viewer, params.reason ?? "closed");
-      return { ok: true };
-    },
-
-    /** The host lost its port or its client: every viewer it carried is over. */
-    stopAll(reason) {
-      return Promise.all([...viewers.values()].map((viewer) => stopViewer(viewer, reason)));
-    },
-  };
+    }
+  }
 }
 
 const MOUSE_TYPES = new Set(["mouseMoved", "mousePressed", "mouseReleased", "mouseWheel"]);

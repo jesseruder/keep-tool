@@ -21,6 +21,7 @@ const { parsePaneRef } = require('./nodes.js');
 
 const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 const TABS_POLL_MS = 2000;
+const PING_MS = 20_000;
 const OPEN_TIMEOUT_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -69,6 +70,17 @@ function createBrowserViewBridge(options = {}) {
     };
     ws.on('close', shutdown);
     ws.on('error', shutdown);
+    // A phone that drops off the network leaves a half-open socket, and with it a view
+    // holding the page at its size. No pong between two pings ends it.
+    let alive = true;
+    ws.on('pong', () => { alive = true; });
+    const pingTimer = setInterval(() => {
+      if (closed) { clearInterval(pingTimer); return; }
+      if (!alive) { ws.terminate(); shutdown(); clearInterval(pingTimer); return; }
+      alive = false;
+      try { ws.ping(); } catch {}
+    }, PING_MS);
+    pingTimer.unref?.();
 
     const onEvent = (event) => {
       if (closed) return;

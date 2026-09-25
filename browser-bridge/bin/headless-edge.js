@@ -344,6 +344,20 @@ export function parseArgs(argv, env = process.env) {
 export function prepareProfileDir(profileDir) {
   fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(profileDir, 0o700);
+  clearServiceWorkers(profileDir);
+}
+
+/**
+ * Edge runs an unpacked extension's service worker from its own script cache, and
+ * Extensions.loadUnpacked of the same directory does not replace it: measured on Edge 153,
+ * a restart after a landing kept running the old background code. Removing the profile's
+ * service worker store before Edge starts is what makes it read the extension's files
+ * again. Removing only ScriptCache is worse - the registration then points at a script
+ * that is gone and the extension's worker never starts (DidStartWorkerFail 5). Websites'
+ * workers go too; they register again on the next visit, and sign-ins live in cookies.
+ */
+export function clearServiceWorkers(profileDir) {
+  fs.rmSync(path.join(profileDir, "Default", "Service Worker"), { recursive: true, force: true });
 }
 
 async function main(argv) {

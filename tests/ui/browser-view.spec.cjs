@@ -104,6 +104,9 @@ test('Hide folds it to a button and drops the stream; Close ends it for good', a
   await panel(page).locator('.bv-pill').click();
   await expect(panel(page).locator('.bv-card')).toBeVisible();
   await expect.poll(() => browserEvents().filter(e => e.t === 'connect').length).toBe(2);
+  // A new connection is a new view on the far side: it must be started again.
+  await expect.poll(() => browserEvents().filter(e => e.t === 'start').length).toBeGreaterThanOrEqual(2);
+  await expect(panel(page).locator('.bv-status')).toBeHidden();
 
   await panel(page).locator('.bv-close').click();
   await expect(panel(page)).toBeHidden();

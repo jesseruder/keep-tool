@@ -147,6 +147,18 @@ test("the profile is private on every start, even one that already existed open"
   assert.equal(fs.statSync(existing).mode & 0o777, 0o700);
 });
 
+test("a start drops the cached service workers, so a landed extension's code runs, and keeps the rest", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bb-profile-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const workers = path.join(root, "Default", "Service Worker", "ScriptCache");
+  fs.mkdirSync(workers, { recursive: true });
+  fs.writeFileSync(path.join(workers, "stale"), "old background.js");
+  fs.writeFileSync(path.join(root, "Default", "Cookies"), "sign-ins");
+  prepareProfileDir(root);
+  assert.equal(fs.existsSync(path.join(root, "Default", "Service Worker")), false);
+  assert.equal(fs.readFileSync(path.join(root, "Default", "Cookies"), "utf8"), "sign-ins");
+});
+
 // --- the supervisor -------------------------------------------------------
 
 /** A child process as much as the supervisor sees of one: fds 3 and 4, kill, exit. */

@@ -158,6 +158,7 @@ function startView(root, ctx, request, key) {
   let touch = null;
   let decoding = false;
   let queued = null;
+  let needsStart = false;
 
   const setStatus = (text) => {
     status.textContent = text || '';
@@ -179,6 +180,7 @@ function startView(root, ctx, request, key) {
   const start = (id) => {
     if (id == null) return;
     tabId = id;
+    needsStart = false;
     sentSize = size();
     send({ t: 'start', tabId: id, ...sentSize, fit: true });
     renderTabs();
@@ -211,10 +213,11 @@ function startView(root, ctx, request, key) {
     return (popup || tabs.find((tab) => tab.active) || tabs[0])?.id ?? null;
   };
 
+  // Every frame is acked exactly once, drawn or not: the stream waits on those acks.
   const drawFrame = async (buffer) => {
-    const { header, image } = parseFrame(buffer);
-    if (header.tabId !== tabId) { send({ t: 'ack' }); return; }
     try {
+      const { header, image } = parseFrame(buffer);
+      if (header.tabId !== tabId) return;
       const bitmap = await createImageBitmap(new Blob([image], { type: 'image/jpeg' }));
       if (disposed) return;
       if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
@@ -252,6 +255,7 @@ function startView(root, ctx, request, key) {
       }
     } catch (error) {
       console.warn('browser view: bad frame', error);
+      if (queued) { queued = null; send({ t: 'ack' }); }
     } finally {
       decoding = false;
     }
@@ -275,6 +279,8 @@ function startView(root, ctx, request, key) {
       if (message.state === 'detached') setStatus('reconnecting to the tab');
       else if (message.state === 'tab-closed') { tabId = null; send({ t: 'tabs' }); }
       else if (message.state === 'error') setStatus(message.reason || 'the view stopped');
+      else if (message.state === 'taken-over') { needsStart = true; setStatus('another view opened this tab · click to take it back'); }
+      else if (message.state === 'stopped') { needsStart = true; setStatus(`the view stopped${message.reason ? `: ${message.reason}` : ''} · click to restart`); }
     } else if (message.t === 'error') {
       setStatus(message.message || 'error');
     }
@@ -282,17 +288,26 @@ function startView(root, ctx, request, key) {
 
   const connect = () => {
     if (disposed || socket) return;
+    // A new connection is a new view on the far side: it has to be started again, on
+    // whichever tab the tab list picks.
+    tabId = null;
+    sentSize = null;
+    needsStart = false;
+    queued = null;
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const query = new URLSearchParams({ session: String(request.num) });
-    socket = new WebSocket(`${protocol}//${location.host}/ws/browser/${encodeURIComponent(request.pane)}?${query}`);
+    const connection = new WebSocket(`${protocol}//${location.host}/ws/browser/${encodeURIComponent(request.pane)}?${query}`);
+    socket = connection;
     socket.binaryType = 'arraybuffer';
     setStatus('connecting');
     socket.addEventListener('message', (event) => {
+      if (connection !== socket) return;
       if (typeof event.data === 'string') {
         try { onMessage(JSON.parse(event.data)); } catch {}
       } else onFrame(event.data);
     });
     socket.addEventListener('close', () => {
+      if (connection !== socket) return;
       socket = null;
       if (!disposed && !root.classList.contains('folded')) setStatus('disconnected · click to reconnect');
     });
@@ -312,9 +327,26 @@ function startView(root, ctx, request, key) {
     input(pendingMove);
     pendingMove = null;
   };
+  // PointerEvent.detail is 0 in Chromium, so double and triple clicks are counted here:
+  // the same button pressed again within half a second, a few pixels from the last.
+  let lastPress = null;
+  const clickCount = (event) => {
+    const now = performance.now();
+    const again = lastPress && lastPress.button === event.button && now - lastPress.at < 500
+      && Math.abs(event.clientX - lastPress.x) + Math.abs(event.clientY - lastPress.y) < 6;
+    const count = again ? Math.min(3, lastPress.count + 1) : 1;
+    lastPress = { button: event.button, at: now, x: event.clientX, y: event.clientY, count };
+    return count;
+  };
   canvas.addEventListener('pointerdown', (event) => {
     screen.focus({ preventScroll: true });
     if (!socket) { connect(); return; }
+    if (needsStart) {
+      // Taken over by another view, or stopped on the far side: a click takes it back.
+      needsStart = false;
+      start(tabId ?? pickTab());
+      return;
+    }
     if (event.pointerType === 'touch') {
       touch = { x: event.clientX, y: event.clientY, lastY: event.clientY, lastX: event.clientX, moved: false };
       canvas.setPointerCapture(event.pointerId);
@@ -324,7 +356,7 @@ function startView(root, ctx, request, key) {
     const button = MOUSE_BUTTONS[event.button] || 'left';
     buttonsDown = event.buttons;
     canvas.setPointerCapture(event.pointerId);
-    input({ kind: 'mouse', type: 'mousePressed', ...point(event), button, buttons: event.buttons, clickCount: event.detail || 1, modifiers: modifierBits(event) });
+    input({ kind: 'mouse', type: 'mousePressed', ...point(event), button, buttons: event.buttons, clickCount: clickCount(event), modifiers: modifierBits(event) });
     event.preventDefault();
   });
   canvas.addEventListener('pointermove', (event) => {
@@ -358,7 +390,7 @@ function startView(root, ctx, request, key) {
     flushMove();
     const button = MOUSE_BUTTONS[event.button] || 'left';
     buttonsDown = event.buttons;
-    input({ kind: 'mouse', type: 'mouseReleased', ...point(event), button, buttons: event.buttons, clickCount: event.detail || 1, modifiers: modifierBits(event) });
+    input({ kind: 'mouse', type: 'mouseReleased', ...point(event), button, buttons: event.buttons, clickCount: lastPress?.count || 1, modifiers: modifierBits(event) });
   });
   canvas.addEventListener('pointercancel', () => { touch = null; buttonsDown = 0; });
   canvas.addEventListener('contextmenu', (event) => event.preventDefault());
@@ -389,7 +421,9 @@ function startView(root, ctx, request, key) {
   screen.addEventListener('paste', (event) => {
     const text = event.clipboardData?.getData('text/plain');
     event.preventDefault();
-    if (text) input({ kind: 'text', text });
+    // The extension inserts at most 20,000 characters, and a bigger message would
+    // close the socket.
+    if (text) input({ kind: 'text', text: text.slice(0, 20_000) });
   });
 
   // The on-screen keyboard: a text field the phone types into, emptied as it goes.
@@ -408,7 +442,7 @@ function startView(root, ctx, request, key) {
       input(keyInput(backspace, 'keyDown'));
       input(keyInput(backspace, 'keyUp'));
     } else if (keys.value) {
-      input({ kind: 'text', text: keys.value });
+      input({ kind: 'text', text: keys.value.slice(0, 20_000) });
     }
     keys.value = '';
   });
