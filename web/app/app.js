@@ -955,7 +955,7 @@ function renderHealth() {
     ? `<dt>terminal host</dt><dd class="bad">${esc(hostOutageText(outage))}${outage.stale && outage.panesAt ? ` · panes last listed ${esc(rel(outage.panesAt))}` : ' · no pane list'}</dd>`
     : '';
   // Each machine's numbers, a single-node install's one included: this is where a
-  // lone machine shows them, since the header strip is a fleet's.
+  // lone machine shows them, since the footer strip is a fleet's.
   const nodeRows = nodeStatsHealthRowsHTML(esc, data);
   button.querySelector('.pop').innerHTML = `<b>keep serve</b> · pid ${esc(health.daemon?.pid || '—')}${enable}<dl>${hostRow}${nodeRows}${rows.map((row) => `<dt>${esc(row.name)}</dt><dd class="${['failing', 'silent', 'never'].includes(row.displayState) ? 'bad' : amber(row) ? 'warning' : ''}">${esc(label(row))}${row.displayDetail ? ` · ${esc(row.displayDetail)}` : ''}</dd>`).join('')}</dl>`;
   button.querySelector('.notify-enable')?.addEventListener('click', async (event) => {
@@ -965,8 +965,9 @@ function renderHealth() {
     renderHealth();
   });
 }
-// Memory, CPU, load and disk per machine, beside the daemon health. Only a fleet of
-// two or more nodes shows it; everything else leaves the header as it was.
+// Memory, CPU, load and disk per machine, in the footer before the connection
+// status. Only a fleet of two or more nodes shows it; everything else leaves the
+// footer as it was.
 function renderNodeStrip() {
   const strip = document.querySelector('#nodeStrip');
   if (!strip) return;

@@ -65,10 +65,11 @@ html.desktop .bar { padding-left: 100px; -webkit-user-select: none; }
 .meter-details span, .meter-details b { display: block; } .meter-details b { font-weight: 600; }
 .meter-group:hover .meter-details, .meter-group:focus-visible .meter-details { display: block; }
 .meter.unavailable { align-self: center; }
-/* Per-node stats (node-stats.js): beside the daemon health, a fleet's only. */
+/* Per-node stats (node-stats.js): at the end of the footer, before the connection
+   status, a fleet's only. */
 .node-strip { margin-left: auto; display: flex; flex-wrap: nowrap; align-items: center; gap: 12px; min-width: 0; overflow: hidden; color: var(--bar-muted); font: 11px var(--mono); white-space: nowrap; }
 .node-strip[hidden] { display: none; }
-.node-strip:not([hidden]) + .health { margin-left: 0; }
+.node-strip:not([hidden]) + .connection { margin-left: 0; }
 .node-stat { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border-radius: 5px; cursor: default; }
 .node-stat > b { color: var(--bar-text); font-weight: 500; }
 .node-stat > i { font-style: normal; color: var(--bar-line); }
@@ -660,7 +661,7 @@ html.mobile .artifact-save { padding: 4px 0; }
 }
 @media (max-width: 760px) {
   .bar { gap: 6px; padding-inline: 8px; }
-  .bar .health, .bar .theme-picker, .bar #dockbtn, .bar .meters, .bar .node-strip { display: none; }
+  .bar .health, .bar .theme-picker, .bar #dockbtn, .bar .meters, .keys .node-strip { display: none; }
   .modes { flex: 1; overflow-x: auto; scrollbar-width: none; }
   .modes::-webkit-scrollbar { display: none; }
   .modes button { flex: none; }

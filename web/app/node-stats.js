@@ -3,7 +3,7 @@
 // without a sample has no `stats`, an older daemon publishes none at all, and every
 // helper here then answers '' so the console renders what it rendered before.
 //
-// A single-node install gets no header strip and no Fleet cards; its one machine is
+// A single-node install gets no footer strip and no Fleet cards; its one machine is
 // shown behind the daemon health details instead.
 
 const GB = 1024 ** 3;
@@ -134,7 +134,7 @@ export function nodeStripEntryHTML(esc, node, now = Date.now()) {
   return `<span class="${entryClass(node, 'node-stat')}" title="${esc(nodeStripTitle(node, now))}" tabindex="0"><b>${esc(node.name)}</b><i>·</i>${parts}</span>`;
 }
 
-// The header strip: one entry per sampled node, the daemon's first (the order the
+// The footer strip: one entry per sampled node, the daemon's first (the order the
 // daemon publishes). Empty unless this is a fleet.
 export function nodeStripHTML(esc, data, now = Date.now()) {
   if (!nodeStatsVisible(data)) return '';
