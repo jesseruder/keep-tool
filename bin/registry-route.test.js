@@ -141,7 +141,8 @@ test('a node may write a check recipe, but never a command the daemon would run'
   const accepted = [
     ['add', ['title', '--check', 'read the logs and fix what you find']],
     ['checkin', ['card', '--check', 'open a session and run this']],
-    ['checkin', ['card', '--check=inline recipe']],
+    // Only the two-argument form: the CLI's parseArgs reads `--check=...` as an unknown
+    // flag, so the route walking it through would only hand it a usage error.
     ['add', ['title', '--check-after', '+1d', '--check', 'look again', '--on-pass', 'rearm', '--check-every', '+1d']],
     ['checkin', ['card', '--on-pass', 'done']],
     ['checkin', ['card', '--check-after', '+2h']],
