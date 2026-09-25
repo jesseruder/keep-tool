@@ -32,7 +32,16 @@ const UNREACHABLE_CODES = new Set([
   'ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH',
   'EHOSTDOWN', 'ENETDOWN', 'ETIMEDOUT', 'EPIPE', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET',
 ]);
-const UNKNOWN_TOOL = /unknown tool|no such tool|tool .*not found/i;
+
+// Whether an error says this exact tool does not exist. The Castle gateway answers
+// "Unknown tool 'discord_recent'. Call tools/list to see what this gateway serves."
+// and the MCP SDKs "Unknown tool: discord_recent"; the name must follow the phrase
+// directly, optionally quoted, and end there — so `discord_recent_archive`, or an
+// error that merely mentions the tool elsewhere, is not a missing tool.
+function isUnknownTool(text, tool) {
+  const name = String(tool).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\bunknown tool:?\\s*['"\`]?${name}['"\`]?(?=$|[\\s.,;:!)])`, 'i').test(String(text));
+}
 
 class GatewayUnavailable extends Error {
   constructor(message, options = {}) {
@@ -270,7 +279,7 @@ async function callTool(options) {
       const text = String(message.error.message || 'error').replace(/\s+/g, ' ').slice(0, 300);
       // Only an unknown-tool error that names this tool: "unknown tool" about some other
       // name is the gateway misbehaving, not our tool being absent.
-      if (method === 'tools/call' && UNKNOWN_TOOL.test(text) && text.includes(tool)) {
+      if (method === 'tools/call' && isUnknownTool(text, tool)) {
         throw new GatewayUnavailable(`${label}: tool ${tool} is not available: ${text}`, { code: 'tool_missing' });
       }
       throw new GatewayError(`${label} ${method}: ${text}`, { code: 'rpc' });
@@ -289,7 +298,7 @@ async function callTool(options) {
     const result = await send('tools/call', { name: tool, arguments: args });
     if (result && result.isError) {
       const text = toolErrorText(result);
-      if (UNKNOWN_TOOL.test(text) && text.includes(tool)) {
+      if (isUnknownTool(text, tool)) {
         throw new GatewayUnavailable(`${label}: tool ${tool} is not available: ${text}`, { code: 'tool_missing' });
       }
       throw new GatewayError(`${label} ${tool}: ${text}`, { code: 'tool_error' });
@@ -307,4 +316,4 @@ async function callTool(options) {
   }
 }
 
-module.exports = { GatewayError, GatewayUnavailable, PROTOCOL_VERSION, callTool, parseSseEvents, runHeadersHelper, unwrapToolResult };
+module.exports = { GatewayError, GatewayUnavailable, PROTOCOL_VERSION, callTool, isUnknownTool, parseSseEvents, runHeadersHelper, unwrapToolResult };

@@ -43,6 +43,10 @@ async function fakeGateway(options = {}) {
         reply = { jsonrpc: '2.0', id: message.id, error: { code: -32603, message: 'internal error' } };
       } else if (message.method === 'tools/call' && message.params.name === 'rpc-unknown') {
         reply = { jsonrpc: '2.0', id: message.id, error: { code: -32602, message: 'Unknown tool: rpc-unknown' } };
+      } else if (message.method === 'tools/call' && message.params.name === 'near-miss') {
+        reply = { jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: "Unknown tool 'near-miss_archive'." }], isError: true } };
+      } else if (message.method === 'tools/call' && message.params.name === 'mentioned') {
+        reply = { jsonrpc: '2.0', id: message.id, error: { code: -32603, message: 'Unknown tool registry failure while handling mentioned' } };
       } else if (message.method === 'tools/call' && message.params.name === 'rpc-unknown-other') {
         reply = { jsonrpc: '2.0', id: message.id, error: { code: -32602, message: 'Unknown tool: some_backend_helper' } };
       } else {
@@ -105,7 +109,10 @@ test('a gateway that is there and failing is a GatewayError, not an outage', asy
   try {
     for (const [tool, code, pattern] of [['broken', 'tool_error', /broken: database is down/], ['rpc-error', 'rpc', /tools\/call: internal error/],
       // "Unknown tool" about some other name is not our tool being absent.
-      ['rpc-unknown-other', 'rpc', /tools\/call: Unknown tool: some_backend_helper/]]) {
+      ['rpc-unknown-other', 'rpc', /tools\/call: Unknown tool: some_backend_helper/],
+      // Nor is one naming a longer tool, or merely mentioning ours after the phrase.
+      ['near-miss', 'tool_error', /near-miss: Unknown tool 'near-miss_archive'/],
+      ['mentioned', 'rpc', /tools\/call: Unknown tool registry failure while handling mentioned/]]) {
       await assert.rejects(mcp.callTool({ url: gateway.url, headers: { Authorization: TOKEN }, tool }), (error) => {
         assert.ok(error instanceof mcp.GatewayError, tool);
         assert.equal(error instanceof mcp.GatewayUnavailable, false);
@@ -143,6 +150,22 @@ test('an auth failure is a GatewayError, an unreachable gateway is GatewayUnavai
     assert.equal(error.message.includes('token=abc'), false, 'the query string is not repeated');
     return true;
   });
+});
+
+test('unknown-tool matching wants the exact tool name right after the phrase', () => {
+  for (const text of [
+    "Unknown tool 'discord_recent'. Call tools/list to see what this gateway serves.", // the Castle gateway, live
+    'Unknown tool: discord_recent', // MCP SDKs
+    'unknown tool "discord_recent"',
+    'Unknown tool `discord_recent`, sorry',
+  ]) assert.equal(mcp.isUnknownTool(text, 'discord_recent'), true, text);
+  for (const text of [
+    "Unknown tool 'discord_recent_archive'.",
+    'Unknown tool: discord_recent2',
+    'Unknown tool: other while handling discord_recent',
+    'database error while handling discord_recent',
+    'discord_recent: unknown tool mode',
+  ]) assert.equal(mcp.isUnknownTool(text, 'discord_recent'), false, text);
 });
 
 test('a redirect is refused as a GatewayError and the credential never reaches its target', async () => {

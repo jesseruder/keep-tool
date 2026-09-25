@@ -152,7 +152,9 @@ an empty table. The first cursor is the larger of H and the highest row the wind
 classified, so a row inserted after the mark (it has a larger `seq`) is read by the
 next `after_seq` poll whichever side of the window query it landed on. If the window's
 backlog stopped the first poll early, the cursor stays at the classified prefix instead,
-so the rest of the window is read next. Every poll after the first successful one reads
+so the rest of the window is read next; and if paging stopped at its page or row bound
+before the end of the window, the cursor is the highest `seq` actually fetched, never
+H, even when every fetched row was filtered out or already seen. Every poll after the first successful one reads
 by `after_seq`. Rows are deduplicated by `message_id` against `.keep/discord/seen.json`
 (30 days), so a row the scraper re-reads under a new `seq` is not classified twice. A
 forum message reaches the classifier as `[post: <thread title>] <text>`. Each decision
@@ -166,8 +168,10 @@ early, the cursor holds at the first unclassified row, and `keep discord status`
 A gateway that is **not there to ask** does not make the `discord` row in `keep health`
 read as failing: the connection refused or reset (before the response or while its body
 was read), the name unresolvable, the call timed out, or the gateway answering without
-the `discord_recent` tool (an unknown-tool error naming `discord_recent`, as a tool
-error or a JSON-RPC error) because it is not deployed yet. That is treated as a state the scheduler tolerates: `poll()` records
+the `discord_recent` tool because it is not deployed yet: a tool error or JSON-RPC error
+reading `Unknown tool 'discord_recent'` / `Unknown tool: discord_recent`, the exact
+name directly after the phrase (`discord_recent_archive`, or an error that only
+mentions the tool elsewhere, does not count). That is treated as a state the scheduler tolerates: `poll()` records
 a skip in its status file, the row records a skip detailed
 `gateway unavailable: <message>`, marked `expected`, which clears the failure streak and
 keeps `bin/lint.js` `daemon-health` from calling it late. One

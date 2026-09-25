@@ -254,6 +254,30 @@ test('a gateway that is there but failing is thrown, not swallowed into a skip',
   assert.equal(readState(root, 'cursor.json').seq, 3);
 });
 
+test('a first run that stops paging at its bound over a filtered prefix does not jump to the mark', () => {
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  // maxPerPoll 1: pages of 50, and paging stops after 3 rows' worth — one page.
+  const root = fixture({ enabled: true, maxPerPoll: 1, channels: ['bug-reports'] });
+  const recent = '2026-09-25T11:00:00Z';
+  const rows = [
+    ...Array.from({ length: 120 }, (_, index) => row(index + 1, { postedAt: recent })),
+    row(121, { channel: 'bug-reports', postedAt: recent, text: 'the one that matters' }),
+  ];
+  const result = run(root, pollScript(rows, `
+    const first = await discord.poll({ deps, now: ${now} });
+    const cursorAfterFirst = JSON.parse(require('fs').readFileSync(discord.CURSOR_FILE, 'utf8')).seq;
+    const backlog = discord.status().backlog;
+    const found = [];
+    for (let i = 0; i < 5 && !found.length; i += 1) found.push(...(await discord.poll({ deps, now: ${now} })).map((entry) => entry.summary));
+    process.stdout.write(JSON.stringify({ first: first.length, cursorAfterFirst, backlog, found }));
+  `));
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    first: 0, cursorAfterFirst: 50, backlog: true, found: ['[post: A post] the one that matters'],
+  });
+  assert.equal(readState(root, 'cursor.json').seq, 121);
+});
+
 test('a message id is classified once however often it comes back', () => {
   const root = fixture({ enabled: true }, { cursor: 0 });
   // The scraper re-read an edited message under a new seq.

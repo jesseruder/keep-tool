@@ -262,16 +262,21 @@ function pageRows(page) {
 // leave the watcher re-reading a sliding 24h window forever.
 async function fetchRows(cursor, cfg, deps, now) {
   const call = deps.callGateway || ((args) => callGateway(args, cfg, deps));
-  if (cursor != null) return { rows: await fetchPages(call, cursor, cfg, now), baseline: null };
+  if (cursor != null) return { ...await fetchPages(call, cursor, cfg, now), baseline: null };
   const newest = pageRows(await call({ limit: 1 }));
   const baseline = newest.reduce((max, row) => Math.max(max, row.seq), 0);
-  return { rows: await fetchPages(call, null, cfg, now), baseline };
+  return { ...await fetchPages(call, null, cfg, now), baseline };
 }
 
+// { rows, truncated }. `truncated` is true whenever paging stopped for any reason
+// other than a short page — the page bound, the row bound, or a full page that made no
+// progress — because then rows the gateway still holds were not fetched. Only a short
+// page says the fetch reached the end.
 async function fetchPages(call, cursor, cfg, now) {
   const limit = Math.min(PAGE_MAX, Math.max(cfg.maxPerPoll, 50));
   const bySeq = new Map();
   let after = cursor;
+  let truncated = true;
   for (let page = 0; page < PAGES_PER_POLL; page += 1) {
     const args = after == null
       ? { since: new Date(now - FIRST_RUN_WINDOW_MS).toISOString(), limit }
@@ -283,11 +288,12 @@ async function fetchPages(call, cursor, cfg, now) {
       bySeq.set(row.seq, row);
       max = Math.max(max, row.seq);
     }
-    if (rows.length < limit || max < 0 || max === after) break;
+    if (rows.length < limit) { truncated = false; break; }
+    if (max < 0 || max === after) break;
     after = max;
     if (bySeq.size >= cfg.maxPerPoll * 3) break;
   }
-  return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+  return { rows: [...bySeq.values()].sort((a, b) => a.seq - b.seq), truncated };
 }
 
 function normalizeRow(row) {
@@ -333,8 +339,9 @@ async function poll(options = {}) {
   const cursor = readCursor();
   let rows;
   let baseline;
+  let truncated;
   try {
-    ({ rows, baseline } = await fetchRows(cursor, cfg, deps, now));
+    ({ rows, baseline, truncated } = await fetchRows(cursor, cfg, deps, now));
   } catch (error) {
     if (!isGatewayFailure(error)) throw error;
     if (!dry) writeStatus({ ...readJson(STATUS_FILE, {}), lastAttemptAt: Date.now(), skipped: true, detail: error.message });
@@ -369,8 +376,11 @@ async function poll(options = {}) {
   // A first run starts at the high-water mark it took before reading the window, or
   // past the window's last classified row if that is later. When the window's backlog
   // held the poll early, the cursor stays at the classified prefix so the rest of the
-  // window (all at or below the mark) is read next time rather than skipped.
-  if (baseline != null && !held) advanceTo = Math.max(baseline, advanceTo == null ? 0 : advanceTo);
+  // window (all at or below the mark) is read next time rather than skipped. Likewise
+  // when paging stopped at a bound before the end of the window: the cursor is the
+  // highest seq actually fetched and passed, never the mark, since rows between the
+  // two were never seen — even if every fetched row was filtered out or already seen.
+  if (baseline != null && !held && !truncated) advanceTo = Math.max(baseline, advanceTo == null ? 0 : advanceTo);
   let decisions = [];
   if (selected.length) {
     const prompt = slack.buildPrompt(context, selected, { source: 'Discord' });
@@ -414,7 +424,7 @@ async function poll(options = {}) {
   if (advanceTo != null && advanceTo !== cursor) writeCursor(advanceTo);
   writeStatus({
     lastAttemptAt: Date.now(), lastPollAt: Date.now(), skipped: false,
-    cursor: advanceTo, fetched: rows.length, backlog: held,
+    cursor: advanceTo, fetched: rows.length, backlog: held || Boolean(truncated),
   });
   return entries;
 }
