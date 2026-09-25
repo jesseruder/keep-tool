@@ -2449,6 +2449,15 @@ way: Keep finds it rather than opening it, so it is moved with `keep move`.
   (`areaAgent`), which is the only way a standing agent's own session gets past the
   cleanup's agent protection, on any node; on a node it is judged on that node's reads
   as the check sweep's close is.
+- **The reviewer.** Keep finds the reviewer rather than opening it, so it is moved with
+  `keep move`, not placed. On a pane-only node its procedure is forwarded: `review-bundle`
+  (its `--session` names the card session to read, not the caller), `review-stats`,
+  `review-replay`, `review-note`, `review-ack`, `review-dismiss`, `review-outcome`,
+  `review-idea` and `alert` run on the daemon under the reviewer's verified session, so
+  `alert` names it the reviewer exactly when the daemon's markers do. `review-land`
+  reads its document on the node (`--file <path>` or `-`) and sends it as the request's
+  body, at most 1 MiB, which the daemon's CLI reads as `review-land -`; no other
+  forwarded command carries a body.
 
 ## Area sessions
 

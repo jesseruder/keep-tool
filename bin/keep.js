@@ -4371,6 +4371,21 @@ function paneOnlyRefusal(cmd, args, env = process.env) {
   if (rule === true || (typeof rule === 'function' && rule(args))) return null;
   return `keep ${cmd}: the registry lives on node ${where.daemon}; this is node ${where.local}`;
 }
+// `keep review-land --file <path>` or `keep review-land -` on a pane-only node: the
+// document read here, as review-land itself reads it, to be sent as the request body.
+function reviewLandDocument(argv) {
+  const o = parseArgs(argv, { file: 'str' });
+  if ((o.file && o._.length) || (!o.file && (o._.length !== 1 || o._[0] !== '-'))) {
+    die('usage: keep review-land --file <path> or keep review-land -');
+  }
+  let raw;
+  try {
+    raw = o.file ? fs.readFileSync(path.resolve(o.file), 'utf8') : require('./stdin.js').readStdin({ isatty: () => false });
+  } catch (error) { die(`cannot read review-land input: ${error.message}`); }
+  if (raw === null) die('cannot read review-land input: cannot read stdin');
+  return raw;
+}
+
 // `keep checkin --attach` on a pane-only node. The files are on this node, so they
 // go up the way a node's `keep artifact` does (remote-cli runArtifact), and the
 // check-in is forwarded without --attach, naming what was stored. The daemon refuses
@@ -4453,10 +4468,17 @@ if (require.main === module) {
       if (remote && !localNodes && require('./registry-commands.js').isRegistryCommand(cmd || 'list')) {
         // The commits and the Codex job a review names are in this node's worktree and
         // jobs directory, so they are resolved here and sent as facts.
-        const args = cmd === 'reviewed' || cmd === 'reviewing'
+        let args = cmd === 'reviewed' || cmd === 'reviewing'
           ? reviewRecordError((reviews) => reviews.nodeFactArgs(cmd, rest, { cwd: process.cwd(), root: ROOT }))
           : rest;
-        const result = await require('./remote-cli.js').runRemote(cmd || 'list', args, { where: remote });
+        // A review-land document is on this node, in a file or on stdin: it is read
+        // here and sent as the request's body, and the daemon's CLI reads it as `-`.
+        let stdin;
+        if (cmd === 'review-land') {
+          stdin = reviewLandDocument(rest);
+          args = ['-'];
+        }
+        const result = await require('./remote-cli.js').runRemote(cmd || 'list', args, { where: remote, stdin });
         if (result.stdout) process.stdout.write(result.stdout);
         if (result.stderr) process.stderr.write(result.stderr);
         process.exitCode = result.code;

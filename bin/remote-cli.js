@@ -102,13 +102,15 @@ function nodeApiRequest(base, pathname, { method = 'POST', payload, token, timeo
 // (keep-core.canonicalCwd, computed here where the worktree is), which the daemon
 // has at the same path because the fleet shares one home. The directory itself goes
 // as `nodeCwd`, for the daemon's journal and logs only.
-function registryBody(command, args, { env = process.env, cwd = process.cwd(), where, key, canonical } = {}) {
+function registryBody(command, args, { env = process.env, cwd = process.cwd(), where, key, canonical, stdin } = {}) {
   const core = require('./keep-core.js');
   const session = core.currentSession({ env });
   const project = (canonical || core.canonicalCwd)(cwd);
   const body = {
     command, args: [...args], cwd: project, nodeCwd: cwd,
     idempotencyKey: key || crypto.randomBytes(16).toString('hex'),
+    // `review-land -`'s document, read on this node (registry-commands stdinRefusal).
+    ...(typeof stdin === 'string' ? { stdin } : {}),
   };
   if (session) { body.session = session.id; body.agent = session.agent; }
   if (env.KEEP_PANE) body.pane = require('./nodes.js').formatPaneRef(where.local, env.KEEP_PANE, env);
@@ -278,7 +280,7 @@ async function runRemote(command, args, deps = {}) {
   let response;
   try {
     daemonBase(where.url);
-    response = await postWithRetry(where, '/api/registry', registryBody(command, args, { env, cwd: deps.cwd || process.cwd(), where }),
+    response = await postWithRetry(where, '/api/registry', registryBody(command, args, { env, cwd: deps.cwd || process.cwd(), where, stdin: deps.stdin }),
       { ...deps, env, timeoutMs: deps.timeoutMs || requestTimeoutMs(command, args) });
   } catch (error) {
     return { code: 2, stdout: '', stderr: `keep ${command}: ${error.message}\n` };

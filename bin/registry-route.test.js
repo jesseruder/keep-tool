@@ -31,6 +31,11 @@ function fakeSpawn(answer = () => ({ code: 0, stdout: 'ok\n', stderr: '' })) {
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
     child.kill = () => { setImmediate(() => child.emit('close', null, 'SIGKILL')); };
+    // What a piped stdin was given, recorded on the call.
+    if (options && Array.isArray(options.stdio) && options.stdio[0] === 'pipe') {
+      const call = calls[calls.length - 1];
+      child.stdin = { on: () => {}, end: (data) => { call.stdin = String(data); } };
+    }
     const result = answer({ file, args, options });
     if (result !== 'hang') {
       setImmediate(() => {
@@ -163,6 +168,35 @@ test('a node forwards an agent\'s emit and feed reads, and nothing else under ke
   assert.equal(calls[0].options.env.CLAUDE_CODE_SESSION_ID, 'sess-aws1', 'the emit runs as the node\'s session, which keep agents emit checks against the record');
 });
 
+test('a reviewer on a node runs its procedure through the daemon, review-land\'s document as the request body', async (t) => {
+  for (const command of ['review-bundle', 'review-note', 'review-ack', 'review-dismiss', 'review-outcome', 'review-idea', 'review-land', 'alert', 'review-stats', 'review-replay']) {
+    assert.ok(REGISTRY_COMMANDS.includes(command), command);
+  }
+  // A bundle's --session names the card session whose transcript it reads, not the caller.
+  assert.equal(argumentRefusal('review-bundle', ['card', '--session', 'someone-else', '--budget', '8000'], ME), null);
+  assert.equal(argumentRefusal('review-note', ['card', '--kind', 'drift', '--subject', 's', '-m', 'a\nb'], ME), null);
+  assert.equal(argumentRefusal('alert', ['--level', 'attention', '-m', 'x'], ME), null);
+  // review-land never names a file on the node; its document is the body, and only its.
+  assert.match(String(nodeSideRefusal('review-land', ['--file', '/tmp/x.json'])), /names a file on this node/);
+  const { svc, root, calls } = service(t);
+  const doc = JSON.stringify({ items: [] });
+  const landed = await svc.handle(AWS1, body(root, { command: 'review-land', args: ['-'], stdin: doc, idempotencyKey: `${KEY}-land` }));
+  assert.equal(landed.status, 200, JSON.stringify(landed.body));
+  assert.deepEqual(calls[0].args.slice(1), ['review-land', '-']);
+  assert.equal(calls[0].stdin, doc, 'the document is the CLI\'s stdin');
+  for (const [request, error] of [
+    [{ command: 'review-land', args: ['-'] }, /sends its document as the request body/],
+    [{ command: 'review-note', args: ['c', '-m', 'x'], stdin: doc }, /only review-land - carries a request body/],
+    [{ command: 'review-land', args: ['--file', 'x'], stdin: doc }, /names a file on this node|only review-land -/],
+    [{ command: 'review-land', args: ['-'], stdin: 'x'.repeat(1024 * 1024 + 1) }, /longer than/],
+  ]) {
+    const answer = await svc.handle(AWS1, body(root, { ...request, idempotencyKey: `${KEY}-${calls.length}-${String(error).length}` }));
+    assert.equal(answer.status, 400, JSON.stringify(request).slice(0, 80));
+    assert.match(answer.body.error, error);
+  }
+  assert.equal(calls.length, 1, 'no refused body reached the CLI');
+});
+
 test('a node\'s note must come from a session', async (t) => {
   const anonymous = "a node's note names the session it is from; run it inside an agent session";
   assert.equal(argumentRefusal('note', ['app', '--scope', 'x', '--for', '+1h', '-m', 'hi']), anonymous);
@@ -228,7 +262,9 @@ test('a flag is read as taking no value exactly where that command\'s parseArgs 
 
   // The table is keep.js's own: every 'bool' in the parseArgs specs of a registry
   // command, and nothing else.
-  const source = fs.readFileSync(path.join(__dirname, 'keep.js'), 'utf8').split('\n');
+  // keep.js and the command modules it loads its commands from (the reviewer's).
+  const source = ['keep.js', path.join('commands', 'review.js')]
+    .flatMap((file) => fs.readFileSync(path.join(__dirname, file), 'utf8').split('\n'));
   const starts = [];
   source.forEach((line, i) => {
     const match = line.match(/^commands(?:\.([a-z]+)|\['([a-z-]+)'\]) = /);

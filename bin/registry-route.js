@@ -32,7 +32,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   isRegistryCommand, argumentRefusal, forwardedWaitMs, isWaitingTell, openExtraMs, openRequiredMs,
-  MAX_FORWARDED_WAIT_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL,
+  MAX_FORWARDED_WAIT_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, stdinRefusal,
 } = require('./registry-commands.js');
 
 const SESSION_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -142,14 +142,17 @@ function validateRequest(body, caller, deps) {
   const fields = sessionFields(body);
   const refusal = argumentRefusal(command, args, { session: fields.session, node: caller });
   if (refusal) refuse(400, refusal);
+  const bodyRefusal = stdinRefusal(command, args, body.stdin);
+  if (bodyRefusal) refuse(400, bodyRefusal);
   const place = callerPlace(body, caller, deps, fields);
-  return { command, args: [...args], ...place, idempotencyKey };
+  return { command, args: [...args], ...place, idempotencyKey, ...(typeof body.stdin === 'string' ? { stdin: body.stdin } : {}) };
 }
 
 function digestOf(request) {
   const fields = [request.command, request.args, request.cwd, request.session, request.agent, request.pane];
   // Only when sent, so a request without one digests as it always did.
   if (request.nodeCwd) fields.push(request.nodeCwd);
+  if (typeof request.stdin === 'string') fields.push({ stdin: request.stdin });
   return crypto.createHash('sha256').update(JSON.stringify(fields)).digest('hex');
 }
 
@@ -269,7 +272,10 @@ function createRegistryService(options = {}) {
 
   function execute(request, caller, limits = {}) {
     const daemon = daemonNode();
-    return spawnKeep([request.command, ...request.args], { cwd: request.cwd, env: childEnv(request, caller, daemon), ...limits });
+    return spawnKeep([request.command, ...request.args], {
+      cwd: request.cwd, env: childEnv(request, caller, daemon),
+      ...(typeof request.stdin === 'string' ? { stdin: request.stdin } : {}), ...limits,
+    });
   }
 
   // Adoption can pin an account, write pane ownership and link a card before the

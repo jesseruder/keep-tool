@@ -17517,8 +17517,11 @@ function start(deps = {}) {
         routes: requestRoutes, matchRoute, routeDenial, readBody, principal: keepConsole.principal,
         // A hook post carries up to 4 MiB of transcript, and an artifact post up to
         // 20 MiB of files, base64-encoded.
+        // A registry command may carry a review-land document as its stdin, which JSON
+        // escaping can grow to several times its size.
         bodyLimit: (pathname) => (pathname === '/api/hook' ? require('./hook-route.js').BODY_MAX_BYTES
-          : pathname === '/api/artifact' ? require('./registry-commands.js').ARTIFACT_BODY_MAX_BYTES : undefined),
+          : pathname === '/api/artifact' ? require('./registry-commands.js').ARTIFACT_BODY_MAX_BYTES
+            : pathname === '/api/registry' ? 6 * require('./registry-commands.js').REVIEW_LAND_STDIN_MAX + 256 * 1024 : undefined),
         // Artifact uploads are admitted before their body is read (bin/artifact-route.js).
         admit: (pathname, who) => (pathname === '/api/artifact' && ctx.artifactService ? ctx.artifactService.admit(who) : null),
         tokenStore: nodeApi.createNodeTokenStore({ initial: nodeTokenMap, read: () => nodes.nodeApiTokens(keep.ROOT) }),

@@ -55,7 +55,18 @@ const REGISTRY_COMMANDS = Object.freeze([
   // only when that session is the one the agent's record names. `seen` is Owner's
   // badge and `place` is Owner's placement; both stay on the daemon node.
   'agents',
+  // The fleet reviewer's procedure (skills/fleet-review), for a reviewer on a node:
+  // its bundles and stats are reads over the daemon's registry and mirrors, and its
+  // findings, acks, outcomes, ideas and batched landing are the writes it exists to
+  // make. `alert` names its caller from the session the daemon verified, so only a
+  // registered reviewer's alert reads as the reviewer's. `review-land` carries its
+  // document as the request's stdin (REVIEW_LAND_STDIN_MAX), never a node file.
+  'review-bundle', 'review-stats', 'review-replay',
+  'review-note', 'review-ack', 'review-dismiss', 'review-outcome', 'review-idea', 'review-land',
+  'alert',
 ]);
+// A forwarded `review-land -` document: one reviewer tick's batch.
+const REVIEW_LAND_STDIN_MAX = 1024 * 1024;
 
 const NODES_ALLOWED = Object.freeze(['update']);
 const NODES_REFUSAL = 'a node runs only keep nodes update; the rest runs on the daemon node';
@@ -105,7 +116,21 @@ const NODE_FILE_FLAGS = Object.freeze({
   tell: ['--message-file'],
   open: ['--message-file'],
   checkin: ['--attach'],
+  // Its document goes up as stdin: the node's CLI reads the file and sends `-`.
+  'review-land': ['--file'],
 });
+
+// The one forwarded command that carries a body: `review-land -` with its document.
+function stdinRefusal(command, args, stdin) {
+  if (stdin === undefined || stdin === null) {
+    return command === 'review-land' ? 'review-land from a node sends its document as the request body' : null;
+  }
+  if (command !== 'review-land' || args.length !== 1 || args[0] !== '-') return 'only review-land - carries a request body';
+  if (typeof stdin !== 'string') return 'the request body must be a string';
+  if (Buffer.byteLength(stdin) > REVIEW_LAND_STDIN_MAX) return `the review-land document is longer than ${REVIEW_LAND_STDIN_MAX} bytes`;
+  if (stdin.includes('\0')) return 'the request body contains a NUL byte';
+  return null;
+}
 
 // A flag that, in that command, names where something happens rather than who is
 // asking. `--session` and `--node` elsewhere name the caller (a card linked to a
@@ -115,6 +140,9 @@ const NODE_FILE_FLAGS = Object.freeze({
 // `--session`, so that rule still applies to it.
 const PLACEMENT_FLAGS = Object.freeze({
   open: ['--node'],
+  // Not where or who but which: the session whose transcript a bundle reads.
+  'review-bundle': ['--session'],
+  'review-replay': ['--session'],
 });
 
 // The commands the daemon runs on behalf of a session and so frames as that session's
@@ -171,6 +199,12 @@ const BOOLEAN_FLAGS = Object.freeze({
   search: ['json', 'all', 'cards', 'conversations'],
   nodes: ['json', 'no-reload'],
   agents: ['json', 'unseen', 'needs-you', 'badge', 'daemon', 'as-owner'],
+  'review-bundle': ['queue', 'raw', 'force'],
+  'review-stats': ['json'],
+  'review-note': ['force', 'no-digest'],
+  'review-ack': ['probe-safe'],
+  'review-outcome': ['json'],
+  alert: ['dry', 'force'],
 });
 
 // The arguments each registry command resolves as a project (keep-core
@@ -183,6 +217,7 @@ const PROJECT_FLAGS = Object.freeze({
   list: ['--project'],
   turns: ['--project'],
   search: ['--project'],
+  'review-idea': ['--project'],
 });
 const PROJECT_POSITIONS = Object.freeze({
   project: [1],
@@ -461,4 +496,4 @@ function artifactNameRefusal(name) {
   return null;
 }
 
-module.exports = { ARTIFACT_STORE_MAX_FILES, ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES, ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { REVIEW_LAND_STDIN_MAX, stdinRefusal, ARTIFACT_STORE_MAX_FILES, ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES, ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
