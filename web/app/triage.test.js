@@ -367,8 +367,11 @@ test('machine filter matches by node, lists machines under Client, and hides on 
     renderRail(ctx, rows);
     assert.doesNotMatch(rail.innerHTML, /data-node=/, 'a single-node install offers no machine choice');
 
-    ctx.data.nodes = [{ name: 'aws1', daemon: false }, { name: 'main', daemon: true }];
+    ctx.data.nodes = [{ name: 'aws1', daemon: false, capabilities: ['linux'] },
+      { name: 'main', daemon: true, capabilities: ['browser'], stats: { platform: 'darwin' } }];
     renderRail(ctx, rows);
+    assert.match(rail.innerHTML, /data-node="main"[^>]*><svg class="rail-node-icon node-laptop"/, 'the MacBook is a laptop');
+    assert.match(rail.innerHTML, /data-node="aws1"[^>]*><svg class="rail-node-icon node-cloud"/, 'a Linux node is a cloud');
     assert.deepEqual([...rail.innerHTML.matchAll(/data-node="([^"]*)"/g)].map((match) => match[1]), ['', 'main', 'aws1'],
       'All, then the daemon node, then the rest');
     assert.ok(rail.innerHTML.indexOf('aria-label="Machine"') > rail.innerHTML.indexOf('aria-label="Client"'));

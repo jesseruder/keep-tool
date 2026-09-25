@@ -87,6 +87,26 @@ export function itemNode(ctx, item) {
   return nodeName(ctx, { item, session, pane: ctx.paneMap().get(item?.pane || session?.pane) });
 }
 
+// A cloud for a Linux machine, a laptop for anything else (the MacBook). The
+// node's own stats sample names its platform; a node with no sample yet falls
+// back on its placement capabilities.
+const NODE_ICONS = {
+  laptop: '<path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/>',
+  cloud: '<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>',
+};
+
+export function nodeIconKind(node) {
+  const platform = node?.stats?.platform;
+  if (platform === 'linux') return 'cloud';
+  if (platform === 'darwin') return 'laptop';
+  return Array.isArray(node?.capabilities) && node.capabilities.includes('linux') ? 'cloud' : 'laptop';
+}
+
+export function nodeIconHTML(node) {
+  const kind = nodeIconKind(node);
+  return `<svg class="rail-node-icon node-${kind}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${NODE_ICONS[kind]}</svg>`;
+}
+
 export function matchesTriageFilters(ctx, item) {
   return (!ctx.state.filter || ctx.projectOf(item.project).key === ctx.state.filter)
     && (!ctx.state.providerFilter || itemProvider(ctx, item) === ctx.state.providerFilter)
@@ -533,11 +553,12 @@ export function renderRail(ctx, items) {
   const clients = `<div class="rail-clients" role="group" aria-label="Client">${collapsed ? '' : '<div class="rh">Client</div>'}${clientChoice('', 'All')}${clientChoice('claude', 'Claude Code')}${clientChoice('codex', 'Codex')}${clientChoice('pi', 'Pi')}</div>`;
   // Machine sits under Client, on a fleet of two or more nodes. A chosen machine
   // that has left the fleet keeps its button, so the filter can still be cleared.
-  const nodeNames = fleetNodes(ctx).map((node) => node.name);
+  const nodes = new Map(fleetNodes(ctx).map((node) => [node.name, node]));
+  const nodeNames = [...nodes.keys()];
   if (ctx.state.nodeFilter && !nodeNames.includes(ctx.state.nodeFilter)) nodeNames.push(ctx.state.nodeFilter);
   const nodeChoice = (name, label) => {
     const on = ctx.state.nodeFilter === (name || null);
-    const mark = name ? `<span class="rail-node-mark">${ctx.esc(name.slice(0, 2))}</span>` : '<span class="rail-client-all">◎</span>';
+    const mark = name ? nodeIconHTML(nodes.get(name) || { name }) : '<span class="rail-client-all">◎</span>';
     return collapsed
       ? `<button data-node="${ctx.esc(name)}" class="rail-dot ${on ? 'on' : ''}" title="${ctx.esc(label)}" aria-label="${ctx.esc(label)}" aria-pressed="${on}">${mark}</button>`
       : `<button data-node="${ctx.esc(name)}" class="${on ? 'on' : ''}" aria-label="${ctx.esc(label)}" aria-pressed="${on}">${mark}<span>${ctx.esc(label)}</span></button>`;
