@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 const test = require('node:test');
 
 const selfRepair = require('./self-repair.js');
@@ -302,6 +303,7 @@ function harness(options = {}) {
   let counter = 0;
   const deps = {
     root,
+    withLock: (fn) => fn(),
     now: options.now ?? NOW,
     config: options.config,
     snapshot: () => options.snapshot,
@@ -404,6 +406,80 @@ test('a retry adopts the intent-marked card after reservation failure instead of
     const reserved = selfRepair.loadState(root).signatures[candidate.sig];
     assert.equal(reserved.cardId, 'repair-card-1');
     assert.equal(reserved.createIntent, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('overlapping transaction children create and reserve one intent-marked card', async () => {
+  const root = makeRoot();
+  const tasks = path.join(root, 'tasks');
+  const entered = path.join(root, 'first-add-entered');
+  fs.mkdirSync(tasks);
+  const script = String.raw`
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const root = process.argv[1];
+    const selfRepair = require(process.argv[2]);
+    const keep = require(process.argv[3]);
+    const tasks = path.join(root, 'tasks');
+    const candidate = { sig: 'sched:review:overlap', kind: 'scheduler', name: 'review', label: 'review',
+      firstSeenAt: 1, why: 'repeated failure', failures: 6, lastError: 'overlap', lastOkAt: 0 };
+    const readTasks = () => fs.readdirSync(tasks).filter((name) => name.endsWith('.json'))
+      .map((name) => JSON.parse(fs.readFileSync(path.join(tasks, name), 'utf8')));
+    const deps = {
+      root,
+      withLock: (fn) => keep.withLock(fn),
+      mutateState: selfRepair.mutateState,
+      addTask: (options) => {
+        if (options.withinLock !== true) throw new Error('addTask would reacquire the Keep lock');
+        const id = 'repair-card-' + (readTasks().length + 1);
+        const task = { id, fm: {}, body: '' };
+        options.beforeSave(task);
+        fs.writeFileSync(path.join(root, 'first-add-entered'), 'yes');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
+        fs.writeFileSync(path.join(tasks, id + '.json'), JSON.stringify(task));
+        return task;
+      },
+      findIntentCard: (intent) => readTasks().find((task) => task.fm.self_repair_intent === intent) || null,
+      loadTaskById: (id) => JSON.parse(fs.readFileSync(path.join(tasks, id + '.json'), 'utf8')),
+      ensureTaskCommitted: () => {},
+      setPlan: (task, steps) => { task.plan = steps; return task; },
+      artifact: () => [],
+      worktreePath: () => '/tmp/worktree',
+      write: () => {},
+    };
+    const result = selfRepair.createRepairCardTransaction({ root, candidate,
+      snapshot: { daemon: {}, schedulers: [] }, now: 1000, config: selfRepair.DEFAULT_CONFIG,
+      previousCardId: null, projectMissing: false }, deps);
+    process.stdout.write(JSON.stringify(result));
+  `;
+  const start = () => {
+    const child = spawn(process.execPath, ['-e', script, root, require.resolve('./self-repair.js'), require.resolve('./keep.js')], {
+      env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' }, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = ''; let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const done = new Promise((resolve, reject) => child.once('close', (code) => code === 0
+      ? resolve(JSON.parse(stdout)) : reject(new Error(`transaction child exited ${code}: ${stderr}`))));
+    return { child, done };
+  };
+  try {
+    const first = start();
+    const deadline = Date.now() + 2000;
+    while (!fs.existsSync(entered) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(fs.existsSync(entered), true, 'the first child reached addTask while holding the Keep lock');
+    const second = start();
+    const results = await Promise.all([first.done, second.done]);
+    assert.deepEqual(results.map((result) => result.cardId), ['repair-card-1', 'repair-card-1']);
+    assert.equal(results.filter((result) => result.repeated).length, 1,
+      'the replacement child recognizes the card reserved by the older child');
+    assert.deepEqual(fs.readdirSync(tasks).filter((name) => name.endsWith('.json')), ['repair-card-1.json']);
+    const entry = selfRepair.loadState(root).signatures['sched:review:overlap'];
+    assert.equal(entry.cardId, 'repair-card-1');
+    assert.equal(entry.attempts, 1);
+    assert.equal(selfRepair.loadState(root).openedToday, 1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
