@@ -297,7 +297,9 @@ commands['review-dismiss'] = (argv) => {
 };
 
 commands['review-outcome'] = (argv) => {
-  requireReviewerFromNode('review-outcome');
+  // Not the reviewer's: an outcome is Owner's or the working session's (review.js
+  // recordFindingOutcome refuses the reviewer), so a node's forwarded one needs only
+  // the session the route verified.
   const o = parseArgs(argv, { evidence: 'str', json: 'bool' });
   const [id, key, status] = o._;
   const review = require('../review.js');

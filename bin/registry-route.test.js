@@ -198,9 +198,13 @@ test('a reviewer on a node runs its procedure through the daemon, review-land\'s
 });
 
 test('a reviewer\'s write from a node is refused without a session, and run only for the registered reviewer', (t) => {
-  for (const command of ['review-note', 'review-ack', 'review-dismiss', 'review-outcome', 'review-idea']) {
+  for (const command of ['review-note', 'review-ack', 'review-dismiss', 'review-idea']) {
     assert.match(String(argumentRefusal(command, ['card', '-m', 'x'], { node: 'aws1' })), /is the reviewer's; run it inside the reviewer's session/, command);
   }
+  // An outcome is the working session's: a session, any session, and never the reviewer
+  // (review.js refuses that one itself).
+  assert.match(String(argumentRefusal('review-outcome', ['card', 'k', 'fixed', '-m', 'x'], { node: 'aws1' })), /names the session recording it/);
+  assert.equal(argumentRefusal('review-outcome', ['card', 'k', 'fixed', '-m', 'x'], ME), null);
   // The daemon's CLI, as the route runs it: the verified session in the environment.
   const root = tempDir(t);
   fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
