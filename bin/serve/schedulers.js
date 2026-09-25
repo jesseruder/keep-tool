@@ -380,14 +380,16 @@ function startSchedulers(ctx) {
   // dies at the end of its turn, has no memory, and cannot be looked at.
   runs.setOpener(openCheckSession);
   runs.setEphemeralHost({
-    // The same boundary the cleanup snapshot keeps: this sweep closes a pane and
-    // then releases the check's delivery stamp on the strength of a local
-    // observation. An exited pane on another node is not this machine's to reap.
+    // The whole fleet, with the nodes that did not answer named: the orphan pass
+    // must see a card agent's check pane on a node as carried, and must not read a
+    // node that said nothing as a node with no panes. Which panes the sweep may
+    // close is its own decision (runs.js sweepEphemeralPanes).
     // A host that did not answer is null, never an empty list: the sweep reads an
     // empty list as "no check pane is carrying any agent" and idles every card agent.
     listPanes: async () => {
-      const panes = await listHostPanes({}, true);
-      return Array.isArray(panes) ? panes.filter((pane) => !nodes.isRemotePane(pane)) : null;
+      const result = await listHostPaneResult({}, true);
+      if (!result || !Array.isArray(result.panes)) return null;
+      return { panes: result.panes, missingNodes: result.missingNodes || [] };
     },
     sessions: () => periodicScan(),
     // The orphan pass runs only with an explicit agents module: a test host without

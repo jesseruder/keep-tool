@@ -961,16 +961,20 @@ function releaseUnfinishedCheck(cardId, sessionId, today = keep.nowStamp().slice
 // "nobody is using it".
 async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
   if (!host || typeof host.listPanes !== 'function' || typeof host.closePane !== 'function') return [];
-  let panes;
-  try { panes = await host.listPanes(); }
+  let listing;
+  try { listing = await host.listPanes(); }
   catch (e) {
     process.stderr.write(`keep runs: could not list host panes for the ephemeral sweep: ${e.message}\n`);
     return [];
   }
+  // A fleet listing is { panes, missingNodes }: every node's panes, and the nodes that
+  // did not answer this time. A bare array is a listing where every node answered.
+  const panes = Array.isArray(listing) ? listing : (listing && listing.panes);
   if (!Array.isArray(panes)) return [];
+  const missingNodes = new Set((listing && !Array.isArray(listing) && listing.missingNodes) || []);
   // Only with the host's own agents module: a host built without one (a test) must
   // never reach whatever registry this process points at.
-  if (host.agents) idleOrphanedCheckAgents(panes, host.agents, now);
+  if (host.agents) idleOrphanedCheckAgents(panes, host.agents, now, missingNodes);
   // A pane on another node is left alone here even if a caller hands one over:
   // closing it and releasing its card's stamp both rest on evidence only the
   // machine running it can produce.
@@ -1058,9 +1062,10 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
 // pane existed must not read as the pane being gone.
 const ORPHAN_CHECK_GRACE_MS = 60e3;
 
-function idleOrphanedCheckAgents(panes, agentApi, now = Date.now()) {
+function idleOrphanedCheckAgents(panes, agentApi, now = Date.now(), missingNodes = new Set()) {
   let records;
   try { records = agentApi.records(); } catch { return []; }
+  const { parsePaneRef } = require('./nodes.js');
   const carried = new Set((panes || [])
     .filter((pane) => pane && pane.meta && pane.meta.ephemeral === 'check' && typeof pane.meta.agentName === 'string')
     .map((pane) => pane.meta.agentName));
@@ -1069,6 +1074,9 @@ function idleOrphanedCheckAgents(panes, agentApi, now = Date.now()) {
     if (!record || record.role !== 'scheduled check' || !record.session || !record.session.id) continue;
     if (carried.has(record.name)) continue;
     if (Number(record.session.startedAt) > now - ORPHAN_CHECK_GRACE_MS) continue;
+    // A check running on a node that did not answer this listing is not missing from
+    // it: that node said nothing at all, and "I could not tell" is not "gone".
+    if (missingNodes.size && missingNodes.has(parsePaneRef(record.session.pane || '').node)) continue;
     try {
       agentApi.writeRecord(record.name, { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } });
       idled.push(record.name);

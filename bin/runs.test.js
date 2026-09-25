@@ -1550,3 +1550,37 @@ test('the ephemeral sweep leaves the panes of another node alone, exited or not'
   assert.deepEqual(closed, [['local', 'local-sid']]);
   assert.deepEqual(removed, ['local']);
 });
+
+test('the orphan pass counts a check pane on a node as carried, and leaves a node that did not answer alone', async () => {
+  const written = [];
+  const records = {
+    // Its check pane runs on aws1, and aws1 answered with it.
+    'on-node': { name: 'on-node', role: 'scheduled check', lifecycle: 'working', session: { id: 'sid-node', pane: 'n@aws1', startedAt: 1_000_000 } },
+    // Its check pane runs on aws2, which did not answer this listing at all.
+    unheard: { name: 'unheard', role: 'scheduled check', lifecycle: 'working', session: { id: 'sid-unheard', pane: 'u@aws2', startedAt: 1_000_000 } },
+    // Its node answered and no pane carries it: orphaned, as on the daemon node.
+    gone: { name: 'gone', role: 'scheduled check', lifecycle: 'working', session: { id: 'sid-gone', pane: 'g@aws1', startedAt: 1_000_000 } },
+  };
+  const now = 1_000_000 + 5 * 3600e3;
+  const closed = [];
+  const result = await sweepEphemeralPanes({
+    listPanes: async () => ({
+      panes: [
+        ephemeralPane({ id: 'n@aws1', node: 'aws1', hostPaneId: 'n', meta: { card: null, sessionId: 'sid-node', agentName: 'on-node' } }),
+      ],
+      missingNodes: ['aws2'],
+    }),
+    sessions: async () => [{ id: 'sid-node', endedTurn: true, mtime: 1_000_000 }],
+    closePane: async (pane) => { closed.push(pane.id); },
+    agents: {
+      records: () => Object.values(records),
+      readRecord: (name) => records[name] || null,
+      writeRecord: (name, patch) => { written.push([name, patch]); },
+      flushCommits: () => true,
+    },
+  }, now);
+  assert.deepEqual(written, [['gone', { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } }]]);
+  // Reaping a node's pane is a separate decision; this listing shape changes nothing there.
+  assert.deepEqual(result, []);
+  assert.deepEqual(closed, []);
+});
