@@ -353,6 +353,60 @@ function harness(options = {}) {
   return { deps, calls };
 }
 
+test('card creation stops before addTask when its durable intent cannot be written', () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'review', consecutiveFailures: 6, lastError: 'intent failure', lastErrorAt: NOW },
+    ]);
+    const candidate = selfRepair.signatures(snapshot, null, NOW,
+      { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 }, null)[0];
+    const { deps, calls } = harness({ root, snapshot });
+    assert.throws(() => selfRepair.createRepairCardTransaction({
+      root, candidate, snapshot, now: NOW, config: selfRepair.DEFAULT_CONFIG,
+      previousCardId: null, projectMissing: false,
+    }, { ...deps, mutateState: () => null }), /intent could not be persisted/);
+    assert.equal(calls.cards.length, 0, 'no registry side effect happens without a durable intent');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a retry adopts the intent-marked card after reservation failure instead of creating a duplicate', () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'review', consecutiveFailures: 6, lastError: 'child died after add', lastErrorAt: NOW },
+    ]);
+    const candidate = selfRepair.signatures(snapshot, null, NOW,
+      { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 }, null)[0];
+    const { deps, calls } = harness({ root, snapshot });
+    const input = { root, candidate, snapshot, now: NOW, config: selfRepair.DEFAULT_CONFIG,
+      previousCardId: null, projectMissing: false };
+    const findIntentCard = (intent) => calls.cards.map((card) => card.draft)
+      .find((task) => task.fm.self_repair_intent === intent) || null;
+    let stateWrites = 0;
+    assert.throws(() => selfRepair.createRepairCardTransaction(input, {
+      ...deps, findIntentCard,
+      mutateState: (fn, options) => ++stateWrites === 2 ? null : selfRepair.mutateState(fn, options),
+    }), /could not be reserved/);
+    assert.equal(calls.cards.length, 1);
+    const pending = selfRepair.loadState(root).signatures[candidate.sig];
+    assert.ok(pending.createIntent);
+    assert.equal(pending.cardId, undefined);
+
+    let recommitted = '';
+    const recovered = selfRepair.createRepairCardTransaction(input, {
+      ...deps, findIntentCard,
+      ensureTaskCommitted: (task) => { recommitted = task.id; },
+    });
+    assert.equal(recovered.cardId, 'repair-card-1');
+    assert.equal(recommitted, 'repair-card-1');
+    assert.equal(calls.cards.length, 1, 'retry reuses the card created by the interrupted child');
+    const reserved = selfRepair.loadState(root).signatures[candidate.sig];
+    assert.equal(reserved.cardId, 'repair-card-1');
+    assert.equal(reserved.createIntent, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a ready signature opens one card, attaches evidence, makes a worktree and opens one session', async () => {
   const root = makeRoot();
   try {

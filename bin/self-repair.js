@@ -838,6 +838,11 @@ function cardTransactionDeps(deps) {
     addTask: deps.addTask || ((options) => keep.addTask(options)),
     artifact: deps.artifact || ((argv) => keep.artifactCommandCli(argv, { quiet: true })),
     setPlan: deps.setPlan || ((task, steps) => keep.setPlan(task, steps)),
+    findIntentCard: deps.findIntentCard || ((intent) => keep.loadAll(true)
+      .find((task) => task?.fm?.self_repair_intent === intent) || null),
+    ensureTaskCommitted: deps.ensureTaskCommitted || ((task) => keep.commitAndPush(`keep: add ${task.id}`, ['tasks', 'archive'])),
+    mutateState: deps.mutateState || mutateState,
+    randomUUID: deps.randomUUID || crypto.randomUUID,
   };
 }
 
@@ -1068,10 +1073,10 @@ function launchNote(candidate, cardId, worktree, opened, config, artifacts, mode
 // worktree build lost the whole record, and its next start opened another card
 // for the same signature — on a restart-loop signature, forever.
 function createRepairCard(candidate, snapshot, context) {
-  const { deps, now, previousCardId, reserve, config = DEFAULT_CONFIG } = context;
+  const { deps, now, previousCardId, reserve, config = DEFAULT_CONFIG, intent, existingTask } = context;
   const root = deps.root;
   const evidence = collectEvidence(candidate, snapshot, { root, now });
-  const task = deps.addTask({
+  const task = existingTask || deps.addTask({
     title: cardTitle(candidate),
     kind: 'task',
     status: 'active',
@@ -1080,11 +1085,15 @@ function createRepairCard(candidate, snapshot, context) {
     note: symptomNote(candidate, previousCardId),
     linkSession: false,
     commit: true,
-    beforeSave: (draft) => deps.setPlan(draft, PLAN.map((text) => ({ text, state: 'todo' }))),
+    beforeSave: (draft) => {
+      draft.fm.self_repair_intent = intent;
+      deps.setPlan(draft, PLAN.map((text) => ({ text, state: 'todo' })));
+    },
   });
   const cardId = task && task.id;
   if (!cardId) throw new Error('addTask returned no card');
-  reserve(cardId);
+  if (existingTask) deps.ensureTaskCommitted(existingTask);
+  if (!reserve(cardId)) throw new Error(`self-repair card ${cardId} could not be reserved`);
 
   const store = (files, label) => {
     const staged = stageEvidence(cardId, files, root);
@@ -1124,8 +1133,8 @@ function createRepairCard(candidate, snapshot, context) {
 }
 
 function reserveRepairCard(candidate, cardId, context) {
-  const { root, now, previousCardId, projectMissing, write } = context;
-  return mutateState((value) => {
+  const { root, now, previousCardId, projectMissing, write, mutate = mutateState } = context;
+  return mutate((value) => {
     const fresh = value.signatures[candidate.sig] || (value.signatures[candidate.sig] = { firstSeenAt: candidate.firstSeenAt });
     if (previousCardId) fresh.previousCardId = previousCardId;
     fresh.cardId = cardId;
@@ -1143,9 +1152,22 @@ function reserveRepairCard(candidate, cardId, context) {
     delete fresh.launchGaveUp;
     delete fresh.relaunchDue;
     delete fresh.deadSince;
+    delete fresh.createIntent;
     value.openedToday = Number(value.openedToday || 0) + 1;
     value.day = localDay(now);
   }, { root, now, write });
+}
+
+function ensureRepairIntent(candidate, context) {
+  const { root, now, write, mutate = mutateState, randomUUID = crypto.randomUUID } = context;
+  const intent = mutate((value) => {
+    const fresh = value.signatures[candidate.sig]
+      || (value.signatures[candidate.sig] = { firstSeenAt: candidate.firstSeenAt });
+    if (!fresh.createIntent) fresh.createIntent = randomUUID();
+    return fresh.createIntent;
+  }, { root, now, write });
+  if (!intent) throw new Error('self-repair card creation intent could not be persisted');
+  return intent;
 }
 
 // The production daemon invokes this whole phase in a mutation child. Card
@@ -1154,16 +1176,22 @@ function reserveRepairCard(candidate, cardId, context) {
 // on the daemon event loop and a created card is reserved before the child replies.
 function createRepairCardTransaction(input, overrides = {}) {
   const deps = cardTransactionDeps({ ...overrides, root: input.root });
+  const intent = ensureRepairIntent(input.candidate, {
+    root: input.root, now: input.now, write: deps.write,
+    mutate: deps.mutateState, randomUUID: deps.randomUUID,
+  });
+  const existingTask = deps.findIntentCard(intent);
   const reserve = (cardId) => reserveRepairCard(input.candidate, cardId, {
     root: input.root,
     now: input.now,
     previousCardId: input.previousCardId || null,
     projectMissing: input.projectMissing === true,
     write: deps.write,
+    mutate: deps.mutateState,
   });
   return createRepairCard(input.candidate, input.snapshot, {
     deps, now: input.now, config: input.config || DEFAULT_CONFIG,
-    previousCardId: input.previousCardId || null, reserve,
+    previousCardId: input.previousCardId || null, reserve, intent, existingTask,
   });
 }
 
@@ -1894,6 +1922,7 @@ function reset(sig, options = {}) {
     delete entry.deadSince;
     delete entry.attempts;
     delete entry.projectMissingAt;
+    delete entry.createIntent;
     delete entry.firstSeenAt;
     entry.ticks = 0;
     return { found: true, cleared: true, previousCardId: entry.previousCardId || null };
@@ -1911,7 +1940,7 @@ module.exports = {
   LEGACY_RUN_TTL_MS, PANE_DEAD_GRACE_MS,
   worktreeName, worktreePath, insideWorktreeRoot, spawnWorktree, worktreeReady,
   REPAIR_PROJECT, projectExists, liveCheckout, cardProject, projectMissingNote,
-  createRepairCard, createRepairCardTransaction, reserveRepairCard,
+  createRepairCard, createRepairCardTransaction, reserveRepairCard, ensureRepairIntent,
   launchRepair, resumeBlocker, EXCLUDED, MAX_LAUNCH_ATTEMPTS, RESUME_BACKOFF_MS,
   tick, startScheduler, status, renderStatus, dryRun, renderDry, reset,
   _resetWarnings,
