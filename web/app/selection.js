@@ -35,14 +35,19 @@ export function stableSessionOrder(items, ranks, knownIds, createdAt = null) {
 // Waiting on you keeps each row where it first appeared. A row's `since` is its
 // session's last transcript message, and Keep writes into a session while it waits
 // (deliveries, nudges), so sorting on the live value swapped rows that did nothing.
-// An anchor lives while its row is listed; a row that leaves and comes back is a
-// new request and takes its new time. Priority still decides the group.
-export function stableAttentionOrder(items, anchors, keyOf) {
+// A delivery starts a turn, so its row leaves the list for the turn and the stop
+// verdict's hold (stop-classifier HOLD_MS) before it comes back: an anchor outlives
+// its row by `grace`. A row gone longer is a new request at its new time.
+// Priority still decides the group.
+export function stableAttentionOrder(items, anchors, keyOf, now = Date.now(), grace = 10 * 60e3) {
   const time = (value) => (typeof value === 'number' ? value : Date.parse(value) || 0);
-  const keys = new Set(items.map(keyOf));
-  for (const key of anchors.keys()) if (!keys.has(key)) anchors.delete(key);
-  for (const item of items) if (!anchors.has(keyOf(item))) anchors.set(keyOf(item), time(item.since));
+  for (const [key, anchor] of anchors) if (now - anchor.seen > grace) anchors.delete(key);
+  for (const item of items) {
+    const anchor = anchors.get(keyOf(item));
+    if (anchor) anchor.seen = now;
+    else anchors.set(keyOf(item), { at: time(item.since), seen: now });
+  }
   return [...items].sort((a, b) => Number(a.pri || 0) - Number(b.pri || 0)
-    || anchors.get(keyOf(a)) - anchors.get(keyOf(b))
+    || anchors.get(keyOf(a)).at - anchors.get(keyOf(b)).at
     || String(keyOf(a)).localeCompare(String(keyOf(b))));
 }

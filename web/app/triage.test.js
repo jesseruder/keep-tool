@@ -844,7 +844,7 @@ test('an agent in needs-input appears under Agents and in no other queue', async
   const { humanAttention } = await import('./status.js');
   const { stableAttentionOrder } = await import('./selection.js');
   const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
-  const agent ={ id: 'agent-sid', pane: 'agent-pane', project: '/tmp/p', title: 'sandboxes',
+  const agent = { id: 'agent-sid', pane: 'agent-pane', project: '/tmp/p', title: 'sandboxes',
     state: 'needs-input', mtime: 30, lastUserAt: 30, agentName: 'sandboxes' };
   const working = { id: 'work-sid', pane: 'work-pane', project: '/tmp/p', title: 'a card',
     state: 'needs-input', mtime: 20, lastUserAt: 20 };

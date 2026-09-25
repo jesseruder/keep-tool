@@ -95,18 +95,25 @@ test('running and waiting sessions retain their slots through status changes', (
 
 test('Waiting on you keeps each row where it first appeared while Keep writes to it', () => {
   const anchors = new Map();
-  const order = (items) => Array.from(selection.stableAttentionOrder(items, anchors, (item) => item.sessionId), (item) => item.sessionId);
+  let now = 1000;
+  const order = (items) => Array.from(selection.stableAttentionOrder(items, anchors, (item) => item.sessionId, now), (item) => item.sessionId);
   assert.deepEqual(order([{ sessionId: 'b', since: 20 }, { sessionId: 'a', since: 10 }]), ['a', 'b']);
   assert.deepEqual(order([{ sessionId: 'a', since: 30 }, { sessionId: 'b', since: 20 }]), ['a', 'b'],
     'a delivery into a waiting session does not move it below its neighbour');
   assert.deepEqual(order([{ sessionId: 'b', since: '1970-01-01T00:00:00.020Z' }, { sessionId: 'a', since: 30 }]), ['a', 'b']);
   assert.deepEqual(order([{ sessionId: 'b', since: 20 }, { sessionId: 'a', since: 30, pri: 1 }]), ['b', 'a'],
     'priority still decides the group');
+  now += 60e3;
+  assert.deepEqual(order([{ sessionId: 'b', since: 20 }]), ['b'], 'a delivered turn takes a out of the list');
+  now += 90e3;
+  assert.deepEqual(order([{ sessionId: 'a', since: 40 }, { sessionId: 'b', since: 20 }]), ['a', 'b'],
+    'a row back within the grace keeps its place');
+  now += 10 * 60e3 + 1;
   assert.deepEqual(order([{ sessionId: 'b', since: 20 }]), ['b']);
+  assert.equal(anchors.has('a'), false, 'an anchor gone past the grace is dropped');
   assert.deepEqual(order([{ sessionId: 'a', since: 40 }, { sessionId: 'b', since: 20 }]), ['b', 'a'],
-    'a row that left and came back is a new request at its new time');
+    'a row gone longer is a new request at its new time');
   assert.deepEqual(order([{ sessionId: 'd', since: 5 }, { sessionId: 'c', since: 5 }]), ['c', 'd'], 'ties break by key');
-  assert.equal(anchors.has('a'), false, 'anchors of rows no longer listed are dropped');
 });
 
 test('running panel orders newest-created first regardless of activity and refresh order', () => {
