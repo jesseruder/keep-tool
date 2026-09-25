@@ -64,6 +64,8 @@ const claudeFamilies = ['fable', 'opus', 'sonnet', 'haiku'];
 // The usage windows that would refuse this model on this account. For Claude, as the
 // daemon's account budget reads them: the 5h window, the shared week, and the model
 // family's own weekly bucket ("Fable wk" caps Fable only). Every Codex window caps.
+// "Account default" ('') names no family, so no model bucket is weighed for it, though
+// the daemon judges it against the account's settings model.
 function capsFor(ctx, account, model) {
   const usage = ctx.data.usage?.accounts?.[account.id];
   if (account.agent !== 'claude') return (usage?.windows || []).filter(Boolean);
@@ -230,10 +232,13 @@ export function openSessionChooser(ctx, options) {
       if (!state.accountChosen && !recordedAccountMissing) state.accountId = pickAccount();
       // Updated in place: a re-render inside this blur or Enter would swallow the click,
       // Tab or submit that caused it.
-      for (const option of modal.querySelector('[data-launch-account]')?.options || []) {
+      const rendered = [...(modal.querySelector('[data-launch-account]')?.options || [])];
+      for (const option of rendered) {
         const account = accountsFor(ctx, state.kind).find((candidate) => candidate.id === option.value);
         if (account) { option.textContent = accountText(account); option.selected = account.id === state.accountId; }
       }
+      // Accounts refreshed since the last render: never submit one the select does not show.
+      if (rendered.length && state.accountId && !rendered.some((option) => option.value === state.accountId)) render();
     });
     modal.querySelector('[data-launch-model-default]')?.addEventListener('click', () => {
       if (state.busy) return;
