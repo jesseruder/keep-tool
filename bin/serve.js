@@ -13111,7 +13111,9 @@ function buildState(options = {}) {
   require('./stop-classifier').attach(sessions);
   const checkFlight = new Map();
   const listedSessions = new Set(sessions.map((session) => session.id));
-  const checkOwnerId = (fm) => (fm.scheduled_by && listedSessions.has(fm.scheduled_by) ? fm.scheduled_by : (fm.sessions || []).at(-1)?.id || null);
+  // The scheduler if Keep still lists it, else the latest linked session it lists.
+  const checkOwnerId = (fm) => (fm.scheduled_by && listedSessions.has(fm.scheduled_by) ? fm.scheduled_by
+    : (fm.sessions || []).map((entry) => entry.id).filter((id) => listedSessions.has(id)).at(-1) || null);
   for (const session of sessions) {
     const task = taskById.get(session.taskId);
     if (task && !dependencyCache.has(task.id)) dependencyCache.set(task.id, keep.unresolvedDependencyIds(task));
