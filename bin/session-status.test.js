@@ -142,6 +142,12 @@ test('an unattended session that ends on a statement is finished, not waiting fo
     assert.equal(asked.kind, 'input');
     assert.equal(asked.attentionLabel, 'Needs an answer');
     assert.equal(attention({ ...done, pendingQuestion: { question: 'Drain?' } }).kind, 'question');
+    // The model's turn-end verdict cannot make an unattended statement "ready for the
+    // next instruction" either; it still counts when the turn asked something.
+    const verdict = { verdict: 'needs-input', reason: 'Ready for your next instruction.', model: 'haiku' };
+    assert.equal(attention({ ...done, stopVerdict: verdict }).kind, 'finished');
+    assert.equal(attention({ ...done, stopVerdict: verdict, lastAssistantFull: 'Drain the host now?' }).pri, 0);
+    assert.equal(activity({ ...done, stopVerdict: verdict, lastAssistantFull: 'Drain the host now?' }).decision.rule, 'model-needs-input');
     // The card's own asks still outrank a finished turn, and a stopped session falls
     // through to the card as it always did.
     assert.equal(attention({ ...done, taskId: 't', taskStatus: 'review' }).pri, 0);

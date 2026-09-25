@@ -485,7 +485,7 @@ function attentionItems(records, options = {}) {
     // The console lists a row only when it can open something; a row with nothing to
     // open would count on the phone and show nowhere.
     if (!sessionId && !card) continue;
-    const since = event.at || Number(record.createdAt) || 0;
+    const since = known ? known.at : (Number(record.createdAt) || 0);
     rows.push({
       kind: 'input', pri: 0, agent: record.name,
       key: `agent:${record.name}:${card}:${event.seq}`,

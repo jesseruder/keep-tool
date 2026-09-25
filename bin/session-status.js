@@ -80,8 +80,13 @@ function activity(session, context = {}) {
   add(['running', 'pending'].includes(verdict?.verdict) && !cardAsks, 'model-running', 'model', 'waiting', `Waiting: ${heldReason}`, heldReason, null,
     verdict?.verdict === 'pending' ? 'uncertain' : 'inferred');
   const asks = model.conversation.hint === 'needs-input';
+  // A session Keep opened for a program (its pane is marked unattended) is never
+  // "ready for the next instruction": nobody is meant to give it one, and its ended
+  // turn is listed as finished below. The model verdict still counts for it when the
+  // turn actually asked something.
+  const unattended = session.unattended === true;
   // The agent's own words stay the row's (and a push's) detail when it asked something.
-  add(verdict?.verdict === 'needs-input' && !durableWait && !cardAsks, 'model-needs-input', 'model', 'needs-input', asks ? 'Needs an answer' : 'Ready for next instruction',
+  add(verdict?.verdict === 'needs-input' && !durableWait && !cardAsks && !(unattended && !asks), 'model-needs-input', 'model', 'needs-input', asks ? 'Needs an answer' : 'Ready for next instruction',
     asks ? 'question' : 'next instruction', { kind: 'input', detail: asks ? text : verdict?.reason || 'Ready for your next instruction.' }, 'inferred');
   add(ended && model.conversation.hint === 'needs-input', 'prose-request', 'prose', 'needs-input', 'Needs an answer', 'question', { kind: 'input', detail: text }, 'inferred');
   add(model.conversation.waiting, 'conversation-wait', model.conversation.source, 'waiting', `Waiting: ${model.conversation.reason}`, model.conversation.reason, null, model.conversation.confidence, model.conversation.handoff?.at ?? model.foreground.at);
@@ -93,7 +98,6 @@ function activity(session, context = {}) {
   // on every turn and made a real question, which the rules above still catch
   // (a prose question, a --handoff needs-input, a pending AskUserQuestion), look
   // exactly like the last twenty turns that needed nothing.
-  const unattended = session.unattended === true;
   const ready = ended && model.identity.interactive && !model.identity.reviewer && !unattended;
   const readyRequest = { kind: 'input', detail: 'Ready for your next instruction.' };
   add(ready, 'conversation-ready', 'conversation', 'needs-input', 'Ready for next instruction', 'next instruction', readyRequest, 'inferred');
