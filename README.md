@@ -69,9 +69,9 @@ unrelated contributor activity does not by itself requeue the card.
 The bundled Keep skill teaches the agent to record progress and next steps on the
 card. You can watch its terminal in the console and respond when it needs a
 decision. Each session's panel leads with its card's last few check-ins, newest
-first, with the next step the session recorded; the session menu can also show a
-small picture of the work that Sonnet draws from those check-ins (an experiment,
-off by default). From another terminal, inspect the task or get an overview:
+first, with the next step the session recorded, beside a small picture of the work
+that Sonnet draws from those check-ins (the session menu hides it). From another
+terminal, inspect the task or get an overview:
 
 ```sh
 keep show improve-checkout-errors

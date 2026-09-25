@@ -95,8 +95,9 @@ const PICTURE_KEY = 'keep.console.cardPictures';
 const pictures = new Map(); // card id -> { svg, fresh, version, fetchedAt, retryAt }
 const inflight = new Set();
 
+// On unless this viewer chose "Hide picture".
 export function picturesEnabled() {
-  try { return localStorage.getItem(PICTURE_KEY) === 'on'; } catch { return false; }
+  try { return localStorage.getItem(PICTURE_KEY) !== 'off'; } catch { return true; }
 }
 
 export function setPicturesEnabled(on) {
@@ -105,7 +106,7 @@ export function setPicturesEnabled(on) {
 
 export function pictureToggleHTML() {
   const on = picturesEnabled();
-  return `<div class="session-actions-label">Card picture (experiment)</div><button class="btn" type="button" data-card-picture aria-pressed="${on}" title="A small picture Sonnet draws from the card's recent check-ins, redrawn when they change">${on ? 'Hide picture' : 'Show picture'}</button>`;
+  return `<div class="session-actions-label">Card picture</div><button class="btn" type="button" data-card-picture aria-pressed="${on}" title="A small picture Sonnet draws from the card's recent check-ins, redrawn when they change">${on ? 'Hide picture' : 'Show picture'}</button>`;
 }
 
 export function installPictureToggle(menu, ctx) {

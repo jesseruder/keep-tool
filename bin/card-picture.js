@@ -1,7 +1,7 @@
 'use strict';
 // A small picture of what a card is about, drawn by a cheap model from the card's
-// title and its last few check-ins. An experiment behind a console toggle: the
-// console asks for it only while Owner has pictures switched on.
+// title and its last few check-ins. The console asks for it unless the viewer
+// chose "Hide picture" in the session menu.
 //
 // It rides the summarizer's queue and cache (summarize.js): the same isolated,
 // tool-less headless Claude on an automation account, one cached result per card,

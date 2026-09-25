@@ -94,13 +94,14 @@ test('before the detail loads, the summary lastLog stands in; with no card, the 
   assert.match(checkinsHTML({ esc }, null, 'No Keep card for this session'), /No Keep card for this session/);
 });
 
-test('the picture is off until switched on, then drawn through an img data URI', async () => {
+test('the picture is on unless hidden, and drawn through an img data URI', async () => {
   const refreshes = [];
   const ctx = { esc, refresh: () => refreshes.push(1) };
   const task = { id: 'kt', _detailVersion: 'v1' };
-  assert.equal(picturesEnabled(), false);
+  assert.equal(picturesEnabled(), true, 'on by default');
+  setPicturesEnabled(false);
   assert.equal(pictureHTML(ctx, task), '');
-  assert.equal(requests.length, 0, 'nothing is requested while pictures are off');
+  assert.equal(requests.length, 0, 'nothing is requested while pictures are hidden');
 
   setPicturesEnabled(true);
   answer = { svg: null, fresh: false };
