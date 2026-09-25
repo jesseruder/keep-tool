@@ -47,8 +47,8 @@ start`, and use its tools the same way as `browser`. If `browser-gpu` failed to 
 at session start (the box was stopped), ask the user to reconnect it with `/mcp`. Confirm the page is really on the GPU before trusting
 frame rates: `javascript_tool` reading `WEBGL_debug_renderer_info` must not name
 SwiftShader or llvmpipe. Do not stop the box when you finish: other sessions may be
-driving it, and it powers itself off 30 minutes after the last tool call, so `gpu-box
-stop` refuses in that window unless it is given `--force`.
+driving it, and it powers itself off 30 minutes after the last tool call. For the same
+reason `gpu-box stop` refuses within 30 minutes of the last use unless given `--force`.
 
 ## Headless browser tests on the Mac
 
