@@ -3264,6 +3264,7 @@ commands.discord = async (argv) => {
     console.log(`enabled: ${state.enabled ? 'yes' : 'no'}`);
     console.log(`last poll: ${state.lastPollAt ? new Date(state.lastPollAt).toLocaleString() : 'never'}`);
     if (state.skipped) console.log(`last attempt: skipped${state.detail ? ` · ${state.detail}` : ''}`);
+    if (state.cursor != null) console.log(`cursor: seq ${state.cursor}${state.backlog ? ' (backlog left for the next poll)' : ''}`);
     const counts = Object.entries(state.counts);
     console.log(`today: ${counts.length ? counts.map(([kind, count]) => `${kind} ${count}`).join(', ') : 'no classifications'}`);
     return;

@@ -68,12 +68,12 @@ object of booleans:
 | `standup` | weekday standup note generated from card activity |
 | `ideas` | daily fleet-wide workflow-improvement pass |
 | `slack` | read-only Slack polling correlated with cards |
-| `discord` | Discord rendered-message polling |
+| `discord` | Discord message polling through the Castle MCP gateway |
 
 Absent means on. A configuration written before this key existed — every existing
 install — keeps all four, so nothing changes under an upgrade. Only an explicit
 `false` switches one off. `keep init` writes the block above into a *new*
-configuration, because a fresh install has no Slack workspace, no Discord tab and
+configuration, because a fresh install has no Slack workspace, no Castle gateway and
 no standup history to summarize.
 
 Off means three things: the daemon starts no scheduler for it, its dashboard state
@@ -96,26 +96,76 @@ review, lint and self-repair read what it records.
 projects the key into `KEEP_FEATURES` the same way it projects `scopes` into
 `KEEP_SCOPES`, so a child process reads the same answer as its parent.
 
-An unavailable Discord **reader** does not make the `discord` row in `keep health` read
-as failing. The reader drives a logged-in browser tab, so it is unavailable for reasons
-no daemon fix addresses — a closed tab, a restarting browser, a binary that is not
-there — and that is treated as a state the scheduler tolerates: the row records a skip
-detailed `reader unavailable: <message>`, marked `expected`, which clears the failure
-streak and keeps `bin/lint.js` `daemon-health` from calling it late. One
-`keep discord: reader unavailable: <message>` line goes to stderr on entering that
-state, not one per tick. Both routes into it are covered: the `browser_reader_unavailable`
-envelope `poll()` swallows into its status file, and a reader subprocess that would not
-spawn, timed out after 30s, exited nonzero or printed something that is not the
-envelope.
+### Discord watcher
 
-Only the reader qualifies. Everything downstream of a good envelope — a wrong guild or
-channel, a classifier that refused, a decisions file that would not write, a
-`KEEP_DISCORD_READER_ARGS` nobody can parse — is a real failure, records `ok: false` with
-its own error, logs the ordinary `keep discord: <message>` line, and goes red on the
-third one as it always did. A poll that classifies messages records a real success. One
-tick writes one health record, so a broken console notification counts as this tick's
-failure rather than clearing the streak first. `keep discord status` is unchanged: it
-reads the watcher's own status file, not health.
+The `discord` feature never talks to Discord. A separate service on the aws1 node
+scrapes the Castle Discord channels (the `cauldron-testing` text channel and the
+`bug-reports` and `feedback` forums) into Postgres, and the Castle MCP gateway serves
+them through its `discord_recent` tool: rows carrying a global, increasing `seq`, the
+`message_id`, `channel_name`, `channel_kind` (`text` or `forum`), the forum post's
+`thread_title`, `author`, `posted_at`, `text` and `permalink`. `bin/discord.js` talks
+to the gateway with the small streamable-HTTP client in `bin/mcp-http.js`
+(initialize, `notifications/initialized`, one `tools/call`, then `DELETE` of the
+session; JSON and event-stream responses; the tool result read from
+`structuredContent` or its JSON text block).
+
+`watch/discord.json`:
+
+| key | default | meaning |
+| --- | --- | --- |
+| `enabled` | `false` | poll at all |
+| `intervalMin` | `15` | minutes between polls |
+| `model` | `haiku` | classifier model |
+| `maxPerPoll` | `100` (max 100) | messages classified per poll; also the page size floor (pages are 50–200 rows) |
+| `channels` | every channel | optional list of channel names to classify; other rows are passed over |
+| `gateway.url` | from the agent config, else `https://mcp.internal.castle.xyz/mcp` | gateway endpoint |
+| `gateway.headersHelper` | from the agent config | shell command printing a JSON object of request headers |
+| `gateway.server` | `castle` | which agent-config MCP server entry to borrow |
+
+The gateway credential is the one the agent sessions on the same machine already use:
+`mcpServers.<server>` in `$CLAUDE_CONFIG_DIR/.claude.json` or `~/.claude.json` (its
+`url`, its static `headers` with `${VAR}` / `${VAR:-default}` expansion, and its
+`headersHelper`), else `[mcp_servers.<server>]` in `~/.codex/config.toml` (`url`,
+`http_headers`). A configured `gateway.headersHelper` replaces the entry's helper and
+its output is merged over the entry's static headers. Header values are never logged,
+stored or put in an error message; errors name the gateway by origin and path only.
+Keep no credential in `watch/discord.json`: the registry is a git repository.
+
+Each poll reads `discord_recent` with `after_seq` = the cursor in
+`.keep/discord/cursor.json`, paging (at most ten pages) until a short page. With no
+cursor it asks for `since` = 24 hours ago instead, so a fresh install classifies
+recent history, not the whole backfill. Rows are deduplicated by `message_id` against
+`.keep/discord/seen.json` (30 days), so a row the scraper re-reads under a new `seq`
+is not classified twice. A forum message reaches the classifier as
+`[post: <thread title>] <text>`. Each decision in `.keep/discord/decisions.jsonl`
+carries its own row's `channel`, forum `thread` title and `permalink`. The cursor moves
+last, after the decisions and the seen set are written, and only past rows that were
+classified or deliberately passed over (filtered channel, empty text, already seen):
+when the prompt budget or `maxPerPoll` stops a poll early, the cursor holds at the
+first unclassified row, and `keep discord status` prints `cursor: seq N (backlog left
+for the next poll)`. A classifier failure moves nothing.
+
+An unavailable **gateway** does not make the `discord` row in `keep health` read as
+failing. The gateway is another service on another machine, and its Discord tool may
+not be deployed yet, so it is unavailable for reasons no daemon fix addresses:
+unreachable, timed out, an HTTP error (401/403 included), a JSON-RPC error, the tool
+missing (`Unknown tool 'discord_recent'`), a tool result flagged `isError`, a headers
+helper that exits nonzero, no credential at all. That is treated as a state the
+scheduler tolerates: `poll()` records a skip in its status file, the row records a skip
+detailed `gateway unavailable: <message>`, marked `expected`, which clears the failure
+streak and keeps `bin/lint.js` `daemon-health` from calling it late. One
+`keep discord: gateway unavailable: <message>` line goes to stderr on entering that
+state, not one per tick.
+
+Only the gateway qualifies. Everything downstream of an answer that arrived — a page
+without a `messages` array or a row without an integer `seq`, a headers helper that
+prints something other than a JSON object of strings, a classifier that refused, a
+decisions file that would not write — is a real failure, records `ok: false` with its
+own error, logs the ordinary `keep discord: <message>` line, and goes red on the third
+one as it always did. A poll that classifies messages records a real success. One tick
+writes one health record, so a broken console notification counts as this tick's
+failure rather than clearing the streak first. `keep discord status` reads the
+watcher's own status file, not health.
 
 
 ## Console access

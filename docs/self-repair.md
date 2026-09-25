@@ -65,12 +65,12 @@ other record — a success, a failure, an ordinary skip, a disable — clears th
 a real fault is a candidate again the moment it lands. `lastError`/`lastErrorAt` stay
 as history; `presentationOf` only reads them while the streak is nonzero.
 
-Two rows use it. `discord` records it when its browser reader is unavailable — by
-either route, the `ReaderUnavailable` its `poll()` swallows into the status file or a
-reader subprocess that would not spawn, timed out or printed nothing usable. Nothing
-downstream of a good reader envelope qualifies: a wrong guild or channel, a classifier
-that refused, a decisions file that would not write, a `KEEP_DISCORD_READER_ARGS`
-nobody can parse are real failures and stay red. `usage` records it when every failure
+Two rows use it. `discord` records it when the Castle MCP gateway it reads from is
+unavailable — unreachable, timed out, an auth failure, the `discord_recent` tool not
+deployed, a tool error: the `GatewayUnavailable` its `poll()` swallows into the status
+file, or one that reaches the scheduler's catch. Nothing downstream of an answer that
+arrived qualifies: a malformed page, a headers helper that prints garbage, a classifier
+that refused, a decisions file that would not write are real failures and stay red. `usage` records it when every failure
 in a batch is an endpoint rate limit over a reading still younger than two hours **and**
 no other account is sitting on an unresolved non-rate-limit fault — the row is
 scheduler-wide, so one account's weather must not clear another account's evidence. In

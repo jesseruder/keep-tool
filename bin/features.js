@@ -31,10 +31,10 @@ const FEATURES = {
     emptyDashboardState: () => ({ mode: 'log', lastPollAt: null, recent: [] }),
   },
   discord: {
-    description: 'Discord rendered-message polling',
+    description: 'Discord message polling through the Castle MCP gateway',
     module: './discord.js',
     command: 'discord',
-    // discord.dashboardState() with the reader off and nothing polled.
+    // discord.dashboardState() with the watcher off and nothing polled.
     emptyDashboardState: () => ({ enabled: false, counts: {}, recent: [] }),
   },
 };

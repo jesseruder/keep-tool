@@ -299,28 +299,34 @@ and registry must have separate remotes. Never point a registry at keep-tool.
 Slack polling activates only when `watch/slack.json` in your private registry names
 channels. Its adapter currently requires a compatible MCP CLI configured through
 `KEEP_JESSE_MCP` (legacy variable name); it is not a standalone Slack integration.
-Discord polling is separately opt-in. It reads only the messages currently rendered
-in the fixed local Edge channel tab; it does not open the browser, scroll, or fetch
-history. Keep that tab open at
-`https://discord.com/channels/515820161694171141/1526722921589112852` and configure:
+Discord polling is separately opt-in. Keep does not talk to Discord: a separate
+service scrapes the Castle Discord channels into a database, and Keep reads new rows
+through the Castle MCP gateway's `discord_recent` tool, in order, from a cursor it
+keeps in `.keep/discord/cursor.json`. The first poll with no cursor starts from the
+last 24 hours rather than the whole history. Configure:
 
 ```json
 {
   "enabled": true,
-  "guildId": "515820161694171141",
-  "channelId": "1526722921589112852",
-  "channel": "cauldron-testing",
   "intervalMin": 15,
   "model": "haiku",
-  "maxPerPoll": 100
+  "maxPerPoll": 100,
+  "channels": ["cauldron-testing", "bug-reports", "feedback"]
 }
 ```
 
-Save that as `watch/discord.json`. Findings stay in log mode and appear beside Slack
-findings in Message watch. `keep discord status` reports a missing extension or tab as
-a skipped snapshot. The default reader is the castle-mcp virtualenv under
-`~/castle/castle-mcp`; override its executable with `KEEP_DISCORD_READER` and its argv
-prefix with a JSON string array in `KEEP_DISCORD_READER_ARGS`.
+Save that as `watch/discord.json`. `channels` is optional; absent means every channel
+the gateway serves. By default Keep reaches the gateway exactly as its agent sessions
+do, through the `castle` MCP server entry: `mcpServers.castle` in `~/.claude.json`
+(its `url`, its `headers` with `${VAR}` expansion, and its `headersHelper`), else
+`[mcp_servers.castle]` in `~/.codex/config.toml`. An optional
+`"gateway": { "url": "...", "headersHelper": "...", "server": "castle" }` block
+overrides the URL, supplies a headers helper (a shell command that prints a JSON
+object of headers, as in Claude Code) or names a different entry. Never put a
+credential in `watch/discord.json` itself; the registry is a git repository. Findings
+stay in log mode and appear beside Slack findings in Message watch. `keep discord
+status` reports an unreachable gateway, an auth failure or a tool that is not deployed
+yet as a skipped poll.
 Phone pushes use `KEEP_PUSH_WEBHOOK`; speaker notifications require an `announce`
 command. Credentials belong in the local environment/configuration, never source.
 
