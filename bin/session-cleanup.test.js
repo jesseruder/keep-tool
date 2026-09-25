@@ -169,11 +169,11 @@ test('a half-built worktree someone is working in is not removed', async (t) => 
   const tree = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-tree-in-use-'));
   t.after(() => fs.rmSync(tree, { recursive: true, force: true }));
   fs.mkdirSync(path.join(tree, 'sub'));
-  assert.equal(treeInUse(tree), false);
+  assert.equal(await treeInUse(tree), false);
   const child = require('node:child_process').spawn('sleep', ['30'], { cwd: path.join(tree, 'sub'), stdio: 'ignore' });
   t.after(() => { try { child.kill('SIGKILL'); } catch {} });
   await new Promise((resolve) => setTimeout(resolve, 200));
-  assert.equal(treeInUse(tree), true, 'a process with its cwd inside the tree');
+  assert.equal(await treeInUse(tree), true, 'a process with its cwd inside the tree');
   const removed = [];
   const answer = await ensureWorktree('r', 'responder', {
     worktreePath: () => tree, worktreeReady: () => false,

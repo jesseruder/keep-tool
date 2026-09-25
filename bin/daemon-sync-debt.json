@@ -597,10 +597,10 @@
       "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/area-session.js ensureRecipe; this exact synchronous filesystem mutation count is frozen, including fallback branches."
     },
     {
-      "function": "bin/area-session.js::ensureWorktree",
+      "function": "bin/area-worktree.js::ensureWorktree",
       "operation": "fs.existsSync",
       "count": 3,
-      "reason": "Conservative metadata debt: the static daemon graph reaches bin/area-session.js ensureWorktree; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation."
+      "reason": "Moved, not added: the worktree helpers left area-session.js/self-repair.js for bin/area-worktree.js (which a registry-less node host also loads for ensure-worktree); the same synchronous work as the entry it replaces, frozen at the same count."
     },
     {
       "function": "bin/attention-push.js::loadState",
@@ -3315,10 +3315,10 @@
       "reason": "Conservative read/scan debt: the static daemon graph reaches bin/self-repair.js findRecipeArtifact; this exact synchronous operation count is frozen, including test or CLI fallback branches."
     },
     {
-      "function": "bin/self-repair.js::insideWorktreeRoot",
+      "function": "bin/area-worktree.js::insideWorktreeRoot",
       "operation": "fs.realpathSync",
       "count": 2,
-      "reason": "Conservative metadata debt: the static daemon graph reaches bin/self-repair.js insideWorktreeRoot; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation."
+      "reason": "Moved, not added: the worktree helpers left area-session.js/self-repair.js for bin/area-worktree.js (which a registry-less node host also loads for ensure-worktree); the same synchronous work as the entry it replaces, frozen at the same count."
     },
     {
       "function": "bin/self-repair.js::loadState",
@@ -3351,10 +3351,10 @@
       "reason": "Conservative read/scan debt: the static daemon graph reaches bin/self-repair.js stateUnreadable; this exact synchronous operation count is frozen, including test or CLI fallback branches."
     },
     {
-      "function": "bin/self-repair.js::worktreeReady",
+      "function": "bin/area-worktree.js::worktreeReady",
       "operation": "fs.existsSync",
       "count": 4,
-      "reason": "Conservative metadata debt: the static daemon graph reaches bin/self-repair.js worktreeReady; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation."
+      "reason": "Moved, not added: the worktree helpers left area-session.js/self-repair.js for bin/area-worktree.js (which a registry-less node host also loads for ensure-worktree); the same synchronous work as the entry it replaces, frozen at the same count."
     },
     {
       "function": "bin/self-repair.js::writeJsonAtomic",
@@ -5232,11 +5232,7 @@
     "bin/area-session.js::deliveryStep>lock callback>beforeType|bin/area-session.js::deliveryStep>held|1",
     "bin/area-session.js::deliveryStep>setInterval callback|bin/area-session.js::deliveryStep>held|1",
     "bin/area-session.js::ensureRecipe|bin/keep-core.js::commitAndPush|1",
-    "bin/area-session.js::ensureWorktree|bin/area-session.js::worktreePath|1",
-    "bin/area-session.js::ensureWorktree|bin/self-repair.js::worktreeReady|2",
-    "bin/area-session.js::launchSession|bin/area-session.js::ensureWorktree|1",
     "bin/area-session.js::launchSession|bin/area-session.js::launchSession>holding|3",
-    "bin/area-session.js::launchSession|bin/self-repair.js::insideWorktreeRoot|1",
     "bin/area-session.js::launchSession>holding|bin/area-session.js::renewLaunchLease|1",
     "bin/area-session.js::nextBatch|bin/agents.js::readAfterSeq|2",
     "bin/area-session.js::releaseDeliveryLease|bin/area-session.js::releaseDeliveryLease>lock callback|1",
@@ -5272,7 +5268,6 @@
     "bin/area-session.js::tick|bin/incidents.js::config|1",
     "bin/area-session.js::tickQuietly|bin/area-session.js::tick|1",
     "bin/area-session.js::transcriptShowsIn|bin/delivery.js::received|1",
-    "bin/area-session.js::worktreePath|bin/wt.js::loadConfig|1",
     "bin/attention-push.js::createAttentionPush|bin/attention-push.js::createAttentionPush>observe|1",
     "bin/attention-push.js::createAttentionPush>observe|bin/attention-push.js::loadState|1",
     "bin/attention-push.js::createAttentionPush>observe|bin/attention-push.js::saveState|1",
@@ -6339,14 +6334,12 @@
     "bin/self-repair.js::defaultDeps|bin/self-repair.js::defaultDeps>right callback[6]|1",
     "bin/self-repair.js::defaultDeps|bin/self-repair.js::defaultDeps>right callback[9]|1",
     "bin/self-repair.js::defaultDeps>right callback|bin/health.js::snapshot|1",
-    "bin/self-repair.js::defaultDeps>right callback[10]|bin/self-repair.js::insideWorktreeRoot|1",
     "bin/self-repair.js::defaultDeps>right callback[11]|bin/self-repair.js::projectExists|1",
     "bin/self-repair.js::defaultDeps>right callback[2]|bin/keep-core.js::checkinTask|1",
     "bin/self-repair.js::defaultDeps>right callback[3]|bin/self-repair.js::spawnWorktree|1",
     "bin/self-repair.js::defaultDeps>right callback[5]|bin/self-repair.js::worktreePath|1",
     "bin/self-repair.js::defaultDeps>right callback[6]|bin/self-repair.js::findRecipeArtifact|1",
     "bin/self-repair.js::defaultDeps>right callback[9]|bin/keep-core.js::loadTask|1",
-    "bin/self-repair.js::insideWorktreeRoot|bin/wt.js::loadConfig|1",
     "bin/self-repair.js::isRepairSession|bin/self-repair.js::loadState|1",
     "bin/self-repair.js::launchNote|bin/session-numbers.js::ref|1",
     "bin/self-repair.js::launchRepair|bin/self-repair.js::launchNote|1",
@@ -6358,7 +6351,6 @@
     "bin/self-repair.js::pauseOnMissingProject|bin/self-repair.js::mutateState|1",
     "bin/self-repair.js::resumeBlocker|bin/session-numbers.js::ref|1",
     "bin/self-repair.js::spawnWorktree|bin/self-repair.js::spawnWorktree>call callback|2",
-    "bin/self-repair.js::spawnWorktree|bin/self-repair.js::worktreeReady|2",
     "bin/self-repair.js::spawnWorktree>call callback|bin/self-repair.js::worktreePath|1",
     "bin/self-repair.js::startScheduler|bin/self-repair.js::startScheduler>run|1",
     "bin/self-repair.js::startScheduler|bin/self-repair.js::startScheduler>setInterval callback|1",
@@ -7683,7 +7675,6 @@
     "bin/serve/schedulers.js::startSchedulers>areaSessionDeps|bin/serve/schedulers.js::startSchedulers>areaSessionDeps>sendToResolvedTarget|1",
     "bin/serve/schedulers.js::startSchedulers>areaSessionDeps|bin/serve/schedulers.js::startSchedulers>areaSessionDeps>transcriptShows|1",
     "bin/serve/schedulers.js::startSchedulers>areaSessionDeps>closeIdleSession|bin/serve.js::closeIdleSession|1",
-    "bin/serve/schedulers.js::startSchedulers>areaSessionDeps>listPanes|bin/serve.js::listHostPanes|1",
     "bin/serve/schedulers.js::startSchedulers>areaSessionDeps>loadCurrentSession|bin/serve.js::loadCurrentSession|1",
     "bin/serve/schedulers.js::startSchedulers>areaSessionDeps>openSession|bin/serve.js::openSession|1",
     "bin/serve/schedulers.js::startSchedulers>areaSessionDeps>resolveSessionTarget|bin/serve.js::resolveSessionTarget|1",
@@ -8025,7 +8016,23 @@
     "bin/wt.js::isLinkedWorktree|bin/wt.js::mainCheckout|1",
     "bin/wt.js::mainCheckout|bin/wt.js::existingContext|1",
     "bin/wt.js::mainCheckout|bin/wt.js::git|2",
-    "bin/wt.js::recycledWorktree|bin/wt.js::loadConfig|1"
+    "bin/wt.js::recycledWorktree|bin/wt.js::loadConfig|1",
+    "bin/area-session.js::launchSession|bin/area-worktree.js::ensureWorktree|1",
+    "bin/area-session.js::launchSession|bin/area-worktree.js::insideWorktreeRoot|1",
+    "bin/area-session.js::worktreePath|bin/area-worktree.js::worktreePath|1",
+    "bin/area-worktree.js::ensureWorktree|bin/area-worktree.js::worktreePath|1",
+    "bin/area-worktree.js::ensureWorktree|bin/area-worktree.js::worktreeReady|2",
+    "bin/area-worktree.js::insideWorktreeRoot|bin/wt.js::loadConfig|1",
+    "bin/area-worktree.js::worktreePath|bin/wt.js::loadConfig|1",
+    "bin/self-repair.js::defaultDeps>right callback[10]|bin/area-worktree.js::insideWorktreeRoot|1",
+    "bin/self-repair.js::spawnWorktree|bin/area-worktree.js::worktreeReady|2",
+    "bin/serve.js::nodeTranscriptShows|bin/serve.js::nodeTranscript|1",
+    "bin/serve/schedulers.js::startSchedulers>areaSessionDeps>listPanes|bin/serve.js::listHostPaneResult|1",
+    "bin/serve/schedulers.js::startSchedulers>areaSessionDeps>placement|bin/serve.js::checkPlacement|1",
+    "bin/serve/schedulers.js::startSchedulers>areaSessionDeps>remoteSession|bin/serve.js::loadSessionForAction|1",
+    "bin/serve/schedulers.js::startSchedulers>areaSessionDeps>transcriptShows|bin/serve.js::nodeTranscriptShows|1",
+    "bin/serve/schedulers.js::startSchedulers>areaSessionDeps|bin/serve/schedulers.js::startSchedulers>areaSessionDeps>placement|1",
+    "bin/serve/schedulers.js::startSchedulers>areaSessionDeps|bin/serve/schedulers.js::startSchedulers>areaSessionDeps>remoteSession|1"
   ],
   "unresolved": [
     {
