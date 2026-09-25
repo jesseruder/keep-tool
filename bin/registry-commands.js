@@ -269,17 +269,35 @@ const WAIT_CAP_REFUSAL = '--wait on a forwarded tell is at most 24h';
 //          typed under the same lock after it
 //   15 s   waitForHostSessionId again, on a card handoff that has not learned it
 // That is 585 s before the pane spawn, a node's pane round trips and the typing
-// itself; twelve minutes covers it with margin. A KEEP_COMPACT_TIMEOUT_MS raised on
-// the daemon past about 300 s needs this raised with it.
+// itself; twelve minutes covers it with margin (OPEN_MARGIN_MS). It is the floor:
+// KEEP_COMPACT_TIMEOUT_MS is a runtime setting, so the daemon computes its own
+// bound from the value it runs with (openExtraMs). A node cannot read the daemon's
+// setting and uses the floor for its request; see requestTimeoutMs in remote-cli.js
+// for what happens when that runs out first.
 //
 // A forwarded open holds a daemon restart for that whole bound (registry-route
 // handle), which is the honest answer: the daemon must not restart under an open it
 // is still performing, and `keep restart-daemon` reports the in-flight work rather
 // than proceed.
 const OPEN_EXTRA_MS = 12 * 60e3;
+const OPEN_MARGIN_MS = 135e3;
+const DEFAULT_COMPACT_TIMEOUT_MS = 240e3;
 
-function forwardedWaitMs(command, args) {
-  if (command === 'open') return OPEN_EXTRA_MS;
+// The open bound for a daemon whose environment is `env`: the waits above with its
+// KEEP_COMPACT_TIMEOUT_MS read the way serve.js envNumber reads it (a finite,
+// non-negative number, else the 240 s default), and never below OPEN_EXTRA_MS.
+function openExtraMs(env = {}) {
+  const configured = Number(env.KEEP_COMPACT_TIMEOUT_MS);
+  const compactMs = Number.isFinite(configured) && configured >= 0 ? configured : DEFAULT_COMPACT_TIMEOUT_MS;
+  const longest = 45e3 + 15e3 + (compactMs + 30e3) + compactMs + 15e3;
+  return Math.max(OPEN_EXTRA_MS, longest + OPEN_MARGIN_MS);
+}
+
+// `env` is the daemon's own environment, passed only by the daemon's route: a node's
+// environment says nothing about the daemon's compaction timeout, so a node leaves
+// it out and gets the floor.
+function forwardedWaitMs(command, args, env) {
+  if (command === 'open') return env ? openExtraMs(env) : OPEN_EXTRA_MS;
   return Math.min(requestedWaitMs(command, args), MAX_FORWARDED_WAIT_MS);
 }
 
@@ -329,4 +347,4 @@ function requestedWaitMs(command, args) {
   try { return require('./wait.js').parseDuration(wait); } catch { return 0; }
 }
 
-module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, openExtraMs, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

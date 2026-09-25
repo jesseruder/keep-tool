@@ -1620,8 +1620,11 @@ refused in favour of `-m`. `--node` names where to open the session, any node th
 daemon knows, not the caller's own. The daemon picks the account and model as for an
 open typed on its own node. A forwarded open may run twelve minutes past the ordinary
 bound, the longest an open can take (a reopen waits for the prompt and may compact the
-session first); it runs beside the node's other commands and holds a restart for as
-long as it runs.
+session first), and longer on a daemon whose `KEEP_COMPACT_TIMEOUT_MS` is raised,
+since the daemon sizes the bound from its own setting. The node's request waits only
+the twelve minutes; past that it resends the same key and is answered by the one run.
+A forwarded open runs beside the node's other commands and holds a restart for as long
+as it runs.
 
 A ledger at `.keep/tell.json` allows six tells per sender-recipient pair per rolling
 hour and twenty into any one session per hour; Owner's shell is exempt from the pair

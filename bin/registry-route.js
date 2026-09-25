@@ -342,7 +342,8 @@ function createRegistryService(options = {}) {
       // request bound waiting. Unlike a waiting tell it holds a restart, as any
       // ordinary command does: it spawns a session and records its ownership and
       // account pin, and a restart in the middle would leave that half done.
-      const waitMs = forwardedWaitMs(request.command, request.args);
+      // An open's bound is read from this daemon's own compaction timeout (baseEnv).
+      const waitMs = forwardedWaitMs(request.command, request.args, baseEnv);
       const waitingTell = isWaitingTell(request.command, request.args);
       const ownQueue = waitingTell || request.command === 'open';
       return await journaled({

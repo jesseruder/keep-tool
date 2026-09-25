@@ -158,7 +158,15 @@ function parsed(response) {
 
 // How long one post of a forwarded command may take: the ordinary bound, plus what
 // the daemon's run may spend waiting (a `tell --wait` re-asking a busy session, an
-// `open` waiting for the session it starts), so the node does not give up on a run the daemon is still honouring.
+// `open` waiting for the session it starts), so the node does not give up on a run
+// the daemon is still honouring.
+//
+// For an open this is the floor of the daemon's bound (registry-commands
+// openExtraMs): a daemon with a raised compaction timeout may run longer than the
+// node waits. Then this request fails, postWithRetry pings and resends the same
+// payload and so the same idempotency key, and the daemon's journaled() holds that
+// resend on the run still in flight under the key and answers it with that run's
+// recorded result. Nothing runs twice; the node just waits in more than one post.
 function requestTimeoutMs(command, args) {
   return REQUEST_TIMEOUT_MS + require('./registry-commands.js').forwardedWaitMs(command, args);
 }

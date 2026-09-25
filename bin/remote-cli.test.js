@@ -370,6 +370,26 @@ test('keep open from a node is posted to the daemon under its session, and its r
   assert.equal(sent.length, 1);
 });
 
+// A daemon with a raised compaction timeout may run an open longer than the node's
+// request waits: the node resends the same key and is answered with that run's result.
+test('an open whose request times out at the node is resent with its key and answered by the one run', async (t) => {
+  const { runRemote, REQUEST_TIMEOUT_MS } = require('./remote-cli.js');
+  const { OPEN_EXTRA_MS } = require('./registry-commands.js');
+  const root = tempDir(t);
+  const posts = [];
+  const request = async (url, pathname, options) => {
+    if (pathname === '/api/registry/ping') return { status: 200, data: '{}' };
+    posts.push(options);
+    if (posts.length === 1) throw new Error(`no answer within ${options.timeoutMs} ms`);
+    return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: 'opened\n', stderr: '', replayed: true }) };
+  };
+  const deps = { where: { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, request, token: 't', env: {}, cwd: root, sleep: async () => {} };
+  assert.deepEqual(await runRemote('open', ['card', '--fresh', '-m', 'hi'], deps), { code: 0, stdout: 'opened\n', stderr: '' });
+  assert.equal(posts.length, 2);
+  assert.equal(posts[0].payload.idempotencyKey, posts[1].payload.idempotencyKey);
+  assert.deepEqual(posts.map((post) => post.timeoutMs), [REQUEST_TIMEOUT_MS + OPEN_EXTRA_MS, REQUEST_TIMEOUT_MS + OPEN_EXTRA_MS]);
+});
+
 test('a tell naming a file on the node, or waiting past a day, is refused on the node and never posted', async (t) => {
   const { runRemote } = require('./remote-cli.js');
   const root = tempDir(t);

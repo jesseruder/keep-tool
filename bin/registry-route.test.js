@@ -9,7 +9,7 @@ const { spawnSync } = require('node:child_process');
 
 const { routes, matchRoute, routeDenial } = require('./serve/routes.js');
 const { createRegistryService } = require('./registry-route.js');
-const { REGISTRY_COMMANDS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, argumentRefusal, forwardedWaitMs, nodeSideRefusal } = require('./registry-commands.js');
+const { REGISTRY_COMMANDS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, openExtraMs, argumentRefusal, forwardedWaitMs, nodeSideRefusal } = require('./registry-commands.js');
 const ME = { session: 'sess-aws1', node: 'aws1' };
 
 const AWS1 = { class: 'node', node: 'aws1' };
@@ -358,6 +358,13 @@ test('a forwarded open runs past the ordinary bound, beside the node\'s other co
   // The longest open, a reopen that compacts, is 585 s of waits (registry-commands.js).
   assert.equal(OPEN_EXTRA_MS, 12 * 60e3);
   assert.ok(OPEN_EXTRA_MS >= (45 + 15 + 270 + 240 + 15) * 1e3);
+  assert.equal(openExtraMs({}), OPEN_EXTRA_MS, 'the default compaction timeout gives the floor');
+  assert.equal(openExtraMs({ KEEP_COMPACT_TIMEOUT_MS: '60000' }), OPEN_EXTRA_MS, 'a shorter one never lowers it');
+  assert.equal(openExtraMs({ KEEP_COMPACT_TIMEOUT_MS: 'soon' }), OPEN_EXTRA_MS, 'an unreadable one is the default, as serve.js reads it');
+  // Raised to 360 s the longest open is 45 + 15 + (360 + 30) + 360 + 15 = 825 s.
+  assert.ok(openExtraMs({ KEEP_COMPACT_TIMEOUT_MS: '360000' }) >= 825e3 + 60e3);
+  assert.equal(forwardedWaitMs('open', ['card'], { KEEP_COMPACT_TIMEOUT_MS: '360000' }), openExtraMs({ KEEP_COMPACT_TIMEOUT_MS: '360000' }));
+  assert.equal(forwardedWaitMs('open', ['card']), OPEN_EXTRA_MS, 'a node, which has no daemon env, gets the floor');
   assert.equal(forwardedWaitMs('open', ['card', '--fresh', '-m', 'hi']), OPEN_EXTRA_MS);
   assert.equal(forwardedWaitMs('open', ['card', '--wait', '5m']), OPEN_EXTRA_MS, 'open takes no --wait of its own');
   assert.equal(forwardedWaitMs('show', ['card']), 0);
@@ -400,6 +407,45 @@ test('a forwarded open is killed only after its longer bound', async (t) => {
   assert.equal(show.status, 504);
   const opened = await svc.handle(AWS1, body(root, { command: 'open', args: ['card', '--fresh'], idempotencyKey: `${KEY}-open` }));
   assert.equal(opened.status, 200, JSON.stringify(opened.body));
+});
+
+// The subprocess bound is the route's own timer; the kill it makes names the bound.
+for (const [label, env, seconds] of [['the default', {}, 60 + 720], ['a raised', { KEEP_COMPACT_TIMEOUT_MS: '360000' }, 60 + 960]]) {
+  test(`the daemon bounds a forwarded open by its own compaction timeout: ${label} one`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const { svc, root } = service(t, { fake: fakeSpawn(() => 'hang'), env });
+    const answer = svc.handle(AWS1, body(root, { command: 'open', args: ['card', '--fresh'], idempotencyKey: `${KEY}-open` }));
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(seconds * 1e3 - 1);
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(svc.busy(), true, 'still running a millisecond short of the bound');
+    t.mock.timers.tick(1);
+    const done = await answer;
+    assert.equal(done.status, 504);
+    assert.match(done.body.stderr, new RegExp(`stopped this command after ${seconds}s`));
+  });
+}
+
+// A node whose request runs out before the daemon's longer open does resends the same
+// key; the resend is held on the run in flight and answered with its result.
+test('a resend of an open still in flight waits for it and is answered with its result', async (t) => {
+  const fake = fakeSpawn(() => 'hang');
+  const original = fake.spawn;
+  const children = [];
+  fake.spawn = (...args) => { const child = original(...args); children.push(child); return child; };
+  const { svc, root, calls } = service(t, { fake });
+  const request = body(root, { command: 'open', args: ['card', '--fresh', '-m', 'hi'], idempotencyKey: `${KEY}-open` });
+  const first = svc.handle(AWS1, request);
+  for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  const resend = svc.handle(AWS1, request);
+  for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(children.length, 1, 'the resend started nothing');
+  children[0].stdout.emit('data', Buffer.from('opened\n'));
+  children[0].emit('close', 0, null);
+  const [a, b] = await Promise.all([first, resend]);
+  assert.deepEqual([a.status, a.body.stdout, a.body.replayed], [200, 'opened\n', false]);
+  assert.deepEqual([b.status, b.body.stdout, b.body.replayed], [200, 'opened\n', true]);
+  assert.equal(calls.length, 1);
 });
 
 test('a project named relative to the node\'s directory is refused; absolute, ~ and bare names are not', () => {
