@@ -119,15 +119,17 @@ function turnsSearch(argv) {
     project: o.project ? turnIndex.normalizeProject(canonicalProjectPath(o.project)) : null,
     agent: o.agent || null,
     sessionLimit: Math.min(turnsIndexNumber(o.limit, '--limit') || 20, 200),
-  }).map((hit) => ({ ...hit, num: numbers.numberFor(hit.sessionId) }));
+  }).map((hit) => ({ ...hit, num: numbers.numberFor(hit.sessionId),
+    snippet: hit.snippet.split(OPEN).join('[').split(CLOSE).join(']') }));
   if (o.json) return console.log(JSON.stringify(hits, null, 2));
   if (!hits.length) return console.log('no matches');
-  const said = (hit) => (hit.role === 'user' ? 'you' : hit.role === 'tool' ? 'tool' : 'agent');
+  // `user` rows also carry Keep's own messages, hook prompts and slash commands.
+  const said = (hit) => (hit.kind === 'human' ? 'you' : hit.role === 'user' ? `${hit.kind || 'user'}` : hit.role === 'tool' ? 'tool' : 'agent');
   for (const hit of hits) {
     const head = [numbers.named(hit.sessionId), hit.title && turnsClip(hit.title, 80), hit.card,
       hit.project && path.basename(hit.project), turnsStamp(hit.ts), hit.hits > 1 ? `${hit.hits} matches` : ''].filter(Boolean);
     console.log(head.join('  ·  '));
-    console.log(`    ${said(hit)}: ${turnsClip(hit.snippet.split(OPEN).join('[').split(CLOSE).join(']'), 200)}`);
+    console.log(`    ${said(hit)}: ${turnsClip(hit.snippet, 200)}`);
   }
 }
 

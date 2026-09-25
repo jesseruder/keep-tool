@@ -219,16 +219,25 @@ moment it wrote the verdict (see `docs/turn-watcher.md`).
 ### `messages_fts`
 
 An FTS5 external-content table over `messages.text` (`tokenize='unicode61'`)
-with insert/delete/update triggers. `keep turns search` uses `snippet()` for the
-match context. Query tokens are quoted before they reach `MATCH` (so `home-only`
-is a phrase, not a `NOT`); the module's `search(query, { raw: true })` passes FTS5
-syntax through unchanged.
+with insert/delete/update triggers. `keep turns search` and the console's ⌘F
+finder share one query (`bin/session-text-search.js`): every word is quoted before
+it reaches `MATCH` (so `home-only` is a phrase, not a `NOT`), a last word of three or
+more letters is also a prefix, and matches are read newest first by FTS rowid, which
+is ingestion order. Ordering by `messages.ts` instead took forty seconds for a common
+word on a 780 MB index; by rowid it takes tens of milliseconds. Hits are grouped to
+one row per session, with `snippet()` for the passage. By default only `human` and
+`text` messages in `interactive` sessions are searched; `--all` searches every
+message of every session. The search covers the whole index unless `--since`
+narrows it. A pane-only node may run `search` (without `--all`, since tool output
+can hold whatever a command printed), `show` and `stats`, forwarded to the daemon.
+The module's `search(query, { raw: true })` still passes FTS5 syntax through
+unchanged for callers in code.
 
 ## CLI
 
 ```
 keep turns show <session-id|card-id> [--last N] [--json]
-keep turns search "<query>" [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]
+keep turns search "<query>" [--all] [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]
 keep turns stats [--since when] [--json]
 keep turns ingest <file> [--agent claude|codex] [--force]
 keep turns backfill [--since when] [--roots dir,dir] [--force] [--json]

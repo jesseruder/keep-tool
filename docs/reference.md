@@ -576,8 +576,9 @@ more letters also matches longer ones. `--all` adds tool calls and their output,
 headless runs and subagents. It orders by the index's insertion order rather than
 by timestamp, which answers a common word in tens of milliseconds where a sort by
 time took forty seconds; the console's ⌘F finder asks the same query. On a pane-only
-node `search`, `show` and `stats` are forwarded to the daemon like the registry
-commands; the other subcommands are refused there.
+node `search` (without `--all`), `show` and `stats` are forwarded to the daemon like
+the registry commands; the other subcommands are refused there. The search covers the
+whole index unless `--since` narrows it.
 `--since` reads backwards here: `+7d` means the last seven days. Hooks index at
 most 512 KiB per turn and wait at most 250 ms for the write lock, so a backlog is
 left to the daemon rather than made an agent's problem. Indexed sessions idle for

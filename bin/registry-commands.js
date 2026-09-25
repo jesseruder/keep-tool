@@ -41,6 +41,15 @@ const REGISTRY_COMMANDS = Object.freeze([
 
 const TURNS_READS = Object.freeze(['search', 'show', 'stats']);
 const TURNS_REFUSAL = `a node runs only keep turns ${TURNS_READS.join('|')}; the rest runs on the daemon node`;
+// Tool output can hold whatever a command printed, a secret included, from every
+// machine in the fleet; a node searches what people typed and the agents' prose.
+const TURNS_ALL_REFUSAL = 'a node searches without --all: tool output stays on the daemon node';
+function turnsRefusal(args) {
+  if (!TURNS_READS.includes(args[0])) return TURNS_REFUSAL;
+  const end = args.indexOf('--');
+  if ((end < 0 ? args : args.slice(0, end)).some((arg) => arg === '--all' || arg.startsWith('--all='))) return TURNS_ALL_REFUSAL;
+  return null;
+}
 
 // A flag whose value is a command the daemon runs: `--probe` on its check schedule,
 // `--done-when` when a plan step is verified, and `plan --verify`, which runs one.
@@ -175,7 +184,7 @@ function argumentRefusal(command, args, identity = {}) {
     if (total > MAX_ARGS_BYTES) return `the arguments are longer than ${MAX_ARGS_BYTES} bytes together`;
     if (arg.includes('\0')) return 'an argument contains a NUL byte';
   }
-  if (command === 'turns' && !TURNS_READS.includes(args[0])) return TURNS_REFUSAL;
+  if (command === 'turns' && turnsRefusal(args)) return turnsRefusal(args);
   if (Object.prototype.hasOwnProperty.call(SESSION_REFUSALS, command) && !identity.session) return SESSION_REFUSALS[command];
   if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return WAIT_CAP_REFUSAL;
   const newline = (arg) => /[\r\n]/.test(arg);
@@ -329,7 +338,7 @@ function isWaitingTell(command, args) {
 // record and are left to the route, which applies these two as well.
 function nodeSideRefusal(command, args) {
   if (!Array.isArray(args)) return null;
-  if (command === 'turns' && !TURNS_READS.includes(args[0])) return TURNS_REFUSAL;
+  if (command === 'turns' && turnsRefusal(args)) return turnsRefusal(args);
   const fileFlags = Object.prototype.hasOwnProperty.call(NODE_FILE_FLAGS, command) ? NODE_FILE_FLAGS[command] : [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];

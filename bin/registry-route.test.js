@@ -231,7 +231,7 @@ test('a flag is read as taking no value exactly where that command\'s parseArgs 
 });
 
 test('a node runs only the reading turns subcommands', () => {
-  assert.equal(argumentRefusal('turns', ['search', 'websocket', '--all', '--project', 'keep-tool']), null);
+  assert.equal(argumentRefusal('turns', ['search', 'websocket', '--json', '--project', 'keep-tool']), null);
   assert.equal(argumentRefusal('turns', ['show', 'my-card', '--last', '5']), null);
   assert.equal(argumentRefusal('turns', ['stats', '--json']), null);
   for (const args of [['ingest', '/tmp/x.jsonl'], ['backfill'], ['prune'], []]) {
@@ -239,6 +239,11 @@ test('a node runs only the reading turns subcommands', () => {
     assert.match(nodeSideRefusal('turns', args), /only keep turns search\|show\|stats/, args.join(' '));
   }
   assert.match(argumentRefusal('turns', ['search', 'x', '--project', '../elsewhere']), /relative to a directory/);
+  for (const args of [['search', 'x', '--all'], ['search', '--all=1', 'x'], ['show', 'c', '--all']]) {
+    assert.match(argumentRefusal('turns', args), /without --all/, args.join(' '));
+    assert.match(nodeSideRefusal('turns', args), /without --all/, args.join(' '));
+  }
+  assert.equal(argumentRefusal('turns', ['search', '--', '--all']), null, 'after -- it is a search word');
 });
 
 test('arguments are checked the way the CLI will read them', (t) => {
