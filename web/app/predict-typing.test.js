@@ -536,12 +536,12 @@ test('a Codex pane is not predicted or measured under any setting', async () => 
   }
 });
 
-function reportingPredictor(terminal) {
+function reportingPredictor(terminal, now = () => 0) {
   const replies = [];
   const xtermReplies = [];
   terminal.onData((data) => xtermReplies.push(data));
   const predictor = createTypingPredictor({
-    terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => 0,
+    terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now,
     reply: (data) => replies.push(data),
   });
   return { predictor, replies, xtermReplies };
@@ -585,4 +585,60 @@ test('with no guess standing, or once the pane moves the cursor, xterm answers a
   await write(terminal, '\r❯ a\x1b[K\x1b[6n');
   assert.deepEqual(replies, [], 'the pane put the cursor where it is');
   assert.deepEqual(xtermReplies, ['\x1b[1;4R']);
+});
+
+test('a guess that expires unconfirmed keeps the cursor correction until the pane redraws the row', async () => {
+  const terminal = await terminalWith('status\r\n❯ ');
+  let clock = 0;
+  const { predictor, replies, xtermReplies } = reportingPredictor(terminal, () => clock);
+  predictor.outputParsed();
+  predictor.keystroke('a');
+  await write(terminal, '');
+  clock = 6001;
+  await write(terminal, '\x1b7\x1b[1;1Hspin\x1b8');
+  predictor.outputParsed();
+  assert.equal(predictor.pending, 0, 'the guess expired');
+  await write(terminal, '\x1b[6n');
+  assert.deepEqual(replies, ['\x1b[2;3R'], 'the report still names the column before the guess');
+  assert.deepEqual(xtermReplies, []);
+  await write(terminal, '\r❯ a\x1b[K\x1b[6n');
+  assert.deepEqual(replies, ['\x1b[2;3R'], 'the redraw retired the correction');
+  assert.deepEqual(xtermReplies, ['\x1b[2;4R']);
+});
+
+test('a guess after an expiry and a late redraw does not carry a stale advance', async () => {
+  const terminal = await terminalWith('❯ ');
+  let clock = 0;
+  const { predictor, replies } = reportingPredictor(terminal, () => clock);
+  predictor.outputParsed();
+  predictor.keystroke('a');
+  await write(terminal, '');
+  clock = 6001;
+  await write(terminal, '\r❯ a\x1b[K');
+  predictor.outputParsed();
+  assert.equal(predictor.pending, 0);
+  predictor.keystroke('b');
+  await write(terminal, '');
+  assert.equal(terminal.buffer.active.cursorX, 4);
+  await write(terminal, '\x1b[6n');
+  assert.deepEqual(replies, ['\x1b[1;4R'], 'exactly one column left of the local cursor');
+});
+
+test('a chain dropped by a redraw that is not an echo retires the correction with it', async () => {
+  const terminal = await terminalWith('❯ ');
+  const { predictor, replies, xtermReplies } = reportingPredictor(terminal);
+  predictor.outputParsed();
+  predictor.keystroke('a');
+  await write(terminal, '');
+  await write(terminal, '\r❯ /model\x1b[K');
+  predictor.outputParsed();
+  assert.equal(predictor.pending, 0);
+  await write(terminal, '\x1b[6n');
+  assert.deepEqual([replies, xtermReplies], [[], ['\x1b[1;9R']]);
+  xtermReplies.length = 0;
+  predictor.keystroke('x');
+  await write(terminal, '');
+  await write(terminal, '\x1b[6n');
+  assert.deepEqual(replies, ['\x1b[1;9R'], 'exactly one column left of the local cursor');
+  assert.deepEqual(xtermReplies, []);
 });

@@ -168,7 +168,10 @@ export function createTypingPredictor({
   let touched = false;
   let localWrite = false;
   const touch = (reach) => () => {
-    if (localWrite || !entries.length) return false;
+    // Runs while a cursor correction stands even with no guess pending: a guess
+    // that expired unconfirmed still moved the cursor, and only the pane's redraw
+    // of the row retires that.
+    if (localWrite || (!entries.length && !advance)) return false;
     const buffer = terminal.buffer.active;
     const cursorRow = buffer.baseY + buffer.cursorY;
     // Erasing in line and inserting or deleting characters act on the cursor's row;
@@ -177,7 +180,7 @@ export function createTypingPredictor({
     if (reach === 'screen' || cursorRow === row || (reach === 'below' && cursorRow < row)) {
       touched = true;
       // The pane is redrawing the row, so wherever the cursor goes next is its own.
-      localCursor = null;
+      retireCorrection();
     }
     // Never handled here: xterm still performs the sequence.
     return false;
@@ -187,8 +190,16 @@ export function createTypingPredictor({
   // it somewhere, and where they left it. A guess moves xterm's real cursor before
   // the pane has echoed anything, so a cursor-position report built from it would
   // name a column the pane never produced.
+  // This correction belongs to the cursor, not to the guesses: a guess that
+  // expires or is dropped leaves the cursor where it moved it, so only evidence
+  // from the pane (an erase or shift on the prompt row, a settled change to the
+  // line, or the cursor no longer where the guesses left it) retires it.
   let advance = 0;
   let localCursor = null;
+  const retireCorrection = () => {
+    advance = 0;
+    localCursor = null;
+  };
   const cursorKey = () => {
     const buffer = terminal.buffer.active;
     return `${buffer.type}:${buffer.baseY + buffer.cursorY}:${buffer.cursorX}`;
@@ -202,7 +213,7 @@ export function createTypingPredictor({
   // standing guess, is left to xterm. A guess never changes the row.
   const reportPosition = (prefix) => (params) => {
     if (params.length !== 1 || params[0] !== 6 || typeof reply !== 'function') return false;
-    if (localWrite || !advance || !entries.some((entry) => entry.drawn) || cursorKey() !== localCursor) return false;
+    if (localWrite || !advance || cursorKey() !== localCursor) return false;
     const buffer = terminal.buffer.active;
     reply(`\x1b[${prefix}${buffer.cursorY + 1};${Math.max(0, buffer.cursorX - advance) + 1}R`);
     return true;
@@ -366,6 +377,7 @@ export function createTypingPredictor({
     const changed = touched || state !== lastSettled;
     lastSettled = state;
     touched = false;
+    if (changed) retireCorrection();
     // A keystroke the agent has not answered in this long is not waiting on the
     // network; it did nothing the line shows. Timing its eventual redraw would read
     // as a very slow echo, so it expires here as well as on the next keypress.
@@ -408,8 +420,7 @@ export function createTypingPredictor({
     lastSettled = '';
     touched = false;
     localWrite = false;
-    advance = 0;
-    localCursor = null;
+    retireCorrection();
     generation++;
   };
   const dispose = () => {
