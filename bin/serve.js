@@ -4216,8 +4216,8 @@ function codexTitleHere(sessionId, accountId, deps = {}) {
 // size, mtime and endedTurn. A local row has them from its transcript; a row for a
 // pane on another node gets them from that node: a `stat` every listing cycle (at
 // most once per 2.5 s per session, the process rows' cache), and a `tail` only when
-// the stat says the transcript changed. Only for a Claude pane whose session the
-// authority record places on the node that lists it. A node that does not answer
+// the stat says the transcript changed. Only for a Claude or Codex pane (a Pi one
+// gives its phase) whose session the authority record places on the node that lists it. A node that does not answer
 // leaves its rows as they were, without a transcript size.
 const REMOTE_TRANSCRIPT_CACHE_MS = PROCESS_ROWS_CACHE_MS;
 const REMOTE_TRANSCRIPT_CACHE_LIMIT = 512;
@@ -4249,6 +4249,54 @@ async function cachedRemoteSession(node, sessionId, deps = {}) {
         entry.accountId = nodeTranscriptAccount(session, deps).id;
       }
       entry.stat = stat;
+      entry.at = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
+    })().finally(() => { entry.pending = null; });
+  }
+  await entry.pending;
+  return model();
+}
+
+// The same for a Codex session: its row needs the rollout's session_meta beside the
+// tail, so a changed stat re-reads both as one pair (readNodeRollout). The stat names
+// the rollout's path as well, since a newer rollout for the session is a new file.
+// Its entries share the cache with the Claude ones under a key of their own kind.
+async function cachedRemoteCodexSession(node, sessionId, deps = {}) {
+  const key = `codex\0${node}\0${sessionId}`;
+  let entry = remoteTranscriptCache.get(key);
+  if (!entry) {
+    entry = { at: 0, stat: null, meta: null, tail: null, accountId: null, pending: null };
+    remoteTranscriptCache.set(key, entry);
+    while (remoteTranscriptCache.size > REMOTE_TRANSCRIPT_CACHE_LIMIT) {
+      remoteTranscriptCache.delete(remoteTranscriptCache.keys().next().value);
+    }
+  }
+  const now = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
+  const model = () => {
+    const session = codexSessionFromTail(sessionId, entry.meta, entry.tail, {
+      root: deps.root || keep.ROOT, accountId: entry.accountId, node,
+      title: codexTitleHere(sessionId, entry.accountId, deps),
+    });
+    // A Companion task is a delegated job, left out as codex.scan leaves it out.
+    return codex.isCompanionTask(session.title) ? null : session;
+  };
+  if (entry.tail && now - entry.at < REMOTE_TRANSCRIPT_CACHE_MS) return model();
+  if (!entry.pending) {
+    entry.pending = (async () => {
+      const session = { id: sessionId, kind: 'codex', node };
+      const client = (deps.nodeTranscript || nodeTranscript)(node, session, deps);
+      const stat = await client.stat();
+      const same = entry.tail && entry.stat && stat.path === entry.stat.path && stat.size === entry.stat.size
+        && stat.mtimeMs === entry.stat.mtimeMs && stat.generation === entry.stat.generation;
+      if (!same) {
+        const { meta, tail } = await readNodeRollout(client, sessionId, node);
+        entry.meta = meta;
+        entry.tail = tail;
+        entry.accountId = nodeTranscriptAccount(session, deps).id;
+      }
+      // What the held pair describes: a rollout that moved on between the stat and
+      // the read is compared next time with what was read, not with the older stat.
+      entry.stat = same ? stat
+        : { path: entry.tail.path, size: entry.tail.size, mtimeMs: entry.tail.mtimeMs, generation: entry.tail.generation };
       entry.at = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
     })().finally(() => { entry.pending = null; });
   }
@@ -4308,7 +4356,7 @@ async function remoteSessionFreshness(panes, deps = {}, { skipNodes = null } = {
   const skip = new Set(skipNodes || []);
   const wanted = (Array.isArray(panes) ? panes : []).filter((pane) => pane && pane.alive
     && nodes.isRemotePane(pane, env) && !skip.has(pane.node) && pane.meta
-    && (pane.meta.agent === 'claude' || pane.meta.agent === 'pi')
+    && ['claude', 'codex', 'pi'].includes(pane.meta.agent)
     && typeof pane.meta.sessionId === 'string' && /^[A-Za-z0-9_-]+$/.test(pane.meta.sessionId));
   if (!wanted.length) return null;
   const out = {};
@@ -4328,7 +4376,10 @@ async function remoteSessionFreshness(panes, deps = {}, { skipNodes = null } = {
         out[id] = { id, kind: 'pi', node: pane.node, piEvent: piEvent || null };
         return;
       }
-      const session = await (deps.cachedRemoteSession || cachedRemoteSession)(pane.node, id, deps);
+      const read = pane.meta.agent === 'codex'
+        ? deps.cachedRemoteCodexSession || cachedRemoteCodexSession
+        : deps.cachedRemoteSession || cachedRemoteSession;
+      const session = await read(pane.node, id, deps);
       if (session) out[id] = session;
     } catch {}
   }));
@@ -12456,7 +12507,10 @@ function copySessions(sessions) {
 function dashboardCodexSessionFor(id, options = {}) {
   let record = codexDashboardRows.get(id) || null;
   const authority = options.accountAuthority?.[id] || null;
-  if (authority && (authority.agent !== 'codex' || authority.stagedAccountId)) {
+  // A session on another node is read there (backfillHostSessions takes its node's
+  // row), never from the rollout a move left here, as the Claude resolver does.
+  if (authority && (authority.agent !== 'codex' || authority.stagedAccountId
+    || (authority.node && authority.node !== daemonNodeName(options)))) {
     codexDashboardRows.delete(id);
     return null;
   }
@@ -13485,7 +13539,11 @@ function backfillHostSessions(sessions, panes, deps = {}) {
             ? (nonDashboardIndexedClaudeSessionFor ||= deps.createIndexedClaudeSessionResolver())
             : deps.freshClaudeSessionFor || claudeSessionFor);
       let session = null;
-      try { session = lookup(id); } catch {}
+      // A Codex pane on another node is never read from a rollout here: the only one
+      // there can be is what a move left behind, frozen at the move (codex.sessionFor
+      // does not ask where the session runs, as findSessionFile does for Claude).
+      const remoteCodex = agent === 'codex' && nodes.isRemotePane(pane, paneRefEnv(deps));
+      if (!remoteCodex) try { session = lookup(id); } catch {}
       // A session on another node has no transcript here. Its node's own read, taken
       // for this listing (remoteSessionFreshness), stands in for the local one: size,
       // mtime, endedTurn and the rest, as a local row has them. Without one the row is

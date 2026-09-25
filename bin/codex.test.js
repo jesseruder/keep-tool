@@ -169,6 +169,41 @@ test('configured Codex roots keep discovery, titles, authority, and path caches 
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
+test('a Codex session whose location record names another node is not listed from the rollout it left here', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-moved-'));
+  try {
+    const keepRoot = path.join(home, 'keep');
+    const configFile = path.join(home, 'config.json');
+    const configDir = path.join(home, 'codex-one');
+    fs.mkdirSync(keepRoot, { recursive: true });
+    fs.writeFileSync(configFile, JSON.stringify({
+      version: 1,
+      accounts: [{ id: 'codex-one', label: 'One', agent: 'codex', configDir }],
+      defaultAccounts: { codex: 'codex-one' },
+    }));
+    const dir = codex.recentDateDirs(configDir)[1];
+    fs.mkdirSync(dir, { recursive: true });
+    writeRollout(path.join(dir, 'rollout-test-sess-moved.jsonl'), { id: 'sess-moved', cwd: '/work/moved' }, true);
+    const authorityDir = path.join(keepRoot, '.keep', 'session-accounts');
+    fs.mkdirSync(authorityDir, { recursive: true });
+    const listed = (node) => {
+      fs.writeFileSync(path.join(authorityDir, 'sess-moved.json'), JSON.stringify({
+        version: 1, sessionId: 'sess-moved', agent: 'codex', accountId: 'codex-one', node,
+      }));
+      const env = { ...process.env, HOME: home, KEEP_DIR: keepRoot, KEEP_CONFIG: configFile, KEEP_DAEMON_NODE: 'main' };
+      delete env.KEEP_NODE_NAME;
+      delete env.CLAUDE_CODE_SESSION_ID;
+      const run = spawnSync(process.execPath, ['-e', `console.log(JSON.stringify(require('./bin/codex.js').scan().map((row) => row.id)))`], {
+        cwd: path.join(__dirname, '..'), env, encoding: 'utf8', timeout: 10000,
+      });
+      assert.equal(run.status, 0, run.stderr);
+      return JSON.parse(run.stdout);
+    };
+    assert.deepEqual(listed('aws7'), [], 'moved to aws7: the copy here is not the session');
+    assert.deepEqual(listed('main'), ['sess-moved'], 'on the daemon node: listed as before');
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
 test('dashboard rollout index invalidation observes new and deleted files within its sweep window', () => {
   const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-index-'));
   try {

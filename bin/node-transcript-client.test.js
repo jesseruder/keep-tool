@@ -661,6 +661,68 @@ test('a silent node adds no wait to the publication: its panes are not asked abo
   } finally { f.cleanup(); }
 });
 
+test('a Codex pane on a node gets its row from that node\'s meta and tail, and the publication takes it', async () => {
+  const sid = 'sess-codex-fresh';
+  const f = codexNodeFixture(sid, 'aws7');
+  try {
+    const pane = { id: 'p1@aws7', node: 'aws7', hostPaneId: 'p1', alive: true, agentAlive: true,
+      createdAt: new Date(Date.now() - 3600e3).toISOString(), meta: { agent: 'codex', sessionId: sid, openingMessage: true } };
+    const read = await serve.remoteSessionFreshness([pane], f.deps);
+    assert.deepEqual(Object.keys(read), [sid]);
+    const row = read[sid];
+    assert.equal(row.kind, 'codex');
+    assert.equal(row.node, 'aws7');
+    assert.equal(row.accountId, 'codex/default');
+    assert.equal(row.lastAssistant, 'The build is green.');
+    assert.equal(row.endedTurn, true);
+    assert.equal(row.size, Buffer.byteLength(codexRollout(sid)));
+    assert.deepEqual(f.asked.filter((op) => op !== 'hello').sort(), ['meta:codex', 'stat:codex', 'tail:codex']);
+    // Within the cache window nothing is asked again.
+    const asked = f.asked.length;
+    await serve.remoteSessionFreshness([pane], f.deps);
+    assert.equal(f.asked.length, asked);
+
+    // The row the publication builds is the node's, even with a rollout here to read:
+    // the only one there can be is what a move left behind.
+    const sessions = [];
+    serve.backfillHostSessions(sessions, [pane], { root: f.root, hostNodes: ['main', 'aws7'],
+      codexSessionFor: () => ({ id: sid, kind: 'codex', lastAssistant: 'frozen at the move', size: 1, mtime: 1 }),
+      nodeSessions: read });
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].kind, 'codex');
+    assert.equal(sessions[0].lastAssistant, 'The build is green.');
+    assert.equal(sessions[0].size, row.size);
+    assert.equal(sessions[0].node, 'aws7');
+    assert.equal(sessions[0].pane, 'p1@aws7');
+    assert.equal(sessions[0].hostOnly, true);
+    // Without the node's read, the row is the pane's alone, with no size nobody read.
+    const bare = [];
+    serve.backfillHostSessions(bare, [pane], { root: f.root, hostNodes: ['main', 'aws7'],
+      codexSessionFor: () => ({ id: sid, kind: 'codex', lastAssistant: 'frozen at the move', size: 1, mtime: 1 }) });
+    assert.equal(bare[0].lastAssistant, '');
+    assert.equal('size' in bare[0], false);
+  } finally { f.cleanup(); }
+});
+
+test('a Codex pane whose rollout meta and tail never pair is left out of the node read', async () => {
+  const sid = 'sess-codex-unpaired';
+  const f = codexNodeFixture(sid, 'aws7');
+  try {
+    const bytes = Buffer.from(codexRollout(sid));
+    const described = (generation) => ({ path: `/node/home/.codex/sessions/2026/01/01/rollout-${sid}.jsonl`,
+      size: bytes.length, mtimeMs: Date.now() - 5000, generation });
+    const deps = { ...f.deps, nodeTranscript: () => ({
+      stat: async () => described('g-new'),
+      meta: async () => ({ ...described('g-new'), meta: { id: sid, cwd: '/work/project', model: null, originator: 'codex_cli_rs',
+        parentThreadId: null, child: false, headless: false }, model: null }),
+      tail: async () => ({ ...described('g-old'), bytes: bytes.toString('base64'), from: 0 }),
+    }) };
+    const pane = { id: 'p1@aws7', node: 'aws7', hostPaneId: 'p1', alive: true, agentAlive: true,
+      createdAt: new Date().toISOString(), meta: { agent: 'codex', sessionId: sid } };
+    assert.equal(await serve.remoteSessionFreshness([pane], deps), null);
+  } finally { f.cleanup(); }
+});
+
 // ---------- a Pi session's phase on a node ----------
 
 function piFixture(node, sid) {

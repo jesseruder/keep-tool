@@ -454,6 +454,7 @@ function scan(options = {}) {
   const seen = new Set();
   const root = process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
   const accountAuthority = require('./accounts.js').authority(root);
+  const daemonNode = options.daemonNode || require('./nodes.js').daemonNode(process.env);
   for (const accountRoot of configuredRoots()) {
     const titles = loadTitles(accountRoot.configDir);
     for (const { file, stat } of indexedRollouts(accountRoot.configDir, { dashboard: options.dashboard === true, now })) {
@@ -479,6 +480,10 @@ function scan(options = {}) {
   for (const [id, candidates] of candidatesById) {
     const authority = accountAuthority[id];
     if (authority && (authority.agent !== 'codex' || authority.stagedAccountId)) continue;
+    // A session moved to another node leaves its rollout here, and that copy stops
+    // growing: it is where the session was, not what it is doing. Its node's own read
+    // stands in for it (backfillHostSessions).
+    if (authority && authority.node && authority.node !== daemonNode) continue;
     const pinnedId = authority?.accountId || null;
     const eligible = pinnedId ? candidates.filter((entry) => entry.accountId === pinnedId) : candidates;
     if (!pinnedId && new Set(eligible.map((entry) => entry.accountId)).size > 1) continue;
