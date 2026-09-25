@@ -309,7 +309,10 @@ function consume(state, row, agent, classify, instance) {
     // Only classification and target IDs survive; never persist arguments.
     const target = String(input?.task_id || input?.session_id || input?.cell_id || input?.id || '');
     state.calls[`call:${id}`] = { name: String(name || '').slice(0, 100), kind: classify(name, input),
-      target: ID.test(target) ? target : '', at };
+      target: ID.test(target) ? target : '', at,
+      // A self-paced wakeup's delay (a number) or its stop, the only fields kept.
+      ...(name === 'ScheduleWakeup' ? { wakeupStop: input?.stop === true,
+        wakeupDelayMs: Math.min(Math.max(Number(input?.delaySeconds) || 0, 0), 7 * 86400) * 1000 } : {}) };
   };
   if (agent === 'claude') {
     const notification = row.type === 'queue-operation' ? row.content
@@ -347,6 +350,19 @@ function consume(state, row, agent, classify, instance) {
         }
       }
       if (call?.name === 'CronDelete' && !item.is_error && /^Cancelled job [\w-]+\./.test(value)) finish(`cron_${call.target}`, 'cancelled');
+      // A self-paced /loop wakeup (ScheduleWakeup) is a one-shot scheduled job that
+      // fires at its delay; a later one replaces it and stop:true ends the loop.
+      if (call?.name === 'ScheduleWakeup' && !item.is_error) {
+        for (const job of Object.values(state.jobs)) {
+          if (job.kind === 'scheduled' && job.status === 'pending' && String(job.id).startsWith('wakeup_')) finish(job.id, 'cancelled');
+        }
+        if (!call.wakeupStop && call.wakeupDelayMs > 0) {
+          const id = `wakeup_${item.tool_use_id}`;
+          start(id, 'scheduled', item.tool_use_id);
+          const job = state.jobs[`job:${id}`];
+          if (job && job.status === 'pending') { job.expiresAt = at + call.wakeupDelayMs; job.recurring = false; }
+        }
+      }
       let id = value.match(/^Command running in background with ID:\s*([\w-]+)/i)?.[1];
       if (id && !item.is_error) start(id, call?.kind || 'unknown', item.tool_use_id);
       id = value.includes('Async agent launched') && value.match(/agentId:\s*([\w-]+)/i)?.[1];
@@ -535,14 +551,15 @@ function sync({ root, agent, sid, file, node = null, instance = null, classify =
       state = { version: 1, restartVersion: restartVersion(agent), jobs: retained, calls: {}, notices: {}, checkpoint: null,
         gap: Boolean(migration.gap), ...(migration.gap ? { gapAt: migration.gapAt, gapReason: migration.gapReason } : {}),
         restart,
-        cronVersion: 1, turnVersion: 1, pollVersion: agent === 'codex' ? 3 : undefined, childStopVersion: 3,
+        cronVersion: 1, turnVersion: 1, wakeupVersion: 1, pollVersion: agent === 'codex' ? 3 : undefined, childStopVersion: 3,
         source: state.source, processEpoch: state.processEpoch, hookBarrier: state.hookBarrier,
         hookGeneration: state.hookGeneration, freshStartup: state.freshStartup, handoffRebind: state.handoffRebind };
     }
     // New Claude adapter evidence needs one replay; preserve existing job history.
-    if (agent === 'claude' && (state.cronVersion !== 1 || state.turnVersion !== 1)) {
+    // wakeupVersion 1: ScheduleWakeup (self-paced /loop) is read as a scheduled job.
+    if (agent === 'claude' && (state.cronVersion !== 1 || state.turnVersion !== 1 || state.wakeupVersion !== 1)) {
       state.checkpoint = null; state.calls = {}; state.notices = {}; state.turnStartedAt = null;
-      state.cronVersion = 1; state.turnVersion = 1;
+      state.cronVersion = 1; state.turnVersion = 1; state.wakeupVersion = 1;
     }
     // A gapped ledger only regains complete evidence by replaying the whole
     // transcript; the gap clears at EOF unless this replay re-marks one.

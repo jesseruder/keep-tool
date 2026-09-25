@@ -276,6 +276,13 @@ test('a RUNNING verdict falls to the rules only when a trusted footer, the proce
     const status = activity({ ...idle, ...change }, context);
     assert.ok(status.decision.rule === 'model-running' || status.state === 'waiting', `${what}: ${status.decision.rule}`);
   }
+  // An incomplete companion job list on this machine is not proof of nothing running.
+  assert.equal(activity({ ...idle, companionComplete: false }).decision.rule, 'model-running');
+  // A one-shot wakeup well past its time has fired; one still ahead keeps it running.
+  const at = Date.parse('2026-09-25T20:00:00Z');
+  const wakeup = (expiresAt) => ({ backgroundJobs: { caughtUp: true, jobs: [{ id: 'wakeup_t1', kind: 'scheduled', status: 'pending', recurring: false, expiresAt }] } });
+  assert.equal(activity({ ...idle, ...wakeup(at + 60e3) }, { now: at }).decision.rule, 'model-running');
+  assert.equal(activity({ ...idle, ...wakeup(at - 20 * 60e3) }, { now: at }).decision.rule, 'conversation-ready');
   // A long-running service is not something that wakes the session.
   assert.equal(activity({ ...idle, backgroundJobs: { caughtUp: true, jobs: [{ id: 's1', kind: 'service', status: 'pending' }] } }).decision.rule, 'conversation-ready');
 });

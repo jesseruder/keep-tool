@@ -89,8 +89,11 @@ function activity(session, context = {}) {
   // decide. Any source missing or unsure leaves the verdict as it was.
   const footer = session.footerTrusted === true && session.footer?.recognized === true && !session.footer.turnRunning ? session.footer : null;
   const ledger = session.backgroundJobs;
-  const ledgerPending = (ledger?.jobs || []).some((job) => job.status === 'pending' && job.kind !== 'service');
-  const wakes = footer?.running || session.agentShells > 0 || model.background.pending || model.background.uncertain.length
+  const nowMs = context.now ?? Date.now();
+  // A one-shot scheduled job (a cron, a /loop wakeup) well past its time has fired.
+  const ledgerPending = (ledger?.jobs || []).some((job) => job.status === 'pending' && job.kind !== 'service'
+    && !(job.kind === 'scheduled' && !job.recurring && Number.isFinite(job.expiresAt) && nowMs - job.expiresAt > 10 * 60e3));
+  const wakes = session.companionComplete === false || footer?.running || session.agentShells > 0 || model.background.pending || model.background.uncertain.length
     || model.background.agents.length || ledgerPending || model.conversation.scheduled.length
     || (model.task.checkAfter && !model.task.checkOverdue) || model.task.dependencies.length;
   const nothingWakes = Boolean(footer) && ledger?.caughtUp === true && !wakes;

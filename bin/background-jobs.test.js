@@ -323,6 +323,29 @@ test('turn migration replays completion notices for pruned historical jobs', () 
   assert.equal(jobs.read(root, 'claude', 'parent').jobs.every(j => j.status === 'completed'), true);
 }));
 
+test('a self-paced /loop wakeup is a one-shot scheduled job; a later one or stop:true ends it', () => fixture(({ root, append, sync }) => {
+  const wake = (call, input) => {
+    append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: call, name: 'ScheduleWakeup', input }] } });
+    append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: call, content: 'Scheduled.' }] } });
+  };
+  const instance = { id: 'pane:10', since: 1, live: true };
+  wake('w1', { delaySeconds: 1200, prompt: 'SECRET PROMPT', reason: 'watching CI' });
+  let job = sync({ instance }).jobs.find((j) => j.id === 'wakeup_w1');
+  assert.equal(job.kind, 'scheduled');
+  assert.equal(job.status, 'pending');
+  assert.equal(job.recurring, false);
+  assert.equal(job.expiresAt - job.startedAt, 1200e3);
+  wake('w2', { delaySeconds: 60, prompt: 'SECRET PROMPT' });
+  const jobsNow = sync({ instance }).jobs;
+  assert.equal(jobsNow.find((j) => j.id === 'wakeup_w1').status, 'cancelled', 'a new wakeup replaces the old one');
+  assert.equal(jobsNow.find((j) => j.id === 'wakeup_w2').status, 'pending');
+  wake('w3', { stop: true });
+  const stopped = sync({ instance }).jobs;
+  assert.equal(stopped.find((j) => j.id === 'wakeup_w2').status, 'cancelled', 'stop ends the loop');
+  assert.equal(stopped.some((j) => j.id === 'wakeup_w3'), false);
+  assert.doesNotMatch(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json'), 'utf8'), /SECRET/);
+}));
+
 test('Claude cron creation, cancellation, expiry, process replacement and old-ledger recovery', () => fixture(({ root, append, sync }) => {
   const create = (call, id) => {
     append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: call, name: 'CronCreate', input: { cron: '* * * * *', prompt: 'SECRET' } }] } });

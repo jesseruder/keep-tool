@@ -29,16 +29,18 @@ function read(lines) {
     }
   }
   if (box < 0) return { recognized: false, shells: null, agents: null, running: null };
-  const text = rows.join('\n');
+  // Joined with spaces, so a mode line wrapped between "1" and "shell" still reads.
+  const text = rows.join(' ');
   const counts = (pattern) => [...text.matchAll(pattern)].map((match) => Number(match[1])).filter(Number.isFinite);
-  const shells = Math.max(0, ...counts(/\b(\d+) shells? still running\b/g), ...counts(/·\s*(\d+) shells?\b/g));
-  const waiting = Math.max(0, ...counts(/\bWaiting for (\d+) background agents? to finish\b/g));
+  const shells = Math.max(0, ...counts(/\b(\d+)\s+shells?\s+still\s+running\b/g), ...counts(/·\s*(\d+)\s+shells?\b/g));
+  const waiting = Math.max(0, ...counts(/\bWaiting\s+for\s+(\d+)\s+background\s+agents?\s+to\s+finish\b/g));
   // One ◯ row per running background agent, listed under the ● main row.
   const rowsBelow = rows.slice(box + 1);
   const agentRows = rowsBelow.filter((row) => /^\s*◯\s+\S/.test(row)).length;
   const agents = Math.max(waiting, agentRows);
   // A spinner row ("✶ Enchanting… (4m 50s ·") means the turn itself is still running.
-  const turnRunning = rows.slice(0, box).some((row) => /^\s*[✻✶✢✳✽*·]\s+\S+…\s*\(/.test(row));
+  // The label is a verb or, with a todo list, the current todo: any words before "… (".
+  const turnRunning = rows.slice(0, box).some((row) => /^\s*[✻✶✢✳✽✦✧*·]\s+.+…\s*\(/.test(row));
   return { recognized: true, shells, agents, turnRunning, running: shells > 0 || agents > 0 };
 }
 

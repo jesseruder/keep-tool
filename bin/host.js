@@ -448,7 +448,8 @@ async function settled(pane) {
 // screen cannot be read simply carries no footer.
 function paneFooter(pane) {
   if (!pane.alive || !pane.term || pane.meta?.agent !== 'claude') return undefined;
-  try { return require('./claude-footer.js').read(renderScreen(pane.term, { lines: 16, compact: true }).lines); }
+  // Enough rows for the spinner above a long todo list and several agent rows.
+  try { return require('./claude-footer.js').read(renderScreen(pane.term, { lines: 40, compact: true }).lines); }
   catch { return undefined; }
 }
 

@@ -13523,17 +13523,27 @@ function buildState(options = {}) {
   applyCompanionJobs(sessions, options.companion);
   // What Claude Code's footer says is running in each live Claude pane, and whether
   // that reading still agrees with the process table and the ledger (footer-health).
-  const footerStatus = footerHealth.observe(footerTracker, sessions.flatMap((session) => {
+  // Only a full dashboard build over the whole pane list advances the check: an
+  // action's one-pane build, or a build without a host list, reads the last verdict.
+  const footerObservations = sessions.flatMap((session) => {
     const pane = panesBySession.get(session.id);
     return pane?.footer && session.kind === 'claude'
-      ? [{ pane: pane.id, footer: pane.footer, agentShells: pane.agentShells, agentAlive: pane.agentAlive, ledger: session.backgroundJobs }] : [];
-  }), now);
+      ? [{ pane: pane.id, footer: pane.footer, agentShells: pane.agentShells, agentAlive: pane.agentAlive,
+        ledger: session.backgroundJobs, endedTurn: session.endedTurn === true }] : [];
+  });
+  const footerStatus = options.fresh !== true && Array.isArray(options.hostPanes)
+    ? footerHealth.observe(footerTracker, footerObservations, now) : footerHealth.peek(footerTracker, now);
+  // Whether this machine's companion job list is complete: a session here whose
+  // discovery is unknown or partial may be waiting on a job status cannot see.
+  const companionComplete = Boolean(options.companion?.known ?? (options.companion?.discovery && options.companion.discovery !== 'unknown'))
+    && options.companion?.partial !== true && options.companion?.discovery !== 'partial';
   for (const session of sessions) {
     const pane = panesBySession.get(session.id);
     if (pane?.footer && session.kind === 'claude') {
       session.footer = pane.footer;
-      session.footerTrusted = footerStatus.trusted;
+      session.footerTrusted = footerStatus.trusted && !footerStatus.untrustedPanes.includes(pane.id);
       if (Number.isInteger(pane.agentShells)) session.agentShells = pane.agentShells;
+      if (!pane.node || pane.node === daemonNodeName()) session.companionComplete = companionComplete;
     }
   }
   // What the classifier reads off the card: whether this session is its latest linked
@@ -13575,7 +13585,7 @@ function buildState(options = {}) {
   if (workerMode) {
     const terminal = new Set(['completed', 'failed', 'cancelled']);
     const derived = new Set(['taskId', 'taskStatus', 'runtime', 'pane', 'launchModel', 'accountLabel',
-      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark', 'stopVerdict', 'cardLatest', 'footer', 'footerTrusted', 'agentShells', 'cardCheck', 'unattended',
+      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark', 'stopVerdict', 'cardLatest', 'footer', 'footerTrusted', 'agentShells', 'companionComplete', 'cardCheck', 'unattended',
       // Attached further down, after this block, and re-read from the usage snapshot
       // on every build. Listed so a reordering cannot freeze a settled session's
       // totals at whatever the collector had seen the moment it was cached.

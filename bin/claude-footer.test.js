@@ -43,3 +43,8 @@ test('text elsewhere on screen that mentions shells above the box still counts o
   // A message line that happens to say "shell" without the footer's shape is ignored.
   assert.equal(read(['● I killed the shell that was running the build.', '✻ Baked for 3s · done 9:31 AM', ...box]).shells, 0);
 });
+
+test('a todo list spinner and a wrapped mode line still read', () => {
+  assert.equal(read(['✶ Running the test suite… (2m 8s · ↓ 8.1k tokens)', '  ⎿  ☐ Fix the clamp', ...box]).turnRunning, true);
+  assert.equal(read(['✻ Baked for 3s · done 9:31 AM', ...box, '  ⏵⏵ bypass permissions on · 1', '  shell · ← for agents']).shells, 1);
+});
