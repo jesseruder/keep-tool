@@ -21,15 +21,16 @@
 // retry of a run that never recorded its end (the daemon died or restarted under
 // it) is refused for a person to inspect rather than run a second time.
 //
-// A daemon restart waits for the runs admitted here (busy()), and once it is on
-// its way (options.stopping) nothing new is admitted: 503, nothing journalled, and
-// the node's CLI resends after the restart.
+// A daemon restart waits for the runs admitted here (busy()), all but a `tell` that
+// may wait on a busy session (see handle), and once it is on its way
+// (options.stopping) nothing new is admitted: 503, nothing journalled, and the
+// node's CLI resends after the restart.
 const childProcess = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { isRegistryCommand, argumentRefusal } = require('./registry-commands.js');
+const { isRegistryCommand, argumentRefusal, forwardedWaitMs } = require('./registry-commands.js');
 
 const SESSION_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const PANE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -237,9 +238,9 @@ function createRegistryService(options = {}) {
     return env;
   }
 
-  function execute(request, caller) {
+  function execute(request, caller, limits = {}) {
     const daemon = daemonNode();
-    return spawnKeep([request.command, ...request.args], { cwd: request.cwd, env: childEnv(request, caller, daemon) });
+    return spawnKeep([request.command, ...request.args], { cwd: request.cwd, env: childEnv(request, caller, daemon), ...limits });
   }
 
   // The daemon's own CLI, with a fixed program and argv entries (no shell), output
@@ -325,9 +326,18 @@ function createRegistryService(options = {}) {
         await lateAdoption.adopt(caller, body.session, body.agent, { pane: body.pane, verify });
       }
       const request = validateRequest(body, caller, deps);
+      // A `tell --wait` may spend its whole duration re-asking a busy session. It runs
+      // for that long plus the ordinary bound, in a queue of its own so the node's
+      // check-ins are not held behind it, and it does not hold a restart: all it does
+      // in that time is post to this daemon's /api/tell, whose typing the restart gate
+      // already waits for, and a restart that ends it leaves its journal entry
+      // interrupted, which is what the node's resend is then told.
+      const waitMs = forwardedWaitMs(request.command, request.args);
       return await journaled({
-        caller, key: request.idempotencyKey, digest: digestOf(request), queue: caller,
-        run: () => execute(request, caller),
+        caller, key: request.idempotencyKey, digest: digestOf(request),
+        queue: waitMs > 0 ? `wait\0${caller}` : caller,
+        holdsRestart: waitMs === 0,
+        run: () => execute(request, caller, waitMs > 0 ? { timeoutMs: timeoutMs + waitMs } : {}),
         what: `keep ${request.command}${request.nodeCwd ? ` from ${request.nodeCwd}` : ''}`,
       });
     } catch (error) {
@@ -340,7 +350,7 @@ function createRegistryService(options = {}) {
   // for another request or a run that never recorded its end is refused, and
   // otherwise `run` is called once, serialised on `queue`, between a started record
   // and its response. Throws RegistryError for an unreadable journal entry.
-  async function journaled({ caller, key, digest, queue, run, what }) {
+  async function journaled({ caller, key, digest, queue, run, what, holdsRestart = true }) {
     prune();
     const file = journalFile(caller, key);
     // A second request with the same key waits for the first, then reads what it
@@ -355,7 +365,7 @@ function createRegistryService(options = {}) {
     // Checked in the same tick the run is counted, so a restart either waits for
     // it or it is never admitted.
     if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };
-    admitted += 1;
+    if (holdsRestart) admitted += 1;
     const pending = serialised(queue, async () => {
       // Before the child exists: whatever happens to this daemon from here, a
       // retry finds that the command may have run.
@@ -383,7 +393,7 @@ function createRegistryService(options = {}) {
     inflight.set(file, pending);
     let outcome;
     try { outcome = await pending; }
-    finally { inflight.delete(file); admitted -= 1; }
+    finally { inflight.delete(file); if (holdsRestart) admitted -= 1; }
     const { response, journaled: recorded } = outcome;
     return { status: response.status, body: { ...response.body, replayed: false, ...(recorded ? {} : { journaled: false }) } };
   }

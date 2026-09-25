@@ -94,7 +94,7 @@ test('the registry route exists only where the daemon listens for nodes', async 
 
 test('only the listed registry commands run, and never a command-bearing flag', async (t) => {
   const { svc, root, calls } = service(t);
-  for (const command of ['open', 'tell', 'land', 'artifact', 'serve', 'restart-daemon', 'probe', 'sync', '', null, 'show; rm -rf /']) {
+  for (const command of ['open', 'handoff', 'land', 'artifact', 'serve', 'restart-daemon', 'probe', 'sync', '', null, 'show; rm -rf /']) {
     const answer = await svc.handle(AWS1, body(root, { command }));
     assert.equal(answer.status, 400, String(command));
   }
@@ -210,6 +210,52 @@ test('arguments are checked the way the CLI will read them', (t) => {
   assert.match(argumentRefusal('link', ['card', '--session', 'other'], { session: 'me', node: 'aws1' }), /caller's own session/);
   assert.match(argumentRefusal('link', ['card', '--node', 'main'], { session: 'me', node: 'aws1' }), /caller's own node/);
   assert.match(argumentRefusal('decide', ['t', '--session=other'], { session: 'me', node: 'aws1' }), /caller's own session/);
+});
+
+test('a node\'s keep tell runs under its own session, and a message file it names on the node is refused', async (t) => {
+  assert.ok(REGISTRY_COMMANDS.includes('tell'));
+  assert.equal(argumentRefusal('tell', ['#12', '-m', 'hi', '--wait', '5m', '--dry']), null);
+  assert.equal(argumentRefusal('tell', ['card', '--json', '-m', 'line one\nline two']), null);
+  assert.equal(argumentRefusal('tell', ['card', '-m', '--message-file']), null, 'a message that reads like the flag is still the message');
+  const refusal = '--message-file names a file on this node; use -m, or run it from the daemon node';
+  assert.equal(argumentRefusal('tell', ['card', '--message-file', 'x']), refusal);
+  assert.equal(argumentRefusal('tell', ['card', '--message-file=x']), refusal);
+  assert.equal(argumentRefusal('tell', ['card', '--wait', '--message-file', 'x']), refusal, 'even where it would be read as a value');
+
+  const { svc, root, calls } = service(t);
+  const told = await svc.handle(AWS1, body(root, { command: 'tell', args: ['#12', '-m', 'hi', '--wait', '5m', '--dry'], idempotencyKey: `${KEY}-tell` }));
+  assert.equal(told.status, 200, JSON.stringify(told.body));
+  assert.deepEqual(calls[0].args.slice(1), ['tell', '#12', '-m', 'hi', '--wait', '5m', '--dry']);
+  assert.equal(calls[0].options.env.CLAUDE_CODE_SESSION_ID, 'sess-aws1', 'the daemon\'s tell names the node\'s session as the sender');
+  const file = await svc.handle(AWS1, body(root, { command: 'tell', args: ['card', '--message-file', 'x'], idempotencyKey: `${KEY}-file` }));
+  assert.deepEqual(file, { status: 400, body: { error: refusal } });
+  assert.equal(calls.length, 1);
+});
+
+test('a tell --wait runs for its wait, beside the node\'s other commands, and does not hold a restart', async (t) => {
+  // Each run closes 100 ms after it starts, well past the 20 ms ordinary bound.
+  const fake = fakeSpawn(() => 'hang');
+  const original = fake.spawn;
+  const children = [];
+  fake.spawn = (...args) => {
+    const child = original(...args);
+    const timer = setTimeout(() => child.emit('close', 0, null), 100);
+    child.once('close', () => clearTimeout(timer));
+    children.push(child);
+    return child;
+  };
+  const { svc, root } = service(t, { fake, timeoutMs: 20 });
+  const plain = await svc.handle(AWS1, body(root, { command: 'tell', args: ['card', '-m', 'hi'], idempotencyKey: `${KEY}-plain` }));
+  assert.equal(plain.status, 504, 'without --wait a tell has the ordinary bound');
+  const waiting = svc.handle(AWS1, body(root, { command: 'tell', args: ['card', '-m', 'hi', '--wait', '1s'], idempotencyKey: `${KEY}-wait` }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(svc.busy(), false, 'a restart does not wait on it');
+  const show = await svc.handle(AWS1, body(root, { idempotencyKey: `${KEY}-show` }));
+  assert.equal(show.status, 504, 'the show ran, on its own bound, while the tell was still waiting');
+  const answer = await waiting;
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(answer.body.status, 0);
+  assert.equal(children.length, 3);
 });
 
 test('a project named relative to the node\'s directory is refused; absolute, ~ and bare names are not', () => {

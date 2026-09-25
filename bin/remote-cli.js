@@ -156,6 +156,13 @@ function parsed(response) {
   try { return JSON.parse(response.data); } catch { return null; }
 }
 
+// How long one post of a forwarded command may take: the ordinary bound, plus what
+// the daemon's run may spend waiting (a `tell --wait` re-asking a busy session),
+// so the node does not give up on a run the daemon is still honouring.
+function requestTimeoutMs(command, args) {
+  return REQUEST_TIMEOUT_MS + require('./registry-commands.js').forwardedWaitMs(command, args);
+}
+
 // Runs one command on the daemon and answers { code, stdout, stderr } — what this
 // process should print and exit with.
 async function runRemote(command, args, deps = {}) {
@@ -164,7 +171,8 @@ async function runRemote(command, args, deps = {}) {
   let response;
   try {
     daemonBase(where.url);
-    response = await postWithRetry(where, '/api/registry', registryBody(command, args, { env, cwd: deps.cwd || process.cwd(), where }), { ...deps, env });
+    response = await postWithRetry(where, '/api/registry', registryBody(command, args, { env, cwd: deps.cwd || process.cwd(), where }),
+      { ...deps, env, timeoutMs: deps.timeoutMs || requestTimeoutMs(command, args) });
   } catch (error) {
     return { code: 2, stdout: '', stderr: `keep ${command}: ${error.message}\n` };
   }
@@ -225,4 +233,5 @@ async function deploySelf(where, { sha, project }, deps = {}) {
 module.exports = {
   deploySelf,
   REQUEST_TIMEOUT_MS, RETRY_WAITS_MS, remoteMode, daemonBase, nodeToken, nodeApiRequest, registryBody, postWithRetry, runRemote, parsed,
+  requestTimeoutMs,
 };

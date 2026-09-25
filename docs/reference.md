@@ -1603,6 +1603,13 @@ while the reason is `busy` and nothing else, and exits 124 if the duration runs 
 would be sent; it writes nothing at all, down to using a read-only session scan that
 neither expires stale markers nor allocates console numbers.
 
+On a pane-only node with `KEEP_DAEMON_URL`, `keep tell` is forwarded to the daemon's
+`POST /api/registry` like the registry commands and runs there under the node session's
+own identity, so the frame, the ledger and the exit statuses are the ones above.
+`--message-file` is refused there, since the path names a file on the node; pass the text
+with `-m`. A `--wait` lengthens both the daemon's run and the node's request by its
+duration, and the waiting run neither holds up the node's other commands nor a restart.
+
 A ledger at `.keep/tell.json` allows six tells per sender-recipient pair per rolling
 hour and twenty into any one session per hour; Owner's shell is exempt from the pair
 cap but not the per-recipient one. The slot is reserved under the registry lock before

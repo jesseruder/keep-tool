@@ -237,7 +237,7 @@ test('a refusal from the daemon is said as one, not as the command\'s output', a
 test('a command that is not registry-class still refuses, and without a daemon URL nothing is posted', async (t) => {
   const daemon = await stubDaemon(t, () => ({ status: 500, body: {} }));
   const { root, env } = nodeEnv(t);
-  for (const argv of [['open', 'card'], ['tell', 'card', 'hi'], ['sync'], ['artifact', 'card']]) {
+  for (const argv of [['open', 'card'], ['handoff', 'card'], ['sync'], ['artifact', 'card']]) {
     const result = await run(argv, { env: { ...env, KEEP_DAEMON_URL: daemon.url }, cwd: root });
     assert.equal(result.status, 2, argv.join(' '));
     assert.equal(result.stderr, `keep ${argv[0]}: the registry lives on node main; this is node aws1\n`);
@@ -291,4 +291,47 @@ test('from a linked worktree the node sends its main checkout as the cwd, and th
   assert.deepEqual(daemon.requests.map((request) => [request.body.cwd, request.body.nodeCwd]), [
     [main, tree], [main, path.join(tree, 'sub')], [main, main],
   ]);
+});
+
+// A session on a node messages another through the daemon, whose tell runs under the
+// sender's own identity; only a file the daemon cannot see is refused.
+test('keep tell from a node is posted to the daemon, and its refused and still-busy statuses come back as they are', async (t) => {
+  let status = 124;
+  const daemon = await stubDaemon(t, () => ({ status: 200, body: { ok: false, status, stdout: '', stderr: 'keep tell: still busy after 5m: mid-turn\n', replayed: false } }));
+  const { root, env } = nodeEnv(t, { CLAUDE_CODE_SESSION_ID: 'sess-aws1' });
+  env.KEEP_DAEMON_URL = daemon.url;
+  const busy = await run(['tell', '#12', '-m', 'hi', '--wait', '5m'], { env, cwd: root });
+  assert.equal(busy.status, 124, busy.stderr);
+  assert.equal(busy.stderr, 'keep tell: still busy after 5m: mid-turn\n');
+  assert.equal(daemon.requests[0].url, '/api/registry');
+  assert.equal(daemon.requests[0].body.command, 'tell');
+  assert.deepEqual(daemon.requests[0].body.args, ['#12', '-m', 'hi', '--wait', '5m']);
+  assert.equal(daemon.requests[0].body.session, 'sess-aws1');
+  status = 3;
+  const refused = await run(['tell', 'some-card', '-m', 'hi'], { env, cwd: root });
+  assert.equal(refused.status, 3, refused.stderr);
+});
+
+test('a forwarded tell\'s request outlasts its --wait; every other command keeps the ordinary bound', async (t) => {
+  const { requestTimeoutMs, runRemote, REQUEST_TIMEOUT_MS } = require('./remote-cli.js');
+  assert.equal(requestTimeoutMs('tell', ['#12', '-m', 'hi', '--wait', '5m', '--dry']), REQUEST_TIMEOUT_MS + 5 * 60e3);
+  assert.equal(requestTimeoutMs('tell', ['card', '--wait', '+10m', '--json', '--wait', '1h']), REQUEST_TIMEOUT_MS + 3600e3, 'the last --wait wins');
+  assert.equal(requestTimeoutMs('tell', ['card', '-m', '--wait', '--dry']), REQUEST_TIMEOUT_MS, 'a message is not a flag');
+  assert.equal(requestTimeoutMs('tell', ['--', 'card', '--wait', '5m']), REQUEST_TIMEOUT_MS, 'after -- nothing is a flag');
+  assert.equal(requestTimeoutMs('tell', ['card', '-m', 'hi', '--wait', 'soon']), REQUEST_TIMEOUT_MS, 'the daemon\'s CLI refuses a bad duration itself');
+  assert.equal(requestTimeoutMs('tell', ['card', '-m', 'hi']), REQUEST_TIMEOUT_MS);
+  assert.equal(requestTimeoutMs('checkin', ['card', '--wait', '5m']), REQUEST_TIMEOUT_MS);
+
+  const root = tempDir(t);
+  const seen = [];
+  const request = async (url, pathname, options) => {
+    seen.push(options.timeoutMs);
+    return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: 'told\n', stderr: '' }) };
+  };
+  const where = { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' };
+  const deps = { where, request, token: 't', env: {}, cwd: root };
+  assert.equal((await runRemote('tell', ['card', '-m', 'hi', '--wait', '2m'], deps)).code, 0);
+  assert.equal((await runRemote('show', ['card'], deps)).code, 0);
+  assert.equal((await runRemote('tell', ['card', '-m', 'hi', '--wait', '2m'], { ...deps, timeoutMs: 5 })).code, 0);
+  assert.deepEqual(seen, [REQUEST_TIMEOUT_MS + 2 * 60e3, REQUEST_TIMEOUT_MS, 5]);
 });

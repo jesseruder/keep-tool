@@ -19,6 +19,11 @@ const REGISTRY_COMMANDS = Object.freeze([
   // that knows which node wrote the note.
   // Read-only: what a node's `keep land` needs from the registry to decide a land.
   'land-facts',
+  // `tell` reaches one named session, not every one: the daemon's CLI runs it under
+  // the caller's verified session (IDENTITY_VARS in registry-route.js), so the
+  // daemon frames the text as a message from that sender, on that sender's card,
+  // and the per-sender ledger in .keep/tell.json caps it like any other tell.
+  'tell',
 ]);
 
 // A flag whose value is a command the daemon runs: `--probe` on its check schedule,
@@ -47,6 +52,12 @@ const COMMAND_FLAGS = Object.freeze(['--probe', '--done-when', '--verify']);
 // text the daemon types straight into every live session in the project, is left
 // out of REGISTRY_COMMANDS until that announce knows which node wrote the note.
 const INSTRUCTION_FLAGS = Object.freeze(['--check', '--on-pass']);
+
+// A flag whose value is a path on the node, per command: the daemon's CLI would read
+// that path from the daemon's own disk, which holds some other file or none.
+const NODE_FILE_FLAGS = Object.freeze({
+  tell: ['--message-file'],
+});
 
 const MAX_ARG_BYTES = 4 * 1024;
 const MAX_ARGS_BYTES = 64 * 1024;
@@ -85,6 +96,7 @@ const BOOLEAN_FLAGS = Object.freeze({
   standup: ['dry', 'show'],
   landed: ['disagree', 'dry'],
   resume: ['raw'],
+  tell: ['dry', 'json'],
 });
 
 // The arguments each registry command resolves as a project (keep-core
@@ -143,6 +155,7 @@ function argumentRefusal(command, args, identity = {}) {
   let position = 0;
   const projectFlags = Object.prototype.hasOwnProperty.call(PROJECT_FLAGS, command) ? PROJECT_FLAGS[command] : [];
   const projectPositions = Object.prototype.hasOwnProperty.call(PROJECT_POSITIONS, command) ? PROJECT_POSITIONS[command] : [];
+  const fileFlags = Object.prototype.hasOwnProperty.call(NODE_FILE_FLAGS, command) ? NODE_FILE_FLAGS[command] : [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (i === message) continue;
@@ -153,6 +166,7 @@ function argumentRefusal(command, args, identity = {}) {
     const flag = !positional && arg.startsWith('--') && arg !== '--' ? (eq < 0 ? arg : arg.slice(0, eq)) : null;
     if (flag && COMMAND_FLAGS.includes(flag)) return `${flag} carries a command the daemon would run; set it from the daemon node`;
     if (flag && INSTRUCTION_FLAGS.includes(flag)) return `${flag} carries text the daemon would hand a session as instructions; set it from the daemon node`;
+    if (flag && fileFlags.includes(flag)) return `${flag} names a file on this node; use -m, or run it from the daemon node`;
     if (flag === '--session' || flag === '--node') {
       const named = eq < 0 ? args[i + 1] : arg.slice(eq + 1);
       const own = flag === '--session' ? identity.session : identity.node;
@@ -195,4 +209,27 @@ function argumentRefusal(command, args, identity = {}) {
   return null;
 }
 
-module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, BOOLEAN_FLAGS, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+// How long a forwarded command may wait on the daemon beyond an ordinary run: a
+// `tell --wait <duration>` re-asks a busy session until that duration runs out, and
+// both the daemon's subprocess and the node's request must outlast it. Read the way
+// parseArgs reads it (the last --wait wins, -m's value and everything after `--`
+// are not flags); a value that does not parse is 0, and the daemon's CLI answers it
+// with its usage error well inside the ordinary bound.
+function forwardedWaitMs(command, args) {
+  if (command !== 'tell' || !Array.isArray(args)) return 0;
+  let wait = null;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--') break;
+    if (arg === '-m') { i += 1; continue; }
+    if (typeof arg !== 'string' || !arg.startsWith('--')) continue;
+    const name = arg.slice(2);
+    if (isBooleanFlag(command, name)) continue;
+    i += 1;
+    if (name === 'wait') wait = args[i];
+  }
+  if (wait == null) return 0;
+  try { return require('./wait.js').parseDuration(wait); } catch { return 0; }
+}
+
+module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, NODE_FILE_FLAGS, BOOLEAN_FLAGS, forwardedWaitMs, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
