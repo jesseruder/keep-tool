@@ -4244,7 +4244,13 @@ const PANE_ONLY_COMMANDS = {
   secret: true, // asks the daemon over its node API; the destination is checked here
   nodes: (args) => !args.length || ['ls', 'usage'].includes(args[0]) || String(args[0]).startsWith('-'),
   node: (args) => args[0] === 'init',
-  codex: (args) => (args[0] === '--account' ? args[2] : args[0]) === 'context',
+  // The Codex companion runs on this machine, for the sessions here: the codex binary,
+  // its login and the plugin script live under this node's own profiles, and a job's
+  // record goes under this node's `.keep`, which nothing registry-class reads. The
+  // review a job answers is recorded through the forwarded `reviewing` / `reviewed`,
+  // which carry the job as this node read it (nodeFactArgs). Limited to `context`
+  // at first, every review a session here ran had to fall back to Opus.
+  codex: true,
 };
 
 function paneOnlyRefusal(cmd, args, env = process.env) {

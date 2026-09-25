@@ -1883,7 +1883,7 @@ test('on a pane-only node the registry commands name the daemon node and exit 2'
     const before = registrySnapshot(f.root);
     for (const argv of [['list'], [], ['checkin', 'unread-card', '-m', 'state'], ['add', 'A card'], ['show', 'unread-card'],
       ['tell', 'unread-card', 'hello'], ['open', 'unread-card'], ['land', 'unread-card'], ['sync'], ['serve'],
-      ['nodes', 'add', 'x'], ['node', 'ls'], ['codex', 'task', 'go'], ['init'], ['usage'], ['move', 'sess-a', '--node', 'main']]) {
+      ['nodes', 'add', 'x'], ['node', 'ls'], ['init'], ['usage'], ['move', 'sess-a', '--node', 'main']]) {
       const result = await keep(argv);
       const cmd = argv[0] || 'list';
       assert.equal(result.status, 2, `${argv.join(' ')}: ${result.stderr}`);
@@ -1902,7 +1902,11 @@ test('on a pane-only node the registry commands name the daemon node and exit 2'
     const node = { KEEP_NODE_NAME: 'aws1', KEEP_DAEMON_NODE: 'main' };
     for (const [cmd, args] of [['hook', ['stop']], ['host', ['ls']], ['attach', ['p1']], ['doctor', []], ['setup', ['hooks']],
       ['nodes', []], ['nodes', ['ls']], ['nodes', ['usage', 'aws1']], ['node', ['init', 'aws1']],
-      ['codex', ['context']], ['codex', ['--account', 'codex-two', 'context', '--json']]]) {
+      ['codex', ['context']], ['codex', ['--account', 'codex-two', 'context', '--json']],
+      // The companion runs here for the sessions here, so a review can be launched
+      // and read on this node; its verdict travels through the forwarded reviewed.
+      ['codex', ['--account', 'codex-two', 'task', '--background', 'review']], ['codex', ['status', '--json']],
+      ['codex', ['--account', 'codex-two', 'result', 'task-1']]]) {
       assert.equal(paneOnlyRefusal(cmd, args, node), null, `${cmd} ${args.join(' ')}`);
     }
     // A name inherited from Object.prototype is not an entry in the table.
