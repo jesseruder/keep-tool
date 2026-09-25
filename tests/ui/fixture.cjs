@@ -17,7 +17,7 @@ async function createFixture() {
   let handoffRecoversOnce = false;
   // Off by default, so every other spec sees the one-node console it always did.
   let moveRefusal = null;
-  let openDelay = 0, openFailsAfterSpawn = false, reopenFails = false, reviewFailsOnce = false, reviewPartialOnce = false, launchSequence = 0;
+  let openDelay = 0, openPaneLateMs = 0, openFailsAfterSpawn = false, reopenFails = false, reviewFailsOnce = false, reviewPartialOnce = false, launchSequence = 0;
   const openRequests = new Map();
   const detailFailures = new Map();
   const detailDelays = new Map();
@@ -175,7 +175,9 @@ async function createFixture() {
             pane = { id: paneId, pid: 700 + launchSequence, alive: true, cwd: session.project || repo,
               meta: { agent: input.agent, sessionId: session.id, accountId: account.id, accountLabel: account.label,
                 project: session.project || repo, openRequestId: input.requestId } };
-            panes.push(pane);
+            // A pane on another node can miss the listings right after the open.
+            if (openPaneLateMs) { const late = pane; setTimeout(() => { panes.push(late); publish(); }, openPaneLateMs); }
+            else panes.push(pane);
           } else pane.alive = true;
           const launch = { pane: pane.id, sessionId: session.id, accountId: account.id, accountLabel: account.label,
             agent: account.agent, recoverable: true };
@@ -435,6 +437,7 @@ async function createFixture() {
       if ('nodes' in options) { if (options.nodes) state.nodes = options.nodes; else delete state.nodes; publish(); }
       if ('moveRefusal' in options) moveRefusal = options.moveRefusal;
       if ('openDelay' in options) openDelay = options.openDelay;
+      if ('openPaneLateMs' in options) openPaneLateMs = options.openPaneLateMs;
       if ('openFailsAfterSpawn' in options) openFailsAfterSpawn = options.openFailsAfterSpawn;
       if ('reopenFails' in options) reopenFails = options.reopenFails;
       if ('reviewFailsOnce' in options) reviewFailsOnce = options.reviewFailsOnce;

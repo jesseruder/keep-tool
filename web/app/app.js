@@ -59,6 +59,18 @@ const hashHue = (value) => {
   return Math.abs(hash) % 360;
 };
 
+// A main checkout named `repo` among the daemon's resolved projects and the directories
+// sessions and panes run in: an absolute path outside ~/wt whose last segment is `repo`.
+function seenCheckout(repo) {
+  const candidates = [
+    ...Object.values(projectChoices).map((choice) => choice?.path),
+    ...(data.sessions || []).map((session) => session.project),
+    ...(data.panes || []).map((pane) => pane.meta?.project || pane.cwd),
+  ];
+  return candidates.map((value) => String(value || '').replace(/\/$/, ''))
+    .find((value) => value.startsWith('/') && !/^\/(?:Users|home)\/[^/]+\/wt\//.test(value) && value.split('/').pop() === repo) || null;
+}
+
 function projectOf(projectPath = '') {
   const clean = String(projectPath || 'unknown').replace(/\/$/, '');
   const choice = projectChoices[clean];
@@ -73,8 +85,10 @@ function projectOf(projectPath = '') {
   const scope = globalThis.KeepScopeRules.scopeForProject(choice ? canonical : (worktree && known ? '~/' + key : clean), settings, settings.home) || settings.default;
   // The checkout a new session opens in: a worktree's own repo, never the worktree.
   const home = clean.match(/^\/(?:Users|home)\/[^/]+\//)?.[0];
-  // Without the daemon's answer only a catalog key names the repo's own directory.
-  const root = !worktree ? canonical : choice?.path || (!known ? clean : home ? home + key : `~/${key}`);
+  // Without the daemon's answer only a catalog key names the repo's own directory, or a
+  // checkout of the same repo the console has already seen: the daemon cannot resolve a
+  // worktree that exists only on another node.
+  const root = !worktree ? canonical : choice?.path || (known ? (home ? home + key : `~/${key}`) : seenCheckout(worktree[1]) || clean);
   return { key, path: clean, root, name, scope, h: known?.h ?? choice?.h ?? hashHue(canonical), icon: known?.icon || choice?.icon, wt: worktree?.[2] || null };
 }
 
@@ -403,7 +417,11 @@ function knownProjects() {
     if (!projectPath) return;
     const found = projectOf(projectPath);
     const project = { ...found, source: found.path, path: found.root };
-    if (!values.has(project.key) || !values.get(project.key).path.startsWith('/')) values.set(project.key, project);
+    // A root that is still a worktree yields to one that is the repo's own checkout.
+    const inWorktree = (value) => /^\/(?:Users|home)\/[^/]+\/wt\//.test(value);
+    const previous = values.get(project.key);
+    if (!previous || !previous.path.startsWith('/')
+      || (inWorktree(previous.path) && project.path.startsWith('/') && !inWorktree(project.path))) values.set(project.key, project);
   };
   for (const session of data.sessions || []) add(session.project);
   for (const pane of data.panes || []) add(pane.meta?.project || pane.cwd);
@@ -634,6 +652,13 @@ async function startChosenSession(cwd, name, selection, requestId) {
   const result = await api.openSession({ fresh: true, cwd, agent: selection.agent, accountId: selection.accountId, requestId,
     ...(selection.model ? { model: selection.model } : {}), ...(selection.node ? { node: selection.node } : {}) });
   await reload();
+  // A pane on another node can miss the first listing after the open (that node's list
+  // has a short budget while it is busy starting the agent), and a pane the console
+  // never lists is never focused. Give it a few more listings.
+  for (let attempt = 0; attempt < 12 && result.pane && !paneMap().get(result.pane)?.alive; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await reload();
+  }
   // A fresh Codex on another node with no opening message has no session id until
   // its first turn: started, not failed.
   if (result.pendingRegistration) toast(pendingRegistrationText(selection, result));

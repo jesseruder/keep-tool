@@ -70,6 +70,26 @@ test('a session in a worktree offers its main checkout, not the worktree', async
   await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue('/home/tester/castle/proj');
 });
 
+test('a worktree of a repo outside the catalog offers a checkout of it the console has seen', async ({ page }) => {
+  fixture.state.projectCatalog = {};
+  for (const session of fixture.state.sessions) session.project = '/home/tester/wt/tool/some-slug';
+  for (const pane of fixture.state.panes) pane.meta = { ...pane.meta, project: '/home/tester/tool' };
+  fixture.publish();
+  await page.reload();
+  await page.locator('#rail [data-shell]').click();
+  await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue('/home/tester/tool');
+});
+
+test('a new session is focused when its pane reaches the listing only after the open', async ({ page }) => {
+  fixture.configure({ openPaneLateMs: 1500 });
+  await page.locator('#rail [data-shell]').click();
+  await chooser(page).locator('[data-launch-submit]').click();
+  await expect(chooser(page)).not.toBeVisible({ timeout: 8000 });
+  const opened = fixture.state.sessions.filter(session => session.id.startsWith('opened-'));
+  expect(opened).toHaveLength(1);
+  await expect(page.locator('#stage')).toHaveAttribute('data-pane', opened[0].pane);
+});
+
 test('post-spawn setup error focuses its saved pane and retry cannot duplicate it', async ({ page }) => {
   fixture.configure({ openFailsAfterSpawn: true });
   await page.locator('#rail [data-shell]').click();
