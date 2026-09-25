@@ -29,12 +29,11 @@ const ROOT = process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
 // and committed test records into it. The operator's registry is named by the passwd
 // home, not $HOME (a test that points HOME at a temporary directory is free to use the
 // registry under it), and by the data directory of the configuration file there, which
-// config.apply has already put into KEEP_DIR by the time this runs. A process whose
-// KEEP_CONFIG names another file is isolated from the operator's configuration (the
-// setup tests run `keep init --dir` that way, with a fresh config and the home default
-// still standing in as ROOT), so only a process on the operator's configuration, or on
-// none, is refused. Paths are compared by what they really are, so a symlink or a
-// case alias of the registry is the registry.
+// config.apply has already put into KEEP_DIR by the time this runs. A test that runs
+// the CLI against a configuration file of its own still gives the child a KEEP_DIR (the
+// setup tests do, for `keep init --dir`): the home default is never a stand-in under
+// test. Paths are compared by what they really are, so a symlink or a case alias of the
+// registry is the registry.
 function samePath(a, b) {
   const real = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
   return real(a) === real(b);
@@ -45,11 +44,9 @@ function operatorHome() {
 function operatorRegistryUnderTest(root, env = process.env) {
   if (!env.NODE_TEST_CONTEXT) return false;
   const home = operatorHome();
-  const configFile = path.join(home, '.config', 'keep', 'config.json');
-  if (env.KEEP_CONFIG && !samePath(env.KEEP_CONFIG, configFile)) return false;
   const registries = [path.join(home, 'keep')];
   try {
-    const dataDir = JSON.parse(fs.readFileSync(configFile, 'utf8')).dataDir;
+    const dataDir = JSON.parse(fs.readFileSync(path.join(home, '.config', 'keep', 'config.json'), 'utf8')).dataDir;
     if (typeof dataDir === 'string' && dataDir) registries.push(path.resolve(dataDir.replace(/^~(?=\/|$)/, home)));
   } catch {}
   return registries.some((registry) => samePath(registry, root));

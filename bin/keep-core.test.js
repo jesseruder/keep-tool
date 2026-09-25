@@ -147,7 +147,8 @@ test('a test process with no registry of its own refuses to load against the ope
     { encoding: 'utf8', env: { ...process.env, ...env } });
   const clean = { ...process.env };
   delete clean.KEEP_DIR;
-  const home = os.userInfo().homedir;
+  let home;
+  try { home = os.userInfo().homedir; } catch { home = os.homedir(); }
   const refused = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(core)}); process.stdout.write('loaded')`],
     { encoding: 'utf8', env: { ...clean, NODE_TEST_CONTEXT: 'child', HOME: home } });
   assert.notEqual(refused.status, 0, 'under node --test with no KEEP_DIR the operator\'s registry is refused');
@@ -162,12 +163,12 @@ test('a test process with no registry of its own refuses to load against the ope
       { encoding: 'utf8', env: { ...clean, NODE_TEST_CONTEXT: 'child', HOME: own } });
     assert.equal(tempHome.status, 0, tempHome.stderr);
     assert.equal(tempHome.stdout, 'loaded', 'a registry under a temporary HOME is not the operator\'s');
-    // The setup tests run `keep init --dir` with a fresh KEEP_CONFIG that does not exist
-    // yet and the real HOME: isolated from the operator's configuration, so allowed.
+    // A configuration file of its own that names no data directory leaves the home
+    // default as the root, which is still the operator's registry: refused.
     const ownConfig = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(core)}); process.stdout.write('loaded')`],
       { encoding: 'utf8', env: { ...clean, NODE_TEST_CONTEXT: 'child', HOME: home, KEEP_CONFIG: path.join(own, 'config.json') } });
-    assert.equal(ownConfig.status, 0, ownConfig.stderr);
-    assert.equal(ownConfig.stdout, 'loaded', 'a process on its own configuration file is not on the operator\'s');
+    assert.notEqual(ownConfig.status, 0, 'a fresh configuration file does not stand in for a registry of its own');
+    assert.match(ownConfig.stderr, /operator's registry/);
     // A symlink to the operator's registry is the operator's registry.
     const alias = path.join(own, 'alias');
     fs.symlinkSync(path.join(home, 'keep'), alias);

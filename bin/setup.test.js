@@ -28,10 +28,11 @@ test('configuration respects explicit environment and isolates explicit registri
 test('fresh initialization supports the full task lifecycle without a source checkout or remote in its registry', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-setup-test-'));
   const root = path.join(tmp, 'private registry');
-  const env = { ...process.env, KEEP_CONFIG: path.join(tmp, 'config.json'), KEEP_NO_PUSH: '1',
+  // The registry the CLI is about to create is also the one it must resolve to while
+  // it does so: under the test runner keep-core refuses the home default.
+  const env = { ...process.env, KEEP_CONFIG: path.join(tmp, 'config.json'), KEEP_DIR: root, KEEP_NO_PUSH: '1',
     GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'Keep Test',
     GIT_CONFIG_KEY_1: 'user.email', GIT_CONFIG_VALUE_1: 'keep@example.test' };
-  delete env.KEEP_DIR;
   for (const key of Object.keys(env)) if (/^(?:KEEP_REVIEWER|CODEX_(?:THREAD_ID|SESSION_ID)|CLAUDE_CODE_SESSION_ID)/.test(key)) delete env[key];
   const cli = (...args) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), ...args], { env, encoding: 'utf8', timeout: 15000 });
   const ok = (...args) => { const result = cli(...args); assert.equal(result.status, 0, result.stderr); return result.stdout; };
@@ -214,8 +215,7 @@ test('local-only Git identity cannot leave a partially initialized registry', ()
   const caller = path.join(tmp, 'caller');
   const registry = path.join(tmp, 'registry');
   const file = path.join(tmp, 'config.json');
-  const env = { ...process.env, KEEP_CONFIG: file, GIT_CONFIG_GLOBAL: path.join(tmp, 'no-global'), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '0' };
-  delete env.KEEP_DIR;
+  const env = { ...process.env, KEEP_CONFIG: file, KEEP_DIR: registry, GIT_CONFIG_GLOBAL: path.join(tmp, 'no-global'), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '0' };
   const run = (args) => spawnSync('git', ['-C', caller, ...args], { env, encoding: 'utf8' });
   try {
     fs.mkdirSync(caller);
