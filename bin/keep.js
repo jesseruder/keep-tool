@@ -3998,6 +3998,8 @@ function helpText() {
                           # this session's requests, or one; exits 3 while one is still pending
   keep secret wait <id> [--for 10m]
                           # 0 delivered, 1 declined or expired, 124 still waiting
+  keep secret cancel <id> [-m "why"]
+                          # take back a request this session no longer needs; Owner stops seeing it
 ${stepUsage()}
   keep decide <type> [--card <id>] [--session <sid>] --send "<message>" -m "why"
                          # the reviewer records what it WOULD do; nothing is sent

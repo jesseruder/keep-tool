@@ -119,6 +119,19 @@ function createSecretService(options = {}) {
   } = options;
   const writing = new Set();
 
+  // A node may only act for a session running on it: its pane must be one of that
+  // node's, and when the daemon knows where the session runs, that pane. Otherwise
+  // one machine could put a request on, or take one off, another machine's session.
+  function callerDenied(node, principal, sessionId, pane) {
+    if (principal && principal.class === 'node') {
+      const at = pane ? pane.lastIndexOf('@') : -1;
+      if (at < 0 || pane.slice(at + 1) !== node) return refusal(403, `a request from node ${node} must name one of its own panes`);
+    }
+    const known = sessionPane(sessionId);
+    if (known && pane && !samePane(known, pane)) return refusal(403, `session ${sessionId.slice(0, 8)} does not run in pane ${pane}`);
+    return null;
+  }
+
   const load = () => {
     const at = now();
     // Resolved and expired requests are kept a week for `keep secret status`, then
@@ -149,15 +162,8 @@ function createSecretService(options = {}) {
     if (card && !CARD_RE.test(card)) return refusal(400, 'not a card id');
     const pane = body.pane ? text(body.pane, 80) : null;
     if (pane && !PANE_RE.test(pane)) return refusal(400, 'not a pane id');
-    // A node may only ask on behalf of a session running on it: its pane must be one
-    // of that node's, and when the daemon knows where the session runs, that pane.
-    // Otherwise one machine could put a request on another machine's session.
-    if (principal && principal.class === 'node') {
-      const at = pane ? pane.lastIndexOf('@') : -1;
-      if (at < 0 || pane.slice(at + 1) !== node) return refusal(403, `a request from node ${node} must name one of its own panes`);
-    }
-    const known = sessionPane(sessionId);
-    if (known && pane && !samePane(known, pane)) return refusal(403, `session ${sessionId.slice(0, 8)} does not run in pane ${pane}`);
+    const denied = callerDenied(node, principal, sessionId, pane);
+    if (denied) return denied;
     const file = typeof body.path === 'string' ? body.path : '';
     if (!file || file.length > 512 || !path.isAbsolute(file) || /[\0\n\r]/.test(file)) {
       return refusal(400, 'the destination must be an absolute path (the CLI resolves it on the node)');
@@ -303,7 +309,34 @@ function createSecretService(options = {}) {
     return { status: 200, body: { request: publicRecord(resolved) } };
   }
 
-  return { request, list, fulfill, decline };
+  // The session that asked takes its own request back: it no longer needs the secret,
+  // so Owner should stop being asked. Nothing is sent to the session; it did this.
+  function cancel(principal, body = {}) {
+    const id = String(body.id || '');
+    if (!ID_RE.test(id)) return refusal(400, 'not a secret request id');
+    const sessionId = text(body.sessionId, 128);
+    if (!SESSION_RE.test(sessionId)) return refusal(400, 'a secret request is cancelled from the session that asked');
+    const pane = body.pane ? text(body.pane, 80) : null;
+    if (pane && !PANE_RE.test(pane)) return refusal(400, 'not a pane id');
+    const found = load().find((r) => r.id === id);
+    // Another node's request, or another session's, reads as missing: nothing about it
+    // is the caller's business.
+    if (!found || found.sessionId !== sessionId
+      || (principal && principal.class === 'node' && found.node !== principal.node)) {
+      return refusal(404, `no secret request ${id} from this session`);
+    }
+    const denied = callerDenied(found.node, principal, sessionId, pane);
+    if (denied) return denied;
+    const record = effective(found, now());
+    if (record.status !== 'pending') return refusal(409, `secret request ${id} is ${record.status}`);
+    if (writing.has(id)) return refusal(409, `secret request ${id} is being written now`);
+    const reason = text(body.reason, 400) || null;
+    const resolved = update(id, { status: 'cancelled', resolvedAt: now(), reason });
+    onChange();
+    return { status: 200, body: { request: publicRecord(resolved) } };
+  }
+
+  return { request, list, fulfill, decline, cancel };
 }
 
 module.exports = { createSecretService, consoleRequests, readStore, storeFile, PENDING_TTL_MS, MAX_PENDING_PER_SESSION };

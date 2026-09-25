@@ -147,8 +147,39 @@ test('routes: a node may ask and read, only the console and the daemon machine m
   assert.equal(routeDenial(find('GET', '/api/secrets'), node), null);
   assert.ok(routeDenial(find('POST', '/api/secrets/fulfill'), node));
   assert.ok(routeDenial(find('POST', '/api/secrets/decline'), node));
+  assert.equal(routeDenial(find('POST', '/api/secrets/cancel'), node), null);
+  assert.ok(routeDenial(find('POST', '/api/secrets/cancel'), { class: 'proxy' }), 'the console declines; it does not cancel');
   assert.equal(routeDenial(find('POST', '/api/secrets/fulfill'), { class: 'proxy' }), null);
   assert.ok(routeDenial(find('POST', '/api/secrets/request'), { class: 'proxy' }), 'the console does not make requests');
+});
+
+test('the asking session can cancel its own pending request, and nobody else can', async (t) => {
+  const { service, root, calls } = setup(t);
+  const node = { class: 'node', node: 'aws1' };
+  const r = service.request(node, ask({ pane: 'p1@aws1' })).body.request;
+  assert.equal(service.cancel(node, { id: r.id, sessionId: 'someone-else', pane: 'p1@aws1' }).status, 404);
+  assert.equal(service.cancel({ class: 'node', node: 'aws2' }, { id: r.id, sessionId: SESSION, pane: 'p1@aws2' }).status, 404);
+  assert.equal(service.cancel(node, { id: r.id, sessionId: SESSION, pane: 'p9@main' }).status, 403);
+  const done = service.cancel(node, { id: r.id, sessionId: SESSION, pane: 'p1@aws1', reason: 'got it from AWS' });
+  assert.equal(done.status, 200);
+  assert.equal(done.body.request.status, 'cancelled');
+  assert.equal(done.body.request.reason, 'got it from AWS');
+  assert.deepEqual(consoleRequests(root, 1_000_000), [], 'the panel goes away');
+  assert.equal(service.cancel(node, { id: r.id, sessionId: SESSION, pane: 'p1@aws1' }).status, 409);
+  assert.equal((await service.fulfill({ id: r.id, value: VALUE })).status, 409);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls.told, [], 'the session is not told what it did itself');
+});
+
+test('a request being written cannot be cancelled', async (t) => {
+  let release;
+  const { service } = setup(t, { writeLocal: () => new Promise((resolve) => { release = resolve; }) });
+  const r = service.request({ class: 'local' }, ask()).body.request;
+  const writing = service.fulfill({ id: r.id, value: VALUE });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(service.cancel({ class: 'local' }, { id: r.id, sessionId: SESSION }).status, 409);
+  release({ replaced: false, bytes: 1 });
+  assert.equal((await writing).status, 200);
 });
 
 test('the session is told in one typing chunk even for a long path, name and reason', async (t) => {

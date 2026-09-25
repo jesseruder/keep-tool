@@ -105,6 +105,16 @@ function routes(ctx) {
       },
     },
     {
+      // The asking session takes its request back; checked against its session and pane.
+      method: 'POST',
+      path: '/api/secrets/cancel',
+      allow: ['node', 'local'],
+      handle: async ({ res, body, principal }) => {
+        const result = ctx.secretService.cancel(principal, body);
+        return json(res, result.status, result.body);
+      },
+    },
+    {
       method: 'POST',
       path: '/api/secrets/fulfill',
       handle: async ({ res, body }) => {

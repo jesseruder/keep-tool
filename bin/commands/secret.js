@@ -18,6 +18,7 @@ const USAGE = [
   'usage: keep secret request <NAME> --to <path> [--key VAR] [-m "what it is for, where Owner finds it"] [--card <id>] [--replace] [--multiline]',
   '       keep secret status [<id>] [--all] [--json]',
   '       keep secret wait <id> [--for 10m]',
+  '       keep secret cancel <id> [-m "why"]',
 ].join('\n');
 
 // The daemon, wherever it is: its loopback API on the daemon's own machine, its node
@@ -56,6 +57,7 @@ function describe(record) {
     : record.status === 'declined'
       ? `declined${record.reason ? `: ${record.reason}` : ''}`
       : record.status === 'expired' ? 'expired unanswered'
+        : record.status === 'cancelled' ? `cancelled by the session${record.reason ? `: ${record.reason}` : ''}`
         : record.status === 'superseded' ? `superseded by ${record.supersededBy || 'a newer request for the same destination'}`
         : `waiting on Owner since ${new Date(record.createdAt).toLocaleString()}${record.lastError ? ` (last attempt failed: ${record.lastError})` : ''}`;
   return `${record.id}  ${record.name} → ${target}  ${state}`;
@@ -130,8 +132,24 @@ async function wait(argv) {
   }
 }
 
+// Take back a request this session no longer needs, so Owner stops seeing its panel.
+async function cancel(argv) {
+  const o = parseArgs(argv, {});
+  const id = o._[0];
+  if (!id || o._.length > 1) die(USAGE);
+  const session = currentSession({ env: process.env });
+  if (!session) die('keep secret cancel: run this from the agent session that asked');
+  const api = transport();
+  let pane = process.env.KEEP_PANE || null;
+  if (pane && api.remote) pane = require('../nodes.js').formatPaneRef(api.remote.local, pane, process.env);
+  const body = await call(() => api.post('/api/secrets/cancel', {
+    id, sessionId: session.id, pane, reason: o.m || null,
+  }), 'cancel the request');
+  console.log(describe(body.request));
+}
+
 commands.secret = async (argv) => {
-  const sub = { request, status, wait }[argv[0]];
+  const sub = { request, status, wait, cancel }[argv[0]];
   if (!sub) die(USAGE);
   return sub(argv.slice(1));
 };

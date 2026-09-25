@@ -50,6 +50,12 @@ he declines, the message says so with his reason; do not ask again without a new
 blocks until one is answered, for the rare case where you must stay mid-turn. Requests
 expire unanswered after 24 hours.
 
+When you no longer need a secret you asked for (you got it another way, the plan
+changed), take the request back with `keep secret cancel <id> -m "why"` rather than
+telling Owner to ignore or decline it: its panel keeps covering your terminal in the
+console until it is answered. Asking again for the same file and key replaces the open
+request; it does not add a second.
+
 ## Using it
 
 The file is the only copy you get. Use it without printing it:
