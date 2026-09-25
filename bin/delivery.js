@@ -343,7 +343,7 @@ async function deliverAttempt({ session, pane, text, key, file, remote = null, d
   let typingError;
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const activeJournal = path.join(directory, hash(session.id) + '.json');
-  let journal = activeJournal, settled = false;
+  let journal = activeJournal, settled = false, prechecked = false;
   let entry;
   try { entry = JSON.parse(fs.readFileSync(journal, 'utf8')); } catch (error) {
     if (error.code !== 'ENOENT') throw error;
@@ -412,11 +412,19 @@ async function deliverAttempt({ session, pane, text, key, file, remote = null, d
       if (partialTyping(entry) && !completedTyping(entry) && samePane
           && journalAgeMs(journal, entry, Date.now()) >= staleJournalMs) {
         let emptyBox = true;
-        try { await precheck(); } catch (error) { if (!sameMessage) throw error; emptyBox = false; }
+        try { await precheck(); } catch (error) {
+          if (!sameMessage) {
+            error.message = `Previous delivery is partially typed and the box is not empty: ${error.message}`;
+            throw error;
+          }
+          emptyBox = false;
+        }
         if (emptyBox) {
           trace('partial-draft-gone', { acknowledgedChunks: entry.typing.acknowledgedChunks, sameMessage });
           try { fs.unlinkSync(journal); } catch (error) { if (error.code !== 'ENOENT') throw error; }
           entry = null;
+          // The box was just found empty; a second precheck would probe it again.
+          prechecked = true;
         }
       }
       if (entry && partialTyping(entry) && (!sameMessage || !samePane)) {
@@ -501,7 +509,7 @@ async function deliverAttempt({ session, pane, text, key, file, remote = null, d
   }
   if (!entry) {
     journal = activeJournal;
-    await precheck();
+    if (!prechecked) await precheck();
     if (remote) {
       // The node's own path and size, taken now, just before the first character:
       // the offset a receipt is looked for from, exactly as a local file's size is.

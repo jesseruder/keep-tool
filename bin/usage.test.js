@@ -340,9 +340,18 @@ test('a lapsed Claude token is an idle reading: no request, the last snapshot ke
   assert.equal(records.at(-1).ok, true);
   assert.match(records.at(-1).detail, /Tertiary: token lapsed while idle/);
 
+  // A day past its expiry it is no longer idle: nothing has refreshed or tested it.
+  expiresAt = firstAt - 25 * 3600e3;
+  currentTime = firstAt + 15 * 60e3;
+  manager.requestRefresh(currentTime);
+  await settleRefresh();
+  assert.equal(requests, 1);
+  assert.equal(records.at(-1).ok, false);
+  assert.match(records.at(-1).error, /Tertiary: token lapsed over a day ago/);
+
   // Claude Code ran on it and refreshed the token: the next due refresh reads again.
-  expiresAt = firstAt + 20 * 3600e3;
-  currentTime = firstAt + 20 * 60e3;
+  expiresAt = (firstAt + 20 * 3600e3) / 1000; // in seconds, read as such
+  currentTime = firstAt + 60 * 60e3;
   manager.requestRefresh(currentTime);
   await settleRefresh();
   assert.equal(requests, 2);
@@ -371,7 +380,7 @@ test('a 401 for a token that should still be good says the login was rejected', 
   manager.requestRefresh(10 ** 12);
   await settleRefresh();
   assert.equal(records.at(-1).ok, false);
-  assert.match(records.at(-1).error, /Work: HTTP 401: login rejected/);
+  assert.match(records.at(-1).error, /Work: HTTP 401: token rejected/);
 });
 
 test('account refresh failures have separate cooldowns, snapshots, and default compatibility view', async () => {

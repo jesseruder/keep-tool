@@ -16,6 +16,9 @@ const CLAUDE_REFRESH_MS = 5 * 60e3;
 // refreshes its own token only when it runs, so an account nobody has used for a few
 // hours holds a lapsed one, and the endpoint's 401 for it says nothing about the login.
 const TOKEN_EXPIRY_MARGIN_MS = 60e3;
+// Lapsed longer than this, the account is no longer read as merely idle: nothing has
+// used or tested it for a day, and a dead refresh token would otherwise stay green.
+const TOKEN_LAPSED_MAX_MS = 24 * 3600e3;
 const CODEX_REFRESH_MS = 5 * 60e3;
 const INITIAL_BACKOFF_MS = 4 * 60e3;
 const MAX_BACKOFF_MS = 29 * 60e3;
@@ -47,7 +50,8 @@ function shortError(source, error) {
   if (code === 'not-found') return 'no recent rate-limit snapshot';
   // Only a token that should still be good reaches the endpoint (fetchClaudeUsage), so
   // a 401 is a login the server no longer accepts.
-  if (source === 'Claude' && code === 401) return 'HTTP 401: login rejected; sign in again with Claude Code on this account';
+  if (source === 'Claude' && code === 401) return 'HTTP 401: token rejected; run Claude Code on this account to refresh it, or sign in again';
+  if (code === 'lapsed') return 'token lapsed over a day ago; run Claude Code on this account to refresh it';
   // A Codex scan's fs error names the sessions dir; a Claude socket error (ENOTFOUND,
   // ECONNRESET) carries the same shape of code and must not.
   if (source === 'Codex' && typeof code === 'string' && /^E[A-Z]+$/.test(code)) return `sessions unreadable (${code})`;
@@ -164,7 +168,9 @@ function credentialsOf(text) {
   const oauth = credentials && credentials.claudeAiOauth;
   const token = oauth && oauth.accessToken;
   if (typeof token !== 'string' || !token) throw codedError('credentials');
-  const expiresAt = Number(oauth.expiresAt);
+  let expiresAt = Number(oauth.expiresAt);
+  // Milliseconds, as Claude Code writes it; a value in seconds is read as such.
+  if (Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt < 1e11) expiresAt *= 1000;
   return { accessToken: token, expiresAt: Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : null };
 }
 
@@ -204,6 +210,7 @@ async function fetchClaudeUsage(account, deps = {}, previous = null) {
   const { accessToken: token, expiresAt } = await claudeCredentials(account, deps);
   const http = deps.https || https;
   const now = deps.now || Date.now;
+  if (expiresAt !== null && now() - expiresAt > TOKEN_LAPSED_MAX_MS) throw codedError('lapsed');
   if (expiresAt !== null && expiresAt - now() <= TOKEN_EXPIRY_MARGIN_MS) {
     const kept = previous && Array.isArray(previous.limits)
       ? { limits: previous.limits, fetchedAt: previous.fetchedAt ?? null } : emptySnapshot('claude');

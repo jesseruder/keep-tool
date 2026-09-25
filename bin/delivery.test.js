@@ -570,7 +570,7 @@ test('partial chunk progress is durable, resumable only for the same send, and n
     // left to write gives up its resume, and this one still owes a chunk.
     fs.writeFileSync(journal, JSON.stringify({ ...JSON.parse(fs.readFileSync(journal, 'utf8')), createdAt: Date.now() - 60 * 60e3 }));
     const halfInBox = async () => { throw new Error('the session input box already contains text'); };
-    await assert.rejects(deliver({ ...base, text: 'different', precheck: halfInBox, type: async () => assert.fail('must not type') }), /already contains text/);
+    await assert.rejects(deliver({ ...base, text: 'different', precheck: halfInBox, type: async () => assert.fail('must not type') }), /partially typed and the box is not empty: the session input box already contains text/);
     assert.deepEqual(await deliver({ ...base, precheck: halfInBox, type }), { ok: true, delivery: 'received' });
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
@@ -608,7 +608,9 @@ test('an old partial journal whose half is gone from an empty box is retired, an
     // Past it, on this pane, with the box empty, the half is gone and the send goes through.
     fs.writeFileSync(journal, JSON.stringify({ ...JSON.parse(fs.readFileSync(journal, 'utf8')), createdAt: Date.now() - 60 * 60e3 }));
     await assert.rejects(deliver({ ...base, pane: 'elsewhere', text: 'other words', type: whole('other words', typed) }), /partially typed/);
-    assert.deepEqual(await deliver({ ...base, text: 'other words', type: whole('other words', typed) }), { ok: true, delivery: 'received' });
+    let prechecks = 0;
+    assert.deepEqual(await deliver({ ...base, precheck: async () => { prechecks += 1; }, text: 'other words', type: whole('other words', typed) }), { ok: true, delivery: 'received' });
+    assert.equal(prechecks, 1, 'the box found empty is not probed a second time');
     assert.deepEqual(typed, ['other words']);
     assert.equal(fs.existsSync(journal), false);
     assert.equal(fs.existsSync(path.join(directory, 'settled', `${textHash('gone')}.json`)), false, 'a half message earns no receipt');
