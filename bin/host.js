@@ -1325,10 +1325,10 @@ function createHost(options = {}) {
       }
       case 'update-self': {
         // The daemon asking this machine to run the code it just landed. Only a
-        // fast-forward of this checkout; a host that moved reloads itself after
-        // answering, keeping its panes, unless the caller asked it not to.
+        // fast-forward of this checkout; when the host's own code moved it reloads
+        // after answering, keeping its panes, unless the caller asked it not to.
         const result = await require('./node-update.js').updateSelf();
-        const reload = result.status === 'updated' && params.reload !== false
+        const reload = result.status === 'updated' && result.hostChanged && params.reload !== false
           && options.boot && typeof options.boot.reload === 'function';
         return {
           result: { ...result, reloading: Boolean(reload) },

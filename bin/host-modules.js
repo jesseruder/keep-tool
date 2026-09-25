@@ -15,6 +15,7 @@ const HOST_ONLY_MODULES = Object.freeze([
   './launch-prep.js',
   './session-artifacts.js',
   './process-table.js',
+  './node-update.js',
 ]);
 
 const HOST_MODULES_FILE = __filename;

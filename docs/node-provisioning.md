@@ -12,7 +12,8 @@ sessions useful.
 
 Keeping a node's code current is not on this list: each land of keep-tool ends with
 `keep nodes update`, which asks every node's host to fast-forward its own keep-tool
-checkout to origin and reload onto it, keeping its sessions (bin/node-update.js). Only
+checkout to origin, and reload onto it when the host's own code changed, keeping its
+sessions (bin/node-update.js). Only
 a clean checkout on the default branch moves; anything else is reported and left for a
 person. Run it by hand to retry a node that was down. A host from before this answers
 that it predates `update-self`, and needs one `git pull --ff-only` and `keep host

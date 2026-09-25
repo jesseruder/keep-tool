@@ -3847,7 +3847,7 @@ function helpText() {
   keep nodes usage <node> <account>
                            # that account's usage as the node itself reads it
   keep nodes update [<node>…] [--no-reload] [--json]
-                           # every other node fast-forwards its keep-tool checkout and reloads its host;
+                           # every other node fast-forwards its keep-tool checkout (and reloads its host if host code changed);
                            # wt land runs it after a keep-tool deploy
   keep node init <name> --daemon-node <name> --listen <ip:port> --token-file <path> [--sock <path>]
                            # on the node itself: install the host-only service

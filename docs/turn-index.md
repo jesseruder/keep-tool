@@ -279,9 +279,11 @@ look before it deletes.
 Search outlives the prune. Inside the same transaction, just before an
 interactive session's rows go, its typed messages and agent prose (`human` and
 `text` rows, a few percent of the session) are copied into `archive_sessions` and
-`archive_messages`, with their own `archive_fts` (migration 15). `keep search`,
-`keep turns search` and the console's finder read the live index first and fill
-what is left from the archive, marking those hits `archived`. The archive is
+`archive_messages`, with their own `archive_fts` (migration 15). `keep search` and
+`keep turns search` read the live index first and fill what is left from the
+archive, marking those hits `archived`. The console's finder asks only about the
+sessions the console lists, so an archived session reaches it only while the console
+still lists it; the CLI reaches them all. The archive is
 dropped on its own horizon, **730 days** after a session's last activity, by the
 same prune in bounded batches; `prune` reports `archived` and `archiveDropped`.
 A session resumed after its prune is re-indexed live, and pruning it again

@@ -16,13 +16,15 @@ const path = require('node:path');
 const { execFile } = require('node:child_process');
 
 const CHECKOUT = path.resolve(__dirname, '..');
-const FETCH_TIMEOUT_MS = 60e3;
+const FETCH_TIMEOUT_MS = 30e3;
 const GIT_TIMEOUT_MS = 15e3;
 const BUSY = ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'sequencer'];
 
 function runGit(cwd, args, timeoutMs = GIT_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    execFile('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: timeoutMs, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } },
+    execFile('git', ['-C', cwd, ...args], // No prompt can be answered here: https asks nothing, and ssh fails at once
+    // rather than waiting on a passphrase or a new host key.
+    { encoding: 'utf8', timeout: timeoutMs, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND || 'ssh -o BatchMode=yes' } },
       (error, stdout, stderr) => {
         if (error) reject(new Error(String(stderr || error.message).trim().split('\n').slice(-2).join(' ') || 'git failed'));
         else resolve(String(stdout).trim());
@@ -30,8 +32,18 @@ function runGit(cwd, args, timeoutMs = GIT_TIMEOUT_MS) {
   });
 }
 
-async function updateSelf(options = {}) {
+// Two asks at once (a node's own land and the laptop's) share one run rather than
+// racing each other for git's index lock.
+const running = new Map();
+function updateSelf(options = {}) {
   const checkout = options.checkout || CHECKOUT;
+  if (!running.has(checkout)) {
+    running.set(checkout, runUpdate(options, checkout).finally(() => running.delete(checkout)));
+  }
+  return running.get(checkout);
+}
+
+async function runUpdate(options, checkout) {
   const git = options.git || ((args, timeoutMs) => runGit(checkout, args, timeoutMs));
   const refused = (reason, extra = {}) => ({ status: 'refused', reason, checkout, ...extra });
   let branch;
@@ -58,7 +70,18 @@ async function updateSelf(options = {}) {
   try { await git(['merge', '--ff-only', '-q', target]); }
   catch (error) { return refused(`could not fast-forward: ${error.message}`, { before, target }); }
   const count = Number(await git(['rev-list', '--count', `${before}..${target}`]).catch(() => 0)) || 0;
-  return { status: 'updated', checkout, before, after: target, branch, commits: count };
+  const changed = (await git(['diff', '--name-only', before, target]).catch(() => '')).split('\n').filter(Boolean);
+  return { status: 'updated', checkout, before, after: target, branch, commits: count, hostChanged: hostCodeChanged(changed) };
+}
+
+// What a host reload would pick up: host.js and the helpers only it loads
+// (host-modules.js). Anything else is read fresh by each CLI run, so a reload for it
+// would only risk the panes for nothing.
+function hostCodeChanged(files) {
+  const { HOST_ONLY_MODULES } = require('./host-modules.js');
+  const host = new Set(['bin/host.js', 'bin/host-modules.js',
+    ...HOST_ONLY_MODULES.map((file) => path.posix.join('bin', file.replace(/^\.\//, '')))]);
+  return files.some((file) => host.has(file));
 }
 
 // One line per node, the same whether it came back from the host or never got there.
@@ -74,4 +97,4 @@ function describeUpdate(node, result) {
   return `${node}: left alone, its checkout ${result.reason}`;
 }
 
-module.exports = { updateSelf, describeUpdate, CHECKOUT };
+module.exports = { updateSelf, describeUpdate, hostCodeChanged, CHECKOUT };

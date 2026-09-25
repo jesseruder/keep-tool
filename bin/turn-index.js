@@ -1497,7 +1497,7 @@ function prune(options = {}) {
   const archivable = (id) => countIn(`SELECT COUNT(*) AS n FROM messages m JOIN sessions s ON s.id = m.session_id
     WHERE m.session_id = ? AND s.kind = 'interactive' AND m.kind IN ('human', 'text') AND m.text IS NOT NULL`, id);
   if (!candidates.length && options.dry !== true) {
-    counts.archiveDropped = dropArchive(handle, archiveCutoff, limit, options.busyTimeoutMs);
+    counts.archiveDropped = dropArchiveQuietly(handle, archiveCutoff, limit, options.busyTimeoutMs);
     return counts;
   }
   if (!candidates.length) return { ...counts, dry: true };
@@ -1542,8 +1542,15 @@ function prune(options = {}) {
     try { handle.exec('ROLLBACK'); } catch {}
     throw error;
   }
-  counts.archiveDropped = dropArchive(handle, archiveCutoff, limit, options.busyTimeoutMs);
+  counts.archiveDropped = dropArchiveQuietly(handle, archiveCutoff, limit, options.busyTimeoutMs);
   return counts;
+}
+
+// The prune above has committed; a busy lock here is the next tick's to retry,
+// not a reason to report the whole prune as failed.
+function dropArchiveQuietly(handle, archiveCutoff, limit, busyTimeoutMs) {
+  try { return dropArchive(handle, archiveCutoff, limit, busyTimeoutMs); }
+  catch (error) { debug(`archive drop deferred: ${error.message}`); return 0; }
 }
 
 // A resumed session pruned twice replaces its archive rather than doubling it.

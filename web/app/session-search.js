@@ -208,7 +208,7 @@ export function installSessionSearch({ rows, cards = () => [], recentIds, open, 
     dialog.className = 'session-search-dialog';
     dialog.innerHTML = '<input type="text" placeholder="Find a session: title, #number, project, card or what was said" aria-label="Find a session" role="combobox" aria-controls="session-search-list" aria-expanded="true" autocomplete="off" spellcheck="false">'
       + '<ul id="session-search-list" role="listbox" aria-label="Sessions"></ul>'
-      + '<footer><span><kbd>↵</kbd> go to</span><span><kbd>⌘↵</kbd> reopen or start</span><span><kbd>esc</kbd> close</span></footer>';
+      + '<footer><span><kbd>↵</kbd> go to, or start a card</span><span><kbd>⌘↵</kbd> reopen if it exited</span><span><kbd>esc</kbd> close</span></footer>';
     input = dialog.querySelector('input');
     list = dialog.querySelector('ul');
     input.addEventListener('input', search);

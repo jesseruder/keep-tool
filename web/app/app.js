@@ -1335,6 +1335,8 @@ const sessionSearch = installSessionSearch({ esc, searchText: api.searchSessionT
     rememberSession(sessionId, 'triage');
     navigateHistory({ sessionId, view: 'triage' });
     refresh();
+    // On the phone the list is the screen: go on to the conversation, as a queue tap does.
+    if (mobileActive()) openMobileStage();
   },
   // The chooser the Reopen buttons open, for the session the finder picked.
   reopen: (sessionId) => {
@@ -1344,7 +1346,8 @@ const sessionSearch = installSessionSearch({ esc, searchText: api.searchSessionT
       .catch((error) => toast(`Could not reopen: ${error.message || error}`));
   },
   start: (card) => {
-    reopenSession({ taskId: card.id, title: card.title, project: card.projectPath })
+    // An inbox card leaves the inbox when it starts, as the inbox's own Start does.
+    reopenSession({ taskId: card.id, title: card.title, project: card.projectPath, fromInbox: card.status === 'inbox' })
       .catch((error) => toast(`Could not start: ${error.message || error}`));
   },
 });

@@ -255,7 +255,9 @@ async function updateNodes(argv, deps) {
         return { node: entry.name, error: 'its host predates update-self: run `git -C ~/keep-tool pull --ff-only && keep host reload` there once' };
       }
       const result = await client.request('update-self', { reload: o['no-reload'] !== true },
-        { timeoutMs: deps.updateTimeoutMs == null ? 120e3 : deps.updateTimeoutMs });
+        // Inside the 60 s a node's forwarded command is given (registry-route.js),
+        // connect included; the host's own fetch gives up sooner still.
+        { timeoutMs: deps.updateTimeoutMs == null ? 50e3 : deps.updateTimeoutMs });
       return { node: entry.name, ...result };
     } catch (error) {
       return { node: entry.name, error: `unreachable: ${error.message}` };

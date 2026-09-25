@@ -46,6 +46,24 @@ test('a clean checkout on the default branch fast-forwards to origin, and is cur
   assert.equal(fs.readFileSync(path.join(node, 'a.txt'), 'utf8'), 'three\n');
   assert.equal((await updateSelf({ checkout: node })).status, 'current');
   assert.match(describeUpdate('aws1', result), /^aws1: fast-forwarded \w{12} → \w{12} \(2 commits\)$/);
+  assert.equal(result.hostChanged, false, 'nothing the host runs moved, so it need not reload');
+});
+
+test('only a change to the host or a helper only it loads calls for a host reload', () => {
+  const { hostCodeChanged } = require('./node-update.js');
+  assert.equal(hostCodeChanged(['bin/host.js']), true);
+  assert.equal(hostCodeChanged(['docs/x.md', 'bin/node-stats.js']), true);
+  assert.equal(hostCodeChanged(['bin/node-update.js']), true);
+  assert.equal(hostCodeChanged(['bin/keep.js', 'web/app/app.js', 'bin/turn-index.js']), false);
+  assert.equal(hostCodeChanged([]), false);
+});
+
+test('two asks at once share one run', async (t) => {
+  const { node, land } = repos(t);
+  land('two\n');
+  const [first, second] = await Promise.all([updateSelf({ checkout: node }), updateSelf({ checkout: node })]);
+  assert.equal(first, second);
+  assert.equal(first.status, 'updated');
 });
 
 test('a checkout someone is working in is left exactly as it is', async (t) => {

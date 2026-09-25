@@ -455,8 +455,33 @@ async function deploySelf(where, { sha, project }, deps = {}) {
   return { deployed: true };
 }
 
+// After deploy-self the daemon goes down and comes back. Wait for both: first for
+// the old one to stop answering (it may take a moment to finish shutting down, and a
+// request it accepts now dies with it), then for the new one. Bounded either way; a
+// restart that was too quick to see down is simply found up.
+async function waitForRestart(where, deps = {}) {
+  const request = deps.request || nodeApiRequest;
+  const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const now = deps.now || Date.now;
+  const pollMs = deps.pollMs || 500;
+  let token;
+  try { token = deps.token || nodeToken(deps.env || process.env, deps.readToken); } catch { return false; }
+  const up = async () => {
+    try { return (await request(where.url, '/api/registry/ping', { method: 'GET', token, timeoutMs: 2000 })).status === 200; }
+    catch { return false; }
+  };
+  const downBy = now() + (deps.downMs || 15e3);
+  while (now() < downBy && await up()) await sleep(pollMs);
+  const upBy = now() + (deps.upMs || 90e3);
+  for (;;) {
+    if (await up()) return true;
+    if (now() >= upBy) return false;
+    await sleep(pollMs);
+  }
+}
+
 module.exports = {
-  deploySelf,
+  deploySelf, waitForRestart,
   REQUEST_TIMEOUT_MS, RETRY_WAITS_MS, RESEND_HORIZON_MS, remoteMode, daemonBase, nodeToken, nodeApiRequest, registryBody, postWithRetry, runRemote, parsed,
   requestTimeoutMs, runArtifact, artifactTimeoutMs, answerOf, ARTIFACT_LINK_BYTES_PER_SECOND,
 };

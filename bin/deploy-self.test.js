@@ -195,8 +195,11 @@ function nodeWorktree(t) {
 test('keep land on a node gates with the daemon\'s facts, pushes, checks in and asks the daemon to deploy', async (t) => {
   const n = nodeWorktree(t);
   const sha = git(n.tree, 'rev-parse', 'HEAD');
+  let pings = 0;
   const daemon = await stubDaemon(t, ({ url, body }) => {
     if (url === '/api/deploy-self') return { status: 200, body: { ok: true, checkout: '/srv/keep-tool', from: 'f'.repeat(40), to: body.sha, restarted: true } };
+    // The old daemon on its way out, then the new one.
+    if (url === '/api/registry/ping') return (pings += 1) === 1 ? { status: 503, body: { error: 'daemon restarting' } } : { status: 200, body: { ok: true } };
     if (body.command === 'land-facts') {
       return { status: 200, body: { status: 0, stdout: `${JSON.stringify({ id: 'card', grants: ['land'], records: [], obligations: [], optOut: '' })}\n`, stderr: '' } };
     }
@@ -208,9 +211,14 @@ test('keep land on a node gates with the daemon\'s facts, pushes, checks in and 
   assert.match(result.stdout, new RegExp(`^card: landed ${sha.slice(0, 12)} onto origin/master\\n`));
   assert.equal(git(n.origin, 'rev-parse', 'master'), sha, 'the node pushed');
   // The check-in before the deploy: deploy-self restarts the daemon that records it.
-  // Then every node, this one included, is brought up to the land through it.
-  assert.deepEqual(daemon.requests.map((entry) => entry.url), ['/api/registry', '/api/registry', '/api/deploy-self', '/api/registry']);
-  assert.deepEqual([daemon.requests[3].body.command, daemon.requests[3].body.args], ['nodes', ['update']]);
+  // Then every node, this one included, is brought up to the land through it, once
+  // the restarted daemon answers.
+  const urls = daemon.requests.map((entry) => entry.url);
+  assert.deepEqual(urls.filter((url) => url !== '/api/registry/ping'), ['/api/registry', '/api/registry', '/api/deploy-self', '/api/registry']);
+  assert.ok(urls.lastIndexOf('/api/registry/ping') > urls.indexOf('/api/deploy-self') && urls.lastIndexOf('/api/registry/ping') < urls.length - 1,
+    'the update waits for the new daemon');
+  const update = daemon.requests.at(-1).body;
+  assert.deepEqual([update.command, update.args], ['nodes', ['update']]);
   assert.match(result.stderr, /wt: node update: aws1: already at abcdefabcdef/);
   assert.deepEqual(daemon.requests[0].body.args, ['card']);
   assert.deepEqual(daemon.requests[2].body, { sha, project: 'keep-tool' });
