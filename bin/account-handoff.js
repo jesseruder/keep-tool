@@ -668,7 +668,8 @@ function permissionClass(args, options = {}) {
   const allowed = [
     /(?:^|\s)--resume(?:=|\s+)["']?[A-Za-z0-9_-]+["']?(?=\s|$)/g,
     /(?:^|\s)--session-id(?:=|\s+)["']?[A-Za-z0-9_-]+["']?(?=\s|$)/g,
-    /(?:^|\s)--model(?:=|\s+)["']?[A-Za-z0-9][A-Za-z0-9._:/-]*["']?(?=\s|$)/g,
+    // The model as the launcher writes it, `[1m]` context suffix included (LAUNCH_MODEL_RE).
+    /(?:^|\s)--model(?:=|\s+)["']?[A-Za-z0-9][A-Za-z0-9._:/[\]-]*["']?(?=\s|$)/g,
     new RegExp(`(?:^|\\s)--settings(?:=|\\s+)(?:'${reviewerSettings}'|"${reviewerSettings}"|${reviewerSettings})(?=\\s|$)`, 'g'),
   ];
   const mcpConfigs = (Array.isArray(options.mcpConfig) ? options.mcpConfig : [options.mcpConfig])

@@ -1129,6 +1129,13 @@ test('custom settings, tool aliases, and restricted mode are refused before sour
     }
     assert.equal(handoff.permissionClass(`claude --mcp-config '${path.join(f.base, 'other mcp.json')}' --resume ${f.sid}`,
       { mcpConfig: candidates }), null, 'an unrelated MCP path is still refused');
+    // The launcher writes the 1M-context model with its suffix; a session launched that
+    // way is as reproducible as any other (it refused every such transfer once).
+    assert.equal(handoff.permissionClass(`claude --dangerously-skip-permissions --model claude-opus-5-5[1m] --session-id ${f.sid}`),
+      'bypass', 'a [1m] model suffix is part of the model, not a custom flag');
+    assert.equal(handoff.permissionClass(`claude --model "claude-opus-5-5[1m]" --resume ${f.sid}`), 'restricted');
+    assert.equal(handoff.permissionClass(`claude --model claude-opus-5-5[1m] --allowedTools Bash --resume ${f.sid}`), null,
+      'other flags are still refused');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
