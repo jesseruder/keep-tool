@@ -127,9 +127,12 @@ export const PREDICTED_CELL_CLASS = 'keep-predicted-cell';
 
 // One per mounted terminal. `agent` names the pane's agent (`claude`, `codex`, or
 // anything else for a pane that is not predicted), `remote` says whether the pane
-// is on another node, `mode` reads the viewer's setting, and `now` is a monotonic
-// clock.
-export function createTypingPredictor({ terminal, agent, remote, mode = getPredictTypingPreference, now = () => Date.now() }) {
+// is on another node, `mode` reads the viewer's setting, `now` is a monotonic
+// clock, and `reply` sends a terminal reply to the pane the way xterm's own
+// replies are sent.
+export function createTypingPredictor({
+  terminal, agent, remote, mode = getPredictTypingPreference, now = () => Date.now(), reply = null,
+}) {
   const samples = [];
   // Keystrokes whose echo has not landed, oldest first, each with the input text it
   // should leave before the cursor. That text is what matches an echo to the
@@ -168,11 +171,41 @@ export function createTypingPredictor({ terminal, agent, remote, mode = getPredi
     // Erasing in line and inserting or deleting characters act on the cursor's row;
     // inserting or deleting lines shifts it and every row below; erasing in display
     // may reach any row.
-    if (reach === 'screen' || cursorRow === row || (reach === 'below' && cursorRow < row)) touched = true;
+    if (reach === 'screen' || cursorRow === row || (reach === 'below' && cursorRow < row)) {
+      touched = true;
+      // The pane is redrawing the row, so wherever the cursor goes next is its own.
+      localCursor = null;
+    }
     // Never handled here: xterm still performs the sequence.
     return false;
   };
   const hooks = [];
+  // How far the guesses have moved the cursor since the pane's own output last put
+  // it somewhere, and where they left it. A guess moves xterm's real cursor before
+  // the pane has echoed anything, so a cursor-position report built from it would
+  // name a column the pane never produced.
+  let advance = 0;
+  let localCursor = null;
+  const cursorKey = () => {
+    const buffer = terminal.buffer.active;
+    return `${buffer.type}:${buffer.baseY + buffer.cursorY}:${buffer.cursorX}`;
+  };
+  // While guesses stand and nothing of the pane's has moved the cursor since, the
+  // report names the column the pane's own output left, formatted exactly as
+  // xterm formats it (1-based row and column, no page for the private form), and
+  // is sent through the same path as xterm's replies. Any other query, or no
+  // standing guess, is left to xterm. A guess never changes the row.
+  const reportPosition = (prefix) => (params) => {
+    if (params.length !== 1 || params[0] !== 6 || typeof reply !== 'function') return false;
+    if (localWrite || !advance || !entries.some((entry) => entry.drawn) || cursorKey() !== localCursor) return false;
+    const buffer = terminal.buffer.active;
+    reply(`\x1b[${prefix}${buffer.cursorY + 1};${Math.max(0, buffer.cursorX - advance) + 1}R`);
+    return true;
+  };
+  if (typeof terminal.parser?.registerCsiHandler === 'function') {
+    hooks.push(terminal.parser.registerCsiHandler({ final: 'n' }, reportPosition('')));
+    hooks.push(terminal.parser.registerCsiHandler({ prefix: '?', final: 'n' }, reportPosition('?')));
+  }
   if (typeof terminal.parser?.registerCsiHandler === 'function') {
     const finals = { K: 'row', X: 'row', '@': 'row', P: 'row', L: 'below', M: 'below', J: 'screen' };
     for (const [final, reach] of Object.entries(finals)) {
@@ -241,6 +274,9 @@ export function createTypingPredictor({ terminal, agent, remote, mode = getPredi
       // With no settle seen yet (a fresh or reset terminal), the screen as it stands
       // before the first guess is the baseline.
       if (!lastSettled) lastSettled = before;
+      // The pane's output moved the cursor since the last guess: it is the pane's
+      // position now, and the advance counts from here.
+      if (cursorKey() !== localCursor) advance = 0;
       localWrite = true;
     });
     unparsed += columns;
@@ -248,6 +284,8 @@ export function createTypingPredictor({ terminal, agent, remote, mode = getPredi
       localWrite = false;
       if (current !== generation) return;
       unparsed -= columns;
+      advance += columns;
+      localCursor = cursorKey();
       done();
       if (before === lastSettled) lastSettled = snapshot();
     });
@@ -365,6 +403,8 @@ export function createTypingPredictor({ terminal, agent, remote, mode = getPredi
     lastSettled = '';
     touched = false;
     localWrite = false;
+    advance = 0;
+    localCursor = null;
     generation++;
   };
   const dispose = () => {

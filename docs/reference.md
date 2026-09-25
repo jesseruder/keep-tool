@@ -208,7 +208,9 @@ or the cursor column from what the guesses left, or erases or shifts cells on th
 not one. So when Codex, which writes only changed cells, echoes exactly what a guess
 already shows, the mark stays until a later echo moves past it or it expires after 5 s;
 the character itself is right on screen throughout. A mark that lingers otherwise means
-the character was never echoed. The session Actions menu
+the character was never echoed. While guesses stand, a cursor-position query from the
+pane (`CSI 6 n`, `CSI ? 6 n`) is answered with the column the pane's own output left,
+not the one the guesses moved the cursor to. The session Actions menu
 carries a per-viewer **Predict typing** setting (`keep.console.predictTyping` in
 localStorage): **Auto**, the default, predicts only on panes of another node and only
 once the median of the last 8 measured echoes on that pane is above 50 ms (it measures

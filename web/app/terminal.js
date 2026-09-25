@@ -197,6 +197,9 @@ export function mountTerminal(container, pane, options = {}) {
     agent: () => paneState?.meta?.agent,
     remote: () => pane.includes('@'),
     now: () => performance.now(),
+    // A cursor-position report the predictor answers goes the way xterm's own
+    // replies go, through onData's path, so it keeps its order with keystrokes.
+    reply: (data) => sendInput(data, { user: performance.now() <= userInputUntil }),
   });
   let composing = false;
   // Output chunks received but not yet parsed. The predictor looks at the prompt

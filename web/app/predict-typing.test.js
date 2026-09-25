@@ -537,3 +537,54 @@ test('a cell-diff echo identical to the guess leaves it pending until it expires
   assert.equal(predictor.echoMs(), null, 'without a sample');
   assert.deepEqual(lineState(terminal), { text: '› a', cursor: 3, marks: [] }, 'the character stays, the overlay goes');
 });
+
+function reportingPredictor(terminal) {
+  const replies = [];
+  const xtermReplies = [];
+  terminal.onData((data) => xtermReplies.push(data));
+  const predictor = createTypingPredictor({
+    terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => 0,
+    reply: (data) => replies.push(data),
+  });
+  return { predictor, replies, xtermReplies };
+}
+
+test('a cursor-position report names the column the pane left, not the guesses', async () => {
+  const terminal = await terminalWith('status\r\n❯ ');
+  const { predictor, replies, xtermReplies } = reportingPredictor(terminal);
+  predictor.keystroke('a');
+  predictor.keystroke('b');
+  await write(terminal, '');
+  assert.equal(terminal.buffer.active.cursorX, 4, 'the guesses sit at columns 3 and 4');
+  await write(terminal, '\x1b[6n');
+  await write(terminal, '\x1b[?6n');
+  assert.deepEqual(replies, ['\x1b[2;3R', '\x1b[?2;3R']);
+  assert.deepEqual(xtermReplies, [], 'xterm does not answer as well');
+});
+
+test('a Backspace guess counts against the advance in the report', async () => {
+  const terminal = await terminalWith('❯ ');
+  const { predictor, replies } = reportingPredictor(terminal);
+  for (const key of ['a', 'b', '\x7f']) predictor.keystroke(key);
+  await write(terminal, '');
+  assert.equal(terminal.buffer.active.cursorX, 3);
+  await write(terminal, '\x1b[6n');
+  assert.deepEqual(replies, ['\x1b[1;3R']);
+});
+
+test('with no guess standing, or once the pane moves the cursor, xterm answers as it always did', async () => {
+  const terminal = await terminalWith('❯ ');
+  const { predictor, replies, xtermReplies } = reportingPredictor(terminal);
+  await write(terminal, '\x1b[6n\x1b[?6n\x1b[5n');
+  assert.deepEqual(replies, []);
+  assert.deepEqual(xtermReplies, ['\x1b[1;3R', '\x1b[?1;3R', '\x1b[0n']);
+  xtermReplies.length = 0;
+  predictor.keystroke('a');
+  await write(terminal, '');
+  await write(terminal, '\x1b[5n');
+  assert.deepEqual(xtermReplies, ['\x1b[0n'], 'other status queries are xterm\'s');
+  xtermReplies.length = 0;
+  await write(terminal, '\r❯ a\x1b[K\x1b[6n');
+  assert.deepEqual(replies, [], 'the pane put the cursor where it is');
+  assert.deepEqual(xtermReplies, ['\x1b[1;4R']);
+});
