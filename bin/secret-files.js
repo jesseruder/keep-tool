@@ -215,6 +215,12 @@ function writeSecret({ path: requested, key = null, replace = false, multiline =
 // (path, key, sizes; never the value). A daemon whose `secret-write` reply was lost
 // asks again with the same request id and gets the recorded answer back instead of
 // a second write, or a refusal because the first one already filled the file.
+//
+// Accepted gaps, each needing a crash or an I/O error inside a single console paste:
+// a machine that dies between the receipt and the secret's rename leaves a receipt
+// for a write that never landed, and a receipt that cannot be removed after a failed
+// write outlives it. Either way the agent finds the file missing and asks again; a
+// two-phase receipt would need a way to verify the file without holding the value.
 const REQUEST_ID_RE = /^[a-f0-9]{8}$/;
 const RECEIPT_KEEP_MS = 14 * 24 * 60 * 60 * 1000;
 
@@ -251,6 +257,8 @@ function writeReceipt(dir, requestId, print, outcome) {
     try { fs.writeSync(fd, JSON.stringify({ fingerprint: print, outcome, at: Date.now() })); fs.fsyncSync(fd); }
     finally { fs.closeSync(fd); }
     fs.renameSync(temp, file);
+    const dirFd = fs.openSync(dir, 'r');
+    try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
   } catch (error) {
     throw new SecretPathError(`could not record the write on this machine: ${error.code || 'receipt failed'}`, 'secret-write');
   }
