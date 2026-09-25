@@ -67,7 +67,7 @@ export function installSessionSearch({ rows, recentIds, open, esc }) {
   const build = () => {
     dialog = document.createElement('dialog');
     dialog.className = 'session-search-dialog';
-    dialog.innerHTML = '<input type="search" placeholder="Find a session: title, #number, project or card" aria-label="Find a session" role="combobox" aria-controls="session-search-list" aria-expanded="true" autocomplete="off" spellcheck="false">'
+    dialog.innerHTML = '<input type="text" placeholder="Find a session: title, #number, project or card" aria-label="Find a session" role="combobox" aria-controls="session-search-list" aria-expanded="true" autocomplete="off" spellcheck="false">'
       + '<ul id="session-search-list" role="listbox" aria-label="Sessions"></ul>';
     input = dialog.querySelector('input');
     list = dialog.querySelector('ul');
