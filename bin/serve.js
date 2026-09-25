@@ -428,7 +428,7 @@ async function sessionSummarySnapshot(deps = {}) {
   if (!live.length) return { sessions: [], panes };
   // Use the same marker-enriched classification as Triage. Raw transcript
   // lookups omit permission notifications that can arrive in the middle of a turn.
-  const state = await (deps.dashboardBuild || deps.buildState || buildState)({ hostPanes: panes, dashboard: true });
+  const state = await isolatedStateBuild({ hostPanes: panes, dashboard: true }, deps);
   return { sessions: state.sessions, panes };
 }
 const WEEKLY_INSTRUCTION = "Summarize what this solo developer completed in the last week. Group related work into 3-6 themed bullets and note anything notable that shipped. Be specific; output only the summary.";
@@ -7313,7 +7313,7 @@ async function restartSession(body, deps = {}) {
     }
     if (!capabilities.replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
     const pane = (await host('get', { pane: body.pane })).pane;
-    const session = (await (deps.buildState || buildState)({ hostPanes: [pane] })).sessions.find((s) => s.id === body.sessionId);
+    const session = (await isolatedStateBuild({ hostPanes: [pane] }, deps)).sessions.find((s) => s.id === body.sessionId);
     if (session?.kind === 'pi') {
       throw new InjectionError(409, 'Pi in-place restart is unavailable; close the pane and use keep open to resume');
     }
@@ -7956,7 +7956,7 @@ async function closeIdleSession(body, deps = {}) {
     const listed = await hostPanesForAction(deps, true);
     if (!Array.isArray(listed.panes)) throw hostPaneVerificationError('Live pane state', listed);
     const panes = listed.panes;
-    const state = await addHostSessionState(await (deps.buildState || buildState)({ hostPanes: panes }), { ...deps, panes });
+    const state = await isolatedHostStateBuild({ hostPanes: panes }, deps);
     const session = state.sessions.find((s) => s.id === body.sessionId);
     const pane = state.panes.find((p) => p.id === body.pane);
     if (await closeExitedCodexShell(session, pane, deps)) return { ok: true, closing: true, sessionId: session.id, pane: pane.id };
@@ -8210,14 +8210,11 @@ async function closeIdleSession(body, deps = {}) {
         if (expectedInputCount !== null && currentPane.inputCount !== expectedInputCount) {
           throw new InjectionError(409, 'Session received unexpected input during cleanup');
         }
-        const currentState = await addHostSessionState(
-          await (deps.buildState || buildState)({ hostPanes: [currentPane] }),
-          { ...deps, panes: [currentPane] },
-        );
+        const currentState = await isolatedHostStateBuild({ hostPanes: [currentPane] }, deps);
         await checkDonePolicy(currentState, currentPane, useAuthorizedActivity ? authorizedPane : currentPane);
         checkTaskSafety(currentState);
       } else {
-        checkTaskSafety(await (deps.buildState || buildState)({ hostPanes: panes }));
+        checkTaskSafety(await isolatedStateBuild({ hostPanes: panes }, deps));
       }
       if (verifyCodexChildren) {
         try { verifyCodexChildren(); } catch (error) { throw new InjectionError(409, error.message); }
@@ -9072,8 +9069,7 @@ function startAutoCompact() {
 // queue may only ask for the same transfer the console button asks for.
 async function handoffQueueState(deps = {}) {
   const panes = await (deps.listHostPanes || listHostPanes)({}, true);
-  return (deps.addHostSessionState || addHostSessionState)(
-    await (deps.buildState || buildState)({ hostPanes: panes }), { panes });
+  return isolatedHostStateBuild({ hostPanes: panes }, deps);
 }
 
 async function handoffQueueSessions(deps = {}) {
@@ -12235,6 +12231,29 @@ async function isolatedSessionScan(options = {}, deps = {}) {
   return reader.run('session-snapshot', { options }, { key });
 }
 
+// A full state build walks the whole transcript fleet just as scanSessions does.
+// Action paths use the dashboard worker once the daemon is active; keeping that
+// choice here means a newly added scheduler or route cannot silently fall back to
+// the synchronous builder by omitting one dependency. Focused library callers and
+// tests still get the direct implementation before start() enters the policy.
+async function isolatedStateBuild(options = {}, deps = {}) {
+  const builder = deps.dashboardBuild || deps.buildState || daemonDashboardBuildForMain;
+  if (builder) return builder(options);
+  const policy = deps.mainLoopPolicy || daemonMainLoopPolicy;
+  if (policy.isActive()) throw new Error('daemon state build has no isolated builder');
+  return buildState(options);
+}
+
+// Dashboard builds already run addHostSessionState in their worker. A direct or
+// explicitly injected raw builder does not, so retain that finalization exactly
+// once for action paths that require pane/account fields.
+async function isolatedHostStateBuild(options = {}, deps = {}) {
+  const dashboardBuilder = deps.dashboardBuild || (!deps.buildState && daemonDashboardBuildForMain);
+  if (dashboardBuilder) return dashboardBuilder(options);
+  const state = await isolatedStateBuild(options, deps);
+  return (deps.addHostSessionState || addHostSessionState)(state, { ...deps, panes: options.hostPanes || [] });
+}
+
 async function isolatedDaemonRead(operation, input, deps = {}, options = {}) {
   const reader = deps.readWorker || daemonReadWorkerForMain;
   if (!reader) throw new Error(`daemon ${operation} has no isolated reader`);
@@ -13295,6 +13314,7 @@ function dashboardSummary(options, target, key, input, instruction, summaryOptio
 }
 
 function buildState(options = {}) {
+  daemonMainLoopPolicy.assertBulkScanAllowed();
   const workerMode = options.dashboardWorker === true;
   const now = typeof options.now === 'function' ? Number(options.now()) : Number(options.now ?? Date.now());
   const liveLedger = readLiveSessionLedger(options);
@@ -14091,10 +14111,7 @@ async function inspectAccountHandoff(body, deps = {}) {
   // A host that did not answer is not a missing pane: account-handoff refuses this one as
   // a transient host timeout rather than "needs the original pane".
   if (!panes) return { hostUnavailable: true };
-  const isolatedBuild = deps.dashboardBuild || daemonDashboardBuildForMain;
-  const state = isolatedBuild
-    ? await isolatedBuild({ hostPanes: panes })
-    : await addHostSessionState(await buildState({ hostPanes: panes }), { ...deps, panes });
+  const state = await isolatedHostStateBuild({ hostPanes: panes }, deps);
   const session = state.sessions.find((entry) => entry.id === body.sessionId);
   const pane = panes.find((entry) => entry.id === body.pane);
   const rows = await agentProcessRows(deps);
@@ -14143,8 +14160,7 @@ async function inspectNodeAccountHandoff(body, node, deps = {}) {
   if (!Array.isArray(listed && listed.panes) || !status || status.ok !== true || status.stale) return { hostUnavailable: true, node };
   const panes = listed.panes;
   const pane = panes.find((entry) => entry && entry.id === body.pane) || null;
-  const state = await (deps.addHostSessionState || addHostSessionState)(
-    await (deps.buildState || buildState)({ hostPanes: panes }), { ...deps, panes });
+  const state = await isolatedHostStateBuild({ hostPanes: panes }, deps);
   const listedRow = (state.sessions || []).find((entry) => entry.id === body.sessionId && entry.node === node) || null;
   // The row the node's transcript gives, read under whichever account holds the
   // conversation now (the staged target once a transfer has published its copy).
@@ -15499,10 +15515,7 @@ async function inspectPortableSource(sessionId, options = {}, deps = {}) {
   else {
     const panes = await listHostPanes(deps, true);
     if (!panes) throw new InjectionError(503, 'terminal host is unavailable; source activity cannot be verified');
-    const isolatedBuild = deps.dashboardBuild || daemonDashboardBuildForMain;
-    state = isolatedBuild
-      ? await isolatedBuild({ hostPanes: panes })
-      : await addHostSessionState(await buildState({ hostPanes: panes }), { ...deps, panes });
+    state = await isolatedHostStateBuild({ hostPanes: panes }, deps);
   }
   const session = state.sessions?.find((entry) => entry.id === sessionId);
   const handoff = require('./account-handoff');
@@ -17237,7 +17250,9 @@ function start(deps = {}) {
     TURN_INDEX_BUDGET_BYTES, TURN_INDEX_BUDGET_MS, TURN_INDEX_PRUNE_LIMIT, WATCHER_CONCURRENCY,
     WATCHER_TURNS_PER_TICK, WATCHER_WINDOW_MS,
     abandonAccountHandoff, abandonTransfer, accounts, addHostSessionState, agentProcessRows, announceStateNote,
-    answerSession, attentionAckKey, attentionAckName, buildState, cancelQueuedHandoff, cardUsage, closeEphemeralPane,
+    answerSession, attentionAckKey, attentionAckName,
+    buildState: (options = {}) => isolatedStateBuild(options, { dashboardBuild }),
+    cancelQueuedHandoff, cardUsage, closeEphemeralPane,
     closeIdleSession, codex, compactSessionById, requestSessionCompaction, companionSnapshot, consoleState, daemonRestartGate,
     dashboardDetail, deliverCheckToThread, deliverUnblockToThread, discord, driftWakeFromVerdict,
     envNumber, features, forceRestartSession, fs, handoffRateLimited, handoffSession, handoffSessionRequest, health, hostRequest,
@@ -17717,6 +17732,7 @@ module.exports = {
   resolveSessionId, screenSession, screenHistorySession, sendSessionKeys, shellPaneTarget, stripTerminalAnsi, writeToShellPane,
   agentProcessRows, parseProcessTable, agentRowUnreadable, liveSessionPids, liveSessionTick, restorePlan,
   createDaemonMainLoopPolicy, createDaemonRegistryLockPolicy,
+  isolatedStateBuild,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession, reopenSessionOnAccount,
   assignOpenedSessionNumber,

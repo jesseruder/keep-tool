@@ -90,6 +90,30 @@ test('the daemon main-loop policy forbids every bulk scan until it leaves', () =
   policy.assertBulkScanAllowed();
 });
 
+test('an active daemon close requires and uses the isolated state builder', async () => {
+  const policy = serve.createDaemonMainLoopPolicy();
+  policy.enter();
+  const pane = { id: 'p', alive: true, meta: { sessionId: 's', agent: 'claude' } };
+  const base = {
+    mainLoopPolicy: policy,
+    withInjectionLock: (fn) => fn(),
+    listHostPaneResult: async () => ({ panes: [pane], missingNodes: [] }),
+  };
+  await assert.rejects(
+    serve.closeIdleSession({ sessionId: 's', pane: 'p' }, base),
+    /daemon state build has no isolated builder/,
+  );
+  let builds = 0;
+  await assert.rejects(serve.closeIdleSession({ sessionId: 's', pane: 'p' }, {
+    ...base,
+    dashboardBuild: async () => {
+      builds += 1;
+      throw new Error('isolated builder reached');
+    },
+  }), /isolated builder reached/);
+  assert.equal(builds, 1);
+});
+
 test('account setup child work stays serialized even after a failed operation', async () => {
   const serialize = serve.createSerialWorkQueue();
   let active = 0;
