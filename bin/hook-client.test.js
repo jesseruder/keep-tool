@@ -994,11 +994,12 @@ test('a Codex child agent\'s event goes without its rollout, and leaves the pare
   assert.equal(daemon.posts[0].body.transcript.path, f.transcript);
   const cursorFile = path.join(f.home, '.keep-node', 'mirror', 'codex-aws1.json');
   const cursor = fs.readFileSync(cursorFile, 'utf8');
-  const result = await codexRun(f, 'lifecycle', daemon.url, codexInput(f, { transcript_path: child, hook_event_name: 'PostToolUse', agent_id: 'codex-child', turn_id: 't2' }));
+  const result = await codexRun(f, 'lifecycle', daemon.url, codexInput(f, { transcript_path: child, hook_event_name: 'PostToolUse', turn_id: 't2' }));
   assert.equal(result.status, 0, result.stderr);
   const post = daemon.posts.at(-1).body;
   assert.equal(post.event, 'codex-lifecycle');
   assert.equal(post.identity.sessionId, 'codex-aws1');
+  assert.equal(post.input.agent_id, 'codex-child', 'the daemon reads the parent\'s rollout for it, so the event names its child');
   assert.equal(post.transcript ?? null, null, 'a child\'s rollout never goes up under its parent\'s id');
   assert.equal(fs.readFileSync(cursorFile, 'utf8'), cursor);
   // The parent's next event has nothing new to send, rather than its whole rollout again.

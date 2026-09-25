@@ -201,12 +201,20 @@ function readRange(file, from, to) {
 // rollout. The mirror (and this node's cursor) is the parent's alone: a child's bytes
 // under the parent's id would replace it, and the parent's next event would send its
 // whole transcript again. A rollout whose session_meta names another id is a child's.
+// Answers the child's own id, or '' for the session's own rollout (or one unreadable).
+const rolloutIds = new Map();
 function childRollout(event, sessionId, transcriptPath) {
-  if (!CODEX_EVENTS.includes(event) || typeof transcriptPath !== 'string') return false;
-  let meta;
-  try { meta = require('./codex.js').readSessionMeta(transcriptPath); } catch { return false; }
-  const id = meta && (meta.id || meta.session_id);
-  return typeof id === 'string' && id !== '' && id !== sessionId;
+  if (!CODEX_EVENTS.includes(event) || typeof transcriptPath !== 'string') return '';
+  // A rollout's first line never changes once written: a replay reads each file once.
+  let id = rolloutIds.get(transcriptPath);
+  if (id === undefined) {
+    let meta;
+    try { meta = require('./codex.js').readSessionMeta(transcriptPath); } catch { return ''; }
+    id = meta && (meta.id || meta.session_id);
+    id = typeof id === 'string' ? id : '';
+    rolloutIds.set(transcriptPath, id);
+  }
+  return id && id !== sessionId ? id : '';
 }
 
 function snapshotOf(transcriptPath) {
@@ -334,8 +342,14 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
   const request = deps.request || require('./remote-cli.js').nodeApiRequest;
   const now = deps.now || Date.now;
   const sid = identity.sessionId;
-  // A child's event goes without bytes: the daemon reads the parent's mirror for it.
-  if (snapshot && childRollout(event, sid, transcriptPath)) snapshot = null;
+  // A child's event goes without bytes: the daemon reads the parent's mirror for it,
+  // so the event names its child, which is how the daemon's Codex handlers tell a
+  // child's stop or tool from the parent's when the rollout they read is the parent's.
+  const child = childRollout(event, sid, transcriptPath);
+  if (child) {
+    snapshot = null;
+    if (input && !input.agent_id) input = { ...input, agent_id: child };
+  }
   const send = async (payload) => {
     const left = deadline - now();
     if (left <= 0) throw new Error('out of time');
