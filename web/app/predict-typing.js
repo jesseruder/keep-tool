@@ -147,33 +147,36 @@ export function createTypingPredictor({ terminal, agent, remote, mode = getPredi
   // them as they were (a spinner elsewhere) is not an echo of anything, and a
   // guess's own change to the line is never mistaken for one.
   let lastSettled = '';
-  // Whether the agent's own output addressed the prompt row since the last settle.
-  // An echo that redraws exactly what the guess drew leaves the line as the guess
-  // left it, so the line alone cannot show it; the cursor movements and erasures
-  // the agent's renderer uses to redraw that row can. Our own writes are excluded.
+  // Whether the agent's own output erased or shifted cells on the prompt row since
+  // the last settle. A whole-line redraw that ends exactly where the guesses did
+  // leaves the line as they left it, so the line alone cannot show it; the erase
+  // the renderer uses (Claude Code ends each redrawn line with EL) can. Cursor
+  // movement never counts: a spinner that draws elsewhere and moves the cursor
+  // back onto the prompt row has answered nothing. Our own writes are excluded.
+  //
+  // The accepted cost: an agent that writes only the cells that changed (Codex),
+  // echoing exactly what a guess already shows, changes nothing observable, so
+  // that guess stays marked until a later echo moves past it or it expires after
+  // STALE_KEYSTROKE_MS. The character on screen is right all the while; only the
+  // mark lingers, and no sample is taken.
   let touched = false;
   let localWrite = false;
-  const touch = (direction) => (params) => {
+  const touch = (reach) => () => {
     if (localWrite || !entries.length) return false;
     const buffer = terminal.buffer.active;
     const cursorRow = buffer.baseY + buffer.cursorY;
-    const first = Number(Array.isArray(params[0]) ? params[0][0] : params[0]) || 1;
-    // A move counts where it lands, not where it leaves: a spinner's jump off the
-    // prompt row does not touch it, and a jump back onto it does.
-    let target = cursorRow;
-    if (direction === 'absolute') target = buffer.baseY + first - 1;
-    else if (direction === 'up') target = cursorRow - first;
-    else if (direction === 'down') target = cursorRow + first;
-    if (direction === 'screen' || target === row) touched = true;
+    // Erasing in line and inserting or deleting characters act on the cursor's row;
+    // inserting or deleting lines shifts it and every row below; erasing in display
+    // may reach any row.
+    if (reach === 'screen' || cursorRow === row || (reach === 'below' && cursorRow < row)) touched = true;
     // Never handled here: xterm still performs the sequence.
     return false;
   };
   const hooks = [];
   if (typeof terminal.parser?.registerCsiHandler === 'function') {
-    const finals = { H: 'absolute', f: 'absolute', d: 'absolute', A: 'up', F: 'up', B: 'down', E: 'down',
-      C: 'row', D: 'row', G: 'row', '`': 'row', K: 'row', X: 'row', P: 'row', '@': 'row', J: 'screen' };
-    for (const [final, direction] of Object.entries(finals)) {
-      hooks.push(terminal.parser.registerCsiHandler({ final }, touch(direction)));
+    const finals = { K: 'row', X: 'row', '@': 'row', P: 'row', L: 'below', M: 'below', J: 'screen' };
+    for (const [final, reach] of Object.entries(finals)) {
+      hooks.push(terminal.parser.registerCsiHandler({ final }, touch(reach)));
     }
   }
 
@@ -235,6 +238,9 @@ export function createTypingPredictor({ terminal, agent, remote, mode = getPredi
     let before = null;
     terminal.write('', () => {
       before = snapshot();
+      // With no settle seen yet (a fresh or reset terminal), the screen as it stands
+      // before the first guess is the baseline.
+      if (!lastSettled) lastSettled = before;
       localWrite = true;
     });
     unparsed += columns;

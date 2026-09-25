@@ -484,3 +484,56 @@ test('keystrokes left unanswered past the stale limit expire without a sample', 
   assert.equal(predictor.echoMs(), null, 'no sample was recorded');
   assert.equal(predictor.enabled(), false, 'auto stays off');
 });
+
+test('a spinner that restores the cursor onto the prompt row with CUP confirms and drops nothing', async () => {
+  const terminal = await terminalWith('status\r\n❯ ');
+  let clock = 0;
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => clock });
+  predictor.outputParsed();
+  predictor.keystroke('a');
+  predictor.keystroke('b');
+  await write(terminal, '');
+  const state = () => ({
+    text: terminal.buffer.active.getLine(1).translateToString(true),
+    cursor: terminal.buffer.active.cursorX, marks: markedColumns(terminal, 1),
+  });
+  assert.deepEqual(state(), { text: '❯ ab', cursor: 4, marks: [2, 3] });
+  clock += 40;
+  await write(terminal, '\x1b[1;1Hspin\x1b[2;5H');
+  predictor.outputParsed();
+  await write(terminal, '');
+  assert.equal(predictor.pending, 2, 'a bare cursor move onto the prompt row is not an echo');
+  assert.deepEqual(state(), { text: '❯ ab', cursor: 4, marks: [2, 3] });
+  clock += 40;
+  await write(terminal, '\r❯ a\x1b[K');
+  predictor.outputParsed();
+  await write(terminal, '');
+  assert.equal(predictor.pending, 1, 'the real redraw of a confirms a');
+  assert.deepEqual(state(), { text: '❯ ab', cursor: 4, marks: [3] }, 'and b is drawn again');
+  clock += 40;
+  await write(terminal, '\r❯ ab\x1b[K');
+  predictor.outputParsed();
+  assert.equal(predictor.pending, 0);
+  assert.deepEqual(state(), { text: '❯ ab', cursor: 4, marks: [] });
+});
+
+test('a cell-diff echo identical to the guess leaves it pending until it expires, character intact', async () => {
+  const terminal = await terminalWith('› ');
+  let clock = 0;
+  const predictor = createTypingPredictor({ terminal, agent: () => 'codex', remote: () => true, mode: () => 'on', now: () => clock });
+  predictor.keystroke('a');
+  await write(terminal, '');
+  clock = 120;
+  // Codex writes the one changed cell and parks its cursor after it: exactly what
+  // the guess already shows.
+  await write(terminal, '\x1b[1;3Ha\x1b[1;4H');
+  predictor.outputParsed();
+  assert.equal(predictor.pending, 1);
+  assert.deepEqual(lineState(terminal), { text: '› a', cursor: 3, marks: [2] });
+  clock = 6001;
+  await write(terminal, '\x1b[3;1Hspin\x1b[1;4H');
+  predictor.outputParsed();
+  assert.equal(predictor.pending, 0, 'the guess expires');
+  assert.equal(predictor.echoMs(), null, 'without a sample');
+  assert.deepEqual(lineState(terminal), { text: '› a', cursor: 3, marks: [] }, 'the character stays, the overlay goes');
+});

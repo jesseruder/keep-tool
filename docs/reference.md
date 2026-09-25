@@ -201,9 +201,14 @@ draws one cell wide (printable ASCII, Latin-1, Latin Extended-A and -B). Pastes,
 arrows, menus, dialogs and shell panes are never predicted or measured, and nothing
 sent to the pane changes. Echoes are acknowledged oldest keystroke first. A predicted character is written plain,
 with no attribute or saved-cursor change to the pane's stream, and an xterm decoration
-(`.keep-predicted-cell`) dims and underlines it until the agent's redraw of that row
-confirms it; a dim placeholder is cleared by the first one, and a mark that lingers
-(up to 5 s) means the character was never echoed. The session Actions menu
+(`.keep-predicted-cell`) dims and underlines it until the agent's echo confirms it; a dim
+placeholder is cleared by the first one. An echo is output that changes the prompt line
+or the cursor column from what the guesses left, or erases or shifts cells on that row
+(Claude Code's whole-line redraw ends with an erase); a bare cursor move onto the row is
+not one. So when Codex, which writes only changed cells, echoes exactly what a guess
+already shows, the mark stays until a later echo moves past it or it expires after 5 s;
+the character itself is right on screen throughout. A mark that lingers otherwise means
+the character was never echoed. The session Actions menu
 carries a per-viewer **Predict typing** setting (`keep.console.predictTyping` in
 localStorage): **Auto**, the default, predicts only on panes of another node and only
 once the median of the last 8 measured echoes on that pane is above 50 ms (it measures
