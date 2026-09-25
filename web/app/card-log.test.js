@@ -106,8 +106,9 @@ test('the plan parses as keep-core does, and cited commits are counted once', ()
   assert.deepEqual(planSteps(PLANNED).map((step) => step.state), ['done', 'doing', 'todo']);
   assert.deepEqual(planSteps(BODY), [], 'a numbered list is not a plan');
   assert.deepEqual(planSteps('## 2026-09-21 11:00 — created\nx\n## Plan\n- [ ] late'), [], 'the plan must lead the body');
-  // A stray done-when ends the plan for keep-core, so it ends it here too.
-  assert.equal(planSteps('## Plan\n- [x] one\n  done-when: true\n  done-when: again\n- [ ] two\n').length, 1);
+  // keep-core calls a plan with stray lines invalid and has no next step, so no plan shows.
+  assert.deepEqual(planSteps('## Plan\n- [x] one\n  done-when: true\n  done-when: again\n- [ ] two\n'), []);
+  assert.deepEqual(planSteps('## Plan\n- [x] one\nsome prose\n'), []);
   assert.equal(commitCount(PLANNED), 2);
 });
 
@@ -136,8 +137,8 @@ test('where it stands: state, next step, plan progress and the last check-in, es
     Date.parse('2026-09-23T14:00'));
   assert.match(html, /class="summary where"/);
   assert.match(html, /where-state ok/);
-  assert.match(html, /Next:<\/span> Wire the CLI/);
-  assert.match(html, /▰▱▱<\/span> step 2 of 3<\/p>/);
+  assert.doesNotMatch(html, /Next:/, 'the latest check-in said next: nothing');
+  assert.match(html, /▰▱▱<\/span> step 2 of 3: Wire the CLI/);
   assert.match(html, /last check-in 1h ago/, 'the probe result 10m ago is newer, but a check-in is what counts');
   assert.match(html, /2 commits/);
   assert.doesNotMatch(html, /<the>/);
@@ -150,12 +151,16 @@ test('where it stands: state, next step, plan progress and the last check-in, es
 });
 
 test('only the latest check-in names the next step; else the plan step, said once', () => {
-  // PLANNED's latest check-in says "next: nothing", so the older "wire <the> CLI"
-  // is stale and the plan's current step stands in, without repeating itself.
-  const html = whereHTML({ esc }, { task: { id: 'plan-fallback', fm: { status: 'active' }, body: PLANNED } });
+  // With no next line on the latest check-in, the older "wire <the> CLI" is stale
+  // and the plan's current step stands in, without repeating itself.
+  const body = PLANNED.replace('next: nothing\n', '');
+  const html = whereHTML({ esc }, { task: { id: 'plan-fallback', fm: { status: 'active' }, body } });
   assert.match(html, /Next:<\/span> Wire the CLI/);
   assert.match(html, /step 2 of 3<\/p>/);
   assert.doesNotMatch(html, /wire &lt;the&gt;/);
+  // A finished card never borrows an unfinished plan step.
+  const done = whereHTML({ esc }, { task: { id: 'plan-done', fm: { status: 'done' }, body } });
+  assert.doesNotMatch(done, /Next:/);
 });
 
 test('a card whose detail is reloading keeps showing the last body seen for it', () => {

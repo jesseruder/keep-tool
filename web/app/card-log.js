@@ -67,9 +67,9 @@ export function planSteps(body) {
     if (/^##\s+/.test(line)) break;
     if (!line.trim()) continue;
     const step = line.match(/^\s*- \[([ ~xX])\]\s+(.+?)\s*$/);
-    // Anything else ends the plan there, as it does for keep-core, so the
-    // console never counts steps `keep next` does not see.
-    if (!step) break;
+    // Anything else makes keep-core treat the whole plan as invalid, with no
+    // next step, so the console shows no plan rather than a partial one.
+    if (!step) return [];
     steps.push({ text: step[2], state: step[1] === '~' ? 'doing' : /x/i.test(step[1]) ? 'done' : 'todo' });
     // A step's acceptance criterion sits on the line directly under it.
     if (/^\s+done-when:\s*\S/.test(lines[index + 1] || '')) index += 1;
@@ -166,10 +166,14 @@ export function whereHTML(ctx, { task, session, waiting = false, waitingText = '
   const steps = planSteps(body);
   const current = steps.find((step) => step.state === 'doing') || steps.find((step) => step.state === 'todo');
   // Only the latest check-in's "next" is current: an older one can name a step
-  // finished days ago. Without one, the plan's current step stands in.
+  // finished days ago. An explicit "nothing" means nothing — `keep done` writes it
+  // over an unfinished plan — so the plan's current step stands in only when the
+  // latest check-in named no next step at all, and never on a finished card.
   const latest = entries.find((entry) => /^(?:check-in|done)\b/.test(entry.kind));
-  const next = latest?.next && !/^nothing\.?$/i.test(latest.next) ? latest.next : '';
-  const nextText = next || (current ? current.text : '');
+  const saidNothing = /^nothing\.?$/i.test(latest?.next || '');
+  const finished = ['done', 'landing'].includes(task.fm?.status);
+  const nextText = latest?.next && !saidNothing ? latest.next
+    : !saidNothing && !finished && current ? current.text : '';
   if (nextText) lines.push(`<p class="where-next"><span class="faint">Next:</span> ${esc(clip(nextText, 200))}</p>`);
   if (steps.length) {
     const done = steps.filter((step) => step.state === 'done').length;
