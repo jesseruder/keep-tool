@@ -10513,10 +10513,35 @@ const reopenOpenOperations = new Map();
 function adoptedPaneMeta(meta) {
   const { ephemeral, awaitingOwnerInput, openingMessage, ...rest } = meta || {};
   // A check that ran as a card's agent stops being that agent's pane with the
-  // check: the replacement is Owner's ordinary session, and a pane that kept the
-  // name would hold the record at `working` with nothing left to idle it.
-  if (ephemeral === 'check') delete rest.agentName;
+  // check: the replacement is Owner's ordinary session. The name leaves the pane
+  // AND the record lets the session go (agents.applySessions binds by the record's
+  // session id as much as by the pane's name), because a pane the sweep no longer
+  // sees would otherwise hold the record at `working` with nothing left to idle it.
+  if (ephemeral === 'check') {
+    releaseCheckAgent(meta);
+    delete rest.agentName;
+  }
   return rest;
+}
+
+// Idle a card agent's record and drop its session when the check pane that carried
+// it is adopted by something else. Only a record still naming this pane's session
+// is touched: a newer check has its own session, and a responder's record never
+// carries `ephemeral` in the first place. Returns whether a record was released.
+function releaseCheckAgent(meta) {
+  const name = meta && typeof meta.agentName === 'string' ? meta.agentName : '';
+  if (!name || !agents.validName(name)) return false;
+  try {
+    const record = agents.readRecord(name);
+    const sessionId = meta.sessionId ? String(meta.sessionId) : '';
+    if (!record || !record.session || (record.session.id && record.session.id !== sessionId)) return false;
+    agents.writeRecord(name, { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } });
+    agents.flushCommits();
+    return true;
+  } catch (error) {
+    process.stderr.write(`keep serve: could not release agent ${name} from an adopted check pane: ${error.message}\n`);
+    return false;
+  }
 }
 
 // Pane metadata openSession resolves for itself. `repair` and the transfer ids are the

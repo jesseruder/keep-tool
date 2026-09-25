@@ -10971,9 +10971,23 @@ test('a check session Keep opens for itself lands on the daemon node', async () 
   await openCheckSession({ taskId: 'some-card', fresh: true, agent: 'claude', agentName: 'Not A Name', message: '[keep] check' },
     { openSession: async (body, deps) => { opens.push({ body, launchMeta: deps.launchMeta }); return { sessionId: 's3' }; } });
   assert.deepEqual(opens[2].launchMeta, { ephemeral: 'check' });
-  // And the replacement of such a pane (a restart, a handoff) is nobody's agent.
+  // And the replacement of such a pane (a restart, a handoff) is nobody's agent: the
+  // name leaves the pane and the record lets the session go, so neither the pane's
+  // name nor the record's session id binds the replacement to the agent.
   const { adoptedPaneMeta } = require('./serve');
-  assert.deepEqual(adoptedPaneMeta({ ephemeral: 'check', agentName: 'redash-daily', card: 'some-card', launchedAt: 5 }), { card: 'some-card', launchedAt: 5 });
+  const agents = require('./agents');
+  agents.ensure('redash-daily', { role: 'scheduled check', card: 'some-card' });
+  agents.writeRecord('redash-daily', { lifecycle: 'working', card: 'some-card', session: { id: 's2', pane: 'p2', startedAt: 5 } });
+  assert.deepEqual(adoptedPaneMeta({ ephemeral: 'check', agentName: 'redash-daily', sessionId: 's2', card: 'some-card', launchedAt: 5 }),
+    { sessionId: 's2', card: 'some-card', launchedAt: 5 });
+  const released = agents.readRecord('redash-daily');
+  assert.equal(released.lifecycle, 'idle');
+  assert.equal(released.card, '');
+  assert.deepEqual(released.session, { id: '', pane: '', startedAt: 0 });
+  // A record already carrying a newer check's session is left alone.
+  agents.writeRecord('redash-daily', { lifecycle: 'working', card: 'some-card', session: { id: 's9', pane: 'p9', startedAt: 9 } });
+  adoptedPaneMeta({ ephemeral: 'check', agentName: 'redash-daily', sessionId: 's2', card: 'some-card' });
+  assert.equal(agents.readRecord('redash-daily').session.id, 's9');
   assert.deepEqual(adoptedPaneMeta({ agentName: 'sandboxes', card: 'inc-1' }), { agentName: 'sandboxes', card: 'inc-1' }, 'an area responder keeps its name across a restart');
 
   // Which is what the pin is for: without it, a card whose last session ran on aws1
