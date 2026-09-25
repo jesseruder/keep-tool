@@ -4147,7 +4147,28 @@ function codexSessionFromTail(id, meta, tail, options = {}) {
   if (!info) throw new InjectionError(409, `the rollout of ${id}${where} could not be read as a session`, { reason: 'remote-node' });
   const stat = { size: Number(tail.size) || 0, mtimeMs: Number(tail.mtimeMs) || 0 };
   const session = codex.sessionFromRollout(info, stat, typeof options.title === 'string' ? options.title : '', Date.now(), options.accountId || null);
+  // The reviewer marker, as claudeSessionFromTail reads it: a reviewer is not
+  // auto-continued, nagged or told, wherever it runs.
+  let reviewer = false;
+  try { reviewer = fs.readdirSync(path.join(options.root || keep.ROOT, '.keep', 'reviewer')).includes(id); } catch {}
+  if (reviewer) session.reviewer = true;
   return options.node ? { ...session, node: options.node } : session;
+}
+
+// A Codex rollout's meta and tail from its node, as one read: each op finds the
+// newest rollout on its own, so both answers must name the same file (path and
+// generation). A rollout replaced, or a newer one begun, between the two would
+// otherwise pair one file's meta with another's tail (an ended turn from the old file
+// read as the new session's state). One mismatch is read again; a second refuses.
+async function readNodeRollout(client, sessionId, node) {
+  const same = (meta, tail) => Boolean(meta && tail && typeof meta.path === 'string' && meta.path
+    && meta.path === tail.path && meta.generation === tail.generation);
+  let [meta, tail] = await Promise.all([client.meta(), client.tail()]);
+  if (same(meta, tail)) return { meta, tail };
+  meta = await client.meta();
+  tail = await client.tail();
+  if (same(meta, tail)) return { meta, tail };
+  throw new InjectionError(409, `the rollout of ${sessionId} changed on ${node} while it was read; nothing was sent`, { reason: 'remote-node' });
 }
 
 // The title the daemon's own session index gives a Codex session, when the account's
@@ -4320,9 +4341,9 @@ async function remoteSessionRead(id, deps = {}) {
     const session = { id: sessionId, kind: 'codex', node };
     const account = nodeTranscriptAccount(session, deps);
     const client = (deps.nodeTranscript || nodeTranscript)(node, session, deps);
-    const [meta, tail] = await Promise.all([client.meta(), client.tail()]);
+    const { meta, tail } = await readNodeRollout(client, sessionId, node);
     return codexSessionFromTail(sessionId, meta, tail, {
-      accountId: account.id, node, title: codexTitleHere(sessionId, account.id, deps),
+      root: deps.root || keep.ROOT, accountId: account.id, node, title: codexTitleHere(sessionId, account.id, deps),
     });
   }
   const session = { id: sessionId, kind: 'claude', node };
@@ -4334,8 +4355,8 @@ async function remoteSessionRead(id, deps = {}) {
 }
 
 // loadCurrentSession for a session the fleet places on another node: the row a local
-// one gets from loadSessionExact (the 48 h window, keep-spawned left out for Claude and
-// a Companion task for Codex, the agent's attention marker, name, marks and number),
+// one gets from loadSessionExact (the 48 h window, keep-spawned left out, and for Codex
+// a Companion task too, the agent's attention marker, name, marks and number),
 // built from the node's tail (and a Codex rollout's meta), plus `node`. Async,
 // because the tail is a request; loadCurrentSession itself is unchanged, and still
 // answers "no session" for such an id to every synchronous caller.
@@ -4345,13 +4366,14 @@ async function loadRemoteSession(id, deps = {}) {
   const root = deps.root || keep.ROOT;
   const now = Date.now();
   if (!(now - Number(session.mtime) <= SESSION_WINDOW_MS)) throw new InjectionError(404, 'no session');
+  // A keep-spawned run is a headless job, not a thread, whichever agent runs it.
+  if (spawnedRecently(root, session.id, now)) throw new InjectionError(404, 'no session');
   const attentionDir = path.join(root, '.keep', 'attention');
   if (session.kind === 'codex') {
     // As codexFleetSession leaves a Companion task out, when its title is known here.
     if (codex.isCompanionTask(session.title)) throw new InjectionError(404, 'no session');
     attachCodexMarkers([session], attentionDir, now, { readOnly: true });
   } else {
-    if (spawnedRecently(root, session.id, now)) throw new InjectionError(404, 'no session');
     attachClaudeMarker(session, attentionDir, now, Number(session.mtime), true);
   }
   sessionNames.apply([session], { root });

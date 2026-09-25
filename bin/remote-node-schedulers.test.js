@@ -900,15 +900,8 @@ test('notes: an author on the node is asked of its node first, and an outage the
   assert.match(byId()[unreachable.id].nagged.reason, /its node could not be read: aws1 did not answer, for \d+ minutes/);
 });
 
-test('notes: the daemon\'s author lookup reads a node author from its node, Codex included, and answers 404s and Pi authors as final', async (t) => {
-  const fleet = createRemoteNodeFleet(t);
-  const serve = require('./serve.js');
-  const { createNoteAuthorLookup } = require('./serve/schedulers.js');
-  await serve.closeHostClient();
-  t.after(() => serve.closeHostClient());
-  let tail = null;
-  let unreachable = false;
-  // The Codex author's rollout as aws1 answers for it: its meta and its tail.
+// The Codex session's rollout as aws1 answers for it: its meta and its tail, one file.
+function remoteCodexAnswer(fleet) {
   const codexId = fleet.remoteCodex.id;
   const rollout = Buffer.from([
     { timestamp: new Date(Date.now() - 9000).toISOString(), type: 'session_meta', payload: { id: codexId, cwd: fleet.project } },
@@ -917,17 +910,85 @@ test('notes: the daemon\'s author lookup reads a node author from its node, Code
     { timestamp: new Date(Date.now() - 6000).toISOString(), type: 'event_msg', payload: { type: 'task_complete' } },
   ].map((row) => `${JSON.stringify(row)}\n`).join(''));
   const described = { path: `/node/codex/rollout-${codexId}.jsonl`, size: rollout.length, mtimeMs: Date.now() - 6000, generation: 'codex' };
+  return (type, params) => {
+    if (type !== 'transcript' || params.sessionId !== codexId) return undefined;
+    assert.equal(params.kind, 'codex');
+    if (params.op === 'meta') {
+      return { ...described, meta: { id: codexId, cwd: fleet.project, model: null, originator: null, parentThreadId: null,
+        child: false, headless: false }, model: null };
+    }
+    if (params.op === 'tail') return { ...described, from: 0, bytes: rollout.toString('base64') };
+    return undefined;
+  };
+}
+
+test('notes: a Codex author on the node that is the reviewer or keep-spawned gets no nag; an ordinary one does', async (t) => {
+  const fleet = createRemoteNodeFleet(t);
+  const notes = require('./notes.js');
+  const serve = require('./serve.js');
+  const { createNoteAuthorLookup } = require('./serve/schedulers.js');
+  await serve.closeHostClient();
+  t.after(() => serve.closeHostClient());
+  const codexAnswer = remoteCodexAnswer(fleet);
+  const hosts = fleet.fakeHosts((node, type, params) => (node === 'aws1' ? codexAnswer(type, params) : undefined));
+  const deps = { connectHost: hosts.connectHost, forceHostReconnect: true };
+  const lookup = createNoteAuthorLookup({ remoteSession: serve.remoteSession, loadSessionForAction: serve.loadSessionForAction,
+    deps, root: fleet.root });
+  const codexId = fleet.remoteCodex.id;
+  const marker = (dir) => path.join(fleet.root, '.keep', dir, codexId);
+  // Each case keeps its one note in a registry of its own (the registry the fleet
+  // shares holds other tests' notes); the markers are read from the fleet's root.
+  const sweepOnce = async () => {
+    const notesRoot = fs.mkdtempSync(path.join(fleet.base, 'notes-'));
+    const start = Date.now();
+    const note = notes.addNote({ project: fleet.project, scopes: ['deploy'], by: { sessionId: codexId, agent: 'codex' },
+      message: 'held by codex', until: new Date(start - 60e3).toISOString(), root: notesRoot, now: start - 3600e3 });
+    const sent = [];
+    await notes.sweep({ root: notesRoot, now: start, sessions: () => [], remoteSession: lookup,
+      send: async (sessionId) => { sent.push(sessionId); } });
+    const after = notes.allNotes(notesRoot).find((candidate) => candidate.id === note.id);
+    return { sent, after };
+  };
+
+  // The reviewer: its row says so, and the sweep defers as it does for a local reviewer.
+  fs.mkdirSync(path.dirname(marker('reviewer')), { recursive: true });
+  fs.writeFileSync(marker('reviewer'), '');
+  const reviewer = await sweepOnce();
+  assert.deepEqual(reviewer.sent, []);
+  assert.equal(reviewer.after.nagged, null);
+  assert.match(reviewer.after.lastNagAttempt.reason, /the reviewer is not auto-continued/);
+  fs.rmSync(marker('reviewer'));
+
+  // A keep-spawned run: no session, so the note goes to Owner, never to the run.
+  fs.mkdirSync(path.dirname(marker('spawned')), { recursive: true });
+  fs.writeFileSync(marker('spawned'), '');
+  const spawned = await sweepOnce();
+  assert.deepEqual(spawned.sent, []);
+  assert.deepEqual({ owner: spawned.after.nagged.owner, reason: spawned.after.nagged.reason }, { owner: true, reason: 'no live session on aws1' });
+  fs.rmSync(marker('spawned'));
+
+  // An ordinary one is nagged.
+  const ordinary = await sweepOnce();
+  assert.deepEqual(ordinary.sent, [codexId]);
+  assert.equal(ordinary.after.nagged.sessionId, codexId);
+  assert.deepEqual(hosts.typedOn('aws1'), []);
+});
+
+test('notes: the daemon\'s author lookup reads a node author from its node, Codex included, and answers 404s and Pi authors as final', async (t) => {
+  const fleet = createRemoteNodeFleet(t);
+  const serve = require('./serve.js');
+  const { createNoteAuthorLookup } = require('./serve/schedulers.js');
+  await serve.closeHostClient();
+  t.after(() => serve.closeHostClient());
+  let tail = null;
+  let unreachable = false;
+  const codexId = fleet.remoteCodex.id;
+  const codexAnswer = remoteCodexAnswer(fleet);
   const hosts = fleet.fakeHosts((node, type, params) => {
     if (node !== 'aws1') return undefined;
     if (unreachable && type === 'transcript') throw new Error('aws1 is unreachable');
-    if (type === 'transcript' && params.sessionId === codexId) {
-      assert.equal(params.kind, 'codex');
-      if (params.op === 'meta') {
-        return { ...described, meta: { id: codexId, cwd: fleet.project, model: null, originator: null, parentThreadId: null,
-          child: false, headless: false }, model: null };
-      }
-      if (params.op === 'tail') return { ...described, from: 0, bytes: rollout.toString('base64') };
-    }
+    const codexAnswered = codexAnswer(type, params);
+    if (codexAnswered) return codexAnswered;
     if (tail && type === 'transcript' && params.op === 'tail') return tail;
     return undefined;
   });

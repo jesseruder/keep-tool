@@ -194,6 +194,66 @@ test('a Codex session on aws1 is loaded for an action from its node\'s meta and 
   } finally { f.cleanup(); }
 });
 
+test('a Codex rollout whose meta and tail name different files is read again once, then refused', async () => {
+  const sid = 'sess-codex-race';
+  const f = codexNodeFixture(sid, 'aws3');
+  try {
+    // The node's two answers, each from whichever rollout was newest when it was asked:
+    // a fresh running rollout's meta beside the old file's ended tail.
+    const oldText = Buffer.from(codexRollout(sid, { ended: true }));
+    const newText = Buffer.from(codexRollout(sid, { ended: false }));
+    const file = (name, bytes, generation) => ({ path: `/node/home/.codex/sessions/2026/01/01/${name}-${sid}.jsonl`,
+      size: bytes.length, mtimeMs: Date.now() - 5000, generation });
+    const metaOf = (described) => ({ ...described, meta: { id: sid, cwd: '/work/project', model: null, originator: 'codex_cli_rs',
+      parentThreadId: null, child: false, headless: false }, model: null });
+    const tailOf = (described, bytes) => ({ ...described, bytes: bytes.toString('base64'), from: 0 });
+    const oldFile = file('rollout-old', oldText, 'g-old');
+    const newFile = file('rollout-new', newText, 'g-new');
+    const client = (metas, tails) => {
+      const asked = [];
+      return { asked, factory: (node, session) => {
+        assert.equal(node, 'aws3');
+        assert.equal(session.kind, 'codex');
+        return { meta: async () => { asked.push('meta'); return metas.shift(); }, tail: async () => { asked.push('tail'); return tails.shift(); } };
+      } };
+    };
+
+    // Disagree once, then agree: the second read is the one used.
+    const settles = client([metaOf(newFile), metaOf(newFile)], [tailOf(oldFile, oldText), tailOf(newFile, newText)]);
+    const session = await serve.remoteSessionRead(sid, { ...f.deps, nodeTranscript: settles.factory });
+    assert.equal(session.endedTurn, false, 'the running rollout, not the old file\'s ended tail');
+    assert.equal(session.state, 'running');
+    assert.deepEqual(settles.asked.sort(), ['meta', 'meta', 'tail', 'tail']);
+
+    // Disagree twice: refused, never paired.
+    const flaps = client([metaOf(newFile), metaOf(oldFile)], [tailOf(oldFile, oldText), tailOf(newFile, newText)]);
+    await assert.rejects(serve.remoteSessionRead(sid, { ...f.deps, nodeTranscript: flaps.factory }),
+      (error) => error.status === 409 && error.extra.reason === 'remote-node'
+        && error.message === `the rollout of ${sid} changed on aws3 while it was read; nothing was sent`);
+    // The same path with another generation (re-created) is a different file too.
+    const recreated = client([metaOf(oldFile), metaOf(oldFile)], [tailOf({ ...oldFile, generation: 'g-again' }, oldText),
+      tailOf({ ...oldFile, generation: 'g-again' }, oldText)]);
+    await assert.rejects(serve.remoteSessionRead(sid, { ...f.deps, nodeTranscript: recreated.factory }),
+      (error) => error.status === 409 && /changed on aws3 while it was read/.test(error.message));
+  } finally { f.cleanup(); }
+});
+
+test('a Codex session on aws1 carries the reviewer marker, and a keep-spawned one is no session', async () => {
+  const sid = 'sess-codex-markers';
+  const f = codexNodeFixture(sid, 'aws3');
+  try {
+    const plain = await serve.loadSessionForAction(sid, f.deps);
+    assert.equal(plain.reviewer, undefined);
+    fs.mkdirSync(path.join(f.root, '.keep', 'reviewer'), { recursive: true });
+    fs.writeFileSync(path.join(f.root, '.keep', 'reviewer', sid), '');
+    assert.equal((await serve.loadSessionForAction(sid, f.deps)).reviewer, true);
+    fs.rmSync(path.join(f.root, '.keep', 'reviewer', sid));
+    fs.mkdirSync(path.join(f.root, '.keep', 'spawned'), { recursive: true });
+    fs.writeFileSync(path.join(f.root, '.keep', 'spawned', sid), '');
+    await assert.rejects(serve.loadSessionForAction(sid, f.deps), (error) => error.status === 404);
+  } finally { f.cleanup(); }
+});
+
 test('a Codex session on aws1 outside the window is no session, as a local one would be', async () => {
   const sid = 'sess-codex-old';
   const f = codexNodeFixture(sid, 'aws3');
