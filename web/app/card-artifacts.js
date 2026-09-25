@@ -146,10 +146,12 @@ function showInViewer(item, url) {
 
 function stepViewer(delta) {
   const images = viewerImages(viewer.card);
-  if (images.length < 2) return;
   const index = images.findIndex((entry) => entry.item.name === viewer.name);
-  const next = images[(Math.max(index, 0) + delta + images.length) % images.length];
-  showInViewer(next.item, next.url);
+  // An image a newer listing dropped steps to the first or the last one left.
+  const next = index < 0
+    ? images[delta > 0 ? 0 : images.length - 1]
+    : images[(index + delta + images.length) % images.length];
+  if (next && next.item.name !== viewer.name) showInViewer(next.item, next.url);
 }
 
 function openViewer(card, item, url) {
