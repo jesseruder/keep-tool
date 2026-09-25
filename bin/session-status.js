@@ -88,7 +88,7 @@ function activity(session, context = {}) {
   const unattended = session.unattended === true;
   // The agent's own words stay the row's (and a push's) detail when it asked something.
   const cardWait = ['waiting', 'blocked', 'landing'].includes(taskStatus) || Boolean(model.task.checkAfter || model.task.dependencies.length);
-  add(verdict?.verdict === 'asks' && !cardAsks && (live || cardWait), 'model-asks', 'model', 'needs-input', 'Needs an answer', 'question',
+  add(verdict?.verdict === 'asks' && !cardAsks && (live || (cardWait && model.task.cardCurrent)), 'model-asks', 'model', 'needs-input', 'Needs an answer', 'question',
     { kind: 'input', detail: text || verdict?.reason }, 'inferred');
   add(live && verdict?.verdict === 'done' && !durableWait && !cardAsks && !unattended, 'model-done', 'model', 'needs-input', 'Ready for next instruction',
     'next instruction', { kind: 'input', detail: verdict?.reason || 'Ready for your next instruction.' }, 'inferred');
@@ -114,9 +114,10 @@ function activity(session, context = {}) {
   add(ended && unattended && model.identity.interactive && !model.identity.reviewer, 'unattended-finished', 'conversation', 'idle', 'Finished', 'finished',
     { kind: 'finished', detail: text }, 'inferred');
   add(model.task.dependencies.length, 'task-dependency', 'registry', 'waiting', 'Waiting: dependency', model.task.dependencies.join(', '));
-  add(model.task.checkAfter, 'scheduled-check', 'registry', 'waiting', 'Waiting: scheduled check', model.task.checkAfter);
-  // Nothing will deliver it now, so the card's wait stops holding the session.
-  add(model.task.checkOverdue && ended, 'check-overdue', 'registry', 'needs-input', 'Check overdue', 'overdue check',
+  add(model.task.checkAfter && !model.task.checkOverdue, 'scheduled-check', 'registry', 'waiting', 'Waiting: scheduled check', model.task.checkAfter);
+  // Nothing will deliver it now, so the card's wait stops holding the session. Only
+  // the card's current session says so, not every conversation it ever linked.
+  add(model.task.checkOverdue && ended && model.task.cardCurrent, 'check-overdue', 'registry', 'needs-input', 'Check overdue', 'overdue check',
     { kind: 'input', detail: `The card's scheduled check (due ${String(model.task.checkOverdue).replace('T', ' ')}) was not delivered.` });
   add(taskStatus === 'waiting', 'task-waiting', 'registry', 'waiting', 'Waiting: dependency', 'dependency');
   add(taskStatus === 'landing', 'task-landing', 'registry', 'waiting', 'Waiting: land', 'land');

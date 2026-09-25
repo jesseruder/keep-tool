@@ -250,6 +250,14 @@ function removeDeliveryStamp(taskId) {
   }
 }
 
+// Whether the card's current check was delivered and is still being answered: a live
+// stamp for this check_after. Read-only and quiet, for status on every build.
+function checkInFlight(task, now = Date.now()) {
+  let stamp = null;
+  try { stamp = JSON.parse(fs.readFileSync(deliveryStampFile(task.id), 'utf8')); } catch { return false; }
+  return Boolean(stamp) && stamp.checkAfter === task.fm?.check_after && !stampExpired(stamp, now);
+}
+
 function readDeliveryStamp(task, now = Date.now()) {
   const file = deliveryStampFile(task.id);
   let stamp = null;
@@ -1431,7 +1439,7 @@ function startScheduler() {
 }
 
 module.exports = {
-  retryPending, startScheduler, schedulerTick, setOnChange, setDeliverer, setOpener, setEphemeralHost,
+  checkInFlight, retryPending, startScheduler, schedulerTick, setOnChange, setDeliverer, setOpener, setEphemeralHost,
   openFreshCheckSession, checksAccountId, checkBudget, budgetDeferralReason, noteBudgetDeferral,
   checksFallbackAccountId, recordBudgetDeferral, clearBudgetDeferral, noteStalledCheck,
   escalateBudgetDeferral, handleBudgetDeferral, MAX_FALLBACK_ATTEMPTS,

@@ -17,6 +17,8 @@ function resolve(session, model, now = Date.now()) {
   const task = model.task;
   const handoff = observedTurn > 0 && task.scheduledAt >= turnAt && task.scheduledAt <= now
     && task.scheduledBy === model.identity.conversationId && task.checkAfter && task.hasCheck
+    // An overdue check no longer holds the turn as waiting; a decision handoff stands.
+    && (!task.checkOverdue || task.scheduledIntent === 'needs-input')
     && task.scheduledFor === task.checkAfter && task.status !== 'done'
     && ['waiting', 'needs-input'].includes(task.scheduledIntent) ? task.scheduledIntent : null;
   const hook = ['waiting', 'needs-input'].includes(session.lifecycleStop?.intent)
@@ -30,7 +32,7 @@ function resolve(session, model, now = Date.now()) {
   const currentJobs = jobs.filter(j => j.kind !== 'service' && j.kind !== 'scheduled'
     && (j.current === true || !session.lastUserAt || j.startedAt >= session.lastUserAt));
   const concrete = model.background.pending || model.background.uncertain.length || model.background.agents.length || scheduled.length
-    || model.task.dependencies.length || model.task.checkAfter;
+    || model.task.dependencies.length || (model.task.checkAfter && !model.task.checkOverdue);
   const intentional = hint === 'waiting' && Boolean(concrete);
   // Legacy adapters without job identities still provide bounded live-job evidence.
   const jobWait = model.background.pending && (!session.backgroundJobs || session.backgroundJobs.caughtUp !== true || currentJobs.length > 0);
@@ -44,7 +46,7 @@ function resolve(session, model, now = Date.now()) {
   const currentJobWait = ownedCurrentJobs.length > 0;
   return { hint, waiting: intentional || (hint !== 'needs-input' && (jobWait || currentJobWait)),
     reason: handoff === 'waiting' ? 'scheduled check' : intentional && scheduled.length ? 'scheduled check' : intentional && model.task.dependencies.length ? 'dependency'
-      : intentional && model.task.checkAfter ? 'scheduled check' : model.background.agents.length ? 'subagent' : require('./session-status').waitReason(session.lastAssistantFull || session.lastAssistant),
+      : intentional && model.task.checkAfter && !model.task.checkOverdue ? 'scheduled check' : model.background.agents.length ? 'subagent' : require('./session-status').waitReason(session.lastAssistantFull || session.lastAssistant),
     scheduled: scheduled.map(j => ({ id: j.id, expiresAt: j.expiresAt })),
     handoff: handoff ? { taskId: task.id, checkAfter: task.checkAfter, at: task.scheduledAt, intent: handoff } : null,
     source: handoff && hint === handoff ? 'registry' : hook ? 'hook' : currentJobWait ? 'background' : 'conversation',

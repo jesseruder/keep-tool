@@ -37,18 +37,18 @@ function lastText(session) {
 }
 
 const livePane = (session) => (session.runtime ? session.runtime.state === 'live' : Boolean(session.pane) && session.alive !== false);
-// A card status that holds a paneless session in Running & waiting (session-status.js).
-const CARD_WAITS = ['waiting', 'blocked', 'landing'];
 
 // A finished turn with nothing explicit pending, in a live pane, or in a conversation
-// whose pane Keep no longer sees while its card holds it waiting: an ended check
-// session can still end on a question the card's schedule would otherwise hide.
+// whose pane Keep no longer sees on its card's behalf: an ended check session can
+// still end on a question the card's schedule would otherwise hide.
 function eligible(session) {
   if (!session || !['claude', 'codex'].includes(session.kind) || session.reviewer || session.agentName) return false;
   if (session.exited || session.state === 'exited' || session.deadMidTurn) return false;
   if (session.endedTurn !== true || session.toolRunning || session.pendingQuestion || session.pendingPlan) return false;
   if (session.runtime && ['exited', 'missing'].includes(session.runtime.state)) return false;
-  if (!livePane(session) && !CARD_WAITS.includes(session.taskStatus)) return false;
+  // Paneless: only the card's current session (serve.js stamps cardCurrent) on an
+  // open card, so an old conversation's stale ask never resurfaces.
+  if (!livePane(session) && !(session.cardCurrent === true && session.taskStatus && session.taskStatus !== 'done')) return false;
   return Boolean(lastText(session));
 }
 
@@ -139,4 +139,4 @@ function request(sessions, deps = {}) {
   }
 }
 
-module.exports = { INSTRUCTION, DEFAULT_MODEL, HOLD_MS, CARD_WAITS, enabled, modelFor, eligible, input, parse, verdictFor, attach, request };
+module.exports = { INSTRUCTION, DEFAULT_MODEL, HOLD_MS, enabled, modelFor, eligible, input, parse, verdictFor, attach, request };

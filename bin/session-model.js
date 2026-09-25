@@ -11,11 +11,16 @@ function normalize(session, context = {}) {
   const live = typeof context.live === 'boolean' ? context.live
     : runtime ? runtime.state === 'live' : Boolean(session.pane) && session.alive !== false;
   const ended = session.endedTurn === true || (session.endedTurn == null && session.notify?.type === 'complete');
-  // A check this far past its time was not delivered (a session on a node the daemon
-  // cannot reach, a refused launch): it no longer holds the session as waiting.
+  const cardDone = (task.status || session.taskStatus) === 'done';
+  // A check this far past its time with no live delivery was not delivered (a session
+  // on a node the daemon cannot reach, a refused launch): it no longer holds the
+  // session as waiting. check_after is the daemon's local time, as nowStamp writes it.
   const checkAt = Date.parse(task.check_after || '');
-  const checkOverdue = Number.isFinite(checkAt) && (task.status || session.taskStatus) !== 'done'
+  const checkOverdue = Number.isFinite(checkAt) && !cardDone && context.checkInFlight !== true
     && (context.now ?? Date.now()) - checkAt > CHECK_OVERDUE_MS;
+  // The session the card last linked, or the one that scheduled its check: the one
+  // whose rows speak for the card when its pane is gone or its check went missing.
+  const cardCurrent = Boolean(session.id) && ((task.sessions || []).at(-1)?.id === session.id || task.scheduled_by === session.id);
   const model = {
     version: 1,
     identity: { conversationId: session.id || null, agent: session.kind || null, interactive: live, reviewer: Boolean(session.reviewer) },
@@ -30,8 +35,8 @@ function normalize(session, context = {}) {
     requests: { question: Boolean(session.pendingQuestion), async: Boolean(session.pendingQuestion?.async),
       plan: Boolean(session.pendingPlan), notification: session.notify?.type || null },
     task: { id: session.taskId || null, status: task.status || session.taskStatus || null,
-      dependencies: context.dependencies || [], checkAfter: checkOverdue ? null : task.check_after || null,
-      checkOverdue: checkOverdue ? task.check_after : null, needs: Boolean(task.needs?.length),
+      dependencies: context.dependencies || [], checkAfter: cardDone ? null : task.check_after || null,
+      checkOverdue: checkOverdue ? task.check_after : null, cardCurrent, needs: Boolean(task.needs?.length),
       hasCheck: Boolean(task.check), scheduledBy: task.scheduled_by || null, scheduledAt: Date.parse(task.scheduled_at || '') || null,
       scheduledFor: task.scheduled_for || null, scheduledIntent: task.scheduled_intent || null },
   };

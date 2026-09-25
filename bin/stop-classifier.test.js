@@ -39,10 +39,12 @@ test('only a finished turn with nothing pending is classified, in a live pane or
     assert.equal(classifier.eligible({ ...base, ...change }), false, JSON.stringify(change));
   }
   assert.equal(classifier.eligible({ ...base, runtime: { state: 'live' } }), true);
-  // A conversation Keep sees no pane for counts only while its card holds it waiting.
+  // A conversation Keep sees no pane for counts only as its open card's current session.
   for (const state of ['unknown', 'external']) {
     assert.equal(classifier.eligible({ ...base, runtime: { state } }), false, state);
-    assert.equal(classifier.eligible({ ...base, runtime: { state }, taskStatus: 'waiting' }), true, state);
+    assert.equal(classifier.eligible({ ...base, runtime: { state }, taskStatus: 'waiting' }), false, `${state}: not the card's current session`);
+    assert.equal(classifier.eligible({ ...base, runtime: { state }, taskStatus: 'active', cardCurrent: true }), true, state);
+    assert.equal(classifier.eligible({ ...base, runtime: { state }, taskStatus: 'done', cardCurrent: true }), false, `${state}: done card`);
   }
 });
 
@@ -79,7 +81,7 @@ test('a missing verdict queues one on the configured model, logs it, and a chang
 
   classifier.request([base], { summarize, root, env: { KEEP_STOP_MODEL: 'claude-haiku-4-5-20251001' } });
   assert.equal(summarize.queued.at(-1).options.model, 'claude-haiku-4-5-20251001');
-  classifier.request([{ ...base, id: 'paneless', runtime: { state: 'unknown' }, taskStatus: 'waiting' }], { summarize, root, env });
+  classifier.request([{ ...base, id: 'paneless', runtime: { state: 'unknown' }, taskStatus: 'waiting', cardCurrent: true }], { summarize, root, env });
   assert.equal(summarize.queued.at(-1).options.priority, 1, 'a paneless conversation queues behind live ones');
   classifier.request([{ ...base, id: 's2' }], { summarize, root, env: { KEEP_STOP_CLASSIFIER: '0' } });
   assert.equal(summarize.queued.filter((job) => job.key === 'stop-s2').length, 0, 'KEEP_STOP_CLASSIFIER=0 turns it off');
@@ -122,9 +124,12 @@ test('an ASKS verdict beats a tracked job wait or poll, with the agent\'s words 
   assert.equal(attention(done).attentionLabel, 'Ready for next instruction');
 });
 
-test('an ASKS verdict counts for a conversation whose pane is gone; RUNNING and DONE do not', () => {
+test('an ASKS verdict counts for the card\'s current session whose pane is gone; RUNNING and DONE do not', () => {
   const gone = { ...base, pane: undefined, runtime: { state: 'unknown' }, taskStatus: 'waiting', lastAssistantFull: 'Decision for you: do you want to start building the usage UI? Reply on the card to start it.' };
-  const card = { task: { status: 'waiting', check_after: '2030-01-01T00:00' } };
+  const card = { task: { status: 'waiting', check_after: '2030-01-01T00:00', sessions: [{ id: 'older' }, { id: 's1' }] } };
+  const older = { task: { ...card.task, sessions: [{ id: 's1' }, { id: 'newer' }] } };
+  assert.equal(activity({ ...gone, stopVerdict: { verdict: 'asks', reason: 'x' } }, older).decision.rule, 'scheduled-check',
+    'an older conversation on the card does not resurface its ask');
   assert.equal(activity(gone, card).decision.rule, 'scheduled-check', 'without a verdict the card schedule holds it');
   assert.equal(activity({ ...gone, stopVerdict: { verdict: 'asks', reason: 'start the usage UI?' } }, card).decision.rule, 'model-asks');
   assert.equal(activity({ ...gone, stopVerdict: { verdict: 'done', reason: 'reported' } }, card).decision.rule, 'scheduled-check');
@@ -133,8 +138,12 @@ test('an ASKS verdict counts for a conversation whose pane is gone; RUNNING and 
 
 test('a card check overdue past its grace stops holding the session as waiting', () => {
   const at = Date.parse('2026-09-24T17:28');
-  const card = { task: { status: 'waiting', check_after: '2026-09-24T17:28' } };
+  const card = { task: { status: 'waiting', check_after: '2026-09-24T17:28', sessions: [{ id: 's1' }] } };
   const gone = { ...base, pane: undefined, runtime: { state: 'unknown' }, lastAssistantFull: 'Recorded the check results on the card.' };
+  assert.equal(activity(gone, { ...card, now: at + 20 * 60e3, checkInFlight: true }).decision.rule, 'scheduled-check',
+    'a delivered check still being answered is not overdue');
+  const other = { task: { ...card.task, sessions: [{ id: 's1' }, { id: 'newer' }] }, now: at + 20 * 60e3 };
+  assert.notEqual(activity(gone, other).decision.rule, 'check-overdue', 'only the card\'s current session reports it');
   assert.equal(activity(gone, { ...card, now: at + 10 * 60e3 }).decision.rule, 'scheduled-check', 'inside the grace it still waits');
   const overdue = activity(gone, { ...card, now: at + 20 * 60e3 });
   assert.equal(overdue.decision.rule, 'check-overdue');
@@ -144,6 +153,16 @@ test('a card check overdue past its grace stops holding the session as waiting',
   const live = { ...base, taskId: 't', lastAssistantFull: 'Scheduled a recovery check in 15 minutes.' };
   assert.equal(activity(live, { ...card, now: at + 20 * 60e3 }).state, 'needs-input');
   assert.equal(activity(live, { task: { ...card.task, status: 'done' }, now: at + 20 * 60e3 }).decision.rule !== 'check-overdue', true);
+  // A decision handoff the session scheduled stands after the check goes overdue.
+  const handoff = { ...live, turnStartedAt: at - 60e3, lastUserAt: at - 60e3 };
+  const decided = { task: { ...card.task, check: 'read it', scheduled_by: 's1', scheduled_at: new Date(at - 30e3).toISOString(),
+    scheduled_for: '2026-09-24T17:28', scheduled_intent: 'needs-input' }, now: at + 20 * 60e3 };
+  assert.equal(activity(handoff, decided).decision.rule, 'handoff-input');
+});
+
+test('a done card\'s leftover check never holds the session', () => {
+  const session = { ...base, lastAssistantFull: 'Waiting for the scheduled check.', stopVerdict: { verdict: 'done', reason: 'finished' } };
+  assert.equal(activity(session, { task: { status: 'done', check_after: '2030-01-01T00:00' } }).state, 'needs-input');
 });
 
 test('a question keeps the agent\'s own words as the detail a push shows', () => {
