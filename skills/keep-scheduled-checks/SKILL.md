@@ -46,6 +46,10 @@ daemon polls due recipes every minute.
   ends without recording anything, the card says so and comes due again.
 - Recurring checks are never delivered into a thread — they always go to a session Keep
   opens.
+- A card with `--agent <name>` runs its checks as that standing agent: the session shows
+  under Agents in the console (working on the card, idle when its pane is reaped) and
+  `keep agents emit <name> …` from it lands on that agent's feed. Use it for a daily
+  review or any recurring check Owner wants to see as an agent rather than a card.
 
 ## Say what a pass means
 

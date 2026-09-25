@@ -19,7 +19,7 @@ const {
   parseDependency, dependencyTarget, dependencyReason, dependencyStep, deploymentFact, isDoneLogHeading,
   dependencyResolved, dependencyInfo, unresolvedDependencyIds, dependencyPath, dependencyError, cleanNext,
   cleanCommits, requestedWaits, logMessage, structuredFieldTips, cleanProbe, cleanCheckEvery,
-  applyCheckPolicy, runDoneWhen, runProbe, checkinTask, postKeepApi, getKeepApi, openNeeds, addNeed,
+  applyCheckPolicy, applyCardAgent, runDoneWhen, runProbe, checkinTask, postKeepApi, getKeepApi, openNeeds, addNeed,
   meetNeeds, sweepNeeds, formatNeed, projectMatchesCwd,
 } = require('./keep-core.js');
 const fs = require('fs');
@@ -102,7 +102,7 @@ commands.usage = (argv) => {
 
 function addTask({
   title, kind, tags, project, checkAfter, check, status, note, experimentId, force, beforeSave,
-  onPass, checkEvery, probe,
+  onPass, checkEvery, probe, agent,
   withinLock = false, commit = true, linkSession = true, claim,
 }) {
   title = cleanScalar(title, 'title');
@@ -157,6 +157,7 @@ function addTask({
       if (cleaned) task.fm.probe = cleaned;
     }
     applyCheckPolicy(task, { onPass, checkEvery });
+    applyCardAgent(task, agent);
     // Session participation and ownership are separate. Internal daemon/reviewer
     // callers use linkSession:false to suppress both. A user-filed card still
     // records who created or scheduled it without moving that session's card link.
@@ -194,7 +195,7 @@ function shadowOwner() {
 }
 
 commands.add = (argv) => {
-  const o = parseArgs(argv, { kind: 'str', tag: 'list', project: 'str', 'check-after': 'str', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', status: 'str', 'experiment-id': 'str', plan: 'many', 'done-when': 'list', allow: 'list', until: 'str', autonomous: 'bool', file: 'bool', claim: 'bool', force: 'bool', 'as-owner': 'bool' });
+  const o = parseArgs(argv, { kind: 'str', tag: 'list', project: 'str', 'check-after': 'str', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', agent: 'str', status: 'str', 'experiment-id': 'str', plan: 'many', 'done-when': 'list', allow: 'list', until: 'str', autonomous: 'bool', file: 'bool', claim: 'bool', force: 'bool', 'as-owner': 'bool' });
   const title = o._.join(' ');
   if (!title.trim()) die('usage: keep add "title" [--kind k] [--file|--claim] [--tag t] [--project p] [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when] [--autonomous] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--status s] [--force] [--as-owner] [-m note]');
   // Creating a card with grants is granting. Gated exactly like `keep allow
@@ -250,7 +251,7 @@ commands.add = (argv) => {
     // hook all miss it. Refuse an unresolvable name rather than store it.
     title, kind: o.kind, tags: o.tag, project: o.project ? resolveProjectArg(o.project) : undefined,
     checkAfter: o['check-after'], check: o.check, status: o.status, note: o.m || forcedNote,
-    onPass: o['on-pass'], checkEvery: o['check-every'], probe: o.probe,
+    onPass: o['on-pass'], checkEvery: o['check-every'], probe: o.probe, agent: o.agent,
     experimentId: o['experiment-id'], force: o.force,
     claim: o.claim ? true : o.file ? false : undefined,
     beforeSave: (created) => {
@@ -454,15 +455,15 @@ function near(a, b) {
 
 
 commands.checkin = (argv) => {
-  const o = parseArgs(argv, { status: 'str', 'check-after': 'str', 'clear-check-after': 'bool', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', 'experiment-id': 'str', step: 'str', force: 'bool', next: 'str', commit: 'list', handoff: 'str' });
+  const o = parseArgs(argv, { status: 'str', 'check-after': 'str', 'clear-check-after': 'bool', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', agent: 'str', 'experiment-id': 'str', step: 'str', force: 'bool', next: 'str', commit: 'list', handoff: 'str' });
   const id = o._[0];
-  if (!id || !o.m) die('usage: keep checkin <id> -m "state + next step" [--next "text"] [--commit sha]... [--step <n|next>] [--status s] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--clear-check-after] [--handoff waiting|needs-input] [--force]');
+  if (!id || !o.m) die('usage: keep checkin <id> -m "state + next step" [--next "text"] [--commit sha]... [--step <n|next>] [--status s] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--agent <name>] [--clear-check-after] [--handoff waiting|needs-input] [--force]');
   const next = cleanNext(o.next);
   const commits = cleanCommits(o.commit);
   const task = checkinTask(id, {
     message: o.m, status: o.status, checkAfter: o['check-after'],
     clearCheckAfter: o['clear-check-after'], check: o.check, experimentId: o['experiment-id'],
-    onPass: o['on-pass'], checkEvery: o['check-every'], probe: o.probe,
+    onPass: o['on-pass'], checkEvery: o['check-every'], probe: o.probe, agent: o.agent,
     step: o.step, force: o.force, next, commits, handoff: o.handoff,
   });
   structuredFieldTips(o.m, next, commits);
@@ -1436,6 +1437,7 @@ commands.show = (argv) => {
     console.log(`  on pass: ${f.check_on_pass === 'rearm' ? `re-arm every ${f.check_every}` : f.check_on_pass}`);
   }
   if (f.probe) console.log(`  probe: ${f.probe}`);
+  if (f.agent) console.log(`  agent: ${f.agent}  (its checks run as this agent; keep agents)`);
   if (f.sessions && f.sessions.length) {
     const s = f.sessions[f.sessions.length - 1];
     console.log(`  last session: ${sessionNumbers.named(s.id, { root: ROOT })} (${s.at})  →  ${resumeCommand(s)}`);

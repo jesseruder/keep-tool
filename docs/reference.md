@@ -253,8 +253,8 @@ from the third keystroke on, so the first few characters on a pane arrive unpred
 ```
 keep add "title" [--kind task|experiment|idea|chore|bug] [--file|--claim] [--tag t]… [--project p]
                  [--plan "step"…] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review]
-                 [--check-every +7d] [--probe "cmd"] [--status s] [-m note]
-keep checkin <id> -m "state + next step" [--next "text"] [--commit <sha>]... [--step <n|next>] [--status s] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--clear-check-after] [--handoff waiting|needs-input]
+                 [--check-every +7d] [--probe "cmd"] [--agent <name>] [--status s] [-m note]
+keep checkin <id> -m "state + next step" [--next "text"] [--commit <sha>]... [--step <n|next>] [--status s] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--agent <name>] [--clear-check-after] [--handoff waiting|needs-input]
 keep probe <id>
 keep plan <id> [--set "step"… | --add "text" | --insert <n> "text" | --remove <n>
                 | --done <n> | --start <n> | --undo <n>]
@@ -2042,7 +2042,13 @@ An agent is a standing worker with a name, a recipe and a feed. Sessions come an
 underneath it: the record says who the agent is and which session is currently carrying
 it, so a restart, a compaction or an account handoff changes the session and leaves the
 agent alone. The fleet reviewer is the first agent; the incident-responder areas are the
-next.
+next. A card can name one too: `keep add … --agent <name>` (or `keep checkin --agent
+<name>`, `--agent ""` to clear) writes `agent:` into its frontmatter, and the scheduler
+then runs the card's checks as that agent — the record is created before the first
+session (`role: scheduled check`), the pane carries `agentName`, the record shows the
+session and `working` on the card while the check runs and `idle` once its pane is
+reaped, and the session's `keep agents emit <name>` lands on the agent's feed. The
+daily Redash review (`docs/agents/redash-daily.md`, agent `redash-daily`) is one.
 
 ### Records
 

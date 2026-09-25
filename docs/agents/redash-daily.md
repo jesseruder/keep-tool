@@ -12,9 +12,11 @@ This file is the recipe. The card's own check-ins are your memory: nothing else 
 between sessions, so read them before the data and write the day's findings there after.
 
 The card is a recurring check: created with `--check "<pointer to this file>"`,
-`--check-after <first morning>T07:30` and `--check-every +1d`, which makes it a `rearm`
-card, so every run goes to a fresh session rather than into a thread that remembers
-yesterday. The delivered message will tell you to re-arm with `--check-after +1d`; use
+`--check-after <first morning>T07:30`, `--check-every +1d` and `--agent redash-daily`,
+which makes it a `rearm` card, so every run goes to a fresh session rather than into a
+thread that remembers yesterday, and runs that session as the standing agent
+`redash-daily`: your row under Agents in Owner's console, whose feed is where your
+morning lands (below). The delivered message will tell you to re-arm with `--check-after +1d`; use
 the fixed `<tomorrow>T07:30` below instead, so the run does not drift later every day.
 
 ## What you read, and how
@@ -133,11 +135,25 @@ Known: <carried list, or none>." --check-after <tomorrow>T07:30
 `--check-after` is tomorrow's date at 07:30 in the registry timezone, written out
 (`2026-01-02T07:30`), so the run does not drift later every day.
 
-Add `--handoff needs-input` only when Owner has to act today: a metric down by a third
-or more with a cause that needs a human (a broken release, a pipeline that stopped, a
-partner surface dark), or a data source that stopped updating. That raises a real alert,
-so it is for something he would want to be woken for, not for a trend. A quiet day is
-recorded too: "quiet" is a result, and the next morning depends on seeing it.
+Then put the morning on your feed, which is what Owner's console shows on your row:
+
+```
+keep agents emit redash-daily --kind reported --card <card> -m "<the one-line verdict>"
+```
+
+Add `--badge` when something moved, so the row lights up only on a morning worth a
+look; a quiet morning is on the feed without a badge. When Owner has to act today — a
+metric down by a third or more with a cause that needs a human (a broken release, a
+pipeline that stopped, a partner surface dark), or a data source that stopped updating —
+emit it as a needs-you instead, and add `--handoff needs-input` to the check-in:
+
+```
+keep agents emit redash-daily --kind needs-you --needs-you --card <card> -m "<what and why, one line>"
+```
+
+That raises a real alert and a row in his Waiting on you list, so it is for something he
+would want to be woken for, not for a trend. A quiet day is recorded too: "quiet" is a
+result, and the next morning depends on seeing it.
 
 If the MCP is not attached or a query fails, say exactly which and check in with what you
 did get, then re-arm as usual: the delivered message says to record a failure "with the

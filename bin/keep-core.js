@@ -1605,9 +1605,19 @@ function guardBlocked(task, status, force) {
   throw error;
 }
 
+// `agent:` on a card names the standing agent its scheduled checks run as (runs.js
+// cardAgent): a usable agent name, or '' to clear it.
+function applyCardAgent(task, agent) {
+  if (agent === undefined) return;
+  const name = String(agent).trim();
+  if (!name) { delete task.fm.agent; return; }
+  if (!require('./agents.js').validName(name)) die(`--agent must be a usable agent name (lowercase letters, digits and dashes): ${name}`);
+  task.fm.agent = name;
+}
+
 function checkinTask(id, {
   message, status, checkAfter, clearCheckAfter, check, heading, experimentId, step,
-  onPass, checkEvery, probe,
+  onPass, checkEvery, probe, agent,
   linkSession = true, commitLabel, force, withinLock = false, commit = true, dependencyWait = false,
   next, commits, handoff, expectStatus,
 }) {
@@ -1676,6 +1686,7 @@ function checkinTask(id, {
       else delete task.fm.probe;
     }
     applyCheckPolicy(task, { onPass, checkEvery });
+    applyCardAgent(task, agent);
     if (handoff && (!task.fm.check_after || !task.fm.check)) die('--handoff needs a scheduled check with a recipe');
     if (experimentId !== undefined) task.fm.experiment_id = experimentId;
     if (status === 'waiting' && !task.fm.check_after && !dependencyWait
@@ -1906,7 +1917,7 @@ module.exports = {
   UNCONFIRMED_DEPLOYMENT_LINE, deploymentFact, isDoneLogHeading, dependencyResolved, sameCommit,
   dependencyInfo, unresolvedDependencyIds, dependencyPath, dependencyError, cleanNext, cleanCommits,
   WAIT_STATUSES, waitStatuses, requestedWaits, logMessage, structuredFieldTips, cleanProbe, cleanCheckEvery,
-  applyCheckPolicy, runShellGate, runDoneWhen, runProbe, verifyStepBeforeLock, AWAIT_PROSE_RE,
+  applyCheckPolicy, applyCardAgent, runShellGate, runDoneWhen, runProbe, verifyStepBeforeLock, AWAIT_PROSE_RE,
   AWAIT_ALLOWED_RE, guardReviewProse, guardLanding, guardBlocked, checkinTask, postKeepApi, getKeepApi,
   ENV_NAME_RE, openNeeds, addNeed, meetNeeds, sweepNeeds, formatNeed, projectMatchesCwd,
 };

@@ -407,6 +407,13 @@ function grantReopen(taskId, today) {
   return true;
 }
 
+// The agent a card's checks run as: `agent:` in its frontmatter, when it is a usable
+// agent name. Empty for the ordinary card.
+function cardAgent(task) {
+  const name = task && task.fm && typeof task.fm.agent === 'string' ? task.fm.agent.trim() : '';
+  return name && require('./agents.js').validName(name) ? name : '';
+}
+
 // The account a scheduled check spends against: the automation pool's pick for the
 // `checks` purpose (`automationAccounts.checks` is a preference, like every other
 // purpose since the pool). A spent pool names its best member all the same, so the
@@ -696,6 +703,21 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
   // the tick it took it from, and to no other.
   const reservedIn = allowanceTick;
   if (enforce) freshOpensThisTick += 1;
+  // A card that names its agent runs its check as a standing agent: the record
+  // exists before the session does (an emit for a name with no record is dropped),
+  // the opener stamps the pane with the name, and the record then carries the
+  // session so the agent's row under Agents shows it working on this card.
+  const agentName = (opts.cardAgent || cardAgent)(task);
+  const agentApi = opts.agents || require('./agents.js');
+  if (agentName) {
+    try {
+      agentApi.ensure(agentName, {
+        role: 'scheduled check', project: task.fm.project || '', card: task.id,
+      }, { root: opts.root || keep.ROOT });
+    } catch (error) {
+      process.stderr.write(`keep runs: could not create the agent record ${agentName} for ${task.id}: ${error.message}\n`);
+    }
+  }
   let opened;
   try {
     opened = await open({
@@ -704,6 +726,7 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
       agent: 'claude',
       ...(accountId ? { accountId } : {}),
       ...(CHECK_MODEL ? { model: CHECK_MODEL } : {}),
+      ...(agentName ? { agentName } : {}),
       message: checkDeliveryMessage(task, { probe: opts.probe }),
     }, {});
   } catch (error) {
@@ -712,6 +735,17 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
   }
   if (!enforce) freshOpensThisTick += 1;
   if (enforce) markDay('opened', task.id, today);
+  if (agentName && opened && opened.sessionId) {
+    try {
+      agentApi.writeRecord(agentName, {
+        session: { id: opened.sessionId, pane: opened.pane || '', startedAt: Date.now() },
+        lifecycle: 'working', card: task.id,
+      }, { root: opts.root || keep.ROOT });
+      agentApi.flushCommits(opts.root || keep.ROOT);
+    } catch (error) {
+      process.stderr.write(`keep runs: could not record the session on agent ${agentName}: ${error.message}\n`);
+    }
+  }
   // A check that ran is not deferred any more, whichever path opened it — the
   // scheduler, a probe escalation, `keep verify`, or the fallback account. Clearing
   // only on the scheduler's path left a probe card carrying its old fallback attempts
@@ -913,6 +947,21 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
     closed.push(pane.id);
     process.stderr.write(`keep runs: closed the ${label}: ${decision.reason}\n`);
     if (!decision.checkedIn) releaseUnfinishedCheck(pane.meta.card, sessionId, today, host.checkinTask ? host : keep);
+    // A check that ran as an agent is idle again once its pane is gone; the record
+    // keeps the session it ran as, for the log, and drops the card it was on.
+    const agentName = typeof pane.meta.agentName === 'string' ? pane.meta.agentName : '';
+    if (agentName) {
+      try {
+        const agentApi = host.agents || require('./agents.js');
+        const record = agentApi.readRecord(agentName);
+        if (record && record.session && record.session.id === sessionId) {
+          agentApi.writeRecord(agentName, { lifecycle: 'idle', card: '' });
+          agentApi.flushCommits();
+        }
+      } catch (e) {
+        process.stderr.write(`keep runs: could not idle agent ${agentName} after closing its pane: ${e.message}\n`);
+      }
+    }
   }
   return closed;
 }

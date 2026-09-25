@@ -15124,8 +15124,15 @@ function openCheckSession(body, openDeps) {
   // check runs the card's recipe, is delivered and reaped from here, and must not
   // land on another machine merely because the card's last session did.
   const open = (openDeps && openDeps.openSession) || openSession;
-  return open({ ...body, node: nodes.daemonNode((openDeps || {}).env || process.env) },
-    { ...openDeps, launchMeta: { ephemeral: 'check' } });
+  // A card that names its agent (`agent:` in its frontmatter, runs.js) opens the
+  // check as that agent: the pane carries `agentName`, so the session is the agent's
+  // (its row under Agents, no "Waiting on you" slot of its own) and its `keep agents
+  // emit` lands on that feed. The scheduler still stamps `ephemeral: 'check'` so
+  // its sweep reaps the pane.
+  const { agentName, ...rest } = body || {};
+  const named = typeof agentName === 'string' && agents.validName(agentName) ? agentName : '';
+  return open({ ...rest, node: nodes.daemonNode((openDeps || {}).env || process.env) },
+    { ...openDeps, launchMeta: { ephemeral: 'check', ...(named ? { agentName: named } : {}) } });
 }
 
 // `keep verify <id>` and the console's "Run check now": run a card's check recipe now

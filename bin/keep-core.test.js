@@ -125,3 +125,15 @@ test('a moved session keeps its place on its card: only the entry\'s node change
     assert.throws(() => keep.relinkSessionNode('moving-card', 'sid-moving', 'AWS 1', scope), /invalid node name/);
   } finally { fs.rmSync(other, { recursive: true, force: true }); }
 });
+
+test('a card names the agent its checks run as, and only a usable name is accepted', () => {
+  const task = { id: 'daily-review', fm: { title: 'Daily review', status: 'waiting' } };
+  keep.applyCardAgent(task, undefined);
+  assert.equal(task.fm.agent, undefined, 'an unset flag leaves the card alone');
+  keep.applyCardAgent(task, ' redash-daily ');
+  assert.equal(task.fm.agent, 'redash-daily');
+  assert.throws(() => keep.applyCardAgent(task, 'Not A Name'), /usable agent name/);
+  assert.equal(task.fm.agent, 'redash-daily', 'a refused name changes nothing');
+  keep.applyCardAgent(task, '');
+  assert.equal(task.fm.agent, undefined, 'an empty value clears it');
+});

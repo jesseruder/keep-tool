@@ -472,6 +472,66 @@ test('cards already noticed today do not consume the tick quota', () => {
   } finally { _resetSchedulerState(); }
 });
 
+test('a card that names its agent opens its check as that agent and records the session', async () => {
+  _resetSchedulerState();
+  try {
+    const bodies = [];
+    const calls = [];
+    const agents = {
+      ensure: (name, fields) => { calls.push(['ensure', name, fields]); return { name }; },
+      writeRecord: (name, patch) => { calls.push(['write', name, patch]); return { name, ...patch }; },
+      flushCommits: () => { calls.push(['flush']); return true; },
+    };
+    const open = async (body) => { bodies.push(body); return { ok: true, sessionId: 'sid-agent', pane: 'p-agent' }; };
+    const refusal = () => null;
+    const task = card({ agent: 'redash-daily', project: '~/castle/ghost-server' });
+    const outcome = await openFreshCheckSession(task, { today: '2026-09-25', open, refusal, agents });
+    assert.equal(outcome.skipped, undefined);
+    assert.equal(bodies[0].agentName, 'redash-daily', 'the opener is told whose session this is');
+    assert.deepEqual(calls[0], ['ensure', 'redash-daily', { role: 'scheduled check', project: '~/castle/ghost-server', card: 'some-card' }],
+      'the record exists before the session, so its first emit is not dropped');
+    assert.equal(calls[1][0], 'write');
+    assert.equal(calls[1][2].session.id, 'sid-agent');
+    assert.equal(calls[1][2].session.pane, 'p-agent');
+    assert.equal(calls[1][2].lifecycle, 'working');
+    assert.equal(calls[1][2].card, 'some-card');
+    assert.deepEqual(calls[2], ['flush']);
+
+    // An ordinary card, or an unusable name, opens as before with no record touched.
+    calls.length = 0; bodies.length = 0;
+    _resetSchedulerState();
+    await openFreshCheckSession(card({ agent: 'Not A Name' }), { today: '2026-09-25', open, refusal, agents });
+    assert.equal(bodies[0].agentName, undefined);
+    assert.deepEqual(calls, []);
+  } finally { _resetSchedulerState(); }
+});
+
+test('the sweep idles an agent whose check pane it closed', async () => {
+  const written = [];
+  const records = { 'redash-daily': { name: 'redash-daily', session: { id: 'sid-agent' } } };
+  const now = 1_000_000 + 5 * 3600e3;
+  const result = await sweepEphemeralPanes({
+    listPanes: async () => [
+      ephemeralPane({ id: 'agent-pane', meta: { card: null, sessionId: 'sid-agent', agentName: 'redash-daily' } }),
+      ephemeralPane({ id: 'other-pane', meta: { card: null, sessionId: 'sid-other', agentName: 'somebody-else' } }),
+    ],
+    sessions: async () => [
+      { id: 'sid-agent', endedTurn: true, mtime: 1_000_000 },
+      { id: 'sid-other', endedTurn: true, mtime: 1_000_000 },
+    ],
+    closePane: async () => {},
+    agents: {
+      readRecord: (name) => records[name] || null,
+      writeRecord: (name, patch) => { written.push([name, patch]); },
+      flushCommits: () => true,
+    },
+  }, now);
+  assert.deepEqual(result.sort(), ['agent-pane', 'other-pane']);
+  // Only the record that still names this session is idled; a record already carrying
+  // a newer session (or none) is left alone.
+  assert.deepEqual(written, [['redash-daily', { lifecycle: 'idle', card: '' }]]);
+});
+
 test('the per-day and per-tick allowances survive a restart, and verify ignores them', async () => {
   _resetSchedulerState();
   try {
