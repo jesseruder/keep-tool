@@ -1258,6 +1258,9 @@ function createHost(options = {}) {
           // updateSelf: this host answers `update-self` (bin/node-update.js), a
           // fast-forward of its own keep-tool checkout that `keep nodes update` asks for.
           updateSelf: 1,
+          // browserView: this host answers `browser-view` (bin/browser-view-host.js), a
+          // live view of a session's tabs in this machine's Browser Bridge browser.
+          browserView: 1,
           bootVersion: options.boot && options.boot.version || null,
           panes: panes.size, pid: process.pid, sock,
           residentTerminals: [...panes.values()].filter((pane) => pane.term).length,
@@ -1890,6 +1893,23 @@ function createHost(options = {}) {
       .finally(() => { transcriptsInFlight -= 1; });
   };
 
+  const runBrowserView = (connection, socket, request) => {
+    const respond = (response) => {
+      if (socket.destroyed) return;
+      connection.send(encodeFrame(response));
+    };
+    Promise.resolve()
+      .then(() => require('./browser-view-host.js').handle(connection, request, {
+        env,
+        send: (frame) => { if (!socket.destroyed) connection.send(encodeFrame(frame)); },
+        backlog: () => socket.writableLength,
+      }))
+      .then((result) => respond(replyFrame(request.id, result)), (error) => {
+        respond({ ok: false, id: request.id, error: error.message });
+      })
+      .catch(() => {});
+  };
+
   const acceptConnection = (socket, transport) => {
     const remote = transport === 'tcp' ? String(socket.remoteAddress || 'unknown') : 'unix';
     // The unix socket is reachable only by this account, so it stays token-free;
@@ -1968,6 +1988,12 @@ function createHost(options = {}) {
         runInventory(connection, socket, request);
         return;
       }
+      // A live view of a session's browser tabs streams frames for as long as it is
+      // open, and its input must not queue behind a pane's screen read.
+      if (request && typeof request === 'object' && request.type === 'browser-view') {
+        runBrowserView(connection, socket, request);
+        return;
+      }
       connection.queue = connection.queue.then(async () => {
         let response;
         let after;
@@ -1993,6 +2019,7 @@ function createHost(options = {}) {
       if (helloTimer) { clearTimeout(helloTimer); helloTimer = null; }
       connections.delete(connection);
       detachConnection(connection, handingOff, true);
+      if (connection.browserViews) require('./browser-view-host.js').closeAll(connection);
     });
   };
 

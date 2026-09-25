@@ -274,6 +274,7 @@ function consoleFixture() {
     hostStatus: { ok: true },
     nodes: [{ name: 'main', daemon: true, capabilities: [], ok: true }],
     secretRequests: [],
+    browserViews: [],
   };
 }
 
@@ -287,7 +288,7 @@ test('console state keeps only the top-level fields the console renders', () => 
   const expectedKeys = [
     'generatedAt', 'shadowDecisions', 'scopes', 'projectCatalog', 'restarts', 'tasks', 'sessions',
     'attention', 'setAside', 'notifications', 'reminders', 'limitResume', 'health', 'usage',
-    'reviewQueue', 'accounts', 'handoffs', 'handoffQueue', 'review', 'agents', 'panes', 'hostStatus', 'nodes', 'secretRequests',
+    'reviewQueue', 'accounts', 'handoffs', 'handoffQueue', 'review', 'agents', 'panes', 'hostStatus', 'nodes', 'secretRequests', 'browserViews',
   ];
   assert.deepEqual(Object.keys(projected).sort(), [...expectedKeys].sort(),
     'exactly the fields the console renders, and the fixture publishes every one of them');

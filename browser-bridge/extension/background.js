@@ -18,11 +18,13 @@ import {
   withSessionLock,
 } from "./lib/sessions.js";
 import { handlerFor } from "./tools/index.js";
+import { createViewerHandlers } from "./lib/viewer.js";
 
 const KEEPALIVE_ALARM = "browser-bridge-keepalive";
 const BLANK_URLS = new Set(["about:blank", "about:newtab", "chrome://newtab/", "edge://newtab/", ""]);
 
 installListeners();
+const viewer = createViewerHandlers();
 
 // Edge kills the host whenever the worker sleeps, so a disconnect is routine: retry
 // quickly at first, then back off so a machine with no installed host is not woken
@@ -45,7 +47,11 @@ const bridge = new NativeBridge({
   onRequest: handleRequest,
   onStatus: (status) => {
     if (status.connected) reconnectAttempt = 0;
-    else scheduleReconnect();
+    else {
+      // Every live view was carried by the host that just went away.
+      viewer.stopAll("the native host disconnected").catch(() => {});
+      scheduleReconnect();
+    }
   },
 });
 
@@ -57,6 +63,10 @@ async function handleRequest(message, generation) {
   }
   if (message.method === "session_closed") {
     await closeSession(message.params?.sessionKey);
+    return;
+  }
+  if (message.method?.startsWith("viewer_")) {
+    await handleViewerRequest(message, generation);
     return;
   }
   if (typeof message.id !== "string") return;
@@ -95,6 +105,38 @@ async function handleRequest(message, generation) {
     });
   }
 }
+
+/**
+ * A live view from the Keep console. The host forwards these only from a client that
+ * proved it holds the daemon token, and names the viewer; there is no session behind it
+ * and nothing here touches session state. A viewer_stop may come without an id, when the
+ * host tears down a client that went away.
+ */
+async function handleViewerRequest(message, generation) {
+  const handler = VIEWER_METHODS.has(message.method) ? viewer[message.method] : null;
+  const reply = (payload) => {
+    if (typeof message.id === "string") bridge.sendFor(generation, payload);
+  };
+  if (!handler) {
+    reply({ id: message.id, ok: false, error: { message: `Unknown method: ${message.method}` } });
+    return;
+  }
+  try {
+    const result = await handler(message.params ?? {}, (event) => bridge.sendFor(generation, event));
+    reply({ id: message.id, ok: true, result: result ?? { ok: true } });
+  } catch (error) {
+    reply({ id: message.id, ok: false, error: { message: String(error?.message ?? error) } });
+  }
+}
+
+const VIEWER_METHODS = new Set([
+  "viewer_tabs",
+  "viewer_start",
+  "viewer_ack",
+  "viewer_input",
+  "viewer_navigate",
+  "viewer_stop",
+]);
 
 /**
  * The session's stored record, refreshed from what the host told us and taken back out

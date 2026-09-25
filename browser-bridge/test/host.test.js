@@ -438,3 +438,81 @@ test("a big reply is chunked over the native port and still reaches the client w
   assert.equal(reply.ok, true);
   assert.equal(reply.result.image.length, image.length);
 });
+
+// --- viewers ---------------------------------------------------------------
+
+function writeDaemonToken(dir, token = "viewer-test-token") {
+  fs.writeFileSync(path.join(dir, "daemon.json"), JSON.stringify({ port: 0, token }), { mode: 0o600 });
+  return token;
+}
+
+async function viewerHello(socketFile, token, id = "vh") {
+  const client = await connect(socketFile);
+  client.send({ id, method: "hello", params: { viewer: true, token, name: "console" } });
+  return { client, reply: await client.reply(id) };
+}
+
+test("a viewer hello needs the daemon token", async (t) => {
+  const { socketFile, dir } = await startHost(t);
+  writeDaemonToken(dir);
+  const { client, reply } = await viewerHello(socketFile, "not-the-token");
+  assert.equal(reply.ok, false);
+  assert.match(reply.error.message, /daemon token/);
+  await waitFor(() => client.closed, { label: "the refused viewer to be closed" });
+});
+
+test("a viewer reaches only viewer methods, and a session never reaches them", async (t) => {
+  const { socketFile, dir, extension } = await startHost(t);
+  const token = writeDaemonToken(dir);
+  const { client: viewer, reply } = await viewerHello(socketFile, token);
+  assert.equal(reply.ok, true);
+
+  viewer.send({ id: "r1", method: "read_page", params: { tabId: 1 } });
+  assert.match((await viewer.reply("r1")).error.message, /Unknown method: read_page/);
+
+  const session = await connect(socketFile);
+  session.send({ id: "h", method: "hello", params: { sessionKey: "session-abc", name: "#1" } });
+  await session.reply("h");
+  session.send({ id: "s1", method: "viewer_tabs", params: { session: "#1" } });
+  assert.match((await session.reply("s1")).error.message, /Unknown method: viewer_tabs/);
+
+  viewer.send({ id: "t1", method: "viewer_tabs", params: { session: "#1" } });
+  const forwarded = await extension.waitFor((m) => m.method === "viewer_tabs", "the forwarded viewer_tabs");
+  assert.equal(forwarded.sessionKey, null);
+  extension.send({ id: forwarded.id, ok: true, result: { tabs: [] } });
+  assert.deepEqual((await viewer.reply("t1")).result, { tabs: [] });
+});
+
+test("frames go to the viewer that started them, under its own id", async (t) => {
+  const { socketFile, dir, extension } = await startHost(t);
+  const token = writeDaemonToken(dir);
+  const { client: one } = await viewerHello(socketFile, token, "h1");
+  const { client: two } = await viewerHello(socketFile, token, "h2");
+
+  one.send({ id: "s1", method: "viewer_start", params: { viewer: "v1", session: "#3", tabId: 9 } });
+  two.send({ id: "s2", method: "viewer_start", params: { viewer: "v1", session: "#3", tabId: 9 } });
+  const starts = await waitFor(() => {
+    const found = extension.messages.filter((m) => m.method === "viewer_start");
+    return found.length === 2 ? found : null;
+  }, { label: "both viewer_starts" });
+  const [wireOne, wireTwo] = starts.map((m) => m.params.viewer);
+  assert.notEqual(wireOne, wireTwo, "two clients' v1 must not collide");
+
+  extension.send({ event: "viewer_frame", viewer: wireTwo, tabId: 9, seq: 1, data: "AAAA", metadata: {} });
+  const frame = await waitFor(() => two.replies.find((m) => m.event === "viewer_frame"), { label: "the frame" });
+  assert.equal(frame.viewer, "v1");
+  assert.equal(frame.data, "AAAA");
+  await sleep(50);
+  assert.equal(one.replies.some((m) => m.event === "viewer_frame"), false);
+});
+
+test("a viewer that disconnects has its views stopped", async (t) => {
+  const { socketFile, dir, extension } = await startHost(t);
+  const token = writeDaemonToken(dir);
+  const { client } = await viewerHello(socketFile, token);
+  client.send({ id: "s1", method: "viewer_start", params: { viewer: "v1", session: "#3", tabId: 9 } });
+  const start = await extension.waitFor((m) => m.method === "viewer_start", "the viewer_start");
+  client.socket.destroy();
+  const stop = await extension.waitFor((m) => m.method === "viewer_stop", "the viewer_stop");
+  assert.equal(stop.params.viewer, start.params.viewer);
+});

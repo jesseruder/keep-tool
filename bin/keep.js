@@ -44,6 +44,7 @@ const stepGroup = require('./commands/step.js');
 const turnsGroup = require('./commands/turns.js');
 const watcherGroup = require('./commands/watcher.js');
 const secretGroup = require('./commands/secret.js');
+const browserGroup = require('./commands/browser.js');
 const {
   codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence,
   hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand,
@@ -4087,6 +4088,11 @@ function helpText() {
                           # 0 delivered, 1 declined, expired, cancelled or superseded, 124 still waiting
   keep secret cancel <id> [-m "why"]
                           # take back a request this session no longer needs; Owner stops seeing it
+  keep browser show [--tab <tabId>] [-m "what Owner should do there"]
+                          # a live view of this session's browser tabs over its terminal in the
+                          # console, to click and type into: a sign-in, a captcha, a page to see
+  keep browser hide | status
+                          # take the view back / whether Owner still has it open (exit 1 if not)
 ${stepUsage()}
   keep decide <type> [--card <id>] [--session <sid>] --send "<message>" -m "why"
                          # the reviewer records what it WOULD do; nothing is sent
@@ -4304,7 +4310,7 @@ commands.help = (argv) => {
 };
 
 // Each command group lives in its own file; their tables merge into this one.
-Object.assign(commands, hookGroup.commands, hostGroup.commands, nodesGroup.commands, reviewGroup.commands, stepGroup.commands, turnsGroup.commands, watcherGroup.commands, secretGroup.commands);
+Object.assign(commands, hookGroup.commands, hostGroup.commands, nodesGroup.commands, reviewGroup.commands, stepGroup.commands, turnsGroup.commands, watcherGroup.commands, secretGroup.commands, browserGroup.commands);
 
 // ---------- main / module ----------
 
@@ -4373,6 +4379,7 @@ const PANE_ONLY_COMMANDS = {
   doctor: true,
   setup: true, // hooks, skills and the shell block of this machine's own agents
   secret: true, // asks the daemon over its node API; the destination is checked here
+  browser: true, // asks the daemon over its node API; the view streams from this node's host
   nodes: (args) => !args.length || ['ls', 'usage'].includes(args[0]) || String(args[0]).startsWith('-'),
   node: (args) => args[0] === 'init',
   // The Codex companion runs on this machine, for the sessions here: the codex binary,
@@ -4539,7 +4546,7 @@ if (require.main === module) {
       // registry's, and it must start where there are no cards to read.
       // `node` joins them: `keep node init` runs on a machine that is being set up to
       // hold terminals for another one's registry, and has none of its own.
-      if (!fs.existsSync(TASKS) && !['help', 'hook', 'init', 'doctor', 'setup', 'review-eval', 'host', 'node', 'secret'].includes(cmd)) die(`no repo at ${ROOT} (set KEEP_DIR?)`);
+      if (!fs.existsSync(TASKS) && !['help', 'hook', 'init', 'doctor', 'setup', 'review-eval', 'host', 'node', 'secret', 'browser'].includes(cmd)) die(`no repo at ${ROOT} (set KEEP_DIR?)`);
       const fn = commands[cmd || 'list'];
       if (!fn) die(`unknown command "${cmd}" — try \`keep help\``);
       const helpArgs = [];

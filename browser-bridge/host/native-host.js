@@ -3,7 +3,7 @@
 // calls connectNative, and kills it when the worker dies. It owns the Unix socket and
 // multiplexes any number of MCP server processes onto the single native port.
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 
@@ -19,6 +19,7 @@ import {
   encodeLine,
   encodeNative,
   logPath,
+  readDaemonConfig,
   runtimeDir,
   socketPath,
 } from "./protocol.js";
@@ -38,6 +39,35 @@ const WIRE_NONCE = `${process.pid.toString(36)}${randomBytes(4).toString("hex")}
 
 /** Methods a socket client may ask us to forward: the tools, and nothing else. */
 const FORWARDABLE = new Set(TOOL_NAMES);
+
+/**
+ * What a viewer may ask for, and all it may ask for: a live view of a session's tabs for
+ * Owner, from the Keep console. A viewer is not a session and never gets the tools; a
+ * session never gets these.
+ */
+const VIEWER_METHODS = new Set([
+  "viewer_tabs",
+  "viewer_start",
+  "viewer_ack",
+  "viewer_input",
+  "viewer_navigate",
+  "viewer_stop",
+]);
+
+/**
+ * A viewer can watch and drive any session's tabs, so saying hello as one takes the
+ * daemon token: the same file that lets a process drive the browser at all.
+ */
+function viewerTokenAccepted(offered) {
+  const expected = readDaemonConfig()?.token;
+  if (typeof offered !== "string" || !offered || !expected) return false;
+  const digest = (text) => createHash("sha256").update(text).digest();
+  return timingSafeEqual(digest(offered), digest(expected));
+}
+
+/** Frames queue behind this much unsent data on a viewer's socket, then are dropped. */
+const MAX_VIEWER_BACKLOG_BYTES = 4 * 1024 * 1024;
+const viewerRoutes = new Map(); // wire viewer id -> {client, viewer}
 
 let logStream = null;
 
@@ -224,6 +254,59 @@ function forward(client, message) {
   }
 }
 
+/**
+ * A viewer names its views with its own ids; the extension sees them prefixed with this
+ * host and client, so two clients' "v1" never meet and events find their way back. A
+ * request without an id (an ack) is fire-and-forget.
+ */
+function forwardViewer(client, message) {
+  const params = { ...(message.params ?? {}) };
+  if (params.viewer !== undefined) {
+    if (typeof params.viewer !== "string" || !params.viewer || params.viewer.length > 100) {
+      replyToClient(client, message.id ?? null, false, { message: "viewer must be a short string" });
+      return;
+    }
+    const wireViewer = `v${WIRE_NONCE}_${client.id}_${params.viewer}`;
+    if (message.method === "viewer_start") viewerRoutes.set(wireViewer, { client, viewer: params.viewer });
+    if (message.method === "viewer_stop") viewerRoutes.delete(wireViewer);
+    params.viewer = wireViewer;
+  }
+  const forwarded = { method: message.method, params };
+  if (message.id === undefined || message.id === null) {
+    try {
+      sendToExtension(forwarded);
+    } catch (error) {
+      log("could not forward a viewer notification:", error.message);
+    }
+    return;
+  }
+  forward(client, { ...forwarded, id: message.id });
+}
+
+/**
+ * An event for one view goes to the client that started it and nobody else. A client
+ * too far behind loses the frame, and the extension is told it was taken, so the stream
+ * keeps going with the next picture instead of stalling on an ack that will never come.
+ */
+function routeViewerEvent(message) {
+  const route = viewerRoutes.get(message.viewer);
+  if (!route || route.client.socket.destroyed) return;
+  const { client } = route;
+  if (message.event === "viewer_frame" && client.socket.writableLength > MAX_VIEWER_BACKLOG_BYTES) {
+    sendToExtension({ method: "viewer_ack", params: { viewer: message.viewer } });
+    return;
+  }
+  if (message.event === "viewer_state" && message.state === "stopped") viewerRoutes.delete(message.viewer);
+  try {
+    client.socket.write(encodeLine({ ...message, viewer: route.viewer }));
+  } catch (error) {
+    log("could not deliver a viewer event:", error.message);
+    if (message.event === "viewer_frame") {
+      sendToExtension({ method: "viewer_ack", params: { viewer: message.viewer } });
+    }
+  }
+}
+
 /** Answer a client whose in-flight request can never complete, and forget it. */
 function failPending(wireId, message) {
   const entry = pending.get(wireId);
@@ -243,13 +326,26 @@ function onClientMessage(client, message) {
     replyToClient(client, null, false, { message: "id must be a short string or a number" });
     return;
   }
-  if (!client.sessionKey) {
+  if (!client.sessionKey && !client.viewer) {
     if (message.method !== "hello") {
       replyToClient(client, message.id ?? null, false, { message: "first message must be hello" });
       client.socket.end();
       return;
     }
     const params = message.params ?? {};
+    if (params.viewer === true) {
+      if (!viewerTokenAccepted(params.token)) {
+        log("refused a viewer hello: wrong or missing token");
+        replyToClient(client, message.id ?? null, false, { message: "a viewer hello needs the daemon token" });
+        client.socket.end();
+        return;
+      }
+      client.viewer = true;
+      client.name = typeof params.name === "string" ? params.name.slice(0, 80) : "viewer";
+      log("viewer hello from", client.name);
+      replyToClient(client, message.id ?? null, true, hostStatus());
+      return;
+    }
     if (typeof params.sessionKey !== "string" || params.sessionKey.length < 8) {
       replyToClient(client, message.id ?? null, false, { message: "hello needs a sessionKey" });
       client.socket.end();
@@ -278,6 +374,20 @@ function onClientMessage(client, message) {
     replyToClient(client, message.id, true, hostStatus());
     return;
   }
+  if (client.viewer) {
+    if (!VIEWER_METHODS.has(message.method)) {
+      replyToClient(client, message.id ?? null, false, { message: `Unknown method: ${message.method}` });
+      return;
+    }
+    if (!extensionReady) {
+      replyToClient(client, message.id ?? null, false, {
+        message: "the browser extension has not finished connecting",
+      });
+      return;
+    }
+    forwardViewer(client, message);
+    return;
+  }
   // session_hello, session_closed and ping are ours to send, never a client's: a client
   // that could name them could rename or evict another session's tab group.
   if (!FORWARDABLE.has(message.method)) {
@@ -299,6 +409,13 @@ function onClientClose(client) {
     if (entry.client === client) {
       clearTimeout(entry.timer);
       pending.delete(wireId);
+    }
+  }
+  for (const [wireViewer, route] of viewerRoutes) {
+    if (route.client !== client) continue;
+    viewerRoutes.delete(wireViewer);
+    if (extensionReady) {
+      sendToExtension({ method: "viewer_stop", params: { viewer: wireViewer, reason: "the viewer disconnected" } });
     }
   }
   if (!client.sessionKey) return;
@@ -331,6 +448,10 @@ function onExtensionMessage(raw) {
     log("extension ready", extensionVersion ?? "");
     // Clients that said hello before the port was up still need announcing.
     for (const client of clients.values()) announceSession(client);
+    return;
+  }
+  if (message.event === "viewer_frame" || message.event === "viewer_state") {
+    routeViewerEvent(message);
     return;
   }
   if (message.event === "pong" || message.event === "log") {
@@ -461,6 +582,7 @@ async function main() {
       id: nextClientId++,
       socket,
       sessionKey: null,
+      viewer: false,
       name: null,
       agent: null,
       account: null,

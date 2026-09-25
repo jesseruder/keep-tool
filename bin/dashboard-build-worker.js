@@ -22,6 +22,9 @@ parentPort.on('message', async (message) => {
       collectHealthErrors: healthErrors,
     });
     await addHostSessionState(state, { panes: input.hostPanes || [] });
+    // Sessions waiting on Owner to look at their browser tabs (bin/browser-view-requests.js),
+    // read here, off the daemon's main thread.
+    try { state.browserViews = require('./browser-view-requests.js').consoleRequests(require('./keep.js').ROOT); } catch { state.browserViews = []; }
     try { addStoppedSessionNodes(state); } catch {}
     parentPort.postMessage({ id, result: { state, backgroundTargets, summaryRequests, healthErrors } });
   } catch (error) {

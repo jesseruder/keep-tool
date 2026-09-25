@@ -2569,6 +2569,7 @@ const URGENT_DASHBOARD_MUTATIONS = new Set([
   '/api/resolve-portable-transfer', '/api/restart-daemon', '/api/restart-session', '/api/review-queue',
   '/api/reviewtick', '/api/run', '/api/send', '/api/session-keep-running', '/api/setaside', '/api/transfer-session',
   '/api/secrets/fulfill', '/api/secrets/decline',
+  '/api/browser-view/open', '/api/browser-view/close',
 ]);
 function urgentDashboardMutation(pathname) {
   return URGENT_DASHBOARD_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname)
@@ -17373,6 +17374,21 @@ function start(deps = {}) {
     onChange: () => broadcast(),
     // Normalised through parsePaneRef so `p` and `p@main` compare equal; the service
     // compares what it is handed the same way (samePane below).
+    sessionPane: (sessionId) => {
+      const row = (sessionSnapshot || []).find((session) => session && session.id === sessionId);
+      return row && row.pane ? String(row.pane) : null;
+    },
+    samePane: (a, b) => {
+      const left = nodes.parsePaneRef(a);
+      const right = nodes.parsePaneRef(b);
+      return left.node === right.node && left.paneId === right.paneId;
+    },
+  });
+  // A session asking Owner to look at its browser tabs (bin/browser-view-requests.js).
+  ctx.browserViewService = require('./browser-view-requests.js').createBrowserViewService({
+    root: keep.ROOT,
+    daemonNode: () => daemonNodeName(),
+    onChange: () => broadcast(),
     sessionPane: (sessionId) => {
       const row = (sessionSnapshot || []).find((session) => session && session.id === sessionId);
       return row && row.pane ? String(row.pane) : null;

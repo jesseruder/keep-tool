@@ -12,6 +12,7 @@ const { MOBILE_VIEWS, projectMobileState } = require('./mobile-state.js');
 const { sendStateJson } = require('./state-response.js');
 const { diffConsoleState } = require('../web/app/shared/state-delta.js');
 const { createTerminalBridge } = require('./terminal-bridge.js');
+const { createBrowserViewBridge, parseBrowserViewUrl } = require('./browser-view-bridge.js');
 const hostclient = require('./hostclient.js');
 
 const MAX_PROXY_IN_FLIGHT = 64;
@@ -88,11 +89,12 @@ function createUiRequestServer(options = {}) {
   // A pane ref carries the node it lives on, so the UI worker reaches another
   // machine's host the same way it reaches this one's.
   const daemonNode = require('./nodes.js').daemonNode();
-  const bridge = options.bridge || createTerminalBridge({
-    hostClient: (node) => (node && node !== daemonNode
-      ? hostclient.connect({ node, timeoutMs: options.hostConnectTimeoutMs })
-      : hostclient.connect({ sock: options.hostSock, timeoutMs: options.hostConnectTimeoutMs })),
-  });
+  const hostClientFor = (node) => (node && node !== daemonNode
+    ? hostclient.connect({ node, timeoutMs: options.hostConnectTimeoutMs })
+    : hostclient.connect({ sock: options.hostSock, timeoutMs: options.hostConnectTimeoutMs }));
+  const bridge = options.bridge || createTerminalBridge({ hostClient: hostClientFor });
+  // Live views of a session's browser tabs, on whichever machine runs its pane.
+  const browserViews = options.browserViews || createBrowserViewBridge({ hostClient: hostClientFor });
 
   // Started on the first ⌘F search, not with the worker: most consoles never search.
   let textSearch = null;
@@ -373,11 +375,21 @@ function createUiRequestServer(options = {}) {
   server.on('upgrade', (req, socket, head) => {
     let url;
     try { url = new URL(req.url, 'http://localhost'); } catch { socket.destroy(); return; }
+    const browserView = parseBrowserViewUrl(url);
     const match = url.pathname.match(/^\/ws\/pane\/([^/]+)$/);
-    if (!match) { socket.destroy(); return; }
+    if (!match && !browserView) { socket.destroy(); return; }
     if ((!authorized(req) && !sessionFor(req)) || !keepConsole.upgradeOriginAllowed(req, { token })) {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
       socket.destroy();
+      return;
+    }
+    if (browserView) {
+      if (browserView.error) {
+        socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      browserViews.handleUpgrade(req, socket, head, browserView);
       return;
     }
     let pane;
@@ -458,6 +470,7 @@ function createUiRequestServer(options = {}) {
       for (const res of clients) res.end();
       clients.clear();
       bridge.close();
+      browserViews.close();
       textSearch?.close();
       server.close(callback);
     },

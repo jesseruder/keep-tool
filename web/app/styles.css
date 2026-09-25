@@ -1058,3 +1058,40 @@ html.mobile .notification-preview { padding-inline: 14px; }
 .secret-drop.busy .sd-card { opacity: .75; }
 html.mobile .secret-drop { padding: 12px; }
 html.mobile .secret-drop .btn, html.mobile .secret-drop .sd-value, html.mobile .secret-drop .sd-reason { min-height: 44px; }
+
+/* Browser view (web/app/browser-view.js): a session's browser tabs, live, over its
+   terminal. Floats like Secret Drop so the pane never resizes; folded, it is a globe
+   button in the terminal's corner. */
+.browser-view { position: absolute; inset: 0 var(--bv-right, 0px) 0 0; z-index: 7; display: flex; padding: 10px; background: var(--backdrop); }
+.browser-view[hidden] { display: none; }
+.browser-view.folded { inset: 10px calc(var(--bv-right, 0px) + 14px) auto auto; padding: 0; background: none; }
+.secret-drop.folded:not([hidden]) ~ .browser-view.folded { top: 48px; }
+.browser-view .bv-card { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; border: 1px solid var(--accent); border-radius: 10px; background: var(--panel); box-shadow: var(--shadow); overflow: hidden; }
+.browser-view .bv-card[hidden] { display: none; }
+.browser-view .bv-bar { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--line); min-width: 0; }
+.browser-view .bv-icon { color: var(--accent); display: inline-flex; }
+.browser-view .bv-title { font-weight: 600; color: var(--text); white-space: nowrap; }
+.browser-view .bv-where { color: var(--muted); font-weight: 400; font-size: 12px; }
+.browser-view .bv-nav { display: inline-flex; gap: 2px; }
+.browser-view .bv-nav .btn { min-width: 28px; padding-inline: 6px; }
+.browser-view .bv-url { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.browser-view .bv-note { padding: 6px 10px; color: var(--text); background: var(--accent-soft); font-size: 12px; line-height: 1.4; white-space: pre-line; }
+.browser-view .bv-tabs { display: flex; gap: 4px; padding: 4px 8px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+.browser-view .bv-tabs[hidden] { display: none; }
+.browser-view .bv-tab { flex: 0 1 auto; max-width: 240px; padding: 3px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+.browser-view .bv-tab.on { border-color: var(--accent); color: var(--text); }
+.browser-view .bv-tab.popup { font-style: italic; }
+.browser-view .bv-screen { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; background: #000; outline: none; overflow: hidden; }
+.browser-view .bv-screen:focus-visible { box-shadow: inset 0 0 0 2px var(--focus); }
+.browser-view .bv-canvas { max-width: 100%; max-height: 100%; touch-action: none; cursor: default; image-rendering: auto; }
+.browser-view .bv-status { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); padding: 6px 12px; border-radius: 6px; background: var(--panel); color: var(--muted); font-size: 12px; pointer-events: none; }
+.browser-view .bv-status[hidden] { display: none; }
+.browser-view .bv-keys { position: absolute; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; resize: none; }
+.browser-view .bv-keyboard { display: none; }
+html.mobile .browser-view .bv-keyboard { display: inline-flex; }
+.browser-view .bv-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--accent); background: var(--panel); color: var(--accent); font: 12px var(--mono); cursor: pointer; box-shadow: var(--shadow); }
+.browser-view .bv-pill[hidden] { display: none; }
+.browser-view .bv-pill span { color: var(--text); }
+html.mobile .browser-view { padding: 4px; }
+html.mobile .browser-view .btn { min-height: 40px; }
+html.mobile .browser-view .bv-url { display: none; }

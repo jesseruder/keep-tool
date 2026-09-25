@@ -141,6 +141,36 @@ function routes(ctx) {
         return json(res, result.status, result.body);
       },
     },
+    // Browser views (bin/browser-view-requests.js). A session asks for one from its own
+    // machine; opening one only shows Owner a view over that session's pane, so the
+    // console may too. The console closes it; so may the session that asked.
+    {
+      method: 'POST',
+      path: '/api/browser-view/open',
+      allow: ['node', 'local', 'proxy', 'admin'],
+      handle: async ({ res, body, principal }) => {
+        const result = await ctx.browserViewService.open(principal, body);
+        return json(res, result.status, result.body);
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/browser-view/close',
+      allow: ['node', 'local', 'proxy', 'admin'],
+      handle: async ({ res, body, principal }) => {
+        const result = await ctx.browserViewService.close(principal, body);
+        return json(res, result.status, result.body);
+      },
+    },
+    {
+      method: 'GET',
+      path: '/api/browser-view',
+      allow: ['node', 'local', 'proxy', 'admin'],
+      handle: async ({ res, url }) => {
+        const result = await ctx.browserViewService.status(url.searchParams.get('session') || '');
+        return json(res, result.status, result.body);
+      },
+    },
     {
       // A Claude hook on a pane-only node, run by the daemon's own `keep hook`
       // against the session's transcript mirror (bin/hook-route.js).

@@ -190,6 +190,8 @@ const CONSOLE_STATE_KEYS = [
   'nodes',
   // Secrets agents are waiting on Owner to hand off (bin/secret-requests.js): metadata only.
   'secretRequests',
+  // Sessions asking Owner to look at their browser tabs (bin/browser-view-requests.js).
+  'browserViews',
 ];
 
 // An exited session is a list row and a transcript link; the console never reads

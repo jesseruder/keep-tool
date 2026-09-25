@@ -20,6 +20,7 @@ import { nodeBadgeHTML, remoteNode } from './node-badge.js';
 import { placeInbox } from './queue-inbox.js';
 import { runAction } from './action.js';
 import { syncSecretDrop } from './secret-drop.js';
+import { syncBrowserView } from './browser-view.js';
 
 // Agent name -> `{ events, seq, at, read, readAt, misses }`: the last page read for an
 // agent and what that read did. Only an agent that has been opened has one;
@@ -1073,6 +1074,8 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   // A secret this session asked Owner for: over its terminal, and only here. After the
   // agent log above, so the overlay knows how wide the terminal beside it is.
   syncSecretDrop(stage, ctx, item);
+  // A session asked Owner to look at its browser tabs: a live view over its terminal.
+  syncBrowserView(stage, ctx, item);
   const terminalHost = stage.querySelector('.stage-terminal');
   if (hasLivePane) {
     const focusKey = `${key}:${paneId}`;

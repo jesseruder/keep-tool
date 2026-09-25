@@ -26,6 +26,7 @@ function connectEndpoint(options = {}) {
     const attachments = new Map();
     const subscribers = new Set();
     const disconnectListeners = new Set();
+    const browserViews = new Map(); // view id -> event listener
     let nextId = 1;
     let connected = false;
     let closed = false;
@@ -57,6 +58,10 @@ function connectEndpoint(options = {}) {
       for (const listener of disconnectListeners) {
         try { listener(info); } catch {}
       }
+      for (const listener of browserViews.values()) {
+        try { listener({ event: 'viewer_state', state: 'closed', reason: 'the host connection closed' }); } catch {}
+      }
+      browserViews.clear();
       attachments.clear();
       subscribers.clear();
       disconnectListeners.clear();
@@ -73,6 +78,9 @@ function connectEndpoint(options = {}) {
         if (listener && listener.onExit) listener.onExit(frame.exitCode, frame.signal);
       } else if (frame.ev === 'pane') {
         for (const listener of subscribers) listener(frame);
+      } else if (frame.ev === 'browser') {
+        const listener = browserViews.get(frame.view);
+        if (listener) listener(frame.event || {});
       } else if (frame.ev === 'reload') {
         for (const listener of attachments.values()) {
           try { if (listener.onExit) listener.onExit({ reload: true }); } catch {}
@@ -212,10 +220,19 @@ function connectEndpoint(options = {}) {
       }
     };
 
+    // Events for one open browser view (bin/browser-view-host.js). The caller opens the
+    // view with request('browser-view', {op: 'open', view, session}) after this.
+    const onBrowserEvent = (view, listener) => {
+      if (typeof listener !== 'function') throw new Error('onBrowserEvent needs a callback');
+      browserViews.set(String(view), listener);
+      return { dispose: () => { if (browserViews.get(String(view)) === listener) browserViews.delete(String(view)); } };
+    };
+
     const close = () => {
       if (closed) return;
       intentionalClose = true;
       closed = true;
+      browserViews.clear();
       attachments.clear();
       subscribers.clear();
       disconnectListeners.clear();
@@ -234,7 +251,7 @@ function connectEndpoint(options = {}) {
       return { dispose: () => disconnectListeners.delete(listener) };
     };
 
-    const client = { sock, socket, request, attach, subscribe, onDisconnect, close };
+    const client = { sock, socket, request, attach, subscribe, onBrowserEvent, onDisconnect, close };
     connectTimer = setTimeout(() => {
       if (connected) return;
       const error = new Error(annotate('host connect timed out'));

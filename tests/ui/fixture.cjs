@@ -7,6 +7,9 @@ const path = require('node:path');
 const { WebSocketServer } = require('ws');
 const { consoleState, dashboardDetail } = require('../../bin/dashboard-state');
 
+// A 64x48 solid JPEG: what a browser view's screencast frame looks like on the wire.
+const BROWSER_FRAME = Buffer.from('/9j/4AAQSkZJRgABAQAAAAAAAAD/2wBDAA0JCgsKCA0LCgsODg0PEyAVExISEyccHhcgLikxMC4pLSwzOko+MzZGNywtQFdBRkxOUlNSMj5aYVpQYEpRUk//2wBDAQ4ODhMREyYVFSZPNS01T09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0//wAARCAAwAEADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAL/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFgEBAQEAAAAAAAAAAAAAAAAAAAIG/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AkBLNAAAAAAAAAAAAAAAAAAAAAAP/2Q==', 'base64');
+
 async function createFixture() {
   const root = path.resolve(__dirname, '../..');
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-ui-fixture-'));
@@ -53,8 +56,14 @@ async function createFixture() {
   state.reviewQueue = { items: [], counts: { 'needs-decision': 0, 'in-progress': 0, resolved: 0 } };
   // Secret handoff: pending requests the stage shows, and what a fulfil was handed.
   state.secretRequests = [];
+  // Browser views sessions asked Owner to look at (bin/browser-view-requests.js).
+  state.browserViews = [];
   const secretWrites = [];
   let secretRefusal = null;
+  let browserTabs = [
+    { id: 11, url: 'https://app.example.test/', title: 'App', active: true, popup: false },
+    { id: 12, url: 'https://accounts.example.test/signin', title: 'Sign in', active: false, popup: true, openerTabId: 11 },
+  ];
   const record = (event, detail = {}) => { events.push({ at: Date.now(), event, ...detail }); if (events.length > 5000) events.shift(); };
   const publish = () => { revision++; record('state', { revision, sessions: sessions.map(s => ({ id: s.id, state: s.state })) }); for (const client of clients) client.write('data: changed\n\n'); };
   function update(id, patch) { Object.assign(sessions.find(s => s.id === id), patch); publish(); }
@@ -383,6 +392,12 @@ async function createFixture() {
           state.secretRequests = state.secretRequests.filter(r => r !== request);
           json({ request: { ...request, status: 'delivered' } }); publish(); return;
         }
+        if (url.pathname === '/api/browser-view/close' && req.method === 'POST') {
+          record('browser-view-close', { id: input.id });
+          const before = state.browserViews.length;
+          state.browserViews = state.browserViews.filter(r => r.id !== input.id);
+          json({ closed: state.browserViews.length !== before }); publish(); return;
+        }
         if (url.pathname === '/api/secrets/decline' && req.method === 'POST') {
           const request = state.secretRequests.find(r => r.id === input.id && r.status === 'pending');
           if (!request) { json({ error: `no pending secret request ${input.id}` }, 409); return; }
@@ -404,6 +419,31 @@ async function createFixture() {
   const sockets = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url, 'http://fixture');
+    const browserPane = url.pathname.match(/^\/ws\/browser\/([^/]+)$/);
+    if (browserPane) {
+      // A browser view (bin/browser-view-bridge.js): one tab, and one solid-colour
+      // frame at the size the view asks for, every time it asks.
+      sockets.handleUpgrade(req, socket, head, client => {
+        const pane = decodeURIComponent(browserPane[1]);
+        record('browser', { pane, t: 'connect', session: url.searchParams.get('session') });
+        client.send(JSON.stringify({ t: 'open', node: null, session: `#${url.searchParams.get('session')}`, extensionConnected: true }));
+        client.send(JSON.stringify({ t: 'tabs', tabs: browserTabs }));
+        client.on('message', (bytes, binary) => {
+          if (binary) return;
+          const message = JSON.parse(bytes);
+          record('browser', { pane, ...message });
+          if (message.t === 'start') {
+            client.send(JSON.stringify({ t: 'started', tab: browserTabs.find(tab => tab.id === message.tabId) || null }));
+            const header = Buffer.from(JSON.stringify({ seq: 1, tabId: message.tabId, metadata: { deviceWidth: message.width, deviceHeight: message.height } }));
+            const length = Buffer.alloc(4);
+            length.writeUInt32BE(header.length, 0);
+            client.send(Buffer.concat([length, header, BROWSER_FRAME]));
+          }
+        });
+        client.on('close', () => record('browser', { pane, t: 'disconnect' }));
+      });
+      return;
+    }
     const pane = panes.find(p => `/ws/pane/${p.id}` === url.pathname);
     if (!pane || req.headers.origin && req.headers.origin !== `http://${req.headers.host}`) { socket.destroy(); return; }
     sockets.handleUpgrade(req, socket, head, client => {
@@ -428,6 +468,8 @@ async function createFixture() {
   return { url: `http://127.0.0.1:${server.address().port}`, events, state, portableTransfers, secretWrites, update, publish, churn,
     configure: options => {
       if ('secretRequests' in options) { state.secretRequests = options.secretRequests; publish(); }
+      if ('browserViews' in options) { state.browserViews = options.browserViews; publish(); }
+      if ('browserTabs' in options) browserTabs = options.browserTabs;
       if ('secretRefusal' in options) secretRefusal = options.secretRefusal;
       if ('closeDelay' in options) closeDelay = options.closeDelay;
       if ('closeFails' in options) closeFails = options.closeFails;
