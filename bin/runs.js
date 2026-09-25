@@ -1655,7 +1655,13 @@ async function schedulerTick() {
           const handled = await handleBudgetDeferral(t, outcome.reason, today, {
             quiet: deferralNotices >= MAX_DEFERRAL_NOTICES_PER_TICK,
             quietEscalation: escalations >= MAX_DEFERRAL_NOTICES_PER_TICK,
+            // The fallback open passes over a stuck home too, not resumes into it.
+            ...(abandonHome ? { abandonHome: true } : {}),
           });
+          // Passed over and then refused: the home gets its own streak again, so a
+          // home that goes idle meanwhile is offered the next check rather than
+          // skipped on every tick until the day's count resets.
+          if (abandonHome) deferred.count = 0;
           if (handled.escalated) { escalations += 1; onChange(); }
           else if (handled.noticed) deferralNotices += 1;
           continue;
@@ -1663,7 +1669,10 @@ async function schedulerTick() {
         // A card whose open already failed for good today reaches here with nothing
         // tried for it (no thread took the check either), so it is not this tick's work.
         if ((outcome.skipped === 'opened-today' || outcome.skipped === 'opened-within-interval') && givenUp.get(t.id) === today) didWork = workBefore;
-        if (outcome.skipped) continue;
+        if (outcome.skipped) {
+          if (abandonHome) deferred.count = 0; // as above, for any other refusal
+          continue;
+        }
         clearBudgetDeferral(t.id, today);
         // A card agent's busy streak that led here is over: its next due check starts
         // its own, rather than finding the limit already passed and abandoning the new
