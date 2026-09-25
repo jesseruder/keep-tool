@@ -5,6 +5,16 @@
 // lifetimes. Rebuild from current evidence; never feed a displayed label back in.
 const CHECK_OVERDUE_MS = 15 * 60e3;
 
+// A card's scheduled check as status sees it: null when there is none (or the card is
+// done), else its time and whether it went past its grace with no live delivery (a
+// session on a node the daemon cannot reach, a refused launch). check_after is the
+// daemon's local time, as nowStamp writes it.
+function cardCheck(task, { now = Date.now(), inFlight = false } = {}) {
+  if (!task || !task.check_after || task.status === 'done') return null;
+  const at = Date.parse(task.check_after);
+  return { at: task.check_after, overdue: Number.isFinite(at) && !inFlight && now - at > CHECK_OVERDUE_MS };
+}
+
 function normalize(session, context = {}) {
   const task = context.task?.fm || context.task || {};
   const runtime = session.runtime;
@@ -12,12 +22,8 @@ function normalize(session, context = {}) {
     : runtime ? runtime.state === 'live' : Boolean(session.pane) && session.alive !== false;
   const ended = session.endedTurn === true || (session.endedTurn == null && session.notify?.type === 'complete');
   const cardDone = (task.status || session.taskStatus) === 'done';
-  // A check this far past its time with no live delivery was not delivered (a session
-  // on a node the daemon cannot reach, a refused launch): it no longer holds the
-  // session as waiting. check_after is the daemon's local time, as nowStamp writes it.
-  const checkAt = Date.parse(task.check_after || '');
-  const checkOverdue = Number.isFinite(checkAt) && !cardDone && context.checkInFlight !== true
-    && (context.now ?? Date.now()) - checkAt > CHECK_OVERDUE_MS;
+  // An overdue check no longer holds the session as waiting (cardCheck above).
+  const checkOverdue = !cardDone && Boolean(cardCheck(task, { now: context.now ?? Date.now(), inFlight: context.checkInFlight === true })?.overdue);
   // One session speaks for the card in each role: its latest linked session for a
   // paneless final ask, and the session that scheduled its check (else the latest)
   // for a check that went missing. Older conversations on the card stay quiet.
@@ -78,4 +84,4 @@ function attachRuntime(sessions, panes = [], independentLive) {
   }
 }
 
-module.exports = { normalize, attachRuntime, CHECK_OVERDUE_MS };
+module.exports = { normalize, attachRuntime, cardCheck, CHECK_OVERDUE_MS };

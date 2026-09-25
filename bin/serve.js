@@ -13210,16 +13210,20 @@ function buildState(options = {}) {
     }
   }
   applyCompanionJobs(sessions, options.companion);
-  // Whether this session is its card's latest linked session: the classifier reads it
-  // to judge a paneless session's final ask (session-model derives the same).
+  // What the classifier reads off the card: whether this session is its latest linked
+  // session (to judge a paneless session's final ask; session-model derives the same)
+  // and the card's scheduled check, which is what wakes a session that says it waits.
+  const checkFlight = new Map();
   for (const session of sessions) {
-    const fm = taskById.get(session.taskId)?.fm;
+    const task = taskById.get(session.taskId);
+    const fm = task?.fm;
     session.cardLatest = Boolean(fm) && (fm.sessions || []).at(-1)?.id === session.id;
+    if (task && !checkFlight.has(task.id)) checkFlight.set(task.id, require('./runs').checkInFlight(task, now));
+    session.cardCheck = require('./session-model').cardCheck(fm, { now, inFlight: checkFlight.get(task?.id) === true });
   }
   // Cache reads only; the daemon queues missing verdicts once agent sessions are
   // marked (below), or in the worker's finalize.
   require('./stop-classifier').attach(sessions);
-  const checkFlight = new Map();
   const listedSessions = new Set(sessions.map((session) => session.id));
   // The scheduler if Keep still lists it, else the latest linked session it lists.
   const checkOwnerId = (fm) => (fm.scheduled_by && listedSessions.has(fm.scheduled_by) ? fm.scheduled_by
@@ -13227,7 +13231,6 @@ function buildState(options = {}) {
   for (const session of sessions) {
     const task = taskById.get(session.taskId);
     if (task && !dependencyCache.has(task.id)) dependencyCache.set(task.id, keep.unresolvedDependencyIds(task));
-    if (task && !checkFlight.has(task.id)) checkFlight.set(task.id, require('./runs').checkInFlight(task, now));
     // Whether Keep opened this session for a program rather than for Owner, read off
     // the pane before the status rules run (addHostSessionState reads the same mark
     // later): an unattended session's ended turn is finished, not waiting for input.
@@ -13245,7 +13248,7 @@ function buildState(options = {}) {
   if (workerMode) {
     const terminal = new Set(['completed', 'failed', 'cancelled']);
     const derived = new Set(['taskId', 'taskStatus', 'runtime', 'pane', 'launchModel', 'accountLabel',
-      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark', 'stopVerdict', 'cardLatest', 'unattended',
+      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark', 'stopVerdict', 'cardLatest', 'cardCheck', 'unattended',
       // Attached further down, after this block, and re-read from the usage snapshot
       // on every build. Listed so a reordering cannot freeze a settled session's
       // totals at whatever the collector had seen the moment it was cached.

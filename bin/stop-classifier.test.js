@@ -49,7 +49,11 @@ test('only a finished turn with nothing pending is classified, in a live pane or
 });
 
 test('the input is the last message plus whether tracked background work is still running', () => {
-  assert.match(classifier.input(base), /^Background work Keep tracks for this session: none running\nLast assistant message:\nThe Codex review/);
+  assert.match(classifier.input(base), /^Background work Keep tracks for this session: none running\nScheduled check on its card: none\nLast assistant message:\nThe Codex review/);
+  assert.match(classifier.input({ ...base, cardCheck: { at: '2026-09-25T20:00', overdue: false } }), /Scheduled check on its card: at 2026-09-25T20:00\n/);
+  assert.match(classifier.input({ ...base, cardCheck: { at: '2026-09-24T17:28', overdue: true } }), /Scheduled check on its card: overdue since 2026-09-24T17:28, not delivered\n/);
+  // A check appearing or going overdue changes the input, so the verdict is redone.
+  assert.notEqual(classifier.input(base), classifier.input({ ...base, cardCheck: { at: '2026-09-25T20:00', overdue: false } }));
   assert.match(classifier.input({ ...base, pendingBackground: true }), /still running/);
   assert.match(classifier.input({ ...base, lifecycleAgents: [{ id: 'a' }] }), /still running/);
   assert.match(classifier.input({ ...base, backgroundJobs: { jobs: [{ status: 'pending', kind: 'scheduled' }] } }), /still running/);
@@ -228,4 +232,21 @@ test('attach sets and clears the verdict from the cache only', () => {
   assert.deepEqual(sessions[0].stopVerdict, { verdict: 'done', reason: 'reports results', model: 'claude-sonnet-5', at: 7 });
   assert.equal(Object.hasOwn(sessions[1], 'stopVerdict'), false);
   assert.equal(summarize.queued.length, 0);
+});
+
+test('the prompt reads an unstarted plan as ASKS and a promise with nothing scheduled as not RUNNING', () => {
+  assert.match(classifier.INSTRUCTION, /proposes, plans or discusses work it has not started/);
+  assert.match(classifier.INSTRUCTION, /RUNNING only when something will wake the agent/);
+  assert.match(classifier.INSTRUCTION, /while the scheduled check line says none is not RUNNING/);
+});
+
+test('cardCheck is null for no check or a done card, and overdue past its grace unless in flight', () => {
+  const { cardCheck } = require('./session-model');
+  const at = Date.parse('2026-09-24T17:28');
+  assert.equal(cardCheck(null), null);
+  assert.equal(cardCheck({ status: 'active' }), null);
+  assert.equal(cardCheck({ status: 'done', check_after: '2026-09-24T17:28' }, { now: at + 3600e3 }), null);
+  assert.deepEqual(cardCheck({ status: 'waiting', check_after: '2026-09-24T17:28' }, { now: at + 10 * 60e3 }), { at: '2026-09-24T17:28', overdue: false });
+  assert.equal(cardCheck({ status: 'waiting', check_after: '2026-09-24T17:28' }, { now: at + 20 * 60e3 }).overdue, true);
+  assert.equal(cardCheck({ status: 'waiting', check_after: '2026-09-24T17:28' }, { now: at + 20 * 60e3, inFlight: true }).overdue, false);
 });
