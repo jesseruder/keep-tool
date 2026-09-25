@@ -243,7 +243,9 @@ test('a node runs only the reading turns subcommands', () => {
     assert.match(argumentRefusal('turns', args), /without --all/, args.join(' '));
     assert.match(nodeSideRefusal('turns', args), /without --all/, args.join(' '));
   }
-  assert.equal(argumentRefusal('turns', ['search', '--', '--all']), null, 'after -- it is a search word');
+  for (const args of [['search', '--', '--all'], ['search', 'x', '--agent', '--', '--all']]) {
+    assert.match(argumentRefusal('turns', args), /without --all/, args.join(' '));
+  }
 });
 
 test('arguments are checked the way the CLI will read them', (t) => {

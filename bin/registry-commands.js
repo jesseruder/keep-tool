@@ -46,8 +46,9 @@ const TURNS_REFUSAL = `a node runs only keep turns ${TURNS_READS.join('|')}; the
 const TURNS_ALL_REFUSAL = 'a node searches without --all: tool output stays on the daemon node';
 function turnsRefusal(args) {
   if (!TURNS_READS.includes(args[0])) return TURNS_REFUSAL;
-  const end = args.indexOf('--');
-  if ((end < 0 ? args : args.slice(0, end)).some((arg) => arg === '--all' || arg.startsWith('--all='))) return TURNS_ALL_REFUSAL;
+  // Anywhere, even past `--`: parseArgs reads a `--` after a value-taking flag as
+  // that flag's value, and a search word spelled --all is not worth telling apart.
+  if (args.some((arg) => arg === '--all' || arg.startsWith('--all='))) return TURNS_ALL_REFUSAL;
   return null;
 }
 
