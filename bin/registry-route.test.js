@@ -194,7 +194,19 @@ test('a flag is read as taking no value exactly where that command\'s parseArgs 
     const match = line.match(/^commands(?:\.([a-z]+)|\['([a-z-]+)'\]) = /);
     if (match) starts.push({ name: match[1] || match[2], i });
   });
+  // `turns` lives in bin/commands/turns.js, and a node may run only its reading
+  // subcommands: its table is those subcommands' specs.
+  const turnsSource = fs.readFileSync(path.join(__dirname, 'commands', 'turns.js'), 'utf8');
+  const turnsBools = new Set();
+  for (const name of ['turnsSearch', 'turnsShow', 'turnsStats']) {
+    const body = turnsSource.slice(turnsSource.indexOf(`function ${name}(`)).split(/\n(?=function |const )/)[0];
+    for (const spec of body.matchAll(/parseArgs\([^,]+,\s*(\{[^}]*\})/g)) {
+      for (const flag of spec[1].matchAll(/'?([a-z-]+)'?\s*:\s*'bool'/g)) turnsBools.add(flag[1]);
+    }
+  }
+  assert.deepEqual([...BOOLEAN_FLAGS.turns].sort(), [...turnsBools].sort(), 'turns');
   for (const command of REGISTRY_COMMANDS) {
+    if (command === 'turns') continue;
     const at = starts.findIndex((entry) => entry.name === command);
     assert.ok(at >= 0, `keep.js defines ${command}`);
     // To the next top-level definition of any kind: a helper after a command (the
@@ -216,6 +228,17 @@ test('a flag is read as taking no value exactly where that command\'s parseArgs 
     }
     assert.deepEqual([...(BOOLEAN_FLAGS[command] || [])].sort(), [...bools].sort(), command);
   }
+});
+
+test('a node runs only the reading turns subcommands', () => {
+  assert.equal(argumentRefusal('turns', ['search', 'websocket', '--all', '--project', 'keep-tool']), null);
+  assert.equal(argumentRefusal('turns', ['show', 'my-card', '--last', '5']), null);
+  assert.equal(argumentRefusal('turns', ['stats', '--json']), null);
+  for (const args of [['ingest', '/tmp/x.jsonl'], ['backfill'], ['prune'], []]) {
+    assert.match(argumentRefusal('turns', args), /only keep turns search\|show\|stats/, args.join(' '));
+    assert.match(nodeSideRefusal('turns', args), /only keep turns search\|show\|stats/, args.join(' '));
+  }
+  assert.match(argumentRefusal('turns', ['search', 'x', '--project', '../elsewhere']), /relative to a directory/);
 });
 
 test('arguments are checked the way the CLI will read them', (t) => {

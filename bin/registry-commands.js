@@ -32,7 +32,15 @@ const REGISTRY_COMMANDS = Object.freeze([
   // and name its own work (see the card titles and plan text below). What it cannot
   // carry is a file on the node (NODE_FILE_FLAGS).
   'open',
+  // Read-only over the daemon's turn index, which holds every node's mirrored
+  // transcripts: an agent on a node finds an earlier conversation the same way one
+  // on the laptop does. Only the reading subcommands (TURNS_READS); ingest,
+  // backfill and prune name files on the node or rewrite the index.
+  'turns',
 ]);
+
+const TURNS_READS = Object.freeze(['search', 'show', 'stats']);
+const TURNS_REFUSAL = `a node runs only keep turns ${TURNS_READS.join('|')}; the rest runs on the daemon node`;
 
 // A flag whose value is a command the daemon runs: `--probe` on its check schedule,
 // `--done-when` when a plan step is verified, and `plan --verify`, which runs one.
@@ -115,6 +123,7 @@ const BOOLEAN_FLAGS = Object.freeze({
   resume: ['raw'],
   tell: ['dry', 'json'],
   open: ['fresh'],
+  turns: ['json', 'all'],
 });
 
 // The arguments each registry command resolves as a project (keep-core
@@ -125,6 +134,7 @@ const BOOLEAN_FLAGS = Object.freeze({
 const PROJECT_FLAGS = Object.freeze({
   add: ['--project'],
   list: ['--project'],
+  turns: ['--project'],
 });
 const PROJECT_POSITIONS = Object.freeze({
   project: [1],
@@ -165,6 +175,7 @@ function argumentRefusal(command, args, identity = {}) {
     if (total > MAX_ARGS_BYTES) return `the arguments are longer than ${MAX_ARGS_BYTES} bytes together`;
     if (arg.includes('\0')) return 'an argument contains a NUL byte';
   }
+  if (command === 'turns' && !TURNS_READS.includes(args[0])) return TURNS_REFUSAL;
   if (Object.prototype.hasOwnProperty.call(SESSION_REFUSALS, command) && !identity.session) return SESSION_REFUSALS[command];
   if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return WAIT_CAP_REFUSAL;
   const newline = (arg) => /[\r\n]/.test(arg);
@@ -318,6 +329,7 @@ function isWaitingTell(command, args) {
 // record and are left to the route, which applies these two as well.
 function nodeSideRefusal(command, args) {
   if (!Array.isArray(args)) return null;
+  if (command === 'turns' && !TURNS_READS.includes(args[0])) return TURNS_REFUSAL;
   const fileFlags = Object.prototype.hasOwnProperty.call(NODE_FILE_FLAGS, command) ? NODE_FILE_FLAGS[command] : [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];

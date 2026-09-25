@@ -325,7 +325,7 @@ keep hook session-start  # used by the Claude Code SessionStart hook
 keep hook prompt         # used by the Claude Code UserPromptSubmit hook (compaction hint)
 
 keep turns show <session-id|card-id> [--last N] [--json]     # indexed turns for a session or card
-keep turns search "<query>" [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]
+keep turns search "<query>" [--all] [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]
 keep turns stats [--since when] [--json]                     # turns, human/[keep] openers, bare nudges
 keep turns ingest <file> [--agent claude|codex] [--force]    # index one transcript now
 keep turns backfill [--since when] [--roots dir,dir] [--json] # walk every transcript root (default 14 days)
@@ -567,8 +567,17 @@ outright. `byRule` still counts what each rule found before either cap.
 transcripts kept in `.keep/turns.sqlite`. Stop hooks and the daemon feed it
 incrementally (byte offsets, so the cost is the delta, not the transcript);
 `keep turns backfill` seeds it from history. `show` accepts a session id or a
-card id, `search` is FTS5 over indexed messages, and `stats` reports turns,
-human and `[keep]` openers, and bare nudge openers per agent and session kind.
+card id, and `stats` reports turns, human and `[keep]` openers, and bare nudge
+openers per agent and session kind. `search` finds earlier conversations: FTS5
+over what people typed and the agents' prose in interactive sessions, one row per
+session with its number, title, card and the newest matching passage, newest first
+(`--limit` sessions, default 20). Every word must match, and a last word of three or
+more letters also matches longer ones. `--all` adds tool calls and their output,
+headless runs and subagents. It orders by the index's insertion order rather than
+by timestamp, which answers a common word in tens of milliseconds where a sort by
+time took forty seconds; the console's ⌘F finder asks the same query. On a pane-only
+node `search`, `show` and `stats` are forwarded to the daemon like the registry
+commands; the other subcommands are refused there.
 `--since` reads backwards here: `+7d` means the last seven days. Hooks index at
 most 512 KiB per turn and wait at most 250 ms for the write lock, so a backlog is
 left to the daemon rather than made an agent's problem. Indexed sessions idle for

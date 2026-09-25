@@ -101,21 +101,33 @@ function turnsShow(argv) {
   }
 }
 
+// One row per session, newest match first, with the session's number and title so
+// an agent can name it (#12) or open it. By default it reads only what people typed
+// and the agents' prose in interactive sessions; --all adds tool calls and output,
+// headless runs and subagents, for an error message or a command.
 function turnsSearch(argv) {
   const turnIndex = require('../turn-index.js');
-  const o = parseArgs(argv, { since: 'str', project: 'str', limit: 'str', agent: 'str', json: 'bool' });
+  const { searchDatabase, ftsMatch, OPEN, CLOSE } = require('../session-text-search.js');
+  const numbers = require('../session-numbers.js');
+  const o = parseArgs(argv, { since: 'str', project: 'str', limit: 'str', agent: 'str', json: 'bool', all: 'bool' });
   const query = o._.join(' ').trim();
-  if (!query) die('usage: keep turns search "<query>" [--since when] [--project p] [--limit n] [--json]');
-  const rows = turnIndex.search(query, {
-    since: turnsSince(o.since),
-    project: o.project ? canonicalProjectPath(o.project) : null,
+  if (!query) die('usage: keep turns search "<query>" [--all] [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]');
+  if (!ftsMatch(query)) die('keep turns search: the query needs at least three characters');
+  const hits = searchDatabase(turnIndex.open(turnIndex.databaseFile()), query, {
+    all: o.all === true,
+    since: o.since ? turnsSince(o.since) : null,
+    project: o.project ? turnIndex.normalizeProject(canonicalProjectPath(o.project)) : null,
     agent: o.agent || null,
-    limit: turnsIndexNumber(o.limit, '--limit') || 25,
-  });
-  if (o.json) return console.log(JSON.stringify(rows, null, 2));
-  if (!rows.length) return console.log('no matches');
-  for (const row of rows) {
-    console.log(`${turnsStamp(row.ts)}  ${String(row.session_id).slice(0, 8)}  ${`${row.role}/${row.kind}`.padEnd(18)} ${turnsClip(row.snippet, 160)}`);
+    sessionLimit: Math.min(turnsIndexNumber(o.limit, '--limit') || 20, 200),
+  }).map((hit) => ({ ...hit, num: numbers.numberFor(hit.sessionId) }));
+  if (o.json) return console.log(JSON.stringify(hits, null, 2));
+  if (!hits.length) return console.log('no matches');
+  const said = (hit) => (hit.role === 'user' ? 'you' : hit.role === 'tool' ? 'tool' : 'agent');
+  for (const hit of hits) {
+    const head = [numbers.named(hit.sessionId), hit.title && turnsClip(hit.title, 80), hit.card,
+      hit.project && path.basename(hit.project), turnsStamp(hit.ts), hit.hits > 1 ? `${hit.hits} matches` : ''].filter(Boolean);
+    console.log(head.join('  ·  '));
+    console.log(`    ${said(hit)}: ${turnsClip(hit.snippet.split(OPEN).join('[').split(CLOSE).join(']'), 200)}`);
   }
 }
 

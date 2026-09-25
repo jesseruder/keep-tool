@@ -7,7 +7,7 @@ const { ftsMatch, searchDatabase, createSessionTextSearch } = require('./session
 function database() {
   const { DatabaseSync } = require('node:sqlite');
   const handle = new DatabaseSync(':memory:');
-  handle.exec(`CREATE TABLE sessions (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+  handle.exec(`CREATE TABLE sessions (id TEXT PRIMARY KEY, kind TEXT NOT NULL, agent TEXT, project TEXT, title TEXT, card_id TEXT);
     CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, ts INTEGER, role TEXT NOT NULL, kind TEXT NOT NULL, text TEXT);
     CREATE VIRTUAL TABLE messages_fts USING fts5(text, content='messages', content_rowid='id', tokenize='unicode61');
     CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text); END;`);
@@ -42,7 +42,12 @@ test('one hit per interactive session, newest first, from prose and typed messag
   assert.deepEqual(searchDatabase(database(), 'build log', { sessions: all }), []);
   assert.deepEqual(searchDatabase(database(), 'reconn', { sessions: all }).map((hit) => hit.sessionId), ['other']);
   assert.deepEqual(searchDatabase(database(), 'websocket', { sessions: ['other', 'bg'] }).map((hit) => hit.sessionId), ['other']);
-  assert.deepEqual(searchDatabase(database(), 'websocket'), [], 'no listed sessions, nothing to search');
+  assert.deepEqual(searchDatabase(database(), 'websocket', { sessions: [] }), [], 'no listed sessions, nothing to search');
+  assert.deepEqual(searchDatabase(database(), 'websocket').map((hit) => hit.sessionId), ['live', 'other'], 'no list, every session');
+  assert.deepEqual(searchDatabase(database(), 'websocket', { all: true }).map((hit) => [hit.sessionId, hit.hits]), [['live', 3], ['bg', 1], ['other', 1]]);
+  assert.deepEqual(searchDatabase(database(), 'websocket', { since: 3 }).map((hit) => hit.sessionId), ['live', 'other']);
+  assert.deepEqual(searchDatabase(database(), 'websocket', { since: 4 }).map((hit) => hit.sessionId), ['live']);
+  assert.deepEqual(searchDatabase(database(), 'websocket', { sessionLimit: 1 }).map((hit) => hit.sessionId), ['live']);
   assert.equal(ftsMatch('web\u0000socket'), '"web" "socket"*');
 });
 

@@ -38,30 +38,47 @@ function ftsMatch(query) {
   }).join(' ');
 }
 
-// Only what a person typed and the agents' prose: tool calls and their output are
-// four fifths of the index and would bury every conversation in build logs.
-// `sessions` names the sessions the finder can list. The index keeps 120 days of
-// every session, the reviewer and standing agents included; without the list they
-// write enough prose to fill the caps with rows the finder would throw away.
+// By default only what a person typed and the agents' prose, in interactive
+// sessions: tool calls and their output are four fifths of the index and would bury
+// every conversation in build logs. `all` searches every message of every session.
+//
+// `sessions`, when given, names the only sessions to search: the console's finder
+// passes the ones it can list. The index keeps 120 days of every session, the
+// reviewer and standing agents included, and without the list they write enough
+// prose to fill the caps with rows the finder would throw away. `since`, `project`
+// and `agent` narrow the search as `keep turns search` names them.
 function searchDatabase(handle, query, options = {}) {
   const match = ftsMatch(query);
-  const sessions = Array.isArray(options.sessions) ? options.sessions.map(String) : [];
-  if (!match || !sessions.length) return [];
-  const rows = handle.prepare(`SELECT m.session_id AS sessionId, m.ts, m.role,
+  if (!match) return [];
+  const where = ['messages_fts MATCH ?'];
+  const params = [match];
+  if (!options.all) where.push("m.kind IN ('human', 'text')", "s.kind = 'interactive'");
+  if (Array.isArray(options.sessions)) {
+    if (!options.sessions.length) return [];
+    where.push('m.session_id IN (SELECT value FROM json_each(?))');
+    params.push(JSON.stringify(options.sessions.map(String)));
+  }
+  if (Number.isFinite(options.since)) { where.push('m.ts >= ?'); params.push(options.since); }
+  if (options.project) { where.push('s.project = ?'); params.push(String(options.project)); }
+  if (options.agent) { where.push('s.agent = ?'); params.push(String(options.agent)); }
+  const sessionLimit = options.sessionLimit || SESSION_LIMIT;
+  params.push(options.hitLimit || Math.max(HIT_LIMIT, sessionLimit * 15));
+  const rows = handle.prepare(`SELECT m.session_id AS sessionId, m.ts, m.role, m.kind,
+      s.title, s.card_id AS card, s.project, s.agent,
       snippet(messages_fts, 0, char(2), char(3), '…', 14) AS snippet
     FROM messages_fts
     JOIN messages m ON m.id = messages_fts.rowid
     JOIN sessions s ON s.id = m.session_id
-    WHERE messages_fts MATCH ? AND m.kind IN ('human', 'text') AND s.kind = 'interactive'
-      AND m.session_id IN (SELECT value FROM json_each(?))
-    ORDER BY messages_fts.rowid DESC LIMIT ?`).all(match, JSON.stringify(sessions), options.hitLimit || HIT_LIMIT);
+    WHERE ${where.join(' AND ')}
+    ORDER BY messages_fts.rowid DESC LIMIT ?`).all(...params);
   const bySession = new Map();
   for (const row of rows) {
     const hit = bySession.get(row.sessionId);
     if (hit) { hit.hits += 1; continue; }
-    if (bySession.size >= (options.sessionLimit || SESSION_LIMIT)) continue;
+    if (bySession.size >= sessionLimit) continue;
     bySession.set(row.sessionId, {
-      sessionId: row.sessionId, ts: row.ts, role: row.role, hits: 1,
+      sessionId: row.sessionId, ts: row.ts, role: row.role, kind: row.kind, hits: 1,
+      title: row.title || '', card: row.card || '', project: row.project || '', agent: row.agent || '',
       snippet: String(row.snippet || '').replace(/\s+/g, ' ').trim(),
     });
   }

@@ -4099,8 +4099,9 @@ ${stepUsage()}
                          # message a live agent about a finding (dry-run without --send)
   keep turns show <session-id|card-id> [--last N] [--json]
                          # indexed turns for a session, or for every session linked to a card
-  keep turns search "<query>" [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]
-                         # full-text search over indexed messages
+  keep turns search "<query>" [--all] [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]
+                         # find earlier conversations: one row per session, newest match first, with its
+                         # #number, title and card; --all also searches tool output, headless runs and subagents
   keep turns stats [--since when] [--json]
                          # sessions, turns, human/[keep] openers and bare-nudge openers per agent and kind
   keep turns ingest <file> [--agent claude|codex] [--force]   # index one transcript now
