@@ -697,6 +697,31 @@ test('the sweep forgets a home whose agent exited without a check-in, and keeps 
   }
 });
 
+test('a dead earlier pane of a home is only removed while a live pane runs the same session', async () => {
+  const written = [];
+  const released = [];
+  const records = { 'redash-daily': { name: 'redash-daily', role: 'scheduled check', session: { id: 'sid-home' }, homes: { 'some-card': 'sid-home' } } };
+  const now = 1_000_000 + 5 * 3600e3;
+  const closed = await sweepEphemeralPanes({
+    listPanes: async () => [
+      ephemeralPane({ id: 'old-pane', alive: false, meta: { card: 'some-card', sessionId: 'sid-home', agentName: 'redash-daily' } }),
+      ephemeralPane({ id: 'new-pane', alive: true, meta: { card: 'some-card', sessionId: 'sid-home', agentName: 'redash-daily', launchedAt: now - 60e3 } }),
+    ],
+    sessions: async () => [{ id: 'sid-home', endedTurn: false, mtime: now }],
+    closePane: async () => {},
+    checkinTask: (...args) => released.push(args),
+    agents: {
+      records: () => Object.values(records),
+      readRecord: (name) => records[name] || null,
+      writeRecord: (name, patch) => { written.push([name, patch]); },
+      flushCommits: () => true,
+    },
+  }, now);
+  assert.deepEqual(closed, ['old-pane']);
+  assert.deepEqual(released, [], 'the live pane\'s stamp is not released');
+  assert.deepEqual(written, [], 'nor its home forgotten or its record idled');
+});
+
 test('the sweep idles an agent whose check pane it closed, or whose pane lost the mark', async () => {
   const written = [];
   const records = {

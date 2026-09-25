@@ -867,7 +867,10 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
   // runs in a fresh session there, which becomes the home. Waiting for the home's
   // account would hold the check past the fallback that exists for exactly this.
   let agentName = (opts.cardAgent || cardAgent)(task, root);
-  let home = agentName ? agentHomeSession(agentName, task, agentApi, root) : '';
+  // `abandonHome`: the scheduler found the home stuck busy past the deferral limit,
+  // so the check opens fresh; the new session replaces it as the home once it opens,
+  // and a refusal here leaves the old home in place.
+  let home = agentName && !opts.abandonHome ? agentHomeSession(agentName, task, agentApi, root) : '';
   const homeAccountId = home ? (opts.sessionAccountId || sessionAccountId)(home, root) : '';
   if (enforce) {
     const refuse = opts.refusal || freshOpenRefusal;
@@ -1238,6 +1241,12 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
     }
     closed.push(pane.id);
     process.stderr.write(`keep runs: closed the ${label}: ${decision.reason}\n`);
+    // A card agent's check resumes the same session id, so a dead earlier pane can sit
+    // beside the live pane now running the check. The session's stamp, home and record
+    // are that live pane's: this one is only removed.
+    const carriedElsewhere = panes.some((other) => other !== pane && other && other.alive !== false
+      && other.meta && other.meta.sessionId === sessionId);
+    if (carriedElsewhere) continue;
     if (!decision.checkedIn) releaseUnfinishedCheck(pane.meta.card, sessionId, today, host.checkinTask ? host : keep);
     // A check that ran as an agent is idle again once its pane is gone, and lets the
     // session go in the same write (the pane's card check-ins are the log), so the
@@ -1546,7 +1555,12 @@ async function schedulerTick() {
       // receipt before choosing another recipient or falling back to headless.
       const pendingDelivery = require('./delivery').statusForText(path.join(keep.ROOT, '.keep', 'delivery'), checkDeliveryMessage(t), checkDeliveryKey(t));
       if (pendingDelivery?.received) {
-        writeDeliveryStamp(t, pendingDelivery);
+        // Into a card agent's home (a verify, or an uncertain delivery confirmed now):
+        // stamped to expire as a tick's own delivery into it is, below.
+        const agentForReceipt = cardAgentName(t);
+        const intoHome = agentForReceipt && pendingDelivery.sessionId
+          && agentHomeSession(agentForReceipt, t, require('./agents.js')) === pendingDelivery.sessionId;
+        writeDeliveryStamp(t, intoHome ? { ...pendingDelivery, ttlMs: FRESH_OPEN_STAMP_TTL_MS } : pendingDelivery);
         require('./delivery').acknowledge(path.join(keep.ROOT, '.keep', 'delivery'), checkDeliveryMessage(t), checkDeliveryKey(t));
         continue;
       }
@@ -1569,9 +1583,10 @@ async function schedulerTick() {
       // the limit it is stuck (a turn that never ends, a prompt nobody answers, a send
       // that always fails), so the check opens fresh as any card's does, and that
       // session becomes the home.
+      let abandonHome = false;
       if (home && threadBusy) {
         process.stderr.write(`keep runs: agent ${agentName}'s session ${home.slice(0, 8)} for ${t.id} stayed busy past the deferral limit; opening a fresh session\n`);
-        forgetAgentHome(require('./agents.js'), agentName, t.id);
+        abandonHome = true;
         home = '';
       }
       if (!threadBusy && (!recurring || home)) {
@@ -1595,7 +1610,7 @@ async function schedulerTick() {
           if (!threadBusy) continue;
           if (home) {
             process.stderr.write(`keep runs: agent ${agentName}'s session ${home.slice(0, 8)} for ${t.id} stayed busy past the deferral limit; opening a fresh session\n`);
-            forgetAgentHome(require('./agents.js'), agentName, t.id);
+            abandonHome = true;
             home = '';
           }
         } else if (delivery) {
@@ -1606,6 +1621,8 @@ async function schedulerTick() {
           if (home && delivery.sessionId === home) {
             noteHomeDelivery(home);
             delivery = { ...delivery, ttlMs: FRESH_OPEN_STAMP_TTL_MS };
+            // A new streak for the next due check: this one was delivered.
+            deferred.count = 0;
           }
           try {
             writeDeliveryStamp(t, delivery);
@@ -1628,7 +1645,7 @@ async function schedulerTick() {
       // opened on the card. One per card per local day, three per tick, none without
       // budget — freshOpenRefusal holds all three rules.
       try {
-        const outcome = await openFreshCheckSession(t, { today, accountId: checksAccount });
+        const outcome = await openFreshCheckSession(t, { today, accountId: checksAccount, ...(abandonHome ? { abandonHome: true } : {}) });
         if (outcome.skipped === 'budget') {
           // Every deferral is logged; only the first few a tick are written to a card.
           // The quota counts check-ins that were actually written — a card that was
@@ -1648,6 +1665,10 @@ async function schedulerTick() {
         if ((outcome.skipped === 'opened-today' || outcome.skipped === 'opened-within-interval') && givenUp.get(t.id) === today) didWork = workBefore;
         if (outcome.skipped) continue;
         clearBudgetDeferral(t.id, today);
+        // A card agent's busy streak that led here is over: its next due check starts
+        // its own, rather than finding the limit already passed and abandoning the new
+        // home. Ordinary cards keep the day's streak as before.
+        if (agentName) deferred.count = 0;
         // A retry that opened (a sub-daily card, once its interval passed) is no
         // longer a failure the health row should keep holding up.
         givenUp.delete(t.id);
