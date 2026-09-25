@@ -766,7 +766,7 @@ function briefHTML(ctx, item, session, task) {
   }
   const cardTask = item.taskId && task?.id ? task : null;
   const picture = cardTask ? pictureHTML(ctx, cardTask) : '';
-  return `<div class="brief-body${picture ? ' with-picture' : ''}">${checkinsHTML(ctx, cardTask, fallback)}${picture}</div>${actions}`;
+  return `<div class="brief-body${picture ? ' with-picture' : ''}">${picture}${checkinsHTML(ctx, cardTask, fallback)}</div>${actions}`;
 }
 
 async function sendReply(ctx, item, text) {
