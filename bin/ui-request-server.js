@@ -348,11 +348,13 @@ function createUiRequestServer(options = {}) {
         catch (error) { return json(res, [400, 404].includes(error.status) ? error.status : 500, { error: error.message }); }
       }
       if (req.method === 'GET' && url.pathname === '/api/session-text-search') {
+        if (!current) return json(res, 503, { error: 'dashboard state is still loading' }, { 'retry-after': '1' });
         // A superseded query answers null: a newer one from the same finder replaced it.
         try {
-          const agents = (current?.state?.sessions || []).filter((session) => session?.reviewer || session?.agentName)
-            .map((session) => session.id).filter(Boolean);
-          const results = await sessionTextSearch().search(url.searchParams.get('q') || '', agents);
+          // The same sessions the finder offers (web/app/session-search.js sessionRows).
+          const listed = (current?.state?.sessions || []).filter((session) => session?.id && !session.reviewer && !session.agentName)
+            .map((session) => session.id);
+          const results = await sessionTextSearch().search(url.searchParams.get('q') || '', listed);
           return json(res, 200, results ? { ok: true, results } : { ok: true, superseded: true, results: [] });
         } catch (error) { return json(res, error.status || 500, { error: error.message }); }
       }

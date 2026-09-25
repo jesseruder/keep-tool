@@ -83,8 +83,9 @@ export function installSessionSearch({ rows, recentIds, open, esc, searchText = 
   let textTimer = 0, textSequence = 0, searching = false, failed = false;
   const render = () => {
     const firstSaid = titled.length;
-    list.innerHTML = results.map((row, index) => (index === firstSaid ? '<li class="heading" role="presentation">In conversation</li>' : '')
+    list.innerHTML = (results.map((row, index) => (index === firstSaid ? '<li class="heading" role="presentation">In conversation</li>' : '')
       + sessionRowHTML(row, index, index === selected, esc)).join('')
+      + (failed && results.length ? '<li class="heading" role="presentation">Conversations could not be searched</li>' : ''))
       || `<li class="empty">${searching ? 'Searching conversations…' : failed ? 'No title matches, and conversations could not be searched' : 'No matching sessions'}</li>`;
     if (results.length) input.setAttribute('aria-activedescendant', `session-search-${selected}`);
     else input.removeAttribute('aria-activedescendant');

@@ -33,13 +33,16 @@ test('every word is quoted, and only a last word still being typed is a prefix',
   assert.equal(ftsMatch('say "hi"'), '"say" """hi"""*');
 });
 
+const all = ['live', 'other', 'bg'];
+
 test('one hit per interactive session, newest first, from prose and typed messages only', () => {
-  const results = searchDatabase(database(), 'websocket');
+  const results = searchDatabase(database(), 'websocket', { sessions: all });
   assert.deepEqual(results.map((hit) => [hit.sessionId, hit.role, hit.hits]), [['live', 'assistant', 2], ['other', 'assistant', 1]]);
   assert.match(results[0].snippet, /\u0002websocket\u0003/);
-  assert.deepEqual(searchDatabase(database(), 'build log'), []);
-  assert.deepEqual(searchDatabase(database(), 'reconn').map((hit) => hit.sessionId), ['other']);
-  assert.deepEqual(searchDatabase(database(), 'websocket', { exclude: ['live'] }).map((hit) => hit.sessionId), ['other']);
+  assert.deepEqual(searchDatabase(database(), 'build log', { sessions: all }), []);
+  assert.deepEqual(searchDatabase(database(), 'reconn', { sessions: all }).map((hit) => hit.sessionId), ['other']);
+  assert.deepEqual(searchDatabase(database(), 'websocket', { sessions: ['other', 'bg'] }).map((hit) => hit.sessionId), ['other']);
+  assert.deepEqual(searchDatabase(database(), 'websocket'), [], 'no listed sessions, nothing to search');
   assert.equal(ftsMatch('web\u0000socket'), '"web" "socket"*');
 });
 
@@ -58,7 +61,7 @@ test('a newer search supersedes one that has not started, and a stuck one is aba
   const third = search.search('charlie');
   assert.equal(await second, null);
   const [worker] = FakeWorker.made;
-  assert.deepEqual(worker.posted.map((message) => [message.query, message.exclude]), [['alpha', ['agent']]]);
+  assert.deepEqual(worker.posted.map((message) => [message.query, message.sessions]), [['alpha', ['agent']]]);
   worker.answer([{ sessionId: 'a' }]);
   assert.deepEqual(await first, [{ sessionId: 'a' }]);
   assert.deepEqual(worker.posted.map((message) => message.query), ['alpha', 'charlie']);

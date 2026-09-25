@@ -484,6 +484,8 @@ test('session text search answers from the search worker, and says when it was s
     close() { closed += 1; },
   }) });
   const search = (query) => request(f.port, `/api/session-text-search?q=${query}`, { headers: { 'x-keep': '1' } });
+  assert.equal((await search('websocket')).status, 503, 'no state yet, so no sessions to search');
+  f.ui.publish({ version: 1, generatedAt: 1, state: { sessions: [{ id: 's1' }, { id: 'rev', reviewer: true }], panes: [], tasks: [], attention: [] } });
   const hit = await search('websocket');
   assert.equal(hit.status, 200);
   assert.deepEqual(JSON.parse(hit.body), { ok: true, results: [{ sessionId: 's1', snippet: 'x' }] });

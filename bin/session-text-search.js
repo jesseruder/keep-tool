@@ -40,20 +40,21 @@ function ftsMatch(query) {
 
 // Only what a person typed and the agents' prose: tool calls and their output are
 // four fifths of the index and would bury every conversation in build logs.
-// `exclude` names sessions the console never lists here (the reviewer and the
-// standing agents): they write the most prose, and would otherwise fill the caps.
+// `sessions` names the sessions the finder can list. The index keeps 120 days of
+// every session, the reviewer and standing agents included; without the list they
+// write enough prose to fill the caps with rows the finder would throw away.
 function searchDatabase(handle, query, options = {}) {
   const match = ftsMatch(query);
-  if (!match) return [];
-  const exclude = JSON.stringify(Array.isArray(options.exclude) ? options.exclude.map(String) : []);
+  const sessions = Array.isArray(options.sessions) ? options.sessions.map(String) : [];
+  if (!match || !sessions.length) return [];
   const rows = handle.prepare(`SELECT m.session_id AS sessionId, m.ts, m.role,
       snippet(messages_fts, 0, char(2), char(3), '…', 14) AS snippet
     FROM messages_fts
     JOIN messages m ON m.id = messages_fts.rowid
     JOIN sessions s ON s.id = m.session_id
     WHERE messages_fts MATCH ? AND m.kind IN ('human', 'text') AND s.kind = 'interactive'
-      AND m.session_id NOT IN (SELECT value FROM json_each(?))
-    ORDER BY messages_fts.rowid DESC LIMIT ?`).all(match, exclude, options.hitLimit || HIT_LIMIT);
+      AND m.session_id IN (SELECT value FROM json_each(?))
+    ORDER BY messages_fts.rowid DESC LIMIT ?`).all(match, JSON.stringify(sessions), options.hitLimit || HIT_LIMIT);
   const bySession = new Map();
   for (const row of rows) {
     const hit = bySession.get(row.sessionId);
@@ -118,14 +119,14 @@ function createSessionTextSearch(options = {}) {
     running = queued;
     queued = null;
     running.timer = setTimeout(() => failRunning(Object.assign(new Error('session search timed out'), { status: 504 })), timeoutMs);
-    ensure().postMessage({ id: running.id, query: running.query, exclude: running.exclude });
+    ensure().postMessage({ id: running.id, query: running.query, sessions: running.sessions });
   };
   return {
-    search(query, exclude = []) {
+    search(query, sessions = []) {
       if (!ftsMatch(query)) return Promise.resolve([]);
       return new Promise((resolve, reject) => {
         if (queued) settle(queued, null, null);
-        queued = { id: ++sequence, query: String(query), exclude, resolve, reject };
+        queued = { id: ++sequence, query: String(query), sessions, resolve, reject };
         next();
       });
     },
