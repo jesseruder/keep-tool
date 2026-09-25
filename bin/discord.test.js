@@ -518,6 +518,52 @@ test('dashboard merges Slack and Discord findings with source labels in time ord
   assert.deepEqual(JSON.parse(result.stdout), [['slack', 'Slack row'], ['discord', 'Discord row']]);
 });
 
+test('collector state: fresh, stale, logged out, or unknown', () => {
+  const discord = require(discordModule);
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  const at = (minutes) => new Date(now - minutes * 60e3).toISOString();
+  assert.equal(discord.collectorState(undefined, now), null, 'an older gateway sends no report');
+  assert.equal(discord.collectorState(null, now), null, 'no report stored yet');
+  assert.equal(discord.collectorState({ last_ok_at: at(20), login_expired: false }, now).stale, null);
+  assert.match(discord.collectorState({ last_ok_at: at(90), login_expired: false, last_error: 'page\ntimed out' }, now).stale,
+    /^Discord collector on aws1 is not collecting \(last good poll 90 min ago\): page timed out$/);
+  assert.match(discord.collectorState({ last_ok_at: at(5), login_expired: true }, now).stale,
+    /logged out of Discord \(last good poll 5 min ago\)/);
+  assert.match(discord.collectorState({ last_ok_at: null, login_expired: false }, now).stale, /no good poll recorded/);
+});
+
+test('a gateway that answers while the collector is logged out turns the row red', () => {
+  const root = fixture({ enabled: true }, { cursor: 0 });
+  const rows = [row(1)];
+  const result = run(root, `
+    const health = require(${JSON.stringify(path.join(__dirname, 'health.js'))});
+    const discord = require(${JSON.stringify(discordModule)});
+    ${FAKE_GATEWAY}
+    const calls = [];
+    const inner = fakeGateway(${JSON.stringify(rows)}, calls);
+    const report = { last_poll_at: new Date().toISOString(), last_ok_at: new Date(Date.now() - 10 * 60e3).toISOString(), login_expired: true, last_error: 'LOGIN_EXPIRED' };
+    const deps = {
+      callGateway: async (args) => ({ ...(await inner(args)), ingest: report }),
+      fleetInput: quietFleet,
+      classify: async (prompt) => { ${classifierBody} },
+    };
+    const scheduler = discord.startScheduler({ deps });
+    clearInterval(scheduler.interval);
+    clearTimeout(scheduler.first);
+    scheduler.tick().then(() => {
+      const entry = health.snapshot().schedulers.find((item) => item.name === 'discord');
+      process.stdout.write(JSON.stringify({ state: entry.state, failures: entry.consecutiveFailures, detail: entry.lastError,
+        status: discord.status().collector }));
+    }).catch((error) => { console.error(error.stack); process.exit(1); });
+  `);
+  assert.equal(result.status, 0, result.stderr);
+  const out = JSON.parse(result.stdout);
+  assert.equal(out.failures, 1);
+  assert.match(out.detail, /logged out of Discord/);
+  assert.equal(out.status.loginExpired, true);
+  assert.equal(readState(root, 'cursor.json').seq, 1, 'the rows it did get are still classified');
+});
+
 const healthModule = path.join(__dirname, 'health.js');
 const selfRepairModule = path.join(__dirname, 'self-repair.js');
 const lintModule = path.join(__dirname, 'lint.js');

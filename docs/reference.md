@@ -187,7 +187,11 @@ printed something other than a JSON object of strings, no credential at all, a p
 without a `messages` array or a row without an integer `seq`, a classifier that
 refused, a decisions file that would not write. Each records `ok: false` with its own
 error, logs the ordinary `keep discord: <message>` line, and goes red on the third one
-so self-repair can see it. A poll that classifies messages records a real success. One
+so self-repair can see it. So does a collector that has stopped: the gateway returns the
+aws1 collector's own report (`ingest`: last good poll, `login_expired`, last error) beside
+the rows, and when that report says the collector is logged out of Discord or has had no
+good poll for an hour, the tick records `ok: false` with that reason even though the
+gateway answered. A gateway that sends no report is not judged. A poll that classifies messages records a real success. One
 tick writes one health record, so a broken console notification counts as this tick's
 failure rather than clearing the streak first. `keep discord status` reads the
 watcher's own status file, not health.

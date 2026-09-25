@@ -27,6 +27,9 @@ const TOOL = 'discord_recent';
 const PAGE_MAX = 200;
 const PAGES_PER_POLL = 10;
 const FIRST_RUN_WINDOW_MS = 24 * 3600e3;
+// The collector on aws1 polls every 15 minutes. An hour without a good poll is four
+// missed polls: not a slow page load, a collector that has stopped.
+const COLLECTOR_STALE_MS = 60 * 60e3;
 const PROMPT_MAX = 40000;
 const SEEN_MAX_AGE_MS = 30 * 86400e3;
 
@@ -282,9 +285,45 @@ function pageRows(page) {
 async function fetchRows(cursor, cfg, deps, now) {
   const call = deps.callGateway || ((args) => callGateway(args, cfg, deps));
   if (cursor != null) return { ...await fetchPages(call, cursor, cfg, now), baseline: null };
-  const newest = pageRows(await call({ limit: 1 }));
-  const baseline = newest.reduce((max, row) => Math.max(max, row.seq), 0);
-  return { ...await fetchPages(call, null, cfg, now), baseline };
+  const newestPage = await call({ limit: 1 });
+  const baseline = pageRows(newestPage).reduce((max, row) => Math.max(max, row.seq), 0);
+  const fetched = await fetchPages(call, null, cfg, now);
+  return { ...fetched, ingest: fetched.ingest === undefined ? pageIngest(newestPage) : fetched.ingest, baseline };
+}
+
+// The collector's own report of its last poll, as the gateway returns it beside the
+// rows. undefined when the gateway does not send one (a gateway older than the field),
+// null when it sends null (no report stored yet): neither is evidence of anything.
+function pageIngest(page) {
+  if (!page || !Object.prototype.hasOwnProperty.call(page, 'ingest')) return undefined;
+  return page.ingest && typeof page.ingest === 'object' ? page.ingest : null;
+}
+
+function describeAge(ms) {
+  const minutes = Math.round(ms / 60e3);
+  return minutes < 120 ? `${minutes} min` : `${Math.round(minutes / 60)} h`;
+}
+
+// Whether the rows this watcher reads are still arriving. The gateway answering says
+// nothing about that: the collector on aws1 can be logged out of Discord or stopped
+// while the database and gateway stay up, and then every poll here is a quiet day.
+function collectorState(ingest, now) {
+  if (!ingest) return null;
+  const lastOk = Date.parse(String(ingest.last_ok_at || ''));
+  const lastError = ingest.last_error ? String(ingest.last_error).replace(/\s+/g, ' ').trim().slice(0, 300) : null;
+  const since = Number.isFinite(lastOk) ? `last good poll ${describeAge(now - lastOk)} ago` : 'no good poll recorded';
+  let stale = null;
+  if (ingest.login_expired === true) {
+    stale = `Discord collector on aws1 is logged out of Discord (${since}); log its browser back in`;
+  } else if (!Number.isFinite(lastOk) || now - lastOk > COLLECTOR_STALE_MS) {
+    stale = `Discord collector on aws1 is not collecting (${since})${lastError ? `: ${lastError}` : ''}`;
+  }
+  return {
+    lastOkAt: Number.isFinite(lastOk) ? new Date(lastOk).toISOString() : null,
+    loginExpired: ingest.login_expired === true,
+    lastError,
+    stale,
+  };
 }
 
 // { rows, truncated }. `truncated` is true whenever paging stopped for any reason
@@ -296,11 +335,15 @@ async function fetchPages(call, cursor, cfg, now) {
   const bySeq = new Map();
   let after = cursor;
   let truncated = true;
+  let ingest;
   for (let page = 0; page < PAGES_PER_POLL; page += 1) {
     const args = after == null
       ? { since: new Date(now - FIRST_RUN_WINDOW_MS).toISOString(), limit }
       : { after_seq: after, limit };
-    const rows = pageRows(await call(args));
+    const answer = await call(args);
+    const rows = pageRows(answer);
+    const report = pageIngest(answer);
+    if (report !== undefined) ingest = report;
     let max = after == null ? -1 : after;
     for (const row of rows) {
       if (after != null && row.seq <= after) continue;
@@ -312,7 +355,7 @@ async function fetchPages(call, cursor, cfg, now) {
     after = max;
     if (bySeq.size >= cfg.maxPerPoll * 3) break;
   }
-  return { rows: [...bySeq.values()].sort((a, b) => a.seq - b.seq), truncated };
+  return { rows: [...bySeq.values()].sort((a, b) => a.seq - b.seq), truncated, ingest };
 }
 
 function normalizeRow(row) {
@@ -359,8 +402,9 @@ async function poll(options = {}) {
   let rows;
   let baseline;
   let truncated;
+  let ingest;
   try {
-    ({ rows, baseline, truncated } = await fetchRows(cursor, cfg, deps, now));
+    ({ rows, baseline, truncated, ingest } = await fetchRows(cursor, cfg, deps, now));
   } catch (error) {
     if (!isGatewayFailure(error)) throw error;
     if (!dry) writeStatus({ ...readJson(STATUS_FILE, {}), lastAttemptAt: Date.now(), skipped: true, detail: error.message });
@@ -451,6 +495,7 @@ async function poll(options = {}) {
   writeStatus({
     lastAttemptAt: Date.now(), lastPollAt: Date.now(), skipped: false,
     cursor: advanceTo, fetched: rows.length, backlog: held || Boolean(truncated),
+    collector: collectorState(ingest, now),
   });
   return entries;
 }
@@ -504,7 +549,7 @@ function startScheduler(options = {}) {
     if (running) return;
     running = true;
     try {
-      const decisions = await poll();
+      const decisions = await poll(options.deps ? { deps: options.deps } : {});
       // poll() swallows GatewayUnavailable and records it in the status file, so this
       // is the same unavailable state arriving by the other route.
       const current = status();
@@ -514,7 +559,13 @@ function startScheduler(options = {}) {
       // could never count past one, never reach three, and never go red.
       if (options.onChange) options.onChange();
       if (current.skipped) gatewayUnavailable(current.detail || 'Castle gateway unavailable');
-      else {
+      else if (current.collector && current.collector.stale) {
+        // The gateway answered, but what it serves has stopped growing. That is a real
+        // failure somebody has to fix on aws1, so it counts toward the red streak.
+        gatewayDown = false;
+        health.record('discord', { ok: false, error: new Error(current.collector.stale), cadenceMs });
+        process.stderr.write(`keep discord: ${current.collector.stale}\n`);
+      } else {
         gatewayDown = false;
         health.record('discord', { ok: true, detail: `${decisions.length} messages`, cadenceMs });
       }
@@ -554,6 +605,7 @@ module.exports = {
   agentServerEntries,
   resolveGateway,
   callGateway,
+  collectorState,
   normalizeRow,
   poll,
   status,

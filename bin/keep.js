@@ -3324,6 +3324,10 @@ commands.discord = async (argv) => {
     console.log(`last poll: ${state.lastPollAt ? new Date(state.lastPollAt).toLocaleString() : 'never'}`);
     if (state.skipped) console.log(`last attempt: skipped${state.detail ? ` · ${state.detail}` : ''}`);
     if (state.cursor != null) console.log(`cursor: seq ${state.cursor}${state.backlog ? ' (backlog left for the next poll)' : ''}`);
+    if (state.collector) {
+      const collector = state.collector;
+      console.log(`collector: ${collector.stale || `ok · last good poll ${collector.lastOkAt ? new Date(collector.lastOkAt).toLocaleString() : 'unknown'}`}`);
+    }
     const counts = Object.entries(state.counts);
     console.log(`today: ${counts.length ? counts.map(([kind, count]) => `${kind} ${count}`).join(', ') : 'no classifications'}`);
     return;
