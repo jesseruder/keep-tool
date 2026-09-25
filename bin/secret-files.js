@@ -211,13 +211,53 @@ function writeSecret({ path: requested, key = null, replace = false, multiline =
   return { path: dest.path, key: dest.key, replaced: dest.existed, bytes: Buffer.byteLength(text), mode: '0600' };
 }
 
+// Receipts: one small file per request this machine has written, holding the answer
+// (path, key, sizes; never the value). A daemon whose `secret-write` reply was lost
+// asks again with the same request id and gets the recorded answer back instead of
+// a second write, or a refusal because the first one already filled the file.
+const REQUEST_ID_RE = /^[a-f0-9]{8}$/;
+const RECEIPT_KEEP_MS = 14 * 24 * 60 * 60 * 1000;
+
+function receiptDir(options = {}) {
+  if (options.receiptDir) return options.receiptDir;
+  const home = options.home || os.homedir();
+  return path.join(process.env.KEEP_DIR || path.join(home, 'keep'), '.keep', 'secret-receipts');
+}
+
+function readReceipt(dir, requestId) {
+  try { return JSON.parse(fs.readFileSync(path.join(dir, `${requestId}.json`), 'utf8')); } catch { return null; }
+}
+
+function writeReceipt(dir, requestId, outcome) {
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = path.join(dir, `${requestId}.json`);
+    const temp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify({ ...outcome, at: Date.now() }), { mode: 0o600 });
+    fs.renameSync(temp, file);
+    const cutoff = Date.now() - RECEIPT_KEEP_MS;
+    for (const name of fs.readdirSync(dir)) {
+      const other = path.join(dir, name);
+      try { if (fs.statSync(other).mtimeMs < cutoff) fs.unlinkSync(other); } catch {}
+    }
+  } catch {}
+}
+
 // The host verb: a plain object in, a plain object out, and a refusal as an error
 // with a code the daemon hands back to the console.
 function handle(params = {}, options = {}) {
-  return writeSecret({
+  const requestId = REQUEST_ID_RE.test(String(params.requestId || '')) ? String(params.requestId) : null;
+  const dir = receiptDir(options);
+  if (requestId) {
+    const prior = readReceipt(dir, requestId);
+    if (prior) return { ...prior, repeated: true };
+  }
+  const outcome = writeSecret({
     path: params.path, key: params.key || null, replace: params.replace === true,
     multiline: params.multiline === true, value: params.value,
   }, options);
+  if (requestId) writeReceipt(dir, requestId, outcome);
+  return outcome;
 }
 
 module.exports = {

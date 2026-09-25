@@ -107,6 +107,20 @@ test('value rules: trims a trailing newline, refuses empty, oversize and stray l
   assert.throws(() => secretFiles.normalizeValue(42), /text/);
 });
 
+test('a repeated request id answers from its receipt instead of writing again', (t) => {
+  const h = home(t);
+  const receiptDir = path.join(h, 'receipts');
+  const params = { requestId: 'a1b2c3d4', path: path.join(h, 'app.env'), key: 'TOKEN', value: 'first' };
+  const first = secretFiles.handle(params, { ...opts(h), receiptDir });
+  assert.equal(first.replaced, false);
+  const again = secretFiles.handle({ ...params, value: 'second' }, { ...opts(h), receiptDir });
+  assert.equal(again.repeated, true);
+  assert.equal(fs.readFileSync(params.path, 'utf8'), 'TOKEN=first\n', 'the retry did not write');
+  assert.ok(!fs.readFileSync(path.join(receiptDir, 'a1b2c3d4.json'), 'utf8').includes('first'), 'a receipt holds no value');
+  assert.throws(() => secretFiles.handle({ ...params, requestId: 'ffffffff' }, { ...opts(h), receiptDir }), /already sets TOKEN/,
+    'another request is still refused');
+});
+
 test('an error never carries the value', (t) => {
   const h = home(t);
   const value = 'sk-SECRETVALUE-123';

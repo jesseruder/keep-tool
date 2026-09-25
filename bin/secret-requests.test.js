@@ -171,20 +171,19 @@ test('asking again updates the purpose; a different --replace is a new request',
   assert.equal(replacing.request.replace, true);
 });
 
-test('after a write whose answer was lost, the retry may overwrite', async (t) => {
-  let calls = 0;
+test('a retry after a lost reply carries the request id and never widens to replace', async (t) => {
+  const sent = [];
   const flaky = async (type, params) => {
     if (type === 'hello') return { secretWrite: 1 };
-    calls += 1;
-    if (calls === 1) throw new Error('host request timed out (secret-write)');
-    return { path: params.path, replaced: params.replace, bytes: 1 };
+    sent.push(params);
+    if (sent.length === 1) throw new Error('host request timed out (secret-write)');
+    return { path: params.path, replaced: false, bytes: 1, repeated: true };
   };
   const { service } = setup(t, { hostRequest: flaky });
   const { id } = service.request({ class: 'node', node: 'aws1' }, ask({ pane: 'p1@aws1' })).body.request;
   assert.equal((await service.fulfill({ id, value: VALUE })).status, 502);
-  const retried = await service.fulfill({ id, value: VALUE });
-  assert.equal(retried.status, 200);
-  assert.equal(retried.body.request.outcome.replaced, true);
+  assert.equal((await service.fulfill({ id, value: VALUE })).status, 200);
+  assert.deepEqual(sent.map((p) => [p.requestId, p.replace]), [[id, false], [id, false]]);
 });
 
 test('expired requests are dropped a week after they expire', (t) => {

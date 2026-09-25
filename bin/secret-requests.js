@@ -190,10 +190,10 @@ function createSecretService(options = {}) {
   }
 
   async function write(record, value) {
-    // After a write whose answer was lost the file may already hold this request's
-    // value, so the retry may overwrite it rather than be refused as existing.
+    // The request id lets the writer recognise a retry of a write it already did
+    // (its reply lost) and answer from its receipt instead of writing again.
     const params = {
-      path: record.path, key: record.key, replace: record.replace || record.uncertain === true,
+      requestId: record.id, path: record.path, key: record.key, replace: record.replace,
       multiline: record.multiline, value,
     };
     if (record.node === daemonNode()) return writeLocal(params);
@@ -223,11 +223,8 @@ function createSecretService(options = {}) {
       try { outcome = await write(record, value); }
       catch (error) {
         const message = String(error && error.message || error).slice(0, 300);
-        // A refusal the writer made is certain nothing was written; a timeout or a
-        // dropped connection is not.
-        const refused = Boolean(error && /^secret-(destination|exists|value|node)$/.test(error.code || ''));
-        update(id, refused ? { lastError: message } : { lastError: message, uncertain: true });
-        const status = refused && error.code !== 'secret-node' ? 409 : 502;
+        update(id, { lastError: message });
+        const status = error && /^secret-(destination|exists|value)$/.test(error.code || '') ? 409 : 502;
         return refusal(status, message, { code: error && error.code || null });
       }
       const resolved = update(id, {
