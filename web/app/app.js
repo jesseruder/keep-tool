@@ -1322,7 +1322,7 @@ historyControls = installSessionHistory({ history: sessionHistory, esc,
   },
   navigate: (entry) => { navigateHistory(entry); refresh(); },
 });
-const sessionSearch = installSessionSearch({ esc,
+const sessionSearch = installSessionSearch({ esc, searchText: api.searchSessionText,
   rows: () => sessionRows(data.sessions, { tasks: data.tasks, projectName: (path) => projectOf(path).name,
     statusOf: sessionLabel, hidden: (session) => isClosingSession(session.id, session.pane) }),
   recentIds: () => sessionHistory.recent.map((entry) => entry.sessionId).filter(Boolean),
@@ -1519,7 +1519,8 @@ function focusTerminal(explicit = false) {
 function focusQueue() { focusQueueItem(state, document); }
 
 document.addEventListener('keydown', (event) => {
-  if (document.querySelector('#notificationsPanel')?.open || sessionSearch.open) return;
+  // The session finder's own keys stay in it, even when a click left focus outside its field.
+  if (document.querySelector('#notificationsPanel')?.open || document.querySelector('.session-search-dialog')?.open) return;
   // Plain keys inside the emoji picker (its search box and its cell buttons)
   // belong to the picker, whichever phase this listener runs in; the modified
   // shortcuts (Cmd+B, Cmd+1-5, Cmd+Enter, ...) stay global there as everywhere.

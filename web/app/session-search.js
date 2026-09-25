@@ -45,29 +45,90 @@ export function sessionRows(sessions, { tasks = [], projectName = (path) => path
     }));
 }
 
+// The daemon marks each matched word with \u0002…\u0003 (bin/session-text-search.js).
+// Everything is escaped first, and a stray or unbalanced marker can only ever
+// open or close one <mark>.
+export function snippetHTML(snippet, esc) {
+  let html = '', open = false;
+  for (const part of String(snippet || '').split(/([\u0002\u0003])/)) {
+    if (part === '\u0002') { if (!open) html += '<mark>'; open = true; }
+    else if (part === '\u0003') { if (open) html += '</mark>'; open = false; }
+    else html += esc(part);
+  }
+  return open ? `${html}</mark>` : html;
+}
+
+// Conversation hits for sessions the console lists, and not already matched by
+// title: the index also holds sessions the console has long forgotten.
+export function textRows(hits, rows, shown) {
+  const known = new Map(rows.map((row) => [row.id, row]));
+  const listed = new Set(shown.map((row) => row.id));
+  return (hits || []).filter((hit) => known.has(hit.sessionId) && !listed.has(hit.sessionId))
+    .map((hit) => ({ ...known.get(hit.sessionId), snippet: hit.snippet, said: hit.role === 'user' ? 'You' : 'Agent' }));
+}
+
 export function sessionRowHTML(row, index, selected, esc) {
-  const meta = [row.project, row.status, row.card].filter(Boolean).map(esc).join(' · ');
-  return `<li role="option" id="session-search-${index}" data-index="${index}" aria-selected="${selected}"${selected ? ' class="sel"' : ''}>`
+  const meta = row.snippet != null ? `${esc(row.said)}: ${snippetHTML(row.snippet, esc)}`
+    : [row.project, row.status, row.card].filter(Boolean).map(esc).join(' · ');
+  const classes = [selected ? 'sel' : '', row.snippet != null ? 'said' : ''].filter(Boolean).join(' ');
+  return `<li role="option" id="session-search-${index}" data-index="${index}" aria-selected="${selected}"${classes ? ` class="${classes}"` : ''}>`
     + `<b>${numBadgeHTML(esc, row.num, row.id)}${esc(row.title)}</b><span>${meta}</span></li>`;
 }
 
-export function installSessionSearch({ rows, recentIds, open, esc }) {
-  let dialog, input, list, returnTo = null, all = [], results = [], selected = 0;
+const TEXT_DELAY_MS = 180;
+const TEXT_MIN = 3;
+
+export function installSessionSearch({ rows, recentIds, open, esc, searchText = null }) {
+  let dialog, input, list, returnTo = null, all = [], titled = [], said = [], results = [], selected = 0;
+  let textTimer = 0, textSequence = 0, searching = false;
   const render = () => {
-    list.innerHTML = results.map((row, index) => sessionRowHTML(row, index, index === selected, esc)).join('')
-      || '<li class="empty">No matching sessions</li>';
+    const firstSaid = titled.length;
+    list.innerHTML = results.map((row, index) => (index === firstSaid ? '<li class="heading" role="presentation">In conversation</li>' : '')
+      + sessionRowHTML(row, index, index === selected, esc)).join('')
+      || `<li class="empty">${searching ? 'Searching conversations…' : 'No matching sessions'}</li>`;
     if (results.length) input.setAttribute('aria-activedescendant', `session-search-${selected}`);
     else input.removeAttribute('aria-activedescendant');
     list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
   };
-  const search = () => { results = rankSessions(all, input.value, recentIds()); selected = 0; render(); };
+  // Titles answer at once; what was said follows once typing pauses. A reply to an
+  // older query, or one that arrives after the finder closed, is dropped.
+  const searchSaid = (query, sequence) => {
+    searchText(query).then((hits) => {
+      if (sequence !== textSequence || !dialog.open) return;
+      searching = false;
+      // Superseded by another console's search: the daemon runs one at a time.
+      if (!hits) { render(); return; }
+      const current = results[selected]?.id;
+      said = textRows(hits, all, titled);
+      results = [...titled, ...said];
+      selected = Math.max(0, results.findIndex((row) => row.id === current));
+      render();
+    }, () => {
+      if (sequence !== textSequence) return;
+      searching = false;
+      render();
+    });
+  };
+  const search = () => {
+    const query = input.value;
+    titled = rankSessions(all, query, recentIds());
+    said = [];
+    results = titled;
+    selected = 0;
+    clearTimeout(textTimer);
+    const sequence = ++textSequence;
+    searching = Boolean(searchText) && query.trim().length >= TEXT_MIN;
+    if (searching) textTimer = setTimeout(() => searchSaid(query, sequence), TEXT_DELAY_MS);
+    render();
+  };
   // Choosing a session leaves focus to the navigation; handing it back to the
   // terminal being left would take control of that pane on its way out.
   const choose = (row) => { if (!row) return; returnTo = null; dialog.close(); open(row.id); };
+  const stopSearching = () => { clearTimeout(textTimer); textSequence += 1; searching = false; };
   const build = () => {
     dialog = document.createElement('dialog');
     dialog.className = 'session-search-dialog';
-    dialog.innerHTML = '<input type="text" placeholder="Find a session: title, #number, project or card" aria-label="Find a session" role="combobox" aria-controls="session-search-list" aria-expanded="true" autocomplete="off" spellcheck="false">'
+    dialog.innerHTML = '<input type="text" placeholder="Find a session: title, #number, project, card or what was said" aria-label="Find a session" role="combobox" aria-controls="session-search-list" aria-expanded="true" autocomplete="off" spellcheck="false">'
       + '<ul id="session-search-list" role="listbox" aria-label="Sessions"></ul>';
     input = dialog.querySelector('input');
     list = dialog.querySelector('ul');
@@ -97,6 +158,7 @@ export function installSessionSearch({ rows, recentIds, open, esc }) {
     // A modal dialog always refocuses whatever had focus before showModal(), so
     // show() blurs that first and a dismissal (Escape, the backdrop) restores it here.
     dialog.addEventListener('close', () => {
+      stopSearching();
       const target = returnTo;
       returnTo = null;
       if (target?.isConnected) target.focus();

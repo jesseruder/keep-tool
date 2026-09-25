@@ -91,6 +91,13 @@ function createUiRequestServer(options = {}) {
       : hostclient.connect({ sock: options.hostSock, timeoutMs: options.hostConnectTimeoutMs })),
   });
 
+  // Started on the first ⌘F search, not with the worker: most consoles never search.
+  let textSearch = null;
+  const sessionTextSearch = () => {
+    if (!textSearch) textSearch = (options.createSessionTextSearch || require('./session-text-search.js').createSessionTextSearch)();
+    return textSearch;
+  };
+
   const authorized = (req) => keepConsole.authorized(req, { isLocal, token });
   const deny = (res) => json(res, 403, { error: 'unauthorized' });
 
@@ -340,6 +347,13 @@ function createUiRequestServer(options = {}) {
         try { return json(res, 200, dashboardDetail(current.state, url.searchParams.get('kind'), url.searchParams.get('id')), snapshotHeaders()); }
         catch (error) { return json(res, [400, 404].includes(error.status) ? error.status : 500, { error: error.message }); }
       }
+      if (req.method === 'GET' && url.pathname === '/api/session-text-search') {
+        // A superseded query answers null: a newer one from the same finder replaced it.
+        try {
+          const results = await sessionTextSearch().search(url.searchParams.get('q') || '');
+          return json(res, 200, results ? { ok: true, results } : { ok: true, superseded: true, results: [] });
+        } catch (error) { return json(res, error.status || 500, { error: error.message }); }
+      }
       if (req.method === 'GET' && url.pathname === '/api/dashboard-review-search') {
         if (!current) return json(res, 503, { error: 'dashboard state is still loading' }, { 'retry-after': '1' });
         try { return json(res, 200, reviewQueueSearch(current.state, url.searchParams.get('q') || ''), snapshotHeaders()); }
@@ -440,6 +454,7 @@ function createUiRequestServer(options = {}) {
       for (const res of clients) res.end();
       clients.clear();
       bridge.close();
+      textSearch?.close();
       server.close(callback);
     },
     snapshot: () => current,

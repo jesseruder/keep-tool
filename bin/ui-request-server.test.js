@@ -469,3 +469,26 @@ test('a session streams events and opens a pane socket from its own origin, with
   assert.equal(upgrades, 1);
   assert.equal(f.seen.length, 0);
 });
+
+test('session text search answers from the search worker, and says when it was superseded', async (t) => {
+  const queries = [];
+  let closed = 0;
+  const answers = { websocket: [{ sessionId: 's1', snippet: 'x' }], stale: null };
+  const f = await fixture(t, { createSessionTextSearch: () => ({
+    search(query) {
+      queries.push(query);
+      return answers[query] === undefined
+        ? Promise.reject(Object.assign(new Error('session search timed out'), { status: 504 }))
+        : Promise.resolve(answers[query]);
+    },
+    close() { closed += 1; },
+  }) });
+  const search = (query) => request(f.port, `/api/session-text-search?q=${query}`, { headers: { 'x-keep': '1' } });
+  const hit = await search('websocket');
+  assert.equal(hit.status, 200);
+  assert.deepEqual(JSON.parse(hit.body), { ok: true, results: [{ sessionId: 's1', snippet: 'x' }] });
+  assert.deepEqual(JSON.parse((await search('stale')).body), { ok: true, superseded: true, results: [] });
+  assert.equal((await search('slow')).status, 504);
+  assert.deepEqual(queries, ['websocket', 'stale', 'slow']);
+  assert.equal(closed, 0);
+});
