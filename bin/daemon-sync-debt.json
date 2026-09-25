@@ -2655,6 +2655,18 @@
       "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/reminders.js update; this exact synchronous filesystem mutation count is frozen, including fallback branches."
     },
     {
+      "function": "bin/resources.js::registeredResources",
+      "operation": "fs.readdirSync",
+      "count": 1,
+      "reason": "Conservative read/scan debt: the static daemon graph reaches bin/resources.js registeredResources; this exact synchronous operation count is frozen, including test or CLI fallback branches."
+    },
+    {
+      "function": "bin/resources.js::registeredResources",
+      "operation": "fs.readFileSync",
+      "count": 1,
+      "reason": "Conservative read/scan debt: the static daemon graph reaches bin/resources.js registeredResources; this exact synchronous operation count is frozen, including test or CLI fallback branches."
+    },
+    {
       "function": "bin/review-obligations.js::cards",
       "operation": "fs.readdirSync",
       "count": 1,
@@ -6004,9 +6016,11 @@
     "bin/notes.js::sweep|bin/notes.js::dueForNag|1",
     "bin/notes.js::sweep|bin/notes.js::markNagged|3",
     "bin/notes.js::updateNote|bin/notes.js::updateNote>withRegistryLock callback|1",
+    "bin/notes.js::updateNote|bin/notes.js::withRegistryLock|1",
     "bin/notes.js::updateNote>withRegistryLock callback|bin/notes.js::findNote|1",
     "bin/notes.js::updateNote>withRegistryLock callback|bin/notes.js::readFileNotes|1",
     "bin/notes.js::updateNote>withRegistryLock callback|bin/notes.js::writeFileNotes|1",
+    "bin/notes.js::withRegistryLock|bin/keep-core.js::withLock|1",
     "bin/notifications.js::snapshot|bin/alerts.js::readAlerts|1",
     "bin/notifications.js::snapshot|bin/notifications.js::load|1",
     "bin/notifications.js::update|bin/alerts.js::readQuiet|1",
@@ -6141,6 +6155,7 @@
     "bin/reminders.js::snapshot|bin/reminders.js::readState|1",
     "bin/reminders.js::update|bin/reminders.js::readState|1",
     "bin/reminders.js::update|bin/reminders.js::snapshot|1",
+    "bin/resources.js::loadResources|bin/resources.js::registeredResources|1",
     "bin/review-obligations.js::settle|bin/review-obligations.js::cards|1",
     "bin/review-obligations.js::settle|bin/review-obligations.js::settle>commit|1",
     "bin/review-obligations.js::settle|bin/review-obligations.js::settle>right callback|1",
@@ -8063,6 +8078,7 @@
     "bin/turn-watcher.js::judgedState|bin/turn-index.js::open|1",
     "bin/turn-watcher.js::listVerdicts|bin/turn-index.js::open|1",
     "bin/turn-watcher.js::observationFor|bin/notes.js::activeNotes|1",
+    "bin/turn-watcher.js::observationFor|bin/resources.js::loadResources|1",
     "bin/turn-watcher.js::observationFor|bin/watcher-live.js::turnCommands|1",
     "bin/turn-watcher.js::pendingDecisions|bin/turn-watcher.js::watcherLedger|1",
     "bin/turn-watcher.js::pendingDecisionsForSession|bin/turn-watcher.js::watcherLedger|1",

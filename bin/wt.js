@@ -879,6 +879,26 @@ function unpushedMainCommits(main, defaultName) {
   return log ? log.split('\n') : [];
 }
 
+function checkDaemonSyncPolicy(worktree, opts = {}) {
+  const run = opts.syncPolicyCheck || ((tree) => spawnSync(process.execPath, [
+    path.join(tree, 'scripts', 'daemon-sync-policy.cjs'), '--check',
+  ], {
+    cwd: tree,
+    encoding: 'utf8',
+    timeout: 10_000,
+    maxBuffer: 10 * 1024 * 1024,
+  }));
+  const result = run(worktree);
+  if (result && result.status === 0) return;
+  const detail = `${result && result.stdout || ''}${result && result.stderr || ''}`.trim();
+  const cause = result && result.error ? `\n${result.error.message}` : '';
+  die([
+    'daemon sync policy failed after rebase; push refused.',
+    detail || cause.trim() || 'the checker did not return a successful status',
+    'Move the blocking path off the daemon thread, or update bin/daemon-sync-debt.json with a specific reviewed rationale, then rerun wt land.',
+  ].join('\n'));
+}
+
 function landWorktree(input, opts = {}) {
   const worktree = gitTopLevel(input || process.cwd());
   if (!worktree) die(`not a git repo: ${path.resolve(expandHome(input || process.cwd()))}`);
@@ -924,6 +944,7 @@ function landWorktree(input, opts = {}) {
   if (opts.noPush) {
     process.stderr.write(`rebased locally onto origin/${defaultName}; ${count} commit(s) not pushed\n`);
   } else {
+    if (path.basename(main) === 'keep-tool') checkDaemonSyncPolicy(worktree, opts);
     git(worktree, ['push', 'origin', `HEAD:${defaultName}`], { stdio: ['ignore', 2, 2] });
     process.stderr.write(`landed ${count} commit(s) to origin/${defaultName}\n`);
     if (!opts.noDeploy) {
@@ -1513,6 +1534,7 @@ module.exports = {
   guardDecision,
   barePushOfSharedRef,
   unpushedMainCommits,
+  checkDaemonSyncPolicy,
   deployAfterLand,
   healthRegressions,
   watchDeployHealth,

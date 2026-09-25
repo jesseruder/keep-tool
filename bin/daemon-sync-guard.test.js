@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const test = require('node:test');
 const { createAnalyzer, comparePolicy, manifestFrom } = require('../scripts/daemon-sync-policy.cjs');
 
@@ -39,6 +40,16 @@ test('daemon main-thread sync debt matches the exact checked manifest', () => {
   ].join('\n'));
 });
 
+test('standalone policy checker enforces the checked manifest', () => {
+  const result = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'daemon-sync-policy.cjs'), '--check'], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    timeout: 10_000,
+  });
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+  assert.match(result.stdout, /daemon sync policy: ok/);
+});
+
 test('scanner resolves aliases, destructuring, reexports, and helper calls', () => {
   const analysis = analyzeFixture({
     'bin/serve/routes.js': `
@@ -46,8 +57,14 @@ test('scanner resolves aliases, destructuring, reexports, and helper calls', () 
       const read = fs.readFileSync;
       const { spawnSync: run } = require('child_process');
       const wait = Atomics.wait;
+      let reassigned;
+      reassigned = fs.realpathSync;
+      let overwritten = fs.accessSync;
       const helper = require('../helper');
-      function routes() { read('x'); run('x'); wait(new Int32Array(1), 0); helper.go(); }
+      function routes() {
+        read('x'); reassigned('x'); run('x'); wait(new Int32Array(1), 0); helper.go();
+        overwritten('x'); overwritten = () => true;
+      }
       module.exports = { routes };
     `,
     'bin/helper.js': `module.exports = require('./leaf')`,
@@ -58,7 +75,7 @@ test('scanner resolves aliases, destructuring, reexports, and helper calls', () 
     `,
   });
   assert.deepEqual(analysis.sinks.map((item) => item.operation).sort(), [
-    'Atomics.wait', 'child_process.spawnSync', 'fs.readFileSync', 'fs.statSync',
+    'Atomics.wait', 'child_process.spawnSync', 'fs.accessSync', 'fs.readFileSync', 'fs.realpathSync', 'fs.statSync',
   ]);
   assert.ok(analysis.edges.some((edge) => edge.caller.endsWith('::routes') && edge.callee.endsWith('::go')));
 });

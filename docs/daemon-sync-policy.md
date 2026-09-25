@@ -34,6 +34,21 @@ of holding the event loop if later wiring selects it. A manifest diff that adds
 debt needs the same scrutiny as the code that caused it; regenerating the file is
 not a fix.
 
+`wt land` enforces the ratchet for `keep-tool` after rebasing onto the current
+`origin/main` and immediately before it pushes. This closes the interval where an
+upstream commit could add blocking work after a session ran its tests. The gate
+runs only the standalone checker, not the test suite, and never regenerates the
+manifest:
+
+```sh
+node scripts/daemon-sync-policy.cjs --check
+```
+
+A failed check refuses the push and leaves the rebased worktree available for a
+fix. Other repositories do not run this Keep-specific policy. `wt land --no-push`
+also skips the gate because it cannot update the remote; a later pushing
+`wt land` checks the then-current rebased tree.
+
 This is static analysis, with deliberate conservative choices. A callback defined
 inside a reached factory is counted even when a runtime option may disable it.
 The analyzer cannot prove targets selected through runtime mutation, injected

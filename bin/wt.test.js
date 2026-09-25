@@ -33,7 +33,14 @@ function fixture(name = 'sample-repo') {
   git(main, 'config', 'user.email', 'wt@example.test');
   git(main, 'checkout', '-q', '-b', 'main');
   write(path.join(main, 'tracked.txt'), 'initial\n');
-  git(main, 'add', 'tracked.txt');
+  if (name === 'keep-tool') {
+    write(path.join(main, 'scripts', 'daemon-sync-policy.cjs'), [
+      "'use strict';",
+      "if (process.argv.length !== 3 || process.argv[2] !== '--check') process.exitCode = 2;",
+      '',
+    ].join('\n'));
+  }
+  git(main, 'add', '-A');
   git(main, 'commit', '-q', '-m', 'initial');
   git(main, 'push', '-q', '-u', 'origin', 'main');
   git(origin, 'symbolic-ref', 'HEAD', 'refs/heads/main');
@@ -449,6 +456,49 @@ test('land leaves the main checkout of an ordinary repo alone', () => {
     assert.equal(git(f.origin, 'rev-parse', 'main'), sha);
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), before, 'a repo whose checkout is not a deployment is untouched');
     assert.deepEqual(restarts, []);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('keep-tool land checks the rebased tree and refuses the push on policy failure', () => {
+  const f = fixture('keep-tool');
+  try {
+    const worktree = runCli(f, ['new', f.name, 'policy-gate', '--no-install']).stdout.trim();
+    write(path.join(worktree, 'mine.txt'), 'mine\n');
+    write(path.join(worktree, 'scripts', 'daemon-sync-policy.cjs'), [
+      "'use strict';",
+      "process.stderr.write('synthetic blocking path\\n');",
+      'process.exitCode = 1;',
+      '',
+    ].join('\n'));
+    commitIn(worktree, 'introduce policy violation');
+
+    write(path.join(f.main, 'upstream.txt'), 'arrived after the worktree test\n');
+    commitIn(f.main, 'upstream after test');
+    git(f.main, 'push', '-q', 'origin', 'main');
+    const upstream = git(f.origin, 'rev-parse', 'main');
+
+    const refused = runCli(f, ['land', worktree, '--no-deploy']);
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /daemon sync policy failed after rebase; push refused/);
+    assert.match(refused.stderr, /synthetic blocking path/);
+    assert.match(refused.stderr, /update bin\/daemon-sync-debt\.json with a specific reviewed rationale/);
+    assert.equal(git(f.origin, 'rev-parse', 'main'), upstream, 'the remote is unchanged');
+    assert.equal(git(worktree, 'merge-base', '--is-ancestor', upstream, 'HEAD'), '', 'the policy ran after the upstream rebase');
+
+    const localOnly = runCli(f, ['land', worktree, '--no-push']);
+    assert.equal(localOnly.status, 0, localOnly.stderr);
+    assert.match(localOnly.stderr, /not pushed/);
+    assert.equal(git(f.origin, 'rev-parse', 'main'), upstream, '--no-push does not update the remote');
+
+    write(path.join(worktree, 'scripts', 'daemon-sync-policy.cjs'), [
+      "'use strict';",
+      "if (process.argv.length !== 3 || process.argv[2] !== '--check') process.exitCode = 2;",
+      '',
+    ].join('\n'));
+    commitIn(worktree, 'fix policy violation');
+    const landed = runCli(f, ['land', worktree, '--no-deploy']);
+    assert.equal(landed.status, 0, landed.stderr);
+    assert.equal(git(f.origin, 'rev-parse', 'main'), landed.stdout.trim(), 'a passing rebased tree is pushed');
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 

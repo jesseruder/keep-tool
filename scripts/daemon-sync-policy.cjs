@@ -137,20 +137,35 @@ function buildScopes(module) {
   const moduleScope = { parent: null, bindings: new Map(), owner: module.top };
   module.top.scope = moduleScope;
 
-  function bindPattern(pattern, value, scope) {
+  function assignedScope(scope, name) {
+    for (let here = scope; here; here = here.parent) if (here.bindings.has(name)) return here;
+    return scope;
+  }
+
+  function mergedRef(existing, value) {
+    if (!existing) return value;
+    const refs = existing.type === 'multi-ref' ? [...existing.refs] : [existing];
+    refs.push(value);
+    return { type: 'multi-ref', refs };
+  }
+
+  function bindPattern(pattern, value, scope, merge = false) {
     if (!pattern) return;
-    if (pattern.type === 'Identifier') scope.bindings.set(pattern.name, value);
+    if (pattern.type === 'Identifier') {
+      const target = merge ? assignedScope(scope, pattern.name) : scope;
+      target.bindings.set(pattern.name, merge ? mergedRef(target.bindings.get(pattern.name), value) : value);
+    }
     else if (pattern.type === 'AssignmentPattern') {
       // The daemon normally takes the default; tests may inject a replacement.
       // Treat the default as the production capability rather than letting an
       // injectable seam hide a synchronous operation.
-      bindPattern(pattern.left, { type: 'expr-ref', expr: pattern.right, scope }, scope);
+      bindPattern(pattern.left, { type: 'expr-ref', expr: pattern.right, scope }, scope, merge);
     }
     else if (pattern.type === 'ObjectPattern') {
       for (const prop of pattern.properties) {
         if (prop.type !== 'Property') continue;
         const name = prop.computed ? literalString(prop.key) : prop.key.name || prop.key.value;
-        bindPattern(prop.value, { type: 'member-ref', object: value, property: name }, scope);
+        bindPattern(prop.value, { type: 'member-ref', object: value, property: name }, scope, merge);
       }
     }
   }
@@ -165,6 +180,9 @@ function buildScopes(module) {
       for (const param of node.params) bindPattern(param, { type: 'unknown-ref' }, current);
     }
     if (node.type === 'VariableDeclarator') bindPattern(node.id, { type: 'expr-ref', expr: node.init, scope: current }, current);
+    if (node.type === 'AssignmentExpression' && node.operator === '=') {
+      bindPattern(node.left, { type: 'expr-ref', expr: node.right, scope: current }, current, true);
+    }
     if (node.type === 'ClassDeclaration' && node.id) current.bindings.set(node.id.name, { type: 'unknown-ref' });
     for (const child of childNodes(node)) walk(child, current);
   }
@@ -229,6 +247,7 @@ function createAnalyzer(root) {
     seen.add(ref);
     if (ref.type === 'function-ref') return { type: 'function', fn: ref.fn };
     if (ref.type === 'unknown-ref') return { type: 'unknown' };
+    if (ref.type === 'multi-ref') return combineResolved(ref.refs.map((item) => resolveRef(item, module, new Set(seen))));
     if (ref.type === 'expr-ref') return resolveExpr(ref.expr, module, ref.scope, seen);
     if (ref.type === 'member-ref') return memberOf(resolveRef(ref.object, module, seen), ref.property, seen);
     return ref;
@@ -236,6 +255,7 @@ function createAnalyzer(root) {
 
   function memberOf(object, property, seen) {
     if (!property) return { type: 'unknown' };
+    if (object.type === 'multi') return combineResolved(object.values.map((value) => memberOf(value, property, new Set(seen))));
     if (object.type === 'builtin-module') {
       if (object.name === 'fs' && property.endsWith('Sync')) return { type: 'sink', operation: `fs.${property}` };
       if (object.name === 'child_process' && CHILD_SYNC.has(property)) return { type: 'sink', operation: `child_process.${property}` };
@@ -249,6 +269,21 @@ function createAnalyzer(root) {
       return prop ? resolveExpr(prop.value, object.module, object.scope, seen) : { type: 'unknown' };
     }
     return { type: 'unknown' };
+  }
+
+  function combineResolved(values) {
+    const flattened = values.flatMap((value) => value.type === 'multi' ? value.values : [value]);
+    const known = flattened.filter((value) => value.type !== 'unknown');
+    if (!known.length) return { type: 'unknown' };
+    const unique = new Map();
+    for (const value of known) {
+      const key = value.type === 'sink' ? `sink:${value.operation}`
+        : value.type === 'function' ? `function:${value.fn.id}`
+          : value.type === 'local-module' ? `module:${value.module.file}`
+            : `${value.type}:${value.name || ''}`;
+      if (!unique.has(key)) unique.set(key, value);
+    }
+    return unique.size === 1 ? unique.values().next().value : { type: 'multi', values: [...unique.values()] };
   }
 
   function resolveExport(module, name, seen = new Set()) {
@@ -303,16 +338,22 @@ function createAnalyzer(root) {
   function analyzeModule(module) {
     if (module.analyzed) return;
     module.analyzed = true;
-    function walk(node, scope) {
+    function walk(node, scope, owner) {
       let current = scope;
       const fnNode = module.nodeFunction.get(node);
-      if (fnNode?.scope) current = fnNode.scope;
+      if (fnNode?.scope) {
+        current = fnNode.scope;
+        owner = fnNode;
+      }
       if (node.type === 'CallExpression' || node.type === 'NewExpression') {
-        const owner = enclosingFunction(module, node);
         const resolved = resolveExpr(node.callee, module, current);
-        if (resolved.type === 'sink') owner.sinks.push({ operation: resolved.operation, line: node.loc.start.line });
-        else if (resolved.type === 'function') owner.calls.push({ kind: 'function', target: resolved.fn, line: node.loc.start.line });
-        else if (node.callee.type === 'MemberExpression' && staticProperty(node.callee) === null) {
+        const targets = resolved.type === 'multi' ? resolved.values : [resolved];
+        for (const target of targets) {
+          if (target.type === 'sink') owner.sinks.push({ operation: target.operation, line: node.loc.start.line });
+          else if (target.type === 'function') owner.calls.push({ kind: 'function', target: target.fn, line: node.loc.start.line });
+        }
+        if (targets.every((target) => target.type !== 'sink' && target.type !== 'function')
+            && node.callee.type === 'MemberExpression' && staticProperty(node.callee) === null) {
           unresolved.push({ file: module.file, function: owner.lexical, line: node.loc.start.line, reason: 'computed call target' });
         }
         // A function passed to invoke/map/then is executable by that higher-order
@@ -320,13 +361,16 @@ function createAnalyzer(root) {
         for (const argument of node.arguments || []) {
           if (/FunctionExpression$/.test(argument.type) || argument.type === 'ArrowFunctionExpression') continue;
           const passed = resolveExpr(argument, module, current);
-          if (passed.type === 'sink') owner.sinks.push({ operation: passed.operation, line: argument.loc.start.line, passed: true });
-          else if (passed.type === 'function') owner.calls.push({ kind: 'function', target: passed.fn, line: argument.loc.start.line, passed: true });
+          const capabilities = passed.type === 'multi' ? passed.values : [passed];
+          for (const capability of capabilities) {
+            if (capability.type === 'sink') owner.sinks.push({ operation: capability.operation, line: argument.loc.start.line, passed: true });
+            else if (capability.type === 'function') owner.calls.push({ kind: 'function', target: capability.fn, line: argument.loc.start.line, passed: true });
+          }
         }
       }
-      for (const child of childNodes(node)) walk(child, current);
+      for (const child of childNodes(node)) walk(child, current, owner);
     }
-    walk(module.ast, module.top.scope);
+    walk(module.ast, module.top.scope, module.top);
     for (const fn of module.functions) {
       for (const call of fn.calls) if (call.target?.module) analyzeModule(call.target.module);
     }
@@ -386,15 +430,26 @@ function createAnalyzer(root) {
       reachable.set(fn.id, fn);
       for (const call of fn.calls) if (call.target) queue.push(call.target);
     }
-    const blocking = new Set([...reachable.values()].filter((fn) => fn.sinks.length).map((fn) => fn.id));
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const fn of reachable.values()) {
-        if (blocking.has(fn.id)) continue;
-        if (fn.calls.some((call) => call.target && blocking.has(call.target.id))) {
-          blocking.add(fn.id); changed = true;
-        }
+    const blocking = new Set();
+    const blockingQueue = [];
+    const callers = new Map();
+    for (const fn of reachable.values()) {
+      if (fn.sinks.length) {
+        blocking.add(fn.id);
+        blockingQueue.push(fn.id);
+      }
+      for (const call of fn.calls) {
+        if (!call.target || !reachable.has(call.target.id)) continue;
+        const list = callers.get(call.target.id) || [];
+        list.push(fn.id);
+        callers.set(call.target.id, list);
+      }
+    }
+    for (let index = 0; index < blockingQueue.length; index += 1) {
+      for (const caller of callers.get(blockingQueue[index]) || []) {
+        if (blocking.has(caller)) continue;
+        blocking.add(caller);
+        blockingQueue.push(caller);
       }
     }
     const sinks = [];
@@ -419,8 +474,8 @@ function createAnalyzer(root) {
     const predecessors = new Map();
     const pathQueue = [...roots];
     const seenPaths = new Set(roots.map((fn) => fn.id));
-    while (pathQueue.length) {
-      const fn = pathQueue.shift();
+    for (let index = 0; index < pathQueue.length; index += 1) {
+      const fn = pathQueue[index];
       for (const call of fn.calls) {
         if (!call.target || !reachable.has(call.target.id) || seenPaths.has(call.target.id)) continue;
         seenPaths.add(call.target.id);
@@ -511,6 +566,40 @@ function manifestFrom(analysis) {
   };
 }
 
+function checkPolicy(root = path.resolve(__dirname, '..'), manifestFile = path.join(root, 'bin', 'daemon-sync-debt.json')) {
+  const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+  const analysis = createAnalyzer(root).run();
+  return { analysis, problems: comparePolicy(analysis, manifest) };
+}
+
+function runCli(argv) {
+  if (argv.length !== 1 || argv[0] !== '--check') {
+    process.stderr.write('usage: node scripts/daemon-sync-policy.cjs --check\n');
+    return 2;
+  }
+  try {
+    const { analysis, problems } = checkPolicy();
+    if (!problems.length) {
+      process.stdout.write(`daemon sync policy: ok (${analysis.sinks.length} sinks, ${analysis.edges.length} blocking edges, ${analysis.unresolved.length} unresolved calls)\n`);
+      return 0;
+    }
+    const shown = problems.slice(0, 50);
+    process.stderr.write([
+      `daemon sync policy: ${problems.length} violation(s)`,
+      ...shown.map((problem) => `  - ${problem}`),
+      ...(problems.length > shown.length ? [`  - ... ${problems.length - shown.length} more`] : []),
+      'Move the work off the daemon thread. If this is an intentional debt change, update bin/daemon-sync-debt.json with a specific reviewed rationale.',
+      '',
+    ].join('\n'));
+    return 1;
+  } catch (error) {
+    process.stderr.write(`daemon sync policy could not run: ${error.message}\n`);
+    return 1;
+  }
+}
+
 module.exports = {
-  MAIN_SURFACES, KNOWN_WORKER_CHILDREN, createAnalyzer, comparePolicy, manifestFrom,
+  MAIN_SURFACES, KNOWN_WORKER_CHILDREN, createAnalyzer, comparePolicy, manifestFrom, checkPolicy,
 };
+
+if (require.main === module) process.exitCode = runCli(process.argv.slice(2));
