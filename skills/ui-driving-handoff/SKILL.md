@@ -126,8 +126,9 @@ project root, even a worktree; shared checkouts are read by other sessions and a
 working directory need the worker to `cd` into the evidence directory first.
 Maestro is the known offender: `takeScreenshot: <name>` saves `<name>.png` into
 the cwd, not next to the flow file or under `--debug-output`. Keep the raw run
-in scratch; copy only the shots a check-in cites with `keep artifact <card>`, since
-artifacts are committed to the registry for good.
+in scratch; the parent attaches the shots that show the result to its card
+(`keep checkin <card> -m "..." --attach <shot>`), which is where Owner sees them in
+the console. Attach those, not the whole run: artifacts are committed for good.
 
 The worker returns completed steps, screenshots or other evidence, observed
 failures, remaining uncertainty, and final UI state. It reports what it observed

@@ -364,6 +364,8 @@ test('a node\'s tell must come from a session, and its wait is at most a day', a
   // The node's own check applies only these two rules, not the identity ones.
   assert.equal(nodeSideRefusal('tell', ['card', '-m', 'hi', '--wait', '24h']), null);
   assert.equal(nodeSideRefusal('tell', ['card', '--message-file=x']), '--message-file names a file on this node; use -m, or run it from the daemon node');
+  assert.equal(nodeSideRefusal('checkin', ['card', '-m', 'x', '--attach', 'shot.png']), '--attach names a file on this node; use -m, or run it from the daemon node');
+  assert.equal(argumentRefusal('checkin', ['card', '-m', 'x', '--attach', '/etc/passwd'], ME), '--attach names a file on this node; use -m, or run it from the daemon node', 'the daemon never reads its own file for a node');
   assert.equal(nodeSideRefusal('tell', ['card', '-m', '--message-file']), null);
   assert.equal(nodeSideRefusal('checkin', ['card', '--message-file', 'x']), null);
 });

@@ -97,4 +97,6 @@ verdict; "run query 1488 on Redash #109; if either arm has <500 exposures, it is
 ramping" does not. Keep it short, and keep it read-only — a check reports, it does not fix.
 
 Never cite a `/tmp` path in a recipe; macOS purges `/tmp` on reboot. Copy files with
-`keep artifact <card> <file>...` and cite the printed path.
+`keep artifact <card> <file>...` and cite the printed path. A check's evidence (the
+query output, a screenshot) goes on the card with `keep checkin <id> --attach <file>`,
+where Owner sees it in the console.

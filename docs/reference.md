@@ -152,7 +152,10 @@ A card's artifacts (the files `keep artifact` stored under `.keep/artifacts/<car
 from this machine or a node) show in the console: on the stage of a session with a
 card, as one "Artifacts · N" line that opens into thumbnails floating over the
 terminal (in flow on the phone; a press outside closes them), and in an Inbox card's
-notes. `GET /api/card-artifacts?card=<id>` lists them
+notes. `keep checkin <id> -m "..." --attach <file>` stores files the same way and names
+them in the check-in (`Attached: …`); on a node it uploads them first, and the daemon
+refuses a forwarded `--attach`, which would read the daemon's own files.
+`GET /api/card-artifacts?card=<id>` lists them
 (name, size, time, whether an image, content type; newest first, at most 200) and
 `GET /api/card-artifact?card=<id>&name=<name>` serves one. Both take the console's own
 auth and `x-keep: 1`, and never a node token. A name must be a plain file name and
@@ -254,7 +257,7 @@ from the third keystroke on, so the first few characters on a pane arrive unpred
 keep add "title" [--kind task|experiment|idea|chore|bug] [--file|--claim] [--tag t]… [--project p]
                  [--plan "step"…] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review]
                  [--check-every +7d] [--probe "cmd"] [--agent <name>] [--status s] [-m note]
-keep checkin <id> -m "state + next step" [--next "text"] [--commit <sha>]... [--step <n|next>] [--status s] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--agent <name>] [--clear-check-after] [--handoff waiting|needs-input]
+keep checkin <id> -m "state + next step" [--attach <file>]... [--next "text"] [--commit <sha>]... [--step <n|next>] [--status s] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--agent <name>] [--clear-check-after] [--handoff waiting|needs-input]
 keep probe <id>
 keep plan <id> [--set "step"… | --add "text" | --insert <n> "text" | --remove <n>
                 | --done <n> | --start <n> | --undo <n>]

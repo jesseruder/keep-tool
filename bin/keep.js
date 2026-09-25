@@ -454,14 +454,26 @@ function near(a, b) {
 
 
 
+const CHECKIN_FLAGS = { status: 'str', 'check-after': 'str', 'clear-check-after': 'bool', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', agent: 'str', 'experiment-id': 'str', step: 'str', force: 'bool', next: 'str', commit: 'list', handoff: 'str', attach: 'list' };
+const CHECKIN_USAGE = 'usage: keep checkin <id> -m "state + next step" [--attach <file>]... [--next "text"] [--commit sha]... [--step <n|next>] [--status s] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--agent <name>] [--clear-check-after] [--handoff waiting|needs-input] [--force]';
+
+// A check-in's message with the names its --attach files were stored under, so the
+// log says what it showed; the card's artifacts are what the console displays.
+function withAttached(message, names) {
+  return names.length ? `${message}\nAttached: ${names.join(', ')}` : message;
+}
+
 commands.checkin = (argv) => {
-  const o = parseArgs(argv, { status: 'str', 'check-after': 'str', 'clear-check-after': 'bool', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', agent: 'str', 'experiment-id': 'str', step: 'str', force: 'bool', next: 'str', commit: 'list', handoff: 'str' });
+  const o = parseArgs(argv, CHECKIN_FLAGS);
   const id = o._[0];
-  if (!id || !o.m) die('usage: keep checkin <id> -m "state + next step" [--next "text"] [--commit sha]... [--step <n|next>] [--status s] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--agent <name>] [--clear-check-after] [--handoff waiting|needs-input] [--force]');
+  if (!id || !o.m) die(CHECKIN_USAGE);
   const next = cleanNext(o.next);
   const commits = cleanCommits(o.commit);
+  // Stored first, the way `keep artifact` would, so the check-in can name them. A
+  // check-in refused after this leaves them stored, and resending it stores nothing twice.
+  const attached = o.attach ? commands.artifact([id, '--', ...o.attach], { quiet: true }) : [];
   const task = checkinTask(id, {
-    message: o.m, status: o.status, checkAfter: o['check-after'],
+    message: withAttached(o.m, attached.map((result) => path.basename(result.destination))), status: o.status, checkAfter: o['check-after'],
     clearCheckAfter: o['clear-check-after'], check: o.check, experimentId: o['experiment-id'],
     onPass: o['on-pass'], checkEvery: o['check-every'], probe: o.probe, agent: o.agent,
     step: o.step, force: o.force, next, commits, handoff: o.handoff,
@@ -3865,7 +3877,7 @@ function helpText() {
                    # --file records follow-up work without moving this session; ideas file by default
                    # --claim starts an idea now; --file and --claim are mutually exclusive
                    # --autonomous requires both --plan and --allow
-  keep checkin <id> -m "state + next step" [--step <n|next>] [--status s] [--experiment-id id]
+  keep checkin <id> -m "state + next step" [--attach <file>]... [--step <n|next>] [--status s] [--experiment-id id]
                     [--next "text"] [--commit sha]… [--check-after when] [--check "recipe"] [--clear-check-after]
                     [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"]
                     [--handoff waiting|needs-input] [--force]
@@ -4263,6 +4275,36 @@ function paneOnlyRefusal(cmd, args, env = process.env) {
   if (rule === true || (typeof rule === 'function' && rule(args))) return null;
   return `keep ${cmd}: the registry lives on node ${where.daemon}; this is node ${where.local}`;
 }
+// `keep checkin --attach` on a pane-only node. The files are on this node, so they
+// go up the way a node's `keep artifact` does (remote-cli runArtifact), and the
+// check-in is forwarded without --attach, naming what was stored. The daemon refuses
+// a forwarded --attach (registry-commands NODE_FILE_FLAGS): it would read its own files.
+async function checkinRemote(argv, where, deps = {}) {
+  const remote = deps.remote || require('./remote-cli.js');
+  const o = parseArgs(argv, CHECKIN_FLAGS);
+  const id = o._[0];
+  if (!id || !o.m) die(CHECKIN_USAGE);
+  const forwarded = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--') { forwarded.push(...argv.slice(i)); break; }
+    if (arg === '--attach') { i += 1; continue; }
+    forwarded.push(arg);
+    if (arg === '-m' || (arg.startsWith('--') && CHECKIN_FLAGS[arg.slice(2)] !== 'bool')) forwarded.push(argv[++i]);
+  }
+  let names = [];
+  if (o.attach) {
+    const stored = await remote.runArtifact([id, '--', ...o.attach], { where });
+    if (stored.code !== 0) return stored;
+    names = stored.stdout.split('\n').filter(Boolean).map((line) => path.basename(line));
+  }
+  const message = withAttached(o.m, names);
+  const at = forwarded.lastIndexOf('-m');
+  forwarded[at + 1] = message;
+  return remote.runRemote('checkin', forwarded, { where });
+}
+
+module.exports.checkinRemote = checkinRemote;
 module.exports.paneOnlyRefusal = paneOnlyRefusal;
 module.exports.PANE_ONLY_COMMANDS = PANE_ONLY_COMMANDS;
 module.exports.landRemote = landRemote;
@@ -4282,6 +4324,13 @@ if (require.main === module) {
       // `keep nodes` answers for this machine (ls, usage) except `update`, which
       // only the daemon can run: it holds the node list and their tokens.
       const localNodes = cmd === 'nodes' && rest[0] !== 'update';
+      if (remote && cmd === 'checkin' && rest.some((arg) => arg === '--attach')) {
+        const result = await checkinRemote(rest, remote);
+        if (result.stdout) process.stdout.write(result.stdout);
+        if (result.stderr) process.stderr.write(result.stderr);
+        process.exitCode = result.code;
+        return;
+      }
       if (remote && !localNodes && require('./registry-commands.js').isRegistryCommand(cmd || 'list')) {
         // The commits and the Codex job a review names are in this node's worktree and
         // jobs directory, so they are resolved here and sent as facts.

@@ -2698,6 +2698,20 @@ test('artifact copies files into a committed per-card directory and logs the dur
     const afterNote = keep.parseTask(fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8'), 'card');
     assert.match(afterNote.body, new RegExp(`Already stored ${durablePlan.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
     assert.ok(afterNote.body.includes('Same plan, cited again.'));
+
+    // A check-in's --attach stores the file the same way and names it in the check-in.
+    const shot = path.join(sourceB, 'shot.png');
+    fs.writeFileSync(shot, 'png bytes\n');
+    for (const dir of ['archive', 'digests']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    const attached = run(['checkin', 'card', '-m', 'Screen looks right.', '--attach', shot]);
+    assert.equal(attached.status, 0, attached.stderr);
+    assert.equal(fs.readFileSync(path.join(artifactDirectory, 'shot.png'), 'utf8'), 'png bytes\n');
+    const afterAttach = keep.parseTask(fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8'), 'card');
+    assert.ok(afterAttach.body.includes('Screen looks right.\nAttached: shot.png'));
+    const missingAttach = run(['checkin', 'card', '-m', 'Nothing here.', '--attach', path.join(sourceB, 'gone.png')]);
+    assert.notEqual(missingAttach.status, 0);
+    assert.match(missingAttach.stderr, /artifact file does not exist/);
+    assert.ok(!keep.parseTask(fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8'), 'card').body.includes('Nothing here.'));
     assert.notEqual(git('rev-parse', 'HEAD').stdout.trim(), headBeforeAgain);
     assert.equal(git('status', '--porcelain').stdout, '');
     assert.deepEqual(git('show', '--name-only', '--format=', 'HEAD').stdout.trim().split('\n'), ['tasks/card.md']);
@@ -3528,4 +3542,32 @@ test('artifact refuses a card whose index entry is conflicted, before copying an
     assert.match(refused.stderr, /merge conflict in the registry's index; resolve it before storing artifacts/);
     assert.equal(fs.existsSync(path.join(root, '.keep', 'artifacts', 'card', 'shot.png')), false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('checkin --attach on a node uploads the files and forwards the check-in without them', async () => {
+  const { checkinRemote } = require('./keep.js');
+  const calls = [];
+  const remote = {
+    runArtifact: async (argv, deps) => {
+      calls.push(['artifact', argv, deps.where]);
+      return { code: 0, stdout: '/r/.keep/artifacts/card/shot-17.png\n', stderr: '' };
+    },
+    runRemote: async (command, args) => {
+      calls.push([command, args]);
+      return { code: 0, stdout: 'ok\n', stderr: '' };
+    },
+  };
+  const where = { url: 'http://127.0.0.1:1' };
+  const result = await checkinRemote(['card', '--force', '-m', 'Looks right.', '--attach', 'shot.png', '--status', 'done'], where, { remote });
+  assert.equal(result.stdout, 'ok\n');
+  assert.deepEqual(calls, [
+    ['artifact', ['card', '--', 'shot.png'], where],
+    ['checkin', ['card', '--force', '-m', 'Looks right.\nAttached: shot-17.png', '--status', 'done']],
+  ]);
+
+  calls.length = 0;
+  remote.runArtifact = async () => ({ code: 2, stdout: '', stderr: 'keep artifact: too large\n' });
+  const refused = await checkinRemote(['card', '-m', 'x', '--attach', 'big.png'], where, { remote });
+  assert.equal(refused.code, 2);
+  assert.deepEqual(calls, [], 'a refused upload forwards no check-in');
 });

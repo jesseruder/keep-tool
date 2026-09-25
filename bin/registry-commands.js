@@ -88,6 +88,7 @@ const COMMAND_FLAGS = Object.freeze(['--probe', '--done-when', '--verify']);
 const NODE_FILE_FLAGS = Object.freeze({
   tell: ['--message-file'],
   open: ['--message-file'],
+  checkin: ['--attach'],
 });
 
 // A flag that, in that command, names where something happens rather than who is

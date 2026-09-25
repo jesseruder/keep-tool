@@ -1,6 +1,6 @@
 ---
 name: keep
-description: Work-registry conventions for ~/keep. Use when starting substantive work, launching an experiment, resuming work, checking status, or when the user asks what is in flight.
+description: Work-registry conventions for ~/keep. Use when starting substantive work, launching an experiment, resuming work, checking status, attaching a screenshot, report or plan for Owner to see, or when the user asks what is in flight.
 ---
 
 # Keep — work registry
@@ -70,9 +70,16 @@ Load the situational skill when its moment comes, not before:
   title, card and the passage that matched. `--cards` or `--conversations` keeps one
   side; `keep turns show <id>` reads a session's turns. Add `--all` to search tool
   output too (an error message, a command).
-- **Durable artifacts**: never cite a `/tmp` path in a check recipe or check-in;
-  macOS purges `/tmp` on reboot. Run `keep artifact <card> <file>...` to copy files into
-  committed `.keep/artifacts/<card>/`, then cite the printed path. `keep show` lists them.
+- **Show your evidence**: when you produce something Owner would look at — a QA or
+  before/after screenshot, a measurement, a chart, a plan, a report, a log excerpt —
+  attach it to the card: `keep checkin <id> -m "..." --attach <file>` (repeatable), or
+  `keep artifact <card> <file>... -m "what this is"` on its own. The console shows a
+  card's artifacts on its session's stage and in the Inbox, so this is how Owner sees
+  them. It is the default place for work on a card: do not publish claude.ai
+  Artifact pages or send files with SendUserFile unless Owner asks for that. Attach
+  what shows the result, not every scratch file; artifacts are committed for good.
+  Never cite a `/tmp` path in a check recipe or check-in (macOS purges `/tmp` on
+  reboot): attach the file and cite the printed path. `keep show` lists them.
 
 ## Waiting on another card
 
