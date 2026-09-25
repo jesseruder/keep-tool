@@ -121,9 +121,12 @@ function ensureBlob(ctx, card, item) {
 // The full-size view: the image over a dimmed console, closed by a click anywhere or
 // Escape. While it is up it takes every key, ahead of the console's own handlers and a
 // focused terminal (a bare ESC in a Claude pane is an interrupt), and focus leaves the
-// terminal so nothing typed reaches the hidden pane.
+// terminal so nothing typed reaches the hidden pane. Closing gives focus back.
+let viewerReturnFocus = null;
+
 function openViewer(url, name) {
   closeViewer();
+  viewerReturnFocus = document.activeElement;
   const overlay = document.createElement('div');
   overlay.className = 'artifact-viewer';
   overlay.tabIndex = -1;
@@ -148,15 +151,22 @@ function viewerKey(event) {
 
 function closeViewer() {
   window.removeEventListener('keydown', viewerKey, true);
-  document.querySelector('.artifact-viewer')?.remove();
+  const overlay = document.querySelector('.artifact-viewer');
+  if (!overlay) return;
+  overlay.remove();
+  const previous = viewerReturnFocus;
+  viewerReturnFocus = null;
+  if (previous?.isConnected && typeof previous.focus === 'function') previous.focus();
 }
 
 function install(ctx) {
   if (installed || typeof document === 'undefined') return;
   installed = true;
   // The open panel closes on a press outside the artifacts row and its full-size view.
+  // Not on the phone, where it sits in flow and covers nothing: closing it there would
+  // shift the page under the finger that pressed.
   document.addEventListener('pointerdown', (event) => {
-    if (!stageOpen || (event.target instanceof Element && event.target.closest('.stage-artifacts, .artifact-viewer'))) return;
+    if (!stageOpen || document.documentElement.classList.contains('mobile') || (event.target instanceof Element && event.target.closest('.stage-artifacts, .artifact-viewer'))) return;
     stageOpen = false;
     ctx.refresh();
   }, true);
