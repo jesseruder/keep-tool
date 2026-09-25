@@ -1361,7 +1361,8 @@ test('ground truth skips openers nobody typed as a reply, and a bare "let\'s" is
   assert.equal(truth('/Users/jesse/notes.md is out of date').expected, 'quiet');
 
   // "let's" aimed at the proposal is an approval; "let's" plus new work is not.
-  for (const text of ["ok let's do that", "ok let's build that", "yes let's do all of that", "let's go"]) {
+  for (const text of ["ok let's do that", "ok let's build that", "yes let's do all of that", "let's go",
+    "let's go ahead and do it", "let's go for it", "ok let's push", "let's commit that"]) {
     assert.equal(truth(text).expected, 'continue', text);
   }
   for (const text of ["let's test safari on my mac", "let's just do 2", "let's look at a previous week",

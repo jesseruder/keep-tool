@@ -82,7 +82,7 @@ const IN_PROGRESS_RE = /\b(?:is in progress|are in progress|still (?:in progress
 // Only "let's" carrying out what was just proposed ("let's do that", "let's
 // build it", "let's do all of that") or a bare go-ahead counts; "let's revert
 // that" and "let's go with option 2" do not.
-const AFFIRMATIVE_RE = /^(?:(?:ok|okay|yes|yep|y|sure|alright|right)\b[,.!\s]*)?(?:let'?s (?:(?:do|build|implement|ship|land|try|run|start|fix|finish|merge|deploy) (?:all of |both of )?(?:it|that|this|them|those|both)\b|go(?: ahead)?\s*[.!]*\s*$|proceed\b|keep going\b|continue\b)|do that\b|go ahead\b|go\b|do it\b|start\b|build\b|implement\b|figure that out\b|proceed\b|keep going\b|continue\b|run it\b|ship it\b|land it\b|push\b)|^(?:ok|okay|yes|yep|y|sure|alright)\s*[.!]?\s*$/i;
+const AFFIRMATIVE_RE = /^(?:(?:ok|okay|yes|yep|y|sure|alright|right)\b[,.!\s]*)?(?:let'?s (?:(?:do|build|implement|ship|land|try|run|start|fix|finish|merge|deploy|push|commit) (?:all of |both of )?(?:it|that|this|them|those|both)\b|go(?:\s*[.!]*\s*$|\s+ahead\b|\s+for it\b)|push\b|proceed\b|keep going\b|continue\b)|do that\b|go ahead\b|go\b|do it\b|start\b|build\b|implement\b|figure that out\b|proceed\b|keep going\b|continue\b|run it\b|ship it\b|land it\b|push\b)|^(?:ok|okay|yes|yep|y|sure|alright)\s*[.!]?\s*$/i;
 // Owner pushing back on the premise — explicit starters only. Any other question
 // is him opening a new topic, which is not the session's to unblock.
 const PREMISE_CHALLENGE_RE = /^(?:i'?m confused|i don'?t think|do you think that'?s|are you sure|isn'?t|wouldn'?t|shouldn'?t|why (?:did|would) you|that'?s not|i thought)/i;
