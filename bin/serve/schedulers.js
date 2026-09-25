@@ -388,7 +388,9 @@ function startSchedulers(ctx) {
     // empty list as "no check pane is carrying any agent" and idles every card agent.
     listPanes: async () => {
       const result = await listHostPaneResult({}, true);
-      if (!result || !Array.isArray(result.panes)) return null;
+      // An unreadable node list is this node's panes and no idea what else exists:
+      // not a listing any record may be judged orphaned against.
+      if (!result || !Array.isArray(result.panes) || result.configurationUnreadable) return null;
       return { panes: result.panes, missingNodes: result.missingNodes || [] };
     },
     sessions: () => periodicScan(),

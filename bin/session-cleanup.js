@@ -23,7 +23,14 @@ function refusal(session, pane, pinned, now = Date.now(), options = {}) {
     const reason = require('./session-restart').refusal(session, pane, false, { force: options.force === true });
     return reason || (!Number.isFinite(session.mtime) ? 'Session activity time is unknown' : null);
   }
-  if (session.reviewer || session.agentName) return 'Standing agent session is protected';
+  // A card agent's scheduled check is the one standing-agent session the check sweep
+  // may close: a pane Keep opened for that check, still unattended, carrying the same
+  // agent's name. The agent itself is the record, which the sweep idles; a responder
+  // or the reviewer is never a check pane.
+  const checkAgentPane = options.ephemeral === true && !session.reviewer && Boolean(session.agentName)
+    && pane.meta?.ephemeral === 'check' && pane.meta?.unattended === true
+    && pane.meta?.agentName === session.agentName;
+  if ((session.reviewer || session.agentName) && !checkAgentPane) return 'Standing agent session is protected';
   if (options.retirement && session.keepRunningKnown !== true) return 'Keep-running preference state is unknown';
   if (options.retirement && session.keepRunning === true) return 'Session is explicitly kept running';
   // A saved Watch layout is presentation state. Only a viewer that is actually
@@ -149,6 +156,7 @@ function retirementPlan(session, pane, state, now = Date.now(), options = {}) {
   const reason = refusal(session, pane, state.pinned || new Set(), now, {
     automatic: true,
     retirement: true,
+    ...(kind === 'completed-check' ? { ephemeral: true } : {}),
     idleMs,
     activityAt: sinceAt,
   });

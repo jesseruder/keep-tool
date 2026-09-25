@@ -97,6 +97,31 @@ test('real cleanup path closes an idle watched reviewer for restart and preserve
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('a card agent\'s finished check pane may be closed by the check sweep, and nothing else of a standing agent may', () => {
+  const { retirementPlan } = require('./session-cleanup');
+  const now = Date.now();
+  const session = { id: 'chk', kind: 'claude', agentName: 'redash-daily', state: 'idle', endedTurn: true,
+    mtime: now - 60e3, keepRunningKnown: true };
+  const pane = { id: 'p@aws1', alive: true, attached: 0,
+    meta: { sessionId: 'chk', agent: 'claude', ephemeral: 'check', unattended: true, agentName: 'redash-daily' } };
+  const policy = { automatic: true, retirement: true, ephemeral: true, idleMs: 0 };
+  assert.equal(refusal(session, pane, new Set(), now, policy), null);
+  const plan = retirementPlan(session, pane, { allTasks: [] }, now, {});
+  assert.equal(plan.kind, 'completed-check');
+  assert.equal(plan.reason, null);
+  // Owner typed into it (unattended cleared), it is another agent's pane, it is not a
+  // check pane, it is the reviewer, or the caller is not the check sweep: protected.
+  for (const [s, p, options] of [
+    [session, { ...pane, meta: { ...pane.meta, unattended: false } }, policy],
+    [session, { ...pane, meta: { ...pane.meta, agentName: 'sandboxes' } }, policy],
+    [session, { ...pane, meta: { ...pane.meta, ephemeral: undefined } }, policy],
+    [{ ...session, reviewer: true }, pane, policy],
+    [session, pane, { automatic: true, retirement: true, idleMs: 0 }],
+  ]) {
+    assert.match(String(refusal(s, p, new Set(), now, options)), /Standing agent session is protected/);
+  }
+});
+
 test('manual Close permits card review but preserves real prompt and activity guards', () => {
   const now = Date.now();
   for (const kind of ['claude', 'codex']) {
