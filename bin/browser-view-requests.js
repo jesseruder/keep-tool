@@ -113,8 +113,14 @@ function createBrowserViewService(options = {}) {
     const tabId = body.tabId == null || body.tabId === '' ? null : Number(body.tabId);
     if (tabId !== null && !Number.isInteger(tabId)) return refusal(400, 'tab must be a tab id from tabs_context_mcp');
     const at = now();
-    // One view per session: asking again moves it to the new tab and note.
-    const requests = (await load()).filter((r) => r.sessionId !== sessionId);
+    // One view per session: asking again moves it to the new tab and note. A node may
+    // only replace a view it asked for itself.
+    const all = await load();
+    const earlier = all.find((r) => r.sessionId === sessionId);
+    if (earlier && principal && principal.class === 'node' && earlier.node !== node) {
+      return refusal(403, `session ${sessionId.slice(0, 8)} already has a view on ${earlier.node}`);
+    }
+    const requests = all.filter((r) => r !== earlier);
     if (requests.length >= MAX_PENDING_TOTAL) return refusal(429, `${MAX_PENDING_TOTAL} browser views are already waiting on Owner`);
     let id;
     do { id = crypto.randomBytes(4).toString('hex'); } while (requests.some((r) => r.id === id));
@@ -145,6 +151,7 @@ function createBrowserViewService(options = {}) {
       : requests.find((r) => r.sessionId === sessionId);
     if (!target) return { status: 200, body: { closed: false } };
     if (principal && principal.class === 'node') {
+      if (target.node !== principal.node) return refusal(403, `that view belongs to a session on ${target.node}`);
       const denied = callerDenied(principal.node, principal, target.sessionId, text(body.pane, 80) || null);
       if (denied || !body.pane) return denied || refusal(403, 'a node closes a view by naming its pane');
     }

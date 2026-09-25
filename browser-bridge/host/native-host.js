@@ -301,7 +301,8 @@ function routeViewerEvent(message) {
     sendToExtension({ method: "viewer_ack", params: { viewer: message.viewer } });
     return;
   }
-  if (message.event === "viewer_state" && message.state === "stopped") viewerRoutes.delete(message.viewer);
+  // Routes go only with a viewer_stop or the client: a late "stopped" from a start that
+  // failed must not take the route of the start that followed it.
   try {
     client.socket.write(encodeLine({ ...message, viewer: route.viewer }));
   } catch (error) {

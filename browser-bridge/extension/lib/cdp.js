@@ -231,6 +231,22 @@ export async function detach(tabId) {
   } catch {
     // already gone
   }
+  // chrome.debugger.onDetach does not fire for a detach we asked for, and a live view
+  // of this tab has just lost its screencast with it.
+  for (const listener of ownDetachListeners) {
+    try {
+      listener(tabId);
+    } catch (error) {
+      console.warn("browser-bridge: detach listener failed", error);
+    }
+  }
+}
+
+const ownDetachListeners = new Set();
+
+/** Called after this extension detaches a tab itself (see detach). */
+export function onOwnDetach(listener) {
+  ownDetachListeners.add(listener);
 }
 
 /** Attach on demand and retry once if the debugger was detached under us. */

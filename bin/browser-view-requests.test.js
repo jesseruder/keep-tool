@@ -85,6 +85,15 @@ test('a node closes a view only by naming its session\'s pane', async (t) => {
   assert.equal((await service.close(node, { sessionId: SESSION, pane: 'p1@aws1' })).body.closed, true);
 });
 
+test('a node may not close or replace a view another node asked for', async (t) => {
+  const { service } = setup(t);
+  const view = (await service.open(node, ask())).body.request;
+  const other = { class: 'node', node: 'other' };
+  assert.equal((await service.close(other, { id: view.id, pane: 'p5@other' })).status, 403);
+  assert.equal((await service.open(other, ask({ pane: 'p5@other' }))).status, 403);
+  assert.equal((await service.status(SESSION, node)).body.request.id, view.id);
+});
+
 test('a node reads only the views of sessions it runs', async (t) => {
   const { service } = setup(t);
   await service.open(node, ask());

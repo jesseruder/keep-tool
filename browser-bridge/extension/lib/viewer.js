@@ -13,7 +13,7 @@
 // until the viewer says it has drawn one: at most MAX_UNACKED frames are ever in flight,
 // which is what keeps a slow link from queueing seconds of stale pictures.
 
-import { attach, isAttached, send } from "./cdp.js";
+import { attach, isAttached, onOwnDetach, send } from "./cdp.js";
 import { allSessions, tabsInGroup } from "./sessions.js";
 import { CTRL, META, macCommands } from "./keys.js";
 
@@ -204,12 +204,19 @@ export function createViewerHandlers() {
 
   // Something detached the debugger: an agent's session ended, or the tab closed. The
   // view says so and picks the screencast back up if the tab is still there.
-  chrome.debugger.onDetach.addListener((source) => {
+  // Both kinds: a detach from outside (onDetach), and one this extension made itself when
+  // a session ended or a tab left its group (onOwnDetach), which onDetach never reports.
+  chrome.debugger.onDetach.addListener((source) => reattach(source.tabId));
+  onOwnDetach((tabId) => reattach(tabId));
+
+  function reattach(tabId) {
     for (const viewer of viewers.values()) {
-      if (viewer.tabId !== source.tabId) continue;
+      if (viewer.tabId !== tabId) continue;
       viewer.emit({ event: "viewer_state", viewer: viewer.id, state: "detached" });
+      viewer.unacked = 0;
+      viewer.heldAck = null;
       setTimeout(() => {
-        if (viewer.stopped || viewer.tabId !== source.tabId) return;
+        if (viewer.stopped || viewer.tabId !== tabId) return;
         startScreencast(viewer).catch((error) =>
           viewer.emit({
             event: "viewer_state",
@@ -220,7 +227,7 @@ export function createViewerHandlers() {
         );
       }, 500);
     }
-  });
+  }
 
   chrome.tabs.onRemoved.addListener((tabId) => {
     for (const viewer of viewers.values()) {
