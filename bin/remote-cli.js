@@ -418,6 +418,52 @@ async function runArtifact(argv, deps = {}) {
   return answerOf('artifact', where, response);
 }
 
+// One stored artifact's bytes from the daemon (GET /api/node-artifact), for
+// `keep artifact <card> --get <name>` on this node. Resolves { code, bytes } or
+// { code, stdout, stderr } with the daemon's refusal. Bounded by the largest file an
+// artifact may be, plus room, so a daemon answering something else cannot fill memory.
+async function fetchArtifact(where, card, name, deps = {}) {
+  const env = deps.env || process.env;
+  const refused = (why) => ({ code: 2, stdout: '', stderr: `keep artifact: ${why}\n` });
+  const limit = require('./registry-commands.js').ARTIFACT_FILE_MAX_BYTES + 64 * 1024;
+  let url;
+  let token;
+  try {
+    url = daemonBase(where.url);
+    token = deps.token || nodeToken(env, deps.readToken);
+  } catch (error) { return refused(error.message); }
+  const pathname = `/api/node-artifact?card=${encodeURIComponent(card)}&name=${encodeURIComponent(name)}`;
+  const timeoutMs = deps.timeoutMs || artifactTimeoutMs(limit);
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value); } };
+    const req = http.request({
+      hostname: url.hostname.replace(/^\[|\]$/g, ''), port: url.port, path: pathname, method: 'GET', agent: false,
+      headers: { 'x-keep': '1', 'x-keep-node-token': token },
+    }, (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on('data', (chunk) => {
+        size += chunk.length;
+        if (size > limit) { req.destroy(); done(refused(`the daemon on ${where.daemon} sent more than an artifact may be`)); return; }
+        chunks.push(chunk);
+      });
+      res.on('error', (error) => done(refused(error.message)));
+      res.on('end', () => {
+        const bytes = Buffer.concat(chunks);
+        if (res.statusCode === 200) return done({ code: 0, bytes });
+        let message = `HTTP ${res.statusCode}`;
+        try { message = JSON.parse(bytes.toString('utf8')).error || message; } catch {}
+        if (res.statusCode === 404 && message === 'no such artifact') message = `no artifact "${name}" on ${card}; keep artifact ${card} lists them`;
+        done({ code: res.statusCode === 404 ? 1 : 2, stdout: '', stderr: `keep artifact: ${message}\n` });
+      });
+    });
+    const timer = setTimeout(() => { req.destroy(); done(refused(`the daemon on ${where.daemon} did not answer in ${Math.round(timeoutMs / 1000)}s`)); }, timeoutMs);
+    req.on('error', (error) => done(refused(error.message)));
+    req.end();
+  });
+}
+
 // Asks the daemon to deploy its own checkout of `project` at `sha`, and says what
 // happened in wt land's own words. Once, never retried: a restart that happened and
 // lost its answer is not one to ask for again. Resolves { deployed, why }; never
@@ -484,5 +530,5 @@ async function waitForRestart(where, deps = {}) {
 module.exports = {
   deploySelf, waitForRestart,
   REQUEST_TIMEOUT_MS, RETRY_WAITS_MS, RESEND_HORIZON_MS, remoteMode, daemonBase, nodeToken, nodeApiRequest, registryBody, postWithRetry, runRemote, parsed,
-  requestTimeoutMs, runArtifact, artifactTimeoutMs, answerOf, ARTIFACT_LINK_BYTES_PER_SECOND,
+  requestTimeoutMs, runArtifact, fetchArtifact, artifactTimeoutMs, answerOf, ARTIFACT_LINK_BYTES_PER_SECOND,
 };

@@ -170,6 +170,21 @@ and shows them from blob URLs rather than pointing an `<img>` at the route (a se
 cookie alone does not reach it); a thumbnail opens full size in an overlay on the
 console (← and → step through the card's loaded images; a click or Escape closes it;
 the desktop and phone shells drop `window.open`), and any other file is downloaded.
+Every image has a Download button too, beside its thumbnail and in the full-size view.
+The phone's WebView cannot save a blob, so there the console asks
+`POST /api/card-artifact-link` (`{ card, name }`, console auth and `x-keep`) for a
+one-time link and follows it: `GET /api/card-artifact-download?t=<grant>` serves that
+file as an attachment to a session without the header, and the WebView hands the
+navigation to Android's download manager, which sends the cookie. The grant is 32
+random bytes naming one card's one file, lasts a minute (the navigation and the
+download manager each fetch it), and lives in memory; it stands in for `x-keep` only,
+and the worker lets a session reach that one path without the header.
+
+`keep artifact <card> --get <name> [--out <path>] [--force]` copies a stored artifact
+back out: into `--out` when it is a directory, at `--out` otherwise, or as `<name>` in
+the working directory, never over an existing file without `--force`. It reads the file
+by the same checks as the console's route. On a node it fetches the bytes from the
+daemon's `GET /api/node-artifact?card=&name=` (node token and `x-keep`).
 
 The console detects the mobile shell as `window.keepShell`
 (`{ platform, version, post(message) }`, injected before page scripts) and sets
@@ -264,6 +279,7 @@ keep plan <id> [--set "step"… | --add "text" | --insert <n> "text" | --remove 
 keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
 keep show <id>
 keep artifact <card> [--] [<file>...] [-m "note"]
+keep artifact <card> --get <name> [--out <path>] [--force]
 keep claim <card>
 keep link <card> --session <sid> --agent claude|codex
 keep wait-on <card> <upstream>[#<step>] [<upstream>...] -m "why"

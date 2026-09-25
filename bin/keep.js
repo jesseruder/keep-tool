@@ -1325,11 +1325,16 @@ function artifactDirectory(id) {
   return { directory, realDirectory: expected };
 }
 
+const ARTIFACT_USAGE = 'usage: keep artifact <card> [--] [<file>...] [-m "note"] | keep artifact <card> --get <name> [--out <path>] [--force]';
+const ARTIFACT_FLAGS = { get: 'str', out: 'str', force: 'bool' };
+
 commands.artifact = (argv, deps = {}) => {
-  const o = parseArgs(argv, {});
+  const o = parseArgs(argv, ARTIFACT_FLAGS);
   const [id, ...inputs] = o._;
-  if (!id) die('usage: keep artifact <card> [--] [<file>...] [-m "note"]');
+  if (!id) die(ARTIFACT_USAGE);
   if (!/^[A-Za-z0-9_-]+$/.test(id)) die(`invalid artifact card id "${id}"`);
+  if (o.get != null) return artifactGet(id, o, inputs);
+  if (o.out != null || o.force) die(ARTIFACT_USAGE);
   loadTask(id);
 
   if (!inputs.length) {
@@ -1434,6 +1439,28 @@ commands.artifact = (argv, deps = {}) => {
   if (!deps.quiet) for (const result of stored) console.log(result.destination);
   return stored;
 };
+
+// `keep artifact <card> --get <name>`: a stored artifact copied back out as a file,
+// read by the same checks the console's route makes (bin/card-artifacts.js).
+function artifactGetArgs(id, o, inputs) {
+  if (inputs.length || o.m != null) die(ARTIFACT_USAGE);
+  const refusal = require('./registry-commands.js').artifactNameRefusal(o.get);
+  if (refusal) die(`invalid artifact name "${o.get}": ${refusal}`);
+}
+
+async function artifactGet(id, o, inputs) {
+  artifactGetArgs(id, o, inputs);
+  const artifacts = require('./card-artifacts.js');
+  const destination = artifacts.getDestination(o.get, o.out, process.cwd());
+  try {
+    const bytes = await artifacts.readArtifact(ROOT, id, o.get);
+    artifacts.writeFetched(destination, bytes, { force: o.force });
+  } catch (error) {
+    if (error instanceof artifacts.ArtifactError) die(error.status === 404 ? `no artifact "${o.get}" on ${id}; keep artifact ${id} lists them` : error.message);
+    throw error;
+  }
+  console.log(destination);
+}
 
 commands.show = (argv) => {
   const id = argv[0];
@@ -3930,6 +3957,8 @@ function helpText() {
   keep show <id>
   keep artifact <card> [--] [<file>...] [-m "note"]
                          # copies files into committed .keep/artifacts/<card>/ and prints durable paths; use instead of citing /tmp
+  keep artifact <card> --get <name> [--out <path>] [--force]
+                         # copies a stored artifact back out as a file (from a node too) and prints where
   keep wait [--no-hold <project> [--scope <resource>]] [--card <id>[#<n>]] [--lane <project> <step>]
             [--check-due <id>] [--for <duration>] [--interval <seconds>]
   keep wait-on <card> <upstream>[#<step>] [<upstream>[#<step>]...] [--whole] -m "why"
@@ -4307,6 +4336,27 @@ async function checkinRemote(argv, where, deps = {}) {
   return remote.runRemote('checkin', forwarded, { where });
 }
 
+// `keep artifact <card> --get <name>` on a pane-only node: the file is in the
+// daemon's registry, so its bytes come from the daemon's node API.
+async function artifactGetRemote(argv, where, deps = {}) {
+  const o = parseArgs(argv, ARTIFACT_FLAGS);
+  const [id, ...inputs] = o._;
+  if (!id || o.get == null) die(ARTIFACT_USAGE);
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) die(`invalid artifact card id "${id}"`);
+  artifactGetArgs(id, o, inputs);
+  const artifacts = require('./card-artifacts.js');
+  const destination = artifacts.getDestination(o.get, o.out, deps.cwd || process.cwd());
+  const fetched = await (deps.fetchArtifact || require('./remote-cli.js').fetchArtifact)(where, id, o.get);
+  if (fetched.code !== 0) return fetched;
+  try { artifacts.writeFetched(destination, fetched.bytes, { force: o.force }); }
+  catch (error) {
+    if (error instanceof artifacts.ArtifactError) return { code: 1, stdout: '', stderr: `keep artifact: ${error.message}\n` };
+    throw error;
+  }
+  return { code: 0, stdout: `${destination}\n`, stderr: '' };
+}
+
+module.exports.artifactGetRemote = artifactGetRemote;
 module.exports.checkinRemote = checkinRemote;
 module.exports.paneOnlyRefusal = paneOnlyRefusal;
 module.exports.PANE_ONLY_COMMANDS = PANE_ONLY_COMMANDS;
@@ -4352,6 +4402,13 @@ if (require.main === module) {
       }
       // Its files are on this node: they are read here and their bytes posted to the
       // daemon, which stores them with its own CLI (bin/artifact-route.js).
+      if (remote && cmd === 'artifact' && rest.includes('--get')) {
+        const result = await artifactGetRemote(rest, remote);
+        if (result.stdout) process.stdout.write(result.stdout);
+        if (result.stderr) process.stderr.write(result.stderr);
+        process.exitCode = result.code;
+        return;
+      }
       if (remote && cmd === 'artifact') {
         const result = await require('./remote-cli.js').runArtifact(rest, { where: remote });
         if (result.stdout) process.stdout.write(result.stdout);

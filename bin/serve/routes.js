@@ -65,6 +65,19 @@ function routes(ctx) {
         return json(res, result.status, result.body);
       },
     },
+    {
+      // `keep artifact <card> --get <name>` from a pane-only node: one stored file's
+      // bytes, by the same checks the console's route makes (bin/card-artifacts.js).
+      method: 'GET',
+      path: '/api/node-artifact',
+      allow: NODE_API_ALLOW,
+      when: nodeApiEnabled,
+      handle: async ({ req, res, url }) => {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        return require('../card-artifacts.js').serveArtifact(res, keep.ROOT,
+          url.searchParams.get('card'), url.searchParams.get('name'), { json, attachment: true });
+      },
+    },
     // Secret handoff (bin/secret-requests.js). An agent asks from its own machine:
     // the daemon's CLI over loopback, or a node's CLI with its node token, whose
     // node the request is then recorded against. Only the console and the daemon's

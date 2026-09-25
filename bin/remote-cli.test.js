@@ -718,3 +718,28 @@ test('an upload refused for a quota is printed as the daemon\'s refusal and neve
   assert.deepEqual(await runArtifact(['card', 'a.txt'], deps), { code: 2, stdout: '', stderr: `keep artifact: the daemon on main refused: ${message}\n` });
   assert.equal(posts, 1);
 });
+
+test('fetchArtifact reads one artifact\'s bytes from the daemon with the node token, and names a refusal', async (t) => {
+  const { fetchArtifact } = require('./remote-cli.js');
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    seen.push({ url: req.url, token: req.headers['x-keep-node-token'], keep: req.headers['x-keep'] });
+    if (req.url.includes('name=shot.png')) {
+      res.writeHead(200, { 'content-type': 'image/png' });
+      res.end(Buffer.from([0x89, 0x00, 0xff]));
+    } else {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'no such artifact' }));
+    }
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  const where = { url: `http://127.0.0.1:${server.address().port}`, daemon: 'main' };
+  const got = await fetchArtifact(where, 'card', 'shot.png', { token: 'node-secret' });
+  assert.equal(got.code, 0);
+  assert.deepEqual([...got.bytes], [0x89, 0x00, 0xff], 'binary bytes arrive intact');
+  assert.deepEqual(seen[0], { url: '/api/node-artifact?card=card&name=shot.png', token: 'node-secret', keep: '1' });
+  const missing = await fetchArtifact(where, 'card', 'gone.png', { token: 'node-secret' });
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /no artifact "gone\.png" on card/);
+});

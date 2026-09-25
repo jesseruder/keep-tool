@@ -216,3 +216,18 @@ test('a one-time download link serves one artifact as an attachment for a minute
   clock += DOWNLOAD_GRANT_TTL_MS;
   assert.equal(downloadGrant(token, { now: () => clock }), null);
 });
+
+test('a node reads one artifact through its own route, and only where the node API is on', async (t) => {
+  const { root } = registry(t);
+  const on = routes({ keep: { ROOT: root }, json: (res, status, value) => ({ status, value }), nodeApiEnabled: () => true });
+  const off = routes({ keep: { ROOT: root }, json: (res, status, value) => ({ status, value }) });
+  const url = new URL('http://x/api/node-artifact?card=some-card&name=shot.png');
+  assert.equal(matchRoute(off, { req: { method: 'GET', headers: {} }, url }), null);
+  const served = await get(on, '/api/node-artifact?card=some-card&name=shot.png');
+  assert.equal(routeDenial(served.route, { class: 'node', node: 'aws1' }), null);
+  assert.equal(served.status, 200);
+  assert.match(served.headers['content-disposition'], /^attachment/);
+  assert.deepEqual([...served.body], [0x89, 0x50, 0x4e, 0x47]);
+  assert.equal((await get(on, '/api/node-artifact?card=some-card&name=shot.png', {})).status, 403);
+  assert.equal((await get(on, '/api/node-artifact?card=some-card&name=..%2Ftasks')).status, 400);
+});

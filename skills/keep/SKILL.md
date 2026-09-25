@@ -81,7 +81,9 @@ Load the situational skill when its moment comes, not before:
   On a node (aws1), an attached file must be under your home directory: copy a
   scratch screenshot into it first. Never cite a `/tmp` path in a check recipe or
   check-in (macOS purges `/tmp` on reboot): store the file with `keep artifact` and
-  cite the path it prints. `keep show` lists them.
+  cite the path it prints. `keep show` or `keep artifact <card>` lists them, and
+  `keep artifact <card> --get <name> [--out <path>]` copies one back out as a file,
+  from a node too.
 
 ## Waiting on another card
 

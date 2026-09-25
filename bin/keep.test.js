@@ -2699,6 +2699,30 @@ test('artifact copies files into a committed per-card directory and logs the dur
     assert.match(afterNote.body, new RegExp(`Already stored ${durablePlan.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
     assert.ok(afterNote.body.includes('Same plan, cited again.'));
 
+    // --get copies a stored artifact back out: into a directory, to a path, and never
+    // over an existing file without --force.
+    const outDir = path.join(sourceB, 'fetched');
+    fs.mkdirSync(outDir);
+    const got = run(['artifact', 'card', '--get', 'plan.json', '--out', outDir]);
+    assert.equal(got.status, 0, got.stderr);
+    assert.equal(got.stdout.trim(), path.join(outDir, 'plan.json'));
+    assert.equal(fs.readFileSync(path.join(outDir, 'plan.json'), 'utf8'), '{"ready":true}\n');
+    const again2 = run(['artifact', 'card', '--get', 'plan.json', '--out', outDir]);
+    assert.notEqual(again2.status, 0);
+    assert.match(again2.stderr, /already exists; pass --force/);
+    fs.writeFileSync(path.join(outDir, 'plan.json'), 'stale');
+    assert.equal(run(['artifact', 'card', '--get', 'plan.json', '--out', outDir, '--force']).status, 0);
+    assert.equal(fs.readFileSync(path.join(outDir, 'plan.json'), 'utf8'), '{"ready":true}\n');
+    const renamed = run(['artifact', 'card', '--get', 'notes.txt', '--out', path.join(outDir, 'renamed.txt')]);
+    assert.equal(renamed.status, 0, renamed.stderr);
+    assert.equal(fs.readFileSync(path.join(outDir, 'renamed.txt'), 'utf8'), 'durable notes\n');
+    const absent = run(['artifact', 'card', '--get', 'nope.txt', '--out', outDir]);
+    assert.notEqual(absent.status, 0);
+    assert.match(absent.stderr, /no artifact "nope\.txt" on card/);
+    const climbing = run(['artifact', 'card', '--get', '../tasks/card.md', '--out', outDir]);
+    assert.notEqual(climbing.status, 0);
+    assert.match(climbing.stderr, /invalid artifact name/);
+
     // A check-in's --attach stores the file the same way and names it in the check-in.
     const shot = path.join(sourceB, 'shot.png');
     fs.writeFileSync(shot, 'png bytes\n');
@@ -3575,4 +3599,25 @@ test('checkin --attach on a node uploads the files and forwards the check-in wit
   const refused = await checkinRemote(['card', '-m', 'x', '--attach', 'big.png'], where, { remote });
   assert.equal(refused.code, 2);
   assert.deepEqual(calls, [], 'a refused upload forwards no check-in');
+});
+
+test('artifact --get on a node fetches the bytes from the daemon and writes them here', async (t) => {
+  const { artifactGetRemote } = require('./keep.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-artifact-get-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const asked = [];
+  const fetchArtifact = async (where, card, name) => {
+    asked.push([where.url, card, name]);
+    return name === 'shot.png' ? { code: 0, bytes: Buffer.from([1, 2, 3]) } : { code: 1, stdout: '', stderr: 'keep artifact: no artifact\n' };
+  };
+  const where = { url: 'http://127.0.0.1:1', daemon: 'main' };
+  const got = await artifactGetRemote(['card', '--get', 'shot.png'], where, { cwd: dir, fetchArtifact });
+  assert.deepEqual(got, { code: 0, stdout: `${path.join(dir, 'shot.png')}\n`, stderr: '' });
+  assert.deepEqual([...fs.readFileSync(path.join(dir, 'shot.png'))], [1, 2, 3]);
+  const exists = await artifactGetRemote(['card', '--get', 'shot.png'], where, { cwd: dir, fetchArtifact });
+  assert.equal(exists.code, 1);
+  assert.match(exists.stderr, /already exists; pass --force/);
+  const missing = await artifactGetRemote(['card', '--get', 'gone.png'], where, { cwd: dir, fetchArtifact });
+  assert.equal(missing.code, 1);
+  assert.deepEqual(asked.map((entry) => entry[2]), ['shot.png', 'shot.png', 'gone.png']);
 });

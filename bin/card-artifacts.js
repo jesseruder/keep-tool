@@ -189,7 +189,40 @@ function downloadGrant(token, { now = Date.now } = {}) {
   return grant;
 }
 
+// Where `keep artifact <card> --get <name> [--out <path>]` writes: into --out when it
+// is a directory, at --out otherwise, and as <name> in the working directory without
+// one. The name is the artifact's plain file name, so it cannot climb out of there.
+function getDestination(name, out, cwd) {
+  if (!out) return path.join(cwd, name);
+  const target = path.resolve(cwd, out);
+  try { if (fs.statSync(target).isDirectory()) return path.join(target, name); } catch {}
+  return target;
+}
+
+// Writes fetched bytes to a new file, or over one with `force`. Never through a link.
+function writeFetched(destination, bytes, { force = false } = {}) {
+  const flags = force
+    ? fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | (fs.constants.O_NOFOLLOW || 0)
+    : fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL;
+  let fd;
+  try { fd = fs.openSync(destination, flags, 0o644); }
+  catch (error) {
+    if (error.code === 'EEXIST') throw new ArtifactError(409, `${destination} already exists; pass --force to replace it`);
+    if (error.code === 'ELOOP') throw new ArtifactError(409, `${destination} is a link; refusing to write through it`);
+    throw error;
+  }
+  try { fs.writeSync(fd, bytes); } finally { fs.closeSync(fd); }
+}
+
+// One artifact's bytes, read from its checked descriptor. Throws ArtifactError.
+async function readArtifact(root, card, name, { fsp = fs.promises } = {}) {
+  const found = await resolveArtifact(root, card, name, { fsp });
+  try { return await found.handle.readFile(); }
+  finally { await found.handle.close().catch(() => {}); }
+}
+
 module.exports = {
+  getDestination, writeFetched, readArtifact,
   createDownloadGrant, downloadGrant, DOWNLOAD_GRANT_TTL_MS,
   listArtifacts, resolveArtifact, serveArtifact, kindOf, ArtifactError, IMAGE_TYPES, FILE_TYPES, ARTIFACT_CSP, LIST_MAX, CARD_RE,
 };
