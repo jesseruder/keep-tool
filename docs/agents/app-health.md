@@ -79,7 +79,9 @@ Then, all read-only:
    null. Google returns only reviews written or edited in the last 7 days and only those
    with text; star-only ratings are invisible. A review is new when its last-modified
    time is later than the `Reviews cursor:` in the previous check-in; judge only those,
-   and write the newest last-modified time you saw as this pass's cursor. With no cursor
+   and write the newest last-modified time you saw as this pass's cursor — but only when
+   paging reached a null `next_page_token`. If any page failed, judge what you got and
+   carry the previous cursor unchanged, so the next pass reads the rest. With no cursor
    yet (the first pass), judge the last 24 hours.
 
 ## Today's baselines (measured 2026-09-25; update when they drift)
