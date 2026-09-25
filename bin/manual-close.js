@@ -84,6 +84,10 @@ async function manualClose(body, deps) {
     const budgetMs = Math.max(10 * delay, readBudgetMs);
     let confirmed = false;
     let lastError = null;
+    // The release is written from the agent's SessionEnd hook, before the agent exits:
+    // a pane that dies (an agent pane is exec'd under its shell) is waited for, and a
+    // released one still alive at the end of the phase is a shell living on.
+    let released = false;
     for (let i = 0; i < Math.ceil(budgetMs / delay) && now() - started < budgetMs; i++) {
       let pane;
       try { pane = await withinBudget(deps.getPane(body.pane), budgetMs - (now() - started)); }
@@ -97,11 +101,12 @@ async function manualClose(body, deps) {
       // exited. Keep polling for an affirmative host observation within this phase.
       if (pane) {
         confirmed = true;
-        if (ended(verify(pane))) return { closed: true, confirmed, lastError, waitedMs: now() - started };
+        if (!verify(pane).alive) return { closed: true, confirmed, lastError, waitedMs: now() - started };
+        released = releasedBySession(pane);
       }
       await sleep(delay);
     }
-    return { closed: false, confirmed, lastError, waitedMs: now() - started };
+    return { closed: released, confirmed, lastError, waitedMs: now() - started };
   };
   const unconfirmed = (signal, waitedMs, cause) => {
     const seconds = Math.max(0, waitedMs) / 1000;

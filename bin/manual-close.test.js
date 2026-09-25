@@ -73,6 +73,20 @@ test('manual close stops at a released pane whose shell lives on and never signa
   assert.equal((await manualClose(body, f.deps)).forced, false);
   assert.deepEqual(f.calls, ['exit', 'SIGTERM']);
 });
+test('manual close waits for a released agent pane to exit before reporting it closed', async () => {
+  const f = releasing({ paneDies: false });
+  let readsAfterRelease = 0;
+  const get = f.deps.getPane;
+  // The SessionEnd hook releases the pane, then the agent exits a few reads later.
+  f.deps.getPane = async () => {
+    const pane = await get();
+    if (pane.meta.agent === 'shell' && ++readsAfterRelease > 3) return { ...pane, alive: false };
+    return pane;
+  };
+  assert.equal((await manualClose(body, f.deps)).forced, false);
+  assert.deepEqual(f.calls, ['exit', 'SIGTERM']);
+  assert.equal(readsAfterRelease, 4);
+});
 test('manual close signals nothing when /exit releases a shell pane Owner opened', async () => {
   const f = releasing({ gracefulReleases: true, paneDies: false });
   assert.equal((await manualClose(body, f.deps)).forced, false);
