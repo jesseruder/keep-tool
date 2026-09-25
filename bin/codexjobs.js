@@ -72,7 +72,7 @@ async function inspect(deps = {}, only) {
     : [];
   const discoveryState = !discovery.known ? 'unknown' : discovery.complete === true ? 'ok' : 'partial';
   return {
-    report: { discovery: discoveryState, jobs, orphans },
+    report: { discovery: discoveryState, jobs, orphans, ...(discovery.unreadable?.length ? { unreadable: discovery.unreadable } : {}) },
     sourceByJob: new Map(discovery.jobs.map((job) => [sourceKey(job), job])),
   };
 }

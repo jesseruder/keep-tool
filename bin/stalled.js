@@ -293,15 +293,17 @@ async function readCodexStateJobs(options = {}, deps = {}) {
   const jobs = [];
   let readable = inventory.readable !== false;
   let foundRoot = false;
+  // What made the read incomplete, for status to say (paths are this machine's own).
+  const unreadable = inventory.readable === false ? ['account inventory'] : [];
   for (const source of inventory.roots) {
     let dirs;
     try { dirs = fs.readdirSync(source.stateRoot, { withFileTypes: true }); foundRoot = true; }
-    catch (error) { if (error.code !== 'ENOENT') readable = false; continue; }
+    catch (error) { if (error.code !== 'ENOENT') { readable = false; unreadable.push(`${source.stateRoot} (${error.code || 'error'})`); } continue; }
     for (const entry of dirs) {
       if (!entry.isDirectory()) continue;
       const file = path.join(source.stateRoot, entry.name, 'state.json');
       const result = await readCodexStateFile(file, deps);
-      if (!result.readable) readable = false;
+      if (!result.readable) { readable = false; unreadable.push(file); }
       for (const job of result.jobs) {
         if (!['queued', 'running'].includes(job.status)) continue;
         jobs.push({ ...job, status: 'running', accountId: source.accountId || null,
@@ -311,7 +313,7 @@ async function readCodexStateJobs(options = {}, deps = {}) {
       }
     }
   }
-  return { jobs, readable, missing: !foundRoot };
+  return { jobs, readable, missing: !foundRoot, unreadable: unreadable.slice(0, 5) };
 }
 
 function companionScript(options = {}) {
@@ -382,6 +384,7 @@ async function discoverCodexJobs(options = {}, deps = {}) {
     jobs: [...direct.jobs, ...fallback.jobs.filter((job) => !direct.jobs.some((item) => item.id === job.id))],
     known: true,
     complete: false,
+    unreadable: direct.unreadable || [],
   };
 }
 

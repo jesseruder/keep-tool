@@ -154,7 +154,10 @@ async function run(operation, input, deps = {}) {
   if (operation === 'companion-jobs') {
     const options = { root: input.root, fallbackCacheMs: input.fallbackCacheMs,
       processRows: input.processRows || [], psKnown: true, psOutput: input.psOutput || '' };
-    return { codexJobs: require('./codexjobs.js').list(options), piJobs: require('./pi-jobs.js').list(options) };
+    // Both lists are async: returning them unawaited sent the daemon two Promises,
+    // which serialize to nothing, so companion discovery always read partial.
+    const [codexJobs, piJobs] = await Promise.all([require('./codexjobs.js').list(options), require('./pi-jobs.js').list(options)]);
+    return { codexJobs, piJobs };
   }
   if (operation === 'prepare-launch') {
     return require('./launch-prep.js').prepare({ ...(input.options || {}), remote: false });

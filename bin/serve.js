@@ -580,7 +580,10 @@ async function companionSnapshot(deps = {}) {
         ?? (snapshot.discovery && snapshot.discovery !== 'unknown'));
       const complete = snapshots.every((snapshot) => snapshot.complete === true || snapshot.discovery === 'ok');
       return { known, complete, discovery: !known ? 'unknown' : complete ? 'ok' : 'partial',
-        jobs: snapshots.flatMap((snapshot) => snapshot.jobs || []) };
+        jobs: snapshots.flatMap((snapshot) => snapshot.jobs || []),
+        // Which half, and why, when discovery is not ok: status reads it (footerHealth).
+        parts: { codex: result.codexJobs ? { discovery: result.codexJobs.discovery ?? null, unreadable: result.codexJobs.unreadable || [] } : null,
+          pi: result.piJobs ? { discovery: result.piJobs.discovery ?? null } : null } };
     }
     const [codexJobs, piJobs] = await Promise.all([
       Promise.resolve(discoverCodex(shared, deps)),
@@ -13718,7 +13721,8 @@ function buildState(options = {}) {
     setAside: setAsideState.value.items,
     // Plus what this build knew of companion jobs, since it gates the same rule.
     footerHealth: { ...footerStatus, companion: options.companion
-      ? { known: options.companion.known ?? null, complete: options.companion.complete ?? null, discovery: options.companion.discovery ?? null } : null },
+      ? { known: options.companion.known ?? null, complete: options.companion.complete ?? null, discovery: options.companion.discovery ?? null,
+        ...(options.companion.parts ? { parts: options.companion.parts } : {}) } : null },
     stalled: stalledItems,
     unblocked,
     digest,
