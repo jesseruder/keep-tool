@@ -192,33 +192,44 @@ function isHeadlessSession(meta) {
   return meta?.source === 'exec' || meta?.originator === 'codex_exec';
 }
 
-// When the model last answered in this rollout: an agent message or assistant reply.
-// A turn refused for a usage limit ends with an error event and no reply.
-function lastReplyAt(file) {
+// When the model last answered a turn that began after `sinceMs` in this rollout: an
+// agent message or assistant reply following a user message or task start stamped
+// after it. A turn already under way when a limit was recorded can still finish, and
+// a turn refused for a usage limit ends with an error event and no reply.
+function repliedAfter(file, sinceMs = 0) {
+  let turnAt = 0;
   let at = 0;
   for (const line of readTail(file).split('\n')) {
-    if (!line || !line.includes('"agent_message"') && !line.includes('"assistant"')) continue;
+    if (!line || !/"(?:agent_message|assistant|user_message|task_started|user)"/.test(line)) continue;
     let record;
     try { record = JSON.parse(line); } catch { continue; }
     const payload = record?.payload;
+    const time = Date.parse(record?.timestamp);
+    if (!Number.isFinite(time)) continue;
+    const started = (record?.type === 'event_msg' && ['user_message', 'task_started'].includes(payload?.type))
+      || (record?.type === 'response_item' && payload?.type === 'message' && payload.role === 'user');
+    if (started) { turnAt = time; continue; }
     const reply = (record?.type === 'event_msg' && payload?.type === 'agent_message')
       || (record?.type === 'response_item' && payload?.type === 'message' && payload.role === 'assistant');
-    const time = Date.parse(record?.timestamp);
-    if (reply && Number.isFinite(time) && time > at) at = time;
+    if (reply && turnAt > sinceMs && time > at) at = time;
   }
   return at;
 }
 
-// A model reply on a Codex account after `sinceMs`, from any of its rollouts
-// (top-level sessions, reviews, companion tasks): proof a recorded usage limit has
-// lifted, including by a reset the ledger never heard about. Null when none.
+// Rollout mtimes can lag their own record stamps on a coarse or skewed filesystem;
+// mtime only narrows the search, so it gets this much slack.
+const MTIME_SLACK_MS = 5 * 60e3;
+
+// A model reply on a Codex account to a turn begun after `sinceMs`, from any of its
+// rollouts (top-level sessions, reviews, companion tasks): proof a recorded usage
+// limit has lifted, including by a reset the ledger never heard about. Null when none.
 function answeredSince(accountId, sinceMs, env = process.env) {
   const root = configuredRoots(env).find((entry) => entry.accountId === accountId);
   if (!root || !Number.isFinite(sinceMs)) return null;
   for (const { file, stat } of indexedRollouts(root.configDir)) {
-    if (!stat.isFile() || stat.mtimeMs <= sinceMs) continue;
+    if (!stat.isFile() || stat.mtimeMs <= sinceMs - MTIME_SLACK_MS) continue;
     let at = 0;
-    try { at = lastReplyAt(file); } catch { continue; }
+    try { at = repliedAfter(file, sinceMs); } catch { continue; }
     if (at > sinceMs) return { at, file };
   }
   return null;
@@ -572,4 +583,4 @@ function sessionFor(sessionId) {
   return sessionFromRollout(info, stat, loadTitles(record.configDir).get(info.id) || '', Date.now(), record.accountId);
 }
 
-module.exports = { answeredSince, lastReplyAt, scan, invalidate, scanRollout, sessionFor, resolveRollout, isCompanionTask, rolloutFileFor, findRolloutFile, rolloutFilesIn, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, isHeadlessSession, configuredRoots, recentDateDirs, indexedRollouts };
+module.exports = { answeredSince, repliedAfter, scan, invalidate, scanRollout, sessionFor, resolveRollout, isCompanionTask, rolloutFileFor, findRolloutFile, rolloutFilesIn, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, isHeadlessSession, configuredRoots, recentDateDirs, indexedRollouts };

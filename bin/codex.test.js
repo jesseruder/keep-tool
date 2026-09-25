@@ -331,11 +331,21 @@ test('a model reply after a recorded usage limit is found on its account, and an
       { timestamp: at(since + 60e3), type: 'event_msg', payload: { type: 'user_message', message: 'go' } },
       { timestamp: at(since + 61e3), type: 'event_msg', payload: { type: 'error', message: "You've hit your usage limit." } },
     ].map(JSON.stringify).join('\n') + '\n');
-    assert.equal(codex.lastReplyAt(limited), since - 60e3);
+    assert.equal(codex.repliedAfter(limited, 0), 0, 'a reply with no turn start in view does not count');
     assert.equal(codex.answeredSince('codex-test', since, env), null, 'an error after the mark is not a reply');
+
+    // A turn already under way when the limit was recorded finishes after it: not proof.
+    const inflight = path.join(dated, 'rollout-inflight.jsonl');
+    fs.writeFileSync(inflight, [
+      { timestamp: at(since - 30e3), type: 'event_msg', payload: { type: 'task_started' } },
+      { timestamp: at(since + 30e3), type: 'event_msg', payload: { type: 'agent_message', message: 'done' } },
+    ].map(JSON.stringify).join('\n') + '\n');
+    assert.equal(codex.repliedAfter(inflight, since), 0);
+    assert.equal(codex.answeredSince('codex-test', since, env), null, 'an in-flight turn finishing after the mark is not proof');
 
     const answered = path.join(dated, 'rollout-answered.jsonl');
     fs.writeFileSync(answered, [
+      { timestamp: at(since + 110e3), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] } },
       { timestamp: at(since + 120e3), type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] } },
     ].map(JSON.stringify).join('\n') + '\n');
     assert.deepEqual(codex.answeredSince('codex-test', since, env), { at: since + 120e3, file: answered });
