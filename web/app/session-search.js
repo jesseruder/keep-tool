@@ -141,7 +141,8 @@ export function sessionRowHTML(row, index, selected, esc) {
 const TEXT_DELAY_MS = 180;
 const TEXT_MIN = 3;
 
-export function installSessionSearch({ rows, cards = () => [], recentIds, open, reopen = () => {}, start = () => {}, esc, searchText = null }) {
+export function installSessionSearch({ rows, cards = () => [], recentIds, open, reopen = () => {}, start = () => {}, esc, searchText = null,
+  onShow = () => {}, onClose = () => {} }) {
   let dialog, input, list, returnTo = null, all = [], allCards = [], titled = [], matchedCards = [], said = [], results = [], selected = 0;
   let textTimer = 0, textSequence = 0, searching = false, failed = false;
   const render = () => {
@@ -236,7 +237,11 @@ export function installSessionSearch({ rows, cards = () => [], recentIds, open, 
     // A modal dialog always refocuses whatever had focus before showModal(), so
     // show() blurs that first and a dismissal (Escape, the backdrop) restores it here.
     dialog.addEventListener('close', () => {
+      // The event is queued, so it can land after the finder was opened again
+      // (Back, then Search at once on the phone): that one is already stale.
+      if (dialog.open) return;
       stopSearching();
+      onClose();
       const target = returnTo;
       returnTo = null;
       if (target?.isConnected) target.focus();
@@ -245,12 +250,14 @@ export function installSessionSearch({ rows, cards = () => [], recentIds, open, 
   };
   return {
     get open() { return Boolean(dialog?.open); },
+    close() { if (dialog?.open) dialog.close(); },
     show() {
       if (!dialog?.isConnected) build();
       if (!dialog.open) {
         returnTo = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
         returnTo?.blur();
         dialog.showModal();
+        onShow();
       }
       all = rows();
       allCards = cards();

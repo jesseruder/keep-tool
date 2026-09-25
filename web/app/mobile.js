@@ -26,6 +26,7 @@ let stageBar = null;
 let stageTitle = null;
 let filterButton = null;
 let statusButton = null;
+let searchButton = null;
 let alertsTab = null;
 let filterSheet = null;
 let statusSheet = null;
@@ -145,6 +146,14 @@ function build() {
   filterButton.addEventListener('click', () => toggle('filter'));
   bar.prepend(filterButton);
 
+  // The phone has no ⌘F: the finder opens from here, and Back closes it like the
+  // inbox (searchOpened / searchClosed below).
+  searchButton = element('button', 'mobile-search', 'Search');
+  searchButton.type = 'button';
+  searchButton.setAttribute('aria-haspopup', 'dialog');
+  searchButton.addEventListener('click', () => ctx.openSessionSearch?.());
+  filterButton.after(searchButton);
+
   statusButton = element('button', 'mobile-status', '<i></i><span class="mobile-status-label">connecting</span>');
   statusButton.type = 'button';
   statusButton.setAttribute('aria-haspopup', 'dialog');
@@ -223,6 +232,7 @@ function deactivate() {
   pendingStage = false;
   closeDroppedAlerts();
   closeDroppedMenu();
+  ctx.closeSessionSearch?.();
   // The mode is the desktop console's own again; only the entries go.
   rewind(pops);
   reportDepth();
@@ -258,6 +268,7 @@ function open(name, mode) {
 // control, by Back, or by the console re-rendering it away.
 function dropped(entries) {
   closeDroppedAlerts();
+  if (!showing('search')) ctx.closeSessionSearch?.();
   closeDroppedMenu();
   // Losing the tab entry is landing back on Triage.
   if (entries.some((entry) => entry.name === 'tab') && ctx.state.mode !== 'triage') ctx.setMode('triage');
@@ -495,6 +506,16 @@ function headingText() {
   const copy = heading.cloneNode(true);
   copy.querySelectorAll('.num-id, .mark').forEach((node) => node.remove());
   return copy.textContent.trim();
+}
+
+// The session finder is the console's own dialog (session-search.js); on the phone
+// it holds an overlay entry while open, so Android's Back closes it and nothing
+// else. A Forward onto its dead entry is not reopened: a search is not a place.
+export function searchOpened() {
+  if (active && !showing('search')) open('search');
+}
+export function searchClosed() {
+  if (active && showing('search')) close('search');
 }
 
 export function installMobile(context) {

@@ -33,7 +33,7 @@ import { createDetailStore } from './details.js';
 import { handleGradeKey } from './state-line.js';
 import { focusQueueItem, handleLeaveTerminalKey } from './leave-terminal.js';
 import { acknowledgeNotificationClick, installNotificationClicks, notificationPermission, notify, requestPermission, setBadge, shellReady } from './shell.js';
-import { installMobile, mobileActive, openMobileStage, syncMobile } from './mobile.js';
+import { installMobile, mobileActive, openMobileStage, searchClosed, searchOpened, syncMobile } from './mobile.js';
 
 applyTheme();
 
@@ -1327,7 +1327,7 @@ const searchListing = {
   hidden: (session) => isClosingSession(session.id, session.pane),
   liveOf: (session) => Boolean(session.pane && paneMap().get(session.pane)?.alive),
 };
-const sessionSearch = installSessionSearch({ esc, searchText: api.searchSessionText,
+const sessionSearch = installSessionSearch({ esc, searchText: api.searchSessionText, onShow: searchOpened, onClose: searchClosed,
   rows: () => sessionRows(data.sessions, { ...searchListing, tasks: data.tasks, statusOf: sessionLabel }),
   cards: () => cardRows(data.tasks, data.sessions, searchListing),
   recentIds: () => sessionHistory.recent.map((entry) => entry.sessionId).filter(Boolean),
@@ -1348,6 +1348,8 @@ const sessionSearch = installSessionSearch({ esc, searchText: api.searchSessionT
       .catch((error) => toast(`Could not start: ${error.message || error}`));
   },
 });
+ctx.openSessionSearch = () => sessionSearch.show();
+ctx.closeSessionSearch = () => sessionSearch.close();
 function rememberPaneEvent(event) {
   if (!(event.target instanceof Element) || event.target.closest('button, a, input, select') && !event.target.closest('.xterm')) return;
   if (state.mode === 'watch') {

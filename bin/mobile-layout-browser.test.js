@@ -489,6 +489,29 @@ test('isolated browser: the console is usable on a 412px touch screen',
       await wait("!document.querySelector('#notificationsPanel').open"
         + " && history.state && history.state.keepOverlay === 'tab'");
 
+      // The phone has no ⌘F: Search in the bar opens the same finder, which owns
+      // an entry like the inbox, so Back closes it and leaves the tab alone.
+      await evaluate("document.querySelector('.mobile-search').click()");
+      await wait("document.querySelector('.session-search-dialog')?.open && history.state?.keepOverlay === 'search'");
+      await evaluate("(() => { const input = document.querySelector('.session-search-dialog input'); input.value = 'refactor';"
+        + " input.dispatchEvent(new Event('input')); })()");
+      await wait("[...document.querySelectorAll('.session-search-dialog li[data-index]')].some((row) => row.textContent.includes('Refactor the second project'))");
+      assert.ok(await evaluate("document.querySelector('.session-search-dialog').getBoundingClientRect().right <= " + WIDTH),
+        'the finder fits the screen');
+      assert.equal(await evaluate("getComputedStyle(document.querySelector('.session-search-dialog input')).fontSize"), '16px',
+        'a 16px field, so the WebView does not zoom in on focus');
+      await shoot('search');
+      await evaluate('history.back()');
+      await wait("!document.querySelector('.session-search-dialog').open && history.state?.keepOverlay === 'tab'");
+      // Closed by Escape instead, the entry it pushed is rewound, not left behind.
+      // Opened again straight after Back: the close event Back queued lands on the
+      // reopened finder and must not close it.
+      await evaluate("document.querySelector('.mobile-search').click()");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await wait("document.querySelector('.session-search-dialog').open && history.state?.keepOverlay === 'search'");
+      await evaluate("document.querySelector('.session-search-dialog').close()");
+      await wait("!document.querySelector('.session-search-dialog').open && history.state?.keepOverlay === 'tab'");
+
       // ── Standing on a tab other than Triage is an overlay too. Without an
       // entry of its own, Android's Back walked out of the console and closed
       // the app; now it lands on Triage, and only the next one leaves.
@@ -839,6 +862,9 @@ test('isolated browser: the console is usable on a 412px touch screen',
       chrome.kill();
       await exited;
       await new Promise((resolve) => server.close(resolve));
-      fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      // Edge on Linux leaves helper processes writing the profile after the browser
+      // exits; a leftover temp directory must not mask what the test found.
+      try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+      catch (error) { if (error.code !== 'ENOTEMPTY') throw error; }
     }
   });

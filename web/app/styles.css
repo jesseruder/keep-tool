@@ -814,8 +814,8 @@ html.mobile .modes [data-mode="watch"] { display: none; }
    that opens usage and health. Everything else is a tab, a sheet, or gone. */
 html.mobile .bar { flex-wrap: nowrap; gap: 8px; padding-inline: 10px; }
 html.mobile .bar .session-history, html.mobile .bar #soundButton, html.mobile .bar #notificationsButton { display: none; }
-.mobile-filter, .mobile-status { display: none; }
-html.mobile .mobile-filter, html.mobile .mobile-status {
+.mobile-filter, .mobile-status, .mobile-search { display: none; }
+html.mobile .mobile-filter, html.mobile .mobile-status, html.mobile .mobile-search {
   display: inline-flex; align-items: center; gap: 7px; min-height: 44px; max-width: 45vw;
   padding: 6px 12px; border: 1px solid var(--bar-line); border-radius: 18px;
   background: var(--bar-seg); color: var(--bar-muted); font-size: 12px;
@@ -824,6 +824,12 @@ html.mobile .mobile-filter, html.mobile .mobile-status {
 html.mobile .mobile-filter[hidden] { display: none; }
 html.mobile .mobile-filter.on { color: var(--bar-text); background: var(--bar-sel); }
 html.mobile .mobile-status { margin-left: auto; }
+/* The finder on a phone: the top of the screen, above the keyboard, rows sized for a thumb. */
+html.mobile .session-search-dialog { width: calc(100vw - 16px); margin: calc(8px + env(safe-area-inset-top, 0px)) auto auto; max-height: calc(100dvh - 16px); }
+html.mobile .session-search-dialog input { font-size: 16px; padding: 14px; }
+html.mobile .session-search-dialog ul { max-height: calc(100dvh - 120px); }
+html.mobile .session-search-dialog li { padding: 11px 10px; }
+html.mobile .session-search-dialog footer { display: none; }
 html.mobile .mobile-status i { width: 9px; height: 9px; flex: none; border-radius: 50%; background: var(--warn); }
 html.mobile .mobile-status[data-status="live"] i { background: var(--ok); }
 html.mobile .mobile-status[data-status="down"] i, html.mobile .mobile-status[data-status="error"] i { background: var(--bad); }
