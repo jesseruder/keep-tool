@@ -31,9 +31,13 @@ Baselines are from 2026-09-25 (main-branch runs, last two to four weeks):
 | cauldron-game-server | main | `ci-cd`: `validate` → `publish-image` → `promote-approval` → `promote-stable` | validate + publish ~1–2 min | `promote-approval` |
 | castle-sandboxes | main | `ci-cd`: `test` → `publish-image`, `publish-browser-worker`, `publish-host-bundle`; `publish-image` → `promote-approval` → `promote-stable` | test ~1 min, publishes 1.5–2.5 min, promote-stable 3–15 min; ~20% red at `test` | `promote-approval` |
 | castle-client | main | on push: `cauldron-contract` (~30 s); `nightly_appium_test` by cron 08:06 UTC weekdays (~65–95 min) | see Known | opt-in holds only |
-| ws-server, image-server, castle-oracle-server, castle-docs, video-upload-server | main | `ecs` | ~1.5–3 min | none |
+| ws-server, castle-oracle-server, castle-docs, video-upload-server | main | `ecs` | ~1.5–3 min | none |
 | game-server-proxy | main | `build-and-test`, `ecs` | — | none |
-| castle-game-server, scene-creator | master | `build` | rarely pushed | none |
+| castle-game-server | master | `build` | rarely pushed | none |
+
+image-server and scene-creator carry a `.circleci/config.yml` but CircleCI has never
+built either (`ci_list_pipelines` returns none on any branch, checked 2026-09-25), so
+they are not read. That is not a finding; name it only if a pipeline ever appears.
 
 Things that are normal and not findings:
 
