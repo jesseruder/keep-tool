@@ -466,11 +466,12 @@ function withAttached(message, names) {
 commands.checkin = (argv) => {
   const o = parseArgs(argv, CHECKIN_FLAGS);
   const id = o._[0];
-  if (!id || !o.m) die(CHECKIN_USAGE);
+  if (!id || !o.m || !o.m.trim()) die(CHECKIN_USAGE);
   const next = cleanNext(o.next);
   const commits = cleanCommits(o.commit);
   // Stored first, the way `keep artifact` would, so the check-in can name them. A
-  // check-in refused after this leaves them stored, and resending it stores nothing twice.
+  // check-in refused after this leaves them stored; a resend stores an unchanged file
+  // again only when its name was already taken by other content (a timestamped copy).
   const attached = o.attach ? commands.artifact([id, '--', ...o.attach], { quiet: true }) : [];
   const task = checkinTask(id, {
     message: withAttached(o.m, attached.map((result) => path.basename(result.destination))), status: o.status, checkAfter: o['check-after'],
@@ -4283,13 +4284,16 @@ async function checkinRemote(argv, where, deps = {}) {
   const remote = deps.remote || require('./remote-cli.js');
   const o = parseArgs(argv, CHECKIN_FLAGS);
   const id = o._[0];
-  if (!id || !o.m) die(CHECKIN_USAGE);
+  if (!id || !o.m || !o.m.trim()) die(CHECKIN_USAGE);
   const forwarded = [];
+  // Where the message parseArgs reads (the last -m) sits in `forwarded`.
+  let messageAt = -1;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--') { forwarded.push(...argv.slice(i)); break; }
     if (arg === '--attach') { i += 1; continue; }
     forwarded.push(arg);
+    if (arg === '-m') messageAt = forwarded.length;
     if (arg === '-m' || (arg.startsWith('--') && CHECKIN_FLAGS[arg.slice(2)] !== 'bool')) forwarded.push(argv[++i]);
   }
   let names = [];
@@ -4297,10 +4301,9 @@ async function checkinRemote(argv, where, deps = {}) {
     const stored = await remote.runArtifact([id, '--', ...o.attach], { where });
     if (stored.code !== 0) return stored;
     names = stored.stdout.split('\n').filter(Boolean).map((line) => path.basename(line));
+    if (stored.stderr) process.stderr.write(stored.stderr);
   }
-  const message = withAttached(o.m, names);
-  const at = forwarded.lastIndexOf('-m');
-  forwarded[at + 1] = message;
+  forwarded[messageAt] = withAttached(o.m, names);
   return remote.runRemote('checkin', forwarded, { where });
 }
 

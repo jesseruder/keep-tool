@@ -78,8 +78,10 @@ Load the situational skill when its moment comes, not before:
   them. It is the default place for work on a card: do not publish claude.ai
   Artifact pages or send files with SendUserFile unless Owner asks for that. Attach
   what shows the result, not every scratch file; artifacts are committed for good.
-  Never cite a `/tmp` path in a check recipe or check-in (macOS purges `/tmp` on
-  reboot): attach the file and cite the printed path. `keep show` lists them.
+  On a node (aws1), an attached file must be under your home directory: copy a
+  scratch screenshot into it first. Never cite a `/tmp` path in a check recipe or
+  check-in (macOS purges `/tmp` on reboot): store the file with `keep artifact` and
+  cite the path it prints. `keep show` lists them.
 
 ## Waiting on another card
 

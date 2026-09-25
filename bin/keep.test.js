@@ -3565,6 +3565,11 @@ test('checkin --attach on a node uploads the files and forwards the check-in wit
     ['checkin', ['card', '--force', '-m', 'Looks right.\nAttached: shot-17.png', '--status', 'done']],
   ]);
 
+  // A literal -m that is another flag's value, or after --, is not the message.
+  calls.length = 0;
+  await checkinRemote(['card', '-m', 'x', '--attach', 'shot.png', '--next', '-m', '--', '-m'], where, { remote });
+  assert.deepEqual(calls[1], ['checkin', ['card', '-m', 'x\nAttached: shot-17.png', '--next', '-m', '--', '-m']]);
+
   calls.length = 0;
   remote.runArtifact = async () => ({ code: 2, stdout: '', stderr: 'keep artifact: too large\n' });
   const refused = await checkinRemote(['card', '-m', 'x', '--attach', 'big.png'], where, { remote });
