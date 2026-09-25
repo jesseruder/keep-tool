@@ -5756,6 +5756,23 @@ test('agent prompt detection needs Claude\'s ruled input box or the Codex placeh
   assert.equal(agentPromptVisible('codex', CLAUDE_IDLE_SCREEN), false);
 });
 
+test('an empty Claude prompt may carry the dim placeholder suggestion, and typed text never counts as one', () => {
+  const rule = '─'.repeat(30);
+  const box = (line, above = rule) => `Welcome to Claude Code\n\n${above}\n${line}\n${rule}\n  keep  (main)  ctx:4%\n`;
+  // The line as a fresh session draws it: the marker, then the suggestion inside a dim
+  // span, then erase-to-end.
+  const placeholder = '\x1b[39m❯ \x1b[2mTry "fix typecheck errors"\x1b[22m\x1b[K';
+  assert.equal(agentPromptVisible('claude', box(placeholder)), true, 'the placeholder is an empty box');
+  assert.equal(agentPromptVisible('claude', box(placeholder, '──────────────────── fable-fleet-reviewer ─')), true,
+    'under a named session\'s rule too');
+  assert.equal(agentPromptVisible('claude', box('❯')), true, 'a bare marker still is');
+  assert.equal(agentPromptVisible('claude', box('\x1b[39m❯ hello\x1b[K')), false, 'typed text is not dim');
+  assert.equal(agentPromptVisible('claude', box('\x1b[39m❯ \x1b[2mTry\x1b[22m more\x1b[K')), false, 'plain text after the span was typed');
+  assert.equal(agentPromptVisible('claude', box('\x1b[2m❯ Try "fix typecheck errors"\x1b[22m\x1b[K')), false,
+    'a dim span opened before the marker is not the placeholder');
+  assert.equal(agentPromptVisible('claude', `Loading\n${placeholder}\n`), false, 'no rule above, no prompt');
+});
+
 function checkDeliveryFixture(fm, sessions, closed = []) {
   const resolved = [];
   const sent = [];

@@ -9199,7 +9199,14 @@ async function sendWithoutTranscript(session, target, text, opts, deps = {}) {
   if (!agentPromptVisible('claude', screen)) {
     throw refuse(`session ${where} has no transcript yet and ${target.pane} does not show Claude's empty prompt; nothing was sent`, screen);
   }
-  try { sendPrecheck(screen); } catch (error) { throw Object.assign(error, { nothingTyped: true, typingStarted: false }); }
+  // The box itself is the bottom-most prompt line, and it must be empty the way
+  // agentPromptVisible reads one: bare, or holding only the dim placeholder, which
+  // sendPrecheck would take for a draft. An empty box above a lower draft is not it.
+  const promptRows = String(screen || '').split(/\r?\n/).slice(-10)
+    .filter((line) => /^\s*❯(?:\s|$)/.test(stripTerminalAnsi(line)));
+  if (!promptRows.length || !EMPTY_CLAUDE_PROMPT_RAW.test(promptRows[promptRows.length - 1])) {
+    throw refuse('the session input box already contains text; clear it in the terminal first', screen);
+  }
   const after = await livePaneState(target.pane, deps);
   if (!after || after.pid !== before.pid || after.inputCount !== before.inputCount) {
     throw refuse('input arrived while the prompt was checked; nothing was sent');
@@ -9541,12 +9548,26 @@ const DIALOG_CONFIRM_GRACE_MS = 600;
 // A bare `❯` alone is not enough: the shell prompt in these panes can be `❯` too,
 // and a stale one stays on screen while Claude loads (or after it exits). Claude's
 // input box draws a horizontal rule directly above its prompt line; a shell never does.
+//
+// An empty box may also carry Claude's placeholder suggestion (`❯ Try "…"`), which it
+// draws dim. Dimness is the only thing that tells it from text someone typed, so the
+// prompt line is matched raw, before any escape is stripped: the marker, spaces, at
+// most one dim span (SGR 2 … SGR 22) with no other escape inside it, and then nothing
+// but SGR or erase escapes and spaces. Typed text is never dim, a plain word after the
+// span is typed, and a dim span opened before the marker is not the placeholder's, so
+// escapes before the marker may be anything but a dim one.
+const EMPTY_CLAUDE_PROMPT_RAW = new RegExp(
+  '^(?:\\s|\\x1b\\[(?:(?:[013-9]\\d*|2\\d+)(?:;(?:[013-9]\\d*|2\\d+))*)?m)*'
+  + '❯ *(?:\\x1b\\[2m[^\\x1b]*\\x1b\\[22m)?(?:\\s|\\x1b\\[[0-9;]*[mK])*$');
+
 function agentPromptVisible(agent, screen) {
-  const lines = String(screen || '').split(/\r?\n/).map((line) => line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ''));
+  const raw = String(screen || '').split(/\r?\n/);
+  const lines = raw.map((line) => line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ''));
   if (agent === 'codex') return lines.some((line) => line.includes('› Ask Codex to do anything'));
   const bottom = lines.slice(-12);
+  const bottomRaw = raw.slice(-12);
   for (let index = bottom.length - 1; index > 0; index -= 1) {
-    if (!/^\s*❯\s*$/.test(bottom[index])) continue;
+    if (!EMPTY_CLAUDE_PROMPT_RAW.test(bottomRaw[index])) continue;
     // A named session draws its name into the rule: "──── fable-fleet-reviewer ─".
     if (/^\s*─{10,}\s*$/.test(bottom[index - 1])
         || /^\s*─{20,}\s\S[^─]{0,80}\s─\s*$/.test(bottom[index - 1])) return true;

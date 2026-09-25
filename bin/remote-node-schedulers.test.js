@@ -530,6 +530,27 @@ test('send: a pane\'s lastInputAt still in the future on this clock is no eviden
   assert.deepEqual(fake.state.submitted, ['clock skew']);
 });
 
+test('send: a fresh session\'s box holding only Claude\'s dim placeholder is empty, and one with a draft under it is not', async (t) => {
+  const fleet = createRemoteNodeFleet(t);
+  const serve = require('./serve.js');
+  t.after(() => serve.closeHostClient());
+  const placeholder = '\x1b[39m❯ \x1b[2mTry "fix typecheck errors"\x1b[22m\x1b[K';
+  const send = async (screen, text) => {
+    await serve.closeHostClient();
+    const fake = freshPaneHosts(fleet, { screen });
+    const result = serve.sendToSession({ sessionId: fleet.unmirrored.id, pane: fleet.unmirrored.pane, text }, undefined, undefined, fake.deps);
+    return { fake, result };
+  };
+  // Claude drops the suggestion as soon as a key is typed.
+  const fresh = await send((draft) => (draft ? emptyPrompt(draft) : `Claude Code\n${RULE}\n${placeholder}\n${RULE}\n`), 'past the placeholder');
+  assert.equal((await fresh.result).transcriptPending, true);
+  assert.deepEqual(fresh.fake.state.submitted, ['past the placeholder']);
+  // An empty-looking box drawn above the real one, which holds a draft.
+  const drafted = await send(() => `${RULE}\n${placeholder}\n${RULE}\n❯ half a sentence\n${RULE}\n`, 'over a draft');
+  await assert.rejects(drafted.result, /the session input box already contains text/);
+  assert.equal(drafted.fake.state.inputs, 0);
+});
+
 test('send: a card tell ranks a fresh node session after the card\'s thread with turns, and picks it only when it is the only one', async (t) => {
   const fleet = createRemoteNodeFleet(t);
   const serve = require('./serve.js');
