@@ -57,6 +57,31 @@ async function withHost(options, body) {
   }
 }
 
+test('an exited pane leaves no file descriptors behind in the host', async () => {
+  // node-pty 1.1.0 on macOS kept each pane's slave fd and its exit kqueue open in the
+  // host for good, and with the slave held the master never saw EIO either: a host up
+  // for weeks held 460 of the Mac's 511 PTYs. The host runs in this process, so its
+  // descriptors are this process's.
+  const openFds = () => fs.readdirSync('/dev/fd').length;
+  await withHost({}, async ({ client }) => {
+    // One pane first, so whatever a first spawn sets up for good is in the baseline.
+    const warm = (await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'exit 0'] })).pane;
+    await waitFor(async () => !(await client.request('get', { pane: warm.id })).pane.alive, 'warm-up exit');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const baseline = openFds();
+    const panes = [];
+    for (let i = 0; i < 10; i += 1) {
+      panes.push((await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'exit 0'] })).pane);
+    }
+    for (const pane of panes) {
+      await waitFor(async () => !(await client.request('get', { pane: pane.id })).pane.alive, `pane ${pane.id} exit`);
+    }
+    // A pane reads as exited only after node-pty has closed its master, so what can
+    // still be open here is what 1.1.0 leaked on macOS: the slave and the exit kqueue.
+    await waitFor(() => openFds() <= baseline + 2, `open fds back to ${baseline}`, 5000);
+  });
+});
+
 test('replace-exited preserves pane identity and refuses live or stale processes', async () => {
   await withHost({}, async ({ client }) => {
     assert.equal((await client.request('hello')).replaceExited, true);
