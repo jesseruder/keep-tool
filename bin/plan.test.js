@@ -448,31 +448,29 @@ test('a Stop block carries the compaction hint, and shares its window with the p
   } finally { f.cleanup(); }
 });
 
-// A session on another node cannot be compacted by the daemon yet, and `keep compact`
-// is refused there, so its hint sends it to /compact. The daemon runs a node session's
-// hooks with KEEP_HOOK_NODE naming that node (hook-route), and its own node for a local
-// caller, whose sessions keep the ordinary hint.
-test('the compaction hint for a session on another node says /compact, not keep compact', () => {
+// The daemon compacts a Claude session on another node too, and a node forwards
+// `keep compact` to it, so a node session gets the same hint as any other. The daemon
+// runs a node session's hooks with KEEP_HOOK_NODE naming that node (hook-route), and its
+// own node for a local caller.
+test('the compaction hint for a session on another node says keep compact, like any other', () => {
   const f = registryFixture();
   try {
     const onNode = { KEEP_HOOK_NODE: 'aws1', KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' };
-    const nodeHint = '[keep] context is 280k tokens. When this turn reaches a stopping point, run /compact yourself; Keep cannot compact a session on this node yet.';
     const transcript = path.join(f.root, 'hint-node.jsonl');
     fs.writeFileSync(transcript, interactive() + sized(280000, 'Finished a chunk.'));
 
     const linked = writeLinkedCard(f, { sid: 'claude-hint-node' });
     const blocked = JSON.parse(stop(f, linked, transcript, onNode).stdout);
     assert.equal(blocked.decision, 'block');
-    assert.ok(blocked.reason.endsWith(`\n\n${nodeHint}`), blocked.reason);
-    assert.doesNotMatch(blocked.reason, /keep compact/);
-    assert.equal(prompt(f, linked, transcript, onNode).stdout, '', 'the node wording shares the one window');
+    assert.ok(blocked.reason.endsWith(`\n\n${HINT_280K}`), blocked.reason);
+    assert.doesNotMatch(blocked.reason, /\/compact yourself/);
+    assert.equal(prompt(f, linked, transcript, onNode).stdout, '', 'the node session shares the one window');
 
     const project = path.join(f.root, 'unlinked-project');
     fs.mkdirSync(project, { recursive: true });
     const viaPrompt = prompt(f, { sid: 'claude-hint-node-prompt', project }, transcript, onNode);
     assert.deepEqual(JSON.parse(viaPrompt.stdout),
-      { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: nodeHint } });
-
+      { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: HINT_280K } });
     const local = prompt(f, { sid: 'claude-hint-daemon-node', project }, transcript, { ...onNode, KEEP_HOOK_NODE: 'main' });
     assert.equal(JSON.parse(local.stdout).hookSpecificOutput.additionalContext, HINT_280K);
     // A single-node install names no node at all: the daemon's name defaults to

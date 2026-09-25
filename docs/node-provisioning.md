@@ -214,7 +214,8 @@ a node.** Run against a fleet where some sessions live on another node, a tick m
   session through anything local: where the work would type into the pane, compact it,
   close it, verify it against its transcript or move it, the session is skipped with a
   reason that names its node, or the action goes through that node's host the way
-  delivery and `keep move` do.
+  delivery, `keep move` and a Claude session's compaction do (typed into its pane
+  there, on its current model, watched for in the mirror).
 
 `findSessionFile` keeps throwing for a session on another node on purpose. Its callers
 deliver, move or verify against the file, and a mirror trails the node by a hook post, so

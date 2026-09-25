@@ -889,7 +889,7 @@ function routes(ctx) {
       method: 'POST',
       path: '/api/compact-request',
       handle: async ({ res, body }) => {
-        try { return json(res, 200, requestSessionCompaction(body)); }
+        try { return json(res, 200, await requestSessionCompaction(body)); }
         catch (e) {
           if (e instanceof InjectionError) return json(res, e.status, { error: e.message });
           return json(res, 500, { error: String(e && e.message || e).slice(0, 500) });

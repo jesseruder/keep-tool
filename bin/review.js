@@ -4772,26 +4772,30 @@ async function reviewerCompactTick(deps) {
   const save = options.saveMeta || saveMeta;
   const meta = load();
   const sessions = options.sessions ? await options.sessions() : [];
+  // The host's panes, so a reviewer on another node is found as the review tick finds
+  // it (remoteReviewerRows): the scan is this machine's transcripts only.
+  let panes;
+  if (!options.reviewer && options.hostPanes) {
+    try { panes = await options.hostPanes(); } catch { panes = undefined; }
+  }
   let reviewer = options.reviewer
     ? options.reviewer(sessions, meta)
-    : findReviewerSession(sessions, meta.bootstrapAttempts);
+    : findReviewerSession(sessions, meta.bootstrapAttempts, { panes });
   if (!reviewer) return { compacted: false, skipped: true, why: 'no live reviewer session registered' };
-  // Compaction types into the pane, and the daemon refuses that on another node
-  // (refuseRemoteCompaction), so a reviewer there is skipped rather than failed.
-  // The node comes from the session's location record: the scanned rows carry no
-  // `node`, and may be a stale local copy from before the session moved. The skip is
-  // `expected`: a reviewer on a node is a placement, not a fault, so it clears the
-  // row's streak instead of leaving an old failure red until a compaction that
-  // cannot happen there.
+  // A reviewer on another node is compacted from here too, on its current model
+  // (serve.js refuseRemoteCompaction). What changes is where it is read: its transcript
+  // is the daemon's mirror of it (readableSessionFile, and serve.js sessionLastTurn for
+  // its context), and its last look before typing is its node's own read of it. The
+  // node comes from the session's location record: the scanned rows carry no `node`,
+  // and may be a stale local copy from before the session moved.
   const daemonNode = (options.daemonNode || (() => require('./nodes.js').daemonNode()))();
   let reviewerNode = null;
   try {
     reviewerNode = (options.sessionNode || ((id) => require('./accounts').sessionNode(id)))(reviewer.id);
   } catch {}
   reviewerNode ||= reviewer.node || null;
-  if (reviewerNode && reviewerNode !== daemonNode) {
-    return { compacted: false, skipped: true, expected: true, why: `reviewer runs on node ${reviewerNode}; compaction there is not supported yet` };
-  }
+  const remote = Boolean(reviewerNode && reviewerNode !== daemonNode);
+  if (remote) reviewer = { ...reviewer, node: reviewerNode };
   let transcriptMtime;
   if (options.transcriptMtime) transcriptMtime = options.transcriptMtime(reviewer);
   else {
@@ -4807,7 +4811,14 @@ async function reviewerCompactTick(deps) {
   // closes the remaining race, but this catches a turn that began after the first scan.
   if (options.sessions) {
     // Fresh, unlike the first look: this is the read the injection decision rests on.
-    const fresh = (await options.sessions({ fresh: true })).find((session) => session && session.id === reviewer.id);
+    // For a reviewer on another node that is its node's read (options.loadSession): a
+    // row this machine's scan has for it is the copy a move left behind.
+    let fresh;
+    if (remote && options.loadSession) {
+      try { fresh = await options.loadSession(reviewer.id); } catch { fresh = null; }
+    } else {
+      fresh = (await options.sessions({ fresh: true })).find((session) => session && session.id === reviewer.id);
+    }
     if (!fresh) return { compacted: false, skipped: true, why: 'reviewer session disappeared' };
     reviewer = fresh;
     decision = reviewerCompactDecision({ meta, reviewer, transcriptMtime, contextTokens, now, minTokens });

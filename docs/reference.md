@@ -1851,6 +1851,14 @@ so it reaches the project's sibling sessions on every node the way a tell does, 
 author left out; a sibling it cannot reach is reported as unreached. As for the other
 forwarded commands, the project must be an absolute path, `~/…` or a bare name.
 
+`keep compact` is forwarded in its request forms. A bare one runs under the node
+session's identity, so the request it files names that session, and is refused without
+one; `keep compact <sid> --when-idle` files a request for the session it names. An id
+without `--when-idle` is refused on the node: it would compact at once, and the daemon's
+CLI waits for that for up to `KEEP_COMPACT_TIMEOUT_MS`, past the minute a forwarded
+command is given. The daemon compacts a Claude session on a node on its current model
+(see Auto-compact). `keep verify <card>` is forwarded as it is and needs no session.
+
 `keep artifact` from a node sends the files themselves, since the paths name files the
 daemon does not have. The node's CLI reads each one and posts it to the daemon's
 `POST /api/artifact` with its basename, size, sha256 and bytes, under the same node
@@ -3061,6 +3069,21 @@ Reopening on another account treats the target as cold and compacts only after t
 handoff reaches its target pane. Claude swap records retain the account settings path so
 interrupted restore and shutdown repair that profile. If model restoration is unconfirmed,
 Keep keeps the pane available for inspection and does not deliver the opening message.
+A session reopened on another node is not compacted at reopen: the turn the decision
+rests on is read from the session's own transcript, which is on that node. The daemon
+logs the skip and delivers the opening message; `keep compact` from inside the session
+compacts it once it is up.
+
+A Claude session on another node is compacted by the daemon on its current model, never
+through the swap below: the swap rewrites the daemon's own `settings.json` and keeps its
+restore record there. The `/compact` is typed into the session's pane through its node's
+host, and the daemon watches its mirror of the session's transcript
+(`.keep/transcript-mirrors/<node>/<id>.jsonl`) for the marker, with the screen as the
+other witness. The mirror advances only on the node's hook posts, and a mirror reset
+(the node's transcript replaced) re-anchors the watch at the mirror's new end rather than
+reading an older compaction's marker. Its context and model come from the same mirror.
+A Codex session on another node is refused: its cold fallback rewrites the Codex
+configuration and relaunches the session, both on the node.
 
 Cold Claude compactions whose transcript model matches `KEEP_AUTO_COMPACT_MODELS` (a
 comma-separated family list, default `fable,opus`) first switch the session to
@@ -3195,12 +3218,16 @@ the fallback at once. A request works on any Claude or Codex model: one outside 
 sweep's families (`KEEP_AUTO_COMPACT_MODELS`, `gpt-6-astra`) has no fallback, so it
 compacts on its own model whatever the cache age, even with no usage record, unless
 that model's window is spent, when the request waits. Everything else still applies —
-busy and waiting sessions, live panes, other nodes, the per-mtime stamp — and requested
-sessions go first. A session with a pending model-swap record (`.swap.json`) is not
+busy and waiting sessions, live panes, the per-mtime stamp — and requested sessions go
+first. A requested Claude session on another node is judged by the daemon's mirror of
+its transcript (the tick's scan is the daemon's own transcripts, and never reads the
+copy a move left behind), read again through its node under the lock before anything is
+typed, and compacted on its own model whatever the cache age (a node that does not
+answer is a retryable skip); its stamp carries `node` and `pathReason: remote-node`. A session with a pending model-swap record (`.swap.json`) is not
 compacted on request until the record clears; the request stays. A request expires
 after `KEEP_COMPACT_REQUEST_TTL_MIN` (default 30) minutes, is spent by any attempt (a
-retryable skip keeps it), and is refused for Pi and reviewer sessions and for a session
-on another node. A new Claude prompt voids it: `keep hook prompt` deletes the request,
+retryable skip keeps it), and is refused for Pi and reviewer sessions and for a Codex
+session on another node. A new Claude prompt voids it: `keep hook prompt` deletes the request,
 because new work arrived before the idle moment and the agent can ask again at the end
 of that turn; a Stop block that sends the agent on with more work voids it the same
 way. Codex has no prompt hook, so a Codex request is voided only by expiry, an

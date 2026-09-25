@@ -59,25 +59,39 @@ test('review: every card session is located through its mirror, a node Codex ses
   });
 });
 
-test('review: the compact tick skips a reviewer on the node by its location record, reading nothing', async (t) => {
+test('review: the compact tick reads a reviewer on the node from its mirror and compacts it there', async (t) => {
   const fleet = createRemoteNodeFleet(t);
   const { reviewerCompactTick } = require('./review.js');
-  let compacted = 0;
+  const { sessionLastTurn } = require('./serve.js');
+  const compacted = [];
+  const results = {};
   for (const session of [fleet.mirrored, fleet.unmirrored]) {
     // A bare row: the location record decides, not the row.
     const reviewer = fleet.row(session, { reviewer: true }, { bare: true });
-    const result = await reviewerCompactTick({
-      loadMeta: () => ({}), saveMeta: () => {},
-      reviewer: () => reviewer, sessions: () => [reviewer],
-      transcriptMtime: () => { throw new Error('read a reviewer on another node'); },
-      sessionContextTokens: () => { throw new Error('read a reviewer on another node'); },
-      compact: async () => { compacted += 1; return { compacted: true }; },
+    const now = Date.now();
+    results[session.name] = await reviewerCompactTick({
+      now: () => now,
+      loadMeta: () => ({ lastTickAt: now - 60e3, lastCompactAt: 0 }), saveMeta: () => {},
+      reviewer: () => reviewer,
+      sessions: (options) => {
+        if (options?.fresh) throw new Error('the last look took the stale local copy');
+        return [reviewer];
+      },
+      // The node's own read, for the last look before typing.
+      loadSession: async (id) => fleet.row(fleet.all.find((candidate) => candidate.id === id), { reviewer: true }),
+      // The daemon's own reader (serve.js sessionContextTokens is this): the mirror's
+      // context, the fixture's one turn, never the copy.
+      sessionContextTokens: (row) => sessionLastTurn(row).contextTokens,
+      minTokens: 1000,
+      compact: async (id) => { compacted.push(id); return { compacted: true }; },
     });
-    assert.equal(result.skipped, true);
-    assert.equal(result.expected, true);
-    assert.match(result.why, /runs on node aws1/);
   }
-  assert.equal(compacted, 0);
+  // Read from the mirror (idle for five minutes, 1200 tokens in its turn) and compacted.
+  assert.equal(results.mirrored.compacted, true, JSON.stringify(results.mirrored));
+  assert.deepEqual(compacted, [fleet.mirrored.id]);
+  // Nothing mirrored: no transcript time to judge it by, so it waits; the stale copy is never read.
+  assert.equal(results.unmirrored.skipped, true);
+  assert.match(results.unmirrored.why, /still warm/);
 });
 
 test('review: a bootstrap message to a reviewer on the node is decided by the node, and typed only into its pane there', async (t) => {

@@ -3081,22 +3081,6 @@ function promptHook(input) {
 // transcript tail exactly as the daemon's compaction sweep reads it.
 const COMPACT_HINT_WINDOW_MS = 2 * 3600e3;
 
-// Whether this hook speaks for a session on a node other than the daemon's, where
-// `keep compact` is refused because the daemon cannot compact a session there yet: a
-// hook run on a pane-only node itself, or one the daemon runs for a node's session
-// (hook-route sets KEEP_HOOK_NODE to the calling node, and to its own for a local
-// caller). Such a session is told to run /compact itself.
-function sessionOnOtherNode(env) {
-  const nodes = require('../nodes.js');
-  if (nodes.paneOnlyNode(env)) return true;
-  const hookNode = env.KEEP_HOOK_NODE;
-  // The daemon's own name defaults to `main` when nothing names it: a single-node
-  // install sets neither variable, and its local hooks must keep the local wording.
-  let daemon = null;
-  try { daemon = nodes.daemonNode(env); } catch { return false; }
-  return Boolean(hookNode && hookNode !== daemon);
-}
-
 function compactHint(sid, transcript, agent) {
   const hint = { text: '', used: false, add: (reason) => reason, mark: () => {} };
   const marker = path.join(META, 'compact-hinted', sid);
@@ -3110,9 +3094,9 @@ function compactHint(sid, transcript, agent) {
   try { contextTokens = lastTurnUsage(readTranscriptTail(transcript), agent).contextTokens; } catch { return hint; }
   if (!(contextTokens >= minTokens)) return hint;
   const tokens = `[keep] context is ${Math.round(contextTokens / 1000)}k tokens. When this turn reaches a stopping point,`;
-  hint.text = sessionOnOtherNode(process.env)
-    ? `${tokens} run /compact yourself; Keep cannot compact a session on this node yet.`
-    : `${tokens} run keep compact so the daemon compacts the session while it is idle.`;
+  // The same words on every node: a session on another node asks the daemon too
+  // (`keep compact` is forwarded there), which compacts it on its current model.
+  hint.text = `${tokens} run keep compact so the daemon compacts the session while it is idle.`;
   hint.mark = () => {
     try { fs.mkdirSync(path.dirname(marker), { recursive: true }); fs.writeFileSync(marker, nowStamp()); } catch {}
   };

@@ -3103,20 +3103,26 @@ test('POST /api/compact-request files a compaction request, and /api/compact has
     'pi-session': { id: 'pi-session', kind: 'pi' },
     'reviewer-session': { id: 'reviewer-session', kind: 'claude', reviewer: true },
     'far-session': { id: 'far-session', kind: 'claude', node: 'aws1' },
+    'far-codex': { id: 'far-codex', kind: 'codex', node: 'aws1' },
   };
-  const deps = { dir, loadCurrentSession: (id) => {
+  // A session on another node is read through its node (loadSessionForAction).
+  const deps = { dir, loadSessionForAction: async (id) => {
     if (!sessions[id]) throw new InjectionError(404, 'no session');
     return sessions[id];
   } };
-  const result = requestSessionCompaction({ sessionId: 'agent-session', by: 'agent', reason: 'landed' }, deps);
+  const result = await requestSessionCompaction({ sessionId: 'agent-session', by: 'agent', reason: 'landed' }, deps);
   assert.deepEqual(Object.keys(result).sort(), ['expiresAt', 'ok', 'requested', 'sessionId']);
   assert.equal(result.requested, true);
   const saved = readCompactRequest('agent-session', dir);
   assert.deepEqual([saved.by, saved.reason, saved.expiresAt], ['agent', 'landed', result.expiresAt]);
-  const refused = (id) => assert.throws(() => requestSessionCompaction({ sessionId: id }, deps),
+  // A Claude session on another node is compacted by the daemon too, so its request is filed.
+  assert.equal((await requestSessionCompaction({ sessionId: 'far-session', by: 'agent' }, deps)).requested, true);
+  assert.equal(readCompactRequest('far-session', dir)?.by, 'agent');
+  const refused = (id) => assert.rejects(requestSessionCompaction({ sessionId: id }, deps),
     (error) => error instanceof InjectionError && error.status === (id === 'missing' ? 404 : 409));
-  for (const id of ['pi-session', 'reviewer-session', 'far-session', 'missing']) refused(id);
+  for (const id of ['pi-session', 'reviewer-session', 'far-codex', 'missing']) await refused(id);
   assert.equal(readCompactRequest('reviewer-session', dir), null);
+  assert.equal(readCompactRequest('far-codex', dir), null);
 
   // The route: its own path, so a daemon too old to know it answers 404 rather than
   // compacting now; no lock is taken. /api/compact is the immediate compaction, as before.
@@ -3339,82 +3345,206 @@ test('auto-compact tick filters dead panes before reading context or spending a 
   assert.equal(decisions.length, 1);
 });
 
-test('auto-compact never picks a session running on another node', async (t) => {
-  const { withTwoNodeFleet } = require('./fixtures/two-node-hosts.js');
-  const { closeHostClient, listHostPanes, hostRequest } = require('./serve');
-  const { connect } = require('./hostclient.js');
-  const previous = process.env.KEEP_AUTO_COMPACT;
-  process.env.KEEP_AUTO_COMPACT = 'dry';
-  t.after(() => {
-    if (previous === undefined) delete process.env.KEEP_AUTO_COMPACT;
-    else process.env.KEEP_AUTO_COMPACT = previous;
+// A Claude session on another node, from bin/fixtures/remote-node-fleet.js, whose
+// mirror gains one more ended turn of `contextTokens` (on `model`), appended the way a
+// node's hook post lands. Answers the mirror's path.
+function mirrorLargeTurn(fleet, session, { contextTokens = 60000, model = 'claude-fable-5-1' } = {}) {
+  const { claudeTranscript } = require('./fixtures/remote-node-fleet.js');
+  const mirror = require('./transcript-mirror.js');
+  const lines = claudeTranscript({ sessionId: session.id, cwd: fleet.project, text: 'a large turn', at: Date.now() - 6 * 60e3 })
+    .trim().split('\n').map((line) => JSON.parse(line));
+  lines[1].message.usage.input_tokens = contextTokens;
+  lines[1].message.model = model;
+  const bytes = Buffer.from(`${lines.map((line) => JSON.stringify(line)).join('\n')}\n`);
+  const current = mirror.stat(fleet.root, fleet.remoteNode, session.id);
+  const appended = mirror.append({
+    root: fleet.root, node: fleet.remoteNode, sessionId: session.id, generation: current.generation,
+    fromOffset: current.size, size: current.size + bytes.length, mtimeMs: Date.now() - 5 * 60e3,
+    sourcePath: current.sourcePath, bytes,
   });
-  await withTwoNodeFleet(t, async ({ root, registry, env, accountId, agentPath }) => {
-    await closeHostClient();
-    const fleetDeps = { root: registry, env, connectHost: connect };
-    try {
-      const spawn = async (node, sessionId) => (await hostRequest('spawn', {
-        cmd: '/bin/sh', args: ['-c', `exec claude --resume ${sessionId}`],
-        cwd: root, env: { PATH: agentPath },
-        meta: { agent: 'claude', sessionId, accountId, accountLabel: 'Node claude' },
-      }, { ...fleetDeps, node })).pane;
-      await spawn('main', 'compact-here');
-      const far = await spawn('aws1', 'compact-far');
-      assert.match(far.id, /@aws1$/);
-      const mtime = Date.now() - 2 * 60 * 60e3;
-      const sessions = ['compact-here', 'compact-far']
-        .map((id) => ({ id, kind: 'claude', endedTurn: true, mtime, accountId }));
-      const reads = [];
-      const decisions = [];
-      const outcome = await autoCompactTick({
-        ...fleetDeps,
-        sweepPendingCompactSwaps: async () => ({ checked: 0 }),
-        gcAutoCompactStamps: () => {},
-        readAutoCompactStamps: () => ({}),
-        scanSessions: () => sessions,
-        // The real fleet listing, through both hosts: the node stamp and the
-        // qualified pane id are the ones the daemon publishes.
-        listHostPanes: async () => listHostPanes(fleetDeps, true),
-        sessionLastTurn: (session) => {
-          reads.push(session.id);
-          return { contextTokens: 140000, model: 'claude-fable-5-1', usageAt: mtime };
-        },
-        writeAutoCompactDecision: (stamp) => decisions.push(stamp),
-        logAutoCompactDecision: () => {},
-      });
-      assert.equal(outcome.ok, true);
-      // Not merely dropped at the end: the session on aws1 never had its context read.
-      assert.deepEqual(reads, ['compact-here']);
-      assert.deepEqual(decisions.map((stamp) => stamp.sessionId), ['compact-here'],
-        'the daemon node still compacts its own, exactly as before');
-    } finally {
-      await closeHostClient();
-    }
-  });
+  assert.equal(appended.ok, true, JSON.stringify(appended));
+  return current.path;
+}
+
+test('auto-compact compacts a requested Claude session on another node from its mirror, never its stale copy', async (t) => {
+  const { createRemoteNodeFleet } = require('./fixtures/remote-node-fleet.js');
+  const fleet = createRemoteNodeFleet(t);
+  const prior = process.env.KEEP_AUTO_COMPACT;
+  delete process.env.KEEP_AUTO_COMPACT;
+  t.after(() => prior === undefined ? delete process.env.KEEP_AUTO_COMPACT : process.env.KEEP_AUTO_COMPACT = prior);
+  mirrorLargeTurn(fleet, fleet.mirrored);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-node-compact-tick-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const now = Date.now();
+  // Both node sessions asked; the Codex one is not compacted on a node at all.
+  const requests = new Map([fleet.mirrored, fleet.remoteCodex, fleet.unmirrored].map((session) =>
+    [session.id, { sessionId: session.id, by: 'agent', expiresAt: now + 60e3 }]));
+  const lastTurnReads = [];
+  const compacted = [];
+  const decisions = [];
+  const cleared = [];
+  let nodeRead = async (id) => ({ ...fleet.row(fleet.mirrored), id, node: fleet.remoteNode, mtime: now - 5 * 60e3 });
+  const deps = {
+    autoCompactDir: dir,
+    sweepPendingCompactSwaps: async () => ({ checked: 0 }), gcAutoCompactStamps: () => {},
+    readAutoCompactStamps: () => ({}),
+    readCompactRequests: () => requests,
+    clearCompactRequest: (id) => cleared.push(id),
+    // The scan is this machine's: it has the stale copy the move left behind, as a bare row.
+    scanSessions: () => [fleet.row(fleet.mirrored, {}, { bare: true })],
+    listHostPanes: async () => fleet.panes(),
+    sessionLastTurn: (session) => { lastTurnReads.push(session.id); return { contextTokens: 900000, model: 'claude-fable-5-1', usageAt: now }; },
+    withInjectionLock: async (fn) => fn(),
+    loadCurrentSession: () => assert.fail('a node session is read through its node'),
+    loadSessionForAction: (id) => nodeRead(id),
+    resolveSessionTarget: async (session) => ({ pane: session.id === fleet.mirrored.id ? fleet.mirrored.pane : 'wrong' }),
+    readScreen: async () => '❯ ',
+    compactSession: async (session, target, instruction, options) => {
+      compacted.push({ id: session.id, node: session.node, pane: target.pane, policy: options.compactionPolicy });
+      return { compacted: true, via: null, compactionModel: session.model };
+    },
+    writeAutoCompactDecision: (stamp) => decisions.push(stamp), logAutoCompactDecision: () => {},
+  };
+
+  // The node cannot be asked right now: a retryable skip, and the request stays.
+  nodeRead = async () => { throw new InjectionError(409, 'node aws1 did not answer'); };
+  assert.deepEqual(await autoCompactTick(deps), { ok: true, detail: 'nothing due', holdResult: true });
+  assert.deepEqual([compacted, cleared, decisions], [[], [], []]);
+
+  nodeRead = async (id) => ({ ...fleet.row(fleet.mirrored), id, node: fleet.remoteNode, mtime: now - 5 * 60e3 });
+  assert.equal((await autoCompactTick(deps)).detail, 'compacted');
+  assert.deepEqual(lastTurnReads, [], 'the stale local copy was never read');
+  assert.deepEqual(compacted.map(({ id, node, pane }) => [id, node, pane]), [[fleet.mirrored.id, 'aws1', fleet.mirrored.pane]]);
+  const policy = compacted[0].policy;
+  assert.deepEqual([policy.path, policy.originalModel, policy.targetModel, policy.reason, policy.cacheUsageAt],
+    ['warm-current', 'claude-fable-5-1', 'claude-fable-5-1', 'remote-node', null]);
+  assert.equal(decisions.length, 1);
+  const [stamp] = decisions;
+  assert.deepEqual([stamp.sessionId, stamp.node, stamp.result, stamp.contextTokens, stamp.pathReason, stamp.requested],
+    [fleet.mirrored.id, 'aws1', 'compacted', 60000, 'remote-node', true]);
+  assert.deepEqual(cleared, [fleet.mirrored.id]);
 });
 
-test('compaction and its model swap refuse a session on another node', async (t) => {
-  const { compactSession, compactSessionTransaction, writePendingCompactSwap,
-    sweepPendingCompactSwaps, autoCompactCandidates: candidates } = require('./serve');
-  const session = { id: 'far-session', kind: 'claude' };
-  const refusal = (error) => error.status === 409
-    && error.message === 'compaction is not available for a session on aws1';
-  // The console's compact button reaches compactSession; the Codex cold fallback
-  // reaches the transaction directly. Both refuse, and before any lock is taken.
-  await assert.rejects(compactSession(session, { pane: 'p1@aws1' }, null), refusal);
-  await assert.rejects(compactSessionTransaction(session, { pane: 'p1@aws1' }, null), refusal);
-  assert.throws(() => writePendingCompactSwap({ id: 'far-session', node: 'aws1' },
-    { originalModel: 'claude-fable-5-1', restoreCommand: '/model claude-fable-5-1' }), refusal);
+test('compaction of a Claude session on another node types /compact there on its current model and watches the mirror', async (t) => {
+  const { createRemoteNodeFleet } = require('./fixtures/remote-node-fleet.js');
+  const { compactSession, compactSessionTransaction, writePendingCompactSwap } = require('./serve');
+  const mirror = require('./transcript-mirror.js');
+  const fleet = createRemoteNodeFleet(t);
+  const file = mirrorLargeTurn(fleet, fleet.mirrored);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-node-compact-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const priorTimeout = process.env.KEEP_COMPACT_TIMEOUT_MS;
+  process.env.KEEP_COMPACT_TIMEOUT_MS = '3000';
+  t.after(() => priorTimeout === undefined ? delete process.env.KEEP_COMPACT_TIMEOUT_MS
+    : process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout);
+  const session = { id: fleet.mirrored.id, kind: 'claude' };
+  const target = { pane: fleet.mirrored.pane };
+  const boundary = `${JSON.stringify({ type: 'system', subtype: 'compact_boundary', timestamp: new Date().toISOString() })}\n`;
+  // What a hook post from the node appends: the mirror's own continuity rules apply.
+  const post = (text, generation) => {
+    const current = mirror.stat(fleet.root, fleet.remoteNode, session.id);
+    const bytes = Buffer.from(text);
+    const fresh = generation && generation !== current.generation;
+    const result = mirror.append({
+      root: fleet.root, node: fleet.remoteNode, sessionId: session.id, generation: generation || current.generation,
+      fromOffset: fresh ? 0 : current.size, size: (fresh ? 0 : current.size) + bytes.length, mtimeMs: Date.now(),
+      sourcePath: current.sourcePath, bytes,
+    });
+    assert.equal(result.ok, true, JSON.stringify(result));
+  };
+  const never = (what) => () => assert.fail(`${what} for a session on another node`);
+  const base = {
+    dir, compactPollMs: 5, compactMarkerGraceMs: 0,
+    compactTrace: () => ({ start() {}, submitted() {}, screenError() {}, poll() {}, finish() {} }),
+    readClaudeSettingsModel: never('read settings.json'),
+    hostPaneModel: never('read the launch model'),
+    waitForModelSwitch: never('waited for a model switch'),
+    repairClaudeSettingsModel: never('repaired settings.json'),
+  };
 
-  // The candidate rule drops it wherever the row came from.
+  // The marker arrives in the mirror, as the node's hook posts it after /compact.
+  const typed = [];
+  const byMarker = await compactSession(session, target, null, { ...base,
+    readScreen: async () => '❯ ',
+    typeAndSubmit: async (into, command) => { typed.push([into.pane, command]); post(boundary); },
+  });
+  assert.deepEqual(typed, [[fleet.mirrored.pane, '/compact']], 'no /model was typed, only the compaction');
+  assert.equal(byMarker.compacted, true);
+  assert.equal(byMarker.confirmedBy, undefined);
+  assert.equal(byMarker.via, null);
+  assert.equal(byMarker.compactionPath, 'manual-current');
+  assert.equal(byMarker.originalModel, 'claude-fable-5-1', 'its last turn was read from the mirror');
+  assert.deepEqual(fs.readdirSync(dir), [], 'no swap record was written');
+
+  // The mirror lags and is then reset under the watch (a new generation renamed over
+  // it, longer than the old offset and ending in an older compaction's marker): that
+  // marker is not this compaction's. The screen confirms it instead.
+  const before = fs.readFileSync(file, 'utf8');
+  let reads = 0;
+  const byScreen = await compactSessionTransaction(session, target, null, { ...base,
+    typeAndSubmit: async () => {},
+    readScreen: async () => {
+      reads += 1;
+      if (reads === 1) {
+        post(`${before}${boundary}`, 'fixture-replaced');
+        return '❯ ';
+      }
+      return '❯ /compact\n  ⎿  Compacted (ctrl+o to see full summary)\n\n❯ ';
+    },
+  });
+  assert.equal(byScreen.compacted, true);
+  assert.equal(byScreen.confirmedBy, 'screen');
+  assert.deepEqual(fs.readdirSync(dir), []);
+
+  // Nothing mirrored: refused before anything is typed.
+  const unmirrored = await compactSessionTransaction({ id: fleet.unmirrored.id, kind: 'claude' }, { pane: fleet.unmirrored.pane }, null,
+    { ...base, typeAndSubmit: never('typed'), readScreen: never('read the screen') });
+  assert.deepEqual([unmirrored.compacted, unmirrored.reason], [false, 'no transcript of this session on aws1 is mirrored here']);
+
+  // A Codex session on a node is refused at the door, before any lock is taken, and so
+  // is Pi; the swap record is never written for a session elsewhere.
+  const codexRefusal = (error) => error.status === 409
+    && /^compaction of a Codex session on aws1 is not supported yet/.test(error.message);
+  const codexSession = { id: fleet.remoteCodex.id, kind: 'codex' };
+  await assert.rejects(compactSession(codexSession, { pane: fleet.remoteCodex.pane }, null, base), codexRefusal);
+  await assert.rejects(compactSessionTransaction(codexSession, { pane: fleet.remoteCodex.pane }, null, base), codexRefusal);
+  await assert.rejects(compactSession({ id: 'far-pi', kind: 'pi' }, { pane: 'p1@aws1' }, null, base),
+    (error) => error.status === 409 && error.message === 'compaction is not available for a session on aws1');
+  assert.throws(() => writePendingCompactSwap({ id: 'far-session', node: 'aws1' },
+    { originalModel: 'claude-fable-5-1', restoreCommand: '/model claude-fable-5-1' }, dir),
+  (error) => error.status === 409 && error.message === 'the compaction model swap is not available for a session on aws1');
+
+  // A reopen does not compact a session on another node, and never refuses its opening
+  // message over it: the skip is an answer, not an error.
+  const { compactReopenedSession } = require('./serve');
+  const reopened = await compactReopenedSession({ id: fleet.mirrored.id, kind: 'claude' }, { pane: fleet.mirrored.pane },
+    fleet.accounts.claude, { model: 'claude-fable-5-1', contextTokens: 400000, usageAt: Date.now() - 3 * 3600e3 },
+    { ...base, compactSession: never('compacted at reopen'), precheckSessionTarget: never('prechecked at reopen') });
+  assert.equal(reopened, null);
+});
+
+test('a session on another node is compacted on its own model or not at all, and its restore record is never ours', async (t) => {
+  const { sweepPendingCompactSwaps, autoCompactCandidates: candidates } = require('./serve');
+  // The candidate rule: a Claude row on a node is compacted on request on its own
+  // model, never through the fallback, and never by the sweep alone, warm or cold; a
+  // spent model and a Codex session on a node are never candidates.
   const now = Date.now();
   const row = (extra) => ({ id: 'far-session', kind: 'claude', endedTurn: true, mtime: now - 2 * 60 * 60e3,
     contextTokens: 140000, model: 'claude-fable-5-1', usageAt: now - 2 * 60 * 60e3, ...extra });
   const opts = { ttlMs: 0, maxIdleMs: 1440 * 60e3, minTokens: 100000, models: ['fable'],
     claudeTtlMs: 60 * 60e3, claudeTargetMs: 50 * 60e3, claudeFallbackModel: 'opus',
     codexTtlMs: 30 * 60e3, codexTargetMs: 20 * 60e3, codexFallbackModel: 'gpt-5.6-sol' };
-  assert.deepEqual(candidates([row({ node: 'aws1' })], {}, now, opts), []);
-  assert.deepEqual(candidates([row()], {}, now, opts).map((candidate) => candidate.session.id), ['far-session']);
+  const picked = (rows, extra = {}) => candidates(rows, {}, now, { ...opts, ...extra })
+    .map((candidate) => [candidate.session.id, candidate.path, candidate.targetModel, candidate.reason || null]);
+  assert.deepEqual(picked([row()]), [['far-session', 'cold-fallback', 'opus', null]], 'the same row here falls back');
+  assert.deepEqual(picked([row({ node: 'aws1' })]), [], 'cold on a node: the sweep leaves it');
+  const warm = row({ usageAt: now - 55 * 60e3, mtime: now - 55 * 60e3 });
+  assert.deepEqual(picked([warm]), [['far-session', 'warm-current', 'claude-fable-5-1', null]], 'warm here, the sweep takes it');
+  assert.deepEqual(picked([{ ...warm, node: 'aws1' }]), [], 'warm on a node: still not the sweep\'s');
+  assert.deepEqual(picked([row({ node: 'aws1' })], { requested: () => true }),
+    [['far-session', 'warm-current', 'claude-fable-5-1', 'remote-node']]);
+  assert.deepEqual(picked([row({ node: 'aws1' })], { requested: () => true, modelExhausted: () => true }), []);
+  assert.deepEqual(picked([row({ node: 'aws1', kind: 'codex', model: 'gpt-6-astra' })], { requested: () => true }), []);
 
   // And the restore sweep leaves a record whose session is elsewhere exactly where
   // it is: this machine's settings.json is not the one that was swapped.

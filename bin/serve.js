@@ -4196,12 +4196,18 @@ function tailText(tail) {
 // interactive marker past the tail (a transcript longer than the tail is taken as
 // the interactive session its pane says it is).
 function claudeSessionFromTail(id, tail, options = {}) {
-  const info = { ...scanTranscriptText(tailText(tail), null), backgroundParentFile: null, backgroundAgents: undefined };
-  const stat = { size: Number(tail.size) || 0, mtimeMs: Number(tail.mtimeMs) || 0 };
+  return claudeSessionFromTailText(id, tailText(tail),
+    { size: Number(tail.size) || 0, mtimeMs: Number(tail.mtimeMs) || 0 }, tail.path, options);
+}
+
+// The same row from a tail's text already in hand: the daemon's mirror of a node's
+// transcript, read with readTranscriptTail (mirroredCompactRow).
+function claudeSessionFromTailText(id, text, stat, file, options = {}) {
+  const info = { ...scanTranscriptText(text, null), backgroundParentFile: null, backgroundAgents: undefined };
   if (options.interactiveOnly === true && !info.interactive && stat.size <= TAIL_BYTES) return null;
   let reviewer = false;
   try { reviewer = fs.readdirSync(path.join(options.root || keep.ROOT, '.keep', 'reviewer')).includes(id); } catch {}
-  const dir = path.basename(path.dirname(String(tail.path || '')));
+  const dir = path.basename(path.dirname(String(file || '')));
   const session = claudeSessionFromInfo(id, info, stat, dir, reviewer, Date.now(), options.accountId || null);
   return options.node ? { ...session, node: options.node } : session;
 }
@@ -4705,11 +4711,22 @@ async function loadSessionForSend(id, deps = {}) {
   return loadCurrentSession(id);
 }
 
-function appendedBytes(file, offset) {
-  const stat = fs.statSync(file);
-  if (stat.size <= offset) return { text: '', offset, stat, bytesRead: 0 };
+// The bytes a compaction's watched file gained past `offset`. `watched` is the
+// { dev, ino } the watch began on. A file that is now another one (a node's mirror is
+// reset by renaming a new file over it when the node's transcript is replaced) or
+// that is shorter than the offset (a reset to fewer bytes) is re-anchored at its new
+// end instead: its bytes past the old offset are not what the compaction appended and
+// could hold an older compaction's marker, and waiting for it to grow back past the
+// old offset would wait out the whole timeout. The screen is the other witness for a
+// compaction whose marker fell into such a gap.
+function appendedBytes(file, offset, watched = null) {
   const fd = fs.openSync(file, 'r');
   try {
+    const stat = fs.fstatSync(fd);
+    if (stat.size < offset || (watched && (stat.ino !== watched.ino || stat.dev !== watched.dev))) {
+      return { text: '', offset: stat.size, stat, bytesRead: 0, reanchored: true };
+    }
+    if (stat.size === offset) return { text: '', offset, stat, bytesRead: 0 };
     const buffer = Buffer.alloc(stat.size - offset);
     const read = fs.readSync(fd, buffer, 0, buffer.length, offset);
     return { text: buffer.subarray(0, read).toString('utf8'), offset: offset + read, stat, bytesRead: read };
@@ -5170,8 +5187,11 @@ function writePendingCompactSwap(session, plan, dir = autoCompactDir(), at = Dat
   if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new Error('bad compact session id');
   // The record is this machine's promise to put its own settings.json back. It is
   // never written for a session elsewhere, where neither the swap nor the restore
-  // would be ours to make.
-  refuseRemoteCompaction(session);
+  // would be ours to make: a session on another node compacts on its current model.
+  const node = sessionNodeOf(session);
+  if (node !== daemonNodeName()) {
+    throw new InjectionError(409, `the compaction model swap is not available for a session on ${node}`);
+  }
   const file = path.join(dir, `${sessionId}.swap.json`);
   const record = {
     sessionId,
@@ -6041,19 +6061,44 @@ async function hostPaneModel(target, deps = {}) {
 // mid-compaction or on the swapped model) and the model key (inFlightSwap and
 // settings.json are shared, so compactions still run one at a time). It does
 // not hold any other pane.
-// Every part of a compaction is local: the instruction is typed into a pane, the
-// transcript it reads is this machine's, and the model it switches to is written
-// into this machine's settings.json and put back from a record kept here. A session
-// on another node is refused at the door, before any lock or gate is taken.
-function refuseRemoteCompaction(sessionOrPane, deps = {}) {
-  const node = sessionNodeOf(sessionOrPane, deps);
-  if (node !== daemonNodeName(deps)) {
-    throw new InjectionError(409, `compaction is not available for a session on ${node}`);
+//
+// The machine a compaction acts on: the pane it types into when it has one, which is
+// where the agent is, and the session's own record otherwise.
+function compactionNode(session, target, deps = {}) {
+  return sessionNodeOf(isHostTarget(target) ? target.pane : session, deps);
+}
+
+// A Claude session on another node is compacted from here, on the model it is running:
+// the /compact is typed into its pane through that node's host, as a tell is, and the
+// marker is looked for in the daemon's mirror of its transcript. What cannot follow it
+// there is the model swap, which rewrites this machine's settings.json and keeps its
+// promise to put it back in a record here, so a node session never swaps. A Codex
+// session on a node is refused: its cold fallback rewrites the Codex configuration
+// and relaunches the session, both on the node's own disk. Pi has no compaction at
+// all. Checked at the door, before any lock or gate is taken.
+function refuseRemoteCompaction(session, node, deps = {}) {
+  if (node === daemonNodeName(deps) || session?.kind === 'claude') return;
+  if (session?.kind === 'codex') {
+    throw new InjectionError(409, `compaction of a Codex session on ${node} is not supported yet: its cold fallback rewrites the Codex configuration and relaunches the session there`);
   }
+  throw new InjectionError(409, `compaction is not available for a session on ${node}`);
+}
+
+// The file a compaction watches for its marker and reads a session's last turn from:
+// the session's own transcript on this machine, and for a Claude session on another
+// node the daemon's mirror of it (bin/transcript-mirror.js), when that is a plain file.
+// transcriptFileForSession keeps answering null for a node session: its synchronous
+// callers deliver, move or verify against the file, which a mirror is not.
+function compactWatchFileForSession(session, deps = {}) {
+  if (!session) return null;
+  const node = sessionNodeOf(session, deps);
+  if (node === daemonNodeName(deps)) return (deps.transcriptFileForSession || transcriptFileForSession)(session);
+  if (session.kind !== 'claude') return null;
+  return backgroundMirrorSource(deps.root || keep.ROOT, node, session.id)?.file || null;
 }
 
 async function compactSession(session, target, instruction, deps = {}) {
-  refuseRemoteCompaction(isHostTarget(target) ? target.pane : session, deps);
+  refuseRemoteCompaction(session, compactionNode(session, target, deps), deps);
   const leave = daemonRestartGate.enter();
   try {
     return await (deps.withInjectionLock || withInjectionLock)(
@@ -6085,13 +6130,18 @@ async function compactSession(session, target, instruction, deps = {}) {
 async function compactSessionTransaction(session, target, instruction, deps = {}) {
   // Again here, not only in compactSession: the Codex cold fallback calls straight
   // into this, and so does anything else holding a transaction directly.
-  refuseRemoteCompaction(isHostTarget(target) ? target.pane : session, deps);
+  const node = compactionNode(session, target, deps);
+  refuseRemoteCompaction(session, node, deps);
+  // A Claude session on another node: no swap, no swap record, and its mirror is the
+  // file watched (see refuseRemoteCompaction).
+  const remote = node !== daemonNodeName(deps);
+  const watched = remote ? { ...session, node } : session;
   const sid = (sessionRef(session && session.id) || 'unknown');
-  process.stderr.write(`keep serve: compacting ${session && session.kind || 'unknown'} session ${sid}\n`);
+  process.stderr.write(`keep serve: compacting ${session && session.kind || 'unknown'} session ${sid}${remote ? ` on ${node}` : ''}\n`);
   const dir = deps.dir || autoCompactDir();
-  const lastTurn = (deps.sessionLastTurn || sessionLastTurn)(session);
+  const lastTurn = (deps.sessionLastTurn || sessionLastTurn)(watched);
   const policy = deps.compactionPolicy || null;
-  const pendingRecordValue = session?.kind === 'claude' ? readPendingCompactSwap(session && session.id, dir) : null;
+  const pendingRecordValue = session?.kind === 'claude' && !remote ? readPendingCompactSwap(session && session.id, dir) : null;
   const pendingRecord = codexCompact.isCodexCompactSwap(pendingRecordValue) ? null : pendingRecordValue;
   const configuredVia = compactViaModel({ configDir: sessionClaudeConfigDir(session, deps) });
   const settingsFile = deps.compactSettingsFile || claudeSettingsPath();
@@ -6099,7 +6149,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
     return { compacted: false, restoreUnconfirmed: true,
       reason: 'pending model restore belongs to a different or unavailable account' };
   }
-  const settingsSnapshot = session && session.kind === 'claude' && policy?.path !== 'warm-current'
+  const settingsSnapshot = session && session.kind === 'claude' && !remote && policy?.path !== 'warm-current'
     ? (deps.readClaudeSettingsModel || readClaudeSettingsModel)(settingsFile) : { ok: true, present: false, value: '' };
   let swap = null;
   let via = null;
@@ -6107,6 +6157,8 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
   const pendingVia = pendingRecord && String(pendingRecord.switchModel || configuredVia).trim();
   if (session?.kind !== 'claude') {
     // Codex switching has its own durable transaction.
+  } else if (remote) {
+    // The current model, whatever the policy asked for.
   } else if (pendingRecord && compactModelContainsFamily(lastTurn.model, pendingVia)) {
     swap = {
       switchCommand: null,
@@ -6156,8 +6208,9 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
   let submittedAt = null;
   inFlightSwap = swap ? { ...swap, switchModel: via } : null;
   try {
-    const file = (deps.transcriptFileForSession || transcriptFileForSession)(session);
-    if (!file) throw new Error('session transcript is unavailable');
+    const file = remote ? compactWatchFileForSession(watched, deps)
+      : (deps.transcriptFileForSession || transcriptFileForSession)(session);
+    if (!file) throw new Error(remote ? `no transcript of this session on ${node} is mirrored here` : 'session transcript is unavailable');
     transcriptFile = file;
 
     if (swap && swap.switchCommand) {
@@ -6187,7 +6240,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
       const started = Date.now();
       const initialStat = fs.statSync(file);
       let offset = initialStat.size;
-      compactWatch = { file, offset, appended: '' };
+      compactWatch = { file, offset, appended: '', watched: { dev: initialStat.dev, ino: initialStat.ino } };
       compactDiagnostic = (deps.compactTrace || require('./compact-trace').compactTrace)(session);
       compactDiagnostic.start(initialStat, offset);
       const confirmation = session.kind === 'codex' ? codexTypedTextVisible : claudeTypedTextVisible;
@@ -6212,7 +6265,11 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
           result = { compacted: false, reason: refusal, via };
           break;
         }
-        const chunk = appendedBytes(file, offset);
+        const chunk = appendedBytes(file, offset, compactWatch.watched);
+        if (chunk.reanchored) {
+          compactWatch.watched = { dev: chunk.stat.dev, ino: chunk.stat.ino };
+          appended = '';
+        }
         offset = chunk.offset;
         compactWatch.offset = offset;
         compactDiagnostic.poll(chunk.stat, offset, chunk.bytesRead);
@@ -6321,7 +6378,11 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
       if (restoreConfirmed && compactWatch) {
         const deadline = Date.now() + (deps.compactMarkerGraceMs ?? 10000);
         do {
-          const chunk = appendedBytes(compactWatch.file, compactWatch.offset);
+          const chunk = appendedBytes(compactWatch.file, compactWatch.offset, compactWatch.watched);
+          if (chunk.reanchored) {
+            compactWatch.watched = { dev: chunk.stat.dev, ino: chunk.stat.ino };
+            compactWatch.appended = '';
+          }
           compactWatch.offset = chunk.offset;
           compactWatch.appended = `${compactWatch.appended}${chunk.text}`;
           compactDiagnostic?.poll(chunk.stat, chunk.offset, chunk.bytesRead);
@@ -8310,8 +8371,10 @@ async function precheckSessionTarget(session, target, deps = {}) {
   return probeSuggestion(target, screen, deps);
 }
 
+// A Claude session on another node is read from the daemon's mirror of it
+// (compactWatchFileForSession), which holds its turns up to the node's last hook post.
 function sessionLastTurn(session, deps = {}) {
-  const file = (deps.transcriptFileForSession || transcriptFileForSession)(session);
+  const file = compactWatchFileForSession(session, deps);
   if (!file) return { contextTokens: 0, model: '' };
   try {
     const result = lastTurnUsage(readTranscriptTail(file), session.kind);
@@ -8427,7 +8490,25 @@ function compactModelResetAt(session, options = {}) {
   return future.length ? Math.max(...future) : null;
 }
 
+// A Claude session on another node is compacted on the model it is running or not at
+// all (refuseRemoteCompaction: the swap is this machine's), so its policy never names
+// the fallback. It is compacted only when its agent asked, and then on its own model
+// whatever the cache says, as a model with no fallback is below: the sweep reads this
+// machine's transcripts and never meets it. A spent model is left alone, because
+// /compact would be answered with the limit message; the request waits or expires.
+// `reason: 'remote-node'` says, in the stamp and the log, why the path is what it is.
 function autoCompactPolicy(session, now, opts) {
+  if (session?.kind === 'claude' && nodes.isRemotePane(session, paneRefEnv(opts))) {
+    const model = String(session.model || '').trim().toLowerCase();
+    if (!model || opts.requested?.(session) !== true || opts.modelExhausted?.(session) === true) return null;
+    const cacheAgeMs = Number.isFinite(session.usageAt) && session.usageAt > 0 ? now - session.usageAt : null;
+    return { path: 'warm-current', originalModel: model, targetModel: model, cacheAgeMs, cacheTtlMs: null,
+      targetAgeMs: 0, ownModel: true, reason: 'remote-node' };
+  }
+  return autoCompactPolicyHere(session, now, opts);
+}
+
+function autoCompactPolicyHere(session, now, opts) {
   const model = String(session?.model || '').trim().toLowerCase();
   const models = Array.isArray(opts.models) ? opts.models : [];
   let swept;
@@ -8591,8 +8672,23 @@ function reopenTurnSnapshot(session, deps = {}, launchModel = '') {
     ? turn.usageAt : null };
 }
 
+// A reopened session on another node is not compacted here: skipped with a logged
+// reason, never refused. The turn this decides by (reopenTurnSnapshot) is read from the
+// session's own transcript, a /model typed after its last turn included, and that is on
+// the node; the mirror trails it by a hook post. And a reopen compaction that times out
+// refuses the opening message, which a node's hook-paced mirror makes likelier. Once it
+// is up, the session is compacted the ordinary way: bare `keep compact` from inside it,
+// or the console's compact button.
+function reopenCompactionElsewhere(session, target, deps = {}) {
+  const node = compactionNode(session, target, deps);
+  if (node === daemonNodeName(deps)) return null;
+  process.stderr.write(`keep serve: reopen compaction skipped ${sessionRef(session.id)}: it runs on node ${node}, where its turn is not read at reopen; keep compact from the session compacts it once it is up\n`);
+  return node;
+}
+
 async function compactReopenedSession(session, target, account, turn, deps = {}) {
   if (deps.reopenCompaction === 'skip') return null;
+  if (reopenCompactionElsewhere(session, target, deps)) return null;
   const dir = deps.dir || path.join(deps.root || keep.ROOT, '.keep', 'compact');
   if (compactRestoreBlocking(session.id, { ...deps, dir })) {
     throw new InjectionError(409, 'model restore is pending; opening message was not delivered');
@@ -8642,13 +8738,32 @@ async function compactReopenedSession(session, target, account, turn, deps = {})
   return result;
 }
 
+// The tick's row for a Claude session on another node, from the daemon's mirror of its
+// transcript. The tick's scan is this machine's transcripts, so it has no row for such
+// a session, or has the copy a move left behind, which is where the session was. The
+// row is built by the scan every node row is built with (claudeSessionFromTail), from
+// the mirror's tail, with its last turn's context and model read from the same bytes;
+// the mirror's mtime is the node's (transcript-mirror sets it from the source), so the
+// idle clock runs on the node's time. null when nothing is mirrored.
+function mirroredCompactRow(id, pane, deps = {}) {
+  const root = deps.root || keep.ROOT;
+  const node = pane && pane.node;
+  if (!node || typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(id)) return null;
+  const mirrored = backgroundMirrorSource(root, node, id);
+  if (!mirrored) return null;
+  const text = readTranscriptTail(mirrored.file);
+  const session = claudeSessionFromTailText(id, text, { size: mirrored.stat.size, mtimeMs: mirrored.stat.mtimeMs },
+    mirrored.file, { root, node, accountId: typeof pane.meta?.accountId === 'string' ? pane.meta.accountId : null });
+  attachClaudeMarker(session, path.join(root, '.keep', 'attention'), Date.now(), Number(session.mtime), true);
+  return { ...session, pane: pane.id, ...lastTurnUsage(text, 'claude') };
+}
+
 function autoCompactCandidates(sessions, stamps, now, opts) {
   const candidates = [];
   for (const session of sessions || []) {
-    // A session on another node is never a candidate: everything a compaction does
-    // is local to the machine running the agent. The node comes from the pane the
-    // tick already holds, so this costs no lookup.
-    if (nodes.isRemotePane(session, paneRefEnv(opts))) continue;
+    // Only a Claude session is compacted on another node (refuseRemoteCompaction).
+    // The node comes from the pane the tick already holds, so this costs no lookup.
+    if (session?.kind !== 'claude' && nodes.isRemotePane(session, paneRefEnv(opts))) continue;
     const idleMs = autoCompactIdleMs(session, stamps, now, opts);
     if (idleMs === null) continue;
     const policy = autoCompactPolicy(session, now, opts);
@@ -8909,21 +9024,32 @@ async function autoCompactTick(deps = {}) {
     usage: usageSnapshot, now, accountId: claudeAccountId(session),
   });
   // Bounded: this only picks candidates; the chosen one is re-read by
-  // loadCurrentSession under the lock before anything is typed.
+  // loadCurrentSession (or its node, below) under the lock before anything is typed.
+  //
+  // The pane says which machine the agent is on; the cheap scanSessions row cannot. A
+  // row whose live pane is on another node is the copy a move left behind here, never
+  // read: such a session is judged by its mirror below instead.
+  const onNode = (id) => {
+    const pane = panesBySession.get(id);
+    return Boolean(pane) && nodes.isRemotePane(pane);
+  };
   const cheap = (await (deps.scanSessions
     ? deps.scanSessions({ fresh: false })
     : isolatedSessionScan({ fresh: false }, deps))).filter((session) =>
-    (sweep || opts.requested(session))
+    (sweep || opts.requested(session)) && !onNode(session.id)
     && liveIds.has(session.id) && autoCompactIdleMs(session, stamps, now, opts) !== null);
+  // A Claude session on another node that asked to be compacted. Only a request: the
+  // sweep reads the scan, which is this machine's, and a request names its session.
+  const remoteRows = [];
+  for (const id of requests.keys()) {
+    const pane = panesBySession.get(id);
+    if (!liveIds.has(id) || !onNode(id) || pane.meta?.agent !== 'claude') continue;
+    let row = null;
+    try { row = (deps.mirroredCompactRow || mirroredCompactRow)(id, pane, deps); } catch {}
+    if (row && opts.requested(row) && autoCompactIdleMs(row, stamps, now, opts) !== null) remoteRows.push(row);
+  }
   const candidates = autoCompactCandidates(
-    cheap.map((session) => {
-      // The pane says which machine the agent is on; the cheap scanSessions row
-      // cannot. A session on another node is stamped and left there — its transcript
-      // is not here to read, and autoCompactCandidates drops it for the same reason.
-      const pane = panesBySession.get(session.id);
-      if (nodes.isRemotePane(pane)) return { ...session, node: pane.node };
-      return { ...session, ...(deps.sessionLastTurn || sessionLastTurn)(session) };
-    }),
+    [...cheap.map((session) => ({ ...session, ...(deps.sessionLastTurn || sessionLastTurn)(session) })), ...remoteRows],
     stamps,
     now,
     opts,
@@ -8951,9 +9077,37 @@ async function autoCompactTick(deps = {}) {
       try {
         const compacted = await (deps.withInjectionLock || withInjectionLock)(async () => {
           phase = 'resolve';
-          const session = (deps.loadCurrentSession || loadCurrentSession)(candidate.session.id);
+          const remoteNode = candidate.session.node && nodes.isRemotePane(candidate.session) ? candidate.session.node : null;
+          let session;
+          let freshTurn;
+          if (remoteNode) {
+            // A session on another node: its node's own read says whether it is still
+            // idle, and the mirror its candidate was judged by gives its last turn and
+            // the time compared below. A node that cannot be asked right now is a
+            // retryable skip, not a spent request; a node that says there is no such
+            // session is an answer.
+            phase = 'node';
+            try {
+              session = await (deps.loadSessionForAction || loadSessionForAction)(candidate.session.id);
+            } catch (e) {
+              if (e instanceof InjectionError && e.status === 404) phase = 'resolve';
+              throw e;
+            }
+            phase = 'resolve';
+            const mirrored = (deps.mirroredCompactRow || mirroredCompactRow)(candidate.session.id,
+              panesBySession.get(candidate.session.id), deps);
+            if (!mirrored) {
+              phase = 'eligibility';
+              throw new InjectionError(409, `no transcript of this session on ${remoteNode} is mirrored here`);
+            }
+            session = { ...session, node: remoteNode, mtime: mirrored.mtime };
+            freshTurn = { contextTokens: mirrored.contextTokens, model: mirrored.model,
+              usageAt: mirrored.usageAt, cacheTtlMs: mirrored.cacheTtlMs };
+          } else {
+            session = (deps.loadCurrentSession || loadCurrentSession)(candidate.session.id);
+            freshTurn = (deps.sessionLastTurn || sessionLastTurn)(session);
+          }
           const freshNow = Date.now();
-          const freshTurn = (deps.sessionLastTurn || sessionLastTurn)(session);
           const freshCandidate = autoCompactCandidates([{ ...session, ...freshTurn }], stamps, freshNow, opts)[0];
           if (session.mtime !== candidate.session.mtime || !freshCandidate
               || freshCandidate.path !== candidate.path || freshCandidate.originalModel !== candidate.originalModel) {
@@ -8990,7 +9144,7 @@ async function autoCompactTick(deps = {}) {
         reason = String(e && e.message || e);
         // Retryable contention and precheck failures do not spend the idle period.
         // Try another candidate so one blocked pane cannot starve the fleet.
-        if (phase === 'lock' || phase === 'precheck' || phase === 'eligibility') {
+        if (phase === 'lock' || phase === 'precheck' || phase === 'eligibility' || phase === 'node') {
           process.stderr.write(`keep serve: auto-compact skipped ${sessionRef(candidate.session.id)} this tick: ${reason}\n`);
           continue;
         }
@@ -9019,6 +9173,8 @@ async function autoCompactTick(deps = {}) {
   const request = candidate.requested ? requests.get(candidate.session.id) : null;
   const stamp = {
     sessionId: candidate.session.id,
+    // Only for a session elsewhere, as `keep open` names a node only when it is not this one.
+    ...(candidate.session.node && nodes.isRemotePane(candidate.session) ? { node: candidate.session.node } : {}),
     mtime: candidate.session.mtime,
     at: Date.now(),
     idleMs: candidate.idleMs,
@@ -9291,7 +9447,11 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   };
   const precheck = async () => {
   promptProof = await checkedPromptProof();
-  if (opts && opts.compactIfCold && !session.reviewer) {
+  // Not for a session on another node, as before it could be compacted at all: there a
+  // cold session would compact on its own model, never the cheaper fallback, which is
+  // a decision for the agent (`keep compact`), not for a delivery to make on its way in.
+  if (opts && opts.compactIfCold && !session.reviewer
+      && compactionNode(session, target, deps) === daemonNodeName(deps)) {
     const ttlMs = envNumber('KEEP_CACHE_TTL_MIN', 60) * 60e3;
     const minTokens = envNumber('KEEP_COMPACT_MIN_TOKENS', 80000);
     const contextTokens = sessionContextTokens(session);
@@ -9735,8 +9895,10 @@ async function resumeAfterLimit(sessionId, text, { hitAt } = {}, deps = {}) {
 
 async function compactSessionById(body) {
   body = body && typeof body === 'object' ? body : {};
-  const session = loadCurrentSession(body.sessionId);
+  // A session on another node is read through its node, as a send reads it.
+  const session = await loadSessionForAction(body.sessionId);
   if (session.kind === 'pi') throw new InjectionError(409, 'Pi automatic compaction is unavailable');
+  refuseRemoteCompaction(session, sessionNodeOf(session));
   const target = claimInjectionTarget(await resolveSessionTarget(session, null));
   await precheckSessionTarget(session, target);
   return compactSession(session, target, body.instruction || (session.reviewer ? review.DEFAULT_REVIEW_COMPACT_INSTRUCTION : undefined));
@@ -9746,15 +9908,17 @@ async function compactSessionById(body) {
 // compact now. The caller is usually mid-turn — that is where the command runs — and
 // a session cannot be compacted while its own turn is in progress. Takes no lock:
 // nothing is typed, and the tick re-checks everything under the lock before it acts.
-function requestSessionCompaction(body, deps = {}) {
+async function requestSessionCompaction(body, deps = {}) {
   body = body && typeof body === 'object' ? body : {};
-  const session = (deps.loadCurrentSession || loadCurrentSession)(body.sessionId);
+  // A session on another node is read through its node, as a send reads it; a forwarded
+  // bare `keep compact` from a node names the caller's own session there.
+  const session = await (deps.loadSessionForAction || loadSessionForAction)(body.sessionId);
   if (session.kind === 'pi') throw new InjectionError(409, 'Pi automatic compaction is unavailable');
   // Reviewers have their own context-pressure policy, which the sweep also leaves them to.
   if (session.reviewer) throw new InjectionError(409, 'a reviewer session is compacted by its own policy, not on request');
-  // The tick never compacts a session on another node, so a request for one would
-  // only sit there until it expired.
-  refuseRemoteCompaction(session, deps);
+  // The tick never compacts a Codex session on another node, so a request for one
+  // would only sit there until it expired.
+  refuseRemoteCompaction(session, sessionNodeOf(session, deps), deps);
   const record = writeCompactRequest(session.id, {
     by: body.by === 'agent' ? 'agent' : 'api', reason: body.reason, dir: deps.dir,
   });
@@ -11627,10 +11791,11 @@ async function openSession(body, deps = {}) {
       if (launchNode === nodes.daemonNode(deps.env || process.env)) {
         reopenTurn = reopenTurnSnapshot({ ...session, kind: agent }, deps, launchModel);
       } else {
-        // The compaction reads and rewrites the transcript, and the transcript is on
-        // the other machine. Said out loud rather than skipped quietly: a reopen that
-        // normally restores the turn is doing less than usual here.
-        process.stderr.write(`keep serve: not restoring ${sessionRef(session.id)}'s turn; it runs on node ${launchNode}, where this daemon cannot read its transcript\n`);
+        // The reopen compaction decides by the session's turn as its own transcript
+        // records it, and that transcript is on the other machine (see
+        // reopenCompactionElsewhere). Said out loud rather than skipped quietly: a
+        // reopen that normally compacts a large session is doing less than usual here.
+        process.stderr.write(`keep serve: reopen compaction skipped ${sessionRef(session.id)}: it runs on node ${launchNode}, where its turn is not read at reopen; keep compact from the session compacts it once it is up\n`);
       }
     }
   }
@@ -11974,6 +12139,9 @@ async function reopenSessionOnAccount(body, deps = {}) {
   };
   const compactTarget = async (result, turn) => {
     if (result?.status !== 'done' || !result.pane) return result;
+    // Before the turn is validated: that reads the session's own transcript, which for
+    // a session on another node is there, and would refuse a reopen that succeeded.
+    if (reopenCompactionElsewhere(session, { pane: result.pane }, deps)) return result;
     try {
       let currentTurn = turn;
       const compacted = await withInjectionLockRetry(() => {
@@ -16917,6 +17085,8 @@ const reviewDeps = {
   // the budget governor reads the reviewer's windows from that account.
   hostPanes: () => listHostPanes({}, false),
   sessionContextTokens,
+  // The compaction tick's last look at a reviewer on another node, read through its node.
+  loadSession: (sessionId) => loadSessionForAction(sessionId),
   compact: (sessionId, instruction) => withInjectionLock(() => compactSessionById({ sessionId, instruction }), { session: sessionId, model: true }),
   gitState: (project, priorSha) => isolatedDaemonRead('review-git-state', { project, priorSha }, {}, {
     // The probe compares current worktree state. Never coalesce it with an older
@@ -17683,6 +17853,7 @@ module.exports = {
   compactModelExhausted,
   autoCompactPolicy,
   reopenCompactPolicy,
+  compactReopenedSession,
   autoCompactCandidates,
   autoCompactOutcome,
   autoCompactTick,

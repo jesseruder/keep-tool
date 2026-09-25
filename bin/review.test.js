@@ -1657,28 +1657,42 @@ test('reviewerCompactTick waits for an idle, clear, over-threshold reviewer and 
   assert.equal((await run({ ...base, mtime: clock - 3 * 60e3 }, 90000)).compacted, true);
   assert.equal(compactCalls, 2);
 
-  // A reviewer on another node is skipped before anything is read or typed. Its
-  // scanned row carries no `node` (a stale local copy); the location record decides.
+  // A reviewer on another node is compacted too. Its scanned row carries no `node` (a
+  // stale local copy); the location record decides, the context is read for the row
+  // placed on that node (serve.js reads its mirror), and the last look before typing
+  // is the node's own read of it, never the scan's copy.
   clock += 1000;
   meta.lastTickAt = clock;
   const reviewer = { ...base, mtime: clock - 3 * 60e3 };
-  const remote = await reviewerCompactTick({
+  const contextFor = [];
+  const loaded = [];
+  const remoteOptions = (fresh) => ({
     now: () => clock,
     loadMeta: () => meta,
     saveMeta: (next) => { meta = next; },
     reviewer: () => reviewer,
-    sessions: () => [reviewer],
+    sessions: (options) => {
+      if (options?.fresh) throw new Error("took the scan's copy as the last look");
+      return [reviewer];
+    },
+    loadSession: async (id) => { loaded.push(id); return fresh; },
     sessionNode: (id) => (id === 'reviewer-one' ? 'aws1' : null),
     daemonNode: () => 'main',
-    transcriptMtime: () => { throw new Error('read a remote reviewer'); },
-    sessionContextTokens: () => { throw new Error('read a remote reviewer'); },
+    transcriptMtime: () => clock - 3 * 60e3,
+    sessionContextTokens: (row) => { contextFor.push(row.node); return 80000; },
     minTokens: 40000,
-    compact: async () => { compactCalls += 1; return { compacted: true }; },
+    compact: async (id) => { compactCalls += 1; return { compacted: true, id }; },
   });
-  assert.equal(remote.skipped, true);
-  assert.match(remote.why, /runs on node aws1/);
-  assert.equal(remote.expected, true);
-  assert.equal(compactCalls, 2);
+  const remote = await reviewerCompactTick(remoteOptions({ ...base, node: 'aws1' }));
+  assert.equal(remote.compacted, true);
+  assert.equal(compactCalls, 3);
+  assert.deepEqual([contextFor, loaded], [['aws1'], ['reviewer-one']]);
+  // The node says it is mid-turn: nothing is typed.
+  clock += 1000;
+  meta.lastTickAt = clock;
+  const busy = await reviewerCompactTick(remoteOptions({ ...base, node: 'aws1', endedTurn: false }));
+  assert.match(busy.why, /mid-turn/);
+  assert.equal(compactCalls, 3);
 });
 
 test('reviewer compaction accepts an idle waiting marker but rejects permission prompts', () => {
@@ -2550,7 +2564,7 @@ test('review and review-compact skips hold the result only when they did not try
   assert.equal(compactSkipHealth({ skipped: true, why: 'injection busy' }).holdResult, true);
   assert.equal(compactSkipHealth({ skipped: true, why: 'reviewer session disappeared' }).holdResult, true);
   assert.equal(compactSkipHealth({ skipped: true, why: 'no newer review tick' }).holdResult, undefined);
-  const remote = compactSkipHealth({ skipped: true, expected: true, why: 'reviewer runs on node n2; compaction there is not supported yet' });
+  const remote = compactSkipHealth({ skipped: true, expected: true, why: 'a placement, not a fault' });
   assert.deepEqual([remote.expected, remote.holdResult], [true, undefined]);
 });
 
