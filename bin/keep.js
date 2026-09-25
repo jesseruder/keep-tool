@@ -4245,11 +4245,14 @@ const PANE_ONLY_COMMANDS = {
   nodes: (args) => !args.length || ['ls', 'usage'].includes(args[0]) || String(args[0]).startsWith('-'),
   node: (args) => args[0] === 'init',
   // The Codex companion runs on this machine, for the sessions here: the codex binary,
-  // its login and the plugin script live under this node's own profiles, and a job's
-  // record goes under this node's `.keep`, which nothing registry-class reads. The
-  // review a job answers is recorded through the forwarded `reviewing` / `reviewed`,
-  // which carry the job as this node read it (nodeFactArgs). Limited to `context`
-  // at first, every review a session here ran had to fall back to Opus.
+  // its login and the plugin script live under this node's own profiles, its accounts
+  // come from this machine's Keep configuration file, and a job's record goes under
+  // this node's registry directory's `.keep` (a node holds a synced copy of the
+  // registry, which node provisioning and `keep node audit` cover, and the guard
+  // below still asks for it, as it did for `context`). The review a job answers is
+  // recorded through the forwarded `reviewing` / `reviewed`, which carry the job as
+  // this node read it (nodeFactArgs). Limited to `context` at first, every review a
+  // session here ran had to fall back to Opus.
   codex: true,
 };
 
