@@ -214,12 +214,15 @@ function startView(root, ctx, request, key) {
   };
 
   // Every frame is acked exactly once, drawn or not: the stream waits on those acks.
+  // A frame belongs to the socket it came on: one still decoding when the view
+  // reconnected is neither drawn nor acked on the new one.
   const drawFrame = async (buffer) => {
+    const from = socket;
     try {
       const { header, image } = parseFrame(buffer);
       if (header.tabId !== tabId) return;
       const bitmap = await createImageBitmap(new Blob([image], { type: 'image/jpeg' }));
-      if (disposed) return;
+      if (disposed || from !== socket) return;
       if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
         canvas.width = bitmap.width;
         canvas.height = bitmap.height;
@@ -233,7 +236,7 @@ function startView(root, ctx, request, key) {
       };
       setStatus('');
     } finally {
-      send({ t: 'ack' });
+      if (from === socket) send({ t: 'ack' });
     }
   };
   // One decode at a time, and only the newest waiting frame: a slow phone skips
@@ -343,7 +346,6 @@ function startView(root, ctx, request, key) {
     if (!socket) { connect(); return; }
     if (needsStart) {
       // Taken over by another view, or stopped on the far side: a click takes it back.
-      needsStart = false;
       start(tabId ?? pickTab());
       return;
     }
@@ -478,6 +480,8 @@ function startView(root, ctx, request, key) {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       const next = size();
+      // A view another console took over stays put until Owner clicks to take it back.
+      if (needsStart) return;
       if (tabId != null && socket && (!sentSize || next.width !== sentSize.width || next.height !== sentSize.height)) start(tabId);
     }, RESIZE_SETTLE_MS);
   });

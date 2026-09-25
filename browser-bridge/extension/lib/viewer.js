@@ -149,13 +149,16 @@ export function createViewerHandlers() {
         mobile: false,
       });
     }
-    if (!current()) {
-      await send(tabId, "Emulation.clearDeviceMetricsOverride").catch(() => {});
-      return;
-    }
+    // Taken over while this start was on its way: the override belongs to the view that
+    // took the tab now, so it is only cleared when no view holds the tab.
+    const abandon = async () => {
+      if (!otherViewerFits(tabId, viewer.id)) await send(tabId, "Emulation.clearDeviceMetricsOverride").catch(() => {});
+    };
+    if (!current()) return abandon();
     // A tab streams once: a restart at a new size, or another view taking the tab over,
     // replaces the screencast that is running ("Screencast is already active" otherwise).
     await send(tabId, "Page.stopScreencast").catch(() => {});
+    if (!current()) return abandon();
     const scale = viewer.pixelRatio;
     await send(tabId, "Page.startScreencast", {
       format: "jpeg",

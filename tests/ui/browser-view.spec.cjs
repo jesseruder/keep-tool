@@ -64,6 +64,10 @@ test('clicks, keys and pastes go to the page in its own pixels, not to the termi
   fixture.configure({ browserViews: [view({ tabId: 11 })] });
   await expect.poll(() => browserEvents().find(e => e.t === 'start')?.tabId).toBe(11);
   await expect(panel(page).locator('.bv-status')).toBeHidden();
+  // The view restarts once its layout settles (the tab strip and note take their room);
+  // click only once no restart has come for a while, on the frame for the last one.
+  const starts = () => browserEvents().filter(e => e.t === 'start').length;
+  for (let seen = -1; seen !== starts();) { seen = starts(); await page.waitForTimeout(500); }
   const canvas = panel(page).locator('.bv-canvas');
   const box = await canvas.boundingBox();
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 4);
