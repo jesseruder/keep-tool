@@ -17,6 +17,7 @@ import { setTerminalRendererPreference } from './terminal-renderer.js';
 import { installFocusDebug } from './focus-debug.js';
 import { retainSelection, stableSessionOrder } from './selection.js';
 import { createSessionHistory, installSessionHistory } from './session-history.js';
+import { installSessionSearch, sessionRows } from './session-search.js';
 import { installTriageControls, matchesTriageFilters, renderTriage, sessionNode } from './triage.js';
 import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
@@ -1311,6 +1312,16 @@ historyControls = installSessionHistory({ history: sessionHistory, esc,
   },
   navigate: (entry) => { navigateHistory(entry); refresh(); },
 });
+const sessionSearch = installSessionSearch({ esc,
+  rows: () => sessionRows(data.sessions, { tasks: data.tasks, projectName: (path) => projectOf(path).name,
+    statusOf: sessionLabel, hidden: (session) => isClosingSession(session.id, session.pane) }),
+  recentIds: () => sessionHistory.recent.map((entry) => entry.sessionId).filter(Boolean),
+  open: (sessionId) => {
+    rememberSession(sessionId, 'triage');
+    navigateHistory({ sessionId, view: 'triage' });
+    refresh();
+  },
+});
 function rememberPaneEvent(event) {
   if (!(event.target instanceof Element) || event.target.closest('button, a, input, select') && !event.target.closest('.xterm')) return;
   if (state.mode === 'watch') {
@@ -1541,6 +1552,13 @@ document.addEventListener('keydown', (event) => {
     return;
   }
   if (event.metaKey && lower === 'r' && !event.shiftKey) { event.preventDefault(); location.reload(); return; } // no reload menu in the desktop shell
+  // ⌘F finds a session, even from inside a terminal; ⌘⇧F is the terminal's own find.
+  if (event.metaKey && lower === 'f' && !event.shiftKey && !event.ctrlKey && !event.altKey && !mobileActive()) {
+    event.preventDefault();
+    event.stopPropagation();
+    sessionSearch.show();
+    return;
+  }
   if (event.metaKey && ['v', 'q', 'w', 't', 'n'].includes(lower)) return;
   if (event.metaKey && lower === 'b') {
     event.preventDefault();

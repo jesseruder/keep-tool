@@ -588,7 +588,7 @@ export function mountTerminal(container, pane, options = {}) {
       sendJson({ t: 'clear' });
       return false;
     }
-    if (event.metaKey && event.key.toLowerCase() === 'f') {
+    if (event.metaKey && event.shiftKey && event.key.toLowerCase() === 'f') {
       wrapper.classList.add('finding');
       wrapper.querySelector('.findbar input').focus();
       return false;

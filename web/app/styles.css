@@ -340,6 +340,16 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .emoji-cell:focus-visible { background: var(--panel-2); outline: 1px solid var(--accent); }
 .handoff-status, .handoff-error { align-self: center; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .handoff-error { color: var(--bad); }
+.session-search-dialog { width: min(600px, calc(100vw - 32px)); max-width: none; margin: 12vh auto auto; padding: 0; border: 1px solid var(--line-2); border-radius: 10px; background: var(--panel); color: var(--text); box-shadow: var(--shadow); }
+.session-search-dialog::backdrop { background: rgb(0 0 0 / .45); }
+.session-search-dialog input { width: 100%; padding: 14px 16px; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--text); font-size: 15px; outline: none; }
+.session-search-dialog ul { list-style: none; margin: 0; padding: 6px; max-height: min(60vh, 520px); overflow: auto; }
+.session-search-dialog li { padding: 7px 10px; border-radius: 5px; cursor: pointer; }
+.session-search-dialog li:hover { background: var(--panel-2); } .session-search-dialog li.sel { background: var(--sel); }
+.session-search-dialog li b, .session-search-dialog li > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-search-dialog li b { font-weight: 500; } .session-search-dialog li b .num-id { margin: 0 6px 0 0; }
+.session-search-dialog li > span { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.session-search-dialog li.empty { color: var(--muted); cursor: default; } .session-search-dialog li.empty:hover { background: none; }
 .session-launch-dialog { width: min(560px, calc(100vw - 32px)); max-width: none; padding: 0; border: 1px solid var(--line-2); border-radius: 10px; background: var(--panel); color: var(--text); box-shadow: var(--shadow); }
 .session-launch-dialog::backdrop { background: rgb(0 0 0 / .55); }
 .session-launch-card > header { display: flex; justify-content: space-between; gap: 20px; padding: 20px 22px 14px; border-bottom: 1px solid var(--line); }
