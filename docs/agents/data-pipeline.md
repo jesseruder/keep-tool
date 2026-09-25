@@ -54,8 +54,8 @@ Everything you need is behind the Castle MCP (`mcp__castle__*`):
      is the ECS agent, not the job).
    - `airbyte_list_connections`: each connection active, its last job succeeded, its
      rows and duration in the usual range for that connection.
-   - `dbt_list_runs` with `limit` 6: the last runs of job 549924 Success, with the
-     usual duration; any Error run.
+   - `dbt_list_runs` with `job_id` 549924 and `limit` 6: the last runs of that job
+     Success, with the usual duration; any Error run.
    - `clickhouse_list_tables` and the two Snowflake freshness queries above.
 3. For each failure, read why before deciding anything: `dagster_get_run` names the
    failing step and the error; a dbt or Airbyte step names the run or job to follow
@@ -71,7 +71,10 @@ Everything you need is behind the Castle MCP (`mcp__castle__*`):
 
 ## Retries
 
-Owner has allowed you to retry Airbyte syncs, dbt jobs and Dagster runs on your own.
+The delivered check message says "do only the read-only check". The retries in this
+section are the one exception Owner allowed, in his own words, and nothing else is:
+no Redash or Grafana writes, no code, no resets. Owner has allowed you to retry Airbyte
+syncs, dbt jobs and Dagster runs on your own.
 The gateway serves them as `airbyte_trigger_sync`, `dbt_trigger_job` and
 `dagster_retry_run`, each of which refuses a retry while the same thing is already
 running, and each of which is audited to you by name. The rules:

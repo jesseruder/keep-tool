@@ -28,7 +28,7 @@ test('scheduled-task timer polls each minute and matches health cadence', () => 
 const {
   checkDeliveryMessage, planDueCard, deliveryWarning, cardFingerprint, pendingCheckin,
   probePayload, startProbe, probeDue, escalateProbeFailure,
-  isTransientStartError, MAX_CONCURRENT_PROBES, _resetSchedulerState, _resetSchedulerStateInMemory,
+  isTransientStartError, MAX_CONCURRENT_PROBES, _resetSchedulerState, _resetSchedulerStateInMemory, recordOpen, grantReopen,
   budgetDeferralReason, noteBudgetDeferral, reapEphemeralPane, sweepEphemeralPanes,
   MAX_FRESH_OPENS_PER_TICK, MAX_DEFERRAL_NOTICES_PER_TICK, EPHEMERAL_IDLE_MS,
   FRESH_OPEN_STAMP_TTL_MS, readDeliveryStamp, writeDeliveryStamp, stampExpired,
@@ -606,18 +606,29 @@ test('a card that re-arms more often than daily gets one fresh session per inter
     const at = (now) => (t, today, accountId) => freshOpenRefusal(t, today, accountId, { checkBudget: () => budget, now });
     const task = card({ check_on_pass: 'rearm', check_every: '+4h' });
     const t0 = Date.parse('2026-09-25T06:00:00Z');
-    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t0) })).skipped, undefined);
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t0), now: t0 })).skipped, undefined);
     // The same day, but not the same interval: refused until four hours have passed.
-    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t0 + 3600e3) })).skipped, 'opened-within-interval');
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t0 + 3600e3), now: t0 + 3600e3 })).skipped, 'opened-within-interval');
     // The interval is judged in wall time from the recorded open, which survives a restart.
-    assert.ok(loadSchedulerState().openedAt.get('some-card') > 0);
+    assert.equal(loadSchedulerState().openedAt.get('some-card'), t0);
     _resetSchedulerStateInMemory();
-    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(Date.now() + 4 * 3600e3 + 1000) })).skipped, undefined);
+    const t1 = t0 + 4 * 3600e3 + 1000;
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t1), now: t1 })).skipped, undefined);
+    assert.equal(loadSchedulerState().openedAt.get('some-card'), t1);
+    // A session that died without recording anything is granted one reopen, and from
+    // then on the card keeps the daily rule: at most twice a day, like any other card.
+    grantReopen('some-card', '2026-09-25');
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t1 + 60e3), now: t1 + 60e3 })).skipped, undefined, 'the reopen');
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t1 + 5 * 3600e3), now: t1 + 5 * 3600e3 })).skipped, 'opened-today');
+    // An open that failed for good is recorded too, so it is not retried every tick.
+    _resetSchedulerState();
+    recordOpen('some-card', '2026-09-25', t0);
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t0 + 60e3), now: t0 + 60e3 })).skipped, 'opened-within-interval');
     // A daily or one-shot card keeps the one-per-day rule.
     _resetSchedulerState();
     const daily = card({ check_on_pass: 'rearm', check_every: '+1d' });
-    assert.equal((await openFreshCheckSession(daily, { today: '2026-09-25', open, refusal: at(t0) })).skipped, undefined);
-    assert.equal((await openFreshCheckSession(daily, { today: '2026-09-25', open, refusal: at(t0 + 5 * 3600e3) })).skipped, 'opened-today');
+    assert.equal((await openFreshCheckSession(daily, { today: '2026-09-25', open, refusal: at(t0), now: t0 })).skipped, undefined);
+    assert.equal((await openFreshCheckSession(daily, { today: '2026-09-25', open, refusal: at(t0 + 5 * 3600e3), now: t0 + 5 * 3600e3 })).skipped, 'opened-today');
   } finally { _resetSchedulerState(); }
 });
 

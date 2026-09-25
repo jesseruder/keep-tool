@@ -431,6 +431,9 @@ function grantReopen(taskId, today) {
   if (state.reopened.get(taskId) === today) return false;
   state.reopened.set(taskId, today);
   state.opened.delete(taskId);
+  // Both marks, so a sub-daily card is reopened on the next tick as promised rather
+  // than once its interval passes.
+  state.openedAt.delete(taskId);
   saveSchedulerState(today);
   return true;
 }
@@ -695,10 +698,24 @@ function resetTickAllowance() { freshOpensThisTick = 0; allowanceTick += 1; }
 
 // Everything that can refuse an open before one is attempted, in one place so the
 // scheduler path and the probe-escalation path cannot drift apart.
+// Both marks of an open the scheduler made: the day, for the one-per-day rule and
+// the reopen grant, and the wall-clock time, for a sub-daily interval. Written
+// together whether the open succeeded or failed for good, so a failed open is not
+// retried every tick.
+function recordOpen(taskId, today, now = Date.now()) {
+  const state = loadSchedulerState();
+  state.opened.set(taskId, today);
+  state.openedAt.set(taskId, Number(now) || Date.now());
+  saveSchedulerState(today);
+}
+
 function freshOpenRefusal(task, today, accountId, deps = {}) {
   const every = subDailyEveryMs(task);
-  if (every) {
-    // A card that re-arms more often than daily: one fresh session per interval.
+  // A card that re-arms more often than daily: one fresh session per interval —
+  // until a session on it dies without recording anything. The reopen that grants
+  // costs its day record, and from then on the card keeps the daily rule, so a card
+  // whose sessions keep dying opens at most twice a day like any other.
+  if (every && !markedToday('reopened', task.id, today)) {
     const last = loadSchedulerState().openedAt.get(task.id) || 0;
     if ((deps.now || Date.now()) - last < every) return { skipped: 'opened-within-interval' };
   } else if (markedToday('opened', task.id, today)) return { skipped: 'opened-today' };
@@ -783,11 +800,7 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
     throw error;
   }
   if (!enforce) freshOpensThisTick += 1;
-  if (enforce) {
-    markDay('opened', task.id, today);
-    loadSchedulerState().openedAt.set(task.id, Date.now());
-    saveSchedulerState(today);
-  }
+  if (enforce) recordOpen(task.id, today, opts.now);
   if (agentName && opened && opened.sessionId) {
     try {
       agentApi.writeRecord(agentName, {
@@ -1187,7 +1200,7 @@ async function escalateProbeFailure(task, result, opts = {}) {
     process.stderr.write(`keep runs: probe failed for ${task.id} (exit ${result.code}); opened a check session\n`);
     return outcome.errors[0] || null;
   } catch (e) {
-    if (!isTransientStartError(e)) markDay('opened', task.id, today);
+    if (!isTransientStartError(e)) recordOpen(task.id, today);
     process.stderr.write(`keep runs: probe escalation for ${task.id} could not open a session: ${e.message}\n`);
     return e;
   }
@@ -1374,7 +1387,7 @@ async function schedulerTick() {
         tickErrors.push(...errors);
         onChange();
       } catch (e) {
-        if (!isTransientStartError(e)) markDay('opened', t.id, today);
+        if (!isTransientStartError(e)) recordOpen(t.id, today);
         if (!isTransientStartError(e)) { tickErrors.push(e); givenUp.set(t.id, today); }
         process.stderr.write(`keep runs: could not open a check session for ${t.id}: ${e.message}\n`);
       }
@@ -1426,5 +1439,5 @@ module.exports = {
   checkDeliveryMessage, checkDeliveryKey, planDueCard, deliveryWarning,
   cardFingerprint, pendingCheckin, onPassOutcome,
   probePayload, startProbe, startDueProbe, probeDue, landProbeResult, escalateProbeFailure,
-  isTransientStartError, MAX_CONCURRENT_PROBES, _resetSchedulerState, _resetSchedulerStateInMemory, subDailyEveryMs,
+  isTransientStartError, MAX_CONCURRENT_PROBES, _resetSchedulerState, _resetSchedulerStateInMemory, subDailyEveryMs, recordOpen, grantReopen,
 };
