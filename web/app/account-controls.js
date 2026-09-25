@@ -183,6 +183,9 @@ function confirmedAccount(ctx, sessionId, paneId) {
 const BULK_MOVE_TIMEOUT_MS = 180000;
 // The button can be re-rendered, enabled, mid-batch; a second press waits for the first.
 let bulkMoving = false;
+// The transfer's own refusals of a session that resumed or changed account after the
+// batch read it (bin/account-handoff.js): the guard working, not a failure.
+const MOVED_ON = /no longer carries the account limit|not the \S+ this transfer was requested from/;
 
 function once(button, run, ctx) {
   button.onclick = () => runAction(button, run, {
@@ -214,6 +217,7 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
         const failed = [];
         const recovery = [];
         const running = [];
+        const resumed = [];
         if (remote.length) {
           const where = [...new Set(remote.map((row) => row.node))].join(', ');
           ctx.toast(`Moving ${remote.length} session${remote.length === 1 ? '' : 's'} on ${where} to ${target}…`);
@@ -224,12 +228,12 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
           const progress = button.querySelector?.('span:last-child');
           if (progress) progress.textContent = `Moving ${index + 1} of ${remote.length}…`;
           try {
-            // Background: the closing toast reports each one, so a single failure
-            // does not leave an unnamed sticky banner that the next success clears.
+            // The write's label is what the header shows while it runs, which outlives
+            // a re-rendered button.
             const moveResult = await write('/api/handoff-session', { sessionId: row.sessionId, pane: row.pane, accountId: targetAccountId,
               ownerForce: true, expectedSourceAccountId: sourceAccountId,
               ...(row.rateLimitAt != null ? { expectedRateLimitAt: row.rateLimitAt } : {}) }, 'POST',
-            { label: 'Moving session', timeoutMs: BULK_MOVE_TIMEOUT_MS, background: true });
+            { label: `Moving session ${index + 1} of ${remote.length} to ${target}`, timeoutMs: BULK_MOVE_TIMEOUT_MS });
             if (moveResult.status === 'recovery-needed') recovery.push(moveResult.reason || 'retry when the session is safe');
             else if (moveResult.status === 'failed') failed.push(moveResult.reason || 'transfer failed');
             else moved += 1;
@@ -238,6 +242,7 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
             // person is told this one may yet land rather than that it failed.
             if (error.timeout) running.push(row.sessionId);
             else if (error.body?.status === 'recovery-needed') recovery.push(error.body.reason || error.message);
+            else if (MOVED_ON.test(error.body?.error || error.message)) resumed.push(row.sessionId);
             else failed.push(error.body?.reason || error.body?.error || error.message);
           }
         }
@@ -248,7 +253,8 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
           running.length ? `${running.length} still running` : '',
           recovery.length ? `${recovery.length} need${recovery.length === 1 ? 's' : ''} recovery (${reasons(recovery)})` : '',
           failed.length ? `${failed.length} failed (${reasons(failed)})` : '',
-          skipped.length ? `${skipped.length} skipped (${reasons(skipped.map((row) => row.reason))})` : '',
+          skipped.length + resumed.length ? `${skipped.length + resumed.length} skipped (${reasons([
+            ...skipped.map((row) => row.reason), ...(resumed.length ? ['resumed or moved since the click'] : [])])})` : '',
         ].filter(Boolean);
         const summary = parts.join('; ');
         ctx.toast(moved || queued || running.length

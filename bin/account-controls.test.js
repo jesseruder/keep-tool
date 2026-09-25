@@ -308,13 +308,13 @@ test('the batch moves sessions on another node itself, forced, and says what hap
   // has resumed or moved since is refused rather than stopped mid-turn.
   assert.equal(JSON.stringify(writes[1].body), JSON.stringify({ sessionId: 'far1', pane: 'far1-pane@aws1', accountId: 'claude-two',
     ownerForce: true, expectedSourceAccountId: 'claude-main', expectedRateLimitAt: 'at-far1' }));
-  assert.equal(writes[1].options.background, true, 'the closing toast reports each one, not a sticky banner');
+  assert.equal(writes[1].options.label, 'Moving session 1 of 5 to Claude Two', 'the header names the progress');
   assert.ok(writes[1].options.timeoutMs > 20000, 'a transfer is given longer than an ordinary write');
   assert.deepEqual(labels, [1, 2, 3, 4, 5].map((n) => `Moving ${n} of 5…`));
   assert.deepEqual(toasts, [
     'Moving 5 sessions on aws1, aws2 to Claude Two…',
     'Claude Two: moved 1; queued 1; 1 still running; 1 needs recovery (source stopped, target did not start); '
-      + '2 failed (target is not logged in; Session no longer carries the account limit this transfer was requested for); 1 skipped (already queued).',
+      + '1 failed (target is not logged in); 2 skipped (already queued; resumed or moved since the click).',
   ]);
 
   // Every one skipped for a reason no click can fix: say which, not just how many.
