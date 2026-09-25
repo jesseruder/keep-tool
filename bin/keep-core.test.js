@@ -162,5 +162,20 @@ test('a test process with no registry of its own refuses to load against the ope
       { encoding: 'utf8', env: { ...clean, NODE_TEST_CONTEXT: 'child', HOME: own } });
     assert.equal(tempHome.status, 0, tempHome.stderr);
     assert.equal(tempHome.stdout, 'loaded', 'a registry under a temporary HOME is not the operator\'s');
+    // The setup tests run `keep init --dir` with a fresh KEEP_CONFIG that does not exist
+    // yet and the real HOME: isolated from the operator's configuration, so allowed.
+    const ownConfig = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(core)}); process.stdout.write('loaded')`],
+      { encoding: 'utf8', env: { ...clean, NODE_TEST_CONTEXT: 'child', HOME: home, KEEP_CONFIG: path.join(own, 'config.json') } });
+    assert.equal(ownConfig.status, 0, ownConfig.stderr);
+    assert.equal(ownConfig.stdout, 'loaded', 'a process on its own configuration file is not on the operator\'s');
+    // A symlink to the operator's registry is the operator's registry.
+    const alias = path.join(own, 'alias');
+    fs.symlinkSync(path.join(home, 'keep'), alias);
+    const viaAlias = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(core)}); process.stdout.write('loaded')`],
+      { encoding: 'utf8', env: { ...clean, NODE_TEST_CONTEXT: 'child', HOME: home, KEEP_DIR: alias } });
+    if (fs.existsSync(path.join(home, 'keep'))) {
+      assert.notEqual(viaAlias.status, 0, 'a symlink alias of the operator\'s registry is refused');
+      assert.match(viaAlias.stderr, /operator's registry/);
+    }
   } finally { fs.rmSync(own, { recursive: true, force: true }); }
 });
