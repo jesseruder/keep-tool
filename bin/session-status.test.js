@@ -148,6 +148,16 @@ test('an unattended session that ends on a statement is finished, not waiting fo
     assert.equal(attention({ ...done, stopVerdict: verdict }).kind, 'finished');
     assert.equal(attention({ ...done, stopVerdict: verdict, lastAssistantFull: 'Drain the host now?' }).pri, 0);
     assert.equal(activity({ ...done, stopVerdict: verdict, lastAssistantFull: 'Drain the host now?' }).decision.rule, 'model-needs-input');
+    // Asks without a question mark still count as asks; a report does not.
+    for (const text of [
+      'I need your approval before continuing.', 'Need your approval to deploy.',
+      'Waiting for your go-ahead to run the migration.', 'Two options: A rebuilds, B patches. Your call.',
+      'Blocked: the API key is missing.', 'Please confirm the target host.',
+    ]) assert.equal(attention({ ...done, lastAssistantFull: text }).pri, 0, text);
+    for (const text of [
+      'Checked in: nothing moved overnight.', 'Blocked on the flaky test; retrying in the morning.',
+      'The key rotation finished and the token is in place.',
+    ]) assert.equal(attention({ ...done, lastAssistantFull: text }).kind, 'finished', text);
     // The card's own asks still outrank a finished turn, and a stopped session falls
     // through to the card as it always did.
     assert.equal(attention({ ...done, taskId: 't', taskStatus: 'review' }).pri, 0);

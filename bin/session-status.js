@@ -25,7 +25,7 @@ function proseRequest(text) {
   // and direct requests for Owner to supply/approve something, in either agent.
   const value = String(text || '').replace(/```[\s\S]*?```/g, '').replace(/^\s*>.*$/gm, '').trim().replace(/[\s*_`]+$/, '');
   return /\?\s*$/.test(value)
-    || /(?:^|[.!?]\s+|\n)(?:[-*]\s+)?(?:please\s+(?:choose|confirm|approve|provide|send|tell|enter)|I need (?:you to|your\b)|(?:send|give|tell|show)\s+me\b|(?:share|provide|paste)\s+(?:the|your)\s+(?:url|link|key|token|code|answer|choice)\b|let me know\s+(?:which|what|where|when|whether|your)\b|reply with\b)/i.test(value);
+    || /(?:^|[.!?]\s+|\n)(?:[-*]\s+)?(?:please\s+(?:choose|confirm|approve|provide|send|tell|enter)|(?:I )?need (?:you to|your\b)|(?:send|give|tell|show)\s+me\b|(?:share|provide|paste)\s+(?:the|your)\s+(?:url|link|key|token|code|answer|choice)\b|let me know\s+(?:which|what|where|when|whether|your)\b|reply with\b|waiting (?:for|on) your\s+(?:go-ahead|approval|decision|answer|reply|choice)\b|your call\b|blocked\b[^.!?\n]*\b(?:key|token|credential|secret|password|approval|permission)\b)/i.test(value);
 }
 
 function activity(session, context = {}) {
