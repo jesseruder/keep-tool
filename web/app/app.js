@@ -18,7 +18,7 @@ import { setPredictTypingPreference } from './predict-typing.js';
 import { installFocusDebug } from './focus-debug.js';
 import { retainSelection, stableSessionOrder } from './selection.js';
 import { createSessionHistory, installSessionHistory } from './session-history.js';
-import { installSessionSearch, sessionRows } from './session-search.js';
+import { cardRows, installSessionSearch, sessionRows } from './session-search.js';
 import { installTriageControls, matchesTriageFilters, renderTriage, sessionNode } from './triage.js';
 import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
@@ -1322,14 +1322,30 @@ historyControls = installSessionHistory({ history: sessionHistory, esc,
   },
   navigate: (entry) => { navigateHistory(entry); refresh(); },
 });
+const searchListing = {
+  projectName: (path) => projectOf(path).name,
+  hidden: (session) => isClosingSession(session.id, session.pane),
+  liveOf: (session) => Boolean(session.pane && paneMap().get(session.pane)?.alive),
+};
 const sessionSearch = installSessionSearch({ esc, searchText: api.searchSessionText,
-  rows: () => sessionRows(data.sessions, { tasks: data.tasks, projectName: (path) => projectOf(path).name,
-    statusOf: sessionLabel, hidden: (session) => isClosingSession(session.id, session.pane) }),
+  rows: () => sessionRows(data.sessions, { ...searchListing, tasks: data.tasks, statusOf: sessionLabel }),
+  cards: () => cardRows(data.tasks, data.sessions, searchListing),
   recentIds: () => sessionHistory.recent.map((entry) => entry.sessionId).filter(Boolean),
   open: (sessionId) => {
     rememberSession(sessionId, 'triage');
     navigateHistory({ sessionId, view: 'triage' });
     refresh();
+  },
+  // The chooser the Reopen buttons open, for the session the finder picked.
+  reopen: (sessionId) => {
+    const session = data.sessions.find((candidate) => candidate.id === sessionId);
+    if (!session) { toast('That conversation is no longer listed'); return; }
+    reopenSession({ sessionId, agent: session.kind, title: session.title, project: session.project, stalePane: session.pane || undefined })
+      .catch((error) => toast(`Could not reopen: ${error.message || error}`));
+  },
+  start: (card) => {
+    reopenSession({ taskId: card.id, title: card.title, project: card.projectPath })
+      .catch((error) => toast(`Could not start: ${error.message || error}`));
   },
 });
 function rememberPaneEvent(event) {
