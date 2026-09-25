@@ -119,6 +119,27 @@ test('a repeated request id answers from its receipt instead of writing again', 
   assert.ok(!fs.readFileSync(path.join(receiptDir, 'a1b2c3d4.json'), 'utf8').includes('first'), 'a receipt holds no value');
   assert.throws(() => secretFiles.handle({ ...params, requestId: 'ffffffff' }, { ...opts(h), receiptDir }), /already sets TOKEN/,
     'another request is still refused');
+  const different = secretFiles.handle({ ...params, key: 'OTHER' }, { ...opts(h), receiptDir });
+  assert.equal(different.repeated, undefined, 'the same id asking for a different write is not answered from the receipt');
+  assert.equal(fs.readFileSync(params.path, 'utf8'), 'TOKEN=first\nOTHER=first\n');
+});
+
+test('a write whose receipt cannot be recorded is refused before the file is touched', (t) => {
+  const h = home(t);
+  const blocker = path.join(h, 'not-a-dir');
+  fs.writeFileSync(blocker, '');
+  const file = path.join(h, 'token');
+  assert.throws(() => secretFiles.handle({ requestId: 'a1b2c3d4', path: file, value: 'v' },
+    { ...opts(h), receiptDir: path.join(blocker, 'receipts') }), /could not record/);
+  assert.equal(fs.existsSync(file), false);
+});
+
+test('a failed write leaves no receipt behind', (t) => {
+  const h = home(t);
+  const receiptDir = path.join(h, 'receipts');
+  assert.throws(() => secretFiles.handle({ requestId: 'a1b2c3d4', path: path.join(h, 'x.env'), key: 'K', value: "it's" },
+    { ...opts(h), receiptDir }), /single quote/);
+  assert.deepEqual(fs.existsSync(receiptDir) ? fs.readdirSync(receiptDir) : [], []);
 });
 
 test('an error never carries the value', (t) => {

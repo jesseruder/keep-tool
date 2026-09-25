@@ -224,18 +224,38 @@ function receiptDir(options = {}) {
   return path.join(process.env.KEEP_DIR || path.join(home, 'keep'), '.keep', 'secret-receipts');
 }
 
-function readReceipt(dir, requestId) {
-  try { return JSON.parse(fs.readFileSync(path.join(dir, `${requestId}.json`), 'utf8')); } catch { return null; }
+// What a receipt answers for: the same id asking for the same write. A receipt for
+// the id with any other destination or flags is not this request's.
+function fingerprint(request) {
+  return JSON.stringify([request.path, request.key || null, request.replace === true, request.multiline === true]);
 }
 
-function writeReceipt(dir, requestId, outcome) {
+function receiptFile(dir, requestId) { return path.join(dir, `${requestId}.json`); }
+
+function readReceipt(dir, requestId, print, now = Date.now()) {
+  try {
+    const receipt = JSON.parse(fs.readFileSync(receiptFile(dir, requestId), 'utf8'));
+    if (receipt.fingerprint !== print || !(now - receipt.at < RECEIPT_KEEP_MS)) return null;
+    return receipt.outcome || null;
+  } catch { return null; }
+}
+
+// Written before the secret, and durably, so a write this machine made always has
+// one: a receipt that cannot be written refuses the write.
+function writeReceipt(dir, requestId, print, outcome) {
   try {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const file = path.join(dir, `${requestId}.json`);
+    const file = receiptFile(dir, requestId);
     const temp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify({ ...outcome, at: Date.now() }), { mode: 0o600 });
+    const fd = fs.openSync(temp, 'w', 0o600);
+    try { fs.writeSync(fd, JSON.stringify({ fingerprint: print, outcome, at: Date.now() })); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
     fs.renameSync(temp, file);
-    const cutoff = Date.now() - RECEIPT_KEEP_MS;
+  } catch (error) {
+    throw new SecretPathError(`could not record the write on this machine: ${error.code || 'receipt failed'}`, 'secret-write');
+  }
+  const cutoff = Date.now() - RECEIPT_KEEP_MS;
+  try {
     for (const name of fs.readdirSync(dir)) {
       const other = path.join(dir, name);
       try { if (fs.statSync(other).mtimeMs < cutoff) fs.unlinkSync(other); } catch {}
@@ -246,18 +266,26 @@ function writeReceipt(dir, requestId, outcome) {
 // The host verb: a plain object in, a plain object out, and a refusal as an error
 // with a code the daemon hands back to the console.
 function handle(params = {}, options = {}) {
-  const requestId = REQUEST_ID_RE.test(String(params.requestId || '')) ? String(params.requestId) : null;
-  const dir = receiptDir(options);
-  if (requestId) {
-    const prior = readReceipt(dir, requestId);
-    if (prior) return { ...prior, repeated: true };
-  }
-  const outcome = writeSecret({
+  const request = {
     path: params.path, key: params.key || null, replace: params.replace === true,
     multiline: params.multiline === true, value: params.value,
-  }, options);
-  if (requestId) writeReceipt(dir, requestId, outcome);
-  return outcome;
+  };
+  const requestId = REQUEST_ID_RE.test(String(params.requestId || '')) ? String(params.requestId) : null;
+  if (!requestId) return writeSecret(request, options);
+  const dir = receiptDir(options);
+  const print = fingerprint(request);
+  const prior = readReceipt(dir, requestId, print);
+  if (prior) return { ...prior, repeated: true };
+  // The answer is known before anything is written: the checks decide it.
+  const dest = checkDestination(request, options);
+  const text = normalizeValue(request.value, { multiline: request.multiline && !dest.key });
+  const outcome = { path: dest.path, key: dest.key, replaced: dest.existed, bytes: Buffer.byteLength(text), mode: '0600' };
+  writeReceipt(dir, requestId, print, outcome);
+  try { return writeSecret(request, options); }
+  catch (error) {
+    try { fs.unlinkSync(receiptFile(dir, requestId)); } catch {}
+    throw error;
+  }
 }
 
 module.exports = {
