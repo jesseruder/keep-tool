@@ -704,6 +704,46 @@ test('a Codex pane on a node gets its row from that node\'s meta and tail, and t
   } finally { f.cleanup(); }
 });
 
+test('a row taken from a node carries the attention marker its hooks wrote here, Codex and Claude alike', async () => {
+  const marker = (root, id, value) => {
+    fs.mkdirSync(path.join(root, '.keep', 'attention'), { recursive: true });
+    const file = path.join(root, '.keep', 'attention', `${id}.json`);
+    fs.writeFileSync(file, JSON.stringify({ at: Date.now(), mt: Date.now() + 60000, ...value }));
+    return file;
+  };
+  const published = (root, node, pane, nodeSessions) => {
+    const sessions = [];
+    serve.backfillHostSessions(sessions, [pane], { root, hostNodes: ['main', node],
+      codexSessionFor: () => null, claudeSessionFor: () => null, nodeSessions });
+    return sessions[0];
+  };
+
+  const sid = 'sess-codex-marked';
+  const c = codexNodeFixture(sid, 'aws7');
+  try {
+    const file = marker(c.root, sid, { source: 'codex', type: 'question', message: 'Which branch?', options: ['main', 'dev'] });
+    const pane = { id: 'p1@aws7', node: 'aws7', hostPaneId: 'p1', alive: true, agentAlive: true,
+      createdAt: new Date(Date.now() - 3600e3).toISOString(), meta: { agent: 'codex', sessionId: sid } };
+    const row = published(c.root, 'aws7', pane, await serve.remoteSessionFreshness([pane], c.deps));
+    assert.equal(row.kind, 'codex');
+    assert.deepEqual(row.notify, { type: 'question', message: 'Which branch?', options: ['main', 'dev'] });
+    assert.ok(fs.existsSync(file), 'the backfill never deletes a marker');
+  } finally { c.cleanup(); }
+
+  const f = freshnessFixture('aws7', 'sess-claude-marked');
+  try {
+    const file = marker(f.root, 'sess-claude-marked', { source: 'claude', type: 'permission', message: 'Allow Bash?' });
+    const row = published(f.root, 'aws7', f.pane, await serve.remoteSessionFreshness([f.pane], f.deps));
+    assert.equal(row.kind, 'claude');
+    assert.deepEqual(row.notify, { type: 'permission', message: 'Allow Bash?' });
+    // A stale marker (the transcript moved past it) is not attached, and still not deleted.
+    fs.writeFileSync(file, JSON.stringify({ source: 'claude', type: 'permission', message: 'Allow Bash?', at: Date.now(), mt: 1 }));
+    const moved = published(f.root, 'aws7', f.pane, await serve.remoteSessionFreshness([f.pane], f.deps));
+    assert.equal(moved.notify, undefined);
+    assert.ok(fs.existsSync(file));
+  } finally { f.cleanup(); }
+});
+
 test('a Codex pane whose rollout meta and tail never pair is left out of the node read', async () => {
   const sid = 'sess-codex-unpaired';
   const f = codexNodeFixture(sid, 'aws7');

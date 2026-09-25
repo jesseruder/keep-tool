@@ -12439,7 +12439,10 @@ function scanClaudeSessions(options = {}) {
         const at = Number(marker.at);
         if (!Number.isFinite(at) || now - at > 24 * 3600e3) {
           fs.unlinkSync(markerFile);
-        } else if (marker.source !== 'codex' && !sessionIds.has(id)) {
+        } else if (marker.source !== 'codex' && !sessionIds.has(id)
+          // A session on another node is not listed from here, but its marker is its
+          // own: the node row backfillHostSessions takes carries it.
+          && !(accountAuthority[id]?.node && accountAuthority[id].node !== daemonNode)) {
           fs.unlinkSync(markerFile);
         }
       } catch {}
@@ -13554,7 +13557,16 @@ function backfillHostSessions(sessions, panes, deps = {}) {
         ? deps.nodeSessions[id] : null;
       const fromThisNode = Boolean(fromNode && fromNode.id === id && fromNode.node === pane.node && fromNode.kind === agent);
       // A Pi session on another node brings its phase, not a row: the row is the pane's.
-      if (fromThisNode && agent !== 'pi') session = { ...fromNode };
+      if (fromThisNode && agent !== 'pi') {
+        session = { ...fromNode };
+        // Its attention marker, as scanSessions attaches one to a local row before this
+        // runs and loadRemoteSession to a node row: the node's hooks write it here. Read
+        // only: whether a marker is stale is the scan's call, not the backfill's.
+        const attentionDir = path.join(deps.root || keep.ROOT, '.keep', 'attention');
+        const now = Date.now();
+        if (agent === 'codex') attachCodexMarkers([session], attentionDir, now, { readOnly: true });
+        else attachClaudeMarker(session, attentionDir, now, Number(session.mtime), true);
+      }
       if (!session) {
         const piEvent = agent !== 'pi' ? null
           : remotePane ? (fromThisNode && fromNode.piEvent && fromNode.piEvent.id === id ? fromNode.piEvent : null)

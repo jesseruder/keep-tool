@@ -12105,6 +12105,17 @@ test('a session moved to a node is listed from its node, not from the copy it le
     const script = `
       ${STATE_FIXTURE_SETUP}
       const serve = require('./bin/serve.js');
+      // The node's hooks write the moved session's attention marker here. A scan that may
+      // write sweeps markers for sessions it did not list, but not one on another node.
+      const fs = require('fs');
+      const attention = ${JSON.stringify(path.join(keepRoot, '.keep', 'attention'))};
+      fs.mkdirSync(attention, { recursive: true });
+      for (const id of ['sess-moved', 'sess-gone']) {
+        fs.writeFileSync(require('path').join(attention, id + '.json'), JSON.stringify({
+          source: 'claude', type: 'waiting', message: 'Claude needs your input', at: Date.now(), mt: Date.now() + 60000 }));
+      }
+      serve.scanSessions({ allocateNumbers: false });
+      const markersKept = fs.readdirSync(attention).sort();
       const scanned = serve.scanSessions({ readOnly: true, allocateNumbers: false });
       const listed = scanned.filter((session) => session.kind === 'claude').map((session) => [session.id, session.accountId]);
       const nodeRead = { id: 'sess-moved', kind: 'claude', node: 'aws7', accountId: 'claude/default', mtime: Date.now(),
@@ -12115,7 +12126,7 @@ test('a session moved to a node is listed from its node, not from the copy it le
       serve.backfillHostSessions(sessions, [pane], { root: ${JSON.stringify(keepRoot)}, hostNodes: ['main', 'aws7'],
         claudeSessionFor: () => null, nodeSessions: { 'sess-moved': nodeRead } });
       const moved = sessions.filter((session) => session.id === 'sess-moved');
-      process.stdout.write(JSON.stringify({ listed, moved, nodeRead }));
+      process.stdout.write(JSON.stringify({ listed, moved, nodeRead, markersKept }));
     `;
     const child = spawnSync(process.execPath, ['-e', script], {
       cwd: path.join(__dirname, '..'),
@@ -12131,6 +12142,8 @@ test('a session moved to a node is listed from its node, not from the copy it le
     assert.equal(result.moved[0].mtime, result.nodeRead.mtime, 'the row is the node\'s read');
     assert.deepEqual(result.moved[0].rateLimit, result.nodeRead.rateLimit);
     assert.equal(result.moved[0].pane, 'p1@aws7');
+    assert.deepEqual(result.markersKept, ['sess-moved.json'], 'the moved session keeps its marker; an unknown one is swept');
+    assert.deepEqual(result.moved[0].notify, { type: 'waiting', message: 'Claude needs your input' });
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
