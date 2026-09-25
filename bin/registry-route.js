@@ -327,15 +327,18 @@ function createRegistryService(options = {}) {
       }
       const request = validateRequest(body, caller, deps);
       // A `tell --wait` may spend its whole duration re-asking a busy session. It runs
-      // for that long plus the ordinary bound, in a queue of its own so the node's
-      // check-ins are not held behind it, and it does not hold a restart: all it does
-      // in that time is post to this daemon's /api/tell, whose typing the restart gate
-      // already waits for, and a restart that ends it leaves its journal entry
-      // interrupted, which is what the node's resend is then told.
+      // for that long plus the ordinary bound, and nothing queues behind it: it has a
+      // queue of its own, keyed by its idempotency key, so neither the node's
+      // check-ins nor another session's waiting tell sit out its wait (and time out
+      // at the node before they start). A resend of the same key still waits for it
+      // through journaled's in-flight entry. It does not hold a restart either: all
+      // it does in that time is post to this daemon's /api/tell, whose typing the
+      // restart gate already waits for, and a restart that ends it leaves its journal
+      // entry interrupted, which is what the node's resend is then told.
       const waitMs = forwardedWaitMs(request.command, request.args);
       return await journaled({
         caller, key: request.idempotencyKey, digest: digestOf(request),
-        queue: waitMs > 0 ? `wait\0${caller}` : caller,
+        queue: waitMs > 0 ? `wait\0${caller}\0${request.idempotencyKey}` : caller,
         holdsRestart: waitMs === 0,
         run: () => execute(request, caller, waitMs > 0 ? { timeoutMs: timeoutMs + waitMs } : {}),
         what: `keep ${request.command}${request.nodeCwd ? ` from ${request.nodeCwd}` : ''}`,

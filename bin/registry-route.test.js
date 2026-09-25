@@ -258,6 +258,31 @@ test('a tell --wait runs for its wait, beside the node\'s other commands, and do
   assert.equal(children.length, 3);
 });
 
+test('two waiting tells from one node run at once, a check-in is not held behind either, and a resend still waits for its own', async (t) => {
+  const fake = fakeSpawn((call) => (call.args[1] === 'tell' ? 'hang' : { code: 0, stdout: 'checked in\n' }));
+  const original = fake.spawn;
+  const hanging = [];
+  fake.spawn = (...args) => {
+    const child = original(...args);
+    if (args[1][1] === 'tell') hanging.push(child);
+    return child;
+  };
+  const { svc, root, calls } = service(t, { fake });
+  const tell = (suffix) => body(root, { command: 'tell', args: ['card', '-m', suffix, '--wait', '20m'], idempotencyKey: `${KEY}-${suffix}` });
+  const first = svc.handle(AWS1, tell('one'));
+  const second = svc.handle(AWS1, tell('two'));
+  const resend = svc.handle(AWS1, tell('one'));
+  for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(hanging.length, 2, 'both waiting tells started without waiting on each other');
+  const checkin = await svc.handle(AWS1, body(root, { command: 'checkin', args: ['card', '-m', 'state'], idempotencyKey: `${KEY}-checkin` }));
+  assert.equal(checkin.status, 200);
+  assert.equal(checkin.body.stdout, 'checked in\n');
+  for (const child of hanging) child.emit('close', 0, null);
+  const answers = await Promise.all([first, second, resend]);
+  assert.deepEqual(answers.map((answer) => [answer.status, answer.body.replayed]), [[200, false], [200, false], [200, true]]);
+  assert.equal(calls.length, 3, 'the resend ran nothing');
+});
+
 test('a project named relative to the node\'s directory is refused; absolute, ~ and bare names are not', () => {
   const relative = /is relative to a directory the daemon does not share/;
   for (const [command, args] of [
