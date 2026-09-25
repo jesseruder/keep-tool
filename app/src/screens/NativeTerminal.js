@@ -15,7 +15,7 @@ import * as api from '../api';
 import { mono } from '../ui';
 
 const { createEmulator } = require('../terminal/emulator');
-const { encodeKey, encodePaste, encodeText, inputDelta } = require('../terminal/keys');
+const { createFieldTracker, encodeKey, encodePaste, encodeText } = require('../terminal/keys');
 const { createRenderQueue } = require('../terminal/render-queue');
 const { rowSegments } = require('../terminal/row');
 const { createScrollbackMirror } = require('../terminal/scrollback');
@@ -51,8 +51,37 @@ const FRAME_MS = 33;
 const REPEAT_MS = 110;
 // What the hidden input is held at, so that a backspace on an otherwise empty field
 // is still a change the app can read. Figure spaces, because a keyboard is less
-// likely to treat them as a word boundary worth autocorrecting.
-const SENTINEL = '    ';
+// likely to treat them as a word boundary worth autocorrecting; 512 of them, because
+// the field is only put back once typing pauses, and a held Backspace deleting a long
+// line eats into it until then. The field is off screen, so the length costs nothing.
+const SENTINEL = '\u2007'.repeat(512);
+// How long typing has to pause before the field is put back to the sentinel.
+const FIELD_IDLE_MS = 500;
+
+// The hidden field the keyboard types into. It is controlled by its own state, which
+// follows every change, so React Native never resets it mid-run: each change is
+// measured against the text before it (createFieldTracker) and nothing is guessed.
+// Once typing pauses the field is put back to the sentinel. Its own component, so a
+// keystroke re-renders the field and not the terminal.
+const TerminalField = React.memo(React.forwardRef(function TerminalField({ onDelta, ...props }, ref) {
+  const [value, setValue] = useState(SENTINEL);
+  const trackerRef = useRef(null);
+  if (!trackerRef.current) trackerRef.current = createFieldTracker(SENTINEL);
+  const idleRef = useRef(null);
+  useEffect(() => () => { if (idleRef.current) clearTimeout(idleRef.current); }, []);
+  const onChangeText = useCallback((next) => {
+    const delta = trackerRef.current.change(next);
+    setValue(next);
+    onDelta(delta);
+    if (idleRef.current) clearTimeout(idleRef.current);
+    idleRef.current = setTimeout(() => {
+      idleRef.current = null;
+      trackerRef.current.reset();
+      setValue(SENTINEL);
+    }, FIELD_IDLE_MS);
+  }, [onDelta]);
+  return <TextInput {...props} onChangeText={onChangeText} ref={ref} value={value} />;
+}));
 
 // Esc/Tab and the arrows are what a terminal needs and a phone keyboard does not
 // have. Ctrl and Alt are sticky: tap, then tap the key they modify.
@@ -478,19 +507,17 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
     board.setStringAsync(text ?? '').then(() => note('Row copied.')).catch(() => note('Could not copy that row.'));
   }, [note]);
 
-  // The hidden field is held at a sentinel so a backspace on an empty field is still
-  // a change the app can see; see inputDelta in src/terminal/keys.js.
-  const onChangeText = useCallback((next) => {
-    const delta = inputDelta(SENTINEL, next);
+  // Enter from the keyboard's send key. Stable, like onFieldDelta, so a terminal repaint
+  // does not re-render the field.
+  const onFieldSubmit = useCallback(() => pressKey('Enter'), [pressKey]);
+
+  // What one change of the hidden field (TerminalField) typed: deletions, then text.
+  const onFieldDelta = useCallback((delta) => {
     if (delta.backspaces) send('\x7f'.repeat(delta.backspaces));
     if (delta.text) {
       send(encodeText(delta.text, modifiersRef.current));
       clearModifiers();
     }
-    // Put the field back the way it was, natively rather than through state: the
-    // next keystroke has to be a delta against the sentinel again, and a re-render
-    // between two fast keystrokes would lose one.
-    if (inputRef.current) inputRef.current.setNativeProps({ text: SENTINEL });
   }, [clearModifiers, send]);
 
   const openOnMac = useCallback(() => {
@@ -682,20 +709,19 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
         {toast ? <View pointerEvents="none" style={styles.toast}><Text style={styles.toastText}>{toast}</Text></View> : null}
       </View>
 
-      <TextInput
+      <TerminalField
         autoCapitalize="none"
         autoComplete="off"
         autoCorrect={false}
         blurOnSubmit={false}
         caretHidden
-        defaultValue={SENTINEL}
         importantForAutofill="no"
         // visible-password is the Android keyboard with no suggestion strip and no
         // autocorrect, which is the only reliable way to stop the keyboard rewriting
         // what is typed into a terminal.
         keyboardType={Platform.OS === 'android' ? 'visible-password' : 'default'}
-        onChangeText={onChangeText}
-        onSubmitEditing={() => pressKey('Enter')}
+        onDelta={onFieldDelta}
+        onSubmitEditing={onFieldSubmit}
         ref={inputRef}
         returnKeyType="send"
         spellCheck={false}

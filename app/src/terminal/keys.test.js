@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { encodeKey, encodePaste, encodeText, inputDelta } = require('./keys.js');
+const { encodeKey, encodePaste, encodeText, createFieldTracker, inputDelta } = require('./keys.js');
 
 test('cursor keys follow the mode the program in the pane chose', () => {
   assert.equal(encodeKey('Up'), '\x1b[A');
@@ -77,4 +77,66 @@ test('the hidden field reports typing, backspaces and replacements as a delta', 
     'an autocorrect replacement deletes and types in one event');
   assert.deepEqual(inputDelta(sentinel, '····café'), { backspaces: 0, text: 'café' });
   assert.deepEqual(inputDelta('', 'x'), { backspaces: 0, text: 'x' });
+});
+
+test('the field tracker measures each change against the text before it', () => {
+  const s = '····';
+  const field = createFieldTracker(s);
+  const typed = (next) => field.change(next);
+  // Typing never resets mid-run, so each change is exactly what the key did.
+  assert.deepEqual(typed('····k'), { backspaces: 0, text: 'k' });
+  assert.deepEqual(typed('····ke'), { backspaces: 0, text: 'e' });
+  assert.deepEqual(typed('····kee'), { backspaces: 0, text: 'e' });
+  // A held Backspace: one delete per press, into the sentinel too.
+  assert.deepEqual(typed('····ke'), { backspaces: 1, text: '' });
+  assert.deepEqual(typed('····k'), { backspaces: 1, text: '' });
+  assert.deepEqual(typed('····'), { backspaces: 1, text: '' });
+  assert.deepEqual(typed('···'), { backspaces: 1, text: '' });
+  assert.deepEqual(typed('··'), { backspaces: 1, text: '' });
+  // A space right after a backspace (the sentinel is spaces too).
+  assert.deepEqual(typed('·· '), { backspaces: 0, text: ' ' });
+  // "aba" fast.
+  assert.deepEqual(typed('·· a'), { backspaces: 0, text: 'a' });
+  assert.deepEqual(typed('·· ab'), { backspaces: 0, text: 'b' });
+  assert.deepEqual(typed('·· aba'), { backspaces: 0, text: 'a' });
+  // Idle: the field goes back to the sentinel and the next key starts from it.
+  field.reset();
+  assert.equal(field.text(), s);
+  assert.deepEqual(typed('····x'), { backspaces: 0, text: 'x' });
+  field.reset();
+  assert.deepEqual(typed('···'), { backspaces: 1, text: '' }, 'a backspace just after the reset');
+});
+
+test('a keystroke that lands while the idle reset is dropped is not typed twice', () => {
+  const s = '····';
+  const field = createFieldTracker(s);
+  field.change('····ls -la');
+  field.reset();
+  // React Native dropped the reset: the change arrives on top of the old text.
+  assert.deepEqual(field.change('····ls -lah'), { backspaces: 0, text: 'h' });
+  assert.deepEqual(field.change('····ls -la'), { backspaces: 1, text: '' }, 'ordinary again after that');
+  // A Backspace on top of a dropped reset is one Backspace, not the line again.
+  field.reset();
+  assert.deepEqual(field.change('····ls -l'), { backspaces: 1, text: '' });
+  // Resets taken below the sentinel, dropped.
+  const held = createFieldTracker(s);
+  held.change('···'); held.change('··'); held.change('·'); held.change('');
+  held.reset();
+  assert.deepEqual(held.change('x'), { backspaces: 0, text: 'x' }, 'typing after four held Backspaces');
+  const once = createFieldTracker(s);
+  once.change('···');
+  once.reset();
+  assert.deepEqual(once.change('··'), { backspaces: 1, text: '' }, 'a second Backspace after a pause');
+  const single = createFieldTracker(s);
+  single.change('····a');
+  single.reset();
+  assert.deepEqual(single.change('····'), { backspaces: 1, text: '' }, 'a Backspace after a one-character run');
+  // When the reset did land, the next key is measured from the sentinel.
+  const landed = createFieldTracker(s);
+  landed.change('····ls');
+  landed.reset();
+  assert.deepEqual(landed.change('····h'), { backspaces: 0, text: 'h' });
+  landed.reset();
+  assert.deepEqual(landed.change('···'), { backspaces: 1, text: '' });
+  assert.deepEqual(inputDelta(s, '····ls'), { backspaces: 0, text: 'ls' });
 });

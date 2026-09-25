@@ -136,4 +136,45 @@ function inputDelta(sentinel, next) {
   return { backspaces: base.length - shared, text: value.slice(shared) };
 }
 
-module.exports = { CURSOR_KEYS, PLAIN_KEYS, ctrlChar, encodeKey, encodePaste, encodeText, inputDelta };
+// The hidden field's text over a run of typing. Every change is measured against
+// the text the field held just before it, which is always known, so nothing has to
+// guess whether a reset has landed. The field is only put back to the sentinel once
+// typing goes idle (the screen calls reset() as it does so); until then it simply
+// grows, and the sentinel is long enough that a held Backspace does not run out.
+//
+// One race is left: a keystroke landing while the idle reset is being applied. React
+// Native drops the reset then, and the change arrives on top of the old text rather
+// than the sentinel, and nothing tells the app which. So the first change after a
+// reset is measured against both and the smaller edit is taken: a real keystroke is a
+// one-character change against the right one and a large edit against the wrong one.
+// A tie goes to the sentinel, where the reset almost always lands.
+function createFieldTracker(sentinel) {
+  const base = String(sentinel == null ? '' : sentinel);
+  let last = base;
+  let resetFrom = null;
+  return {
+    change(next) {
+      const value = String(next == null ? '' : next);
+      let delta = inputDelta(last, value);
+      if (resetFrom !== null) {
+        const fromOld = inputDelta(resetFrom, value);
+        const cost = (d) => d.backspaces + d.text.length;
+        // A change that costs nothing against the sentinel cannot be real: had the reset
+        // landed, any change would move the field off it. (One case stays ambiguous: after
+        // a two-character run, a Backspace on a dropped reset and a landed reset plus that
+        // same first character give the same text; it goes to the sentinel.)
+        if (cost(delta) === 0 || cost(fromOld) < cost(delta)) delta = fromOld;
+      }
+      resetFrom = null;
+      last = value;
+      return delta;
+    },
+    reset() {
+      if (last !== base) resetFrom = last;
+      last = base;
+    },
+    text() { return last; },
+  };
+}
+
+module.exports = { CURSOR_KEYS, PLAIN_KEYS, ctrlChar, encodeKey, encodePaste, encodeText, createFieldTracker, inputDelta };
