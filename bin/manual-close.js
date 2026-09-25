@@ -34,9 +34,15 @@ async function manualClose(body, deps) {
   }
   let expectedInputCount = null;
   let expectedOutputCount = null;
+  // A session ending in a pane that outlives it (a node's panes are a shell with the
+  // agent inside) has its SessionEnd hook hand the pane back: sessionId cleared, agent
+  // 'shell'. On the same process that is this close taking effect, not a new identity;
+  // any other session binding the pane still refuses below.
+  const releasedBySession = (pane) => pane !== initial && Boolean(initial?.pid) && pane.pid === initial.pid
+    && pane.meta?.agent === 'shell' && !pane.meta?.sessionId;
   const verify = (pane) => {
-    if (!pane || pane.id !== body.pane || pane.meta?.sessionId !== body.sessionId
-        || !['claude', 'codex', 'pi'].includes(pane.meta?.agent) || (initial?.pid && pane.pid !== initial.pid)) {
+    if (!pane || pane.id !== body.pane || (!releasedBySession(pane) && (pane.meta?.sessionId !== body.sessionId
+        || !['claude', 'codex', 'pi'].includes(pane.meta?.agent))) || (initial?.pid && pane.pid !== initial.pid)) {
       throw new Error('Session/pane identity changed; nothing terminated');
     }
     if (deps.protectInput && expectedInputCount !== null && pane.inputCount !== expectedInputCount) {

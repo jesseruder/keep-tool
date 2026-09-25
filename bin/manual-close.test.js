@@ -37,6 +37,54 @@ test('manual close rechecks process identity after graceful attempt', async () =
   await assert.rejects(manualClose(body, f.deps), /identity/);
   assert.deepEqual(f.calls, ['exit']);
 });
+// A node pane is a shell with the agent inside: SIGTERM runs the agent's SessionEnd
+// hook, which hands the pane back (agent 'shell', no sessionId) before the pane dies.
+for (const [label, releasedAlive, calls, forced] of [
+  ['and the pane then exits', false, ['exit', 'SIGTERM'], false],
+  ['while its shell lives on', true, ['exit', 'SIGTERM', 'SIGKILL'], true],
+]) test(`manual close accepts a pane its own session released on exit, ${label}`, async () => {
+  let released = false;
+  let alive = true;
+  const calls_ = [];
+  const deps = {
+    getPane: async () => ({ id: 'pane', pid: 123, alive,
+      meta: released ? { agent: 'shell' } : { agent: 'claude', sessionId: 'session' } }),
+    graceful: async () => { calls_.push('exit'); throw new Error('a graceful close reads the transcript on aws1'); },
+    signal: async (_pane, signal) => {
+      calls_.push(signal);
+      released = true;
+      if (!releasedAlive || signal === 'SIGKILL') alive = false;
+    },
+    sleep: async () => {},
+  };
+  assert.equal((await manualClose(body, deps)).forced, forced);
+  assert.deepEqual(calls_, calls);
+});
+test('manual close still refuses a released pane another session has bound', async () => {
+  let bound = false;
+  const calls = [];
+  const deps = {
+    getPane: async () => ({ id: 'pane', pid: 123, alive: true,
+      meta: bound ? { agent: 'claude', sessionId: 'other' } : { agent: 'claude', sessionId: 'session' } }),
+    graceful: async () => { calls.push('exit'); bound = true; },
+    signal: async (_pane, signal) => { calls.push(signal); },
+    sleep: async () => {},
+  };
+  await assert.rejects(manualClose(body, deps), /identity changed/);
+  assert.deepEqual(calls, ['exit']);
+});
+test('manual close does not accept a released pane on a different process', async () => {
+  let reads = 0;
+  const deps = {
+    getPane: async () => (++reads === 1
+      ? { id: 'pane', pid: 123, alive: true, meta: { agent: 'claude', sessionId: 'session' } }
+      : { id: 'pane', pid: 456, alive: true, meta: { agent: 'shell' } }),
+    graceful: async () => { throw new Error('refused'); },
+    signal: async () => { throw new Error('must not signal'); },
+    sleep: async () => {},
+  };
+  await assert.rejects(manualClose(body, deps), /identity changed/);
+});
 test('manual close does not report success if termination cannot be verified', async () => {
   const f = fixture('never');
   await assert.rejects(manualClose(body, f.deps), /still alive/);
