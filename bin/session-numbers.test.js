@@ -59,7 +59,9 @@ test('the registry file is written atomically and leaves no temporary behind', (
   const value = registry(dir);
   assert.deepEqual(value, { next: 2, ids: { only: 1 } });
   const left = fs.readdirSync(path.join(dir, '.keep'));
-  assert.deepEqual(left, ['session-numbers.json'], 'no tmp file and no stale lock');
+  assert.deepEqual(left.sort(), ['session-numbers-backups', 'session-numbers.json', 'session-numbers.last.json'],
+    'no tmp file and no stale lock');
+  assert.equal(fs.readdirSync(path.join(dir, '.keep', 'session-numbers-backups')).filter((name) => name.includes('.tmp-')).length, 0);
 });
 
 test('a held lock skips allocation but still labels the sessions the file knows', () => {
@@ -204,4 +206,177 @@ test('a machine with no registry shows no numbers and refuses one by name', () =
     assert.match(out.error, /this machine has none/);
     assert.equal(out.resolved, undefined);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+function overwrite(dir, value) {
+  fs.writeFileSync(path.join(dir, '.keep', 'session-numbers.json'), JSON.stringify(value));
+}
+
+test('a registry replaced from outside is repaired from its backup before anything is labelled', () => {
+  const dir = root();
+  const fleet = ['a', 'b', 'c', 'd', 'e'].map((id, index) => ({ id, mtime: index + 1 }));
+  numbers.assign(fleet, { root: dir });
+  assert.deepEqual(fleet.map((session) => session.num), [1, 2, 3, 4, 5]);
+
+  // What the tell test's fixture did to the live registry: a gap, and none of the fleet.
+  overwrite(dir, { next: 9, ids: { 'known-session': 8 } });
+  const scan = [...['a', 'b', 'c', 'd', 'e'].map((id, index) => ({ id, mtime: index + 1 })), { id: 'f', mtime: 99 }];
+  numbers.assign(scan, { root: dir });
+  assert.deepEqual(scan.map((session) => [session.id, session.num]),
+    [['a', 1], ['b', 2], ['c', 3], ['d', 4], ['e', 5], ['f', 9]], 'the fleet keeps its numbers; a newcomer goes past both');
+  assert.equal(registry(dir).ids['known-session'], 8, 'a number the backup never held is kept');
+  assert.equal(registry(dir).next, 10);
+});
+
+test('a session the damaged registry numbered over a restored one is numbered again', () => {
+  const dir = root();
+  numbers.assign([{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }], { root: dir });
+  overwrite(dir, { next: 2, ids: { stranger: 1 } });
+  const scan = [{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }, { id: 'stranger', mtime: 3 }];
+  numbers.assign(scan, { root: dir });
+  assert.deepEqual(scan.map((session) => session.num), [1, 2, 3]);
+});
+
+test('a read-only scan neither repairs nor records', () => {
+  const dir = root();
+  numbers.assign([{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }], { root: dir });
+  overwrite(dir, { next: 2, ids: { stranger: 1 } });
+  const before = fs.readFileSync(path.join(dir, '.keep', 'session-numbers.json'), 'utf8');
+  const scan = [{ id: 'a', mtime: 1 }, { id: 'stranger', mtime: 3 }];
+  numbers.assign(scan, { root: dir, readOnly: true });
+  assert.equal(fs.readFileSync(path.join(dir, '.keep', 'session-numbers.json'), 'utf8'), before);
+  assert.deepEqual(scan.map((session) => session.num), [undefined, undefined], 'nothing is labelled from a damaged registry');
+});
+
+test('a damaged registry whose repair cannot take the lock labels nothing and allocates nothing', () => {
+  const dir = root();
+  numbers.assign([{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }], { root: dir });
+  overwrite(dir, { next: 2, ids: { stranger: 1 } });
+  fs.writeFileSync(numbers.lockFile(dir), String(process.pid));
+  try {
+    const scan = [{ id: 'stranger', mtime: 3 }, { id: 'new', mtime: 4 }];
+    numbers.assign(scan, { root: dir, lockRetries: 0 });
+    assert.deepEqual(scan.map((session) => session.num), [undefined, undefined]);
+    assert.deepEqual(registry(dir), { next: 2, ids: { stranger: 1 } });
+  } finally { fs.unlinkSync(numbers.lockFile(dir)); }
+});
+
+test('a replacement that keeps the size but moves the numbers is caught, and lookups trust nothing until it is repaired', () => {
+  const dir = root();
+  numbers.assign([{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }], { root: dir });
+  overwrite(dir, { next: 3, ids: { a: 2, b: 1 } });
+  assert.equal(numbers.lookup('#1', { root: dir }), null, 'a damaged registry resolves no number');
+  assert.equal(numbers.lookup('a', { root: dir }), null);
+  const scan = [{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }];
+  numbers.assign(scan, { root: dir });
+  assert.deepEqual(scan.map((session) => session.num), [1, 2]);
+  assert.deepEqual(numbers.lookup('#1', { root: dir }), { id: 'a', num: 1 });
+});
+
+test('a backup that contradicts the mirror is never used, however full', () => {
+  const dir = root();
+  numbers.assign([{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }], { root: dir });
+  const backups = path.join(dir, '.keep', 'session-numbers-backups');
+  fs.writeFileSync(path.join(backups, '2030-01-01T00.json'), JSON.stringify({ next: 9, ids: { a: 2, b: 1, x: 3, y: 4 } }));
+  overwrite(dir, { next: 1, ids: {} });
+  const scan = [{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }];
+  numbers.assign(scan, { root: dir });
+  assert.deepEqual(scan.map((session) => session.num), [1, 2]);
+});
+
+test('two sessions sharing a number is damage even when every mirrored number is kept', () => {
+  const dir = root();
+  numbers.assign([{ id: 'a', mtime: 1 }], { root: dir });
+  overwrite(dir, { next: 2, ids: { a: 1, stranger: 1 } });
+  assert.equal(numbers.lookup('#1', { root: dir }), null);
+  const scan = [{ id: 'a', mtime: 1 }, { id: 'stranger', mtime: 2 }];
+  numbers.assign(scan, { root: dir });
+  assert.deepEqual(scan.map((session) => session.num), [1, 2]);
+});
+
+test('a mirror left behind by a crash after the registry write catches up on the next scan', () => {
+  const dir = root();
+  numbers.assign([{ id: 'a', mtime: 1 }], { root: dir });
+  // The registry gained b, but the mirror write after it never happened.
+  overwrite(dir, { next: 3, ids: { a: 1, b: 2 } });
+  numbers.assign([{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }], { root: dir });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, '.keep', 'session-numbers.last.json'), 'utf8')), { next: 3, ids: { a: 1, b: 2 } });
+  // So losing b afterwards is caught.
+  overwrite(dir, { next: 3, ids: { a: 1 } });
+  const scan = [{ id: 'b', mtime: 2 }];
+  numbers.assign(scan, { root: dir });
+  assert.equal(scan[0].num, 2);
+});
+
+test('an outside write that only adds is not taken for a crash: next raised alone, or a number past next', () => {
+  const dir = root();
+  numbers.assign([{ id: 'a', mtime: 1 }], { root: dir });
+  overwrite(dir, { next: 1000000, ids: { a: 1 } });
+  const scan = [{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }];
+  numbers.assign(scan, { root: dir });
+  assert.deepEqual(scan.map((session) => session.num), [1, 2], 'next is not taken from the damaged file');
+  overwrite(dir, { next: 3, ids: { a: 1, b: 2, stray: 50 } });
+  assert.equal(numbers.lookup('#50', { root: dir }), null, 'a number Keep never allocated resolves to nothing');
+});
+
+test('a mirror that is itself damaged is ignored and rewritten, not repaired from forever', () => {
+  const dir = root();
+  numbers.assign([{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }], { root: dir });
+  const mirror = path.join(dir, '.keep', 'session-numbers.last.json');
+  fs.writeFileSync(mirror, JSON.stringify({ next: 3, ids: { a: 1, x: 1 } }));
+  const scan = [{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }];
+  numbers.assign(scan, { root: dir });
+  assert.deepEqual(scan.map((session) => session.num), [1, 2]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(mirror, 'utf8')), { next: 3, ids: { a: 1, b: 2 } });
+});
+
+test('numberFor stops trusting a cached registry when only the mirror changes', () => {
+  const dir = root();
+  numbers.assign([{ id: 'a', mtime: 1 }, { id: 'b', mtime: 2 }], { root: dir });
+  assert.equal(numbers.numberFor('a', { root: dir }), 1);
+  // The mirror now says a is 2: the unchanged registry contradicts it.
+  const mirror = path.join(dir, '.keep', 'session-numbers.last.json');
+  fs.writeFileSync(mirror, JSON.stringify({ next: 3, ids: { a: 2, b: 1 } }));
+  const later = new Date(Date.now() + 5000);
+  fs.utimesSync(mirror, later, later);
+  assert.equal(numbers.numberFor('a', { root: dir }), null);
+});
+
+test('repair prefers the backup that holds the most sessions over one whose next ran ahead', () => {
+  const dir = root();
+  const fleet = ['a', 'b', 'c'].map((id, index) => ({ id, mtime: index + 1 }));
+  numbers.assign(fleet, { root: dir, now: Date.parse('2026-01-01T00:00:00Z') });
+  // A damaged copy with a higher next, snapshotted in a later hour.
+  const backups = path.join(dir, '.keep', 'session-numbers-backups');
+  fs.writeFileSync(path.join(backups, '2026-01-01T05.json'), JSON.stringify({ next: 50, ids: { stray: 49 } }));
+  overwrite(dir, { next: 1, ids: {} });
+  const scan = fleet.map(({ id, mtime }) => ({ id, mtime }));
+  numbers.assign(scan, { root: dir });
+  assert.deepEqual(scan.map((session) => session.num), [1, 2, 3]);
+});
+
+test('a registry older than its records starts them on the first scan', () => {
+  const dir = root();
+  fs.mkdirSync(path.join(dir, '.keep'), { recursive: true });
+  overwrite(dir, { next: 42, ids: { old: 41 } });
+  numbers.assign([{ id: 'old', mtime: 1 }], { root: dir });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, '.keep', 'session-numbers.last.json'), 'utf8')), { next: 42, ids: { old: 41 } });
+  assert.equal(fs.readdirSync(path.join(dir, '.keep', 'session-numbers-backups')).length, 1);
+  // And a later loss of that registry is caught against them.
+  overwrite(dir, { next: 1, ids: {} });
+  const scan = [{ id: 'old', mtime: 1 }];
+  numbers.assign(scan, { root: dir });
+  assert.equal(scan[0].num, 41);
+});
+
+test('backups are hourly and only the newest 48 are kept', () => {
+  const dir = root();
+  const start = Date.parse('2026-01-01T00:00:00Z');
+  for (let hour = 0; hour < 50; hour += 1) {
+    numbers.assign([{ id: `s${hour}`, mtime: hour + 1 }], { root: dir, now: start + hour * 3600e3 });
+  }
+  const kept = fs.readdirSync(path.join(dir, '.keep', 'session-numbers-backups')).sort();
+  assert.equal(kept.length, 48);
+  assert.equal(kept[0], '2026-01-01T02.json');
+  assert.equal(kept.at(-1), '2026-01-03T01.json');
 });

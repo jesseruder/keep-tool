@@ -4407,12 +4407,6 @@
       "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/session-names.js set; this exact synchronous filesystem mutation count is frozen, including fallback branches."
     },
     {
-      "function": "bin/session-numbers.js::numberFor",
-      "operation": "fs.statSync",
-      "count": 1,
-      "reason": "Conservative metadata debt: the static daemon graph reaches bin/session-numbers.js numberFor; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation."
-    },
-    {
       "function": "bin/session-numbers.js::read",
       "operation": "fs.readFileSync",
       "count": 1,
@@ -4939,6 +4933,54 @@
       "operation": "fs.existsSync",
       "count": 1,
       "reason": "Conservative metadata debt: the static daemon graph reaches bin/wt.js recycledWorktree; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation."
+    },
+    {
+      "function": "bin/session-numbers.js::bestCopy",
+      "operation": "fs.readdirSync",
+      "count": 1,
+      "reason": "Session-number registry integrity: small synchronous reads and writes of .keep/session-numbers.last.json (a mirror of the last registry Keep wrote) and .keep/session-numbers-backups/ beside the registry write this path already makes. A repair runs only when the registry disagrees with the mirror (lost or changed numbers, duplicates, or growth Keep did not allocate), and the mirror catches up only to growth shaped like Keep's own."
+    },
+    {
+      "function": "bin/session-numbers.js::readMirror",
+      "operation": "fs.existsSync",
+      "count": 1,
+      "reason": "Session-number registry integrity: small synchronous reads and writes of .keep/session-numbers.last.json (a mirror of the last registry Keep wrote) and .keep/session-numbers-backups/ beside the registry write this path already makes. A repair runs only when the registry disagrees with the mirror (lost or changed numbers, duplicates, or growth Keep did not allocate), and the mirror catches up only to growth shaped like Keep's own."
+    },
+    {
+      "function": "bin/session-numbers.js::snapshot",
+      "operation": "fs.mkdirSync",
+      "count": 1,
+      "reason": "Session-number registry integrity: small synchronous reads and writes of .keep/session-numbers.last.json (a mirror of the last registry Keep wrote) and .keep/session-numbers-backups/ beside the registry write this path already makes. A repair runs only when the registry disagrees with the mirror (lost or changed numbers, duplicates, or growth Keep did not allocate), and the mirror catches up only to growth shaped like Keep's own."
+    },
+    {
+      "function": "bin/session-numbers.js::snapshot",
+      "operation": "fs.readdirSync",
+      "count": 1,
+      "reason": "Session-number registry integrity: small synchronous reads and writes of .keep/session-numbers.last.json (a mirror of the last registry Keep wrote) and .keep/session-numbers-backups/ beside the registry write this path already makes. A repair runs only when the registry disagrees with the mirror (lost or changed numbers, duplicates, or growth Keep did not allocate), and the mirror catches up only to growth shaped like Keep's own."
+    },
+    {
+      "function": "bin/session-numbers.js::snapshot",
+      "operation": "fs.unlinkSync",
+      "count": 1,
+      "reason": "Session-number registry integrity: small synchronous reads and writes of .keep/session-numbers.last.json (a mirror of the last registry Keep wrote) and .keep/session-numbers-backups/ beside the registry write this path already makes. A repair runs only when the registry disagrees with the mirror (lost or changed numbers, duplicates, or growth Keep did not allocate), and the mirror catches up only to growth shaped like Keep's own."
+    },
+    {
+      "function": "bin/session-numbers.js::writeJson",
+      "operation": "fs.renameSync",
+      "count": 1,
+      "reason": "Session-number registry integrity: small synchronous reads and writes of .keep/session-numbers.last.json (a mirror of the last registry Keep wrote) and .keep/session-numbers-backups/ beside the registry write this path already makes. A repair runs only when the registry disagrees with the mirror (lost or changed numbers, duplicates, or growth Keep did not allocate), and the mirror catches up only to growth shaped like Keep's own."
+    },
+    {
+      "function": "bin/session-numbers.js::writeJson",
+      "operation": "fs.writeFileSync",
+      "count": 1,
+      "reason": "Session-number registry integrity: small synchronous reads and writes of .keep/session-numbers.last.json (a mirror of the last registry Keep wrote) and .keep/session-numbers-backups/ beside the registry write this path already makes. A repair runs only when the registry disagrees with the mirror (lost or changed numbers, duplicates, or growth Keep did not allocate), and the mirror catches up only to growth shaped like Keep's own."
+    },
+    {
+      "function": "bin/session-numbers.js::numberFor",
+      "operation": "fs.statSync",
+      "count": 2,
+      "reason": "Conservative metadata debt: the static daemon graph reaches bin/session-numbers.js numberFor; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation. The second stat is the session-number mirror, which decides whether the cached registry is trusted."
     }
   ],
   "edges": [
@@ -7757,10 +7799,6 @@
     "bin/session-names.js::apply|bin/session-names.js::read|1",
     "bin/session-names.js::read|bin/session-names.js::readEntry|1",
     "bin/session-numbers.js::assign|bin/session-numbers.js::assign>withLock callback|1",
-    "bin/session-numbers.js::assign|bin/session-numbers.js::read|2",
-    "bin/session-numbers.js::assign|bin/session-numbers.js::withLock|1",
-    "bin/session-numbers.js::assign>withLock callback|bin/session-numbers.js::read|1",
-    "bin/session-numbers.js::assign>withLock callback|bin/session-numbers.js::write|1",
     "bin/session-numbers.js::lookup|bin/session-numbers.js::read|1",
     "bin/session-numbers.js::named|bin/session-numbers.js::numberFor|1",
     "bin/session-numbers.js::numberFor|bin/session-numbers.js::read|1",
@@ -8032,7 +8070,34 @@
     "bin/serve/schedulers.js::startSchedulers>areaSessionDeps>remoteSession|bin/serve.js::loadSessionForAction|1",
     "bin/serve/schedulers.js::startSchedulers>areaSessionDeps>transcriptShows|bin/serve.js::nodeTranscriptShows|1",
     "bin/serve/schedulers.js::startSchedulers>areaSessionDeps|bin/serve/schedulers.js::startSchedulers>areaSessionDeps>placement|1",
-    "bin/serve/schedulers.js::startSchedulers>areaSessionDeps|bin/serve/schedulers.js::startSchedulers>areaSessionDeps>remoteSession|1"
+    "bin/serve/schedulers.js::startSchedulers>areaSessionDeps|bin/serve/schedulers.js::startSchedulers>areaSessionDeps>remoteSession|1",
+    "bin/session-numbers.js::assign>withLock callback[2]|bin/session-numbers.js::read|1",
+    "bin/session-numbers.js::assign>withLock callback[2]|bin/session-numbers.js::snapshot|1",
+    "bin/session-numbers.js::assign>withLock callback[2]|bin/session-numbers.js::writeJson|1",
+    "bin/session-numbers.js::assign>withLock callback[3]|bin/session-numbers.js::repair|1",
+    "bin/session-numbers.js::assign>withLock callback[3]|bin/session-numbers.js::write|1",
+    "bin/session-numbers.js::assign>withLock callback|bin/session-numbers.js::repair|1",
+    "bin/session-numbers.js::assign|bin/session-numbers.js::assign>withLock callback[2]|1",
+    "bin/session-numbers.js::assign|bin/session-numbers.js::assign>withLock callback[3]|1",
+    "bin/session-numbers.js::assign|bin/session-numbers.js::readMirror|1",
+    "bin/session-numbers.js::assign|bin/session-numbers.js::read|3",
+    "bin/session-numbers.js::assign|bin/session-numbers.js::regressed|3",
+    "bin/session-numbers.js::assign|bin/session-numbers.js::withLock|3",
+    "bin/session-numbers.js::bestCopy|bin/session-numbers.js::readMirror|1",
+    "bin/session-numbers.js::bestCopy|bin/session-numbers.js::read|1",
+    "bin/session-numbers.js::lookup|bin/session-numbers.js::trusted|1",
+    "bin/session-numbers.js::numberFor|bin/session-numbers.js::trusted|1",
+    "bin/session-numbers.js::readMirror|bin/session-numbers.js::read|1",
+    "bin/session-numbers.js::regressed|bin/session-numbers.js::readMirror|1",
+    "bin/session-numbers.js::repair|bin/session-numbers.js::bestCopy|1",
+    "bin/session-numbers.js::repair|bin/session-numbers.js::readMirror|1",
+    "bin/session-numbers.js::repair|bin/session-numbers.js::read|1",
+    "bin/session-numbers.js::repair|bin/session-numbers.js::regressed|1",
+    "bin/session-numbers.js::repair|bin/session-numbers.js::write|1",
+    "bin/session-numbers.js::snapshot|bin/session-numbers.js::writeJson|1",
+    "bin/session-numbers.js::trusted|bin/session-numbers.js::regressed|1",
+    "bin/session-numbers.js::write|bin/session-numbers.js::snapshot|1",
+    "bin/session-numbers.js::write|bin/session-numbers.js::writeJson|2"
   ],
   "unresolved": [
     {

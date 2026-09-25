@@ -160,7 +160,7 @@ function renderHostPanes(panes) {
 function knownSessionNumbers() {
   const root = registryRoot();
   if (!root) return {};
-  try { return sessionNumbers.read({ root }).ids; } catch { return {}; }
+  try { return sessionNumbers.readTrusted({ root }).ids; } catch { return {}; }
 }
 
 function renderPanePanes(panes, numbers = null) {
