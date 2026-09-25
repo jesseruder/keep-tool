@@ -94,11 +94,13 @@ promotion or rollback, an AMI pin-back, a terraform apply, terminating a host, a
 database write — run `keep who cauldron-game-server` and claim the hold the runbook
 names, for as long as the runbook says the operation takes:
 `keep hold cauldron-game-server --scope runtime-image --for +2h -m "why"` for the
-runtime image, `--scope terraform --for +2h` for an apply, plus `--scope fleet` whenever
-instances will refresh or a host is terminated (a refresh drains for up to an hour, so
-never hold it for less). `keep release <id>` the moment you are done. The scopes in
-this area are `runtime-image`, `terraform` and `fleet` (and `database` on ghost-server
-for a production write). Never release someone else's hold, and if one of those scopes is
+runtime image, `--scope terraform --for +2h` for an apply, and `--scope fleet --for +2h`
+for anything that changes the fleet — scaling an ASG, a refresh, terminating a host, an
+AMI build — on its own or alongside `terraform` (a refresh drains for up to an hour, so
+never hold it for less). A production database write is ghost-server's, and holds are
+per project: `keep who ghost-server`, then `keep hold ghost-server --scope database
+--for +15m -m "why"`. `keep release <id>` the moment you are done. The scopes in this
+area are `runtime-image`, `terraform` and `fleet`. Never release someone else's hold, and if one of those scopes is
 held by somebody else, that is itself worth a line on the card: their work may be your
 incident's cause, and you coordinate with it rather than act through it. Deploys that
 are gated steps (`keep steps cauldron-game-server`) go through `keep step claim` /
@@ -161,8 +163,9 @@ The order is the on-call order:
    log, write down the deck id and the fix (the pattern the deck guide describes), and
    record a `keep decide answer` whose `--send` is the note you would send the creator.
    You cannot reach creators yourself; Owner decides whether to. Several unrelated
-   decks firing at once is the other case: then the budget is wrong, and that is a
-   fleet incident.
+   decks firing at once is the other case: that is a fleet investigation — a runtime
+   or host regression, a shared author pattern, or a budget that is too tight — and
+   you find out which before you touch anything.
 2. **Find the cause.** Then diagnose properly, with the evidence rules above.
 3. **Fix it, or make sure it gets fixed.** A code fix goes in a worktree, gets a Codex
    review (`codex-review-runner` skill) and lands through `wt land`; deploys follow the
