@@ -156,10 +156,11 @@ test('a node forwards an agent\'s emit and feed reads, and nothing else under ke
   assert.equal(argumentRefusal('agents', ['events', 'redash-daily', '--unseen', '--json'], ME), null);
   assert.equal(argumentRefusal('agents', ['--json'], ME), null);
   assert.equal(argumentRefusal('agents', [], ME), null);
-  for (const sub of ['seen', 'place']) {
-    assert.match(String(argumentRefusal('agents', [sub, 'redash-daily'], ME)), /a node runs only keep agents emit\|events/);
-    assert.match(String(nodeSideRefusal('agents', [sub, 'redash-daily'])), /a node runs only keep agents emit\|events/);
-  }
+  assert.match(String(argumentRefusal('agents', ['seen', 'redash-daily'], ME)), /a node runs only keep agents emit\|events\|place/);
+  assert.match(String(nodeSideRefusal('agents', ['seen', 'redash-daily'])), /a node runs only keep agents emit\|events\|place/);
+  // A node may move an agent, to any node: --node there is the agent's, not the caller's.
+  assert.equal(argumentRefusal('agents', ['place', 'redash-daily', '--node', 'main'], ME), null);
+  assert.equal(argumentRefusal('agents', ['place', 'redash-daily', '--daemon'], ME), null);
   assert.match(String(argumentRefusal('agents', ['emit', 'redash-daily', '--kind', 'x', '-m', 'y'], { node: 'aws1' })),
     /a node's emit names the session it is from/);
   const { svc, root, calls } = service(t);

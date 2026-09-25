@@ -52,8 +52,9 @@ const REGISTRY_COMMANDS = Object.freeze([
   // An agent's own feed (AGENTS_ALLOWED): a card agent or responder on a node says
   // what it found with `emit`, and reads its feed with `events` or the bare list.
   // The daemon's CLI runs an emit under the caller's verified session and writes it
-  // only when that session is the one the agent's record names. `seen` is Owner's
-  // badge and `place` is Owner's placement; both stay on the daemon node.
+  // only when that session is the one the agent's record names. `place` moves an
+  // agent to a node, said on its feed with the session that did it. `seen` is
+  // Owner's badge and stays on the daemon node.
   'agents',
   // The fleet reviewer's procedure (skills/fleet-review), for a reviewer on a node:
   // its bundles and stats are reads over the daemon's registry and mirrors, and its
@@ -71,7 +72,7 @@ const REVIEW_LAND_STDIN_MAX = 1024 * 1024;
 const NODES_ALLOWED = Object.freeze(['update']);
 const NODES_REFUSAL = 'a node runs only keep nodes update; the rest runs on the daemon node';
 
-const AGENTS_ALLOWED = Object.freeze(['emit', 'events']);
+const AGENTS_ALLOWED = Object.freeze(['emit', 'events', 'place']);
 const AGENTS_REFUSAL = `a node runs only keep agents ${AGENTS_ALLOWED.join('|')} (or the bare list); the rest runs on the daemon node`;
 const AGENTS_EMIT_REFUSAL = "a node's emit names the session it is from; run it inside the agent's session";
 function agentsRefusal(args, identity = null) {
@@ -140,6 +141,8 @@ function stdinRefusal(command, args, stdin) {
 // `--session`, so that rule still applies to it.
 const PLACEMENT_FLAGS = Object.freeze({
   open: ['--node'],
+  // Where the agent's sessions will run, not where the caller is.
+  agents: ['--node'],
   // Not where or who but which: the session whose transcript a bundle reads.
   'review-bundle': ['--session'],
   'review-replay': ['--session'],
@@ -204,7 +207,7 @@ const BOOLEAN_FLAGS = Object.freeze({
   turns: ['json', 'all'],
   search: ['json', 'all', 'cards', 'conversations'],
   nodes: ['json', 'no-reload'],
-  agents: ['json', 'unseen', 'needs-you', 'badge', 'daemon', 'as-owner'],
+  agents: ['json', 'unseen', 'needs-you', 'badge', 'daemon'],
   'review-bundle': ['queue', 'raw', 'force'],
   'review-stats': ['json'],
   'review-note': ['force', 'no-digest'],

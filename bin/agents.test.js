@@ -1145,7 +1145,7 @@ test('keep agents lists, emits and marks seen from the command line', () => {
   } finally { cleanup(root); }
 });
 
-test('keep agents place puts an agent on a configured node, and only Owner may', () => {
+test('keep agents place puts an agent on a configured node, from any session, and says so on its feed', () => {
   const root = makeRoot();
   try {
     agents.ensure('redash-daily', { role: 'scheduled check' }, { root });
@@ -1168,18 +1168,24 @@ test('keep agents place puts an agent on a configured node, and only Owner may',
     const unknown = run(['redash-daily', '--node', 'aws9']);
     assert.notEqual(unknown.status, 0);
     assert.match(unknown.stderr, /no configured node named aws9 \(known: main, aws1\)/);
-    // An agent session may read the placement but not change it.
-    const inSession = run(['redash-daily', '--daemon'], { CLAUDE_CODE_SESSION_ID: 'abc' });
-    assert.notEqual(inSession.status, 0);
-    assert.match(inSession.stderr, /only Owner places an agent/);
+    // Every change is said on the feed, with who made it; a read writes nothing.
+    const placedEvents = () => agents.readEvents('redash-daily', { root }).filter((event) => event.kind === 'placed');
+    assert.equal(placedEvents().length, 1);
+    assert.match(placedEvents()[0].text, /placed on aws1 \(needs redash\), was the daemon node, by a shell/);
     assert.match(run(['redash-daily'], { CLAUDE_CODE_SESSION_ID: 'abc' }).stdout, /runs on aws1/);
-    assert.equal(agents.readRecord('redash-daily', root).node, 'aws1');
+    assert.equal(placedEvents().length, 1);
+    // An agent session may change it too, and is named.
+    const inSession = run(['redash-daily', '--needs', 'redash,browser'], { CLAUDE_CODE_SESSION_ID: 'abc' });
+    assert.equal(inSession.status, 0, inSession.stderr);
+    assert.deepEqual(agents.readRecord('redash-daily', root).needs, ['redash', 'browser']);
+    assert.match(placedEvents()[0].text, /by claude .*abc/, "newest first");
 
     // Back to the daemon node: naming it is the same as --daemon.
     assert.equal(run(['redash-daily', '--node', 'main']).status, 0);
     assert.equal(agents.readRecord('redash-daily', root).node, '');
     assert.equal(run(['redash-daily', '--daemon']).status, 0);
     assert.deepEqual(agents.readRecord('redash-daily', root).needs, []);
+    assert.equal(placedEvents().length, 4);
     // The reviewer is not Keep's to open, so it is not placed this way.
     assert.match(run(['fleet-reviewer', '--node', 'aws1']).stderr, /keep move/);
 
@@ -1192,9 +1198,9 @@ test('keep agents place puts an agent on a configured node, and only Owner may',
     assert.notEqual(stranger.status, 0);
     assert.match(stranger.stderr, /an emit from a node must come from that session/);
     assert.notEqual(emit(null).status, 0);
-    assert.equal(agents.readEvents('redash-daily', { root }).length, 0);
+    assert.equal(agents.readEvents('redash-daily', { root }).filter((event) => event.kind === 'diagnosed').length, 0);
     const own = emit('sid-agent');
     assert.equal(own.status, 0, own.stderr);
-    assert.equal(agents.readEvents('redash-daily', { root }).length, 1);
+    assert.equal(agents.readEvents('redash-daily', { root }).filter((event) => event.kind === 'diagnosed').length, 1);
   } finally { cleanup(root); }
 });

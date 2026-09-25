@@ -417,7 +417,7 @@ keep agents [--json]   # agent records: lifecycle, current session, unseen event
 keep agents events <name> [--unseen] [--limit N] [--json]
 keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] [--badge] -m "text"
 keep agents seen <name>
-keep agents place <name> [--node <node>] [--needs cap,cap] [--daemon]   # Owner only: where its sessions run
+keep agents place <name> [--node <node>] [--needs cap,cap] [--daemon]   # where its sessions run
 keep verify <id>       # run a check recipe now, in its thread or a fresh session (needs keep serve)
                        # Owner-initiated: never refused by, and never counted against,
                        # the scheduler's one-open-per-card-per-day allowance
@@ -2409,7 +2409,8 @@ reviewer emits no events in this slice, so it never carries a badge.
   [--needs-you] -m "text"` is how an agent session writes its own feed.
 - `keep agents seen <name>` marks everything seen; this is what the console posts.
 - `keep agents place <name> [--node <node>] [--needs cap,cap] [--daemon]` shows or sets
-  where the agent's sessions run (below). Changing it is Owner's, gated like a grant.
+  where the agent's sessions run (below). Any session may change it, from any node; each
+  change lands on the agent's feed as a `placed` event naming who made it.
 
 ### Placement: an agent on another node
 
@@ -2425,10 +2426,11 @@ way: Keep finds it rather than opening it, so it is moved with `keep move`.
   without spending its daily allowance or recording a failure, and the agent's feed gets
   one `waiting` event per outage (`record.nodeWait`, cleared by the next open that works).
   A plain check, or an agent with no placement, still opens on the daemon node.
-- **Its CLI.** A pane-only node forwards `keep agents emit`, `keep agents events` and the
-  bare `keep agents` list. The daemon runs a forwarded emit under the caller's verified
-  session and writes it only when that session is the one the record names; `seen` and
-  `place` stay on the daemon node.
+- **Its CLI.** A pane-only node forwards `keep agents emit`, `keep agents events`,
+  `keep agents place` and the bare `keep agents` list. The daemon runs a forwarded emit
+  under the caller's verified session and writes it only when that session is the one
+  the record names; a forwarded place names that session on the feed. `seen` stays on
+  the daemon node.
 - **Reaping.** The ephemeral sweep gets the fleet listing with the nodes that did not
   answer. The orphan pass counts a check pane on a node as carrying its agent, and never
   idles a record whose pane is on a node that did not answer. A finished check pane on a

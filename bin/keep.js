@@ -3246,11 +3246,11 @@ commands.agents = (argv) => {
     return;
   }
 
-  // Where an agent's sessions run. Owner's call, gated like a grant: an agent moving
-  // itself (or another) to a machine is choosing where unattended work runs.
+  // Where an agent's sessions run. Any session may change it, from any node; every
+  // change is said on the agent's feed with who made it, so a move is never silent.
   if (subcommand === 'place') {
-    const usage = 'usage: keep agents place <name> [--node <node>] [--needs cap,cap] [--daemon] [--as-owner] [--json]';
-    const o = parseArgs(rest, { node: 'str', needs: 'list', daemon: 'bool', json: 'bool', 'as-owner': 'bool' });
+    const usage = 'usage: keep agents place <name> [--node <node>] [--needs cap,cap] [--daemon] [--json]';
+    const o = parseArgs(rest, { node: 'str', needs: 'list', daemon: 'bool', json: 'bool' });
     if (o._.length !== 1) die(usage);
     const name = o._[0];
     if (!agents.validName(name)) die(`bad agent name: ${name}`);
@@ -3268,10 +3268,6 @@ commands.agents = (argv) => {
       return;
     }
     if (o.daemon && (o.node !== undefined || o.needs !== undefined)) die('--daemon clears the placement; it takes no --node or --needs');
-    if (inAgentSession() && !(o['as-owner'] && process.env.KEEP_OWNER === '1' && !process.env.KEEP_REMOTE_CALLER)) {
-      die(`only Owner places an agent. End the turn and ask him for "keep agents place ${name} …". `
-        + 'If Owner is running this himself from an agent session, pass --as-owner with KEEP_OWNER=1 in the environment.');
-    }
     const nodesApi = require('./nodes.js');
     const patch = {};
     if (o.daemon) Object.assign(patch, { node: '', needs: [] });
@@ -3283,8 +3279,21 @@ commands.agents = (argv) => {
       // never strands an agent on a name that no longer exists.
       patch.node = node === nodesApi.daemonNode() ? '' : node;
     }
-    if (o.needs !== undefined) patch.needs = o.needs.map((entry) => String(entry).trim()).filter(Boolean);
+    // Repeatable, and each may be a comma list: --needs a,b and --needs a --needs b.
+    if (o.needs !== undefined) patch.needs = o.needs.flatMap((entry) => String(entry).split(',')).map((entry) => entry.trim()).filter(Boolean);
     const record = agents.writeRecord(name, patch, { root: ROOT });
+    // Who moved it: the session the daemon verified for a node's request, this
+    // process's own session here, or a shell.
+    const by = currentSession();
+    const where = (value) => value.node || 'the daemon node';
+    const needs = record.needs.length ? ` (needs ${record.needs.join(', ')})` : '';
+    try {
+      agents.emit(name, {
+        kind: 'placed', severity: 'low',
+        text: `placed on ${where(record)}${needs}, was ${where(current)}, by ${by ? `${by.agent} ${sessionNamed(by.id)}` : 'a shell'}`
+          + `${process.env.KEEP_REMOTE_CALLER ? ` on ${process.env.KEEP_REMOTE_CALLER}` : ''}`,
+      }, { root: ROOT });
+    } catch {}
     agents.flushCommits(ROOT);
     if (o.json) { console.log(JSON.stringify({ name, node: record.node, needs: record.needs }, null, 2)); return; }
     console.log(describePlacement(record));
