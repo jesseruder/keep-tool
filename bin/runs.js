@@ -362,10 +362,11 @@ function loadSchedulerState() {
       reopened: dayRecord(parsed && parsed.reopened),
       deferred: checkDeferrals.parse(parsed && parsed.deferred),
       openedAt: timeRecord(parsed && parsed.openedAt),
+      homeDelivered: timeRecord(parsed && parsed.homeDelivered),
     };
   } catch (e) {
     process.stderr.write(`keep runs: scheduler state was unreadable and has been reset: ${e.message}\n`);
-    schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map(), deferred: new Map(), openedAt: new Map() };
+    schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map(), deferred: new Map(), openedAt: new Map(), homeDelivered: new Map() };
   }
   return schedulerState;
 }
@@ -410,6 +411,9 @@ function saveSchedulerState(today = keep.nowStamp().slice(0, 10)) {
     // Nor is this one: a sub-daily interval is judged in wall time, so it keeps a
     // day's worth and drops the rest.
     openedAt: Object.fromEntries([...state.openedAt].filter(([, at]) => Date.now() - at < DAY_MS)),
+    // sessionId -> ms a check was last typed into that card agent's live home. Kept a
+    // week, past any pane the sweep could still be judging on it.
+    homeDelivered: Object.fromEntries([...state.homeDelivered].filter(([, at]) => Date.now() - at < 7 * DAY_MS)),
   };
   const tmp = `${SCHEDULER_STATE_FILE}.${process.pid}.${Date.now()}.tmp`;
   try {
@@ -469,7 +473,7 @@ function cardAgent(task, root = keep.ROOT) {
 //
 // An agent that ran before homes were recorded has none. Its home is then the
 // card's last linked Claude session, but only on evidence that session was the
-// agent: it checked in on the card within two hours of the agent's last event on
+// agent: a check-in on the card attributed to it by id, within two hours of the agent's last event on
 // this card (a check session checks in and emits its report together). Owner's
 // own session on the card, linked later, has no such check-in and is not taken.
 // Empty when there is none, and a fresh session is opened as before.
@@ -493,7 +497,7 @@ function agentHomeSession(agentName, task, agentApi, root = keep.ROOT) {
   const event = record.lastEvent;
   const last = linked.slice(-1)[0];
   if (!last || !event || event.card !== task.id || !Number(event.at)) return '';
-  const checkedIn = checkinFromSessionAt(task, last.id, 0);
+  const checkedIn = checkinFromSessionAt(task, last.id, 0, true);
   return checkedIn && Math.abs(checkedIn - Number(event.at)) <= HOME_EVIDENCE_MS ? last.id : '';
 }
 
@@ -532,21 +536,23 @@ function homeSessionIfStill(agentApi, agentName, task, home, root) {
   return agentHomeSession(agentName, task, agentApi, root) === home ? home : '';
 }
 
-// When a check was last typed into a card agent's live home pane, by session. The
-// sweep reads it so a pane still up from an earlier check is judged on this one: its
-// earlier check-in does not make it finished. In memory only: after a daemon restart
-// the pane is judged from its launch, and at worst it is closed and resumed next run.
-const homeDeliveries = new Map();
+// When a check was last typed into a card agent's live home pane, by session, in the
+// scheduler state so a daemon restart keeps it. The sweep reads it so a pane still up
+// from an earlier check is judged on this one: its earlier check-in does not make it
+// finished, and a turn that ends without a new one is released as unfinished.
+function noteHomeDelivery(sessionId) {
+  loadSchedulerState().homeDelivered.set(sessionId, Date.now());
+  saveSchedulerState();
+}
+function homeDeliveredAt(sessionId) { return loadSchedulerState().homeDelivered.get(sessionId) || 0; }
 
-// A check typed into an agent's live home: the sweep judges the pane on it from now.
-function noteHomeDelivery(sessionId) { homeDeliveries.set(sessionId, Date.now()); }
-
-// The account a session is pinned to, from its durable record; '' when it has none
-// and the pool's pick stands.
+// The account a session resumes on: the same lookup openSession makes for it,
+// which finds an older session's transcript when it has no pinned record. '' when
+// it cannot be told, and the pool's pick stands.
 function sessionAccountId(sessionId, root = keep.ROOT) {
   try {
-    const location = require('./accounts.js').sessionLocation(sessionId, { root });
-    return (location && location.accountId) || '';
+    const account = require('./accounts.js').forSession(sessionId, 'claude', { root });
+    return (account && account.id) || '';
   } catch { return ''; }
 }
 
@@ -1031,7 +1037,11 @@ function stampMs(stamp) {
 // only inferred to be ours, so it counts from the next minute: one stamped in the launch
 // minute may have been written a moment before the pane came up. A miss there falls back
 // to the 60-minute idle rule, so the pane closes late, never early.
-function checkinFromSessionAt(task, sessionId, since) {
+//
+// `attributedOnly` counts only entries that name the session, for a caller asking
+// whether this session wrote to the card at all rather than which of the card's
+// own sessions did.
+function checkinFromSessionAt(task, sessionId, since, attributedOnly = false) {
   if (!task || !sessionId) return 0;
   let entries = [];
   try { entries = require('./review.js').logEntries(task.body); } catch { return 0; }
@@ -1045,7 +1055,7 @@ function checkinFromSessionAt(task, sessionId, since) {
     const at = stampMs(split[1]);
     if (!at) continue;
     const attributed = /\(by (?:claude|codex) ([A-Za-z0-9_-]+)\)/.exec(split[2]);
-    const mine = attributed ? attributed[1] === sessionId : (owns && !/\(reviewer /.test(split[2]));
+    const mine = attributed ? attributed[1] === sessionId : (!attributedOnly && owns && !/\(reviewer /.test(split[2]));
     if (!mine) continue;
     if (at < (attributed ? launchMinute : launchMinute + 60e3)) continue;
     if (at > latest) latest = at;
@@ -1061,7 +1071,7 @@ function checkinFromSessionAt(task, sessionId, since) {
 // interactive session is the point — it may still be finishing the check.
 //
 // `deliveredAt` is when a later check was typed into this same pane (a card agent's
-// home, homeDeliveries): from then on it is that check the pane is running, so only
+// home, homeDeliveredAt): from then on it is that check the pane is running, so only
 // a check-in after it counts, and its idle clock starts there too.
 function reapEphemeralPane({ pane, session, checkedInAt = 0, now = Date.now(), deliveredAt = 0 } = {}, idleMs = EPHEMERAL_IDLE_MS) {
   const meta = (pane && pane.meta) || {};
@@ -1172,7 +1182,7 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
     }
     let card = null;
     if (pane.meta.card) { try { card = keep.loadTask(pane.meta.card); } catch {} }
-    const deliveredAt = homeDeliveries.get(sessionId) || 0;
+    const deliveredAt = homeDeliveredAt(sessionId);
     const checkedInAt = checkinFromSessionAt(card, sessionId, Math.max(Number(pane.meta.launchedAt) || 0, deliveredAt));
     const decision = reapEphemeralPane({ pane, session, checkedInAt, now, deliveredAt });
     if (!decision.reap) continue;
@@ -1525,8 +1535,9 @@ async function schedulerTick() {
       const home = agentName ? agentHomeSession(agentName, t, require('./agents.js')) : '';
       // A busy home is waited for, however long: typing into it would land the check
       // in the middle of other work, and opening beside it is the second session this
-      // exists to prevent. Offered again every tick until it is idle.
-      if (home && threadBusy) continue;
+      // exists to prevent. So the deferral limit does not apply to it: it is offered
+      // the check again on every tick until it is idle.
+      if (home) threadBusy = false;
       if (!threadBusy && (!recurring || home)) {
         let delivery = null;
         try {
@@ -1622,10 +1633,9 @@ async function schedulerTick() {
 function _resetSchedulerStateInMemory() { schedulerState = null; }
 
 function _resetSchedulerState() {
-  schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map(), deferred: new Map(), openedAt: new Map() };
+  schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map(), deferred: new Map(), openedAt: new Map(), homeDelivered: new Map() };
   try { fs.unlinkSync(SCHEDULER_STATE_FILE); } catch {}
   openInFlight.clear();
-  homeDeliveries.clear();
   resetTickAllowance();
   deferrals.clear();
   probesInFlight.clear();
@@ -1640,7 +1650,7 @@ function startScheduler() {
 
 module.exports = {
   checkInFlight, retryPending, startScheduler, schedulerTick, setOnChange, setDeliverer, setOpener, setEphemeralHost,
-  openFreshCheckSession, agentHomeSession, checksAccountId, checkBudget, budgetDeferralReason, noteBudgetDeferral,
+  openFreshCheckSession, agentHomeSession, noteHomeDelivery, homeDeliveredAt, checksAccountId, checkBudget, budgetDeferralReason, noteBudgetDeferral,
   checksFallbackAccountId, recordBudgetDeferral, clearBudgetDeferral, noteStalledCheck,
   escalateBudgetDeferral, handleBudgetDeferral, MAX_FALLBACK_ATTEMPTS,
   freshOpenRefusal, resetTickAllowance, loadSchedulerState, releaseUnfinishedCheck,

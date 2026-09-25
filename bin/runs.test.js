@@ -637,6 +637,22 @@ test('an agent that ran before homes were recorded goes back into the card\'s la
   assert.equal(agentHomeSession('redash-daily', task, api({ ...base, homes: { 'some-card': '' } })), '', 'forgotten');
   assert.equal(agentHomeSession('redash-daily', task, api({ ...base, role: 'incident-responder' })), '');
   assert.equal(agentHomeSession('', task, api(base)), '');
+  // An unattributed entry could be anybody's on the card: it is no evidence.
+  const unattributed = { ...task, body: '\n## 2026-09-24 21:22 — check-in\nMoved: two things.\n' };
+  assert.equal(agentHomeSession('redash-daily', unattributed, api(base)), '');
+});
+
+test('when a check was typed into a home survives a daemon restart', () => {
+  const runs = require('./runs.js');
+  runs._resetSchedulerState();
+  try {
+    runs.noteHomeDelivery('sid-home');
+    const at = runs.homeDeliveredAt('sid-home');
+    assert.ok(at > 0);
+    runs._resetSchedulerStateInMemory();
+    assert.equal(runs.homeDeliveredAt('sid-home'), at, 'read back from the scheduler state file');
+    assert.equal(runs.homeDeliveredAt('sid-other'), 0);
+  } finally { runs._resetSchedulerState(); }
 });
 
 test('the sweep idles an agent whose check pane it closed, or whose pane lost the mark', async () => {
