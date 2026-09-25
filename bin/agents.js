@@ -473,18 +473,24 @@ function attentionItems(records, options = {}) {
   const rows = [];
   for (const record of records || []) {
     if (!record || !record.unseen || record.unseen.needsYou !== true) continue;
-    // A record written before lastNeedsYou existed still has a question waiting:
-    // the row carries its newest event when that is the question, else a pointer.
-    const last = eventSummary(record.lastEvent);
-    const event = eventSummary(record.lastNeedsYou) || (last && last.needsYou ? last : null)
-      || { at: last ? last.at : 0, seq: last ? last.seq : 0, card: record.card || '', text: '' };
+    // A record written before lastNeedsYou existed (or one whose needs-you fell
+    // outside emit's tail window) still has a question waiting. Its row is a
+    // pointer with a FIXED key and time: keyed on the newest event it would move
+    // with every pass, and a row that moves is a new notification each time and a
+    // dismiss that never holds. markSeen rebuilds the record and retires it.
+    const known = eventSummary(record.lastNeedsYou);
+    const event = known || { at: Number(record.createdAt) || 0, seq: 'pending', card: record.card || '', text: '' };
     const card = event.card || record.card || '';
-    const since = event.at || Number(options.now) || Date.now();
+    const sessionId = record.session && record.session.id ? record.session.id : '';
+    // The console lists a row only when it can open something; a row with nothing to
+    // open would count on the phone and show nowhere.
+    if (!sessionId && !card) continue;
+    const since = event.at || Number(record.createdAt) || 0;
     rows.push({
       kind: 'input', pri: 0, agent: record.name,
       key: `agent:${record.name}:${card}:${event.seq}`,
       id: `agent:${record.name}`,
-      ...(record.session && record.session.id ? { sessionId: record.session.id } : {}),
+      ...(sessionId ? { sessionId } : {}),
       ...(card ? { taskId: card } : {}),
       project: record.project || '',
       title: `${record.name} needs you`,

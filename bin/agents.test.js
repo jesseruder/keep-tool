@@ -215,6 +215,17 @@ test('the badge counts what the agent did or needs, and a needs-you puts a row i
     assert.equal(seen.unseen.needsYou, false);
     assert.equal(seen.lastNeedsYou, null);
     assert.deepEqual(agents.attentionItems(agents.records(root)), []);
+
+    // A record from before lastNeedsYou existed: a pointer row with a fixed key and
+    // time, whatever the feed's newest event is, so it notifies once and dismisses.
+    const legacy = { ...seen, card: 'inc-one', unseen: { count: 1, needsYou: true }, lastNeedsYou: null, createdAt: 500,
+      lastEvent: { at: 8000, seq: 9, kind: 'watching', text: 'polling' } };
+    const [pointer] = agents.attentionItems([legacy]);
+    assert.equal(pointer.key, 'agent:sandboxes:inc-one:pending');
+    assert.equal(pointer.since, 500);
+    assert.equal(pointer.taskId, 'inc-one');
+    assert.deepEqual(agents.attentionItems([{ ...legacy, card: '', session: { id: '' } }]), [],
+      'nothing to open, nothing listed or counted');
   } finally { cleanup(root); }
 });
 
