@@ -138,7 +138,9 @@ comes from `javascript_tool` reading `WEBGL_debug_renderer_info` on the page und
 
 A session on another machine can drive this Edge with no token leaving the box: register
 the stdio server run over SSH, for example `claude mcp add-json --scope user browser-gpu
-'{"type":"stdio","command":"ssh","args":["-T","<user>@<gpu-node>","node","<checkout>/browser-bridge/mcp/server.js"]}'`.
+'{"type":"stdio","command":"ssh","args":["-T","<user>@<gpu-node>","<node>","<checkout>/browser-bridge/mcp/server.js"]}'`,
+with `<node>` the absolute path of node on the node (a non-interactive SSH shell does not
+load nvm).
 `mcp/server.js` talks to the host's socket on the node itself, like the daemon does. A
 node that stops itself when idle should count tool calls rather than open connections as
 use, because a session keeps its MCP servers connected for as long as it runs.

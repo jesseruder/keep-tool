@@ -43,8 +43,8 @@ WebGL and other GPU-heavy pages: a headless Edge on a Linux node renders WebGL o
 SwiftShader, on the CPU, which is slow and can take most of the node's cores. Where a
 `browser-gpu` MCP server is registered, it is a Browser Bridge on a stoppable GPU box
 (`gpu-box start|stop|status|probe`, about $0.53/hour while running): run `gpu-box
-start`, reconnect `browser-gpu` with `/mcp` if it failed at session start, and use its
-tools the same way as `browser`. Confirm the page is really on the GPU before trusting
+start`, and use its tools the same way as `browser`. If `browser-gpu` failed to connect
+at session start (the box was stopped), ask the user to reconnect it with `/mcp`. Confirm the page is really on the GPU before trusting
 frame rates: `javascript_tool` reading `WEBGL_debug_renderer_info` must not name
 SwiftShader or llvmpipe. Run `gpu-box stop` when the check is done. The box also
 powers itself off after 30 minutes with no tool calls.
