@@ -154,6 +154,10 @@ const SESSION_REFUSALS = Object.freeze({
   tell: "a node's tell names the session it is from; run it inside an agent session",
   open: "a node's open names the session it is from; run it inside an agent session",
   note: "a node's note names the session it is from; run it inside an agent session",
+  // A reviewer's writes are its own only from its registered session, which the
+  // daemon's review commands then check (commands/review.js requireReviewerFromNode).
+  ...Object.fromEntries(['review-note', 'review-ack', 'review-dismiss', 'review-outcome', 'review-idea', 'review-land']
+    .map((command) => [command, `a node's ${command} is the reviewer's; run it inside the reviewer's session`])),
 });
 
 const MAX_ARG_BYTES = 4 * 1024;

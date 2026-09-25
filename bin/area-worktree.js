@@ -73,6 +73,34 @@ function runWt(args, options = {}) {
   });
 }
 
+// Whether any process of this user has its working directory in `directory`: Linux
+// reads /proc, anything else asks lsof. A table that cannot be read answers true,
+// because the question is whether removing the tree could pull a cwd out from under
+// someone, and "could not tell" is not "nobody".
+function treeInUse(directory, options = {}) {
+  let real;
+  try { real = fs.realpathSync(directory); } catch { return false; }
+  const within = (cwd) => cwd === real || cwd.startsWith(real + path.sep);
+  if ((options.platform || process.platform) === 'linux') {
+    let pids;
+    try { pids = fs.readdirSync('/proc').filter((entry) => /^\d+$/.test(entry)); } catch { return true; }
+    for (const pid of pids) {
+      let cwd;
+      try { cwd = fs.readlinkSync(`/proc/${pid}/cwd`); } catch { continue; } // gone, or not ours to read
+      if (within(cwd)) return true;
+    }
+    return false;
+  }
+  try {
+    const out = require('child_process').execFileSync('lsof', ['-a', '-d', 'cwd', '-F', 'n'], { encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'] });
+    return out.split('\n').some((line) => line.startsWith('n') && within(line.slice(1)));
+  } catch (error) {
+    // lsof exits 1 when it matched nothing, with nothing printed.
+    if (error && error.status === 1 && !String(error.stdout || '').trim()) return false;
+    return true;
+  }
+}
+
 // Mirrors self-repair's spawnWorktree, for an arbitrary repo rather than
 // keep-tool. A tree that is there and finished is reused as it stands; a
 // half-built one (a daemon that died mid-create) is removed through wt, which
@@ -88,6 +116,11 @@ async function ensureWorktree(repo, name, deps = {}) {
   try { existing = (deps.worktreePath || worktreePath)(repo, name); } catch {}
   if (existing && fs.existsSync(existing)) {
     if (ready(existing)) return { ok: true, path: existing, reused: true };
+    // Half-built, but somebody may be working in it (another agent, a shell): a
+    // forced removal would take their cwd with it. Left for a person to look at.
+    if ((deps.treeInUse || treeInUse)(existing)) {
+      return { ok: false, error: `half-built worktree at ${existing} is in use by a running process; it was not removed` };
+    }
     const removed = await wtRun(['rm', existing, '--force', '--delete']);
     if (!removed.ok || fs.existsSync(existing)) {
       return { ok: false, error: `half-built worktree at ${existing} could not be removed: ${removed.error || 'it is still there'}` };
@@ -125,5 +158,5 @@ async function ensure(params = {}, deps = {}) {
 }
 
 module.exports = {
-  WORKTREE_TIMEOUT_MS, worktreePath, worktreeReady, insideWorktreeRoot, runWt, ensureWorktree, ensure,
+  WORKTREE_TIMEOUT_MS, worktreePath, worktreeReady, insideWorktreeRoot, treeInUse, runWt, ensureWorktree, ensure,
 };

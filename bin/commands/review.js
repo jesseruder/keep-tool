@@ -5,8 +5,18 @@
 
 const {
   ROOT, nowStamp, withLock, commitAndPush, stampOf, loadAll, lastLogLine, loadTaskAnywhere, isOverdue, git,
-  getKeepApi, parseArgs, die, postKeepApi, resolveProjectArg, KeepError,
+  getKeepApi, parseArgs, die, postKeepApi, resolveProjectArg, KeepError, isReviewerSession,
 } = require('../keep-core.js');
+
+// A reviewer's write forwarded from a pane-only node runs here under the session the
+// daemon verified (registry-route IDENTITY_VARS), and is the reviewer's only when
+// that session is the registered reviewer: otherwise any session on a node, or a node
+// shell with no session, would write findings under the reviewer's name.
+function requireReviewerFromNode(command) {
+  if (process.env.KEEP_REMOTE_CALLER && !isReviewerSession()) {
+    die(`keep ${command} from a node runs only in the registered reviewer's session`);
+  }
+}
 const fs = require('fs');
 const path = require('path');
 
@@ -232,6 +242,7 @@ commands['review-queue'] = async (argv) => {
 };
 
 commands['review-note'] = async (argv) => {
+  requireReviewerFromNode('review-note');
   const o = parseArgs(argv, { kind: 'str', subject: 'str', severity: 'str', 'suggest-status': 'str', bundle: 'str', force: 'bool', 'no-digest': 'bool', basis: 'str', evidence: 'str', checked: 'str', question: 'str', unknown: 'str' });
   const id = o._[0];
   if (!id || !o.m) die('usage: keep review-note <id> --kind <k> --subject <s> [--severity low|med|high] [--suggest-status s] [--force] -m "finding"');
@@ -251,6 +262,7 @@ commands['review-note'] = async (argv) => {
 };
 
 commands['review-idea'] = (argv) => {
+  requireReviewerFromNode('review-idea');
   const o = parseArgs(argv, { project: 'str', cards: 'str', severity: 'str' });
   const title = o._.join(' ');
   if (!title.trim() || !o.m) {
@@ -267,6 +279,7 @@ commands['review-idea'] = (argv) => {
 };
 
 commands['review-ack'] = (argv) => {
+  requireReviewerFromNode('review-ack');
   const o = parseArgs(argv, { bundle: 'str', 'probe-safe': 'bool' });
   const id = o._[0];
   if (!id) die('usage: keep review-ack <id> [--bundle id] [-m "nothing to flag"]');
@@ -275,6 +288,7 @@ commands['review-ack'] = (argv) => {
 };
 
 commands['review-dismiss'] = (argv) => {
+  requireReviewerFromNode('review-dismiss');
   const o = parseArgs(argv, {});
   const [id, key] = o._;
   if (!id || !key) die('usage: keep review-dismiss <id> <finding-key> [-m why]');
@@ -283,6 +297,7 @@ commands['review-dismiss'] = (argv) => {
 };
 
 commands['review-outcome'] = (argv) => {
+  requireReviewerFromNode('review-outcome');
   const o = parseArgs(argv, { evidence: 'str', json: 'bool' });
   const [id, key, status] = o._;
   const review = require('../review.js');
@@ -310,6 +325,7 @@ commands['review-eval'] = async (argv) => {
 };
 
 commands['review-land'] = async (argv) => {
+  requireReviewerFromNode('review-land');
   const o = parseArgs(argv, { file: 'str' });
   if ((o.file && o._.length) || (!o.file && (o._.length !== 1 || o._[0] !== '-'))) {
     die('usage: keep review-land --file <path> or keep review-land -');

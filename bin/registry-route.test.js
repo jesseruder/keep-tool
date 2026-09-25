@@ -197,6 +197,28 @@ test('a reviewer on a node runs its procedure through the daemon, review-land\'s
   assert.equal(calls.length, 1, 'no refused body reached the CLI');
 });
 
+test('a reviewer\'s write from a node is refused without a session, and run only for the registered reviewer', (t) => {
+  for (const command of ['review-note', 'review-ack', 'review-dismiss', 'review-outcome', 'review-idea']) {
+    assert.match(String(argumentRefusal(command, ['card', '-m', 'x'], { node: 'aws1' })), /is the reviewer's; run it inside the reviewer's session/, command);
+  }
+  // The daemon's CLI, as the route runs it: the verified session in the environment.
+  const root = tempDir(t);
+  fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.keep', 'reviewer'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.keep', 'reviewer', 'sess-reviewer'), '');
+  const run = (session) => require('node:child_process').spawnSync(process.execPath,
+    [path.join(__dirname, 'keep.js'), 'review-ack', 'no-such-card', '-m', 'nothing to flag'], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_SYNC: '0',
+        KEEP_REMOTE_CALLER: 'aws1', CLAUDE_CODE_SESSION_ID: session },
+    });
+  const stranger = run('sess-aws1');
+  assert.notEqual(stranger.status, 0);
+  assert.match(stranger.stderr, /runs only in the registered reviewer's session/);
+  const reviewer = run('sess-reviewer');
+  assert.doesNotMatch(reviewer.stderr, /registered reviewer's session/, 'the reviewer gets past the gate');
+});
+
 test('a node\'s note must come from a session', async (t) => {
   const anonymous = "a node's note names the session it is from; run it inside an agent session";
   assert.equal(argumentRefusal('note', ['app', '--scope', 'x', '--for', '+1h', '-m', 'hi']), anonymous);

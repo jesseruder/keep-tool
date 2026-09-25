@@ -164,6 +164,26 @@ test('ensure-worktree refuses a request it cannot pass to wt safely, and a tree 
     { ok: true, path: '/elsewhere/r/responder' });
 });
 
+test('a half-built worktree someone is working in is not removed', async (t) => {
+  const { treeInUse, ensureWorktree } = require('./area-worktree');
+  const tree = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-tree-in-use-'));
+  t.after(() => fs.rmSync(tree, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(tree, 'sub'));
+  assert.equal(treeInUse(tree), false);
+  const child = require('node:child_process').spawn('sleep', ['30'], { cwd: path.join(tree, 'sub'), stdio: 'ignore' });
+  t.after(() => { try { child.kill('SIGKILL'); } catch {} });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(treeInUse(tree), true, 'a process with its cwd inside the tree');
+  const removed = [];
+  const answer = await ensureWorktree('r', 'responder', {
+    worktreePath: () => tree, worktreeReady: () => false,
+    runWt: async (args) => { removed.push(args); return { ok: true, stdout: '', error: '' }; },
+  });
+  assert.equal(answer.ok, false);
+  assert.match(answer.error, /in use by a running process/);
+  assert.deepEqual(removed, []);
+});
+
 test('manual Close permits card review but preserves real prompt and activity guards', () => {
   const now = Date.now();
   for (const kind of ['claude', 'codex']) {
