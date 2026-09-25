@@ -79,9 +79,10 @@ const IN_PROGRESS_RE = /\b(?:is in progress|are in progress|still (?:in progress
 // A bare "let's" is not an affirmative: "let's test safari on my mac" and "let's
 // just do 2" are Owner giving a new instruction or picking an option, and reading
 // them as nudges was the largest defect in the first score over live verdicts.
-// Only "let's" aimed at what was just proposed ("let's do that", "let's build
-// it", "let's do all of that") or a plain go-ahead counts.
-const AFFIRMATIVE_RE = /^(?:(?:ok|okay|yes|yep|y|sure|alright|right)\b[,.!\s]*)?(?:let'?s (?:\w+ (?:all of |both of )?(?:it|that|this|them|those|both)|go|proceed|keep going|continue|push)\b|do that\b|go ahead\b|go\b|do it\b|start\b|build\b|implement\b|figure that out\b|proceed\b|keep going\b|continue\b|run it\b|ship it\b|land it\b|push\b)|^(?:ok|okay|yes|yep|y|sure|alright)\s*[.!]?\s*$/i;
+// Only "let's" carrying out what was just proposed ("let's do that", "let's
+// build it", "let's do all of that") or a bare go-ahead counts; "let's revert
+// that" and "let's go with option 2" do not.
+const AFFIRMATIVE_RE = /^(?:(?:ok|okay|yes|yep|y|sure|alright|right)\b[,.!\s]*)?(?:let'?s (?:(?:do|build|implement|ship|land|try|run|start|fix|finish|merge|deploy) (?:all of |both of )?(?:it|that|this|them|those|both)\b|go(?: ahead)?\s*[.!]*\s*$|proceed\b|keep going\b|continue\b)|do that\b|go ahead\b|go\b|do it\b|start\b|build\b|implement\b|figure that out\b|proceed\b|keep going\b|continue\b|run it\b|ship it\b|land it\b|push\b)|^(?:ok|okay|yes|yep|y|sure|alright)\s*[.!]?\s*$/i;
 // Owner pushing back on the premise — explicit starters only. Any other question
 // is him opening a new topic, which is not the session's to unblock.
 const PREMISE_CHALLENGE_RE = /^(?:i'?m confused|i don'?t think|do you think that'?s|are you sure|isn'?t|wouldn'?t|shouldn'?t|why (?:did|would) you|that'?s not|i thought)/i;
@@ -1396,7 +1397,8 @@ function liveVerdictTurns(options = {}) {
   const rows = handle.prepare(`SELECT ${TURN_COLUMNS}, t.verdict_message AS verdict_message,
       t.verdict_confidence AS verdict_confidence, t.verdict_model AS verdict_model,
       t.verdict_reason AS verdict_reason, t.verdict_at AS verdict_at,
-      next.id AS next_id, next.opener_text AS next_opener, next.opener_kind AS next_kind
+      next.id AS next_id, next.opener_text AS next_opener, next.opener_kind AS next_kind,
+      next.started_at AS next_started_at
     FROM turns t
     JOIN sessions s ON s.id = t.session_id
     LEFT JOIN turns next ON next.session_id = t.session_id AND next.n = t.n + 1
@@ -1416,10 +1418,16 @@ function scoreLive(options = {}) {
   // A verdict with no following turn yet has no answer to be scored against.
   const unanswered = {};
   for (const turn of turns) {
-    if (turn.next_id == null || turn.next_opener == null) {
+    if (turn.next_id == null) {
       unanswered[turn.verdict] = (unanswered[turn.verdict] || 0) + 1;
       continue;
     }
+    if (turn.next_opener == null) { skip('no-opener'); continue; }
+    // A verdict stamped after Owner had already replied was never in front of
+    // him: a backlogged tick, or `keep watcher run` re-judging an old turn. The
+    // card it read may also carry a check-in made after that reply.
+    if (!options.includeLate && Number.isFinite(turn.verdict_at) && Number.isFinite(turn.next_started_at)
+      && turn.verdict_at > turn.next_started_at) { skip('judged-after-reply'); continue; }
     const next = { opener_text: turn.next_opener, opener_kind: turn.next_kind };
     const value = { verdict: turn.verdict, message: turn.verdict_message, confidence: turn.verdict_confidence };
     if (!VERDICTS.includes(value.verdict)) { skip('unknown-verdict'); continue; }

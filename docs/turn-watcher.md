@@ -417,6 +417,11 @@ no model call, nothing written, and grading buttons Owner never pressed cost no
 signal. Every stored live verdict is scored unless `--since` narrows it; replay
 verdicts are left out because they were never in front of Owner. A verdict whose
 session has no following turn yet is counted as unanswered, not scored.
+A verdict stamped **after** the next turn started is skipped
+(`judged-after-reply`) unless `--include-late`: Owner had already answered before
+it existed — a backlogged tick, or `keep watcher run` re-judging an old turn — so
+it was never what the console showed, and the card it read may carry a check-in
+made after his reply.
 
 The first run over live verdicts (2,107 scored, September 2026) found two ground
 truth defects that replay's samples had been too few to show, both fixed in the
@@ -428,8 +433,13 @@ rules above:
   `human`. They are skipped by name (`MACHINE_OPENERS`) rather than reclassified
   in the index, so the fix applies to rows already stored.
 - **A bare "let's" is not a nudge.** "let's test safari on my mac" is a new
-  instruction; only "let's" followed by a go-ahead ("let's do it", "let's go")
-  counts as an affirmative.
+  instruction and "let's revert that" a correction; only "let's" with a verb that
+  carries out the proposal ("let's do it", "let's build that") or a bare
+  "let's go" counts as an affirmative.
+
+A one-segment path at the start of a reply ("/tmp is full") still reads as a
+slash command and is skipped. It is rare, and telling it from `/model opus`
+would need a list of every command name.
 
 ## Daemon
 

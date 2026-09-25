@@ -336,7 +336,7 @@ keep turns prune [--older-than when] [--dry] [--json]        # drop indexed sess
 keep watcher run <session-id|card-id> [--turn n] [--dry] [--json]   # what would Owner type next? recorded, never sent
 keep watcher ls [--since when] [--verdict v] [--limit n] [--json]   # verdicts, confidence, state lines
 keep watcher replay [--since when] [--limit n] [--agent a] [--json] # score verdicts against what Owner actually typed
-keep watcher score [--since when] [--agent a] [--misses n] [--json] # score live verdicts against the next reply, no model call
+keep watcher score [--since when] [--agent a] [--misses n] [--include-late] [--json] # score live verdicts against the next reply, no model call
 keep watcher stats [--since when] [--json]                          # verdict counts and shadow agreement rate
 keep watcher live [on|off|<type,type>] [--force] [--json]           # which verdict types are delivered for real
 

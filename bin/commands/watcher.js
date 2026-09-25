@@ -176,17 +176,20 @@ async function watcherReplay(argv) {
 // model call and no write, so it is safe to run at any time and as often as liked.
 function watcherScore(argv) {
   const watcher = require('../turn-watcher.js');
-  const o = parseArgs(argv, { since: 'str', agent: 'str', misses: 'str', json: 'bool' });
+  const o = parseArgs(argv, { since: 'str', agent: 'str', misses: 'str', 'include-late': 'bool', json: 'bool' });
   if (o.agent && !['claude', 'codex'].includes(o.agent)) die('--agent must be claude or codex');
   // Every stored verdict by default: the question is the whole record, and the
   // index already drops sessions idle past its retention.
-  const result = watcher.scoreLive({ sinceMs: o.since ? turnsSince(o.since) : 0, agent: o.agent || null });
+  const result = watcher.scoreLive({
+    sinceMs: o.since ? turnsSince(o.since) : 0, agent: o.agent || null, includeLate: Boolean(o['include-late']),
+  });
   if (o.json) return console.log(JSON.stringify(result, null, 2));
+  if (!result.verdicts) return console.log('no live verdicts stored (the daemon judges turns only with KEEP_WATCHER=1)');
   const unanswered = Object.entries(result.unanswered).map(([verdict, n]) => `${n} ${verdict}`).join(', ');
   console.log(`${result.verdicts} live verdicts; ${unanswered ? `no reply yet to ${unanswered}` : 'every one has a reply'}\n`);
   if (!result.total) return console.log(`no scorable turns (${watcherSkips(result)})`);
   console.log(renderScoreboard(result, watcher));
-  const limit = o.misses == null ? 10 : turnsIndexNumber(o.misses, '--misses');
+  const limit = o.misses == null ? 10 : o.misses === '0' ? 0 : turnsIndexNumber(o.misses, '--misses');
   const misses = result.samples.filter((sample) => !sample.agreed).slice(0, limit);
   if (misses.length) {
     console.log(`\nnewest ${misses.length} misses (--misses n for more, --json for all):`);

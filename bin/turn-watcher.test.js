@@ -1364,9 +1364,11 @@ test('ground truth skips openers nobody typed as a reply, and a bare "let\'s" is
   for (const text of ["ok let's do that", "ok let's build that", "yes let's do all of that", "let's go"]) {
     assert.equal(truth(text).expected, 'continue', text);
   }
-  for (const text of ["let's test safari on my mac", "let's just do 2", "let's look at a previous week"]) {
+  for (const text of ["let's test safari on my mac", "let's just do 2", "let's look at a previous week",
+    "let's go with option 2", "let's make this faster"]) {
     assert.equal(truth(text).rule, 'new-instruction', text);
   }
+  assert.equal(truth("let's revert that").expected, 'drift', 'a reversal is not a go-ahead');
 });
 
 test('scoreLive scores the stored live verdicts without a model call or a write', (t) => {
@@ -1376,7 +1378,8 @@ test('scoreLive scores the stored live verdicts without a model call or a write'
     ['continue', 'Wired.'],                                        // 2: next opener is /compact
     ['/compact', 'Compacted.'],                                    // 3: next opener is new work
     ['now write the docs', 'Docs written.'],                       // 4: replay verdict, left out
-    ['and a changelog', 'Done.'],                                  // 5: no reply yet
+    ['and a changelog', 'Done.'],                                  // 5: judged after the reply
+    ['now bump the version', 'Bumped.'],                           // 6: no reply yet
   ]);
   const turn = (n) => watcher.turnFor(SESSION, n);
   const write = (n, verdict, model = 'fake') => watcher.writeVerdict(turn(n),
@@ -1386,12 +1389,18 @@ test('scoreLive scores the stored live verdicts without a model call or a write'
   write(3, 'continue');
   write(4, 'quiet', 'fake:replay');
   write(5, 'quiet');
+  write(6, 'quiet');
+  // Stamp each verdict a second after its turn ended, before Owner's reply,
+  // except turn 5, whose verdict landed after the next turn had started.
+  const db = turnIndex.open();
+  db.prepare('UPDATE turns SET verdict_at = ended_at + 1000 WHERE verdict IS NOT NULL').run();
+  db.prepare('UPDATE turns SET verdict_at = ended_at + 600000 WHERE n = 5').run();
   const before = turnIndex.open().prepare('SELECT id, verdict, verdict_model, decision_id FROM turns ORDER BY n').all();
 
   const result = watcher.scoreLive({ sinceMs: 0 });
-  assert.equal(result.verdicts, 4, 'the replay verdict was never shown, so it is not scored');
+  assert.equal(result.verdicts, 5, 'the replay verdict was never shown, so it is not scored');
   assert.deepEqual(result.unanswered, { quiet: 1 });
-  assert.deepEqual(result.skipped.reasons, { 'slash-command': 1 });
+  assert.deepEqual(result.skipped.reasons, { 'slash-command': 1, 'judged-after-reply': 1 });
   assert.equal(result.total, 2);
   const byTurn = Object.fromEntries(result.samples.map((row) => [row.n, row]));
   assert.equal(byTurn[1].agreed, true, 'continue, and Owner nudged');
@@ -1402,6 +1411,12 @@ test('scoreLive scores the stored live verdicts without a model call or a write'
   const after = turnIndex.open().prepare('SELECT id, verdict, verdict_model, decision_id FROM turns ORDER BY n').all();
   assert.deepEqual(after, before, 'scoring writes nothing');
   assert.equal(fs.existsSync(path.join(REGISTRY, '.keep', 'watcher', 'replays')), false, 'and saves no scoreboard');
+
+  // --include-late scores it; the reply to turn 5 was new work, so quiet agrees.
+  const late = watcher.scoreLive({ sinceMs: 0, includeLate: true });
+  assert.equal(late.total, 3);
+  assert.equal(late.samples.find((row) => row.n === 5).agreed, true);
+  assert.equal(watcher.scoreLive({ sinceMs: 0, agent: 'codex' }).verdicts, 0, '--agent filters');
 });
 
 test('the scoreboard reports agreement by confidence band and is kept on disk', async (t) => {
