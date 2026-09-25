@@ -193,27 +193,35 @@ function isHeadlessSession(meta) {
 }
 
 // When the model last answered a turn that began after `sinceMs` in this rollout: an
-// agent message or assistant reply following a user message or task start stamped
-// after it. A turn already under way when a limit was recorded can still finish, and
-// a turn refused for a usage limit ends with an error event and no reply.
+// agent message or assistant reply following a task start stamped after it. A turn
+// already under way when a limit was recorded can still finish (a user message sent
+// mid-turn is steering, not a new turn), and a turn refused for a usage limit ends
+// with an error event and no reply. A long turn can push its own start out of the
+// tail, so a later reply with no start in view reads the whole file.
 function repliedAfter(file, sinceMs = 0) {
-  let turnAt = 0;
-  let at = 0;
-  for (const line of readTail(file).split('\n')) {
-    if (!line || !/"(?:agent_message|assistant|user_message|task_started|user)"/.test(line)) continue;
-    let record;
-    try { record = JSON.parse(line); } catch { continue; }
-    const payload = record?.payload;
-    const time = Date.parse(record?.timestamp);
-    if (!Number.isFinite(time)) continue;
-    const started = (record?.type === 'event_msg' && ['user_message', 'task_started'].includes(payload?.type))
-      || (record?.type === 'response_item' && payload?.type === 'message' && payload.role === 'user');
-    if (started) { turnAt = time; continue; }
-    const reply = (record?.type === 'event_msg' && payload?.type === 'agent_message')
-      || (record?.type === 'response_item' && payload?.type === 'message' && payload.role === 'assistant');
-    if (reply && turnAt > sinceMs && time > at) at = time;
-  }
-  return at;
+  const read = (text) => {
+    let turnAt = 0;
+    let at = 0;
+    let unanchored = false;
+    for (const line of text.split('\n')) {
+      if (!line || !/"(?:agent_message|assistant|task_started)"/.test(line)) continue;
+      let record;
+      try { record = JSON.parse(line); } catch { continue; }
+      const payload = record?.payload;
+      const time = Date.parse(record?.timestamp);
+      if (!Number.isFinite(time)) continue;
+      if (record?.type === 'event_msg' && payload?.type === 'task_started') { turnAt = time; continue; }
+      const reply = (record?.type === 'event_msg' && payload?.type === 'agent_message')
+        || (record?.type === 'response_item' && payload?.type === 'message' && payload.role === 'assistant');
+      if (!reply) continue;
+      if (turnAt > sinceMs && time > at) at = time;
+      else if (!turnAt && time > sinceMs) unanchored = true;
+    }
+    return { at, unanchored };
+  };
+  const tail = read(readTail(file));
+  if (tail.at || !tail.unanchored || fs.statSync(file).size <= TAIL_BYTES) return tail.at;
+  return read(fs.readFileSync(file, 'utf8')).at;
 }
 
 // Rollout mtimes can lag their own record stamps on a coarse or skewed filesystem;

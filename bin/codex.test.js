@@ -343,9 +343,29 @@ test('a model reply after a recorded usage limit is found on its account, and an
     assert.equal(codex.repliedAfter(inflight, since), 0);
     assert.equal(codex.answeredSince('codex-test', since, env), null, 'an in-flight turn finishing after the mark is not proof');
 
+    // Steering sent mid-turn after the mark is not a new turn.
+    const steered = path.join(dated, 'rollout-steered.jsonl');
+    fs.writeFileSync(steered, [
+      { timestamp: at(since - 30e3), type: 'event_msg', payload: { type: 'task_started' } },
+      { timestamp: at(since + 10e3), type: 'event_msg', payload: { type: 'user_message', message: 'also check x' } },
+      { timestamp: at(since + 30e3), type: 'event_msg', payload: { type: 'agent_message', message: 'done' } },
+    ].map(JSON.stringify).join('\n') + '\n');
+    assert.equal(codex.repliedAfter(steered, since), 0);
+
+    // A long turn whose start is beyond the tail is read in full.
+    const long = path.join(dated, 'rollout-long.jsonl');
+    const filler = { timestamp: at(since + 40e3), type: 'response_item', payload: { type: 'function_call_output', output: 'x'.repeat(4096) } };
+    fs.writeFileSync(long, [
+      { timestamp: at(since + 20e3), type: 'event_msg', payload: { type: 'task_started' } },
+      ...Array.from({ length: 80 }, () => filler),
+      { timestamp: at(since + 90e3), type: 'event_msg', payload: { type: 'agent_message', message: 'finished' } },
+    ].map(JSON.stringify).join('\n') + '\n');
+    assert.equal(codex.repliedAfter(long, since), since + 90e3);
+    fs.rmSync(long);
+
     const answered = path.join(dated, 'rollout-answered.jsonl');
     fs.writeFileSync(answered, [
-      { timestamp: at(since + 110e3), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] } },
+      { timestamp: at(since + 110e3), type: 'event_msg', payload: { type: 'task_started' } },
       { timestamp: at(since + 120e3), type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] } },
     ].map(JSON.stringify).join('\n') + '\n');
     assert.deepEqual(codex.answeredSince('codex-test', since, env), { at: since + 120e3, file: answered });
