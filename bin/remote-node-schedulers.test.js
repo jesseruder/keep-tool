@@ -308,141 +308,256 @@ test('review: a message to a reviewer on the node is gated on the node\'s own re
 
 // ---------- sends to a session on the node ----------
 
+// A fresh Claude pane on aws1 for the send tests: it echoes what is typed into its box
+// and takes it on Enter. `screen(draft)` draws what the pane shows, `list(panes)` may
+// rewrite aws1's pane list, and `answer` answers anything first. Every send gets the
+// same deps: the fleet's hosts, no settle wait, and the ordinary receipted delivery
+// stubbed so a test can see whether it was taken.
+const RULE = '─'.repeat(60);
+const emptyPrompt = (draft = '') => `Claude Code\n${RULE}\n❯ ${draft}\n${RULE}\n`;
+
+function freshPaneHosts(fleet, { screen = emptyPrompt, list = null, answer = () => undefined, input = null } = {}) {
+  const state = { draft: '', submitted: [], ordinary: [], inputs: 0 };
+  const awsPanes = () => fleet.all.filter((session) => session.node === 'aws1').map((session) => {
+    const { node: _node, hostPaneId: _hostPaneId, ...pane } = session.paneRow;
+    return { ...pane, id: session.hostPaneId, meta: { ...pane.meta } };
+  });
+  const hosts = fleet.fakeHosts((node, type, params) => {
+    const answered = answer(node, type, params, state);
+    if (answered !== undefined) return answered;
+    if (node !== 'aws1') return undefined;
+    if (type === 'list' && list) return { panes: list(awsPanes(), state) };
+    if (type === 'screen') return { text: screen(state.draft, state), cursor: { x: 2, y: 2 } };
+    if (type === 'input') {
+      state.inputs += 1;
+      const custom = input ? input(params, state) : undefined;
+      if (custom !== undefined) return custom;
+      const data = Buffer.from(params.data, 'base64').toString('utf8');
+      if (data === '\r') { state.submitted.push(state.draft); state.draft = ''; } else state.draft += data;
+      return {};
+    }
+    return undefined;
+  });
+  const deps = {
+    connectHost: hosts.connectHost, forceHostReconnect: true, sleep: () => Promise.resolve(),
+    sendToResolvedTarget: async (session, target) => { state.ordinary.push({ session, target }); return { ok: true }; },
+  };
+  return { hosts, deps, state };
+}
+
+const transcriptMissing = (id) => Object.assign(new Error(`no claude transcript for ${id} on this node`), { code: 'transcript-missing' });
+
 test('send: a tell or pane send to a fresh session on the node, which has no transcript yet, is typed into its pane once the screen shows the empty prompt', async (t) => {
   const fleet = createRemoteNodeFleet(t);
   const serve = require('./serve.js');
-  await serve.closeHostClient();
   t.after(() => serve.closeHostClient());
-  const rule = '─'.repeat(60);
-  // A Claude pane on aws1 that echoes what is typed into its box and takes it on
-  // Enter. `prompt: false` is a Claude still starting, with no input box drawn yet.
-  const send = async (run, { prompt = true, answer = () => undefined } = {}) => {
+  const run = async (call, options) => {
     await serve.closeHostClient();
-    let draft = '';
-    const submitted = [];
-    const ordinary = [];
-    const hosts = fleet.fakeHosts((node, type, params) => {
-      const answered = answer(node, type, params);
-      if (answered !== undefined) return answered;
-      if (node !== 'aws1') return undefined;
-      if (type === 'screen') {
-        return { text: prompt ? `Claude Code\n${rule}\n❯ ${draft}\n${rule}\n` : 'Starting Claude Code...\n', cursor: { x: 2, y: 2 } };
-      }
-      if (type === 'input') {
-        const data = Buffer.from(params.data, 'base64').toString('utf8');
-        if (data === '\r') { submitted.push(draft); draft = ''; } else draft += data;
-        return {};
-      }
-      return undefined;
-    });
-    const deps = { connectHost: hosts.connectHost, forceHostReconnect: true,
-      sendToResolvedTarget: async (session, target) => { ordinary.push({ session, target }); return { ok: true }; } };
-    const result = run(deps);
-    return { hosts, result, submitted, ordinary };
+    const fake = freshPaneHosts(fleet, options);
+    return { ...fake, result: call(fake.deps) };
   };
   const paneSend = (session, text) => (deps) => serve.sendToSession({ sessionId: session.id, pane: session.pane, text }, undefined, undefined, deps);
   const tellTo = (session, text) => (deps) => serve.tellSession({ sessionId: session.id, text },
     { ...deps, excluded: new Set(), taskForSession: () => null, sendDeps: deps });
-  const missing = (id) => (node, type, params) => {
-    if (node === 'aws1' && type === 'transcript' && params.sessionId === id) {
-      throw Object.assign(new Error(`no claude transcript for ${id} on this node`), { code: 'transcript-missing' });
-    }
-    return undefined;
-  };
 
   // keep pane send (and the console's send): the node answers transcript-missing, so
   // the pane's screen decides, and the message is typed on aws1 and submitted.
-  const pane = await send(paneSend(fleet.unmirrored, 'first message'));
+  const pane = await run(paneSend(fleet.unmirrored, 'first message'));
   const sent = await pane.result;
   assert.equal(sent.ok, true);
   assert.equal(sent.transcriptPending, true);
-  assert.deepEqual(pane.submitted, ['first message']);
-  assert.deepEqual(pane.ordinary, [], 'no transcript-receipted delivery was attempted');
+  assert.deepEqual(pane.state.submitted, ['first message']);
+  assert.deepEqual(pane.state.ordinary, [], 'no transcript-receipted delivery was attempted');
   assert.ok(pane.hosts.typedOn('aws1').every((entry) => entry.params.pane === fleet.unmirrored.hostPaneId));
   assert.deepEqual(pane.hosts.typedOn('main'), []);
 
   // keep tell: its guards pass a session with no turn, and the envelope is typed there.
-  const told = await send(tellTo(fleet.unmirrored, 'hello from a tell'));
+  const told = await run(tellTo(fleet.unmirrored, 'hello from a tell'));
   const receipt = await told.result;
   assert.equal(receipt.sessionId, fleet.unmirrored.id);
-  assert.equal(told.submitted.length, 1);
-  assert.equal(told.submitted[0], receipt.text);
-  assert.match(told.submitted[0], /hello from a tell/);
-  assert.deepEqual(told.ordinary, []);
-
-  // Claude has not drawn its prompt yet: refused, and nothing was typed.
-  const starting = await send(paneSend(fleet.unmirrored, 'too early'), { prompt: false });
-  await assert.rejects(starting.result, (error) => error.status === 409 && error.typingStarted === false
-    && /has no transcript yet and .* does not show Claude's empty prompt; nothing was sent/.test(error.message));
-  assert.deepEqual(starting.hosts.typedOn('aws1'), []);
-
-  // A transcript this daemon mirrored, gone on the node: a lost transcript, not a new
-  // one. The node's refusal stands and nothing is typed.
-  const lost = await send(paneSend(fleet.mirrored, 'into the void'), { answer: missing(fleet.mirrored.id) });
-  await assert.rejects(lost.result, (error) => error.code === 'transcript-missing');
-  assert.deepEqual(lost.hosts.typedOn('aws1'), []);
-
-  // No live pane for it on aws1: nothing to type into, and the node's refusal stands.
-  const paneless = await send(paneSend(fleet.unmirrored, 'nobody home'), {
-    answer: (node, type) => (node === 'aws1' && type === 'list' ? { panes: [] } : undefined) });
-  await assert.rejects(paneless.result, (error) => error.code === 'transcript-missing');
-  assert.deepEqual(paneless.hosts.typedOn('aws1'), []);
+  assert.equal(told.state.submitted.length, 1);
+  assert.equal(told.state.submitted[0], receipt.text);
+  assert.match(told.state.submitted[0], /hello from a tell/);
+  assert.deepEqual(told.state.ordinary, []);
 
   // A node session that has a transcript takes the ordinary, receipted path.
-  const spoken = await send(paneSend(fleet.mirrored, 'a second message'));
+  const spoken = await run(paneSend(fleet.mirrored, 'a second message'));
   await spoken.result;
-  assert.equal(spoken.ordinary.length, 1);
-  assert.equal(spoken.ordinary[0].session.transcriptPending, undefined);
-  assert.equal(spoken.ordinary[0].target.pane, fleet.mirrored.pane);
-  assert.deepEqual(spoken.submitted, []);
-  const spokenTell = await send(tellTo(fleet.mirrored, 'a told message'));
+  assert.equal(spoken.state.ordinary.length, 1);
+  assert.equal(spoken.state.ordinary[0].session.transcriptPending, undefined);
+  assert.equal(spoken.state.ordinary[0].target.pane, fleet.mirrored.pane);
+  assert.deepEqual(spoken.state.submitted, []);
+  const spokenTell = await run(tellTo(fleet.mirrored, 'a told message'));
   await spokenTell.result;
-  assert.equal(spokenTell.ordinary.length, 1);
-  assert.deepEqual(spokenTell.submitted, []);
+  assert.equal(spokenTell.state.ordinary.length, 1);
+  assert.deepEqual(spokenTell.state.submitted, []);
+});
+
+test('send: every refusal on the fresh-session path types nothing, and a refused tell gives its hourly slot back', async (t) => {
+  const fleet = createRemoteNodeFleet(t);
+  const serve = require('./serve.js');
+  const tell = require('./tell.js');
+  t.after(() => serve.closeHostClient());
+  const id = fleet.unmirrored.id;
+  const refused = async (label, options, expected, { body = {}, deps: extra = {} } = {}) => {
+    await serve.closeHostClient();
+    const fake = freshPaneHosts(fleet, options);
+    await assert.rejects(serve.sendToSession({ sessionId: id, pane: fleet.unmirrored.pane, text: 'hello', ...body },
+      undefined, undefined, { ...fake.deps, ...extra }), (error) => {
+      assert.match(error.message, expected, label);
+      assert.equal(Boolean(error.typingStarted), false, `${label}: nothing typed`);
+      return true;
+    });
+    assert.deepEqual(fake.state.submitted, [], `${label}: nothing submitted`);
+    assert.deepEqual(fake.state.ordinary, [], `${label}: no receipted delivery`);
+    return fake;
+  };
+
+  // What the screen shows.
+  const onScreen = (text) => ({ screen: () => text });
+  const turn = await refused('a running turn', onScreen(`✻ Working… (esc to interrupt)\n${emptyPrompt()}`),
+    /is showing a dialog or a running turn; nothing was sent/);
+  assert.equal(turn.state.inputs, 0);
+  await refused('a trust screen', onScreen(`Do you trust the files in this folder?\n\n ❯ 1. Yes, I trust this folder\n   2. No, exit\n\n${emptyPrompt()}`),
+    /is showing a dialog or a running turn; nothing was sent/);
+  await refused('a dialog', onScreen(`Allow this edit?\n Enter to confirm · Esc to cancel\n${emptyPrompt()}`),
+    /is showing a dialog or a running turn; nothing was sent/);
+  await refused('a draft in the box', onScreen(emptyPrompt('something Owner is writing')),
+    /does not show Claude's empty prompt; nothing was sent/);
+  await refused('still starting', onScreen('Starting Claude Code...\n'), /does not show Claude's empty prompt; nothing was sent/);
+
+  // The pane's input: its counter moving between the two reads, a key in the last two
+  // seconds, and the host dropping the first chunk under the counter guard.
+  let lists = 0;
+  await refused('the counter moved', { list: (panes) => panes.map((pane) => ({ ...pane, inputCount: lists++ })) },
+    /input arrived while the prompt was checked; nothing was sent/);
+  await refused('a recent key', { list: (panes) => panes.map((pane) => ({ ...pane, lastInputAt: new Date(Date.now() - 500).toISOString() })) },
+    /someone typed into .* in the last 2 s; nothing was sent/);
+  const dropped = await refused('a dropped first chunk', { input: () => ({ dropped: true, reason: 'input', inputCount: 1 }) },
+    /input arrived on the pane before this keystroke; nothing was typed/);
+  assert.equal(dropped.state.inputs, 1, 'the one guarded chunk, refused by the host');
+
+  // A transcript written between the row's read and the send: the next send takes the
+  // ordinary path; this one types nothing.
+  await refused('a transcript appeared', { answer: (node, type, params) => (node === 'aws1' && type === 'transcript' && params.op === 'stat'
+    ? { path: '/node/fresh.jsonl', size: 10, mtimeMs: Date.now(), generation: 'g' } : undefined) },
+  /has written its first transcript line since it was read; nothing was sent/);
+
+  // A pane named by the caller on the wrong node: the session's leftover on main.
+  const stray = await refused('a pane on another node', { answer: (node, type) => (node === 'main' && type === 'list'
+    ? { panes: [{ ...fleet.local.paneRow, id: 'fxstray', node: undefined, meta: { ...fleet.local.paneRow.meta, sessionId: id } }] }
+    : undefined) }, /pane fxstray is not the live pane of .* on aws1 .*; nothing was sent/, { body: { pane: 'fxstray' } });
+  assert.deepEqual(stray.hosts.typedOn('main'), []);
+
+  // aws1 does not answer its pane list: its pane cannot be verified.
+  await refused('the node did not answer', { answer: (node, type) => {
+    if (node === 'aws1' && type === 'list') throw new Error('aws1 is unreachable');
+    return undefined;
+  } }, /node aws1 did not answer, so the pane of .* cannot be verified; nothing was sent/);
+
+  // A pane opened for Owner to type into is his.
+  await refused('awaiting Owner', { list: (panes) => panes.map((pane) => ({ ...pane, meta: { ...pane.meta, awaitingOwnerInput: true } })) },
+    /was opened for Owner to type into; nothing was sent/);
+
+  // Witnesses that the session has had turns: the node's transcript-missing stands.
+  const missing = /no claude transcript for .* on this node/;
+  await refused('another account in the pane', { list: (panes) => panes.map((pane) => ({ ...pane, meta: { ...pane.meta, accountId: 'another-account' } })) }, missing);
+  await refused('outside the 48 h window', { list: (panes) => panes.map((pane) => ({ ...pane, createdAt: new Date(Date.now() - 3 * 86400e3).toISOString() })) }, missing);
+  const authority = path.join(fleet.root, '.keep', 'session-accounts', `${id}.json`);
+  const record = fs.readFileSync(authority, 'utf8');
+  fs.writeFileSync(authority, JSON.stringify({ ...JSON.parse(record), stagedAccountId: fleet.accounts.claude.id, transactionId: 'fixture' }));
+  // The account read refuses a staged record before the node is even asked.
+  try { await refused('a staged transfer', {}, /unfinished account handoff|no claude transcript/); } finally { fs.writeFileSync(authority, record); }
+  const indexDb = path.join(fleet.base, 'turns.sqlite');
+  const { DatabaseSync } = require('node:sqlite');
+  const index = new DatabaseSync(indexDb);
+  index.exec('CREATE TABLE turns (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, n INTEGER NOT NULL)');
+  index.exec('CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL)');
+  index.prepare('INSERT INTO turns (session_id, n) VALUES (?, 1)').run(id);
+  index.close();
+  await refused('the turn index has its turns', {}, missing, { deps: { turnIndexDb: indexDb } });
+  const deliveryDirectory = path.join(fleet.base, 'delivery');
+  fs.mkdirSync(path.join(deliveryDirectory, 'settled'), { recursive: true });
+  fs.writeFileSync(path.join(deliveryDirectory, 'settled', `${require('./delivery.js').textHash(id)}.json`), '{}');
+  await refused('a delivery journal', {}, missing, { deps: { deliveryDirectory } });
+
+  // A tell refused on this path gives its slot back.
+  await serve.closeHostClient();
+  const fake = freshPaneHosts(fleet, onScreen('Starting Claude Code...\n'));
+  await assert.rejects(serve.tellSession({ sessionId: id, text: 'too early' },
+    { ...fake.deps, excluded: new Set(), taskForSession: () => null, sendDeps: fake.deps }),
+  /does not show Claude's empty prompt; nothing was sent/);
+  assert.equal((tell.loadLedger(fleet.root).targets?.[id] || []).length, 0);
+  assert.deepEqual(fake.state.submitted, []);
+});
+
+test('send: a card tell ranks a fresh node session after the card\'s thread with turns, and picks it only when it is the only one', async (t) => {
+  const fleet = createRemoteNodeFleet(t);
+  const serve = require('./serve.js');
+  t.after(() => serve.closeHostClient());
+  const card = (ids) => ({ id: 'fixture-card', fm: { sessions: ids.map((sessionId) => ({ id: sessionId })) } });
+  const tellCard = async (ids) => {
+    await serve.closeHostClient();
+    // Launched just now: newer than the local thread's last turn ten minutes ago.
+    const fake = freshPaneHosts(fleet, { list: (panes) => panes.map((pane) => ({ ...pane, meta: { ...pane.meta, launchedAt: Date.now() } })) });
+    const receipt = await serve.tellSession({ taskId: 'fixture-card', text: 'for the card' },
+      { ...fake.deps, excluded: new Set(), taskForSession: () => null, loadTask: () => card(ids), sendDeps: fake.deps,
+        // The local thread as the scan lists it (idle, its last turn five minutes ago);
+        // the node session through the daemon's own reader.
+        loadTellSession: (sessionId, loaderDeps, pin) => (sessionId === fleet.local.id ? fleet.row(fleet.local)
+          : serve.loadTellSession(sessionId, loaderDeps, pin)) });
+    return { ...fake, receipt };
+  };
+  const both = await tellCard([fleet.unmirrored.id, fleet.local.id]);
+  assert.equal(both.receipt.sessionId, fleet.local.id);
+  assert.equal(both.state.ordinary.length, 1);
+  assert.deepEqual(both.state.submitted, []);
+  const alone = await tellCard([fleet.unmirrored.id]);
+  assert.equal(alone.receipt.sessionId, fleet.unmirrored.id);
+  assert.equal(alone.state.submitted.length, 1);
+  assert.deepEqual(alone.state.ordinary, []);
 });
 
 test('send: keep open\'s opening message to a fresh session on the node waits for the prompt on its screen and never asks for the transcript it does not have yet', async (t) => {
   const fleet = createRemoteNodeFleet(t);
   const serve = require('./serve.js');
-  await serve.closeHostClient();
   t.after(() => serve.closeHostClient());
-  const rule = '─'.repeat(60);
-  // A node slow to start Claude: the first screens show no input box at all.
+  await serve.closeHostClient();
+  // A node slow to start Claude: the first screens show no input box at all. Enter
+  // submits the first prompt, which is when Claude writes the transcript, and the
+  // turn it starts is still running.
   let reads = 0;
-  let draft = '';
-  const submitted = [];
-  const hosts = fleet.fakeHosts((node, type, params) => {
-    if (node !== 'aws1') return undefined;
-    if (type === 'screen') {
+  const midTurn = Buffer.from(`${JSON.stringify({ type: 'user', uuid: 'fixture-user', sessionId: fleet.unmirrored.id, cwd: fleet.project,
+    timestamp: new Date().toISOString(), message: { role: 'user', content: 'begin the card' } })}\n`);
+  const fake = freshPaneHosts(fleet, {
+    screen: (draft, state) => {
       reads += 1;
-      return { text: reads <= 3 ? 'Starting Claude Code...\n' : `Claude Code\n${rule}\n❯ ${draft}\n${rule}\n`, cursor: { x: 2, y: 2 } };
-    }
-    if (type === 'input') {
-      const data = Buffer.from(params.data, 'base64').toString('utf8');
-      if (data === '\r') { submitted.push(draft); draft = ''; } else draft += data;
-      return {};
-    }
-    return undefined;
+      if (reads <= 3) return 'Starting Claude Code...\n';
+      return state.submitted.length ? `✻ Working… (esc to interrupt)\n${emptyPrompt()}` : emptyPrompt(draft);
+    },
+    answer: (node, type, params, state) => {
+      if (node !== 'aws1' || type !== 'transcript' || params.sessionId !== fleet.unmirrored.id || !state.submitted.length) return undefined;
+      const described = { path: '/node/fresh.jsonl', size: midTurn.length, mtimeMs: Date.now(), generation: 'g' };
+      return params.op === 'tail' ? { ...described, from: 0, bytes: midTurn.toString('base64') } : described;
+    },
   });
-  const deps = { connectHost: hosts.connectHost, forceHostReconnect: true, sleep: () => Promise.resolve() };
   const target = { pane: fleet.unmirrored.pane };
   // openSession's own two steps for a launch with a message: the wait for the prompt,
   // then the typing under the injection lock.
-  assert.equal(await serve.waitForHostAgent(target, 'claude', deps), true);
+  assert.equal(await serve.waitForHostAgent(target, 'claude', fake.deps), true);
   assert.ok(reads > 3, 'the wait sat out the screens without a prompt');
-  await serve.typeOpeningMessage(target, 'claude', 'begin the card', deps);
-  assert.deepEqual(submitted, ['begin the card']);
-  assert.ok(hosts.typedOn('aws1').every((entry) => entry.params.pane === fleet.unmirrored.hostPaneId));
-  assert.equal(hosts.requests.some((entry) => entry.type === 'transcript'), false,
+  await serve.typeOpeningMessage(target, 'claude', 'begin the card', fake.deps);
+  assert.deepEqual(fake.state.submitted, ['begin the card']);
+  assert.ok(fake.hosts.typedOn('aws1').every((entry) => entry.params.pane === fleet.unmirrored.hostPaneId));
+  assert.equal(fake.hosts.requests.some((entry) => entry.type === 'transcript'), false,
     'the opening message is judged from the screen alone');
-  // And once it is in, the session still has no transcript on its node (Claude writes
-  // it on the first turn): a tell right after is typed the same way, from the screen.
+  // The first prompt wrote the transcript and its turn is running: a tell now reads
+  // that transcript like any other, and is refused as busy, typing nothing.
   await serve.closeHostClient();
-  const told = await serve.tellSession({ sessionId: fleet.unmirrored.id, text: 'and a follow-up' },
-    { connectHost: hosts.connectHost, forceHostReconnect: true, excluded: new Set(), taskForSession: () => null,
-      sendDeps: { connectHost: hosts.connectHost, forceHostReconnect: true } });
-  assert.equal(submitted.length, 2);
-  assert.equal(submitted[1], told.text);
+  await assert.rejects(serve.tellSession({ sessionId: fleet.unmirrored.id, text: 'and a follow-up' },
+    { ...fake.deps, excluded: new Set(), taskForSession: () => null, sendDeps: fake.deps }),
+  (error) => error.status === 409 && error.extra.reason === 'busy');
+  assert.equal(fake.state.submitted.length, 1);
 });
 
 // ---------- session summaries ----------

@@ -4309,34 +4309,82 @@ async function loadSessionForAction(id, deps = {}) {
 // transcript-receipted delivery, which has no file to take a receipt from.
 //
 // Only for a Claude session with a live Claude pane on that node in a list the node
-// answered just now. A session whose transcript this daemon has mirrored has had
-// turns: a missing file on its node is a lost transcript, not a new one, and the
-// node's refusal stands, as it does for a session with no live pane there.
-async function remoteSessionWithoutTranscript(id, node, deps = {}) {
+// answered just now, and only when nothing says it has had a turn. The node's answer
+// alone proves little: it is transcript-missing whenever no file exists under the
+// account directory it was asked about, so a session with turns looks fresh to it
+// after an account mismatch or while a transfer is staged. And the daemon's mirror of
+// it trails the node, stops while its hook posts fail, is pruned after 30 days and is
+// seeded best-effort after a move. So the pane must name the account the location
+// record does, with no transfer staged, and there must be no second witness of a turn:
+// the mirror, a row for the session in the turn index, or a delivery journal for it
+// (a journal is only ever written against a transcript). Any of those, or no live
+// pane there, and the node's refusal stands: a lost transcript, not a new one.
+//
+// The row's time is its pane's launch, not now, so it ranks by when the session began
+// and the 48 h window applies to it as it does to any other; a pane opened for Owner
+// to type into (awaitingOwnerInput) is his, and nothing is typed into it.
+function sessionHadTurn(id, node, deps = {}) {
+  const root = deps.root || keep.ROOT;
   let mirrored = null;
-  try { mirrored = require('./transcript-mirror.js').stat(deps.root || keep.ROOT, node, id); } catch {}
-  if (mirrored && mirrored.size > 0) return null;
-  let location = null;
-  try { location = (deps.sessionLocation || accounts.sessionLocation)(id, { root: deps.root || keep.ROOT, env: deps.env || process.env }); } catch {}
-  if (!location || location.agent !== 'claude') return null;
+  try { mirrored = require('./transcript-mirror.js').stat(root, node, id); } catch {}
+  if (mirrored && mirrored.size > 0) return 'its transcript is mirrored here';
+  const delivery = require('./delivery');
+  const directory = deps.deliveryDirectory || path.join(root, '.keep', 'delivery');
+  const journal = `${delivery.textHash(id)}.json`;
+  if (fs.existsSync(path.join(directory, journal)) || fs.existsSync(path.join(directory, 'settled', journal))) {
+    return 'a delivery was journalled against its transcript';
+  }
+  let file;
+  try { file = deps.turnIndexDb || require('./turn-index.js').databaseFile(); } catch { return 'the turn index could not be located'; }
+  // Never created from here: turn-index's own open() makes the database and migrates it.
+  if (!fs.existsSync(file)) return null;
+  let handle;
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    handle = new DatabaseSync(file, { readOnly: true });
+    handle.exec('PRAGMA busy_timeout = 250');
+    const row = handle.prepare(`SELECT 1 AS found FROM turns WHERE session_id = ?
+      UNION ALL SELECT 1 AS found FROM messages WHERE session_id = ? LIMIT 1`).get(id, id);
+    return row ? 'the turn index has turns for it' : null;
+  } catch (error) {
+    return `the turn index could not be read (${String(error && error.message || error).slice(0, 120)})`;
+  } finally {
+    try { if (handle) handle.close(); } catch {}
+  }
+}
+
+async function remoteSessionWithoutTranscript(id, node, deps = {}) {
+  const root = deps.root || keep.ROOT;
+  let record = null;
+  try { record = JSON.parse(fs.readFileSync(accounts.authorityFile(root, id), 'utf8')); } catch {}
+  if (!record || record.agent !== 'claude' || record.node !== node || typeof record.accountId !== 'string'
+      || record.stagedAccountId) return null;
+  if (sessionHadTurn(id, node, deps)) return null;
   const listed = await (deps.listHostPaneResult || listHostPaneResult)(deps, true);
   const status = listed && listed.nodes && listed.nodes[node];
   if (!status || !status.ok || status.stale) {
-    throw new InjectionError(409, `node ${node} did not answer, so the pane of ${id} there cannot be verified; nothing was sent`,
-      { reason: 'node-unanswered' });
+    throw Object.assign(new InjectionError(409, `node ${node} did not answer, so the pane of ${id} there cannot be verified; nothing was sent`,
+      { reason: 'node-unanswered' }), { nothingTyped: true, typingStarted: false });
   }
   const env = paneRefEnv(deps);
   const onNode = (Array.isArray(listed.panes) ? listed.panes : []).filter((pane) => pane
     && (pane.node || nodes.parsePaneRef(String(pane.id || ''), { env }).node) === node);
   const hosted = sessionHostPane(onNode, id);
-  if (!hosted || !hosted.alive || hosted.agentAlive === false || hosted.meta.agent !== 'claude') return null;
+  if (!hosted || !hosted.alive || hosted.agentAlive === false || hosted.meta.agent !== 'claude'
+      || hosted.meta.accountId !== record.accountId) return null;
+  if (hosted.meta.awaitingOwnerInput === true) {
+    throw Object.assign(new InjectionError(409, `${hosted.id} was opened for Owner to type into; nothing was sent`,
+      { reason: 'waiting-on-owner' }), { nothingTyped: true, typingStarted: false });
+  }
+  const launched = Number(hosted.meta.launchedAt);
+  const mtime = Number.isFinite(launched) && launched > 0 ? launched : Date.parse(hosted.createdAt || '');
+  if (!Number.isFinite(mtime) || !(Date.now() - mtime <= SESSION_WINDOW_MS)) return null;
   const session = {
     id, kind: 'claude', agent: 'claude', node, pane: hosted.id,
     project: typeof hosted.meta.project === 'string' ? hosted.meta.project : '',
-    ...(typeof hosted.meta.accountId === 'string' ? { accountId: hosted.meta.accountId } : {}),
-    state: 'idle', endedTurn: true, mtime: Date.now(), transcriptPending: true,
+    accountId: record.accountId,
+    state: 'idle', endedTurn: true, mtime, transcriptPending: true,
   };
-  const root = deps.root || keep.ROOT;
   sessionNames.apply([session], { root });
   sessionMarks.apply([session], { root });
   sessionNumbers.assign([session], { root, readOnly: true });
@@ -9083,18 +9131,44 @@ async function sendToSession(body, targetHint, opts, deps = {}) {
 // prompt with no turn or dialog on it, and the keys are typed conditionally on the
 // pane's input counter read around that screen, so a key anyone else types in
 // between refuses them. Confirmed on screen, as the opening message is; no journal.
+//
+// The pane is the one the row was built from, on the session's own node, and no
+// other: a pane named by the caller (keep pane send, the console) is matched by
+// resolveSessionTarget on any node whose pane names the session, and a leftover pane
+// from a move or a split resume must not take keys when the question "is there a
+// transcript yet" was asked of another node. And the input must have been quiet for
+// a moment, as for a compaction's restore: a key typed just before the first count,
+// whose echo has not drawn yet, reads as an empty box with a count that never moves.
+const FRESH_SEND_INPUT_QUIET_MS = 2000;
+const FRESH_SEND_SETTLE_MS = 1500;
+
 async function sendWithoutTranscript(session, target, text, opts, deps = {}) {
   const refuse = (message, screen) => Object.assign(new InjectionError(409, message,
     screen === undefined ? {} : { screenTail: screenTail(screen) }), { nothingTyped: true, typingStarted: false });
   const where = `${session.id} on ${session.node}`;
+  const paneNode = nodes.parsePaneRef(String(target && target.pane || ''), { env: paneRefEnv(deps) }).node;
+  if (paneNode !== session.node || !session.pane || target.pane !== session.pane) {
+    throw refuse(`pane ${target && target.pane} is not the live pane of ${where} (${session.pane || 'none'}); nothing was sent`);
+  }
   try {
     await (deps.nodeTranscript || nodeTranscript)(session.node, { id: session.id, kind: 'claude', node: session.node }, deps).stat();
     throw refuse(`session ${where} has written its first transcript line since it was read; nothing was sent, send again`);
   } catch (error) {
-    if (!error || error.code !== 'transcript-missing') throw error;
+    if (!error || error.code !== 'transcript-missing') {
+      if (error && typeof error === 'object' && !error.typingStarted) Object.assign(error, { nothingTyped: true, typingStarted: false });
+      throw error;
+    }
   }
+  const now = deps.now || Date.now;
   const before = await livePaneState(target.pane, deps);
   if (!before) throw refuse('pane input activity could not be verified before typing; nothing was sent');
+  const lastInputAt = Date.parse(before.lastInputAt || '');
+  if (Number.isFinite(lastInputAt) && now() - lastInputAt < FRESH_SEND_INPUT_QUIET_MS) {
+    throw refuse(`someone typed into ${target.pane} in the last ${FRESH_SEND_INPUT_QUIET_MS / 1000} s; nothing was sent`);
+  }
+  // Measured from the count either way, so a key that landed at the last instant has
+  // time to draw before the screen below is read.
+  await (deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(FRESH_SEND_SETTLE_MS);
   let screen = '';
   try { screen = await readScreen(target, 30, false, deps); }
   catch { throw refuse(`the screen of ${target.pane} could not be read; nothing was sent`); }
@@ -14662,7 +14736,10 @@ function pickDeliveryCandidates(linkedIds, sessions, excluded) {
     && !session.pendingQuestion && !session.pendingPlan && session.askedProse !== true
     // `waiting` is Claude Code's idle_prompt: the turn ended and Owner has not typed, so it is safe for delivery.
     && !(session.notify && ['permission', 'question'].includes(session.notify.type));
-  const candidates = present.filter(safe).sort((a, b) => b.mtime - a.mtime);
+  // A node session with no transcript yet (transcriptPending) has never been told
+  // anything: it ranks after every thread that has, whatever their times.
+  const pending = (session) => (session.transcriptPending === true ? 1 : 0);
+  const candidates = present.filter(safe).sort((a, b) => pending(a) - pending(b) || b.mtime - a.mtime);
   return { candidates, busy: present.length - candidates.length };
 }
 
