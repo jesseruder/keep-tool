@@ -156,3 +156,13 @@ test('a path replaced between the open and the check serves nothing', async (t) 
   assert.equal(res.status, undefined, 'no head was written');
   assert.ok(fs.existsSync(path.join(dir, 'shot.png')));
 });
+
+test('a link planted in the artifacts directory is not listed', async (t) => {
+  const { root, dir } = registry(t);
+  const outside = tempDir(t, 'keep-card-artifacts-outside-');
+  fs.writeFileSync(path.join(outside, 'secret.png'), 'secret bytes');
+  fs.symlinkSync(path.join(outside, 'secret.png'), path.join(dir, 'planted.png'));
+  const { artifacts } = await listArtifacts(root, 'some-card');
+  assert.equal(artifacts.some((entry) => entry.name === 'planted.png'), false);
+  assert.equal(artifacts.length, 5);
+});

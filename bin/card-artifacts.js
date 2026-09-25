@@ -73,8 +73,10 @@ async function listArtifacts(root, card, { fsp = fs.promises } = {}) {
   const artifacts = [];
   for (const name of names) {
     if (artifactNameRefusal(name)) continue;
+    // lstat: a link planted in the directory is not an artifact, and its target's size
+    // and time are nobody's business here.
     let stat;
-    try { stat = await fsp.stat(path.join(directory, name)); } catch { continue; }
+    try { stat = await fsp.lstat(path.join(directory, name)); } catch { continue; }
     if (!stat.isFile()) continue;
     artifacts.push({ name, size: stat.size, mtime: stat.mtime.toISOString(), ...kindOf(name) });
   }

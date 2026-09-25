@@ -57,7 +57,7 @@ function services(t, overrides = {}) {
     env: overrides.env || { PATH: '/usr/bin:/bin', HOME: root, LANG: 'C' },
     configFile: path.join(root, 'config.json'),
   });
-  const artifacts = createArtifactService({ registry, tmpRoot });
+  const artifacts = createArtifactService({ registry, tmpRoot, ...(overrides.artifactOptions || {}) });
   return { registry, artifacts, root, tmpRoot, calls: fake.calls };
 }
 
@@ -371,4 +371,65 @@ test('an upload whose client hangs up holds its slot until its run ends, and a b
   await api.until(() => api.artifacts.uploads() === 0);
   const admitted = await api.post(`${KEY}-next`);
   assert.equal(admitted.status, 200, admitted.data);
+});
+
+test('a node\'s daily quota refuses the upload that would pass it, counts only accepted uploads, survives a restart and frees with the window', async (t) => {
+  let clock = Date.parse('2026-09-20T10:00:00Z');
+  const artifactOptions = { now: () => clock, dailyBytes: 20, dailyFiles: 3 };
+  let code = 0;
+  const { artifacts, root, calls, registry } = services(t, { artifactOptions, answer: () => ({ code, stdout: 'stored\n', stderr: '' }) });
+  const upload = (key, content = 'png bytes') => artifacts.handle(AWS1, body(root, { idempotencyKey: `${KEY}-${key}`, files: [fileOf('shot.png', content)] }));
+  const ledger = () => JSON.parse(fs.readFileSync(path.join(root, '.keep', 'artifact-quota.json'), 'utf8')).nodes.aws1 || [];
+  assert.equal((await upload('a')).status, 200);
+  clock += 60e3;
+  // A CLI that fails stored nothing and counts nothing.
+  code = 1;
+  assert.equal((await upload('failed')).body.status, 1);
+  code = 0;
+  assert.equal(ledger().length, 1);
+  assert.equal((await upload('b')).status, 200);
+  assert.deepEqual(ledger().map((entry) => entry.bytes), [9, 9]);
+
+  const refused = await upload('c');
+  assert.equal(refused.status, 413);
+  assert.equal(refused.body.error, 'node aws1 has stored 0.0 MB in 2 artifact files in the last 24 hours; '
+    + 'this upload of 0.0 MB in 1 would pass its daily limit of 0.0 MB and 3 files; room frees at 2026-09-21T10:00:00.000Z');
+  assert.equal(calls.length, 3, 'nothing was spawned for it');
+  assert.equal(ledger().length, 2, 'a refusal takes no quota');
+  const ops = path.join(root, '.keep', 'registry-ops');
+  assert.equal(fs.readdirSync(ops).length, 3, 'and leaves no journal record');
+
+  // A resend of an accepted upload is still answered from the journal.
+  assert.equal((await upload('a')).body.replayed, true);
+
+  // The next daemon reads the same ledger.
+  const restarted = createArtifactService({ registry, tmpRoot: tempDir(t), ...artifactOptions });
+  assert.equal((await restarted.handle(AWS1, body(root, { idempotencyKey: `${KEY}-c`, files: [fileOf('shot.png', 'png bytes')] }))).status, 413);
+
+  // Once the first upload leaves the window, the same key goes through.
+  clock = Date.parse('2026-09-21T10:00:01Z');
+  const later = await upload('c');
+  assert.equal(later.status, 200, JSON.stringify(later.body));
+  assert.deepEqual(ledger().map((entry) => entry.at), [Date.parse('2026-09-20T10:01:00Z'), clock]);
+  // Another node has its own quota.
+  const other = await artifacts.handle({ class: 'node', node: 'aws2' }, body(root, { idempotencyKey: `${KEY}-aws2`, session: null, agent: null }));
+  assert.equal(other.status, 200, JSON.stringify(other.body));
+});
+
+test('the store cap refuses an upload that would pass it, counting regular files only', async (t) => {
+  const { artifacts, root, calls } = services(t, { artifactOptions: { storeMaxBytes: 16 } });
+  const dir = path.join(root, '.keep', 'artifacts', 'older-card');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'kept.bin'), Buffer.alloc(8));
+  // A link to something large is not part of the store.
+  const outside = tempDir(t);
+  fs.writeFileSync(path.join(outside, 'large.bin'), Buffer.alloc(4096));
+  fs.symlinkSync(path.join(outside, 'large.bin'), path.join(dir, 'link.bin'));
+  const refused = await artifacts.handle(AWS1, body(root));
+  assert.equal(refused.status, 413);
+  assert.equal(refused.body.error, 'the artifact store holds 0.0 MB of its 0.0 MB cap; remove old artifacts under .keep/artifacts on the daemon before storing more');
+  assert.equal(calls.length, 0);
+  assert.equal(fs.existsSync(path.join(root, '.keep', 'artifact-quota.json')), false);
+  const small = await artifacts.handle(AWS1, body(root, { idempotencyKey: `${KEY}-small`, files: [fileOf('tiny.txt', 'tiny')] }));
+  assert.equal(small.status, 200, JSON.stringify(small.body));
 });

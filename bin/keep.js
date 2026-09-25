@@ -1265,7 +1265,7 @@ function restoreArtifactIndex(snapshot) {
   for (const [file, entry] of snapshot) {
     if (!entry) continue;
     try {
-      if (entry.removed) git('rm', '-q', '--cached', '--ignore-unmatch', '--', file);
+      if (entry.removed) git('rm', '-q', '--cached', '--force', '--ignore-unmatch', '--', file);
       else git('update-index', '--cacheinfo', `${entry.mode},${entry.object},${file}`);
     } catch {}
   }
@@ -1342,6 +1342,10 @@ commands.artifact = (argv, deps = {}) => {
 
   const stored = withLock(() => {
     const task = loadTask(id);
+    // A conflicted index entry has several stages, which a rollback could not put
+    // back as they were: refused before anything is copied.
+    const conflicted = git('ls-files', '-u', '-z', '--', path.relative(ROOT, taskPath(task.id)), path.relative(ROOT, path.join(META, 'artifacts', id)));
+    if (conflicted) die(`the card or its artifacts have a merge conflict in the registry's index; resolve it before storing artifacts`);
     const { directory, realDirectory } = artifactDirectory(id);
     const results = [];
     // { destination, identity } for each file this call created, so a rollback

@@ -25,6 +25,18 @@
 // under the same key (remote-cli postWithRetry). An admitted upload is decoded one
 // file at a time, in slices that yield to the event loop, and each slice is hashed
 // and written as it is decoded, so no file is ever held decoded in memory whole.
+//
+// Admission bounds memory; two durable limits bound what is kept. Each node has a
+// rolling 24-hour quota of accepted bytes and files, in a ledger at
+// .keep/artifact-quota.json that survives restarts and records only uploads the CLI
+// stored, never refusals. The whole of .keep/artifacts has a cap, measured by a walk
+// that follows no link and cached for a minute. Both are checked first thing in the
+// journalled run, before any temporary file: inside it, so a resend of an upload
+// already accepted is answered from the journal rather than refused by a quota it
+// has itself used up, and so a node's uploads, serialised on its queue, are checked
+// and recorded one at a time. A refusal is a 413 naming the limit (and for the daily
+// one, when the window frees room); it throws before the CLI is spawned, so it
+// leaves no journal record and the node's CLI prints it without resending.
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -34,6 +46,7 @@ const {
 } = require('./registry-route.js');
 const {
   ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, MAX_ARG_BYTES, artifactNameRefusal,
+  ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES,
 } = require('./registry-commands.js');
 
 // keep-core loadTask's own rule for a card id.
@@ -48,6 +61,25 @@ const ARTIFACT_UPLOADS_MAX = 2;
 const BUSY_RETRY_MS = 2000;
 // Base64 decoded per slice: a multiple of four characters, 768 KiB of bytes.
 const DECODE_SLICE_CHARS = 1024 * 1024;
+const STORE_SIZE_CACHE_MS = 60e3;
+const mib = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+
+// The total size of the regular files under `dir`, walked with lstat: a link is
+// neither followed nor counted.
+async function storeSize(fsp, dir) {
+  let total = 0;
+  let names;
+  try { names = await fsp.readdir(dir); }
+  catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return 0; throw error; }
+  for (const name of names) {
+    const entry = path.join(dir, name);
+    let stat;
+    try { stat = await fsp.lstat(entry); } catch { continue; }
+    if (stat.isDirectory()) total += await storeSize(fsp, entry);
+    else if (stat.isFile()) total += stat.size;
+  }
+  return total;
+}
 
 function refuse(status, message) { throw new RegistryError(status, message); }
 
@@ -165,6 +197,80 @@ function createArtifactService(options = {}) {
   const root = options.root || shared.root;
   const fsp = options.fsp || fs.promises;
   const tmpRoot = options.tmpRoot || os.tmpdir();
+  const now = options.now || shared.now || Date.now;
+  const dailyBytes = options.dailyBytes || ARTIFACT_NODE_DAILY_BYTES;
+  const dailyFiles = options.dailyFiles || ARTIFACT_NODE_DAILY_FILES;
+  const windowMs = options.quotaWindowMs || ARTIFACT_QUOTA_WINDOW_MS;
+  const storeMaxBytes = options.storeMaxBytes || ARTIFACT_STORE_MAX_BYTES;
+  const ledgerFile = path.join(root, '.keep', 'artifact-quota.json');
+  let storeCache = null;
+
+  // { node: [{ at, bytes, files }] }, only entries inside the window. An unreadable
+  // ledger is an error, not an empty one: starting over would reset every quota.
+  async function readLedger() {
+    let raw;
+    try { raw = await fsp.readFile(ledgerFile, 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') return {}; throw error; }
+    const value = JSON.parse(raw);
+    const nodes = value && value.version === 1 && value.nodes && typeof value.nodes === 'object' ? value.nodes : {};
+    const cutoff = now() - windowMs;
+    const kept = {};
+    for (const [node, entries] of Object.entries(nodes)) {
+      const live = (Array.isArray(entries) ? entries : []).filter((entry) => entry && Number(entry.at) > cutoff);
+      if (live.length) kept[node] = live;
+    }
+    return kept;
+  }
+
+  async function writeLedger(nodes) {
+    await fsp.mkdir(path.dirname(ledgerFile), { recursive: true });
+    const temp = `${ledgerFile}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    await fsp.writeFile(temp, `${JSON.stringify({ version: 1, nodes })}\n`, { mode: 0o600 });
+    await fsp.rename(temp, ledgerFile);
+  }
+
+  async function currentStoreSize() {
+    if (!storeCache || now() - storeCache.at >= STORE_SIZE_CACHE_MS) {
+      storeCache = { at: now(), bytes: await storeSize(fsp, path.join(root, '.keep', 'artifacts')) };
+    }
+    return storeCache.bytes;
+  }
+
+  // Throws the 413 for an upload past either limit.
+  async function checkLimits(caller, bytes, files) {
+    const entries = (await readLedger())[caller] || [];
+    const usedBytes = entries.reduce((sum, entry) => sum + (Number(entry.bytes) || 0), 0);
+    const usedFiles = entries.reduce((sum, entry) => sum + (Number(entry.files) || 0), 0);
+    if (usedBytes + bytes > dailyBytes || usedFiles + files > dailyFiles) {
+      // The moment enough of the oldest uploads leave the window for this one to fit.
+      let freedBytes = 0;
+      let freedFiles = 0;
+      let frees = null;
+      for (const entry of [...entries].sort((a, b) => a.at - b.at)) {
+        freedBytes += Number(entry.bytes) || 0;
+        freedFiles += Number(entry.files) || 0;
+        if (usedBytes - freedBytes + bytes <= dailyBytes && usedFiles - freedFiles + files <= dailyFiles) {
+          frees = new Date(Number(entry.at) + windowMs).toISOString();
+          break;
+        }
+      }
+      refuse(413, `node ${caller} has stored ${mib(usedBytes)} in ${usedFiles} artifact files in the last 24 hours; `
+        + `this upload of ${mib(bytes)} in ${files} would pass its daily limit of ${mib(dailyBytes)} and ${dailyFiles} files`
+        + `${frees ? `; room frees at ${frees}` : ''}`);
+    }
+    const stored = await currentStoreSize();
+    if (stored + bytes > storeMaxBytes) {
+      refuse(413, `the artifact store holds ${mib(stored)} of its ${mib(storeMaxBytes)} cap; `
+        + 'remove old artifacts under .keep/artifacts on the daemon before storing more');
+    }
+  }
+
+  async function recordAccepted(caller, bytes, files) {
+    const nodes = await readLedger();
+    nodes[caller] = [...(nodes[caller] || []), { at: now(), bytes, files }];
+    await writeLedger(nodes);
+    if (storeCache) storeCache.bytes += bytes;
+  }
 
   async function cardExists(card) {
     try { return (await fsp.stat(path.join(root, 'tasks', `${card}.md`))).isFile(); }
@@ -176,6 +282,9 @@ function createArtifactService(options = {}) {
   // for a local call.
   async function run(request, caller) {
     const daemon = shared.daemonNode();
+    const bytes = request.files.reduce((sum, file) => sum + file.size, 0);
+    // A listing stores nothing and is never limited.
+    if (request.files.length) await checkLimits(caller, bytes, request.files.length);
     const dir = await fsp.mkdtemp(path.join(tmpRoot, 'keep-artifact-'));
     try {
       const copies = [];
@@ -191,7 +300,14 @@ function createArtifactService(options = {}) {
         env.KEEP_ARTIFACT_SOURCES = JSON.stringify(request.files.map((file) => file.source));
       }
       const argv = ['artifact', ...(request.note !== null ? ['-m', request.note] : []), '--', request.card, ...copies];
-      return await shared.spawnKeep(argv, { cwd: request.cwd, env });
+      const answer = await shared.spawnKeep(argv, { cwd: request.cwd, env });
+      // Counted once the CLI has stored the files. A ledger that cannot be written
+      // does not turn a stored upload into an error; it is said in the log.
+      if (request.files.length && answer.body && answer.body.status === 0) {
+        await recordAccepted(caller, bytes, request.files.length)
+          .catch((error) => { try { process.stderr.write(`keep serve: artifact quota ledger not written: ${error.message}\n`); } catch {} });
+      }
+      return answer;
     } finally {
       await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
     }

@@ -3484,3 +3484,34 @@ test('artifact never follows or reads through a link planted at a destination na
     fs.rmSync(outside, { recursive: true, force: true });
   }
 });
+
+test('artifact refuses a card whose index entry is conflicted, before copying anything', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-artifact-conflict-'));
+  const run = (args) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), ...args], {
+    cwd: root, encoding: 'utf8', timeout: 15000, env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+  });
+  const git = (args, input) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', input });
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'));
+    fs.writeFileSync(path.join(root, '.gitignore'), '.keep/\nsource/\n');
+    assert.equal(git(['init', '-q']).status, 0);
+    git(['config', 'user.name', 'Keep Test']);
+    git(['config', 'user.email', 'keep@example.test']);
+    const keep = require('./keep.js');
+    fs.writeFileSync(path.join(root, 'tasks', 'card.md'), keep.serializeTask({
+      id: 'card', fm: { title: 'Artifacts', status: 'active', kind: 'task', tags: ['personal'] }, body: '',
+    }));
+    git(['add', '.gitignore', 'tasks']);
+    assert.equal(git(['commit', '-q', '-m', 'test fixture']).status, 0);
+    const blob = git(['hash-object', '-w', 'tasks/card.md']).stdout.trim();
+    const info = [1, 2, 3].map((stage) => `100644 ${blob} ${stage}\ttasks/card.md`).join('\n') + '\n';
+    assert.equal(git(['update-index', '--index-info'], `0 ${'0'.repeat(40)}\ttasks/card.md\n${info}`).status, 0);
+    assert.notEqual(git(['ls-files', '-u']).stdout, '');
+    fs.mkdirSync(path.join(root, 'source'));
+    fs.writeFileSync(path.join(root, 'source', 'shot.png'), 'png');
+    const refused = run(['artifact', 'card', path.join(root, 'source', 'shot.png')]);
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /merge conflict in the registry's index; resolve it before storing artifacts/);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'artifacts', 'card', 'shot.png')), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

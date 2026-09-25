@@ -683,3 +683,15 @@ test('an upload the daemon turns away as busy is resent with its key after the w
     { request: busy, token: 't', now: () => clock, sleep: async () => { clock += 60e3; }, note: () => {}, resendHorizonMs: 5 * 60e3 }),
   /gave up waiting after 5m: busy upload/);
 });
+
+test('an upload refused for a quota is printed as the daemon\'s refusal and never resent', async (t) => {
+  const { runArtifact } = require('./remote-cli.js');
+  const home = tempDir(t);
+  fs.writeFileSync(path.join(home, 'a.txt'), 'a');
+  let posts = 0;
+  const message = 'node aws1 has stored 256.0 MB in 12 artifact files in the last 24 hours; this upload of 0.0 MB in 1 would pass its daily limit of 256.0 MB and 200 files; room frees at 2026-09-21T10:00:00.000Z';
+  const request = async () => { posts += 1; return { status: 413, data: JSON.stringify({ error: message }) }; };
+  const deps = { where: { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, request, token: 't', env: {}, cwd: home, home, sleep: async () => { throw new Error('no wait'); } };
+  assert.deepEqual(await runArtifact(['card', 'a.txt'], deps), { code: 2, stdout: '', stderr: `keep artifact: the daemon on main refused: ${message}\n` });
+  assert.equal(posts, 1);
+});

@@ -364,7 +364,15 @@ function requestedWaitMs(command, args) {
 //                       in one JSON body the daemon parses on its event loop, so this
 //                       also bounds that parse (ARTIFACT_BODY_MAX_BYTES).
 //   32 files            a screenshot series, not a directory.
+//
+// What a node may keep adding, since every stored byte stays in .keep/artifacts, the
+// card log and the registry's history for good: a rolling day per node of 256 MiB and
+// 200 files accepted, and 2 GiB for the whole store, past which a person prunes it.
 const ARTIFACT_FILE_MAX_BYTES = 5 * 1024 * 1024;
+const ARTIFACT_NODE_DAILY_BYTES = 256 * 1024 * 1024;
+const ARTIFACT_NODE_DAILY_FILES = 200;
+const ARTIFACT_QUOTA_WINDOW_MS = 24 * 3600e3;
+const ARTIFACT_STORE_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 const ARTIFACT_COMMAND_MAX_BYTES = 20 * 1024 * 1024;
 const ARTIFACT_MAX_FILES = 32;
 // The body /api/artifact accepts: the files at 4/3 for base64, and room for the note,
@@ -385,4 +393,4 @@ function artifactNameRefusal(name) {
   return null;
 }
 
-module.exports = { ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES, ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

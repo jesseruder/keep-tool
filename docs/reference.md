@@ -1714,7 +1714,14 @@ not free it while its run goes on). One turned away gets `429` with `busy: true`
 node's CLI says so once, waits and resends the same key, up to the same horizon as a
 command still running (the body has been sent by then; asking first is a follow-up).
 An admitted upload is decoded a slice at a time, padding only at its end, and hashed,
-written and counted as it goes. The node opens each file once and reads it from that descriptor,
+written and counted as it goes. What is kept is bounded too: each node may have 256 MiB and 200
+files accepted in any rolling 24 hours (a ledger at `.keep/artifact-quota.json` that
+counts only uploads the CLI stored), and the whole of `.keep/artifacts` may hold 2 GiB
+(measured without following links, cached for a minute). Past either the upload is
+refused with `413`, naming the limit and, for the daily one, when room frees; the
+node prints that and does not resend. A resend of an upload already accepted is still
+answered from the journal. `keep artifact` refuses a card whose index entry is
+conflicted before copying anything. The node opens each file once and reads it from that descriptor,
 after checking that the descriptor is the file the path resolves to under home both
 before and after the open, so a file swapped in between is refused. `keep artifact`
 itself refuses a card directory (or `.keep/artifacts`) that is a symbolic link or
