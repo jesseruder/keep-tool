@@ -100,11 +100,12 @@ function main(argv) {
       return 2;
     }
     const renderer = parseRenderer(result.stdout ?? "");
-    if (renderer === null && (result.status !== 0 || result.signal)) {
-      // Edge died before the page ran: that says nothing about the GPU flags.
+    if (renderer === null) {
+      // The page writes "none" when there is no WebGL, so no line at all means it never ran
+      // (Edge died, or dumped nothing): that says nothing about the GPU flags.
       const how = result.signal ? `signal ${result.signal}` : `code ${result.status}`;
       const tail = (result.stderr ?? "").trim().split("\n").slice(-5).join("\n");
-      process.stderr.write(`${options.edgePath} exited with ${how} before the page ran${tail ? `:\n${tail}` : ""}\n`);
+      process.stderr.write(`the probe page never ran (Edge exited with ${how})${tail ? `:\n${tail}` : ""}\n`);
       return 2;
     }
     const verdict = judge(renderer);
