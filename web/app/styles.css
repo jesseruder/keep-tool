@@ -490,7 +490,7 @@ html.mobile .artifact-save { padding: 4px 0; }
 /* Where the work stands: what it waits on, next step, plan, last check-in. The
    fixed .summary height above still holds, so an update never resizes the PTY. */
 .brief .summary.where { white-space: normal; display: flex; flex-direction: column; gap: 4px; }
-.brief .where p { margin: 0; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.brief .where p { margin: 0; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .brief .where-state { color: var(--text); font-weight: 600; }
 .brief .where-dot { margin-right: 6px; font-size: 10px; vertical-align: 1px; }
 .brief .where-state.warn .where-dot { color: var(--warn); }

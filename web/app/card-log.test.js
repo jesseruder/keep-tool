@@ -106,6 +106,8 @@ test('the plan parses as keep-core does, and cited commits are counted once', ()
   assert.deepEqual(planSteps(PLANNED).map((step) => step.state), ['done', 'doing', 'todo']);
   assert.deepEqual(planSteps(BODY), [], 'a numbered list is not a plan');
   assert.deepEqual(planSteps('## 2026-09-21 11:00 — created\nx\n## Plan\n- [ ] late'), [], 'the plan must lead the body');
+  // A stray done-when ends the plan for keep-core, so it ends it here too.
+  assert.equal(planSteps('## Plan\n- [x] one\n  done-when: true\n  done-when: again\n- [ ] two\n').length, 1);
   assert.equal(commitCount(PLANNED), 2);
 });
 
@@ -119,9 +121,14 @@ test('the first line says what the work waits on, in the order Owner cares about
   assert.equal(at({ status: 'review' }).text, 'Waiting for your review');
   assert.deepEqual(at({ status: 'waiting', check_after: '2026-09-24T15:00' }), { tone: 'info', text: 'Check scheduled in 3h' });
   assert.deepEqual(at({ status: 'waiting', check_after: '2026-09-24T10:00' }), { tone: 'warn', text: 'Check overdue since 2h ago' });
-  assert.equal(at({ status: 'waiting', depends_on: ['upstream-card', { task: 'other#2' }] }).text, 'Waiting on upstream-card, other#2');
+  assert.equal(at({ status: 'waiting', depends_on: ['upstream-card#2', { card: 'other', kind: 'status', statuses: ['done'] }] }).text,
+    'Waiting on upstream-card#2, other', 'both the string and the object form keep-core writes');
   assert.deepEqual(at({ status: 'active' }, { session: { id: 's' }, sessionLabel: 'Running' }), { tone: 'ok', text: 'Running' });
-  assert.equal(at({ status: 'done', check_after: '2026-09-24T15:00' }).text, 'Done', 'a done card has no pending check');
+  assert.equal(at({ status: 'done', check_after: '2026-09-24T15:00', depends_on: ['up'] }).text, 'Done', 'a done card waits on nothing');
+  // A later check and a resolved dependency say nothing about a card being worked now.
+  assert.equal(at({ status: 'active', check_after: '2026-09-27T15:00' }, { session: { id: 's' }, sessionLabel: 'Running' }).text, 'Running');
+  assert.equal(at({ status: 'active', depends_on: ['resolved-card'] }, { session: { id: 's' }, sessionLabel: 'Running' }).text, 'Running');
+  assert.equal(at({ status: 'active', check_after: '2026-09-24T10:00' }).text, 'Check overdue since 2h ago', 'an overdue check always shows');
 });
 
 test('where it stands: state, next step, plan progress and the last check-in, escaped', () => {

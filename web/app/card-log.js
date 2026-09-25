@@ -65,10 +65,14 @@ export function planSteps(body) {
   for (index += 1; index < lines.length; index += 1) {
     const line = lines[index];
     if (/^##\s+/.test(line)) break;
-    if (!line.trim() || /^\s+done-when:/.test(line)) continue;
+    if (!line.trim()) continue;
     const step = line.match(/^\s*- \[([ ~xX])\]\s+(.+?)\s*$/);
+    // Anything else ends the plan there, as it does for keep-core, so the
+    // console never counts steps `keep next` does not see.
     if (!step) break;
     steps.push({ text: step[2], state: step[1] === '~' ? 'doing' : /x/i.test(step[1]) ? 'done' : 'todo' });
+    // A step's acceptance criterion sits on the line directly under it.
+    if (/^\s+done-when:\s*\S/.test(lines[index + 1] || '')) index += 1;
   }
   return steps;
 }
@@ -110,29 +114,35 @@ function clip(text, limit) {
   return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
 }
 
+// keep-core stores a dependency as a bare card id (optionally `id#step`) or, for
+// a --status/--commit/--deployed wait, as an object whose `card` names it.
 function dependencyName(entry) {
   if (typeof entry === 'string') return entry;
-  return String(entry?.task || entry?.id || entry?.upstream || '');
+  const card = String(entry?.card || entry?.id || '');
+  return card && entry?.step ? `${card}#${entry.step}` : card;
 }
 
-// The first line: what the session is waiting on, in the order Owner cares about.
-// A need or a waiting queue item is his to act on; a scheduled check or another
-// card is the session waiting on its own; otherwise it is the session's own state.
+// The first line: what the work is waiting on, in the order Owner cares about.
+// A need or a waiting queue item is his to act on. A card in `waiting` is the
+// session waiting on its own — a scheduled check or another card. Otherwise it is
+// the session's own state: a check scheduled for later on a card that is still
+// being worked does not describe what is happening now, and a dependency entry
+// stays on the card after it resolves, so neither is read outside `waiting`.
 export function standing({ task, session, waiting, waitingText, sessionLabel }, now = Date.now()) {
   const fm = task?.fm || {};
   const needs = Array.isArray(fm.needs) ? fm.needs.filter((need) => need?.text) : [];
   if (needs.length) return { tone: 'warn', text: `Waiting on you: ${needs.map((need) => need.text).join('; ')}` };
   if (waiting) return { tone: 'warn', text: `Waiting on you${waitingText ? `: ${waitingText}` : ''}` };
   if (fm.status === 'review') return { tone: 'warn', text: 'Waiting for your review' };
-  if (fm.status !== 'done' && fm.check_after) {
-    const at = stampTime(fm.check_after);
-    if (Number.isFinite(at) && at <= now) return { tone: 'warn', text: `Check overdue since ${ageText(fm.check_after, now)}` };
-    return { tone: 'info', text: `Check scheduled ${untilText(fm.check_after, now)}` };
-  }
-  const deps = (Array.isArray(fm.depends_on) ? fm.depends_on : []).map(dependencyName).filter(Boolean);
-  if (deps.length) return { tone: 'info', text: `Waiting on ${deps.join(', ')}` };
-  if (fm.status === 'landing') return { tone: 'info', text: 'Landing' };
   if (fm.status === 'done') return { tone: 'faint', text: 'Done' };
+  if (fm.status === 'landing') return { tone: 'info', text: 'Landing' };
+  const checkAt = fm.check_after ? stampTime(fm.check_after) : NaN;
+  if (Number.isFinite(checkAt) && checkAt <= now) return { tone: 'warn', text: `Check overdue since ${ageText(fm.check_after, now)}` };
+  if (fm.status === 'waiting') {
+    if (Number.isFinite(checkAt)) return { tone: 'info', text: `Check scheduled ${untilText(fm.check_after, now)}` };
+    const deps = (Array.isArray(fm.depends_on) ? fm.depends_on : []).map(dependencyName).filter(Boolean);
+    if (deps.length) return { tone: 'info', text: `Waiting on ${deps.join(', ')}` };
+  }
   if (session) return { tone: /running|working/i.test(sessionLabel || '') ? 'ok' : 'faint', text: sessionLabel || 'Idle' };
   return { tone: 'faint', text: fm.status ? fm.status[0].toUpperCase() + fm.status.slice(1) : 'No session' };
 }
@@ -157,7 +167,7 @@ export function whereHTML(ctx, { task, session, waiting = false, waitingText = '
   const current = steps.find((step) => step.state === 'doing') || steps.find((step) => step.state === 'todo');
   // Only the latest check-in's "next" is current: an older one can name a step
   // finished days ago. Without one, the plan's current step stands in.
-  const latest = entries.find((entry) => !/^(?:probe|check) result/.test(entry.kind));
+  const latest = entries.find((entry) => /^(?:check-in|done)\b/.test(entry.kind));
   const next = latest?.next && !/^nothing\.?$/i.test(latest.next) ? latest.next : '';
   const nextText = next || (current ? current.text : '');
   if (nextText) lines.push(`<p class="where-next"><span class="faint">Next:</span> ${esc(clip(nextText, 200))}</p>`);

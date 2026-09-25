@@ -753,7 +753,8 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
 }
 
 function briefHTML(ctx, item, session, task) {
-  const fallback = item.sessionId ? 'No Keep card for this session' : item.detail || 'No session transcript available.';
+  const fallback = item.taskId ? `Card ${item.taskId} is not loaded`
+    : item.sessionId ? 'No Keep card for this session' : item.detail || 'No session transcript available.';
   let actions = '';
   if (item.kind === 'question') {
     const options = Array.isArray(item.options) ? item.options : [];
@@ -768,7 +769,7 @@ function briefHTML(ctx, item, session, task) {
   const waiting = item.kind !== 'running' && item.kind !== 'pinned' && item.kind !== 'recent';
   const label = session ? sessionLabel(session) : '';
   const where = whereHTML(ctx, {
-    task: cardTask, session, waiting, waitingText: item.detail || label, sessionLabel: label, fallbackText: fallback,
+    task: cardTask, session, waiting, waitingText: item.detail || '', sessionLabel: label, fallbackText: fallback,
   });
   return `<div class="brief-body${picture ? ' with-picture' : ''}">${picture}${where}</div>${actions}`;
 }
