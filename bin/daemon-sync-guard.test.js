@@ -183,6 +183,32 @@ test('higher-order calls and bound aliases cannot hide blocking capabilities', (
     JSON.stringify(analysis.edges));
 });
 
+test('call and apply invoke direct sinks and every selected helper capability', () => {
+  const analysis = analyzeFixture({
+    'bin/serve/routes.js': `
+      const fs = require('node:fs');
+      const helper = require('../helper');
+      function routes() {
+        fs.readFileSync.call(fs, 'one');
+        fs.statSync.apply(fs, ['two']);
+        (helper.safe || helper.blocking).call(helper, 'three');
+      }
+      module.exports = { routes };
+    `,
+    'bin/helper.js': `
+      const fs = require('node:fs');
+      function safe() { return true; }
+      function blocking() { return fs.realpathSync('file'); }
+      module.exports = { safe, blocking };
+    `,
+  });
+  assert.deepEqual(analysis.sinks.map((sink) => sink.operation).sort(), [
+    'fs.readFileSync', 'fs.realpathSync', 'fs.statSync',
+  ]);
+  assert.ok(analysis.edges.some((edge) => edge.caller.endsWith('::routes') && edge.callee.endsWith('::blocking')),
+    JSON.stringify(analysis.edges));
+});
+
 test('a Worker launch is a boundary but directly requiring its child is not', () => {
   const analysis = analyzeFixture({
     'bin/serve/routes.js': `

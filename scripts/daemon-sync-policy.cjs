@@ -360,12 +360,12 @@ function createAnalyzer(root) {
     if (node.type === 'MemberExpression') return memberOf(resolveExpr(node.object, module, scope, seen), staticProperty(node), seen);
     if (node.type === 'ObjectExpression') return { type: 'object', node, module, scope };
     if (node.type === 'LogicalExpression') {
-      const left = resolveExpr(node.left, module, scope, seen);
+      const left = resolveExpr(node.left, module, scope, new Set(seen));
       const right = resolveExpr(node.right, module, scope, new Set(seen));
       return combineResolved([left, right]);
     }
     if (node.type === 'ConditionalExpression') {
-      const yes = resolveExpr(node.consequent, module, scope, seen);
+      const yes = resolveExpr(node.consequent, module, scope, new Set(seen));
       const no = resolveExpr(node.alternate, module, scope, new Set(seen));
       return combineResolved([yes, no]);
     }
@@ -374,7 +374,7 @@ function createAnalyzer(root) {
     if (node.type === 'AssignmentExpression' && node.operator === '=') return resolveExpr(node.right, module, scope, seen);
     if (node.type === 'AssignmentExpression' && ['||=', '&&=', '??='].includes(node.operator)) {
       return combineResolved([
-        resolveExpr(node.left, module, scope, seen),
+        resolveExpr(node.left, module, scope, new Set(seen)),
         resolveExpr(node.right, module, scope, new Set(seen)),
       ]);
     }
@@ -402,7 +402,12 @@ function createAnalyzer(root) {
         owner = fnNode;
       }
       if (node.type === 'CallExpression' || node.type === 'NewExpression') {
-        const resolved = resolveExpr(node.callee, module, current);
+        // Function.prototype.call/apply invoke the receiver capability. Treating
+        // `.call` as an ordinary property lookup would let both direct sinks and
+        // selected helpers disappear behind a common invocation form.
+        const transparentInvocation = node.type === 'CallExpression' && node.callee.type === 'MemberExpression'
+          && ['call', 'apply'].includes(staticProperty(node.callee));
+        const resolved = resolveExpr(transparentInvocation ? node.callee.object : node.callee, module, current);
         const targets = resolved.type === 'multi' ? resolved.values : [resolved];
         for (const target of targets) {
           if (target.type === 'sink') owner.sinks.push({ operation: target.operation, line: node.loc.start.line });

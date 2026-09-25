@@ -4329,12 +4329,6 @@
       "reason": "Bounded lifecycle metadata debt: read() stats one session lifecycle directory and each retained event file (record() caps child and turn evidence); the exact two synchronous stat call sites are frozen."
     },
     {
-      "function": "bin/session-marks.js::read",
-      "operation": "fs.readdirSync",
-      "count": 1,
-      "reason": "Conservative read/scan debt: the static daemon graph reaches bin/session-marks.js read; this exact synchronous operation count is frozen, including test or CLI fallback branches."
-    },
-    {
       "function": "bin/session-marks.js::readEntry",
       "operation": "fs.readFileSync",
       "count": 1,
@@ -4375,18 +4369,6 @@
       "operation": "fs.readFileSync",
       "count": 1,
       "reason": "Conservative read/scan debt: the static daemon graph reaches bin/session-move.js listMoves>map callback; this exact synchronous operation count is frozen, including test or CLI fallback branches."
-    },
-    {
-      "function": "bin/session-names.js::read",
-      "operation": "fs.readdirSync",
-      "count": 1,
-      "reason": "Conservative read/scan debt: the static daemon graph reaches bin/session-names.js read; this exact synchronous operation count is frozen, including test or CLI fallback branches."
-    },
-    {
-      "function": "bin/session-names.js::readEntry",
-      "operation": "fs.readFileSync",
-      "count": 1,
-      "reason": "Conservative read/scan debt: the static daemon graph reaches bin/session-names.js readEntry; this exact synchronous operation count is frozen, including test or CLI fallback branches."
     },
     {
       "function": "bin/session-names.js::set",
@@ -4743,84 +4725,6 @@
       "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/tell.js saveLedger; this exact synchronous filesystem mutation count is frozen, including fallback branches."
     },
     {
-      "function": "bin/transcript-mirror.js::append",
-      "operation": "fs.closeSync",
-      "count": 2,
-      "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/transcript-mirror.js append; this exact synchronous filesystem mutation count is frozen, including fallback branches."
-    },
-    {
-      "function": "bin/transcript-mirror.js::append",
-      "operation": "fs.fstatSync",
-      "count": 1,
-      "reason": "Conservative metadata debt: the static daemon graph reaches bin/transcript-mirror.js append; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation."
-    },
-    {
-      "function": "bin/transcript-mirror.js::append",
-      "operation": "fs.openSync",
-      "count": 2,
-      "reason": "Conservative read/scan debt: the static daemon graph reaches bin/transcript-mirror.js append; this exact synchronous operation count is frozen, including test or CLI fallback branches."
-    },
-    {
-      "function": "bin/transcript-mirror.js::append",
-      "operation": "fs.renameSync",
-      "count": 1,
-      "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/transcript-mirror.js append; this exact synchronous filesystem mutation count is frozen, including fallback branches."
-    },
-    {
-      "function": "bin/transcript-mirror.js::append",
-      "operation": "fs.unlinkSync",
-      "count": 1,
-      "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/transcript-mirror.js append; this exact synchronous filesystem mutation count is frozen, including fallback branches."
-    },
-    {
-      "function": "bin/transcript-mirror.js::append>writeAll",
-      "operation": "fs.futimesSync",
-      "count": 1,
-      "reason": "Conservative read/scan debt: the static daemon graph reaches bin/transcript-mirror.js append>writeAll; this exact synchronous operation count is frozen, including test or CLI fallback branches."
-    },
-    {
-      "function": "bin/transcript-mirror.js::append>writeAll",
-      "operation": "fs.writeSync",
-      "count": 1,
-      "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/transcript-mirror.js append>writeAll; this exact synchronous filesystem mutation count is frozen, including fallback branches."
-    },
-    {
-      "function": "bin/transcript-mirror.js::checkedDirectory",
-      "operation": "fs.mkdirSync",
-      "count": 1,
-      "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/transcript-mirror.js checkedDirectory; this exact synchronous filesystem mutation count is frozen, including fallback branches."
-    },
-    {
-      "function": "bin/transcript-mirror.js::checkedDirectory",
-      "operation": "fs.realpathSync",
-      "count": 2,
-      "reason": "Conservative metadata debt: the static daemon graph reaches bin/transcript-mirror.js checkedDirectory; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation."
-    },
-    {
-      "function": "bin/transcript-mirror.js::currentSize",
-      "operation": "fs.lstatSync",
-      "count": 1,
-      "reason": "Conservative metadata debt: the static daemon graph reaches bin/transcript-mirror.js currentSize; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation."
-    },
-    {
-      "function": "bin/transcript-mirror.js::prune",
-      "operation": "fs.lstatSync",
-      "count": 3,
-      "reason": "Conservative metadata debt: the static daemon graph reaches bin/transcript-mirror.js prune; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation."
-    },
-    {
-      "function": "bin/transcript-mirror.js::prune",
-      "operation": "fs.readdirSync",
-      "count": 2,
-      "reason": "Conservative read/scan debt: the static daemon graph reaches bin/transcript-mirror.js prune; this exact synchronous operation count is frozen, including test or CLI fallback branches."
-    },
-    {
-      "function": "bin/transcript-mirror.js::prune",
-      "operation": "fs.unlinkSync",
-      "count": 2,
-      "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/transcript-mirror.js prune; this exact synchronous filesystem mutation count is frozen, including fallback branches."
-    },
-    {
       "function": "bin/transcript-mirror.js::readSidecar",
       "operation": "fs.lstatSync",
       "count": 1,
@@ -4833,34 +4737,10 @@
       "reason": "Conservative read/scan debt: the static daemon graph reaches bin/transcript-mirror.js readSidecar; this exact synchronous operation count is frozen, including test or CLI fallback branches."
     },
     {
-      "function": "bin/transcript-mirror.js::realDirectory",
-      "operation": "fs.lstatSync",
-      "count": 2,
-      "reason": "Conservative metadata debt: the static daemon graph reaches bin/transcript-mirror.js realDirectory; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation."
-    },
-    {
-      "function": "bin/transcript-mirror.js::realDirectory",
-      "operation": "fs.mkdirSync",
-      "count": 1,
-      "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/transcript-mirror.js realDirectory; this exact synchronous filesystem mutation count is frozen, including fallback branches."
-    },
-    {
       "function": "bin/transcript-mirror.js::stat",
       "operation": "fs.lstatSync",
       "count": 1,
       "reason": "Conservative metadata debt: the static daemon graph reaches bin/transcript-mirror.js stat; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation."
-    },
-    {
-      "function": "bin/transcript-mirror.js::writeSidecar",
-      "operation": "fs.renameSync",
-      "count": 1,
-      "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/transcript-mirror.js writeSidecar; this exact synchronous filesystem mutation count is frozen, including fallback branches."
-    },
-    {
-      "function": "bin/transcript-mirror.js::writeSidecar",
-      "operation": "fs.writeFileSync",
-      "count": 1,
-      "reason": "Conservative state-mutation debt: the static daemon graph reaches bin/transcript-mirror.js writeSidecar; this exact synchronous filesystem mutation count is frozen, including fallback branches."
     },
     {
       "function": "bin/transcripts.js::claudeFilesInProjects",
@@ -5632,20 +5512,12 @@
     "bin/health.js::snapshot|bin/health.js::snapshot>map callback|1",
     "bin/health.js::snapshot>map callback|bin/health.js::stateOf|1",
     "bin/health.js::stateOf|bin/health.js::readStore|1",
-    "bin/hook-route.js::createHookService|bin/hook-route.js::createHookService>applyTranscript|1",
     "bin/hook-route.js::createHookService|bin/hook-route.js::createHookService>context|1",
-    "bin/hook-route.js::createHookService|bin/hook-route.js::createHookService>handle|1",
     "bin/hook-route.js::createHookService|bin/hook-route.js::createHookService>mirrorStat|1",
-    "bin/hook-route.js::createHookService|bin/hook-route.js::createHookService>pruneMirrors|1",
     "bin/hook-route.js::createHookService|bin/hook-route.js::createHookService>right callback[2]|1",
     "bin/hook-route.js::createHookService|bin/hook-route.js::createHookService>right callback[3]|1",
-    "bin/hook-route.js::createHookService>applyTranscript|bin/transcript-mirror.js::append|1",
     "bin/hook-route.js::createHookService>context|bin/hook-route.js::publishedFingerprints|1",
-    "bin/hook-route.js::createHookService>handle|bin/hook-route.js::createHookService>handle>inSession callback|1",
-    "bin/hook-route.js::createHookService>handle|bin/hook-route.js::createHookService>pruneMirrors|1",
-    "bin/hook-route.js::createHookService>handle>inSession callback|bin/hook-route.js::createHookService>applyTranscript|1",
     "bin/hook-route.js::createHookService>mirrorStat|bin/transcript-mirror.js::stat|1",
-    "bin/hook-route.js::createHookService>pruneMirrors|bin/transcript-mirror.js::prune|1",
     "bin/hook-route.js::createHookService>right callback[2]|bin/self-repair.js::cardForSession|1",
     "bin/hook-route.js::createHookService>right callback[3]|bin/self-repair.js::stateUnreadable|1",
     "bin/hook-route.js::publishedFingerprints|bin/steps.js::registeredSteps|1",
@@ -6581,8 +6453,6 @@
     "bin/serve.js::backfillHostSessions|bin/serve.js::attachCodexMarkers|1",
     "bin/serve.js::backfillHostSessions|bin/serve.js::claudeSessionFor|1",
     "bin/serve.js::backfillHostSessions|bin/serve.js::createDashboardClaudeSessionResolver|1",
-    "bin/serve.js::backfillHostSessions|bin/session-marks.js::apply|1",
-    "bin/serve.js::backfillHostSessions|bin/session-names.js::apply|1",
     "bin/serve.js::backfillHostSessions|bin/session-numbers.js::assign|1",
     "bin/serve.js::backgroundChildFile|bin/codex.js::findRolloutFile|1",
     "bin/serve.js::backgroundChildFile|bin/serve.js::backgroundMirrorSource|1",
@@ -6622,10 +6492,7 @@
     "bin/serve.js::buildState|bin/serve.js::messageWatcherDashboardState|1",
     "bin/serve.js::buildState|bin/serve.js::readLiveSessionLedger|1",
     "bin/serve.js::buildState|bin/serve.js::scanSessions|1",
-    "bin/serve.js::buildState|bin/session-marks.js::apply|1",
-    "bin/serve.js::buildState|bin/session-names.js::apply|1",
     "bin/serve.js::buildState|bin/session-restart.js::read|1",
-    "bin/serve.js::buildState|bin/session-retirement.js::apply|1",
     "bin/serve.js::buildState|bin/stalled.js::readCurrent|1",
     "bin/serve.js::buildState|bin/stop-classifier.js::attach|1",
     "bin/serve.js::buildState|bin/stop-classifier.js::request|1",
@@ -6953,8 +6820,6 @@
     "bin/serve.js::loadRemoteSession|bin/serve.js::attachCodexMarkers|1",
     "bin/serve.js::loadRemoteSession|bin/serve.js::remoteSessionRead|1",
     "bin/serve.js::loadRemoteSession|bin/serve.js::spawnedRecently|1",
-    "bin/serve.js::loadRemoteSession|bin/session-marks.js::apply|1",
-    "bin/serve.js::loadRemoteSession|bin/session-names.js::apply|1",
     "bin/serve.js::loadRemoteSession|bin/session-numbers.js::assign|1",
     "bin/serve.js::loadRemoteSessionForSend|bin/serve.js::loadRemoteSession|1",
     "bin/serve.js::loadRemoteSessionForSend|bin/serve.js::remoteSessionWithoutTranscript|1",
@@ -6966,8 +6831,6 @@
     "bin/serve.js::loadSessionExact|bin/serve.js::codexFleetSession|1",
     "bin/serve.js::loadSessionExact|bin/serve.js::sessionNodeOf|1",
     "bin/serve.js::loadSessionExact|bin/serve.js::spawnedRecently|1",
-    "bin/serve.js::loadSessionExact|bin/session-marks.js::apply|1",
-    "bin/serve.js::loadSessionExact|bin/session-names.js::apply|1",
     "bin/serve.js::loadSessionExact|bin/session-numbers.js::assign|1",
     "bin/serve.js::loadSessionForAction|bin/serve.js::hostNodeNames|1",
     "bin/serve.js::loadSessionForAction|bin/serve.js::loadCurrentSession|1",
@@ -7160,8 +7023,6 @@
     "bin/serve.js::remoteSessionRead|bin/serve.js::sessionNodeOf|1",
     "bin/serve.js::remoteSessionWithoutTranscript|bin/serve.js::listHostPaneResult|1",
     "bin/serve.js::remoteSessionWithoutTranscript|bin/serve.js::sessionHadTurn|1",
-    "bin/serve.js::remoteSessionWithoutTranscript|bin/session-marks.js::apply|1",
-    "bin/serve.js::remoteSessionWithoutTranscript|bin/session-names.js::apply|1",
     "bin/serve.js::remoteSessionWithoutTranscript|bin/session-numbers.js::assign|1",
     "bin/serve.js::reopenSessionOnAccount|bin/accounts.js::get|1",
     "bin/serve.js::reopenSessionOnAccount|bin/serve.js::reopenSessionOnAccount>call callback|2",
@@ -7264,8 +7125,6 @@
     "bin/serve.js::scanSessions|bin/serve.js::attachCodexMarkers|1",
     "bin/serve.js::scanSessions|bin/serve.js::scanClaudeSessions|1",
     "bin/serve.js::scanSessions|bin/serve.js::scanDashboardCodexSessions|1",
-    "bin/serve.js::scanSessions|bin/session-marks.js::apply|1",
-    "bin/serve.js::scanSessions|bin/session-names.js::apply|1",
     "bin/serve.js::scanSessions|bin/session-numbers.js::assign|1",
     "bin/serve.js::scanSessions|bin/titles.js::applyLiveTitles|1",
     "bin/serve.js::scanTranscript|bin/transcripts.js::readTranscriptTail|1",
@@ -7877,13 +7736,9 @@
     "bin/serve/schedulers.js::startSchedulers>watcherTick>deliverObservation|bin/watcher-live.js::maybeDeliverObservation|1",
     "bin/serve/schedulers.js::startSchedulers>watcherTick>deliverObservation>freshSession|bin/serve.js::loadCurrentSession|1",
     "bin/serve/schedulers.js::startSchedulers>watcherTick>deliverObservation>send|bin/serve.js::watcherSend|1",
-    "bin/session-marks.js::apply|bin/session-marks.js::read|1",
-    "bin/session-marks.js::read|bin/session-marks.js::readEntry|1",
     "bin/session-marks.js::set|bin/session-marks.js::readEntry|1",
     "bin/session-move.js::inFlight|bin/session-move.js::listMoves|1",
     "bin/session-move.js::listMoves|bin/session-move.js::listMoves>map callback|1",
-    "bin/session-names.js::apply|bin/session-names.js::read|1",
-    "bin/session-names.js::read|bin/session-names.js::readEntry|1",
     "bin/session-numbers.js::assign|bin/session-numbers.js::assign>withLock callback|1",
     "bin/session-numbers.js::assign|bin/session-numbers.js::read|2",
     "bin/session-numbers.js::assign|bin/session-numbers.js::withLock|1",
@@ -7907,8 +7762,6 @@
     "bin/session-restart.js::createManager>tick|bin/session-restart.js::createManager>run|1",
     "bin/session-retirement.js::acknowledge|bin/session-retirement.js::retirements|1",
     "bin/session-retirement.js::acknowledge|bin/session-retirement.js::write|1",
-    "bin/session-retirement.js::apply|bin/session-retirement.js::preferences|1",
-    "bin/session-retirement.js::apply|bin/session-retirement.js::retirements|1",
     "bin/session-retirement.js::assertRetirable|bin/session-retirement.js::preferences|1",
     "bin/session-retirement.js::begin|bin/session-retirement.js::retirements|1",
     "bin/session-retirement.js::begin|bin/session-retirement.js::write|1",
@@ -8000,13 +7853,6 @@
     "bin/titles.js::applyLiveTitles|bin/titles.js::liveTitle|1",
     "bin/titles.js::liveTitle|bin/summarize.js::getSummary|1",
     "bin/titles.js::liveTitle|bin/summarize.js::peekSummary|2",
-    "bin/transcript-mirror.js::append|bin/transcript-mirror.js::append>writeAll|3",
-    "bin/transcript-mirror.js::append|bin/transcript-mirror.js::checkedDirectory|1",
-    "bin/transcript-mirror.js::append|bin/transcript-mirror.js::currentSize|1",
-    "bin/transcript-mirror.js::append|bin/transcript-mirror.js::readSidecar|1",
-    "bin/transcript-mirror.js::append|bin/transcript-mirror.js::writeSidecar|1",
-    "bin/transcript-mirror.js::checkedDirectory|bin/transcript-mirror.js::realDirectory|2",
-    "bin/transcript-mirror.js::prune|bin/transcript-mirror.js::readSidecar|1",
     "bin/transcript-mirror.js::stat|bin/transcript-mirror.js::readSidecar|1",
     "bin/transcripts.js::findSessionFile|bin/accounts.js::forSession|1",
     "bin/transcripts.js::findSessionFile|bin/accounts.js::knownClaudeFile|1",
