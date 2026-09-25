@@ -456,6 +456,12 @@ const nodePaneMemo = new Map();
 // Bumped before every request that can change the host, so a list collected
 // across a spawn or replacement is never remembered as the last known state.
 let hostMutationEpoch = 0;
+// The same fence per node, for each node's own memo. A request changes the host it
+// is sent to and no other, so a delivery typed into a pane here must not cost aws1
+// its last known list: that list is what keeps aws1's sessions on screen through a
+// one-second network blip, and losing it made them vanish and come back.
+const nodeMutationEpochs = new Map();
+function nodeMutationEpoch(node) { return nodeMutationEpochs.get(node) || 0; }
 // One set of connections per node, keyed `<node>\0<channel>`. Each has its own
 // client, its own negative cache and its own failure, so a node that is down
 // cannot make its neighbours look down.
@@ -2209,9 +2215,11 @@ async function hostRequest(type, params, deps = {}) {
         hostMutationEpoch += 1;
         lastKnownHostPaneMemo.panes = null;
         lastKnownHostPaneMemo.at = 0;
-        // The per-node memos are behind the same fence: a remote list from before
-        // this mutation must not come back as that node's "last known" afterwards.
-        nodePaneMemo.clear();
+        // The node's own memo is behind the same fence: a list from before this
+        // mutation must not come back as that node's "last known" afterwards. Only
+        // this node's: the others' hosts are untouched by it.
+        nodeMutationEpochs.set(node, nodeMutationEpoch(node) + 1);
+        nodePaneMemo.delete(node);
       }
       const result = await requestHostClient(client, type, attempt, {
         ...deps, hostRequestTimeoutMs: attemptTimeoutMs,
@@ -2324,7 +2332,7 @@ function hostNodeNames(deps = {}) {
   return hostNodeEntries(deps).filter((entry) => !entry.invalid).map((entry) => entry.name);
 }
 
-async function listNodePaneResult(node, deps = {}, fresh = false, epoch = hostMutationEpoch) {
+async function listNodePaneResult(node, deps = {}, fresh = false, epoch = nodeMutationEpoch(node)) {
   const client = await hostClientFor(node, deps);
   if (!client) return { panes: null, failure: 'unreachable', endpoint: hostEndpointExists({ ...deps, node }) };
   const now = deps.now || Date.now;
@@ -2356,7 +2364,7 @@ async function listNodePaneResult(node, deps = {}, fresh = false, epoch = hostMu
     // knows about that node. A node half a second too slow is stale for one read,
     // not until it happens to be quick.
     noteHostPaneSessions(panes);
-    if (epoch === hostMutationEpoch) {
+    if (epoch === nodeMutationEpoch(node)) {
       hostPaneCaches.set(client, { at: now(), panes });
       rememberNodePanes(node, panes, now(), epoch);
     }
@@ -2370,8 +2378,8 @@ async function listNodePaneResult(node, deps = {}, fresh = false, epoch = hostMu
 
 // Each node's own last known list, kept apart from the merged memo so that one
 // node falling silent neither empties its panes nor overwrites what the others said.
-function rememberNodePanes(node, panes, at, epoch = hostMutationEpoch) {
-  if (epoch !== hostMutationEpoch) return;
+function rememberNodePanes(node, panes, at, epoch = nodeMutationEpoch(node)) {
+  if (epoch !== nodeMutationEpoch(node)) return;
   nodePaneMemo.set(node, { panes, at });
 }
 
@@ -2411,12 +2419,12 @@ async function listHostPaneResult(deps = {}, fresh = false) {
   // One node is the whole fleet: the result is the one the daemon has always
   // returned, pane for pane and field for field.
   if (entries.length === 1 && !unreadable) {
-    const only = await listNodePaneResult(daemon, deps, fresh, epoch);
+    const only = await listNodePaneResult(daemon, deps, fresh);
     if (Array.isArray(only.panes)) remember(only.panes, !cachedPaneResults.has(only));
     return only;
   }
   if (unreadable) {
-    const only = await listNodePaneResult(daemon, deps, fresh, epoch);
+    const only = await listNodePaneResult(daemon, deps, fresh);
     return { ...only, configurationUnreadable: true, nodes: {}, missingNodes: [] };
   }
   // Every node is asked at once, and each remote answer has its own, shorter budget
@@ -2424,7 +2432,7 @@ async function listHostPaneResult(deps = {}, fresh = false) {
   // hear what the panes on this machine are doing.
   const budgetMs = deps.hostRemoteListTimeoutMs == null ? HOST_REMOTE_LIST_TIMEOUT_MS : deps.hostRemoteListTimeoutMs;
   const inFlight = new Map(entries.filter((entry) => !entry.invalid)
-    .map((entry) => [entry.name, listNodePaneResult(entry.name, deps, fresh, epoch)]));
+    .map((entry) => [entry.name, listNodePaneResult(entry.name, deps, fresh)]));
   const others = entries.filter((entry) => entry.name !== daemon).map(async (entry) => {
     // An entry nobody can resolve is asked nothing and reported as unusable.
     if (entry.invalid) return [entry.name, { panes: null, failure: 'invalid', detail: entry.reason }];
@@ -4223,6 +4231,30 @@ const REMOTE_TRANSCRIPT_CACHE_MS = PROCESS_ROWS_CACHE_MS;
 const REMOTE_TRANSCRIPT_CACHE_LIMIT = 512;
 const remoteTranscriptCache = new Map(); // `${node}\0${sessionId}` -> { at, stat, tail, accountId, pending }
 
+function remoteClaudeModel(entry, node, sessionId, deps = {}) {
+  return claudeSessionFromTail(sessionId, entry.tail, { root: deps.root || keep.ROOT, accountId: entry.accountId, node });
+}
+
+function remoteCodexModel(entry, node, sessionId, deps = {}) {
+  const session = codexSessionFromTail(sessionId, entry.meta, entry.tail, {
+    root: deps.root || keep.ROOT, accountId: entry.accountId, node,
+    title: codexTitleHere(sessionId, entry.accountId, deps),
+  });
+  // A Companion task is a delegated job, left out as codex.scan leaves it out.
+  return codex.isCompanionTask(session.title) ? null : session;
+}
+
+// The row the last read of a node session built, asking the node nothing: what a
+// row stands on while its node is silent or slower than the listing's budget, so a
+// blip on the link leaves it as it was instead of turning it into a bare pane row
+// for a cycle. undefined when nothing has been read for it yet.
+function peekRemoteSession(node, sessionId, agent, deps = {}) {
+  const codexRow = agent === 'codex';
+  const entry = remoteTranscriptCache.get(codexRow ? `codex\0${node}\0${sessionId}` : `${node}\0${sessionId}`);
+  if (!entry || !entry.tail) return undefined;
+  return codexRow ? remoteCodexModel(entry, node, sessionId, deps) : remoteClaudeModel(entry, node, sessionId, deps);
+}
+
 async function cachedRemoteSession(node, sessionId, deps = {}) {
   const key = `${node}\0${sessionId}`;
   let entry = remoteTranscriptCache.get(key);
@@ -4234,7 +4266,7 @@ async function cachedRemoteSession(node, sessionId, deps = {}) {
     }
   }
   const now = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
-  const model = () => claudeSessionFromTail(sessionId, entry.tail, { root: deps.root || keep.ROOT, accountId: entry.accountId, node });
+  const model = () => remoteClaudeModel(entry, node, sessionId, deps);
   if (entry.tail && now - entry.at < REMOTE_TRANSCRIPT_CACHE_MS) return model();
   if (!entry.pending) {
     entry.pending = (async () => {
@@ -4271,14 +4303,7 @@ async function cachedRemoteCodexSession(node, sessionId, deps = {}) {
     }
   }
   const now = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
-  const model = () => {
-    const session = codexSessionFromTail(sessionId, entry.meta, entry.tail, {
-      root: deps.root || keep.ROOT, accountId: entry.accountId, node,
-      title: codexTitleHere(sessionId, entry.accountId, deps),
-    });
-    // A Companion task is a delegated job, left out as codex.scan leaves it out.
-    return codex.isCompanionTask(session.title) ? null : session;
-  };
+  const model = () => remoteCodexModel(entry, node, sessionId, deps);
   if (entry.tail && now - entry.at < REMOTE_TRANSCRIPT_CACHE_MS) return model();
   if (!entry.pending) {
     entry.pending = (async () => {
@@ -4349,29 +4374,48 @@ async function cachedRemotePiEvent(node, sessionId, deps = {}) {
 // The console never waits on a node in another building: a node this listing could
 // not hear from (`skipNodes`: its remembered panes are still listed) is not asked at
 // all, and the reads that are asked share the remote-list budget listHostPaneResult
-// gives a node's pane list. A read still running at the deadline leaves its row
-// without a size this cycle; it finishes into the cache for the next one.
+// gives a node's pane list. Either way a row starts from what its node last said
+// (peekRemoteSession), so a silent node or a read still running at the deadline
+// leaves the row as it was rather than a bare pane row; the read finishes into the
+// cache for the next cycle.
 async function remoteSessionFreshness(panes, deps = {}, { skipNodes = null } = {}) {
   const env = paneRefEnv(deps);
   const skip = new Set(skipNodes || []);
-  const wanted = (Array.isArray(panes) ? panes : []).filter((pane) => pane && pane.alive
-    && nodes.isRemotePane(pane, env) && !skip.has(pane.node) && pane.meta
+  const remote = (Array.isArray(panes) ? panes : []).filter((pane) => pane && pane.alive
+    && nodes.isRemotePane(pane, env) && pane.meta
     && ['claude', 'codex', 'pi'].includes(pane.meta.agent)
     && typeof pane.meta.sessionId === 'string' && /^[A-Za-z0-9_-]+$/.test(pane.meta.sessionId));
-  if (!wanted.length) return null;
+  if (!remote.length) return null;
   const out = {};
+  const peek = (pane) => {
+    const id = pane.meta.sessionId;
+    if (pane.meta.agent === 'pi') {
+      const cached = (deps.peekRemotePiEvent || peekRemotePiEvent)(pane.node, id);
+      if (cached !== undefined) out[id] = { id, kind: 'pi', node: pane.node, piEvent: cached || null };
+      return;
+    }
+    const cached = (deps.peekRemoteSession || peekRemoteSession)(pane.node, id, pane.meta.agent, deps);
+    if (!cached) return;
+    // Without its size: nothing read it this cycle, and the stalled detector must not
+    // time a session by a size nobody read, as it never did for a bare pane row.
+    const { size: _unread, ...row } = cached;
+    out[id] = row;
+  };
+  for (const pane of remote.filter((candidate) => skip.has(candidate.node))) {
+    try { if (sessionNodeOf({ id: pane.meta.sessionId }, deps) === pane.node) peek(pane); } catch {}
+  }
+  const wanted = remote.filter((pane) => !skip.has(pane.node));
   const reads = Promise.all(wanted.map(async (pane) => {
     const id = pane.meta.sessionId;
     try {
       if (sessionNodeOf({ id }, deps) !== pane.node) return;
+      // The last answer first, so a node read slower than the budget below leaves
+      // the row on it this cycle rather than on none; the read, when it lands in
+      // time, replaces it.
+      peek(pane);
       // A Pi session on a node has no transcript row here: what the node gives is its
       // phase, which the host-only row (backfillHostSessions) takes its turn state from.
       if (pane.meta.agent === 'pi') {
-        // The last answer first, so a node read slower than the budget below leaves
-        // the row on its cached phase this cycle rather than on none; the read, when
-        // it lands in time, replaces it.
-        const cached = (deps.peekRemotePiEvent || peekRemotePiEvent)(pane.node, id);
-        if (cached !== undefined) out[id] = { id, kind: 'pi', node: pane.node, piEvent: cached || null };
         const piEvent = await (deps.cachedRemotePiEvent || cachedRemotePiEvent)(pane.node, id, deps);
         out[id] = { id, kind: 'pi', node: pane.node, piEvent: piEvent || null };
         return;

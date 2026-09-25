@@ -635,6 +635,41 @@ test('a node that does not answer leaves its row without a transcript size, whic
   } finally { f.cleanup(); }
 });
 
+test('a node that falls silent keeps its rows on their last read, without a size, until it answers again', async () => {
+  const f = freshnessFixture('aws3', 'sess-blip');
+  try {
+    const first = (await serve.remoteSessionFreshness([f.pane], f.deps))['sess-blip'];
+    assert.equal(first.endedTurn, true);
+    assert.ok(Number.isFinite(first.size));
+    const asked = f.asked.length;
+
+    // aws3 misses a listing: it is asked nothing, and its row is what it last said, so
+    // the console does not see it turn into a bare pane row and back.
+    f.advance(3000);
+    const blip = (await serve.remoteSessionFreshness([f.pane], f.deps, { skipNodes: ['aws3'] }))['sess-blip'];
+    assert.equal(f.asked.length, asked, 'nothing was asked of the silent node');
+    assert.equal(blip.node, 'aws3');
+    assert.equal(blip.endedTurn, true);
+    assert.equal(blip.lastAssistant, first.lastAssistant);
+    assert.equal('size' in blip, false, 'no size nobody read this cycle');
+    const sessions = [];
+    serve.backfillHostSessions(sessions, [f.pane], { root: f.root, hostNodes: ['main', 'aws3'], claudeSessionFor: () => null,
+      nodeSessions: { 'sess-blip': blip } });
+    assert.equal(sessions[0].state, first.state, 'the row keeps its state through the blip');
+    assert.equal(sessions[0].lastAssistant, first.lastAssistant);
+
+    // A read slower than the budget stands on the same last answer.
+    const slow = { ...f.deps, hostRemoteListTimeoutMs: 30, cachedRemoteSession: () => new Promise(() => {}) };
+    const cut = (await serve.remoteSessionFreshness([f.pane], slow))['sess-blip'];
+    assert.equal(cut.lastAssistant, first.lastAssistant);
+    assert.equal('size' in cut, false);
+
+    // A session nothing was ever read for has nothing to stand on.
+    const unread = { ...f.pane, meta: { ...f.pane.meta, sessionId: 'sess-never-read' } };
+    assert.equal(await serve.remoteSessionFreshness([unread], f.deps, { skipNodes: ['aws3'] }), null);
+  } finally { f.cleanup(); }
+});
+
 test('a silent node adds no wait to the publication: its panes are not asked about, and a slow read is cut at the list budget', async () => {
   const f = freshnessFixture('aws4', 'sess-slow');
   try {

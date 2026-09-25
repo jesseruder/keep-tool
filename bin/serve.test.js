@@ -15220,8 +15220,18 @@ test('a node memo follows the last answer, the whole picture, and the mutation f
       assert.deepEqual(third.nodes, { aws1: { ok: true } });
       assert.deepEqual(memo.panes.map((pane) => pane.id).sort(), [local.id, remote.id].sort());
 
-      // A mutation clears what every node was last known to hold, not just this one.
+      // A mutation here leaves what aws1 was last known to hold: its host is untouched.
       await hostRequest('clear', { pane: local.id }, deps);
+      delayMs = 300;
+      const elsewhere = await list();
+      assert.deepEqual(elsewhere.missingNodes, ['aws1']);
+      assert.equal(elsewhere.nodes.aws1.stale, true, 'a mutation on another node keeps this node\'s memo');
+      assert.deepEqual(elsewhere.panes.map((pane) => pane.id).sort(), [local.id, remote.id].sort());
+
+      // A mutation on aws1 clears aws1's memo, so a pre-mutation list never comes back.
+      delayMs = 0;
+      await list();
+      await hostRequest('clear', { pane: remote.id }, { ...deps, node: 'aws1' });
       delayMs = 300;
       const fenced = await list();
       assert.deepEqual(fenced.missingNodes, ['aws1']);
