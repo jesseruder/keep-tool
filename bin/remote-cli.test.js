@@ -237,7 +237,7 @@ test('a refusal from the daemon is said as one, not as the command\'s output', a
 test('a command that is not registry-class still refuses, and without a daemon URL nothing is posted', async (t) => {
   const daemon = await stubDaemon(t, () => ({ status: 500, body: {} }));
   const { root, env } = nodeEnv(t);
-  for (const argv of [['open', 'card'], ['handoff', 'card'], ['sync'], ['artifact', 'card']]) {
+  for (const argv of [['handoff', 'card'], ['sync'], ['artifact', 'card'], ['serve']]) {
     const result = await run(argv, { env: { ...env, KEEP_DAEMON_URL: daemon.url }, cwd: root });
     assert.equal(result.status, 2, argv.join(' '));
     assert.equal(result.stderr, `keep ${argv[0]}: the registry lives on node main; this is node aws1\n`);
@@ -334,6 +334,40 @@ test('a forwarded tell\'s request outlasts its --wait; every other command keeps
   assert.equal((await runRemote('show', ['card'], deps)).code, 0);
   assert.equal((await runRemote('tell', ['card', '-m', 'hi', '--wait', '2m'], { ...deps, timeoutMs: 5 })).code, 0);
   assert.deepEqual(seen, [REQUEST_TIMEOUT_MS + 2 * 60e3, REQUEST_TIMEOUT_MS, 5]);
+});
+
+// A session on a node that plans work opens sessions for it through the daemon, on
+// any node the daemon knows.
+test('keep open from a node is posted to the daemon under its session, and its request outlasts the open', async (t) => {
+  const daemon = await stubDaemon(t, () => ({ status: 200, body: { ok: true, status: 0, stdout: 'opened pane p1: claude as new\n', stderr: '', replayed: false } }));
+  const { root, env } = nodeEnv(t, { CLAUDE_CODE_SESSION_ID: 'sess-aws1' });
+  env.KEEP_DAEMON_URL = daemon.url;
+  const opened = await run(['open', 'card', '--fresh', '-m', 'hi', '--node', 'main'], { env, cwd: root });
+  assert.equal(opened.status, 0, opened.stderr);
+  assert.equal(opened.stdout, 'opened pane p1: claude as new\n');
+  assert.equal(daemon.requests[0].url, '/api/registry');
+  assert.equal(daemon.requests[0].body.command, 'open');
+  assert.deepEqual(daemon.requests[0].body.args, ['card', '--fresh', '-m', 'hi', '--node', 'main']);
+  assert.equal(daemon.requests[0].body.session, 'sess-aws1');
+
+  const { requestTimeoutMs, runRemote, REQUEST_TIMEOUT_MS } = require('./remote-cli.js');
+  const { OPEN_EXTRA_MS } = require('./registry-commands.js');
+  assert.equal(requestTimeoutMs('open', ['card', '--fresh', '-m', 'hi']), REQUEST_TIMEOUT_MS + OPEN_EXTRA_MS);
+  const seen = [];
+  const sent = [];
+  const request = async (url, pathname, options) => {
+    sent.push(pathname);
+    seen.push(options.timeoutMs);
+    return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: 'opened\n', stderr: '' }) };
+  };
+  const deps = { where: { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, request, token: 't', env: {}, cwd: root };
+  assert.equal((await runRemote('open', ['card', '--fresh'], deps)).code, 0);
+  assert.deepEqual(seen, [REQUEST_TIMEOUT_MS + OPEN_EXTRA_MS]);
+  // A message file is a path on this node: refused here, before anything is posted.
+  assert.deepEqual(await runRemote('open', ['card', '--fresh', '--message-file', 'note.md'], deps), {
+    code: 2, stdout: '', stderr: 'keep open: --message-file names a file on this node; use -m, or run it from the daemon node\n',
+  });
+  assert.equal(sent.length, 1);
 });
 
 test('a tell naming a file on the node, or waiting past a day, is refused on the node and never posted', async (t) => {

@@ -30,7 +30,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { isRegistryCommand, argumentRefusal, forwardedWaitMs } = require('./registry-commands.js');
+const { isRegistryCommand, argumentRefusal, forwardedWaitMs, isWaitingTell } = require('./registry-commands.js');
 
 const SESSION_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const PANE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -335,11 +335,20 @@ function createRegistryService(options = {}) {
       // it does in that time is post to this daemon's /api/tell, whose typing the
       // restart gate already waits for, and a restart that ends it leaves its journal
       // entry interrupted, which is what the node's resend is then told.
+      //
+      // An `open` also runs past the ordinary bound, for as long as the session it
+      // starts takes to show its prompt, and on a queue of its own for the same
+      // reason: a check-in queued behind it would otherwise spend the node's whole
+      // request bound waiting. Unlike a waiting tell it holds a restart, as any
+      // ordinary command does: it spawns a session and records its ownership and
+      // account pin, and a restart in the middle would leave that half done.
       const waitMs = forwardedWaitMs(request.command, request.args);
+      const waitingTell = isWaitingTell(request.command, request.args);
+      const ownQueue = waitingTell || request.command === 'open';
       return await journaled({
         caller, key: request.idempotencyKey, digest: digestOf(request),
-        queue: waitMs > 0 ? `wait\0${caller}\0${request.idempotencyKey}` : caller,
-        holdsRestart: waitMs === 0,
+        queue: ownQueue ? `${request.command}\0${caller}\0${request.idempotencyKey}` : caller,
+        holdsRestart: !waitingTell,
         run: () => execute(request, caller, waitMs > 0 ? { timeoutMs: timeoutMs + waitMs } : {}),
         what: `keep ${request.command}${request.nodeCwd ? ` from ${request.nodeCwd}` : ''}`,
       });

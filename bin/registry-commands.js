@@ -24,6 +24,14 @@ const REGISTRY_COMMANDS = Object.freeze([
   // daemon frames the text as a message from that sender, on that sender's card,
   // and the per-sender ledger in .keep/tell.json caps it like any other tell.
   'tell',
+  // `open` starts or resumes a session for a card. The daemon's CLI runs it under the
+  // caller's verified session, so the caller is the requester the card is handed over
+  // from; the daemon resolves the card and picks the node, account and model itself,
+  // exactly as for an open typed on the daemon node. Its -m opening message is typed
+  // into the new session: trusted node input, by the same trust that lets a node land
+  // and name its own work (see the card titles and plan text below). What it cannot
+  // carry is a file on the node (NODE_FILE_FLAGS).
+  'open',
 ]);
 
 // A flag whose value is a command the daemon runs: `--probe` on its check schedule,
@@ -57,6 +65,26 @@ const INSTRUCTION_FLAGS = Object.freeze(['--check', '--on-pass']);
 // that path from the daemon's own disk, which holds some other file or none.
 const NODE_FILE_FLAGS = Object.freeze({
   tell: ['--message-file'],
+  open: ['--message-file'],
+});
+
+// A flag that, in that command, names where something happens rather than who is
+// asking. `--session` and `--node` elsewhere name the caller (a card linked to a
+// session, a decision taken for one), so they must name the caller's own; `open
+// --node` is where the new session runs, and a session on one node opening work on
+// the daemon node or on a third is the point of forwarding it. `open` takes no
+// `--session`, so that rule still applies to it.
+const PLACEMENT_FLAGS = Object.freeze({
+  open: ['--node'],
+});
+
+// The commands the daemon runs on behalf of a session and so frames as that session's
+// act; without one the daemon's CLI would attribute a node's request to Owner's own
+// shell. A tell is framed as a message from its sender, and an open names its opener
+// as the requester a card is handed over from.
+const SESSION_REFUSALS = Object.freeze({
+  tell: "a node's tell names the session it is from; run it inside an agent session",
+  open: "a node's open names the session it is from; run it inside an agent session",
 });
 
 const MAX_ARG_BYTES = 4 * 1024;
@@ -97,6 +125,7 @@ const BOOLEAN_FLAGS = Object.freeze({
   landed: ['disagree', 'dry'],
   resume: ['raw'],
   tell: ['dry', 'json'],
+  open: ['fresh'],
 });
 
 // The arguments each registry command resolves as a project (keep-core
@@ -134,7 +163,8 @@ function isBooleanFlag(command, name) {
 //
 // `identity` is { session, node }: an argument that names a session or a node must
 // name the caller's own, so a node cannot link a card to, or decide for, a session
-// somewhere else.
+// somewhere else. A flag PLACEMENT_FLAGS names for the command is where, not who,
+// and is judged only as an ordinary value.
 function argumentRefusal(command, args, identity = {}) {
   if (!Array.isArray(args)) return 'args must be an array of strings';
   let total = 0;
@@ -146,9 +176,7 @@ function argumentRefusal(command, args, identity = {}) {
     if (total > MAX_ARGS_BYTES) return `the arguments are longer than ${MAX_ARGS_BYTES} bytes together`;
     if (arg.includes('\0')) return 'an argument contains a NUL byte';
   }
-  // A tell is framed as a message from the session that sent it; without one the
-  // daemon's CLI would frame a node's text as Owner's own shell.
-  if (command === 'tell' && !identity.session) return TELL_SESSION_REFUSAL;
+  if (Object.prototype.hasOwnProperty.call(SESSION_REFUSALS, command) && !identity.session) return SESSION_REFUSALS[command];
   if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return WAIT_CAP_REFUSAL;
   const newline = (arg) => /[\r\n]/.test(arg);
   const NEWLINE = 'only the -m message may contain a newline';
@@ -160,6 +188,7 @@ function argumentRefusal(command, args, identity = {}) {
   const projectFlags = Object.prototype.hasOwnProperty.call(PROJECT_FLAGS, command) ? PROJECT_FLAGS[command] : [];
   const projectPositions = Object.prototype.hasOwnProperty.call(PROJECT_POSITIONS, command) ? PROJECT_POSITIONS[command] : [];
   const fileFlags = Object.prototype.hasOwnProperty.call(NODE_FILE_FLAGS, command) ? NODE_FILE_FLAGS[command] : [];
+  const placementFlags = Object.prototype.hasOwnProperty.call(PLACEMENT_FLAGS, command) ? PLACEMENT_FLAGS[command] : [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (i === message) continue;
@@ -171,7 +200,7 @@ function argumentRefusal(command, args, identity = {}) {
     if (flag && COMMAND_FLAGS.includes(flag)) return `${flag} carries a command the daemon would run; set it from the daemon node`;
     if (flag && INSTRUCTION_FLAGS.includes(flag)) return `${flag} carries text the daemon would hand a session as instructions; set it from the daemon node`;
     if (flag && fileFlags.includes(flag)) return `${flag} names a file on this node; use -m, or run it from the daemon node`;
-    if (flag === '--session' || flag === '--node') {
+    if ((flag === '--session' || flag === '--node') && !placementFlags.includes(flag)) {
       const named = eq < 0 ? args[i + 1] : arg.slice(eq + 1);
       const own = flag === '--session' ? identity.session : identity.node;
       if (!own || named !== own) return `${flag} must name the caller's own ${flag.slice(2)}`;
@@ -215,7 +244,8 @@ function argumentRefusal(command, args, identity = {}) {
 
 // How long a forwarded command may wait on the daemon beyond an ordinary run: a
 // `tell --wait <duration>` re-asks a busy session until that duration runs out, and
-// both the daemon's subprocess and the node's request must outlast it.
+// an `open` waits for the session it starts (OPEN_EXTRA_MS). Both the daemon's
+// subprocess and the node's request must outlast it.
 //
 // At most a day. A waiting tell does not hold a daemon restart, so its started
 // journal entry is all that stops a resend running it twice, and entries are pruned
@@ -223,10 +253,26 @@ function argumentRefusal(command, args, identity = {}) {
 // also fires at once.
 const MAX_FORWARDED_WAIT_MS = 24 * 3600e3;
 const WAIT_CAP_REFUSAL = '--wait on a forwarded tell is at most 24h';
-const TELL_SESSION_REFUSAL = "a node's tell names the session it is from; run it inside an agent session";
+
+// What an `open` may spend past the ordinary bound. Its /api/open call has no client
+// timeout: the daemon spawns the pane (on another node, over that node's host),
+// waits up to 45 s for the agent's empty prompt (serve.js AGENT_PROMPT_TIMEOUT_MS,
+// longer by a confirming read when a dialog shows), up to 15 s more for the session
+// to name itself, and then types the opening message under the injection lock, which
+// may be busy with another delivery. Two minutes covers that with room to spare; a
+// run past it is killed and the node told so, as any other timed-out command is.
+const OPEN_EXTRA_MS = 120e3;
 
 function forwardedWaitMs(command, args) {
+  if (command === 'open') return OPEN_EXTRA_MS;
   return Math.min(requestedWaitMs(command, args), MAX_FORWARDED_WAIT_MS);
+}
+
+// A tell that re-asks a busy session: all it does for most of its run is post to
+// the daemon's /api/tell, so it neither holds a daemon restart nor keeps the node's
+// other commands waiting (registry-route handle).
+function isWaitingTell(command, args) {
+  return command === 'tell' && requestedWaitMs(command, args) > 0;
 }
 
 // What a node can refuse before it posts, from the arguments alone: a file named on
@@ -268,4 +314,4 @@ function requestedWaitMs(command, args) {
   try { return require('./wait.js').parseDuration(wait); } catch { return 0; }
 }
 
-module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, NODE_FILE_FLAGS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, forwardedWaitMs, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

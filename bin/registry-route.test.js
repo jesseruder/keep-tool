@@ -9,7 +9,7 @@ const { spawnSync } = require('node:child_process');
 
 const { routes, matchRoute, routeDenial } = require('./serve/routes.js');
 const { createRegistryService } = require('./registry-route.js');
-const { REGISTRY_COMMANDS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, argumentRefusal, forwardedWaitMs, nodeSideRefusal } = require('./registry-commands.js');
+const { REGISTRY_COMMANDS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, argumentRefusal, forwardedWaitMs, nodeSideRefusal } = require('./registry-commands.js');
 const ME = { session: 'sess-aws1', node: 'aws1' };
 
 const AWS1 = { class: 'node', node: 'aws1' };
@@ -95,7 +95,7 @@ test('the registry route exists only where the daemon listens for nodes', async 
 
 test('only the listed registry commands run, and never a command-bearing flag', async (t) => {
   const { svc, root, calls } = service(t);
-  for (const command of ['open', 'handoff', 'land', 'artifact', 'serve', 'restart-daemon', 'probe', 'sync', '', null, 'show; rm -rf /']) {
+  for (const command of ['handoff', 'land', 'artifact', 'serve', 'restart-daemon', 'probe', 'sync', '', null, 'show; rm -rf /']) {
     const answer = await svc.handle(AWS1, body(root, { command }));
     assert.equal(answer.status, 400, String(command));
   }
@@ -310,6 +310,94 @@ test('two waiting tells from one node run at once, a check-in is not held behind
   const answers = await Promise.all([first, second, resend]);
   assert.deepEqual(answers.map((answer) => [answer.status, answer.body.replayed]), [[200, false], [200, false], [200, true]]);
   assert.equal(calls.length, 3, 'the resend ran nothing');
+});
+
+// A session on a node that plans work opens sessions for it: the daemon's open runs
+// under the node's session, which the card is handed over from.
+test('a node\'s keep open runs under its own session, may name any node, and a message file it names on the node is refused', async (t) => {
+  assert.ok(REGISTRY_COMMANDS.includes('open'));
+  assert.equal(argumentRefusal('open', ['card', '--fresh', '-m', 'hi', '--node', 'main'], ME), null, 'the daemon node');
+  assert.equal(argumentRefusal('open', ['card', '--fresh', '--node=other', '-m', 'line one\nline two'], ME), null, 'a third node');
+  assert.equal(argumentRefusal('open', ['card', '--node', 'aws1', '--fresh', '--agent', 'codex'], ME), null, 'its own node');
+  assert.match(argumentRefusal('open', ['card', '--node', 'main\nx'], ME), /only the -m message/, 'the node is still judged as a value');
+  assert.match(argumentRefusal('open', ['card', '--session', 'other'], ME), /caller's own session/, 'open takes no --session, so the rule stands');
+  const refusal = '--message-file names a file on this node; use -m, or run it from the daemon node';
+  assert.equal(argumentRefusal('open', ['card', '--fresh', '--message-file', 'x'], ME), refusal);
+  assert.equal(argumentRefusal('open', ['card', '--message-file=x'], ME), refusal);
+  assert.equal(argumentRefusal('open', ['card', '-m', '--message-file'], ME), null, 'a message that reads like the flag is still the message');
+  assert.equal(nodeSideRefusal('open', ['card', '--fresh', '--message-file', 'x']), refusal);
+  assert.equal(nodeSideRefusal('open', ['card', '--fresh', '-m', 'hi', '--node', 'main']), null);
+
+  const { svc, root, calls } = service(t);
+  const opened = await svc.handle(AWS1, body(root, { command: 'open', args: ['card', '--fresh', '-m', 'hi', '--node', 'main'], idempotencyKey: `${KEY}-open` }));
+  assert.equal(opened.status, 200, JSON.stringify(opened.body));
+  assert.deepEqual(calls[0].args.slice(1), ['open', 'card', '--fresh', '-m', 'hi', '--node', 'main']);
+  assert.equal(calls[0].options.env.CLAUDE_CODE_SESSION_ID, 'sess-aws1', 'the daemon\'s open names the node\'s session as the requester');
+  const file = await svc.handle(AWS1, body(root, { command: 'open', args: ['card', '--message-file', 'x'], idempotencyKey: `${KEY}-file` }));
+  assert.deepEqual(file, { status: 400, body: { error: refusal } });
+  assert.equal(calls.length, 1);
+});
+
+test('a node\'s open must come from a session; --node is still the caller\'s own everywhere but open', async (t) => {
+  const anonymous = "a node's open names the session it is from; run it inside an agent session";
+  assert.equal(argumentRefusal('open', ['card', '--fresh']), anonymous);
+  assert.equal(argumentRefusal('open', ['card', '--fresh'], { node: 'aws1' }), anonymous);
+  const { svc, root, calls } = service(t);
+  const bare = await svc.handle(AWS1, body(root, { command: 'open', args: ['card', '--fresh'], session: null, agent: null, idempotencyKey: `${KEY}-bare` }));
+  assert.deepEqual(bare, { status: 400, body: { error: anonymous } });
+  for (const command of ['link', 'decide', 'checkin', 'tell']) {
+    assert.match(String(argumentRefusal(command, ['card', '--node', 'main', '-m', 'hi'], ME)), /caller's own node/, command);
+  }
+  const linked = await svc.handle(AWS1, body(root, { command: 'link', args: ['card', '--node', 'main'], idempotencyKey: `${KEY}-link` }));
+  assert.equal(linked.status, 400);
+  assert.match(linked.body.error, /caller's own node/);
+  assert.equal(calls.length, 0);
+});
+
+test('a forwarded open runs past the ordinary bound, beside the node\'s other commands, and holds a restart', async (t) => {
+  assert.equal(OPEN_EXTRA_MS, 120e3);
+  assert.equal(forwardedWaitMs('open', ['card', '--fresh', '-m', 'hi']), OPEN_EXTRA_MS);
+  assert.equal(forwardedWaitMs('open', ['card', '--wait', '5m']), OPEN_EXTRA_MS, 'open takes no --wait of its own');
+  assert.equal(forwardedWaitMs('show', ['card']), 0);
+  const fake = fakeSpawn((call) => (call.args[1] === 'open' ? 'hang' : { code: 0, stdout: 'checked in\n' }));
+  const original = fake.spawn;
+  const opens = [];
+  fake.spawn = (...args) => {
+    const child = original(...args);
+    if (args[1][1] === 'open') opens.push({ child, options: args[2] });
+    return child;
+  };
+  const { svc, root, calls } = service(t, { fake });
+  const open = (suffix) => body(root, { command: 'open', args: ['card', '--fresh', '-m', suffix], idempotencyKey: `${KEY}-${suffix}` });
+  const first = svc.handle(AWS1, open('one'));
+  const second = svc.handle(AWS1, open('two'));
+  for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(opens.length, 2, 'two opens from one node start without waiting on each other');
+  assert.equal(svc.busy(), true, 'a restart waits for an open');
+  const checkin = await svc.handle(AWS1, body(root, { command: 'checkin', args: ['card', '-m', 'state'], idempotencyKey: `${KEY}-checkin` }));
+  assert.equal(checkin.body.stdout, 'checked in\n', 'a check-in is not held behind an open');
+  for (const { child } of opens) child.emit('close', 0, null);
+  const answers = await Promise.all([first, second]);
+  assert.deepEqual(answers.map((answer) => answer.status), [200, 200]);
+  assert.equal(svc.busy(), false);
+  assert.equal(calls.length, 3);
+});
+
+test('a forwarded open is killed only after its longer bound', async (t) => {
+  const fake = fakeSpawn(() => 'hang');
+  const original = fake.spawn;
+  fake.spawn = (...args) => {
+    const child = original(...args);
+    const timer = setTimeout(() => child.emit('close', 0, null), 100);
+    child.once('close', () => clearTimeout(timer));
+    return child;
+  };
+  // 20 ms is the ordinary bound; an open has OPEN_EXTRA_MS on top of it.
+  const { svc, root } = service(t, { fake, timeoutMs: 20 });
+  const show = await svc.handle(AWS1, body(root, { idempotencyKey: `${KEY}-show` }));
+  assert.equal(show.status, 504);
+  const opened = await svc.handle(AWS1, body(root, { command: 'open', args: ['card', '--fresh'], idempotencyKey: `${KEY}-open` }));
+  assert.equal(opened.status, 200, JSON.stringify(opened.body));
 });
 
 test('a project named relative to the node\'s directory is refused; absolute, ~ and bare names are not', () => {

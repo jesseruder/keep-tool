@@ -157,8 +157,8 @@ function parsed(response) {
 }
 
 // How long one post of a forwarded command may take: the ordinary bound, plus what
-// the daemon's run may spend waiting (a `tell --wait` re-asking a busy session),
-// so the node does not give up on a run the daemon is still honouring.
+// the daemon's run may spend waiting (a `tell --wait` re-asking a busy session, an
+// `open` waiting for the session it starts), so the node does not give up on a run the daemon is still honouring.
 function requestTimeoutMs(command, args) {
   return REQUEST_TIMEOUT_MS + require('./registry-commands.js').forwardedWaitMs(command, args);
 }

@@ -1613,6 +1613,15 @@ request by its duration, and the waiting run neither holds up the node's other c
 nor a restart. A forwarded `--wait` is at most 24 hours, well inside the week the
 daemon keeps the journal entry that stops a resend running it twice.
 
+`keep open` is forwarded the same way, so a session on a node can start or resume
+sessions for the work it plans. It too runs under the node session's identity (the
+opener a card is handed over from) and is refused without one, and `--message-file` is
+refused in favour of `-m`. `--node` names where to open the session, any node the
+daemon knows, not the caller's own. The daemon picks the account and model as for an
+open typed on its own node. A forwarded open may run two minutes past the ordinary
+bound while it waits for the new session's prompt; it runs beside the node's other
+commands and holds a restart like any other.
+
 A ledger at `.keep/tell.json` allows six tells per sender-recipient pair per rolling
 hour and twenty into any one session per hour; Owner's shell is exempt from the pair
 cap but not the per-recipient one. The slot is reserved under the registry lock before
