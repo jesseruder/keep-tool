@@ -226,8 +226,14 @@ async function readProcRollouts(wanted, deps = {}) {
       if (error && error.code === 'ENOENT') return [];
       throw new Error(`cannot read the open files of ${pid}: ${error && error.message || error}`);
     }
+    // A process with more descriptors than this read will walk is not proven to hold
+    // nothing: the rollout could sit on the descriptor the walk would have skipped.
+    // The whole read fails, as lsof failing does, and the caller retries or refuses.
+    if (names.length > PROC_FDS_MAX) {
+      throw new Error(`cannot read the open files of ${pid}: more than ${PROC_FDS_MAX} descriptors; nothing is proven`);
+    }
     const files = [];
-    for (const name of names.slice(0, PROC_FDS_MAX)) {
+    for (const name of names) {
       if (!/^\d+$/.test(String(name))) continue;
       reader.check('the open files');
       let target;

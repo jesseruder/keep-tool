@@ -264,6 +264,12 @@ test('a Linux node without lsof reads the open rollouts from /proc, only for the
   ], 'one rollout per open file, a deleted one and a non-rollout left out, a pid that is gone holding nothing, and never pid 99');
   await assert.rejects(table.readOpenRollouts([21, 24], { platform: 'linux', hasLsof: () => false, fs: procFs(links, { unreadable: [24] }) }),
     /cannot read the open files of 24/, 'a read that fails is a failure, never an empty answer');
+  // A process holding more descriptors than the walk covers is not proven to hold
+  // nothing: the rollout could sit past the cap, so the read fails rather than
+  // answering from the part it walked.
+  const crowded = { 25: Object.fromEntries(Array.from({ length: 4097 }, (_, i) => [i, i === 4096 ? ROLLOUT(ID_B) : 'pipe:[9]'])) };
+  await assert.rejects(table.readOpenRollouts([25], { platform: 'linux', hasLsof: () => false, fs: procFs(crowded) }),
+    /cannot read the open files of 25: more than 4096 descriptors/, 'past the descriptor cap nothing is proven');
   // lsof is preferred wherever it is installed.
   const calls = [];
   await table.readOpenRollouts([21], { platform: 'linux', hasLsof: () => true, fs: procFs(links),
