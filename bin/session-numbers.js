@@ -59,6 +59,9 @@ function read(options = {}) {
 
 function write(registry, options = {}) {
   const root = options.root;
+  // The file a bare test run once replaced: refuse it here too, for a caller that
+  // never booted through config.apply.
+  require('./config').refuseLiveRegistryUnderTest({ ...process.env, KEEP_DIR: root });
   const dir = directory(root);
   const file = registryFile(root);
   const tmp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;

@@ -204,4 +204,4 @@ function apply(env = process.env) {
   return value;
 }
 
-module.exports = { configFile, load, update, apply, nodeConfig, placementConfig, nodeNames, daemonNode, NODE_NAME_RE };
+module.exports = { configFile, load, update, apply, refuseLiveRegistryUnderTest, nodeConfig, placementConfig, nodeNames, daemonNode, NODE_NAME_RE };

@@ -60,15 +60,19 @@ const hashHue = (value) => {
 };
 
 // A main checkout named `repo` among the daemon's resolved projects and the directories
-// sessions and panes run in: an absolute path outside ~/wt whose last segment is `repo`.
-function seenCheckout(repo) {
+// sessions and panes run in: an absolute path in the worktree's own home, outside ~/wt,
+// whose last segment is `repo`. Two different such checkouts are no answer: guessing
+// between them could open a session in the wrong repository.
+function seenCheckout(repo, home) {
+  if (!home) return null;
   const candidates = [
     ...Object.values(projectChoices).map((choice) => choice?.path),
     ...(data.sessions || []).map((session) => session.project),
     ...(data.panes || []).map((pane) => pane.meta?.project || pane.cwd),
-  ];
-  return candidates.map((value) => String(value || '').replace(/\/$/, ''))
-    .find((value) => value.startsWith('/') && !/^\/(?:Users|home)\/[^/]+\/wt\//.test(value) && value.split('/').pop() === repo) || null;
+  ].map((value) => String(value || '').replace(/\/$/, ''))
+    .filter((value) => value.startsWith(home) && !value.startsWith(`${home}wt/`) && value.split('/').pop() === repo);
+  const found = [...new Set(candidates)];
+  return found.length === 1 ? found[0] : null;
 }
 
 function projectOf(projectPath = '') {
@@ -81,14 +85,15 @@ function projectOf(projectPath = '') {
   if (worktree && !choice) key = Object.keys({ ...PROJECTS, ...data.projectCatalog }).find((candidate) => candidate.split('/').pop() === worktree[1]) || worktree[1];
   const known = data.projectCatalog?.[key] || (Object.hasOwn(PROJECTS, key) ? PROJECTS[key] : null);
   const name = known?.name || relative.split('/').filter(Boolean).pop() || 'Unknown';
-  const settings = data.scopes || globalThis.KeepScopeRules.defaults;
-  const scope = globalThis.KeepScopeRules.scopeForProject(choice ? canonical : (worktree && known ? '~/' + key : clean), settings, settings.home) || settings.default;
   // The checkout a new session opens in: a worktree's own repo, never the worktree.
   const home = clean.match(/^\/(?:Users|home)\/[^/]+\//)?.[0];
   // Without the daemon's answer only a catalog key names the repo's own directory, or a
   // checkout of the same repo the console has already seen: the daemon cannot resolve a
   // worktree that exists only on another node.
-  const root = !worktree ? canonical : choice?.path || (known ? (home ? home + key : `~/${key}`) : seenCheckout(worktree[1]) || clean);
+  const seen = worktree && !choice && !known ? seenCheckout(worktree[1], home) : null;
+  const root = !worktree ? canonical : choice?.path || (known ? (home ? home + key : `~/${key}`) : seen || clean);
+  const settings = data.scopes || globalThis.KeepScopeRules.defaults;
+  const scope = globalThis.KeepScopeRules.scopeForProject(choice ? canonical : (worktree && known ? '~/' + key : seen || clean), settings, settings.home) || settings.default;
   return { key, path: clean, root, name, scope, h: known?.h ?? choice?.h ?? hashHue(canonical), icon: known?.icon || choice?.icon, wt: worktree?.[2] || null };
 }
 
@@ -654,10 +659,11 @@ async function startChosenSession(cwd, name, selection, requestId) {
   await reload();
   // A pane on another node can miss the first listing after the open (that node's list
   // has a short budget while it is busy starting the agent), and a pane the console
-  // never lists is never focused. Give it a few more listings.
-  for (let attempt = 0; attempt < 12 && result.pane && !paneMap().get(result.pane)?.alive; attempt += 1) {
+  // never lists is never focused. Give it more listings for five seconds at most.
+  const deadline = Date.now() + 5000;
+  while (result.pane && !paneMap().get(result.pane)?.alive && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 400));
-    await reload();
+    await Promise.race([reload(), new Promise((resolve) => setTimeout(resolve, Math.max(0, deadline - Date.now())))]);
   }
   // A fresh Codex on another node with no opening message has no session id until
   // its first turn: started, not failed.
