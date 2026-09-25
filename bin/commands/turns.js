@@ -4,7 +4,7 @@
 'use strict';
 
 const {
-  relativeDurationMs, parseWhen, die, loadTaskAnywhere, parseArgs, canonicalProjectPath,
+  relativeDurationMs, parseWhen, die, loadTaskAnywhere, parseArgs, canonicalProjectPath, getKeepApi,
 } = require('../keep-core.js');
 const path = require('path');
 
@@ -101,11 +101,25 @@ function turnsShow(argv) {
   }
 }
 
+// The console's own name for each session, by id: a name Owner typed, else the AI
+// title, as the console shows it. The turn index stores none, so this asks the
+// daemon's console projection; with no daemon answering, rows keep what the
+// index has and search still works.
+async function consoleSessions(deps = {}) {
+  try {
+    const response = await (deps.getKeepApi || getKeepApi)('/api/state?console=1', 3000);
+    if (response.status !== 200) return new Map();
+    const sessions = JSON.parse(response.data)?.sessions;
+    return new Map((Array.isArray(sessions) ? sessions : []).filter((session) => session?.id)
+      .map((session) => [session.id, { title: session.title || '', num: session.num, state: session.state || '' }]));
+  } catch { return new Map(); }
+}
+
 // One row per session, newest match first, with the session's number and title so
 // an agent can name it (#12) or open it. By default it reads only what people typed
 // and the agents' prose in interactive sessions; --all adds tool calls and output,
 // headless runs and subagents, for an error message or a command.
-function turnsSearch(argv) {
+async function turnsSearch(argv, deps = {}) {
   const turnIndex = require('../turn-index.js');
   const { searchDatabase, ftsMatch, OPEN, CLOSE } = require('../session-text-search.js');
   const numbers = require('../session-numbers.js');
@@ -119,14 +133,21 @@ function turnsSearch(argv) {
     project: o.project ? turnIndex.normalizeProject(canonicalProjectPath(o.project)) : null,
     agent: o.agent || null,
     sessionLimit: Math.min(turnsIndexNumber(o.limit, '--limit') || 20, 200),
-  }).map((hit) => ({ ...hit, num: numbers.numberFor(hit.sessionId),
-    snippet: hit.snippet.split(OPEN).join('[').split(CLOSE).join(']') }));
+  });
+  const known = hits.length ? await consoleSessions(deps) : new Map();
+  for (const hit of hits) {
+    const listed = known.get(hit.sessionId);
+    hit.num = listed?.num ?? numbers.numberFor(hit.sessionId);
+    hit.title = listed?.title || hit.title;
+    if (listed?.state) hit.state = listed.state;
+    hit.snippet = hit.snippet.split(OPEN).join('[').split(CLOSE).join(']');
+  }
   if (o.json) return console.log(JSON.stringify(hits, null, 2));
   if (!hits.length) return console.log('no matches');
   // `user` rows also carry Keep's own messages, hook prompts and slash commands.
   const said = (hit) => (hit.kind === 'human' ? 'you' : hit.role === 'user' ? `${hit.kind || 'user'}` : hit.role === 'tool' ? 'tool' : 'agent');
   for (const hit of hits) {
-    const head = [numbers.named(hit.sessionId), hit.title && turnsClip(hit.title, 80), hit.card,
+    const head = [hit.num ? `${numbers.label(hit.num)} (${hit.sessionId})` : hit.sessionId, hit.title && turnsClip(hit.title, 80), hit.state, hit.card,
       hit.project && path.basename(hit.project), turnsStamp(hit.ts), hit.hits > 1 ? `${hit.hits} matches` : ''].filter(Boolean);
     console.log(head.join('  ·  '));
     console.log(`    ${said(hit)}: ${turnsClip(hit.snippet, 200)}`);
@@ -199,4 +220,4 @@ commands.turns = (argv) => {
   return sub(argv.slice(1));
 };
 
-module.exports = { commands, indexTurns, turnsSince, turnsClip, turnsStamp, turnsIndexNumber };
+module.exports = { commands, consoleSessions, turnsSearch, indexTurns, turnsSince, turnsClip, turnsStamp, turnsIndexNumber };
