@@ -14196,7 +14196,7 @@ function nodeHandoffDeps(node, deps = {}) {
     compatible: (source, target, cwd, resumeSpec) => ask(`whether ${target.id} matches ${source.id}`, async () => {
       const answer = await ends(source).compatible(target, source.agent === 'codex'
         ? { provider: String(resumeSpec && resumeSpec.provider || '') } : { cwd });
-      return { ok: Boolean(answer && answer.ok === true), reasons: Array.isArray(answer && answer.reasons) ? answer.reasons : [], mcpConfig: null };
+      return { ok: Boolean(answer && answer.compatible === true), reasons: Array.isArray(answer && answer.reasons) ? answer.reasons : [], mcpConfig: null };
     }),
     resumeSpec: (sessionId, plan, source) => {
       const root = plan && Array.isArray(plan.artifacts) && plan.artifacts.find((entry) => entry.sessionId === sessionId);

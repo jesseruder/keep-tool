@@ -74,6 +74,21 @@ const TRANSCRIPT_VERSION = 4;
 const ARTIFACTS_VERSION = 3;
 const STATS_VERSION = 1;
 const INVENTORY_VERSION = 1;
+
+// A reply frame is the request's answer spread beside the frame's own `ok` and `id`
+// (and `ev`, which marks an event). An answer carrying one of those would rewrite the
+// frame: a verb whose result had an `ok: false` field once read on the daemon as a
+// failed request with no error text. Such an answer is a bug in the verb, and is
+// reported as one rather than sent.
+const RESERVED_FRAME_KEYS = Object.freeze(['ok', 'id', 'ev']);
+function replyFrame(id, result) {
+  if (result && typeof result === 'object') {
+    for (const key of RESERVED_FRAME_KEYS) {
+      if (Object.hasOwn(result, key)) throw new Error(`a host answer may not carry "${key}"; the verb's result names a field the reply frame owns`);
+    }
+  }
+  return { ok: true, id, ...result };
+}
 const HELLO_FAILURE_LIMIT = 10;
 const HELLO_FAILURE_WINDOW_MS = 60e3;
 const HELLO_FAILURE_ADDRESSES = 256;
@@ -1850,7 +1865,11 @@ function createHost(options = {}) {
     transcriptsInFlight += 1;
     Promise.resolve()
       .then(() => require('./node-transcript.js').handle(request, { env, closed: () => socket.destroyed }))
-      .then((result) => respond({ ok: true, id: request.id, ...result }), (error) => {
+      .then((result) => {
+        let frame;
+        try { frame = replyFrame(request.id, result); } catch (error) { frame = { ok: false, id: request.id, error: error.message }; }
+        respond(frame);
+      }, (error) => {
         const response = { ok: false, id: request.id, error: error.message };
         if (error && error.code) response.code = String(error.code);
         respond(response);
@@ -1942,7 +1961,7 @@ function createHost(options = {}) {
         let after;
         try {
           const handled = await handleRequest(connection, request);
-          response = { ok: true, id: request.id, ...handled.result };
+          response = replyFrame(request.id, handled.result);
           after = handled.after;
         } catch (error) {
           response = { ok: false, id: request && request.id, error: error.message };
@@ -2366,6 +2385,7 @@ module.exports = {
   HOST_ONLY_MODULES,
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
+  replyFrame,
   STATS_VERSION,
   INVENTORY_VERSION,
   canonicalIp,

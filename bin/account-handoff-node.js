@@ -122,8 +122,11 @@ function compatible(params, options = {}) {
     const cwd = absolutePath(params.cwd, 'compatibility cwd');
     result = (options.accountSetup || require('./account-setup.js')).compatible(source, target, cwd);
   }
+  // Not `ok`: the host spreads an answer into its reply frame, whose own `ok` says
+  // whether the request succeeded, and a false one there reads as a failed request
+  // with no error text on the daemon (found the first time a real pair was compared).
   return {
-    ok: Boolean(result && result.ok === true),
+    compatible: Boolean(result && result.ok === true),
     reasons: (Array.isArray(result && result.reasons) ? result.reasons : []).slice(0, 20).map(short),
   };
 }

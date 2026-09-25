@@ -540,3 +540,30 @@ test('a machine with more processes than the ownership check reads is never take
   const message = `Source exit could not be verified: the session's processes could not be read (aws1 runs 16390 processes, more than the 16384 an ownership check reads)`;
   assert.equal(handoff.classifyRefusal(message), 'transient');
 });
+
+test('no answer of a transfer op names a field the host reply frame owns, and compatible says so by name', async (t) => {
+  const f = fleet(t);
+  const accountSetup = { ...require('./account-setup'), compatible: () => ({ ok: false, reasons: ['portable Claude settings differ'] }) };
+  const options = { env: f.env, accounts: () => f.list, accountSetup,
+    claudeAuth: async (account) => ({ loggedIn: true, configDirectory: account.configDir }), codexAuth: async () => true };
+  const one = { id: 'one', configDir: f.node.one };
+  const two = { id: 'two', configDir: f.node.two };
+  // The host spreads an answer into `{ ok: true, id, ...answer }`: an `ok: false` in it
+  // once turned a real comparison into "host request failed" with no text.
+  const compared = await nodeOps.handle({ op: 'compatible', kind: 'claude', account: one, target: two, cwd: f.project }, options);
+  assert.deepEqual(compared, { compatible: false, reasons: ['portable Claude settings differ'] });
+  const answers = [
+    compared,
+    await nodeOps.handle({ op: 'auth', kind: 'claude', account: one }, options),
+    await nodeOps.handle({ op: 'shared-setup', account: one, cwd: f.project }, options),
+    await nodeOps.handle({ op: 'project-trust', account: two, path: f.project }, options),
+  ];
+  for (const answer of answers) {
+    for (const key of ['ok', 'id', 'ev']) assert.equal(Object.hasOwn(answer, key), false, `${JSON.stringify(answer)} must not carry ${key}`);
+  }
+  const host = require('./host.js');
+  assert.deepEqual(host.replyFrame(7, compared), { ok: true, id: 7, compatible: false, reasons: ['portable Claude settings differ'] });
+  assert.throws(() => host.replyFrame(7, { ok: false, reasons: [] }), /a host answer may not carry "ok"/);
+  assert.throws(() => host.replyFrame(7, { id: 'x' }), /may not carry "id"/);
+  assert.deepEqual(host.replyFrame(8, undefined), { ok: true, id: 8 });
+});
