@@ -7,8 +7,9 @@
 // up, so a flag on a command line proves nothing: this starts Edge with the flags the
 // headless-edge wrapper uses with --gpu, on a scratch profile (the wrapper's own Edge holds
 // its profile's lock), loads a page that reads WEBGL_debug_renderer_info, and prints what
-// came back. Exit 0 for a hardware renderer, 1 for a software one or no WebGL at all, 2 for
-// a probe that could not run. --without-gpu-flags shows what Edge picks on its own.
+// came back. Exit 0 for a hardware renderer, 1 for a software one, a masked one or no WebGL
+// at all, 2 for a probe that could not run (Edge missing, timed out, or dead before the
+// page). --without-gpu-flags shows what Edge picks on its own.
 
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -23,7 +24,7 @@ const gl = document.createElement("canvas").getContext("webgl");
 let r = "none";
 if (gl) {
   const info = gl.getExtension("WEBGL_debug_renderer_info");
-  r = info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  r = info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : "masked: " + gl.getParameter(gl.RENDERER);
 }
 document.body.textContent = "WEBGL_RENDERER=" + r + "=END";
 </script></body></html>`;
@@ -52,10 +53,14 @@ export function parseRenderer(dom) {
   return match ? match[1] : null;
 }
 
-/** `{ ok, renderer }`: ok only for a WebGL context on something other than a CPU renderer. */
+/**
+ * `{ ok, renderer }`: ok only for a WebGL context on something other than a CPU renderer. A
+ * masked renderer ("WebKit WebGL", when the debug extension is missing) says nothing either
+ * way, so it does not pass.
+ */
 export function judge(renderer) {
   if (renderer === null || renderer === "none") return { ok: false, renderer: renderer ?? "none" };
-  return { ok: !SOFTWARE_RENDERER.test(renderer), renderer };
+  return { ok: !SOFTWARE_RENDERER.test(renderer) && !renderer.startsWith("masked: "), renderer };
 }
 
 export function parseArgs(argv, env = process.env) {
@@ -85,13 +90,24 @@ function main(argv) {
     const result = spawnSync(options.edgePath, probeArgs(profileDir, options), {
       encoding: "utf8",
       timeout: 60_000,
-      stdio: ["ignore", "pipe", "ignore"],
+      // Edge's stderr is chatty (D-Bus complaints on a headless box); past the default 1 MB
+      // spawnSync would kill it and report ENOBUFS, which is not a GPU answer.
+      maxBuffer: 16 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
     });
     if (result.error) {
       process.stderr.write(`could not run ${options.edgePath}: ${result.error.message}\n`);
       return 2;
     }
-    const verdict = judge(parseRenderer(result.stdout ?? ""));
+    const renderer = parseRenderer(result.stdout ?? "");
+    if (renderer === null && (result.status !== 0 || result.signal)) {
+      // Edge died before the page ran: that says nothing about the GPU flags.
+      const how = result.signal ? `signal ${result.signal}` : `code ${result.status}`;
+      const tail = (result.stderr ?? "").trim().split("\n").slice(-5).join("\n");
+      process.stderr.write(`${options.edgePath} exited with ${how} before the page ran${tail ? `:\n${tail}` : ""}\n`);
+      return 2;
+    }
+    const verdict = judge(renderer);
     process.stdout.write(`${verdict.ok ? "hardware" : "SOFTWARE OR NONE"}: ${verdict.renderer}\n`);
     return verdict.ok ? 0 : 1;
   } finally {

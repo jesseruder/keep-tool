@@ -129,7 +129,7 @@ Edge itself, since there is nobody at a screen to click **Load unpacked**:
 
 On a machine with a GPU, `node bin/install.js --gpu` starts that Edge with the flags that
 put WebGL on it (ANGLE over EGL; measured with the proprietary NVIDIA driver) instead of
-`--disable-gpu`. Headless Edge falls back to SwiftShader without complaint when the GPU
+`--disable-gpu`; a later plain re-install keeps that, and `--no-gpu` turns it off. Headless Edge falls back to SwiftShader without complaint when the GPU
 path does not come up, so check the result rather than the flags:
 `node bin/webgl-probe.js` starts a scratch Edge with the same flags, prints the WebGL
 renderer it got and exits 1 if that is SwiftShader, llvmpipe or no WebGL at all

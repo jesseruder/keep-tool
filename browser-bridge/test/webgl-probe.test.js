@@ -35,6 +35,7 @@ test("a hardware renderer passes; SwiftShader, llvmpipe and no WebGL fail", () =
   assert.equal(judge("llvmpipe (LLVM 20.1.2, 256 bits)").ok, false);
   assert.deepEqual(judge("none"), { ok: false, renderer: "none" });
   assert.deepEqual(judge(null), { ok: false, renderer: "none" });
+  assert.equal(judge("masked: WebKit WebGL").ok, false);
 });
 
 test("arguments pick the Edge binary and whether the GPU flags go on", () => {

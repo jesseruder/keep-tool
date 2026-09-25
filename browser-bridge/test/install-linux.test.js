@@ -148,6 +148,16 @@ test("the Linux plan writes XDG paths, a profile manifest and two user units, an
   assert.deepEqual(JSON.parse(add.args[5]).url, `http://127.0.0.1:${DEFAULT_DAEMON_PORT}/mcp`);
 });
 
+test("a re-install keeps the GPU flags the Edge unit already had, until --no-gpu", (t) => {
+  const env = fakeHome(t);
+  const edgeContent = (plan) => plan.files.find((file) => file.path === edgeUnitPath(env)).content;
+  assert.doesNotMatch(edgeContent(buildPlan(LINUX, env)), /"--gpu"/);
+  fs.mkdirSync(path.dirname(edgeUnitPath(env)), { recursive: true });
+  fs.writeFileSync(edgeUnitPath(env), edgeContent(buildPlan({ ...LINUX, gpu: true }, env)));
+  assert.match(edgeContent(buildPlan(LINUX, env)), /"--gpu"$/m);
+  assert.doesNotMatch(edgeContent(buildPlan({ ...LINUX, gpu: false }, env)), /"--gpu"/);
+});
+
 test("XDG_CONFIG_HOME and XDG_STATE_HOME move the Linux paths", (t) => {
   const env = { ...fakeHome(t) };
   env.XDG_CONFIG_HOME = path.join(env.HOME, "cfg");
