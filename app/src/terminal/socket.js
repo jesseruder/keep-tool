@@ -269,9 +269,14 @@ function openPaneSocket(options = {}) {
   return {
     // Raw bytes for keystrokes, exactly as the console sends them; a JSON `reply`
     // frame is how the console answers the terminal's own queries, and an observer
-    // has no business doing that, so it is not offered here.
-    sendInput(bytes) {
+    // has no business doing that, so it is not offered here. The keyboard hands over
+    // strings, and a string goes out as a text frame, which the bridge reads as a
+    // control message and refuses (closing the socket); keystrokes have to be a
+    // binary frame, so they are encoded here.
+    sendInput(input) {
       if (closed) return false;
+      const bytes = inputBytes(input);
+      if (!bytes.length) return false;
       // Typing before the replay has been parsed would land the keystroke in a screen
       // the emulator has not caught up to, so it waits with the rest of the handshake.
       if (!socket || socket.readyState !== 1 || !replayDone) {
@@ -306,4 +311,26 @@ function openPaneSocket(options = {}) {
   };
 }
 
-module.exports = { openPaneSocket, classifyFrame, parseFrame, paneSocketUrl, toBytes };
+// UTF-8 bytes for a keystroke: strings are encoded (TextEncoder where the runtime has
+// it, a small encoder otherwise), byte arrays pass through.
+function utf8(text) {
+  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(text);
+  const out = [];
+  for (const char of text) {
+    let code = char.codePointAt(0);
+    if (code >= 0xd800 && code <= 0xdfff) code = 0xfffd;
+    if (code < 0x80) out.push(code);
+    else if (code < 0x800) out.push(0xc0 | (code >> 6), 0x80 | (code & 63));
+    else if (code < 0x10000) out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 63), 0x80 | (code & 63));
+    else out.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 63), 0x80 | ((code >> 6) & 63), 0x80 | (code & 63));
+  }
+  return new Uint8Array(out);
+}
+
+function inputBytes(input) {
+  if (input instanceof Uint8Array) return input;
+  if (typeof input === 'string') return utf8(input);
+  return toBytes(input);
+}
+
+module.exports = { openPaneSocket, classifyFrame, parseFrame, paneSocketUrl, toBytes, inputBytes };

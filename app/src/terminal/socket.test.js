@@ -146,7 +146,24 @@ test('input is held until the replay has been parsed, then sent as raw bytes', (
   const live = new Uint8Array([27]);
   assert.equal(handle.sendInput(live), true);
   assert.equal(ws.sent[ws.sent.length - 1], live, 'keystrokes go out as bytes, not JSON');
+
+  // What the keyboard actually hands over is a string. Sent as-is it would be a text
+  // frame, which the bridge reads as a control message and refuses.
+  assert.equal(handle.sendInput('keeptest'), true);
+  const typed = ws.sent[ws.sent.length - 1];
+  assert.ok(typed instanceof Uint8Array, 'a typed string still goes out as a binary frame');
+  assert.deepEqual(Array.from(typed), Array.from(Buffer.from('keeptest')));
+  handle.sendInput('é\x7f');
+  assert.deepEqual(Array.from(ws.sent[ws.sent.length - 1]), [0xc3, 0xa9, 0x7f], 'as UTF-8');
+  assert.equal(handle.sendInput(''), false, 'nothing is sent for an empty keystroke');
   handle.close();
+});
+
+test('input bytes: strings are UTF-8, byte arrays pass through', () => {
+  const { inputBytes } = require('./socket.js');
+  const bytes = new Uint8Array([1, 2]);
+  assert.equal(inputBytes(bytes), bytes);
+  assert.deepEqual(Array.from(inputBytes('a\u{1F600}')), [0x61, 0xf0, 0x9f, 0x98, 0x80]);
 });
 
 test('the replay is not done until the parser has caught up', () => {
