@@ -126,16 +126,11 @@ function median(values) {
 export const PREDICTED_CELL_CLASS = 'keep-predicted-cell';
 export const PREDICTED_BLANK_CLASS = 'keep-predicted-blank';
 export const PREDICTED_CURSOR_CLASS = 'keep-predicted-cursor';
-// The only bytes the predictor ever writes to xterm: hide and show the cursor
-// (DECTCEM). They change no cell and move nothing.
-const HIDE_CURSOR = '\x1b[?25l';
-const SHOW_CURSOR = '\x1b[?25h';
-
 // One per mounted terminal. `agent` names the pane's agent (only those in
 // PREDICTED_AGENTS are predicted or measured), `remote` says whether the pane
 // is on another node, `mode` reads the viewer's setting, `now` is a monotonic
 // clock, and `outputQueued` says whether any of the pane's output is still
-// waiting in xterm's write queue.
+// waiting in xterm's write queue. The predictor never writes to the terminal.
 export function createTypingPredictor({
   terminal, agent, remote, mode = getPredictTypingPreference, now = () => Date.now(),
   outputQueued = () => false,
@@ -160,40 +155,16 @@ export function createTypingPredictor({
   const overlays = new Map();
 
   // The real cursor is hidden while a guess stands, since the stand-in cursor sits
-  // after the guesses; with no guess standing its visibility is exactly what the
-  // pane last asked for. `paneShows` is that request (DECTCEM), which is what is
-  // put back; the predictor's own writes are left out of it. While `hidden`, the
-  // pane's own show (Claude Code ends every frame with one) is recorded and not
-  // performed, so the real cursor never appears beside the stand-in one, even in a
-  // frame split across chunks. A show that carries other modes with it cannot be
-  // withheld alone: xterm performs it and `reconceal` hides the cursor again as soon
-  // as its chunk has parsed. `restoreOwed` is a restore waiting for queued output
-  // to settle: until then the pane's latest request is not known.
+  // after the guesses. It is hidden by colour, never by DECTCEM: the theme's cursor
+  // colours are set to the background from the start of a chain to its end, and
+  // the theme in place before is put back exactly. A mode change written into the
+  // terminal would be queued behind pane output already waiting, and the pane's own
+  // shows and hides would race it; the colour takes effect at once and leaves the
+  // pane's cursor visibility untouched. `savedTheme` is the theme to put back, and
+  // setTheme() keeps it current when the console changes theme mid-chain.
   let hidden = false;
-  let paneShows = true;
-  let reconceal = false;
-  let restoreOwed = false;
-  let localWrite = false;
+  let savedTheme;
   const hooks = [];
-  const cursorMode = (visible) => (params) => {
-    if (localWrite || !params.includes(25)) return false;
-    paneShows = visible;
-    if (visible && hidden) {
-      if (params.length === 1) return true;
-      reconceal = true;
-    }
-    return false;
-  };
-  if (typeof terminal.parser?.registerCsiHandler === 'function') {
-    hooks.push(terminal.parser.registerCsiHandler({ prefix: '?', final: 'h' }, cursorMode(true)));
-    hooks.push(terminal.parser.registerCsiHandler({ prefix: '?', final: 'l' }, cursorMode(false)));
-  }
-  // Written in the same queue as the pane's output, so the flag brackets exactly
-  // these bytes.
-  const writeLocal = (bytes) => {
-    terminal.write('', () => { localWrite = true; });
-    terminal.write(bytes, () => { localWrite = false; });
-  };
 
   const echoMs = () => samples.length >= MIN_SAMPLES ? median(samples) : null;
   const enabled = () => {
@@ -247,7 +218,7 @@ export function createTypingPredictor({
   };
 
   const colors = () => {
-    const theme = terminal.options?.theme || {};
+    const theme = (hidden ? savedTheme : terminal.options?.theme) || {};
     let style = null;
     try { style = terminal.element ? globalThis.getComputedStyle?.(terminal.element) : null; } catch {}
     const background = theme.background || style?.backgroundColor || '#000';
@@ -276,8 +247,7 @@ export function createTypingPredictor({
   };
   const canDraw = () => typeof terminal.registerDecoration === 'function' && typeof terminal.registerMarker === 'function';
   const clearOverlays = () => {
-    for (const overlay of overlays.values()) overlay.decoration?.dispose();
-    overlays.clear();
+    dropOverlays();
     marker?.dispose();
     marker = null;
   };
@@ -286,43 +256,59 @@ export function createTypingPredictor({
     overlays.set(key, { kind, decoration });
     decoration?.onRender(paint(kind, ch));
   };
-  const conceal = () => {
-    hidden = true;
-    reconceal = false;
-    if (paneShows) writeLocal(HIDE_CURSOR);
+  const hiddenTheme = (theme) => {
+    const { background } = colors();
+    return { ...(theme || {}), cursor: background, cursorAccent: background };
   };
-  // Puts back the pane's own cursor visibility. With pane output still queued, the
-  // request that output makes is not known yet, and a show written now would parse
-  // after it, so the restore waits for the output to settle (outputParsed).
+  const conceal = () => {
+    if (hidden || !terminal.options) return;
+    savedTheme = terminal.options.theme;
+    hidden = true;
+    terminal.options.theme = hiddenTheme(savedTheme);
+  };
   const restore = () => {
     if (!hidden) return;
-    if (outputQueued()) { restoreOwed = true; return; }
     hidden = false;
-    reconceal = false;
-    restoreOwed = false;
-    if (paneShows) writeLocal(SHOW_CURSOR);
+    terminal.options.theme = savedTheme;
+    savedTheme = undefined;
+  };
+  // The console's own theme change: while the cursor is hidden it becomes the
+  // theme to put back, shown with the cursor still hidden.
+  const setTheme = (theme) => {
+    if (!hidden) { terminal.options.theme = theme; return; }
+    savedTheme = theme;
+    terminal.options.theme = hiddenTheme(theme);
+  };
+  const dropOverlays = () => {
+    for (const overlay of overlays.values()) overlay.decoration?.dispose();
+    overlays.clear();
   };
   const anchored = () => !marker || (!marker.isDisposed && marker.line === row);
 
-  // Brings the overlays and the real cursor's visibility in line with the pending
+  // Brings the overlays and the real cursor's colour in line with the pending
   // keystrokes. An overlay already in place is left alone; one that moved is
   // disposed and registered again at its new column.
   const render = () => {
     // A prompt row that moved under the chain (reflow, scrollback trimming) ends
     // it: its columns were laid out on a line that is no longer where they point.
     if (!anchored()) entries = [];
-    const { cells, cursor, veil } = layout();
-    if (cursor == null) {
+    if (!entries.length) {
       clearOverlays();
       restore();
       return;
     }
-    restoreOwed = false;
-    if (!hidden) conceal();
+    // Every chain is anchored, measured or shown, so a moved row is always seen.
     if (!marker && typeof terminal.registerMarker === 'function') {
       const buffer = terminal.buffer.active;
       marker = terminal.registerMarker(row - (buffer.baseY + buffer.cursorY)) || null;
     }
+    const { cells, cursor, veil } = layout();
+    if (cursor == null) {
+      dropOverlays();
+      restore();
+      return;
+    }
+    conceal();
     // A build without decorations (the headless one in tests) keeps the guesses,
     // the marker and the cursor handling, and draws nothing.
     if (!marker || !canDraw()) return;
@@ -386,7 +372,6 @@ export function createTypingPredictor({
   const outputParsed = (settled = true) => {
     if (!settled) {
       if (!anchored()) render();
-      else if (hidden && reconceal && !restoreOwed) conceal();
       return;
     }
     // A keystroke the agent has not answered in this long is not waiting on the
@@ -394,6 +379,9 @@ export function createTypingPredictor({
     // as a very slow echo, so it expires here as well as on the next keypress.
     const at = now();
     while (entries.length && at - entries[0].at > STALE_KEYSTROKE_MS) entries.shift();
+    // A prompt row that moved is checked before any confirmation: another line now
+    // at the chain's old index may show the expected text and would read as an echo.
+    if (!anchored()) entries = [];
     const buffer = terminal.buffer.active;
     // A full-screen view over the input box (the alternate screen) ends the chain;
     // its overlays belong to a row that is no longer shown.
@@ -425,23 +413,14 @@ export function createTypingPredictor({
         entries = [];
       }
     }
-    // Every overlay left is laid out again from where the pane's cursor now is, and
-    // a cursor the pane showed again is hidden while a guess still stands.
+    // Every overlay left is laid out again from where the pane's cursor now is.
     render();
-    if (hidden && reconceal) conceal();
   };
 
   const reset = () => {
     entries = [];
     clearOverlays();
     restore();
-    restoreOwed = false;
-    hidden = false;
-    // Follows xterm's own reset, which shows the cursor; the pane's replay sets it
-    // again as it needs.
-    paneShows = true;
-    reconceal = false;
-    localWrite = false;
   };
   // A resize can reflow the prompt row and move the pane's cursor; the chain's
   // columns no longer hold, so it ends, and the pane's redraw is waited for.
@@ -466,7 +445,7 @@ export function createTypingPredictor({
   };
 
   return {
-    keystroke, outputParsed, reset, dispose, enabled, echoMs, positions,
+    keystroke, outputParsed, reset, dispose, enabled, echoMs, positions, setTheme,
     get pending() { return entries.length; },
     // Drawn overlays on guessed cells: characters and blanked cells.
     get marked() {

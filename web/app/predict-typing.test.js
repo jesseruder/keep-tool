@@ -30,12 +30,15 @@ function stubDecorations(terminal) {
   terminal.liveDecorations = live;
   return terminal;
 }
-// Every write the predictor makes to the terminal is recorded; the pane's output in
-// these tests goes through `paneWrite`, which is not. `cursorShown` follows xterm's
-// cursor visibility (DECTCEM) from whichever side set it.
+// Every write made to the terminal other than the pane's is recorded (the predictor
+// makes none); the pane's output in these tests goes through `paneWrite`.
+// `cursorShown` follows xterm's cursor visibility (DECTCEM), which only the pane
+// sets. `theme0` is the console's theme, which the predictor must put back exactly.
 async function terminalWith(screen, { cols = 40, rows = 6, decorations = true, scrollback = 1000 } = {}) {
   const terminal = new Terminal({ cols, rows, allowProposedApi: true, scrollback });
   if (decorations) stubDecorations(terminal);
+  terminal.theme0 = { background: '#101010', foreground: '#e0e0e0', cursor: '#ffffff', cursorAccent: '#202020' };
+  terminal.options.theme = terminal.theme0;
   terminal.cursorShown = true;
   for (const [final, shown] of [['h', true], ['l', false]]) {
     terminal.parser.registerCsiHandler({ prefix: '?', final }, (params) => {
@@ -72,8 +75,15 @@ const BARE_BACKSPACE_ECHO = '\x1b[?25l\x1b[1D\x1b[?25h';
 // Backspace over a character: to the new cursor column, erase to the end of the line.
 const backspaceEcho = (col) => `\x1b[?25l\x1b[${col + 1}D\x1b[4B\r\x1b[${col}C\x1b[4A\x1b[K\r\r\n\r\n\r\n\r\n\x1b[${col}C\x1b[4A\x1b[?25h`;
 
-// The predictor never writes anything but cursor hide and show.
-const onlyCursorWrites = (terminal) => terminal.localWrites.every((data) => ['', '\x1b[?25l', '\x1b[?25h'].includes(data));
+// The real cursor is hidden by colour: the console's theme with both cursor colours
+// set to its background. Otherwise the theme is exactly the console's own object.
+const cursorHidden = (terminal) => {
+  const theme = terminal.options.theme;
+  const { background } = terminal.theme0;
+  return theme !== terminal.theme0 && theme.cursor === background && theme.cursorAccent === background
+    && theme.foreground === terminal.theme0.foreground;
+};
+const themeRestored = (terminal) => terminal.options.theme === terminal.theme0;
 
 test('only single printable characters and backspace are predictable keys', () => {
   assert.equal(predictableKey('a'), 'char');
@@ -200,7 +210,6 @@ test('on predicts everywhere, off nowhere, and auto only on a remote pane with a
 
 test('a guess is an overlay showing the character over an opaque cell, with a stand-in cursor after it', async () => {
   const terminal = await terminalWith('❯ ');
-  terminal.options.theme = { background: '#101010', foreground: '#e0e0e0', cursor: '#ffffff', cursorAccent: '#202020' };
   terminal.options.fontFamily = 'Mono Test';
   terminal.options.fontSize = 13;
   const predictor = predictorFor(terminal);
@@ -208,7 +217,8 @@ test('a guess is an overlay showing the character over an opaque cell, with a st
   await write(terminal, '');
   assert.equal(terminal.buffer.active.getLine(0).translateToString(true), '❯ ', 'nothing is written into the buffer');
   assert.equal(terminal.buffer.active.cursorX, 2, 'and the real cursor has not moved');
-  assert.equal(terminal.cursorShown, false, 'the real cursor is hidden while the guess stands');
+  assert.equal(cursorHidden(terminal), true, 'the real cursor is hidden by colour while the guess stands');
+  assert.equal(terminal.cursorShown, true, 'its visibility is the pane\'s, untouched');
   const decorations = [...terminal.liveDecorations];
   const cell = decorations.find((decoration) => decoration.classes.has(PREDICTED_CELL_CLASS));
   assert.deepEqual([cell.x, cell.width, cell.layer, cell.marker.line], [2, 1, 'top', 0]);
@@ -225,8 +235,8 @@ test('a guess is an overlay showing the character over an opaque cell, with a st
   await write(terminal, '');
   assert.equal(terminal.liveDecorations.size, 0, 'the echo confirms it and every overlay goes');
   assert.equal(predictor.pending, 0);
-  assert.equal(terminal.cursorShown, true);
-  assert.ok(onlyCursorWrites(terminal));
+  assert.equal(themeRestored(terminal), true);
+  assert.deepEqual(terminal.localWrites, [], 'the predictor wrote nothing');
 });
 
 test('typing "ab c" against Claude\'s relative-move echoes never doubles a character', async () => {
@@ -244,7 +254,7 @@ test('typing "ab c" against Claude\'s relative-move echoes never doubles a chara
     assert.equal(terminal.buffer.active.cursorX, cursorBefore);
     assert.deepEqual(predictor.positions(), { cells: [cursorBefore], blanks: [], cursor: cursorBefore + 1 });
     assert.equal(predictor.marked, 1);
-    assert.equal(terminal.cursorShown, false);
+    assert.equal(cursorHidden(terminal), true);
     clock += 100;
     await write(terminal, echo);
     predictor.outputParsed();
@@ -254,7 +264,7 @@ test('typing "ab c" against Claude\'s relative-move echoes never doubles a chara
     assert.equal(predictor.pending, 0, 'the echo confirmed the guess');
     assert.deepEqual(predictor.positions(), { cells: [], blanks: [], cursor: null });
     assert.equal(terminal.liveDecorations.size, 0);
-    assert.equal(terminal.cursorShown, true);
+    assert.equal(themeRestored(terminal), true);
   };
   await step('a', letterEcho('a', 2), '❯ a', 3);
   await step('b', letterEcho('b', 3), '❯ ab', 4);
@@ -263,7 +273,7 @@ test('typing "ab c" against Claude\'s relative-move echoes never doubles a chara
   await step(' ', SPACE_ECHO, '❯ ab', 5);
   await step('c', letterEcho('c', 5), '❯ ab c', 6);
   assert.equal(terminal.buffer.active.getLine(0).translateToString(true), '❯ ab c');
-  assert.ok(onlyCursorWrites(terminal));
+  assert.deepEqual(terminal.localWrites, [], 'the predictor wrote nothing');
   assert.equal(predictor.echoMs(), 100);
 });
 
@@ -285,12 +295,12 @@ test('guesses typed ahead of their echoes are laid out again from the pane\'s cu
   assert.equal(predictor.pending, 2);
   assert.deepEqual(predictor.positions(), { cells: [5, 6], blanks: [], cursor: 7 });
   assert.deepEqual(at(), [[5, 'c'], [6, 'd']]);
-  assert.equal(terminal.cursorShown, false, 'the pane showed its cursor at the end of the frame; it is hidden again');
+  assert.equal(cursorHidden(terminal), true, 'the pane showed its cursor at the end of the frame; it is hidden again');
   await write(terminal, letterEcho('c', 5));
   predictor.outputParsed();
   await write(terminal, '');
   assert.deepEqual(predictor.positions(), { cells: [6], blanks: [], cursor: 7 });
-  assert.equal(terminal.cursorShown, false);
+  assert.equal(cursorHidden(terminal), true);
   await write(terminal, letterEcho('d', 6));
   predictor.outputParsed();
   await write(terminal, '');
@@ -298,8 +308,8 @@ test('guesses typed ahead of their echoes are laid out again from the pane\'s cu
   assert.equal(terminal.buffer.active.cursorX, 7);
   assert.equal(predictor.pending, 0);
   assert.equal(terminal.liveDecorations.size, 0);
-  assert.equal(terminal.cursorShown, true);
-  assert.ok(onlyCursorWrites(terminal));
+  assert.equal(themeRestored(terminal), true);
+  assert.deepEqual(terminal.localWrites, [], 'the predictor wrote nothing');
 });
 
 test('a fast burst answered by one coalesced echo confirms every keystroke', async () => {
@@ -341,7 +351,7 @@ test('a bare relative move with no guess pending changes nothing', async () => {
   assert.equal(predictor.pending, 0);
   assert.equal(terminal.liveDecorations.size, 0);
   assert.deepEqual(terminal.localWrites, [], 'the predictor wrote nothing');
-  assert.equal(terminal.cursorShown, true);
+  assert.equal(themeRestored(terminal), true);
 });
 
 test('Backspace guesses blank the pane\'s characters and take back guessed ones', async () => {
@@ -385,33 +395,8 @@ test('Backspace guesses blank the pane\'s characters and take back guessed ones'
   assert.equal(predictor.pending, 0);
   assert.equal(terminal.buffer.active.getLine(0).translateToString(true), '❯ aq');
   assert.equal(terminal.liveDecorations.size, 0);
-  assert.equal(terminal.cursorShown, true);
-  assert.ok(onlyCursorWrites(terminal));
-});
-
-test('reset takes every overlay away and puts back the cursor the pane showed', async () => {
-  const terminal = await terminalWith('❯ ');
-  const predictor = predictorFor(terminal);
-  predictor.keystroke('a');
-  predictor.keystroke('b');
-  await write(terminal, '');
-  assert.equal(terminal.cursorShown, false);
-  assert.equal(terminal.liveDecorations.size, 3);
-  predictor.reset();
-  await write(terminal, '');
-  assert.equal(terminal.cursorShown, true);
-  assert.equal(terminal.liveDecorations.size, 0);
-  assert.equal(predictor.pending, 0);
-
-  // A pane that hid its own cursor keeps it hidden.
-  await write(terminal, '\x1b[?25l');
-  predictor.keystroke('c');
-  await write(terminal, '');
-  assert.deepEqual(terminal.localWrites, ['', '\x1b[?25l', '', '\x1b[?25h'], 'nothing to hide the second time');
-  predictor.reset();
-  await write(terminal, '');
-  assert.equal(terminal.cursorShown, false);
-  assert.deepEqual(terminal.localWrites, ['', '\x1b[?25l', '', '\x1b[?25h']);
+  assert.equal(themeRestored(terminal), true);
+  assert.deepEqual(terminal.localWrites, [], 'the predictor wrote nothing');
 });
 
 test('a whole-line redraw for an earlier keystroke keeps the later guess where the pane\'s cursor now is', async () => {
@@ -459,7 +444,7 @@ test('a render that is not an echo ends the chain and takes its overlays', async
   assert.equal(predictor.pending, 0);
   assert.deepEqual(predictor.positions(), { cells: [], blanks: [], cursor: null });
   assert.equal(terminal.liveDecorations.size, 0);
-  assert.equal(terminal.cursorShown, true);
+  assert.equal(themeRestored(terminal), true);
 });
 
 test('a split render is not read until its last chunk has parsed', async () => {
@@ -598,11 +583,11 @@ test('without decorations the guesses are tracked, not drawn, and the cursor is 
   assert.equal(terminal.buffer.active.getLine(0).translateToString(true), '❯ ');
   assert.deepEqual(predictor.positions(), { cells: [2], blanks: [], cursor: 3 });
   assert.equal(predictor.marked, 0);
-  assert.equal(terminal.cursorShown, false);
+  assert.equal(cursorHidden(terminal), true);
   predictor.dispose();
   await write(terminal, '');
   assert.equal(predictor.pending, 0);
-  assert.equal(terminal.cursorShown, true);
+  assert.equal(themeRestored(terminal), true);
 });
 
 test('every overlay is disposed on expiry, on a render that is not an echo, and on dispose', async () => {
@@ -639,7 +624,7 @@ test('a chain ended by Enter leaves no overlay and gives the cursor back', async
   assert.equal(predictor.pending, 0);
   assert.equal(terminal.liveDecorations.size, 0);
   assert.equal(predictor.marked, 0);
-  assert.equal(terminal.cursorShown, true);
+  assert.equal(themeRestored(terminal), true);
 });
 
 test('no guess is made or measured while pane output is still queued', async () => {
@@ -680,7 +665,7 @@ test('a resize that reflows the prompt row ends the chain, leaves no overlay and
   assert.equal(predictor.pending, 0);
   assert.equal(terminal.liveDecorations.size, 0, 'no overlay is left on the old row');
   assert.deepEqual(predictor.positions(), { cells: [], blanks: [], cursor: null });
-  assert.equal(terminal.cursorShown, true);
+  assert.equal(themeRestored(terminal), true);
   // The next keystroke starts a chain on the row the prompt is on now.
   predictor.keystroke('c');
   assert.ok([...terminal.liveDecorations].every((decoration) => decoration.marker.line === 2));
@@ -701,79 +686,7 @@ test('a prompt row trimmed out of the scrollback ends the chain even when anothe
   await write(terminal, '');
   assert.equal(predictor.pending, 0);
   assert.equal(terminal.liveDecorations.size, 0);
-  assert.equal(terminal.cursorShown, true);
-});
-
-test('the pane\'s show in the first chunk of a split frame never shows the real cursor beside the stand-in', async () => {
-  const terminal = await terminalWith('❯ ');
-  const predictor = predictorFor(terminal);
-  predictor.keystroke('a');
-  predictor.keystroke('b');
-  await write(terminal, '');
-  assert.equal(terminal.cursorShown, false);
-  // The first chunk ends with the pane's show; more of the frame is still queued.
-  await write(terminal, letterEcho('a', 2));
-  predictor.outputParsed(false);
-  assert.equal(terminal.cursorShown, false, 'the show is recorded, not performed, while a guess stands');
-  assert.equal(predictor.pending, 2, 'nothing is read before the frame settles');
-  await write(terminal, '\x1b[1;4H');
-  predictor.outputParsed(true);
-  await write(terminal, '');
-  assert.equal(predictor.pending, 1);
-  assert.equal(terminal.cursorShown, false);
-  // A show that carries another mode with it is performed, and hidden again as soon
-  // as its chunk has parsed, before the rest of the frame.
-  const writes = terminal.localWrites.length;
-  await write(terminal, '\x1b[?7;25h');
-  assert.equal(terminal.cursorShown, true);
-  predictor.outputParsed(false);
-  assert.deepEqual(terminal.localWrites.slice(writes), ['', '\x1b[?25l']);
-  await write(terminal, '');
-  assert.equal(terminal.cursorShown, false);
-  // Once the last guess is confirmed the pane's own show is put back.
-  await write(terminal, letterEcho('b', 3));
-  predictor.outputParsed(true);
-  await write(terminal, '');
-  assert.equal(predictor.pending, 0);
-  assert.equal(terminal.cursorShown, true);
-});
-
-test('a chain dropped while pane output is queued restores the cursor only as that output leaves it', async () => {
-  const terminal = await terminalWith('❯ ');
-  let queued = false;
-  const predictor = predictorFor(terminal, { outputQueued: () => queued });
-  predictor.keystroke('a');
-  await write(terminal, '');
-  assert.equal(terminal.cursorShown, false);
-  // A pane frame that hides its cursor is queued when the next key arrives.
-  queued = true;
-  const parsed = write(terminal, '\x1b[?25l\x1b[1;1H\x1b[2K❯ /');
-  assert.equal(predictor.keystroke('/'), false);
-  assert.equal(predictor.pending, 0);
-  assert.equal(terminal.liveDecorations.size, 0);
-  const writes = terminal.localWrites.length;
-  await parsed;
-  queued = false;
-  predictor.outputParsed(true);
-  await write(terminal, '');
-  assert.deepEqual(terminal.localWrites.slice(writes), [], 'no show is written after the pane\'s hide');
-  assert.equal(terminal.cursorShown, false, 'the cursor is as the pane last asked');
-
-  // The same with a pane that shows its cursor: it is shown once the output settles.
-  predictor.keystroke('x');
-  await write(terminal, '\x1b[?25h');
-  predictor.outputParsed(true);
-  await write(terminal, '');
-  assert.equal(terminal.cursorShown, false, 'the guess stands, so the pane\'s show is held');
-  queued = true;
-  const more = write(terminal, '\x1b[1;1H\x1b[2K❯ /x');
-  predictor.keystroke('\r');
-  await more;
-  assert.equal(terminal.cursorShown, false, 'nothing is shown before the output settles');
-  queued = false;
-  predictor.outputParsed(true);
-  await write(terminal, '');
-  assert.equal(terminal.cursorShown, true);
+  assert.equal(themeRestored(terminal), true);
 });
 
 test('an alternate screen over the input box ends the chain and gives the cursor back', async () => {
@@ -785,5 +698,126 @@ test('an alternate screen over the input box ends the chain and gives the cursor
   await write(terminal, '');
   assert.equal(predictor.pending, 0);
   assert.equal(terminal.liveDecorations.size, 0);
+  assert.equal(themeRestored(terminal), true);
+});
+
+test('reset and dispose put back the exact theme, and the pane\'s own cursor mode is never touched', async () => {
+  const terminal = await terminalWith('❯ ');
+  const predictor = predictorFor(terminal);
+  predictor.keystroke('a');
+  predictor.keystroke('b');
+  assert.equal(cursorHidden(terminal), true);
+  assert.equal(terminal.liveDecorations.size, 3);
+  predictor.reset();
+  assert.equal(themeRestored(terminal), true);
+  assert.equal(terminal.liveDecorations.size, 0);
+  assert.equal(predictor.pending, 0);
+
+  // A pane that hid its own cursor keeps it hidden through a chain and after it.
+  await write(terminal, '\x1b[?25l');
+  predictor.keystroke('c');
+  assert.equal(cursorHidden(terminal), true);
+  predictor.dispose();
+  await write(terminal, '');
+  assert.equal(themeRestored(terminal), true);
+  assert.equal(terminal.cursorShown, false, 'still as the pane set it');
+  assert.deepEqual(terminal.localWrites, [], 'the predictor wrote nothing');
+});
+
+test('the pane\'s cursor shows and hides pass through unchanged while a guess stands, split frames included', async () => {
+  const terminal = await terminalWith('❯ ');
+  const predictor = predictorFor(terminal);
+  predictor.keystroke('a');
+  predictor.keystroke('b');
+  // The first chunk of a frame ends with the pane's show; more is still queued.
+  await write(terminal, letterEcho('a', 2));
+  predictor.outputParsed(false);
+  assert.equal(terminal.cursorShown, true, 'xterm performed the pane\'s show');
+  assert.equal(cursorHidden(terminal), true, 'and the cursor is still invisible by colour');
+  await write(terminal, '\x1b[1;4H');
+  predictor.outputParsed(true);
+  assert.equal(predictor.pending, 1);
+  assert.equal(cursorHidden(terminal), true);
+  // A show combined with another mode needs nothing special.
+  await write(terminal, '\x1b[?25l\x1b[?7;25h');
+  predictor.outputParsed(false);
   assert.equal(terminal.cursorShown, true);
+  assert.equal(cursorHidden(terminal), true);
+  await write(terminal, letterEcho('b', 3));
+  predictor.outputParsed(true);
+  assert.equal(predictor.pending, 0);
+  assert.equal(themeRestored(terminal), true, 'the chain ended: the console\'s own theme object is back');
+  assert.deepEqual(terminal.localWrites, [], 'the predictor wrote nothing');
+});
+
+test('a chain dropped while pane output is queued leaves the cursor as that output sets it', async () => {
+  const terminal = await terminalWith('❯ ');
+  let queued = false;
+  const predictor = predictorFor(terminal, { outputQueued: () => queued });
+  predictor.keystroke('a');
+  queued = true;
+  const parsed = write(terminal, '\x1b[?25l\x1b[1;1H\x1b[2K❯ /');
+  assert.equal(predictor.keystroke('/'), false);
+  assert.equal(themeRestored(terminal), true, 'the colour comes back at once, with nothing written');
+  await parsed;
+  queued = false;
+  predictor.outputParsed(true);
+  assert.equal(terminal.cursorShown, false, 'the pane\'s hide stands');
+  assert.equal(themeRestored(terminal), true);
+  assert.deepEqual(terminal.localWrites, []);
+});
+
+test('a theme change mid-chain is kept hidden and is the theme put back', async () => {
+  const terminal = await terminalWith('❯ ');
+  const predictor = predictorFor(terminal);
+  predictor.setTheme(terminal.theme0);
+  assert.equal(themeRestored(terminal), true, 'with no guess standing the theme is applied as given');
+  predictor.keystroke('a');
+  const light = { background: '#fafafa', foreground: '#111111', cursor: '#000000', cursorAccent: '#fafafa' };
+  predictor.setTheme(light);
+  assert.notEqual(terminal.options.theme, light);
+  assert.deepEqual([terminal.options.theme.background, terminal.options.theme.cursor, terminal.options.theme.cursorAccent],
+    ['#fafafa', '#fafafa', '#fafafa']);
+  await write(terminal, letterEcho('a', 2));
+  predictor.outputParsed();
+  assert.equal(terminal.options.theme, light, 'the chain ended: the new theme object, exactly');
+});
+
+test('a theme without a background hides the cursor with the terminal element\'s computed background', async () => {
+  const terminal = await terminalWith('❯ ');
+  const bare = { foreground: '#e0e0e0' };
+  terminal.options.theme = bare;
+  const element = {};
+  Object.defineProperty(terminal, 'element', { configurable: true, get: () => element });
+  const original = globalThis.getComputedStyle;
+  globalThis.getComputedStyle = (target) => (target === element ? { backgroundColor: 'rgb(1, 2, 3)', color: 'rgb(9, 9, 9)' } : {});
+  try {
+    const predictor = predictorFor(terminal);
+    predictor.keystroke('a');
+    assert.deepEqual([terminal.options.theme.cursor, terminal.options.theme.cursorAccent], ['rgb(1, 2, 3)', 'rgb(1, 2, 3)']);
+    predictor.reset();
+    assert.equal(terminal.options.theme, bare);
+  } finally { globalThis.getComputedStyle = original; }
+});
+
+test('a scrollback trim that puts the expected text at the chain\'s old row is never timed as an echo', async () => {
+  for (const mode of ['on', 'auto']) {
+    const terminal = await terminalWith('status\r\n❯ ', { rows: 4, scrollback: 1 });
+    let clock = 0;
+    const predictor = predictorFor(terminal, { mode: () => mode, now: () => clock });
+    let typed = '';
+    for (const ch of 'abc') {
+      predictor.keystroke(ch);
+      typed += ch;
+      clock += 100;
+      await write(terminal, '\r\n'.repeat(10));
+      await write(terminal, `\x1b[1;1H❯ ${typed}`);
+      assert.equal(terminal.buffer.active.baseY + terminal.buffer.active.cursorY, 1, 'another line at the old index');
+      predictor.outputParsed();
+      assert.equal(predictor.pending, 0, mode);
+      assert.equal(terminal.liveDecorations.size, 0);
+    }
+    assert.equal(predictor.echoMs(), null, 'no sample was recorded');
+    assert.equal(themeRestored(terminal), true);
+  }
 });

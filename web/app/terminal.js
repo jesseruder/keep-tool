@@ -714,7 +714,8 @@ export function mountTerminal(container, pane, options = {}) {
     get socket() { return socket; },
     focus: () => { if (!disposed && isVisible()) terminal.focus(); },
     fit: fitNow,
-    setTheme(theme) { terminal.options.theme = theme?.mode ? xtermTheme(theme.mode, theme.palette) : theme; },
+    // Through the predictor, which keeps the cursor hidden while a guess stands.
+    setTheme(theme) { predictor.setTheme(theme?.mode ? xtermTheme(theme.mode, theme.palette) : theme); },
     setRenderer,
     show,
     hide() {

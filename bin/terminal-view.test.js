@@ -941,3 +941,24 @@ test('a reattach resets the terminal and takes every guess overlay with it', asy
     assert.equal(f.terminal.liveDecorations.size, 0);
   } finally { f.mounted.dispose(); }
 });
+
+test('a theme change while a guess stands keeps the real cursor hidden and is the theme put back', async () => {
+  const f = fixture({ storage: new Map([['keep.console.predictTyping', 'on']]), pane: { meta: { agent: 'claude' } } });
+  try {
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    hostOutput(f, '\x1b[2J\x1b[H❯ ');
+    await f.drain();
+    const dark = { background: '#101010', foreground: '#e0e0e0', cursor: '#ffffff', cursorAccent: '#101010' };
+    f.mounted.setTheme(dark);
+    assert.equal(f.terminal.options.theme, dark);
+    type(f, 'x');
+    assert.deepEqual([f.terminal.options.theme.cursor, f.terminal.options.theme.cursorAccent], ['#101010', '#101010']);
+    const light = { background: '#fafafa', foreground: '#111111', cursor: '#000000', cursorAccent: '#fafafa' };
+    f.mounted.setTheme(light);
+    assert.deepEqual([f.terminal.options.theme.background, f.terminal.options.theme.cursor], ['#fafafa', '#fafafa']);
+    hostOutput(f, letterEcho('x', 2));
+    await f.drain();
+    assert.equal(f.terminal.options.theme, light, 'the chain ended: the console\'s theme, exactly');
+  } finally { f.mounted.dispose(); }
+});
