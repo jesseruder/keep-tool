@@ -148,6 +148,22 @@ A pane socket (`/ws/pane/<id>`) additionally needs either an `Origin` whose host
 equals the request's `Host`, or no `Origin` and a valid `x-keep-token` (a native
 client). See `docs/ui-reliability.md` for the reasoning.
 
+A card's artifacts (the files `keep artifact` stored under `.keep/artifacts/<card>/`,
+from this machine or a node) show in the console: on the stage of a session with a
+card, as one "Artifacts · N" line that opens into thumbnails and is remembered per
+viewer, and in an Inbox card's notes. `GET /api/card-artifacts?card=<id>` lists them
+(name, size, time, whether an image, content type; newest first, at most 200) and
+`GET /api/card-artifact?card=<id>&name=<name>` serves one. Both take the console's own
+auth and `x-keep: 1`, and never a node token. A name must be a plain file name and
+the path it resolves to, links followed, a regular file inside `.keep/artifacts/`.
+PNG, JPEG, GIF, WebP and SVG are served inline with their image type; anything else
+as an attachment. Every response carries `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox`, so
+an SVG opened directly runs no script. The console fetches the bytes with the header
+and shows them from blob URLs rather than pointing an `<img>` at the route (a session
+cookie alone does not reach it); a thumbnail opens full size in a new tab inside a
+small page whose own policy allows only that image, and any other file is downloaded.
+
 The console detects the mobile shell as `window.keepShell`
 (`{ platform, version, post(message) }`, injected before page scripts) and sets
 `<html class="mobile">`. Console → shell messages, all through `post()`:

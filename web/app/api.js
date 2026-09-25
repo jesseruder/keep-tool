@@ -245,6 +245,29 @@ export const launchPortableTransfer = (transferId) => write('/api/transfer-sessi
 export const resolvePortableTransfer = (transferId, destinationSessionId) => write('/api/resolve-portable-transfer', { transferId, destinationSessionId }, 'POST', { label: 'Resolving transfer' });
 export const abandonAccountHandoff = (sessionId, pane, transactionId) => write('/api/abandon-account-handoff', { sessionId, pane, transactionId }, 'POST', { label: 'Abandoning handoff' });
 export const getAgentEvents = (name, limit = 20) => request(`/api/agents/${encodeURIComponent(name)}/events?limit=${encodeURIComponent(limit)}`);
+export const getCardArtifacts = (card) => request(`/api/card-artifacts?card=${encodeURIComponent(card)}`);
+// One artifact's bytes, as a Blob. Fetched with the x-keep header like every other
+// request rather than put in an <img src>: a browser session's cookie alone reaches
+// only the console's own files (ui-request-server COOKIE_OPEN_PATHS), and the header
+// is what keeps a cross-site page from reading anything else.
+export async function fetchCardArtifact(card, name) {
+  let response;
+  try {
+    response = await fetch(`/api/card-artifact?card=${encodeURIComponent(card)}&name=${encodeURIComponent(name)}`, { headers: { 'x-keep': '1' } });
+  } catch (error) {
+    if (error && typeof error === 'object') error.transient = true;
+    throw error;
+  }
+  if (!response.ok) {
+    if (response.status === 403) reportUnauthorized();
+    let message = `${response.status} ${response.statusText}`;
+    try { message = (await response.json()).error || message; } catch {}
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
+  return response.blob();
+}
 export const markAgentSeen = (name) => write(`/api/agents/${encodeURIComponent(name)}/seen`, {}, 'POST', { label: 'Marking agent seen', background: true });
 
 // Every write is registered while it is in flight, so the header can say what the

@@ -10,6 +10,7 @@
 // Dismiss.
 import { closeInboxCard } from './api.js';
 import { runAction } from './action.js';
+import { cardArtifactsHTML } from './card-artifacts.js';
 
 const EXPANDED_KEY = 'keep.console.inbox.expanded';
 let expanded = null;
@@ -64,7 +65,7 @@ export function inboxRowHTML(ctx, task) {
   return `<button type="button" class="qinbox-main" data-inbox-toggle aria-expanded="${open}"><span class="t">${ctx.esc(fm.title || task.id)}</span>`
     + `<span class="w num">${ctx.esc(ctx.rel(updatedAt(task) || NaN))}</span>`
     + `<span class="p"><span class="kind card-kind ${ctx.esc(kind)}">${ctx.esc(kind)}</span>${fm.project ? ctx.projectHTML(fm.project) : ''}</span></button>`
-    + (open ? `<div class="qinbox-detail"><div class="qinbox-id mono">${ctx.esc(task.id)}</div>${notesHTML(ctx, task)}`
+    + (open ? `<div class="qinbox-detail"><div class="qinbox-id mono">${ctx.esc(task.id)}</div>${notesHTML(ctx, task)}${cardArtifactsHTML(ctx, task)}`
       + '<div class="qinbox-acts"><button class="btn primary" data-inbox-open title="Start a session on this card">Open</button>'
       + '<button class="btn" data-inbox-action="done" title="Close the card as done">Done</button>'
       + '<button class="btn" data-inbox-action="dismiss" title="Close the card as not wanted">Dismiss</button></div></div>' : '');

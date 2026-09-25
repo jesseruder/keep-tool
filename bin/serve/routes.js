@@ -237,6 +237,29 @@ function routes(ctx) {
       },
     },
     {
+      // A card's stored artifacts, and one of them, for the console's card views
+      // (bin/card-artifacts.js holds every rule about what may be served, and how).
+      // The console's own callers only: a node token is never among a route's
+      // default classes.
+      method: 'GET',
+      path: '/api/card-artifacts',
+      handle: async ({ req, res, url }) => {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        const artifacts = require('../card-artifacts.js');
+        try { return json(res, 200, await artifacts.listArtifacts(keep.ROOT, url.searchParams.get('card'))); }
+        catch (error) { return json(res, error instanceof artifacts.ArtifactError ? error.status : 500, { error: error.message }); }
+      },
+    },
+    {
+      method: 'GET',
+      path: '/api/card-artifact',
+      handle: async ({ req, res, url }) => {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        return require('../card-artifacts.js').serveArtifact(res, keep.ROOT,
+          url.searchParams.get('card'), url.searchParams.get('name'), { json });
+      },
+    },
+    {
       method: 'GET',
       path: '/api/portable-transfer-draft',
       handle: async ({ req, res, url }) => {

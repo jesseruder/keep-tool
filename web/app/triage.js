@@ -1,3 +1,4 @@
+import { cardArtifactsHTML } from './card-artifacts.js';
 import { modelUsageHTML } from './model-usage.js';
 import * as api from './api.js';
 import { closeSession } from './close-session.js';
@@ -1021,7 +1022,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     // stage is showing an agent's work. The aside is part of the skeleton and is
     // only hidden, never added or removed, so appearing next to the terminal
     // cannot rebuild the host the terminal is mounted in.
-    ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts"><span class="quick-actions"></span>${actionsMenuHTML()}</div></div><div class="brief"></div>${replyComposerHTML(item, session?.kind || pane?.meta?.agent)}<div class="stage-body"><div class="stage-terminal"></div><aside class="stage-agent-log" hidden></aside></div>`);
+    ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts"><span class="quick-actions"></span>${actionsMenuHTML()}</div></div><div class="brief"></div><div class="stage-artifacts"></div>${replyComposerHTML(item, session?.kind || pane?.meta?.agent)}<div class="stage-body"><div class="stage-terminal"></div><aside class="stage-agent-log" hidden></aside></div>`);
     stage.dataset.itemKey = key;
     stage.dataset.pane = paneId;
     stage.dataset.focusKey = '';
@@ -1086,6 +1087,10 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   if (move) installMoveControls(menu.querySelector('.move-controls'), ctx, item.sessionId);
   if (restart) installRestartControls(menu.querySelector('.restart-controls'), ctx, item.sessionId, paneId);
   const briefChanged = ctx.patchHTML(brief, briefHTML(ctx, item, session));
+  // The card's stored files, one line until opened (card-artifacts.js). A stage from
+  // before this section existed has no box for it and simply goes without.
+  const artifactsBox = stage.querySelector('.stage-artifacts');
+  if (artifactsBox) ctx.patchHTML(artifactsBox, item.taskId && task?.id ? cardArtifactsHTML(ctx, task, { collapsible: true }) : '');
   installGrading(brief, ctx, session);
   // An agent's pane on the stage brings its log with it, in a column beside the
   // terminal. The aside is patched like the brief; the terminal host beside it is
