@@ -13716,7 +13716,9 @@ function buildState(options = {}) {
     sessions,
     attention: visibleAttention,
     setAside: setAsideState.value.items,
-    footerHealth: footerStatus,
+    // Plus what this build knew of companion jobs, since it gates the same rule.
+    footerHealth: { ...footerStatus, companion: options.companion
+      ? { known: options.companion.known ?? null, complete: options.companion.complete ?? null, discovery: options.companion.discovery ?? null } : null },
     stalled: stalledItems,
     unblocked,
     digest,
