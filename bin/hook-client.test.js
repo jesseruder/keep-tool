@@ -984,6 +984,31 @@ test('each Codex action is posted as codex-<action> for the Codex session, and t
   assert.equal(daemon.posts.at(-1).body.identity.env, undefined);
 });
 
+test('a Codex child agent\'s event goes without its rollout, and leaves the parent\'s mirror cursor alone', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.transcript, `${JSON.stringify({ type: 'session_meta', payload: { id: 'codex-aws1' } })}\n`);
+  const child = path.join(f.base, 'rollout-child.jsonl');
+  fs.writeFileSync(child, `${JSON.stringify({ type: 'session_meta', payload: { id: 'codex-child', parent_thread_id: 'codex-aws1' } })}\n{"n":2}\n`);
+  const daemon = await stubDaemon(t, () => ran('{}\n'));
+  await codexRun(f, 'lifecycle', daemon.url, codexInput(f, { hook_event_name: 'UserPromptSubmit', turn_id: 't1' }));
+  assert.equal(daemon.posts[0].body.transcript.path, f.transcript);
+  const cursorFile = path.join(f.home, '.keep-node', 'mirror', 'codex-aws1.json');
+  const cursor = fs.readFileSync(cursorFile, 'utf8');
+  const result = await codexRun(f, 'lifecycle', daemon.url, codexInput(f, { transcript_path: child, hook_event_name: 'PostToolUse', agent_id: 'codex-child', turn_id: 't2' }));
+  assert.equal(result.status, 0, result.stderr);
+  const post = daemon.posts.at(-1).body;
+  assert.equal(post.event, 'codex-lifecycle');
+  assert.equal(post.identity.sessionId, 'codex-aws1');
+  assert.equal(post.transcript ?? null, null, 'a child\'s rollout never goes up under its parent\'s id');
+  assert.equal(fs.readFileSync(cursorFile, 'utf8'), cursor);
+  // The parent's next event has nothing new to send, rather than its whole rollout again.
+  await codexRun(f, 'lifecycle', daemon.url, codexInput(f, { hook_event_name: 'Stop', turn_id: 't1' }));
+  const next = daemon.posts.at(-1).body.transcript;
+  assert.equal(next.path, f.transcript);
+  assert.equal(next.fromOffset, fs.statSync(f.transcript).size);
+  assert.equal(next.bytes, '');
+});
+
 test('a Codex answer on the node is always JSON: {} for anything else and when the daemon is not there', async (t) => {
   const f = fixture(t);
   fs.writeFileSync(f.transcript, '{"n":1}\n');

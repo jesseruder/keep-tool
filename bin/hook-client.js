@@ -197,6 +197,18 @@ function readRange(file, from, to) {
 
 // The transcript as it stands now: what an event fired against. null when there is
 // no transcript to send.
+// A Codex child agent's hooks carry its parent's session id and the child's own
+// rollout. The mirror (and this node's cursor) is the parent's alone: a child's bytes
+// under the parent's id would replace it, and the parent's next event would send its
+// whole transcript again. A rollout whose session_meta names another id is a child's.
+function childRollout(event, sessionId, transcriptPath) {
+  if (!CODEX_EVENTS.includes(event) || typeof transcriptPath !== 'string') return false;
+  let meta;
+  try { meta = require('./codex.js').readSessionMeta(transcriptPath); } catch { return false; }
+  const id = meta && (meta.id || meta.session_id);
+  return typeof id === 'string' && id !== '' && id !== sessionId;
+}
+
 function snapshotOf(transcriptPath) {
   const stat = transcriptStat(transcriptPath);
   return stat ? { generation: generationOf(stat), size: stat.size, mtimeMs: stat.mtimeMs } : null;
@@ -322,6 +334,8 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
   const request = deps.request || require('./remote-cli.js').nodeApiRequest;
   const now = deps.now || Date.now;
   const sid = identity.sessionId;
+  // A child's event goes without bytes: the daemon reads the parent's mirror for it.
+  if (snapshot && childRollout(event, sid, transcriptPath)) snapshot = null;
   const send = async (payload) => {
     const left = deadline - now();
     if (left <= 0) throw new Error('out of time');
