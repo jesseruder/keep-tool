@@ -339,9 +339,12 @@ test('a self-paced /loop wakeup is a one-shot scheduled job; a later one or stop
   const jobsNow = sync({ instance }).jobs;
   assert.equal(jobsNow.find((j) => j.id === 'wakeup_w1').status, 'cancelled', 'a new wakeup replaces the old one');
   assert.equal(jobsNow.find((j) => j.id === 'wakeup_w2').status, 'pending');
+  wake('w2b', { prompt: 'no delay given' });
+  const fallback = sync({ instance }).jobs.find((j) => j.id === 'wakeup_w2b');
+  assert.equal(fallback.expiresAt - fallback.startedAt, 3600e3, 'an unreadable delay still records the wakeup for an hour');
   wake('w3', { stop: true });
   const stopped = sync({ instance }).jobs;
-  assert.equal(stopped.find((j) => j.id === 'wakeup_w2').status, 'cancelled', 'stop ends the loop');
+  assert.equal(stopped.find((j) => j.id === 'wakeup_w2b').status, 'cancelled', 'stop ends the loop');
   assert.equal(stopped.some((j) => j.id === 'wakeup_w3'), false);
   assert.doesNotMatch(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json'), 'utf8'), /SECRET/);
 }));

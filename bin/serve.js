@@ -13543,7 +13543,9 @@ function buildState(options = {}) {
       session.footer = pane.footer;
       session.footerTrusted = footerStatus.trusted && !footerStatus.untrustedPanes.includes(pane.id);
       if (Number.isInteger(pane.agentShells)) session.agentShells = pane.agentShells;
-      if (!pane.node || pane.node === daemonNodeName()) session.companionComplete = companionComplete;
+      // Companion jobs are discovered on this machine only: a session on another
+      // node may be waiting on one nothing here can see, so it keeps its RUNNING.
+      session.companionComplete = !pane.node || pane.node === daemonNodeName() ? companionComplete : false;
     }
   }
   // What the classifier reads off the card: whether this session is its latest linked

@@ -65,9 +65,12 @@ test('a running agent the ledger is sure of must show in the footer: one pane di
   const status = health.observe(tracker, one, now + P);
   assert.equal(status.trusted, true, 'one stale ledger entry is not a format change');
   assert.deepEqual(status.untrustedPanes, ['p1']);
-  const two = [{ pane: 'p1', footer: idle, agentShells: 0, ledger: ledger(now - 5 * 60e3) }, { pane: 'p2', footer: idle, agentShells: 0, ledger: ledger(now - 5 * 60e3) }];
-  health.observe(tracker, two, now + P + 1);
-  const broken = health.observe(tracker, two, now + 2 * P + 1);
+  // A second pane disagreeing within the hour, after the first has cleared, breaks it.
+  const clear = [{ pane: 'p1', footer: idle, agentShells: 0 }, { pane: 'p2', footer: idle, agentShells: 0 }];
+  health.observe(tracker, clear, now + P + 1);
+  const second = [{ pane: 'p1', footer: idle, agentShells: 0 }, { pane: 'p2', footer: idle, agentShells: 0, ledger: ledger(now + 20 * 60e3 - 5 * 60e3) }];
+  health.observe(tracker, second, now + 20 * 60e3);
+  const broken = health.observe(tracker, second, now + 20 * 60e3 + P);
   assert.equal(broken.trusted, false);
   assert.equal(broken.problems.length, 2);
 });

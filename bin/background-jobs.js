@@ -356,11 +356,12 @@ function consume(state, row, agent, classify, instance) {
         for (const job of Object.values(state.jobs)) {
           if (job.kind === 'scheduled' && job.status === 'pending' && String(job.id).startsWith('wakeup_')) finish(job.id, 'cancelled');
         }
-        if (!call.wakeupStop && call.wakeupDelayMs > 0) {
+        if (!call.wakeupStop) {
           const id = `wakeup_${item.tool_use_id}`;
           start(id, 'scheduled', item.tool_use_id);
           const job = state.jobs[`job:${id}`];
-          if (job && job.status === 'pending') { job.expiresAt = at + call.wakeupDelayMs; job.recurring = false; }
+          // An unreadable delay still records the wakeup, with an hour's lifetime.
+          if (job && job.status === 'pending') { job.expiresAt = at + (call.wakeupDelayMs > 0 ? call.wakeupDelayMs : 3600e3); job.recurring = false; }
         }
       }
       let id = value.match(/^Command running in background with ID:\s*([\w-]+)/i)?.[1];

@@ -21,8 +21,10 @@ const RECOVER_MS = 10 * 60e3;
 const AGENT_MIN_AGE_MS = 60e3;
 const AGENT_MAX_AGE_MS = 60 * 60e3;
 
+const AGENT_WINDOW_MS = 60 * 60e3;
+
 function createTracker() {
-  return { since: new Map(), firstAt: 0, brokenAt: 0, clearSince: 0, last: null };
+  return { since: new Map(), agentPanes: new Map(), firstAt: 0, brokenAt: 0, clearSince: 0, last: null };
 }
 
 // An agent job the ledger is sure is still running: caught-up ledger, pending, and
@@ -74,8 +76,12 @@ function observe(tracker, observations, now = Date.now()) {
   for (const key of [...tracker.since.keys()]) if (!current.has(key)) tracker.since.delete(key);
   for (const key of current.keys()) if (!tracker.since.has(key)) tracker.since.set(key, now);
   const persisted = [...current].filter(([key]) => now - tracker.since.get(key) >= PERSIST_MS).map(([, problem]) => problem);
-  const agentPanes = persisted.filter((problem) => problem.agent);
-  const fleetProblems = [...persisted.filter((problem) => problem.fleet), ...(agentPanes.length >= 2 ? agentPanes : [])];
+  // Agent disagreements from two different panes within an hour, not necessarily at
+  // once, say the agent wording moved; one pane's stale ledger entry does not.
+  for (const problem of persisted.filter((item) => item.agent)) tracker.agentPanes.set(problem.pane, { at: now, detail: problem.detail });
+  for (const [pane, entry] of [...tracker.agentPanes]) if (now - entry.at > AGENT_WINDOW_MS) tracker.agentPanes.delete(pane);
+  const agentProblems = tracker.agentPanes.size >= 2 ? [...tracker.agentPanes.values()].map((entry) => ({ detail: entry.detail })) : [];
+  const fleetProblems = [...persisted.filter((problem) => problem.fleet), ...agentProblems];
   if (fleetProblems.length) {
     tracker.brokenAt ||= now;
     tracker.clearSince = 0;
