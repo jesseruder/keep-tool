@@ -70,7 +70,7 @@ The bundled Keep skill teaches the agent to record progress and next steps on th
 card. You can watch its terminal in the console and respond when it needs a
 decision. Each session's panel leads with its card's last few check-ins, newest
 first, with the next step the session recorded, beside a small picture of the work
-that Sonnet draws from those check-ins (the session menu hides it). From another
+that Opus draws from those check-ins (the session menu hides it). From another
 terminal, inspect the task or get an overview:
 
 ```sh

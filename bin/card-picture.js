@@ -5,34 +5,48 @@
 //
 // It rides the summarizer's queue and cache (summarize.js): the same isolated,
 // tool-less headless Claude on an automation account, one cached result per card,
-// redrawn only when its input — the title and those check-ins — changes. Sonnet
+// redrawn only when its input — the title and those check-ins — changes. Claude
 // cannot produce pixels, so the picture is an SVG, and the console draws it
 // through an <img>, where it runs no script and loads nothing.
+//
+// Opus, with a picture-book prompt: a bake-off over three live cards (Sonnet 5,
+// Opus 5.5, Fable 5.1) found the prompt mattered most, and Opus drew the clearest
+// visual jokes at about a minute and 8-11 KB a picture. The alias follows the
+// newest Opus.
 
 const summarize = require('./summarize.js');
 const { logEntries } = require('./review.js');
 
-const MODEL = process.env.KEEP_PICTURE_MODEL || 'claude-sonnet-5';
+const MODEL = process.env.KEEP_PICTURE_MODEL || 'opus';
 const ENTRIES = 3;
 const ENTRY_LIMIT = 600;
 const MAX_SVG_BYTES = 64 * 1024;
-// Entries Keep or the fleet reviewer wrote, check results included: a card with a
-// frequent check would otherwise be redrawn on every result nobody changed.
-const AUTOMATED_KIND_RE = /^(?:check result \(agent\)|agent run\b|delivery warning|review \()|\(reviewer\b/;
+// Only what a session or Owner wrote about the work: check-ins, creation and
+// closing. Everything else on a card — probe and check results, code-review
+// records, landed markers, alerts, the reviewer's entries — is written by Keep, and
+// on a typical day it is more than half the log; letting it in would redraw a
+// picture every time a probe ran.
+const PICTURE_KIND_RE = /^(?:check-in|created|done|closed)\b/;
+const REVIEWER_KIND_RE = /\(reviewer\b/;
 
 const INSTRUCTION = [
-  'Draw one small illustration of what the work described in the source is about, as a single SVG.',
-  'Pick a concrete visual metaphor for the subject of the work (the thing being built or fixed),',
-  'not a diagram, chart, or screenshot of text. Flat shapes, a few colours, a clear focal object.',
+  'Draw a small, delightful illustration of the work described in the source, as a single SVG.',
+  'Make it a tiny scene with personality: a cute character or creature (a robot, animal, wizard, gremlin) doing',
+  'something that is a visual joke or pun about what the work is about — the subject of the work, not software in general.',
+  'Think picture-book or sticker art: bold outlines, a rich warm palette, a background with depth (sky, room, landscape),',
+  'expressive faces, small details that reward a second look. Gradients and simple shading are welcome.',
   'Requirements: output only the <svg> element and nothing else, no code fence and no commentary;',
-  'viewBox="0 0 320 200"; no text or at most three short words; no <script>, no event attributes,',
-  'no <foreignObject>, no external links, images, or fonts; under 8 KB.',
+  'viewBox="0 0 320 200"; no text at all; no <script>, no event attributes, no <foreignObject>,',
+  'no external links, images, or fonts; under 24 KB.',
 ].join(' ');
 
 function pictureInput(task) {
   const title = String((task && task.fm && task.fm.title) || '').trim();
   const entries = logEntries(task && task.body)
-    .filter((entry) => !AUTOMATED_KIND_RE.test(entry.heading.split(' — ').slice(1).join(' — ')))
+    .filter((entry) => {
+      const kind = entry.heading.split(' — ').slice(1).join(' — ');
+      return PICTURE_KIND_RE.test(kind) && !REVIEWER_KIND_RE.test(kind);
+    })
     .slice(-ENTRIES)
     .map((entry) => `${entry.heading.split(' — ')[0]}: ${String(entry.text || '').replace(/\s+/g, ' ').slice(0, ENTRY_LIMIT)}`);
   if (!title && !entries.length) return '';

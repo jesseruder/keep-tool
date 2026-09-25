@@ -11,10 +11,12 @@ import { getCardPicture } from './api.js';
 // Only a stamped heading starts an entry, as in bin/review.js logEntries: older
 // cards carry check-in bodies that begin with their own `## ` heading.
 const HEADING_RE = /^## (Plan|\d{4}-\d{2}-\d{2} \d{2}:\d{2} — .+)$/gm;
-// Keep's own bookkeeping and the fleet reviewer's notes are not what the session
-// did; they would push its check-ins out of the three slots. Check results stay:
-// on a check card they are the work.
-const AUTOMATED_KIND_RE = /^(?:agent run\b|delivery warning|review \()|\(reviewer\b/;
+// What a session or Owner wrote about the work, plus check and probe results,
+// which on a check card are the work. Keep's other bookkeeping (code-review
+// records, landed markers, alerts, agent runs) and the fleet reviewer's entries
+// would push the session's own check-ins out of the three slots.
+const SHOWN_KIND_RE = /^(?:check-in|created|done|closed|check result|probe result)\b/;
+const REVIEWER_KIND_RE = /\(reviewer\b/;
 
 export function recentLogEntries(body, limit = 3) {
   const text = String(body || '');
@@ -27,7 +29,8 @@ export function recentLogEntries(body, limit = 3) {
     if (marks[index].heading === 'Plan') continue;
     const end = index + 1 < marks.length ? marks[index + 1].start : text.length;
     const [stamp, ...rest] = marks[index].heading.split(' — ');
-    if (AUTOMATED_KIND_RE.test(rest.join(' — '))) continue;
+    const rawKind = rest.join(' — ');
+    if (!SHOWN_KIND_RE.test(rawKind) || REVIEWER_KIND_RE.test(rawKind)) continue;
     const lines = text.slice(marks[index].bodyStart, end).trim().split('\n');
     let next = '';
     const prose = [];
@@ -106,7 +109,7 @@ export function setPicturesEnabled(on) {
 
 export function pictureToggleHTML() {
   const on = picturesEnabled();
-  return `<div class="session-actions-label">Card picture</div><button class="btn" type="button" data-card-picture aria-pressed="${on}" title="A small picture Sonnet draws from the card's recent check-ins, redrawn when they change">${on ? 'Hide picture' : 'Show picture'}</button>`;
+  return `<div class="session-actions-label">Card picture</div><button class="btn" type="button" data-card-picture aria-pressed="${on}" title="A small picture Opus draws from the card's recent check-ins, redrawn when they change">${on ? 'Hide picture' : 'Show picture'}</button>`;
 }
 
 export function installPictureToggle(menu, ctx) {

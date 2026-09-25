@@ -77,6 +77,12 @@ Looks fine.
 
 ## 2026-09-24 12:00 — check-in (reviewer fable) → active
 Reviewer moved it.
+
+## 2026-09-24 12:10 — code-review (by claude 1)
+clean
+
+## 2026-09-24 12:20 — landed (daemon)
+abc1234 is on origin/master
 `;
   const entries = recentLogEntries(body);
   assert.deepEqual(entries.map((entry) => entry.at), ['2026-09-24 09:00', '2026-09-23 13:00', '2026-09-22 12:00']);

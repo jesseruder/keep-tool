@@ -30,7 +30,11 @@ test('the input is the title and the last three check-ins', () => {
 test('entries Keep or the reviewer wrote do not change the input, so they never redraw', () => {
   const withNoise = { ...task, body: `${task.body}\n## 2026-09-24 09:00 — check result (agent) → waiting\nProbe passed.\n`
     + '\n## 2026-09-24 10:00 — agent run (claude) → active\nStarted.\n'
-    + '\n## 2026-09-24 11:00 — check-in (reviewer fable) → active\nMoved.\n' };
+    + '\n## 2026-09-24 11:00 — check-in (reviewer fable) → active\nMoved.\n'
+    + '\n## 2026-09-24 11:10 — probe result → waiting\nexit 0\n'
+    + '\n## 2026-09-24 11:20 — code-review (by claude 1) \nclean\n'
+    + '\n## 2026-09-24 11:30 — landed (daemon)\nabc1234 is on origin/master\n'
+    + '\n## 2026-09-24 11:40 — alert firing (2)\nhost down\n' };
   assert.equal(picture.pictureInput(withNoise), picture.pictureInput(task));
 });
 
