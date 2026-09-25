@@ -957,17 +957,17 @@ function startSchedulers(ctx) {
 // `remoteSession`). null for a session that is not on another node: the sweep then
 // reads its own scan. Otherwise the node's read of the session (loadSessionForAction),
 // or { absent: reason } when the answer is final for this note: the node says the
-// session is not there (404: outside the window, or one Keep spawned), or it is not a
-// Claude session, which a note cannot be delivered to on a node yet. Anything else a
-// node read throws (unreachable, a host that predates the transcript verb, an account
-// that cannot be resolved) is thrown on, and the sweep waits for the node.
+// session is not there (404: outside the window, or one Keep spawned), or it is neither
+// a Claude nor a Codex session, which a note cannot be delivered to on a node yet.
+// Anything else a node read throws (unreachable, a host that predates the transcript
+// verb, an account that cannot be resolved) is thrown on, and the sweep waits for it.
 function createNoteAuthorLookup({ remoteSession, loadSessionForAction, deps = {}, root, sessionLocation } = {}) {
   const locate = sessionLocation || ((id) => require('../accounts.js').sessionLocation(id, { root }));
   return async (sessionId) => {
     if (!remoteSession({ id: sessionId }, deps)) return null;
     let location = null;
     try { location = locate(sessionId); } catch {}
-    if (location && location.agent !== 'claude') {
+    if (location && !['claude', 'codex'].includes(location.agent)) {
       return { absent: `its author is a ${location.agent} session on ${location.node}, and a note cannot be delivered there yet` };
     }
     const absent = { absent: `no live session on ${location ? location.node : 'its node'}` };

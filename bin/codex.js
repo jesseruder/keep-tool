@@ -242,8 +242,51 @@ function answeredSince(accountId, sinceMs, env = process.env) {
   return null;
 }
 
+// A user message that is the person's own, not Keep's or the harness's: the kind
+// lastUserAt tracks.
+const MACHINE_USER_TEXT_RE = /^\s*(?:\[keep\]|<(?:environment_context|user_instructions|system-reminder|task-notification|cross-session-message)\b|# AGENTS\.md)/i;
+
 function scanRollout(file, { includeChild = false, includeHeadless = false } = {}) {
-  const meta = readSessionMeta(file);
+  const out = foldRollout(readSessionMeta(file), () => readTail(file), {
+    includeChild, includeHeadless, complete: () => fs.statSync(file).size <= TAIL_BYTES,
+  });
+  if (!out) return null;
+  out.pendingQuestion = scanQuestion(file);
+  out.lastUserAt = questionCache.get(file)?.lastUserAt;
+  out.turnStartedAt = questionCache.get(file)?.turnStartedAt || out.turnStartedAt;
+  return out;
+}
+
+// scanRollout's fold over text already in hand: a rollout's session_meta payload and
+// the text of its tail (whole lines; a tail that starts mid-file has dropped its
+// partial first line, as readTail does). `complete` says the tail is the whole file
+// (a boolean, or a function asked only when it matters), which is what lets a
+// metadata-only rollout be judged a TUI that never took a turn. With no file to read
+// in full, the pending question and lastUserAt are the tail's own: a question asked
+// before the tail began, or the last user message before it, is not seen. How the
+// daemon reads a Codex session on another node from what that node sends it.
+function scanRolloutText(meta, tailText, options = {}) {
+  const out = foldRollout(meta, tailText, options);
+  if (!out) return null;
+  let lastUserAt;
+  for (const line of String(tailText || '').split('\n')) {
+    if (!line || !/"(?:user_message|user)"/.test(line)) continue;
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    const p = row && row.payload;
+    if (!p || !((row.type === 'event_msg' && p.type === 'user_message')
+        || (row.type === 'response_item' && p.type === 'message' && p.role === 'user'))) continue;
+    const text = p.message || textOf(p.content);
+    if (text && !MACHINE_USER_TEXT_RE.test(text) && Number.isFinite(Date.parse(row.timestamp))) lastUserAt = Date.parse(row.timestamp);
+  }
+  // The same three fields scanRollout sets from the whole file, set from the tail.
+  out.pendingQuestion = out.pendingQuestion || null;
+  out.lastUserAt = lastUserAt;
+  if (!('turnStartedAt' in out)) out.turnStartedAt = undefined;
+  return out;
+}
+
+function foldRollout(meta, tailText, { includeChild = false, includeHeadless = false, complete = false } = {}) {
   // Multi-agent rollouts share session_id with their parent, but id identifies
   // the actual thread. Children must never compete with the parent by mtime.
   if (!meta || (!includeChild && (isChildSession(meta) || (!includeHeadless && isHeadlessSession(meta))))) return null;
@@ -255,7 +298,8 @@ function scanRollout(file, { includeChild = false, includeHeadless = false } = {
   const out = { id, cwd: typeof meta.cwd === 'string' ? meta.cwd : '', lastUser: '', lastAssistant: '', endedTurn: false };
   const pending = new Map();
   let nonMetadata = false;
-  for (const line of readTail(file).split('\n')) {
+  // A function is read only once the meta has passed, as scanRollout always read it.
+  for (const line of String((typeof tailText === 'function' ? tailText() : tailText) || '').split('\n')) {
     if (!line) continue;
     let record;
     try { record = JSON.parse(line); } catch { continue; }
@@ -306,15 +350,12 @@ function scanRollout(file, { includeChild = false, includeHeadless = false } = {
   }
   // Starting the TUI can leave a metadata-only rollout without any submitted
   // turn. Only decide this from the complete file, never a truncated tail.
-  if (!nonMetadata && fs.statSync(file).size <= TAIL_BYTES) {
+  if (!nonMetadata && (typeof complete === 'function' ? complete() : complete === true)) {
     if (!includeHeadless && !includeChild) return null;
     out.endedTurn = true;
   }
   out.waitingFor = [...pending.values()].find((tool) => tool.waitingFor)?.waitingFor || null;
   out.toolRunning = pending.size > 0;
-  out.pendingQuestion = scanQuestion(file);
-  out.lastUserAt = questionCache.get(file)?.lastUserAt;
-  out.turnStartedAt = questionCache.get(file)?.turnStartedAt || out.turnStartedAt;
   return out;
 }
 
@@ -350,7 +391,7 @@ function scanQuestion(file) {
           // Track actual user events across the full file, even after a large
           // tool result pushes the request out of the rollout tail.
           const text = p.message || textOf(p.content);
-          if (text && !/^\s*(?:\[keep\]|<(?:environment_context|user_instructions|system-reminder|task-notification|cross-session-message)\b|# AGENTS\.md)/i.test(text)
+          if (text && !MACHINE_USER_TEXT_RE.test(text)
               && Number.isFinite(Date.parse(row.timestamp))) state.lastUserAt = Date.parse(row.timestamp);
         } else if (row.type === 'response_item' && ['function_call', 'custom_tool_call'].includes(p.type)
             && /request_user_input(?:_async)?$/.test(p.name || '')) {
@@ -590,4 +631,4 @@ function sessionFor(sessionId) {
   return sessionFromRollout(info, stat, loadTitles(record.configDir).get(info.id) || '', Date.now(), record.accountId);
 }
 
-module.exports = { answeredSince, repliedAfter, scan, invalidate, scanRollout, sessionFor, resolveRollout, isCompanionTask, rolloutFileFor, findRolloutFile, rolloutFilesIn, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, isHeadlessSession, configuredRoots, recentDateDirs, indexedRollouts };
+module.exports = { answeredSince, repliedAfter, scan, invalidate, scanRollout, scanRolloutText, sessionFromRollout, loadTitles, sessionFor, resolveRollout, isCompanionTask, rolloutFileFor, findRolloutFile, rolloutFilesIn, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, isHeadlessSession, configuredRoots, recentDateDirs, indexedRollouts };

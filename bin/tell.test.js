@@ -107,15 +107,16 @@ test('the daemon refuses the sender itself, the reviewer, and a keep-spawned run
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('a Claude session on another node is told like a local one; any other agent there is refused by name', async () => {
+test('a Claude or Codex session on another node is told like a local one; a Pi session there is refused by name', async () => {
   const root = tmpRoot('tell-remote-node');
   try {
     // The row the fleet publishes for a pane on aws1: the node stamp and the
     // qualified pane id. Its receipt is aws1's to give, so it takes a tell.
     const far = liveSession('far-session', { node: 'aws1', pane: 'p1@aws1' });
     const farCodex = liveSession('far-codex', { kind: 'codex', node: 'aws1', pane: 'p2@aws1' });
+    const farPi = liveSession('far-pi', { kind: 'pi', node: 'aws1', pane: 'p3@aws1' });
     const sent = [];
-    const deps = tellDeps(root, [far, farCodex, liveSession('here-session')], {
+    const deps = tellDeps(root, [far, farCodex, farPi, liveSession('here-session')], {
       loadTask: (id) => (id === 'far-card' ? { id, fm: { sessions: [{ id: 'far-session' }] } } : null),
       watcherSend: async (request) => { sent.push(request); return {}; },
     });
@@ -125,17 +126,22 @@ test('a Claude session on another node is told like a local one; any other agent
     assert.deepEqual(sent.map((request) => request.sessionId), ['far-session', 'far-session']);
     assert.equal(tell.loadLedger(root).targets['far-session'].length, 2);
 
-    // A Codex session there cannot be confirmed yet: refused by name, before the ledger.
-    await assert.rejects(tellSession({ sessionId: 'far-codex', text: 'ping' }, deps),
+    // A Codex session there is told the same way: its node gives the receipt too.
+    assert.equal((await tellSession({ sessionId: 'far-codex', text: 'ping' }, deps)).sessionId, 'far-codex');
+    assert.equal(tell.loadLedger(root).targets['far-codex'].length, 1);
+    assert.equal(sent.length, 3);
+
+    // A Pi session there cannot be: refused by name, before the ledger.
+    await assert.rejects(tellSession({ sessionId: 'far-pi', text: 'ping' }, deps),
       (error) => error.status === 409 && error.extra.reason === 'remote-node'
-        && error.message === "delivery is not available for a codex session on aws1 yet; only a Claude session's receipt can be read on a node");
-    assert.equal(tell.loadLedger(root).targets['far-codex'], undefined);
-    assert.equal(sent.length, 2);
+        && error.message === "delivery is not available for a pi session on aws1 yet; only a Claude or Codex session's receipt can be read on a node");
+    assert.equal(tell.loadLedger(root).targets['far-pi'], undefined);
+    assert.equal(sent.length, 3);
 
     // The same daemon still delivers to its own, unchanged.
     const here = await tellSession({ sessionId: 'here-session', text: 'ping' }, deps);
     assert.equal(here.sessionId, 'here-session');
-    assert.equal(sent.length, 3);
+    assert.equal(sent.length, 4);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -56,6 +56,186 @@ test('a Claude session built from a node tail is the one a local file with the s
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+// ---------- a Codex session on a node ----------
+
+function codexRollout(sid, { padding = 0, ended = true, meta = {} } = {}) {
+  const lines = [
+    line({ type: 'session_meta', timestamp: at(9000), payload: { id: sid, cwd: '/work/project', originator: 'codex_cli_rs', ...meta } }),
+    line({ type: 'event_msg', timestamp: at(8500), payload: { type: 'task_started' } }),
+    line({ type: 'event_msg', timestamp: at(8000), payload: { type: 'user_message', message: 'please look at the build' } }),
+  ];
+  for (let i = 0; i < padding; i += 1) {
+    lines.push(line({ type: 'response_item', timestamp: at(7000), payload: { type: 'function_call_output', call_id: `c${i}`, output: 'x'.repeat(900) } }));
+  }
+  lines.push(line({ type: 'event_msg', timestamp: at(6000), payload: { type: 'agent_message', message: 'The build is green.' } }));
+  if (ended) lines.push(line({ type: 'event_msg', timestamp: at(5000), payload: { type: 'task_complete' } }));
+  return lines.join('');
+}
+
+// A rollout where the node's own lookups find it: <config>/sessions/<today>/rollout-*-<sid>.jsonl.
+function writeCodexRollout(configDir, sid, text) {
+  const now = new Date();
+  const day = path.join(configDir, 'sessions', String(now.getFullYear()), String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'));
+  fs.mkdirSync(day, { recursive: true });
+  const file = path.join(day, `rollout-2026-01-01T00-00-00-${sid}.jsonl`);
+  fs.writeFileSync(file, text);
+  return file;
+}
+
+test('a Codex session built from a node\'s meta and tail is the one a local rollout with the same bytes gives', () => {
+  const codex = require('./codex.js');
+  const nodeTranscript = require('./node-transcript.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-tail-model-'));
+  try {
+    for (const [padding, ended] of [[0, true], [0, false], [400, true]]) {
+      const sid = `sess-codex-model-${padding}-${ended}`;
+      const file = writeCodexRollout(dir, sid, codexRollout(sid, { padding, ended }));
+      const stat = fs.statSync(file);
+      if (padding) assert.ok(stat.size > 256 * 1024, 'the long case really is past one tail');
+      // What the node's meta op answers, from the node's own code.
+      const meta = nodeTranscript.rolloutMeta(dir, sid);
+      assert.equal(meta.meta.id, sid);
+      const remote = serve.codexSessionFromTail(sid, meta, tailOf(file), { accountId: 'codex-a', node: 'aws1' });
+      assert.equal(remote.node, 'aws1');
+      assert.equal(remote.kind, 'codex');
+      assert.equal(remote.accountId, 'codex-a');
+      assert.equal(remote.project, '/work/project');
+      assert.equal(remote.endedTurn, ended);
+      assert.equal(remote.state, ended ? 'idle' : 'running');
+      assert.equal(remote.lastAssistant, 'The build is green.');
+      assert.equal(remote.size, stat.size);
+      assert.equal(remote.mtime, stat.mtimeMs);
+      assert.equal(remote.title, '');
+      if (!padding) {
+        // The whole file is in the tail: the same row codex.sessionFor builds here.
+        const local = codex.sessionFromRollout(codex.scanRollout(file, { includeHeadless: true }), stat, '', Date.now(), 'codex-a');
+        const { node, ...rest } = remote;
+        assert.deepEqual(rest, local, `ended ${ended}`);
+        assert.equal(remote.lastUser, 'please look at the build');
+      } else {
+        // Past the tail, the user message is the tail's own: none.
+        assert.equal(remote.lastUser, '');
+      }
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a child Codex thread, or a rollout that names another session, is refused; a headless one is read', () => {
+  const tail = (text) => ({ path: '/node/rollout.jsonl', size: Buffer.byteLength(text), mtimeMs: Date.now() - 5000, generation: 'g',
+    bytes: Buffer.from(text).toString('base64'), from: 0 });
+  const sid = 'sess-codex-kinds';
+  const facts = (extra) => ({ meta: { id: sid, cwd: '/work/project', model: null, originator: 'codex_cli_rs', parentThreadId: null,
+    child: false, headless: false, ...extra }, model: null });
+  const text = codexRollout(sid);
+  assert.throws(() => serve.codexSessionFromTail(sid, facts({ child: true, parentThreadId: 'parent' }), tail(text), { node: 'aws1' }),
+    (error) => error.status === 409 && error.extra.reason === 'remote-node' && /is a child Codex thread/.test(error.message));
+  assert.throws(() => serve.codexSessionFromTail(sid, facts({ id: 'another-thread' }), tail(text), { node: 'aws1' }),
+    (error) => error.status === 409 && error.extra.reason === 'remote-node' && /does not name that session/.test(error.message));
+  assert.throws(() => serve.codexSessionFromTail(sid, { meta: null, model: null }, tail(text), { node: 'aws1' }),
+    (error) => error.status === 409 && error.extra.reason === 'remote-node');
+  const headless = serve.codexSessionFromTail(sid, facts({ headless: true, originator: 'codex_exec' }), tail(text), { node: 'aws1' });
+  assert.equal(headless.id, sid);
+  assert.equal(headless.endedTurn, true);
+});
+
+function codexNodeFixture(sid, node, { agent = 'codex', text = null } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-remote-'));
+  fs.mkdirSync(path.join(root, '.keep', 'session-accounts'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.keep', 'session-accounts', `${sid}.json`), JSON.stringify({
+    version: 1, sessionId: sid, agent, accountId: `${agent}/default`, node,
+  }));
+  const bytes = Buffer.from(text == null ? codexRollout(sid) : text);
+  const mtimeMs = Date.now() - 5000;
+  const asked = [];
+  const described = { path: `/node/home/.codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-${sid}.jsonl`, size: bytes.length, mtimeMs, generation: 'g' };
+  const hostRequest = async (type, params, options) => {
+    asked.push(type === 'transcript' ? `${params.op}:${params.kind}` : type);
+    assert.equal(options.node, node);
+    if (type === 'hello') return { transcript: 4 };
+    if (type === 'transcript' && params.op === 'meta') {
+      return { ...described, meta: { id: sid, cwd: '/work/project', model: 'gpt-test', originator: 'codex_cli_rs', parentThreadId: null,
+        child: false, headless: false }, model: 'gpt-test' };
+    }
+    if (type === 'transcript' && params.op === 'tail') return { ...described, bytes: bytes.toString('base64'), from: 0 };
+    if (type === 'transcript' && params.op === 'stat') return described;
+    throw new Error(`unexpected ${type} ${params && params.op}`);
+  };
+  return { root, asked, mtimeMs, deps: { root, hostNodes: ['main', node], hostRequest },
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+}
+
+test('a Codex session on aws1 is loaded for an action from its node\'s meta and tail', async () => {
+  const sid = 'sess-codex-remote';
+  const f = codexNodeFixture(sid, 'aws3');
+  try {
+    // Its attention marker here, as for a local Codex session.
+    fs.mkdirSync(path.join(f.root, '.keep', 'attention'), { recursive: true });
+    fs.writeFileSync(path.join(f.root, '.keep', 'attention', `${sid}.json`), JSON.stringify({
+      source: 'codex', type: 'complete', message: 'done', at: Date.now(), mt: f.mtimeMs,
+    }));
+    const session = await serve.loadSessionForAction(sid, f.deps);
+    assert.equal(session.id, sid);
+    assert.equal(session.kind, 'codex');
+    assert.equal(session.node, 'aws3');
+    assert.equal(session.accountId, 'codex/default');
+    assert.equal(session.project, '/work/project');
+    assert.equal(session.endedTurn, true);
+    assert.equal(session.state, 'idle');
+    assert.equal(session.lastUser, 'please look at the build');
+    assert.equal(session.lastAssistant, 'The build is green.');
+    assert.equal(session.mtime, f.mtimeMs);
+    assert.equal(session.notify && session.notify.type, 'complete');
+    assert.deepEqual(f.asked.filter((op) => op !== 'hello').sort(), ['meta:codex', 'tail:codex']);
+    // The same read is what a send's re-checks use.
+    const again = await serve.remoteSessionRead(sid, f.deps);
+    assert.equal(again.kind, 'codex');
+    assert.equal(again.node, 'aws3');
+  } finally { f.cleanup(); }
+});
+
+test('a Codex session on aws1 outside the window is no session, as a local one would be', async () => {
+  const sid = 'sess-codex-old';
+  const f = codexNodeFixture(sid, 'aws3');
+  try {
+    const hostRequest = f.deps.hostRequest;
+    const deps = { ...f.deps, hostRequest: async (type, params, options) => {
+      const answer = await hostRequest(type, params, options);
+      return answer && typeof answer.mtimeMs === 'number' ? { ...answer, mtimeMs: Date.now() - 30 * 86400e3 } : answer;
+    } };
+    await assert.rejects(serve.loadSessionForAction(sid, deps), (error) => error.status === 404);
+  } finally { f.cleanup(); }
+});
+
+test('keep pane send to a Codex pane on aws1 reaches that session', async () => {
+  const sid = 'sess-codex-pane-send';
+  const f = codexNodeFixture(sid, 'aws7');
+  try {
+    const reached = [];
+    const deps = {
+      ...f.deps,
+      resolveSessionTarget: async (session, hint) => ({ pane: hint.expectedPane }),
+      sendToResolvedTarget: async (session, target, text) => {
+        reached.push({ id: session.id, node: session.node, kind: session.kind, pane: target.pane, text, endedTurn: session.endedTurn });
+        return { ok: true };
+      },
+    };
+    const result = await serve.sendToSessionLocked({ sessionId: sid, pane: 'p3@aws7', text: 'hello' }, deps);
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(reached, [{ id: sid, node: 'aws7', kind: 'codex', pane: 'p3@aws7', text: 'hello', endedTurn: true }]);
+  } finally { f.cleanup(); }
+});
+
+test('a Pi session, or one of no known agent, on a node is still refused by name and nothing is asked', async () => {
+  const f = codexNodeFixture('sess-pi-remote', 'aws1', { agent: 'pi' });
+  try {
+    await assert.rejects(serve.loadSessionForAction('sess-pi-remote', f.deps), (error) => error.status === 409
+      && error.extra.reason === 'remote-node'
+      && error.message === "delivery is not available for a pi session on aws1 yet; only a Claude or Codex session's receipt can be read on a node");
+    assert.deepEqual(f.asked, []);
+  } finally { f.cleanup(); }
+});
+
 test('a node whose host predates the transcript verb is refused by name, and nothing is asked of it', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-tail-capability-'));
   try {
@@ -201,17 +381,22 @@ test('a send a node cannot confirm is refused before anything is typed', async (
     hostNodes: ['main', 'aws1'],
     hostRequest: async (type) => { typed.push(type); throw new Error(`unexpected ${type}`); },
   };
-  // A Codex session there: its receipt needs what the verb does not send yet.
-  await assert.rejects(serve.sendToResolvedTarget({ id: 'sess-codex', kind: 'codex', node: 'aws1' }, { pane: 'p1@aws1' }, 'hi', {}, deps),
-    (error) => error.status === 409 && error.extra.reason === 'remote-node'
-      && /a codex session on aws1/.test(error.message));
+  // A Pi session there takes no API delivery anywhere (and is refused before the node
+  // is asked for anything).
+  await assert.rejects(serve.sendToResolvedTarget({ id: 'sess-pi', kind: 'pi', node: 'aws1' }, { pane: 'p1@aws1' }, 'hi', {}, deps),
+    (error) => error.status === 409 && /Pi API message delivery is unavailable/.test(error.message));
   // A pane on one machine and a session on another: nothing is sent anywhere.
   await assert.rejects(serve.sendToResolvedTarget({ id: 'sess-split', kind: 'claude', node: 'aws1' }, { pane: 'p1' }, 'hi', {}, deps),
     (error) => error.status === 409 && /pane p1 is on main but session sess-split is on aws1/.test(error.message));
   assert.deepEqual(typed, []);
-  // What is still refused is named by remoteDeliveryRefusal; a Claude session there is not.
+  // What is still refused is named by remoteDeliveryRefusal; a Claude or Codex session
+  // there is not.
   assert.equal(serve.remoteDeliveryRefusal({ id: 'x', node: 'aws1', kind: 'claude' }, deps), null);
-  assert.equal(serve.remoteDeliveryRefusal({ id: 'x', kind: 'codex' }, deps), null, 'a session here is never refused');
+  assert.equal(serve.remoteDeliveryRefusal({ id: 'x', node: 'aws1', kind: 'codex' }, deps), null);
+  assert.equal(serve.remoteDeliveryRefusal({ id: 'x', node: 'aws1' }, deps, 'codex'), null);
+  assert.equal(serve.remoteDeliveryRefusal({ id: 'x', kind: 'pi' }, deps), null, 'a session here is never refused');
+  assert.equal(serve.remoteDeliveryRefusal({ id: 'x', node: 'aws1', kind: 'pi' }, deps).message,
+    "delivery is not available for a pi session on aws1 yet; only a Claude or Codex session's receipt can be read on a node");
   assert.match(serve.remoteDeliveryRefusal({ id: 'x', node: 'aws1' }, deps).message, /a session whose agent is not known on aws1/);
 });
 

@@ -1513,8 +1513,11 @@ permission flag its source process ran with (`--dangerously-bypass-approvals-and
 or none; Keep's default when no process was read) and the model established above. Codex
 reports its session-start only at its first turn, so the move also accepts the target's
 own process evidence (the launch pane's process arguing `resume <sid>` or holding the
-rollout open) and writes the pane record itself. `keep tell` to a Codex session on a
-node other than the daemon's is still unsupported: open its pane, or move it back.
+rollout open) and writes the pane record itself. A Codex session on a node other than
+the daemon's is delivered to and receipted like a Claude one there (`keep tell`, a
+scheduled delivery, a state note): the daemon reads its state from the rollout's
+session_meta and tail through that node's `transcript` verb, and the receipt is the
+node's. A Pi session on a node is not; open its pane, or move it back.
 
 `--dry` prints what the move would do and changes nothing. `--force` is Owner's own move,
 as with `keep handoff --force`: the source is signalled instead of being asked to exit.

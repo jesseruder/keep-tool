@@ -500,8 +500,8 @@ test('a Codex session on a node is inspected from its pane, its node\'s processe
       nodeTranscript: (node, session) => ({ meta: async () => { asked.push([node, session.id, session.kind]); return { model: 'gpt-rollout', meta: { model: 'gpt-meta', cwd: '/work/rollout' } }; } }),
       ...extra,
     });
-    // A session on another node that is Codex: remoteSessionRead would refuse it, so a
-    // move that asked it for a row could not start at all.
+    // A session on another node that is Codex: the move reads no session row for it
+    // (the stub node answers only `meta`), just its pane, process and rollout meta.
     const inspected = await serve.inspectSessionMove(CODEX_SID, deps(`codex --dangerously-bypass-approvals-and-sandbox -m gpt-argv resume ${CODEX_SID}`));
     assert.equal(inspected.agent, 'codex');
     assert.equal(inspected.from, 'aws1');

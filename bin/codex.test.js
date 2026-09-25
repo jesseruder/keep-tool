@@ -384,3 +384,64 @@ test('a model reply after a recorded usage limit is found on its account, and an
     assert.equal(codex.answeredSince('codex-other', since, env), null);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('scanRolloutText folds the same meta and tail into what scanRollout reads from the file', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-text-'));
+  try {
+    const file = path.join(dir, 'rollout.jsonl');
+    const stamp = (s) => new Date(Date.UTC(2026, 0, 2, 3, 4, s)).toISOString();
+    const rows = (extra) => [
+      { type: 'session_meta', timestamp: stamp(0), payload: { id: 'text-thread', cwd: '/work/project', originator: 'codex_cli_rs' } },
+      { type: 'event_msg', timestamp: stamp(1), payload: { type: 'task_started' } },
+      { type: 'event_msg', timestamp: stamp(2), payload: { type: 'user_message', message: 'Please check the build' } },
+      { type: 'response_item', timestamp: stamp(3), payload: { type: 'function_call', name: 'shell', call_id: 'c1', arguments: '{"command":["ls"]}' } },
+      { type: 'response_item', timestamp: stamp(4), payload: { type: 'function_call_output', call_id: 'c1', output: 'ok' } },
+      { type: 'event_msg', timestamp: stamp(5), payload: { type: 'agent_message', message: 'The build is green.' } },
+      { type: 'event_msg', timestamp: stamp(6), payload: { type: 'user_message', message: '[keep] a check arrived' } },
+      ...extra,
+    ];
+    const cases = {
+      ended: [{ type: 'event_msg', timestamp: stamp(7), payload: { type: 'task_complete' } }],
+      asking: [{ type: 'response_item', timestamp: stamp(7), payload: { type: 'function_call', name: 'request_user_input', call_id: 'q1',
+        arguments: JSON.stringify({ questions: [{ question: 'Ship it?', options: [{ label: 'Yes' }, 'No'] }] }) } }],
+      running: [{ type: 'response_item', timestamp: stamp(7), payload: { type: 'function_call', name: 'shell', call_id: 'c2', arguments: '{}' } }],
+    };
+    // One file per case: the question scan reads a rollout incrementally, as one that
+    // is only ever appended to.
+    const scanned = {};
+    for (const [name, extra] of Object.entries(cases)) {
+      const caseFile = path.join(dir, `rollout-${name}.jsonl`);
+      fs.writeFileSync(caseFile, rows(extra).map((row) => JSON.stringify(row)).join('\n') + '\n');
+      const fromFile = codex.scanRollout(caseFile, { includeHeadless: true });
+      const fromText = codex.scanRolloutText(codex.readSessionMeta(caseFile), codex.readTail(caseFile), { includeHeadless: true, complete: true });
+      assert.deepStrictEqual(fromText, fromFile, name);
+      assert.equal(fromFile.id, 'text-thread');
+      assert.equal(fromFile.cwd, '/work/project');
+      assert.equal(fromFile.lastUser, '[keep] a check arrived');
+      assert.equal(fromFile.lastAssistant, 'The build is green.');
+      assert.equal(fromFile.lastUserAt, Date.parse(stamp(2)), 'a [keep] message is not the person\'s own');
+      assert.equal(fromFile.turnStartedAt, Date.parse(stamp(6)));
+      scanned[name] = fromFile;
+    }
+    assert.equal(scanned.running.endedTurn, false);
+    assert.equal(scanned.running.toolRunning, true);
+    assert.equal(scanned.ended.endedTurn, true);
+    assert.equal(scanned.ended.toolRunning, false);
+    assert.deepEqual(scanned.asking.pendingQuestion, { question: 'Ship it?', options: ['Yes', 'No'], callId: 'q1', async: false });
+
+    // A metadata-only rollout: an exact read keeps it as an idle TUI only when the tail
+    // is the whole file; discovery leaves it out, from a file or from text.
+    const metaOnly = JSON.stringify({ type: 'session_meta', payload: { id: 'fresh', source: 'cli' } }) + '\n';
+    fs.writeFileSync(file, metaOnly);
+    const meta = codex.readSessionMeta(file);
+    assert.equal(codex.scanRollout(file), null);
+    assert.equal(codex.scanRolloutText(meta, metaOnly, { complete: true }), null);
+    assert.equal(codex.scanRolloutText(meta, metaOnly, { includeHeadless: true, complete: true }).endedTurn, true);
+    assert.equal(codex.scanRolloutText(meta, metaOnly, { includeHeadless: true, complete: false }).endedTurn, false);
+    assert.equal(codex.scanRolloutText(meta, metaOnly, { includeHeadless: true, complete: () => true }).endedTurn, true);
+    // Children and headless jobs are judged from the meta alike.
+    assert.equal(codex.scanRolloutText({ id: 'c', parent_thread_id: 'p' }, '', { includeHeadless: true }), null);
+    assert.equal(codex.scanRolloutText({ id: 'j', source: 'exec' }, '', {}), null);
+    assert.equal(codex.scanRolloutText(null, '', { includeHeadless: true }), null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

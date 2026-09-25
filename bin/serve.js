@@ -4124,6 +4124,41 @@ function claudeSessionFromTail(id, tail, options = {}) {
   return options.node ? { ...session, node: options.node } : session;
 }
 
+// The Codex session model from a node's `meta` and `tail`: the row codex.sessionFor
+// builds from a rollout here, from the node's copy of the same two reads (the
+// session_meta line and the last 256 KiB). A child thread's rollout is not a session
+// a message is typed to, and one whose meta names another thread, or none, is not the
+// one asked about: both are refused. A headless (exec-origin) one is kept, as
+// sessionFor keeps it for an explicitly hosted conversation. What only the whole file
+// gives locally (a question asked before the tail began, the last user message before
+// it) is the tail's own answer here. The title is the caller's: titles live in the
+// account's session index, which is the node's.
+function codexSessionFromTail(id, meta, tail, options = {}) {
+  const where = options.node ? ` on ${options.node}` : '';
+  const facts = meta && meta.meta;
+  if (!facts || facts.id !== id) {
+    throw new InjectionError(409, `the rollout of ${id}${where} does not name that session in its session_meta; nothing can be delivered to it`, { reason: 'remote-node' });
+  }
+  if (facts.child) {
+    throw new InjectionError(409, `${id}${where} is a child Codex thread, which takes no delivery`, { reason: 'remote-node' });
+  }
+  const info = codex.scanRolloutText({ id: facts.id, cwd: typeof facts.cwd === 'string' ? facts.cwd : '' }, tailText(tail),
+    { includeHeadless: true, complete: Number(tail && tail.from) === 0 });
+  if (!info) throw new InjectionError(409, `the rollout of ${id}${where} could not be read as a session`, { reason: 'remote-node' });
+  const stat = { size: Number(tail.size) || 0, mtimeMs: Number(tail.mtimeMs) || 0 };
+  const session = codex.sessionFromRollout(info, stat, typeof options.title === 'string' ? options.title : '', Date.now(), options.accountId || null);
+  return options.node ? { ...session, node: options.node } : session;
+}
+
+// The title the daemon's own session index gives a Codex session, when the account's
+// config directory is one this machine has; '' otherwise (the node's index is its own).
+function codexTitleHere(sessionId, accountId, deps = {}) {
+  try {
+    const where = codex.configuredRoots(deps.env || process.env).find((entry) => entry.accountId === accountId);
+    return where ? codex.loadTitles(where.configDir).get(sessionId) || '' : '';
+  } catch { return ''; }
+}
+
 // ---------- a node session's freshness, for the publication ----------
 //
 // The console's idle and attention states and the stalled detector read a row's
@@ -4265,8 +4300,10 @@ function unansweredNodes(result) {
 }
 
 // A remote session's current model, straight off its node: what claudeSessionFor is
-// for a local one. Only Claude so far; a Codex rollout's state needs its first line
-// as well as its tail, which the verb does not yet send, so one is refused by name.
+// for a local Claude one, and codex.sessionFor for a local Codex one. A Claude row is
+// built from the node's tail; a Codex row needs its rollout's session_meta as well,
+// which the node's `meta` op gives, asked beside the tail. A Pi session there, or one
+// whose agent is not recorded, is refused by name (remoteDeliveryRefusal).
 async function remoteSessionRead(id, deps = {}) {
   const sessionId = String(id || '');
   if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new InjectionError(400, 'bad session id');
@@ -4276,8 +4313,17 @@ async function remoteSessionRead(id, deps = {}) {
   try { location = (deps.sessionLocation || accounts.sessionLocation)(sessionId, { root: deps.root || keep.ROOT, env: deps.env || process.env }); } catch {}
   // A session placed on another node whose agent cannot be named is refused by name
   // (remoteDeliveryRefusal), never called unknown: it exists, and it is not here.
-  if (!location || location.agent !== 'claude') {
+  if (!location || !['claude', 'codex'].includes(location.agent)) {
     throw remoteDeliveryRefusal({ id: sessionId, node }, deps, location && location.agent ? location.agent : null);
+  }
+  if (location.agent === 'codex') {
+    const session = { id: sessionId, kind: 'codex', node };
+    const account = nodeTranscriptAccount(session, deps);
+    const client = (deps.nodeTranscript || nodeTranscript)(node, session, deps);
+    const [meta, tail] = await Promise.all([client.meta(), client.tail()]);
+    return codexSessionFromTail(sessionId, meta, tail, {
+      accountId: account.id, node, title: codexTitleHere(sessionId, account.id, deps),
+    });
   }
   const session = { id: sessionId, kind: 'claude', node };
   const account = nodeTranscriptAccount(session, deps);
@@ -4288,8 +4334,9 @@ async function remoteSessionRead(id, deps = {}) {
 }
 
 // loadCurrentSession for a session the fleet places on another node: the row a local
-// one gets from loadSessionExact (the 48 h window, keep-spawned left out, attention
-// marker, name, marks and number), built from the node's tail, plus `node`. Async,
+// one gets from loadSessionExact (the 48 h window, keep-spawned left out for Claude and
+// a Companion task for Codex, the agent's attention marker, name, marks and number),
+// built from the node's tail (and a Codex rollout's meta), plus `node`. Async,
 // because the tail is a request; loadCurrentSession itself is unchanged, and still
 // answers "no session" for such an id to every synchronous caller.
 async function loadRemoteSession(id, deps = {}) {
@@ -4298,8 +4345,15 @@ async function loadRemoteSession(id, deps = {}) {
   const root = deps.root || keep.ROOT;
   const now = Date.now();
   if (!(now - Number(session.mtime) <= SESSION_WINDOW_MS)) throw new InjectionError(404, 'no session');
-  if (spawnedRecently(root, session.id, now)) throw new InjectionError(404, 'no session');
-  attachClaudeMarker(session, path.join(root, '.keep', 'attention'), now, Number(session.mtime), true);
+  const attentionDir = path.join(root, '.keep', 'attention');
+  if (session.kind === 'codex') {
+    // As codexFleetSession leaves a Companion task out, when its title is known here.
+    if (codex.isCompanionTask(session.title)) throw new InjectionError(404, 'no session');
+    attachCodexMarkers([session], attentionDir, now, { readOnly: true });
+  } else {
+    if (spawnedRecently(root, session.id, now)) throw new InjectionError(404, 'no session');
+    attachClaudeMarker(session, attentionDir, now, Number(session.mtime), true);
+  }
   sessionNames.apply([session], { root });
   sessionMarks.apply([session], { root });
   sessionNumbers.assign([session], { root, readOnly: true });
@@ -13847,8 +13901,8 @@ async function inspectSessionMove(sessionId, deps = {}) {
   try { location = accounts.sessionLocation(sessionId, { root, env }); }
   catch (error) { throw new InjectionError(409, error.message); }
   const from = location ? location.node : daemon;
-  // A Codex session on another node has no session row here (its state would need the
-  // rollout's first line as well as its tail, and remoteSessionRead refuses one): what
+  // A Codex session on another node is not read as a session row here (the move does
+  // not need remoteSessionRead's tail-only view of its turn, nor its 48 h window): what
   // the move needs comes from its pane, its node's process table and its rollout's
   // session_meta and last turn, read on that node.
   const hostOnly = Boolean(location && location.agent === 'codex' && from !== daemon);
@@ -15501,9 +15555,10 @@ async function tellSession(body, deps = {}) {
   } else {
     target = resolveTellTarget(body.sessionId, source, deps);
     // A bare row for a session on another node becomes that node's read of it. Any
-    // refusal (its host predates the transcript verb, it is not a Claude session, the
-    // node did not answer) lands here, before the ledger is read, let alone reserved:
-    // a message this daemon cannot confirm must not spend the sender's hour either.
+    // refusal (its host predates the transcript verb, it is a Pi session or of no
+    // known agent, the node did not answer) lands here, before the ledger is read, let
+    // alone reserved: a message this daemon cannot confirm must not spend the sender's
+    // hour either.
     // A Claude session there that has not taken its first turn is a row with no
     // transcript (loadRemoteSessionForSend), which is idle by definition.
     if (!source.scanned && bareRemoteRow(target, deps)) target = await loadRemoteSessionForSend(target.id, deps);
@@ -15512,8 +15567,8 @@ async function tellSession(body, deps = {}) {
   if (senderId && target.id === senderId) {
     throw new InjectionError(409, 'self: a session cannot tell itself', { reason: 'self' });
   }
-  // What a node still cannot confirm (anything but a Claude session there) is refused
-  // by name here, before the ledger is read.
+  // What a node still cannot confirm (a Pi session there, or one of no known agent) is
+  // refused by name here, before the ledger is read.
   const elsewhere = remoteDeliveryRefusal(target, deps);
   if (elsewhere) throw elsewhere;
   // The same read, again, for the re-checks inside the lock and for the send itself:
@@ -15660,22 +15715,22 @@ async function readRemoteTellRow(row, deps = {}) {
 
 // Delivery is a message with a receipt: the text is typed into a pane, confirmed
 // against the session's transcript, and journalled here so one that was left
-// unconfirmed can be finished rather than sent twice. For a Claude session on another
-// node the receipt is that node's (the `transcript` verb, bin/node-transcript.js),
-// so it takes a delivery like a local one. What still cannot is anything else there:
-// a Codex session's state needs its rollout's first line as well as its tail, which
-// the verb does not send yet, and a Pi session takes no API delivery anywhere. For
-// those, and for a session whose agent is not known, every delivery path says so by
-// name, and no journal is ever written. Null for a session on this machine, and for a
-// Claude one elsewhere. `kind` names the agent when the caller has it.
+// unconfirmed can be finished rather than sent twice. For a Claude or Codex session on
+// another node the receipt is that node's (the `transcript` verb,
+// bin/node-transcript.js: a Claude transcript's tail, a Codex rollout's meta and
+// tail), so it takes a delivery like a local one. What still cannot is a Pi session,
+// which takes no API delivery anywhere. For that, and for a session whose agent is not
+// known, every delivery path says so by name, and no journal is ever written. Null for
+// a session on this machine, and for a Claude or Codex one elsewhere. `kind` names the
+// agent when the caller has it.
 function remoteDeliveryRefusal(sessionOrPane, deps = {}, kind = undefined) {
   const node = sessionNodeOf(sessionOrPane, deps);
   if (node === daemonNodeName(deps)) return null;
   const agent = kind !== undefined ? kind
     : sessionOrPane && typeof sessionOrPane === 'object' ? sessionOrPane.kind : undefined;
-  if (agent === 'claude') return null;
+  if (agent === 'claude' || agent === 'codex') return null;
   return new InjectionError(409,
-    `delivery is not available for ${agent ? `a ${agent} session` : 'a session whose agent is not known'} on ${node} yet; only a Claude session's receipt can be read on a node`,
+    `delivery is not available for ${agent ? `a ${agent} session` : 'a session whose agent is not known'} on ${node} yet; only a Claude or Codex session's receipt can be read on a node`,
     { reason: 'remote-node' });
 }
 
@@ -16602,6 +16657,7 @@ module.exports = {
   scanTranscript,
   scanTranscriptText,
   claudeSessionFromTail,
+  codexSessionFromTail,
   nodeTranscript,
   nodeTranscriptFileForSession,
   deliveryReceiptFor,

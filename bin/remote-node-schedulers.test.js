@@ -900,7 +900,7 @@ test('notes: an author on the node is asked of its node first, and an outage the
   assert.match(byId()[unreachable.id].nagged.reason, /its node could not be read: aws1 did not answer, for \d+ minutes/);
 });
 
-test('notes: the daemon\'s author lookup reads a node author from its node and answers 404s and Codex authors as final', async (t) => {
+test('notes: the daemon\'s author lookup reads a node author from its node, Codex included, and answers 404s and Pi authors as final', async (t) => {
   const fleet = createRemoteNodeFleet(t);
   const serve = require('./serve.js');
   const { createNoteAuthorLookup } = require('./serve/schedulers.js');
@@ -908,9 +908,26 @@ test('notes: the daemon\'s author lookup reads a node author from its node and a
   t.after(() => serve.closeHostClient());
   let tail = null;
   let unreachable = false;
+  // The Codex author's rollout as aws1 answers for it: its meta and its tail.
+  const codexId = fleet.remoteCodex.id;
+  const rollout = Buffer.from([
+    { timestamp: new Date(Date.now() - 9000).toISOString(), type: 'session_meta', payload: { id: codexId, cwd: fleet.project } },
+    { timestamp: new Date(Date.now() - 8000).toISOString(), type: 'event_msg', payload: { type: 'user_message', message: 'deploy it' } },
+    { timestamp: new Date(Date.now() - 7000).toISOString(), type: 'event_msg', payload: { type: 'agent_message', message: 'deployed' } },
+    { timestamp: new Date(Date.now() - 6000).toISOString(), type: 'event_msg', payload: { type: 'task_complete' } },
+  ].map((row) => `${JSON.stringify(row)}\n`).join(''));
+  const described = { path: `/node/codex/rollout-${codexId}.jsonl`, size: rollout.length, mtimeMs: Date.now() - 6000, generation: 'codex' };
   const hosts = fleet.fakeHosts((node, type, params) => {
     if (node !== 'aws1') return undefined;
     if (unreachable && type === 'transcript') throw new Error('aws1 is unreachable');
+    if (type === 'transcript' && params.sessionId === codexId) {
+      assert.equal(params.kind, 'codex');
+      if (params.op === 'meta') {
+        return { ...described, meta: { id: codexId, cwd: fleet.project, model: null, originator: null, parentThreadId: null,
+          child: false, headless: false }, model: null };
+      }
+      if (params.op === 'tail') return { ...described, from: 0, bytes: rollout.toString('base64') };
+    }
     if (tail && type === 'transcript' && params.op === 'tail') return tail;
     return undefined;
   });
@@ -926,8 +943,16 @@ test('notes: the daemon\'s author lookup reads a node author from its node and a
   assert.equal(author.id, fleet.mirrored.id);
   assert.equal(author.node, 'aws1');
   assert.equal(author.endedTurn, true);
-  // A Codex author there: final, and said accurately (delivery refuses it by kind).
-  assert.match((await lookup(fleet.remoteCodex.id)).absent, /codex session on aws1, and a note cannot be delivered there yet/);
+  // A Codex author there: read from its node's rollout meta and tail, like a Claude one.
+  const codexAuthor = await lookup(codexId);
+  assert.equal(codexAuthor.id, codexId);
+  assert.equal(codexAuthor.kind, 'codex');
+  assert.equal(codexAuthor.node, 'aws1');
+  assert.equal(codexAuthor.endedTurn, true);
+  // An author whose agent is Pi is still final, and said accurately.
+  const piLookup = createNoteAuthorLookup({ remoteSession: serve.remoteSession, loadSessionForAction: serve.loadSessionForAction,
+    deps, root: fleet.root, sessionLocation: () => ({ agent: 'pi', node: 'aws1' }) });
+  assert.match((await piLookup(fleet.mirrored.id)).absent, /pi session on aws1, and a note cannot be delivered there yet/);
   // The node says the session is outside the window (the daemon's 404): final.
   const old = Buffer.from(claudeTranscript({ sessionId: fleet.mirrored.id, cwd: fleet.project, text: 'long ago',
     at: Date.now() - 30 * 86400e3 }));
