@@ -14,6 +14,7 @@ const HOST_ONLY_MODULES = Object.freeze([
   './node-transcript.js',
   './launch-prep.js',
   './session-artifacts.js',
+  './account-handoff-node.js',
   './process-table.js',
   './node-update.js',
 ]);

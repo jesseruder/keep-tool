@@ -15,10 +15,13 @@
 // Every request may name `kind` ('claude' when it names none, which is all an older
 // daemon sends); the account must be one of this node's accounts of that agent.
 //
-//   list    { sessionId, account }                    -> { projectName, files: [{ relPath, size, mtimeMs, mode, sha256, generation }], bytes }
+//   list    { sessionId, account }                    -> { projectName, files: [{ relPath, size, mtimeMs, mode, sha256, generation, owned }], bytes }
 //             `generation` names the file as the hook client does (hook-client.js
 //             generationOf), so a daemon seeding its mirror of this node's copy
-//             stamps it with the identity the node's hook posts will carry.
+//             stamps it with the identity the node's hook posts will carry. `owned`
+//             (version 3) says a move or a transfer put exactly these bytes here, so
+//             a publish may replace them: an account transfer asks before it stops
+//             anything whether its publish would be refused.
 //   read   { sessionId, account, relPath, from, length ≤ 4 MiB } -> { relPath, size, mtimeMs, from, bytes, eof }
 //   stage   { sessionId, account, tx, relPath, from, bytes, size, sha256 }
 //                                                      -> { relPath, staged, complete } | { relPath, staged, needFrom }
@@ -28,6 +31,9 @@
 //   cwd     { path }                                  -> { path, exists, directory }
 //   account { account }                               -> { account, directory: true }: this node has the account, and its directory
 //   drop-session { sessionId }                        -> { dropped }: this node's hook queue and mirror cursor for the session
+//   auth, shared-setup, compatible, resume-spec, project-trust (version 3): an account
+//             transfer's questions about this node's own account configuration, answered
+//             by bin/account-handoff-node.js.
 //
 // Nothing here takes a path from the caller beyond a relative one that must name a
 // session artifact of the session asked about. The account must be one this node has
@@ -52,7 +58,8 @@ const REQUEST_MAX_BYTES = 4 * 1024 * 1024;
 const TX_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_FILES = 50000;
 const MOVE_DIR = '.keep-move';
-const OPS = new Set(['list', 'read', 'stage', 'publish', 'release', 'abort', 'cwd', 'drop-session', 'account']);
+const HANDOFF_OPS = new Set(['auth', 'shared-setup', 'compatible', 'resume-spec', 'project-trust']);
+const OPS = new Set(['list', 'read', 'stage', 'publish', 'release', 'abort', 'cwd', 'drop-session', 'account', ...HANDOFF_OPS]);
 const KINDS = new Set(['claude', 'codex']);
 const ROLLOUT_NAME_RE = /^rollout-[A-Za-z0-9._:+=@-]+\.jsonl$/;
 const META_MAX_BYTES = 256 * 1024;
@@ -444,6 +451,7 @@ function artifactParts(root, sessionId, kind = 'claude') {
 
 async function list(root, sessionId, kind = 'claude') {
   const { projectName, files } = artifactParts(root, sessionId, kind);
+  const owned = (readProvenance(root, sessionId) || {}).files || {};
   const out = [];
   let bytes = 0;
   for (const parts of files) {
@@ -452,7 +460,7 @@ async function list(root, sessionId, kind = 'claude') {
     bytes += digest.size;
     if (bytes > TX_MAX_BYTES) throw refused('the session\'s artifacts are larger than a move carries');
     out.push({ relPath: parts.join('/'), size: digest.size, mtimeMs: digest.mtimeMs, mode: digest.mode, sha256: digest.sha256,
-      generation: digest.generation });
+      generation: digest.generation, owned: owned[parts.join('/')] === digest.sha256 });
   }
   return { sessionId, projectName, files: out, bytes };
 }
@@ -703,6 +711,9 @@ async function handle(params, options = {}) {
   if (!OPS.has(params.op)) throw invalid(`artifacts op must be one of ${[...OPS].join(', ')}`);
   if (params.op === 'cwd') return cwd(params);
   if (params.op === 'drop-session') return dropSession(params, options);
+  // An account transfer's questions about this node's own account configuration
+  // (verb version 3): bin/account-handoff-node.js checks its accounts itself.
+  if (HANDOFF_OPS.has(params.op)) return require('./account-handoff-node.js').handle(params, options);
   const root = accountRoot(params, options);
   const kind = validKind(params);
   // Asked before a move stops anything: the account is one this node has configured,
@@ -718,5 +729,5 @@ async function handle(params, options = {}) {
 }
 
 module.exports = {
-  handle, scopedParts, REQUEST_MAX_BYTES, TX_MAX_BYTES, TX_RE, MOVE_DIR, scanStats,
+  handle, scopedParts, resolveUnder, REQUEST_MAX_BYTES, TX_MAX_BYTES, TX_RE, MOVE_DIR, scanStats,
 };

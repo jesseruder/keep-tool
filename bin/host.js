@@ -71,7 +71,7 @@ const PROTOCOL_VERSION = 1;
 // The shapes of the verbs a caller checks for in the hello before it asks. Named once,
 // because the `stats` verb reports them too.
 const TRANSCRIPT_VERSION = 4;
-const ARTIFACTS_VERSION = 2;
+const ARTIFACTS_VERSION = 3;
 const STATS_VERSION = 1;
 const INVENTORY_VERSION = 1;
 const HELLO_FAILURE_LIMIT = 10;
@@ -1216,7 +1216,9 @@ function createHost(options = {}) {
           // artifacts: this host answers the `artifacts` verb (bin/session-artifacts.js),
           // which lists, reads, stages and publishes a session's files under one of
           // this node's own accounts, so a session can be moved onto or off it. 2 adds
-          // `kind: 'codex'`: a Codex session's root and child-thread rollouts.
+          // `kind: 'codex'`: a Codex session's root and child-thread rollouts. 3 adds an
+          // account transfer's ops (auth, shared-setup, compatible, resume-spec,
+          // project-trust) and a list's `owned` flag.
           artifacts: ARTIFACTS_VERSION,
           // stats: this host answers the `stats` verb (bin/node-stats.js): memory, swap,
           // CPU, disk, uptime, pane and agent counts, its versions and its clock offset.

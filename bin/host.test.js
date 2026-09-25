@@ -3029,7 +3029,7 @@ test('a node lists, reads, stages and publishes a session\'s artifacts, and the 
   try {
     await withHost({ env: source.env }, async ({ client: from }) => {
       await withHost({ env: target.env }, async ({ client: to }) => {
-        assert.equal((await to.request('hello')).artifacts, 2, 'the verb is advertised, Codex rollouts with it');
+        assert.equal((await to.request('hello')).artifacts, 3, 'the verb is advertised, Codex rollouts and account transfers with it');
         const { listed, entries } = await carry(from, to, source, target);
         assert.equal(listed.projectName, '-work-project');
         assert.deepEqual(listed.files.map((file) => file.relPath).sort(), [
