@@ -213,12 +213,13 @@ commands['review-tick'] = async (argv) => {
   else console.log(`no tick: ${result.why}`);
 };
 
-commands['review-queue'] = (argv) => {
+commands['review-queue'] = async (argv) => {
   const o = parseArgs(argv, { limit: 'str', 'min-score': 'str', json: 'bool' });
   const review = require('../review.js');
-  const out = review.reviewQueue({
+  const out = await review.reviewQueue({
     limit: o.limit ? parseInt(o.limit, 10) : undefined,
     minScore: o['min-score'] !== undefined ? parseInt(o['min-score'], 10) : undefined,
+    gitState: review.gitState,
   });
   if (o.json) { console.log(JSON.stringify(out, null, 2)); return; }
   console.log(`# keep review-queue  generated=${nowStamp()}  ranked=${out.ranked.length}/${out.total}`);
@@ -342,7 +343,7 @@ commands['review-land'] = async (argv) => {
   if (out.failed) process.exitCode = 1;
 };
 
-commands['review-bundle'] = (argv) => {
+commands['review-bundle'] = async (argv) => {
   const opts = parseArgs(argv, { budget: 'str', 'total-budget': 'str', queue: 'bool', limit: 'str', session: 'str', from: 'str', raw: 'bool', force: 'bool' });
   const review = require('../review.js');
   if (opts.queue && opts._.length) die('keep review-bundle accepts either card ids or --queue, not both');
@@ -352,7 +353,10 @@ commands['review-bundle'] = (argv) => {
   }
   const tickLimit = parseInt(process.env.KEEP_REVIEW_TICK_LIMIT || '5', 10);
   const ids = opts.queue
-    ? review.reviewQueue({ limit: opts.limit ? parseInt(opts.limit, 10) : (Number.isFinite(tickLimit) && tickLimit > 0 ? tickLimit : 5) }).ranked.map((row) => row.task)
+    ? (await review.reviewQueue({
+      limit: opts.limit ? parseInt(opts.limit, 10) : (Number.isFinite(tickLimit) && tickLimit > 0 ? tickLimit : 5),
+      gitState: review.gitState,
+    })).ranked.map((row) => row.task)
     : opts._;
   if (!opts.queue && ids.length === 1) {
     const out = review.buildBundle(ids[0], {

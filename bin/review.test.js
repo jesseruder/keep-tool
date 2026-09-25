@@ -652,7 +652,7 @@ test('reviewQueue skips idea cards and reviewer-idea cards outright', () => {
     write('plain-idea', 'kind: idea\n');
     write('tagged-task', 'tags: [reviewer-idea]\n');
     write('real-task', '');
-    const script = "const q=require('./bin/review.js').reviewQueue({limit:5}); process.stdout.write(JSON.stringify(q))";
+    const script = "require('./bin/review.js').reviewQueue({limit:5}).then(q=>process.stdout.write(JSON.stringify(q)))";
     const child = spawnSync(process.execPath, ['-e', script], {
       cwd: path.join(__dirname, '..'),
       env: { ...process.env, KEEP_DIR: root },
@@ -685,7 +685,7 @@ test('reviewQueue selects one cohort title stem and fills the tick with another 
       fs.writeFileSync(path.join(root, 'tasks', `${id}.md`),
         `---\ntitle: ${id}\nstatus: active\ncreated: ${stamp.slice(0, 10)}\nupdated: ${stamp.replace(' ', 'T')}\n---\n${entries}\n`);
     }
-    const script = "const q=require('./bin/review.js').reviewQueue({limit:5}); process.stdout.write(JSON.stringify(q))";
+    const script = "require('./bin/review.js').reviewQueue({limit:5}).then(q=>process.stdout.write(JSON.stringify(q)))";
     const child = spawnSync(process.execPath, ['-e', script], {
       cwd: path.join(__dirname, '..'),
       env: { ...process.env, KEEP_DIR: root },

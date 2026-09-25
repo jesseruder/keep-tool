@@ -84,6 +84,9 @@ const {
   dashboardDetail, reviewQueueSearch,
 } = require('./dashboard-state');
 const { createDashboardWorker } = require('./dashboard-worker');
+const { createDaemonReadWorker } = require('./daemon-read-worker');
+const { createDaemonMutationProcess } = require('./daemon-mutation-process');
+const { createDigestRefresh } = require('./digest-refresh');
 const { createDashboardPublisher } = require('./dashboard-publisher');
 const { createUiRequestWorker } = require('./ui-request-worker');
 const { routes: buildRequestRoutes, matchRoute, routeDenial } = require('./serve/routes.js');
@@ -562,6 +565,18 @@ async function companionSnapshot(deps = {}) {
       psKnown: true,
       psOutput: rows.map((row) => `${row.pid} ${row.elapsed || '00:00'} ${row.args || ''}`).join('\n'),
     } : options;
+    if (!injected && daemonMutationProcessForMain) {
+      const result = await daemonMutationProcessForMain.run('companion-jobs', {
+        root: options.root, fallbackCacheMs: options.fallbackCacheMs,
+        processRows: rows || [], psOutput: shared.psOutput || '',
+      }, { timeoutMs: 30e3 });
+      const snapshots = [result.codexJobs, result.piJobs].filter(Boolean);
+      const known = snapshots.some((snapshot) => snapshot.known
+        ?? (snapshot.discovery && snapshot.discovery !== 'unknown'));
+      const complete = snapshots.every((snapshot) => snapshot.complete === true || snapshot.discovery === 'ok');
+      return { known, complete, discovery: !known ? 'unknown' : complete ? 'ok' : 'partial',
+        jobs: snapshots.flatMap((snapshot) => snapshot.jobs || []) };
+    }
     const [codexJobs, piJobs] = await Promise.all([
       Promise.resolve(discoverCodex(shared, deps)),
       Promise.resolve(discoverPi(shared, deps)),
@@ -5629,7 +5644,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
   sweepInFlight = true;
   const now = deps.now || Date.now;
   const dir = deps.dir || autoCompactDir();
-  const scan = deps.scanSessions || scanSessions;
+  const scan = deps.scanSessions || ((options = {}) => isolatedSessionScan(options, deps));
   const resolve = deps.resolveSessionTarget || resolveSessionTarget;
   const read = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
   const submit = deps.typeAndSubmit || typeAndSubmit;
@@ -5643,7 +5658,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
     if (!allRecords.length) return summary;
     let sessions;
     let scanError = null;
-    try { sessions = scan(); } catch (e) { scanError = e; }
+    try { sessions = await scan(); } catch (e) { scanError = e; }
     // A model someone picked by hand after the swap retires the record before anything
     // below can act on it: no restore typed over the choice (see compactSwapUserModelChoice).
     const retired = new Set();
@@ -6671,6 +6686,12 @@ async function prepareLaunchOn(node, options, deps = {}, localDeps = {}) {
   // launch may assume the account is already installed there, and only the caller
   // knows whether this is the daemon node preparing for itself.
   if (node === daemonNodeName(deps)) {
+    if (daemonMainLoopPolicy.isActive() && daemonMutationProcessForMain && !Object.keys(localDeps).length) {
+      return daemonMutationProcessForMain.run('prepare-launch', {
+        root: deps.root || keep.ROOT,
+        options: { ...options, remote: false },
+      }, { timeoutMs: 30e3 });
+    }
     return require('./launch-prep.js').prepare({ ...options, remote: false }, localDeps);
   }
   // Keep's nodes share one home directory, and accounts.js has already expanded `~`
@@ -6866,8 +6887,7 @@ function resolveSessionId(value, deps = {}) {
   if (!number && !/^[A-Za-z0-9_-]+$/.test(wanted)) throw new InjectionError(400, 'bad session id');
   // A phone polls this every couple of seconds; a snapshot under 5 s old is fresh enough
   // to resolve an id and spares the event loop a full transcript scan per poll.
-  const scanned = deps.scanSessions ? deps.scanSessions()
-    : (Date.now() - sessionSnapshotAt < 5000 && sessionSnapshot.length ? sessionSnapshot : scanSessions());
+  const scanned = deps.scanSessions ? deps.scanSessions() : copySessions(sessionSnapshot);
   const exact = scanned.find((candidate) => candidate.id === wanted);
   if (number && !exact) {
     const numbered = scanned.filter((candidate) => candidate.num === number);
@@ -6882,6 +6902,20 @@ function resolveSessionId(value, deps = {}) {
   }
   if (!matches.length) throw new InjectionError(400, 'bad session id');
   return matches[0];
+}
+
+async function resolveSessionIdOffMain(value, deps = {}) {
+  if (deps.scanSessions) return resolveSessionId(value, deps);
+  const recent = Date.now() - sessionSnapshotAt < 5000 && sessionSnapshot.length
+    ? copySessions(sessionSnapshot) : null;
+  if (recent) {
+    try { return resolveSessionId(value, { ...deps, scanSessions: () => recent }); }
+    catch (error) {
+      if (!(error instanceof InjectionError) || error.message !== 'bad session id') throw error;
+    }
+  }
+  const rows = await isolatedSessionScan({ fresh: false }, deps);
+  return resolveSessionId(value, { ...deps, scanSessions: () => rows });
 }
 
 function stripTerminalAnsi(value) {
@@ -6942,7 +6976,7 @@ async function screenSession(query, deps = {}) {
     ? (name) => query.get(name)
     : (name) => query && query[name];
   const shellPane = get('session') ? null : get('pane');
-  const session = shellPane ? null : resolveSessionId(get('session'), deps);
+  const session = shellPane ? null : await resolveSessionIdOffMain(get('session'), deps);
   let target;
   try {
     target = shellPane
@@ -6989,7 +7023,7 @@ async function screenHistorySession(query, deps = {}) {
     ? (name) => query.get(name)
     : (name) => query && query[name];
   const shellPane = get('session') ? null : get('pane');
-  const session = shellPane ? null : resolveSessionId(get('session'), deps);
+  const session = shellPane ? null : await resolveSessionIdOffMain(get('session'), deps);
   let target;
   try {
     target = shellPane
@@ -7083,7 +7117,7 @@ async function sendSessionKeys(body, deps = {}) {
     bytes.push(SESSION_KEY_BYTES[key]);
   }
   const shellPane = body.sessionId ? null : body.pane;
-  const session = shellPane ? null : resolveSessionId(body.sessionId, deps);
+  const session = shellPane ? null : await resolveSessionIdOffMain(body.sessionId, deps);
   const lock = deps.withInjectionLock || withInjectionLock;
   return lock(async () => {
     let target;
@@ -7352,7 +7386,7 @@ async function restartSession(body, deps = {}) {
     // the argument vector carries a placeholder until it answers.
     let resumeMcpConfig = deps.resumeMcpConfig || null;
     if (!remotePane && session.kind === 'claude' && account.managed) {
-      try { resumeMcpConfig ||= (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(account, cwd).mcpConfig; }
+      try { resumeMcpConfig ||= (await ensureSharedMemoryOffMain(account, cwd, deps)).mcpConfig; }
       catch (error) { throw new InjectionError(409, `account shared setup is unavailable: ${error.message}`); }
     }
     const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -7421,10 +7455,11 @@ async function restartSession(body, deps = {}) {
       // An account transfer of a pane on another node copies the conversation here, on
       // the stopped pane's relaunch (replaceExited); on this node it wraps the host.
       const replace = (params) => host('replace-exited', params);
+      const adoptedMeta = await adoptedPaneMetaForAction(pane.meta, deps);
       const replaceParams = { paneId: pane.id, expectedPid: pane.pid, sessionId: stoppedPane.meta?.sessionId,
         cmd: '/bin/zsh', args: ['-lic', `exec ${command}`], cwd,
         env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: session.id }, deps), ...reviewerSpec.env }),
-        cols: pane.cols, rows: pane.rows, meta: { ...adoptedPaneMeta(pane.meta), agent: session.kind, sessionId: session.id,
+        cols: pane.cols, rows: pane.rows, meta: { ...adoptedMeta, agent: session.kind, sessionId: session.id,
           accountId: account.id, accountLabel: account.label, restartedAt: Date.now() } };
       const result = deps.replaceExited ? await deps.replaceExited(replaceParams, replace) : await replace(replaceParams);
       await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
@@ -7833,7 +7868,7 @@ async function forceRestartSession(entry, save, deps = {}) {
     // resume has its shared setup prepared there instead, through prepare-launch.
     let resumeMcpConfig = null;
     if (!remotePane && resumeAgent === 'claude' && resumeAccount.managed) {
-      try { resumeMcpConfig = (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(resumeAccount, cwd).mcpConfig; }
+      try { resumeMcpConfig = (await ensureSharedMemoryOffMain(resumeAccount, cwd, deps)).mcpConfig; }
       catch (error) { throw new InjectionError(409, `account shared setup is unavailable: ${error.message}`); }
     }
     // Kept to hand so the guard below reads the very table the stop signals against.
@@ -7876,10 +7911,11 @@ async function forceRestartSession(entry, save, deps = {}) {
             cwd: original.cwd, bypass: false, argv, pi: null,
           }, deps)).command
           : require('./agent-launcher').profileCommand(argv, account);
+        const adoptedMeta = await adoptedPaneMetaForAction(original.meta, deps);
         const result = await host('replace-exited', { paneId: job.pane, expectedPid, sessionId: stopped.meta?.sessionId,
           cmd: '/bin/zsh', args: ['-lic', `exec ${command}`], cwd: original.cwd,
           env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: job.sessionId }, deps), ...reviewerSpec.env }),
-          cols: original.cols, rows: original.rows, meta: { ...adoptedPaneMeta(original.meta), accountId: account.id, accountLabel: account.label,
+          cols: original.cols, rows: original.rows, meta: { ...adoptedMeta, accountId: account.id, accountLabel: account.label,
             forceRestartToken: job.token, restartedAt: Date.now() } });
         return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: job.sessionId };
       },
@@ -8853,7 +8889,9 @@ async function autoCompactTick(deps = {}) {
   });
   // Bounded: this only picks candidates; the chosen one is re-read by
   // loadCurrentSession under the lock before anything is typed.
-  const cheap = (deps.scanSessions || scanSessions)({ fresh: false }).filter((session) =>
+  const cheap = (await (deps.scanSessions
+    ? deps.scanSessions({ fresh: false })
+    : isolatedSessionScan({ fresh: false }, deps))).filter((session) =>
     (sweep || opts.requested(session))
     && liveIds.has(session.id) && autoCompactIdleMs(session, stamps, now, opts) !== null);
   const candidates = autoCompactCandidates(
@@ -10687,7 +10725,7 @@ const reopenOpenOperations = new Map();
 // moves it to another account it is an ordinary session that nobody may reap. The
 // original `launchedAt` rides along because the open-request dedupe reads it; with
 // `ephemeral` gone the reaper never looks at it.
-function adoptedPaneMeta(meta) {
+function adoptedPaneMeta(meta, options = {}) {
   const { ephemeral, awaitingOwnerInput, openingMessage, ...rest } = meta || {};
   // A check that ran as a card's agent stops being that agent's pane with the
   // check: the replacement is Owner's ordinary session. The name leaves the pane
@@ -10695,7 +10733,7 @@ function adoptedPaneMeta(meta) {
   // session id as much as by the pane's name), because a pane the sweep no longer
   // sees would otherwise hold the record at `working` with nothing left to idle it.
   if (ephemeral === 'check') {
-    releaseCheckAgent(meta);
+    releaseCheckAgent(meta, options);
     delete rest.agentName;
   }
   return rest;
@@ -10705,7 +10743,7 @@ function adoptedPaneMeta(meta) {
 // it is adopted by something else. Only a record still naming this pane's session
 // is touched: a newer check has its own session, and a responder's record never
 // carries `ephemeral` in the first place. Returns whether a record was released.
-function releaseCheckAgent(meta) {
+function releaseCheckAgent(meta, options = {}) {
   const name = meta && typeof meta.agentName === 'string' ? meta.agentName : '';
   if (!name || !agents.validName(name)) return false;
   try {
@@ -10713,12 +10751,24 @@ function releaseCheckAgent(meta) {
     const sessionId = meta.sessionId ? String(meta.sessionId) : '';
     if (!record || !record.session || (record.session.id && record.session.id !== sessionId)) return false;
     agents.writeRecord(name, { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } });
-    agents.flushCommits();
+    if (options.flush !== false) agents.flushCommits();
     return true;
   } catch (error) {
     process.stderr.write(`keep serve: could not release agent ${name} from an adopted check pane: ${error.message}\n`);
     return false;
   }
+}
+
+async function adoptedPaneMetaForAction(meta, deps = {}) {
+  const result = adoptedPaneMeta(meta, { flush: false });
+  if (meta?.ephemeral !== 'check') return result;
+  const root = deps.root || keep.ROOT;
+  const names = agents.takePendingNames(root);
+  if (!names.length) return result;
+  const runner = deps.mutationProcess || daemonMutationProcessForMain;
+  if (!runner) agents.flushNamedCommits(names, root);
+  else await runner.run('flush-agent-records', { root, names }, { timeoutMs: 30e3 });
+  return result;
 }
 
 // Pane metadata openSession resolves for itself. `repair` and the transfer ids are the
@@ -10767,6 +10817,13 @@ function openedSessionNumber(id, deps = {}) {
   let num = null;
   try { num = sessionNumbers.lookup(id, { root: deps.root || keep.ROOT })?.num || null; } catch {}
   return num ? { num } : {};
+}
+
+function assignOpenedSessionNumber(sessionId, launchedAt, deps = {}) {
+  return (deps.assignSessionNumbers || sessionNumbers.assign)([{ id: sessionId, mtime: launchedAt }], {
+    root: deps.root || keep.ROOT,
+    lockRetries: 0,
+  });
 }
 
 // What the Browser Bridge should call the session's browser — and so its Edge tab
@@ -10999,7 +11056,7 @@ async function openSession(body, deps = {}) {
     if (!body.fresh) session = (task.fm.sessions || []).slice(-1)[0];
   } else if (body.sessionId) {
     // Accept a unique prefix of at least 8 characters, the way ids are shown everywhere.
-    try { session = resolveSessionId(body.sessionId, deps); } catch (error) {
+    try { session = await resolveSessionIdOffMain(body.sessionId, deps); } catch (error) {
       if (!(error instanceof InjectionError) || error.status !== 400 || error.message !== 'bad session id') throw error;
     }
     if (session) body.sessionId = session.id;
@@ -11057,8 +11114,13 @@ async function openSession(body, deps = {}) {
       launchCwd = fs.realpathSync(launchCwd);
       if (!fs.statSync(launchCwd).isDirectory()) throw new Error();
     } catch { throw new InjectionError(400, 'cwd directory does not exist'); }
-    if (body.taskId && !keep.projectMatchesCwd(project, launchCwd)) {
-      throw new InjectionError(409, 'cwd is not part of the card project');
+    if (body.taskId) {
+      const matchesProject = deps.projectMatchesCwd
+        ? await deps.projectMatchesCwd(project, launchCwd)
+        : daemonMainLoopPolicy.isActive()
+          ? await isolatedDaemonRead('project-matches-cwd', { project, cwd: launchCwd }, deps)
+          : keep.projectMatchesCwd(project, launchCwd);
+      if (!matchesProject) throw new InjectionError(409, 'cwd is not part of the card project');
     }
     project = launchCwd;
   }
@@ -11307,7 +11369,9 @@ async function openSession(body, deps = {}) {
     const sessionId = session ? session.id : ['claude', 'pi'].includes(agent) ? (deps.randomUUID || crypto.randomUUID)() : null;
     // Number a new session before it starts, so its start hook can tell it which it is.
     if (sessionId && !session) {
-      try { sessionNumbers.assign([{ id: sessionId, mtime: launchedAt }], { root: deps.root || keep.ROOT }); } catch {}
+      // The dashboard worker will allocate on its next scan if another writer owns
+      // the number registry. An API request must never wait on its synchronous lock.
+      try { assignOpenedSessionNumber(sessionId, launchedAt, deps); } catch {}
     }
     // Named after the number just assigned and the card, so the session's Edge tab
     // group is recognisable in the browser.
@@ -12082,6 +12146,107 @@ let sessionSnapshot = [];
 let sessionSnapshotAt = 0;
 let lastDashboardSessionScan = 0;
 let lastStalledSessionScan = 0;
+let lastStalledSessionSnapshot = [];
+function createDaemonMainLoopPolicy() {
+  let active = false;
+  return {
+    enter() { active = true; },
+    leave() { active = false; },
+    isActive() { return active; },
+    assertBulkScanAllowed() {
+      if (active) throw new Error('bulk session discovery is forbidden on the daemon main loop; use isolatedSessionScan');
+    },
+  };
+}
+const daemonMainLoopPolicy = createDaemonMainLoopPolicy();
+
+// keep-core's lock owner includes the process start time so a future process can
+// distinguish a dead daemon from PID reuse. Resolve that identity asynchronously:
+// until it is known, daemon mutations fail with the ordinary busy error rather
+// than running `ps` or sleeping on the event loop. A failed lookup retries, since
+// a transiently overloaded machine must not leave mutations refused forever.
+function createDaemonRegistryLockPolicy(options = {}) {
+  const core = options.core || require('./keep-core.js');
+  const run = options.execFile || execFile;
+  const retryMs = options.retryMs ?? 1000;
+  const later = options.setTimeout || setTimeout;
+  let ownerStartedAt = '';
+  let retryTimer = null;
+  let closed = false;
+  const restore = core.setLockPolicy(() => ({ ready: Boolean(ownerStartedAt), ownerStartedAt }));
+  const resolveIdentity = () => {
+    if (closed) return;
+    run('ps', ['-p', String(process.pid), '-o', 'lstart='], {
+      encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, LC_ALL: 'C' },
+    }, (error, stdout) => {
+      if (closed) return;
+      ownerStartedAt = error ? '' : String(stdout || '').trim();
+      if (ownerStartedAt) return;
+      retryTimer = later(resolveIdentity, retryMs);
+      retryTimer.unref?.();
+    });
+  };
+  resolveIdentity();
+  return {
+    ready: () => Boolean(ownerStartedAt),
+    close() {
+      if (closed) return;
+      closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      restore();
+    },
+  };
+}
+let daemonReadWorkerForMain = null;
+let daemonDashboardBuildForMain = null;
+let daemonMutationProcessForMain = null;
+let daemonReadSequence = 0;
+
+async function isolatedSessionScan(options = {}, deps = {}) {
+  if (deps.scanSessions) return deps.scanSessions(options);
+  const reader = deps.readWorker || daemonReadWorkerForMain;
+  if (!reader) throw new Error('daemon session scan has no isolated reader');
+  const key = options.fresh === true
+    ? `session-snapshot:fresh:${++daemonReadSequence}`
+    : `session-snapshot:bounded:${JSON.stringify(Object.fromEntries(Object.entries(options).sort(([a], [b]) => a.localeCompare(b))))}`;
+  return reader.run('session-snapshot', { options }, { key });
+}
+
+async function isolatedDaemonRead(operation, input, deps = {}, options = {}) {
+  const reader = deps.readWorker || daemonReadWorkerForMain;
+  if (!reader) throw new Error(`daemon ${operation} has no isolated reader`);
+  return reader.run(operation, input, options);
+}
+
+async function isolatedDaemonMutation(operation, input, deps = {}, options = {}) {
+  const runner = deps.mutationProcess || daemonMutationProcessForMain;
+  if (!runner) throw new Error(`daemon ${operation} has no isolated mutation process`);
+  return runner.run(operation, input, options);
+}
+
+async function ensureSharedMemoryOffMain(account, cwd, deps = {}) {
+  if (deps.ensureSharedMemory) return deps.ensureSharedMemory(account, cwd);
+  if (!daemonMainLoopPolicy.isActive() && !deps.mutationProcess) {
+    return require('./account-setup.js').ensureSharedMemory(account, cwd);
+  }
+  return isolatedDaemonMutation('ensure-shared-memory', {
+    root: deps.root || keep.ROOT, account, cwd,
+  }, deps, { timeoutMs: 30e3 });
+}
+
+async function compatibleAccountsOffMain(source, target, cwd, resumeSpec, deps = {}) {
+  if (deps.compatible) return deps.compatible(source, target, cwd, resumeSpec);
+  if (source.agent !== 'claude') {
+    return require('./codex-handoff-support').compatible(source, target, resumeSpec);
+  }
+  if (!daemonMainLoopPolicy.isActive() && !deps.mutationProcess) {
+    return require('./account-setup.js').compatible(source, target, cwd);
+  }
+  return isolatedDaemonMutation('account-compatible', {
+    root: deps.root || keep.ROOT, source, target, cwd,
+  }, deps, { timeoutMs: 30e3 });
+}
 let codexDashboardRows = new Map();
 let codexDashboardFullScanAt = 0;
 let codexDashboardDiscoveryDirty = true;
@@ -12710,6 +12875,7 @@ function scanDashboardCodexSessions(options, now) {
 }
 
 function scanSessions(options = {}) {
+  daemonMainLoopPolicy.assertBulkScanAllowed();
   const now = Date.now();
   const attentionDir = path.join(keep.ROOT, '.keep', 'attention');
   const sessions = scanClaudeSessions(options);
@@ -12855,7 +13021,12 @@ async function liveSessionTick(deps = {}) {
     const records = paneRecordEntries(deps);
     let scanned = [];
     // Bounded: a ledger of what was alive, refreshed every tick; nothing acts on it here.
-    try { scanned = await (deps.scanSessions || scanSessions)({ fresh: false }); } catch {}
+    try {
+      if (!deps.scanSessions && !deps.readWorker) throw new Error('live session tick has no isolated session reader');
+      scanned = await (deps.scanSessions
+        ? deps.scanSessions({ fresh: false })
+        : deps.readWorker.run('session-snapshot', { options: { fresh: false } }, { key: 'session-snapshot:bounded' }));
+    } catch {}
     const scannedById = new Map(scanned.map((session) => [session.id, session]));
     const exitedIds = new Set(scanned.filter((session) => session && session.exited).map((session) => session.id));
     for (const id of exitedIds) delete ledger.sessions[id];
@@ -12905,7 +13076,7 @@ async function restorePlan(query, deps = {}) {
   const project = normalizedProject(get('project'));
   const ledger = readLiveSessionLedger(deps);
   let scanned = [];
-  try { scanned = await (deps.scanSessions || scanSessions)(); } catch {}
+  try { scanned = await isolatedSessionScan({ fresh: true }, deps); } catch {}
   const scannedById = new Map(scanned.map((session) => [session.id, session]));
   const live = await (deps.liveSessionPids || liveSessionPids)(deps);
   // The whole result, not just its panes: a node that did not answer is missing from
@@ -13047,12 +13218,19 @@ async function restorePlan(query, deps = {}) {
   rows.sort((a, b) => b.lastSeenAlive - a.lastSeenAlive);
   return { ok: true, since, sessions: rows };
 }
-function stalledSessionSnapshot(now = Date.now()) {
+async function stalledSessionSnapshot(now = Date.now(), deps = {}) {
   if (sessionSnapshotAt && now - lastDashboardSessionScan < 5 * 60e3) return copySessions(sessionSnapshot);
-  if (lastStalledSessionScan && now - lastStalledSessionScan < 5 * 60e3) return copySessions(sessionSnapshot);
+  if (lastStalledSessionScan && now - lastStalledSessionScan < 5 * 60e3) return copySessions(lastStalledSessionSnapshot);
+  // A stall report already accepts a snapshot up to five minutes old. The cold
+  // discovery can walk every transcript account, so production runs it in the
+  // read worker and only copies its observation back here.
+  if (!deps.scanSessions && !deps.readWorker) throw new Error('stalled sweep has no isolated session reader');
+  const scanned = await (deps.scanSessions
+    ? deps.scanSessions({ readOnly: true, allocateNumbers: false, fresh: false })
+    : deps.readWorker.run('session-snapshot', { options: { fresh: false } }, { key: 'session-snapshot:bounded' }));
+  lastStalledSessionSnapshot = copySessions(scanned);
   lastStalledSessionScan = now;
-  // Bounded: a stall report already accepts a snapshot up to five minutes old.
-  return scanSessions({ readOnly: true, fresh: false });
+  return copySessions(lastStalledSessionSnapshot);
 }
 
 // ---------- state assembly ----------
@@ -13084,48 +13262,6 @@ function applySessionLiveness(sessions, ledger, panes, now = Date.now()) {
   }
   sessions.splice(0, sessions.length, ...kept);
   return sessions;
-}
-
-function ensureDigest() {
-  const today = keep.nowStamp().slice(0, 10);
-  const file = path.join(keep.ROOT, 'digests', `${today}.md`);
-  if (fs.existsSync(file)) {
-    try {
-      const md = fs.readFileSync(file, 'utf8');
-      health.record('digest', { ok: true, detail: 'exists' });
-      return { date: today, md };
-    } catch (error) {
-      health.record('digest', { ok: false, error });
-      throw error;
-    }
-  }
-  if (new Date().getHours() < 5) {
-    health.record('digest', { ok: true, skipped: true, detail: 'nothing due' });
-    return null; // don't stamp "today" in the small hours
-  }
-  let md = null;
-  let digestError = null;
-  try {
-    keep.withLock(() => {
-      if (fs.existsSync(file)) return; // another process won the race
-      md = keep.buildDigest(); // build inside the lock so no mutation is mid-flight
-      fs.writeFileSync(file, md);
-      keep.commitAndPush(`keep: digest ${today}`, ['digests']);
-    });
-  } catch (e) {
-    digestError = e;
-    health.record('digest', { ok: false, error: e });
-    process.stderr.write(`keep serve: digest failed: ${e.message}\n`);
-  }
-  if (md === null && fs.existsSync(file)) {
-    try { md = fs.readFileSync(file, 'utf8'); }
-    catch (error) {
-      health.record('digest', { ok: false, error });
-      throw error;
-    }
-  }
-  if (md !== null && !digestError) health.record('digest', { ok: true, detail: 'generated' });
-  return md === null ? null : { date: today, md };
 }
 
 function dashboardSummary(options, target, key, input, instruction, summaryOptions = {}) {
@@ -13581,11 +13717,8 @@ function buildState(options = {}) {
   return state;
 }
 
-function dashboardRuntimeSnapshot() {
-  let digest = null;
-  try { digest = ensureDigest(); }
-  catch (error) { process.stderr.write(`keep serve: digest failed: ${error.message}\n`); }
-  return { digest, health: health.snapshot(), usage: usage.getUsage() };
+function dashboardRuntimeSnapshot(digestRefresh) {
+  return { digest: digestRefresh?.snapshot() || null, health: health.snapshot(), usage: usage.getUsage() };
 }
 
 function setPath(object, pathParts, value) {
@@ -13609,8 +13742,9 @@ function finalizeDashboardWorkerResult(result) {
   }
 
   const taskById = new Map((state.tasks || []).map((task) => [task.id, task]));
-  sessionNames.apply(state.sessions, { root: keep.ROOT });
-  sessionMarks.apply(state.sessions, { root: keep.ROOT });
+  // Names and marks were applied to this exact state in the build worker. A
+  // rename invalidates the publisher and causes a new fenced build; repeating
+  // both directory walks here only stalls the parent event loop.
   titles.applyLiveTitles(state.sessions, { onChange, taskFor: (session) => taskById.get(session.taskId) });
   require('./stop-classifier').request(state.sessions, { onChange });
   for (const session of state.sessions || []) require('./session-debug').record(session, Date.now());
@@ -13879,7 +14013,7 @@ function addStoppedSessionNodes(state, deps = {}) {
 
 function buildWhoSnapshot(project) {
   const tasks = keep.loadAll(false);
-  const sessions = scanSessions();
+  const sessions = copySessions(sessionSnapshot);
   const holds = keep.activeHolds(project, Date.now(), { devices: true });
   const owners = sessionTaskOwners(tasks);
   for (const session of sessions) session.taskId = owners[session.id] || null;
@@ -13935,7 +14069,10 @@ async function inspectAccountHandoff(body, deps = {}) {
   // A host that did not answer is not a missing pane: account-handoff refuses this one as
   // a transient host timeout rather than "needs the original pane".
   if (!panes) return { hostUnavailable: true };
-  const state = await addHostSessionState(await buildState({ hostPanes: panes }), { ...deps, panes });
+  const isolatedBuild = deps.dashboardBuild || daemonDashboardBuildForMain;
+  const state = isolatedBuild
+    ? await isolatedBuild({ hostPanes: panes })
+    : await addHostSessionState(await buildState({ hostPanes: panes }), { ...deps, panes });
   const session = state.sessions.find((entry) => entry.id === body.sessionId);
   const pane = panes.find((entry) => entry.id === body.pane);
   const rows = await agentProcessRows(deps);
@@ -14242,12 +14379,13 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
       cwd, bypass: false, argv, pi: null,
     }, deps)).command
     : require('./agent-launcher').profileCommand(argv, account);
+  const adoptedMeta = await adoptedPaneMetaForAction(pane.meta, deps);
   const result = await host('replace-exited', {
     paneId: pane.id, expectedPid: entry.pid, sessionId: pane.meta?.sessionId,
     cmd: '/bin/zsh', args: ['-lic', `exec ${command}`], cwd,
     env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: entry.sessionId }, deps), ...reviewerSpec.env }),
     cols: entry.cols, rows: entry.rows,
-    meta: { ...adoptedPaneMeta(pane.meta), agent, sessionId: entry.sessionId, accountId: account.id, accountLabel: account.label,
+    meta: { ...adoptedMeta, agent, sessionId: entry.sessionId, accountId: account.id, accountLabel: account.label,
       handoffTransactionId: entry.id, restartedAt: Date.now() },
   });
   const launched = { ok: true, pane: result.pane.id, pid: result.pane.pid,
@@ -14484,6 +14622,10 @@ async function handoffSession(body, deps = {}) {
     host: deps.host || { request: (type, params) => hostRequest(type, params, node ? { ...deps, node } : deps) },
     restartSession: deps.restartSession || restartSession,
     restartDeps: deps.restartDeps || deps,
+    ensureSharedMemory: deps.ensureSharedMemory || ((account, cwd) =>
+      ensureSharedMemoryOffMain(account, cwd, deps)),
+    compatible: (source, target, cwd, resumeSpec) =>
+      compatibleAccountsOffMain(source, target, cwd, resumeSpec, deps),
     resumeExited: deps.resumeExited || ((entry, account, mcpConfig, hooks = {}) => resumeExitedAccountHandoff(entry, account, mcpConfig,
       { ...deps, ...hooks })),
     waitForAccountRecord: deps.waitForAccountRecord || ((sid, pane, accountId, after) => waitForAccountRecord(sid, pane, accountId, after, deps)),
@@ -15335,7 +15477,10 @@ async function inspectPortableSource(sessionId, options = {}, deps = {}) {
   else {
     const panes = await listHostPanes(deps, true);
     if (!panes) throw new InjectionError(503, 'terminal host is unavailable; source activity cannot be verified');
-    state = await addHostSessionState(await buildState({ hostPanes: panes }), { ...deps, panes });
+    const isolatedBuild = deps.dashboardBuild || daemonDashboardBuildForMain;
+    state = isolatedBuild
+      ? await isolatedBuild({ hostPanes: panes })
+      : await addHostSessionState(await buildState({ hostPanes: panes }), { ...deps, panes });
   }
   const session = state.sessions?.find((entry) => entry.id === sessionId);
   const handoff = require('./account-handoff');
@@ -15669,7 +15814,7 @@ async function deliverCheckToThread(task, deps = {}) {
   // chosen candidate is then read exactly (loadCurrentSession) before it is typed into.
   const { candidates, busy } = pickDeliveryCandidates(
     checkDeliveryIds(task),
-    (deps.scanSessions || scanSessions)(),
+    await isolatedSessionScan({ fresh: false }, deps),
     deps.excluded || excludedSessionIds(),
   );
   // pickDeliveryCandidates ranks by recency, so hoist the scheduler back to the
@@ -15913,7 +16058,7 @@ async function deliverUnblockToThread(task, text) {
   // On the scan for the same reason as deliverCheckToThread's pick.
   const { candidates, busy } = pickDeliveryCandidates(
     (task.fm.sessions || []).map((session) => session && session.id),
-    scanSessions(),
+    await isolatedSessionScan({ fresh: false }),
     excludedSessionIds(),
   );
   for (const candidate of candidates) {
@@ -15946,7 +16091,8 @@ async function deliverUnblockToThread(task, text) {
 // same one resolveSessionId reads — and fall back to an explicitly read-only scan,
 // which labels whatever is already numbered and writes nothing.
 function tellSessions(dry, deps = {}) {
-  const scan = deps.scanSessions || scanSessions;
+  const scan = deps.scanSessions;
+  if (!scan) return copySessions(sessionSnapshot);
   if (!dry) return scan({});
   if (!deps.scanSessions && Date.now() - sessionSnapshotAt < 5000 && sessionSnapshot.length) {
     return copySessions(sessionSnapshot);
@@ -16150,6 +16296,8 @@ function tellRowSource(dry, deps = {}) {
   // miss; it is kept apart from the exact reads so a cached null can never stand in
   // for an exact read of the same id later in the tell.
   const guessed = new Map();
+  let listed = null;
+  let listing = null;
   return {
     scanned: false,
     row: (id, { speculative = false } = {}) => {
@@ -16168,9 +16316,16 @@ function tellRowSource(dry, deps = {}) {
     // the ids that exist, so it is the one case that lists. Bounded is enough to
     // find the id: the row the tell then acts on is read fresh with row(), and the
     // injection lock reads it again before the first character.
-    list: () => (deps.listTellSessions || (() => (Date.now() - sessionSnapshotAt < 5000 && sessionSnapshot.length
-      ? copySessions(sessionSnapshot)
-      : scanSessions({ readOnly: true, allocateNumbers: false, fresh: false }))))(),
+    list: async () => {
+      if (listed) return listed;
+      if (listing) return listing;
+      listing = Promise.resolve().then(async () => {
+        if (deps.listTellSessions) return deps.listTellSessions();
+        if (Date.now() - sessionSnapshotAt < 5000 && sessionSnapshot.length) return copySessions(sessionSnapshot);
+        return isolatedSessionScan({ fresh: false }, deps);
+      }).then((rows) => (listed = rows));
+      try { return await listing; } finally { listing = null; }
+    },
     fresh: (id) => load(id, deps, pinFor(id)) || null,
   };
 }
@@ -16190,9 +16345,10 @@ function tellRowSource(dry, deps = {}) {
 // literal id, and a value that is not a full id, tried exactly before it is matched
 // as a prefix. A full id is a UUID, or any id with an account record; those name a
 // session and are read without a cached miss.
-function resolveTellTarget(value, source, deps = {}) {
+async function resolveTellTarget(value, source, deps = {}) {
   if (deps.resolveSessionId || source.scanned) {
-    return (deps.resolveSessionId || resolveSessionId)(value, { ...deps, scanSessions: () => source.list() });
+    const rows = await source.list();
+    return (deps.resolveSessionId || resolveSessionId)(value, { ...deps, scanSessions: () => rows });
   }
   const wanted = String(value || '');
   const number = sessionNumbers.parseNumber(wanted);
@@ -16211,7 +16367,7 @@ function resolveTellTarget(value, source, deps = {}) {
   const exact = source.row(wanted, { speculative: !fullId });
   if (exact) return exact;
   if (number || wanted.length < 8) throw new InjectionError(400, 'bad session id');
-  const matches = source.list().filter((candidate) => candidate && String(candidate.id || '').startsWith(wanted));
+  const matches = (await source.list()).filter((candidate) => candidate && String(candidate.id || '').startsWith(wanted));
   if (matches.length > 1) {
     throw new InjectionError(400, `session prefix ${wanted} is ambiguous (${matches.map((candidate) => candidate.id.slice(0, 12)).join(', ')})`);
   }
@@ -16305,7 +16461,7 @@ async function tellSession(body, deps = {}) {
       throw new InjectionError(409, `${worst.reason}: ${worst.detail} (on ${body.taskId})`, { reason: worst.reason });
     }
   } else {
-    target = resolveTellTarget(body.sessionId, source, deps);
+    target = await resolveTellTarget(body.sessionId, source, deps);
     // A bare row for a session on another node becomes that node's read of it. Any
     // refusal (its host predates the transcript verb, it is a Pi session or of no
     // known agent, the node did not answer) lands here, before the ledger is read, let
@@ -16369,12 +16525,21 @@ async function tellSession(body, deps = {}) {
     return { ...receipt, dry: true };
   }
 
-  const gate = (deps.withLock || keep.withLock)(() => {
-    const store = tell.loadLedger(root);
-    const decision = tell.tellDecision(store, slot);
-    if (decision.ok) tell.saveLedger(root, tell.recordTell(store, slot));
-    return decision;
-  });
+  const mutationProcess = deps.mutationProcess || daemonMutationProcessForMain
+    || createDaemonMutationProcess();
+  let gate;
+  if (deps.withLock) {
+    gate = deps.withLock(() => {
+      const store = tell.loadLedger(root);
+      const decision = tell.tellDecision(store, slot);
+      if (decision.ok) tell.saveLedger(root, tell.recordTell(store, slot));
+      return decision;
+    });
+  } else {
+    const leave = (deps.daemonRestartGate || daemonRestartGate).enter();
+    try { gate = await mutationProcess.run('tell-reserve', { root, slot }); }
+    finally { leave(); }
+  }
   if (!gate.ok) throw new InjectionError(409, `rate-limited: ${gate.why}`, { reason: 'rate-limited' });
 
   // watcherSend runs this three times — entering the lock, immediately before the first
@@ -16411,7 +16576,13 @@ async function tellSession(body, deps = {}) {
     const typed = Boolean(error && error.typingStarted);
     if (!typed) {
       try {
-        (deps.withLock || keep.withLock)(() => tell.saveLedger(root, tell.releaseTell(tell.loadLedger(root), slot)));
+        if (deps.withLock) {
+          deps.withLock(() => tell.saveLedger(root, tell.releaseTell(tell.loadLedger(root), slot)));
+        } else {
+          const leave = (deps.daemonRestartGate || daemonRestartGate).enter();
+          try { await mutationProcess.run('tell-release', { root, slot }); }
+          finally { leave(); }
+        }
       } catch {}
     } else {
       tell.logTell(root, {
@@ -16511,7 +16682,7 @@ async function announceStateNote(id, deps = {}) {
   );
   const { candidates, busy } = pickDeliveryCandidates(
     (ledger.sessions || []).map((session) => session.id),
-    (deps.scanSessions || scanSessions)(),
+    await isolatedSessionScan({ fresh: false }, deps),
     deps.excluded || excludedSessionIds(),
   );
   const send = deps.send || ((sessionId) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }));
@@ -16584,13 +16755,17 @@ const reviewDeps = {
   sendPlain: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }),
   // Bounded for finding the reviewer and deciding whether a tick is due; review.js
   // asks for { fresh: true } on the look it takes immediately before typing.
-  sessions: (options = {}) => scanSessions({ fresh: false, ...options }),
+  sessions: (options = {}) => isolatedSessionScan({ fresh: false, ...options }),
   // The reviewer pane's meta names the account the automation policy launched it on;
   // the budget governor reads the reviewer's windows from that account.
   hostPanes: () => listHostPanes({}, false),
   sessionContextTokens,
   compact: (sessionId, instruction) => withInjectionLock(() => compactSessionById({ sessionId, instruction }), { session: sessionId, model: true }),
-  who: (project) => buildWhoSnapshot(project),
+  gitState: (project, priorSha) => isolatedDaemonRead('review-git-state', { project, priorSha }, {}, {
+    // The probe compares current worktree state. Never coalesce it with an older
+    // request whose child may have started before the edit this probe is testing.
+    key: `review-git-state:fresh:${++daemonReadSequence}`,
+  }),
 };
 
 function briefClock(value) {
@@ -16626,6 +16801,11 @@ function startBriefScheduler(options = {}) {
   const clock = briefClock(process.env.KEEP_BRIEF_AT || '08:00');
   if (clock.invalid) process.stderr.write(`keep serve: invalid KEEP_BRIEF_AT; using 08:00\n`);
   let running = false;
+  const runMutation = async (operation, input, runOptions) => {
+    const leave = options.restartGate?.enter?.() || (() => {});
+    try { return await options.mutationProcess.run(operation, input, runOptions); }
+    finally { leave(); }
+  };
   const tick = async () => {
     if (running) return;
     const now = Date.now();
@@ -16638,46 +16818,21 @@ function startBriefScheduler(options = {}) {
     }
     const noon = new Date(date.getFullYear(), date.getMonth(), date.getDate(), 12, 0).getTime();
     if (now >= noon) {
-      let recorded;
+      running = true;
       try {
-        recorded = keep.withLock(() => {
-          const latest = alerts.loadMeta(keep.ROOT);
-          if ((latest.lastBriefDay === day && !latest.lastBriefClaim) || latest.lastBriefGiveUpDay === day) return false;
-          if (latest.lastBriefClaim && now - Number(latest.lastBriefClaimAt || 0) < 10e3) return false;
-          delete latest.lastBriefDay;
-          delete latest.lastBriefClaim;
-          delete latest.lastBriefClaimAt;
-          latest.lastBriefGiveUpDay = day;
-          alerts.appendAlert({
-            id: `brief-failed-${day}`,
-            at: now,
-            level: 'brief',
-            key: `brief:${day}`,
-            text: 'Morning brief delivery failed until the noon cutoff.',
-            from: 'daemon',
-            caller: 'manual',
-            channels: [],
-            delivered: {},
-            deferred: false,
-            failed: true,
-            why: 'no successful delivery by 12:00 local',
-          }, keep.ROOT);
-          alerts.saveMeta(latest, keep.ROOT);
-          return true;
-        });
+        const { recorded } = await runMutation('brief-cutoff', { root: keep.ROOT, now, day });
+        if (recorded) {
+          health.record('brief', { ok: false, error: 'no successful delivery by 12:00 local' });
+          process.stderr.write(`keep serve: morning brief failed; giving up after 12:00 local\n`);
+          // After the cutoff nothing is retried until tomorrow, so these skips hold the
+          // result (bin/health.js record): a brief that gave up is not recovered because
+          // the afternoon has nothing due. After a delivered brief there is no failure to
+          // hold and the skip stays a clean one.
+        } else health.record('brief', { ok: true, skipped: true, holdResult: true, detail: 'nothing due' });
       } catch (error) {
         health.record('brief', { ok: false, error });
         process.stderr.write(`keep serve: morning brief cutoff record failed: ${error.message}\n`);
-        return;
-      }
-      if (recorded) {
-        health.record('brief', { ok: false, error: 'no successful delivery by 12:00 local' });
-        process.stderr.write(`keep serve: morning brief failed; giving up after 12:00 local\n`);
-        // After the cutoff nothing is retried until tomorrow, so these skips hold the
-        // result (bin/health.js record): a brief that gave up is not recovered because
-        // the afternoon has nothing due. After a delivered brief there is no failure to
-        // hold and the skip stays a clean one.
-      } else health.record('brief', { ok: true, skipped: true, holdResult: true, detail: 'nothing due' });
+      } finally { running = false; }
       return;
     }
     if (!briefDue(meta, now, clock)) {
@@ -16686,18 +16841,7 @@ function startBriefScheduler(options = {}) {
     }
     running = true;
     try {
-      const brief = keep.briefSnapshot(now);
-      const result = await alerts.sendAlert({
-        root: keep.ROOT,
-        level: 'brief',
-        key: `brief:${day}`,
-        text: brief.text,
-        spoken: brief.spoken,
-        from: 'daemon',
-        caller: 'manual',
-        now,
-        withLock: keep.withLock,
-      });
+      const result = await runMutation('morning-brief', { root: keep.ROOT, now, day }, { timeoutMs: 5 * 60e3 });
       const outcome = briefTickOutcome(result);
       process.stderr.write(`keep serve: ${outcome.log}\n`);
       if (options.onChange) options.onChange();
@@ -16755,10 +16899,14 @@ function startWtGcScheduler(options = {}) {
 }
 
 function start(deps = {}) {
+  const daemonRegistryLockPolicy = deps.daemonRegistryLockPolicy || createDaemonRegistryLockPolicy(deps.lockPolicyDeps);
   health.record('daemon', { at: Date.now(), pid: process.pid, version: health.VERSION, ...health.codeCommit() });
   const terminalProfile = deps.terminalProfile || require('./terminal-profile').createTerminalProfileStore();
   let consoleServer = null;
   let dashboardBuilder = null;
+  let daemonReadWorker = null;
+  let maintenanceProcess = null;
+  let digestRefresh = null;
   let dashboardPublisher = null;
   let uiWorker = null;
   let backendServer = null;
@@ -16769,7 +16917,15 @@ function start(deps = {}) {
   const mutationEpoch = crypto.randomBytes(12).toString('hex');
   let mutationSequence = 0;
   const mutationFence = () => `${mutationEpoch}:${mutationSequence}`;
-  const shutdown = () => {
+  let shutdownStarted = false;
+  const shutdown = async () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    daemonMainLoopPolicy.leave();
+    daemonRegistryLockPolicy.close?.();
+    daemonReadWorkerForMain = null;
+    daemonDashboardBuildForMain = null;
+    daemonMutationProcessForMain = null;
     if (inFlightSwap) {
       const settingsFile = inFlightSwap.settingsFile || claudeSettingsPath();
       const action = shutdownSettingsRepair(inFlightSwap, readClaudeSettingsModel(settingsFile));
@@ -16786,11 +16942,14 @@ function start(deps = {}) {
     }
     dashboardPublisher?.close();
     dashboardBuilder?.close();
+    daemonReadWorker?.close();
     uiWorker?.close();
     consoleServer?.close();
     backendServer?.close();
     nodeApiServer?.close();
     try { if (backendSock) fs.unlinkSync(backendSock); } catch {}
+    try { await maintenanceProcess?.close(); }
+    catch (error) { process.stderr.write(`keep serve: mutation cleanup failed: ${error.message}\n`); }
     process.exit(0);
   };
   process.on('SIGTERM', shutdown);
@@ -16801,8 +16960,19 @@ function start(deps = {}) {
     if (fs.statSync(logFile).size > 5 * 1024 * 1024) fs.truncateSync(logFile);
   } catch {}
 
+  daemonReadWorker = deps.daemonReadWorker || createDaemonReadWorker();
+  daemonReadWorkerForMain = daemonReadWorker;
+  daemonMainLoopPolicy.enter();
+  maintenanceProcess = deps.maintenanceProcess || createDaemonMutationProcess({
+    enter: () => daemonRestartGate.enter(),
+  });
+  daemonMutationProcessForMain = maintenanceProcess;
+  digestRefresh = createDigestRefresh({
+    root: keep.ROOT, health, mutationProcess: maintenanceProcess, restartGate: daemonRestartGate,
+    onChange: () => dashboardPublisher?.invalidate(),
+  });
   dashboardBuilder = deps.dashboardWorker || createDashboardWorker({
-    prepare: (input) => ({ ...input, dashboardRuntime: dashboardRuntimeSnapshot() }),
+    prepare: (input) => ({ ...input, dashboardRuntime: dashboardRuntimeSnapshot(digestRefresh) }),
     finalize: finalizeDashboardWorkerResult,
   });
   const jobLedger = require('./background-jobs');
@@ -16815,6 +16985,7 @@ function start(deps = {}) {
     // present when there are any, so a single-node build input is what it always was.
     ...(options.nodeSessions ? { nodeSessions: options.nodeSessions } : {}),
   });
+  daemonDashboardBuildForMain = dashboardBuild;
   const publishedPanes = { panes: null, at: 0, epoch: 0 };
   let lastPaneEpoch = 0;
   const attentionPush = require('./attention-push.js').createAttentionPush({
@@ -17043,23 +17214,27 @@ function start(deps = {}) {
     dashboardDetail, deliverCheckToThread, deliverUnblockToThread, discord, driftWakeFromVerdict,
     envNumber, features, forceRestartSession, fs, handoffRateLimited, handoffSession, handoffSessionRequest, health, hostRequest,
     ideas,
+    inspectAccountHandoff: (body, options = {}) => inspectAccountHandoff(body, { ...options, dashboardBuild }),
     inspectReviewQueueLaunch, keep, keepConsole, landed, launchReviewQueueSession,
-    limitresume, listHostPaneResult, listHostPanes, listPortableTransfers, liveSessionTick, liveTurnIndexSessions,
+    limitresume, listHostPaneResult, listHostPanes, listPortableTransfers,
+    liveSessionTick: (options = {}) => liveSessionTick({ ...options, readWorker: daemonReadWorker }), liveTurnIndexSessions,
     loadCurrentSession, loadSessionForAction, notifications, openCheckSession, openSession, path, portableTransferDraft,
     portableTransferPreview, preparePortableTransfer, prepareSessionSummary, projectMobileState,
     readBody, readLiveSessionLedger, readScreenResult, recentTranscriptText, recoverReviewQueueLaunch, reminders,
+    readSessions: (options = {}) => isolatedSessionScan(options),
     remoteSession, reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, resolveSessionTarget,
     restartSession,
     restorePlan, resumeAfterLimit, retireLeftDeliveryDrafts, review, reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow,
     runTaskNow, runs, scanSessions, screenHistorySession, screenSession, sendSessionKeys,
     sendStateJson, sendToResolvedTarget, sendToSession, sendToSessionLocked, sessionMarks, sessionNames, sessionSummaryFile, sessionSummarySnapshot,
-    setAsideCandidates, slack, stallAliveIds, stalled, stalledSessionSnapshot, standup, tellSession,
+    setAsideCandidates, slack, stallAliveIds, stalled,
+    stalledSessionSnapshot: (now) => stalledSessionSnapshot(now, { readWorker: daemonReadWorker }), standup, tellSession,
     startAutoCompact, startBriefScheduler, startHandoffQueue, startWtGcScheduler, summarize,
     transcriptFileForSession, pendingCompactSwaps, deliveryReceiptFor,
     transferSession, moveSession,
     unblock, updateSetAside, usage, wantsConsoleState, watcherSend,
     withInjectionLock, writeTarget, writeToShellPane,
-    broadcast, dashboardBuild, dashboardBuilder, deps, shutdown, terminalProfile,
+    broadcast, dashboardBuild, dashboardBuilder, daemonReadWorker, maintenanceProcess, deps, shutdown, terminalProfile,
     get json() { return json; },
     get onChange() { return onChange; },
     get onFocus() { return onFocus; },
@@ -17099,6 +17274,8 @@ function start(deps = {}) {
   ctx.nodeApiEnabled = () => nodeApiListen.enabled === true;
   ctx.registryService = nodeApiListen.enabled ? require('./registry-route.js').createRegistryService({
     root: keep.ROOT, stopping: () => daemonRestartGate.stopping,
+    readWorker: daemonReadWorker,
+    mutationProcess: maintenanceProcess,
   }) : null;
   if (ctx.registryService) registryRunsInFlight = () => ctx.registryService.busy();
   // A node's Claude hooks, through the registry service's journal and restart gate.
@@ -17510,8 +17687,10 @@ module.exports = {
   resolveSessionTarget, remoteDeliveryRefusal,
   resolveSessionId, screenSession, screenHistorySession, sendSessionKeys, shellPaneTarget, stripTerminalAnsi, writeToShellPane,
   agentProcessRows, parseProcessTable, agentRowUnreadable, liveSessionPids, liveSessionTick, restorePlan,
+  createDaemonMainLoopPolicy, createDaemonRegistryLockPolicy,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession, reopenSessionOnAccount,
+  assignOpenedSessionNumber,
   runCheckNow, runTaskNow, openCheckSession, taskRunMessage, adoptedPaneMeta, closeEphemeralPane, resolveOpener, inheritedOpener,
   transcriptFileForSession,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession, sessionHeldOn,

@@ -840,6 +840,7 @@ const lockToken = () => `${process.pid}-${Date.now().toString(36)}-${Math.random
 // withLock below is the three lines it actually is — acquire, wait, release —
 // rather than that loop with a body threaded through it.
 function acquireLock(token, deps = {}) {
+  deps = lockPolicyOptions(deps);
   const now = deps.now || Date.now;
   const startedAt = deps.processStartedAt || processStartedAt;
   const kill = deps.kill || process.kill;
@@ -850,7 +851,9 @@ function acquireLock(token, deps = {}) {
       fs.mkdirSync(LOCK);
       try {
         fs.writeFileSync(ownerFile, JSON.stringify({
-          pid: process.pid, token, startedAt: ownProcessStartedAt(),
+          pid: process.pid, token,
+          startedAt: typeof deps.ownerStartedAt === 'string'
+            ? deps.ownerStartedAt : ownProcessStartedAt(),
         }));
       }
       catch (error) {
@@ -860,6 +863,10 @@ function acquireLock(token, deps = {}) {
       return true;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
+      // The daemon never proves another process dead from its event loop. `ps`
+      // can take a second on a swapping machine, and reclaiming is not required
+      // for a request that can immediately report contention and be retried.
+      if (deps.reclaimStale === false) return false;
       let reclaimed = false;
       try {
         if (now() - fs.statSync(LOCK).mtimeMs > 60e3) {
@@ -905,20 +912,61 @@ function releaseLock(token, scope) {
 
 const lockWaitArray = new Int32Array(new SharedArrayBuffer(4));
 function waitForLock(ms = 100) {
+  // A daemon policy is process-local. Mutation children load a separate module
+  // instance and keep the ordinary CLI wait/reclaim behavior, while any direct
+  // wait accidentally introduced on the daemon main thread fails closed.
+  if (lockPolicy) die(LOCK_BUSY);
   Atomics.wait(lockWaitArray, 0, 0, ms);
 }
 
+let lockPolicy = null;
+
+// Install a process-local policy for lock acquisition. The daemon uses this to
+// make every lexical or destructured withLock caller fail fast, including callers
+// loaded before serve starts; mutation children are separate processes and do not
+// inherit it. Returns an idempotent restore function for orderly shutdown/tests.
+function setLockPolicy(policy) {
+  const previous = lockPolicy;
+  lockPolicy = typeof policy === 'function' ? policy : (policy ? () => policy : null);
+  const installed = lockPolicy;
+  let restored = false;
+  return () => {
+    if (restored) return;
+    restored = true;
+    if (lockPolicy === installed) lockPolicy = previous;
+  };
+}
+
+function lockPolicyOptions(options = {}) {
+  if (!lockPolicy) return options;
+  const enforced = lockPolicy() || {};
+  // Until the asynchronously-read process identity is available, taking a lock
+  // would create an owner record that cannot safely distinguish PID reuse.
+  if (enforced.ready === false || typeof enforced.ownerStartedAt !== 'string'
+      || !enforced.ownerStartedAt) die(LOCK_BUSY);
+  return {
+    ...options,
+    // These values deliberately come last: daemon callers cannot opt back into
+    // a synchronous wait or stale-owner `ps` probe.
+    timeoutMs: 0,
+    reclaimStale: false,
+    ownerStartedAt: enforced.ownerStartedAt,
+  };
+}
+
 function withLock(fn, options = {}) {
+  options = lockPolicyOptions(options);
   const scope = scopeFor(options.scope);
   fs.mkdirSync(paths(scope.root).meta, { recursive: true });
   const now = options.now || scope.now;
   const acquire = options.acquire || ((token) => acquireLock(token, { ...options, scope }));
   const release = options.release || ((token) => releaseLock(token, scope));
   const wait = options.wait || waitForLock;
-  const deadline = now() + 5000;
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(0, options.timeoutMs) : 5000;
+  const deadline = now() + timeoutMs;
   const token = lockToken();
   while (!acquire(token)) {
-    if (now() > deadline) die(LOCK_BUSY);
+    if (timeoutMs === 0 || now() > deadline) die(LOCK_BUSY);
     wait(100);
   }
   try {
@@ -1912,7 +1960,7 @@ module.exports = {
   attributeHeading, countReviewerStatusChange, sessionInTaskProject, recordScheduler, clearScheduler,
   invalidateSchedulerHandoff, recordProgressMarker, recordContribution, recordSession,
   warnSkippedSessionLink, parsePlan, renderPlan, setPlan, nextStep, demoteHeadings, appendLog,
-  recordDaemonSessionClose, lastLogLine, processStartedAt, acquireLock, waitForLock, withLock,
+  recordDaemonSessionClose, lastLogLine, processStartedAt, acquireLock, waitForLock, withLock, setLockPolicy,
   git, commitAndPush, parseArgs,
   inAgentSession, die, cleanScalar, cleanExperimentId, canonicalCwdMemo, canonicalCwd, inferProject,
   normalizeProjectPath, canonicalProjectPath, resolveProjectArg, writeJsonAtomic, activeHolds, holdFile,

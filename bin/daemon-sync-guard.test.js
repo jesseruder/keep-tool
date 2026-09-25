@@ -1,169 +1,235 @@
 'use strict';
 
-// The daemon runs every scheduler tick and every HTTP route on one event loop. A
-// synchronous child process there (execFileSync, spawnSync, execSync) blocks all of
-// it, host requests included, for as long as the child runs: that is how git
-// spawns and the handoff tick ended up as multi-second stalls. This test keeps the
-// class from coming back quietly. Every synchronous spawn in the daemon's tick and
-// route files, and in the modules whose schedulers the daemon runs in-process, has
-// to be on the allowlist below: either with the reason it is safe, or marked as
-// known debt so a new site beside it still fails.
-
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { createAnalyzer, comparePolicy, manifestFrom } = require('../scripts/daemon-sync-policy.cjs');
 
-const FILES = [
-  'bin/serve.js', 'bin/serve/schedulers.js', 'bin/serve/routes.js', 'bin/handoff-queue.js',
-  // Modules whose startScheduler the daemon calls, so their ticks run on its loop.
-  'bin/landed.js', 'bin/lint.js', 'bin/review.js', 'bin/self-repair.js',
-  // Run from the stalled tick (bin/serve/schedulers.js) every minute.
-  'bin/inflight.js',
-];
-const SYNC_SPAWN = /\b(execFileSync|spawnSync|execSync)\b/g;
+const ROOT = path.join(__dirname, '..');
+const MANIFEST = path.join(__dirname, 'daemon-sync-debt.json');
 
-// Keyed by file and the enclosing top-level declaration (a function, or the
-// `const` a top-level object or import is bound to; '(top level)' for a
-// destructured import); `count` is the exact number of mentions there (imports
-// and injectable defaults count, so a new call beside the allowed ones fails).
-const ALLOWLIST = [
-  {
-    file: 'bin/serve/schedulers.js',
-    function: 'createRegistryPull',
-    count: 4,
-    // The injectable default (two mentions on one line), the rebase and the
-    // abort. The rebase runs under the registry lock on purpose: every other
-    // keep.withLock caller in
-    // the process waits by blocking the loop, so an async holder could never be
-    // woken to release it. It only runs when the fetch (asynchronous, unlocked)
-    // found new commits, and with the objects already local it takes milliseconds.
-    why: 'registry rebase under the registry lock, only after an async fetch found commits',
-  },
-  // ---- Known debt: synchronous today, on a daemon tick. Do not copy these; move
-  // them to an async child when their module is next touched.
-  {
-    file: 'bin/landed.js',
-    function: 'deps',
-    count: 2,
-    // DEBT: the test seam every landed.js git call goes through. The module memoizes
-    // answers (repo, default branch, commit dependencies) so a state build rarely
-    // spawns, but a cache miss spawns git synchronously on the daemon loop.
-    why: 'debt: landed.js git seam, synchronous on a cache miss',
-  },
-  {
-    file: 'bin/landed.js',
-    function: 'git',
-    count: 1,
-    // DEBT: the one caller of the seam above.
-    why: 'debt: landed.js git(), synchronous on a cache miss',
-  },
-  {
-    file: 'bin/lint.js',
-    function: '(top level)',
-    count: 1,
-    // DEBT: the import the two sites below use.
-    why: 'debt: lint.js execFileSync import',
-  },
-  {
-    file: 'bin/lint.js',
-    function: 'checkoutState',
-    count: 1,
-    // DEBT: git status of each main checkout, on the 30-minute lint tick.
-    why: 'debt: lint.js checkout status, synchronous on the lint tick',
-  },
-  {
-    file: 'bin/lint.js',
-    function: 'git',
-    count: 1,
-    // DEBT: the lint rules' local git reads, on the 30-minute lint tick.
-    why: 'debt: lint.js git(), synchronous on the lint tick',
-  },
-  {
-    file: 'bin/review.js',
-    function: '(top level)',
-    count: 1,
-    // DEBT: the import the git() site below uses.
-    why: 'debt: review.js execFileSync import',
-  },
-  {
-    file: 'bin/review.js',
-    function: 'git',
-    count: 1,
-    // DEBT: the fleet reviewer's git reads (diffs, logs) for its bundle.
-    why: 'debt: review.js git(), synchronous in the reviewer tick',
-  },
-  {
-    file: 'bin/self-repair.js',
-    function: 'patchIdOf',
-    count: 1,
-    // DEBT: git patch-id when the self-repair tick checks whether a repair card's
-    // commit landed through a reviewed patch; runs in the daemon, not a child.
-    why: 'debt: self-repair.js patch-id, synchronous in the self-repair tick',
-  },
-];
-
-// Line comments and block-comment lines are prose, not calls.
-function codeOf(line) {
-  const trimmed = line.trim();
-  if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) return '';
-  const comment = line.indexOf(' // ');
-  return comment >= 0 ? line.slice(0, comment) : line;
+function fixture(files, run) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-daemon-sync-'));
+  try {
+    for (const [name, source] of Object.entries(files)) {
+      const file = path.join(root, name);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, source);
+    }
+    return run(root);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 }
 
-function syncSpawns(file) {
-  const lines = fs.readFileSync(path.join(__dirname, '..', file), 'utf8').split('\n');
-  const found = [];
-  let enclosing = '(top level)';
-  lines.forEach((line, index) => {
-    const declared = /^(?:async\s+)?function\s*\*?\s*([A-Za-z0-9_$]+)\s*\(/.exec(line);
-    const bound = /^(?:const|let|var)\s+([A-Za-z0-9_$]+)\b/.exec(line);
-    if (declared) enclosing = declared[1];
-    else if (bound) enclosing = bound[1];
-    else if (/^(?:const|let|var)\s*[{[]/.test(line) || /^module\.exports\b/.test(line)) enclosing = '(top level)';
-    for (const match of codeOf(line).matchAll(SYNC_SPAWN)) {
-      found.push({ file, function: enclosing, line: index + 1, name: match[1], text: line.trim() });
-    }
-  });
-  return found;
+function analyzeFixture(files, surfaces = ['bin/serve/routes.js']) {
+  return fixture(files, (root) => createAnalyzer(root).run(surfaces));
 }
 
-test('daemon tick and route files spawn children asynchronously, outside the allowlist', () => {
-  const found = FILES.flatMap(syncSpawns);
-  const groups = new Map();
-  for (const hit of found) {
-    const key = `${hit.file} ${hit.function}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(hit);
-  }
-  const problems = [];
-  for (const [key, hits] of groups) {
-    const allowed = ALLOWLIST.find((entry) => `${entry.file} ${entry.function}` === key);
-    if (!allowed || hits.length !== allowed.count) {
-      problems.push(...hits.map((hit) => `${hit.file}:${hit.line} (${hit.function}) ${hit.text}`));
-    }
-  }
+test('daemon main-thread sync debt matches the exact checked manifest', () => {
+  const analysis = createAnalyzer(ROOT).run();
+  const manifest = JSON.parse(fs.readFileSync(MANIFEST, 'utf8'));
+  const problems = comparePolicy(analysis, manifest);
   assert.deepEqual(problems, [], [
-    'A synchronous child process in the daemon blocks every scheduler tick and HTTP route',
-    'for as long as the child runs. Daemon tick and route paths spawn asynchronously',
-    '(execFile/spawn with a callback or promise). If this call genuinely must be',
-    'synchronous, add it with its reason to ALLOWLIST in bin/daemon-sync-guard.test.js.',
-    'Unlisted or over-count sites:',
+    'Synchronous filesystem, subprocess, and Atomics.wait work blocks every daemon route and scheduler when selected on the main thread.',
+    'Move new work to an asynchronous API or a worker. The manifest contains exact legacy debt, not safe APIs:',
     ...problems,
   ].join('\n'));
 });
 
-test('every allowlisted site still exists, so the list cannot rot into a blanket pass', () => {
-  const found = FILES.flatMap(syncSpawns);
-  for (const entry of ALLOWLIST) {
-    const hits = found.filter((hit) => hit.file === entry.file && hit.function === entry.function);
-    assert.equal(hits.length, entry.count,
-      `${entry.file} ${entry.function} is allowlisted for ${entry.count} synchronous spawn mentions but has ${hits.length}; update ALLOWLIST in bin/daemon-sync-guard.test.js`);
+test('scanner resolves aliases, destructuring, reexports, and helper calls', () => {
+  const analysis = analyzeFixture({
+    'bin/serve/routes.js': `
+      const fs = require('node:fs');
+      const read = fs.readFileSync;
+      const { spawnSync: run } = require('child_process');
+      const wait = Atomics.wait;
+      const helper = require('../helper');
+      function routes() { read('x'); run('x'); wait(new Int32Array(1), 0); helper.go(); }
+      module.exports = { routes };
+    `,
+    'bin/helper.js': `module.exports = require('./leaf')`,
+    'bin/leaf.js': `
+      const { statSync: stat } = require('fs');
+      function go() { return stat('.'); }
+      module.exports = { go };
+    `,
+  });
+  assert.deepEqual(analysis.sinks.map((item) => item.operation).sort(), [
+    'Atomics.wait', 'child_process.spawnSync', 'fs.readFileSync', 'fs.statSync',
+  ]);
+  assert.ok(analysis.edges.some((edge) => edge.caller.endsWith('::routes') && edge.callee.endsWith('::go')));
+});
+
+test('a new route path to a pre-existing blocking helper fails the ratchet', () => {
+  fixture({
+    'bin/serve/routes.js': `
+      const helper = require('../helper');
+      function routes() { return helper.safe(); }
+      module.exports = { routes };
+    `,
+    'bin/helper.js': `
+      const fs = require('node:fs');
+      function safe() { return 1; }
+      function blocking() { return fs.readFileSync('large'); }
+      module.exports = { safe, blocking };
+    `,
+  }, (root) => {
+    const first = createAnalyzer(root).run(['bin/serve/routes.js']);
+    const manifest = manifestFrom(first);
+    assert.deepEqual(comparePolicy(first, manifest), []);
+    fs.writeFileSync(path.join(root, 'bin/serve/routes.js'), `
+      const helper = require('../helper');
+      function routes() { return helper.blocking(); }
+      module.exports = { routes };
+    `);
+    const regressed = createAnalyzer(root).run(['bin/serve/routes.js']);
+    const problems = comparePolicy(regressed, manifest);
+    assert.ok(problems.some((item) => item.includes('new direct sink') && item.includes('fs.readFileSync')), problems.join('\n'));
+    assert.ok(problems.some((item) => item.includes('new blocking call edge') && item.includes('routes') && item.includes('blocking')), problems.join('\n'));
+  });
+});
+
+test('a second call to an already-reached blocking helper fails the edge count', () => {
+  fixture({
+    'bin/serve/schedulers.js': `
+      const helper = require('../helper');
+      function startSchedulers() { helper.blocking(); }
+      module.exports = { startSchedulers };
+    `,
+    'bin/helper.js': `
+      const { readFileSync } = require('node:fs');
+      function blocking() { return readFileSync('large'); }
+      module.exports = { blocking };
+    `,
+  }, (root) => {
+    const first = createAnalyzer(root).run(['bin/serve/schedulers.js']);
+    const manifest = manifestFrom(first);
+    fs.writeFileSync(path.join(root, 'bin/serve/schedulers.js'), `
+      const helper = require('../helper');
+      function startSchedulers() { helper.blocking(); helper.blocking(); }
+      module.exports = { startSchedulers };
+    `);
+    const problems = comparePolicy(createAnalyzer(root).run(['bin/serve/schedulers.js']), manifest);
+    assert.ok(problems.some((item) => item.includes('new blocking call edge') && item.endsWith('|2')), problems.join('\n'));
+    assert.ok(problems.some((item) => item.includes('stale blocking-edge debt') && item.endsWith('|1')), problems.join('\n'));
+  });
+});
+
+test('higher-order calls and bound aliases cannot hide blocking capabilities', () => {
+  const analysis = analyzeFixture({
+    'bin/serve/routes.js': `
+      const fs = require('node:fs');
+      const helper = require('../helper');
+      const read = fs.readFileSync.bind(fs);
+      function invoke(fn) { return fn('file'); }
+      function routes() { read('one'); invoke(fs.readFileSync); [1].map(helper.blocking); }
+      module.exports = { routes };
+    `,
+    'bin/helper.js': `
+      const fs = require('node:fs');
+      function blocking() { return fs.statSync('file'); }
+      module.exports = { blocking };
+    `,
+  });
+  const read = analysis.sinks.find((sink) => sink.operation === 'fs.readFileSync');
+  assert.equal(read.count, 2, JSON.stringify(analysis.sinks));
+  assert.ok(analysis.edges.some((edge) => edge.caller.endsWith('::routes') && edge.callee.endsWith('::blocking')),
+    JSON.stringify(analysis.edges));
+});
+
+test('a Worker launch is a boundary but directly requiring its child is not', () => {
+  const analysis = analyzeFixture({
+    'bin/serve/routes.js': `
+      const path = require('node:path');
+      const { Worker } = require('node:worker_threads');
+      function routes() { return new Worker(path.join(__dirname, '../dashboard-build-worker.js')); }
+      module.exports = { routes };
+    `,
+    'bin/dashboard-build-worker.js': `
+      const fs = require('node:fs');
+      function run() { return fs.readFileSync('large'); }
+      module.exports = { run };
+    `,
+  });
+  assert.deepEqual(analysis.sinks, []);
+  assert.equal(analysis.reachable.some((name) => name.includes('dashboard-build-worker')), false);
+
+  const direct = analyzeFixture({
+    'bin/serve/routes.js': `
+      const worker = require('../dashboard-build-worker');
+      function routes() { return worker.run(); }
+      module.exports = { routes };
+    `,
+    'bin/dashboard-build-worker.js': `
+      const fs = require('node:fs');
+      function run() { return fs.readFileSync('large'); }
+      module.exports = { run };
+    `,
+  });
+  assert.ok(direct.sinks.some((sink) => sink.operation === 'fs.readFileSync'), JSON.stringify(direct.sinks));
+  assert.ok(direct.edges.some((edge) => edge.caller.endsWith('::routes') && edge.callee.endsWith('::run')),
+    JSON.stringify(direct.edges));
+});
+
+test('new computed dispatch fails closed and stale debt cannot linger', () => {
+  const analysis = analyzeFixture({
+    'bin/serve/routes.js': `
+      const handlers = { a() {} };
+      function routes(name) { return handlers[name](); }
+      module.exports = { routes };
+    `,
+  });
+  const problems = comparePolicy(analysis, { version: 1, sinks: [], edges: [], unresolved: [] });
+  assert.ok(problems.some((item) => item.includes('new unresolved call')), problems.join('\n'));
+  const manifest = manifestFrom(analysis);
+  assert.deepEqual(comparePolicy(analysis, manifest), []);
+  const clean = analyzeFixture({
+    'bin/serve/routes.js': `function routes() { return 1; } module.exports = { routes };`,
+  });
+  assert.ok(comparePolicy(clean, manifest).some((item) => item.includes('stale unresolved-call debt')));
+});
+
+test('review queue HEAD lookup is asynchronous, shares in-flight work, and caches failures', async () => {
+  const { headShaCached } = require('./review.js');
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-head-'));
+  try {
+    let calls = 0;
+    const run = (_command, _args, options, callback) => {
+      calls += 1;
+      assert.equal(options.timeout, 10e3);
+      setImmediate(() => callback(null, 'abc123\n'));
+    };
+    const cache = new Map();
+    assert.deepEqual(await Promise.all([
+      headShaCached(project, cache, run),
+      headShaCached(project, cache, run),
+    ]), ['abc123', 'abc123']);
+    assert.equal(calls, 1);
+
+    const failed = new Map();
+    const fail = (_command, _args, _options, callback) => {
+      calls += 1;
+      setImmediate(() => callback(new Error('not a repository'), ''));
+    };
+    assert.equal(await headShaCached(project, failed, fail), '');
+    assert.equal(await headShaCached(project, failed, fail), '');
+    assert.equal(calls, 2, 'the rejected lookup is cached as an empty result');
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true });
   }
 });
 
-test('the scanner sees a call and ignores prose', () => {
-  assert.equal(codeOf('  // execFileSync says ETIMEDOUT'), '');
-  assert.equal(codeOf('  run(); // spawnSync would block').includes('spawnSync'), false);
-  assert.equal([...codeOf("  require('child_process').execSync('ls');").matchAll(SYNC_SPAWN)].length, 1);
+test('review Git state is available through the daemon read worker boundary', async (t) => {
+  const { createDaemonReadWorker } = require('./daemon-read-worker.js');
+  const worker = createDaemonReadWorker({ timeoutMs: 30e3 });
+  t.after(() => worker.close());
+  const state = await worker.run('review-git-state', { project: ROOT, priorSha: '' }, {
+    key: `review-git-state:test:${Date.now()}`,
+  });
+  assert.equal(state.available, true);
+  assert.equal(typeof state.head, 'string');
+  assert.equal(typeof state.status, 'string');
 });

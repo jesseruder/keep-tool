@@ -1109,6 +1109,77 @@ test('a Codex session the daemon never heard register is adopted from its one pa
   assert.equal(host.asked, 1);
 });
 
+test('production late adoption keeps authority on the daemon and preserves the same records', async (t) => {
+  const mutationProcess = require('./daemon-mutation-process.js').createDaemonMutationProcess({ timeoutMs: 10e3 });
+  t.after(() => mutationProcess.close());
+  const { svc, root, env } = adoptingService(t, [lateCodexPane()], { mutationProcess });
+  const answer = await svc.handle(AWS1, lateBody(root));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.deepEqual(require('./accounts.js').sessionLocation('codex-late', { root, env }),
+    { node: 'aws1', agent: 'codex', accountId: 'codex-node' });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.keep', 'panes', 'codex-late.json'))).pane, 'p7@aws1');
+});
+
+test('two concurrent Pi successors cannot both take one predecessor pane', async (t) => {
+  const root = tempDir(t);
+  const configFile = path.join(root, 'config.json');
+  fs.writeFileSync(configFile, `${JSON.stringify({ version: 1, daemonNode: 'main', nodes: { main: {}, aws1: {} },
+    accounts: [] })}\n`);
+  const env = { PATH: '/usr/bin:/bin', HOME: root, KEEP_CONFIG: configFile };
+  const accounts = require('./accounts.js');
+  accounts.pinSession('pi-old', 'pi', 'pi/default', { root, env, node: 'aws1' });
+  const instance = '11111111-1111-4111-8111-111111111111';
+  fs.mkdirSync(path.join(root, '.keep', 'panes'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.keep', 'panes', 'pi-old.json'), JSON.stringify({
+    pane: 'p7@aws1', agent: 'pi', piInstance: instance,
+  }));
+  const pane = { id: 'p7', alive: true, cwd: '/home/node/project',
+    meta: { agent: 'pi', accountId: 'pi/default', sessionId: 'pi-old', node: 'aws1' } };
+  const hostConnect = async () => ({
+    request: async (type) => type === 'list' ? { panes: [pane] }
+      : { event: { id: 'pi-old', phase: 'shutdown', instance, pid: 77 } },
+    close() {},
+  });
+  const mutationProcess = require('./daemon-mutation-process.js').createDaemonMutationProcess({ timeoutMs: 10e3 });
+  t.after(() => mutationProcess.close());
+  const adoption = require('./late-adoption.js').createLateAdoption({
+    root, env, accounts, hostConnect, mutationProcess, daemonNode: () => 'main',
+    location: (id) => accounts.sessionLocation(id, { root, env }),
+  });
+  const attempt = (sessionId) => adoption.adopt('aws1', sessionId, 'pi', {
+    pane: 'p7@aws1', pi: { instance, pid: 77 },
+  });
+  const results = await Promise.all([attempt('pi-new-a'), attempt('pi-new-b')]);
+  assert.equal(results.filter((result) => result.adopted).length, 1);
+  assert.equal(results.filter((result) => !result.adopted).length, 1);
+  const prior = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'panes', 'pi-old.json'), 'utf8'));
+  assert.ok(['pi-new-a', 'pi-new-b'].includes(prior.successor));
+  const locations = ['pi-new-a', 'pi-new-b'].map((id) => accounts.sessionLocation(id, { root, env })).filter(Boolean);
+  assert.equal(locations.length, 1, 'only the recorded successor gains authority');
+  assert.equal(locations[0].node, 'aws1');
+});
+
+test('late adoption is admitted before its journal and holds the restart gate until it settles', async (t) => {
+  const root = tempDir(t);
+  let finish;
+  let stopping = false;
+  const lateAdoption = {
+    unlocated: () => true,
+    adopt: () => new Promise((resolve) => { finish = resolve; }),
+  };
+  const svc = createRegistryService({ root, daemonNode: () => 'main', stopping: () => stopping,
+    lateAdoption, location: () => null, env: { PATH: '/usr/bin:/bin', HOME: root },
+    configFile: path.join(root, 'config.json') });
+  const pending = svc.shared.adopt('aws1', 'late-session', 'codex', {});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(svc.busy(), true, 'restart waits before the command journal exists');
+  stopping = true;
+  await assert.rejects(svc.shared.adopt('aws1', 'another-session', 'codex', {}), /daemon restarting/);
+  finish({ adopted: false, why: 'test complete' });
+  await pending;
+  assert.equal(svc.busy(), false);
+});
+
 test('late adoption refuses a pane of another agent, two panes naming the session, an unknown account and a pane the request does not name', async (t) => {
   const cases = [
     ['wrong agent', [lateCodexPane({ agent: 'claude' })], {}],
@@ -1463,6 +1534,20 @@ test('a card open\'s launch puts the adopted session on that card, releases the 
   result = await plain.adopt();
   assert.equal(result.adopted, true);
   assert.equal(result.linked, undefined);
+  // Production keeps the exact-file authority transition above on this event loop,
+  // then delegates only the card's registry lock/commit work.
+  const operations = [];
+  const isolatedCard = directAdoption(t, [lateCodexPane()], {
+    mutationProcess: { run: async (operation, input) => {
+      operations.push({ operation, input });
+      return operation === 'late-adoption-link' ? { linked: true } : { released: true };
+    } },
+  }, { card: 'the-card', requester: 'handing-session' });
+  result = await isolatedCard.adopt();
+  assert.equal(result.adopted, true);
+  assert.deepEqual(operations.map(({ operation }) => operation), ['late-adoption-link', 'late-adoption-release']);
+  assert.equal(operations[0].input.session.id, 'codex-late');
+  assert.equal(operations[1].input.sessionId, 'handing-session');
 });
 
 test('late adoption gives up on a node host that never answers its hello within about two seconds, well inside a start\'s deadline', async (t) => {

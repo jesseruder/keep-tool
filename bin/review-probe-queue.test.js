@@ -8,7 +8,7 @@ const { spawnSync } = require('node:child_process');
 
 test('queue backoff leaves cursors intact and yields to human, result, card, Git and attention changes', () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-probe-queue-')));
-  const source = `
+  const source = `(async () => {
     const assert = require('node:assert/strict');
     const fs = require('node:fs');
     const path = require('node:path');
@@ -45,26 +45,26 @@ test('queue backoff leaves cursors intact and yields to human, result, card, Git
     state.git = {sha:git.head,dirtyHash:git.dirtyHash};
     state.probe = probes.acknowledgeProbe(probes.acknowledgeProbe(null,candidate,true,now),candidate,false,now);
     review.saveState(state);
-    const queue = () => review.reviewQueue({minScore:-100});
-    assert.equal(queue().skips['probe-backoff'],1);
+    const queue = () => review.reviewQueue({minScore:-100,gitState:review.gitState});
+    assert.equal((await queue()).skips['probe-backoff'],1);
     assert.equal(review.loadState(task.id).sessions['probe-worker'].offset,0);
     rows[2].message.content[0].content='approved'; write();
-    assert.equal(queue().skips['probe-backoff'],0);
+    assert.equal((await queue()).skips['probe-backoff'],0);
     rows[2].message.content[0].content='pending'; write();
     rows.push({type:'user',message:{content:'Please change the plan'}}); write();
-    assert.equal(queue().skips['probe-backoff'],0);
+    assert.equal((await queue()).skips['probe-backoff'],0);
     rows.pop(); write();
-    task.fm.status='blocked'; assert.equal(queue().skips['probe-backoff'],0); task.fm.status='active';
+    task.fm.status='blocked'; assert.equal((await queue()).skips['probe-backoff'],0); task.fm.status='active';
     fs.writeFileSync(path.join(project,'new-code.js'),'changed');
-    assert.equal(queue().skips['probe-backoff'],0);
+    assert.equal((await queue()).skips['probe-backoff'],0);
     fs.unlinkSync(path.join(project,'new-code.js'));
     fs.mkdirSync(path.join(root,'.keep','attention'),{recursive:true});
     fs.writeFileSync(path.join(root,'.keep','attention','probe-worker.json'),JSON.stringify({type:'question'}));
-    assert.equal(queue().skips['probe-backoff'],0);
+    assert.equal((await queue()).skips['probe-backoff'],0);
     fs.unlinkSync(path.join(root,'.keep','attention','probe-worker.json'));
-    assert.equal(queue().skips['probe-backoff'],1);
+    assert.equal((await queue()).skips['probe-backoff'],1);
     rows[2].message.content[0].is_error=true; write();
-    assert.equal(queue().skips['probe-backoff'],0);
+    assert.equal((await queue()).skips['probe-backoff'],0);
     assert.equal(review.loadState(task.id).sessions['probe-worker'].offset,0);
     // A concurrent outcome lands after bundle gathering began but before staging.
     keep.loadTask = () => task;
@@ -84,7 +84,7 @@ test('queue backoff leaves cursors intact and yields to human, result, card, Git
     assert.equal(review.loadState(task.id).sessions['probe-worker'].offset, 0);
     keep.withLock = lock;
     assert.match(review.buildBundle(task.id, { force: true }).md, /Correction landed/);
-  `;
+  })().catch((error) => { console.error(error); process.exitCode = 1; });`;
   try {
     const result = spawnSync(process.execPath, ['-e', source], {
       cwd: path.join(__dirname, '..'), env: { ...process.env, KEEP_DIR: root, KEEP_ALLOW_PUSH: '0' }, encoding: 'utf8',

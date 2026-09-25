@@ -448,7 +448,7 @@ async function sweep(options = {}) {
   if (!due.length) return { changed: 0, nagged: 0, owner: 0, deferred: 0 };
   const live = require('./watcher-live.js');
   let sessions = [];
-  try { sessions = (options.sessions ? options.sessions() : []) || []; } catch {}
+  try { sessions = (options.sessions ? await options.sessions() : []) || []; } catch {}
   let nagged = 0;
   let owner = 0;
   let deferred = 0;

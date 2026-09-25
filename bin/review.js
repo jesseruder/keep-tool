@@ -18,7 +18,7 @@ const path = require('path');
 const { ref: sessionRef, named: sessionNamed } = require('./session-numbers.js');
 const os = require('os');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const { execFile, execFileSync } = require('child_process');
 const { Worker } = require('node:worker_threads');
 const keep = require('./keep.js');
 const steps = require('./steps.js');
@@ -3818,14 +3818,28 @@ function attentionMarker(sessionId) {
   } catch { return null; }
 }
 
-function headShaCached(project, cache) {
+function asyncGit(cwd, args, run = execFile) {
+  return new Promise((resolve, reject) => run('git', [
+    '-C', cwd,
+    '--no-optional-locks',
+    '-c', 'core.fsmonitor=false',
+    '-c', 'core.hooksPath=/dev/null',
+    ...args,
+  ], {
+    encoding: 'utf8', timeout: 10e3, maxBuffer: 16 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }, (error, stdout) => error ? reject(error) : resolve(stdout)));
+}
+
+async function headShaCached(project, cache, run) {
   const cwd = expandProject(project);
   if (!cwd) return '';
-  if (cache.has(cwd)) return cache.get(cwd);
-  let sha = '';
-  try { sha = git(cwd, ['rev-parse', 'HEAD']).trim(); } catch {}
-  cache.set(cwd, sha);
-  return sha;
+  if (!cache.has(cwd)) {
+    // Cache the in-flight lookup as well as its result: several cards in one
+    // checkout share one child even though the queue can await between cards.
+    cache.set(cwd, asyncGit(cwd, ['rev-parse', 'HEAD'], run).then((out) => out.trim(), () => ''));
+  }
+  return cache.get(cwd);
 }
 
 function scoreTask(task, state, ctx) {
@@ -3911,8 +3925,9 @@ function scoreTask(task, state, ctx) {
   return { score, reasons, newBytes };
 }
 
-function reviewQueue(options) {
+async function reviewQueue(options) {
   const opts = options || {};
+  const readGitState = opts.gitState;
   const limit = Number.isFinite(opts.limit) ? opts.limit : 5;
   const minScore = Number.isFinite(opts.minScore) ? opts.minScore : 10;
   const now = Date.now();
@@ -3947,7 +3962,7 @@ function reviewQueue(options) {
       // `waiting` is Claude Code's idle_prompt: the turn ended and Owner has not typed, not a prompt requiring an answer.
       if (marker && ['question', 'permission'].indexOf(marker.type) !== -1) pendingHuman = true;
     }
-    const headSha = headShaCached(task.fm.project, shaCache);
+    const headSha = await headShaCached(task.fm.project, shaCache, opts.execFile);
     const runs = runsForTask(task.id);
     // Only an unlanded check-in is evidence of failure; a fresh log is just a run.
     const failedRun = runs.runs.some((r) => r.pending);
@@ -3984,7 +3999,8 @@ function reviewQueue(options) {
       const candidate = probes.combineProbes(entries);
       if (probes.probeBackoff(state.probe, candidate, now)) {
         // External edits/deploy commits must also bypass transcript-only backoff.
-        const currentGit = gitState(task.fm.project, state.git.sha);
+        if (typeof readGitState !== 'function') throw new Error('review queue Git probe needs a gitState reader');
+        const currentGit = await readGitState(task.fm.project, state.git.sha);
         if (currentGit.available && !/^\?\?/m.test(currentGit.status) && currentGit.head === state.git.sha && currentGit.dirtyHash === state.git.dirtyHash) {
           skips['probe-backoff']++; continue;
         }
@@ -4578,7 +4594,9 @@ async function reviewTick(deps, opts) {
   const meta = loadMeta();
   // The daemon's session source is bounded unless asked otherwise. A forced tick
   // skips the re-look below and types on this read alone, so it asks for fresh here.
-  const sessions = deps.sessions ? (options.force ? deps.sessions({ fresh: true }) : deps.sessions()) : [];
+  const sessions = deps.sessions
+    ? await deps.sessions(options.force ? { fresh: true } : undefined)
+    : [];
   // The host's panes, read first: a reviewer on another node is only a candidate
   // with a live pane in this list (remoteReviewerRows), forced tick or not.
   let reviewerPanes;
@@ -4599,7 +4617,10 @@ async function reviewTick(deps, opts) {
     ? { code: 0, reason: 'forced' }
     : (deps.reviewBudget || reviewBudget)(model, undefined,
       reviewerPaneAccountId(reviewerPanes, reviewer && reviewer.id) || (reviewer && reviewer.accountId) || reviewerAccountId());
-  const queue = reviewQueue({ limit: Number.isFinite(TICK_LIMIT) && TICK_LIMIT > 0 ? TICK_LIMIT : 5 });
+  const queue = await reviewQueue({
+    limit: Number.isFinite(TICK_LIMIT) && TICK_LIMIT > 0 ? TICK_LIMIT : 5,
+    ...(deps.gitState ? { gitState: deps.gitState } : {}),
+  });
   const decision = options.force
     ? (reviewer ? { send: Boolean(queue.ranked.length), why: queue.ranked.length ? '' : 'nothing ranked' } : { send: false, why: 'no live reviewer session registered' })
     : shouldSendTick({
@@ -4637,7 +4658,7 @@ async function reviewTick(deps, opts) {
   if (!options.force) {
     // The daemon's session source is bounded for the first look; this one decides
     // whether to type, so it asks for a fresh transcript scan.
-    const again = (deps.findReviewer || findReviewerSession)(deps.sessions ? deps.sessions({ fresh: true }) : [], meta.bootstrapAttempts, findOptions);
+    const again = (deps.findReviewer || findReviewerSession)(deps.sessions ? await deps.sessions({ fresh: true }) : [], meta.bootstrapAttempts, findOptions);
     const recheck = shouldSendTick({
       budget, reviewer: again && again.id === reviewer.id ? again : null, queue, lastTickAt: meta.lastTickAt, now, trigger,
       drift: detail ? driftGate(meta, detail, now) : null,
@@ -4750,7 +4771,7 @@ async function reviewerCompactTick(deps) {
   const load = options.loadMeta || loadMeta;
   const save = options.saveMeta || saveMeta;
   const meta = load();
-  const sessions = options.sessions ? options.sessions() : [];
+  const sessions = options.sessions ? await options.sessions() : [];
   let reviewer = options.reviewer
     ? options.reviewer(sessions, meta)
     : findReviewerSession(sessions, meta.bootstrapAttempts);
@@ -4786,7 +4807,7 @@ async function reviewerCompactTick(deps) {
   // closes the remaining race, but this catches a turn that began after the first scan.
   if (options.sessions) {
     // Fresh, unlike the first look: this is the read the injection decision rests on.
-    const fresh = options.sessions({ fresh: true }).find((session) => session && session.id === reviewer.id);
+    const fresh = (await options.sessions({ fresh: true })).find((session) => session && session.id === reviewer.id);
     if (!fresh) return { compacted: false, skipped: true, why: 'reviewer session disappeared' };
     reviewer = fresh;
     decision = reviewerCompactDecision({ meta, reviewer, transcriptMtime, contextTokens, now, minTokens });
@@ -5154,6 +5175,7 @@ module.exports = {
   isReviewerIdeaTask,
   deltaHasActivity,
   linesHaveActivity,
+  headShaCached,
   scanSubagentsForCodex,
   resolveCodexParent,
   verificationCommands,

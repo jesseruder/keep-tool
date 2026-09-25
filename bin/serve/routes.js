@@ -29,7 +29,7 @@ function routes(ctx) {
     writeToShellPane,
     // start()'s own locals. onChange and onFocus are the module-level hooks start()
     // has already pointed at its broadcaster by the time routes() is called.
-    broadcast, dashboardBuild, dashboardBuilder, deps, json, onChange, onFocus, restarts, shutdown,
+    broadcast, dashboardBuild, dashboardBuilder, deps, json, maintenanceProcess, onChange, onFocus, restarts, shutdown,
     terminalProfile,
   } = ctx;
 
@@ -39,6 +39,17 @@ function routes(ctx) {
   // builds this list without them gets that 404 too.
   const nodeApiEnabled = () => typeof ctx.nodeApiEnabled === 'function' && ctx.nodeApiEnabled() === true;
   const NODE_API_ALLOW = ['node', 'admin', 'local'];
+  const isKeepError = (error) => error instanceof keep.KeepError || error?.remoteName === 'KeepError';
+  const checkinTask = async (id, options) => {
+    // Tests and embedded callers may provide a minimal ctx. Production always
+    // supplies the mutation process, keeping the lock, git and done-when shell
+    // gate in the child whose PID owns the transaction.
+    if (!maintenanceProcess) return keep.checkinTask(id, options);
+    const leave = daemonRestartGate?.enter?.() || (() => {});
+    try {
+      return await maintenanceProcess.run('checkin-task', { root: keep.ROOT, id, options }, { timeoutMs: 5 * 60e3 });
+    } finally { leave(); }
+  };
 
   return withLoopHolds([
     {
@@ -464,8 +475,17 @@ function routes(ctx) {
         const name = agents.nameFromPath(url.pathname);
         if (!name) return json(res, 400, { error: 'bad agent name' });
         try {
-          const result = agents.markSeen(name, Number(body && body.until) || Date.now(), { root: keep.ROOT });
-          agents.flushCommits(keep.ROOT);
+          const leave = daemonRestartGate?.enter?.() || (() => {});
+          let result;
+          try {
+            if (maintenanceProcess) result = await maintenanceProcess.run('agent-mark-seen', {
+                root: keep.ROOT, name, until: Number(body && body.until) || Date.now(),
+              }, { timeoutMs: 30e3 });
+            else {
+              result = agents.markSeen(name, Number(body && body.until) || Date.now(), { root: keep.ROOT });
+              agents.flushCommits(keep.ROOT);
+            }
+          } finally { leave(); }
           broadcast();
           return json(res, 200, { ok: true, name, ...result });
         } catch (error) { return json(res, error.status || 500, { error: error.message }); }
@@ -613,11 +633,16 @@ function routes(ctx) {
       method: 'POST',
       path: '/api/checkin',
       handle: async ({ req, res, url, body }) => {
-        keep.checkinTask(body.id, {
-          message: body.message, status: body.status,
-          checkAfter: body.checkAfter, clearCheckAfter: body.clearCheckAfter,
-          experimentId: body.experimentId,
-        });
+        try {
+          await checkinTask(body.id, {
+            message: body.message, status: body.status,
+            checkAfter: body.checkAfter, clearCheckAfter: body.clearCheckAfter,
+            experimentId: body.experimentId,
+          });
+        } catch (error) {
+          if (isKeepError(error)) return json(res, 400, { error: error.message.replace(/^daemon mutation checkin-task failed: /, '') });
+          throw error;
+        }
         broadcast();
         return json(res, 200, { ok: true });
       },
@@ -635,13 +660,15 @@ function routes(ctx) {
         }
         if (!Object.hasOwn(messages, body.action)) return json(res, 400, { error: 'action must be done or dismiss' });
         try {
-          keep.checkinTask(body.id, {
+          await checkinTask(body.id, {
             message: messages[body.action], status: 'done', expectStatus: 'inbox',
             heading: 'console', linkSession: false,
           });
         } catch (error) {
-          if (error?.code === 'STATUS_CHANGED') return json(res, 409, { error: error.message });
-          if (error instanceof keep.KeepError) return json(res, 400, { error: error.message });
+          if (error?.code === 'STATUS_CHANGED') {
+            return json(res, 409, { error: error.message.replace(/^daemon mutation checkin-task failed: /, '') });
+          }
+          if (isKeepError(error)) return json(res, 400, { error: error.message.replace(/^daemon mutation checkin-task failed: /, '') });
           throw error;
         }
         broadcast();
@@ -871,7 +898,7 @@ function routes(ctx) {
                 : await withInjectionLock(() => answerSession(body), { session: sessionId });
           if (fromInbox) {
             try {
-              keep.checkinTask(body.taskId, {
+              await checkinTask(body.taskId, {
                 message: 'opened from console inbox', status: 'active', expectStatus: 'inbox',
                 heading: 'console', linkSession: false,
               });

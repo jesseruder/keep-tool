@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { named: sessionNamed } = require('./session-numbers.js');
-const { execFileSync } = require('node:child_process');
+const { execFile } = require('node:child_process');
 
 const ID = /^[A-Za-z0-9_-]{8,160}$/;
 const ACCOUNT_ID = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex)\/default)$/;
@@ -155,27 +155,29 @@ function defaultSource(sessionId, options = {}) {
   throw problem(`source session ${sessionNamed(sessionId)} was not found`);
 }
 
-function defaultGitSnapshot(cwd) {
-  const execute = (args, options = {}) => execFileSync('git', ['-C', options.cwd || cwd, ...args], {
-    encoding: Object.hasOwn(options, 'encoding') ? options.encoding : 'utf8',
-    timeout: 10000, maxBuffer: options.maxBuffer || 256 * 1024,
-    stdio: ['ignore', 'pipe', 'ignore'],
-  });
-  const run = (args) => execute(args).trim();
+async function defaultGitSnapshot(cwd) {
+  const execute = (args, options = {}) => new Promise((resolve, reject) => execFile(
+    'git', ['-C', options.cwd || cwd, '--no-optional-locks', ...args], {
+      encoding: Object.hasOwn(options, 'encoding') ? options.encoding : 'utf8',
+      timeout: 10000, maxBuffer: options.maxBuffer || 256 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }, (error, stdout) => error ? reject(error) : resolve(stdout),
+  ));
+  const run = async (args) => (await execute(args)).trim();
   const result = { cwd, available: false, top: '', commonDir: '', head: '', branch: '', status: '', contentDigest: '' };
   try {
-    result.top = path.resolve(run(['rev-parse', '--show-toplevel']));
-    result.commonDir = path.resolve(run(['rev-parse', '--path-format=absolute', '--git-common-dir']));
-    result.head = run(['rev-parse', 'HEAD']);
-    result.branch = run(['rev-parse', '--abbrev-ref', 'HEAD']);
-    result.status = execute(['status', '--short', '--untracked-files=all'], { cwd: result.top }).trim().slice(0, 64 * 1024);
-    const indexDiff = execute(['diff', '--cached', '--binary', '--no-ext-diff', 'HEAD', '--'], {
+    result.top = path.resolve(await run(['rev-parse', '--show-toplevel']));
+    result.commonDir = path.resolve(await run(['rev-parse', '--path-format=absolute', '--git-common-dir']));
+    result.head = await run(['rev-parse', 'HEAD']);
+    result.branch = await run(['rev-parse', '--abbrev-ref', 'HEAD']);
+    result.status = (await execute(['status', '--short', '--untracked-files=all'], { cwd: result.top })).trim().slice(0, 64 * 1024);
+    const indexDiff = await execute(['diff', '--cached', '--binary', '--no-ext-diff', 'HEAD', '--'], {
       cwd: result.top, encoding: null, maxBuffer: GIT_CAPTURE_LIMIT + 1,
     });
-    const worktreeDiff = execute(['diff', '--binary', '--no-ext-diff', '--'], {
+    const worktreeDiff = await execute(['diff', '--binary', '--no-ext-diff', '--'], {
       cwd: result.top, encoding: null, maxBuffer: GIT_CAPTURE_LIMIT + 1,
     });
-    const untracked = execute(['ls-files', '--others', '--exclude-standard', '-z'], {
+    const untracked = await execute(['ls-files', '--others', '--exclude-standard', '-z'], {
       cwd: result.top, encoding: null, maxBuffer: 1024 * 1024,
     });
     let captured = indexDiff.length + worktreeDiff.length + untracked.length;
@@ -569,7 +571,7 @@ async function launchState(state, stateFile, deps) {
       root: deps.root, env: deps.env || process.env,
     }), id: state.sourceSessionId };
     const transcript = transcriptSnapshot(source.file);
-    const git = (deps.gitSnapshot || defaultGitSnapshot)(state.cwd);
+    const git = await Promise.resolve((deps.gitSnapshot || defaultGitSnapshot)(state.cwd));
     if (!git.available || !git.contentDigest) {
       throw problem(`portable transfer cannot verify the worktree snapshot${git.error ? `: ${git.error}` : ''}`,
         'KEEP_PORTABLE_TRANSFER_GIT', 409);
@@ -750,7 +752,7 @@ async function run(request, deps = {}) {
   }
   const transcript = transcriptSnapshot(source.file);
   const conversation = extractConversation(source.agent, transcript.text);
-  const git = (deps.gitSnapshot || defaultGitSnapshot)(cwd);
+  const git = await Promise.resolve((deps.gitSnapshot || defaultGitSnapshot)(cwd));
   if (desktop && (!git.available || !git.contentDigest)) {
     throw problem(`portable transfer cannot capture the worktree snapshot${git.error ? `: ${git.error}` : ''}`,
       'KEEP_PORTABLE_TRANSFER_GIT', 409);

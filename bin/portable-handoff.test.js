@@ -604,7 +604,7 @@ test('setup retry rechecks source readiness before delivering the saved opening'
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test('git freshness digest changes when the contents of an already-dirty file change', () => {
+test('git freshness digest changes when the contents of an already-dirty file change', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-portable-git-'));
   try {
     const git = (...args) => execFileSync('git', ['-C', root, ...args], { stdio: 'ignore' });
@@ -613,17 +613,17 @@ test('git freshness digest changes when the contents of an already-dirty file ch
     const nested = path.join(root, 'nested'); fs.mkdirSync(nested);
     fs.writeFileSync(path.join(root, 'tracked.txt'), 'first dirty value\n');
     fs.writeFileSync(path.join(root, 'untracked.txt'), 'first untracked value\n');
-    const first = portable.defaultGitSnapshot(nested);
+    const first = await portable.defaultGitSnapshot(nested);
     fs.writeFileSync(path.join(root, 'tracked.txt'), 'second dirty value\n');
-    const second = portable.defaultGitSnapshot(nested);
+    const second = await portable.defaultGitSnapshot(nested);
     assert.equal(first.available, true);
     assert.equal(second.available, true);
     assert.equal(first.status, second.status, 'porcelain status alone cannot observe this edit');
     assert.notEqual(first.contentDigest, second.contentDigest);
     fs.writeFileSync(path.join(root, 'tracked.txt'), 'first staged value\n'); git('add', 'tracked.txt');
-    const firstIndex = portable.defaultGitSnapshot(nested);
+    const firstIndex = await portable.defaultGitSnapshot(nested);
     fs.writeFileSync(path.join(root, 'tracked.txt'), 'second staged value\n'); git('add', 'tracked.txt');
-    const secondIndex = portable.defaultGitSnapshot(nested);
+    const secondIndex = await portable.defaultGitSnapshot(nested);
     assert.equal(firstIndex.status, secondIndex.status);
     assert.notEqual(firstIndex.contentDigest, secondIndex.contentDigest);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }

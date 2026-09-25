@@ -174,6 +174,8 @@ function createRegistryService(options = {}) {
   // (bin/late-adoption.js): asked before a request naming it is refused.
   const lateAdoption = options.lateAdoption || require('./late-adoption.js').createLateAdoption({
     root, env: { ...baseEnv, KEEP_CONFIG: configFile }, now, nodes, daemonNode, location, log,
+    ...(options.readWorker ? { readWorker: options.readWorker } : {}),
+    ...(options.mutationProcess ? { mutationProcess: options.mutationProcess } : {}),
     ...(options.hostConnect ? { hostConnect: options.hostConnect } : {}),
     ...(options.locatedLocally ? { locatedLocally: options.locatedLocally } : {}),
     ...(options.linkLaunchedSession ? { linkLaunchedSession: options.linkLaunchedSession } : {}),
@@ -270,6 +272,16 @@ function createRegistryService(options = {}) {
     return spawnKeep([request.command, ...request.args], { cwd: request.cwd, env: childEnv(request, caller, daemon), ...limits });
   }
 
+  // Adoption can pin an account, write pane ownership and link a card before the
+  // registry command itself is journalled. Count that transaction independently so
+  // the restart gate cannot stop the daemon between those durable steps.
+  async function adopt(...args) {
+    if (stopping()) throw new RegistryError(503, 'daemon restarting');
+    admitted += 1;
+    try { return await lateAdoption.adopt(...args); }
+    finally { admitted -= 1; }
+  }
+
   // The daemon's own CLI, with a fixed program and argv entries (no shell), output
   // capped and a timeout that kills it. stdin is closed unless `stdin` is given,
   // and then it is written and closed. Resolves { status: 200 | 504, body }.
@@ -359,7 +371,7 @@ function createRegistryService(options = {}) {
         // Checked again inside the adoption against the location it would write, before
         // it pins. A registry request names no account, so today that is the same check.
         const verify = (where) => validateRequest(body, caller, { ...deps, location: () => where });
-        await lateAdoption.adopt(caller, body.session, body.agent, { pane: body.pane, verify });
+        await adopt(caller, body.session, body.agent, { pane: body.pane, verify });
       }
       const request = validateRequest(body, caller, deps);
       // A `tell --wait` may spend its whole duration re-asking a busy session. It runs
@@ -484,7 +496,7 @@ function createRegistryService(options = {}) {
   const shared = {
     root, daemonNode, location, nodes, now, baseEnv, io,
     callerNode: (principal) => callerNode(principal, daemonNode()),
-    journaled, spawnKeep, childEnv, adopt: lateAdoption.adopt, unlocated: lateAdoption.unlocated,
+    journaled, spawnKeep, childEnv, adopt, unlocated: lateAdoption.unlocated,
     parsePaneRef: (ref) => nodes.parsePaneRef(ref),
     formatPaneRef: (node, paneId) => nodes.formatPaneRef(node, paneId),
   };

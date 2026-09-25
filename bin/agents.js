@@ -754,9 +754,13 @@ function pendingNames(root = keep.ROOT) {
   return [...(pending.get(String(root)) || [])];
 }
 
-function flushCommits(root = keep.ROOT, options = {}) {
+function takePendingNames(root = keep.ROOT) {
   const names = pendingNames(root);
   pending.delete(String(root));
+  return names;
+}
+
+function flushNamedCommits(names, root = keep.ROOT, options = {}) {
   if (!names.length) return false;
   // keep's git helpers are bound to the registry the process was configured
   // with; a fixture root is not a repository and is left alone.
@@ -782,6 +786,10 @@ function flushCommits(root = keep.ROOT, options = {}) {
     } catch {}
     return false;
   }
+}
+
+function flushCommits(root = keep.ROOT, options = {}) {
+  return flushNamedCommits(takePendingNames(root), root, options);
 }
 
 // ---------- the incidents hook ----------
@@ -988,7 +996,7 @@ module.exports = {
   readRecord, records, writeRecord, ensure, normalizeRecord, lastFeedSeq,
   emit, markSeen, readEvents, readTail, readAfterSeq, loadEvents, unseenSummary, eventLine, eventSummary, alertText, normalizeEvent,
   BADGE_KINDS, badges, lastNeedsYou, attentionItems, reservedAgentName,
-  flushCommits, pendingNames,
+  flushCommits, flushNamedCommits, pendingNames, takePendingNames,
   areaAgent, incidentEmitter,
   applySessions, agentView, reviewerView, dashboardAgents,
 };

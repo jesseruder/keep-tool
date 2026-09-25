@@ -1003,12 +1003,12 @@ async function run(body, deps = {}) {
     } else if (agent === 'claude' && (deps.readSetup || require('./account-setup').readSetup)(source)) {
       const ensureSharedMemory = deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory;
       try {
-        sourceMcpConfigs.push(ensureSharedMemory(source, session.project || pane.cwd).mcpConfig);
+        sourceMcpConfigs.push((await ensureSharedMemory(source, session.project || pane.cwd)).mcpConfig);
         // A session can move into a worktree after launch, so its argv still carries the
         // managed MCP path keyed by the pane's launch cwd rather than the current project.
         // It goes through the same check, so only a verified managed file is accepted.
         if (typeof pane.cwd === 'string' && pane.cwd && pane.cwd !== session.project) {
-          sourceMcpConfigs.push(ensureSharedMemory(source, pane.cwd).mcpConfig);
+          sourceMcpConfigs.push((await ensureSharedMemory(source, pane.cwd)).mcpConfig);
         }
       } catch (error) { const failure = new Error(`Source account setup is unavailable: ${error.message}`); failure.status = 409; throw failure; }
     }

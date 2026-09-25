@@ -339,7 +339,7 @@ async function observe(record, name, deps = {}) {
   const adopted = carrying.find((pane) => (pane.meta || {}).sessionId) || carrying[0];
   const id = String((adopted.meta || {}).sessionId || recorded || '');
   let sessions = [];
-  try { sessions = (deps.scanSessions && deps.scanSessions()) || []; } catch { sessions = []; }
+  try { sessions = (deps.scanSessions && await deps.scanSessions()) || []; } catch { sessions = []; }
   const rows = sessions.filter((session) => session && session.id === id).map((session) => ({ ...session }));
   if (rows.length) sessionModel.attachRuntime(rows, panes);
   const session = rows[0] || null;

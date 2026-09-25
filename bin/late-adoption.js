@@ -205,6 +205,34 @@ function accountRoots(accounts, env) {
   return [...listed, ...defaults];
 }
 
+// Broad transcript discovery is a read-only observation. Production calls this in
+// daemon-read-worker; keeping the operation here makes its conservative safety rule
+// identical in the worker and in injected unit tests.
+function knownLocally(sessionId, options = {}) {
+  const root = options.root;
+  const env = options.env || process.env;
+  const accounts = options.accounts || require('./accounts.js');
+  if (walkedLocally(sessionId, accountRoots(accounts, env))) return true;
+  try { if (accounts.forSession(sessionId, 'claude', { root, env, allowDiscovery: true })) return true; }
+  catch { return true; }
+  try { if (require('./transcripts.js').findSessionFile(sessionId, { root, env })) return true; }
+  catch { return true; }
+  return false;
+}
+
+function cardOfSessionLocal(sessionId, options = {}) {
+  let best = null;
+  for (const task of require('./keep-core.js').loadAll(false, { root: options.root })) {
+    if (!task || !task.fm || task.fm.status === 'done') continue;
+    for (const entry of task.fm.sessions || []) {
+      if (!entry || entry.id !== sessionId) continue;
+      const at = String(entry.at || '');
+      if (!best || at > best.at) best = { id: task.id, at };
+    }
+  }
+  return best ? best.id : null;
+}
+
 function createLateAdoption(options = {}) {
   const root = options.root;
   if (!root) throw new Error('createLateAdoption needs the registry root');
@@ -216,37 +244,35 @@ function createLateAdoption(options = {}) {
   const connect = options.hostConnect
     || ((node, timeoutMs, helloTimeoutMs) => require('./hostclient.js').connect({ node, env, timeoutMs, helloTimeoutMs }));
   const log = options.log || (() => {});
+  const readWorker = options.readWorker || null;
+  const mutationProcess = options.mutationProcess || null;
   // Puts a session on a card, as openSession does once a card open learns its session.
   const linkLaunchedSession = options.linkLaunchedSession
+    || (mutationProcess && ((card, session) => mutationProcess.run('late-adoption-link', {
+      root, card, session,
+    }).then((result) => result.linked)))
     || ((card, session) => require('./keep-core.js').linkLaunchedSession(card, session, { root }));
   // And takes the card from the session that handed it over, as openSession does.
   const releaseCardSession = options.releaseCardSession
+    || (mutationProcess && ((card, sessionId) => mutationProcess.run('late-adoption-release', {
+      root, card, sessionId,
+    }).then((result) => result.released)))
     || ((card, sessionId) => require('./keep-core.js').releaseCardSession(card, sessionId, { root }));
   // Whether this machine knows the session itself: a Claude transcript or a Codex
   // rollout of it under any account here (walkedLocally, the authority), or one the
   // shared lookups find. A look that fails says yes; the walk's own failure throws,
   // so the refusal says why.
-  const locatedLocally = options.locatedLocally || ((sessionId) => {
-    if (walkedLocally(sessionId, accountRoots(accounts, env))) return true;
-    try { if (accounts.forSession(sessionId, 'claude', { root, env, allowDiscovery: true })) return true; } catch { return true; }
-    try { if (require('./transcripts.js').findSessionFile(sessionId, { root, env })) return true; } catch { return true; }
-    return false;
-  });
+  const locatedLocally = options.locatedLocally || (readWorker
+    ? ((sessionId) => readWorker.run('late-adoption-known', { sessionId, root, env },
+      { key: `late-adoption-known:${sessionId}` }))
+    : ((sessionId) => knownLocally(sessionId, { root, env, accounts })));
   const daemonNode = options.daemonNode || (() => nodes.daemonNode(env));
   // The open card a session is on, newest link first, from the daemon's registry
   // (hook.js newestTaskForSession asks the same of its own snapshot).
-  const cardOfSession = options.cardOfSession || ((sessionId) => {
-    let best = null;
-    for (const task of require('./keep-core.js').loadAll(false, { root })) {
-      if (!task || !task.fm || task.fm.status === 'done') continue;
-      for (const entry of task.fm.sessions || []) {
-        if (!entry || entry.id !== sessionId) continue;
-        const at = String(entry.at || '');
-        if (!best || at > best.at) best = { id: task.id, at };
-      }
-    }
-    return best ? best.id : null;
-  });
+  const cardOfSession = options.cardOfSession || (readWorker
+    ? ((sessionId) => readWorker.run('late-adoption-card', { sessionId, root },
+      { key: `late-adoption-card:${sessionId}` }))
+    : ((sessionId) => cardOfSessionLocal(sessionId, { root })));
   const refusedUntil = new Map();
   const inflight = new Map();
 
@@ -357,7 +383,7 @@ function createLateAdoption(options = {}) {
     // transcript or rollout of it here.
     if (fs.existsSync(paneFile(sessionId))) return refusal('the daemon already has a pane record for the session');
     let known;
-    try { known = locatedLocally(sessionId); } catch (error) { known = error; }
+    try { known = await locatedLocally(sessionId); } catch (error) { known = error; }
     if (known instanceof Error) return refusal(known.message);
     if (known) return refusal('the session is known on the daemon itself');
     // Checked again at the last moment: a hook that registered it meanwhile is the answer.
@@ -398,7 +424,7 @@ function createLateAdoption(options = {}) {
     let linked;
     if (typeof launch.card === 'string' && CARD_RE.test(launch.card)) {
       try {
-        linked = Boolean(linkLaunchedSession(launch.card, { id: sessionId, agent, node: caller }));
+        linked = Boolean(await linkLaunchedSession(launch.card, { id: sessionId, agent, node: caller }));
         if (!linked) log(`late adoption: ${agent} session ${sessionId} could not be linked to card ${launch.card}: no such card`);
       } catch (error) {
         linked = false;
@@ -406,7 +432,7 @@ function createLateAdoption(options = {}) {
       }
       // Only once the new session is on the card does the one that handed it over leave.
       if (linked && typeof launch.requester === 'string' && SESSION_RE.test(launch.requester) && launch.requester !== sessionId) {
-        try { releaseCardSession(launch.card, launch.requester); } catch (error) {
+        try { await releaseCardSession(launch.card, launch.requester); } catch (error) {
           log(`late adoption: ${launch.requester} could not be unlinked from card ${launch.card}: ${error && error.message || error}`);
         }
       }
@@ -522,13 +548,13 @@ function createLateAdoption(options = {}) {
     }
     log(`late adoption: pi session ${sessionId} adopted on ${caller} in pane ${ref} after ${previous} (account ${accountId})`);
     let card = null;
-    try { card = cardOfSession(previous); } catch (error) {
+    try { card = await cardOfSession(previous); } catch (error) {
       log(`late adoption: the card of pi session ${previous} could not be read: ${error && error.message || error}`);
     }
     let linked;
     if (typeof card === 'string' && CARD_RE.test(card)) {
       try {
-        linked = Boolean(linkLaunchedSession(card, { id: sessionId, agent: 'pi', node: caller }));
+        linked = Boolean(await linkLaunchedSession(card, { id: sessionId, agent: 'pi', node: caller }));
         if (!linked) log(`late adoption: pi session ${sessionId} could not be linked to card ${card}: no such card`);
       } catch (error) {
         linked = false;
@@ -600,4 +626,6 @@ function createLateAdoption(options = {}) {
   return { adopt, unlocated };
 }
 
-module.exports = { createLateAdoption, recordNodeCodexLaunch, readNodeCodexLaunch, consumeNodeCodexLaunch, walkedLocally, accountRoots, LOOKUP_DEADLINE_MS, NEGATIVE_TTL_MS, SHORT_TTL_MS, LAUNCH_TTL_MS };
+module.exports = { createLateAdoption, recordNodeCodexLaunch, readNodeCodexLaunch, consumeNodeCodexLaunch,
+  walkedLocally, accountRoots, knownLocally, cardOfSessionLocal,
+  LOOKUP_DEADLINE_MS, NEGATIVE_TTL_MS, SHORT_TTL_MS, LAUNCH_TTL_MS };

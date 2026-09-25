@@ -11,6 +11,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const { createRegistryPull, createCleanupSnapshot, startLoopLagProbe, startReceiptsPoller } = require('./serve/schedulers.js');
+const maintenanceTasks = require('./maintenance-tasks.js');
 
 const ROOT = '/registry/root';
 
@@ -55,7 +56,7 @@ const gitName = (args) => (args[2] === 'rebase' && args[3] === '--abort' ? 'abor
 function harness(answers = {}) {
   const order = [];
   const rows = [];
-  const calls = { async: [], sync: [] };
+  const calls = { async: [], sync: [], mutation: [] };
   const held = [];
   let clock = 1000;
 
@@ -88,15 +89,21 @@ function harness(answers = {}) {
       if (answer.hold) { answer.hold = false; held.push(answered); return; }
       setImmediate(answered);
     },
-    execFileSync: (file, args, options) => {
-      calls.sync.push({ file, args, options });
-      order.push(gitName(args));
-      const answer = answerFor(args);
-      if (answer.error) {
-        // Node's synchronous timeout shape: code ETIMEDOUT, no `killed` at all.
-        throw Object.assign(new Error(answer.error), { stderr: answer.stderr || '', ...(answer.code ? { code: answer.code } : {}) });
-      }
-      return answer.stdout ?? '';
+    mutationProcess: {
+      run: async (operation, input, options) => {
+        calls.mutation.push({ operation, input, options });
+        return maintenanceTasks.registryRebase(input, { keep, execFileSync: (file, args, execOptions) => {
+          calls.sync.push({ file, args, options: execOptions });
+          order.push(gitName(args));
+          const answer = answerFor(args);
+          if (answer.error) {
+            throw Object.assign(new Error(answer.error), {
+              stderr: answer.stderr || '', ...(answer.code ? { code: answer.code } : {}),
+            });
+          }
+          return answer.stdout ?? '';
+        } });
+      },
     },
   });
 
@@ -120,12 +127,13 @@ test('a registry already up to date fetches, counts, and never takes the lock', 
   assert.deepEqual(h.rows, [['git-pull', { ok: true, detail: 'up to date, 125ms' }]]);
 });
 
-test('a registry behind the remote rebases under the ordinary synchronous lock', async () => {
+test('a registry behind the remote delegates the complete locked rebase transaction', async () => {
   const h = harness({ fetch: { elapsed: 200 }, 'rev-list': { stdout: '3\n' }, rebase: { elapsed: 40 } });
   await h.pull();
   assert.deepEqual(h.order, ['fetch', 'rev-list', 'lock', 'rebase', 'unlock'],
     'the lock is taken after the network is done with, and only around the local rebase');
   assert.deepEqual(h.calls.sync.map((call) => call.args), [['-C', ROOT, 'rebase', '-q', '--autostash', '@{u}']]);
+  assert.deepEqual(h.calls.mutation, [{ operation: 'registry-rebase', input: { root: ROOT }, options: { timeoutMs: 65e3 } }]);
   assert.deepEqual(h.calls.sync[0].options.stdio, ['ignore', 'ignore', 'pipe']);
   assert.equal(h.calls.sync[0].options.timeout, 30e3);
   assert.deepEqual(h.rows, [['git-pull', { ok: true, detail: '3 behind, rebased in 240ms' }]]);
@@ -607,20 +615,18 @@ test('periodic schedulers read sessions from the bounded transcript index', () =
   wired(/runs\.setEphemeralHost\(\{[\s\S]*?agents: require\('\.\.\/agents\.js'\),[\s\S]*?\}\);/);
   wired(/limitresume\.startScheduler\(\{[\s\S]*?scanSessions: \(\) => periodicScan\(\)\.filter\(/);
   wired(/ctx\.sessionSnapshot : periodicScan\(\);/);
-  wired(/require\('\.\.\/notes\.js'\)\.startScheduler\(\{[\s\S]*?sessions: \(\) => scanSessions\(\{ fresh: true \}\),/);
-  wired(/const areaSessionDeps = \(\) => \(\{[\s\S]*?scanSessions: \(\) => scanSessions\(\),/);
-  // Strip every sanctioned use, then no reference to scanSessions may remain: not a
-  // bare call, not one with other options, not the function handed over as is.
+  wired(/require\('\.\.\/notes\.js'\)\.startScheduler\(\{[\s\S]*?sessions: \(\) => readSessions\(\{ fresh: true \}\),/);
+  wired(/const areaSessionDeps = \(\) => \(\{[\s\S]*?scanSessions: \(\) => readSessions\(\{ fresh: true \}\),/);
+  // No scheduler may retain direct access to the main-thread scanner. Observational
+  // ticks use the published snapshot; decisions that need a fresh fleet view ask the
+  // isolated reader through readSessions.
   const allowed = [
-    /\bruns, scanSessions, sendToResolvedTarget\b/, // the destructuring of ctx
-    /periodicSessionScan\(scanSessions\)/,
-    /scanSessions: \(\) => scanSessions\(\),/, // area-session deps
-    /sessions: \(\) => scanSessions\(\{ fresh: true \}\),/, // notes sweep
+    /scanSessions: \(\) => readSessions\(\{ fresh: true \}\),/, // area-session property
   ];
   for (const pattern of allowed) {
     assert.equal((body.match(new RegExp(pattern.source, 'g')) || []).length, 1, String(pattern));
     body = body.replace(pattern, '');
   }
   body = body.replace(/\bscanSessions:/g, ''); // property names handed to modules
-  assert.deepEqual(body.match(/.*\bscanSessions\b.*/g) || [], [], 'every other scan is periodicScan');
+  assert.deepEqual(body.match(/.*\bscanSessions\b.*/g) || [], [], 'no scheduler can call the main-thread scanner');
 });

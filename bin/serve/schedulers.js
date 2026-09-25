@@ -99,22 +99,20 @@ function startReceiptsPoller({
 //
 // The fetch is the slow, network-bound half, and it runs unlocked in a child: it
 // touches nothing but .git/refs, and holding the registry lock across it was the
-// whole problem. Nothing else here may hold that lock asynchronously — every other
-// keep.withLock caller in this process waits for it by blocking the event loop in
-// a `sleep 0.1` loop, so an async holder could never be woken to release it, and
-// the collision would be a guaranteed five seconds followed by the lock error.
+// whole problem. The lock itself is synchronous, so daemon mutations own it only
+// inside mutation children; the parent never awaits while it owns that lock.
 //
-// The rebase is the only part that touches the working tree, and with the objects
-// already local it is a fast-forward or a few commits — tens of milliseconds. It
-// runs synchronously under the ordinary lock, exactly like every other registry
-// mutation the daemon makes. When the remote has not moved, the counting stops the
-// tick and the lock is never taken at all.
+// The rebase is the only part that touches the working tree. Its complete locked
+// transaction runs in a child process: the event loop never waits for the lock or
+// git, and a crash leaves a dead lock-owner PID rather than this live daemon's PID.
+// When the remote has not moved, the counting stops the tick and no child starts.
 //
 // Built by a factory so a test can drive it without standing up startSchedulers.
 function createRegistryPull({
   keep, health,
   execFile = require('child_process').execFile,
-  execFileSync = require('child_process').execFileSync,
+  mutationProcess = require('../daemon-mutation-process.js').createDaemonMutationProcess(),
+  daemonRestartGate = null,
   now = Date.now,
 } = {}) {
   const run = (...args) => new Promise((resolve, reject) => {
@@ -138,23 +136,14 @@ function createRegistryPull({
         health.record('git-pull', { ok: true, detail: `up to date, ${now() - startedAt}ms` });
         return;
       }
-      keep.withLock(() => {
-        try {
-          execFileSync('git', ['-C', keep.ROOT, 'rebase', '-q', '--autostash', '@{u}'], {
-            timeout: PULL_TIMEOUT_MS, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8',
-          });
-        } catch (error) {
-          // A conflict must not leave the registry mid-rebase for the next keep
-          // command to walk into. The abort happens inside the same lock, and its
-          // own failure says nothing the rebase's stderr does not already say.
-          try {
-            execFileSync('git', ['-C', keep.ROOT, 'rebase', '--abort'], {
-              timeout: PULL_TIMEOUT_MS, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8',
-            });
-          } catch {}
-          throw gitFailure(error, error.stderr);
-        }
-      });
+      // The complete lock/rebase/abort transaction belongs to a child PID. Waiting
+      // for its result yields this event loop, and a crash leaves a dead owner the
+      // registry's stale-lock recovery can reclaim. Restart admission stays held
+      // through child cleanup so shutdown cannot cut the mutation in half.
+      const leave = daemonRestartGate?.enter?.() || (() => {});
+      try {
+        await mutationProcess.run('registry-rebase', { root: keep.ROOT }, { timeoutMs: 65e3 });
+      } finally { leave(); }
       health.record('git-pull', { ok: true, detail: `${behind} behind, rebased in ${now() - startedAt}ms` });
     } catch (error) {
       // offline, a rebase that needs hands, or lock contention — the next tick catches up
@@ -356,17 +345,17 @@ function startSchedulers(ctx) {
     WATCHER_CONCURRENCY, WATCHER_TURNS_PER_TICK, WATCHER_WINDOW_MS,
     addHostSessionState, agentProcessRows, broadcast, buildState, cardUsage, closeEphemeralPane,
     closeIdleSession, companionSnapshot, dashboardBuild, dashboardBuilder, deliverCheckToThread, deliverUnblockToThread,
-    deps, discord, driftWakeFromVerdict, envNumber, features, forceRestartSession, fs, health, hostRequest,
+    daemonReadWorker, daemonRestartGate, deps, discord, driftWakeFromVerdict, envNumber, features, forceRestartSession, fs, health, hostRequest,
     ideas, keep, keepConsole, landed, limitresume, listHostPaneResult, listHostPanes, liveSessionTick,
     liveTurnIndexSessions, loadCurrentSession, loadSessionForAction, openCheckSession, openSession, path, pendingCompactSwaps,
-    prepareSessionSummary, readLiveSessionLedger, readScreenResult, remoteSession, resolveSessionTarget, restartSession,
+    prepareSessionSummary, readLiveSessionLedger, readScreenResult, readSessions, remoteSession, resolveSessionTarget, restartSession,
     resumeAfterLimit, retireLeftDeliveryDrafts,
-    review, reviewDeps, runs, scanSessions, sendToResolvedTarget, sendToSession, sessionSummarySnapshot, slack,
+    review, reviewDeps, runs, sendToResolvedTarget, sendToSession, sessionSummarySnapshot, slack,
     stallAliveIds, stalled, stalledSessionSnapshot, standup, startAutoCompact, startBriefScheduler,
     startHandoffQueue, startWtGcScheduler, summarize, transcriptFileForSession,
     unblock, usage, watcherSend, withInjectionLock, writeTarget, deliveryReceiptFor,
   } = ctx;
-  const periodicScan = periodicSessionScan(scanSessions);
+  const periodicScan = () => (ctx.sessionSnapshot || []).map((session) => ({ ...session }));
   // The interval ticks this function starts itself run inside a loop hold, named
   // after their health row where they have one and after the tick otherwise, so a
   // stall the lag probe sees can be attributed (bin/loop-hold.js). The feature
@@ -433,7 +422,7 @@ function startSchedulers(ctx) {
     // Fresh on purpose: an author absent or exited in these rows gets its note
     // handed to Owner for good, a terminal decision a bounded index could make on a
     // session it has not caught up with. It scans only when a note is due.
-    sessions: () => scanSessions({ fresh: true }),
+    sessions: () => readSessions({ fresh: true }),
     // An author on another node is not in that scan, or is there only as a stale
     // copy: its node answers for it (createNoteAuthorLookup).
     remoteSession: createNoteAuthorLookup({ remoteSession, loadSessionForAction, deps, root: keep.ROOT }),
@@ -573,7 +562,12 @@ function startSchedulers(ctx) {
             throw error;
           }
         }, { pane: body.pane, session: body.sessionId });
-        keep.recordDaemonSessionClose(body.cardIds, body.sessionId, body.idleMinutes);
+        const leaveMutation = daemonRestartGate?.enter?.() || (() => {});
+        try {
+          await ctx.maintenanceProcess.run('record-daemon-session-close', {
+            root: keep.ROOT, cardIds: body.cardIds, sessionId: body.sessionId, idleMinutes: body.idleMinutes,
+          });
+        } finally { leaveMutation(); }
         broadcast();
         return result;
       },
@@ -601,7 +595,9 @@ function startSchedulers(ctx) {
     onChange: broadcast,
   });
   review.startScheduler(reviewDeps);
-  startBriefScheduler({ onChange: broadcast });
+  startBriefScheduler({
+    onChange: broadcast, mutationProcess: ctx.maintenanceProcess, restartGate: daemonRestartGate,
+  });
   startFeatureSchedulers(features, { standup, ideas }, { onChange: broadcast }, health);
   // Deterministic hygiene, refreshed on a clock: the reviewer bundle splices the
   // persisted snapshot in and review-land refuses notes against it, so a day-old
@@ -691,7 +687,7 @@ function startSchedulers(ctx) {
     listPanes: () => listHostPanes(deps, true),
     // Fresh on purpose: this tick launches, delivers and closes in the same pass,
     // from what it reads here, and scans only when a pane carries an area session.
-    scanSessions: () => scanSessions(),
+    scanSessions: () => readSessions({ fresh: true }),
     loadCurrentSession: (id) => loadCurrentSession(id),
     resolveSessionTarget: (session, hint) => resolveSessionTarget(session, hint),
     sendToResolvedTarget: (session, target, text, opts) => sendToResolvedTarget(session, target, text, opts),
@@ -743,7 +739,7 @@ function startSchedulers(ctx) {
       const ledger = readLiveSessionLedger();
       const aliveIds = stallAliveIds(ledger, now);
       const result = await stalled.sweep({
-        root: keep.ROOT, sessions: stalledSessionSnapshot(), includeAgents: true, includeInflight: true,
+        root: keep.ROOT, sessions: await stalledSessionSnapshot(now), includeAgents: true, includeInflight: true,
         ...(aliveIds ? { aliveIds } : {}),
       });
       health.record('stalled', { ok: true, cadenceMs: 60e3, detail: result.detail });
@@ -769,27 +765,31 @@ function startSchedulers(ctx) {
   setTimeout(heldStalledTick, 5e3).unref();
   // Stop hooks feed the turn index, but a session can run for hours without
   // stopping and an agent that never loaded the hooks would be missing entirely.
-  // The bound is wall time and bytes, not files: this runs on the daemon's event
-  // loop, so what must stay small is how long one tick blocks it. The round-robin
-  // cursor lives in the module, so the next tick resumes where this one stopped.
+  // The bound is wall time and bytes, not files. Ingest and prune run in the
+  // persistent read worker, where the module's round-robin cursor survives each
+  // tick; bounding a pass keeps watcher ordering timely without blocking this loop.
   let turnIndexRunning = false;
   let lastTurnIndexPruneAt = 0;
-  const turnIndexTick = () => {
+  const turnIndexTick = async () => {
     if (turnIndexRunning) return;
     turnIndexRunning = true;
     try {
-      const turnIndex = require('../turn-index.js');
-      const result = turnIndex.ingestSessionsFromLiveState(liveTurnIndexSessions(), {
-        budgetMs: TURN_INDEX_BUDGET_MS, maxBytes: TURN_INDEX_BUDGET_BYTES, busyTimeoutMs: 250,
-      });
+      const pruneDue = Date.now() - lastTurnIndexPruneAt >= 86400e3;
+      const indexed = await daemonReadWorker.run('turn-index', {
+        sessions: liveTurnIndexSessions(),
+        budgetMs: TURN_INDEX_BUDGET_MS,
+        maxBytes: TURN_INDEX_BUDGET_BYTES,
+        busyTimeoutMs: 250,
+        prune: pruneDue,
+        pruneLimit: TURN_INDEX_PRUNE_LIMIT,
+      }, { key: 'turn-index' });
+      const result = indexed.ingest;
       let detail = `${result.files} files, ${result.bytes} bytes, ${result.ms} ms`
         + `${result.partial ? ', more pending' : ''}${result.skipped ? `, ${result.skipped} skipped` : ''}`;
-      // Retention is a once-a-day sweep, not tick work; it rides along here so it
-      // needs no second timer and shows up in the same health row.
-      if (Date.now() - lastTurnIndexPruneAt >= 86400e3) {
-        const pruned = turnIndex.prune({ busyTimeoutMs: 250, limit: TURN_INDEX_PRUNE_LIMIT });
-        // A sweep that hit its limit keeps the clock unset so the next tick
-        // continues it; only a finished sweep counts as today's prune.
+      // A sweep that hit its limit keeps the clock unset so the next tick
+      // continues it; only a finished sweep counts as today's prune.
+      if (indexed.prune) {
+        const pruned = indexed.prune;
         if (!pruned.more) lastTurnIndexPruneAt = Date.now();
         if (pruned.sessions) detail += `; pruned ${pruned.sessions} sessions${pruned.more ? ', more to go' : ''}`
           + `${pruned.archived ? `, kept ${pruned.archived} messages for search` : ''}`;
@@ -910,7 +910,7 @@ function startSchedulers(ctx) {
   };
   // One hold for the pair: two holds entered in one callback would credit the
   // first one's continuations to the second.
-  const turnTicks = hold('turn-ticks', () => { turnIndexTick(); return watcherTick(); });
+  const turnTicks = hold('turn-ticks', async () => { await turnIndexTick(); return watcherTick(); });
   setInterval(turnTicks, 30e3).unref();
   setTimeout(turnTicks, 10e3).unref();
   // Drip-fold fleet transcripts for the weekly attribution: ~750MB of history on a
@@ -956,7 +956,9 @@ function startSchedulers(ctx) {
   startReceiptsPoller({ keep, health });
 
   startLoopLagProbe({ health });
-  const pull = hold('git-pull', createRegistryPull({ keep, health }));
+  const pull = hold('git-pull', createRegistryPull({
+    keep, health, mutationProcess: ctx.maintenanceProcess, daemonRestartGate,
+  }));
   if (process.env.KEEP_SYNC === '1') {
     // A start is not a pull: the placeholder holds the row's result (bin/health.js record).
     health.record('git-pull', { skipped: true, holdResult: true });
