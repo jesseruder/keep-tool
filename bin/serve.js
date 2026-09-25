@@ -16816,8 +16816,14 @@ function start(deps = {}) {
     });
   }
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true }); } catch {}
-  watch(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true },
-    (name) => { dashboardBuilder.invalidate({ kind: 'lifecycle', name }); dashboardPublisher.invalidate(); });
+  // A submitted prompt skips the build throttle: the session it started should leave
+  // Waiting on you as soon as it is sent, not up to KEEP_DASHBOARD_MIN_INTERVAL_MS later.
+  const promptsSeen = new Set();
+  watch(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true }, (name) => {
+    dashboardBuilder.invalidate({ kind: 'lifecycle', name });
+    if (require('./session-lifecycle').promptSubmitted(keep.ROOT, name, promptsSeen)) dashboardPublisher.refresh();
+    else dashboardPublisher.invalidate();
+  });
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'session-accounts'), { recursive: true }); } catch {}
   watch(path.join(keep.ROOT, '.keep', 'session-accounts'), null,
     (name) => { dashboardBuilder.invalidate({ kind: 'accounts', name }); dashboardPublisher.invalidate(); });

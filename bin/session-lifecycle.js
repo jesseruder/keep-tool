@@ -146,4 +146,26 @@ function pendingAgents(events, parentFile, scanChild, now = Date.now(), complete
   }).map((event) => event.entity);
 }
 
-module.exports = { record, read, pendingAgents, foreground, stopReason, turnAt, EVENTS };
+// Whether a lifecycle watch event names a newly written prompt submission, so the
+// daemon can publish that turn at once instead of waiting out the dashboard throttle:
+// a session should leave Waiting on you the moment its prompt is sent. `name` is the
+// watch path relative to the lifecycle directory (`<sid>/<digest>.json`). A create can
+// be heard before its content is written, so an unreadable file is asked again on the
+// next event; `seen` makes each file count once.
+function promptSubmitted(root, name, seen, now = Date.now()) {
+  const parts = String(name || '').split(/[\\/]+/);
+  if (parts.length !== 2 || !ID.test(parts[0]) || !EVENT_FILE.test(parts[1])) return false;
+  const key = parts.join('/');
+  if (seen?.has(key)) return false;
+  let value;
+  try { value = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'lifecycle', parts[0], parts[1]), 'utf8')); }
+  catch { return false; }
+  if (seen) {
+    seen.add(key);
+    if (seen.size > READ_CACHE_FILES) seen.delete(seen.values().next().value);
+  }
+  // A repeated submission keeps its original file (and age), so only a fresh one counts.
+  return value?.event === 'UserPromptSubmit' && Number.isFinite(value.at) && now - value.at < 30000;
+}
+
+module.exports = { record, read, pendingAgents, foreground, stopReason, turnAt, promptSubmitted, EVENTS };

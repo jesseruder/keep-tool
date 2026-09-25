@@ -191,3 +191,30 @@ test('fresh turn/tool signals supersede stale dependency and prompt state, then 
   assert.equal(foreground([wait, { ...wait, event: 'PostToolUse', at: 2002 }], old, 2100).state, 'running');
   assert.equal(foreground([{ ...wait, tool: 'AskUserQuestion' }], old, 2100), null);
 });
+
+test('a newly written prompt submission is recognized once, and nothing else is', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-prompt-submitted-'));
+  try {
+    const { promptSubmitted } = require('./session-lifecycle');
+    const dir = path.join(root, '.keep', 'lifecycle', 's');
+    const names = () => fs.readdirSync(dir).map((name) => `s/${name}`);
+    record(root, { session_id: 's', hook_event_name: 'PreToolUse', tool_use_id: 't1', tool_name: 'Bash' }, 1000);
+    const [tool] = names();
+    record(root, { session_id: 's', hook_event_name: 'UserPromptSubmit', prompt_id: 'p1' }, 2000);
+    const prompt = names().find((name) => name !== tool);
+    const seen = new Set();
+    assert.equal(promptSubmitted(root, tool, seen, 2001), false);
+    assert.equal(promptSubmitted(root, prompt, seen, 2001), true);
+    assert.equal(promptSubmitted(root, prompt, seen, 2002), false, 'the create and the write after it count once');
+    assert.equal(promptSubmitted(root, prompt, new Set(), 2000 + 30000), false, 'an old submission is not news');
+    assert.equal(promptSubmitted(root, 's', seen, 2001), false);
+    assert.equal(promptSubmitted(root, null, seen, 2001), false);
+    assert.equal(promptSubmitted(root, `s/${'0'.repeat(64)}.json`, seen, 2001), false, 'a file already gone');
+    // Heard before its content is written: not counted, and asked again on the next event.
+    const early = `s/${'a'.repeat(64)}.json`;
+    fs.writeFileSync(path.join(root, '.keep', 'lifecycle', early), '');
+    assert.equal(promptSubmitted(root, early, seen, 2001), false);
+    fs.writeFileSync(path.join(root, '.keep', 'lifecycle', early), JSON.stringify({ event: 'UserPromptSubmit', entity: 'p2', at: 2001 }));
+    assert.equal(promptSubmitted(root, early, seen, 2002), true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
