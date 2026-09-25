@@ -480,6 +480,20 @@ test('send: every refusal on the fresh-session path types nothing, and a refused
   fs.mkdirSync(path.join(deliveryDirectory, 'settled'), { recursive: true });
   fs.writeFileSync(path.join(deliveryDirectory, 'settled', `${require('./delivery.js').textHash(id)}.json`), '{}');
   await refused('a delivery journal', {}, missing, { deps: { deliveryDirectory } });
+  // A turn index that exists and cannot be read is no witness: refused by its name,
+  // never passed off as the node's missing transcript.
+  const brokenIndex = path.join(fleet.base, 'broken-turns.sqlite');
+  fs.writeFileSync(brokenIndex, 'not a database, only bytes where one should be\n'.repeat(200));
+  const unreadable = /the turn index could not be read \(.*\), so whether this session has had a turn cannot be told; nothing was sent/;
+  await refused('an unreadable turn index', {}, unreadable, { deps: { turnIndexDb: brokenIndex } });
+
+  // The quiet rule reads the pane's lastInputAt on its node's clock. aws1 runs a
+  // minute ahead: a key it stamps a minute and half a second "from now" was typed
+  // half a second ago here, and is refused.
+  const aheadMemo = new Map([['aws1', { sample: { clockOffsetMs: 60e3 }, sampledAt: Date.now() }]]);
+  await refused('a recent key on a clock that runs ahead', {
+    list: (panes) => panes.map((pane) => ({ ...pane, lastInputAt: new Date(Date.now() + 60e3 - 500).toISOString() })),
+  }, /someone typed into .* in the last 2 s; nothing was sent/, { deps: { nodeStatsMemo: aheadMemo } });
 
   // A tell refused on this path gives its slot back.
   await serve.closeHostClient();
@@ -489,6 +503,31 @@ test('send: every refusal on the fresh-session path types nothing, and a refused
   /does not show Claude's empty prompt; nothing was sent/);
   assert.equal((tell.loadLedger(fleet.root).targets?.[id] || []).length, 0);
   assert.deepEqual(fake.state.submitted, []);
+  // So does one refused for an unreadable turn index, by that name.
+  await serve.closeHostClient();
+  const indexed = freshPaneHosts(fleet);
+  const indexDeps = { ...indexed.deps, turnIndexDb: brokenIndex };
+  await assert.rejects(serve.tellSession({ sessionId: id, text: 'no index' },
+    { ...indexDeps, excluded: new Set(), taskForSession: () => null, sendDeps: indexDeps }),
+  (error) => error.status === 409 && unreadable.test(error.message));
+  assert.equal((tell.loadLedger(fleet.root).targets?.[id] || []).length, 0);
+  assert.deepEqual(indexed.state.submitted, []);
+});
+
+test('send: a pane\'s lastInputAt still in the future on this clock is no evidence of a key, and the send goes ahead', async (t) => {
+  const fleet = createRemoteNodeFleet(t);
+  const serve = require('./serve.js');
+  t.after(() => serve.closeHostClient());
+  await serve.closeHostClient();
+  // aws1's clock runs half a minute ahead and no stats sample says so: its stamp of a
+  // key typed long ago reads as the future here, which the settle and the counter cover.
+  const fake = freshPaneHosts(fleet, {
+    list: (panes) => panes.map((pane) => ({ ...pane, lastInputAt: new Date(Date.now() + 30e3).toISOString() })),
+  });
+  const sent = await serve.sendToSession({ sessionId: fleet.unmirrored.id, pane: fleet.unmirrored.pane, text: 'clock skew' },
+    undefined, undefined, { ...fake.deps, nodeStatsMemo: new Map() });
+  assert.equal(sent.transcriptPending, true);
+  assert.deepEqual(fake.state.submitted, ['clock skew']);
 });
 
 test('send: a card tell ranks a fresh node session after the card\'s thread with turns, and picks it only when it is the only one', async (t) => {

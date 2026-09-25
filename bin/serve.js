@@ -4323,6 +4323,17 @@ async function loadSessionForAction(id, deps = {}) {
 // The row's time is its pane's launch, not now, so it ranks by when the session began
 // and the 48 h window applies to it as it does to any other; a pane opened for Owner
 // to type into (awaitingOwnerInput) is his, and nothing is typed into it.
+//
+// A turn index that exists but cannot be read is no witness either way, and is not
+// the node's answer: it refuses by name, so a locked or damaged turns.sqlite is not
+// mistaken for a session with turns and every first message refused as a missing
+// transcript.
+function turnIndexUnreadable(why) {
+  return Object.assign(new InjectionError(409,
+    `the turn index could not be read (${why}), so whether this session has had a turn cannot be told; nothing was sent`,
+    { reason: 'turn-index-unreadable' }), { nothingTyped: true, typingStarted: false });
+}
+
 function sessionHadTurn(id, node, deps = {}) {
   const root = deps.root || keep.ROOT;
   let mirrored = null;
@@ -4335,7 +4346,8 @@ function sessionHadTurn(id, node, deps = {}) {
     return 'a delivery was journalled against its transcript';
   }
   let file;
-  try { file = deps.turnIndexDb || require('./turn-index.js').databaseFile(); } catch { return 'the turn index could not be located'; }
+  try { file = deps.turnIndexDb || require('./turn-index.js').databaseFile(); }
+  catch (error) { throw turnIndexUnreadable(String(error && error.message || error).slice(0, 120)); }
   // Never created from here: turn-index's own open() makes the database and migrates it.
   if (!fs.existsSync(file)) return null;
   let handle;
@@ -4347,7 +4359,7 @@ function sessionHadTurn(id, node, deps = {}) {
       UNION ALL SELECT 1 AS found FROM messages WHERE session_id = ? LIMIT 1`).get(id, id);
     return row ? 'the turn index has turns for it' : null;
   } catch (error) {
-    return `the turn index could not be read (${String(error && error.message || error).slice(0, 120)})`;
+    throw turnIndexUnreadable(String(error && error.message || error).slice(0, 120));
   } finally {
     try { if (handle) handle.close(); } catch {}
   }
@@ -4378,7 +4390,7 @@ async function remoteSessionWithoutTranscript(id, node, deps = {}) {
   }
   const launched = Number(hosted.meta.launchedAt);
   const mtime = Number.isFinite(launched) && launched > 0 ? launched : Date.parse(hosted.createdAt || '');
-  if (!Number.isFinite(mtime) || !(Date.now() - mtime <= SESSION_WINDOW_MS)) return null;
+  if (!Number.isFinite(mtime) || !((deps.now || Date.now)() - mtime <= SESSION_WINDOW_MS)) return null;
   const session = {
     id, kind: 'claude', agent: 'claude', node, pane: hosted.id,
     project: typeof hosted.meta.project === 'string' ? hosted.meta.project : '',
@@ -9162,8 +9174,15 @@ async function sendWithoutTranscript(session, target, text, opts, deps = {}) {
   const now = deps.now || Date.now;
   const before = await livePaneState(target.pane, deps);
   if (!before) throw refuse('pane input activity could not be verified before typing; nothing was sent');
-  const lastInputAt = Date.parse(before.lastInputAt || '');
-  if (Number.isFinite(lastInputAt) && now() - lastInputAt < FRESH_SEND_INPUT_QUIET_MS) {
+  // The pane's lastInputAt is stamped by its node's clock: moved onto this one by the
+  // node's measured offset while its stats sample is fresh. One still in the future
+  // after that says nothing about when the key was typed, and is left to the settle
+  // window and the counter below rather than refused.
+  const nodeStats = (deps.nodeStatsMemo || nodeStatsMemo).get(session.node);
+  const offset = nodeStats && nodeStats.sample && Number.isFinite(nodeStats.sample.clockOffsetMs)
+    && nodeStatsClock(deps) - nodeStats.sampledAt <= NODE_STATS_STALE_MS ? nodeStats.sample.clockOffsetMs : 0;
+  const lastInputAt = Date.parse(before.lastInputAt || '') - offset;
+  if (Number.isFinite(lastInputAt) && lastInputAt <= now() && now() - lastInputAt < FRESH_SEND_INPUT_QUIET_MS) {
     throw refuse(`someone typed into ${target.pane} in the last ${FRESH_SEND_INPUT_QUIET_MS / 1000} s; nothing was sent`);
   }
   // Measured from the count either way, so a key that landed at the last instant has
