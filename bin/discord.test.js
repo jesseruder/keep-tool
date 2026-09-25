@@ -278,6 +278,33 @@ test('a first run that stops paging at its bound over a filtered prefix does not
   assert.equal(readState(root, 'cursor.json').seq, 121);
 });
 
+test('draining a truncated first run passes over backfilled rows posted before the window', () => {
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  const root = fixture({ enabled: true, maxPerPoll: 1, channels: ['bug-reports'] });
+  const recent = '2026-09-25T11:00:00Z';
+  const old = '2026-09-20T11:00:00Z';
+  const rows = [
+    ...Array.from({ length: 50 }, (_, index) => row(index + 1, { postedAt: recent })),
+    // Ingested after the recent rows, posted days before the window: history.
+    ...Array.from({ length: 70 }, (_, index) => row(index + 51, { channel: 'bug-reports', postedAt: old, text: `old ${index + 51}` })),
+    row(121, { channel: 'bug-reports', postedAt: recent, text: 'the one that matters' }),
+  ];
+  const result = run(root, pollScript(rows, `
+    await discord.poll({ deps, now: ${now} });
+    const afterFirst = JSON.parse(require('fs').readFileSync(discord.CURSOR_FILE, 'utf8'));
+    const found = [];
+    for (let i = 0; i < 5; i += 1) found.push(...(await discord.poll({ deps, now: ${now} })).map((entry) => entry.summary));
+    process.stdout.write(JSON.stringify({ afterFirst: { seq: afterFirst.seq, highWater: afterFirst.bootstrap && afterFirst.bootstrap.highWater }, found }));
+  `));
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    afterFirst: { seq: 50, highWater: 121 }, found: ['[post: A post] the one that matters'],
+  });
+  const cursor = readState(root, 'cursor.json');
+  assert.equal(cursor.seq, 121);
+  assert.equal(cursor.bootstrap, undefined);
+});
+
 test('a message id is classified once however often it comes back', () => {
   const root = fixture({ enabled: true }, { cursor: 0 });
   // The scraper re-read an edited message under a new seq.

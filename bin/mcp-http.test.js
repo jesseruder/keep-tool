@@ -158,9 +158,15 @@ test('unknown-tool matching wants the exact tool name right after the phrase', (
     'Unknown tool: discord_recent', // MCP SDKs
     'unknown tool "discord_recent"',
     'Unknown tool `discord_recent`, sorry',
+    'Unknown tool: discord_recent.',
   ]) assert.equal(mcp.isUnknownTool(text, 'discord_recent'), true, text);
   for (const text of [
     "Unknown tool 'discord_recent_archive'.",
+    "Unknown tool 'discord_recent.archive'.",
+    'Unknown tool: discord_recent.archive',
+    'Unknown tool: discord_recent:x',
+    'Unknown tool: discord_recent-2',
+    "Unknown tool 'discord_recent",
     'Unknown tool: discord_recent2',
     'Unknown tool: other while handling discord_recent',
     'database error while handling discord_recent',

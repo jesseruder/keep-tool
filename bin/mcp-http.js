@@ -40,7 +40,11 @@ const UNREACHABLE_CODES = new Set([
 // error that merely mentions the tool elsewhere, is not a missing tool.
 function isUnknownTool(text, tool) {
   const name = String(tool).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`\\bunknown tool:?\\s*['"\`]?${name}['"\`]?(?=$|[\\s.,;:!)])`, 'i').test(String(text));
+  // A quoted name must close with its own quote; a bare one must not run on into a longer
+  // tool name (discord_recent.archive, discord_recent:x, discord_recent-2).
+  const quoted = `(['"\`])${name}\\1`;
+  const bare = `${name}(?![A-Za-z0-9_:-]|\\.[A-Za-z0-9_])`;
+  return new RegExp(`\\bunknown tool:?\\s*(?:${quoted}|${bare})`, 'i').test(String(text));
 }
 
 class GatewayUnavailable extends Error {

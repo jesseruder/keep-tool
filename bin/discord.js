@@ -227,13 +227,32 @@ function appendDecision(entry) {
   fs.appendFileSync(DECISIONS_FILE, JSON.stringify(entry) + '\n');
 }
 
+// { seq, bootstrap }. `bootstrap` ({ since, highWater }) survives a first run that could
+// not read its whole window in one poll: until the cursor reaches the mark, rows at or
+// below it that were posted before the window are passed over, not classified. Seq is
+// ingest order, and the scraper backfills old forum posts, so draining by after_seq
+// alone would otherwise classify history the first run meant to leave behind.
 function readCursor() {
-  const seq = Number(readJson(CURSOR_FILE, {}).seq);
-  return Number.isSafeInteger(seq) && seq >= 0 ? seq : null;
+  const value = readJson(CURSOR_FILE, {});
+  const seq = Number(value.seq);
+  if (!Number.isSafeInteger(seq) || seq < 0) return { seq: null, bootstrap: null };
+  const since = Number(value.bootstrap && value.bootstrap.since);
+  const highWater = Number(value.bootstrap && value.bootstrap.highWater);
+  const bootstrap = Number.isFinite(since) && Number.isSafeInteger(highWater) && highWater > seq
+    ? { since, highWater } : null;
+  return { seq, bootstrap };
 }
 
-function writeCursor(seq) {
-  writeJsonAtomic(CURSOR_FILE, { seq, at: Date.now() });
+function writeCursor(seq, bootstrap) {
+  writeJsonAtomic(CURSOR_FILE, { seq, ...(bootstrap ? { bootstrap } : {}), at: Date.now() });
+}
+
+// A row the first run's window deliberately left out: at or below its mark and posted
+// before the window. A row with no timestamp is classified rather than guessed old.
+function beforeBootstrap(row, bootstrap) {
+  if (!bootstrap || row.seq > bootstrap.highWater) return false;
+  const posted = Date.parse(String(row.posted_at || ''));
+  return Number.isFinite(posted) && posted < bootstrap.since;
 }
 
 // One page of the tool's answer, checked. A page that arrived but is not the shape
@@ -336,7 +355,7 @@ async function poll(options = {}) {
   if (!cfg.enabled) return [];
   const deps = options.deps || {};
   const now = Number(options.now) || Date.now();
-  const cursor = readCursor();
+  const { seq: cursor, bootstrap: storedBootstrap } = readCursor();
   let rows;
   let baseline;
   let truncated;
@@ -347,6 +366,9 @@ async function poll(options = {}) {
     if (!dry) writeStatus({ ...readJson(STATUS_FILE, {}), lastAttemptAt: Date.now(), skipped: true, detail: error.message });
     return [];
   }
+  const bootstrap = baseline != null
+    ? { since: now - FIRST_RUN_WINDOW_MS, highWater: baseline }
+    : storedBootstrap;
   const seen = readJson(SEEN_FILE, {});
   pruneSeen(seen, now);
   const wanted = cfg.channels.length ? new Set(cfg.channels) : null;
@@ -361,7 +383,7 @@ async function poll(options = {}) {
   for (const row of rows) {
     const message = normalizeRow(row);
     const skip = !message || (wanted && !wanted.has(message.channel)) || seen[message.id]
-      || selected.some((item) => item.id === message.id);
+      || selected.some((item) => item.id === message.id) || beforeBootstrap(row, bootstrap);
     if (!skip) {
       if (held || selected.length >= cfg.maxPerPoll) { held = true; continue; }
       const withSuspects = { ...message, suspects: slack.computeSuspects(message, input) };
@@ -381,6 +403,8 @@ async function poll(options = {}) {
   // highest seq actually fetched and passed, never the mark, since rows between the
   // two were never seen — even if every fetched row was filtered out or already seen.
   if (baseline != null && !held && !truncated) advanceTo = Math.max(baseline, advanceTo == null ? 0 : advanceTo);
+  // The window's rule lasts until the cursor reaches the mark it was taken at.
+  const nextBootstrap = bootstrap && advanceTo != null && advanceTo < bootstrap.highWater ? bootstrap : null;
   let decisions = [];
   if (selected.length) {
     const prompt = slack.buildPrompt(context, selected, { source: 'Discord' });
@@ -421,7 +445,9 @@ async function poll(options = {}) {
   writeJsonAtomic(SEEN_FILE, seen);
   // Last, after the decisions and the seen set are on disk: a crash before this line
   // re-reads rows the seen set already skips, never loses one.
-  if (advanceTo != null && advanceTo !== cursor) writeCursor(advanceTo);
+  if (advanceTo != null && (advanceTo !== cursor || Boolean(nextBootstrap) !== Boolean(storedBootstrap))) {
+    writeCursor(advanceTo, nextBootstrap);
+  }
   writeStatus({
     lastAttemptAt: Date.now(), lastPollAt: Date.now(), skipped: false,
     cursor: advanceTo, fetched: rows.length, backlog: held || Boolean(truncated),
