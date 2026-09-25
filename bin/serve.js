@@ -16819,12 +16819,14 @@ function start(deps = {}) {
   // A prompt sent to a session in Waiting on you skips the build throttle, so the
   // session leaves the list as soon as it is sent, not up to
   // KEEP_DASHBOARD_MIN_INTERVAL_MS later. Only those: the prompts Keep and agents send
-  // to working sessions (a keep tell fan-out, check deliveries) keep the throttle.
+  // to working sessions (a keep tell fan-out, check deliveries) keep the throttle, and
+  // so do event batches to a standing agent, whose needs-you row a prompt does not clear.
   const promptsSeen = new Set();
   watch(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true }, (name) => {
     dashboardBuilder.invalidate({ kind: 'lifecycle', name });
     const sid = require('./session-lifecycle').promptSubmitted(keep.ROOT, name, promptsSeen);
-    const waiting = sid && (retainedPublication?.state?.attention || []).some((item) => item?.sessionId === sid);
+    const waiting = sid && (retainedPublication?.state?.attention || [])
+      .some((item) => item?.sessionId === sid && !item.agent);
     if (waiting) dashboardPublisher.refresh();
     else dashboardPublisher.invalidate();
   });

@@ -151,8 +151,8 @@ function pendingAgents(events, parentFile, scanChild, now = Date.now(), complete
 // dashboard throttle: a session should leave Waiting on you the moment its prompt is
 // sent. `name` is the watch path relative to the lifecycle directory
 // (`<sid>/<digest>.json`). A create can be heard before its content is written; an
-// unreadable file is left for a later event (macOS reports the write, Linux may not,
-// and then the ordinary throttled build still shows it). `seen` makes each prompt count once.
+// unreadable file is not counted and is read again on the write's own event. `seen`
+// makes each prompt count once.
 function promptSubmitted(root, name, seen, now = Date.now()) {
   const parts = String(name || '').split(/[\\/]+/);
   if (parts.length !== 2 || !ID.test(parts[0]) || !EVENT_FILE.test(parts[1])) return null;
