@@ -512,6 +512,17 @@ test('an open whose request times out at the node is resent with its key and ans
   assert.deepEqual(posts.map((post) => post.timeoutMs), [REQUEST_TIMEOUT_MS + OPEN_EXTRA_MS, REQUEST_TIMEOUT_MS + OPEN_EXTRA_MS]);
 });
 
+test('an open the daemon cannot bound comes back as the daemon\'s refusal, word for word', async (t) => {
+  const { OPEN_UNBOUNDED_REFUSAL } = require('./registry-commands.js');
+  const daemon = await stubDaemon(t, () => ({ status: 409, body: { error: OPEN_UNBOUNDED_REFUSAL } }));
+  const { root, env } = nodeEnv(t, { CLAUDE_CODE_SESSION_ID: 'sess-aws1' });
+  env.KEEP_DAEMON_URL = daemon.url;
+  const result = await run(['open', 'card', '--fresh'], { env, cwd: root });
+  assert.equal(result.status, 2);
+  assert.equal(result.stderr, `keep open: the daemon on main refused: ${OPEN_UNBOUNDED_REFUSAL}\n`);
+  assert.equal(daemon.requests.filter((entry) => entry.method === 'POST').length, 1, 'a refusal is not resent');
+});
+
 test('a tell naming a file on the node, or waiting past a day, is refused on the node and never posted', async (t) => {
   const { runRemote } = require('./remote-cli.js');
   const root = tempDir(t);

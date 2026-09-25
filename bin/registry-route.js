@@ -30,7 +30,10 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { isRegistryCommand, argumentRefusal, forwardedWaitMs, isWaitingTell, openExtraMs, MAX_FORWARDED_WAIT_MS } = require('./registry-commands.js');
+const {
+  isRegistryCommand, argumentRefusal, forwardedWaitMs, isWaitingTell, openExtraMs, openRequiredMs,
+  MAX_FORWARDED_WAIT_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL,
+} = require('./registry-commands.js');
 
 const SESSION_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const PANE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -311,6 +314,12 @@ function createRegistryService(options = {}) {
     try {
       const daemon = daemonNode();
       const caller = callerNode(principal, daemon);
+      // An open this daemon's compaction timeout would let run past the capped bound
+      // is refused before anything is adopted, journaled or spawned: killing its CLI
+      // at the cap would leave the in-process open running with nothing recording it.
+      if (body && body.command === 'open' && openRequiredMs(baseEnv) > MAX_OPEN_EXTRA_MS) {
+        refuse(409, OPEN_UNBOUNDED_REFUSAL);
+      }
       const deps = {
         io, location,
         parsePaneRef: (ref) => nodes.parsePaneRef(ref),

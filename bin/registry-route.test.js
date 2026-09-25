@@ -9,7 +9,7 @@ const { spawnSync } = require('node:child_process');
 
 const { routes, matchRoute, routeDenial } = require('./serve/routes.js');
 const { createRegistryService } = require('./registry-route.js');
-const { REGISTRY_COMMANDS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, openExtraMs, argumentRefusal, forwardedWaitMs, nodeSideRefusal } = require('./registry-commands.js');
+const { REGISTRY_COMMANDS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, openExtraMs, openRequiredMs, argumentRefusal, forwardedWaitMs, nodeSideRefusal } = require('./registry-commands.js');
 const ME = { session: 'sess-aws1', node: 'aws1' };
 
 const AWS1 = { class: 'node', node: 'aws1' };
@@ -448,12 +448,36 @@ test('a resend of an open still in flight waits for it and is answered with its 
   assert.equal(calls.length, 1);
 });
 
+test('a forwarded open this daemon cannot bound is refused before anything is spawned or journaled', async (t) => {
+  const refusal = "this daemon's compaction timeout is set so high that a forwarded open cannot be bounded; run keep open on the daemon node, or lower KEEP_COMPACT_TIMEOUT_MS";
+  const twoDays = { KEEP_COMPACT_TIMEOUT_MS: '172800000' };
+  assert.ok(openRequiredMs(twoDays) > MAX_OPEN_EXTRA_MS);
+  assert.equal(openExtraMs(twoDays), MAX_OPEN_EXTRA_MS);
+  const { svc, root, calls } = service(t, { env: twoDays });
+  const open = await svc.handle(AWS1, body(root, { command: 'open', args: ['card', '--fresh'], idempotencyKey: `${KEY}-open` }));
+  assert.deepEqual(open, { status: 409, body: { error: refusal } });
+  assert.equal(calls.length, 0, 'nothing spawned');
+  assert.deepEqual(fs.existsSync(svc.journalDir) ? fs.readdirSync(svc.journalDir) : [], [], 'nothing journaled');
+  // A tell is unaffected: its wait is capped on both sides already.
+  const told = await svc.handle(AWS1, body(root, { command: 'tell', args: ['card', '-m', 'hi'], idempotencyKey: `${KEY}-tell` }));
+  assert.equal(told.status, 200);
+  // At the default and at two hours an open still runs.
+  for (const env of [{}, { KEEP_COMPACT_TIMEOUT_MS: '7200000' }]) {
+    assert.ok(openRequiredMs(env) <= MAX_OPEN_EXTRA_MS);
+    const ok = service(t, { env });
+    const ran = await ok.svc.handle(AWS1, body(ok.root, { command: 'open', args: ['card', '--fresh'], idempotencyKey: `${KEY}-ok` }));
+    assert.equal(ran.status, 200, JSON.stringify(ran.body));
+    assert.equal(ok.calls.length, 1);
+  }
+});
+
 test('an open\'s bound is capped well inside the journal\'s lifetime', (t) => {
   const { JOURNAL_TTL_MS, TIMEOUT_MS } = require('./registry-route.js');
   assert.ok(MAX_OPEN_EXTRA_MS < JOURNAL_TTL_MS);
   assert.equal(MAX_OPEN_EXTRA_MS, JOURNAL_TTL_MS / 2);
   const env = { KEEP_COMPACT_TIMEOUT_MS: String(4 * 24 * 3600e3) };
   assert.equal(openExtraMs(env), MAX_OPEN_EXTRA_MS, 'a four-day compaction timeout gets the cap, not eight days');
+  assert.ok(openRequiredMs(env) > 8 * 24 * 3600e3, 'the requirement itself is not capped');
   assert.equal(openExtraMs({ KEEP_COMPACT_TIMEOUT_MS: '1e15' }), MAX_OPEN_EXTRA_MS);
   assert.equal(service(t, { env }).svc.maxRunMs(), TIMEOUT_MS + MAX_OPEN_EXTRA_MS, 'the ping advertises the cap');
   assert.ok(TIMEOUT_MS + MAX_OPEN_EXTRA_MS < JOURNAL_TTL_MS);
