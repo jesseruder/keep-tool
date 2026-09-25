@@ -77,13 +77,13 @@ Then, all read-only:
    comparing versions with each other on the same morning.
 6. `play_list_reviews` with `max_results 100`, following `next_page_token` until it is
    null. Google returns only reviews written or edited in the last 7 days and only those
-   with text; star-only ratings are invisible. A review is new when its last-modified
-   time is later than the `Reviews cursor:` in the previous check-in; judge only those,
-   and write the newest last-modified time you saw as this pass's cursor — but only when
-   paging reached a null `next_page_token`. If any page failed, judge what you got and
-   carry the previous cursor unchanged, so the next pass reads the rest. With no cursor
-   yet (the first pass), the previous cursor is 24 hours before this pass: judge from
-   there, and write that time as the cursor if paging failed.
+   with text; star-only ratings are invisible. The previous cursor is the `Reviews
+   cursor:` in the last check-in, or 24 hours before this pass when there is none. A
+   review is new when its last-modified time is later than the previous cursor; judge
+   only those. The cursor you write is the later of the previous cursor and the newest
+   new review's last-modified time — so it never moves backward — and only when paging
+   reached a null `next_page_token`; if any page failed, judge what you got and write
+   the previous cursor unchanged, so the next pass reads the rest.
 
 ## Today's baselines (measured 2026-09-25; update when they drift)
 
