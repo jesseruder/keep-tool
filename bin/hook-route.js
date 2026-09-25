@@ -601,6 +601,10 @@ function createHookService(options = {}) {
   const stopping = options.stopping || (() => false);
   const timeoutMs = options.timeoutMs || HOOK_TIMEOUT_MS;
   const now = shared.now;
+  const mirrorOps = options.mirror || mirror;
+  if (typeof mirrorOps.appendAsync !== 'function' || typeof mirrorOps.pruneAsync !== 'function') {
+    throw new Error('createHookService needs asynchronous mirror append and prune operations');
+  }
   // The fleet shares one home path; the node's repository facts must lie under it.
   const home = options.home || (shared.baseEnv && shared.baseEnv.HOME) || os.homedir();
   const repairDeps = {
@@ -611,6 +615,8 @@ function createHookService(options = {}) {
   // continuity check and the run that reads it must not interleave.
   const sessions = new Map();
   let prunedAt = -Infinity;
+  let pruneInFlight = null;
+  let mirrorTail = Promise.resolve();
 
   function inSession(key, fn) {
     const tail = sessions.get(key) || Promise.resolve();
@@ -621,21 +627,31 @@ function createHookService(options = {}) {
     return run;
   }
 
-  function pruneMirrors() {
-    if (now() - prunedAt < PRUNE_EVERY_MS) return;
-    prunedAt = now();
-    try { mirror.prune(root, { now }); } catch {}
+  function inMirror(fn) {
+    const run = mirrorTail.then(fn, fn);
+    mirrorTail = run.then(() => {}, () => {});
+    return run;
   }
 
-  function applyTranscript(request, caller) {
+  function pruneMirrors() {
+    if (pruneInFlight) return pruneInFlight;
+    if (now() - prunedAt < PRUNE_EVERY_MS) return Promise.resolve();
+    prunedAt = now();
+    pruneInFlight = inMirror(async () => {
+      try { await mirrorOps.pruneAsync(root, { now }); } catch {}
+    }).finally(() => { pruneInFlight = null; });
+    return pruneInFlight;
+  }
+
+  async function applyTranscript(request, caller) {
     const { transcript } = request;
     let result;
     try {
-      result = mirror.append({
+      result = await inMirror(() => mirrorOps.appendAsync({
         root, node: caller, sessionId: request.child || request.sessionId, generation: transcript.generation,
         fromOffset: transcript.fromOffset, bytes: transcript.bytes, size: transcript.size,
         mtimeMs: transcript.mtimeMs, sourcePath: transcript.sourcePath, now,
-      });
+      }));
     } catch (error) {
       if (error instanceof mirror.MirrorError) refuse(error.status, error.message);
       throw error;
@@ -685,11 +701,11 @@ function createHookService(options = {}) {
       }
       const request = validateRequest(body, caller, deps);
       if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };
-      pruneMirrors();
+      await pruneMirrors();
       const scope = request.sessionId || '\0client-end';
       return await inSession(`${caller}\0${scope}`, async () => {
         if (request.transcript) {
-          const applied = applyTranscript(request, caller);
+          const applied = await applyTranscript(request, caller);
           if (applied.status) return applied;
           if (request.event === TRANSCRIPT_ONLY) return { status: 200, body: { ok: true, size: applied.size } };
         }

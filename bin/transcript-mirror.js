@@ -98,6 +98,29 @@ function checkedDirectory(root, node, create) {
   return dir;
 }
 
+async function realDirectoryAsync(dir, create) {
+  let stat;
+  try { stat = await fs.promises.lstat(dir); } catch (error) {
+    if (error.code !== 'ENOENT' || !create) throw error;
+    try { await fs.promises.mkdir(dir, { mode: 0o700 }); }
+    catch (mkdirError) { if (mkdirError.code !== 'EEXIST') throw mkdirError; }
+    stat = await fs.promises.lstat(dir);
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) refuse(403, `${path.basename(dir)} in the mirror directory is not a plain directory`);
+}
+
+async function checkedDirectoryAsync(root, node, create) {
+  const meta = path.join(root, '.keep');
+  if (create) await fs.promises.mkdir(meta, { recursive: true });
+  const top = mirrorRoot(root);
+  const { dir } = paths(root, node, 'x');
+  await realDirectoryAsync(top, create);
+  await realDirectoryAsync(dir, create);
+  const expected = path.join(await fs.promises.realpath(meta), DIR_NAME, node);
+  if (await fs.promises.realpath(dir) !== expected) refuse(403, 'the mirror directory resolves outside .keep/transcript-mirrors');
+  return dir;
+}
+
 function readSidecar(file) {
   try {
     const stat = fs.lstatSync(file);
@@ -111,6 +134,21 @@ function writeSidecar(file, value) {
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temp, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
   fs.renameSync(temp, file);
+}
+
+async function readSidecarAsync(file) {
+  try {
+    const stat = await fs.promises.lstat(file);
+    if (!stat.isFile()) return null;
+    const value = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+    return value && typeof value === 'object' && typeof value.generation === 'string' ? value : null;
+  } catch { return null; }
+}
+
+async function writeSidecarAsync(file, value) {
+  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  await fs.promises.writeFile(temp, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
+  await fs.promises.rename(temp, file);
 }
 
 function checkedSourcePath(sourcePath) {
@@ -128,6 +166,17 @@ function nonNegativeInteger(value, name) {
 function currentSize(file) {
   try {
     const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) refuse(403, 'the mirror is not a plain file');
+    return stat.size;
+  } catch (error) {
+    if (error.code === 'ENOENT') return 0;
+    throw error;
+  }
+}
+
+async function currentSizeAsync(file) {
+  try {
+    const stat = await fs.promises.lstat(file);
     if (stat.isSymbolicLink() || !stat.isFile()) refuse(403, 'the mirror is not a plain file');
     return stat.size;
   } catch (error) {
@@ -198,6 +247,67 @@ function append(options = {}) {
   }
   const total = from + bytes.length;
   writeSidecar(where.sidecar, { generation, size: total, mtimeMs, sourcePath, updatedAt: now() });
+  return { ok: true, size: total, reset };
+}
+
+// The hook route uses this equivalent implementation so directory metadata and a
+// multi-megabyte append yield the daemon event loop. The synchronous API remains
+// for CLI/library callers; both keep the same no-follow and atomic-reset rules.
+async function appendAsync(options = {}) {
+  const { root, node, sessionId, generation, fromOffset, size, mtimeMs, sourcePath } = options;
+  const now = options.now || Date.now;
+  if (!root) throw new Error('transcript-mirror.append needs the registry root');
+  const where = paths(root, node, sessionId);
+  if (typeof generation !== 'string' || !GENERATION_RE.test(generation)) refuse(400, 'invalid transcript generation');
+  nonNegativeInteger(fromOffset, 'fromOffset');
+  nonNegativeInteger(size, 'size');
+  if (!Number.isFinite(mtimeMs) || mtimeMs <= 0) refuse(400, 'mtimeMs must be a positive number');
+  checkedSourcePath(sourcePath);
+  const bytes = options.bytes || Buffer.alloc(0);
+  if (!Buffer.isBuffer(bytes)) refuse(400, 'bytes must be a buffer');
+  if (bytes.length > POST_CAP_BYTES) return { ok: false, status: 413, reason: `a post carries at most ${POST_CAP_BYTES} bytes` };
+  if (fromOffset + bytes.length > size) refuse(400, 'the bytes run past the size the source reports');
+
+  await checkedDirectoryAsync(root, node, true);
+  const sidecar = await readSidecarAsync(where.sidecar);
+  const actual = await currentSizeAsync(where.file);
+  const reset = !sidecar || sidecar.generation !== generation || size < actual;
+  const from = reset ? 0 : actual;
+  if (fromOffset !== from) return { ok: false, needFrom: from };
+  if (from + bytes.length > MIRROR_CAP_BYTES) {
+    return { ok: false, status: 413, reason: `a mirror holds at most ${MIRROR_CAP_BYTES} bytes; this transcript is past it` };
+  }
+  const writeAll = async (handle) => {
+    let written = 0;
+    while (written < bytes.length) written += (await handle.write(bytes, written, bytes.length - written)).bytesWritten;
+    await handle.utimes(now() / 1000, mtimeMs / 1000);
+  };
+  if (reset) {
+    const temp = path.join(where.dir, `.reset.${sessionId}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+    let placed = false;
+    let handle = null;
+    try {
+      handle = await fs.promises.open(temp,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      await writeAll(handle);
+      await handle.close();
+      handle = null;
+      await fs.promises.rename(temp, where.file);
+      placed = true;
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      if (!placed) await fs.promises.unlink(temp).catch(() => {});
+    }
+  } else {
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW;
+    const handle = await fs.promises.open(where.file, flags, 0o600);
+    try {
+      if (!(await handle.stat()).isFile()) refuse(403, 'the mirror is not a plain file');
+      await writeAll(handle);
+    } finally { await handle.close(); }
+  }
+  const total = from + bytes.length;
+  await writeSidecarAsync(where.sidecar, { generation, size: total, mtimeMs, sourcePath, updatedAt: now() });
   return { ok: true, size: total, reset };
 }
 
@@ -363,7 +473,42 @@ function prune(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now } = {}) {
   return removed;
 }
 
+async function pruneAsync(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now } = {}) {
+  const removed = [];
+  const cutoff = now() - olderThanMs;
+  const seedCutoff = now() - SEED_TEMP_MAX_AGE_MS;
+  let nodes;
+  try { nodes = await fs.promises.readdir(mirrorRoot(root), { withFileTypes: true }); } catch { return removed; }
+  for (const entry of nodes) {
+    if (!entry.isDirectory() || !NODE_NAME_RE.test(entry.name)) continue;
+    const dir = path.join(mirrorRoot(root), entry.name);
+    let names = [];
+    try { names = await fs.promises.readdir(dir); } catch {}
+    for (const name of names.filter((value) => SEED_TEMP_RE.test(value))) {
+      const temp = path.join(dir, name);
+      try {
+        const info = await fs.promises.lstat(temp);
+        if (info.isFile() && Math.max(info.mtimeMs, info.ctimeMs) < seedCutoff) await fs.promises.unlink(temp);
+      } catch {}
+    }
+    const sessions = new Set(names.map((name) => name.replace(/\.(jsonl|json)$/, '')).filter((name) => SESSION_RE.test(name)));
+    for (const sid of sessions) {
+      const sidecar = path.join(dir, `${sid}.json`);
+      const file = path.join(dir, `${sid}.jsonl`);
+      let at = null;
+      const value = await readSidecarAsync(sidecar);
+      if (value && Number.isFinite(value.updatedAt)) at = value.updatedAt;
+      if (at === null) { try { at = (await fs.promises.lstat(sidecar)).mtimeMs; } catch {} }
+      if (at === null) { try { at = (await fs.promises.lstat(file)).mtimeMs; } catch {} }
+      if (at === null || at >= cutoff) continue;
+      for (const target of [file, sidecar]) { try { await fs.promises.unlink(target); } catch {} }
+      removed.push(`${entry.name}/${sid}`);
+    }
+  }
+  return removed;
+}
+
 module.exports = {
-  append, seed, stat, read, prune, usage, paths, mirrorRoot, MirrorError,
+  append, appendAsync, seed, stat, read, prune, pruneAsync, usage, paths, mirrorRoot, MirrorError,
   POST_CAP_BYTES, MIRROR_CAP_BYTES, PRUNE_AFTER_MS, GENERATION_RE, SESSION_RE,
 };

@@ -63,7 +63,8 @@ function services(t, overrides = {}) {
     env: { PATH: process.env.PATH, HOME: root, LANG: 'C', ...(overrides.env || {}) },
     configFile: path.join(root, 'config.json'),
   });
-  const hooks = createHookService({ root, registry, stopping: overrides.stopping, cardForSession: overrides.cardForSession });
+  const hooks = createHookService({ root, registry, stopping: overrides.stopping, cardForSession: overrides.cardForSession,
+    mirror: overrides.mirror });
   return { root, registry, hooks, calls: fake.calls };
 }
 
@@ -100,6 +101,43 @@ test('the hook route is on the node API only, beside the registry route', async 
   assert.equal(routeDenial(route, AWS1), null);
   assert.deepEqual(routeDenial(route, { class: 'proxy' }), { status: 403, error: 'forbidden for proxy' });
   assert.deepEqual(await route.handle({ req, res: {}, url, body: {}, principal: AWS1 }), { status: 200, value: { ok: true } });
+});
+
+test('slow mirror filesystem work yields the loop and keeps same-session appends ordered', async (t) => {
+  let releasePrune;
+  const pruneHeld = new Promise((resolve) => { releasePrune = resolve; });
+  const appendReleases = [];
+  const appends = [];
+  const fakeMirror = {
+    pruneAsync: async () => pruneHeld,
+    appendAsync: async (options) => {
+      appends.push(options.fromOffset);
+      return new Promise((resolve) => appendReleases.push(() => resolve({
+        ok: true, size: options.fromOffset + options.bytes.length, reset: options.fromOffset === 0,
+      })));
+    },
+  };
+  const { hooks } = services(t, { mirror: fakeMirror });
+  const first = hooks.handle(AWS1, body({ event: 'transcript', transcript: transcript('one') }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(appends, [], 'append waits for the asynchronous prune barrier');
+  let heartbeat = false;
+  setImmediate(() => { heartbeat = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(heartbeat, true, 'unrelated event-loop work runs while mirror I/O is pending');
+  releasePrune();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(appends, [0]);
+
+  const second = hooks.handle(AWS1, body({ event: 'transcript', transcript: transcript('two', { fromOffset: 3, size: 6 }) }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(appends, [0], 'the next post for the session cannot overtake the first');
+  appendReleases.shift()();
+  assert.equal((await first).status, 200);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(appends, [0, 3]);
+  appendReleases.shift()();
+  assert.equal((await second).status, 200);
 });
 
 test('a hook post is refused unless it is a Claude event for a session and pane on the calling node', async (t) => {

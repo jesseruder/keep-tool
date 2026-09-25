@@ -23,6 +23,84 @@ function post(root, extra = {}) {
   });
 }
 
+function postAsync(root, extra = {}) {
+  const bytes = extra.bytes === undefined ? Buffer.from('{"a":1}\n') : extra.bytes;
+  return mirror.appendAsync({
+    root, node: 'aws1', sessionId: 'sess-1', generation: '1:2:3', fromOffset: 0,
+    size: bytes.length, mtimeMs: 1_700_000_000_000, sourcePath: SOURCE, ...extra, bytes,
+  });
+}
+
+test('async posts preserve continuity, append in place, and replace a reset atomically', async (t) => {
+  const root = tempRoot(t);
+  const one = Buffer.from('{"n":1}\n');
+  const two = Buffer.from('{"n":2}\n');
+  assert.deepEqual(await postAsync(root, { bytes: one }), { ok: true, size: one.length, reset: true });
+  const file = mirror.paths(root, 'aws1', 'sess-1').file;
+  const first = fs.statSync(file);
+  assert.deepEqual(await postAsync(root, { bytes: two, fromOffset: one.length + 1, size: one.length + one.length + 1 }),
+    { ok: false, needFrom: one.length });
+  assert.deepEqual(await postAsync(root, { bytes: two, fromOffset: one.length, size: one.length + two.length }),
+    { ok: true, size: one.length + two.length, reset: false });
+  assert.equal(fs.statSync(file).ino, first.ino);
+  assert.equal(fs.readFileSync(file, 'utf8'), `${one}${two}`);
+  const replacement = Buffer.from('new generation\n');
+  assert.deepEqual(await postAsync(root, { generation: '4:5:6', bytes: replacement }),
+    { ok: true, size: replacement.length, reset: true });
+  assert.notEqual(fs.statSync(file).ino, first.ino);
+  assert.equal(fs.readFileSync(file, 'utf8'), replacement.toString());
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.deepEqual(fs.readdirSync(path.dirname(file)).filter((name) => name.endsWith('.tmp')), []);
+});
+
+test('a failed async reset preserves the old mirror and concurrent directory creation is harmless', async (t) => {
+  const root = tempRoot(t);
+  await Promise.all([
+    postAsync(root, { sessionId: 'sess-1' }),
+    postAsync(root, { sessionId: 'sess-2' }),
+  ]);
+  const file = mirror.paths(root, 'aws1', 'sess-1').file;
+  const before = fs.statSync(file);
+  const rename = fs.promises.rename;
+  fs.promises.rename = async (from, to) => {
+    if (to === file) throw Object.assign(new Error('simulated async rename failure'), { code: 'EIO' });
+    return rename(from, to);
+  };
+  try {
+    await assert.rejects(postAsync(root, { generation: '4:5:6', bytes: Buffer.from('other\n') }),
+      /simulated async rename failure/);
+  } finally { fs.promises.rename = rename; }
+  assert.equal(fs.statSync(file).ino, before.ino);
+  assert.equal(fs.readFileSync(file, 'utf8'), '{"a":1}\n');
+  assert.deepEqual(fs.readdirSync(path.dirname(file)).filter((name) => name.endsWith('.tmp')), []);
+});
+
+test('async mirror writes retain no-follow protection and async prune removes only stale mirrors', async (t) => {
+  const root = tempRoot(t);
+  const target = path.join(root, 'target');
+  fs.writeFileSync(target, 'do not touch\n');
+  fs.mkdirSync(path.join(root, '.keep', 'transcript-mirrors', 'aws1'), { recursive: true });
+  fs.symlinkSync(target, mirror.paths(root, 'aws1', 'sess-1').file);
+  await assert.rejects(postAsync(root), (error) => error.status === 403 || error.code === 'ELOOP');
+  assert.equal(fs.readFileSync(target, 'utf8'), 'do not touch\n');
+
+  const linkedRoot = tempRoot(t);
+  fs.mkdirSync(path.join(linkedRoot, '.keep', 'transcript-mirrors'), { recursive: true });
+  fs.symlinkSync(root, path.join(linkedRoot, '.keep', 'transcript-mirrors', 'aws1'));
+  await assert.rejects(postAsync(linkedRoot), (error) => error.status === 403);
+
+  fs.unlinkSync(mirror.paths(root, 'aws1', 'sess-1').file);
+  const now = Date.now();
+  await postAsync(root, { now: () => now });
+  await postAsync(root, { sessionId: 'sess-new', now: () => now });
+  const later = now + 31 * 24 * 3600e3;
+  await postAsync(root, { sessionId: 'sess-new', fromOffset: 8, size: 10, bytes: Buffer.from('z\n'),
+    mtimeMs: later, now: () => later });
+  assert.deepEqual(await mirror.pruneAsync(root, { now: () => later }), ['aws1/sess-1']);
+  assert.equal(fs.existsSync(mirror.paths(root, 'aws1', 'sess-1').file), false);
+  assert.ok(mirror.stat(root, 'aws1', 'sess-new'));
+});
+
 test('posts append in order, and a post that does not start at the end writes nothing', (t) => {
   const root = tempRoot(t);
   const one = Buffer.from('{"n":1}\n');
