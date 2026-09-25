@@ -68,7 +68,10 @@ function resolveLocalFile(root, fromFile, request) {
 function parseModule(root, file) {
   const source = fs.readFileSync(path.join(root, file), 'utf8');
   const ast = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'script', locations: true, allowHashBang: true });
-  const module = { root, file, source, ast, functions: [], nodeFunction: new Map(), exports: new Map(), exportAll: null };
+  const module = {
+    root, file, source, ast, functions: [], nodeFunction: new Map(), exports: new Map(), exportAll: null,
+    untrackedPropertyAssignments: new WeakSet(),
+  };
   let serial = 0;
 
   function labelFor(node, parent, key, owner) {
@@ -149,6 +152,38 @@ function buildScopes(module) {
     return { type: 'multi-ref', refs };
   }
 
+  function refsForObject(node, scope, seen = new Set()) {
+    if (!node || seen.has(node)) return [];
+    seen.add(node);
+    if (node.type !== 'Identifier') return [];
+    let ref = null;
+    for (let here = scope; here; here = here.parent) {
+      if (here.bindings.has(node.name)) { ref = here.bindings.get(node.name); break; }
+    }
+    if (!ref) return [];
+    if (ref.type === 'multi-ref') return ref.refs.flatMap((item) => {
+      if (item.type === 'expr-ref' && item.expr?.type === 'Identifier') return refsForObject(item.expr, item.scope, seen);
+      return [item];
+    });
+    if (ref.type === 'expr-ref' && ref.expr?.type === 'Identifier') {
+      const target = refsForObject(ref.expr, ref.scope, seen);
+      return target.length ? target : [ref];
+    }
+    return [ref];
+  }
+
+  function bindMemberAssignment(left, value, scope) {
+    const property = staticProperty(left);
+    if (!property) return false;
+    const refs = refsForObject(left.object, scope);
+    if (!refs.length) return false;
+    for (const ref of refs) {
+      if (!ref.assignedMembers) ref.assignedMembers = new Map();
+      ref.assignedMembers.set(property, mergedRef(ref.assignedMembers.get(property), value));
+    }
+    return true;
+  }
+
   function bindPattern(pattern, value, scope, merge = false) {
     if (!pattern) return;
     if (pattern.type === 'Identifier') {
@@ -180,8 +215,11 @@ function buildScopes(module) {
       for (const param of node.params) bindPattern(param, { type: 'unknown-ref' }, current);
     }
     if (node.type === 'VariableDeclarator') bindPattern(node.id, { type: 'expr-ref', expr: node.init, scope: current }, current);
-    if (node.type === 'AssignmentExpression' && node.operator === '=') {
-      bindPattern(node.left, { type: 'expr-ref', expr: node.right, scope: current }, current, true);
+    if (node.type === 'AssignmentExpression' && ['=', '||=', '&&=', '??='].includes(node.operator)) {
+      const value = { type: 'expr-ref', expr: node.right, scope: current };
+      if (node.left.type === 'MemberExpression') {
+        if (!bindMemberAssignment(node.left, value, current)) module.untrackedPropertyAssignments.add(node);
+      } else bindPattern(node.left, value, current, true);
     }
     if (node.type === 'ClassDeclaration' && node.id) current.bindings.set(node.id.name, { type: 'unknown-ref' });
     for (const child of childNodes(node)) walk(child, current);
@@ -245,17 +283,24 @@ function createAnalyzer(root) {
   function resolveRef(ref, module, seen = new Set()) {
     if (!ref || seen.has(ref)) return { type: 'unknown' };
     seen.add(ref);
-    if (ref.type === 'function-ref') return { type: 'function', fn: ref.fn };
-    if (ref.type === 'unknown-ref') return { type: 'unknown' };
-    if (ref.type === 'multi-ref') return combineResolved(ref.refs.map((item) => resolveRef(item, module, new Set(seen))));
-    if (ref.type === 'expr-ref') return resolveExpr(ref.expr, module, ref.scope, seen);
-    if (ref.type === 'member-ref') return memberOf(resolveRef(ref.object, module, seen), ref.property, seen);
-    return ref;
+    let resolved;
+    if (ref.type === 'function-ref') resolved = { type: 'function', fn: ref.fn };
+    else if (ref.type === 'unknown-ref') resolved = { type: 'unknown' };
+    else if (ref.type === 'multi-ref') resolved = combineResolved(ref.refs.map((item) => resolveRef(item, module, new Set(seen))));
+    else if (ref.type === 'expr-ref') resolved = resolveExpr(ref.expr, module, ref.scope, seen);
+    else if (ref.type === 'member-ref') resolved = memberOf(resolveRef(ref.object, module, seen), ref.property, seen);
+    else resolved = ref;
+    return ref.assignedMembers ? { type: 'assigned-object', base: resolved, members: ref.assignedMembers, module: ref.scope?.owner?.module || module } : resolved;
   }
 
   function memberOf(object, property, seen) {
     if (!property) return { type: 'unknown' };
     if (object.type === 'multi') return combineResolved(object.values.map((value) => memberOf(value, property, new Set(seen))));
+    if (object.type === 'assigned-object') {
+      const base = memberOf(object.base, property, new Set(seen));
+      const assigned = object.members.get(property);
+      return assigned ? combineResolved([base, resolveRef(assigned, object.module, new Set(seen))]) : base;
+    }
     if (object.type === 'builtin-module') {
       if (object.name === 'fs' && property.endsWith('Sync')) return { type: 'sink', operation: `fs.${property}` };
       if (object.name === 'child_process' && CHILD_SYNC.has(property)) return { type: 'sink', operation: `child_process.${property}` };
@@ -280,7 +325,8 @@ function createAnalyzer(root) {
       const key = value.type === 'sink' ? `sink:${value.operation}`
         : value.type === 'function' ? `function:${value.fn.id}`
           : value.type === 'local-module' ? `module:${value.module.file}`
-            : `${value.type}:${value.name || ''}`;
+            : ['builtin-module', 'atomics'].includes(value.type) ? `${value.type}:${value.name || ''}`
+              : value;
       if (!unique.has(key)) unique.set(key, value);
     }
     return unique.size === 1 ? unique.values().next().value : { type: 'multi', values: [...unique.values()] };
@@ -366,6 +412,19 @@ function createAnalyzer(root) {
             if (capability.type === 'sink') owner.sinks.push({ operation: capability.operation, line: argument.loc.start.line, passed: true });
             else if (capability.type === 'function') owner.calls.push({ kind: 'function', target: capability.fn, line: argument.loc.start.line, passed: true });
           }
+        }
+      }
+      if (node.type === 'AssignmentExpression' && module.untrackedPropertyAssignments.has(node)) {
+        const assigned = resolveExpr(node.right, module, current);
+        const capabilities = assigned.type === 'multi' ? assigned.values : [assigned];
+        for (const capability of capabilities) {
+          if (capability.type !== 'sink') continue;
+          unresolved.push({
+            file: module.file,
+            function: owner.lexical,
+            line: node.loc.start.line,
+            reason: `unresolved property assignment of ${capability.operation}`,
+          });
         }
       }
       for (const child of childNodes(node)) walk(child, current, owner);

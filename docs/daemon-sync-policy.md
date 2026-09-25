@@ -9,7 +9,9 @@ APIs.
 The guard parses CommonJS with Acorn. It starts at `bin/serve.js`'s `start()`,
 maps the `ctx` object into the route and scheduler factories, and follows local
 function calls, static `require` imports, destructured imports, aliases, object
-properties, and reexports. Functions created inside a reached factory are treated
+properties, property assignments, logical assignments, and reexports. Alias
+assignments retain every possible value so a later safe assignment cannot erase
+an earlier blocking capability. Functions created inside a reached factory are treated
 as reachable callbacks. Only an actual `Worker`/process launch is an execution
 boundary. A file named `*-worker.js` that is directly required and called is still
 followed as main-thread code, so a worker-looking filename cannot bypass the guard.
@@ -35,7 +37,7 @@ debt needs the same scrutiny as the code that caused it; regenerating the file i
 not a fix.
 
 `wt land` enforces the ratchet for `keep-tool` after rebasing onto the current
-`origin/main` and immediately before it pushes. This closes the interval where an
+`origin/<default>` and immediately before it pushes. This closes the interval where an
 upstream commit could add blocking work after a session ran its tests. The gate
 runs only the standalone checker, not the test suite, and never regenerates the
 manifest:
@@ -56,6 +58,8 @@ objects other than the daemon's `ctx`, dynamic `require`, or arbitrary computed
 properties. A newly reached computed call fails closed. The few existing computed
 dispatches are exact-count debt with reasons in the manifest. Code should use a
 static import/property or a worker boundary instead of expanding those exceptions.
+A blocking capability assigned through a property the analyzer cannot identify
+also fails closed rather than becoming an escape hatch.
 
 To inspect the current high-risk paths without changing the debt file:
 

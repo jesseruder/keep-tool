@@ -60,10 +60,16 @@ test('scanner resolves aliases, destructuring, reexports, and helper calls', () 
       let reassigned;
       reassigned = fs.realpathSync;
       let overwritten = fs.accessSync;
+      const io = {};
+      io.copy = fs.copyFileSync;
+      io.copy = () => true;
+      let logical;
+      logical ||= fs.openSync;
       const helper = require('../helper');
       function routes() {
         read('x'); reassigned('x'); run('x'); wait(new Int32Array(1), 0); helper.go();
         overwritten('x'); overwritten = () => true;
+        io.copy('from', 'to'); logical('x');
       }
       module.exports = { routes };
     `,
@@ -75,9 +81,25 @@ test('scanner resolves aliases, destructuring, reexports, and helper calls', () 
     `,
   });
   assert.deepEqual(analysis.sinks.map((item) => item.operation).sort(), [
-    'Atomics.wait', 'child_process.spawnSync', 'fs.accessSync', 'fs.readFileSync', 'fs.realpathSync', 'fs.statSync',
+    'Atomics.wait', 'child_process.spawnSync', 'fs.accessSync', 'fs.copyFileSync', 'fs.openSync', 'fs.readFileSync', 'fs.realpathSync', 'fs.statSync',
   ]);
   assert.ok(analysis.edges.some((edge) => edge.caller.endsWith('::routes') && edge.callee.endsWith('::go')));
+});
+
+test('an unresolved property assignment of a blocking capability fails closed', () => {
+  const analysis = analyzeFixture({
+    'bin/serve/routes.js': `
+      const fs = require('node:fs');
+      const io = {};
+      const operation = 'read';
+      io[operation] = fs.readFileSync;
+      function routes() { return 1; }
+      module.exports = { routes };
+    `,
+  });
+  assert.ok(analysis.unresolved.some((item) => item.reason === 'unresolved property assignment of fs.readFileSync'), analysis.unresolved);
+  assert.ok(comparePolicy(analysis, manifestFrom({ ...analysis, unresolved: [] }))
+    .some((item) => item.includes('new unresolved call') && item.includes('fs.readFileSync')));
 });
 
 test('a new route path to a pre-existing blocking helper fails the ratchet', () => {
