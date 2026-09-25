@@ -188,10 +188,16 @@ test('call and apply invoke direct sinks and every selected helper capability', 
     'bin/serve/routes.js': `
       const fs = require('node:fs');
       const helper = require('../helper');
+      const runner = {
+        call() { return fs.openSync('four'); },
+        apply() { return fs.closeSync(1); },
+      };
       function routes() {
         fs.readFileSync.call(fs, 'one');
         fs.statSync.apply(fs, ['two']);
         (helper.safe || helper.blocking).call(helper, 'three');
+        runner.call();
+        runner.apply();
       }
       module.exports = { routes };
     `,
@@ -203,9 +209,13 @@ test('call and apply invoke direct sinks and every selected helper capability', 
     `,
   });
   assert.deepEqual(analysis.sinks.map((sink) => sink.operation).sort(), [
-    'fs.readFileSync', 'fs.realpathSync', 'fs.statSync',
+    'fs.closeSync', 'fs.openSync', 'fs.readFileSync', 'fs.realpathSync', 'fs.statSync',
   ]);
   assert.ok(analysis.edges.some((edge) => edge.caller.endsWith('::routes') && edge.callee.endsWith('::blocking')),
+    JSON.stringify(analysis.edges));
+  assert.ok(analysis.edges.some((edge) => edge.caller.endsWith('::routes') && edge.callee.endsWith('::call')),
+    JSON.stringify(analysis.edges));
+  assert.ok(analysis.edges.some((edge) => edge.caller.endsWith('::routes') && edge.callee.endsWith('::apply')),
     JSON.stringify(analysis.edges));
 });
 

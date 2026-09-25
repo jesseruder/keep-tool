@@ -407,7 +407,12 @@ function createAnalyzer(root) {
         // selected helpers disappear behind a common invocation form.
         const transparentInvocation = node.type === 'CallExpression' && node.callee.type === 'MemberExpression'
           && ['call', 'apply'].includes(staticProperty(node.callee));
-        const resolved = resolveExpr(transparentInvocation ? node.callee.object : node.callee, module, current);
+        // `call` and `apply` can also be ordinary own methods. Keep both possible
+        // targets: the method property and Function.prototype's receiver.
+        const resolved = transparentInvocation ? combineResolved([
+          resolveExpr(node.callee, module, current, new Set()),
+          resolveExpr(node.callee.object, module, current, new Set()),
+        ]) : resolveExpr(node.callee, module, current);
         const targets = resolved.type === 'multi' ? resolved.values : [resolved];
         for (const target of targets) {
           if (target.type === 'sink') owner.sinks.push({ operation: target.operation, line: node.loc.start.line });
