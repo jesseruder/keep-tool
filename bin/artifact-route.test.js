@@ -114,7 +114,7 @@ test('only a node, or the daemon\'s own callers, may post an artifact', async (t
   assert.equal(calls.length, 0);
 });
 
-test('a file whose bytes do not match its sha256 or size is refused, and nothing is journalled or run', async (t) => {
+test('a file whose bytes do not match its sha256 or size is refused, and nothing is recorded or run', async (t) => {
   const { artifacts, root, calls } = services(t);
   const damaged = { ...fileOf('shot.png', 'png bytes'), content: Buffer.from('png bytez').toString('base64') };
   const mismatch = await artifacts.handle(AWS1, body(root, { files: [damaged] }));
@@ -123,10 +123,17 @@ test('a file whose bytes do not match its sha256 or size is refused, and nothing
   const short = await artifacts.handle(AWS1, body(root, { files: [{ ...fileOf('shot.png', 'png bytes'), size: 3 }] }));
   assert.equal(short.status, 400);
   assert.match(short.body.error, /9 bytes arrived, 3 were sent/);
-  const notBase64 = await artifacts.handle(AWS1, body(root, { files: [{ ...fileOf('shot.png', 'x'), content: '!!!!' }] }));
-  assert.match(notBase64.body.error, /must be base64/);
+  const notBase64 = await artifacts.handle(AWS1, body(root, { files: [{ ...fileOf('shot.png', 'x'), size: 3, content: '!!!!' }] }));
+  assert.equal(notBase64.status, 400);
+  assert.match(notBase64.body.error, /content must be base64/);
   assert.equal(calls.length, 0);
-  assert.equal(fs.existsSync(path.join(root, '.keep', 'registry-ops')), false);
+  // The digest is checked as the file is written, inside the journalled run: a run
+  // that throws before its CLI is spawned leaves no record, so a corrected resend runs.
+  const ops = path.join(root, '.keep', 'registry-ops');
+  assert.deepEqual(fs.existsSync(ops) ? fs.readdirSync(ops) : [], []);
+  const fixed = await artifacts.handle(AWS1, body(root));
+  assert.equal(fixed.status, 200);
+  assert.equal(calls.length, 1);
 });
 
 test('files past the per-file, per-command or count bound are refused', async (t) => {
@@ -226,4 +233,85 @@ test('a real keep artifact stores a node\'s file in the registry through the dae
   assert.match(card, /Stored .*shot\.png \(from aws1:\/home\/someone\/shots\/shot\.png\)/, 'the log names the node\'s file, not the copy');
   assert.match(card, /the login screen/);
   assert.deepEqual(fs.readdirSync(tmpRoot), []);
+});
+
+test('a file larger than one decode slice is written whole and exact', async (t) => {
+  const { DECODE_SLICE_CHARS } = require('./artifact-route.js');
+  const { artifacts, root, calls } = services(t);
+  const bytes = crypto.randomBytes(Math.ceil(DECODE_SLICE_CHARS * 3 / 4) * 2 + 17);
+  const answer = await artifacts.handle(AWS1, body(root, { files: [fileOf('big.bin', bytes)] }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(Buffer.compare(calls[0].copies[0].bytes, bytes), 0);
+});
+
+// Admission, before the node API reads a body: one upload per node, two in all.
+function fakeResponse() {
+  const res = new EventEmitter();
+  res.close = () => res.emit('close');
+  return res;
+}
+
+test('artifact uploads are admitted one per node and two in all, and a slot frees when its response closes', (t) => {
+  const { artifacts } = services(t);
+  const first = fakeResponse();
+  assert.equal(artifacts.admit(AWS1, first), null);
+  const busy = artifacts.admit(AWS1, fakeResponse());
+  assert.equal(busy.status, 429);
+  assert.equal(busy.body.busy, true);
+  assert.equal(busy.headers['retry-after'], '2');
+  const other = fakeResponse();
+  assert.equal(artifacts.admit({ class: 'node', node: 'aws2' }, other), null);
+  assert.equal(artifacts.admit({ class: 'node', node: 'aws3' }, fakeResponse()).status, 429, 'two in all');
+  first.close();
+  first.close();
+  assert.equal(artifacts.uploads(), 1, 'a slot is freed once');
+  assert.equal(artifacts.admit(AWS1, fakeResponse()), null, 'admitted once the first finished');
+});
+
+test('through the node API a second upload from one node is turned away unread, and admitted after the first', async (t) => {
+  const http = require('node:http');
+  const nodeApi = require('./serve/node-api.js');
+  const { routes, matchRoute, routeDenial } = require('./serve/routes.js');
+  const keepConsole = require('./console.js');
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let spawned = 0;
+  const fake = fakeSpawn(() => ({ code: 0, stdout: 'stored\n', stderr: '' }));
+  const spawn = (...args) => {
+    spawned += 1;
+    const child = fake.spawn(...args);
+    // The first run is held open until the test lets it finish.
+    if (spawned === 1) {
+      const emit = child.emit.bind(child);
+      child.emit = (name, ...rest) => (name === 'close' ? held.then(() => emit(name, ...rest)) : emit(name, ...rest));
+    }
+    return child;
+  };
+  const { artifacts, root } = services(t, { fake: { spawn, calls: fake.calls } });
+  const read = [];
+  const handler = nodeApi.createNodeApiHandler({
+    routes: routes({ json: (res, status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); },
+      nodeApiEnabled: () => true, artifactService: artifacts }),
+    matchRoute, routeDenial, principal: keepConsole.principal, log: () => {},
+    tokenStore: nodeApi.createNodeTokenStore({ initial: { aws1: 'aws1-secret' }, read: () => ({ aws1: 'aws1-secret' }) }),
+    readBody: (req) => new Promise((resolve) => { let data = ''; req.on('data', (c) => { data += c; }); req.on('end', () => { read.push(req.url); resolve(JSON.parse(data)); }); }),
+    admit: (pathname, who, res) => (pathname === '/api/artifact' ? artifacts.admit(who, res) : null),
+  });
+  const server = http.createServer(handler);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  const { nodeApiRequest } = require('./remote-cli.js');
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const post = (key) => nodeApiRequest(url, '/api/artifact', { payload: body(root, { idempotencyKey: key }), token: 'aws1-secret', timeoutMs: 10e3 });
+  const first = post(`${KEY}-one`);
+  while (spawned === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+  const second = await post(`${KEY}-two`);
+  assert.equal(second.status, 429);
+  assert.equal(JSON.parse(second.data).busy, true);
+  assert.equal(read.length, 1, 'the refused upload was never read');
+  release();
+  assert.equal((await first).status, 200);
+  const again = await post(`${KEY}-two`);
+  assert.equal(again.status, 200, again.data);
+  assert.equal(JSON.parse(again.data).stdout, 'stored\n');
 });

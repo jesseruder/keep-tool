@@ -155,7 +155,9 @@ viewer, and in an Inbox card's notes. `GET /api/card-artifacts?card=<id>` lists 
 (name, size, time, whether an image, content type; newest first, at most 200) and
 `GET /api/card-artifact?card=<id>&name=<name>` serves one. Both take the console's own
 auth and `x-keep: 1`, and never a node token. A name must be a plain file name and
-the path it resolves to, links followed, a regular file inside `.keep/artifacts/`.
+the file is opened first (never through a link as its last component) and the
+descriptor must be a regular file that the path, resolved after the open, names inside
+`.keep/artifacts/`; the bytes and the length are the descriptor's.
 PNG, JPEG, GIF, WebP and SVG are served inline with their image type; anything else
 as an attachment. Every response carries `X-Content-Type-Options: nosniff` and
 `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox`, so
@@ -1705,6 +1707,17 @@ temporary copy. The node prints what that CLI printed (the durable paths, on the
 daemon) with its exit status, and a refusal as the daemon's. The node's post is bounded
 by the ordinary three minutes plus the upload at 256 KiB/s. `keep artifact <card>`
 with no files lists the card's artifacts on the daemon.
+
+The daemon admits artifact uploads before it reads their body: one at a time per node
+and two in all. One turned away gets `429` with `busy: true` and `Retry-After`, and the
+node's CLI says so once, waits and resends the same key, up to the same horizon as a
+command still running. An admitted upload is decoded a slice at a time and hashed and
+written as it goes. The node opens each file once and reads it from that descriptor,
+after checking that the descriptor is the file the path resolves to under home both
+before and after the open, so a file swapped in between is refused. `keep artifact`
+itself refuses a card directory (or `.keep/artifacts`) that is a symbolic link or
+resolves anywhere but the registry's own `.keep/artifacts/<card>`, and a store that
+fails removes its copies and restores the card and the index.
 
 The same trust covers a check recipe: a node's `keep add` or `keep checkin` may carry
 `--check` and `--on-pass`, whose text the daemon later hands a session just as it types a

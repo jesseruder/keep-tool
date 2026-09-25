@@ -3376,3 +3376,56 @@ test('the move route answers local and admin callers only, never a node or the p
   // No node-API route by this name: a node's listener never reaches it.
   assert.equal(route.when, undefined);
 });
+
+test('artifact refuses a card directory that is a symbolic link, and a failed store leaves nothing behind', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-artifact-link-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-artifact-outside-'));
+  const run = (args) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), ...args], {
+    cwd: root, encoding: 'utf8', timeout: 15000, env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+  });
+  const git = (...args) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'));
+    fs.writeFileSync(path.join(root, '.gitignore'), '.keep/\nsource/\n');
+    assert.equal(git('init', '-q').status, 0);
+    git('config', 'user.name', 'Keep Test');
+    git('config', 'user.email', 'keep@example.test');
+    git('add', '.gitignore');
+    assert.equal(git('commit', '-q', '-m', 'test fixture').status, 0);
+    const keep = require('./keep.js');
+    for (const id of ['card', 'other']) {
+      fs.writeFileSync(path.join(root, 'tasks', `${id}.md`), keep.serializeTask({
+        id, fm: { title: 'Artifacts', status: 'active', kind: 'task', tags: ['personal'] }, body: '',
+      }));
+    }
+    fs.mkdirSync(path.join(root, 'source'));
+    const shot = path.join(root, 'source', 'shot.png');
+    fs.writeFileSync(shot, 'png');
+    fs.mkdirSync(path.join(root, '.keep', 'artifacts'), { recursive: true });
+    fs.symlinkSync(outside, path.join(root, '.keep', 'artifacts', 'card'));
+    const before = fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8');
+    const linked = run(['artifact', 'card', shot]);
+    assert.equal(linked.status, 1);
+    assert.match(linked.stderr, /is not a plain directory; refusing to store artifacts through it/);
+    assert.deepEqual(fs.readdirSync(outside), [], 'nothing was written through the link');
+    assert.equal(fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8'), before);
+
+    // A copy that fails after another succeeded takes the first one back out, and the
+    // card and the index are as they were.
+    if (!(process.getuid && process.getuid() === 0)) {
+      const unreadable = path.join(root, 'source', 'locked.txt');
+      fs.writeFileSync(unreadable, 'secret');
+      fs.chmodSync(unreadable, 0o000);
+      const otherBefore = fs.readFileSync(path.join(root, 'tasks', 'other.md'), 'utf8');
+      const failed = run(['artifact', 'other', shot, unreadable]);
+      assert.notEqual(failed.status, 0);
+      assert.deepEqual(fs.readdirSync(path.join(root, '.keep', 'artifacts', 'other')), []);
+      assert.equal(fs.readFileSync(path.join(root, 'tasks', 'other.md'), 'utf8'), otherBefore);
+      assert.equal(git('diff', '--cached', '--name-only').stdout, '');
+      fs.chmodSync(unreadable, 0o600);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});

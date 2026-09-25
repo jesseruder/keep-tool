@@ -15,6 +15,15 @@
 // it), late adoption, the idempotency journal, the per-node queue, the restart gate
 // and the subprocess (registry-route.js shared). The bytes themselves are never
 // journalled; the digest names them by their sha256.
+//
+// An upload is up to 20 MiB of files, base64-encoded in one JSON body, which the
+// node API buffers and parses before any route sees it. So uploads are admitted
+// before their body is read (admit(), called by the node API handler): one at a
+// time per node and ARTIFACT_UPLOADS_MAX across all of them. One turned away gets
+// 429 with `busy: true` and a Retry-After, and the node's CLI waits and resends it
+// under the same key (remote-cli postWithRetry). An admitted upload is decoded one
+// file at a time, in slices that yield to the event loop, and each slice is hashed
+// and written as it is decoded, so no file is ever held decoded in memory whole.
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -31,11 +40,23 @@ const CARD_RE = /^[a-z0-9][a-z0-9-]{0,127}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 const SOURCE_MAX_BYTES = 4096;
+const ARTIFACT_UPLOADS_PER_NODE = 1;
+const ARTIFACT_UPLOADS_MAX = 2;
+const BUSY_RETRY_MS = 2000;
+// Base64 decoded per slice: a multiple of four characters, 768 KiB of bytes.
+const DECODE_SLICE_CHARS = 1024 * 1024;
 
 function refuse(status, message) { throw new RegistryError(status, message); }
 
-// The files, decoded and checked. Throws RegistryError; returns [{ name, size, sha256,
-// source, bytes }]. Every bound is checked on what arrived, not on what the node said.
+// How many bytes a base64 string decodes to, from its length and padding alone.
+function decodedLength(content) {
+  const padding = content.endsWith('==') ? 2 : content.endsWith('=') ? 1 : 0;
+  return (content.length / 4) * 3 - padding;
+}
+
+// The files, checked without decoding them. Throws RegistryError; returns [{ name,
+// size, sha256, source, content }]. Every bound is checked on the length of what
+// arrived, not on what the node said; the digest is checked as the file is written.
 function checkedFiles(value) {
   if (!Array.isArray(value)) refuse(400, 'files must be an array');
   if (value.length > ARTIFACT_MAX_FILES) refuse(413, `at most ${ARTIFACT_MAX_FILES} files per keep artifact`);
@@ -49,17 +70,13 @@ function checkedFiles(value) {
       refuse(413, `artifact too large: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB); at most ${ARTIFACT_FILE_MAX_BYTES / 1024 / 1024} MB per file`);
     }
     if (typeof file.sha256 !== 'string' || !SHA256_RE.test(file.sha256)) refuse(400, `files[${index}].sha256 must be a hex sha256`);
-    if (typeof file.content !== 'string' || file.content.length % 4 !== 0 || !BASE64_RE.test(file.content)) {
-      refuse(400, `files[${index}].content must be base64`);
-    }
-    const bytes = Buffer.from(file.content, 'base64');
-    if (bytes.length !== file.size) refuse(400, `${file.name}: ${bytes.length} bytes arrived, ${file.size} were sent`);
-    total += bytes.length;
+    if (typeof file.content !== 'string' || file.content.length % 4 !== 0) refuse(400, `files[${index}].content must be base64`);
+    const length = decodedLength(file.content);
+    if (length !== file.size) refuse(400, `${file.name}: ${length} bytes arrived, ${file.size} were sent`);
+    total += length;
     if (total > ARTIFACT_COMMAND_MAX_BYTES) {
       refuse(413, `the files are larger than ${ARTIFACT_COMMAND_MAX_BYTES / 1024 / 1024} MB together; store them in more than one keep artifact`);
     }
-    const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
-    if (sha256 !== file.sha256) refuse(400, `${file.name}: sha256 mismatch; the file changed or was damaged on the way`);
     let source = null;
     if (file.source !== undefined && file.source !== null) {
       if (typeof file.source !== 'string' || !file.source || !path.isAbsolute(file.source) || /[\r\n\0]/.test(file.source)
@@ -68,8 +85,32 @@ function checkedFiles(value) {
       }
       source = file.source;
     }
-    return { name: file.name, size: bytes.length, sha256, source, bytes };
+    return { name: file.name, size: length, sha256: file.sha256, source, content: file.content };
   });
+}
+
+// Decodes `file.content` into `copy` a slice at a time, hashing as it goes, and drops
+// the encoded string once written. Throws RegistryError when the bytes are not
+// base64 or do not match the digest the node sent.
+async function writeDecoded(fsp, copy, file) {
+  const hash = crypto.createHash('sha256');
+  const handle = await fsp.open(copy, 'wx', 0o600);
+  try {
+    const content = file.content;
+    file.content = null;
+    for (let at = 0; at < content.length; at += DECODE_SLICE_CHARS) {
+      const slice = content.slice(at, at + DECODE_SLICE_CHARS);
+      if (!BASE64_RE.test(slice)) refuse(400, `${file.name}: content must be base64`);
+      const bytes = Buffer.from(slice, 'base64');
+      hash.update(bytes);
+      await handle.write(bytes);
+      // Between slices, the daemon's other work runs.
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  } finally {
+    await handle.close();
+  }
+  if (hash.digest('hex') !== file.sha256) refuse(400, `${file.name}: sha256 mismatch; the file changed or was damaged on the way`);
 }
 
 // The request, checked field by field, before anything is adopted, journalled or
@@ -124,7 +165,7 @@ function createArtifactService(options = {}) {
         const sub = path.join(dir, String(index));
         await fsp.mkdir(sub, { mode: 0o700 });
         const copy = path.join(sub, file.name);
-        await fsp.writeFile(copy, file.bytes, { mode: 0o600, flag: 'wx' });
+        await writeDecoded(fsp, copy, file);
         copies.push(copy);
       }
       const env = shared.childEnv(request, caller, daemon);
@@ -136,6 +177,33 @@ function createArtifactService(options = {}) {
     } finally {
       await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
     }
+  }
+
+  // Admission, before the body is read: null to proceed, or the busy answer. The
+  // slot is held until the response closes, whether it was answered, refused later
+  // or dropped.
+  const perNode = new Map();
+  let uploads = 0;
+  function admit(principal, res) {
+    const who = principal && principal.class === 'node' ? `node:${principal.node}` : String(principal && principal.class);
+    if ((perNode.get(who) || 0) >= ARTIFACT_UPLOADS_PER_NODE || uploads >= ARTIFACT_UPLOADS_MAX) {
+      return {
+        status: 429,
+        body: { error: 'the daemon is taking another artifact upload; try again', busy: true, retryAfterMs: BUSY_RETRY_MS },
+        headers: { 'retry-after': String(Math.ceil(BUSY_RETRY_MS / 1000)) },
+      };
+    }
+    perNode.set(who, (perNode.get(who) || 0) + 1);
+    uploads += 1;
+    let released = false;
+    res.once('close', () => {
+      if (released) return;
+      released = true;
+      uploads -= 1;
+      const left = perNode.get(who) - 1;
+      if (left > 0) perNode.set(who, left); else perNode.delete(who);
+    });
+    return null;
   }
 
   async function handle(principal, body) {
@@ -165,7 +233,10 @@ function createArtifactService(options = {}) {
     }
   }
 
-  return { handle };
+  return { handle, admit, uploads: () => uploads };
 }
 
-module.exports = { createArtifactService, validateArtifactRequest, checkedFiles, digestOf, CARD_RE };
+module.exports = {
+  createArtifactService, validateArtifactRequest, checkedFiles, digestOf, CARD_RE,
+  ARTIFACT_UPLOADS_PER_NODE, ARTIFACT_UPLOADS_MAX, BUSY_RETRY_MS, DECODE_SLICE_CHARS,
+};

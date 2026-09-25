@@ -84,22 +84,38 @@ async function listArtifacts(root, card, { fsp = fs.promises } = {}) {
     : { card, artifacts };
 }
 
-// The file a request names, once it has been shown to be a regular file inside the
-// artifacts directory. Throws ArtifactError.
+// The file a request names, opened, once the open descriptor has been shown to be a
+// regular file inside the artifacts directory. Throws ArtifactError; the caller owns
+// the returned handle. The file is opened first (never through a link as its last
+// component), and the checks are made on that descriptor: its path resolved after
+// the open must lie inside the directory and name the very file the descriptor
+// holds, so a path swapped between the check and the read serves nothing.
 async function resolveArtifact(root, card, name, { fsp = fs.promises } = {}) {
   checkedCard(card);
   if (artifactNameRefusal(name)) throw new ArtifactError(400, 'invalid artifact name');
-  let base;
-  let file;
+  const candidate = path.join(artifactsRoot(root), card, name);
+  let handle;
+  try { handle = await fsp.open(candidate, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)); }
+  catch { throw new ArtifactError(404, 'no such artifact'); }
   try {
-    base = await fsp.realpath(artifactsRoot(root));
-    file = await fsp.realpath(path.join(artifactsRoot(root), card, name));
-  } catch { throw new ArtifactError(404, 'no such artifact'); }
-  // Links are followed first: one planted in the directory still may not lead out.
-  if (!file.startsWith(`${base}${path.sep}`)) throw new ArtifactError(404, 'no such artifact');
-  const stat = await fsp.stat(file).catch(() => null);
-  if (!stat || !stat.isFile()) throw new ArtifactError(404, 'no such artifact');
-  return { file, size: stat.size, name, ...kindOf(name) };
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new ArtifactError(404, 'no such artifact');
+    let base;
+    let real;
+    let named;
+    try {
+      base = await fsp.realpath(artifactsRoot(root));
+      real = await fsp.realpath(candidate);
+      named = await fsp.lstat(real);
+    } catch { throw new ArtifactError(404, 'no such artifact'); }
+    if (!real.startsWith(`${base}${path.sep}`) || named.dev !== stat.dev || named.ino !== stat.ino) {
+      throw new ArtifactError(404, 'no such artifact');
+    }
+    return { handle, size: stat.size, name, ...kindOf(name) };
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw error;
+  }
 }
 
 function dispositionOf(name, inline) {
@@ -107,8 +123,9 @@ function dispositionOf(name, inline) {
   return `${inline ? 'inline' : 'attachment'}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
 
-// Streams the artifact the request names, or answers its refusal as JSON.
-async function serveArtifact(res, root, card, name, { json, fsp = fs.promises, createReadStream = fs.createReadStream } = {}) {
+// Streams the artifact the request names from its checked descriptor, or answers
+// its refusal as JSON. The headers are the descriptor's size and the name's type.
+async function serveArtifact(res, root, card, name, { json, fsp = fs.promises } = {}) {
   let found;
   try { found = await resolveArtifact(root, card, name, { fsp }); }
   catch (error) {
@@ -124,8 +141,10 @@ async function serveArtifact(res, root, card, name, { json, fsp = fs.promises, c
     'cross-origin-resource-policy': 'same-origin',
     'cache-control': 'private, no-cache',
   });
-  const stream = createReadStream(found.file);
+  // The stream owns the descriptor from here and closes it when it ends or fails.
+  const stream = fs.createReadStream(null, { fd: found.handle, autoClose: true, end: Math.max(found.size - 1, 0) });
   stream.on('error', (error) => res.destroy(error));
+  if (found.size === 0) { stream.destroy(); res.end(); return undefined; }
   stream.pipe(res);
   return undefined;
 }

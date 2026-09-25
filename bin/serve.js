@@ -16251,9 +16251,9 @@ function start(deps = {}) {
 
   const { restarts } = startSchedulers(ctx);
 
-  const json = (res, code, obj) => {
+  const json = (res, code, obj, headers = {}) => {
     const body = JSON.stringify(obj);
-    res.writeHead(code, { 'content-type': 'application/json' });
+    res.writeHead(code, { 'content-type': 'application/json', ...headers });
     res.end(body);
   };
 
@@ -16443,6 +16443,8 @@ function start(deps = {}) {
         // 20 MiB of files, base64-encoded.
         bodyLimit: (pathname) => (pathname === '/api/hook' ? require('./hook-route.js').BODY_MAX_BYTES
           : pathname === '/api/artifact' ? require('./registry-commands.js').ARTIFACT_BODY_MAX_BYTES : undefined),
+        // Artifact uploads are admitted before their body is read (bin/artifact-route.js).
+        admit: (pathname, who, res) => (pathname === '/api/artifact' && ctx.artifactService ? ctx.artifactService.admit(who, res) : null),
         tokenStore: nodeApi.createNodeTokenStore({ initial: nodeTokenMap, read: () => nodes.nodeApiTokens(keep.ROOT) }),
         json,
         onMutation: () => dashboardPublisher?.invalidate(),

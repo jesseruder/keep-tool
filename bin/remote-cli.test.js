@@ -638,3 +638,48 @@ test('keep artifact from a node prints the daemon\'s refusal as the daemon\'s, a
   });
   assert.deepEqual(await runArtifact(['card', 'a.txt'], deps), { code: 1, stdout: '', stderr: 'keep: something failed\n' });
 });
+
+test('keep artifact from a node refuses a file swapped between its check and its read', async (t) => {
+  const { runArtifact } = require('./remote-cli.js');
+  const home = tempDir(t);
+  const elsewhere = tempDir(t);
+  fs.writeFileSync(path.join(home, 'shot.png'), 'png');
+  fs.writeFileSync(path.join(elsewhere, 'secret.txt'), 'secret');
+  let sent = 0;
+  const request = async () => { sent += 1; return { status: 200, data: '{}' }; };
+  // The open lands on a file outside home, as a rename would have made it.
+  const io = { ...fs, openSync: (file, flags) => fs.openSync(file.endsWith('shot.png') ? path.join(elsewhere, 'secret.txt') : file, flags) };
+  const deps = { where: { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, request, token: 't', env: {}, cwd: home, home, io };
+  const answer = await runArtifact(['card', 'shot.png'], deps);
+  assert.equal(answer.code, 2);
+  assert.match(answer.stderr, /shot\.png changed while it was being read; try again/);
+  assert.equal(sent, 0);
+});
+
+test('an upload the daemon turns away as busy is resent with its key after the wait it names', async (t) => {
+  const { postWithRetry } = require('./remote-cli.js');
+  const posts = [];
+  const answers = [
+    { status: 429, data: JSON.stringify({ error: 'the daemon is taking another artifact upload; try again', busy: true, retryAfterMs: 2000 }) },
+    { status: 429, data: JSON.stringify({ error: 'the daemon is taking another artifact upload; try again', busy: true, retryAfterMs: 2000 }) },
+    { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: 'stored\n', stderr: '' }) },
+  ];
+  const slept = [];
+  const notes = [];
+  const request = async (url, pathname, options) => { posts.push({ pathname, key: options.payload.idempotencyKey }); return answers.shift(); };
+  const response = await postWithRetry({ local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, '/api/artifact',
+    { command: 'artifact', idempotencyKey: 'k-0123456789abcdef' },
+    { request, token: 't', sleep: async (ms) => { slept.push(ms); }, note: (line) => notes.push(line), label: 'keep artifact' });
+  assert.equal(response.status, 200);
+  assert.deepEqual(posts.map((entry) => entry.key), ['k-0123456789abcdef', 'k-0123456789abcdef', 'k-0123456789abcdef']);
+  assert.deepEqual(posts.map((entry) => entry.pathname), ['/api/artifact', '/api/artifact', '/api/artifact'], 'no ping: the daemon answered');
+  assert.deepEqual(slept, [2000, 2000]);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /keep artifact: the daemon is taking another artifact upload; try again \(daemon on main\), waiting…/);
+  // Past the horizon it stops, and says why.
+  let clock = 0;
+  const busy = async () => ({ status: 429, data: JSON.stringify({ error: 'busy upload', busy: true, retryAfterMs: 1000 }) });
+  await assert.rejects(postWithRetry({ local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, '/api/artifact', { idempotencyKey: 'k' },
+    { request: busy, token: 't', now: () => clock, sleep: async () => { clock += 60e3; }, note: () => {}, resendHorizonMs: 5 * 60e3 }),
+  /gave up waiting after 5m: busy upload/);
+});

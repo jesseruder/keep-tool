@@ -1199,6 +1199,24 @@ function artifactOrigins(sources, env = process.env) {
   return named.map((value) => `${caller}:${value}`);
 }
 
+// The card's artifacts directory, made if it is missing and refused unless it is a
+// real directory whose resolved path is the registry's own .keep/artifacts/<card>: a
+// symbolic link planted there (or at .keep/artifacts) would send the copies, and
+// the commit's view of them, somewhere else.
+function artifactDirectory(id) {
+  const base = path.join(META, 'artifacts');
+  const directory = path.join(base, id);
+  fs.mkdirSync(base, { recursive: true });
+  try { fs.mkdirSync(directory); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+  for (const entry of [base, directory]) {
+    const stat = fs.lstatSync(entry);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) die(`${entry} is not a plain directory; refusing to store artifacts through it`);
+  }
+  const expected = path.join(fs.realpathSync(META), 'artifacts', id);
+  if (fs.realpathSync(directory) !== expected) die(`${directory} does not resolve inside the registry's .keep/artifacts; refusing to store artifacts through it`);
+  return directory;
+}
+
 commands.artifact = (argv, deps = {}) => {
   const o = parseArgs(argv, {});
   const [id, ...inputs] = o._;
@@ -1230,8 +1248,7 @@ commands.artifact = (argv, deps = {}) => {
 
   const stored = withLock(() => {
     const task = loadTask(id);
-    const directory = path.join(META, 'artifacts', id);
-    fs.mkdirSync(directory, { recursive: true });
+    const directory = artifactDirectory(id);
     const results = [];
     const createdDestinations = [];
     const cleanupCreated = () => {
@@ -1239,6 +1256,18 @@ commands.artifact = (argv, deps = {}) => {
         try { fs.unlinkSync(destination); } catch {}
       }
     };
+    // A copy that fails part way leaves a partial file under a name nobody else
+    // owned (COPYFILE_EXCL): it is removed before the error goes on.
+    const copyExclusive = (source, destination) => {
+      try { fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL); }
+      catch (error) {
+        if (error.code !== 'EEXIST') { try { fs.unlinkSync(destination); } catch {} }
+        throw error;
+      }
+    };
+    const taskFile = taskPath(task.id);
+    const taskBefore = fs.readFileSync(taskFile);
+    let staged = null;
     try {
       for (const source of sources) {
         const basename = path.basename(source);
@@ -1246,7 +1275,7 @@ commands.artifact = (argv, deps = {}) => {
         let destination = preferred;
         let created = false;
         try {
-          fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+          copyExclusive(source, destination);
           created = true;
         } catch (error) {
           if (error.code !== 'EEXIST') throw error;
@@ -1256,7 +1285,7 @@ commands.artifact = (argv, deps = {}) => {
             for (let timestamp = Date.now(); ; timestamp++) {
               destination = path.join(directory, `${stem}-${timestamp}${ext}`);
               try {
-                fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+                copyExclusive(source, destination);
                 created = true;
                 break;
               } catch (copyError) {
@@ -1275,24 +1304,29 @@ commands.artifact = (argv, deps = {}) => {
         }
         results.push({ source, destination, created });
       }
+
+      const text = results.map(({ source, destination, created }, index) =>
+        `${created ? 'Stored' : 'Already stored'} ${destination} (from ${origins[index]})`).join('\n');
+      appendLog(task, 'artifact', o.m != null ? `${text}\n${o.m}` : text);
+      saveTask(task);
+      const paths = [...new Set([
+        ...results.filter((result) => result.created).map((result) => path.relative(ROOT, result.destination)),
+        path.relative(ROOT, taskFile),
+      ])];
+      // .keep is otherwise ignored runtime state; only these immutable artifacts are
+      // deliberately tracked. Never sweep up another card's artifacts or task.
+      staged = paths;
+      git('add', '-f', '--', ...paths);
+      commitAndPush(`keep: artifact ${id} (${sources.length} file${sources.length === 1 ? '' : 's'})`, paths, { staged: true });
+      return results;
     } catch (error) {
+      // Nothing was committed (the commit is the last step that throws), so the
+      // card, the index and the directory go back to how they were.
       cleanupCreated();
+      try { fs.writeFileSync(taskFile, taskBefore); } catch {}
+      if (staged) { try { git('reset', '-q', '--', ...staged); } catch {} }
       throw error;
     }
-
-    const text = results.map(({ source, destination, created }, index) =>
-      `${created ? 'Stored' : 'Already stored'} ${destination} (from ${origins[index]})`).join('\n');
-    appendLog(task, 'artifact', o.m != null ? `${text}\n${o.m}` : text);
-    saveTask(task);
-    const paths = [...new Set([
-      ...results.filter((result) => result.created).map((result) => path.relative(ROOT, result.destination)),
-      path.relative(ROOT, taskPath(task.id)),
-    ])];
-    // .keep is otherwise ignored runtime state; only these immutable artifacts are
-    // deliberately tracked. Never sweep up another card's artifacts or task.
-    git('add', '-f', '--', ...paths);
-    commitAndPush(`keep: artifact ${id} (${sources.length} file${sources.length === 1 ? '' : 's'})`, paths, { staged: true });
-    return results;
   });
 
   if (!deps.quiet) for (const result of stored) console.log(result.destination);

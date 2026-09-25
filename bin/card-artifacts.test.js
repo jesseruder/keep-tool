@@ -142,3 +142,17 @@ test('nothing outside the card\'s artifacts directory is served', async (t) => {
     assert.equal(answer.body, undefined, `${pathname} sent no bytes`);
   }
 });
+
+test('a path replaced between the open and the check serves nothing', async (t) => {
+  const { root, dir } = registry(t);
+  const { serveArtifact } = require('./card-artifacts.js');
+  const outside = tempDir(t, 'keep-card-artifacts-outside-');
+  fs.writeFileSync(path.join(outside, 'secret.png'), 'secret');
+  // The open lands on another file than the one the path names when it is checked.
+  const fsp = { ...fs.promises, open: (file, flags) => fs.promises.open(file.endsWith('shot.png') ? path.join(outside, 'secret.png') : file, flags) };
+  const res = response();
+  const answer = await serveArtifact(res, root, 'some-card', 'shot.png', { json: (r, status, value) => ({ status, value }), fsp });
+  assert.deepEqual(answer, { status: 404, value: { error: 'no such artifact' } });
+  assert.equal(res.status, undefined, 'no head was written');
+  assert.ok(fs.existsSync(path.join(dir, 'shot.png')));
+});

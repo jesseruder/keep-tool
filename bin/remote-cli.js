@@ -142,6 +142,10 @@ const RESEND_HORIZON_MS = 4 * 3600e3;
 // is waited out the same way: the daemon refused it before running or recording
 // anything. Those waits are the fixed budget in RETRY_WAITS_MS.
 //
+// A 429 with `busy: true` (an artifact upload the daemon turned away unread while it
+// takes another) is the daemon answering, so it too is resent with the same payload
+// after the wait it names, up to the same horizon, without spending that budget.
+//
 // A post that timed out while the daemon still answers its ping is a command still
 // running there, and does not spend that budget: it is resent at once with the same
 // payload, and a line on stderr says the command is still running, until the answer
@@ -161,6 +165,14 @@ async function postWithRetry(where, pathname, payload, deps = {}) {
   const send = async () => {
     const response = await request(where.url, pathname, { payload, token, timeoutMs: deps.timeoutMs });
     if (response.status === 503 && (parsed(response) || {}).error === 'daemon restarting') throw new Error('daemon restarting');
+    // Turned away before it was read (an artifact upload while the daemon takes
+    // another): nothing ran, so the same key is resent after the wait it names.
+    const value = response.status === 429 ? parsed(response) : null;
+    if (value && value.busy === true) {
+      const error = new Error(value.error || 'daemon busy');
+      error.busyMs = Math.min(Math.max(Number(value.retryAfterMs) || 2000, 250), 60e3);
+      throw error;
+    }
     return response;
   };
   // Resolves null when the daemon answered, noting the bound it advertises, and the
@@ -176,10 +188,28 @@ async function postWithRetry(where, pathname, payload, deps = {}) {
   };
   let lastError;
   let held = false;
+  let busyMs = 0;
+  let saidBusy = false;
+  const failed = (error) => { lastError = error; held = Boolean(error && error.timedOut); busyMs = (error && error.busyMs) || 0; };
   try { return await send(); }
-  catch (error) { lastError = error; held = Boolean(error && error.timedOut); }
+  catch (error) { failed(error); }
   let spent = 0;
   for (;;) {
+    // A daemon that said it is busy is answering: this waits as long as a held
+    // command would, and does not spend the budget for a daemon that is down.
+    if (busyMs) {
+      if (now() - started >= horizon()) {
+        const failure = new Error(`gave up waiting after ${Math.round((now() - started) / 60e3)}m: ${lastError.message}`);
+        failure.horizon = true;
+        throw failure;
+      }
+      if (!saidBusy) note(`${label}: ${lastError.message} (daemon on ${where.daemon}), waiting…\n`);
+      saidBusy = true;
+      await sleep(busyMs);
+      try { return await send(); }
+      catch (error) { failed(error); }
+      continue;
+    }
     if (held) {
       const down = await ping();
       if (!down) {
@@ -193,7 +223,7 @@ async function postWithRetry(where, pathname, payload, deps = {}) {
         const allowed = advertised !== null ? ` (allowed up to ${Math.round(advertised / 60e3)} min)` : '';
         note(`${label}: still running on the daemon on ${where.daemon}${allowed}, waiting…\n`);
         try { return await send(); }
-        catch (error) { lastError = error; held = Boolean(error && error.timedOut); }
+        catch (error) { failed(error); }
         continue;
       }
       lastError = down;
@@ -205,7 +235,7 @@ async function postWithRetry(where, pathname, payload, deps = {}) {
     const down = await ping();
     if (down) { lastError = down; continue; }
     try { return await send(); }
-    catch (error) { lastError = error; held = Boolean(error && error.timedOut); }
+    catch (error) { failed(error); }
   }
   const failure = new Error(`daemon on ${where.daemon} unreachable (${lastError && lastError.message})`);
   failure.unreachable = true;
@@ -296,6 +326,7 @@ async function runArtifact(argv, deps = {}) {
   const where = deps.where || remoteMode(env);
   const cwd = deps.cwd || process.cwd();
   const io = deps.io || require('node:fs');
+  const fsConstants = require('node:fs').constants;
   const home = deps.home || env.HOME || require('node:os').homedir();
   const path = require('node:path');
   const limits = require('./registry-commands.js');
@@ -311,24 +342,52 @@ async function runArtifact(argv, deps = {}) {
   try { realHome = io.realpathSync(home); } catch { return refused(`cannot resolve this node's home directory ${home}`); }
   const files = [];
   let total = 0;
+  const underHome = (real) => {
+    const inside = path.relative(realHome, real);
+    return Boolean(inside) && !inside.startsWith('..') && !path.isAbsolute(inside);
+  };
+  // The file is opened once and every byte sent is read from that descriptor. The
+  // path is judged before the open (its resolved path under home) and again after
+  // it, and the descriptor must be the very file the second resolution names: a
+  // rename or a swapped link between the check and the read is refused, never
+  // followed out of home.
+  const readChecked = (source) => {
+    const outside = () => refused(`${source} is outside this node's home directory ${home}; only files under it are sent to the daemon`);
+    let real;
+    try { real = io.realpathSync(source); } catch { return { answer: refused(`artifact file does not exist: ${source}`) }; }
+    if (!underHome(real)) return { answer: outside() };
+    let fd;
+    try { fd = io.openSync(real, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0)); }
+    catch (error) {
+      if (error.code === 'ENOENT') return { answer: refused(`artifact file does not exist: ${source}`) };
+      if (error.code === 'ELOOP') return { answer: refused(`${source} changed while it was being read; try again`) };
+      return { answer: refused(`cannot read ${source}: ${error.message}`) };
+    }
+    try {
+      const stat = io.fstatSync(fd);
+      if (!stat.isFile()) return { answer: refused(`artifact is not a regular file: ${source}`) };
+      if (stat.size > limits.ARTIFACT_FILE_MAX_BYTES) return { stat };
+      let again;
+      let named;
+      try { again = io.realpathSync(source); named = io.lstatSync(again); } catch { named = null; }
+      if (!named || !underHome(again)) return { answer: outside() };
+      if (named.dev !== stat.dev || named.ino !== stat.ino) return { answer: refused(`${source} changed while it was being read; try again`) };
+      try { return { stat, bytes: io.readFileSync(fd) }; }
+      catch (error) { return { answer: refused(`cannot read ${source}: ${error.message}`) }; }
+    } finally {
+      try { io.closeSync(fd); } catch {}
+    }
+  };
   for (const input of inputs) {
     const source = path.resolve(cwd, input);
-    let real;
-    try { real = io.realpathSync(source); } catch { return refused(`artifact file does not exist: ${source}`); }
-    const inside = path.relative(realHome, real);
-    if (!inside || inside.startsWith('..') || path.isAbsolute(inside)) {
-      return refused(`${source} is outside this node's home directory ${home}; only files under it are sent to the daemon`);
-    }
-    let stat;
-    try { stat = io.statSync(real); } catch { return refused(`artifact file does not exist: ${source}`); }
-    if (!stat.isFile()) return refused(`artifact is not a regular file: ${source}`);
     const tooLarge = (size) => refused(`artifact too large: ${source} (${(size / 1024 / 1024).toFixed(1)} MB); trim or compress it before storing`);
-    if (stat.size > limits.ARTIFACT_FILE_MAX_BYTES) return tooLarge(stat.size);
     const name = path.basename(source);
     const nameRefusal = limits.artifactNameRefusal(name);
     if (nameRefusal) return refused(nameRefusal);
-    let bytes;
-    try { bytes = io.readFileSync(real); } catch (error) { return refused(`cannot read ${source}: ${error.message}`); }
+    const read = readChecked(source);
+    if (read.answer) return read.answer;
+    if (!read.bytes) return tooLarge(read.stat.size);
+    const bytes = read.bytes;
     // Read once and judged on what was read: a file still being written may have grown.
     if (bytes.length > limits.ARTIFACT_FILE_MAX_BYTES) return tooLarge(bytes.length);
     total += bytes.length;

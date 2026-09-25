@@ -39,9 +39,9 @@ function createNodeTokenStore({ read, initial, now = Date.now, rereadMs = NODE_T
   };
 }
 
-function writeJson(res, status, value) {
+function writeJson(res, status, value, headers = {}) {
   const body = JSON.stringify(value);
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), ...headers });
   res.end(body);
 }
 
@@ -52,6 +52,12 @@ function createNodeApiHandler(options) {
     routes, matchRoute, routeDenial, readBody, principal, tokenStore,
     json = writeJson, onMutation = null, log = (line) => process.stderr.write(`${line}\n`),
     bodyLimit = () => undefined,
+    // (pathname, principal) => null to proceed, or { status, body, headers } to answer
+    // before the body is read. A route whose body is large (an artifact upload)
+    // admits a bounded number at a time, and one it turns away never costs the
+    // daemon the buffering and parsing of what it sent. An admitted request is
+    // released when its response closes, however it ends.
+    admit = () => null,
   } = options;
   const identify = (req) => {
     const auth = () => ({
@@ -74,6 +80,12 @@ function createNodeApiHandler(options) {
       let body;
       if (req.method === 'POST') {
         if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        const refusal = admit(url.pathname, who, res);
+        if (refusal) {
+          // Answered without reading the body: Node discards what the client still
+          // sends, so it receives this answer rather than a reset.
+          return json(res, refusal.status, refusal.body, refusal.headers);
+        }
         const limit = bodyLimit(url.pathname);
         try { body = await (limit ? readBody(req, limit) : readBody(req)); } catch (error) { return json(res, 400, { error: error.message }); }
       }
