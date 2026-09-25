@@ -88,9 +88,14 @@ test('the registry route exists only where the daemon listens for nodes', async 
   assert.deepEqual(ping.allow, ['node', 'admin', 'local']);
   // Every other route still refuses a node: the node API is these, the hook routes and deploy-self.
   const forNodes = on.filter((entry) => (entry.allow || []).includes('node')).map((entry) => entry.path);
-  assert.deepEqual(forNodes, ['/api/registry', '/api/hook', '/api/hook/context', '/api/hook/mirror', '/api/registry/ping', '/api/deploy-self']);
-  for (const entry of on.filter((route) => forNodes.includes(route.path))) assert.equal(entry.when(), true);
-  for (const entry of off.filter((route) => forNodes.includes(route.path))) assert.equal(entry.when(), false);
+  assert.deepEqual(forNodes, ['/api/registry', '/api/secrets/request', '/api/secrets', '/api/hook', '/api/hook/context', '/api/hook/mirror', '/api/registry/ping', '/api/deploy-self']);
+  // The node API proper is gated on the daemon listening for nodes. The secrets routes
+  // are not: a single-node daemon serves them to its own local callers, and a node
+  // reaches them by its principal alone.
+  const gated = forNodes.filter((path) => !path.startsWith('/api/secrets'));
+  for (const entry of on.filter((route) => gated.includes(route.path))) assert.equal(entry.when(), true);
+  for (const entry of off.filter((route) => gated.includes(route.path))) assert.equal(entry.when(), false);
+  for (const entry of on.filter((route) => forNodes.includes(route.path) && !gated.includes(route.path))) assert.equal(entry.when, undefined);
 });
 
 test('only the listed registry commands run, and never a command-bearing flag', async (t) => {
