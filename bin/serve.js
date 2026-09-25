@@ -16816,12 +16816,16 @@ function start(deps = {}) {
     });
   }
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true }); } catch {}
-  // A submitted prompt skips the build throttle: the session it started should leave
-  // Waiting on you as soon as it is sent, not up to KEEP_DASHBOARD_MIN_INTERVAL_MS later.
+  // A prompt sent to a session in Waiting on you skips the build throttle, so the
+  // session leaves the list as soon as it is sent, not up to
+  // KEEP_DASHBOARD_MIN_INTERVAL_MS later. Only those: the prompts Keep and agents send
+  // to working sessions (a keep tell fan-out, check deliveries) keep the throttle.
   const promptsSeen = new Set();
   watch(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true }, (name) => {
     dashboardBuilder.invalidate({ kind: 'lifecycle', name });
-    if (require('./session-lifecycle').promptSubmitted(keep.ROOT, name, promptsSeen)) dashboardPublisher.refresh();
+    const sid = require('./session-lifecycle').promptSubmitted(keep.ROOT, name, promptsSeen);
+    const waiting = sid && (retainedPublication?.state?.attention || []).some((item) => item?.sessionId === sid);
+    if (waiting) dashboardPublisher.refresh();
     else dashboardPublisher.invalidate();
   });
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'session-accounts'), { recursive: true }); } catch {}

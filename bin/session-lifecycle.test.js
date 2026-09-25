@@ -192,7 +192,7 @@ test('fresh turn/tool signals supersede stale dependency and prompt state, then 
   assert.equal(foreground([{ ...wait, tool: 'AskUserQuestion' }], old, 2100), null);
 });
 
-test('a newly written prompt submission is recognized once, and nothing else is', () => {
+test('a newly written prompt submission names its session once, and nothing else does', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-prompt-submitted-'));
   try {
     const { promptSubmitted } = require('./session-lifecycle');
@@ -203,18 +203,18 @@ test('a newly written prompt submission is recognized once, and nothing else is'
     record(root, { session_id: 's', hook_event_name: 'UserPromptSubmit', prompt_id: 'p1' }, 2000);
     const prompt = names().find((name) => name !== tool);
     const seen = new Set();
-    assert.equal(promptSubmitted(root, tool, seen, 2001), false);
-    assert.equal(promptSubmitted(root, prompt, seen, 2001), true);
-    assert.equal(promptSubmitted(root, prompt, seen, 2002), false, 'the create and the write after it count once');
-    assert.equal(promptSubmitted(root, prompt, new Set(), 2000 + 30000), false, 'an old submission is not news');
-    assert.equal(promptSubmitted(root, 's', seen, 2001), false);
-    assert.equal(promptSubmitted(root, null, seen, 2001), false);
-    assert.equal(promptSubmitted(root, `s/${'0'.repeat(64)}.json`, seen, 2001), false, 'a file already gone');
+    assert.equal(promptSubmitted(root, tool, seen, 2001), null);
+    assert.equal(promptSubmitted(root, prompt, seen, 2001), 's');
+    assert.equal(promptSubmitted(root, prompt, seen, 2002), null, 'the create and the write after it count once');
+    assert.equal(promptSubmitted(root, prompt, new Set(), 2000 + 30000), null, 'an old submission is not news');
+    assert.equal(promptSubmitted(root, 's', seen, 2001), null);
+    assert.equal(promptSubmitted(root, null, seen, 2001), null);
+    assert.equal(promptSubmitted(root, `s/${'0'.repeat(64)}.json`, seen, 2001), null, 'a file already gone');
     // Heard before its content is written: not counted, and asked again on the next event.
     const early = `s/${'a'.repeat(64)}.json`;
     fs.writeFileSync(path.join(root, '.keep', 'lifecycle', early), '');
-    assert.equal(promptSubmitted(root, early, seen, 2001), false);
+    assert.equal(promptSubmitted(root, early, seen, 2001), null);
     fs.writeFileSync(path.join(root, '.keep', 'lifecycle', early), JSON.stringify({ event: 'UserPromptSubmit', entity: 'p2', at: 2001 }));
-    assert.equal(promptSubmitted(root, early, seen, 2002), true);
+    assert.equal(promptSubmitted(root, early, seen, 2002), 's');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
