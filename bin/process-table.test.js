@@ -69,6 +69,22 @@ test('on Linux the same answer comes out of /proc, still only for the asked pids
   assert.deepEqual(found, [{ pid: 7, sessionId: 'seven' }]);
 });
 
+test('on Linux an environment that cannot be read fails the read instead of finding nothing', async () => {
+  const deps = (code) => ({
+    platform: 'linux',
+    fs: { readFileSync: (file) => {
+      if (file === '/proc/7/environ') return ['CLAUDE_CODE_SESSION_ID=seven', ''].join('\0');
+      throw Object.assign(new Error(code), { code });
+    } },
+  });
+  for (const gone of ['ENOENT', 'ESRCH']) {
+    assert.deepEqual(await table.readSessionEnv([7, 8], deps(gone)), [{ pid: 7, sessionId: 'seven' }], gone);
+  }
+  for (const unread of ['EACCES', 'EPERM', 'EIO']) {
+    await assert.rejects(table.readSessionEnv([7, 8], deps(unread)), { code: unread });
+  }
+});
+
 test('open rollouts come back with the mtimes of the machine holding them', async () => {
   const calls = [];
   const files = await table.readOpenRollouts([21], {

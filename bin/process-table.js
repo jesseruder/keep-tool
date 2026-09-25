@@ -138,7 +138,13 @@ async function readSessionEnv(pids, deps = {}) {
     const reader = procReader(deps);
     const environs = await eachBounded(wanted, async (pid) => {
       reader.check('the process environments');
-      try { return await reader.call('readFile', `/proc/${pid}/environ`, 'utf8'); } catch { return null; }
+      // A process that exited between the table and this read has no session to
+      // report. Any other failure (EACCES, EPERM, EIO) is a read that could not look,
+      // and throws so the caller's evidence says so rather than "nothing found".
+      try { return await reader.call('readFile', `/proc/${pid}/environ`, 'utf8'); } catch (error) {
+        if (error && (error.code === 'ENOENT' || error.code === 'ESRCH')) return null;
+        throw error;
+      }
     });
     reader.check('the process environments');
     for (const [index, pid] of wanted.entries()) {
