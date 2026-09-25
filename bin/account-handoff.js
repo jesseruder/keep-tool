@@ -289,8 +289,12 @@ function ownedSessionIds(entry) {
   return ids;
 }
 
+// A session on another node keeps its node: a Codex child thread pinned here for the
+// first time is recorded where its conversation runs, not on the daemon node.
 function pinSourceAuthority(entry, source, root, env) {
-  for (const sessionId of ownedSessionIds(entry)) accounts.pinSession(sessionId, entry.agent, source.id, { root, env });
+  for (const sessionId of ownedSessionIds(entry)) {
+    accounts.pinSession(sessionId, entry.agent, source.id, { root, env, ...(entry.node ? { node: entry.node } : {}) });
+  }
 }
 
 function stageTargetAuthority(entry, target, root, env) {
@@ -366,19 +370,23 @@ function targetPaneMatches(binding, inspected, entry, target) {
     && session?.id === entry.sessionId && session.kind === entry.agent);
 }
 
-function targetRolloutMatches(entry, identity) {
+// Which rollout the target agent holds open, compared with the one the copy wrote. A
+// session on another node names paths on that machine, which this one cannot resolve:
+// its deps compare them as the node reported them (rolloutMatches).
+function targetRolloutMatches(entry, identity, deps = {}) {
   if (entry.agent !== 'codex') return true;
+  if (deps.rolloutMatches) return deps.rolloutMatches(identity?.rolloutFile, entry.targetTranscript) === true;
   try { return fs.realpathSync(identity?.rolloutFile) === fs.realpathSync(entry.targetTranscript); }
   catch { return false; }
 }
 
-function targetIdentityMatches(entry, inspected, target) {
+function targetIdentityMatches(entry, inspected, target, deps = {}) {
   const identity = inspected?.agentIdentity;
   return Boolean(targetPaneMatches(entry?.targetIdentity, inspected, entry, target)
     && identity?.primary === true && identity.pid === entry.targetIdentity.agentPid
     && identity.pidStart === entry.targetIdentity.agentPidStart
     && identity.ownsPane === true
-    && targetRolloutMatches(entry, identity));
+    && targetRolloutMatches(entry, identity, deps));
 }
 
 function targetIdentityBound(entry, target) {
@@ -407,7 +415,7 @@ async function verifyTargetLaunch(entry, target, record, deps, root) {
       || identity?.primary !== true || !Number.isInteger(identity.pid) || identity.pid <= 0
       || typeof identity.pidStart !== 'string' || !identity.pidStart
       || identity.ownsPane !== true
-      || !targetRolloutMatches(entry, identity)) {
+      || !targetRolloutMatches(entry, identity, deps)) {
     throw new Error('Target process identity was not verified');
   }
   entry.targetIdentity = { ...entry.targetLaunch, agentPid: identity.pid, agentPidStart: identity.pidStart,
@@ -415,8 +423,8 @@ async function verifyTargetLaunch(entry, target, record, deps, root) {
   writeOne(root, entry);
 }
 
-function requireTargetIdentity(entry, inspected, target) {
-  if (!targetIdentityMatches(entry, inspected, target)) throw new Error('Target process identity changed before continuation delivery');
+function requireTargetIdentity(entry, inspected, target, deps = {}) {
+  if (!targetIdentityMatches(entry, inspected, target, deps)) throw new Error('Target process identity changed before continuation delivery');
 }
 
 function deliveryOptions(entry, source) {
@@ -456,13 +464,16 @@ function providerCompatibility(agent, source, target, cwd, resumeSpec, deps = {}
 // answer over, using the exact directory key the source trusts, which may be an
 // ancestor of the resume directory. No trust on the source is no evidence of an answer,
 // and the target's own dialog is then the correct outcome.
-function carryProjectTrust(source, target, cwd, deps = {}) {
+//
+// For a session on another node both profiles are that machine's, and its deps ask the
+// node (the artifacts verb's project-trust op), which is why every step is awaited.
+async function carryProjectTrust(source, target, cwd, deps = {}) {
   if (!cwd || source?.agent !== 'claude' || target?.agent !== 'claude') return null;
   const setup = require('./account-setup');
   const trustedProjectFor = deps.trustedProjectFor || setup.trustedProjectFor;
-  const trusted = trustedProjectFor(source, cwd);
-  if (!trusted || trustedProjectFor(target, cwd)) return null;
-  try { (deps.trustProject || setup.trustProject)(target, trusted); }
+  const trusted = await trustedProjectFor(source, cwd);
+  if (!trusted || await trustedProjectFor(target, cwd)) return null;
+  try { await (deps.trustProject || setup.trustProject)(target, trusted); }
   catch (error) { throw new Error(`Target account could not pre-trust ${trusted}: ${error?.message || error}`); }
   return trusted;
 }
@@ -471,26 +482,32 @@ function copyProviderArtifacts(provider, agent, ...args) {
   return agent === 'codex' ? provider.copyCodexArtifacts(...args) : provider.copyClaudeArtifacts(...args);
 }
 
-function resumeSpecFor(sessionId, agent, plan, deps = {}) {
+function resumeSpecFor(sessionId, agent, plan, deps = {}, source = null) {
   if (agent !== 'codex') return null;
-  if (deps.resumeSpec) return deps.resumeSpec(sessionId, plan);
+  if (deps.resumeSpec) return deps.resumeSpec(sessionId, plan, source);
   const root = plan?.artifacts?.find((entry) => entry.sessionId === sessionId);
   if (!root?.source) throw new Error('Codex source rollout identity is unavailable');
   return require('./codex-handoff-support').readResumeSpec(root.source, sessionId);
 }
 
-function verifyFrozenResumeSpec(entry, plan, deps = {}) {
+async function verifyFrozenResumeSpec(entry, plan, deps = {}, source = null) {
   if (!entry?.resumeSpec) return;
   const verified = deps.resumeSpec
-    ? deps.resumeSpec(entry.sessionId, plan || { artifacts: [{ sessionId: entry.sessionId, source: entry.sourceTranscript }] })
+    ? await deps.resumeSpec(entry.sessionId, plan || { artifacts: [{ sessionId: entry.sessionId, source: entry.sourceTranscript }] }, source)
     : require('./codex-handoff-support').readResumeSpec(entry.sourceTranscript, entry.sessionId);
   if (verified.digest !== entry.resumeSpec.digest) throw new Error('Codex launch settings changed before restart');
 }
 
-function codexResumeCwd(resumeSpec) {
+// The directory is on the machine the session runs on: a session on another node asks
+// that node (deps.directoryExists) rather than this filesystem.
+async function codexResumeCwd(resumeSpec, deps = {}) {
   const cwd = resumeSpec?.cwd;
   let available = typeof cwd === 'string' && cwd.length > 0 && !cwd.includes('\0') && path.isAbsolute(cwd);
-  if (available) {
+  if (available && deps.directoryExists) {
+    // A node that did not answer is not a missing directory: its own refusal stands.
+    try { available = await deps.directoryExists(cwd) === true; }
+    catch (error) { error.status ||= 409; throw error; }
+  } else if (available) {
     try { available = fs.statSync(cwd).isDirectory(); } catch { available = false; }
   }
   if (!available) {
@@ -553,6 +570,18 @@ async function authPreflight(account, deps = {}) {
   if (deps.authPreflight) return deps.authPreflight(account);
   if (account.agent === 'codex') return require('./codex-handoff-support').authPreflight(account, deps);
   if (account.agent !== 'claude') return false;
+  const status = await authStatus(account, deps);
+  return status.loggedIn === true && (!status.configDirectory || status.configDirectory === path.resolve(account.configDir));
+}
+
+// What `claude auth status --json` says about one account, run as the launch runs it:
+// whether it is logged in and which config directory it reports, and nothing else of
+// its output. Never throws; a check that could not run is simply not logged in. A
+// node answers the same question for its own copy of an account with this (the
+// artifacts verb's `auth` op, bin/account-handoff-node.js).
+async function authStatus(account, deps = {}) {
+  const none = { loggedIn: false, configDirectory: null };
+  if (!account || account.agent !== 'claude') return none;
   try {
     // Match the real launch path: the login shell resolves Claude from the
     // user's configured PATH, then the profile launcher applies account
@@ -577,8 +606,8 @@ async function authPreflight(account, deps = {}) {
       value = null;
     }
     const reported = value && typeof value.configDirectory === 'string' ? path.resolve(value.configDirectory) : null;
-    return value && value.loggedIn === true && (!reported || reported === path.resolve(account.configDir));
-  } catch { return false; }
+    return { loggedIn: Boolean(value && value.loggedIn === true), configDirectory: reported };
+  } catch { return none; }
 }
 
 function permissionClass(args, options = {}) {
@@ -608,6 +637,10 @@ function permissionClass(args, options = {}) {
   consume(/(?:^|\s)--dangerously-skip-permissions(?=\s|$)/g, () => { bypass = true; });
   return text.trim() ? null : bypass ? 'bypass' : 'restricted';
 }
+
+// A host's pane id, bare or qualified by the node it is on.
+// A node name is config's NODE_NAME_RE.
+const PANE_REF_RE = /^[A-Za-z0-9_-]+(?:@[a-z0-9]+)?$/;
 
 const LIMIT_GONE = 'Session no longer carries the account limit this transfer was requested for';
 const USED_SINCE_REQUEST = 'Session was used after the transfer was requested';
@@ -639,16 +672,25 @@ async function requireExpectedSessionState(body, deps) {
 async function run(body, deps = {}) {
   const root = deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
   const env = deps.env || process.env;
-  // A pane qualified by node (`<id>@<node>`) is refused here on purpose: a transfer
-  // stops the source agent and proves it stopped by reading this machine's process
-  // table, which says nothing about another machine's pid. It waits for node-local
-  // process verification (landing 1b) rather than guessing.
-  if (!/^[A-Za-z0-9_-]+$/.test(String(body?.sessionId || '')) || !/^[A-Za-z0-9_-]+$/.test(String(body?.pane || ''))
+  // A pane may be qualified by its node (`<id>@<node>`). Such a transfer is proven on
+  // that node, never here: the caller's deps name it (paneNode) and answer every
+  // process, file and account question from it — the node's process table for the
+  // stop, its own copies of both accounts for the login, trust and artifacts. A
+  // qualified pane with no node deps is refused below, before anything is written.
+  if (!/^[A-Za-z0-9_-]+$/.test(String(body?.sessionId || '')) || !PANE_REF_RE.test(String(body?.pane || ''))
       || !accounts.ID_RE.test(String(body?.accountId || ''))) {
     const error = new Error('Expected exact session, pane and target account'); error.status = 400; throw error;
   }
   if (body.ownerForce !== undefined && typeof body.ownerForce !== 'boolean') {
     const error = new Error('Account handoff ownerForce must be a boolean'); error.status = 400; throw error;
+  }
+  // Which node the pane is on, when it is not this one. Only a caller that wired that
+  // node's answers (serve.js handoffSession) may name one, and it must be the pane's.
+  const paneNode = deps.paneNode || null;
+  const qualifiedNode = String(body.pane).includes('@') ? String(body.pane).slice(String(body.pane).lastIndexOf('@') + 1) : null;
+  if (qualifiedNode !== paneNode) {
+    const error = new Error(`A transfer of a pane on ${qualifiedNode || paneNode} needs that node's own process and account answers`);
+    error.status = 409; throw error;
   }
   if (body.force !== undefined && typeof body.force !== 'boolean') {
     const error = new Error('Account handoff force must be a boolean'); error.status = 400; throw error;
@@ -784,7 +826,7 @@ async function run(body, deps = {}) {
         if (current.phase !== 'delivering-continuation') {
           const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
           await verifyTargetLaunch(current, target, record, deps, root);
-        } else requireTargetIdentity(current, inspected, target);
+        } else requireTargetIdentity(current, inspected, target, deps);
         if (current.resumeSpec && deps.verifyTargetSpec) await deps.verifyTargetSpec(current, target);
         if (intent === 'open-only') return finishOpenOnly(current, target, root);
         Object.assign(current, { status: 'delivering', phase: 'delivering-continuation', deliveryId: current.deliveryId || crypto.randomUUID() });
@@ -804,28 +846,28 @@ async function run(body, deps = {}) {
     if (current?.status === 'recovery-needed' && !pane.alive) {
       try {
         if (!current.sourceStopVerifiedAt) await verifySourceStopAfterTheFact(current, pane, deps, root);
-        if (!await authPreflight(target, deps)) throw new Error(`Target ${agent} account is not logged in`);
+        if (!await authPreflight(target, deps)) throw new Error(`Target ${agent} account is not logged in${paneNode ? ` on ${paneNode}` : ''}`);
         const recoveryCwd = session.project || current.cwd || pane.cwd;
-        const compatibility = providerCompatibility(agent, source, target, recoveryCwd, current.resumeSpec, deps);
+        const compatibility = await providerCompatibility(agent, source, target, recoveryCwd, current.resumeSpec, deps);
         if (!compatibility.ok) throw new Error(`Target account setup is incompatible: ${compatibility.reasons.join('; ')}`);
-        const recoveryTrust = carryProjectTrust(source, target, recoveryCwd, deps);
+        const recoveryTrust = await carryProjectTrust(source, target, recoveryCwd, deps);
         if (recoveryTrust) { current.trustCarried = recoveryTrust; writeOne(root, current); }
         const targetWasStaged = ['starting-target', 'verifying-target', 'delivering-continuation'].includes(current.phase);
         if (!targetWasStaged) {
-          if (agent === 'claude') providerArtifacts.preflight(session.id, source, target, { root, env });
+          if (agent === 'claude') await providerArtifacts.preflight(session.id, source, target, { root, env });
           Object.assign(current, { status: 'copying', phase: 'copying-artifacts' }); writeOne(root, current);
           // Only Owner's own transfer skips the artifact proof; a queue entry's legacy force never does.
-          const copiedPlan = copyProviderArtifacts(providerArtifacts, agent, session.id, source, target, current.id,
+          const copiedPlan = await copyProviderArtifacts(providerArtifacts, agent, session.id, source, target, current.id,
             { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force: current.ownerForce === true });
           if (agent === 'codex' && current.ownerForce === true) adoptOwnedGraph(current, copiedPlan, source, root, env);
           else if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
           current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
           writeOne(root, current);
-          (deps.rebindLedger || providerArtifacts.rebindLedger)(session.id, source, target, current.id,
+          await (deps.rebindLedger || providerArtifacts.rebindLedger)(session.id, source, target, current.id,
             { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force: current.force === true });
           stageTargetAuthority(current, target, root, env);
         }
-        verifyFrozenResumeSpec(current, null, deps);
+        await verifyFrozenResumeSpec(current, null, deps, source);
         Object.assign(current, { status: 'starting', phase: 'starting-target', targetLaunchStartedAt: Date.now() }); writeOne(root, current);
         const result = await deps.resumeExited(current, target, compatibility.mcpConfig, {
           onLaunched: (launch) => recordTargetLaunch(current, launch, target, root),
@@ -851,8 +893,26 @@ async function run(body, deps = {}) {
       }
     }
     if (!pane.alive) { const error = new Error('Interrupted handoff requires explicit recovery'); error.status = 409; throw error; }
+    // A stop that is not Owner's own proves the session idle from its job ledger, which
+    // is verified against the transcript on the machine that writes it; for a session
+    // on another node that proof cannot be taken here (restartSession refuses the same
+    // in-place restart for the same reason). Refused before anything is asked or
+    // written, so the session keeps running where it is.
+    if (paneNode && !ownerForce) {
+      const error = new Error(`A transfer of a session on ${paneNode} must be forced by Owner: its background work cannot be verified from here`);
+      error.status = 409; throw error;
+    }
     const sourceMcpConfigs = [];
-    if (agent === 'claude' && (deps.readSetup || require('./account-setup').readSetup)(source)) {
+    if (agent === 'claude' && deps.sourceMcpConfigs) {
+      // The node prepares its own copy of the source's shared setup, as its launch did.
+      try {
+        const cwds = [session.project || pane.cwd];
+        if (typeof pane.cwd === 'string' && pane.cwd && pane.cwd !== session.project) cwds.push(pane.cwd);
+        sourceMcpConfigs.push(...await deps.sourceMcpConfigs(source, cwds.filter(Boolean)));
+      } catch (error) {
+        const failure = new Error(`Source account setup is unavailable: ${error.message}`); failure.status = 409; throw failure;
+      }
+    } else if (agent === 'claude' && (deps.readSetup || require('./account-setup').readSetup)(source)) {
       const ensureSharedMemory = deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory;
       try {
         sourceMcpConfigs.push(ensureSharedMemory(source, session.project || pane.cwd).mcpConfig);
@@ -877,23 +937,25 @@ async function run(body, deps = {}) {
       Object.assign(current, { agent, intent, status: 'failed', phase: 'preflight',
         ...(sourceIdentity ? { sourceAgentPid: sourceIdentity.pid, sourceAgentPidStart: sourceIdentity.pidStart,
           sourceOwnsPane: true } : {}),
-        reason: `Target ${agent} account is not logged in; source session was left running` });
+        reason: `Target ${agent} account is not logged in${paneNode ? ` on ${paneNode}` : ''}; source session was left running` });
       writeOne(root, current);
       const error = new Error(current.reason); error.status = 409; error.extra = safe(current); throw error;
     }
     let artifactPlan;
-    try { artifactPlan = providerArtifacts.preflight(session.id, source, target, { root, env, force: ownerForce }); }
+    try { artifactPlan = await providerArtifacts.preflight(session.id, source, target, { root, env, force: ownerForce }); }
     catch (error) { error.status = 409; throw error; }
-    const resumeSpec = resumeSpecFor(session.id, agent, artifactPlan, deps);
-    const resumeCwd = agent === 'codex' ? codexResumeCwd(resumeSpec) : session.project || pane.cwd;
-    const compatibility = providerCompatibility(agent, source, target, resumeCwd, resumeSpec, deps);
+    let resumeSpec;
+    try { resumeSpec = await resumeSpecFor(session.id, agent, artifactPlan, deps, source); }
+    catch (error) { error.status ||= 409; throw error; }
+    const resumeCwd = agent === 'codex' ? await codexResumeCwd(resumeSpec, deps) : session.project || pane.cwd;
+    const compatibility = await providerCompatibility(agent, source, target, resumeCwd, resumeSpec, deps);
     if (!compatibility.ok) {
       const error = new Error(`Target account setup is incompatible: ${compatibility.reasons.join('; ')}`); error.status = 409; throw error;
     }
     // Before the source is stopped: a target that cannot be pre-trusted refuses the
     // transfer here, with the session still running, rather than parking it on a dialog.
     let trustCarried = null;
-    try { trustCarried = carryProjectTrust(source, target, resumeCwd, deps); }
+    try { trustCarried = await carryProjectTrust(source, target, resumeCwd, deps); }
     catch (error) { error.status ||= 409; throw error; }
     // The limit, and the moment the transfer was asked for, were last observed before
     // authPreflight, which starts an interactive login shell and can take 45 seconds.
@@ -916,6 +978,7 @@ async function run(body, deps = {}) {
     current.transactionId ||= current.id;
     current.agent = agent;
     current.intent = intent;
+    if (paneNode) current.node = paneNode;
     current.ownedSessionIds = agent === 'codex' ? artifactPlan.artifacts.map((entry) => entry.sessionId) : [session.id];
     // A new stop attempt starts with no committed Enter: an earlier attempt's mark says
     // nothing about this one.
@@ -945,29 +1008,41 @@ async function run(body, deps = {}) {
     pinSourceAuthority(current, source, root, env);
     let copied = false;
     const baseHost = deps.host;
-    const wrappedHost = { request: async (type, params) => {
-      if (type !== 'replace-exited') return baseHost.request(type, params);
+    // The moment the stopped pane is handed back for the relaunch: the source is proven
+    // stopped, so its artifacts are copied, the ledger rebound and the target staged,
+    // and only then is the target started in the same pane. On this machine the host
+    // wrapper below catches the relaunch; for a pane on another node restartSession
+    // hands it to replaceExited instead, since that node's host is reached directly.
+    const interceptReplace = async (params, send) => {
       Object.assign(current, { status: 'copying', phase: 'copying-artifacts', sourceStopVerifiedAt: Date.now() }); writeOne(root, current);
-      const copiedPlan = copyProviderArtifacts(providerArtifacts, agent, session.id, source, target, current.id,
+      const copiedPlan = await copyProviderArtifacts(providerArtifacts, agent, session.id, source, target, current.id,
         { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force: ownerForce });
       if (agent === 'codex' && ownerForce) adoptOwnedGraph(current, copiedPlan, source, root, env);
       else if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
       current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
       writeOne(root, current);
-      verifyFrozenResumeSpec(current, artifactPlan, deps);
-      (deps.rebindLedger || providerArtifacts.rebindLedger)(session.id, source, target, current.id,
+      await verifyFrozenResumeSpec(current, artifactPlan, deps, source);
+      await (deps.rebindLedger || providerArtifacts.rebindLedger)(session.id, source, target, current.id,
         { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force });
       copied = true;
       stageTargetAuthority(current, target, root, env);
       Object.assign(current, { status: 'starting', phase: 'starting-target', targetLaunchStartedAt: Date.now() }); writeOne(root, current);
-      const result = await baseHost.request(type, { ...params, meta: { ...params.meta, handoffTransactionId: current.id } });
+      const result = await send({ ...params, meta: { ...params.meta, handoffTransactionId: current.id } });
       recordTargetLaunch(current, result, target, root);
       return result;
+    };
+    const wrappedHost = { request: async (type, params) => {
+      if (type !== 'replace-exited') return baseHost.request(type, params);
+      return interceptReplace(params, (request) => baseHost.request(type, request));
     } };
+    // For a node the wrapper is not handed to restartSession at all: a host override
+    // answers for the daemon node's requests too, and none of those belong to the node.
+    const { host: _unused, ...restartBase } = deps.restartDeps || {};
+    const restartHost = paneNode ? { replaceExited: interceptReplace } : { host: wrappedHost };
     try {
       const result = await deps.restartSession({ sessionId: session.id, pane: pane.id, pid: pane.pid, mode: 'now',
         ...(force ? { force: true } : {}) }, {
-        ...deps.restartDeps, root, env, host: wrappedHost, resumeAccount: target, ownerForce,
+        ...(paneNode ? restartBase : deps.restartDeps), root, env, ...restartHost, resumeAccount: target, ownerForce,
         priorForcedProcesses: Array.isArray(current.forcedProcesses) ? current.forcedProcesses : [], resumeMcpConfig: compatibility.mcpConfig,
         resumeModel: current.model, resumeArgv: current.resumeSpec?.argv, resumeCwd: current.resumeSpec ? current.cwd : null,
         allowTerminalRateLimit: true,
@@ -1026,7 +1101,7 @@ async function abandonForPortable(body, deps = {}) {
   const root = deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
   const env = deps.env || process.env;
   if (!/^[A-Za-z0-9_-]+$/.test(String(body?.sessionId || ''))
-      || !/^[A-Za-z0-9_-]+$/.test(String(body?.pane || ''))
+      || !PANE_REF_RE.test(String(body?.pane || ''))
       || !/^[A-Za-z0-9_-]+$/.test(String(body?.transactionId || ''))) {
     const error = new Error('Expected exact session, pane and handoff transaction'); error.status = 400; throw error;
   }
@@ -1132,9 +1207,11 @@ function abandon(body, deps = {}) {
 // "Proven gone" is read fresh, from the machine the source ran on: every node answered
 // a fresh pane list and none of them has a live pane carrying the session, and a `ps`
 // snapshot has no process with the recorded pid and start time, no survivor of a
-// forced stop, and no agent resuming this conversation by its id. The recorded pane
-// must be on the daemon node, the only one whose process table this can read. Any
-// doubt refuses, and Retry stays available.
+// forced stop, and no agent resuming this conversation by its id. The snapshot is the
+// table of the node the recorded pane is on, read fresh through that node's host
+// (deps.agentProcessRows({ node })): a pid only means something on the machine that
+// issued it. A node that cannot be asked proves nothing. Any doubt refuses, and Retry
+// stays available.
 function exitedAbandonCandidate(entry, now = Date.now()) {
   if (!entry || entry.phase !== 'stopping-source') return false;
   const interrupted = entry.status === 'recovery-needed'
@@ -1158,9 +1235,7 @@ async function abandonExited(body, deps = {}) {
   const refuse = (message) => { const error = new Error(`${message}; retry the transfer instead`); error.status = 409; return error; };
   const nodes = require('./nodes.js');
   const daemon = nodes.daemonNode();
-  if (current.pane && nodes.parsePaneRef(String(current.pane)).node !== daemon) {
-    throw refuse(`The session ran on node ${nodes.parsePaneRef(String(current.pane)).node}, whose processes this daemon cannot read`);
-  }
+  const node = current.pane ? nodes.parsePaneRef(String(current.pane)).node : daemon;
   if (typeof deps.listPanes !== 'function' || typeof deps.agentProcessRows !== 'function') {
     throw refuse('The session\'s exit could not be proven: no pane list or process snapshot is available');
   }
@@ -1171,14 +1246,15 @@ async function abandonExited(body, deps = {}) {
     try { listed = await deps.listPanes(); } catch (error) {
       throw refuse(`The session's exit could not be proven: the pane list failed (${String(error?.message || error).slice(0, 160)})`);
     }
-    if (!Array.isArray(listed?.panes) || listed.configurationUnreadable || (listed.missingNodes || []).length) {
+    if (!Array.isArray(listed?.panes) || listed.configurationUnreadable || (listed.missingNodes || []).length
+        || node !== daemon && !(listed.nodes?.[node]?.ok === true && !listed.nodes[node].stale)) {
       throw refuse('The session\'s exit could not be proven: not every node answered the pane list');
     }
     const open = listed.panes.find((pane) => pane?.meta?.sessionId === current.sessionId && pane.alive !== false);
     if (open) throw refuse(`The session is still open in pane ${open.id}`);
     let rows;
-    try { rows = await deps.agentProcessRows(); } catch (error) {
-      throw refuse(`The session's exit could not be proven: ps failed (${String(error?.message || error).slice(0, 160)})`);
+    try { rows = await deps.agentProcessRows(node === daemon ? {} : { node }); } catch (error) {
+      throw refuse(`The session's exit could not be proven: ${node === daemon ? 'ps' : `the process table on ${node}`} failed (${String(error?.message || error).slice(0, 160)})`);
     }
     if (!Array.isArray(rows) || !rows.length) throw refuse('The session\'s exit could not be proven: ps returned no processes');
     if (rows.some((row) => row && row.pid === current.sourceAgentPid && row.pidStart === current.sourceAgentPidStart)) {
@@ -1209,5 +1285,5 @@ function abandonedForPortable(root, sessionId) {
       sourceOwnsPane: entry.sourceOwnsPane === true } : null;
 }
 
-module.exports = { run, abandon, abandonExited, abandonForPortable, abandonedForPortable, list, readOne, safe, authPreflight, permissionClass,
+module.exports = { run, abandon, abandonExited, abandonForPortable, abandonedForPortable, list, readOne, safe, authPreflight, authStatus, permissionClass,
   loginShellOutput, classifyRefusal, transferInFlight, abandonCandidate, exitedAbandonCandidate, CONTINUATION_TEXT };

@@ -473,13 +473,21 @@ test('a restart may name a pane on another node, and refuses anything else', asy
   await assert.rejects(manager.request({ sessionId: 'sess-2', pane: '1a2b@AWS1', mode: 'idle' }), /Expected exact session/);
 });
 
-test('the two automatic paths keep refusing a pane on another node', () => {
-  // Both prove what they did by reading this machine's process table, so until a
-  // node can answer for its own processes (landing 1b) they refuse rather than guess.
+test('the retirement path keeps refusing a pane on another node, and a transfer needs that node\'s answers', async () => {
+  // Retirement proves what it did by reading this machine's process table, so it
+  // refuses a node pane rather than guess.
   assert.throws(() => require('./session-retirement.js').begin('/tmp/nowhere', {
     sessionId: 'sess-1', pane: '1a2b@aws1',
   }), /bad retirement target/);
-  return assert.rejects(require('./account-handoff.js').run({
+  // An account transfer of a node pane is proven on that node, and only a caller that
+  // wired the node's answers (serve.js handoffSession names it as paneNode) may ask.
+  await assert.rejects(require('./account-handoff.js').run({
     sessionId: 'sess-1', pane: '1a2b@aws1', accountId: 'claude/default',
+  }), /needs that node's own process and account answers/);
+  await assert.rejects(require('./account-handoff.js').run({
+    sessionId: 'sess-1', pane: '1a2b@aws1', accountId: 'claude/default',
+  }, { paneNode: 'other' }), /needs that node's own process and account answers/);
+  await assert.rejects(require('./account-handoff.js').run({
+    sessionId: 'sess-1', pane: '1a2b@AWS1', accountId: 'claude/default',
   }), /Expected exact session, pane and target account/);
 });

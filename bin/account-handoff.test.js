@@ -852,7 +852,7 @@ test('abandon takes a transfer past its /exit only on a fresh proof that the ses
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
-test('abandon after the exit refuses a launched target and a pane on another node', async () => {
+test('abandon after the exit refuses a launched target, and asks a node pane\'s own table', async () => {
   const f = fixture();
   try {
     const d = deps(f, { restartSession: async () => { throw new Error('An agent process still owns this conversation'); } });
@@ -865,7 +865,14 @@ test('abandon after the exit refuses a launched target and a pane on another nod
     fs.writeFileSync(journal, JSON.stringify({ ...original, sourceExitEnterAt: Date.now(), targetLaunchStartedAt: Date.now() }));
     await assert.rejects(handoff.abandonExited(body, proof), /got past stopping the session/);
     fs.writeFileSync(journal, JSON.stringify({ ...original, sourceExitEnterAt: Date.now(), pane: 'pane-1@aws1' }));
-    await assert.rejects(handoff.abandonExited(body, proof), /ran on node aws1/);
+    // A listing that says nothing about the node proves nothing about it.
+    await assert.rejects(handoff.abandonExited(body, proof), /not every node answered/);
+    const asked = [];
+    const abandoned = await handoff.abandonExited(body, { ...proof, log: () => {},
+      listPanes: async () => ({ panes: [], nodes: { aws1: { ok: true } } }),
+      agentProcessRows: async (options) => { asked.push(options); return proof.agentProcessRows(); } });
+    assert.equal(abandoned.phase, 'abandoned');
+    assert.deepEqual(asked, [{ node: 'aws1' }]);
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
@@ -1640,4 +1647,271 @@ test('a target that cannot be pre-trusted refuses the transfer with the source s
 test('a target parked on the folder-trust dialog is a blocked refusal, not a transient one', () => {
   assert.equal(handoff.classifyRefusal(
     'claude is awaiting workspace trust in pane pane-1; accept it there, then retry delivery'), 'blocked');
+});
+
+// ---------- a session whose pane is on another node ----------
+//
+// run() asks the node for everything it would otherwise read here: these deps stand in
+// for serve.js's nodeHandoffDeps, and every answer is recorded against the node it came
+// from, so a test can say that nothing about the session was read from this machine.
+function nodeDeps(f, overrides = {}) {
+  accounts.pinSession(f.sid, 'claude', 'one', { root: f.root, env: f.env, node: 'aws1', transferNode: true });
+  const pane = { id: 'pane-1@aws1', node: 'aws1', pid: 10, createdAt: 'source-pane', alive: true, cwd: f.project, cols: 80, rows: 24,
+    agentAlive: true, meta: { sessionId: f.sid, accountId: 'one', agent: 'claude', model: 'claude-opus-4-1' } };
+  const asked = [];
+  const events = [];
+  let continuations = 0;
+  const node = (what, value) => { asked.push(what); return value; };
+  const d = {
+    root: f.root, env: f.env, pane, asked, events, paneNode: 'aws1',
+    inspect: async () => node('inspect', { session: { id: f.sid, kind: 'claude', project: f.project, endedTurn: true, node: 'aws1' }, pane,
+      processArgs: `claude --dangerously-skip-permissions --resume ${f.sid}`, currentModel: 'claude-opus-4-1',
+      agentIdentity: pane.meta.accountId === 'two'
+        ? { pid: 21, pidStart: 'target-start', primary: true, ownsPane: true }
+        : { pid: 11, pidStart: 'source-start', primary: true, ownsPane: true } }),
+    authPreflight: async (account) => node(`auth:${account.id}`, true),
+    sourceMcpConfigs: async (account) => node(`shared-setup:${account.id}`, []),
+    compatible: async (source, target) => node(`compatible:${source.id}>${target.id}`, { ok: true, reasons: [], mcpConfig: null }),
+    trustedProjectFor: async (account, cwd) => node(`trusted:${account.id}`, account.id === 'one' ? cwd : null),
+    trustProject: async (account, project) => { node(`trust:${account.id}:${project === f.project}`); events.push('trust'); return { changed: true }; },
+    rolloutMatches: (actual, wanted) => actual === wanted,
+    artifactProvider: {
+      preflight: async (sid, source, target) => {
+        node(`preflight:${source.id}>${target.id}`); events.push('preflight');
+        return { sessionId: sid, node: 'aws1', artifacts: [{ relPath: `projects/${f.projectName}/${sid}.jsonl` }] };
+      },
+      copyClaudeArtifacts: async (sid, source, target, transactionId, options) => {
+        assert.equal(pane.alive, false, 'artifacts are walked only after the source is stopped');
+        assert.ok(transactionId); assert.ok(options.sourceStopVerifiedAt);
+        node(`copy:${source.id}>${target.id}`); events.push('copy');
+        return { sessionId: sid, node: 'aws1', artifacts: [] };
+      },
+      rebindLedger: () => ({ rebound: [], node: 'aws1' }),
+    },
+    agentProcessRows: async () => node('process', [{ pid: 99, pidStart: 'other', args: 'zsh' }]),
+    // The node's host answers the relaunch, and the transfer copies inside its hook.
+    restartSession: async (body, options) => {
+      assert.equal(body.pane, 'pane-1@aws1');
+      assert.equal(options.ownerForce, true, 'a node transfer is Owner-forced');
+      assert.equal(Object.prototype.hasOwnProperty.call(options, 'host'), false,
+        'no host override is handed to a restart whose pane is on another node');
+      events.push('stop'); pane.alive = false;
+      return options.replaceExited({ paneId: pane.id, meta: { sessionId: f.sid, accountId: options.resumeAccount.id } }, async (params) => {
+        events.push('launch'); node('replace-exited');
+        pane.alive = true; pane.pid = 20; pane.createdAt = 'target-pane';
+        pane.meta = { ...pane.meta, ...params.meta };
+        return { pane };
+      });
+    },
+    waitForAccountRecord: async (_sid, paneId, accountId, after) => ({ pane: paneId, accountId, agent: 'claude', startedAt: after + 1 }),
+    resumeExited: async (entry, target, _mcpConfig, hooks = {}) => {
+      events.push('resume-exited'); node('replace-exited');
+      pane.alive = true; pane.pid = 20; pane.createdAt = 'target-pane';
+      pane.meta = { ...pane.meta, accountId: target.id, handoffTransactionId: entry.id };
+      const launch = { ok: true, pane: pane.id, pid: 20, createdAt: pane.createdAt };
+      await hooks.onLaunched?.(launch); return launch;
+    },
+    continueSession: async (_sid, _text, options) => {
+      assert.equal(options.targetIdentity.pane, 'pane-1@aws1'); events.push('continue'); continuations++;
+    },
+    continuations: () => continuations,
+    ...overrides,
+  };
+  return d;
+}
+
+test('a Claude session on a node is transferred with every proof taken on that node', async () => {
+  const f = fixture();
+  try {
+    const d = nodeDeps(f);
+    const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', ownerForce: true }, d);
+    assert.equal(result.status, 'done');
+    assert.deepEqual(d.events, ['preflight', 'trust', 'stop', 'copy', 'launch', 'continue']);
+    for (const what of ['auth:two', 'shared-setup:one', 'compatible:one>two', 'trusted:one', 'trusted:two', 'trust:two:true',
+      'preflight:one>two', 'copy:one>two', 'replace-exited']) assert.ok(d.asked.includes(what), what);
+    const journal = handoff.readOne(f.root, f.sid);
+    assert.equal(journal.node, 'aws1');
+    assert.equal(journal.pane, 'pane-1@aws1');
+    assert.equal(journal.trustCarried, f.project);
+    assert.equal(journal.targetIdentity.pane, 'pane-1@aws1');
+    // The account moved; the machine did not.
+    const authority = accounts.authority(f.root)[f.sid];
+    assert.equal(authority.accountId, 'two'); assert.equal(authority.node, 'aws1'); assert.equal(authority.stagedAccountId, undefined);
+    // Nothing of the session was written to this machine's copy of either account.
+    assert.equal(fs.existsSync(path.join(f.profiles.two, 'projects', f.projectName, `${f.sid}.jsonl`)), false);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a transfer of a node session that is not Owner-forced is refused before anything is asked or written', async () => {
+  const f = fixture();
+  try {
+    const d = nodeDeps(f, { restartSession: async () => assert.fail('the source must not be stopped') });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two' }, d), (error) => error.status === 409
+      && /must be forced by Owner: its background work cannot be verified from here/.test(error.message)
+      && handoff.classifyRefusal(error.message) === 'blocked');
+    assert.equal(handoff.readOne(f.root, f.sid), null);
+    assert.deepEqual(d.asked, ['inspect']);
+    assert.equal(accounts.authority(f.root)[f.sid].accountId, 'one');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a target not logged in on the node is refused there with the source left running', async () => {
+  const f = fixture();
+  try {
+    // The daemon's own copy of the account is logged in; the node's is not, and only the
+    // node's answer counts for a session there.
+    const d = nodeDeps(f, {
+      authPreflight: async (account) => { d.asked.push(`auth:${account.id}`); return false; },
+      restartSession: async () => assert.fail('the source must not be stopped'),
+    });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', ownerForce: true }, d),
+      (error) => error.status === 409 && error.message === 'Target claude account is not logged in on aws1; source session was left running');
+    assert.ok(d.asked.includes('auth:two'));
+    const journal = handoff.readOne(f.root, f.sid);
+    assert.equal(journal.status, 'failed'); assert.equal(journal.phase, 'preflight');
+    assert.equal(d.pane.alive, true);
+    assert.equal(accounts.authority(f.root)[f.sid].accountId, 'one');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a lost stop on a node is proven only from that node\'s table, and a running source blocks it', async () => {
+  const f = fixture();
+  try {
+    const d = nodeDeps(f, { restartSession: async (_body, options) => {
+      options.onForcedStop([{ pid: 10, pidStart: 'shell-start' }, { pid: 11, pidStart: 'source-start' }]);
+      d.pane.alive = false;
+      throw new Error('host request timed out asking aws1 for its process table (unreachable); the handoff can be retried');
+    } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', ownerForce: true }, d),
+      /host request timed out asking aws1/);
+    assert.equal(handoff.readOne(f.root, f.sid).status, 'recovery-needed');
+    assert.equal(handoff.list(f.root)[0].refusalClass, 'transient');
+    // The node's table still shows the source agent: not a stop.
+    d.agentProcessRows = async () => [{ pid: 11, pidStart: 'source-start', args: 'claude' }];
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', ownerForce: true }, d),
+      /Source agent is still running although its pane exited; recovery is blocked/);
+    // A node that cannot be asked proves nothing either.
+    d.agentProcessRows = async () => { throw new Error('host request timed out asking aws1 for its process table'); };
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', ownerForce: true }, d),
+      (error) => /^Source exit could not be verified/.test(error.message) && handoff.classifyRefusal(error.message) === 'transient');
+    assert.equal(handoff.readOne(f.root, f.sid).sourceStopVerifiedAt, undefined);
+    // Gone from the node's table: proven, copied on the node and relaunched there.
+    d.agentProcessRows = async () => [{ pid: 11, pidStart: 'a-later-process', args: 'zsh' }];
+    const recovered = await handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', ownerForce: true }, d);
+    assert.equal(recovered.status, 'done');
+    assert.equal(recovered.sourceStopVerifiedBy, 'post-hoc-ps');
+    assert.deepEqual(d.events, ['preflight', 'trust', 'trust', 'preflight', 'copy', 'resume-exited', 'continue']);
+    assert.equal(accounts.authority(f.root)[f.sid].node, 'aws1');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a node that stops answering mid-transfer leaves a recoverable record, and Retry finishes once it answers', async () => {
+  const f = fixture();
+  try {
+    const d = nodeDeps(f);
+    const provider = d.artifactProvider;
+    let answering = false;
+    d.artifactProvider = { ...provider, copyClaudeArtifacts: async (...args) => {
+      if (!answering) {
+        throw Object.assign(new Error('host request timed out asking aws1 to copy session-123 (terminal host is unavailable); the handoff can be retried'),
+          { status: 409 });
+      }
+      return provider.copyClaudeArtifacts(...args);
+    } };
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', ownerForce: true }, d),
+      /host request timed out asking aws1/);
+    const stalled = handoff.readOne(f.root, f.sid);
+    assert.equal(stalled.status, 'recovery-needed');
+    assert.equal(stalled.phase, 'copying-artifacts');
+    assert.ok(stalled.sourceStopVerifiedAt, 'the stop itself was proven before the node went quiet');
+    assert.equal(handoff.list(f.root)[0].refusalClass, 'transient');
+    assert.equal(accounts.authority(f.root)[f.sid].stagedAccountId, undefined, 'nothing is staged before the copy lands');
+    // Still quiet: Retry refuses in the same words, and the record stays recoverable.
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', ownerForce: true }, d),
+      /host request timed out asking aws1/);
+    assert.equal(handoff.readOne(f.root, f.sid).status, 'recovery-needed');
+    answering = true;
+    const done = await handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', ownerForce: true }, d);
+    assert.equal(done.status, 'done');
+    assert.equal(d.continuations(), 1);
+    assert.equal(accounts.authority(f.root)[f.sid].accountId, 'two');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a Codex session on a node carries its resume policy, owned threads and node through the transfer', async () => {
+  const f = fixture();
+  try {
+    const d = codexDeps(f);
+    accounts.pinSession(d.sid, 'codex', 'codex-work', { root: f.root, env: f.env, node: 'aws1', transferNode: true });
+    d.pane.id = 'pane-codex@aws1';
+    const targetFile = d.plan.artifacts[0].target;
+    const asked = [];
+    Object.assign(d, {
+      paneNode: 'aws1',
+      directoryExists: async (cwd) => { asked.push(`cwd:${cwd === f.project}`); return true; },
+      resumeSpec: async (sid, _plan, source) => {
+        asked.push(`resume-spec:${source.id}`);
+        return { sessionId: sid, cwd: f.project, model: 'gpt-6-astra', effort: 'high', provider: 'openai',
+          argv: [...d.argv], digest: 'frozen-policy' };
+      },
+      rolloutMatches: (actual, wanted) => actual === wanted,
+      restartSession: async (_body, options) => {
+        assert.equal(options.ownerForce, true); assert.deepEqual(options.resumeArgv, d.argv);
+        d.pane.alive = false;
+        await options.replaceExited({ paneId: d.pane.id, meta: { sessionId: d.sid, accountId: 'codex-two' } }, async (params) => {
+          d.events.push('launch'); d.pane.alive = true; d.pane.pid = 40; d.pane.createdAt = 'codex-target-pane';
+          d.pane.meta = { ...d.pane.meta, ...params.meta, accountId: 'codex-two' };
+          return { pane: d.pane };
+        });
+        return { ok: true, pane: d.pane.id, pid: d.pane.pid };
+      },
+      waitForAccountRecord: async (_sid, paneId, accountId, after) => ({ pane: paneId, accountId, agent: 'codex', startedAt: after + 1 }),
+    });
+    const result = await handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two', ownerForce: true }, d);
+    assert.equal(result.status, 'done');
+    assert.deepEqual(d.events, ['copy', 'rebind', 'launch', 'verify-target', 'continue']);
+    assert.ok(asked.includes('cwd:true')); assert.ok(asked.includes('resume-spec:codex-work'));
+    const journal = handoff.readOne(f.root, d.sid);
+    assert.equal(journal.node, 'aws1'); assert.equal(journal.targetTranscript, targetFile);
+    for (const id of [d.sid, d.child]) {
+      const authority = accounts.authority(f.root)[id];
+      assert.equal(authority.accountId, 'codex-two'); assert.equal(authority.node, 'aws1', `${id} stays on its node`);
+    }
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('abandon after the exit reads the node\'s own table, and refuses when the node cannot be asked', async () => {
+  const f = fixture();
+  try {
+    const d = nodeDeps(f, { restartSession: async (_body, options) => {
+      options.onExitEnter(); d.pane.alive = false;
+      throw new Error('host request timed out: get');
+    } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', ownerForce: true }, d));
+    const pending = handoff.list(f.root)[0];
+    assert.equal(pending.abandonNeedsExitProof, true);
+    const body = { sessionId: f.sid, transactionId: pending.id };
+    const answered = async () => ({ panes: [], nodes: { main: { ok: true }, aws1: { ok: true } } });
+    const asked = [];
+    const rows = (list) => async (options = {}) => { asked.push(options.node || 'main'); return list; };
+    const refuses = async (overrides, pattern) => {
+      await assert.rejects(handoff.abandonExited(body, { root: f.root, listPanes: answered,
+        agentProcessRows: rows([{ pid: 1, pidStart: 'x', args: 'init' }]), ...overrides }),
+      (error) => error.status === 409 && pattern.test(error.message) && /retry the transfer instead/.test(error.message));
+      assert.equal(handoff.readOne(f.root, f.sid).status, 'recovery-needed', 'a refusal writes nothing');
+    };
+    // The node did not answer the listing: nothing is proven.
+    await refuses({ listPanes: async () => ({ panes: [], nodes: { main: { ok: true }, aws1: { ok: false, stale: true } }, missingNodes: ['aws1'] }) },
+      /not every node answered/);
+    await refuses({ listPanes: async () => ({ panes: [], nodes: { main: { ok: true } } }) }, /not every node answered/);
+    // Its table could not be read.
+    await refuses({ agentProcessRows: async () => { throw new Error('terminal host is unavailable'); } }, /the process table on aws1 failed/);
+    // Its table still shows the source.
+    await refuses({ agentProcessRows: rows([{ pid: 11, pidStart: 'source-start', args: 'claude' }]) }, /source agent is still running/);
+    assert.ok(asked.length && asked.every((node) => node === 'aws1'), 'only the node\'s table was read');
+    const abandoned = await handoff.abandonExited(body, { root: f.root, listPanes: answered, log: () => {},
+      agentProcessRows: rows([{ pid: 11, pidStart: 'a-later-process', args: 'zsh' }]) });
+    assert.equal(abandoned.phase, 'abandoned');
+    assert.equal(accounts.authority(f.root)[f.sid].accountId, 'one');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
