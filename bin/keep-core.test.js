@@ -140,3 +140,27 @@ test('a card names the agent its checks run as, and only a usable name is accept
   keep.applyCardAgent(task, '');
   assert.equal(task.fm.agent, undefined, 'an empty value clears it');
 });
+
+test('a test process with no registry of its own refuses to load against the operator\'s ~/keep', () => {
+  const core = path.join(__dirname, 'keep-core.js');
+  const load = (env) => spawnSync(process.execPath, ['-e', `require(${JSON.stringify(core)}); process.stdout.write('loaded')`],
+    { encoding: 'utf8', env: { ...process.env, ...env } });
+  const clean = { ...process.env };
+  delete clean.KEEP_DIR;
+  const home = os.userInfo().homedir;
+  const refused = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(core)}); process.stdout.write('loaded')`],
+    { encoding: 'utf8', env: { ...clean, NODE_TEST_CONTEXT: 'child', HOME: home } });
+  assert.notEqual(refused.status, 0, 'under node --test with no KEEP_DIR the operator\'s registry is refused');
+  assert.match(refused.stderr, /a test process would use the operator's registry/);
+  assert.equal(refused.stdout, '');
+  const own = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-core-guard-'));
+  try {
+    const withDir = load({ NODE_TEST_CONTEXT: 'child', KEEP_DIR: own, HOME: home });
+    assert.equal(withDir.status, 0, withDir.stderr);
+    assert.equal(withDir.stdout, 'loaded', 'its own KEEP_DIR is fine');
+    const tempHome = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(core)}); process.stdout.write('loaded')`],
+      { encoding: 'utf8', env: { ...clean, NODE_TEST_CONTEXT: 'child', HOME: own } });
+    assert.equal(tempHome.status, 0, tempHome.stderr);
+    assert.equal(tempHome.stdout, 'loaded', 'a registry under a temporary HOME is not the operator\'s');
+  } finally { fs.rmSync(own, { recursive: true, force: true }); }
+});

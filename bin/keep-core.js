@@ -22,6 +22,26 @@ const taskParseCache = require('./stat-parse-cache').createStatParseCache({
 });
 
 const ROOT = process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+// A process under node's test runner that was given no registry of its own reads and
+// writes the operator's: the suite run without its preload (scripts/test-env.cjs, which
+// hands every test process an empty KEEP_DIR) did exactly that on a node, where the
+// fixtures emptied the registry clone's tasks, set its git identity to the fixture's
+// and committed test records into it. The operator's registry is named by the passwd
+// home, not $HOME (a test that points HOME at a temporary directory is free to use the
+// registry under it), and by the data directory of the configuration file there, which
+// config.apply has already put into KEEP_DIR by the time this runs.
+function operatorRegistries() {
+  const home = os.userInfo().homedir;
+  const registries = [path.join(home, 'keep')];
+  try {
+    const dataDir = JSON.parse(fs.readFileSync(path.join(home, '.config', 'keep', 'config.json'), 'utf8')).dataDir;
+    if (typeof dataDir === 'string' && dataDir) registries.push(path.resolve(dataDir.replace(/^~(?=\/|$)/, home)));
+  } catch {}
+  return registries;
+}
+if (process.env.NODE_TEST_CONTEXT && operatorRegistries().includes(path.resolve(ROOT))) {
+  throw new Error(`keep: a test process would use the operator's registry at ${ROOT}; run the suite with --require ./scripts/test-env.cjs (npm test), or give the child its own KEEP_DIR`);
+}
 const TASKS = path.join(ROOT, 'tasks');
 const ARCHIVE = path.join(ROOT, 'archive');
 const META = path.join(ROOT, '.keep');
