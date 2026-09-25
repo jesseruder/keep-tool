@@ -955,8 +955,6 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     installReplyComposer(stage, ctx, item);
   }
   syncReplyComposer(stage, session, ctx.state);
-  // A secret this session asked Owner for: shown here, above its terminal, and only here.
-  syncSecretDrop(stage, ctx, item);
   const pinLabel = ctx.isPanePinned(paneId) ? 'Unpin from Watch' : 'Pin to Watch';
   const closable = hasLivePane && item.sessionId && ['claude', 'codex', 'pi'].includes(pane.meta?.agent);
   const dependencyAcknowledged = ctx.setAsideFor(item)?.kind === 'dependency';
@@ -1041,6 +1039,9 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   if (logWasHidden !== logAside.hidden || logWasCollapsed !== logAside.classList.contains('collapsed')) {
     ctx.scheduleTerminalFit();
   }
+  // A secret this session asked Owner for: over its terminal, and only here. After the
+  // agent log above, so the overlay knows how wide the terminal beside it is.
+  syncSecretDrop(stage, ctx, item);
   const terminalHost = stage.querySelector('.stage-terminal');
   if (hasLivePane) {
     const focusKey = `${key}:${paneId}`;

@@ -960,8 +960,8 @@ html.mobile .notification-preview { padding-inline: 14px; }
    floats over the terminal so the pane never changes size; folded, it is a key button
    in the terminal's corner. */
 .stage-body { position: relative; }
-.secret-drop { position: absolute; inset: 0; z-index: 6; display: flex; justify-content: center; align-items: flex-start; padding: 28px 16px; background: var(--backdrop); overflow: auto; }
-.secret-drop.folded { inset: 10px 14px auto auto; padding: 0; background: none; overflow: visible; }
+.secret-drop { position: absolute; inset: 0 var(--sd-right, 0px) 0 0; z-index: 6; display: flex; justify-content: center; align-items: flex-start; padding: 28px 16px; background: var(--backdrop); overflow: auto; }
+.secret-drop.folded { inset: 10px calc(var(--sd-right, 0px) + 14px) auto auto; padding: 0; background: none; overflow: visible; }
 .secret-drop[hidden] { display: none; }
 .secret-drop .sd-card { width: min(640px, 100%); padding: 14px 16px; border: 1px solid var(--accent); border-left-width: 4px; border-radius: 10px; background: linear-gradient(var(--accent-soft), var(--accent-soft)), var(--panel); box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 10px; }
 .secret-drop .sd-card[hidden] { display: none; }

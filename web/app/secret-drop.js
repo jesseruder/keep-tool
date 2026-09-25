@@ -94,7 +94,13 @@ function install(root, ctx, request) {
     showError(root, '');
   };
   field.addEventListener('input', update);
-  root.querySelector('.sd-later').addEventListener('click', () => { later.add(request.id); setFolded(root, true); });
+  root.querySelector('.sd-later').addEventListener('click', () => {
+    later.add(request.id);
+    setFolded(root, true);
+    // The button just went away with the card: hand the keyboard back to the
+    // terminal rather than leave it on nothing.
+    root.closest('.stage-body')?.querySelector('.stage-terminal .xterm-helper-textarea')?.focus();
+  });
   root.querySelector('.sd-pill').addEventListener('click', () => {
     later.delete(request.id);
     setFolded(root, false);
@@ -174,6 +180,9 @@ export function syncSecretDrop(stage, ctx, item) {
     root.setAttribute('aria-label', 'Secret requested');
     body.append(root);
   }
+  // Over the terminal only: when the agent log sits beside it, stop at its edge.
+  const aside = stage.querySelector('.stage-agent-log');
+  root.style.setProperty('--sd-right', aside && !aside.hidden && aside.offsetWidth ? `${aside.offsetWidth}px` : '0px');
   const found = secretRequestFor(ctx.data, item?.sessionId);
   if (!found) {
     if (!root.hidden || root.dataset.requestId) {

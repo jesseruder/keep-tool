@@ -151,6 +151,19 @@ test('routes: a node may ask and read, only the console and the daemon machine m
   assert.ok(routeDenial(find('POST', '/api/secrets/request'), { class: 'proxy' }), 'the console does not make requests');
 });
 
+test('the session is told in one typing chunk even for a long path, name and reason', async (t) => {
+  const { service, calls } = setup(t);
+  const deep = `/home/u/${'very-long-directory-name/'.repeat(18)}service-account.json`;
+  const a = service.request({ class: 'local' }, ask({ name: `N${'x'.repeat(63)}`, path: deep, key: null })).body.request;
+  assert.equal((await service.fulfill({ id: a.id, value: VALUE })).status, 200);
+  const b = service.request({ class: 'local' }, ask({ path: '/home/u/other', key: null })).body.request;
+  service.decline({ id: b.id, reason: 'r'.repeat(400) });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.told.length, 2);
+  for (const told of calls.told) assert.ok(told.text.length <= 200, `${told.text.length}: ${told.text}`);
+  assert.match(calls.told[0].text, /…\/service-account\.json on main/);
+});
+
 test('a node may only ask for a session in one of its own panes', (t) => {
   const { service } = setup(t, { sessionPane: (id) => (id === SESSION ? 'p9@aws1' : null) });
   const node = { class: 'node', node: 'aws1' };

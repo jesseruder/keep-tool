@@ -74,10 +74,22 @@ function text(value, limit) {
 // Short on purpose: the session is told in one typed line, and a message longer than
 // one typing chunk (200 characters) can be left half-typed if the pane takes input
 // between chunks. The keep-secrets skill already says how to use the file.
-function where(record) {
+const MESSAGE_CHARS = 200;
+
+function where(record, short = false) {
   const home = require('node:os').homedir();
-  const file = record.path.startsWith(`${home}/`) ? `~${record.path.slice(home.length)}` : record.path;
+  let file = record.path.startsWith(`${home}/`) ? `~${record.path.slice(home.length)}` : record.path;
+  if (short) file = `…/${path.basename(record.path)}`.slice(0, 60);
   return `${file}${record.key ? ` as ${record.key}` : ''} on ${record.node}`;
+}
+
+// The message with the path in full when it fits one chunk, abbreviated when not,
+// and cut as a last resort; `keep secret status` always has the whole path.
+function fitted(build) {
+  const full = build(false);
+  if (full.length <= MESSAGE_CHARS) return full;
+  const short = build(true);
+  return short.length <= MESSAGE_CHARS ? short : `${short.slice(0, MESSAGE_CHARS - 1)}…`;
 }
 
 function createSecretService(options = {}) {
@@ -236,7 +248,7 @@ function createSecretService(options = {}) {
         status: 'delivered', resolvedAt: now(), lastError: null,
         outcome: { replaced: Boolean(outcome && outcome.replaced), bytes: Number(outcome && outcome.bytes) || null },
       });
-      tell(resolved, `[keep] secret ${record.name} written to ${where(record)} (request ${id}); use it without printing it.`);
+      tell(resolved, fitted((short) => `[keep] secret ${record.name} written to ${where(record, short)} (request ${id}); use it without printing it.`));
       return { status: 200, body: { request: publicRecord(resolved) } };
     } finally {
       writing.delete(id);
@@ -254,7 +266,7 @@ function createSecretService(options = {}) {
     if (writing.has(id)) return refusal(409, `secret request ${id} is being written`);
     const reason = text(body.reason, 400) || null;
     const resolved = update(id, { status: 'declined', resolvedAt: now(), reason });
-    tell(resolved, `[keep] Owner declined secret ${record.name} (request ${id})${reason ? `: ${reason.slice(0, 120)}` : ''}`);
+    tell(resolved, fitted(() => `[keep] Owner declined secret ${record.name} (request ${id})${reason ? `: ${reason}` : ''}`));
     onChange();
     return { status: 200, body: { request: publicRecord(resolved) } };
   }
