@@ -2,6 +2,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 const { createTerminalBridge } = require('./terminal-bridge.js');
 const { createTerminalRelay } = require('./terminal-relay.js');
 
@@ -108,28 +109,230 @@ function staticPath(webRoot, pathname) {
   } catch { return null; }
 }
 
-async function serveFile(res, file) {
-  let stat;
-  try { stat = await fs.promises.stat(file); }
-  catch (error) {
-    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
-      res.writeHead(404, { 'cache-control': 'no-cache' });
-      res.end('not found');
-      return;
+// The console's files are served under a path that names their version,
+// `/app/v/<version>/…` and `/vendor/v/<version>/…`, and those responses may be kept
+// for good: a deploy changes the version and so every URL. Only the index is checked
+// on each load, and it is rewritten to point at the current version. Relative module
+// imports inherit the versioned directory, so nothing in web/app has to know. The
+// version is a hash of every served file's name, size and mtime, so an edit on disk
+// takes effect on the next load with no restart, as it always has.
+const IMMUTABLE = 'private, max-age=31536000, immutable';
+const VERSIONED_APP = /^\/app\/v\/([0-9a-f]{12})\/(.+)$/;
+const VERSIONED_VENDOR = /^\/vendor\/v\/([0-9a-f]{12})\/([^/]+)$/;
+const VERSION_MEMO_MS = 2000;
+let versionMemo = { key: '', at: 0, scan: null };
+let scanInFlight = null;
+
+// What identifies a file's content without reading it. ctime and the inode are in it
+// because size and mtime alone survive an mtime-preserving copy (rsync -a, cp -p, a
+// tarball's timestamps) of a same-size edit; ctime cannot be carried over.
+function statSig(stat) {
+  return `${stat.size}\0${stat.mtimeMs}\0${stat.ctimeMs}\0${stat.ino}`;
+}
+
+// Every file under the root, following symlinks (staticPath serves what they point
+// at, so their targets are part of the version too), with a depth bound for loops.
+async function listFiles(dir, prefix = '', depth = 0, root = null, seen = new Set()) {
+  const out = [];
+  if (depth > 8) return out;
+  let realDir;
+  try { realDir = await fs.promises.realpath(dir); } catch { return out; }
+  const realRoot = root || realDir;
+  if (seen.has(realDir)) return out;
+  seen.add(realDir);
+  let entries;
+  try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
+  catch { return out; }
+  for (const entry of entries) {
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const full = path.join(dir, entry.name);
+    let isDir = entry.isDirectory();
+    let isFile = entry.isFile();
+    if (entry.isSymbolicLink()) {
+      // staticPath refuses a target outside the root, so the version ignores it too.
+      try {
+        const real = await fs.promises.realpath(full);
+        if (real !== realRoot && !real.startsWith(`${realRoot}${path.sep}`)) continue;
+        const target = await fs.promises.stat(real);
+        isDir = target.isDirectory();
+        isFile = target.isFile();
+      } catch { continue; }
     }
+    if (isDir) out.push(...await listFiles(full, relative, depth + 1, realRoot, seen));
+    else if (isFile) out.push(relative);
+  }
+  return out;
+}
+
+// The version, and each served file's signature as the scan saw it (keyed by real
+// path). A response is kept for good only when the file it sends still has that
+// signature, so a memoized version that is a moment old can never pin new content
+// under an old URL: a file changed since the scan goes out no-cache instead.
+// Concurrent callers share one scan, and a scan that finishes late never replaces a
+// newer one.
+async function assetScan(webRoot, modulesRoot, now = Date.now()) {
+  const key = `${webRoot}\0${modulesRoot}`;
+  if (versionMemo.key === key && now - versionMemo.at < VERSION_MEMO_MS) return versionMemo.scan;
+  if (scanInFlight && scanInFlight.key === key) return scanInFlight.promise;
+  const promise = (async () => {
+    const hash = crypto.createHash('sha256');
+    const sigs = new Map();
+    const add = async (label, file) => {
+      try {
+        const stat = await fs.promises.stat(file);
+        const sig = statSig(stat);
+        sigs.set(await fs.promises.realpath(file), sig);
+        hash.update(`${label}\0${sig}\n`);
+      } catch { hash.update(`${label}\0missing\n`); }
+    };
+    for (const relative of (await listFiles(webRoot)).sort()) await add(`app/${relative}`, path.join(webRoot, relative));
+    for (const name of Object.keys(VENDOR).sort()) await add(`vendor/${name}`, path.join(modulesRoot, ...VENDOR[name]));
+    return { value: hash.digest('hex').slice(0, 12), sigs };
+  })();
+  scanInFlight = { key, promise };
+  try {
+    const scan = await promise;
+    if (versionMemo.key !== key || now >= versionMemo.at) versionMemo = { key, at: now, scan };
+    return scan;
+  } finally {
+    if (scanInFlight && scanInFlight.promise === promise) scanInFlight = null;
+  }
+}
+
+async function assetVersion(webRoot, modulesRoot, now = Date.now()) {
+  return (await assetScan(webRoot, modulesRoot, now)).value;
+}
+
+// Text files go out gzipped when the client takes it. The compressed copy is kept per
+// file, size and mtime, so each version is compressed once, off the event loop.
+const COMPRESSIBLE = new Set(['.css', '.html', '.js', '.json', '.svg']);
+const GZIP_CACHE_MAX = 256;
+const gzipCache = new Map();
+const gzipAsync = (buffer) => new Promise((resolve, reject) => {
+  zlib.gzip(buffer, { level: 6 }, (error, out) => (error ? reject(error) : resolve(out)));
+});
+
+function acceptsGzip(req) {
+  return /\bgzip\b/i.test(String(req?.headers?.['accept-encoding'] || ''));
+}
+
+async function gzipped(cacheKey, read) {
+  const cached = gzipCache.get(cacheKey);
+  if (cached) return cached;
+  const out = await gzipAsync(await read());
+  if (gzipCache.size >= GZIP_CACHE_MAX) gzipCache.delete(gzipCache.keys().next().value);
+  gzipCache.set(cacheKey, out);
+  return out;
+}
+
+// The stat that decides whether a response may be kept and the bytes it carries come
+// from one open handle, so a file replaced between the two cannot go out under the
+// old file's signature. The console's files are small enough to read whole.
+async function readOpenFile(file) {
+  let handle;
+  try { handle = await fs.promises.open(file, 'r'); }
+  catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR' || error.code === 'EISDIR') return null;
     throw error;
   }
-  if (!stat.isFile()) {
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) return null;
+    return { stat, bytes: await handle.readFile() };
+  } finally { await handle.close().catch(() => {}); }
+}
+
+async function serveFile(res, file, options = {}) {
+  const opened = await readOpenFile(file);
+  if (!opened) {
     res.writeHead(404, { 'cache-control': 'no-cache' });
     res.end('not found');
     return;
   }
-  res.writeHead(200, {
-    'content-type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
-    'content-length': stat.size,
-    'cache-control': 'no-cache',
-  });
-  fs.createReadStream(file).pipe(res);
+  const { stat, bytes } = opened;
+  const ext = path.extname(file).toLowerCase();
+  const headers = {
+    'content-type': MIME[ext] || 'application/octet-stream',
+    'cache-control': options.keepIf ? (options.keepIf(stat) ? IMMUTABLE : 'no-cache') : (options.cacheControl || 'no-cache'),
+  };
+  const compressible = COMPRESSIBLE.has(ext);
+  if (compressible) headers.vary = 'accept-encoding';
+  if (options.transform) {
+    // A rewritten file (the index) is small and differs per version: build it each time.
+    let body = Buffer.from(options.transform(bytes.toString('utf8')), 'utf8');
+    if (compressible && acceptsGzip(options.req)) {
+      body = await gzipAsync(body);
+      headers['content-encoding'] = 'gzip';
+    }
+    headers['content-length'] = body.length;
+    res.writeHead(200, headers);
+    res.end(body);
+    return;
+  }
+  if (compressible && stat.size > 1024 && acceptsGzip(options.req)) {
+    const body = await gzipped(`${file}\0${statSig(stat)}`, async () => bytes);
+    headers['content-encoding'] = 'gzip';
+    headers['content-length'] = body.length;
+    res.writeHead(200, headers);
+    res.end(body);
+    return;
+  }
+  headers['content-length'] = bytes.length;
+  res.writeHead(200, headers);
+  res.end(bytes);
+}
+
+function notFound(res) {
+  res.writeHead(404, { 'cache-control': 'no-cache' });
+  res.end('not found');
+}
+
+function isIndexPath(pathname) {
+  return pathname === '/app' || pathname === '/app/' || pathname === '/app/index.html';
+}
+
+// Point the index's own /app/ and /vendor/ references at the current version.
+function versionIndex(html, version) {
+  return html
+    .replace(/(["'(])\/app\/(?!v\/)/g, `$1/app/v/${version}/`)
+    .replace(/(["'(])\/vendor\/(?!v\/)/g, `$1/vendor/v/${version}/`);
+}
+
+// GET /app, /app/…, /app/v/<version>/…: the one place both servers serve the console.
+// A versioned path whose version is not the current one is still answered (an open
+// tab may lazily ask for a file after a deploy) but not kept, since its content is
+// the current file's, not that version's.
+async function serveApp(req, res, { webRoot, modulesRoot, pathname }) {
+  if (isIndexPath(pathname)) {
+    const file = staticPath(webRoot, '/app/index.html');
+    if (!file) return notFound(res);
+    const version = await assetVersion(webRoot, modulesRoot);
+    return serveFile(res, file, { req, transform: (html) => versionIndex(html, version) });
+  }
+  const versioned = VERSIONED_APP.exec(pathname);
+  if (versioned) {
+    const file = staticPath(webRoot, `/app/${versioned[2]}`);
+    if (!file) return notFound(res);
+    const scan = await assetScan(webRoot, modulesRoot);
+    const current = versioned[1] === scan.value;
+    return serveFile(res, file, { req, keepIf: (stat) => current && scan.sigs.get(file) === statSig(stat) });
+  }
+  const file = staticPath(webRoot, pathname);
+  if (!file) return notFound(res);
+  return serveFile(res, file, { req });
+}
+
+async function serveVendor(req, res, { webRoot, modulesRoot, pathname }) {
+  const versioned = VERSIONED_VENDOR.exec(pathname);
+  const name = versioned ? versioned[2] : pathname.slice('/vendor/'.length);
+  if (!Object.hasOwn(VENDOR, name)) return notFound(res);
+  const file = path.join(modulesRoot, ...VENDOR[name]);
+  if (!versioned) return serveFile(res, file, { req });
+  const scan = await assetScan(webRoot, modulesRoot);
+  let real = null;
+  try { real = await fs.promises.realpath(file); } catch {}
+  const current = versioned[1] === scan.value;
+  return serveFile(res, file, { req, keepIf: (stat) => current && real !== null && scan.sigs.get(real) === statSig(stat) });
 }
 
 function validateLayouts(value) {
@@ -318,16 +521,11 @@ function install(input) {
         return true;
       }
       if (isApp) {
-        const file = staticPath(webRoot, url.pathname);
-        if (!file) { res.writeHead(404, { 'cache-control': 'no-cache' }); res.end('not found'); }
-        else await serveFile(res, file);
+        await serveApp(req, res, { webRoot, modulesRoot, pathname: url.pathname });
         return true;
       }
       if (isVendor) {
-        const name = url.pathname.slice('/vendor/'.length);
-        const parts = VENDOR[name];
-        if (!parts) { res.writeHead(404, { 'cache-control': 'no-cache' }); res.end('not found'); }
-        else await serveFile(res, path.join(modulesRoot, ...parts));
+        await serveVendor(req, res, { webRoot, modulesRoot, pathname: url.pathname });
         return true;
       }
       if (isLayouts && req.method === 'GET') {
@@ -434,4 +632,5 @@ function install(input) {
 module.exports = {
   VENDOR, install, validateLayouts, readLayouts, writeLayouts,
   sameOrigin, upgradeOriginAllowed, authorized, principal, tokenMatches, cookieValue, staticPath, serveFile,
+  serveApp, serveVendor, assetVersion, versionIndex, IMMUTABLE,
 };

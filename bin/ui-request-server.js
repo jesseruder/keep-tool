@@ -285,15 +285,12 @@ function createUiRequestServer(options = {}) {
         try { traversal = decodeURIComponent(rawPath).split('/').includes('..'); } catch { traversal = true; }
       }
       if (req.method === 'GET' && (url.pathname === '/app' || url.pathname.startsWith('/app/'))) {
-        const file = traversal ? null : keepConsole.staticPath(appRoot, url.pathname);
-        if (!file) { res.writeHead(404, { 'cache-control': 'no-cache' }); res.end('not found'); }
-        else await keepConsole.serveFile(res, file);
+        if (traversal) { res.writeHead(404, { 'cache-control': 'no-cache' }); res.end('not found'); }
+        else await keepConsole.serveApp(req, res, { webRoot: appRoot, modulesRoot, pathname: url.pathname });
         return;
       }
       if (req.method === 'GET' && url.pathname.startsWith('/vendor/')) {
-        const parts = keepConsole.VENDOR[url.pathname.slice('/vendor/'.length)];
-        if (!parts) { res.writeHead(404, { 'cache-control': 'no-cache' }); res.end('not found'); }
-        else await keepConsole.serveFile(res, path.join(modulesRoot, ...parts));
+        await keepConsole.serveVendor(req, res, { webRoot: appRoot, modulesRoot, pathname: url.pathname });
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/events') {

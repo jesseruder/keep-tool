@@ -244,6 +244,112 @@ test('serves app files and only allowlisted vendor files', async (t) => {
   assert.equal((await get(f.port, '/vendor/package.json')).status, 404);
 });
 
+test('the index points at versioned files that can be kept for good, gzipped on request', async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const index = await get(f.port, '/app');
+  assert.equal(index.headers['cache-control'], 'no-cache', 'the index is checked on every load');
+  const html = index.body.toString('utf8');
+  const version = /\/app\/v\/([0-9a-f]{12})\/app\.js/.exec(html)?.[1];
+  assert.ok(version, 'the app module is referenced under its version');
+  assert.match(html, new RegExp(`/app/v/${version}/styles\\.css`));
+  assert.match(html, new RegExp(`/vendor/v/${version}/xterm\\.js`), 'vendor files too, inside the desktop-only loader');
+  assert.doesNotMatch(html, /["'(]\/app\/(?!v\/)/, 'no unversioned /app/ reference is left');
+  assert.match(html, /if \(!window\.keepShell\)/, 'the phone shell skips the terminal library');
+
+  const onDisk = await fs.promises.readFile(path.join(__dirname, '..', 'web', 'app', 'api.js'));
+  const current = await get(f.port, `/app/v/${version}/api.js`);
+  assert.equal(current.status, 200);
+  assert.equal(current.headers['cache-control'], keepConsole.IMMUTABLE);
+  assert.deepEqual(current.body, onDisk, 'a relative import under the version reaches the same file');
+  const stale = await get(f.port, '/app/v/000000000000/api.js');
+  assert.equal(stale.status, 200, 'an open tab asking under an old version still gets the file');
+  assert.equal(stale.headers['cache-control'], 'no-cache', 'but it is not kept, since it is not that version');
+  assert.equal((await get(f.port, `/app/v/${version}/%2e%2e%2fpackage.json`)).status, 404);
+  assert.equal((await get(f.port, `/vendor/v/${version}/xterm.js`)).headers['cache-control'], keepConsole.IMMUTABLE);
+  assert.equal((await get(f.port, `/vendor/v/${version}/package.json`)).status, 404);
+
+  const zipped = await get(f.port, `/app/v/${version}/api.js`, { headers: { 'accept-encoding': 'gzip, deflate' } });
+  assert.equal(zipped.headers['content-encoding'], 'gzip');
+  assert.equal(zipped.headers.vary, 'accept-encoding');
+  assert.deepEqual(require('node:zlib').gunzipSync(zipped.body), onDisk);
+  assert.ok(zipped.body.length < onDisk.length / 2, 'and it is actually smaller');
+  const zippedIndex = await get(f.port, '/app', { headers: { 'accept-encoding': 'gzip' } });
+  assert.equal(require('node:zlib').gunzipSync(zippedIndex.body).toString('utf8'), html);
+});
+
+test('the asset version follows the files on disk', async (t) => {
+  const web = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'keep-assets-'));
+  t.after(() => fs.promises.rm(web, { recursive: true, force: true }));
+  await fs.promises.mkdir(path.join(web, 'shared'));
+  await fs.promises.writeFile(path.join(web, 'app.js'), 'export {};');
+  await fs.promises.writeFile(path.join(web, 'shared', 'x.js'), 'export {};');
+  const modules = path.join(__dirname, '..', 'node_modules');
+  const first = await keepConsole.assetVersion(web, modules, 1e12);
+  assert.match(first, /^[0-9a-f]{12}$/);
+  assert.equal(await keepConsole.assetVersion(web, modules, 1e12 + 10_000), first, 'unchanged files keep the version');
+  await fs.promises.writeFile(path.join(web, 'shared', 'x.js'), 'export const changed = true;');
+  assert.notEqual(await keepConsole.assetVersion(web, modules, 1e12 + 20_000), first, 'an edit in a subdirectory moves it');
+  assert.equal(keepConsole.versionIndex('<script src="/app/app.js"></script>', 'abcdefabcdef'),
+    '<script src="/app/v/abcdefabcdef/app.js"></script>');
+
+  // A symlink inside the root is served, so its target counts toward the version; one
+  // that leaves the root is refused by staticPath, so it does not.
+  await fs.promises.writeFile(path.join(web, 'shared', 'target.js'), 'export const a = 1;');
+  await fs.promises.symlink(path.join(web, 'shared', 'target.js'), path.join(web, 'linked.js'));
+  await fs.promises.symlink(web, path.join(web, 'shared', 'loop'));
+  const outside = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'keep-assets-target-'));
+  t.after(() => fs.promises.rm(outside, { recursive: true, force: true }));
+  await fs.promises.writeFile(path.join(outside, 'far.js'), 'export const b = 1;');
+  await fs.promises.symlink(outside, path.join(web, 'far'));
+  const withLink = await keepConsole.assetVersion(web, modules, 1e12 + 30_000);
+  await fs.promises.writeFile(path.join(outside, 'far.js'), 'export const b = 2;');
+  assert.equal(await keepConsole.assetVersion(web, modules, 1e12 + 40_000), withLink, 'a link out of the root is not followed');
+  await fs.promises.writeFile(path.join(web, 'shared', 'target.js'), 'export const a = 22;');
+  assert.notEqual(await keepConsole.assetVersion(web, modules, 1e12 + 50_000), withLink, 'an edit behind an inside link moves it');
+});
+
+function capture() {
+  const res = { status: 0, headers: {}, body: Buffer.alloc(0) };
+  res.writeHead = (status, headers) => { res.status = status; res.headers = headers || {}; };
+  res.end = (body) => { if (body) res.body = Buffer.concat([res.body, Buffer.from(body)]); res.done = true; };
+  res.write = (chunk) => { res.body = Buffer.concat([res.body, Buffer.from(chunk)]); return true; };
+  res.on = res.once = res.emit = () => res;
+  res.removeListener = () => res;
+  return res;
+}
+
+test('a file that changed after the version was computed is not kept under it', async (t) => {
+  const web = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'keep-assets-'));
+  t.after(() => fs.promises.rm(web, { recursive: true, force: true }));
+  await fs.promises.writeFile(path.join(web, 'index.html'), '<script type="module" src="/app/app.js"></script>');
+  await fs.promises.writeFile(path.join(web, 'app.js'), 'export const v = 1;');
+  const modules = path.join(__dirname, '..', 'node_modules');
+  const index = capture();
+  await keepConsole.serveApp({ headers: {} }, index, { webRoot: web, modulesRoot: modules, pathname: '/app' });
+  const version = /\/app\/v\/([0-9a-f]{12})\//.exec(index.body.toString('utf8'))[1];
+
+  const kept = capture();
+  await keepConsole.serveApp({ headers: {} }, kept, { webRoot: web, modulesRoot: modules, pathname: `/app/v/${version}/app.js` });
+  assert.equal(kept.headers['cache-control'], keepConsole.IMMUTABLE);
+
+  // Within the memo window the version is unchanged, but the file is not what the
+  // scan saw: it goes out, and is not kept.
+  await fs.promises.writeFile(path.join(web, 'app.js'), 'export const v = 22;');
+  const moved = capture();
+  await keepConsole.serveApp({ headers: {} }, moved, { webRoot: web, modulesRoot: modules, pathname: `/app/v/${version}/app.js` });
+  assert.equal(moved.headers['cache-control'], 'no-cache');
+
+  for (const name of ['__proto__', 'constructor', 'hasOwnProperty']) {
+    const vendor = capture();
+    await keepConsole.serveVendor({ headers: {} }, vendor, { webRoot: web, modulesRoot: modules, pathname: `/vendor/v/${version}/${name}` });
+    assert.equal(vendor.status, 404, `${name} is not a vendor file`);
+    const plain = capture();
+    await keepConsole.serveVendor({ headers: {} }, plain, { webRoot: web, modulesRoot: modules, pathname: `/vendor/${name}` });
+    assert.equal(plain.status, 404);
+  }
+});
+
 test('bridges a pane websocket in both directions', async (t) => {
   const f = await fixture({ liveAfterAttach: 'live' });
   let fixtureClosed = false;

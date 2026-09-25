@@ -67,7 +67,9 @@ function mountViewerId(pane, slot) {
 }
 
 export function mountTerminal(container, pane, options = {}) {
-  if (isMobileShell()) return mountShellPanel(container, pane, options);
+  // A page loaded inside the phone shell has no xterm at all (index.html skips it),
+  // so it hands the pane over even if the shell has since gone away.
+  if (isMobileShell() || !window.Terminal) return mountShellPanel(container, pane, options);
   const wrapper = document.createElement('div');
   wrapper.className = 'term';
   wrapper.tabIndex = 0;
