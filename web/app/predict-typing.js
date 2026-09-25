@@ -153,27 +153,35 @@ export function createTypingPredictor({
   // laid out from it. Only the pane moves xterm's cursor.
   let base = 0;
   // The overlays on screen, keyed by what they show and where, and the marker that
-  // anchors them to the prompt row.
+  // anchors them to the prompt row while a guess is shown. The marker follows its
+  // line through reflow and scrollback trimming, which `row` does not, so a marker
+  // that has left `row` means the chain's row and columns are no longer known.
   let marker = null;
   const overlays = new Map();
 
   // The real cursor is hidden while a guess stands, since the stand-in cursor sits
-  // after the guesses. `paneShows` is the cursor visibility the pane itself last set,
-  // which is what is put back; the predictor's own writes are left out of it.
-  // `reconceal` records that the pane showed the cursor again while it was hidden
-  // (Claude Code ends every frame with a show), so it is hidden again once the
-  // output settles.
+  // after the guesses; with no guess standing its visibility is exactly what the
+  // pane last asked for. `paneShows` is that request (DECTCEM), which is what is
+  // put back; the predictor's own writes are left out of it. While `hidden`, the
+  // pane's own show (Claude Code ends every frame with one) is recorded and not
+  // performed, so the real cursor never appears beside the stand-in one, even in a
+  // frame split across chunks. A show that carries other modes with it cannot be
+  // withheld alone: xterm performs it and `reconceal` hides the cursor again as soon
+  // as its chunk has parsed. `restoreOwed` is a restore waiting for queued output
+  // to settle: until then the pane's latest request is not known.
   let hidden = false;
   let paneShows = true;
   let reconceal = false;
+  let restoreOwed = false;
   let localWrite = false;
   const hooks = [];
   const cursorMode = (visible) => (params) => {
-    if (!localWrite && params.includes(25)) {
-      paneShows = visible;
-      if (visible && hidden) reconceal = true;
+    if (localWrite || !params.includes(25)) return false;
+    paneShows = visible;
+    if (visible && hidden) {
+      if (params.length === 1) return true;
+      reconceal = true;
     }
-    // Never handled here: xterm still performs the sequence.
     return false;
   };
   if (typeof terminal.parser?.registerCsiHandler === 'function') {
@@ -283,33 +291,41 @@ export function createTypingPredictor({
     reconceal = false;
     if (paneShows) writeLocal(HIDE_CURSOR);
   };
+  // Puts back the pane's own cursor visibility. With pane output still queued, the
+  // request that output makes is not known yet, and a show written now would parse
+  // after it, so the restore waits for the output to settle (outputParsed).
   const restore = () => {
     if (!hidden) return;
+    if (outputQueued()) { restoreOwed = true; return; }
     hidden = false;
     reconceal = false;
+    restoreOwed = false;
     if (paneShows) writeLocal(SHOW_CURSOR);
   };
+  const anchored = () => !marker || (!marker.isDisposed && marker.line === row);
 
   // Brings the overlays and the real cursor's visibility in line with the pending
   // keystrokes. An overlay already in place is left alone; one that moved is
   // disposed and registered again at its new column.
   const render = () => {
+    // A prompt row that moved under the chain (reflow, scrollback trimming) ends
+    // it: its columns were laid out on a line that is no longer where they point.
+    if (!anchored()) entries = [];
     const { cells, cursor, veil } = layout();
     if (cursor == null) {
       clearOverlays();
       restore();
       return;
     }
+    restoreOwed = false;
     if (!hidden) conceal();
-    // A build without decorations (the headless one in tests) keeps the guesses
-    // and the cursor handling, and draws nothing.
-    if (!canDraw()) return;
-    if (marker && (marker.isDisposed || marker.line !== row)) clearOverlays();
-    if (!marker) {
+    if (!marker && typeof terminal.registerMarker === 'function') {
       const buffer = terminal.buffer.active;
       marker = terminal.registerMarker(row - (buffer.baseY + buffer.cursorY)) || null;
-      if (!marker) return;
     }
+    // A build without decorations (the headless one in tests) keeps the guesses,
+    // the marker and the cursor handling, and draws nothing.
+    if (!marker || !canDraw()) return;
     const wanted = new Map();
     for (const [x, ch] of cells) {
       const kind = ch == null ? 'blank' : 'char';
@@ -330,7 +346,10 @@ export function createTypingPredictor({
   // With none of the pane's output queued, xterm's cursor is the pane's as it stands.
   const keystroke = (data, options = {}) => {
     const at = now();
-    if (entries.length && at - entries[0].at > STALE_KEYSTROKE_MS) entries = [];
+    if (!anchored() || (entries.length && at - entries[0].at > STALE_KEYSTROKE_MS)) {
+      entries = [];
+      render();
+    }
     // xterm parses writes later, in order. With pane output still queued, the
     // screen read here is older than the one the echo will land on: that output may
     // move the cursor or replace the prompt. Such a keystroke is sent unpredicted
@@ -365,7 +384,11 @@ export function createTypingPredictor({
   // more of its output is still queued behind it, since a render split across
   // chunks leaves the cursor wherever the chunk ended.
   const outputParsed = (settled = true) => {
-    if (!settled) return;
+    if (!settled) {
+      if (!anchored()) render();
+      else if (hidden && reconceal && !restoreOwed) conceal();
+      return;
+    }
     // A keystroke the agent has not answered in this long is not waiting on the
     // network; it did nothing the line shows. Timing its eventual redraw would read
     // as a very slow echo, so it expires here as well as on the next keypress.
@@ -412,12 +435,22 @@ export function createTypingPredictor({
     entries = [];
     clearOverlays();
     restore();
+    restoreOwed = false;
+    hidden = false;
     // Follows xterm's own reset, which shows the cursor; the pane's replay sets it
     // again as it needs.
     paneShows = true;
     reconceal = false;
     localWrite = false;
   };
+  // A resize can reflow the prompt row and move the pane's cursor; the chain's
+  // columns no longer hold, so it ends, and the pane's redraw is waited for.
+  if (typeof terminal.onResize === 'function') {
+    hooks.push(terminal.onResize(() => {
+      entries = [];
+      render();
+    }));
+  }
   const dispose = () => {
     reset();
     for (const hook of hooks.splice(0)) hook.dispose();

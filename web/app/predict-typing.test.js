@@ -33,8 +33,8 @@ function stubDecorations(terminal) {
 // Every write the predictor makes to the terminal is recorded; the pane's output in
 // these tests goes through `paneWrite`, which is not. `cursorShown` follows xterm's
 // cursor visibility (DECTCEM) from whichever side set it.
-async function terminalWith(screen, { cols = 40, rows = 6, decorations = true } = {}) {
-  const terminal = new Terminal({ cols, rows, allowProposedApi: true });
+async function terminalWith(screen, { cols = 40, rows = 6, decorations = true, scrollback = 1000 } = {}) {
+  const terminal = new Terminal({ cols, rows, allowProposedApi: true, scrollback });
   if (decorations) stubDecorations(terminal);
   terminal.cursorShown = true;
   for (const [final, shown] of [['h', true], ['l', false]]) {
@@ -664,6 +664,116 @@ test('a cursor-position query is answered by xterm with the pane\'s own cursor',
   predictor.keystroke('b');
   await write(terminal, '\x1b[6n');
   assert.deepEqual(replies, ['\x1b[1;3R'], 'the guesses never moved it');
+});
+
+test('a resize that reflows the prompt row ends the chain, leaves no overlay and gives the cursor back', async () => {
+  const terminal = await terminalWith(`${'x'.repeat(30)}\r\n❯ `, { cols: 40 });
+  const predictor = predictorFor(terminal);
+  predictor.keystroke('a');
+  predictor.keystroke('b');
+  await write(terminal, '');
+  assert.equal(terminal.liveDecorations.size, 3);
+  assert.ok([...terminal.liveDecorations].every((decoration) => decoration.marker.line === 1));
+  terminal.resize(20, 6);
+  await write(terminal, '');
+  assert.equal(terminal.buffer.active.baseY + terminal.buffer.active.cursorY, 2, 'the wrapped line above pushed the prompt down');
+  assert.equal(predictor.pending, 0);
+  assert.equal(terminal.liveDecorations.size, 0, 'no overlay is left on the old row');
+  assert.deepEqual(predictor.positions(), { cells: [], blanks: [], cursor: null });
+  assert.equal(terminal.cursorShown, true);
+  // The next keystroke starts a chain on the row the prompt is on now.
+  predictor.keystroke('c');
+  assert.ok([...terminal.liveDecorations].every((decoration) => decoration.marker.line === 2));
+});
+
+test('a prompt row trimmed out of the scrollback ends the chain even when another prompt takes its index', async () => {
+  const terminal = await terminalWith('status\r\n❯ ', { rows: 4, scrollback: 1 });
+  const predictor = predictorFor(terminal);
+  predictor.keystroke('a');
+  await write(terminal, '');
+  assert.equal(terminal.liveDecorations.size, 2);
+  // The pane scrolls far enough that the scrollback drops lines, then draws a prompt
+  // on the line that now has the chain's old index.
+  await write(terminal, '\r\n'.repeat(10));
+  await write(terminal, '\x1b[1;1H❯ ');
+  assert.equal(terminal.buffer.active.baseY + terminal.buffer.active.cursorY, 1);
+  predictor.outputParsed();
+  await write(terminal, '');
+  assert.equal(predictor.pending, 0);
+  assert.equal(terminal.liveDecorations.size, 0);
+  assert.equal(terminal.cursorShown, true);
+});
+
+test('the pane\'s show in the first chunk of a split frame never shows the real cursor beside the stand-in', async () => {
+  const terminal = await terminalWith('❯ ');
+  const predictor = predictorFor(terminal);
+  predictor.keystroke('a');
+  predictor.keystroke('b');
+  await write(terminal, '');
+  assert.equal(terminal.cursorShown, false);
+  // The first chunk ends with the pane's show; more of the frame is still queued.
+  await write(terminal, letterEcho('a', 2));
+  predictor.outputParsed(false);
+  assert.equal(terminal.cursorShown, false, 'the show is recorded, not performed, while a guess stands');
+  assert.equal(predictor.pending, 2, 'nothing is read before the frame settles');
+  await write(terminal, '\x1b[1;4H');
+  predictor.outputParsed(true);
+  await write(terminal, '');
+  assert.equal(predictor.pending, 1);
+  assert.equal(terminal.cursorShown, false);
+  // A show that carries another mode with it is performed, and hidden again as soon
+  // as its chunk has parsed, before the rest of the frame.
+  const writes = terminal.localWrites.length;
+  await write(terminal, '\x1b[?7;25h');
+  assert.equal(terminal.cursorShown, true);
+  predictor.outputParsed(false);
+  assert.deepEqual(terminal.localWrites.slice(writes), ['', '\x1b[?25l']);
+  await write(terminal, '');
+  assert.equal(terminal.cursorShown, false);
+  // Once the last guess is confirmed the pane's own show is put back.
+  await write(terminal, letterEcho('b', 3));
+  predictor.outputParsed(true);
+  await write(terminal, '');
+  assert.equal(predictor.pending, 0);
+  assert.equal(terminal.cursorShown, true);
+});
+
+test('a chain dropped while pane output is queued restores the cursor only as that output leaves it', async () => {
+  const terminal = await terminalWith('❯ ');
+  let queued = false;
+  const predictor = predictorFor(terminal, { outputQueued: () => queued });
+  predictor.keystroke('a');
+  await write(terminal, '');
+  assert.equal(terminal.cursorShown, false);
+  // A pane frame that hides its cursor is queued when the next key arrives.
+  queued = true;
+  const parsed = write(terminal, '\x1b[?25l\x1b[1;1H\x1b[2K❯ /');
+  assert.equal(predictor.keystroke('/'), false);
+  assert.equal(predictor.pending, 0);
+  assert.equal(terminal.liveDecorations.size, 0);
+  const writes = terminal.localWrites.length;
+  await parsed;
+  queued = false;
+  predictor.outputParsed(true);
+  await write(terminal, '');
+  assert.deepEqual(terminal.localWrites.slice(writes), [], 'no show is written after the pane\'s hide');
+  assert.equal(terminal.cursorShown, false, 'the cursor is as the pane last asked');
+
+  // The same with a pane that shows its cursor: it is shown once the output settles.
+  predictor.keystroke('x');
+  await write(terminal, '\x1b[?25h');
+  predictor.outputParsed(true);
+  await write(terminal, '');
+  assert.equal(terminal.cursorShown, false, 'the guess stands, so the pane\'s show is held');
+  queued = true;
+  const more = write(terminal, '\x1b[1;1H\x1b[2K❯ /x');
+  predictor.keystroke('\r');
+  await more;
+  assert.equal(terminal.cursorShown, false, 'nothing is shown before the output settles');
+  queued = false;
+  predictor.outputParsed(true);
+  await write(terminal, '');
+  assert.equal(terminal.cursorShown, true);
 });
 
 test('an alternate screen over the input box ends the chain and gives the cursor back', async () => {

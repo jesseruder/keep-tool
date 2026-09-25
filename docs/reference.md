@@ -228,9 +228,12 @@ character over an opaque cell, at the pane's cursor column plus the net advance 
 keystrokes before it; a Backspace guess blanks the pane's character (`.keep-predicted-blank`)
 or takes back a guessed one; a stand-in block cursor (`.keep-predicted-cursor`) sits after
 the guesses, and a dim placeholder past it is veiled. While a guess stands the real cursor
-is hidden (`CSI ? 25 l`; hide and show are the only bytes the predictor writes), again after each frame of
-the pane's that shows it; when the last guess is confirmed, dropped or reset, the cursor
-visibility the pane itself last set is put back. Echoes are acknowledged oldest keystroke
+is hidden (`CSI ? 25 l`; hide and show are the only bytes the predictor writes), and the
+pane's own show is recorded rather than performed (one combined with other modes is
+performed and hidden again as soon as its chunk parses); when the last guess is
+confirmed, dropped or reset, the cursor visibility the pane itself last set is put back,
+after any pane output still queued has parsed. A resize, or a prompt row moved by
+scrollback trimming, ends the chain. Echoes are acknowledged oldest keystroke
 first, by comparing the input text before the pane's cursor with the text each keystroke
 should leave; after every settled chunk of output the remaining overlays are laid out again
 from where the pane's cursor now is. Output that shows neither the text before the oldest
