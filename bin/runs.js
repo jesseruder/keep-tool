@@ -910,7 +910,9 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
     return [];
   }
   if (!Array.isArray(panes)) return [];
-  idleOrphanedCheckAgents(panes, host.agents || require('./agents.js'));
+  // Only with the host's own agents module: a host built without one (a test) must
+  // never reach whatever registry this process points at.
+  if (host.agents) idleOrphanedCheckAgents(panes, host.agents, now);
   // A pane on another node is left alone here even if a caller hands one over:
   // closing it and releasing its card's stamp both rest on evidence only the
   // machine running it can produce.
@@ -964,15 +966,16 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
     closed.push(pane.id);
     process.stderr.write(`keep runs: closed the ${label}: ${decision.reason}\n`);
     if (!decision.checkedIn) releaseUnfinishedCheck(pane.meta.card, sessionId, today, host.checkinTask ? host : keep);
-    // A check that ran as an agent is idle again once its pane is gone; the record
-    // keeps the session it ran as, for the log, and drops the card it was on.
+    // A check that ran as an agent is idle again once its pane is gone, and lets the
+    // session go in the same write (the pane's card check-ins are the log), so the
+    // orphan pass above has nothing left to write next tick.
     const agentName = typeof pane.meta.agentName === 'string' ? pane.meta.agentName : '';
-    if (agentName) {
+    if (agentName && host.agents) {
       try {
-        const agentApi = host.agents || require('./agents.js');
+        const agentApi = host.agents;
         const record = agentApi.readRecord(agentName);
         if (record && record.session && record.session.id === sessionId) {
-          agentApi.writeRecord(agentName, { lifecycle: 'idle', card: '' });
+          agentApi.writeRecord(agentName, { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } });
           agentApi.flushCommits();
         }
       } catch (e) {
@@ -992,7 +995,12 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
 // `ephemeral: 'check'` + `agentName` is idled and lets the session go. Judged over
 // the whole pane list, alive or not: a dead check pane is reaped further down and
 // idles the record itself; only a pane that lost the mark, or is gone, counts here.
-function idleOrphanedCheckAgents(panes, agentApi) {
+// A record whose session started within the last minute is left for the next tick:
+// `keep verify` opens a check beside the tick, and a pane list answered before that
+// pane existed must not read as the pane being gone.
+const ORPHAN_CHECK_GRACE_MS = 60e3;
+
+function idleOrphanedCheckAgents(panes, agentApi, now = Date.now()) {
   let records;
   try { records = agentApi.records(); } catch { return []; }
   const carried = new Set((panes || [])
@@ -1002,6 +1010,7 @@ function idleOrphanedCheckAgents(panes, agentApi) {
   for (const record of records || []) {
     if (!record || record.role !== 'scheduled check' || !record.session || !record.session.id) continue;
     if (carried.has(record.name)) continue;
+    if (Number(record.session.startedAt) > now - ORPHAN_CHECK_GRACE_MS) continue;
     try {
       agentApi.writeRecord(record.name, { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } });
       idled.push(record.name);

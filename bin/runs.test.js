@@ -539,7 +539,10 @@ test('the sweep idles an agent whose check pane it closed, or whose pane lost th
   const records = {
     'redash-daily': { name: 'redash-daily', role: 'scheduled check', session: { id: 'sid-agent' } },
     // Moved to another node or resumed by hand: its pane no longer carries the mark.
-    'moved-check': { name: 'moved-check', role: 'scheduled check', lifecycle: 'working', session: { id: 'sid-moved', pane: 'p-moved' } },
+    'moved-check': { name: 'moved-check', role: 'scheduled check', lifecycle: 'working', session: { id: 'sid-moved', pane: 'p-moved', startedAt: 1_000_000 } },
+    // Opened seconds ago beside this tick (keep verify): the pane list may predate its
+    // pane, so it is left for the next tick.
+    'fresh-check': { name: 'fresh-check', role: 'scheduled check', lifecycle: 'working', session: { id: 'sid-fresh', pane: 'p-fresh', startedAt: 1_000_000 + 5 * 3600e3 - 10e3 } },
     // A responder is never this sweep's to idle, however its panes look.
     sandboxes: { name: 'sandboxes', role: 'incident-responder', lifecycle: 'working', session: { id: 'sid-resp', pane: 'p-resp' } },
     // Already idle with no session: nothing to write.
@@ -568,10 +571,30 @@ test('the sweep idles an agent whose check pane it closed, or whose pane lost th
   assert.deepEqual(written, [
     // The moved check first: its pane carries the name but not the mark.
     ['moved-check', { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } }],
-    // Then the record whose check pane this sweep closed; a record already carrying
-    // a newer session (or none) is left alone.
-    ['redash-daily', { lifecycle: 'idle', card: '' }],
+    // Then the record whose check pane this sweep closed, which lets its session go in
+    // the same write; a record already carrying a newer session (or none) is left alone.
+    ['redash-daily', { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } }],
   ]);
+
+  // A host that could not list its panes answers null (never an empty list): nothing
+  // is orphaned by a listing that did not happen.
+  written.length = 0;
+  await sweepEphemeralPanes({
+    listPanes: async () => null,
+    sessions: async () => [],
+    closePane: async () => {},
+    agents: { records: () => Object.values(records), readRecord: (name) => records[name] || null,
+      writeRecord: (name, patch) => { written.push([name, patch]); }, flushCommits: () => true },
+  }, now);
+  assert.deepEqual(written, [], 'an unanswered host idles nobody');
+  // A host built without an agents module never reaches a registry: no orphan pass,
+  // no idle write, whatever the pane list says.
+  await sweepEphemeralPanes({
+    listPanes: async () => [],
+    sessions: async () => [],
+    closePane: async () => {},
+  }, now);
+  assert.deepEqual(written, []);
 });
 
 test('the per-day and per-tick allowances survive a restart, and verify ignores them', async () => {

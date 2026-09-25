@@ -383,9 +383,16 @@ function startSchedulers(ctx) {
     // The same boundary the cleanup snapshot keeps: this sweep closes a pane and
     // then releases the check's delivery stamp on the strength of a local
     // observation. An exited pane on another node is not this machine's to reap.
-    listPanes: async () => (await listHostPanes({}, true) || [])
-      .filter((pane) => !nodes.isRemotePane(pane)),
+    // A host that did not answer is null, never an empty list: the sweep reads an
+    // empty list as "no check pane is carrying any agent" and idles every card agent.
+    listPanes: async () => {
+      const panes = await listHostPanes({}, true);
+      return Array.isArray(panes) ? panes.filter((pane) => !nodes.isRemotePane(pane)) : null;
+    },
     sessions: () => periodicScan(),
+    // The orphan pass runs only with an explicit agents module: a test host without
+    // one must never reach the registry this process happens to point at.
+    agents: require('../agents.js'),
     closePane: (pane, sessionId) => closeEphemeralPane(pane, sessionId, { onChange: broadcast }),
     // A closed pane still sits in the host's list. Forget it, or the sweep re-decides
     // about a dead pane on every tick and the `runs` health row never reports idle.
