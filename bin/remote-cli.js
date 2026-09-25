@@ -168,6 +168,9 @@ function requestTimeoutMs(command, args) {
 async function runRemote(command, args, deps = {}) {
   const env = deps.env || process.env;
   const where = deps.where || remoteMode(env);
+  // Said here rather than after a round trip: the daemon would refuse it the same way.
+  const refusal = require('./registry-commands.js').nodeSideRefusal(command, args);
+  if (refusal) return { code: 2, stdout: '', stderr: `keep ${command}: ${refusal}\n` };
   let response;
   try {
     daemonBase(where.url);

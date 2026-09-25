@@ -335,3 +335,18 @@ test('a forwarded tell\'s request outlasts its --wait; every other command keeps
   assert.equal((await runRemote('tell', ['card', '-m', 'hi', '--wait', '2m'], { ...deps, timeoutMs: 5 })).code, 0);
   assert.deepEqual(seen, [REQUEST_TIMEOUT_MS + 2 * 60e3, REQUEST_TIMEOUT_MS, 5]);
 });
+
+test('a tell naming a file on the node, or waiting past a day, is refused on the node and never posted', async (t) => {
+  const { runRemote } = require('./remote-cli.js');
+  const root = tempDir(t);
+  const sent = [];
+  const request = async (...args) => { sent.push(args); return { status: 500, data: '{}' }; };
+  const deps = { where: { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, request, token: 't', env: {}, cwd: root };
+  assert.deepEqual(await runRemote('tell', ['card', '--message-file', 'note.md'], deps), {
+    code: 2, stdout: '', stderr: 'keep tell: --message-file names a file on this node; use -m, or run it from the daemon node\n',
+  });
+  assert.deepEqual(await runRemote('tell', ['card', '-m', 'hi', '--wait', '2d'], deps), {
+    code: 2, stdout: '', stderr: 'keep tell: --wait on a forwarded tell is at most 24h\n',
+  });
+  assert.equal(sent.length, 0);
+});

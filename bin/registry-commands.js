@@ -146,6 +146,10 @@ function argumentRefusal(command, args, identity = {}) {
     if (total > MAX_ARGS_BYTES) return `the arguments are longer than ${MAX_ARGS_BYTES} bytes together`;
     if (arg.includes('\0')) return 'an argument contains a NUL byte';
   }
+  // A tell is framed as a message from the session that sent it; without one the
+  // daemon's CLI would frame a node's text as Owner's own shell.
+  if (command === 'tell' && !identity.session) return TELL_SESSION_REFUSAL;
+  if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return WAIT_CAP_REFUSAL;
   const newline = (arg) => /[\r\n]/.test(arg);
   const NEWLINE = 'only the -m message may contain a newline';
   let positional = false;
@@ -211,11 +215,43 @@ function argumentRefusal(command, args, identity = {}) {
 
 // How long a forwarded command may wait on the daemon beyond an ordinary run: a
 // `tell --wait <duration>` re-asks a busy session until that duration runs out, and
-// both the daemon's subprocess and the node's request must outlast it. Read the way
-// parseArgs reads it (the last --wait wins, -m's value and everything after `--`
-// are not flags); a value that does not parse is 0, and the daemon's CLI answers it
-// with its usage error well inside the ordinary bound.
+// both the daemon's subprocess and the node's request must outlast it.
+//
+// At most a day. A waiting tell does not hold a daemon restart, so its started
+// journal entry is all that stops a resend running it twice, and entries are pruned
+// after a week (registry-route JOURNAL_TTL_MS); a timer set past about 24.8 days
+// also fires at once.
+const MAX_FORWARDED_WAIT_MS = 24 * 3600e3;
+const WAIT_CAP_REFUSAL = '--wait on a forwarded tell is at most 24h';
+const TELL_SESSION_REFUSAL = "a node's tell names the session it is from; run it inside an agent session";
+
 function forwardedWaitMs(command, args) {
+  return Math.min(requestedWaitMs(command, args), MAX_FORWARDED_WAIT_MS);
+}
+
+// What a node can refuse before it posts, from the arguments alone: a file named on
+// the node, and a wait past the cap. The identity rules need the daemon's location
+// record and are left to the route, which applies these two as well.
+function nodeSideRefusal(command, args) {
+  if (!Array.isArray(args)) return null;
+  const fileFlags = Object.prototype.hasOwnProperty.call(NODE_FILE_FLAGS, command) ? NODE_FILE_FLAGS[command] : [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (typeof arg !== 'string') continue;
+    if (arg === '--') break;
+    if (arg === '-m') { i += 1; continue; }
+    const flag = arg.startsWith('--') ? arg.split('=')[0] : null;
+    if (flag && fileFlags.includes(flag)) return `${flag} names a file on this node; use -m, or run it from the daemon node`;
+  }
+  if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return WAIT_CAP_REFUSAL;
+  return null;
+}
+
+// The --wait a forwarded command asks for, read the way parseArgs reads it (the
+// last --wait wins, a value-taking flag takes the next argument, -m's value and
+// everything after `--` are not flags). A value that does not parse is 0: the
+// daemon's CLI answers it with its usage error well inside the ordinary bound.
+function requestedWaitMs(command, args) {
   if (command !== 'tell' || !Array.isArray(args)) return 0;
   let wait = null;
   for (let i = 0; i < args.length; i += 1) {
@@ -232,4 +268,4 @@ function forwardedWaitMs(command, args) {
   try { return require('./wait.js').parseDuration(wait); } catch { return 0; }
 }
 
-module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, NODE_FILE_FLAGS, BOOLEAN_FLAGS, forwardedWaitMs, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, NODE_FILE_FLAGS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, forwardedWaitMs, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

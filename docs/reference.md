@@ -1605,10 +1605,13 @@ neither expires stale markers nor allocates console numbers.
 
 On a pane-only node with `KEEP_DAEMON_URL`, `keep tell` is forwarded to the daemon's
 `POST /api/registry` like the registry commands and runs there under the node session's
-own identity, so the frame, the ledger and the exit statuses are the ones above.
-`--message-file` is refused there, since the path names a file on the node; pass the text
-with `-m`. A `--wait` lengthens both the daemon's run and the node's request by its
-duration, and the waiting run neither holds up the node's other commands nor a restart.
+own identity, so the frame, the ledger and the exit statuses are the ones above. It must
+come from an agent session: a node's tell with none is refused rather than framed as
+Owner's shell. `--message-file` is refused there, since the path names a file on the
+node; pass the text with `-m`. A `--wait` lengthens both the daemon's run and the node's
+request by its duration, and the waiting run neither holds up the node's other commands
+nor a restart. A forwarded `--wait` is at most 24 hours, well inside the week the
+daemon keeps the journal entry that stops a resend running it twice.
 
 A ledger at `.keep/tell.json` allows six tells per sender-recipient pair per rolling
 hour and twenty into any one session per hour; Owner's shell is exempt from the pair

@@ -9,7 +9,8 @@ const { spawnSync } = require('node:child_process');
 
 const { routes, matchRoute, routeDenial } = require('./serve/routes.js');
 const { createRegistryService } = require('./registry-route.js');
-const { REGISTRY_COMMANDS, BOOLEAN_FLAGS, argumentRefusal } = require('./registry-commands.js');
+const { REGISTRY_COMMANDS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, argumentRefusal, forwardedWaitMs, nodeSideRefusal } = require('./registry-commands.js');
+const ME = { session: 'sess-aws1', node: 'aws1' };
 
 const AWS1 = { class: 'node', node: 'aws1' };
 const KEY = 'k-0123456789abcdef';
@@ -214,13 +215,13 @@ test('arguments are checked the way the CLI will read them', (t) => {
 
 test('a node\'s keep tell runs under its own session, and a message file it names on the node is refused', async (t) => {
   assert.ok(REGISTRY_COMMANDS.includes('tell'));
-  assert.equal(argumentRefusal('tell', ['#12', '-m', 'hi', '--wait', '5m', '--dry']), null);
-  assert.equal(argumentRefusal('tell', ['card', '--json', '-m', 'line one\nline two']), null);
-  assert.equal(argumentRefusal('tell', ['card', '-m', '--message-file']), null, 'a message that reads like the flag is still the message');
+  assert.equal(argumentRefusal('tell', ['#12', '-m', 'hi', '--wait', '5m', '--dry'], ME), null);
+  assert.equal(argumentRefusal('tell', ['card', '--json', '-m', 'line one\nline two'], ME), null);
+  assert.equal(argumentRefusal('tell', ['card', '-m', '--message-file'], ME), null, 'a message that reads like the flag is still the message');
   const refusal = '--message-file names a file on this node; use -m, or run it from the daemon node';
-  assert.equal(argumentRefusal('tell', ['card', '--message-file', 'x']), refusal);
-  assert.equal(argumentRefusal('tell', ['card', '--message-file=x']), refusal);
-  assert.equal(argumentRefusal('tell', ['card', '--wait', '--message-file', 'x']), refusal, 'even where it would be read as a value');
+  assert.equal(argumentRefusal('tell', ['card', '--message-file', 'x'], ME), refusal);
+  assert.equal(argumentRefusal('tell', ['card', '--message-file=x'], ME), refusal);
+  assert.equal(argumentRefusal('tell', ['card', '--wait', '--message-file', 'x'], ME), refusal, 'even where it would be read as a value');
 
   const { svc, root, calls } = service(t);
   const told = await svc.handle(AWS1, body(root, { command: 'tell', args: ['#12', '-m', 'hi', '--wait', '5m', '--dry'], idempotencyKey: `${KEY}-tell` }));
@@ -230,6 +231,34 @@ test('a node\'s keep tell runs under its own session, and a message file it name
   const file = await svc.handle(AWS1, body(root, { command: 'tell', args: ['card', '--message-file', 'x'], idempotencyKey: `${KEY}-file` }));
   assert.deepEqual(file, { status: 400, body: { error: refusal } });
   assert.equal(calls.length, 1);
+});
+
+test('a node\'s tell must come from a session, and its wait is at most a day', async (t) => {
+  const anonymous = "a node's tell names the session it is from; run it inside an agent session";
+  assert.equal(argumentRefusal('tell', ['card', '-m', 'hi']), anonymous);
+  assert.equal(argumentRefusal('tell', ['card', '-m', 'hi'], { node: 'aws1' }), anonymous);
+  const { svc, root, calls } = service(t);
+  const bare = await svc.handle(AWS1, body(root, { command: 'tell', args: ['card', '-m', 'hi'], session: null, agent: null, idempotencyKey: `${KEY}-bare` }));
+  assert.deepEqual(bare, { status: 400, body: { error: anonymous } });
+
+  const capped = '--wait on a forwarded tell is at most 24h';
+  assert.equal(MAX_FORWARDED_WAIT_MS, 24 * 3600e3);
+  for (const wait of ['24h', '1d', '1440m']) assert.equal(argumentRefusal('tell', ['card', '-m', 'hi', '--wait', wait], ME), null, wait);
+  for (const wait of ['24.01h', '25h', '2d', '1w', '100w']) {
+    assert.equal(argumentRefusal('tell', ['card', '-m', 'hi', '--wait', wait], ME), capped, wait);
+    assert.equal(nodeSideRefusal('tell', ['card', '-m', 'hi', '--wait', wait]), capped, wait);
+  }
+  assert.equal(forwardedWaitMs('tell', ['card', '--wait', '1w']), MAX_FORWARDED_WAIT_MS, 'never more than the cap');
+  assert.equal(forwardedWaitMs('tell', ['card', '--wait', '2h']), 2 * 3600e3);
+  const long = await svc.handle(AWS1, body(root, { command: 'tell', args: ['card', '-m', 'hi', '--wait', '1w'], idempotencyKey: `${KEY}-long` }));
+  assert.deepEqual(long, { status: 400, body: { error: capped } });
+  assert.equal(calls.length, 0);
+
+  // The node's own check applies only these two rules, not the identity ones.
+  assert.equal(nodeSideRefusal('tell', ['card', '-m', 'hi', '--wait', '24h']), null);
+  assert.equal(nodeSideRefusal('tell', ['card', '--message-file=x']), '--message-file names a file on this node; use -m, or run it from the daemon node');
+  assert.equal(nodeSideRefusal('tell', ['card', '-m', '--message-file']), null);
+  assert.equal(nodeSideRefusal('checkin', ['card', '--message-file', 'x']), null);
 });
 
 test('a tell --wait runs for its wait, beside the node\'s other commands, and does not hold a restart', async (t) => {
