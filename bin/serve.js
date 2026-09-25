@@ -16097,10 +16097,15 @@ async function requireNodeAnswers(node, deps = {}) {
 async function runCheckNow(taskId, deps = {}) {
   const task = (deps.loadTask || keep.loadTask)(taskId);
   if (!task.fm.check) throw new keep.KeepError(`${taskId} has no check recipe`);
+  // A card agent's check goes to the agent's own session, as the scheduler sends it
+  // (runs.js agentHomeSession), never to Owner's or the builder's thread on the card.
+  const agentName = runs.cardAgentName(task);
+  const home = agentName ? runs.agentHomeSession(agentName, task, deps.agents || agents) : '';
   let delivery = null;
-  try { delivery = await (deps.deliverCheckToThread || deliverCheckToThread)(task); }
+  try { delivery = await (deps.deliverCheckToThread || deliverCheckToThread)(task, home ? { candidateIds: [home] } : undefined); }
   catch (error) { delivery = { deferred: true, reason: String(error && error.message || error) }; }
   if (delivery && !delivery.deferred && delivery.sessionId) {
+    if (home && delivery.sessionId === home) runs.noteHomeDelivery(home);
     return { ok: true, delivered: 'thread', sessionId: delivery.sessionId, kind: delivery.kind || 'claude' };
   }
   // `enforce: false`: Owner asked for this check now, so it is neither refused by the

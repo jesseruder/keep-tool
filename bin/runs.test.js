@@ -610,6 +610,20 @@ test('a card agent goes back into its own session, and opens fresh only when tha
       assert.deepEqual(record.homes, { 'some-card': 'sid-home' });
     }
 
+    // A home whose account is spent while the given account has room: one fresh
+    // session there, which becomes the home. Both spent: the budget refusal stands.
+    record = home(); bodies.length = 0; _resetSchedulerState(); refuse = null;
+    const spent = new Set(['claude-home']);
+    const budget = (_task, _today, accountId) => (spent.has(accountId) ? { skipped: 'budget', reason: `${accountId} is spent` } : null);
+    await openFreshCheckSession(task, { ...base, refusal: budget, today: '2026-09-30' });
+    assert.deepEqual(bodies.map((b) => [b.sessionId, b.fresh, b.accountId]), [[undefined, true, 'claude-pool']]);
+    assert.deepEqual(record.homes, { 'some-card': 'sid-new' });
+    record = home(); bodies.length = 0; _resetSchedulerState();
+    spent.add('claude-pool');
+    const held = await openFreshCheckSession(task, { ...base, refusal: budget, today: '2026-10-01' });
+    assert.equal(held.skipped, 'budget');
+    assert.equal(bodies.length, 0);
+
     // A home the card no longer links is not reached through it.
     record = home(); bodies.length = 0; _resetSchedulerState(); refuse = null;
     await openFreshCheckSession(card({ agent: 'redash-daily', sessions: [{ id: 'sid-other', agent: 'claude' }] }), { ...base, today: '2026-09-29' });
@@ -622,7 +636,8 @@ test('an agent that ran before homes were recorded goes back into the card\'s la
   // The check session checked in on the card at 21:22 and emitted its report then.
   const reportedAt = Date.parse('2026-09-24T21:22:00');
   const log = '\n## 2026-09-24 21:22 — check-in (by claude sid-last)\nMoved: two things.\n';
-  const task = card({ agent: 'redash-daily', sessions: [{ id: 'sid-old', agent: 'claude' }, { id: 'sid-last', agent: 'claude' }] });
+  const task = card({ agent: 'redash-daily', sessions: [{ id: 'sid-old', agent: 'claude', at: '2026-09-23T07:30' },
+    { id: 'sid-last', agent: 'claude', at: '2026-09-24T21:18' }] });
   task.body = log;
   const api = (record) => ({ readRecord: () => record });
   const base = { name: 'redash-daily', role: 'scheduled check', card: '', lastEvent: { card: 'some-card', at: reportedAt } };
@@ -630,8 +645,11 @@ test('an agent that ran before homes were recorded goes back into the card\'s la
   assert.equal(agentHomeSession('redash-daily', task, api({ ...base, lastEvent: { card: 'other-card', at: reportedAt } })), '');
   assert.equal(agentHomeSession('redash-daily', task, api({ ...base, lastEvent: { card: 'some-card', at: reportedAt + 5 * 3600e3 } })), '',
     'a check-in hours away from the report is not the agent\'s');
-  const later = { ...task, fm: { ...task.fm, sessions: [...task.fm.sessions, { id: 'sid-owner', agent: 'claude' }] } };
+  const later = { ...task, fm: { ...task.fm, sessions: [...task.fm.sessions, { id: 'sid-owner', agent: 'claude', at: '2026-09-24T22:00' }] } };
   assert.equal(agentHomeSession('redash-daily', later, api(base)), '', 'Owner\'s session linked later never checked in as the agent');
+  // Nor when he checked in by name soon after the report: he was linked after it.
+  const ownerCheckin = { ...later, body: log + '\n## 2026-09-24 22:05 — check-in (by claude sid-owner)\nRead it.\n' };
+  assert.equal(agentHomeSession('redash-daily', ownerCheckin, api(base)), '');
   assert.equal(agentHomeSession('redash-daily', task, api({ ...base, homes: { 'some-card': 'sid-old' } })), 'sid-old');
   assert.equal(agentHomeSession('redash-daily', task, api({ ...base, homes: { 'some-card': 'sid-gone' } })), '', 'no longer linked');
   assert.equal(agentHomeSession('redash-daily', task, api({ ...base, homes: { 'some-card': '' } })), '', 'forgotten');
@@ -653,6 +671,30 @@ test('when a check was typed into a home survives a daemon restart', () => {
     assert.equal(runs.homeDeliveredAt('sid-home'), at, 'read back from the scheduler state file');
     assert.equal(runs.homeDeliveredAt('sid-other'), 0);
   } finally { runs._resetSchedulerState(); }
+});
+
+test('the sweep forgets a home whose agent exited without a check-in, and keeps one that finished', async () => {
+  for (const exited of [true, false]) {
+    const written = [];
+    const records = { 'redash-daily': { name: 'redash-daily', role: 'scheduled check', session: { id: 'sid-home' }, homes: { 'some-card': 'sid-home', other: 'sid-x' } } };
+    const now = 1_000_000 + 5 * 3600e3;
+    await sweepEphemeralPanes({
+      listPanes: async () => [ephemeralPane({ id: 'home-pane', alive: !exited, meta: { card: 'some-card', sessionId: 'sid-home', agentName: 'redash-daily' } })],
+      sessions: async () => [{ id: 'sid-home', endedTurn: true, mtime: 1_000_000 }],
+      closePane: async () => {},
+      checkinTask: () => {},
+      loadTask: () => card(),
+      agents: {
+        records: () => Object.values(records),
+        readRecord: (name) => records[name] || null,
+        writeRecord: (name, patch) => { written.push([name, patch]); },
+        flushCommits: () => true,
+      },
+    }, now);
+    const patch = written.find(([name]) => name === 'redash-daily')[1];
+    if (exited) assert.deepEqual(patch.homes, { 'some-card': '', other: 'sid-x' }, 'exited with nothing recorded: forgotten');
+    else assert.equal(patch.homes, undefined, 'idle past the limit is not a failed resume: the home stays');
+  }
 });
 
 test('the sweep idles an agent whose check pane it closed, or whose pane lost the mark', async () => {
@@ -1295,19 +1337,27 @@ test('a recurring card agent check is typed into its own session, waits for it w
         runs.setEphemeralHost({ listPanes: async () => [], sessions: async () => [], closePane: async () => {} });
         (async () => {
           for (let i = 0; i < 3; i++) await runs.schedulerTick();
-          process.stdout.write(JSON.stringify({ delivered, opened, homes: agents.readRecord('redash-daily').homes }));
+          let stamp = null;
+          try { stamp = JSON.parse(require('fs').readFileSync(require('path').join(process.env.KEEP_DIR, '.keep', 'runs', 'daily-card.delivered.json'), 'utf8')); } catch {}
+          process.stdout.write(JSON.stringify({ delivered, opened, stamp, homes: agents.readRecord('redash-daily').homes }));
         })();
       `;
       const state = JSON.parse(execFileSync(process.execPath, ['-e', script], {
         encoding: 'utf8', env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_NO_COMMIT: '1' },
       }));
       assert.deepEqual(state.delivered[0], ['sid-home'], 'only the agent\'s session is a candidate, not the card\'s builder');
-      if (mode === 'live') assert.deepEqual(state.opened, [], 'typed into the live session: nothing opened');
+      if (mode === 'live') {
+        assert.deepEqual(state.opened, [], 'typed into the live session: nothing opened');
+        assert.equal(state.stamp && state.stamp.sessionId, 'sid-home');
+        assert.equal(state.stamp.ttlMs, 2 * 3600e3, 'the stamp expires like a fresh open\'s: nobody watches a home');
+      }
       else if (mode === 'busy') {
-        assert.deepEqual(state.opened, [], 'a busy home is waited for past the deferral limit, never opened beside');
-        assert.ok(state.delivered.length >= 2, 'and offered the check again on later ticks');
+        assert.ok(state.delivered.length >= 2, 'a busy home is offered the check again on later ticks');
+        assert.deepEqual(state.opened, [{ taskId: 'daily-card', fresh: true }],
+          'and, stuck past the deferral limit, abandoned for one fresh session');
+        assert.deepEqual(state.homes, { 'daily-card': 'sid-new' }, 'which is the home from then on');
       } else assert.deepEqual(state.opened, [{ taskId: 'daily-card', sessionId: 'sid-home' }], 'resumed, not fresh');
-      assert.deepEqual(state.homes, { 'daily-card': 'sid-home' });
+      if (mode !== 'busy') assert.deepEqual(state.homes, { 'daily-card': 'sid-home' });
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

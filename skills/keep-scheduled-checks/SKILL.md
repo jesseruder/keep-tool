@@ -51,9 +51,10 @@ daemon polls due recipes every minute.
   under Agents in the console (working on the card, idle when its pane is reaped) and
   `keep agents emit <name> …` from it lands on that agent's feed. Every check goes back
   into the same session: typed in if its pane is up, resumed if it was reaped. A fresh
-  session opens only the first time, or when that one cannot be resumed (say it runs on
-  another node than the agent's placement), and it becomes the agent's session from then
-  on. Use it for a daily review or any recurring check Owner wants to see as an agent
+  session opens only the first time, when that one cannot be resumed (it runs on another
+  node than the agent's placement, or its last resume exited without a result), when its
+  account is out of budget and the checks account is not, or when it stays busy past the
+  deferral limit; the fresh one becomes the agent's session from then on. Use it for a daily review or any recurring check Owner wants to see as an agent
   rather than a card.
 
 ## Say what a pass means

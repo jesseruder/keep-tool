@@ -474,8 +474,9 @@ function cardAgent(task, root = keep.ROOT) {
 // An agent that ran before homes were recorded has none. Its home is then the
 // card's last linked Claude session, but only on evidence that session was the
 // agent: a check-in on the card attributed to it by id, within two hours of the agent's last event on
-// this card (a check session checks in and emits its report together). Owner's
-// own session on the card, linked later, has no such check-in and is not taken.
+// this card (a check session checks in and emits its report together), and it was
+// linked to the card before that event. Owner's own session on the card is linked
+// later, when he comes to read the report, and is not taken.
 // Empty when there is none, and a fresh session is opened as before.
 //
 // Only a record in the 'scheduled check' role has a home, which is also what keeps
@@ -497,6 +498,9 @@ function agentHomeSession(agentName, task, agentApi, root = keep.ROOT) {
   const event = record.lastEvent;
   const last = linked.slice(-1)[0];
   if (!last || !event || event.card !== task.id || !Number(event.at)) return '';
+  // Linked after the agent reported, it is somebody who came to read the report.
+  const linkedAt = stampMs(last.at);
+  if (!linkedAt || linkedAt > Number(event.at)) return '';
   const checkedIn = checkinFromSessionAt(task, last.id, 0, true);
   return checkedIn && Math.abs(checkedIn - Number(event.at)) <= HOME_EVIDENCE_MS ? last.id : '';
 }
@@ -857,11 +861,25 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
   const agentApi = opts.agents || require('./agents.js');
   // A card agent goes back into its own session, which runs on its own account: the
   // budget is that account's, not the pool's pick for a fresh session.
+  //
+  // A home whose account is out of budget while the account this open was given
+  // (the pool's pick, or the budget fallback's) has room is passed over: the check
+  // runs in a fresh session there, which becomes the home. Waiting for the home's
+  // account would hold the check past the fallback that exists for exactly this.
   let agentName = (opts.cardAgent || cardAgent)(task, root);
-  const home = agentName ? agentHomeSession(agentName, task, agentApi, root) : '';
+  let home = agentName ? agentHomeSession(agentName, task, agentApi, root) : '';
   const homeAccountId = home ? (opts.sessionAccountId || sessionAccountId)(home, root) : '';
   if (enforce) {
-    const refusal = (opts.refusal || freshOpenRefusal)(task, today, homeAccountId || accountId);
+    const refuse = opts.refusal || freshOpenRefusal;
+    let refusal = refuse(task, today, homeAccountId || accountId);
+    if (refusal && refusal.skipped === 'budget' && homeAccountId && accountId && homeAccountId !== accountId) {
+      const elsewhere = refuse(task, today, accountId);
+      if (!elsewhere) {
+        process.stderr.write(`keep runs: agent ${agentName}'s session for ${task.id} is on ${homeAccountId}, which is out of budget; opening a fresh session on ${accountId}\n`);
+        home = '';
+      }
+      refusal = elsewhere;
+    }
     if (refusal) return { ...refusal, errors: [] };
   }
   // Reserved before the await, not counted after it. Opening a session is async, and
@@ -898,8 +916,9 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
     // check to it if its pane is up (deliverToThread), so this resumes a reaped one;
     // `resumeClosedOnly` makes the open refuse (HOME_LIVE) rather than type into a
     // pane that turned out to be up, which may be mid-turn — that is a deferral, and
-    // the next tick offers it again. A resume keeps the session's own account and
-    // model, so neither is passed.
+    // the next tick offers it again. A resume keeps the session's own account, so none
+    // is passed; the check model is, as on a fresh open (a Claude resume with no
+    // --model runs settings.json's).
     //
     // Exactly one refusal falls through to a fresh session: SESSION_ELSEWHERE, the
     // session runs on another node than the agent is placed on, decided before
@@ -908,7 +927,8 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
     // late failure may already have started.
     if (home && home === homeSessionIfStill(agentApi, agentName, task, home, root)) {
       try {
-        opened = await open({ taskId: task.id, sessionId: home, agentName, message }, { resumeClosedOnly: true });
+        opened = await open({ taskId: task.id, sessionId: home, agentName, message,
+          ...(CHECK_MODEL ? { model: CHECK_MODEL } : {}) }, { resumeClosedOnly: true });
       } catch (error) {
         const code = error && (error.code || (error.extra && error.extra.code));
         if (code === 'HOME_LIVE') {
@@ -1227,8 +1247,19 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
       try {
         const agentApi = host.agents;
         const record = agentApi.readRecord(agentName);
+        // A home whose agent exited without recording anything cannot be trusted to
+        // resume (a transcript that will not load, a project that moved): forgotten,
+        // so the reopen and every later run open fresh instead of failing the same way.
+        const homes = record && record.homes && typeof record.homes === 'object' ? record.homes : {};
+        const card = pane.meta.card || '';
+        const forget = !decision.checkedIn && decision.reason === 'the agent has exited'
+          && card && homes[card] === sessionId;
         if (record && record.session && record.session.id === sessionId) {
-          agentApi.writeRecord(agentName, { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } });
+          agentApi.writeRecord(agentName, { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 },
+            ...(forget ? { homes: { ...homes, [card]: '' } } : {}) });
+          agentApi.flushCommits();
+        } else if (forget) {
+          agentApi.writeRecord(agentName, { homes: { ...homes, [card]: '' } });
           agentApi.flushCommits();
         }
       } catch (e) {
@@ -1532,12 +1563,17 @@ async function schedulerTick() {
       // thread (the one that set the card up is not the agent), recurring or not.
       // When that session is not up, the open below resumes it.
       const agentName = cardAgentName(t);
-      const home = agentName ? agentHomeSession(agentName, t, require('./agents.js')) : '';
-      // A busy home is waited for, however long: typing into it would land the check
-      // in the middle of other work, and opening beside it is the second session this
-      // exists to prevent. So the deferral limit does not apply to it: it is offered
-      // the check again on every tick until it is idle.
-      if (home) threadBusy = false;
+      let home = agentName ? agentHomeSession(agentName, t, require('./agents.js')) : '';
+      // A busy home is waited for up to the deferral limit, offered the check on every
+      // tick: typing into it would land the check in the middle of other work. Past
+      // the limit it is stuck (a turn that never ends, a prompt nobody answers, a send
+      // that always fails), so the check opens fresh as any card's does, and that
+      // session becomes the home.
+      if (home && threadBusy) {
+        process.stderr.write(`keep runs: agent ${agentName}'s session ${home.slice(0, 8)} for ${t.id} stayed busy past the deferral limit; opening a fresh session\n`);
+        forgetAgentHome(require('./agents.js'), agentName, t.id);
+        home = '';
+      }
       if (!threadBusy && (!recurring || home)) {
         let delivery = null;
         try {
@@ -1556,9 +1592,21 @@ async function schedulerTick() {
             deferrals: deferred,
             maxDeferrals: MAX_DELIVER_DEFERRALS,
           }) === 'open-after-deferrals';
-          if (!threadBusy || home) continue;
+          if (!threadBusy) continue;
+          if (home) {
+            process.stderr.write(`keep runs: agent ${agentName}'s session ${home.slice(0, 8)} for ${t.id} stayed busy past the deferral limit; opening a fresh session\n`);
+            forgetAgentHome(require('./agents.js'), agentName, t.id);
+            home = '';
+          }
         } else if (delivery) {
-          if (home && delivery.sessionId === home) noteHomeDelivery(home);
+          // Nobody watches a home the way Owner watches a thread: if its pane goes
+          // away without a result (a host restart drops it from the listing without
+          // ever reading dead), the stamp expires like a fresh open's and the card is
+          // due again, instead of standing until check_after moves.
+          if (home && delivery.sessionId === home) {
+            noteHomeDelivery(home);
+            delivery = { ...delivery, ttlMs: FRESH_OPEN_STAMP_TTL_MS };
+          }
           try {
             writeDeliveryStamp(t, delivery);
             require('./delivery').acknowledge(path.join(keep.ROOT, '.keep', 'delivery'), checkDeliveryMessage(t), checkDeliveryKey(t));
@@ -1650,7 +1698,7 @@ function startScheduler() {
 
 module.exports = {
   checkInFlight, retryPending, startScheduler, schedulerTick, setOnChange, setDeliverer, setOpener, setEphemeralHost,
-  openFreshCheckSession, agentHomeSession, noteHomeDelivery, homeDeliveredAt, checksAccountId, checkBudget, budgetDeferralReason, noteBudgetDeferral,
+  openFreshCheckSession, agentHomeSession, cardAgentName, noteHomeDelivery, homeDeliveredAt, checksAccountId, checkBudget, budgetDeferralReason, noteBudgetDeferral,
   checksFallbackAccountId, recordBudgetDeferral, clearBudgetDeferral, noteStalledCheck,
   escalateBudgetDeferral, handleBudgetDeferral, MAX_FALLBACK_ATTEMPTS,
   freshOpenRefusal, resetTickAllowance, loadSchedulerState, releaseUnfinishedCheck,
