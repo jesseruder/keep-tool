@@ -152,7 +152,12 @@ config directory where that is the unit.
 - **Settings.** `settings.json` keys, hooks and permissions per config directory; the
   audit compares them key by key.
 - **Codex.** `config.toml` model defaults, MCP servers and profiles, `AGENTS.md` and
-  skills, in each Codex profile directory.
+  skills, in each Codex profile directory. On Ubuntu 24.04 and later the Codex command
+  sandbox (bubblewrap) also needs unprivileged user namespaces, which AppArmor restricts
+  by default: every command a job runs then fails with `bwrap: loopback: Failed
+  RTM_NEWADDR: Operation not permitted` and the job returns having read nothing. Set
+  `kernel.apparmor_restrict_unprivileged_userns = 0` in a file under `/etc/sysctl.d/`
+  and apply it with `sysctl --system`; `unshare -Urn true` succeeds once it is in effect.
 - **Pi.** `settings.json`, `models.json` (without its keys), skills and extensions.
 - **`~/bin` scripts and dotfiles.** The scripts your sessions call, and the shell rc lines
   that set `PATH` and the SDK variables.
