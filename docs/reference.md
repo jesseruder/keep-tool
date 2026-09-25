@@ -211,25 +211,33 @@ desktop the module builds nothing at all.
 ### Predictive typing
 
 A pane on another node echoes a keystroke only after a round trip and the agent's
-render, so the console draws the character itself first (`web/app/predict-typing.js`).
+render, so the console shows the character itself first (`web/app/predict-typing.js`).
 It predicts only in the input box of a Claude session (the pane's host meta names the
-`claude` agent); Codex sessions echo normally, because Codex redraws only the cells that
-changed, so its echo of exactly what a guess shows would leave nothing to confirm it by.
+`claude` agent); Codex sessions echo normally.
 The cursor's line starts with Claude Code's `❯` and a space, the cursor is past them at the end of the typed text and more
 than three cells from the right edge, the screen is the normal one, no selection or IME
 composition is in progress, and the key is Backspace or one character xterm always
 draws one cell wide (printable ASCII, Latin-1, Latin Extended-A and -B). Pastes, Enter,
 arrows, menus, dialogs and shell panes are never predicted or measured, and nothing
-sent to the pane changes. Echoes are acknowledged oldest keystroke first. A predicted character is written plain,
-with no attribute or saved-cursor change to the pane's stream, and an xterm decoration
-(`.keep-predicted-cell`) dims and underlines it until the agent's echo confirms it; a dim
-placeholder is cleared by the first one. An echo is output that changes the prompt line
-or the cursor column from what the guesses left, or erases or shifts cells on that row
-(Claude Code's whole-line redraw ends with an erase); a bare cursor move onto the row is
-not one. A mark that lingers (up to 5 s) means the character was never echoed. From a guess until the pane's own output
-redraws the prompt row or moves the cursor (even if the guess expires first), a
-cursor-position query from the pane (`CSI 6 n`, `CSI ? 6 n`) is answered with the column
-the pane's own output left, not the one the guesses moved the cursor to. No guess is
+sent to the pane changes. A guess is never written into xterm's buffer and never moves
+its cursor: Claude Code's renderer sends a diff of changed cells placed with relative
+cursor moves (a trailing space echoes as a bare cursor-forward), so a cursor a guess had
+moved would land every such move one cell off. Instead each guessed character is an
+xterm decoration (`.keep-predicted-cell`, underlined until confirmed) that draws the
+character over an opaque cell, at the pane's cursor column plus the net advance of the
+keystrokes before it; a Backspace guess blanks the pane's character (`.keep-predicted-blank`)
+or takes back a guessed one; a stand-in block cursor (`.keep-predicted-cursor`) sits after
+the guesses, and a dim placeholder past it is veiled. While a guess stands the real cursor
+is hidden (`CSI ? 25 l`; hide and show are the only bytes the predictor writes), again after each frame of
+the pane's that shows it; when the last guess is confirmed, dropped or reset, the cursor
+visibility the pane itself last set is put back. Echoes are acknowledged oldest keystroke
+first, by comparing the input text before the pane's cursor with the text each keystroke
+should leave; after every settled chunk of output the remaining overlays are laid out again
+from where the pane's cursor now is. Output that shows neither the text before the oldest
+pending keystroke nor any expected text (a completion, a submitted prompt) drops the chain
+and its overlays. A mark that lingers (up to 5 s) means the character was never echoed.
+Cursor-position queries from the pane are answered by xterm as always, since the cursor is
+the pane's. No guess is
 made while the pane's output is still queued in xterm, since the screen it would be
 drawn from is stale. The session Actions menu
 carries a per-viewer **Predict typing** setting (`keep.console.predictTyping` in
