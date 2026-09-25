@@ -348,7 +348,7 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
   const child = childRollout(event, sid, transcriptPath);
   if (child) {
     snapshot = null;
-    if (input && !input.agent_id) input = { ...input, agent_id: child };
+    if (input && !input.agent_id && /^[A-Za-z0-9_-]{1,160}$/.test(child)) input = { ...input, agent_id: child };
   }
   const send = async (payload) => {
     const left = deadline - now();
