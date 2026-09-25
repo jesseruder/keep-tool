@@ -12,6 +12,10 @@ const health = require('./health.js');
 const accounts = require('./accounts.js');
 
 const CLAUDE_REFRESH_MS = 5 * 60e3;
+// A stored access token this close to its expiry is not asked with: Claude Code
+// refreshes its own token only when it runs, so an account nobody has used for a few
+// hours holds a lapsed one, and the endpoint's 401 for it says nothing about the login.
+const TOKEN_EXPIRY_MARGIN_MS = 60e3;
 const CODEX_REFRESH_MS = 5 * 60e3;
 const INITIAL_BACKOFF_MS = 4 * 60e3;
 const MAX_BACKOFF_MS = 29 * 60e3;
@@ -41,6 +45,9 @@ function shortError(source, error) {
   if (code === 'timeout') return 'request timed out';
   if (code === 'response') return 'invalid response';
   if (code === 'not-found') return 'no recent rate-limit snapshot';
+  // Only a token that should still be good reaches the endpoint (fetchClaudeUsage), so
+  // a 401 is a login the server no longer accepts.
+  if (source === 'Claude' && code === 401) return 'HTTP 401: login rejected; sign in again with Claude Code on this account';
   // A Codex scan's fs error names the sessions dir; a Claude socket error (ENOTFOUND,
   // ECONNRESET) carries the same shape of code and must not.
   if (source === 'Codex' && typeof code === 'string' && /^E[A-Z]+$/.test(code)) return `sessions unreadable (${code})`;
@@ -151,20 +158,26 @@ function claudeCredentialService(account, env = process.env) {
   return `Claude Code${oauthSuffix}-credentials-${suffix}`;
 }
 
-function credentialsToken(text) {
+function credentialsOf(text) {
   let credentials;
   try { credentials = JSON.parse(text); } catch { throw codedError('credentials'); }
-  const token = credentials && credentials.claudeAiOauth && credentials.claudeAiOauth.accessToken;
+  const oauth = credentials && credentials.claudeAiOauth;
+  const token = oauth && oauth.accessToken;
   if (typeof token !== 'string' || !token) throw codedError('credentials');
-  return token;
+  const expiresAt = Number(oauth.expiresAt);
+  return { accessToken: token, expiresAt: Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : null };
 }
 
 function claudeToken(account, deps = {}) {
+  return claudeCredentials(account, deps).then((credentials) => credentials.accessToken);
+}
+
+function claudeCredentials(account, deps = {}) {
   const platform = deps.platform || process.platform;
   const env = deps.env || process.env;
   const fileSystem = deps.fs || fs;
   if (platform !== 'darwin') {
-    return Promise.resolve().then(() => credentialsToken(
+    return Promise.resolve().then(() => credentialsOf(
       fileSystem.readFileSync(path.join(account.configDir, '.credentials.json'), 'utf8'),
     )).catch(() => { throw codedError('credentials'); });
   }
@@ -180,15 +193,22 @@ function claudeToken(account, deps = {}) {
       encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10e3,
     }, (error, stdout) => {
       if (error) return reject(codedError('credentials'));
-      try { resolve(credentialsToken(stdout)); } catch (credentialError) { reject(credentialError); }
+      try { resolve(credentialsOf(stdout)); } catch (credentialError) { reject(credentialError); }
     });
   });
 }
 
-async function fetchClaudeUsage(account, deps = {}) {
-  const token = await claudeToken(account, deps);
+// `previous` is the account's last snapshot: an idle account keeps it, marked idle,
+// rather than trading it for an error.
+async function fetchClaudeUsage(account, deps = {}, previous = null) {
+  const { accessToken: token, expiresAt } = await claudeCredentials(account, deps);
   const http = deps.https || https;
   const now = deps.now || Date.now;
+  if (expiresAt !== null && expiresAt - now() <= TOKEN_EXPIRY_MARGIN_MS) {
+    const kept = previous && Array.isArray(previous.limits)
+      ? { limits: previous.limits, fetchedAt: previous.fetchedAt ?? null } : emptySnapshot('claude');
+    return { ...kept, idle: true, idleDetail: 'token lapsed while idle; Claude Code refreshes it when it next runs on this account' };
+  }
   const body = await new Promise((resolve, reject) => {
     const req = http.get('https://api.anthropic.com/api/oauth/usage', {
       headers: { Authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20' },
@@ -500,9 +520,9 @@ function createUsageManager(deps = {}) {
     } catch {}
   }
 
-  async function refreshAccount(stateAccount) {
+  async function refreshAccount(stateAccount, snapshot) {
     return stateAccount.agent === 'claude'
-      ? fetchClaudeUsage(stateAccount, deps)
+      ? fetchClaudeUsage(stateAccount, deps, snapshot)
       : Promise.resolve().then(() => scanCodexAccount(stateAccount, deps));
   }
 
@@ -557,7 +577,7 @@ function createUsageManager(deps = {}) {
   function idleDetail() {
     const idle = [...states.values()].filter((state) => state.snapshot.idle === true);
     if (!idle.length) return null;
-    return idle.map((state) => `${state.account.label || state.account.id}: no sessions in ${CODEX_SCAN_DAYS} days`).join('; ');
+    return idle.map((state) => `${state.account.label || state.account.id}: ${state.snapshot.idleDetail || `no sessions in ${CODEX_SCAN_DAYS} days`}`).join('; ');
   }
 
   function requestRefresh(now = clock(), performRefresh = refreshAccount) {

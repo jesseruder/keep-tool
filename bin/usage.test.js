@@ -297,6 +297,83 @@ test('Claude HTTP 429 carries Retry-After into cooldown handling', async () => {
   }), (error) => error.code === 429 && error.retryAfter === '1200');
 });
 
+test('a lapsed Claude token is an idle reading: no request, the last snapshot kept, the row healthy', async () => {
+  const account = { id: 'claude-tertiary', label: 'Tertiary', agent: 'claude', configDir: '/profiles/tertiary' };
+  const firstAt = 10 ** 12;
+  let expiresAt = firstAt + 3600e3;
+  let requests = 0;
+  const fakeHttps = { get: (_url, _options, callback) => {
+    requests += 1;
+    const request = new EventEmitter();
+    request.setTimeout = () => {};
+    request.destroy = (error) => request.emit('error', error);
+    const response = new EventEmitter();
+    response.statusCode = 200;
+    response.setEncoding = () => {};
+    setImmediate(() => { callback(response); response.emit('data', JSON.stringify({ limits: [{ kind: 'session', percent: 12 }] })); response.emit('end'); });
+    return request;
+  } };
+  const records = [];
+  let currentTime = firstAt;
+  const manager = createUsageManager({
+    accounts: { list: () => [account], defaultFor: () => account },
+    health: { record: (name, options) => records.push(options) },
+    now: () => currentTime, platform: 'linux', https: fakeHttps,
+    fs: { readFileSync: () => JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-token', expiresAt } }) },
+  });
+  manager.requestRefresh(currentTime);
+  await settleRefresh();
+  assert.equal(requests, 1);
+  assert.equal(manager._view().accounts['claude-tertiary'].limits[0].percent, 12);
+
+  // Idle for hours: the stored token lapsed, and nothing is asked with it.
+  expiresAt = firstAt + 60e3;
+  currentTime = firstAt + 10 * 60e3;
+  manager.requestRefresh(currentTime);
+  await settleRefresh();
+  assert.equal(requests, 1, 'a lapsed token is never sent');
+  const view = manager._view().accounts['claude-tertiary'];
+  assert.equal(view.error, undefined);
+  assert.equal(view.idle, true);
+  assert.equal(view.limits[0].percent, 12, 'the last reading stands, with its own fetchedAt');
+  assert.equal(view.fetchedAt, firstAt);
+  assert.equal(records.at(-1).ok, true);
+  assert.match(records.at(-1).detail, /Tertiary: token lapsed while idle/);
+
+  // Claude Code ran on it and refreshed the token: the next due refresh reads again.
+  expiresAt = firstAt + 20 * 3600e3;
+  currentTime = firstAt + 20 * 60e3;
+  manager.requestRefresh(currentTime);
+  await settleRefresh();
+  assert.equal(requests, 2);
+  assert.equal(manager._view().accounts['claude-tertiary'].idle, undefined);
+});
+
+test('a 401 for a token that should still be good says the login was rejected', async () => {
+  const account = accountFixture().list()[1];
+  const records = [];
+  const fakeHttps = { get: (_url, _options, callback) => {
+    const request = new EventEmitter();
+    request.setTimeout = () => {};
+    request.destroy = (error) => request.emit('error', error);
+    const response = new EventEmitter();
+    response.statusCode = 401;
+    response.setEncoding = () => {};
+    setImmediate(() => { callback(response); response.emit('end'); });
+    return request;
+  } };
+  const manager = createUsageManager({
+    accounts: { list: () => [account], defaultFor: () => account },
+    health: { record: (name, options) => records.push(options) },
+    now: () => 10 ** 12, platform: 'linux', https: fakeHttps,
+    fs: { readFileSync: () => JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-token', expiresAt: 10 ** 12 + 3600e3 } }) },
+  });
+  manager.requestRefresh(10 ** 12);
+  await settleRefresh();
+  assert.equal(records.at(-1).ok, false);
+  assert.match(records.at(-1).error, /Work: HTTP 401: login rejected/);
+});
+
 test('account refresh failures have separate cooldowns, snapshots, and default compatibility view', async () => {
   const fixture = accountFixture();
   const calls = [];
