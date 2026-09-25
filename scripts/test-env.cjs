@@ -15,13 +15,14 @@ if (process.env.NODE_TEST_CONTEXT) {
   // block, features, scopes, placement, the pane and account it runs as, and on a
   // non-daemon node that node's identity, daemon address and live host socket. Any of
   // it changes what a fixture CLI does (a registry write sent to the real daemon, a
-  // feature switched off), so the suite starts from none of it. KEEP_TEST_* knobs are
-  // the caller's to pass through. A child forked by a test runs this preload again
+  // feature switched off), so the suite starts from none of it. KEEP_TEST_* knobs and
+  // the browser-suite controls below are the caller's to pass through. A child forked by a test runs this preload again
   // (fork keeps execArgv) with the KEEP_* env its test gave it, so the sweep runs
   // once, in the test file's own process.
+  const callerControls = new Set(['KEEP_BROWSER_TEST', 'KEEP_CHROME', 'KEEP_SHOT_DIR']);
   if (!process.env.KEEP_TEST_ENV_SCRUBBED) {
     for (const name of Object.keys(process.env)) {
-      if (name.startsWith('KEEP_') && !name.startsWith('KEEP_TEST_')) delete process.env[name];
+      if (name.startsWith('KEEP_') && !name.startsWith('KEEP_TEST_') && !callerControls.has(name)) delete process.env[name];
     }
     process.env.KEEP_TEST_ENV_SCRUBBED = '1';
   }
