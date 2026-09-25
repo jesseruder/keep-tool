@@ -235,6 +235,43 @@ test('a command still running on the daemon is resent with its key until it answ
   assert.equal(tries.length, RETRY_WAITS_MS.length + 1);
 });
 
+// The daemon's ping says how long a command may run there; the node follows it past
+// its own four-hour floor, and keeps the floor only for a daemon that says nothing.
+test('a command still running is waited on for as long as the daemon\'s ping says it may run', async (t) => {
+  const { postWithRetry, RESEND_HORIZON_MS, REQUEST_TIMEOUT_MS } = require('./remote-cli.js');
+  const payload = { command: 'open', args: ['card'], cwd: '/', idempotencyKey: 'k'.repeat(32) };
+  const run = async (pingBody) => {
+    let clock = 0;
+    const posts = [];
+    const notes = [];
+    const error = await postWithRetry({ local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, '/api/registry', payload, {
+      token: 't', timeoutMs: 900e3, now: () => clock,
+      request: async (url, pathname, options) => {
+        if (pathname === '/api/registry/ping') return { status: 200, data: JSON.stringify(pingBody) };
+        posts.push(options.payload);
+        clock += options.timeoutMs;
+        throw Object.assign(new Error('timed out after 900s'), { timedOut: true });
+      },
+      sleep: async () => { throw new Error('no backoff wait expected'); }, note: (line) => notes.push(line),
+    }).then(() => null, (failure) => failure);
+    return { error, posts, notes, clock };
+  };
+  const advertised = 245 * 60e3;
+  const followed = await run({ ok: true, maxRunMs: advertised });
+  assert.ok(followed.clock > RESEND_HORIZON_MS, 'it kept resending past four hours');
+  assert.ok(followed.clock >= advertised + REQUEST_TIMEOUT_MS, 'and stopped only past the bound plus a post');
+  assert.ok(followed.clock < advertised + REQUEST_TIMEOUT_MS + 900e3, 'at the first ping past it');
+  assert.equal(followed.error.horizon, true);
+  assert.match(followed.error.message, new RegExp(`under key ${'k'.repeat(32)}`));
+  assert.equal(followed.notes[0], 'keep open: still running on the daemon on main (allowed up to 245 min), waiting…\n');
+
+  const older = await run({ ok: true });
+  assert.equal(older.clock, RESEND_HORIZON_MS, 'a daemon that advertises nothing gets the four-hour floor');
+  assert.equal(older.error.horizon, true);
+  assert.match(older.error.message, new RegExp(`under key ${'k'.repeat(32)}`));
+  assert.equal(older.notes[0], 'keep open: still running on the daemon on main, waiting…\n');
+});
+
 test('a command still running on the daemon is waited on up to the horizon, which names its key', async (t) => {
   const { postWithRetry, RESEND_HORIZON_MS } = require('./remote-cli.js');
   assert.equal(RESEND_HORIZON_MS, 4 * 3600e3);

@@ -124,11 +124,15 @@ const PING_TIMEOUT_MS = 3000;
 // How long a node keeps resending a command the daemon is still running. A post
 // that times out is not a daemon that went away: the daemon's journaled() holds a
 // resend of the same key on the run still in flight and answers it with that run's
-// result, so the node resends for as long as the daemon answers its ping. Four hours
-// is longer than any bound the daemon derives from a supported setting (an open
-// with KEEP_COMPACT_TIMEOUT_MS at an hour is about two); a person who has waited
-// that long should look at the daemon rather than wait on. A waiting tell's own post
-// may already be a day long, so the horizon is never shorter than two of its posts.
+// result, so the node resends for as long as the daemon answers its ping.
+//
+// The daemon says how long that may be: its ping advertises `maxRunMs`, the longest
+// run it allows any forwarded command, derived from its own settings (an open's
+// bound grows with KEEP_COMPACT_TIMEOUT_MS, which takes any value). The node waits
+// that plus one ordinary post as margin, re-read on every ping so a daemon
+// restarted with another setting mid-wait is followed. An older daemon that
+// advertises nothing is given these four hours. Either way the horizon is never
+// shorter than two of the command's own posts (a waiting tell's may be a day long).
 const RESEND_HORIZON_MS = 4 * 3600e3;
 
 // Posts, and when there was no answer at all waits with backoff until the daemon
@@ -141,7 +145,7 @@ const RESEND_HORIZON_MS = 4 * 3600e3;
 // A post that timed out while the daemon still answers its ping is a command still
 // running there, and does not spend that budget: it is resent at once with the same
 // payload, and a line on stderr says the command is still running, until the answer
-// comes or RESEND_HORIZON_MS has passed since the first post.
+// comes or the horizon above has passed since the first post.
 async function postWithRetry(where, pathname, payload, deps = {}) {
   const request = deps.request || nodeApiRequest;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -150,16 +154,25 @@ async function postWithRetry(where, pathname, payload, deps = {}) {
   const now = deps.now || Date.now;
   const note = deps.note || ((line) => { try { process.stderr.write(line); } catch {} });
   const label = deps.label || `keep ${payload && payload.command ? payload.command : 'request'}`;
-  const horizon = Math.max(deps.resendHorizonMs ?? RESEND_HORIZON_MS, 2 * (deps.timeoutMs || 0));
+  let advertised = null;
+  const horizon = () => Math.max(advertised !== null ? advertised + REQUEST_TIMEOUT_MS : (deps.resendHorizonMs ?? RESEND_HORIZON_MS),
+    2 * (deps.timeoutMs || 0));
   const started = now();
   const send = async () => {
     const response = await request(where.url, pathname, { payload, token, timeoutMs: deps.timeoutMs });
     if (response.status === 503 && (parsed(response) || {}).error === 'daemon restarting') throw new Error('daemon restarting');
     return response;
   };
+  // Resolves null when the daemon answered, noting the bound it advertises, and the
+  // error when it did not.
   const ping = async () => {
-    try { await request(where.url, '/api/registry/ping', { method: 'GET', token, timeoutMs: PING_TIMEOUT_MS }); return null; }
+    let response;
+    try { response = await request(where.url, '/api/registry/ping', { method: 'GET', token, timeoutMs: PING_TIMEOUT_MS }); }
     catch (error) { return error; }
+    const value = response && response.status === 200 ? parsed(response) : null;
+    const bound = value ? Number(value.maxRunMs) : NaN;
+    if (Number.isFinite(bound) && bound > 0) advertised = bound;
+    return null;
   };
   let lastError;
   let held = false;
@@ -168,16 +181,17 @@ async function postWithRetry(where, pathname, payload, deps = {}) {
   let spent = 0;
   for (;;) {
     if (held) {
-      if (now() - started >= horizon) {
-        const key = payload && payload.idempotencyKey ? ` under key ${payload.idempotencyKey}` : '';
-        const failure = new Error(`gave up waiting after ${Math.round((now() - started) / 60e3)}m${key}; `
-          + `the command may still be running on the daemon on ${where.daemon}; check there before running it again`);
-        failure.horizon = true;
-        throw failure;
-      }
       const down = await ping();
       if (!down) {
-        note(`${label}: still running on the daemon on ${where.daemon}, waiting…\n`);
+        if (now() - started >= horizon()) {
+          const key = payload && payload.idempotencyKey ? ` under key ${payload.idempotencyKey}` : '';
+          const failure = new Error(`gave up waiting after ${Math.round((now() - started) / 60e3)}m${key}; `
+            + `the command may still be running on the daemon on ${where.daemon}; check there before running it again`);
+          failure.horizon = true;
+          throw failure;
+        }
+        const allowed = advertised !== null ? ` (allowed up to ${Math.round(advertised / 60e3)} min)` : '';
+        note(`${label}: still running on the daemon on ${where.daemon}${allowed}, waiting…\n`);
         try { return await send(); }
         catch (error) { lastError = error; held = Boolean(error && error.timedOut); }
         continue;
@@ -213,7 +227,7 @@ function parsed(response) {
 // payload and so the same idempotency key, and the daemon's journaled() holds that
 // resend on the run still in flight under the key and answers it with that run's
 // recorded result. Nothing runs twice; the node just waits in more than one post,
-// for as long as the daemon answers, up to RESEND_HORIZON_MS.
+// for as long as the daemon answers, up to the bound its ping advertises.
 function requestTimeoutMs(command, args) {
   return REQUEST_TIMEOUT_MS + require('./registry-commands.js').forwardedWaitMs(command, args);
 }

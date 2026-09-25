@@ -586,6 +586,24 @@ test('the ping names the caller and the daemon', (t) => {
   assert.equal(svc.ping(null).status, 403);
 });
 
+test('the ping advertises the longest run the daemon allows a forwarded command', (t) => {
+  const { TIMEOUT_MS } = require('./registry-route.js');
+  // At the default a day-long waiting tell is the longest.
+  const plain = service(t).svc.ping(AWS1).body.maxRunMs;
+  assert.equal(plain, TIMEOUT_MS + MAX_FORWARDED_WAIT_MS);
+  assert.ok(plain >= TIMEOUT_MS + openExtraMs({}));
+  // A compaction timeout of two hours makes an open 245 minutes long, still inside it.
+  const twoHours = service(t, { env: { KEEP_COMPACT_TIMEOUT_MS: '7200000' } }).svc;
+  assert.equal(TIMEOUT_MS + openExtraMs({ KEEP_COMPACT_TIMEOUT_MS: '7200000' }), 245 * 60e3);
+  assert.ok(twoHours.ping(AWS1).body.maxRunMs >= 245 * 60e3);
+  assert.equal(twoHours.maxRunMs(), twoHours.ping(AWS1).body.maxRunMs);
+  // Past about twelve hours the open is the longest, and the ping follows it.
+  const env = { KEEP_COMPACT_TIMEOUT_MS: String(24 * 3600e3) };
+  const long = service(t, { env }).svc;
+  assert.equal(long.ping(AWS1).body.maxRunMs, TIMEOUT_MS + openExtraMs(env));
+  assert.ok(long.ping(AWS1).body.maxRunMs > TIMEOUT_MS + MAX_FORWARDED_WAIT_MS);
+});
+
 test('a real keep add and keep show round-trip through the daemon\'s own CLI', async (t) => {
   const root = tempDir(t);
   for (const dir of ['tasks', 'archive', 'digests']) fs.mkdirSync(path.join(root, dir), { recursive: true });

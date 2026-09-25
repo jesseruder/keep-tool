@@ -30,7 +30,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { isRegistryCommand, argumentRefusal, forwardedWaitMs, isWaitingTell } = require('./registry-commands.js');
+const { isRegistryCommand, argumentRefusal, forwardedWaitMs, isWaitingTell, openExtraMs, MAX_FORWARDED_WAIT_MS } = require('./registry-commands.js');
 
 const SESSION_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const PANE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -425,11 +425,18 @@ function createRegistryService(options = {}) {
     return 'an earlier run of this request was interrupted; inspect before retrying';
   }
 
+  // The longest run this daemon allows any forwarded command: an open, bounded by this
+  // daemon's own compaction timeout, or a tell waiting its longest. Advertised on the
+  // ping, so a node whose post times out knows how long to keep resending its key.
+  function maxRunMs() {
+    return timeoutMs + Math.max(openExtraMs(baseEnv), MAX_FORWARDED_WAIT_MS);
+  }
+
   function ping(principal) {
     try {
       const daemon = daemonNode();
       const caller = callerNode(principal, daemon);
-      return { status: 200, body: { ok: true, node: caller, daemon, now: new Date(now()).toISOString() } };
+      return { status: 200, body: { ok: true, node: caller, daemon, now: new Date(now()).toISOString(), maxRunMs: maxRunMs() } };
     } catch (error) {
       return { status: error.status || 500, body: { error: error.message } };
     }
@@ -445,7 +452,7 @@ function createRegistryService(options = {}) {
     formatPaneRef: (node, paneId) => nodes.formatPaneRef(node, paneId),
   };
 
-  return { handle, ping, journalDir, busy: () => admitted > 0, shared };
+  return { handle, ping, maxRunMs, journalDir, busy: () => admitted > 0, shared };
 }
 
 module.exports = {

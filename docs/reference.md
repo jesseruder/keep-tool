@@ -1624,8 +1624,10 @@ session first), and longer on a daemon whose `KEEP_COMPACT_TIMEOUT_MS` is raised
 since the daemon sizes the bound from its own setting. Each of the node's posts waits
 the twelve minutes; when one times out and the daemon still answers its ping, the node
 says the command is still running and resends the same key, which the one run answers.
-It keeps resending while the daemon answers, up to four hours, and then stops with the
-key and a warning that the command may still be running on the daemon. A daemon that
+It keeps resending while the daemon answers, for as long as the daemon says a command
+may run (its ping advertises the bound), and an older daemon that does not is given four
+hours; then it stops with the key and a warning that the command may still be running
+on the daemon. A daemon that
 stops answering gets the usual twenty seconds of retries.
 A forwarded open runs beside the node's other commands and holds a restart for as long
 as it runs.
