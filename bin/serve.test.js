@@ -12081,6 +12081,59 @@ test('periodic scans read the bounded transcript index and action scans stay fre
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
+test('a session moved to a node is listed from its node, not from the copy it left here', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-moved-scan-'));
+  try {
+    const keepRoot = path.join(home, 'keep');
+    const projectDir = path.join(home, '.claude', 'projects', '-test-project');
+    const records = path.join(keepRoot, '.keep', 'session-accounts');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(records, { recursive: true });
+    const at = new Date(Date.now() - 3600e3).toISOString();
+    // Both transcripts sit here inside the 48 h window; only their records differ.
+    for (const [id, node] of [['sess-moved', 'aws7'], ['sess-here', 'main']]) {
+      fs.writeFileSync(path.join(projectDir, `${id}.jsonl`), `${[
+        { type: 'mode', mode: 'normal', sessionId: id },
+        { type: 'user', sessionId: id, cwd: '/test/project', timestamp: at, message: { role: 'user', content: 'go' } },
+        { type: 'assistant', sessionId: id, timestamp: at,
+          message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'Done' }] } },
+      ].map(JSON.stringify).join('\n')}\n`);
+      fs.writeFileSync(path.join(records, `${id}.json`), JSON.stringify({
+        version: 1, sessionId: id, agent: 'claude', accountId: 'claude/default', node,
+      }));
+    }
+    const script = `
+      ${STATE_FIXTURE_SETUP}
+      const serve = require('./bin/serve.js');
+      const scanned = serve.scanSessions({ readOnly: true, allocateNumbers: false });
+      const listed = scanned.filter((session) => session.kind === 'claude').map((session) => [session.id, session.accountId]);
+      const nodeRead = { id: 'sess-moved', kind: 'claude', node: 'aws7', accountId: 'claude/default', mtime: Date.now(),
+        size: 4096, endedTurn: true, state: 'recent', rateLimit: { resetsAt: 1790000000000, text: 'limit reached' } };
+      const pane = { id: 'p1@aws7', node: 'aws7', hostPaneId: 'p1', alive: true, agentAlive: true,
+        createdAt: new Date(Date.now() - 7200e3).toISOString(), meta: { agent: 'claude', sessionId: 'sess-moved' } };
+      const sessions = scanned.slice();
+      serve.backfillHostSessions(sessions, [pane], { root: ${JSON.stringify(keepRoot)}, hostNodes: ['main', 'aws7'],
+        claudeSessionFor: () => null, nodeSessions: { 'sess-moved': nodeRead } });
+      const moved = sessions.filter((session) => session.id === 'sess-moved');
+      process.stdout.write(JSON.stringify({ listed, moved, nodeRead }));
+    `;
+    const child = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, HOME: home, KEEP_DIR: keepRoot, KEEP_CONFIG: '', KEEP_DAEMON_NODE: 'main' },
+      encoding: 'utf8', timeout: 10000,
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout);
+    assert.deepEqual(result.listed, [['sess-here', 'claude/default']],
+      'the session on the daemon node is read from its file; the moved one is not read from the copy it left');
+    assert.equal(result.moved.length, 1);
+    assert.equal(result.moved[0].node, 'aws7');
+    assert.equal(result.moved[0].mtime, result.nodeRead.mtime, 'the row is the node\'s read');
+    assert.deepEqual(result.moved[0].rateLimit, result.nodeRead.rateLimit);
+    assert.equal(result.moved[0].pane, 'p1@aws7');
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
 test('a Claude transcript miss is reused by build paths for a short while and forgotten when a pane appears', async () => {
   const { claudeSessionFor, forgetClaudeSessionMisses, noteHostPaneSessions } = require('./serve.js');
   const id = `miss-${process.pid}-${Date.now()}`;

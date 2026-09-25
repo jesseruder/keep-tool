@@ -12307,6 +12307,7 @@ function scanClaudeSessions(options = {}) {
   const seen = new Set();
   const sessionIds = new Set();
   const accountAuthority = options.accountAuthority || accounts.authority(keep.ROOT);
+  const daemonNode = daemonNodeName(options);
   const panesBySession = options.hostPanesBySession || hostPanesBySession(options.hostPanes || []);
   // Fresh re-lists every project directory and stats every transcript (tens of
   // thousands on a long-lived machine); bounded trusts the watcher and re-stats a
@@ -12337,6 +12338,10 @@ function scanClaudeSessions(options = {}) {
   if (typeof options.onTranscriptRows === 'function') options.onTranscriptRows(transcriptRows, { fresh });
   for (const { dir, file, id, stat, accountId } of transcriptRows) {
     if (accountAuthority[id]?.accountId && accountAuthority[id].accountId !== accountId) continue;
+    // A session moved to another node leaves its transcript here, and that copy stops
+    // growing. Read as the session, it would keep backfillHostSessions from putting the
+    // node's own read in its place, and the row's state and rate limit would go stale.
+    if (accountAuthority[id]?.node && accountAuthority[id].node !== daemonNode) continue;
     if (sessionIds.has(id)) continue;
     sessionIds.add(id);
     if (spawned.has(id) || now - stat.mtimeMs > SESSION_WINDOW_MS) continue;
