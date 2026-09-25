@@ -278,9 +278,9 @@ function createRegistryService(options = {}) {
       const started = now();
       let child;
       try {
-        // `keep turns` opens node:sqlite, whose warning would otherwise reach the
+        // `keep turns` and `keep search` open node:sqlite, whose warning would otherwise reach the
         // node's terminal with the answer; bin/keep passes the same flag.
-        const quiet = argv[0] === 'turns' ? ['--disable-warning=ExperimentalWarning'] : [];
+        const quiet = ['turns', 'search'].includes(argv[0]) ? ['--disable-warning=ExperimentalWarning'] : [];
         child = spawn(execPath, [...quiet, keepBin, ...argv], {
           cwd, env, stdio: [stdin === null ? 'ignore' : 'pipe', 'pipe', 'pipe'], shell: false,
         });
