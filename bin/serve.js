@@ -428,7 +428,7 @@ async function sessionSummarySnapshot(deps = {}) {
   if (!live.length) return { sessions: [], panes };
   // Use the same marker-enriched classification as Triage. Raw transcript
   // lookups omit permission notifications that can arrive in the middle of a turn.
-  const state = await isolatedStateBuild({ hostPanes: panes, dashboard: true }, deps);
+  const state = await isolatedStateBuild({ hostPanes: panes, dashboard: true, fresh: false }, deps);
   return { sessions: state.sessions, panes };
 }
 const WEEKLY_INSTRUCTION = "Summarize what this solo developer completed in the last week. Group related work into 3-6 themed bullets and note anything notable that shipped. Be specific; output only the summary.";
@@ -12238,10 +12238,11 @@ async function isolatedSessionScan(options = {}, deps = {}) {
 // tests still get the direct implementation before start() enters the policy.
 async function isolatedStateBuild(options = {}, deps = {}) {
   const builder = deps.dashboardBuild || deps.buildState || daemonDashboardBuildForMain;
-  if (builder) return builder(options);
+  const input = { fresh: true, ...options };
+  if (builder) return builder(input);
   const policy = deps.mainLoopPolicy || daemonMainLoopPolicy;
   if (policy.isActive()) throw new Error('daemon state build has no isolated builder');
-  return buildState(options);
+  return buildState(input);
 }
 
 // Dashboard builds already run addHostSessionState in their worker. A direct or
@@ -12249,7 +12250,7 @@ async function isolatedStateBuild(options = {}, deps = {}) {
 // once for action paths that require pane/account fields.
 async function isolatedHostStateBuild(options = {}, deps = {}) {
   const dashboardBuilder = deps.dashboardBuild || (!deps.buildState && daemonDashboardBuildForMain);
-  if (dashboardBuilder) return dashboardBuilder(options);
+  if (dashboardBuilder) return dashboardBuilder({ fresh: true, ...options });
   const state = await isolatedStateBuild(options, deps);
   return (deps.addHostSessionState || addHostSessionState)(state, { ...deps, panes: options.hostPanes || [] });
 }
@@ -17022,6 +17023,7 @@ function start(deps = {}) {
   const dashboardBuild = (options) => dashboardBuilder.build({
     hostPanes: options.hostPanes || [],
     companion: options.companion || null,
+    ...(typeof options.fresh === 'boolean' ? { fresh: options.fresh } : {}),
     // Sessions on other nodes, as their nodes read them (remoteSessionFreshness). Only
     // present when there are any, so a single-node build input is what it always was.
     ...(options.nodeSessions ? { nodeSessions: options.nodeSessions } : {}),

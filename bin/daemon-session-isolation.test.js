@@ -104,14 +104,30 @@ test('an active daemon close requires and uses the isolated state builder', asyn
     /daemon state build has no isolated builder/,
   );
   let builds = 0;
+  let buildInput = null;
   await assert.rejects(serve.closeIdleSession({ sessionId: 's', pane: 'p' }, {
     ...base,
-    dashboardBuild: async () => {
+    dashboardBuild: async (input) => {
       builds += 1;
+      buildInput = input;
       throw new Error('isolated builder reached');
     },
   }), /isolated builder reached/);
   assert.equal(builds, 1);
+  assert.equal(buildInput.fresh, true);
+});
+
+test('queued handoff eligibility requests a fresh isolated state build', async () => {
+  let input = null;
+  const sessions = await serve.handoffQueueSessions({
+    listHostPanes: async () => [],
+    dashboardBuild: async (options) => {
+      input = options;
+      return { sessions: [{ id: 's' }] };
+    },
+  });
+  assert.deepEqual(sessions, [{ id: 's' }]);
+  assert.equal(input.fresh, true);
 });
 
 test('account setup child work stays serialized even after a failed operation', async () => {
