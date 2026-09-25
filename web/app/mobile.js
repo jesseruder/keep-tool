@@ -225,6 +225,7 @@ function deactivate() {
   closeDroppedMenu();
   // The mode is the desktop console's own again; only the entries go.
   rewind(pops);
+  reportDepth();
   giveBack();
   if (collapsedBefore) {
     ctx.state.collapsed.rail = collapsedBefore.rail;
@@ -246,7 +247,8 @@ function apply({ booting = false } = {}) {
 function open(name, mode) {
   if (!active || showing(name)) return;
   let pushed = false;
-  const entry = mode ? { keepOverlay: name, keepMode: mode } : { keepOverlay: name };
+  const keepDepth = depthHere() + 1;
+  const entry = mode ? { keepOverlay: name, keepMode: mode, keepDepth } : { keepOverlay: name, keepDepth };
   try { history.pushState(entry, ''); pushed = true; } catch {}
   overlays.push({ name, pushed, mode });
   sync();
@@ -308,6 +310,10 @@ function reopen(name, state) {
 }
 
 function onPopState(event) {
+  // The app counted its own Back down already; say where the history landed even
+  // on the paths below that return without a sync(), or the next push to this
+  // same depth looks unchanged and is never reported.
+  reportDepth();
   // One of ours landing: the stack is already right, but anything held back
   // while it was in flight is settled now.
   if (swallow > 0) {
@@ -423,7 +429,7 @@ function reconcile() {
     entry.mode = mode;
     if (entry.pushed && overlays[overlays.length - 1] === entry
       && history.state?.keepOverlay === 'tab' && history.state.keepMode !== mode) {
-      try { history.replaceState({ keepOverlay: 'tab', keepMode: mode }, ''); } catch {}
+      try { history.replaceState({ keepOverlay: 'tab', keepMode: mode, keepDepth: depthHere() }, ''); } catch {}
     }
   } finally { reconciling = false; }
 }
@@ -453,6 +459,27 @@ function sync() {
   badge.classList.toggle('zero', !unread);
   if (stageOpen) stageTitle.textContent = headingText() || document.querySelector('#stage .qempty b')?.textContent || '';
   alertsTab.classList.toggle('on', showing('alerts'));
+  reportDepth();
+}
+
+// Android's Back cannot rely on the WebView's own history: Chromium skips, for
+// browser back and canGoBack, an entry a page pushed with no user gesture since
+// the one before it, and a notification tap pushes the stage from injected script.
+// A script's history.back() is not skipped. So every entry this layout pushes
+// carries its depth over the page it loaded on, the console tells the app the
+// depth of the entry it is standing on, and the app's Back runs history.back()
+// in the page while that is above zero. It is the history's own position, not a
+// count of the stack, so a stack that drifted from the history cannot hold Back
+// on a page with nothing to go back to. Sent only when it changes.
+function depthHere() {
+  const depth = Math.floor(Number(history.state?.keepDepth));
+  return Number.isFinite(depth) && depth > 0 ? depth : 0;
+}
+let reportedDepth = null;
+function reportDepth() {
+  const depth = active ? depthHere() : 0;
+  if (depth === reportedDepth) return;
+  if (postShell({ type: 'history', depth })) reportedDepth = depth;
 }
 
 export function mobileFilterLabel(project, providerFilter) {
@@ -479,7 +506,8 @@ export function installMobile(context) {
   // can and announces itself afterwards when it cannot; either way the phone
   // layout has to come up once the shell is there — and go away again if the
   // shell ever does, which is the only thing that deactivates it.
-  window.addEventListener('keep-shell-hello', () => apply());
+  // A shell that says hello may have forgotten the depth: say it again.
+  window.addEventListener('keep-shell-hello', () => { reportedDepth = null; apply(); });
   // `toggle` does not bubble, so the stage's actions menu is heard in the
   // capture phase — the rows triage.js recycles need to know nothing about it.
   document.addEventListener('toggle', onMenuToggle, true);

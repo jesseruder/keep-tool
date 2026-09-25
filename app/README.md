@@ -146,6 +146,7 @@ Console → shell, via `window.keepShell.post(message)`:
 | `{type:'authenticated'}` | a request came back 200; clears the refusal count |
 | `{type:'unauthorized'}` | re-bootstraps, under the rules above |
 | `{type:'badge', count}` | sets the launcher badge |
+| `{type:'history', depth}` | the depth of the phone layout's current history entry; while it is above zero hardware Back runs the page's `history.back()`, since the WebView's own `goBack` skips entries pushed without a user gesture |
 | `{type:'notify', title, body, key}` | schedules an immediate local notification carrying `key` |
 | `{type:'openTerminal', pane, session, title}` | opens the Terminal screen on that target |
 | `{type:'openExternal', url}` | hands an `http(s)` URL to the phone's browser |

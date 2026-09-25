@@ -23,6 +23,10 @@ test('parsing keeps the messages the shell can act on and drops the rest', () =>
   assert.deepEqual(parseBridgeMessage('{"type":"authenticated"}'), { type: 'authenticated' });
   assert.deepEqual(parseBridgeMessage('{"type":"unauthorized"}'), { type: 'unauthorized' });
   assert.deepEqual(parseBridgeMessage('{"type":"badge","count":"3"}'), { type: 'badge', count: 3 });
+  assert.deepEqual(parseBridgeMessage('{"type":"history","depth":2}'), { type: 'history', depth: 2 });
+  assert.deepEqual(parseBridgeMessage('{"type":"history","depth":0}'), { type: 'history', depth: 0 });
+  assert.equal(parseBridgeMessage('{"type":"history","depth":-1}'), null);
+  assert.equal(parseBridgeMessage('{"type":"history"}'), null);
   assert.deepEqual(parseBridgeMessage('{"type":"badge","count":2.7}'), { type: 'badge', count: 2 });
   assert.deepEqual(parseBridgeMessage('{"type":"openTerminal","pane":"p1"}'),
     { type: 'openTerminal', session: null, pane: 'p1', title: null });

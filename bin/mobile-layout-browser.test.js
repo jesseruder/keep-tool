@@ -376,6 +376,7 @@ test('isolated browser: the console is usable on a 412px touch screen',
       await evaluate("document.querySelector('.mobile-back').click()");
       await wait("!document.documentElement.classList.contains('mobile-stage-open')"
         + " && !(history.state && history.state.keepOverlay)");
+      await wait("(window.__shellPosts || []).filter(m => m.type === 'history').at(-1)?.depth === 0");
 
       // ── The tab bar switches modes.
       await evaluate("document.querySelector('.modes [data-mode=fleet]').click()");
@@ -659,6 +660,10 @@ test('isolated browser: the console is usable on a 412px touch screen',
         'and so does the back bar');
       assert.equal(await evaluate('history.state && history.state.keepOverlay'), 'stage',
         'the stage a tap opens owns its entry, so Back returns to the queue');
+      // The app's canGoBack can miss this entry when the tap brought it back from the
+      // background, so the console tells it how deep its own stack is.
+      assert.equal(await evaluate("(window.__shellPosts || []).filter(m => m.type === 'history').at(-1)?.depth"), 1,
+        'the shell is told the console holds one entry');
       await shoot('triage-notification-stage');
       await evaluate("document.querySelector('.mobile-back').click()");
       await wait("!document.documentElement.classList.contains('mobile-stage-open')"

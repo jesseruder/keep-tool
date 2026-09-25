@@ -89,6 +89,12 @@ function parseBridgeMessage(raw) {
       return { type: 'authenticated' };
     case 'unauthorized':
       return { type: 'unauthorized' };
+    case 'history': {
+      // How many history entries the console's phone layout holds over its base page.
+      const depth = Number(parsed.depth);
+      if (!Number.isFinite(depth) || depth < 0) return null;
+      return { type: 'history', depth: Math.min(999, Math.floor(depth)) };
+    }
     case 'badge': {
       const count = Number(parsed.count);
       if (!Number.isFinite(count) || count < 0) return null;

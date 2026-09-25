@@ -55,6 +55,12 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
   const webRef = useRef(null);
   const readyRef = useRef(false);
   const canGoBackRef = useRef(false);
+  // The depth of the console's current history entry over the page it loaded on.
+  // The WebView's own canGoBack and goBack skip an entry the page pushed without a
+  // user gesture (Chromium's history intervention), which is how a notification tap
+  // opens a stage, so while the console reports depth Back runs the page's own
+  // history.back(), which does not skip.
+  const consoleDepthRef = useRef(0);
   const graceRef = useRef(null);
   const retryRef = useRef(null);
   const triggerRef = useRef(null);
@@ -89,6 +95,7 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
     retryRef.current = null;
     readyRef.current = false;
     canGoBackRef.current = false;
+    consoleDepthRef.current = 0;
     setError(null);
     setLoading(true);
     setBootstrapKey((value) => value + 1);
@@ -164,6 +171,13 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
   // that first and only then falls through to the navigator.
   useFocusEffect(useCallback(() => {
     const onBack = () => {
+      if (consoleDepthRef.current > 0 && webRef.current) {
+        // Counted down here too, so a report that never comes (or a second press
+        // before it does) costs one press at most, never a stuck Back button.
+        consoleDepthRef.current -= 1;
+        webRef.current.injectJavaScript('history.back(); true;');
+        return true;
+      }
       if (canGoBackRef.current && webRef.current) {
         webRef.current.goBack();
         return true;
@@ -189,6 +203,7 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
       // The daemon answered a real request: the session is good, once per page load.
       authenticated: () => trigger('authenticated'),
       unauthorized: () => trigger('unauthorized'),
+      history: (message) => { consoleDepthRef.current = message.depth; },
       badge: onBadge,
       notify: onNotify,
       openTerminal: onOpenTerminal,
