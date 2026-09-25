@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 globalThis.location = new URL('http://localhost:7777/app/');
 
-const { secretRequestFor, valueShape, secretDropHTML } = await import('./secret-drop.js');
+const { secretRequestFor, valueShape, secretDropHTML, answeredKey } = await import('./secret-drop.js');
 
 const esc = (value) => String(value == null ? '' : value)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -23,7 +23,8 @@ test('only the focused session\'s pending requests show, oldest first', () => {
   assert.equal(secretRequestFor(data, 's3'), null);
   assert.equal(secretRequestFor(data, undefined), null);
   assert.equal(secretRequestFor({}, 's1'), null);
-  assert.deepEqual(secretRequestFor(data, 's1', new Set([data.secretRequests[1].id])).more, 0, 'an answered request is skipped');
+  assert.deepEqual(secretRequestFor(data, 's1', new Set([answeredKey(data.secretRequests[1])])).more, 0, 'an answered request is skipped');
+  assert.equal(secretRequestFor(data, 's1', new Set(['a:99'])).more, 1, 'a reused id is a new request');
 });
 
 test('the counter says length and lines, never the value', () => {

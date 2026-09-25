@@ -14,13 +14,15 @@ const FULFILL_TIMEOUT_MS = 45e3;
 // Requests answered (saved or declined) on this page. The state that still lists one
 // may have been built before the answer landed, and a stage rebuilt in the meantime
 // has lost its own mark: without this the answered card came back over the terminal.
+// Keyed by id and creation time, since an id can be reused once its record ages out.
 const answeredHere = new Set();
+export const answeredKey = (r) => `${r.id}:${r.createdAt}`;
 
 // The pending request for a session, oldest first when there are several: the
 // panel answers one at a time and the next takes its place.
 export function secretRequestFor(data, sessionId, answered = answeredHere) {
   if (!sessionId) return null;
-  const rows = (data?.secretRequests || []).filter((r) => r && r.status === 'pending' && r.sessionId === sessionId && !answered.has(r.id));
+  const rows = (data?.secretRequests || []).filter((r) => r && r.status === 'pending' && r.sessionId === sessionId && !answered.has(answeredKey(r)));
   rows.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   return rows.length ? { request: rows[0], more: rows.length - 1 } : null;
 }
@@ -136,7 +138,7 @@ function install(root, ctx, request) {
       await api.write('/api/secrets/fulfill', { id: request.id, value: field.value }, 'POST',
         { label: 'Handing off secret', timeoutMs: FULFILL_TIMEOUT_MS });
       field.value = '';
-      answeredHere.add(request.id);
+      answeredHere.add(answeredKey(request));
       root.dataset.done = '1';
       root.hidden = true;
       justAnswered = { sessionId: request.sessionId, text: `✓ ${request.name} saved on ${request.node}`, at: Date.now() };
@@ -160,7 +162,7 @@ function install(root, ctx, request) {
       await api.write('/api/secrets/decline', { id: request.id, reason: root.querySelector('.sd-reason').value },
         'POST', { label: 'Declining secret request' });
       field.value = '';
-      answeredHere.add(request.id);
+      answeredHere.add(answeredKey(request));
       root.dataset.done = '1';
       root.hidden = true;
       justAnswered = { sessionId: request.sessionId, text: `Declined ${request.name}`, at: Date.now() };

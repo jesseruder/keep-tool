@@ -248,6 +248,10 @@ function createSecretService(options = {}) {
     const record = effective(found, now());
     if (record.status !== 'pending') return refusal(409, `secret request ${id} is ${record.status}`);
     if (writing.has(id)) return refusal(409, `secret request ${id} is already being written`);
+    // One write per destination at a time: two open asks for one key (made before they
+    // were merged) must not both be written, the second over the first.
+    const rival = load().find((r) => r.id !== id && writing.has(r.id) && sameDestination(r, record));
+    if (rival) return refusal(409, `secret request ${rival.id} for that destination is being written now`);
     writing.add(id);
     onChange();
     try {
