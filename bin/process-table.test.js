@@ -187,14 +187,51 @@ test('on Linux a Codex thread id is read from /proc only when asked for, and rep
   assert.deepEqual(inspected.env, [{ pid: 7, sessionId: 'thread-seven', agent: 'codex' }]);
 });
 
-test('on macOS the ps -E read is what it always was, codex option or not', async () => {
+test('on macOS a Codex thread id is read from ps -E when asked for, as an exact variable, and reported as Codex\'s', async () => {
   const calls = [];
-  const found = await table.readSessionEnv([11], { platform: 'darwin', codex: true, execFile: async (cmd, args) => {
-    calls.push([cmd, args]);
-    return { stdout: '  11 codex CODEX_THREAD_ID=t CLAUDE_CODE_SESSION_ID=one\n' };
-  } });
-  assert.deepEqual(calls, [['ps', ['-E', '-o', 'pid=,args=', '-p', '11']]]);
-  assert.deepEqual(found, [{ pid: 11, sessionId: 'one' }]);
+  // A reparented Codex child: the root thread's id in its environment, its own rollout
+  // open, and no agent in its arguments. And a variable that only ends in the name.
+  const stdout = '  11 codex CODEX_THREAD_ID=t CLAUDE_CODE_SESSION_ID=one\n'
+    + '  12 node child.js HOME=/h CODEX_THREAD_ID=root-thread PATH=/bin\n'
+    + '  13 node other.js MY_CODEX_THREAD_ID=not-a-thread\n';
+  const execFile = async (cmd, args) => { calls.push([cmd, args]); return { stdout }; };
+  assert.deepEqual(await table.readSessionEnv([11, 12, 13], { platform: 'darwin', execFile }),
+    [{ pid: 11, sessionId: 'one' }], 'unchanged without the option');
+  assert.deepEqual(await table.readSessionEnv([11, 12, 13], { platform: 'darwin', codex: true, execFile }), [
+    { pid: 11, sessionId: 'one' },
+    { pid: 11, sessionId: 't', agent: 'codex' },
+    { pid: 12, sessionId: 'root-thread', agent: 'codex' },
+  ]);
+  assert.deepEqual(calls[0], ['ps', ['-E', '-o', 'pid=,args=', '-p', '11,12,13']]);
+  const inspected = await table.inspect({ pids: [12], env: true, codexEnv: true }, { platform: 'darwin',
+    execFile: async (cmd, args) => (args.includes('-E') ? { stdout } : { stdout: '' }) });
+  assert.deepEqual(inspected.env, [{ pid: 12, sessionId: 'root-thread', agent: 'codex' }]);
+});
+
+test('the /proc reads are asynchronous and bounded in total time, failing rather than answering in part', async () => {
+  let clock = 0;
+  let inFlight = 0, most = 0;
+  const slow = { promises: {
+    readFile: async (file) => {
+      inFlight++; most = Math.max(most, inFlight);
+      await new Promise((resolve) => setImmediate(resolve));
+      inFlight--; clock += 100;
+      return file.endsWith('/7/environ') ? 'CLAUDE_CODE_SESSION_ID=seven\0' : '';
+    },
+    readdir: async () => { clock += 100; return ['3']; },
+    readlink: async () => ROLLOUT(ID_A),
+    stat: async () => ({ mtimeMs: 5 }),
+  } };
+  const pids = Array.from({ length: 40 }, (_, i) => i + 2);
+  const deps = { platform: 'linux', fs: slow, now: () => clock, execFile: () => assert.fail('no ps -E on Linux') };
+  assert.deepEqual(await table.readSessionEnv(pids, { ...deps, procDeadlineMs: 60e3 }), [{ pid: 7, sessionId: 'seven' }]);
+  assert.ok(most > 1 && most <= 16, `a few reads at a time (${most})`);
+  clock = 0;
+  await assert.rejects(table.readSessionEnv(pids, { ...deps, procDeadlineMs: 500 }), /took longer than 500ms/);
+  clock = 0;
+  await assert.rejects(table.readOpenRollouts(pids, { ...deps, hasLsof: () => false, procDeadlineMs: 500 }), /took longer than 500ms/);
+  clock = 0;
+  assert.equal((await table.readOpenRollouts([2], { ...deps, hasLsof: () => false, procDeadlineMs: 60e3 })).length, 1);
 });
 
 function procFs(links, { unreadable = [] } = {}) {

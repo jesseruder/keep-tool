@@ -84,23 +84,66 @@ async function readFullProcessTable(deps = {}) {
   return parseFullProcessTable(String(result.stdout || ''));
 }
 
+// The /proc reads below run over as many pids as a caller asks about, which for an
+// ownership proof is every process on the machine. They are asynchronous, a few at
+// a time, and bounded in total: a read that outlives the deadline fails the whole
+// answer rather than blocking the loop it runs on (a host's, or the daemon's) or
+// coming back with part of it.
+const PROC_CONCURRENCY = 16;
+const PROC_DEADLINE_MS = 10e3;
+
+function procReader(deps = {}) {
+  const io = deps.fs || fs;
+  // A test's fs may be synchronous only; the real one is read through its promises.
+  const call = (name, ...args) => (io.promises && typeof io.promises[name] === 'function'
+    ? io.promises[name](...args)
+    : new Promise((resolve, reject) => { try { resolve(io[`${name}Sync`](...args)); } catch (error) { reject(error); } }));
+  const deadlineMs = Number.isFinite(deps.procDeadlineMs) ? deps.procDeadlineMs : PROC_DEADLINE_MS;
+  const now = deps.now || Date.now;
+  const started = now();
+  const check = (what) => {
+    if (now() - started > deadlineMs) throw new Error(`reading ${what} took longer than ${deadlineMs}ms`);
+  };
+  return { call, check };
+}
+
+// Runs `work` over `items`, at most PROC_CONCURRENCY at once, in order of results.
+async function eachBounded(items, work, concurrency = PROC_CONCURRENCY) {
+  const results = new Array(items.length);
+  let next = 0;
+  const lanes = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await work(items[index]);
+    }
+  });
+  await Promise.all(lanes);
+  return results;
+}
+
 // Which of these processes is a Claude agent that exported its session id. macOS
 // hands out another process's environment through `ps -E`; Linux has no such flag,
 // and the same answer is in /proc. Both are limited to the pids asked about.
 //
-// On Linux, `deps.codex` also asks for the id a Codex TUI exports to its children
+// `deps.codex` also asks for the id a Codex TUI exports to its children
 // (CODEX_THREAD_ID), reported apart as { pid, sessionId, agent: 'codex' } so no
-// reader takes it for a Claude session. Without it the answer is what it always was;
-// on macOS the option is not read.
+// reader takes it for a Claude session, on either machine. Without it the answer is
+// what it always was. Each is an exact variable: CODEX_THREAD_ID, never a name that
+// merely ends in it.
 async function readSessionEnv(pids, deps = {}) {
   const wanted = [...new Set((pids || []).map(Number).filter(Number.isInteger))];
   if (!wanted.length) return [];
   const found = [];
   if ((deps.platform || process.platform) === 'linux') {
-    const io = deps.fs || fs;
-    for (const pid of wanted) {
-      let bytes;
-      try { bytes = io.readFileSync(`/proc/${pid}/environ`, 'utf8'); } catch { continue; }
+    const reader = procReader(deps);
+    const environs = await eachBounded(wanted, async (pid) => {
+      reader.check('the process environments');
+      try { return await reader.call('readFile', `/proc/${pid}/environ`, 'utf8'); } catch { return null; }
+    });
+    reader.check('the process environments');
+    for (const [index, pid] of wanted.entries()) {
+      const bytes = environs[index];
+      if (bytes == null) continue;
       let claude = null;
       let codex = null;
       for (const entry of String(bytes).split('\0')) {
@@ -121,6 +164,8 @@ async function readSessionEnv(pids, deps = {}) {
   for (const line of String(result.stdout || '').split(/\r?\n/)) {
     const match = /^\s*(\d+)\s+.*(?:^|\s)CLAUDE_CODE_SESSION_ID=([A-Za-z0-9_-]+)(?=\s|$)/.exec(line);
     if (match && wanted.includes(Number(match[1]))) found.push({ pid: Number(match[1]), sessionId: match[2] });
+    const thread = deps.codex === true ? /^\s*(\d+)\s+.*(?:^|\s)CODEX_THREAD_ID=([A-Za-z0-9_-]+)(?=\s|$)/.exec(line) : null;
+    if (thread && wanted.includes(Number(thread[1]))) found.push({ pid: Number(thread[1]), sessionId: thread[2], agent: 'codex' });
   }
   return found;
 }
@@ -171,28 +216,32 @@ const PROC_FDS_MAX = 4096;
 // readOpenRollouts from /proc: each asked pid's descriptors, read as links. A pid that
 // is gone holds nothing, as lsof would say; one whose descriptors cannot be read
 // (another user's process) fails the whole read, as lsof failing does.
-function readProcRollouts(wanted, deps = {}) {
-  const io = deps.fs || fs;
-  const files = [];
-  for (const pid of wanted) {
+async function readProcRollouts(wanted, deps = {}) {
+  const reader = procReader(deps);
+  const perPid = await eachBounded(wanted, async (pid) => {
+    reader.check('the open files');
     const dir = `/proc/${pid}/fd`;
     let names;
-    try { names = io.readdirSync(dir); } catch (error) {
-      if (error && error.code === 'ENOENT') continue;
+    try { names = await reader.call('readdir', dir); } catch (error) {
+      if (error && error.code === 'ENOENT') return [];
       throw new Error(`cannot read the open files of ${pid}: ${error && error.message || error}`);
     }
+    const files = [];
     for (const name of names.slice(0, PROC_FDS_MAX)) {
       if (!/^\d+$/.test(String(name))) continue;
+      reader.check('the open files');
       let target;
-      try { target = io.readlinkSync(`${dir}/${name}`); } catch { continue; }
+      try { target = await reader.call('readlink', `${dir}/${name}`); } catch { continue; }
       const match = PROC_ROLLOUT_RE.exec(String(target));
-      if (!match || files.some((entry) => entry.pid === pid && entry.path === match[1])) continue;
+      if (!match || files.some((entry) => entry.path === match[1])) continue;
       let mtime = null;
-      try { mtime = io.statSync(match[1]).mtimeMs; } catch {}
+      try { mtime = (await reader.call('stat', match[1])).mtimeMs; } catch {}
       files.push({ pid, path: match[1], id: match[2], mtime });
     }
-  }
-  return files;
+    return files;
+  });
+  reader.check('the open files');
+  return perPid.flat();
 }
 
 // The table, and whichever of the two per-pid reads the caller asked for. One call,
