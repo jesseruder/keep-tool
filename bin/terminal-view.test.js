@@ -76,7 +76,7 @@ function fixture(options = {}) {
   }
   let terminal, fits = 0, exits = 0, refreshes = 0, webglLoads = 0, webglDisposals = 0;
   class Terminal extends HeadlessTerminal {
-    constructor(options) { super(options); terminal = this; this.textarea = new Element(); this.visualElement = new Element(); }
+    constructor(options) { super(options); terminal = this; this.textarea = new Element(); this.visualElement = new Element(); this.liveDecorations = new Set(); }
     get element() { return this.visualElement; }
     open() {
       const screen = this.visualElement.querySelector('.xterm-screen');
@@ -91,6 +91,20 @@ function fixture(options = {}) {
     onBinary(handler) { this.binaryHandler = handler; return { dispose() {} }; }
     refresh() { refreshes++; }
     focus() {}
+    // The headless xterm has markers but no decorations; this keeps the live ones
+    // so a test can see the typing predictor's overlays.
+    registerDecoration({ marker, x, width, layer }) {
+      const live = this.liveDecorations;
+      const classes = new Set();
+      const element = { classList: { add: (name) => classes.add(name) }, style: {}, textContent: '' };
+      const decoration = {
+        marker, x, width, layer, classes, element,
+        onRender(listener) { listener(element); return { dispose() {} }; },
+        dispose() { live.delete(decoration); },
+      };
+      live.add(decoration);
+      return decoration;
+    }
   }
   class WebSocket {
     static OPEN = 1;
@@ -770,8 +784,20 @@ test('observer fitting converges with rounded cell heights and grows only after 
 });
 
 const hostOutput = (f, text) => f.socket.onmessage({ data: new TextEncoder().encode(text).buffer });
+// Echo frames shaped like Claude Code's: a cell diff placed with relative cursor
+// moves, the status line four rows below the prompt, the cursor hidden for the frame.
+const letterEcho = (text, col) => `\x1b[?25l\x1b[${col}D\x1b[4B\r\x1b[${col}C\x1b[4A${text}\r\r\n\r\n\r\n\r\n\x1b[${col + text.length}C\x1b[4A\x1b[?25h`;
+const SPACE_ECHO = '\x1b[?25l\x1b[1C\x1b[?25h';
+// The guessed characters on screen: the predictor's overlays, as [column, text].
+const guesses = (f) => [...f.terminal.liveDecorations].filter((decoration) => decoration.classes.has('keep-predicted-cell'))
+  .map((decoration) => [decoration.x, decoration.element.textContent]).sort((a, b) => a[0] - b[0]);
+const promptLine = (f) => f.terminal.buffer.active.getLine(0).translateToString(true);
+const type = (f, key) => {
+  f.terminal.keyHandler({ type: 'keydown', key });
+  f.terminal.input(key, true);
+};
 
-test('a typed character is drawn as a prediction before it is sent, and the bytes sent are unchanged', async () => {
+test('a typed character is shown as an overlay before it is sent, and neither the buffer nor the bytes sent change', async () => {
   const f = fixture({ storage: new Map([['keep.console.predictTyping', 'on']]), pane: { meta: { agent: 'claude' } } });
   try {
     f.message({ t: 'replay-end' });
@@ -779,21 +805,46 @@ test('a typed character is drawn as a prediction before it is sent, and the byte
     hostOutput(f, '\x1b[2J\x1b[H❯ ');
     await f.drain();
     f.socket.sent.length = 0;
-    f.terminal.keyHandler({ type: 'keydown', key: 'x' });
-    f.terminal.input('x', true);
+    type(f, 'x');
     assert.deepEqual([...f.socket.sent.at(-1)], [0x78], 'the PTY gets exactly the typed byte');
     await f.drain();
-    const line = f.terminal.buffer.active.getLine(0);
-    assert.equal(line.translateToString(true), '❯ x', 'the guess is on screen before any echo');
-    assert.ok(!line.getCell(2).isDim() && !line.getCell(2).isUnderline(), 'and written plain');
-    hostOutput(f, '\r❯ x\x1b[K');
+    assert.deepEqual(guesses(f), [[2, 'x']], 'the guess is on screen before any echo');
+    assert.equal(promptLine(f), '❯ ', 'as an overlay: the buffer is the pane\'s');
+    assert.equal(f.terminal.buffer.active.cursorX, 2);
+    hostOutput(f, letterEcho('x', 2));
     await f.drain();
-    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), '❯ x');
+    assert.equal(promptLine(f), '❯ x');
+    assert.equal(f.terminal.liveDecorations.size, 0, 'the echo confirmed it');
 
-    f.terminal.keyHandler({ type: 'keydown', key: 'Enter' });
-    f.terminal.input('\r', true);
+    type(f, '\r');
     await f.drain();
-    assert.equal(f.terminal.buffer.active.cursorX, 3, 'Enter is sent, not predicted');
+    assert.equal(f.terminal.liveDecorations.size, 0, 'Enter is sent, not predicted');
+  } finally { f.mounted.dispose(); }
+});
+
+test('typing a space and a letter against relative-move echoes shows each character once', async () => {
+  const f = fixture({ storage: new Map([['keep.console.predictTyping', 'on']]), pane: { meta: { agent: 'claude' } } });
+  try {
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    hostOutput(f, '\x1b[2J\x1b[H❯ ');
+    await f.drain();
+    const steps = [['a', letterEcho('a', 2), '❯ a', 3], ['b', letterEcho('b', 3), '❯ ab', 4],
+      [' ', SPACE_ECHO, '❯ ab', 5], ['c', letterEcho('c', 5), '❯ ab c', 6]];
+    for (const [key, echo, pane, cursor] of steps) {
+      const before = promptLine(f);
+      const at = f.terminal.buffer.active.cursorX;
+      type(f, key);
+      await f.drain();
+      assert.equal(promptLine(f), before);
+      assert.deepEqual(guesses(f), [[at, key]], JSON.stringify(key));
+      hostOutput(f, echo);
+      await f.drain();
+      assert.equal(promptLine(f), pane);
+      assert.equal(f.terminal.buffer.active.cursorX, cursor);
+      assert.equal(f.terminal.liveDecorations.size, 0);
+    }
+    assert.deepEqual(f.socket.sent.filter(data => typeof data !== 'string').map(data => new TextDecoder().decode(data)).join(''), 'ab c');
   } finally { f.mounted.dispose(); }
 });
 
@@ -804,10 +855,10 @@ test('the default setting predicts nothing on a pane of the daemon node', async 
     await f.drain();
     hostOutput(f, '\x1b[2J\x1b[H❯ ');
     await f.drain();
-    f.terminal.keyHandler({ type: 'keydown', key: 'x' });
-    f.terminal.input('x', true);
+    type(f, 'x');
     await f.drain();
-    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), '❯ ');
+    assert.equal(promptLine(f), '❯ ');
+    assert.equal(f.terminal.liveDecorations.size, 0);
   } finally { f.mounted.dispose(); }
 });
 
@@ -823,18 +874,18 @@ test('auto starts predicting on a pane of another node once its echo is measured
     const drawn = [];
     for (const ch of 'abcd') {
       f.setPerf(clock);
-      f.terminal.keyHandler({ type: 'keydown', key: ch });
-      f.terminal.input(ch, true);
+      type(f, ch);
       await f.drain();
-      drawn.push(f.terminal.buffer.active.getLine(0).getCell(2 + typed.length).getChars() === ch);
+      drawn.push(guesses(f).some(([x, text]) => x === 2 + typed.length && text === ch));
       typed += ch;
       clock += 120;
       f.setPerf(clock);
-      hostOutput(f, `\r❯ ${typed}\x1b[K`);
+      hostOutput(f, letterEcho(ch, 1 + typed.length));
       await f.drain();
       clock += 200;
     }
     assert.deepEqual(drawn, [false, false, false, true], 'three slow echoes, then the fourth key is predicted');
+    assert.equal(promptLine(f), '❯ abcd');
     assert.deepEqual(f.socket.sent.filter(data => typeof data !== 'string').map(data => new TextDecoder().decode(data)),
       ['a', 'b', 'c', 'd'], 'every keystroke reached the pane unchanged');
   } finally { f.mounted.dispose(); }
@@ -847,11 +898,11 @@ test('a shell pane on another node is not predicted even when prediction is on',
     await f.drain();
     hostOutput(f, '\x1b[2J\x1b[H❯ ');
     await f.drain();
-    f.terminal.keyHandler({ type: 'keydown', key: 'a' });
-    f.terminal.input('a', true);
+    type(f, 'a');
     hostOutput(f, 'a');
     await f.drain();
-    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), '❯ a', 'the shell echo is the only copy');
+    assert.equal(promptLine(f), '❯ a', 'the shell echo is the only copy');
+    assert.equal(f.terminal.liveDecorations.size, 0);
   } finally { f.mounted.dispose(); }
 });
 
@@ -865,14 +916,28 @@ test('a keystroke while pane output is queued is sent unpredicted; the next one 
     f.socket.sent.length = 0;
     // A pane frame arrives and is still waiting to parse when the key goes down.
     hostOutput(f, '\x1b7\x1b[5;1Hspin\x1b8');
-    f.terminal.keyHandler({ type: 'keydown', key: 'x' });
-    f.terminal.input('x', true);
+    type(f, 'x');
     assert.deepEqual([...f.socket.sent.at(-1)], [0x78], 'the keystroke is sent as always');
     await f.drain();
-    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), '❯ ', 'no guess was drawn');
-    f.terminal.keyHandler({ type: 'keydown', key: 'y' });
-    f.terminal.input('y', true);
+    assert.equal(f.terminal.liveDecorations.size, 0, 'no guess was shown');
+    type(f, 'y');
     await f.drain();
-    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), '❯ y');
+    assert.deepEqual(guesses(f), [[2, 'y']]);
+  } finally { f.mounted.dispose(); }
+});
+
+test('a reattach resets the terminal and takes every guess overlay with it', async () => {
+  const f = fixture({ storage: new Map([['keep.console.predictTyping', 'on']]), pane: { meta: { agent: 'claude' } } });
+  try {
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    hostOutput(f, '\x1b[2J\x1b[H❯ ');
+    await f.drain();
+    type(f, 'x');
+    await f.drain();
+    assert.equal(f.terminal.liveDecorations.size, 2, 'the guess and the stand-in cursor');
+    f.message({ t: 'attached', pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 50, meta: { agent: 'claude' } } });
+    await f.drain();
+    assert.equal(f.terminal.liveDecorations.size, 0);
   } finally { f.mounted.dispose(); }
 });

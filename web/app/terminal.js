@@ -186,10 +186,10 @@ export function mountTerminal(container, pane, options = {}) {
     capture: (value) => { profileCapture = value; },
     status: (value) => { profileNote = value; note(); },
   });
-  // Draws a typed character before its echo returns from a pane on another node.
-  // It only ever writes to this xterm; what reaches the PTY is unchanged. The
-  // console names a pane on another node `<id>@<node>` and the daemon node's own
-  // by its bare id, and `@` is outside the host's pane-id alphabet.
+  // Shows a typed character before its echo returns from a pane on another node, as
+  // an overlay: the buffer and cursor stay the pane's, and what reaches the PTY is
+  // unchanged. The console names a pane on another node `<id>@<node>` and the daemon
+  // node's own by its bare id, and `@` is outside the host's pane-id alphabet.
   const predictor = createTypingPredictor({
     terminal,
     // The host records which agent a pane runs in its meta; a shell pane, or one
@@ -197,9 +197,6 @@ export function mountTerminal(container, pane, options = {}) {
     agent: () => paneState?.meta?.agent,
     remote: () => pane.includes('@'),
     now: () => performance.now(),
-    // A cursor-position report the predictor answers goes the way xterm's own
-    // replies go, through onData's path, so it keeps its order with keystrokes.
-    reply: (data) => sendInput(data, { user: performance.now() <= userInputUntil }),
     outputQueued: () => queuedOutput !== 0,
   });
   let composing = false;
@@ -584,9 +581,9 @@ export function mountTerminal(container, pane, options = {}) {
   const sendInput = (data, options) => sendBytes(encoder.encode(data), options);
   terminal.onData((data) => {
     const user = performance.now() <= userInputUntil;
-    // The prediction is written before the keystroke is sent so it is queued ahead
-    // of any output that answers it. A snapshot still parsing has no settled cursor
-    // to predict from.
+    // The keystroke is recorded before it is sent, so any output that answers it
+    // finds it pending. A snapshot still parsing has no settled cursor to predict
+    // from.
     if (user && replayDone && !exited) predictor.keystroke(data, { composing });
     sendInput(data, { user });
   });

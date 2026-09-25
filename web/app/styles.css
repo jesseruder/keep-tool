@@ -516,9 +516,11 @@ html.mobile .stage-artifacts .artifact-body { position: static; max-height: 30dv
 .term.focused { box-shadow: inset 0 0 0 2px var(--focus); }
 .xterm-host { flex: 1; min-height: 0; padding: 0; margin: 8px 8px 0; overflow: hidden; }
 .xterm { height: 100%; } .xterm .xterm-viewport { overflow: hidden; pointer-events: none; } .xterm .xterm-scrollable-element { height: 100%; }
-/* A typed character the pane has not echoed yet (predict-typing.js): a veil of the
-   terminal background dims it and an inset line underlines it, over the plain cell. */
-.xterm .keep-predicted-cell { pointer-events: none; background: color-mix(in srgb, var(--term-bg) 45%, transparent); box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--term-fg) 70%, transparent); }
+/* A typed character the pane has not echoed yet (predict-typing.js): an overlay that
+   draws the character over an opaque cell background it sets inline, underlined to mark
+   it unconfirmed; a blanked cell or covered placeholder; and the stand-in cursor. */
+.xterm .keep-predicted-cell, .xterm .keep-predicted-blank, .xterm .keep-predicted-cursor { pointer-events: none; white-space: pre; overflow: hidden; }
+.xterm .keep-predicted-cell { text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--term-fg) 55%, transparent); text-underline-offset: 2px; }
 .term.observer .xterm-host { display: flex; align-items: flex-start; justify-content: flex-start; }
 .term.observer .xterm { flex: none; width: max-content; height: max-content; }
 .term-status { flex: none; min-height: 21px; padding: 3px 10px; color: var(--term-dim); border-top: 1px solid var(--term-line); font: 10px var(--mono); text-transform: uppercase; letter-spacing: .06em; display: flex; align-items: center; gap: 10px; }
