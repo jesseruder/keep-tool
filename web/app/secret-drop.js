@@ -110,14 +110,14 @@ function install(root, ctx, request) {
   };
   field.addEventListener('input', update);
   root.querySelector('.sd-later').addEventListener('click', () => {
-    later.add(request.id);
+    later.add(answeredKey(request));
     setFolded(root, true);
     // The button just went away with the card: hand the keyboard back to the
     // terminal rather than leave it on nothing.
     root.closest('.stage-body')?.querySelector('.stage-terminal .xterm-helper-textarea')?.focus();
   });
   root.querySelector('.sd-pill').addEventListener('click', () => {
-    later.delete(request.id);
+    later.delete(answeredKey(request));
     setFolded(root, false);
     field.focus();
   });
@@ -215,18 +215,18 @@ export function syncSecretDrop(stage, ctx, item) {
     return;
   }
   const { request, more } = found;
-  if (root.dataset.requestId === request.id && root.dataset.done !== '1') {
+  if (root.dataset.requestId === answeredKey(request) && root.dataset.done !== '1') {
     const counter = root.querySelector('.sd-more');
     if (counter) counter.textContent = waitingText(more);
     return;
   }
   // A request answered here stays hidden until the state stops listing it.
-  if (root.dataset.requestId === request.id && root.dataset.done === '1') return;
+  if (root.dataset.requestId === answeredKey(request) && root.dataset.done === '1') return;
   const answered = justAnswered && justAnswered.sessionId === request.sessionId && Date.now() - justAnswered.at < 15000
     ? justAnswered : null;
   justAnswered = null;
   root.innerHTML = secretDropHTML(ctx.esc, request, { home: ctx.data?.scopes?.home || '', more, saved: answered?.text || '' });
-  root.dataset.requestId = request.id;
+  root.dataset.requestId = answeredKey(request);
   root.dataset.node = request.node;
   delete root.dataset.done;
   // The busy mark of the request answered before this one lives on the container, not
@@ -234,7 +234,7 @@ export function syncSecretDrop(stage, ctx, item) {
   root.classList.remove('busy');
   root.hidden = false;
   install(root, ctx, request);
-  setFolded(root, later.has(request.id));
+  setFolded(root, later.has(answeredKey(request)));
   // Straight on to the next one, the way Owner was going.
-  if (answered && !later.has(request.id)) root.querySelector('.sd-value')?.focus();
+  if (answered && !later.has(answeredKey(request))) root.querySelector('.sd-value')?.focus();
 }
