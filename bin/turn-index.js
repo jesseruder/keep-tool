@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 15;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -41,6 +41,9 @@ const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 const HEAD_FINGERPRINT_BYTES = 4096;
 const JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024;
 const DEFAULT_PRUNE_DAYS = 120;
+// What a pruned interactive session leaves behind for search: what people typed
+// and the agents' prose, a few percent of its rows, kept this much longer.
+const ARCHIVE_DAYS = 730;
 
 // A "nudge" is a turn Owner spent only to restart an agent that stopped early.
 // This is the metric the turn watcher is meant to drive down.
@@ -253,6 +256,28 @@ const MIGRATIONS = [
   { version: 14, statements: [
     'CREATE INDEX IF NOT EXISTS turns_unjudged ON turns(ended_at DESC) WHERE ended = 1 AND verdict IS NULL',
     'CREATE INDEX IF NOT EXISTS turns_unjudged_started ON turns(started_at DESC) WHERE ended = 1 AND verdict IS NULL AND ended_at IS NULL',
+  ] },
+  // Search outlives the prune. Before an interactive session's rows go, its typed
+  // messages and agent prose are copied here (prune below), and `keep search` and
+  // the console's finder read them after the live index (session-text-search.js).
+  // Separate tables, so ingest never meets a half-pruned session.
+  { version: 15, statements: [
+    `CREATE TABLE IF NOT EXISTS archive_sessions (
+       id TEXT PRIMARY KEY, agent TEXT, kind TEXT, project TEXT, card_id TEXT,
+       started_at INTEGER, last_at INTEGER)`,
+    `CREATE TABLE IF NOT EXISTS archive_messages (
+       id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, ts INTEGER, role TEXT NOT NULL,
+       kind TEXT NOT NULL, text TEXT)`,
+    'CREATE INDEX IF NOT EXISTS archive_messages_session ON archive_messages(session_id)',
+    'CREATE INDEX IF NOT EXISTS archive_sessions_last ON archive_sessions(last_at)',
+    `CREATE VIRTUAL TABLE IF NOT EXISTS archive_fts USING fts5(
+       text, content='archive_messages', content_rowid='id', tokenize='unicode61')`,
+    `CREATE TRIGGER IF NOT EXISTS archive_fts_ai AFTER INSERT ON archive_messages BEGIN
+       INSERT INTO archive_fts(rowid, text) VALUES (new.id, new.text);
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS archive_fts_ad AFTER DELETE ON archive_messages BEGIN
+       INSERT INTO archive_fts(archive_fts, rowid, text) VALUES ('delete', old.id, old.text);
+     END`,
   ] },
 ];
 
@@ -1465,13 +1490,21 @@ function prune(options = {}) {
   const candidates = chosen || pruneCandidates({ ...options, cutoff });
   const countIn = (sql, id) => Number(statement(handle, sql).get(id).n || 0);
   const counts = {
-    cutoff, sessions: 0, messages: 0, turns: 0, files: 0,
+    cutoff, sessions: 0, messages: 0, turns: 0, files: 0, archived: 0, archiveDropped: 0,
     more: !chosen && limit > 0 && candidates.length === limit,
   };
-  if (!candidates.length) return options.dry === true ? { ...counts, dry: true } : counts;
+  const archiveCutoff = Number.isFinite(options.archiveCutoff) ? options.archiveCutoff : Date.now() - ARCHIVE_DAYS * 86400e3;
+  const archivable = (id) => countIn(`SELECT COUNT(*) AS n FROM messages m JOIN sessions s ON s.id = m.session_id
+    WHERE m.session_id = ? AND s.kind = 'interactive' AND m.kind IN ('human', 'text') AND m.text IS NOT NULL`, id);
+  if (!candidates.length && options.dry !== true) {
+    counts.archiveDropped = dropArchive(handle, archiveCutoff, limit, options.busyTimeoutMs);
+    return counts;
+  }
+  if (!candidates.length) return { ...counts, dry: true };
   if (options.dry === true) {
     for (const id of candidates) {
       counts.sessions += 1;
+      counts.archived += archivable(id);
       counts.messages += countIn('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?', id);
       counts.turns += countIn('SELECT COUNT(*) AS n FROM turns WHERE session_id = ?', id);
       counts.files += countIn('SELECT COUNT(*) AS n FROM ingest_state WHERE session_id = ?', id);
@@ -1486,10 +1519,14 @@ function prune(options = {}) {
       // turn since. The cutoff is re-checked here, in the same statement that
       // deletes: only a session that is still stale loses its rows, and the
       // counts report what actually went rather than what was planned.
+      // Archived first, under the same lock and the same staleness test as the
+      // delete, so only a session that is really going leaves its words behind.
+      const archived = archiveSession(handle, id, cutoff);
       const deleted = statement(handle,
         `DELETE FROM sessions WHERE id = ? AND COALESCE(last_at, started_at) IS NOT NULL
            AND COALESCE(last_at, started_at) < ?`).run(id, cutoff);
       if (!Number(deleted.changes)) continue;
+      counts.archived += archived;
       counts.sessions += 1;
       counts.messages += countIn('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?', id);
       counts.turns += countIn('SELECT COUNT(*) AS n FROM turns WHERE session_id = ?', id);
@@ -1505,7 +1542,44 @@ function prune(options = {}) {
     try { handle.exec('ROLLBACK'); } catch {}
     throw error;
   }
+  counts.archiveDropped = dropArchive(handle, archiveCutoff, limit, options.busyTimeoutMs);
   return counts;
+}
+
+// A resumed session pruned twice replaces its archive rather than doubling it.
+function archiveSession(handle, id, cutoff) {
+  const session = statement(handle, `SELECT id, agent, kind, project, card_id, started_at, last_at FROM sessions
+    WHERE id = ? AND kind = 'interactive' AND COALESCE(last_at, started_at) IS NOT NULL
+      AND COALESCE(last_at, started_at) < ?`).get(id, cutoff);
+  if (!session) return 0;
+  statement(handle, 'DELETE FROM archive_messages WHERE session_id = ?').run(id);
+  statement(handle, `INSERT OR REPLACE INTO archive_sessions (id, agent, kind, project, card_id, started_at, last_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`).run(session.id, session.agent, session.kind, session.project, session.card_id,
+    session.started_at, session.last_at);
+  const copied = statement(handle, `INSERT INTO archive_messages (session_id, ts, role, kind, text)
+    SELECT session_id, ts, role, kind, text FROM messages
+    WHERE session_id = ? AND kind IN ('human', 'text') AND text IS NOT NULL ORDER BY seq`).run(id);
+  return Number(copied.changes || 0);
+}
+
+// The archive's own horizon, oldest first and in bounded batches like the prune.
+function dropArchive(handle, archiveCutoff, limit, busyTimeoutMs) {
+  const ids = statement(handle, 'SELECT id FROM archive_sessions WHERE last_at IS NOT NULL AND last_at < ? ORDER BY last_at LIMIT ?')
+    .all(archiveCutoff, limit).map((row) => row.id);
+  if (!ids.length) return 0;
+  setBusyTimeout(handle, busyTimeoutMs);
+  handle.exec('BEGIN IMMEDIATE');
+  try {
+    for (const id of ids) {
+      statement(handle, 'DELETE FROM archive_messages WHERE session_id = ?').run(id);
+      statement(handle, 'DELETE FROM archive_sessions WHERE id = ?').run(id);
+    }
+    handle.exec('COMMIT');
+  } catch (error) {
+    try { handle.exec('ROLLBACK'); } catch {}
+    throw error;
+  }
+  return ids.length;
 }
 
 // ---------- queries ----------
@@ -1593,6 +1667,6 @@ function stats(options = {}) {
 module.exports = {
   open, close, databaseFile, ingestFile, ingestSessionsFromLiveState, backfill, prune, pruneCandidates,
   search, turnsForSession, sessionRow, stats, isNudge, normalizeProject,
-  SCHEMA_VERSION, TEXT_CAP, TOOL_CAP, COMMAND_CAP, NUDGE_RE, DEFAULT_PRUNE_DAYS,
+  SCHEMA_VERSION, TEXT_CAP, TOOL_CAP, COMMAND_CAP, NUDGE_RE, DEFAULT_PRUNE_DAYS, ARCHIVE_DAYS,
   toolInputCommand,
 };

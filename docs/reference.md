@@ -604,7 +604,9 @@ whole index unless `--since` narrows it.
 `--since` reads backwards here: `+7d` means the last seven days. Hooks index at
 most 512 KiB per turn and wait at most 250 ms for the write lock, so a backlog is
 left to the daemon rather than made an agent's problem. Indexed sessions idle for
-more than 120 days are pruned by the daemon once a day, or by `keep turns prune`.
+more than 120 days are pruned by the daemon once a day, or by `keep turns prune`;
+an interactive session's typed messages and agent prose stay searchable in the
+index's archive for two years (see [turn index](turn-index.md#retention)).
 The database is a derived cache and can be deleted at any time.
 See [turn index](turn-index.md).
 

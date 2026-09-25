@@ -50,39 +50,71 @@ function ftsMatch(query) {
 function searchDatabase(handle, query, options = {}) {
   const match = ftsMatch(query);
   if (!match) return [];
-  const where = ['messages_fts MATCH ?'];
+  if (Array.isArray(options.sessions) && !options.sessions.length) return [];
+  const sessionLimit = options.sessionLimit || SESSION_LIMIT;
+  const bySession = new Map();
+  collect(bySession, queryHits(handle, LIVE, match, options, sessionLimit), sessionLimit, false);
+  // Sessions the prune has taken leave their words in the archive (turn-index.js
+  // migration 15); they are older than anything live, so they only fill what is left.
+  if (bySession.size < sessionLimit && hasArchive(handle)) {
+    collect(bySession, queryHits(handle, ARCHIVE, match, options, sessionLimit), sessionLimit, true);
+  }
+  return [...bySession.values()];
+}
+
+const LIVE = { fts: 'messages_fts', messages: 'messages', sessions: 'sessions', title: 's.title', archive: false };
+const ARCHIVE = { fts: 'archive_fts', messages: 'archive_messages', sessions: 'archive_sessions', title: "''", archive: true };
+
+function queryHits(handle, source, match, options, sessionLimit) {
+  const where = [`${source.fts} MATCH ?`];
   const params = [match];
-  if (!options.all) where.push("m.kind IN ('human', 'text')", "s.kind = 'interactive'");
+  // The archive holds only typed messages and prose from interactive sessions.
+  if (!options.all && !source.archive) where.push("m.kind IN ('human', 'text')", "s.kind = 'interactive'");
   if (Array.isArray(options.sessions)) {
-    if (!options.sessions.length) return [];
     where.push('m.session_id IN (SELECT value FROM json_each(?))');
     params.push(JSON.stringify(options.sessions.map(String)));
   }
   if (Number.isFinite(options.since)) { where.push('m.ts >= ?'); params.push(options.since); }
   if (options.project) { where.push('s.project = ?'); params.push(String(options.project)); }
   if (options.agent) { where.push('s.agent = ?'); params.push(String(options.agent)); }
-  const sessionLimit = options.sessionLimit || SESSION_LIMIT;
   params.push(options.hitLimit || Math.max(HIT_LIMIT, sessionLimit * 15));
-  const rows = handle.prepare(`SELECT m.session_id AS sessionId, m.ts, m.role, m.kind,
-      s.title, s.card_id AS card, s.project, s.agent,
-      snippet(messages_fts, 0, char(2), char(3), '…', 14) AS snippet
-    FROM messages_fts
-    JOIN messages m ON m.id = messages_fts.rowid
-    JOIN sessions s ON s.id = m.session_id
+  return handle.prepare(`SELECT m.session_id AS sessionId, m.ts, m.role, m.kind,
+      ${source.title} AS title, s.card_id AS card, s.project, s.agent,
+      snippet(${source.fts}, 0, char(2), char(3), '…', 14) AS snippet
+    FROM ${source.fts}
+    JOIN ${source.messages} m ON m.id = ${source.fts}.rowid
+    JOIN ${source.sessions} s ON s.id = m.session_id
     WHERE ${where.join(' AND ')}
-    ORDER BY messages_fts.rowid DESC LIMIT ?`).all(...params);
-  const bySession = new Map();
+    ORDER BY ${source.fts}.rowid DESC LIMIT ?`).all(...params);
+}
+
+function collect(bySession, rows, sessionLimit, archived) {
+  const fresh = new Set();
   for (const row of rows) {
     const hit = bySession.get(row.sessionId);
-    if (hit) { hit.hits += 1; continue; }
+    // A session resumed after its prune has live rows and archived ones; the live
+    // hit stands, and the archive's copies of the same words are not counted again.
+    if (hit) { if (!archived || fresh.has(row.sessionId)) hit.hits += 1; continue; }
     if (bySession.size >= sessionLimit) continue;
+    if (archived) fresh.add(row.sessionId);
     bySession.set(row.sessionId, {
       sessionId: row.sessionId, ts: row.ts, role: row.role, kind: row.kind, hits: 1,
       title: row.title || '', card: row.card || '', project: row.project || '', agent: row.agent || '',
       snippet: String(row.snippet || '').replace(/\s+/g, ' ').trim(),
+      ...(archived ? { archived: true } : {}),
     });
   }
-  return [...bySession.values()];
+}
+
+// A database no newer Keep has opened yet has no archive; a read-only handle cannot
+// create one, so search simply does without it.
+// Only a yes is remembered: the daemon may migrate while a reader holds its handle.
+const archiveKnown = new WeakSet();
+function hasArchive(handle) {
+  if (archiveKnown.has(handle)) return true;
+  if (!handle.prepare("SELECT 1 AS found FROM sqlite_master WHERE name = 'archive_fts'").get()) return false;
+  archiveKnown.add(handle);
+  return true;
 }
 
 // One long-lived worker holding one read-only handle. A newer query supersedes any

@@ -628,7 +628,7 @@ test('prune drops sessions last active before the cutoff and leaves the rest who
 
   // Nothing old enough is a no-op, not an error.
   assert.deepEqual(turnIndex.prune({ cutoff: 0 }),
-    { cutoff: 0, sessions: 0, messages: 0, turns: 0, files: 0, more: false });
+    { cutoff: 0, sessions: 0, messages: 0, turns: 0, files: 0, archived: 0, archiveDropped: 0, more: false });
 });
 
 test('a bounded prune drops its limit and says there is more to do', (t) => {
@@ -1102,5 +1102,13 @@ test('migration 14 creates sparse indexes for the unjudged watcher queue', (t) =
     .map((row) => [row.name, row.sql]));
   assert.match(indexes.get('turns_unjudged'), /WHERE ended = 1 AND verdict IS NULL/);
   assert.match(indexes.get('turns_unjudged_started'), /ended_at IS NULL/);
-  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 14);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, turnIndex.SCHEMA_VERSION);
+});
+
+test('migration 15 creates the search archive beside the live tables', (t) => {
+  tempDir(t);
+  const db = turnIndex.open();
+  const names = new Set(db.prepare('SELECT name FROM sqlite_master').all().map((row) => row.name));
+  for (const name of ['archive_sessions', 'archive_messages', 'archive_fts', 'archive_fts_ai', 'archive_fts_ad']) assert.ok(names.has(name), name);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 15);
 });

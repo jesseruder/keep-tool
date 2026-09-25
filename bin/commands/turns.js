@@ -252,7 +252,9 @@ function turnsPrune(argv) {
   if (o.json) return console.log(JSON.stringify(result, null, 2));
   console.log(`${o.dry ? 'would drop' : 'dropped'} ${result.sessions} sessions, ${result.messages} messages, `
     + `${result.turns} turns, ${result.files} ingest records last active before `
-    + `${new Date(result.cutoff).toISOString().slice(0, 10)}`);
+    + `${new Date(result.cutoff).toISOString().slice(0, 10)}; `
+    + `${o.dry ? 'would keep' : 'kept'} ${result.archived || 0} typed messages and replies for search`
+    + `${result.archiveDropped ? `, and dropped ${result.archiveDropped} archived sessions past ${turnIndex.ARCHIVE_DAYS} days` : ''}`);
 }
 
 const TURNS_SUBCOMMANDS = {

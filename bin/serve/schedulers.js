@@ -776,7 +776,9 @@ function startSchedulers(ctx) {
         // A sweep that hit its limit keeps the clock unset so the next tick
         // continues it; only a finished sweep counts as today's prune.
         if (!pruned.more) lastTurnIndexPruneAt = Date.now();
-        if (pruned.sessions) detail += `; pruned ${pruned.sessions} sessions${pruned.more ? ', more to go' : ''}`;
+        if (pruned.sessions) detail += `; pruned ${pruned.sessions} sessions${pruned.more ? ', more to go' : ''}`
+          + `${pruned.archived ? `, kept ${pruned.archived} messages for search` : ''}`;
+        if (pruned.archiveDropped) detail += `; dropped ${pruned.archiveDropped} archived sessions`;
       }
       health.record('turn-index', { ok: true, cadenceMs: 30e3, detail });
     } catch (error) {

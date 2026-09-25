@@ -64,3 +64,30 @@ test('keep search answers with cards and conversations, and either alone on requ
   const text = await output(() => search(['websocket'], { loadAll, getKeepApi }));
   assert.deepEqual([text[0], text[2], text[3]], ['Cards', '', 'Conversations']);
 });
+
+test('a pruned interactive session keeps its words in the archive, and search still finds it until the archive horizon', () => {
+  const { searchDatabase } = require('./session-text-search.js');
+  const handle = turnIndex.open(turnIndex.databaseFile());
+  handle.prepare("INSERT INTO sessions (id, agent, kind, project, card_id, last_at) VALUES ('old', 'claude', 'interactive', '~/keep-tool', 'old-card', 1000)").run();
+  handle.prepare("INSERT INTO sessions (id, agent, kind, project, last_at) VALUES ('old-bg', 'claude', 'headless', '~/keep-tool', 1000)").run();
+  const message = handle.prepare('INSERT INTO messages (session_id, seq, ts, role, kind, text) VALUES (?, ?, ?, ?, ?, ?)');
+  message.run('old', 1, 900, 'user', 'human', 'decide the zeppelin schema');
+  message.run('old', 2, 950, 'tool', 'tool_result', 'zeppelin build log');
+  message.run('old', 3, 990, 'assistant', 'text', 'The zeppelin schema is settled.');
+  message.run('old-bg', 1, 900, 'user', 'human', 'zeppelin in a headless run');
+
+  const dry = turnIndex.prune({ cutoff: 5000, dry: true });
+  assert.deepEqual([dry.sessions, dry.archived], [2, 2]);
+  const pruned = turnIndex.prune({ cutoff: 5000, archiveCutoff: 0 });
+  assert.deepEqual([pruned.sessions, pruned.messages, pruned.archived, pruned.archiveDropped], [2, 4, 2, 0]);
+  assert.equal(handle.prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id IN ('old', 'old-bg')").get().n, 0);
+
+  const [hit, ...rest] = searchDatabase(handle, 'zeppelin schema');
+  assert.equal(rest.length, 0, 'the headless run and the tool output were not archived');
+  assert.deepEqual([hit.sessionId, hit.archived, hit.card, hit.hits, hit.role], ['old', true, 'old-card', 2, 'assistant']);
+  assert.deepEqual(searchDatabase(handle, 'zeppelin', { sessions: ['other'] }), []);
+  assert.deepEqual(searchDatabase(handle, 'zeppelin', { since: 950 }).map((row) => row.hits), [1]);
+
+  assert.equal(turnIndex.prune({ cutoff: 5000, archiveCutoff: 1001 }).archiveDropped, 1);
+  assert.deepEqual(searchDatabase(handle, 'zeppelin'), []);
+});

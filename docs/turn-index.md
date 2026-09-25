@@ -276,6 +276,18 @@ turns and `ingest_state`, and the reported counts are what actually went rather
 than what was planned. `pruneCandidates()` exposes that selection so a caller can
 look before it deletes.
 
+Search outlives the prune. Inside the same transaction, just before an
+interactive session's rows go, its typed messages and agent prose (`human` and
+`text` rows, a few percent of the session) are copied into `archive_sessions` and
+`archive_messages`, with their own `archive_fts` (migration 15). `keep search`,
+`keep turns search` and the console's finder read the live index first and fill
+what is left from the archive, marking those hits `archived`. The archive is
+dropped on its own horizon, **730 days** after a session's last activity, by the
+same prune in bounded batches; `prune` reports `archived` and `archiveDropped`.
+A session resumed after its prune is re-indexed live, and pruning it again
+replaces its archive rather than doubling it. Headless runs, subagents and tool
+output are not archived.
+
 A pruned file that is still on disk is simply re-indexed from zero the next time
 something ingests it, since its `ingest_state` row went with it. Sessions with no
 timestamp at all are never pruned: an unknown age is not an old age.
