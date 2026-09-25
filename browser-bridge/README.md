@@ -136,6 +136,13 @@ renderer it got and exits 1 if that is SwiftShader, llvmpipe or no WebGL at all
 (`--without-gpu-flags` shows what Edge picks on its own). From a session, the same answer
 comes from `javascript_tool` reading `WEBGL_debug_renderer_info` on the page under test.
 
+A session on another machine can drive this Edge with no token leaving the box: register
+the stdio server run over SSH, for example `claude mcp add-json --scope user browser-gpu
+'{"type":"stdio","command":"ssh","args":["-T","<user>@<gpu-node>","node","<checkout>/browser-bridge/mcp/server.js"]}'`.
+`mcp/server.js` talks to the host's socket on the node itself, like the daemon does. A
+node that stops itself when idle should count tool calls rather than open connections as
+use, because a session keeps its MCP servers connected for as long as it runs.
+
 To check it: `systemctl --user status browser-bridge-daemon browser-bridge-edge`,
 `curl -s http://127.0.0.1:47331/healthz`, `edge.log` for the extension id, and
 `host.log` for `extension ready`. `claude mcp list` should show `browser` connected.
