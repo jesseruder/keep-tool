@@ -4161,8 +4161,11 @@ function codexSessionFromTail(id, meta, tail, options = {}) {
 // otherwise pair one file's meta with another's tail (an ended turn from the old file
 // read as the new session's state). One mismatch is read again; a second refuses.
 async function readNodeRollout(client, sessionId, node) {
+  // A generation is the node's generationOf string; an answer without one names no
+  // particular incarnation of its path, so it never pairs, even with another without.
   const same = (meta, tail) => Boolean(meta && tail && typeof meta.path === 'string' && meta.path
-    && meta.path === tail.path && meta.generation === tail.generation);
+    && meta.path === tail.path && typeof meta.generation === 'string' && meta.generation
+    && meta.generation === tail.generation);
   let [meta, tail] = await Promise.all([client.meta(), client.tail()]);
   if (same(meta, tail)) return { meta, tail };
   meta = await client.meta();

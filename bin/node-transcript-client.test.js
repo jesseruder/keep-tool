@@ -235,6 +235,16 @@ test('a Codex rollout whose meta and tail name different files is read again onc
       tailOf({ ...oldFile, generation: 'g-again' }, oldText)]);
     await assert.rejects(serve.remoteSessionRead(sid, { ...f.deps, nodeTranscript: recreated.factory }),
       (error) => error.status === 409 && /changed on aws3 while it was read/.test(error.message));
+    // The same path with no generation on either answer (missing, null or empty) names
+    // no incarnation of it: never paired, read again once, then refused.
+    for (const generation of [undefined, null, '']) {
+      const bare = { ...oldFile, generation };
+      const unnamed = client([metaOf(bare), metaOf(bare)], [tailOf(bare, oldText), tailOf(bare, oldText)]);
+      await assert.rejects(serve.remoteSessionRead(sid, { ...f.deps, nodeTranscript: unnamed.factory }),
+        (error) => error.status === 409 && error.extra.reason === 'remote-node'
+          && error.message === `the rollout of ${sid} changed on aws3 while it was read; nothing was sent`, `generation ${generation}`);
+      assert.deepEqual(unnamed.asked.sort(), ['meta', 'meta', 'tail', 'tail'], `generation ${generation}: read again once`);
+    }
   } finally { f.cleanup(); }
 });
 
