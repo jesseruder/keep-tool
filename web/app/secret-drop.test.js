@@ -23,6 +23,7 @@ test('only the focused session\'s pending requests show, oldest first', () => {
   assert.equal(secretRequestFor(data, 's3'), null);
   assert.equal(secretRequestFor(data, undefined), null);
   assert.equal(secretRequestFor({}, 's1'), null);
+  assert.deepEqual(secretRequestFor(data, 's1', new Set([data.secretRequests[1].id])).more, 0, 'an answered request is skipped');
 });
 
 test('the counter says length and lines, never the value', () => {

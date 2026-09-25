@@ -11,11 +11,16 @@ import * as api from './api.js';
 const KEY_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.8-9.8M17 6l3 3M14.5 8.5l2.5 2.5"/></svg>';
 const FULFILL_TIMEOUT_MS = 45e3;
 
+// Requests answered (saved or declined) on this page. The state that still lists one
+// may have been built before the answer landed, and a stage rebuilt in the meantime
+// has lost its own mark: without this the answered card came back over the terminal.
+const answeredHere = new Set();
+
 // The pending request for a session, oldest first when there are several: the
 // panel answers one at a time and the next takes its place.
-export function secretRequestFor(data, sessionId) {
+export function secretRequestFor(data, sessionId, answered = answeredHere) {
   if (!sessionId) return null;
-  const rows = (data?.secretRequests || []).filter((r) => r && r.status === 'pending' && r.sessionId === sessionId);
+  const rows = (data?.secretRequests || []).filter((r) => r && r.status === 'pending' && r.sessionId === sessionId && !answered.has(r.id));
   rows.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   return rows.length ? { request: rows[0], more: rows.length - 1 } : null;
 }
@@ -131,6 +136,7 @@ function install(root, ctx, request) {
       await api.write('/api/secrets/fulfill', { id: request.id, value: field.value }, 'POST',
         { label: 'Handing off secret', timeoutMs: FULFILL_TIMEOUT_MS });
       field.value = '';
+      answeredHere.add(request.id);
       root.dataset.done = '1';
       root.hidden = true;
       justAnswered = { sessionId: request.sessionId, text: `✓ ${request.name} saved on ${request.node}`, at: Date.now() };
@@ -154,6 +160,7 @@ function install(root, ctx, request) {
       await api.write('/api/secrets/decline', { id: request.id, reason: root.querySelector('.sd-reason').value },
         'POST', { label: 'Declining secret request' });
       field.value = '';
+      answeredHere.add(request.id);
       root.dataset.done = '1';
       root.hidden = true;
       justAnswered = { sessionId: request.sessionId, text: `Declined ${request.name}`, at: Date.now() };

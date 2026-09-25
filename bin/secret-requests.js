@@ -51,11 +51,11 @@ function effective(record, now) {
 function publicRecord(record) {
   const {
     id, name, purpose, card, sessionId, agent, pane, node, path: file, key, replace, multiline,
-    status, createdAt, expiresAt, resolvedAt, outcome, reason, lastError,
+    status, createdAt, expiresAt, resolvedAt, outcome, reason, lastError, supersededBy,
   } = record;
   return {
     id, name, purpose, card, sessionId, agent, pane, node, path: file, key, replace, multiline,
-    status, createdAt, expiresAt, resolvedAt, outcome, reason, lastError,
+    status, createdAt, expiresAt, resolvedAt, outcome, reason, lastError, supersededBy: supersededBy || null,
   };
 }
 
@@ -63,6 +63,12 @@ function publicRecord(record) {
 // Read straight from the store, so the dashboard worker can build it too.
 function consoleRequests(root, now = Date.now()) {
   return readStore(root).map((r) => effective(r, now)).filter((r) => r.status === 'pending').map(publicRecord);
+}
+
+// One destination for one session: the same file (and key) on the same machine. Two
+// pending requests for it are one ask made twice, and Owner should see one panel.
+function sameDestination(a, b) {
+  return a.sessionId === b.sessionId && a.node === b.node && a.path === b.path && (a.key || null) === (b.key || null);
 }
 
 function refusal(status, error, extra = {}) { return { status, body: { error, ...extra } }; }
@@ -160,15 +166,20 @@ function createSecretService(options = {}) {
     const replace = body.replace === true;
     const purpose = text(body.purpose, 400) || null;
     // The same destination asked for the same way is the same request; a new name or
-    // purpose updates it. Asking with a different --replace or --multiline is a new one.
-    const same = live.find((r) => r.status === 'pending' && r.sessionId === sessionId && r.node === node
-      && r.path === file && (r.key || null) === key && r.replace === replace && r.multiline === multiline);
+    // purpose updates it. Asked with a different --replace or --multiline, it is a new
+    // request that takes the old one's place: Owner consented to what the panel said,
+    // so its terms are never changed under it, and he still sees one panel, not two.
+    const asked = { sessionId, node, path: file, key };
+    const earlier = live.filter((r) => r.status === 'pending' && sameDestination(r, asked));
+    const same = earlier.find((r) => r.replace === replace && r.multiline === multiline);
     if (same) {
       const updated = same.name === name && same.purpose === purpose ? same : update(same.id, { name, purpose });
       if (updated !== same) onChange();
       return { status: 200, body: { request: publicRecord(updated), existing: true } };
     }
-    const pending = live.filter((r) => r.status === 'pending');
+    const busy = earlier.find((r) => writing.has(r.id));
+    if (busy) return refusal(409, `secret request ${busy.id} for that destination is being written now; ask again once it settles`);
+    const pending = live.filter((r) => r.status === 'pending' && !earlier.includes(r));
     if (pending.filter((r) => r.sessionId === sessionId).length >= MAX_PENDING_PER_SESSION) {
       return refusal(429, `this session already has ${MAX_PENDING_PER_SESSION} secret requests waiting`);
     }
@@ -181,10 +192,14 @@ function createSecretService(options = {}) {
       pane, node, path: file, key, replace, multiline,
       status: 'pending', createdAt: at, expiresAt: at + PENDING_TTL_MS, resolvedAt: null,
     };
+    for (const old of earlier) {
+      const index = requests.findIndex((r) => r.id === old.id);
+      requests[index] = { ...requests[index], status: 'superseded', resolvedAt: at, supersededBy: id };
+    }
     requests.push(record);
     save(requests);
     onChange();
-    return { status: 200, body: { request: publicRecord(record) } };
+    return { status: 200, body: { request: publicRecord(record), ...(earlier.length ? { superseded: earlier.map((r) => r.id) } : {}) } };
   }
 
   // A node sees its own requests; the daemon's own callers see every one.
@@ -248,6 +263,13 @@ function createSecretService(options = {}) {
         status: 'delivered', resolvedAt: now(), lastError: null,
         outcome: { replaced: Boolean(outcome && outcome.replaced), bytes: Number(outcome && outcome.bytes) || null },
       });
+      // Anything else still asking for this destination is answered by this write.
+      const at = now();
+      const rest = load();
+      const stale = rest.filter((r) => r.id !== id && effective(r, at).status === 'pending' && !writing.has(r.id) && sameDestination(r, record));
+      if (stale.length) {
+        save(rest.map((r) => (stale.includes(r) ? { ...r, status: 'superseded', resolvedAt: at, supersededBy: id } : r)));
+      }
       tell(resolved, fitted((short) => `[keep] secret ${record.name} written to ${where(record, short)} (request ${id}); use it without printing it.`));
       return { status: 200, body: { request: publicRecord(resolved) } };
     } finally {

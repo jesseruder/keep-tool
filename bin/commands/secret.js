@@ -56,6 +56,7 @@ function describe(record) {
     : record.status === 'declined'
       ? `declined${record.reason ? `: ${record.reason}` : ''}`
       : record.status === 'expired' ? 'expired unanswered'
+        : record.status === 'superseded' ? `superseded by ${record.supersededBy || 'a newer request for the same destination'}`
         : `waiting on Owner since ${new Date(record.createdAt).toLocaleString()}${record.lastError ? ` (last attempt failed: ${record.lastError})` : ''}`;
   return `${record.id}  ${record.name} → ${target}  ${state}`;
 }
@@ -79,6 +80,7 @@ async function request(argv) {
   }), 'record the request');
   const record = body.request;
   console.log(`${body.existing ? 'already requested' : 'requested'}: ${describe(record)}`);
+  if (body.superseded?.length) console.log(`replaces ${body.superseded.join(', ')}: Owner sees only this one`);
   console.log('Owner fills this in from the Keep console when they open this session; the value goes straight to that file.');
   console.log(`End your turn now: a [keep] message arrives here once it is written. Check with: keep secret status ${record.id}`);
 }

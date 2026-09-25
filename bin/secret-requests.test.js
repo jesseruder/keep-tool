@@ -174,8 +174,8 @@ test('a node may only ask for a session in one of its own panes', (t) => {
   assert.equal(service.request(node, ask({ pane: 'p9@aws1' })).status, 200);
 });
 
-test('asking again updates the purpose; a different --replace is a new request', (t) => {
-  const { service } = setup(t);
+test('asking again updates the purpose; a different --replace replaces the pending one', (t) => {
+  const { service, root } = setup(t);
   const first = service.request({ class: 'local' }, ask()).body.request;
   const again = service.request({ class: 'local' }, ask({ purpose: 'clearer purpose' })).body;
   assert.equal(again.request.id, first.id);
@@ -183,6 +183,38 @@ test('asking again updates the purpose; a different --replace is a new request',
   const replacing = service.request({ class: 'local' }, ask({ replace: true })).body;
   assert.notEqual(replacing.request.id, first.id);
   assert.equal(replacing.request.replace, true);
+  assert.deepEqual(replacing.superseded, [first.id]);
+  assert.deepEqual(consoleRequests(root, 1_000_000).map((r) => r.id), [replacing.request.id], 'Owner sees one panel');
+  const old = service.list({ class: 'local' }, { id: first.id }).body.requests[0];
+  assert.equal(old.status, 'superseded');
+  assert.equal(old.supersededBy, replacing.request.id);
+});
+
+test('delivering a secret closes the other requests for that destination', async (t) => {
+  const { service, root } = setup(t);
+  // Stored as the old service left them: two pending asks for one key.
+  const a = service.request({ class: 'local' }, ask()).body.request;
+  const stored = JSON.parse(fs.readFileSync(storeFile(root), 'utf8'));
+  stored.requests.push({ ...stored.requests[0], id: 'bbbbbbbb', replace: true });
+  fs.writeFileSync(storeFile(root), JSON.stringify(stored));
+  const other = service.request({ class: 'local' }, ask({ key: 'OTHER_TOKEN' })).body.request;
+  assert.equal((await service.fulfill({ id: a.id, value: VALUE })).status, 200);
+  assert.deepEqual(consoleRequests(root, 1_000_000).map((r) => r.id), [other.id]);
+  const dup = service.list({ class: 'local' }, { id: 'bbbbbbbb' }).body.requests[0];
+  assert.equal(dup.status, 'superseded');
+  assert.equal(dup.supersededBy, a.id);
+  assert.equal((await service.fulfill({ id: 'bbbbbbbb', value: VALUE })).status, 409);
+});
+
+test('re-asking with other terms waits while the pending one is being written', async (t) => {
+  let release;
+  const { service } = setup(t, { writeLocal: () => new Promise((resolve) => { release = resolve; }) });
+  const a = service.request({ class: 'local' }, ask()).body.request;
+  const writing = service.fulfill({ id: a.id, value: VALUE });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(service.request({ class: 'local' }, ask({ replace: true })).status, 409);
+  release({ replaced: false, bytes: 1 });
+  assert.equal((await writing).status, 200);
 });
 
 test('a retry after a lost reply carries the request id and never widens to replace', async (t) => {
