@@ -151,8 +151,10 @@ function daemonNode(value = {}) { return nodeConfig(value).daemonNode; }
 function refuseLiveRegistryUnderTest(env) {
   if (!env.NODE_TEST_CONTEXT || env.KEEP_TEST_ENV_SCRUBBED) return;
   const dir = env.KEEP_DIR ? path.resolve(env.KEEP_DIR) : '';
+  // macOS names its temp dirs through the /private alias as well; no filesystem call,
+  // since the daemon reaches this through the session-number registry.
   const temps = new Set([os.tmpdir(), '/tmp']);
-  for (const temp of [...temps]) { try { temps.add(fs.realpathSync(temp)); } catch {} }
+  for (const temp of [...temps]) temps.add(temp.startsWith('/private/') ? temp.slice('/private'.length) : `/private${temp}`);
   if (dir && [...temps].some((temp) => dir.startsWith(`${path.resolve(temp)}${path.sep}`))) return;
   throw new Error(`keep: a test run without scripts/test-env.cjs would use the live registry at ${dir || '~/keep'}; `
     + 'run tests with `node scripts/test-runner.cjs <files>` or `node --test --require ./scripts/test-env.cjs <files>`');
