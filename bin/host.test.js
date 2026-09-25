@@ -370,7 +370,8 @@ test('PTY output preserves invalid UTF-8 bytes in live and replay data', async (
     const expected = Buffer.from([0xff, 0xfe, 0x41]);
     const { pane } = await client.request('spawn', {
       cmd: '/bin/sh',
-      args: ['-c', "sleep 0.05; printf '\\xff\\xfeA'"],
+      // Octal, not \x: /bin/sh is dash on Linux, and POSIX printf has no \x escape.
+      args: ['-c', "sleep 0.05; printf '\\377\\376A'"],
     });
     const live = [];
     let resolveExit;

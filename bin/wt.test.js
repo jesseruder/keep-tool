@@ -271,7 +271,8 @@ test('land deploys a live main checkout and says why when it cannot', () => {
     commitIn(worktree, 'first');
     const first = land(worktree);
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, 'the live checkout runs what was just landed');
-    assert.deepEqual(restarts, [['keep', 'restart-daemon']], 'and is handed its own restart');
+    // Its own restart, then every other node catching up through the daemon.
+    assert.deepEqual(restarts, [['keep', 'restart-daemon'], ['keep', 'nodes', 'update']], 'and is handed its own restart');
     assert.match(said, new RegExp(`fast-forwarded .*keep-tool to ${first.slice(0, 12)}`), 'the message names the sha this land pushed');
     assert.equal(git(f.main, 'status', '--porcelain'), '', 'the fast-forward leaves no working-tree changes');
 
@@ -281,7 +282,7 @@ test('land deploys a live main checkout and says why when it cannot', () => {
     commitIn(worktree, 'second');
     const second = land(worktree);
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, 'a dirty checkout keeps its own state');
-    assert.equal(restarts.length, 1, 'and is not restarted onto code it does not have');
+    assert.equal(restarts.length, 2, 'and is not restarted onto code it does not have');
     assert.match(said, /has uncommitted changes; left it alone — it is still running the old code/);
     assert.equal(git(f.origin, 'rev-parse', 'main'), second, 'but the land itself still happened');
     fs.unlinkSync(path.join(f.main, 'local.txt'));
@@ -292,7 +293,7 @@ test('land deploys a live main checkout and says why when it cannot', () => {
     commitIn(worktree, 'third');
     const third = land(worktree);
     assert.equal(git(f.main, 'rev-parse', 'side'), first, 'the other branch is left where it was');
-    assert.equal(restarts.length, 1);
+    assert.equal(restarts.length, 2);
     assert.match(said, /: on side, not main; left it alone/);
     git(f.main, 'checkout', '-q', 'main');
 
@@ -303,7 +304,7 @@ test('land deploys a live main checkout and says why when it cannot', () => {
     land(worktree);
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, 'an unfinished cherry-pick is not merged over');
     assert.match(said, /unfinished operation \(CHERRY_PICK_HEAD\)/);
-    assert.equal(restarts.length, 1);
+    assert.equal(restarts.length, 2);
     fs.unlinkSync(path.join(f.main, '.git', 'CHERRY_PICK_HEAD'));
 
     // A refused restart is reported, not raised: the commits are already on origin.
@@ -323,7 +324,7 @@ test('land deploys a live main checkout and says why when it cannot', () => {
     const fifth = land(worktree, { noDeploy: true });
     assert.equal(git(f.origin, 'rev-parse', 'main'), fifth);
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), fourth, 'the checkout stays where it was');
-    assert.equal(restarts.length, 1);
+    assert.equal(restarts.length, 2);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -353,7 +354,7 @@ test('wt land deploys end to end through the CLI, and --no-deploy and WT_NO_DEPL
     assert.equal(landed.status, 0, landed.stderr);
     const first = landed.stdout.trim();
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), first);
-    assert.equal(readLog().trim(), 'restart-daemon', 'the configured restart actually runs');
+    assert.equal(readLog().trim(), 'restart-daemon\nnodes update', 'the configured restart actually runs, then the node update');
     assert.match(landed.stderr, /restarted/, 'and its output is relayed');
 
     write(path.join(worktree, 'two.txt'), 'two\n');
@@ -362,14 +363,14 @@ test('wt land deploys end to end through the CLI, and --no-deploy and WT_NO_DEPL
     assert.equal(skipped.status, 0, skipped.stderr);
     assert.equal(git(f.origin, 'rev-parse', 'main'), skipped.stdout.trim());
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, '--no-deploy reaches landWorktree from the CLI');
-    assert.equal(readLog().trim(), 'restart-daemon', 'and nothing was restarted');
+    assert.equal(readLog().trim(), 'restart-daemon\nnodes update', 'and nothing was restarted');
 
     write(path.join(worktree, 'three.txt'), 'three\n');
     commitIn(worktree, 'third');
     const disabled = runCli(f, ['land', worktree], undefined, { PATH: deployEnv.PATH, WT_TEST_RESTART_LOG: log });
     assert.equal(disabled.status, 0, disabled.stderr);
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, 'WT_NO_DEPLOY=1 keeps the harness away from the real thing');
-    assert.equal(readLog().trim(), 'restart-daemon');
+    assert.equal(readLog().trim(), 'restart-daemon\nnodes update');
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -1130,8 +1131,8 @@ test('land watches daemon health after the restart and names a regression with t
         onDeploy: (result) => events.push(result),
       });
     } finally { process.stderr.write = write2; }
-    assert.deepEqual(events.slice(0, 2), ['snapshot-before', 'keep restart-daemon'], 'the before picture is taken ahead of the restart');
-    const result = events[2];
+    assert.deepEqual(events.slice(0, 3), ['snapshot-before', 'keep restart-daemon', 'keep nodes update'], 'the before picture is taken ahead of the restart');
+    const result = events[3];
     assert.equal(result.deployed, true);
     assert.deepEqual(result.health.regressions, ['review-compact', 'brand-new'], 'a row failing before the restart, a startup stall, and the deploy row are not listed');
     assert.deepEqual(result.health.once, ['handoff-queue']);

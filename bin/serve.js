@@ -6744,12 +6744,10 @@ async function liveSessionPids(deps = {}, options = {}) {
       let output;
       if (typeof deps.psEnv === 'function') output = await deps.psEnv(pids, at);
       else {
-        // The same patience agentProcessRows now has: this read is what gives a fresh
-        // TUI its session id, and losing it under load loses the whole identity.
-        const result = await (deps.execFile || execFileAsync)('ps', ['-E', '-o', 'pid=,args=', '-p', pids.join(',')], {
-          encoding: 'utf8', timeout: 15e3, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' },
-        });
-        output = result.stdout;
+        // The reader a node's host uses: `ps -E` on macOS (with the same patience
+        // agentProcessRows has), /proc/<pid>/environ on Linux, which has no such flag.
+        const found = await processTable.readSessionEnv(pids, { execFile: deps.execFile, platform: deps.platform });
+        output = found.map((entry) => `${entry.pid} CLAUDE_CODE_SESSION_ID=${entry.sessionId}`).join('\n');
       }
       for (const line of String(output || '').split(/\r?\n/)) {
         const match = /^\s*(\d+)\s+.*(?:^|\s)CLAUDE_CODE_SESSION_ID=([A-Za-z0-9_-]+)(?=\s|$)/.exec(line);

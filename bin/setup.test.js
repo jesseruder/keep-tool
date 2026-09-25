@@ -509,7 +509,7 @@ function strayBackups(home) {
 
 test('the pack manifest names skills this checkout ships', () => {
   const packs = setup.loadPacks();
-  assert.deepEqual(packs.core.skills, ['keep', 'keep-scheduled-checks', 'keep-sessions', 'keep-shared-state', 'keep-ops', 'keep-agent-session', 'fleet-review']);
+  assert.deepEqual(packs.core.skills, ['keep', 'keep-scheduled-checks', 'keep-sessions', 'keep-shared-state', 'keep-secrets', 'keep-ops', 'keep-agent-session', 'fleet-review']);
   assert.deepEqual(packs.handoff.skills, ['implementation-handoff', 'codex-review-runner', 'ui-driving-handoff']);
   for (const pack of Object.values(packs)) {
     assert.ok(pack.description, 'every pack describes itself');
@@ -565,7 +565,7 @@ test('a shared skill directory is one destination even before it exists', () => 
     assert.equal(fs.existsSync(path.join(f.home, '.claude', 'skills')), false);
 
     const plans = setup.skillPlans(['core']);
-    assert.deepEqual(plans.map((plan) => plan.skill), ['keep', 'keep-scheduled-checks', 'keep-sessions', 'keep-shared-state', 'keep-ops', 'keep-agent-session', 'fleet-review'], 'one plan per skill');
+    assert.deepEqual(plans.map((plan) => plan.skill), ['keep', 'keep-scheduled-checks', 'keep-sessions', 'keep-shared-state', 'keep-secrets', 'keep-ops', 'keep-agent-session', 'fleet-review'], 'one plan per skill');
     setup.installHooks();
     for (const skill of ['keep', 'fleet-review']) {
       for (const real of linkTargets(f.home, skill)) assert.equal(real, fs.realpathSync(path.join(SKILLS, skill)), skill);

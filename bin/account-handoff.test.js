@@ -204,8 +204,10 @@ test('auth preflight kills a login-shell process group when startup exceeds its 
     const account = { id: 'secondary', label: 'Secondary', agent: 'claude', configDir, managed: true, builtIn: false };
     const env = { ...process.env, HOME: home, ZDOTDIR: home, PATH: '/usr/bin:/bin' };
     const started = Date.now();
-    assert.equal(await handoff.authPreflight(account, { env, authTimeoutMs: 250 }), false);
-    assert.ok(Date.now() - started < 2000, 'interactive shell startup remains bounded');
+    // The deadline has to outlast zsh reaching this .zshrc, or there is no descendant to
+    // kill: a cold interactive login zsh on Ubuntu reads /etc/zsh/* first and takes ~250ms.
+    assert.equal(await handoff.authPreflight(account, { env, authTimeoutMs: 1500 }), false);
+    assert.ok(Date.now() - started < 4000, 'interactive shell startup remains bounded');
     childPid = Number(fs.readFileSync(pidFile, 'utf8').trim());
     const alive = () => { try { process.kill(childPid, 0); return true; } catch (error) { if (error.code === 'ESRCH') return false; throw error; } };
     for (let i = 0; i < 50 && alive(); i++) await new Promise((resolve) => setTimeout(resolve, 20));
