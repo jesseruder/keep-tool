@@ -137,10 +137,12 @@ export const PREDICTED_CELL_CLASS = 'keep-predicted-cell';
 // One per mounted terminal. `agent` names the pane's agent (only those in
 // PREDICTED_AGENTS are predicted or measured), `remote` says whether the pane
 // is on another node, `mode` reads the viewer's setting, `now` is a monotonic
-// clock, and `reply` sends a terminal reply to the pane the way xterm's own
-// replies are sent.
+// clock, `reply` sends a terminal reply to the pane the way xterm's own replies
+// are sent, and `outputQueued` says whether any of the pane's output is still
+// waiting in xterm's write queue.
 export function createTypingPredictor({
   terminal, agent, remote, mode = getPredictTypingPreference, now = () => Date.now(), reply = null,
+  outputQueued = () => false,
 }) {
   const samples = [];
   // Keystrokes whose echo has not landed, oldest first, each with the input text it
@@ -204,13 +206,15 @@ export function createTypingPredictor({
     const buffer = terminal.buffer.active;
     return `${buffer.type}:${buffer.baseY + buffer.cursorY}:${buffer.cursorX}`;
   };
-  // While guesses stand and nothing of the pane's has moved the cursor since, the
-  // pane has not echoed them: a predicted agent's echo always erases on the prompt
-  // row (see PREDICTED_AGENTS), which clears `localCursor`. So the report names the
-  // column the pane's own output left, formatted exactly as
-  // xterm formats it (1-based row and column, no page for the private form), and
-  // is sent through the same path as xterm's replies. Any other query, or no
-  // standing guess, is left to xterm. A guess never changes the row.
+  // While a correction stands and nothing of the pane's has moved the cursor since
+  // the guesses did, the pane has not echoed them: a predicted agent's echo always
+  // erases on the prompt row (see PREDICTED_AGENTS), which retires the correction.
+  // That holds after the guesses themselves expire or are dropped, since the
+  // cursor is still where they left it. So the report names the column the pane's
+  // own output left, formatted exactly as xterm formats it (1-based row and
+  // column, no page for the private form), and is sent through the same path as
+  // xterm's replies. Any other query, or no correction, is left to xterm. A guess
+  // never changes the row.
   const reportPosition = (prefix) => (params) => {
     if (params.length !== 1 || params[0] !== 6 || typeof reply !== 'function') return false;
     if (localWrite || !advance || cursorKey() !== localCursor) return false;
@@ -313,7 +317,13 @@ export function createTypingPredictor({
   const keystroke = (data, options = {}) => {
     const at = now();
     if (entries.length && at - entries[0].at > STALE_KEYSTROKE_MS) clearEntries();
-    const decision = predictKeystroke(terminal, data, { ...options, agent: agent(), extraColumns: unparsed });
+    // xterm parses writes later, in order. With pane output still queued, the
+    // screen read here is older than the one the guess would land on: that output
+    // may move the cursor or replace the prompt before the guess runs. Such a
+    // keystroke is sent unpredicted and unmeasured, and the chain it would have
+    // extended can no longer be followed.
+    const decision = outputQueued() ? null
+      : predictKeystroke(terminal, data, { ...options, agent: agent(), extraColumns: unparsed });
     if (!decision) {
       // Enter, arrows, pastes and the like change the line in ways the expected
       // text cannot follow, so the keystrokes before them are no longer matched.
@@ -337,7 +347,9 @@ export function createTypingPredictor({
       // A Backspace guess blanks the cell it moved onto; a guessed character there
       // loses its overlay with it.
       if (decision.kind === 'backspace') drop(entries.filter((other) => other.decoration && other.x === x));
-      else mark(entry, x - 1);
+      // A chain dropped while this write waited in the queue took the entry with
+      // it; an overlay made now would belong to nothing and never be disposed.
+      else if (entries.includes(entry)) mark(entry, x - 1);
     });
     return true;
   };
@@ -364,7 +376,7 @@ export function createTypingPredictor({
     const bytes = first.bytes + waiting.slice(1).map((entry) => PREDICT_CHAR(entry.ch)).join('');
     draw(bytes, waiting.length, () => {
       const end = terminal.buffer.active.cursorX;
-      waiting.forEach((entry, i) => mark(entry, end - waiting.length + i));
+      waiting.forEach((entry, i) => { if (entries.includes(entry)) mark(entry, end - waiting.length + i); });
     });
   };
 

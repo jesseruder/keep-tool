@@ -642,3 +642,33 @@ test('a chain dropped by a redraw that is not an echo retires the correction wit
   assert.deepEqual(replies, ['\x1b[1;9R'], 'exactly one column left of the local cursor');
   assert.deepEqual(xtermReplies, []);
 });
+
+test('no guess is made or measured while pane output is still queued', async () => {
+  const terminal = await terminalWith('❯ ');
+  let queued = true;
+  const predictor = createTypingPredictor({
+    terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => 0, outputQueued: () => queued,
+  });
+  assert.equal(predictor.keystroke('a'), false);
+  await write(terminal, '');
+  assert.equal(predictor.pending, 0, 'nothing is recorded to measure');
+  assert.equal(terminal.liveDecorations.size, 0);
+  assert.equal(terminal.buffer.active.getLine(0).translateToString(true), '❯ ');
+  queued = false;
+  assert.equal(predictor.keystroke('b'), true);
+  await write(terminal, '');
+  assert.equal(predictor.pending, 1);
+  assert.deepEqual(markedColumns(terminal), [2]);
+});
+
+test('a guess whose chain is dropped before its write parses leaves no overlay', async () => {
+  const terminal = await terminalWith('❯ ');
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => 0 });
+  assert.equal(predictor.keystroke('a'), true);
+  // Enter drops the chain while the guess is still in xterm's write queue.
+  assert.equal(predictor.keystroke('\r'), false);
+  assert.equal(predictor.pending, 0);
+  await write(terminal, '');
+  assert.equal(terminal.liveDecorations.size, 0, 'the draw callback made no overlay for the dropped entry');
+  assert.equal(predictor.marked, 0);
+});

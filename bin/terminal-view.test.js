@@ -854,3 +854,25 @@ test('a shell pane on another node is not predicted even when prediction is on',
     assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), '❯ a', 'the shell echo is the only copy');
   } finally { f.mounted.dispose(); }
 });
+
+test('a keystroke while pane output is queued is sent unpredicted; the next one after it drains is predicted', async () => {
+  const f = fixture({ storage: new Map([['keep.console.predictTyping', 'on']]), pane: { meta: { agent: 'claude' } } });
+  try {
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    hostOutput(f, '\x1b[2J\x1b[H❯ ');
+    await f.drain();
+    f.socket.sent.length = 0;
+    // A pane frame arrives and is still waiting to parse when the key goes down.
+    hostOutput(f, '\x1b7\x1b[5;1Hspin\x1b8');
+    f.terminal.keyHandler({ type: 'keydown', key: 'x' });
+    f.terminal.input('x', true);
+    assert.deepEqual([...f.socket.sent.at(-1)], [0x78], 'the keystroke is sent as always');
+    await f.drain();
+    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), '❯ ', 'no guess was drawn');
+    f.terminal.keyHandler({ type: 'keydown', key: 'y' });
+    f.terminal.input('y', true);
+    await f.drain();
+    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), '❯ y');
+  } finally { f.mounted.dispose(); }
+});

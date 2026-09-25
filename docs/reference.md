@@ -206,9 +206,12 @@ with no attribute or saved-cursor change to the pane's stream, and an xterm deco
 placeholder is cleared by the first one. An echo is output that changes the prompt line
 or the cursor column from what the guesses left, or erases or shifts cells on that row
 (Claude Code's whole-line redraw ends with an erase); a bare cursor move onto the row is
-not one. A mark that lingers (up to 5 s) means the character was never echoed. While guesses stand, a cursor-position query from the
-pane (`CSI 6 n`, `CSI ? 6 n`) is answered with the column the pane's own output left,
-not the one the guesses moved the cursor to. The session Actions menu
+not one. A mark that lingers (up to 5 s) means the character was never echoed. From a guess until the pane's own output
+redraws the prompt row or moves the cursor (even if the guess expires first), a
+cursor-position query from the pane (`CSI 6 n`, `CSI ? 6 n`) is answered with the column
+the pane's own output left, not the one the guesses moved the cursor to. No guess is
+made while the pane's output is still queued in xterm, since the screen it would be
+drawn from is stale. The session Actions menu
 carries a per-viewer **Predict typing** setting (`keep.console.predictTyping` in
 localStorage): **Auto**, the default, predicts only in Claude sessions on panes of another node and only
 once the median of the last 8 measured echoes on that pane is above 50 ms (it measures

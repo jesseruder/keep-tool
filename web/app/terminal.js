@@ -200,6 +200,7 @@ export function mountTerminal(container, pane, options = {}) {
     // A cursor-position report the predictor answers goes the way xterm's own
     // replies go, through onData's path, so it keeps its order with keystrokes.
     reply: (data) => sendInput(data, { user: performance.now() <= userInputUntil }),
+    outputQueued: () => queuedOutput !== 0,
   });
   let composing = false;
   // Output chunks received but not yet parsed. The predictor looks at the prompt
