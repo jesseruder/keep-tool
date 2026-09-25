@@ -95,9 +95,10 @@ database write — run `keep who cauldron-game-server` and claim the hold the ru
 names, for as long as the runbook says the operation takes:
 `keep hold cauldron-game-server --scope runtime-image --for +2h -m "why"` for the
 runtime image, `--scope terraform --for +2h` for an apply, and `--scope fleet --for +2h`
-for anything that changes the fleet — scaling an ASG, a refresh, terminating a host, an
-AMI build — on its own or alongside `terraform` (a refresh drains for up to an hour, so
-never hold it for less). A production database write is ghost-server's, and holds are
+for anything that changes the fleet — scaling an ASG, a refresh, terminating a host —
+on its own or alongside `terraform` (a refresh drains for up to an hour, so never hold
+it for less). An AMI build holds both `fleet` and `terraform`: a new AMI changes what
+every concurrent plan selects. A production database write is ghost-server's, and holds are
 per project: `keep who ghost-server`, then `keep hold ghost-server --scope database
 --for +15m -m "why"`. `keep release <id>` the moment you are done. The scopes in this
 area are `runtime-image`, `terraform` and `fleet`. Never release someone else's hold, and if one of those scopes is
