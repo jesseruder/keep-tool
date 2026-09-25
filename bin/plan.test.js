@@ -475,6 +475,10 @@ test('the compaction hint for a session on another node says /compact, not keep 
 
     const local = prompt(f, { sid: 'claude-hint-daemon-node', project }, transcript, { ...onNode, KEEP_HOOK_NODE: 'main' });
     assert.equal(JSON.parse(local.stdout).hookSpecificOutput.additionalContext, HINT_280K);
+    // A single-node install names no node at all: the daemon's name defaults to
+    // `main`, and a local hook carrying that name is not a session elsewhere.
+    const unnamed = prompt(f, { sid: 'claude-hint-unnamed-node', project }, transcript, { KEEP_HOOK_NODE: 'main' });
+    assert.equal(JSON.parse(unnamed.stdout).hookSpecificOutput.additionalContext, HINT_280K);
   } finally { f.cleanup(); }
 });
 

@@ -3087,9 +3087,14 @@ const COMPACT_HINT_WINDOW_MS = 2 * 3600e3;
 // (hook-route sets KEEP_HOOK_NODE to the calling node, and to its own for a local
 // caller). Such a session is told to run /compact itself.
 function sessionOnOtherNode(env) {
-  if (require('../nodes.js').paneOnlyNode(env)) return true;
+  const nodes = require('../nodes.js');
+  if (nodes.paneOnlyNode(env)) return true;
   const hookNode = env.KEEP_HOOK_NODE;
-  return Boolean(hookNode && hookNode !== (env.KEEP_DAEMON_NODE || env.KEEP_NODE_NAME));
+  // The daemon's own name defaults to `main` when nothing names it: a single-node
+  // install sets neither variable, and its local hooks must keep the local wording.
+  let daemon = null;
+  try { daemon = nodes.daemonNode(env); } catch { return false; }
+  return Boolean(hookNode && hookNode !== daemon);
 }
 
 function compactHint(sid, transcript, agent) {
