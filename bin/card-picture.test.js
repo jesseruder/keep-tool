@@ -34,7 +34,8 @@ test('entries Keep or the reviewer wrote do not change the input, so they never 
     + '\n## 2026-09-24 11:10 — probe result → waiting\nexit 0\n'
     + '\n## 2026-09-24 11:20 — code-review (by claude 1) \nclean\n'
     + '\n## 2026-09-24 11:30 — landed (daemon)\nabc1234 is on origin/master\n'
-    + '\n## 2026-09-24 11:40 — alert firing (2)\nhost down\n' };
+    + '\n## 2026-09-24 11:40 — alert firing (2)\nhost down\n'
+    + '\n## 2026-09-24 11:50 — closed (daemon)\nidle 60 min after done\n' };
   assert.equal(picture.pictureInput(withNoise), picture.pictureInput(task));
 });
 
@@ -62,6 +63,7 @@ test('cardPicture asks the summarizer for Sonnet, keyed by card, and passes fres
   assert.equal(calls.length, 1);
   assert.equal(calls[0].key, 'picture-kt-1');
   assert.equal(calls[0].options.model, picture.MODEL);
+  assert.equal(calls[0].options.priority, 2, 'pictures queue behind session briefs');
   assert.equal(calls[0].instruction, picture.INSTRUCTION);
   assert.equal(calls[0].onDone, undefined, 'a finished drawing uses the summarizer\'s own change hook');
 

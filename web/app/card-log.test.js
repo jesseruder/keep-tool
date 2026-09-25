@@ -81,11 +81,15 @@ Reviewer moved it.
 ## 2026-09-24 12:10 — code-review (by claude 1)
 clean
 
+## 2026-09-24 12:15 — needs Owner → blocked
+the Stripe key
+
 ## 2026-09-24 12:20 — landed (daemon)
 abc1234 is on origin/master
 `;
   const entries = recentLogEntries(body);
-  assert.deepEqual(entries.map((entry) => entry.at), ['2026-09-24 09:00', '2026-09-23 13:00', '2026-09-22 12:00']);
+  assert.deepEqual(entries.map((entry) => entry.at), ['2026-09-24 12:15', '2026-09-24 09:00', '2026-09-23 13:00']);
+  assert.equal(entries[0].kind, 'needs Owner → blocked');
 });
 
 test('a card whose detail is reloading keeps showing the last body seen for it', () => {

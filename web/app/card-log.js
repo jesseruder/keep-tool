@@ -11,11 +11,12 @@ import { getCardPicture } from './api.js';
 // Only a stamped heading starts an entry, as in bin/review.js logEntries: older
 // cards carry check-in bodies that begin with their own `## ` heading.
 const HEADING_RE = /^## (Plan|\d{4}-\d{2}-\d{2} \d{2}:\d{2} — .+)$/gm;
-// What a session or Owner wrote about the work, plus check and probe results,
-// which on a check card are the work. Keep's other bookkeeping (code-review
-// records, landed markers, alerts, agent runs) and the fleet reviewer's entries
-// would push the session's own check-ins out of the three slots.
-const SHOWN_KIND_RE = /^(?:check-in|created|done|closed|check result|probe result)\b/;
+// What a session or Owner wrote about the work — check-ins, plan steps, needs
+// (the moment Owner is asked for something), state notes, reopening — plus check
+// and probe results, which on a check card are the work. Keep's other bookkeeping
+// (code-review records, landed markers, alerts, agent runs, artifacts) and the
+// fleet reviewer's entries would push those out of the three slots.
+const SHOWN_KIND_RE = /^(?:check-in|created|done|closed|reopened|plan|needs|state note|check result|probe result)\b/;
 const REVIEWER_KIND_RE = /\(reviewer\b/;
 
 export function recentLogEntries(body, limit = 3) {
@@ -162,6 +163,6 @@ export function pictureHTML(ctx, task) {
   if (!task?.id || !picturesEnabled()) return '';
   ensurePicture(ctx, task);
   const picture = pictures.get(task.id);
-  if (!picture?.svg) return `<div class="card-picture pending faint">${picture && picture.fresh ? 'No picture' : 'Drawing…'}</div>`;
+  if (!picture?.svg) return `<div class="card-picture pending faint"><span>${picture && picture.fresh ? 'No picture' : 'Drawing…'}</span></div>`;
   return `<figure class="card-picture"><img alt="" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(picture.svg)}"></figure>`;
 }

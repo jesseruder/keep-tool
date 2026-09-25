@@ -21,12 +21,12 @@ const MODEL = process.env.KEEP_PICTURE_MODEL || 'opus';
 const ENTRIES = 3;
 const ENTRY_LIMIT = 600;
 const MAX_SVG_BYTES = 64 * 1024;
-// Only what a session or Owner wrote about the work: check-ins, creation and
-// closing. Everything else on a card — probe and check results, code-review
-// records, landed markers, alerts, the reviewer's entries — is written by Keep, and
-// on a typical day it is more than half the log; letting it in would redraw a
-// picture every time a probe ran.
-const PICTURE_KIND_RE = /^(?:check-in|created|done|closed)\b/;
+// Only what a session wrote about the work: check-ins, creation and done.
+// Everything else on a card — probe and check results, code-review records,
+// landed markers, alerts, the daemon's idle close, the reviewer's entries — is
+// written by Keep, and on a typical day it is more than half the log; letting it
+// in would redraw a picture every time a probe ran.
+const PICTURE_KIND_RE = /^(?:check-in|created|done)\b/;
 const REVIEWER_KIND_RE = /\(reviewer\b/;
 
 const INSTRUCTION = [
@@ -68,7 +68,9 @@ function extractSvg(text) {
 function cardPicture(task, deps = {}) {
   const input = pictureInput(task);
   if (!input) return { svg: null, fresh: true };
-  const result = (deps.summarize || summarize).getSummary(`picture-${task.id}`, input, INSTRUCTION, undefined, { model: MODEL });
+  // Priority 2 queues behind session briefs (1, or -1 for the selected session):
+  // a picture takes about a minute, and a burst of them must not hold up a brief.
+  const result = (deps.summarize || summarize).getSummary(`picture-${task.id}`, input, INSTRUCTION, undefined, { model: MODEL, priority: 2 });
   return { svg: extractSvg(result && result.text), fresh: Boolean(result && result.fresh) };
 }
 

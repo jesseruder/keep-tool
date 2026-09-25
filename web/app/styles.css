@@ -502,7 +502,8 @@ html.mobile .stage-artifacts .artifact-body { position: static; max-height: 30dv
 .brief-body.with-picture > .summary { height: 10em; }
 .card-picture { margin: 0; flex: 0 0 16em; height: 10em; border: 1px solid var(--line); border-radius: 5px; overflow: hidden; background: var(--panel); display: flex; align-items: center; justify-content: center; }
 .card-picture img { width: 100%; height: 100%; object-fit: contain; display: block; }
-.card-picture.pending { font-size: 11px; }
+/* The placeholder keeps the picture's em-based size; only its label is small. */
+.card-picture.pending span { font-size: 11px; }
 .opts { display: flex; flex-wrap: wrap; gap: 6px; }
 .opt { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 5px; border: 1px solid var(--line-2); background: var(--panel-2); text-align: left; }
 .opt:hover, .opt.rec { border-color: var(--accent); } .opt .n { font: 500 11px/1 var(--mono); color: var(--accent); } .opt .d { color: var(--muted); font-size: 12px; }
@@ -921,6 +922,7 @@ html.mobile .session-actions-pop { width: min(300px, calc(100vw - 24px)); right:
 html.mobile .brief { padding: 10px 12px 16px; }
 html.mobile .brief .summary { height: auto; max-height: 28dvh; }
 html.mobile .card-picture { display: none; }
+html.mobile .brief-body.with-picture > .summary { height: auto; }
 /* The terminal is a handoff panel on the phone: its button has to be on the
    screen with the answer buttons, not below a full page of stage. */
 html.mobile .stage-body { flex-direction: column; }
