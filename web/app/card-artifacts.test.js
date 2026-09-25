@@ -39,7 +39,7 @@ test('the stage form is one line until opened, and nothing shows for a card with
   const closed = artifactsSectionHTML({ card: 'some-card', list: listing([shot, log]), collapsible: true, expanded: false });
   assert.equal(closed, '<section class="card-artifacts collapsed"><button type="button" class="artifacts-toggle" data-artifacts-toggle aria-expanded="false">▸ Artifacts · 2</button></section>');
   const opened = artifactsSectionHTML({ card: 'some-card', list: listing([shot]), collapsible: true, expanded: true });
-  assert.match(opened, /aria-expanded="true">▾ Artifacts · 1<\/button><div class="artifact-grid">/);
+  assert.match(opened, /aria-expanded="true">▾ Artifacts · 1<\/button><div class="artifact-body"><div class="artifact-grid">/);
   assert.equal(artifactsSectionHTML({ card: 'some-card', list: listing([]) }), '');
   assert.equal(artifactsSectionHTML({ card: 'some-card', list: { status: 'loading', value: null } }), '');
   // An older daemon without the route answers 404: the section is left out.

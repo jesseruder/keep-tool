@@ -1,14 +1,15 @@
 // A card's artifacts in the console: the files `keep artifact` stored under
 // .keep/artifacts/<card>/, from this machine or from a node (bin/artifact-route.js).
-// Images show as thumbnails that open full size in a new tab; any other file is a
-// link that downloads it.
+// Images show as thumbnails that open full size in an overlay on the console; any
+// other file is a link that downloads it.
 //
 // The bytes are fetched with the x-keep header (api.fetchCardArtifact) and shown
 // from blob URLs, never by pointing an <img> or a link at the daemon route: a
-// browser session's cookie does not reach it without the header. A blob URL is
-// same-origin with the console, so a full-size image opens inside a small page whose
-// own policy allows nothing but that image: an SVG with a script in it renders as a
-// picture and runs nothing. A file that is not an image is only ever downloaded.
+// browser session's cookie does not reach it without the header. The full-size view
+// is an overlay in the console itself, not a new tab: the desktop shell and the
+// phone's WebView both drop window.open. It is still only an <img>, so an SVG with a
+// script in it renders as a picture and runs nothing. A file that is not an image is
+// only ever downloaded.
 //
 // The listing is fetched once per card version (the card's _detailVersion changes
 // when `keep artifact` logs to it), and an older daemon without the route leaves the
@@ -78,7 +79,7 @@ export function artifactsSectionHTML({ card, list, blobOf = () => null, esc = de
     return `<figure class="artifact file"><button type="button" class="artifact-link" data-artifact-download ${attrs(item)} title="Download ${esc(item.name)}">${esc(item.name)}</button>${caption(item, false)}</figure>`;
   }).join('');
   const more = list.value.truncated ? `<p class="muted">Showing the newest ${esc(artifacts.length)} of ${esc(list.value.truncated)}.</p>` : '';
-  return `<section class="card-artifacts">${heading}<div class="artifact-grid">${rows}</div>${more}</section>`;
+  return `<section class="card-artifacts">${heading}<div class="artifact-body"><div class="artifact-grid">${rows}</div>${more}</div></section>`;
 }
 
 function ensureList(ctx, card, version) {
@@ -129,12 +130,34 @@ function ensureBlob(ctx, card, item) {
   return null;
 }
 
-function viewerPage(url, name) {
-  return '<!doctype html><meta charset="utf-8">'
-    + `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src blob:; style-src 'unsafe-inline'">`
-    + `<title>${defaultEsc(name)}</title>`
-    + '<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#111}img{max-width:100%;height:auto}</style>'
-    + `<img src="${defaultEsc(url)}" alt="${defaultEsc(name)}">`;
+// The full-size view: the image over a dimmed console, closed by a click anywhere or
+// Escape. Escape is caught before the terminal sees it, since a bare ESC in a focused
+// Claude pane is an interrupt.
+function openViewer(url, name) {
+  closeViewer();
+  const overlay = document.createElement('div');
+  overlay.className = 'artifact-viewer';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-label', name);
+  const image = document.createElement('img');
+  image.src = url;
+  image.alt = name;
+  overlay.append(image);
+  overlay.addEventListener('click', closeViewer);
+  document.addEventListener('keydown', viewerKey, true);
+  document.body.append(overlay);
+}
+
+function viewerKey(event) {
+  if (event.key !== 'Escape') return;
+  event.preventDefault();
+  event.stopPropagation();
+  closeViewer();
+}
+
+function closeViewer() {
+  document.removeEventListener('keydown', viewerKey, true);
+  document.querySelector('.artifact-viewer')?.remove();
 }
 
 function install(ctx) {
@@ -153,11 +176,7 @@ function install(ctx) {
     if (!item) return;
     if (target.hasAttribute('data-artifact-open')) {
       const url = blobs.get(blobKey(card, item))?.url;
-      if (!url) return;
-      // Opened in the click itself, so a popup blocker sees a user gesture.
-      const page = URL.createObjectURL(new Blob([viewerPage(url, name)], { type: 'text/html' }));
-      window.open(page, '_blank');
-      setTimeout(() => URL.revokeObjectURL(page), 60e3);
+      if (url) openViewer(url, name);
       return;
     }
     try {
