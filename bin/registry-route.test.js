@@ -87,7 +87,7 @@ test('the registry route exists only where the daemon listens for nodes', async 
   assert.deepEqual(ping.allow, ['node', 'admin', 'local']);
   // Every other route still refuses a node: the node API is these, the hook routes and deploy-self.
   const forNodes = on.filter((entry) => (entry.allow || []).includes('node')).map((entry) => entry.path);
-  assert.deepEqual(forNodes, ['/api/registry', '/api/hook', '/api/hook/context', '/api/registry/ping', '/api/deploy-self']);
+  assert.deepEqual(forNodes, ['/api/registry', '/api/hook', '/api/hook/context', '/api/hook/mirror', '/api/registry/ping', '/api/deploy-self']);
   for (const entry of on.filter((route) => forNodes.includes(route.path))) assert.equal(entry.when(), true);
   for (const entry of off.filter((route) => forNodes.includes(route.path))) assert.equal(entry.when(), false);
 });
