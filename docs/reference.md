@@ -1726,7 +1726,12 @@ node waits and resends; one that cannot record a stored upload leaves its reserv
 counting until it can. Past either the upload is
 refused with `413`, naming the limit and, for the daily one, when room frees; the
 node prints that and does not resend. A resend of an upload already accepted is still
-answered from the journal. `keep artifact` refuses a card whose index entry is
+answered from the journal. A file whose bytes are already stored under that name is
+counted against the daily quota like any other, and with no `-m` the command is a
+durable no-op: it prints the stored path and adds no card-log entry and no commit,
+so a repeated command grows nothing. With a note it is a card-log entry naming the
+stored copy, bounded per node and day by the file quota, as `keep checkin` is by
+nothing. `keep artifact` refuses a card whose index entry is
 conflicted before copying anything. The node opens each file once and reads it from that descriptor,
 after checking that the descriptor is the file the path resolves to under home both
 before and after the open, so a file swapped in between is refused. `keep artifact`

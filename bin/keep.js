@@ -1390,6 +1390,9 @@ commands.artifact = (argv, deps = {}) => {
         results.push({ source, destination, created: Boolean(identity) });
       }
 
+      // Every file already stored and nothing to say: a durable no-op, so a resent
+      // command (or a loop of them) adds no card-log entry and no commit.
+      if (o.m == null && !results.some((result) => result.created)) return results;
       const text = results.map(({ source, destination, created: made }, index) =>
         `${made ? 'Stored' : 'Already stored'} ${destination} (from ${origins[index]})`).join('\n');
       appendLog(task, 'artifact', o.m != null ? `${text}\n${o.m}` : text);

@@ -2682,8 +2682,18 @@ test('artifact copies files into a committed per-card directory and logs the dur
     assert.equal(again.status, 0, again.stderr);
     assert.equal(again.stdout.trim(), durablePlan);
     assert.deepEqual(fs.readdirSync(artifactDirectory).sort(), ['notes.txt', 'plan.json']);
+    // Nothing new and nothing to say: no card-log entry, no commit.
     const afterAgain = keep.parseTask(fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8'), 'card');
-    assert.match(afterAgain.body, new RegExp(`Already stored ${durablePlan.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.ok(!afterAgain.body.includes('Already stored'));
+    assert.equal(git('rev-parse', 'HEAD').stdout.trim(), headBeforeAgain);
+    assert.equal(git('status', '--porcelain').stdout, '');
+    // With a message, the repeat is a card-log entry that names the stored copy.
+    const withNote = run(['artifact', 'card', plan, '-m', 'Same plan, cited again.']);
+    assert.equal(withNote.status, 0, withNote.stderr);
+    assert.equal(withNote.stdout.trim(), durablePlan);
+    const afterNote = keep.parseTask(fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8'), 'card');
+    assert.match(afterNote.body, new RegExp(`Already stored ${durablePlan.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.ok(afterNote.body.includes('Same plan, cited again.'));
     assert.notEqual(git('rev-parse', 'HEAD').stdout.trim(), headBeforeAgain);
     assert.equal(git('status', '--porcelain').stdout, '');
     assert.deepEqual(git('show', '--name-only', '--format=', 'HEAD').stdout.trim().split('\n'), ['tasks/card.md']);
