@@ -8,6 +8,12 @@
 // between and only the machine that holds the file can judge it.
 //
 // Nothing here logs, and no error message carries the value.
+//
+// The checks are by pathname, so a process racing this one could swap a directory
+// for a symlink between the check and the rename. The only such process is one
+// running as the same user on the same machine — the asking agent — and the value
+// is written there for it to read, so the race gains it nothing. The checks exist to
+// keep an honest request from landing somewhere git or the registry would carry it.
 const childProcess = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');

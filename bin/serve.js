@@ -16258,6 +16258,17 @@ function start(deps = {}) {
     hostRequest: (type, params, options) => hostRequest(type, params, options),
     notifySession: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }),
     onChange: () => broadcast(),
+    // Normalised through parsePaneRef so `p` and `p@main` compare equal; the service
+    // compares what it is handed the same way (samePane below).
+    sessionPane: (sessionId) => {
+      const row = (sessionSnapshot || []).find((session) => session && session.id === sessionId);
+      return row && row.pane ? String(row.pane) : null;
+    },
+    samePane: (a, b) => {
+      const left = nodes.parsePaneRef(a);
+      const right = nodes.parsePaneRef(b);
+      return left.node === right.node && left.paneId === right.paneId;
+    },
   });
   // The restart is the one /api/restart-daemon makes: wait for in-flight work, then
   // mark the request and exit after the answer has gone out.

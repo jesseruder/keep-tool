@@ -15,6 +15,7 @@ const secretFiles = require('./secret-files.js');
 const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 const RESOLVED_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_PENDING_PER_SESSION = 10;
+const MAX_PENDING_TOTAL = 100;
 const NAME_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
 const ID_RE = /^[a-f0-9]{8}$/;
 const SESSION_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
@@ -83,14 +84,21 @@ function createSecretService(options = {}) {
     now = Date.now,
     writeLocal = (params) => secretFiles.handle(params),
     onChange = () => {},
+    // The pane the daemon last saw a session in, or null when it does not know.
+    sessionPane = () => null,
+    samePane = (a, b) => a === b,
     log = (line) => process.stderr.write(`${line}\n`),
   } = options;
   const writing = new Set();
 
   const load = () => {
     const at = now();
-    // Resolved requests are kept a week for `keep secret status`, then dropped.
-    return readStore(root).filter((r) => r.status === 'pending' || !r.resolvedAt || at - r.resolvedAt < RESOLVED_KEEP_MS);
+    // Resolved and expired requests are kept a week for `keep secret status`, then
+    // dropped; an expired one counts from when it expired.
+    return readStore(root).filter((r) => {
+      const seen = effective(r, at);
+      return seen.status === 'pending' || !seen.resolvedAt || at - seen.resolvedAt < RESOLVED_KEEP_MS;
+    });
   };
   const save = (requests) => writeStore(root, requests);
   const update = (id, patch) => {
@@ -113,6 +121,15 @@ function createSecretService(options = {}) {
     if (card && !CARD_RE.test(card)) return refusal(400, 'not a card id');
     const pane = body.pane ? text(body.pane, 80) : null;
     if (pane && !PANE_RE.test(pane)) return refusal(400, 'not a pane id');
+    // A node may only ask on behalf of a session running on it: its pane must be one
+    // of that node's, and when the daemon knows where the session runs, that pane.
+    // Otherwise one machine could put a request on another machine's session.
+    if (principal && principal.class === 'node') {
+      const at = pane ? pane.lastIndexOf('@') : -1;
+      if (at < 0 || pane.slice(at + 1) !== node) return refusal(403, `a request from node ${node} must name one of its own panes`);
+    }
+    const known = sessionPane(sessionId);
+    if (known && pane && !samePane(known, pane)) return refusal(403, `session ${sessionId.slice(0, 8)} does not run in pane ${pane}`);
     const file = typeof body.path === 'string' ? body.path : '';
     if (!file || file.length > 512 || !path.isAbsolute(file) || /[\0\n\r]/.test(file)) {
       return refusal(400, 'the destination must be an absolute path (the CLI resolves it on the node)');
@@ -123,18 +140,28 @@ function createSecretService(options = {}) {
     const at = now();
     const requests = load();
     const live = requests.map((r) => effective(r, at));
+    const replace = body.replace === true;
+    const purpose = text(body.purpose, 400) || null;
+    // The same destination asked for the same way is the same request; a new name or
+    // purpose updates it. Asking with a different --replace or --multiline is a new one.
     const same = live.find((r) => r.status === 'pending' && r.sessionId === sessionId && r.node === node
-      && r.path === file && (r.key || null) === key);
-    if (same) return { status: 200, body: { request: publicRecord(same), existing: true } };
-    if (live.filter((r) => r.status === 'pending' && r.sessionId === sessionId).length >= MAX_PENDING_PER_SESSION) {
+      && r.path === file && (r.key || null) === key && r.replace === replace && r.multiline === multiline);
+    if (same) {
+      const updated = same.name === name && same.purpose === purpose ? same : update(same.id, { name, purpose });
+      if (updated !== same) onChange();
+      return { status: 200, body: { request: publicRecord(updated), existing: true } };
+    }
+    const pending = live.filter((r) => r.status === 'pending');
+    if (pending.filter((r) => r.sessionId === sessionId).length >= MAX_PENDING_PER_SESSION) {
       return refusal(429, `this session already has ${MAX_PENDING_PER_SESSION} secret requests waiting`);
     }
+    if (pending.length >= MAX_PENDING_TOTAL) return refusal(429, `${MAX_PENDING_TOTAL} secret requests are already waiting on Owner`);
     let id;
     do { id = crypto.randomBytes(4).toString('hex'); } while (requests.some((r) => r.id === id));
     const record = {
-      id, name, purpose: text(body.purpose, 400) || null, card, sessionId,
+      id, name, purpose, card, sessionId,
       agent: body.agent === 'codex' || body.agent === 'claude' || body.agent === 'pi' ? body.agent : null,
-      pane, node, path: file, key, replace: body.replace === true, multiline,
+      pane, node, path: file, key, replace, multiline,
       status: 'pending', createdAt: at, expiresAt: at + PENDING_TTL_MS, resolvedAt: null,
     };
     requests.push(record);
@@ -163,8 +190,11 @@ function createSecretService(options = {}) {
   }
 
   async function write(record, value) {
+    // After a write whose answer was lost the file may already hold this request's
+    // value, so the retry may overwrite it rather than be refused as existing.
     const params = {
-      path: record.path, key: record.key, replace: record.replace, multiline: record.multiline, value,
+      path: record.path, key: record.key, replace: record.replace || record.uncertain === true,
+      multiline: record.multiline, value,
     };
     if (record.node === daemonNode()) return writeLocal(params);
     if (!hostRequest) throw Object.assign(new Error(`no route to node ${record.node}`), { code: 'secret-node' });
@@ -193,8 +223,11 @@ function createSecretService(options = {}) {
       try { outcome = await write(record, value); }
       catch (error) {
         const message = String(error && error.message || error).slice(0, 300);
-        update(id, { lastError: message });
-        const status = error && /^secret-(destination|exists|value)$/.test(error.code || '') ? 409 : 502;
+        // A refusal the writer made is certain nothing was written; a timeout or a
+        // dropped connection is not.
+        const refused = Boolean(error && /^secret-(destination|exists|value|node)$/.test(error.code || ''));
+        update(id, refused ? { lastError: message } : { lastError: message, uncertain: true });
+        const status = refused && error.code !== 'secret-node' ? 409 : 502;
         return refusal(status, message, { code: error && error.code || null });
       }
       const resolved = update(id, {

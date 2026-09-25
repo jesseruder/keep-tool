@@ -38,7 +38,7 @@ const ask = (extra = {}) => ({ name: 'GITHUB_TOKEN', sessionId: SESSION, path: '
 
 test('a node request is recorded against the node that sent it, not what its body claims', (t) => {
   const { service, root } = setup(t);
-  const result = service.request({ class: 'node', node: 'aws1' }, ask({ node: 'main' }));
+  const result = service.request({ class: 'node', node: 'aws1' }, ask({ node: 'main', pane: 'p1@aws1' }));
   assert.equal(result.status, 200);
   assert.equal(result.body.request.node, 'aws1');
   assert.equal(result.body.request.status, 'pending');
@@ -66,7 +66,7 @@ test('refuses requests without a session, a name, or an absolute path', (t) => {
 
 test('fulfilling a remote request writes through the node host and tells the session the path only', async (t) => {
   const { service, calls, root } = setup(t);
-  const { id } = service.request({ class: 'node', node: 'aws1' }, ask()).body.request;
+  const { id } = service.request({ class: 'node', node: 'aws1' }, ask({ pane: 'p1@aws1' })).body.request;
   const result = await service.fulfill({ id, value: VALUE });
   assert.equal(result.status, 200);
   assert.equal(result.body.request.status, 'delivered');
@@ -99,7 +99,7 @@ test('a failed write leaves the request pending with the error, never the value'
     throw Object.assign(new Error('/home/u/app/.env is inside the git repository /home/u/app and is not gitignored'), { code: 'secret-destination' });
   };
   const { service, root } = setup(t, { hostRequest: failing });
-  const { id } = service.request({ class: 'node', node: 'aws1' }, ask()).body.request;
+  const { id } = service.request({ class: 'node', node: 'aws1' }, ask({ pane: 'p1@aws1' })).body.request;
   const result = await service.fulfill({ id, value: VALUE });
   assert.equal(result.status, 409);
   assert.match(result.body.error, /not gitignored/);
@@ -111,7 +111,7 @@ test('a failed write leaves the request pending with the error, never the value'
 
 test('an old node host is refused by name', async (t) => {
   const { service } = setup(t, { hostRequest: async () => ({}) });
-  const { id } = service.request({ class: 'node', node: 'aws1' }, ask()).body.request;
+  const { id } = service.request({ class: 'node', node: 'aws1' }, ask({ pane: 'p1@aws1' })).body.request;
   const result = await service.fulfill({ id, value: VALUE });
   assert.equal(result.status, 502);
   assert.match(result.body.error, /predates secret handoff/);
@@ -132,7 +132,7 @@ test('declining tells the session the reason; expiry needs no sweep', async (t) 
 
 test('a node lists only its own requests', (t) => {
   const { service } = setup(t);
-  service.request({ class: 'node', node: 'aws1' }, ask());
+  service.request({ class: 'node', node: 'aws1' }, ask({ pane: 'p1@aws1' }));
   service.request({ class: 'local' }, ask({ path: '/home/u/mac' }));
   assert.equal(service.list({ class: 'node', node: 'aws1' }, {}).body.requests.length, 1);
   assert.equal(service.list({ class: 'local' }, {}).body.requests.length, 2);
@@ -148,4 +148,50 @@ test('routes: a node may ask and read, only the console and the daemon machine m
   assert.ok(routeDenial(find('POST', '/api/secrets/decline'), node));
   assert.equal(routeDenial(find('POST', '/api/secrets/fulfill'), { class: 'proxy' }), null);
   assert.ok(routeDenial(find('POST', '/api/secrets/request'), { class: 'proxy' }), 'the console does not make requests');
+});
+
+test('a node may only ask for a session in one of its own panes', (t) => {
+  const { service } = setup(t, { sessionPane: (id) => (id === SESSION ? 'p9@aws1' : null) });
+  const node = { class: 'node', node: 'aws1' };
+  assert.equal(service.request(node, ask()).status, 403, 'no pane');
+  assert.equal(service.request(node, ask({ pane: 'p1' })).status, 403, 'a daemon-node pane');
+  assert.equal(service.request(node, ask({ pane: 'p1@other' })).status, 403, 'another node');
+  assert.equal(service.request(node, ask({ pane: 'p1@aws1' })).status, 403, 'not where the session runs');
+  assert.equal(service.request(node, ask({ pane: 'p9@aws1' })).status, 200);
+});
+
+test('asking again updates the purpose; a different --replace is a new request', (t) => {
+  const { service } = setup(t);
+  const first = service.request({ class: 'local' }, ask()).body.request;
+  const again = service.request({ class: 'local' }, ask({ purpose: 'clearer purpose' })).body;
+  assert.equal(again.request.id, first.id);
+  assert.equal(again.request.purpose, 'clearer purpose');
+  const replacing = service.request({ class: 'local' }, ask({ replace: true })).body;
+  assert.notEqual(replacing.request.id, first.id);
+  assert.equal(replacing.request.replace, true);
+});
+
+test('after a write whose answer was lost, the retry may overwrite', async (t) => {
+  let calls = 0;
+  const flaky = async (type, params) => {
+    if (type === 'hello') return { secretWrite: 1 };
+    calls += 1;
+    if (calls === 1) throw new Error('host request timed out (secret-write)');
+    return { path: params.path, replaced: params.replace, bytes: 1 };
+  };
+  const { service } = setup(t, { hostRequest: flaky });
+  const { id } = service.request({ class: 'node', node: 'aws1' }, ask({ pane: 'p1@aws1' })).body.request;
+  assert.equal((await service.fulfill({ id, value: VALUE })).status, 502);
+  const retried = await service.fulfill({ id, value: VALUE });
+  assert.equal(retried.status, 200);
+  assert.equal(retried.body.request.outcome.replaced, true);
+});
+
+test('expired requests are dropped a week after they expire', (t) => {
+  const { service, root, advance } = setup(t);
+  service.request({ class: 'local' }, ask());
+  advance(24 * 60 * 60 * 1000 + 8 * 24 * 60 * 60 * 1000);
+  service.request({ class: 'local' }, ask({ path: '/home/u/other', key: null }));
+  const stored = JSON.parse(fs.readFileSync(storeFile(root), 'utf8')).requests;
+  assert.deepEqual(stored.map((r) => r.path), ['/home/u/other']);
 });
