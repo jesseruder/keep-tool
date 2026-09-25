@@ -619,6 +619,8 @@ test('periodic schedulers read sessions from the bounded transcript index', () =
   wired(/const areaSessionDeps = \(\) => \(\{[\s\S]*?scanSessions: \(\) => readSessions\(\{ fresh: true \}\),/);
   wired(/require\('\.\.\/self-repair\.js'\)\.startScheduler\(\{[\s\S]*?createCard: \(input\) => ctx\.maintenanceProcess\.run\('self-repair-create-card', input/);
   wired(/require\('\.\.\/self-repair\.js'\)\.startScheduler\(\{[\s\S]*?checkin: \(id, options\) => ctx\.maintenanceProcess\.run\('checkin-task', \{ root: keep\.ROOT, id, options \}\)/);
+  wired(/daemonReadWorker\.run\('turn-index', \{\s*root: keep\.ROOT,/);
+  assert.doesNotMatch(body, /liveTurnIndexSessions/, 'turn-index discovery must stay inside the read worker');
   // No scheduler may retain direct access to the main-thread scanner. Observational
   // ticks use the published snapshot; decisions that need a fresh fleet view ask the
   // isolated reader through readSessions.

@@ -69,3 +69,41 @@ test('an actual screen route waits for isolated discovery while the daemon loop 
   assert.ok(heartbeats >= 5, 'route discovery did not stop the main heartbeat');
   assert.deepEqual((await route).lines, ['ready']);
 });
+
+test('turn-index discovery and ingest stay in the worker while HTTP and timers continue', async (t) => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-turn-index-worker-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.keep', 'live-sessions.json'), '{"updatedAt":0,"sessions":{}}\n');
+  const reader = createDaemonReadWorker({ timeoutMs: 2000,
+    workerData: { env: { KEEP_DIR: root }, turnIndexDiscoveryDelayMs: 250 } });
+  t.after(() => reader.close());
+  const server = http.createServer((_req, res) => res.end('alive'));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  let heartbeats = 0;
+  const timer = setInterval(() => { heartbeats += 1; }, 10);
+  t.after(() => clearInterval(timer));
+
+  const indexing = reader.run('turn-index', {
+    root, budgetMs: 10, maxBytes: 1024, busyTimeoutMs: 50, prune: false,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  const body = await new Promise((resolve, reject) => {
+    http.get({ hostname: '127.0.0.1', port: server.address().port, path: '/' }, (response) => {
+      let text = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { text += chunk; });
+      response.on('end', () => resolve(text));
+    }).on('error', reject);
+  });
+  assert.equal(body, 'alive');
+  assert.ok(heartbeats >= 3);
+  const result = await indexing;
+  assert.equal(result.ingest.files, 0);
+  assert.equal(result.ingest.bytes, 0);
+  assert.equal(result.ingest.partial, false);
+  assert.equal(result.prune, null);
+});

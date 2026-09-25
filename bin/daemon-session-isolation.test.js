@@ -130,6 +130,13 @@ test('queued handoff eligibility requests a fresh isolated state build', async (
   assert.equal(input.fresh, true);
 });
 
+test('active daemon policy forbids turn-index discovery on the main loop', () => {
+  const policy = serve.createDaemonMainLoopPolicy();
+  policy.enter();
+  assert.throws(() => serve.liveTurnIndexSessions({ mainLoopPolicy: policy }),
+    /bulk session discovery is forbidden on the daemon main loop/);
+});
+
 test('account setup child work stays serialized even after a failed operation', async () => {
   const serialize = serve.createSerialWorkQueue();
   let active = 0;

@@ -3663,12 +3663,6 @@
       "reason": "Conservative metadata debt: the static daemon graph reaches bin/serve.js liveSessionPids; this exact synchronous lookup count is frozen rather than treated as safe, even when production injects another implementation."
     },
     {
-      "function": "bin/serve.js::liveTurnIndexSessions",
-      "operation": "fs.readdirSync",
-      "count": 1,
-      "reason": "Conservative read/scan debt: the static daemon graph reaches bin/serve.js liveTurnIndexSessions; this exact synchronous operation count is frozen, including test or CLI fallback branches."
-    },
-    {
       "function": "bin/serve.js::loadSessionExact",
       "operation": "fs.readFileSync",
       "count": 1,
@@ -6834,8 +6828,6 @@
     "bin/serve.js::liveSessionTick|bin/serve.js::readLiveSessionLedger|1",
     "bin/serve.js::liveSessionTick|bin/serve.js::sessionProjectFromTranscript|1",
     "bin/serve.js::liveSessionTick|bin/serve.js::writeLiveSessionLedger|1",
-    "bin/serve.js::liveTurnIndexSessions|bin/codex.js::findRolloutFile|1",
-    "bin/serve.js::liveTurnIndexSessions|bin/serve.js::readLiveSessionLedger|1",
     "bin/serve.js::loadCurrentSession|bin/serve.js::loadSessionExact|1",
     "bin/serve.js::loadInjectionSession|bin/serve.js::scanTranscript|1",
     "bin/serve.js::loadInjectionSession|bin/transcripts.js::findSessionFile|1",
@@ -7747,7 +7739,6 @@
     "bin/serve/schedulers.js::startSchedulers>tick|bin/serve/schedulers.js::startSchedulers>tick>panes|1",
     "bin/serve/schedulers.js::startSchedulers>tick>panes|bin/serve.js::listHostPaneResult|1",
     "bin/serve/schedulers.js::startSchedulers>turnIndexTick|bin/health.js::record|2",
-    "bin/serve/schedulers.js::startSchedulers>turnIndexTick|bin/serve.js::liveTurnIndexSessions|1",
     "bin/serve/schedulers.js::startSchedulers>watcherTick|bin/health.js::record|3",
     "bin/serve/schedulers.js::startSchedulers>watcherTick|bin/serve/schedulers.js::startSchedulers>watcherTick>deliver|1",
     "bin/serve/schedulers.js::startSchedulers>watcherTick|bin/serve/schedulers.js::startSchedulers>watcherTick>deliverObservation|1",

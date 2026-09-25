@@ -347,7 +347,7 @@ function startSchedulers(ctx) {
     closeIdleSession, companionSnapshot, dashboardBuild, dashboardBuilder, deliverCheckToThread, deliverUnblockToThread,
     daemonReadWorker, daemonRestartGate, deps, discord, driftWakeFromVerdict, envNumber, features, forceRestartSession, fs, health, hostRequest,
     ideas, keep, keepConsole, landed, limitresume, listHostPaneResult, listHostPanes, liveSessionTick,
-    liveTurnIndexSessions, loadCurrentSession, loadSessionForAction, openCheckSession, openSession, path, pendingCompactSwaps,
+    loadCurrentSession, loadSessionForAction, openCheckSession, openSession, path, pendingCompactSwaps,
     prepareSessionSummary, readLiveSessionLedger, readScreenResult, readSessions, remoteSession, resolveSessionTarget, restartSession,
     resumeAfterLimit, retireLeftDeliveryDrafts,
     review, reviewDeps, runs, sendToResolvedTarget, sendToSession, sessionSummarySnapshot, slack,
@@ -778,7 +778,7 @@ function startSchedulers(ctx) {
     try {
       const pruneDue = Date.now() - lastTurnIndexPruneAt >= 86400e3;
       const indexed = await daemonReadWorker.run('turn-index', {
-        sessions: liveTurnIndexSessions(),
+        root: keep.ROOT,
         budgetMs: TURN_INDEX_BUDGET_MS,
         maxBytes: TURN_INDEX_BUDGET_BYTES,
         busyTimeoutMs: 250,

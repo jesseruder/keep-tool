@@ -12993,6 +12993,7 @@ function writeLiveSessionLedger(ledger, deps = {}) {
 // (60-180ms, synchronous). Found paths never move; misses are retried after a while.
 const turnIndexRolloutLookups = new Map();
 function liveTurnIndexSessions(deps = {}) {
+  (deps.mainLoopPolicy || daemonMainLoopPolicy).assertBulkScanAllowed();
   const ledger = readLiveSessionLedger(deps);
   const now = (deps.now || Date.now)();
   const wanted = new Map();
@@ -17262,7 +17263,7 @@ function start(deps = {}) {
     inspectAccountHandoff: (body, options = {}) => inspectAccountHandoff(body, { ...options, dashboardBuild }),
     inspectReviewQueueLaunch, keep, keepConsole, landed, launchReviewQueueSession,
     limitresume, listHostPaneResult, listHostPanes, listPortableTransfers,
-    liveSessionTick: (options = {}) => liveSessionTick({ ...options, readWorker: daemonReadWorker }), liveTurnIndexSessions,
+    liveSessionTick: (options = {}) => liveSessionTick({ ...options, readWorker: daemonReadWorker }),
     loadCurrentSession, loadSessionForAction, notifications, openCheckSession, openSession, path, portableTransferDraft,
     portableTransferPreview, preparePortableTransfer, prepareSessionSummary, projectMobileState,
     readBody, readLiveSessionLedger, readScreenResult, recentTranscriptText, recoverReviewQueueLaunch, reminders,

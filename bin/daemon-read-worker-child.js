@@ -26,8 +26,16 @@ async function run(operation, input) {
     return require('./review.js').gitState(input.project, input.priorSha, input.options || {});
   }
   if (operation === 'turn-index') {
+    // Discovery belongs in this persistent worker too: resolving missing Codex
+    // rollouts can walk every dated directory, and the miss cache must survive
+    // ticks here rather than expire into a main-loop walk every ten minutes.
+    if (Number.isFinite(workerData?.turnIndexDiscoveryDelayMs) && workerData.turnIndexDiscoveryDelayMs > 0) {
+      const until = Date.now() + Math.min(5000, workerData.turnIndexDiscoveryDelayMs);
+      while (Date.now() < until) {} // Test seam for proving a blocked worker leaves the daemon responsive.
+    }
+    const sessions = require('./serve.js').liveTurnIndexSessions({ root: input.root });
     const turnIndex = require('./turn-index.js');
-    const ingest = turnIndex.ingestSessionsFromLiveState(input.sessions || [], {
+    const ingest = turnIndex.ingestSessionsFromLiveState(sessions, {
       budgetMs: input.budgetMs,
       maxBytes: input.maxBytes,
       busyTimeoutMs: input.busyTimeoutMs,
