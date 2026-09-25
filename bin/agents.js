@@ -472,8 +472,12 @@ function lastNeedsYou(events) {
 function attentionItems(records, options = {}) {
   const rows = [];
   for (const record of records || []) {
-    const event = record && record.unseen && record.unseen.needsYou === true ? eventSummary(record.lastNeedsYou) : null;
-    if (!event) continue;
+    if (!record || !record.unseen || record.unseen.needsYou !== true) continue;
+    // A record written before lastNeedsYou existed still has a question waiting:
+    // the row carries its newest event when that is the question, else a pointer.
+    const last = eventSummary(record.lastEvent);
+    const event = eventSummary(record.lastNeedsYou) || (last && last.needsYou ? last : null)
+      || { at: last ? last.at : 0, seq: last ? last.seq : 0, card: record.card || '', text: '' };
     const card = event.card || record.card || '';
     const since = event.at || Number(options.now) || Date.now();
     rows.push({

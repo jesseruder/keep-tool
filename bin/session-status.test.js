@@ -142,6 +142,12 @@ test('an unattended session that ends on a statement is finished, not waiting fo
     assert.equal(asked.kind, 'input');
     assert.equal(asked.attentionLabel, 'Needs an answer');
     assert.equal(attention({ ...done, pendingQuestion: { question: 'Drain?' } }).kind, 'question');
+    // The card's own asks still outrank a finished turn, and a stopped session falls
+    // through to the card as it always did.
+    assert.equal(attention({ ...done, taskId: 't', taskStatus: 'review' }).pri, 0);
+    assert.equal(activity({ ...done, taskId: 't', taskStatus: 'review' }).reason, 'your review');
+    assert.equal(activity({ ...done, pane: undefined, alive: undefined, taskId: 't', taskStatus: 'waiting' }, { dependencies: ['other'] }).reason, 'other',
+      'a stopped unattended session reads the card dependency, not Finished');
     // Nothing changes for a session Owner opened himself.
     assert.equal(attention({ ...done, unattended: false }).attentionLabel, 'Ready for next instruction');
     assert.equal(attention({ ...done, endedTurn: false }), null);

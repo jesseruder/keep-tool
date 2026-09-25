@@ -94,14 +94,17 @@ function activity(session, context = {}) {
   // (a prose question, a --handoff needs-input, a pending AskUserQuestion), look
   // exactly like the last twenty turns that needed nothing.
   const unattended = session.unattended === true;
-  add(ended && unattended && !model.identity.reviewer, 'unattended-finished', 'conversation', 'idle', 'Finished', 'finished',
-    { kind: 'finished', detail: text }, 'inferred');
   const ready = ended && model.identity.interactive && !model.identity.reviewer && !unattended;
   const readyRequest = { kind: 'input', detail: 'Ready for your next instruction.' };
   add(ready, 'conversation-ready', 'conversation', 'needs-input', 'Ready for next instruction', 'next instruction', readyRequest, 'inferred');
   add(taskStatus === 'done' && ready, 'completed-task-ready', 'conversation', 'needs-input', 'Ready for next instruction', 'next instruction', readyRequest, 'inferred');
   add(taskStatus === 'done', 'task-done', 'registry', 'done', 'Done');
   add(taskStatus === 'review', 'task-review', 'registry', 'needs-input', 'Needs input', 'your review', { kind: 'input', detail: 'Ready for your review.' });
+  // After the card's own asks (a review to read is Owner's whichever session ended
+  // the turn) and only for a live session: a stopped one falls through to the
+  // card's schedule or dependency, as it always did.
+  add(ended && unattended && model.identity.interactive && !model.identity.reviewer, 'unattended-finished', 'conversation', 'idle', 'Finished', 'finished',
+    { kind: 'finished', detail: text }, 'inferred');
   add(model.task.dependencies.length, 'task-dependency', 'registry', 'waiting', 'Waiting: dependency', model.task.dependencies.join(', '));
   add(model.task.checkAfter, 'scheduled-check', 'registry', 'waiting', 'Waiting: scheduled check', model.task.checkAfter);
   add(taskStatus === 'waiting', 'task-waiting', 'registry', 'waiting', 'Waiting: dependency', 'dependency');

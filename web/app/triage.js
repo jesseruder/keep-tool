@@ -223,6 +223,11 @@ export function agentLogHTML(ctx, events) {
 // agent whose pane is gone and whose transcript the stage is showing instead.
 export function agentForStage(ctx, item, session) {
   if (!item) return null;
+  // An agent's needs-you row stages the session the question came from, not the
+  // agent: bringing the feed up here would mark it seen — which removes this row —
+  // on a mere selection, the auto-selected first item included. Opening the agent's
+  // own row under Agents is the acknowledgement, as it always was.
+  if (item.agent) return null;
   const agents = ctx.data?.agents || [];
   const pane = item.pane || '';
   const sessionId = item.sessionId || session?.id || '';

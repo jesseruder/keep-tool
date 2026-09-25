@@ -975,7 +975,7 @@ function renderTop() {
   const count = queueItems().filter((item) => !state.dismissed.has(itemKey(item)) && countsTowardBadge(item)).length;
   setBadge(count + (data.notifications || []).filter((entry) => !entry.read).length);
   if (attentionSeeded) attentionSound.update(queueItems()
-    .filter((item) => !state.dismissed.has(itemKey(item))).map((item) => soundEventKey(item, sessionFor(item))));
+    .filter((item) => !state.dismissed.has(itemKey(item)) && countsTowardBadge(item)).map((item) => soundEventKey(item, sessionFor(item))));
   document.querySelector('#qcount').textContent = count;
   document.querySelector('#qcount').classList.toggle('zero', count === 0);
   renderConnectionStatus();

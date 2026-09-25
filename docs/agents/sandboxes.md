@@ -207,12 +207,12 @@ list with the event text, so use it only when the incident cannot move without h
 **end your turn with the question** when you do, because his reply arrives back in this
 session. One `--needs-you` per thing you need. Event text is a pointer: one line, a card
 id, no transcripts and no log excerpts. Your ended turns never reach Waiting on you on
-their own: only a `--needs-you` does, or a turn that ends on a question.
+their own, a closing question included: only a `--needs-you` does.
 
 Not every event lights your row. The badge counts what you did (`diagnosed`,
-`mitigated`, `fixed`, `escalated`, `closed`, `landed`, `decided`, `filed`) and what you
-need (`--needs-you`); `watching`, `noise` and the rest go on the feed for the record and
-never badge. `--badge` forces one for a kind outside that list.
+`mitigated`, `fixed`, `escalated`, `closed`, `landed`, `decided`, `filed`, `opened`) and
+what you need (`--needs-you`); `watching`, `noise` and the rest go on the feed for the
+record and never badge. `--badge` forces one for a kind outside that list.
 
 You can always look at what is going on:
 

@@ -253,6 +253,10 @@ function setAsideCandidates(attention, sessions) {
   const bySession = new Map(sessions.map((session) => [session.id, session]));
   return [
     ...attention.map((item) => {
+      // An agent's needs-you row keeps its own clock: every event batch Keep delivers
+      // into the agent's pane moves that session's lastUserAt, and a snooze that
+      // read it would be dropped at the next delivery rather than by Owner.
+      if (item.agent) return item;
       const lastUserAt = bySession.get(item.sessionId)?.lastUserAt;
       if (Number.isFinite(lastUserAt)) item.lastUserAt = lastUserAt;
       Object.assign(item, dependencyAsideContext(bySession.get(item.sessionId)));
@@ -12960,6 +12964,12 @@ function buildState(options = {}) {
   for (const session of sessions) {
     const task = taskById.get(session.taskId);
     if (task && !dependencyCache.has(task.id)) dependencyCache.set(task.id, keep.unresolvedDependencyIds(task));
+    // Whether Keep opened this session for a program rather than for Owner, read off
+    // the pane before the status rules run (addHostSessionState reads the same mark
+    // later): an unattended session's ended turn is finished, not waiting for input.
+    // A console keystroke clears the pane mark, which is why this is re-read on every
+    // build and never taken from a cached row.
+    session.unattended = Boolean(panesBySession.get(session.id)?.meta?.unattended);
     session.activity = sessionStatus.activity(session, { task, dependencies: dependencyCache.get(task?.id) || [], live: liveHostedSessions.has(session.id) });
     session.observation = require('./session-model').normalize(session, { task, dependencies: dependencyCache.get(task?.id) || [], live: liveHostedSessions.has(session.id) });
     session.state = session.activity.state;
@@ -12969,7 +12979,7 @@ function buildState(options = {}) {
   if (workerMode) {
     const terminal = new Set(['completed', 'failed', 'cancelled']);
     const derived = new Set(['taskId', 'taskStatus', 'runtime', 'pane', 'launchModel', 'accountLabel',
-      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark', 'stopVerdict',
+      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark', 'stopVerdict', 'unattended',
       // Attached further down, after this block, and re-read from the usage snapshot
       // on every build. Listed so a reordering cannot freeze a settled session's
       // totals at whatever the collector had seen the moment it was cached.
@@ -13019,10 +13029,6 @@ function buildState(options = {}) {
   if (!workerMode) require('./stop-classifier').request(sessions, { onChange });
   const attention = [];
   for (const s of sessions) {
-    // Whether Keep opened this session for a program rather than for Owner, read
-    // off the pane here as addHostSessionState reads it later: the status rules
-    // list such a session's ended turn as finished, not as waiting for input.
-    if (s.unattended === undefined) s.unattended = Boolean(panesBySession.get(s.id)?.meta?.unattended);
     const item = sessionAttentionItem(s, now);
     if (item) attention.push(item);
   }

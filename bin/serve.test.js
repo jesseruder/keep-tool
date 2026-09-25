@@ -11167,7 +11167,7 @@ test('API state synthesizes a minimal session when a host transcript lookup find
   });
 });
 
-function buildStateWithHostSession(root, ack = false, needsQuestion = true, agentAlive = true, externalLive = false, companion = null) {
+function buildStateWithHostSession(root, ack = false, needsQuestion = true, agentAlive = true, externalLive = false, companion = null, unattended = false) {
   for (const dir of ['tasks', 'archive', 'digests', path.join('.keep', 'acks')]) {
     fs.mkdirSync(path.join(root, dir), { recursive: true });
   }
@@ -11190,11 +11190,11 @@ function buildStateWithHostSession(root, ack = false, needsQuestion = true, agen
       ledger: ${externalLive ? "{ updatedAt: Date.now(), sessions: { [id]: { lastSeenAlive: Date.now(), source: 'argv', pid: 999 } } }" : "{ updatedAt: Date.now(), sessions: {} }"},
       hostPanes: [{
         id: 'pane-host-only', alive: true, agentAlive: ${agentAlive},
-        meta: { sessionId: id, agent: 'claude', project: '/host/project' },
+        meta: { sessionId: id, agent: 'claude', project: '/host/project'${unattended ? ', unattended: true, opener: { kind: "check", id: "some-card" }' : ''} },
       }],
       claudeSessionFor: (sessionId) => ({
         id: sessionId, kind: 'claude', project: '/host/project', title: 'Needs an answer',
-        lastUser: 'please decide', lastAssistant: '', lastAssistantFull: '',
+        lastUser: 'please decide', lastAssistant: ${JSON.stringify(unattended ? 'Checked in: nothing moved.' : '')}, lastAssistantFull: ${JSON.stringify(unattended ? 'Checked in: nothing moved.' : '')},
         mtime: ${mtime}, size: 10, endedTurn: true, state: 'recent',
         pendingQuestion: ${needsQuestion ? JSON.stringify({ question: 'Which one?', options: ['A', 'B'] }) : 'null'},
       }),
@@ -11327,6 +11327,24 @@ test('buildState puts a host-only Claude question in attention before stalled an
     assert.deepEqual(result.attention.map(({ kind, sessionId }) => ({ kind, sessionId })), [
       { kind: 'question', sessionId: 'claude-host-only' },
     ]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('buildState lists an unattended session\'s ended turn as finished, and its question as a question', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-unattended-attention-'));
+  try {
+    // The pane's unattended mark is read before the status rules run, so a turn
+    // that ended on a statement is Finished at pri 1: listed, never pushed or counted.
+    const finished = buildStateWithHostSession(root, false, false, true, false, null, true);
+    assert.equal(finished.session.unattended, true);
+    assert.equal(finished.session.state, 'idle');
+    assert.equal(finished.session.stateLabel, 'Finished');
+    assert.deepEqual(finished.attention.map(({ kind, pri, attentionLabel, detail }) => ({ kind, pri, attentionLabel, detail })), [
+      { kind: 'finished', pri: 1, attentionLabel: 'Finished', detail: 'Checked in: nothing moved.' },
+    ]);
+    // A pending question in the same session is still a pri-0 question.
+    const asked = buildStateWithHostSession(root, false, true, true, false, null, true);
+    assert.deepEqual(asked.attention.map(({ kind, pri }) => ({ kind, pri })), [{ kind: 'question', pri: 0 }]);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
