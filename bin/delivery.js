@@ -398,80 +398,103 @@ async function deliverAttempt({ session, pane, text, key, file, remote = null, d
       // other words. Refuse before the expiry below, which would drop the record and
       // let this send type a second copy somewhere else while the first still sits
       // in a box somebody can submit.
-      if (partialTyping(entry) && (!sameMessage || !samePane)) {
-        throw new Error('Previous delivery is partially typed; no message was retyped. Inspect the session draft before retrying.');
-      }
-      // Resuming is for the retry that follows a lost chunk by seconds or minutes.
-      // For an entry with every chunk acknowledged there is nothing left to write,
-      // so past the stale window a resume is the only thing that can still happen to
-      // it and it happens forever: each one walks back into the same guard that
-      // refused Enter and throws again. On 2026-09-21 (delivery:343bbbb6) that cost
-      // 32 consecutive delivery sweeps and a self-repair card, because the expiry
-      // below - which had settled this exact shape before 018ac71 - sits in the
-      // branch a partial entry never takes. So an old complete one falls through to
-      // it. A genuinely unfinished one still has chunks to resume, and keeps them.
-      const expiredDraft = completedTyping(entry) && journalAgeMs(journal, entry, Date.now()) >= staleJournalMs;
-      if (partialTyping(entry) && !expiredDraft) {
-        trace('partial-resume-start', {
-          acknowledgedChunks: entry.typing.acknowledgedChunks,
-          ambiguous: Number.isInteger(entry.typing.inFlightChunk),
-        });
-        const writeJournal = () => {
-          const temp = journal + '.tmp';
-          fs.writeFileSync(temp, JSON.stringify(entry), { mode: 0o600 });
-          fs.renameSync(temp, journal);
-        };
-        try {
-          await type(typingProgress(entry, writeJournal));
-        } catch (error) {
-          rememberLeftDraft(entry, error, writeJournal);
-          // A resumed attempt may finish the remaining chunks and then abort at a
-          // beforeEnter guard. The atomic draft clear proves none of the partial
-          // message remains, so keeping its old counts would wedge every later send.
-          if (error?.typingStarted && error.draftCleared) {
-            trace('typed-draft-cleared');
-            try { fs.unlinkSync(journal); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-          }
-          // In particular, `nothingTyped` by itself is not cleanup evidence here:
-          // earlier acknowledged chunks still belong to this journal.
-          throw error;
-        }
-        entry.typedAt = Date.now();
-        writeJournal();
-        trace('partial-resume-ok');
-      } else {
-        const draftPresent = await draftMatches();
-        if (!sameMessage || !samePane || !draftPresent) {
-          const ageMs = journalAgeMs(journal, entry, Date.now());
-          if (draftPresent || ageMs < staleJournalMs) {
-            throw new Error('Previous delivery is unconfirmed; no message was retyped. Inspect the session draft/transcript before retrying.');
-          }
-        // Same text, same pane, and the draft is gone from the box: the likeliest
-        // reading is that it WAS submitted and `received` cannot see it - a session
-        // that resumed writes to a new transcript, so the journal's file/offset can
-        // point at a path that will never gain another line. Retyping there sends the
-        // message twice. Expire it without typing: unproven delivery beats a duplicate.
-        //
-        // Only for an entry whose text actually reached the pane - all of it. Where
-        // the typing failed part way, or failed outright, nothing recoverable was
-        // ever on screen, and assuming delivery would file a received receipt - and
-        // let a sweep tick consume the day - for a message nobody has seen.
-          const assumedDelivered = sameMessage && samePane
-            && (Number(entry.typedAt) > 0 || completedTyping(entry));
-          // A retained receipt (a scheduled check) is stamped delivered here, which
-          // is the opposite of what reconcile does when a pane disappears. The two
-          // differ in what a wrong guess costs: there the pane is gone and nothing
-          // can be typed again, so dropping the record is free; here the pane lives
-          // and no record means the next tick types the check a second time.
-          trace('pending-journal-expired', { ageMs, assumedDelivered });
-          if (assumedDelivered) {
-            finish(directory, journal, entry);
-            return { ok: true, delivery: 'assumed-delivered', expired: true };
-          }
+      //
+      //
+      // Except for a message stopped part way, on this pane, past the stale window,
+      // whose input box the precheck finds empty (it refuses a box with any text in it,
+      // the half message included). The half is gone then, submitted or cleared, and
+      // nothing can complete it: a resume would type only the rest into an empty box
+      // and submit that. On 2026-09-25 one such entry refused every send to #305 for
+      // four hours. It is retired with no receipt of any kind, as reconcile retires a
+      // partial one whose pane is gone, and this send types its message whole. For the
+      // same words a box that is not empty may still hold the half, so that send goes
+      // on to resume it as before; for other words the precheck's refusal stands.
+      if (partialTyping(entry) && !completedTyping(entry) && samePane
+          && journalAgeMs(journal, entry, Date.now()) >= staleJournalMs) {
+        let emptyBox = true;
+        try { await precheck(); } catch (error) { if (!sameMessage) throw error; emptyBox = false; }
+        if (emptyBox) {
+          trace('partial-draft-gone', { acknowledgedChunks: entry.typing.acknowledgedChunks, sameMessage });
           try { fs.unlinkSync(journal); } catch (error) { if (error.code !== 'ENOENT') throw error; }
           entry = null;
+        }
+      }
+      if (entry && partialTyping(entry) && (!sameMessage || !samePane)) {
+        throw new Error('Previous delivery is partially typed; no message was retyped. Inspect the session draft before retrying.');
+      }
+      if (entry) {
+        // Resuming is for the retry that follows a lost chunk by seconds or minutes.
+        // For an entry with every chunk acknowledged there is nothing left to write,
+        // so past the stale window a resume is the only thing that can still happen to
+        // it and it happens forever: each one walks back into the same guard that
+        // refused Enter and throws again. On 2026-09-21 (delivery:343bbbb6) that cost
+        // 32 consecutive delivery sweeps and a self-repair card, because the expiry
+        // below - which had settled this exact shape before 018ac71 - sits in the
+        // branch a partial entry never takes. So an old complete one falls through to
+        // it. A genuinely unfinished one still has chunks to resume, and keeps them.
+        const expiredDraft = completedTyping(entry) && journalAgeMs(journal, entry, Date.now()) >= staleJournalMs;
+        if (partialTyping(entry) && !expiredDraft) {
+          trace('partial-resume-start', {
+            acknowledgedChunks: entry.typing.acknowledgedChunks,
+            ambiguous: Number.isInteger(entry.typing.inFlightChunk),
+          });
+          const writeJournal = () => {
+            const temp = journal + '.tmp';
+            fs.writeFileSync(temp, JSON.stringify(entry), { mode: 0o600 });
+            fs.renameSync(temp, journal);
+          };
+          try {
+            await type(typingProgress(entry, writeJournal));
+          } catch (error) {
+            rememberLeftDraft(entry, error, writeJournal);
+            // A resumed attempt may finish the remaining chunks and then abort at a
+            // beforeEnter guard. The atomic draft clear proves none of the partial
+            // message remains, so keeping its old counts would wedge every later send.
+            if (error?.typingStarted && error.draftCleared) {
+              trace('typed-draft-cleared');
+              try { fs.unlinkSync(journal); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+            }
+            // In particular, `nothingTyped` by itself is not cleanup evidence here:
+            // earlier acknowledged chunks still belong to this journal.
+            throw error;
+          }
+          entry.typedAt = Date.now();
+          writeJournal();
+          trace('partial-resume-ok');
         } else {
-          await submitDraft();
+          const draftPresent = await draftMatches();
+          if (!sameMessage || !samePane || !draftPresent) {
+            const ageMs = journalAgeMs(journal, entry, Date.now());
+            if (draftPresent || ageMs < staleJournalMs) {
+              throw new Error('Previous delivery is unconfirmed; no message was retyped. Inspect the session draft/transcript before retrying.');
+            }
+          // Same text, same pane, and the draft is gone from the box: the likeliest
+          // reading is that it WAS submitted and `received` cannot see it - a session
+          // that resumed writes to a new transcript, so the journal's file/offset can
+          // point at a path that will never gain another line. Retyping there sends the
+          // message twice. Expire it without typing: unproven delivery beats a duplicate.
+          //
+          // Only for an entry whose text actually reached the pane - all of it. Where
+          // the typing failed part way, or failed outright, nothing recoverable was
+          // ever on screen, and assuming delivery would file a received receipt - and
+          // let a sweep tick consume the day - for a message nobody has seen.
+            const assumedDelivered = sameMessage && samePane
+              && (Number(entry.typedAt) > 0 || completedTyping(entry));
+            // A retained receipt (a scheduled check) is stamped delivered here, which
+            // is the opposite of what reconcile does when a pane disappears. The two
+            // differ in what a wrong guess costs: there the pane is gone and nothing
+            // can be typed again, so dropping the record is free; here the pane lives
+            // and no record means the next tick types the check a second time.
+            trace('pending-journal-expired', { ageMs, assumedDelivered });
+            if (assumedDelivered) {
+              finish(directory, journal, entry);
+              return { ok: true, delivery: 'assumed-delivered', expired: true };
+            }
+            try { fs.unlinkSync(journal); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+            entry = null;
+          } else {
+            await submitDraft();
+          }
         }
       }
     }

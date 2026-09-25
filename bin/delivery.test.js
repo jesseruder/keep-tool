@@ -565,10 +565,58 @@ test('partial chunk progress is durable, resumable only for the same send, and n
     assert.deepEqual(reconcile(directory, { now: Date.now() + 60 * 60e3, panes: new Set(['pane']) }), []);
     assert.equal(fs.existsSync(journal), true);
     await assert.rejects(deliver({ ...base, text: 'different', type: async () => assert.fail('must not type') }), /partially typed/);
-    // Unfinished typing keeps its chunks at any age: only a journal with nothing
+    // Unfinished typing keeps its chunks at any age while its half is still in the
+    // box (the precheck refuses a box with text in it): only a journal with nothing
     // left to write gives up its resume, and this one still owes a chunk.
     fs.writeFileSync(journal, JSON.stringify({ ...JSON.parse(fs.readFileSync(journal, 'utf8')), createdAt: Date.now() - 60 * 60e3 }));
-    assert.deepEqual(await deliver({ ...base, type }), { ok: true, delivery: 'received' });
+    const halfInBox = async () => { throw new Error('the session input box already contains text'); };
+    await assert.rejects(deliver({ ...base, text: 'different', precheck: halfInBox, type: async () => assert.fail('must not type') }), /already contains text/);
+    assert.deepEqual(await deliver({ ...base, precheck: halfInBox, type }), { ok: true, delivery: 'received' });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('an old partial journal whose half is gone from an empty box is retired, and the next send types whole', async () => {
+  const { textHash } = require('./delivery');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-partial-gone-'));
+  const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  const journal = path.join(directory, `${textHash('gone')}.json`);
+  const base = { session: { id: 'gone', kind: 'claude' }, pane: 'pane', file, directory,
+    precheck: async () => {}, submitDraft: async () => assert.fail('unexpected recovery Enter'),
+    draftMatches: async () => false, pause: async () => {}, attempts: 1 };
+  const seed = async (text) => {
+    await assert.rejects(deliver({ ...base, text, type: async (progress) => {
+      progress.plan({ pid: 42, initialInputCount: 7, chunkChars: 3, chunkCount: 2, operationSeed: 'delivery_1234567890abcdef' });
+      progress.start(0);
+      progress.acknowledge(0, textHash(text.slice(0, 3)));
+      throw new Error('the host refused the second chunk');
+    } }), /refused the second chunk/);
+    fs.writeFileSync(journal, JSON.stringify({ ...JSON.parse(fs.readFileSync(journal, 'utf8')), createdAt: Date.now() - 60 * 60e3 }));
+  };
+  const whole = (text, typed) => async (progress) => {
+    // Typed from its first chunk: nothing is resumed onto an empty box.
+    assert.equal(progress.state, null);
+    typed.push(text);
+    fs.appendFileSync(file, `${JSON.stringify({ type: 'user', message: { role: 'user', content: text } })}\n`);
+  };
+  try {
+    // Other words: before the stale window the half still refuses them.
+    await seed('abcdef');
+    const typed = [];
+    fs.writeFileSync(journal, JSON.stringify({ ...JSON.parse(fs.readFileSync(journal, 'utf8')), createdAt: Date.now() }));
+    await assert.rejects(deliver({ ...base, text: 'other words', type: whole('other words', typed) }), /partially typed/);
+    // Past it, on this pane, with the box empty, the half is gone and the send goes through.
+    fs.writeFileSync(journal, JSON.stringify({ ...JSON.parse(fs.readFileSync(journal, 'utf8')), createdAt: Date.now() - 60 * 60e3 }));
+    await assert.rejects(deliver({ ...base, pane: 'elsewhere', text: 'other words', type: whole('other words', typed) }), /partially typed/);
+    assert.deepEqual(await deliver({ ...base, text: 'other words', type: whole('other words', typed) }), { ok: true, delivery: 'received' });
+    assert.deepEqual(typed, ['other words']);
+    assert.equal(fs.existsSync(journal), false);
+    assert.equal(fs.existsSync(path.join(directory, 'settled', `${textHash('gone')}.json`)), false, 'a half message earns no receipt');
+
+    // The same words: the whole message is typed again, never just its missing half.
+    await seed('uvwxyz');
+    assert.deepEqual(await deliver({ ...base, text: 'uvwxyz', type: whole('uvwxyz', typed) }), { ok: true, delivery: 'received' });
+    assert.deepEqual(typed, ['other words', 'uvwxyz']);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

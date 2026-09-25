@@ -147,7 +147,9 @@ const KINDS = [
         node: entry.node,
         waitingFor: entry.node ? `the transcript receipt from node ${entry.node}` : 'its transcript receipt',
         resolve: `keep pane screen ${entry.pane || '<pane>'}: if the text is still in the input box, submit or clear it there; `
-          + 'an unconfirmed keep tell is recovered by re-running the byte-identical tell, which settles the journal',
+          + (stage === 'partially typed'
+            ? 'once the box is empty, the next send to the session retires this record and types its own message whole'
+            : 'an unconfirmed keep tell is recovered by re-running the byte-identical tell, which settles the journal'),
       };
     },
   },
