@@ -4742,9 +4742,9 @@ function envString(name, fallback) {
 }
 
 function compactModelFamilies() {
-  const families = envString('KEEP_AUTO_COMPACT_MODELS', 'fable')
+  const families = envString('KEEP_AUTO_COMPACT_MODELS', 'fable,opus')
     .split(',').map((model) => model.trim().toLowerCase()).filter(Boolean);
-  return families.length ? families : ['fable'];
+  return families.length ? families : ['fable', 'opus'];
 }
 
 function claudeSettingsPath() {
@@ -17205,6 +17205,7 @@ module.exports = {
   compactSessionTransaction,
   compactRequestTelemetry,
   hasCompactionMarker,
+  compactModelFamilies,
   compactSwapPlan,
   compactionSwappedModel,
   ensureCompactionRestored,

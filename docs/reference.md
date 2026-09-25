@@ -2907,9 +2907,10 @@ interrupted restore and shutdown repair that profile. If model restoration is un
 Keep keeps the pane available for inspection and does not deliver the opening message.
 
 Cold Claude compactions whose transcript model matches `KEEP_AUTO_COMPACT_MODELS` (a
-comma-separated family list, default `fable`) first switch the session to
+comma-separated family list, default `fable,opus`) first switch the session to
 `KEEP_COMPACT_VIA_MODEL` (default `opus`, the latest Opus; set it to `off` to disable the
-swap). `opus` resolves to the newest `claude-opus-<major>[-<minor>]` id a transcript under
+swap). A session already on the via model's family has no swap and compacts on its own
+model. `opus` resolves to the newest `claude-opus-<major>[-<minor>]` id a transcript under
 the same Claude account has reported, kept per account config dir in
 `.keep/latest-opus.json` across restarts, and never lower than `claude-opus-5-5`; a new
 Opus release is picked up on an account once one of its sessions has run it. The switch types that full id, with `[1m]` appended when the session's
@@ -2992,7 +2993,7 @@ session's unverifiable transcript likewise leaves `settings.json` as-is.
 
 Auto-compact targets large eligible Claude sessions and Codex sessions running exactly
 `gpt-6-astra`. Claude eligibility still follows `KEEP_AUTO_COMPACT_MODELS` (default
-`fable`); that setting does not opt other Codex models in. It measures cache age from
+`fable,opus`); that setting does not opt other Codex models in. It measures cache age from
 the last model-usage record rather than the transcript file timestamp. For Claude it
 uses the cache-creation metadata to infer a five-minute or one-hour lifetime (mixed
 metadata uses five minutes), falling back to `KEEP_AUTO_COMPACT_CLAUDE_TTL_MIN`, then

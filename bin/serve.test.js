@@ -42,6 +42,7 @@ const {
   compactSession,
   compactRequestTelemetry,
   hasCompactionMarker,
+  compactModelFamilies,
   compactSwapPlan,
   compactionSwappedModel,
   ensureCompactionRestored,
@@ -4155,6 +4156,21 @@ test('settings model repair preserves exact values and removes an originally abs
     else process.env.KEEP_CLAUDE_SETTINGS_PATH = priorPath;
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('auto-compact sweeps Fable and Opus by default, and an Opus session compacts on itself', () => {
+  const prior = process.env.KEEP_AUTO_COMPACT_MODELS;
+  delete process.env.KEEP_AUTO_COMPACT_MODELS;
+  try {
+    assert.deepEqual(compactModelFamilies(), ['fable', 'opus']);
+  } finally {
+    if (prior === undefined) delete process.env.KEEP_AUTO_COMPACT_MODELS;
+    else process.env.KEEP_AUTO_COMPACT_MODELS = prior;
+  }
+  const opts = { via: 'opus', families: ['fable', 'opus'], settingsModel: '', settingsPresent: false };
+  assert.equal(compactSwapPlan({ kind: 'claude', model: 'claude-opus-5-5[1m]' }, opts), null);
+  assert.equal(compactSwapPlan({ kind: 'claude', model: 'claude-sonnet-5' }, opts), null);
+  assert.equal(compactSwapPlan({ kind: 'claude', model: 'claude-fable-5-1' }, opts).switchCommand, '/model opus');
 });
 
 test('settings model snapshots distinguish unreadable, absent, empty, and non-string values', () => {
