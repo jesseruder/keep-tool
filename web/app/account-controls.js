@@ -102,7 +102,7 @@ function bulkHandoffHTML(ctx, session, pane) {
   return `<div class="bulk-handoff">${destinations.map((account) => {
     const hint = usageHint(ctx, account);
     const label = account.label || account.id;
-    return `<button class="btn" data-bulk-handoff="${ctx.esc(account.id)}" data-bulk-source="${ctx.esc(current.id)}" title="Queue every rate-limited session on ${ctx.esc(from)} for transfer to ${ctx.esc(label)}; each one still passes every transfer check"><span>Move ${ctx.esc(noun)} to ${ctx.esc(label)}</span>${hint ? `<small>${ctx.esc(hint)}</small>` : ''}</button>`;
+    return `<button class="btn" data-bulk-handoff="${ctx.esc(account.id)}" data-bulk-source="${ctx.esc(current.id)}" title="Queue every rate-limited session on ${ctx.esc(from)} for transfer to ${ctx.esc(label)}; each one still passes every transfer check, and one on another machine moves now, as its own Continue would"><span>Move ${ctx.esc(noun)} to ${ctx.esc(label)}</span>${hint ? `<small>${ctx.esc(hint)}</small>` : ''}</button>`;
   }).join('')}</div>`;
 }
 
@@ -189,14 +189,39 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
     once(button, async () => {
       const targetAccountId = button.dataset.bulkHandoff;
       const sourceAccountId = button.dataset.bulkSource;
+      const target = labelForAccountId(ctx, targetAccountId);
       try {
         const result = await write('/api/handoff-rate-limited', { sourceAccountId, targetAccountId }, 'POST',
           { label: 'Queueing transfers', retry: () => button.click() });
-        const queued = result.queued?.length || 0;
-        const skipped = result.skipped?.length || 0;
-        ctx.toast(queued
-          ? `Queued ${queued} transfer${queued === 1 ? '' : 's'} to ${labelForAccountId(ctx, targetAccountId)}${skipped ? `; ${skipped} skipped` : ''}.`
-          : `Nothing queued${skipped ? `; ${skipped} skipped` : ''}.`);
+        // The queue never force-stops a session, and a session on another node moves
+        // only when forced, so the batch hands those back with their pane. This click
+        // is Owner's own, so each moves now as its own Continue button would move it.
+        const remote = (result.skipped || []).filter((row) => row.node && row.pane);
+        const skipped = (result.skipped || []).filter((row) => !remote.includes(row));
+        let queued = result.queued?.length || 0;
+        let moved = 0;
+        const failed = [];
+        if (remote.length) ctx.toast(`Moving ${remote.length} session${remote.length === 1 ? '' : 's'} on ${remote[0].node} to ${target}…`);
+        for (const [index, row] of remote.entries()) {
+          const progress = button.querySelector?.('span:last-child');
+          if (progress) progress.textContent = `Moving ${index + 1} of ${remote.length}…`;
+          try {
+            const moveResult = await write('/api/handoff-session', { sessionId: row.sessionId, pane: row.pane, accountId: targetAccountId,
+              queueOnTransient: true, ownerForce: true }, 'POST', { label: 'Moving session' });
+            if (moveResult.status === 'queued') queued += 1;
+            else if (['failed', 'recovery-needed'].includes(moveResult.status)) failed.push(moveResult.reason || moveResult.status);
+            else moved += 1;
+          } catch (error) { failed.push(error.body?.reason || error.message); }
+        }
+        const reasons = (rows) => [...new Set(rows)].join('; ');
+        const parts = [
+          moved ? `moved ${moved} to ${target}` : '',
+          queued ? `queued ${queued} transfer${queued === 1 ? '' : 's'} to ${target}` : '',
+          failed.length ? `${failed.length} failed (${reasons(failed)})` : '',
+          skipped.length ? `${skipped.length} skipped (${reasons(skipped.map((row) => row.reason))})` : '',
+        ].filter(Boolean);
+        const summary = parts.join('; ');
+        ctx.toast(moved || queued ? `${summary[0].toUpperCase()}${summary.slice(1)}.` : `Nothing moved${summary ? `: ${summary}` : ''}.`);
         await ctx.reload();
       } catch (error) { ctx.toast(`Not queued: ${error.message}`); }
     }, ctx);

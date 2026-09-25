@@ -356,12 +356,14 @@ test('a rate-limited session on another node is never queued for a transfer', as
   assert.deepEqual(queue.list(f.root).map((entry) => entry.sessionId), ['session-here'],
     'the policy still queues this machine\'s own, and only it');
 
-  // The batch the console's button runs says why, rather than passing it over.
+  // The batch the console's button runs says why, rather than passing it over, and
+  // names the pane and node so the console can move it with a forced transfer.
   fs.rmSync(path.join(queue.dir(f.root), 'session-here.json'));
   const result = queue.batch({ root: f.root, env: f.env, now: T, log: () => {}, sessions,
     sourceAccountId: 'one', targetAccountId: 'two' });
   assert.deepEqual(result.queued.map((row) => row.sessionId), ['session-here']);
-  assert.deepEqual(result.skipped, [{ sessionId: 'session-far', reason: 'session runs on aws1' }]);
+  assert.deepEqual(result.skipped, [{ sessionId: 'session-far', pane: 'pane-1@aws1', node: 'aws1', reason: 'session runs on aws1' }]);
+  assert.equal(queue.readOne(f.root, 'session-far'), null, 'still never queued');
 });
 
 test('an unusable automationPool is said once per process, not on every tick, and held sessions write no health', async () => {

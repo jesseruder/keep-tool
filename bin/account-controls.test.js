@@ -270,6 +270,56 @@ test('the batch, retry, and cancel buttons post exactly what they name', async (
   assert.equal(JSON.stringify(writes), JSON.stringify([{ url: '/api/handoff-queue-cancel', body: { sessionId: 's' } }]));
 });
 
+test('the batch moves sessions on another node itself, forced, and says what happened to every one', async () => {
+  writes.length = 0;
+  const toasts = [];
+  const ctx = limited();
+  ctx.toast = (message) => toasts.push(message);
+  const answers = {
+    '/api/handoff-rate-limited': { ok: true, queued: [{ sessionId: 's', pane: 'p' }], skipped: [
+      { sessionId: 'far1', pane: 'p5@aws1', node: 'aws1', reason: 'session runs on aws1' },
+      { sessionId: 'far2', pane: 'p6@aws1', node: 'aws1', reason: 'session runs on aws1' },
+      { sessionId: 'far3', pane: 'p7@aws1', node: 'aws1', reason: 'session runs on aws1' },
+      { sessionId: 's2', reason: 'already queued' },
+    ] },
+  };
+  const results = [{ status: 'done' }, { status: 'failed', reason: 'target is not logged in' }];
+  const original = context.write;
+  context.write = async (url, body) => {
+    writes.push({ url, body });
+    if (answers[url]) return answers[url];
+    const next = results.shift();
+    if (!next) throw Object.assign(new Error('host request timed out'), { body: {} });
+    return next;
+  };
+  const labels = [];
+  const bulk = { disabled: false, dataset: { bulkHandoff: 'claude-two', bulkSource: 'claude-main' },
+    querySelector: () => ({ set textContent(value) { labels.push(value); } }) };
+  try {
+    context.installHandoffControls(fakeContainer({ '[data-bulk-handoff]': [bulk] }), ctx, 's', 'p');
+    await bulk.onclick();
+  } finally { context.write = original; }
+
+  assert.deepEqual(writes.map((row) => row.url), ['/api/handoff-rate-limited', '/api/handoff-session', '/api/handoff-session', '/api/handoff-session']);
+  assert.equal(JSON.stringify(writes[1].body), JSON.stringify({ sessionId: 'far1', pane: 'p5@aws1', accountId: 'claude-two', queueOnTransient: true, ownerForce: true }));
+  assert.deepEqual(labels, ['Moving 1 of 3…', 'Moving 2 of 3…', 'Moving 3 of 3…']);
+  assert.deepEqual(toasts, [
+    'Moving 3 sessions on aws1 to Claude Two…',
+    'Moved 1 to Claude Two; queued 1 transfer to Claude Two; 2 failed (target is not logged in; host request timed out); 1 skipped (already queued).',
+  ]);
+
+  // Every one skipped for a reason no click can fix: say which, not just how many.
+  writes.length = 0;
+  toasts.length = 0;
+  context.writeResult = { ok: true, queued: [], skipped: [{ sessionId: 's', reason: 'already queued' }] };
+  try {
+    const again = { disabled: false, dataset: { bulkHandoff: 'claude-two', bulkSource: 'claude-main' } };
+    context.installHandoffControls(fakeContainer({ '[data-bulk-handoff]': [again] }), ctx, 's', 'p');
+    await again.onclick();
+  } finally { context.writeResult = null; }
+  assert.deepEqual(toasts, ['Nothing moved: 1 skipped (already queued).']);
+});
+
 test('a parked transfer whose session has moved on keeps the ordinary controls beside it', () => {
   const parked = { sessionId: 's', sourceAccountId: 'claude-main', targetAccountId: 'claude-two',
     status: 'parked', lastClass: 'transient', lastReason: 'host request timed out (get)' };

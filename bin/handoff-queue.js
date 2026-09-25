@@ -533,8 +533,13 @@ function batch(deps = {}) {
     if (!session.rateLimit) { if (named) skipped.push({ sessionId: session.id, reason: 'not rate limited' }); continue; }
     if (!session.pane) { skipped.push({ sessionId: session.id, reason: 'no live pane' }); continue; }
     // Said out loud rather than passed over, so a person who asked for every
-    // rate-limited session on an account is told which ones this machine cannot move.
-    if (nodes.isRemotePane(session)) { skipped.push({ sessionId: session.id, reason: `session runs on ${session.node}` }); continue; }
+    // rate-limited session on an account is told which ones the queue cannot move.
+    // The pane and node let the console move them itself with an Owner-forced
+    // transfer, the only kind a session on another node accepts.
+    if (nodes.isRemotePane(session)) {
+      skipped.push({ sessionId: session.id, pane: session.pane, node: session.node, reason: `session runs on ${session.node}` });
+      continue;
+    }
     const current = readOne(root, session.id);
     if (current && current.status === 'queued') { skipped.push({ sessionId: session.id, reason: 'already queued' }); continue; }
     enqueue(root, { sessionId: session.id, pane: session.pane, sourceAccountId, targetAccountId, force,
