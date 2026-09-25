@@ -45,7 +45,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const KINDS = new Set(['claude', 'codex', 'pi']);
-const OPS = new Set(['stat', 'tail', 'match', 'find', 'meta', 'pi-event']);
+const OPS = new Set(['stat', 'tail', 'match', 'find', 'meta', 'pi-event', 'close-proof']);
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const ACCOUNT_ID_RE = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex|pi)\/default)$/;
 const HASH_RE = /^[a-f0-9]{64}$/;
@@ -80,7 +80,7 @@ function generationOf(stat) {
 
 function validate(params) {
   if (!params || typeof params !== 'object') throw invalid('a transcript request must be an object');
-  if (!OPS.has(params.op)) throw invalid('transcript op must be stat, tail, match, find, meta or pi-event');
+  if (!OPS.has(params.op)) throw invalid('transcript op must be stat, tail, match, find, meta, pi-event or close-proof');
   if (!KINDS.has(params.kind)) throw invalid('transcript kind must be claude, codex or pi');
   if (params.op === 'meta' && params.kind !== 'codex') throw invalid('transcript meta is for codex rollouts');
   if (params.op === 'pi-event') {
@@ -376,8 +376,48 @@ function piEvent(params, options = {}) {
   } };
 }
 
+// What an automatic close has to know that only a whole-transcript read can tell:
+// for Claude, whether any background command ran and is still unfinished; for Codex,
+// whether the session ever launched a child agent. The daemon runs the same scan in a
+// worker over a local file (serve.js inspectCloseTranscript); for a session on this
+// node the file is here, so the scan is too. Transcript verb 5.
+const CLOSE_PROOF_TIMEOUT_MS = 60e3;
+
+function closeProof(params, options = {}) {
+  const { fd, file, stat } = open(params, options);
+  fs.closeSync(fd);
+  const run = options.inspectCloseTranscript || ((target, kind) => new Promise((resolve, reject) => {
+    const { Worker } = require('node:worker_threads');
+    const worker = new Worker(path.join(__dirname, 'close-transcript-worker.js'), { workerData: { file: target, kind } });
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(result);
+    };
+    const timer = setTimeout(() => {
+      finish(coded(`close transcript scan timed out after ${CLOSE_PROOF_TIMEOUT_MS / 1000}s`, 'transcript-timeout'));
+      try { worker.terminate(); } catch {}
+    }, CLOSE_PROOF_TIMEOUT_MS);
+    worker.once('message', (message) => {
+      if (message && message.error) finish(new Error(message.error.message || String(message.error)));
+      else finish(null, (message && message.result) || {});
+    });
+    worker.once('error', (error) => finish(error));
+    worker.once('exit', (code) => finish(new Error(code ? `close transcript worker exited ${code}` : 'close transcript worker exited without a result')));
+  }));
+  return Promise.resolve(run(file, params.kind)).then((result) => ({
+    ...describe(file, stat),
+    ...(params.kind === 'claude'
+      ? { hasBackgroundCommands: result.hasBackgroundCommands === true, pendingBackground: result.pendingBackground === true }
+      : { launched: result.launched === true }),
+  }));
+}
+
 async function handle(params, options = {}) {
   if (params && params.op === 'find') return find(params, options);
+  if (params && params.op === 'close-proof') { validate(params); return closeProof(params, options); }
   if (params && params.op === 'pi-event') return piEvent(params, options);
   if (params && params.op === 'meta') return rolloutMetaOp(params, options);
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));

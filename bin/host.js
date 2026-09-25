@@ -70,7 +70,7 @@ const HOST_LOG_MAX_BYTES = 5 * 1024 * 1024;
 const PROTOCOL_VERSION = 1;
 // The shapes of the verbs a caller checks for in the hello before it asks. Named once,
 // because the `stats` verb reports them too.
-const TRANSCRIPT_VERSION = 4;
+const TRANSCRIPT_VERSION = 5;
 const ARTIFACTS_VERSION = 3;
 const STATS_VERSION = 1;
 const INVENTORY_VERSION = 1;

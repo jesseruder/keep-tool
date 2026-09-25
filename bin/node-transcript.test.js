@@ -149,3 +149,42 @@ test('meta says transcript-missing for a session with no rollout, and refuses a 
   await assert.rejects(ask({ account: { id: 'codex-b', configDir: f.configDir } }), (error) => error.code === 'transcript-refused');
   assert.equal(require('./node-transcript.js').rolloutMeta(f.configDir, '../x'), null);
 });
+
+// The `close-proof` op (transcript verb 5): the whole-transcript scan an automatic
+// close needs, run on the node that has the file.
+test('close-proof scans a Codex rollout on the node for child agents, with the real worker', async (t) => {
+  const f = codexFixture(t);
+  const file = path.join(f.day, `rollout-2026-09-25T10-00-00-${ID}.jsonl`);
+  const ask = () => handle({ op: 'close-proof', kind: 'codex', sessionId: ID, account: { id: 'codex-a', configDir: f.configDir } }, f.options);
+  fs.writeFileSync(file, line({ type: 'session_meta', payload: { id: ID, cwd: '/work/project' } })
+    + line({ type: 'response_item', payload: { type: 'function_call', name: 'shell', arguments: '{"cmd":"ls"}' } }));
+  const quiet = await ask();
+  assert.equal(quiet.path, file);
+  assert.equal(quiet.launched, false);
+  fs.appendFileSync(file, line({ type: 'response_item', payload: { type: 'function_call', name: 'spawn_agent', arguments: '{}' } }));
+  assert.equal((await ask()).launched, true);
+});
+
+test('close-proof answers a Claude transcript\'s background state, and says transcript-missing for none', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-node-close-proof-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const configDir = path.join(root, 'claude');
+  fs.mkdirSync(path.join(configDir, 'projects', '-work-project'), { recursive: true });
+  const account = { id: 'claude-a', agent: 'claude', configDir };
+  const request = { op: 'close-proof', kind: 'claude', sessionId: ID, account: { id: 'claude-a', configDir } };
+  const scanned = [];
+  const options = {
+    accounts: () => [account],
+    inspectCloseTranscript: (file, kind) => { scanned.push([file, kind]); return { hasBackgroundCommands: true, pendingBackground: false }; },
+  };
+  await assert.rejects(handle(request, options), (error) => error.code === 'transcript-missing');
+  const file = path.join(configDir, 'projects', '-work-project', `${ID}.jsonl`);
+  fs.writeFileSync(file, line({ type: 'user', message: { content: 'hi' } }));
+  const answer = await handle(request, options);
+  assert.equal(answer.path, file);
+  assert.equal(answer.hasBackgroundCommands, true);
+  assert.equal(answer.pendingBackground, false);
+  assert.deepEqual(scanned, [[file, 'claude']]);
+  // An account this node does not have is refused before anything is read.
+  await assert.rejects(handle({ ...request, account: { id: 'claude-b', configDir } }, options), (error) => error.code === 'transcript-refused');
+});

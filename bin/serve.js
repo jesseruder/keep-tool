@@ -4002,6 +4002,16 @@ function nodeTranscript(node, session, deps = {}) {
       const timeoutMs = Math.max(0, Math.min(9000, Math.floor(Number(options.timeoutMs) || 0)));
       return ask('match', { fromOffset: offset, hash, timeoutMs }, timeoutMs + 2000);
     },
+    // The whole-transcript scan an automatic close needs (transcript verb 5), run on
+    // the node over its own file: background commands for Claude, child agents for
+    // Codex. The node gives its scan a minute; the reply window is a little more.
+    closeProof: async () => {
+      const hello = await (deps.hostRequest || hostRequest)('hello', {}, { ...deps, node });
+      if (!(Number(hello && hello.transcript) >= 5)) {
+        throw new InjectionError(409, `the terminal host on ${node} predates the close proof (transcript verb 5); update keep-tool on ${node} and reload its host`);
+      }
+      return ask('close-proof', {}, 70e3);
+    },
   };
 }
 
@@ -7897,7 +7907,10 @@ async function closeIdleSession(body, deps = {}) {
   // An id qualified with this node's own name is this node's pane: everything below
   // compares against the ids the pane list publishes, which are bare here.
   if (!paneNode.qualified && paneNode.paneId !== body.pane) body = { ...body, pane: paneNode.paneId };
-  if (remoteSession(body.pane, deps) && deps.closePolicy && !deps.closePolicy.manual) {
+  // The one automatic close a node's pane takes is the check sweep's: a pane Keep
+  // opened for one recipe, judged below on the node's own reads of its turn, its
+  // whole transcript (the close proof) and its process table.
+  if (remoteSession(body.pane, deps) && deps.closePolicy && !deps.closePolicy.manual && !deps.closePolicy.ephemeral) {
     throw new InjectionError(409, `automatic close is not available for a pane on ${paneNode.node}; close it by hand`);
   }
   // By hand, a pane on another node is judged by that node's answers about its own
@@ -8008,14 +8021,25 @@ async function closeIdleSession(body, deps = {}) {
     checkTaskSafety(state);
     const target = claimInjectionTarget(await resolveSessionTarget(session, { expectedPane: pane.id }, deps));
     await precheckSessionTarget(session, target, deps); // Preserve unsent drafts and modal prompts.
-    const fresh = session.kind === 'claude' ? (deps.claudeSessionFor || claudeSessionFor)(session.id) : (deps.codexSessionFor || codex.sessionFor)(session.id);
+    // On another node the turn is read from the node itself (its tail), never from
+    // the mirror here, which trails it by a hook post. That first read is then the
+    // baseline every later read must match: the row built above came from the mirror.
+    const readTurn = async () => {
+      if (elsewhere) {
+        try { return await (deps.remoteSessionRead || remoteSessionRead)(session.id, deps); }
+        catch (error) { throw new InjectionError(409, `Session activity on ${elsewhere} could not be read: ${String(error && error.message || error)}`); }
+      }
+      return session.kind === 'claude' ? (deps.claudeSessionFor || claudeSessionFor)(session.id) : (deps.codexSessionFor || codex.sessionFor)(session.id);
+    };
+    const fresh = await readTurn();
     if (!fresh || typeof fresh.endedTurn !== 'boolean' || !Number.isFinite(fresh.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
+    const baselineMtime = elsewhere ? fresh.mtime : session.mtime;
     const freshEnded = fresh.endedTurn === true || (deps.allowTerminalRateLimit && fresh.rateLimit && !fresh.pendingBackground
       && !fresh.toolRunning && !fresh.pendingQuestion && !fresh.pendingPlan
       && !require('./session-restart').blockingUnknownJobs(fresh).length);
     // A forced restart already accepted uncertain background evidence upstream;
     // the transcript's turn, tool and mtime checks still have to agree.
-    if (fresh.mtime !== session.mtime || !freshEnded || (!deps.closePolicy?.force && fresh.pendingBackground) || fresh.toolRunning) throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
+    if (fresh.mtime !== baselineMtime || !freshEnded || (!deps.closePolicy?.force && fresh.pendingBackground) || fresh.toolRunning) throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
     let verifyCodexChildren = null;
     let automaticProcessIdentity = null;
     let automaticProcessRows = null;
@@ -8064,7 +8088,27 @@ async function closeIdleSession(body, deps = {}) {
       return rows;
     };
     if (deps.closePolicy?.retirement || deps.closePolicy?.done) await inspectAutomaticProcesses({ initial: true });
-    if (session.kind === 'claude' && !(deps.closePolicy?.restart && deps.restartProof)) {
+    if (elsewhere) {
+      // The whole-transcript half of the proof, run on the node over its own file.
+      // A Codex session there that ever launched a child agent is left open: its
+      // children's rollouts are on that machine too, and nothing here verifies them.
+      let proof;
+      try { proof = await (deps.nodeCloseProof || ((s) => nodeTranscript(elsewhere, s, deps).closeProof()))(session); }
+      catch (error) {
+        if (error instanceof InjectionError) throw error;
+        throw new InjectionError(409, `Background completion on ${elsewhere} could not be verified: ${String(error && error.message || error)}`);
+      }
+      if (session.kind === 'claude' && (proof.hasBackgroundCommands || proof.pendingBackground)) {
+        throw new InjectionError(409, 'Background command completion is unverified; leave the session open');
+      }
+      if (session.kind === 'codex') {
+        const processes = automaticProcessRows || await (deps.agentProcessRows || agentProcessRows)(deps);
+        const identity = (await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => processes })).get(session.id);
+        if (!identity || !identity.primary) throw new InjectionError(409, 'Codex process identity could not be verified; nothing closed');
+        if (processes.some((p) => p.ppid === identity.pid)) throw new InjectionError(409, 'Automatic cleanup protects Codex child processes; use Close to request an explicit graceful exit');
+        if (proof.launched) throw new InjectionError(409, `Codex child agents on ${elsewhere} cannot be verified from here; leave the session open`);
+      }
+    } else if (session.kind === 'claude' && !(deps.closePolicy?.restart && deps.restartProof)) {
       const file = findSessionFile(session.id);
       if (!file) throw new InjectionError(409, 'Session history is unavailable for background completion verification');
       const lifecycle = await inspectCloseTranscript(file, 'claude', deps);
@@ -8100,13 +8144,13 @@ async function closeIdleSession(body, deps = {}) {
       if (deps.closePolicy?.retirement || deps.closePolicy?.done) {
         await inspectAutomaticProcesses();
       } else if (session.kind === 'codex' && !deps.closePolicy?.manual) {
-        const rows = await agentProcessRows(deps);
+        const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
         const identity = (await (deps.liveSessionPids || liveSessionPids)({
           ...deps, agentProcessRows: async () => rows,
         })).get(session.id);
         if (!identity?.primary || rows.some((p) => p.ppid === identity.pid)) throw new InjectionError(409, 'Codex child processes changed during cleanup');
       }
-      const latest = session.kind === 'claude' ? (deps.claudeSessionFor || claudeSessionFor)(session.id) : (deps.codexSessionFor || codex.sessionFor)(session.id);
+      const latest = await readTurn();
       if (!latest || typeof latest.endedTurn !== 'boolean' || !Number.isFinite(latest.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
       // A transfer that named when it was requested is asking about this very read. The
       // comparison below is against `session`, the baseline this close was handed, which
@@ -8116,7 +8160,7 @@ async function closeIdleSession(body, deps = {}) {
       const latestEnded = latest.endedTurn === true || (deps.allowTerminalRateLimit && latest.rateLimit && !latest.pendingBackground
         && !latest.toolRunning && !latest.pendingQuestion && !latest.pendingPlan
         && !require('./session-restart').blockingUnknownJobs(latest).length);
-      if (latest.mtime !== session.mtime || !latestEnded
+      if (latest.mtime !== baselineMtime || !latestEnded
           || (!deps.closePolicy?.force && (latest.pendingBackground
             || require('./session-restart').blockingUnknownJobs(latest).length))
           || latest.toolRunning || latest.pendingQuestion || latest.pendingPlan) {
@@ -15704,7 +15748,11 @@ async function closeEphemeralPane(pane, sessionId, deps = {}) {
     });
     let exitInputStarted = false;
     try {
-      const capabilities = await host('hello');
+      // The host that would do the guarded kill is the pane's own: on a node, that
+      // node's host, whose version is not this one's.
+      const paneNode = nodes.parsePaneRef(String(pane.id || '')).node;
+      const capabilities = paneNode === daemonNodeName(deps)
+        ? await host('hello') : await host('hello', {}, { ...deps, node: paneNode });
       const closed = await (deps.manualClose || require('./manual-close').manualClose)(
       { pane: pane.id, sessionId }, {
         requireGraceful: true,

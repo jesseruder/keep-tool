@@ -396,6 +396,10 @@ function startSchedulers(ctx) {
     // one must never reach the registry this process happens to point at.
     agents: require('../agents.js'),
     closePane: (pane, sessionId) => closeEphemeralPane(pane, sessionId, { onChange: broadcast }),
+    // closeEphemeralPane proves a node's pane finished on that node's own reads.
+    remoteClose: true,
+    // A session on another node is not in this machine's scan: its node reads it.
+    remoteSession: (sessionId) => loadSessionForAction(sessionId),
     // A closed pane still sits in the host's list. Forget it, or the sweep re-decides
     // about a dead pane on every tick and the `runs` health row never reports idle.
     removePane: (pane) => hostRequest('remove', { pane: pane.id }),

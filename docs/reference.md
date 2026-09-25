@@ -413,6 +413,7 @@ keep agents [--json]   # agent records: lifecycle, current session, unseen event
 keep agents events <name> [--unseen] [--limit N] [--json]
 keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] [--badge] -m "text"
 keep agents seen <name>
+keep agents place <name> [--node <node>] [--needs cap,cap] [--daemon]   # Owner only: where its sessions run
 keep verify <id>       # run a check recipe now, in its thread or a fresh session (needs keep serve)
                        # Owner-initiated: never refused by, and never counted against,
                        # the scheduler's one-open-per-card-per-day allowance
@@ -2400,6 +2401,36 @@ reviewer emits no events in this slice, so it never carries a badge.
 - `keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high]
   [--needs-you] -m "text"` is how an agent session writes its own feed.
 - `keep agents seen <name>` marks everything seen; this is what the console posts.
+- `keep agents place <name> [--node <node>] [--needs cap,cap] [--daemon]` shows or sets
+  where the agent's sessions run (below). Changing it is Owner's, gated like a grant.
+
+### Placement: an agent on another node
+
+An agent's record carries `node` (empty for the daemon node) and `needs` (capabilities
+that machine must declare). `keep agents place redash-daily --node aws1` puts a card
+agent's checks on aws1; `--daemon` brings it back. The fleet reviewer is not placed this
+way: Keep finds it rather than opening it, so it is moved with `keep move`.
+
+- **Opening.** `openCheckSession` resolves the record's placement through
+  `resolvePlacement` (a named node is a demand, its `needs` are held to) and asks that
+  node's host for `hello` first. A node that does not answer is waited for, never
+  substituted: the open throws `NODE_WAIT`, the scheduler skips the card for the tick
+  without spending its daily allowance or recording a failure, and the agent's feed gets
+  one `waiting` event per outage (`record.nodeWait`, cleared by the next open that works).
+  A plain check, or an agent with no placement, still opens on the daemon node.
+- **Its CLI.** A pane-only node forwards `keep agents emit`, `keep agents events` and the
+  bare `keep agents` list. The daemon runs a forwarded emit under the caller's verified
+  session and writes it only when that session is the one the record names; `seen` and
+  `place` stay on the daemon node.
+- **Reaping.** The ephemeral sweep gets the fleet listing with the nodes that did not
+  answer. The orphan pass counts a check pane on a node as carrying its agent, and never
+  idles a record whose pane is on a node that did not answer. A finished check pane on a
+  node that answered is closed on that node's evidence: its turn from the node's tail
+  (`remoteSessionRead`, never the mirror), its whole transcript from the node's
+  `close-proof` transcript op (verb 5: background commands for Claude, child agents for
+  Codex, which leave the pane open), and its process table and guarded kill from the
+  node's host. That automatic close is the only one a node pane takes; the idle
+  retirement sweep still leaves node panes to be closed by hand.
 
 ## Area sessions
 

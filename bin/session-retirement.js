@@ -5,6 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const ID = /^[A-Za-z0-9_-]+$/;
+const PANE_REF = /^[A-Za-z0-9_-]+(?:@[a-z0-9]+)?$/;
 const retirementNotifyOverlay = new WeakSet();
 
 function files(root) {
@@ -80,11 +81,11 @@ function safeNotify(notify) {
 }
 
 function begin(root, plan, now = Date.now()) {
-  // A node-qualified pane (`<id>@<node>`) is refused here on purpose: retirement's
-  // identity check is an agent pid read from this machine's process table, and it
-  // has no meaning for a pane on another machine. It waits for node-local process
-  // verification (landing 1b); until then a remote pane is closed by hand.
-  if (!ID.test(String(plan?.sessionId || '')) || !ID.test(String(plan?.pane || ''))) throw Error('bad retirement target');
+  // A node-qualified pane (`<id>@<node>`) is the check sweep closing a pane on a node
+  // on that node's own evidence. Its record keeps the qualified id beside that node's
+  // pid, and reconcile only ever compares a record with this machine's panes, so a
+  // pid from one machine is never read against another's table.
+  if (!ID.test(String(plan?.sessionId || '')) || !PANE_REF.test(String(plan?.pane || ''))) throw Error('bad retirement target');
   const current = retirements(root);
   if (!current.known) throw Error('session retirement registry is unreadable');
   current.value.sessions[plan.sessionId] = {

@@ -474,11 +474,14 @@ test('a restart may name a pane on another node, and refuses anything else', asy
 });
 
 test('the retirement path keeps refusing a pane on another node, and a transfer needs that node\'s answers', async () => {
-  // Retirement proves what it did by reading this machine's process table, so it
-  // refuses a node pane rather than guess.
-  assert.throws(() => require('./session-retirement.js').begin('/tmp/nowhere', {
-    sessionId: 'sess-1', pane: '1a2b@aws1',
-  }), /bad retirement target/);
+  // The idle retirement sweep still never closes a node pane (closeIdleSession
+  // refuses it at the door); only the check sweep's close records one, by its
+  // qualified ref. A ref that is not one is still refused.
+  for (const pane of ['a@b@c', 'bad pane@aws1', '1a2b@AWS1']) {
+    assert.throws(() => require('./session-retirement.js').begin('/tmp/nowhere', {
+      sessionId: 'sess-1', pane,
+    }), /bad retirement target/);
+  }
   // An account transfer of a node pane is proven on that node, and only a caller that
   // wired the node's answers (serve.js handoffSession names it as paneNode) may ask.
   await assert.rejects(require('./account-handoff.js').run({

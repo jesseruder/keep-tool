@@ -1585,6 +1585,43 @@ test('the orphan pass counts a check pane on a node as carried, and leaves a nod
   assert.deepEqual(closed, []);
 });
 
+test('a host that can close on a node reaps a finished check pane there, on that node\'s read of the session', async () => {
+  const now = 1_000_000 + 5 * 3600e3;
+  const closed = [];
+  const removed = [];
+  const asked = [];
+  const result = await sweepEphemeralPanes({
+    listPanes: async () => ({
+      panes: [
+        // Checked in and ended, on a node that answered: reaped.
+        ephemeralPane({ id: 'done@aws1', node: 'aws1', hostPaneId: 'done', meta: { card: null, sessionId: 'sid-done' } }),
+        // Mid-turn on its node: left.
+        ephemeralPane({ id: 'busy@aws1', node: 'aws1', hostPaneId: 'busy', meta: { card: null, sessionId: 'sid-busy' } }),
+        // Its node could not read it: left, however ripe it looks here.
+        ephemeralPane({ id: 'unread@aws1', node: 'aws1', hostPaneId: 'unread', meta: { card: null, sessionId: 'sid-unread' } }),
+        // The last panes of a node that did not answer: never considered.
+        ephemeralPane({ id: 'stale@aws2', node: 'aws2', hostPaneId: 'stale', alive: false, meta: { card: 'some-card', sessionId: 'sid-stale' } }),
+      ],
+      missingNodes: ['aws2'],
+    }),
+    // This machine's scan has none of them.
+    sessions: async () => [],
+    remoteClose: true,
+    remoteSession: async (id) => {
+      asked.push(id);
+      if (id === 'sid-unread') throw new Error('node aws1 did not answer');
+      return { id, endedTurn: id !== 'sid-busy', mtime: 1_000_000 };
+    },
+    closePane: async (pane, sessionId) => { closed.push([pane.id, sessionId]); },
+    removePane: async (pane) => { removed.push(pane.id); },
+    checkinTask: () => {},
+  }, now);
+  assert.deepEqual(result, ['done@aws1']);
+  assert.deepEqual(closed, [['done@aws1', 'sid-done']]);
+  assert.deepEqual(removed, ['done@aws1']);
+  assert.deepEqual(asked.sort(), ['sid-busy', 'sid-done', 'sid-unread']);
+});
+
 test('a placed agent whose node is silent waits: nothing is spent, the feed hears it once, an open clears it', async () => {
   _resetSchedulerState();
   try {

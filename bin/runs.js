@@ -1009,12 +1009,16 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
   // Only with the host's own agents module: a host built without one (a test) must
   // never reach whatever registry this process points at.
   if (host.agents) idleOrphanedCheckAgents(panes, host.agents, now, missingNodes);
-  // A pane on another node is left alone here even if a caller hands one over:
-  // closing it and releasing its card's stamp both rest on evidence only the
-  // machine running it can produce.
-  const isRemotePane = require('./nodes.js').isRemotePane;
+  // A pane on another node is considered only when that node answered this listing:
+  // a node that did not is represented by the panes it last reported, which say
+  // nothing about now. Its close then rests on that node's own evidence — its reads
+  // of the turn, the transcript and the process table (closeIdleSession) — and a host
+  // that cannot give it refuses, which leaves the pane for the next tick. A host
+  // that does not say it can (`remoteClose`) never gets one.
+  const { isRemotePane, parsePaneRef } = require('./nodes.js');
   const ephemeral = panes.filter((pane) => pane && pane.meta && pane.meta.ephemeral
-    && !isRemotePane(pane));
+    && (!isRemotePane(pane) || (host.remoteClose === true
+      && !missingNodes.has(pane.node || parsePaneRef(pane.id).node))));
   if (!ephemeral.length) return [];
   let sessions = [];
   try { sessions = (host.sessions ? await host.sessions() : []) || []; } catch {}
@@ -1024,10 +1028,23 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
   for (const pane of ephemeral) {
     const sessionId = pane.meta.sessionId || null;
     if (!sessionId) continue; // nothing to close against; the pane keeps its own record
+    // This machine's scan has no row for a session on another node; that node's own
+    // read of it stands in. A live pane whose session could not be read is left for
+    // the next tick: without its turn, "idle" and "mid-turn" look the same.
+    let session = byId.get(sessionId);
+    if (!session && isRemotePane(pane) && pane.alive !== false) {
+      if (typeof host.remoteSession !== 'function') continue;
+      try { session = await host.remoteSession(sessionId, pane); }
+      catch (e) {
+        process.stderr.write(`keep runs: left the check pane ${pane.id} alone: its session on ${pane.node || parsePaneRef(pane.id).node} could not be read (${e.message})\n`);
+        continue;
+      }
+      if (!session) continue;
+    }
     let card = null;
     if (pane.meta.card) { try { card = keep.loadTask(pane.meta.card); } catch {} }
     const checkedInAt = checkinFromSessionAt(card, sessionId, Number(pane.meta.launchedAt) || 0);
-    const decision = reapEphemeralPane({ pane, session: byId.get(sessionId), checkedInAt, now });
+    const decision = reapEphemeralPane({ pane, session, checkedInAt, now });
     if (!decision.reap) continue;
     const label = `${pane.meta.ephemeral} session pane ${pane.id} for ${pane.meta.card || 'no card'}`;
     // An account transfer stops the source agent on purpose, so mid-transfer the pane

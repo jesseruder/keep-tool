@@ -9275,6 +9275,26 @@ test('the check sweep close composition refuses rather than kills, and guards it
   });
   assert.deepEqual(require('./session-retirement').lookup(root, 'check-sid').notify,
     { type: 'complete', message: 'check complete' });
+
+  // A check pane on a node: whether its guarded kill exists is asked of that node's
+  // host, whose version need not be this one's, and the pane is read there by its ref.
+  const remotePane = { ...pane, id: 'pane-check@aws1', node: 'aws1', hostPaneId: 'pane-check' };
+  const nodeAsked = [];
+  let nodeAlive = true;
+  const nodeClosed = await closeEphemeralPane(remotePane, 'check-sid', {
+    root,
+    hostRequest: async (type, params, requestDeps) => {
+      nodeAsked.push([type, (requestDeps && requestDeps.node) || (params && params.pane) || null]);
+      if (type === 'hello') return { guardedKill: true };
+      if (type === 'get') return { pane: { ...livePane({ alive: nodeAlive }), id: 'pane-check@aws1' } };
+      return { ok: true };
+    },
+    withInjectionLock: (fn) => fn(),
+    closeIdleSession: async () => { nodeAlive = false; return { ok: true, expectedInputCount: 3, expectedOutputCount: 9 }; },
+  });
+  assert.equal(nodeClosed.closed, true);
+  assert.deepEqual(nodeAsked[0], ['hello', 'aws1']);
+  assert.ok(nodeAsked.filter(([type]) => type === 'get').every(([, where]) => where === 'pane-check@aws1'));
 });
 
 test('a restarted or handed-off pane stops being the check scheduler\'s to reap', () => {
@@ -15570,6 +15590,82 @@ test('a pane on another node closed by hand is killed on that node, and nothing 
       // for nothing else.
       assert.deepEqual([...new Set(asked.filter((call) => call.node === 'main').map((call) => call.type))]
         .filter((type) => !['hello', 'list'].includes(type)), []);
+    } finally {
+      await closeHostClient();
+    }
+  });
+});
+
+test('the check sweep\'s close of a pane on a node is judged by that node\'s reads, and types nothing when they disagree', async (t) => {
+  const { withTwoNodeFleet } = require('./fixtures/two-node-hosts.js');
+  const { closeHostClient, closeIdleSession, hostRequest } = require('./serve');
+  const { connect } = require('./hostclient.js');
+  await withTwoNodeFleet(t, async ({ root, registry, env, accountId, agentPath }) => {
+    await closeHostClient();
+    const sessionId = 'remote-check-session';
+    const asked = [];
+    const policy = {
+      automatic: true, retirement: true, ephemeral: true, expectedReason: 'completed-check',
+      doneIdleMs: 0, attentionIdleMs: 0, unattendedIdleMs: 0, idleMs: 0,
+    };
+    const base = { root: registry, env,
+      connectHost: async (options) => {
+        const client = await connect(options);
+        const node = options.node || 'main';
+        return {
+          ...client,
+          request: (type, params, requestOptions) => { asked.push({ node, type }); return client.request(type, params, requestOptions); },
+          onDisconnect: (listener) => client.onDisconnect(listener),
+          close: () => client.close(),
+        };
+      },
+      withInjectionLock: (fn) => fn(),
+      // The mirror's row: ended, and long idle.
+      buildState: async () => ({ sessions: [{ id: sessionId, kind: 'claude', state: 'idle', endedTurn: true, mtime: 1, project: root, node: 'aws1', keepRunningKnown: true }], tasks: [] }),
+      discoverCodexJobs: async () => ({ jobs: [] }),
+      loadAll: () => [],
+      readPendingCompactSwap: () => null,
+      closePolicy: policy,
+    };
+    try {
+      const spawned = (await hostRequest('spawn', {
+        cmd: '/bin/sh', args: ['-c', `exec claude --resume ${sessionId}`],
+        cwd: root, env: { PATH: agentPath },
+        meta: { agent: 'claude', sessionId, accountId, ephemeral: 'check', unattended: true },
+      }, { ...base, node: 'aws1' })).pane;
+      // The agent's process identity is proven from aws1's table before the close
+      // proof is asked, so wait for that table to show the agent under load.
+      const { agentProcessRows } = require('./serve');
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const rows = await agentProcessRows({ ...base, now: () => Date.now() + attempt * 1e6 }, { node: 'aws1' });
+        if (rows.some((row) => String(row.args || '').includes(sessionId))) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      // The idle retirement sweep still never closes a node pane.
+      await assert.rejects(closeIdleSession({ sessionId, pane: spawned.id }, { ...base, closePolicy: { automatic: true, retirement: true } }),
+        /automatic close is not available for a pane on aws1/);
+      asked.length = 0;
+      // The node says the session is mid-turn, whatever the mirror says: nothing typed.
+      const proofs = [];
+      await assert.rejects(closeIdleSession({ sessionId, pane: spawned.id }, {
+        ...base,
+        remoteSessionRead: async (id) => ({ id, kind: 'claude', endedTurn: false, mtime: 7 }),
+        nodeCloseProof: async () => { proofs.push('asked'); return { hasBackgroundCommands: false, pendingBackground: false }; },
+      }), /Session changed during cleanup; nothing closed/);
+      // Ended on the node, but a background command ran there: nothing typed.
+      await assert.rejects(closeIdleSession({ sessionId, pane: spawned.id }, {
+        ...base,
+        remoteSessionRead: async (id) => ({ id, kind: 'claude', endedTurn: true, mtime: 7 }),
+        nodeCloseProof: async () => { proofs.push('asked'); return { hasBackgroundCommands: true, pendingBackground: false }; },
+      }), /Background command completion is unverified/);
+      // A node that cannot be read is not an idle session.
+      await assert.rejects(closeIdleSession({ sessionId, pane: spawned.id }, {
+        ...base,
+        remoteSessionRead: async () => { throw new Error('node aws1 did not answer'); },
+      }), /Session activity on aws1 could not be read/);
+      assert.deepEqual(proofs, ['asked'], 'the close proof is asked only once the turn read agrees');
+      assert.equal(asked.some((call) => call.type === 'input'), false, 'nothing was typed');
+      assert.equal((await hostRequest('get', { pane: spawned.id }, base)).pane.alive, true);
     } finally {
       await closeHostClient();
     }

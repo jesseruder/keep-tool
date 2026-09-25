@@ -2808,7 +2808,7 @@ test('a node answers stat, tail and match for a transcript of its own account', 
   const node = transcriptNode('ops');
   try {
     await withHost({ env: node.env }, async ({ client }) => {
-      assert.equal((await client.request('hello')).transcript, 4, 'the verb is advertised, find, pi-event and meta with it');
+      assert.equal((await client.request('hello')).transcript, 5, 'the verb is advertised, find, pi-event, meta and close-proof with it');
       const asked = { kind: 'claude', sessionId: 'sess-transcript', account: node.account };
       const stat = await client.request('transcript', { ...asked, op: 'stat' });
       const onDisk = fs.statSync(node.file);
