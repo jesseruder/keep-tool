@@ -161,8 +161,7 @@ test('a first run with no cursor reads only the recent window, then continues fr
   assert.equal(result.status, 0, result.stderr);
   const out = JSON.parse(result.stdout);
   assert.deepEqual(out.first, ['recent']);
-  assert.deepEqual(out.calls[0], { since: '2026-09-24T12:00:00.000Z', limit: 100 });
-  assert.deepEqual(out.calls[1], { after_seq: 3, limit: 100 });
+  assert.deepEqual(out.calls.slice(0, 3), [{ limit: 1 }, { since: '2026-09-24T12:00:00.000Z', limit: 100 }, { after_seq: 3, limit: 100 }]);
   assert.equal(out.second, 0);
   assert.equal(readState(root, 'cursor.json').seq, 3);
 });
@@ -179,7 +178,7 @@ test('a first run over a quiet window still sets the cursor from the newest row,
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), {
     first: 0, second: 0, prompts: 0,
-    calls: [{ since: '2026-09-24T12:00:00.000Z', limit: 100 }, { limit: 1 }, { after_seq: 9, limit: 100 }],
+    calls: [{ limit: 1 }, { since: '2026-09-24T12:00:00.000Z', limit: 100 }, { after_seq: 9, limit: 100 }],
   });
   assert.equal(readState(quiet, 'cursor.json').seq, 9);
 
@@ -190,8 +189,55 @@ test('a first run over a quiet window still sets the cursor from the newest row,
     process.stdout.write(JSON.stringify(calls));
   `));
   assert.equal(emptyRun.status, 0, emptyRun.stderr);
-  assert.deepEqual(JSON.parse(emptyRun.stdout).slice(1), [{ limit: 1 }, { after_seq: 0, limit: 100 }]);
+  assert.deepEqual(JSON.parse(emptyRun.stdout), [{ limit: 1 }, { since: '2026-09-24T12:00:00.000Z', limit: 100 }, { after_seq: 0, limit: 100 }]);
   assert.equal(readState(empty, 'cursor.json').seq, 0);
+});
+
+test('a first run takes the high-water mark before the window, so a row inserted around the window query is never skipped', () => {
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  const root = fixture({ enabled: true });
+  const recent = '2026-09-25T11:00:00Z';
+  const rows = [row(5, { postedAt: '2026-09-20T12:00:00Z', text: 'old' })];
+  // One row lands between the mark and the window query (seq 6, inside the window),
+  // another right after the window query (seq 7).
+  const between = row(6, { postedAt: recent, text: 'between' });
+  const after = row(7, { postedAt: recent, text: 'after' });
+  const result = run(root, pollScript(rows, `
+    const base = deps.callGateway;
+    deps.callGateway = async (args) => {
+      const out = await base(args);
+      if (args.limit === 1 && args.since == null && args.after_seq == null) rows.push(${JSON.stringify(between)});
+      if (args.since) rows.push(${JSON.stringify(after)});
+      return out;
+    };
+    const first = await discord.poll({ deps, now: ${now} });
+    const cursorAfterFirst = JSON.parse(require('fs').readFileSync(discord.CURSOR_FILE, 'utf8')).seq;
+    const second = await discord.poll({ deps, now: ${now} });
+    process.stdout.write(JSON.stringify({ first: first.map((entry) => entry.summary), cursorAfterFirst,
+      second: second.map((entry) => entry.summary), calls }));
+  `));
+  assert.equal(result.status, 0, result.stderr);
+  const out = JSON.parse(result.stdout);
+  assert.deepEqual(out.calls[0], { limit: 1 }, 'the mark comes first');
+  assert.deepEqual(out.first, ['between']);
+  assert.equal(out.cursorAfterFirst, 6, 'max(mark 5, highest classified 6)');
+  assert.deepEqual(out.second, ['after']);
+  assert.equal(readState(root, 'cursor.json').seq, 7);
+});
+
+test('a first run whose window backlog holds the poll keeps the cursor at the classified prefix, not the mark', () => {
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  const root = fixture({ enabled: true, maxPerPoll: 1 });
+  const rows = [row(1, { postedAt: '2026-09-25T10:00:00Z', text: 'one' }), row(2, { postedAt: '2026-09-25T11:00:00Z', text: 'two' })];
+  const result = run(root, pollScript(rows, `
+    const first = await discord.poll({ deps, now: ${now} });
+    const cursorAfterFirst = JSON.parse(require('fs').readFileSync(discord.CURSOR_FILE, 'utf8')).seq;
+    const second = await discord.poll({ deps, now: ${now} });
+    process.stdout.write(JSON.stringify({ first: first.map((entry) => entry.summary), cursorAfterFirst, second: second.map((entry) => entry.summary) }));
+  `));
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { first: ['one'], cursorAfterFirst: 1, second: ['two'] });
+  assert.equal(readState(root, 'cursor.json').seq, 2);
 });
 
 test('a gateway that is there but failing is thrown, not swallowed into a skip', () => {
@@ -357,12 +403,21 @@ test('the gateway credential comes from the agent config, and only ever goes to 
   // Codex: static headers, env_http_headers, bearer_token_env_var, http_headers_helper.
   writeCodex('[mcp_servers.castle]\nurl = "https://castle.example/mcp"\n\n[mcp_servers.castle.http_headers]\nX-Static = "s"\n\n'
     + '[mcp_servers.castle.env_http_headers]\nX-From-Env = "CASTLE_TEST_HEADER"\n');
-  assert.equal(resolve({ enabled: true }).tolerated, false, 'an unset env header is no credential');
+  // An unset env header drops only that header, as in Codex.
+  assert.deepEqual(resolve({ enabled: true }).gateway, { url: 'https://castle.example/mcp', headers: { 'X-Static': 's' } });
   assert.deepEqual(resolve({ enabled: true }, { CASTLE_TEST_HEADER: 'e' }).gateway,
     { url: 'https://castle.example/mcp', headers: { 'X-Static': 's', 'X-From-Env': 'e' } });
-  writeCodex('[mcp_servers.castle]\nurl = "https://castle.example/mcp"\nbearer_token_env_var = "CASTLE_TEST_TOKEN"\n');
+  // Codex's http_headers are literal: no ${VAR} expansion.
+  writeCodex('[mcp_servers.castle]\nurl = "https://castle.example/mcp"\n\n[mcp_servers.castle.http_headers]\nX-Literal = "${NOT_EXPANDED}"\n');
+  assert.deepEqual(resolve({ enabled: true }).gateway, { url: 'https://castle.example/mcp', headers: { 'X-Literal': '${NOT_EXPANDED}' } });
+  writeCodex('[mcp_servers.castle]\nurl = "https://castle.example/mcp"\nbearer_token_env_var = "CASTLE_TEST_TOKEN"\n\n'
+    + '[mcp_servers.castle.http_headers]\nX-Static = "s"\n\n[mcp_servers.castle.env_http_headers]\nX-From-Env = "CASTLE_TEST_HEADER"\n');
   assert.deepEqual(resolve({ enabled: true }, { CASTLE_TEST_TOKEN: 'tok' }).gateway,
-    { url: 'https://castle.example/mcp', headers: { Authorization: 'Bearer tok' } });
+    { url: 'https://castle.example/mcp', headers: { 'X-Static': 's', Authorization: 'Bearer tok' } });
+  // An unset bearer_token_env_var fails the whole source, static headers and all.
+  const noBearer = resolve({ enabled: true });
+  assert.equal(noBearer.tolerated, false);
+  assert.match(noBearer.error, /^no credentials for the Castle gateway/);
   writeCodex('[mcp_servers.castle]\nurl = "https://castle.example/mcp"\nhttp_headers_helper = "printf \'{\\"Authorization\\":\\"Bearer codex-helper\\"}\'"\n');
   assert.deepEqual(resolve({ enabled: true }).gateway,
     { url: 'https://castle.example/mcp', headers: { Authorization: 'Bearer codex-helper' } });

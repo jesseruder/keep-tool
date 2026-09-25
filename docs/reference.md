@@ -129,8 +129,11 @@ and `~/.claude.json` (its `url`, its static `headers` with `${VAR}` / `${VAR:-de
 expansion, and its `headersHelper`), then `[mcp_servers.<server>]` in
 `~/.codex/config.toml` (`url`, `http_headers`, `env_http_headers` mapping header names
 to environment variable names, `bearer_token_env_var`, `http_headers_helper`). The
-first candidate on the target URL's origin that yields a credential wins; one whose
-headers name an unset variable yields none, and the next is tried.
+first candidate on the target URL's origin that yields a credential wins. Each form
+resolves on its own, as in Codex: an `env_http_headers` variable that is unset drops
+only that header; an unset `bearer_token_env_var`, or a Claude `${VAR}` header naming
+an unset variable, fails that whole source, and the next is tried. Codex's
+`http_headers` are literal, not expanded.
 
 An agent entry's credential only ever goes to that entry's own origin. A `gateway.url`
 on another origin must bring its own `gateway.headersHelper` or `gateway.headers`, and
@@ -143,10 +146,14 @@ Keep no literal credential in `watch/discord.json`: the registry is a git reposi
 Each poll reads `discord_recent` with `after_seq` = the cursor in
 `.keep/discord/cursor.json`, paging (at most ten pages) until a short page. With no
 cursor it asks for `since` = 24 hours ago instead, so a fresh install classifies
-recent history, not the whole backfill. If that window is empty it asks for the newest
-row alone (`limit: 1`, no `after_seq` or `since`) and sets the cursor to its `seq`, or
-to 0 when the table is empty, so every poll after the first successful one reads by
-`after_seq`. Rows are deduplicated by `message_id` against `.keep/discord/seen.json`
+recent history, not the whole backfill. Before the window it takes the high-water mark:
+the newest row alone (`limit: 1`, no `after_seq` or `since`), whose `seq` is H, or 0 on
+an empty table. The first cursor is the larger of H and the highest row the window
+classified, so a row inserted after the mark (it has a larger `seq`) is read by the
+next `after_seq` poll whichever side of the window query it landed on. If the window's
+backlog stopped the first poll early, the cursor stays at the classified prefix instead,
+so the rest of the window is read next. Every poll after the first successful one reads
+by `after_seq`. Rows are deduplicated by `message_id` against `.keep/discord/seen.json`
 (30 days), so a row the scraper re-reads under a new `seq` is not classified twice. A
 forum message reaches the classifier as `[post: <thread title>] <text>`. Each decision
 in `.keep/discord/decisions.jsonl` carries its own row's `channel`, forum `thread` title
@@ -157,18 +164,19 @@ early, the cursor holds at the first unclassified row, and `keep discord status`
 `cursor: seq N (backlog left for the next poll)`. A classifier failure moves nothing.
 
 A gateway that is **not there to ask** does not make the `discord` row in `keep health`
-read as failing: the connection refused or reset, the name unresolvable, the call
-timed out, or the gateway answering without the `discord_recent` tool
-(`Unknown tool 'discord_recent'`, as a tool error or a JSON-RPC error) because it is
-not deployed yet. That is treated as a state the scheduler tolerates: `poll()` records
+read as failing: the connection refused or reset (before the response or while its body
+was read), the name unresolvable, the call timed out, or the gateway answering without
+the `discord_recent` tool (an unknown-tool error naming `discord_recent`, as a tool
+error or a JSON-RPC error) because it is not deployed yet. That is treated as a state the scheduler tolerates: `poll()` records
 a skip in its status file, the row records a skip detailed
 `gateway unavailable: <message>`, marked `expected`, which clears the failure streak and
 keeps `bin/lint.js` `daemon-health` from calling it late. One
 `keep discord: gateway unavailable: <message>` line goes to stderr on entering that
 state, not one per tick.
 
-Nothing else qualifies. A gateway that is there and failing — HTTP 401/403 or 5xx, a
-JSON-RPC error other than an unknown tool, a response that is not JSON or a stream that
+Nothing else qualifies. A gateway that is there and failing — a redirect (never
+followed, so the credential is never resent to its target), HTTP 401/403 or 5xx, a
+JSON-RPC error other than an unknown `discord_recent`, a response that is not JSON or a stream that
 ended without an answer, a tool result flagged `isError` (its database is down) — is a
 real failure, and so is everything on this side: a headers helper that failed or
 printed something other than a JSON object of strings, no credential at all, a page

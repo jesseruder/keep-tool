@@ -17,8 +17,16 @@ async function fakeGateway(options = {}) {
       const message = body ? JSON.parse(body) : null;
       log.push({ method: req.method, rpc: message && message.method, session: req.headers['mcp-session-id'] || null,
         auth: req.headers.authorization, protocol: req.headers['mcp-protocol-version'] || null });
+      if (options.redirectTo) { res.writeHead(307, { location: options.redirectTo }).end(); return; }
       if (req.headers.authorization !== TOKEN) { res.writeHead(401).end('unauthorized'); return; }
       if (options.status && message && message.method === 'tools/call') { res.writeHead(options.status).end('boom'); return; }
+      if (options.body && message && message.method === 'tools/call') {
+        // The status line and part of a body, then the connection drops or goes silent.
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"jsonrpc":"2.0",');
+        if (options.body === 'drop') setTimeout(() => req.socket.destroy(), 20);
+        return;
+      }
       if (req.method === 'DELETE') { res.writeHead(200).end(); return; }
       if (!message.id) { res.writeHead(202).end(); return; }
       let reply;
@@ -35,6 +43,8 @@ async function fakeGateway(options = {}) {
         reply = { jsonrpc: '2.0', id: message.id, error: { code: -32603, message: 'internal error' } };
       } else if (message.method === 'tools/call' && message.params.name === 'rpc-unknown') {
         reply = { jsonrpc: '2.0', id: message.id, error: { code: -32602, message: 'Unknown tool: rpc-unknown' } };
+      } else if (message.method === 'tools/call' && message.params.name === 'rpc-unknown-other') {
+        reply = { jsonrpc: '2.0', id: message.id, error: { code: -32602, message: 'Unknown tool: some_backend_helper' } };
       } else {
         reply = { jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: `Unknown tool '${message.params.name}'.` }], isError: true } };
       }
@@ -55,7 +65,7 @@ async function fakeGateway(options = {}) {
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const url = `http://127.0.0.1:${server.address().port}/mcp`;
-  return { url, log, close: () => new Promise((resolve) => server.close(resolve)) };
+  return { url, log, closeAll: () => server.closeAllConnections(), close: () => new Promise((resolve) => server.close(resolve)) };
 }
 
 for (const [label, options] of [['JSON', {}], ['event-stream', { sse: true }], ['structuredContent', { structured: true }]]) {
@@ -93,7 +103,9 @@ test('a tool the gateway does not serve yet is GatewayUnavailable, by either err
 test('a gateway that is there and failing is a GatewayError, not an outage', async () => {
   const gateway = await fakeGateway();
   try {
-    for (const [tool, code, pattern] of [['broken', 'tool_error', /discord|broken: database is down/], ['rpc-error', 'rpc', /tools\/call: internal error/]]) {
+    for (const [tool, code, pattern] of [['broken', 'tool_error', /broken: database is down/], ['rpc-error', 'rpc', /tools\/call: internal error/],
+      // "Unknown tool" about some other name is not our tool being absent.
+      ['rpc-unknown-other', 'rpc', /tools\/call: Unknown tool: some_backend_helper/]]) {
       await assert.rejects(mcp.callTool({ url: gateway.url, headers: { Authorization: TOKEN }, tool }), (error) => {
         assert.ok(error instanceof mcp.GatewayError, tool);
         assert.equal(error instanceof mcp.GatewayUnavailable, false);
@@ -131,6 +143,40 @@ test('an auth failure is a GatewayError, an unreachable gateway is GatewayUnavai
     assert.equal(error.message.includes('token=abc'), false, 'the query string is not repeated');
     return true;
   });
+});
+
+test('a redirect is refused as a GatewayError and the credential never reaches its target', async () => {
+  const target = await fakeGateway();
+  const redirecting = await fakeGateway({ redirectTo: target.url });
+  try {
+    await assert.rejects(mcp.callTool({ url: redirecting.url, headers: { Authorization: TOKEN }, tool: 'discord_recent' }), (error) => {
+      assert.ok(error instanceof mcp.GatewayError);
+      assert.equal(error.code, 'redirect');
+      assert.equal(error.message, `${redirecting.url} initialize: refused to follow a redirect (HTTP 307)`);
+      return true;
+    });
+    assert.deepEqual(target.log, [], 'nothing was sent to the redirect target');
+  } finally { await redirecting.close(); await target.close(); }
+});
+
+test('a connection that drops or stalls after the status line is GatewayUnavailable, like one that never connected', async () => {
+  const dropping = await fakeGateway({ body: 'drop' });
+  try {
+    await assert.rejects(mcp.callTool({ url: dropping.url, headers: { Authorization: TOKEN }, tool: 'discord_recent' }), (error) => {
+      assert.ok(error instanceof mcp.GatewayUnavailable, error.message);
+      assert.equal(error.code, 'unreachable');
+      assert.match(error.message, /tools\/call: connection dropped while reading the response: /);
+      return true;
+    });
+  } finally { await dropping.close(); }
+  const stalling = await fakeGateway({ body: 'stall' });
+  try {
+    await assert.rejects(mcp.callTool({ url: stalling.url, headers: { Authorization: TOKEN }, tool: 'discord_recent', timeoutMs: 500 }), (error) => {
+      assert.ok(error instanceof mcp.GatewayUnavailable, error.message);
+      assert.equal(error.code, 'timeout');
+      return true;
+    });
+  } finally { stalling.closeAll(); await stalling.close(); }
 });
 
 test('a headers helper prints a JSON object of string headers', async () => {

@@ -11,10 +11,11 @@
 // Two kinds of failure, and the difference matters to a caller's health row:
 //
 // - `GatewayUnavailable`: the gateway is not there to ask. The connection was refused
-//   or reset, the name did not resolve, the call timed out, or the gateway answered
-//   but does not serve the tool (not deployed yet). Nobody on this side can fix that,
-//   and it is expected to pass.
-// - `GatewayError`: the gateway is there and something is wrong. An HTTP error status
+//   or reset (before or while the response body was read), the name did not resolve,
+//   the call timed out, or the gateway answered but does not serve the tool (not
+//   deployed yet). Nobody on this side can fix that, and it is expected to pass.
+// - `GatewayError`: the gateway is there and something is wrong. A redirect (never
+//   followed, so the credential is never resent elsewhere), an HTTP error status
 //   (401/403 and 5xx included), a JSON-RPC error, a response that is not JSON or a
 //   stream that ended without an answer, a tool result flagged isError (its database
 //   is down), a headers helper that failed. Somebody has to fix these, so they are not
@@ -129,7 +130,17 @@ function matchResponse(message, id) {
   return list.find((item) => item && typeof item === 'object' && item.id === id && ('result' in item || 'error' in item));
 }
 
-async function readResponse(response, id, label) {
+// A failure after the status line arrived — the socket reset, the network dropped, the
+// deadline fired mid-body — is the same outage as one before it, not a bad answer.
+function droppedWhileReading(error, label, deadline, timeoutMs) {
+  if (deadline && deadline.aborted) {
+    return new GatewayUnavailable(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`, { code: 'timeout' });
+  }
+  const code = (error && error.cause && error.cause.code) || (error && error.code) || (error && error.name) || 'read failed';
+  return new GatewayUnavailable(`${label}: connection dropped while reading the response: ${code}`, { code: 'unreachable' });
+}
+
+async function readResponse(response, id, label, deadline, timeoutMs) {
   const type = String(response.headers.get('content-type') || '');
   if (!response.body) throw new GatewayError(`${label}: empty response`);
   const reader = response.body.getReader();
@@ -140,7 +151,9 @@ async function readResponse(response, id, label) {
   let pending = '';
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      let chunk0;
+      try { chunk0 = await reader.read(); } catch (error) { throw droppedWhileReading(error, label, deadline, timeoutMs); }
+      const { done, value } = chunk0;
       if (done) break;
       size += value.byteLength;
       if (size > RESPONSE_MAX) throw new GatewayError(`${label}: response exceeded 10 MiB`);
@@ -224,7 +237,11 @@ async function callTool(options) {
     const body = { jsonrpc: '2.0', method, ...(params ? { params } : {}), ...(notification ? {} : { id }) };
     let response;
     try {
-      response = await fetchImpl(url, { method: 'POST', headers: headersFor(), body: JSON.stringify(body), signal: deadline });
+      // Never follow a redirect: fetch would resend the credential headers to wherever
+      // the Location points. A 3xx is refused below as a GatewayError.
+      response = await fetchImpl(url, {
+        method: 'POST', headers: headersFor(), body: JSON.stringify(body), signal: deadline, redirect: 'manual',
+      });
     } catch (error) {
       if (deadline.aborted) throw new GatewayUnavailable(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`, { code: 'timeout' });
       const code = error && error.cause && error.cause.code;
@@ -234,6 +251,10 @@ async function callTool(options) {
     }
     if (!notification) nextId += 1;
     if (method === 'initialize') sessionId = response.headers.get('mcp-session-id') || null;
+    if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)) {
+      try { await response.body?.cancel(); } catch {}
+      throw new GatewayError(`${label} ${method}: refused to follow a redirect (HTTP ${response.status || 'redirect'})`, { code: 'redirect' });
+    }
     if (!response.ok) {
       try { await response.body?.cancel(); } catch {}
       const status = response.status;
@@ -244,10 +265,12 @@ async function callTool(options) {
       try { await response.body?.cancel(); } catch {}
       return null;
     }
-    const message = await readResponse(response, id, `${label} ${method}`);
+    const message = await readResponse(response, id, `${label} ${method}`, deadline, timeoutMs);
     if (message.error) {
       const text = String(message.error.message || 'error').replace(/\s+/g, ' ').slice(0, 300);
-      if (method === 'tools/call' && UNKNOWN_TOOL.test(text)) {
+      // Only an unknown-tool error that names this tool: "unknown tool" about some other
+      // name is the gateway misbehaving, not our tool being absent.
+      if (method === 'tools/call' && UNKNOWN_TOOL.test(text) && text.includes(tool)) {
         throw new GatewayUnavailable(`${label}: tool ${tool} is not available: ${text}`, { code: 'tool_missing' });
       }
       throw new GatewayError(`${label} ${method}: ${text}`, { code: 'rpc' });
@@ -276,7 +299,7 @@ async function callTool(options) {
     if (sessionId) {
       try {
         const response = await fetchImpl(url, {
-          method: 'DELETE', headers: headersFor(), signal: AbortSignal.timeout(5e3),
+          method: 'DELETE', headers: headersFor(), signal: AbortSignal.timeout(5e3), redirect: 'manual',
         });
         try { await response.body?.cancel(); } catch {}
       } catch {}

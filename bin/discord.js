@@ -133,7 +133,7 @@ function agentServerEntries(server, home = os.homedir()) {
     const entry = readJson(file, {})?.mcpServers?.[server];
     if (entry && typeof entry === 'object' && entry.url) {
       entries.push({ source: file, url: String(entry.url), headers: stringMap(entry.headers),
-        envHeaders: {}, bearerEnv: '', headersHelper: entry.headersHelper ? String(entry.headersHelper) : '' });
+        expand: true, envHeaders: {}, bearerEnv: '', headersHelper: entry.headersHelper ? String(entry.headersHelper) : '' });
     }
   }
   try {
@@ -151,13 +151,19 @@ function agentServerEntries(server, home = os.homedir()) {
 
 // An entry's static credential, or null when it has none it can supply right now:
 // no headers at all, or one naming an environment variable that is not set.
+//
+// Each form resolves on its own, the way Codex does it: an `env_http_headers` entry
+// whose variable is unset drops that one header and keeps the rest (static headers,
+// the bearer token, the helper's output). An unset `bearer_token_env_var` is an error
+// for the whole source, as it is in Codex, and so is a Claude `${VAR}` header naming an
+// unset variable; the caller then falls through to the next source. Codex does not
+// expand `${VAR}` in `http_headers`, so neither does this.
 function staticHeaders(entry) {
-  const headers = expandHeaders(entry.headers);
+  const headers = entry.expand ? expandHeaders(entry.headers) : { ...(entry.headers || {}) };
   if (headers == null) return null;
   for (const [name, variable] of Object.entries(entry.envHeaders || {})) {
     const value = process.env[variable];
-    if (value == null || value === '') return null;
-    headers[name] = value;
+    if (value != null && value !== '') headers[name] = value;
   }
   if (entry.bearerEnv) {
     const token = process.env[entry.bearerEnv];
@@ -189,7 +195,8 @@ async function resolveGateway(cfg, deps = {}) {
   for (const entry of entries) {
     if (!target || origin(entry.url) !== target) continue;
     const headers = staticHeaders(entry);
-    if (entry.headersHelper) return { url, headers: { ...(headers || {}), ...await helper(entry.headersHelper) } };
+    if (headers == null) continue; // this source cannot authenticate here; try the next
+    if (entry.headersHelper) return { url, headers: { ...headers, ...await helper(entry.headersHelper) } };
     if (headers && Object.keys(headers).length) return { url, headers };
     // This entry has the URL but nothing to authenticate with here; try the next.
   }
@@ -245,17 +252,20 @@ function pageRows(page) {
 // Fetches everything after `cursor` (or, with no cursor, the recent window), a
 // bounded number of pages per poll. Rows come back in seq order, deduplicated by seq.
 //
-// A first run whose recent window is empty still establishes the cursor: it asks for
-// the newest row alone (no after_seq, no since) and starts after it, or at 0 when the
-// table is empty. So every poll after the first successful one reads by after_seq,
-// and a quiet day does not leave the watcher re-reading a sliding 24h window forever.
-// `baseline` is that seq, or null when the window had rows.
+// A first run (no cursor) takes the high-water mark FIRST — the newest row alone, no
+// after_seq or since — and only then reads the recent window. `baseline` is that seq
+// (0 on an empty table), and poll() sets the cursor to at least it. A row the scraper
+// inserts after the mark has a larger seq, so the next after_seq poll reads it
+// whichever side of the window query it landed on; taking the mark after the window
+// would let a row inserted between the two calls fall below the cursor unread. Every
+// poll after the first successful one reads by after_seq, and a quiet day does not
+// leave the watcher re-reading a sliding 24h window forever.
 async function fetchRows(cursor, cfg, deps, now) {
   const call = deps.callGateway || ((args) => callGateway(args, cfg, deps));
-  const rows = await fetchPages(call, cursor, cfg, now);
-  if (cursor != null || rows.length) return { rows, baseline: null };
+  if (cursor != null) return { rows: await fetchPages(call, cursor, cfg, now), baseline: null };
   const newest = pageRows(await call({ limit: 1 }));
-  return { rows: [], baseline: newest.reduce((max, row) => Math.max(max, row.seq), 0) };
+  const baseline = newest.reduce((max, row) => Math.max(max, row.seq), 0);
+  return { rows: await fetchPages(call, null, cfg, now), baseline };
 }
 
 async function fetchPages(call, cursor, cfg, now) {
@@ -339,7 +349,7 @@ async function poll(options = {}) {
   // The cursor may pass a row only once it is classified or is one this watcher skips
   // (filtered channel, empty text, already seen). The first row that is neither — the
   // prompt is full or the poll's budget is spent — holds it for the next poll.
-  let advanceTo = baseline != null ? baseline : cursor;
+  let advanceTo = cursor;
   let held = false;
   for (const row of rows) {
     const message = normalizeRow(row);
@@ -356,6 +366,11 @@ async function poll(options = {}) {
     }
     if (!held) advanceTo = row.seq;
   }
+  // A first run starts at the high-water mark it took before reading the window, or
+  // past the window's last classified row if that is later. When the window's backlog
+  // held the poll early, the cursor stays at the classified prefix so the rest of the
+  // window (all at or below the mark) is read next time rather than skipped.
+  if (baseline != null && !held) advanceTo = Math.max(baseline, advanceTo == null ? 0 : advanceTo);
   let decisions = [];
   if (selected.length) {
     const prompt = slack.buildPrompt(context, selected, { source: 'Discord' });
