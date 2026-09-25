@@ -154,8 +154,8 @@ What to do with them:
    This is the one kind of user report that always reaches Owner.
 8. **Replies to users are not urgent.** You cannot post on Discord or Slack. When a user
    is owed an answer, write the reply you would send on the card as a check-in
-   (`Suggested reply: …`) and leave the card open with status `filed` until someone has
-   posted it; never close a card whose reply is only suggested. Never raise `needs-you`
+   (`Suggested reply: …`) and leave the card open (status `inbox`, as `--file` sets
+   it) until someone has posted it; never close a card whose reply is only suggested. Never raise `needs-you`
    just to get a user answered; that is for incidents and security reports.
 
 ### Holds
