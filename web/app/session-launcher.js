@@ -137,6 +137,9 @@ export function openSessionChooser(ctx, options) {
   };
   const pickAccount = () => preferredAccount(ctx, state.kind, options.accountId, state.models[state.kind]);
   if (!recordedAccountMissing) state.accountId = pickAccount();
+  const accountText = (account) => (account.label || account.id)
+    + (account.id === options.accountId ? ' · current' : account.isDefault ? ' · default' : '')
+    + (spentAccount(ctx, account, state.models[state.kind]) ? ' · out of usage' : '');
   const nodes = options.chooseNode === true ? nodesFor(ctx) : [];
   // The caller's preferred machine starts selected while it is listed and reachable.
   const preferredNode = nodes.find((node) => node.name === options.defaultNode && !node.daemon && node.ok !== false);
@@ -160,9 +163,7 @@ export function openSessionChooser(ctx, options) {
       ? `<label>Session type<select data-launch-kind ${state.busy || state.bound ? 'disabled' : ''}>${kinds.map((kind) => `<option value="${ctx.esc(kind)}" ${kind === state.kind ? 'selected' : ''}>${ctx.esc(labels[kind])}</option>`).join('')}</select></label>`
       : `<div class="session-launch-value"><span>Provider</span><strong>${ctx.esc(labels[state.kind])}</strong></div>`;
     const accountField = state.kind === 'shell' ? '' : `<label>Account<select data-launch-account ${state.busy || state.bound || noAccount ? 'disabled' : ''}>${recordedAccountMissing && !state.accountId ? `<option value="" selected disabled>Recorded account unavailable — choose another</option>` : ''}${choices.map((account) => {
-      const suffix = (account.id === options.accountId ? ' · current' : account.isDefault ? ' · default' : '')
-        + (spentAccount(ctx, account, state.models[state.kind]) ? ' · out of usage' : '');
-      return `<option value="${ctx.esc(account.id)}" ${account.id === state.accountId ? 'selected' : ''}>${ctx.esc((account.label || account.id) + suffix)}</option>`;
+      return `<option value="${ctx.esc(account.id)}" ${account.id === state.accountId ? 'selected' : ''}>${ctx.esc(accountText(account))}</option>`;
     }).join('')}</select></label>`;
     const locked = state.busy || state.bound ? 'disabled' : '';
     const model = state.models[state.kind] || '';
@@ -224,10 +225,15 @@ export function openSessionChooser(ctx, options) {
     modal.querySelector('[data-launch-model-custom]')?.addEventListener('input', (event) => { state.models[state.kind] = event.target.value; });
     // A typed id is weighed once it is committed, not per keystroke.
     modal.querySelector('[data-launch-model-custom]')?.addEventListener('change', (event) => {
-      if (state.busy || state.accountChosen || recordedAccountMissing) return;
+      if (state.busy) return;
       state.models[state.kind] = event.target.value;
-      const accountId = pickAccount();
-      if (accountId !== state.accountId) { state.accountId = accountId; render(); }
+      if (!state.accountChosen && !recordedAccountMissing) state.accountId = pickAccount();
+      // Updated in place: a re-render inside this blur or Enter would swallow the click,
+      // Tab or submit that caused it.
+      for (const option of modal.querySelector('[data-launch-account]')?.options || []) {
+        const account = accountsFor(ctx, state.kind).find((candidate) => candidate.id === option.value);
+        if (account) { option.textContent = accountText(account); option.selected = account.id === state.accountId; }
+      }
     });
     modal.querySelector('[data-launch-model-default]')?.addEventListener('click', () => {
       if (state.busy) return;

@@ -312,7 +312,9 @@ test('an unrecognised Claude window does not cap, and an epoch-seconds string re
 test('a typed Other… model is weighed once committed', async () => {
   const { modal, submitted, done } = openWithUsage({ 'claude/default': limits(10, 100), 'claude-secondary': limits(40) });
   modal.querySelector('[data-launch-model]').fire('change', { target: { value: '__other__' } });
+  const before = modal.innerHTML;
   modal.querySelector('[data-launch-model-custom]').fire('change', { target: { value: 'fable' } });
+  assert.equal(modal.innerHTML, before, 'no re-render inside the blur that may be a click on Open');
   await submit(modal); await done;
   assert.deepEqual({ accountId: submitted[0].accountId, model: submitted[0].model }, { accountId: 'claude-secondary', model: 'fable' });
 });
