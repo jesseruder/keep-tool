@@ -9553,11 +9553,12 @@ const DIALOG_CONFIRM_GRACE_MS = 600;
 // draws dim. Dimness is the only thing that tells it from text someone typed, so the
 // prompt line is matched raw, before any escape is stripped: the marker, spaces, at
 // most one dim span (SGR 2 … SGR 22) with no other escape inside it, and then nothing
-// but SGR or erase escapes and spaces. Typed text is never dim, a plain word after the
-// span is typed, and a dim span opened before the marker is not the placeholder's, so
-// escapes before the marker may be anything but a dim one.
+// but SGR or erase escapes and spaces. Typed text is never dim, and a plain word after
+// the span was typed. Only what follows the marker decides: any escape may precede it
+// (a truecolor marker is `38;2;r;g;b`), and a dim span opened before it leaves the text
+// after the marker without a span of its own, which that part already refuses.
 const EMPTY_CLAUDE_PROMPT_RAW = new RegExp(
-  '^(?:\\s|\\x1b\\[(?:(?:[013-9]\\d*|2\\d+)(?:;(?:[013-9]\\d*|2\\d+))*)?m)*'
+  '^(?:\\s|\\x1b\\[[0-?]*[ -/]*[@-~])*'
   + '❯ *(?:\\x1b\\[2m[^\\x1b]*\\x1b\\[22m)?(?:\\s|\\x1b\\[[0-9;]*[mK])*$');
 
 function agentPromptVisible(agent, screen) {

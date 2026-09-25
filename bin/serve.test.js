@@ -5766,6 +5766,8 @@ test('an empty Claude prompt may carry the dim placeholder suggestion, and typed
   assert.equal(agentPromptVisible('claude', box(placeholder, '──────────────────── fable-fleet-reviewer ─')), true,
     'under a named session\'s rule too');
   assert.equal(agentPromptVisible('claude', box('❯')), true, 'a bare marker still is');
+  assert.equal(agentPromptVisible('claude', box('\x1b[38;2;153;153;153m❯ \x1b[2mTry "fix typecheck errors"\x1b[22m\x1b[K')), true,
+    'a truecolor marker before the placeholder');
   assert.equal(agentPromptVisible('claude', box('\x1b[39m❯ hello\x1b[K')), false, 'typed text is not dim');
   assert.equal(agentPromptVisible('claude', box('\x1b[39m❯ \x1b[2mTry\x1b[22m more\x1b[K')), false, 'plain text after the span was typed');
   assert.equal(agentPromptVisible('claude', box('\x1b[2m❯ Try "fix typecheck errors"\x1b[22m\x1b[K')), false,
