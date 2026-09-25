@@ -44,7 +44,7 @@ test('only single printable characters and backspace are predictable keys', () =
 
 test('a character on the Claude and Codex prompt lines is predicted with the exact bytes', async () => {
   const claude = await terminalWith('\x1b[2;1H❯ hi');
-  assert.deepEqual(predict(claude, 'x'), { kind: 'char', inputStart: 2, bytes: '\x1b7\x1b[2;4mx\x1b8\x1b[1C' });
+  assert.deepEqual(predict(claude, 'x'), { kind: 'char', inputStart: 2, bytes: '\x1b[2;4mx\x1b[22;24m' });
   const codex = await terminalWith('› hi');
   assert.equal(predict(codex, 'x', { agent: 'codex' }).bytes, PREDICT_CHAR('x'));
   assert.equal(predict(codex, 'x'), null, 'Claude is matched only by its own marker');
@@ -55,8 +55,8 @@ test('a character on the Claude and Codex prompt lines is predicted with the exa
 
 test('backspace is predicted only past the first input column', async () => {
   const typed = await terminalWith('❯ hi');
-  assert.deepEqual(predict(typed, '\x7f'), { kind: 'backspace', inputStart: 2, bytes: '\x1b7\x1b[1D \x1b8\x1b[1D' });
-  assert.equal(PREDICT_BACKSPACE, '\x1b7\x1b[1D \x1b8\x1b[1D');
+  assert.deepEqual(predict(typed, '\x7f'), { kind: 'backspace', inputStart: 2, bytes: '\x1b[1D \x1b[1D' });
+  assert.equal(PREDICT_BACKSPACE, '\x1b[1D \x1b[1D');
   const empty = await terminalWith('❯ ');
   assert.equal(predict(empty, '\x7f'), null);
   assert.equal(predict(empty, 'a').kind, 'char');
@@ -65,7 +65,7 @@ test('backspace is predicted only past the first input column', async () => {
 test('a dim placeholder after the cursor is cleared before the first predicted character', async () => {
   const terminal = await terminalWith('❯ \x1b[7mT\x1b[0m\x1b[2mry "fix the tests"\x1b[0m\x1b[1;3H');
   const decision = predict(terminal, 'f');
-  assert.equal(decision.bytes, '\x1b7\x1b[K\x1b[2;4mf\x1b8\x1b[1C');
+  assert.equal(decision.bytes, '\x1b[K\x1b[2;4mf\x1b[22;24m');
   await write(terminal, decision.bytes);
   const line = terminal.buffer.active.getLine(0).translateToString(true);
   assert.equal(line, '❯ f');
@@ -323,4 +323,75 @@ test('a burst that repeats a state is acknowledged in order and a deleted charac
   predictor.keystroke('c');
   await write(terminal, '');
   assert.deepEqual(lineState(terminal), { text: '❯ ac', cursor: 4, marks: [3] });
+});
+
+test('a prediction leaves the saved cursor and the agent\'s other attributes alone', async () => {
+  const terminal = await terminalWith('status\r\n❯ ');
+  // The agent saves its cursor on the first row, then parks it in the input box.
+  await write(terminal, '\x1b[1;3H\x1b7\x1b[2;3H\x1b[3m');
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => 0 });
+  assert.equal(predictor.keystroke('x'), true);
+  predictor.keystroke('\x7f');
+  predictor.keystroke('y');
+  await write(terminal, '');
+  const cell = terminal.buffer.active.getLine(1).getCell(2);
+  assert.equal(cell.getChars(), 'y');
+  assert.ok(cell.isDim() && cell.isUnderline() && cell.isItalic(), 'the guess is marked on top of the agent\'s italic');
+  await write(terminal, 'z');
+  const after = terminal.buffer.active.getLine(1).getCell(3);
+  assert.ok(after.isItalic() && !after.isDim() && !after.isUnderline(), 'dim and underline end with the guess');
+  await write(terminal, '\x1b8');
+  assert.deepEqual([terminal.buffer.active.cursorY, terminal.buffer.active.cursorX], [0, 2],
+    'the agent\'s restore lands where it saved, not at the guess');
+});
+
+test('output that leaves the prompt line and cursor as they were confirms nothing', async () => {
+  const terminal = await terminalWith('status\r\n❯ ');
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'auto', now: () => 0 });
+  predictor.outputParsed();
+  predictor.keystroke('a');
+  await write(terminal, '');
+  // Not drawn, so the line is unchanged; a spinner elsewhere is not the echo.
+  await write(terminal, '\x1b[1;1Hspin\x1b[2;3H');
+  predictor.outputParsed();
+  assert.equal(predictor.pending, 1);
+  await write(terminal, '\r❯ a\x1b[K');
+  predictor.outputParsed();
+  assert.equal(predictor.pending, 0);
+});
+
+test('a line still at the state before the oldest pending keystroke confirms none of the later ones', async () => {
+  const terminal = await terminalWith('status\r\n❯ ');
+  let clock = 0;
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => clock });
+  for (const key of ['a', 'b', '\x7f']) predictor.keystroke(key);
+  await write(terminal, '');
+  const settle = async (bytes) => {
+    clock += 40;
+    await write(terminal, bytes);
+    predictor.outputParsed();
+  };
+  await settle('\r❯ a\x1b[K');
+  assert.equal(predictor.pending, 2, 'a is answered; ab and a wait');
+  await settle('\x1b[1;1Hspin\x1b[2;4H');
+  assert.equal(predictor.pending, 2, 'a spinner redraw is not an echo');
+  await settle('\r❯ a\x1b[K\x1b[1;1Hspun\x1b[2;4H');
+  assert.equal(predictor.pending, 2, 'a changed screen that still shows a answers neither ab nor the later a');
+  await settle('\r❯ ab\x1b[K');
+  assert.equal(predictor.pending, 1, 'ab answers only its own keystroke');
+  await settle('\r❯ a\x1b[K');
+  assert.equal(predictor.pending, 0);
+});
+
+test('keystrokes left unanswered past the stale limit expire without a sample', async () => {
+  const terminal = await terminalWith('❯ ');
+  let clock = 0;
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'auto', now: () => clock });
+  for (const ch of 'abc') predictor.keystroke(ch);
+  clock = 6001;
+  await write(terminal, '\r❯ abc\x1b[K');
+  predictor.outputParsed();
+  assert.equal(predictor.pending, 0);
+  assert.equal(predictor.echoMs(), null, 'no sample was recorded');
+  assert.equal(predictor.enabled(), false, 'auto stays off');
 });
