@@ -296,3 +296,23 @@ test('an account picked by hand survives a model change, and a passed reset is n
   await submit(reset.modal); await reset.done;
   assert.equal(reset.submitted[0].accountId, 'claude/default');
 });
+
+test('an unrecognised Claude window does not cap, and an epoch-seconds string reset is read as a time', async () => {
+  const past = String(Math.floor((Date.now() - 60e3) / 1000));
+  const { modal, submitted, done } = openWithUsage({
+    'claude/default': { agent: 'claude', limits: [{ label: 'weekly_scoped', percent: 100, resetsAt: ahead },
+      { label: 'week', percent: 100, resetsAt: past }] },
+    'claude-secondary': limits(5),
+  });
+  assert.doesNotMatch(modal.innerHTML, /out of usage/);
+  await submit(modal); await done;
+  assert.equal(submitted[0].accountId, 'claude/default');
+});
+
+test('a typed Other… model is weighed once committed', async () => {
+  const { modal, submitted, done } = openWithUsage({ 'claude/default': limits(10, 100), 'claude-secondary': limits(40) });
+  modal.querySelector('[data-launch-model]').fire('change', { target: { value: '__other__' } });
+  modal.querySelector('[data-launch-model-custom]').fire('change', { target: { value: 'fable' } });
+  await submit(modal); await done;
+  assert.deepEqual({ accountId: submitted[0].accountId, model: submitted[0].model }, { accountId: 'claude-secondary', model: 'fable' });
+});

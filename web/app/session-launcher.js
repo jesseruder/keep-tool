@@ -59,24 +59,36 @@ function accountsFor(ctx, agent) {
   return (ctx.data.accounts || []).filter((account) => account.agent === agent);
 }
 
-// The usage windows that would refuse this model on this account: the 5h window, the
-// shared week, and the model family's own weekly bucket ("Fable wk" caps Fable only).
+const claudeFamilies = ['fable', 'opus', 'sonnet', 'haiku'];
+
+// The usage windows that would refuse this model on this account. For Claude, as the
+// daemon's account budget reads them: the 5h window, the shared week, and the model
+// family's own weekly bucket ("Fable wk" caps Fable only). Every Codex window caps.
 function capsFor(ctx, account, model) {
   const usage = ctx.data.usage?.accounts?.[account.id];
-  const windows = (account.agent === 'claude' ? usage?.limits : usage?.windows) || [];
-  const family = /^claude-([a-z]+)/i.exec(String(model || ''))?.[1]?.toLowerCase() || '';
-  return windows.filter((window) => window && (!/ wk$/i.test(String(window.label || ''))
-    || (family && String(window.label).toLowerCase().startsWith(family))));
+  if (account.agent !== 'claude') return (usage?.windows || []).filter(Boolean);
+  const name = String(model || '').toLowerCase();
+  const family = claudeFamilies.find((candidate) => name.includes(candidate));
+  return (usage?.limits || []).filter((window) => {
+    const label = String(window?.label || '').toLowerCase();
+    return label === '5h' || label === 'week' || (!!family && / wk$/.test(label) && label.startsWith(family));
+  });
 }
 
-// Out of usage: a window at 100% whose reset is unknown or still ahead. An account with
-// no reading is not called spent.
+function resetMs(value) {
+  if (value == null || value === '') return NaN;
+  const number = Number(value);
+  if (Number.isFinite(number)) return number < 1e12 ? number * 1000 : number;
+  return Date.parse(value);
+}
+
+// A window at 100% whose reset is unknown or still ahead.
+const spentWindow = (window, now) => Number(window.percent) >= 100
+  && !(resetMs(window.resetsAt) <= now);
+
+// Out of usage: any capping window spent. An account with no reading is not called spent.
 function spentAccount(ctx, account, model, now = Date.now()) {
-  return capsFor(ctx, account, model).some((window) => {
-    if (!(Number(window.percent) >= 100)) return false;
-    const reset = typeof window.resetsAt === 'number' ? (window.resetsAt < 1e12 ? window.resetsAt * 1000 : window.resetsAt) : Date.parse(window.resetsAt);
-    return !Number.isFinite(reset) || reset > now;
-  });
+  return capsFor(ctx, account, model).some((window) => spentWindow(window, now));
 }
 
 // A named account wins (a reopen's recorded one). Otherwise the default account while it
@@ -89,10 +101,12 @@ function preferredAccount(ctx, agent, requested, model) {
   const fallback = choices.find((account) => account.isDefault) || choices[0];
   if (!fallback) return '';
   if (!spentAccount(ctx, fallback, model)) return fallback.id;
-  // An account with no reading ranks after every account with one.
+  // An account with no reading ranks after every account with one; a window whose reset
+  // has passed counts as empty.
+  const now = Date.now();
   const fullest = (account) => {
     const caps = capsFor(ctx, account, model);
-    return caps.length ? Math.max(...caps.map((window) => Number(window.percent) || 0)) : 101;
+    return caps.length ? Math.max(...caps.map((window) => (resetMs(window.resetsAt) <= now ? 0 : Number(window.percent) || 0))) : 101;
   };
   const open = choices.filter((account) => !spentAccount(ctx, account, model)).sort((a, b) => fullest(a) - fullest(b));
   return (open[0] || fallback).id;
@@ -208,6 +222,13 @@ export function openSessionChooser(ctx, options) {
       state.node = event.target.value;
     });
     modal.querySelector('[data-launch-model-custom]')?.addEventListener('input', (event) => { state.models[state.kind] = event.target.value; });
+    // A typed id is weighed once it is committed, not per keystroke.
+    modal.querySelector('[data-launch-model-custom]')?.addEventListener('change', (event) => {
+      if (state.busy || state.accountChosen || recordedAccountMissing) return;
+      state.models[state.kind] = event.target.value;
+      const accountId = pickAccount();
+      if (accountId !== state.accountId) { state.accountId = accountId; render(); }
+    });
     modal.querySelector('[data-launch-model-default]')?.addEventListener('click', () => {
       if (state.busy) return;
       setDefaultModel(state.kind, state.models[state.kind]);
