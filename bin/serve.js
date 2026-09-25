@@ -3618,15 +3618,17 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
       throw failure;
     };
     // A chunk the host let through a viewer's focus reports lands at a count past the
-    // plan's; the plan follows it (typingProgress.followCount) so the next chunk and the
-    // Enter expect what the pane shows. Only the host can say those inputs were focus
-    // reports and nothing else; any other input still refuses the write.
-    const followHostCount = (index, accepted) => {
-      const counted = accepted && Number.isInteger(accepted.inputCount) ? accepted.inputCount : null;
-      if (counted === null || counted === deps.typingProgress.state.initialInputCount + index + 1) return;
-      deps.typingProgress.followCount(index + 1, counted);
+    // plan's; acknowledge() takes that count in the same journal write and the plan
+    // follows it. Only the host can say those inputs were focus reports and nothing
+    // else; any other input still refuses the write.
+    const acknowledgeChunk = (index, accepted) => {
+      const counted = accepted && Number.isInteger(accepted.inputCount) ? accepted.inputCount : undefined;
+      const before = typingState.initialInputCount;
+      deps.typingProgress.acknowledge(index, deliveryJournal.textHash(chunks.slice(0, index + 1).join('')), counted);
       typingState = deps.typingProgress.state;
-      deps.deliveryTrace?.('focus-reports-skipped', { index, inputCount: counted });
+      if (typingState.initialInputCount !== before) {
+        deps.deliveryTrace?.('focus-reports-skipped', { index, inputCount: counted });
+      }
     };
     deps.deliveryTrace?.('write-start');
     if (Number.isInteger(typingState.inFlightChunk)) {
@@ -3640,8 +3642,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
       );
       try {
         const accepted = await writeChunk(index);
-        deps.typingProgress.acknowledge(index, deliveryJournal.textHash(chunks.slice(0, index + 1).join('')));
-        followHostCount(index, accepted);
+        acknowledgeChunk(index, accepted);
       } catch (error) {
         // This operation predates this process attempt. A dropped replay can mean
         // the host restarted after accepting it but before persisting/replaying its
@@ -3660,8 +3661,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
       deps.typingProgress.start(index);
       try {
         const accepted = await writeChunk(index);
-        deps.typingProgress.acknowledge(index, deliveryJournal.textHash(chunks.slice(0, index + 1).join('')));
-        followHostCount(index, accepted);
+        acknowledgeChunk(index, accepted);
       } catch (error) {
         if (error?.inputDropped) {
           deps.typingProgress.reject(index);

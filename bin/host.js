@@ -32,6 +32,11 @@ const INPUT_RECEIPT_LIMIT = 256;
 // expected was one of these: they reach the program and can change nothing in its
 // input box. A viewer clicking into a pane between two chunks of a delivery left half
 // a message unsent. The pane remembers the kind of its last few inputs to answer that.
+//
+// The bytes decide, not where they came from: a key binding that sends exactly CSI I
+// reaches the program as exactly what a focus change sends, and the program cannot
+// tell them apart either. Claude Code and Codex redraw on focus and leave the
+// composer alone, which is what lets the Enter tolerate them too.
 const FOCUS_REPORTS_ONLY = /^(?:\x1b\[[IO])+$/;
 const INPUT_KIND_LIMIT = 64;
 
@@ -111,8 +116,9 @@ function inputOperationFingerprint(params) {
   return crypto.createHash('sha256').update(JSON.stringify([
     String(params.pane || ''), params.expectedPid, params.expectedInputCount,
     String(params.data || ''), params.auto === true,
-    // Only when set, so a receipt recorded before this flag existed still matches.
-    ...(params.tolerateFocusReports === true ? [true] : []),
+    // tolerateFocusReports is left out on purpose: a caller may ask again under the same
+    // operation id against a host that gained the capability in a reload, and the answer
+    // it gets is the one recorded the first time, landed or refused.
   ])).digest('hex');
 }
 

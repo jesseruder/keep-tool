@@ -257,39 +257,34 @@ function typingProgress(entry, writeJournal) {
       state.partialAt ||= Date.now();
       writeJournal();
     },
-    acknowledge(index, prefixHash) {
+    // `inputCount`, when the host reported one, is the pane's count after this chunk.
+    // It is past the plan's when the write was let through a viewer's focus reports
+    // (host.js tolerateFocusReports: the host checks every one was a focus report), and
+    // the plan follows it in the same journal write, so the next chunk, the Enter and
+    // any resume expect what the pane shows.
+    acknowledge(index, prefixHash, inputCount) {
       const state = current();
+      const planned = state.initialInputCount + index + 1;
       if (index !== state.acknowledgedChunks || state.inFlightChunk !== index
-          || !/^[a-f0-9]{64}$/.test(String(prefixHash || ''))) {
+          || !/^[a-f0-9]{64}$/.test(String(prefixHash || ''))
+          || (inputCount !== undefined && inputCount !== null && (!Number.isInteger(inputCount) || inputCount < planned))) {
         throw new Error('delivery chunk acknowledgement is out of order');
       }
       state.acknowledgedChunks = index + 1;
       state.inFlightChunk = null;
       state.prefixHash = String(prefixHash);
       state.partialAt ||= Date.now();
+      if (Number.isInteger(inputCount) && inputCount > planned) {
+        state.initialInputCount = inputCount - (index + 1);
+        state.focusReportsSkipped = (Number.isInteger(state.focusReportsSkipped) ? state.focusReportsSkipped : 0)
+          + (inputCount - planned);
+      }
       writeJournal();
     },
     reject(index) {
       const state = current();
       if (state.inFlightChunk !== index) throw new Error('delivery chunk rejection is out of order');
       state.inFlightChunk = null;
-      writeJournal();
-    },
-    // The host accepted chunk `acknowledged - 1` at a count past the plan's, because a
-    // viewer's focus reports arrived before it and the write tolerated them (the host
-    // checks that every one was a focus report). The plan follows the pane's count, so
-    // the next chunk, the Enter and any resume expect what the pane actually shows.
-    followCount(acknowledged, inputCount) {
-      const state = current();
-      const planned = state.initialInputCount + acknowledged;
-      if (state.inFlightChunk !== null || acknowledged !== state.acknowledgedChunks || acknowledged < 1
-          || !Number.isInteger(inputCount) || inputCount < planned) {
-        throw new Error('delivery typing count is out of order');
-      }
-      if (inputCount === planned) return;
-      state.initialInputCount = inputCount - acknowledged;
-      state.focusReportsSkipped = (Number.isInteger(state.focusReportsSkipped) ? state.focusReportsSkipped : 0)
-        + (inputCount - planned);
       writeJournal();
     },
     complete() {
