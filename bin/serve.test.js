@@ -15409,7 +15409,10 @@ test('a pane on another node is force-restarted on that node evidence, and nothi
       assert.equal(signalled[0].params.pid, child.pid);
       assert.equal(signalled[0].params.pidStart, child.pidStart);
       assert.equal(signalled[0].params.signal, 'SIGTERM');
-      assert.equal(signalled[0].params.ppid, 1, 'the parent as just observed, not as captured');
+      // Reparented to init on macOS, but to the nearest subreaper on Linux (systemd --user
+      // on a node), so the new parent is whatever adopted it — just not the agent.
+      assert.ok(Number.isInteger(signalled[0].params.ppid) && signalled[0].params.ppid > 0);
+      assert.notEqual(signalled[0].params.ppid, child.ppid, 'the parent as just observed, not as captured');
       assert.match(signalled[0].params.args, /sleep/);
       // The record still carries what was seen when the tree was first walked.
       assert.equal(entry.processes.find((row) => row.pid === child.pid).ppid, child.ppid);

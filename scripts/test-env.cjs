@@ -3,19 +3,29 @@
 // Node's test runner executes each test file in a child with this marker. Give
 // every child its own empty registry before application modules can load the
 // operator's Keep configuration into process.env. Fixture CLIs may still pass
-// their own KEEP_DIR or KEEP_CONFIG explicitly.
+// their own KEEP_DIR or KEEP_CONFIG explicitly; tests that care about an account or
+// pane set it in their own env object.
 if (process.env.NODE_TEST_CONTEXT) {
   const fs = require('node:fs');
   const os = require('node:os');
   const path = require('node:path');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-node-test-'));
 
+  // An agent pane inherits the operator's whole Keep environment: its config's env
+  // block, features, scopes, placement, the pane and account it runs as, and on a
+  // non-daemon node that node's identity, daemon address and live host socket. Any of
+  // it changes what a fixture CLI does (a registry write sent to the real daemon, a
+  // feature switched off), so the suite starts from none of it. KEEP_TEST_* knobs are
+  // the caller's to pass through. A child forked by a test runs this preload again
+  // (fork keeps execArgv) with the KEEP_* env its test gave it, so the sweep runs
+  // once, in the test file's own process.
+  if (!process.env.KEEP_TEST_ENV_SCRUBBED) {
+    for (const name of Object.keys(process.env)) {
+      if (name.startsWith('KEEP_') && !name.startsWith('KEEP_TEST_')) delete process.env[name];
+    }
+    process.env.KEEP_TEST_ENV_SCRUBBED = '1';
+  }
   process.env.KEEP_DIR = root;
-  delete process.env.KEEP_CONFIG;
-  // Running the suite from an agent pane must not stamp that pane or account
-  // onto the records fixture CLIs write.
-  delete process.env.KEEP_AGENT_ACCOUNT_ID;
-  delete process.env.KEEP_PANE;
   process.env.KEEP_NO_PUSH = '1';
   // Timeout diagnostics sample swap out of band with sysctl. A suite of a few hundred
   // test processes has no use for that reading and every reason not to spawn for it.
@@ -23,10 +33,5 @@ if (process.env.NODE_TEST_CONTEXT) {
   // A daemon under test must never switch the operator's desktop reminders.
   process.env.KEEP_REMINDERS_CONFIG = path.join(root, 'reminders.config.json');
   process.env.KEEP_REMINDERS_STATE = path.join(root, 'reminders-state.json');
-  // The account a session runs under is inherited by everything it spawns, and a
-  // hook that stamps it turns an expected pane record into an unexpected one. The
-  // tests that care about an account set it in their own env object.
-  delete process.env.KEEP_AGENT_ACCOUNT_ID;
-
   process.once('exit', () => fs.rmSync(root, { recursive: true, force: true }));
 }
