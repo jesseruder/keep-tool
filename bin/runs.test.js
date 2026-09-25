@@ -605,21 +605,29 @@ test('a card that re-arms more often than daily gets one fresh session per inter
     const budget = { code: 0 };
     const at = (now) => (t, today, accountId) => freshOpenRefusal(t, today, accountId, { checkBudget: () => budget, now });
     const task = card({ check_on_pass: 'rearm', check_every: '+4h' });
-    const t0 = Date.parse('2026-09-25T06:00:00Z');
+    // Anchored to the real clock: the saved state keeps a day of opens, judged by it.
+    const t0 = Date.now() - 12 * 3600e3;
     assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t0), now: t0 })).skipped, undefined);
     // The same day, but not the same interval: refused until four hours have passed.
     assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t0 + 3600e3), now: t0 + 3600e3 })).skipped, 'opened-within-interval');
     // The interval is judged in wall time from the recorded open, which survives a restart.
-    assert.equal(loadSchedulerState().openedAt.get('some-card'), t0);
     _resetSchedulerStateInMemory();
+    assert.equal(loadSchedulerState().openedAt.get('some-card'), t0, 'read back from disk');
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t0 + 3600e3), now: t0 + 3600e3 })).skipped, 'opened-within-interval');
     const t1 = t0 + 4 * 3600e3 + 1000;
+    resetTickAllowance(); // each of these opens is on its own tick
     assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t1), now: t1 })).skipped, undefined);
     assert.equal(loadSchedulerState().openedAt.get('some-card'), t1);
-    // A session that died without recording anything is granted one reopen, and from
-    // then on the card keeps the daily rule: at most twice a day, like any other card.
+    // A session that died without recording anything is granted one reopen on the next
+    // tick; after that the interval is the ceiling again, so a card whose sessions keep
+    // dying opens once per interval plus that one reopen a day.
     grantReopen('some-card', '2026-09-25');
+    resetTickAllowance();
     assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t1 + 60e3), now: t1 + 60e3 })).skipped, undefined, 'the reopen');
-    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t1 + 5 * 3600e3), now: t1 + 5 * 3600e3 })).skipped, 'opened-today');
+    assert.equal(grantReopen('some-card', '2026-09-25'), false, 'one reopen a day');
+    resetTickAllowance();
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t1 + 120e3), now: t1 + 120e3 })).skipped, 'opened-within-interval');
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t1 + 5 * 3600e3), now: t1 + 5 * 3600e3 })).skipped, undefined, 'the next interval');
     // An open that failed for good is recorded too, so it is not retried every tick.
     _resetSchedulerState();
     recordOpen('some-card', '2026-09-25', t0);

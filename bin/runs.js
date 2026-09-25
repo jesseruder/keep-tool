@@ -711,11 +711,11 @@ function recordOpen(taskId, today, now = Date.now()) {
 
 function freshOpenRefusal(task, today, accountId, deps = {}) {
   const every = subDailyEveryMs(task);
-  // A card that re-arms more often than daily: one fresh session per interval —
-  // until a session on it dies without recording anything. The reopen that grants
-  // costs its day record, and from then on the card keeps the daily rule, so a card
-  // whose sessions keep dying opens at most twice a day like any other.
-  if (every && !markedToday('reopened', task.id, today)) {
+  // A card that re-arms more often than daily: one fresh session per interval. The
+  // interval is its ceiling too: a card whose sessions keep dying without recording
+  // anything opens once per interval plus the one reopen grantReopen allows a day,
+  // which is the pane count a healthy card is allowed anyway.
+  if (every) {
     const last = loadSchedulerState().openedAt.get(task.id) || 0;
     if ((deps.now || Date.now()) - last < every) return { skipped: 'opened-within-interval' };
   } else if (markedToday('opened', task.id, today)) return { skipped: 'opened-today' };
@@ -1382,6 +1382,9 @@ async function schedulerTick() {
         if ((outcome.skipped === 'opened-today' || outcome.skipped === 'opened-within-interval') && givenUp.get(t.id) === today) didWork = workBefore;
         if (outcome.skipped) continue;
         clearBudgetDeferral(t.id, today);
+        // A retry that opened (a sub-daily card, once its interval passed) is no
+        // longer a failure the health row should keep holding up.
+        givenUp.delete(t.id);
         const { delivery, errors } = outcome;
         process.stderr.write(`keep runs: opened a check session for ${t.id}${delivery.sessionId ? ` (session ${sessionRef(delivery.sessionId)})` : ''}\n`);
         tickErrors.push(...errors);
