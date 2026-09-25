@@ -257,9 +257,10 @@ async function policyEnqueue(root, loadSessions, now, deps, log) {
     // sessions Keep started by itself): the owner's own sessions move automatically only
     // off a source they opted in with a rateLimitHandoff key.
     if (!map[sourceAccountId] && (!poolIds.length || session.unattended !== true)) continue;
-    // A transfer stops an agent and proves it from a process table; a session on
-    // another machine answers none of that here, and the retry this entry promises
-    // could only ever be refused. Never enqueued at all.
+    // A queued transfer is never Owner-forced, and an unforced transfer of a session
+    // on another machine is refused (its graceful stop's background-work proof reads
+    // the transcript here), so the retry this entry promises could only ever be
+    // refused. Never enqueued at all.
     if (nodes.isRemotePane(session)) continue;
     // A parked or cancelled entry is waiting on a person; the policy never
     // overrules that, so only the console's Retry starts one of those again.

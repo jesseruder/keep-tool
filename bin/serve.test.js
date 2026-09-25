@@ -10996,15 +10996,26 @@ test('a check session Keep opens for itself lands on the daemon node', async () 
   assert.equal(resolvePlacement({ node: 'main', lastCardNode: 'aws1' }, { hostNodes: ['main', 'aws1'] }), 'main');
 });
 
-test('an account handoff and a rate-limit resume refuse a session on another node', async (t) => {
+test('an account handoff of a session on another node asks that node first; a rate-limit resume still refuses', async (t) => {
   const { handoffSession, handoffSessionRequest, resumeAfterLimit } = require('./serve');
-  const refusal = (error) => error.status === 409
-    && error.message === 'account handoff is not available for a session on aws1';
-  // The pane says which machine, so nothing has to be read to know this cannot run.
-  await assert.rejects(handoffSession({ sessionId: 'far', pane: 'p1@aws1', accountId: 'two' }), refusal);
-  // And the console's transfer, which would otherwise hand the refusal to the queue.
-  await assert.rejects(handoffSessionRequest({ sessionId: 'far', pane: 'p1@aws1', accountId: 'two', queueOnTransient: true },
-    { handoffSession: async () => { throw new Error('ran the transfer for a session on another machine'); } }), refusal);
+  const handoff = require('./account-handoff');
+  // The pane says which machine, and that machine is asked before anything else. One
+  // that does not answer is a slow host: refused as retryable, with nothing journalled.
+  const unreachable = (error) => error.status === 409 && /^host request timed out asking aws1/.test(error.message)
+    && handoff.classifyRefusal(error.message) === 'transient';
+  await assert.rejects(handoffSession({ sessionId: 'far', pane: 'p1@aws1', accountId: 'two' }, {
+    hostRequest: async () => { throw new Error('terminal host is unavailable'); },
+    restartSession: async () => { throw new Error('stopped a session its node was never asked about'); },
+  }), unreachable);
+  // One whose host predates the transfer ops is refused by name and version.
+  await assert.rejects(handoffSession({ sessionId: 'far', pane: 'p1@aws2', accountId: 'two' }, {
+    hostRequest: async (type) => (type === 'hello' ? { artifacts: 2, transcript: 4 } : assert.fail(`asked ${type}`)),
+  }), (error) => error.status === 409 && /predates account transfers \(its artifacts verb is version 2; a transfer needs 3\)/.test(error.message));
+  // The console's transfer is no longer refused before it starts: it runs.
+  let ran = 0;
+  await handoffSessionRequest({ sessionId: 'far', pane: 'p1@aws1', accountId: 'two', queueOnTransient: true },
+    { handoffSession: async () => { ran++; return { ok: true, status: 'done', sessionId: 'far' }; } });
+  assert.equal(ran, 1);
   // A transient refusal for a session on another node is not queued for a retry
   // that could only be refused again — and the queue decision costs no state build.
   const record = { status: 'recovery-needed', refusalClass: 'transient', intent: 'continue',

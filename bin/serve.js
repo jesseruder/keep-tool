@@ -3947,11 +3947,16 @@ async function requireNodeTranscript(node, deps = {}) {
   nodeTranscriptCapability.set(node, now);
 }
 
+// An account transfer of a session on a node reads it through here while the target
+// is staged (nodeTranscriptPreferStaged): the copy under the target account is the
+// session's transcript from the moment it was published, and the source's is history.
+// Everything else keeps refusing a staged session, as forSession does.
 function nodeTranscriptAccount(session, deps = {}) {
   let account = null;
   try {
     account = accounts.forSession(session.id, session.kind, {
       root: deps.root || keep.ROOT, env: deps.env || process.env, allowDiscovery: false,
+      ...(deps.nodeTranscriptPreferStaged === true ? { preferStaged: true } : {}),
     });
   } catch (error) {
     throw new InjectionError(409, `the account of ${session.id} could not be resolved: ${error.message}`, { reason: 'remote-node' });
@@ -4025,7 +4030,13 @@ const nodeArtifactsCapability = new Map();
 const NODE_ARTIFACTS_CAPABILITY_MS = 60e3;
 // The artifacts verb version a Codex session's move needs: 2 carries its rollouts.
 const CODEX_ARTIFACTS_VERSION = 2;
-const ARTIFACTS_TIMEOUT_MS = { list: 120e3, read: 30e3, stage: 30e3, publish: 120e3, release: 120e3, abort: 30e3, cwd: 8e3, 'drop-session': 8e3, account: 8e3 };
+// The version an account transfer of a session on a node needs: 3 adds the ops that
+// answer for the node's own copy of an account (auth, shared-setup, compatible,
+// resume-spec, project-trust) and a list's `owned` flag.
+const HANDOFF_ARTIFACTS_VERSION = 3;
+// `auth` runs an interactive login shell on the node, which takes up to 45 s there.
+const ARTIFACTS_TIMEOUT_MS = { list: 120e3, read: 30e3, stage: 30e3, publish: 120e3, release: 120e3, abort: 30e3, cwd: 8e3, 'drop-session': 8e3, account: 8e3,
+  auth: 60e3, 'shared-setup': 20e3, compatible: 20e3, 'resume-spec': 30e3, 'project-trust': 10e3 };
 
 // `minimum` is the verb version the move needs: 1 for a Claude session, 2 for a Codex
 // one. A host that answers an older one is refused by name, never asked and left to
@@ -4043,6 +4054,11 @@ async function requireNodeArtifacts(node, deps = {}, minimum = 1) {
       { reason: 'remote-node' });
   }
   nodeArtifactsCapability.set(node, { at: now, version });
+  if (!(version >= minimum) && minimum >= HANDOFF_ARTIFACTS_VERSION) {
+    throw new InjectionError(409,
+      `the terminal host on ${node} predates account transfers (its artifacts verb is version ${version}; a transfer needs ${minimum}), so no session on it can be transferred to another account; update keep-tool on ${node} and reload its host`,
+      { reason: 'remote-node' });
+  }
   if (!(version >= minimum)) {
     throw new InjectionError(409,
       `the terminal host on ${node} predates Codex moves (its artifacts verb is version ${version}), so no Codex session can be moved to or from it; update keep-tool on ${node} and reload its host`,
@@ -4050,8 +4066,11 @@ async function requireNodeArtifacts(node, deps = {}, minimum = 1) {
   }
 }
 
-function nodeArtifacts(node, account, deps = {}) {
+// `minimum` raises the verb version every request needs: an account transfer asks for
+// HANDOFF_ARTIFACTS_VERSION on its walk too, since its preflight reads `owned`.
+function nodeArtifacts(node, account, deps = {}, minimum = 1) {
   if (!node || node === daemonNodeName(deps)) throw new Error('nodeArtifacts is for another node');
+  const handoffOps = new Set(['auth', 'shared-setup', 'compatible', 'resume-spec', 'project-trust']);
   const request = async (params) => {
     const unscoped = params.op === 'cwd' || params.op === 'drop-session';
     // Only the two ops that name no account may be asked without one.
@@ -4060,15 +4079,23 @@ function nodeArtifacts(node, account, deps = {}) {
     }
     // A Codex account's files are its rollouts: the node is told so, and must know how.
     const codex = Boolean(account && account.agent === 'codex');
-    await requireNodeArtifacts(node, deps, codex ? CODEX_ARTIFACTS_VERSION : 1);
+    await requireNodeArtifacts(node, deps, Math.max(minimum, codex ? CODEX_ARTIFACTS_VERSION : 1,
+      handoffOps.has(params.op) ? HANDOFF_ARTIFACTS_VERSION : 1));
     const scoped = unscoped ? params : { ...params, account: { id: account.id, configDir: account.configDir }, ...(codex ? { kind: 'codex' } : {}) };
     return (deps.hostRequest || hostRequest)('artifacts', scoped,
       { ...deps, node, hostRequestTimeoutMs: ARTIFACTS_TIMEOUT_MS[params.op] || HOST_REQUEST_TIMEOUT_MS });
   };
+  const other = (value) => ({ id: value.id, configDir: value.configDir });
   return {
     ...artifactTransport.endpoint(request, { where: node }),
     cwd: (cwdPath) => request({ op: 'cwd', path: cwdPath }),
     dropSession: (sessionId) => request({ op: 'drop-session', sessionId }),
+    // An account transfer's questions about this account as the node has it.
+    auth: () => request({ op: 'auth' }),
+    sharedSetup: (cwdPath) => request({ op: 'shared-setup', cwd: cwdPath }),
+    compatible: (target, extra = {}) => request({ op: 'compatible', target: other(target), ...extra }),
+    resumeSpec: (sessionId, relPath) => request({ op: 'resume-spec', sessionId, relPath }),
+    projectTrust: (projectPath, trust = false) => request({ op: 'project-trust', path: projectPath, ...(trust ? { trust: true } : {}) }),
   };
 }
 
@@ -7069,10 +7096,10 @@ function repairEnvFor(context, deps = {}) {
   }
 }
 
-function validatedCodexResumeCwd(agent, value) {
+function validatedCodexResumeCwd(agent, value, options = {}) {
   let available = agent === 'codex' && typeof value === 'string' && value.length > 0
     && !value.includes('\0') && path.isAbsolute(value);
-  if (available) {
+  if (available && options.local !== false) {
     try { available = fs.statSync(value).isDirectory(); } catch { available = false; }
   }
   if (!available) throw new InjectionError(409, 'Saved Codex working directory is unavailable');
@@ -7178,8 +7205,10 @@ async function restartSession(body, deps = {}) {
       if (/^Waiting |^Pause session-local scheduled jobs/.test(reason)) throw transient(reason);
       throw new InjectionError(409, reason);
     }
+    // A saved Codex directory on another node is that machine's: its shape is checked
+    // here, and its existence was asked of the node before the transfer began.
     const cwd = deps.resumeCwd == null ? session.project || pane.cwd
-      : validatedCodexResumeCwd(session.kind, deps.resumeCwd);
+      : validatedCodexResumeCwd(session.kind, deps.resumeCwd, { local: !remotePane });
     // The directory is on the machine the pane is on; this one cannot see another
     // node's filesystem, and the spawn there fails for itself if it is gone.
     if (!cwd || (!remotePane && !fs.statSync(cwd).isDirectory())) throw Error('Session directory is unavailable');
@@ -7280,11 +7309,15 @@ async function restartSession(body, deps = {}) {
           cwd, bypass: false, argv, pi: null,
         }, deps)).command
         : require('./agent-launcher').profileCommand(argv, account);
-      const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stoppedPane.meta?.sessionId,
+      // An account transfer of a pane on another node copies the conversation here, on
+      // the stopped pane's relaunch (replaceExited); on this node it wraps the host.
+      const replace = (params) => host('replace-exited', params);
+      const replaceParams = { paneId: pane.id, expectedPid: pane.pid, sessionId: stoppedPane.meta?.sessionId,
         cmd: '/bin/zsh', args: ['-lic', `exec ${command}`], cwd,
         env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: session.id }, deps), ...reviewerSpec.env }),
         cols: pane.cols, rows: pane.rows, meta: { ...adoptedPaneMeta(pane.meta), agent: session.kind, sessionId: session.id,
-          accountId: account.id, accountLabel: account.label, restartedAt: Date.now() } });
+          accountId: account.id, accountLabel: account.label, restartedAt: Date.now() } };
+      const result = deps.replaceExited ? await deps.replaceExited(replaceParams, replace) : await replace(replaceParams);
       await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
       return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid,
         createdAt: result.pane.createdAt };
@@ -8873,8 +8906,9 @@ async function handoffQueueSessions(deps = {}) {
 async function handoffPolicySessions(deps = {}) {
   const panes = await (deps.listHostPanes || listHostPanes)({}, true);
   if (!Array.isArray(panes)) return [];
-  // A transfer stops an agent and proves it from this machine's process table, so a
-  // pane on another node is never a candidate, as policyEnqueue itself refuses.
+  // The policy's transfers are never forced, and an unforced transfer of a session on
+  // another node is refused, so a pane there is never a candidate, as policyEnqueue
+  // itself refuses.
   const live = panes.filter((pane) => pane && pane.alive === true && pane.agentAlive !== false
     && pane.meta?.agent === 'claude' && !nodes.isRemotePane(pane));
   const lookup = deps.claudeSessionFor || ((id) => claudeSessionFor(id, { allowCachedMiss: true }));
@@ -13666,6 +13700,8 @@ function readBody(req, maxBytes = 1024 * 1024) {
 }
 
 async function inspectAccountHandoff(body, deps = {}) {
+  const paneNode = sessionNodeOf(String(body?.pane || ''), deps);
+  if (paneNode !== daemonNodeName(deps)) return inspectNodeAccountHandoff(body, paneNode, deps);
   const panes = await listHostPanes(deps, true);
   // A host that did not answer is not a missing pane: account-handoff refuses this one as
   // a transient host timeout rather than "needs the original pane".
@@ -13683,6 +13719,80 @@ async function inspectAccountHandoff(body, deps = {}) {
     if (session?.kind === 'claude') currentModel = handoffCurrentModel(session, pane, processArgs, deps);
   } catch {}
   return { session, pane, processArgs, currentModel,
+    agentIdentity: identity ? { pid: identity.pid, pidStart: identity.pidStart, primary: identity.primary === true,
+      ownsPane, ...(identity.rolloutFile ? { rolloutFile: identity.rolloutFile } : {}) } : null };
+}
+
+// Whether a failed request says the node could not be reached (or answered too late),
+// which is a slow host, not an answer about the session.
+function nodeUnreachable(error) {
+  return hostRequestTimedOut(error) || retryableHostError(error)
+    || /terminal host (?:is unavailable|.*request was not retried)/i.test(String(error && error.message || error));
+}
+
+// A Claude session's current model on a node, from what can be read there without its
+// whole transcript: the launch (pane meta, then the process's `--model`) and the
+// newest genuine assistant record in the node's tail. A tail naming another base
+// model is the newer evidence; the same base keeps the launch spelling, which alone
+// carries the context window; a tail with no genuine record (a session parked on the
+// limit) leaves the launch. Nothing at all is '<unknown>', which the transfer refuses.
+function nodeHandoffModel(launch, tailModel) {
+  const tail = tailModel && tailModel !== '<unknown>' ? tailModel : '';
+  if (tail && (!launch || compactModelBase(tail) !== compactModelBase(launch))) return tail;
+  return launch || '<unknown>';
+}
+
+// inspectAccountHandoff for a pane on another node: the pane from that node's own
+// answer to a fresh listing, the agent's identity from that node's process table read
+// now (never the listing's cache), and the session row from its node's transcript
+// (remoteSessionRead). A node that does not answer the listing or the table is a slow
+// host, and the transfer refuses as it does for one here (hostUnavailable).
+async function inspectNodeAccountHandoff(body, node, deps = {}) {
+  let listed;
+  try { listed = await (deps.listHostPaneResult || listHostPaneResult)(deps, true); }
+  catch { return { hostUnavailable: true, node }; }
+  const status = listed && listed.nodes && listed.nodes[node];
+  if (!Array.isArray(listed && listed.panes) || !status || status.ok !== true || status.stale) return { hostUnavailable: true, node };
+  const panes = listed.panes;
+  const pane = panes.find((entry) => entry && entry.id === body.pane) || null;
+  const state = await (deps.addHostSessionState || addHostSessionState)(
+    await (deps.buildState || buildState)({ hostPanes: panes }), { ...deps, panes });
+  const listedRow = (state.sessions || []).find((entry) => entry.id === body.sessionId && entry.node === node) || null;
+  // The row the node's transcript gives, read under whichever account holds the
+  // conversation now (the staged target once a transfer has published its copy).
+  let row = null;
+  try { row = await (deps.remoteSessionRead || remoteSessionRead)(body.sessionId, { ...deps, nodeTranscriptPreferStaged: true }); }
+  catch (error) { if (nodeUnreachable(error)) return { hostUnavailable: true, node }; }
+  const session = row || listedRow ? { ...(listedRow || {}), ...(row || {}), node, ...(pane ? { pane: pane.id } : {}) } : null;
+  if (session && session.kind === 'pi') {
+    throw new InjectionError(409, `${session.id} is a Pi session on ${node}; only Claude and Codex sessions can be transferred to another account`);
+  }
+  nodeProcessRowsCaches.delete(node);
+  let rows;
+  try { rows = await (deps.agentProcessRows || agentProcessRows)(deps, { node }); }
+  catch { return { hostUnavailable: true, node }; }
+  if (!Array.isArray(rows)) return { hostUnavailable: true, node };
+  const live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => rows,
+    codexRolloutOnly: session?.kind === 'codex' }, { node });
+  // An unreadable piece of evidence names no agent: the transfer refuses as unverified.
+  const identity = unverifiedProcesses(live, session?.kind === 'codex' ? 'codex' : 'claude') ? null : live.get(body.sessionId);
+  const ownsPane = agentIdentityOwnsPane(identity, pane, rows);
+  const processArgs = identity ? rows.find((entry) => entry.pid === identity.pid)?.args || '' : '';
+  let currentModel = '';
+  if (session?.kind === 'claude' && pane?.alive) {
+    const launch = launchModelId(pane.meta?.model) || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(String(processArgs || ''))?.[1]);
+    let tailModel = '';
+    try {
+      const tail = await (deps.nodeTranscript || nodeTranscript)(node, { id: body.sessionId, kind: 'claude', node },
+        { ...deps, nodeTranscriptPreferStaged: true }).tail();
+      tailModel = lastClaudeHandoffModel(tailText(tail));
+    } catch (error) {
+      if (nodeUnreachable(error)) return { hostUnavailable: true, node };
+      tailModel = '';
+    }
+    currentModel = nodeHandoffModel(launch, tailModel);
+  }
+  return { session, pane, processArgs, currentModel, node,
     agentIdentity: identity ? { pid: identity.pid, pidStart: identity.pidStart, primary: identity.primary === true,
       ownsPane, ...(identity.rolloutFile ? { rolloutFile: identity.rolloutFile } : {}) } : null };
 }
@@ -13743,16 +13853,28 @@ async function verifyAccountHandoffTarget(sessionId, paneId, accountId, agent, t
     assertPane(pane);
     return pane;
   };
+  // A pane on another node is answered by that node's own table, read now; its rollout
+  // paths are that machine's, compared as it reported them.
+  const node = sessionNodeOf(String(expected.pane), deps);
+  const remote = node !== daemonNodeName(deps);
   const currentAgent = async (pane) => {
-    const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
+    if (remote) nodeProcessRowsCaches.delete(node);
+    const rows = await (deps.agentProcessRows || agentProcessRows)(deps, remote ? { node } : {});
     const live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => rows,
-      codexRolloutOnly: agent === 'codex' });
+      codexRolloutOnly: agent === 'codex' }, remote ? { node } : {});
+    if (remote && unverifiedProcesses(live, agent)) {
+      throw new InjectionError(409, `the process table on ${node} could not be read; nothing was sent`);
+    }
     const identity = live.get(sessionId);
     if (!identity?.primary || identity.agent !== agent || identity.pid !== expected.agentPid
         || identity.pidStart !== expected.agentPidStart || !agentIdentityOwnsPane(identity, pane, rows)) {
       throw new InjectionError(409, 'Native handoff destination agent identity changed; nothing was sent');
     }
-    if (agent === 'codex') {
+    if (agent === 'codex' && remote) {
+      if (identity.source !== 'rollout' || typeof identity.rolloutFile !== 'string' || identity.rolloutFile !== targetTranscript) {
+        throw new InjectionError(409, 'Native handoff destination rollout ownership changed; nothing was sent');
+      }
+    } else if (agent === 'codex') {
       let actual, wanted;
       try { actual = fs.realpathSync(identity.rolloutFile); wanted = fs.realpathSync(targetTranscript); }
       catch { throw new InjectionError(409, 'Native handoff destination rollout ownership is unavailable; nothing was sent'); }
@@ -13784,6 +13906,9 @@ function continueAccountHandoff(sessionId, pane, accountId, text, deliveryId, op
   const target = accounts.get(accountId, env);
   const agent = options.agent || 'claude';
   if (!target || target.agent !== agent) throw new InjectionError(409, 'Target account changed before continuation delivery');
+  if (sessionNodeOf(String(pane || ''), deps) !== daemonNodeName(deps)) {
+    return continueNodeAccountHandoff(sessionId, pane, target, text, deliveryId, options, deps);
+  }
   let file;
   if (agent === 'codex') {
     if (typeof options.targetTranscript !== 'string' || !path.isAbsolute(options.targetTranscript)
@@ -13817,13 +13942,53 @@ function continueAccountHandoff(sessionId, pane, accountId, text, deliveryId, op
   return sendToSessionLocked({ sessionId, pane, text }, exactDeps);
 }
 
+// continueAccountHandoff for a pane on another node. The session is read from its node
+// under the target account (its transcript there is the copy the transfer published),
+// delivered through the ordinary node delivery, whose receipt the node takes from that
+// same transcript, and the target's pane, agent and SessionStart are proven again from
+// that node immediately before the first byte (verifyAccountHandoffTarget).
+function continueNodeAccountHandoff(sessionId, pane, target, text, deliveryId, options = {}, deps = {}) {
+  const agent = options.agent || 'claude';
+  let targetTranscript = null;
+  if (agent === 'codex') {
+    const file = options.targetTranscript;
+    const relative = typeof file === 'string' ? path.relative(path.resolve(target.configDir), path.resolve(file)) : '..';
+    if (typeof file !== 'string' || !path.isAbsolute(file) || file.includes('\0')
+        || !relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new InjectionError(409, 'Target Codex rollout path is outside its account');
+    }
+    targetTranscript = file;
+  }
+  const nodeDeps = { ...deps, nodeTranscriptPreferStaged: true };
+  const loadTarget = async (id) => {
+    const session = await remoteSessionRead(id, nodeDeps);
+    if (!session || session.id !== sessionId || session.kind !== agent || session.accountId !== target.id) {
+      throw new InjectionError(409, 'Target session was not read from the target account; nothing was sent');
+    }
+    return session;
+  };
+  const exactDeps = { ...nodeDeps, loadCurrentSession: loadTarget, loadDeliverySession: loadTarget };
+  exactDeps.sendToResolvedTarget = (session, resolved, message) => sendToResolvedTarget(session, resolved, message,
+    { retainReceipt: true, deliveryKey: deliveryId,
+      beforeType: () => verifyAccountHandoffTarget(sessionId, pane, target.id, agent, targetTranscript, options, exactDeps) }, exactDeps);
+  return sendToSessionLocked({ sessionId, pane, text }, exactDeps);
+}
+
+// The relaunch of an interrupted transfer's exited pane on the target account. A pane
+// on another node is relaunched there: the conversation proven not running from that
+// node's own table read now, the command built by that node's prepare-launch (its
+// launcher, its shared setup for the target account), and the replace sent to its host.
 async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) {
   const host = (type, params) => hostRequest(type, params, deps);
+  const node = sessionNodeOf(String(entry.pane || ''), deps);
+  const remote = node !== daemonNodeName(deps);
   const pane = (await host('get', { pane: entry.pane })).pane;
   if (pane.alive || pane.pid !== entry.pid) throw new InjectionError(409, 'Exited handoff pane changed before recovery');
-  if ((await liveSessionPids(deps)).has(entry.sessionId)) throw new InjectionError(409, 'An agent process still owns this conversation');
   const agent = entry.agent || 'claude';
-  const cwd = agent === 'codex' ? validatedCodexResumeCwd(agent, entry.cwd) : entry.cwd;
+  if (remote) {
+    if (await agentLiveOn(node, entry.sessionId, deps, agent)) throw new InjectionError(409, 'An agent process still owns this conversation');
+  } else if ((await liveSessionPids(deps)).has(entry.sessionId)) throw new InjectionError(409, 'An agent process still owns this conversation');
+  const cwd = agent === 'codex' ? validatedCodexResumeCwd(agent, entry.cwd, { local: !remote }) : entry.cwd;
   let argv, reviewerSpec = { env: null };
   if (agent === 'codex') {
     argv = entry.resumeSpec?.argv;
@@ -13836,11 +14001,21 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
     const flags = entry.permissionClass === 'bypass' ? ['--dangerously-skip-permissions'] : [];
     const modelArgs = entry.model && keep.LAUNCH_MODEL_RE.test(entry.model) ? ['--model', entry.model] : [];
     reviewerSpec = reviewerResumeSpec({ id: entry.sessionId }, pane, deps);
-    argv = ['claude', ...flags, ...reviewerSpec.flags, ...(mcpConfig ? ['--mcp-config', mcpConfig] : []), ...modelArgs, '--resume', entry.sessionId];
+    // On a node the target's MCP config is that machine's, spliced in by its prepare-launch.
+    const mcpArgs = remote ? [{ insert: 'mcpConfig' }] : mcpConfig ? ['--mcp-config', mcpConfig] : [];
+    argv = ['claude', ...flags, ...reviewerSpec.flags, ...mcpArgs, ...modelArgs, '--resume', entry.sessionId];
   }
+  const command = remote
+    ? (await (deps.prepareLaunchOn || prepareLaunchOn)(node, {
+      agent,
+      account: { id: account.id, agent: account.agent, configDir: account.configDir,
+        builtIn: account.builtIn === true, managed: account.managed === true },
+      cwd, bypass: false, argv, pi: null,
+    }, deps)).command
+    : require('./agent-launcher').profileCommand(argv, account);
   const result = await host('replace-exited', {
     paneId: pane.id, expectedPid: entry.pid, sessionId: pane.meta?.sessionId,
-    cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
+    cmd: '/bin/zsh', args: ['-lic', `exec ${command}`], cwd,
     env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: entry.sessionId }, deps), ...reviewerSpec.env }),
     cols: entry.cols, rows: entry.rows,
     meta: { ...adoptedPaneMeta(pane.meta), agent, sessionId: entry.sessionId, accountId: account.id, accountLabel: account.label,
@@ -13853,29 +14028,200 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
   return launched;
 }
 
-// An account transfer stops one agent, rewrites this machine's account authority
-// and starts the conversation again from a transcript here, proving each step from
-// this machine's process table. A session on another node is refused before any of
-// it begins — account-handoff.run would refuse a qualified pane too, but with
-// nothing to tell a person about which machine the session is actually on.
-function refuseRemoteHandoff(body, deps = {}) {
-  const node = sessionNodeOf({ sessionId: body?.sessionId, pane: body?.pane }, deps);
-  if (node !== daemonNodeName(deps)) {
-    throw new InjectionError(409, `account handoff is not available for a session on ${node}`);
+// Where an account transfer is proven: on the node the pane is on. The pane's node and
+// the node the session's authority record names must agree; a session recorded on one
+// machine whose named pane is on another is not one a transfer can reason about.
+function handoffNode(body, deps = {}) {
+  const daemon = daemonNodeName(deps);
+  const paneNode = sessionNodeOf(String(body?.pane || ''), deps);
+  let recorded = null;
+  if (/^[A-Za-z0-9_-]+$/.test(String(body?.sessionId || '')) && hostNodeNames(deps).length > 1) {
+    try { recorded = accounts.sessionNode(body.sessionId, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
+    catch { recorded = null; }
   }
+  if (recorded && recorded !== paneNode) {
+    throw new InjectionError(409, `session ${body.sessionId} is recorded on ${recorded}, but pane ${body.pane} is on ${paneNode}; nothing was transferred`);
+  }
+  return paneNode === daemon ? null : paneNode;
+}
+
+// A request to a node that could not be reached reads as a slow host, which the
+// transfer (and its queue) treats as retryable, never as an answer.
+function nodeHandoffUnreachable(node, what, error) {
+  return Object.assign(new Error(`host request timed out asking ${node} ${what} (${String(error && error.message || error).slice(0, 160)}); the handoff can be retried`),
+    { status: 409 });
+}
+
+// The node's answers to every question account-handoff.run asks about the machine the
+// session runs on, for a pane on another node: the node's copies of both accounts
+// (login, shared setup, compatibility, project trust, the Codex resume policy), the
+// artifacts copied from the source account's directory to the target's on that node
+// through the same endpoint walk a move uses (both ends on the node), and a directory
+// asked of its filesystem. Nothing is copied through or staged on this machine beyond
+// the walk's own pieces in flight.
+function nodeHandoffDeps(node, deps = {}) {
+  const ends = (account) => nodeArtifacts(node, moveNodeAccount(node, account, deps), deps, HANDOFF_ARTIFACTS_VERSION);
+  const ask = async (what, work) => {
+    try { return await work(); }
+    catch (error) {
+      if (!(error instanceof InjectionError) && nodeUnreachable(error)) throw nodeHandoffUnreachable(node, what, error);
+      if (error && typeof error === 'object' && !error.status) error.status = 409;
+      throw error;
+    }
+  };
+  const within = (root, file) => {
+    const relative = typeof file === 'string' ? path.relative(path.resolve(root), path.resolve(file)) : '..';
+    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
+    return relative.split(path.sep).join('/');
+  };
+  const codexThread = (relPath, sessionId) => {
+    const name = relPath.split('/').pop();
+    if (name.endsWith(`-${sessionId}.jsonl`)) return sessionId;
+    const match = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(name);
+    return match ? match[1] : null;
+  };
+  // The plan's shape as the local providers give it: for Codex, one entry per thread
+  // rollout (the owned conversation graph), each with the node's paths under both accounts.
+  const planOf = (sessionId, source, target, files) => {
+    const artifacts = files.map((file) => ({
+      relPath: file.relPath, sha256: file.sha256,
+      source: path.join(source.configDir, ...file.relPath.split('/')),
+      target: path.join(target.configDir, ...file.relPath.split('/')),
+      ...(source.agent === 'codex' ? { sessionId: codexThread(file.relPath, sessionId) } : {}),
+    }));
+    if (source.agent === 'codex') {
+      if (artifacts.some((entry) => !entry.sessionId)) {
+        throw new InjectionError(409, `a Codex rollout of ${sessionId} on ${node} does not name its thread`);
+      }
+      if (!artifacts.some((entry) => entry.sessionId === sessionId && /^sessions\//.test(entry.relPath))) {
+        throw new InjectionError(409, `${node} listed no root rollout for ${sessionId}`);
+      }
+    } else if (!artifacts.some((entry) => /^projects\/[^/]+\/[^/]+\.jsonl$/.test(entry.relPath))) {
+      throw new InjectionError(409, `${node} listed no transcript for ${sessionId}`);
+    }
+    return { sessionId, node, artifacts };
+  };
+  const missing = (error) => error && (error.code === 'artifacts-missing'
+    || /^no (?:Claude transcript|Codex rollout) for /.test(String(error.message || '')));
+  const provider = {
+    // Before anything stops: the source's copy is listed and the target's too, and a
+    // file the walk would publish over that the target holds with other bytes, which
+    // no move or transfer put there, refuses now rather than at the publish after the
+    // stop. The node's own publish makes the same check again.
+    preflight: (sessionId, source, target) => ask(`for the artifacts of ${sessionId}`, async () => {
+      if (!source || !target || source.id === target.id || path.resolve(source.configDir) === path.resolve(target.configDir)
+          || within(source.configDir, target.configDir) || within(target.configDir, source.configDir)) {
+        throw new InjectionError(409, 'source and target profiles overlap');
+      }
+      const listed = await ends(source).list(sessionId);
+      const files = Array.isArray(listed && listed.files) ? listed.files : [];
+      const plan = planOf(sessionId, source, target, files);
+      let there = null;
+      try { there = await ends(target).list(sessionId); }
+      catch (error) { if (!missing(error)) throw error; }
+      const carried = new Map(files.map((file) => [file.relPath, file.sha256]));
+      const conflict = ((there && there.files) || []).find((file) => carried.has(file.relPath)
+        && carried.get(file.relPath) !== file.sha256 && file.owned !== true);
+      if (conflict) {
+        throw new InjectionError(409, `target session artifacts for ${sessionId} in ${target.id} on ${node} have unrecognized changes: ${conflict.relPath}`);
+      }
+      return { ...plan, disposition: there && there.files && there.files.length ? 'managed' : 'empty' };
+    }),
+    copyClaudeArtifacts: (...args) => provider.copy(...args),
+    copyCodexArtifacts: (...args) => provider.copy(...args),
+    // The walk proves the source did not change while it was carried and that the
+    // target holds exactly what was sent; the source's copy is then released (left
+    // behind, and a later transfer back may replace it).
+    copy: (sessionId, source, target, transactionId) => ask(`to copy ${sessionId}`, async () => {
+      const from = ends(source);
+      const moved = await artifactTransport.transfer({ sessionId, tx: String(transactionId), from, to: ends(target) });
+      await from.release(sessionId);
+      return planOf(sessionId, source, target, moved.files);
+    }),
+    // The job ledger is verified against a transcript on this machine; a node session
+    // has none here to verify or rebind. A transfer of one is Owner-forced (run()).
+    rebindLedger: () => ({ rebound: [], node }),
+  };
+  const resumeSpecFrom = async (account, sessionId, file) => {
+    const relPath = within(account.configDir, file);
+    if (!relPath) throw new InjectionError(409, 'Codex rollout path is outside its account');
+    const spec = await ask(`for the resume policy of ${sessionId}`, () => ends(account).resumeSpec(sessionId, relPath));
+    const { file: _file, ...rest } = spec || {};
+    return rest;
+  };
+  return {
+    paneNode: node,
+    artifactProvider: provider,
+    authPreflight: (account) => ask(`whether ${account.id} is logged in`, async () => {
+      const answer = await ends(account).auth();
+      return Boolean(answer && answer.loggedIn === true
+        && (!answer.configDirectory || path.resolve(answer.configDirectory) === path.resolve(account.configDir)));
+    }),
+    sourceMcpConfigs: (account, cwds) => ask(`for the shared setup of ${account.id}`, async () => {
+      const found = [];
+      for (const cwd of cwds) {
+        const answer = await ends(account).sharedSetup(cwd);
+        if (answer && answer.managed === true && typeof answer.mcpConfig === 'string' && answer.mcpConfig) found.push(answer.mcpConfig);
+      }
+      return found;
+    }),
+    compatible: (source, target, cwd, resumeSpec) => ask(`whether ${target.id} matches ${source.id}`, async () => {
+      const answer = await ends(source).compatible(target, source.agent === 'codex'
+        ? { provider: String(resumeSpec && resumeSpec.provider || '') } : { cwd });
+      return { ok: Boolean(answer && answer.ok === true), reasons: Array.isArray(answer && answer.reasons) ? answer.reasons : [], mcpConfig: null };
+    }),
+    resumeSpec: (sessionId, plan, source) => {
+      const root = plan && Array.isArray(plan.artifacts) && plan.artifacts.find((entry) => entry.sessionId === sessionId);
+      if (!root || !root.source || !source) throw new InjectionError(409, 'Codex source rollout identity is unavailable');
+      return resumeSpecFrom(source, sessionId, root.source);
+    },
+    verifyTargetSpec: async (entry, target) => {
+      if (!entry.resumeSpec) return true;
+      const verified = await resumeSpecFrom(target, entry.sessionId, entry.targetTranscript);
+      if (verified.digest !== entry.resumeSpec.digest) throw new InjectionError(409, 'Target Codex resume policy differs from the stopped source');
+      return true;
+    },
+    directoryExists: (cwd) => ask(`whether ${cwd} exists`, async () =>
+      (await nodeArtifacts(node, null, deps, HANDOFF_ARTIFACTS_VERSION).cwd(cwd)).directory === true),
+    trustedProjectFor: (account, cwd) => ask(`which project ${account.id} trusts`, async () => (await ends(account).projectTrust(cwd)).trusted || null),
+    trustProject: (account, project) => ask(`to trust ${project} for ${account.id}`, () => ends(account).projectTrust(project, true)),
+    // The node reported both paths; they are compared as that machine wrote them.
+    rolloutMatches: (actual, wanted) => typeof actual === 'string' && actual.length > 0 && actual === wanted,
+    // A fresh read of the node's own table, never the listing's short cache.
+    agentProcessRows: async () => {
+      nodeProcessRowsCaches.delete(node);
+      try { return await (deps.agentProcessRows || agentProcessRows)(deps, { node }); }
+      catch (error) { throw nodeHandoffUnreachable(node, 'for its process table', error); }
+    },
+  };
 }
 
 async function handoffSession(body, deps = {}) {
-  refuseRemoteHandoff(body, deps);
+  const node = handoffNode(body, deps);
   const root = deps.root || keep.ROOT;
   const deliveryDirectory = deps.deliveryDirectory || path.join(root, '.keep', 'delivery');
+  // A session on another node reads its transcript, while a transfer is staged, under
+  // the account that holds the conversation now (nodeTranscriptAccount).
+  const readDeps = node ? { ...deps, nodeTranscriptPreferStaged: true } : deps;
+  if (node) {
+    // An older host is refused by name, before anything is asked of it or journalled.
+    try { await requireNodeArtifacts(node, deps, HANDOFF_ARTIFACTS_VERSION); }
+    catch (error) {
+      if (error instanceof InjectionError) throw error;
+      throw nodeHandoffUnreachable(node, 'for its capabilities', error);
+    }
+  }
+  // Everything run() would read from this machine is answered by the node instead; a
+  // caller's own deps still win, as they do for every dep here.
+  const fromNode = node ? Object.fromEntries(Object.entries(nodeHandoffDeps(node, deps))
+    .filter(([key]) => key === 'paneNode' || deps[key] === undefined)) : {};
   return require('./account-handoff').run(body, {
     ...deps,
     root,
     inspect: deps.inspect || ((request) => inspectAccountHandoff(request, deps)),
     // A fresh snapshot for proving an unverified stop after the fact.
     agentProcessRows: deps.agentProcessRows ? () => deps.agentProcessRows(deps) : () => agentProcessRows(deps),
-    host: deps.host || { request: (type, params) => hostRequest(type, params, deps) },
+    host: deps.host || { request: (type, params) => hostRequest(type, params, node ? { ...deps, node } : deps) },
     restartSession: deps.restartSession || restartSession,
     restartDeps: deps.restartDeps || deps,
     resumeExited: deps.resumeExited || ((entry, account, mcpConfig, hooks = {}) => resumeExitedAccountHandoff(entry, account, mcpConfig,
@@ -13884,13 +14230,14 @@ async function handoffSession(body, deps = {}) {
     continueSession: deps.continueSession || ((sessionId, text, options) => continueAccountHandoff(sessionId, body.pane, body.accountId,
       text, options?.deliveryId, options, { ...deps, deliveryDirectory })),
     deliveryStatus: deps.deliveryStatus || ((_sessionId, text, deliveryId) => require('./delivery').statusForTextAsync(deliveryDirectory, text, deliveryId,
-      { receiptFor: (entry) => deliveryReceiptFor(entry, deps) })),
+      { receiptFor: (entry) => deliveryReceiptFor(entry, readDeps) })),
     verifyTargetSpec: deps.verifyTargetSpec || (async (entry, target) => {
       if (!entry.resumeSpec) return true;
       const verified = require('./codex-handoff-support').readResumeSpec(entry.targetTranscript, entry.sessionId);
       if (verified.digest !== entry.resumeSpec.digest) throw new InjectionError(409, 'Target Codex resume policy differs from the stopped source');
       return true;
     }),
+    ...fromNode,
   });
 }
 
@@ -14448,9 +14795,9 @@ async function queueRefusedHandoff(body, record, requestedAt, deps = {}) {
     process.stderr.write(`keep serve: not queuing ${sessionId}: ${why}\n`);
     return null;
   };
-  // The queue's only side effect is calling handoffSession again, and that transfer
-  // cannot run from here for a session on another machine. Nothing is queued that
-  // could only ever be refused.
+  // The queue's only side effect is calling handoffSession again, unforced, and an
+  // unforced transfer of a session on another machine is refused (account-handoff.js
+  // run). Nothing is queued that could only ever be refused.
   const node = sessionNodeOf({ sessionId, pane }, deps);
   if (node !== daemonNodeName(deps)) return skip(`the session runs on ${node}`);
   // Order matters, and it is the order of how long each answer stays true. The state
@@ -14502,9 +14849,9 @@ async function queueRefusedHandoff(body, record, requestedAt, deps = {}) {
 // route and does not ask: it reports the refusal to whoever typed it, unchanged.
 async function handoffSessionRequest(body, deps = {}) {
   const { queueOnTransient, ...request } = body && typeof body === 'object' ? body : {};
-  // Before the queue is offered one: a transfer that cannot run here must not be
-  // retried here either, whatever the caller asked for.
-  refuseRemoteHandoff(request, deps);
+  // Before the queue is offered one: a transfer whose pane and recorded node disagree
+  // cannot run anywhere, and must not be retried either, whatever the caller asked for.
+  handoffNode(request, deps);
   const run = deps.handoffSession || handoffSession;
   // An Owner-forced transfer has nothing left to wait out, and a queued retry would run
   // without Owner behind it; its refusal goes straight back to the person who clicked.
@@ -14538,7 +14885,15 @@ async function abandonTransfer(body, deps = {}) {
   return handoff.abandonExited(body, {
     ...deps, root,
     listPanes: deps.listPanes || (() => listHostPaneResult(deps, true)),
-    agentProcessRows: deps.agentProcessRows || (() => agentProcessRows({ ...deps, processRowsCache: {} })),
+    // A fresh table of the machine the session ran on: this one's, or a node's through
+    // its host (never the listing's short cache).
+    agentProcessRows: deps.agentProcessRows || ((options = {}) => {
+      if (options.node && options.node !== daemonNodeName(deps)) {
+        nodeProcessRowsCaches.delete(options.node);
+        return agentProcessRows(deps, { node: options.node });
+      }
+      return agentProcessRows({ ...deps, processRowsCache: {} });
+    }),
   });
 }
 
