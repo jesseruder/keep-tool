@@ -195,6 +195,8 @@ export function syncSecretDrop(stage, ctx, item) {
   root.style.setProperty('--sd-right', aside && !aside.hidden && aside.offsetWidth ? `${aside.offsetWidth}px` : '0px');
   const found = secretRequestFor(ctx.data, item?.sessionId);
   if (!found) {
+    // Nothing left after the one just answered: a request that arrives later is new.
+    if (justAnswered && justAnswered.sessionId === item?.sessionId) justAnswered = null;
     if (!root.hidden || root.dataset.requestId) {
       root.hidden = true;
       root.replaceChildren();
