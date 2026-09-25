@@ -14,6 +14,7 @@ import { installInteractionGuard } from './interaction-guard.js';
 import { captureFocusIntent } from './focus-intent.js';
 import { mountTerminal } from './terminal.js';
 import { setTerminalRendererPreference } from './terminal-renderer.js';
+import { setPredictTypingPreference } from './predict-typing.js';
 import { installFocusDebug } from './focus-debug.js';
 import { retainSelection, stableSessionOrder } from './selection.js';
 import { createSessionHistory, installSessionHistory } from './session-history.js';
@@ -853,6 +854,10 @@ function setTerminalRenderer(pane, renderer) {
   for (const entry of terminals.get(pane)?.values() || []) entry.mounted.setRenderer(renderer);
   refresh();
 }
+// Each terminal reads the setting on every keystroke, so only the menus need redrawing.
+function setPredictTyping(mode) {
+  if (setPredictTypingPreference(mode)) refresh();
+}
 function patchHTML(element, html) {
   if (renderedHTML.get(element) === html) return false;
   element.innerHTML = html;
@@ -1270,7 +1275,7 @@ const ctx = {
   queueItems, runningItems, pinnedItems, recentItems, triageItems, toggleCollapsed, toggleRunning, toggleRecent, setSelected,
   itemKey, triageKey, eventKey, sessionFor, taskFor, paneMap, entityForPane, kindLabel, limitResumeFor, toast, dismiss, restore, setAside, setAsideFor, isMarkedRunning,
   pinPane, startShell, newSession, reopenSession, removePane, isPanePinned, knownPaneCount, saveLayouts, dropPane, mount, patchHTML, clearElement, refresh, reload,
-  scheduleTerminalFit, setTerminalRenderer, setMode, setDock, toggleFocus, focusTerminal, focusDebug, retainedSelectionItem,
+  scheduleTerminalFit, setTerminalRenderer, setPredictTyping, setMode, setDock, toggleFocus, focusTerminal, focusDebug, retainedSelectionItem,
   detail(kind, item) { return item ? detailStore.peek(kind, item.id, item._detailVersion) : { status: 'idle', value: null, error: '' }; },
   ensureDetail(kind, item) { return item && item._detailVersion ? detailStore.ensure(kind, item.id, item._detailVersion) : Promise.resolve(item || null); },
   retryDetail(kind, item) { return item && item._detailVersion ? detailStore.retry(kind, item.id, item._detailVersion) : Promise.resolve(item || null); },

@@ -5,7 +5,7 @@ import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHa
 import { portableTransferControls, installPortableTransferControls } from './portable-transfer.js';
 import { installMoveControls, moveControlsHTML, paneMoveSession } from './move-controls.js';
 import { actionsMenuHTML, installActionsMenu, installKeepRunningControl, keepRunningControlHTML,
-  patchActionsMenu, rendererControlsHTML } from './session-actions.js';
+  patchActionsMenu, predictTypingControlsHTML, rendererControlsHTML } from './session-actions.js';
 import { numBadgeHTML } from './session-number.js';
 import { installHeadingRename, installRenameControls, isEditing, renameButtonsHTML, titleAttrsHTML } from './session-rename.js';
 import { installMarkControls, markControlsHTML, markHTML } from './session-mark.js';
@@ -138,7 +138,7 @@ function renderGrid(ctx, layout) {
     const keepRunning = providerControls && closable && entity.session && !entity.session.reviewer && !entity.session.agentName
       ? keepRunningControlHTML(entity.session) : '';
     const menu = element.querySelector('.session-actions');
-    patchActionsMenu(ctx, menu, `<button class="btn" data-unpin>Unpin from Watch</button>${closable ? '<button class="btn" data-close-session>Close session</button>' : ''}${shell ? `<button class="btn" data-kill>${pane.alive ? 'Kill shell' : 'Remove shell'}</button>` : ''}${exitedAgent && !pendingHandoff ? `<button class="btn" data-reopen>${entity.session?.retirement?.automatic === true ? 'Resume' : 'Reopen'}</button><button class="btn" data-remove-pane>Remove pane</button>` : ''}${keepRunning}${renameButtonsHTML(entity.session?.id, entity.renamed)}${markControlsHTML(ctx.esc, entity.session?.id, entity.mark)}<div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><div class="move-controls">${move}</div><span class="restart-controls">${restart}</span>${rendererControlsHTML(ctx, pane.id, pane)}`);
+    patchActionsMenu(ctx, menu, `<button class="btn" data-unpin>Unpin from Watch</button>${closable ? '<button class="btn" data-close-session>Close session</button>' : ''}${shell ? `<button class="btn" data-kill>${pane.alive ? 'Kill shell' : 'Remove shell'}</button>` : ''}${exitedAgent && !pendingHandoff ? `<button class="btn" data-reopen>${entity.session?.retirement?.automatic === true ? 'Resume' : 'Reopen'}</button><button class="btn" data-remove-pane>Remove pane</button>` : ''}${keepRunning}${renameButtonsHTML(entity.session?.id, entity.renamed)}${markControlsHTML(ctx.esc, entity.session?.id, entity.mark)}<div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><div class="move-controls">${move}</div><span class="restart-controls">${restart}</span>${rendererControlsHTML(ctx, pane.id, pane)}${predictTypingControlsHTML()}`);
     installActionsMenu(menu, ctx, pane.id);
     if (keepRunning) installKeepRunningControl(menu, ctx, entity.session, api.setSessionKeepRunning);
     installRenameControls(menu, ctx, heading, entity.session?.id, entity.title, api.renameSession);

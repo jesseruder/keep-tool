@@ -188,6 +188,24 @@ the desktop is typed into xterm and the phone hands the terminal to the app;
 Fleet rows carry a `Terminal` button that posts the same `openTerminal`. On a
 desktop the module builds nothing at all.
 
+### Predictive typing
+
+A pane on another node echoes a keystroke only after a round trip and the agent's
+render, so the console draws the character itself first (`web/app/predict-typing.js`).
+It predicts only in an agent's input box: the cursor's line starts with Claude Code's
+`❯` or Codex's `›` and a space, the cursor is past them at the end of the typed text and
+more than three cells from the right edge, the screen is the normal one, no selection
+or IME composition is in progress, and the key is one printable single-width
+character or Backspace. Pastes, Enter, arrows, menus, dialogs and shell panes are never
+predicted, and nothing sent to the pane changes. A predicted character is dim and
+underlined until the agent's own redraw replaces it; a dim placeholder is cleared by the
+first one, and a character that stays dim was never echoed. The session Actions menu
+carries a per-viewer **Predict typing** setting (`keep.console.predictTyping` in
+localStorage): **Auto**, the default, predicts only on panes of another node and only
+once the median of the last 8 measured echoes on that pane is above 50 ms (it measures
+from the third keystroke on, so the first few characters on a pane arrive unpredicted);
+**On** predicts on every pane, the daemon node's included; **Off** never predicts.
+
 ## CLI
 
 ```

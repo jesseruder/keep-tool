@@ -1,4 +1,5 @@
 import { effectiveTerminalRenderer } from './terminal-renderer.js';
+import { getPredictTypingPreference } from './predict-typing.js';
 
 export function actionsMenuHTML() {
   return '<details class="session-actions"><summary class="btn" aria-label="Session actions">Actions</summary><div class="session-actions-pop"><div class="session-actions-content"></div></div></details>';
@@ -6,7 +7,7 @@ export function actionsMenuHTML() {
 
 function focusIdentity(element) {
   if (!(element instanceof Element)) return null;
-  for (const name of ['renderer', 'restart', 'handoffAccount', 'portableTransfer', 'portableFallback', 'relaySession',
+  for (const name of ['renderer', 'predictTyping', 'restart', 'handoffAccount', 'portableTransfer', 'portableFallback', 'relaySession',
     'markColor', 'emoji']) {
     if (element.dataset[name] != null) return `[data-${name.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}="${CSS.escape(element.dataset[name])}"]`;
   }
@@ -43,6 +44,14 @@ export function rendererControlsHTML(ctx, pane, paneState) {
   const selected = effectiveTerminalRenderer(pane, paneState);
   const option = (renderer, label) => `<button class="btn renderer-choice ${selected === renderer ? 'selected' : ''}" type="button" aria-pressed="${selected === renderer}" data-renderer="${renderer}"><span>${label}</span><span class="renderer-check" aria-hidden="true">${selected === renderer ? '✓' : ''}</span></button>`;
   return `<div class="session-actions-label">Terminal renderer</div><div class="renderer-options" role="group" aria-label="Terminal renderer">${option('dom', 'Standard')}${option('webgl', 'GPU accelerated')}</div>`;
+}
+
+// One setting for every pane this viewer opens: prediction is a property of the
+// viewer's link to the node, not of the session.
+export function predictTypingControlsHTML() {
+  const selected = getPredictTypingPreference();
+  const option = (mode, label, help) => `<button class="btn renderer-choice ${selected === mode ? 'selected' : ''}" type="button" aria-pressed="${selected === mode}" data-predict-typing="${mode}" title="${help}"><span>${label}</span><span class="renderer-check" aria-hidden="true">${selected === mode ? '✓' : ''}</span></button>`;
+  return `<div class="session-actions-label">Predict typing</div><div class="renderer-options" role="group" aria-label="Predict typing">${option('auto', 'Auto', 'Predict on panes of another node once their echo is slower than 50 ms')}${option('on', 'On', 'Predict typing on every pane')}${option('off', 'Off', 'Never predict typing')}</div>`;
 }
 
 export function keepRunningControlHTML(session) {
@@ -119,6 +128,13 @@ export function installActionsMenu(menu, ctx, pane) {
       const renderer = button.dataset.renderer;
       ctx.setTerminalRenderer(pane, renderer);
       menu.querySelector(`[data-renderer="${renderer}"]`)?.focus({ preventScroll: true });
+    };
+  });
+  menu.querySelectorAll('[data-predict-typing]').forEach((button) => {
+    button.onclick = () => {
+      const mode = button.dataset.predictTyping;
+      ctx.setPredictTyping(mode);
+      menu.querySelector(`[data-predict-typing="${mode}"]`)?.focus({ preventScroll: true });
     };
   });
 }

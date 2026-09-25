@@ -4,6 +4,7 @@ import { captureFocusIntent } from './focus-intent.js';
 import { createTrackedPixelWheelHandler } from './terminal-scroll.js';
 import { createTerminalProfiler } from './terminal-profile.js';
 import { getTerminalRendererPreference, rendererTrialExpiry, terminalRendererKey } from './terminal-renderer.js';
+import { createTypingPredictor } from './predict-typing.js';
 
 const encoder = new TextEncoder();
 
@@ -185,6 +186,20 @@ export function mountTerminal(container, pane, options = {}) {
     capture: (value) => { profileCapture = value; },
     status: (value) => { profileNote = value; note(); },
   });
+  // Draws a typed character before its echo returns from a pane on another node.
+  // It only ever writes to this xterm; what reaches the PTY is unchanged. The
+  // console names a pane on another node `<id>@<node>` and the daemon node's own
+  // by its bare id, and `@` is outside the host's pane-id alphabet.
+  const predictor = createTypingPredictor({
+    terminal,
+    remote: () => pane.includes('@'),
+    now: () => performance.now(),
+  });
+  let composing = false;
+  // Output chunks received but not yet parsed. The predictor looks at the prompt
+  // line only once the last of them has parsed, so a render split across websocket
+  // frames is never read half-drawn.
+  let queuedOutput = 0;
   const trackpadWheel = createTrackedPixelWheelHandler(terminal, {
     active: () => !disposed && !document.hidden && presented && isVisible()
       && socket?.readyState === WebSocket.OPEN && replayDone,
@@ -445,10 +460,13 @@ export function mountTerminal(container, pane, options = {}) {
       if (typeof event.data !== 'string') {
         const bytes = new Uint8Array(event.data);
         const capture = profileCapture;
-        if (capture) {
-          const output = capture.outputReceived(bytes.byteLength);
-          terminal.write(bytes, () => capture.outputParsed(output));
-        } else terminal.write(bytes);
+        const output = capture?.outputReceived(bytes.byteLength);
+        queuedOutput++;
+        terminal.write(bytes, () => {
+          queuedOutput--;
+          if (capture) capture.outputParsed(output);
+          predictor.outputParsed(queuedOutput === 0);
+        });
         if (replayDone) markHealthy();
         return;
       }
@@ -466,6 +484,7 @@ export function mountTerminal(container, pane, options = {}) {
         // The bridge guarantees this precedes the serialized snapshot, so stale
         // local scrollback cannot be doubled when the host reconnects after reload.
         terminal.reset();
+        predictor.reset();
         expandingHistory = false;
         moreHistory = message.history?.truncated === true;
         setPaneState(message.pane);
@@ -556,7 +575,14 @@ export function mountTerminal(container, pane, options = {}) {
     socket.send(JSON.stringify({ t: 'reply', data: base64Bytes(bytes) }));
   };
   const sendInput = (data, options) => sendBytes(encoder.encode(data), options);
-  terminal.onData((data) => sendInput(data, { user: performance.now() <= userInputUntil }));
+  terminal.onData((data) => {
+    const user = performance.now() <= userInputUntil;
+    // The prediction is written before the keystroke is sent so it is queued ahead
+    // of any output that answers it. A snapshot still parsing has no settled cursor
+    // to predict from.
+    if (user && replayDone && !exited) predictor.keystroke(data, { composing });
+    sendInput(data, { user });
+  });
   // Legacy mouse reports arrive through onBinary because their coordinate bytes
   // are not UTF-8. Preserve each byte when forwarding them to the PTY.
   terminal.onBinary((data) => sendBytes(
@@ -610,7 +636,12 @@ export function mountTerminal(container, pane, options = {}) {
     report: (message) => { statusNote.textContent = message; },
   }), true);
   terminal.textarea?.addEventListener('paste', markInsertedInput, true);
-  terminal.textarea?.addEventListener('compositionend', markInsertedInput, true);
+  // An IME draws its own composition view; a prediction under it would be a second copy.
+  terminal.textarea?.addEventListener('compositionstart', () => { composing = true; }, true);
+  terminal.textarea?.addEventListener('compositionend', (event) => {
+    composing = false;
+    markInsertedInput(event);
+  }, true);
   terminal.textarea?.addEventListener('input', markInsertedInput, true);
   // Mouse motion and focus reports bypass the wheel frame queue in xterm. Clear
   // delayed wheel reports in capture phase so they cannot overtake either one.

@@ -9,7 +9,8 @@ const imagePasteSource = fs.readFileSync(path.join(__dirname, '../web/app/image-
 const terminalScrollSource = fs.readFileSync(path.join(__dirname, '../web/app/terminal-scroll.js'), 'utf8').replace(/^export /gm, '');
 const terminalProfileSource = fs.readFileSync(path.join(__dirname, '../web/app/terminal-profile.js'), 'utf8').replace(/^export /gm, '');
 const terminalRendererSource = fs.readFileSync(path.join(__dirname, '../web/app/terminal-renderer.js'), 'utf8').replace(/^export /gm, '');
-const source = imagePasteSource + '\n' + terminalScrollSource + '\n' + terminalProfileSource + '\n' + terminalRendererSource + '\n' + fs.readFileSync(path.join(__dirname, '../web/app/terminal.js'), 'utf8')
+const predictTypingSource = fs.readFileSync(path.join(__dirname, '../web/app/predict-typing.js'), 'utf8').replace(/^export /gm, '');
+const source = imagePasteSource + '\n' + terminalScrollSource + '\n' + terminalProfileSource + '\n' + terminalRendererSource + '\n' + predictTypingSource + '\n' + fs.readFileSync(path.join(__dirname, '../web/app/terminal.js'), 'utf8')
   .replace(/^import .*;\n/gm, '').replace('export function mountTerminal', 'function mountTerminal');
 
 test('Triage and Watch move one terminal viewer instead of retaining a hidden primary', () => {
@@ -107,6 +108,7 @@ function fixture(options = {}) {
   const frames = new Map();
   let frameId = 0;
   let now = options.now ?? 1_000_000;
+  let perf = 1;
   class FakeDate extends Date {
     static now() { return now; }
   }
@@ -132,7 +134,7 @@ function fixture(options = {}) {
     ResizeObserver: class { observe() {} disconnect() {} },
     sessionStorage: { getItem: () => 'viewer' }, localStorage,
     location: { protocol: 'http:', host: 'localhost' },
-    performance: { now: () => 1 },
+    performance: { now: () => perf },
     getComputedStyle: () => ({ paddingLeft: '8', paddingRight: '8', paddingTop: '8', paddingBottom: '0' }),
     resolvedTheme() {}, getPalette() {}, xtermTheme: () => ({}),
     captureFocusIntent: () => () => true,
@@ -148,13 +150,14 @@ function fixture(options = {}) {
     cancelAnimationFrame(id) { frames.delete(id); },
   });
   vm.runInContext(source, context);
-  const mounted = context.mountTerminal(new Element(), 'pane', { focus: true, onExit: () => { exits++; } });
+  const paneId = options.paneId ?? 'pane';
+  const mounted = context.mountTerminal(new Element(), paneId, { focus: true, onExit: () => { exits++; } });
   const socket = mounted.socket;
   const message = (value) => socket.onmessage({ data: JSON.stringify(value) });
   socket.onopen();
   message({
     t: 'attached',
-    pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 50, ...options.pane },
+    pane: { id: paneId, primary: 'viewer', cols: 80, rows: 50, ...options.pane },
     ...(options.history ? { history: options.history } : {}),
   });
   const drain = () => new Promise((resolve) => terminal.write('', resolve));
@@ -166,6 +169,7 @@ function fixture(options = {}) {
       for (const fn of pending) fn();
     },
     setNow(value) { now = value; },
+    setPerf(value) { perf = value; },
     get fits() { return fits; }, get exits() { return exits; },
     storage, setPreference: context.setTerminalRendererPreference,
     get refreshes() { return refreshes; }, get webglLoads() { return webglLoads; }, get webglDisposals() { return webglDisposals; },
@@ -762,5 +766,76 @@ test('observer fitting converges with rounded cell heights and grows only after 
     settleTimers();
     assert.ok(f.terminal.options.fontSize > 8.25);
     assert.equal(f.socket.sent.length, 0, 'observer sizing never resizes the live process');
+  } finally { f.mounted.dispose(); }
+});
+
+const hostOutput = (f, text) => f.socket.onmessage({ data: new TextEncoder().encode(text).buffer });
+
+test('a typed character is drawn as a prediction before it is sent, and the bytes sent are unchanged', async () => {
+  const f = fixture({ storage: new Map([['keep.console.predictTyping', 'on']]) });
+  try {
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    hostOutput(f, '\x1b[2J\x1b[H❯ ');
+    await f.drain();
+    f.socket.sent.length = 0;
+    f.terminal.keyHandler({ type: 'keydown', key: 'x' });
+    f.terminal.input('x', true);
+    assert.deepEqual([...f.socket.sent.at(-1)], [0x78], 'the PTY gets exactly the typed byte');
+    await f.drain();
+    const line = f.terminal.buffer.active.getLine(0);
+    assert.equal(line.translateToString(true), '❯ x');
+    assert.ok(line.getCell(2).isDim());
+    hostOutput(f, '\r❯ x\x1b[K');
+    await f.drain();
+    assert.ok(!f.terminal.buffer.active.getLine(0).getCell(2).isDim(), 'the echo replaces the guess');
+
+    f.terminal.keyHandler({ type: 'keydown', key: 'Enter' });
+    f.terminal.input('\r', true);
+    await f.drain();
+    assert.equal(f.terminal.buffer.active.cursorX, 3, 'Enter is sent, not predicted');
+  } finally { f.mounted.dispose(); }
+});
+
+test('the default setting predicts nothing on a pane of the daemon node', async () => {
+  const f = fixture();
+  try {
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    hostOutput(f, '\x1b[2J\x1b[H❯ ');
+    await f.drain();
+    f.terminal.keyHandler({ type: 'keydown', key: 'x' });
+    f.terminal.input('x', true);
+    await f.drain();
+    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), '❯ ');
+  } finally { f.mounted.dispose(); }
+});
+
+test('auto starts predicting on a pane of another node once its echo is measured slow', async () => {
+  const f = fixture({ paneId: 'pane@remote' });
+  try {
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    hostOutput(f, '\x1b[2J\x1b[H❯ ');
+    await f.drain();
+    let clock = 1000;
+    let typed = '';
+    const drawn = [];
+    for (const ch of 'abcd') {
+      f.setPerf(clock);
+      f.terminal.keyHandler({ type: 'keydown', key: ch });
+      f.terminal.input(ch, true);
+      await f.drain();
+      drawn.push(f.terminal.buffer.active.getLine(0).getCell(2 + typed.length).isDim() !== 0);
+      typed += ch;
+      clock += 120;
+      f.setPerf(clock);
+      hostOutput(f, `\r❯ ${typed}\x1b[K`);
+      await f.drain();
+      clock += 200;
+    }
+    assert.deepEqual(drawn, [false, false, false, true], 'three slow echoes, then the fourth key is predicted');
+    assert.deepEqual(f.socket.sent.filter(data => typeof data !== 'string').map(data => new TextDecoder().decode(data)),
+      ['a', 'b', 'c', 'd'], 'every keystroke reached the pane unchanged');
   } finally { f.mounted.dispose(); }
 });
