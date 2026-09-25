@@ -65,11 +65,15 @@ test('scanner resolves aliases, destructuring, reexports, and helper calls', () 
       io.copy = () => true;
       let logical;
       logical ||= fs.openSync;
+      const logicalChoice = (() => true) && fs.mkdtempSync;
+      const conditionalChoice = Math.random() > 2 ? (() => true) : fs.chmodSync;
+      const sequenceChoice = (0, fs.fdatasyncSync);
       const helper = require('../helper');
       function routes() {
         read('x'); reassigned('x'); run('x'); wait(new Int32Array(1), 0); helper.go();
         overwritten('x'); overwritten = () => true;
         io.copy('from', 'to'); logical('x');
+        logicalChoice('x'); conditionalChoice('x'); sequenceChoice(1);
       }
       module.exports = { routes };
     `,
@@ -81,7 +85,7 @@ test('scanner resolves aliases, destructuring, reexports, and helper calls', () 
     `,
   });
   assert.deepEqual(analysis.sinks.map((item) => item.operation).sort(), [
-    'Atomics.wait', 'child_process.spawnSync', 'fs.accessSync', 'fs.copyFileSync', 'fs.openSync', 'fs.readFileSync', 'fs.realpathSync', 'fs.statSync',
+    'Atomics.wait', 'child_process.spawnSync', 'fs.accessSync', 'fs.chmodSync', 'fs.copyFileSync', 'fs.fdatasyncSync', 'fs.mkdtempSync', 'fs.openSync', 'fs.readFileSync', 'fs.realpathSync', 'fs.statSync',
   ]);
   assert.ok(analysis.edges.some((edge) => edge.caller.endsWith('::routes') && edge.callee.endsWith('::go')));
 });

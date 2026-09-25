@@ -361,12 +361,22 @@ function createAnalyzer(root) {
     if (node.type === 'ObjectExpression') return { type: 'object', node, module, scope };
     if (node.type === 'LogicalExpression') {
       const left = resolveExpr(node.left, module, scope, seen);
-      return left.type === 'unknown' ? resolveExpr(node.right, module, scope, seen) : left;
+      const right = resolveExpr(node.right, module, scope, new Set(seen));
+      return combineResolved([left, right]);
     }
     if (node.type === 'ConditionalExpression') {
       const yes = resolveExpr(node.consequent, module, scope, seen);
-      const no = resolveExpr(node.alternate, module, scope, seen);
-      return yes.type === 'unknown' ? no : yes;
+      const no = resolveExpr(node.alternate, module, scope, new Set(seen));
+      return combineResolved([yes, no]);
+    }
+    if (node.type === 'SequenceExpression') return resolveExpr(node.expressions.at(-1), module, scope, seen);
+    if (node.type === 'ChainExpression') return resolveExpr(node.expression, module, scope, seen);
+    if (node.type === 'AssignmentExpression' && node.operator === '=') return resolveExpr(node.right, module, scope, seen);
+    if (node.type === 'AssignmentExpression' && ['||=', '&&=', '??='].includes(node.operator)) {
+      return combineResolved([
+        resolveExpr(node.left, module, scope, seen),
+        resolveExpr(node.right, module, scope, new Set(seen)),
+      ]);
     }
     if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression'
         && staticProperty(node.callee) === 'bind') {
