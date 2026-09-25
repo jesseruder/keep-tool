@@ -356,7 +356,9 @@ test('a refusal from the daemon is said as one, not as the command\'s output', a
 test('a command that is not registry-class still refuses, and without a daemon URL nothing is posted', async (t) => {
   const daemon = await stubDaemon(t, () => ({ status: 500, body: {} }));
   const { root, env } = nodeEnv(t);
-  for (const argv of [['handoff', 'card'], ['sync'], ['artifact', 'card'], ['serve']]) {
+  // keep artifact is not registry-class either, but a node with a URL posts its files
+  // to /api/artifact (see the tests at the end); without a URL it refuses as these do.
+  for (const argv of [['handoff', 'card'], ['sync'], ['serve']]) {
     const result = await run(argv, { env: { ...env, KEEP_DAEMON_URL: daemon.url }, cwd: root });
     assert.equal(result.status, 2, argv.join(' '));
     assert.equal(result.stderr, `keep ${argv[0]}: the registry lives on node main; this is node aws1\n`);
@@ -364,6 +366,9 @@ test('a command that is not registry-class still refuses, and without a daemon U
   const plain = await run(['show', 'card'], { env, cwd: root });
   assert.equal(plain.status, 2);
   assert.equal(plain.stderr, 'keep show: the registry lives on node main; this is node aws1\n');
+  const artifact = await run(['artifact', 'card'], { env, cwd: root });
+  assert.equal(artifact.status, 2);
+  assert.equal(artifact.stderr, 'keep artifact: the registry lives on node main; this is node aws1\n');
   assert.equal(daemon.requests.length, 0);
   // On the daemon node a URL in the environment changes nothing.
   const { remoteMode } = require('./remote-cli.js');
@@ -536,4 +541,100 @@ test('a tell naming a file on the node, or waiting past a day, is refused on the
     code: 2, stdout: '', stderr: 'keep tell: --wait on a forwarded tell is at most 24h\n',
   });
   assert.equal(sent.length, 0);
+});
+
+// ---- keep artifact from a node (bin/artifact-route.js is the daemon's side) ----
+
+test('keep artifact from a node reads its files and posts their bytes, and prints the daemon\'s answer', async (t) => {
+  const crypto = require('node:crypto');
+  const daemon = await stubDaemon(t, () => ({ status: 200, body: { ok: true, status: 0, stdout: '/registry/.keep/artifacts/card/shot.png\n', stderr: '', replayed: false } }));
+  const { root, env } = nodeEnv(t, { CLAUDE_CODE_SESSION_ID: 'sess-aws1', KEEP_PANE: 'p7' });
+  env.HOME = root;
+  env.KEEP_DAEMON_URL = daemon.url;
+  fs.mkdirSync(path.join(root, 'shots'));
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 3]);
+  fs.writeFileSync(path.join(root, 'shots', 'shot.png'), png);
+  const result = await run(['artifact', 'card', 'shots/shot.png', '-m', 'the login screen'], { env, cwd: root });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, '/registry/.keep/artifacts/card/shot.png\n');
+  assert.equal(daemon.requests.length, 1);
+  const [request] = daemon.requests;
+  assert.equal(request.url, '/api/artifact');
+  assert.equal(request.headers['x-keep-node-token'], 'aws1-secret');
+  const { idempotencyKey, ...rest } = request.body;
+  assert.match(idempotencyKey, /^[a-f0-9]{32}$/);
+  assert.deepEqual(rest, {
+    command: 'artifact', cwd: root, nodeCwd: root, session: 'sess-aws1', agent: 'claude', pane: 'p7@aws1',
+    card: 'card', note: 'the login screen',
+    files: [{
+      name: 'shot.png', size: png.length, sha256: crypto.createHash('sha256').update(png).digest('hex'),
+      source: path.join(root, 'shots', 'shot.png'), content: png.toString('base64'),
+    }],
+  });
+  // A listing posts no files and prints the daemon's list.
+  const listed = await run(['artifact', 'card'], { env, cwd: root });
+  assert.equal(listed.status, 0, listed.stderr);
+  assert.deepEqual(daemon.requests[1].body.files, []);
+  assert.equal(daemon.requests[1].body.note, null);
+});
+
+test('keep artifact from a node refuses a file outside home, not a regular file, or too large before posting', async (t) => {
+  const { runArtifact } = require('./remote-cli.js');
+  const { ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES } = require('./registry-commands.js');
+  const home = tempDir(t);
+  const elsewhere = tempDir(t);
+  const sent = [];
+  const request = async (url, pathname, options) => {
+    sent.push({ pathname, options });
+    return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: 'stored\n', stderr: '' }) };
+  };
+  const deps = { where: { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, request, token: 't', env: {}, cwd: home, home };
+  fs.writeFileSync(path.join(elsewhere, 'secret.txt'), 'x');
+  const outside = await runArtifact(['card', path.join(elsewhere, 'secret.txt')], deps);
+  assert.equal(outside.code, 2);
+  assert.match(outside.stderr, /^keep artifact: .*secret\.txt is outside this node's home directory/);
+  // A link inside home is judged by where it leads.
+  fs.symlinkSync(path.join(elsewhere, 'secret.txt'), path.join(home, 'link.txt'));
+  assert.match((await runArtifact(['card', 'link.txt'], deps)).stderr, /outside this node's home directory/);
+  fs.mkdirSync(path.join(home, 'dir'));
+  assert.match((await runArtifact(['card', 'dir'], deps)).stderr, /artifact is not a regular file: .*dir/);
+  assert.match((await runArtifact(['card', 'missing.png'], deps)).stderr, /artifact file does not exist: .*missing\.png/);
+  fs.writeFileSync(path.join(home, 'big.bin'), Buffer.alloc(ARTIFACT_FILE_MAX_BYTES + 1));
+  assert.match((await runArtifact(['card', 'big.bin'], deps)).stderr, /artifact too large: .*big\.bin \(5\.0 MB\)/);
+  // Each under the per-file bound, together over the per-command one.
+  const count = Math.floor(ARTIFACT_COMMAND_MAX_BYTES / ARTIFACT_FILE_MAX_BYTES) + 1;
+  const names = [];
+  for (let i = 0; i < count; i += 1) {
+    names.push(`part-${i}.bin`);
+    fs.writeFileSync(path.join(home, names[i]), Buffer.alloc(ARTIFACT_FILE_MAX_BYTES));
+  }
+  assert.match((await runArtifact(['card', ...names], deps)).stderr, /larger than 20 MB together/);
+  assert.equal(sent.length, 0, 'nothing was posted');
+
+  // A file that passes is posted once, with a bound that grows with its size.
+  fs.writeFileSync(path.join(home, 'ok.txt'), 'hello');
+  const ok = await runArtifact(['card', 'ok.txt'], deps);
+  assert.deepEqual(ok, { code: 0, stdout: 'stored\n', stderr: '' });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].pathname, '/api/artifact');
+  const { artifactTimeoutMs, REQUEST_TIMEOUT_MS } = require('./remote-cli.js');
+  assert.equal(sent[0].options.timeoutMs, artifactTimeoutMs(5));
+  assert.ok(artifactTimeoutMs(ARTIFACT_COMMAND_MAX_BYTES) > REQUEST_TIMEOUT_MS + 60e3);
+  assert.ok(artifactTimeoutMs(ARTIFACT_COMMAND_MAX_BYTES) < REQUEST_TIMEOUT_MS + 180e3);
+});
+
+test('keep artifact from a node prints the daemon\'s refusal as the daemon\'s, and its failing CLI as it is', async (t) => {
+  const { runArtifact } = require('./remote-cli.js');
+  const home = tempDir(t);
+  fs.writeFileSync(path.join(home, 'a.txt'), 'a');
+  const answers = [
+    { status: 404, data: JSON.stringify({ error: 'no task "card" on the daemon — try `keep list`' }) },
+    { status: 200, data: JSON.stringify({ ok: false, status: 1, stdout: '', stderr: 'keep: something failed\n' }) },
+  ];
+  const request = async () => answers.shift();
+  const deps = { where: { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, request, token: 't', env: {}, cwd: home, home };
+  assert.deepEqual(await runArtifact(['card', 'a.txt'], deps), {
+    code: 2, stdout: '', stderr: 'keep artifact: the daemon on main refused: no task "card" on the daemon — try `keep list`\n',
+  });
+  assert.deepEqual(await runArtifact(['card', 'a.txt'], deps), { code: 1, stdout: '', stderr: 'keep: something failed\n' });
 });

@@ -248,6 +248,12 @@ async function runRemote(command, args, deps = {}) {
   } catch (error) {
     return { code: 2, stdout: '', stderr: `keep ${command}: ${error.message}\n` };
   }
+  return answerOf(command, where, response);
+}
+
+// What the daemon's answer to a forwarded command prints: its CLI's output and exit
+// status when it ran, or the daemon's refusal named as the daemon's.
+function answerOf(command, where, response) {
   const value = parsed(response);
   if ((response.status === 200 || response.status === 504) && value && Number.isInteger(value.status)) {
     // The command ran but the daemon could not record its answer, so a resend of
@@ -263,6 +269,89 @@ async function runRemote(command, args, deps = {}) {
   }
   const why = value && value.error ? value.error : `HTTP ${response.status}`;
   return { code: 2, stdout: '', stderr: `keep ${command}: the daemon on ${where.daemon} refused: ${why}\n` };
+}
+
+// A slow link the node allows for when it bounds an artifact post: the files go
+// base64-encoded in one request, and a daemon reading them over a thin tunnel is not
+// a daemon that went away. At this rate the 20 MiB command bound adds under two
+// minutes to the ordinary post bound.
+const ARTIFACT_LINK_BYTES_PER_SECOND = 256 * 1024;
+
+function artifactTimeoutMs(bytes) {
+  return REQUEST_TIMEOUT_MS + Math.ceil((Math.ceil(bytes * 4 / 3) / ARTIFACT_LINK_BYTES_PER_SECOND) * 1000);
+}
+
+// `keep artifact <card> [--] [<file>...] [-m "note"]` on a pane-only node. The files
+// are here, not on the daemon, so this reads them and posts their bytes to the
+// daemon's /api/artifact (bin/artifact-route.js), which stores them with its own CLI.
+// Refused here, before anything is posted: a path that is not a regular file under
+// this node's home directory (a symbolic link is followed, and judged by where it
+// leads), and files past the bounds in registry-commands.js. The name the daemon
+// stores is the one this CLI would: the basename of the path as given.
+//
+// Resolves { code, stdout, stderr } like runRemote. Throws the CLI's own KeepError
+// for a usage mistake, which keep.js prints as it would any other.
+async function runArtifact(argv, deps = {}) {
+  const env = deps.env || process.env;
+  const where = deps.where || remoteMode(env);
+  const cwd = deps.cwd || process.cwd();
+  const io = deps.io || require('node:fs');
+  const home = deps.home || env.HOME || require('node:os').homedir();
+  const path = require('node:path');
+  const limits = require('./registry-commands.js');
+  const core = require('./keep-core.js');
+  const o = core.parseArgs(argv, {});
+  const [card, ...inputs] = o._;
+  if (!card) core.die('usage: keep artifact <card> [--] [<file>...] [-m "note"]');
+  if (!/^[A-Za-z0-9_-]+$/.test(card)) core.die(`invalid artifact card id "${card}"`);
+  const refused = (why) => ({ code: 2, stdout: '', stderr: `keep artifact: ${why}\n` });
+  if (o.m != null && Buffer.byteLength(o.m) > limits.MAX_ARG_BYTES) return refused(`the note is longer than ${limits.MAX_ARG_BYTES} bytes`);
+  if (inputs.length > limits.ARTIFACT_MAX_FILES) return refused(`at most ${limits.ARTIFACT_MAX_FILES} files per keep artifact`);
+  let realHome;
+  try { realHome = io.realpathSync(home); } catch { return refused(`cannot resolve this node's home directory ${home}`); }
+  const files = [];
+  let total = 0;
+  for (const input of inputs) {
+    const source = path.resolve(cwd, input);
+    let real;
+    try { real = io.realpathSync(source); } catch { return refused(`artifact file does not exist: ${source}`); }
+    const inside = path.relative(realHome, real);
+    if (!inside || inside.startsWith('..') || path.isAbsolute(inside)) {
+      return refused(`${source} is outside this node's home directory ${home}; only files under it are sent to the daemon`);
+    }
+    let stat;
+    try { stat = io.statSync(real); } catch { return refused(`artifact file does not exist: ${source}`); }
+    if (!stat.isFile()) return refused(`artifact is not a regular file: ${source}`);
+    const tooLarge = (size) => refused(`artifact too large: ${source} (${(size / 1024 / 1024).toFixed(1)} MB); trim or compress it before storing`);
+    if (stat.size > limits.ARTIFACT_FILE_MAX_BYTES) return tooLarge(stat.size);
+    const name = path.basename(source);
+    const nameRefusal = limits.artifactNameRefusal(name);
+    if (nameRefusal) return refused(nameRefusal);
+    let bytes;
+    try { bytes = io.readFileSync(real); } catch (error) { return refused(`cannot read ${source}: ${error.message}`); }
+    // Read once and judged on what was read: a file still being written may have grown.
+    if (bytes.length > limits.ARTIFACT_FILE_MAX_BYTES) return tooLarge(bytes.length);
+    total += bytes.length;
+    if (total > limits.ARTIFACT_COMMAND_MAX_BYTES) {
+      return refused(`the files are larger than ${limits.ARTIFACT_COMMAND_MAX_BYTES / 1024 / 1024} MB together; store them in more than one keep artifact`);
+    }
+    files.push({
+      name, size: bytes.length, sha256: require('node:crypto').createHash('sha256').update(bytes).digest('hex'),
+      source, content: bytes.toString('base64'),
+    });
+  }
+  let response;
+  try {
+    daemonBase(where.url);
+    const identity = registryBody('artifact', [], { env, cwd, where, key: deps.key, canonical: deps.canonical });
+    delete identity.args;
+    const payload = { ...identity, card, note: o.m != null ? o.m : null, files };
+    response = await postWithRetry(where, '/api/artifact', payload,
+      { ...deps, env, label: 'keep artifact', timeoutMs: deps.timeoutMs || artifactTimeoutMs(total) });
+  } catch (error) {
+    return refused(error.message);
+  }
+  return answerOf('artifact', where, response);
 }
 
 // Asks the daemon to deploy its own checkout of `project` at `sha`, and says what
@@ -305,5 +394,5 @@ async function deploySelf(where, { sha, project }, deps = {}) {
 module.exports = {
   deploySelf,
   REQUEST_TIMEOUT_MS, RETRY_WAITS_MS, RESEND_HORIZON_MS, remoteMode, daemonBase, nodeToken, nodeApiRequest, registryBody, postWithRetry, runRemote, parsed,
-  requestTimeoutMs,
+  requestTimeoutMs, runArtifact, artifactTimeoutMs, answerOf, ARTIFACT_LINK_BYTES_PER_SECOND,
 };

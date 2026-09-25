@@ -1184,6 +1184,21 @@ function filesIdentical(left, right) {
     && fs.readFileSync(left).equals(fs.readFileSync(right));
 }
 
+// Where each stored file came from, for the card log. A node's files reach this CLI
+// as the daemon's temporary copies (bin/artifact-route.js), which are gone once it
+// exits; the route passes the node's own paths in KEEP_ARTIFACT_SOURCES, one per
+// file, and the log names those, with the node, instead. It is read only under
+// KEEP_REMOTE_CALLER, which only the daemon's route sets, and only when it fits.
+function artifactOrigins(sources, env = process.env) {
+  const caller = env.KEEP_REMOTE_CALLER;
+  if (!caller || !env.KEEP_ARTIFACT_SOURCES) return sources;
+  let named;
+  try { named = JSON.parse(env.KEEP_ARTIFACT_SOURCES); } catch { return sources; }
+  if (!Array.isArray(named) || named.length !== sources.length
+    || !named.every((value) => typeof value === 'string' && value && !/[\r\n\0]/.test(value))) return sources;
+  return named.map((value) => `${caller}:${value}`);
+}
+
 commands.artifact = (argv, deps = {}) => {
   const o = parseArgs(argv, {});
   const [id, ...inputs] = o._;
@@ -1201,7 +1216,8 @@ commands.artifact = (argv, deps = {}) => {
   }
 
   const sources = inputs.map((input) => path.resolve(input));
-  const limit = 5 * 1024 * 1024;
+  const limit = require('./registry-commands.js').ARTIFACT_FILE_MAX_BYTES;
+  const origins = artifactOrigins(sources);
   for (const source of sources) {
     let stat;
     try { stat = fs.statSync(source); }
@@ -1264,8 +1280,8 @@ commands.artifact = (argv, deps = {}) => {
       throw error;
     }
 
-    const text = results.map(({ source, destination, created }) =>
-      `${created ? 'Stored' : 'Already stored'} ${destination} (from ${source})`).join('\n');
+    const text = results.map(({ source, destination, created }, index) =>
+      `${created ? 'Stored' : 'Already stored'} ${destination} (from ${origins[index]})`).join('\n');
     appendLog(task, 'artifact', o.m != null ? `${text}\n${o.m}` : text);
     saveTask(task);
     const paths = [...new Set([
@@ -4134,6 +4150,15 @@ if (require.main === module) {
       }
       if (remote && cmd === 'land') {
         await landRemote(rest, remote);
+        return;
+      }
+      // Its files are on this node: they are read here and their bytes posted to the
+      // daemon, which stores them with its own CLI (bin/artifact-route.js).
+      if (remote && cmd === 'artifact') {
+        const result = await require('./remote-cli.js').runArtifact(rest, { where: remote });
+        if (result.stdout) process.stdout.write(result.stdout);
+        if (result.stderr) process.stderr.write(result.stderr);
+        process.exitCode = result.code;
         return;
       }
       // Before the registry is even looked for: on a pane-only node the answer is

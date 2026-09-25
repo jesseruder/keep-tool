@@ -1,0 +1,229 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const { EventEmitter } = require('node:events');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+
+const { createRegistryService } = require('./registry-route.js');
+const { createArtifactService } = require('./artifact-route.js');
+const { ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES } = require('./registry-commands.js');
+
+const AWS1 = { class: 'node', node: 'aws1' };
+const KEY = 'a-0123456789abcdef';
+
+function tempDir(t, prefix = 'keep-artifact-route-') {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+// A child process stand-in that records what it was asked to run and, while the
+// daemon's temporary copies still exist, what they held.
+function fakeSpawn(answer = () => ({ code: 0, stdout: 'stored\n', stderr: '' })) {
+  const calls = [];
+  const spawn = (file, args, options) => {
+    const copies = args.slice(args.indexOf('--') + 2).map((copy) => ({ copy, bytes: fs.readFileSync(copy) }));
+    calls.push({ file, args, options, copies });
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => { setImmediate(() => child.emit('close', null, 'SIGKILL')); };
+    const result = answer({ file, args, options });
+    setImmediate(() => {
+      if (result.stdout) child.stdout.emit('data', Buffer.from(result.stdout));
+      if (result.stderr) child.stderr.emit('data', Buffer.from(result.stderr));
+      child.emit('close', result.code, null);
+    });
+    return child;
+  };
+  return { spawn, calls };
+}
+
+function services(t, overrides = {}) {
+  const root = overrides.root || tempDir(t);
+  fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+  if (!overrides.noCard) fs.writeFileSync(path.join(root, 'tasks', 'some-card.md'), '---\ntitle: Some card\n---\n');
+  const tmpRoot = tempDir(t, 'keep-artifact-tmp-');
+  const fake = overrides.fake || fakeSpawn(overrides.answer);
+  const registry = createRegistryService({
+    root,
+    ...(overrides.realSpawn ? {} : { spawn: fake.spawn }),
+    daemonNode: () => 'main',
+    location: (id) => ({ 'sess-aws1': { node: 'aws1', agent: 'claude' }, 'sess-main': { node: 'main', agent: 'claude' } })[id] || null,
+    env: overrides.env || { PATH: '/usr/bin:/bin', HOME: root, LANG: 'C' },
+    configFile: path.join(root, 'config.json'),
+  });
+  const artifacts = createArtifactService({ registry, tmpRoot });
+  return { registry, artifacts, root, tmpRoot, calls: fake.calls };
+}
+
+function fileOf(name, bytes, extra = {}) {
+  const content = Buffer.from(bytes);
+  return {
+    name, size: content.length, sha256: crypto.createHash('sha256').update(content).digest('hex'),
+    content: content.toString('base64'), source: `/home/someone/shots/${name}`, ...extra,
+  };
+}
+
+function body(root, extra = {}) {
+  return {
+    card: 'some-card', note: 'the login screen', files: [fileOf('shot.png', 'png bytes')],
+    cwd: root, session: 'sess-aws1', agent: 'claude', idempotencyKey: KEY, ...extra,
+  };
+}
+
+test('the daemon writes each file under its own name, runs its own keep artifact as the node\'s session, and removes the copies', async (t) => {
+  const { artifacts, root, tmpRoot, calls } = services(t, { answer: () => ({ code: 0, stdout: '/r/.keep/artifacts/some-card/shot.png\n', stderr: '' }) });
+  const files = [fileOf('shot.png', 'first'), fileOf('shot.png', 'second, from another directory'), fileOf('notes.txt', 'text')];
+  const answer = await artifacts.handle(AWS1, body(root, { files, pane: 'p3@aws1' }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(answer.body.status, 0);
+  assert.equal(answer.body.stdout, '/r/.keep/artifacts/some-card/shot.png\n');
+  assert.equal(calls.length, 1);
+  const [call] = calls;
+  const dashes = call.args.indexOf('--');
+  assert.deepEqual(call.args.slice(1, dashes + 2), ['artifact', '-m', 'the login screen', '--', 'some-card']);
+  assert.deepEqual(call.copies.map(({ copy }) => path.basename(copy)), ['shot.png', 'shot.png', 'notes.txt'],
+    'each copy keeps the name it had on the node');
+  assert.deepEqual(call.copies.map(({ bytes }) => bytes.toString()), ['first', 'second, from another directory', 'text']);
+  for (const { copy } of call.copies) assert.ok(copy.startsWith(`${tmpRoot}${path.sep}`));
+  assert.equal(call.options.cwd, root);
+  assert.equal(call.options.env.CLAUDE_CODE_SESSION_ID, 'sess-aws1');
+  assert.equal(call.options.env.KEEP_REMOTE_CALLER, 'aws1');
+  assert.equal(call.options.env.KEEP_PANE, 'p3@aws1');
+  assert.deepEqual(JSON.parse(call.options.env.KEEP_ARTIFACT_SOURCES), files.map((file) => file.source));
+  assert.deepEqual(fs.readdirSync(tmpRoot), [], 'the temporary copies are gone');
+  // A listing carries no files and no note.
+  const listed = await artifacts.handle(AWS1, body(root, { files: [], note: null, idempotencyKey: `${KEY}-list` }));
+  assert.equal(listed.status, 200);
+  assert.deepEqual(calls[1].args.slice(1), ['artifact', '--', 'some-card']);
+});
+
+test('only a node, or the daemon\'s own callers, may post an artifact', async (t) => {
+  const { artifacts, root, calls } = services(t);
+  assert.deepEqual(await artifacts.handle(null, body(root)), { status: 403, body: { error: 'unauthorized' } });
+  assert.deepEqual(await artifacts.handle({ class: 'proxy' }, body(root)), { status: 403, body: { error: 'unauthorized' } });
+  assert.deepEqual(await artifacts.handle({ class: 'node', node: 'main' }, body(root)), { status: 403, body: { error: 'unauthorized' } });
+  // A node acts only for its own sessions and panes.
+  assert.equal((await artifacts.handle(AWS1, body(root, { session: 'sess-main' }))).status, 403);
+  assert.equal((await artifacts.handle(AWS1, body(root, { pane: 'p1@main' }))).status, 403);
+  assert.equal(calls.length, 0);
+});
+
+test('a file whose bytes do not match its sha256 or size is refused, and nothing is journalled or run', async (t) => {
+  const { artifacts, root, calls } = services(t);
+  const damaged = { ...fileOf('shot.png', 'png bytes'), content: Buffer.from('png bytez').toString('base64') };
+  const mismatch = await artifacts.handle(AWS1, body(root, { files: [damaged] }));
+  assert.equal(mismatch.status, 400);
+  assert.match(mismatch.body.error, /shot\.png: sha256 mismatch/);
+  const short = await artifacts.handle(AWS1, body(root, { files: [{ ...fileOf('shot.png', 'png bytes'), size: 3 }] }));
+  assert.equal(short.status, 400);
+  assert.match(short.body.error, /9 bytes arrived, 3 were sent/);
+  const notBase64 = await artifacts.handle(AWS1, body(root, { files: [{ ...fileOf('shot.png', 'x'), content: '!!!!' }] }));
+  assert.match(notBase64.body.error, /must be base64/);
+  assert.equal(calls.length, 0);
+  assert.equal(fs.existsSync(path.join(root, '.keep', 'registry-ops')), false);
+});
+
+test('files past the per-file, per-command or count bound are refused', async (t) => {
+  const { artifacts, root, calls } = services(t);
+  const big = await artifacts.handle(AWS1, body(root, { files: [fileOf('big.bin', Buffer.alloc(ARTIFACT_FILE_MAX_BYTES + 1))] }));
+  assert.equal(big.status, 413);
+  assert.match(big.body.error, /artifact too large: big\.bin/);
+  const count = Math.floor(ARTIFACT_COMMAND_MAX_BYTES / ARTIFACT_FILE_MAX_BYTES) + 1;
+  const full = fileOf('part.bin', Buffer.alloc(ARTIFACT_FILE_MAX_BYTES));
+  const together = await artifacts.handle(AWS1, body(root, { files: Array.from({ length: count }, () => full) }));
+  assert.equal(together.status, 413);
+  assert.match(together.body.error, /larger than 20 MB together/);
+  const many = await artifacts.handle(AWS1, body(root, { files: Array.from({ length: ARTIFACT_MAX_FILES + 1 }, (_, i) => fileOf(`f${i}.txt`, 'x')) }));
+  assert.equal(many.status, 413);
+  const note = await artifacts.handle(AWS1, body(root, { note: 'x'.repeat(4097) }));
+  assert.equal(note.status, 400);
+  assert.match(note.body.error, /note is longer than 4096 bytes/);
+  assert.equal(calls.length, 0);
+});
+
+test('a name that is not a plain file name is refused', async (t) => {
+  const { artifacts, root, calls } = services(t);
+  for (const name of ['../escape.png', 'dir/shot.png', '..', '.', 'two\nlines.txt', 'back\\slash', '', 'nul\0.txt']) {
+    const answer = await artifacts.handle(AWS1, body(root, { files: [fileOf(name, 'x')] }));
+    assert.equal(answer.status, 400, JSON.stringify(name));
+  }
+  const relative = await artifacts.handle(AWS1, body(root, { files: [fileOf('ok.png', 'x', { source: 'shots/ok.png' })] }));
+  assert.equal(relative.status, 400);
+  assert.match(relative.body.error, /source must be an absolute path/);
+  assert.equal(calls.length, 0);
+});
+
+test('a card the daemon does not have is refused before anything runs', async (t) => {
+  const { artifacts, root, calls } = services(t, { noCard: true });
+  const answer = await artifacts.handle(AWS1, body(root));
+  assert.equal(answer.status, 404);
+  assert.match(answer.body.error, /no task "some-card" on the daemon/);
+  assert.equal((await artifacts.handle(AWS1, body(root, { card: '../tasks/x' }))).status, 400);
+  assert.equal((await artifacts.handle(AWS1, body(root, { card: 'Some_Card' }))).status, 400);
+  assert.equal(calls.length, 0);
+});
+
+test('a resend under its key is answered from the journal, and the key used for other files is refused', async (t) => {
+  let n = 0;
+  const { artifacts, root, calls } = services(t, { answer: () => { n += 1; return { code: 0, stdout: `stored ${n}\n`, stderr: '' }; } });
+  const first = await artifacts.handle(AWS1, body(root));
+  assert.equal(first.body.replayed, false);
+  const again = await artifacts.handle(AWS1, body(root));
+  assert.deepEqual(again, { status: 200, body: { ...first.body, replayed: true } });
+  assert.equal(calls.length, 1);
+  const other = await artifacts.handle(AWS1, body(root, { files: [fileOf('shot.png', 'other bytes')] }));
+  assert.equal(other.status, 409);
+  assert.equal(calls.length, 1);
+  // The journal names the files by their digest, never holds their bytes.
+  const [entry] = fs.readdirSync(path.join(root, '.keep', 'registry-ops'));
+  const recorded = fs.readFileSync(path.join(root, '.keep', 'registry-ops', entry), 'utf8');
+  assert.equal(recorded.includes(Buffer.from('png bytes').toString('base64')), false);
+});
+
+test('a daemon on its way to a restart refuses an artifact with 503 and writes nothing', async (t) => {
+  const root = tempDir(t);
+  fs.mkdirSync(path.join(root, 'tasks'));
+  fs.writeFileSync(path.join(root, 'tasks', 'some-card.md'), '---\ntitle: Some card\n---\n');
+  const fake = fakeSpawn();
+  const registry = createRegistryService({
+    root, spawn: fake.spawn, daemonNode: () => 'main', stopping: () => true,
+    location: () => ({ node: 'aws1', agent: 'claude' }), env: { PATH: '/usr/bin:/bin', HOME: root, LANG: 'C' },
+    configFile: path.join(root, 'config.json'),
+  });
+  const artifacts = createArtifactService({ registry, tmpRoot: tempDir(t) });
+  assert.deepEqual(await artifacts.handle(AWS1, body(root)), { status: 503, body: { error: 'daemon restarting' } });
+  assert.equal(fake.calls.length, 0);
+});
+
+test('a real keep artifact stores a node\'s file in the registry through the daemon\'s own CLI', async (t) => {
+  const root = tempDir(t);
+  for (const dir of ['tasks', 'archive', 'digests']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+  const env = { ...process.env, KEEP_DIR: root };
+  delete env.CLAUDE_CODE_SESSION_ID;
+  assert.equal(spawnSync('git', ['init', '-q', root], { env }).status, 0);
+  spawnSync('git', ['-C', root, 'config', 'user.name', 'Keep Test'], { env });
+  spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test'], { env });
+  const { registry, artifacts, tmpRoot } = services(t, {
+    root, noCard: true, realSpawn: true, env: { PATH: process.env.PATH, HOME: root, LANG: 'C' },
+  });
+  const added = await registry.handle(AWS1, {
+    command: 'add', args: ['Artifact card'], cwd: root, session: 'sess-aws1', agent: 'claude', idempotencyKey: 'add-0123456789abcdef',
+  });
+  assert.equal(added.body.status, 0, added.body.stderr);
+  const stored = await artifacts.handle(AWS1, body(root, { card: 'artifact-card', files: [fileOf('shot.png', 'png bytes')] }));
+  assert.equal(stored.status, 200);
+  assert.equal(stored.body.status, 0, stored.body.stderr);
+  const destination = path.join(root, '.keep', 'artifacts', 'artifact-card', 'shot.png');
+  assert.equal(stored.body.stdout, `${destination}\n`);
+  assert.equal(fs.readFileSync(destination, 'utf8'), 'png bytes');
+  const card = fs.readFileSync(path.join(root, 'tasks', 'artifact-card.md'), 'utf8');
+  assert.match(card, /Stored .*shot\.png \(from aws1:\/home\/someone\/shots\/shot\.png\)/, 'the log names the node\'s file, not the copy');
+  assert.match(card, /the login screen/);
+  assert.deepEqual(fs.readdirSync(tmpRoot), []);
+});

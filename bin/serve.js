@@ -16283,6 +16283,10 @@ function start(deps = {}) {
   ctx.hookService = ctx.registryService ? require('./hook-route.js').createHookService({
     root: keep.ROOT, stopping: () => daemonRestartGate.stopping, registry: ctx.registryService,
   }) : null;
+  // A node's `keep artifact`, with the files' bytes, through the same journal and gate.
+  ctx.artifactService = ctx.registryService ? require('./artifact-route.js').createArtifactService({
+    root: keep.ROOT, registry: ctx.registryService,
+  }) : null;
   // Secret handoff (bin/secret-requests.js). The value goes from the console request
   // to the writer and nowhere else; the session is told the path once it is written.
   ctx.secretService = require('./secret-requests.js').createSecretService({
@@ -16435,8 +16439,10 @@ function start(deps = {}) {
       onState: (value) => nodeApi.writeState(keep.ROOT, value),
       handler: nodeApi.createNodeApiHandler({
         routes: requestRoutes, matchRoute, routeDenial, readBody, principal: keepConsole.principal,
-        // A hook post carries up to 4 MiB of transcript, base64-encoded.
-        bodyLimit: (pathname) => (pathname === '/api/hook' ? require('./hook-route.js').BODY_MAX_BYTES : undefined),
+        // A hook post carries up to 4 MiB of transcript, and an artifact post up to
+        // 20 MiB of files, base64-encoded.
+        bodyLimit: (pathname) => (pathname === '/api/hook' ? require('./hook-route.js').BODY_MAX_BYTES
+          : pathname === '/api/artifact' ? require('./registry-commands.js').ARTIFACT_BODY_MAX_BYTES : undefined),
         tokenStore: nodeApi.createNodeTokenStore({ initial: nodeTokenMap, read: () => nodes.nodeApiTokens(keep.ROOT) }),
         json,
         onMutation: () => dashboardPublisher?.invalidate(),

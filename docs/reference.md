@@ -1673,6 +1673,23 @@ stops answering gets the usual twenty seconds of retries.
 A forwarded open runs beside the node's other commands and holds a restart for as long
 as it runs.
 
+`keep artifact` from a node sends the files themselves, since the paths name files the
+daemon does not have. The node's CLI reads each one and posts it to the daemon's
+`POST /api/artifact` with its basename, size, sha256 and bytes, under the same node
+token, idempotency key, journal, restart gate and session identity as a forwarded
+command. It refuses, before posting, anything that is not a regular file under the
+node's home directory (a symbolic link is judged by where it leads), a file over 5 MiB
+(the limit a local `keep artifact` has always had), more than 20 MiB or 32 files in one
+command, and a note over 4 KiB. The daemon refuses a card it does not have, a name that
+is not a plain file name, and a file whose bytes do not match its size or digest; it
+then writes each file into a temporary directory under its original name and runs its
+own `keep artifact`, so the copy under `.keep/artifacts/<card>/`, the card log and the
+commit are a local call's, and the log names the file as `<node>:<path>` rather than the
+temporary copy. The node prints what that CLI printed (the durable paths, on the
+daemon) with its exit status, and a refusal as the daemon's. The node's post is bounded
+by the ordinary three minutes plus the upload at 256 KiB/s. `keep artifact <card>`
+with no files lists the card's artifacts on the daemon.
+
 The same trust covers a check recipe: a node's `keep add` or `keep checkin` may carry
 `--check` and `--on-pass`, whose text the daemon later hands a session just as it types a
 tell or an open's `-m`. What a node may not forward is a command the daemon would run

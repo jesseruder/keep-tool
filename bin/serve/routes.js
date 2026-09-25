@@ -53,6 +53,18 @@ function routes(ctx) {
         return json(res, result.status, result.body);
       },
     },
+    {
+      // `keep artifact` from a pane-only node: the node posts the files' bytes and the
+      // daemon's own CLI stores them (bin/artifact-route.js).
+      method: 'POST',
+      path: '/api/artifact',
+      allow: NODE_API_ALLOW,
+      when: nodeApiEnabled,
+      handle: async ({ res, body, principal }) => {
+        const result = await ctx.artifactService.handle(principal, body);
+        return json(res, result.status, result.body);
+      },
+    },
     // Secret handoff (bin/secret-requests.js). An agent asks from its own machine:
     // the daemon's CLI over loopback, or a node's CLI with its node token, whose
     // node the request is then recorded against. Only the console and the daemon's

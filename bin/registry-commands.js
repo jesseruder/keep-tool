@@ -352,4 +352,37 @@ function requestedWaitMs(command, args) {
   try { return require('./wait.js').parseDuration(wait); } catch { return 0; }
 }
 
-module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+// `keep artifact` from a node (bin/artifact-route.js). It is not in REGISTRY_COMMANDS:
+// its arguments are paths on the node, which the daemon's CLI would read from its own
+// disk. The node reads the files itself and posts their bytes to /api/artifact, and
+// the daemon hands its CLI copies under the same basenames. The bounds live here so
+// both sides and the CLI read one number:
+//   5 MiB per file      the CLI's own limit (keep.js commands.artifact), which a local
+//                       call has always had: the registry is a repository every
+//                       machine clones, not a file store.
+//   20 MiB per command  four files at the limit; the post carries them base64-encoded
+//                       in one JSON body the daemon parses on its event loop, so this
+//                       also bounds that parse (ARTIFACT_BODY_MAX_BYTES).
+//   32 files            a screenshot series, not a directory.
+const ARTIFACT_FILE_MAX_BYTES = 5 * 1024 * 1024;
+const ARTIFACT_COMMAND_MAX_BYTES = 20 * 1024 * 1024;
+const ARTIFACT_MAX_FILES = 32;
+// The body /api/artifact accepts: the files at 4/3 for base64, and room for the note,
+// the names, the sources and the identity fields.
+const ARTIFACT_BODY_MAX_BYTES = Math.ceil(ARTIFACT_COMMAND_MAX_BYTES * 4 / 3) + 1024 * 1024;
+const ARTIFACT_NAME_MAX_BYTES = 255;
+
+// Null when `name` is a plain file name the daemon can give its copy, or why not. The
+// daemon writes the copy under this name and the CLI keeps it, so anything that could
+// leave the temporary directory or break the card log onto a second line is refused.
+// (A leading dash is fine: the daemon passes absolute paths, after `--`.)
+function artifactNameRefusal(name) {
+  if (typeof name !== 'string' || !name) return 'an artifact file name must be a non-empty string';
+  if (Buffer.byteLength(name) > ARTIFACT_NAME_MAX_BYTES) return `artifact file name is longer than ${ARTIFACT_NAME_MAX_BYTES} bytes: ${JSON.stringify(name)}`;
+  if (name === '.' || name === '..' || /[/\\\0\r\n]/.test(name)) {
+    return `artifact file name must be a plain file name: ${JSON.stringify(name)}`;
+  }
+  return null;
+}
+
+module.exports = { ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

@@ -78,22 +78,21 @@ function checkedCwd(value, io) {
   return value;
 }
 
-// The request, checked field by field. Throws RegistryError; returns the normalised
-// request the digest and the subprocess are built from.
-function validateRequest(body, caller, deps) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) refuse(400, 'the request body must be an object');
-  const { command, args = [], idempotencyKey } = body;
-  if (!isRegistryCommand(command)) refuse(400, `${JSON.stringify(String(command))} is not a registry command`);
-  if (typeof idempotencyKey !== 'string' || !KEY_RE.test(idempotencyKey)) {
-    refuse(400, 'idempotencyKey must be 16-128 letters, digits, _ or -');
-  }
+// The session and agent a request names, checked for form only. Throws RegistryError.
+function sessionFields(body) {
   const session = body.session === undefined || body.session === null ? null : body.session;
   if (session !== null && (typeof session !== 'string' || !SESSION_RE.test(session))) refuse(400, 'invalid session id');
   const agent = body.agent === undefined || body.agent === null ? null : body.agent;
   if (agent !== null && !AGENTS.includes(agent)) refuse(400, 'agent must be claude, codex or pi');
   if (agent !== null && session === null) refuse(400, 'an agent names the session it runs; give the session too');
-  const refusal = argumentRefusal(command, args, { session, node: caller });
-  if (refusal) refuse(400, refusal);
+  return { session, agent };
+}
+
+// Where and as whom a node's request runs: the project directory, the node's own
+// directory for the logs, and the session and pane, each of which must be the
+// caller's own. Shared by every route that runs the daemon's CLI for a node
+// (bin/artifact-route.js too), so the identity rules are written once.
+function callerPlace(body, caller, deps, { session, agent }) {
   const cwd = checkedCwd(body.cwd, deps.io);
   // Where the node's command was typed: named in the journal digest and the logs,
   // never used as a directory here, so it need not exist on the daemon.
@@ -123,7 +122,28 @@ function validateRequest(body, caller, deps) {
     if (parsed.node !== caller) refuse(403, `pane ${body.pane} is not on node ${caller}`);
     pane = deps.formatPaneRef(parsed.node, parsed.paneId);
   }
-  return { command, args: [...args], cwd, ...(nodeCwd !== null ? { nodeCwd } : {}), session, agent: resolvedAgent, pane, idempotencyKey };
+  return { cwd, ...(nodeCwd !== null ? { nodeCwd } : {}), session, agent: resolvedAgent, pane };
+}
+
+function checkedKey(body) {
+  if (typeof body.idempotencyKey !== 'string' || !KEY_RE.test(body.idempotencyKey)) {
+    refuse(400, 'idempotencyKey must be 16-128 letters, digits, _ or -');
+  }
+  return body.idempotencyKey;
+}
+
+// The request, checked field by field. Throws RegistryError; returns the normalised
+// request the digest and the subprocess are built from.
+function validateRequest(body, caller, deps) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) refuse(400, 'the request body must be an object');
+  const { command, args = [] } = body;
+  if (!isRegistryCommand(command)) refuse(400, `${JSON.stringify(String(command))} is not a registry command`);
+  const idempotencyKey = checkedKey(body);
+  const fields = sessionFields(body);
+  const refusal = argumentRefusal(command, args, { session: fields.session, node: caller });
+  if (refusal) refuse(400, refusal);
+  const place = callerPlace(body, caller, deps, fields);
+  return { command, args: [...args], ...place, idempotencyKey };
 }
 
 function digestOf(request) {
@@ -455,10 +475,11 @@ function createRegistryService(options = {}) {
     }
   }
 
-  // What bin/hook-route.js runs its requests through: the same caller rule, journal,
-  // serialisation, restart gate and subprocess, so a restart waits for both kinds.
+  // What bin/hook-route.js and bin/artifact-route.js run their requests through: the
+  // same caller rule, journal, serialisation, restart gate and subprocess, so a
+  // restart waits for every kind.
   const shared = {
-    root, daemonNode, location, nodes, now, baseEnv,
+    root, daemonNode, location, nodes, now, baseEnv, io,
     callerNode: (principal) => callerNode(principal, daemonNode()),
     journaled, spawnKeep, childEnv, adopt: lateAdoption.adopt, unlocated: lateAdoption.unlocated,
     parsePaneRef: (ref) => nodes.parsePaneRef(ref),
@@ -469,6 +490,6 @@ function createRegistryService(options = {}) {
 }
 
 module.exports = {
-  createRegistryService, validateRequest, digestOf, RegistryError,
+  createRegistryService, validateRequest, sessionFields, callerPlace, checkedKey, digestOf, RegistryError,
   TIMEOUT_MS, MAX_OUTPUT_BYTES, JOURNAL_TTL_MS, IDENTITY_VARS,
 };
