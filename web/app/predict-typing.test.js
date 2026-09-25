@@ -63,9 +63,9 @@ test('a character on the Claude and Codex prompt lines is predicted with the exa
   const claude = await terminalWith('\x1b[2;1H❯ hi');
   assert.deepEqual(predict(claude, 'x'), { kind: 'char', inputStart: 2, bytes: 'x' });
   const codex = await terminalWith('› hi');
-  assert.equal(predict(codex, 'x', { agent: 'codex' }).bytes, PREDICT_CHAR('x'));
   assert.equal(predict(codex, 'x'), null, 'Claude is matched only by its own marker');
-  assert.equal(predict(claude, 'x', { agent: 'codex' }), null, 'Codex is matched only by its own marker');
+  assert.equal(predict(codex, 'x', { agent: 'codex' }), null, 'a Codex pane is not predicted');
+  assert.equal(predict(claude, 'x', { agent: 'codex' }), null);
   const padded = await terminalWith('❯\u00a0');
   assert.equal(predict(padded, 'x').bytes, PREDICT_CHAR('x'));
 });
@@ -233,10 +233,10 @@ test('a whole-line redraw for an earlier keystroke keeps the later guesses on sc
   assert.equal(predictor.pending, 0);
 });
 
-test('an agent that redraws only changed cells confirms each guess without a redraw', async () => {
-  const terminal = await terminalWith('› ');
+test('output that redraws only changed cells confirms each guess and steps over the rest', async () => {
+  const terminal = await terminalWith('❯ ');
   let clock = 0;
-  const predictor = createTypingPredictor({ terminal, agent: () => 'codex', remote: () => true, mode: () => 'on', now: () => clock });
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => clock });
   predictor.keystroke('a');
   predictor.keystroke('b');
   await write(terminal, '');
@@ -244,16 +244,16 @@ test('an agent that redraws only changed cells confirms each guess without a red
   await write(terminal, '\x1b[1;3H\x1b[0ma\x1b[1;4H');
   predictor.outputParsed();
   await write(terminal, '');
-  assert.deepEqual(lineState(terminal), { text: '› ab', cursor: 4, marks: [3] },
+  assert.deepEqual(lineState(terminal), { text: '❯ ab', cursor: 4, marks: [3] },
     'the cursor steps over the guess the agent left in place');
   assert.equal(predictor.pending, 1);
   predictor.keystroke('c');
   await write(terminal, '');
-  assert.deepEqual(lineState(terminal), { text: '› abc', cursor: 5, marks: [3, 4] });
+  assert.deepEqual(lineState(terminal), { text: '❯ abc', cursor: 5, marks: [3, 4] });
   await write(terminal, '\x1b[1;4H\x1b[0mb\x1b[1;5H');
   predictor.outputParsed();
   await write(terminal, '');
-  assert.deepEqual(lineState(terminal), { text: '› abc', cursor: 5, marks: [4] });
+  assert.deepEqual(lineState(terminal), { text: '❯ abc', cursor: 5, marks: [4] });
   assert.equal(predictor.pending, 1);
 });
 
@@ -517,25 +517,23 @@ test('a spinner that restores the cursor onto the prompt row with CUP confirms a
   assert.deepEqual(state(), { text: '❯ ab', cursor: 4, marks: [] });
 });
 
-test('a cell-diff echo identical to the guess leaves it pending until it expires, character intact', async () => {
-  const terminal = await terminalWith('› ');
-  let clock = 0;
-  const predictor = createTypingPredictor({ terminal, agent: () => 'codex', remote: () => true, mode: () => 'on', now: () => clock });
-  predictor.keystroke('a');
-  await write(terminal, '');
-  clock = 120;
-  // Codex writes the one changed cell and parks its cursor after it: exactly what
-  // the guess already shows.
-  await write(terminal, '\x1b[1;3Ha\x1b[1;4H');
-  predictor.outputParsed();
-  assert.equal(predictor.pending, 1);
-  assert.deepEqual(lineState(terminal), { text: '› a', cursor: 3, marks: [2] });
-  clock = 6001;
-  await write(terminal, '\x1b[3;1Hspin\x1b[1;4H');
-  predictor.outputParsed();
-  assert.equal(predictor.pending, 0, 'the guess expires');
-  assert.equal(predictor.echoMs(), null, 'without a sample');
-  assert.deepEqual(lineState(terminal), { text: '› a', cursor: 3, marks: [] }, 'the character stays, the overlay goes');
+test('a Codex pane is not predicted or measured under any setting', async () => {
+  for (const mode of ['on', 'auto']) {
+    const terminal = await terminalWith('› ');
+    let clock = 0;
+    const predictor = createTypingPredictor({ terminal, agent: () => 'codex', remote: () => true, mode: () => mode, now: () => clock });
+    let typed = '';
+    for (const ch of 'abcd') {
+      assert.equal(predictor.keystroke(ch), false, mode);
+      assert.equal(predictor.pending, 0);
+      typed += ch;
+      clock += 150;
+      await write(terminal, `\x1b[1;${2 + typed.length}H${ch}`);
+      predictor.outputParsed();
+    }
+    assert.equal(predictor.echoMs(), null);
+    assert.deepEqual(lineState(terminal), { text: '› abcd', cursor: 6, marks: [] });
+  }
 });
 
 function reportingPredictor(terminal) {

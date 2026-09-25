@@ -22,13 +22,22 @@ const MIN_SAMPLES = 3;
 // later be matched to an unrelated redraw and read as a huge echo time.
 const STALE_KEYSTROKE_MS = 5000;
 
-// Claude Code's input line starts with `❯`, Codex's with `›`, each followed by a
-// space (Claude pads the empty box with U+00A0). Each agent is matched only by its
-// own marker: a shell prompt can use either glyph, and a shell echoes at the
-// cursor a prediction has already advanced, which would double the character.
+// The agents whose input box is predicted. Claude Code's renderer redraws the
+// input line and ends it with an erase (EL) on every keystroke, so every echo is
+// observable, through that erase or through the line and cursor it leaves: a guess
+// never lingers unconfirmed, and "the cursor is where the guess left it, with no
+// erase since" reliably means the pane has not echoed, which is what makes the
+// cursor-position reply exact. Codex redraws only the cells that changed, so its
+// echo of exactly what a guess already shows changes nothing on screen; it is not
+// predicted until a print-level signal can tell that echo apart.
+export const PREDICTED_AGENTS = ['claude'];
+
+// Claude Code's input line starts with `❯` and a space (U+00A0 in the empty box).
+// Only a pane whose agent is on record is matched: a shell prompt can use the same
+// glyph, and a shell echoes at the cursor a prediction has already advanced, which
+// would double the character.
 const PROMPTS = {
   claude: { line: /^(\s*)❯[ \u00a0]/, menu: /^\s*❯[ \u00a0]+\d+\.\s/ },
-  codex: { line: /^(\s*)›[ \u00a0]/, menu: /^\s*›[ \u00a0]+\d+\.\s/ },
 };
 // A highlighted choice in the agent's selection menu also starts with the marker
 // (`❯ 1. Yes`). Typing there picks an option rather than editing text.
@@ -84,7 +93,7 @@ const blankCell = (cell) => !cell || cell.getChars() === '' || cell.getChars() =
 export function predictKeystroke(terminal, data, { agent, composing = false, extraColumns = 0 } = {}) {
   // Only an agent's own input box is predicted; a shell pane, or a pane with no
   // agent on record, never is.
-  const prompts = Object.hasOwn(PROMPTS, agent) ? PROMPTS[agent] : null;
+  const prompts = PREDICTED_AGENTS.includes(agent) && Object.hasOwn(PROMPTS, agent) ? PROMPTS[agent] : null;
   const kind = predictableKey(data);
   if (!prompts || !kind || composing) return null;
   if (terminal.hasSelection?.()) return null;
@@ -125,8 +134,8 @@ function median(values) {
 // The class the console's stylesheet gives the overlay on a guessed cell.
 export const PREDICTED_CELL_CLASS = 'keep-predicted-cell';
 
-// One per mounted terminal. `agent` names the pane's agent (`claude`, `codex`, or
-// anything else for a pane that is not predicted), `remote` says whether the pane
+// One per mounted terminal. `agent` names the pane's agent (only those in
+// PREDICTED_AGENTS are predicted or measured), `remote` says whether the pane
 // is on another node, `mode` reads the viewer's setting, `now` is a monotonic
 // clock, and `reply` sends a terminal reply to the pane the way xterm's own
 // replies are sent.
@@ -156,12 +165,6 @@ export function createTypingPredictor({
   // the renderer uses (Claude Code ends each redrawn line with EL) can. Cursor
   // movement never counts: a spinner that draws elsewhere and moves the cursor
   // back onto the prompt row has answered nothing. Our own writes are excluded.
-  //
-  // The accepted cost: an agent that writes only the cells that changed (Codex),
-  // echoing exactly what a guess already shows, changes nothing observable, so
-  // that guess stays marked until a later echo moves past it or it expires after
-  // STALE_KEYSTROKE_MS. The character on screen is right all the while; only the
-  // mark lingers, and no sample is taken.
   let touched = false;
   let localWrite = false;
   const touch = (reach) => () => {
@@ -191,7 +194,9 @@ export function createTypingPredictor({
     return `${buffer.type}:${buffer.baseY + buffer.cursorY}:${buffer.cursorX}`;
   };
   // While guesses stand and nothing of the pane's has moved the cursor since, the
-  // report names the column the pane's own output left, formatted exactly as
+  // pane has not echoed them: a predicted agent's echo always erases on the prompt
+  // row (see PREDICTED_AGENTS), which clears `localCursor`. So the report names the
+  // column the pane's own output left, formatted exactly as
   // xterm formats it (1-based row and column, no page for the private form), and
   // is sent through the same path as xterm's replies. Any other query, or no
   // standing guess, is left to xterm. A guess never changes the row.
@@ -328,9 +333,9 @@ export function createTypingPredictor({
 
   // An agent that rewrites its whole input line erases the guesses for keystrokes
   // it has not processed yet. Draw them again, or a fast typist sees characters
-  // vanish and come back. An agent that writes only the cells that changed leaves
-  // them in place but puts its cursor back before them; step over them, or the
-  // next guess would land on top of one. Only character guesses are redrawn: a
+  // vanish and come back. Output that leaves them in place but puts the cursor
+  // back before them (a redraw of only the cells that changed) is stepped over,
+  // or the next guess would land on top of one. Only character guesses are redrawn: a
   // Backspace guess leaves nothing to find, so there is no telling whether it is
   // still on screen. A guess still in the write queue would land ahead of the
   // redrawn ones, so wait for it.

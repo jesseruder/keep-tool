@@ -51,7 +51,7 @@ export function rendererControlsHTML(ctx, pane, paneState) {
 export function predictTypingControlsHTML() {
   const selected = getPredictTypingPreference();
   const option = (mode, label, help) => `<button class="btn renderer-choice ${selected === mode ? 'selected' : ''}" type="button" aria-pressed="${selected === mode}" data-predict-typing="${mode}" title="${help}"><span>${label}</span><span class="renderer-check" aria-hidden="true">${selected === mode ? '✓' : ''}</span></button>`;
-  return `<div class="session-actions-label">Predict typing</div><div class="renderer-options" role="group" aria-label="Predict typing">${option('auto', 'Auto', 'Predict on panes of another node once their echo is slower than 50 ms')}${option('on', 'On', 'Predict typing on every pane')}${option('off', 'Off', 'Never predict typing')}</div>`;
+  return `<div class="session-actions-label">Predict typing</div><div class="renderer-options" role="group" aria-label="Predict typing">${option('auto', 'Auto', 'Predict in Claude sessions on another node once their echo is slower than 50 ms')}${option('on', 'On', 'Predict typing in every Claude session')}${option('off', 'Off', 'Never predict typing')}</div>`;
 }
 
 export function keepRunningControlHTML(session) {

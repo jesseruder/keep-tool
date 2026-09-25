@@ -192,9 +192,10 @@ desktop the module builds nothing at all.
 
 A pane on another node echoes a keystroke only after a round trip and the agent's
 render, so the console draws the character itself first (`web/app/predict-typing.js`).
-It predicts only in the input box of a pane whose host meta names a Claude or Codex
-agent: the cursor's line starts with that agent's own marker (`❯` for Claude Code, `›`
-for Codex) and a space, the cursor is past them at the end of the typed text and more
+It predicts only in the input box of a Claude session (the pane's host meta names the
+`claude` agent); Codex sessions echo normally, because Codex redraws only the cells that
+changed, so its echo of exactly what a guess shows would leave nothing to confirm it by.
+The cursor's line starts with Claude Code's `❯` and a space, the cursor is past them at the end of the typed text and more
 than three cells from the right edge, the screen is the normal one, no selection or IME
 composition is in progress, and the key is Backspace or one character xterm always
 draws one cell wide (printable ASCII, Latin-1, Latin Extended-A and -B). Pastes, Enter,
@@ -205,17 +206,14 @@ with no attribute or saved-cursor change to the pane's stream, and an xterm deco
 placeholder is cleared by the first one. An echo is output that changes the prompt line
 or the cursor column from what the guesses left, or erases or shifts cells on that row
 (Claude Code's whole-line redraw ends with an erase); a bare cursor move onto the row is
-not one. So when Codex, which writes only changed cells, echoes exactly what a guess
-already shows, the mark stays until a later echo moves past it or it expires after 5 s;
-the character itself is right on screen throughout. A mark that lingers otherwise means
-the character was never echoed. While guesses stand, a cursor-position query from the
+not one. A mark that lingers (up to 5 s) means the character was never echoed. While guesses stand, a cursor-position query from the
 pane (`CSI 6 n`, `CSI ? 6 n`) is answered with the column the pane's own output left,
 not the one the guesses moved the cursor to. The session Actions menu
 carries a per-viewer **Predict typing** setting (`keep.console.predictTyping` in
-localStorage): **Auto**, the default, predicts only on panes of another node and only
+localStorage): **Auto**, the default, predicts only in Claude sessions on panes of another node and only
 once the median of the last 8 measured echoes on that pane is above 50 ms (it measures
 from the third keystroke on, so the first few characters on a pane arrive unpredicted);
-**On** predicts on every pane, the daemon node's included; **Off** never predicts.
+**On** predicts in every Claude session, the daemon node's included; **Off** never predicts.
 
 ## CLI
 
