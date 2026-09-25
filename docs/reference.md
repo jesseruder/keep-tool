@@ -2054,8 +2054,11 @@ scheduler, and a record with another role is never taken over: such a card's che
 opens as an ordinary session. Only a check that opens a fresh session runs as the
 agent (a `rearm` card always does; a plain card with a live linked thread is delivered
 into that thread instead), and a check pane that is restarted or handed off stops
-being the agent's — `adoptedPaneMeta` drops the name with `ephemeral` — so the record
-reads `working` only while the pane the scheduler opened is alive.
+being the agent's — `adoptedPaneMeta` drops the name with `ephemeral` and releases
+the record — while the ephemeral sweep idles any scheduled-check record whose session
+no pane still carries as `ephemeral: 'check'` (a move, a resume by hand, a pane closed
+elsewhere), so the record reads `working` only while the pane the scheduler opened is
+carrying it.
 
 ### Records
 

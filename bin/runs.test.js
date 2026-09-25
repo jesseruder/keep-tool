@@ -534,14 +534,23 @@ test('a card that names its agent opens its check as that agent and records the 
   } finally { _resetSchedulerState(); }
 });
 
-test('the sweep idles an agent whose check pane it closed', async () => {
+test('the sweep idles an agent whose check pane it closed, or whose pane lost the mark', async () => {
   const written = [];
-  const records = { 'redash-daily': { name: 'redash-daily', session: { id: 'sid-agent' } } };
+  const records = {
+    'redash-daily': { name: 'redash-daily', role: 'scheduled check', session: { id: 'sid-agent' } },
+    // Moved to another node or resumed by hand: its pane no longer carries the mark.
+    'moved-check': { name: 'moved-check', role: 'scheduled check', lifecycle: 'working', session: { id: 'sid-moved', pane: 'p-moved' } },
+    // A responder is never this sweep's to idle, however its panes look.
+    sandboxes: { name: 'sandboxes', role: 'incident-responder', lifecycle: 'working', session: { id: 'sid-resp', pane: 'p-resp' } },
+    // Already idle with no session: nothing to write.
+    'quiet-check': { name: 'quiet-check', role: 'scheduled check', lifecycle: 'idle', session: { id: '', pane: '' } },
+  };
   const now = 1_000_000 + 5 * 3600e3;
   const result = await sweepEphemeralPanes({
     listPanes: async () => [
       ephemeralPane({ id: 'agent-pane', meta: { card: null, sessionId: 'sid-agent', agentName: 'redash-daily' } }),
       ephemeralPane({ id: 'other-pane', meta: { card: null, sessionId: 'sid-other', agentName: 'somebody-else' } }),
+      { id: 'p-moved', alive: true, meta: { sessionId: 'sid-moved', agentName: 'moved-check' } },
     ],
     sessions: async () => [
       { id: 'sid-agent', endedTurn: true, mtime: 1_000_000 },
@@ -549,15 +558,20 @@ test('the sweep idles an agent whose check pane it closed', async () => {
     ],
     closePane: async () => {},
     agents: {
+      records: () => Object.values(records),
       readRecord: (name) => records[name] || null,
       writeRecord: (name, patch) => { written.push([name, patch]); },
       flushCommits: () => true,
     },
   }, now);
   assert.deepEqual(result.sort(), ['agent-pane', 'other-pane']);
-  // Only the record that still names this session is idled; a record already carrying
-  // a newer session (or none) is left alone.
-  assert.deepEqual(written, [['redash-daily', { lifecycle: 'idle', card: '' }]]);
+  assert.deepEqual(written, [
+    // The moved check first: its pane carries the name but not the mark.
+    ['moved-check', { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } }],
+    // Then the record whose check pane this sweep closed; a record already carrying
+    // a newer session (or none) is left alone.
+    ['redash-daily', { lifecycle: 'idle', card: '' }],
+  ]);
 });
 
 test('the per-day and per-tick allowances survive a restart, and verify ignores them', async () => {

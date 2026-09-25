@@ -910,6 +910,7 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
     return [];
   }
   if (!Array.isArray(panes)) return [];
+  idleOrphanedCheckAgents(panes, host.agents || require('./agents.js'));
   // A pane on another node is left alone here even if a caller hands one over:
   // closing it and releasing its card's stamp both rest on evidence only the
   // machine running it can produce.
@@ -980,6 +981,36 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
     }
   }
   return closed;
+}
+
+// A card agent's record names a session only while the check pane the scheduler
+// opened is carrying it. Adoption (a restart, a handoff) releases the record itself,
+// but a session move, a resume by hand or a pane closed outside this sweep never
+// pass through adoption, and agents.applySessions binds by the record's session id
+// as much as by the pane's name — so the record would read `working` forever. Once
+// a tick, then: a scheduled-check record whose session no pane still carries as
+// `ephemeral: 'check'` + `agentName` is idled and lets the session go. Judged over
+// the whole pane list, alive or not: a dead check pane is reaped further down and
+// idles the record itself; only a pane that lost the mark, or is gone, counts here.
+function idleOrphanedCheckAgents(panes, agentApi) {
+  let records;
+  try { records = agentApi.records(); } catch { return []; }
+  const carried = new Set((panes || [])
+    .filter((pane) => pane && pane.meta && pane.meta.ephemeral === 'check' && typeof pane.meta.agentName === 'string')
+    .map((pane) => pane.meta.agentName));
+  const idled = [];
+  for (const record of records || []) {
+    if (!record || record.role !== 'scheduled check' || !record.session || !record.session.id) continue;
+    if (carried.has(record.name)) continue;
+    try {
+      agentApi.writeRecord(record.name, { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } });
+      idled.push(record.name);
+    } catch (e) {
+      process.stderr.write(`keep runs: could not idle card agent ${record.name} whose check pane is gone: ${e.message}\n`);
+    }
+  }
+  if (idled.length) { try { agentApi.flushCommits(); } catch {} }
+  return idled;
 }
 
 // ---------- deterministic probes ----------
