@@ -176,6 +176,88 @@ test('a check-in that races a restart waits for the daemon and is resent once', 
   assert.equal(down.requests.filter((entry) => entry.method === 'POST').length, 1);
 });
 
+// A post that times out while the daemon answers its ping is a command still running
+// there: it is resent with its key as often as it takes, and spends none of the fixed
+// budget that a daemon which stopped answering gets.
+test('a command still running on the daemon is resent with its key until it answers, past the fixed retries', async (t) => {
+  const { postWithRetry, RETRY_WAITS_MS } = require('./remote-cli.js');
+  const payload = { command: 'open', args: ['card'], cwd: '/', idempotencyKey: 'k'.repeat(32) };
+  const where = { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' };
+  const timedOut = () => Object.assign(new Error('timed out after 900s'), { timedOut: true });
+  const posts = [];
+  const notes = [];
+  const held = RETRY_WAITS_MS.length + 3;
+  const response = await postWithRetry(where, '/api/registry', payload, {
+    token: 't', timeoutMs: 900e3,
+    request: async (url, pathname, options) => {
+      if (pathname === '/api/registry/ping') return { status: 200, data: '{}' };
+      posts.push(options.payload);
+      if (posts.length <= held) throw timedOut();
+      return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: 'opened\n', stderr: '', replayed: true }) };
+    },
+    sleep: async () => { throw new Error('no backoff wait expected'); },
+    note: (line) => notes.push(line),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(posts.length, held + 1, 'more resends than the fixed budget has waits');
+  assert.ok(posts.every((body) => body === payload), 'every resend is the identical payload and key');
+  assert.equal(notes.length, held);
+
+  // A timed-out post whose ping then goes unanswered is a daemon gone: the fixed
+  // backoff, then unreachable.
+  const waits = [];
+  const gone = [];
+  await assert.rejects(postWithRetry(where, '/api/registry', payload, {
+    token: 't', timeoutMs: 900e3,
+    request: async (url, pathname) => {
+      if (pathname === '/api/registry/ping') throw new Error('connect ECONNREFUSED');
+      gone.push(pathname);
+      throw timedOut();
+    },
+    sleep: async (ms) => { waits.push(ms); }, note: () => {},
+  }), /^Error: daemon on main unreachable \(connect ECONNREFUSED\)/);
+  assert.deepEqual(waits, [...RETRY_WAITS_MS]);
+  assert.equal(gone.length, 1, 'nothing is resent to a daemon that does not answer');
+
+  // A network error still gets the fixed retries and no more.
+  const tries = [];
+  const spent = [];
+  await assert.rejects(postWithRetry(where, '/api/registry', payload, {
+    token: 't',
+    request: async (url, pathname) => {
+      if (pathname === '/api/registry/ping') return { status: 200, data: '{}' };
+      tries.push(pathname);
+      throw new Error('socket hang up');
+    },
+    sleep: async (ms) => { spent.push(ms); }, note: () => { throw new Error('no still-running note for a lost connection'); },
+  }), /^Error: daemon on main unreachable \(socket hang up\)/);
+  assert.deepEqual(spent, [...RETRY_WAITS_MS]);
+  assert.equal(tries.length, RETRY_WAITS_MS.length + 1);
+});
+
+test('a command still running on the daemon is waited on up to the horizon, which names its key', async (t) => {
+  const { postWithRetry, RESEND_HORIZON_MS } = require('./remote-cli.js');
+  assert.equal(RESEND_HORIZON_MS, 4 * 3600e3);
+  const payload = { command: 'open', args: ['card'], cwd: '/', idempotencyKey: 'k'.repeat(32) };
+  let clock = 0;
+  const posts = [];
+  const error = await postWithRetry({ local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, '/api/registry', payload, {
+    token: 't', timeoutMs: 900e3, now: () => clock,
+    request: async (url, pathname, options) => {
+      if (pathname === '/api/registry/ping') return { status: 200, data: '{}' };
+      posts.push(options.payload);
+      clock += options.timeoutMs;
+      throw Object.assign(new Error('timed out after 900s'), { timedOut: true });
+    },
+    sleep: async () => { throw new Error('no backoff wait expected'); }, note: () => {},
+  }).then(() => null, (failure) => failure);
+  assert.ok(error, 'it gave up');
+  assert.equal(posts.length, RESEND_HORIZON_MS / 900e3, 'posts until the horizon, then none');
+  assert.match(error.message, new RegExp(`under key ${'k'.repeat(32)}`));
+  assert.match(error.message, /may still be running on the daemon on main/);
+  assert.equal(error.horizon, true);
+});
+
 // A daemon on its way down refuses new commands before running or recording them;
 // the node waits for the next daemon and sends the same request again.
 test('a daemon restarting answers 503 and the command is resent with its key after the restart', async (t) => {
@@ -380,11 +462,14 @@ test('an open whose request times out at the node is resent with its key and ans
   const request = async (url, pathname, options) => {
     if (pathname === '/api/registry/ping') return { status: 200, data: '{}' };
     posts.push(options);
-    if (posts.length === 1) throw new Error(`no answer within ${options.timeoutMs} ms`);
+    if (posts.length === 1) throw Object.assign(new Error(`timed out after ${options.timeoutMs / 1000}s`), { timedOut: true });
     return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: 'opened\n', stderr: '', replayed: true }) };
   };
-  const deps = { where: { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, request, token: 't', env: {}, cwd: root, sleep: async () => {} };
+  const notes = [];
+  const deps = { where: { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, request, token: 't', env: {}, cwd: root,
+    sleep: async () => { throw new Error('a timed-out post spends no backoff wait'); }, note: (line) => notes.push(line) };
   assert.deepEqual(await runRemote('open', ['card', '--fresh', '-m', 'hi'], deps), { code: 0, stdout: 'opened\n', stderr: '' });
+  assert.deepEqual(notes, ['keep open: still running on the daemon on main, waiting…\n']);
   assert.equal(posts.length, 2);
   assert.equal(posts[0].payload.idempotencyKey, posts[1].payload.idempotencyKey);
   assert.deepEqual(posts.map((post) => post.timeoutMs), [REQUEST_TIMEOUT_MS + OPEN_EXTRA_MS, REQUEST_TIMEOUT_MS + OPEN_EXTRA_MS]);

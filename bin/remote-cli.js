@@ -121,31 +121,77 @@ function registryBody(command, args, { env = process.env, cwd = process.cwd(), w
 const RETRY_WAITS_MS = Object.freeze([1000, 2000, 4000, 8000, 5000]);
 const PING_TIMEOUT_MS = 3000;
 
+// How long a node keeps resending a command the daemon is still running. A post
+// that times out is not a daemon that went away: the daemon's journaled() holds a
+// resend of the same key on the run still in flight and answers it with that run's
+// result, so the node resends for as long as the daemon answers its ping. Four hours
+// is longer than any bound the daemon derives from a supported setting (an open
+// with KEEP_COMPACT_TIMEOUT_MS at an hour is about two); a person who has waited
+// that long should look at the daemon rather than wait on. A waiting tell's own post
+// may already be a day long, so the horizon is never shorter than two of its posts.
+const RESEND_HORIZON_MS = 4 * 3600e3;
+
 // Posts, and when there was no answer at all waits with backoff until the daemon
 // answers GET /api/registry/ping, then sends the same request again with the same
 // key: the first may have run, and the key is what makes the next one safe. Nothing
 // is resent to a daemon that is not answering its ping. A 503 `daemon restarting`
 // is waited out the same way: the daemon refused it before running or recording
-// anything.
+// anything. Those waits are the fixed budget in RETRY_WAITS_MS.
+//
+// A post that timed out while the daemon still answers its ping is a command still
+// running there, and does not spend that budget: it is resent at once with the same
+// payload, and a line on stderr says the command is still running, until the answer
+// comes or RESEND_HORIZON_MS has passed since the first post.
 async function postWithRetry(where, pathname, payload, deps = {}) {
   const request = deps.request || nodeApiRequest;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const waits = deps.retryWaitsMs || RETRY_WAITS_MS;
   const token = deps.token || nodeToken(deps.env || process.env, deps.readToken);
+  const now = deps.now || Date.now;
+  const note = deps.note || ((line) => { try { process.stderr.write(line); } catch {} });
+  const label = deps.label || `keep ${payload && payload.command ? payload.command : 'request'}`;
+  const horizon = Math.max(deps.resendHorizonMs ?? RESEND_HORIZON_MS, 2 * (deps.timeoutMs || 0));
+  const started = now();
   const send = async () => {
     const response = await request(where.url, pathname, { payload, token, timeoutMs: deps.timeoutMs });
     if (response.status === 503 && (parsed(response) || {}).error === 'daemon restarting') throw new Error('daemon restarting');
     return response;
   };
+  const ping = async () => {
+    try { await request(where.url, '/api/registry/ping', { method: 'GET', token, timeoutMs: PING_TIMEOUT_MS }); return null; }
+    catch (error) { return error; }
+  };
   let lastError;
+  let held = false;
   try { return await send(); }
-  catch (error) { lastError = error; }
-  for (const wait of waits) {
-    await sleep(wait);
-    try { await request(where.url, '/api/registry/ping', { method: 'GET', token, timeoutMs: PING_TIMEOUT_MS }); }
-    catch (error) { lastError = error; continue; }
+  catch (error) { lastError = error; held = Boolean(error && error.timedOut); }
+  let spent = 0;
+  for (;;) {
+    if (held) {
+      if (now() - started >= horizon) {
+        const key = payload && payload.idempotencyKey ? ` under key ${payload.idempotencyKey}` : '';
+        const failure = new Error(`gave up waiting after ${Math.round((now() - started) / 60e3)}m${key}; `
+          + `the command may still be running on the daemon on ${where.daemon}; check there before running it again`);
+        failure.horizon = true;
+        throw failure;
+      }
+      const down = await ping();
+      if (!down) {
+        note(`${label}: still running on the daemon on ${where.daemon}, waiting…\n`);
+        try { return await send(); }
+        catch (error) { lastError = error; held = Boolean(error && error.timedOut); }
+        continue;
+      }
+      lastError = down;
+      held = false;
+    }
+    if (spent >= waits.length) break;
+    await sleep(waits[spent]);
+    spent += 1;
+    const down = await ping();
+    if (down) { lastError = down; continue; }
     try { return await send(); }
-    catch (error) { lastError = error; }
+    catch (error) { lastError = error; held = Boolean(error && error.timedOut); }
   }
   const failure = new Error(`daemon on ${where.daemon} unreachable (${lastError && lastError.message})`);
   failure.unreachable = true;
@@ -163,10 +209,11 @@ function parsed(response) {
 //
 // For an open this is the floor of the daemon's bound (registry-commands
 // openExtraMs): a daemon with a raised compaction timeout may run longer than the
-// node waits. Then this request fails, postWithRetry pings and resends the same
+// node waits. Then this post times out, postWithRetry pings and resends the same
 // payload and so the same idempotency key, and the daemon's journaled() holds that
 // resend on the run still in flight under the key and answers it with that run's
-// recorded result. Nothing runs twice; the node just waits in more than one post.
+// recorded result. Nothing runs twice; the node just waits in more than one post,
+// for as long as the daemon answers, up to RESEND_HORIZON_MS.
 function requestTimeoutMs(command, args) {
   return REQUEST_TIMEOUT_MS + require('./registry-commands.js').forwardedWaitMs(command, args);
 }
@@ -243,6 +290,6 @@ async function deploySelf(where, { sha, project }, deps = {}) {
 
 module.exports = {
   deploySelf,
-  REQUEST_TIMEOUT_MS, RETRY_WAITS_MS, remoteMode, daemonBase, nodeToken, nodeApiRequest, registryBody, postWithRetry, runRemote, parsed,
+  REQUEST_TIMEOUT_MS, RETRY_WAITS_MS, RESEND_HORIZON_MS, remoteMode, daemonBase, nodeToken, nodeApiRequest, registryBody, postWithRetry, runRemote, parsed,
   requestTimeoutMs,
 };
