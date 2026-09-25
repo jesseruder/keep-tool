@@ -2160,7 +2160,10 @@ then runs the card's checks as that agent — the record is created before the f
 session (`role: scheduled check`), the pane carries `agentName`, the record shows the
 session and `working` on the card while the check runs and `idle` once its pane is
 reaped, and the session's `keep agents emit <name>` lands on the agent's feed. The
-daily Redash review (`docs/agents/redash-daily.md`, agent `redash-daily`) is one. The
+daily Redash review (`docs/agents/redash-daily.md`, agent `redash-daily`) is one, as are
+`data-pipeline` (every 4h), `ci-health` (CircleCI on every Castle repo's default branch,
+every 3h), `app-health` (Play vitals, rollouts and reviews, daily) and `spend` (AWS, Oracle
+and OpenRouter cost against the trailing week, daily). The
 reviewer's name and every area responder's are refused, at the CLI and again by the
 scheduler, and a record with another role is never taken over: such a card's check
 opens as an ordinary session. Only a check that opens a fresh session runs as the
@@ -2721,9 +2724,10 @@ config error and neither runs (see **Restart from the log**).
 to edit. This repo ships the version the code was written against at
 `docs/agents/<name>.md`, and the tick installs it into the registry when there is none.
 An existing file is never overwritten, so Owner's edits survive every later tick.
-Not every recipe under `docs/agents/` is an area agent's: `redash-daily.md` is read by
-the scheduled-check session a card opens every morning (its `--check` text points at the
-file), keeps its memory in that card's check-ins, and has no record or feed.
+Not every recipe under `docs/agents/` is an area agent's: `redash-daily.md`,
+`data-pipeline.md`, `ci-health.md`, `app-health.md` and `spend.md` are read by the
+scheduled-check session their card opens (its `--check` text points at the file) and keep
+their memory in that card's check-ins; they are never installed into the registry.
 `.keep/agents/<name>/notes.md` beside it is the agent's own standing notes, owned by
 that recipe.
 
