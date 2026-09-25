@@ -59,10 +59,43 @@ function accountsFor(ctx, agent) {
   return (ctx.data.accounts || []).filter((account) => account.agent === agent);
 }
 
-function preferredAccount(ctx, agent, requested) {
+// The usage windows that would refuse this model on this account: the 5h window, the
+// shared week, and the model family's own weekly bucket ("Fable wk" caps Fable only).
+function capsFor(ctx, account, model) {
+  const usage = ctx.data.usage?.accounts?.[account.id];
+  const windows = (account.agent === 'claude' ? usage?.limits : usage?.windows) || [];
+  const family = /^claude-([a-z]+)/i.exec(String(model || ''))?.[1]?.toLowerCase() || '';
+  return windows.filter((window) => window && (!/ wk$/i.test(String(window.label || ''))
+    || (family && String(window.label).toLowerCase().startsWith(family))));
+}
+
+// Out of usage: a window at 100% whose reset is unknown or still ahead. An account with
+// no reading is not called spent.
+function spentAccount(ctx, account, model, now = Date.now()) {
+  return capsFor(ctx, account, model).some((window) => {
+    if (!(Number(window.percent) >= 100)) return false;
+    const reset = typeof window.resetsAt === 'number' ? (window.resetsAt < 1e12 ? window.resetsAt * 1000 : window.resetsAt) : Date.parse(window.resetsAt);
+    return !Number.isFinite(reset) || reset > now;
+  });
+}
+
+// A named account wins (a reopen's recorded one). Otherwise the default account while it
+// has usage left, then the account with usage left whose fullest window is emptiest, and
+// only when every account is spent, the default anyway.
+function preferredAccount(ctx, agent, requested, model) {
   const choices = accountsFor(ctx, agent);
-  return choices.find((account) => account.id === requested)?.id
-    || choices.find((account) => account.isDefault)?.id || choices[0]?.id || '';
+  const named = choices.find((account) => account.id === requested);
+  if (named) return named.id;
+  const fallback = choices.find((account) => account.isDefault) || choices[0];
+  if (!fallback) return '';
+  if (!spentAccount(ctx, fallback, model)) return fallback.id;
+  // An account with no reading ranks after every account with one.
+  const fullest = (account) => {
+    const caps = capsFor(ctx, account, model);
+    return caps.length ? Math.max(...caps.map((window) => Number(window.percent) || 0)) : 101;
+  };
+  const open = choices.filter((account) => !spentAccount(ctx, account, model)).sort((a, b) => fullest(a) - fullest(b));
+  return (open[0] || fallback).id;
 }
 
 export function openSessionChooser(ctx, options) {
@@ -75,7 +108,8 @@ export function openSessionChooser(ctx, options) {
   const runId = String(++runSequence);
   const state = {
     kind: initialKind,
-    accountId: recordedAccountMissing ? '' : preferredAccount(ctx, initialKind, options.accountId),
+    accountId: '',
+    accountChosen: false,
     directory: String(options.directory ?? options.project ?? ''),
     models: {
       claude: options.models?.claude ?? (options.agent === 'claude' ? options.model || '' : ''),
@@ -87,7 +121,12 @@ export function openSessionChooser(ctx, options) {
     node: '',
     error: '', busy: false, bound: false,
   };
+  const pickAccount = () => preferredAccount(ctx, state.kind, options.accountId, state.models[state.kind]);
+  if (!recordedAccountMissing) state.accountId = pickAccount();
   const nodes = options.chooseNode === true ? nodesFor(ctx) : [];
+  // The caller's preferred machine starts selected while it is listed and reachable.
+  const preferredNode = nodes.find((node) => node.name === options.defaultNode && !node.daemon && node.ok !== false);
+  if (preferredNode) state.node = preferredNode.name;
   const daemonNode = nodes.find((node) => node.daemon)?.name || '';
   const nodeChoice = () => nodes.length >= 2 && state.kind !== 'shell';
   // Pi runs on the daemon node only, so it is named rather than left to placement,
@@ -100,14 +139,15 @@ export function openSessionChooser(ctx, options) {
   const render = () => {
     const choices = state.kind === 'shell' ? [] : accountsFor(ctx, state.kind);
     if (state.kind !== 'shell' && state.accountId && !choices.some((account) => account.id === state.accountId)) {
-      state.accountId = preferredAccount(ctx, state.kind, options.accountId);
+      state.accountId = pickAccount();
     }
     const noAccount = state.kind !== 'shell' && !choices.length;
     const providerField = kinds.length > 1
       ? `<label>Session type<select data-launch-kind ${state.busy || state.bound ? 'disabled' : ''}>${kinds.map((kind) => `<option value="${ctx.esc(kind)}" ${kind === state.kind ? 'selected' : ''}>${ctx.esc(labels[kind])}</option>`).join('')}</select></label>`
       : `<div class="session-launch-value"><span>Provider</span><strong>${ctx.esc(labels[state.kind])}</strong></div>`;
     const accountField = state.kind === 'shell' ? '' : `<label>Account<select data-launch-account ${state.busy || state.bound || noAccount ? 'disabled' : ''}>${recordedAccountMissing && !state.accountId ? `<option value="" selected disabled>Recorded account unavailable — choose another</option>` : ''}${choices.map((account) => {
-      const suffix = account.id === options.accountId ? ' · current' : account.isDefault ? ' · default' : '';
+      const suffix = (account.id === options.accountId ? ' · current' : account.isDefault ? ' · default' : '')
+        + (spentAccount(ctx, account, state.models[state.kind]) ? ' · out of usage' : '');
       return `<option value="${ctx.esc(account.id)}" ${account.id === state.accountId ? 'selected' : ''}>${ctx.esc((account.label || account.id) + suffix)}</option>`;
     }).join('')}</select></label>`;
     const locked = state.busy || state.bound ? 'disabled' : '';
@@ -144,12 +184,13 @@ export function openSessionChooser(ctx, options) {
     </form>`;
     modal.querySelector('[data-launch-kind]')?.addEventListener('change', (event) => {
       if (state.busy) return;
-      state.kind = event.target.value; state.accountId = preferredAccount(ctx, state.kind); state.error = ''; render();
+      state.kind = event.target.value; state.accountId = pickAccount(); state.accountChosen = false; state.error = ''; render();
       queueMicrotask(() => modal.querySelector(state.kind === 'shell' ? '[data-launch-submit]' : '[data-launch-account]')?.focus());
     });
     modal.querySelector('[data-launch-account]')?.addEventListener('change', (event) => {
       const wasEmpty = !state.accountId;
       state.accountId = event.target.value;
+      state.accountChosen = true;
       if (wasEmpty) render();
     });
     modal.querySelector('[data-launch-model]')?.addEventListener('change', (event) => {
@@ -157,6 +198,8 @@ export function openSessionChooser(ctx, options) {
       const custom = event.target.value === OTHER_MODEL;
       state.customModel[state.kind] = custom;
       if (!custom) state.models[state.kind] = event.target.value;
+      // A model with its own weekly bucket can be spent where another is not.
+      if (!state.accountChosen && !recordedAccountMissing) state.accountId = pickAccount();
       render();
       queueMicrotask(() => modal.querySelector(custom ? '[data-launch-model-custom]' : '[data-launch-model]')?.focus());
     });

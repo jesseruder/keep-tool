@@ -226,3 +226,73 @@ test('a malformed saved default falls back to the built-in one', () => {
   assert.equal(defaultModels().claude, 'claude-opus-5-5[1m]');
   store.clear();
 });
+
+test('a defaultNode starts selected when it is listed and reachable, and Automatic otherwise', async () => {
+  const chosen = open(fleet, { defaultNode: 'aws1' });
+  assert.match(chosen.modal.innerHTML, /<option value="aws1" selected >aws1<\/option>/);
+  await submit(chosen.modal); await chosen.done;
+  assert.equal(chosen.submitted[0].node, 'aws1');
+
+  for (const defaultNode of ['mini', 'main', 'gone']) {
+    const fallback = open(fleet, { defaultNode });
+    assert.match(fallback.modal.innerHTML, /<option value="" selected>Automatic<\/option>/, defaultNode);
+    fallback.modal.close(); await fallback.done;
+  }
+});
+
+function openWithUsage(usage, options = {}) {
+  const submitted = [];
+  const ctx = { esc, data: { usage: { accounts: usage }, accounts: [
+    { id: 'claude/default', agent: 'claude', label: 'Default', isDefault: true },
+    { id: 'claude-secondary', agent: 'claude', label: 'Secondary' },
+    { id: 'claude-tertiary', agent: 'claude', label: 'Tertiary' },
+  ] } };
+  const done = openSessionChooser(ctx, {
+    title: 'New session', project: '/repo', kinds: ['claude'], initialKind: 'claude', models: { claude: 'claude-opus-5-5[1m]' },
+    ...options, async onSubmit(selection) { submitted.push(selection); },
+  });
+  return { modal: dialogs.at(-1), submitted, done };
+}
+const ahead = Date.now() + 3600e3;
+const limits = (week, fable = 0, short = 0) => ({ agent: 'claude', limits: [
+  { label: '5h', percent: short, resetsAt: ahead }, { label: 'week', percent: week, resetsAt: ahead }, { label: 'Fable wk', percent: fable, resetsAt: ahead }] });
+
+test('the default account stays chosen while it has usage left', async () => {
+  const { modal, submitted, done } = openWithUsage({ 'claude/default': limits(90), 'claude-secondary': limits(5) });
+  await submit(modal); await done;
+  assert.equal(submitted[0].accountId, 'claude/default');
+});
+
+test('a spent default account gives way to the account with the most usage left, and is marked', async () => {
+  const { modal, submitted, done } = openWithUsage({
+    'claude/default': limits(100), 'claude-secondary': limits(60), 'claude-tertiary': limits(20, 0, 40),
+  });
+  assert.match(modal.innerHTML, /Default · default · out of usage/);
+  await submit(modal); await done;
+  assert.equal(submitted[0].accountId, 'claude-tertiary');
+});
+
+test('a spent model bucket counts only for that model', async () => {
+  const usage = { 'claude/default': limits(50, 100), 'claude-secondary': limits(70) };
+  const opus = openWithUsage(usage);
+  await submit(opus.modal); await opus.done;
+  assert.equal(opus.submitted[0].accountId, 'claude/default', 'Opus is not capped by the Fable week');
+
+  const fable = openWithUsage(usage);
+  fable.modal.querySelector('[data-launch-model]').fire('change', { target: { value: 'claude-fable-5-1' } });
+  await submit(fable.modal); await fable.done;
+  assert.equal(fable.submitted[0].accountId, 'claude-secondary', 'switching to Fable moves off the spent account');
+});
+
+test('an account picked by hand survives a model change, and a passed reset is not spent', async () => {
+  const hand = openWithUsage({ 'claude/default': limits(10), 'claude-secondary': limits(10, 100) });
+  hand.modal.querySelector('[data-launch-account]').fire('change', { target: { value: 'claude-secondary' } });
+  hand.modal.querySelector('[data-launch-model]').fire('change', { target: { value: 'claude-fable-5-1' } });
+  await submit(hand.modal); await hand.done;
+  assert.equal(hand.submitted[0].accountId, 'claude-secondary');
+
+  const reset = openWithUsage({ 'claude/default': { agent: 'claude', limits: [{ label: 'week', percent: 100, resetsAt: Date.now() - 1000 }] },
+    'claude-secondary': limits(5) });
+  await submit(reset.modal); await reset.done;
+  assert.equal(reset.submitted[0].accountId, 'claude/default');
+});

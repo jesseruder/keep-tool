@@ -646,6 +646,8 @@ async function newSession(cwd, name, onOpened) {
     title: 'New session', description: 'Choose what to open and where.', project: cwd,
     directory: cwd, editableDirectory: true,
     kinds: ['shell', 'claude', 'codex', 'pi'], initialKind: 'claude', confirmLabel: 'Open session', chooseNode: true,
+    // Remote by default for now; Automatic and this machine stay one click away.
+    defaultNode: 'aws1',
     models: defaultModels(), defaultModels: true,
     async onSubmit(selection) {
       state.pendingFocus = true;
