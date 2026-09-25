@@ -602,6 +602,9 @@ test('periodic schedulers read sessions from the bounded transcript index', () =
   let body = source.slice(source.indexOf('function startSchedulers('));
   const wired = (pattern) => assert.match(body, pattern);
   wired(/runs\.setEphemeralHost\(\{[\s\S]*?sessions: \(\) => periodicScan\(\),[\s\S]*?\}\);/);
+  // The sweep idles a card agent's record only through the host's own agents module;
+  // without this line every card agent would stay `working` for good, silently.
+  wired(/runs\.setEphemeralHost\(\{[\s\S]*?agents: require\('\.\.\/agents\.js'\),[\s\S]*?\}\);/);
   wired(/limitresume\.startScheduler\(\{[\s\S]*?scanSessions: \(\) => periodicScan\(\)\.filter\(/);
   wired(/ctx\.sessionSnapshot : periodicScan\(\);/);
   wired(/require\('\.\.\/notes\.js'\)\.startScheduler\(\{[\s\S]*?sessions: \(\) => scanSessions\(\{ fresh: true \}\),/);

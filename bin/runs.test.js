@@ -587,13 +587,14 @@ test('the sweep idles an agent whose check pane it closed, or whose pane lost th
       writeRecord: (name, patch) => { written.push([name, patch]); }, flushCommits: () => true },
   }, now);
   assert.deepEqual(written, [], 'an unanswered host idles nobody');
-  // A host built without an agents module never reaches a registry: no orphan pass,
-  // no idle write, whatever the pane list says.
-  await sweepEphemeralPanes({
-    listPanes: async () => [],
-    sessions: async () => [],
+  // A host built without an agents module never reaches a registry: a dead check pane
+  // that carries an agent's name is still reaped, and nothing is idled or thrown.
+  const reaped = await sweepEphemeralPanes({
+    listPanes: async () => [ephemeralPane({ id: 'orphan-pane', meta: { card: null, sessionId: 'sid-agent', agentName: 'redash-daily' } })],
+    sessions: async () => [{ id: 'sid-agent', endedTurn: true, mtime: 1_000_000 }],
     closePane: async () => {},
   }, now);
+  assert.deepEqual(reaped, ['orphan-pane']);
   assert.deepEqual(written, []);
 });
 
