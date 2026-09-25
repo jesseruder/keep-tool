@@ -17,6 +17,7 @@ const HOST_ONLY_MODULES = Object.freeze([
   './account-handoff-node.js',
   './process-table.js',
   './node-update.js',
+  './claude-footer.js',
 ]);
 
 const HOST_MODULES_FILE = __filename;

@@ -251,3 +251,31 @@ test('cardCheck is null for no check or a done card, and overdue past its grace 
   assert.equal(cardCheck({ status: 'waiting', check_after: '2026-09-24T17:28' }, { now: at + 20 * 60e3 }).overdue, true);
   assert.equal(cardCheck({ status: 'waiting', check_after: '2026-09-24T17:28' }, { now: at + 20 * 60e3, inFlight: true }).overdue, false);
 });
+
+test('a RUNNING verdict falls to the rules only when a trusted footer, the processes and the ledger all show nothing', () => {
+  const text = 'The gateway is rolling. I\'ll confirm the roll completed on the next check.';
+  const footer = { recognized: true, shells: 0, agents: 0, turnRunning: false, running: false };
+  const idle = { ...base, lastAssistantFull: text, stopVerdict: { verdict: 'running', reason: 'waiting on gateway roll' },
+    footer, footerTrusted: true, agentShells: 0, backgroundJobs: { caughtUp: true, pending: false, jobs: [] } };
+  assert.equal(activity(idle).decision.rule, 'conversation-ready');
+  for (const [what, change, context] of [
+    ['the footer shows an agent', { footer: { ...footer, agents: 1, running: true } }],
+    ['the footer shows a shell', { footer: { ...footer, shells: 1, running: true } }],
+    ['a background shell process', { agentShells: 1 }],
+    ['a pending ledger job', { backgroundJobs: { caughtUp: true, jobs: [{ id: 'c1', kind: 'scheduled', status: 'pending' }] } }],
+    ['an uncertain job', { unknownBackgroundJobs: ['b9slnffu0'] }],
+    ['unread history', { unknownBackgroundJobs: ['history-gap'] }],
+    ['a subagent hook', { lifecycleAgents: [{ id: 'a1' }] }],
+    ['an untrusted footer', { footerTrusted: false }],
+    ['no footer', { footer: undefined }],
+    ['an unrecognized footer', { footer: { recognized: false } }],
+    ['a ledger not caught up', { backgroundJobs: { caughtUp: undefined, jobs: [] } }],
+    ['no ledger', { backgroundJobs: undefined }],
+    ['a scheduled card check', {}, { task: { status: 'waiting', check_after: '2030-01-01T00:00' } }],
+  ]) {
+    const status = activity({ ...idle, ...change }, context);
+    assert.ok(status.decision.rule === 'model-running' || status.state === 'waiting', `${what}: ${status.decision.rule}`);
+  }
+  // A long-running service is not something that wakes the session.
+  assert.equal(activity({ ...idle, backgroundJobs: { caughtUp: true, jobs: [{ id: 's1', kind: 'service', status: 'pending' }] } }).decision.rule, 'conversation-ready');
+});

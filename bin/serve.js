@@ -45,6 +45,11 @@ const landed = require('./landed.js');
 const unblock = require('./unblock.js');
 const limitresume = require('./limitresume.js');
 const health = require('./health.js');
+const footerHealth = require('./footer-health.js');
+// Kept across builds in whichever process builds state (the dashboard worker in the
+// daemon): the footer check needs a disagreement to last before it counts.
+const footerTracker = footerHealth.createTracker();
+const footerHealthMemo = {};
 const features = require('./features.js');
 const stalled = require('./stalled.js');
 const sessionNumbers = require('./session-numbers.js');
@@ -2685,8 +2690,19 @@ function annotatePaneAgents(panes, rows, deps = {}) {
       for (const row of rows) if (tree.has(row.ppid)) tree.add(row.pid);
     }
     const agent = rows.find((row) => tree.has(row.pid) && row.interactive && row.agent === pane.meta.agent);
-    if (agent) { pane.agentAlive = true; pane.agentPid = agent.pid; }
-    else if (tree.size === 1 && /^(?:\/bin\/(?:zsh|bash)|-(?:zsh|bash))(?:\s+-l)?$/.test(root.args)) {
+    if (agent) {
+      pane.agentAlive = true; pane.agentPid = agent.pid;
+      // Claude Code runs every Bash tool call, its own or a subagent's, as a
+      // snapshot-sourcing shell under its process. Once the turn has ended, those
+      // are background shells: the process-table check on the pane's footer
+      // (bin/footer-health.js), independent of the screen and the transcript.
+      if (pane.meta.agent === 'claude') {
+        const snapshotShell = (row) => /\/shell-snapshots\/snapshot-/.test(row?.args || '');
+        // The outermost wrapper of each call only: a nested shell is the same call.
+        pane.agentShells = rows.filter((row) => tree.has(row.pid) && row.pid !== agent.pid && snapshotShell(row)
+          && !snapshotShell(byPid.get(row.ppid))).length;
+      }
+    } else if (tree.size === 1 && /^(?:\/bin\/(?:zsh|bash)|-(?:zsh|bash))(?:\s+-l)?$/.test(root.args)) {
       pane.agentAlive = false;
     }
   }
@@ -13505,6 +13521,21 @@ function buildState(options = {}) {
     }
   }
   applyCompanionJobs(sessions, options.companion);
+  // What Claude Code's footer says is running in each live Claude pane, and whether
+  // that reading still agrees with the process table and the ledger (footer-health).
+  const footerStatus = footerHealth.observe(footerTracker, sessions.flatMap((session) => {
+    const pane = panesBySession.get(session.id);
+    return pane?.footer && session.kind === 'claude'
+      ? [{ pane: pane.id, footer: pane.footer, agentShells: pane.agentShells, agentAlive: pane.agentAlive, ledger: session.backgroundJobs }] : [];
+  }), now);
+  for (const session of sessions) {
+    const pane = panesBySession.get(session.id);
+    if (pane?.footer && session.kind === 'claude') {
+      session.footer = pane.footer;
+      session.footerTrusted = footerStatus.trusted;
+      if (Number.isInteger(pane.agentShells)) session.agentShells = pane.agentShells;
+    }
+  }
   // What the classifier reads off the card: whether this session is its latest linked
   // session (to judge a paneless session's final ask; session-model derives the same)
   // and, for the session the check will wake, the card's scheduled check.
@@ -13544,7 +13575,7 @@ function buildState(options = {}) {
   if (workerMode) {
     const terminal = new Set(['completed', 'failed', 'cancelled']);
     const derived = new Set(['taskId', 'taskStatus', 'runtime', 'pane', 'launchModel', 'accountLabel',
-      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark', 'stopVerdict', 'cardLatest', 'cardCheck', 'unattended',
+      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark', 'stopVerdict', 'cardLatest', 'footer', 'footerTrusted', 'agentShells', 'cardCheck', 'unattended',
       // Attached further down, after this block, and re-read from the usage snapshot
       // on every build. Listed so a reordering cannot freeze a settled session's
       // totals at whatever the collector had seen the moment it was cached.
@@ -13670,6 +13701,7 @@ function buildState(options = {}) {
     sessions,
     attention: visibleAttention,
     setAside: setAsideState.value.items,
+    footerHealth: footerStatus,
     stalled: stalledItems,
     unblocked,
     digest,
@@ -13808,6 +13840,7 @@ function finalizeDashboardWorkerResult(result) {
   // the worker snapshot that selected the session.
   associateDashboardSessionFiles(state, result.backgroundTargets);
   for (const item of result.healthErrors || []) health.record(item.name, { ok: false, error: item.message });
+  try { footerHealth.record(state.footerHealth, health, footerHealthMemo); } catch {}
   for (const target of result.backgroundTargets || []) {
     registerBackgroundTarget(target);
   }

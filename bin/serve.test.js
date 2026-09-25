@@ -8366,6 +8366,28 @@ test('pane process liveness distinguishes an empty parent shell from an agent su
   assert.equal(panes[3].agentAlive, undefined, 'missing process rows are inconclusive');
 });
 
+test('a Claude pane counts the background shells under its claude process, one per tool call', () => {
+  const { annotatePaneAgents } = require('./serve');
+  const panes = [{ id: 'p1', pid: 1, alive: true, meta: { agent: 'claude', sessionId: 's1' } },
+    { id: 'p2', pid: 2, alive: true, meta: { agent: 'codex', sessionId: 's2' } }];
+  const snapshot = '/usr/bin/zsh -c source /home/u/.claude/shell-snapshots/snapshot-zsh-1790-ab.sh 2>/dev/null || true && eval';
+  annotatePaneAgents(panes, [
+    { pid: 1, ppid: 0, args: 'node agent-launcher.js' },
+    { pid: 10, ppid: 1, args: 'claude --resume s1', agent: 'claude', interactive: true },
+    { pid: 11, ppid: 10, args: `${snapshot} 'sleep 45'` },
+    { pid: 12, ppid: 11, args: 'sleep 45' },
+    { pid: 13, ppid: 11, args: `${snapshot} 'nested'` },
+    { pid: 14, ppid: 10, args: `${snapshot} 'until ok; do sleep 30; done'` },
+    { pid: 15, ppid: 10, args: 'npm exec @playwright/mcp@latest' },
+    { pid: 16, ppid: 10, args: '/bin/sh -c ~/keep-tool/bin/keep hook lifecycle' },
+    { pid: 2, ppid: 0, args: 'node agent-launcher.js' },
+    { pid: 20, ppid: 2, args: 'codex', agent: 'codex', interactive: true },
+    { pid: 21, ppid: 20, args: snapshot },
+  ]);
+  assert.equal(panes[0].agentShells, 2, 'two tool calls; the nested shell, an MCP server and a hook do not count');
+  assert.equal(panes[1].agentShells, undefined, 'only Claude panes are counted');
+});
+
 test('empty parent shell is not refreshed into the live-session ledger or targeted for injection', async () => {
   const pane = { id: 'p', pid: 123, alive: true, meta: { sessionId: 's', agent: 'codex' } };
   const host = recordingHost((type) => type === 'list' ? { panes: [{ ...pane }] } : {});

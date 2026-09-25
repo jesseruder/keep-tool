@@ -443,6 +443,15 @@ async function settled(pane) {
   } while (pending !== pane.writeChain);
 }
 
+// What a live Claude pane's footer says is still running (bin/claude-footer.js), read
+// from the last rows of its screen on every listing. Never throws: a pane whose
+// screen cannot be read simply carries no footer.
+function paneFooter(pane) {
+  if (!pane.alive || !pane.term || pane.meta?.agent !== 'claude') return undefined;
+  try { return require('./claude-footer.js').read(renderScreen(pane.term, { lines: 16, compact: true }).lines); }
+  catch { return undefined; }
+}
+
 function publicPane(pane) {
   const activityTimes = [pane.lastInputAt, pane.lastOutputAt]
     .map((value) => Date.parse(value || ''))
@@ -473,6 +482,7 @@ function publicPane(pane) {
     alt: pane.term ? pane.term.buffer.active.type === 'alternate' : pane.coldSnapshot.alt,
     meta: pane.meta,
     primary: pane.primary,
+    footer: paneFooter(pane),
   };
 }
 

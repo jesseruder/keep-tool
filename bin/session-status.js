@@ -81,7 +81,20 @@ function activity(session, context = {}) {
   const cardAsks = taskStatus === 'review' || (taskStatus !== 'done' && model.task.needs);
   const durableWait = model.conversation.waiting && ['scheduled check', 'dependency'].includes(model.conversation.reason);
   const heldReason = verdict?.verdict === 'pending' ? 'classifying' : verdict?.reason || 'background work';
-  add(live && ['running', 'pending'].includes(verdict?.verdict) && !cardAsks, 'model-running', 'model', 'waiting', `Waiting: ${heldReason}`, heldReason, null,
+  // RUNNING needs something that will wake the session. It is dropped only when every
+  // source agrees nothing will: a trusted Claude footer (bin/footer-health.js) shows
+  // no running shell or agent, no background shell process, a caught-up ledger with
+  // no pending job of any kind but a service, no uncertain job (unread history
+  // included), no subagent, and no card check or dependency. Then the rules below
+  // decide. Any source missing or unsure leaves the verdict as it was.
+  const footer = session.footerTrusted === true && session.footer?.recognized === true && !session.footer.turnRunning ? session.footer : null;
+  const ledger = session.backgroundJobs;
+  const ledgerPending = (ledger?.jobs || []).some((job) => job.status === 'pending' && job.kind !== 'service');
+  const wakes = footer?.running || session.agentShells > 0 || model.background.pending || model.background.uncertain.length
+    || model.background.agents.length || ledgerPending || model.conversation.scheduled.length
+    || (model.task.checkAfter && !model.task.checkOverdue) || model.task.dependencies.length;
+  const nothingWakes = Boolean(footer) && ledger?.caughtUp === true && !wakes;
+  add(live && (verdict?.verdict === 'pending' || (verdict?.verdict === 'running' && !nothingWakes)) && !cardAsks, 'model-running', 'model', 'waiting', `Waiting: ${heldReason}`, heldReason, null,
     verdict?.verdict === 'pending' ? 'uncertain' : 'inferred');
   // A session Keep opened for a program (its pane is marked unattended) is never
   // "ready for the next instruction": nobody is meant to give it one, and its ended
