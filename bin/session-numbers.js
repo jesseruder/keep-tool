@@ -59,6 +59,7 @@ function read(options = {}) {
 
 function write(registry, options = {}) {
   const root = options.root;
+  require('./config').refuseLiveRegistryUnderTest({ ...process.env, KEEP_DIR: root });
   const dir = directory(root);
   const file = registryFile(root);
   const tmp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
