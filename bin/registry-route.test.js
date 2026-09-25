@@ -88,7 +88,7 @@ test('the registry route exists only where the daemon listens for nodes', async 
   assert.deepEqual(ping.allow, ['node', 'admin', 'local']);
   // Every other route still refuses a node: the node API is these, artifact and node-artifact, the hook routes and deploy-self.
   const forNodes = on.filter((entry) => (entry.allow || []).includes('node')).map((entry) => entry.path);
-  assert.deepEqual(forNodes, ['/api/registry', '/api/artifact', '/api/node-artifact', '/api/secrets/request', '/api/secrets', '/api/hook', '/api/hook/context', '/api/hook/mirror', '/api/registry/ping', '/api/deploy-self']);
+  assert.deepEqual(forNodes, ['/api/registry', '/api/artifact', '/api/node-artifact', '/api/secrets/request', '/api/secrets', '/api/secrets/cancel', '/api/hook', '/api/hook/context', '/api/hook/mirror', '/api/registry/ping', '/api/deploy-self']);
   // The node API proper is gated on the daemon listening for nodes. The secrets routes
   // are not: a single-node daemon serves them to its own local callers, and a node
   // reaches them by its principal alone.

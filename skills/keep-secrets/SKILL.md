@@ -53,8 +53,9 @@ expire unanswered after 24 hours.
 When you no longer need a secret you asked for (you got it another way, the plan
 changed), take the request back with `keep secret cancel <id> -m "why"` rather than
 telling Owner to ignore or decline it: its panel keeps covering your terminal in the
-console until it is answered. Asking again for the same file and key replaces the open
-request; it does not add a second.
+console until it is answered. Asking again for the same file and key reuses the open
+request (or, with a different `--replace` or `--multiline`, replaces it); it never adds a
+second panel.
 
 ## Using it
 

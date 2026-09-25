@@ -319,11 +319,16 @@ function createSecretService(options = {}) {
     const pane = body.pane ? text(body.pane, 80) : null;
     if (pane && !PANE_RE.test(pane)) return refusal(400, 'not a pane id');
     const found = load().find((r) => r.id === id);
-    // Another node's request, or another session's, reads as missing: nothing about it
-    // is the caller's business.
-    if (!found || found.sessionId !== sessionId
-      || (principal && principal.class === 'node' && found.node !== principal.node)) {
-      return refusal(404, `no secret request ${id} from this session`);
+    // Only from the machine that asked (a node's own token, the daemon's loopback for
+    // its own node), the session that asked, and the pane it asked from. Anything else
+    // reads as missing. Session and pane are what the caller says, as they are on a
+    // request: a process on that machine could as well write the file itself.
+    const caller = principal && principal.class === 'node' ? principal.node : daemonNode();
+    const known = sessionPane(sessionId);
+    if (!found || found.node !== caller || found.sessionId !== sessionId
+      || (found.pane && (!pane || !samePane(found.pane, pane)))
+      || (known && (!pane || !samePane(known, pane)))) {
+      return refusal(404, `no secret request ${id} from this session and pane`);
     }
     const denied = callerDenied(found.node, principal, sessionId, pane);
     if (denied) return denied;

@@ -159,7 +159,10 @@ test('the asking session can cancel its own pending request, and nobody else can
   const r = service.request(node, ask({ pane: 'p1@aws1' })).body.request;
   assert.equal(service.cancel(node, { id: r.id, sessionId: 'someone-else', pane: 'p1@aws1' }).status, 404);
   assert.equal(service.cancel({ class: 'node', node: 'aws2' }, { id: r.id, sessionId: SESSION, pane: 'p1@aws2' }).status, 404);
-  assert.equal(service.cancel(node, { id: r.id, sessionId: SESSION, pane: 'p9@main' }).status, 403);
+  assert.equal(service.cancel(node, { id: r.id, sessionId: SESSION, pane: 'p9@main' }).status, 404);
+  assert.equal(service.cancel(node, { id: r.id, sessionId: SESSION, pane: 'p2@aws1' }).status, 404, 'another pane');
+  assert.equal(service.cancel(node, { id: r.id, sessionId: SESSION }).status, 404, 'no pane');
+  assert.equal(service.cancel({ class: 'local' }, { id: r.id, sessionId: SESSION, pane: 'p1@aws1' }).status, 404, 'the daemon machine cannot cancel a node request');
   const done = service.cancel(node, { id: r.id, sessionId: SESSION, pane: 'p1@aws1', reason: 'got it from AWS' });
   assert.equal(done.status, 200);
   assert.equal(done.body.request.status, 'cancelled');
