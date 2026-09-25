@@ -151,7 +151,8 @@ client). See `docs/ui-reliability.md` for the reasoning.
 A card's artifacts (the files `keep artifact` stored under `.keep/artifacts/<card>/`,
 from this machine or a node) show in the console: on the stage of a session with a
 card, as one "Artifacts · N" line that opens into thumbnails floating over the
-terminal and is remembered per viewer, and in an Inbox card's notes. `GET /api/card-artifacts?card=<id>` lists them
+terminal (in flow on the phone; a press outside closes them), and in an Inbox card's
+notes. `GET /api/card-artifacts?card=<id>` lists them
 (name, size, time, whether an image, content type; newest first, at most 200) and
 `GET /api/card-artifact?card=<id>&name=<name>` serves one. Both take the console's own
 auth and `x-keep: 1`, and never a node token. A name must be a plain file name and

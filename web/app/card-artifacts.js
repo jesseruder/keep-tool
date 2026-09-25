@@ -16,12 +16,13 @@
 // section out rather than showing an error.
 import { fetchCardArtifact, getCardArtifacts } from './api.js';
 
-const OPEN_KEY = 'keep.console.artifacts.open';
 // Thumbnails fetched per card; the rest are listed by name.
 export const THUMB_LIMIT = 24;
 const lists = new Map();
 const blobs = new Map();
-let stageOpen = null;
+// Whether the stage's panel is open. Not remembered: the open panel floats over the
+// reply field and the terminal, so each session starts with it closed.
+let stageOpen = false;
 let installed = false;
 
 const defaultEsc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -34,19 +35,6 @@ export function humanSize(bytes) {
 }
 
 const blobKey = (card, item) => `${card}\n${item.name}\n${item.mtime}`;
-
-function stageExpanded() {
-  if (stageOpen === null) {
-    stageOpen = false;
-    try { stageOpen = localStorage.getItem(OPEN_KEY) === '1'; } catch {}
-  }
-  return stageOpen;
-}
-
-function setStageExpanded(value) {
-  stageOpen = Boolean(value);
-  try { localStorage.setItem(OPEN_KEY, stageOpen ? '1' : '0'); } catch {}
-}
 
 // The section, from what has been fetched so far. Pure, so a test can render it.
 // `list` is { status, value, error } for the card's listing; `blobOf(item)` is the
@@ -131,43 +119,52 @@ function ensureBlob(ctx, card, item) {
 }
 
 // The full-size view: the image over a dimmed console, closed by a click anywhere or
-// Escape. Escape is caught before the terminal sees it, since a bare ESC in a focused
-// Claude pane is an interrupt.
+// Escape. While it is up it takes every key, ahead of the console's own handlers and a
+// focused terminal (a bare ESC in a Claude pane is an interrupt), and focus leaves the
+// terminal so nothing typed reaches the hidden pane.
 function openViewer(url, name) {
   closeViewer();
   const overlay = document.createElement('div');
   overlay.className = 'artifact-viewer';
+  overlay.tabIndex = -1;
   overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
   overlay.setAttribute('aria-label', name);
   const image = document.createElement('img');
   image.src = url;
   image.alt = name;
   overlay.append(image);
   overlay.addEventListener('click', closeViewer);
-  document.addEventListener('keydown', viewerKey, true);
+  window.addEventListener('keydown', viewerKey, true);
   document.body.append(overlay);
+  overlay.focus();
 }
 
 function viewerKey(event) {
-  if (event.key !== 'Escape') return;
   event.preventDefault();
-  event.stopPropagation();
-  closeViewer();
+  event.stopImmediatePropagation();
+  if (event.key === 'Escape' && !event.metaKey && !event.ctrlKey && !event.altKey) closeViewer();
 }
 
 function closeViewer() {
-  document.removeEventListener('keydown', viewerKey, true);
+  window.removeEventListener('keydown', viewerKey, true);
   document.querySelector('.artifact-viewer')?.remove();
 }
 
 function install(ctx) {
   if (installed || typeof document === 'undefined') return;
   installed = true;
+  // The open panel closes on a press outside the artifacts row and its full-size view.
+  document.addEventListener('pointerdown', (event) => {
+    if (!stageOpen || (event.target instanceof Element && event.target.closest('.stage-artifacts, .artifact-viewer'))) return;
+    stageOpen = false;
+    ctx.refresh();
+  }, true);
   document.addEventListener('click', async (event) => {
     const target = event.target instanceof Element ? event.target.closest('[data-artifact-open], [data-artifact-download], [data-artifacts-toggle]') : null;
     if (!target) return;
     if (target.hasAttribute('data-artifacts-toggle')) {
-      setStageExpanded(!stageExpanded());
+      stageOpen = !stageOpen;
       ctx.refresh();
       return;
     }
@@ -196,14 +193,13 @@ function install(ctx) {
 }
 
 // The section for `task`, fetching what it needs. `collapsible` is the stage's form:
-// one line until opened, remembered per viewer, so a card with artifacts does not
-// take the terminal's height unasked.
+// one line that opens into a panel over the terminal (in flow on the phone).
 export function cardArtifactsHTML(ctx, task, { collapsible = false } = {}) {
   if (!task?.id || typeof ctx?.refresh !== 'function') return '';
   install(ctx);
   const card = task.id;
   const list = ensureList(ctx, card, task._detailVersion || task.fm?.updated || '');
-  const expanded = !collapsible || stageExpanded();
+  const expanded = !collapsible || stageOpen;
   const blobOf = (item) => (expanded ? ensureBlob(ctx, card, item) : null);
   return artifactsSectionHTML({
     card, list, blobOf, esc: ctx.esc || defaultEsc, rel: ctx.rel ? (at) => ctx.rel(Date.parse(at)) : undefined,

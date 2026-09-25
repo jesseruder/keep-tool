@@ -230,6 +230,7 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .stage-artifacts { position: relative; padding: 6px 16px; border-bottom: 1px solid var(--line); flex-shrink: 0; }
 /* On the stage, the opened thumbnails float over the terminal instead of taking its height. */
 .stage-artifacts .artifact-body { position: absolute; top: 100%; left: 0; right: 0; z-index: 12; max-height: 40vh; overflow: auto; padding: 8px 16px; background: var(--panel-2); border-bottom: 1px solid var(--line-2); box-shadow: var(--shadow); }
+html.mobile .stage-artifacts .artifact-body { position: static; max-height: 30dvh; padding: 6px 0 0; background: none; border: 0; box-shadow: none; }
 .artifact-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .artifact-viewer { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 16px; background: rgba(0, 0, 0, .85); cursor: zoom-out; }
 .artifact-viewer img { max-width: 100%; max-height: calc(100vh - 32px); object-fit: contain; }
