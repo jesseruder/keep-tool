@@ -235,7 +235,6 @@ export const getDashboardDetail = (kind, id) => request(`/api/dashboard-detail?k
 export const searchSessionText = (query) => request(`/api/session-text-search?q=${encodeURIComponent(query)}`)
   .then((body) => (body?.superseded ? null : body?.results || []));
 export const searchDashboardReviews = (query) => request(`/api/dashboard-review-search?q=${encodeURIComponent(query)}`);
-export const getPendingDecisions = (sessionId) => request(`/api/decisions?session=${encodeURIComponent(sessionId)}&pending=1`);
 export const getPortableTransfers = () => freshRequest('/api/portable-transfers');
 export const getPortableTransferDraft = (sessionId) => request(`/api/portable-transfer-draft?session=${encodeURIComponent(sessionId)}`);
 export const getPortableTransferPreview = (transferId) => request(`/api/portable-transfer-preview?id=${encodeURIComponent(transferId)}`);

@@ -321,7 +321,8 @@ function routes(ctx) {
         const id = url.searchParams.get('id') || '';
         if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) return json(res, 400, { error: 'bad card id' });
         let task = null;
-        try { task = keep.loadTask(id); } catch {}
+        // A done card can still be on the stage, and it lives in archive/.
+        try { task = keep.loadTaskAnywhere(id); } catch {}
         if (!task) return json(res, 404, { error: 'no card' });
         return json(res, 200, require('../card-picture.js').cardPicture(task));
       },

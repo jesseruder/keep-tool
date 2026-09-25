@@ -11,6 +11,10 @@ import { getCardPicture } from './api.js';
 // Only a stamped heading starts an entry, as in bin/review.js logEntries: older
 // cards carry check-in bodies that begin with their own `## ` heading.
 const HEADING_RE = /^## (Plan|\d{4}-\d{2}-\d{2} \d{2}:\d{2} — .+)$/gm;
+// Keep's own bookkeeping and the fleet reviewer's notes are not what the session
+// did; they would push its check-ins out of the three slots. Check results stay:
+// on a check card they are the work.
+const AUTOMATED_KIND_RE = /^(?:agent run\b|delivery warning|review \()|\(reviewer\b/;
 
 export function recentLogEntries(body, limit = 3) {
   const text = String(body || '');
@@ -23,6 +27,7 @@ export function recentLogEntries(body, limit = 3) {
     if (marks[index].heading === 'Plan') continue;
     const end = index + 1 < marks.length ? marks[index + 1].start : text.length;
     const [stamp, ...rest] = marks[index].heading.split(' — ');
+    if (AUTOMATED_KIND_RE.test(rest.join(' — '))) continue;
     const lines = text.slice(marks[index].bodyStart, end).trim().split('\n');
     let next = '';
     const prose = [];
@@ -58,11 +63,18 @@ function clip(text, limit) {
   return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
 }
 
-// `task` is the card with its body once the detail has loaded; before that only
-// the summary's lastLog is known, which is still the newest check-in.
+// The console's state carries no card bodies (and no lastLog), and a new check-in
+// changes the card's detail version, which idles its loaded detail until the
+// refetch lands. The last body seen for each card stands in until then, so a new
+// check-in never flashes "no check-ins".
+const lastBodies = new Map(); // card id -> body
+
+// `task` is the card with its body once the detail has loaded.
 export function checkinsHTML(ctx, task, fallbackText, now = Date.now()) {
   const esc = ctx.esc;
-  const entries = typeof task?.body === 'string' ? recentLogEntries(task.body) : [];
+  if (task?.id && typeof task.body === 'string') lastBodies.set(task.id, task.body);
+  const body = typeof task?.body === 'string' ? task.body : task?.id ? lastBodies.get(task.id) : undefined;
+  const entries = typeof body === 'string' ? recentLogEntries(body) : [];
   if (!entries.length) {
     const text = task?.lastLog ? clip(task.lastLog, 280) : fallbackText;
     return `<div class="summary card-log"><p class="card-log-empty">${esc(text)}</p></div>`;
@@ -121,9 +133,12 @@ function ensurePicture(ctx, task, now = Date.now()) {
   inflight.add(id);
   getCardPicture(id)
     .then((result) => {
+      const fresh = result?.fresh !== false;
       pictures.set(id, {
-        svg: typeof result?.svg === 'string' ? result.svg : cached?.svg || '',
-        fresh: result?.fresh !== false,
+        // While a redraw is pending the old picture stays up; once the answer for
+        // this input is final, no picture means none, not the previous card state.
+        svg: typeof result?.svg === 'string' ? result.svg : fresh ? '' : cached?.svg || '',
+        fresh,
         version,
         fetchedAt: Date.now(),
       });

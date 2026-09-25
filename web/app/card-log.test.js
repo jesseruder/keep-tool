@@ -31,8 +31,8 @@ Card opened.
 First pass done.
 next: wire the CLI
 
-## 2026-09-22 12:00 — check-in (reviewer fable)
-Reviewer note <b>.
+## 2026-09-22 12:00 — check-in (by claude 2222) → active
+Tests pass for <b>.
 
 ## 2026-09-23 13:00 — check-in (by codex 1111) → done
 Landed the parser
@@ -47,7 +47,7 @@ test('the newest three log entries come back newest first, with next and commits
   assert.equal(entries[0].kind, 'check-in → done', 'the session id is dropped from the heading');
   assert.equal(entries[0].text, 'Landed the parser and the CLI.');
   assert.equal(entries[0].next, 'nothing');
-  assert.equal(entries[1].kind, 'check-in');
+  assert.equal(entries[1].kind, 'check-in → active');
   // An old body's own `## ` heading is text, not a new entry.
   assert.match(entries[2].text, /^## A heading inside an old check-in body First pass done\.$/);
   assert.equal(entries[2].next, 'wire the CLI');
@@ -60,12 +60,37 @@ test('check-ins render escaped, and the newest carries its next step', () => {
   assert.match(html, /1h ago/);
   assert.match(html, /next: nothing/);
   assert.equal((html.match(/next:/g) || []).length, 1, 'only the newest entry shows next');
-  assert.match(html, /Reviewer note &lt;b&gt;\./);
+  assert.match(html, /Tests pass for &lt;b&gt;\./);
   assert.doesNotMatch(html, /<b>/);
 });
 
+test('Keep bookkeeping and reviewer notes do not take a slot; check results do', () => {
+  const body = `${BODY}
+## 2026-09-24 09:00 — check result (agent) → waiting
+Probe passed.
+
+## 2026-09-24 10:00 — agent run (claude) → active
+Started.
+
+## 2026-09-24 11:00 — review (fable)
+Looks fine.
+
+## 2026-09-24 12:00 — check-in (reviewer fable) → active
+Reviewer moved it.
+`;
+  const entries = recentLogEntries(body);
+  assert.deepEqual(entries.map((entry) => entry.at), ['2026-09-24 09:00', '2026-09-23 13:00', '2026-09-22 12:00']);
+});
+
+test('a card whose detail is reloading keeps showing the last body seen for it', () => {
+  checkinsHTML({ esc }, { id: 'reload', body: BODY }, 'fallback');
+  const html = checkinsHTML({ esc }, { id: 'reload' }, 'No check-ins on this card yet');
+  assert.match(html, /Landed the parser/);
+  assert.doesNotMatch(html, /No check-ins/);
+});
+
 test('before the detail loads, the summary lastLog stands in; with no card, the fallback', () => {
-  assert.match(checkinsHTML({ esc }, { id: 'kt', lastLog: 'Newest <check-in>' }, 'fallback'), /Newest &lt;check-in&gt;/);
+  assert.match(checkinsHTML({ esc }, { id: 'never-loaded', lastLog: 'Newest <check-in>' }, 'fallback'), /Newest &lt;check-in&gt;/);
   assert.match(checkinsHTML({ esc }, null, 'No Keep card for this session'), /No Keep card for this session/);
 });
 
@@ -95,4 +120,11 @@ test('the picture is off until switched on, then drawn through an img data URI',
   assert.match(src, /%3Ccircle/);
   assert.doesNotMatch(src, /[<>]/, 'the markup is URI-encoded, not inlined');
   assert.equal(requests.length, 2, 'a fresh picture for the same version is not refetched');
+
+  // A final answer with no picture for the new input clears the old one.
+  answer = { svg: null, fresh: true };
+  const third = { id: 'kt', _detailVersion: 'v3' };
+  pictureHTML(ctx, third);
+  await settle();
+  assert.match(pictureHTML(ctx, third), /No picture/);
 });

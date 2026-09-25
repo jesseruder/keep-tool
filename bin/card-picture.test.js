@@ -27,6 +27,13 @@ test('the input is the title and the last three check-ins', () => {
   assert.equal(picture.pictureInput({ id: 'x', fm: {}, body: '' }), '');
 });
 
+test('entries Keep or the reviewer wrote do not change the input, so they never redraw', () => {
+  const withNoise = { ...task, body: `${task.body}\n## 2026-09-24 09:00 — check result (agent) → waiting\nProbe passed.\n`
+    + '\n## 2026-09-24 10:00 — agent run (claude) → active\nStarted.\n'
+    + '\n## 2026-09-24 11:00 — check-in (reviewer fable) → active\nMoved.\n' };
+  assert.equal(picture.pictureInput(withNoise), picture.pictureInput(task));
+});
+
 test('only a single passive svg element survives', () => {
   const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 200"><rect width="10" height="10"/></svg>';
   assert.equal(picture.extractSvg(`Here you go:\n\`\`\`svg\n${svg}\n\`\`\``), svg);

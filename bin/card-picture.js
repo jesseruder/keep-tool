@@ -16,6 +16,9 @@ const MODEL = process.env.KEEP_PICTURE_MODEL || 'claude-sonnet-5';
 const ENTRIES = 3;
 const ENTRY_LIMIT = 600;
 const MAX_SVG_BYTES = 64 * 1024;
+// Entries Keep or the fleet reviewer wrote, check results included: a card with a
+// frequent check would otherwise be redrawn on every result nobody changed.
+const AUTOMATED_KIND_RE = /^(?:check result \(agent\)|agent run\b|delivery warning|review \()|\(reviewer\b/;
 
 const INSTRUCTION = [
   'Draw one small illustration of what the work described in the source is about, as a single SVG.',
@@ -28,7 +31,9 @@ const INSTRUCTION = [
 
 function pictureInput(task) {
   const title = String((task && task.fm && task.fm.title) || '').trim();
-  const entries = logEntries(task && task.body).slice(-ENTRIES)
+  const entries = logEntries(task && task.body)
+    .filter((entry) => !AUTOMATED_KIND_RE.test(entry.heading.split(' — ').slice(1).join(' — ')))
+    .slice(-ENTRIES)
     .map((entry) => `${entry.heading.split(' — ')[0]}: ${String(entry.text || '').replace(/\s+/g, ' ').slice(0, ENTRY_LIMIT)}`);
   if (!title && !entries.length) return '';
   return [`Card: ${title}`, ...entries].join('\n');
