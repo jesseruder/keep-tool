@@ -33,7 +33,8 @@ daemon polls due recipes every minute.
   `--check-after` to reschedule). Busy sessions retain approximately two hours of default
   deferral before Keep opens a session instead.
 - Otherwise Keep opens a fresh interactive Claude session on the card and types the same
-  instruction into it — nothing runs headless. At most one such session per card per day,
+  instruction into it — nothing runs headless. At most one such session per card per day
+  (one per interval for a card that re-arms more often than daily, such as `--check-every +4h`),
   and none while the checks account (the automation pool's pick for `checks`) has its
   usage window exhausted (the card records a
   `check deferred` note and stays overdue). A deferral has a ceiling: on the second

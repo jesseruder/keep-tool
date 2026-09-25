@@ -28,7 +28,7 @@ test('scheduled-task timer polls each minute and matches health cadence', () => 
 const {
   checkDeliveryMessage, planDueCard, deliveryWarning, cardFingerprint, pendingCheckin,
   probePayload, startProbe, probeDue, escalateProbeFailure,
-  isTransientStartError, MAX_CONCURRENT_PROBES, _resetSchedulerState,
+  isTransientStartError, MAX_CONCURRENT_PROBES, _resetSchedulerState, _resetSchedulerStateInMemory,
   budgetDeferralReason, noteBudgetDeferral, reapEphemeralPane, sweepEphemeralPanes,
   MAX_FRESH_OPENS_PER_TICK, MAX_DEFERRAL_NOTICES_PER_TICK, EPHEMERAL_IDLE_MS,
   FRESH_OPEN_STAMP_TTL_MS, readDeliveryStamp, writeDeliveryStamp, stampExpired,
@@ -596,6 +596,29 @@ test('the sweep idles an agent whose check pane it closed, or whose pane lost th
   }, now);
   assert.deepEqual(reaped, ['orphan-pane']);
   assert.deepEqual(written, []);
+});
+
+test('a card that re-arms more often than daily gets one fresh session per interval', async () => {
+  _resetSchedulerState();
+  try {
+    const open = async () => ({ ok: true, sessionId: 'sid-4h', pane: 'p4' });
+    const budget = { code: 0 };
+    const at = (now) => (t, today, accountId) => freshOpenRefusal(t, today, accountId, { checkBudget: () => budget, now });
+    const task = card({ check_on_pass: 'rearm', check_every: '+4h' });
+    const t0 = Date.parse('2026-09-25T06:00:00Z');
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t0) })).skipped, undefined);
+    // The same day, but not the same interval: refused until four hours have passed.
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(t0 + 3600e3) })).skipped, 'opened-within-interval');
+    // The interval is judged in wall time from the recorded open, which survives a restart.
+    assert.ok(loadSchedulerState().openedAt.get('some-card') > 0);
+    _resetSchedulerStateInMemory();
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-25', open, refusal: at(Date.now() + 4 * 3600e3 + 1000) })).skipped, undefined);
+    // A daily or one-shot card keeps the one-per-day rule.
+    _resetSchedulerState();
+    const daily = card({ check_on_pass: 'rearm', check_every: '+1d' });
+    assert.equal((await openFreshCheckSession(daily, { today: '2026-09-25', open, refusal: at(t0) })).skipped, undefined);
+    assert.equal((await openFreshCheckSession(daily, { today: '2026-09-25', open, refusal: at(t0 + 5 * 3600e3) })).skipped, 'opened-today');
+  } finally { _resetSchedulerState(); }
 });
 
 test('the per-day and per-tick allowances survive a restart, and verify ignores them', async () => {

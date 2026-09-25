@@ -353,12 +353,37 @@ function loadSchedulerState() {
       budgetNotice: dayRecord(parsed && parsed.budgetNotice),
       reopened: dayRecord(parsed && parsed.reopened),
       deferred: checkDeferrals.parse(parsed && parsed.deferred),
+      openedAt: timeRecord(parsed && parsed.openedAt),
     };
   } catch (e) {
     process.stderr.write(`keep runs: scheduler state was unreadable and has been reset: ${e.message}\n`);
-    schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map(), deferred: new Map() };
+    schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map(), deferred: new Map(), openedAt: new Map() };
   }
   return schedulerState;
+}
+
+const DAY_MS = 24 * 3600e3;
+
+// taskId -> ms of the last session the scheduler opened on it. Beside `opened`'s
+// day: a card that re-arms more often than daily is allowed a fresh session once
+// its interval has passed, which a day record cannot tell.
+function timeRecord(value) {
+  const map = new Map();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return map;
+  for (const [id, at] of Object.entries(value)) {
+    if (typeof id === 'string' && id && Number.isFinite(Number(at)) && Number(at) > 0) map.set(id, Number(at));
+  }
+  return map;
+}
+
+// How often a re-arming card may be opened: its `check_every`, when that is under a
+// day (never less than MIN_CHECK_EVERY_MS, which cleanCheckEvery already enforces).
+// Null for every other card, which keeps the one-per-day rule.
+function subDailyEveryMs(task) {
+  const fm = task && task.fm || {};
+  if (fm.check_on_pass !== 'rearm' || !fm.check_every) return null;
+  const every = keep.relativeDurationMs(String(fm.check_every));
+  return Number.isFinite(every) && every > 0 && every < DAY_MS ? every : null;
 }
 
 // Written whole, atomically, and pruned to today: this file is bookkeeping, not a log,
@@ -374,6 +399,9 @@ function saveSchedulerState(today = keep.nowStamp().slice(0, 10)) {
     // Not a day record: a deferral streak has to be able to see across midnight, so
     // this bucket prunes on its own retention rather than on today's date.
     deferred: checkDeferrals.serialize(state.deferred),
+    // Nor is this one: a sub-daily interval is judged in wall time, so it keeps a
+    // day's worth and drops the rest.
+    openedAt: Object.fromEntries([...state.openedAt].filter(([, at]) => Date.now() - at < DAY_MS)),
   };
   const tmp = `${SCHEDULER_STATE_FILE}.${process.pid}.${Date.now()}.tmp`;
   try {
@@ -668,7 +696,12 @@ function resetTickAllowance() { freshOpensThisTick = 0; allowanceTick += 1; }
 // Everything that can refuse an open before one is attempted, in one place so the
 // scheduler path and the probe-escalation path cannot drift apart.
 function freshOpenRefusal(task, today, accountId, deps = {}) {
-  if (markedToday('opened', task.id, today)) return { skipped: 'opened-today' };
+  const every = subDailyEveryMs(task);
+  if (every) {
+    // A card that re-arms more often than daily: one fresh session per interval.
+    const last = loadSchedulerState().openedAt.get(task.id) || 0;
+    if ((deps.now || Date.now()) - last < every) return { skipped: 'opened-within-interval' };
+  } else if (markedToday('opened', task.id, today)) return { skipped: 'opened-today' };
   if (freshOpensThisTick >= MAX_FRESH_OPENS_PER_TICK) return { skipped: 'tick-cap' };
   const denial = budgetDeferralReason((deps.checkBudget || checkBudget)(accountId));
   if (denial) return { skipped: 'budget', reason: denial };
@@ -750,7 +783,11 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
     throw error;
   }
   if (!enforce) freshOpensThisTick += 1;
-  if (enforce) markDay('opened', task.id, today);
+  if (enforce) {
+    markDay('opened', task.id, today);
+    loadSchedulerState().openedAt.set(task.id, Date.now());
+    saveSchedulerState(today);
+  }
   if (agentName && opened && opened.sessionId) {
     try {
       agentApi.writeRecord(agentName, {
@@ -1329,7 +1366,7 @@ async function schedulerTick() {
         }
         // A card whose open already failed for good today reaches here with nothing
         // tried for it (no thread took the check either), so it is not this tick's work.
-        if (outcome.skipped === 'opened-today' && givenUp.get(t.id) === today) didWork = workBefore;
+        if ((outcome.skipped === 'opened-today' || outcome.skipped === 'opened-within-interval') && givenUp.get(t.id) === today) didWork = workBefore;
         if (outcome.skipped) continue;
         clearBudgetDeferral(t.id, today);
         const { delivery, errors } = outcome;
@@ -1357,8 +1394,12 @@ async function schedulerTick() {
 
 // Test seam only: the per-day escalation budget and the probe bookkeeping are module
 // state, and a unit test has to start from a known one and leave none behind.
+// Forget the in-memory copy only, so the next load reads the file back: what a
+// daemon restart does.
+function _resetSchedulerStateInMemory() { schedulerState = null; }
+
 function _resetSchedulerState() {
-  schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map(), deferred: new Map() };
+  schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map(), deferred: new Map(), openedAt: new Map() };
   try { fs.unlinkSync(SCHEDULER_STATE_FILE); } catch {}
   openInFlight.clear();
   resetTickAllowance();
@@ -1385,5 +1426,5 @@ module.exports = {
   checkDeliveryMessage, checkDeliveryKey, planDueCard, deliveryWarning,
   cardFingerprint, pendingCheckin, onPassOutcome,
   probePayload, startProbe, startDueProbe, probeDue, landProbeResult, escalateProbeFailure,
-  isTransientStartError, MAX_CONCURRENT_PROBES, _resetSchedulerState,
+  isTransientStartError, MAX_CONCURRENT_PROBES, _resetSchedulerState, _resetSchedulerStateInMemory, subDailyEveryMs,
 };

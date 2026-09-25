@@ -2763,7 +2763,9 @@ delivery stamp, which stands until the schedule moves: a thread has Owner watchi
 while a session Keep opened by itself has nobody to notice that it died. When the TTL
 passes with no result, the stamp is discarded and the card is simply due again.
 
-Keep opens at most one scheduler session per card per local day and three per scheduler
+Keep opens at most one scheduler session per card per local day (a card that re-arms
+more often than daily — `check_every` under 24h — gets one per interval instead, judged
+in wall time from the last open recorded in `openedAt`) and three per scheduler
 tick. That bookkeeping is persisted to `.keep/runs/scheduler-state.json`, so a daemon
 restart does not hand every card a second pane. The account it spends is the automation
 pool's pick for the `checks` purpose (`docs/accounts.md`, **Automation pool**;
