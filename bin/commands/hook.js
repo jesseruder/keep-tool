@@ -3081,6 +3081,17 @@ function promptHook(input) {
 // transcript tail exactly as the daemon's compaction sweep reads it.
 const COMPACT_HINT_WINDOW_MS = 2 * 3600e3;
 
+// Whether this hook speaks for a session on a node other than the daemon's, where
+// `keep compact` is refused because the daemon cannot compact a session there yet: a
+// hook run on a pane-only node itself, or one the daemon runs for a node's session
+// (hook-route sets KEEP_HOOK_NODE to the calling node, and to its own for a local
+// caller). Such a session is told to run /compact itself.
+function sessionOnOtherNode(env) {
+  if (require('../nodes.js').paneOnlyNode(env)) return true;
+  const hookNode = env.KEEP_HOOK_NODE;
+  return Boolean(hookNode && hookNode !== (env.KEEP_DAEMON_NODE || env.KEEP_NODE_NAME));
+}
+
 function compactHint(sid, transcript, agent) {
   const hint = { text: '', used: false, add: (reason) => reason, mark: () => {} };
   const marker = path.join(META, 'compact-hinted', sid);
@@ -3093,7 +3104,10 @@ function compactHint(sid, transcript, agent) {
   let contextTokens = 0;
   try { contextTokens = lastTurnUsage(readTranscriptTail(transcript), agent).contextTokens; } catch { return hint; }
   if (!(contextTokens >= minTokens)) return hint;
-  hint.text = `[keep] context is ${Math.round(contextTokens / 1000)}k tokens. When this turn reaches a stopping point, run keep compact so the daemon compacts the session while it is idle.`;
+  const tokens = `[keep] context is ${Math.round(contextTokens / 1000)}k tokens. When this turn reaches a stopping point,`;
+  hint.text = sessionOnOtherNode(process.env)
+    ? `${tokens} run /compact yourself; Keep cannot compact a session on this node yet.`
+    : `${tokens} run keep compact so the daemon compacts the session while it is idle.`;
   hint.mark = () => {
     try { fs.mkdirSync(path.dirname(marker), { recursive: true }); fs.writeFileSync(marker, nowStamp()); } catch {}
   };
