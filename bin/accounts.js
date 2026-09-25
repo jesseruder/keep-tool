@@ -292,7 +292,14 @@ function sessionLocation(sessionId, options = {}) {
   const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
   const env = options.env || process.env;
   const record = readRecord(root, sessionId, env);
-  return record ? { node: record.node, agent: record.agent, ...(record.accountId ? { accountId: record.accountId } : {}) } : null;
+  // A transfer in flight stages its target: the session may already run there while
+  // the record still commits the source, so a caller judging where a hook came from
+  // sees both.
+  return record ? {
+    node: record.node, agent: record.agent,
+    ...(record.accountId ? { accountId: record.accountId } : {}),
+    ...(record.stagedAccountId ? { stagedAccountId: record.stagedAccountId } : {}),
+  } : null;
 }
 
 function pinSession(sessionId, agent, accountId, options = {}) {

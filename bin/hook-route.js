@@ -488,11 +488,16 @@ function validateRequest(body, caller, deps) {
     try { where = deps.location(sessionId); } catch { where = null; }
     if (!where || where.node !== caller) refuse(403, `session ${sessionId} is not on node ${caller}`, SESSION_NOT_ON_NODE);
     if (where.agent !== agent) refuse(403, `session ${sessionId} is a ${where.agent} session, not ${agent}`);
-    if (accountId && where.accountId && accountId !== where.accountId) {
+    // An account transfer stages its target before the relaunched agent's first hook:
+    // the record still commits the source, and the hook names the staged account.
+    // That hook is the transfer's own proof of its relaunch, so it is taken as the
+    // staged account's; any other account than those two is refused.
+    const staged = typeof where.stagedAccountId === 'string' && ACCOUNT_RE.test(where.stagedAccountId) ? where.stagedAccountId : null;
+    if (accountId && where.accountId && accountId !== where.accountId && accountId !== staged) {
       refuse(403, `session ${sessionId} runs on account ${where.accountId}, not ${accountId}`);
     }
     // The daemon's record is the authority; the node's word only fills a gap in it.
-    if (typeof where.accountId === 'string' && ACCOUNT_RE.test(where.accountId)) accountId = where.accountId;
+    if (!(staged && accountId === staged) && typeof where.accountId === 'string' && ACCOUNT_RE.test(where.accountId)) accountId = where.accountId;
   }
   // When a replayed event fired, on the node's clock: the time its attention marker
   // carries. Never later than now.

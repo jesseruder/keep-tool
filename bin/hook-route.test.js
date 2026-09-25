@@ -1878,3 +1878,23 @@ test('a node\'s context ask whose adoption outlasts the client timeout answers f
   assert.ok(answered[0].ms >= 1900 && answered[0].ms < 3000, `the adoption ran to its deadline (${answered[0].ms} ms)`);
   assert.equal(JSON.parse(fs.readFileSync(client.contextFile(nodeEnv), 'utf8')).at, 1, 'the late answer never reached the cache');
 });
+
+test('a hook from the staged account of a transfer in flight is taken as that account\'s; a third account is refused', async (t) => {
+  // An account transfer stages its target before the relaunched agent's first hook,
+  // and that SessionStart is the transfer's own proof of the relaunch: the record still
+  // commits the source, the hook names the staged account, and it must run under the
+  // staged one so the pane record the transfer waits for carries it.
+  const locations = { ...LOCATIONS, 'sess-aws1': { node: 'aws1', agent: 'claude', accountId: 'claude-node', stagedAccountId: 'claude-next' } };
+  const { hooks, calls } = services(t, { locations, answer: () => ({ code: 0, stdout: '', stderr: '' }) });
+  const staged = await hooks.handle(AWS1, body({ identity: { agent: 'claude', sessionId: 'sess-aws1', accountId: 'claude-next' }, transcript: transcript('') }));
+  assert.equal(staged.status, 200, JSON.stringify(staged.body));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.env.KEEP_AGENT_ACCOUNT_ID, 'claude-next', 'the staged account, not the committed one');
+  const committed = await hooks.handle(AWS1, body({ identity: { agent: 'claude', sessionId: 'sess-aws1', accountId: 'claude-node' }, transcript: transcript(''), idempotencyKey: `${KEY}-staged-2` }));
+  assert.equal(committed.status, 200, JSON.stringify(committed.body));
+  assert.equal(calls[1].options.env.KEEP_AGENT_ACCOUNT_ID, 'claude-node');
+  const other = await hooks.handle(AWS1, body({ identity: { agent: 'claude', sessionId: 'sess-aws1', accountId: 'claude-other' }, transcript: transcript(''), idempotencyKey: `${KEY}-staged-3` }));
+  assert.equal(other.status, 403);
+  assert.match(other.body.error, /runs on account claude-node, not claude-other/);
+  assert.equal(calls.length, 2, 'the refused hook never ran');
+});
