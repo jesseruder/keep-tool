@@ -97,6 +97,12 @@ call or a write.
 The daemon runs from the main keep-tool checkout, which must stay clean: work in a
 worktree, then land. `wt land` fast-forwards a ready main checkout and restarts the
 daemon; it reports a skipped or failed deployment for the landing session to inspect.
+It then runs `keep nodes update`, which has every other node fast-forward its own
+keep-tool checkout and reload its host (sessions kept); a node that is down, or whose
+checkout is dirty or off master, is named in a `node update:` line and left alone.
+Run `keep nodes update` yourself to retry one. A host older than this answers that it
+predates `update-self`: pull there by hand once (`git -C ~/keep-tool pull --ff-only &&
+keep host reload`).
 It then watches `keep health` for up to 90 seconds and names any scheduler that was
 healthy before the restart and failed after it, with the landed range and the
 `git revert` to run in a fresh worktree (it never reverts itself); give it a command

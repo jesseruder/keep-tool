@@ -3846,6 +3846,9 @@ function helpText() {
   keep nodes rm <name>
   keep nodes usage <node> <account>
                            # that account's usage as the node itself reads it
+  keep nodes update [<node>…] [--no-reload] [--json]
+                           # every other node fast-forwards its keep-tool checkout and reloads its host;
+                           # wt land runs it after a keep-tool deploy
   keep node init <name> --daemon-node <name> --listen <ip:port> --token-file <path> [--sock <path>]
                            # on the node itself: install the host-only service
   keep node audit <name> [--json] [--all]
@@ -4265,7 +4268,10 @@ if (require.main === module) {
         await allowRemote(rest, remote);
         return;
       }
-      if (remote && require('./registry-commands.js').isRegistryCommand(cmd || 'list')) {
+      // `keep nodes` answers for this machine (ls, usage) except `update`, which
+      // only the daemon can run: it holds the node list and their tokens.
+      const localNodes = cmd === 'nodes' && rest[0] !== 'update';
+      if (remote && !localNodes && require('./registry-commands.js').isRegistryCommand(cmd || 'list')) {
         // The commits and the Codex job a review names are in this node's worktree and
         // jobs directory, so they are resolved here and sent as facts.
         const args = cmd === 'reviewed' || cmd === 'reviewing'

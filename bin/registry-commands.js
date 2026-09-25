@@ -45,7 +45,14 @@ const REGISTRY_COMMANDS = Object.freeze([
   // Cards and conversations in one read (bin/commands/turns.js search): a node's
   // agent already reads any card with `show`; --all is refused as for turns.
   'search',
+  // Only `nodes update` (NODES_READS below is its whole list): after a node's land
+  // restarts the daemon, the node asks it to bring every node, itself included, up
+  // to origin (bin/node-update.js). It can only fast-forward to what origin has.
+  'nodes',
 ]);
+
+const NODES_ALLOWED = Object.freeze(['update']);
+const NODES_REFUSAL = 'a node runs only keep nodes update; the rest runs on the daemon node';
 
 const TURNS_READS = Object.freeze(['search', 'show', 'stats']);
 const TURNS_REFUSAL = `a node runs only keep turns ${TURNS_READS.join('|')}; the rest runs on the daemon node`;
@@ -145,6 +152,7 @@ const BOOLEAN_FLAGS = Object.freeze({
   open: ['fresh'],
   turns: ['json', 'all'],
   search: ['json', 'all', 'cards', 'conversations'],
+  nodes: ['json', 'no-reload'],
 });
 
 // The arguments each registry command resolves as a project (keep-core
@@ -199,6 +207,7 @@ function argumentRefusal(command, args, identity = {}) {
     if (arg.includes('\0')) return 'an argument contains a NUL byte';
   }
   if ((command === 'turns' || command === 'search') && turnsRefusal(args, command)) return turnsRefusal(args, command);
+  if (command === 'nodes' && !NODES_ALLOWED.includes(args[0])) return NODES_REFUSAL;
   if (Object.prototype.hasOwnProperty.call(SESSION_REFUSALS, command) && !identity.session) return SESSION_REFUSALS[command];
   if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return WAIT_CAP_REFUSAL;
   const newline = (arg) => /[\r\n]/.test(arg);
@@ -353,6 +362,7 @@ function isWaitingTell(command, args) {
 function nodeSideRefusal(command, args) {
   if (!Array.isArray(args)) return null;
   if ((command === 'turns' || command === 'search') && turnsRefusal(args, command)) return turnsRefusal(args, command);
+  if (command === 'nodes' && !NODES_ALLOWED.includes(args[0])) return NODES_REFUSAL;
   const fileFlags = Object.prototype.hasOwnProperty.call(NODE_FILE_FLAGS, command) ? NODE_FILE_FLAGS[command] : [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];

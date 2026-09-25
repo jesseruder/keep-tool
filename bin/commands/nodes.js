@@ -13,7 +13,7 @@ const registry = require('../node-registry.js');
 
 const commands = {};
 
-const USAGE = 'usage: keep nodes [ls] | keep nodes add <name> --address <ip:port> [--capabilities a,b] | keep nodes rm <name> | keep nodes usage <node> <account>';
+const USAGE = 'usage: keep nodes [ls] | keep nodes add <name> --address <ip:port> [--capabilities a,b] | keep nodes rm <name> | keep nodes usage <node> <account> | keep nodes update [<node>…] [--no-reload] [--json]';
 
 function root() {
   return require('../keep-core.js').ROOT;
@@ -229,6 +229,48 @@ async function nodeUsage(argv, deps) {
   }
 }
 
+// Every other machine catches up with what origin has: each node's host
+// fast-forwards its own keep-tool checkout (bin/node-update.js) and reloads onto
+// it. wt land runs this after it restarts the daemon, so a land reaches every node.
+// A node that is down, or whose checkout someone is working in, is reported and
+// skipped; the rest are not held up by it.
+async function updateNodes(argv, deps) {
+  const o = parseArgs(argv, { json: 'bool', 'no-reload': 'bool' });
+  let entries;
+  try { entries = registry.listNodes(); }
+  catch (error) { return die(error.message); }
+  const wanted = new Set(o._);
+  for (const name of wanted) {
+    if (!entries.some((entry) => entry.name === name)) die(`no such node: ${name}`);
+  }
+  const targets = entries.filter((entry) => !entry.daemon && !entry.invalid && (!wanted.size || wanted.has(entry.name)));
+  const connect = deps.connect || require('../hostclient.js').connect;
+  const { describeUpdate } = require('../node-update.js');
+  const rows = await Promise.all(targets.map(async (entry) => {
+    let client;
+    try {
+      client = await connect({ node: entry.name, timeoutMs: deps.timeoutMs == null ? 5000 : deps.timeoutMs });
+      const hello = client.descriptor || await client.request('hello');
+      if (!hello.updateSelf) {
+        return { node: entry.name, error: 'its host predates update-self: run `git -C ~/keep-tool pull --ff-only && keep host reload` there once' };
+      }
+      const result = await client.request('update-self', { reload: o['no-reload'] !== true },
+        { timeoutMs: deps.updateTimeoutMs == null ? 120e3 : deps.updateTimeoutMs });
+      return { node: entry.name, ...result };
+    } catch (error) {
+      return { node: entry.name, error: `unreachable: ${error.message}` };
+    } finally {
+      if (client) { try { client.close(); } catch {} }
+    }
+  }));
+  if (o.json) console.log(JSON.stringify(rows));
+  else if (!rows.length) console.log('no other nodes to update');
+  else for (const row of rows) console.log(describeUpdate(row.node, row));
+  // A node left behind is worth a non-zero exit, so a caller can tell; wt land
+  // prints it and carries on.
+  if (rows.some((row) => row.error || row.status === 'refused')) process.exitCode = 1;
+}
+
 const AUDIT_USAGE = 'usage: keep node audit <name> [--json] [--all]';
 const AUDIT_TIMEOUT_MS = 60e3;
 
@@ -324,8 +366,9 @@ commands.nodes = async (argv, deps = {}) => {
   if (subcommand === 'add') return addNode(rest, deps);
   if (subcommand === 'rm') return removeNode(rest, deps);
   if (subcommand === 'usage') return nodeUsage(rest, deps);
+  if (subcommand === 'update') return updateNodes(rest, deps);
   if (subcommand.startsWith('-')) return listNodes(argv, deps);
   return die(USAGE);
 };
 
-module.exports = { commands, renderNodes, renderUsage, nodeAudit, auditScope, USAGE, AUDIT_USAGE };
+module.exports = { commands, renderNodes, renderUsage, updateNodes, nodeAudit, auditScope, USAGE, AUDIT_USAGE };

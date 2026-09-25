@@ -568,7 +568,9 @@ const DEPLOY_AFTER_LAND = {
   // its own git-pull only syncs the ~/keep registry, never the code.
   // `watchHealth`: after the restart, watch the daemon's health rows for a
   // regression this land caused (watchDeployHealth).
-  'keep-tool': { restart: ['keep', 'restart-daemon'], watchHealth: true },
+  // `updateNodes`: then every other machine fast-forwards its own checkout onto the
+  // land (bin/node-update.js), so its CLI, hooks and host run the same code.
+  'keep-tool': { restart: ['keep', 'restart-daemon'], watchHealth: true, updateNodes: ['keep', 'nodes', 'update'] },
 };
 
 // How long `wt land` watches the restarted daemon before it reports and exits. Most
@@ -794,11 +796,28 @@ function deployAfterLand(main, defaultName, sha, opts = {}) {
       return { deployed: false, why: 'restart', output };
     }
     if (output) note(output);
+    const nodes = plan.updateNodes ? updateNodesAfterLand(plan.updateNodes, run, note) : null;
     const health = before ? watchDeployHealth(main, sha, before, { ...opts, from: head }) : null;
-    return { deployed: true, output, ...(health ? { health } : {}) };
+    return { deployed: true, output, ...(nodes ? { nodes } : {}), ...(health ? { health } : {}) };
   } catch (error) {
     note(`post-land deploy failed: ${describe(error)}`);
     return { deployed: false, why: 'error' };
+  }
+}
+
+// Each line `keep nodes update` prints is one node's outcome; a node left behind
+// is reported, never a reason to call the land itself a failure.
+function updateNodesAfterLand(command, run, note) {
+  try {
+    const [program, ...args] = command;
+    const result = run(program, args) || {};
+    const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+    for (const line of output.split('\n').filter(Boolean)) note(`node update: ${line}`);
+    if (result.status !== 0 && !output) note(`${command.join(' ')} exited ${result.status}`);
+    return { ok: result.status === 0, output };
+  } catch (error) {
+    note(`node update failed: ${String(error && error.message || error)}`);
+    return { ok: false, output: '' };
   }
 }
 
@@ -820,7 +839,22 @@ function deployOnDaemon(main, defaultName, sha, opts = {}) {
       note(`${project} runs on node ${node.daemon}, and this node has no KEEP_DAEMON_URL to ask it to deploy; it is still running the old code`);
       return Promise.resolve({ deployed: false, why: 'no-daemon-url' });
     }
-    return remote.deploySelf(where, { sha, project }, { note, ...(opts.deployDeps || {}) });
+    return remote.deploySelf(where, { sha, project }, { note, ...(opts.deployDeps || {}) }).then(async (result) => {
+      // The daemon is on the land (or past it); now every other machine, this one
+      // included, catches up through it (bin/node-update.js). Reported, never fatal.
+      if (!plans[project].updateNodes || !(result.deployed || result.why === 'ahead')) return result;
+      try {
+        // `keep nodes update …`, forwarded: the daemon holds the node list and tokens.
+        const [, command, ...args] = plans[project].updateNodes;
+        const answer = await (opts.runRemote || remote.runRemote)(command, args, { where, ...(opts.deployDeps || {}) });
+        const output = `${answer.stdout || ''}${answer.stderr || ''}`.trim();
+        for (const line of output.split('\n').filter(Boolean)) note(`node update: ${line}`);
+        return { ...result, nodes: { ok: answer.code === 0, output } };
+      } catch (error) {
+        note(`node update failed: ${String(error && error.message || error)}`);
+        return result;
+      }
+    });
   } catch (error) {
     note(`post-land deploy failed: ${String(error && error.message || error)}`);
     return Promise.resolve({ deployed: false, why: 'error' });

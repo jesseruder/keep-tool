@@ -411,7 +411,8 @@ test('the deploy advances to the sha that was landed, not to wherever the shared
     git(f.main, 'reset', '-q', '--hard', mine);
     const exact = wt.deployAfterLand(f.main, 'main', mine, { runDeploy: (...args) => { restarts.push(args); return { status: 0 }; } });
     assert.equal(exact.deployed, true);
-    assert.equal(restarts.length, 1);
+    assert.deepEqual(restarts, [['keep', ['restart-daemon']], ['keep', ['nodes', 'update']]],
+      'the restart, then every other machine catches up');
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 

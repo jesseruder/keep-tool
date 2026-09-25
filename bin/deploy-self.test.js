@@ -200,6 +200,7 @@ test('keep land on a node gates with the daemon\'s facts, pushes, checks in and 
     if (body.command === 'land-facts') {
       return { status: 200, body: { status: 0, stdout: `${JSON.stringify({ id: 'card', grants: ['land'], records: [], obligations: [], optOut: '' })}\n`, stderr: '' } };
     }
+    if (body.command === 'nodes') return { status: 200, body: { status: 0, stdout: 'aws1: already at abcdefabcdef\n', stderr: '' } };
     return { status: 200, body: { status: 0, stdout: 'checked in\n', stderr: '' } };
   });
   const result = await runKeep(['land', 'card'], { env: { ...n.env, KEEP_DAEMON_URL: daemon.url }, cwd: n.tree });
@@ -207,7 +208,10 @@ test('keep land on a node gates with the daemon\'s facts, pushes, checks in and 
   assert.match(result.stdout, new RegExp(`^card: landed ${sha.slice(0, 12)} onto origin/master\\n`));
   assert.equal(git(n.origin, 'rev-parse', 'master'), sha, 'the node pushed');
   // The check-in before the deploy: deploy-self restarts the daemon that records it.
-  assert.deepEqual(daemon.requests.map((entry) => entry.url), ['/api/registry', '/api/registry', '/api/deploy-self']);
+  // Then every node, this one included, is brought up to the land through it.
+  assert.deepEqual(daemon.requests.map((entry) => entry.url), ['/api/registry', '/api/registry', '/api/deploy-self', '/api/registry']);
+  assert.deepEqual([daemon.requests[3].body.command, daemon.requests[3].body.args], ['nodes', ['update']]);
+  assert.match(result.stderr, /wt: node update: aws1: already at abcdefabcdef/);
   assert.deepEqual(daemon.requests[0].body.args, ['card']);
   assert.deepEqual(daemon.requests[2].body, { sha, project: 'keep-tool' });
   assert.equal(daemon.requests[2].headers['x-keep-node-token'], 'aws1-secret');

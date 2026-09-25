@@ -1233,6 +1233,9 @@ function createHost(options = {}) {
           spawnReceipts: true,
           // secretWrite: this host answers the `secret-write` verb (bin/secret-files.js).
           secretWrite: 1,
+          // updateSelf: this host answers `update-self` (bin/node-update.js), a
+          // fast-forward of its own keep-tool checkout that `keep nodes update` asks for.
+          updateSelf: 1,
           bootVersion: options.boot && options.boot.version || null,
           panes: panes.size, pid: process.pid, sock,
           residentTerminals: [...panes.values()].filter((pane) => pane.term).length,
@@ -1319,6 +1322,18 @@ function createHost(options = {}) {
         // machine the asking agent runs on. The destination is checked again on this
         // filesystem (bin/secret-files.js); the answer names the file, never the value.
         return { result: require('./secret-files.js').handle(params) };
+      }
+      case 'update-self': {
+        // The daemon asking this machine to run the code it just landed. Only a
+        // fast-forward of this checkout; a host that moved reloads itself after
+        // answering, keeping its panes, unless the caller asked it not to.
+        const result = await require('./node-update.js').updateSelf();
+        const reload = result.status === 'updated' && params.reload !== false
+          && options.boot && typeof options.boot.reload === 'function';
+        return {
+          result: { ...result, reloading: Boolean(reload) },
+          ...(reload ? { after: () => options.boot.reload().catch((error) => eventLog(`host: reload after update failed: ${error.message}`)) } : {}),
+        };
       }
       case 'process': {
         // This machine's process table, for this machine's panes. The bootId rides
