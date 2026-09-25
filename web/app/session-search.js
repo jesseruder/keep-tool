@@ -52,7 +52,7 @@ export function sessionRowHTML(row, index, selected, esc) {
 }
 
 export function installSessionSearch({ rows, recentIds, open, esc }) {
-  let dialog, input, list, all = [], results = [], selected = 0;
+  let dialog, input, list, returnTo = null, all = [], results = [], selected = 0;
   const render = () => {
     list.innerHTML = results.map((row, index) => sessionRowHTML(row, index, index === selected, esc)).join('')
       || '<li class="empty">No matching sessions</li>';
@@ -61,9 +61,9 @@ export function installSessionSearch({ rows, recentIds, open, esc }) {
     list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
   };
   const search = () => { results = rankSessions(all, input.value, recentIds()); selected = 0; render(); };
-  // Blur first so closing does not hand focus back to the terminal being left:
-  // its focusin would take control of that pane just before we navigate away.
-  const choose = (row) => { if (!row) return; input.blur(); dialog.close(); open(row.id); };
+  // Choosing a session leaves focus to the navigation; handing it back to the
+  // terminal being left would take control of that pane on its way out.
+  const choose = (row) => { if (!row) return; returnTo = null; dialog.close(); open(row.id); };
   const build = () => {
     dialog = document.createElement('dialog');
     dialog.className = 'session-search-dialog';
@@ -94,13 +94,24 @@ export function installSessionSearch({ rows, recentIds, open, esc }) {
     dialog.addEventListener('mousedown', (event) => { if (event.target !== input) event.preventDefault(); });
     // A click on the backdrop lands on the dialog itself.
     dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
+    // A modal dialog always refocuses whatever had focus before showModal(), so
+    // show() blurs that first and a dismissal (Escape, the backdrop) restores it here.
+    dialog.addEventListener('close', () => {
+      const target = returnTo;
+      returnTo = null;
+      if (target?.isConnected) target.focus();
+    });
     document.body.append(dialog);
   };
   return {
     get open() { return Boolean(dialog?.open); },
     show() {
       if (!dialog?.isConnected) build();
-      if (!dialog.open) dialog.showModal();
+      if (!dialog.open) {
+        returnTo = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
+        returnTo?.blur();
+        dialog.showModal();
+      }
       all = rows();
       input.select();
       search();
