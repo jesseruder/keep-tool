@@ -1568,6 +1568,20 @@ typed-text confirmation, delivery journal, transcript receipt — and every guar
 re-checked inside that lock immediately before the first character and again after the
 text is on screen and before Enter, where the box must hold only this message.
 
+A Claude session on another node has no transcript until its first prompt is submitted,
+and its node answers a transcript read with `transcript-missing`. A send to such a
+session (`keep open`'s opening message, `keep tell`, `keep pane send`, the console) does
+not refuse on that: it judges the empty prompt from the screen and types into the
+session's own live pane on its node, but only when every witness agrees the session never
+had a turn (the daemon holds no mirror, no delivery journal and no turn-index rows for
+it, the pane's account is the location record's and no handoff is staged), the pane is
+the one a fresh listing named, nobody typed there in the last two seconds, and the box
+is empty with no turn, dialog or trust screen showing. No delivery journal or receipt is
+written for it, since there is no transcript to take one from, and a session with no
+transcript yet ranks after every thread with turns when a card is told. A pane opened
+for Owner to type into himself is refused. Any other missing transcript is still the
+node's refusal.
+
 The daemon builds the frame, so a caller cannot dress its message up as Owner or as
 Keep: the recipient reads who sent it, which card they are on, and that it grants no
 approval or permission. The card is validated as a card id and the text as plain
