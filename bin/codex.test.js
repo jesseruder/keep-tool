@@ -311,3 +311,35 @@ test('resolveRollout searches once, caches for sessionFor and sessionMetaFor, an
     assert.equal(result.stagedMeta, null);
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+test('a model reply after a recorded usage limit is found on its account, and an error-only turn is not', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-answered-'));
+  try {
+    const home = path.join(dir, 'codex-home');
+    const day = new Date();
+    const dated = path.join(home, 'sessions', String(day.getFullYear()), String(day.getMonth() + 1).padStart(2, '0'), String(day.getDate()).padStart(2, '0'));
+    fs.mkdirSync(dated, { recursive: true });
+    const configFile = path.join(dir, 'config.json');
+    fs.writeFileSync(configFile, JSON.stringify({ version: 1, accounts: [{ id: 'codex-test', label: 'Test', agent: 'codex', configDir: home }],
+      defaultAccounts: { codex: 'codex-test' } }));
+    const env = { ...process.env, KEEP_DIR: dir, KEEP_CONFIG: configFile };
+    const since = Date.now() - 3600e3;
+    const at = (ms) => new Date(ms).toISOString();
+    const limited = path.join(dated, 'rollout-limited.jsonl');
+    fs.writeFileSync(limited, [
+      { timestamp: at(since - 60e3), type: 'event_msg', payload: { type: 'agent_message', message: 'before the limit' } },
+      { timestamp: at(since + 60e3), type: 'event_msg', payload: { type: 'user_message', message: 'go' } },
+      { timestamp: at(since + 61e3), type: 'event_msg', payload: { type: 'error', message: "You've hit your usage limit." } },
+    ].map(JSON.stringify).join('\n') + '\n');
+    assert.equal(codex.lastReplyAt(limited), since - 60e3);
+    assert.equal(codex.answeredSince('codex-test', since, env), null, 'an error after the mark is not a reply');
+
+    const answered = path.join(dated, 'rollout-answered.jsonl');
+    fs.writeFileSync(answered, [
+      { timestamp: at(since + 120e3), type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] } },
+    ].map(JSON.stringify).join('\n') + '\n');
+    assert.deepEqual(codex.answeredSince('codex-test', since, env), { at: since + 120e3, file: answered });
+    assert.equal(codex.answeredSince('codex-test', since + 180e3, env), null);
+    assert.equal(codex.answeredSince('codex-other', since, env), null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

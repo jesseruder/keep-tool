@@ -259,6 +259,7 @@ function openFlowContext(selection, result) {
     reopeningSessions: new Map(),
     reload: async () => {}, paneMap: () => new Map(), taskFor: () => null, toast: (message) => toasts.push(message),
     openSessionChooser: async (_ctx, options) => { context.chooserOptions = options; await options.onSubmit(selection); return true; },
+    defaultModels: () => ({ claude: 'claude-opus-5-5[1m]', codex: '', pi: '' }),
     openPortableTransfer() {}, pinPane() {}, dropPane: async () => {}, startShell: async () => assert.fail('not a shell'),
     ctx: { openReviewPane() {} }, crypto: { randomUUID: () => 'request-1' },
     state: {}, projectOf: () => ({ name: 'repo' }), refresh() {},

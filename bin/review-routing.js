@@ -122,6 +122,23 @@ function clearExhausted(accountId, options = {}) {
   return had;
 }
 
+// A recorded limit also ends when the account answers again: a usage reset bought
+// mid-window never reaches this ledger, but the next Codex turn on that account does.
+// Split into what still holds and what a later reply has lifted.
+function unlifted(exhausted, deps = {}) {
+  const answeredSince = deps.answeredSince || ((id, since) => require('./codex.js').answeredSince(id, since, deps.env));
+  const held = new Map();
+  const lifted = [];
+  for (const [id, entry] of exhausted) {
+    const since = timeMs(entry.at);
+    let reply = null;
+    try { reply = since === null ? null : answeredSince(id, since); } catch { reply = null; }
+    if (reply) lifted.push({ accountId: id, ...entry, repliedAt: new Date(reply.at).toISOString() });
+    else held.set(id, entry);
+  }
+  return { held, lifted };
+}
+
 // ---------- the decision ----------
 
 function codexAccounts(root = keep.ROOT, deps = {}) {
@@ -144,16 +161,16 @@ function route(options = {}) {
   const now = options.now || Date.now();
   const settings = options.config || config(root);
   const accounts = options.codexAccounts || codexAccounts(root, options);
-  const exhausted = options.ledger || ledger(root, now);
+  const { held: exhausted, lifted } = unlifted(options.ledger || ledger(root, now), options);
   const available = accounts.filter((id) => !exhausted.has(id));
   const blocked = accounts.filter((id) => exhausted.has(id))
     .map((id) => ({ accountId: id, ...exhausted.get(id) }));
   if (!accounts.length) {
-    return { reviewer: '', accountId: '', why: 'no Codex account is registered', exhausted: blocked, fallback: settings.fallback };
+    return { reviewer: '', accountId: '', why: 'no Codex account is registered', exhausted: blocked, lifted, fallback: settings.fallback };
   }
   if (available.length) {
     return {
-      reviewer: 'codex', accountId: available[0], exhausted: blocked, fallback: settings.fallback,
+      reviewer: 'codex', accountId: available[0], exhausted: blocked, lifted, fallback: settings.fallback,
       why: blocked.length
         ? `${available[0]} is available; ${blocked.map((entry) => entry.accountId).join(', ')} exhausted`
         : `${available[0]} is available`,
@@ -162,12 +179,12 @@ function route(options = {}) {
   const until = blocked.map((entry) => entry.until).sort()[0] || '';
   if (!settings.fallback) {
     return {
-      reviewer: '', accountId: '', until, exhausted: blocked, fallback: '',
+      reviewer: '', accountId: '', until, exhausted: blocked, lifted, fallback: '',
       why: `every Codex account is exhausted${until ? ` until ${until}` : ''}, and no fallback reviewer is configured`,
     };
   }
   return {
-    reviewer: settings.fallback, accountId: '', until, exhausted: blocked, fallback: settings.fallback,
+    reviewer: settings.fallback, accountId: '', until, exhausted: blocked, lifted, fallback: settings.fallback,
     why: `every Codex account is exhausted${until ? ` until ${until}` : ''}; the configured fallback is ${settings.fallback}`,
   };
 }
@@ -180,7 +197,7 @@ function route(options = {}) {
 function fallbackReason(options = {}) {
   const root = options.root || keep.ROOT;
   const now = options.now || Date.now();
-  const exhausted = options.ledger || ledger(root, now);
+  const exhausted = unlifted(options.ledger || ledger(root, now), options).held;
   if (!exhausted.size) return '';
   // Only the accounts this install actually routes reviews to, and only what the ledger
   // says *now*. A window that has already reset and been replaced by another one would
@@ -207,6 +224,9 @@ function describe(decision) {
   for (const entry of decision.exhausted) {
     lines.push(`  exhausted: ${entry.accountId} until ${entry.until}${entry.note ? ` — ${entry.note}` : ''}`);
   }
+  for (const entry of decision.lifted || []) {
+    lines.push(`  lifted: ${entry.accountId} answered at ${entry.repliedAt}, after its limit was recorded at ${entry.at}`);
+  }
   if (!decision.fallback) {
     lines.push('  no fallback configured: add {"fallback": "opus"} to watch/review-routing.json to allow one');
   }
@@ -215,5 +235,5 @@ function describe(decision) {
 
 module.exports = {
   FALLBACK_REVIEWERS, configFile, ledgerFile, config, ledger, writeLedger,
-  markExhausted, clearExhausted, codexAccounts, route, fallbackReason, describe,
+  markExhausted, clearExhausted, unlifted, codexAccounts, route, fallbackReason, describe,
 };

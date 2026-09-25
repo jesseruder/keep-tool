@@ -103,6 +103,32 @@ test('a fallback is only taken when every Codex account is exhausted and one is 
   } finally { unconfigured.cleanup(); }
 });
 
+test('a Codex reply on the account after its limit was recorded lifts the mark', () => {
+  const box = fixture({ fallback: 'opus' });
+  const now = Date.now();
+  try {
+    const at = now - 2 * HOUR;
+    routing.markExhausted('codex-main', iso(now + 48 * HOUR), { root: box.root, now: at, withLock: (fn) => fn() });
+    routing.markExhausted('codex-secondary', iso(now + 48 * HOUR), { root: box.root, now: at, withLock: (fn) => fn() });
+    const asked = [];
+    // Only codex-secondary has answered since the limits were recorded.
+    const answeredSince = (id, since) => { asked.push([id, since]); return id === 'codex-secondary' ? { at: now - HOUR } : null; };
+    const decision = routing.route({ root: box.root, now, accounts: accounts('codex-main', 'codex-secondary'), answeredSince });
+    assert.deepEqual(asked.map(([id, since]) => [id, since]), [['codex-main', at], ['codex-secondary', at]]);
+    assert.equal(decision.reviewer, 'codex');
+    assert.equal(decision.accountId, 'codex-secondary');
+    assert.deepEqual(decision.exhausted.map((entry) => entry.accountId), ['codex-main']);
+    assert.deepEqual(decision.lifted.map((entry) => [entry.accountId, entry.repliedAt]), [['codex-secondary', iso(now - HOUR)]]);
+    assert.match(routing.describe(decision), /lifted: codex-secondary answered at /);
+    // The fallback stamp describes only the limit still in force.
+    assert.equal(routing.fallbackReason({ root: box.root, now, codexAccounts: ['codex-main', 'codex-secondary'], answeredSince }),
+      `codex-main exhausted until ${iso(now + 48 * HOUR)} as recorded`);
+    // A lookup that throws keeps the mark rather than guessing.
+    const kept = routing.route({ root: box.root, now, accounts: accounts('codex-main', 'codex-secondary'), answeredSince: () => { throw new Error('io'); } });
+    assert.equal(kept.reviewer, 'opus');
+  } finally { box.cleanup(); }
+});
+
 test('an install with no Codex account says so rather than claiming a fallback', () => {
   const box = fixture({ fallback: 'opus' });
   try {
@@ -142,11 +168,15 @@ test('the fallback reason describes the ledger, and only the accounts reviews ar
 
 test('keep review-route records and clears an account, and refuses an unknown one', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-routing-cli-'));
-  const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_NO_COMMIT: '1' };
+  // HOME too: the built-in Codex account reads ~/.codex, and a real reply there would lift the mark.
+  const env = { ...process.env, KEEP_DIR: root, HOME: root, KEEP_NO_PUSH: '1', KEEP_NO_COMMIT: '1' };
+  // An isolated registry: the real config's accounts would name the real home.
+  delete env.KEEP_CONFIG;
   const run = (...args) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'review-route', ...args],
     { encoding: 'utf8', env, cwd: root });
   try {
     fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.codex'), { recursive: true });
     const unknown = run('--exhausted', 'codex-nope', '--until', '+2h');
     assert.notEqual(unknown.status, 0);
     assert.match(unknown.stderr, /not a registered Codex account/);

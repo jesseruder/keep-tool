@@ -192,6 +192,38 @@ function isHeadlessSession(meta) {
   return meta?.source === 'exec' || meta?.originator === 'codex_exec';
 }
 
+// When the model last answered in this rollout: an agent message or assistant reply.
+// A turn refused for a usage limit ends with an error event and no reply.
+function lastReplyAt(file) {
+  let at = 0;
+  for (const line of readTail(file).split('\n')) {
+    if (!line || !line.includes('"agent_message"') && !line.includes('"assistant"')) continue;
+    let record;
+    try { record = JSON.parse(line); } catch { continue; }
+    const payload = record?.payload;
+    const reply = (record?.type === 'event_msg' && payload?.type === 'agent_message')
+      || (record?.type === 'response_item' && payload?.type === 'message' && payload.role === 'assistant');
+    const time = Date.parse(record?.timestamp);
+    if (reply && Number.isFinite(time) && time > at) at = time;
+  }
+  return at;
+}
+
+// A model reply on a Codex account after `sinceMs`, from any of its rollouts
+// (top-level sessions, reviews, companion tasks): proof a recorded usage limit has
+// lifted, including by a reset the ledger never heard about. Null when none.
+function answeredSince(accountId, sinceMs, env = process.env) {
+  const root = configuredRoots(env).find((entry) => entry.accountId === accountId);
+  if (!root || !Number.isFinite(sinceMs)) return null;
+  for (const { file, stat } of indexedRollouts(root.configDir)) {
+    if (!stat.isFile() || stat.mtimeMs <= sinceMs) continue;
+    let at = 0;
+    try { at = lastReplyAt(file); } catch { continue; }
+    if (at > sinceMs) return { at, file };
+  }
+  return null;
+}
+
 function scanRollout(file, { includeChild = false, includeHeadless = false } = {}) {
   const meta = readSessionMeta(file);
   // Multi-agent rollouts share session_id with their parent, but id identifies
@@ -540,4 +572,4 @@ function sessionFor(sessionId) {
   return sessionFromRollout(info, stat, loadTitles(record.configDir).get(info.id) || '', Date.now(), record.accountId);
 }
 
-module.exports = { scan, invalidate, scanRollout, sessionFor, resolveRollout, isCompanionTask, rolloutFileFor, findRolloutFile, rolloutFilesIn, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, isHeadlessSession, configuredRoots, recentDateDirs, indexedRollouts };
+module.exports = { answeredSince, lastReplyAt, scan, invalidate, scanRollout, sessionFor, resolveRollout, isCompanionTask, rolloutFileFor, findRolloutFile, rolloutFilesIn, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, isHeadlessSession, configuredRoots, recentDateDirs, indexedRollouts };
