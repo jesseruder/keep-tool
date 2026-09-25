@@ -15500,7 +15500,7 @@ async function tellSession(body, deps = {}) {
 
   const sender = {
     sessionId: senderId || null,
-    agent: body.senderAgent === 'codex' ? 'codex' : 'claude',
+    agent: ['codex', 'pi'].includes(body.senderAgent) ? body.senderAgent : 'claude',
     card: body.senderCard || null,
     // Named from a row already in hand, else the numbers registry: the sender is not
     // read just to be named.
