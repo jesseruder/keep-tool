@@ -71,7 +71,9 @@ async function runUpdate(options, checkout) {
   catch (error) { return refused(`could not fast-forward: ${error.message}`, { before, target }); }
   const count = Number(await git(['rev-list', '--count', `${before}..${target}`]).catch(() => 0)) || 0;
   const changed = (await git(['diff', '--name-only', before, target]).catch(() => '')).split('\n').filter(Boolean);
-  return { status: 'updated', checkout, before, after: target, branch, commits: count, hostChanged: hostCodeChanged(changed) };
+  // The bootstrap is the one piece a reload cannot swap: it needs the service restarted.
+  return { status: 'updated', checkout, before, after: target, branch, commits: count, hostChanged: hostCodeChanged(changed),
+    bootChanged: changed.includes('bin/host-boot.js') };
 }
 
 // What a host reload would pick up: host.js and the helpers only it loads
@@ -92,7 +94,8 @@ function describeUpdate(node, result) {
   if (result.status === 'current') return `${node}: already at ${short(result.after)}`;
   if (result.status === 'updated') {
     return `${node}: fast-forwarded ${short(result.before)} → ${short(result.after)} (${result.commits} commit${result.commits === 1 ? '' : 's'})`
-      + (result.reloading ? '; host reloading, sessions kept' : '');
+      + (result.reloading ? '; host reloading, sessions kept' : '')
+      + (result.bootChanged ? '; host-boot.js changed, so the host service there needs a restart to run it' : '');
   }
   return `${node}: left alone, its checkout ${result.reason}`;
 }

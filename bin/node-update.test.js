@@ -56,6 +56,8 @@ test('only a change to the host or a helper only it loads calls for a host reloa
   assert.equal(hostCodeChanged(['bin/node-update.js']), true);
   assert.equal(hostCodeChanged(['bin/keep.js', 'web/app/app.js', 'bin/turn-index.js']), false);
   assert.equal(hostCodeChanged([]), false);
+  assert.match(describeUpdate('aws1', { status: 'updated', before: 'a', after: 'b', commits: 1, bootChanged: true }),
+    /\(1 commit\); host-boot\.js changed, so the host service there needs a restart to run it$/);
 });
 
 test('two asks at once share one run', async (t) => {

@@ -465,7 +465,8 @@ async function waitForRestart(where, deps = {}) {
   const now = deps.now || Date.now;
   const pollMs = deps.pollMs || 500;
   let token;
-  try { token = deps.token || nodeToken(deps.env || process.env, deps.readToken); } catch { return false; }
+  // No token, no way to ask: null, which the caller tells apart from a daemon that stayed down.
+  try { token = deps.token || nodeToken(deps.env || process.env, deps.readToken); } catch { return null; }
   const up = async () => {
     try { return (await request(where.url, '/api/registry/ping', { method: 'GET', token, timeoutMs: 2000 })).status === 200; }
     catch { return false; }

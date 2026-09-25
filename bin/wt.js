@@ -846,8 +846,10 @@ function deployOnDaemon(main, defaultName, sha, opts = {}) {
       try {
         // `keep nodes update …`, forwarded: the daemon holds the node list and tokens.
         // Not before the restarted daemon answers, or the old one runs it and dies.
-        if (result.deployed && !(await (opts.waitForRestart || remote.waitForRestart)(where, opts.deployDeps || {}))) {
-          note(`the daemon on ${where.daemon} did not come back in time; run keep nodes update there once it has`);
+        const back = result.deployed ? await (opts.waitForRestart || remote.waitForRestart)(where, opts.deployDeps || {}) : true;
+        if (!back) {
+          note(back === null ? 'this node has no token to reach the daemon with; run keep nodes update on the daemon node'
+            : `the daemon on ${where.daemon} did not come back in time; run keep nodes update there once it has`);
           return result;
         }
         const [, command, ...args] = plans[project].updateNodes;
