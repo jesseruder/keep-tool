@@ -355,7 +355,9 @@ test('a node\'s open must come from a session; --node is still the caller\'s own
 });
 
 test('a forwarded open runs past the ordinary bound, beside the node\'s other commands, and holds a restart', async (t) => {
-  assert.equal(OPEN_EXTRA_MS, 120e3);
+  // The longest open, a reopen that compacts, is 585 s of waits (registry-commands.js).
+  assert.equal(OPEN_EXTRA_MS, 12 * 60e3);
+  assert.ok(OPEN_EXTRA_MS >= (45 + 15 + 270 + 240 + 15) * 1e3);
   assert.equal(forwardedWaitMs('open', ['card', '--fresh', '-m', 'hi']), OPEN_EXTRA_MS);
   assert.equal(forwardedWaitMs('open', ['card', '--wait', '5m']), OPEN_EXTRA_MS, 'open takes no --wait of its own');
   assert.equal(forwardedWaitMs('show', ['card']), 0);

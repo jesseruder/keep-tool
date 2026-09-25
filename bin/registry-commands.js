@@ -255,13 +255,28 @@ const MAX_FORWARDED_WAIT_MS = 24 * 3600e3;
 const WAIT_CAP_REFUSAL = '--wait on a forwarded tell is at most 24h';
 
 // What an `open` may spend past the ordinary bound. Its /api/open call has no client
-// timeout: the daemon spawns the pane (on another node, over that node's host),
-// waits up to 45 s for the agent's empty prompt (serve.js AGENT_PROMPT_TIMEOUT_MS,
-// longer by a confirming read when a dialog shows), up to 15 s more for the session
-// to name itself, and then types the opening message under the injection lock, which
-// may be busy with another delivery. Two minutes covers that with room to spare; a
-// run past it is killed and the node told so, as any other timed-out command is.
-const OPEN_EXTRA_MS = 120e3;
+// timeout, and killing the CLI at this bound only drops that loopback request: the
+// daemon's own openSession carries on, spawning, typing and linking. So the bound
+// must cover the longest open there is, or the node is told a 504 for an open still
+// in progress and a person re-running it launches twice. The longest is a reopen of
+// an existing session, whose steps in bin/serve.js openSession are, at most:
+//   45 s   AGENT_PROMPT_TIMEOUT_MS, the wait for the agent's empty prompt (a dialog
+//          seen at its end adds one confirming read, DIALOG_CONFIRM_GRACE_MS 600 ms)
+//   15 s   waitForHostSessionId, for the session to name itself
+//   270 s  the injection lock retry for a reopen compaction:
+//          KEEP_COMPACT_TIMEOUT_MS (default 240 s) + 30 s
+//   240 s  the compaction itself, KEEP_COMPACT_TIMEOUT_MS, with the opening message
+//          typed under the same lock after it
+//   15 s   waitForHostSessionId again, on a card handoff that has not learned it
+// That is 585 s before the pane spawn, a node's pane round trips and the typing
+// itself; twelve minutes covers it with margin. A KEEP_COMPACT_TIMEOUT_MS raised on
+// the daemon past about 300 s needs this raised with it.
+//
+// A forwarded open holds a daemon restart for that whole bound (registry-route
+// handle), which is the honest answer: the daemon must not restart under an open it
+// is still performing, and `keep restart-daemon` reports the in-flight work rather
+// than proceed.
+const OPEN_EXTRA_MS = 12 * 60e3;
 
 function forwardedWaitMs(command, args) {
   if (command === 'open') return OPEN_EXTRA_MS;

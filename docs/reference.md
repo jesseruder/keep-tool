@@ -1618,9 +1618,10 @@ sessions for the work it plans. It too runs under the node session's identity (t
 opener a card is handed over from) and is refused without one, and `--message-file` is
 refused in favour of `-m`. `--node` names where to open the session, any node the
 daemon knows, not the caller's own. The daemon picks the account and model as for an
-open typed on its own node. A forwarded open may run two minutes past the ordinary
-bound while it waits for the new session's prompt; it runs beside the node's other
-commands and holds a restart like any other.
+open typed on its own node. A forwarded open may run twelve minutes past the ordinary
+bound, the longest an open can take (a reopen waits for the prompt and may compact the
+session first); it runs beside the node's other commands and holds a restart for as
+long as it runs.
 
 A ledger at `.keep/tell.json` allows six tells per sender-recipient pair per rolling
 hour and twenty into any one session per hour; Owner's shell is exempt from the pair
