@@ -2695,6 +2695,7 @@ async function writeTarget(target, value, deps = {}, options = {}) {
     pane: target.pane,
     data: Buffer.from(String(value), 'utf8').toString('base64'),
     ...(guarded ? { expectedInputCount: options.expectedInputCount, expectedPid: options.expectedPid } : {}),
+    ...(guarded && options.tolerateFocusReports === true ? { tolerateFocusReports: true } : {}),
     ...(options.operationId ? { operationId: String(options.operationId) } : {}),
   }, deps);
   if (result && result.dropped) {
@@ -3485,6 +3486,9 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   const guardedChunks = Boolean(deps.typingProgress);
   const pane = (target && target.pane) || 'unknown';
   let typingState = savedTyping;
+  // Whether this host lets a guarded write through a viewer's focus reports (host.js
+  // focusTolerantInput). Only a guarded message asks, and only a host that says so.
+  let tolerateFocus = false;
   const stableScreen = async (expectedCount, expectedText, empty = false, alternate = null) => {
     const before = await livePaneState(pane, deps);
     const allowedCount = before && (before.inputCount === expectedCount
@@ -3570,6 +3574,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
     if (!capabilities || capabilities.guardedInput !== true || capabilities.guardedInputReceipts !== true) {
       throw nothingTyped(new InjectionError(409, 'terminal host reload required before a guarded message can be typed'));
     }
+    tolerateFocus = capabilities.focusTolerantInput === true;
     if (typingState) {
       if (typingState.chunkChars !== chunkChars || typingState.chunkCount !== chunks.length
           || !Number.isInteger(typingState.acknowledgedChunks)
@@ -3600,6 +3605,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
         expectedPid: typingState.pid,
         expectedInputCount: typingState.initialInputCount + index,
         operationId: deps.typingProgress.operationId(index),
+        ...(tolerateFocus ? { tolerateFocusReports: true } : {}),
       };
       let failure;
       for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -3610,6 +3616,17 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
         }
       }
       throw failure;
+    };
+    // A chunk the host let through a viewer's focus reports lands at a count past the
+    // plan's; the plan follows it (typingProgress.followCount) so the next chunk and the
+    // Enter expect what the pane shows. Only the host can say those inputs were focus
+    // reports and nothing else; any other input still refuses the write.
+    const followHostCount = (index, accepted) => {
+      const counted = accepted && Number.isInteger(accepted.inputCount) ? accepted.inputCount : null;
+      if (counted === null || counted === deps.typingProgress.state.initialInputCount + index + 1) return;
+      deps.typingProgress.followCount(index + 1, counted);
+      typingState = deps.typingProgress.state;
+      deps.deliveryTrace?.('focus-reports-skipped', { index, inputCount: counted });
     };
     deps.deliveryTrace?.('write-start');
     if (Number.isInteger(typingState.inFlightChunk)) {
@@ -3622,8 +3639,9 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
         { count: typingState.initialInputCount + index + 1, text: prefix + chunks[index] },
       );
       try {
-        await writeChunk(index);
+        const accepted = await writeChunk(index);
         deps.typingProgress.acknowledge(index, deliveryJournal.textHash(chunks.slice(0, index + 1).join('')));
+        followHostCount(index, accepted);
       } catch (error) {
         // This operation predates this process attempt. A dropped replay can mean
         // the host restarted after accepting it but before persisting/replaying its
@@ -3641,8 +3659,9 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
     for (let index = typingState.acknowledgedChunks; index < chunks.length; index += 1) {
       deps.typingProgress.start(index);
       try {
-        await writeChunk(index);
+        const accepted = await writeChunk(index);
         deps.typingProgress.acknowledge(index, deliveryJournal.textHash(chunks.slice(0, index + 1).join('')));
+        followHostCount(index, accepted);
       } catch (error) {
         if (error?.inputDropped) {
           deps.typingProgress.reject(index);
@@ -3865,7 +3884,8 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   deps.deliveryTrace?.('enter-start');
   try {
     await pressTargetKey(target, 'Enter', deps, exactExpectation
-      ? { expectedInputCount: exactExpectation.inputCount, expectedPid: exactExpectation.pid }
+      ? { expectedInputCount: exactExpectation.inputCount, expectedPid: exactExpectation.pid,
+        ...(tolerateFocus ? { tolerateFocusReports: true } : {}) }
       : {});
   } catch (error) {
     if (error && error.inputDropped && deps.enterKeyDropped) await deps.enterKeyDropped();

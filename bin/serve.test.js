@@ -6310,11 +6310,16 @@ function draftHarness(screen, onEvent = () => {}) {
         if (live.pid !== params.expectedPid) {
           return { dropped: true, reason: 'pane replaced', pid: live.pid, inputCount: count() };
         }
-        if (count() !== params.expectedInputCount) {
+        // A host that tolerates focus reports lets a write through inputs a test marks
+        // as focus reports (foreign.focusOnly), exactly as host.js checks its log.
+        const tolerated = params.tolerateFocusReports === true && hello.focusTolerantInput === true
+          && foreign.focusOnly === true && count() > params.expectedInputCount;
+        if (count() !== params.expectedInputCount && !tolerated) {
           return { dropped: true, reason: 'input arrived', inputCount: count() };
         }
       }
       inputs.push(Buffer.from(params.data, 'base64').toString());
+      if (params.operationId) return { accepted: true, inputCount: count() };
     }
     return {};
   });
@@ -6977,6 +6982,46 @@ test('a partial resume on a busy pane checks its own composer, not the turns abo
     typingProgress: resumed(),
   }), /partial delivery draft changed/);
   assert.equal(moved.inputs.length, 1, 'nothing more was typed into a pane that moved on');
+});
+
+// 2026-09-25, #305: a viewer's focus report landed between the two chunks of a
+// 312-character notice, the second chunk was refused, and the one-shot sender never
+// came back, so half the message sat in the box unsent. A host that can prove the
+// inputs in between were only focus reports lets the rest through, and the plan
+// follows the pane's count to the Enter; any other input still stops it.
+test('a focus report between chunks is let through by a tolerant host, and the send finishes', async () => {
+  const { typingProgress } = require('./delivery');
+  const lead = '[keep] a notice long enough for two chunks ';
+  const prefix = `${lead}${'x'.repeat(200 - lead.length - 1)} `;
+  const message = `${prefix}and its tail`;
+  const run = async ({ tolerant, focusOnly }) => {
+    let added = false;
+    const screenFor = (inputs) => (inputs.length === 0 ? BOX('') : inputs.length === 1 ? BOX(prefix.trimEnd()) : BOX(message));
+    const harness = draftHarness(screenFor, (type, { inputs, foreign }) => {
+      if (type === 'input' && inputs.length === 1 && !added) { added = true; foreign.count += 1; foreign.focusOnly = focusOnly; }
+    });
+    harness.hello.focusTolerantInput = tolerant;
+    const entry = {};
+    const error = await typeAndSubmit({ pane: 'p' }, message, () => true, {
+      ...harness.deps, typingProgress: typingProgress(entry, () => {}),
+    }).then(() => null, (failure) => failure);
+    return { harness, error, entry, sent: harness.host.calls.filter((c) => c.type === 'input').map((c) => c.params) };
+  };
+
+  const focus = await run({ tolerant: true, focusOnly: true });
+  assert.equal(focus.error, null, focus.error?.message);
+  assert.deepEqual(focus.harness.inputs, [prefix, 'and its tail', '\r'], 'the rest was typed and submitted');
+  assert.equal(focus.entry.typing.focusReportsSkipped, 1);
+  assert.equal(focus.entry.typing.initialInputCount, 1, 'the plan follows the pane count');
+  assert.ok(focus.sent.every((params) => params.tolerateFocusReports === true), 'every guarded key asked for it');
+
+  const key = await run({ tolerant: true, focusOnly: false });
+  assert.ok(key.error, 'a real key between chunks still stops the send');
+  assert.deepEqual(key.harness.inputs, [prefix], 'nothing more was typed and Enter was not pressed');
+
+  const oldHost = await run({ tolerant: false, focusOnly: true });
+  assert.ok(oldHost.error, 'a host that cannot tell is not asked');
+  assert.ok(oldHost.sent.every((params) => params.tolerateFocusReports === undefined));
 });
 
 test('the counter does not vouch for a dialog, for control bytes, or for Claude', async () => {

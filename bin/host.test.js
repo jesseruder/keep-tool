@@ -962,6 +962,34 @@ test('a host handoff cancels primary grace timers', async () => {
   }
 });
 
+test('a guarded input that tolerates focus reports lands through them, and through nothing else', async () => {
+  await withHost({}, async ({ client }) => {
+    assert.equal((await client.request('hello')).focusTolerantInput, true);
+    const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 30'] });
+    const countOf = async () => (await client.request('get', { pane: pane.id })).pane.inputCount;
+    const send = (data) => client.request('input', { pane: pane.id, data: Buffer.from(data, 'latin1').toString('base64') });
+    const guarded = (expected, extra = {}) => client.request('input', {
+      pane: pane.id, data: Buffer.from('x').toString('base64'), expectedInputCount: expected, expectedPid: pane.pid, ...extra,
+    });
+    const start = await countOf();
+    await send('\x1b[I');
+    await send('\x1b[O\x1b[I');
+    assert.equal(await countOf(), start + 2, 'focus reports still count as input');
+    assert.equal((await guarded(start)).dropped, true, 'an ordinary guarded write is refused as before');
+    assert.deepEqual(await guarded(start, { tolerateFocusReports: true, operationId: 'op_tolerate_focus_1' }),
+      { accepted: true, inputCount: start + 3 }, 'a tolerant one lands, and says where the count is now');
+
+    // A key among them, or before the window it can vouch for, still refuses.
+    const after = await countOf();
+    await send('\x1b[I');
+    await send('y');
+    assert.equal((await guarded(after, { tolerateFocusReports: true })).dropped, true);
+    await send('\x1b[Iz');
+    assert.equal((await guarded(after + 2, { tolerateFocusReports: true })).dropped, true,
+      'a report with a key in the same write is a key');
+  });
+});
+
 test('a guarded input writes only while the pane is the same process and has taken no other keystroke', async () => {
   await withHost({}, async ({ client }) => {
     // Advertised, because a host that predates this ignores the parameter and writes

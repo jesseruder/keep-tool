@@ -275,6 +275,23 @@ function typingProgress(entry, writeJournal) {
       state.inFlightChunk = null;
       writeJournal();
     },
+    // The host accepted chunk `acknowledged - 1` at a count past the plan's, because a
+    // viewer's focus reports arrived before it and the write tolerated them (the host
+    // checks that every one was a focus report). The plan follows the pane's count, so
+    // the next chunk, the Enter and any resume expect what the pane actually shows.
+    followCount(acknowledged, inputCount) {
+      const state = current();
+      const planned = state.initialInputCount + acknowledged;
+      if (state.inFlightChunk !== null || acknowledged !== state.acknowledgedChunks || acknowledged < 1
+          || !Number.isInteger(inputCount) || inputCount < planned) {
+        throw new Error('delivery typing count is out of order');
+      }
+      if (inputCount === planned) return;
+      state.initialInputCount = inputCount - acknowledged;
+      state.focusReportsSkipped = (Number.isInteger(state.focusReportsSkipped) ? state.focusReportsSkipped : 0)
+        + (inputCount - planned);
+      writeJournal();
+    },
     complete() {
       const state = current();
       if (state.inFlightChunk !== null || state.acknowledgedChunks !== state.chunkCount) {
@@ -893,6 +910,6 @@ async function reconcileAsync(directory, options = {}) {
   return reconcile(directory, { ...rest, nodeReceipts: await collectNodeReceipts(directory, receiptFor) });
 }
 
-module.exports = { deliver, received, matchesFrom, indexConfirms, reconcile, reconcileAsync, userText, statusForText, statusForTextAsync, acknowledge, pendingForSession, pendingForSessionAsync,
+module.exports = { deliver, typingProgress, received, matchesFrom, indexConfirms, reconcile, reconcileAsync, userText, statusForText, statusForTextAsync, acknowledge, pendingForSession, pendingForSessionAsync,
   collectNodeReceipts, nodeReceiptKey, REMOTE_MATCH_MAX_MS,
   settleObserved, completedTyping, textHash: hash, STALE_JOURNAL_MS, INDEX_GRACE_MS };

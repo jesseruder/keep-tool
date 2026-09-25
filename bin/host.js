@@ -26,6 +26,38 @@ const COLD_RESTORE_CONCURRENCY = 4;
 const PANE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const INPUT_OPERATION_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 const INPUT_RECEIPT_LIMIT = 256;
+// Focus in/out reports (CSI I, CSI O) that a viewer's terminal sends when it gains or
+// loses focus. They count as input like everything else, but a guarded write that
+// asks to (`tolerateFocusReports`) may still land when every input since the count it
+// expected was one of these: they reach the program and can change nothing in its
+// input box. A viewer clicking into a pane between two chunks of a delivery left half
+// a message unsent. The pane remembers the kind of its last few inputs to answer that.
+const FOCUS_REPORTS_ONLY = /^(?:\x1b\[[IO])+$/;
+const INPUT_KIND_LIMIT = 64;
+
+function focusReportsOnly(data) {
+  return FOCUS_REPORTS_ONLY.test(Buffer.from(String(data || ''), 'base64').toString('latin1'));
+}
+
+// Records one counted input. `inputKinds` holds [count, focusOnly] pairs, newest last.
+function countInput(pane, data) {
+  pane.inputCount += 1;
+  if (!Array.isArray(pane.inputKinds)) pane.inputKinds = [];
+  pane.inputKinds.push([pane.inputCount, focusReportsOnly(data)]);
+  if (pane.inputKinds.length > INPUT_KIND_LIMIT) pane.inputKinds.shift();
+}
+
+// Whether every input after `expected` up to now was a focus report. An input this
+// process never saw (a pane adopted across a reload, or one past the window) is not
+// known to be one, so the answer is no.
+function onlyFocusReportsSince(pane, expected) {
+  if (!Number.isInteger(expected) || pane.inputCount <= expected) return false;
+  const kinds = new Map(Array.isArray(pane.inputKinds) ? pane.inputKinds : []);
+  for (let count = expected + 1; count <= pane.inputCount; count += 1) {
+    if (kinds.get(count) !== true) return false;
+  }
+  return true;
+}
 const HOST_LOG_MAX_BYTES = 5 * 1024 * 1024;
 // The wire contract a remote node agent speaks. The unix socket answers the same
 // frames, so this is not a second protocol: it is the number a caller checks before
@@ -79,6 +111,8 @@ function inputOperationFingerprint(params) {
   return crypto.createHash('sha256').update(JSON.stringify([
     String(params.pane || ''), params.expectedPid, params.expectedInputCount,
     String(params.data || ''), params.auto === true,
+    // Only when set, so a receipt recorded before this flag existed still matches.
+    ...(params.tolerateFocusReports === true ? [true] : []),
   ])).digest('hex');
 }
 
@@ -1163,6 +1197,9 @@ function createHost(options = {}) {
         return { result: {
           version: 1, replaceExited: true, guardedKill: true, compactScreen: true, guardedInput: true,
           guardedInputReceipts: true,
+          // focusTolerantInput: a guarded input may pass tolerateFocusReports, and lands
+          // when every input since its expected count was a viewer's focus report.
+          focusTolerantInput: true,
           // transcript: this host answers the `transcript` verb (bin/node-transcript.js)
           // for the sessions it runs, which is how the daemon confirms a delivery to a
           // pane on this machine. A number, so a later shape can say it is a later one:
@@ -1379,7 +1416,8 @@ function createHost(options = {}) {
             if (operationId) rememberInputReceipt(pane, operationId, operationFingerprint, result);
             return { result };
           }
-          if (pane.inputCount !== params.expectedInputCount) {
+          if (pane.inputCount !== params.expectedInputCount
+              && !(params.tolerateFocusReports === true && onlyFocusReportsSince(pane, params.expectedInputCount))) {
             const result = { dropped: true, reason: 'input arrived', inputCount: pane.inputCount };
             if (operationId) rememberInputReceipt(pane, operationId, operationFingerprint, result);
             return { result };
@@ -1391,7 +1429,7 @@ function createHost(options = {}) {
             return { result: { dropped: true } };
           }
           pane.lastInputAt = new Date().toISOString();
-          pane.inputCount += 1;
+          countInput(pane, params.data);
           pane.pty.write(Buffer.from(String(params.data || ''), 'base64'));
           return { result: {} };
         }
@@ -1405,7 +1443,7 @@ function createHost(options = {}) {
           setPrimary(pane, viewer);
         }
         pane.lastInputAt = new Date().toISOString();
-        pane.inputCount += 1;
+        countInput(pane, params.data);
         pane.pty.write(Buffer.from(String(params.data || ''), 'base64'));
         const result = operationId ? { accepted: true, inputCount: pane.inputCount } : {};
         if (operationId) rememberInputReceipt(pane, operationId, operationFingerprint, result);
