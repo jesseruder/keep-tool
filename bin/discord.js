@@ -30,14 +30,15 @@ const FIRST_RUN_WINDOW_MS = 24 * 3600e3;
 const PROMPT_MAX = 40000;
 const SEEN_MAX_AGE_MS = 30 * 86400e3;
 
-// The gateway could not answer: unreachable, timed out, an auth failure, the tool not
-// deployed yet, the tool itself reporting an error. None of that is anything this
-// process can fix, so the scheduler treats it as tolerated weather — logged, not a
-// failing scheduler. Everything downstream of a result that arrived is deliberately
-// NOT tagged: a malformed page, a headers helper that prints garbage, a classifier
-// that refused, a decisions file that would not write are real failures somebody has
-// to fix, and they stay red.
-const { GatewayUnavailable } = mcp;
+// Only a gateway that is not there to ask is tolerated: refused, reset, unresolvable,
+// timed out, or answering without the discord_recent tool because it is not deployed
+// yet (bin/mcp-http.js GatewayUnavailable). The scheduler logs that once and keeps the
+// row out of the red. Everything else is a real failure somebody has to fix and goes
+// red on the normal streak: a 401/403 or 5xx, a JSON-RPC error, a stream that ended
+// without an answer, the tool reporting an error (its database is down), a headers
+// helper that failed, no credentials at all, a malformed page, a classifier that
+// refused, a decisions file that would not write.
+const { GatewayUnavailable, GatewayError } = mcp;
 
 function isGatewayFailure(error) {
   return error instanceof GatewayUnavailable || Boolean(error && error.gatewayUnavailable);
@@ -62,6 +63,11 @@ function writeJsonAtomic(file, value) {
   }
 }
 
+function stringMap(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, String(item)]));
+}
+
 function config() {
   const value = readJson(CONFIG_FILE, {});
   const gateway = value.gateway && typeof value.gateway === 'object' ? value.gateway : {};
@@ -76,29 +82,58 @@ function config() {
     gateway: {
       url: gateway.url ? String(gateway.url) : '',
       headersHelper: gateway.headersHelper ? String(gateway.headersHelper) : '',
+      // Values are expanded from the environment (`${VAR}`); the file is in a git
+      // repository, so a literal credential never belongs here.
+      headers: stringMap(gateway.headers),
       server: String(gateway.server || DEFAULT_GATEWAY_SERVER),
     },
   };
 }
 
-// Claude Code expands ${VAR} and ${VAR:-default} in configured header values.
+// Claude Code expands ${VAR} and ${VAR:-default} in configured header values. A
+// reference to an unset variable with no default yields null: that header is missing,
+// not an empty credential.
 function expandEnv(value) {
-  return String(value).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g,
-    (_, name, fallback) => process.env[name] ?? fallback ?? '');
+  let missing = false;
+  const out = String(value).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g, (_, name, fallback) => {
+    const found = process.env[name];
+    if (found != null && found !== '') return found;
+    if (fallback != null) return fallback;
+    missing = true;
+    return '';
+  });
+  return missing ? null : out;
 }
 
-// The MCP server entry the Mac's agent sessions already use for the Castle gateway:
-// the user-scope `mcpServers.<server>` of the Claude config, then Codex's
-// `[mcp_servers.<server>]`. Keep does not hold a gateway credential of its own.
-function agentServerEntry(server, home = os.homedir()) {
+function expandHeaders(headers) {
+  const out = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    const expanded = expandEnv(value);
+    if (expanded == null || !expanded.trim()) return null;
+    out[name] = expanded;
+  }
+  return out;
+}
+
+function origin(url) {
+  try { return new URL(url).origin; } catch { return null; }
+}
+
+// The MCP server entries this machine's agent sessions already use for the Castle
+// gateway, in order: the user-scope `mcpServers.<server>` of the Claude config(s),
+// then Codex's `[mcp_servers.<server>]`. Keep holds no gateway credential of its own.
+// Each is { source, url, headers, envHeaders, bearerEnv, headersHelper }.
+function agentServerEntries(server, home = os.homedir()) {
+  const entries = [];
   const claudeFiles = [
     ...(process.env.CLAUDE_CONFIG_DIR ? [path.join(process.env.CLAUDE_CONFIG_DIR, '.claude.json')] : []),
     path.join(home, '.claude.json'),
   ];
-  for (const file of claudeFiles) {
+  for (const file of [...new Set(claudeFiles)]) {
     const entry = readJson(file, {})?.mcpServers?.[server];
     if (entry && typeof entry === 'object' && entry.url) {
-      return { source: file, url: String(entry.url), headers: entry.headers || {}, headersHelper: entry.headersHelper || '' };
+      entries.push({ source: file, url: String(entry.url), headers: stringMap(entry.headers),
+        envHeaders: {}, bearerEnv: '', headersHelper: entry.headersHelper ? String(entry.headersHelper) : '' });
     }
   }
   try {
@@ -106,28 +141,59 @@ function agentServerEntry(server, home = os.homedir()) {
     const file = path.join(home, '.codex', 'config.toml');
     const entry = toml.parse(fs.readFileSync(file, 'utf8'))?.mcp_servers?.[server];
     if (entry && typeof entry === 'object' && entry.url) {
-      return { source: file, url: String(entry.url), headers: entry.http_headers || {}, headersHelper: '' };
+      entries.push({ source: file, url: String(entry.url), headers: stringMap(entry.http_headers),
+        envHeaders: stringMap(entry.env_http_headers), bearerEnv: entry.bearer_token_env_var ? String(entry.bearer_token_env_var) : '',
+        headersHelper: entry.http_headers_helper ? String(entry.http_headers_helper) : '' });
     }
   } catch {}
-  return null;
+  return entries;
 }
 
-// Where to call and with which headers. `gateway.url` and `gateway.headersHelper` in
-// watch/discord.json win; anything they leave out comes from the agent config's
-// server entry. The header values are never logged or written anywhere.
+// An entry's static credential, or null when it has none it can supply right now:
+// no headers at all, or one naming an environment variable that is not set.
+function staticHeaders(entry) {
+  const headers = expandHeaders(entry.headers);
+  if (headers == null) return null;
+  for (const [name, variable] of Object.entries(entry.envHeaders || {})) {
+    const value = process.env[variable];
+    if (value == null || value === '') return null;
+    headers[name] = value;
+  }
+  if (entry.bearerEnv) {
+    const token = process.env[entry.bearerEnv];
+    if (token == null || token === '') return null;
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
+}
+
+// Where to call and with which headers. The header values are never logged or
+// written anywhere.
+//
+// An agent entry's credential is only ever sent to that entry's own origin. With a
+// `gateway.url` override on another origin, watch/discord.json must bring its own
+// `gateway.headersHelper` or `gateway.headers`; otherwise there is no credential, and
+// a typo in the URL cannot hand the Castle token to whatever host it names.
 async function resolveGateway(cfg, deps = {}) {
-  const entry = (deps.agentServerEntry || agentServerEntry)(cfg.gateway.server, deps.home);
-  const url = cfg.gateway.url || (entry && entry.url) || DEFAULT_GATEWAY_URL;
-  const helper = cfg.gateway.headersHelper || (entry && entry.headersHelper) || '';
-  let headers = {};
-  if (entry && entry.headers && typeof entry.headers === 'object') {
-    for (const [name, value] of Object.entries(entry.headers)) headers[name] = expandEnv(value);
+  const entries = (deps.agentServerEntries || agentServerEntries)(cfg.gateway.server, deps.home);
+  const url = cfg.gateway.url || (entries[0] && entries[0].url) || DEFAULT_GATEWAY_URL;
+  const helper = deps.runHeadersHelper || mcp.runHeadersHelper;
+  const own = cfg.gateway.headersHelper || Object.keys(cfg.gateway.headers).length;
+  if (own) {
+    const headers = expandHeaders(cfg.gateway.headers);
+    if (headers == null) throw new GatewayError('gateway.headers in watch/discord.json names an unset environment variable', { code: 'credentials' });
+    if (cfg.gateway.headersHelper) Object.assign(headers, await helper(cfg.gateway.headersHelper));
+    return { url, headers };
   }
-  if (helper) headers = { ...headers, ...await (deps.runHeadersHelper || mcp.runHeadersHelper)(helper) };
-  if (!Object.keys(headers).length) {
-    throw new GatewayUnavailable(`no credentials for the Castle gateway: no "${cfg.gateway.server}" MCP server entry with headers, and no gateway.headersHelper in watch/discord.json`);
+  const target = origin(url);
+  for (const entry of entries) {
+    if (!target || origin(entry.url) !== target) continue;
+    const headers = staticHeaders(entry);
+    if (entry.headersHelper) return { url, headers: { ...(headers || {}), ...await helper(entry.headersHelper) } };
+    if (headers && Object.keys(headers).length) return { url, headers };
+    // This entry has the URL but nothing to authenticate with here; try the next.
   }
-  return { url, headers };
+  throw new GatewayError(`no credentials for the Castle gateway at ${target || url}: no "${cfg.gateway.server}" MCP server entry for that origin supplies headers, and watch/discord.json has no gateway.headersHelper or gateway.headers`, { code: 'credentials' });
 }
 
 async function callGateway(args, cfg, deps = {}) {
@@ -137,6 +203,7 @@ async function callGateway(args, cfg, deps = {}) {
     clientName: 'keep-discord', fetch: deps.fetch,
   });
 }
+
 
 function readDecisions(limit = 0) {
   let lines;
@@ -177,8 +244,21 @@ function pageRows(page) {
 
 // Fetches everything after `cursor` (or, with no cursor, the recent window), a
 // bounded number of pages per poll. Rows come back in seq order, deduplicated by seq.
+//
+// A first run whose recent window is empty still establishes the cursor: it asks for
+// the newest row alone (no after_seq, no since) and starts after it, or at 0 when the
+// table is empty. So every poll after the first successful one reads by after_seq,
+// and a quiet day does not leave the watcher re-reading a sliding 24h window forever.
+// `baseline` is that seq, or null when the window had rows.
 async function fetchRows(cursor, cfg, deps, now) {
   const call = deps.callGateway || ((args) => callGateway(args, cfg, deps));
+  const rows = await fetchPages(call, cursor, cfg, now);
+  if (cursor != null || rows.length) return { rows, baseline: null };
+  const newest = pageRows(await call({ limit: 1 }));
+  return { rows: [], baseline: newest.reduce((max, row) => Math.max(max, row.seq), 0) };
+}
+
+async function fetchPages(call, cursor, cfg, now) {
   const limit = Math.min(PAGE_MAX, Math.max(cfg.maxPerPoll, 50));
   const bySeq = new Map();
   let after = cursor;
@@ -242,8 +322,9 @@ async function poll(options = {}) {
   const now = Number(options.now) || Date.now();
   const cursor = readCursor();
   let rows;
+  let baseline;
   try {
-    rows = await fetchRows(cursor, cfg, deps, now);
+    ({ rows, baseline } = await fetchRows(cursor, cfg, deps, now));
   } catch (error) {
     if (!isGatewayFailure(error)) throw error;
     if (!dry) writeStatus({ ...readJson(STATUS_FILE, {}), lastAttemptAt: Date.now(), skipped: true, detail: error.message });
@@ -258,7 +339,7 @@ async function poll(options = {}) {
   // The cursor may pass a row only once it is classified or is one this watcher skips
   // (filtered channel, empty text, already seen). The first row that is neither — the
   // prompt is full or the poll's budget is spent — holds it for the next poll.
-  let advanceTo = cursor;
+  let advanceTo = baseline != null ? baseline : cursor;
   let held = false;
   for (const row of rows) {
     const message = normalizeRow(row);
@@ -353,9 +434,11 @@ function startScheduler(options = {}) {
   // Whether the last tick already found the gateway unavailable. The log line belongs
   // to the transition into that state, not to every tick that finds it still down.
   let gatewayDown = false;
-  // The gateway is another team's service on another machine, and its Discord tool may
-  // not be deployed yet: it is unavailable for reasons nothing in this process can fix.
-  // Owner wants that logged, not presented as a failing scheduler. `expected` keeps the
+  // A gateway that is not there to ask — unreachable, timed out, or not serving the
+  // Discord tool because it is not deployed yet — is nothing this process can fix.
+  // Owner wants that logged, not presented as a failing scheduler. A gateway that is
+  // there and failing (auth, 5xx, a tool error) is not this state; see the top of the
+  // file. `expected` keeps the
   // streak from turning the row red, keeps bin/self-repair.js from opening a card on
   // weather, and tells bin/lint.js that this row has no success to be late against.
   const gatewayUnavailable = (message) => {
@@ -385,11 +468,11 @@ function startScheduler(options = {}) {
         health.record('discord', { ok: true, detail: `${decisions.length} messages`, cadenceMs });
       }
     } catch (error) {
-      // Only the gateway call itself is weather. This catch wraps the whole pipeline,
-      // so a malformed page, a classifier that refused, a decisions file that would not
-      // write and an onChange that threw all land here too — those are real failures,
-      // and calling them "gateway unavailable" would hide a broken watcher behind
-      // somebody else's outage.
+      // Only an absent gateway is weather. This catch wraps the whole pipeline, so an
+      // auth failure, a gateway or tool error, a malformed page, a classifier that
+      // refused, a decisions file that would not write and an onChange that threw all
+      // land here too — those are real failures, and calling them "gateway
+      // unavailable" would hide a broken watcher behind an outage.
       if (isGatewayFailure(error)) gatewayUnavailable(error.message);
       else {
         gatewayDown = false;
@@ -413,10 +496,11 @@ module.exports = {
   CURSOR_FILE,
   DECISIONS_FILE,
   DEFAULT_GATEWAY_URL,
+  GatewayError,
   GatewayUnavailable,
   isGatewayFailure,
   config,
-  agentServerEntry,
+  agentServerEntries,
   resolveGateway,
   callGateway,
   normalizeRow,

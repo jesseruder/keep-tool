@@ -73,6 +73,7 @@ function fakeGateway(rows, calls) {
     let out = [...rows].sort((a, b) => a.seq - b.seq);
     if (args.after_seq != null) out = out.filter((item) => item.seq > args.after_seq);
     else if (args.since) out = out.filter((item) => Date.parse(item.posted_at) >= Date.parse(args.since));
+    else out.reverse(); // neither: newest first
     out = out.slice(0, Math.min(args.limit || 50, 200));
     return { messages: out, next_seq: out.length ? out[out.length - 1].seq : (args.after_seq ?? null) };
   };
@@ -163,6 +164,47 @@ test('a first run with no cursor reads only the recent window, then continues fr
   assert.deepEqual(out.calls[0], { since: '2026-09-24T12:00:00.000Z', limit: 100 });
   assert.deepEqual(out.calls[1], { after_seq: 3, limit: 100 });
   assert.equal(out.second, 0);
+  assert.equal(readState(root, 'cursor.json').seq, 3);
+});
+
+test('a first run over a quiet window still sets the cursor from the newest row, or 0 on an empty table', () => {
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  const quiet = fixture({ enabled: true });
+  const rows = [row(8, { postedAt: '2026-09-20T12:00:00Z' }), row(9, { postedAt: '2026-09-21T12:00:00Z' })];
+  const result = run(quiet, pollScript(rows, `
+    const first = await discord.poll({ deps, now: ${now} });
+    const second = await discord.poll({ deps, now: ${now} });
+    process.stdout.write(JSON.stringify({ first: first.length, second: second.length, calls, prompts: prompts.length }));
+  `));
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    first: 0, second: 0, prompts: 0,
+    calls: [{ since: '2026-09-24T12:00:00.000Z', limit: 100 }, { limit: 1 }, { after_seq: 9, limit: 100 }],
+  });
+  assert.equal(readState(quiet, 'cursor.json').seq, 9);
+
+  const empty = fixture({ enabled: true });
+  const emptyRun = run(empty, pollScript([], `
+    await discord.poll({ deps, now: ${now} });
+    await discord.poll({ deps, now: ${now} });
+    process.stdout.write(JSON.stringify(calls));
+  `));
+  assert.equal(emptyRun.status, 0, emptyRun.stderr);
+  assert.deepEqual(JSON.parse(emptyRun.stdout).slice(1), [{ limit: 1 }, { after_seq: 0, limit: 100 }]);
+  assert.equal(readState(empty, 'cursor.json').seq, 0);
+});
+
+test('a gateway that is there but failing is thrown, not swallowed into a skip', () => {
+  const root = fixture({ enabled: true }, { cursor: 3 });
+  const result = run(root, `
+    const discord = require(${JSON.stringify(discordModule)});
+    discord.poll({ deps: { callGateway: async () => { throw new discord.GatewayError('discord_recent: database is down'); } } })
+      .then(() => process.exit(2))
+      .catch((error) => process.stdout.write(JSON.stringify({ message: error.message, tolerated: discord.isGatewayFailure(error),
+        status: require('fs').existsSync(discord.STATUS_FILE) })));
+  `);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { message: 'discord_recent: database is down', tolerated: false, status: false });
   assert.equal(readState(root, 'cursor.json').seq, 3);
 });
 
@@ -287,7 +329,7 @@ test('dry poll fences untrusted Discord text and writes no state', () => {
   assert.equal(fs.existsSync(path.join(root, '.keep', 'discord')), false);
 });
 
-test('the gateway comes from the agent config castle entry unless watch/discord.json overrides it', () => {
+test('the gateway credential comes from the agent config, and only ever goes to that entry\'s origin', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-discord-home-'));
   const root = fixture({ enabled: true });
   const resolve = (config, env = {}) => {
@@ -296,45 +338,64 @@ test('the gateway comes from the agent config castle entry unless watch/discord.
       const discord = require(${JSON.stringify(discordModule)});
       discord.resolveGateway(discord.config())
         .then((gateway) => process.stdout.write(JSON.stringify({ gateway })))
-        .catch((error) => process.stdout.write(JSON.stringify({ error: error.message, gatewayFailure: discord.isGatewayFailure(error) })));
+        .catch((error) => process.stdout.write(JSON.stringify({ error: error.message, tolerated: discord.isGatewayFailure(error) })));
     `, { HOME: home, ...env });
     assert.equal(result.status, 0, result.stderr);
     return JSON.parse(result.stdout);
   };
-  // No agent config at all: nothing to authenticate with, which is the gateway's
-  // weather (auth), not a crash.
+  const writeClaude = (castle) => fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ mcpServers: { castle } }));
+  const writeCodex = (text) => {
+    fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.codex', 'config.toml'), text);
+  };
+
+  // No agent config at all: a real failure (red), not an outage.
   const none = resolve({ enabled: true });
-  assert.equal(none.gatewayFailure, true);
-  assert.match(none.error, /no credentials for the Castle gateway/);
+  assert.equal(none.tolerated, false);
+  assert.match(none.error, /^no credentials for the Castle gateway at https:\/\/mcp\.internal\.castle\.xyz/);
 
-  // Codex's server entry is the fallback.
-  fs.mkdirSync(path.join(home, '.codex'));
-  fs.writeFileSync(path.join(home, '.codex', 'config.toml'),
-    '[mcp_servers.castle]\nurl = "https://codex.example/mcp"\n\n[mcp_servers.castle.http_headers]\nAuthorization = "Bearer codex"\n');
-  assert.deepEqual(resolve({ enabled: true }).gateway, { url: 'https://codex.example/mcp', headers: { Authorization: 'Bearer codex' } });
+  // Codex: static headers, env_http_headers, bearer_token_env_var, http_headers_helper.
+  writeCodex('[mcp_servers.castle]\nurl = "https://castle.example/mcp"\n\n[mcp_servers.castle.http_headers]\nX-Static = "s"\n\n'
+    + '[mcp_servers.castle.env_http_headers]\nX-From-Env = "CASTLE_TEST_HEADER"\n');
+  assert.equal(resolve({ enabled: true }).tolerated, false, 'an unset env header is no credential');
+  assert.deepEqual(resolve({ enabled: true }, { CASTLE_TEST_HEADER: 'e' }).gateway,
+    { url: 'https://castle.example/mcp', headers: { 'X-Static': 's', 'X-From-Env': 'e' } });
+  writeCodex('[mcp_servers.castle]\nurl = "https://castle.example/mcp"\nbearer_token_env_var = "CASTLE_TEST_TOKEN"\n');
+  assert.deepEqual(resolve({ enabled: true }, { CASTLE_TEST_TOKEN: 'tok' }).gateway,
+    { url: 'https://castle.example/mcp', headers: { Authorization: 'Bearer tok' } });
+  writeCodex('[mcp_servers.castle]\nurl = "https://castle.example/mcp"\nhttp_headers_helper = "printf \'{\\"Authorization\\":\\"Bearer codex-helper\\"}\'"\n');
+  assert.deepEqual(resolve({ enabled: true }).gateway,
+    { url: 'https://castle.example/mcp', headers: { Authorization: 'Bearer codex-helper' } });
 
-  // Claude's user-scope entry wins, with ${VAR} expansion the way Claude Code does it.
-  fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ mcpServers: { castle: {
-    type: 'http', url: 'https://claude.example/mcp', headers: { Authorization: 'Bearer ${CASTLE_TEST_TOKEN}' },
-  } } }));
+  // Claude's entry comes first, with ${VAR} expansion the way Claude Code does it...
+  writeClaude({ type: 'http', url: 'https://castle.example/mcp', headers: { Authorization: 'Bearer ${CASTLE_TEST_TOKEN}' } });
   assert.deepEqual(resolve({ enabled: true }, { CASTLE_TEST_TOKEN: 'abc' }).gateway,
-    { url: 'https://claude.example/mcp', headers: { Authorization: 'Bearer abc' } });
+    { url: 'https://castle.example/mcp', headers: { Authorization: 'Bearer abc' } });
+  // ...but an entry that has the URL and no usable credential falls through to Codex.
+  assert.deepEqual(resolve({ enabled: true }).gateway,
+    { url: 'https://castle.example/mcp', headers: { Authorization: 'Bearer codex-helper' } });
 
-  // An agent entry with a headersHelper runs it.
-  fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ mcpServers: { castle: {
-    type: 'http', url: 'https://claude.example/mcp', headersHelper: 'printf \'{"Authorization":"Bearer helped"}\'',
-  } } }));
-  assert.deepEqual(resolve({ enabled: true }).gateway, { url: 'https://claude.example/mcp', headers: { Authorization: 'Bearer helped' } });
+  // A Claude headersHelper runs.
+  writeClaude({ type: 'http', url: 'https://castle.example/mcp', headersHelper: 'printf \'{"Authorization":"Bearer helped"}\'' });
+  assert.deepEqual(resolve({ enabled: true }).gateway, { url: 'https://castle.example/mcp', headers: { Authorization: 'Bearer helped' } });
 
-  // watch/discord.json overrides both: its helper replaces the entry's helper.
-  assert.deepEqual(resolve({ enabled: true, gateway: { url: 'https://override.example/mcp', headersHelper: 'printf \'{"X-Key":"k"}\'' } }).gateway,
-    { url: 'https://override.example/mcp', headers: { 'X-Key': 'k' } });
+  // A URL override on the same origin keeps the entry's credential.
+  assert.deepEqual(resolve({ enabled: true, gateway: { url: 'https://castle.example/other' } }).gateway,
+    { url: 'https://castle.example/other', headers: { Authorization: 'Bearer helped' } });
+  // On another origin it does not: no helper or headers of its own means no credential.
+  const elsewhere = resolve({ enabled: true, gateway: { url: 'https://typo.example/mcp' } });
+  assert.equal(elsewhere.tolerated, false);
+  assert.match(elsewhere.error, /^no credentials for the Castle gateway at https:\/\/typo\.example/);
+  // With its own, only its own is sent.
+  assert.deepEqual(resolve({ enabled: true, gateway: { url: 'https://typo.example/mcp', headersHelper: 'printf \'{"X-Key":"k"}\'' } }).gateway,
+    { url: 'https://typo.example/mcp', headers: { 'X-Key': 'k' } });
+  assert.deepEqual(resolve({ enabled: true, gateway: { url: 'https://typo.example/mcp', headers: { 'X-Key': '${CASTLE_TEST_TOKEN}' } } },
+    { CASTLE_TEST_TOKEN: 'v' }).gateway, { url: 'https://typo.example/mcp', headers: { 'X-Key': 'v' } });
 
-  // A helper that exits nonzero is an auth failure; one that prints garbage is misconfigured.
-  const failed = resolve({ enabled: true, gateway: { headersHelper: 'exit 4' } });
-  assert.deepEqual(failed, { error: 'headers helper exited 4', gatewayFailure: true });
-  const garbage = resolve({ enabled: true, gateway: { headersHelper: 'echo not json' } });
-  assert.deepEqual(garbage, { error: 'headers helper did not print a JSON object', gatewayFailure: false });
+  // A helper that fails or prints garbage is this machine's to fix: red either way.
+  assert.deepEqual(resolve({ enabled: true, gateway: { headersHelper: 'exit 4' } }), { error: 'headers helper exited 4', tolerated: false });
+  assert.deepEqual(resolve({ enabled: true, gateway: { headersHelper: 'echo not json' } }),
+    { error: 'headers helper did not print a JSON object', tolerated: false });
 });
 
 test('dashboard merges Slack and Discord findings with source labels in time order', () => {
@@ -400,17 +461,17 @@ function schedulerTicks(root, env = {}, onChange = '') {
 const SECRET = 'Bearer do-not-log-this-value';
 const UNREACHABLE = {
   enabled: true, intervalMin: 15,
-  gateway: { url: 'http://127.0.0.1:1/mcp', headersHelper: `printf '{"Authorization":"${SECRET}"}'` },
+  gateway: { url: 'http://127.0.0.1:2/mcp', headersHelper: `printf '{"Authorization":"${SECRET}"}'` },
 };
 
-test('an unreachable or uncredentialed gateway is a tolerated state, logged once', () => {
+test('an unreachable gateway is a tolerated state, logged once', () => {
   const down = schedulerTicks(fixture(UNREACHABLE));
   assert.equal(down.before.state, 'failing', 'the inherited streak read as red');
   assert.equal(down.before.sigs, 1, 'and handed self-repair a signature');
   for (const row of [down.first, down.second]) {
     assert.equal(row.state, 'skipped');
     assert.equal(row.displayState, 'skipped');
-    assert.match(row.detail, /^gateway unavailable: http:\/\/127\.0\.0\.1:1\/mcp unreachable: /);
+    assert.match(row.detail, /^gateway unavailable: http:\/\/127\.0\.0\.1:2\/mcp unreachable: /);
     assert.equal(row.failures, 0);
     assert.equal(row.expected, true);
     assert.deepEqual(row.sigs, []);
@@ -420,13 +481,6 @@ test('an unreachable or uncredentialed gateway is a tolerated state, logged once
   assert.match(lines[0], /^keep discord: gateway unavailable: /);
   assert.equal(down.stderr.includes('do-not-log-this-value'), false, 'no header value in the log');
   assert.deepEqual(down.lint, [], 'an outage elsewhere is not a finding, however long it lasts');
-
-  // No credentials anywhere: an empty HOME and no helper.
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-discord-home-'));
-  const bare = schedulerTicks(fixture({ enabled: true, gateway: { url: 'http://127.0.0.1:1/mcp' } }), { HOME: home });
-  assert.equal(bare.second.state, 'skipped');
-  assert.equal(bare.second.expected, true);
-  assert.match(bare.second.detail, /^gateway unavailable: no credentials for the Castle gateway/);
 });
 
 test('only the gateway is weather: everything downstream of it still fails the row', () => {
@@ -451,6 +505,14 @@ test('only the gateway is weather: everything downstream of it still fails the r
   assert.equal(misconfigured.second.expected, false);
   assert.equal(misconfigured.second.failures, 7);
   assert.match(misconfigured.stderr, /^keep discord: headers helper did not print a JSON object$/m);
+
+  // Nor is having no credential at all: that is this machine's configuration.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-discord-home-'));
+  const bare = schedulerTicks(fixture({ enabled: true, gateway: { url: 'http://127.0.0.1:2/mcp' } }), { HOME: home });
+  assert.equal(bare.second.state, 'failing');
+  assert.equal(bare.second.expected, false);
+  assert.equal(bare.second.failures, 7);
+  assert.match(bare.stderr, /^keep discord: no credentials for the Castle gateway at http:\/\/127\.0\.0\.1:2/m);
 });
 
 test('scheduler health uses the configured Discord polling interval', () => {

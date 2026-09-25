@@ -8,10 +8,17 @@
 // Header values are credentials. Nothing here logs them or puts them in an error
 // message, and errors name the gateway by origin and path only.
 //
-// Every failure that means "the gateway could not answer this call" — unreachable,
-// timed out, an HTTP error status (401/403 included), a JSON-RPC error, a tool that
-// does not exist yet, a tool result flagged isError — is a `GatewayUnavailable`.
-// What the caller does with a result that arrived is its own business.
+// Two kinds of failure, and the difference matters to a caller's health row:
+//
+// - `GatewayUnavailable`: the gateway is not there to ask. The connection was refused
+//   or reset, the name did not resolve, the call timed out, or the gateway answered
+//   but does not serve the tool (not deployed yet). Nobody on this side can fix that,
+//   and it is expected to pass.
+// - `GatewayError`: the gateway is there and something is wrong. An HTTP error status
+//   (401/403 and 5xx included), a JSON-RPC error, a response that is not JSON or a
+//   stream that ended without an answer, a tool result flagged isError (its database
+//   is down), a headers helper that failed. Somebody has to fix these, so they are not
+//   tolerated.
 
 const { spawn } = require('child_process');
 
@@ -19,12 +26,26 @@ const PROTOCOL_VERSION = '2025-06-18';
 const RESPONSE_MAX = 10 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30e3;
 const HELPER_TIMEOUT_MS = 15e3;
+// Transport codes that mean nothing answered: refused, reset, unresolvable, unroutable.
+const UNREACHABLE_CODES = new Set([
+  'ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH',
+  'EHOSTDOWN', 'ENETDOWN', 'ETIMEDOUT', 'EPIPE', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET',
+]);
+const UNKNOWN_TOOL = /unknown tool|no such tool|tool .*not found/i;
 
 class GatewayUnavailable extends Error {
   constructor(message, options = {}) {
     super(message);
     this.name = 'GatewayUnavailable';
     this.gatewayUnavailable = true;
+    if (options.code) this.code = options.code;
+  }
+}
+
+class GatewayError extends Error {
+  constructor(message, options = {}) {
+    super(message);
+    this.name = 'GatewayError';
     if (options.code) this.code = options.code;
   }
 }
@@ -37,16 +58,15 @@ function where(url) {
 }
 
 // Claude Code's `headersHelper` contract: a shell command whose stdout is a JSON
-// object of header names to values. A helper that fails to run or exits nonzero is
-// an auth failure (unavailable); one that runs and prints something that is not a
-// header object is misconfigured, which is a person's to fix.
+// object of header names to values. Any failure of the helper is a GatewayError: it
+// is how this machine authenticates, and a broken one is this machine's to fix.
 function runHeadersHelper(command, options = {}) {
   return new Promise((resolve, reject) => {
     let child;
     try {
       child = (options.spawn || spawn)('/bin/sh', ['-c', String(command)], { stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (error) {
-      reject(new GatewayUnavailable(`headers helper did not start: ${error.code || error.message}`));
+      reject(new GatewayError(`headers helper did not start: ${error.code || error.message}`, { code: 'helper' }));
       return;
     }
     let stdout = '';
@@ -57,27 +77,28 @@ function runHeadersHelper(command, options = {}) {
       clearTimeout(timer);
       if (error) reject(error); else resolve(value);
     };
+    const fail = (message) => finish(new GatewayError(message, { code: 'helper' }));
     const timer = setTimeout(() => {
       try { child.kill(); } catch {}
-      finish(new GatewayUnavailable('headers helper timed out'));
+      fail('headers helper timed out');
     }, options.timeoutMs || HELPER_TIMEOUT_MS);
     child.stdout.on('data', (chunk) => {
       stdout += chunk;
       if (stdout.length > 64 * 1024) {
         try { child.kill(); } catch {}
-        finish(new Error('headers helper printed more than 64 KiB'));
+        fail('headers helper printed more than 64 KiB');
       }
     });
     // stderr is drained but never repeated: a helper can print anything there.
     child.stderr.on('data', () => {});
-    child.on('error', (error) => finish(new GatewayUnavailable(`headers helper did not start: ${error.code || error.message}`)));
+    child.on('error', (error) => fail(`headers helper did not start: ${error.code || error.message}`));
     child.on('close', (code) => {
-      if (code !== 0) { finish(new GatewayUnavailable(`headers helper exited ${code}`)); return; }
+      if (code !== 0) { fail(`headers helper exited ${code}`); return; }
       let parsed;
-      try { parsed = JSON.parse(stdout); } catch { finish(new Error('headers helper did not print a JSON object')); return; }
+      try { parsed = JSON.parse(stdout); } catch { fail('headers helper did not print a JSON object'); return; }
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
         || Object.values(parsed).some((value) => typeof value !== 'string')) {
-        finish(new Error('headers helper did not print a JSON object of string headers'));
+        fail('headers helper did not print a JSON object of string headers');
         return;
       }
       finish(null, parsed);
@@ -85,12 +106,16 @@ function runHeadersHelper(command, options = {}) {
   });
 }
 
+// Returns [events, rest]. An event is the joined data: lines of one block. CRLF, bare
+// CR and LF all end a line; a CR at the very end is held back in `rest`, since the LF
+// that completes it may be the first byte of the next chunk.
 function parseSseEvents(buffer) {
-  // Returns [events, rest]. An event is the joined data: lines of one block.
+  let tail = '';
+  let text = buffer;
+  if (text.endsWith('\r')) { tail = '\r'; text = text.slice(0, -1); }
+  const blocks = text.replace(/\r\n?/g, '\n').split('\n\n');
+  const rest = blocks.pop() + tail;
   const events = [];
-  const normalized = buffer.replace(/\r\n/g, '\n');
-  const blocks = normalized.split('\n\n');
-  const rest = blocks.pop();
   for (const block of blocks) {
     const data = block.split('\n').filter((line) => line.startsWith('data:'))
       .map((line) => line.slice(5).replace(/^ /, '')).join('\n');
@@ -106,7 +131,7 @@ function matchResponse(message, id) {
 
 async function readResponse(response, id, label) {
   const type = String(response.headers.get('content-type') || '');
-  if (!response.body) throw new GatewayUnavailable(`${label}: empty response`);
+  if (!response.body) throw new GatewayError(`${label}: empty response`);
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let text = '';
@@ -118,7 +143,7 @@ async function readResponse(response, id, label) {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > RESPONSE_MAX) throw new GatewayUnavailable(`${label}: response exceeded 10 MiB`);
+      if (size > RESPONSE_MAX) throw new GatewayError(`${label}: response exceeded 10 MiB`);
       const chunk = decoder.decode(value, { stream: true });
       if (!sse) { text += chunk; continue; }
       pending += chunk;
@@ -142,12 +167,12 @@ async function readResponse(response, id, label) {
         if (found) return found;
       } catch {}
     }
-    throw new GatewayUnavailable(`${label}: event stream ended without a response`);
+    throw new GatewayError(`${label}: event stream ended without a response`);
   }
   let message;
-  try { message = JSON.parse(text); } catch { throw new GatewayUnavailable(`${label}: response is not JSON`); }
+  try { message = JSON.parse(text); } catch { throw new GatewayError(`${label}: response is not JSON`); }
   const found = matchResponse(message, id);
-  if (!found) throw new GatewayUnavailable(`${label}: no JSON-RPC response for request ${id}`);
+  if (!found) throw new GatewayError(`${label}: no JSON-RPC response for request ${id}`);
   return found;
 }
 
@@ -186,13 +211,12 @@ async function callTool(options) {
   let protocolVersion = PROTOCOL_VERSION;
   let nextId = 1;
 
-  const headersFor = (extra = {}) => ({
+  const headersFor = () => ({
     ...baseHeaders,
     'content-type': 'application/json',
     accept: 'application/json, text/event-stream',
     ...(sessionId ? { 'mcp-session-id': sessionId } : {}),
     ...(nextId > 1 ? { 'mcp-protocol-version': protocolVersion } : {}),
-    ...extra,
   });
 
   const send = async (method, params, notification = false) => {
@@ -204,15 +228,17 @@ async function callTool(options) {
     } catch (error) {
       if (deadline.aborted) throw new GatewayUnavailable(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`, { code: 'timeout' });
       const code = error && error.cause && error.cause.code;
-      throw new GatewayUnavailable(`${label} unreachable: ${code || (error && error.message) || 'fetch failed'}`, { code: 'unreachable' });
+      if (UNREACHABLE_CODES.has(code)) throw new GatewayUnavailable(`${label} unreachable: ${code}`, { code: 'unreachable' });
+      // A TLS failure, a malformed URL, anything else: something to fix, not an outage.
+      throw new GatewayError(`${label} request failed: ${code || (error && error.message) || 'fetch failed'}`, { code: 'fetch' });
     }
     if (!notification) nextId += 1;
     if (method === 'initialize') sessionId = response.headers.get('mcp-session-id') || null;
     if (!response.ok) {
       try { await response.body?.cancel(); } catch {}
       const status = response.status;
-      const kind = status === 401 || status === 403 ? 'auth failed' : 'HTTP error';
-      throw new GatewayUnavailable(`${label} ${method}: ${kind} (HTTP ${status})`, { code: status === 401 || status === 403 ? 'auth' : 'http' });
+      const auth = status === 401 || status === 403;
+      throw new GatewayError(`${label} ${method}: ${auth ? 'auth failed' : 'HTTP error'} (HTTP ${status})`, { code: auth ? 'auth' : 'http' });
     }
     if (notification) {
       try { await response.body?.cancel(); } catch {}
@@ -221,9 +247,10 @@ async function callTool(options) {
     const message = await readResponse(response, id, `${label} ${method}`);
     if (message.error) {
       const text = String(message.error.message || 'error').replace(/\s+/g, ' ').slice(0, 300);
-      const missing = method === 'tools/call' && (/unknown tool|not found|no such tool/i.test(text) || message.error.code === -32601);
-      throw new GatewayUnavailable(`${label} ${method}: ${missing ? `tool ${tool} is not available: ` : ''}${text}`,
-        { code: missing ? 'tool_missing' : 'rpc' });
+      if (method === 'tools/call' && UNKNOWN_TOOL.test(text)) {
+        throw new GatewayUnavailable(`${label}: tool ${tool} is not available: ${text}`, { code: 'tool_missing' });
+      }
+      throw new GatewayError(`${label} ${method}: ${text}`, { code: 'rpc' });
     }
     return message.result;
   };
@@ -239,8 +266,10 @@ async function callTool(options) {
     const result = await send('tools/call', { name: tool, arguments: args });
     if (result && result.isError) {
       const text = toolErrorText(result);
-      const missing = /unknown tool|not found|no such tool/i.test(text) && text.includes(tool);
-      throw new GatewayUnavailable(`${label} ${tool}: ${text}`, { code: missing ? 'tool_missing' : 'tool_error' });
+      if (UNKNOWN_TOOL.test(text) && text.includes(tool)) {
+        throw new GatewayUnavailable(`${label}: tool ${tool} is not available: ${text}`, { code: 'tool_missing' });
+      }
+      throw new GatewayError(`${label} ${tool}: ${text}`, { code: 'tool_error' });
     }
     return unwrapToolResult(result);
   } finally {
@@ -255,4 +284,4 @@ async function callTool(options) {
   }
 }
 
-module.exports = { GatewayUnavailable, PROTOCOL_VERSION, callTool, parseSseEvents, runHeadersHelper, unwrapToolResult };
+module.exports = { GatewayError, GatewayUnavailable, PROTOCOL_VERSION, callTool, parseSseEvents, runHeadersHelper, unwrapToolResult };

@@ -320,13 +320,15 @@ the gateway serves. By default Keep reaches the gateway exactly as its agent ses
 do, through the `castle` MCP server entry: `mcpServers.castle` in `~/.claude.json`
 (its `url`, its `headers` with `${VAR}` expansion, and its `headersHelper`), else
 `[mcp_servers.castle]` in `~/.codex/config.toml`. An optional
-`"gateway": { "url": "...", "headersHelper": "...", "server": "castle" }` block
-overrides the URL, supplies a headers helper (a shell command that prints a JSON
-object of headers, as in Claude Code) or names a different entry. Never put a
-credential in `watch/discord.json` itself; the registry is a git repository. Findings
+`"gateway": { "url": "...", "headersHelper": "...", "headers": {...}, "server": "castle" }`
+block overrides the URL, supplies its own credential (a shell command that prints a
+JSON object of headers, as in Claude Code, or headers whose values are `${VAR}`
+references) or names a different entry. The agent entry's credential is only sent to
+that entry's own origin; a URL elsewhere needs a credential of its own. Never put a
+literal credential in `watch/discord.json`; the registry is a git repository. Findings
 stay in log mode and appear beside Slack findings in Message watch. `keep discord
-status` reports an unreachable gateway, an auth failure or a tool that is not deployed
-yet as a skipped poll.
+status` reports an unreachable gateway or a tool that is not deployed yet as a skipped
+poll; an auth failure or a gateway error is a real failure.
 Phone pushes use `KEEP_PUSH_WEBHOOK`; speaker notifications require an `announce`
 command. Credentials belong in the local environment/configuration, never source.
 

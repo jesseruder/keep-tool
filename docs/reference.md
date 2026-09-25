@@ -119,51 +119,64 @@ session; JSON and event-stream responses; the tool result read from
 | `maxPerPoll` | `100` (max 100) | messages classified per poll; also the page size floor (pages are 50–200 rows) |
 | `channels` | every channel | optional list of channel names to classify; other rows are passed over |
 | `gateway.url` | from the agent config, else `https://mcp.internal.castle.xyz/mcp` | gateway endpoint |
-| `gateway.headersHelper` | from the agent config | shell command printing a JSON object of request headers |
+| `gateway.headersHelper` | none | shell command printing a JSON object of request headers |
+| `gateway.headers` | none | request headers whose values are `${VAR}` references to the environment |
 | `gateway.server` | `castle` | which agent-config MCP server entry to borrow |
 
-The gateway credential is the one the agent sessions on the same machine already use:
-`mcpServers.<server>` in `$CLAUDE_CONFIG_DIR/.claude.json` or `~/.claude.json` (its
-`url`, its static `headers` with `${VAR}` / `${VAR:-default}` expansion, and its
-`headersHelper`), else `[mcp_servers.<server>]` in `~/.codex/config.toml` (`url`,
-`http_headers`). A configured `gateway.headersHelper` replaces the entry's helper and
-its output is merged over the entry's static headers. Header values are never logged,
+The gateway credential is the one the agent sessions on the same machine already use.
+The candidates, in order: `mcpServers.<server>` in `$CLAUDE_CONFIG_DIR/.claude.json`
+and `~/.claude.json` (its `url`, its static `headers` with `${VAR}` / `${VAR:-default}`
+expansion, and its `headersHelper`), then `[mcp_servers.<server>]` in
+`~/.codex/config.toml` (`url`, `http_headers`, `env_http_headers` mapping header names
+to environment variable names, `bearer_token_env_var`, `http_headers_helper`). The
+first candidate on the target URL's origin that yields a credential wins; one whose
+headers name an unset variable yields none, and the next is tried.
+
+An agent entry's credential only ever goes to that entry's own origin. A `gateway.url`
+on another origin must bring its own `gateway.headersHelper` or `gateway.headers`, and
+when either is set only those are sent. Otherwise there is no credential and the poll
+fails with `no credentials for the Castle gateway at <origin>` — so a typo in the URL
+cannot hand the Castle token to the host it names. Header values are never logged,
 stored or put in an error message; errors name the gateway by origin and path only.
-Keep no credential in `watch/discord.json`: the registry is a git repository.
+Keep no literal credential in `watch/discord.json`: the registry is a git repository.
 
 Each poll reads `discord_recent` with `after_seq` = the cursor in
 `.keep/discord/cursor.json`, paging (at most ten pages) until a short page. With no
 cursor it asks for `since` = 24 hours ago instead, so a fresh install classifies
-recent history, not the whole backfill. Rows are deduplicated by `message_id` against
-`.keep/discord/seen.json` (30 days), so a row the scraper re-reads under a new `seq`
-is not classified twice. A forum message reaches the classifier as
-`[post: <thread title>] <text>`. Each decision in `.keep/discord/decisions.jsonl`
-carries its own row's `channel`, forum `thread` title and `permalink`. The cursor moves
-last, after the decisions and the seen set are written, and only past rows that were
-classified or deliberately passed over (filtered channel, empty text, already seen):
-when the prompt budget or `maxPerPoll` stops a poll early, the cursor holds at the
-first unclassified row, and `keep discord status` prints `cursor: seq N (backlog left
-for the next poll)`. A classifier failure moves nothing.
+recent history, not the whole backfill. If that window is empty it asks for the newest
+row alone (`limit: 1`, no `after_seq` or `since`) and sets the cursor to its `seq`, or
+to 0 when the table is empty, so every poll after the first successful one reads by
+`after_seq`. Rows are deduplicated by `message_id` against `.keep/discord/seen.json`
+(30 days), so a row the scraper re-reads under a new `seq` is not classified twice. A
+forum message reaches the classifier as `[post: <thread title>] <text>`. Each decision
+in `.keep/discord/decisions.jsonl` carries its own row's `channel`, forum `thread` title
+and `permalink`. The cursor moves last, after the decisions and the seen set are
+written, and only past rows that were classified or deliberately passed over (filtered
+channel, empty text, already seen): when the prompt budget or `maxPerPoll` stops a poll
+early, the cursor holds at the first unclassified row, and `keep discord status` prints
+`cursor: seq N (backlog left for the next poll)`. A classifier failure moves nothing.
 
-An unavailable **gateway** does not make the `discord` row in `keep health` read as
-failing. The gateway is another service on another machine, and its Discord tool may
-not be deployed yet, so it is unavailable for reasons no daemon fix addresses:
-unreachable, timed out, an HTTP error (401/403 included), a JSON-RPC error, the tool
-missing (`Unknown tool 'discord_recent'`), a tool result flagged `isError`, a headers
-helper that exits nonzero, no credential at all. That is treated as a state the
-scheduler tolerates: `poll()` records a skip in its status file, the row records a skip
-detailed `gateway unavailable: <message>`, marked `expected`, which clears the failure
-streak and keeps `bin/lint.js` `daemon-health` from calling it late. One
+A gateway that is **not there to ask** does not make the `discord` row in `keep health`
+read as failing: the connection refused or reset, the name unresolvable, the call
+timed out, or the gateway answering without the `discord_recent` tool
+(`Unknown tool 'discord_recent'`, as a tool error or a JSON-RPC error) because it is
+not deployed yet. That is treated as a state the scheduler tolerates: `poll()` records
+a skip in its status file, the row records a skip detailed
+`gateway unavailable: <message>`, marked `expected`, which clears the failure streak and
+keeps `bin/lint.js` `daemon-health` from calling it late. One
 `keep discord: gateway unavailable: <message>` line goes to stderr on entering that
 state, not one per tick.
 
-Only the gateway qualifies. Everything downstream of an answer that arrived — a page
-without a `messages` array or a row without an integer `seq`, a headers helper that
-prints something other than a JSON object of strings, a classifier that refused, a
-decisions file that would not write — is a real failure, records `ok: false` with its
-own error, logs the ordinary `keep discord: <message>` line, and goes red on the third
-one as it always did. A poll that classifies messages records a real success. One tick
-writes one health record, so a broken console notification counts as this tick's
+Nothing else qualifies. A gateway that is there and failing — HTTP 401/403 or 5xx, a
+JSON-RPC error other than an unknown tool, a response that is not JSON or a stream that
+ended without an answer, a tool result flagged `isError` (its database is down) — is a
+real failure, and so is everything on this side: a headers helper that failed or
+printed something other than a JSON object of strings, no credential at all, a page
+without a `messages` array or a row without an integer `seq`, a classifier that
+refused, a decisions file that would not write. Each records `ok: false` with its own
+error, logs the ordinary `keep discord: <message>` line, and goes red on the third one
+so self-repair can see it. A poll that classifies messages records a real success. One
+tick writes one health record, so a broken console notification counts as this tick's
 failure rather than clearing the streak first. `keep discord status` reads the
 watcher's own status file, not health.
 
