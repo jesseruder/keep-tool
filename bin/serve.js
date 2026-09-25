@@ -4290,6 +4290,83 @@ async function loadSessionForAction(id, deps = {}) {
   return loadCurrentSession(id);
 }
 
+// ---------- a node session that has not taken its first turn ----------
+//
+// Claude Code writes no transcript until its first prompt is submitted, so for a
+// session opened on another node a moment ago the node's host answers every read
+// with transcript-missing. Every send read the session through that answer and
+// refused: `keep open` on a node slow to draw its prompt gave up on the opening
+// message, and every `keep tell`, `keep pane send` and console send after it refused
+// with "no claude transcript for <id> on this node", so the session could never be
+// given its first message at all.
+//
+// With no transcript there is no turn: nothing running, no question, no plan. What
+// a send needs to know is what the reviewer bootstrap (reviewerBootstrapPane) and an
+// opening message already judge from the pane, that Claude is up in a live pane on
+// the node the session is recorded on and its input box is empty. So such a session
+// gets a row saying exactly that (transcriptPending), which the tell's guards pass,
+// and sendToSession types it through the pane (sendWithoutTranscript) instead of the
+// transcript-receipted delivery, which has no file to take a receipt from.
+//
+// Only for a Claude session with a live Claude pane on that node in a list the node
+// answered just now. A session whose transcript this daemon has mirrored has had
+// turns: a missing file on its node is a lost transcript, not a new one, and the
+// node's refusal stands, as it does for a session with no live pane there.
+async function remoteSessionWithoutTranscript(id, node, deps = {}) {
+  let mirrored = null;
+  try { mirrored = require('./transcript-mirror.js').stat(deps.root || keep.ROOT, node, id); } catch {}
+  if (mirrored && mirrored.size > 0) return null;
+  let location = null;
+  try { location = (deps.sessionLocation || accounts.sessionLocation)(id, { root: deps.root || keep.ROOT, env: deps.env || process.env }); } catch {}
+  if (!location || location.agent !== 'claude') return null;
+  const listed = await (deps.listHostPaneResult || listHostPaneResult)(deps, true);
+  const status = listed && listed.nodes && listed.nodes[node];
+  if (!status || !status.ok || status.stale) {
+    throw new InjectionError(409, `node ${node} did not answer, so the pane of ${id} there cannot be verified; nothing was sent`,
+      { reason: 'node-unanswered' });
+  }
+  const env = paneRefEnv(deps);
+  const onNode = (Array.isArray(listed.panes) ? listed.panes : []).filter((pane) => pane
+    && (pane.node || nodes.parsePaneRef(String(pane.id || ''), { env }).node) === node);
+  const hosted = sessionHostPane(onNode, id);
+  if (!hosted || !hosted.alive || hosted.agentAlive === false || hosted.meta.agent !== 'claude') return null;
+  const session = {
+    id, kind: 'claude', agent: 'claude', node, pane: hosted.id,
+    project: typeof hosted.meta.project === 'string' ? hosted.meta.project : '',
+    ...(typeof hosted.meta.accountId === 'string' ? { accountId: hosted.meta.accountId } : {}),
+    state: 'idle', endedTurn: true, mtime: Date.now(), transcriptPending: true,
+  };
+  const root = deps.root || keep.ROOT;
+  sessionNames.apply([session], { root });
+  sessionMarks.apply([session], { root });
+  sessionNumbers.assign([session], { root, readOnly: true });
+  return session;
+}
+
+// loadRemoteSession for a send: a node's transcript-missing answer is "no transcript
+// yet" when the session is a fresh one there (above), and the node's refusal otherwise.
+async function loadRemoteSessionForSend(id, deps = {}) {
+  try {
+    return await loadRemoteSession(id, deps);
+  } catch (error) {
+    if (!error || error.code !== 'transcript-missing') throw error;
+    const node = sessionNodeOf({ id: String(id) }, deps);
+    const fresh = await remoteSessionWithoutTranscript(String(id), node, deps);
+    if (!fresh) throw error;
+    return fresh;
+  }
+}
+
+// loadSessionForAction for a send, which alone may take a node session that has no
+// transcript yet: a move, a restart or a question's answer still needs one.
+async function loadSessionForSend(id, deps = {}) {
+  if (hostNodeNames(deps).length > 1 && /^[A-Za-z0-9_-]+$/.test(String(id || ''))
+      && sessionNodeOf({ id: String(id) }, deps) !== daemonNodeName(deps)) {
+    return loadRemoteSessionForSend(id, deps);
+  }
+  return loadCurrentSession(id);
+}
+
 function appendedBytes(file, offset) {
   const stat = fs.statSync(file);
   if (stat.size <= offset) return { text: '', offset, stat, bytesRead: 0 };
@@ -8988,11 +9065,72 @@ async function sendToSession(body, targetHint, opts, deps = {}) {
 
   // A session on another node is read from its node (loadSessionForAction); every
   // other one exactly as before. Awaited, so an injected loader may be either kind.
-  const session = await (deps.loadCurrentSession || ((id) => loadSessionForAction(id, deps)))(body.sessionId);
+  // A node session that has not taken its first turn comes back as a row with no
+  // transcript (transcriptPending), and is typed through its pane.
+  const session = await (deps.loadCurrentSession || ((id) => loadSessionForSend(id, deps)))(body.sessionId);
   const target = claimInjectionTarget(await (deps.resolveSessionTarget || resolveSessionTarget)(
     session, body.pane ? { expectedPane: body.pane } : targetHint, deps,
   ));
+  if (session && session.transcriptPending === true) return sendWithoutTranscript(session, target, text, opts, deps);
   return (deps.sendToResolvedTarget || sendToResolvedTarget)(session, target, text, opts, deps);
+}
+
+// A send to a Claude session on another node that has no transcript yet
+// (remoteSessionWithoutTranscript). There is no file to take a receipt from, so this
+// is the opening message's path rather than delivery's: the node is asked once more
+// that there is still no transcript (a first turn submitted since the row was read
+// takes the ordinary path on the next send), the screen must show Claude's empty
+// prompt with no turn or dialog on it, and the keys are typed conditionally on the
+// pane's input counter read around that screen, so a key anyone else types in
+// between refuses them. Confirmed on screen, as the opening message is; no journal.
+async function sendWithoutTranscript(session, target, text, opts, deps = {}) {
+  const refuse = (message, screen) => Object.assign(new InjectionError(409, message,
+    screen === undefined ? {} : { screenTail: screenTail(screen) }), { nothingTyped: true, typingStarted: false });
+  const where = `${session.id} on ${session.node}`;
+  try {
+    await (deps.nodeTranscript || nodeTranscript)(session.node, { id: session.id, kind: 'claude', node: session.node }, deps).stat();
+    throw refuse(`session ${where} has written its first transcript line since it was read; nothing was sent, send again`);
+  } catch (error) {
+    if (!error || error.code !== 'transcript-missing') throw error;
+  }
+  const before = await livePaneState(target.pane, deps);
+  if (!before) throw refuse('pane input activity could not be verified before typing; nothing was sent');
+  let screen = '';
+  try { screen = await readScreen(target, 30, false, deps); }
+  catch { throw refuse(`the screen of ${target.pane} could not be read; nothing was sent`); }
+  const plain = stripTerminalAnsi(screen);
+  const dialog = claudePrompts.recognize(plain);
+  if (claudeTrustScreen(plain) || (dialog && dialog.live) || CLAUDE_TURN_OR_DIALOG_RE.test(plain)) {
+    throw refuse(`session ${where} has no transcript yet and ${target.pane} is showing a dialog or a running turn; nothing was sent`, screen);
+  }
+  if (!agentPromptVisible('claude', screen)) {
+    throw refuse(`session ${where} has no transcript yet and ${target.pane} does not show Claude's empty prompt; nothing was sent`, screen);
+  }
+  try { sendPrecheck(screen); } catch (error) { throw Object.assign(error, { nothingTyped: true, typingStarted: false }); }
+  const after = await livePaneState(target.pane, deps);
+  if (!after || after.pid !== before.pid || after.inputCount !== before.inputCount) {
+    throw refuse('input arrived while the prompt was checked; nothing was sent');
+  }
+  let typing = false;
+  try {
+    if (opts && opts.beforeType) await opts.beforeType();
+    const result = await typeAndSubmit(target, text, claudeTypedTextVisible, {
+      ...deps,
+      draftKind: 'claude',
+      inputBaseline: { pid: after.pid, inputCount: after.inputCount },
+      deliveryTrace: (stage, fields) => {
+        if (stage === 'write-start' || stage === 'enter-start') typing = true;
+        return deps.deliveryTrace?.(stage, fields);
+      },
+    });
+    return { ...(result && typeof result === 'object' ? result : { ok: true }), transcriptPending: true };
+  } catch (error) {
+    const failure = error instanceof InjectionError ? error : new InjectionError(409, String(error && error.message || error));
+    failure.typingStarted = error?.draftCleared ? false : error?.nothingTyped ? false : typing || Boolean(error && error.typingStarted);
+    if (error && error.nothingTyped) failure.nothingTyped = true;
+    if (error && error.draftCleared) failure.draftCleared = true;
+    throw failure;
+  }
 }
 
 // The pane a reviewer bootstrap message is typed into, or null when the reviewer has
@@ -15150,7 +15288,9 @@ async function tellSession(body, deps = {}) {
     // refusal (its host predates the transcript verb, it is not a Claude session, the
     // node did not answer) lands here, before the ledger is read, let alone reserved:
     // a message this daemon cannot confirm must not spend the sender's hour either.
-    if (!source.scanned && bareRemoteRow(target, deps)) target = await loadRemoteSession(target.id, deps);
+    // A Claude session there that has not taken its first turn is a row with no
+    // transcript (loadRemoteSessionForSend), which is idle by definition.
+    if (!source.scanned && bareRemoteRow(target, deps)) target = await loadRemoteSessionForSend(target.id, deps);
   }
 
   if (senderId && target.id === senderId) {
@@ -15164,7 +15304,7 @@ async function tellSession(body, deps = {}) {
   // off the node for a session elsewhere, off the tell's own source for any other.
   const remoteTarget = !source.scanned && remoteSession(target, deps);
   const freshTarget = remoteTarget
-    ? async (id) => { try { return await loadRemoteSession(id, deps); } catch { return null; } }
+    ? async (id) => { try { return await loadRemoteSessionForSend(id, deps); } catch { return null; } }
     : async (id) => source.fresh(id);
   const marked = (dir) => {
     try { return fs.existsSync(path.join(root, '.keep', dir, target.id)); } catch { return false; }
@@ -15290,9 +15430,10 @@ function bareRemoteRow(row, deps = {}) {
 // A card's linked row, with a bare remote one replaced by its node's read. A node that
 // has no live transcript for it (404) makes it absent, like a stale local session; any
 // other failure keeps the row, marked with the refusal to give if nothing else is left.
+// A fresh session there, with a live pane but no transcript yet, is a candidate.
 async function readRemoteTellRow(row, deps = {}) {
   if (!bareRemoteRow(row, deps)) return row;
-  try { return await loadRemoteSession(row.id, deps); }
+  try { return await loadRemoteSessionForSend(row.id, deps); }
   catch (error) {
     if (error instanceof InjectionError && error.status === 404) return null;
     const refusal = error instanceof InjectionError && error.status === 409 ? error
@@ -16231,6 +16372,8 @@ module.exports = {
   remoteSessionFreshness, unansweredNodes, piEventFor, waitForPiStart, cachedRemotePiEvent,
   remoteSessionRead,
   loadRemoteSession,
+  loadRemoteSessionForSend,
+  sendWithoutTranscript,
   loadSessionForAction,
   claudeTranscriptIsInteractive,
   claudeSessionFromInfo,
