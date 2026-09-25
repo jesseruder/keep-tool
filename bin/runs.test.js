@@ -1584,3 +1584,35 @@ test('the orphan pass counts a check pane on a node as carried, and leaves a nod
   assert.deepEqual(result, []);
   assert.deepEqual(closed, []);
 });
+
+test('a placed agent whose node is silent waits: nothing is spent, the feed hears it once, an open clears it', async () => {
+  _resetSchedulerState();
+  try {
+    const record = { name: 'redash-daily', role: 'scheduled check', node: 'aws1', session: { id: '' } };
+    const emitted = [];
+    const agentApi = {
+      ensure: () => record,
+      readRecord: () => record,
+      writeRecord: (name, patch) => Object.assign(record, patch),
+      emit: (name, event) => emitted.push(event),
+      flushCommits: () => true,
+    };
+    const silent = async () => {
+      throw Object.assign(new Error('node aws1 did not answer (host connect timed out); the check waits for it'), { code: 'NODE_WAIT', node: 'aws1' });
+    };
+    const opts = { today: '2026-09-25', agents: agentApi, cardAgent: () => 'redash-daily', refusal: () => null };
+    for (let i = 0; i < 3; i += 1) {
+      const outcome = await openFreshCheckSession(card(), { ...opts, open: silent });
+      assert.equal(outcome.skipped, 'node-wait');
+      assert.match(outcome.reason, /node aws1 did not answer/);
+    }
+    assert.equal(loadSchedulerState().opened.has('some-card'), false, 'a wait is not the day\'s open');
+    assert.equal(emitted.length, 1, 'said once, not every tick');
+    assert.match(emitted[0].text, /node aws1 is not answering/);
+    assert.equal(record.nodeWait.node, 'aws1');
+    const outcome = await openFreshCheckSession(card(), { ...opts, open: async () => ({ ok: true, sessionId: 'sid', pane: 'p@aws1' }) });
+    assert.equal(outcome.skipped, undefined);
+    assert.equal(record.nodeWait, null);
+    assert.equal(record.session.pane, 'p@aws1');
+  } finally { _resetSchedulerState(); }
+});

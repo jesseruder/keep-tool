@@ -3211,6 +3211,17 @@ commands.agents = (argv) => {
     if (!agents.validName(name)) die(`bad agent name: ${name}`);
     if (!o.kind) die('keep agents emit needs --kind');
     if (o.severity && !['low', 'med', 'high'].includes(o.severity)) die('--severity must be low, med or high');
+    // Forwarded from a node, an emit speaks for the agent only from the session its
+    // record names: the daemon verified which session is asking (registry-route
+    // IDENTITY_VARS), and any session on a node could otherwise write any feed.
+    if (process.env.KEEP_REMOTE_CALLER) {
+      const caller = process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || process.env.KEEP_PI_SESSION_ID || '';
+      const record = agents.readRecord(name, ROOT);
+      if (!record) die(`no agent record for ${name}; nothing was written`);
+      if (!caller || record.session.id !== caller) {
+        die(`${name}'s record names session ${record.session.id ? sessionNamed(record.session.id) : '(none)'}; an emit from a node must come from that session`);
+      }
+    }
     const event = agents.emit(name, {
       kind: o.kind, card: o.card || '', severity: o.severity || 'med',
       needsYou: Boolean(o['needs-you']), text: o.m || '',
@@ -3235,8 +3246,56 @@ commands.agents = (argv) => {
     return;
   }
 
+  // Where an agent's sessions run. Owner's call, gated like a grant: an agent moving
+  // itself (or another) to a machine is choosing where unattended work runs.
+  if (subcommand === 'place') {
+    const usage = 'usage: keep agents place <name> [--node <node>] [--needs cap,cap] [--daemon] [--as-owner] [--json]';
+    const o = parseArgs(rest, { node: 'str', needs: 'list', daemon: 'bool', json: 'bool', 'as-owner': 'bool' });
+    if (o._.length !== 1) die(usage);
+    const name = o._[0];
+    if (!agents.validName(name)) die(`bad agent name: ${name}`);
+    if (name === agents.REVIEWER_NAME) {
+      die('the fleet reviewer is not opened by Keep; move its session with keep move <session> --node <node>');
+    }
+    const current = agents.readRecord(name, ROOT);
+    if (!current) die(`no agent record for ${name}`);
+    const describePlacement = (record) => `${record.name}: runs on ${record.node || `the daemon node (${require('./nodes.js').daemonNode()})`}`
+      + `${record.needs.length ? `, needs ${record.needs.join(', ')}` : ''}`;
+    const changing = o.node !== undefined || o.needs !== undefined || o.daemon;
+    if (!changing) {
+      if (o.json) { console.log(JSON.stringify({ name, node: current.node, needs: current.needs }, null, 2)); return; }
+      console.log(describePlacement(current));
+      return;
+    }
+    if (o.daemon && (o.node !== undefined || o.needs !== undefined)) die('--daemon clears the placement; it takes no --node or --needs');
+    if (inAgentSession() && !(o['as-owner'] && process.env.KEEP_OWNER === '1' && !process.env.KEEP_REMOTE_CALLER)) {
+      die(`only Owner places an agent. End the turn and ask him for "keep agents place ${name} …". `
+        + 'If Owner is running this himself from an agent session, pass --as-owner with KEEP_OWNER=1 in the environment.');
+    }
+    const nodesApi = require('./nodes.js');
+    const patch = {};
+    if (o.daemon) Object.assign(patch, { node: '', needs: [] });
+    if (o.node !== undefined) {
+      const node = String(o.node).trim();
+      const known = nodesApi.configuredNodeNames();
+      if (!known.includes(node)) die(`no configured node named ${node} (known: ${known.join(', ') || 'none'})`);
+      // The daemon node is stored as no placement, so a rename of the daemon node
+      // never strands an agent on a name that no longer exists.
+      patch.node = node === nodesApi.daemonNode() ? '' : node;
+    }
+    if (o.needs !== undefined) patch.needs = o.needs.map((entry) => String(entry).trim()).filter(Boolean);
+    const record = agents.writeRecord(name, patch, { root: ROOT });
+    agents.flushCommits(ROOT);
+    if (o.json) { console.log(JSON.stringify({ name, node: record.node, needs: record.needs }, null, 2)); return; }
+    console.log(describePlacement(record));
+    if (record.session && record.session.id) {
+      console.log(`  the running session ${sessionNamed(record.session.id)} stays where it is; the next one opens on the new placement`);
+    }
+    return;
+  }
+
   const o = parseArgs(argv, { json: 'bool' });
-  if (o._.length) die('usage: keep agents [--json] | keep agents events|emit|seen <name> …');
+  if (o._.length) die('usage: keep agents [--json] | keep agents events|emit|seen|place <name> …');
   const rows = agents.records(ROOT).map((record) => agents.agentView(record, { root: ROOT }));
   if (o.json) { console.log(JSON.stringify(rows, null, 2)); return; }
   if (!rows.length) { console.log('no agent records'); return; }

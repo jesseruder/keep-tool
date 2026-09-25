@@ -49,10 +49,26 @@ const REGISTRY_COMMANDS = Object.freeze([
   // restarts the daemon, the node asks it to bring every node, itself included, up
   // to origin (bin/node-update.js). It can only fast-forward to what origin has.
   'nodes',
+  // An agent's own feed (AGENTS_ALLOWED): a card agent or responder on a node says
+  // what it found with `emit`, and reads its feed with `events` or the bare list.
+  // The daemon's CLI runs an emit under the caller's verified session and writes it
+  // only when that session is the one the agent's record names. `seen` is Owner's
+  // badge and `place` is Owner's placement; both stay on the daemon node.
+  'agents',
 ]);
 
 const NODES_ALLOWED = Object.freeze(['update']);
 const NODES_REFUSAL = 'a node runs only keep nodes update; the rest runs on the daemon node';
+
+const AGENTS_ALLOWED = Object.freeze(['emit', 'events']);
+const AGENTS_REFUSAL = `a node runs only keep agents ${AGENTS_ALLOWED.join('|')} (or the bare list); the rest runs on the daemon node`;
+const AGENTS_EMIT_REFUSAL = "a node's emit names the session it is from; run it inside the agent's session";
+function agentsRefusal(args, identity = null) {
+  const sub = args[0];
+  if (sub !== undefined && !String(sub).startsWith('-') && !AGENTS_ALLOWED.includes(sub)) return AGENTS_REFUSAL;
+  if (identity && sub === 'emit' && !identity.session) return AGENTS_EMIT_REFUSAL;
+  return null;
+}
 
 const TURNS_READS = Object.freeze(['search', 'show', 'stats']);
 const TURNS_REFUSAL = `a node runs only keep turns ${TURNS_READS.join('|')}; the rest runs on the daemon node`;
@@ -154,6 +170,7 @@ const BOOLEAN_FLAGS = Object.freeze({
   turns: ['json', 'all'],
   search: ['json', 'all', 'cards', 'conversations'],
   nodes: ['json', 'no-reload'],
+  agents: ['json', 'unseen', 'needs-you', 'badge', 'daemon', 'as-owner'],
 });
 
 // The arguments each registry command resolves as a project (keep-core
@@ -209,6 +226,7 @@ function argumentRefusal(command, args, identity = {}) {
   }
   if ((command === 'turns' || command === 'search') && turnsRefusal(args, command)) return turnsRefusal(args, command);
   if (command === 'nodes' && !NODES_ALLOWED.includes(args[0])) return NODES_REFUSAL;
+  if (command === 'agents' && agentsRefusal(args, identity)) return agentsRefusal(args, identity);
   if (Object.prototype.hasOwnProperty.call(SESSION_REFUSALS, command) && !identity.session) return SESSION_REFUSALS[command];
   if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return WAIT_CAP_REFUSAL;
   const newline = (arg) => /[\r\n]/.test(arg);
@@ -364,6 +382,7 @@ function nodeSideRefusal(command, args) {
   if (!Array.isArray(args)) return null;
   if ((command === 'turns' || command === 'search') && turnsRefusal(args, command)) return turnsRefusal(args, command);
   if (command === 'nodes' && !NODES_ALLOWED.includes(args[0])) return NODES_REFUSAL;
+  if (command === 'agents' && agentsRefusal(args)) return agentsRefusal(args);
   const fileFlags = Object.prototype.hasOwnProperty.call(NODE_FILE_FLAGS, command) ? NODE_FILE_FLAGS[command] : [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];

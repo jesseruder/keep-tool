@@ -145,6 +145,24 @@ test('a node\'s keep note runs under its own session with its flags intact, and 
   assert.deepEqual(calls.at(-1).args.slice(1), ['notes']);
 });
 
+test('a node forwards an agent\'s emit and feed reads, and nothing else under keep agents', async (t) => {
+  assert.ok(REGISTRY_COMMANDS.includes('agents'));
+  assert.equal(argumentRefusal('agents', ['emit', 'redash-daily', '--kind', 'diagnosed', '--needs-you', '-m', 'a\nb'], ME), null);
+  assert.equal(argumentRefusal('agents', ['events', 'redash-daily', '--unseen', '--json'], ME), null);
+  assert.equal(argumentRefusal('agents', ['--json'], ME), null);
+  assert.equal(argumentRefusal('agents', [], ME), null);
+  for (const sub of ['seen', 'place']) {
+    assert.match(String(argumentRefusal('agents', [sub, 'redash-daily'], ME)), /a node runs only keep agents emit\|events/);
+    assert.match(String(nodeSideRefusal('agents', [sub, 'redash-daily'])), /a node runs only keep agents emit\|events/);
+  }
+  assert.match(String(argumentRefusal('agents', ['emit', 'redash-daily', '--kind', 'x', '-m', 'y'], { node: 'aws1' })),
+    /a node's emit names the session it is from/);
+  const { svc, root, calls } = service(t);
+  const answer = await svc.handle(AWS1, body(root, { command: 'agents', args: ['emit', 'redash-daily', '--kind', 'diagnosed', '-m', 'x'], idempotencyKey: `${KEY}-agents` }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(calls[0].options.env.CLAUDE_CODE_SESSION_ID, 'sess-aws1', 'the emit runs as the node\'s session, which keep agents emit checks against the record');
+});
+
 test('a node\'s note must come from a session', async (t) => {
   const anonymous = "a node's note names the session it is from; run it inside an agent session";
   assert.equal(argumentRefusal('note', ['app', '--scope', 'x', '--for', '+1h', '-m', 'hi']), anonymous);

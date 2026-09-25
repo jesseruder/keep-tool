@@ -120,6 +120,18 @@ function writeTextAtomic(file, text) {
 
 // ---------- records ----------
 
+function placementNode(value) {
+  const name = typeof value === 'string' ? value.trim() : '';
+  return name && require('./config').NODE_NAME_RE.test(name) ? name : '';
+}
+
+const CAPABILITY_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
+
+function placementNeeds(value) {
+  const list = Array.isArray(value) ? value : [];
+  return [...new Set(list.map((entry) => String(entry || '').trim()).filter((entry) => CAPABILITY_RE.test(entry)))];
+}
+
 // Unknown keys survive: a later stage stores its own bookkeeping in the record
 // and a write from this one must not silently drop it.
 function normalizeRecord(name, value = {}) {
@@ -136,6 +148,11 @@ function normalizeRecord(name, value = {}) {
     project: String(value.project || ''),
     cwd: String(value.cwd || ''),
     area: oneLine(value.area || '', 60),
+    // Where the agent's sessions run: a node name, or '' for the daemon node. Set by
+    // Owner with `keep agents place`; an opener waits for the node rather than run
+    // the agent anywhere else. `needs` are capabilities that machine must declare.
+    node: placementNode(value.node),
+    needs: placementNeeds(value.needs),
     session: {
       id: String(session.id || ''),
       pane: String(session.pane || ''),

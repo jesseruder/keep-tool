@@ -15758,9 +15758,9 @@ async function closeEphemeralPane(pane, sessionId, deps = {}) {
 // The scheduler's opener, used by every caller that opens a session on a card the
 // scheduler would otherwise have opened one for.
 function openCheckSession(body, openDeps) {
-  // Pinned to this node, the way self-repair and the area sessions pin theirs: a
-  // check runs the card's recipe, is delivered and reaped from here, and must not
-  // land on another machine merely because the card's last session did.
+  // Pinned, the way self-repair and the area sessions pin theirs: a check must not
+  // land on another machine merely because the card's last session did. The pin is
+  // this node unless the card's agent was placed elsewhere (checkPlacement below).
   const open = (openDeps && openDeps.openSession) || openSession;
   // A card that names its agent (`agent:` in its frontmatter, runs.js) opens the
   // check as that agent: the pane carries `agentName`, so the session is the agent's
@@ -15769,8 +15769,44 @@ function openCheckSession(body, openDeps) {
   // its sweep reaps the pane.
   const { agentName, ...rest } = body || {};
   const named = typeof agentName === 'string' && agents.validName(agentName) ? agentName : '';
-  return open({ ...rest, node: nodes.daemonNode((openDeps || {}).env || process.env) },
+  // A card agent Owner placed on a node (`keep agents place`) runs there and nowhere
+  // else. The daemon's sweep reaps it there on that node's own evidence. Anything
+  // else — a plain check, an agent with no placement — stays on this node.
+  const placement = checkPlacement(named, openDeps || {});
+  const launch = () => open({ ...rest, node: placement.node },
     { ...openDeps, launchMeta: { ephemeral: 'check', ...(named ? { agentName: named } : {}) } });
+  if (!placement.remote) return launch();
+  return (async () => {
+    await requireNodeAnswers(placement.node, openDeps || {});
+    return launch();
+  })();
+}
+
+// Where a card agent's check opens: its record's placement resolved through the same
+// resolvePlacement every open takes (a named node is a demand, its needs are held to),
+// or this node when it has none.
+function checkPlacement(agentName, deps = {}) {
+  const daemon = nodes.daemonNode(deps.env || process.env);
+  const record = agentName ? (deps.readAgentRecord || agents.readRecord)(agentName) : null;
+  if (!record || (!record.node && !(record.needs || []).length)) return { node: daemon, remote: false };
+  const node = resolvePlacement({
+    pinned: record.node || daemon,
+    needs: record.needs || [],
+    label: `agent ${agentName}`,
+  }, deps);
+  return { node, remote: node !== daemon };
+}
+
+// "Wait for the node": an agent placed on a machine that is not answering is not
+// opened anywhere else. The error carries `code: 'NODE_WAIT'`, which the scheduler
+// reads as "not this tick" — no allowance spent, nothing recorded as a failure.
+async function requireNodeAnswers(node, deps = {}) {
+  try {
+    await (deps.hostRequest || hostRequest)('hello', {}, { ...deps, node });
+  } catch (error) {
+    throw Object.assign(new Error(`node ${node} did not answer (${String(error && error.message || error)}); the check waits for it`),
+      { code: 'NODE_WAIT', node });
+  }
 }
 
 // `keep verify <id>` and the console's "Run check now": run a card's check recipe now

@@ -805,8 +805,16 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
     }, {});
   } catch (error) {
     if (enforce && reservedIn === allowanceTick) freshOpensThisTick = Math.max(0, freshOpensThisTick - 1);
+    // An agent placed on a node that is not answering waits for it: nothing is
+    // recorded as opened or failed, so the next tick asks again. The wait is said
+    // once on the agent's feed, not on every tick.
+    if (error && error.code === 'NODE_WAIT') {
+      noteNodeWait(agentApi, agentName, error.node, opts.root || keep.ROOT);
+      return { skipped: 'node-wait', reason: error.message, errors: [] };
+    }
     throw error;
   }
+  if (agentName) clearNodeWait(agentApi, agentName, opts.root || keep.ROOT);
   if (!enforce) freshOpensThisTick += 1;
   if (enforce) recordOpen(task.id, today, opts.now);
   if (agentName && opened && opened.sessionId) {
@@ -832,6 +840,32 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
     ttlMs: FRESH_OPEN_STAMP_TTL_MS,
   };
   return { opened, delivery, errors: stampFreshOpen(task, delivery) };
+}
+
+// `nodeWait` on the record is the outage the feed was told about: one event when a
+// placed agent first finds its node silent, none while it stays silent, and the
+// field cleared by the open that succeeds.
+function noteNodeWait(agentApi, agentName, node, root) {
+  if (!agentName) return;
+  try {
+    const record = agentApi.readRecord(agentName, root);
+    if (!record || (record.nodeWait && record.nodeWait.node === node)) return;
+    agentApi.writeRecord(agentName, { nodeWait: { node: String(node || ''), since: Date.now() } }, { root });
+    agentApi.emit(agentName, {
+      kind: 'waiting', severity: 'med',
+      text: `node ${node} is not answering; this agent's checks wait for it`,
+    }, { root });
+    agentApi.flushCommits(root);
+  } catch (error) {
+    process.stderr.write(`keep runs: could not note that ${agentName} waits for node ${node}: ${error.message}\n`);
+  }
+}
+
+function clearNodeWait(agentApi, agentName, root) {
+  try {
+    const record = agentApi.readRecord(agentName, root);
+    if (record && record.nodeWait) agentApi.writeRecord(agentName, { nodeWait: null }, { root });
+  } catch {}
 }
 
 // Stamp the opened session the way a thread delivery is stamped, so a daemon restart

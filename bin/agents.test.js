@@ -1144,3 +1144,57 @@ test('keep agents lists, emits and marks seen from the command line', () => {
     assert.equal(fs.existsSync(agents.agentDir('nobody', root)), false);
   } finally { cleanup(root); }
 });
+
+test('keep agents place puts an agent on a configured node, and only Owner may', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('redash-daily', { role: 'scheduled check' }, { root });
+    const configFile = path.join(root, 'config.json');
+    fs.writeFileSync(configFile, JSON.stringify({ version: 1, nodes: { main: {}, aws1: { address: '100.64.0.2:47402' } }, daemonNode: 'main' }));
+    const env = { ...process.env, KEEP_DIR: root, KEEP_CONFIG: configFile, KEEP_NO_PUSH: '1', KEEP_ALERT_CHANNELS: 'none' };
+    for (const name of ['CLAUDE_CODE_SESSION_ID', 'CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'KEEP_PI_SESSION_ID',
+      'KEEP_REMOTE_CALLER', 'KEEP_NODE_NAME', 'KEEP_DAEMON_NODE', 'KEEP_OWNER']) delete env[name];
+    const keepBin = path.join(__dirname, 'keep.js');
+    const run = (args, extra = {}) => spawnSync(process.execPath, [keepBin, 'agents', 'place', ...args], { encoding: 'utf8', env: { ...env, ...extra } });
+
+    assert.match(run(['redash-daily']).stdout, /redash-daily: runs on the daemon node \(main\)/);
+    const placed = run(['redash-daily', '--node', 'aws1', '--needs', 'redash']);
+    assert.equal(placed.status, 0, placed.stderr);
+    assert.match(placed.stdout, /runs on aws1, needs redash/);
+    assert.equal(agents.readRecord('redash-daily', root).node, 'aws1');
+    assert.deepEqual(agents.readRecord('redash-daily', root).needs, ['redash']);
+
+    // A node nobody configured is refused by name; the record is unchanged.
+    const unknown = run(['redash-daily', '--node', 'aws9']);
+    assert.notEqual(unknown.status, 0);
+    assert.match(unknown.stderr, /no configured node named aws9 \(known: main, aws1\)/);
+    // An agent session may read the placement but not change it.
+    const inSession = run(['redash-daily', '--daemon'], { CLAUDE_CODE_SESSION_ID: 'abc' });
+    assert.notEqual(inSession.status, 0);
+    assert.match(inSession.stderr, /only Owner places an agent/);
+    assert.match(run(['redash-daily'], { CLAUDE_CODE_SESSION_ID: 'abc' }).stdout, /runs on aws1/);
+    assert.equal(agents.readRecord('redash-daily', root).node, 'aws1');
+
+    // Back to the daemon node: naming it is the same as --daemon.
+    assert.equal(run(['redash-daily', '--node', 'main']).status, 0);
+    assert.equal(agents.readRecord('redash-daily', root).node, '');
+    assert.equal(run(['redash-daily', '--daemon']).status, 0);
+    assert.deepEqual(agents.readRecord('redash-daily', root).needs, []);
+    // The reviewer is not Keep's to open, so it is not placed this way.
+    assert.match(run(['fleet-reviewer', '--node', 'aws1']).stderr, /keep move/);
+
+    // An emit forwarded from a node (KEEP_REMOTE_CALLER, and the session the daemon
+    // verified) writes the feed only from the session the record names.
+    agents.writeRecord('redash-daily', { lifecycle: 'working', session: { id: 'sid-agent', pane: 'p@aws1', startedAt: 1 } }, { root });
+    const emit = (session) => spawnSync(process.execPath, [keepBin, 'agents', 'emit', 'redash-daily', '--kind', 'diagnosed', '-m', 'x'],
+      { encoding: 'utf8', env: { ...env, KEEP_REMOTE_CALLER: 'aws1', ...(session ? { CLAUDE_CODE_SESSION_ID: session } : {}) } });
+    const stranger = emit('sid-other');
+    assert.notEqual(stranger.status, 0);
+    assert.match(stranger.stderr, /an emit from a node must come from that session/);
+    assert.notEqual(emit(null).status, 0);
+    assert.equal(agents.readEvents('redash-daily', { root }).length, 0);
+    const own = emit('sid-agent');
+    assert.equal(own.status, 0, own.stderr);
+    assert.equal(agents.readEvents('redash-daily', { root }).length, 1);
+  } finally { cleanup(root); }
+});

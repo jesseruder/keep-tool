@@ -11057,6 +11057,42 @@ test('a check session Keep opens for itself lands on the daemon node', async () 
   assert.equal(resolvePlacement({ node: 'main', lastCardNode: 'aws1' }, { hostNodes: ['main', 'aws1'] }), 'main');
 });
 
+test('a card agent Owner placed on a node opens its check there, and waits for a node that does not answer', async () => {
+  const { openCheckSession } = require('./serve');
+  const records = {
+    'on-node': { name: 'on-node', node: 'aws1', needs: [] },
+    unplaced: { name: 'unplaced', node: '', needs: [] },
+  };
+  const opens = [];
+  const asked = [];
+  const deps = (hello) => ({
+    hostNodes: ['main', 'aws1'],
+    readAgentRecord: (name) => records[name] || null,
+    hostRequest: async (type, params, requestDeps) => { asked.push([type, requestDeps.node]); return hello(); },
+    openSession: async (body, openDeps) => { opens.push({ body, launchMeta: openDeps.launchMeta }); return { sessionId: 's' }; },
+  });
+  // Placed: the node is asked first, then the check opens there, named as the agent.
+  await openCheckSession({ taskId: 'c', agentName: 'on-node', message: 'm' }, deps(() => ({})));
+  assert.deepEqual(asked, [['hello', 'aws1']]);
+  assert.equal(opens[0].body.node, 'aws1');
+  assert.deepEqual(opens[0].launchMeta, { ephemeral: 'check', agentName: 'on-node' });
+  // Not answering: nothing opens anywhere, and the refusal says to wait.
+  await assert.rejects(openCheckSession({ taskId: 'c', agentName: 'on-node', message: 'm' },
+    deps(() => { throw new Error('host connect timed out'); })),
+  (error) => error.code === 'NODE_WAIT' && error.node === 'aws1' && /node aws1 did not answer/.test(error.message));
+  assert.equal(opens.length, 1, 'a placed agent never falls back to the daemon node');
+  // No placement, or no agent: the daemon node, and no node is asked anything.
+  asked.length = 0;
+  await openCheckSession({ taskId: 'c', agentName: 'unplaced', message: 'm' }, deps(() => assert.fail('asked')));
+  await openCheckSession({ taskId: 'c', message: 'm' }, deps(() => assert.fail('asked')));
+  assert.deepEqual(opens.slice(1).map((open) => open.body.node), ['main', 'main']);
+  assert.deepEqual(asked, []);
+  // A placement whose node is missing a capability it needs is refused, not moved.
+  records.picky = { name: 'picky', node: 'aws1', needs: ['android'] };
+  assert.throws(() => openCheckSession({ taskId: 'c', agentName: 'picky', message: 'm' }, deps(() => ({}))),
+    (error) => error.status === 409 && /node aws1 does not have android/.test(error.message));
+});
+
 test('an account handoff of a session on another node asks that node first; a rate-limit resume still refuses', async (t) => {
   const { handoffSession, handoffSessionRequest, resumeAfterLimit } = require('./serve');
   const handoff = require('./account-handoff');
