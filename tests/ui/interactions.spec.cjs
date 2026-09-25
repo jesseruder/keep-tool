@@ -70,25 +70,25 @@ test('rapid switching routes typing to the last clicked session during updates',
   }
 });
 
-test('a new card check-in does not resize the desktop terminal', async ({ page }) => {
+test('a change in where the work stands does not resize the desktop terminal', async ({ page }) => {
   await page.locator('#qlist [data-key="running:b"]').click();
   await selected(page, 'b');
   const card = fixture.state.tasks.find((task) => task.id === 'card-b');
-  card.lastLog = 'Short check-in.';
+  card.fm.needs = [{ text: 'the Stripe key' }];
   fixture.publish();
-  await expect(page.locator('#stage .card-log')).toHaveText('Short check-in.');
+  await expect(page.locator('#stage .where-state')).toHaveText(/Waiting on you: the Stripe key/);
   await page.waitForTimeout(100);
   const before = await page.locator('#stage').evaluate((stage) => ({
-    brief: stage.querySelector('.summary.card-log').getBoundingClientRect().height,
+    brief: stage.querySelector('.summary.where').getBoundingClientRect().height,
     terminal: stage.querySelector('.xterm-host').getBoundingClientRect().height,
   }));
 
-  card.lastLog = Array.from({ length: 80 }, (_, index) => `check-in ${index}`).join(' ');
+  card.fm.needs = [{ text: Array.from({ length: 80 }, (_, index) => `need ${index}`).join(' ') }];
   fixture.publish();
-  await expect(page.locator('#stage .card-log')).toContainText('check-in 20');
+  await expect(page.locator('#stage .where-state')).toContainText('need 20');
   await page.waitForTimeout(100);
   const after = await page.locator('#stage').evaluate((stage) => ({
-    brief: stage.querySelector('.summary.card-log').getBoundingClientRect().height,
+    brief: stage.querySelector('.summary.where').getBoundingClientRect().height,
     terminal: stage.querySelector('.xterm-host').getBoundingClientRect().height,
   }));
   expect(after).toEqual(before);

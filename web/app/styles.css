@@ -487,17 +487,19 @@ html.mobile .artifact-save { padding: 4px 0; }
 .brief { position: relative; padding: 10px 16px 24px; border-bottom: 1px solid var(--line); background: var(--answer-bg); display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
 /* Summary refreshes are background metadata, not a reason to resize the PTY. */
 .brief .summary { color: var(--muted); white-space: pre-line; line-height: 1.4; height: 7em; flex-shrink: 0; overflow: auto; }
-/* The card's last few check-ins, newest first. The fixed .summary height above
-   still holds: a new check-in scrolls inside the box instead of resizing the PTY. */
-.brief .summary.card-log { white-space: normal; }
-.brief .card-log ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
-.brief .card-log li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
-.brief .card-log li:first-child .card-log-text { color: var(--text); }
-.brief .card-log-when { font-size: 11px; flex: 0 0 auto; }
-.brief .card-log-kind { font: 10px var(--mono); flex: 0 0 auto; }
-.brief .card-log-text { flex: 1 1 24ch; min-width: 0; }
-.brief .card-log-next { flex: 1 0 100%; font-size: 11px; }
-.brief .card-log-empty { margin: 0; }
+/* Where the work stands: what it waits on, next step, plan, last check-in. The
+   fixed .summary height above still holds, so an update never resizes the PTY. */
+.brief .summary.where { white-space: normal; display: flex; flex-direction: column; gap: 4px; }
+.brief .where p { margin: 0; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.brief .where-state { color: var(--text); font-weight: 600; }
+.brief .where-dot { margin-right: 6px; font-size: 10px; vertical-align: 1px; }
+.brief .where-state.warn .where-dot { color: var(--warn); }
+.brief .where-state.ok .where-dot { color: var(--ok); }
+.brief .where-state.info .where-dot { color: var(--info); }
+.brief .where-state.faint .where-dot { color: var(--faint); }
+.brief .where-next { color: var(--text); }
+.brief .where-bar { font-family: var(--mono); letter-spacing: 1px; color: var(--accent); }
+.brief .where-meta { font-size: 11px; }
 .brief-body { display: flex; gap: 12px; align-items: stretch; min-width: 0; }
 .brief-body > .summary { flex: 1 1 auto; min-width: 0; }
 /* With a picture the box is taller, the same height whether the picture has

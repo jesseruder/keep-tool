@@ -11,7 +11,7 @@ import { sessionLabel, sessionExplanation, backgroundLabel, hostOutage, hostOuta
 import { retainSelection, selectionIndex } from './selection.js';
 import { actionsMenuHTML, installActionsMenu, installKeepRunningControl, keepRunningControlHTML,
   patchActionsMenu, predictTypingControlsHTML, rendererControlsHTML } from './session-actions.js';
-import { checkinsHTML, pictureHTML, pictureToggleHTML, installPictureToggle } from './card-log.js';
+import { whereHTML, pictureHTML, pictureToggleHTML, installPictureToggle } from './card-log.js';
 import { numBadgeHTML } from './session-number.js';
 import { installHeadingRename, installRenameControls, isEditing, renameButtonsHTML, titleAttrsHTML } from './session-rename.js';
 import { installMarkControls, markControlsHTML, markHTML, markRowClass } from './session-mark.js';
@@ -753,9 +753,7 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
 }
 
 function briefHTML(ctx, item, session, task) {
-  const fallback = item.taskId
-    ? 'No check-ins on this card yet'
-    : item.sessionId ? 'No Keep card for this session' : item.detail || 'No session transcript available.';
+  const fallback = item.sessionId ? 'No Keep card for this session' : item.detail || 'No session transcript available.';
   let actions = '';
   if (item.kind === 'question') {
     const options = Array.isArray(item.options) ? item.options : [];
@@ -766,7 +764,13 @@ function briefHTML(ctx, item, session, task) {
   }
   const cardTask = item.taskId && task?.id ? task : null;
   const picture = cardTask ? pictureHTML(ctx, cardTask) : '';
-  return `<div class="brief-body${picture ? ' with-picture' : ''}">${picture}${checkinsHTML(ctx, cardTask, fallback)}</div>${actions}`;
+  // The same test renderStage uses for a row in Waiting on you.
+  const waiting = item.kind !== 'running' && item.kind !== 'pinned' && item.kind !== 'recent';
+  const label = session ? sessionLabel(session) : '';
+  const where = whereHTML(ctx, {
+    task: cardTask, session, waiting, waitingText: item.detail || label, sessionLabel: label, fallbackText: fallback,
+  });
+  return `<div class="brief-body${picture ? ' with-picture' : ''}">${picture}${where}</div>${actions}`;
 }
 
 async function sendReply(ctx, item, text) {

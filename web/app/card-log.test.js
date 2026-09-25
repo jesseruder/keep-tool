@@ -14,7 +14,7 @@ globalThis.fetch = async (url) => {
   return new Response(JSON.stringify(answer), { status: 200, headers: { 'content-type': 'application/json' } });
 };
 
-const { recentLogEntries, checkinsHTML, pictureHTML, setPicturesEnabled, picturesEnabled } = await import('./card-log.js');
+const { recentLogEntries, planSteps, commitCount, standing, whereHTML, pictureHTML, setPicturesEnabled, picturesEnabled } = await import('./card-log.js');
 
 const esc = (value) => String(value == null ? '' : value)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -54,16 +54,6 @@ test('the newest three log entries come back newest first, with next and commits
   assert.deepEqual(recentLogEntries(''), []);
 });
 
-test('check-ins render escaped, and the newest carries its next step', () => {
-  const html = checkinsHTML({ esc }, { id: 'kt', body: BODY }, 'fallback', Date.parse('2026-09-23T14:00'));
-  assert.match(html, /class="summary card-log"/);
-  assert.match(html, /1h ago/);
-  assert.match(html, /next: nothing/);
-  assert.equal((html.match(/next:/g) || []).length, 1, 'only the newest entry shows next');
-  assert.match(html, /Tests pass for &lt;b&gt;\./);
-  assert.doesNotMatch(html, /<b>/);
-});
-
 test('Keep bookkeeping and reviewer notes do not take a slot; check results do', () => {
   const body = `${BODY}
 ## 2026-09-24 09:00 — check result (agent) → waiting
@@ -92,16 +82,87 @@ abc1234 is on origin/master
   assert.equal(entries[0].kind, 'needs Owner → blocked');
 });
 
-test('a card whose detail is reloading keeps showing the last body seen for it', () => {
-  checkinsHTML({ esc }, { id: 'reload', body: BODY }, 'fallback');
-  const html = checkinsHTML({ esc }, { id: 'reload' }, 'No check-ins on this card yet');
-  assert.match(html, /Landed the parser/);
-  assert.doesNotMatch(html, /No check-ins/);
+const PLANNED = `## Plan
+- [x] Parser
+  done-when: node --test parser.test.js
+- [~] Wire the CLI
+- [ ] Docs
+
+## 2026-09-21 11:00 — check-in (by claude 1) → active
+Parser landed.
+next: wire <the> CLI
+commits: abc1234, def5678
+
+## 2026-09-23 13:00 — check-in (by claude 1) → active
+Half the CLI.
+next: nothing
+commits: abc1234
+
+## 2026-09-23 13:50 — probe result → active
+exit 0
+`;
+
+test('the plan parses as keep-core does, and cited commits are counted once', () => {
+  assert.deepEqual(planSteps(PLANNED).map((step) => step.state), ['done', 'doing', 'todo']);
+  assert.deepEqual(planSteps(BODY), [], 'a numbered list is not a plan');
+  assert.deepEqual(planSteps('## 2026-09-21 11:00 — created\nx\n## Plan\n- [ ] late'), [], 'the plan must lead the body');
+  assert.equal(commitCount(PLANNED), 2);
 });
 
-test('before the detail loads, the summary lastLog stands in; with no card, the fallback', () => {
-  assert.match(checkinsHTML({ esc }, { id: 'never-loaded', lastLog: 'Newest <check-in>' }, 'fallback'), /Newest &lt;check-in&gt;/);
-  assert.match(checkinsHTML({ esc }, null, 'No Keep card for this session'), /No Keep card for this session/);
+test('the first line says what the work waits on, in the order Owner cares about', () => {
+  const now = Date.parse('2026-09-24T12:00');
+  const at = (fm, extra = {}) => standing({ task: { id: 'kt', fm }, ...extra }, now);
+  assert.deepEqual(at({ status: 'blocked', needs: [{ text: 'the Stripe key' }] }, { waiting: true }),
+    { tone: 'warn', text: 'Waiting on you: the Stripe key' }, 'a need outranks everything');
+  assert.deepEqual(at({ status: 'active' }, { waiting: true, waitingText: 'Should I land this?' }),
+    { tone: 'warn', text: 'Waiting on you: Should I land this?' });
+  assert.equal(at({ status: 'review' }).text, 'Waiting for your review');
+  assert.deepEqual(at({ status: 'waiting', check_after: '2026-09-24T15:00' }), { tone: 'info', text: 'Check scheduled in 3h' });
+  assert.deepEqual(at({ status: 'waiting', check_after: '2026-09-24T10:00' }), { tone: 'warn', text: 'Check overdue since 2h ago' });
+  assert.equal(at({ status: 'waiting', depends_on: ['upstream-card', { task: 'other#2' }] }).text, 'Waiting on upstream-card, other#2');
+  assert.deepEqual(at({ status: 'active' }, { session: { id: 's' }, sessionLabel: 'Running' }), { tone: 'ok', text: 'Running' });
+  assert.equal(at({ status: 'done', check_after: '2026-09-24T15:00' }).text, 'Done', 'a done card has no pending check');
+});
+
+test('where it stands: state, next step, plan progress and the last check-in, escaped', () => {
+  const html = whereHTML({ esc }, { task: { id: 'plan-card', fm: { status: 'active' }, body: PLANNED }, session: { id: 's' }, sessionLabel: 'Running' },
+    Date.parse('2026-09-23T14:00'));
+  assert.match(html, /class="summary where"/);
+  assert.match(html, /where-state ok/);
+  assert.match(html, /Next:<\/span> Wire the CLI/);
+  assert.match(html, /▰▱▱<\/span> step 2 of 3<\/p>/);
+  assert.match(html, /last check-in 1h ago/, 'the probe result 10m ago is newer, but a check-in is what counts');
+  assert.match(html, /2 commits/);
+  assert.doesNotMatch(html, /<the>/);
+
+  // A latest check-in with its own next step shows it, and the plan line names its step.
+  const own = PLANNED.replace('next: nothing\n', 'next: ship <it>\n');
+  const html2 = whereHTML({ esc }, { task: { id: 'plan-own', fm: { status: 'active' }, body: own } });
+  assert.match(html2, /Next:<\/span> ship &lt;it&gt;/);
+  assert.match(html2, /step 2 of 3: Wire the CLI/);
+});
+
+test('only the latest check-in names the next step; else the plan step, said once', () => {
+  // PLANNED's latest check-in says "next: nothing", so the older "wire <the> CLI"
+  // is stale and the plan's current step stands in, without repeating itself.
+  const html = whereHTML({ esc }, { task: { id: 'plan-fallback', fm: { status: 'active' }, body: PLANNED } });
+  assert.match(html, /Next:<\/span> Wire the CLI/);
+  assert.match(html, /step 2 of 3<\/p>/);
+  assert.doesNotMatch(html, /wire &lt;the&gt;/);
+});
+
+test('a card whose detail is reloading keeps showing the last body seen for it', () => {
+  whereHTML({ esc }, { task: { id: 'reload', fm: {}, body: PLANNED } });
+  const html = whereHTML({ esc }, { task: { id: 'reload', fm: {} } });
+  assert.match(html, /step 2 of 3/);
+  assert.doesNotMatch(html, /Loading the card/);
+  assert.match(whereHTML({ esc }, { task: { id: 'never-loaded', fm: {} } }), /Loading the card/);
+});
+
+test('with no card, the session state and the fallback', () => {
+  const html = whereHTML({ esc }, { task: null, session: { id: 's' }, sessionLabel: 'Ready for next instruction', fallbackText: 'No Keep card for this session' });
+  assert.match(html, /Ready for next instruction/);
+  assert.match(html, /No Keep card for this session/);
 });
 
 test('the picture is on unless hidden, and drawn through an img data URI', async () => {
