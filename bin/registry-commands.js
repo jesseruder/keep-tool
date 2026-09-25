@@ -36,30 +36,19 @@ const REGISTRY_COMMANDS = Object.freeze([
 
 // A flag whose value is a command the daemon runs: `--probe` on its check schedule,
 // `--done-when` when a plan step is verified, and `plan --verify`, which runs one.
+// (resources --command/--deploy are patterns matched against commands, never run.)
 const COMMAND_FLAGS = Object.freeze(['--probe', '--done-when', '--verify']);
 
-// A flag whose value the daemon later hands a session as instructions, or that
-// makes it act on text that does: a node must not make the laptop open a session
-// that follows node-written text. Walked from the parseArgs specs of every command
-// in REGISTRY_COMMANDS (add, checkin, plan, wait-on, needs and the rest):
-//   --check    add/checkin: the recipe a due check delivers to a session, one the
-//              daemon opens when none is live. (resources --check only reads, but
-//              the name is refused in every command: failing closed is the point.)
-//   --on-pass  add/checkin: re-arms that recipe on a schedule.
-// Left allowed, and why: --check-after alone schedules a bare nudge with no recipe;
-// --check-every and checkin --handoff act only on a recipe already on the card,
-// which a node cannot have written; --next and -m are recorded and shown; decide
-// --send is recorded, never sent; resources --command/--deploy are patterns
-// matched against commands, never run; wait-on --deployed/--target and needs --env
-// name facts, not text.
-// Card titles (add, retitle) and plan step text DO reach laptop sessions: the
-// daemon quotes them into the check and unblock prompts it delivers. They are
-// trusted node input, by the same trust that lets a node push to master and land:
-// a node with a token is one of Owner's own machines, and what this list keeps it
-// from is writing a recipe or a command, not naming its own work. `note`, whose
-// text the daemon types straight into every live session in the project, is left
-// out of REGISTRY_COMMANDS until that announce knows which node wrote the note.
-const INSTRUCTION_FLAGS = Object.freeze(['--check', '--on-pass']);
+// What a node may write, and why: a node with a token is one of Owner's own machines,
+// so text it writes that the daemon later hands a session is trusted node input, by
+// the same trust that lets a node push to master and land. That covers the check
+// recipe (add/checkin --check, re-armed by --on-pass), card titles (add, retitle) and
+// plan step text, which the daemon quotes into the check and unblock prompts it
+// delivers, just as a forwarded tell and an open's -m are typed into sessions. What
+// it may not write is a command the daemon runs itself (COMMAND_FLAGS above): that
+// is execution on the laptop, not text a session reads and weighs. `note`, whose text
+// the daemon types straight into every live session in the project, is left out of
+// REGISTRY_COMMANDS until that announce knows which node wrote the note.
 
 // A flag whose value is a path on the node, per command: the daemon's CLI would read
 // that path from the daemon's own disk, which holds some other file or none.
@@ -198,7 +187,6 @@ function argumentRefusal(command, args, identity = {}) {
     const eq = arg.indexOf('=');
     const flag = !positional && arg.startsWith('--') && arg !== '--' ? (eq < 0 ? arg : arg.slice(0, eq)) : null;
     if (flag && COMMAND_FLAGS.includes(flag)) return `${flag} carries a command the daemon would run; set it from the daemon node`;
-    if (flag && INSTRUCTION_FLAGS.includes(flag)) return `${flag} carries text the daemon would hand a session as instructions; set it from the daemon node`;
     if (flag && fileFlags.includes(flag)) return `${flag} names a file on this node; use -m, or run it from the daemon node`;
     if ((flag === '--session' || flag === '--node') && !placementFlags.includes(flag)) {
       const named = eq < 0 ? args[i + 1] : arg.slice(eq + 1);
@@ -364,4 +352,4 @@ function requestedWaitMs(command, args) {
   try { return require('./wait.js').parseDuration(wait); } catch { return 0; }
 }
 
-module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

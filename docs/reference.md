@@ -1635,6 +1635,12 @@ stops answering gets the usual twenty seconds of retries.
 A forwarded open runs beside the node's other commands and holds a restart for as long
 as it runs.
 
+The same trust covers a check recipe: a node's `keep add` or `keep checkin` may carry
+`--check` and `--on-pass`, whose text the daemon later hands a session just as it types a
+tell or an open's `-m`. What a node may not forward is a command the daemon would run
+itself: `--probe`, `--done-when` and `plan --verify` are refused there and must be set
+from the daemon node.
+
 A ledger at `.keep/tell.json` allows six tells per sender-recipient pair per rolling
 hour and twenty into any one session per hour; Owner's shell is exempt from the pair
 cap but not the per-recipient one. The slot is reserved under the registry lock before

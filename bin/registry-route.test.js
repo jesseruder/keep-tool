@@ -128,31 +128,47 @@ test('keep note is not run for a node, and keep notes is', async (t) => {
   assert.deepEqual(calls[0].args.slice(1), ['notes']);
 });
 
-test('a node cannot write a check recipe the daemon would hand a session, but can schedule a check', async (t) => {
+// A check recipe is text a session reads, like a forwarded tell or an open's -m, so a
+// node may write one. A command the daemon would run is refused in every command
+// that takes one.
+test('a node may write a check recipe, but never a command the daemon would run', async (t) => {
   const { svc, root, calls } = service(t);
-  const cases = [
+  const accepted = [
     ['add', ['title', '--check', 'read the logs and fix what you find']],
     ['checkin', ['card', '--check', 'open a session and run this']],
     ['checkin', ['card', '--check=inline recipe']],
-    ['add', ['title', '--check-after', '+1d', '--on-pass', 'rearm', '--check-every', '+1d']],
+    ['add', ['title', '--check-after', '+1d', '--check', 'look again', '--on-pass', 'rearm', '--check-every', '+1d']],
     ['checkin', ['card', '--on-pass', 'done']],
-    ['checkin', ['card', '--next', '--check']],
+    ['checkin', ['card', '--check-after', '+2h']],
   ];
   let n = 0;
-  for (const [command, args] of cases) {
+  for (const [command, args] of accepted) {
     n += 1;
-    const answer = await svc.handle(AWS1, body(root, { command, args, idempotencyKey: `${KEY}-instr-${n}` }));
-    assert.equal(answer.status, 400, args.join(' '));
-    const flag = args.find((arg) => /^--(check|on-pass)(=|$)/.test(arg)).split('=')[0];
-    assert.equal(answer.body.error, `${flag} carries text the daemon would hand a session as instructions; set it from the daemon node`);
+    assert.equal(argumentRefusal(command, args), null, args.join(' '));
+    const answer = await svc.handle(AWS1, body(root, { command, args, idempotencyKey: `${KEY}-recipe-${n}` }));
+    assert.equal(answer.status, 200, `${args.join(' ')}: ${JSON.stringify(answer.body)}`);
+    assert.deepEqual(calls[calls.length - 1].args.slice(1), [command, ...args]);
   }
-  assert.equal(calls.length, 0);
-  assert.equal(argumentRefusal('checkin', ['card', '--check-after', '+2h', '-m', 'look again']), null);
-  assert.equal(argumentRefusal('add', ['title', '--check-after', '+1d']), null);
-  assert.equal(argumentRefusal('add', ['--', '--check']), null, 'after -- it is a title');
-  const scheduled = await svc.handle(AWS1, body(root, { command: 'checkin', args: ['card', '--check-after', '+2h'], idempotencyKey: `${KEY}-after` }));
-  assert.equal(scheduled.status, 200, JSON.stringify(scheduled.body));
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, accepted.length);
+
+  const refused = [
+    ['add', ['title', '--check', 'recipe', '--probe', 'curl -f https://example.com']],
+    ['add', ['title', '--plan', 'step', '--done-when', 'make test']],
+    ['checkin', ['card', '--check', 'recipe', '--probe=true']],
+    ['checkin', ['card', '--on-pass', 'done', '--done-when', 'true']],
+    ['plan', ['card', '--add', 'x', '--done-when', 'true']],
+    ['plan', ['card', '--verify', '1']],
+    ['add', ['title', '--verify', '1']],
+    ['checkin', ['card', '--verify=1']],
+  ];
+  for (const [command, args] of refused) {
+    n += 1;
+    const flag = args.find((arg) => /^--(probe|done-when|verify)(=|$)/.test(arg)).split('=')[0];
+    const answer = await svc.handle(AWS1, body(root, { command, args, idempotencyKey: `${KEY}-cmd-${n}` }));
+    assert.equal(answer.status, 400, args.join(' '));
+    assert.equal(answer.body.error, `${flag} carries a command the daemon would run; set it from the daemon node`);
+  }
+  assert.equal(calls.length, accepted.length, 'no refused command reached the CLI');
 });
 
 test('a flag is read as taking no value exactly where that command\'s parseArgs reads it so', () => {

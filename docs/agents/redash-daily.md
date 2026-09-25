@@ -16,7 +16,6 @@ The card is a recurring check: created with `--check "<pointer to this file>"`,
 card, so every run goes to a fresh session rather than into a thread that remembers
 yesterday. The delivered message will tell you to re-arm with `--check-after +1d`; use
 the fixed `<tomorrow>T07:30` below instead, so the run does not drift later every day.
-(The `--check` text can only be set from the daemon node, not from a pane-only node.)
 
 ## What you read, and how
 
