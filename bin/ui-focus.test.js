@@ -108,8 +108,13 @@ test('Waiting on you keeps each row where it first appeared while Keep writes to
   now += 90e3;
   assert.deepEqual(order([{ sessionId: 'a', since: 40 }, { sessionId: 'b', since: 20 }]), ['a', 'b'],
     'a row back within the grace keeps its place');
+  now += 60 * 60e3;
+  assert.deepEqual(order([{ sessionId: 'a', since: 50 }, { sessionId: 'b', since: 20 }]), ['a', 'b'],
+    'a console that slept past the grace keeps rows that never left');
   now += 10 * 60e3 + 1;
   assert.deepEqual(order([{ sessionId: 'b', since: 20 }]), ['b']);
+  now += 10 * 60e3 + 1;
+  order([{ sessionId: 'b', since: 20 }]);
   assert.equal(anchors.has('a'), false, 'an anchor gone past the grace is dropped');
   assert.deepEqual(order([{ sessionId: 'a', since: 40 }, { sessionId: 'b', since: 20 }]), ['b', 'a'],
     'a row gone longer is a new request at its new time');

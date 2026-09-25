@@ -253,8 +253,13 @@ function entityForPane(id) {
   };
 }
 function queueItems() {
-  return stableAttentionOrder(humanAttention(data)
-    .filter((item) => !isClosingSession(item.sessionId, item.pane) && !state.sent.has(eventKey(item))), waitingOrder, itemKey);
+  // A row answered from here gives up its place: its next ask is a new request,
+  // not the one that has waited longest.
+  return stableAttentionOrder(humanAttention(data).filter((item) => {
+    if (!state.sent.has(eventKey(item))) return !isClosingSession(item.sessionId, item.pane);
+    waitingOrder.delete(itemKey(item));
+    return false;
+  }), waitingOrder, itemKey);
 }
 function sessionItem(kind, session, pane = session.pane) {
   return {

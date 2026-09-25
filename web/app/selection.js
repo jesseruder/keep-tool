@@ -41,12 +41,14 @@ export function stableSessionOrder(items, ranks, knownIds, createdAt = null) {
 // Priority still decides the group.
 export function stableAttentionOrder(items, anchors, keyOf, now = Date.now(), grace = 10 * 60e3) {
   const time = (value) => (typeof value === 'number' ? value : Date.parse(value) || 0);
-  for (const [key, anchor] of anchors) if (now - anchor.seen > grace) anchors.delete(key);
+  // Listed rows are marked seen before anything is pruned: a console that slept
+  // past the grace must not re-anchor rows that never left.
   for (const item of items) {
     const anchor = anchors.get(keyOf(item));
     if (anchor) anchor.seen = now;
     else anchors.set(keyOf(item), { at: time(item.since), seen: now });
   }
+  for (const [key, anchor] of anchors) if (now - anchor.seen > grace) anchors.delete(key);
   return [...items].sort((a, b) => Number(a.pri || 0) - Number(b.pri || 0)
     || anchors.get(keyOf(a)).at - anchors.get(keyOf(b)).at
     || String(keyOf(a)).localeCompare(String(keyOf(b))));

@@ -883,6 +883,10 @@ test('an agent in needs-input appears under Agents and in no other queue', async
   assert.deepEqual(ids(ctx.pinnedItems()), ['work-sid'], 'Pinned');
   assert.deepEqual(ids(ctx.recentItems()), ['work-sid'], 'Recent');
   assert.deepEqual(data.agents.map((row) => row.name), ['sandboxes'], 'and exactly one Agents row');
+  assert.equal(ctx.waitingOrder.has('work-sid'), true);
+  ctx.state.sent.add('work-sid');
+  assert.deepEqual(ids(ctx.queueItems()), [], 'an answered row is hidden');
+  assert.equal(ctx.waitingOrder.has('work-sid'), false, 'and gives up its place in Waiting on you');
 });
 
 class ReplyControl {
