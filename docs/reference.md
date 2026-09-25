@@ -2600,7 +2600,8 @@ on spends a model account, so it is Owner's switch to flip, per area, and only a
 parser has run clean. Recipes ship for `sandboxes` and, since 2026-09-25, `app-server`
 (`docs/agents/app-server.md`: the default area, so every alert no other area claims —
 GraphQL faults, app latency, the worker, Aurora, Redis, ClickHouse, the ECS services),
-and since 2026-09-25 also `cauldron` (`docs/agents/cauldron.md`: the `^Cauldron ` alerts
+and since 2026-09-25 also `cauldron`, whose agent is `multiplayer` (`"agent":
+"multiplayer"`, recipe `docs/agents/multiplayer.md`: the `^Cauldron ` alerts
 from `#errors-multiplayer` — the multiplayer host-agent, proxy, runtime shim and their
 fleet, working in `~/wt/cauldron-game-server/responder`); flipping `"session": true` on
 an area with a recipe is all it takes to run it. `account` defaults to `claude-secondary`, `restartAfterIdleMin` to
