@@ -52,20 +52,23 @@ export function sessionRowHTML(row, index, selected, esc) {
 }
 
 export function installSessionSearch({ rows, recentIds, open, esc }) {
-  let dialog, input, list, results = [], selected = 0;
+  let dialog, input, list, all = [], results = [], selected = 0;
   const render = () => {
     list.innerHTML = results.map((row, index) => sessionRowHTML(row, index, index === selected, esc)).join('')
       || '<li class="empty">No matching sessions</li>';
-    input.setAttribute('aria-activedescendant', results.length ? `session-search-${selected}` : '');
+    if (results.length) input.setAttribute('aria-activedescendant', `session-search-${selected}`);
+    else input.removeAttribute('aria-activedescendant');
     list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
   };
-  const search = () => { results = rankSessions(rows(), input.value, recentIds()); selected = 0; render(); };
-  const choose = (row) => { if (!row) return; dialog.close(); open(row.id); };
+  const search = () => { results = rankSessions(all, input.value, recentIds()); selected = 0; render(); };
+  // Blur first so closing does not hand focus back to the terminal being left:
+  // its focusin would take control of that pane just before we navigate away.
+  const choose = (row) => { if (!row) return; input.blur(); dialog.close(); open(row.id); };
   const build = () => {
     dialog = document.createElement('dialog');
     dialog.className = 'session-search-dialog';
     dialog.innerHTML = '<input type="search" placeholder="Find a session: title, #number, project or card" aria-label="Find a session" role="combobox" aria-controls="session-search-list" aria-expanded="true" autocomplete="off" spellcheck="false">'
-      + '<ul id="session-search-list" role="listbox"></ul>';
+      + '<ul id="session-search-list" role="listbox" aria-label="Sessions"></ul>';
     input = dialog.querySelector('input');
     list = dialog.querySelector('ul');
     input.addEventListener('input', search);
@@ -85,6 +88,10 @@ export function installSessionSearch({ rows, recentIds, open, esc }) {
       }
     });
     list.addEventListener('click', (event) => choose(results[Number(event.target.closest('[data-index]')?.dataset.index)]));
+    // Focus stays in the field: a click on a row, the padding or the empty note must
+    // not drop it to <body>, where the console's bare-key shortcuts would act on the
+    // page behind the finder.
+    dialog.addEventListener('mousedown', (event) => { if (event.target !== input) event.preventDefault(); });
     // A click on the backdrop lands on the dialog itself.
     dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
     document.body.append(dialog);
@@ -94,6 +101,7 @@ export function installSessionSearch({ rows, recentIds, open, esc }) {
     show() {
       if (!dialog?.isConnected) build();
       if (!dialog.open) dialog.showModal();
+      all = rows();
       input.select();
       search();
     },

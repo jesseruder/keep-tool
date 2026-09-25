@@ -1509,7 +1509,7 @@ function focusTerminal(explicit = false) {
 function focusQueue() { focusQueueItem(state, document); }
 
 document.addEventListener('keydown', (event) => {
-  if (document.querySelector('#notificationsPanel')?.open) return;
+  if (document.querySelector('#notificationsPanel')?.open || sessionSearch.open) return;
   // Plain keys inside the emoji picker (its search box and its cell buttons)
   // belong to the picker, whichever phase this listener runs in; the modified
   // shortcuts (Cmd+B, Cmd+1-5, Cmd+Enter, ...) stay global there as everywhere.
