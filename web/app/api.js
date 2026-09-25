@@ -10,6 +10,7 @@ const STATE_MUTATIONS = new Set([
   '/api/portable-transfers', '/api/reminders', '/api/rename-session', '/api/reopen-session',
   '/api/resolve-portable-transfer', '/api/restart-daemon', '/api/restart-session', '/api/review-queue',
   '/api/reviewtick', '/api/run', '/api/send', '/api/session-keep-running', '/api/setaside', '/api/transfer-session',
+  '/api/secrets/fulfill', '/api/secrets/decline',
 ]);
 let stateAfterMutation = '';
 let observedMutationFence = '';

@@ -43,6 +43,7 @@ const reviewGroup = require('./commands/review.js');
 const stepGroup = require('./commands/step.js');
 const turnsGroup = require('./commands/turns.js');
 const watcherGroup = require('./commands/watcher.js');
+const secretGroup = require('./commands/secret.js');
 const {
   codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence,
   hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand,
@@ -3803,6 +3804,13 @@ function helpText() {
   keep needs [<card> "<secret or action>" [--env NAME] | <card> --met [--env NAME|"<text>"]]
                           # what only Owner can supply; no args is a read-only list
                           # env needs auto-clear only at startup of a linked owning session
+  keep secret request <NAME> --to <path> [--key VAR] [-m "what it is for"] [--card <id>] [--replace] [--multiline]
+                          # Owner pastes it in the console on this session; it is written to <path>
+                          # on this machine (0600), never shown to the agent. --key upserts VAR=value
+  keep secret status [<id>] [--all] [--json]
+                          # this session's requests, or one; exits 3 while one is still pending
+  keep secret wait <id> [--for 10m]
+                          # 0 delivered, 1 declined or expired, 124 still waiting
 ${stepUsage()}
   keep decide <type> [--card <id>] [--session <sid>] --send "<message>" -m "why"
                          # the reviewer records what it WOULD do; nothing is sent
@@ -4013,7 +4021,7 @@ commands.help = (argv) => {
 };
 
 // Each command group lives in its own file; their tables merge into this one.
-Object.assign(commands, hookGroup.commands, hostGroup.commands, nodesGroup.commands, reviewGroup.commands, stepGroup.commands, turnsGroup.commands, watcherGroup.commands);
+Object.assign(commands, hookGroup.commands, hostGroup.commands, nodesGroup.commands, reviewGroup.commands, stepGroup.commands, turnsGroup.commands, watcherGroup.commands, secretGroup.commands);
 
 // ---------- main / module ----------
 
@@ -4081,6 +4089,7 @@ const PANE_ONLY_COMMANDS = {
   attach: true,
   doctor: true,
   setup: true, // hooks, skills and the shell block of this machine's own agents
+  secret: true, // asks the daemon over its node API; the destination is checked here
   nodes: (args) => !args.length || ['ls', 'usage'].includes(args[0]) || String(args[0]).startsWith('-'),
   node: (args) => args[0] === 'init',
   codex: (args) => (args[0] === '--account' ? args[2] : args[0]) === 'context',
@@ -4137,7 +4146,7 @@ if (require.main === module) {
       // registry's, and it must start where there are no cards to read.
       // `node` joins them: `keep node init` runs on a machine that is being set up to
       // hold terminals for another one's registry, and has none of its own.
-      if (!fs.existsSync(TASKS) && !['help', 'hook', 'init', 'doctor', 'setup', 'review-eval', 'host', 'node'].includes(cmd)) die(`no repo at ${ROOT} (set KEEP_DIR?)`);
+      if (!fs.existsSync(TASKS) && !['help', 'hook', 'init', 'doctor', 'setup', 'review-eval', 'host', 'node', 'secret'].includes(cmd)) die(`no repo at ${ROOT} (set KEEP_DIR?)`);
       const fn = commands[cmd || 'list'];
       if (!fn) die(`unknown command "${cmd}" — try \`keep help\``);
       const helpArgs = [];

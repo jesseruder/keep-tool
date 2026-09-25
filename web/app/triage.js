@@ -18,6 +18,7 @@ import { providerIconHTML } from './provider-icon.js';
 import { nodeBadgeHTML, remoteNode } from './node-badge.js';
 import { placeInbox } from './queue-inbox.js';
 import { runAction } from './action.js';
+import { syncSecretDrop } from './secret-drop.js';
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
 const summaryInflight = new Map();
@@ -954,6 +955,8 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     installReplyComposer(stage, ctx, item);
   }
   syncReplyComposer(stage, session, ctx.state);
+  // A secret this session asked Owner for: shown here, above its terminal, and only here.
+  syncSecretDrop(stage, ctx, item);
   const pinLabel = ctx.isPanePinned(paneId) ? 'Unpin from Watch' : 'Pin to Watch';
   const closable = hasLivePane && item.sessionId && ['claude', 'codex', 'pi'].includes(pane.meta?.agent);
   const dependencyAcknowledged = ctx.setAsideFor(item)?.kind === 'dependency';

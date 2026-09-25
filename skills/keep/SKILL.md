@@ -18,6 +18,7 @@ Load the situational skill when its moment comes, not before:
 | Scheduling anything for later: an experiment, `--check-after`, a recipe or probe, a delivered check | `keep-scheduled-checks` |
 | Starting, handing off to, messaging or inspecting another session; choosing its account or model | `keep-sessions` |
 | Before a deploy, migration, restart, terraform run or shared device: who, holds, notes, gated steps | `keep-shared-state` |
+| A task needs a secret, API key, token or credential file you do not have | `keep-secrets` |
 | Keep itself is misbehaving: daemon, host, console, delivery, accounts, Codex jobs | `keep-ops` |
 | You are a named agent (an area's incident responder, a standing worker) | `keep-agent-session` |
 | A "[keep] review tick", or Owner asks for a fleet review | `fleet-review` |
@@ -129,7 +130,9 @@ background-terminal wake-up is not yet verified.
   linked owning session starts with that env var set, or when Owner runs `keep needs
   <card> --met`. Bare `keep needs` only lists; an unrelated session or shell never clears
   a need. Never scrape a token out of browser state, a signed-in Chrome, or another
-  agent's session to get past such a gate.
+  agent's session to get past such a gate. A secret this session needs now is asked for
+  with `keep secret request` (the `keep-secrets` skill), never pasted into chat or fetched
+  with a one-off command Owner has to run.
 
 ## Landing and closing
 

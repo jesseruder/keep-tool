@@ -51,6 +51,10 @@ async function createFixture() {
     accounts, handoffs: [], setAside: {}, health: { daemon: { running: true } }, usage: { accounts: usageAccounts,
       claude: { limits: [{ label: 'legacy claude', percent: 99 }] }, codex: { windows: [{ label: 'legacy codex', percent: 99 }] } }, review: { events: [], stats: {} }, limitResume: {} };
   state.reviewQueue = { items: [], counts: { 'needs-decision': 0, 'in-progress': 0, resolved: 0 } };
+  // Secret handoff: pending requests the stage shows, and what a fulfil was handed.
+  state.secretRequests = [];
+  const secretWrites = [];
+  let secretRefusal = null;
   const record = (event, detail = {}) => { events.push({ at: Date.now(), event, ...detail }); if (events.length > 5000) events.shift(); };
   const publish = () => { revision++; record('state', { revision, sessions: sessions.map(s => ({ id: s.id, state: s.state })) }); for (const client of clients) client.write('data: changed\n\n'); };
   function update(id, patch) { Object.assign(sessions.find(s => s.id === id), patch); publish(); }
@@ -369,6 +373,20 @@ async function createFixture() {
           transfer.status = 'done'; transfer.destinationSessionId = successor.id; transfer.destinationPane = successor.pane;
           publish(); json({ ok: true, transfer }); return;
         }
+        if (url.pathname === '/api/secrets/fulfill' && req.method === 'POST') {
+          const request = state.secretRequests.find(r => r.id === input.id && r.status === 'pending');
+          if (!request) { json({ error: `no pending secret request ${input.id}` }, 409); return; }
+          if (secretRefusal) { const error = secretRefusal; secretRefusal = null; json({ error }, 409); return; }
+          secretWrites.push({ id: input.id, value: input.value });
+          state.secretRequests = state.secretRequests.filter(r => r !== request);
+          json({ request: { ...request, status: 'delivered' } }); publish(); return;
+        }
+        if (url.pathname === '/api/secrets/decline' && req.method === 'POST') {
+          const request = state.secretRequests.find(r => r.id === input.id && r.status === 'pending');
+          if (!request) { json({ error: `no pending secret request ${input.id}` }, 409); return; }
+          state.secretRequests = state.secretRequests.filter(r => r !== request);
+          json({ request: { ...request, status: 'declined', reason: input.reason || null } }); publish(); return;
+        }
         if (url.pathname === '/api/setaside') { if (input.kind === 'clear') delete state.setAside[input.key]; else state.setAside[input.key] = { kind: input.kind, at: Date.now() }; json({ ok: true }); publish(); return; }
         // Unsupported actions fail visibly instead of accidentally invoking real services.
         json({ error: `Unsupported fixture endpoint: ${url.pathname}` }, 404); return;
@@ -405,8 +423,10 @@ async function createFixture() {
     });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  return { url: `http://127.0.0.1:${server.address().port}`, events, state, portableTransfers, update, publish, churn,
+  return { url: `http://127.0.0.1:${server.address().port}`, events, state, portableTransfers, secretWrites, update, publish, churn,
     configure: options => {
+      if ('secretRequests' in options) { state.secretRequests = options.secretRequests; publish(); }
+      if ('secretRefusal' in options) secretRefusal = options.secretRefusal;
       if ('closeDelay' in options) closeDelay = options.closeDelay;
       if ('closeFails' in options) closeFails = options.closeFails;
       if ('layoutFails' in options) layoutFails = options.layoutFails;

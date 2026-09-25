@@ -53,6 +53,48 @@ function routes(ctx) {
         return json(res, result.status, result.body);
       },
     },
+    // Secret handoff (bin/secret-requests.js). An agent asks from its own machine:
+    // the daemon's CLI over loopback, or a node's CLI with its node token, whose
+    // node the request is then recorded against. Only the console and the daemon's
+    // own machine may answer one; a node may not.
+    {
+      method: 'POST',
+      path: '/api/secrets/request',
+      allow: ['node', 'local'],
+      handle: async ({ res, body, principal }) => {
+        const result = ctx.secretService.request(principal, body);
+        return json(res, result.status, result.body);
+      },
+    },
+    {
+      method: 'GET',
+      path: '/api/secrets',
+      allow: ['node', 'local', 'proxy', 'admin'],
+      handle: async ({ res, url, principal }) => {
+        const result = ctx.secretService.list(principal, {
+          id: url.searchParams.get('id') || null,
+          sessionId: url.searchParams.get('session') || null,
+          pending: url.searchParams.get('pending') === '1',
+        });
+        return json(res, result.status, result.body);
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/secrets/fulfill',
+      handle: async ({ res, body }) => {
+        const result = await ctx.secretService.fulfill(body);
+        return json(res, result.status, result.body);
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/secrets/decline',
+      handle: async ({ res, body }) => {
+        const result = ctx.secretService.decline(body);
+        return json(res, result.status, result.body);
+      },
+    },
     {
       // A Claude hook on a pane-only node, run by the daemon's own `keep hook`
       // against the session's transcript mirror (bin/hook-route.js).

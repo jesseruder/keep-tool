@@ -955,3 +955,34 @@ html.mobile #notificationsPanel { inset: calc(var(--top-bar-height) + 6px) 8px c
 html.mobile .notification-heading, html.mobile .notification-toolbar, html.mobile .notification-item { padding-inline: 14px; }
 html.mobile .notification-toolbar .btn, html.mobile .notification-actions .btn, html.mobile .notification-enable { min-height: 44px; }
 html.mobile .notification-preview { padding-inline: 14px; }
+
+/* Secret Drop (web/app/secret-drop.js): a session waiting on Owner for a secret. */
+.secret-drop { flex-shrink: 0; margin: 10px 16px; padding: 12px 14px; border: 1px solid var(--accent); border-left-width: 4px; border-radius: 8px; background: var(--accent-soft); display: flex; flex-direction: column; gap: 10px; }
+.secret-drop[hidden] { display: none; }
+.secret-drop code { font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }
+.secret-drop .sd-head { display: flex; gap: 10px; align-items: flex-start; }
+.secret-drop .sd-icon { color: var(--accent); display: inline-flex; padding-top: 1px; }
+.secret-drop .sd-title { font-weight: 600; color: var(--text); }
+.secret-drop .sd-more { font-weight: 400; color: var(--muted); font-size: 12px; }
+.secret-drop .sd-purpose { color: var(--muted); margin-top: 2px; line-height: 1.4; white-space: pre-line; }
+.secret-drop .sd-dest { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.secret-drop .sd-row { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+.secret-drop .sd-label { flex: 0 0 56px; color: var(--muted); }
+.secret-drop .sd-row > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.secret-drop .sd-node { display: inline-block; padding: 0 6px; border-radius: 4px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font-size: 11px; }
+.secret-drop .sd-path { color: var(--text); }
+.secret-drop .sd-note { color: var(--muted); }
+.secret-drop .sd-form { display: flex; flex-direction: column; gap: 6px; }
+.secret-drop .sd-field { display: flex; gap: 6px; align-items: stretch; }
+.secret-drop .sd-value { flex: 1; min-width: 0; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 13px; resize: vertical; }
+.secret-drop .sd-value:focus { outline: 2px solid var(--focus); outline-offset: -1px; }
+.secret-drop textarea.sd-value.masked { -webkit-text-security: disc; }
+.secret-drop .sd-shape { min-height: 1em; color: var(--muted); font-size: 11px; }
+.secret-drop .sd-error { color: var(--bad); background: var(--bad-soft); border-radius: 6px; padding: 6px 8px; font-size: 12px; overflow-wrap: anywhere; }
+.secret-drop .sd-actions, .secret-drop .sd-declining { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.secret-drop .sd-declining[hidden] { display: none; }
+.secret-drop .sd-spacer { flex: 1; }
+.secret-drop .sd-reason { flex: 1; min-width: 160px; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+.secret-drop.busy { opacity: .75; }
+html.mobile .secret-drop { margin: 8px 12px; }
+html.mobile .secret-drop .btn, html.mobile .secret-drop .sd-value, html.mobile .secret-drop .sd-reason { min-height: 44px; }

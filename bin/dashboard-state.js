@@ -188,6 +188,8 @@ const CONSOLE_STATE_KEYS = [
   'reviewQueue', 'accounts', 'handoffs', 'handoffQueue', 'review', 'agents', 'panes', 'hostStatus',
   // The machines the console may start a session on or move one to (serve.js addNodeState).
   'nodes',
+  // Secrets agents are waiting on Owner to hand off (bin/secret-requests.js): metadata only.
+  'secretRequests',
 ];
 
 // An exited session is a list row and a transcript link; the console never reads

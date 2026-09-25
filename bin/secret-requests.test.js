@@ -1,0 +1,151 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const { createSecretService, consoleRequests, storeFile } = require('./secret-requests.js');
+const { routes, matchRoute, routeDenial } = require('./serve/routes.js');
+
+const SESSION = '11111111-2222-3333-4444-555555555555';
+const VALUE = 'sk-SECRETVALUE-abc';
+
+function setup(t, overrides = {}) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-secret-req-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const calls = { host: [], local: [], told: [], changes: 0 };
+  let clock = 1_000_000;
+  const service = createSecretService({
+    root,
+    daemonNode: () => 'main',
+    hostRequest: async (type, params, options) => {
+      calls.host.push({ type, params, options });
+      if (type === 'hello') return { secretWrite: 1 };
+      return { path: params.path, key: params.key, replaced: false, bytes: params.value.length };
+    },
+    writeLocal: (params) => { calls.local.push(params); return { path: params.path, replaced: false, bytes: params.value.length }; },
+    notifySession: async (sessionId, text) => { calls.told.push({ sessionId, text }); },
+    onChange: () => { calls.changes += 1; },
+    now: () => clock,
+    log: () => {},
+    ...overrides,
+  });
+  return { root, service, calls, advance: (ms) => { clock += ms; } };
+}
+
+const ask = (extra = {}) => ({ name: 'GITHUB_TOKEN', sessionId: SESSION, path: '/home/u/app/.env', key: 'GITHUB_TOKEN', purpose: 'release script', ...extra });
+
+test('a node request is recorded against the node that sent it, not what its body claims', (t) => {
+  const { service, root } = setup(t);
+  const result = service.request({ class: 'node', node: 'aws1' }, ask({ node: 'main' }));
+  assert.equal(result.status, 200);
+  assert.equal(result.body.request.node, 'aws1');
+  assert.equal(result.body.request.status, 'pending');
+  assert.equal(fs.statSync(storeFile(root)).mode & 0o777, 0o600);
+  const local = service.request({ class: 'local' }, ask({ path: '/home/u/other' , key: null }));
+  assert.equal(local.body.request.node, 'main');
+});
+
+test('the same pending request is not recorded twice', (t) => {
+  const { service } = setup(t);
+  const first = service.request({ class: 'local' }, ask());
+  const again = service.request({ class: 'local' }, ask());
+  assert.equal(again.body.existing, true);
+  assert.equal(again.body.request.id, first.body.request.id);
+  assert.equal(consoleRequests(setup(t).root).length, 0, 'a fresh root has none');
+});
+
+test('refuses requests without a session, a name, or an absolute path', (t) => {
+  const { service } = setup(t);
+  assert.equal(service.request({ class: 'local' }, ask({ sessionId: '' })).status, 400);
+  assert.equal(service.request({ class: 'local' }, ask({ name: '1bad' })).status, 400);
+  assert.equal(service.request({ class: 'local' }, ask({ path: 'rel/x' })).status, 400);
+  assert.equal(service.request({ class: 'local' }, ask({ key: 'no-dash' })).status, 400);
+});
+
+test('fulfilling a remote request writes through the node host and tells the session the path only', async (t) => {
+  const { service, calls, root } = setup(t);
+  const { id } = service.request({ class: 'node', node: 'aws1' }, ask()).body.request;
+  const result = await service.fulfill({ id, value: VALUE });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.request.status, 'delivered');
+  const write = calls.host.find((c) => c.type === 'secret-write');
+  assert.equal(write.options.node, 'aws1');
+  assert.equal(write.params.value, VALUE);
+  assert.equal(write.params.key, 'GITHUB_TOKEN');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.told.length, 1);
+  assert.equal(calls.told[0].sessionId, SESSION);
+  assert.match(calls.told[0].text, /\/home\/u\/app\/\.env as GITHUB_TOKEN on aws1/);
+  assert.ok(!calls.told[0].text.includes(VALUE));
+  assert.ok(!fs.readFileSync(storeFile(root), 'utf8').includes(VALUE), 'the store never holds a value');
+  assert.ok(!JSON.stringify(result.body).includes(VALUE));
+  assert.equal(consoleRequests(root, 1_000_000).length, 0);
+  assert.equal((await service.fulfill({ id, value: VALUE })).status, 409, 'a delivered request cannot be written again');
+});
+
+test('a request on the daemon node is written in-process', async (t) => {
+  const { service, calls } = setup(t);
+  const { id } = service.request({ class: 'local' }, ask()).body.request;
+  assert.equal((await service.fulfill({ id, value: VALUE })).status, 200);
+  assert.equal(calls.local.length, 1);
+  assert.equal(calls.host.length, 0);
+});
+
+test('a failed write leaves the request pending with the error, never the value', async (t) => {
+  const failing = async (type) => {
+    if (type === 'hello') return { secretWrite: 1 };
+    throw Object.assign(new Error('/home/u/app/.env is inside the git repository /home/u/app and is not gitignored'), { code: 'secret-destination' });
+  };
+  const { service, root } = setup(t, { hostRequest: failing });
+  const { id } = service.request({ class: 'node', node: 'aws1' }, ask()).body.request;
+  const result = await service.fulfill({ id, value: VALUE });
+  assert.equal(result.status, 409);
+  assert.match(result.body.error, /not gitignored/);
+  const [pending] = consoleRequests(root, 1_000_000);
+  assert.equal(pending.status, 'pending');
+  assert.match(pending.lastError, /not gitignored/);
+  assert.ok(!fs.readFileSync(storeFile(root), 'utf8').includes(VALUE));
+});
+
+test('an old node host is refused by name', async (t) => {
+  const { service } = setup(t, { hostRequest: async () => ({}) });
+  const { id } = service.request({ class: 'node', node: 'aws1' }, ask()).body.request;
+  const result = await service.fulfill({ id, value: VALUE });
+  assert.equal(result.status, 502);
+  assert.match(result.body.error, /predates secret handoff/);
+});
+
+test('declining tells the session the reason; expiry needs no sweep', async (t) => {
+  const { service, calls, root, advance } = setup(t);
+  const a = service.request({ class: 'local' }, ask()).body.request;
+  const b = service.request({ class: 'local' }, ask({ path: '/home/u/b', key: null })).body.request;
+  assert.equal(service.decline({ id: a.id, reason: 'use the staging key' }).status, 200);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(calls.told[0].text, /declined.*use the staging key/);
+  advance(25 * 60 * 60 * 1000);
+  assert.equal(consoleRequests(root, 1_000_000 + 25 * 60 * 60 * 1000).length, 0);
+  assert.equal(service.list({ class: 'local' }, { id: b.id }).body.requests[0].status, 'expired');
+  assert.equal((await service.fulfill({ id: b.id, value: VALUE })).status, 409);
+});
+
+test('a node lists only its own requests', (t) => {
+  const { service } = setup(t);
+  service.request({ class: 'node', node: 'aws1' }, ask());
+  service.request({ class: 'local' }, ask({ path: '/home/u/mac' }));
+  assert.equal(service.list({ class: 'node', node: 'aws1' }, {}).body.requests.length, 1);
+  assert.equal(service.list({ class: 'local' }, {}).body.requests.length, 2);
+});
+
+test('routes: a node may ask and read, only the console and the daemon machine may answer', () => {
+  const list = routes({ secretService: {} });
+  const find = (method, pathname) => matchRoute(list, { req: { method }, url: new URL(`http://x${pathname}`) });
+  const node = { class: 'node', node: 'aws1' };
+  assert.equal(routeDenial(find('POST', '/api/secrets/request'), node), null);
+  assert.equal(routeDenial(find('GET', '/api/secrets'), node), null);
+  assert.ok(routeDenial(find('POST', '/api/secrets/fulfill'), node));
+  assert.ok(routeDenial(find('POST', '/api/secrets/decline'), node));
+  assert.equal(routeDenial(find('POST', '/api/secrets/fulfill'), { class: 'proxy' }), null);
+  assert.ok(routeDenial(find('POST', '/api/secrets/request'), { class: 'proxy' }), 'the console does not make requests');
+});

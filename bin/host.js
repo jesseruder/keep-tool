@@ -1188,6 +1188,8 @@ function createHost(options = {}) {
           // spawnReceipts: a spawn naming an operationId is journalled, so a caller
           // whose reply was lost may ask again instead of starting a second process.
           spawnReceipts: true,
+          // secretWrite: this host answers the `secret-write` verb (bin/secret-files.js).
+          secretWrite: 1,
           bootVersion: options.boot && options.boot.version || null,
           panes: panes.size, pid: process.pid, sock,
           residentTerminals: [...panes.values()].filter((pane) => pane.term).length,
@@ -1268,6 +1270,12 @@ function createHost(options = {}) {
         // this node's own account directory and a relative path the module checks
         // against the shapes a session's artifacts can have; refusals carry a code.
         return { result: await require('./session-artifacts.js').handle(params, { env }) };
+      }
+      case 'secret-write': {
+        // A secret Owner handed off in the console, written here because this is the
+        // machine the asking agent runs on. The destination is checked again on this
+        // filesystem (bin/secret-files.js); the answer names the file, never the value.
+        return { result: require('./secret-files.js').handle(params) };
       }
       case 'process': {
         // This machine's process table, for this machine's panes. The bootId rides

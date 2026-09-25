@@ -1822,7 +1822,8 @@ function isHostTarget(target) {
 // node can never sit in front of a keystroke bound for another. `transcript` goes
 // further and has a connection of its own (HOST_CHANNEL_BY_TYPE): a receipt's long
 // poll waits up to nine seconds, and a launch's prepare must not queue behind it.
-const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state', 'artifacts', 'stats']);
+// `secret-write` joins them: it checks the destination against the node's repos first.
+const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state', 'artifacts', 'stats', 'secret-write']);
 // `artifacts` carries a moving session's files in 4 MiB frames: a connection of its
 // own, so a move never sits in front of a receipt, a launch or a keystroke.
 const HOST_CHANNEL_BY_TYPE = new Map([['transcript', 'transcript'], ['artifacts', 'artifacts']]);
@@ -2538,6 +2539,7 @@ const URGENT_DASHBOARD_MUTATIONS = new Set([
   '/api/portable-transfers', '/api/reminders', '/api/rename-session', '/api/reopen-session',
   '/api/resolve-portable-transfer', '/api/restart-daemon', '/api/restart-session', '/api/review-queue',
   '/api/reviewtick', '/api/run', '/api/send', '/api/session-keep-running', '/api/setaside', '/api/transfer-session',
+  '/api/secrets/fulfill', '/api/secrets/decline',
 ]);
 function urgentDashboardMutation(pathname) {
   return URGENT_DASHBOARD_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname)
@@ -13084,6 +13086,8 @@ function buildState(options = {}) {
     health: healthSnapshot,
     usage: options.dashboardRuntime?.usage || usage.getUsage(),
     reviewQueue: reviewQueue.snapshot({ loadTasks: () => allTasks, now }),
+    // Secrets agents are waiting on: metadata only, never a value (bin/secret-requests.js).
+    secretRequests: require('./secret-requests').consoleRequests(keep.ROOT, now),
   };
   Object.assign(state, accounts.publicState(), {
     handoffs: require('./account-handoff').list(keep.ROOT),
@@ -16246,6 +16250,15 @@ function start(deps = {}) {
   ctx.hookService = ctx.registryService ? require('./hook-route.js').createHookService({
     root: keep.ROOT, stopping: () => daemonRestartGate.stopping, registry: ctx.registryService,
   }) : null;
+  // Secret handoff (bin/secret-requests.js). The value goes from the console request
+  // to the writer and nowhere else; the session is told the path once it is written.
+  ctx.secretService = require('./secret-requests.js').createSecretService({
+    root: keep.ROOT,
+    daemonNode: () => daemonNodeName(),
+    hostRequest: (type, params, options) => hostRequest(type, params, options),
+    notifySession: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }),
+    onChange: () => broadcast(),
+  });
   // The restart is the one /api/restart-daemon makes: wait for in-flight work, then
   // mark the request and exit after the answer has gone out.
   ctx.deploySelf = nodeApiListen.enabled ? require('./deploy-self.js').createDeploySelf({
