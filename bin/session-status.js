@@ -72,8 +72,9 @@ function activity(session, context = {}) {
   // tracked-job waits below, but not a stop intent a hook or card handoff declared.
   // It sees only the message, so it cannot hide the card's own review or needs, and
   // DONE cannot pull a session out of a scheduled or dependency wait it does not see.
-  // RUNNING and DONE speak for a live pane only; ASKS also for a conversation whose
-  // pane is gone, whose final ask would otherwise sit behind the card's schedule.
+  // RUNNING and DONE speak for a live pane only; ASKS also for the card's latest
+  // session whose pane is gone, whose final ask would otherwise sit behind the card's
+  // schedule or read as idle.
   const verdict = ended && !model.identity.reviewer
     && !['hook', 'registry'].includes(model.conversation.source) ? session.stopVerdict : null;
   const live = model.identity.interactive;
@@ -87,8 +88,7 @@ function activity(session, context = {}) {
   // turn is listed as finished below. An ASKS verdict still counts for it.
   const unattended = session.unattended === true;
   // The agent's own words stay the row's (and a push's) detail when it asked something.
-  const cardWait = ['waiting', 'blocked', 'landing'].includes(taskStatus) || Boolean(model.task.checkAfter || model.task.dependencies.length);
-  add(verdict?.verdict === 'asks' && !cardAsks && (live || (cardWait && model.task.cardCurrent)), 'model-asks', 'model', 'needs-input', 'Needs an answer', 'question',
+  add(verdict?.verdict === 'asks' && !cardAsks && (live || model.task.cardLatest), 'model-asks', 'model', 'needs-input', 'Needs an answer', 'question',
     { kind: 'input', detail: text || verdict?.reason }, 'inferred');
   add(live && verdict?.verdict === 'done' && !durableWait && !cardAsks && !unattended, 'model-done', 'model', 'needs-input', 'Ready for next instruction',
     'next instruction', { kind: 'input', detail: verdict?.reason || 'Ready for your next instruction.' }, 'inferred');
@@ -117,7 +117,7 @@ function activity(session, context = {}) {
   add(model.task.checkAfter && !model.task.checkOverdue, 'scheduled-check', 'registry', 'waiting', 'Waiting: scheduled check', model.task.checkAfter);
   // Nothing will deliver it now, so the card's wait stops holding the session. Only
   // the card's current session says so, not every conversation it ever linked.
-  add(model.task.checkOverdue && ended && model.task.cardCurrent, 'check-overdue', 'registry', 'needs-input', 'Check overdue', 'overdue check',
+  add(model.task.checkOverdue && ended && model.task.checkOwner, 'check-overdue', 'registry', 'needs-input', 'Check overdue', 'overdue check',
     { kind: 'input', detail: `The card's scheduled check (due ${String(model.task.checkOverdue).replace('T', ' ')}) was not delivered.` });
   add(taskStatus === 'waiting', 'task-waiting', 'registry', 'waiting', 'Waiting: dependency', 'dependency');
   add(taskStatus === 'landing', 'task-landing', 'registry', 'waiting', 'Waiting: land', 'land');

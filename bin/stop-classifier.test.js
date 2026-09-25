@@ -43,8 +43,8 @@ test('only a finished turn with nothing pending is classified, in a live pane or
   for (const state of ['unknown', 'external']) {
     assert.equal(classifier.eligible({ ...base, runtime: { state } }), false, state);
     assert.equal(classifier.eligible({ ...base, runtime: { state }, taskStatus: 'waiting' }), false, `${state}: not the card's current session`);
-    assert.equal(classifier.eligible({ ...base, runtime: { state }, taskStatus: 'active', cardCurrent: true }), true, state);
-    assert.equal(classifier.eligible({ ...base, runtime: { state }, taskStatus: 'done', cardCurrent: true }), false, `${state}: done card`);
+    assert.equal(classifier.eligible({ ...base, runtime: { state }, taskStatus: 'active', cardLatest: true }), true, state);
+    assert.equal(classifier.eligible({ ...base, runtime: { state }, taskStatus: 'done', cardLatest: true }), false, `${state}: done card`);
   }
 });
 
@@ -81,7 +81,7 @@ test('a missing verdict queues one on the configured model, logs it, and a chang
 
   classifier.request([base], { summarize, root, env: { KEEP_STOP_MODEL: 'claude-haiku-4-5-20251001' } });
   assert.equal(summarize.queued.at(-1).options.model, 'claude-haiku-4-5-20251001');
-  classifier.request([{ ...base, id: 'paneless', runtime: { state: 'unknown' }, taskStatus: 'waiting', cardCurrent: true }], { summarize, root, env });
+  classifier.request([{ ...base, id: 'paneless', runtime: { state: 'unknown' }, taskStatus: 'waiting', cardLatest: true }], { summarize, root, env });
   assert.equal(summarize.queued.at(-1).options.priority, 1, 'a paneless conversation queues behind live ones');
   classifier.request([{ ...base, id: 's2' }], { summarize, root, env: { KEEP_STOP_CLASSIFIER: '0' } });
   assert.equal(summarize.queued.filter((job) => job.key === 'stop-s2').length, 0, 'KEEP_STOP_CLASSIFIER=0 turns it off');
@@ -134,6 +134,9 @@ test('an ASKS verdict counts for the card\'s current session whose pane is gone;
   assert.equal(activity({ ...gone, stopVerdict: { verdict: 'asks', reason: 'start the usage UI?' } }, card).decision.rule, 'model-asks');
   assert.equal(activity({ ...gone, stopVerdict: { verdict: 'done', reason: 'reported' } }, card).decision.rule, 'scheduled-check');
   assert.equal(activity({ ...gone, stopVerdict: { verdict: 'running', reason: 'x' } }, card).decision.rule, 'scheduled-check');
+  // On an ordinary active card the ask still counts rather than reading as idle.
+  assert.equal(activity({ ...gone, taskStatus: 'active', stopVerdict: { verdict: 'asks', reason: 'pick a schema path' } },
+    { task: { status: 'active', sessions: [{ id: 's1' }] } }).decision.rule, 'model-asks');
 });
 
 test('a card check overdue past its grace stops holding the session as waiting', () => {
@@ -144,6 +147,10 @@ test('a card check overdue past its grace stops holding the session as waiting',
     'a delivered check still being answered is not overdue');
   const other = { task: { ...card.task, sessions: [{ id: 's1' }, { id: 'newer' }] }, now: at + 20 * 60e3 };
   assert.notEqual(activity(gone, other).decision.rule, 'check-overdue', 'only the card\'s current session reports it');
+  // The session that scheduled the check owns the alert, not also the latest one.
+  const scheduled = { task: { ...card.task, scheduled_by: 'older', sessions: [{ id: 'older' }, { id: 's1' }] }, now: at + 20 * 60e3 };
+  assert.notEqual(activity(gone, scheduled).decision.rule, 'check-overdue');
+  assert.equal(activity({ ...gone, id: 'older' }, scheduled).decision.rule, 'check-overdue');
   assert.equal(activity(gone, { ...card, now: at + 10 * 60e3 }).decision.rule, 'scheduled-check', 'inside the grace it still waits');
   const overdue = activity(gone, { ...card, now: at + 20 * 60e3 });
   assert.equal(overdue.decision.rule, 'check-overdue');

@@ -18,9 +18,12 @@ function normalize(session, context = {}) {
   const checkAt = Date.parse(task.check_after || '');
   const checkOverdue = Number.isFinite(checkAt) && !cardDone && context.checkInFlight !== true
     && (context.now ?? Date.now()) - checkAt > CHECK_OVERDUE_MS;
-  // The session the card last linked, or the one that scheduled its check: the one
-  // whose rows speak for the card when its pane is gone or its check went missing.
-  const cardCurrent = Boolean(session.id) && ((task.sessions || []).at(-1)?.id === session.id || task.scheduled_by === session.id);
+  // One session speaks for the card in each role: its latest linked session for a
+  // paneless final ask, and the session that scheduled its check (else the latest)
+  // for a check that went missing. Older conversations on the card stay quiet.
+  const latestId = (task.sessions || []).at(-1)?.id || null;
+  const cardLatest = Boolean(session.id) && latestId === session.id;
+  const checkOwner = Boolean(session.id) && (task.scheduled_by || latestId) === session.id;
   const model = {
     version: 1,
     identity: { conversationId: session.id || null, agent: session.kind || null, interactive: live, reviewer: Boolean(session.reviewer) },
@@ -36,7 +39,7 @@ function normalize(session, context = {}) {
       plan: Boolean(session.pendingPlan), notification: session.notify?.type || null },
     task: { id: session.taskId || null, status: task.status || session.taskStatus || null,
       dependencies: context.dependencies || [], checkAfter: cardDone ? null : task.check_after || null,
-      checkOverdue: checkOverdue ? task.check_after : null, cardCurrent, needs: Boolean(task.needs?.length),
+      checkOverdue: checkOverdue ? task.check_after : null, cardLatest, checkOwner, needs: Boolean(task.needs?.length),
       hasCheck: Boolean(task.check), scheduledBy: task.scheduled_by || null, scheduledAt: Date.parse(task.scheduled_at || '') || null,
       scheduledFor: task.scheduled_for || null, scheduledIntent: task.scheduled_intent || null },
   };

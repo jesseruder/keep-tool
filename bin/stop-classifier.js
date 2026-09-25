@@ -46,9 +46,9 @@ function eligible(session) {
   if (session.exited || session.state === 'exited' || session.deadMidTurn) return false;
   if (session.endedTurn !== true || session.toolRunning || session.pendingQuestion || session.pendingPlan) return false;
   if (session.runtime && ['exited', 'missing'].includes(session.runtime.state)) return false;
-  // Paneless: only the card's current session (serve.js stamps cardCurrent) on an
-  // open card, so an old conversation's stale ask never resurfaces.
-  if (!livePane(session) && !(session.cardCurrent === true && session.taskStatus && session.taskStatus !== 'done')) return false;
+  // Paneless: only the card's latest session (serve.js stamps cardLatest) on an open
+  // card, so an old conversation's stale ask never resurfaces.
+  if (!livePane(session) && !(session.cardLatest === true && session.taskStatus && session.taskStatus !== 'done')) return false;
   return Boolean(lastText(session));
 }
 

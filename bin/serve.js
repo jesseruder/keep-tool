@@ -13100,11 +13100,11 @@ function buildState(options = {}) {
     }
   }
   applyCompanionJobs(sessions, options.companion);
-  // Whether this session speaks for its card (its latest linked session, or the one
-  // that scheduled its check): the classifier and the status rules both read it.
+  // Whether this session is its card's latest linked session: the classifier reads it
+  // to judge a paneless session's final ask (session-model derives the same).
   for (const session of sessions) {
     const fm = taskById.get(session.taskId)?.fm;
-    session.cardCurrent = Boolean(fm) && ((fm.sessions || []).at(-1)?.id === session.id || fm.scheduled_by === session.id);
+    session.cardLatest = Boolean(fm) && (fm.sessions || []).at(-1)?.id === session.id;
   }
   // Cache reads only; the daemon queues missing verdicts once agent sessions are
   // marked (below), or in the worker's finalize.
@@ -13131,7 +13131,7 @@ function buildState(options = {}) {
   if (workerMode) {
     const terminal = new Set(['completed', 'failed', 'cancelled']);
     const derived = new Set(['taskId', 'taskStatus', 'runtime', 'pane', 'launchModel', 'accountLabel',
-      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark', 'stopVerdict', 'cardCurrent', 'unattended',
+      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed', 'mark', 'stopVerdict', 'cardLatest', 'unattended',
       // Attached further down, after this block, and re-read from the usage snapshot
       // on every build. Listed so a reordering cannot freeze a settled session's
       // totals at whatever the collector had seen the moment it was cached.
