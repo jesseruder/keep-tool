@@ -40,8 +40,8 @@ const PRUNE_AFTER_MS = 30 * 24 * 60 * 60e3;
 const SOURCE_PATH_MAX = 4096;
 const HASH_RE = /^[a-f0-9]{64}$/;
 const SEED_CHUNK_BYTES = 1024 * 1024;
-// A seed's temporary file: `.seed.<sid>.<pid>.<hex>.tmp`, in the node's mirror directory.
-const SEED_TEMP_RE = /^\.seed\.[A-Za-z0-9_-]{1,128}\.\d+\.[a-f0-9]+\.tmp$/;
+// A seed's or a reset's temporary file: `.seed.<sid>.<pid>.<hex>.tmp` or `.reset.…`, in the node's mirror directory.
+const SEED_TEMP_RE = /^\.(?:seed|reset)\.[A-Za-z0-9_-]{1,128}\.\d+\.[a-f0-9]+\.tmp$/;
 const SEED_TEMP_MAX_AGE_MS = 60 * 60e3;
 
 class MirrorError extends Error {
@@ -164,17 +164,37 @@ function append(options = {}) {
   if (from + bytes.length > MIRROR_CAP_BYTES) {
     return { ok: false, status: 413, reason: `a mirror holds at most ${MIRROR_CAP_BYTES} bytes; this transcript is past it` };
   }
-  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW;
-  const fd = fs.openSync(where.file, flags, 0o600);
-  try {
-    if (!fs.fstatSync(fd).isFile()) refuse(403, 'the mirror is not a plain file');
-    if (reset) fs.ftruncateSync(fd, 0);
+  const writeAll = (fd) => {
     let written = 0;
     while (written < bytes.length) written += fs.writeSync(fd, bytes, written, bytes.length - written);
     // What readers take as activity evidence is the source's time, not the append's.
     fs.futimesSync(fd, now() / 1000, mtimeMs / 1000);
-  } finally {
-    fs.closeSync(fd);
+  };
+  if (reset) {
+    // A reset is a new file renamed over the mirror, never the old one truncated: a
+    // reader that remembers the mirror's identity (the background-job ledger's
+    // checkpoint) sees a new inode, as it does when a local agent's transcript is
+    // rewritten, even when the new bytes happen to end like the old ones.
+    const temp = path.join(where.dir, `.reset.${sessionId}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+    let placed = false;
+    try {
+      const fd = fs.openSync(temp,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      try { writeAll(fd); } finally { fs.closeSync(fd); }
+      fs.renameSync(temp, where.file);
+      placed = true;
+    } finally {
+      if (!placed) { try { fs.unlinkSync(temp); } catch {} }
+    }
+  } else {
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW;
+    const fd = fs.openSync(where.file, flags, 0o600);
+    try {
+      if (!fs.fstatSync(fd).isFile()) refuse(403, 'the mirror is not a plain file');
+      writeAll(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
   }
   const total = from + bytes.length;
   writeSidecar(where.sidecar, { generation, size: total, mtimeMs, sourcePath, updatedAt: now() });
@@ -303,7 +323,7 @@ function usage(root) {
 
 // Mirrors nobody has appended to in a month: the sidecar's updatedAt (its mtime
 // when unreadable) decides, and a mirror with no sidecar goes by its own mtime.
-// A seed's temporary file left by a daemon that died mid-seed (it can be as large as
+// A seed's (or a reset's) temporary file left by a daemon that died mid-write (it can be as large as
 // a mirror) goes once it is an hour old. Its age is the later of its mtime and ctime:
 // a seed stamps the source's mtime on the file just before renaming it, which moves
 // the ctime to now, so a seed still running is never taken for a dead one. Those

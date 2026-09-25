@@ -1199,3 +1199,31 @@ test('referrer verification handoff recognizes a live cron through the productio
   sync({ instance });
   assert.equal(observe({ backgroundJobs: jobs.read(root, 'claude', 'parent', now()) }).needsInput, true);
 }));
+
+test('a node mirror reset to the same size, mtime and last bytes still reads as a replaced transcript', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-jobs-mirror-reset-'));
+  try {
+    const mirror = require('./transcript-mirror');
+    const sid = 'mirrored';
+    const file = mirror.paths(root, 'workera', sid).file;
+    const tail = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'the same ending, longer than the 64-byte anchor' }] } }) + '\n';
+    const body = (text) => Buffer.from(JSON.stringify({ type: 'user', message: { content: text } }) + '\n' + tail);
+    const post = (generation, bytes) => mirror.append({ root, node: 'workera', sessionId: sid, generation, fromOffset: 0,
+      size: bytes.length, mtimeMs: 1_700_000_000_000, sourcePath: '/node/transcript.jsonl', bytes });
+    const first = body('first earlier record'), second = body('other earlier record');
+    assert.equal(first.length, second.length);
+    assert.equal(post('1:1:1', first).ok, true);
+    const sync = () => jobs.sync({ root, agent: 'claude', sid, file, node: 'workera', now: 1000 });
+    assert.equal(sync().gap, false);
+    assert.equal(post('2:2:2', second).reset, true);
+    const stat = fs.statSync(file);
+    assert.equal(stat.size, first.length);
+    assert.equal(Math.round(stat.mtimeMs), 1_700_000_000_000);
+    const replaced = sync();
+    assert.equal(replaced.gap, true);
+    assert.equal(replaced.gapReason, 'transcript-replaced');
+    const saved = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'background-jobs', 'claude', sid, 'state.json'), 'utf8'));
+    assert.equal(saved.source.file, file);
+    assert.equal(saved.source.node, 'workera', 'the persisted source names the node');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

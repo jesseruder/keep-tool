@@ -69,6 +69,68 @@ test('a new generation or a shrunken source starts the mirror again from zero', 
   assert.equal(mirror.read(root, 'aws1', 'sess-1').toString(), 's\n');
 });
 
+test('a reset replaces the mirror with a new file, and an ordinary append keeps it', (t) => {
+  const root = tempRoot(t);
+  const file = mirror.paths(root, 'aws1', 'sess-1').file;
+  const dir = path.dirname(file);
+  const one = Buffer.from('{"n":1}\n');
+  const two = Buffer.from('{"n":2}\n');
+  post(root, { bytes: one });
+  const first = fs.statSync(file);
+  assert.equal(first.mode & 0o777, 0o600);
+
+  assert.equal(post(root, { bytes: two, fromOffset: one.length, size: one.length + two.length }).reset, false);
+  assert.equal(fs.statSync(file).ino, first.ino, 'an append writes the same file');
+
+  // A new generation whose bytes, size and mtime match the old mirror's exactly.
+  const both = Buffer.concat([one, two]);
+  assert.deepEqual(post(root, { generation: '4:5:6', bytes: both }), { ok: true, size: both.length, reset: true });
+  const regenerated = fs.statSync(file);
+  assert.notEqual(regenerated.ino, first.ino, 'a new generation is a new file');
+  assert.equal(regenerated.mode & 0o777, 0o600);
+  assert.equal(Math.round(regenerated.mtimeMs), 1_700_000_000_000);
+  assert.equal(fs.readFileSync(file, 'utf8'), both.toString());
+  assert.equal(mirror.stat(root, 'aws1', 'sess-1').generation, '4:5:6');
+
+  // A shrunken source under the same generation: a new file too.
+  assert.equal(post(root, { generation: '4:5:6', bytes: one }).reset, true);
+  assert.notEqual(fs.statSync(file).ino, regenerated.ino, 'a truncated source is a new file');
+  assert.equal(fs.readFileSync(file, 'utf8'), one.toString());
+  assert.deepEqual(fs.readdirSync(dir).filter((name) => name.endsWith('.tmp')), [], 'no temporary file is left');
+});
+
+test('a reset that fails to write leaves the old mirror and no temporary file', (t) => {
+  const root = tempRoot(t);
+  const file = mirror.paths(root, 'aws1', 'sess-1').file;
+  const one = Buffer.from('{"n":1}\n');
+  post(root, { bytes: one });
+  const before = fs.statSync(file);
+  const rename = fs.renameSync;
+  fs.renameSync = (from, to) => {
+    if (to === file) throw Object.assign(new Error('simulated rename failure'), { code: 'EIO' });
+    return rename(from, to);
+  };
+  try {
+    assert.throws(() => post(root, { generation: '4:5:6', bytes: Buffer.from('other\n') }), /simulated rename failure/);
+  } finally { fs.renameSync = rename; }
+  assert.equal(fs.statSync(file).ino, before.ino);
+  assert.equal(fs.readFileSync(file, 'utf8'), one.toString());
+  assert.deepEqual(fs.readdirSync(path.dirname(file)).filter((name) => name.endsWith('.tmp')), []);
+});
+
+test('prune removes a reset\'s temporary file left an hour, and never takes it for a session', (t) => {
+  const root = tempRoot(t);
+  post(root);
+  const dir = path.dirname(mirror.paths(root, 'aws1', 'sess-1').file);
+  const dead = path.join(dir, '.reset.sess-1.4242.0badf00d.tmp');
+  fs.writeFileSync(dead, 'partial');
+  const now = Date.now();
+  assert.deepEqual(mirror.prune(root, { now: () => now + 30 * 60e3 }), []);
+  assert.ok(fs.existsSync(dead));
+  assert.deepEqual(mirror.prune(root, { now: () => now + 61 * 60e3 }), []);
+  assert.equal(fs.existsSync(dead), false);
+});
+
 test('the mirror path is built from validated parts and never leaves the mirror directory', (t) => {
   const root = tempRoot(t);
   for (const [node, sessionId] of [['..', 'sess-1'], ['aws1', '../escape'], ['aws1', 'a/b'], ['AWS1', 'sess'], ['aws1', ''], ['aws1', '..']]) {
