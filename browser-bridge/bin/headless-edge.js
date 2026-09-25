@@ -2,7 +2,7 @@
 // Keeps a headless Edge running with the extension loaded, for a machine with no display
 // and so no everyday browser for the extension to live in (a Linux node, under systemd).
 //
-//   node bin/headless-edge.js [--edge <path>] [--user-data-dir <dir>] [--extension <dir>]
+//   node bin/headless-edge.js [--edge <path>] [--user-data-dir <dir>] [--extension <dir>] [--gpu]
 //
 // Edge 153 ignores --load-extension, so the extension goes in the one way that works on a
 // browser started from a script: over the DevTools pipe. With --remote-debugging-pipe Edge
@@ -83,12 +83,20 @@ export function loadUnpackedMessage(extensionPath) {
 }
 
 /**
+ * What puts headless WebGL on a real GPU (measured on an NVIDIA T4 with the proprietary
+ * driver): ANGLE over EGL. Headless Edge left to itself renders WebGL on SwiftShader, on the
+ * CPU, and says nothing about it; ANGLE over Vulkan and plain EGL both came up with no WebGL
+ * context at all. `bin/webgl-probe.js` checks which renderer a set of flags actually gets.
+ */
+export const GPU_ARGS = ["--use-gl=angle", "--use-angle=gl-egl", "--ignore-gpu-blocklist", "--enable-gpu"];
+
+/**
  * `--headless=new` is the full browser without a window, which is what extensions need (the
  * old headless mode has no extension system). The rest keep a scratch profile quiet: no
- * first-run page, no default-browser prompt, no GPU process on a machine with no GPU, and no
- * wait on a desktop keyring that is not there.
+ * first-run page, no default-browser prompt, no GPU process on a machine with no GPU (unless
+ * `gpu`, which swaps that for GPU_ARGS), and no wait on a desktop keyring that is not there.
  */
-export function edgeArgs(profileDir) {
+export function edgeArgs(profileDir, { gpu = false } = {}) {
   return [
     "--headless=new",
     `--user-data-dir=${profileDir}`,
@@ -96,7 +104,7 @@ export function edgeArgs(profileDir) {
     "--enable-unsafe-extension-debugging",
     "--no-first-run",
     "--no-default-browser-check",
-    "--disable-gpu",
+    ...(gpu ? GPU_ARGS : ["--disable-gpu"]),
     "--password-store=basic",
     "about:blank",
   ];
@@ -114,6 +122,7 @@ export function createSupervisor({
   edgePath = DEFAULT_EDGE,
   profileDir,
   extensionPath = path.join(PROJECT_DIR, "extension"),
+  gpu = false,
   log = (line) => process.stdout.write(`${new Date().toISOString()} ${line}\n`),
   setTimer = (fn, ms) => setTimeout(fn, ms),
   clearTimer = (timer) => clearTimeout(timer),
@@ -131,7 +140,7 @@ export function createSupervisor({
    */
   loadTimeoutMs = 30_000,
 }) {
-  const args = edgeArgs(profileDir);
+  const args = edgeArgs(profileDir, { gpu });
   let child = null;
   /** The current Edge: its process, and the load and kill timers that belong to it. */
   let run = null;
@@ -146,7 +155,7 @@ export function createSupervisor({
     if (stopping) return;
     launches += 1;
     const startedAt = now();
-    log(`starting ${edgePath} (launch ${launches}) on ${profileDir}`);
+    log(`starting ${edgePath} (launch ${launches}) on ${profileDir}${gpu ? " with GPU flags" : ""}`);
     let proc;
     try {
       proc = spawn(edgePath, args, { stdio: ["ignore", "inherit", "inherit", "pipe", "pipe"] });
@@ -306,9 +315,14 @@ export function parseArgs(argv, env = process.env) {
     edgePath: env.BROWSER_BRIDGE_EDGE || DEFAULT_EDGE,
     profileDir: env.BROWSER_BRIDGE_EDGE_PROFILE || edgeProfileDir(env),
     extensionPath: path.join(PROJECT_DIR, "extension"),
+    gpu: env.BROWSER_BRIDGE_EDGE_GPU === "1",
   };
   const flags = { "--edge": "edgePath", "--user-data-dir": "profileDir", "--extension": "extensionPath" };
   for (let index = 0; index < argv.length; index++) {
+    if (argv[index] === "--gpu") {
+      options.gpu = true;
+      continue;
+    }
     const key = flags[argv[index]];
     if (!key) throw new Error(`Unknown argument: ${argv[index]}`);
     const value = argv[++index];

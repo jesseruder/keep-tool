@@ -155,7 +155,9 @@ test("arguments select the browsers and the mode", () => {
     uninstall: false,
     stdio: false,
     rotateToken: false,
+    gpu: false,
   });
+  assert.equal(parseArgs(["--gpu"]).gpu, true);
   assert.deepEqual(parseArgs(["--browser", "chrome"]).browsers, ["chrome"]);
   assert.deepEqual(parseArgs(["--chrome-too"]).browsers, ["edge", "chrome"]);
   assert.equal(parseArgs(["--dry-run"]).dryRun, true);

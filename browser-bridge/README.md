@@ -127,6 +127,15 @@ Edge itself, since there is nobody at a screen to click **Load unpacked**:
 - Registration is the same `claude mcp add-json` into every `~/.claude*` config, with this
   machine's node, so any Claude session started afterwards has the `browser` tools.
 
+On a machine with a GPU, `node bin/install.js --gpu` starts that Edge with the flags that
+put WebGL on it (ANGLE over EGL; measured with the proprietary NVIDIA driver) instead of
+`--disable-gpu`. Headless Edge falls back to SwiftShader without complaint when the GPU
+path does not come up, so check the result rather than the flags:
+`node bin/webgl-probe.js` starts a scratch Edge with the same flags, prints the WebGL
+renderer it got and exits 1 if that is SwiftShader, llvmpipe or no WebGL at all
+(`--without-gpu-flags` shows what Edge picks on its own). From a session, the same answer
+comes from `javascript_tool` reading `WEBGL_debug_renderer_info` on the page under test.
+
 To check it: `systemctl --user status browser-bridge-daemon browser-bridge-edge`,
 `curl -s http://127.0.0.1:47331/healthz`, `edge.log` for the extension id, and
 `host.log` for `extension ready`. `claude mcp list` should show `browser` connected.

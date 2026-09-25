@@ -234,6 +234,11 @@ test("the Edge unit follows the daemon, restarts on failure and stops the wrappe
     /^ExecStart="\/opt\/node\/bin\/node" "\/srv\/bb\/bin\/headless-edge\.js" "--user-data-dir" "\/home\/test\/\.local\/state\/browser-bridge\/edge-profile"$/m,
   );
   assert.match(edgeUnit("/opt/node/bin/node", { HOME: "/home/test" }, "/srv/bb", "/home/test/p"), /"--user-data-dir" "\/home\/test\/p"$/m);
+  assert.match(
+    edgeUnit("/opt/node/bin/node", { HOME: "/home/test" }, "/srv/bb", "/home/test/p", { gpu: true }),
+    /^ExecStart=.*"--user-data-dir" "\/home\/test\/p" "--gpu"$/m,
+  );
+  assert.doesNotMatch(unit, /--gpu/);
   assert.match(unit, /^Restart=on-failure$/m);
   assert.match(unit, /^KillMode=mixed$/m);
   assert.match(unit, /^StandardOutput=append:\/home\/test\/\.local\/state\/browser-bridge\/edge\.log$/m);

@@ -12,6 +12,7 @@ import test from "node:test";
 import {
   DEFAULT_EDGE,
   FrameDecoder,
+  GPU_ARGS,
   MAX_FRAME_BYTES,
   createSupervisor,
   edgeArgs,
@@ -93,6 +94,18 @@ test("Edge runs headless on the pipe with extension debugging, on the given prof
     assert.ok(args.includes(flag), flag);
   }
   assert.equal(args.at(-1), "about:blank");
+  assert.ok(args.includes("--disable-gpu"));
+  for (const flag of GPU_ARGS) assert.ok(!args.includes(flag), flag);
+});
+
+test("with gpu, Edge gets ANGLE over EGL in place of --disable-gpu", () => {
+  const args = edgeArgs("/home/test/p", { gpu: true });
+  assert.ok(!args.includes("--disable-gpu"));
+  for (const flag of ["--use-gl=angle", "--use-angle=gl-egl", "--ignore-gpu-blocklist", "--enable-gpu"]) {
+    assert.ok(args.includes(flag), flag);
+  }
+  assert.ok(args.includes("--remote-debugging-pipe"));
+  assert.equal(args.at(-1), "about:blank");
 });
 
 test("the Edge path and the profile come from flags, then the environment, then defaults", () => {
@@ -110,7 +123,11 @@ test("the Edge path and the profile come from flags, then the environment, then 
     ...env,
     BROWSER_BRIDGE_EDGE: "/opt/edge",
   });
-  assert.deepEqual(fromFlags, { edgePath: "/opt/other", profileDir: "/home/test/q", extensionPath: "/srv/ext" });
+  assert.deepEqual(fromFlags, { edgePath: "/opt/other", profileDir: "/home/test/q", extensionPath: "/srv/ext", gpu: false });
+  assert.equal(defaults.gpu, false);
+  assert.equal(parseArgs(["--gpu"], env).gpu, true);
+  assert.equal(parseArgs(["--gpu", "--edge", "/opt/e"], env).edgePath, "/opt/e");
+  assert.equal(parseArgs([], { ...env, BROWSER_BRIDGE_EDGE_GPU: "1" }).gpu, true);
   assert.throws(() => parseArgs(["--edge"], env), /needs a value/);
   assert.throws(() => parseArgs(["--wat"], env), /Unknown argument/);
 });
@@ -234,6 +251,13 @@ test("each start spawns Edge with the pipe on fds 3 and 4 and asks it to load th
   await flush();
   assert.ok(lines.includes(`extension loaded: ${EXTENSION_ID} from /srv/bb/extension`));
   assert.equal(lines.some((line) => line.startsWith("expected extension id")), false);
+});
+
+test("a supervisor started with gpu spawns Edge with the GPU flags and says so", () => {
+  const { supervisor, spawned, lines } = harness({ gpu: true });
+  supervisor.start();
+  assert.deepEqual(spawned[0].args, edgeArgs("/home/test/profile", { gpu: true }));
+  assert.ok(lines.some((line) => line.endsWith("with GPU flags")));
 });
 
 test("a wrong id and an unreadable message are logged, and nothing restarts", async () => {

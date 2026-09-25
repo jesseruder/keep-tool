@@ -4,7 +4,7 @@
 // directory and Codex home on this machine at it over loopback HTTP.
 //
 //   node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
-//                       [--user-data-dir <dir>] [--rotate-token] [--dry-run] [--uninstall]
+//                       [--user-data-dir <dir>] [--gpu] [--rotate-token] [--dry-run] [--uninstall]
 //
 // Nothing here is clever on purpose: --dry-run prints every file it would write, every
 // config edit it would make and every command it would run, so the whole thing can be
@@ -78,6 +78,7 @@ export function parseArgs(argv) {
     uninstall: false,
     stdio: false,
     rotateToken: false,
+    gpu: false,
   };
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
@@ -85,6 +86,7 @@ export function parseArgs(argv) {
     else if (arg === "--uninstall") options.uninstall = true;
     else if (arg === "--stdio") options.stdio = true;
     else if (arg === "--rotate-token") options.rotateToken = true;
+    else if (arg === "--gpu") options.gpu = true;
     else if (arg === "--chrome-too") options.browsers = ["edge", "chrome"];
     else if (arg === "--browser") {
       const value = argv[++index];
@@ -326,7 +328,13 @@ export function daemonUnit(nodePath, env = process.env, projectDir = PROJECT_DIR
  * the stop signal to the wrapper alone, so it can close Edge down in order; anything still
  * left in the cgroup after that is killed outright.
  */
-export function edgeUnit(nodePath, env = process.env, projectDir = PROJECT_DIR, userDataDir = edgeProfileDir(env, "linux")) {
+export function edgeUnit(
+  nodePath,
+  env = process.env,
+  projectDir = PROJECT_DIR,
+  userDataDir = edgeProfileDir(env, "linux"),
+  { gpu = false } = {},
+) {
   const log = edgeLogPath(env, "linux");
   const script = path.join(projectDir, "bin", "headless-edge.js");
   return [
@@ -338,7 +346,7 @@ export function edgeUnit(nodePath, env = process.env, projectDir = PROJECT_DIR, 
     "[Service]",
     // The profile is named even when it is the default, so the unit and the manifest copy the
     // installer wrote cannot disagree about where it is.
-    `ExecStart=${[nodePath, script, "--user-data-dir", userDataDir].map(systemdExecArg).join(" ")}`,
+    `ExecStart=${[nodePath, script, "--user-data-dir", userDataDir, ...(gpu ? ["--gpu"] : [])].map(systemdExecArg).join(" ")}`,
     `WorkingDirectory=${systemdPath(projectDir)}`,
     `Environment=BROWSER_BRIDGE_RUNTIME_DIR=${systemdQuote(runtimeDir(env, "linux"))}`,
     `StandardOutput=append:${systemdPath(log)}`,
@@ -715,7 +723,7 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
   if (linux && !options.uninstall) {
     // Written for --stdio too: the per-session servers still reach the browser through the
     // extension, and on Linux this unit is the only thing that loads it.
-    files.push({ path: edgeUnitPath(env), content: edgeUnit(nodePath, env, projectDir, userDataDir), mode: 0o644 });
+    files.push({ path: edgeUnitPath(env), content: edgeUnit(nodePath, env, projectDir, userDataDir, { gpu: options.gpu }), mode: 0o644 });
     files.push({ path: edgeLogPath(env, platform), mode: 0o600, append: true, content: "" });
   }
 
@@ -1225,7 +1233,7 @@ function runCommand(command) {
 const HELP = `Browser Bridge installer
 
   node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
-                      [--user-data-dir <dir>] [--rotate-token] [--dry-run] [--uninstall]
+                      [--user-data-dir <dir>] [--gpu] [--rotate-token] [--dry-run] [--uninstall]
 
   --browser <name>  which browser's native messaging directory to write (default: edge)
   --chrome-too      write both Edge's and Chrome's
@@ -1233,6 +1241,8 @@ const HELP = `Browser Bridge installer
                     also write the manifest into <dir>/NativeMessagingHosts, for a browser
                     started with --user-data-dir=<dir> (on Linux this defaults to the
                     headless Edge's profile, <runtime dir>/edge-profile)
+  --gpu             Linux: start the headless Edge with the flags that put WebGL on the
+                    machine's GPU (bin/webgl-probe.js checks they did) instead of --disable-gpu
   --stdio           register one stdio MCP server per session instead of the daemon
   --rotate-token    replace the daemon token and the key-derivation secret. No registration
                     changes: the helper reads the token from daemon.json each time, so a live
