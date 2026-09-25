@@ -68,7 +68,12 @@ function consoleRequests(root, now = Date.now()) {
 // One destination for one session: the same file (and key) on the same machine. Two
 // pending requests for it are one ask made twice, and Owner should see one panel.
 function sameDestination(a, b) {
-  return a.sessionId === b.sessionId && a.node === b.node && a.path === b.path && (a.key || null) === (b.key || null);
+  return a.sessionId === b.sessionId && sameFile(a, b) && (a.key || null) === (b.key || null);
+}
+
+// The same file on the same machine, whoever asked: two writes to it never overlap.
+function sameFile(a, b) {
+  return a.node === b.node && a.path === b.path;
 }
 
 function refusal(status, error, extra = {}) { return { status, body: { error, ...extra } }; }
@@ -248,10 +253,11 @@ function createSecretService(options = {}) {
     const record = effective(found, now());
     if (record.status !== 'pending') return refusal(409, `secret request ${id} is ${record.status}`);
     if (writing.has(id)) return refusal(409, `secret request ${id} is already being written`);
-    // One write per destination at a time: two open asks for one key (made before they
-    // were merged) must not both be written, the second over the first.
-    const rival = load().find((r) => r.id !== id && writing.has(r.id) && sameDestination(r, record));
-    if (rival) return refusal(409, `secret request ${rival.id} for that destination is being written now`);
+    // One write per file at a time, whichever session asked: two open asks for one key
+    // must not both be written, the second over the first, and two keys upserted into
+    // one env file at once could each drop the other's line.
+    const rival = load().find((r) => r.id !== id && writing.has(r.id) && sameFile(r, record));
+    if (rival) return refusal(409, `secret request ${rival.id} is writing that file now; try again in a moment`);
     writing.add(id);
     onChange();
     try {

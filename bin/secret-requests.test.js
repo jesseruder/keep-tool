@@ -221,6 +221,19 @@ test('two open asks for one destination are never written at once', async (t) =>
   assert.equal(service.list({ class: 'local' }, { id: 'cccccccc' }).body.requests[0].status, 'superseded');
 });
 
+test('another session writing the same file waits its turn', async (t) => {
+  let release;
+  const { service } = setup(t, { writeLocal: () => new Promise((resolve) => { release = resolve; }) });
+  const a = service.request({ class: 'local' }, ask()).body.request;
+  const b = service.request({ class: 'local' }, ask({ sessionId: 'other-session', key: 'OTHER' })).body.request;
+  const first = service.fulfill({ id: a.id, value: VALUE });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((await service.fulfill({ id: b.id, value: VALUE })).status, 409);
+  release({ replaced: false, bytes: 1 });
+  assert.equal((await first).status, 200);
+  assert.equal(service.list({ class: 'local' }, { id: b.id }).body.requests[0].status, 'pending', 'another session is not superseded');
+});
+
 test('re-asking with other terms waits while the pending one is being written', async (t) => {
   let release;
   const { service } = setup(t, { writeLocal: () => new Promise((resolve) => { release = resolve; }) });
