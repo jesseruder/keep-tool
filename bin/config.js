@@ -143,7 +143,23 @@ function update(mutate, env = process.env) {
 function nodeNames(value = {}) { return Object.keys(nodeConfig(value).nodes); }
 function daemonNode(value = {}) { return nodeConfig(value).daemonNode; }
 
+// A test file run by bare `node --test`, without scripts/test-env.cjs, inherits an
+// agent pane's KEEP_DIR (or none, which means ~/keep): its fixtures then write the
+// operator's live registry. bin/tell.test.js replaced the session-number registry
+// that way, and every session was renumbered. Such a run may only use a registry
+// under the temp directory, as the tests that make their own do.
+function refuseLiveRegistryUnderTest(env) {
+  if (!env.NODE_TEST_CONTEXT || env.KEEP_TEST_ENV_SCRUBBED) return;
+  const dir = env.KEEP_DIR ? path.resolve(env.KEEP_DIR) : '';
+  const temps = new Set([os.tmpdir(), '/tmp']);
+  for (const temp of [...temps]) { try { temps.add(fs.realpathSync(temp)); } catch {} }
+  if (dir && [...temps].some((temp) => dir.startsWith(`${path.resolve(temp)}${path.sep}`))) return;
+  throw new Error(`keep: a test run without scripts/test-env.cjs would use the live registry at ${dir || '~/keep'}; `
+    + 'run tests with `node scripts/test-runner.cjs <files>` or `node --test --require ./scripts/test-env.cjs <files>`');
+}
+
 function apply(env = process.env) {
+  refuseLiveRegistryUnderTest(env);
   // An explicit data directory is an isolated registry (also used by tests).
   // Do not silently import another registry's settings into it.
   const value = env.KEEP_DIR && !env.KEEP_CONFIG ? {} : load(env);
