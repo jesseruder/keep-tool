@@ -17,10 +17,10 @@ function database() {
   return handle;
 }
 
-parentPort.on('message', ({ id, query }) => {
+parentPort.on('message', ({ id, query, exclude }) => {
   try {
     const db = database();
-    parentPort.postMessage({ id, results: db ? searchDatabase(db, query) : [] });
+    parentPort.postMessage({ id, results: db ? searchDatabase(db, query, { exclude }) : [] });
   } catch (error) {
     // A handle that failed once (a migration mid-swap, a replaced file) is reopened next time.
     try { handle?.close(); } catch {}

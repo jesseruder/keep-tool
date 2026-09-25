@@ -27,7 +27,8 @@ const CLOSE = '\u0003';
 // Every word is quoted so FTS5 reads `home-only` or `NOT` as text, and all must
 // match. A last word still being typed also matches longer words.
 function ftsMatch(query) {
-  const text = String(query || '').slice(0, 200);
+  // A NUL or other control character ends an FTS5 string early; none belongs in a query.
+  const text = String(query || '').slice(0, 200).replace(/[\u0000-\u001f\u007f]/g, ' ');
   const words = text.trim().split(/\s+/).filter(Boolean).slice(0, MAX_WORDS);
   if (text.trim().length < MIN_QUERY || !words.length) return null;
   const typing = !/\s$/.test(text);
@@ -39,16 +40,20 @@ function ftsMatch(query) {
 
 // Only what a person typed and the agents' prose: tool calls and their output are
 // four fifths of the index and would bury every conversation in build logs.
+// `exclude` names sessions the console never lists here (the reviewer and the
+// standing agents): they write the most prose, and would otherwise fill the caps.
 function searchDatabase(handle, query, options = {}) {
   const match = ftsMatch(query);
   if (!match) return [];
+  const exclude = JSON.stringify(Array.isArray(options.exclude) ? options.exclude.map(String) : []);
   const rows = handle.prepare(`SELECT m.session_id AS sessionId, m.ts, m.role,
       snippet(messages_fts, 0, char(2), char(3), '…', 14) AS snippet
     FROM messages_fts
     JOIN messages m ON m.id = messages_fts.rowid
     JOIN sessions s ON s.id = m.session_id
     WHERE messages_fts MATCH ? AND m.kind IN ('human', 'text') AND s.kind = 'interactive'
-    ORDER BY messages_fts.rowid DESC LIMIT ?`).all(match, options.hitLimit || HIT_LIMIT);
+      AND m.session_id NOT IN (SELECT value FROM json_each(?))
+    ORDER BY messages_fts.rowid DESC LIMIT ?`).all(match, exclude, options.hitLimit || HIT_LIMIT);
   const bySession = new Map();
   for (const row of rows) {
     const hit = bySession.get(row.sessionId);
@@ -113,14 +118,14 @@ function createSessionTextSearch(options = {}) {
     running = queued;
     queued = null;
     running.timer = setTimeout(() => failRunning(Object.assign(new Error('session search timed out'), { status: 504 })), timeoutMs);
-    ensure().postMessage({ id: running.id, query: running.query });
+    ensure().postMessage({ id: running.id, query: running.query, exclude: running.exclude });
   };
   return {
-    search(query) {
+    search(query, exclude = []) {
       if (!ftsMatch(query)) return Promise.resolve([]);
       return new Promise((resolve, reject) => {
         if (queued) settle(queued, null, null);
-        queued = { id: ++sequence, query: String(query), resolve, reject };
+        queued = { id: ++sequence, query: String(query), exclude, resolve, reject };
         next();
       });
     },

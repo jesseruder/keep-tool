@@ -39,6 +39,8 @@ test('one hit per interactive session, newest first, from prose and typed messag
   assert.match(results[0].snippet, /\u0002websocket\u0003/);
   assert.deepEqual(searchDatabase(database(), 'build log'), []);
   assert.deepEqual(searchDatabase(database(), 'reconn').map((hit) => hit.sessionId), ['other']);
+  assert.deepEqual(searchDatabase(database(), 'websocket', { exclude: ['live'] }).map((hit) => hit.sessionId), ['other']);
+  assert.equal(ftsMatch('web\u0000socket'), '"web" "socket"*');
 });
 
 class FakeWorker extends EventEmitter {
@@ -51,12 +53,12 @@ class FakeWorker extends EventEmitter {
 test('a newer search supersedes one that has not started, and a stuck one is abandoned', async () => {
   FakeWorker.made = [];
   const search = createSessionTextSearch({ Worker: FakeWorker, timeoutMs: 20 });
-  const first = search.search('alpha');
+  const first = search.search('alpha', ['agent']);
   const second = search.search('bravo');
   const third = search.search('charlie');
   assert.equal(await second, null);
   const [worker] = FakeWorker.made;
-  assert.deepEqual(worker.posted.map((message) => message.query), ['alpha']);
+  assert.deepEqual(worker.posted.map((message) => [message.query, message.exclude]), [['alpha', ['agent']]]);
   worker.answer([{ sessionId: 'a' }]);
   assert.deepEqual(await first, [{ sessionId: 'a' }]);
   assert.deepEqual(worker.posted.map((message) => message.query), ['alpha', 'charlie']);

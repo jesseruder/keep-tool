@@ -80,12 +80,12 @@ const TEXT_MIN = 3;
 
 export function installSessionSearch({ rows, recentIds, open, esc, searchText = null }) {
   let dialog, input, list, returnTo = null, all = [], titled = [], said = [], results = [], selected = 0;
-  let textTimer = 0, textSequence = 0, searching = false;
+  let textTimer = 0, textSequence = 0, searching = false, failed = false;
   const render = () => {
     const firstSaid = titled.length;
     list.innerHTML = results.map((row, index) => (index === firstSaid ? '<li class="heading" role="presentation">In conversation</li>' : '')
       + sessionRowHTML(row, index, index === selected, esc)).join('')
-      || `<li class="empty">${searching ? 'Searching conversations…' : 'No matching sessions'}</li>`;
+      || `<li class="empty">${searching ? 'Searching conversations…' : failed ? 'No title matches, and conversations could not be searched' : 'No matching sessions'}</li>`;
     if (results.length) input.setAttribute('aria-activedescendant', `session-search-${selected}`);
     else input.removeAttribute('aria-activedescendant');
     list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
@@ -106,6 +106,7 @@ export function installSessionSearch({ rows, recentIds, open, esc, searchText = 
     }, () => {
       if (sequence !== textSequence) return;
       searching = false;
+      failed = true;
       render();
     });
   };
@@ -117,6 +118,7 @@ export function installSessionSearch({ rows, recentIds, open, esc, searchText = 
     selected = 0;
     clearTimeout(textTimer);
     const sequence = ++textSequence;
+    failed = false;
     searching = Boolean(searchText) && query.trim().length >= TEXT_MIN;
     if (searching) textTimer = setTimeout(() => searchSaid(query, sequence), TEXT_DELAY_MS);
     render();

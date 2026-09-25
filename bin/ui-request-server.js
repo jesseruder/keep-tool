@@ -350,7 +350,9 @@ function createUiRequestServer(options = {}) {
       if (req.method === 'GET' && url.pathname === '/api/session-text-search') {
         // A superseded query answers null: a newer one from the same finder replaced it.
         try {
-          const results = await sessionTextSearch().search(url.searchParams.get('q') || '');
+          const agents = (current?.state?.sessions || []).filter((session) => session?.reviewer || session?.agentName)
+            .map((session) => session.id).filter(Boolean);
+          const results = await sessionTextSearch().search(url.searchParams.get('q') || '', agents);
           return json(res, 200, results ? { ok: true, results } : { ok: true, superseded: true, results: [] });
         } catch (error) { return json(res, error.status || 500, { error: error.message }); }
       }
