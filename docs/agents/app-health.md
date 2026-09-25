@@ -98,6 +98,9 @@ Then, all read-only:
    Count only reports about the mobile app itself — crashes, freezes, not opening,
    losing work, login, a device or build named — and set aside ones about a deck's own
    content, the web editor or Cauldron multiplayer (those are other agents' areas).
+   Everyone who posts in Castle's Slack is on the team, and so is a Discord author whose
+   name matches one of them (nikki and ben answer there most): a team reply means
+   someone has the report, so cite it rather than counting the report as unanswered.
 
 ## Today's baselines (measured 2026-09-25; update when they drift)
 
@@ -170,6 +173,14 @@ with the numbers, the Sentry issue ids, the review ids, the report links and the
 queries in its body.
 Never halt or resume a rollout, publish a release, approve a CI hold, reply to a review,
 or resolve a Sentry issue. Halting a rollout is Owner's call: raise it as a needs-you.
+
+A **security report** — a way to reach other users' data, run code where it should not
+run, open off-platform URLs, bypass remix or view-source restrictions — is never
+reproduced or tested. Open one card for it (`keep add "<one line>" --file --tag security
+--project ~/castle/castle-client`, or the repo it names) that links the report rather
+than restating the method, and emit a needs-you naming the card; it does not count
+against the one-card limit above. A user who is owed an answer is not a needs-you: put
+`Suggested reply: …` in the morning check-in and leave it there.
 
 ## The report
 
