@@ -409,9 +409,18 @@ function grantReopen(taskId, today) {
 
 // The agent a card's checks run as: `agent:` in its frontmatter, when it is a usable
 // agent name. Empty for the ordinary card.
-function cardAgent(task) {
+function cardAgent(task, root = keep.ROOT) {
   const name = task && task.fm && typeof task.fm.agent === 'string' ? task.fm.agent.trim() : '';
-  return name && require('./agents.js').validName(name) ? name : '';
+  const agents = require('./agents.js');
+  if (!name || !agents.validName(name)) return '';
+  // The CLI refuses these at add/checkin time; the frontmatter can still be written
+  // by hand, so the scheduler refuses again where the name is used.
+  const owner = agents.reservedAgentName(name, root);
+  if (owner) {
+    process.stderr.write(`keep runs: ${task.id} names agent ${name}, which is ${owner}; its check opens as an ordinary session\n`);
+    return '';
+  }
+  return name;
 }
 
 // The account a scheduled check spends against: the automation pool's pick for the
@@ -707,15 +716,22 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
   // exists before the session does (an emit for a name with no record is dropped),
   // the opener stamps the pane with the name, and the record then carries the
   // session so the agent's row under Agents shows it working on this card.
-  const agentName = (opts.cardAgent || cardAgent)(task);
+  let agentName = (opts.cardAgent || cardAgent)(task, opts.root || keep.ROOT);
   const agentApi = opts.agents || require('./agents.js');
   if (agentName) {
     try {
-      agentApi.ensure(agentName, {
+      const record = agentApi.ensure(agentName, {
         role: 'scheduled check', project: task.fm.project || '', card: task.id,
       }, { root: opts.root || keep.ROOT });
+      // A record that is somebody else's (a responder's, or one launched some other
+      // way) is never taken over: the check opens as an ordinary session instead.
+      if (record && record.role !== 'scheduled check') {
+        process.stderr.write(`keep runs: agent ${agentName} is ${record.role || 'another agent'}, not a scheduled check; ${task.id} opens as an ordinary session\n`);
+        agentName = '';
+      }
     } catch (error) {
       process.stderr.write(`keep runs: could not create the agent record ${agentName} for ${task.id}: ${error.message}\n`);
+      agentName = '';
     }
   }
   let opened;

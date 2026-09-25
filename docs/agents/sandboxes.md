@@ -128,11 +128,11 @@ The order is the on-call order:
      reject reason) gets that field, in a code change you land;
    - a condition you could only find by hand gets a metric or a log event;
    - an alert that resolved while the fault continued, or that never fired, gets a
-     better rule. The MCP does not serve alert-rule writes yet, so write the rule you
-     want — the exact expression, `for`, labels — on the card, raise `needs-you`, and
-     put the rule under `Grafana` in your notes so the next session knows it is
-     pending. Dashboards and annotations you can change directly: annotate the window
-     you investigated, and add the panel you wished you had.
+     better rule. `grafana_alerting_manage_rules` serves rule writes: add or tighten
+     the rule yourself (a rule is reversible), record its uid, the expression and the
+     prior state on the card, and never delete a rule you did not create. Dashboards
+     and annotations likewise: annotate the window you investigated, and add the
+     panel you wished you had.
    Say on the card what you added and what it will show next time.
 
 ### Judgement, and what waits for Owner
@@ -144,7 +144,7 @@ normal range, rolling back to the previous known-good bundle, terraform changes 
 the runbook already describes — yes. Reversible, bounded, and written down first.
 
 Wait for Owner — `keep agents emit sandboxes --kind needs-you --needs-you`, then end the
-turn with the question — when the action is hard to undo or wide: deleting or
+turn on a statement that names the question — when the action is hard to undo or wide: deleting or
 overwriting user data without a copy, terminating hosts that may still hold unsalvaged
 work, terraform that changes the fleet's shape or its credentials, a production
 database write that touches more than the incident's rows, a deploy of an unreviewed
@@ -204,7 +204,8 @@ keep agents emit sandboxes --kind needs-you --card <id> --needs-you -m "<one lin
 
 `--needs-you` raises a real alert on Owner's phone and puts a row in his Waiting on you
 list with the event text, so use it only when the incident cannot move without him — and
-**end your turn with the question** when you do, because his reply arrives back in this
+**end your turn on a statement that names what you need** when you do (never on a
+question: the unattended Stop hook refuses one), because his reply arrives back in this
 session. One `--needs-you` per thing you need. Event text is a pointer: one line, a card
 id, no transcripts and no log excerpts. Your ended turns never reach Waiting on you on
 their own, a closing question included: only a `--needs-you` does.

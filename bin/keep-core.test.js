@@ -133,6 +133,9 @@ test('a card names the agent its checks run as, and only a usable name is accept
   keep.applyCardAgent(task, ' redash-daily ');
   assert.equal(task.fm.agent, 'redash-daily');
   assert.throws(() => keep.applyCardAgent(task, 'Not A Name'), /usable agent name/);
+  assert.throws(() => keep.applyCardAgent(task, 'fleet-reviewer'), /the fleet reviewer/);
+  // With no incidents config the one area is `default`, whose responder is `default`.
+  assert.throws(() => keep.applyCardAgent(task, 'default'), /default area's incident responder/);
   assert.equal(task.fm.agent, 'redash-daily', 'a refused name changes nothing');
   keep.applyCardAgent(task, '');
   assert.equal(task.fm.agent, undefined, 'an empty value clears it');

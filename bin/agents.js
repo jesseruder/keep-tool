@@ -59,6 +59,24 @@ function validName(name) {
   return NAME_RE.test(String(name == null ? '' : name));
 }
 
+// Names a card may not run its checks as: the fleet reviewer's, and every area
+// responder's. A check that opened under one of those would overwrite that agent's
+// record with its own session, be adopted by the area tick as the responder's pane,
+// and be idled by the sweep over a responder mid-incident. Returns what the name
+// belongs to, or '' when it is free. The incidents module is read lazily: nothing
+// here may require it at load time.
+function reservedAgentName(name, root = keep.ROOT) {
+  const value = String(name == null ? '' : name);
+  if (!value) return '';
+  if (value === REVIEWER_NAME) return 'the fleet reviewer';
+  let cfg = null;
+  try { cfg = require('./incidents.js').config(root); } catch { return ''; }
+  for (const area of Object.keys((cfg && cfg.areas) || {})) {
+    if ((areaAgent(area, cfg) || area) === value) return `the ${area} area's incident responder`;
+  }
+  return '';
+}
+
 // The one place an HTTP path turns into a name. A path segment that is not a
 // valid name is not an agent, so the route answers 400 rather than reading
 // whatever the segment happens to point at.
@@ -952,7 +970,7 @@ module.exports = {
   validName, nameFromPath, agentsDir, agentDir, recordFile, eventsFile, notesFile,
   readRecord, records, writeRecord, ensure, normalizeRecord, lastFeedSeq,
   emit, markSeen, readEvents, readTail, readAfterSeq, loadEvents, unseenSummary, eventLine, eventSummary, alertText, normalizeEvent,
-  BADGE_KINDS, badges, lastNeedsYou, attentionItems,
+  BADGE_KINDS, badges, lastNeedsYou, attentionItems, reservedAgentName,
   flushCommits, pendingNames,
   areaAgent, incidentEmitter,
   applySessions, agentView, reviewerView, dashboardAgents,

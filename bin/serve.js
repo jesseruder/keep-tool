@@ -10512,6 +10512,10 @@ const reopenOpenOperations = new Map();
 // `ephemeral` gone the reaper never looks at it.
 function adoptedPaneMeta(meta) {
   const { ephemeral, awaitingOwnerInput, openingMessage, ...rest } = meta || {};
+  // A check that ran as a card's agent stops being that agent's pane with the
+  // check: the replacement is Owner's ordinary session, and a pane that kept the
+  // name would hold the record at `working` with nothing left to idle it.
+  if (ephemeral === 'check') delete rest.agentName;
   return rest;
 }
 

@@ -478,7 +478,7 @@ test('a card that names its agent opens its check as that agent and records the 
     const bodies = [];
     const calls = [];
     const agents = {
-      ensure: (name, fields) => { calls.push(['ensure', name, fields]); return { name }; },
+      ensure: (name, fields) => { calls.push(['ensure', name, fields]); return { name, ...fields }; },
       writeRecord: (name, patch) => { calls.push(['write', name, patch]); return { name, ...patch }; },
       flushCommits: () => { calls.push(['flush']); return true; },
     };
@@ -503,6 +503,34 @@ test('a card that names its agent opens its check as that agent and records the 
     await openFreshCheckSession(card({ agent: 'Not A Name' }), { today: '2026-09-25', open, refusal, agents });
     assert.equal(bodies[0].agentName, undefined);
     assert.deepEqual(calls, []);
+    // A responder's or the reviewer's name is never taken over: the registry's
+    // incident areas name their agents, and the reviewer is fleet-reviewer.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-runs-agent-'));
+    fs.mkdirSync(path.join(root, 'watch'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'watch', 'incidents.json'), JSON.stringify({
+      areas: { sandboxes: { project: 'castle-sandboxes', match: ['^Sandbox '] }, 'app-server': { project: 'ghost-server', default: true, agent: 'ghost' } },
+    }));
+    try {
+      for (const reserved of ['sandboxes', 'ghost', 'fleet-reviewer']) {
+        calls.length = 0; bodies.length = 0;
+        _resetSchedulerState();
+        await openFreshCheckSession(card({ agent: reserved }), { today: '2026-09-25', open, refusal, agents, root });
+        assert.equal(bodies[0].agentName, undefined, reserved);
+        assert.deepEqual(calls, [], reserved);
+      }
+      // The area's own name is free when its agent is named differently.
+      calls.length = 0; bodies.length = 0;
+      _resetSchedulerState();
+      await openFreshCheckSession(card({ agent: 'app-server' }), { today: '2026-09-25', open, refusal, agents, root });
+      assert.equal(bodies[0].agentName, 'app-server');
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    // Nor is a record that exists with another role, whatever the card says.
+    calls.length = 0; bodies.length = 0;
+    _resetSchedulerState();
+    const taken = { ...agents, ensure: (name) => { calls.push(['ensure', name]); return { name, role: 'incident-responder' }; } };
+    await openFreshCheckSession(card({ agent: 'somebody' }), { today: '2026-09-25', open, refusal, agents: taken });
+    assert.equal(bodies[0].agentName, undefined);
+    assert.deepEqual(calls, [['ensure', 'somebody']], 'looked at, never written');
   } finally { _resetSchedulerState(); }
 });
 

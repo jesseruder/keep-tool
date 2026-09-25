@@ -10962,6 +10962,20 @@ test('a check session Keep opens for itself lands on the daemon node', async () 
   assert.equal(opens[0].body.node, 'main');
   assert.deepEqual(opens[0].launchMeta, { ephemeral: 'check' });
 
+  // A card that names its agent: the name leaves the body for the launch meta, beside
+  // the ephemeral mark; a name that is not usable is dropped rather than stamped.
+  await openCheckSession({ taskId: 'some-card', fresh: true, agent: 'claude', agentName: 'redash-daily', message: '[keep] check' },
+    { openSession: async (body, deps) => { opens.push({ body, launchMeta: deps.launchMeta }); return { sessionId: 's2' }; } });
+  assert.equal(opens[1].body.agentName, undefined);
+  assert.deepEqual(opens[1].launchMeta, { ephemeral: 'check', agentName: 'redash-daily' });
+  await openCheckSession({ taskId: 'some-card', fresh: true, agent: 'claude', agentName: 'Not A Name', message: '[keep] check' },
+    { openSession: async (body, deps) => { opens.push({ body, launchMeta: deps.launchMeta }); return { sessionId: 's3' }; } });
+  assert.deepEqual(opens[2].launchMeta, { ephemeral: 'check' });
+  // And the replacement of such a pane (a restart, a handoff) is nobody's agent.
+  const { adoptedPaneMeta } = require('./serve');
+  assert.deepEqual(adoptedPaneMeta({ ephemeral: 'check', agentName: 'redash-daily', card: 'some-card', launchedAt: 5 }), { card: 'some-card', launchedAt: 5 });
+  assert.deepEqual(adoptedPaneMeta({ agentName: 'sandboxes', card: 'inc-1' }), { agentName: 'sandboxes', card: 'inc-1' }, 'an area responder keeps its name across a restart');
+
   // Which is what the pin is for: without it, a card whose last session ran on aws1
   // would put its check there, where nothing can deliver to it or reap it.
   assert.equal(resolvePlacement({ lastCardNode: 'aws1' }, { hostNodes: ['main', 'aws1'] }), 'aws1');

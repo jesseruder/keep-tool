@@ -1611,7 +1611,10 @@ function applyCardAgent(task, agent) {
   if (agent === undefined) return;
   const name = String(agent).trim();
   if (!name) { delete task.fm.agent; return; }
-  if (!require('./agents.js').validName(name)) die(`--agent must be a usable agent name (lowercase letters, digits and dashes): ${name}`);
+  const agents = require('./agents.js');
+  if (!agents.validName(name)) die(`--agent must be a usable agent name (lowercase letters, digits and dashes): ${name}`);
+  const owner = agents.reservedAgentName(name);
+  if (owner) die(`--agent ${name} is ${owner}; a card cannot run its checks as an existing responder or the reviewer`);
   task.fm.agent = name;
 }
 
