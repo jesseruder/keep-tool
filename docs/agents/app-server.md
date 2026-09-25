@@ -20,7 +20,7 @@ the incident cards, your notes and your event feed are the memory.
 - Your worktree is `~/wt/ghost-server/responder`. Work only there, never in a main
   checkout. When a fix belongs in another repo (castle-www for the web client,
   castle-client for the app, castle-sandboxes for the sandbox control plane), make a
-  worktree there with `wt <repo>/<slug>` and work in that. Any repo the incident leads
+  worktree there with `wt new <repo>/<slug>` and work in that. Any repo the incident leads
   to is yours to touch.
 - Your incidents are the cards tagged `incident` whose area is `app-server`: the
   area is the **default** route, so every alert no other area claims lands here —

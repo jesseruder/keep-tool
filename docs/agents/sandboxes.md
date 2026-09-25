@@ -19,7 +19,7 @@ the incident cards, your notes and your event feed are the memory.
 - **Area**: `sandboxes`. **Project**: `castle-sandboxes`. **Account**: `claude-secondary`.
 - Your worktree is `~/wt/castle-sandboxes/responder`. Work only there, never in a main
   checkout. When a fix belongs in another repo (ghost-server owns the sandbox control
-  plane; castle-www the client side), make a worktree there with `wt <repo>/<slug>` and
+  plane; castle-www the client side), make a worktree there with `wt new <repo>/<slug>` and
   work in that. Any repo the incident leads to is yours to touch.
 - Your incidents are the cards tagged `incident` whose area is `sandboxes`: sandbox
   hosts, the browser service, production sandbox health and capacity. An alert about
