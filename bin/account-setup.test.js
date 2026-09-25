@@ -82,6 +82,32 @@ test('future projects get isolated memory and exact scoped MCP configuration', (
   } finally { f.cleanup(); }
 });
 
+test('a concurrent creator of the same memory alias is accepted', () => {
+  const f = fixture();
+  const symlinkSync = fs.symlinkSync;
+  try {
+    setup.shareSetup(f.source, f.target);
+    let raced = false;
+    fs.symlinkSync = (target, destination, ...args) => {
+      if (!raced && destination.endsWith(`${path.sep}memory`)) {
+        raced = true;
+        symlinkSync(target, destination, ...args);
+        const error = new Error('already exists');
+        error.code = 'EEXIST';
+        throw error;
+      }
+      return symlinkSync(target, destination, ...args);
+    };
+    const ensured = setup.ensureSharedMemory(f.target, f.repoFuture);
+    assert.equal(raced, true);
+    assert.equal(fs.realpathSync(ensured.memoryDir),
+      fs.realpathSync(path.join(f.sourceDir, 'projects', setup.projectKey(f.repoFuture), 'memory')));
+  } finally {
+    fs.symlinkSync = symlinkSync;
+    f.cleanup();
+  }
+});
+
 test('git main checkout, subdirectory, and detached worktree share one repository memory', () => {
   const f = fixture();
   const worktree = path.join(f.root, 'repo-a-worktree');

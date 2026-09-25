@@ -324,7 +324,15 @@ function writeJSON(file, value) {
 
 function link(source, destination) {
   fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
-  fs.symlinkSync(canonical(source), destination);
+  const target = canonical(source);
+  try {
+    fs.symlinkSync(target, destination);
+  } catch (error) {
+    // Another Keep process may have completed the same idempotent setup between
+    // the caller's existence check and this write. Accept only the exact alias we
+    // intended; a different file or link remains a setup conflict.
+    if (!(error && error.code === 'EEXIST' && canonical(destination) === target)) throw error;
+  }
 }
 
 function pathExists(file) {

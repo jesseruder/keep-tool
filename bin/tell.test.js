@@ -425,6 +425,29 @@ test('--dry runs every guard and the brake, and writes nothing at all', async ()
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('--dry refreshes session rows through the isolated read worker', async () => {
+  const root = tmpRoot('tell-dry-reader');
+  try {
+    const calls = [];
+    const deps = tellDeps(root, []);
+    delete deps.scanSessions;
+    deps.readWorker = { run: async (...args) => {
+      calls.push(args);
+      return [liveSession('new-target', { num: 17 })];
+    } };
+    const result = await tellSession({ sessionId: 'new-target', text: 'ping', dry: true }, deps);
+    assert.equal(result.dry, true);
+    assert.equal(result.name, '#17');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], 'session-snapshot');
+    assert.deepEqual(calls[0][1].options, {
+      fresh: true,
+      readOnly: true,
+      allocateNumbers: false,
+    });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('the re-check before typing stops a session that moved on between the decision and the keystrokes', async () => {
   const root = tmpRoot('tell-precondition');
   try {

@@ -6687,10 +6687,10 @@ async function prepareLaunchOn(node, options, deps = {}, localDeps = {}) {
   // knows whether this is the daemon node preparing for itself.
   if (node === daemonNodeName(deps)) {
     if (daemonMainLoopPolicy.isActive() && daemonMutationProcessForMain && !Object.keys(localDeps).length) {
-      return daemonMutationProcessForMain.run('prepare-launch', {
+      return serializeAccountSetupMutation(() => daemonMutationProcessForMain.run('prepare-launch', {
         root: deps.root || keep.ROOT,
         options: { ...options, remote: false },
-      }, { timeoutMs: 30e3 });
+      }, { timeoutMs: 30e3 }));
     }
     return require('./launch-prep.js').prepare({ ...options, remote: false }, localDeps);
   }
@@ -12203,10 +12203,32 @@ let daemonDashboardBuildForMain = null;
 let daemonMutationProcessForMain = null;
 let daemonReadSequence = 0;
 
+function createSerialWorkQueue() {
+  let tail = Promise.resolve();
+  return (work) => {
+    const result = tail.catch(() => {}).then(work);
+    tail = result.catch(() => {});
+    return result;
+  };
+}
+
+// Account setup updates several shared files and aliases. It used to run as one
+// contiguous main-loop operation, which also serialized two launches. Keep that
+// ordering while the slow work runs in children: separate child processes must not
+// both observe an alias missing and then race to create it.
+const serializeAccountSetupMutation = createSerialWorkQueue();
+
 async function isolatedSessionScan(options = {}, deps = {}) {
   if (deps.scanSessions) return deps.scanSessions(options);
   const reader = deps.readWorker || daemonReadWorkerForMain;
-  if (!reader) throw new Error('daemon session scan has no isolated reader');
+  // serve.js is also imported as a library by focused commands and tests. Before
+  // start() enters the daemon policy there is no event loop to protect and no
+  // worker lifecycle, so retain the direct implementation. Once the daemon is
+  // active, absence of its reader is an error rather than a blocking fallback.
+  if (!reader) {
+    if (!daemonMainLoopPolicy.isActive()) return scanSessions(options);
+    throw new Error('daemon session scan has no isolated reader');
+  }
   const key = options.fresh === true
     ? `session-snapshot:fresh:${++daemonReadSequence}`
     : `session-snapshot:bounded:${JSON.stringify(Object.fromEntries(Object.entries(options).sort(([a], [b]) => a.localeCompare(b))))}`;
@@ -12230,9 +12252,9 @@ async function ensureSharedMemoryOffMain(account, cwd, deps = {}) {
   if (!daemonMainLoopPolicy.isActive() && !deps.mutationProcess) {
     return require('./account-setup.js').ensureSharedMemory(account, cwd);
   }
-  return isolatedDaemonMutation('ensure-shared-memory', {
+  return serializeAccountSetupMutation(() => isolatedDaemonMutation('ensure-shared-memory', {
     root: deps.root || keep.ROOT, account, cwd,
-  }, deps, { timeoutMs: 30e3 });
+  }, deps, { timeoutMs: 30e3 }));
 }
 
 async function compatibleAccountsOffMain(source, target, cwd, resumeSpec, deps = {}) {
@@ -12243,9 +12265,9 @@ async function compatibleAccountsOffMain(source, target, cwd, resumeSpec, deps =
   if (!daemonMainLoopPolicy.isActive() && !deps.mutationProcess) {
     return require('./account-setup.js').compatible(source, target, cwd);
   }
-  return isolatedDaemonMutation('account-compatible', {
+  return serializeAccountSetupMutation(() => isolatedDaemonMutation('account-compatible', {
     root: deps.root || keep.ROOT, source, target, cwd,
-  }, deps, { timeoutMs: 30e3 });
+  }, deps, { timeoutMs: 30e3 }));
 }
 let codexDashboardRows = new Map();
 let codexDashboardFullScanAt = 0;
@@ -16087,9 +16109,10 @@ async function deliverUnblockToThread(task, text) {
 
 // The ordinary session scan expires stale attention and spawned markers and allocates
 // console numbers, so it is not something `--dry` may run: a dry run promises to leave
-// the registry exactly as it found it. Prefer the snapshot the daemon keeps warm — the
-// same one resolveSessionId reads — and fall back to an explicitly read-only scan,
-// which labels whatever is already numbered and writes nothing.
+// the registry exactly as it found it. The production request has already obtained
+// fresh rows from the read worker before it reaches this helper. Injected callers can
+// supply an explicitly read-only scan, which labels whatever is already numbered and
+// writes nothing.
 function tellSessions(dry, deps = {}) {
   const scan = deps.scanSessions;
   if (!scan) return copySessions(sessionSnapshot);
@@ -16268,10 +16291,9 @@ function codexFleetSession(sessionId, pin = null) {
 // session (only a prefix needs it), and `fresh(id)` a new read for the re-check
 // inside the injection lock.
 //
-// A dry run keeps the snapshot path tellSessions gives it: it promises to write
-// nothing, and a snapshot under 5 s old costs nothing. A caller that injects
-// `scanSessions` (the tests) gets its rows from that scan, as before. Every other
-// real tell reads the sessions it names and nothing else.
+// A dry run keeps the read-only rows tellSession gives it: it promises to write
+// nothing. A caller that injects `scanSessions` gets its rows from that scan, as
+// before. Every other real tell reads the sessions it names and nothing else.
 function tellRowSource(dry, deps = {}) {
   if (dry || deps.scanSessions) {
     let rows = null;
@@ -16401,6 +16423,15 @@ async function tellSession(body, deps = {}) {
   // The card rides inside the frame, so it may only ever be a card id.
   if (body.senderCard != null && !tell.CARD_ID_RE.test(String(body.senderCard))) {
     throw new InjectionError(400, 'bad sender card id');
+  }
+  // A dry tell still needs an authoritative live-session view. The ordinary tell
+  // can load its exact target directly, but the dry path deliberately uses scan
+  // rows so every guard is exercised without touching markers or number files.
+  // Obtain those rows in the read worker; a warm dashboard snapshot may predate a
+  // newly opened target and must not turn a valid dry tell into "bad session id".
+  if (dry && !deps.scanSessions && (deps.readWorker || daemonReadWorkerForMain)) {
+    const rows = await isolatedSessionScan({ fresh: true, readOnly: true, allocateNumbers: false }, deps);
+    deps = { ...deps, scanSessions: () => rows };
   }
   const source = tellRowSource(dry, deps);
   const excluded = deps.excluded || excludedSessionIds();
@@ -17555,6 +17586,7 @@ module.exports = {
   checkDeliveryIds,
   deliverCheckToThread,
   tellSession,
+  createSerialWorkQueue,
   loadTellSession,
   loadCurrentSession,
   loadSessionExact,

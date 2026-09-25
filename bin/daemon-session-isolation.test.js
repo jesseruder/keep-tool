@@ -89,3 +89,32 @@ test('the daemon main-loop policy forbids every bulk scan until it leaves', () =
   policy.leave();
   policy.assertBulkScanAllowed();
 });
+
+test('account setup child work stays serialized even after a failed operation', async () => {
+  const serialize = serve.createSerialWorkQueue();
+  let active = 0;
+  let maxActive = 0;
+  let secondStarted = false;
+  let releaseFirst;
+  const held = new Promise((resolve) => { releaseFirst = resolve; });
+  const first = serialize(async () => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await held;
+    active -= 1;
+    throw new Error('first setup failed');
+  });
+  const second = serialize(async () => {
+    secondStarted = true;
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    active -= 1;
+    return 'done';
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(secondStarted, false, 'the second setup must wait for the first child');
+  releaseFirst();
+  await assert.rejects(first, /first setup failed/);
+  assert.equal(await second, 'done', 'a failed setup must not poison the queue');
+  assert.equal(maxActive, 1);
+});
