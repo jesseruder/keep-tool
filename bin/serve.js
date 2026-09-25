@@ -11054,7 +11054,15 @@ async function openSession(body, deps = {}) {
     card = task || null;
     if (!task) throw new InjectionError(400, 'no task');
     project = task.fm.project;
-    if (!body.fresh) session = (task.fm.sessions || []).slice(-1)[0];
+    // A card open resumes the card's last session, or — named by `sessionId` — one
+    // of its other linked sessions (a card agent's own, runs.js agentHomeSession).
+    // A session the card does not link is refused rather than reached through it.
+    const linked = task.fm.sessions || [];
+    if (!body.fresh && body.sessionId) {
+      if (typeof body.sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(body.sessionId)) throw new InjectionError(400, 'bad session id');
+      session = linked.find((entry) => entry && entry.id === body.sessionId);
+      if (!session) throw new InjectionError(409, `session ${sessionRef(body.sessionId)} is not linked to ${body.taskId}`);
+    } else if (!body.fresh) session = linked.slice(-1)[0];
   } else if (body.sessionId) {
     // Accept a unique prefix of at least 8 characters, the way ids are shown everywhere.
     try { session = await resolveSessionIdOffMain(body.sessionId, deps); } catch (error) {
@@ -15851,8 +15859,10 @@ async function deliverCheckToThread(task, deps = {}) {
   // of each one no index names (no authority record, a Codex id, one that ended days
   // ago) walks every Claude project directory, which costs more than one scan. The
   // chosen candidate is then read exactly (loadCurrentSession) before it is typed into.
+  // `candidateIds` is the scheduler naming the only thread that may take this check:
+  // a card agent's own session (runs.js agentHomeSession).
   const { candidates, busy } = pickDeliveryCandidates(
-    checkDeliveryIds(task),
+    Array.isArray(deps.candidateIds) ? deps.candidateIds : checkDeliveryIds(task),
     await isolatedSessionScan({ fresh: false }, deps),
     deps.excluded || excludedSessionIds(),
   );

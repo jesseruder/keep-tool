@@ -534,6 +534,69 @@ test('a card that names its agent opens its check as that agent and records the 
   } finally { _resetSchedulerState(); }
 });
 
+test('a card agent goes back into its own session, and opens fresh only when that cannot be resumed', async () => {
+  _resetSchedulerState();
+  try {
+    let record = { name: 'redash-daily', role: 'scheduled check', card: '', homes: { 'some-card': 'sid-home' } };
+    const writes = [];
+    const agents = {
+      ensure: () => record,
+      readRecord: () => record,
+      writeRecord: (name, patch) => { writes.push(patch); record = { ...record, ...patch }; return record; },
+      flushCommits: () => true,
+    };
+    const bodies = [];
+    let refuse = null;
+    const open = async (body) => {
+      bodies.push(body);
+      if (body.sessionId && refuse) throw refuse;
+      return { ok: true, sessionId: body.sessionId || 'sid-new', pane: 'p' };
+    };
+    const refusal = () => null;
+    const task = card({ agent: 'redash-daily', sessions: [{ id: 'sid-home', agent: 'claude' }] });
+
+    // Its home is resumed on this card with the check as the message: no fresh
+    // session, and neither the pool's account nor the check model is forced on it.
+    await openFreshCheckSession(task, { today: '2026-09-25', open, refusal, agents, accountId: 'claude-pool' });
+    assert.equal(bodies.length, 1);
+    assert.equal(bodies[0].taskId, 'some-card');
+    assert.equal(bodies[0].sessionId, 'sid-home');
+    assert.equal(bodies[0].fresh, undefined);
+    assert.equal(bodies[0].accountId, undefined);
+    assert.equal(bodies[0].agentName, 'redash-daily');
+    assert.match(bodies[0].message, /sim-srs/);
+    assert.deepEqual(writes.at(-1).homes, { 'some-card': 'sid-home' });
+
+    // A home that cannot be resumed (a refusal before anything launched) falls
+    // through to a fresh session, which becomes the home.
+    bodies.length = 0; _resetSchedulerState();
+    refuse = Object.assign(new Error('session #396 runs on node mac'), { status: 409 });
+    await openFreshCheckSession(task, { today: '2026-09-26', open, refusal, agents });
+    assert.deepEqual(bodies.map((b) => [b.sessionId, b.fresh]), [['sid-home', undefined], [undefined, true]]);
+    assert.deepEqual(record.homes, { 'some-card': 'sid-new' });
+
+    // Anything but a refusal is the open's own failure, and is not retried fresh.
+    bodies.length = 0; _resetSchedulerState();
+    refuse = new Error('host did not answer');
+    await assert.rejects(openFreshCheckSession(task, { today: '2026-09-27', open, refusal, agents }), /host did not answer/);
+    assert.equal(bodies.length, 1);
+  } finally { _resetSchedulerState(); }
+});
+
+test('an agent that ran before homes were recorded goes back into the card\'s last session, only for its own card', async () => {
+  const { agentHomeSession } = require('./runs.js');
+  const task = card({ agent: 'redash-daily', sessions: [{ id: 'sid-old', agent: 'claude' }, { id: 'sid-last', agent: 'claude' }] });
+  const api = (record) => ({ readRecord: () => record });
+  const base = { name: 'redash-daily', role: 'scheduled check', card: '' };
+  assert.equal(agentHomeSession('redash-daily', task, api({ ...base, lastEvent: { card: 'some-card' } })), 'sid-last');
+  assert.equal(agentHomeSession('redash-daily', task, api({ ...base, lastEvent: { card: 'other-card' } })), '');
+  assert.equal(agentHomeSession('redash-daily', task, api({ ...base, homes: { 'some-card': 'sid-old' } })), 'sid-old');
+  assert.equal(agentHomeSession('redash-daily', task, api({ ...base, homes: { 'some-card': 'bad id!' } })), '');
+  assert.equal(agentHomeSession('redash-daily', task, api({ ...base, role: 'incident-responder', card: 'some-card' })), '');
+  assert.equal(agentHomeSession('redash-daily', card({ sessions: [{ id: 'sid-codex', agent: 'codex' }] }), api({ ...base, card: 'some-card' })), '');
+  assert.equal(agentHomeSession('', task, api(base)), '');
+});
+
 test('the sweep idles an agent whose check pane it closed, or whose pane lost the mark', async () => {
   const written = [];
   const records = {
@@ -1140,6 +1203,50 @@ test('the per-day allowances are read back from disk by a fresh process', () => 
       empty, 'entries that are not id -> day strings are dropped');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A recurring check skips the card's linked threads — except a card agent's own
+// session, which is the one place its check is meant to go.
+test('a recurring card agent check is typed into its own session, and resumes it when it is not up', () => {
+  for (const live of [true, false]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-runs-home-'));
+    try {
+      fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'tasks', 'daily-card.md'), [
+        '---', 'title: Daily card', 'status: waiting', 'kind: task', 'tags: [personal]',
+        'agent: redash-daily', 'check_on_pass: rearm', 'check_every: +1d', 'scheduled_by: sid-builder',
+        'check_after: 2020-01-01T00:00', 'check: |', '  Review yesterday.',
+        'created: 2020-01-01T00:00', 'updated: 2020-01-01T00:00', '---', '', 'Context.', '',
+      ].join('\n'));
+      const script = `
+        const runs = require(${JSON.stringify(require.resolve('./runs.js'))});
+        const agents = require(${JSON.stringify(require.resolve('./agents.js'))});
+        agents.writeRecord('redash-daily', { role: 'scheduled check', homes: { 'daily-card': 'sid-home' } });
+        const delivered = [];
+        const opened = [];
+        runs.setDeliverer(async (task, deps) => {
+          delivered.push(deps && deps.candidateIds);
+          return ${live} ? { sessionId: 'sid-home', kind: 'claude' } : null;
+        });
+        runs.setOpener(async (body) => { opened.push({ taskId: body.taskId, sessionId: body.sessionId, fresh: body.fresh });
+          return { ok: true, sessionId: body.sessionId || 'sid-new', pane: 'p' }; });
+        runs.setEphemeralHost({ listPanes: async () => [], sessions: async () => [], closePane: async () => {} });
+        (async () => {
+          await runs.schedulerTick();
+          process.stdout.write(JSON.stringify({ delivered, opened, homes: agents.readRecord('redash-daily').homes }));
+        })();
+      `;
+      const state = JSON.parse(execFileSync(process.execPath, ['-e', script], {
+        encoding: 'utf8', env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_NO_COMMIT: '1' },
+      }));
+      assert.deepEqual(state.delivered, [['sid-home']], 'only the agent\'s session is a candidate, not the card\'s builder');
+      if (live) assert.deepEqual(state.opened, [], 'typed into the live session: nothing opened');
+      else assert.deepEqual(state.opened, [{ taskId: 'daily-card', sessionId: 'sid-home' }], 'resumed, not fresh');
+      assert.deepEqual(state.homes, { 'daily-card': 'sid-home' });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 

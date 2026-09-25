@@ -13,9 +13,10 @@ between sessions, so read them before the data and write the day's findings ther
 
 The card is a recurring check: created with `--check "<pointer to this file>"`,
 `--check-after <first morning>T07:30`, `--check-every +1d` and `--agent redash-daily`,
-which makes it a `rearm` card, so every run goes to a fresh session rather than into a
-thread that remembers yesterday, and runs that session as the standing agent
-`redash-daily`: your row under Agents in Owner's console, whose feed is where your
+which makes it a `rearm` card run as the standing agent `redash-daily`. Every morning goes
+back into the same session (resumed if its pane was closed), so yesterday may still be in
+your context, compacted or not; the check-ins stay the record. The session is
+`redash-daily`'s: your row under Agents in Owner's console, whose feed is where your
 morning lands (below). The delivered message will tell you to re-arm with `--check-after +1d`; use
 the fixed `<tomorrow>T07:30` below instead, so the run does not drift later every day.
 

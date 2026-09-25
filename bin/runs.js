@@ -462,6 +462,40 @@ function cardAgent(task, root = keep.ROOT) {
   return name;
 }
 
+// The session a card agent's checks go back into, so the agent keeps one
+// conversation on its card instead of a new session every day. `homes` on the
+// record maps a card to the session its last check ran in; an agent that ran
+// before homes were recorded falls back to the card's last linked session, but
+// only when the record says this card is the one it worked on. Empty when there
+// is none, and a fresh session is opened as before.
+const SESSION_ID_RE = /^[A-Za-z0-9_-]+$/;
+function agentHomeSession(agentName, task, agentApi, root = keep.ROOT) {
+  if (!agentName || !task) return '';
+  let record = null;
+  try { record = agentApi.readRecord(agentName, root); } catch {}
+  if (!record || record.role !== 'scheduled check') return '';
+  const homes = record.homes && typeof record.homes === 'object' && !Array.isArray(record.homes) ? record.homes : {};
+  if (Object.prototype.hasOwnProperty.call(homes, task.id)) {
+    const id = homes[task.id];
+    return typeof id === 'string' && SESSION_ID_RE.test(id) ? id : '';
+  }
+  const worked = record.card === task.id || (record.lastEvent && record.lastEvent.card === task.id);
+  const last = worked ? (task.fm.sessions || []).slice(-1)[0] : null;
+  const id = last && typeof last.id === 'string' ? last.id : '';
+  return SESSION_ID_RE.test(id) && (!last.agent || last.agent === 'claude') ? id : '';
+}
+
+// The record's card→session map with this card's home set, merged into the same
+// write that records the open. A record that cannot be read starts a new map.
+function withAgentHome(agentApi, agentName, taskId, sessionId, root = keep.ROOT) {
+  let record = null;
+  try { record = agentApi.readRecord(agentName, root); } catch {}
+  const homes = record && record.homes && typeof record.homes === 'object' && !Array.isArray(record.homes)
+    ? { ...record.homes } : {};
+  homes[taskId] = sessionId;
+  return homes;
+}
+
 // The account a scheduled check spends against: the automation pool's pick for the
 // `checks` purpose (`automationAccounts.checks` is a preference, like every other
 // purpose since the pool). A spent pool names its best member all the same, so the
@@ -792,16 +826,33 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
       agentName = '';
     }
   }
+  const message = checkDeliveryMessage(task, { probe: opts.probe });
+  const root = opts.root || keep.ROOT;
   let opened;
   try {
-    opened = await open({
+    // A card agent goes back into its own session: typed in if its pane is still
+    // up, resumed if not. Only a session that cannot be resumed here (a refusal
+    // before anything launched: gone, on another node than the agent's placement,
+    // pinned to an account that is not available) falls through to a fresh one,
+    // which becomes the home from then on. A resume keeps the session's own account
+    // and model, so neither is passed.
+    const home = agentName ? agentHomeSession(agentName, task, agentApi, root) : '';
+    if (home) {
+      try {
+        opened = await open({ taskId: task.id, sessionId: home, agentName, message }, {});
+      } catch (error) {
+        if (!error || (error.status !== 400 && error.status !== 409)) throw error;
+        process.stderr.write(`keep runs: agent ${agentName} could not go back into ${sessionRef(home)} for ${task.id} (${error.message}); opening a fresh session\n`);
+      }
+    }
+    opened ||= await open({
       taskId: task.id,
       fresh: true,
       agent: 'claude',
       ...(accountId ? { accountId } : {}),
       ...(CHECK_MODEL ? { model: CHECK_MODEL } : {}),
       ...(agentName ? { agentName } : {}),
-      message: checkDeliveryMessage(task, { probe: opts.probe }),
+      message,
     }, {});
   } catch (error) {
     if (enforce && reservedIn === allowanceTick) freshOpensThisTick = Math.max(0, freshOpensThisTick - 1);
@@ -822,6 +873,7 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
       agentApi.writeRecord(agentName, {
         session: { id: opened.sessionId, pane: opened.pane || '', startedAt: Date.now() },
         lifecycle: 'working', card: task.id,
+        homes: withAgentHome(agentApi, agentName, task.id, opened.sessionId, root),
       }, { root: opts.root || keep.ROOT });
       agentApi.flushCommits(opts.root || keep.ROOT);
     } catch (error) {
@@ -1388,10 +1440,15 @@ async function schedulerTick() {
       // A recurring check re-arms itself: a thread would have to remember the interval
       // and re-schedule it by hand, and a monitor needs none of that thread's context.
       const recurring = t.fm.check_on_pass === 'rearm';
-      if (!threadBusy && !recurring) {
+      // A card agent's check goes to the agent's own session and no other linked
+      // thread (the one that set the card up is not the agent), recurring or not.
+      // When that session is not up, the open below resumes it.
+      const agentName = cardAgent(t);
+      const home = agentName ? agentHomeSession(agentName, t, require('./agents.js')) : '';
+      if (!threadBusy && (!recurring || home)) {
         let delivery = null;
         try {
-          delivery = await deliverToThread(t);
+          delivery = await deliverToThread(t, home ? { candidateIds: [home] } : undefined);
         } catch (e) {
           delivery = { deferred: true, reason: String(e && e.message || e) };
         }
@@ -1499,7 +1556,7 @@ function startScheduler() {
 
 module.exports = {
   checkInFlight, retryPending, startScheduler, schedulerTick, setOnChange, setDeliverer, setOpener, setEphemeralHost,
-  openFreshCheckSession, checksAccountId, checkBudget, budgetDeferralReason, noteBudgetDeferral,
+  openFreshCheckSession, agentHomeSession, checksAccountId, checkBudget, budgetDeferralReason, noteBudgetDeferral,
   checksFallbackAccountId, recordBudgetDeferral, clearBudgetDeferral, noteStalledCheck,
   escalateBudgetDeferral, handleBudgetDeferral, MAX_FALLBACK_ATTEMPTS,
   freshOpenRefusal, resetTickAllowance, loadSchedulerState, releaseUnfinishedCheck,

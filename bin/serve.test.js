@@ -8567,6 +8567,25 @@ test('a console number resolves to its session, and an unknown number is a bad s
     (error) => error.status === 400 && error.message === 'bad session id');
 });
 
+test('a card open may name one of the card\'s linked sessions, and only one of them', async () => {
+  const project = os.tmpdir();
+  const task = { fm: { project, sessions: [{ id: 'agent-home', agent: 'claude' }, { id: 'later-session', agent: 'claude' }] } };
+  const sent = [];
+  const deps = {
+    loadTask: () => task,
+    resolveSessionTarget: async (session) => ({ pane: `pane-${session.id}` }),
+    sendToResolvedTarget: async (session, target, text) => sent.push({ id: session.id, target, text }),
+  };
+  const named = await openSession({ taskId: 'card', sessionId: 'agent-home', message: 'check' }, deps);
+  assert.equal(named.sessionId, 'agent-home', 'the named session, not the card\'s last');
+  assert.deepEqual(sent, [{ id: 'agent-home', target: { pane: 'pane-agent-home' }, text: 'check' }]);
+  await assert.rejects(openSession({ taskId: 'card', sessionId: 'somebody-else', message: 'check' }, deps),
+    (error) => error.status === 409 && /not linked to card/.test(error.message));
+  await assert.rejects(openSession({ taskId: 'card', sessionId: '../x', message: 'check' }, deps),
+    (error) => error.status === 400);
+  assert.equal(sent.length, 1);
+});
+
 test('open uses host panes for both existing sessions and new Claude and Codex launches', async () => {
   const project = os.tmpdir();
   const task = { fm: { project, sessions: [{ id: 'existing-session', agent: 'claude' }] } };
