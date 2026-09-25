@@ -662,6 +662,9 @@ html.mobile .artifact-save { padding: 4px 0; }
 @media (max-width: 760px) {
   .bar { gap: 6px; padding-inline: 8px; }
   .bar .health, .bar .theme-picker, .bar #dockbtn, .bar .meters, .keys .node-strip { display: none; }
+  /* The strip is hidden by this rule, not by its attribute, so the sibling rule above
+     would still take the status's auto margin: it goes back to the footer's end. */
+  .keys .node-strip:not([hidden]) + .connection { margin-left: auto; }
   .modes { flex: 1; overflow-x: auto; scrollbar-width: none; }
   .modes::-webkit-scrollbar { display: none; }
   .modes button { flex: none; }
