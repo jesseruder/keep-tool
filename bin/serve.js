@@ -11061,7 +11061,7 @@ async function openSession(body, deps = {}) {
     if (!body.fresh && body.sessionId) {
       if (typeof body.sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(body.sessionId)) throw new InjectionError(400, 'bad session id');
       session = linked.find((entry) => entry && entry.id === body.sessionId);
-      if (!session) throw new InjectionError(409, `session ${sessionRef(body.sessionId)} is not linked to ${body.taskId}`);
+      if (!session) throw new InjectionError(409, `session ${body.sessionId.slice(0, 8)} is not linked to ${body.taskId}`);
     } else if (!body.fresh) session = linked.slice(-1)[0];
   } else if (body.sessionId) {
     // Accept a unique prefix of at least 8 characters, the way ids are shown everywhere.
@@ -11147,12 +11147,20 @@ async function openSession(body, deps = {}) {
     let runsOn = null;
     try { runsOn = accounts.sessionNode(session.id, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
     catch (error) { throw new InjectionError(409, error.message); }
-    launchNode = resolvePlacement({
-      node: body.node || null,
-      pinned: runsOn || nodes.daemonNode(deps.env || process.env),
-      needs,
-      label: `session ${sessionRef(session.id)}`,
-    }, deps);
+    const pinned = runsOn || nodes.daemonNode(deps.env || process.env);
+    try {
+      launchNode = resolvePlacement({
+        node: body.node || null,
+        pinned,
+        needs,
+        label: `session ${sessionRef(session.id)}`,
+      }, deps);
+    } catch (error) {
+      // Named, because it is decided before anything launches: a card agent's check
+      // (runs.js) opens a fresh session on its own node instead of this one.
+      if (error instanceof InjectionError && body.node && body.node !== pinned) error.extra.code = 'SESSION_ELSEWHERE';
+      throw error;
+    }
     // A session being moved between nodes is stopped on purpose while its files are
     // carried: only the move itself may start it again. A single-node install has
     // never recorded a move, so it never reads the directory.
@@ -11565,6 +11573,12 @@ async function openSession(body, deps = {}) {
         if (external) throw new InjectionError(409,
           `a Pi process outside Keep is running (pid ${external.pid}); exit it before resuming this session`, { pid: external.pid });
       }
+    }
+    // A card agent's check resumes a reaped session and never types into a live one:
+    // the scheduler offers a live one the check itself, where a busy turn is waited
+    // for (runs.js). A pane found up here is refused, before anything is sent.
+    if (target && deps.resumeClosedOnly) {
+      throw new InjectionError(409, `session ${session.id.slice(0, 8)} is already running`, { code: 'HOME_LIVE' });
     }
     if (target) {
       return withInjectionLock(async () => {

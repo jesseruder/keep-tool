@@ -464,25 +464,45 @@ function cardAgent(task, root = keep.ROOT) {
 
 // The session a card agent's checks go back into, so the agent keeps one
 // conversation on its card instead of a new session every day. `homes` on the
-// record maps a card to the session its last check ran in; an agent that ran
-// before homes were recorded falls back to the card's last linked session, but
-// only when the record says this card is the one it worked on. Empty when there
-// is none, and a fresh session is opened as before.
+// record maps a card to the session its last check ran in, and it must still be
+// linked to the card (a card open resumes only its own sessions).
+//
+// An agent that ran before homes were recorded has none. Its home is then the
+// card's last linked Claude session, but only on evidence that session was the
+// agent: it checked in on the card within two hours of the agent's last event on
+// this card (a check session checks in and emits its report together). Owner's
+// own session on the card, linked later, has no such check-in and is not taken.
+// Empty when there is none, and a fresh session is opened as before.
+//
+// Only a record in the 'scheduled check' role has a home, which is also what keeps
+// a responder's or the reviewer's session from ever being reached through a card.
 const SESSION_ID_RE = /^[A-Za-z0-9_-]+$/;
+const HOME_EVIDENCE_MS = 2 * 3600e3;
 function agentHomeSession(agentName, task, agentApi, root = keep.ROOT) {
   if (!agentName || !task) return '';
   let record = null;
   try { record = agentApi.readRecord(agentName, root); } catch {}
   if (!record || record.role !== 'scheduled check') return '';
+  const linked = (task.fm.sessions || []).filter((entry) => entry && typeof entry.id === 'string'
+    && SESSION_ID_RE.test(entry.id) && (!entry.agent || entry.agent === 'claude'));
   const homes = record.homes && typeof record.homes === 'object' && !Array.isArray(record.homes) ? record.homes : {};
   if (Object.prototype.hasOwnProperty.call(homes, task.id)) {
     const id = homes[task.id];
-    return typeof id === 'string' && SESSION_ID_RE.test(id) ? id : '';
+    return typeof id === 'string' && linked.some((entry) => entry.id === id) ? id : '';
   }
-  const worked = record.card === task.id || (record.lastEvent && record.lastEvent.card === task.id);
-  const last = worked ? (task.fm.sessions || []).slice(-1)[0] : null;
-  const id = last && typeof last.id === 'string' ? last.id : '';
-  return SESSION_ID_RE.test(id) && (!last.agent || last.agent === 'claude') ? id : '';
+  const event = record.lastEvent;
+  const last = linked.slice(-1)[0];
+  if (!last || !event || event.card !== task.id || !Number(event.at)) return '';
+  const checkedIn = checkinFromSessionAt(task, last.id, 0);
+  return checkedIn && Math.abs(checkedIn - Number(event.at)) <= HOME_EVIDENCE_MS ? last.id : '';
+}
+
+// The agent name on a card, for the scheduler's own loop: a usable name, without
+// cardAgent's read of the incident areas (the open below still goes through
+// cardAgent). agentHomeSession's role check is what refuses a responder's name here.
+function cardAgentName(task) {
+  const name = task && task.fm && typeof task.fm.agent === 'string' ? task.fm.agent.trim() : '';
+  return name && require('./agents.js').validName(name) ? name : '';
 }
 
 // The record's card→session map with this card's home set, merged into the same
@@ -494,6 +514,40 @@ function withAgentHome(agentApi, agentName, taskId, sessionId, root = keep.ROOT)
     ? { ...record.homes } : {};
   homes[taskId] = sessionId;
   return homes;
+}
+
+// Forget a card's home after its resume was refused, so the next run opens fresh
+// instead of failing on the same session every day.
+function forgetAgentHome(agentApi, agentName, taskId, root = keep.ROOT) {
+  try {
+    agentApi.writeRecord(agentName, { homes: withAgentHome(agentApi, agentName, taskId, '', root) }, { root });
+  } catch (error) {
+    process.stderr.write(`keep runs: could not forget ${agentName}'s session for ${taskId}: ${error.message}\n`);
+  }
+}
+
+// The same home, read again just before the open: the record's `ensure` above may
+// have been the first write, and a home that changed meanwhile is not resumed.
+function homeSessionIfStill(agentApi, agentName, task, home, root) {
+  return agentHomeSession(agentName, task, agentApi, root) === home ? home : '';
+}
+
+// When a check was last typed into a card agent's live home pane, by session. The
+// sweep reads it so a pane still up from an earlier check is judged on this one: its
+// earlier check-in does not make it finished. In memory only: after a daemon restart
+// the pane is judged from its launch, and at worst it is closed and resumed next run.
+const homeDeliveries = new Map();
+
+// A check typed into an agent's live home: the sweep judges the pane on it from now.
+function noteHomeDelivery(sessionId) { homeDeliveries.set(sessionId, Date.now()); }
+
+// The account a session is pinned to, from its durable record; '' when it has none
+// and the pool's pick stands.
+function sessionAccountId(sessionId, root = keep.ROOT) {
+  try {
+    const location = require('./accounts.js').sessionLocation(sessionId, { root });
+    return (location && location.accountId) || '';
+  } catch { return ''; }
 }
 
 // The account a scheduled check spends against: the automation pool's pick for the
@@ -793,8 +847,15 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
   // one-per-day allowance and is never refused for it, but it does write the same
   // TTL'd stamp, so the tick a minute later does not open a second pane on the card.
   const enforce = opts.enforce !== false;
+  const root = opts.root || keep.ROOT;
+  const agentApi = opts.agents || require('./agents.js');
+  // A card agent goes back into its own session, which runs on its own account: the
+  // budget is that account's, not the pool's pick for a fresh session.
+  let agentName = (opts.cardAgent || cardAgent)(task, root);
+  const home = agentName ? agentHomeSession(agentName, task, agentApi, root) : '';
+  const homeAccountId = home ? (opts.sessionAccountId || sessionAccountId)(home, root) : '';
   if (enforce) {
-    const refusal = (opts.refusal || freshOpenRefusal)(task, today, accountId);
+    const refusal = (opts.refusal || freshOpenRefusal)(task, today, homeAccountId || accountId);
     if (refusal) return { ...refusal, errors: [] };
   }
   // Reserved before the await, not counted after it. Opening a session is async, and
@@ -808,8 +869,6 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
   // exists before the session does (an emit for a name with no record is dropped),
   // the opener stamps the pane with the name, and the record then carries the
   // session so the agent's row under Agents shows it working on this card.
-  let agentName = (opts.cardAgent || cardAgent)(task, opts.root || keep.ROOT);
-  const agentApi = opts.agents || require('./agents.js');
   if (agentName) {
     try {
       const record = agentApi.ensure(agentName, {
@@ -827,22 +886,36 @@ async function openFreshCheckSessionOnce(task, opts = {}) {
     }
   }
   const message = checkDeliveryMessage(task, { probe: opts.probe });
-  const root = opts.root || keep.ROOT;
   let opened;
   try {
-    // A card agent goes back into its own session: typed in if its pane is still
-    // up, resumed if not. Only a session that cannot be resumed here (a refusal
-    // before anything launched: gone, on another node than the agent's placement,
-    // pinned to an account that is not available) falls through to a fresh one,
-    // which becomes the home from then on. A resume keeps the session's own account
-    // and model, so neither is passed.
-    const home = agentName ? agentHomeSession(agentName, task, agentApi, root) : '';
-    if (home) {
+    // A card agent goes back into its own session. The scheduler already offered the
+    // check to it if its pane is up (deliverToThread), so this resumes a reaped one;
+    // `resumeClosedOnly` makes the open refuse (HOME_LIVE) rather than type into a
+    // pane that turned out to be up, which may be mid-turn — that is a deferral, and
+    // the next tick offers it again. A resume keeps the session's own account and
+    // model, so neither is passed.
+    //
+    // Exactly one refusal falls through to a fresh session: SESSION_ELSEWHERE, the
+    // session runs on another node than the agent is placed on, decided before
+    // anything launched. Anything else is this open failing: a refusal forgets the
+    // home so the next run opens fresh, and nothing is opened beside a pane that a
+    // late failure may already have started.
+    if (home && home === homeSessionIfStill(agentApi, agentName, task, home, root)) {
       try {
-        opened = await open({ taskId: task.id, sessionId: home, agentName, message }, {});
+        opened = await open({ taskId: task.id, sessionId: home, agentName, message }, { resumeClosedOnly: true });
       } catch (error) {
-        if (!error || (error.status !== 400 && error.status !== 409)) throw error;
-        process.stderr.write(`keep runs: agent ${agentName} could not go back into ${sessionRef(home)} for ${task.id} (${error.message}); opening a fresh session\n`);
+        const code = error && (error.code || (error.extra && error.extra.code));
+        if (code === 'HOME_LIVE') {
+          if (enforce && reservedIn === allowanceTick) freshOpensThisTick = Math.max(0, freshOpensThisTick - 1);
+          return { skipped: 'home-busy', reason: error.message, errors: [] };
+        }
+        if (code !== 'SESSION_ELSEWHERE') {
+          if (error && (error.status === 400 || error.status === 409) && !(error.extra && error.extra.launch)) {
+            forgetAgentHome(agentApi, agentName, task.id, root);
+          }
+          throw error;
+        }
+        process.stderr.write(`keep runs: agent ${agentName} cannot go back into its session ${home.slice(0, 8)} for ${task.id} (${error.message}); opening a fresh session\n`);
       }
     }
     opened ||= await open({
@@ -986,10 +1059,14 @@ function checkinFromSessionAt(task, sessionId, since) {
 //
 // The one rule that is never traded away: a session mid-turn is never closed. An
 // interactive session is the point — it may still be finishing the check.
-function reapEphemeralPane({ pane, session, checkedInAt = 0, now = Date.now() } = {}, idleMs = EPHEMERAL_IDLE_MS) {
+//
+// `deliveredAt` is when a later check was typed into this same pane (a card agent's
+// home, homeDeliveries): from then on it is that check the pane is running, so only
+// a check-in after it counts, and its idle clock starts there too.
+function reapEphemeralPane({ pane, session, checkedInAt = 0, now = Date.now(), deliveredAt = 0 } = {}, idleMs = EPHEMERAL_IDLE_MS) {
   const meta = (pane && pane.meta) || {};
   if (!meta.ephemeral) return { reap: false, reason: 'not a scheduler-opened pane' };
-  const launchedAt = Number(meta.launchedAt) || 0;
+  const launchedAt = Math.max(Number(meta.launchedAt) || 0, Number(deliveredAt) || 0);
   // Compared by minute, because a card log stamp has no seconds: a session opened at
   // 12:00:20 that checked in at 12:00 did check in after its launch. checkinFromSessionAt
   // has already decided which entries are in window, so anything it returns counts.
@@ -1095,8 +1172,9 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
     }
     let card = null;
     if (pane.meta.card) { try { card = keep.loadTask(pane.meta.card); } catch {} }
-    const checkedInAt = checkinFromSessionAt(card, sessionId, Number(pane.meta.launchedAt) || 0);
-    const decision = reapEphemeralPane({ pane, session, checkedInAt, now });
+    const deliveredAt = homeDeliveries.get(sessionId) || 0;
+    const checkedInAt = checkinFromSessionAt(card, sessionId, Math.max(Number(pane.meta.launchedAt) || 0, deliveredAt));
+    const decision = reapEphemeralPane({ pane, session, checkedInAt, now, deliveredAt });
     if (!decision.reap) continue;
     const label = `${pane.meta.ephemeral} session pane ${pane.id} for ${pane.meta.card || 'no card'}`;
     // An account transfer stops the source agent on purpose, so mid-transfer the pane
@@ -1443,8 +1521,12 @@ async function schedulerTick() {
       // A card agent's check goes to the agent's own session and no other linked
       // thread (the one that set the card up is not the agent), recurring or not.
       // When that session is not up, the open below resumes it.
-      const agentName = cardAgent(t);
+      const agentName = cardAgentName(t);
       const home = agentName ? agentHomeSession(agentName, t, require('./agents.js')) : '';
+      // A busy home is waited for, however long: typing into it would land the check
+      // in the middle of other work, and opening beside it is the second session this
+      // exists to prevent. Offered again every tick until it is idle.
+      if (home && threadBusy) continue;
       if (!threadBusy && (!recurring || home)) {
         let delivery = null;
         try {
@@ -1463,8 +1545,9 @@ async function schedulerTick() {
             deferrals: deferred,
             maxDeferrals: MAX_DELIVER_DEFERRALS,
           }) === 'open-after-deferrals';
-          if (!threadBusy) continue;
+          if (!threadBusy || home) continue;
         } else if (delivery) {
+          if (home && delivery.sessionId === home) noteHomeDelivery(home);
           try {
             writeDeliveryStamp(t, delivery);
             require('./delivery').acknowledge(path.join(keep.ROOT, '.keep', 'delivery'), checkDeliveryMessage(t), checkDeliveryKey(t));
@@ -1542,6 +1625,7 @@ function _resetSchedulerState() {
   schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map(), deferred: new Map(), openedAt: new Map() };
   try { fs.unlinkSync(SCHEDULER_STATE_FILE); } catch {}
   openInFlight.clear();
+  homeDeliveries.clear();
   resetTickAllowance();
   deferrals.clear();
   probesInFlight.clear();

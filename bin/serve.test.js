@@ -8583,7 +8583,23 @@ test('a card open may name one of the card\'s linked sessions, and only one of t
     (error) => error.status === 409 && /not linked to card/.test(error.message));
   await assert.rejects(openSession({ taskId: 'card', sessionId: '../x', message: 'check' }, deps),
     (error) => error.status === 400);
+  // A card agent's check resumes only a closed session: a live one is refused, by
+  // code, before anything is typed into it.
+  await assert.rejects(openSession({ taskId: 'card', sessionId: 'agent-home', message: 'check' }, { ...deps, resumeClosedOnly: true }),
+    (error) => error.status === 409 && error.extra.code === 'HOME_LIVE');
   assert.equal(sent.length, 1);
+});
+
+test('a resume asked for on another node than the session runs on is refused as SESSION_ELSEWHERE', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-elsewhere-'));
+  try {
+    const task = { fm: { project: os.tmpdir(), sessions: [{ id: 'agent-home', agent: 'claude' }] } };
+    const env = { ...process.env, KEEP_DIR: root, KEEP_DAEMON_NODE: 'mac' };
+    await assert.rejects(openSession({ taskId: 'card', sessionId: 'agent-home', message: 'check', node: 'aws1' }, {
+      root, env, loadTask: () => task,
+      placementNodes: [{ name: 'mac' }, { name: 'aws1' }], daemonNode: 'mac',
+    }), (error) => error.status === 409 && error.extra.code === 'SESSION_ELSEWHERE');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('open uses host panes for both existing sessions and new Claude and Codex launches', async () => {
