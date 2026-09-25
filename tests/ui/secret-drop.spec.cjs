@@ -117,6 +117,12 @@ test('a refused write keeps the value and says why; the next request takes the p
   await expect(panel(page).locator('.sd-value')).toBeFocused();
   await expect(panel(page).locator('.sd-more')).toHaveCount(0);
   expect(fixture.secretWrites).toEqual([{ id: 'a1b2c3d4', value: 'tok-1' }]);
+  // And the next one saves too: the answered card's busy state does not carry over.
+  await page.keyboard.type('tok-2');
+  await expect(panel(page).locator('.sd-save')).toBeEnabled();
+  await page.keyboard.press('Enter');
+  await expect(panel(page)).toBeHidden();
+  expect(fixture.secretWrites).toEqual([{ id: 'a1b2c3d4', value: 'tok-1' }, { id: 'b2c3d4e5', value: 'tok-2' }]);
 });
 
 test('declining sends the reason and clears the panel', async ({ page }) => {

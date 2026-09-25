@@ -220,6 +220,9 @@ export function syncSecretDrop(stage, ctx, item) {
   root.dataset.requestId = request.id;
   root.dataset.node = request.node;
   delete root.dataset.done;
+  // The busy mark of the request answered before this one lives on the container, not
+  // the card: left on, it kept the next card's Save disabled for good.
+  root.classList.remove('busy');
   root.hidden = false;
   install(root, ctx, request);
   setFolded(root, later.has(request.id));
