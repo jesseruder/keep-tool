@@ -93,7 +93,7 @@ Before anything that touches shared hardware or shared state — a runtime-image
 promotion or rollback, an AMI pin-back, a terraform apply, terminating a host, a
 database write — run `keep who cauldron-game-server` and claim the hold the runbook
 names, for as long as the runbook says the operation takes:
-`keep hold cauldron-game-server --scope runtime-image --for +1h -m "why"` for the
+`keep hold cauldron-game-server --scope runtime-image --for +2h -m "why"` for the
 runtime image, `--scope terraform --for +2h` for an apply, plus `--scope fleet` whenever
 instances will refresh or a host is terminated (a refresh drains for up to an hour, so
 never hold it for less). `keep release <id>` the moment you are done. The scopes in
