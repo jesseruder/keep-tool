@@ -16444,7 +16444,7 @@ function start(deps = {}) {
         bodyLimit: (pathname) => (pathname === '/api/hook' ? require('./hook-route.js').BODY_MAX_BYTES
           : pathname === '/api/artifact' ? require('./registry-commands.js').ARTIFACT_BODY_MAX_BYTES : undefined),
         // Artifact uploads are admitted before their body is read (bin/artifact-route.js).
-        admit: (pathname, who, res) => (pathname === '/api/artifact' && ctx.artifactService ? ctx.artifactService.admit(who, res) : null),
+        admit: (pathname, who) => (pathname === '/api/artifact' && ctx.artifactService ? ctx.artifactService.admit(who) : null),
         tokenStore: nodeApi.createNodeTokenStore({ initial: nodeTokenMap, read: () => nodes.nodeApiTokens(keep.ROOT) }),
         json,
         onMutation: () => dashboardPublisher?.invalidate(),

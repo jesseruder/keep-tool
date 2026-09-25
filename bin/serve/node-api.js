@@ -52,11 +52,13 @@ function createNodeApiHandler(options) {
     routes, matchRoute, routeDenial, readBody, principal, tokenStore,
     json = writeJson, onMutation = null, log = (line) => process.stderr.write(`${line}\n`),
     bodyLimit = () => undefined,
-    // (pathname, principal) => null to proceed, or { status, body, headers } to answer
-    // before the body is read. A route whose body is large (an artifact upload)
-    // admits a bounded number at a time, and one it turns away never costs the
-    // daemon the buffering and parsing of what it sent. An admitted request is
-    // released when its response closes, however it ends.
+    // (pathname, principal) => null to proceed unadmitted, { status, body, headers }
+    // to answer before the body is read, or { release } for an admitted request. A
+    // route whose body is large (an artifact upload) admits a bounded number at a
+    // time, and one it turns away never costs the daemon the buffering and parsing of
+    // what it sent. An admitted request is released when its processing settles,
+    // here in the finally, never when its client goes: a client that uploads and
+    // disconnects leaves its run, and its body, alive until that run is done.
     admit = () => null,
   } = options;
   const identify = (req) => {
@@ -73,6 +75,7 @@ function createNodeApiHandler(options) {
     return who && who.class === 'node' && typeof who.node === 'string' && who.node ? who : null;
   };
   return async (req, res) => {
+    let release = null;
     try {
       const who = identify(req);
       if (!who) return json(res, 403, { error: 'unauthorized' });
@@ -80,11 +83,12 @@ function createNodeApiHandler(options) {
       let body;
       if (req.method === 'POST') {
         if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
-        const refusal = admit(url.pathname, who, res);
-        if (refusal) {
+        const admission = admit(url.pathname, who);
+        if (admission && typeof admission.release === 'function') release = admission.release;
+        else if (admission) {
           // Answered without reading the body: Node discards what the client still
           // sends, so it receives this answer rather than a reset.
-          return json(res, refusal.status, refusal.body, refusal.headers);
+          return json(res, admission.status, admission.body, admission.headers);
         }
         const limit = bodyLimit(url.pathname);
         try { body = await (limit ? readBody(req, limit) : readBody(req)); } catch (error) { return json(res, 400, { error: error.message }); }
@@ -103,6 +107,8 @@ function createNodeApiHandler(options) {
         if (!res.headersSent) json(res, 500, { error: error.message });
         else res.end();
       } catch {}
+    } finally {
+      if (release) release();
     }
   };
 }

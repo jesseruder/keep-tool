@@ -1173,15 +1173,102 @@ function artifactFiles(id) {
   return files;
 }
 
-function filesIdentical(left, right) {
-  let leftStat;
-  let rightStat;
+// Whether the regular file already at `existing` in a card's artifacts directory holds
+// the same bytes as `source`. It is opened without following a link, and the open
+// file must be the one the path names: a link planted there is refused rather than
+// read, so it can neither be followed to another file nor serve as an oracle for
+// that file's contents.
+function artifactIdentical(source, existing) {
+  let fd;
+  try { fd = fs.openSync(existing, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)); }
+  catch (error) {
+    if (error.code === 'ELOOP') die(`an artifact path is a link; remove it: ${existing}`);
+    throw error;
+  }
   try {
-    leftStat = fs.statSync(left);
-    rightStat = fs.statSync(right);
-  } catch { return false; }
-  return leftStat.isFile() && rightStat.isFile() && leftStat.size === rightStat.size
-    && fs.readFileSync(left).equals(fs.readFileSync(right));
+    const opened = fs.fstatSync(fd);
+    const named = fs.lstatSync(existing);
+    if (!opened.isFile() || !sameFileIdentity(opened, named)) die(`an artifact path is not a plain file; remove it: ${existing}`);
+    const sourceStat = fs.statSync(source);
+    return sourceStat.size === opened.size && fs.readFileSync(fd).equals(fs.readFileSync(source));
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function sameFileIdentity(left, right) {
+  return Boolean(left && right) && left.dev === right.dev && left.ino === right.ino;
+}
+
+// Removes `file` only while the path still names the file this process created
+// (`identity`, its fstat): whatever took its place is someone else's and is left.
+function removeIfCreated(file, identity) {
+  try { if (sameFileIdentity(fs.lstatSync(file), identity)) fs.unlinkSync(file); } catch {}
+}
+
+// Creates `destination` in the verified card directory and copies `source` into it
+// through the new descriptor. Node has no openat, so the strongest check available is
+// made: the file is created exclusively without following a link (an existing link
+// is EEXIST, never a target), and before any byte is written its descriptor must be
+// the file a fresh lstat of the path names, in a parent that still resolves to the
+// verified directory. Returns the created file's identity; throws EEXIST when the
+// name is taken.
+function createArtifactCopy(source, destination, realDirectory) {
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0);
+  const fd = fs.openSync(destination, flags, 0o666);
+  let identity = null;
+  try {
+    identity = fs.fstatSync(fd);
+    let named = null;
+    let parent = null;
+    try { named = fs.lstatSync(destination); parent = fs.realpathSync(path.dirname(destination)); } catch {}
+    if (!sameFileIdentity(identity, named) || parent !== realDirectory) {
+      die(`${destination} changed while it was being created; refusing to store artifacts through it`);
+    }
+    const input = fs.openSync(source, 'r');
+    try {
+      const buffer = Buffer.alloc(1024 * 1024);
+      for (;;) {
+        const read = fs.readSync(input, buffer, 0, buffer.length, null);
+        if (!read) break;
+        for (let written = 0; written < read;) written += fs.writeSync(fd, buffer, written, read - written);
+      }
+    } finally { fs.closeSync(input); }
+    identity = fs.fstatSync(fd);
+  } catch (error) {
+    fs.closeSync(fd);
+    removeIfCreated(destination, identity);
+    throw error;
+  }
+  fs.closeSync(fd);
+  return identity;
+}
+
+// For each path: the index entry it had if it was staged (differed from HEAD), or
+// null if it was not. `git diff --cached` names the staged ones; `ls-files -s` gives
+// their entries to put back.
+function artifactIndexSnapshot(paths) {
+  const staged = new Set(git('diff', '--cached', '--name-only', '-z', '--', ...paths).split('\0').filter(Boolean));
+  const snapshot = new Map();
+  for (const file of paths) {
+    if (!staged.has(file)) { snapshot.set(file, null); continue; }
+    const entry = git('ls-files', '-s', '-z', '--', file).split('\0').filter(Boolean)[0] || '';
+    const match = entry.match(/^(\d+) ([0-9a-f]+) \d\t/);
+    snapshot.set(file, match ? { mode: match[1], object: match[2] } : { removed: true });
+  }
+  return snapshot;
+}
+
+function restoreArtifactIndex(snapshot) {
+  const unstaged = [...snapshot].filter(([, entry]) => entry === null).map(([file]) => file);
+  if (unstaged.length) { try { git('reset', '-q', '--', ...unstaged); } catch {} }
+  for (const [file, entry] of snapshot) {
+    if (!entry) continue;
+    try {
+      if (entry.removed) git('rm', '-q', '--cached', '--ignore-unmatch', '--', file);
+      else git('update-index', '--cacheinfo', `${entry.mode},${entry.object},${file}`);
+    } catch {}
+  }
 }
 
 // Where each stored file came from, for the card log. A node's files reach this CLI
@@ -1202,7 +1289,14 @@ function artifactOrigins(sources, env = process.env) {
 // The card's artifacts directory, made if it is missing and refused unless it is a
 // real directory whose resolved path is the registry's own .keep/artifacts/<card>: a
 // symbolic link planted there (or at .keep/artifacts) would send the copies, and
-// the commit's view of them, somewhere else.
+// the commit's view of them, somewhere else. Returns { directory, realDirectory }.
+//
+// The model these checks answer to: the registry is on Owner's machine, and a
+// process of the same user that can swap directories under .keep can already edit
+// any card directly. So they are against links that were planted and left there,
+// not against an active racer with the same uid; the copies re-check the directory
+// once each (createArtifactCopy) because that costs nothing, not because it closes
+// every window.
 function artifactDirectory(id) {
   const base = path.join(META, 'artifacts');
   const directory = path.join(base, id);
@@ -1214,7 +1308,7 @@ function artifactDirectory(id) {
   }
   const expected = path.join(fs.realpathSync(META), 'artifacts', id);
   if (fs.realpathSync(directory) !== expected) die(`${directory} does not resolve inside the registry's .keep/artifacts; refusing to store artifacts through it`);
-  return directory;
+  return { directory, realDirectory: expected };
 }
 
 commands.artifact = (argv, deps = {}) => {
@@ -1248,74 +1342,61 @@ commands.artifact = (argv, deps = {}) => {
 
   const stored = withLock(() => {
     const task = loadTask(id);
-    const directory = artifactDirectory(id);
+    const { directory, realDirectory } = artifactDirectory(id);
     const results = [];
-    const createdDestinations = [];
+    // { destination, identity } for each file this call created, so a rollback
+    // removes only what is still that file.
+    const created = [];
     const cleanupCreated = () => {
-      for (const destination of createdDestinations) {
-        try { fs.unlinkSync(destination); } catch {}
-      }
+      for (const entry of created) removeIfCreated(entry.destination, entry.identity);
     };
-    // A copy that fails part way leaves a partial file under a name nobody else
-    // owned (COPYFILE_EXCL): it is removed before the error goes on.
-    const copyExclusive = (source, destination) => {
-      try { fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL); }
-      catch (error) {
-        if (error.code !== 'EEXIST') { try { fs.unlinkSync(destination); } catch {} }
+    const tryCreate = (source, destination) => {
+      try {
+        const identity = createArtifactCopy(source, destination, realDirectory);
+        created.push({ destination, identity });
+        return identity;
+      } catch (error) {
+        if (error.code === 'EEXIST') return null;
         throw error;
       }
     };
     const taskFile = taskPath(task.id);
     const taskBefore = fs.readFileSync(taskFile);
-    let staged = null;
+    // The index entries of the paths about to be staged, as they were: a rollback
+    // puts back an entry that was already staged and unstages only what this call
+    // added, so a change Owner had staged to the card survives a failed store.
+    let indexBefore = null;
     try {
       for (const source of sources) {
         const basename = path.basename(source);
         const preferred = path.join(directory, basename);
         let destination = preferred;
-        let created = false;
-        try {
-          copyExclusive(source, destination);
-          created = true;
-        } catch (error) {
-          if (error.code !== 'EEXIST') throw error;
-          if (!filesIdentical(source, preferred)) {
-            const ext = path.extname(basename);
-            const stem = ext ? basename.slice(0, -ext.length) : basename;
-            for (let timestamp = Date.now(); ; timestamp++) {
-              destination = path.join(directory, `${stem}-${timestamp}${ext}`);
-              try {
-                copyExclusive(source, destination);
-                created = true;
-                break;
-              } catch (copyError) {
-                if (copyError.code !== 'EEXIST') throw copyError;
-              }
-            }
+        let identity = tryCreate(source, destination);
+        if (!identity && !artifactIdentical(source, preferred)) {
+          const ext = path.extname(basename);
+          const stem = ext ? basename.slice(0, -ext.length) : basename;
+          for (let timestamp = Date.now(); !identity; timestamp++) {
+            destination = path.join(directory, `${stem}-${timestamp}${ext}`);
+            identity = tryCreate(source, destination);
           }
         }
-        if (created) {
-          createdDestinations.push(destination);
-          const destinationStat = fs.statSync(destination);
-          if (destinationStat.size > limit) {
-            cleanupCreated();
-            die(`artifact too large: ${source} (${(destinationStat.size / 1024 / 1024).toFixed(1)} MB); trim or compress it before storing`);
-          }
+        if (identity && identity.size > limit) {
+          die(`artifact too large: ${source} (${(identity.size / 1024 / 1024).toFixed(1)} MB); trim or compress it before storing`);
         }
-        results.push({ source, destination, created });
+        results.push({ source, destination, created: Boolean(identity) });
       }
 
-      const text = results.map(({ source, destination, created }, index) =>
-        `${created ? 'Stored' : 'Already stored'} ${destination} (from ${origins[index]})`).join('\n');
+      const text = results.map(({ source, destination, created: made }, index) =>
+        `${made ? 'Stored' : 'Already stored'} ${destination} (from ${origins[index]})`).join('\n');
       appendLog(task, 'artifact', o.m != null ? `${text}\n${o.m}` : text);
       saveTask(task);
       const paths = [...new Set([
         ...results.filter((result) => result.created).map((result) => path.relative(ROOT, result.destination)),
         path.relative(ROOT, taskFile),
       ])];
+      indexBefore = artifactIndexSnapshot(paths);
       // .keep is otherwise ignored runtime state; only these immutable artifacts are
       // deliberately tracked. Never sweep up another card's artifacts or task.
-      staged = paths;
       git('add', '-f', '--', ...paths);
       commitAndPush(`keep: artifact ${id} (${sources.length} file${sources.length === 1 ? '' : 's'})`, paths, { staged: true });
       return results;
@@ -1324,7 +1405,7 @@ commands.artifact = (argv, deps = {}) => {
       // card, the index and the directory go back to how they were.
       cleanupCreated();
       try { fs.writeFileSync(taskFile, taskBefore); } catch {}
-      if (staged) { try { git('reset', '-q', '--', ...staged); } catch {} }
+      if (indexBefore) restoreArtifactIndex(indexBefore);
       throw error;
     }
   });

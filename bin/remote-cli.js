@@ -166,7 +166,10 @@ async function postWithRetry(where, pathname, payload, deps = {}) {
     const response = await request(where.url, pathname, { payload, token, timeoutMs: deps.timeoutMs });
     if (response.status === 503 && (parsed(response) || {}).error === 'daemon restarting') throw new Error('daemon restarting');
     // Turned away before it was read (an artifact upload while the daemon takes
-    // another): nothing ran, so the same key is resent after the wait it names.
+    // another): nothing ran, so the same key is resent after the wait it names. The
+    // answer comes after the whole body was sent, which the daemon discards; asking
+    // first (a lease, or Expect: 100-continue) so a busy daemon costs no upload is a
+    // follow-up.
     const value = response.status === 429 ? parsed(response) : null;
     if (value && value.busy === true) {
       const error = new Error(value.error || 'daemon busy');

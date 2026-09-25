@@ -1709,15 +1709,22 @@ by the ordinary three minutes plus the upload at 256 KiB/s. `keep artifact <card
 with no files lists the card's artifacts on the daemon.
 
 The daemon admits artifact uploads before it reads their body: one at a time per node
-and two in all. One turned away gets `429` with `busy: true` and `Retry-After`, and the
+and two in all, each held until its processing is done (a client that hangs up does
+not free it while its run goes on). One turned away gets `429` with `busy: true` and `Retry-After`, and the
 node's CLI says so once, waits and resends the same key, up to the same horizon as a
-command still running. An admitted upload is decoded a slice at a time and hashed and
-written as it goes. The node opens each file once and reads it from that descriptor,
+command still running (the body has been sent by then; asking first is a follow-up).
+An admitted upload is decoded a slice at a time, padding only at its end, and hashed,
+written and counted as it goes. The node opens each file once and reads it from that descriptor,
 after checking that the descriptor is the file the path resolves to under home both
 before and after the open, so a file swapped in between is refused. `keep artifact`
 itself refuses a card directory (or `.keep/artifacts`) that is a symbolic link or
-resolves anywhere but the registry's own `.keep/artifacts/<card>`, and a store that
-fails removes its copies and restores the card and the index.
+resolves anywhere but the registry's own `.keep/artifacts/<card>`. Each copy is created
+exclusively without following a link and written through its own descriptor once that
+descriptor is the file the path names in the verified directory; a name already taken
+by a link is refused, never read. A store that fails removes only the files it created,
+restores the card, unstages what it added and puts back any entry that was already
+staged. These guard against planted links: a process of the same user that can swap
+directories under `.keep` could edit any card directly.
 
 The same trust covers a check recipe: a node's `keep add` or `keep checkin` may carry
 `--check` and `--on-pass`, whose text the daemon later hands a session just as it types a

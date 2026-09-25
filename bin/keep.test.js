@@ -3429,3 +3429,58 @@ test('artifact refuses a card directory that is a symbolic link, and a failed st
     fs.rmSync(outside, { recursive: true, force: true });
   }
 });
+
+test('artifact never follows or reads through a link planted at a destination name, and a failed store keeps what was staged', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-artifact-dest-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-artifact-outside-'));
+  const run = (args) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), ...args], {
+    cwd: root, encoding: 'utf8', timeout: 15000, env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+  });
+  const git = (...args) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'));
+    fs.writeFileSync(path.join(root, '.gitignore'), '.keep/\nsource/\n');
+    assert.equal(git('init', '-q').status, 0);
+    git('config', 'user.name', 'Keep Test');
+    git('config', 'user.email', 'keep@example.test');
+    const keep = require('./keep.js');
+    for (const id of ['card', 'other']) {
+      fs.writeFileSync(path.join(root, 'tasks', `${id}.md`), keep.serializeTask({
+        id, fm: { title: 'Artifacts', status: 'active', kind: 'task', tags: ['personal'] }, body: '',
+      }));
+    }
+    git('add', '.gitignore', 'tasks');
+    assert.equal(git('commit', '-q', '-m', 'test fixture').status, 0);
+    fs.mkdirSync(path.join(root, 'source'));
+    const shot = path.join(root, 'source', 'shot.png');
+    fs.writeFileSync(shot, 'png');
+
+    // A link where the copy would go: neither written through nor read to compare.
+    const secret = path.join(outside, 'secret.png');
+    fs.writeFileSync(secret, 'png');
+    fs.mkdirSync(path.join(root, '.keep', 'artifacts', 'card'), { recursive: true });
+    fs.symlinkSync(secret, path.join(root, '.keep', 'artifacts', 'card', 'shot.png'));
+    const linked = run(['artifact', 'card', shot]);
+    assert.equal(linked.status, 1);
+    assert.match(linked.stderr, /an artifact path is a link; remove it: .*shot\.png/);
+    assert.equal(fs.readFileSync(secret, 'utf8'), 'png');
+    assert.deepEqual(fs.readdirSync(path.join(root, '.keep', 'artifacts', 'card')), ['shot.png']);
+
+    // A change to the card that Owner had staged survives a store whose commit fails.
+    const otherFile = path.join(root, 'tasks', 'other.md');
+    fs.writeFileSync(otherFile, `${fs.readFileSync(otherFile, 'utf8')}\nstaged by hand\n`);
+    git('add', 'tasks/other.md');
+    const stagedBlob = git('rev-parse', ':tasks/other.md').stdout.trim();
+    const worktreeBefore = fs.readFileSync(otherFile, 'utf8');
+    fs.writeFileSync(path.join(root, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const failed = run(['artifact', 'other', shot]);
+    assert.notEqual(failed.status, 0);
+    assert.equal(git('rev-parse', ':tasks/other.md').stdout.trim(), stagedBlob, 'the staged card is as it was');
+    assert.equal(fs.readFileSync(otherFile, 'utf8'), worktreeBefore);
+    assert.equal(git('diff', '--cached', '--name-only').stdout, 'tasks/other.md\n', 'nothing of the store stays staged');
+    assert.deepEqual(fs.readdirSync(path.join(root, '.keep', 'artifacts', 'other')), []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});

@@ -19,7 +19,8 @@
 // An upload is up to 20 MiB of files, base64-encoded in one JSON body, which the
 // node API buffers and parses before any route sees it. So uploads are admitted
 // before their body is read (admit(), called by the node API handler): one at a
-// time per node and ARTIFACT_UPLOADS_MAX across all of them. One turned away gets
+// time per node and ARTIFACT_UPLOADS_MAX across all of them, each held until its
+// processing settles (the handler's finally), not until its client disconnects. One turned away gets
 // 429 with `busy: true` and a Retry-After, and the node's CLI waits and resends it
 // under the same key (remote-cli postWithRetry). An admitted upload is decoded one
 // file at a time, in slices that yield to the event loop, and each slice is hashed
@@ -38,7 +39,9 @@ const {
 // keep-core loadTask's own rule for a card id.
 const CARD_RE = /^[a-z0-9][a-z0-9-]{0,127}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
-const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+// Base64 without padding, for every slice but the last; the last may end in padding.
+const BASE64_BODY_RE = /^[A-Za-z0-9+/]*$/;
+const BASE64_TAIL_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 const SOURCE_MAX_BYTES = 4096;
 const ARTIFACT_UPLOADS_PER_NODE = 1;
 const ARTIFACT_UPLOADS_MAX = 2;
@@ -89,28 +92,43 @@ function checkedFiles(value) {
   });
 }
 
-// Decodes `file.content` into `copy` a slice at a time, hashing as it goes, and drops
-// the encoded string once written. Throws RegistryError when the bytes are not
-// base64 or do not match the digest the node sent.
-async function writeDecoded(fsp, copy, file) {
+// Decodes `file.content` into `copy` a slice at a time, hashing and writing as it
+// goes, and drops the encoded string once taken. Slices are whole groups of four
+// characters and only the last may carry padding, so each decodes exactly as the
+// whole string would. Throws RegistryError, with the partial copy removed, when the
+// content is not base64, writes a different number of bytes than the node sent, or
+// does not match its digest.
+async function writeDecoded(fsp, copy, file, sliceChars = DECODE_SLICE_CHARS) {
   const hash = crypto.createHash('sha256');
   const handle = await fsp.open(copy, 'wx', 0o600);
+  let written = 0;
   try {
-    const content = file.content;
-    file.content = null;
-    for (let at = 0; at < content.length; at += DECODE_SLICE_CHARS) {
-      const slice = content.slice(at, at + DECODE_SLICE_CHARS);
-      if (!BASE64_RE.test(slice)) refuse(400, `${file.name}: content must be base64`);
-      const bytes = Buffer.from(slice, 'base64');
-      hash.update(bytes);
-      await handle.write(bytes);
-      // Between slices, the daemon's other work runs.
-      await new Promise((resolve) => setImmediate(resolve));
+    try {
+      const content = file.content;
+      file.content = null;
+      for (let at = 0; at < content.length; at += sliceChars) {
+        const last = at + sliceChars >= content.length;
+        const slice = content.slice(at, at + sliceChars);
+        if (!(last ? BASE64_TAIL_RE : BASE64_BODY_RE).test(slice)) refuse(400, `${file.name}: content must be base64`);
+        const bytes = Buffer.from(slice, 'base64');
+        hash.update(bytes);
+        for (let offset = 0; offset < bytes.length;) {
+          const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset);
+          offset += bytesWritten;
+        }
+        written += bytes.length;
+        // Between slices, the daemon's other work runs.
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    } finally {
+      await handle.close();
     }
-  } finally {
-    await handle.close();
+    if (written !== file.size) refuse(400, `${file.name}: ${written} bytes decoded, ${file.size} were sent`);
+    if (hash.digest('hex') !== file.sha256) refuse(400, `${file.name}: sha256 mismatch; the file changed or was damaged on the way`);
+  } catch (error) {
+    await fsp.rm(copy, { force: true }).catch(() => {});
+    throw error;
   }
-  if (hash.digest('hex') !== file.sha256) refuse(400, `${file.name}: sha256 mismatch; the file changed or was damaged on the way`);
 }
 
 // The request, checked field by field, before anything is adopted, journalled or
@@ -179,12 +197,12 @@ function createArtifactService(options = {}) {
     }
   }
 
-  // Admission, before the body is read: null to proceed, or the busy answer. The
-  // slot is held until the response closes, whether it was answered, refused later
-  // or dropped.
+  // Admission, before the body is read: { release } to proceed, or the busy answer.
+  // The caller releases the slot when the request's processing settles, however it
+  // ended; a client that disconnects early does not free it while its run goes on.
   const perNode = new Map();
   let uploads = 0;
-  function admit(principal, res) {
+  function admit(principal) {
     const who = principal && principal.class === 'node' ? `node:${principal.node}` : String(principal && principal.class);
     if ((perNode.get(who) || 0) >= ARTIFACT_UPLOADS_PER_NODE || uploads >= ARTIFACT_UPLOADS_MAX) {
       return {
@@ -196,14 +214,15 @@ function createArtifactService(options = {}) {
     perNode.set(who, (perNode.get(who) || 0) + 1);
     uploads += 1;
     let released = false;
-    res.once('close', () => {
-      if (released) return;
-      released = true;
-      uploads -= 1;
-      const left = perNode.get(who) - 1;
-      if (left > 0) perNode.set(who, left); else perNode.delete(who);
-    });
-    return null;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        uploads -= 1;
+        const left = perNode.get(who) - 1;
+        if (left > 0) perNode.set(who, left); else perNode.delete(who);
+      },
+    };
   }
 
   async function handle(principal, body) {
@@ -237,6 +256,6 @@ function createArtifactService(options = {}) {
 }
 
 module.exports = {
-  createArtifactService, validateArtifactRequest, checkedFiles, digestOf, CARD_RE,
+  createArtifactService, validateArtifactRequest, checkedFiles, digestOf, writeDecoded, CARD_RE,
   ARTIFACT_UPLOADS_PER_NODE, ARTIFACT_UPLOADS_MAX, BUSY_RETRY_MS, DECODE_SLICE_CHARS,
 };

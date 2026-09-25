@@ -245,30 +245,43 @@ test('a file larger than one decode slice is written whole and exact', async (t)
 });
 
 // Admission, before the node API reads a body: one upload per node, two in all.
-function fakeResponse() {
-  const res = new EventEmitter();
-  res.close = () => res.emit('close');
-  return res;
-}
-
-test('artifact uploads are admitted one per node and two in all, and a slot frees when its response closes', (t) => {
+test('artifact uploads are admitted one per node and two in all, and a slot frees once when released', (t) => {
   const { artifacts } = services(t);
-  const first = fakeResponse();
-  assert.equal(artifacts.admit(AWS1, first), null);
-  const busy = artifacts.admit(AWS1, fakeResponse());
+  const first = artifacts.admit(AWS1);
+  assert.equal(typeof first.release, 'function');
+  const busy = artifacts.admit(AWS1);
   assert.equal(busy.status, 429);
   assert.equal(busy.body.busy, true);
   assert.equal(busy.headers['retry-after'], '2');
-  const other = fakeResponse();
-  assert.equal(artifacts.admit({ class: 'node', node: 'aws2' }, other), null);
-  assert.equal(artifacts.admit({ class: 'node', node: 'aws3' }, fakeResponse()).status, 429, 'two in all');
-  first.close();
-  first.close();
+  assert.equal(typeof artifacts.admit({ class: 'node', node: 'aws2' }).release, 'function');
+  assert.equal(artifacts.admit({ class: 'node', node: 'aws3' }).status, 429, 'two in all');
+  first.release();
+  first.release();
   assert.equal(artifacts.uploads(), 1, 'a slot is freed once');
-  assert.equal(artifacts.admit(AWS1, fakeResponse()), null, 'admitted once the first finished');
+  assert.equal(typeof artifacts.admit(AWS1).release, 'function', 'admitted once the first finished');
 });
 
-test('through the node API a second upload from one node is turned away unread, and admitted after the first', async (t) => {
+test('the decoder refuses padding before the last slice and a byte count other than the one sent, and leaves no partial file', async (t) => {
+  const { writeDecoded } = require('./artifact-route.js');
+  const dir = tempDir(t);
+  const sha = (text) => crypto.createHash('sha256').update(text).digest('hex');
+  // "A" and "A" as two padded groups: each decodes alone, but padding mid-stream is not base64.
+  const padded = path.join(dir, 'padded.bin');
+  await assert.rejects(writeDecoded(fs.promises, padded, { name: 'padded.bin', content: 'QQ==QQ==', size: 2, sha256: sha('AA') }, 4),
+    /padded\.bin: content must be base64/);
+  assert.equal(fs.existsSync(padded), false);
+  const short = path.join(dir, 'short.bin');
+  await assert.rejects(writeDecoded(fs.promises, short, { name: 'short.bin', content: Buffer.from('abcdef').toString('base64'), size: 7, sha256: sha('abcdef') }, 4),
+    /short\.bin: 6 bytes decoded, 7 were sent/);
+  assert.equal(fs.existsSync(short), false);
+  const good = path.join(dir, 'good.bin');
+  await writeDecoded(fs.promises, good, { name: 'good.bin', content: Buffer.from('abcdefg').toString('base64'), size: 7, sha256: sha('abcdefg') }, 4);
+  assert.equal(fs.readFileSync(good, 'utf8'), 'abcdefg');
+});
+
+// A node API over a real socket, with the artifact service's first run held open
+// until the test lets it finish.
+async function heldNodeApi(t) {
   const http = require('node:http');
   const nodeApi = require('./serve/node-api.js');
   const { routes, matchRoute, routeDenial } = require('./serve/routes.js');
@@ -280,7 +293,6 @@ test('through the node API a second upload from one node is turned away unread, 
   const spawn = (...args) => {
     spawned += 1;
     const child = fake.spawn(...args);
-    // The first run is held open until the test lets it finish.
     if (spawned === 1) {
       const emit = child.emit.bind(child);
       child.emit = (name, ...rest) => (name === 'close' ? held.then(() => emit(name, ...rest)) : emit(name, ...rest));
@@ -289,13 +301,24 @@ test('through the node API a second upload from one node is turned away unread, 
   };
   const { artifacts, root } = services(t, { fake: { spawn, calls: fake.calls } });
   const read = [];
+  let peak = 0;
   const handler = nodeApi.createNodeApiHandler({
     routes: routes({ json: (res, status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); },
       nodeApiEnabled: () => true, artifactService: artifacts }),
     matchRoute, routeDenial, principal: keepConsole.principal, log: () => {},
     tokenStore: nodeApi.createNodeTokenStore({ initial: { aws1: 'aws1-secret' }, read: () => ({ aws1: 'aws1-secret' }) }),
-    readBody: (req) => new Promise((resolve) => { let data = ''; req.on('data', (c) => { data += c; }); req.on('end', () => { read.push(req.url); resolve(JSON.parse(data)); }); }),
-    admit: (pathname, who, res) => (pathname === '/api/artifact' ? artifacts.admit(who, res) : null),
+    readBody: (req) => new Promise((resolve, reject) => {
+      let data = '';
+      req.on('data', (c) => { data += c; });
+      req.on('error', reject);
+      req.on('end', () => { read.push(req.url); resolve(JSON.parse(data)); });
+    }),
+    admit: (pathname, who) => {
+      if (pathname !== '/api/artifact') return null;
+      const answer = artifacts.admit(who);
+      peak = Math.max(peak, artifacts.uploads());
+      return answer;
+    },
   });
   const server = http.createServer(handler);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -303,15 +326,49 @@ test('through the node API a second upload from one node is turned away unread, 
   const { nodeApiRequest } = require('./remote-cli.js');
   const url = `http://127.0.0.1:${server.address().port}`;
   const post = (key) => nodeApiRequest(url, '/api/artifact', { payload: body(root, { idempotencyKey: key }), token: 'aws1-secret', timeoutMs: 10e3 });
-  const first = post(`${KEY}-one`);
-  while (spawned === 0) await new Promise((resolve) => setTimeout(resolve, 5));
-  const second = await post(`${KEY}-two`);
+  // Sends a whole upload and hangs up without waiting for the answer.
+  const postAndAbort = (key) => new Promise((resolve) => {
+    const payload = JSON.stringify(body(root, { idempotencyKey: key }));
+    const req = http.request(`${url}/api/artifact`, {
+      method: 'POST', agent: false,
+      headers: { 'x-keep': '1', 'x-keep-node-token': 'aws1-secret', 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
+    });
+    req.on('error', () => resolve());
+    req.on('response', (res) => { res.resume(); res.on('end', resolve); });
+    req.end(payload, () => setTimeout(() => { req.destroy(); resolve(); }, 20));
+  });
+  const until = async (fn) => { while (!fn()) await new Promise((resolve) => setTimeout(resolve, 5)); };
+  return { artifacts, post, postAndAbort, release, read, until, spawned: () => spawned, peak: () => peak };
+}
+
+test('through the node API a second upload from one node is turned away unread, and admitted after the first', async (t) => {
+  const api = await heldNodeApi(t);
+  const first = api.post(`${KEY}-one`);
+  await api.until(() => api.spawned() === 1);
+  const second = await api.post(`${KEY}-two`);
   assert.equal(second.status, 429);
   assert.equal(JSON.parse(second.data).busy, true);
-  assert.equal(read.length, 1, 'the refused upload was never read');
-  release();
+  assert.equal(api.read.length, 1, 'the refused upload was never read');
+  api.release();
   assert.equal((await first).status, 200);
-  const again = await post(`${KEY}-two`);
+  const again = await api.post(`${KEY}-two`);
   assert.equal(again.status, 200, again.data);
   assert.equal(JSON.parse(again.data).stdout, 'stored\n');
+});
+
+test('an upload whose client hangs up holds its slot until its run ends, and a burst of hang-ups never runs two at once', async (t) => {
+  const api = await heldNodeApi(t);
+  await api.postAndAbort(`${KEY}-gone`);
+  await api.until(() => api.spawned() === 1);
+  assert.equal(api.artifacts.uploads(), 1, 'the run goes on after its client left, and so does its slot');
+  for (let i = 0; i < 5; i += 1) await api.postAndAbort(`${KEY}-burst-${i}`);
+  const refused = await api.post(`${KEY}-next`);
+  assert.equal(refused.status, 429);
+  assert.equal(api.read.length, 1, 'no upload behind it was read');
+  assert.equal(api.spawned(), 1);
+  assert.equal(api.peak(), 1, 'never more than one in flight for the node');
+  api.release();
+  await api.until(() => api.artifacts.uploads() === 0);
+  const admitted = await api.post(`${KEY}-next`);
+  assert.equal(admitted.status, 200, admitted.data);
 });
