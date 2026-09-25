@@ -34,7 +34,7 @@ test('the counter says length and lines, never the value', () => {
 
 test('the panel names the machine, the file and the key, escaped, with a masked field', () => {
   const html = secretDropHTML(esc, request(), { home: '/Users/j', more: 2 });
-  assert.match(html, /<code>GITHUB_TOKEN<\/code> <span class="sd-more">\+2 more<\/span>/);
+  assert.match(html, /<code>GITHUB_TOKEN<\/code> <span class="sd-more">3 waiting<\/span>/);
   assert.match(html, /release &lt;script&gt;/);
   assert.match(html, /<span class="sd-node">aws1<\/span> <code class="sd-path" title="\/Users\/j\/castle\/app\/.env">~\/castle\/app\/.env<\/code>/);
   assert.match(html, /<code>GITHUB_TOKEN=…<\/code> <span class="sd-note">new key/);

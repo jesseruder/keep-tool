@@ -102,7 +102,7 @@ test('the panel shows only on the session that asked, and hands the value off on
 test('a refused write keeps the value and says why; the next request takes the panel', async ({ page }) => {
   fixture.configure({ secretRequests: [request(), request({ id: 'b2c3d4e5', name: 'NPM_TOKEN', createdAt: Date.now() + 1 })],
     secretRefusal: '/Users/j/castle/app/.env is inside the git repository /Users/j/castle/app and is not gitignored' });
-  await expect(panel(page)).toContainText('+1 more');
+  await expect(panel(page)).toContainText('2 waiting');
   const field = panel(page).locator('.sd-value');
   await field.fill('tok-1');
   await panel(page).locator('.sd-save').click();
@@ -111,7 +111,11 @@ test('a refused write keeps the value and says why; the next request takes the p
   await expect(page.locator('#writeFailure')).toBeHidden();
   await panel(page).locator('.sd-save').click();
   await expect(panel(page)).toContainText('NPM_TOKEN');
+  // The next card says the last one went through, and takes the cursor.
+  await expect(panel(page).locator('.sd-saved')).toHaveText('✓ GITHUB_TOKEN saved on aws1');
   await expect(panel(page).locator('.sd-value')).toHaveValue('');
+  await expect(panel(page).locator('.sd-value')).toBeFocused();
+  await expect(panel(page).locator('.sd-more')).toHaveCount(0);
   expect(fixture.secretWrites).toEqual([{ id: 'a1b2c3d4', value: 'tok-1' }]);
 });
 

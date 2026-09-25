@@ -36,7 +36,10 @@ function displayPath(path, home) {
   return home && path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
 }
 
-export function secretDropHTML(esc, request, { home = '', more = 0 } = {}) {
+// The count beside the title when a session asked for several at once.
+export function waitingText(more) { return more ? `${more + 1} waiting` : ''; }
+
+export function secretDropHTML(esc, request, { home = '', more = 0, saved = '' } = {}) {
   const target = displayPath(request.path, home);
   const as = request.key
     ? `<div class="sd-row"><span class="sd-label">As</span><span><code>${esc(request.key)}=…</code> <span class="sd-note">${request.replace ? 'replaces the current value if there is one' : 'new key'}</span></span></div>`
@@ -44,7 +47,7 @@ export function secretDropHTML(esc, request, { home = '', more = 0 } = {}) {
   const field = request.multiline
     ? '<textarea class="sd-value masked" name="value" rows="4" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" aria-label="Secret value"></textarea>'
     : '<input class="sd-value" name="value" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" aria-label="Secret value">';
-  return `<div class="sd-card" role="dialog" aria-label="Secret requested"><div class="sd-head"><span class="sd-icon">${KEY_ICON}</span><div class="sd-titles"><div class="sd-title">Secret requested · <code>${esc(request.name)}</code>${more ? ` <span class="sd-more">+${more} more</span>` : ''}</div>${request.purpose ? `<div class="sd-purpose">${esc(request.purpose)}</div>` : ''}</div><button type="button" class="btn sd-later" title="Hide this over the terminal; the key button brings it back">Later</button></div>`
+  return `<div class="sd-card" role="dialog" aria-label="Secret requested">${saved ? `<div class="sd-saved" role="status">${esc(saved)}</div>` : ''}<div class="sd-head"><span class="sd-icon">${KEY_ICON}</span><div class="sd-titles"><div class="sd-title">Secret requested · <code>${esc(request.name)}</code>${more ? ` <span class="sd-more">${waitingText(more)}</span>` : ''}</div>${request.purpose ? `<div class="sd-purpose">${esc(request.purpose)}</div>` : ''}</div><button type="button" class="btn sd-later" title="Hide this over the terminal; the key button brings it back">Later</button></div>`
     + `<div class="sd-dest"><div class="sd-row"><span class="sd-label">Goes to</span><span><span class="sd-node">${esc(request.node)}</span> <code class="sd-path" title="${esc(request.path)}">${esc(target)}</code></span></div>${as}</div>`
     + `<form class="sd-form" autocomplete="off"><div class="sd-field">${field}<button type="button" class="btn sd-reveal" aria-pressed="false" title="Show the value">Show</button></div>`
     + '<div class="sd-shape mono" aria-live="polite"></div><div class="sd-error" role="alert" hidden></div>'
@@ -57,6 +60,11 @@ export function secretDropHTML(esc, request, { home = '', more = 0 } = {}) {
 // Requests Owner put off with Later, for this page's life only: the card stays
 // folded into its key button until he opens it again.
 const later = new Set();
+
+// The request just answered on this page, so the next one a session asked for opens
+// saying so and takes the cursor: without it the next card looked like the same one
+// refusing to close.
+let justAnswered = null;
 
 function setFolded(root, folded) {
   root.classList.toggle('folded', folded);
@@ -125,6 +133,7 @@ function install(root, ctx, request) {
       field.value = '';
       root.dataset.done = '1';
       root.hidden = true;
+      justAnswered = { sessionId: request.sessionId, text: `✓ ${request.name} saved on ${request.node}`, at: Date.now() };
       ctx.toast(`${request.name} written to ${displayPath(request.path, ctx.data?.scopes?.home)} on ${request.node}`);
       ctx.refresh();
     } catch (error) {
@@ -147,6 +156,7 @@ function install(root, ctx, request) {
       field.value = '';
       root.dataset.done = '1';
       root.hidden = true;
+      justAnswered = { sessionId: request.sessionId, text: `Declined ${request.name}`, at: Date.now() };
       ctx.toast(`Declined ${request.name}`);
       ctx.refresh();
     } catch (error) {
@@ -196,16 +206,21 @@ export function syncSecretDrop(stage, ctx, item) {
   const { request, more } = found;
   if (root.dataset.requestId === request.id && root.dataset.done !== '1') {
     const counter = root.querySelector('.sd-more');
-    if (counter) counter.textContent = more ? `+${more} more` : '';
+    if (counter) counter.textContent = waitingText(more);
     return;
   }
   // A request answered here stays hidden until the state stops listing it.
   if (root.dataset.requestId === request.id && root.dataset.done === '1') return;
-  root.innerHTML = secretDropHTML(ctx.esc, request, { home: ctx.data?.scopes?.home || '', more });
+  const answered = justAnswered && justAnswered.sessionId === request.sessionId && Date.now() - justAnswered.at < 15000
+    ? justAnswered : null;
+  justAnswered = null;
+  root.innerHTML = secretDropHTML(ctx.esc, request, { home: ctx.data?.scopes?.home || '', more, saved: answered?.text || '' });
   root.dataset.requestId = request.id;
   root.dataset.node = request.node;
   delete root.dataset.done;
   root.hidden = false;
   install(root, ctx, request);
   setFolded(root, later.has(request.id));
+  // Straight on to the next one, the way Owner was going.
+  if (answered && !later.has(request.id)) root.querySelector('.sd-value')?.focus();
 }
