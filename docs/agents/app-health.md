@@ -82,7 +82,8 @@ Then, all read-only:
    and write the newest last-modified time you saw as this pass's cursor — but only when
    paging reached a null `next_page_token`. If any page failed, judge what you got and
    carry the previous cursor unchanged, so the next pass reads the rest. With no cursor
-   yet (the first pass), judge the last 24 hours.
+   yet (the first pass), the previous cursor is 24 hours before this pass: judge from
+   there, and write that time as the cursor if paging failed.
 
 ## Today's baselines (measured 2026-09-25; update when they drift)
 
