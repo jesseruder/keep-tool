@@ -278,7 +278,10 @@ function createRegistryService(options = {}) {
       const started = now();
       let child;
       try {
-        child = spawn(execPath, [keepBin, ...argv], {
+        // `keep turns` opens node:sqlite, whose warning would otherwise reach the
+        // node's terminal with the answer; bin/keep passes the same flag.
+        const quiet = argv[0] === 'turns' ? ['--disable-warning=ExperimentalWarning'] : [];
+        child = spawn(execPath, [...quiet, keepBin, ...argv], {
           cwd, env, stdio: [stdin === null ? 'ignore' : 'pipe', 'pipe', 'pipe'], shell: false,
         });
       } catch (error) { reject(error); return; }

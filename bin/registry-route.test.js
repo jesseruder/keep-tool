@@ -248,6 +248,16 @@ test('a node runs only the reading turns subcommands', () => {
   }
 });
 
+test('a forwarded turns search runs with node:sqlite\'s warning silenced, and nothing else changes how it runs', async (t) => {
+  const { svc, root, calls } = service(t);
+  const turns = await svc.handle(AWS1, body(root, { command: 'turns', args: ['search', 'websocket'], idempotencyKey: `${KEY}-turns` }));
+  assert.equal(turns.status, 200, JSON.stringify(turns.body));
+  await svc.handle(AWS1, body(root, { command: 'list', args: [], idempotencyKey: `${KEY}-list` }));
+  assert.equal(calls[0].args[0], '--disable-warning=ExperimentalWarning');
+  assert.deepEqual(calls[0].args.slice(2), ['turns', 'search', 'websocket']);
+  assert.deepEqual(calls[1].args.slice(1), ['list']);
+});
+
 test('arguments are checked the way the CLI will read them', (t) => {
   assert.equal(argumentRefusal('checkin', ['card', '-m', 'line one\nline two']), null, 'the message may span lines');
   assert.equal(argumentRefusal('checkin', ['card', '--force', '-m', 'a\nb']), null, 'after a flag that takes no value');
