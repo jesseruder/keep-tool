@@ -26,17 +26,29 @@
 // file at a time, in slices that yield to the event loop, and each slice is hashed
 // and written as it is decoded, so no file is ever held decoded in memory whole.
 //
-// Admission bounds memory; two durable limits bound what is kept. Each node has a
-// rolling 24-hour quota of accepted bytes and files, in a ledger at
-// .keep/artifact-quota.json that survives restarts and records only uploads the CLI
-// stored, never refusals. The whole of .keep/artifacts has a cap, measured by a walk
-// that follows no link and cached for a minute. Both are checked first thing in the
-// journalled run, before any temporary file: inside it, so a resend of an upload
-// already accepted is answered from the journal rather than refused by a quota it
-// has itself used up, and so a node's uploads, serialised on its queue, are checked
-// and recorded one at a time. A refusal is a 413 naming the limit (and for the daily
-// one, when the window frees room); it throws before the CLI is spawned, so it
-// leaves no journal record and the node's CLI prints it without resending.
+// Admission bounds memory; durable limits bound what is kept. Each node has a
+// rolling 24-hour quota of bytes and files, and the whole of .keep/artifacts a cap
+// on bytes and on files (the file count bounds the names, card log lines and
+// history that tiny uploads would otherwise grow under the byte cap), measured by
+// a walk that follows no link and cached for a minute.
+//
+// They are kept in a ledger, .keep/artifact-quota.json, and changed only under one
+// process-wide lock (quotaLock), whichever node's queue the upload runs on: the
+// check and a reservation for the upload are one step, written before any
+// temporary file, so two uploads can never both pass on the same reading. A
+// reservation counts while it stands; the CLI storing the upload turns it into an
+// accepted entry, and anything else removes it. A reservation with no outcome past
+// RESERVATION_STALE_MS was left by a daemon that died, and is dropped when next read.
+//
+// The check runs first thing in the journalled run: there, so a resend of an upload
+// already accepted is answered from the journal rather than refused by the quota it
+// used, and a refusal throws before the CLI is spawned, leaving no journal record.
+// Past a limit the answer is a 413 naming it (and for the daily one, when room
+// frees), which the node prints without resending. A ledger that cannot be written
+// refuses the upload before anything is stored, with a 503 the node waits out and
+// resends: the quota never fails open. If the ledger cannot be written after the
+// store, the reservation stands and keeps counting; this process remembers that it
+// was stored and writes it as accepted at the next quota step.
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -47,6 +59,7 @@ const {
 const {
   ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, MAX_ARG_BYTES, artifactNameRefusal,
   ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES,
+  ARTIFACT_STORE_MAX_FILES,
 } = require('./registry-commands.js');
 
 // keep-core loadTask's own rule for a card id.
@@ -64,21 +77,44 @@ const DECODE_SLICE_CHARS = 1024 * 1024;
 const STORE_SIZE_CACHE_MS = 60e3;
 const mib = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 
-// The total size of the regular files under `dir`, walked with lstat: a link is
+// The run bound, with room: a reservation this old whose upload never reported
+// back belongs to a daemon that died with it in flight.
+const RESERVATION_STALE_MS = 10 * 60e3;
+const LEDGER_RETRY_MS = 30e3;
+
+// The regular files under `dir`, { bytes, files }, walked with lstat: a link is
 // neither followed nor counted.
 async function storeSize(fsp, dir) {
-  let total = 0;
+  const total = { bytes: 0, files: 0 };
   let names;
   try { names = await fsp.readdir(dir); }
-  catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return 0; throw error; }
+  catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return total; throw error; }
   for (const name of names) {
     const entry = path.join(dir, name);
     let stat;
     try { stat = await fsp.lstat(entry); } catch { continue; }
-    if (stat.isDirectory()) total += await storeSize(fsp, entry);
-    else if (stat.isFile()) total += stat.size;
+    if (stat.isDirectory()) {
+      const inner = await storeSize(fsp, entry);
+      total.bytes += inner.bytes;
+      total.files += inner.files;
+    } else if (stat.isFile()) {
+      total.bytes += stat.size;
+      total.files += 1;
+    }
   }
   return total;
+}
+
+// One chain per ledger file for the whole process: every quota step on it runs
+// after the one before has settled, whichever node's queue asked.
+const quotaChains = new Map();
+function quotaLock(file, fn) {
+  const tail = quotaChains.get(file) || Promise.resolve();
+  const run = tail.then(fn, fn);
+  const settled = run.then(() => {}, () => {});
+  quotaChains.set(file, settled);
+  settled.then(() => { if (quotaChains.get(file) === settled) quotaChains.delete(file); });
+  return run;
 }
 
 function refuse(status, message) { throw new RegistryError(status, message); }
@@ -202,51 +238,67 @@ function createArtifactService(options = {}) {
   const dailyFiles = options.dailyFiles || ARTIFACT_NODE_DAILY_FILES;
   const windowMs = options.quotaWindowMs || ARTIFACT_QUOTA_WINDOW_MS;
   const storeMaxBytes = options.storeMaxBytes || ARTIFACT_STORE_MAX_BYTES;
+  const storeMaxFiles = options.storeMaxFiles || ARTIFACT_STORE_MAX_FILES;
+  const staleMs = options.reservationStaleMs || RESERVATION_STALE_MS;
   const ledgerFile = path.join(root, '.keep', 'artifact-quota.json');
+  const log = options.log || ((text) => { try { process.stderr.write(`keep serve: ${text}\n`); } catch {} });
   let storeCache = null;
+  // Reservations whose upload was stored but whose flip to accepted could not be
+  // written: written as accepted at the next quota step, and never dropped as stale.
+  const storedUnrecorded = new Set();
 
-  // { node: [{ at, bytes, files }] }, only entries inside the window. An unreadable
-  // ledger is an error, not an empty one: starting over would reset every quota.
+  // [{ id, node, key, bytes, files, at, state }], accepted entries inside the window
+  // and reservations not yet stale. An unreadable ledger is an error, not an empty
+  // one: starting over would reset every quota.
   async function readLedger() {
     let raw;
     try { raw = await fsp.readFile(ledgerFile, 'utf8'); }
-    catch (error) { if (error.code === 'ENOENT') return {}; throw error; }
+    catch (error) { if (error.code === 'ENOENT') return []; throw error; }
     const value = JSON.parse(raw);
-    const nodes = value && value.version === 1 && value.nodes && typeof value.nodes === 'object' ? value.nodes : {};
-    const cutoff = now() - windowMs;
-    const kept = {};
-    for (const [node, entries] of Object.entries(nodes)) {
-      const live = (Array.isArray(entries) ? entries : []).filter((entry) => entry && Number(entry.at) > cutoff);
-      if (live.length) kept[node] = live;
-    }
-    return kept;
+    const entries = value && value.version === 2 && Array.isArray(value.entries) ? value.entries : [];
+    const at = now();
+    return entries.filter((entry) => entry && typeof entry.id === 'string').map((entry) => (
+      storedUnrecorded.has(entry.id) ? { ...entry, state: 'accepted' } : entry
+    )).filter((entry) => (entry.state === 'accepted'
+      ? Number(entry.at) > at - windowMs
+      : entry.state === 'reserved' && Number(entry.at) > at - staleMs));
   }
 
-  async function writeLedger(nodes) {
+  // Written to a temporary file and renamed over the ledger; the temporary file is
+  // removed on every failure.
+  async function writeLedger(entries) {
     await fsp.mkdir(path.dirname(ledgerFile), { recursive: true });
     const temp = `${ledgerFile}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-    await fsp.writeFile(temp, `${JSON.stringify({ version: 1, nodes })}\n`, { mode: 0o600 });
-    await fsp.rename(temp, ledgerFile);
-  }
-
-  async function currentStoreSize() {
-    if (!storeCache || now() - storeCache.at >= STORE_SIZE_CACHE_MS) {
-      storeCache = { at: now(), bytes: await storeSize(fsp, path.join(root, '.keep', 'artifacts')) };
+    try {
+      await fsp.writeFile(temp, `${JSON.stringify({ version: 2, entries })}\n`, { mode: 0o600 });
+      await fsp.rename(temp, ledgerFile);
+    } catch (error) {
+      await fsp.rm(temp, { force: true }).catch(() => {});
+      throw error;
     }
-    return storeCache.bytes;
+    // Whatever this process remembered as stored is now written as accepted.
+    for (const entry of entries) if (entry.state === 'accepted') storedUnrecorded.delete(entry.id);
   }
 
-  // Throws the 413 for an upload past either limit.
-  async function checkLimits(caller, bytes, files) {
-    const entries = (await readLedger())[caller] || [];
-    const usedBytes = entries.reduce((sum, entry) => sum + (Number(entry.bytes) || 0), 0);
-    const usedFiles = entries.reduce((sum, entry) => sum + (Number(entry.files) || 0), 0);
+  async function measuredStore(fresh) {
+    if (fresh || !storeCache || now() - storeCache.at >= STORE_SIZE_CACHE_MS) {
+      storeCache = { at: now(), ...(await storeSize(fsp, path.join(root, '.keep', 'artifacts'))) };
+    }
+    return storeCache;
+  }
+
+  // Throws the 413 for an upload past any limit, judged on `entries` (reservations
+  // included) and the measured store.
+  async function checkLimits(entries, caller, bytes, files) {
+    const own = entries.filter((entry) => entry.node === caller);
+    const usedBytes = own.reduce((sum, entry) => sum + (Number(entry.bytes) || 0), 0);
+    const usedFiles = own.reduce((sum, entry) => sum + (Number(entry.files) || 0), 0);
     if (usedBytes + bytes > dailyBytes || usedFiles + files > dailyFiles) {
       // The moment enough of the oldest uploads leave the window for this one to fit.
       let freedBytes = 0;
       let freedFiles = 0;
       let frees = null;
-      for (const entry of [...entries].sort((a, b) => a.at - b.at)) {
+      for (const entry of [...own].sort((a, b) => a.at - b.at)) {
         freedBytes += Number(entry.bytes) || 0;
         freedFiles += Number(entry.files) || 0;
         if (usedBytes - freedBytes + bytes <= dailyBytes && usedFiles - freedFiles + files <= dailyFiles) {
@@ -258,18 +310,61 @@ function createArtifactService(options = {}) {
         + `this upload of ${mib(bytes)} in ${files} would pass its daily limit of ${mib(dailyBytes)} and ${dailyFiles} files`
         + `${frees ? `; room frees at ${frees}` : ''}`);
     }
-    const stored = await currentStoreSize();
-    if (stored + bytes > storeMaxBytes) {
-      refuse(413, `the artifact store holds ${mib(stored)} of its ${mib(storeMaxBytes)} cap; `
+    // Reservations are not in the store yet; they are added to what was measured.
+    const pending = entries.filter((entry) => entry.state === 'reserved');
+    const pendingBytes = pending.reduce((sum, entry) => sum + (Number(entry.bytes) || 0), 0);
+    const pendingFiles = pending.reduce((sum, entry) => sum + (Number(entry.files) || 0), 0);
+    let store = await measuredStore(false);
+    // Near a cap a minute-old measure is not good enough.
+    const near = store.bytes + pendingBytes + bytes > storeMaxBytes - Math.min(ARTIFACT_COMMAND_MAX_BYTES, storeMaxBytes / 2)
+      || store.files + pendingFiles + files > storeMaxFiles - Math.min(ARTIFACT_MAX_FILES, storeMaxFiles / 2);
+    if (near) store = await measuredStore(true);
+    if (store.bytes + pendingBytes + bytes > storeMaxBytes) {
+      refuse(413, `the artifact store holds ${mib(store.bytes + pendingBytes)} of its ${mib(storeMaxBytes)} cap; `
+        + 'remove old artifacts under .keep/artifacts on the daemon before storing more');
+    }
+    if (store.files + pendingFiles + files > storeMaxFiles) {
+      refuse(413, `the artifact store holds ${store.files + pendingFiles} files of its ${storeMaxFiles}-file cap; `
         + 'remove old artifacts under .keep/artifacts on the daemon before storing more');
     }
   }
 
-  async function recordAccepted(caller, bytes, files) {
-    const nodes = await readLedger();
-    nodes[caller] = [...(nodes[caller] || []), { at: now(), bytes, files }];
-    await writeLedger(nodes);
-    if (storeCache) storeCache.bytes += bytes;
+  // Check and reserve, as one step under the lock. Returns the reservation's id.
+  function reserve(caller, key, bytes, files) {
+    return quotaLock(ledgerFile, async () => {
+      const entries = await readLedger();
+      // An upload stored while the ledger could not be written is written as accepted
+      // now, whatever this step decides.
+      if (storedUnrecorded.size) await writeLedger(entries).catch(() => {});
+      await checkLimits(entries, caller, bytes, files);
+      const entry = { id: crypto.randomBytes(8).toString('hex'), node: caller, key, bytes, files, at: now(), state: 'reserved' };
+      try { await writeLedger([...entries, entry]); }
+      catch (error) {
+        throw Object.assign(new RegistryError(503, `the artifact quota ledger cannot be written (${error.message}); nothing was stored, try again later`),
+          { retryAfterMs: LEDGER_RETRY_MS });
+      }
+      return entry.id;
+    });
+  }
+
+  // The CLI stored the upload: the reservation becomes an accepted entry. A ledger
+  // that cannot be written leaves the reservation standing, still counted.
+  function accept(id, bytes, files) {
+    storedUnrecorded.add(id);
+    if (storeCache) { storeCache.bytes += bytes; storeCache.files += files; }
+    return quotaLock(ledgerFile, async () => {
+      try { await writeLedger(await readLedger()); }
+      catch (error) { log(`artifact quota: an upload was stored but its ledger entry could not be written (${error.message}); it still counts, and is written at the next quota step`); }
+    });
+  }
+
+  // Nothing was stored: the reservation goes. One that cannot be removed is dropped
+  // as stale later.
+  function release(id) {
+    return quotaLock(ledgerFile, async () => {
+      try { await writeLedger((await readLedger()).filter((entry) => entry.id !== id)); }
+      catch (error) { log(`artifact quota: a reservation could not be released (${error.message}); it lapses after ${Math.round(staleMs / 60e3)} min`); }
+    });
   }
 
   async function cardExists(card) {
@@ -284,8 +379,12 @@ function createArtifactService(options = {}) {
     const daemon = shared.daemonNode();
     const bytes = request.files.reduce((sum, file) => sum + file.size, 0);
     // A listing stores nothing and is never limited.
-    if (request.files.length) await checkLimits(caller, bytes, request.files.length);
-    const dir = await fsp.mkdtemp(path.join(tmpRoot, 'keep-artifact-'));
+    const reservation = request.files.length ? await reserve(caller, request.idempotencyKey, bytes, request.files.length) : null;
+    let settled = false;
+    const dir = await fsp.mkdtemp(path.join(tmpRoot, 'keep-artifact-')).catch(async (error) => {
+      if (reservation) await release(reservation);
+      throw error;
+    });
     try {
       const copies = [];
       for (const [index, file] of request.files.entries()) {
@@ -301,13 +400,15 @@ function createArtifactService(options = {}) {
       }
       const argv = ['artifact', ...(request.note !== null ? ['-m', request.note] : []), '--', request.card, ...copies];
       const answer = await shared.spawnKeep(argv, { cwd: request.cwd, env });
-      // Counted once the CLI has stored the files. A ledger that cannot be written
-      // does not turn a stored upload into an error; it is said in the log.
-      if (request.files.length && answer.body && answer.body.status === 0) {
-        await recordAccepted(caller, bytes, request.files.length)
-          .catch((error) => { try { process.stderr.write(`keep serve: artifact quota ledger not written: ${error.message}\n`); } catch {} });
+      settled = true;
+      if (reservation) {
+        if (answer.body && answer.body.status === 0) await accept(reservation, bytes, request.files.length);
+        else await release(reservation);
       }
       return answer;
+    } catch (error) {
+      if (reservation && !settled) await release(reservation);
+      throw error;
     } finally {
       await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
     }
@@ -363,7 +464,9 @@ function createArtifactService(options = {}) {
         what: `keep artifact ${request.card}${request.nodeCwd ? ` from ${request.nodeCwd}` : ''}`,
       });
     } catch (error) {
-      if (error instanceof RegistryError) return { status: error.status, body: { error: error.message } };
+      if (error instanceof RegistryError) {
+        return { status: error.status, body: { error: error.message, ...(error.retryAfterMs ? { busy: true, retryAfterMs: error.retryAfterMs } : {}) } };
+      }
       return { status: 500, body: { error: error.message } };
     }
   }
@@ -373,5 +476,5 @@ function createArtifactService(options = {}) {
 
 module.exports = {
   createArtifactService, validateArtifactRequest, checkedFiles, digestOf, writeDecoded, CARD_RE,
-  ARTIFACT_UPLOADS_PER_NODE, ARTIFACT_UPLOADS_MAX, BUSY_RETRY_MS, DECODE_SLICE_CHARS,
+  ARTIFACT_UPLOADS_PER_NODE, ARTIFACT_UPLOADS_MAX, BUSY_RETRY_MS, DECODE_SLICE_CHARS, RESERVATION_STALE_MS, LEDGER_RETRY_MS,
 };

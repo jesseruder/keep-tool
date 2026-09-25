@@ -170,7 +170,9 @@ async function postWithRetry(where, pathname, payload, deps = {}) {
     // answer comes after the whole body was sent, which the daemon discards; asking
     // first (a lease, or Expect: 100-continue) so a busy daemon costs no upload is a
     // follow-up.
-    const value = response.status === 429 ? parsed(response) : null;
+    // A 503 with `busy` is the same: a quota ledger the daemon could not write, refused
+    // before anything was stored.
+    const value = response.status === 429 || response.status === 503 ? parsed(response) : null;
     if (value && value.busy === true) {
       const error = new Error(value.error || 'daemon busy');
       error.busyMs = Math.min(Math.max(Number(value.retryAfterMs) || 2000, 250), 60e3);

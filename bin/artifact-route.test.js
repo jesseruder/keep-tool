@@ -379,7 +379,7 @@ test('a node\'s daily quota refuses the upload that would pass it, counts only a
   let code = 0;
   const { artifacts, root, calls, registry } = services(t, { artifactOptions, answer: () => ({ code, stdout: 'stored\n', stderr: '' }) });
   const upload = (key, content = 'png bytes') => artifacts.handle(AWS1, body(root, { idempotencyKey: `${KEY}-${key}`, files: [fileOf('shot.png', content)] }));
-  const ledger = () => JSON.parse(fs.readFileSync(path.join(root, '.keep', 'artifact-quota.json'), 'utf8')).nodes.aws1 || [];
+  const ledger = () => JSON.parse(fs.readFileSync(path.join(root, '.keep', 'artifact-quota.json'), 'utf8')).entries.filter((entry) => entry.node === 'aws1');
   assert.equal((await upload('a')).status, 200);
   clock += 60e3;
   // A CLI that fails stored nothing and counts nothing.
@@ -432,4 +432,108 @@ test('the store cap refuses an upload that would pass it, counting regular files
   assert.equal(fs.existsSync(path.join(root, '.keep', 'artifact-quota.json')), false);
   const small = await artifacts.handle(AWS1, body(root, { idempotencyKey: `${KEY}-small`, files: [fileOf('tiny.txt', 'tiny')] }));
   assert.equal(small.status, 200, JSON.stringify(small.body));
+});
+
+// A spawn whose first run is held until the test lets it finish.
+function heldSpawn(answer) {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let spawned = 0;
+  const fake = fakeSpawn(answer);
+  const spawn = (...args) => {
+    spawned += 1;
+    const child = fake.spawn(...args);
+    if (spawned === 1) {
+      const emit = child.emit.bind(child);
+      child.emit = (name, ...rest) => (name === 'close' ? held.then(() => emit(name, ...rest)) : emit(name, ...rest));
+    }
+    return child;
+  };
+  return { fake: { spawn, calls: fake.calls }, release, spawned: () => spawned };
+}
+const until = async (fn) => { while (!fn()) await new Promise((resolve) => setTimeout(resolve, 5)); };
+const AWS2 = { class: 'node', node: 'aws2' };
+const quotaEntries = (root) => JSON.parse(fs.readFileSync(path.join(root, '.keep', 'artifact-quota.json'), 'utf8')).entries;
+function storeFiles(root, count, size) {
+  const dir = path.join(root, '.keep', 'artifacts', 'older-card');
+  fs.mkdirSync(dir, { recursive: true });
+  for (let i = 0; i < count; i += 1) fs.writeFileSync(path.join(dir, `kept-${i}.bin`), Buffer.alloc(size));
+}
+
+test('two uploads from different nodes near the store cap cannot both pass', async (t) => {
+  const { artifacts, root } = services(t, { artifactOptions: { storeMaxBytes: 20 } });
+  storeFiles(root, 1, 8);
+  const answers = await Promise.all([
+    artifacts.handle(AWS1, body(root, { idempotencyKey: `${KEY}-one`, session: null, agent: null })),
+    artifacts.handle(AWS2, body(root, { idempotencyKey: `${KEY}-two`, session: null, agent: null })),
+  ]);
+  assert.deepEqual(answers.map((answer) => answer.status).sort(), [200, 413]);
+  assert.match(answers.find((answer) => answer.status === 413).body.error, /the artifact store holds 0\.0 MB of its 0\.0 MB cap/);
+});
+
+test('the store\'s file-count cap refuses an upload that would pass it', async (t) => {
+  const { artifacts, root, calls } = services(t, { artifactOptions: { storeMaxFiles: 2 } });
+  storeFiles(root, 2, 1);
+  const refused = await artifacts.handle(AWS1, body(root));
+  assert.equal(refused.status, 413);
+  assert.equal(refused.body.error, 'the artifact store holds 2 files of its 2-file cap; remove old artifacts under .keep/artifacts on the daemon before storing more');
+  assert.equal(calls.length, 0);
+});
+
+test('a reservation counts while its upload runs, and is dropped when the upload fails', async (t) => {
+  const held = heldSpawn(() => ({ code: 1, stdout: '', stderr: 'keep: failed\n' }));
+  const { artifacts, root } = services(t, { fake: held.fake, artifactOptions: { storeMaxBytes: 12 } });
+  const first = artifacts.handle(AWS1, body(root, { idempotencyKey: `${KEY}-one` }));
+  await until(() => held.spawned() === 1);
+  assert.deepEqual(quotaEntries(root).map((entry) => [entry.node, entry.state, entry.bytes]), [['aws1', 'reserved', 9]]);
+  const other = await artifacts.handle(AWS2, body(root, { idempotencyKey: `${KEY}-two`, session: null, agent: null }));
+  assert.equal(other.status, 413, 'the reservation is counted against the store');
+  held.release();
+  assert.equal((await first).body.status, 1);
+  assert.deepEqual(quotaEntries(root), [], 'a failed upload leaves no reservation');
+  const after = await artifacts.handle(AWS2, body(root, { idempotencyKey: `${KEY}-two`, session: null, agent: null }));
+  assert.equal(after.status, 200, JSON.stringify(after.body));
+});
+
+test('a ledger that cannot be written refuses the upload before anything is stored, and leaves no temporary file', async (t) => {
+  // The temporary file is written, and the rename over the ledger fails.
+  const fsp = { ...fs.promises, rename: async (from, to) => {
+    if (String(to).includes('artifact-quota')) { const error = new Error('EIO: i/o error, write'); error.code = 'EIO'; throw error; }
+    return fs.promises.rename(from, to);
+  } };
+  const { artifacts, root, tmpRoot, calls } = services(t, { artifactOptions: { fsp } });
+  const refused = await artifacts.handle(AWS1, body(root));
+  assert.equal(refused.status, 503);
+  assert.equal(refused.body.busy, true, 'the node waits and resends it');
+  assert.match(refused.body.error, /the artifact quota ledger cannot be written \(EIO: i\/o error, write\); nothing was stored/);
+  assert.equal(calls.length, 0);
+  assert.deepEqual(fs.readdirSync(tmpRoot), []);
+  assert.deepEqual(fs.readdirSync(path.join(root, '.keep')).filter((name) => name.includes('artifact-quota')), []);
+});
+
+test('an upload stored while the ledger cannot record it keeps counting, and is written as accepted once it can be', async (t) => {
+  let failing = false;
+  let clock = Date.parse('2026-09-20T10:00:00Z');
+  const fsp = { ...fs.promises, writeFile: async (file, ...rest) => {
+    if (failing && String(file).includes('artifact-quota')) { const error = new Error('ENOSPC: no space left on device'); error.code = 'ENOSPC'; throw error; }
+    return fs.promises.writeFile(file, ...rest);
+  } };
+  const held = heldSpawn(() => ({ code: 0, stdout: 'stored\n', stderr: '' }));
+  const logged = [];
+  const { artifacts, root } = services(t, { fake: held.fake, artifactOptions: { fsp, now: () => clock, dailyBytes: 10, log: (line) => logged.push(line) } });
+  const first = artifacts.handle(AWS1, body(root, { idempotencyKey: `${KEY}-one` }));
+  await until(() => held.spawned() === 1);
+  failing = true;
+  held.release();
+  assert.equal((await first).status, 200, 'the store is not undone');
+  assert.match(logged.join('\n'), /stored but its ledger entry could not be written \(ENOSPC/);
+  assert.deepEqual(quotaEntries(root).map((entry) => entry.state), ['reserved']);
+  // Long past the stale bound, it still counts.
+  clock += 60 * 60e3;
+  const refused = await artifacts.handle(AWS1, body(root, { idempotencyKey: `${KEY}-two` }));
+  assert.equal(refused.status, 413);
+  failing = false;
+  const again = await artifacts.handle(AWS1, body(root, { idempotencyKey: `${KEY}-two` }));
+  assert.equal(again.status, 413);
+  assert.deepEqual(quotaEntries(root).map((entry) => entry.state), ['accepted'], 'written as accepted at the next step');
 });

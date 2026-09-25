@@ -1715,9 +1715,15 @@ node's CLI says so once, waits and resends the same key, up to the same horizon 
 command still running (the body has been sent by then; asking first is a follow-up).
 An admitted upload is decoded a slice at a time, padding only at its end, and hashed,
 written and counted as it goes. What is kept is bounded too: each node may have 256 MiB and 200
-files accepted in any rolling 24 hours (a ledger at `.keep/artifact-quota.json` that
-counts only uploads the CLI stored), and the whole of `.keep/artifacts` may hold 2 GiB
-(measured without following links, cached for a minute). Past either the upload is
+files in any rolling 24 hours, and the whole of `.keep/artifacts` may hold 2 GiB and
+20,000 files (measured without following links, cached for a minute and measured afresh
+near a cap). Check and reservation are one step under a process-wide lock, written to
+a ledger at `.keep/artifact-quota.json` before any file is written: a reservation
+counts while its upload runs, becomes an accepted entry once the CLI stored it, and is
+removed otherwise (or dropped after ten minutes, if a daemon died with it). A ledger
+that cannot be written refuses the upload with `503` before anything is stored, and the
+node waits and resends; one that cannot record a stored upload leaves its reservation
+counting until it can. Past either the upload is
 refused with `413`, naming the limit and, for the daily one, when room frees; the
 node prints that and does not resend. A resend of an upload already accepted is still
 answered from the journal. `keep artifact` refuses a card whose index entry is
