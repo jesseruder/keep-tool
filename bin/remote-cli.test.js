@@ -436,6 +436,29 @@ test('keep tell from a node is posted to the daemon, and its refused and still-b
   assert.equal(refused.status, 3, refused.stderr);
 });
 
+// A state note from a node is written by the daemon's CLI under the note's author, the
+// node's session; every form goes as the node typed it, and nothing is read on the node.
+test('keep note from a node is posted to the daemon with its flags as they are', async (t) => {
+  const daemon = await stubDaemon(t, () => ({ status: 200, body: { ok: true, status: 0, stdout: 'n-0001: noted\n', stderr: '', replayed: false } }));
+  const { root, env } = nodeEnv(t, { CLAUDE_CODE_SESSION_ID: 'sess-aws1' });
+  env.KEEP_DAEMON_URL = daemon.url;
+  const forms = [
+    ['app', '--scope', 'staging', '--for', '+2h', '-m', 'deploying now'],
+    ['app', '--scope', 'db', '--for', '+30m', '--task', 'some-card', '-m', 'migrating'],
+    ['--extend', 'n-0001', '--for', '+1h'],
+    ['--clear', 'n-0001', '-m', 'done early'],
+  ];
+  for (const [i, args] of forms.entries()) {
+    const result = await run(['note', ...args], { env, cwd: root });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'n-0001: noted\n');
+    assert.equal(daemon.requests[i].url, '/api/registry');
+    assert.equal(daemon.requests[i].body.command, 'note');
+    assert.deepEqual(daemon.requests[i].body.args, args);
+    assert.equal(daemon.requests[i].body.session, 'sess-aws1');
+  }
+});
+
 test('a forwarded tell\'s request outlasts its --wait; every other command keeps the ordinary bound', async (t) => {
   const { requestTimeoutMs, runRemote, REQUEST_TIMEOUT_MS } = require('./remote-cli.js');
   assert.equal(requestTimeoutMs('tell', ['#12', '-m', 'hi', '--wait', '5m', '--dry']), REQUEST_TIMEOUT_MS + 5 * 60e3);

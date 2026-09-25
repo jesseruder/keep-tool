@@ -14,9 +14,14 @@ const REGISTRY_COMMANDS = Object.freeze([
   'reviewed', 'reviewing', 'reviews', 'review-route', 'plan', 'link', 'tag', 'tags', 'hold',
   'release', 'holds', 'resources', 'who', 'deps', 'wait-on', 'decide', 'decisions', 'notes',
   'retitle', 'project', 'landed', 'health', 'stalled', 'standup',
-  // Not `note`: posting one makes the daemon type it into every live session in the
-  // project (/api/notes/announce), the laptop's included. It waits for an announce
-  // that knows which node wrote the note.
+  // `note` posts a state note the daemon then types into every live session in the
+  // project (/api/notes/announce). The daemon's CLI runs it under the caller's
+  // verified session (IDENTITY_VARS in registry-route.js), so the note's author is
+  // that session, which its announce leaves out; and the announce is the daemon's
+  // own, so it reaches the project's siblings on every node the way a tell does
+  // (sendToSession), a sibling it cannot reach reported as unreached. Its text is
+  // trusted node input, like a tell's.
+  'note',
   // Read-only: what a node's `keep land` needs from the registry to decide a land.
   'land-facts',
   // `tell` reaches one named session, not every one: the daemon's CLI runs it under
@@ -64,9 +69,9 @@ const COMMAND_FLAGS = Object.freeze(['--probe', '--done-when', '--verify']);
 // plan step text, which the daemon quotes into the check and unblock prompts it
 // delivers, just as a forwarded tell and an open's -m are typed into sessions. What
 // it may not write is a command the daemon runs itself (COMMAND_FLAGS above): that
-// is execution on the laptop, not text a session reads and weighs. `note`, whose text
-// the daemon types straight into every live session in the project, is left out of
-// REGISTRY_COMMANDS until that announce knows which node wrote the note.
+// is execution on the laptop, not text a session reads and weighs. A forwarded `note`,
+// which the daemon types into every live session in the project, is the same trusted
+// text, written under the caller's verified session.
 
 // A flag whose value is a path on the node, per command: the daemon's CLI would read
 // that path from the daemon's own disk, which holds some other file or none.
@@ -88,10 +93,12 @@ const PLACEMENT_FLAGS = Object.freeze({
 // The commands the daemon runs on behalf of a session and so frames as that session's
 // act; without one the daemon's CLI would attribute a node's request to Owner's own
 // shell. A tell is framed as a message from its sender, and an open names its opener
-// as the requester a card is handed over from.
+// as the requester a card is handed over from. A note names the session that wrote
+// it, which its announce leaves out and a clear by another session is warned about.
 const SESSION_REFUSALS = Object.freeze({
   tell: "a node's tell names the session it is from; run it inside an agent session",
   open: "a node's open names the session it is from; run it inside an agent session",
+  note: "a node's note names the session it is from; run it inside an agent session",
 });
 
 const MAX_ARG_BYTES = 4 * 1024;
@@ -150,6 +157,7 @@ const PROJECT_POSITIONS = Object.freeze({
   project: [1],
   who: [0],
   hold: [0],
+  note: [0],
   resources: [0],
   notes: [0],
 });

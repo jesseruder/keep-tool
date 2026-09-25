@@ -1704,6 +1704,13 @@ stops answering gets the usual twenty seconds of retries.
 A forwarded open runs beside the node's other commands and holds a restart for as long
 as it runs.
 
+`keep note` is forwarded too, in all its forms (`--scope`, `--for`, `--task`,
+`--extend`, `--clear`). It runs under the node session's identity, which the note
+records as its author, and is refused without one. The announce is the daemon's own,
+so it reaches the project's sibling sessions on every node the way a tell does, the
+author left out; a sibling it cannot reach is reported as unreached. As for the other
+forwarded commands, the project must be an absolute path, `~/…` or a bare name.
+
 `keep artifact` from a node sends the files themselves, since the paths name files the
 daemon does not have. The node's CLI reads each one and posts it to the daemon's
 `POST /api/artifact` with its basename, size, sha256 and bytes, under the same node

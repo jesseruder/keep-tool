@@ -117,20 +117,42 @@ test('only the listed registry commands run, and never a command-bearing flag', 
   assert.equal(REGISTRY_COMMANDS.includes('artifact'), false);
 });
 
-// A note is announced by typing it into every live session in the project, the
-// laptop's included: node-written text a laptop session would read as a message.
-// Reading notes is fine.
-test('keep note is not run for a node, and keep notes is', async (t) => {
+// A note is announced by typing it into every live session in the project, so the
+// daemon's CLI writes it under the node session's own identity: the note's author,
+// whom the announce leaves out. Every form keeps its flags as the node gave them.
+test('a node\'s keep note runs under its own session with its flags intact, and keep notes still runs', async (t) => {
+  assert.ok(REGISTRY_COMMANDS.includes('note'));
   const { svc, root, calls } = service(t);
-  const note = await svc.handle(AWS1, body(root, { command: 'note', args: ['-m', 'deploying now'], idempotencyKey: `${KEY}-note` }));
-  assert.equal(note.status, 400);
-  assert.equal(note.body.error, '"note" is not a registry command');
-  assert.equal(calls.length, 0);
-  assert.equal(REGISTRY_COMMANDS.includes('note'), false);
+  const forms = [
+    ['/srv/app', '--scope', 'staging', '--for', '+2h', '-m', 'deploying now\nback soon'],
+    ['app', '--scope', 'db', '--scope', 'cache', '--for', '+30m', '--task', 'some-card', '-m', 'migrating'],
+    ['~/code/app', '--scope=db', '--for=+1h', '-m', 'x'],
+    ['--extend', 'n-0001', '--for', '+1h'],
+    ['--clear', 'n-0001', '-m', 'done early'],
+    ['--clear', 'n-0001'],
+  ];
+  for (const [i, args] of forms.entries()) {
+    assert.equal(argumentRefusal('note', args, ME), null, args.join(' '));
+    const answer = await svc.handle(AWS1, body(root, { command: 'note', args, idempotencyKey: `${KEY}-note${i}` }));
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    assert.deepEqual(calls[i].args.slice(1), ['note', ...args]);
+    assert.equal(calls[i].options.env.CLAUDE_CODE_SESSION_ID, 'sess-aws1', 'the daemon\'s note names the node\'s session as its author');
+  }
+  assert.match(String(argumentRefusal('note', ['./app', '--scope', 'x', '--for', '+1h', '-m', 'y'], ME)), /is relative to a directory the daemon does not share/);
+  assert.match(String(argumentRefusal('note', ['app', '--scope', 'x', '--for', '+1h', '--probe', 'true', '-m', 'y'], ME)), /carries a command the daemon would run/);
   const notes = await svc.handle(AWS1, body(root, { command: 'notes', args: [], idempotencyKey: `${KEY}-notes` }));
   assert.equal(notes.status, 200, JSON.stringify(notes.body));
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].args.slice(1), ['notes']);
+  assert.deepEqual(calls.at(-1).args.slice(1), ['notes']);
+});
+
+test('a node\'s note must come from a session', async (t) => {
+  const anonymous = "a node's note names the session it is from; run it inside an agent session";
+  assert.equal(argumentRefusal('note', ['app', '--scope', 'x', '--for', '+1h', '-m', 'hi']), anonymous);
+  assert.equal(argumentRefusal('note', ['--clear', 'n-0001'], { node: 'aws1' }), anonymous);
+  const { svc, root, calls } = service(t);
+  const bare = await svc.handle(AWS1, body(root, { command: 'note', args: ['app', '--scope', 'x', '--for', '+1h', '-m', 'hi'], session: null, agent: null, idempotencyKey: `${KEY}-bare` }));
+  assert.deepEqual(bare, { status: 400, body: { error: anonymous } });
+  assert.equal(calls.length, 0);
 });
 
 // A check recipe is text a session reads, like a forwarded tell or an open's -m, so a
@@ -183,7 +205,7 @@ test('a flag is read as taking no value exactly where that command\'s parseArgs 
   assert.equal(argumentRefusal('landed', ['--disagree', '-m', 'a\nb']), null);
   // The same names take a value elsewhere, and there the -m is that value.
   assert.match(argumentRefusal('plan', ['c', '--remove', '-m', 'a\nb']), /only the -m message/);
-  assert.match(argumentRefusal('note', ['--clear', '-m', 'a\nb']), /only the -m message/);
+  assert.match(argumentRefusal('note', ['--clear', '-m', 'a\nb'], ME), /only the -m message/);
   assert.match(argumentRefusal('review-route', ['--clear', '-m', 'a\nb']), /only the -m message/);
 
   // The table is keep.js's own: every 'bool' in the parseArgs specs of a registry
