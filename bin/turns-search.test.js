@@ -9,7 +9,7 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-turns-search-'));
 process.env.KEEP_TURN_INDEX_DB = path.join(dir, 'turns.sqlite');
 process.env.KEEP_DIR = dir;
 const turnIndex = require('./turn-index.js');
-const { turnsSearch } = require('./commands/turns.js');
+const { turnsSearch, search } = require('./commands/turns.js');
 
 test.after(() => { try { turnIndex.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
 
@@ -49,4 +49,18 @@ test('search rows carry the console\'s title and number, and fall back to the in
 
   const offline = JSON.parse((await output(() => turnsSearch(['websocket', '--json'], { getKeepApi: async () => { throw new Error('ECONNREFUSED'); } })))[0]);
   assert.deepEqual(offline.map((hit) => hit.title), ['', '']);
+});
+
+test('keep search answers with cards and conversations, and either alone on request', async () => {
+  const loadAll = () => [{ id: 'websocket-retry', fm: { title: 'Websocket retry', status: 'active', updated: '2026-09-25' }, body: '' }];
+  const getKeepApi = async () => ({ status: 200, data: JSON.stringify({ sessions: [] }) });
+  const both = JSON.parse((await output(() => search(['websocket', '--json'], { loadAll, getKeepApi })))[0]);
+  assert.deepEqual(both.cards.map((card) => card.id), ['websocket-retry']);
+  assert.deepEqual(both.conversations.map((hit) => hit.sessionId), ['s-two', 's-one']);
+  const cards = JSON.parse((await output(() => search(['websocket', '--cards', '--json'], { loadAll, getKeepApi })))[0]);
+  assert.deepEqual([cards.cards.length, cards.conversations.length], [1, 0]);
+  const talk = JSON.parse((await output(() => search(['websocket', '--conversations', '--json'], { loadAll, getKeepApi })))[0]);
+  assert.deepEqual([talk.cards.length, talk.conversations.length], [0, 2]);
+  const text = await output(() => search(['websocket'], { loadAll, getKeepApi }));
+  assert.deepEqual([text[0], text[2], text[3]], ['Cards', '', 'Conversations']);
 });

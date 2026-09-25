@@ -64,10 +64,12 @@ Load the situational skill when its moment comes, not before:
   session at its next idle moment, and the compacted session reads the card, not its old context.
 - **Questions about current work**: answer from `keep list`, `keep overdue`, and
   `keep resume`.
-- **Finding an earlier conversation** ("the session where we fixed the websocket
-  retry"): `keep turns search "<words>"` lists matching sessions, newest first, with
-  their `#number`, title, card and the passage that matched; `keep turns show <id>`
-  reads its turns. Add `--all` to search tool output too (an error message, a command).
+- **Finding earlier work** ("where did we decide X", "the session that fixed the
+  websocket retry"): `keep search "<words>"` lists matching cards (title, tags, check-ins)
+  and then matching conversations, newest first, each session with its `#number`,
+  title, card and the passage that matched. `--cards` or `--conversations` keeps one
+  side; `keep turns show <id>` reads a session's turns. Add `--all` to search tool
+  output too (an error message, a command).
 - **Durable artifacts**: never cite a `/tmp` path in a check recipe or check-in;
   macOS purges `/tmp` on reboot. Run `keep artifact <card> <file>...` to copy files into
   committed `.keep/artifacts/<card>/`, then cite the printed path. `keep show` lists them.

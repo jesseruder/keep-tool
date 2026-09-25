@@ -4,7 +4,7 @@
 'use strict';
 
 const {
-  relativeDurationMs, parseWhen, die, loadTaskAnywhere, parseArgs, canonicalProjectPath, getKeepApi,
+  relativeDurationMs, parseWhen, die, loadTaskAnywhere, loadAll, parseArgs, canonicalProjectPath, getKeepApi,
 } = require('../keep-core.js');
 const path = require('path');
 
@@ -119,14 +119,10 @@ async function consoleSessions(deps = {}) {
 // an agent can name it (#12) or open it. By default it reads only what people typed
 // and the agents' prose in interactive sessions; --all adds tool calls and output,
 // headless runs and subagents, for an error message or a command.
-async function turnsSearch(argv, deps = {}) {
+async function conversationHits(query, o, deps = {}) {
   const turnIndex = require('../turn-index.js');
-  const { searchDatabase, ftsMatch, OPEN, CLOSE } = require('../session-text-search.js');
+  const { searchDatabase, OPEN, CLOSE } = require('../session-text-search.js');
   const numbers = require('../session-numbers.js');
-  const o = parseArgs(argv, { since: 'str', project: 'str', limit: 'str', agent: 'str', json: 'bool', all: 'bool' });
-  const query = o._.join(' ').trim();
-  if (!query) die('usage: keep turns search "<query>" [--all] [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]');
-  if (!ftsMatch(query)) die('keep turns search: the query needs at least three characters');
   const hits = searchDatabase(turnIndex.open(turnIndex.databaseFile()), query, {
     all: o.all === true,
     since: o.since ? turnsSince(o.since) : null,
@@ -142,8 +138,11 @@ async function turnsSearch(argv, deps = {}) {
     if (listed?.state) hit.state = listed.state;
     hit.snippet = hit.snippet.split(OPEN).join('[').split(CLOSE).join(']');
   }
-  if (o.json) return console.log(JSON.stringify(hits, null, 2));
-  if (!hits.length) return console.log('no matches');
+  return hits;
+}
+
+function printConversations(hits) {
+  const numbers = require('../session-numbers.js');
   // `user` rows also carry Keep's own messages, hook prompts and slash commands.
   const said = (hit) => (hit.kind === 'human' ? 'you' : hit.role === 'user' ? `${hit.kind || 'user'}` : hit.role === 'tool' ? 'tool' : 'agent');
   for (const hit of hits) {
@@ -153,6 +152,53 @@ async function turnsSearch(argv, deps = {}) {
     console.log(`    ${said(hit)}: ${turnsClip(hit.snippet, 200)}`);
   }
 }
+
+async function turnsSearch(argv, deps = {}) {
+  const { ftsMatch } = require('../session-text-search.js');
+  const o = parseArgs(argv, { since: 'str', project: 'str', limit: 'str', agent: 'str', json: 'bool', all: 'bool' });
+  const query = o._.join(' ').trim();
+  if (!query) die('usage: keep turns search "<query>" [--all] [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]');
+  if (!ftsMatch(query)) die('keep turns search: the query needs at least three characters');
+  const hits = await conversationHits(query, o, deps);
+  if (o.json) return console.log(JSON.stringify(hits, null, 2));
+  if (!hits.length) return console.log('no matches');
+  printConversations(hits);
+}
+
+// keep search: cards and conversations in one answer to "where did we decide X".
+// Cards first (every word in the card's title, tags or text), then the sessions
+// `keep turns search` finds. --cards or --conversations keeps one side.
+async function search(argv, deps = {}) {
+  const { ftsMatch } = require('../session-text-search.js');
+  const { searchCards } = require('../card-search.js');
+  const o = parseArgs(argv, { since: 'str', project: 'str', limit: 'str', agent: 'str', json: 'bool', all: 'bool', cards: 'bool', conversations: 'bool' });
+  const query = o._.join(' ').trim();
+  if (!query) die('usage: keep search "<words>" [--cards|--conversations] [--all] [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]');
+  const cardsOnly = o.cards === true && o.conversations !== true;
+  const conversationsOnly = o.conversations === true && o.cards !== true;
+  const limit = Math.min(turnsIndexNumber(o.limit, '--limit') || 10, 200);
+  const cards = conversationsOnly ? [] : searchCards((deps.loadAll || loadAll)(true), query, {
+    limit, project: o.project ? canonicalProjectPath(o.project) : null,
+  });
+  const conversations = cardsOnly || !ftsMatch(query) ? []
+    : await conversationHits(query, { ...o, limit: String(limit) }, deps);
+  if (o.json) return console.log(JSON.stringify({ cards, conversations }, null, 2));
+  if (!cards.length && !conversations.length) return console.log('no matches');
+  if (cards.length) {
+    console.log('Cards');
+    for (const card of cards) {
+      console.log([card.id, turnsClip(card.title, 80), card.status, card.project && path.basename(card.project), card.updated]
+        .filter(Boolean).join('  ·  '));
+      if (card.snippet) console.log(`    ${turnsClip(card.snippet, 200)}`);
+    }
+  }
+  if (conversations.length) {
+    if (cards.length) console.log('');
+    console.log('Conversations');
+    printConversations(conversations);
+  }
+}
+commands.search = search;
 
 function turnsStats(argv) {
   const turnIndex = require('../turn-index.js');
@@ -220,4 +266,4 @@ commands.turns = (argv) => {
   return sub(argv.slice(1));
 };
 
-module.exports = { commands, consoleSessions, turnsSearch, indexTurns, turnsSince, turnsClip, turnsStamp, turnsIndexNumber };
+module.exports = { commands, consoleSessions, turnsSearch, search, indexTurns, turnsSince, turnsClip, turnsStamp, turnsIndexNumber };

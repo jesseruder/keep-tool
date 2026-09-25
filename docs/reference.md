@@ -336,6 +336,7 @@ keep sync              # pull --rebase + push
 keep hook session-start  # used by the Claude Code SessionStart hook
 keep hook prompt         # used by the Claude Code UserPromptSubmit hook (compaction hint)
 
+keep search "<words>" [--cards|--conversations] [--all] [--since when] [--project p] [--limit n] [--json]
 keep turns show <session-id|card-id> [--last N] [--json]     # indexed turns for a session or card
 keep turns search "<query>" [--all] [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]
 keep turns stats [--since when] [--json]                     # turns, human/[keep] openers, bare nudges
@@ -575,6 +576,14 @@ each and `experiment-undecided` at eight, so no one rule fills the report. The
 finding, then every rule's second, and so on — because the rows are ordered by severity
 and then rule name, and taking a prefix would evict the alphabetically-last rules
 outright. `byRule` still counts what each rule found before either cap.
+
+`keep search` answers "where did we decide X" from both halves of Keep's memory:
+cards whose id, title, tags or text hold every word (a title that holds them all
+first, then the most recently updated, each with the passage that matched), then the
+conversations `keep turns search` finds, with `--limit` of each (default 10).
+`--cards` or `--conversations` keeps one side. Cards are read straight from the
+registry, archive included, with no index to keep in step. A pane-only node forwards
+it to the daemon like `keep turns search`, without `--all`.
 
 `keep turns` reads the turn index, a SQLite summary of Claude Code and Codex CLI
 transcripts kept in `.keep/turns.sqlite`. Stop hooks and the daemon feed it

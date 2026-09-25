@@ -42,6 +42,9 @@ const REGISTRY_COMMANDS = Object.freeze([
   // on the laptop does. Only the reading subcommands (TURNS_READS); ingest,
   // backfill and prune name files on the node or rewrite the index.
   'turns',
+  // Cards and conversations in one read (bin/commands/turns.js search): a node's
+  // agent already reads any card with `show`; --all is refused as for turns.
+  'search',
 ]);
 
 const TURNS_READS = Object.freeze(['search', 'show', 'stats']);
@@ -49,8 +52,8 @@ const TURNS_REFUSAL = `a node runs only keep turns ${TURNS_READS.join('|')}; the
 // Tool output can hold whatever a command printed, a secret included, from every
 // machine in the fleet; a node searches what people typed and the agents' prose.
 const TURNS_ALL_REFUSAL = 'a node searches without --all: tool output stays on the daemon node';
-function turnsRefusal(args) {
-  if (!TURNS_READS.includes(args[0])) return TURNS_REFUSAL;
+function turnsRefusal(args, command = 'turns') {
+  if (command === 'turns' && !TURNS_READS.includes(args[0])) return TURNS_REFUSAL;
   // Anywhere, even past `--`: parseArgs reads a `--` after a value-taking flag as
   // that flag's value, and a search word spelled --all is not worth telling apart.
   if (args.some((arg) => arg === '--all' || arg.startsWith('--all='))) return TURNS_ALL_REFUSAL;
@@ -141,6 +144,7 @@ const BOOLEAN_FLAGS = Object.freeze({
   tell: ['dry', 'json'],
   open: ['fresh'],
   turns: ['json', 'all'],
+  search: ['json', 'all', 'cards', 'conversations'],
 });
 
 // The arguments each registry command resolves as a project (keep-core
@@ -152,6 +156,7 @@ const PROJECT_FLAGS = Object.freeze({
   add: ['--project'],
   list: ['--project'],
   turns: ['--project'],
+  search: ['--project'],
 });
 const PROJECT_POSITIONS = Object.freeze({
   project: [1],
@@ -193,7 +198,7 @@ function argumentRefusal(command, args, identity = {}) {
     if (total > MAX_ARGS_BYTES) return `the arguments are longer than ${MAX_ARGS_BYTES} bytes together`;
     if (arg.includes('\0')) return 'an argument contains a NUL byte';
   }
-  if (command === 'turns' && turnsRefusal(args)) return turnsRefusal(args);
+  if ((command === 'turns' || command === 'search') && turnsRefusal(args, command)) return turnsRefusal(args, command);
   if (Object.prototype.hasOwnProperty.call(SESSION_REFUSALS, command) && !identity.session) return SESSION_REFUSALS[command];
   if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return WAIT_CAP_REFUSAL;
   const newline = (arg) => /[\r\n]/.test(arg);
@@ -347,7 +352,7 @@ function isWaitingTell(command, args) {
 // record and are left to the route, which applies these two as well.
 function nodeSideRefusal(command, args) {
   if (!Array.isArray(args)) return null;
-  if (command === 'turns' && turnsRefusal(args)) return turnsRefusal(args);
+  if ((command === 'turns' || command === 'search') && turnsRefusal(args, command)) return turnsRefusal(args, command);
   const fileFlags = Object.prototype.hasOwnProperty.call(NODE_FILE_FLAGS, command) ? NODE_FILE_FLAGS[command] : [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];

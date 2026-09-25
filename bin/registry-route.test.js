@@ -221,14 +221,20 @@ test('a flag is read as taking no value exactly where that command\'s parseArgs 
   const turnsSource = fs.readFileSync(path.join(__dirname, 'commands', 'turns.js'), 'utf8');
   const turnsBools = new Set();
   for (const name of ['turnsSearch', 'turnsShow', 'turnsStats']) {
-    const body = turnsSource.slice(turnsSource.indexOf(`function ${name}(`)).split(/\n(?=function |const )/)[0];
+    const body = turnsSource.slice(turnsSource.indexOf(`function ${name}(`)).split(/\n(?=function |async function |const |commands\.)/)[0];
     for (const spec of body.matchAll(/parseArgs\([^,]+,\s*(\{[^}]*\})/g)) {
       for (const flag of spec[1].matchAll(/'?([a-z-]+)'?\s*:\s*'bool'/g)) turnsBools.add(flag[1]);
     }
   }
   assert.deepEqual([...BOOLEAN_FLAGS.turns].sort(), [...turnsBools].sort(), 'turns');
+  const searchBools = new Set();
+  const searchBody = turnsSource.slice(turnsSource.indexOf('async function search(')).split(/\n(?=function |async function |const |commands\.)/)[0];
+  for (const spec of searchBody.matchAll(/parseArgs\([^,]+,\s*(\{[^}]*\})/g)) {
+    for (const flag of spec[1].matchAll(/'?([a-z-]+)'?\s*:\s*'bool'/g)) searchBools.add(flag[1]);
+  }
+  assert.deepEqual([...BOOLEAN_FLAGS.search].sort(), [...searchBools].sort(), 'search');
   for (const command of REGISTRY_COMMANDS) {
-    if (command === 'turns') continue;
+    if (command === 'turns' || command === 'search') continue;
     const at = starts.findIndex((entry) => entry.name === command);
     assert.ok(at >= 0, `keep.js defines ${command}`);
     // To the next top-level definition of any kind: a helper after a command (the
@@ -261,6 +267,10 @@ test('a node runs only the reading turns subcommands', () => {
     assert.match(nodeSideRefusal('turns', args), /only keep turns search\|show\|stats/, args.join(' '));
   }
   assert.match(argumentRefusal('turns', ['search', 'x', '--project', '../elsewhere']), /relative to a directory/);
+  assert.equal(argumentRefusal('search', ['secret', 'drop', '--cards', '--project', 'keep-tool']), null);
+  assert.match(argumentRefusal('search', ['secret', '--all']), /without --all/);
+  assert.match(nodeSideRefusal('search', ['secret', '--all']), /without --all/);
+  assert.match(argumentRefusal('search', ['x', '--project', '../elsewhere']), /relative to a directory/);
   for (const args of [['search', 'x', '--all'], ['search', '--all=1', 'x'], ['show', 'c', '--all']]) {
     assert.match(argumentRefusal('turns', args), /without --all/, args.join(' '));
     assert.match(nodeSideRefusal('turns', args), /without --all/, args.join(' '));

@@ -4097,6 +4097,8 @@ ${stepUsage()}
   keep nudge live [on|off|contradictions|<kind,kind>]
                          # --send only delivers for a live kind
                          # message a live agent about a finding (dry-run without --send)
+  keep search "<words>" [--cards|--conversations] [--all] [--since when] [--project p] [--limit n] [--json]
+                         # where was X decided: matching cards (title, tags, text), then conversations
   keep turns show <session-id|card-id> [--last N] [--json]
                          # indexed turns for a session, or for every session linked to a card
   keep turns search "<query>" [--all] [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]
