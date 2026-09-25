@@ -172,6 +172,33 @@ async function watcherReplay(argv) {
   if (result.savedTo) console.log(`\nscoreboard saved to ${result.savedTo}`);
 }
 
+// Scores what the console already showed, against what Owner typed next. No
+// model call and no write, so it is safe to run at any time and as often as liked.
+function watcherScore(argv) {
+  const watcher = require('../turn-watcher.js');
+  const o = parseArgs(argv, { since: 'str', agent: 'str', misses: 'str', json: 'bool' });
+  if (o.agent && !['claude', 'codex'].includes(o.agent)) die('--agent must be claude or codex');
+  // Every stored verdict by default: the question is the whole record, and the
+  // index already drops sessions idle past its retention.
+  const result = watcher.scoreLive({ sinceMs: o.since ? turnsSince(o.since) : 0, agent: o.agent || null });
+  if (o.json) return console.log(JSON.stringify(result, null, 2));
+  const unanswered = Object.entries(result.unanswered).map(([verdict, n]) => `${n} ${verdict}`).join(', ');
+  console.log(`${result.verdicts} live verdicts; ${unanswered ? `no reply yet to ${unanswered}` : 'every one has a reply'}\n`);
+  if (!result.total) return console.log(`no scorable turns (${watcherSkips(result)})`);
+  console.log(renderScoreboard(result, watcher));
+  const limit = o.misses == null ? 10 : turnsIndexNumber(o.misses, '--misses');
+  const misses = result.samples.filter((sample) => !sample.agreed).slice(0, limit);
+  if (misses.length) {
+    console.log(`\nnewest ${misses.length} misses (--misses n for more, --json for all):`);
+    for (const miss of misses) {
+      console.log(`\n${turnsStamp(miss.at)}  ${String(miss.session).slice(0, 8)}#${miss.n}  said ${miss.actual}`
+        + `${miss.confidence == null ? '' : ` (${miss.confidence})`}, Owner did ${miss.expected} [${miss.rule}]`);
+      if (miss.message) console.log(`    proposed: ${turnsClip(miss.message, 110)}`);
+      console.log(`    typed:    ${turnsClip(miss.nextOpener, 110)}`);
+    }
+  }
+}
+
 function watcherPct(value) {
   return value == null ? '   -' : `${Math.round(value * 100)}%`.padStart(4);
 }
@@ -323,12 +350,12 @@ function watcherLive(argv) {
 
 const WATCHER_SUBCOMMANDS = {
   run: watcherRun, ls: watcherLs, replay: watcherReplay, stats: watcherStats, live: watcherLive,
-  compare: watcherCompare,
+  compare: watcherCompare, score: watcherScore,
 };
 
 commands.watcher = async (argv) => {
   const sub = WATCHER_SUBCOMMANDS[argv[0]];
-  if (!sub) die('usage: keep watcher run|ls|compare|replay|stats|live (see keep help watcher)');
+  if (!sub) die('usage: keep watcher run|ls|compare|replay|score|stats|live (see keep help watcher)');
   return sub(argv.slice(1));
 };
 

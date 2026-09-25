@@ -408,6 +408,29 @@ history, so putting them in front of Owner would pollute the agreement rate he i
 actually being asked to produce. The output is precision and recall per verdict
 plus the confusion table.
 
+## Scoring live verdicts
+
+`keep watcher score` applies the same ground truth to the verdicts the console
+**actually showed**, instead of re-judging history. The verdict being measured is
+already on the turn row and the reply is the next turn's opener, so it is a join:
+no model call, nothing written, and grading buttons Owner never pressed cost no
+signal. Every stored live verdict is scored unless `--since` narrows it; replay
+verdicts are left out because they were never in front of Owner. A verdict whose
+session has no following turn yet is counted as unanswered, not scored.
+
+The first run over live verdicts (2,107 scored, September 2026) found two ground
+truth defects that replay's samples had been too few to show, both fixed in the
+rules above:
+
+- **Openers nobody typed as a reply.** A slash command injected into the pane
+  (`/compact`), Claude Code's compaction summary, Keep's account-move
+  continuation, an interrupt marker, and a `From #n:` relay all reach the index as
+  `human`. They are skipped by name (`MACHINE_OPENERS`) rather than reclassified
+  in the index, so the fix applies to rows already stored.
+- **A bare "let's" is not a nudge.** "let's test safari on my mac" is a new
+  instruction; only "let's" followed by a go-ahead ("let's do it", "let's go")
+  counts as an affirmative.
+
 ## Daemon
 
 `keep serve` runs `watcherTick` immediately after each `turnIndexTick` (the

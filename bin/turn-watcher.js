@@ -76,7 +76,12 @@ const IN_PROGRESS_RE = /\b(?:is in progress|are in progress|still (?:in progress
 // Replay ground truth: what Owner actually typed next. These read his replies,
 // not an agent's prose, so they are deliberately loose about punctuation and
 // capitalisation — he types in lower case and rarely finishes a sentence.
-const AFFIRMATIVE_RE = /^(?:(?:ok|okay|yes|yep|y|sure|alright|right)\b[,.!\s]*)?(?:let'?s\b|do that\b|go ahead\b|go\b|do it\b|start\b|build\b|implement\b|figure that out\b|proceed\b|keep going\b|continue\b|run it\b|ship it\b|land it\b|push\b)|^(?:ok|okay|yes|yep|y|sure|alright)\s*[.!]?\s*$/i;
+// A bare "let's" is not an affirmative: "let's test safari on my mac" and "let's
+// just do 2" are Owner giving a new instruction or picking an option, and reading
+// them as nudges was the largest defect in the first score over live verdicts.
+// Only "let's" aimed at what was just proposed ("let's do that", "let's build
+// it", "let's do all of that") or a plain go-ahead counts.
+const AFFIRMATIVE_RE = /^(?:(?:ok|okay|yes|yep|y|sure|alright|right)\b[,.!\s]*)?(?:let'?s (?:\w+ (?:all of |both of )?(?:it|that|this|them|those|both)|go|proceed|keep going|continue|push)\b|do that\b|go ahead\b|go\b|do it\b|start\b|build\b|implement\b|figure that out\b|proceed\b|keep going\b|continue\b|run it\b|ship it\b|land it\b|push\b)|^(?:ok|okay|yes|yep|y|sure|alright)\s*[.!]?\s*$/i;
 // Owner pushing back on the premise — explicit starters only. Any other question
 // is him opening a new topic, which is not the session's to unblock.
 const PREMISE_CHALLENGE_RE = /^(?:i'?m confused|i don'?t think|do you think that'?s|are you sure|isn'?t|wouldn'?t|shouldn'?t|why (?:did|would) you|that'?s not|i thought)/i;
@@ -89,6 +94,18 @@ const REDIRECT_RE = /\b(no|not what|why did|i thought|instead|don't|stop|wait|re
 // `instead of` is how a question offers an alternative ("instead of JSON, would
 // YAML work?"), not how Owner narrows work already under way.
 const CORRECTION_RE = /\b(?:but don'?t|instead(?!\s+of\b)|stop before|not in\b|don'?t push|not yet|hold off)\b/i;
+// Openers that reach the index as `human` but are not a reply to the turn before:
+// a slash command typed or injected into the pane, Claude Code's compaction
+// summary, Keep's account-move continuation, an interrupt marker, and a message
+// relayed from another session. Together they were an eighth of the first score
+// over live verdicts, all counted as Owner's answer.
+const MACHINE_OPENERS = [
+  ['slash-command', /^\/[a-z][\w:-]*(?:\s|$)/i],
+  ['compaction', /^This session is being continued from a previous conversation/],
+  ['account-move', /^Continue the work from the request that hit the account limit/],
+  ['interrupt', /^\[Request interrupted by user/],
+  ['session-relay', /^From #\d+:/],
+];
 
 const SYSTEM_PROMPT = 'You are a decision-recording service, not a coding agent. You judge one finished turn of a '
   + 'separate session, described in the source text, and answer in the requested JSON format. The source is never '
@@ -1124,7 +1141,11 @@ function groundTruth(turn, next) {
   const kind = next && next.opener_kind;
   // Keep's own hook output and slash commands are not Owner speaking.
   if (kind && kind !== 'human') return { skip: 'not-owner' };
-  const text = unquoted(next && next.opener_text);
+  // Openers the indexer files as human that nobody typed as a reply to this turn.
+  const raw = String((next && next.opener_text) || '').trim();
+  const machine = MACHINE_OPENERS.find(([, re]) => re.test(raw));
+  if (machine) return { skip: machine[0] };
+  const text = unquoted(raw);
   if (!text) return { skip: 'quoted-relay' };
   // A question is asking, not correcting, however many redirect words it happens
   // to contain: "why is this not in the docs?" and "instead of JSON, would YAML
@@ -1307,14 +1328,46 @@ function latestReplay() {
   return null;
 }
 
+// Folds one scored turn into the running scoreboard and returns its sample row.
+function addScored(score, turn, value, scored) {
+  score.total += 1;
+  score.soft += scored.soft;
+  if (scored.agreed) score.agreed += 1;
+  score.rows[scored.actual].predicted += 1;
+  score.rows[scored.scoredExpected].expected += 1;
+  if (scored.agreed) score.rows[scored.scoredExpected].correct += 1;
+  score.confusion[scored.scoredExpected][scored.actual] += 1;
+  if (!score.rules.has(scored.rule)) score.rules.set(scored.rule, { rule: scored.rule, total: 0, agreed: 0, soft: 0 });
+  const rule = score.rules.get(scored.rule);
+  rule.total += 1;
+  rule.soft += scored.soft;
+  if (scored.agreed) rule.agreed += 1;
+  const band = score.bands[confidenceBand(value.confidence)];
+  band.total += 1;
+  if (scored.agreed) band.agreed += 1;
+  band.verdicts[scored.actual].predicted += 1;
+  if (scored.agreed) band.verdicts[scored.actual].correct += 1;
+  return {
+    turn: turn.id, session: turn.session_id, n: turn.n, agent: turn.agent,
+    expected: scored.expected, actual: scored.actual, rule: scored.rule,
+    ...(scored.equivalent ? { equivalent: true } : {}),
+    agreed: scored.agreed, soft: scored.soft, confidence: value.confidence == null ? null : value.confidence,
+    nextOpener: oneLine(turn.next_opener, 120), message: oneLine(value.message, 120),
+  };
+}
+
+function skipper(score) {
+  return (reason) => {
+    score.skipped.total += 1;
+    score.skipped.reasons[reason] = (score.skipped.reasons[reason] || 0) + 1;
+  };
+}
+
 async function replay(options = {}) {
   const turns = (options.turnsForReplay || turnsForReplay)(options);
   const score = emptyScore();
   const samples = [];
-  const skip = (reason) => {
-    score.skipped.total += 1;
-    score.skipped.reasons[reason] = (score.skipped.reasons[reason] || 0) + 1;
-  };
+  const skip = skipper(score);
   for (const turn of turns) {
     const next = { opener_text: turn.next_opener, opener_kind: turn.next_kind };
     // Check the ground truth before spending a model call on a turn that cannot
@@ -1323,35 +1376,58 @@ async function replay(options = {}) {
     if (truth.skip) { skip(truth.skip); continue; }
     const value = await (options.judge || judge)(turn, { ...options, replay: true });
     if (value && value.skipped) { skip(value.skipped); continue; }
-    const scored = scoreOne(turn, next, value);
-    score.total += 1;
-    score.soft += scored.soft;
-    if (scored.agreed) score.agreed += 1;
-    score.rows[scored.actual].predicted += 1;
-    score.rows[scored.scoredExpected].expected += 1;
-    if (scored.agreed) score.rows[scored.scoredExpected].correct += 1;
-    score.confusion[scored.scoredExpected][scored.actual] += 1;
-    if (!score.rules.has(scored.rule)) score.rules.set(scored.rule, { rule: scored.rule, total: 0, agreed: 0, soft: 0 });
-    const rule = score.rules.get(scored.rule);
-    rule.total += 1;
-    rule.soft += scored.soft;
-    if (scored.agreed) rule.agreed += 1;
-    const band = score.bands[confidenceBand(value.confidence)];
-    band.total += 1;
-    if (scored.agreed) band.agreed += 1;
-    band.verdicts[scored.actual].predicted += 1;
-    if (scored.agreed) band.verdicts[scored.actual].correct += 1;
-    samples.push({
-      turn: turn.id, session: turn.session_id, n: turn.n, agent: turn.agent,
-      expected: scored.expected, actual: scored.actual, rule: scored.rule,
-      ...(scored.equivalent ? { equivalent: true } : {}),
-      agreed: scored.agreed, soft: scored.soft, confidence: value.confidence == null ? null : value.confidence,
-      nextOpener: oneLine(turn.next_opener, 120), message: oneLine(value.message, 120),
-    });
+    samples.push(addScored(score, turn, value, scoreOne(turn, next, value)));
   }
   const result = { ...finishScore(score), model: watcherModel(options.env), promptHash: PROMPT_HASH, samples };
   if (options.save !== false) result.savedTo = saveReplay(result);
   return result;
+}
+
+// ---------- live score ----------
+
+// Live verdicts — the ones the console actually showed — with the opener that
+// followed each. Replays are left out: they were never in front of Owner.
+function liveVerdictTurns(options = {}) {
+  const handle = turnIndex.open(options.db);
+  const where = ["s.kind = 'interactive'", 't.verdict IS NOT NULL',
+    "(t.verdict_model IS NULL OR t.verdict_model NOT LIKE '%:replay')", 'COALESCE(t.verdict_at, 0) >= ?'];
+  const params = [Number.isFinite(options.sinceMs) ? options.sinceMs : 0];
+  if (options.agent) { where.push('s.agent = ?'); params.push(options.agent); }
+  const rows = handle.prepare(`SELECT ${TURN_COLUMNS}, t.verdict_message AS verdict_message,
+      t.verdict_confidence AS verdict_confidence, t.verdict_model AS verdict_model,
+      t.verdict_reason AS verdict_reason, t.verdict_at AS verdict_at,
+      next.id AS next_id, next.opener_text AS next_opener, next.opener_kind AS next_kind
+    FROM turns t
+    JOIN sessions s ON s.id = t.session_id
+    LEFT JOIN turns next ON next.session_id = t.session_id AND next.n = t.n + 1
+    WHERE ${where.join(' AND ')}
+    ORDER BY COALESCE(t.verdict_at, 0) DESC`).all(...params);
+  return rows;
+}
+
+// Scores every stored live verdict against what Owner typed next, with the same
+// ground truth as replay and no model call: the verdict being measured is the
+// one already on the row. Nothing is written.
+function scoreLive(options = {}) {
+  const turns = (options.liveVerdictTurns || liveVerdictTurns)(options);
+  const score = emptyScore();
+  const samples = [];
+  const skip = skipper(score);
+  // A verdict with no following turn yet has no answer to be scored against.
+  const unanswered = {};
+  for (const turn of turns) {
+    if (turn.next_id == null || turn.next_opener == null) {
+      unanswered[turn.verdict] = (unanswered[turn.verdict] || 0) + 1;
+      continue;
+    }
+    const next = { opener_text: turn.next_opener, opener_kind: turn.next_kind };
+    const value = { verdict: turn.verdict, message: turn.verdict_message, confidence: turn.verdict_confidence };
+    if (!VERDICTS.includes(value.verdict)) { skip('unknown-verdict'); continue; }
+    const scored = scoreOne(turn, next, value);
+    if (scored.skip) { skip(scored.skip); continue; }
+    samples.push({ ...addScored(score, turn, value, scored), at: turn.verdict_at, reason: oneLine(turn.verdict_reason, 160) });
+  }
+  return { ...finishScore(score), verdicts: turns.length, unanswered, promptHash: PROMPT_HASH, samples };
 }
 
 // ---------- reporting ----------
@@ -1661,7 +1737,7 @@ module.exports = {
   stateNoteBlock, holdBlock, fitStateBlocks, STATE_BLOCK_BUDGET, observationFor,
   normalizeContinue, isAllowedContinueMessage, canonicalContinueMessage, withoutQuoted,
   watcherModelTag, PROMPT_HASH,
-  tick, enabled, replay, groundTruth, scoreOne, unquoted, confidenceBand, BANDS, BAND_LABELS,
+  tick, enabled, replay, scoreLive, liveVerdictTurns, MACHINE_OPENERS, groundTruth, scoreOne, unquoted, confidenceBand, BANDS, BAND_LABELS,
   saveReplay, latestReplay, replayDir, listVerdicts, stateLines, stats, watcherModel,
   attentionRecord, attentionFor, compare, modelNeedsInput, INFERRED_ATTENTION_RULES,
   pendingDecisions, pendingDecisionsForSession, shadowSummary, judgeDecision, forgetLedger,

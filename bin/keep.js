@@ -4123,6 +4123,9 @@ ${stepUsage()}
                          # is the real question; drift is counted apart and left out of the 2x2
   keep watcher replay [--since when] [--limit n] [--agent claude|codex] [--json]
                          # re-judge history and score each verdict against what Owner actually typed
+  keep watcher score [--since when] [--agent claude|codex] [--misses n] [--json]
+                         # score the verdicts the console actually showed against what Owner typed next;
+                         # no model call, nothing written; every stored verdict unless --since
   keep watcher stats [--since when] [--json]
                          # verdict counts plus the shadow-decision agreement rate per type
                          # the daemon tick is off unless KEEP_WATCHER=1
