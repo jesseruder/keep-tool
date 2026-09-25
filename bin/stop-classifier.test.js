@@ -235,7 +235,8 @@ test('attach sets and clears the verdict from the cache only', () => {
 });
 
 test('the prompt reads an unstarted plan as ASKS and a promise with nothing scheduled as not RUNNING', () => {
-  assert.match(classifier.INSTRUCTION, /proposes, plans or discusses work it has not started/);
+  assert.match(classifier.INSTRUCTION, /proposing its own next work that it has not started/);
+  assert.match(classifier.INSTRUCTION, /Conditional or retrospective advice in a finished report/);
   assert.match(classifier.INSTRUCTION, /RUNNING only when something will wake the agent/);
   assert.match(classifier.INSTRUCTION, /while the scheduled check line says none is not RUNNING/);
 });

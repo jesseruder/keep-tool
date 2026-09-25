@@ -13212,22 +13212,23 @@ function buildState(options = {}) {
   applyCompanionJobs(sessions, options.companion);
   // What the classifier reads off the card: whether this session is its latest linked
   // session (to judge a paneless session's final ask; session-model derives the same)
-  // and the card's scheduled check, which is what wakes a session that says it waits.
+  // and, for the session the check will wake, the card's scheduled check.
   const checkFlight = new Map();
+  const listedSessions = new Set(sessions.map((session) => session.id));
+  // The scheduler if Keep still lists it, else the latest linked session it lists.
+  const checkOwnerId = (fm) => (fm.scheduled_by && listedSessions.has(fm.scheduled_by) ? fm.scheduled_by
+    : (fm.sessions || []).map((entry) => entry.id).filter((id) => listedSessions.has(id)).at(-1) || null);
   for (const session of sessions) {
     const task = taskById.get(session.taskId);
     const fm = task?.fm;
     session.cardLatest = Boolean(fm) && (fm.sessions || []).at(-1)?.id === session.id;
     if (task && !checkFlight.has(task.id)) checkFlight.set(task.id, require('./runs').checkInFlight(task, now));
-    session.cardCheck = require('./session-model').cardCheck(fm, { now, inFlight: checkFlight.get(task?.id) === true });
+    session.cardCheck = fm && checkOwnerId(fm) === session.id
+      ? require('./session-model').cardCheck(fm, { now, inFlight: checkFlight.get(task.id) === true }) : null;
   }
   // Cache reads only; the daemon queues missing verdicts once agent sessions are
   // marked (below), or in the worker's finalize.
   require('./stop-classifier').attach(sessions);
-  const listedSessions = new Set(sessions.map((session) => session.id));
-  // The scheduler if Keep still lists it, else the latest linked session it lists.
-  const checkOwnerId = (fm) => (fm.scheduled_by && listedSessions.has(fm.scheduled_by) ? fm.scheduled_by
-    : (fm.sessions || []).map((entry) => entry.id).filter((id) => listedSessions.has(id)).at(-1) || null);
   for (const session of sessions) {
     const task = taskById.get(session.taskId);
     if (task && !dependencyCache.has(task.id)) dependencyCache.set(task.id, keep.unresolvedDependencyIds(task));
