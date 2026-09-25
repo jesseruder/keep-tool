@@ -2599,8 +2599,11 @@ Two things are understood and deliberately not fixed here; they are their own ca
 on spends a model account, so it is Owner's switch to flip, per area, and only after the
 parser has run clean. Recipes ship for `sandboxes` and, since 2026-09-25, `app-server`
 (`docs/agents/app-server.md`: the default area, so every alert no other area claims —
-GraphQL faults, app latency, the worker, Aurora, Redis, ClickHouse, the ECS services);
-flipping `"session": true` on `app-server` is all it takes to run it. `account` defaults to `claude-secondary`, `restartAfterIdleMin` to
+GraphQL faults, app latency, the worker, Aurora, Redis, ClickHouse, the ECS services),
+and since 2026-09-25 also `cauldron` (`docs/agents/cauldron.md`: the `^Cauldron ` alerts
+from `#errors-multiplayer` — the multiplayer host-agent, proxy, runtime shim and their
+fleet, working in `~/wt/cauldron-game-server/responder`); flipping `"session": true` on
+an area with a recipe is all it takes to run it. `account` defaults to `claude-secondary`, `restartAfterIdleMin` to
 120, and `agent` to the area's own name. Several areas may share one `agent` so their
 events land in one feed, but only one of them may set `session: true`: two that do are a
 config error and neither runs (see **Restart from the log**).
