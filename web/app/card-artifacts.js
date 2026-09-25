@@ -119,24 +119,52 @@ function ensureBlob(ctx, card, item) {
 }
 
 // The full-size view: the image over a dimmed console, closed by a click anywhere or
-// Escape. While it is up it takes every key, ahead of the console's own handlers and a
-// focused terminal (a bare ESC in a Claude pane is an interrupt), and focus leaves the
-// terminal so nothing typed reaches the hidden pane. Closing gives focus back.
-let viewerReturnFocus = null;
+// Escape; ← and → step through the card's other images that have loaded. While it is
+// up it takes every key, ahead of the console's own handlers and a focused terminal
+// (a bare ESC in a Claude pane is an interrupt), and focus leaves the terminal so
+// nothing typed reaches the hidden pane. Closing gives focus back.
+let viewer = null;
 
-function openViewer(url, name) {
+// The card's images that can be shown, in the listing's order: those with thumbnails
+// whose bytes have arrived.
+function viewerImages(card) {
+  return (lists.get(card)?.value?.artifacts || [])
+    .filter((item, index) => item.image && index < THUMB_LIMIT)
+    .map((item) => ({ item, url: blobs.get(blobKey(card, item))?.url }))
+    .filter((entry) => entry.url);
+}
+
+function showInViewer(item, url) {
+  const images = viewerImages(viewer.card);
+  const index = images.findIndex((entry) => entry.item.name === item.name);
+  viewer.name = item.name;
+  viewer.image.src = url;
+  viewer.image.alt = item.name;
+  viewer.overlay.setAttribute('aria-label', item.name);
+  viewer.caption.textContent = images.length > 1 ? `${item.name} · ${index + 1} / ${images.length}` : item.name;
+}
+
+function stepViewer(delta) {
+  const images = viewerImages(viewer.card);
+  if (images.length < 2) return;
+  const index = images.findIndex((entry) => entry.item.name === viewer.name);
+  const next = images[(Math.max(index, 0) + delta + images.length) % images.length];
+  showInViewer(next.item, next.url);
+}
+
+function openViewer(card, item, url) {
   closeViewer();
-  viewerReturnFocus = document.activeElement;
   const overlay = document.createElement('div');
   overlay.className = 'artifact-viewer';
   overlay.tabIndex = -1;
   overlay.setAttribute('role', 'dialog');
   overlay.setAttribute('aria-modal', 'true');
-  overlay.setAttribute('aria-label', name);
   const image = document.createElement('img');
-  image.src = url;
-  image.alt = name;
-  overlay.append(image);
+  const caption = document.createElement('p');
+  caption.className = 'artifact-viewer-caption';
+  overlay.append(image, caption);
+  viewer = { card, name: item.name, overlay, image, caption, returnFocus: document.activeElement };
+  showInViewer(item, url);
   overlay.addEventListener('click', closeViewer);
   window.addEventListener('keydown', viewerKey, true);
   document.body.append(overlay);
@@ -146,17 +174,19 @@ function openViewer(url, name) {
 function viewerKey(event) {
   event.preventDefault();
   event.stopImmediatePropagation();
-  if (event.key === 'Escape' && !event.metaKey && !event.ctrlKey && !event.altKey) closeViewer();
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  if (event.key === 'Escape') closeViewer();
+  else if (event.key === 'ArrowLeft') stepViewer(-1);
+  else if (event.key === 'ArrowRight') stepViewer(1);
 }
 
 function closeViewer() {
   window.removeEventListener('keydown', viewerKey, true);
-  const overlay = document.querySelector('.artifact-viewer');
-  if (!overlay) return;
+  if (!viewer) return;
+  const { overlay, returnFocus } = viewer;
+  viewer = null;
   overlay.remove();
-  const previous = viewerReturnFocus;
-  viewerReturnFocus = null;
-  if (previous?.isConnected && typeof previous.focus === 'function') previous.focus();
+  if (returnFocus?.isConnected && typeof returnFocus.focus === 'function') returnFocus.focus();
 }
 
 function install(ctx) {
@@ -183,7 +213,7 @@ function install(ctx) {
     if (!item) return;
     if (target.hasAttribute('data-artifact-open')) {
       const url = blobs.get(blobKey(card, item))?.url;
-      if (url) openViewer(url, name);
+      if (url) openViewer(card, item, url);
       return;
     }
     try {

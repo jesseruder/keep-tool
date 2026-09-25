@@ -165,8 +165,8 @@ as an attachment. Every response carries `X-Content-Type-Options: nosniff` and
 an SVG opened directly runs no script. The console fetches the bytes with the header
 and shows them from blob URLs rather than pointing an `<img>` at the route (a session
 cookie alone does not reach it); a thumbnail opens full size in an overlay on the
-console (click or Escape closes it; the desktop and phone shells drop `window.open`),
-and any other file is downloaded.
+console (← and → step through the card's loaded images; a click or Escape closes it;
+the desktop and phone shells drop `window.open`), and any other file is downloaded.
 
 The console detects the mobile shell as `window.keepShell`
 (`{ platform, version, post(message) }`, injected before page scripts) and sets
