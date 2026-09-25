@@ -518,3 +518,25 @@ test('whether a node still holds a conversation reads every process there, not o
   await assert.rejects(serve.sessionHeldOn('aws1', sid, 'claude', deps(undefined)), /environments on aws1 could not be read/);
   await assert.rejects(serve.sessionHeldOn('aws1', sid, 'codex', deps([])), /open rollouts on aws1 could not be read/);
 });
+
+test('a machine with more processes than the ownership check reads is never taken as proof', async () => {
+  const serve = require('./serve');
+  const handoff = require('./account-handoff');
+  const sid = 'node-held-crowded';
+  // The writer is the last of 16,390 processes, past any slice, and its arguments do
+  // not name the session.
+  const rows = [{ pid: 1, ppid: 0, pidStart: 'boot', args: 'init' },
+    ...Array.from({ length: 16390 }, (_, i) => ({ pid: i + 2, ppid: 1, pidStart: `p${i}`, args: 'sleep 1' }))];
+  const envAsked = [];
+  const deps = { daemonNode: 'main', hostNodes: ['main', 'aws1'], agentProcessRows: async () => rows,
+    hostRequest: async (_type, params) => {
+      if (params.pids) envAsked.push(params.pids.length);
+      return { rows, env: [{ pid: 16391, sessionId: sid }] };
+    } };
+  await assert.rejects(serve.sessionHeldOn('aws1', sid, 'claude', deps),
+    /aws1 runs 16390 processes, more than the 16384 an ownership check reads/);
+  assert.deepEqual(envAsked, [], 'no partial read is taken');
+  // Through a transfer's proof, that is a stop not yet verified, which a retry may clear.
+  const message = `Source exit could not be verified: the session's processes could not be read (aws1 runs 16390 processes, more than the 16384 an ownership check reads)`;
+  assert.equal(handoff.classifyRefusal(message), 'transient');
+});

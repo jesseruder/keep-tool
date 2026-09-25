@@ -14320,6 +14320,7 @@ async function agentLiveOn(node, sessionId, deps = {}, agent = 'claude') {
 // open (a Codex session). This is what proves a stop that was never confirmed: a
 // descendant of the stopped agent reparented between two snapshots is in no recorded
 // set, and only a look at every process finds it. Throws when any of it cannot be read.
+const SESSION_HOLD_MAX_PIDS = 16384;
 async function sessionHeldOn(node, sessionId, agent, deps = {}) {
   if (await agentLiveOn(node, sessionId, deps, agent)) return true;
   const local = node === daemonNodeName(deps);
@@ -14330,7 +14331,12 @@ async function sessionHeldOn(node, sessionId, agent, deps = {}) {
   const rows = Array.isArray(first && first.rows) ? first.rows : null;
   if (!rows || !rows.length) throw new Error(`the process table on ${node} came back empty`);
   if (rows.some((row) => row && typeof row.args === 'string' && row.args.includes(sessionId))) return true;
-  const pids = rows.map((row) => row && row.pid).filter((pid) => Number.isInteger(pid) && pid > 1).slice(0, 16384);
+  // Every process, or no answer: a proof that read only some of them has not looked
+  // at the rest, and one of those could be the writer.
+  const pids = rows.map((row) => row && row.pid).filter((pid) => Number.isInteger(pid) && pid > 1);
+  if (pids.length > SESSION_HOLD_MAX_PIDS) {
+    throw new Error(`${node} runs ${pids.length} processes, more than the ${SESSION_HOLD_MAX_PIDS} an ownership check reads`);
+  }
   const detail = await ask({ pids, env: true, codexEnv: true, ...(agent === 'codex' ? { files: true } : {}) });
   if (!detail || !Array.isArray(detail.env)) throw new Error(`the process environments on ${node} could not be read`);
   if (detail.env.some((entry) => entry && entry.sessionId === sessionId)) return true;

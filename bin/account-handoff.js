@@ -864,6 +864,17 @@ async function run(body, deps = {}) {
       const error = new Error(LIMIT_GONE); error.status = 409; throw error;
     }
     requireNoLaterActivity(body, inspected?.session);
+    const sourceIdentity = inspected.agentIdentity?.primary === true && Number.isInteger(inspected.agentIdentity.pid)
+      && inspected.agentIdentity.pid > 0 && typeof inspected.agentIdentity.pidStart === 'string'
+      && inspected.agentIdentity.pidStart && inspected.agentIdentity.ownsPane === true ? inspected.agentIdentity : null;
+    // A Retry of a recorded transaction stops only the source that transaction
+    // recorded, never whatever the pane runs now. Asked before the record is touched at
+    // all (an interrupted working record is rewritten to recovery-needed just below),
+    // so a refused Retry leaves it exactly as it was. A live pane in a target phase is
+    // the target's, and the recovery below verifies it as one.
+    if (current && pane.alive && !['starting-target', 'verifying-target', 'opening-target', 'delivering-continuation'].includes(current.phase)) {
+      requireRecordedSource(current, pane, sourceIdentity);
+    }
     if (current && force) current.force = true;
     if (current && ownerForce) current.ownerForce = true;
     if (current && current.status !== 'recovery-needed') {
@@ -877,9 +888,6 @@ async function run(body, deps = {}) {
     }
     const agent = session.kind;
     const providerArtifacts = artifactProvider(agent, deps);
-    const sourceIdentity = inspected.agentIdentity?.primary === true && Number.isInteger(inspected.agentIdentity.pid)
-      && inspected.agentIdentity.pid > 0 && typeof inspected.agentIdentity.pidStart === 'string'
-      && inspected.agentIdentity.pidStart && inspected.agentIdentity.ownsPane === true ? inspected.agentIdentity : null;
     const intent = current?.intent || requestedIntent || 'continue';
     if (source.id === target.id) { const error = new Error('source and target account are the same'); error.status = 409; throw error; }
     if (current?.openedAt && intent === 'open-only') return finishOpenOnly(current, target, root);
@@ -981,9 +989,6 @@ async function run(body, deps = {}) {
       }
     }
     if (!pane.alive) { const error = new Error('Interrupted handoff requires explicit recovery'); error.status = 409; throw error; }
-    // A Retry of a recorded transaction stops only the source that transaction
-    // recorded, never whatever the pane runs now.
-    if (current) requireRecordedSource(current, pane, sourceIdentity);
     const sourceMcpConfigs = [];
     if (agent === 'claude' && deps.sourceMcpConfigs) {
       // The node prepares its own copy of the source's shared setup, as its launch did.

@@ -1970,6 +1970,34 @@ test('a Retry past the stop refuses a pane that is running again, here and on a 
   }
 });
 
+test('a Retry of a working record whose daemon died leaves it byte for byte when the pane was relaunched', async () => {
+  for (const onNode of [false, true]) {
+    const f = fixture();
+    try {
+      const d = onNode ? nodeDeps(f) : deps(f);
+      const paneId = onNode ? 'pane-1@aws1' : 'pane-1';
+      if (onNode) {
+        d.artifactProvider = { ...d.artifactProvider, copyClaudeArtifacts: async () => { throw new Error('host request timed out asking aws1 to copy'); } };
+      } else {
+        d.rebindLedger = () => { throw new Error('job ledger source evidence is unavailable'); };
+      }
+      await assert.rejects(handoff.run({ sessionId: f.sid, pane: paneId, accountId: 'two', ownerForce: true }, d));
+      // As a daemon that died mid-copy left it: still saying it is copying, and fresh.
+      const file = path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`);
+      const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+      Object.assign(record, { status: 'copying', reason: '', updatedAt: Date.now() });
+      delete record.refusalClass;
+      fs.writeFileSync(file, JSON.stringify(record, null, 2) + '\n');
+      const bytes = fs.readFileSync(file);
+      Object.assign(d.pane, { alive: true, pid: 30, createdAt: 'relaunched-elsewhere' });
+      d.restartSession = async () => assert.fail('a pane this transfer did not launch must not be stopped');
+      await assert.rejects(handoff.run({ sessionId: f.sid, pane: paneId, accountId: 'two', ownerForce: true }, d),
+        /is running again; nothing was stopped and the transfer record was left as it is/);
+      assert.ok(fs.readFileSync(file).equals(bytes), 'the record is exactly as it was');
+    } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+  }
+});
+
 test('a Retry of a stop that was only begun stops only the recorded source', async () => {
   const f = fixture();
   try {
