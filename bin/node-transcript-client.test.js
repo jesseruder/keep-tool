@@ -664,6 +664,10 @@ test('a node that falls silent keeps its rows on their last read, without a size
     assert.equal(cut.lastAssistant, first.lastAssistant);
     assert.equal('size' in cut, false);
 
+    // A last read older than a silent node's remembered panes is history, not a row.
+    f.advance(10 * 60e3);
+    assert.equal(await serve.remoteSessionFreshness([f.pane], f.deps, { skipNodes: ['aws3'] }), null);
+
     // A session nothing was ever read for has nothing to stand on.
     const unread = { ...f.pane, meta: { ...f.pane.meta, sessionId: 'sess-never-read' } };
     assert.equal(await serve.remoteSessionFreshness([unread], f.deps, { skipNodes: ['aws3'] }), null);

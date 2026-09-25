@@ -4251,7 +4251,9 @@ function remoteCodexModel(entry, node, sessionId, deps = {}) {
 function peekRemoteSession(node, sessionId, agent, deps = {}) {
   const codexRow = agent === 'codex';
   const entry = remoteTranscriptCache.get(codexRow ? `codex\0${node}\0${sessionId}` : `${node}\0${sessionId}`);
-  if (!entry || !entry.tail) return undefined;
+  // Only as old as a silent node's remembered panes may be: past that it is history.
+  const now = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
+  if (!entry || !entry.tail || now - entry.at >= HOST_PANES_SLOW_REUSE_MS) return undefined;
   return codexRow ? remoteCodexModel(entry, node, sessionId, deps) : remoteClaudeModel(entry, node, sessionId, deps);
 }
 
@@ -4401,21 +4403,18 @@ async function remoteSessionFreshness(panes, deps = {}, { skipNodes = null } = {
     const { size: _unread, ...row } = cached;
     out[id] = row;
   };
-  for (const pane of remote.filter((candidate) => skip.has(candidate.node))) {
-    try { if (sessionNodeOf({ id: pane.meta.sessionId }, deps) === pane.node) peek(pane); } catch {}
-  }
   const wanted = remote.filter((pane) => !skip.has(pane.node));
   const reads = Promise.all(wanted.map(async (pane) => {
     const id = pane.meta.sessionId;
     try {
       if (sessionNodeOf({ id }, deps) !== pane.node) return;
-      // The last answer first, so a node read slower than the budget below leaves
-      // the row on it this cycle rather than on none; the read, when it lands in
-      // time, replaces it.
-      peek(pane);
       // A Pi session on a node has no transcript row here: what the node gives is its
       // phase, which the host-only row (backfillHostSessions) takes its turn state from.
       if (pane.meta.agent === 'pi') {
+        // The last answer first, so a node read slower than the budget below leaves
+        // the row on its cached phase this cycle rather than on none; the read, when
+        // it lands in time, replaces it.
+        peek(pane);
         const piEvent = await (deps.cachedRemotePiEvent || cachedRemotePiEvent)(pane.node, id, deps);
         out[id] = { id, kind: 'pi', node: pane.node, piEvent: piEvent || null };
         return;
@@ -4431,6 +4430,11 @@ async function remoteSessionFreshness(panes, deps = {}, { skipNodes = null } = {
   let timer;
   await Promise.race([reads, new Promise((resolve) => { timer = setTimeout(resolve, budgetMs); })]);
   clearTimeout(timer);
+  // Whatever did not answer in time, or was not asked, stands on its last read.
+  for (const pane of remote) {
+    if (Object.prototype.hasOwnProperty.call(out, pane.meta.sessionId)) continue;
+    try { if (sessionNodeOf({ id: pane.meta.sessionId }, deps) === pane.node) peek(pane); } catch {}
+  }
   const answered = { ...out };
   return Object.keys(answered).length ? answered : null;
 }
