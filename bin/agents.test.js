@@ -974,7 +974,7 @@ test('the provider field survives: a codex session keeps agent and gains agentNa
     const summary = sessionSummary(session);
     assert.equal(summary.agent, 'codex');
     assert.equal(summary.agentName, 'sandboxes');
-    const view = projectMobileState({ sessions: [session], attention: [], tasks: [], panes: [], agents: [{ name: 'sandboxes' }] }, 'fleet');
+    const view = projectMobileState({ sessions: [session], attention: [], tasks: [], panes: [], agents: [{ name: 'sandboxes' }] }, 'terminal', 'sess-codex');
     assert.equal(view.sessions[0].agent, 'codex');
     assert.equal(view.sessions[0].agentName, 'sandboxes');
     assert.deepEqual(view.agents, [{ name: 'sandboxes' }]);

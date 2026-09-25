@@ -144,7 +144,8 @@ test('real dashboard routes use the worker snapshot across full, console, mobile
     'the detail route reports the version the console list advertised');
   assert.ok(Array.isArray(consoleState.panes));
 
-  assert.equal((await request(port, '/api/state?view=needs')).status, 200);
+  assert.equal((await request(port, '/api/state?view=notifications')).status, 200);
+  assert.equal((await request(port, '/api/state?view=needs')).status, 400, 'a removed mobile view is an unknown one');
   assert.equal((await request(port, '/api/dashboard-review-search?q=route')).status, 200);
 
   const changed = await request(port, '/api/ui-debug', {

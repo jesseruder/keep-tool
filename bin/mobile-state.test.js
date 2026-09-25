@@ -30,77 +30,45 @@ function fixture() {
   };
 }
 
-test('needs is a bounded allowlist with no done cards or detail bodies', () => {
-  const source = fixture();
-  const view = projectMobileState(source, 'needs');
-  assert.equal(view.view, 'needs');
-  assert.deepEqual(view.tasks.map((task) => task.id), ['open']);
-  assert.equal(view.tasks[0].body, undefined);
-  assert.equal(view.tasks[0].modelUsage, undefined);
-  assert.equal(view.sessions[0].modelUsage, undefined, 'the phone drops session token totals as it drops a card\'s');
-  assert.equal(view.tasks[0].fm.sessions, undefined);
-  assert.equal(view.sessions[0].backgroundJobs, undefined);
-  assert.equal(view.sessions[0].lastAssistantFull, undefined);
-  assert.equal(view.sessions[0].lastAssistant, 'short answer');
-  assert.equal(view.panes[0].cmd, undefined);
-  assert.equal(view.generatedAt, undefined);
-  assert.ok(Buffer.byteLength(JSON.stringify(view)) < 5000);
-});
-
-test('session returns only the selected session and its open task summary', () => {
-  const source = fixture();
-  source.attention.push({ kind: 'permission', sessionId: 'other', pri: 0, since: 4 });
-  const view = projectMobileState(source, 'session', 's');
-  assert.deepEqual(view.sessions.map((session) => session.id), ['s']);
-  assert.equal(view.sessions[0].lastAssistantFull.startsWith('full answer'), true);
-  assert.equal(view.sessions[0].backgroundJobs, undefined);
-  assert.deepEqual(view.tasks.map((task) => task.id), ['open']);
-  assert.deepEqual(view.attention, [source.attention[0]]);
-  assert.equal(view.needsCount, 2, 'shared chrome keeps the global queue count');
-  assert.deepEqual(view.panes.map((pane) => pane.id), ['p']);
-});
-
-test('needs clips list copy while session detail preserves the complete actionable prompt', () => {
+test('notifications carries clipped attention and nothing else', () => {
   const source = fixture();
   source.attention[0].question = 'question '.repeat(1000);
-  source.attention[0].options = [{ label: 'Exact option', recommended: true }];
-  const needs = projectMobileState(source, 'needs');
-  assert.ok(needs.attention[0].question.length <= 500);
-  assert.equal(needs.attention[0].options, undefined);
-  const detail = projectMobileState(source, 'session', 's');
-  assert.equal(detail.attention[0].question, source.attention[0].question);
-  assert.deepEqual(detail.attention[0].options, source.attention[0].options);
+  const view = projectMobileState(source, 'notifications');
+  assert.deepEqual(Object.keys(view).sort(), ['attention', 'view']);
+  assert.equal(view.view, 'notifications');
+  assert.ok(view.attention[0].question.length <= 500);
+  assert.equal(view.attention[0].options, undefined);
+  assert.equal(view.attention[0].sessionId, 's');
 });
 
-test('task detail loads one full body on demand, including a done card', () => {
+test('terminal resolves a session or a pane id to one bounded session and pane', () => {
   const source = fixture();
-  const view = projectMobileState(source, 'task', 'done');
-  assert.equal(view.task.id, 'done');
-  assert.equal(view.task.body, source.tasks[1].body);
-  assert.equal(projectMobileState(source, 'task', 'missing').task, null);
+  source.sessions.push({ id: 'other', pane: 'q' });
+  const bySession = projectMobileState(source, 'terminal', 's');
+  assert.equal(bySession.view, 'terminal');
+  assert.equal(bySession.id, 's');
+  assert.deepEqual(bySession.sessions.map((session) => session.id), ['s']);
+  assert.equal(bySession.sessions[0].lastAssistant, 'short answer');
+  assert.equal(bySession.sessions[0].lastAssistantFull, undefined);
+  assert.equal(bySession.sessions[0].backgroundJobs, undefined);
+  assert.equal(bySession.sessions[0].modelUsage, undefined);
+  assert.deepEqual(bySession.panes.map((pane) => pane.id), ['p']);
+  assert.equal(bySession.panes[0].cmd, undefined);
+  assert.deepEqual(bySession.panes[0].meta, { agent: 'codex', sessionId: 's', project: '/work/keep' });
+  assert.equal(bySession.needsCount, 1, 'shared chrome keeps the global queue count');
+  assert.equal(bySession.generatedAt, undefined);
+  assert.equal(bySession.tasks, undefined);
+
+  const byPane = projectMobileState(source, 'terminal', 'p');
+  assert.deepEqual(byPane.sessions, []);
+  assert.deepEqual(byPane.panes.map((pane) => pane.id), ['p']);
+
+  const missing = projectMobileState(source, 'terminal', 'gone');
+  assert.deepEqual(missing.sessions, []);
+  assert.deepEqual(missing.panes, []);
 });
 
-test('reviewer and notifications carry only their screen-specific data', () => {
-  const source = fixture();
-  const reviewer = projectMobileState(source, 'reviewer');
-  assert.deepEqual(reviewer.review, source.review);
-  assert.equal(reviewer.tasks, undefined);
-  assert.equal(reviewer.sessions, undefined);
-  const notifications = projectMobileState(source, 'notifications');
-  assert.equal(notifications.attention[0].question, source.attention[0].question);
-  assert.equal(notifications.attention[0].options, undefined);
-  assert.equal(notifications.review, undefined);
-});
-
-test('fleet keeps a bounded last message for every session', () => {
-  const source = fixture();
-  source.sessions.push({ id: 'second', state: 'running', lastAssistant: 'second answer' });
-  const fleet = projectMobileState(source, 'fleet');
-  assert.equal(fleet.sessions[0].lastAssistant, 'short answer');
-  assert.equal(fleet.sessions[1].lastAssistant, 'second answer');
-});
-
-test('non-rendered timestamps and verbose internals do not churn a list representation', () => {
+test('non-rendered timestamps and verbose internals do not churn the terminal view', () => {
   const first = fixture();
   const later = structuredClone(first);
   later.generatedAt += 8000;
@@ -108,13 +76,13 @@ test('non-rendered timestamps and verbose internals do not churn a list represen
   first.health.schedulers = [{ name: 'review', state: 'healthy', lastRunAt: 2, lastOkAt: 2 }];
   later.sessions[0].backgroundJobs.lastReconciledAt = 999;
   later.sessions[0].observation.checkedAt = 999;
-  assert.deepEqual(projectMobileState(later, 'needs'), projectMobileState(first, 'needs'));
+  assert.deepEqual(projectMobileState(later, 'terminal', 's'), projectMobileState(first, 'terminal', 's'));
 });
 
-test('views requiring an entity reject missing ids', () => {
+test('terminal requires an id, and removed or unknown views are rejected', () => {
   const source = fixture();
-  for (const view of ['session', 'task', 'terminal']) {
-    assert.throws(() => projectMobileState(source, view), (error) => error.status === 400);
+  assert.throws(() => projectMobileState(source, 'terminal'), (error) => error.status === 400);
+  for (const view of ['needs', 'fleet', 'reviewer', 'session', 'task', 'new', 'unknown']) {
+    assert.throws(() => projectMobileState(source, view, 's'), (error) => error.status === 400 && /unknown mobile state view/.test(error.message));
   }
-  assert.throws(() => projectMobileState(source, 'unknown'), (error) => error.status === 400);
 });

@@ -19,6 +19,7 @@ import Terminal from './src/screens/Terminal';
 import { makeStyles } from './src/ui';
 
 const push = require('./src/push');
+const servers = require('./src/servers');
 const { drainShellQueue, queueShellMessage } = require('./src/bridge');
 
 const CONFIG_KEY = '@keep/config';
@@ -303,6 +304,43 @@ function KeepShell() {
   const styles = useMemo(() => makeStyles(colors), [colors]);
   const [booting, setBooting] = useState(true);
   const [config, setConfig] = useState(null);
+  // Every server this phone has connected to, for Setup to switch between. Only
+  // `config` is active: it alone is registered for push and read by the sweep.
+  const [savedServers, setSavedServers] = useState([]);
+  // The list as it stands now, for the saves below: a callback's captured copy is
+  // a render old, and writing from it would bring back an entry removed since.
+  const serversRef = useRef([]);
+  // False while the stored list has not been read successfully this launch: the
+  // in-memory list is then only the active server, and writing it would erase the
+  // rest. Each change tries the read again first.
+  const serversOkRef = useRef(false);
+  const commitServers = useCallback(async (change) => {
+    if (!serversOkRef.current) {
+      const again = await servers.loadServers(AsyncStorage, configRef.current);
+      if (again.ok) {
+        serversOkRef.current = true;
+        serversRef.current = again.list;
+      }
+    }
+    const list = change(serversRef.current);
+    serversRef.current = list;
+    setSavedServers(list);
+    if (serversOkRef.current) await servers.writeServers(AsyncStorage, list);
+  }, []);
+  // The active config as it is now, for the changes below: Setup can be left with
+  // Back and opened again while one is still running, and the new screen's
+  // callbacks would otherwise carry the config from before it.
+  const configRef = useRef(null);
+  // One server change at a time, across Setup screens: Connect, a switch, Remove and
+  // Forget each move push or the list, and two overlapping leave a registration on
+  // a server nobody is using. A second one is refused with a message Setup shows.
+  const changingRef = useRef(false);
+  const exclusive = useCallback(async (run) => {
+    if (changingRef.current) throw new Error('Another server change is still finishing. Try again in a moment.');
+    changingRef.current = true;
+    try { return await run(); }
+    finally { changingRef.current = false; }
+  }, []);
   const [pushState, setPushState] = useState({ status: 'idle', sweep: true });
   const consoleRef = useRef(null);
   // A notification tapped from a cold start arrives before the WebView exists, so
@@ -323,11 +361,19 @@ function KeepShell() {
         ]);
         if (cancelled) return;
         if (savedPalette) setPaletteId(savedPalette);
-        const nextConfig = savedConfig ? JSON.parse(savedConfig) : null;
+        let nextConfig = null;
+        try { nextConfig = savedConfig ? JSON.parse(savedConfig) : null; }
+        catch {}
         if (nextConfig?.server && nextConfig?.token) {
           nextConfig.server = api.normalizeServer(nextConfig.server);
-          setConfig(nextConfig);
-        }
+        } else nextConfig = null;
+        const { list, ok } = await servers.loadServers(AsyncStorage, nextConfig);
+        if (cancelled) return;
+        serversOkRef.current = ok;
+        serversRef.current = list;
+        setSavedServers(list);
+        configRef.current = nextConfig;
+        if (nextConfig) setConfig(nextConfig);
       } catch {}
       finally { if (!cancelled) setBooting(false); }
     };
@@ -454,22 +500,33 @@ function KeepShell() {
     return () => subscription.remove();
   }, [toConsole]);
 
-  const saveConfig = useCallback(async (next) => {
+  const saveConfig = useCallback((next) => exclusive(async () => {
     // Moving to another server: the old daemon still holds this phone, and only the
     // config being replaced can authenticate the removal, so it happens here.
-    if (config?.server && api.normalizeServer(config.server) !== api.normalizeServer(next.server)) {
+    const current = configRef.current;
+    if (current?.server && api.normalizeServer(current.server) !== api.normalizeServer(next.server)) {
       pushGenRef.current += 1;
-      await push.unregisterDevice({ config, remove: api.unregisterDevice, storage: AsyncStorage });
+      await push.unregisterDevice({ config: current, remove: api.unregisterDevice, storage: AsyncStorage });
       pushIsLive = false;
     }
     await AsyncStorage.setItem(CONFIG_KEY, JSON.stringify(next));
+    await commitServers((list) => servers.upsertServer(list, next));
     lastBadgeCount = null;
+    configRef.current = next;
     setConfig(next);
-  }, [config]);
+  }), [commitServers, exclusive]);
+
+  // A saved server that is not the active one was never registered for push, so
+  // dropping it is only a matter of the list.
+  const removeSavedServer = useCallback((server) => exclusive(async () => {
+    if (configRef.current && servers.sameServer(configRef.current, server)) return;
+    await commitServers((list) => servers.removeServer(list, server));
+  }), [commitServers, exclusive]);
 
   // Forget: unregister from the daemon best-effort, then drop the config. The sweep
   // goes with it — there is no server left for it to read.
-  const forgetConfig = useCallback(async () => {
+  const forgetConfig = useCallback(() => exclusive(async () => {
+    const config = configRef.current;
     // Before the DELETE, not after: a registration in flight has to be superseded
     // while it can still be stopped from writing the record back.
     pushGenRef.current += 1;
@@ -479,11 +536,16 @@ function KeepShell() {
     await applySweepTask(false);
     try { await AsyncStorage.multiRemove([CONFIG_KEY, NOTIFIED_ATTENTION_KEY, BACKGROUND_ATTENTION_ETAG_KEY, BACKGROUND_ATTENTION_STATE_KEY]); }
     catch {}
+    // The forgotten server leaves the saved list too. The others stay on offer, but
+    // none is made active behind the user's back: Setup comes up empty, as it always
+    // has after Forget, with the list to pick from.
+    if (config) await commitServers((list) => servers.removeServer(list, config));
     lastBadgeCount = null;
     applyBadge(0);
     setPushState({ status: 'idle', sweep: true });
+    configRef.current = null;
     setConfig(null);
-  }, [config]);
+  }), [commitServers, exclusive]);
 
   const changePalette = useCallback((next) => {
     setPaletteId(next);
@@ -581,9 +643,11 @@ function KeepShell() {
                   nav.reset({ index: 0, routes: [{ name: 'Setup' }] });
                 }}
                 onPalette={changePalette}
+                onRemoveServer={removeSavedServer}
                 onRetryPush={config ? () => syncPush(config, { force: true }) : undefined}
                 paletteId={paletteId}
                 push={pushState}
+                savedServers={savedServers}
                 scheme={scheme}
                 styles={styles}
               />

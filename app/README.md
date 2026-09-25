@@ -8,14 +8,54 @@ daemon; each teammate enters their own server address and access token.
 The app is a shell around the Keep web console rather than a second interface over
 the same API. Three screens, on a React Navigation native stack:
 
-- **Setup** — server URL, token, and palette, saved in AsyncStorage, plus the push
-  registration state with a Retry and **Forget this server**. Reachable again from
+- **Setup** — the saved servers, the server URL and token form, the palette, an
+  **About** section (app version and build number, the active server, and the push
+  registration state with a Retry), and **Forget this server**. Reachable again from
   the gear in the console screen's top bar.
 - **Console** — a `react-native-webview` holding the console itself. This is where
   everything happens.
 - **Terminal** — the native terminal, reached only when the console asks for it. The
   old polled plain-text viewer is still there behind a **Text view** toggle, which is
   remembered; it goes away once the native one has a week of use.
+
+### Servers
+
+The phone can keep up to eight servers, but only one is **active**. `@keep/config`
+holds the active `{server, token}` exactly as it always has — the background sweep,
+push registration and installs from before the list existed read nothing else — and
+`@keep/servers` holds the saved list, one `{server, token}` per normalized server URL.
+An install that has only `@keep/config` gets a one-entry list on its first launch; no
+migration step. The rules are pure functions in `src/servers.js`, tested by
+`src/servers.test.js`.
+
+- **Connect** adds the server to the list, or updates the token of the one already
+  saved, and makes it active.
+- Tapping a saved server switches to it through the same save as Connect, so push
+  moves with it (below): the phone is registered only with the active server. It is
+  checked first, like Connect, so a server that is down or whose token went stale
+  fails on Setup before the working server is given up.
+- Connect, a switch, Remove and Forget each take one guard, so only one of them runs
+  at a time: two at once could leave push registered on a server nobody is using.
+- A saved server that is not active can be removed (with a confirm); nothing else
+  happens, because it was never registered for push.
+- **Forget this server** means what it did: unregister from the active daemon, drop
+  its address and token — now from the list too. If other servers are saved, none is
+  made active: Setup comes back empty with the list still offered.
+
+Tokens are never shown on Setup; the list shows the server URL only.
+
+The **About** section reads nothing from the network: the version and build number
+come from the app config embedded in the binary (`expo-constants`,
+`expoConfig.version` and `android.versionCode` / `ios.buildNumber`).
+
+### What the shell reads from the daemon
+
+Apart from the console in the WebView, the native side reads two projections of
+`/api/state`, both from `bin/mobile-state.js`: `view=notifications` (Setup's
+connection check and the background sweep) and `view=terminal&id=<session or pane>`
+(the native terminal resolving a pane). The other mobile views (`needs`, `fleet`,
+`reviewer`, `session`, `task`, `new`) belonged to the old native screens and are
+gone; asking for one is a 400 like any unknown view.
 
 ### Bootstrap
 
@@ -203,7 +243,8 @@ it. A refused permission clears the record and unregisters the phone from the da
 a phone that cannot show a notification should not be collecting pushes. Nothing here logs the token, and only its last six characters are
 ever displayed.
 
-**Moving on.** Connecting to a different server, or **Forget this server**, sends
+**Moving on.** Connecting to a different server, switching to a saved one, or
+**Forget this server**, sends
 `DELETE /api/devices` to the daemon being left, best effort, with the config that is
 being replaced — it is the only thing that can still authenticate the removal.
 

@@ -5,7 +5,8 @@
 `keep serve` gives the public TCP listener to a supervised child process. That
 process serves `/app`, allowlisted `/vendor` files, SSE, terminal WebSocket
 upgrades, layouts, portable-transfer summaries, and every `/api/state` projection —
-full, `console=1`, and the mobile `view=<name>` views — from its last completed
+full, `console=1`, and the phone app's `view=notifications` and `view=terminal`
+projections — from its last completed
 publication. Nothing is served at `/`; it answers 404. The daemon keeps action ordering, injection
 locks, restart admission, and every authoritative mutation behind a mode-0600 Unix
 socket. The frontend authenticates the real public peer and Host before forwarding

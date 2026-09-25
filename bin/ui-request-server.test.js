@@ -262,7 +262,7 @@ test('since changes nothing about the fence, the other projections, or caching',
   const full = JSON.parse((await request(f.port, `/api/state?since=${instance}:1`)).body);
   assert.equal(full.tasks[0].body, 'full body', 'the full projection is unwrapped');
   assert.equal(full.full, undefined);
-  const mobile = JSON.parse((await request(f.port, `/api/state?view=needs&since=${instance}:1`)).body);
+  const mobile = JSON.parse((await request(f.port, `/api/state?view=notifications&since=${instance}:1`)).body);
   assert.equal(mobile.full, undefined);
   assert.equal(mobile.deltas, undefined);
 

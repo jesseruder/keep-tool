@@ -1,6 +1,9 @@
 'use strict';
 
-const MOBILE_VIEWS = new Set(['needs', 'fleet', 'reviewer', 'session', 'task', 'new', 'notifications', 'terminal']);
+// The phone app reads two projections: `notifications` (its connection check and
+// the notification fallback) and `terminal` (resolving a session to its pane). The
+// console itself runs in a WebView and reads the console projection.
+const MOBILE_VIEWS = new Set(['notifications', 'terminal']);
 const HUMAN_ATTENTION_KINDS = new Set(['question', 'permission', 'plan', 'input']);
 
 function pick(source, fields) {
@@ -11,7 +14,6 @@ function pick(source, fields) {
   return out;
 }
 
-const TASK_FRONTMATTER_FIELDS = ['title', 'status', 'project', 'tags', 'next', 'next_step', 'updated'];
 const SESSION_SUMMARY_FIELDS = [
   'id', 'num', 'kind', 'agent', 'project', 'title', 'renamed', 'mark', 'taskId', 'taskStatus', 'mtime', 'lastUserAt',
   'state', 'stateLabel', 'endedTurn', 'alive', 'exited', 'pane', 'rateLimit', 'reviewer',
@@ -22,10 +24,6 @@ const SESSION_SUMMARY_FIELDS = [
   // verdict it came from. `pick` drops them when the watcher has not run.
   'gitBranch', 'stalled', 'stateLine', 'lastVerdict', 'lastVerdictAt', 'verdictConfidence', 'pendingDecision',
 ];
-const SESSION_DETAIL_FIELDS = [
-  ...SESSION_SUMMARY_FIELDS, 'lastAssistant', 'lastAssistantFull', 'pendingQuestion', 'pendingPlan', 'waitingFor',
-  'toolRunning', 'pendingBackground', 'unknownBackgroundJobs', 'askedProse', 'attentionAt',
-];
 const PANE_FIELDS = ['id', 'cwd', 'alive', 'agentAlive', 'createdAt', 'exitedAt', 'title', 'meta'];
 
 function clip(value, max = 500) {
@@ -33,26 +31,9 @@ function clip(value, max = 500) {
   return `${value.slice(0, max - 1)}…`;
 }
 
-function taskSummary(task) {
-  return {
-    id: task.id,
-    fm: pick(task.fm, TASK_FRONTMATTER_FIELDS),
-    ...(task.lastLog !== undefined ? { lastLog: clip(task.lastLog) } : {}),
-    ...(task.overdue !== undefined ? { overdue: task.overdue } : {}),
-  };
-}
-
-function taskPickerSummary(task) {
-  return { id: task.id, fm: pick(task.fm, ['title', 'status', 'project', 'tags']) };
-}
-
-function openTaskSummaries(state) {
-  return (state.tasks || []).filter((task) => task?.fm?.status !== 'done').map(taskPickerSummary);
-}
-
-function sessionSummary(session, includeLastMessage = true) {
+function sessionSummary(session) {
   const summary = pick(session, SESSION_SUMMARY_FIELDS);
-  if (includeLastMessage && session?.lastAssistant !== undefined) summary.lastAssistant = clip(session.lastAssistant);
+  if (session?.lastAssistant !== undefined) summary.lastAssistant = clip(session.lastAssistant);
   return summary;
 }
 
@@ -94,14 +75,6 @@ function shared(state, view) {
   };
 }
 
-function attentionState(state, view) {
-  return {
-    ...shared(state, view),
-    attention: (state.attention || []).map(attentionSummary),
-    setAside: state.setAside || {},
-  };
-}
-
 function requireId(view, id) {
   if (typeof id !== 'string' || !id) {
     const error = new Error(`${view} view requires id`);
@@ -112,10 +85,6 @@ function requireId(view, id) {
 
 function exactSession(state, id) {
   return (state.sessions || []).find((session) => session.id === id) || null;
-}
-
-function exactTask(state, id) {
-  return (state.tasks || []).find((task) => task.id === id) || null;
 }
 
 function projectMobileState(state, view, id) {
@@ -129,89 +98,14 @@ function projectMobileState(state, view, id) {
     return { view, attention: (state.attention || []).map(attentionSummary) };
   }
 
-  if (view === 'reviewer') {
-    return {
-      ...attentionState(state, view),
-      review: state.review || { events: [], stats: {} },
-    };
-  }
-
-  if (view === 'task') {
-    requireId(view, id);
-    const task = exactTask(state, id);
-    if (!task) return { ...shared(state, view), id, task: null };
-    return { ...shared(state, view), id, task };
-  }
-
-  if (view === 'session') {
-    requireId(view, id);
-    const session = exactSession(state, id);
-    const task = session?.taskId ? exactTask(state, session.taskId) : null;
-    const attention = (state.attention || []).filter((item) => item.sessionId === id);
-    const pane = session?.pane ? (state.panes || []).find((candidate) => candidate.id === session.pane) : null;
-    return {
-      ...shared(state, view),
-      id,
-      sessions: session ? [pick(session, SESSION_DETAIL_FIELDS)] : [],
-      tasks: task ? [taskSummary(task)] : [],
-      attention,
-      setAside: state.setAside || {},
-      panes: pane ? [paneSummary(pane)] : [],
-    };
-  }
-
-  if (view === 'terminal') {
-    requireId(view, id);
-    const session = exactSession(state, id);
-    const pane = (state.panes || []).find((candidate) => candidate.id === id || candidate.id === session?.pane) || null;
-    return {
-      ...shared(state, view),
-      id,
-      sessions: session ? [sessionSummary(session)] : [],
-      panes: pane ? [paneSummary(pane)] : [],
-    };
-  }
-
-  if (view === 'new') {
-    return {
-      ...shared(state, view),
-      tasks: openTaskSummaries(state),
-      sessions: (state.sessions || []).map((session) => pick(session, ['id', 'project'])),
-      panes: (state.panes || []).map((pane) => {
-        const summary = pick(pane, ['id', 'cwd', 'alive', 'title']);
-        summary.meta = pick(pane.meta, ['project']);
-        return summary;
-      }),
-    };
-  }
-
-  if (view === 'fleet') {
-    return {
-      ...attentionState(state, view),
-      sessions: (state.sessions || []).map((session) => sessionSummary(session)),
-      panes: (state.panes || []).map(paneSummary),
-      tasks: [],
-    };
-  }
-
+  requireId(view, id);
+  const session = exactSession(state, id);
+  const pane = (state.panes || []).find((candidate) => candidate.id === id || candidate.id === session?.pane) || null;
   return {
-    ...attentionState(state, view),
-    tasks: (() => {
-      const taskIds = new Set([
-        ...(state.sessions || []).map((session) => session.taskId),
-        ...(state.attention || []).map((item) => item.taskId),
-      ].filter(Boolean));
-      return (state.tasks || []).filter((task) => taskIds.has(task.id) && task?.fm?.status !== 'done').map(taskPickerSummary);
-    })(),
-    sessions: (() => {
-      const attentionSessions = new Set((state.attention || []).map((item) => item.sessionId).filter(Boolean));
-      return (state.sessions || []).map((session) => sessionSummary(session, attentionSessions.has(session.id)));
-    })(),
-    panes: (state.panes || []).map((pane) => {
-      const summary = pick(pane, ['id', 'cwd', 'alive', 'createdAt', 'title']);
-      summary.meta = pick(pane.meta, ['agent', 'sessionId', 'project', 'title']);
-      return summary;
-    }),
+    ...shared(state, view),
+    id,
+    sessions: session ? [sessionSummary(session)] : [],
+    panes: pane ? [paneSummary(pane)] : [],
   };
 }
 
@@ -219,8 +113,6 @@ module.exports = {
   MOBILE_VIEWS,
   HUMAN_ATTENTION_KINDS,
   projectMobileState,
-  taskSummary,
-  taskPickerSummary,
   sessionSummary,
   paneSummary,
   attentionSummary,
