@@ -77,9 +77,10 @@ Then, all read-only:
    comparing versions with each other on the same morning.
 6. `play_list_reviews` with `max_results 100`, following `next_page_token` until it is
    null. Google returns only reviews written or edited in the last 7 days and only those
-   with text; star-only ratings are invisible. Look only at reviews new since the last
-   check-in (by the `review_id`s you named then, or by reading them all against the
-   carried `Known:` line).
+   with text; star-only ratings are invisible. A review is new when its last-modified
+   time is later than the `Reviews cursor:` in the previous check-in; judge only those,
+   and write the newest last-modified time you saw as this pass's cursor. With no cursor
+   yet (the first pass), judge the last 24 hours.
 
 ## Today's baselines (measured 2026-09-25; update when they drift)
 
@@ -155,7 +156,7 @@ keep checkin <card> -m "<date>: <one-line verdict: healthy | N findings>.
 Vitals (<day judged>): crash <x>% (14d median <y>%), ANR <x>% (median <y>%); fresh | stale <n>d.
 Rollout: production <versions serving>; <rolling> at <share>% of GA4 users (<trend>).
 Versions: errored-user ratio <v>: <r>%, <v>: <r>%, <v>: <r>%.
-Reviews: <n> new, <n> at 1–2 stars; cluster: <what, ids> | none.
+Reviews: <n> new, <n> at 1–2 stars; cluster: <what, ids> | none. Reviews cursor: <newest last-modified, ISO>.
 iOS: not covered.
 Followup: <card id opened or cited> | none.
 Known: <carried list, or none>." --check-after <tomorrow>T07:45

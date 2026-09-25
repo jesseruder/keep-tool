@@ -38,7 +38,10 @@ are UTC days. Let Y = yesterday, T = today, S = Y minus 8 days.
    `start_date = end_date = Y`, `limit: 5` (both dates inclusive).
 3. **OpenRouter** — `openrouter_activity` with no date returns the last 31 complete
    days by model and endpoint (~290 rows, ~100 KB; the tool result spills to a file, so
-   read it with `jq`, do not page it). With `date: "<Y>"` it returns one day. Sum
+   read it with `jq`, do not page it). With `date: "<Y>"` it returns one day. Also call
+   it once with `date: "<T>"` for today so far: that is the only read the runaway check
+   below has for OpenRouter. If it returns nothing, say T's OpenRouter is unknown and
+   judge T on Oracle alone. Sum
    `usage` (dollars) per date and per `model`. This is the whole OpenRouter bill:
    Oracle plus every other LLM caller (Cauldron and the rest), so it runs ~$50/day
    above Oracle. `openrouter_model_prices` (`name_contains`) only to explain a model
@@ -144,15 +147,17 @@ One check-in per pass, short, this shape:
 ```
 keep checkin <card> -m "<Y>: <one-line verdict: quiet | N lines jumped>.
 AWS: $<Y> vs med $<m> (<pct>); <flagged service: $ vs med, usage type that moved>, or ok.
-Oracle: $<Y> vs med $<m>; top user <id> $<cost> (<requests> req, <staff?>, <normal | loop | abuse>).
+Oracle: $<Y> vs med $<m>; <flagged user: <id> $<cost> (<requests> req, <staff?>, <normal | loop | abuse>)>, or ok.
 OpenRouter: $<Y> vs med $<m>; <flagged model: $ vs med, volume or price>, or ok.
 New: <new service or model>, or none.
 Filed: <card id and title>, or none.
 Known: <carried list with levels, or none>." --check-after <tomorrow>T08:00
 ```
 
-User ids only: never a username, never a quote or paraphrase of what a user wrote. The
-classification word is the whole of what a conversation contributes to the card.
+A user appears in the report only when the dominance rule above flagged them; a quiet
+pass stays aggregate and reads no conversation. User ids only: never a username, never a
+quote or paraphrase of what a user wrote. The classification word is the whole of what a
+conversation contributes to the card.
 
 Then put the pass on your feed, which is what Owner's console shows on your row:
 

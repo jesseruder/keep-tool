@@ -109,10 +109,21 @@ Things that are normal and not findings:
 
 The delivered check says "do only the read-only check". The one exception Owner allowed
 is this: **`ci_rerun_workflow` with `from_failed: true`, once, on a workflow whose failure
-is clearly infra-flake**, and only when no newer pipeline on that branch has run the same
-workflow (rerunning an older commit's deploy after a newer one would roll production
-back). Record the workflow id and the new result. A rerun that fails again is a finding,
-not a second rerun.
+is clearly infra-flake**, and only when all of these hold, checked in this order
+immediately before the rerun:
+
+1. The workflow has **no approval job** (`ci_list_jobs` shows no `type: approval`), so
+   never cauldron's or sandboxes' `ci-cd`, and never a castle-client release workflow.
+   Rerunning from failed after a gate was approved would reuse that approval.
+2. The pipeline's commit **is the head of the default branch right now**:
+   `git -C ~/castle/<repo> ls-remote origin refs/heads/<branch>` returns the same sha as
+   the pipeline's `vcs.revision`. A newer commit may have no pipeline at all, so "no
+   newer pipeline" is not enough; a head that moved means no rerun (its own pipeline, or
+   the next push, will deploy the newer code). If `ls-remote` fails, do not rerun.
+
+Rerunning the head commit's own deploy is what its push should have done, which is why
+this is safe and nothing older is. Record the workflow id, the sha you compared and the
+new result. A rerun that fails again is a finding, not a second rerun.
 
 Never `ci_approve_job`: every hold gates a production deploy or a mobile release, and the
 approval is Owner's. Never `ci_trigger_pipeline`, never push, commit or edit code, never
@@ -156,8 +167,9 @@ a pass worth a look; a green pass, or one with only Known items, is on the feed 
 badge. When you reran a workflow, emit it as `--kind mitigated` (it badges on its own).
 When Owner has to act — the newest commit on ghost-server or castle-www red two passes
 running, a rerun that failed again, a migration check red, a fix waiting at a gate more
-than a day, a repeated flake — emit a needs-you and add `--handoff needs-input` to the
-check-in:
+than a day, a repeated flake whose rerun failed or that still leaves the branch
+blocked (a repeated flake that its rerun fixed is a badged finding, not a needs-you) —
+emit a needs-you and add `--handoff needs-input` to the check-in:
 
 ```
 keep agents emit ci-health --kind needs-you --needs-you --card <card> -m "<what and why, one line>"
