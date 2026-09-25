@@ -15631,14 +15631,11 @@ function portableDeps(deps = {}) {
   const root = deps.root || keep.ROOT;
   const portable = deps.portable || require('./portable-handoff');
   const storePackage = deps.storePackage || (async ({ cardId, fileName, content, note }) => {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-portable-transfer-'));
-    const file = path.join(directory, fileName);
-    try {
-      fs.writeFileSync(file, content, { mode: 0o600 });
-      const stored = keep.artifactCommandCli([cardId, file, '-m', note], { quiet: true });
-      if (!stored?.[0]?.destination) throw new Error('portable transfer artifact was not stored');
-      return stored[0].destination;
-    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+    const result = await isolatedDaemonMutation('store-portable-package', {
+      root, cardId, fileName, content, note,
+    }, deps, { timeoutMs: 90e3 });
+    if (!result?.destination) throw new Error('portable transfer artifact was not stored');
+    return result.destination;
   });
   return {
     ...deps, root, accounts: deps.accounts || accounts,

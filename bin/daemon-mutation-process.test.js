@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { createDaemonMutationProcess } = require('./daemon-mutation-process.js');
-const { markAgentSeen } = require('./maintenance-tasks.js');
+const { markAgentSeen, storePortablePackage } = require('./maintenance-tasks.js');
 
 const fixture = path.join(__dirname, 'fixtures', 'daemon-mutation-process-fixture.js');
 const waitFor = async (check, timeoutMs = 1000) => {
@@ -114,4 +114,29 @@ test('agent seen mutation keeps the feed rewrite and git flush in one child tran
     ['mark', 'reviewer', 123, { root: '/registry' }],
     ['flush', '/registry'],
   ]);
+});
+
+test('portable package storage keeps the temporary file and artifact transaction in the child', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-portable-store-test-'));
+  let temporaryFile;
+  try {
+    const result = storePortablePackage({
+      root: '/registry', cardId: 'portable-card', fileName: 'package.md',
+      content: '# portable\n', note: 'Portable continuation',
+    }, {
+      tmpdir: () => root,
+      keep: { artifactCommandCli: (args, options) => {
+        temporaryFile = args[1];
+        assert.deepEqual(args, ['portable-card', temporaryFile, '-m', 'Portable continuation']);
+        assert.deepEqual(options, { quiet: true });
+        assert.equal(fs.readFileSync(temporaryFile, 'utf8'), '# portable\n');
+        assert.equal(fs.statSync(temporaryFile).mode & 0o777, 0o600);
+        return [{ destination: '/registry/artifacts/package.md' }];
+      } },
+    });
+    assert.deepEqual(result, { destination: '/registry/artifacts/package.md' });
+    assert.equal(fs.existsSync(path.dirname(temporaryFile)), false, 'the child transaction cleans its temporary directory');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

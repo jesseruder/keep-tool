@@ -806,9 +806,8 @@ function defaultDeps(deps) {
     write: deps.write || process.stderr.write.bind(process.stderr),
     record: deps.record || health.record,
     snapshot: deps.snapshot || ((now) => health.snapshot(now)),
-    addTask: deps.addTask || ((options) => keep.addTask(options)),
     checkin: deps.checkin || ((id, payload) => keep.checkinTask(id, payload)),
-    artifact: deps.artifact || ((argv) => keep.artifactCommandCli(argv, { quiet: true })),
+    createCard: deps.createCard || null,
     spawnWorktree: deps.spawnWorktree || ((name) => spawnWorktree(name)),
     // Injected by serve.js at startScheduler: requiring serve.js from here would
     // be a cycle. Without it there is no way to open a session, which is a
@@ -826,8 +825,19 @@ function defaultDeps(deps) {
     loadTask: deps.loadTask || ((id) => { try { return keep.loadTask(id, deps.root || keep.ROOT); } catch { return null; } }),
     insideWorktreeRoot: deps.insideWorktreeRoot || ((candidate) => insideWorktreeRoot(candidate)),
     projectExists: deps.projectExists || ((project) => projectExists(project)),
-    setPlan: deps.setPlan || ((task, steps) => keep.setPlan(task, steps)),
     onChange: deps.onChange || (() => {}),
+  };
+}
+
+// These dependencies are reachable only from the mutation child operation. Keep
+// the synchronous registry/artifact defaults out of the daemon tick's dependency
+// graph so adding a new main-loop call cannot silently reconnect them.
+function cardTransactionDeps(deps) {
+  return {
+    ...defaultDeps(deps),
+    addTask: deps.addTask || ((options) => keep.addTask(options)),
+    artifact: deps.artifact || ((argv) => keep.artifactCommandCli(argv, { quiet: true })),
+    setPlan: deps.setPlan || ((task, steps) => keep.setPlan(task, steps)),
   };
 }
 
@@ -1113,6 +1123,50 @@ function createRepairCard(candidate, snapshot, context) {
   return { cardId, artifacts, recipe };
 }
 
+function reserveRepairCard(candidate, cardId, context) {
+  const { root, now, previousCardId, projectMissing, write } = context;
+  return mutateState((value) => {
+    const fresh = value.signatures[candidate.sig] || (value.signatures[candidate.sig] = { firstSeenAt: candidate.firstSeenAt });
+    if (previousCardId) fresh.previousCardId = previousCardId;
+    fresh.cardId = cardId;
+    fresh.openedAt = now;
+    fresh.sessionId = null;
+    fresh.pane = null;
+    fresh.worktree = null;
+    delete fresh.runId;
+    fresh.attempts = Number(fresh.attempts || 0) + (projectMissing ? 0 : 1);
+    fresh.lastAttemptAt = now;
+    delete fresh.projectMissingAt;
+    delete fresh.resolvedAt;
+    delete fresh.cooldownUntil;
+    delete fresh.okSinceAt;
+    delete fresh.launchGaveUp;
+    delete fresh.relaunchDue;
+    delete fresh.deadSince;
+    value.openedToday = Number(value.openedToday || 0) + 1;
+    value.day = localDay(now);
+  }, { root, now, write });
+}
+
+// The production daemon invokes this whole phase in a mutation child. Card
+// creation, its durable reservation, evidence collection and both artifact commits
+// stay in one PID-owned operation, so a slow registry lock or git push never runs
+// on the daemon event loop and a created card is reserved before the child replies.
+function createRepairCardTransaction(input, overrides = {}) {
+  const deps = cardTransactionDeps({ ...overrides, root: input.root });
+  const reserve = (cardId) => reserveRepairCard(input.candidate, cardId, {
+    root: input.root,
+    now: input.now,
+    previousCardId: input.previousCardId || null,
+    projectMissing: input.projectMissing === true,
+    write: deps.write,
+  });
+  return createRepairCard(input.candidate, input.snapshot, {
+    deps, now: input.now, config: input.config || DEFAULT_CONFIG,
+    previousCardId: input.previousCardId || null, reserve,
+  });
+}
+
 // Phase two: the worktree and the session. Resumable — a tick that finds a
 // reserved card with no session comes back here instead of opening a second card.
 async function launchRepair(candidate, cardId, artifacts, context) {
@@ -1120,7 +1174,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
   const name = worktreeName(candidate.sig);
   const created = await deps.spawnWorktree(name);
   if (!created || !created.ok) {
-    deps.checkin(cardId, {
+    await deps.checkin(cardId, {
       heading: 'self-repair',
       message: `Could not create the worktree ${REPO}/${name}: ${created && created.error || 'unknown error'}. No agent was launched; the card stands for a human or a manual \`keep open\` on it.`,
       linkSession: false,
@@ -1133,7 +1187,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
   // predicate; the check is repeated here so the refusal says so on the card instead
   // of throwing from inside the daemon loop.
   if (!deps.insideWorktreeRoot(created.path)) {
-    deps.checkin(cardId, {
+    await deps.checkin(cardId, {
       heading: 'self-repair',
       message: `Refusing to launch: ${created.path} is not inside the configured worktree root, and a repair agent only ever runs in a worktree. No agent was launched.`,
       linkSession: false,
@@ -1150,7 +1204,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
   try { existing = await deps.findCardPane(cardId, sessionId || null); }
   catch (error) { deps.write(`keep self-repair: could not ask the host about ${cardId}: ${clip(error && error.message || error, 200)}\n`); }
   if (existing && existing.pane) {
-    deps.checkin(cardId, {
+    await deps.checkin(cardId, {
       heading: 'self-repair',
       message: `Found the repair session already running in pane ${existing.pane}`
         + `${existing.sessionId ? ` (session ${sessionRef(existing.sessionId)})` : ''};`
@@ -1196,7 +1250,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
     // after that. Only a failure before the spawn is safe to retry.
     const started = (error && error.extra && error.extra.launch) || (error && error.launch) || null;
     if (started && started.pane) {
-      deps.checkin(cardId, {
+      await deps.checkin(cardId, {
         heading: 'self-repair',
         message: `A repair session opened in pane ${started.pane}${started.sessionId ? ` (session ${sessionRef(started.sessionId)})` : ''},`
           + ` but the launch could not be confirmed: ${clip(error && error.message || error, 300)}.`
@@ -1213,7 +1267,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
         launchError: String(error && error.message || error),
       };
     }
-    deps.checkin(cardId, {
+    await deps.checkin(cardId, {
       heading: 'self-repair',
       message: `Worktree ${created.path} is ready but the repair session could not be opened: ${clip(error && error.message || error, 300)}. Open it by hand with \`keep open ${cardId}\`.`,
       linkSession: false,
@@ -1222,7 +1276,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
     return { cardId, artifacts, worktree: created.path, launched: false, runError: String(error && error.message || error) };
   }
 
-  deps.checkin(cardId, {
+  await deps.checkin(cardId, {
     heading: 'self-repair',
     message: launchNote(candidate, cardId, created.path, opened, config, artifacts, model),
     linkSession: false,
@@ -1242,7 +1296,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
 // here. The card is told once per outage — the tick runs every few minutes, and a
 // check-in on each would bury the card's log — and `projectMissingAt` is the
 // marker; the launch that finally goes ahead clears it. Answers the skip reason.
-function pauseOnMissingProject(candidate, cardId, project, context) {
+async function pauseOnMissingProject(candidate, cardId, project, context) {
   const { deps, root, now, result } = context;
   const why = `project ${project} is not a directory on this host; no attempt spent, paused until it exists`;
   const entry = loadState(root).signatures[candidate.sig] || {};
@@ -1251,7 +1305,7 @@ function pauseOnMissingProject(candidate, cardId, project, context) {
     // resolve path: a check-in that fails (a locked registry, say) is retried on
     // the next tick instead of leaving the card open with no explanation.
     try {
-      deps.checkin(cardId, {
+      await deps.checkin(cardId, {
         heading: 'self-repair',
         message: projectMissingNote(cardId, project),
         linkSession: false,
@@ -1370,7 +1424,7 @@ async function tick(input = {}) {
     const okSinceAt = Number(entry.okSinceAt) || 0;
     if (!okSinceAt || now - okSinceAt < CLEARED_FOR_MS) continue;
     try {
-      deps.checkin(entry.cardId, {
+      await deps.checkin(entry.cardId, {
         heading: 'self-repair',
         message: `Signature ${sig} cleared at ${stamp(okSinceAt)} and has stayed clear for ${describeAge(now - okSinceAt)}; verify the fix landed, then close.`,
         linkSession: false,
@@ -1464,7 +1518,7 @@ async function tick(input = {}) {
     const project = cardProject(task);
     const held = !deps.projectExists(project);
     try {
-      deps.checkin(entry.cardId, {
+      await deps.checkin(entry.cardId, {
         heading: 'self-repair',
         message: `The repair session in pane ${entry.pane || '(unknown)'} has been gone for`
           + ` ${describeAge(now - deadSince)} without landing; `
@@ -1504,7 +1558,7 @@ async function tick(input = {}) {
       const why = resumeBlocker(entry, config, now);
       if (why) { result.skipped.push({ sig: candidate.sig, why }); continue; }
       if (!present) {
-        result.skipped.push({ sig: candidate.sig, why: pauseOnMissingProject(candidate, entry.cardId, project, { deps, root, now, result }) });
+        result.skipped.push({ sig: candidate.sig, why: await pauseOnMissingProject(candidate, entry.cardId, project, { deps, root, now, result }) });
         continue;
       }
 
@@ -1545,7 +1599,7 @@ async function tick(input = {}) {
         deps.write(`keep self-repair: resumed the launch for ${entry.cardId}${resumed.launched ? ` (session ${(sessionRef(resumed.sessionId || resumed.pane) || '?')})` : ' — still not launched'}\n`);
         if (gaveUp) {
           try {
-            deps.checkin(entry.cardId, {
+            await deps.checkin(entry.cardId, {
               heading: 'self-repair',
               message: `That was attempt ${MAX_LAUNCH_ATTEMPTS} of ${MAX_LAUNCH_ATTEMPTS} for this signature.`
                 + ' Self-repair will not open another, however this one ends.'
@@ -1578,37 +1632,14 @@ async function tick(input = {}) {
     // that openSession would refuse. The resume path launches once the project is back.
     const projectMissing = !deps.projectExists(REPAIR_PROJECT);
 
-    // The slot is reserved inside createRepairCard, the moment the card exists.
-    const reserve = (cardId) => mutateState((value) => {
-      const fresh = value.signatures[candidate.sig] || (value.signatures[candidate.sig] = { firstSeenAt: candidate.firstSeenAt });
-      if (entry.cardId) fresh.previousCardId = entry.cardId;
-      fresh.cardId = cardId;
-      fresh.openedAt = now;
-      fresh.sessionId = null;
-      fresh.pane = null;
-      fresh.worktree = null;
-      delete fresh.runId;
-      fresh.attempts = Number(fresh.attempts || 0) + (projectMissing ? 0 : 1);
-      fresh.lastAttemptAt = now;
-      delete fresh.projectMissingAt;
-      delete fresh.resolvedAt;
-      delete fresh.cooldownUntil;
-      delete fresh.okSinceAt;
-      delete fresh.launchGaveUp;
-      // A new card starts with a clean debounce: these belong to the launch that
-      // has just been replaced, and carrying them over pre-expires the grace
-      // window for a session that does not exist yet.
-      delete fresh.relaunchDue;
-      delete fresh.deadSince;
-      value.openedToday = Number(value.openedToday || 0) + 1;
-      value.day = localDay(now);
-    }, { root, now, write: deps.write });
-
     let card;
     try {
-      card = createRepairCard(candidate, snapshot, {
-        deps, now, config, previousCardId: entry.cardId || null, reserve,
-      });
+      const transaction = {
+        root, candidate, snapshot, now, config,
+        previousCardId: entry.cardId || null, projectMissing,
+      };
+      if (!deps.createCard) throw new Error('no isolated self-repair card transaction was wired');
+      card = await deps.createCard(transaction);
       openedToday += 1;
     } catch (error) {
       result.errors.push(`open ${candidate.sig}: ${clip(error && error.message || error, 200)}`);
@@ -1633,7 +1664,7 @@ async function tick(input = {}) {
 
     if (!config.launch) {
       try {
-        deps.checkin(card.cardId, {
+        await deps.checkin(card.cardId, {
           heading: 'self-repair',
           message: `Evidence attached${card.artifacts.length ? `: ${card.artifacts.join(', ')}` : ''}. Launching is off (watch/self-repair.json launch:false), so no worktree or agent was created.`,
           linkSession: false,
@@ -1647,7 +1678,7 @@ async function tick(input = {}) {
     }
 
     if (projectMissing) {
-      const why = pauseOnMissingProject(candidate, card.cardId, REPAIR_PROJECT, { deps, root, now, result });
+      const why = await pauseOnMissingProject(candidate, card.cardId, REPAIR_PROJECT, { deps, root, now, result });
       result.opened.push({ sig: candidate.sig, cardId: card.cardId, sessionId: null, worktree: null, launched: false, paused: why });
       continue;
     }
@@ -1880,7 +1911,8 @@ module.exports = {
   LEGACY_RUN_TTL_MS, PANE_DEAD_GRACE_MS,
   worktreeName, worktreePath, insideWorktreeRoot, spawnWorktree, worktreeReady,
   REPAIR_PROJECT, projectExists, liveCheckout, cardProject, projectMissingNote,
-  createRepairCard, launchRepair, resumeBlocker, EXCLUDED, MAX_LAUNCH_ATTEMPTS, RESUME_BACKOFF_MS,
+  createRepairCard, createRepairCardTransaction, reserveRepairCard,
+  launchRepair, resumeBlocker, EXCLUDED, MAX_LAUNCH_ATTEMPTS, RESUME_BACKOFF_MS,
   tick, startScheduler, status, renderStatus, dryRun, renderDry, reset,
   _resetWarnings,
 };

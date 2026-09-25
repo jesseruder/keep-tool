@@ -630,6 +630,8 @@ function startSchedulers(ctx) {
     health.record('self-repair', { disabled: true, detail: 'KEEP_SELF_REPAIR=0', cadenceMs: require('../self-repair.js').CADENCE_MS });
   } else require('../self-repair.js').startScheduler({
     onChange: broadcast,
+    createCard: (input) => ctx.maintenanceProcess.run('self-repair-create-card', input, { timeoutMs: 90e3 }),
+    checkin: (id, options) => ctx.maintenanceProcess.run('checkin-task', { root: keep.ROOT, id, options }),
     // The repair agent is an ordinary interactive session in the terminal host,
     // not a headless run that dies at the end of its turn. self-repair.js takes
     // these through deps rather than requiring serve.js, which would be a cycle.

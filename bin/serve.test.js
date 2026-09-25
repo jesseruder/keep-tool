@@ -10331,6 +10331,26 @@ test('desktop portable APIs accept bounded text and ids without browser-controll
     context: 'x'.repeat(512 * 1024 + 1) }, { portable }), (error) => error.status === 400 && /too large/.test(error.message));
 });
 
+test('portable package storage is dispatched as one mutation child operation', async () => {
+  const calls = [];
+  const result = await portableTransferDraft({ sourceSessionId: 'source-session-1234' }, {
+    root: '/keep', accounts: {}, inspectSource: async () => {},
+    mutationProcess: { run: async (...args) => {
+      calls.push(args);
+      return { destination: '/keep/artifacts/package.md' };
+    } },
+    portable: { draft: async (request, deps) => ({ request,
+      stored: await deps.storePackage({ cardId: 'portable-card', fileName: 'package.md',
+        content: '# package\n', note: 'Portable continuation' }) }) },
+  });
+  assert.equal(result.draft.stored, '/keep/artifacts/package.md');
+  assert.deepEqual(calls, [[
+    'store-portable-package',
+    { root: '/keep', cardId: 'portable-card', fileName: 'package.md', content: '# package\n', note: 'Portable continuation' },
+    { timeoutMs: 90e3 },
+  ]]);
+});
+
 test('desktop prepare API accepts an omitted model through the real portable implementation', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-portable-api-'));
   const cwd = path.join(root, 'worktree');

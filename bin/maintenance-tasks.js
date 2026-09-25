@@ -117,6 +117,22 @@ function markAgentSeen(input, deps = {}) {
   return result;
 }
 
+function storePortablePackage(input, deps = {}) {
+  const keep = deps.keep || require('./keep.js');
+  const io = deps.fs || fs;
+  const tmpdir = deps.tmpdir || require('node:os').tmpdir;
+  const directory = io.mkdtempSync(path.join(tmpdir(), 'keep-portable-transfer-'));
+  const file = path.join(directory, input.fileName);
+  try {
+    io.writeFileSync(file, input.content, { mode: 0o600 });
+    const stored = keep.artifactCommandCli([input.cardId, file, '-m', input.note], { quiet: true });
+    if (!stored?.[0]?.destination) throw new Error('portable transfer artifact was not stored');
+    return { destination: stored[0].destination };
+  } finally {
+    io.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 function tellReservation(operation, input, deps = {}) {
   const keep = deps.keep || require('./keep.js');
   const tell = deps.tell || require('./tell.js');
@@ -157,6 +173,10 @@ async function run(operation, input, deps = {}) {
   if (operation === 'checkin-task') return checkinTask(input, deps);
   if (operation === 'record-daemon-session-close') return recordDaemonSessionClose(input, deps);
   if (operation === 'agent-mark-seen') return markAgentSeen(input, deps);
+  if (operation === 'store-portable-package') return storePortablePackage(input, deps);
+  if (operation === 'self-repair-create-card') {
+    return require('./self-repair.js').createRepairCardTransaction(input);
+  }
   if (operation === 'tell-reserve' || operation === 'tell-release') return tellReservation(operation, input, deps);
   if (operation.startsWith('late-adoption-')) {
     return require('./late-adoption-mutation.js').run(operation, input);
@@ -166,5 +186,5 @@ async function run(operation, input, deps = {}) {
 
 module.exports = {
   run, registryRebase, ensureDigest, morningBrief, briefCutoff, checkinTask, recordDaemonSessionClose, markAgentSeen,
-  tellReservation,
+  tellReservation, storePortablePackage,
 };

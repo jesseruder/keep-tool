@@ -349,6 +349,7 @@ function harness(options = {}) {
       return { ok: true, pane: `pane-${nth}`, sessionId: `${String(nth).repeat(8)}-0000-4000-8000-000000000000` };
     },
   };
+  deps.createCard = options.createCard || ((input) => selfRepair.createRepairCardTransaction(input, deps));
   return { deps, calls };
 }
 
@@ -371,9 +372,17 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
     // An hour later the same signature is actionable.
     const later = NOW + 61 * 60e3;
     snapshot.schedulers[0].lastErrorAt = later;
-    const second = await selfRepair.tick({ ...deps, now: later });
+    let transaction;
+    const second = await selfRepair.tick({ ...deps, now: later, createCard: async (input) => {
+      transaction = input;
+      await new Promise((resolve) => setImmediate(resolve));
+      return selfRepair.createRepairCardTransaction(input, deps);
+    } });
     assert.equal(second.opened.length, 1);
     assert.equal(second.opened[0].launched, true);
+    assert.equal(transaction.candidate.sig, sig);
+    assert.equal(transaction.previousCardId, null);
+    assert.equal(transaction.projectMissing, false);
 
     const card = calls.cards[0];
     assert.match(card.title, /^Daemon self-repair: review: tick failed for pid 123$/);
