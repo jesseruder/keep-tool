@@ -51,6 +51,8 @@ function deps(f, overrides = {}) {
         ? { pid: 21, pidStart: 'target-start', primary: true, ownsPane: true }
         : { pid: 11, pidStart: 'source-start', primary: true, ownsPane: true } }),
     authPreflight: async () => true,
+    // Nothing on the machine holds the conversation once its pane exited.
+    sessionLive: async () => false,
     compatible: () => ({ ok: true, reasons: [], mcpConfig: path.join(f.base, 'mcp.json') }),
     rebindLedger: () => ({ rebound: [{ sessionId: f.sid, reused: false }] }),
     host: baseHost,
@@ -109,6 +111,7 @@ function codexDeps(f, overrides = {}) {
   const base = {
     root: f.root, env: f.env, pane, plan, sid, child, argv, events, artifactProvider,
     preflights: () => preflights,
+    sessionLive: async () => false,
     inspect: async () => ({ session: { id: sid, kind: 'codex', project: f.project, endedTurn: true }, pane,
       processArgs: `codex resume ${sid}`, agentIdentity: pane.meta.accountId === 'codex-two'
         ? { pid: 41, pidStart: 'codex-target-start', primary: true, ownsPane: true, rolloutFile: targetFile }
@@ -829,7 +832,7 @@ test('abandon takes a transfer past its /exit only on a fresh proof that the ses
     const gonePanes = async () => ({ panes: [{ id: 'other', alive: true, meta: { sessionId: 'someone-else' } }], nodes: {} });
     const noAgent = async () => [{ pid: 99, pidStart: 'other-start', args: 'zsh', agent: null }];
     const refuses = async (overrides, pattern) => {
-      await assert.rejects(handoff.abandonExited(body, { root: f.root, listPanes: gonePanes, agentProcessRows: noAgent, ...overrides }),
+      await assert.rejects(handoff.abandonExited(body, { root: f.root, sessionLive: async () => false, listPanes: gonePanes, agentProcessRows: noAgent, ...overrides }),
         (error) => error.status === 409 && pattern.test(error.message) && /retry the transfer instead/.test(error.message));
       assert.equal(handoff.readOne(f.root, f.sid).status, 'recovery-needed', 'a refusal writes nothing');
     };
@@ -842,7 +845,7 @@ test('abandon takes a transfer past its /exit only on a fresh proof that the ses
     await refuses({ agentProcessRows: async () => [{ pid: 11, pidStart: 'source-start', args: 'claude', agent: 'claude' }] }, /source agent is still running/);
     await refuses({ agentProcessRows: async () => [{ pid: 55, pidStart: 'x', args: `claude --resume ${f.sid}`, agent: 'claude' }] }, /still running this conversation/);
     // The same pid reused by a process that started at another time is not the source.
-    const abandoned = await handoff.abandonExited(body, { root: f.root, listPanes: gonePanes, log: () => {},
+    const abandoned = await handoff.abandonExited(body, { root: f.root, sessionLive: async () => false, listPanes: gonePanes, log: () => {},
       agentProcessRows: async () => [{ pid: 11, pidStart: 'later-start', args: 'zsh', agent: null }] });
     assert.equal(abandoned.phase, 'abandoned');
     assert.match(abandoned.reason, /after the session exited; it stays on one/);
@@ -861,7 +864,7 @@ test('abandon after the exit refuses a launched target, and asks a node pane\'s 
     const journal = path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`);
     const original = JSON.parse(fs.readFileSync(journal, 'utf8'));
     const body = { sessionId: f.sid, transactionId: pending.id };
-    const proof = { root: f.root, listPanes: async () => ({ panes: [] }), agentProcessRows: async () => [{ pid: 1, pidStart: 'boot', args: 'launchd' }] };
+    const proof = { root: f.root, sessionLive: async () => false, listPanes: async () => ({ panes: [] }), agentProcessRows: async () => [{ pid: 1, pidStart: 'boot', args: 'launchd' }] };
     fs.writeFileSync(journal, JSON.stringify({ ...original, sourceExitEnterAt: Date.now(), targetLaunchStartedAt: Date.now() }));
     await assert.rejects(handoff.abandonExited(body, proof), /got past stopping the session/);
     fs.writeFileSync(journal, JSON.stringify({ ...original, sourceExitEnterAt: Date.now(), pane: 'pane-1@aws1' }));
@@ -1664,6 +1667,7 @@ function nodeDeps(f, overrides = {}) {
   const node = (what, value) => { asked.push(what); return value; };
   const d = {
     root: f.root, env: f.env, pane, asked, events, paneNode: 'aws1',
+    sessionLive: async () => false,
     inspect: async () => node('inspect', { session: { id: f.sid, kind: 'claude', project: f.project, endedTurn: true, node: 'aws1' }, pane,
       processArgs: `claude --dangerously-skip-permissions --resume ${f.sid}`, currentModel: 'claude-opus-4-1',
       agentIdentity: pane.meta.accountId === 'two'
@@ -1746,11 +1750,21 @@ test('a transfer of a node session that is not Owner-forced is refused before an
   const f = fixture();
   try {
     const d = nodeDeps(f, { restartSession: async () => assert.fail('the source must not be stopped') });
-    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two' }, d), (error) => error.status === 409
-      && /must be forced by Owner: its background work cannot be verified from here/.test(error.message)
-      && handoff.classifyRefusal(error.message) === 'blocked');
+    const refused = (error) => error.status === 409
+      && error.message === 'A session on aws1 is transferred only when forced: use the console\'s transfer, or keep handoff --force'
+      && handoff.classifyRefusal(error.message) === 'blocked';
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two' }, d), refused);
     assert.equal(handoff.readOne(f.root, f.sid), null);
-    assert.deepEqual(d.asked, ['inspect']);
+    assert.deepEqual(d.asked, [], 'neither the session, its pane nor its node was asked anything');
+    // An existing record is not touched either: an unforced Retry does not rewrite it.
+    const journal = path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`);
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    const recorded = JSON.stringify({ id: 'tx-old', transactionId: 'tx-old', sessionId: f.sid, pane: 'pane-1@aws1',
+      targetAccountId: 'two', sourceAccountId: 'one', status: 'copying', phase: 'copying-artifacts', updatedAt: Date.now() });
+    fs.writeFileSync(journal, recorded);
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two' }, d), refused);
+    assert.equal(fs.readFileSync(journal, 'utf8'), recorded);
+    assert.deepEqual(d.asked, []);
     assert.equal(accounts.authority(f.root)[f.sid].accountId, 'one');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
@@ -1895,7 +1909,7 @@ test('abandon after the exit reads the node\'s own table, and refuses when the n
     const asked = [];
     const rows = (list) => async (options = {}) => { asked.push(options.node || 'main'); return list; };
     const refuses = async (overrides, pattern) => {
-      await assert.rejects(handoff.abandonExited(body, { root: f.root, listPanes: answered,
+      await assert.rejects(handoff.abandonExited(body, { root: f.root, sessionLive: async () => false, listPanes: answered,
         agentProcessRows: rows([{ pid: 1, pidStart: 'x', args: 'init' }]), ...overrides }),
       (error) => error.status === 409 && pattern.test(error.message) && /retry the transfer instead/.test(error.message));
       assert.equal(handoff.readOne(f.root, f.sid).status, 'recovery-needed', 'a refusal writes nothing');
@@ -1908,10 +1922,167 @@ test('abandon after the exit reads the node\'s own table, and refuses when the n
     await refuses({ agentProcessRows: async () => { throw new Error('terminal host is unavailable'); } }, /the process table on aws1 failed/);
     // Its table still shows the source.
     await refuses({ agentProcessRows: rows([{ pid: 11, pidStart: 'source-start', args: 'claude' }]) }, /source agent is still running/);
+    // A survivor nothing recorded, still holding the conversation there; or no way to ask.
+    const holders = [];
+    await refuses({ sessionLive: async (id, agent, options) => { holders.push([id, agent, options]); return true; } },
+      /A process still owns this conversation/);
+    assert.deepEqual(holders, [[f.sid, 'claude', { node: 'aws1' }]]);
+    await refuses({ sessionLive: async () => { throw new Error('terminal host is unavailable'); } }, /processes could not be read/);
+    await refuses({ sessionLive: undefined }, /no session ownership check is available/);
     assert.ok(asked.length && asked.every((node) => node === 'aws1'), 'only the node\'s table was read');
-    const abandoned = await handoff.abandonExited(body, { root: f.root, listPanes: answered, log: () => {},
+    const abandoned = await handoff.abandonExited(body, { root: f.root, sessionLive: async () => false, listPanes: answered, log: () => {},
       agentProcessRows: rows([{ pid: 11, pidStart: 'a-later-process', args: 'zsh' }]) });
     assert.equal(abandoned.phase, 'abandoned');
     assert.equal(accounts.authority(f.root)[f.sid].accountId, 'one');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+// ---------- a Retry never stops a pane something else relaunched ----------
+
+test('a Retry past the stop refuses a pane that is running again, here and on a node', async () => {
+  for (const onNode of [false, true]) {
+    const f = fixture();
+    try {
+      const d = onNode ? nodeDeps(f) : deps(f);
+      const paneId = onNode ? 'pane-1@aws1' : 'pane-1';
+      // The stop landed and the copy was interrupted: the source is proven stopped.
+      const provider = d.artifactProvider;
+      if (onNode) {
+        d.artifactProvider = { ...provider, copyClaudeArtifacts: async () => { throw new Error('host request timed out asking aws1 to copy'); } };
+      } else {
+        d.rebindLedger = () => { throw new Error('job ledger source evidence is unavailable'); };
+      }
+      await assert.rejects(handoff.run({ sessionId: f.sid, pane: paneId, accountId: 'two', ownerForce: true }, d));
+      const before = handoff.readOne(f.root, f.sid);
+      assert.equal(before.status, 'recovery-needed'); assert.equal(before.phase, 'copying-artifacts');
+      assert.ok(before.sourceStopVerifiedAt);
+      // Something else (a restart, a reopen) starts the session in the pane again.
+      Object.assign(d.pane, { alive: true, pid: 30, createdAt: 'relaunched-elsewhere' });
+      d.restartSession = async () => assert.fail('a pane this transfer did not launch must not be stopped');
+      await assert.rejects(handoff.run({ sessionId: f.sid, pane: paneId, accountId: 'two', ownerForce: true }, d),
+        (error) => error.status === 409 && /source was stopped, and pane .* is running again; nothing was stopped/.test(error.message)
+          && handoff.classifyRefusal(error.message) === 'blocked');
+      const after = handoff.readOne(f.root, f.sid);
+      assert.equal(after.sourceAgentPid, before.sourceAgentPid, 'the recorded source identity is kept');
+      assert.equal(after.pid, before.pid);
+      assert.equal(after.phase, 'copying-artifacts');
+    } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+  }
+});
+
+test('a Retry of a stop that was only begun stops only the recorded source', async () => {
+  const f = fixture();
+  try {
+    let stops = 0;
+    const d = deps(f, { restartSession: async (_body, options) => {
+      stops++; options.onExitEnter();
+      throw new Error('message was typed but could not be confirmed');
+    } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d));
+    assert.equal(stops, 1);
+    // The same pane process, a new agent in it: not the source this stop began on.
+    const inspect = d.inspect;
+    d.inspect = async (body) => ({ ...(await inspect(body)), agentIdentity: { pid: 55, pidStart: 'new-agent', primary: true, ownsPane: true } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d),
+      /no longer runs the source this transfer began stopping; nothing was stopped/);
+    // Another transfer launched into the pane since.
+    d.inspect = inspect;
+    d.pane.meta.handoffTransactionId = 'another-transaction';
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d),
+      /was relaunched by another transfer since this one recorded its source/);
+    assert.equal(stops, 1);
+    // The recorded source, unchanged: the Retry stops it.
+    delete d.pane.meta.handoffTransactionId;
+    d.restartSession = deps(f).restartSession;
+    const done = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    assert.equal(done.status, 'done');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+// ---------- a lost stop is proven only when nothing holds the conversation ----------
+
+test('a lost stop is not proven while an unrecorded process still holds the conversation', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f, { restartSession: async (_body, options) => {
+      options.onForcedStop([{ pid: 10, pidStart: 'shell-start' }, { pid: 11, pidStart: 'source-start' }]);
+      d.pane.alive = false;
+      throw new Error('host request timed out: get');
+    } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', ownerForce: true }, d));
+    // The recorded pids are gone; a reparented descendant still holds the session.
+    d.agentProcessRows = async () => [{ pid: 1, pidStart: 'boot', args: 'init' }, { pid: 77, ppid: 1, pidStart: 'x', args: 'node mcp-server' }];
+    const asked = [];
+    d.sessionLive = async (id, agent) => { asked.push([id, agent]); return true; };
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', ownerForce: true }, d),
+      (error) => /A process still owns this conversation although its pane exited; recovery is blocked/.test(error.message)
+        && handoff.classifyRefusal(error.message) === 'blocked');
+    assert.deepEqual(asked, [[f.sid, 'claude']]);
+    // A check that cannot run proves nothing, and says so as something a retry can clear.
+    d.sessionLive = async () => { throw new Error('terminal host is unavailable'); };
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', ownerForce: true }, d),
+      (error) => /^Source exit could not be verified/.test(error.message) && handoff.classifyRefusal(error.message) === 'transient');
+    assert.equal(handoff.readOne(f.root, f.sid).sourceStopVerifiedAt, undefined);
+    d.sessionLive = async () => false;
+    assert.equal((await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', ownerForce: true }, d)).status, 'done');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+// ---------- a relaunch whose reply was lost is adopted, never launched twice ----------
+
+test('a relaunch that ran but whose reply was lost is adopted on Retry, here and on a node', async () => {
+  for (const onNode of [false, true]) {
+    const f = fixture();
+    try {
+      const d = onNode ? nodeDeps(f) : deps(f);
+      const paneId = onNode ? 'pane-1@aws1' : 'pane-1';
+      let launches = 0;
+      const launch = (params) => {
+        launches++;
+        Object.assign(d.pane, { alive: true, pid: 20, createdAt: 'target-pane', meta: { ...d.pane.meta, ...params.meta } });
+        throw new Error('host request timed out: replace-exited');
+      };
+      if (onNode) {
+        d.restartSession = async (_body, options) => {
+          d.pane.alive = false;
+          return options.replaceExited({ paneId, meta: { sessionId: f.sid, accountId: 'two' }, cmd: '/bin/zsh', args: ['-lic', 'exec x'] },
+            async (params) => launch(params));
+        };
+      } else {
+        d.host = { request: async (type, params) => { assert.equal(type, 'replace-exited'); return launch(params); } };
+      }
+      await assert.rejects(handoff.run({ sessionId: f.sid, pane: paneId, accountId: 'two', ownerForce: true }, d), /replace-exited/);
+      const lost = handoff.readOne(f.root, f.sid);
+      assert.equal(lost.status, 'recovery-needed'); assert.equal(lost.phase, 'starting-target');
+      assert.equal(lost.targetLaunch, undefined);
+      assert.equal(lost.targetLaunchIntent.transactionId, lost.id);
+      assert.equal(lost.targetLaunchIntent.pane, paneId);
+      assert.equal(lost.targetLaunchIntent.accountId, 'two');
+      if (onNode) assert.match(lost.targetLaunchIntent.commandDigest, /^[a-f0-9]{64}$/);
+      d.restartSession = async () => assert.fail('a landed launch must not be stopped');
+      d.resumeExited = async () => assert.fail('a landed launch must not be launched again');
+      const done = await handoff.run({ sessionId: f.sid, pane: paneId, accountId: 'two', ownerForce: true }, d);
+      assert.equal(done.status, 'done');
+      assert.equal(launches, 1);
+      assert.equal(d.continuations(), 1);
+      const journal = handoff.readOne(f.root, f.sid);
+      assert.deepEqual([journal.targetIdentity.pane, journal.targetIdentity.panePid, journal.targetIdentity.agentPid], [paneId, 20, 21]);
+      assert.equal(accounts.authority(f.root)[f.sid].accountId, 'two');
+    } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+  }
+});
+
+test('a pane that does not carry this transaction\'s mark is never adopted as its launch', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f);
+    d.host = { request: async () => { throw new Error('host request timed out: replace-exited'); } };
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', ownerForce: true }, d));
+    // The pane came back alive under the target account, but not by this transaction.
+    Object.assign(d.pane, { alive: true, pid: 20, createdAt: 'someone-else', meta: { ...d.pane.meta, accountId: 'two', handoffTransactionId: 'other' } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', ownerForce: true }, d),
+      /Target pane launch identity was not verified/);
+    assert.equal(handoff.readOne(f.root, f.sid).targetLaunch, undefined);
+    assert.equal(d.continuations(), 0);
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });

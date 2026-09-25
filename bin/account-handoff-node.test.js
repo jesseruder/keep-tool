@@ -473,3 +473,48 @@ test('an interrupted transfer on a node is relaunched there, only once its table
   assert.equal(replacement.meta.accountId, 'two');
   assert.equal(replacement.meta.handoffTransactionId, 'tx-relaunch');
 });
+
+test('a Codex transfer on a node needs the transcript meta op, and is refused by name before any work', async (t) => {
+  const f = fleet(t);
+  const sid = crypto.randomUUID();
+  accounts.pinSession(sid, 'codex', 'cx-one', { root: f.root, env: f.env, node: 'aws4' });
+  const asked = [];
+  const deps = {
+    root: f.root, env: f.env, daemonNode: 'main', hostNodes: ['main', 'aws4'],
+    hostRequest: async (type) => { asked.push(type); return type === 'hello' ? { artifacts: 3, transcript: 3 } : assert.fail(`asked ${type}`); },
+    inspect: async () => assert.fail('nothing about the session is inspected'),
+  };
+  await assert.rejects(require('./serve').handoffSession({ sessionId: sid, pane: 'p7@aws4', accountId: 'cx-two', ownerForce: true }, deps),
+    (error) => error.status === 409
+      && /predates Codex account transfers \(its transcript verb is version 3; a Codex transfer needs 4\)/.test(error.message));
+  assert.deepEqual(asked, ['hello']);
+  assert.equal(handoff.readOne(f.root, sid), null);
+});
+
+test('whether a node still holds a conversation reads every process there, not only the recorded ones', async () => {
+  const serve = require('./serve');
+  const sid = 'node-held-session';
+  // The agent and the pane are gone; a descendant reparented to init kept the
+  // session in its environment, and nothing recorded its pid.
+  const rows = [
+    { pid: 1, ppid: 0, pidStart: 'boot', args: 'init' },
+    { pid: 70, ppid: 1, pidStart: 'shell', args: '-zsh' },
+    { pid: 77, ppid: 1, pidStart: 'survivor', args: 'node mcp-server.js' },
+  ];
+  const nodeAnswers = (env, extra = {}) => async (type, params, opts) => {
+    assert.equal(type, 'process'); assert.equal(opts.node, 'aws1');
+    if (!params.pids) return { rows };
+    assert.deepEqual(params.pids, [70, 77], 'every process on the node is asked about');
+    return { rows, env, ...extra };
+  };
+  const deps = (env, extra) => ({ daemonNode: 'main', hostNodes: ['main', 'aws1'], hostRequest: nodeAnswers(env, extra),
+    agentProcessRows: async () => rows });
+  assert.equal(await serve.sessionHeldOn('aws1', sid, 'claude', deps([{ pid: 77, sessionId: sid }])), true);
+  assert.equal(await serve.sessionHeldOn('aws1', sid, 'claude', deps([{ pid: 77, sessionId: 'another-session' }])), false);
+  // A Codex rollout held open counts as holding it.
+  assert.equal(await serve.sessionHeldOn('aws1', sid, 'codex',
+    deps([], { files: [{ pid: 77, path: `/n/sessions/2026/01/01/rollout-x-${sid}.jsonl`, id: sid }] })), true);
+  // Environments that could not be read prove nothing.
+  await assert.rejects(serve.sessionHeldOn('aws1', sid, 'claude', deps(undefined)), /environments on aws1 could not be read/);
+  await assert.rejects(serve.sessionHeldOn('aws1', sid, 'codex', deps([])), /open rollouts on aws1 could not be read/);
+});

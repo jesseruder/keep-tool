@@ -11003,12 +11003,17 @@ test('an account handoff of a session on another node asks that node first; a ra
   // that does not answer is a slow host: refused as retryable, with nothing journalled.
   const unreachable = (error) => error.status === 409 && /^host request timed out asking aws1/.test(error.message)
     && handoff.classifyRefusal(error.message) === 'transient';
+  // Only Owner's forced transfer runs there; an unforced one is refused before the
+  // node is asked anything.
   await assert.rejects(handoffSession({ sessionId: 'far', pane: 'p1@aws1', accountId: 'two' }, {
+    hostRequest: async (type) => assert.fail(`asked ${type}`),
+  }), (error) => error.status === 409 && /^A session on aws1 is transferred only when forced/.test(error.message));
+  await assert.rejects(handoffSession({ sessionId: 'far', pane: 'p1@aws1', accountId: 'two', ownerForce: true }, {
     hostRequest: async () => { throw new Error('terminal host is unavailable'); },
     restartSession: async () => { throw new Error('stopped a session its node was never asked about'); },
   }), unreachable);
   // One whose host predates the transfer ops is refused by name and version.
-  await assert.rejects(handoffSession({ sessionId: 'far', pane: 'p1@aws2', accountId: 'two' }, {
+  await assert.rejects(handoffSession({ sessionId: 'far', pane: 'p1@aws2', accountId: 'two', ownerForce: true }, {
     hostRequest: async (type) => (type === 'hello' ? { artifacts: 2, transcript: 4 } : assert.fail(`asked ${type}`)),
   }), (error) => error.status === 409 && /predates account transfers \(its artifacts verb is version 2; a transfer needs 3\)/.test(error.message));
   // The console's transfer is no longer refused before it starts: it runs.

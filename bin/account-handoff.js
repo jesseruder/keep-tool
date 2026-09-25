@@ -185,6 +185,8 @@ async function verifySourceStopAfterTheFact(current, pane, deps, root) {
   if (rows.some((row) => row && row.pid === current.sourceAgentPid && row.pidStart === current.sourceAgentPidStart)) {
     throw new Error('Source agent is still running although its pane exited; recovery is blocked');
   }
+  await requireSessionUnowned(current, deps, (why) => new Error(`Source exit could not be verified: ${why}`),
+    () => new Error('A process still owns this conversation although its pane exited; recovery is blocked'));
   // A forced stop that could not capture its whole tree cannot prove it stopped all of it.
   if (current.forcedCaptureIncomplete === true) {
     throw new Error('The forced stop could not capture every process; recovery is blocked');
@@ -198,6 +200,20 @@ async function verifySourceStopAfterTheFact(current, pane, deps, root) {
   Object.assign(current, { sourceStopVerifiedAt: Date.now(), sourceStopVerifiedBy: 'post-hoc-ps' });
   writeOne(root, current);
 }
+// Nothing on the session's machine still holds the conversation: no process resuming
+// it by id, carrying its id in its environment, or holding its rollout open. The pid
+// and the processes a stop recorded are not enough on their own: a descendant that
+// forked and was reparented between two snapshots is in neither, and it can still be
+// writing the transcript about to be copied. deps.sessionLive asks the machine the
+// pane is on (serve.js sessionHeldOn), fresh; a check that cannot run proves nothing.
+async function requireSessionUnowned(current, deps, unverified, owned) {
+  if (typeof deps.sessionLive !== 'function') throw unverified('no session ownership check is available');
+  let live;
+  try { live = await deps.sessionLive(current.sessionId, current.agent || 'claude'); }
+  catch (error) { throw unverified(`the session's processes could not be read (${String(error && error.message || error).slice(0, 200)})`); }
+  if (live) throw owned();
+}
+
 function safe(entry) {
   if (!entry) return null;
   // sourceStopVerifiedAt is the transaction's own proof that the source agent
@@ -349,6 +365,34 @@ function targetLaunchFrom(result, entry, target) {
   }
   return { pane: pane.id, panePid: pane.pid, paneCreatedAt: pane.createdAt,
     sessionId: entry.sessionId, accountId: target.id, transactionId: entry.id };
+}
+
+// Journalled before the relaunch is sent. The host's replace is not idempotent, and a
+// reply lost after it ran leaves a target pane carrying this transaction's marker with
+// no targetLaunch here; the intent says this transaction asked for exactly that pane
+// on exactly that account, so a Retry can adopt the pane (adoptLandedLaunch) instead
+// of refusing forever or launching a second agent.
+function recordLaunchIntent(entry, target, root, params = null) {
+  const command = params ? crypto.createHash('sha256')
+    .update(JSON.stringify({ cmd: params.cmd || null, args: params.args || null, cwd: params.cwd || null })).digest('hex') : null;
+  entry.targetLaunchIntent = { transactionId: entry.id, pane: entry.pane, accountId: target.id, commandDigest: command,
+    at: Date.now() };
+  writeOne(root, entry);
+}
+
+// The launch identity of a target this transaction started whose reply never came
+// back, read off the pane the host lists now: the pane of this transaction, alive,
+// carrying this transaction's marker, this session and the target account. It is then
+// verified exactly as a fresh launch is (verifyTargetLaunch: SessionStart record
+// newer than the launch, the agent in the pane, the Codex rollout).
+function adoptLandedLaunch(entry, pane, target, root) {
+  const intent = entry.targetLaunchIntent;
+  if (!pane?.alive || pane.id !== entry.pane || pane.meta?.handoffTransactionId !== entry.id
+      || pane.meta?.sessionId !== entry.sessionId || pane.meta?.accountId !== target.id
+      || intent && (intent.transactionId !== entry.id || intent.pane !== entry.pane || intent.accountId !== target.id)) {
+    throw new Error('Target pane launch identity was not verified');
+  }
+  recordTargetLaunch(entry, { pane: { id: pane.id, pid: pane.pid, createdAt: pane.createdAt } }, target, root);
 }
 
 function recordTargetLaunch(entry, result, target, root) {
@@ -642,6 +686,41 @@ function permissionClass(args, options = {}) {
 // A node name is config's NODE_NAME_RE.
 const PANE_REF_RE = /^[A-Za-z0-9_-]+(?:@[a-z0-9]+)?$/;
 
+function nodeTransferNotForced(node) {
+  const error = new Error(`A session on ${node} is transferred only when forced: use the console's transfer, or keep handoff --force`);
+  error.status = 409;
+  return error;
+}
+
+// Whether a live pane is still the source a recorded transaction was stopping. A Retry
+// arrives here with the pane alive when the recovery branches above did not take it:
+// a transaction that never touched its stop may start it afresh (and adopts the
+// identity it finds, as a new transfer would), but one that committed its /exit,
+// signalled a forced stop or got past the stop must find exactly the pane and agent
+// it recorded. Anything else is a pane something relaunched since (a restart, a
+// reopen, another transfer), and stopping it would end a session this transaction
+// knows nothing about. Refused with the record left as it is, for a person to look at
+// the pane and Abandon or Retry.
+function requireRecordedSource(current, pane, identity) {
+  const refuse = (why) => {
+    const error = new Error(`${why}; nothing was stopped and the transfer record was left as it is`);
+    error.status = 409; return error;
+  };
+  if (!paneMarkerUnchanged(current, pane)) {
+    throw refuse(`Pane ${pane.id} was relaunched by another transfer since this one recorded its source`);
+  }
+  const pastStop = Boolean(current.sourceStopVerifiedAt) || !['preflight', 'stopping-source'].includes(current.phase);
+  const stopTouched = pastStop || current.sourceExitEnterAt != null || current.forcedCaptureIncomplete === true
+    || Array.isArray(current.forcedProcesses) && current.forcedProcesses.length > 0;
+  if (!stopTouched) return;
+  if (pastStop) throw refuse(`This transfer's source was stopped, and pane ${pane.id} is running again`);
+  if (Number.isInteger(current.pid) && pane.pid !== current.pid
+      || !Number.isInteger(current.sourceAgentPid) || typeof current.sourceAgentPidStart !== 'string'
+      || !identity || identity.pid !== current.sourceAgentPid || identity.pidStart !== current.sourceAgentPidStart) {
+    throw refuse(`Pane ${pane.id} no longer runs the source this transfer began stopping`);
+  }
+}
+
 const LIMIT_GONE = 'Session no longer carries the account limit this transfer was requested for';
 const USED_SINCE_REQUEST = 'Session was used after the transfer was requested';
 
@@ -719,6 +798,12 @@ async function run(body, deps = {}) {
   // The rate-limit queue never sends it.
   const ownerForce = body.ownerForce === true;
   const force = body.force === true || ownerForce;
+  // A stop that is not Owner's own proves the session idle from its job ledger, which
+  // is verified against the transcript on the machine that writes it; for a session
+  // on another node that proof cannot be taken here (restartSession refuses the same
+  // in-place restart for the same reason). Refused first, before the session, its pane
+  // or its node is asked anything and before any record is read or rewritten.
+  if (paneNode && !ownerForce) throw nodeTransferNotForced(paneNode);
   const requestedIntent = body.intent == null ? null : body.intent;
   if (requestedIntent != null && !['continue', 'open-only'].includes(requestedIntent)) {
     const error = new Error('Account handoff intent must be continue or open-only'); error.status = 400; throw error;
@@ -824,6 +909,7 @@ async function run(body, deps = {}) {
       try {
         if (!current.sourceStopVerifiedAt) throw new Error('Source exit was not verified by the handoff transaction; recovery is blocked');
         if (current.phase !== 'delivering-continuation') {
+          if (!current.targetLaunch) adoptLandedLaunch(current, pane, target, root);
           const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
           await verifyTargetLaunch(current, target, record, deps, root);
         } else requireTargetIdentity(current, inspected, target, deps);
@@ -869,6 +955,8 @@ async function run(body, deps = {}) {
         }
         await verifyFrozenResumeSpec(current, null, deps, source);
         Object.assign(current, { status: 'starting', phase: 'starting-target', targetLaunchStartedAt: Date.now() }); writeOne(root, current);
+        delete current.targetLaunch;
+        recordLaunchIntent(current, target, root);
         const result = await deps.resumeExited(current, target, compatibility.mcpConfig, {
           onLaunched: (launch) => recordTargetLaunch(current, launch, target, root),
         });
@@ -893,15 +981,9 @@ async function run(body, deps = {}) {
       }
     }
     if (!pane.alive) { const error = new Error('Interrupted handoff requires explicit recovery'); error.status = 409; throw error; }
-    // A stop that is not Owner's own proves the session idle from its job ledger, which
-    // is verified against the transcript on the machine that writes it; for a session
-    // on another node that proof cannot be taken here (restartSession refuses the same
-    // in-place restart for the same reason). Refused before anything is asked or
-    // written, so the session keeps running where it is.
-    if (paneNode && !ownerForce) {
-      const error = new Error(`A transfer of a session on ${paneNode} must be forced by Owner: its background work cannot be verified from here`);
-      error.status = 409; throw error;
-    }
+    // A Retry of a recorded transaction stops only the source that transaction
+    // recorded, never whatever the pane runs now.
+    if (current) requireRecordedSource(current, pane, sourceIdentity);
     const sourceMcpConfigs = [];
     if (agent === 'claude' && deps.sourceMcpConfigs) {
       // The node prepares its own copy of the source's shared setup, as its launch did.
@@ -1027,7 +1109,10 @@ async function run(body, deps = {}) {
       copied = true;
       stageTargetAuthority(current, target, root, env);
       Object.assign(current, { status: 'starting', phase: 'starting-target', targetLaunchStartedAt: Date.now() }); writeOne(root, current);
-      const result = await send({ ...params, meta: { ...params.meta, handoffTransactionId: current.id } });
+      const request = { ...params, meta: { ...params.meta, handoffTransactionId: current.id } };
+      delete current.targetLaunch;
+      recordLaunchIntent(current, target, root, request);
+      const result = await send(request);
       recordTargetLaunch(current, result, target, root);
       return result;
     };
@@ -1267,6 +1352,9 @@ async function abandonExited(body, deps = {}) {
     if (rows.some((row) => row?.agent && typeof row.args === 'string' && row.args.includes(current.sessionId))) {
       throw refuse('A process is still running this conversation');
     }
+    await requireSessionUnowned(current, { sessionLive: deps.sessionLive && ((id, agent) => deps.sessionLive(id, agent, { node })) },
+      (why) => refuse(`The session's exit could not be proven: ${why}`),
+      () => refuse('A process still owns this conversation'));
   } finally { active.delete(body.sessionId); }
   // The proof took time; act only on the record it was taken for.
   const still = readOne(root, body.sessionId);

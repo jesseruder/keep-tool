@@ -14045,6 +14045,34 @@ function handoffNode(body, deps = {}) {
   return paneNode === daemon ? null : paneNode;
 }
 
+// The verbs a transfer of a session on `node` uses, by name and version, asked once
+// before anything else: the artifacts verb's transfer ops (3) for every session, and
+// the transcript verb's `meta` (4) for a Codex one, whose row and target check read it.
+// A host that does not answer is a slow host (retryable).
+async function requireNodeHandoff(node, body, deps = {}) {
+  let location = null;
+  try { location = accounts.sessionLocation(String(body?.sessionId || ''), { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
+  catch { location = null; }
+  let hello;
+  try { hello = await (deps.hostRequest || hostRequest)('hello', {}, { ...deps, node }); }
+  catch (error) { throw nodeHandoffUnreachable(node, 'for its capabilities', error); }
+  const artifacts = hello ? Number(hello.artifacts) || 0 : 0;
+  const transcript = hello ? Number(hello.transcript) || 0 : 0;
+  const needTranscript = location && location.agent === 'codex' ? 4 : 1;
+  if (artifacts < HANDOFF_ARTIFACTS_VERSION) {
+    throw new InjectionError(409,
+      `the terminal host on ${node} predates account transfers (its artifacts verb is version ${artifacts}; a transfer needs ${HANDOFF_ARTIFACTS_VERSION}), so no session on it can be transferred to another account; update keep-tool on ${node} and reload its host`,
+      { reason: 'remote-node' });
+  }
+  if (transcript < needTranscript) {
+    throw new InjectionError(409,
+      `the terminal host on ${node} predates ${needTranscript > 1 ? 'Codex ' : ''}account transfers (its transcript verb is version ${transcript}; a ${needTranscript > 1 ? 'Codex ' : ''}transfer needs ${needTranscript}); update keep-tool on ${node} and reload its host`,
+      { reason: 'remote-node' });
+  }
+  nodeArtifactsCapability.set(node, { at: Date.now(), version: artifacts });
+  nodeTranscriptCapability.set(node, Date.now());
+}
+
 // A request to a node that could not be reached reads as a slow host, which the
 // transfer (and its queue) treats as retryable, never as an answer.
 function nodeHandoffUnreachable(node, what, error) {
@@ -14204,12 +14232,13 @@ async function handoffSession(body, deps = {}) {
   // the account that holds the conversation now (nodeTranscriptAccount).
   const readDeps = node ? { ...deps, nodeTranscriptPreferStaged: true } : deps;
   if (node) {
-    // An older host is refused by name, before anything is asked of it or journalled.
-    try { await requireNodeArtifacts(node, deps, HANDOFF_ARTIFACTS_VERSION); }
-    catch (error) {
-      if (error instanceof InjectionError) throw error;
-      throw nodeHandoffUnreachable(node, 'for its capabilities', error);
+    // Only Owner's forced transfer runs on a node (account-handoff.js says why); said
+    // before the node is asked anything.
+    if (body?.ownerForce !== true) {
+      throw new InjectionError(409, `A session on ${node} is transferred only when forced: use the console's transfer, or keep handoff --force`);
     }
+    // An older host is refused by name, before anything is asked of it or journalled.
+    await requireNodeHandoff(node, body, deps);
   }
   // Everything run() would read from this machine is answered by the node instead; a
   // caller's own deps still win, as they do for every dep here.
@@ -14221,6 +14250,8 @@ async function handoffSession(body, deps = {}) {
     inspect: deps.inspect || ((request) => inspectAccountHandoff(request, deps)),
     // A fresh snapshot for proving an unverified stop after the fact.
     agentProcessRows: deps.agentProcessRows ? () => deps.agentProcessRows(deps) : () => agentProcessRows(deps),
+    // And whether anything on the pane's machine still holds the conversation.
+    sessionLive: deps.sessionLive || ((sessionId, agent) => sessionHeldOn(node || daemonNodeName(deps), sessionId, agent, deps)),
     host: deps.host || { request: (type, params) => hostRequest(type, params, node ? { ...deps, node } : deps) },
     restartSession: deps.restartSession || restartSession,
     restartDeps: deps.restartDeps || deps,
@@ -14280,6 +14311,34 @@ async function agentLiveOn(node, sessionId, deps = {}, agent = 'claude') {
       { reason: 'processes-unverified' });
   }
   return live.has(sessionId);
+}
+
+// Whether anything on `node` still holds this conversation, read fresh from that
+// machine: an agent process owning it (agentLiveOn), or any process at all whose
+// arguments name it, whose environment carries it (CLAUDE_CODE_SESSION_ID, and a Codex
+// thread's CODEX_THREAD_ID where the machine can read it), or which holds its rollout
+// open (a Codex session). This is what proves a stop that was never confirmed: a
+// descendant of the stopped agent reparented between two snapshots is in no recorded
+// set, and only a look at every process finds it. Throws when any of it cannot be read.
+async function sessionHeldOn(node, sessionId, agent, deps = {}) {
+  if (await agentLiveOn(node, sessionId, deps, agent)) return true;
+  const local = node === daemonNodeName(deps);
+  const ask = (params) => (local
+    ? (deps.inspectProcesses || processTable.inspect)(params)
+    : (deps.hostRequest || hostRequest)('process', params, { ...deps, node }));
+  const first = await ask({});
+  const rows = Array.isArray(first && first.rows) ? first.rows : null;
+  if (!rows || !rows.length) throw new Error(`the process table on ${node} came back empty`);
+  if (rows.some((row) => row && typeof row.args === 'string' && row.args.includes(sessionId))) return true;
+  const pids = rows.map((row) => row && row.pid).filter((pid) => Number.isInteger(pid) && pid > 1).slice(0, 16384);
+  const detail = await ask({ pids, env: true, codexEnv: true, ...(agent === 'codex' ? { files: true } : {}) });
+  if (!detail || !Array.isArray(detail.env)) throw new Error(`the process environments on ${node} could not be read`);
+  if (detail.env.some((entry) => entry && entry.sessionId === sessionId)) return true;
+  if (agent === 'codex') {
+    if (!Array.isArray(detail.files)) throw new Error(`the open rollouts on ${node} could not be read`);
+    if (detail.files.some((entry) => entry && (entry.id === sessionId || String(entry.path || '').endsWith(`-${sessionId}.jsonl`)))) return true;
+  }
+  return false;
 }
 
 // No agent process for this conversation on `node`; anything short of that proof refuses.
@@ -14894,6 +14953,8 @@ async function abandonTransfer(body, deps = {}) {
       }
       return agentProcessRows({ ...deps, processRowsCache: {} });
     }),
+    sessionLive: deps.sessionLive || ((sessionId, agent, options = {}) =>
+      sessionHeldOn(options.node || daemonNodeName(deps), sessionId, agent, deps)),
   });
 }
 
@@ -17160,7 +17221,7 @@ module.exports = {
   readPaneRecord, sessionProjectFromTranscript, openSession, reopenSessionOnAccount,
   runCheckNow, runTaskNow, openCheckSession, taskRunMessage, adoptedPaneMeta, closeEphemeralPane, resolveOpener, inheritedOpener,
   transcriptFileForSession,
-  inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
+  inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession, sessionHeldOn,
   abandonAccountHandoff,
   abandonTransfer,
   handoffQueueSessions, handoffPolicySessions, handoffQueueTick, handoffRateLimited, cancelQueuedHandoff, handoffSessionRequest,
