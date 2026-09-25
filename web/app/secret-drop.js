@@ -44,13 +44,24 @@ export function secretDropHTML(esc, request, { home = '', more = 0 } = {}) {
   const field = request.multiline
     ? '<textarea class="sd-value masked" name="value" rows="4" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" aria-label="Secret value"></textarea>'
     : '<input class="sd-value" name="value" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" aria-label="Secret value">';
-  return `<div class="sd-head"><span class="sd-icon">${KEY_ICON}</span><div class="sd-titles"><div class="sd-title">Secret requested · <code>${esc(request.name)}</code>${more ? ` <span class="sd-more">+${more} more</span>` : ''}</div>${request.purpose ? `<div class="sd-purpose">${esc(request.purpose)}</div>` : ''}</div></div>`
+  return `<div class="sd-card" role="dialog" aria-label="Secret requested"><div class="sd-head"><span class="sd-icon">${KEY_ICON}</span><div class="sd-titles"><div class="sd-title">Secret requested · <code>${esc(request.name)}</code>${more ? ` <span class="sd-more">+${more} more</span>` : ''}</div>${request.purpose ? `<div class="sd-purpose">${esc(request.purpose)}</div>` : ''}</div><button type="button" class="btn sd-later" title="Hide this over the terminal; the key button brings it back">Later</button></div>`
     + `<div class="sd-dest"><div class="sd-row"><span class="sd-label">Goes to</span><span><span class="sd-node">${esc(request.node)}</span> <code class="sd-path" title="${esc(request.path)}">${esc(target)}</code></span></div>${as}</div>`
     + `<form class="sd-form" autocomplete="off"><div class="sd-field">${field}<button type="button" class="btn sd-reveal" aria-pressed="false" title="Show the value">Show</button></div>`
     + '<div class="sd-shape mono" aria-live="polite"></div><div class="sd-error" role="alert" hidden></div>'
     + `<div class="sd-actions"><button type="button" class="btn sd-decline">Decline…</button><span class="sd-spacer"></span><button type="submit" class="btn primary sd-save" disabled>Save to ${esc(request.node)}</button></div>`
     + '<div class="sd-declining" hidden><input class="sd-reason" type="text" maxlength="400" autocomplete="off" placeholder="Why (optional, sent to the session)" aria-label="Reason for declining"><button type="button" class="btn sd-decline-confirm">Decline request</button><button type="button" class="btn sd-decline-cancel">Cancel</button></div>'
-    + '</form>';
+    + '</form></div>'
+    + `<button type="button" class="sd-pill" title="Secret requested: ${esc(request.name)}" aria-label="Show the secret request for ${esc(request.name)}">${KEY_ICON}<span>${esc(request.name)}</span></button>`;
+}
+
+// Requests Owner put off with Later, for this page's life only: the card stays
+// folded into its key button until he opens it again.
+const later = new Set();
+
+function setFolded(root, folded) {
+  root.classList.toggle('folded', folded);
+  root.querySelector('.sd-card').hidden = folded;
+  root.querySelector('.sd-pill').hidden = !folded;
 }
 
 function setBusy(root, busy, label) {
@@ -83,6 +94,12 @@ function install(root, ctx, request) {
     showError(root, '');
   };
   field.addEventListener('input', update);
+  root.querySelector('.sd-later').addEventListener('click', () => { later.add(request.id); setFolded(root, true); });
+  root.querySelector('.sd-pill').addEventListener('click', () => {
+    later.delete(request.id);
+    setFolded(root, false);
+    field.focus();
+  });
   reveal.addEventListener('click', () => {
     const shown = reveal.getAttribute('aria-pressed') !== 'true';
     reveal.setAttribute('aria-pressed', String(shown));
@@ -102,7 +119,6 @@ function install(root, ctx, request) {
       field.value = '';
       root.dataset.done = '1';
       root.hidden = true;
-      ctx.scheduleTerminalFit?.();
       ctx.toast(`${request.name} written to ${displayPath(request.path, ctx.data?.scopes?.home)} on ${request.node}`);
       ctx.refresh();
     } catch (error) {
@@ -125,7 +141,6 @@ function install(root, ctx, request) {
       field.value = '';
       root.dataset.done = '1';
       root.hidden = true;
-      ctx.scheduleTerminalFit?.();
       ctx.toast(`Declined ${request.name}`);
       ctx.refresh();
     } catch (error) {
@@ -144,14 +159,20 @@ function install(root, ctx, request) {
 // alone after that, so a state refresh never wipes what Owner is typing; it is
 // torn down (and the field with it) when the request is answered or the stage
 // shows another session.
+//
+// It floats over the terminal rather than taking a row above it: a panel in the
+// layout resized the pane when it came and went, and every resize makes the agent
+// redraw — and a refit's focus report reached the pane as input mid-delivery.
 export function syncSecretDrop(stage, ctx, item) {
   let root = stage.querySelector('.secret-drop');
   if (!root) {
+    const body = stage.querySelector('.stage-body');
+    if (!body) return;
     root = document.createElement('section');
     root.className = 'secret-drop';
     root.hidden = true;
     root.setAttribute('aria-label', 'Secret requested');
-    stage.querySelector('.stage-body')?.before(root);
+    body.append(root);
   }
   const found = secretRequestFor(ctx.data, item?.sessionId);
   if (!found) {
@@ -160,7 +181,6 @@ export function syncSecretDrop(stage, ctx, item) {
       root.replaceChildren();
       delete root.dataset.requestId;
       delete root.dataset.done;
-      ctx.scheduleTerminalFit?.();
     }
     return;
   }
@@ -178,5 +198,5 @@ export function syncSecretDrop(stage, ctx, item) {
   delete root.dataset.done;
   root.hidden = false;
   install(root, ctx, request);
-  ctx.scheduleTerminalFit?.();
+  setFolded(root, later.has(request.id));
 }

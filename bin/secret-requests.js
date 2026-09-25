@@ -71,8 +71,13 @@ function text(value, limit) {
   return typeof value === 'string' ? value.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ' ').trim().slice(0, limit) : '';
 }
 
+// Short on purpose: the session is told in one typed line, and a message longer than
+// one typing chunk (200 characters) can be left half-typed if the pane takes input
+// between chunks. The keep-secrets skill already says how to use the file.
 function where(record) {
-  return `${record.path}${record.key ? ` as ${record.key}` : ''} on ${record.node}`;
+  const home = require('node:os').homedir();
+  const file = record.path.startsWith(`${home}/`) ? `~${record.path.slice(home.length)}` : record.path;
+  return `${file}${record.key ? ` as ${record.key}` : ''} on ${record.node}`;
 }
 
 function createSecretService(options = {}) {
@@ -231,7 +236,7 @@ function createSecretService(options = {}) {
         status: 'delivered', resolvedAt: now(), lastError: null,
         outcome: { replaced: Boolean(outcome && outcome.replaced), bytes: Number(outcome && outcome.bytes) || null },
       });
-      tell(resolved, `[keep] secret ${record.name} was written to ${where(record)} (request ${id}). Owner handed it off; the value is only in that file. Use it without printing it (for example \`set -a; . <file>; set +a\`, or pass the path to the tool), and never echo, cat or commit it.`);
+      tell(resolved, `[keep] secret ${record.name} written to ${where(record)} (request ${id}); use it without printing it.`);
       return { status: 200, body: { request: publicRecord(resolved) } };
     } finally {
       writing.delete(id);
@@ -249,7 +254,7 @@ function createSecretService(options = {}) {
     if (writing.has(id)) return refusal(409, `secret request ${id} is being written`);
     const reason = text(body.reason, 400) || null;
     const resolved = update(id, { status: 'declined', resolvedAt: now(), reason });
-    tell(resolved, `[keep] Owner declined secret request ${id} (${record.name} for ${where(record)})${reason ? `. Owner's reason: ${reason}` : ''}. Do not ask again for the same thing without a new reason.`);
+    tell(resolved, `[keep] Owner declined secret ${record.name} (request ${id})${reason ? `: ${reason.slice(0, 120)}` : ''}`);
     onChange();
     return { status: 200, body: { request: publicRecord(resolved) } };
   }

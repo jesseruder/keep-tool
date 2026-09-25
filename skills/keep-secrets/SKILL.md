@@ -43,7 +43,7 @@ symlink, and a file inside a git repository that is not gitignored. Add the path
 Then **end your turn**. Say in your final message what you asked for and why, in a
 sentence: the console shows the request as a panel above your terminal when Owner opens
 this session. There is no notification, so your message is how he learns of it. When it
-is written, a `[keep] secret NAME was written to …` message arrives in this session. If
+is written, a `[keep] secret NAME written to …` message arrives in this session. If
 he declines, the message says so with his reason; do not ask again without a new one.
 
 `keep secret status` lists this session's requests. `keep secret wait <id> --for 10m`

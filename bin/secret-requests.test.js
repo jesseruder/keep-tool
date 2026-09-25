@@ -79,6 +79,7 @@ test('fulfilling a remote request writes through the node host and tells the ses
   assert.equal(calls.told[0].sessionId, SESSION);
   assert.match(calls.told[0].text, /\/home\/u\/app\/\.env as GITHUB_TOKEN on aws1/);
   assert.ok(!calls.told[0].text.includes(VALUE));
+  assert.ok(calls.told[0].text.length <= 200, `one typing chunk: ${calls.told[0].text.length}`);
   assert.ok(!fs.readFileSync(storeFile(root), 'utf8').includes(VALUE), 'the store never holds a value');
   assert.ok(!JSON.stringify(result.body).includes(VALUE));
   assert.equal(consoleRequests(root, 1_000_000).length, 0);

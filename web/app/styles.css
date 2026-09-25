@@ -956,9 +956,20 @@ html.mobile .notification-heading, html.mobile .notification-toolbar, html.mobil
 html.mobile .notification-toolbar .btn, html.mobile .notification-actions .btn, html.mobile .notification-enable { min-height: 44px; }
 html.mobile .notification-preview { padding-inline: 14px; }
 
-/* Secret Drop (web/app/secret-drop.js): a session waiting on Owner for a secret. */
-.secret-drop { flex-shrink: 0; margin: 10px 16px; padding: 12px 14px; border: 1px solid var(--accent); border-left-width: 4px; border-radius: 8px; background: var(--accent-soft); display: flex; flex-direction: column; gap: 10px; }
+/* Secret Drop (web/app/secret-drop.js): a session waiting on Owner for a secret. It
+   floats over the terminal so the pane never changes size; folded, it is a key button
+   in the terminal's corner. */
+.stage-body { position: relative; }
+.secret-drop { position: absolute; inset: 0; z-index: 6; display: flex; justify-content: center; align-items: flex-start; padding: 28px 16px; background: var(--backdrop); overflow: auto; }
+.secret-drop.folded { inset: 10px 14px auto auto; padding: 0; background: none; overflow: visible; }
 .secret-drop[hidden] { display: none; }
+.secret-drop .sd-card { width: min(640px, 100%); padding: 14px 16px; border: 1px solid var(--accent); border-left-width: 4px; border-radius: 10px; background: linear-gradient(var(--accent-soft), var(--accent-soft)), var(--panel); box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 10px; }
+.secret-drop .sd-card[hidden] { display: none; }
+.secret-drop .sd-later { margin-left: auto; flex-shrink: 0; }
+.secret-drop .sd-titles { min-width: 0; }
+.secret-drop .sd-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--accent); background: var(--panel); color: var(--accent); font: 12px var(--mono); cursor: pointer; box-shadow: var(--shadow); }
+.secret-drop .sd-pill[hidden] { display: none; }
+.secret-drop .sd-pill span { color: var(--text); }
 .secret-drop code { font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }
 .secret-drop .sd-head { display: flex; gap: 10px; align-items: flex-start; }
 .secret-drop .sd-icon { color: var(--accent); display: inline-flex; padding-top: 1px; }
@@ -983,6 +994,6 @@ html.mobile .notification-preview { padding-inline: 14px; }
 .secret-drop .sd-declining[hidden] { display: none; }
 .secret-drop .sd-spacer { flex: 1; }
 .secret-drop .sd-reason { flex: 1; min-width: 160px; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
-.secret-drop.busy { opacity: .75; }
-html.mobile .secret-drop { margin: 8px 12px; }
+.secret-drop.busy .sd-card { opacity: .75; }
+html.mobile .secret-drop { padding: 12px; }
 html.mobile .secret-drop .btn, html.mobile .secret-drop .sd-value, html.mobile .secret-drop .sd-reason { min-height: 44px; }

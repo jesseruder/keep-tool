@@ -26,6 +26,37 @@ test.afterEach(async ({}, info) => {
 const panel = page => page.locator('#stage .secret-drop');
 const terminalInput = () => fixture.events.filter(event => event.event === 'input');
 
+test('the panel floats over the terminal: it never resizes the pane, and Later folds it to a key', async ({ page }) => {
+  const terminal = page.locator('#stage .stage-terminal');
+  await expect(page.locator('#stage .xterm')).toBeVisible();
+  const before = await terminal.boundingBox();
+  const resizes = () => fixture.events.filter(event => event.event === 'terminal' && event.t === 'resize').length;
+  const resizesBefore = resizes();
+  fixture.configure({ secretRequests: [request()] });
+  await expect(panel(page).locator('.sd-card')).toBeVisible();
+  const over = await panel(page).boundingBox();
+  expect(await terminal.boundingBox()).toEqual(before);
+  expect(over.y).toBeGreaterThanOrEqual(before.y - 1);
+
+  await panel(page).locator('.sd-later').click();
+  await expect(panel(page).locator('.sd-card')).toBeHidden();
+  await expect(panel(page).locator('.sd-pill')).toBeVisible();
+  // Still folded after a state refresh.
+  fixture.update('a', { title: 'Session A again' });
+  await expect(page.locator('#stage .session-heading')).toContainText('Session A again');
+  await expect(panel(page).locator('.sd-pill')).toBeVisible();
+  await panel(page).locator('.sd-pill').click();
+  await expect(panel(page).locator('.sd-card')).toBeVisible();
+  await expect(panel(page).locator('.sd-value')).toBeFocused();
+
+  await panel(page).locator('.sd-value').fill('tok');
+  await panel(page).locator('.sd-save').click();
+  await expect(panel(page)).toBeHidden();
+  expect(await terminal.boundingBox()).toEqual(before);
+  await page.waitForTimeout(300);
+  expect(resizes()).toBe(resizesBefore);
+});
+
 test('the panel shows only on the session that asked, and hands the value off once', async ({ page }) => {
   fixture.configure({ secretRequests: [request()] });
   await expect(panel(page)).toBeVisible();
