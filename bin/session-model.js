@@ -23,7 +23,11 @@ function normalize(session, context = {}) {
   // for a check that went missing. Older conversations on the card stay quiet.
   const latestId = (task.sessions || []).at(-1)?.id || null;
   const cardLatest = Boolean(session.id) && latestId === session.id;
-  const checkOwner = Boolean(session.id) && (task.scheduled_by || latestId) === session.id;
+  // serve.js names the owner among the sessions it actually lists (checkOwnerId); a
+  // scheduler that is gone hands the role to the latest session.
+  const ownerId = context.checkOwnerId !== undefined ? context.checkOwnerId
+    : task.scheduled_by && (task.sessions || []).some((entry) => entry.id === task.scheduled_by) ? task.scheduled_by : latestId;
+  const checkOwner = Boolean(session.id) && ownerId === session.id;
   const model = {
     version: 1,
     identity: { conversationId: session.id || null, agent: session.kind || null, interactive: live, reviewer: Boolean(session.reviewer) },

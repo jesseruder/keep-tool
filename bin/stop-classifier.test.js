@@ -151,6 +151,10 @@ test('a card check overdue past its grace stops holding the session as waiting',
   const scheduled = { task: { ...card.task, scheduled_by: 'older', sessions: [{ id: 'older' }, { id: 's1' }] }, now: at + 20 * 60e3 };
   assert.notEqual(activity(gone, scheduled).decision.rule, 'check-overdue');
   assert.equal(activity({ ...gone, id: 'older' }, scheduled).decision.rule, 'check-overdue');
+  // A scheduler Keep no longer lists hands the alert to the latest session.
+  const pruned = { task: { ...card.task, scheduled_by: 'gone-session', sessions: [{ id: 's1' }] }, now: at + 20 * 60e3 };
+  assert.equal(activity(gone, pruned).decision.rule, 'check-overdue');
+  assert.equal(activity(gone, { ...scheduled, checkOwnerId: 's1' }).decision.rule, 'check-overdue', 'serve.js names the listed owner');
   assert.equal(activity(gone, { ...card, now: at + 10 * 60e3 }).decision.rule, 'scheduled-check', 'inside the grace it still waits');
   const overdue = activity(gone, { ...card, now: at + 20 * 60e3 });
   assert.equal(overdue.decision.rule, 'check-overdue');

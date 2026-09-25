@@ -13110,6 +13110,8 @@ function buildState(options = {}) {
   // marked (below), or in the worker's finalize.
   require('./stop-classifier').attach(sessions);
   const checkFlight = new Map();
+  const listedSessions = new Set(sessions.map((session) => session.id));
+  const checkOwnerId = (fm) => (fm.scheduled_by && listedSessions.has(fm.scheduled_by) ? fm.scheduled_by : (fm.sessions || []).at(-1)?.id || null);
   for (const session of sessions) {
     const task = taskById.get(session.taskId);
     if (task && !dependencyCache.has(task.id)) dependencyCache.set(task.id, keep.unresolvedDependencyIds(task));
@@ -13121,7 +13123,7 @@ function buildState(options = {}) {
     // build and never taken from a cached row.
     session.unattended = Boolean(panesBySession.get(session.id)?.meta?.unattended);
     const statusContext = { task, dependencies: dependencyCache.get(task?.id) || [], live: liveHostedSessions.has(session.id),
-      checkInFlight: checkFlight.get(task?.id) === true };
+      checkInFlight: checkFlight.get(task?.id) === true, checkOwnerId: task ? checkOwnerId(task.fm) : null };
     session.activity = sessionStatus.activity(session, statusContext);
     session.observation = require('./session-model').normalize(session, statusContext);
     session.state = session.activity.state;
