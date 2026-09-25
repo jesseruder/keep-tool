@@ -19,7 +19,9 @@ test('queue backoff leaves cursors intact and yields to human, result, card, Git
     cp.execFileSync('git', ['init', '-q', project]);
     cp.execFileSync('git', ['-C', project, '-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '--allow-empty', '-qm', 'initial']);
     const file = path.join(root, 'probe.jsonl');
-    require('./bin/transcripts').findSessionFile = () => file;
+    // The reviewer reads a transcript through readableSessionFile (bound when review.js
+    // loads, below), which calls findSessionFile internally; patch the one it binds.
+    require('./bin/transcripts').readableSessionFile = () => file;
     const keep = require('./bin/keep.js');
     const task = { id: 'probe-fixture', fm: { title: 'Probe', project, status: 'active', sessions: [{ id: 'probe-worker', agent: 'claude' }] }, body: '' };
     keep.loadAll = () => [task];

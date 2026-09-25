@@ -1519,7 +1519,9 @@ test('buildBundle exits 3 and advances the git baseline when only HEAD moved', (
     assert.equal(spawnSync('git', ['init', '-q', root], { env }).status, 0);
     spawnSync('git', ['-C', root, 'config', 'user.name', 'Keep Test'], { env });
     spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test'], { env });
-    assert.equal(run(['add', 'Head only', '--status', 'blocked', '-m', 'Started.']).status, 0);
+    // Named, not inferred from cwd: a cwd inside the registry files no project, and on
+    // macOS it only looked like one because /var/folders resolves to /private/var.
+    assert.equal(run(['add', 'Head only', '--project', fs.realpathSync(root), '--status', 'blocked', '-m', 'Started.']).status, 0);
 
     const first = run(['review-bundle', 'head-only']);
     assert.equal(first.status, 0, first.stderr);
@@ -2711,7 +2713,8 @@ test('reviewer bundles list foreign device holds inside the safety envelope', ()
     spawnSync('git', ['init', '-q', root], { env });
     spawnSync('git', ['-C', root, 'config', 'user.name', 'Keep Test'], { env });
     spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test'], { env });
-    assert.equal(run(['add', 'Some work', '--status', 'active', '-m', 'Started.']).status, 0);
+    // Named, as in the head-only test above: a cwd inside the registry files no project.
+    assert.equal(run(['add', 'Some work', '--project', fs.realpathSync(root), '--status', 'active', '-m', 'Started.']).status, 0);
     const holds = path.join(root, '.keep', 'holds');
     fs.mkdirSync(holds, { recursive: true });
     const until = new Date(Date.now() + 60e3).toISOString();

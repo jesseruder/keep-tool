@@ -92,13 +92,23 @@ function read(root, sid, now = Date.now()) {
     for (const name of cache.files.keys()) if (!present.has(name)) cache.files.delete(name);
     const events = [];
     for (const name of names) {
-      let value = cache.files.get(name);
+      // A name is a digest of the event without its time, so a pruned file can come
+      // back under the same name with a new time, and a recreated directory can reuse
+      // its inode (Linux does). The file's own identity decides whether the parse holds.
+      let identity = null;
+      try {
+        const file = fs.statSync(path.join(dir, name));
+        identity = `${file.ino}:${file.size}:${file.mtimeMs}`;
+      } catch { continue; }
+      const cached = cache.files.get(name);
+      let value = cached && cached.identity === identity ? cached.value : null;
       if (!value) {
+        cache.files.delete(name);
         try {
           const parsed = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
           if (EVENTS.has(parsed.event) && ID.test(parsed.entity) && Number.isFinite(parsed.at)) {
             value = parsed;
-            cache.files.set(name, value);
+            cache.files.set(name, { identity, value });
             if (cache.files.size > READ_CACHE_FILES) cache.files.delete(cache.files.keys().next().value);
           }
         } catch {}

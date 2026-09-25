@@ -43,13 +43,15 @@ test('shell cleanup closes empty old shells and exited Claude shells, preserving
   }
 });
 
-test('agent cleanup uses an eight-hour boundary for transcript and output activity', () => {
+test('agent cleanup uses an eight-hour boundary for transcript and input activity', () => {
   const p = { ...pane, meta: { agent: 'claude', sessionId: 's' } };
   const s = { id: 's', kind: 'claude', state: 'idle', endedTurn: true, mtime: now - IDLE_MS };
   assert.equal(IDLE_MS, 8 * 3600e3);
   assert.equal(refusal(s, p, new Set(), now, { automatic: true }), null);
   assert.match(refusal({ ...s, mtime: s.mtime + 1 }, p, new Set(), now, { automatic: true }), /8 hours/);
-  assert.match(refusal(s, { ...p, lastOutputAt: new Date(now - IDLE_MS + 1).toISOString() }, new Set(), now, { automatic: true }), /recent/);
+  assert.match(refusal(s, { ...p, lastInputAt: new Date(now - IDLE_MS + 1).toISOString() }, new Set(), now, { automatic: true }), /recent input/);
+  // Output alone is not activity: an idle TUI still redraws.
+  assert.equal(refusal(s, { ...p, lastOutputAt: new Date(now).toISOString() }, new Set(), now, { automatic: true }), null);
 });
 
 test('scheduler includes shells and throttles failed closure attempts', async () => {

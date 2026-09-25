@@ -24,7 +24,9 @@ function fixture() {
     input: options.input,
   });
   const addPlan = (idTitle = 'Parent card') => {
-    const result = run(['add', idTitle, '--status', 'active', '--plan', 'Implement alpha', 'Verify beta'], { CODEX_THREAD_ID: 'parent-session' });
+    // The project is named: a cwd inside the registry files none (macOS only inferred
+    // one because its temp dir resolves through /private). Canonical, as claim compares it.
+    const result = run(['add', idTitle, '--project', fs.realpathSync(root), '--status', 'active', '--plan', 'Implement alpha', 'Verify beta'], { CODEX_THREAD_ID: 'parent-session' });
     assert.equal(result.status, 0, result.stderr);
     return idTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-');
   };
