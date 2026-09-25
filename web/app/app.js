@@ -16,7 +16,7 @@ import { mountTerminal } from './terminal.js';
 import { setTerminalRendererPreference } from './terminal-renderer.js';
 import { setPredictTypingPreference } from './predict-typing.js';
 import { installFocusDebug } from './focus-debug.js';
-import { retainSelection, stableSessionOrder } from './selection.js';
+import { retainSelection, stableAttentionOrder, stableSessionOrder } from './selection.js';
 import { createSessionHistory, installSessionHistory } from './session-history.js';
 import { cardRows, installSessionSearch, sessionRows } from './session-search.js';
 import { installTriageControls, matchesTriageFilters, renderTriage, sessionNode } from './triage.js';
@@ -224,6 +224,7 @@ function queueSetAsideWrite(key, write) {
 const focusDebug = installFocusDebug(() => ({ mode: state.mode, selected: state.selectedKey || '', session: state.currentItem?.sessionId || '', pane: state.currentItem?.pane || '' }));
 const reopeningSessions = new Map();
 const runningOrder = new Map();
+const waitingOrder = new Map();
 
 function itemKey(item) { return item?.key || item?.sessionId || item?.taskId || item?.pane || `${item?.kind}:${item?.title}:${item?.since}`; }
 function triageKey(item) {
@@ -252,9 +253,8 @@ function entityForPane(id) {
   };
 }
 function queueItems() {
-  return humanAttention(data).filter((item) => !isClosingSession(item.sessionId, item.pane) && !state.sent.has(eventKey(item)))
-    .sort((a, b) => Number(a.pri || 0) - Number(b.pri || 0)
-      || (typeof a.since === 'number' ? a.since : Date.parse(a.since) || 0) - (typeof b.since === 'number' ? b.since : Date.parse(b.since) || 0));
+  return stableAttentionOrder(humanAttention(data)
+    .filter((item) => !isClosingSession(item.sessionId, item.pane) && !state.sent.has(eventKey(item))), waitingOrder, itemKey);
 }
 function sessionItem(kind, session, pane = session.pane) {
   return {

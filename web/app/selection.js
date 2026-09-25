@@ -31,3 +31,18 @@ export function stableSessionOrder(items, ranks, knownIds, createdAt = null) {
     ? createdAt(b) - createdAt(a) || a.id.localeCompare(b.id)
     : ranks.get(a.id) - ranks.get(b.id));
 }
+
+// Waiting on you keeps each row where it first appeared. A row's `since` is its
+// session's last transcript message, and Keep writes into a session while it waits
+// (deliveries, nudges), so sorting on the live value swapped rows that did nothing.
+// An anchor lives while its row is listed; a row that leaves and comes back is a
+// new request and takes its new time. Priority still decides the group.
+export function stableAttentionOrder(items, anchors, keyOf) {
+  const time = (value) => (typeof value === 'number' ? value : Date.parse(value) || 0);
+  const keys = new Set(items.map(keyOf));
+  for (const key of anchors.keys()) if (!keys.has(key)) anchors.delete(key);
+  for (const item of items) if (!anchors.has(keyOf(item))) anchors.set(keyOf(item), time(item.since));
+  return [...items].sort((a, b) => Number(a.pri || 0) - Number(b.pri || 0)
+    || anchors.get(keyOf(a)) - anchors.get(keyOf(b))
+    || String(keyOf(a)).localeCompare(String(keyOf(b))));
+}

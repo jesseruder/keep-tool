@@ -93,6 +93,22 @@ test('running and waiting sessions retain their slots through status changes', (
   assert.deepEqual(order([d, c, b, a]), ['a', 'b', 'c', 'd']);
 });
 
+test('Waiting on you keeps each row where it first appeared while Keep writes to it', () => {
+  const anchors = new Map();
+  const order = (items) => Array.from(selection.stableAttentionOrder(items, anchors, (item) => item.sessionId), (item) => item.sessionId);
+  assert.deepEqual(order([{ sessionId: 'b', since: 20 }, { sessionId: 'a', since: 10 }]), ['a', 'b']);
+  assert.deepEqual(order([{ sessionId: 'a', since: 30 }, { sessionId: 'b', since: 20 }]), ['a', 'b'],
+    'a delivery into a waiting session does not move it below its neighbour');
+  assert.deepEqual(order([{ sessionId: 'b', since: '1970-01-01T00:00:00.020Z' }, { sessionId: 'a', since: 30 }]), ['a', 'b']);
+  assert.deepEqual(order([{ sessionId: 'b', since: 20 }, { sessionId: 'a', since: 30, pri: 1 }]), ['b', 'a'],
+    'priority still decides the group');
+  assert.deepEqual(order([{ sessionId: 'b', since: 20 }]), ['b']);
+  assert.deepEqual(order([{ sessionId: 'a', since: 40 }, { sessionId: 'b', since: 20 }]), ['b', 'a'],
+    'a row that left and came back is a new request at its new time');
+  assert.deepEqual(order([{ sessionId: 'd', since: 5 }, { sessionId: 'c', since: 5 }]), ['c', 'd'], 'ties break by key');
+  assert.equal(anchors.has('a'), false, 'anchors of rows no longer listed are dropped');
+});
+
 test('running panel orders newest-created first regardless of activity and refresh order', () => {
   const source = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
   const data = {

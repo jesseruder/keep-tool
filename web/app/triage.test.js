@@ -842,8 +842,9 @@ test('an agent in needs-input appears under Agents and in no other queue', async
   const fs = await import('node:fs');
   const vm = await import('node:vm');
   const { humanAttention } = await import('./status.js');
+  const { stableAttentionOrder } = await import('./selection.js');
   const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
-  const agent = { id: 'agent-sid', pane: 'agent-pane', project: '/tmp/p', title: 'sandboxes',
+  const agent ={ id: 'agent-sid', pane: 'agent-pane', project: '/tmp/p', title: 'sandboxes',
     state: 'needs-input', mtime: 30, lastUserAt: 30, agentName: 'sandboxes' };
   const working = { id: 'work-sid', pane: 'work-pane', project: '/tmp/p', title: 'a card',
     state: 'needs-input', mtime: 20, lastUserAt: 20 };
@@ -861,6 +862,9 @@ test('an agent in needs-input appears under Agents and in no other queue', async
     data,
     state: { markedRunning: new Set(), sent: new Set(), dismissed: new Set() },
     humanAttention,
+    stableAttentionOrder,
+    waitingOrder: new Map(),
+    itemKey: (item) => item.sessionId,
     isClosingSession: () => false,
     eventKey: (item) => item.sessionId || item.kind,
     pinnedLayout: () => ({ ids: ['agent-pane', 'work-pane'] }),
