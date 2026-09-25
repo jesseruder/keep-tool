@@ -3281,19 +3281,33 @@ commands.agents = (argv) => {
     }
     // Repeatable, and each may be a comma list: --needs a,b and --needs a --needs b.
     if (o.needs !== undefined) patch.needs = o.needs.flatMap((entry) => String(entry).split(',')).map((entry) => entry.trim()).filter(Boolean);
-    const record = agents.writeRecord(name, patch, { root: ROOT });
     // Who moved it: the session the daemon verified for a node's request, this
     // process's own session here, or a shell.
     const by = currentSession();
     const where = (value) => value.node || 'the daemon node';
-    const needs = record.needs.length ? ` (needs ${record.needs.join(', ')})` : '';
-    try {
-      agents.emit(name, {
-        kind: 'placed', severity: 'low',
-        text: `placed on ${where(record)}${needs}, was ${where(current)}, by ${by ? `${by.agent} ${sessionNamed(by.id)}` : 'a shell'}`
-          + `${process.env.KEEP_REMOTE_CALLER ? ` on ${process.env.KEEP_REMOTE_CALLER}` : ''}`,
-      }, { root: ROOT });
-    } catch {}
+    // One lock for the read, the write and the feed event, so two placements racing
+    // from different nodes each report the placement they actually replaced, in the
+    // order they happened. A move the feed cannot record is not made: the gate this
+    // replaced was Owner's, and what stands in for it is that no move is silent.
+    const record = withLock(() => {
+      const before = agents.readRecord(name, ROOT);
+      if (!before) die(`no agent record for ${name}`);
+      const after = agents.writeRecord(name, patch, { root: ROOT, withinLock: true });
+      const needs = after.needs.length ? ` (needs ${after.needs.join(', ')})` : '';
+      let event = null;
+      try {
+        event = agents.emit(name, {
+          kind: 'placed', severity: 'low',
+          text: `placed on ${where(after)}${needs}, was ${where(before)}, by ${by ? `${by.agent} ${sessionNamed(by.id)}` : 'a shell'}`
+            + `${process.env.KEEP_REMOTE_CALLER ? ` on ${process.env.KEEP_REMOTE_CALLER}` : ''}`,
+        }, { root: ROOT, withinLock: true });
+      } catch {}
+      if (!event) {
+        agents.writeRecord(name, { node: before.node, needs: before.needs }, { root: ROOT, withinLock: true });
+        die(`${name}'s feed could not record the move, so its placement is unchanged`);
+      }
+      return after;
+    });
     agents.flushCommits(ROOT);
     if (o.json) { console.log(JSON.stringify({ name, node: record.node, needs: record.needs }, null, 2)); return; }
     console.log(describePlacement(record));

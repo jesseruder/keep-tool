@@ -1188,6 +1188,17 @@ test('keep agents place puts an agent on a configured node, from any session, an
     assert.equal(placedEvents().length, 4);
     // The reviewer is not Keep's to open, so it is not placed this way.
     assert.match(run(['fleet-reviewer', '--node', 'aws1']).stderr, /keep move/);
+    // A move the feed cannot record is not made.
+    const feedFile = agents.eventsFile('redash-daily', root);
+    const saved = fs.readFileSync(feedFile);
+    fs.rmSync(feedFile);
+    fs.mkdirSync(feedFile);
+    const unrecorded = run(['redash-daily', '--node', 'aws1']);
+    assert.notEqual(unrecorded.status, 0);
+    assert.match(unrecorded.stderr, /feed could not record the move, so its placement is unchanged/);
+    assert.equal(agents.readRecord('redash-daily', root).node, '');
+    fs.rmSync(feedFile, { recursive: true });
+    fs.writeFileSync(feedFile, saved);
 
     // An emit forwarded from a node (KEEP_REMOTE_CALLER, and the session the daemon
     // verified) writes the feed only from the session the record names.
