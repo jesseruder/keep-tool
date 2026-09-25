@@ -146,21 +146,17 @@ export function agentPane(ctx, agent) {
   return paneId ? ctx.paneMap().get(paneId) : null;
 }
 
-export function agentProject(ctx, agent) {
+// An agent belongs to the fleet, not to a project: the reviewer happens to sit in
+// the registry's directory and a responder in its area's repo, but neither is that
+// project's work. So agents are listed under All only — a selected project hides
+// them all — while a selected client or machine still has to match their current
+// session or pane.
+export function matchesAgentTriageFilters(ctx, agent) {
+  if (ctx.state.filter) return false;
   const session = agentSession(ctx, agent);
   const pane = agentPane(ctx, agent);
-  return session?.project || pane?.meta?.project || pane?.cwd || agent?.project || '';
-}
-
-// Unresolved agents still appear under All; a selected client requires a
-// provider from their current session or pane.
-export function matchesAgentTriageFilters(ctx, agent, includeProject = true) {
-  const session = agentSession(ctx, agent);
-  const pane = agentPane(ctx, agent);
-  const project = session?.project || pane?.meta?.project || pane?.cwd || agent?.project || '';
   const provider = session?.kind || pane?.meta?.agent || '';
-  return (!includeProject || !ctx.state.filter || (Boolean(project) && ctx.projectOf(project).key === ctx.state.filter))
-    && (!ctx.state.providerFilter || provider === ctx.state.providerFilter)
+  return (!ctx.state.providerFilter || provider === ctx.state.providerFilter)
     && (!ctx.state.nodeFilter || nodeName(ctx, { session, pane }) === ctx.state.nodeFilter);
 }
 
@@ -538,14 +534,14 @@ export function renderRail(ctx, items) {
     const key = ctx.projectOf(item.project).key;
     counts.set(key, (counts.get(key) || 0) + 1);
   }
-  const agentProjects = new Set((ctx.data.agents || [])
-    .filter((agent) => matchesAgentTriageFilters(ctx, agent, false))
-    .map((agent) => agentProject(ctx, agent)).filter(Boolean).map((path) => ctx.projectOf(path).key));
   // Inbox cards are not sessions: a project whose only open work is a card asks
   // nothing of you and nothing is running in it, so it is not in the rail either
-  // — the Inbox section itself is where those cards are read and opened.
+  // — the Inbox section itself is where those cards are read and opened. Nor do
+  // agents earn a project its icon: the reviewer's session sits in the registry's
+  // directory and a responder's in its area's repo, and neither is that project's
+  // work (matchesAgentTriageFilters lists them under All only).
   const projects = ctx.knownProjects().filter((project) => counts.has(project.key)
-    || agentProjects.has(project.key) || project.key === ctx.state.filter);
+    || project.key === ctx.state.filter);
   const collapsed = ctx.state.collapsed.rail;
   const row = (project) => `<button data-project="${ctx.esc(project.key)}" class="${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}">${ctx.projectIcon(project)}<span>${ctx.esc(project.name)}</span><span class="c ${counts.get(project.key) ? 'hot' : ''}">${counts.get(project.key) || ''}</span></button>`;
   const dot = (project) => `<button data-project="${ctx.esc(project.key)}" class="rail-dot ${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}" title="${ctx.esc(project.name)}">${ctx.projectIcon(project)}</button>`;

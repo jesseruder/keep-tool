@@ -2207,7 +2207,11 @@ posted it, so one written after the page in hand can be dated before it. The con
 renders an
 **Agents** group under Running & waiting and above Pinned, and only when that array is
 non-empty. The group is not gated on the Running toggle: collapsing the working sessions
-leaves the fleet listed. One row
+leaves the fleet listed. It is gated on the project filter, the other way round: an
+agent belongs to the fleet, not to the project its session happens to sit in (the
+reviewer's in the registry's directory, a responder's in its area's repo), so a selected
+project lists no agents and no agent earns a project its rail icon or count; a selected
+client or machine still has to match the agent's current session or pane. One row
 per agent: the name, the lifecycle (`idle` / `on <card>` / `needs you` / `stopped`), the
 last event as a one-liner with its relative time, and a badge with the unseen count —
 red when any unseen event asked for Owner, grey when they are only news, absent at zero.

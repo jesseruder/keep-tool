@@ -96,9 +96,14 @@ test('client and project filters combine for session, pane-only, and agent rows'
   ];
   assert.deepEqual(agents.map((agent) => matchesAgentTriageFilters(ctx, agent)), [true, false, false, false]);
   ctx.state.providerFilter = 'codex';
-  ctx.state.filter = '/work/a';
-  assert.deepEqual(agents.map((agent) => matchesAgentTriageFilters(ctx, agent)), [false, false, true, false],
+  ctx.state.filter = null;
+  assert.deepEqual(agents.map((agent) => matchesAgentTriageFilters(ctx, agent)), [false, true, true, false],
     'pane metadata resolves an agent with no session record');
+  // An agent belongs to the fleet, not to the project its session happens to sit in:
+  // a selected project hides every agent, whatever its session's directory.
+  ctx.state.filter = '/work/a';
+  assert.deepEqual(agents.map((agent) => matchesAgentTriageFilters(ctx, agent)), [false, false, false, false],
+    'a project filter lists no agents');
   ctx.state.filter = null;
   ctx.state.providerFilter = null;
   assert.equal(agents.every((agent) => matchesAgentTriageFilters(ctx, agent)), true,
@@ -166,10 +171,13 @@ test('a stale agent record resolves the live stamped session for filtering and s
   });
   ctx.projectOf = (path) => ({ key: path });
   ctx.state.providerFilter = 'codex';
-  ctx.state.filter = '/work/b';
+  ctx.state.filter = null;
   const oldItem = { kind: 'running', sessionId: 'old', pane: 'old-pane', project: '/work/a' };
   assert.equal(agentSession(ctx, agent)?.id, 'new');
-  assert.equal(matchesAgentTriageFilters(ctx, agent), true);
+  assert.equal(matchesAgentTriageFilters(ctx, agent), true, 'the client filter reads the live session');
+  ctx.state.filter = '/work/b';
+  assert.equal(matchesAgentTriageFilters(ctx, agent), false, 'a project filter lists no agent, even the one its session sits in');
+  ctx.state.filter = null;
   assert.equal(agentLivePane(ctx, agent), 'new-pane');
   assert.equal(agentForStage(ctx, oldItem)?.name, 'sandboxes');
   assert.equal(agentForStage(ctx, { kind: 'running', sessionId: 'new', pane: 'new-pane' })?.name, 'sandboxes');
@@ -273,14 +281,12 @@ test('the rail lists the projects waiting on you or running, not every project w
     assert.deepEqual(listed(), ['', '/work/a', '/work/b'],
       'an inbox card is not a session: its project stays out of the rail');
 
-    // An agent is working in its project whether or not the queue has a row for
-    // it, so it keeps its icon — listed without a count, like before.
+    // An agent belongs to the fleet, not to the project its session sits in: it
+    // earns that project neither an icon nor a count.
     ctx.data.agents = [{ name: 'sandboxes', session: { id: 'agent-one' } }];
     ctx.data.sessions = [{ id: 'agent-one', agentName: 'sandboxes', project: '/work/c', state: 'running' }];
     renderRail(ctx, rows);
-    assert.deepEqual(listed(), ['', '/work/a', '/work/b', '/work/c']);
-    assert.match(rail.innerHTML, /data-project="\/work\/c"[^>]*>.*?<span class="c "><\/span>/,
-      'an agent-only project is listed without a count');
+    assert.deepEqual(listed(), ['', '/work/a', '/work/b'], 'an agent-only project stays out of the rail');
   } finally {
     globalThis.document = previousDocument;
   }
@@ -338,8 +344,8 @@ test('rail client controls remain separate from project controls when expanded o
       pane: 'agent-pane', project: '/work/b', state: 'running' }];
     ctx.data.panes = [{ id: 'agent-pane', alive: true, meta: { agent: 'codex', project: '/work/b' } }];
     renderRail(ctx, []);
-    assert.match(rail.innerHTML, /data-project="\/work\/b"[^>]*>.*?<span class="c "><\/span>/,
-      'an agent-only project stays selectable without pretending it has a counted queue session');
+    assert.doesNotMatch(rail.innerHTML, /data-project="\/work\/b"/,
+      'an agent earns no project its icon: the reviewer sits in the registry directory and a responder in its repo, and neither is that project\'s work');
   } finally {
     globalThis.document = previousDocument;
   }
