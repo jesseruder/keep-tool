@@ -535,9 +535,11 @@ function batch(deps = {}) {
     // Said out loud rather than passed over, so a person who asked for every
     // rate-limited session on an account is told which ones the queue cannot move.
     // The pane and node let the console move them itself with an Owner-forced
-    // transfer, the only kind a session on another node accepts.
+    // transfer, the only kind a session on another node accepts; the limit it saw
+    // lets that transfer refuse a session that has since resumed.
     if (nodes.isRemotePane(session)) {
-      skipped.push({ sessionId: session.id, pane: session.pane, node: session.node, reason: `session runs on ${session.node}` });
+      skipped.push({ sessionId: session.id, pane: session.pane, node: session.node,
+        rateLimitAt: session.rateLimit?.at ?? null, reason: `session runs on ${session.node}` });
       continue;
     }
     const current = readOne(root, session.id);

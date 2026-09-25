@@ -275,37 +275,46 @@ test('the batch moves sessions on another node itself, forced, and says what hap
   const toasts = [];
   const ctx = limited();
   ctx.toast = (message) => toasts.push(message);
-  const answers = {
-    '/api/handoff-rate-limited': { ok: true, queued: [{ sessionId: 's', pane: 'p' }], skipped: [
-      { sessionId: 'far1', pane: 'p5@aws1', node: 'aws1', reason: 'session runs on aws1' },
-      { sessionId: 'far2', pane: 'p6@aws1', node: 'aws1', reason: 'session runs on aws1' },
-      { sessionId: 'far3', pane: 'p7@aws1', node: 'aws1', reason: 'session runs on aws1' },
-      { sessionId: 's2', reason: 'already queued' },
-    ] },
-  };
-  const results = [{ status: 'done' }, { status: 'failed', reason: 'target is not logged in' }];
+  const far = (id, node) => ({ sessionId: id, pane: `${id}-pane@${node}`, node, rateLimitAt: `at-${id}`, reason: `session runs on ${node}` });
+  const batch = { ok: true, queued: [{ sessionId: 's', pane: 'p' }], skipped: [
+    far('far1', 'aws1'), far('far2', 'aws1'), far('far3', 'aws1'), far('far4', 'aws2'), far('far5', 'aws2'),
+    { sessionId: 's2', reason: 'already queued' },
+  ] };
+  const results = [
+    { status: 'done' },
+    { status: 'failed', reason: 'target is not logged in' },
+    Object.assign(new Error('Moving session timed out after 180 s'), { timeout: true, body: null }),
+    Object.assign(new Error('409'), { body: { status: 'recovery-needed', reason: 'source stopped, target did not start' } }),
+    Object.assign(new Error('409'), { body: { error: 'Session no longer carries the account limit this transfer was requested for' } }),
+  ];
   const original = context.write;
-  context.write = async (url, body) => {
-    writes.push({ url, body });
-    if (answers[url]) return answers[url];
+  context.write = async (url, body, method, options) => {
+    writes.push({ url, body, options });
+    if (url === '/api/handoff-rate-limited') return batch;
     const next = results.shift();
-    if (!next) throw Object.assign(new Error('host request timed out'), { body: {} });
+    if (next instanceof Error) throw next;
     return next;
   };
   const labels = [];
   const bulk = { disabled: false, dataset: { bulkHandoff: 'claude-two', bulkSource: 'claude-main' },
-    querySelector: () => ({ set textContent(value) { labels.push(value); } }) };
+    querySelector: (selector) => (selector === 'span:last-child' ? { set textContent(value) { labels.push(value); } } : null) };
   try {
     context.installHandoffControls(fakeContainer({ '[data-bulk-handoff]': [bulk] }), ctx, 's', 'p');
     await bulk.onclick();
   } finally { context.write = original; }
 
-  assert.deepEqual(writes.map((row) => row.url), ['/api/handoff-rate-limited', '/api/handoff-session', '/api/handoff-session', '/api/handoff-session']);
-  assert.equal(JSON.stringify(writes[1].body), JSON.stringify({ sessionId: 'far1', pane: 'p5@aws1', accountId: 'claude-two', queueOnTransient: true, ownerForce: true }));
-  assert.deepEqual(labels, ['Moving 1 of 3…', 'Moving 2 of 3…', 'Moving 3 of 3…']);
+  assert.deepEqual(writes.map((row) => row.url), ['/api/handoff-rate-limited', ...Array(5).fill('/api/handoff-session')]);
+  // The limit and account the batch saw travel with the forced transfer, so one that
+  // has resumed or moved since is refused rather than stopped mid-turn.
+  assert.equal(JSON.stringify(writes[1].body), JSON.stringify({ sessionId: 'far1', pane: 'far1-pane@aws1', accountId: 'claude-two',
+    ownerForce: true, expectedSourceAccountId: 'claude-main', expectedRateLimitAt: 'at-far1' }));
+  assert.equal(writes[1].options.background, true, 'the closing toast reports each one, not a sticky banner');
+  assert.ok(writes[1].options.timeoutMs > 20000, 'a transfer is given longer than an ordinary write');
+  assert.deepEqual(labels, [1, 2, 3, 4, 5].map((n) => `Moving ${n} of 5…`));
   assert.deepEqual(toasts, [
-    'Moving 3 sessions on aws1 to Claude Two…',
-    'Moved 1 to Claude Two; queued 1 transfer to Claude Two; 2 failed (target is not logged in; host request timed out); 1 skipped (already queued).',
+    'Moving 5 sessions on aws1, aws2 to Claude Two…',
+    'Claude Two: moved 1; queued 1; 1 still running; 1 needs recovery (source stopped, target did not start); '
+      + '2 failed (target is not logged in; Session no longer carries the account limit this transfer was requested for); 1 skipped (already queued).',
   ]);
 
   // Every one skipped for a reason no click can fix: say which, not just how many.
@@ -318,6 +327,35 @@ test('the batch moves sessions on another node itself, forced, and says what hap
     await again.onclick();
   } finally { context.writeResult = null; }
   assert.deepEqual(toasts, ['Nothing moved: 1 skipped (already queued).']);
+});
+
+test('a second press while a batch is moving sessions does not start another', async () => {
+  writes.length = 0;
+  const toasts = [];
+  const ctx = limited();
+  ctx.toast = (message) => toasts.push(message);
+  let release;
+  const original = context.write;
+  context.write = async (url, body) => {
+    writes.push({ url, body });
+    if (url === '/api/handoff-rate-limited') return { ok: true, queued: [], skipped: [{ sessionId: 'far', pane: 'x@aws1', node: 'aws1', rateLimitAt: 't', reason: 'session runs on aws1' }] };
+    await new Promise((resolve) => { release = resolve; });
+    return { status: 'done' };
+  };
+  try {
+    const first = { disabled: false, dataset: { bulkHandoff: 'claude-two', bulkSource: 'claude-main' } };
+    const rerendered = { disabled: false, dataset: { bulkHandoff: 'claude-two', bulkSource: 'claude-main' } };
+    context.installHandoffControls(fakeContainer({ '[data-bulk-handoff]': [first] }), ctx, 's', 'p');
+    context.installHandoffControls(fakeContainer({ '[data-bulk-handoff]': [rerendered] }), ctx, 's', 'p');
+    const running = first.onclick();
+    while (!release) await new Promise((resolve) => setImmediate(resolve));
+    await rerendered.onclick();
+    assert.equal(writes.length, 2, 'the second press sent nothing');
+    assert.match(toasts.at(-1), /Already moving/);
+    release();
+    await running;
+  } finally { context.write = original; }
+  assert.equal(toasts.at(-1), 'Claude Two: moved 1.');
 });
 
 test('a parked transfer whose session has moved on keeps the ordinary controls beside it', () => {

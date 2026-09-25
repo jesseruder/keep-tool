@@ -178,6 +178,12 @@ function confirmedAccount(ctx, sessionId, paneId) {
   return session?.accountId || pane?.meta?.accountId;
 }
 
+// One forced transfer on a node: an auth preflight alone can take 45 seconds, so the
+// ordinary 20-second write deadline would call a move that is still landing a failure.
+const BULK_MOVE_TIMEOUT_MS = 180000;
+// The button can be re-rendered, enabled, mid-batch; a second press waits for the first.
+let bulkMoving = false;
+
 function once(button, run, ctx) {
   button.onclick = () => runAction(button, run, {
     label: 'Working…', ctx, retry: () => button.click(),
@@ -190,40 +196,65 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
       const targetAccountId = button.dataset.bulkHandoff;
       const sourceAccountId = button.dataset.bulkSource;
       const target = labelForAccountId(ctx, targetAccountId);
+      if (bulkMoving) { ctx.toast('Already moving rate-limited sessions; wait for that to finish.'); return; }
+      bulkMoving = true;
       try {
         const result = await write('/api/handoff-rate-limited', { sourceAccountId, targetAccountId }, 'POST',
           { label: 'Queueing transfers', retry: () => button.click() });
         // The queue never force-stops a session, and a session on another node moves
         // only when forced, so the batch hands those back with their pane. This click
-        // is Owner's own, so each moves now as its own Continue button would move it.
+        // is Owner's own, so each moves now as its own Continue button would move it,
+        // except that he saw a count rather than the session: each transfer names the
+        // limit and account the batch saw, and refuses a session that has since resumed
+        // or moved rather than force-stopping it mid-turn.
         const remote = (result.skipped || []).filter((row) => row.node && row.pane);
         const skipped = (result.skipped || []).filter((row) => !remote.includes(row));
-        let queued = result.queued?.length || 0;
+        const queued = result.queued?.length || 0;
         let moved = 0;
         const failed = [];
-        if (remote.length) ctx.toast(`Moving ${remote.length} session${remote.length === 1 ? '' : 's'} on ${remote[0].node} to ${target}…`);
+        const recovery = [];
+        const running = [];
+        if (remote.length) {
+          const where = [...new Set(remote.map((row) => row.node))].join(', ');
+          ctx.toast(`Moving ${remote.length} session${remote.length === 1 ? '' : 's'} on ${where} to ${target}…`);
+        }
         for (const [index, row] of remote.entries()) {
+          // A finished move re-renders the controls, which can replace this button;
+          // the progress then lands on a detached copy, and the toasts still report.
           const progress = button.querySelector?.('span:last-child');
           if (progress) progress.textContent = `Moving ${index + 1} of ${remote.length}…`;
           try {
+            // Background: the closing toast reports each one, so a single failure
+            // does not leave an unnamed sticky banner that the next success clears.
             const moveResult = await write('/api/handoff-session', { sessionId: row.sessionId, pane: row.pane, accountId: targetAccountId,
-              queueOnTransient: true, ownerForce: true }, 'POST', { label: 'Moving session' });
-            if (moveResult.status === 'queued') queued += 1;
-            else if (['failed', 'recovery-needed'].includes(moveResult.status)) failed.push(moveResult.reason || moveResult.status);
+              ownerForce: true, expectedSourceAccountId: sourceAccountId,
+              ...(row.rateLimitAt != null ? { expectedRateLimitAt: row.rateLimitAt } : {}) }, 'POST',
+            { label: 'Moving session', timeoutMs: BULK_MOVE_TIMEOUT_MS, background: true });
+            if (moveResult.status === 'recovery-needed') recovery.push(moveResult.reason || 'retry when the session is safe');
+            else if (moveResult.status === 'failed') failed.push(moveResult.reason || 'transfer failed');
             else moved += 1;
-          } catch (error) { failed.push(error.body?.reason || error.message); }
+          } catch (error) {
+            // Still running on the daemon: the next session waits for nothing, but the
+            // person is told this one may yet land rather than that it failed.
+            if (error.timeout) running.push(row.sessionId);
+            else if (error.body?.status === 'recovery-needed') recovery.push(error.body.reason || error.message);
+            else failed.push(error.body?.reason || error.body?.error || error.message);
+          }
         }
         const reasons = (rows) => [...new Set(rows)].join('; ');
         const parts = [
-          moved ? `moved ${moved} to ${target}` : '',
-          queued ? `queued ${queued} transfer${queued === 1 ? '' : 's'} to ${target}` : '',
+          moved ? `moved ${moved}` : '',
+          queued ? `queued ${queued}` : '',
+          running.length ? `${running.length} still running` : '',
+          recovery.length ? `${recovery.length} need${recovery.length === 1 ? 's' : ''} recovery (${reasons(recovery)})` : '',
           failed.length ? `${failed.length} failed (${reasons(failed)})` : '',
           skipped.length ? `${skipped.length} skipped (${reasons(skipped.map((row) => row.reason))})` : '',
         ].filter(Boolean);
         const summary = parts.join('; ');
-        ctx.toast(moved || queued ? `${summary[0].toUpperCase()}${summary.slice(1)}.` : `Nothing moved${summary ? `: ${summary}` : ''}.`);
+        ctx.toast(moved || queued || running.length
+          ? `${target}: ${summary}.` : `Nothing moved${summary ? `: ${summary}` : ''}.`);
         await ctx.reload();
-      } catch (error) { ctx.toast(`Not queued: ${error.message}`); }
+      } catch (error) { ctx.toast(`Not queued: ${error.message}`); } finally { bulkMoving = false; }
     }, ctx);
   });
   container.querySelectorAll('[data-queue-retry]').forEach((button) => {

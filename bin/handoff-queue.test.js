@@ -362,7 +362,8 @@ test('a rate-limited session on another node is never queued for a transfer', as
   const result = queue.batch({ root: f.root, env: f.env, now: T, log: () => {}, sessions,
     sourceAccountId: 'one', targetAccountId: 'two' });
   assert.deepEqual(result.queued.map((row) => row.sessionId), ['session-here']);
-  assert.deepEqual(result.skipped, [{ sessionId: 'session-far', pane: 'pane-1@aws1', node: 'aws1', reason: 'session runs on aws1' }]);
+  assert.deepEqual(result.skipped, [{ sessionId: 'session-far', pane: 'pane-1@aws1', node: 'aws1',
+    rateLimitAt: T, reason: 'session runs on aws1' }]);
   assert.equal(queue.readOne(f.root, 'session-far'), null, 'still never queued');
 });
 
