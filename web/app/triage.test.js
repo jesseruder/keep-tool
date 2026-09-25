@@ -209,7 +209,7 @@ function railStub() {
     set innerHTML(value) { this._html = value; this._buttons = {}; },
     querySelector() { return { addEventListener() {} }; },
     querySelectorAll(selector) {
-      const field = selector === '[data-client]' ? 'client' : 'project';
+      const field = ({ '[data-client]': 'client', '[data-node]': 'node' })[selector] || 'project';
       return this._buttons[field] ||= [...this.innerHTML.matchAll(new RegExp(`<button[^>]*data-${field}="([^"]*)"[^>]*>`, 'g'))]
         .map((match) => ({ dataset: { [field]: match[1] }, addEventListener(_type, handler) { this.click = handler; } }));
     },
@@ -345,6 +345,55 @@ test('rail client controls remain separate from project controls when expanded o
   }
 });
 
+test('machine filter matches by node, lists machines under Client, and hides on a single node', async () => {
+  const { renderRail, matchesTriageFilters, matchesAgentTriageFilters } = await import('./triage.js');
+  const previousDocument = globalThis.document;
+  const rail = railStub();
+  globalThis.document = { querySelector: (selector) => selector === '#rail' ? rail : null };
+  try {
+    const ctx = railCtx();
+    ctx.data.sessions = [
+      { id: 'here', kind: 'claude', project: '/work/a', pane: 'p1' },
+      { id: 'there', kind: 'claude', project: '/work/a', pane: 'p2@aws1', node: 'aws1' },
+    ];
+    ctx.data.panes = [{ id: 'p1', node: 'main' }, { id: 'p2@aws1', node: 'aws1' }, { id: 'p3@aws1', node: 'aws1' }];
+    const rows = [
+      { kind: 'question', sessionId: 'here', project: '/work/a' },
+      { kind: 'question', sessionId: 'there', project: '/work/a' },
+      { kind: 'running', pane: 'p3@aws1', project: '/work/a' },
+    ];
+    const visible = () => rows.filter((row) => matchesTriageFilters(ctx, row)).map((row) => row.sessionId || row.pane);
+
+    renderRail(ctx, rows);
+    assert.doesNotMatch(rail.innerHTML, /data-node=/, 'a single-node install offers no machine choice');
+
+    ctx.data.nodes = [{ name: 'aws1', daemon: false }, { name: 'main', daemon: true }];
+    renderRail(ctx, rows);
+    assert.deepEqual([...rail.innerHTML.matchAll(/data-node="([^"]*)"/g)].map((match) => match[1]), ['', 'main', 'aws1'],
+      'All, then the daemon node, then the rest');
+    assert.ok(rail.innerHTML.indexOf('aria-label="Machine"') > rail.innerHTML.indexOf('aria-label="Client"'));
+    assert.ok(rail.innerHTML.indexOf('aria-label="Machine"') < rail.innerHTML.indexOf('data-shell'));
+
+    assert.deepEqual(visible(), ['here', 'there', 'p3@aws1']);
+    rail.querySelectorAll('[data-node]')[1].click();
+    assert.equal(ctx.state.nodeFilter, 'main');
+    assert.deepEqual(visible(), ['here'], 'a session with no node runs on the daemon node');
+    ctx.state.nodeFilter = 'aws1';
+    assert.deepEqual(visible(), ['there', 'p3@aws1'], 'a pane-only row reads its node off the pane id');
+    assert.equal(matchesAgentTriageFilters(ctx, { session: { id: 'there', pane: 'p2@aws1' } }), true);
+    assert.equal(matchesAgentTriageFilters(ctx, { session: { id: 'here', pane: 'p1' } }), false);
+
+    ctx.data.nodes = [{ name: 'main', daemon: true }];
+    ctx.state.collapsed.rail = true;
+    renderRail(ctx, rows);
+    assert.match(rail.innerHTML, /data-node="aws1" class="rail-dot on"/, 'a chosen machine that left keeps its button');
+    rail.querySelectorAll('[data-node]')[0].click();
+    assert.equal(ctx.state.nodeFilter, null);
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
 test('empty queue copy names active filters without claiming the global queue is clear', async () => {
   const { emptyQueueHTML } = await import('./triage.js');
   assert.match(emptyQueueHTML({ filter: null, providerFilter: null }), /Nothing waiting on you/);
@@ -352,6 +401,7 @@ test('empty queue copy names active filters without claiming the global queue is
     { filter: '/work/a', providerFilter: null },
     { filter: null, providerFilter: 'codex' },
     { filter: '/work/a', providerFilter: 'codex' },
+    { filter: null, providerFilter: null, nodeFilter: 'aws1' },
   ]) {
     const html = emptyQueueHTML(state);
     assert.match(html, /No sessions shown for these filters/);

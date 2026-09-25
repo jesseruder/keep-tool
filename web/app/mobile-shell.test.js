@@ -94,6 +94,7 @@ test('mobile filter label includes Pi alone and with a project', async () => {
   assert.equal(mobileFilterLabel(null, 'codex'), 'Codex');
   assert.equal(mobileFilterLabel(null, 'pi'), 'Pi');
   assert.equal(mobileFilterLabel({ name: 'Keep' }, 'pi'), 'Keep · Pi');
+  assert.equal(mobileFilterLabel({ name: 'Keep' }, 'pi', 'aws1'), 'Keep · Pi · aws1');
 });
 
 test('the app owns permissions, notifications and sounds', async () => {

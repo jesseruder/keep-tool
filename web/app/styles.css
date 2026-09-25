@@ -123,6 +123,8 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .rail-clients .rh { padding-bottom: 4px; }
 .rail-clients .provider-icon { width: 16px; height: 16px; margin: 0; vertical-align: 0; }
 .rail-client-all { width: 16px; text-align: center; font: 16px/1 var(--sans); color: var(--muted); }
+.rail-nodes { margin-top: 0; }
+.rail-node-mark { width: 16px; text-align: center; font: 600 10px/1 var(--mono); color: var(--muted); text-transform: uppercase; }
 .rail.collapsed .rail-clients { padding-top: 7px; }
 .rail.collapsed .rail-clients button { margin-left: 0; }
 .rail button.rail-shell { grid-template-columns: 16px 1fr; }

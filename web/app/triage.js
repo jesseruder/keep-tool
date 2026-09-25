@@ -63,9 +63,34 @@ export function itemProvider(ctx, item) {
   return ['claude', 'codex', 'pi'].includes(kind) ? kind : '';
 }
 
+// The machines a fleet of two or more nodes publishes (serve.js consoleNodes), the
+// daemon's own first. A single-node install publishes one or none, and the rail
+// offers no machine choice at all.
+export function fleetNodes(ctx) {
+  const nodes = Array.isArray(ctx.data?.nodes)
+    ? ctx.data.nodes.filter((node) => node && typeof node.name === 'string' && node.name) : [];
+  return [...nodes.filter((node) => node.daemon), ...nodes.filter((node) => !node.daemon)];
+}
+
+// Which machine a session runs on, by name. remoteNode() answers '' for the
+// daemon's own, so that is the daemon node's name here.
+export function nodeName(ctx, source) {
+  return remoteNode(source) || fleetNodes(ctx).find((node) => node.daemon)?.name || '';
+}
+
+export function sessionNode(ctx, session) {
+  return nodeName(ctx, { session, pane: ctx.paneMap().get(session?.pane || session?.runtime?.paneId) });
+}
+
+export function itemNode(ctx, item) {
+  const session = ctx.sessionFor(item);
+  return nodeName(ctx, { item, session, pane: ctx.paneMap().get(item?.pane || session?.pane) });
+}
+
 export function matchesTriageFilters(ctx, item) {
   return (!ctx.state.filter || ctx.projectOf(item.project).key === ctx.state.filter)
-    && (!ctx.state.providerFilter || itemProvider(ctx, item) === ctx.state.providerFilter);
+    && (!ctx.state.providerFilter || itemProvider(ctx, item) === ctx.state.providerFilter)
+    && (!ctx.state.nodeFilter || itemNode(ctx, item) === ctx.state.nodeFilter);
 }
 
 // /api/state stamps the sessions an agent currently owns. Its record can still
@@ -114,7 +139,8 @@ export function matchesAgentTriageFilters(ctx, agent, includeProject = true) {
   const project = session?.project || pane?.meta?.project || pane?.cwd || agent?.project || '';
   const provider = session?.kind || pane?.meta?.agent || '';
   return (!includeProject || !ctx.state.filter || (Boolean(project) && ctx.projectOf(project).key === ctx.state.filter))
-    && (!ctx.state.providerFilter || provider === ctx.state.providerFilter);
+    && (!ctx.state.providerFilter || provider === ctx.state.providerFilter)
+    && (!ctx.state.nodeFilter || nodeName(ctx, { session, pane }) === ctx.state.nodeFilter);
 }
 
 export function agentLifecycleLabel(agent) {
@@ -505,11 +531,25 @@ export function renderRail(ctx, items) {
     ? `<button data-client="${kind}" class="rail-dot ${ctx.state.providerFilter === (kind || null) ? 'on' : ''}" title="${label}" aria-label="${label}" aria-pressed="${ctx.state.providerFilter === (kind || null)}">${kind ? providerIconHTML(kind, ctx.esc) : '<span class="rail-client-all">◎</span>'}</button>`
     : `<button data-client="${kind}" class="${ctx.state.providerFilter === (kind || null) ? 'on' : ''}" aria-label="${label}" aria-pressed="${ctx.state.providerFilter === (kind || null)}">${kind ? providerIconHTML(kind, ctx.esc) : '<span class="rail-client-all">◎</span>'}<span>${label}</span></button>`;
   const clients = `<div class="rail-clients" role="group" aria-label="Client">${collapsed ? '' : '<div class="rh">Client</div>'}${clientChoice('', 'All')}${clientChoice('claude', 'Claude Code')}${clientChoice('codex', 'Codex')}${clientChoice('pi', 'Pi')}</div>`;
+  // Machine sits under Client, on a fleet of two or more nodes. A chosen machine
+  // that has left the fleet keeps its button, so the filter can still be cleared.
+  const nodeNames = fleetNodes(ctx).map((node) => node.name);
+  if (ctx.state.nodeFilter && !nodeNames.includes(ctx.state.nodeFilter)) nodeNames.push(ctx.state.nodeFilter);
+  const nodeChoice = (name, label) => {
+    const on = ctx.state.nodeFilter === (name || null);
+    const mark = name ? `<span class="rail-node-mark">${ctx.esc(name.slice(0, 2))}</span>` : '<span class="rail-client-all">◎</span>';
+    return collapsed
+      ? `<button data-node="${ctx.esc(name)}" class="rail-dot ${on ? 'on' : ''}" title="${ctx.esc(label)}" aria-label="${ctx.esc(label)}" aria-pressed="${on}">${mark}</button>`
+      : `<button data-node="${ctx.esc(name)}" class="${on ? 'on' : ''}" aria-label="${ctx.esc(label)}" aria-pressed="${on}">${mark}<span>${ctx.esc(label)}</span></button>`;
+  };
+  const machines = nodeNames.length > 1 || ctx.state.nodeFilter
+    ? `<div class="rail-clients rail-nodes" role="group" aria-label="Machine">${collapsed ? '' : '<div class="rh">Machine</div>'}${nodeChoice('', 'All')}${nodeNames.map((name) => nodeChoice(name, name)).join('')}</div>`
+    : '';
   rail.classList.toggle('collapsed', collapsed);
   rail.innerHTML = collapsed
-    ? `<div class="rh"><button class="collapse" aria-expanded="false" title="Expand (⌘B)">›</button></div><button data-project="" class="rail-dot all ${ctx.state.filter ? '' : 'on'}" title="All projects">${ctx.projectIcon({ key: 'all' })}</button>${projects.map(dot).join('')}${clients}${shellButton}`
+    ? `<div class="rh"><button class="collapse" aria-expanded="false" title="Expand (⌘B)">›</button></div><button data-project="" class="rail-dot all ${ctx.state.filter ? '' : 'on'}" title="All projects">${ctx.projectIcon({ key: 'all' })}</button>${projects.map(dot).join('')}${clients}${machines}${shellButton}`
     : `<div class="rh"><span>Projects</span><button class="collapse" aria-expanded="true" title="Collapse (⌘B)">‹</button></div><button data-project="" class="all ${ctx.state.filter ? '' : 'on'}">${ctx.projectIcon({ key: 'all' })}<span>All</span><span class="c hot">${counted.length}</span></button>`
-      + (ctx.data.scopes || globalThis.KeepScopeRules.defaults).names.map((scope) => `<div class="scope">${ctx.esc(scope)}</div>${projects.filter((p) => p.scope === scope).map(row).join('')}`).join('') + clients + shellButton;
+      + (ctx.data.scopes || globalThis.KeepScopeRules.defaults).names.map((scope) => `<div class="scope">${ctx.esc(scope)}</div>${projects.filter((p) => p.scope === scope).map(row).join('')}`).join('') + clients + machines + shellButton;
   rail.querySelector('.collapse').addEventListener('click', () => ctx.toggleCollapsed('rail'));
   rail.querySelectorAll('[data-project]').forEach((button) => button.addEventListener('click', () => {
     ctx.state.filter = button.dataset.project || null;
@@ -519,6 +559,12 @@ export function renderRail(ctx, items) {
   }));
   rail.querySelectorAll('[data-client]').forEach((button) => button.addEventListener('click', () => {
     ctx.state.providerFilter = button.dataset.client || null;
+    ctx.setSelected(0);
+    ctx.state.ensureSelectedVisible = true;
+    ctx.refresh();
+  }));
+  rail.querySelectorAll('[data-node]').forEach((button) => button.addEventListener('click', () => {
+    ctx.state.nodeFilter = button.dataset.node || null;
     ctx.setSelected(0);
     ctx.state.ensureSelectedVisible = true;
     ctx.refresh();
@@ -540,6 +586,7 @@ export function renderRail(ctx, items) {
         try { sessionStorage.setItem('keep-running-expanded', '1'); } catch {}
         ctx.state.filter = null;
         ctx.state.providerFilter = null;
+        ctx.state.nodeFilter = null;
         // openReviewPane keeps the pane selected until its own running row exists.
         if (ctx.paneMap().get(pane.id)?.alive) ctx.openReviewPane(pane.id);
         ctx.state.ensureSelectedVisible = true;
@@ -877,7 +924,7 @@ export function emptyStateCounts(ctx, running, pinned) {
 }
 
 export function emptyQueueHTML(state) {
-  return state.filter || state.providerFilter
+  return state.filter || state.providerFilter || state.nodeFilter
     ? '<div class="qempty"><b>No sessions shown for these filters</b>Change a filter or expand Running, Pinned, or Recent.</div>'
     : '<div class="qempty"><b>Nothing waiting on you</b>Expand Running, Pinned, or Recent to browse sessions, or open Watch for live panes.</div>';
 }
@@ -1152,7 +1199,8 @@ export function renderTriage(ctx) {
   // them: the rail has to list the projects it lets you filter to. Pinned and
   // Recent are left out on purpose — see renderRail().
   renderRail(ctx, [...items, ...ctx.runningItems()]
-    .filter((item) => !ctx.state.providerFilter || itemProvider(ctx, item) === ctx.state.providerFilter));
+    .filter((item) => (!ctx.state.providerFilter || itemProvider(ctx, item) === ctx.state.providerFilter)
+      && (!ctx.state.nodeFilter || itemNode(ctx, item) === ctx.state.nodeFilter)));
   const queue = renderQueue(ctx, waiting, running, pinned, recent, dismissed);
   renderStage(ctx, queue, focusItem, running, pinned);
 }
