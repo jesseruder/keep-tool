@@ -1483,7 +1483,24 @@ scheduler to that suite are in
 carries its files to the other node, and resumes it there: the same conversation, on the
 same account, with the same model and permission class. It is the fleet's way to drain a
 machine (the laptop to `aws1` and back); `keep handoff` still moves a session between
-accounts on one machine, and `keep transfer` is still the fresh portable continuation.
+accounts on the machine it runs on, and `keep transfer` is still the fresh portable
+continuation.
+
+**An account transfer on a node.** `keep handoff --force` (and the console's transfer)
+works for a session whose pane is on another node, and the session stays there: the
+target account's login, the setup comparison, the folder trust and the Codex resume
+policy are all asked of that node's own copies of the accounts, the forced stop is
+captured, signalled and proven from the node's process table, and the conversation's
+files are walked between the two account directories on the node through the same
+`artifacts` verb a move uses, with both ends on that node. The transfer ops are that
+verb's version 3 (`auth`, `shared-setup`, `compatible`, `resume-spec`, `project-trust`,
+answered by `bin/account-handoff-node.js`, plus a list's `owned` flag); an older host is
+refused by name. An unforced transfer of a node session (the rate-limit queue) is
+refused, for the same reason a move off a node is forced: the graceful stop's
+background-work proof reads the transcript on the daemon. A node that does not answer
+refuses as a transient host timeout, and a transfer it interrupted stays
+`recovery-needed` until **Retry** finds it answering. See "A session on another node" in
+`docs/accounts.md`.
 
 What moves is the session's own files under its account's config directory. For Claude:
 the transcript `projects/<slug>/<sid>.jsonl`, its session tree `projects/<slug>/<sid>/`,
