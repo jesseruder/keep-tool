@@ -59,9 +59,6 @@ function read(options = {}) {
 
 function write(registry, options = {}) {
   const root = options.root;
-  // The file a bare test run once replaced: refuse it here too, for a caller that
-  // never booted through config.apply.
-  require('./config').refuseLiveRegistryUnderTest({ ...process.env, KEEP_DIR: root });
   const dir = directory(root);
   const file = registryFile(root);
   const tmp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
@@ -78,6 +75,9 @@ function sleepSync(ms) {
 // knows and leaves allocation to the next scan rather than racing.
 function withLock(options, run) {
   const root = options.root;
+  // The registry a bare test run once replaced: refuse it before touching even its lock,
+  // for a caller that never booted through config.apply.
+  require('./config').refuseLiveRegistryUnderTest({ ...process.env, KEEP_DIR: root });
   const file = lockFile(root);
   const retries = Number.isInteger(options.lockRetries) ? options.lockRetries : LOCK_RETRIES;
   const waitMs = Number.isInteger(options.lockWaitMs) ? options.lockWaitMs : LOCK_WAIT_MS;

@@ -59,19 +59,14 @@ const hashHue = (value) => {
   return Math.abs(hash) % 360;
 };
 
-// A main checkout named `repo` among the daemon's resolved projects and the directories
-// sessions and panes run in: an absolute path in the worktree's own home, outside ~/wt,
-// whose last segment is `repo`. Two different such checkouts are no answer: guessing
-// between them could open a session in the wrong repository.
+// A main checkout named `repo` that the daemon resolved as a repository's own root, in
+// the worktree's own home. Only the daemon's answer counts: a directory a session merely
+// runs in could be any folder of that name. Two such checkouts are no answer, since
+// guessing between them could open a session in the wrong repository.
 function seenCheckout(repo, home) {
   if (!home) return null;
-  const candidates = [
-    ...Object.values(projectChoices).map((choice) => choice?.path),
-    ...(data.sessions || []).map((session) => session.project),
-    ...(data.panes || []).map((pane) => pane.meta?.project || pane.cwd),
-  ].map((value) => String(value || '').replace(/\/$/, ''))
-    .filter((value) => value.startsWith(home) && !value.startsWith(`${home}wt/`) && value.split('/').pop() === repo);
-  const found = [...new Set(candidates)];
+  const found = [...new Set(Object.values(projectChoices).map((choice) => String(choice?.path || '').replace(/\/$/, ''))
+    .filter((value) => value.startsWith(home) && !value.startsWith(`${home}wt/`) && value.split('/').pop() === repo))];
   return found.length === 1 ? found[0] : null;
 }
 
@@ -652,19 +647,22 @@ async function startShell(cwd, name) {
   spawnedPanes.set(result.pane.id, { pane: result.pane, throughGeneration: reloadGeneration });
   return result.pane;
 }
+// A pane on another node can miss the first listing after the open (that node's list
+// has a short budget while it is busy starting the agent), and a pane the console
+// never lists is never focused. Give it more listings for five seconds at most.
+async function waitForListedPane(paneId) {
+  const deadline = Date.now() + 5000;
+  while (paneId && !paneMap().get(paneId)?.alive && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await Promise.race([reload(), new Promise((resolve) => setTimeout(resolve, Math.max(0, deadline - Date.now())))]);
+  }
+}
 async function startChosenSession(cwd, name, selection, requestId) {
   if (selection.kind === 'shell') return startShell(cwd, name);
   const result = await api.openSession({ fresh: true, cwd, agent: selection.agent, accountId: selection.accountId, requestId,
     ...(selection.model ? { model: selection.model } : {}), ...(selection.node ? { node: selection.node } : {}) });
   await reload();
-  // A pane on another node can miss the first listing after the open (that node's list
-  // has a short budget while it is busy starting the agent), and a pane the console
-  // never lists is never focused. Give it more listings for five seconds at most.
-  const deadline = Date.now() + 5000;
-  while (result.pane && !paneMap().get(result.pane)?.alive && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    await Promise.race([reload(), new Promise((resolve) => setTimeout(resolve, Math.max(0, deadline - Date.now())))]);
-  }
+  await waitForListedPane(result.pane);
   // A fresh Codex on another node with no opening message has no session id until
   // its first turn: started, not failed.
   if (result.pendingRegistration) toast(pendingRegistrationText(selection, result));

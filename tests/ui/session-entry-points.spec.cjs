@@ -70,8 +70,11 @@ test('a session in a worktree offers its main checkout, not the worktree', async
   await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue('/home/tester/castle/proj');
 });
 
-test('a worktree of a repo outside the catalog offers a checkout of it the console has seen', async ({ page }) => {
+test('a worktree of a repo outside the catalog offers a checkout of it the daemon resolved', async ({ page }) => {
   fixture.state.projectCatalog = {};
+  // The daemon resolved the main checkout (a pane runs there) but not the worktree,
+  // which exists only on another node.
+  fixture.state.projectIcons = { '/home/tester/tool': { path: '/home/tester/tool' } };
   for (const session of fixture.state.sessions) session.project = '/home/tester/wt/tool/some-slug';
   for (const pane of fixture.state.panes) pane.meta = { ...pane.meta, project: '/home/tester/tool' };
   fixture.publish();

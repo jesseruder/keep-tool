@@ -257,7 +257,7 @@ function openFlowContext(selection, result) {
     api: { openSession: async (body) => { opens.push(body); return result; }, reopenSession: async () => assert.fail('not a reopen') },
     data: { sessions: [], panes: [], accounts: [] },
     reopeningSessions: new Map(),
-    reload: async () => {}, paneMap: () => new Map(), taskFor: () => null, toast: (message) => toasts.push(message),
+    reload: async () => {}, waitForListedPane: async () => {}, paneMap: () => new Map(), taskFor: () => null, toast: (message) => toasts.push(message),
     openSessionChooser: async (_ctx, options) => { context.chooserOptions = options; await options.onSubmit(selection); return true; },
     defaultModels: () => ({ claude: 'claude-opus-5-5[1m]', codex: '', pi: '' }),
     openPortableTransfer() {}, pinPane() {}, dropPane: async () => {}, startShell: async () => assert.fail('not a shell'),

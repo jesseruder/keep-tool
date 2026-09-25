@@ -250,7 +250,7 @@ async function createFixture() {
           if (req.method === 'PUT') { if (layoutFails) { json({ error: 'Fixture layout failure' }, 500); return; } layouts = input.layouts; }
           json({ layouts }); return;
         }
-        if (url.pathname === '/api/project-icons') { json({ projects: {} }); return; }
+        if (url.pathname === '/api/project-icons') { json({ projects: state.projectIcons || {} }); return; }
         if (url.pathname === '/api/ui-debug') { for (const e of input.events || []) record('ui', e); json({ ok: true }); return; }
         if (url.pathname === '/api/sessionsummary') { json({ text: 'Fake session for interaction testing. Type freely; input is only echoed and recorded.', fresh: true }); return; }
         if (url.pathname === '/api/close-session') {
