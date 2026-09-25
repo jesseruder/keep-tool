@@ -110,8 +110,11 @@ What to do with them:
 6. **Reports nobody's responder owns** — the mobile app, the web editor (castle-www),
    the Cauldron editor and author SDK (castle-experimental-web) — are filed, not
    investigated: `keep add "<symptom>" --file --project <that repo>` with the report
-   quoted and linked, once, after checking `keep list --project <that repo>` for one
-   already open.
+   quoted and linked, once.
+   Before filing any report card, here or in item 2, check whether one exists by the
+   report itself rather than by repo, because the same report gets filed under
+   different repos: `grep -l "<discord thread id or slack ts>" ~/keep/tasks/*.md`, then
+   `keep list` for the symptom. Add to the card you find instead.
 7. **Security reports** — someone describing a way to reach other users' data, run code
    or HTML where it should not run, open off-platform URLs, bypass remix or view-source
    restrictions, escalate an account, or escape a sandbox — are never reproduced,
