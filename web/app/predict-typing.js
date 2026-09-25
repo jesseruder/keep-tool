@@ -2,11 +2,11 @@
 //
 // A pane on another node echoes a keystroke only after a network round trip and the
 // agent's own render, which makes typing feel sticky. This module lets the console
-// draw a typed character into its own xterm at once, dim and underlined, and leaves
-// the agent's redraw to replace it. Both Claude Code and Codex rewrite the whole
-// input line on every keystroke, so nothing has to be reconciled: an echo that
-// never lands simply leaves the dim cell until the next redraw, which is the signal
-// that the prediction was not confirmed. Nothing here changes what is sent.
+// draw a typed character into its own xterm at once, under a dim, underlined
+// overlay, and leaves the agent's redraw to replace it. Each echo is matched to the
+// keystroke it answers, which confirms the guess and times the echo; a guess whose
+// echo never lands keeps its overlay until it expires, which is the signal that it
+// was not confirmed. Nothing here changes what is sent.
 //
 // The module has no imports so the terminal tests can load it as plain source.
 
@@ -33,17 +33,14 @@ const PROMPTS = {
 // A highlighted choice in the agent's selection menu also starts with the marker
 // (`❯ 1. Yes`). Typing there picks an option rather than editing text.
 
-// A guess is written in the agent's own stream without saving the cursor: xterm
-// has one saved-cursor slot, and an agent that saved its cursor before our write
-// would restore to the guess's position instead of its own. Saving would also have
-// been the only way to put the agent's text attributes back, since xterm cannot
-// report the active SGR state; instead the guess cancels the dim and underline it
-// set. SGR 22 is normal intensity, so it also ends a bold the agent left active at
-// the cursor; both agents' renderers reset styles at the end of every styled
-// segment, so in practice nothing of theirs is active there to lose. Clearing to the end of the line
-// removes a dim placeholder before the first character.
-export const PREDICT_CHAR = (ch, clearPlaceholder = false) =>
-  `${clearPlaceholder ? '\x1b[K' : ''}\x1b[2;4m${ch}\x1b[22;24m`;
+// A guess is written in the agent's own stream as plain text: no saved cursor
+// (xterm has one slot, and an agent that saved its cursor would restore to the
+// guess's position) and no attribute changes (xterm cannot report the active SGR,
+// so any change could not be undone exactly, and the agent's attributes persist
+// across its writes). The character takes whatever attributes are active, which
+// the agent's redraw replaces anyway; an overlay marks it as unconfirmed. Clearing
+// to the end of the line removes a dim placeholder before the first character.
+export const PREDICT_CHAR = (ch, clearPlaceholder = false) => `${clearPlaceholder ? '\x1b[K' : ''}${ch}`;
 // Move left, blank that cell with the current attributes, and move left again.
 export const PREDICT_BACKSPACE = '\x1b[1D \x1b[1D';
 
@@ -125,9 +122,8 @@ function median(values) {
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
-// A cell this module drew is dim and underlined at once, which neither agent uses
-// for the text of its input box.
-const predictedCell = (cell) => Boolean(cell && cell.isDim() && cell.isUnderline());
+// The class the console's stylesheet gives the overlay on a guessed cell.
+export const PREDICTED_CELL_CLASS = 'keep-predicted-cell';
 
 // One per mounted terminal. `agent` names the pane's agent (`claude`, `codex`, or
 // anything else for a pane that is not predicted), `remote` says whether the pane
@@ -138,16 +134,48 @@ export function createTypingPredictor({ terminal, agent, remote, mode = getPredi
   // Keystrokes whose echo has not landed, oldest first, each with the input text it
   // should leave before the cursor. That text is what matches an echo to the
   // keystroke it answers, even when the agent renders several keystrokes at once.
-  // Auto records these while prediction is still off: that is how it measures.
+  // Auto records these while prediction is still off: that is how it measures. A
+  // drawn character guess also keeps its column and the overlay that marks it.
   let entries = [];
   let row = -1;
   let inputStart = 0;
   // Columns drawn by predictions still in xterm's write queue.
   let unparsed = 0;
   let generation = 0;
-  // The cursor's line and column when the agent's output last settled. Output that
-  // leaves both as they were (a spinner elsewhere) is not an echo of anything.
+  // The cursor's line (every cell, an erased one told apart from a written space)
+  // and column as of the last settled output or the last guess. Output that leaves
+  // them as they were (a spinner elsewhere) is not an echo of anything, and a
+  // guess's own change to the line is never mistaken for one.
   let lastSettled = '';
+  // Whether the agent's own output addressed the prompt row since the last settle.
+  // An echo that redraws exactly what the guess drew leaves the line as the guess
+  // left it, so the line alone cannot show it; the cursor movements and erasures
+  // the agent's renderer uses to redraw that row can. Our own writes are excluded.
+  let touched = false;
+  let localWrite = false;
+  const touch = (direction) => (params) => {
+    if (localWrite || !entries.length) return false;
+    const buffer = terminal.buffer.active;
+    const cursorRow = buffer.baseY + buffer.cursorY;
+    const first = Number(Array.isArray(params[0]) ? params[0][0] : params[0]) || 1;
+    // A move counts where it lands, not where it leaves: a spinner's jump off the
+    // prompt row does not touch it, and a jump back onto it does.
+    let target = cursorRow;
+    if (direction === 'absolute') target = buffer.baseY + first - 1;
+    else if (direction === 'up') target = cursorRow - first;
+    else if (direction === 'down') target = cursorRow + first;
+    if (direction === 'screen' || target === row) touched = true;
+    // Never handled here: xterm still performs the sequence.
+    return false;
+  };
+  const hooks = [];
+  if (typeof terminal.parser?.registerCsiHandler === 'function') {
+    const finals = { H: 'absolute', f: 'absolute', d: 'absolute', A: 'up', F: 'up', B: 'down', E: 'down',
+      C: 'row', D: 'row', G: 'row', '`': 'row', K: 'row', X: 'row', P: 'row', '@': 'row', J: 'screen' };
+    for (const [final, direction] of Object.entries(finals)) {
+      hooks.push(terminal.parser.registerCsiHandler({ final }, touch(direction)));
+    }
+  }
 
   const echoMs = () => samples.length >= MIN_SAMPLES ? median(samples) : null;
   const enabled = () => {
@@ -162,13 +190,60 @@ export function createTypingPredictor({ terminal, agent, remote, mode = getPredi
     const line = buffer.getLine(row);
     return line ? line.translateToString(false, inputStart, Math.max(inputStart, buffer.cursorX)) : '';
   };
+  const snapshot = () => {
+    const buffer = terminal.buffer.active;
+    const cursorRow = buffer.baseY + buffer.cursorY;
+    const line = buffer.getLine(cursorRow);
+    let cells = '';
+    for (let x = 0; line && x < terminal.cols; x++) cells += line.getCell(x)?.getChars() || '\0';
+    return `${buffer.type}\n${cursorRow}\n${buffer.cursorX}\n${cells}`;
+  };
+
+  // The unconfirmed look is an overlay, never an attribute: the guess is written
+  // plain so the agent's text attributes, which persist across its writes, are
+  // exactly as it left them. The bundled xterm draws decorations; a build without
+  // them (the headless one in tests) simply shows the guess unmarked.
+  const mark = (entry, x) => {
+    entry.x = x;
+    if (typeof terminal.registerDecoration !== 'function' || typeof terminal.registerMarker !== 'function') return;
+    const marker = terminal.registerMarker(0);
+    if (!marker) return;
+    const decoration = terminal.registerDecoration({ marker, x, width: 1, layer: 'top' });
+    if (!decoration) { marker.dispose(); return; }
+    decoration.onRender((element) => element.classList.add(PREDICTED_CELL_CLASS));
+    entry.marker = marker;
+    entry.decoration = decoration;
+  };
+  const unmark = (entry) => {
+    entry.decoration?.dispose();
+    entry.marker?.dispose();
+    entry.decoration = null;
+    entry.marker = null;
+  };
+  const drop = (dropped) => {
+    for (const entry of dropped) unmark(entry);
+  };
+  const clearEntries = () => {
+    drop(entries);
+    entries = [];
+  };
+
   const draw = (bytes, columns, done = () => {}) => {
     const current = generation;
+    // Re-baseline only if nothing of the agent's changed the line since the last
+    // settle; an unsettled change of its own must still count when output settles.
+    let before = null;
+    terminal.write('', () => {
+      before = snapshot();
+      localWrite = true;
+    });
     unparsed += columns;
     terminal.write(bytes, () => {
+      localWrite = false;
       if (current !== generation) return;
       unparsed -= columns;
       done();
+      if (before === lastSettled) lastSettled = snapshot();
     });
   };
 
@@ -177,26 +252,34 @@ export function createTypingPredictor({ terminal, agent, remote, mode = getPredi
   // output that arrives after this keystroke parses after its prediction.
   const keystroke = (data, options = {}) => {
     const at = now();
-    if (entries.length && at - entries[0].at > STALE_KEYSTROKE_MS) entries = [];
+    if (entries.length && at - entries[0].at > STALE_KEYSTROKE_MS) clearEntries();
     const decision = predictKeystroke(terminal, data, { ...options, agent: agent(), extraColumns: unparsed });
     if (!decision) {
       // Enter, arrows, pastes and the like change the line in ways the expected
       // text cannot follow, so the keystrokes before them are no longer matched.
-      entries = [];
+      clearEntries();
       return false;
     }
     const buffer = terminal.buffer.active;
     const cursorRow = buffer.baseY + buffer.cursorY;
-    if (entries.length && (cursorRow !== row || decision.inputStart !== inputStart)) entries = [];
+    if (entries.length && (cursorRow !== row || decision.inputStart !== inputStart)) clearEntries();
     row = cursorRow;
     inputStart = decision.inputStart;
     const before = entries.length ? entries.at(-1).expected : inputBeforeCursor();
     const expected = decision.kind === 'backspace' ? before.slice(0, -1) : before + data;
     const drawn = enabled();
-    const entry = { at, ch: data, kind: decision.kind, before, expected, drawn, parsed: !drawn };
+    const entry = { at, ch: data, kind: decision.kind, before, expected, drawn, parsed: !drawn, x: -1, marker: null, decoration: null };
     entries.push(entry);
-    if (drawn) draw(decision.bytes, decision.kind === 'backspace' ? -1 : 1, () => { entry.parsed = true; });
-    return drawn;
+    if (!drawn) return false;
+    draw(decision.bytes, decision.kind === 'backspace' ? -1 : 1, () => {
+      entry.parsed = true;
+      const x = terminal.buffer.active.cursorX;
+      // A Backspace guess blanks the cell it moved onto; a guessed character there
+      // loses its overlay with it.
+      if (decision.kind === 'backspace') drop(entries.filter((other) => other.decoration && other.x === x));
+      else mark(entry, x - 1);
+    });
+    return true;
   };
 
   // An agent that rewrites its whole input line erases the guesses for keystrokes
@@ -204,24 +287,25 @@ export function createTypingPredictor({ terminal, agent, remote, mode = getPredi
   // vanish and come back. An agent that writes only the cells that changed leaves
   // them in place but puts its cursor back before them; step over them, or the
   // next guess would land on top of one. Only character guesses are redrawn: a
-  // Backspace guess leaves no mark, so there is no telling whether it is still on
-  // screen. A guess still in the write queue would land ahead of the redrawn ones,
-  // so wait for it.
+  // Backspace guess leaves nothing to find, so there is no telling whether it is
+  // still on screen. A guess still in the write queue would land ahead of the
+  // redrawn ones, so wait for it.
   const redrawWaiting = (line, cursorX) => {
     const waiting = entries.filter((entry) => entry.drawn);
     if (!waiting.length || waiting.some((entry) => entry.kind !== 'char' || !entry.parsed)) return;
-    let marked = 0;
-    while (cursorX + marked < terminal.cols && predictedCell(line.getCell(cursorX + marked))) marked++;
-    if (marked) {
-      if (marked === waiting.length) draw(`\x1b[${marked}C`, marked);
+    if (cursorX + waiting.length > terminal.cols - 3) return;
+    if (waiting.every((entry, i) => entry.x === cursorX + i && line.getCell(cursorX + i)?.getChars() === entry.ch)) {
+      draw(`\x1b[${waiting.length}C`, waiting.length);
       return;
     }
-    for (let x = cursorX; x < terminal.cols; x++) if (predictedCell(line.getCell(x))) return;
-    if (cursorX + waiting.length > terminal.cols - 3) return;
+    drop(waiting);
     const first = predictKeystroke(terminal, waiting[0].ch, { agent: agent() });
     if (!first) return;
     const bytes = first.bytes + waiting.slice(1).map((entry) => PREDICT_CHAR(entry.ch)).join('');
-    draw(bytes, waiting.length);
+    draw(bytes, waiting.length, () => {
+      const end = terminal.buffer.active.cursorX;
+      waiting.forEach((entry, i) => mark(entry, end - waiting.length + i));
+    });
   };
 
   // Called after a chunk of the agent's output has parsed; `settled` is false while
@@ -229,25 +313,20 @@ export function createTypingPredictor({ terminal, agent, remote, mode = getPredi
   // chunks leaves the cursor wherever the chunk ended.
   const outputParsed = (settled = true) => {
     if (!settled) return;
-    const buffer = terminal.buffer.active;
-    const cursorRow = buffer.baseY + buffer.cursorY;
-    const cursorLine = buffer.getLine(cursorRow);
-    const state = `${buffer.type}\n${cursorRow}\n${buffer.cursorX}\n${cursorLine?.translateToString(false) ?? ''}`;
-    const changed = state !== lastSettled;
+    const state = snapshot();
+    const changed = touched || state !== lastSettled;
     lastSettled = state;
+    touched = false;
     // A keystroke the agent has not answered in this long is not waiting on the
     // network; it did nothing the line shows. Timing its eventual redraw would read
     // as a very slow echo, so it expires here as well as on the next keypress.
     const at = now();
-    while (entries.length && at - entries[0].at > STALE_KEYSTROKE_MS) entries.shift();
-    if (!entries.length) return;
-    if (buffer.type !== 'normal' || cursorRow !== row) return;
-    const line = cursorLine;
+    while (entries.length && at - entries[0].at > STALE_KEYSTROKE_MS) unmark(entries.shift());
+    if (!entries.length || !changed) return;
+    const buffer = terminal.buffer.active;
+    if (buffer.type !== 'normal' || buffer.baseY + buffer.cursorY !== row) return;
+    const line = buffer.getLine(row);
     if (!line) return;
-    const cursorX = buffer.cursorX;
-    // A guess still marked before the cursor means the agent has not redrawn this
-    // far: the cursor is where the predictions left it.
-    for (let x = inputStart; x < cursorX; x++) if (predictedCell(line.getCell(x))) return;
     const current = inputBeforeCursor();
     // Acknowledge in order. The text on the line says which state the agent has
     // reached; the question is only which keystroke produced it, since a burst can
@@ -259,25 +338,37 @@ export function createTypingPredictor({ terminal, agent, remote, mode = getPredi
     // at an earlier one, the line would show that one's different text. That is
     // also how one render answering several keystrokes confirms them all.
     const unanswered = current === entries[0].before;
-    const confirmed = !changed || unanswered ? -1 : entries.findIndex((entry) => entry.expected === current);
+    const confirmed = unanswered ? -1 : entries.findIndex((entry) => entry.expected === current);
     if (confirmed < 0) {
-      // Anything but an unchanged line or the state before the oldest keystroke (a
-      // completion, a submitted prompt) is not an echo and ends the chain.
-      if (changed && !unanswered) { entries = []; return; }
+      // Anything but the state before the oldest keystroke (a completion, a
+      // submitted prompt) is not an echo and ends the chain.
+      if (!unanswered) { clearEntries(); return; }
     } else {
-      for (const entry of entries.slice(0, confirmed + 1)) samples.push(at - entry.at);
+      const answered = entries.slice(0, confirmed + 1);
+      for (const entry of answered) samples.push(at - entry.at);
       while (samples.length > SAMPLE_WINDOW) samples.shift();
+      drop(answered);
       entries = entries.slice(confirmed + 1);
     }
-    redrawWaiting(line, cursorX);
+    redrawWaiting(line, buffer.cursorX);
   };
 
   const reset = () => {
-    entries = [];
+    clearEntries();
     unparsed = 0;
     lastSettled = '';
+    touched = false;
+    localWrite = false;
     generation++;
   };
+  const dispose = () => {
+    reset();
+    for (const hook of hooks.splice(0)) hook.dispose();
+  };
 
-  return { keystroke, outputParsed, reset, enabled, echoMs, get pending() { return entries.length; } };
+  return {
+    keystroke, outputParsed, reset, dispose, enabled, echoMs,
+    get pending() { return entries.length; },
+    get marked() { return entries.filter((entry) => entry.decoration).length; },
+  };
 }

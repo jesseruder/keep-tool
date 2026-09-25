@@ -740,6 +740,7 @@ export function mountTerminal(container, pane, options = {}) {
     },
     dispose() {
       profiler.stop('disposed');
+      predictor.dispose();
       disposed = true;
       trackpadWheel.cancel();
       clearTimeout(retryTimer);

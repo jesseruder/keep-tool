@@ -784,11 +784,11 @@ test('a typed character is drawn as a prediction before it is sent, and the byte
     assert.deepEqual([...f.socket.sent.at(-1)], [0x78], 'the PTY gets exactly the typed byte');
     await f.drain();
     const line = f.terminal.buffer.active.getLine(0);
-    assert.equal(line.translateToString(true), '❯ x');
-    assert.ok(line.getCell(2).isDim());
+    assert.equal(line.translateToString(true), '❯ x', 'the guess is on screen before any echo');
+    assert.ok(!line.getCell(2).isDim() && !line.getCell(2).isUnderline(), 'and written plain');
     hostOutput(f, '\r❯ x\x1b[K');
     await f.drain();
-    assert.ok(!f.terminal.buffer.active.getLine(0).getCell(2).isDim(), 'the echo replaces the guess');
+    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), '❯ x');
 
     f.terminal.keyHandler({ type: 'keydown', key: 'Enter' });
     f.terminal.input('\r', true);
@@ -826,7 +826,7 @@ test('auto starts predicting on a pane of another node once its echo is measured
       f.terminal.keyHandler({ type: 'keydown', key: ch });
       f.terminal.input(ch, true);
       await f.drain();
-      drawn.push(f.terminal.buffer.active.getLine(0).getCell(2 + typed.length).isDim() !== 0);
+      drawn.push(f.terminal.buffer.active.getLine(0).getCell(2 + typed.length).getChars() === ch);
       typed += ch;
       clock += 120;
       f.setPerf(clock);
