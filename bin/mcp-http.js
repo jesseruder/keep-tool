@@ -43,7 +43,7 @@ function isUnknownTool(text, tool) {
   // A quoted name must close with its own quote; a bare one must not run on into a longer
   // tool name (discord_recent.archive, discord_recent:x, discord_recent-2).
   const quoted = `(['"\`])${name}\\1`;
-  const bare = `${name}(?![A-Za-z0-9_:-]|\\.[A-Za-z0-9_])`;
+  const bare = `${name}(?![A-Za-z0-9_:-]|\\.\\S)`;
   return new RegExp(`\\bunknown tool:?\\s*(?:${quoted}|${bare})`, 'i').test(String(text));
 }
 
