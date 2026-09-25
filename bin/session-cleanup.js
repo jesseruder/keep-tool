@@ -30,7 +30,12 @@ function refusal(session, pane, pinned, now = Date.now(), options = {}) {
   const checkAgentPane = options.ephemeral === true && !session.reviewer && Boolean(session.agentName)
     && pane.meta?.ephemeral === 'check' && pane.meta?.unattended === true
     && pane.meta?.agentName === session.agentName;
-  if ((session.reviewer || session.agentName) && !checkAgentPane) return 'Standing agent session is protected';
+  // And an area's responder, closed by that area's own quiet close (area-session.js
+  // considerRestart names the agent): its record outlives the session, and the next
+  // event relaunches it. No other caller names an agent, so nothing else gets past.
+  const areaAgentPane = typeof options.areaAgent === 'string' && options.areaAgent !== ''
+    && !session.reviewer && session.agentName === options.areaAgent && pane.meta?.agentName === options.areaAgent;
+  if ((session.reviewer || session.agentName) && !checkAgentPane && !areaAgentPane) return 'Standing agent session is protected';
   if (options.retirement && session.keepRunningKnown !== true) return 'Keep-running preference state is unknown';
   if (options.retirement && session.keepRunning === true) return 'Session is explicitly kept running';
   // A saved Watch layout is presentation state. Only a viewer that is actually

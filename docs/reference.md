@@ -2436,8 +2436,19 @@ way: Keep finds it rather than opening it, so it is moved with `keep move`.
   (`remoteSessionRead`, never the mirror), its whole transcript from the node's
   `close-proof` transcript op (verb 5: background commands for Claude, child agents for
   Codex, which leave the pane open), and its process table and guarded kill from the
-  node's host. That automatic close is the only one a node pane takes; the idle
-  retirement sweep still leaves node panes to be closed by hand.
+  node's host. The idle retirement sweep still leaves node panes to be closed by hand.
+- **Responders.** An area responder placed on a node (`keep agents place sandboxes
+  --node aws1`) is launched there by the area-session tick: the node must answer
+  `hello` (a silent node is waited for exactly as above, spending no launch attempt),
+  its worktree is built by that node's host (`ensure-worktree`, `bin/area-worktree.js`,
+  checked against the node's own worktree root), and the session opens there. A node
+  that did not answer this listing makes the responder `unknown`, never `gone`, so no
+  second one is launched elsewhere. Its session is read from its node, a retried batch
+  is checked against the node's transcript (`match`), and delivery and restart use the
+  node paths they already had. The area's quiet close names its agent in the policy
+  (`areaAgent`), which is the only way a standing agent's own session gets past the
+  cleanup's agent protection, on any node; on a node it is judged on that node's reads
+  as the check sweep's close is.
 
 ## Area sessions
 

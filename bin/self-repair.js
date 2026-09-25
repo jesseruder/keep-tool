@@ -622,15 +622,7 @@ function worktreePath(name, wt = require('./wt.js')) {
 // The last gate before a bypassPermissions agent starts: a repair agent only ever
 // runs in a worktree. An arbitrary cwd would let a card point that agent anywhere on
 // the disk — the card's own project is ~/keep-tool, the live daemon checkout.
-function insideWorktreeRoot(candidate, wt = require('./wt.js')) {
-  try {
-    const configured = String(wt.loadConfig().worktreeRoot || '~/wt').replace(/^~(?=\/|$)/, require('os').homedir());
-    const root = fs.realpathSync(path.resolve(configured));
-    const target = fs.realpathSync(path.resolve(candidate));
-    const relative = path.relative(root, target);
-    return relative !== '' && !relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative);
-  } catch { return false; }
-}
+const { insideWorktreeRoot } = require('./area-worktree.js');
 
 // Whether a card project is a directory on this host: the check lint's
 // missing-project rule makes, and the one openSession makes again before it
@@ -672,13 +664,7 @@ function projectMissingNote(cardId, project) {
 // a checkout plus either its install marker or its installed dependencies. A tree
 // abandoned half-built by a daemon that died mid-create has the .git file and
 // nothing else, and handing that to an agent wastes the whole run.
-function worktreeReady(directory) {
-  try {
-    if (!fs.existsSync(path.join(directory, '.git'))) return false;
-    if (fs.existsSync(path.join(directory, '.wt-install-failed'))) return false;
-    return fs.existsSync(path.join(directory, '.wt.json')) || fs.existsSync(path.join(directory, 'node_modules'));
-  } catch { return false; }
-}
+const { worktreeReady } = require('./area-worktree.js');
 
 function runWt(args, options = {}) {
   const run = options.execFile || execFile;

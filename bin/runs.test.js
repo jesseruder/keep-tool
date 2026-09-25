@@ -1645,7 +1645,7 @@ test('a placed agent whose node is silent waits: nothing is spent, the feed hear
     }
     assert.equal(loadSchedulerState().opened.has('some-card'), false, 'a wait is not the day\'s open');
     assert.equal(emitted.length, 1, 'said once, not every tick');
-    assert.match(emitted[0].text, /node aws1 is not answering/);
+    assert.match(emitted[0].text, /node aws1 is not answering; this agent waits for it/);
     assert.equal(record.nodeWait.node, 'aws1');
     const outcome = await openFreshCheckSession(card(), { ...opts, open: async () => ({ ok: true, sessionId: 'sid', pane: 'p@aws1' }) });
     assert.equal(outcome.skipped, undefined);

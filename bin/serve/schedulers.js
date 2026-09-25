@@ -354,6 +354,7 @@ function startSchedulers(ctx) {
     stallAliveIds, stalled, stalledSessionSnapshot, standup, startAutoCompact, startBriefScheduler,
     startHandoffQueue, startWtGcScheduler, summarize, transcriptFileForSession,
     unblock, usage, watcherSend, withInjectionLock, writeTarget, deliveryReceiptFor,
+    checkPlacement, requireNodeAnswers, ensureWorktreeOn, nodeTranscriptShows,
   } = ctx;
   const periodicScan = () => (ctx.sessionSnapshot || []).map((session) => ({ ...session }));
   // The interval ticks this function starts itself run inside a loop hold, named
@@ -686,10 +687,23 @@ function startSchedulers(ctx) {
     // `true` bypasses the host-list cache: a launch decision made from a stale
     // list is how a second session gets opened, and a close decision made from
     // one would signal a pane that has come back to life.
-    listPanes: () => listHostPanes(deps, true),
+    // With the nodes that did not answer named: a responder placed on a silent node
+    // is unknown, never gone, so the tick does not launch a second one elsewhere.
+    listPanes: async () => {
+      const result = await listHostPaneResult(deps, true);
+      if (!result || !Array.isArray(result.panes) || result.configurationUnreadable) return null;
+      return { panes: result.panes, missingNodes: result.missingNodes || [] };
+    },
     // Fresh on purpose: this tick launches, delivers and closes in the same pass,
     // from what it reads here, and scans only when a pane carries an area session.
     scanSessions: () => readSessions({ fresh: true }),
+    // A responder on another node: its session is read there, where it runs.
+    remoteSession: (sessionId) => loadSessionForAction(sessionId),
+    // Where Owner placed it (`keep agents place`), whether that node answers, and its
+    // worktree built on that node.
+    placement: (agentName) => checkPlacement(agentName, deps),
+    nodeAnswers: (node) => requireNodeAnswers(node, deps),
+    ensureWorktreeOn: (node, repo, name) => ensureWorktreeOn(node, repo, name, deps),
     loadCurrentSession: (id) => loadCurrentSession(id),
     resolveSessionTarget: (session, hint) => resolveSessionTarget(session, hint),
     sendToResolvedTarget: (session, target, text, opts) => sendToResolvedTarget(session, target, text, opts),
@@ -706,8 +720,9 @@ function startSchedulers(ctx) {
     // The message carries its own delivery key on its first line, so this matches
     // one seq range's message and cannot be satisfied by an older batch that
     // happened to render the same way.
-    transcriptShows: (session, text) => require('../area-session.js')
-      .transcriptShowsIn(session, text, transcriptFileForSession),
+    transcriptShows: (session, text) => (session && session.node && nodes.isRemotePane({ node: session.node })
+      ? nodeTranscriptShows(session, text, deps)
+      : require('../area-session.js').transcriptShowsIn(session, text, transcriptFileForSession)),
     onChange: broadcast,
   });
   const areaSessionTick = (options = {}) => require('../area-session.js').tickQuietly(options, areaSessionDeps());

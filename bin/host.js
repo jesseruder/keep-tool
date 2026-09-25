@@ -73,6 +73,7 @@ const PROTOCOL_VERSION = 1;
 const TRANSCRIPT_VERSION = 5;
 const ARTIFACTS_VERSION = 3;
 const STATS_VERSION = 1;
+const WORKTREE_VERSION = 1;
 const INVENTORY_VERSION = 1;
 
 // A reply frame is the request's answer spread beside the frame's own `ok` and `id`
@@ -1226,8 +1227,12 @@ function createHost(options = {}) {
           // pane on this machine. A number, so a later shape can say it is a later one:
           // 2 adds `find`, the Codex rollouts written since a launch; 3 adds
           // `pi-event`, the Keep Pi extension's phase file for a session here; 4
-          // adds `meta`, a Codex rollout's session_meta and last turn's model.
+          // adds `meta`, a Codex rollout's session_meta and last turn's model; 5
+          // adds `close-proof`, the whole-transcript scan an automatic close needs.
           transcript: TRANSCRIPT_VERSION,
+          // worktree: this host answers `ensure-worktree` (bin/area-worktree.js), which
+          // prepares a standing agent's worktree on this machine.
+          worktree: WORKTREE_VERSION,
           // artifacts: this host answers the `artifacts` verb (bin/session-artifacts.js),
           // which lists, reads, stages and publishes a session's files under one of
           // this node's own accounts, so a session can be moved onto or off it. 2 adds
@@ -1327,6 +1332,11 @@ function createHost(options = {}) {
         // straight to whoever asked. The code rides along: `shared-setup` is the
         // one the daemon turns back into its own 409.
         return { result: require('./launch-prep.js').prepare(params) };
+      }
+      case 'ensure-worktree': {
+        // A standing agent placed on this machine runs in a worktree here: built and
+        // checked against this node's own worktree root, the answer naming its path.
+        return { result: await require('./area-worktree.js').ensure(params) };
       }
       case 'artifacts': {
         // A session's files, for a move between nodes. Every path is built here from

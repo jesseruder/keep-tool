@@ -45,7 +45,6 @@ const fs = require('fs');
 const path = require('path');
 const { ref: sessionRef } = require('./session-numbers.js');
 const crypto = require('crypto');
-const { execFile } = require('child_process');
 const keep = require('./keep.js');
 const agents = require('./agents.js');
 const incidents = require('./incidents.js');
@@ -80,7 +79,6 @@ const DELIVERY_RENEW_MS = 30e3;
 // the session has probably had them every time — so at this point the
 // uncertainty is recorded on the feed instead and the queue moves on.
 const ASSUMED_ATTEMPT_LIMIT = 3;
-const WORKTREE_TIMEOUT_MS = 5 * MINUTE_MS;
 // Every area's session lives in the same long-lived worktree name under its own
 // repo, so `~/wt/castle-sandboxes/responder` is the sandboxes responder's tree
 // for as long as the area exists. Never the main checkout.
@@ -118,62 +116,11 @@ function expandHome(value) {
 
 // ---------- the worktree ----------
 
-// `~/wt/<repo>/<name>`, resolved through wt's own configuration so a moved
-// worktree root moves these with it.
-function worktreePath(repo, name = WORKTREE_NAME, wt = require('./wt.js')) {
-  const configured = String(wt.loadConfig().worktreeRoot || '~/wt');
-  return path.resolve(expandHome(configured), String(repo), String(name));
-}
-
-// Out of process, always — `wt.createWorktree` is synchronous end to end (a
-// checkout plus a ~30 s install) and calling it inline stalls every scheduler
-// behind it. CLAUDE_CODE_SESSION_ID is dropped from the child's environment: a
-// keep process that inherits it attributes whatever it writes to the session that
-// happened to spawn it.
-function runWt(args, options = {}) {
-  const run = options.execFile || execFile;
-  const env = { ...(options.env || process.env) };
-  delete env.CLAUDE_CODE_SESSION_ID;
-  delete env.KEEP_PI_SESSION_ID;
-  return new Promise((resolve) => {
-    run(process.execPath, [path.join(__dirname, 'wt.js'), ...args], {
-      env,
-      timeout: options.timeoutMs ?? WORKTREE_TIMEOUT_MS,
-      maxBuffer: 4 << 20,
-    }, (error, stdout, stderr) => resolve({
-      ok: !error,
-      stdout: String(stdout || ''),
-      error: clip(String(stderr || '').trim() || (error && error.message) || '', 400),
-    }));
-  });
-}
-
-// Mirrors self-repair's spawnWorktree, for an arbitrary repo rather than
-// keep-tool. A tree that is there and finished is reused as it stands; a
-// half-built one (a daemon that died mid-create) is removed through wt, which
-// knows how to unregister it, and built again.
-//
-// The caller only ever asks for this when no session is live in the tree —
-// removing a half-built tree out from under a running agent would take its cwd
-// with it.
-async function ensureWorktree(repo, name, deps = {}) {
-  const ready = deps.worktreeReady || selfRepair.worktreeReady;
-  const wtRun = deps.runWt || runWt;
-  let existing = null;
-  try { existing = (deps.worktreePath || worktreePath)(repo, name); } catch {}
-  if (existing && fs.existsSync(existing)) {
-    if (ready(existing)) return { ok: true, path: existing, reused: true };
-    const removed = await wtRun(['rm', existing, '--force', '--delete']);
-    if (!removed.ok || fs.existsSync(existing)) {
-      return { ok: false, error: `half-built worktree at ${existing} could not be removed: ${removed.error || 'it is still there'}` };
-    }
-  }
-  const created = await wtRun(['new', `${repo}/${name}`]);
-  const printed = created.stdout.trim().split('\n').pop().trim();
-  if (created.ok && printed) return { ok: true, path: printed };
-  if (existing && fs.existsSync(existing) && ready(existing)) return { ok: true, path: existing, reused: true };
-  return { ok: false, error: created.error || 'worktree creation produced no path' };
-}
+// The worktree helpers live in area-worktree.js, which a node's host also loads
+// (host verb `ensure-worktree`) to prepare a responder's tree on that node.
+const areaWorktree = require('./area-worktree.js');
+const worktreePath = (repo, name = WORKTREE_NAME, wt) => areaWorktree.worktreePath(repo, name, wt);
+const { runWt, ensureWorktree } = areaWorktree;
 
 // ---------- the recipe ----------
 
@@ -327,12 +274,24 @@ async function observe(record, name, deps = {}) {
   if (typeof deps.listPanes !== 'function') {
     return { state: 'unknown', reason: 'no terminal host was wired into the area-session tick' };
   }
-  let panes;
-  try { panes = await deps.listPanes(); } catch (error) {
+  let listing;
+  try { listing = await deps.listPanes(); } catch (error) {
     return { state: 'unknown', reason: `the terminal host could not be asked: ${oneLine(error && error.message || error, 120)}` };
   }
+  // A fleet listing is { panes, missingNodes }; a bare array is one where every node
+  // answered. A node that did not answer is represented by the panes it last reported,
+  // which say nothing about now.
+  const panes = Array.isArray(listing) ? listing : (listing && listing.panes);
   if (!Array.isArray(panes)) {
     return { state: 'unknown', reason: 'the terminal host did not answer with a pane list' };
+  }
+  const missing = new Set((listing && !Array.isArray(listing) && listing.missingNodes) || []);
+  if (missing.size) {
+    const { parsePaneRef } = require('./nodes.js');
+    const recordedPane = String((record && record.session && record.session.pane) || '');
+    const placed = String((record && record.node) || '');
+    const silent = [recordedPane && parsePaneRef(recordedPane).node, placed].find((node) => node && missing.has(node));
+    if (silent) return { state: 'unknown', reason: `node ${silent} did not answer, so whether ${name}'s session is live there is unknown` };
   }
   const carrying = panes.filter((pane) => paneCarries(pane, recorded, name));
   if (!carrying.length) return recorded ? { state: 'gone' } : { state: 'none' };
@@ -341,6 +300,18 @@ async function observe(record, name, deps = {}) {
   let sessions = [];
   try { sessions = (deps.scanSessions && await deps.scanSessions()) || []; } catch { sessions = []; }
   const rows = sessions.filter((session) => session && session.id === id).map((session) => ({ ...session }));
+  // This machine's scan has no row for a session on another node; that node's own
+  // read of it stands in, and one that cannot be read is not a session known idle.
+  if (!rows.length && id && require('./nodes.js').isRemotePane(adopted)) {
+    if (typeof deps.remoteSession !== 'function') {
+      return { state: 'unknown', reason: `${name}'s session runs on ${adopted.node}, and nothing here can read it` };
+    }
+    let remote = null;
+    try { remote = await deps.remoteSession(id); } catch (error) {
+      return { state: 'unknown', reason: `${name}'s session on ${adopted.node} could not be read: ${oneLine(error && error.message || error, 120)}` };
+    }
+    if (remote) rows.push({ ...remote });
+  }
   if (rows.length) sessionModel.attachRuntime(rows, panes);
   const session = rows[0] || null;
   const paneId = (session && session.runtime && session.runtime.paneId) || adopted.id;
@@ -918,7 +889,30 @@ async function launchSession(context, deps, say) {
     say(`abandoning ${agentName}'s launch ${stage}: another tick holds the launch lease now`);
     return false;
   };
-  const tree = await ensureWorktree(repo, WORKTREE_NAME, deps);
+  // Where the responder runs: this node, unless Owner placed the agent elsewhere
+  // (`keep agents place`). A placed agent waits for a node that is not answering —
+  // nothing is spawned and no launch attempt is spent — and its feed hears it once.
+  let placement = { node: require('./nodes.js').daemonNode(), remote: false };
+  if (deps.placement) {
+    try { placement = deps.placement(agentName); }
+    catch (error) {
+      say(`could not place ${agentName}: ${oneLine(error && error.message || error, 200)}`);
+      return { state: 'failed', reason: `placement: ${oneLine(error && error.message || error, 200)}` };
+    }
+  }
+  if (placement.remote) {
+    try { await deps.nodeAnswers(placement.node); }
+    catch (error) {
+      (deps.noteNodeWait || require('./runs.js').noteNodeWait)(agents, agentName, placement.node, root);
+      return { state: 'skipped', waitingForNode: placement.node, reason: oneLine(error && error.message || error, 200) };
+    }
+    (deps.clearNodeWait || require('./runs.js').clearNodeWait)(agents, agentName, root);
+  }
+  // On a node, the tree is built there and checked against that machine's own
+  // worktree root; here, as it always was.
+  const tree = placement.remote
+    ? await deps.ensureWorktreeOn(placement.node, repo, WORKTREE_NAME)
+    : await ensureWorktree(repo, WORKTREE_NAME, deps);
   if (!tree.ok) {
     say(`could not prepare ${repo}/${WORKTREE_NAME} for ${agentName}: ${tree.error}`);
     return { state: 'failed', reason: `worktree: ${tree.error}`, worktree: tree };
@@ -930,7 +924,7 @@ async function launchSession(context, deps, say) {
   // in a worktree. A `project` in watch/incidents.json is Owner's, but a cwd that
   // resolved to a main checkout would put an agent in the live tree.
   const inside = (deps.insideWorktreeRoot || selfRepair.insideWorktreeRoot);
-  if (!inside(tree.path)) {
+  if (!placement.remote && !inside(tree.path)) {
     say(`refusing to launch ${agentName}: ${tree.path} is not inside the configured worktree root`);
     return { state: 'failed', reason: `${tree.path} is not inside the worktree root`, worktree: tree };
   }
@@ -943,8 +937,9 @@ async function launchSession(context, deps, say) {
     opened = await deps.openSession({
       fresh: true,
       cwd: tree.path,
-      // An area agent reads and writes this registry, so it runs beside it.
-      node: require('./nodes.js').daemonNode(),
+      // Beside the registry, unless placed: on a node it reads and writes the
+      // registry through the forwarded CLI.
+      node: placement.node,
       agent: 'claude',
       accountId: account || undefined,
       model: MODEL,
@@ -1144,7 +1139,7 @@ async function deliveryStep(context, deps, say) {
         return defer('no transcript check is wired in, so a retry cannot be made safely');
       }
       let shown = null;
-      try { shown = deps.transcriptShows(session, text); } catch (error) {
+      try { shown = await deps.transcriptShows(session, text); } catch (error) {
         say(`${agentName} could not read the session transcript for seq ${batch.firstSeq}-${batch.lastSeq}: `
           + `${oneLine(error && error.message || error, 160)}; leaving the batch pending`);
         return defer('the session transcript could not be read');
@@ -1373,7 +1368,9 @@ async function considerRestart(context, deps, say) {
       // is the area's own: closeIdleSession then refuses a session or a pane that
       // has done anything inside it, which is the second opinion this decision
       // wants rather than one it should waive with `idleMs: 0`.
-      closePolicy: { automatic: true, idleMs: idleMin * MINUTE_MS },
+      // `areaAgent` is what lets the standing agent's own session through the
+      // cleanup's agent protection, and only this agent's.
+      closePolicy: { automatic: true, idleMs: idleMin * MINUTE_MS, areaAgent: agentName },
     });
   } catch (error) {
     const reason = oneLine(error && error.message || error, 200);

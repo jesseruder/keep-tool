@@ -1850,7 +1850,7 @@ function isHostTarget(target) {
 // further and has a connection of its own (HOST_CHANNEL_BY_TYPE): a receipt's long
 // poll waits up to nine seconds, and a launch's prepare must not queue behind it.
 // `secret-write` joins them: it checks the destination against the node's repos first.
-const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state', 'artifacts', 'stats', 'secret-write']);
+const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state', 'artifacts', 'stats', 'secret-write', 'ensure-worktree']);
 // `artifacts` carries a moving session's files in 4 MiB frames: a connection of its
 // own, so a move never sits in front of a receipt, a launch or a keystroke.
 const HOST_CHANNEL_BY_TYPE = new Map([['transcript', 'transcript'], ['artifacts', 'artifacts']]);
@@ -7941,10 +7941,14 @@ async function closeIdleSession(body, deps = {}) {
   // An id qualified with this node's own name is this node's pane: everything below
   // compares against the ids the pane list publishes, which are bare here.
   if (!paneNode.qualified && paneNode.paneId !== body.pane) body = { ...body, pane: paneNode.paneId };
-  // The one automatic close a node's pane takes is the check sweep's: a pane Keep
-  // opened for one recipe, judged below on the node's own reads of its turn, its
-  // whole transcript (the close proof) and its process table.
-  if (remoteSession(body.pane, deps) && deps.closePolicy && !deps.closePolicy.manual && !deps.closePolicy.ephemeral) {
+  // The automatic closes a node's pane takes are the check sweep's (a pane Keep
+  // opened for one recipe) and an area's quiet close of its own responder, judged
+  // below on the node's own reads of its turn, its whole transcript (the close
+  // proof) and its process table.
+  // An area's quiet close of its own responder (closePolicy.areaAgent) is judged the
+  // same way.
+  if (remoteSession(body.pane, deps) && deps.closePolicy && !deps.closePolicy.manual && !deps.closePolicy.ephemeral
+      && !deps.closePolicy.areaAgent) {
     throw new InjectionError(409, `automatic close is not available for a pane on ${paneNode.node}; close it by hand`);
   }
   // By hand, a pane on another node is judged by that node's answers about its own
@@ -16022,6 +16026,27 @@ function checkPlacement(agentName, deps = {}) {
   return { node, remote: node !== daemon };
 }
 
+// Whether a session on another node has this exact message in its transcript, as
+// that node reads it (the transcript verb's `match`, from the start of the file). The
+// area-session retry's last witness, asked of the machine the session runs on.
+async function nodeTranscriptShows(session, text, deps = {}) {
+  const result = await nodeTranscript(session.node, session, deps).match(0, require('./delivery').textHash(text));
+  return result && result.matched === true;
+}
+
+// A standing agent's worktree on the node it is placed on (host verb `ensure-worktree`,
+// bin/area-worktree.js): built there, checked against that machine's worktree root.
+// A build is a checkout plus an install, so the reply window is the build's own bound
+// and then some. Answers { ok, path } or { ok: false, error }, like ensureWorktree.
+async function ensureWorktreeOn(node, repo, name, deps = {}) {
+  const ask = deps.hostRequest || hostRequest;
+  const hello = await ask('hello', {}, { ...deps, node });
+  if (!(Number(hello && hello.worktree) >= 1)) {
+    return { ok: false, error: `the terminal host on ${node} predates ensure-worktree; update keep-tool on ${node} and reload its host` };
+  }
+  return ask('ensure-worktree', { repo, name }, { ...deps, node, hostRequestTimeoutMs: 6 * 60e3 });
+}
+
 // "Wait for the node": an agent placed on a machine that is not answering is not
 // opened anywhere else. The error carries `code: 'NODE_WAIT'`, which the scheduler
 // reads as "not this tick" — no allowance spent, nothing recorded as a failure.
@@ -16029,7 +16054,7 @@ async function requireNodeAnswers(node, deps = {}) {
   try {
     await (deps.hostRequest || hostRequest)('hello', {}, { ...deps, node });
   } catch (error) {
-    throw Object.assign(new Error(`node ${node} did not answer (${String(error && error.message || error)}); the check waits for it`),
+    throw Object.assign(new Error(`node ${node} did not answer (${String(error && error.message || error)}); waiting for it`),
       { code: 'NODE_WAIT', node });
   }
 }
@@ -17277,6 +17302,7 @@ function start(deps = {}) {
     stalledSessionSnapshot: (now) => stalledSessionSnapshot(now, { readWorker: daemonReadWorker }), standup, tellSession,
     startAutoCompact, startBriefScheduler, startHandoffQueue, startWtGcScheduler, summarize,
     transcriptFileForSession, pendingCompactSwaps, deliveryReceiptFor,
+    checkPlacement, requireNodeAnswers, ensureWorktreeOn, nodeTranscriptShows,
     transferSession, moveSession,
     unblock, updateSetAside, usage, wantsConsoleState, watcherSend,
     withInjectionLock, writeTarget, writeToShellPane,
@@ -17530,6 +17556,7 @@ function start(deps = {}) {
 }
 
 module.exports = {
+  checkPlacement, requireNodeAnswers, ensureWorktreeOn, nodeTranscriptShows,
   runWorktreeRecreation,
   repairEnvFor,
   sendReviewerMessage,

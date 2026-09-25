@@ -122,6 +122,36 @@ test('a card agent\'s finished check pane may be closed by the check sweep, and 
   }
 });
 
+test('an area\'s quiet close may close its own responder, and only its own', () => {
+  const now = Date.now();
+  const session = { id: 'resp', kind: 'claude', agentName: 'sandboxes', state: 'idle', endedTurn: true, mtime: now - 3 * 3600e3 };
+  const pane = { id: 'p@aws1', alive: true, attached: 0, meta: { sessionId: 'resp', agent: 'claude', agentName: 'sandboxes' } };
+  const policy = { automatic: true, idleMs: 7200e3, areaAgent: 'sandboxes' };
+  assert.doesNotMatch(String(refusal(session, pane, new Set(), now, policy)), /Standing agent session is protected/);
+  for (const [s, p, options] of [
+    [session, pane, { automatic: true, idleMs: 7200e3 }],
+    [session, pane, { ...policy, areaAgent: 'multiplayer' }],
+    [session, { ...pane, meta: { ...pane.meta, agentName: 'multiplayer' } }, policy],
+    [{ ...session, reviewer: true }, pane, policy],
+  ]) {
+    assert.match(String(refusal(s, p, new Set(), now, options)), /Standing agent session is protected/);
+  }
+});
+
+test('ensure-worktree refuses a request it cannot pass to wt safely, and a tree outside the root', async () => {
+  const { ensure } = require('./area-worktree');
+  for (const params of [{}, { repo: '--force', name: 'responder' }, { repo: 'r\nx', name: 'responder' }, { repo: 'r', name: '../x' }, { repo: 'r', name: '-x' }]) {
+    assert.equal((await ensure(params, { runWt: async () => assert.fail('wt ran') })).code, 'invalid', JSON.stringify(params));
+  }
+  const deps = {
+    worktreePath: () => '/nowhere/r/responder',
+    runWt: async () => ({ ok: true, stdout: '/elsewhere/r/responder\n', error: '' }),
+  };
+  assert.equal((await ensure({ repo: 'r', name: 'responder' }, { ...deps, insideWorktreeRoot: () => false })).code, 'outside');
+  assert.deepEqual(await ensure({ repo: 'r', name: 'responder' }, { ...deps, insideWorktreeRoot: () => true }),
+    { ok: true, path: '/elsewhere/r/responder' });
+});
+
 test('manual Close permits card review but preserves real prompt and activity guards', () => {
   const now = Date.now();
   for (const kind of ['claude', 'codex']) {

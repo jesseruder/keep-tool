@@ -853,7 +853,7 @@ function noteNodeWait(agentApi, agentName, node, root) {
     agentApi.writeRecord(agentName, { nodeWait: { node: String(node || ''), since: Date.now() } }, { root });
     agentApi.emit(agentName, {
       kind: 'waiting', severity: 'med',
-      text: `node ${node} is not answering; this agent's checks wait for it`,
+      text: `node ${node} is not answering; this agent waits for it`,
     }, { root });
     agentApi.flushCommits(root);
   } catch (error) {
@@ -1504,7 +1504,7 @@ module.exports = {
   escalateBudgetDeferral, handleBudgetDeferral, MAX_FALLBACK_ATTEMPTS,
   freshOpenRefusal, resetTickAllowance, loadSchedulerState, releaseUnfinishedCheck,
   readDeliveryStamp, writeDeliveryStamp, readRawDeliveryStamp, stampExpired, checkinFromSessionAt,
-  reapEphemeralPane, sweepEphemeralPanes, MAX_FRESH_OPENS_PER_TICK, MAX_DEFERRAL_NOTICES_PER_TICK,
+  reapEphemeralPane, sweepEphemeralPanes, noteNodeWait, clearNodeWait, MAX_FRESH_OPENS_PER_TICK, MAX_DEFERRAL_NOTICES_PER_TICK,
   EPHEMERAL_IDLE_MS, FRESH_OPEN_STAMP_TTL_MS,
   checkDeliveryMessage, checkDeliveryKey, planDueCard, deliveryWarning,
   cardFingerprint, pendingCheckin, onPassOutcome,

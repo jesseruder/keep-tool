@@ -11097,6 +11097,25 @@ test('a check session Keep opens for itself lands on the daemon node', async () 
   assert.equal(resolvePlacement({ node: 'main', lastCardNode: 'aws1' }, { hostNodes: ['main', 'aws1'] }), 'main');
 });
 
+test('a responder\'s worktree on a node is built by that node\'s host, and an older host is named rather than asked', async () => {
+  const { ensureWorktreeOn } = require('./serve');
+  const asked = [];
+  const host = (hello) => async (type, params, requestDeps) => {
+    asked.push([type, requestDeps.node, params, requestDeps.hostRequestTimeoutMs]);
+    if (type === 'hello') return hello;
+    return { ok: true, path: '/home/node/wt/castle-sandboxes/responder' };
+  };
+  assert.deepEqual(await ensureWorktreeOn('aws1', 'castle-sandboxes', 'responder', { hostRequest: host({ worktree: 1 }) }),
+    { ok: true, path: '/home/node/wt/castle-sandboxes/responder' });
+  assert.deepEqual(asked[1].slice(0, 3), ['ensure-worktree', 'aws1', { repo: 'castle-sandboxes', name: 'responder' }]);
+  assert.ok(asked[1][3] >= 5 * 60e3, 'the reply window covers a build');
+  asked.length = 0;
+  const old = await ensureWorktreeOn('aws1', 'castle-sandboxes', 'responder', { hostRequest: host({ transcript: 5 }) });
+  assert.equal(old.ok, false);
+  assert.match(old.error, /predates ensure-worktree/);
+  assert.deepEqual(asked.map(([type]) => type), ['hello']);
+});
+
 test('a card agent Owner placed on a node opens its check there, and waits for a node that does not answer', async () => {
   const { openCheckSession } = require('./serve');
   const records = {

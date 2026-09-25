@@ -1362,7 +1362,7 @@ test('an idle session with nothing open is closed gracefully, and the next tick 
     // The area's own idle window, not zero: closeIdleSession's elapsed-activity
     // checks are a second opinion this decision wants, not one it should waive.
     assert.deepEqual(deps.calls.closes[0].closeDeps.closePolicy,
-      { automatic: true, idleMs: 120 * MINUTE });
+      { automatic: true, idleMs: 120 * MINUTE, areaAgent: 'sandboxes' });
     const saved = record(fixture);
     assert.equal(saved.session.id, '', 'the record drops the session it closed');
     assert.equal(saved.lifecycle, 'idle');
@@ -1750,5 +1750,101 @@ test('a tick never throws into the poll, whatever a dep does', async () => {
     const noConfig = await areaSession.tickQuietly({ root: fixture.root, now: NOW },
       { ...deps, config: () => { throw new Error('unreadable incidents.json'); } });
     assert.match(noConfig.error, /unreadable/);
+  } finally { cleanup(fixture.root); }
+});
+
+// ---------- a responder placed on another node ----------
+
+function placedDeps(fixture, state) {
+  const deps = makeDeps(fixture, state);
+  deps.calls.nodeTrees = [];
+  deps.calls.asked = [];
+  deps.placement = () => ({ node: 'aws1', remote: true });
+  deps.nodeAnswers = async (node) => {
+    deps.calls.asked.push(node);
+    if (state.nodeSilent) throw new Error(`node ${node} did not answer (host connect timed out); waiting for it`);
+  };
+  deps.ensureWorktreeOn = async (node, repo, name) => {
+    deps.calls.nodeTrees.push([node, repo, name]);
+    return state.nodeTree || { ok: true, path: '/home/node/wt/castle-sandboxes/responder' };
+  };
+  deps.insideWorktreeRoot = () => { throw new Error('a node tree is checked on its node, not here'); };
+  deps.remoteSession = async (id) => {
+    if (state.remoteError) throw state.remoteError;
+    return state.remoteRows ? state.remoteRows[id] || null : null;
+  };
+  return deps;
+}
+
+test('a responder placed on a node launches there, in a worktree built there, and waits for a silent node', async () => {
+  const fixture = makeRoot();
+  try {
+    const state = { panes: [], sessions: [], nodeSilent: true };
+    const deps = placedDeps(fixture, state);
+    // The node is silent: nothing is built or opened, and no launch attempt is spent.
+    const waiting = sandboxes(await tick(fixture, deps));
+    assert.equal(waiting.launch.state, 'skipped');
+    assert.equal(waiting.launch.waitingForNode, 'aws1');
+    assert.match(waiting.launch.reason, /node aws1 did not answer/);
+    assert.deepEqual(deps.calls.nodeTrees, []);
+    assert.equal(deps.calls.opens.length, 0);
+    assert.equal(Number(record(fixture).launch.attempts || 0), 0, 'a wait is not a failed launch');
+    assert.equal(record(fixture).nodeWait.node, 'aws1');
+    assert.equal(agents.readEvents('sandboxes', { root: fixture.root }).filter((event) => event.kind === 'waiting').length, 1);
+    await tick(fixture, deps);
+    assert.equal(agents.readEvents('sandboxes', { root: fixture.root }).filter((event) => event.kind === 'waiting').length, 1,
+      'the wait is said once');
+
+    // It answers: the tree is built on aws1 and the session opened there.
+    state.nodeSilent = false;
+    const launched = sandboxes(await tick(fixture, deps));
+    assert.equal(launched.launch.state, 'launched');
+    assert.deepEqual(deps.calls.nodeTrees, [['aws1', 'castle-sandboxes', 'responder']], 'the repo as wt names it, built on aws1');
+    assert.equal(deps.calls.wt.length, 0, 'no worktree is built on the daemon node');
+    assert.equal(deps.calls.opens[0].body.node, 'aws1');
+    assert.equal(deps.calls.opens[0].body.cwd, '/home/node/wt/castle-sandboxes/responder');
+    assert.equal(record(fixture).nodeWait, null);
+
+    // A node that could not build the tree fails the launch, as a local one would.
+    const failing = makeRoot();
+    try {
+      const failState = { panes: [], sessions: [], nodeTree: { ok: false, error: 'no castle-sandboxes checkout on this node' } };
+      const failed = sandboxes(await tick(failing, placedDeps(failing, failState)));
+      assert.equal(failed.launch.state, 'failed');
+      assert.match(failed.launch.reason, /no castle-sandboxes checkout/);
+    } finally { cleanup(failing.root); }
+  } finally { cleanup(fixture.root); }
+});
+
+test('a responder on a node that did not answer is unknown, never gone, and its session is read on its node', async () => {
+  const fixture = makeRoot();
+  try {
+    idleFor(fixture, 3, { node: 'aws1', session: { id: 'sess-1', pane: 'pane-1@aws1', startedAt: NOW - 3 * HOUR } });
+    const remotePane = livePane('pane-1@aws1', 'sess-1', { node: 'aws1', hostPaneId: 'pane-1' });
+    // aws1 said nothing this listing: no launch, no delivery, no close.
+    const state = { panes: { panes: [], missingNodes: ['aws1'] }, sessions: [] };
+    const deps = placedDeps(fixture, state);
+    const silent = sandboxes(await tick(fixture, deps));
+    assert.equal(silent.session.state, 'unknown');
+    assert.match(silent.launch.reason, /node aws1 did not answer/);
+    assert.equal(deps.calls.opens.length, 0);
+    assert.equal(deps.calls.closes.length, 0);
+
+    // It answered, and its session could not be read there: still unknown.
+    state.panes = { panes: [remotePane], missingNodes: [] };
+    state.remoteError = new Error('transcript-missing');
+    assert.equal(sandboxes(await tick(fixture, deps)).session.state, 'unknown');
+
+    // Read there: live, and idle long enough to close through the area's own policy.
+    state.remoteError = null;
+    state.remoteRows = { 'sess-1': { ...idleSession('sess-1', 'pane-1@aws1', NOW - 3 * HOUR), node: 'aws1' } };
+    state.open = [];
+    const live = sandboxes(await tick(fixture, deps));
+    assert.equal(live.session.state, 'live');
+    assert.equal(deps.calls.opens.length, 0);
+    assert.equal(live.restart.state, 'closed', JSON.stringify(live.restart));
+    assert.equal(deps.calls.closes.length, 1);
+    assert.equal(deps.calls.closes[0].body.pane, 'pane-1@aws1');
+    assert.equal(deps.calls.closes[0].closeDeps.closePolicy.areaAgent, 'sandboxes');
   } finally { cleanup(fixture.root); }
 });
