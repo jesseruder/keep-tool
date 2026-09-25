@@ -24,19 +24,26 @@ function fakeSummarize() {
 
 test('parse reads the verdict line and a short reason, and rejects anything else', () => {
   assert.deepEqual(classifier.parse('RUNNING: waiting on Codex review'), { verdict: 'running', reason: 'waiting on Codex review' });
-  assert.deepEqual(classifier.parse('**WAITING_ON_YOU** — asks which model to use.'), { verdict: 'needs-input', reason: 'asks which model to use' });
+  assert.deepEqual(classifier.parse('**ASKS** — which model to use.'), { verdict: 'asks', reason: 'which model to use' });
+  assert.deepEqual(classifier.parse('DONE: reported the results'), { verdict: 'done', reason: 'reported the results' });
+  assert.equal(classifier.parse('WAITING_ON_YOU: an old answer'), null, 'the old two-way answer is not read');
   assert.equal(classifier.parse('I think it is running'), null);
   assert.equal(classifier.parse(''), null);
 });
 
-test('only a finished turn in a live agent conversation with nothing pending is classified', () => {
+test('only a finished turn with nothing pending is classified, in a live pane or one Keep no longer sees', () => {
   assert.equal(classifier.eligible(base), true);
   for (const change of [{ endedTurn: false }, { endedTurn: undefined }, { toolRunning: true }, { pendingQuestion: { question: 'x' } },
     { pendingPlan: true }, { reviewer: true }, { agentName: 'sandboxes' }, { exited: true }, { kind: 'pi' },
-    { lastAssistantFull: '  ' }, { runtime: { state: 'exited' } }, { runtime: { state: 'external' } }]) {
+    { lastAssistantFull: '  ' }, { runtime: { state: 'exited' } }, { runtime: { state: 'missing' } }]) {
     assert.equal(classifier.eligible({ ...base, ...change }), false, JSON.stringify(change));
   }
   assert.equal(classifier.eligible({ ...base, runtime: { state: 'live' } }), true);
+  // A conversation Keep sees no pane for counts only while its card holds it waiting.
+  for (const state of ['unknown', 'external']) {
+    assert.equal(classifier.eligible({ ...base, runtime: { state } }), false, state);
+    assert.equal(classifier.eligible({ ...base, runtime: { state }, taskStatus: 'waiting' }), true, state);
+  }
 });
 
 test('the input is the last message plus whether tracked background work is still running', () => {
@@ -72,6 +79,8 @@ test('a missing verdict queues one on the configured model, logs it, and a chang
 
   classifier.request([base], { summarize, root, env: { KEEP_STOP_MODEL: 'claude-haiku-4-5-20251001' } });
   assert.equal(summarize.queued.at(-1).options.model, 'claude-haiku-4-5-20251001');
+  classifier.request([{ ...base, id: 'paneless', runtime: { state: 'unknown' }, taskStatus: 'waiting' }], { summarize, root, env });
+  assert.equal(summarize.queued.at(-1).options.priority, 1, 'a paneless conversation queues behind live ones');
   classifier.request([{ ...base, id: 's2' }], { summarize, root, env: { KEEP_STOP_CLASSIFIER: '0' } });
   assert.equal(summarize.queued.filter((job) => job.key === 'stop-s2').length, 0, 'KEEP_STOP_CLASSIFIER=0 turns it off');
 });
@@ -98,38 +107,68 @@ test('a RUNNING verdict moves a finished turn out of Waiting on you', () => {
   assert.equal(attention(running), null);
 });
 
-test('a WAITING_ON_YOU verdict beats a tracked job wait and carries its reason to the row', () => {
-  const session = { ...base, pendingBackground: true, lastAssistantFull: 'The review is running. Separately: should Transfer follow the new default' };
-  assert.equal(activity(session).state, 'waiting', 'the rules alone read the running job');
-  const asks = { ...session, stopVerdict: { verdict: 'needs-input', reason: 'asks whether Transfer follows default' } };
+test('an ASKS verdict beats a tracked job wait or poll, with the agent\'s words as the detail', () => {
+  const text = 'None of the four records resolve yet. Here they are again for the castle.xyz zone. I\'m watching the certificate in the background';
+  const session = { ...base, pendingBackground: true, lastAssistantFull: text };
+  assert.equal(activity(session).state, 'waiting', 'the rules alone read the running poll');
+  const asks = { ...session, stopVerdict: { verdict: 'asks', reason: 'add the DNS validation records' } };
   assert.equal(activity(asks).state, 'needs-input');
-  assert.equal(attention(asks).detail, 'asks whether Transfer follows default');
-  assert.equal(attention(asks).attentionLabel, 'Ready for next instruction');
+  assert.equal(activity(asks).decision.rule, 'model-asks');
+  assert.equal(attention(asks).detail, text);
+  assert.equal(attention(asks).attentionLabel, 'Needs an answer');
+  // A DONE verdict also beats a stale job wait, labelled as ready.
+  const done = { ...session, stopVerdict: { verdict: 'done', reason: 'reported the deploy' } };
+  assert.equal(attention(done).detail, 'reported the deploy');
+  assert.equal(attention(done).attentionLabel, 'Ready for next instruction');
+});
+
+test('an ASKS verdict counts for a conversation whose pane is gone; RUNNING and DONE do not', () => {
+  const gone = { ...base, pane: undefined, runtime: { state: 'unknown' }, taskStatus: 'waiting', lastAssistantFull: 'Decision for you: do you want to start building the usage UI? Reply on the card to start it.' };
+  const card = { task: { status: 'waiting', check_after: '2030-01-01T00:00' } };
+  assert.equal(activity(gone, card).decision.rule, 'scheduled-check', 'without a verdict the card schedule holds it');
+  assert.equal(activity({ ...gone, stopVerdict: { verdict: 'asks', reason: 'start the usage UI?' } }, card).decision.rule, 'model-asks');
+  assert.equal(activity({ ...gone, stopVerdict: { verdict: 'done', reason: 'reported' } }, card).decision.rule, 'scheduled-check');
+  assert.equal(activity({ ...gone, stopVerdict: { verdict: 'running', reason: 'x' } }, card).decision.rule, 'scheduled-check');
+});
+
+test('a card check overdue past its grace stops holding the session as waiting', () => {
+  const at = Date.parse('2026-09-24T17:28');
+  const card = { task: { status: 'waiting', check_after: '2026-09-24T17:28' } };
+  const gone = { ...base, pane: undefined, runtime: { state: 'unknown' }, lastAssistantFull: 'Recorded the check results on the card.' };
+  assert.equal(activity(gone, { ...card, now: at + 10 * 60e3 }).decision.rule, 'scheduled-check', 'inside the grace it still waits');
+  const overdue = activity(gone, { ...card, now: at + 20 * 60e3 });
+  assert.equal(overdue.decision.rule, 'check-overdue');
+  assert.equal(overdue.state, 'needs-input');
+  assert.match(overdue.request.detail, /due 2026-09-24 17:28\) was not delivered/);
+  // A live session that scheduled it is ready once the check is overdue.
+  const live = { ...base, taskId: 't', lastAssistantFull: 'Scheduled a recovery check in 15 minutes.' };
+  assert.equal(activity(live, { ...card, now: at + 20 * 60e3 }).state, 'needs-input');
+  assert.equal(activity(live, { task: { ...card.task, status: 'done' }, now: at + 20 * 60e3 }).decision.rule !== 'check-overdue', true);
 });
 
 test('a question keeps the agent\'s own words as the detail a push shows', () => {
   const text = 'Tests pass. Should I deploy to prod now, or wait for the migration?';
-  const session = { ...base, lastAssistantFull: text, stopVerdict: { verdict: 'needs-input', reason: 'asks whether to deploy now' } };
+  const session = { ...base, lastAssistantFull: text, stopVerdict: { verdict: 'asks', reason: 'asks whether to deploy now' } };
   assert.equal(attention(session).detail, text);
   assert.equal(attention(session).attentionLabel, 'Needs an answer');
 });
 
-test('a WAITING_ON_YOU verdict does not pull a session out of a scheduled check or dependency wait', () => {
-  const needs = { verdict: 'needs-input', reason: 'finished, nothing running' };
+test('a DONE verdict does not pull a session out of a scheduled check or dependency wait', () => {
+  const needs = { verdict: 'done', reason: 'finished, nothing running' };
   const session = { ...base, lastAssistantFull: 'Waiting for the scheduled check at 3pm.', stopVerdict: needs };
-  const checked = activity(session, { task: { check_after: '2026-09-25T15:00' } });
+  const checked = activity(session, { task: { check_after: '2030-09-25T15:00' } });
   assert.equal(checked.state, 'waiting');
   assert.equal(activity(session, { dependencies: ['upstream'] }).state, 'waiting');
 });
 
 test('a far-off card check does not stop the verdict overriding a stale job wait', () => {
   const session = { ...base, pendingBackground: true, lastAssistantFull: 'Deployed and verified; everything is green.',
-    stopVerdict: { verdict: 'needs-input', reason: 'deploy finished and verified' } };
-  assert.equal(activity(session, { task: { check_after: '2026-10-01T00:00' } }).state, 'needs-input');
+    stopVerdict: { verdict: 'done', reason: 'deploy finished and verified' } };
+  assert.equal(activity(session, { task: { check_after: '2030-10-01T00:00' } }).state, 'needs-input');
 });
 
-test('a card\'s open needs keep their own text over a WAITING_ON_YOU verdict', () => {
-  const session = { ...base, lastAssistantFull: 'Migration done.', stopVerdict: { verdict: 'needs-input', reason: 'migration finished' } };
+test('a card\'s open needs keep their own text over a DONE verdict', () => {
+  const session = { ...base, lastAssistantFull: 'Migration done.', stopVerdict: { verdict: 'done', reason: 'migration finished' } };
   const status = activity(session, { task: { status: 'active', needs: [{ text: 'Approve prod cutover window' }] } });
   assert.equal(status.decision.rule, 'task-needs');
   assert.equal(status.request.detail, 'Approve prod cutover window');
@@ -153,10 +192,10 @@ test('explicit signals still outrank the verdict', () => {
 
 test('attach sets and clears the verdict from the cache only', () => {
   const summarize = fakeSummarize();
-  summarize.cache.set(`stop-s1|claude-sonnet-5|${classifier.input(base)}`, { text: 'WAITING_ON_YOU: done, reports results', generatedAt: 7 });
+  summarize.cache.set(`stop-s1|claude-sonnet-5|${classifier.input(base)}`, { text: 'DONE: reports results', generatedAt: 7 });
   const sessions = [{ ...base }, { ...base, id: 'other', endedTurn: false, stopVerdict: { verdict: 'running' } }];
   classifier.attach(sessions, { summarize, env: {}, now: () => 10e6 });
-  assert.deepEqual(sessions[0].stopVerdict, { verdict: 'needs-input', reason: 'done, reports results', model: 'claude-sonnet-5', at: 7 });
+  assert.deepEqual(sessions[0].stopVerdict, { verdict: 'done', reason: 'reports results', model: 'claude-sonnet-5', at: 7 });
   assert.equal(Object.hasOwn(sessions[1], 'stopVerdict'), false);
   assert.equal(summarize.queued.length, 0);
 });

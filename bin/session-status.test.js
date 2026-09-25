@@ -144,10 +144,11 @@ test('an unattended session that ends on a statement is finished, not waiting fo
     assert.equal(attention({ ...done, pendingQuestion: { question: 'Drain?' } }).kind, 'question');
     // The model's turn-end verdict cannot make an unattended statement "ready for the
     // next instruction" either; it still counts when the turn asked something.
-    const verdict = { verdict: 'needs-input', reason: 'Ready for your next instruction.', model: 'haiku' };
+    const verdict = { verdict: 'done', reason: 'reported the overnight check', model: 'haiku' };
     assert.equal(attention({ ...done, stopVerdict: verdict }).kind, 'finished');
-    assert.equal(attention({ ...done, stopVerdict: verdict, lastAssistantFull: 'Drain the host now?' }).pri, 0);
-    assert.equal(activity({ ...done, stopVerdict: verdict, lastAssistantFull: 'Drain the host now?' }).decision.rule, 'model-needs-input');
+    const asks = { verdict: 'asks', reason: 'asks whether to drain the host', model: 'haiku' };
+    assert.equal(attention({ ...done, stopVerdict: asks, lastAssistantFull: 'Drain the host now?' }).pri, 0);
+    assert.equal(activity({ ...done, stopVerdict: asks, lastAssistantFull: 'Drain the host now?' }).decision.rule, 'model-asks');
     // Asks without a question mark still count as asks; a report does not.
     for (const text of [
       'I need your approval before continuing.', 'Need your approval to deploy.',
