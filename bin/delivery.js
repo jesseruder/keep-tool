@@ -414,7 +414,7 @@ async function deliverAttempt({ session, pane, text, key, file, remote = null, d
         let emptyBox = true;
         try { await precheck(); } catch (error) {
           if (!sameMessage) {
-            error.message = `Previous delivery is partially typed and the box is not empty: ${error.message}`;
+            if (error instanceof Error) error.message = `Previous delivery is partially typed; ${error.message}`;
             throw error;
           }
           emptyBox = false;

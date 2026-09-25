@@ -663,6 +663,13 @@ function createHookService(options = {}) {
       // KEEP_PANE, and the node's own bind needs it), so it never asks the node's host.
       // A Pi session is asked about only from its start: the one Pi post that names the
       // extension instance and process a /new or /resume inside Pi is adopted by.
+      // A child that is a session of its own is refused before anything else, the
+      // adoption below included: its check stands in a location for every id.
+      if (isObject(body) && typeof body.child === 'string' && body.child) {
+        let located = null;
+        try { located = shared.location(body.child); } catch { located = null; }
+        if (located) refuse(403, `${body.child} is a session of its own, not a child agent`);
+      }
       const identity = isObject(body) && isObject(body.identity) ? body.identity : null;
       const piStart = identity && identity.agent === 'pi' && body.event === 'pi-start';
       const ofItsAgent = identity && typeof identity.pane === 'string' && identity.pane !== ''
@@ -677,11 +684,6 @@ function createHookService(options = {}) {
           ...(piStart ? { pi: { instance: checked.input.instance, pid: checked.input.pid } } : {}) });
       }
       const request = validateRequest(body, caller, deps);
-      if (request.child) {
-        let located = null;
-        try { located = shared.location(request.child); } catch { located = null; }
-        if (located) refuse(403, `${request.child} is a session of its own, not a child agent`);
-      }
       if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };
       pruneMirrors();
       const scope = request.sessionId || '\0client-end';

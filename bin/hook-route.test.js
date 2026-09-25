@@ -1161,7 +1161,7 @@ test('a Codex child agent\'s rollout is mirrored under its own id, and its hook 
 
   const refused = [
     [{ ...body(), child: 'codex-child' }, 400, /only a Codex session's hook names a child/],
-    [codexBody('codex-post-tool', { ...post, agent_id: 'codex-aws1' }, { child: 'codex-aws1' }), 400, /not its own parent/],
+    [codexBody('codex-post-tool', { ...post, agent_id: 'codex-aws1' }, { child: 'codex-aws1' }), 403, /is a session of its own/],
     [codexBody('codex-post-tool', { ...post, agent_id: 'other' }, { child: 'codex-child' }), 400, /names it as input.agent_id/],
     [codexBody('codex-post-tool', { ...post, agent_id: 'sess-aws1' }, { child: 'sess-aws1' }), 403, /is a session of its own/],
     [codexBody('codex-post-tool', post, { child: 'bad id!' }), 400, /invalid child/],

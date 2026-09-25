@@ -570,7 +570,7 @@ test('partial chunk progress is durable, resumable only for the same send, and n
     // left to write gives up its resume, and this one still owes a chunk.
     fs.writeFileSync(journal, JSON.stringify({ ...JSON.parse(fs.readFileSync(journal, 'utf8')), createdAt: Date.now() - 60 * 60e3 }));
     const halfInBox = async () => { throw new Error('the session input box already contains text'); };
-    await assert.rejects(deliver({ ...base, text: 'different', precheck: halfInBox, type: async () => assert.fail('must not type') }), /partially typed and the box is not empty: the session input box already contains text/);
+    await assert.rejects(deliver({ ...base, text: 'different', precheck: halfInBox, type: async () => assert.fail('must not type') }), /partially typed; the session input box already contains text/);
     assert.deepEqual(await deliver({ ...base, precheck: halfInBox, type }), { ok: true, delivery: 'received' });
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

@@ -48,8 +48,8 @@ function shortError(source, error) {
   if (code === 'timeout') return 'request timed out';
   if (code === 'response') return 'invalid response';
   if (code === 'not-found') return 'no recent rate-limit snapshot';
-  // Only a token that should still be good reaches the endpoint (fetchClaudeUsage), so
-  // a 401 is a login the server no longer accepts.
+  // A token past its expiry never reaches the endpoint (fetchClaudeUsage); one with no
+  // expiry on record, or revoked early, can still be refused, so the wording allows both.
   if (source === 'Claude' && code === 401) return 'HTTP 401: token rejected; run Claude Code on this account to refresh it, or sign in again';
   if (code === 'lapsed') return 'token lapsed over a day ago; run Claude Code on this account to refresh it';
   // A Codex scan's fs error names the sessions dir; a Claude socket error (ENOTFOUND,
