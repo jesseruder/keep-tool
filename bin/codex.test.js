@@ -363,6 +363,17 @@ test('a model reply after a recorded usage limit is found on its account, and an
     assert.equal(codex.repliedAfter(long, since), since + 90e3);
     fs.rmSync(long);
 
+    // An answered turn pushed out of the tail by a later, still-running long turn.
+    const buried = path.join(dated, 'rollout-buried.jsonl');
+    fs.writeFileSync(buried, [
+      { timestamp: at(since + 20e3), type: 'event_msg', payload: { type: 'task_started' } },
+      { timestamp: at(since + 25e3), type: 'event_msg', payload: { type: 'agent_message', message: 'first answer' } },
+      { timestamp: at(since + 30e3), type: 'event_msg', payload: { type: 'task_started' } },
+      ...Array.from({ length: 80 }, () => filler),
+    ].map(JSON.stringify).join('\n') + '\n');
+    assert.equal(codex.repliedAfter(buried, since), since + 25e3);
+    fs.rmSync(buried);
+
     const answered = path.join(dated, 'rollout-answered.jsonl');
     fs.writeFileSync(answered, [
       { timestamp: at(since + 110e3), type: 'event_msg', payload: { type: 'task_started' } },

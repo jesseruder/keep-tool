@@ -196,13 +196,13 @@ function isHeadlessSession(meta) {
 // agent message or assistant reply following a task start stamped after it. A turn
 // already under way when a limit was recorded can still finish (a user message sent
 // mid-turn is steering, not a new turn), and a turn refused for a usage limit ends
-// with an error event and no reply. A long turn can push its own start out of the
-// tail, so a later reply with no start in view reads the whole file.
+// with an error event and no reply. A long turn can push its own start, or an earlier
+// answered turn, out of the tail, so a tail without a qualifying reply reads the whole
+// file; only rollouts touched since the mark, on marked accounts, get here.
 function repliedAfter(file, sinceMs = 0) {
   const read = (text) => {
     let turnAt = 0;
     let at = 0;
-    let unanchored = false;
     for (const line of text.split('\n')) {
       if (!line || !/"(?:agent_message|assistant|task_started)"/.test(line)) continue;
       let record;
@@ -215,13 +215,12 @@ function repliedAfter(file, sinceMs = 0) {
         || (record?.type === 'response_item' && payload?.type === 'message' && payload.role === 'assistant');
       if (!reply) continue;
       if (turnAt > sinceMs && time > at) at = time;
-      else if (!turnAt && time > sinceMs) unanchored = true;
     }
-    return { at, unanchored };
+    return at;
   };
   const tail = read(readTail(file));
-  if (tail.at || !tail.unanchored || fs.statSync(file).size <= TAIL_BYTES) return tail.at;
-  return read(fs.readFileSync(file, 'utf8')).at;
+  if (tail || fs.statSync(file).size <= TAIL_BYTES) return tail;
+  return read(fs.readFileSync(file, 'utf8'));
 }
 
 // Rollout mtimes can lag their own record stamps on a coarse or skewed filesystem;
